@@ -1,0 +1,47 @@
+<UserControl x:Class="ApexLink.App.Views.Pages.OutputPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             xmlns:ctl="clr-namespace:ApexLink.App.Controls">
+    <UserControl.Resources>
+        <ctl:BoolToStatusBrushConverter x:Key="StatusBrush" />
+    </UserControl.Resources>
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="24" MaxWidth="980">
+            <ui:TextBlock Text="Output (vJoy)" FontTypography="Title" Margin="0,0,0,4" />
+            <ui:TextBlock Text="Install the BrunnerInnovation vJoy v2.2.2.0 driver once."
+                          Appearance="Secondary" Margin="0,0,0,16" TextWrapping="Wrap" />
+
+            <ui:Card Padding="16" Margin="0,0,0,12">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                        <Ellipse Width="12" Height="12" VerticalAlignment="Center"
+                                 Fill="{Binding Connected, Converter={StaticResource StatusBrush}}" />
+                        <ui:TextBlock Text="Device status" FontTypography="BodyStrong" Margin="8,0,0,0" />
+                    </StackPanel>
+                    <ui:TextBlock Text="{Binding StatusText}" Appearance="Secondary" Margin="0,8,0,0" TextWrapping="Wrap" />
+                    <ui:TextBlock Text="{Binding DetailsText}" Margin="0,4,0,0" TextWrapping="Wrap" />
+                </StackPanel>
+            </ui:Card>
+
+            <ui:Card Padding="16" Margin="0,0,0,12">
+                <StackPanel>
+                    <ui:TextBlock Text="vJoy device" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <StackPanel Orientation="Horizontal">
+                        <ui:NumberBox Value="{Binding DeviceId, Mode=TwoWay}" Minimum="1" Maximum="16"
+                                      SpinButtonPlacementMode="Inline" Width="160" Margin="0,0,8,0" />
+                        <ui:Button Content="Apply device" Command="{Binding ApplyDeviceCommand}" />
+                    </StackPanel>
+                    <ui:TextBlock Text="In vJoyConf, enable axes X, Y, Z and 2+ buttons."
+                                  Appearance="Secondary" Margin="0,8,0,0" TextWrapping="Wrap" />
+                </StackPanel>
+            </ui:Card>
+
+            <StackPanel Orientation="Horizontal">
+                <ui:Button Content="Open Game Controllers (joy.cpl)" Command="{Binding OpenGameControllersCommand}" Margin="0,0,8,0" />
+                <ui:Button Content="Open vJoyConf" Command="{Binding OpenVJoyConfCommand}" />
+            </StackPanel>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

@@ -1,0 +1,65 @@
+<ui:FluentWindow x:Class="ApexLink.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+        Title="ApexLink" Height="700" Width="1100" MinHeight="580" MinWidth="920"
+        WindowBackdropType="None" ExtendsContentIntoTitleBar="True"
+        WindowStartupLocation="CenterScreen"
+        Background="{StaticResource AxBg}">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <ui:TitleBar Grid.Row="0" Title="ApexLink" />
+
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="206" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <Border Grid.Column="0" Background="White" BorderBrush="{StaticResource AxLine}"
+                    BorderThickness="0,0,1,0" Padding="14,20">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                        <StackPanel>
+                            <StackPanel Orientation="Horizontal" Margin="6,0,0,18">
+                                <Border Width="32" Height="32" CornerRadius="10" Background="{StaticResource AxAccent}">
+                                    <TextBlock Text="A" Foreground="White" FontWeight="Bold" FontSize="16"
+                                               HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                </Border>
+                                <TextBlock Text="ApexLink" FontSize="16" FontWeight="Bold" Foreground="{StaticResource AxInk}"
+                                           VerticalAlignment="Center" Margin="10,0,0,0" />
+                            </StackPanel>
+
+                            <RadioButton x:Name="NavHome" Content="Home" Tag="Home" GroupName="nav" Style="{StaticResource AxNav}" Checked="Nav_Checked" />
+                            <RadioButton x:Name="NavSetup" Content="Setup" Tag="Setup" GroupName="nav" Style="{StaticResource AxNav}" Checked="Nav_Checked" />
+                            <RadioButton Content="Tune" Tag="Tune" GroupName="nav" Style="{StaticResource AxNav}" Checked="Nav_Checked" />
+                            <RadioButton Content="Buttons" Tag="Buttons" GroupName="nav" Style="{StaticResource AxNav}" Checked="Nav_Checked" />
+                            <RadioButton Content="Profiles" Tag="Profiles" GroupName="nav" Style="{StaticResource AxNav}" Checked="Nav_Checked" />
+
+                            <Button Content="Advanced" Style="{StaticResource AxNavPlain}" Click="Advanced_Click" Margin="0,12,0,0" />
+                            <StackPanel x:Name="AdvPanel" Visibility="Collapsed" Margin="14,0,0,0">
+                                <RadioButton Content="Manual calibration" Tag="Manual" GroupName="nav" Style="{StaticResource AxNav}" Checked="Nav_Checked" />
+                                <RadioButton Content="Input monitor" Tag="Monitor" GroupName="nav" Style="{StaticResource AxNav}" Checked="Nav_Checked" />
+                                <RadioButton Content="Output (vJoy)" Tag="Output" GroupName="nav" Style="{StaticResource AxNav}" Checked="Nav_Checked" />
+                                <RadioButton Content="Connection" Tag="Connection" GroupName="nav" Style="{StaticResource AxNav}" Checked="Nav_Checked" />
+                                <RadioButton Content="Diagnostics" Tag="Diagnostics" GroupName="nav" Style="{StaticResource AxNav}" Checked="Nav_Checked" />
+                            </StackPanel>
+                        </StackPanel>
+                    </ScrollViewer>
+                    <RadioButton Grid.Row="1" Content="Settings" Tag="Settings" GroupName="nav" Style="{StaticResource AxNav}" Checked="Nav_Checked" />
+                </Grid>
+            </Border>
+
+            <ContentControl Grid.Column="1" x:Name="PageHost" Focusable="False"
+                            Foreground="{StaticResource AxInk}" />
+        </Grid>
+    </Grid>
+</ui:FluentWindow>

@@ -1,0 +1,2051 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"><link rel="icon" href="data:," />
+    <title>RSH — Real Sim Hub</title>
+    <style>
+      button, [role="button"], select, summary, input:not([type="checkbox"], [type="radio"]) { min-height: 2rem; }
+    </style>
+    <style>
+      *{box-sizing:border-box}html,body{margin:0;height:100%}
+body{padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);font-family:Inter,"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;background:#0d0e10}
+.wrap,.appframe{height:100%;max-width:none;padding:0;margin:0}
+/* ============ RSH app mock — fitonist / Loud style tokens ============ */
+      .app{
+        --bg:#08080d; --s1:#12121a; --s2:#1a1a25; --s3:#232333;
+        --border:rgba(255,255,255,.08); --border-strong:rgba(255,255,255,.17);
+        --tx:#f4f2fb; --tx2:rgba(244,242,251,.62); --tx3:rgba(244,242,251,.40);
+        --accent:#a78bfa; --accent-deep:#7c3aed; --accent-soft:rgba(139,92,246,.18);
+        --lime:#b7e33c; --ok:#4ade80; --warn:#f0b23e; --bad:#f0564b; --orange:#f08c2e;
+        --track:rgba(255,255,255,.13);
+        --rad:18px;
+        --shadow:0 24px 60px rgba(10,4,32,.55);
+        background:var(--bg); color:var(--tx);
+        border:1px solid var(--border-strong); border-radius:22px;
+        box-shadow:var(--shadow); overflow:hidden;
+        font-size:14px; line-height:1.45;
+      }
+      .app[data-theme="light"]{
+        --bg:#ededf3; --s1:#ffffff; --s2:#f3f2f8; --s3:#ffffff;
+        --border:rgba(26,18,54,.10); --border-strong:rgba(26,18,54,.20);
+        --tx:#181226; --tx2:rgba(24,18,38,.64); --tx3:rgba(24,18,38,.44);
+        --accent:#7c3aed; --accent-deep:#7c3aed; --accent-soft:rgba(124,58,237,.12);
+        --lime:#6f9a12; --track:rgba(26,18,54,.13);
+        --shadow:0 24px 60px rgba(46,16,101,.25);
+      }
+      .app *{ box-sizing:border-box; }
+      .app button{ font:inherit; color:inherit; }
+      .winbar{
+        display:flex; align-items:center; gap:8px; padding:8px 14px;
+        background:var(--s1); border-bottom:1px solid var(--border); font-size:12.5px; color:var(--tx2);
+        user-select:none;
+      }
+      .winbar .dots{ display:flex; gap:7px; margin-right:4px; }
+      .winbar .dots i{ width:11px; height:11px; border-radius:50%; display:block; }
+      .winbar .wtitle{ font-weight:600; color:var(--tx); }
+      .shell{ display:grid; grid-template-columns:224px 1fr; min-height:660px; }
+      /* Sidebar — pill navigation, active = white pill (dark) / violet pill (light) */
+      .side{
+        background:var(--s1); border-right:1px solid var(--border);
+        display:flex; flex-direction:column; padding:14px 12px; gap:4px;
+      }
+      .side .brand{ display:flex; align-items:center; gap:9px; padding:4px 8px 14px; }
+      .side .brand .mark{
+        width:32px; height:32px; border-radius:10px; background:var(--accent-deep); color:#fff;
+        display:grid; place-items:center; font-weight:700; font-size:12px; letter-spacing:.02em; flex:none;
+      }
+      .side .brand b{ font-size:15px; font-weight:700; }
+      .side .brand small{ display:block; color:var(--tx2); font-size:11px; font-weight:400; }
+      .nav-item{
+        display:flex; align-items:center; gap:10px; width:100%; text-align:left;
+        background:none; border:0; border-radius:999px; padding:9px 14px; cursor:pointer;
+        color:var(--tx2); font-size:13.5px; font-weight:600; min-height:40px; position:relative;
+      }
+      .nav-item svg{ flex:none; opacity:.9; }
+      .nav-item:hover{ background:var(--s2); color:var(--tx); }
+      .nav-item.active{ background:#ffffff; color:#16121f; font-weight:700; }
+      .app[data-theme="light"] .nav-item.active{ background:var(--accent-deep); color:#fff; }
+      .side .spacer{ flex:1; }
+      .fwbox{ border-top:1px solid var(--border); padding:12px 8px 2px; font-size:12.5px; color:var(--tx2); }
+      .fwbox b{ color:var(--tx); display:block; font-size:12.5px; }
+      /* Main column */
+      .main{ display:flex; flex-direction:column; min-width:0; background:var(--bg); }
+      .topbar{
+        display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+        padding:14px 20px; border-bottom:1px solid var(--border); background:var(--bg);
+      }
+      .topbar h2{ font-size:22px; margin:0; font-weight:700; letter-spacing:-.01em; }
+      .topbar .grow{ flex:1; }
+      .seg{ display:flex; background:var(--s2); border:1px solid var(--border); border-radius:999px; padding:3px; gap:2px; }
+      .seg button{
+        border:0; background:none; padding:5px 14px; border-radius:999px; cursor:pointer; font-size:13px;
+        color:var(--tx2); min-height:32px; font-weight:600;
+      }
+      .seg button[aria-pressed="true"]{ background:#ffffff; color:#16121f; box-shadow:0 1px 3px rgba(0,0,0,.25); }
+      .app[data-theme="light"] .seg button[aria-pressed="true"]{ background:var(--accent-deep); color:#fff; }
+      .profilepick{ position:relative; }
+      .profilepick > button{
+        display:flex; align-items:center; gap:8px; background:var(--s2); border:1px solid var(--border);
+        border-radius:999px; padding:6px 14px; cursor:pointer; font-size:13px; font-weight:600; min-height:36px;
+      }
+      .unsaved-dot{ width:8px; height:8px; border-radius:50%; background:var(--orange); display:none; flex:none; }
+      .unsaved-dot.on{ display:block; }
+      .pill{
+        display:inline-flex; align-items:center; gap:7px; font-size:12.5px; font-weight:600;
+        padding:5px 13px; border-radius:999px; border:1px solid var(--border); background:var(--s2); min-height:32px;
+      }
+      .pill .cdot{ width:8px; height:8px; border-radius:50%; background:var(--ok); }
+      .pill.off .cdot{ background:var(--bad); }
+      .helpbtn{
+        height:36px; border-radius:999px; border:1px solid var(--border); background:var(--s2);
+        cursor:pointer; font-weight:700; font-size:13.5px; display:grid; place-items:center; padding:0 16px;
+      }
+      .helpmenu{
+        position:absolute; right:0; top:calc(100% + 6px); width:230px; z-index:60;
+        background:var(--s3); border:1px solid var(--border-strong); border-radius:14px; padding:6px;
+        box-shadow:0 12px 32px rgba(0,0,0,.35); display:none;
+      }
+      .helpmenu.open{ display:block; }
+      .helpmenu button{
+        display:block; width:100%; text-align:left; background:none; border:0; padding:8px 10px;
+        border-radius:9px; cursor:pointer; font-size:13.5px; min-height:36px;
+      }
+      .helpmenu button:hover{ background:var(--accent-soft); }
+      .content{ padding:20px 22px 26px; overflow-y:auto; max-height:780px; }
+      .page{ display:none; }
+      .page.active{ display:block; }
+      /* Cards & controls */
+      .card{ background:var(--s1); border:1px solid var(--border); border-radius:var(--rad); padding:18px 20px; }
+      .card h3{ margin:0 0 4px; font-size:15px; font-weight:700; }
+      .card .sub{ color:var(--tx2); font-size:12.5px; }
+      .grid4{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:12px; }
+      .grid3{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-bottom:12px; }
+      .grid2{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px; }
+      @media (max-width:900px){ .grid4{ grid-template-columns:1fr 1fr; } .grid3,.grid2{ grid-template-columns:1fr; } }
+      .stat .lbl{ font-size:12px; color:var(--tx2); display:flex; align-items:center; gap:6px; }
+      .stat .big{ font-size:27px; font-weight:750; letter-spacing:-.015em; margin-top:4px; display:flex; align-items:center; gap:9px; }
+      .stat .big .unit{ font-size:13px; color:var(--tx2); font-weight:600; letter-spacing:0; }
+      .stat .range{ font-size:12px; color:var(--tx2); margin-top:3px; }
+      .delta{
+        display:inline-flex; align-items:center; gap:3px; font-size:11px; font-weight:700;
+        padding:2px 8px; border-radius:999px; vertical-align:2px; letter-spacing:.01em;
+      }
+      .delta.up{ background:rgba(183,227,60,.16); color:var(--lime); }
+      .app[data-theme="light"] .delta.up{ background:rgba(111,154,18,.14); }
+      .delta.down{ background:rgba(240,86,75,.15); color:var(--bad); }
+      .delta.flat{ background:var(--s2); color:var(--tx2); }
+      .ok-txt{ color:var(--ok); } .warn-txt{ color:var(--warn); } .bad-txt{ color:var(--bad); }
+      .statusdot{ width:9px; height:9px; border-radius:50%; flex:none; }
+      .slider-row{ margin:14px 0 4px; }
+      .slider-row .lab{ display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+      .slider-row .lab label{ font-weight:600; font-size:14px; }
+      .slider-row .val{ font-variant-numeric:tabular-nums; font-weight:700; font-size:15px; }
+      .slider-row .cap{ color:var(--tx2); font-size:12.5px; margin-top:5px; }
+      input[type="range"]{ width:100%; accent-color:var(--accent); height:28px; cursor:pointer; }
+      .abtn{
+        background:var(--accent-deep); color:#fff; border:0; border-radius:999px; padding:8px 18px;
+        cursor:pointer; font-weight:600; font-size:13.5px; min-height:38px;
+      }
+      .abtn:hover{ filter:brightness(1.14); }
+      .abtn.ghost{ background:var(--s3); color:var(--tx); border:1px solid var(--border-strong); }
+      .abtn.ghost:hover{ border-color:var(--accent); filter:none; }
+      .abtn.small{ min-height:34px; padding:5px 13px; font-size:12.5px; }
+      .chip{
+        display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:600;
+        background:var(--accent-soft); color:var(--accent); border-radius:999px; padding:2px 9px;
+      }
+      .app[data-theme="light"] .chip{ color:var(--accent-deep); }
+      /* Hints: the control/label itself is the trigger — no separate "?" icons */
+      [data-tip]{ position:relative; cursor:help; }
+      .tooltip{
+        position:absolute; z-index:80; width:250px; max-width:78vw; pointer-events:none;
+        background:var(--s3); color:var(--tx); border:1px solid var(--border-strong); border-radius:12px;
+        padding:10px 12px; font-size:12.5px; line-height:1.5; font-weight:400; text-align:left;
+        box-shadow:0 10px 28px rgba(0,0,0,.4); opacity:0; transform:translateY(3px);
+        transition:opacity .15s ease, transform .15s ease; display:none;
+      }
+      .tooltip.show{ display:block; opacity:1; transform:translateY(0); pointer-events:auto; }
+      .tooltip .lm{ color:var(--accent); font-weight:600; cursor:pointer; display:inline-block; margin-top:5px; background:none;border:0;padding:0;font-size:12.5px; min-height:0;}
+      /* Advanced gating */
+      .adv{ display:none !important; }
+      .app[data-mode="advanced"] .adv{ display:revert !important; }
+      .app[data-mode="advanced"] .adv-flex{ display:flex !important; }
+      .app[data-mode="advanced"] .adv-grid{ display:grid !important; }
+      .expander{
+        width:100%; display:flex; justify-content:space-between; align-items:center; background:none; border:0;
+        border-top:1px solid var(--border); padding:13px 2px 4px; margin-top:10px; cursor:pointer;
+        font-weight:700; font-size:13.5px; color:var(--tx); min-height:40px; text-align:left;
+      }
+      .expander .chev{ transition:transform .18s ease; color:var(--tx2); }
+      .expander[aria-expanded="true"] .chev{ transform:rotate(180deg); }
+      .exp-body{ display:none; padding-top:6px; }
+      .exp-body.open{ display:block; }
+      /* Monitor bars */
+      .bar-wrap{ margin:10px 0; }
+      .bar-lab{ display:flex; justify-content:space-between; font-size:12.5px; color:var(--tx2); margin-bottom:4px; }
+      .bar-lab b{ color:var(--tx); font-variant-numeric:tabular-nums; }
+      .bar{ height:14px; background:var(--track); border-radius:7px; position:relative; overflow:hidden; }
+      .bar .fill{ position:absolute; top:0; bottom:0; border-radius:7px; }
+      .bar.signed .zero{ position:absolute; left:50%; top:0; bottom:0; width:2px; background:var(--border-strong); }
+      .bar .peak{ position:absolute; top:0; bottom:0; width:3px; background:var(--tx); opacity:.75; }
+      .clipflag{
+        display:none; font-size:11px; font-weight:700; letter-spacing:.04em; color:#fff; background:var(--bad);
+        border-radius:999px; padding:2px 8px; margin-left:8px; vertical-align:1px;
+      }
+      .clipflag.on{ display:inline-block; }
+      .btngrid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(64px,1fr)); gap:8px; margin-top:8px; }
+      .btcell{
+        border:1px solid var(--border); background:var(--s2); border-radius:14px; padding:8px 4px 6px;
+        text-align:center; font-size:11.5px; color:var(--tx2); cursor:pointer; min-height:52px; user-select:none;
+      }
+      .btcell b{ display:block; font-size:14px; color:var(--tx); font-variant-numeric:tabular-nums; }
+      .btcell.pressed{ background:var(--accent-soft); border-color:var(--accent); color:var(--tx); }
+      .btcell.pressed b{ color:var(--accent); }
+      .diag-line{
+        display:flex; gap:9px; align-items:flex-start; background:var(--accent-soft); border-radius:12px;
+        padding:10px 13px; font-size:13.5px; margin-top:12px;
+      }
+      .diag-line.warn{ background:rgba(240,178,62,.14); }
+      .diag-line.bad{ background:rgba(240,86,75,.14); }
+      .spark{ width:100%; height:56px; display:block; }
+      .sampletag{
+        font-size:10.5px; font-weight:700; letter-spacing:.05em; text-transform:uppercase;
+        border:1px solid var(--border-strong); color:var(--tx2); border-radius:999px; padding:1px 7px; vertical-align:2px; margin-left:8px;
+      }
+      /* Profiles */
+      .preset-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+      @media (max-width:900px){ .preset-grid{ grid-template-columns:1fr; } }
+      .preset{ text-align:left; cursor:pointer; font:inherit; color:inherit; }
+      .preset.sel{ border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+      .preset h4{ margin:0 0 3px; font-size:15px; }
+      .preset p{ margin:0; color:var(--tx2); font-size:12.5px; }
+      .autoswitch{ display:flex; gap:0; border:1px solid var(--border); border-radius:14px; overflow:hidden; margin-top:10px; }
+      .autoswitch button{
+        flex:1; background:var(--s2); border:0; border-right:1px solid var(--border); padding:9px 6px;
+        cursor:pointer; font-size:12.5px; font-weight:600; color:var(--tx2); min-height:44px;
+      }
+      .autoswitch button:last-child{ border-right:0; }
+      .autoswitch button[aria-pressed="true"]{ background:var(--accent-soft); color:var(--tx); }
+      .autoswitch small{ display:block; font-weight:400; font-size:11px; margin-top:1px; }
+      /* Checklist */
+      .check-item{ display:flex; gap:10px; align-items:center; padding:7px 0; font-size:13.5px; }
+      .check-item .box{
+        width:20px; height:20px; border-radius:7px; border:1.5px solid var(--border-strong); flex:none;
+        display:grid; place-items:center; color:#fff; font-size:12px;
+      }
+      .check-item.done .box{ background:var(--ok); border-color:var(--ok); }
+      .check-item.done .txt{ color:var(--tx2); text-decoration:line-through; }
+      .check-item button{ margin-left:auto; }
+      .linklike{ background:none; border:0; color:var(--accent); cursor:pointer; font-weight:600; font-size:13px; padding:4px 6px; min-height:32px;}
+      /* Devices */
+      .devrow{ display:flex; align-items:center; gap:13px; padding:12px 0; border-bottom:1px solid var(--border); }
+      .devrow:last-child{ border-bottom:0; }
+      .devrow .dic{
+        width:38px; height:38px; border-radius:12px; background:var(--s2); flex:none;
+        display:grid; place-items:center; color:var(--tx2);
+      }
+      .devrow .dname{ font-weight:650; font-size:14px; display:flex; align-items:center; gap:8px; }
+      .devrow .dsub{ color:var(--tx2); font-size:12.5px; }
+      .devrow .dright{ margin-left:auto; display:flex; align-items:center; gap:10px; }
+      .stateword{ font-size:12px; font-weight:700; }
+      .pinrow{ display:flex; align-items:center; gap:12px; padding:9px 0; border-bottom:1px solid var(--border); font-size:13.5px; }
+      .pinrow:last-child{ border-bottom:0; }
+      .pinrow .pname{ font-weight:600; min-width:110px; }
+      .pinrow .psrc{ color:var(--tx2); font-size:12.5px; }
+      .pinrow select{ margin-left:auto; }
+      /* Game launcher */
+      .gamerow{ display:flex; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid var(--border); }
+      .gamerow:last-child{ border-bottom:0; }
+      .gamerow .gname{ font-weight:650; font-size:14px; }
+      .gamerow .gsub{ color:var(--tx2); font-size:12.5px; }
+      .gamerow select{ margin-left:auto; }
+      /* Heatmap (Loud "Activity by time" pattern) */
+      .heat{ display:grid; grid-template-columns:30px repeat(7,1fr); gap:5px; margin-top:12px; align-items:center; }
+      .heat .hday{ font-size:11px; color:var(--tx2); text-align:center; font-weight:600; }
+      .heat .hhour{ font-size:11px; color:var(--tx2); font-weight:600; }
+      .hcell{ aspect-ratio:1.15; border-radius:7px; background:var(--track); }
+      .heat-legend{ display:flex; align-items:center; gap:5px; justify-content:flex-end; margin-top:10px; font-size:11px; color:var(--tx2); }
+      .heat-legend i{ width:13px; height:13px; border-radius:4px; display:block; }
+      /* LED page */
+      .ledstrip{ display:flex; gap:5px; flex-wrap:wrap; margin:10px 0; }
+      .led{
+        width:30px; height:30px; border-radius:50%; border:2px solid var(--border-strong); cursor:pointer;
+        padding:0; min-height:0; background:var(--s2);
+      }
+      .led.on{ box-shadow:0 0 10px currentColor; }
+      .wheelwrap{ display:flex; gap:18px; flex-wrap:wrap; align-items:flex-start; }
+      .wheelwrap svg{ flex:none; }
+      /* Diagnostics log */
+      .logbox{
+        background:#0b0b10; color:#c9d1c9; border-radius:12px; padding:12px 14px; font-family:Consolas,"Cascadia Code",monospace;
+        font-size:12px; line-height:1.7; max-height:190px; overflow-y:auto; border:1px solid var(--border);
+      }
+      .logbox .t{ color:#7d8590; } .logbox .w{ color:#e8a33d; }
+      /* Switch */
+      .switchrow{ display:flex; align-items:center; justify-content:space-between; gap:14px; padding:11px 0; border-bottom:1px solid var(--border); }
+      .switchrow:last-child{ border-bottom:0; }
+      .switchrow .d{ color:var(--tx2); font-size:12.5px; }
+      .tgl{ position:relative; width:44px; height:24px; flex:none; }
+      .tgl input{ position:absolute; opacity:0; width:100%; height:100%; margin:0; cursor:pointer; }
+      .tgl .tr{ position:absolute; inset:0; background:var(--track); border-radius:999px; transition:background .15s; pointer-events:none;}
+      .tgl .tr::after{ content:""; position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%; background:#fff; transition:left .15s; box-shadow:0 1px 3px rgba(0,0,0,.35);}
+      .tgl input:checked + .tr{ background:var(--accent-deep); }
+      .tgl input:checked + .tr::after{ left:23px; }
+      .tgl input:focus-visible + .tr{ outline:2px solid var(--accent); outline-offset:2px; }
+      select.sel, input.txtin{
+        background:var(--s2); color:var(--tx); border:1px solid var(--border-strong); border-radius:10px;
+        padding:7px 10px; font:inherit; font-size:13.5px; min-height:36px;
+      }
+      /* Wizard + tour + modal overlays */
+      .appframe{ position:relative; }
+      .overlay{
+        position:absolute; inset:0; z-index:100; display:none; align-items:center; justify-content:center;
+        background:rgba(5,4,10,.62); padding:18px;
+      }
+      .overlay.open{ display:flex; }
+      .wiz{
+        background:var(--s1); color:var(--tx); border:1px solid var(--border-strong); border-radius:20px;
+        width:560px; max-width:100%; max-height:92%; overflow-y:auto; padding:22px 24px; box-shadow:0 24px 60px rgba(0,0,0,.5);
+      }
+      .wiz .whead{ display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
+      .wiz .step-lbl{ font-size:12.5px; color:var(--tx2); font-weight:600; }
+      .wiz h3{ font-size:19px; margin:6px 0 8px; }
+      .wiz p{ color:var(--tx2); font-size:14px; margin:0 0 10px; }
+      .wiz .wfoot{ display:flex; justify-content:space-between; align-items:center; margin-top:18px; gap:10px; flex-wrap:wrap;}
+      .wiz .wstep{ display:none; } .wiz .wstep.active{ display:block; }
+      .scanbar{ height:8px; border-radius:5px; background:var(--track); overflow:hidden; margin:14px 0; }
+      .scanbar i{ display:block; height:100%; width:35%; background:var(--accent); border-radius:5px; animation:scan 1.1s ease-in-out infinite alternate; }
+      @keyframes scan{ from{ transform:translateX(-30%);} to{ transform:translateX(260%);} }
+      .tourcard{
+        position:absolute; z-index:120; width:300px; max-width:calc(100% - 24px);
+        background:var(--s3); color:var(--tx); border:1px solid var(--border-strong); border-radius:16px;
+        padding:16px 18px; box-shadow:0 18px 44px rgba(0,0,0,.45); display:none;
+      }
+      .tourcard.open{ display:block; }
+      .tourcard h4{ margin:0 0 5px; font-size:15px; }
+      .tourcard p{ margin:0 0 12px; color:var(--tx2); font-size:13.5px; }
+      .tourring{
+        position:absolute; z-index:110; border:2.5px solid var(--accent); border-radius:12px;
+        pointer-events:none; display:none; box-shadow:0 0 0 4px var(--accent-soft);
+      }
+      .tourring.open{ display:block; }
+      .helpmodal p{ font-size:14px; color:var(--tx2); }
+      .kbd{ font-family:Consolas,monospace; font-size:12px; background:var(--s3); border:1px solid var(--border-strong); border-bottom-width:2px; border-radius:5px; padding:1px 6px; }
+      @media (prefers-reduced-motion: reduce){
+        .scanbar i{ animation:none; }
+        *{ transition:none !important; animation:none !important; }
+      }
+      /* ===== Component-library styling (Magic UI / Uiverse / Jitter patterns, re-implemented) ===== */
+      @property --ba { syntax:'<angle>'; initial-value:0deg; inherits:false; }
+      .beam-card{ position:relative; }
+      .beam-card::before{
+        content:""; position:absolute; inset:0; border-radius:var(--rad); padding:1.5px; pointer-events:none;
+        background:conic-gradient(from var(--ba), transparent 0deg, transparent 250deg, var(--accent) 305deg, transparent 360deg);
+        -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+        -webkit-mask-composite:xor; mask-composite:exclude;
+        animation:beamspin 5.5s linear infinite;
+      }
+      @keyframes beamspin{ to{ --ba:360deg; } }
+      .abtn{ position:relative; overflow:hidden; }
+      .abtn::after{
+        content:""; position:absolute; top:0; bottom:0; width:45%; left:-60%;
+        background:linear-gradient(100deg, transparent, rgba(255,255,255,.35), transparent);
+        transform:skewX(-18deg); transition:left .55s ease; pointer-events:none;
+      }
+      .abtn:hover::after{ left:115%; }
+      .abtn:active{ transform:scale(.975); }
+      .nav-item{ transition:background .16s ease, color .16s ease, transform .16s ease; }
+      .nav-item:active{ transform:scale(.98); }
+      .statusdot.live{ position:relative; }
+      .statusdot.live::after{
+        content:""; position:absolute; inset:-4px; border-radius:50%; border:2px solid var(--ok);
+        opacity:.55; animation:ping 2.2s ease-out infinite;
+      }
+      @keyframes ping{ 0%{ transform:scale(.55); opacity:.6; } 70%,100%{ transform:scale(1.25); opacity:0; } }
+      .page.active{ animation:pagein .28s ease both; }
+      @keyframes pagein{ from{ opacity:0; transform:translateY(7px); } to{ opacity:1; transform:none; } }
+      .app input[type="range"]{ -webkit-appearance:none; appearance:none; background:transparent; height:28px; }
+      .app input[type="range"]::-webkit-slider-runnable-track{ height:6px; border-radius:3px; background:linear-gradient(90deg, var(--accent) var(--p,50%), var(--track) var(--p,50%)); }
+      .app input[type="range"]::-webkit-slider-thumb{
+        -webkit-appearance:none; width:18px; height:18px; margin-top:-6px; border-radius:50%;
+        background:#fff; border:2px solid var(--accent); box-shadow:0 1px 5px rgba(0,0,0,.4); cursor:pointer;
+        transition:transform .15s ease;
+      }
+      .app input[type="range"]:active::-webkit-slider-thumb{ transform:scale(1.25); }
+      .app input[type="range"]::-moz-range-track{ height:6px; border-radius:3px; background:var(--track); }
+      .app input[type="range"]::-moz-range-progress{ height:6px; border-radius:3px; background:var(--accent); }
+      .app input[type="range"]::-moz-range-thumb{ width:15px; height:15px; border-radius:50%; background:#fff; border:2px solid var(--accent); box-shadow:0 1px 5px rgba(0,0,0,.4); cursor:pointer; }
+      .scanbar i{
+        background:repeating-linear-gradient(45deg, var(--accent) 0 10px, rgba(255,255,255,.35) 10px 20px), var(--accent);
+        background-size:200% 100%;
+      }
+      .preset{ transition:border-color .18s ease, transform .18s ease, box-shadow .18s ease; }
+      .preset:hover{ transform:translateY(-2px); }
+      .btcell{ transition:background .15s ease, border-color .15s ease, transform .1s ease; }
+      .btcell:active{ transform:scale(.94); }
+      .led{ transition:background .18s ease, box-shadow .18s ease, transform .12s ease; }
+      .led:active{ transform:scale(.88); }
+      /* Visual-only controls: meters, calibration drag bar, spec chips, flag swatches */
+      .meter{ height:7px; border-radius:4px; background:var(--track); margin-top:9px; overflow:hidden; }
+      .meter i{ display:block; height:100%; border-radius:4px; background:var(--accent); }
+      .calbar{ position:relative; height:34px; margin:8px 2px 2px; }
+      .calbar .track{ position:absolute; left:0; right:0; top:14px; height:6px; border-radius:3px; background:var(--track); }
+      .calbar .fill{ position:absolute; top:14px; height:6px; border-radius:3px; background:var(--accent); }
+      .calbar .hnd{ position:absolute; top:3px; width:24px; height:28px; margin-left:-12px; border-radius:8px; background:var(--s3); border:2px solid var(--accent); cursor:ew-resize; touch-action:none; display:grid; place-items:center; font-size:8.5px; font-weight:700; color:var(--accent); user-select:none; }
+      .calbar-lab{ display:flex; justify-content:space-between; font-size:12px; color:var(--tx2); margin-top:4px; font-variant-numeric:tabular-nums; }
+      .calbar-lab b{ color:var(--tx); }
+      .spec{ display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+      .spec > span{ font-size:11.5px; font-weight:600; background:var(--s2); border:1px solid var(--border); border-radius:999px; padding:2px 9px; color:var(--tx2); }
+      .flagrow{ display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap; }
+      .flagsw{ width:26px; height:26px; border-radius:50%; border:2px solid var(--border-strong); cursor:pointer; padding:0; min-height:0; }
+      .flagsw.sel{ border-color:var(--tx); box-shadow:0 0 0 3px var(--accent-soft); }
+
+      /* Tune — vertical module cards, tuning opens below the clicked card */
+      .tune-stack{ display:flex; flex-direction:column; gap:12px; }
+      .module-card{ background:var(--s1); border:1px solid var(--border); border-radius:18px; overflow:hidden; }
+      .module-card.open{ border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset, 0 10px 28px rgba(0,0,0,.18); }
+      .module-head{
+        display:flex; align-items:center; gap:14px; width:100%; text-align:left;
+        background:transparent; border:0; padding:16px 18px; cursor:pointer; color:var(--tx); min-height:76px;
+      }
+      .module-head:hover{ background:var(--s2); }
+      .module-card.open .module-head{ background:var(--accent-soft); }
+      .module-icon{ width:46px; height:46px; border-radius:13px; display:grid; place-items:center; flex:none; color:#fff; }
+      .module-head .m-info{ flex:1; min-width:0; }
+      .module-head .m-name{ font-size:16.5px; font-weight:750; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+      .module-head .m-sub{ font-size:12.5px; color:var(--tx2); margin-top:1px; display:block; }
+      .module-head .m-live{ text-align:right; flex:none; }
+      .module-head .m-live b{ font-size:19px; font-variant-numeric:tabular-nums; display:block; line-height:1.1; }
+      .module-head .m-live span{ font-size:11px; color:var(--tx2); font-weight:600; letter-spacing:.04em; text-transform:uppercase; }
+      .module-head .m-open{ font-size:12px; font-weight:700; color:var(--accent); border:1px solid var(--border-strong); border-radius:999px; padding:5px 11px; flex:none; }
+      .module-card.open .m-open{ background:var(--accent-deep); color:#fff; border-color:var(--accent-deep); }
+      .module-head .chev{ color:var(--tx2); flex:none; transition:transform .18s ease; font-size:18px; }
+      .module-card.open .module-head .chev{ transform:rotate(180deg); }
+      .tune-sec{ display:none; border-top:1px solid var(--border); padding:18px 20px 20px; background:var(--s1); }
+      .tune-sec.active{ display:block; }
+      .tune-sec > h3{ display:none; }
+      .tune-top{ display:grid; grid-template-columns:1fr 220px; gap:16px; align-items:start; margin-top:12px; }
+      @media (max-width:760px){ .tune-top{ grid-template-columns:1fr; } .module-head .m-live{ display:none; } }
+      .tune-graph{ background:var(--s2); border:1px solid var(--border); border-radius:14px; padding:12px 14px; }
+      .tune-graph .tg-head{ display:flex; justify-content:space-between; gap:8px; font-size:12px; font-weight:700; color:var(--tx2); margin-bottom:6px; }
+      .tune-graph .tg-head b{ color:var(--tx); }
+      .tune-graph svg{ width:100%; height:auto; display:block; }
+      .tune-graph .tg-foot{ display:flex; justify-content:space-between; font-size:11px; color:var(--tx3); margin-top:4px; }
+      .savebar{ display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+      .livedot{ width:9px; height:9px; border-radius:50%; background:var(--track); display:inline-block; flex:none; }
+      .livedot.on{ background:var(--warn); box-shadow:0 0 8px var(--warn); }
+      .dashgraph{ width:100%; height:64px; display:block; margin-top:8px; }
+      .gategrid{ display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-top:10px; }
+      .gatecell{
+        border:1px solid var(--border); background:var(--s2); border-radius:12px; padding:10px 4px;
+        text-align:center; font-size:13px; font-weight:700; color:var(--tx2); cursor:pointer; min-height:46px;
+      }
+      .gatecell.active{ background:var(--accent-soft); border-color:var(--accent); color:var(--tx); }
+      /* Mock responsive: rail sidebar on narrow widths */
+      @media (max-width:760px){
+        .shell{ grid-template-columns:60px 1fr; min-height:600px; }
+        .side .brand b, .side .brand small, .nav-item span, .fwbox{ display:none; }
+        .nav-item{ justify-content:center; padding:10px 0; }
+        .side .brand{ justify-content:center; padding-bottom:8px; }
+        .content{ padding:16px 14px 22px; max-height:none; }
+        .topbar{ padding:10px 14px; }
+        .wrap{ padding:18px 10px 48px; }
+      }
+    
+/* ===== polish: neutral graphite base, switchable accent ===== */
+.app{--bg:#0d0e10;--s1:#151719;--s2:#1d2024;--s3:#272b30;--border:rgba(255,255,255,.08);--border-strong:rgba(255,255,255,.16);--tx:#f2f3f5;--tx2:rgba(242,243,245,.64);--tx3:rgba(242,243,245,.42);--track:rgba(255,255,255,.12);--lime:#34d399;--rad:14px;--shadow:none;
+ border:0;border-radius:0;height:100%;font-family:inherit}
+.app[data-theme="light"]{--bg:#eceef1;--s1:#fff;--s2:#f1f3f5;--s3:#fff;--border:rgba(16,24,32,.1);--border-strong:rgba(16,24,32,.2);--tx:#14181d;--tx2:rgba(20,24,29,.66);--tx3:rgba(20,24,29,.46);--track:rgba(16,24,32,.12);--lime:#15803d}
+.app[data-palette=amber]{--accent:#fbbf24;--accent-deep:#f59e0b;--accent-soft:rgba(245,158,11,.16);--onac:#1a1204}
+.app[data-theme="light"][data-palette=amber]{--accent:#b45309;--accent-deep:#b45309;--accent-soft:rgba(180,83,9,.11);--onac:#fff}
+.app[data-palette=teal]{--accent:#2dd4bf;--accent-deep:#14b8a6;--accent-soft:rgba(20,184,166,.16);--onac:#04201c}
+.app[data-theme="light"][data-palette=teal]{--accent:#0f766e;--accent-deep:#0f766e;--accent-soft:rgba(15,118,110,.11);--onac:#fff}
+.app[data-palette=blue]{--accent:#60a5fa;--accent-deep:#3b82f6;--accent-soft:rgba(59,130,246,.16);--onac:#fff}
+.app[data-theme="light"][data-palette=blue]{--accent:#2563eb;--accent-deep:#2563eb;--accent-soft:rgba(37,99,235,.11);--onac:#fff}
+.app[data-palette=red]{--accent:#f87171;--accent-deep:#e5383b;--accent-soft:rgba(229,56,59,.16);--onac:#fff}
+.app[data-theme="light"][data-palette=red]{--accent:#c62828;--accent-deep:#c62828;--accent-soft:rgba(198,40,40,.1);--onac:#fff}
+.app .abtn,.app .side .brand .mark{color:var(--onac)}.app .abtn.ghost{color:var(--tx)}
+.app .nav-item.active{background:var(--tx);color:var(--bg)}
+.app[data-theme="light"] .nav-item.active,.app[data-theme="light"] .seg button[aria-pressed="true"]{background:var(--accent-deep);color:var(--onac)}
+.app .seg button[aria-pressed="true"]{background:var(--tx);color:var(--bg)}
+.shell{height:100%;min-height:0;grid-template-rows:minmax(0,1fr)}
+.main{min-height:0}.content{flex:1;max-height:none;min-height:0;padding:18px 24px 28px}
+.topbar{padding:12px 24px;min-height:64px}
+.page.active,.preset:hover{animation:none;transform:none}
+.beam-card::before,.abtn::after,.statusdot.live::after,.sampletag,.delta,.module-head .m-open,.module-head .chip,.tune-sec>h3+.sub,.tg-head span,.tg-foot span:nth-child(2){display:none}
+.module-head{min-height:64px;padding:12px 18px}.module-icon{width:38px;height:38px;border-radius:11px}
+.module-head .m-name{font-size:15px}.module-head .m-live span{text-transform:none;letter-spacing:0}
+.module-card.open{box-shadow:none}.module-card.open .module-head{background:transparent}
+.tune-stack{gap:8px}.grid2>div:only-child,.grid2>.card[hidden]+div{display:contents}
+.swatches{display:flex;gap:8px;align-items:center;padding:0 4px}
+.swatches button{width:22px;height:22px;min-height:0;border-radius:50%;background:var(--c);border:0;padding:0;cursor:pointer}
+.swatches button[aria-pressed="true"]{box-shadow:0 0 0 2px var(--bg),0 0 0 4px var(--c)}
+.rail-item.active{background:transparent}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div hidden><button id="openWizardBtn" type="button"></button><button id="openTourBtn" type="button"></button></div>
+
+      <div class="appframe" id="appFrame">
+        <div class="app" id="app" data-mode="simple" data-theme="dark" data-palette="amber">
+          <div class="shell">
+            <!-- ============ Sidebar ============ -->
+            <nav class="side" aria-label="RSH pages" id="sidebar">
+              <div class="brand"><span class="mark">RSH</span><span><b>Real Sim Hub</b><small>Wireless wheel hub</small></span></div>
+              <button class="nav-item active" type="button" data-page="dashboard"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="8" height="8" rx="2.5"/><rect x="13" y="3" width="8" height="8" rx="2.5"/><rect x="3" y="13" width="8" height="8" rx="2.5"/><rect x="13" y="13" width="8" height="8" rx="2.5"/></svg><span>Dashboard</span></button>
+              <button class="nav-item" type="button" data-page="devices"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M10 2v3M14 2v3M10 19v3M14 19v3M2 10h3M2 14h3M19 10h3M19 14h3"/></svg><span>Devices</span></button>
+              <button class="nav-item" type="button" data-page="tune"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1"/><circle cx="15" cy="7" r="2.2"/><circle cx="9" cy="12" r="2.2"/><circle cx="17" cy="17" r="2.2"/></svg><span>Tune</span></button>
+              <button class="nav-item" type="button" data-page="profiles"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l2.5 5.3 5.8.7-4.3 4 1.1 5.7L12 16l-5.1 2.7L8 13 3.7 9l5.8-.7z"/></svg><span>Profiles</span></button>
+              <button class="nav-item" type="button" data-page="monitor" id="navMonitor"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></svg><span>Monitor</span></button>
+              <button class="nav-item" type="button" data-page="settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.5 5.5l2.1 2.1M16.4 16.4l2.1 2.1M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1"/></svg><span>Settings</span></button>
+              <div class="spacer"></div>
+              <div class="fwbox">
+                <b>Firmware</b>
+                Firmware 4.0.0 · up to date<br />
+              </div>
+            </nav>
+
+            <!-- ============ Main ============ -->
+            <div class="main">
+              <div class="topbar">
+                <h2 id="pageTitle">Dashboard</h2>
+                <div class="grow"></div>
+                <div class="swatches" id="palSeg" role="group" aria-label="Accent colour"><button type="button" data-pal="amber" style="--c:#f59e0b" aria-label="Amber" title="Amber" aria-pressed="true"></button><button type="button" data-pal="teal" style="--c:#14b8a6" aria-label="Teal" title="Teal" aria-pressed="false"></button><button type="button" data-pal="blue" style="--c:#3b82f6" aria-label="Blue" title="Blue" aria-pressed="false"></button><button type="button" data-pal="red" style="--c:#e5383b" aria-label="Red" title="Red" aria-pressed="false"></button></div><div class="seg" role="group" aria-label="Theme" id="themeSeg">
+                  <button type="button" id="themeDark" aria-pressed="true">Dark</button>
+                  <button type="button" id="themeLight" aria-pressed="false">Light</button>
+                </div>
+                <div class="seg" role="group" aria-label="Simple or Advanced mode" id="modeSeg" hidden>
+                  <button type="button" id="modeSimple" aria-pressed="true">Simple</button>
+                  <button type="button" id="modeAdvanced" aria-pressed="false">Advanced</button>
+                </div>
+                <div class="profilepick">
+                  <button type="button" id="profileBtn" aria-haspopup="true" aria-expanded="false">
+                    <span class="unsaved-dot" id="unsavedDot" title="Unsaved changes"></span>
+                    <span id="profileName">GT — Balanced</span>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 9l7 7 7-7"/></svg>
+                  </button>
+                  <div class="helpmenu" id="profileMenu" role="menu">
+                    <button type="button" data-profile="GT — Balanced">GT — Balanced</button>
+                    <button type="button" data-profile="Formula — Sharp">Formula — Sharp</button>
+                    <button type="button" data-profile="Rally / Road — Calm">Rally / Road — Calm</button>
+                    <button type="button" data-profile="My baseline">My baseline</button>
+                  </div>
+                </div>
+                <span class="pill" id="connPill"><span class="cdot"></span><span id="connPillTxt">Wheel connected</span></span>
+                <div style="position:relative">
+                  <button class="helpbtn" type="button" id="helpBtn" aria-label="Help" aria-haspopup="true" aria-expanded="false">Help</button>
+                  <div class="helpmenu" id="helpMenu" role="menu">
+                    <button type="button" id="hmTour">Take the tour</button>
+                    <button type="button" id="hmChecklist">Setup checklist</button>
+                    <button type="button" id="hmHelp">Help for this page</button>
+                    <button type="button" id="hmKeys">Keyboard shortcuts</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="content" id="content">
+                <!-- ================= DASHBOARD ================= -->
+                <section class="page active" data-page="dashboard">
+                  <div class="grid4">
+                    <div class="card stat">
+                      <div class="lbl">Wheel</div>
+                      <div class="big" style="font-size:23px"><span class="statusdot live" style="background:var(--ok)"></span>RSH Wheel</div>
+                      <div class="range">Firmware 4.0.0 · battery 86%</div>
+                      <div class="meter"><i style="width:86%;background:var(--ok)"></i></div>
+                    </div>
+                    <div class="card stat">
+                      <div class="lbl" data-tip="Share of radio packets that arrived safely. Above 99% is good; below 95%, move closer to the receiver.">Link quality </div>
+                      <div class="big ok-txt" id="dashLinkWord">Good</div>
+                      <div class="range"><span id="dashLoss">0.4</span>% lost</div>
+                    </div>
+                    <div class="card stat">
+                      <div class="lbl" data-tip="RSH appears to games as a standard joystick. The on/off switch lives on Monitor.">Output (vJoy) </div>
+                      <div class="big" style="font-size:23px"><span class="statusdot" style="background:var(--ok)"></span>Sending</div>
+                      <div class="range">vJoy device 1</div>
+                    </div>
+                    <div class="card stat">
+                      <div class="lbl" data-tip="Packets per second arriving from the wheel. Link detail lives on Monitor.">Session rate </div>
+                      <div class="big"><span id="dashPps">200</span> <span class="unit">packets/sec</span></div>
+                      <div class="range">Target 200</div>
+                    </div>
+                  </div>
+
+                  <div class="card" style="margin-bottom:12px">
+                    <h3>Live inputs</h3>
+                    <div data-mod-section="steering">
+                      <div class="bar-wrap">
+                        <div class="bar-lab"><span>Steering</span><b><span id="dashSteerVal">0</span>°</b></div>
+                        <div class="bar signed"><span class="zero"></span><div class="fill" id="dashSteerFill" style="background:var(--accent)"></div></div>
+                      </div>
+                    </div>
+                    <div data-mod-section="throttle">
+                      <div class="bar-wrap">
+                        <div class="bar-lab"><span style="color:var(--lime)">Throttle</span><b><span id="dashThrVal">0</span>%</b></div>
+                        <div class="bar"><div class="fill" id="dashThrFill" style="background:var(--lime);left:0"></div></div>
+                      </div>
+                    </div>
+                    <div data-mod-section="brake">
+                      <div class="bar-wrap">
+                        <div class="bar-lab"><span style="color:var(--bad)">Brake</span><b><span id="dashBrkVal">0</span>%</b></div>
+                        <div class="bar"><div class="fill" id="dashBrkFill" style="background:var(--bad);left:0"></div></div>
+                      </div>
+                    </div>
+                    <div data-mod-section="clutch" style="display:none">
+                      <div class="bar-wrap">
+                        <div class="bar-lab"><span style="color:var(--warn)">Clutch</span><b><span id="dashCluVal">0</span>%</b></div>
+                        <div class="bar"><div class="fill" id="dashCluFill" style="background:var(--warn);left:0"></div></div>
+                      </div>
+                    </div>
+                    <div data-mod-section="handbrake">
+                      <div class="bar-wrap">
+                        <div class="bar-lab"><span style="color:var(--orange)">Handbrake</span><b><span id="dashHbVal">0</span>%</b></div>
+                        <div class="bar"><div class="fill" id="dashHbFill" style="background:var(--orange);left:0"></div></div>
+                      </div>
+                    </div>
+                    <canvas class="dashgraph" id="dashGraph" width="900" height="64" aria-label="Scrolling live graph of steering and throttle"></canvas>
+                    <div class="bar-lab"><span style="color:var(--accent)">— Steering</span><span style="color:var(--lime)">— Throttle</span><span>Last 6 seconds</span></div>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+                      <span class="pill" data-mod-section="buttons">Horn <span class="livedot" id="dashHornDot"></span></span>
+                      <span class="pill" data-mod-section="buttons">Ignition <span class="livedot on" id="dashIgnDot"></span></span>
+                      <span class="pill" data-mod-section="shifter">Gear <b id="dashGear">N</b></span>
+                      <span class="pill" data-mod-section="encoders">Encoder 1 <b id="dashEnc">0</b></span>
+                    </div>
+                  </div>
+
+                  <div class="grid2">
+                    <div class="card" hidden>
+                      <h3>Current tune</h3>
+                      <div style="margin-top:8px">
+                        <div class="switchrow"><div>Steering range</div><b><span id="sumRange">540</span>°</b></div>
+                        <div class="switchrow"><div>Steering curve</div><b id="sumCurve">Linear</b></div>
+                        <div class="switchrow"><div>Modules on</div><b id="sumModules">6 of 7</b></div>
+                        <div class="switchrow"><div>Clutch</div><b style="color:var(--tx2);font-weight:400" id="sumClutch">Off — no Tune section, no bar above</b></div>
+                      </div>
+                      <div style="margin-top:12px"><button class="abtn ghost small" type="button" data-goto="tune">Open Tune</button></div>
+                    </div>
+                    <div>
+                      <div class="card beam-card" style="margin-bottom:12px">
+                        <h3>Active profile</h3>
+                        <div style="font-size:19px;font-weight:750;margin:8px 0 2px" id="dashProfile">GT — Balanced</div>
+                        <div class="sub">Auto-switch: <b style="color:var(--tx)">Per game</b></div>
+                        <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+                          <button class="abtn ghost small" type="button" data-goto="profiles">Open Profiles</button>
+                        </div>
+                      </div>
+                      <div class="card" id="checklistCard">
+                        <div style="display:flex;justify-content:space-between;align-items:center">
+                          <h3 style="margin:0">Get set up</h3>
+                          <button class="linklike" type="button" id="dismissChecklist">Dismiss</button>
+                        </div>
+                        <div class="check-item done"><span class="box">✓</span><span class="txt">Connect your wheel</span></div>
+                        <div class="check-item done"><span class="box">✓</span><span class="txt">Calibrate centre and range</span></div>
+                        <div class="check-item" id="checkProfile"><span class="box"></span><span class="txt">Pick a starting profile</span><button class="abtn ghost small" type="button" data-goto="profiles">Choose</button></div>
+                        <div style="margin-top:10px"><button class="abtn ghost small" type="button" id="dashWizardBtn">Run setup wizard</button></div>
+                      </div>
+                    </div>
+                  </div>
+</section>
+
+                <!-- ================= DEVICES ================= -->
+                <section class="page" data-page="devices">
+                  <div class="grid2">
+                    <div class="card">
+                      <h3>Connection</h3>
+                      <div style="display:flex;align-items:center;gap:12px;margin:16px 0">
+                        <span class="statusdot live" style="background:var(--ok);width:12px;height:12px"></span>
+                        <div><div style="font-weight:700;font-size:16px">RSH Wheel</div><div class="sub">Signal: Strong (−52 dBm) · Battery 86%</div></div>
+                      </div>
+                      <div style="display:flex;gap:8px;flex-wrap:wrap">
+                        <button class="abtn" type="button" id="findWheelBtn">Find wheel again</button>
+                        <button class="abtn ghost" type="button">Disconnect</button>
+                      </div>
+                      <div class="adv">
+                        <button class="expander" type="button" aria-expanded="false" data-exp="connAdv">Advanced — channel, address, port <span class="chev">▾</span></button>
+                        <div class="exp-body" id="connAdv">
+                          <div class="switchrow"><div data-tip="Change only if the link drops often.">Wi-Fi channel</div><select class="sel"><option>Auto</option><option>1</option><option>6</option><option>11</option></select></div>
+                          <div class="switchrow"><div data-tip="Give the wheel the same address every time.">Fixed address</div><label class="tgl"><input type="checkbox" /><span class="tr"></span></label></div>
+                          <div class="switchrow"><div data-tip="Default 5000. Both ends must match.">UDP port</div><select class="sel"><option>5000</option><option>5001</option><option>5002</option><option>5005</option><option>5010</option></select></div>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="card">
+                      <h3>Your rig — status</h3>
+                      <div style="margin-top:6px">
+                        <div class="devrow"><span class="dic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.6"/><path d="M12 3.5v6M4.8 17l5-3.4M19.2 17l-5-3.4"/></svg></span><div><div class="dname">Steering <span class="stateword ok-txt">On</span></div><div class="dsub">GPIO 34 · ADC · calibrated</div></div><span class="dright"><button class="linklike" type="button" data-goto="settings">Manage</button></span></div>
+                        <div class="devrow"><span class="dic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 20V9l7-5 7 5v11"/><path d="M9 20v-6h6v6"/></svg></span><div><div class="dname">Throttle <span class="stateword ok-txt">On</span></div><div class="dsub">GPIO 32 · analog</div></div><span class="dright"><button class="linklike" type="button" data-goto="settings">Manage</button></span></div>
+                        <div class="devrow"><span class="dic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 20V9l7-5 7 5v11"/><path d="M9 20v-6h6v6"/></svg></span><div><div class="dname">Brake <span class="stateword ok-txt">On</span></div><div class="dsub">GPIO 33 · analog</div></div><span class="dright"><button class="linklike" type="button" data-goto="settings">Manage</button></span></div>
+                        <div class="devrow"><span class="dic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 21V8a6 6 0 0 1 12 0"/><path d="M6 13h12"/></svg></span><div><div class="dname">Handbrake <span class="stateword ok-txt">On</span></div><div class="dsub">GPIO 35 · analog</div></div><span class="dright"><button class="linklike" type="button" data-goto="settings">Manage</button></span></div>
+                        <div class="devrow"><span class="dic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/></svg></span><div><div class="dname">Clutch <span class="stateword" style="color:var(--tx3)">Off</span></div><div class="dsub">Not wired · no Tune section, no Dashboard bar</div></div><span class="dright"><button class="linklike" type="button" data-goto="settings">Manage</button></span></div>
+                        <div class="devrow"><span class="dic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 21v-8"/><circle cx="12" cy="8" r="3.4"/><path d="M7 21h10"/></svg></span><div><div class="dname">Shifter <span class="stateword ok-txt">On</span></div><div class="dsub">Sequential · up GPIO 25 · down GPIO 26 · H-pattern ready</div></div><span class="dright"><button class="linklike" type="button" data-goto="settings">Manage</button></span></div>
+                        <div class="devrow"><span class="dic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2.5" y="7" width="19" height="11" rx="5.5"/><circle cx="8" cy="12.5" r="1.6"/><circle cx="12" cy="12.5" r="1.6"/><circle cx="16" cy="12.5" r="1.6"/></svg></span><div><div class="dname">Buttons <span class="stateword ok-txt">On</span></div><div class="dsub">12 of 15 assigned · test them below</div></div><span class="dright"><button class="linklike" type="button" data-goto="settings">Manage</button></span></div>
+                        <div class="devrow"><span class="dic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><path d="M12 12l4.5-4.5"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/></svg></span><div><div class="dname">Encoders <span class="stateword ok-txt">On</span></div><div class="dsub">2 rotary encoders · pulse mode</div></div><span class="dright"><button class="linklike" type="button" data-goto="settings">Manage</button></span></div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="card" style="margin-bottom:12px">
+                    <h3>Buttons — press to test</h3>
+                    <div class="btngrid" id="btnGrid"></div>
+                  </div>
+
+                  <div class="card">
+                    <h3>LED &amp; Display</h3>
+                    <div class="wheelwrap" style="margin-top:14px">
+                      <svg width="240" height="240" viewBox="0 0 240 240" role="img" aria-label="Steering wheel with clickable RPM LEDs">
+                        <circle cx="120" cy="120" r="102" fill="none" stroke="var(--tx2)" stroke-width="17"/>
+                        <circle cx="120" cy="120" r="102" fill="none" stroke="var(--s3)" stroke-width="17" stroke-dasharray="2 6" opacity=".35"/>
+                        <path d="M36 148 L104 128 M204 148 L136 128 M120 218 L120 146" stroke="var(--tx2)" stroke-width="15" stroke-linecap="round"/>
+                        <circle cx="120" cy="122" r="27" fill="var(--s3)" stroke="var(--border-strong)"/>
+                        <text x="120" y="118" text-anchor="middle" fill="var(--tx)" font-size="13" font-weight="700">RSH</text>
+                        <text x="120" y="134" text-anchor="middle" fill="var(--tx2)" font-size="9">GEAR <tspan id="wheelGear" fill="var(--tx)" font-weight="700">4</tspan></text>
+                        <g id="wheelLeds"></g>
+                      </svg>
+                      <div style="flex:1;min-width:250px">
+                        <div class="bar-lab"><span>LED strip (15)</span></div>
+                        <div class="ledstrip" id="ledStrip"></div>
+                        <div class="slider-row">
+                          <div class="lab"><label for="rngBright" data-tip="Fifteen steps, like Fanatec. Set here, nowhere else.">Brightness</label><span class="val"><span id="rngBrightVal">9</span> / 15</span></div>
+                          <input type="range" id="rngBright" min="1" max="15" step="1" value="9" />
+                        </div>
+                        <div class="slider-row">
+                          <div class="lab"><label for="rngRpm">Test — engine RPM</label><span class="val"><span id="rngRpmVal">5200</span></span></div>
+                          <input type="range" id="rngRpm" min="0" max="9000" step="100" value="5200" />
+                        </div>
+                        <div class="switchrow"><div data-tip="Auto Preset = per-car patterns RSH ships. User Profile = your colours above win.">Pattern source</div>
+                          <div class="seg" role="group" aria-label="LED pattern source">
+                            <button type="button" id="ledAuto" aria-pressed="true">Auto Preset</button>
+                            <button type="button" id="ledUser" aria-pressed="false">User Profile</button>
+                          </div>
+                        </div>
+                        <div class="adv">
+                          <button class="expander" type="button" aria-expanded="false" data-exp="ledAdv">Advanced — per-LED thresholds, flash patterns, flag colours <span class="chev">▾</span></button>
+                          <div class="exp-body" id="ledAdv">
+                            <div class="slider-row">
+                              <div class="lab"><label for="rngShift" data-tip="The whole strip flashes when RPM passes this point.">Shift flash point</label><span class="val"><span id="rngShiftVal">8200</span> rpm</span></div>
+                              <input type="range" id="rngShift" min="4000" max="9000" step="100" value="8200" />
+                            </div>
+                            <div style="font-size:13.5px;font-weight:600;margin-top:12px" data-tip="Colour the strip shows for game flags: yellow caution, blue car behind, red stopped, white final lap. Click to pick.">Flag colour</div>
+                            <div class="flagrow" id="flagRow">
+                              <button class="flagsw sel" type="button" style="background:#f5d90a" aria-label="Yellow flag colour"></button>
+                              <button class="flagsw" type="button" style="background:#38bdf8" aria-label="Blue flag colour"></button>
+                              <button class="flagsw" type="button" style="background:#f0564b" aria-label="Red flag colour"></button>
+                              <button class="flagsw" type="button" style="background:#ffffff" aria-label="White flag colour"></button>
+                            </div>
+                            <div class="slider-row">
+                              <div class="lab"><label for="rngDisp" data-tip="What the wheel display shows first: gear, speed, lap or fuel. Drag to cycle.">Display page</label><span class="val" id="rngDispVal">Gear</span></div>
+                              <input type="range" id="rngDisp" min="0" max="3" step="1" value="0" />
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+                <!-- ================= TUNE ================= -->
+                <section class="page" data-page="tune">
+                  <div class="card savebar">
+                    <div><div class="sub">Only modules that are on appear here. Turn modules on or off in Settings.</div></div>
+                    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span class="sub" id="tuneSaveState">All changes saved</span><button class="abtn" type="button" id="tuneSaveBtn">Save to wheel</button></div>
+                  </div>
+
+                  <div class="tune-stack">
+                      <!-- STEERING -->
+                      <div class="module-card open" data-mod-section="steering">
+                        <button class="module-head rail-item active" type="button" data-rail="steering" aria-expanded="true"><span class="module-icon" style="background:var(--accent-deep)"><svg width='22' height='22' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.9'><circle cx='12' cy='12' r='9'/><circle cx='12' cy='12' r='2.6'/><path d='M12 3v6.5M3.5 15l6-2M20.5 15l-6-2'/></svg></span><span class="m-info"><span class="m-name">Steering <span class="chip">ON</span></span><span class="m-sub">Wheel axis · vJoy Axis X · Range, centre, curve & deadzone</span></span><span class="m-live"><b><span data-head-live='steering'>0°</span></b><span>Live angle</span></span><span class="m-open">Tuning open</span><span class="chev">▾</span></button>
+                        <div class="tune-sec active" data-tune-sec="steering">
+                        <h3>Steering</h3>
+                        <div class="sub">The wheel itself \u00b7 vJoy Axis X</div>
+                        <div class="tune-graph"><div class="tg-head"><b>Response graph</b><span>INPUT → OUTPUT</span></div><svg viewBox="0 0 220 110" role="img" aria-label="Response curve graph"><line x1="14" y1="96" x2="206" y2="96" stroke="var(--border-strong)"/><line x1="14" y1="96" x2="14" y2="10" stroke="var(--border-strong)"/><line x1="14" y1="96" x2="206" y2="10" stroke="var(--border-strong)" stroke-dasharray="4 4"/><polyline points="14,96 62,72 110,53 158,32 206,10" fill="none" stroke="var(--accent)" stroke-width="2.5"/><circle cx="62" cy="72" r="4" fill="var(--accent)"/><circle cx="110" cy="53" r="4" fill="var(--accent)"/><circle cx="158" cy="32" r="4" fill="var(--accent)"/></svg><div class="tg-foot"><span>0% input</span><span>Curve preview — changes with preset below</span><span>100% output</span></div></div>
+                        <div class="bar-wrap" style="margin-top:14px">
+                          <div class="bar-lab"><span>Live</span><b><span id="calSteerVal">0</span>\u00b0</b></div>
+                          <div class="bar signed"><span class="zero"></span><div class="fill" id="calSteerFill" style="background:var(--accent)"></div></div>
+                        </div>
+                        <div class="slider-row">
+                          <div class="lab"><label for="tRange" data-tip="How far you can turn the wheel, lock to lock. 540\u00b0 suits GT cars, 900\u00b0 road cars. The game should match this number.">Steering range</label><span class="val"><span id="tRangeVal">540</span>\u00b0</span></div>
+                          <input type="range" id="tRange" min="180" max="1080" step="10" value="540" />
+                        </div>
+                        <div class="slider-row">
+                          <div class="lab"><label data-tip="How wheel movement maps to the game. Linear is 1-to-1. Progressive is gentler near the centre. Custom opens the point editor under Advanced.">Response curve</label></div>
+                          <div class="seg curveseg" data-curve="steer" data-opens="steerAdv" role="group" aria-label="Steering curve preset">
+                            <button type="button" aria-pressed="true">Linear</button>
+                            <button type="button" aria-pressed="false">Progressive</button>
+                            <button type="button" aria-pressed="false">Custom</button>
+                          </div>
+                        </div>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+                          <button class="abtn" type="button" id="setCentreBtn">Set centre here</button>
+                          <span class="sub" id="centreMsg" style="align-self:center">Centre not set yet \u2014 straighten the wheel, then set it.</span>
+                        </div>
+                        <button class="expander" type="button" aria-expanded="false" data-exp="steerAdv">Advanced \u2014 curve points, sensor range, deadzone, smoothing <span class="chev">\u25be</span></button>
+                        <div class="exp-body" id="steerAdv">
+                          <div class="slider-row">
+                            <div class="lab"><label data-tip="Drag the middle points to bend how movement maps to the game. Endpoints stay fixed." data-learn="curve">Curve points</label><span class="val" style="font-size:12.5px;color:var(--tx2)">drag the points</span></div>
+                            <svg id="curveSvg" viewBox="0 0 300 170" style="width:100%;max-width:420px;background:var(--s2);border:1px solid var(--border);border-radius:14px;touch-action:none" role="img" aria-label="Steering response curve editor">
+                              <line x1="20" y1="150" x2="280" y2="150" stroke="var(--border-strong)"/>
+                              <line x1="20" y1="20" x2="20" y2="150" stroke="var(--border-strong)"/>
+                              <line x1="20" y1="150" x2="280" y2="20" stroke="var(--border-strong)" stroke-dasharray="4 4"/>
+                              <polyline id="curveLine" fill="none" stroke="var(--accent)" stroke-width="2.5"/>
+                              <g id="curvePts"></g>
+                            </svg>
+                          </div>
+                          <div style="font-size:13.5px;font-weight:600;margin-top:10px" data-tip="Drag the handles to match your sensor's real travel \u2014 minimum, centre, maximum. No typing.">Sensor range</div>
+                          <div class="calbar" id="calBar">
+                            <span class="track"></span><span class="fill" id="calFill"></span>
+                            <span class="hnd" id="calHMin" style="left:5.2%">MIN</span>
+                            <span class="hnd" id="calHCtr" style="left:50%">CTR</span>
+                            <span class="hnd" id="calHMax" style="left:94.8%">MAX</span>
+                          </div>
+                          <div class="calbar-lab"><span>Min <b id="calMinVal">212</b></span><span>Centre <b id="calCtrVal">2048</b></span><span>Max <b id="calMaxVal">3884</b></span></div>
+                          <div class="slider-row">
+                            <div class="lab"><label for="rngDz" data-tip="A small ignore-zone around the centre, so tiny wobbles don't move the car. Keep it as small as you can." data-learn="deadzone">Centre deadzone</label><span class="val"><span id="rngDzVal">1.0</span>%</span></div>
+                            <input type="range" id="rngDz" min="0" max="5" step="0.5" value="1" />
+                          </div>
+                          <div class="slider-row">
+                            <div class="lab"><label for="rngSmS" data-tip="Averages the last few sensor samples to remove jitter from the analog signal. Higher is steadier, a touch slower.">Signal smoothing</label><span class="val"><span id="rngSmSVal">2</span></span></div>
+                            <input type="range" id="rngSmS" min="0" max="10" step="1" value="2" />
+                          </div>
+                          <div class="switchrow"><div data-tip="Flips the axis \u2014 use it if turning right steers left in the game.">Invert axis</div><label class="tgl"><input type="checkbox" /><span class="tr"></span></label></div>
+                        </div>
+                      </div>
+
+                      <!-- THROTTLE -->
+                      </div>
+                    <div class="module-card" data-mod-section="throttle">
+                        <button class="module-head rail-item" type="button" data-rail="throttle" aria-expanded="false"><span class="module-icon" style="background:#65a30d"><svg width='22' height='22' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.9'><path d='M5 19V9M12 19V5M19 19v-8'/></svg></span><span class="m-info"><span class="m-name">Throttle <span class="chip">ON</span></span><span class="m-sub">Analog pedal · vJoy Axis Y · Calibration, deadzones & curve</span></span><span class="m-live"><b><span data-head-live='thr'>0%</span></b><span>Live travel</span></span><span class="m-open">Open tuning</span><span class="chev">▾</span></button>
+                        <div class="tune-sec" data-tune-sec="throttle">
+                        <h3>Throttle</h3>
+                        <div class="sub">Analog pedal \u00b7 vJoy Axis Y</div>
+                        <div class="tune-graph"><div class="tg-head"><b>Response graph</b><span>INPUT → OUTPUT</span></div><svg viewBox="0 0 220 110" role="img" aria-label="Response curve graph"><line x1="14" y1="96" x2="206" y2="96" stroke="var(--border-strong)"/><line x1="14" y1="96" x2="14" y2="10" stroke="var(--border-strong)"/><line x1="14" y1="96" x2="206" y2="10" stroke="var(--border-strong)" stroke-dasharray="4 4"/><polyline points="14,96 62,72 110,53 158,32 206,10" fill="none" stroke="var(--accent)" stroke-width="2.5"/><circle cx="62" cy="72" r="4" fill="var(--accent)"/><circle cx="110" cy="53" r="4" fill="var(--accent)"/><circle cx="158" cy="32" r="4" fill="var(--accent)"/></svg><div class="tg-foot"><span>0% input</span><span>Curve preview — changes with preset below</span><span>100% output</span></div></div>
+                        <div class="bar-wrap" style="margin-top:14px">
+                          <div class="bar-lab"><span>Live</span><b><span id="thrLiveVal">0</span>%</b></div>
+                          <div class="bar"><div class="fill" id="thrLiveFill" style="background:var(--lime);left:0"></div></div>
+                        </div>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">
+                          <span style="font-weight:600;font-size:13.5px">Calibrate:</span>
+                          <button class="abtn ghost small" type="button" data-calset="thr" data-side="min">Set rest (0%)</button>
+                          <button class="abtn ghost small" type="button" data-calset="thr" data-side="max">Set full (100%)</button>
+                          <span class="sub" id="calThrState">Not calibrated \u2014 full sensor range in use.</span>
+                        </div>
+                        <div class="slider-row">
+                          <div class="lab"><label for="rngDzT" data-tip="Ignores the first bit of pedal travel, so a resting foot doesn't creep the car forward." data-learn="deadzone">Bottom deadzone</label><span class="val"><span id="rngDzTVal">2.0</span>%</span></div>
+                          <input type="range" id="rngDzT" min="0" max="10" step="0.5" value="2" />
+                        </div>
+                        <div class="slider-row">
+                          <div class="lab"><label data-tip="Linear is 1-to-1. Progressive gives finer control in the first half of travel.">Response curve</label></div>
+                          <div class="seg curveseg" data-curve="thr" role="group" aria-label="Throttle curve preset">
+                            <button type="button" aria-pressed="true">Linear</button>
+                            <button type="button" aria-pressed="false">Progressive</button>
+                            <button type="button" aria-pressed="false">Custom</button>
+                          </div>
+                        </div>
+                        <button class="expander" type="button" aria-expanded="false" data-exp="thrAdv">Advanced \u2014 top deadzone, smoothing, invert <span class="chev">\u25be</span></button>
+                        <div class="exp-body" id="thrAdv">
+                          <div class="slider-row">
+                            <div class="lab"><label for="rngDzTT" data-tip="Ignores the last bit of travel, so a pedal that can't quite reach its sensor end still reads a full 100%.">Top deadzone</label><span class="val"><span id="rngDzTTVal">2.0</span>%</span></div>
+                            <input type="range" id="rngDzTT" min="0" max="10" step="0.5" value="2" />
+                          </div>
+                          <div class="slider-row">
+                            <div class="lab"><label for="rngSmT" data-tip="Averages the last few sensor samples to remove jitter from the analog signal.">Signal smoothing</label><span class="val"><span id="rngSmTVal">2</span></span></div>
+                            <input type="range" id="rngSmT" min="0" max="10" step="1" value="2" />
+                          </div>
+                          <div class="switchrow"><div data-tip="Flips the axis \u2014 use it if pressing the pedal lowers the value.">Invert axis</div><label class="tgl"><input type="checkbox" /><span class="tr"></span></label></div>
+                        </div>
+                      </div>
+
+                      <!-- BRAKE -->
+                      </div>
+                    <div class="module-card" data-mod-section="brake">
+                        <button class="module-head rail-item" type="button" data-rail="brake" aria-expanded="false"><span class="module-icon" style="background:#dc2626"><svg width='22' height='22' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.9'><circle cx='12' cy='12' r='8'/><path d='M12 7v5l3 2'/></svg></span><span class="m-info"><span class="m-name">Brake <span class="chip">ON</span></span><span class="m-sub">Analog pedal · vJoy Axis Z · Calibration, deadzones & curve</span></span><span class="m-live"><b><span data-head-live='brk'>0%</span></b><span>Live travel</span></span><span class="m-open">Open tuning</span><span class="chev">▾</span></button>
+                        <div class="tune-sec" data-tune-sec="brake">
+                        <h3>Brake</h3>
+                        <div class="sub">Analog pedal \u00b7 vJoy Axis Z</div>
+                        <div class="tune-graph"><div class="tg-head"><b>Response graph</b><span>INPUT → OUTPUT</span></div><svg viewBox="0 0 220 110" role="img" aria-label="Response curve graph"><line x1="14" y1="96" x2="206" y2="96" stroke="var(--border-strong)"/><line x1="14" y1="96" x2="14" y2="10" stroke="var(--border-strong)"/><line x1="14" y1="96" x2="206" y2="10" stroke="var(--border-strong)" stroke-dasharray="4 4"/><polyline points="14,96 62,72 110,53 158,32 206,10" fill="none" stroke="var(--accent)" stroke-width="2.5"/><circle cx="62" cy="72" r="4" fill="var(--accent)"/><circle cx="110" cy="53" r="4" fill="var(--accent)"/><circle cx="158" cy="32" r="4" fill="var(--accent)"/></svg><div class="tg-foot"><span>0% input</span><span>Curve preview — changes with preset below</span><span>100% output</span></div></div>
+                        <div class="bar-wrap" style="margin-top:14px">
+                          <div class="bar-lab"><span>Live</span><b><span id="brkLiveVal">0</span>%</b></div>
+                          <div class="bar"><div class="fill" id="brkLiveFill" style="background:var(--bad);left:0"></div></div>
+                        </div>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">
+                          <span style="font-weight:600;font-size:13.5px">Calibrate:</span>
+                          <button class="abtn ghost small" type="button" data-calset="brk" data-side="min">Set rest (0%)</button>
+                          <button class="abtn ghost small" type="button" data-calset="brk" data-side="max">Set full (100%)</button>
+                          <span class="sub" id="calBrkState">Not calibrated \u2014 full sensor range in use.</span>
+                        </div>
+                        <div class="slider-row">
+                          <div class="lab"><label for="rngDzB" data-tip="Ignores the first bit of brake travel, so a resting foot doesn't drag the brakes." data-learn="deadzone">Bottom deadzone</label><span class="val"><span id="rngDzBVal">2.0</span>%</span></div>
+                          <input type="range" id="rngDzB" min="0" max="10" step="0.5" value="2" />
+                        </div>
+                        <div class="slider-row">
+                          <div class="lab"><label data-tip="Linear is 1-to-1. Progressive gives finer control in the first half of travel \u2014 popular for brakes.">Response curve</label></div>
+                          <div class="seg curveseg" data-curve="brk" role="group" aria-label="Brake curve preset">
+                            <button type="button" aria-pressed="true">Linear</button>
+                            <button type="button" aria-pressed="false">Progressive</button>
+                            <button type="button" aria-pressed="false">Custom</button>
+                          </div>
+                        </div>
+                        <button class="expander" type="button" aria-expanded="false" data-exp="brkAdv">Advanced \u2014 top deadzone, smoothing, invert <span class="chev">\u25be</span></button>
+                        <div class="exp-body" id="brkAdv">
+                          <div class="slider-row">
+                            <div class="lab"><label for="rngDzBT" data-tip="Ignores the last bit of travel, so full braking still reads 100% even if the pedal can't reach its sensor end.">Top deadzone</label><span class="val"><span id="rngDzBTVal">2.0</span>%</span></div>
+                            <input type="range" id="rngDzBT" min="0" max="10" step="0.5" value="2" />
+                          </div>
+                          <div class="slider-row">
+                            <div class="lab"><label for="rngSmB" data-tip="Averages the last few sensor samples to remove jitter from the analog signal.">Signal smoothing</label><span class="val"><span id="rngSmBVal">2</span></span></div>
+                            <input type="range" id="rngSmB" min="0" max="10" step="1" value="2" />
+                          </div>
+                          <div class="switchrow"><div data-tip="Flips the axis \u2014 use it if pressing the pedal lowers the value.">Invert axis</div><label class="tgl"><input type="checkbox" /><span class="tr"></span></label></div>
+                        </div>
+                      </div>
+
+                      <!-- CLUTCH (hidden until switched ON in Settings) -->
+                      </div>
+                    <div class="module-card" data-mod-section="clutch" style="display:none">
+                        <button class="module-head rail-item" type="button" data-rail="clutch" aria-expanded="false"><span class="module-icon" style="background:#d97706"><svg width='22' height='22' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.9'><path d='M4 17h16M7 17V9M17 17V9M7 9h10'/></svg></span><span class="m-info"><span class="m-name">Clutch <span class="chip">ON</span></span><span class="m-sub">Analog pedal · vJoy Axis Rx · Calibration, deadzones & curve</span></span><span class="m-live"><b><span data-head-live='clu'>0%</span></b><span>Live travel</span></span><span class="m-open">Open tuning</span><span class="chev">▾</span></button>
+                        <div class="tune-sec" data-tune-sec="clutch">
+                        <h3>Clutch</h3>
+                        <div class="sub">Analog pedal \u00b7 vJoy Axis Rx</div>
+                        <div class="tune-graph"><div class="tg-head"><b>Response graph</b><span>INPUT → OUTPUT</span></div><svg viewBox="0 0 220 110" role="img" aria-label="Response curve graph"><line x1="14" y1="96" x2="206" y2="96" stroke="var(--border-strong)"/><line x1="14" y1="96" x2="14" y2="10" stroke="var(--border-strong)"/><line x1="14" y1="96" x2="206" y2="10" stroke="var(--border-strong)" stroke-dasharray="4 4"/><polyline points="14,96 62,72 110,53 158,32 206,10" fill="none" stroke="var(--accent)" stroke-width="2.5"/><circle cx="62" cy="72" r="4" fill="var(--accent)"/><circle cx="110" cy="53" r="4" fill="var(--accent)"/><circle cx="158" cy="32" r="4" fill="var(--accent)"/></svg><div class="tg-foot"><span>0% input</span><span>Curve preview — changes with preset below</span><span>100% output</span></div></div>
+                        <div class="bar-wrap" style="margin-top:14px">
+                          <div class="bar-lab"><span>Live</span><b><span id="cluLiveVal">0</span>%</b></div>
+                          <div class="bar"><div class="fill" id="cluLiveFill" style="background:var(--warn);left:0"></div></div>
+                        </div>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">
+                          <span style="font-weight:600;font-size:13.5px">Calibrate:</span>
+                          <button class="abtn ghost small" type="button" data-calset="clu" data-side="min">Set rest (0%)</button>
+                          <button class="abtn ghost small" type="button" data-calset="clu" data-side="max">Set full (100%)</button>
+                          <span class="sub" id="calCluState">Not calibrated \u2014 full sensor range in use.</span>
+                        </div>
+                        <div class="slider-row">
+                          <div class="lab"><label for="rngDzC" data-tip="Ignores the first bit of pedal travel, so a resting foot doesn't slip the clutch." data-learn="deadzone">Bottom deadzone</label><span class="val"><span id="rngDzCVal">2.0</span>%</span></div>
+                          <input type="range" id="rngDzC" min="0" max="10" step="0.5" value="2" />
+                        </div>
+                        <div class="slider-row">
+                          <div class="lab"><label data-tip="Linear is 1-to-1. Progressive moves the bite point later in the travel.">Response curve</label></div>
+                          <div class="seg curveseg" data-curve="clu" role="group" aria-label="Clutch curve preset">
+                            <button type="button" aria-pressed="true">Linear</button>
+                            <button type="button" aria-pressed="false">Progressive</button>
+                            <button type="button" aria-pressed="false">Custom</button>
+                          </div>
+                        </div>
+                        <button class="expander" type="button" aria-expanded="false" data-exp="cluAdv">Advanced \u2014 top deadzone, smoothing, invert <span class="chev">\u25be</span></button>
+                        <div class="exp-body" id="cluAdv">
+                          <div class="slider-row">
+                            <div class="lab"><label for="rngDzCT" data-tip="Ignores the last bit of travel, so the clutch still reads a full 100% at the end of its travel.">Top deadzone</label><span class="val"><span id="rngDzCTVal">2.0</span>%</span></div>
+                            <input type="range" id="rngDzCT" min="0" max="10" step="0.5" value="2" />
+                          </div>
+                          <div class="slider-row">
+                            <div class="lab"><label for="rngSmC" data-tip="Averages the last few sensor samples to remove jitter from the analog signal.">Signal smoothing</label><span class="val"><span id="rngSmCVal">2</span></span></div>
+                            <input type="range" id="rngSmC" min="0" max="10" step="1" value="2" />
+                          </div>
+                          <div class="switchrow"><div data-tip="Flips the axis \u2014 use it if pressing the pedal lowers the value.">Invert axis</div><label class="tgl"><input type="checkbox" /><span class="tr"></span></label></div>
+                        </div>
+                      </div>
+
+                      <!-- HANDBRAKE -->
+                      </div>
+                    <div class="module-card" data-mod-section="handbrake">
+                        <button class="module-head rail-item" type="button" data-rail="handbrake" aria-expanded="false"><span class="module-icon" style="background:#ea580c"><svg width='22' height='22' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.9'><path d='M6 20L14 6M14 6l3-2M6 20h12'/></svg></span><span class="m-info"><span class="m-name">Handbrake <span class="chip">ON</span></span><span class="m-sub">Analog lever · vJoy Axis Ry · Calibration, deadzones & curve</span></span><span class="m-live"><b><span data-head-live='hb'>0%</span></b><span>Live pull</span></span><span class="m-open">Open tuning</span><span class="chev">▾</span></button>
+                        <div class="tune-sec" data-tune-sec="handbrake">
+                        <h3>Handbrake</h3>
+                        <div class="sub">Analog lever \u00b7 vJoy Axis Ry \u00b7 same template as a pedal</div>
+                        <div class="tune-graph"><div class="tg-head"><b>Response graph</b><span>INPUT → OUTPUT</span></div><svg viewBox="0 0 220 110" role="img" aria-label="Response curve graph"><line x1="14" y1="96" x2="206" y2="96" stroke="var(--border-strong)"/><line x1="14" y1="96" x2="14" y2="10" stroke="var(--border-strong)"/><line x1="14" y1="96" x2="206" y2="10" stroke="var(--border-strong)" stroke-dasharray="4 4"/><polyline points="14,96 62,72 110,53 158,32 206,10" fill="none" stroke="var(--accent)" stroke-width="2.5"/><circle cx="62" cy="72" r="4" fill="var(--accent)"/><circle cx="110" cy="53" r="4" fill="var(--accent)"/><circle cx="158" cy="32" r="4" fill="var(--accent)"/></svg><div class="tg-foot"><span>0% input</span><span>Curve preview — changes with preset below</span><span>100% output</span></div></div>
+                        <div class="bar-wrap" style="margin-top:14px">
+                          <div class="bar-lab"><span>Live</span><b><span id="hbLiveVal">0</span>%</b></div>
+                          <div class="bar"><div class="fill" id="hbLiveFill" style="background:var(--orange);left:0"></div></div>
+                        </div>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">
+                          <span style="font-weight:600;font-size:13.5px">Calibrate:</span>
+                          <button class="abtn ghost small" type="button" data-calset="hb" data-side="min">Set rest (0%)</button>
+                          <button class="abtn ghost small" type="button" data-calset="hb" data-side="max">Set full (100%)</button>
+                          <span class="sub" id="calHbState">Not calibrated \u2014 full sensor range in use.</span>
+                        </div>
+                        <div class="slider-row">
+                          <div class="lab"><label for="rngDzH" data-tip="Ignores the first bit of lever travel, so a resting hand or cable slack doesn't apply the brake." data-learn="deadzone">Bottom deadzone</label><span class="val"><span id="rngDzHVal">3.0</span>%</span></div>
+                          <input type="range" id="rngDzH" min="0" max="10" step="0.5" value="3" />
+                        </div>
+                        <div class="slider-row">
+                          <div class="lab"><label data-tip="Linear is 1-to-1. Progressive gives finer control early in the pull.">Response curve</label></div>
+                          <div class="seg curveseg" data-curve="hb" role="group" aria-label="Handbrake curve preset">
+                            <button type="button" aria-pressed="true">Linear</button>
+                            <button type="button" aria-pressed="false">Progressive</button>
+                            <button type="button" aria-pressed="false">Custom</button>
+                          </div>
+                        </div>
+                        <button class="expander" type="button" aria-expanded="false" data-exp="hbAdv">Advanced \u2014 top deadzone, smoothing, invert <span class="chev">\u25be</span></button>
+                        <div class="exp-body" id="hbAdv">
+                          <div class="slider-row">
+                            <div class="lab"><label for="rngDzHT" data-tip="Ignores the last bit of travel, so a full pull still reads 100%.">Top deadzone</label><span class="val"><span id="rngDzHTVal">2.0</span>%</span></div>
+                            <input type="range" id="rngDzHT" min="0" max="10" step="0.5" value="2" />
+                          </div>
+                          <div class="slider-row">
+                            <div class="lab"><label for="rngSmH" data-tip="Averages the last few sensor samples to remove jitter from the analog signal.">Signal smoothing</label><span class="val"><span id="rngSmHVal">2</span></span></div>
+                            <input type="range" id="rngSmH" min="0" max="10" step="1" value="2" />
+                          </div>
+                          <div class="switchrow"><div data-tip="Flips the axis \u2014 use it if pulling the lever lowers the value.">Invert axis</div><label class="tgl"><input type="checkbox" /><span class="tr"></span></label></div>
+                        </div>
+                      </div>
+
+                      <!-- SHIFTER -->
+                      </div>
+                    <div class="module-card" data-mod-section="shifter">
+                        <button class="module-head rail-item" type="button" data-rail="shifter" aria-expanded="false"><span class="module-icon" style="background:#0891b2"><svg width='22' height='22' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.9'><path d='M6 4v16M12 4v16M18 4v16M6 12h12'/></svg></span><span class="m-info"><span class="m-name">Shifter <span class="chip">ON</span></span><span class="m-sub">Digital gates · Sequential / H-pattern · Mode, gate test & debounce</span></span><span class="m-live"><b id="headGate">N</b><span>Current gate</span></span><span class="m-open">Open tuning</span><span class="chev">▾</span></button>
+                        <div class="tune-sec" data-tune-sec="shifter">
+                        <h3>Shifter</h3>
+                        <div class="sub">Digital switches \u00b7 no axis, so no curve or deadzone \u2014 mode and test only</div>
+                        <div class="slider-row">
+                          <div class="lab"><label data-tip="Sequential uses the up/down switches. H-pattern reads one switch per gate. Both were decided for RSH \u2014 the mode you pick here is what the firmware reports.">Mode</label></div>
+                          <div class="seg" id="shifterModeSeg" role="group" aria-label="Shifter mode">
+                            <button type="button" aria-pressed="true" data-gatemode="seq">Sequential</button>
+                            <button type="button" aria-pressed="false" data-gatemode="h">H-pattern</button>
+                          </div>
+                        </div>
+                        <div style="font-size:13.5px;font-weight:600;margin-top:12px">Gate test \u2014 <span style="color:var(--tx2);font-weight:400">click a gate to test it; the live gate lights up while driving</span></div>
+                        <div class="gategrid" id="gateGrid">
+                          <button class="gatecell active" type="button" data-gate="N">N</button>
+                          <button class="gatecell" type="button" data-gate="1">1</button>
+                          <button class="gatecell" type="button" data-gate="2">2</button>
+                          <button class="gatecell" type="button" data-gate="3">3</button>
+                          <button class="gatecell" type="button" data-gate="4">4</button>
+                          <button class="gatecell" type="button" data-gate="5">5</button>
+                          <button class="gatecell" type="button" data-gate="6">6</button>
+                          <button class="gatecell" type="button" data-gate="R">R</button>
+                        </div>
+                        <div class="sub" style="margin-top:10px">Current gate: <b style="color:var(--tx)" id="gateNow">N</b></div>
+                        <button class="expander" type="button" aria-expanded="false" data-exp="shfAdv">Advanced \u2014 debounce <span class="chev">\u25be</span></button>
+                        <div class="exp-body" id="shfAdv">
+                          <div class="slider-row">
+                            <div class="lab"><label for="rngDeb" data-tip="Ignores repeat switch bounces within this time, so one shift never registers twice. Raise it only if you see double shifts.">Debounce</label><span class="val"><span id="rngDebVal">8</span> ms</span></div>
+                            <input type="range" id="rngDeb" min="0" max="50" step="1" value="8" />
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- HORN & IGNITION -->
+                      </div>
+                    <div class="module-card" data-mod-section="buttons">
+                        <button class="module-head rail-item" type="button" data-rail="buttons" aria-expanded="false"><span class="module-icon" style="background:#7c3aed"><svg width='22' height='22' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.9'><circle cx='12' cy='12' r='3'/><path d='M12 2v4M18.5 5.5l-2.5 2.5M22 12h-4M18.5 18.5L16 16M12 22v-4M5.5 18.5L8 16M2 12h4M5.5 5.5L8 8'/></svg></span><span class="m-info"><span class="m-name">Horn & Ignition <span class="chip">ON</span></span><span class="m-sub">Momentary buttons · Test, latch behaviour — no fake sliders</span></span><span class="m-live"><b id="headIgn">ON</b><span>Ignition</span></span><span class="m-open">Open tuning</span><span class="chev">▾</span></button>
+                        <div class="tune-sec" data-tune-sec="buttons">
+                        <h3>Horn &amp; ignition</h3>
+                        <div class="sub">Plain buttons \u2014 a button has no travel, so there is no curve or deadzone to tune. Test here; assignment lives in Settings.</div>
+                        <div class="switchrow" style="margin-top:8px">
+                          <div style="display:flex;align-items:center;gap:10px"><span class="livedot" id="hornDot"></span><div>Horn<div class="d" style="color:var(--tx2);font-size:12.5px">Momentary \u00b7 sounds while held</div></div></div>
+                          <span style="display:flex;gap:8px"><button class="abtn ghost small" type="button" data-testbtn="horn">Test</button><button class="linklike" type="button" data-goto="settings">Assignment \u2192</button></span>
+                        </div>
+                        <div class="switchrow">
+                          <div style="display:flex;align-items:center;gap:10px"><span class="livedot on" id="ignDot"></span><div>Ignition<div class="d" style="color:var(--tx2);font-size:12.5px">Momentary button \u00b7 the app latches ON/OFF; starter works only while ignition is ON</div></div></div>
+                          <span style="display:flex;gap:8px"><button class="abtn ghost small" type="button" data-testbtn="ign">Test</button><button class="linklike" type="button" data-goto="settings">Assignment \u2192</button></span>
+                        </div>
+                      </div>
+
+                      <!-- ENCODERS -->
+                      </div>
+                    <div class="module-card" data-mod-section="encoders">
+                        <button class="module-head rail-item" type="button" data-rail="encoders" aria-expanded="false"><span class="module-icon" style="background:#475569"><svg width='22' height='22' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.9'><circle cx='12' cy='12' r='8'/><path d='M12 12L12 5'/><circle cx='12' cy='12' r='1.6' fill='currentColor'/></svg></span><span class="m-info"><span class="m-name">Rotary Encoders <span class="chip">ON</span></span><span class="m-sub">2 encoders · Pulses per step, direction & live step test</span></span><span class="m-live"><b id="headEnc">0</b><span>Steps</span></span><span class="m-open">Open tuning</span><span class="chev">▾</span></button>
+                        <div class="tune-sec" data-tune-sec="encoders">
+                        <h3>Rotary encoders</h3>
+                        <div class="sub">2 encoders \u00b7 Pulse/Axis mode is assignment \u2014 set in Settings</div>
+                        <div class="slider-row">
+                          <div class="lab"><label for="rngEncSteps" data-tip="How many encoder pulses make one step the game sees. Higher = finer, slower adjustments (brake bias, TC).">Pulses per step</label><span class="val"><span id="rngEncStepsVal">2</span></span></div>
+                          <input type="range" id="rngEncSteps" min="1" max="8" step="1" value="2" />
+                        </div>
+                        <div style="display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap">
+                          <span style="font-weight:600;font-size:13.5px">Test \u2014 step counter:</span>
+                          <b style="font-size:19px" id="encCount">0</b>
+                          <button class="abtn ghost small" type="button" id="encMinus">Turn \u2212</button>
+                          <button class="abtn ghost small" type="button" id="encPlus">Turn +</button>
+                        </div>
+                        <button class="expander" type="button" aria-expanded="false" data-exp="encAdv">Advanced \u2014 direction <span class="chev">\u25be</span></button>
+                        <div class="exp-body" id="encAdv">
+                          <div class="switchrow"><div data-tip="Inverted swaps clockwise and counter-clockwise for both encoders.">Direction</div>
+                            <div class="seg dirseg" role="group" aria-label="Encoder direction">
+                              <button type="button" aria-pressed="true">Normal</button>
+                              <button type="button" aria-pressed="false">Inverted</button>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="diag-line" data-mod-offnote="clutch" style="margin-top:12px"><span>＋</span><span><b>Clutch is Off.</b> Turn it on in Settings \u2192 Modules &amp; pins and its Tune section, Dashboard bar and Monitor row appear automatically. <button class="linklike" type="button" data-goto="settings">Open Settings</button></span></div>
+                </section>
+
+                <!-- ================= PROFILES ================= -->
+                <section class="page" data-page="profiles">
+                  <div class="card" style="margin-bottom:12px">
+                    <h3>Start from a preset</h3>
+                    <div class="preset-grid" style="margin-top:14px">
+                      <button class="card preset sel" type="button" data-preset="GT — Balanced"><h4>GT — Balanced</h4><span class="spec"><span>540° range</span><span>Linear curve</span><span>Deadzone 1%</span></span></button>
+                      <button class="card preset" type="button" data-preset="Formula — Sharp"><h4>Formula — Sharp</h4><span class="spec"><span>360° range</span><span>Progressive curve</span><span>Deadzone 0.5%</span></span></button>
+                      <button class="card preset" type="button" data-preset="Rally / Road — Calm"><h4>Rally / Road — Calm</h4><span class="spec"><span>900° range</span><span>Linear curve</span><span>Deadzone 2%</span></span></button>
+                    </div>
+                  </div>
+                  <div class="grid2">
+                    <div class="card">
+                      <h3>Automatic switching</h3>
+                      <div class="autoswitch" role="group" aria-label="Automatic profile switching">
+                        <button type="button" data-as="off" aria-pressed="false">Off<small>Switch by hand</small></button>
+                        <button type="button" data-as="game" aria-pressed="true">Per game<small>Use when this game starts</small></button>
+                        <button type="button" data-as="car" aria-pressed="false">Per car<small>Use for this car in this game</small></button>
+                      </div>
+                    </div>
+                    <div class="card">
+                      <h3>My profiles</h3>
+                      <div style="margin-top:10px">
+                        <div class="switchrow"><div>My baseline</div><button class="abtn ghost small" type="button">Load</button></div>
+                        <div class="switchrow"><div>ACC — GT3 night</div><button class="abtn ghost small" type="button">Load</button></div>
+                      </div>
+                      <div class="sub" style="margin-top:12px">Import / export lives in Settings → Profiles — the files are portable JSON either way.</div>
+                    </div>
+                  </div>
+                  <div class="card">
+                    <h3>Game launcher</h3>
+                    <div style="margin-top:6px">
+                      <div class="gamerow"><div><div class="gname">Assetto Corsa Competizione</div><div class="gsub">Installed · last played today</div></div><select class="sel game-profile"><option>GT — Balanced</option><option>Formula — Sharp</option><option>Rally / Road — Calm</option><option>My baseline</option></select><button class="abtn small launch-btn" type="button" data-game="Assetto Corsa Competizione">Launch</button></div>
+                      <div class="gamerow"><div><div class="gname">Assetto Corsa</div><div class="gsub">Installed · last played last week</div></div><select class="sel game-profile"><option>My baseline</option><option>GT — Balanced</option><option>Formula — Sharp</option><option>Rally / Road — Calm</option></select><button class="abtn small launch-btn" type="button" data-game="Assetto Corsa">Launch</button></div>
+                      <div class="gamerow"><div><div class="gname">iRacing</div><div class="gsub">Installed</div></div><select class="sel game-profile"><option>Formula — Sharp</option><option>GT — Balanced</option><option>Rally / Road — Calm</option><option>My baseline</option></select><button class="abtn small launch-btn" type="button" data-game="iRacing">Launch</button></div>
+                      <div class="gamerow"><div><div class="gname">EA SPORTS WRC</div><div class="gsub">Not detected</div></div><button class="abtn ghost small" type="button" style="margin-left:auto">Locate game…</button></div>
+                    </div>
+                    <div class="sub" id="launchMsg" style="margin-top:10px"></div>
+                  </div>
+                </section>
+
+                <!-- ================= MONITOR ================= -->
+                <section class="page" data-page="monitor">
+                  <div style="border:1.5px dashed var(--border-strong);border-radius:14px;padding:10px 14px;margin-bottom:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+                    <span style="font-size:12.5px;color:var(--tx2)"><b style="color:var(--tx)">Preview controls</b> (not part of the app) — try the link states:</span>
+                    <button class="abtn ghost small" type="button" data-link="good">Link good</button>
+                    <button class="abtn ghost small" type="button" data-link="lossy">Packets dropping</button>
+                    <button class="abtn ghost small" type="button" data-link="down">Wheel off</button>
+                  </div>
+                  <div class="grid2">
+                    <div class="card">
+                      <h3>Inputs</h3>
+                      <div class="bar-wrap" data-mod-section="steering">
+                        <div class="bar-lab"><span>Steering</span><b><span id="monSteerVal">0</span>°</b></div>
+                        <div class="bar signed"><span class="zero"></span><div class="fill" id="monSteerFill" style="background:var(--accent)"></div></div>
+                      </div>
+                      <div class="bar-wrap" data-mod-section="throttle">
+                        <div class="bar-lab"><span style="color:var(--lime)">Throttle</span><b><span id="monThrVal">0</span>%</b></div>
+                        <div class="bar"><div class="fill" id="monThrFill" style="background:var(--lime);left:0"></div></div>
+                      </div>
+                      <div class="bar-wrap" data-mod-section="brake">
+                        <div class="bar-lab"><span style="color:var(--bad)">Brake</span><b><span id="monBrkVal">0</span>%</b></div>
+                        <div class="bar"><div class="fill" id="monBrkFill" style="background:var(--bad);left:0"></div></div>
+                      </div>
+                      <div class="bar-wrap" data-mod-section="handbrake">
+                        <div class="bar-lab"><span style="color:var(--orange)">Handbrake</span><b><span id="monHbVal">0</span>%</b></div>
+                        <div class="bar"><div class="fill" id="monHbFill" style="background:var(--orange);left:0"></div></div>
+                      </div>
+                      <div class="bar-wrap" data-mod-section="clutch" style="display:none">
+                        <div class="bar-lab"><span style="color:var(--warn)">Clutch</span><b><span id="monCluVal">0</span>%</b></div>
+                        <div class="bar"><div class="fill" id="monCluFill" style="background:var(--warn);left:0"></div></div>
+                      </div>
+                    </div>
+                    <div class="card">
+                      <h3>Output to game</h3>
+                      <div class="bar-wrap">
+                        <div class="bar-lab"><span>Output</span><b><span id="monOutVal">0</span>%<span class="clipflag" id="monClip">AT LIMIT</span></b></div>
+                        <div class="bar" style="height:18px"><div class="fill" id="monOutFill" style="background:var(--ok);left:0"></div><div class="peak" id="monOutPeak" style="left:0%"></div></div>
+                      </div>
+                      <div class="bar-lab" style="margin-top:4px"><span data-tip="The output axis hit its end stop — the response curve is pushing past the calibrated range. Lower the curve bend or recalibrate the module on Tune.">Saturation</span><b>flags at 100%</b></div>
+                      <div style="margin-top:14px">
+                        <div class="switchrow"><div>Active profile</div><b id="monProfile">GT — Balanced</b></div>
+                        <div class="switchrow"><div>Mode</div><b id="monMode">Simple</b></div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="grid2">
+                    <div class="card">
+                      <h3>Game output (vJoy)</h3>
+                      <div class="switchrow"><div data-tip="vJoy device 1 · driver 2.2.2.0 detected. Turning this off is a safety action — RSH asks first, and the wheel goes neutral, never frozen mid-turn.">Send output to games</div><label class="tgl"><input type="checkbox" id="outToggle" checked /><span class="tr"></span></label></div>
+                      <div class="diag-line" id="outDiag"><span>✓</span><span><b>Output on.</b> Writing to vJoy at 200/sec.</span></div>
+                    </div>
+                    <div class="card">
+                      <h3>Mapping summary</h3>
+                      <div style="margin-top:8px">
+                        <div class="switchrow"><div>Steering</div><b>Axis X</b></div>
+                        <div class="switchrow"><div>Throttle</div><b>Axis Y</b></div>
+                        <div class="switchrow"><div>Brake</div><b>Axis Z</b></div>
+                        <div class="switchrow"><div>Handbrake</div><b>Axis Ry</b></div>
+                        <div class="switchrow"><div>Wheel buttons</div><b>Buttons 1–15</b></div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="card" style="margin-bottom:12px">
+                    <h3>Link health</h3>
+                    <div class="grid4" style="margin-top:12px">
+                      <div class="stat"><div class="lbl">Packets / sec</div><div class="big" id="monPps">200</div><div class="range">target 200</div></div>
+                      <div class="stat"><div class="lbl">Lost</div><div class="big"><span id="monLoss">0.4</span><span class="unit">%</span></div><div class="range">healthy under 1%</div></div>
+                      <div class="stat"><div class="lbl">Last packet</div><div class="big"><span id="monAge">4</span><span class="unit">ms ago</span></div><div class="range">healthy under 25</div></div>
+                      <div class="stat"><div class="lbl">Signal</div><div class="big" id="monRssi">−52 <span class="unit">dBm</span></div><div class="range">healthy above −65</div></div>
+                    </div>
+                    <canvas class="spark" id="lossSpark" width="900" height="56" aria-label="Packet loss history graph"></canvas>
+                    <div class="diag-line" id="diagLine"><span id="diagIcon">✓</span><span id="diagText"><b>Link good.</b> Packets are arriving on time — drive.</span></div>
+                  </div>
+                  <div class="grid2">
+                    <div class="card">
+                      <h3>Diagnostics</h3>
+                      <div class="diag-line" style="margin-top:10px"><span>✓</span><span><b>Nothing wrong found.</b> Link, wheel, output and versions all check out.</span></div>
+                      <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+                        <button class="abtn" type="button" id="copyDiagBtn">Copy diagnostics</button>
+                        <button class="abtn ghost" type="button">Run self-test</button>
+                      </div>
+                      <div class="sub" id="copyMsg" style="margin-top:8px">Versions, link stats, faults and settings — in plain words.</div>
+                    </div>
+                    <div class="card">
+                      <h3>Recent events</h3>
+                      <div class="logbox" style="margin-top:12px" id="logBox">
+                        <div><span class="t">21:02:11</span> app started · RSH 2.0 preview · Windows 11</div>
+                        <div><span class="t">21:02:12</span> wheel found · RSH Wheel · signal −52 dBm</div>
+                        <div><span class="t">21:02:12</span> profile loaded · GT — Balanced · auto-switch per game</div>
+                        <div><span class="t">21:02:13</span> vJoy output started · device 1 · 200 Hz</div>
+                        <div><span class="t">21:04:47</span> <span class="w">link degraded 240 ms · 3 packets late · recovered, no failsafe</span></div>
+                        <div><span class="t">21:04:47</span> failsafe NOT triggered · under the 200 ms threshold</div>
+                      </div>
+                      <div class="adv">
+                        <button class="expander" type="button" aria-expanded="false" data-exp="diagAdv">Advanced — filters, raw packet log, export <span class="chev">▾</span></button>
+                        <div class="exp-body" id="diagAdv">
+                          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+                            <select class="sel"><option>All events</option><option>Link only</option><option>Faults only</option><option>Packets (raw)</option></select>
+                            <button class="abtn ghost small" type="button">Export log file…</button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+                <!-- ================= SETTINGS ================= -->
+                <section class="page" data-page="settings">
+                  <div class="card" style="margin-bottom:12px">
+                    <h3>Modules &amp; pins</h3>
+                    <div style="margin-top:8px">
+                      <div class="pinrow"><span class="pname">Steering</span><label class="tgl"><input type="checkbox" class="mod-tgl" data-module="steering" checked /><span class="tr"></span></label><span class="psrc">analog · ADC1</span><select class="sel pin-sel"><option>GPIO 34</option><option>GPIO 35</option><option>ADS1115 · A0</option></select></div>
+                      <div class="pinrow"><span class="pname">Throttle</span><label class="tgl"><input type="checkbox" class="mod-tgl" data-module="throttle" checked /><span class="tr"></span></label><span class="psrc">analog · ADC1</span><select class="sel pin-sel"><option>GPIO 32</option><option>GPIO 34</option><option>ADS1115 · A1</option></select></div>
+                      <div class="pinrow"><span class="pname">Brake</span><label class="tgl"><input type="checkbox" class="mod-tgl" data-module="brake" checked /><span class="tr"></span></label><span class="psrc">analog · ADC1</span><select class="sel pin-sel"><option>GPIO 33</option><option>GPIO 35</option><option>ADS1115 · A2</option></select></div>
+                      <div class="pinrow"><span class="pname">Clutch</span><label class="tgl"><input type="checkbox" class="mod-tgl" data-module="clutch" /><span class="tr"></span></label><span class="psrc">analog · not assigned</span><select class="sel pin-sel"><option>Not assigned</option><option>GPIO 36</option><option>ADS1115 · A3</option></select></div>
+                      <div class="pinrow"><span class="pname">Handbrake</span><label class="tgl"><input type="checkbox" class="mod-tgl" data-module="handbrake" checked /><span class="tr"></span></label><span class="psrc">analog · ADC1</span><select class="sel pin-sel"><option>GPIO 35</option><option>GPIO 39</option><option>PCF8574 · P0 (digital)</option></select></div>
+                      <div class="pinrow"><span class="pname">Shifter up</span><label class="tgl"><input type="checkbox" class="mod-tgl" data-module="shifter" checked /><span class="tr"></span></label><span class="psrc">digital · shifter module</span><select class="sel pin-sel"><option>GPIO 25</option><option>GPIO 27</option><option>MCP23017 · GPA0</option></select></div>
+                      <div class="pinrow"><span class="pname">Shifter down</span><span class="psrc">digital</span><select class="sel pin-sel"><option>GPIO 26</option><option>GPIO 14</option><option>MCP23017 · GPA1</option></select></div>
+                      <div class="pinrow"><span class="pname">Horn</span><label class="tgl"><input type="checkbox" class="mod-tgl" data-module="buttons" checked /><span class="tr"></span></label><span class="psrc">digital · buttons module</span><select class="sel pin-sel"><option>GPIO 27</option><option>GPIO 13</option><option>MCP23017 · GPA2</option></select></div>
+                      <div class="pinrow"><span class="pname">Ignition</span><span class="psrc">digital · momentary</span><select class="sel pin-sel"><option>GPIO 14</option><option>GPIO 12</option><option>MCP23017 · GPA3</option></select></div>
+                      <div class="pinrow"><span class="pname">Encoders</span><label class="tgl"><input type="checkbox" class="mod-tgl" data-module="encoders" checked /><span class="tr"></span></label><span class="psrc">digital · 2 rotary</span><select class="sel pin-sel"><option>GPIO 16 / 17</option><option>GPIO 18 / 19</option><option>MCP23017 · GPA4 / 5</option></select></div>
+                    </div>
+                    <button class="expander" type="button" aria-expanded="false" data-exp="pinsAdv">I2C bus — expanders <span class="chev">▾</span></button>
+                    <div class="exp-body" id="pinsAdv">
+                      <div class="switchrow"><div data-tip="SDA GPIO 21 · SCL GPIO 22 · 400 kHz. Expander reads are scheduled so the 200 Hz input loop never waits on the bus.">I2C bus</div><span class="chip">ADS1115 · 0x48</span></div>
+                      <div class="sub" style="margin-top:6px">An OFF module never reaches the game — no ghost readings from unconnected pins.</div>
+                    </div>
+                  </div>
+
+                  <div class="card" style="margin-bottom:12px">
+                    <h3>Button &amp; encoder assignment</h3>
+                    <div style="margin-top:8px">
+                      <div class="pinrow"><span class="pname">Paddle −</span><select class="sel assign-sel"><option selected>Button 1</option><option>Button 2</option><option>Button 3</option><option>Button 4</option><option>Button 5</option><option>Button 6</option></select></div>
+                      <div class="pinrow"><span class="pname">Paddle +</span><select class="sel assign-sel"><option>Button 1</option><option selected>Button 2</option><option>Button 3</option><option>Button 4</option><option>Button 5</option><option>Button 6</option></select></div>
+                      <div class="pinrow"><span class="pname">Horn</span><select class="sel assign-sel"><option>Button 1</option><option>Button 2</option><option selected>Button 3</option><option>Button 4</option><option>Button 5</option><option>Button 6</option></select></div>
+                      <div class="pinrow"><span class="pname">Ignition</span><select class="sel assign-sel"><option>Button 1</option><option>Button 2</option><option>Button 3</option><option selected>Button 4</option><option>Button 5</option><option>Button 6</option></select></div>
+                      <div class="pinrow"><span class="pname">Pit limiter</span><select class="sel assign-sel"><option>Button 1</option><option>Button 2</option><option>Button 3</option><option>Button 4</option><option selected>Button 5</option><option>Button 6</option></select></div>
+                      <div class="pinrow"><span class="pname">DRS</span><select class="sel assign-sel"><option>Button 1</option><option>Button 2</option><option>Button 3</option><option>Button 4</option><option>Button 5</option><option selected>Button 6</option></select></div>
+                      <div class="pinrow"><span class="pname">Encoder 1 mode</span><span class="psrc">Pulse = button pairs · Axis = vJoy axis</span><select class="sel assign-sel"><option selected>Pulse</option><option>Axis</option></select></div>
+                      <div class="pinrow"><span class="pname">Encoder 2 mode</span><span class="psrc">Pulse = button pairs · Axis = vJoy axis</span><select class="sel assign-sel"><option selected>Pulse</option><option>Axis</option></select></div>
+                    </div>
+                  </div>
+
+                  <div class="card" style="margin-bottom:12px">
+                    <h3>App settings</h3>
+                    <div class="switchrow"><div data-tip="Off unless you choose it. This switch exists only here.">Start RSH when Windows starts</div><label class="tgl"><input type="checkbox" /><span class="tr"></span></label></div>
+                    <div class="switchrow"><div data-tip="Your wheel keeps working while you race. “Exit” in the tray menu stops RSH fully.">Keep running in the tray when the window closes</div><label class="tgl"><input type="checkbox" checked /><span class="tr"></span></label></div>
+                    <div class="switchrow"><div data-tip="For autostart users who race right away.">Start minimised to tray</div><label class="tgl"><input type="checkbox" /><span class="tr"></span></label></div>
+                    <div class="adv">
+                      <button class="expander" type="button" aria-expanded="false" data-exp="setAdv">Advanced — updates, logging, reset <span class="chev">▾</span></button>
+                      <div class="exp-body" id="setAdv">
+                        <div class="switchrow"><div>Update channel</div><select class="sel"><option>Stable</option><option>Beta</option></select></div>
+                        <div class="switchrow"><div>Log detail</div><select class="sel"><option>Normal</option><option>Verbose (support)</option></select></div>
+                        <div class="switchrow"><div data-tip="Profiles, calibration and settings back to first-run defaults.">Reset everything</div><button class="abtn ghost small" type="button">Reset…</button></div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="card" style="margin-bottom:12px">
+                    <h3>Profiles — import &amp; export</h3>
+                    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+                      <button class="abtn ghost small" type="button">Import profile…</button>
+                      <button class="abtn ghost small" type="button">Export active…</button>
+                    </div>
+                  </div>
+                  <div class="card">
+                    <h3>Firmware — update &amp; recovery</h3>
+                    <div style="margin-top:8px">
+                      <div class="switchrow"><div>Wheel firmware</div><b>3.3 · up to date</b></div>
+                      <div class="switchrow"><div>App version</div><b>RSH 2.0</b></div>
+                    </div>
+                    <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+                      <button class="abtn" type="button" id="fwCheckBtn">Check for updates</button>
+                      <button class="abtn ghost" type="button">Update firmware…</button>
+                    </div>
+                    <div class="sub" id="fwMsg" style="margin-top:8px">Updates come from GitHub Releases, verified before flashing. A failed update rolls back automatically.</div>
+                    <div style="border-top:1px solid var(--border);margin-top:14px;padding-top:12px">
+                      <div style="font-weight:650" data-tip="If a board stops answering after an update, recovery reflashes it over USB — no special tools. Profiles and calibration are kept on the PC.">Recovery</div>
+                      <button class="abtn ghost" type="button">Enter recovery mode…</button>
+                    </div>
+                  </div>
+                </section>
+              </div><!-- /content -->
+            </div><!-- /main -->
+          </div><!-- /shell -->
+
+          <!-- ============ Wizard overlay ============ -->
+          <div class="overlay" id="wizardOverlay" role="dialog" aria-modal="true" aria-label="First-run setup wizard">
+            <div class="wiz">
+              <div class="whead"><span class="step-lbl" id="wizStepLbl">Step 1 of 5</span><button class="linklike" type="button" id="wizSkipTop">Skip setup ✕</button></div>
+              <div class="wstep active" data-wstep="1">
+                <h3>Welcome to RSH</h3>
+                <p>Setup takes about a minute — or skip it and start with safe defaults.</p>
+                <div style="display:grid;gap:10px;margin-top:14px">
+                  <button class="card preset sel" type="button" style="text-align:left"><h4>Quick setup (recommended)</h4><p>Find the wheel, set the centre, pick a feel.</p></button>
+                  <button class="card preset" type="button" style="text-align:left"><h4>Custom setup</h4><p>Same steps, Advanced options open.</p></button>
+                </div>
+              </div>
+              <div class="wstep" data-wstep="2">
+                <h3>Find your wheel</h3>
+                <p>Make sure the wheel is switched on and you're on the same Wi-Fi.</p>
+                <div class="scanbar" id="wizScan"><i></i></div>
+                <div id="wizFound" style="display:none">
+                  <div class="diag-line"><span>✓</span><span><b>RSH Wheel found.</b> Signal strong (−52 dBm). Firmware 4.0.0 — up to date, nothing to update before you drive.</span></div>
+                </div>
+                <p id="wizScanning" class="sub">Looking…</p>
+              </div>
+              <div class="wstep" data-wstep="3">
+                <h3>Calibrate centre + range</h3>
+                <p>Calibration lives on the Tune page. Turn lock-to-lock, set the centre, then come back.</p>
+                <button class="abtn" type="button" id="wizGotoCal">Open the Tune page</button>
+                <p class="sub" style="margin-top:12px">Wheel-only is fine — no pedal step is forced.</p>
+              </div>
+              <div class="wstep" data-wstep="4">
+                <h3>Pick a starting feel</h3>
+                <p>This creates your first profile. Fine-tune later on Tune.</p>
+                <div style="display:grid;gap:10px;margin-top:12px">
+                  <button class="card preset sel" type="button" style="text-align:left" data-wpreset="GT — Balanced"><h4>GT</h4><p>540° · balanced</p></button>
+                  <button class="card preset" type="button" style="text-align:left" data-wpreset="Formula — Sharp"><h4>Formula</h4><p>360° · sharp</p></button>
+                  <button class="card preset" type="button" style="text-align:left" data-wpreset="Rally / Road — Calm"><h4>Rally / Road</h4><p>900° · calm</p></button>
+                </div>
+              </div>
+              <div class="wstep" data-wstep="5">
+                <h3>You're ready to race</h3>
+                <p>Wheel: <b style="color:var(--tx)">RSH Wheel</b> · Profile: <b style="color:var(--tx)" id="wizSummaryProfile">GT — Balanced</b> · Output to games: <b style="color:var(--tx)">on</b></p>
+                <p>Start-with-Windows lives in <b style="color:var(--tx)">Settings</b>.</p>
+              </div>
+              <div class="wfoot">
+                <button class="abtn ghost" type="button" id="wizBack">Back</button>
+                <span class="sub" id="wizDots">● ○ ○ ○ ○</span>
+                <span style="display:flex;gap:8px">
+                  <button class="abtn ghost" type="button" id="wizSkip">Skip this step</button>
+                  <button class="abtn" type="button" id="wizNext">Next</button>
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <!-- ============ Help modal ============ -->
+          <div class="overlay" id="helpOverlay" role="dialog" aria-modal="true" aria-label="Help">
+            <div class="wiz helpmodal">
+              <div class="whead"><span class="step-lbl">Help</span><button class="linklike" type="button" data-closehelp>Close ✕</button></div>
+              <div id="helpBody"></div>
+              <div class="wfoot"><span></span><button class="abtn" type="button" data-closehelp>Done</button></div>
+            </div>
+          </div>
+
+          <div class="tourring" id="tourRing"></div>
+          <div class="tourcard" id="tourCard">
+            <h4 id="tourTitle"></h4>
+            <p id="tourText"></p>
+            <div style="display:flex;justify-content:space-between;align-items:center">
+              <button class="linklike" type="button" id="tourSkip">Skip tour</button>
+              <span class="sub" id="tourCount"></span>
+              <button class="abtn small" type="button" id="tourNext">Next</button>
+            </div>
+          </div>
+        </div><!-- /app -->
+      </div><!-- /appframe -->
+
+      </div><!-- /wrap -->
+
+    <script>
+    (function(){
+      "use strict";
+      var app = document.getElementById('app');
+      var frame = document.getElementById('appFrame');
+      var $ = function(id){ return document.getElementById(id); };
+      var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+      /* ---------- Navigation ---------- */
+      var titles = { dashboard:'Dashboard', devices:'Devices', tune:'Tune', profiles:'Profiles', monitor:'Monitor', settings:'Settings' };
+      function gotoPage(name){
+        var items = document.querySelectorAll('.nav-item');
+        for (var i=0;i<items.length;i++) items[i].classList.toggle('active', items[i].getAttribute('data-page')===name);
+        var pages = document.querySelectorAll('.page');
+        for (var j=0;j<pages.length;j++) pages[j].classList.toggle('active', pages[j].getAttribute('data-page')===name);
+        $('pageTitle').textContent = titles[name] || name;
+        $('content').scrollTop = 0;
+      }
+      var navItems = document.querySelectorAll('.nav-item');
+      for (var n=0;n<navItems.length;n++) navItems[n].addEventListener('click', function(){ gotoPage(this.getAttribute('data-page')); });
+      var gotos = document.querySelectorAll('[data-goto]');
+      for (var g=0;g<gotos.length;g++) gotos[g].addEventListener('click', function(){ gotoPage(this.getAttribute('data-goto')); });
+
+      /* ---------- Simple / Advanced ---------- */
+      function setMode(mode){
+        app.setAttribute('data-mode', mode);
+        $('modeSimple').setAttribute('aria-pressed', mode==='simple' ? 'true':'false');
+        $('modeAdvanced').setAttribute('aria-pressed', mode==='advanced' ? 'true':'false');
+        $('monMode').textContent = mode==='simple' ? 'Simple' : 'Advanced';
+      }
+      $('modeSimple').addEventListener('click', function(){ setMode('simple'); });
+      $('modeAdvanced').addEventListener('click', function(){ setMode('advanced'); });
+
+      /* ---------- Theme (single control: top-bar switch) ---------- */
+      function setTheme(th){
+        app.setAttribute('data-theme', th);
+        $('themeDark').setAttribute('aria-pressed', th==='dark' ? 'true':'false');
+        $('themeLight').setAttribute('aria-pressed', th==='light' ? 'true':'false');
+        drawSpark();
+      }
+      $('themeDark').addEventListener('click', function(){ setTheme('dark'); });
+      $('themeLight').addEventListener('click', function(){ setTheme('light'); });
+
+      /* ---------- Profiles ---------- */
+      var dot = $('unsavedDot');
+      function setProfile(name){
+        $('profileName').textContent = name;
+        $('dashProfile').textContent = name;
+        $('monProfile').textContent = name;
+        dot.classList.remove('on');
+        $('checkProfile').classList.add('done');
+      }
+      function closeMenus(){ $('profileMenu').classList.remove('open'); $('helpMenu').classList.remove('open'); $('profileBtn').setAttribute('aria-expanded','false'); $('helpBtn').setAttribute('aria-expanded','false'); }
+      $('profileBtn').addEventListener('click', function(e){ e.stopPropagation(); var m=$('profileMenu'); var open=m.classList.contains('open'); closeMenus(); if(!open){ m.classList.add('open'); this.setAttribute('aria-expanded','true'); } });
+      $('helpBtn').addEventListener('click', function(e){ e.stopPropagation(); var m=$('helpMenu'); var open=m.classList.contains('open'); closeMenus(); if(!open){ m.classList.add('open'); this.setAttribute('aria-expanded','true'); } });
+      document.addEventListener('click', function(){ closeMenus(); });
+      var pItems = $('profileMenu').querySelectorAll('[data-profile]');
+      for (var p=0;p<pItems.length;p++) pItems[p].addEventListener('click', function(){ setProfile(this.getAttribute('data-profile')); closeMenus(); });
+      var presets = document.querySelectorAll('.preset[data-preset]');
+      for (var pr=0;pr<presets.length;pr++) presets[pr].addEventListener('click', function(){
+        var all = document.querySelectorAll('.preset[data-preset]');
+        for (var k=0;k<all.length;k++) all[k].classList.toggle('sel', all[k]===this);
+        setProfile(this.getAttribute('data-preset'));
+      });
+      var asBtns = document.querySelectorAll('.autoswitch button');
+      for (var a=0;a<asBtns.length;a++) asBtns[a].addEventListener('click', function(){
+        for (var k=0;k<asBtns.length;k++) asBtns[k].setAttribute('aria-pressed', asBtns[k]===this ? 'true':'false');
+      });
+
+      /* ---------- Game launcher ---------- */
+      var launchBtns = document.querySelectorAll('.launch-btn');
+      for (var lb=0; lb<launchBtns.length; lb++) launchBtns[lb].addEventListener('click', function(){
+        var row = this.closest('.gamerow');
+        var sel = row ? row.querySelector('.game-profile') : null;
+        var prof = sel ? sel.value : '';
+        if (prof) setProfile(prof);
+        $('launchMsg').innerHTML = 'Launching <b style="color:var(--tx)">' + this.getAttribute('data-game') + '</b> — profile <b style="color:var(--tx)">' + prof + '</b> loads automatically when the game starts.';
+      });
+
+      /* ---------- Pin Setup changes mark the profile unsaved ---------- */
+      var pinSels = document.querySelectorAll('.pin-sel');
+      for (var ps=0; ps<pinSels.length; ps++) pinSels[ps].addEventListener('change', function(){ dot.classList.add('on'); });
+
+      /* ---------- Expanders ---------- */
+      var exps = document.querySelectorAll('.expander');
+      for (var e=0;e<exps.length;e++) exps[e].addEventListener('click', function(){
+        var body = $(this.getAttribute('data-exp'));
+        var open = body.classList.toggle('open');
+        this.setAttribute('aria-expanded', open ? 'true':'false');
+      });
+
+      /* ---------- Slider labels + unsaved dot ---------- */
+      function paintRange(el){
+        var min = Number(el.min||0), max = Number(el.max||100);
+        el.style.setProperty('--p', ((Number(el.value)-min)/(max-min)*100)+'%');
+      }
+      function bindSlider(id, valId, fmt){
+        var el = $(id); if(!el) return;
+        paintRange(el);
+        el.addEventListener('input', function(){
+          paintRange(el);
+          var v = el.value;
+          if (valId) $(valId).textContent = fmt ? fmt(v) : v;
+          dot.classList.add('on');
+          syncSummary();
+        });
+      }
+      function syncSummary(){
+        if ($('sumRange') && $('tRange')) $('sumRange').textContent = $('tRange').value;
+      }
+      function pct1(v){ return Number(v).toFixed(1); }
+      bindSlider('tRange','tRangeVal');
+      bindSlider('rngDz','rngDzVal', pct1); bindSlider('rngDzT','rngDzTVal', pct1); bindSlider('rngDzB','rngDzBVal', pct1);
+      bindSlider('rngDzC','rngDzCVal', pct1); bindSlider('rngDzH','rngDzHVal', pct1);
+      bindSlider('rngDzTT','rngDzTTVal', pct1); bindSlider('rngDzBT','rngDzBTVal', pct1);
+      bindSlider('rngDzCT','rngDzCTVal', pct1); bindSlider('rngDzHT','rngDzHTVal', pct1);
+      bindSlider('rngSmS','rngSmSVal'); bindSlider('rngSmT','rngSmTVal'); bindSlider('rngSmB','rngSmBVal');
+      bindSlider('rngSmC','rngSmCVal'); bindSlider('rngSmH','rngSmHVal');
+      bindSlider('rngDeb','rngDebVal'); bindSlider('rngEncSteps','rngEncStepsVal');
+      bindSlider('rngBright','rngBrightVal');
+      bindSlider('rngRpm','rngRpmVal');
+      bindSlider('rngShift','rngShiftVal');
+      var dispNames = ['Gear','Speed','Lap','Fuel'];
+      bindSlider('rngDisp', null, null);
+      $('rngDisp').addEventListener('input', function(){ $('rngDispVal').textContent = dispNames[Number(this.value)]; });
+
+      /* ---------- Calibration sensor-range drag bar (visual only, no typing) ---------- */
+      (function(){
+        var bar = $('calBar'); if (!bar) return;
+        var vals = { min:212, ctr:2048, max:3884 };
+        var hnds = { min:$('calHMin'), ctr:$('calHCtr'), max:$('calHMax') };
+        var outs = { min:$('calMinVal'), ctr:$('calCtrVal'), max:$('calMaxVal') };
+        function paintCal(){
+          for (var k in vals){ hnds[k].style.left = (vals[k]/4095*100)+'%'; outs[k].textContent = vals[k]; }
+          var fill = $('calFill');
+          fill.style.left = (vals.min/4095*100)+'%';
+          fill.style.width = ((vals.max-vals.min)/4095*100)+'%';
+        }
+        paintCal();
+        var dragKey = null;
+        function barVal(ev){
+          var r = bar.getBoundingClientRect();
+          var cx = (ev.touches ? ev.touches[0].clientX : ev.clientX);
+          return Math.round(Math.max(0, Math.min(1, (cx - r.left)/r.width)) * 4095);
+        }
+        function startDrag(key){ return function(ev){ dragKey = key; ev.preventDefault(); }; }
+        for (var k2 in hnds) hnds[k2].addEventListener('pointerdown', startDrag(k2));
+        document.addEventListener('pointermove', function(ev){
+          if (!dragKey) return;
+          var v = barVal(ev);
+          if (dragKey==='min') vals.min = Math.min(v, vals.ctr - 50);
+          else if (dragKey==='max') vals.max = Math.max(v, vals.ctr + 50);
+          else vals.ctr = Math.max(vals.min + 50, Math.min(vals.max - 50, v));
+          paintCal(); dot.classList.add('on');
+        });
+        document.addEventListener('pointerup', function(){ dragKey = null; });
+      })();
+
+      /* ---------- Encoder mode segment + flag colour swatches ---------- */
+      var encBtns = document.querySelectorAll('.encseg button');
+      for (var eb=0; eb<encBtns.length; eb++) encBtns[eb].addEventListener('click', function(){
+        for (var k=0;k<encBtns.length;k++) encBtns[k].setAttribute('aria-pressed', encBtns[k]===this ? 'true':'false');
+        dot.classList.add('on');
+      });
+      var flagSws = document.querySelectorAll('#flagRow .flagsw');
+      for (var fs=0; fs<flagSws.length; fs++) flagSws[fs].addEventListener('click', function(){
+        for (var k=0;k<flagSws.length;k++) flagSws[k].classList.toggle('sel', flagSws[k]===this);
+        dot.classList.add('on');
+      });
+
+      /* ---------- Help modal ---------- */
+      var helpTexts = {
+        range:{ t:'Steering range', b:'<p>The range is how far the wheel turns lock to lock, in degrees. Set it here once, then set the same number in the game — if the two disagree, the car steers more or less than your hands expect.</p><p>540 suits GT cars, 360 formula cars, 900 road cars. The presets on the Profiles page set sensible starting points per style.</p>' },
+        curve:{ t:'Response curve', b:'<p>The curve maps your hand movement to the game\'s steering. A straight diagonal line is 1-to-1 — the safest starting point.</p><p>Bend the middle down to make the car calmer around the centre (good for road cars); bend it up for a sharper centre (formula cars). Change one thing, drive a stint, then judge. Drag the points on the Tune page to try it.</p>' },
+        deadzone:{ t:'Deadzones', b:'<p>A deadzone ignores the first (or last) slice of travel. The bottom deadzone stops a resting foot from creeping the car; the top deadzone makes sure a pedal that cannot quite reach its sensor end still reads a full 100%.</p><p>Keep deadzones as small as you can — every percent added is travel thrown away. If a value jitters at rest, fix that with signal smoothing in the Advanced part of the same section, not with a bigger deadzone.</p>' },
+        page:{ t:'Help for this page', b:'<p>Every control in RSH carries a plain-English explanation — tap or hover the setting itself to see it; there are no separate ? icons. The six settings people misunderstand most (steering range, response curve, deadzones, shifter mode, link quality) also have a short help page like this one, linked from their hints.</p><p>Stuck? Monitor → Diagnostics → “Copy diagnostics” gathers everything support needs in one click.</p>' },
+        keys:{ t:'Keyboard shortcuts', b:'<p><span class="kbd">1</span>–<span class="kbd">9</span>, <span class="kbd">0</span> — on the Devices page, light up buttons 1–10 (same as clicking them).</p><p><span class="kbd">Tab</span> — move through every control; focus outlines stay visible on both themes. <span class="kbd">Esc</span> — close menus, the wizard and this help.</p>' }
+      };
+      function openHelp(key){
+        var h = helpTexts[key] || helpTexts.page;
+        $('helpBody').innerHTML = '<h3 style="font-size:18px;margin:4px 0 8px;color:var(--tx)">'+h.t+'</h3>' + h.b;
+        $('helpOverlay').classList.add('open');
+      }
+      function closeHelp(){ $('helpOverlay').classList.remove('open'); }
+      var closers = document.querySelectorAll('[data-closehelp]');
+      for (var c=0;c<closers.length;c++) closers[c].addEventListener('click', closeHelp);
+      $('hmHelp').addEventListener('click', function(){ closeMenus(); openHelp('page'); });
+      $('hmKeys').addEventListener('click', function(){ closeMenus(); openHelp('keys'); });
+      $('hmChecklist').addEventListener('click', function(){ closeMenus(); $('checklistCard').style.display=''; gotoPage('dashboard'); });
+      $('dismissChecklist').addEventListener('click', function(){ $('checklistCard').style.display='none'; });
+
+      /* ---------- Tooltips ---------- */
+      var tip = document.createElement('div'); tip.className='tooltip'; frame.appendChild(tip);
+      var tipTimer = null, tipTarget = null;
+      function showTip(btn){
+        var fr = frame.getBoundingClientRect(), r = btn.getBoundingClientRect();
+        tip.innerHTML = '';
+        var span = document.createElement('span'); span.textContent = btn.getAttribute('data-tip'); tip.appendChild(span);
+        if (btn.getAttribute('data-learn')){
+          var lm = document.createElement('button'); lm.className='lm'; lm.type='button'; lm.textContent='Learn more →';
+          lm.addEventListener('click', function(){ hideTip(); openHelp(btn.getAttribute('data-learn')); });
+          tip.appendChild(document.createElement('br')); tip.appendChild(lm);
+        }
+        tip.classList.add('show');
+        var x = r.left - fr.left + frame.scrollLeft, y = r.bottom - fr.top + frame.scrollTop + 8;
+        x = Math.max(6, Math.min(x, frame.clientWidth - 262));
+        tip.style.left = x+'px'; tip.style.top = y+'px';
+      }
+      function hideTip(){ tip.classList.remove('show'); tipTarget=null; }
+      var tipBtns = app.querySelectorAll('[data-tip]');
+      for (var tI=0;tI<tipBtns.length;tI++){
+        (function(btn){
+          btn.addEventListener('mouseenter', function(){ tipTarget=btn; clearTimeout(tipTimer); tipTimer=setTimeout(function(){ showTip(btn); }, 420); });
+          btn.addEventListener('mouseleave', function(){ clearTimeout(tipTimer); setTimeout(function(){ if(tipTarget===btn) hideTip(); }, 120); });
+          btn.addEventListener('click', function(e){ e.stopPropagation(); clearTimeout(tipTimer); if(tipTarget===btn && tip.classList.contains('show')) hideTip(); else { tipTarget=btn; showTip(btn); } });
+          btn.addEventListener('blur', hideTip);
+        })(tipBtns[tI]);
+      }
+
+      /* ---------- Buttons grid (Devices page) ---------- */
+      var btnNames = ['Paddle −','Paddle +','Horn','Ignition','Pit limiter','DRS','Radio','Menu','Look left','Look right','Start','Wipers'];
+      var grid = $('btnGrid'), cells = [];
+      for (var b=0;b<btnNames.length;b++){
+        var cell = document.createElement('button'); cell.type='button'; cell.className='btcell';
+        cell.innerHTML = '<b>'+(b+1)+'</b>'+btnNames[b];
+        (function(c){ c.addEventListener('click', function(){ pressCell(c); }); })(cell);
+        grid.appendChild(cell); cells.push(cell);
+      }
+      function pressCell(c){ c.classList.add('pressed'); setTimeout(function(){ c.classList.remove('pressed'); }, 650); }
+      document.addEventListener('keydown', function(ev){
+        if (!document.querySelector('.page[data-page="devices"]').classList.contains('active')) return;
+        var map = {'1':0,'2':1,'3':2,'4':3,'5':4,'6':5,'7':6,'8':7,'9':8,'0':9};
+        if (map.hasOwnProperty(ev.key)) pressCell(cells[map[ev.key]]);
+        if (ev.key === 'Escape'){ closeHelp(); closeWizard(); endTour(); }
+      });
+
+      /* ---------- Driving-activity heatmap (Dashboard) ---------- */
+      (function buildHeat(){
+        var days = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+        var hours = ['9a','11a','1p','3p','5p','7p','9p'];
+        var g = $('heatGrid'); if (!g) return;
+        var html = '<span></span>' + days.map(function(d){ return '<span class="hday">'+d+'</span>'; }).join('');
+        for (var r=0;r<hours.length;r++){
+          html += '<span class="hhour">'+hours[r]+'</span>';
+          for (var cc=0;cc<7;cc++){
+            var v = (r*3 + cc*5 + ((r+cc)%4)*2 + (cc>=5 ? 3 : 0) + (r>=4 ? 2 : 0)) % 9;
+            var a = v===0 ? 0 : (0.14 + v*0.105);
+            html += '<span class="hcell" style="background:rgba(139,92,246,'+a.toFixed(2)+')" title="'+days[cc]+' '+hours[r]+'"></span>';
+          }
+        }
+        g.innerHTML = html;
+      })();
+
+      /* ---------- Curve editor ---------- */
+      var curvePts = [ {x:20,y:150},{x:85,y:117},{x:150,y:85},{x:215,y:52},{x:280,y:20} ];
+      var ptsG = $('curvePts'), line = $('curveLine');
+      function drawCurve(){
+        line.setAttribute('points', curvePts.map(function(p){ return p.x+','+p.y; }).join(' '));
+        ptsG.innerHTML='';
+        curvePts.forEach(function(p, idx){
+          var cEl = document.createElementNS('http://www.w3.org/2000/svg','circle');
+          cEl.setAttribute('cx', p.x); cEl.setAttribute('cy', p.y); cEl.setAttribute('r', 7);
+          cEl.setAttribute('fill','var(--accent)'); cEl.setAttribute('stroke','var(--bg)'); cEl.setAttribute('stroke-width','2');
+          cEl.setAttribute('data-idx', idx); cEl.style.cursor='grab';
+          ptsG.appendChild(cEl);
+        });
+      }
+      drawCurve();
+      var dragIdx = null;
+      function svgPoint(ev){
+        var svg = $('curveSvg'), r = svg.getBoundingClientRect();
+        var cx = (ev.touches ? ev.touches[0].clientX : ev.clientX), cy = (ev.touches ? ev.touches[0].clientY : ev.clientY);
+        return { x:(cx-r.left)/r.width*300, y:(cy-r.top)/r.height*170 };
+      }
+      $('curveSvg').addEventListener('pointerdown', function(ev){
+        var p = svgPoint(ev), best=1e9;
+        curvePts.forEach(function(pt, idx){ var d=(pt.x-p.x)*(pt.x-p.x)+(pt.y-p.y)*(pt.y-p.y); if(d<best){ best=d; dragIdx=idx; } });
+        if (best > 1600) dragIdx = null;
+        if (dragIdx!==null){ this.setPointerCapture(ev.pointerId); ev.preventDefault(); }
+      });
+      $('curveSvg').addEventListener('pointermove', function(ev){
+        if (dragIdx===null || dragIdx===0 || dragIdx===curvePts.length-1) return;
+        var p = svgPoint(ev);
+        curvePts[dragIdx].y = Math.max(20, Math.min(150, p.y));
+        drawCurve(); dot.classList.add('on');
+      });
+      $('curveSvg').addEventListener('pointerup', function(){ dragIdx=null; });
+
+      /* ---------- LED & Display (Devices page) ---------- */
+      var palette = ['#a3e635','#8b5cf6','#f5d90a','#f0a13e','#f0564b','#38bdf8','#c084fc','#ffffff'];
+      var ledColors = [], i;
+      for (i=0;i<15;i++) ledColors.push(i<5?0:(i<10?2:4));
+      var strip = $('ledStrip'), ledBtns = [], wheelG = $('wheelLeds'), wheelLeds = [];
+      for (i=0;i<15;i++){
+        var lb = document.createElement('button'); lb.type='button'; lb.className='led'; lb.setAttribute('aria-label','LED '+(i+1));
+        strip.appendChild(lb); ledBtns.push(lb);
+        var ang = (-66 + i*(132/14)) * Math.PI/180;
+        var wc = document.createElementNS('http://www.w3.org/2000/svg','circle');
+        wc.setAttribute('cx', 120 + 86*Math.sin(ang)); wc.setAttribute('cy', 120 - 86*Math.cos(ang)); wc.setAttribute('r', 7.5);
+        wc.style.cursor='pointer';
+        wheelG.appendChild(wc); wheelLeds.push(wc);
+        (function(idx){
+          lb.addEventListener('click', function(){ ledColors[idx]=(ledColors[idx]+1)%palette.length; paintLeds(); });
+          wheelLeds[idx].addEventListener('click', function(){ ledColors[idx]=(ledColors[idx]+1)%palette.length; paintLeds(); });
+        })(i);
+      }
+      var flashOn = true;
+      setInterval(function(){ flashOn = !flashOn; paintLeds(); }, 420);
+      function paintLeds(){
+        var rpm = Number($('rngRpm').value), bright = Number($('rngBright').value);
+        var lit = Math.round(rpm/9000*15), flashing = rpm >= Number($('rngShift').value);
+        var gear = Math.min(6, 1 + Math.floor(rpm/1700)); $('wheelGear').textContent = gear; if ($('dashGear')) $('dashGear').textContent = gear;
+        for (var k=0;k<15;k++){
+          var on = k < lit && (!flashing || flashOn);
+          var col = palette[ledColors[k]];
+          ledBtns[k].style.background = on ? col : 'var(--s2)';
+          ledBtns[k].style.color = col;
+          ledBtns[k].style.opacity = on ? (0.45 + 0.55*(bright/15)) : 1;
+          ledBtns[k].classList.toggle('on', on);
+          wheelLeds[k].setAttribute('fill', on ? col : 'var(--s2)');
+          wheelLeds[k].setAttribute('stroke', col); wheelLeds[k].setAttribute('stroke-width','1.6');
+          wheelLeds[k].style.opacity = on ? (0.45 + 0.55*(bright/15)) : 1;
+        }
+      }
+      $('rngRpm').addEventListener('input', paintLeds);
+      $('rngBright').addEventListener('input', paintLeds);
+      paintLeds();
+      function ledSeg(which){
+        $('ledAuto').setAttribute('aria-pressed', which==='auto'?'true':'false');
+        $('ledUser').setAttribute('aria-pressed', which==='user'?'true':'false');
+      }
+      $('ledAuto').addEventListener('click', function(){ ledSeg('auto'); });
+      $('ledUser').addEventListener('click', function(){ ledSeg('user'); });
+
+      /* ---------- Output toggle / misc buttons ---------- */
+      $('outToggle').addEventListener('change', function(){
+        $('outDiag').innerHTML = this.checked
+          ? '<span>✓</span><span><b>Output on.</b> Writing to vJoy at 200/sec.</span>'
+          : '<span>!</span><span><b>Output off.</b> Games cannot see the wheel. Values went neutral first.</span>';
+        $('outDiag').className = 'diag-line' + (this.checked ? '' : ' warn');
+      });
+      $('copyDiagBtn').addEventListener('click', function(){
+        var txt = 'RSH diagnostics (preview)\nApp: RSH 2.0 · Firmware: 3.3 · vJoy 2.2.2.0\nWheel: RSH Wheel · signal -52 dBm · battery 86%\nLink: 200 pps · loss 0.4% · jitter 3.1 ms\nProfile: GT - Balanced · Mode: Simple\nLast fault: none (link degraded 240 ms at 21:04, recovered)';
+        function done(){ $('copyMsg').textContent = 'Copied ✓ — paste it into your message to support.'; }
+        if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(done, done); else done();
+      });
+      $('findWheelBtn').addEventListener('click', function(){ var b=this; b.textContent='Looking…'; setTimeout(function(){ b.textContent='Find wheel again'; }, 1200); });
+      $('setCentreBtn').addEventListener('click', function(){ $('centreMsg').innerHTML = '<span class="ok-txt"><b>Centre set ✓</b></span> — the bar sits at 0° when the wheel is straight.'; });
+      $('fwCheckBtn').addEventListener('click', function(){ var b=this; b.textContent='Checking…'; setTimeout(function(){ b.textContent='Check for updates'; $('fwMsg').innerHTML = '<span class="ok-txt"><b>Up to date ✓</b></span> — firmware 3.3 and app 2.0 are the latest on the Stable channel.'; }, 1100); });
+
+      /* ---------- Wizard ---------- */
+      var wizStep = 1, wizTimer = null;
+      function showStep(nS){
+        wizStep = nS;
+        var steps = document.querySelectorAll('.wstep');
+        for (var s=0;s<steps.length;s++) steps[s].classList.toggle('active', Number(steps[s].getAttribute('data-wstep'))===nS);
+        $('wizStepLbl').textContent = 'Step '+nS+' of 5';
+        var dots=''; for (var d=1;d<=5;d++) dots += (d===nS?'●':'○') + (d<5?' ':'');
+        $('wizDots').textContent = dots;
+        $('wizBack').style.visibility = nS===1 ? 'hidden':'visible';
+        $('wizNext').textContent = nS===5 ? 'Start racing' : 'Next';
+        if (nS===2){
+          $('wizFound').style.display='none'; $('wizScanning').style.display=''; $('wizScan').style.display='';
+          clearTimeout(wizTimer);
+          wizTimer = setTimeout(function(){ $('wizFound').style.display=''; $('wizScanning').style.display='none'; $('wizScan').style.display='none'; }, reduced ? 200 : 1600);
+        }
+      }
+      function openWizard(){ $('wizardOverlay').classList.add('open'); showStep(1); }
+      function closeWizard(){ $('wizardOverlay').classList.remove('open'); }
+      $('openWizardBtn').addEventListener('click', openWizard);
+      $('dashWizardBtn').addEventListener('click', openWizard);
+      $('wizSkipTop').addEventListener('click', closeWizard);
+      $('wizSkip').addEventListener('click', function(){ if (wizStep<5) showStep(wizStep+1); else closeWizard(); });
+      $('wizBack').addEventListener('click', function(){ if (wizStep>1) showStep(wizStep-1); });
+      $('wizNext').addEventListener('click', function(){ if (wizStep<5) showStep(wizStep+1); else closeWizard(); });
+      $('wizGotoCal').addEventListener('click', function(){ closeWizard(); gotoPage('tune'); });
+      var wpresets = document.querySelectorAll('[data-wpreset]');
+      for (var w=0;w<wpresets.length;w++) wpresets[w].addEventListener('click', function(){
+        for (var k=0;k<wpresets.length;k++) wpresets[k].classList.toggle('sel', wpresets[k]===this);
+        $('wizSummaryProfile').textContent = this.getAttribute('data-wpreset');
+        setProfile(this.getAttribute('data-wpreset'));
+      });
+
+      /* ---------- Tour ---------- */
+      var tourStops = [
+        { sel:'#sidebar', title:'Six pages, in the order you use them', text:'Dashboard first, then Devices, Tune, Profiles, Monitor, Settings — most-used at the top, never alphabetical. Every setting lives on exactly one page.' },
+        { sel:'#profileBtn', title:'Your active profile', text:'The profile in use, always visible. The orange dot means unsaved changes — RSH asks before anything switches and loses them.' },
+        { sel:'#palSeg', title:'Colour', text:'Pick the accent colour you like. It applies to the whole app.' },
+        { sel:'#themeSeg', title:'Dark / Light', text:'The theme switch lives here, in the top bar, and flips the whole app instantly. Both themes are first-class — same layout, same controls, only the colours change.' },
+        { sel:'#navMonitor', page:'monitor', title:'The Monitor', text:'Live steering, pedals, vJoy output with a saturation flag, link health, diagnostics and the event log — fed at 30 Hz while packets flow at 200 Hz untouched.' },
+        { sel:'#helpBtn', title:'Help lives here', text:'The Help button restarts this tour, reopens the setup checklist, and opens help for the page you are on. Tap or hover any setting itself for its one-sentence hint.' }
+      ];
+      var tourIdx = -1;
+      function placeTour(stop){
+        var el = document.querySelector(stop.sel); if(!el) return;
+        var fr = frame.getBoundingClientRect(), r = el.getBoundingClientRect();
+        var ring = $('tourRing');
+        ring.style.left = (r.left - fr.left + frame.scrollLeft - 4)+'px';
+        ring.style.top = (r.top - fr.top + frame.scrollTop - 4)+'px';
+        ring.style.width = (r.width + 8)+'px'; ring.style.height = (r.height + 8)+'px';
+        ring.classList.add('open');
+        var card = $('tourCard');
+        var cx = r.left - fr.left + frame.scrollLeft, cy = r.bottom - fr.top + frame.scrollTop + 14;
+        cx = Math.max(8, Math.min(cx, frame.clientWidth - 312));
+        if (cy + 190 > frame.scrollTop + frame.clientHeight) cy = r.top - fr.top + frame.scrollTop - 200;
+        card.style.left = cx+'px'; card.style.top = Math.max(8, cy)+'px';
+        card.classList.add('open');
+        $('tourTitle').textContent = stop.title;
+        $('tourText').textContent = stop.text;
+        $('tourCount').textContent = (tourIdx+1)+' of '+tourStops.length;
+        $('tourNext').textContent = tourIdx===tourStops.length-1 ? 'Finish' : 'Next';
+      }
+      function startTour(){ closeMenus(); tourIdx = 0; var s = tourStops[0]; if (s.page) gotoPage(s.page); placeTour(s); }
+      function endTour(){ tourIdx = -1; $('tourRing').classList.remove('open'); $('tourCard').classList.remove('open'); }
+      $('tourNext').addEventListener('click', function(){
+        tourIdx++;
+        if (tourIdx >= tourStops.length){ endTour(); return; }
+        var s = tourStops[tourIdx]; if (s.page) gotoPage(s.page);
+        setTimeout(function(){ placeTour(s); }, 30);
+      });
+      $('tourSkip').addEventListener('click', endTour);
+      $('openTourBtn').addEventListener('click', startTour);
+      $('hmTour').addEventListener('click', startTour);
+      window.addEventListener('resize', function(){ if (tourIdx>=0) placeTour(tourStops[tourIdx]); });
+
+      /* ---------- Tune module rail ---------- */
+      var railBtns = document.querySelectorAll('.rail-item');
+      function activateModule(name, forceOpen){
+        var current = document.querySelector('.tune-sec.active');
+        var isOpen = current && current.getAttribute('data-tune-sec')===name;
+        var openName = (isOpen && !forceOpen) ? null : name;
+        for (var rI=0;rI<railBtns.length;rI++){
+          var on = railBtns[rI].getAttribute('data-rail')===openName;
+          railBtns[rI].classList.toggle('active', on);
+          railBtns[rI].setAttribute('aria-expanded', on ? 'true' : 'false');
+          var lbl = railBtns[rI].querySelector('.m-open'); if (lbl) lbl.textContent = on ? 'Tuning open' : 'Open tuning';
+          var card = railBtns[rI].closest('.module-card'); if (card) card.classList.toggle('open', on);
+        }
+        var secs = document.querySelectorAll('.tune-sec');
+        for (var sI=0;sI<secs.length;sI++) secs[sI].classList.toggle('active', secs[sI].getAttribute('data-tune-sec')===openName);
+      }
+      for (var rB=0;rB<railBtns.length;rB++) railBtns[rB].addEventListener('click', function(){ activateModule(this.getAttribute('data-rail')); });
+
+      /* ---------- Module on/off (Settings) drives Tune, Dashboard, Monitor ---------- */
+      function applyModule(mod, on){
+        var els = document.querySelectorAll('[data-mod-section="'+mod+'"]');
+        for (var mI=0;mI<els.length;mI++) els[mI].style.display = on ? '' : 'none';
+        var notes = document.querySelectorAll('[data-mod-offnote="'+mod+'"]');
+        for (var nI=0;nI<notes.length;nI++) notes[nI].style.display = on ? 'none' : '';
+        var onCount = document.querySelectorAll('.mod-tgl:checked').length;
+        if ($('sumModules')) $('sumModules').textContent = onCount + ' of 7';
+        if (mod==='clutch' && $('sumClutch')) $('sumClutch').textContent = on ? 'On — Tune section + bars visible' : 'Off — no Tune section, no bar above';
+        if (!on){
+          var activeSec = document.querySelector('.tune-sec.active');
+          if (activeSec && activeSec.getAttribute('data-tune-sec')===mod){
+            var order = ['steering','throttle','brake','handbrake','shifter','buttons','encoders','clutch'];
+            for (var oI=0;oI<order.length;oI++){
+              var tg = document.querySelector('.mod-tgl[data-module="'+order[oI]+'"]');
+              if (tg && tg.checked){ activateModule(order[oI], true); break; }
+            }
+          }
+        }
+        dot.classList.add('on');
+      }
+      var modTgls = document.querySelectorAll('.mod-tgl');
+      for (var mT=0;mT<modTgls.length;mT++) modTgls[mT].addEventListener('change', function(){ applyModule(this.getAttribute('data-module'), this.checked); });
+      var assignSels = document.querySelectorAll('.assign-sel');
+      for (var aS=0;aS<assignSels.length;aS++) assignSels[aS].addEventListener('change', function(){ dot.classList.add('on'); });
+
+      /* ---------- Tune save state ---------- */
+      var tuneInputs = document.querySelectorAll('.tune-sec input');
+      for (var tIn=0;tIn<tuneInputs.length;tIn++) tuneInputs[tIn].addEventListener('input', function(){ $('tuneSaveState').textContent = 'Unsaved changes — previewing live'; });
+      $('tuneSaveBtn').addEventListener('click', function(){
+        $('tuneSaveState').innerHTML = '<span class="ok-txt"><b>Saved ✓</b></span> — written to the wheel and the active profile.';
+        dot.classList.remove('on');
+      });
+
+      /* ---------- Curve preset segments ---------- */
+      var curveSegs = document.querySelectorAll('.curveseg');
+      for (var cS=0;cS<curveSegs.length;cS++){
+        (function(seg){
+          var btns = seg.querySelectorAll('button');
+          for (var bI=0;bI<btns.length;bI++) btns[bI].addEventListener('click', function(){
+            for (var k=0;k<btns.length;k++) btns[k].setAttribute('aria-pressed', btns[k]===this ? 'true':'false');
+            if (seg.getAttribute('data-curve')==='steer' && $('sumCurve')) $('sumCurve').textContent = this.textContent;
+            if (this.textContent==='Custom' && seg.getAttribute('data-opens')){
+              var body = $(seg.getAttribute('data-opens'));
+              if (body && !body.classList.contains('open')){
+                body.classList.add('open');
+                var exp = document.querySelector('[data-exp="'+seg.getAttribute('data-opens')+'"]');
+                if (exp) exp.setAttribute('aria-expanded','true');
+              }
+            }
+            dot.classList.add('on');
+            $('tuneSaveState').textContent = 'Unsaved changes — previewing live';
+          });
+        })(curveSegs[cS]);
+      }
+      var dirBtns = document.querySelectorAll('.dirseg button');
+      for (var dB=0;dB<dirBtns.length;dB++) dirBtns[dB].addEventListener('click', function(){
+        for (var k=0;k<dirBtns.length;k++) dirBtns[k].setAttribute('aria-pressed', dirBtns[k]===this ? 'true':'false');
+        dot.classList.add('on');
+      });
+
+      /* ---------- Pedal calibration: capture the live value ---------- */
+      var calState = {};
+      var calBtns = document.querySelectorAll('[data-calset]');
+      for (var cB=0;cB<calBtns.length;cB++) calBtns[cB].addEventListener('click', function(){
+        var key = this.getAttribute('data-calset'), side = this.getAttribute('data-side');
+        var now = (window.__sim && typeof window.__sim[key]==='number') ? Math.round(window.__sim[key]) : 0;
+        calState[key] = calState[key] || {};
+        calState[key][side] = now;
+        var st = { thr:$('calThrState'), brk:$('calBrkState'), clu:$('calCluState'), hb:$('calHbState') }[key];
+        var cs = calState[key];
+        if (st) st.innerHTML = (cs.min!==undefined && cs.max!==undefined)
+          ? '<span class="ok-txt"><b>Calibrated ✓</b></span> — rest ' + cs.min + '% · full ' + cs.max + '%.'
+          : (side==='min' ? 'Rest set at ' + now + '% — now press fully and set Full.' : 'Full set at ' + now + '% — now release fully and set Rest.');
+        dot.classList.add('on');
+        $('tuneSaveState').textContent = 'Unsaved changes — previewing live';
+      });
+
+      /* ---------- Shifter gate test + mode ---------- */
+      var gateCells = document.querySelectorAll('#gateGrid .gatecell');
+      for (var gC=0;gC<gateCells.length;gC++) gateCells[gC].addEventListener('click', function(){
+        for (var k=0;k<gateCells.length;k++) gateCells[k].classList.toggle('active', gateCells[k]===this);
+        $('gateNow').textContent = this.getAttribute('data-gate'); if ($('headGate')) $('headGate').textContent = this.getAttribute('data-gate'); if ($('dashGear')) $('dashGear').textContent = this.getAttribute('data-gate');
+      });
+      var gmBtns = document.querySelectorAll('#shifterModeSeg button');
+      for (var gM=0;gM<gmBtns.length;gM++) gmBtns[gM].addEventListener('click', function(){
+        for (var k=0;k<gmBtns.length;k++) gmBtns[k].setAttribute('aria-pressed', gmBtns[k]===this ? 'true':'false');
+        dot.classList.add('on');
+      });
+
+      /* ---------- Horn / ignition / encoder tests ---------- */
+      var testBtns = document.querySelectorAll('[data-testbtn]');
+      for (var tB=0;tB<testBtns.length;tB++) testBtns[tB].addEventListener('click', function(){
+        var which = this.getAttribute('data-testbtn');
+        var dotEl = which==='horn' ? $('hornDot') : $('ignDot');
+        var dashEl = which==='horn' ? $('dashHornDot') : $('dashIgnDot');
+        var on = !dotEl.classList.contains('on');
+        dotEl.classList.toggle('on', on); if (dashEl) dashEl.classList.toggle('on', on);
+        if (which==='horn') setTimeout(function(){ dotEl.classList.remove('on'); if (dashEl) dashEl.classList.remove('on'); }, 500);
+      });
+      var encVal = 0;
+      function encStep(d){ encVal += d; $('encCount').textContent = encVal; if ($('headEnc')) $('headEnc').textContent = encVal; if ($('dashEnc')) $('dashEnc').textContent = encVal; dot.classList.add('on'); }
+      $('encPlus').addEventListener('click', function(){ encStep(1); });
+      $('encMinus').addEventListener('click', function(){ encStep(-1); });
+
+      /* ---------- Dashboard scrolling graph (steering + throttle) ---------- */
+      var steerHist = [], thrHist = [];
+      function drawDash(){
+        var cv = $('dashGraph'); if (!cv) return;
+        var ctx = cv.getContext('2d');
+        var W = cv.width, H = cv.height; ctx.clearRect(0,0,W,H);
+        var cs = getComputedStyle(app);
+        ctx.strokeStyle = 'rgba(127,127,127,.35)'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0,H/2); ctx.lineTo(W,H/2); ctx.stroke();
+        function plot(hist, color, mid){
+          if (hist.length < 2) return;
+          ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+          for (var k=0;k<hist.length;k++){
+            var x = k/89*W;
+            var y = mid ? (H/2 - hist[k]/100*(H/2-4)) : (H-4 - hist[k]/100*(H-8));
+            if (k===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+          }
+          ctx.stroke();
+        }
+        plot(steerHist, cs.getPropertyValue('--accent'), true);
+        plot(thrHist, cs.getPropertyValue('--lime'), false);
+      }
+
+      /* ---------- Live simulation (sample data) ---------- */
+      var linkState = 'good', simT = 0, peak = 0, downSecs = 0;
+      var lossHist = []; for (var lh=0; lh<60; lh++) lossHist.push(0.4);
+      function signedFill(el, angle){
+        var pct = Math.max(-100, Math.min(100, angle/270*100));
+        if (pct >= 0){ el.style.left = '50%'; el.style.width = (pct/2)+'%'; }
+        else { el.style.left = (50 + pct/2)+'%'; el.style.width = (-pct/2)+'%'; }
+      }
+      function drawSpark(){
+        var cv = $('lossSpark'); if (!cv) return;
+        var ctx = cv.getContext('2d');
+        var W = cv.width, H = cv.height; ctx.clearRect(0,0,W,H);
+        ctx.strokeStyle = 'rgba(127,127,127,.35)'; ctx.beginPath(); ctx.moveTo(0,H-14); ctx.lineTo(W,H-14); ctx.stroke();
+        ctx.strokeStyle = getComputedStyle(app).getPropertyValue('--accent'); ctx.lineWidth = 2; ctx.beginPath();
+        for (var k=0;k<lossHist.length;k++){
+          var x = k/(lossHist.length-1)*W, y = H-14 - Math.min(1, lossHist[k]/8)*(H-22);
+          if (k===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+        }
+        ctx.stroke();
+      }
+      function simTick(){
+        simT += 0.033;
+        var down = linkState==='down';
+        var angle = down ? 0 : Math.sin(simT*0.55)*165 + Math.sin(simT*1.63)*34;
+        var thr = down ? 0 : Math.pow(Math.max(0, Math.sin(simT*0.8)), 3)*100;
+        var brk = down ? 0 : Math.pow(Math.max(0, Math.sin(simT*0.8 + 2.4)), 6)*88;
+        var out = down ? 0 : Math.min(100, Math.abs(angle)/270*46 + thr*0.5 + Math.sin(simT*2.2)*7 + 12);
+        if (out > peak) peak = out; else peak = Math.max(out, peak - 0.25);
+        var clipping = out >= 95;
+        signedFill($('monSteerFill'), angle);
+        $('monSteerVal').textContent = down ? '—' : Math.round(angle);
+        $('monThrFill').style.width = thr+'%'; $('monThrVal').textContent = down ? '—' : Math.round(thr);
+        $('monBrkFill').style.width = brk+'%'; $('monBrkVal').textContent = down ? '—' : Math.round(brk);
+        var hb = down ? 0 : Math.pow(Math.max(0, Math.sin(simT*0.5 + 4.2)), 8)*100;
+        var clu = down ? 0 : Math.pow(Math.max(0, Math.sin(simT*0.8 + 4.6)), 5)*76;
+        window.__sim = { thr:thr, brk:brk, hb:hb, clu:clu };
+        if ($('monHbFill')){ $('monHbFill').style.width = hb+'%'; $('monHbVal').textContent = down ? '—' : Math.round(hb); }
+        if ($('monCluFill')){ $('monCluFill').style.width = clu+'%'; $('monCluVal').textContent = down ? '—' : Math.round(clu); }
+        if ($('dashSteerFill')){ signedFill($('dashSteerFill'), angle); $('dashSteerVal').textContent = down ? '—' : Math.round(angle); }
+        if ($('dashThrFill')){ $('dashThrFill').style.width = thr+'%'; $('dashThrVal').textContent = down ? '—' : Math.round(thr); }
+        if ($('dashBrkFill')){ $('dashBrkFill').style.width = brk+'%'; $('dashBrkVal').textContent = down ? '—' : Math.round(brk); }
+        if ($('dashHbFill')){ $('dashHbFill').style.width = hb+'%'; $('dashHbVal').textContent = down ? '—' : Math.round(hb); }
+        if ($('dashCluFill')){ $('dashCluFill').style.width = clu+'%'; $('dashCluVal').textContent = down ? '—' : Math.round(clu); }
+        if ($('thrLiveFill')){ $('thrLiveFill').style.width = thr+'%'; $('thrLiveVal').textContent = Math.round(thr); }
+        if ($('brkLiveFill')){ $('brkLiveFill').style.width = brk+'%'; $('brkLiveVal').textContent = Math.round(brk); }
+        if ($('hbLiveFill')){ $('hbLiveFill').style.width = hb+'%'; $('hbLiveVal').textContent = Math.round(hb); }
+        if ($('cluLiveFill')){ $('cluLiveFill').style.width = clu+'%'; $('cluLiveVal').textContent = Math.round(clu); }
+        if ($('dashHornDot') && linkState!=='down') $('dashHornDot').classList.toggle('on', (simT % 5) < 0.45);
+        steerHist.push(down ? 0 : angle/270*100); thrHist.push(thr);
+        if (steerHist.length > 90){ steerHist.shift(); thrHist.shift(); }
+        drawDash();
+        $('monOutFill').style.width = out+'%';
+        $('monOutFill').style.background = clipping ? 'var(--bad)' : 'var(--ok)';
+        $('monOutPeak').style.left = 'calc('+peak+'% - 2px)';
+        $('monOutVal').textContent = down ? '—' : Math.round(out);
+        $('monClip').classList.toggle('on', clipping && !down);
+        signedFill($('calSteerFill'), angle); $('calSteerVal').textContent = Math.round(angle);
+        var hlS=document.querySelector("[data-head-live='steering']"); if(hlS) hlS.textContent=Math.round(angle)+'°';
+        var hlT=document.querySelector("[data-head-live='thr']"); if(hlT) hlT.textContent=Math.round(thr)+'%';
+        var hlB=document.querySelector("[data-head-live='brk']"); if(hlB) hlB.textContent=Math.round(brk)+'%';
+        var hlC=document.querySelector("[data-head-live='clu']"); if(hlC) hlC.textContent=Math.round(clu)+'%';
+        var hlH=document.querySelector("[data-head-live='hb']"); if(hlH) hlH.textContent=Math.round(hb)+'%';
+        if (down) downSecs += 0.033; else downSecs = 0;
+      }
+      function numTick(){
+        var down = linkState==='down', lossy = linkState==='lossy';
+        var pps = down ? 0 : (lossy ? 168 + Math.round(Math.random()*24) : 199 + Math.round(Math.random()*2));
+        var loss = down ? 100 : (lossy ? (3.8 + Math.random()*3.2) : (0.2 + Math.random()*0.4));
+        var age = down ? Math.round(downSecs*1000) : (lossy ? 14 + Math.round(Math.random()*22) : 3 + Math.round(Math.random()*3));
+        $('dashPps').textContent = pps;
+        $('dashLoss').textContent = loss.toFixed(1);
+        $('monPps').textContent = pps;
+        $('monLoss').textContent = loss.toFixed(1);
+        $('monAge').textContent = age;
+        $('monRssi').innerHTML = down ? '—' : (lossy ? '−71 <span class="unit">dBm</span>' : '−52 <span class="unit">dBm</span>');
+        lossHist.push(down ? 8 : loss); lossHist.shift(); drawSpark();
+        var pill = $('connPill');
+        if (down){
+          pill.classList.add('off'); $('connPillTxt').textContent = 'No wheel';
+          $('dashLinkWord').textContent = 'No signal'; $('dashLinkWord').className = 'big bad-txt';
+          $('diagLine').className = 'diag-line bad'; $('diagIcon').textContent = '✕';
+          $('diagText').innerHTML = '<b>No packets for '+downSecs.toFixed(0)+' s.</b> Check the wheel is switched on and on the same Wi-Fi — output has gone neutral, so the car is safe.';
+        } else if (lossy){
+          pill.classList.remove('off'); $('connPillTxt').textContent = 'Wheel connected';
+          $('dashLinkWord').textContent = 'Weak'; $('dashLinkWord').className = 'big warn-txt';
+          $('diagLine').className = 'diag-line warn'; $('diagIcon').textContent = '!';
+          $('diagText').innerHTML = '<b>Some packets are being lost ('+loss.toFixed(1)+'%).</b> Try moving closer to the receiver or changing the Wi-Fi channel on the Devices page.';
+        } else {
+          pill.classList.remove('off'); $('connPillTxt').textContent = 'Wheel connected';
+          $('dashLinkWord').textContent = 'Good'; $('dashLinkWord').className = 'big ok-txt';
+          $('diagLine').className = 'diag-line'; $('diagIcon').textContent = '✓';
+          $('diagText').innerHTML = '<b>Link good.</b> Packets are arriving on time — drive.';
+        }
+      }
+      var linkBtns = document.querySelectorAll('[data-link]');
+      for (var li=0; li<linkBtns.length; li++) linkBtns[li].addEventListener('click', function(){ linkState = this.getAttribute('data-link'); numTick(); });
+      if (reduced){ simTick(); numTick(); }
+      else { setInterval(simTick, 33); setInterval(numTick, 400); numTick(); }
+    })();
+    document.getElementById('palSeg').addEventListener('click',function(e){var b=e.target.closest('[data-pal]');if(!b)return;document.getElementById('app').dataset.palette=b.dataset.pal;this.querySelectorAll('button').forEach(function(x){x.setAttribute('aria-pressed',x===b)})});
+</script>
+  </body>
+</html>

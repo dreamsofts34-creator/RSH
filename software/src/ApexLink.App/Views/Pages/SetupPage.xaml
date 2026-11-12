@@ -1,0 +1,133 @@
+<UserControl x:Class="ApexLink.App.Views.Pages.SetupPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ctl="clr-namespace:ApexLink.App.Controls">
+    <UserControl.Resources>
+        <ctl:BoolToVisibilityConverter x:Key="BoolVis" />
+        <Style x:Key="Chip" TargetType="Border">
+            <Setter Property="CornerRadius" Value="20" />
+            <Setter Property="Padding" Value="12,4" />
+            <Setter Property="Margin" Value="0,0,10,0" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="TextElement.Foreground" Value="#5F5A7A" />
+            <Setter Property="TextElement.FontWeight" Value="SemiBold" />
+            <Setter Property="TextElement.FontSize" Value="13" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource Self}}" Value="1">
+                    <Setter Property="Background" Value="#6C4CF1" />
+                    <Setter Property="TextElement.Foreground" Value="White" />
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource Self}}" Value="2">
+                    <Setter Property="Background" Value="#E3F6EA" />
+                    <Setter Property="TextElement.Foreground" Value="#17803D" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+    </UserControl.Resources>
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="32,28">
+            <TextBlock Text="Setup" Style="{StaticResource AxH1}" />
+            <TextBlock Text="Four quick steps. We read your wheel live, so you just move it." Style="{StaticResource AxSub}" />
+
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,18">
+                <Border Style="{StaticResource Chip}" Tag="{Binding Chip0}"><TextBlock Text="{Binding Chip0Text}" /></Border>
+                <Border Style="{StaticResource Chip}" Tag="{Binding Chip1}"><TextBlock Text="{Binding Chip1Text}" /></Border>
+                <Border Style="{StaticResource Chip}" Tag="{Binding Chip2}"><TextBlock Text="{Binding Chip2Text}" /></Border>
+                <Border Style="{StaticResource Chip}" Tag="{Binding Chip3}"><TextBlock Text="{Binding Chip3Text}" /></Border>
+            </StackPanel>
+
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="1.5*" />
+                    <ColumnDefinition Width="16" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0" Style="{StaticResource AxCard}">
+                    <StackPanel>
+                        <TextBlock Text="{Binding StepTitle}" FontSize="22" FontWeight="Bold" TextWrapping="Wrap" Margin="0,0,0,6" />
+                        <TextBlock Text="{Binding StepHint}" Style="{StaticResource AxMuted}" Margin="0,0,0,18" />
+
+                        <TextBlock Text="Wheel not connected. Power the wheel and join the APEXLINK WiFi network."
+                                   Foreground="#B42318" TextWrapping="Wrap" Margin="0,0,0,12" FontSize="13"
+                                   Visibility="{Binding HasData, Converter={StaticResource BoolVis}, ConverterParameter=Invert}" />
+
+                        <!-- Track: live position (steps 1-2), captured range markers (step 2) -->
+                        <Grid Height="56" Margin="0,0,0,10" Visibility="{Binding ShowTrack, Converter={StaticResource BoolVis}}">
+                            <Border Background="{StaticResource AxTrack}" CornerRadius="12" />
+                            <Grid Visibility="{Binding ShowMarkers, Converter={StaticResource BoolVis}}">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition x:Name="RC0" Width="*" />
+                                    <ColumnDefinition x:Name="RC1" Width="*" />
+                                    <ColumnDefinition x:Name="RC2" Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Border Grid.Column="1" Background="#CFC4FA" CornerRadius="12" />
+                                <Border Grid.Column="1" Width="4" Margin="0,-4" Background="{StaticResource AxAccent}" HorizontalAlignment="Left" />
+                                <Border Grid.Column="1" Width="4" Margin="0,-4" Background="{StaticResource AxAccent}" HorizontalAlignment="Right" />
+                            </Grid>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition x:Name="NC0" Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition x:Name="NC2" Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Border Grid.Column="1" Width="10" Margin="0,8" CornerRadius="5" Background="{StaticResource AxInk}" />
+                            </Grid>
+                        </Grid>
+
+                        <StackPanel Visibility="{Binding IsStep0, Converter={StaticResource BoolVis}}">
+                            <TextBlock Style="{StaticResource AxMuted}">
+                                <Run Text="Live reading: " /><Run Text="{Binding LiveSteering, Mode=OneWay}" FontWeight="SemiBold" />
+                            </TextBlock>
+                        </StackPanel>
+
+                        <StackPanel Visibility="{Binding IsStep1, Converter={StaticResource BoolVis}}">
+                            <Grid Margin="0,0,0,18">
+                                <TextBlock Text="{Binding LeftText}" FontSize="13" FontWeight="SemiBold" />
+                                <TextBlock Text="{Binding RightText}" FontSize="13" FontWeight="SemiBold" HorizontalAlignment="Right" />
+                            </Grid>
+                            <ProgressBar Style="{StaticResource AxBar}" Value="{Binding RangePercent, Mode=OneWay}" />
+                            <TextBlock Style="{StaticResource AxMuted}" Margin="0,6,0,0">
+                                <Run Text="Range found: " /><Run Text="{Binding RangePercent, StringFormat={}{0:F0}, Mode=OneWay}" /><Run Text="%" />
+                            </TextBlock>
+                        </StackPanel>
+
+                        <StackPanel Visibility="{Binding IsStep2, Converter={StaticResource BoolVis}}">
+                            <TextBlock Text="{Binding AccelText}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6" />
+                            <ProgressBar Style="{StaticResource AxBar}" Value="{Binding AccelPercent, Mode=OneWay}" Margin="0,0,0,16" />
+                            <TextBlock Text="{Binding BrakeText}" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,6" />
+                            <ProgressBar Style="{StaticResource AxBar}" Value="{Binding BrakePercent, Mode=OneWay}" />
+                        </StackPanel>
+
+                        <StackPanel Visibility="{Binding IsStep3, Converter={StaticResource BoolVis}}">
+                            <TextBlock Text="{Binding Summary}" TextWrapping="Wrap" FontSize="14" />
+                        </StackPanel>
+
+                        <TextBlock Text="{Binding Message}" Foreground="#B42318" TextWrapping="Wrap" Margin="0,12,0,0" FontSize="13" />
+                    </StackPanel>
+                </Border>
+
+                <Border Grid.Column="2" Style="{StaticResource AxCard}" VerticalAlignment="Top">
+                    <StackPanel>
+                        <TextBlock Text="Tips" Style="{StaticResource AxH2}" />
+                        <TextBlock Style="{StaticResource AxMuted}" LineHeight="22">
+                            <Run Text="• Hold the wheel by the rim." /><LineBreak />
+                            <Run Text="• Don't force it past the stop." /><LineBreak />
+                            <Run Text="• Wrong direction later? Use Invert steering in Tune." />
+                        </TextBlock>
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <Grid Margin="0,20,0,0">
+                <Button Content="Back" Style="{StaticResource AxGhost}" Command="{Binding BackCommand}" HorizontalAlignment="Left"
+                        Visibility="{Binding CanGoBack, Converter={StaticResource BoolVis}}" />
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button Content="Restart" Style="{StaticResource AxGhost}" Command="{Binding RestartCommand}" Margin="0,0,10,0" />
+                    <Button Content="{Binding NextLabel}" Style="{StaticResource AxPrimary}" Command="{Binding NextCommand}" />
+                </StackPanel>
+            </Grid>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

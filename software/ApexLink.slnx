@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ApexLink.App/ApexLink.App.csproj" />
+    <Project Path="src/ApexLink.Core/ApexLink.Core.csproj" />
+    <Project Path="src/ApexLink.Output.VJoy/ApexLink.Output.VJoy.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ApexLink.Tests/ApexLink.Tests.csproj" />
+    <Project Path="tests/ApexLink.VJoy.Tests/ApexLink.VJoy.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/ApexLink.Benchmarks/ApexLink.Benchmarks.csproj" />
+    <Project Path="tools/ApexLink.Simulator/ApexLink.Simulator.csproj" />
+  </Folder>
+</Solution>

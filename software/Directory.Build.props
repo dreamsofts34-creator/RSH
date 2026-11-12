@@ -1,0 +1,11 @@
+<Project>
+  <!-- ApexLink stability rules: har build bilkul waisa hi jo test hua tha.
+       Nullable + warnings-as-errors production code mein; packages lock-file
+       se restore hote hain (koi floating version nahi). -->
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+</Project>
