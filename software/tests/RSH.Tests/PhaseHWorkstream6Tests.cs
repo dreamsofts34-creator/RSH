@@ -245,10 +245,10 @@ public class PhaseHWorkstream6Tests
     }
 
     [Fact]
-    public void Artifact_UserGuide_Version_IsV200()
+    public void Artifact_UserGuide_Version_IsV201()
     {
         string text = ReadRepoFileOrSkip("docs/USER-GUIDE.md");
-        Assert.Contains("Version 2.0.0", text);
+        Assert.Contains("Version 2.0.1", text);
         Assert.Contains("v4.0.0", text);
         Assert.DoesNotContain("RSH-Setup-1.0.0.exe", text);
     }
@@ -266,7 +266,7 @@ public class PhaseHWorkstream6Tests
     {
         string text = ReadRepoFileOrSkip("software/packaging/msix/Package.appxmanifest");
         Assert.Contains("Name=\"RSH\"", text);
-        Assert.Contains("Version=\"2.0.0.0\"", text);
+        Assert.Contains("Version=\"2.0.1.0\"", text);
         Assert.Contains("MinVersion=\"10.0.22000.0\"", text);
         Assert.Contains("RSH.exe", text);
         Assert.Contains("privateNetworkClientServer", text);
@@ -299,13 +299,13 @@ public class PhaseHWorkstream6Tests
     }
 
     [Fact]
-    public void Artifact_WingetManifests_Version200()
+    public void Artifact_WingetManifests_Version201()
     {
         string installer = ReadRepoFileOrSkip("software/packaging/winget/dreamsofts34-creator.RSH.installer.yaml");
-        Assert.Contains("PackageVersion: 2.0.0", installer);
+        Assert.Contains("PackageVersion: 2.0.1", installer);
         Assert.Contains("msix", installer);
         string version = ReadRepoFileOrSkip("software/packaging/winget/dreamsofts34-creator.RSH.yaml");
-        Assert.Contains("PackageVersion: 2.0.0", version);
+        Assert.Contains("PackageVersion: 2.0.1", version);
     }
 
     [Fact]

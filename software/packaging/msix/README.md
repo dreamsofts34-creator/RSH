@@ -16,6 +16,15 @@
 - [x] Manifest draft tayyar (Name RSH, Version 2.0.0.0, MinVersion Win 11
       10.0.22000.0, capabilities `internetClient` +
       `privateNetworkClientServer`, Executable `RSH.exe`).
+- [ ] **v2.0.1 HOTFIX (W2, 2026-11-13): publish framework-dependent +
+      LOOSE ho gaya hai** (single-file NAHI — user faisla, halki RSH.exe +
+      DLLs saath) — MSIX ab Desktop Runtime par depend karta hai: install
+      karne wale PC par **.NET 10 Desktop Runtime** chahiye
+      (WPF usi mein hai, sirf base runtime nahi). MSIX mein koi framework
+      dependency declare nahi hoti, is liye ye requirement release notes /
+      USER-GUIDE mein likhni hai (W3). **Ho gaya (v2.0.1):** manifest `Version`
+      `2.0.1.0` hai aur script output `RSH-2.0.1.msix` hai. `build-msix.ps1` ki publish command
+      framework-dependent loose par update kar di gayi hai.
 - [x] `verify-manifest.py` pass (Publisher `CN=RSH` — unsigned identity,
       dekho neeche).
 - [x] **Publisher set hai** (`CN=RSH`, PublisherDisplayName `RSH`) —
@@ -30,6 +39,14 @@
       saka. Pehla asal (unsigned) MSIX Windows PC par banna + clean PC par
       install test hona baaqi hai (release checklist item). Unsigned MSIX
       install par SmartScreen warning aayega — USER-GUIDE §3 dekho.
+- [ ] **v2.0.1 note (framework-dependent):** v2.0.1 zip ab .NET bundle
+      nahi karta — app ko **.NET 10 Desktop Runtime 10.x** alag se
+      chahiye (docs/RELEASE-NOTES-v2.0.1.md). Jab MSIX banaya jaye to
+      manifest mein Desktop Runtime dependency declare karni hogi
+      (PackageDependency `Microsoft.WindowsDesktop.App` 10.x), warna
+      MSIX install hone ke baad bhi app runtime ke baghair nahi
+      chalegi. Ye packaging (W2) ka kaam hai — is docs workstream ne
+      sirf note likha hai, dependency abhi declare nahi hui.
 - [ ] **Signing step release workflow mein nahi hai** (SEC-H-03, W1 ka kaam)
       — workflow abhi unsigned zip + **signed firmware** ship karta hai.
       App signing **DEFERRED hai (cert khareedne ke baad)** — user faisla

@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (jaise v2.0.0)"
+        description: "Release tag (jaise v2.0.1)"
         required: true
-        default: "v2.0.0"
+        default: "v2.0.1"
 
 permissions:
   contents: write
@@ -191,15 +191,29 @@ jobs:
           path: test-results/*.trx
           if-no-files-found: warn
       - name: Publish app
+        # v2.0.1 HOTFIX (W2): framework-dependent LOOSE publish.
+        # User faisla 2026-11-13: .NET runtime zip se NIKALO (user ke PC par
+        # .NET pehle se installed hai) + zip organized rakho — v2.0.0
+        # self-contained zip mein 150+ files flat thin (~83 MB).
+        # --self-contained false: sirf app ki managed assemblies + apphost
+        # publish hoti hain; .NET runtime user ke PC se aata hai.
+        # Single-file NAHI (user faisla — akeli RSH.exe mein sab pack hoga
+        # to heavy ho jayegi): LOOSE publish — halki RSH.exe + DLLs saath.
+        # WPF app hai — is ke liye user ke PC par .NET 10 DESKTOP Runtime
+        # chahiye hota hai, sirf base runtime nahi; release notes mein ye
+        # requirement saaf likhni hai (W3).
         working-directory: software
         run: >
           dotnet publish src/RSH.App/RSH.App.csproj
-          -c Release -r win-x64 --self-contained true
+          -c Release -r win-x64 --self-contained false
           -o publish/RSH
       - name: Zip app
         shell: pwsh
         run: |
+          if (-not (Test-Path software/publish/RSH/RSH.exe)) { throw "RSH.exe missing after publish — publish fail hua?" }
           Compress-Archive -Path software/publish/RSH/* -DestinationPath RSH-windows-x64.zip
+          Write-Host "Zip contents (framework-dependent loose — runtime DLLs nahi, sirf app files expected):"
+          (Get-ChildItem software/publish/RSH/ | ForEach-Object { "$($_.Name)  $([math]::Round($_.Length/1MB,2)) MB" }) | Out-Host
           Get-FileHash RSH-windows-x64.zip -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  RSH-windows-x64.zip" } |
             Out-File -Encoding ascii SHA256SUMS-app.txt
@@ -250,7 +264,7 @@ jobs:
               exit 1
             fi
           done
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "RSH $TAG" --notes-file docs/RELEASE-NOTES-v2.0.0.md \
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "RSH $TAG" --notes-file docs/RELEASE-NOTES-v2.0.1.md \
             artifacts/firmware/firmware-signed.bin \
             artifacts/firmware/RSH-Firmware-DevKitV1-v*.bin \
             artifacts/firmware/SHA256SUMS.txt \

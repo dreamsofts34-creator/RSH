@@ -20,7 +20,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
 $PublishDir = Join-Path $RepoRoot "software\publish\RSH"
 $LayoutDir  = Join-Path $RepoRoot "software\packaging\msix\layout"
-$OutMsix    = Join-Path $RepoRoot "software\packaging\msix\RSH-2.0.0.msix"
+$OutMsix    = Join-Path $RepoRoot "software\packaging\msix\RSH-2.0.1.msix"
 $Manifest   = Join-Path $PSScriptRoot "Package.appxmanifest"
 
 # 0. Manifest mein placeholder Publisher to nahi? (signing ke waqt lazmi check)
@@ -31,9 +31,15 @@ if ($publisher -like "*TODO*") {
     throw "Manifest Publisher abhi placeholder hai ($publisher) — pehle ise CN=RSH (unsigned identity) ya OV cert Subject se badlo."
 }
 
-# 1. Publish (self-contained win-x64) — release workflow wali command jaisi.
+# 1. Publish (framework-dependent loose win-x64) — release workflow
+# wali command jaisi (v2.0.1 HOTFIX W2: self-contained hata diya — user ke PC
+# par .NET pehle se hai; single-file NAHI — user faisla, halki RSH.exe +
+# DLLs saath). MSIX install karne wale PC par .NET 10 DESKTOP
+# Runtime chahiye hota hai (WPF usi mein hai, sirf base runtime nahi) —
+# MSIX mein koi framework dependency declare nahi hoti, is liye ye
+# requirement release notes / USER-GUIDE mein likhni hai (W3).
 dotnet publish (Join-Path $RepoRoot "software\src\RSH.App\RSH.App.csproj") `
-    -c $Configuration -r win-x64 --self-contained true -o $PublishDir
+    -c $Configuration -r win-x64 --self-contained false -o $PublishDir
 if (-not (Test-Path (Join-Path $PublishDir "RSH.exe"))) { throw "RSH.exe missing after publish." }
 
 # 2. Layout: publish output + manifest + Assets (logos — rsh.ico se banao, abhi nahi hain to step fail hoga).

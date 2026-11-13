@@ -1,7 +1,10 @@
 # RSH — User Guide
 
-**Version 2.0.0 — for RSH app v2.0.0 / firmware v4.0.0 / protocol v2.1.**
-(Previous guide version: 1.2.2 / firmware v3.3 — this guide is for v2.0.0 only.)
+**Version 2.0.1 — for RSH app v2.0.1 / firmware v4.0.0 / protocol v2.1.**
+(Previous guide version: 2.0.0 / firmware v4.0.0 — v2.0.1 only changes
+the app packaging: framework-dependent (loose), see §1/§3.
+Firmware v4.0.0 is unchanged; if your board already runs v4.0.0,
+do not reflash it.)
 
 Wireless DIY sim-racing wheel: an ESP32 in the wheel sends its movement over
 its own WiFi; RSH on the PC turns that into a standard game controller
@@ -17,6 +20,17 @@ where you can change it without reflashing anything.
 
 - The wheel, flashed with the RSH firmware v4.0.0 (ESP32 DevKit V1 build).
 - Windows 11 (64-bit). Windows 10 is end-of-life (14 Oct 2025) — best-effort only, no guarantee.
+- **.NET 10 Desktop Runtime 10.x (x64) — REQUIRED from v2.0.1.**
+  The v2.0.1 app is framework-dependent: it does NOT bundle .NET
+  anymore, so without this runtime `RSH.exe` will not start at all.
+  Download it from the official Microsoft page
+  <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>
+  (Run apps → **.NET Desktop Runtime 10.0.x**, Windows x64 installer),
+  or run `winget install Microsoft.DotNet.DesktopRuntime.10`.
+  The plain ".NET Runtime" alone is NOT enough (RSH is a WPF app),
+  and .NET 8/9 does NOT count — it must be 10.x. Check with
+  `dotnet --list-runtimes` — the output must contain a line
+  `Microsoft.WindowsDesktop.App 10.x.x`.
 - The **vJoy driver, BrunnerInnovation v2.2.2.0** — this is the signed
   release that works on Windows 11. Get the driver and `vJoyInterface.dll`
   from the same release; mixing versions does not work (RSH checks and
@@ -44,13 +58,25 @@ the app first, then in the vJoy install folder
 
 ## 3. Install RSH
 
-**v2.0.0 app UNSIGNED hai** (user faisla 2026-11-13 — OV code-signing
+**v2.0.1 app UNSIGNED hai** (user faisla 2026-11-13 — OV code-signing
 certificate abhi nahi khareeda gaya, baad mein aayega). Is liye:
 
+0. **Pehle .NET 10 Desktop Runtime install karo (v2.0.1 se REQUIRED).**
+   `RSH.exe` chalane se pehle check karo: Command Prompt / PowerShell
+   mein `dotnet --list-runtimes` chalao — output mein
+   `Microsoft.WindowsDesktop.App 10.x.x` hona chahiye. Agar nahi hai
+   (ya `dotnet` command hi nahi milti) to Microsoft se install karo:
+   <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>
+   (Run apps → **.NET Desktop Runtime 10.0.x**, Windows x64 installer),
+   ya `winget install Microsoft.DotNet.DesktopRuntime.10`. Sirf
+   ".NET Runtime" kaafi nahi (WPF app hai), aur .NET 8/9 nahi chalega —
+   10.x chahiye. v2.0.0 mein runtime zip ke andar bundled tha; v2.0.1
+   mein nahi hai — yehi is hotfix ki packaging tabdeeli hai.
 - **Portable build (recommended):** `RSH-windows-x64.zip` download karo,
   unzip karo, `RSH.exe` chalao — is ko signing ki zaroorat nahi, install
-  bhi nahi hota. Yehi tareeqa v2.0.0 ke liye primary hai.
-- **MSIX (`RSH-2.0.0.msix`):** unsigned package hai — Windows SmartScreen
+  bhi nahi hota. Yehi tareeqa v2.0.1 ke liye primary hai. Zip mein ab
+  RSH.exe + us ki app DLLs hain (41 files) — framework-dependent (loose).
+- **MSIX (`RSH-2.0.1.msix`):** unsigned package hai — Windows SmartScreen
   **"Windows protected your PC" / "Unknown publisher"** warning dikhayega
   (package par koi verified publisher nahi hai). Install karne ke liye
   Developer Mode (sideloading) chahiye ho sakta hai; pehla install test
@@ -130,6 +156,7 @@ and fine-tune later on the Calibration page.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| `RSH.exe` won't start / "You must install or update .NET" | .NET 10 Desktop Runtime missing (v2.0.1 is framework-dependent) | Install .NET Desktop Runtime 10.x (x64) from <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>, then check `dotnet --list-runtimes` shows `Microsoft.WindowsDesktop.App 10.x.x` |
 | Dashboard: "Wheel not connected" | PC not on RSH WiFi, wheel off, or HELO blocked | Join RSH, check wheel LED (solid = connected), check firewall allows RSH |
 | Packets arrive but stop after 2 s | Windows dropped the WiFi (power saving) | In Device Manager, disable "allow the computer to turn off this device" for the WiFi adapter |
 | Output red: "device BUSY" | Another feeder app holds the vJoy device | Close the other app (or pick a different device on the Output page) |

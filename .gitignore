@@ -12,3 +12,6 @@ tests-host/run_tests
 *.pem
 signing-keys/
 secure-boot-key.pem
+
+# Local publish output (dotnet publish -o publish/) — verify ke baad delete karo.
+publish/

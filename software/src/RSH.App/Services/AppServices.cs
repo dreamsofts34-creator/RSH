@@ -595,6 +595,11 @@ public sealed class AppServices : IDisposable, ITransportSwitchTarget
     {
         ProfileStore.Save(Profiles);
         Engine.SetProfile(ActiveProfile);
+        // v2.0.1 HOTFIX (P0): har apply log ho — v2.0.0 ki report mein
+        // "Profile applied: Default" 4 dafa ~2.3 s mein aaya tha aur is
+        // code mein us ka koi record nahi tha (na event, na call-site),
+        // is liye repeat-apply ka raasta diagnose nahi ho saka tha.
+        Log.Information("Profile applied: {Profile}", ActiveProfile.Name);
     }
 
     /// <summary>
@@ -607,6 +612,8 @@ public sealed class AppServices : IDisposable, ITransportSwitchTarget
     {
         await ProfileStore.SaveAsync(Profiles, cancellationToken).ConfigureAwait(false);
         Engine.SetProfile(ActiveProfile);
+        // v2.0.1: sync wale raste jaisi logging (upar dekho).
+        Log.Information("Profile applied: {Profile}", ActiveProfile.Name);
     }
 
     /// <summary>Ek profile ki settings badal kar save + engine par laagu (debounce caller ki zimmedari).</summary>

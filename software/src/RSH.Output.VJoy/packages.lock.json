@@ -105,11 +105,6 @@
         "resolved": "10.0.0",
         "contentHash": "kggkJk7S8OcoOLa9OyrP2zQ/eStiKHOytWVK8lJuRckzcz52eUgDo66+d9n2KciukcNmeAbmSHEY6fh2n394Jg=="
       },
-      "System.IO.FileSystem.AccessControl": {
-        "type": "Transitive",
-        "resolved": "5.0.0",
-        "contentHash": "SxHB3nuNrpptVk+vZ/F+7OHEpoHUIKKMl02bUmYHQr1r+glbZQxs7pRtsf4ENO29TVm2TH3AEeep2fJcy92oYw=="
-      },
       "System.IO.Ports": {
         "type": "Transitive",
         "resolved": "10.0.0",
@@ -121,7 +116,6 @@
       "rsh.core": {
         "type": "Project",
         "dependencies": {
-          "System.IO.FileSystem.AccessControl": "[5.0.0, )",
           "System.IO.Ports": "[10.0.0, )"
         }
       }
