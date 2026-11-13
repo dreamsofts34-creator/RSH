@@ -424,7 +424,10 @@ typedef struct {
 static inline rsh_v2_result_t rsh_v2_ctrl_parse_structure(const uint8_t *data, size_t len,
                                                           rsh_v2_ctrl_t *out) {
   if (!data || !out) return RSH_V2_TOO_SHORT;
-  if (len < (size_t)RSH_V2_CTRL_HEADER_SIZE + RSH_V2_CTRL_TAG_SIZE)
+  // TOO_SHORT sirf tab jab 13 B ka header hi parha na ja sake (§3.1).
+  // Header parh liya gaya ho to har length mismatch (truncation samet)
+  // → BAD_LENGTH (RSH_V2_BAD_LENGTH ki doc comment dekho).
+  if (len < (size_t)RSH_V2_CTRL_HEADER_SIZE)
     return RSH_V2_TOO_SHORT;
   if (data[0] != 'R' || data[1] != 'S' || data[2] != 'H' || data[3] != 'C')
     return RSH_V2_BAD_MAGIC;

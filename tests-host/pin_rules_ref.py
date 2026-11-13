@@ -227,9 +227,9 @@ if __name__ == "__main__":
 
     # --- T7 limit tests (D6 bounds: axes <= 8, buttons <= 128, encoders <= 4) ---
     T("9 axes rejected (6 direct + 3 ADS1115)",
-      any("too many axes" in e for e in validate([A(32), A(33), A(34), A(35), A(36), ADS(0), ADS(1), ADS(2)], expanders=True)))
+      any("too many axes" in e for e in validate([A(32), A(33), A(34), A(35), A(36), A(39), ADS(0), ADS(1), ADS(2)], expanders=True)))
     T("8 axes valid (6 direct + 2 ADS1115, boundary)",
-      validate([A(32), A(33), A(34), A(35), A(36), ADS(0), ADS(1)], expanders=True) == [])
+      validate([A(32), A(33), A(34), A(35), A(36), A(39), ADS(0), ADS(1)], expanders=True) == [])
     T("5 encoders rejected (limit + 1)",
       any("too many encoders" in e for e in validate([E(4, 13), E(14, 16), E(17, 18), E(19, 23), E(25, 26)])))
     T("4 encoders valid (boundary, D6)",

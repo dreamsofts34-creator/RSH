@@ -98,7 +98,10 @@ public static class ControlFrameCodec
     public static ControlParseResult TryParseStructure(ReadOnlySpan<byte> data, out ControlFrame frame)
     {
         frame = default;
-        if (data.Length < ProtocolV2.ControlHeaderSize + ProtocolV2.ControlTagSize)
+        // TooShort sirf tab jab 13 B ka header hi parha na ja sake (§3.1).
+        // Header parh liya gaya ho to har length mismatch (truncation samet)
+        // → BadLength (doc comment dekho).
+        if (data.Length < ProtocolV2.ControlHeaderSize)
             return ControlParseResult.TooShort;
         if (data[0] != (byte)'R' || data[1] != (byte)'S' || data[2] != (byte)'H' || data[3] != (byte)'C')
             return ControlParseResult.BadMagic;

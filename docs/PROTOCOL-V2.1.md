@@ -222,6 +222,14 @@ Total **92 B fixed** — parser length se validate kare; `!= 92` → drop.
 
 Total = `13 + len + 16`. **Max frame 1053 B.**
 
+**Parse error codes (structure parse, §3.2):** `TOO_SHORT` sirf tab jab
+frame **13 B se chhota** ho (header ka `len` field hi parha na ja sake).
+Header parh liya gaya ho to har length mismatch → `BAD_LENGTH` — `len >
+1024` ho, ya total length `13 + len + 16` se match na kare, **truncation
+samet** (misal 29 B ka GET_CAPS frame 8 B truncate ho kar 21 B reh jaye
+to `BAD_LENGTH`, `TOO_SHORT` nahi). C# (`ControlFrame.TryParseStructure`)
+aur C++ (`rsh_v2_ctrl_parse_structure`) dono mein yahi rule hai.
+
 ### 3.2 HMAC + duplicate / replay rules (D3)
 
 - **Key:** per-device random **32 bytes** (OPEN-2 — CLOSED). Koi password
