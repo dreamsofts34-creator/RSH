@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>RSH.RenderTest</AssemblyName>
+    <RootNamespace>RSH.RenderTest</RootNamespace>
+    <!-- Ships with RSH v2.0.2 as the blank-window diagnostic tool. -->
+    <Version>2.0.2</Version>
+    <!-- DELIBERATELY no PackageReferences: plain framework-only WPF.
+         If even this renders blank, the fault is below WPF (GPU/OS),
+         not in any RSH dependency (no WPF-UI, no Serilog, no vJoy). -->
+  </PropertyGroup>
+
+</Project>

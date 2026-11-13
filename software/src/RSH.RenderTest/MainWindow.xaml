@@ -1,0 +1,16 @@
+<Window x:Class="RSH.RenderTest.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="RSH Render Test" Height="340" Width="540"
+        WindowStartupLocation="CenterScreen">
+    <StackPanel Margin="24">
+        <TextBlock FontSize="16" FontWeight="Bold" Text="RSH Render Test" />
+        <TextBlock Margin="0,8,0,0" TextWrapping="Wrap"
+                   Text="Plain WPF window — no FluentWindow, no NavigationView, no WPF-UI, no tray, no theme. If you can read this, WPF renders on this PC." />
+        <TextBlock x:Name="DiagnosticsText" Margin="0,16,0,0" TextWrapping="Wrap" FontFamily="Consolas" />
+        <Button x:Name="TestButton" Margin="0,16,0,0" Padding="12,6"
+                Content="Click to confirm the window renders"
+                Click="TestButton_Click" />
+        <TextBlock x:Name="StatusText" Margin="0,12,0,0" TextWrapping="Wrap" />
+    </StackPanel>
+</Window>

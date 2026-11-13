@@ -1,10 +1,11 @@
 # RSH — User Guide
 
-**Version 2.0.1 — for RSH app v2.0.1 / firmware v4.0.0 / protocol v2.1.**
-(Previous guide version: 2.0.0 / firmware v4.0.0 — v2.0.1 only changes
-the app packaging: framework-dependent (loose), see §1/§3.
-Firmware v4.0.0 is unchanged; if your board already runs v4.0.0,
-do not reflash it.)
+**Version 2.0.2 — for RSH app v2.0.2 / firmware v4.0.0 / protocol v2.1.**
+(Previous guide version: 2.0.1 / firmware v4.0.0 — v2.0.2 adds
+render-failure diagnostics (software-render / classic-window flags,
+see §6) and startup hardening (version-aware single instance,
+CloseToTray trap fix). Firmware v4.0.0 is unchanged; if your board
+already runs v4.0.0, do not reflash it.)
 
 Wireless DIY sim-racing wheel: an ESP32 in the wheel sends its movement over
 its own WiFi; RSH on the PC turns that into a standard game controller
@@ -21,7 +22,7 @@ where you can change it without reflashing anything.
 - The wheel, flashed with the RSH firmware v4.0.0 (ESP32 DevKit V1 build).
 - Windows 11 (64-bit). Windows 10 is end-of-life (14 Oct 2025) — best-effort only, no guarantee.
 - **.NET 10 Desktop Runtime 10.x (x64) — REQUIRED from v2.0.1.**
-  The v2.0.1 app is framework-dependent: it does NOT bundle .NET
+  The v2.0.2 app is framework-dependent: it does NOT bundle .NET
   anymore, so without this runtime `RSH.exe` will not start at all.
   Download it from the official Microsoft page
   <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>
@@ -58,7 +59,7 @@ the app first, then in the vJoy install folder
 
 ## 3. Install RSH
 
-**v2.0.1 app UNSIGNED hai** (user faisla 2026-11-13 — OV code-signing
+**v2.0.2 app UNSIGNED hai** (user faisla 2026-11-13 — OV code-signing
 certificate abhi nahi khareeda gaya, baad mein aayega). Is liye:
 
 0. **Pehle .NET 10 Desktop Runtime install karo (v2.0.1 se REQUIRED).**
@@ -74,9 +75,9 @@ certificate abhi nahi khareeda gaya, baad mein aayega). Is liye:
    mein nahi hai — yehi is hotfix ki packaging tabdeeli hai.
 - **Portable build (recommended):** `RSH-windows-x64.zip` download karo,
   unzip karo, `RSH.exe` chalao — is ko signing ki zaroorat nahi, install
-  bhi nahi hota. Yehi tareeqa v2.0.1 ke liye primary hai. Zip mein ab
+  bhi nahi hota. Yehi tareeqa v2.0.2 ke liye primary hai. Zip mein ab
   RSH.exe + us ki app DLLs hain (41 files) — framework-dependent (loose).
-- **MSIX (`RSH-2.0.1.msix`):** unsigned package hai — Windows SmartScreen
+- **MSIX (`RSH-2.0.2.msix`):** unsigned package hai — Windows SmartScreen
   **"Windows protected your PC" / "Unknown publisher"** warning dikhayega
   (package par koi verified publisher nahi hai). Install karne ke liye
   Developer Mode (sideloading) chahiye ho sakta hai; pehla install test
@@ -156,7 +157,8 @@ and fine-tune later on the Calibration page.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `RSH.exe` won't start / "You must install or update .NET" | .NET 10 Desktop Runtime missing (v2.0.1 is framework-dependent) | Install .NET Desktop Runtime 10.x (x64) from <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>, then check `dotnet --list-runtimes` shows `Microsoft.WindowsDesktop.App 10.x.x` |
+| `RSH.exe` won't start / "You must install or update .NET" | .NET 10 Desktop Runtime missing (v2.0.2 is framework-dependent) | Install .NET Desktop Runtime 10.x (x64) from <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>, then check `dotnet --list-runtimes` shows `Microsoft.WindowsDesktop.App 10.x.x` |
+| Blank window (no content, no tray icon) | Render failure — the window's GPU / FluentWindow render path is not painting (a stale-process cause was ruled out: a PC restart + fresh install still showed the blank window) | Try in this order, and note which step first shows content: **(a)** `RSH.exe --software-render` — forces software rendering; **(b)** `RSH.exe --classic-window` — plain WPF window instead of FluentWindow; **(c)** the plain-Window test build (see `docs/RELEASE-NOTES-v2.0.2.md`) — a minimal window with no FluentWindow at all; **(d)** report the result (which step worked, or that none did) together with `%AppData%\RSH\logs\rsh-<today>.log` |
 | Dashboard: "Wheel not connected" | PC not on RSH WiFi, wheel off, or HELO blocked | Join RSH, check wheel LED (solid = connected), check firewall allows RSH |
 | Packets arrive but stop after 2 s | Windows dropped the WiFi (power saving) | In Device Manager, disable "allow the computer to turn off this device" for the WiFi adapter |
 | Output red: "device BUSY" | Another feeder app holds the vJoy device | Close the other app (or pick a different device on the Output page) |
@@ -171,6 +173,50 @@ and fine-tune later on the Calibration page.
 Something else? Open **Diagnostics → Export diagnostics (.zip)** and keep
 the file — it contains the logs and the counters that explain what the
 link was doing.
+
+### Blank window — the app opens but shows nothing
+
+If `RSH.exe` starts (you may see it in Task Manager) but the window is
+completely blank and no tray icon appears, the window is most likely
+failing to *render* — the app itself is running. Try these in order,
+one at a time:
+
+1. **Software rendering:** close RSH completely, then start it from
+   a Command Prompt with
+   `RSH.exe --software-render`
+   This forces WPF to draw without the GPU. If the window appears now,
+   the GPU driver (or its render thread) is the problem — update the
+   GPU driver from the manufacturer's site and try again without the
+   flag. The log line `Software rendering requested (Render Tier: X)`
+   in `%APPDATA%\RSH\logs` confirms the flag was active.
+2. **Classic window chrome:** close RSH, then start it with
+   `RSH.exe --classic-window`
+   This keeps the same app but uses a plain Windows title bar instead
+   of the custom FluentWindow chrome. If this fixes it, the custom
+   window chrome is what fails on this PC.
+3. **Both together:** `RSH.exe --software-render --classic-window`
+   narrows it further — if even this stays blank, the problem is below
+   WPF itself (GPU/OS level).
+4. **Disable hardware acceleration for all WPF apps** (manual test):
+   in Registry Editor create DWORD
+   `HKEY_CURRENT_USER\SOFTWARE\Microsoft\Avalon.Graphics\DisableHWAcceleration`
+   = `1`, restart RSH, and remove the value afterwards if it made no
+   difference.
+5. **Render test:** the release ships a tiny separate tool,
+   `RSH.RenderTest.exe` — a plain window with one button and no
+   WPF-UI at all (it also accepts `--software-render`). If *that*
+   window renders but RSH stays blank, the WPF-UI window chrome is
+   the culprit; if it is blank too, the problem is the GPU/OS, not RSH.
+
+Neither flag changes any setting — they only affect that one launch.
+If a flag fixes it, tell us which one (Diagnostics → Export
+diagnostics) so the fix can be made permanent.
+
+> **Stale-process note:** agar update ke baad bhi purani blank window
+> dikhe to Task Manager mein check karo ke koi purani `RSH.exe` to nahi
+> chal rahi — v2.0.2 ka version-aware single instance purane-version
+> process ko khud terminate karke start hota hai, is liye aam tor par ye
+> karne ki zaroorat nahi parni chahiye.
 
 ## 7. Performance (by design)
 

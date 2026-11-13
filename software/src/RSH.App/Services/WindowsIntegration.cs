@@ -40,6 +40,26 @@ public static class WindowsIntegration
 
     public static bool GetAutostart() => Autostart.GetAutostart();
 
+    /// <summary>Registry mein mojood autostart value (null = koi entry nahi).</summary>
+    public static string? GetAutostartValue() => Autostart.GetStoredValue();
+
+    /// <summary>
+    /// v2.0.2 HOTFIX — startup par stale autostart entry repair karo
+    /// (purane folder/version ki taraf ishara karti entry ko current exe
+    /// par overwrite — <see cref="AutostartService.RepairStaleEntry"/>).
+    /// Failure startup ko kabhi nahi rokti (caller log kare).
+    /// </summary>
+    public static bool RepairStaleAutostart(out bool repaired, out string? error) =>
+        Autostart.RepairStaleEntry(out repaired, out error);
+
+    /// <summary>
+    /// v2.0.2 HOTFIX — autostart ko current exe par le aao: settings on ho
+    /// ya registry entry mojood ho to stale entry repair / missing entry
+    /// dobara banao; off ho to kuch nahi.
+    /// </summary>
+    public static bool EnsureAutostartCurrent(bool desiredOn, out bool changed, out string? error) =>
+        Autostart.EnsureAutostartCurrent(desiredOn, out changed, out error);
+
     /// <summary>
     /// Autostart lagao/hatao — A5: kamyabi sirf tab jab registry write ke
     /// baad read-back match kare. <c>false</c> = UI ON nahi dikhaye, error

@@ -19,7 +19,7 @@
     <!-- Low-end PC dost: workstation GC (server GC zyada memory leta hai) -->
     <ServerGarbageCollection>false</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
-    <Version>2.0.1</Version>
+    <Version>2.0.2</Version>
   </PropertyGroup>
 
   <!-- Phase F (W3): RSH.App.Tests ko internals (GameLauncher test seams) dikhte hain. -->

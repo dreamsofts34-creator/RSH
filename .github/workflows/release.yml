@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (jaise v2.0.1)"
+        description: "Release tag (jaise v2.0.2)"
         required: true
-        default: "v2.0.1"
+        default: "v2.0.2"
 
 permissions:
   contents: write
@@ -217,11 +217,33 @@ jobs:
           Get-FileHash RSH-windows-x64.zip -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  RSH-windows-x64.zip" } |
             Out-File -Encoding ascii SHA256SUMS-app.txt
+      - name: Publish render test
+        # v2.0.2 (C1): RSH.RenderTest — plain WPF Window + Button, ZERO
+        # NuGet deps (framework-only). Blank-window diagnostic tool:
+        # agar ye bhi blank ho to masla GPU/OS level hai, RSH code mein
+        # nahi. Alag zip asset banta hai (main zip ke ANDAR nahi — user
+        # ka organized-zip rule). Framework-dependent loose, app jaisa.
+        working-directory: software
+        run: >
+          dotnet publish src/RSH.RenderTest/RSH.RenderTest.csproj
+          -c Release -r win-x64 --self-contained false
+          -o publish/RSH.RenderTest
+      - name: Zip render test
+        shell: pwsh
+        run: |
+          if (-not (Test-Path software/publish/RSH.RenderTest/RSH.RenderTest.exe)) { throw "RSH.RenderTest.exe missing after publish — publish fail hua?" }
+          Compress-Archive -Path software/publish/RSH.RenderTest/* -DestinationPath RSH-render-test-x64.zip
+          Write-Host "RenderTest zip contents (5 files expected, zero NuGet deps):"
+          (Get-ChildItem software/publish/RSH.RenderTest/ | ForEach-Object { "$($_.Name)  $([math]::Round($_.Length/1KB,1)) KB" }) | Out-Host
+          Get-FileHash RSH-render-test-x64.zip -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  RSH-render-test-x64.zip" } |
+            Out-File -Encoding ascii -Append SHA256SUMS-app.txt
       - uses: actions/upload-artifact@v4
         with:
           name: software
           path: |
             RSH-windows-x64.zip
+            RSH-render-test-x64.zip
             SHA256SUMS-app.txt
 
   release:
@@ -264,9 +286,10 @@ jobs:
               exit 1
             fi
           done
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "RSH $TAG" --notes-file docs/RELEASE-NOTES-v2.0.1.md \
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "RSH $TAG" --notes-file docs/RELEASE-NOTES-v2.0.2.md \
             artifacts/firmware/firmware-signed.bin \
             artifacts/firmware/RSH-Firmware-DevKitV1-v*.bin \
             artifacts/firmware/SHA256SUMS.txt \
             artifacts/software/RSH-windows-x64.zip \
+            artifacts/software/RSH-render-test-x64.zip \
             artifacts/software/SHA256SUMS-app.txt

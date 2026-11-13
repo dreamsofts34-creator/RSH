@@ -1,6 +1,7 @@
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Interop;
 using System.Windows.Media;
 using RSH.App.Resources;
 using RSH.App.Services;
@@ -19,6 +20,12 @@ public partial class App : Application
     private SingleInstanceCoordinator? _singleInstance;
     private AppServices? _services;
 
+    /// <summary>v2.0.2 diagnostic flag --classic-window: true ho to
+    /// MainWindow FluentWindow chrome ke bajaye plain WPF title bar use
+    /// karta hai (ExtendsContentIntoTitleBar=False). Default false —
+    /// flag na ho to behaviour bilkul waisa hi jaisa pehle tha.</summary>
+    internal static bool ClassicWindowRequested { get; private set; }
+
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
@@ -36,15 +43,49 @@ public partial class App : Application
                 rollingInterval: RollingInterval.Day, retainedFileCountLimit: 7, shared: true,
                 outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
             .CreateLogger();
-        Log.Information("RSH started");
+        // v2.0.2 HOTFIX: version assembly se lo (hard-code nahi) — taake
+        // agle report se foran pata chale kaunsi binary chali thi. Dono
+        // likho agar farq ho (informational mein commit hash bhi hota hai).
+        var appVersion = AppVersionInfo.ForAssembly(typeof(App).Assembly);
+        if (appVersion.InformationalVersion is not null
+            && appVersion.InformationalVersion != appVersion.AssemblyVersion.ToString())
+            Log.Information("RSH started v{DisplayVersion} (assembly {AssemblyVersion}, informational {InformationalVersion})",
+                appVersion.DisplayVersion, appVersion.AssemblyVersion, appVersion.InformationalVersion);
+        else
+            Log.Information("RSH started v{DisplayVersion} (assembly {AssemblyVersion})",
+                appVersion.DisplayVersion, appVersion.AssemblyVersion);
+
+        // v2.0.2 HOTFIX — version-aware single instance: mutex/pipe naam
+        // mein version hai (Global\RSH.SingleInstance.2.0.2 jaisa), is liye
+        // purani version ki instance nayi ko kabhi nahi rokti. Us se PEHLE
+        // purani version ka instance terminate karo (same user + RSH.exe +
+        // file version < current — SingleInstanceCoordinator dekho); cleanup
+        // fail ho to bhi startup nahi rukti, versioned mutex phir bhi
+        // same-version duplicates rokta hai.
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                int terminated = SingleInstanceCoordinator.TerminateOlderInstances(
+                    appVersion.AssemblyVersion, msg => Log.Information("{StaleInstanceLog}", msg));
+                if (terminated > 0)
+                    Log.Information("Terminated {Count} older RSH instance(s) before startup", terminated);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Older-instance cleanup failed — continuing with versioned single instance");
+            }
+        }
 
         // A4 — Single instance: do engine kabhi nahi. Doosri instance
-        // pehli ko named pipe se activate karti hai (bring-to-front),
-        // phir khud band ho jati hai — koi duplicate engine nahi.
-        _singleInstance = new SingleInstanceCoordinator();
+        // (SAME version) pehli ko named pipe se activate karti hai
+        // (bring-to-front), phir khud band ho jati hai — koi duplicate
+        // engine nahi.
+        _singleInstance = new SingleInstanceCoordinator(appVersion.MutexName, appVersion.PipeName);
         if (!_singleInstance.TryAcquire())
         {
-            SingleInstanceCoordinator.SignalExisting();
+            SingleInstanceCoordinator.SignalExisting(appVersion.PipeName);
+            Log.Information("Same-version RSH instance already running — activating it and exiting");
             Shutdown();
             return;
         }
@@ -52,6 +93,60 @@ public partial class App : Application
 
         _services = new AppServices();
         Log.Information("App services created — active profile {Profile}", _services.Profiles.ActiveProfileName);
+
+        // v2.0.2 HOTFIX — autostart stale-entry repair: Run key mein purane
+        // folder ki taraf ishara karti entry agle login par purana version
+        // dobara la sakti thi. Settings on ho ya registry entry mojood ho
+        // to use current exe par le aao; failure startup nahi rokti.
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                bool autostartDesired = _services.Settings.Autostart || WindowsIntegration.GetAutostart();
+                if (autostartDesired)
+                {
+                    if (WindowsIntegration.EnsureAutostartCurrent(true, out bool autostartChanged, out string? autostartError))
+                    {
+                        if (autostartChanged)
+                            Log.Information("Autostart entry updated to current exe (stale entry repaired)");
+                    }
+                    else
+                    {
+                        Log.Warning("Autostart entry could not be updated to current exe: {Error}",
+                            autostartError ?? "unknown error");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Autostart repair failed — continuing");
+            }
+        }
+
+        // v2.0.2 diagnostic flags (opt-in — default behaviour bilkul
+        // waisa hi jaisa pehle tha; flag na ho to yahan kuch nahi hota).
+        // --software-render: GPU/driver render-thread failure (H2) ka
+        // test — koi window banne se pehle process-wide software
+        // rendering on karo (RenderOptions.ProcessRenderMode static hai,
+        // ek dafa set ho to poore process par lagta hai). Render Tier
+        // log mein likho taake agla report bataye ke GPU tier kya tha.
+        // --classic-window: FluentWindow chrome ke bajaye plain WPF
+        // title bar (WPF-UI #1594 jaisa blank-window case) — flag
+        // MainWindow tak static holder se pohchta hai.
+        if (e.Args.Contains("--software-render"))
+        {
+            RenderOptions.ProcessRenderMode = RenderMode.SoftwareOnly;
+            Log.Information("Software rendering requested (Render Tier: {Tier})", RenderCapability.Tier);
+        }
+        if (e.Args.Contains("--classic-window"))
+        {
+            ClassicWindowRequested = true;
+            Log.Information("Classic window chrome requested");
+        }
+
+        // (Purana unversioned single-instance + duplicate AppServices block
+        // yahan tha — v2.0.2 mein upar versioned block se replace ho gaya;
+        // doosri dafa TryAcquire/AppServices nahi chalne chahiye.)
 
         // AUDIT FIX (F3): akhri-dam ka UI exception handler — koi bhi
         // na-sambhla exception app ko hard crash karne ke bajaye log ho

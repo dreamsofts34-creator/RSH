@@ -3,12 +3,12 @@
 # 2026-11-13: OV cert abhi nahi, v2.0.0 unsigned; winget submit cert
 # khareedne + signed MSIX ke baad (unsigned MSIX winget par nahi jayega),
 # (2) release v2.0.0 GitHub par na ho, (3) InstallerSha256 release MSIX se na mila ho.
-# (4) v2.0.1 note: app framework-dependent hai — MSIX mein .NET 10 Desktop
+# (4) v2.0.2 note: app framework-dependent hai — MSIX mein .NET 10 Desktop
 # Runtime 10.x dependency declare honi chahiye (msix/README.md dekho).
 # Authority: Plan v2.3 §5 Phase H (winget manifest), D22 (MSIX primary).
 # Installer URL + SHA256 release ke baad bharo — yahan guess mat likho.
 PackageIdentifier: dreamsofts34-creator.RSH
-PackageVersion: 2.0.1
+PackageVersion: 2.0.2
 PackageLocale: en-US
 Publisher: RSH
 PublisherUrl: https://github.com/dreamsofts34-creator/RSH
@@ -17,7 +17,7 @@ License: MIT
 ShortDescription: Real Sim Hub — wireless DIY sim-racing wheel (ESP32 + vJoy)
 Description: >-
   RSH turns an ESP32-based DIY sim-racing wheel into a standard game
-  controller (vJoy virtual joystick) on Windows 11. App v2.0.1, firmware
+  controller (vJoy virtual joystick) on Windows 11. App v2.0.2, firmware
   v4.0.0, protocol v2.1.
 Moniker: rsh
 Tags:

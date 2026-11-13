@@ -24,6 +24,17 @@ public partial class MainWindow : FluentWindow
     {
         _services = services;
         InitializeComponent();
+
+        // v2.0.2 diagnostic flag --classic-window: FluentWindow ka
+        // ExtendsContentIntoTitleBar chrome band karke plain WPF title
+        // bar use karo (WPF-UI #1594 jaisa blank-window case).
+        // WindowBackdropType ko nahi chherte — None hi rehta hai.
+        if (App.ClassicWindowRequested)
+        {
+            ExtendsContentIntoTitleBar = false;
+            Log.Information("Classic window chrome applied (ExtendsContentIntoTitleBar=False)");
+        }
+
         Log.Information("Main window created (InitializeComponent done)");
 
         // UI refresh sirf 30 Hz, sirf jab window samne ho — pipeline
@@ -246,7 +257,15 @@ public partial class MainWindow : FluentWindow
 
     protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
     {
-        if (!_reallyExit && _services.Settings.CloseToTray)
+        // v2.0.2 HOTFIX — CloseToTray trap: pehle CloseToTray=true hone par
+        // hamesha hide hota tha, chahe tray icon bana hi na ho (v2.0.0/2.0.1
+        // mein Loaded mar jane par tray kabhi banta hi nahi tha) — X dabane
+        // par app asal mein band hone ke bajaye invisible process ban kar
+        // zinda rehti thi. Ab sirf tab hide karo jab tray asal mein mojood
+        // ho (_trayIcon != null); warna asal exit (tray null hone par
+        // _trayIcon?.Unregister() pehle se null-safe hai).
+        // Default CloseToTray=true rehta hai — koi UX change nahi.
+        if (!_reallyExit && _services.Settings.CloseToTray && _trayIcon is not null)
         {
             e.Cancel = true;
             Hide();

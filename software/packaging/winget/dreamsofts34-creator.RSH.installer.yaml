@@ -3,11 +3,11 @@
 # MSIX signed hona chahiye (Publisher == OV cert Subject, SIGNING.md §3.1) —
 # USER DECISION 2026-11-13: OV cert abhi nahi, v2.0.0 unsigned; winget
 # submit cert khareedne + signed MSIX ke baad.
-# v2.0.1 note: app framework-dependent hai — MSIX mein .NET 10 Desktop
+# v2.0.2 note: app framework-dependent hai — MSIX mein .NET 10 Desktop
 # Runtime 10.x dependency declare karni hogi (msix/README.md dekho),
 # warna install ke baad app runtime ke baghair nahi chalegi.
 PackageIdentifier: dreamsofts34-creator.RSH
-PackageVersion: 2.0.1
+PackageVersion: 2.0.2
 InstallerType: msix
 Architecture: x64
 InstallerUrl: TODO-RELEASE-MSIX-URL

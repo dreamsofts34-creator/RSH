@@ -20,7 +20,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
 $PublishDir = Join-Path $RepoRoot "software\publish\RSH"
 $LayoutDir  = Join-Path $RepoRoot "software\packaging\msix\layout"
-$OutMsix    = Join-Path $RepoRoot "software\packaging\msix\RSH-2.0.1.msix"
+$OutMsix    = Join-Path $RepoRoot "software\packaging\msix\RSH-2.0.2.msix"
 $Manifest   = Join-Path $PSScriptRoot "Package.appxmanifest"
 
 # 0. Manifest mein placeholder Publisher to nahi? (signing ke waqt lazmi check)

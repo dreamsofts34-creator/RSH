@@ -1,6 +1,6 @@
 # RSH — MSIX packaging (D22, Phase H / SW-16)
 
-**Version 2.0.0 — app v2.0.0 · firmware v4.0.0**
+**Version 2.0.2 — app v2.0.2 · firmware v4.0.0**
 
 ## Files
 
@@ -13,7 +13,7 @@
 
 ## Status (honest)
 
-- [x] Manifest draft tayyar (Name RSH, Version 2.0.0.0, MinVersion Win 11
+- [x] Manifest draft tayyar (Name RSH, Version 2.0.2.0, MinVersion Win 11
       10.0.22000.0, capabilities `internetClient` +
       `privateNetworkClientServer`, Executable `RSH.exe`).
 - [ ] **v2.0.1 HOTFIX (W2, 2026-11-13): publish framework-dependent +
@@ -22,8 +22,8 @@
       karne wale PC par **.NET 10 Desktop Runtime** chahiye
       (WPF usi mein hai, sirf base runtime nahi). MSIX mein koi framework
       dependency declare nahi hoti, is liye ye requirement release notes /
-      USER-GUIDE mein likhni hai (W3). **Ho gaya (v2.0.1):** manifest `Version`
-      `2.0.1.0` hai aur script output `RSH-2.0.1.msix` hai. `build-msix.ps1` ki publish command
+      USER-GUIDE mein likhni hai (W3). **Ho gaya (v2.0.2):** manifest `Version`
+      `2.0.2.0` hai aur script output `RSH-2.0.2.msix` hai. `build-msix.ps1` ki publish command
       framework-dependent loose par update kar di gayi hai.
 - [x] `verify-manifest.py` pass (Publisher `CN=RSH` — unsigned identity,
       dekho neeche).

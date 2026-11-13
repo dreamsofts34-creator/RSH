@@ -4,6 +4,7 @@
     <Project Path="src/RSH.Core/RSH.Core.csproj" />
     <Project Path="src/RSH.Output.VJoy/RSH.Output.VJoy.csproj" />
     <Project Path="src/RSH.Output.HIDMaestro/RSH.Output.HIDMaestro.csproj" />
+    <Project Path="src/RSH.RenderTest/RSH.RenderTest.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/RSH.Tests/RSH.Tests.csproj" />
