@@ -56,11 +56,21 @@ public class TransportTests
         // Ek kharab packet bhi — stats mein gin'na chahiye, crash nahi
         await sender.SendAsync(new byte[] { 0x00, 0x01, 0x02 }, 3, ep);
 
-        // Receive loop ko waqt do (loopback par aam tor par chand ms)
+        // Receive loop ko waqt do (loopback par aam tor par chand ms).
+        // Sirf pehle packet ka intezar kafi NAHI: teeno datagrams process
+        // hone tak ruko — loaded runner (2 cores, parallel tests) par
+        // receive loop p2 abhi buffer mein rakh sakta hai jab pehla packet
+        // mil jaye, aur ValidPackets==2 / Sequence==2 ka assert race karta
+        // hai (CI run 43415259155: Expected 2, Actual 1). Test-only fix;
+        // product code mein koi tabdeeli nahi.
         WheelPacket latest = default;
         long age = long.MaxValue;
-        for (int i = 0; i < 100 && !source.TryGetLatest(out latest, out age); i++)
+        for (int i = 0; i < 100 && source.Statistics.TotalDatagrams < 3; i++)
+        {
+            source.TryGetLatest(out latest, out age);
             await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
+        source.TryGetLatest(out latest, out age);
 
         Assert.Equal((ushort)2, latest.Sequence);          // sab se naya wala
         Assert.Equal((ushort)2100, latest.Steering);
