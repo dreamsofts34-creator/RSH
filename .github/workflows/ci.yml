@@ -201,25 +201,133 @@ jobs:
       - name: Run benchmarks (short CI soak)
         # Full soak (60 s default) local/manual run ke liye hai;
         # CI mein --soak-sec 10 taake gate halka rahe.
-        run: dotnet run --project software/tools/RSH.Benchmarks -c Release -- --soak-sec 10
+        # Output benchmarks.log mein bhi jata hai — agla step (Threshold gate)
+        # usi log ko thresholds.json se dobara milata hai (sirf Program.cs ke
+        # apne exit code par bharosa nahi — gate step khud enforcing hai).
+        run: |
+          dotnet run --project software/tools/RSH.Benchmarks -c Release -- --soak-sec 10 > benchmarks.log 2>&1
+          rc=$?
+          cat benchmarks.log
+          exit $rc
 
       - name: Threshold gate
-        # Thresholds TBD — Phase B (P13/P14/T13).
-        # Structure tayyar hai: jab software/tools/RSH.Benchmarks/
-        # thresholds.json maujood hoga, gate us ke khilaf assert karega
-        # aur breach par FAIL hoga. Jab tak file nahi hai, gate PASS
-        # karta hai (jaan-boojh kar fail nahi karwaya — thresholds abhi
-        # final nahi hue). Phase B mein is step ko enforcing banao.
+        # ENFORCING (Phase C QA — pehle sirf print karta tha, TODO ke sath).
+        # 1) thresholds.json lazmi hai (TBD era khatam — file na ho to FAIL).
+        # 2) benchmarks.log mein "--- Gate ---" section lazmi hai, aur us mein
+        #    koi [FAIL] nahi hona chahiye + "GATE PASS" lazmi hai.
+        # 3) Aazad dobara-jaanch: log ki [Parse]/[Pipe]/[E2E]/[Soak] lines se
+        #    numbers nikal kar thresholds.json ke khilaf compare karo — taake
+        #    Program.cs ka exit code khamoshi se badal bhi jaye to gate phir
+        #    bhi breach par FAIL ho. Koi bhi breach = exit 1 = job red.
+        # E2E checks sirf tab jab E2E chala ho (UDP loopback band mahol mein
+        # SKIP hota hai — us surat mein wo checks SKIP, baqi sab enforcing).
         run: |
-          THRESHOLDS="software/tools/RSH.Benchmarks/thresholds.json"
-          if [ ! -f "$THRESHOLDS" ]; then
-            echo "Benchmark thresholds TBD — Phase B (file $THRESHOLDS nahi hai); gate abhi enforce nahi ho raha."
-            exit 0
-          fi
-          python3 - "$THRESHOLDS" <<'EOF'
-          import json, sys
-          print("thresholds file maujood hai — Phase B gate yahan assert karega:", sys.argv[1])
-          print(json.load(open(sys.argv[1])))
-          # TODO (Phase B): benchmark output ko thresholds se compare karo
-          # aur breach par sys.exit(1) karo.
+          python3 - <<'EOF'
+          import json, re, sys
+          from pathlib import Path
+
+          failures, skips, passes = [], [], []
+          def check(name, ok, detail):
+              (passes if ok else failures).append(f"{name}: {detail}")
+          def skip(name, detail):
+              skips.append(f"{name}: {detail}")
+
+          thresholds_path = Path("software/tools/RSH.Benchmarks/thresholds.json")
+          log_path = Path("benchmarks.log")
+          if not thresholds_path.is_file():
+              print(f"FAIL: thresholds.json nahi hai ({thresholds_path}) — gate enforce nahi ho sakta.")
+              sys.exit(1)
+          try:
+              thresholds = json.loads(thresholds_path.read_text())
+          except Exception as e:
+              print(f"FAIL: thresholds.json parse nahi hua: {e}")
+              sys.exit(1)
+          if not log_path.is_file():
+              print("FAIL: benchmarks.log nahi hai — 'Run benchmarks' step chala hi nahi?")
+              sys.exit(1)
+          log = log_path.read_text(errors="replace")
+
+          # --- Gate section (Program.cs ki apni verdict) ---
+          if "--- Gate ---" not in log:
+              print("FAIL: benchmarks.log mein '--- Gate ---' section nahi — benchmarks mukammal nahi chale.")
+              sys.exit(1)
+          gate_section = log.split("--- Gate ---", 1)[1]
+          fail_lines = re.findall(r"\[FAIL\] (.+)", gate_section)
+          if fail_lines:
+              failures.append(f"benchmark gate FAIL lines: {'; '.join(fail_lines)}")
+          if "GATE PASS" not in gate_section:
+              failures.append("benchmark gate mein 'GATE PASS' nahi — gate FAIL ya adhura.")
+
+          # --- Aazad dobara-jaanch: numbers vs thresholds.json ---
+          def num(pat, text, label):
+              m = re.search(pat, text)
+              if not m:
+                  failures.append(f"{label}: log mein number nahi mila (pattern {pat!r}) — benchmark adhura?")
+                  return None
+              return float(m.group(1))
+          def need(key):
+              if key not in thresholds:
+                  failures.append(f"thresholds.json mein '{key}' nahi — fail-closed.")
+                  return None
+              return float(thresholds[key])
+
+          v = num(r"\((\d+) ns/packet\)", log, "parse-ns")
+          t = need("parseNsPerPacketMax")
+          if v is not None and t is not None: check("parse-ns", v <= t, f"{v:.0f} ns/packet <= {t:.0f}")
+          v = num(r"\(([\d.]+) B/packet\)", log, "parse-alloc")
+          t = need("parseAllocBytesPerPacketMax")
+          if v is not None and t is not None: check("parse-alloc", v <= t, f"{v:.2f} B/packet <= {t:.2f}")
+          v = num(r"\((\d+) ns/tick\)", log, "pipe-ns")
+          t = need("pipeNsPerTickMax")
+          if v is not None and t is not None: check("pipe-ns", v <= t, f"{v:.0f} ns/tick <= {t:.0f}")
+          v = num(r"\(([\d.]+) B/tick\)", log, "pipe-alloc")
+          t = need("pipeAllocBytesPerTickMax")
+          if v is not None and t is not None: check("pipe-alloc", v <= t, f"{v:.2f} B/tick <= {t:.2f}")
+
+          if "[E2E]    SKIP" in log:
+              skip("e2e-loss/e2e-age/e2e-pacing", "UDP loopback is mahol mein band — E2E SKIP (fail nahi)")
+          else:
+              v = num(r"lost=(\d+)", log, "e2e-loss")
+              t = need("e2eLostMax")
+              if v is not None and t is not None: check("e2e-loss", v <= t, f"lost={v:.0f} <= {t:.0f}")
+              v = num(r"latest-age avg=[\d.]+ ms p99=([\d.]+) ms", log, "e2e-age")
+              t = need("e2eAgeP99MsMax")
+              if v is not None and t is not None: check("e2e-age", v <= t, f"age p99={v:.1f} ms <= {t:.0f} ms")
+              v = num(r"send-gap avg=[\d.]+ ms p99=([\d.]+) ms", log, "e2e-pacing")
+              t = need("e2eSendGapP99MsMax")
+              if v is not None and t is not None: check("e2e-pacing", v <= t, f"send-gap p99={v:.2f} ms <= {t:.2f} ms")
+
+          v = num(r"\(~([\d.]+)/s\)", log, "soak-rate")
+          t = need("soakTicksPerSecMin")
+          if v is not None and t is not None: check("soak-rate", v >= t, f"{v:.0f} ticks/s >= {t:.0f}")
+          v = num(r"avg tick \(soak-only\)=([\d.]+) us", log, "soak-avg-tick")
+          t = need("soakAvgTickUsMax")
+          if v is not None and t is not None: check("soak-avg-tick", v <= t, f"avg tick {v:.1f} us <= {t:.0f} us")
+          v = num(r"max tick \(lifetime, warm-up samet\)=(\d+) us", log, "soak-max-tick")
+          t = need("soakMaxTickUsMax")
+          if v is not None and t is not None: check("soak-max-tick", v <= t, f"max tick {v:.0f} us <= {t:.0f} us")
+          v = num(r"late=\d+ \(([\d.]+) ?%\)", log, "soak-late")
+          t = need("soakLateTickRatioMax")
+          if v is not None and t is not None: check("soak-late", v / 100.0 <= t, f"late {v:.1f}% <= {t * 100:.0f}%")
+          v = num(r"steady-state \(2nd half\)=([\d.]+) B", log, "soak-alloc")
+          t = need("soakAllocBytesPerTickSecondHalfMax")
+          if v is not None and t is not None: check("soak-alloc", v <= t, f"steady-state alloc {v:.1f} B/tick <= {t:.0f} B/tick")
+          v = num(r"\(growth ([\d.\-]+) MB\)", log, "soak-heap")
+          t = need("soakHeapGrowthMbMax")
+          if v is not None and t is not None: check("soak-heap", v <= t, f"heap growth {v:.2f} MB <= {t:.1f} MB")
+          v = num(r"Gen2 collections=(\d+)", log, "soak-gen2")
+          t = need("soakGen2CollectionsMax")
+          if v is not None and t is not None: check("soak-gen2", v <= t, f"Gen2 collections {v:.0f} <= {t:.0f}")
+          v = num(r"working set [\d.]+ MB -> ([\d.]+) MB", log, "soak-ws")
+          t = need("soakWorkingSetMbMax")
+          if v is not None and t is not None: check("soak-ws", v <= t, f"WS end {v:.1f} MB <= {t:.0f} MB")
+
+          print("--- Threshold gate (enforcing, Phase C QA) ---")
+          for p in passes: print(f"[PASS] {p}")
+          for s in skips: print(f"[SKIP] {s}")
+          for f in failures: print(f"[FAIL] {f}")
+          if failures:
+              print(f"=== THRESHOLD GATE FAIL ({len(failures)} breach, {len(passes)} pass, {len(skips)} skip) ===")
+              sys.exit(1)
+          print(f"=== THRESHOLD GATE PASS ({len(passes)} pass, {len(skips)} skip) ===")
           EOF

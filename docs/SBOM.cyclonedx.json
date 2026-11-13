@@ -1,0 +1,491 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:990ba564-0df5-511f-9432-8a9143847925",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-11-13T00:00:00Z",
+    "component": {
+      "type": "application",
+      "name": "RSH",
+      "version": "2.0.0",
+      "description": "Real Sim Hub \u2014 app v2.0.0 / firmware v4.0.0 / protocol v2.1"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "CommunityToolkit.Mvvm",
+      "version": "8.4.2",
+      "purl": "pkg:nuget/CommunityToolkit.Mvvm@8.4.2",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "HarfBuzzSharp",
+      "version": "8.3.1.1",
+      "purl": "pkg:nuget/HarfBuzzSharp@8.3.1.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "HarfBuzzSharp.NativeAssets.Linux",
+      "version": "8.3.1.1",
+      "purl": "pkg:nuget/HarfBuzzSharp.NativeAssets.Linux@8.3.1.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "HarfBuzzSharp.NativeAssets.Win32",
+      "version": "8.3.1.1",
+      "purl": "pkg:nuget/HarfBuzzSharp.NativeAssets.Win32@8.3.1.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "HarfBuzzSharp.NativeAssets.macOS",
+      "version": "8.3.1.1",
+      "purl": "pkg:nuget/HarfBuzzSharp.NativeAssets.macOS@8.3.1.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK",
+      "version": "4.9.4",
+      "purl": "pkg:nuget/OpenTK@4.9.4",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK.Audio.OpenAL",
+      "version": "4.9.4",
+      "purl": "pkg:nuget/OpenTK.Audio.OpenAL@4.9.4",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK.Compute",
+      "version": "4.9.4",
+      "purl": "pkg:nuget/OpenTK.Compute@4.9.4",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK.Core",
+      "version": "4.9.4",
+      "purl": "pkg:nuget/OpenTK.Core@4.9.4",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK.GLWpfControl",
+      "version": "4.3.3",
+      "purl": "pkg:nuget/OpenTK.GLWpfControl@4.3.3",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK.Graphics",
+      "version": "4.9.4",
+      "purl": "pkg:nuget/OpenTK.Graphics@4.9.4",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK.Input",
+      "version": "4.9.4",
+      "purl": "pkg:nuget/OpenTK.Input@4.9.4",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK.Mathematics",
+      "version": "4.9.4",
+      "purl": "pkg:nuget/OpenTK.Mathematics@4.9.4",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK.Windowing.Common",
+      "version": "4.9.4",
+      "purl": "pkg:nuget/OpenTK.Windowing.Common@4.9.4",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK.Windowing.Desktop",
+      "version": "4.9.4",
+      "purl": "pkg:nuget/OpenTK.Windowing.Desktop@4.9.4",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK.Windowing.GraphicsLibraryFramework",
+      "version": "4.9.4",
+      "purl": "pkg:nuget/OpenTK.Windowing.GraphicsLibraryFramework@4.9.4",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "OpenTK.redist.glfw",
+      "version": "3.4.0.44",
+      "purl": "pkg:nuget/OpenTK.redist.glfw@3.4.0.44",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ScottPlot",
+      "version": "5.1.59",
+      "purl": "pkg:nuget/ScottPlot@5.1.59",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "ScottPlot.WPF",
+      "version": "5.1.59",
+      "purl": "pkg:nuget/ScottPlot.WPF@5.1.59",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "Serilog",
+      "version": "4.4.0",
+      "purl": "pkg:nuget/Serilog@4.4.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "Serilog.Sinks.File",
+      "version": "7.0.0",
+      "purl": "pkg:nuget/Serilog.Sinks.File@7.0.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "SkiaSharp",
+      "version": "3.119.0",
+      "purl": "pkg:nuget/SkiaSharp@3.119.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "SkiaSharp.HarfBuzz",
+      "version": "3.119.0",
+      "purl": "pkg:nuget/SkiaSharp.HarfBuzz@3.119.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "SkiaSharp.NativeAssets.Linux.NoDependencies",
+      "version": "3.119.0",
+      "purl": "pkg:nuget/SkiaSharp.NativeAssets.Linux.NoDependencies@3.119.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "SkiaSharp.NativeAssets.Win32",
+      "version": "3.119.0",
+      "purl": "pkg:nuget/SkiaSharp.NativeAssets.Win32@3.119.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "SkiaSharp.NativeAssets.macOS",
+      "version": "3.119.0",
+      "purl": "pkg:nuget/SkiaSharp.NativeAssets.macOS@3.119.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "SkiaSharp.Views.Desktop.Common",
+      "version": "3.119.0",
+      "purl": "pkg:nuget/SkiaSharp.Views.Desktop.Common@3.119.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "SkiaSharp.Views.WPF",
+      "version": "3.119.0",
+      "purl": "pkg:nuget/SkiaSharp.Views.WPF@3.119.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "System.IO.FileSystem.AccessControl",
+      "version": "5.0.0",
+      "purl": "pkg:nuget/System.IO.FileSystem.AccessControl@5.0.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "System.IO.Ports",
+      "version": "10.0.0",
+      "purl": "pkg:nuget/System.IO.Ports@10.0.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "WPF-UI",
+      "version": "4.3.0",
+      "purl": "pkg:nuget/WPF-UI@4.3.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "WPF-UI.Abstractions",
+      "version": "4.3.0",
+      "purl": "pkg:nuget/WPF-UI.Abstractions@4.3.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "WPF-UI.Tray",
+      "version": "4.3.0",
+      "purl": "pkg:nuget/WPF-UI.Tray@4.3.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "vJoy",
+      "version": "2.2.2.0",
+      "description": "BrunnerInnovation vJoy virtual joystick driver (external driver, app bundle nahi karti \u2014 D18)",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/BrunnerInnovation/vJoy/releases"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": "Arduino-ESP32 framework",
+      "version": "espressif32@6.9.0",
+      "description": "ESP32 firmware framework (platformio.ini pin)",
+      "licenses": [
+        {
+          "license": {
+            "id": "LGPL-2.1-only"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "name": ".NET runtime",
+      "version": "10.0.100",
+      "description": "Self-contained publish ka runtime (software/global.json pin)",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    }
+  ]
+}

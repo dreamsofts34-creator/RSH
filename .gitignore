@@ -7,3 +7,8 @@ TestResults/
 __pycache__/
 *.user
 tests-host/run_tests
+# Signing / Secure Boot keys — kabhi commit mat karo (SEC-C-06, OPEN-19).
+# Release keys repo ke BAHAR hain: ~/workspace/projects/rsh/signing-keys/
+*.pem
+signing-keys/
+secure-boot-key.pem

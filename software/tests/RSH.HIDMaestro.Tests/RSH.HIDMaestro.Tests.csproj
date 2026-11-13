@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+    <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="3.2.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\RSH.Core\RSH.Core.csproj" />
+    <ProjectReference Include="..\..\src\RSH.Output.VJoy\RSH.Output.VJoy.csproj" />
+    <ProjectReference Include="..\..\src\RSH.Output.HIDMaestro\RSH.Output.HIDMaestro.csproj" />
+    <!-- Tests HM* types seedha istemal karte hain (fake SDK, catalog
+         checks) — is liye vendored DLL ka direct reference bhi chahiye. -->
+    <Reference Include="HIDMaestro.Core">
+      <HintPath>..\..\src\RSH.Output.HIDMaestro\lib\HIDMaestro.Core.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

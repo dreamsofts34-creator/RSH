@@ -95,10 +95,11 @@ Notes:
 - **Buttons total** = `button` + `button_matrix` (rows×cols each) + `expander_button`.
 - **I²C kinds** (`axis_ads1115`, `expander_button`) require `expanders=True`, which
   reserves GPIO21/22 — a direct-pin module on 21/22 is then rejected.
-- **AS5600** (`axis_as5600`, D34) is **not yet a validator kind**: it is only valid
-  for ≤ 360° rotation; 900° needs a turn counter (index pulse or software turn
-  tracking), otherwise use `ENCODER_STEERING`. It will be added as an I²C axis kind
-  when FW-12 lands. Unknown kinds are rejected with `unknown kind`, never crash.
+- **AS5600** (`axis_as5600`, D34 — Phase G WS4, `docs/AS5600-SPEC.md`):
+  I²C axis kind hai — koi GPIO pin nahi, `expanders=True` lazmi (I²C bus
+  GPIO21/22), axes limit (≤ 8) mein gina jata hai, aur **max 1 per board**
+  (I²C address 0x36 fixed hai). ≤ 360° direct hai; 900° ke liye turn
+  counter (firmware, `as5600.h`) lazmi hai, warna `ENCODER_STEERING` use karo.
 - `AXIS_GENERIC` (Firmware Plan §3.2) is likewise future — use `axis` for any extra
   pot/hall/slider until then.
 

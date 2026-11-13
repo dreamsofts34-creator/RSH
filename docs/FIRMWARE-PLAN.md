@@ -209,7 +209,18 @@ RPM, gear, flags, speed @ ~30–60 Hz for LED strip / display modules.
 
 ### 6.3 Security
 
-Config/control commands are HMAC-SHA256 signed with a key derived from the OTA password (mbedTLS is already in the ESP32 core). Only stations on the board's own AP can reach port 4212 anyway; the HMAC stops a second device on the AP from rewriting the pin map.
+Config/control commands are HMAC-SHA256 signed with a **per-device random
+32-byte key** (board pehle boot par hardware RNG se banata hai, encrypted
+NVS — `docs/KEY-LIFECYCLE.md` §2, `docs/PROTOCOL-V2.1.md` §4.1; purani
+`PROTOCOL-V2.md` wali "key = SHA-256(OTA password)" derivation **superseded**
+hai, KEY-LIFECYCLE OPEN-1 — use kabhi implement mat karo). Only stations on
+the board's own AP can reach port 4212 anyway; the HMAC stops a second device
+on the AP from rewriting the pin map. WebOTA: har endpoint par auth +
+lockout, signed image verify-before-apply (Ed25519, `docs/SIGNED-OTA.md`).
+
+**SEC-D-04 doc fix (Phase D):** is section ki purani line ("key derived
+from the OTA password") ghalat thi — OTA password se key derive karna
+KEY-LIFECYCLE OPEN-1 ke mutabiq superseded hai. Upar wali line hi sahi hai.
 
 ---
 

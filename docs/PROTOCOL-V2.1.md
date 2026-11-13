@@ -21,6 +21,8 @@ Product naam: **RSH**.
   bytes nahi rakhta.
 - **UDP ports** (unchanged): PC→board `4210` (HELO), board→PC `4211`
   (stream, status, HELLO reply, PIN_PROBE frames), control dono taraf `4212`.
+  Ping (§9) bhi `4212` par hai — control se magic se demux hota hai
+  (`"RSHN"` vs `"RSHC"`), is liye ping ke liye naya port / firewall rule nahi.
 - **Reserved bytes hamesha 0** bhejta hai; receiver nonzero reserved par
   packet/frame **drop + count** karta hai (D6).
 - **Bounds (D6):** nAxes ≤ 8, nBtn ≤ 128 (config ceiling), nEnc ≤ 4. Is se
@@ -64,6 +66,22 @@ Length = `20 + 2·popcount(axisMask) + 2·nEnc + 2`.
 `popcount(axisMask) > 8` mumkin nahi (mask 8 bit hai). Axis indices **slots**
 hain, roles (steering, throttle…) config se map hote hain — PC mapping
 `GET_CFG`/`GET_CAPS` se seekhta hai, hard-coded positions se nahi.
+
+> **Canonical default slot map (Phase F WS5, 2026-11-13):** factory blob
+> mein axes ye slots lete hain — 0 Steering, 1 Accelerator, 2 Brake,
+> 3 Clutch, 4 Handbrake. Clutch default OFF hai (pin GPIO33, `PIN_CLUTCH_ADC`);
+> enabled tab hoti hai jab config blob mein `AXIS_ADC` slot 3, pin 33 ho.
+> Handbrake slot 3 se slot 4 par muntaqil hua (Phase E WS5 stream-emission
+> contract se tabdeeli — host tests §23 isi map par hain).
+>
+> **H-pattern gear bits (Phase F WS5):** Shifter gate mode H-pattern ho
+> to gears 1–6 stream `buttons` bits **5–10** par aate hain (bit 5 = gear 1
+> … bit 10 = gear 6; gear-up/down bits 0–4 se takrao nahi — D1 absolute
+> numbering barkarar). Core `Gear` decode karta hai (0 = neutral; exactly
+> ek gear bit set ho warna 0) aur gear bits ko `ButtonsMask` se hata deta
+> hai. Sequential mode mein bits aam buttons ki tarah guzarte hain aur
+> `Gear` hamesha 0. Gate mode SET_CFG type-11 `SHIFTER` record se aata hai
+> (§3.6).
 
 **Encoders cumulative (D1):** har encoder ka value boot se cumulative count
 hai (i16, wrap allowed — PC delta `new - old` ko i16 wrap ke saath nikale).
@@ -206,6 +224,37 @@ Total **92 B fixed** — parser length se validate kare; `!= 92` → drop.
   `pairingWindowOpen = 0` aur `deviceKey`/`wifiPassword` fields zero. Window
   ke baad dobara pairing ke liye KEY_RESET (§4.4) lazmi hai.
 
+### 2.4 HELO acceptance (Phase D, SEC-D-08)
+
+Pehle 4 bytes `"HELO"` dekhte hi `pcIp` overwrite karna hijack tha — AP
+par koi bhi station ek packet se 200 Hz stream apni taraf mor sakta tha.
+Ab board ye rules lagata hai:
+
+- **Proto check:** 5th byte `0x01` (legacy) ya `0x02` (v2) hona lazmi hai;
+  kuch aur ho to HELO ignore. `sessionFlag` (6th byte) `0`/`1` ke ilawa
+  ho to bhi ignore.
+- **Live-session takeover mana:** jab tak koi PC active ho (aakhri HELO
+  2 s ke andar), koi **doosra IP** `pcIp` overwrite nahi kar sakta — us
+  ka HELO ignore hota hai (na timer refresh, na HELLO reply).
+- **Flap throttle:** idle board par bhi `pcIp` change 5 s mein ek se
+  zyada nahi hota.
+- **HELLO reply rate limit:** 92 B reply vs 5 B request = 18x
+  amplification; flood par board reflector na bane — 500 ms mein ek se
+  zyada HELLO reply nahi.
+- **Residual (documented):** idle board (koi active PC nahi) par koi bhi
+  HELO bhej kar stream le sakta hai — unauthenticated UDP bootstrap ki
+  fitri had hai (OPEN-6). Pairing window (60 s) + pairing ke baad WPA2
+  is ki had bandhte hain; mukammal hal DTLS hai (deferred, §0.8).
+- **SEC-E-14 (Phase F):** stream emission ab authenticated session se
+  bandhi hai — board 200 Hz stream (v1 + v2) sirf tab bhejta hai jab is
+  session mein kam az kam ek HMAC-verified control command ACCEPT hua
+  ho (aam tor par GET_CAPS; `stream_emit.h` / `net.cpp`
+  `sessionAuthenticated`). HELO akela stream nahi kholta; naya peer ya
+  naya nonce (sessionFlag=1) flag saaf kar deta hai. Nateeja: app ko
+  har (dobara) connect par pehle ek signed control command (GET_CAPS)
+  bhejna lazmi hai — sirf HELO bhejne wala dashboard khaali rehta hai.
+  1 Hz status packet is gate se bahar hai (diagnostics, stream nahi).
+
 ## 3. Control frames (port 4212, dono taraf)
 
 ### 3.1 Frame layout
@@ -216,7 +265,7 @@ Total **92 B fixed** — parser length se validate kare; `!= 92` → drop.
 | 4 | cmd | u8 | §3.3 table; reply mein `reqCmd \| 0x80` |
 | 5–6 | reqId | u16 | PC chunta hai; retry mein **wahi** reqId (D3) |
 | 7–10 | counter | u32 | Per-session monotonic (§2.3, §3.2) |
-| 11–12 | len | u16 | Payload length, 0..1024. `> 1024` → `TOO_BIG` |
+| 11–12 | len | u16 | Payload length, 0..1024. `> 1024` → `BAD_LENGTH` (parse result); reply status `TOO_BIG` (4) |
 | 13… | payload | bytes | `len` bytes |
 | last 16 | tag | 16 B | HMAC-SHA256 (§3.1) ke pehle 16 bytes |
 
@@ -234,7 +283,8 @@ aur C++ (`rsh_v2_ctrl_parse_structure`) dono mein yahi rule hai.
 
 - **Key:** per-device random **32 bytes** (OPEN-2 — CLOSED). Koi password
   hash nahi (OPEN-1 — dekho §6.1). Key board pehle boot par hardware RNG se
-  banata hai, encrypted NVS mein rehti hai; app DPAPI se store karti hai
+  banata hai, NVS mein rehti hai (plaintext — encrypted NVS abhi OPEN-3 hai,
+  Phase H; `docs/KEY-LIFECYCLE.md` §2 dekho); app DPAPI se store karti hai
   (`docs/KEY-LIFECYCLE.md` §4).
 - **Tag:** `tag = HMAC-SHA256(key, nonce ‖ counter_LE ‖ cmd ‖ payload)[0:16]`
   — nonce 16 B (HELLO reply se), counter u32 LE, cmd 1 B, payload raw.
@@ -249,9 +299,16 @@ aur C++ (`rsh_v2_ctrl_parse_structure`) dono mein yahi rule hai.
   chahiye (SET_CFG chunk dobara likhna, COMMIT/CONFIRM dobara — sab safe).
 - **Duplicate (exact retransmit):** board pichle **32** `(reqId, counter)`
   pairs (per session) cache rakhta hai. Wahi pair dobara aaye to board
-  **cached reply dobara bhejta hai, dobara execute nahi karta**.
-- **Replay:** naya reqId lekin counter ≤ session ka max-seen counter →
-  reply status `REPLAY` (2). Board koi bhi counter gap accept karta hai
+  **cached reply dobara bhejta hai, dobara execute nahi karta**. Reply
+  cache bhi 32 slots hai; sirf ≤ 128 B replies cache hote hain — is se
+  bara reply (misal poora pin table) cache nahi hota, us ka duplicate
+  dobara execute hota hai (tamam commands idempotent honi chahiye, is
+  liye ye fallback mehfooz hai).
+- **Replay:** naya reqId lekin counter session ke max-seen se **purana**
+  ho → reply status `REPLAY` (2). "Purana" ka matlab RFC 1982 serial
+  arithmetic hai: `(int32_t)(counter − max_seen) ≤ 0` → replay. Is se
+  **counter wrap** bhi sahi chalta hai: `0xFFFFFFFF` ke baad `0` naya
+  counter hai, purana nahi. Board koi bhi counter gap accept karta hai
   (counter > max-seen theek hai — khoya packet session ko wedge nahi karta).
 - **Malformed frame** (bad magic, `len` datagram se match na kare, truncated)
   → **bina reply ke drop** (reqId par bharosa nahi kiya ja sakta). Tag fail
@@ -263,6 +320,20 @@ aur C++ (`rsh_v2_ctrl_parse_structure`) dono mein yahi rule hai.
 - **Timeout:** PC 250 ms mein reply na aaye to retry; 3 retries ke baad
   command fail (UI ko dikhaye). GET_CAPS timeout **2 s** sirf legacy
   fallback ke liye hai (R-H18) — normal command timeout 250 ms × 3 hai.
+
+**Header malleability (SEC-D-07a — Phase D amendment, D3):** tag mein
+sirf `nonce ‖ counter ‖ cmd ‖ payload` hai — header (`magic`/`reqId`/
+`len`) HMAC mein **nahi** hai. Is ka asar tajziya kiya gaya hai:
+`reqId` badalne se koi **nayi execution nahi** hoti — badla hua `reqId`
+ya to cached pair se takra kar **DUPLICATE** (cached reply, no execute)
+banta hai, ya naye `reqId` + purane counter par **REPLAY** (status 2, no
+execute) banta hai. `len` badalne se total length `13 + len + 16` se
+match nahi karti → **BAD_LENGTH, silent drop**. Payload/cmd/counter
+badle baghair koi doosra command execute nahi ho sakta. Is liye tag
+formula **v2.1-frozen rehta hai** — `reqId`/`len` ko HMAC mein shamil
+karna tamam 3-language golden vectors (C#/C++/Python) + deployed app
+v2.0.0 ko invalid kar deta, jab ke security faida sifar hai (upar wala
+tajziya). Ye faisla yahan darj hai taake khamoshi se na badle.
 
 ### 3.3 Commands
 
@@ -276,7 +347,9 @@ aur C++ (`rsh_v2_ctrl_parse_structure`) dono mein yahi rule hai.
 | `0x06` | REVERT | — → `status` |
 | `0x07` | PIN_PROBE | `pin u8, durationMs u16, mode u8` → `status, acceptedMs u16`; phir §3.8 stream frames |
 | `0x08` | FACTORY_RESET | — → `status`; phir reboot (key+password **rehte** hain, §4.3) |
-| `0x09` | REBOOT | — → `status`; phir reboot |
+| `0x09` | REBOOT | — → `status`; phir reboot. **Waahid restart rasta hai**
+  (SEC-D-01): unauthenticated `"RSTX"` (port 4210) **hata diya gaya** —
+  restart sirf HMAC-signed REBOOT se hota hai, reply bhejne ke baad. |
 | `0x0A` | LED_TEST | §3.7 pattern → `status` |
 | `0x0B` | KEY_RESET | — → `status`; sirf key-reset-armed state mein (§4.4, OPEN-10) |
 | `0x0C` | SET_PASSWORD | `newLen u8 (8..63), password[newLen] ASCII` → `status`; §5.2 |
@@ -319,7 +392,9 @@ Pin table entry (8 B):
 Kind: `0 NONE · 1 ADC_NATIVE · 2 ADC_ADS1115 · 3 DIGITAL_IN ·
 4 DIGITAL_OUT · 5 LED_STRIP · 6 I2C_SDA · 7 I2C_SCL ·
 8 EXPANDER_MCP23017 · 9 EXPANDER_PCF8574 · 10 AXIS_GENERIC ·
-11 RESERVED_PIN` (strapping/forbidden — `docs/board-esp32-devkitv1.json`
+11 RESERVED_PIN · 12 AXIS_AS5600` (Phase G WS4 — magnetic encoder axis,
+I²C addr 0x36 fixed, max 1/board; `docs/AS5600-SPEC.md`, D34).
+`RESERVED_PIN` strapping/forbidden hai — `docs/board-esp32-devkitv1.json`
 `class` forbidden/avoid/reserved se map hota hai; WP1/WP2 pin rules hi
 authority hain — GET_CAPS sirf board ki current table batata hai).
 
@@ -339,11 +414,13 @@ Module (roles, Plan v2.3 §4): `0 NONE · 1 STEERING · 2 ACCELERATOR ·
 
 Rules: chunk ≤ 1024 B, total ≤ 2048 B (2 KB). Chunk `offset + chunkLen`
 `total` se zyada ho → `TOO_BIG` (4). Chunk CRC mismatch → `BAD_CRC` (3).
-Chunks kisi bhi order mein aa sakte hain; board staged buffer mein likhta
-hai; poora blob milne par (staged == total) board blob CRC32 (trailer, §3.6)
-verify karta hai — fail ho to agle COMMIT par `PIN_CONFLICT` nahi, `BAD_CRC`
-(3) milega (COMMIT reply status byte mein). Naya SET_CFG session (offset 0,
-alag total) purana staged buffer discard karta hai.
+Pehla chunk offset 0 ka hona chahiye (wo session kholta hai — kisi aur
+offset se shuru ho to `TOO_BIG`); us ke baad chunks kisi bhi order mein
+aa sakte hain; board staged buffer mein likhta hai; poora blob milne par
+(staged == total) board blob CRC32 (trailer, §3.6) verify karta hai — fail
+ho to agle COMMIT par `PIN_CONFLICT` nahi, `BAD_CRC` (3) milega (COMMIT
+reply status byte mein). Naya SET_CFG session (offset 0, alag total) purana
+staged buffer discard karta hai.
 
 ### 3.6 Config blob (staged / stored, §3.5 ka `data`)
 
@@ -352,17 +429,55 @@ Config blob magic **`"RSHG"`** hai (v2 draft ka `"RSHC"` **badal diya gaya**
 SET_CFG payload ke andar aata hai, wire frame nahi hai).
 
 ```
-Header (8 B): 'RSHG' | schema u8 (= 2) | moduleCount u8 | cfgVersion u16 | flags u8 | reserved u8
+Header (8 B): 'RSHG' | schema u8 (= 2) | moduleCount u8 | cfgVersion u16 LE (offset 6)
 Module record (fixed 16 B): type u8 | slot u8 | flags u8 | pinA u8 | pinB u8 | pinC u8 | params[10]
 Trailer (4 B): CRC32 (header + records par, CRC-32/ISO-HDLC, poly 0xEDB88320, init 0xFFFFFFFF)
 ```
 
 Types: `1 AXIS_ADC · 2 AXIS_ADS1115 · 3 BUTTON · 4 BUTTON_MATRIX ·
 5 ENCODER · 6 LED_STRIP · 7 BATTERY · 8 EXPANDER_MCP23017 ·
-9 EXPANDER_PCF8574 · 10 AXIS_GENERIC`.
-Role (steering, throttle, horn…) **PC-side naming** hai, profile mein
-rehta hai; board sirf type/slot/pins/hardware params janta hai.
-Factory default = v3.3 pin map.
+9 EXPANDER_PCF8574 · 10 AXIS_GENERIC · 11 SHIFTER` (Phase F WS5) ·
+`12 AXIS_AS5600` (Phase G WS4 — magnetic encoder axis, I²C addr 0x36
+fixed, max 1/board; record layout `docs/AS5600-SPEC.md` §5).
+Slot semantics (board-side — type/slot hi role tay karta hai; blob hi
+poori sach hai — **replace semantics**: jis function ka record blob mein
+nahi, board usay sample hi nahi karta, pin `0xFF`):
+
+| Type | Slot | Role (board) |
+|---|---|---|
+| `1 AXIS_ADC` | 0 | Steering |
+| `1 AXIS_ADC` | 1 | Accelerator |
+| `1 AXIS_ADC` | 2 | Brake |
+| `1 AXIS_ADC` | 3 | Clutch (koi bhi ADC1 pin 32/33/34/35/36/39) |
+| `1 AXIS_ADC` | 4 | Handbrake |
+| `7 BATTERY` | 0 | Battery sense |
+| `3 BUTTON` | 0 | Shifter up (sequential) |
+| `3 BUTTON` | 1 | Shifter down (sequential) |
+| `3 BUTTON` | 2 | Horn |
+| `5 ENCODER` | 0 | Encoder 1 (pinA/pinB) |
+| `5 ENCODER` | 1 | Encoder 2 (pinA/pinB) |
+| `6 LED_STRIP` | 0 | LED strip data |
+| `11 SHIFTER` | — | Gate mode + H-pattern gear pins (neeche) |
+
+Factory default blob (Phase G C3, 188 B, 11 records, cfgVersion 1):
+AXIS 0:34, 1:35, 2:36, 4:32 · BATTERY 0:39 · BUTTON 0:27, 1:33, 2:4 ·
+ENCODER 0:23/19, 1:16/17 · LED_STRIP 0:21. Clutch default OFF (koi
+record nahi), shifter sequential (koi SHIFTER record nahi). Purana
+7-record factory blob (BUTTON slots 0..3) legacy hai — boot par naye
+factory blob se migrate hota hai. Fixed pins (blob mein nahi):
+accel/brake button-mode pins 25/26 — GET_CAPS mein hamesha aate hain.
+
+> **Type 11 SHIFTER (Phase F WS5; layout Phase G C3 mein code se verify —
+> `pinmap.h`, `config_transaction.h`):** `params[0]` = gate mode
+> (`0` Sequential, `1` H-pattern; koi aur value → reject). Gear pins:
+> `pinA` = gear 1, `pinB` = gear 2, `pinC` = gear 3, `params[1]` = gear 4,
+> `params[2]` = gear 5, `params[3]` = gear 6 (H-pattern mein 6 pins
+> chahiye). Validator: mode 0/1, gear pins range + unique, H-pattern +
+> ENCODER records → `PIN_CONFLICT`. Sequential mode mein SHIFTER record ki
+> zaroorat nahi — BUTTON slots 0/1 (gear up/down) istemal hote hain.
+> Clutch koi naya type nahi — `AXIS_ADC` slot 3, koi bhi ADC1 pin
+> (32/33/34/35/36/39); gear-down `BUTTON` slot 1 hai — dono ek hi pin par
+> hon to validator `PIN_CONFLICT` deta hai.
 
 **Transaction (D28):** stage (SET_CFG chunks) → COMMIT → CONFIRM (30 s) →
 permanent. Confirm na ho 30 s mein → **rollback** (purani config wapas).
@@ -392,6 +507,26 @@ Unknown patternId → `UNSUPPORTED`. LED module configured na ho → reply
 par use na ho — matlab LED strip GPIO21 par digital-out configured hona
 chahiye, warna `PIN_CONFLICT` (5). Test khatam hone par strip purani state
 par wapas.
+
+**Sink (Phase H WS2 — RMT):** Strip ko ESP32 RMT peripheral chalata
+hai (`firmware/rsh/led_sink_rmt.cpp`, hardware timing — bit-bang nahi;
+koi external library nahi, ESP-IDF ka built-in legacy RMT driver).
+Bitstream encode (`ws2812_rmt.h`): GRB order, MSB-first, T0 400/800 ns,
+T1 800/400 ns, reset ≥ 50 us LOW; 16 LEDs ki frame ~511 us, 60 LEDs
+~1778 us (200 Hz loop budget 3500 us se neeche; RMT hardware bhejta
+hai, CPU block nahi hota). Driver (`led_driver.h`) sink sirf frame
+badalne par bulata hai (SOLID 1 write / 5 s). Strip pin config se
+badle (expanders → freed pin) to RMT sink us pin par dobara lagta hai.
+
+**Brightness:** Wire format mein koi brightness field nahi — PC app
+r/g/b ko brightness% se scale karke bhejti hai (integer math,
+`BoardSession.SendLedTestAsync(brightnessPct)`); firmware ko tabdeeli
+nahi chahiye.
+
+**SEC-H-10 (Phase H W7, Low):** Total run time cap **60 s** — repeats
+255 × period 5000 ms ~21 min tak blink kar sakta tha; ab pattern
+60 s ke baad khud all-off ho jata hai (clamp, reject nahi — repeats
+255 wire par valid hai; `led_patterns.h: RSH_LED_TEST_MAX_MS`).
 
 ### 3.8 PIN_PROBE (request + stream frames)
 
@@ -437,7 +572,8 @@ v2 draft ke string/status codes (`0 ok · 1 bad HMAC · 2 bad frame…`)
 ### 4.1 Device key (OPEN-2 — CLOSED)
 
 - **32 bytes**, per-device random, board pehle boot par hardware RNG se
-  generate karta hai, encrypted NVS mein store hoti hai.
+  generate karta hai, NVS mein store hoti hai (plaintext — encrypted NVS
+  abhi OPEN-3 hai, Phase H; `docs/KEY-LIFECYCLE.md` §2 dekho).
 - Sirf **pehli HELLO** mein (pairing window 60 s ke andar) app ko di jati
   hai (§2.2). Window ke baad kabhi nahi.
 - App DPAPI (CurrentUser) se store karti hai; kabhi plain text / log / UI /
@@ -530,6 +666,12 @@ banti, koi pairing nahi. Kamzor ya repeat key ke saath boot **kabhi** aage
 nahi barhega. ESP-IDF RNG API + NVS encryption ka exact mechanism
 (OPEN-3) Phase D ka hai — contract sirf ye behaviour mangta hai: key /
 password **kabhi plain flash mein nahi**, hamesha encrypted NVS mein.
+> **Correction (Phase F W1 — SEC-E-01):** aakhri jumla abhi sach nahi hai.
+> Asal code plaintext NVS istemal karta hai (OPEN-3 khula hai, Phase H);
+> password ke liye Phase F obfuscation (`"wifipw2"`) hai — encryption
+> nahi. Contract ka asal mutalba (flash dump se key/password na mile)
+> **Phase H mein flash encryption se** poora hoga; tab tak residual risk
+> TM-W07 hai.
 
 ## 5. Wi-Fi / OTA password (OPEN-13/14/15/16 — CLOSED)
 
@@ -542,8 +684,9 @@ password **kabhi plain flash mein nahi**, hamesha encrypted NVS mein.
   bina security faide ke. Compromise ka asar bhi ek jaisa hai (dono local
   hain). Is liye ek password, do jagah istemal.
 - **Faisla (OPEN-14): 24 characters**, charset `A–Z, a–z, 2–9` — ambiguous
-  characters `0, 1, I, O, l` **nikal diye gaye** (58 symbols). Entropy ≈
-  `24 × log2(58) ≈ 140 bit`. Generation: hardware RNG, uniform (modulo bias
+  characters `0, 1, I, O, l` **nikal diye gaye** (57 symbols — gin lo:
+  24+25+8; pehle "58" likha tha, wo ghalat tha, SEC-D follow-up mein
+  theek hua). Entropy ≈ `24 × log2(57) ≈ 140 bit`. Generation: hardware RNG, uniform (modulo bias
   se bachne ke liye rejection sampling — Phase D). WPA2-PSK minimum 8
   characters se zyada hai; 24 user ke liye type karne ke qaabil hai.
 - **Display:** app password ko pehli pairing par **ek dafa** QR / label ke
@@ -564,7 +707,41 @@ password **kabhi plain flash mein nahi**, hamesha encrypted NVS mein.
 - SET_PASSWORD HMAC-signed hona lazmi hai (purani key se) — bina key ke
   password nahi badal sakta.
 
-### 5.3 App-side storage (OPEN-15 — CLOSED)
+### 5.3 App-side storage (OPEN-15 — CLOSED, Phase F correction)
+
+> **Correction (Phase F W1, 2026-11-13 — SEC-E-04):** is section par
+> "CLOSED" Phase E se likha tha, lekin implementation ult thi: DPAPI blob
+> (`KeyStore.TrySavePassword`) likha jata tha, parha kabhi nahi jata tha —
+> app asal mein plaintext `WheelWifiPassword` (`settings.json`) istemal
+> karti thi, aur `ChangePassword` + backup zip do mazeed plaintext raste
+> thay. Doc-vs-code contradiction thi; Phase F mein **code ko doc ke
+> mutabiq kiya gaya** (doc ka faisla sahi tha, implementation ghalat thi).
+> Ab sach ye hai:
+>
+> - **Read path:** sirf DPAPI KeyStore (`BoardSession.TryGetWifiPassword`,
+>   board MAC se) — `settings.json` se password kabhi nahi parha jata.
+> - **Write path:** `SET_PASSWORD` kamyaabi par KeyStore mein save hota
+>   hai (`BoardSession.SetPasswordAsync`); Wi-Fi join kamyaabi par bhi
+>   (`ConnectionViewModel.ConnectWifi`); `settings.json` mein kabhi nahi.
+> - **Migration:** purani `settings.json` mein plaintext mile to pehle
+>   HELLO par KeyStore mein migrate hota hai
+>   (`AppServices.TryMigrateWifiPassword`), phir settings dobara save ho
+>   kar disk se saaf ho jata hai. Board kabhi connect na ho to legacy
+>   value sirf us session ki memory mein rehti hai; agla Save disk wali
+>   copy bhi mita deta hai (password dobara darj karna hoga).
+> - **Backup:** `rsh-backup-*.zip` mein `settings.json` live settings se
+>   serialize hoti hai (`AppSettingsStore.ToBackupJson`) — password fields
+>   `[JsonIgnore]` hain, is liye backup mein password kabhi nahi aata.
+> - **Rotation (SEC-E-09):** nayi device key (KEY_RESET / nayi pairing)
+>   purana stored password stale kar deti hai — `UpdateFromHello` use
+>   foran mitata hai. `SET_PASSWORD` ke baad store save fail ho to
+>   `(true, warning)` milta hai (board badal gaya hai — jhoot nahi), aur
+>   warning mein KEY_RESET recovery likhna lazmi hai.
+> - **Board side (SEC-E-01):** password NVS mein ab obfuscated hai
+>   (`"wifipw2"`, device key se keystream XOR — `pw_obfuscate.h`); ye
+>   **obfuscation hai, encryption nahi** (device key khud usi NVS mein
+>   plaintext hai). Asal hal flash encryption / encrypted NVS hai
+>   (OPEN-3) — Phase H, `KEY-LIFECYCLE.md` §2 dekho.
 
 - **Wi-Fi join:** OS Wi-Fi profile (Windows WLAN profile) — app password
   ko apni file mein **nahi** rakhti join ke liye; OS profile is ka ghar hai.
@@ -630,7 +807,7 @@ hai — v2.1 ke liye **ye doc authority** hai.
 |---|---|---|---|
 | OPEN-1 | Key = SHA256(OTA pw) vs per-device random | **CLOSED** | §6.1 — per-device random 32 B; `PROTOCOL-V2.md` update ho gayi |
 | OPEN-2 | Key length | **CLOSED** | §4.1 — **32 bytes** (HMAC-SHA256) |
-| OPEN-3 | Encrypted NVS mechanism + flash encryption on/off | **OPEN — Phase D** | Contract sirf behaviour mangta hai (§4.6: kabhi plain flash nahi). ESP-IDF mechanism firmware ka faisla hai |
+| OPEN-3 | Encrypted NVS mechanism + flash encryption on/off | **OPEN — Phase H** (procedure + secure-build files Phase H W1 mein ban gaye: `docs/FLASH-ENCRYPTION-PROCEDURE.md`, `partitions-secure.csv`, `sdkconfig.secure.defaults`, `[env:esp32dev-secure]`, `secure_nvs.h` runtime check; board execution + closure criteria procedure §5/§8 mein) | Contract sirf behaviour mangta hai (§4.6: kabhi plain flash nahi — **abhi poora nahi hua**, residual TM-W07). ESP-IDF mechanism firmware ka faisla hai |
 | OPEN-4 | RNG tayyari + key-gen failure behaviour | **CLOSED** (behaviour) | §4.6 — fail closed, 3× retry, phir fault state (LED 3-short-blink). API/mechanism Phase D |
 | OPEN-5 | Pairing window start trigger | **CLOSED** | §2.3 — AP-up se 60 s; expiry nishani flags bit3 + zero fields |
 | OPEN-6 | Pairing bootstrap circular dependency | **CLOSED** (**BLOCKER**, coordinator review) | §4.2 — pehli pairing tak AP khula; phir WPA2. Security asar likha hai |
@@ -641,13 +818,13 @@ hai — v2.1 ke liye **ye doc authority** hai.
 | OPEN-11 | OTA key NVS ko nahi chheerti | **OPEN — Phase D** | Contract requirement: OTA NVS key namespace ko preserve kare. Firmware mein confirm karna hai |
 | OPEN-12 | Forced password change UX/flow | **OPEN — Phase D/E** | Mechanism `SET_PASSWORD` (§5.2) define hai; app UX + board apply flow Phase D/E |
 | OPEN-13 | Wi-Fi vs OTA password: ek ya do | **CLOSED** | §5.1 — **ek credential** dono ke liye |
-| OPEN-14 | Password length / charset | **CLOSED** | §5.1 — **24 chars**, `A–Z a–z 2–9` (58 symbols, ≈140 bit) |
-| OPEN-15 | App-side password storage | **CLOSED** | §5.3 — Wi-Fi: OS profile; WebOTA: DPAPI blob (key store ke saath) |
+| OPEN-14 | Password length / charset | **CLOSED** | §5.1 — **24 chars**, `A–Z a–z 2–9` (57 symbols, ≈140 bit) |
+| OPEN-15 | App-side password storage | **CLOSED** (Phase F correction — Phase E ka "CLOSED" daawa ghalat tha: DPAPI blob likha jata tha, parha nahi jata tha; app plaintext `settings.json` istemal karti thi. Phase F W1 mein code doc ke mutabiq hua: read/write sirf KeyStore, migration + backup fix — §5.3 dekho) | §5.3 — Wi-Fi: OS profile; WebOTA: DPAPI blob (key store ke saath) |
 | OPEN-16 | Password bhoolne par reset rasta | **CLOSED** | §5.4 — **KEY_RESET** (key + password dono naye); FACTORY_RESET nahi |
 | OPEN-17 | App-level signature: Ed25519 vs ECDSA P-256 | **CLOSED** (coordinator review) | **Ed25519** — 64 B signatures, deterministic verify, verify ke liye RNG nahi chahiye, ESP-IDF/mbedTLS support. ECDSA P-256 alternate nahi — ek algorithm, wahi verify-before-apply |
 | OPEN-18 | Anti-downgrade exact mechanism | **CLOSED** (rule) / mechanism **Phase D** | Rule: OTA image ka version (fwMajor/Minor/Patch, image header mein) running version se **kam ho to reject**. eFuse counter istemal karna hai ya nahi — Phase D |
 | OPEN-19 | Signing/Secure Boot key compromise response | **OPEN — Phase H** | Release process ka kaam (revocation / re-sign / purane boards) |
-| OPEN-20 | Wired (USB-serial) par pairing | **OPEN — Phase G** | v2.1 mein pairing sirf Wi-Fi SoftAP par define hai; wired spec D26 Phase G mein |
+| OPEN-20 | Wired (USB-serial) par pairing | **CLOSED** (Phase G WS1) | §10.5 — USB cable trust anchor hai; HELLO key disclosure + HMAC GET_CAPS confirm serial par (Wi-Fi pairing §4.2 unchanged) |
 
 ## 8. Verification status
 
@@ -663,6 +840,318 @@ hai — v2.1 ke liye **ye doc authority** hai.
 - **Coordinator review ke liye flagged:** OPEN-6 (bootstrap), OPEN-9
   (BOOT-hold bands), §1.2 status offsets note, §1.1 N1 (buttons 64–127),
   OPEN-17 (Ed25519).
+
+## 9. NTP-style ping (Phase C, SW-13) — E2E latency measurement
+
+Status: **CONTRACT — Phase C deliverable.** Plan v2.3 §3 (R-H2): E2E latency
+**sirf** isi ping se measure hoti hai; jab tak ping na ho, SLO "unmeasured".
+Security requirements: `docs/SECURITY-REVIEW-PHASE-C.md` §4
+(SEC-C-21/22/23/24/25) — neeche §9.4–§9.6 mein wahi numbers/rules contract
+mein likhe gaye hain. **Board-side reply firmware Phase D mein aayega;**
+tab tak virtual wheel (`test-env/virtual-wheel/wheel.py`) ping reply deta
+hai (wahi frame, wahi rate limit) taake PC side rig mein test ho sake.
+
+### 9.1 Frame layout — fixed 34 B (request = reply, dono)
+
+| Bytes | Field | Type | Notes |
+|---|---|---|---|
+| 0–3 | magic | `"RSHN"` | ASCII `0x52 0x53 0x48 0x4E` — stream (`"RSH2"`), control (`"RSHC"`), probe (`"RSHP"`) se alag |
+| 4 | version | u8 | `0x21` (= v2.1, §0) |
+| 5 | type | u8 | `0` = request (PC → board), `1` = reply (board → PC). Aur koi value → drop |
+| 6–7 | seq | u16 | PC chunta hai, har ping +1 (wrap allowed); reply wahi seq echo karta hai |
+| 8–15 | t0 | u64 | PC send, PC monotonic µs (Stopwatch). Request aur reply dono mein wahi value (echo) |
+| 16–23 | t1 | u64 | Board receive, board monotonic µs (boot se). Request mein `0` |
+| 24–31 | t2 | u64 | Board send, board monotonic µs (boot se). Request mein `0` |
+| 32–33 | CRC16 | u16 | §0 ke mutabiq (bytes 0–31 par) |
+
+Total **34 B fixed** — request aur reply dono. Length `!= 34` → drop + count
+(header parha ja sake to `BadLength`, 8 B se chhota ho to `TooShort` —
+control §3.1 jaisa rule). Timestamps **u64 µs** hain: u32 µs 71 min mein wrap
+hota — ping mein wrap nahi chahiye, is liye firmware board clock ko u64
+monotonic rakhega (boot se µs). PC aur board ke epochs alag hain — offset
+formula hi un ka farq nikaalta hai; delay par epoch ka koi asar nahi.
+
+### 9.2 NTP formulas (PC side)
+
+t3 = PC receive ka waqt (wire par nahi aata — PC reply milte hi khud naapta hai).
+
+- **delay** = `(t3 − t0) − (t2 − t1)` — round-trip minus board processing.
+  Yehi E2E network delay hai; SLO isi par lagta hai (p99 ≤ 10 ms Wi-Fi /
+  ≤ 5 ms wired, v2.3 §3).
+- **offset** = `((t1 − t0) + (t2 − t3)) / 2` — board clock − PC clock (µs).
+- **board processing** = `t2 − t1` (diagnostics ke liye).
+
+PC reply tab hi maanta hai jab: magic/version/type/length/CRC sahi hon,
+`type = 1` ho, `seq` aur `t0` bheje gaye request se match karein, aur
+`t2 ≥ t1`, `t3 ≥ t0`, `delay ≥ 0` hon. Warna reply **invalid** hai — metric
+mein nahi daala jata, sirf gin'a jata hai. Timeout (500 ms, koi retry nahi —
+agla ping 1 s baad aata hai) par metric **"unmeasured"** rehta hai, crash nahi.
+
+### 9.3 Board-side reply rules (firmware, Phase D)
+
+- Request milte hi foran reply: t1 = receive karte waqt ka board clock,
+  t2 = send karte waqt ka board clock. Reply banane mein **koi heap
+  allocation nahi, koi state store nahi** — sirf frame bharo aur bhejo.
+- Reply **sirf packet ke asal source address/port** par bhejo (UDP
+  `recvfrom` se mila hua). Payload ke andar koi address hota hi nahi —
+  frame mein address ka field hai hi nahi, is liye payload se address
+  lene ka rasta maujood hi nahi (SEC-C-22).
+- **Firmware status (Phase D, SEC-D-09):** board-side ping handler +
+  per-source token bucket implement hain (`net.cpp` `handle_ping`,
+  `net_logic.h` `rsh_ping_limiter_t` — §9.4 ke numbers). Flood negative
+  test host tests mein hai; rig ka `ntp-ping` scenario PC side + virtual
+  wheel ka reference limiter check karta hai.
+- **Ping se koi state change nahi:** ping HELO ka 2 s silence timer reset
+  **nahi** karta, koi config/session/counter nahi badalta, koi stream
+  packet nahi rokta. Ping sirf jawab deta hai (SEC-C-25). Busy ho (stream
+  loop peeche ho) to ping **drop** karo — stream loop ko kabhi na roko.
+- Reply mein sirf seq + 4 timestamps hote hain — **koi key, nonce,
+  password, ya high-precision uptime nahi** (SEC-C-23). Koi variable-size
+  token nahi hai (seq u16 hi echo token hai, fixed size).
+
+### 9.4 Board-side rate limit — SEC-C-21 (High)
+
+Ping unauthenticated UDP hai (hona hi chahiye — ye measurement hai, control
+nahi; pairing se pehle bhi chalna chahiye). Bina limit ke board reflector /
+DoS vector ban jata hai (TM-W05), is liye:
+
+- **Per-source token bucket: max 10 replies/s, burst 5** (bucket capacity 5,
+  refill 10 tokens/s). Key = **source IP address** (port nahi).
+- Limit se zyada ping **khamoshi se drop** karo — koi error reply nahi
+  (error reply bhi amplification hai). Drop ko gino (diagnostics), lekin
+  drop ki wajah se koi packet mat bhejo.
+- Bucket table **bounded** hai (fixed-size table, misal 64 sources) —
+  attacker sources ki list ko flood na kar sake. Table bhar jaye to sab se
+  purana source nikaal kar naya rakho.
+- Reference implementation: `RSH.Core/Transport/PingRateLimiter.cs`
+  (wahi numbers, unit tests ke saath); virtual wheel mein wahi rule Python
+  mein hai. Firmware Phase D mein is se match karega.
+
+### 9.5 PC-side rules — SEC-C-24 (Low) + SEC-C-22 (Medium)
+
+- **Sender 1–4 Hz:** normal loop 1 Hz; `NtpPingClient` do pings ke darmiyan
+  kam se kam **250 ms** ka waqfa lazmi rakhta hai (max 4 Hz) — is se tez
+  bulaya jaye to packet bheje baghair null milta hai (throttled, timeout nahi).
+- **Ephemeral port (T10):** ping socket bind nahi hota — OS ephemeral port
+  deta hai. Timeout 500 ms, koi retry nahi; jawab na aaye to "unmeasured"
+  dikhao, board-failure nahi.
+- **Reply ≤ request (SEC-C-22):** dono fixed 34 B hain — reply request se
+  bara kabhi nahi, is liye amplification factor ≤ 1 hai. Per-source rate
+  limit (§9.4) reflection ka asal rok hai.
+- **HELO-gating ka faisla (SEC-C-22 sakht option — NAHI liya gaya):**
+  jawab sirf un sources ko dena jinhon ne haal mein valid HELO bheja ho —
+  ye option **reject** kiya gaya hai, kyun ke ping ko pairing/HELO se pehle
+  bhi measurement ke liye chalna hai. Is ke bajaye rate limit (§9.4) +
+  fixed size hi rok hain. Ye faisla yahan darj hai taake khamoshi se na badle.
+- Ping kabhi UI thread par nahi chalta (async); raw ping payload kabhi log
+  nahi hota.
+
+### 9.6 Clock offset — SEC-C-25 (Low)
+
+- Offset **sirf SLO display** (E2E latency panel) ke liye hai. Ping
+  timestamps **untrusted measurement** hain — in se koi auth / replay /
+  expiry / koi security faisla **nahi** hoga. Code mein `PingResult.OffsetUs`
+  ka waahid consumer `E2ELatency` (display) hai — isay koi security path
+  istemal nahi karta, aur aisa karna is contract ki khilaf-warzi hogi.
+- Board ka waqt monotonic hai (wall clock nahi) — NTP adjustment se nahi hilta.
+
+### 9.7 Negative tests (rig mein — `ntp-ping` scenario + unit tests)
+
+- Flood: 100 ping/s ek source se → pehle 5 replies, baqi silent drop;
+  board/stream 200 Hz barqarar (`PingRateLimiter` unit tests + wheel self-check).
+- Spoofed source: reply sirf asal source par, size ≤ request (34 B = 34 B).
+- Ghalat length / ghalat magic / bara token: frame mein variable token hai
+  hi nahi; ghalat length/magic → drop + count, crash nahi.
+- Timeout: board jawab na de → metric "unmeasured", crash nahi; board
+  wapas aaye to measurement dobara shuru.
+- PC flood: `PingAsync` ko 200 Hz par bulana → throttle (250 ms), board
+  tak flood nahi pahunchta.
+
+## 10. Wired USB-serial transport (D26 / OPEN-20, Phase G)
+
+Status: **CONTRACT — Phase G WS1 deliverable** ("Wired spec + working link",
+plan v2.3 §5 D26 — spec ab TBD nahi). Wi-Fi/UDP ke saath **dual transport**:
+wahi v2.1 payloads, wahi session/auth rules — sirf envelope aur medium alag
+hai. Koi naya wire format nahi — serial sirf UDP payloads ko lapet ta hai.
+
+### 10.1 Frame format — "RSHS" envelope
+
+| Bytes | Field | Type | Notes |
+|---|---|---|---|
+| 0–3 | magic | `"RSHS"` | ASCII `0x52 0x53 0x48 0x53` |
+| 4 | kind | u8 | §10.1 table (1..7); aur koi value → BadLength |
+| 5–6 | len | u16 LE | Payload length (0..1053) |
+| 7.. | payload | bytes | Wahi bytes jo UDP par jate (§1/§2/§3/§9) |
+| last 2 | CRC16 | u16 LE | CRC16-CCITT (§0: poly 0x1021, init 0xFFFF) — CRC field se pehle ke tamam bytes par (D2) |
+
+Max payload **1053 B** (bara control frame, §3.1) → max frame **1062 B**.
+Header 7 B, CRC 2 B.
+
+Kinds (payload wahi jo UDP par — koi naya format nahi):
+
+| Kind | Name | Direction | Payload |
+|---|---|---|---|
+| 1 | STREAM | Board → PC | v2.1 `"RSH2"` stream packet (§1.1) ya v1 18 B packet |
+| 2 | STATUS | Board → PC | v2.1 status packet (§1.2, 34/38 B) |
+| 3 | HELLO | Board → PC | HELLO reply (§2.2, 92 B) |
+| 4 | CONTROL | Dono taraf | `"RSHC"` control frame (§3.1, max 1053 B) |
+| 5 | PING | Dono taraf | `"RSHN"` ping frame (§9, 34 B) |
+| 6 | HELO | PC → board | HELO request (§2.1, 5 B `"HELO"` + proto + sessionFlag) |
+| 7 | PROBE | Dono taraf | `"RSHP"` probe frame (§3.8) |
+
+Canonical vectors (§10.1 — 3-language match: C# `SerialFrameCodec`,
+C++ `serial_transport.h` host tests §22, Python `protocol_v2_vectors.py`
+— teeno byte-exact):
+
+- Stream, payload `01..08` → `525348530108000102030405060708d95d` (CRC 0x5DD9)
+- Helo, payload `"HELO" 02 00` → `5253485306060048454c4f02004749` (CRC 0x4947)
+
+Parse error rules (control §3.1 jaisa — B1 rule): **TooShort sirf tab jab
+7 B header bhi poora na ho**; header parh liya gaya ho to har length
+mismatch (truncation, len > 1053, kind unknown, extra byte) → **BadLength**;
+CRC mismatch → **BadCrc**; magic ghalat → **BadMagic**.
+
+### 10.2 Decoder rules (incremental, dono taraf ek jaisi)
+
+- Byte-at-a-time: Serial se jese bytes aain, wese feed karo. Partial frame,
+  chunked delivery aur beech mein garbage (boot log / bootloader output)
+  sab sambhalta hai — ghalat magic/CRC/length par resync, **frame kabhi
+  aadha deliver nahi hota**.
+- Ghalat frame **khamoshi se gira** diya jata hai aur gin'a jata hai
+  (`BadMagic` / `BadCrc` / `BadLength` counters) — koi error reply nahi.
+- **Dropped-frame attribution:** frame gira to bhi, agar header parh liya
+  gaya tha (kind maloom hai) to gira hua frame apne kind ke saath gin'a
+  jata hai — C# `SerialFrameDecoder.FrameDropped` (kind + reason
+  BadCrc/BadLength). Is ka waahid consumer abhi `SerialLink.HelloBadCount`
+  hai: **bad-CRC HELLO frame → `BadCrc` bhi 1, `HelloBadCount` bhi 1**
+  (frame deliver nahi hota, lekin HELLO kharab hai — ye gin'na lazmi hai).
+  Magic scan mein gire bytes ka kind maloom nahi hota — wo sirf `BadMagic`
+  mein rehte hain. Firmware side (`serial_link.cpp`) mein HELLO kabhi
+  inbound nahi aata (board HELLO *bhejta* hai), is liye wahan ye rule
+  laagu nahi — sirf `bad_frames` counter hai.
+- HELLO payload parse fail (valid frame CRC, lekin payload magic/version/
+  length/CRC ghalat) → bhi `HelloBadCount` (dispatch ke baad).
+
+### 10.3 Physical layer — CP2102 USB-UART bridge
+
+- ESP32 DevKit V1 par **native USB nahi hai** — USB-serial ka matlab
+  CP2102 USB-UART bridge (`Serial`) hai. S3 ka native USB OTG is spec ka
+  hissa nahi (Phase G/H HIDMaestro evaluation ke saath future path).
+- **921600 baud, 8N1**, no handshake, no flow control. 115200 kaafi nahi:
+  200 Hz × ~45 B frame ≈ 9000 B/s = 115200 baud ka ~78% — control
+  replies/status ke liye headroom nahi. 921600 par ~10% utilization.
+- **DTR/RTS KABHI assert nahi hote** (`DtrEnable`/`RtsEnable` = false):
+  DevKit V1 par DTR/RTS EN/BOOT lines se jure hote hain — assert karne par
+  board reset ho jata hai ya bootloader mein chala jata hai. Port kholna
+  board ko reset **nahi** karta (flashing tool jaisa behaviour nahi —
+  transport sirf data bhejta hai).
+- Cable unplugged ho to CP2102 bytes yunhi leta hai (koi flow control
+  nahi) — `Serial.write` block nahi hota; read loop port error par band
+  ho kar dobara `Start()` se khulta hai (reconnect).
+
+### 10.4 Dual transport — do peer, do session, ek sequence
+
+- Wi-Fi aur serial **alag peer, alag session** hain: apna HELO timer, apna
+  auth state, apna counter (firmware `net_serial_*` — Wi-Fi `net_*` se
+  alag). Packet ek dafa banta hai, dono transports ko jata hai (har
+  transport ko sirf us ka version: v2 peer ko v2 packet, legacy v1 peer ko
+  v1 packet). Dono peer hon to **seq ek hi rehta hai** (ek sequence space).
+- Stream emission (200 Hz) **per transport gated** hai (SEC-E-14, har
+  transport par alag): serial peer active + v2 + authenticated session
+  (pehle ek HMAC-verified control command, aam tor par GET_CAPS) — warna
+  serial par kuch nahi jata. Status packet (1 Hz) waisi hi gating se
+  serial peer ko jata hai. HELO (unauthenticated bootstrap) se stream
+  kabhi nahi khulta — Wi-Fi jaisa hi rule.
+- Ek serial link par kayi logical channels: stream/status/probe → events
+  (`SerialWheelSource`); control/ping/HELO replies → waiter
+  (`SerialControlTransport` / `SerialPingTransport` / `SendHelloAsync`).
+  **Ek waqt mein ek hi control exchange / HELO / ping** — doosra caller
+  `InvalidOperationException` pata hai (ControlClient sequential hai).
+- PC se board ko na chahiye wale inbound frames (STREAM/STATUS/HELLO/
+  PROBE PC → board) drop + count hote hain (`DroppedInboundFrames` /
+  firmware `serial_link_dropped_inbound()`).
+- Board-side poll har call mein zyada se zyada **512 bytes** drain karta
+  hai (flood se 200 Hz loop starve na ho — `net_poll` ke 8-datagram cap
+  jaisa). Reply banane mein koi heap allocation nahi.
+- Reconnect: cable nikalo + dobara lagao → PC dobara `Start()` karta hai
+  (port reopen, decoder reset, stale bytes discard); board ka serial
+  session HELO timeout ke baad khatam hota hai, naya HELO naya session
+  kholta hai (resume flag ke saath — §2.3).
+
+### 10.5 Wired pairing (OPEN-20 — CLOSED)
+
+- **USB cable trust anchor hai:** pairing ke waqt board aur PC ke darmiyan
+  physical cable hai — jo cable pakar sakta hai, wo board pakar sakta hai.
+  Is liye wired pairing mein **OPEN-6 bootstrap circularity nahi hai**:
+  pehli pairing ke liye khula SoftAP nahi chahiye, AP password ka masla
+  hi nahi — key seedha cable par milti hai.
+- Flow Wi-Fi pairing (§4.2) jaisa hai, transport serial hai:
+  1. Unpaired board (pehla boot ya KEY_RESET ke baad) 60 s pairing window
+     kholta hai (§2.3 — wahi flags bit3 + window rule).
+  2. PC HELO bhejta hai (serial, §10.1 kind 6); board HELLO reply deta
+     hai (serial, kind 3) — **92 B, §2.2 layout, key + Wi-Fi/OTA password
+     sirf unpaired + window-open hon to** (wahi disclosure rule — §4.1).
+  3. App pairing ki tasdeeq karti hai: HMAC-signed GET_CAPS bhejti hai
+     (serial control transport par — wahi `BoardSession` path, transport
+     se be-niyaz; naye nonce, counter 0 se — D3/D30). Board tag verify
+     kare; OK mile to pairing kamyab.
+  4. Kamyab tasdeeq par (ya window khatam hone par) board **paired** mark
+     hota hai. Is ke baad HELLO mein sirf nonce milta hai — key kabhi nahi
+     (serial par bhi nahi).
+  5. Ghalti par: window ke andar GET_CAPS fail ho to app dobara koshish
+     kar sakti hai (naya HELLO, naya session). Window khatam hone ke baad
+     pairing band — dobara pairing ke liye KEY_RESET (§4.4) lazmi hai.
+- `SET_PASSWORD` (§5.2) aur `KEY_RESET` (§4.4) wahi control commands hain
+  — serial par bhi chalte hain (koi alag pairing command nahi).
+- Wi-Fi pairing (§4.2) unchanged — dono raste ek hi key/session rules
+  istemal karte hain; ek dafa paired board dono transports par paired hai.
+
+### 10.6 App side — auto-detect + transport switch
+
+- **Auto-detect:** candidate ports par HELO probe (500 ms timeout) —
+  pehla port jis se valid HELLO (92 B, §2.2) aaye, wahi RSH board hai.
+  Ghalat port (doosra USB-serial device, khaali port) khamoshi se chhor
+  diya jata hai — koi exception bahar nahi aati, sirf null milta hai.
+  (`SerialDeviceDetector.DetectAsync` / `DetectOnSystemPortsAsync`.)
+- **Transport switch** (`AppServices`): `SwitchToSerialAsync(portName)` /
+  `SwitchToWifi()` / `DetectAndSwitchToSerialAsync()` — engine dobara
+  banta hai (naye source ke saath), HELO serial se bheja jata hai,
+  control transport serial par chala jata hai (`ActiveControlTransport`).
+  Switch par purana transport band hota hai (port close + dispose).
+- **Koi engine duplication nahi:** `SerialWheelSource` wahi interfaces
+  implement karta hai jo `UdpWheelSource` karta hai (`ISampleSource` /
+  `IV2SampleSource` / `IStatusSource` / `IWheelSource`) — WheelEngine ko
+  farq nahi parta ke packet UDP se aaya ya USB-serial se. Link SHARED
+  hota hai (control transport bhi usi link par), is liye source by default
+  link ka malik nahi hota (`ownsLink: false` — `Stop()` link ko band nahi
+  karta).
+- **Ping SLO wired:** E2E p99 ≤ 5 ms (§9.2 — Wi-Fi ≤ 10 ms, wired ≤ 5 ms);
+  wahi `NtpPingClient`, wahi 34 B frame, sirf transport alag hai
+  (`SerialPingTransport`).
+
+### 10.7 Verification — sandbox mein kya hua, kya baaqi hai
+
+- **C# (sandbox):** `PhaseGWorkstream1Tests` — 17 tests, sab pass: codec
+  canonical vectors + round-trip + error rules, decoder (byte-at-a-time /
+  chunked / garbage resync / bad CRC), SerialLink loopback (HELO/HELLO,
+  control GET_CAPS, ping echo, timeout, busy-throw, bad-HELLO counting,
+  unsolicited/dropped), transports, SerialWheelSource (v2 stream + status
+  + HELLO slot), detector (live port milta hai, dead port skip). Asal USB
+  port / board ki zaroorat nahi — in-memory `LoopbackSerialPort` do
+  `ISerialPort` ko jorta hai (rig pty jaisa, lekin process ke andar).
+- **C++ (sandbox):** host tests §22 — framing build/parse, canonical
+  vectors byte-exact, decoder byte-at-a-time/chunked/garbage; Python
+  vectors (§10.1) 3-language match.
+- **Firmware (sandbox):** `pio run` SUCCESS — `serial_link` + `net_serial_*`
+  + `rsh.ino` emission wiring; real board par stream rate verify nahi hua.
+- **Rig scenario nahi hai:** Virtual Test Rig ka harness UDP-based hai —
+  serial ke liye koi rig scenario nahi banaya gaya (rig behaviour badle
+  baghair). Sandbox verification = WS1 loopback tests + host tests (rig
+  ke unit stage mein chalte hain).
+- **Phase H A7 (real board / Windows PC) par verify hoga:** asal CP2102
+  port par 921600 baud link, 200 Hz serial stream rate + jitter, cable
+  unplug/replug recovery, DTR/RTS no-reset behaviour, Windows COM port
+  auto-detect, wired pairing end-to-end (pehli dafa key exchange USB se).
 
 ## Appendix A — v1 legacy packet (reference, unchanged)
 

@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using RSH.Core.Output;
+using RSH.Core.Pipeline;
 using RSH.Core.Processing;
 
 namespace RSH.Output.VJoy;
@@ -20,10 +21,15 @@ public sealed class VJoyOutput : IJoystickOutput
     public const ushort UsageX = 0x30;
     public const ushort UsageY = 0x31;
     public const ushort UsageZ = 0x32;
+    // Phase G C8: Slider (HID Generic Desktop usage 0x36 — X 0x30, Y 0x31,
+    // Z 0x32, Rx 0x33, Ry 0x34, Rz 0x35, Slider 0x36, Dial 0x37, Wheel
+    // 0x38) — handbrake isi axis par jata hai (docs/HANDBRAKE-MAPPING.md).
+    public const ushort UsageSlider = 0x36;
 
     private readonly uint _deviceId;
     private JoystickPosition _position;
     private bool _connected;
+    private bool _capsKnown;   // P12: TryConnect ne caps parhe hon to true — warna Unknown
 
     static VJoyOutput()
     {
@@ -64,11 +70,64 @@ public sealed class VJoyOutput : IJoystickOutput
     public bool HasAxisX { get; private set; }
     public bool HasAxisY { get; private set; }
     public bool HasAxisZ { get; private set; }
+    /// <summary>Phase G C8: device mein Slider axis hai ya nahi (handbrake).</summary>
+    public bool HasAxisSlider { get; private set; }
 
     private static string FormatVersion(ushort v) =>
         $"{(v >> 8) & 0xF}.{(v >> 4) & 0xF}.{v & 0xF}";
 
-    public bool TryConnect(out string error)
+    /// <summary>
+    /// P12 (D11): device ki salahiyatein configured modules ke khilaf
+    /// validate karo — sirf enabled modules ki zarooratein lagti hain.
+    /// Steering-only wheel valid hai (sirf X axis chahiye, buttons ki
+    /// shart nahi); band module ke liye axis/button ki shart nahi.
+    /// Clutch ka vJoy mapping hai (WClutch — BuildPosition, Phase F WS5);
+    /// Encoders ka mapping hai (pulse buttons 65..72 — EncoderPulseMask,
+    /// BuildPosition, Phase F WS5 — device caps se mask, koi shart nahi);
+    /// Phase G C8: Handbrake → WSlider (analog). Slider ki HID usage
+    /// (0x36) hoti hai, is liye driver se poocha ja sakta hai — Handbrake
+    /// enabled ho aur device mein Slider na ho to error hai (khamoshi se
+    /// drop nahi — D11). Shifter/Horn/LED ka is app path mein koi vJoy
+    /// axis/button mapping nahi, is liye un ki koi shart nahi.
+    /// Khaali list = valid.
+    /// </summary>
+    public static IReadOnlyList<string> ValidateCapabilities(PipelinePlan plan, VJoyCapabilities caps)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        var errors = new List<string>();
+        if (caps.ButtonCount is < 0 or > VJoyCapabilities.MaxButtons)
+            errors.Add($"ButtonCount {caps.ButtonCount} hadd se bahar hai (0..{VJoyCapabilities.MaxButtons}).");
+        if (plan.IsEnabled(ModuleKind.Steering) && !caps.HasAxisX)
+            errors.Add("Steering module on hai lekin vJoy device mein X axis nahi hai.");
+        if (plan.IsEnabled(ModuleKind.Accelerator) && !caps.HasAxisY)
+            errors.Add("Accelerator module on hai lekin vJoy device mein Y axis nahi hai.");
+        if (plan.IsEnabled(ModuleKind.Brake) && !caps.HasAxisZ)
+            errors.Add("Brake module on hai lekin vJoy device mein Z axis nahi hai.");
+        if (plan.IsEnabled(ModuleKind.Handbrake) && !caps.HasAxisSlider)
+            errors.Add("Handbrake module on hai lekin vJoy device mein Slider axis nahi hai.");
+        if (plan.IsEnabled(ModuleKind.Buttons) && caps.ButtonCount < 1)
+            errors.Add("Buttons module on hai lekin vJoy device mein koi button nahi hai.");
+        return errors;
+    }
+
+    /// <summary>
+    /// P12: maujooda (connected) device ki salahiyatein plan ke khilaf
+    /// validate karo. Connect se pehle caps (false/0) hain — is liye
+    /// ye sirf connected device par maani rakhta hai.
+    /// </summary>
+    public IReadOnlyList<string> ValidateCurrentCapabilities(PipelinePlan plan) =>
+        ValidateCapabilities(plan, new VJoyCapabilities(HasAxisX, HasAxisY, HasAxisZ, ButtonCount, HasAxisSlider));
+    /// <summary>Is device ki salahiyatein (TryConnect ke baad sahi hoti hain).</summary>
+    public VJoyCapabilities Capabilities => new(HasAxisX, HasAxisY, HasAxisZ, ButtonCount, HasAxisSlider);
+
+    public bool TryConnect(out string error) => TryConnect(out error, plan: null);
+
+    /// <summary>
+    /// P12: plan diya jaye to connect ke baad capabilities us ke khilaf
+    /// validate hoti hain — fail ho to device wapas kar diya jata hai
+    /// (relinquish) aur wajah ke saath false milta hai.
+    /// </summary>
+    public bool TryConnect(out string error, PipelinePlan? plan)
     {
         error = "";
         if (_connected) return true;
@@ -109,7 +168,7 @@ public sealed class VJoyOutput : IJoystickOutput
                     error = $"vJoy device {_deviceId} kisi aur app ke paas hai (BUSY). Wo app band karke dobara koshish karo.";
                     return false;
                 case VjdStatus.Missing:
-                    error = $"vJoy device {_deviceId} maujood nahi. vJoyConf mein Device {_deviceId} enable karo (X, Y, Z axes ke sath).";
+                    error = $"vJoy device {_deviceId} maujood nahi. vJoyConf mein Device {_deviceId} enable karo (X, Y, Z + Slider axes ke sath).";
                     return false;
                 default:
                     error = $"vJoy device {_deviceId} ki halat maloom nahi ho saki (Unknown).";
@@ -120,7 +179,22 @@ public sealed class VJoyOutput : IJoystickOutput
             HasAxisX = NativeMethods.GetVJDAxisExist(_deviceId, UsageX);
             HasAxisY = NativeMethods.GetVJDAxisExist(_deviceId, UsageY);
             HasAxisZ = NativeMethods.GetVJDAxisExist(_deviceId, UsageZ);
+            HasAxisSlider = NativeMethods.GetVJDAxisExist(_deviceId, UsageSlider);
             ButtonCount = NativeMethods.GetVJDButtonNumber(_deviceId);
+            _capsKnown = true;
+
+            // P12 (D11): plan diya ho to capabilities us ke khilaf
+            // validate karo — fail ho to device wapas karo, connect nahi.
+            if (plan is not null)
+            {
+                var errors = ValidateCapabilities(plan, Capabilities);
+                if (errors.Count > 0)
+                {
+                    RelinquishIfConnected();
+                    error = "vJoy device is plan ke liye kaafi nahi hai: " + string.Join(" ", errors);
+                    return false;
+                }
+            }
 
             NativeMethods.ResetVJD(_deviceId);
             SendNeutral();
@@ -167,20 +241,69 @@ public sealed class VJoyOutput : IJoystickOutput
     {
         if (!_connected) throw new InvalidOperationException("vJoy connected nahi hai.");
 
-        var p = NeutralPosition(_deviceId);
-        p.WAxisX = state.SteeringAxis;
-        p.WAxisY = state.AccelAxis;
-        p.WAxisZ = state.BrakeAxis;
-        // V3 ke khaas driving axes par bhi wahi values — jo game inhe
-        // parhta hai, use bhi durust data mile.
-        p.WSteering = state.SteeringAxis;
-        p.WAccelerator = state.AccelAxis;
-        p.WBrake = state.BrakeAxis;
-        p.LButtons = (int)(state.ButtonsMask & 0xFFFF_FFFF);
-        _position = p;
+        // P12: position har Update par neutral se dobara banti hai
+        // (rebuild) — caps maloom hon to sirf wohi axes likhe jate hain
+        // jo device mein hain (baqi neutral rehte hain), aur buttons
+        // device ke ButtonCount se mask hote hain (count se zyada bits
+        // kabhi nahi). Caps maloom na hon (kabhi connect nahi hua) to
+        // Unknown = sab kuch likho (purana behaviour; T11 mapping tests
+        // isi par hain — default false/0 ko "device mein kuch nahi"
+        // samajhna ghalat tha, wo "maloom nahi" hai).
+        _position = BuildPosition(state, _capsKnown ? Capabilities : VJoyCapabilities.Unknown, _deviceId);
 
         if (!NativeMethods.UpdateVJD(_deviceId, ref _position))
             throw new InvalidOperationException("UpdateVJD nakam — device haath se nikal gaya lagta hai.");
+    }
+
+    /// <summary>
+    /// P12: ProcessedState → JoystickPosition, device ki salahiyaton ke
+    /// khilaf. Pure function — baghair driver ke test ho sakta hai.
+    /// Na-mojood axis neutral rehta hai; buttons ButtonCount se mask hote hain.
+    /// T11/Ex: ButtonsMaskEx (33..96) → LButtonsEx1 (33..64, neeche 32 bits),
+    /// LButtonsEx2 (65..96, oopar 32 bits); LButtonsEx3 (97..128) ka koi
+    /// source nahi (wire max 64 buttons) — hamesha 0.
+    /// Phase F WS5: encoder pulses (ProcessedState.EncoderPulseMask, bit
+    /// (n-65) = vJoy button n, 65..72) LButtonsEx2 mein OR hote hain
+    /// (caps.Ex2Mask se mask — 72 se kam buttons wale device par pulses
+    /// khamoshi se mask ho jati hain, koi error nahi).
+    /// Phase G C8: handbrake → WSlider (analog, caps-gated — device mein
+    /// Slider na ho to neutral rehta hai; validation mein ye error hai,
+    /// dekho ValidateCapabilities). Faisla: docs/HANDBRAKE-MAPPING.md.
+    /// </summary>
+    internal static JoystickPosition BuildPosition(in ProcessedState state, VJoyCapabilities caps, uint deviceId)
+    {
+        var p = NeutralPosition(deviceId);
+        if (caps.HasAxisX)
+        {
+            p.WAxisX = state.SteeringAxis;
+            p.WSteering = state.SteeringAxis;   // V3 khaas driving axis
+        }
+        if (caps.HasAxisY)
+        {
+            p.WAxisY = state.AccelAxis;
+            p.WAccelerator = state.AccelAxis;
+        }
+        if (caps.HasAxisZ)
+        {
+            p.WAxisZ = state.BrakeAxis;
+            p.WBrake = state.BrakeAxis;
+        }
+        // Phase F WS5: clutch → WClutch (vJoy V3 driving axis). Is ke liye
+        // caps mein koi flag nahi (HasAxisX/Y/Z sirf X/Y/Z hain) — field
+        // NeutralPosition mein bhi hamesha likha jata hai (min), aur
+        // device mein axis na ho to driver is field ko ignore karta hai.
+        p.WClutch = state.ClutchAxis;
+        // Phase G C8: handbrake → WSlider (analog). vJoy V3 mein handbrake
+        // ka koi dedicated axis nahi (sirf Steering/Accel/Brake/Clutch);
+        // Slider generic 1-D axis hai — games isay handbrake ke tor par
+        // bind kar sakte hain. Neutral = AxisMin (chhora hua), pedals jaisa.
+        if (caps.HasAxisSlider)
+            p.WSlider = state.HandbrakeAxis;
+        p.LButtons = (int)(state.ButtonsMask & caps.ButtonMask);
+        p.LButtonsEx1 = (int)(uint)(state.ButtonsMaskEx & caps.Ex1Mask);
+        p.LButtonsEx2 = (int)(uint)(((state.ButtonsMaskEx >> 32) | state.EncoderPulseMask) & caps.Ex2Mask);
+        p.LButtonsEx3 = 0;   // 97..128: koi wire source nahi (StatusPacketV2.BtnsEx sirf 32..63 deta hai)
+        return p;
     }
 
     public void SendNeutral()
@@ -205,7 +328,10 @@ public sealed class VJoyOutput : IJoystickOutput
             WThrottle = c, WRudder = c, WAileron = c,
             WAxisX = c, WAxisY = min, WAxisZ = min,
             WAxisXRot = c, WAxisYRot = c, WAxisZRot = c,
-            WSlider = c, WDial = c, WWheel = c,
+            // Phase G C8: Slider handbrake hai — neutral = min (chhora hua),
+            // center nahi (center aadha handbrake hota). Slider pehle kisi
+            // module mein istemal nahi hota tha, is liye koi aur asar nahi.
+            WSlider = min, WDial = c, WWheel = c,
             WAccelerator = min, WBrake = min, WClutch = min, WSteering = c,
             WAxisVX = c, WAxisVY = c,
             LButtons = 0,

@@ -18,4 +18,20 @@
     <SolidColorBrush x:Key="RSHNavActiveForegroundBrush" Color="#4B2FD0" />
     <SolidColorBrush x:Key="RSHNavDotBrush" Color="#C9C1EE" />
     <SolidColorBrush x:Key="RSHShadowColorBrush" Color="#3C288C" />
+    <!-- UI-12: theme-aware Color keys — RSHTheme.xaml mein Ax* brushes
+         in se bante hain, taake page content bhi Dark mein badle. -->
+    <Color x:Key="RSHBackgroundColor">#F5F3FF</Color>
+    <Color x:Key="RSHCardColor">#FFFFFF</Color>
+    <Color x:Key="RSHTextColor">#1F1B2E</Color>
+    <Color x:Key="RSHSecondaryTextColor">#5F5A7A</Color>
+    <Color x:Key="RSHTrackColor">#ECE8FA</Color>
+    <Color x:Key="RSHBorderColor">#E7E3F7</Color>
+    <Color x:Key="RSHAccentSoftColor">#EEE9FF</Color>
+    <Color x:Key="RSHAccentDeepColor">#4B2FD0</Color>
+    <Color x:Key="RSHAccentColor">#6C4CF1</Color>
+    <Color x:Key="RSHAccentHoverColor">#5A3BE0</Color>
+    <Color x:Key="RSHErrorColor">#B42318</Color>
+    <Color x:Key="RSHWarningTextColor">#B54708</Color>
+    <Color x:Key="RSHBannerColor">#FFF4E5</Color>
+    <Color x:Key="RSHSuccessTextColor">#146C35</Color>
 </ResourceDictionary>

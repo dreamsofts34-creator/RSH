@@ -60,7 +60,7 @@ public class TransportTests
         WheelPacket latest = default;
         long age = long.MaxValue;
         for (int i = 0; i < 100 && !source.TryGetLatest(out latest, out age); i++)
-            await Task.Delay(10);
+            await Task.Delay(10, TestContext.Current.CancellationToken);
 
         Assert.Equal((ushort)2, latest.Sequence);          // sab se naya wala
         Assert.Equal((ushort)2100, latest.Steering);
@@ -92,5 +92,127 @@ public class TransportTests
         Assert.Equal(1, stats.BadCrc);
         Assert.Equal(2, stats.LostPackets);
         Assert.Equal(40.0, stats.LossPercent, precision: 1);   // 2 / (3+2)
+    }
+
+    // ---- P8 (D8): LossPercent sliding window, last 1000 packets ----
+
+    private static void FeedContiguous(LinkStatistics stats, int start, int count)
+    {
+        for (int i = 0; i < count; i++)
+            stats.Record(PacketParseResult.Ok, (ushort)(start + i));
+    }
+
+    [Fact]
+    public void LossPercent_NoPackets_IsZero()
+    {
+        var stats = new LinkStatistics();
+        Assert.Equal(0.0, stats.LossPercent, precision: 1);
+    }
+
+    [Fact]
+    public void LossPercent_Under1000_PartialWindowCounts()
+    {
+        var stats = new LinkStatistics();
+        FeedContiguous(stats, 0, 10);          // 10 valid, 0 lost
+        Assert.Equal(0.0, stats.LossPercent, precision: 1);
+        stats.Record(PacketParseResult.Ok, 20); // gap 10..19 ghayeb
+        // Window: 11 valid + 10 lost = 21 entries → 10/21 = 47.6%
+        Assert.Equal(47.6, stats.LossPercent, precision: 1);
+        Assert.Equal(10, stats.LostPackets);   // cumulative counter waisa hi
+    }
+
+    [Fact]
+    public void LossPercent_Exactly1000_BoundaryEvictsOldest()
+    {
+        var stats = new LinkStatistics();
+        stats.Record(PacketParseResult.Ok, 0);     // window: [V]
+        stats.Record(PacketParseResult.Ok, 1000);  // 999 lost + 1 valid
+        // 1001 entries hoti — sab se purani (pehli V) bahar girti hai:
+        // window = 999 lost + 1 valid = 99.9%
+        Assert.Equal(99.9, stats.LossPercent, precision: 1);
+        stats.Record(PacketParseResult.Ok, 1001);  // ek aur valid
+        // Sab se purana lost bahar gira: 998 lost + 2 valid = 99.8%
+        Assert.Equal(99.8, stats.LossPercent, precision: 1);
+    }
+
+    [Fact]
+    public void LossPercent_Exactly1000Valid_ThenSmallLoss()
+    {
+        var stats = new LinkStatistics();
+        FeedContiguous(stats, 0, 1000);        // 1000 valid → 0%
+        Assert.Equal(0.0, stats.LossPercent, precision: 1);
+        stats.Record(PacketParseResult.Ok, 1009); // 9 ghayeb
+        // Window ab bhi 1000: 991 valid + 9 lost → 0.9%
+        Assert.Equal(0.9, stats.LossPercent, precision: 1);
+    }
+
+    [Fact]
+    public void LossPercent_OldLossAgesOut_After1000GoodPackets()
+    {
+        var stats = new LinkStatistics();
+        stats.Record(PacketParseResult.Ok, 0);
+        stats.Record(PacketParseResult.Ok, 100); // 99 ghayeb
+        Assert.Equal(98.0, stats.LossPercent, precision: 1); // 99/101
+        FeedContiguous(stats, 101, 500);
+        // Window 601 entries, loss abhi bhi andar: 99/601 = 16.5%
+        Assert.Equal(16.5, stats.LossPercent, precision: 1);
+        FeedContiguous(stats, 601, 1000);
+        // 1000 naye valid packets ne purana loss poora bahar dhakel diya
+        Assert.Equal(0.0, stats.LossPercent, precision: 1);
+        // Cumulative counter window se mutasir nahi hota — loss hua tha
+        Assert.Equal(99, stats.LostPackets);
+    }
+
+    [Fact]
+    public void LossPercent_RebootDoesNotSpike()
+    {
+        var stats = new LinkStatistics();
+        FeedContiguous(stats, 0, 100);         // 0% loss
+        Assert.Equal(0.0, stats.LossPercent, precision: 1);
+        stats.Record(PacketParseResult.Ok, 5); // reboot: seq 0 se shuru
+        Assert.Equal(0.0, stats.LossPercent, precision: 1);
+        Assert.Equal(0, stats.LostPackets);    // koi fake loss nahi
+        FeedContiguous(stats, 6, 100);
+        Assert.Equal(0.0, stats.LossPercent, precision: 1);
+    }
+
+    [Fact]
+    public void LossPercent_DuplicatesDoNotDiluteWindow()
+    {
+        var stats = new LinkStatistics();
+        stats.Record(PacketParseResult.Ok, 0);
+        stats.Record(PacketParseResult.Ok, 10); // 9 ghayeb → 9/11 = 81.8%
+        Assert.Equal(81.8, stats.LossPercent, precision: 1);
+        for (int i = 0; i < 10; i++)
+            stats.Record(PacketParseResult.Ok, 10); // duplicate
+        Assert.Equal(10, stats.DuplicatesOrLate);
+        Assert.Equal(81.8, stats.LossPercent, precision: 1); // badla nahi
+        stats.Record(PacketParseResult.Ok, 11); // naya valid → 9/12
+        Assert.Equal(75.0, stats.LossPercent, precision: 1);
+    }
+
+    [Fact]
+    public void LossPercent_HugeGapSaturatesAtWindow()
+    {
+        var stats = new LinkStatistics();
+        stats.Record(PacketParseResult.Ok, 0);
+        stats.Record(PacketParseResult.Ok, 5000); // 4999 ghayeb
+        // Window mein sirf aakhri 1000: 999 lost + 1 valid = 99.9%
+        Assert.Equal(99.9, stats.LossPercent, precision: 1);
+        Assert.Equal(4999, stats.LostPackets); // cumulative poora
+    }
+
+    [Fact]
+    public void LossPercent_ResetSequenceBaselineClearsWindow()
+    {
+        var stats = new LinkStatistics();
+        stats.Record(PacketParseResult.Ok, 0);
+        stats.Record(PacketParseResult.Ok, 10); // 81.8%
+        Assert.Equal(81.8, stats.LossPercent, precision: 1);
+        stats.ResetSequenceBaseline();           // naya link/session
+        Assert.Equal(0.0, stats.LossPercent, precision: 1);
+        Assert.Equal(0, stats.LostPackets);
+        FeedContiguous(stats, 0, 3);
+        Assert.Equal(0.0, stats.LossPercent, precision: 1);
     }
 }

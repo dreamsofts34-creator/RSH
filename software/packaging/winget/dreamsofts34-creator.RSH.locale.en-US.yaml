@@ -1,0 +1,18 @@
+# RSH — winget locale manifest draft (Phase H / SW-16)
+# DRAFT — winget submit karne se pehle installer manifest ke TODO bharo.
+PackageIdentifier: dreamsofts34-creator.RSH
+PackageVersion: 2.0.0
+PackageLocale: en-US
+Publisher: RSH
+PublisherUrl: https://github.com/dreamsofts34-creator/RSH
+PackageName: RSH
+License: MIT
+Copyright: Dreamsofts
+ShortDescription: Real Sim Hub — wireless DIY sim-racing wheel (ESP32 + vJoy)
+Description: >-
+  RSH turns an ESP32-based DIY sim-racing wheel into a standard game
+  controller (vJoy virtual joystick) on Windows 11. App v2.0.0, firmware
+  v4.0.0, protocol v2.1.
+ReleaseNotesUrl: https://github.com/dreamsofts34-creator/RSH/releases/tag/v2.0.0
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

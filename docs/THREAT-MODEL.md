@@ -167,14 +167,19 @@ pehle, fallback IP) + UDP port 4212. Stream packets (200 Hz) aur control frames
   flash reader) aur encrypted NVS se key nikalne ki koshish karta hai.
 - **Asar:** Zyada (agar kamyab ho to poora control).
 - **Mitigation:**
-  - Key encrypted NVS mein hai (WP4 design).
+  - Key encrypted NVS mein hai (WP4 design — **abhi implement nahi**:
+    NVS plaintext hai, OPEN-3 khula hai; procedure
+    `docs/FLASH-ENCRYPTION-PROCEDURE.md` mein hai).
   - Secure Boot v2 RSA-3072 (eFuse digest) — sirf signed image boot hoti hai;
     hamlaawar apni image flash kar ke key nahi nikal sakta (jab tak Secure Boot
-    enable ho — enablement Phase D ka kaam hai).
+    enable ho — enablement Phase H ka kaam hai; Secure Boot RSA-3072 keypair
+    Phase H W1 mein ban gaya hai, eFuse burn sacrificial board par hoga).
   - Flash encryption enable karna hai ya nahi — OPEN-3 (`KEY-LIFECYCLE.md` §9):
     is ke bagair flash dump se NVS cipher parha ja sakta hai (key nikalna
     phir bhi NVS encryption key mangta hai, lekin attack surface barhta hai).
-- **Fix phase:** Phase D (Secure Boot enablement + flash encryption faisla).
+- **Fix phase:** Phase H (procedure `docs/FLASH-ENCRYPTION-PROCEDURE.md` —
+  secure-build files + runtime check Phase H W1 mein ban gaye; eFuse burn
+  + dump verification sacrificial board par, A7 gate).
 - **Residual risk:** Medium jab tak OPEN-3 band na ho; physical attacker ke
   khilaf koi bhi software daawa mehdood hai (dekho §5).
 

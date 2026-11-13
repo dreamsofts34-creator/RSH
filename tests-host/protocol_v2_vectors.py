@@ -102,6 +102,15 @@ WRONG_KEY = bytes([0xFF]) * 32
 TEST_MAC = bytes.fromhex("aabbccddeeff")
 TEST_PW = b"Ab3dEf6hJk9mNp2rSt5vWx8Y"          # 24 chars, A-Z a-z 2-9
 
+# ---- serial frame (§10, Phase G WS1) -----------------------------------------
+# Envelope: "RSHS" | kind u8 | len u16 LE | payload | CRC16 (§0, frame ke
+# CRC field se pehle ke tamam bytes par). Kind 1..7, max payload 1053 B.
+def serial_frame(kind: int, payload: bytes) -> bytes:
+    """Serial frame banao (§10). Payload wahi bytes jo UDP par jate."""
+    assert 1 <= kind <= 7 and len(payload) <= 1053
+    body = b"RSHS" + struct.pack("<BH", kind, len(payload)) + payload
+    return with_crc(body)
+
 VECTORS = {
   # stream v2.1: seq 0x1234, ts 0x01020304, axes 0-4 mV, buttons 0x205,
   # enc cumulative +1000,-250, flags 0x01 (config-changed)
@@ -127,6 +136,12 @@ VECTORS = {
   # control reply: GET_CAPS OK, reqId 1, counter 0
   "ctrl_get_caps_reply": ctrl_reply(TEST_KEY, TEST_NONCE, 0x01, 1, 0, 0,
                                     TEST_MAC + bytes([4, 0, 0, 2, 1, 8, 64, 4, 6, 0, 0])),
+  # serial canonical vectors (§10.1 — C# CanonicalVectorFrame /
+  # CanonicalHeloVectorFrame + C++ host tests §22 se byte-exact match):
+  # kind=Stream(1), payload 01..08 -> ...d95d (CRC 0x5DD9)
+  "serial_stream_0102030405060708": serial_frame(1, bytes(range(1, 9))),
+  # kind=Helo(6), payload "HELO" 02 00 -> ...4749 (CRC 0x4947)
+  "serial_helo": serial_frame(6, b"HELO" + bytes([2, 0])),
 }
 
 # ---- negative vectors (T2): each must FAIL verification / be rejected ---------
@@ -174,6 +189,15 @@ if __name__ == "__main__":
     assert ctrl_verify(TEST_KEY, TEST_NONCE, c), "good control frame must verify"
     r = VECTORS["ctrl_get_caps_reply"]
     assert ctrl_verify(TEST_KEY, TEST_NONCE, r) and r[4] == (0x01 | 0x80)
+    # serial canonical vectors (§10.1 — C# + C++ host tests §22 se byte-exact)
+    sv = VECTORS["serial_stream_0102030405060708"]
+    assert len(sv) == 17 and sv.hex() == "525348530108000102030405060708d95d"
+    assert crc16(sv[:-2]) == struct.unpack("<H", sv[-2:])[0]
+    sh = VECTORS["serial_helo"]
+    assert len(sh) == 15 and sh.hex() == "5253485306060048454c4f02004749"
+    assert crc16(sh[:-2]) == struct.unpack("<H", sh[-2:])[0]
+    # serial negative: CRC byte flip -> CRC fail (receiver drop + count)
+    assert crc16(_flip(sv, len(sv) - 1)[:-2]) != struct.unpack("<H", _flip(sv, len(sv) - 1)[-2:])[0]
     # negative checks (T2)
     assert not ctrl_verify(TEST_KEY, TEST_NONCE, NEGATIVE["neg_bad_tag"]), "bad tag must fail"
     assert not ctrl_verify(WRONG_KEY, TEST_NONCE, NEGATIVE["neg_wrong_key_frame"]), \

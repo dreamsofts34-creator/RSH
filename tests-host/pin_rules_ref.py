@@ -1,7 +1,7 @@
 """Reference pin validator + tests (S0/F0, FW-1 WP1/WP2). Firmware (C++) and app (C#) must match these rules.
 Run (in the Virtual Test Rig only): python3 -I tests-host/pin_rules_ref.py
 
-Kinds (T7): axis | button | encoder | led | battery | axis_ads1115 | button_matrix | expander_button.
+Kinds (T7): axis | button | encoder | led | battery | axis_ads1115 | button_matrix | expander_button | axis_as5600 (Phase G WS4, D34).
 Limits (D6): axes <= 8, buttons <= 128, encoders <= 4; LED strips <= 1 (60 LEDs/strip);
 one battery module -- and a battery is NOT an axis (T7 fix for the old
 `n[...] += 1 if kind in n else 0` line, which counted a battery as 0 axes
@@ -12,7 +12,7 @@ BOARD = json.load(open(os.path.join(os.path.dirname(__file__), "..", "docs", "bo
 PINS = BOARD["pins"]; RES = BOARD["reserved"]; LIM = BOARD["limits"]
 
 KINDS = ("axis", "button", "encoder", "led", "battery",
-         "axis_ads1115", "button_matrix", "expander_button")
+         "axis_ads1115", "button_matrix", "expander_button", "axis_as5600")
 
 def _pin_errs(p, kind, m, used):
     """Per-GPIO checks shared by every kind that uses ESP32 pins.
@@ -42,7 +42,7 @@ def validate(modules, expanders=False):
     """modules: list of dicts {kind: ..., pins: [...], ...}.
     Returns list of error strings (empty = valid).
     expanders=True reserves GPIO21/22 for I2C and is required by any I2C kind
-    (axis_ads1115, expander_button)."""
+    (axis_ads1115, expander_button, axis_as5600)."""
     errs, used = [], {}
     if not modules:
         errs.append("at least one input module required")
@@ -52,6 +52,7 @@ def validate(modules, expanders=False):
     used[RES["status_led"]] = "status LED"
     n = {"axis": 0, "button": 0, "encoder": 0, "led": 0, "battery": 0}
     ads_used, exp_used = set(), set()
+    as5600_used = False
     for m in modules:
         kind = m.get("kind")
         if kind not in KINDS:
@@ -75,6 +76,21 @@ def validate(modules, expanders=False):
                 errs.append(f"axis_ads1115: channel {ch} on addr {addr} already used")
             else:
                 ads_used.add((addr, ch))
+            n["axis"] += 1
+            continue
+        if kind == "axis_as5600":
+            # Phase G WS4 (D34, docs/AS5600-SPEC.md): magnetic encoder axis,
+            # I2C addr 0x36 fixed — koi ESP32 GPIO nahi, max 1 per board,
+            # axes limit (<=8) mein gina jata hai. Rotation <=360° direct
+            # hai; 900° ke liye turn counter (firmware) lazmi hai.
+            if pins:
+                errs.append("axis_as5600: uses I2C, no GPIO pin")
+            if not expanders:
+                errs.append("axis_as5600: requires I2C expander (pass expanders=True)")
+            if as5600_used:
+                errs.append("axis_as5600: only one AS5600 per board (fixed I2C address 0x36)")
+            else:
+                as5600_used = True
             n["axis"] += 1
             continue
         if kind == "expander_button":
@@ -281,6 +297,16 @@ if __name__ == "__main__":
     T("encoder with 3 pins rejected (push is a separate button)",
       any("exactly 2 pins" in e for e in validate([{"kind": "encoder", "pins": [23, 25, 26]}])))
     T("unknown kind rejected, no crash", any("unknown kind" in e for e in validate([{"kind": "teleport", "pins": [4]}])))
-    T("axis_as5600 not yet a validator kind (D34, future)",
-      any("unknown kind" in e for e in validate([{"kind": "axis_as5600", "pins": []}])))
+    # --- Phase G WS4: AS5600 validator kind (D34, docs/AS5600-SPEC.md) ---
+    AS = lambda **k: {"kind": "axis_as5600", "pins": [], **k}
+    T("axis_as5600 valid (I2C, no GPIO pin)",
+      validate([AS()], expanders=True) == [])
+    T("axis_as5600 without expanders rejected", any("requires I2C" in e for e in validate([AS()])))
+    T("axis_as5600 with GPIO pin rejected", any("no GPIO pin" in e for e in validate([{"kind": "axis_as5600", "pins": [32]}], expanders=True)))
+    T("two axis_as5600 rejected (fixed I2C address 0x36)",
+      any("only one AS5600" in e for e in validate([AS(), AS()], expanders=True)))
+    T("axis_as5600 counts toward axis limit (8 axes incl AS5600 valid)",
+      validate([A(32), A(33), A(34), A(35), A(36), A(39), ADS(0), AS()], expanders=True) == [])
+    T("axis_as5600 counts toward axis limit (9 axes rejected)",
+      any("too many axes" in e for e in validate([A(32), A(33), A(34), A(35), A(36), A(39), ADS(0), ADS(1), AS()], expanders=True)))
     print(f"\n{'ALL PASS' if not fails else str(fails)+' FAILED'}"); raise SystemExit(1 if fails else 0)

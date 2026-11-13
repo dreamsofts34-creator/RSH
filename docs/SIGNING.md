@@ -9,6 +9,17 @@ what to check first.
 D23 (signing). Plan reference: `RSH-PLAN-v2.3.md` §6 (Windows row) and §0 D22/D23.
 Nothing in this doc overrides the plan.
 
+> **USER DECISION 2026-11-13 — OV certificate abhi NAHI khareeda jayega.**
+> v2.0.0 **UNSIGNED** ship hoga (app + MSIX); SmartScreen warning expected
+> hai (USER-GUIDE §3 + `docs/RELEASE-NOTES-v2.0.0.md` dekho). Is doc ka
+> procurement checklist (§6) **"baad mein (cert khareedne ke baad)"** ke tor
+> par darj hai — **release blocker NAHI hai**. Cert milne ke din: §6 ke
+> steps karo, MSIX manifest Publisher ko exact cert Subject se badlo
+> (§3.1), `-Sign` build karo, aur release notes se "unsigned" notice hatao.
+> **Firmware signing (Ed25519, local key) is faisle se mutaliq NAHI hai** —
+> firmware `firmware-signed.bin` hi ship hota hai, waisa hi jaisa Phase H
+> scope mein hai.
+
 **Product name is RSH.** Do not use any other product name in signing,
 packaging, or Store listings.
 
@@ -19,7 +30,7 @@ packaging, or Store listings.
 | Item | Decision |
 |---|---|
 | Code-signing certificate | **OV (Organization Validation)** certificate, **$150–300/year** (plan figure — see §7, verify current price before buying) |
-| Procurement | **Start in Phase A** — organization validation takes **days to weeks**, so it is on the critical path to the first signed release |
+| Procurement | **DEFERRED — user faisla 2026-11-13:** OV certificate abhi nahi khareeda jayega; v2.0.0 unsigned ship hoga. Jab cert kharidna ho, tab procurement shuru karo — organization validation takes **days to weeks**, so it is on the critical path to the first signed release (§6 checklist) |
 | Packaging | **MSIX is primary** (D22). WiX is dropped |
 | Fallback distribution | **Microsoft Store MSIX** — registration fee waived since May 2026; the Store re-signs the package (see §4) |
 | Azure Artifact Signing (formerly Trusted Signing) | **Closed route — do not pursue.** It is not available to a Pakistan-based individual developer; individuals are only eligible in the USA/Canada (D23) |
@@ -276,13 +287,18 @@ Read this before anyone promises a user "no warning":
 
 ---
 
-## 6. Checklist — do this now (Phase A)
+## 6. Checklist — baad mein (cert khareedne ke baad)
+
+**DEFERRED — user faisla 2026-11-13:** OV certificate abhi nahi khareeda
+jayega; v2.0.0 unsigned ship hoga. Ye checklist tab karni hai jab cert
+kharidna ho — release blocker nahi hai. Neeche ke steps us waqt ke liye
+tayyar rakhe gaye hain.
 
 Owner actions — nothing here is done by the team writing this doc:
 
-- [ ] **Start OV certificate procurement now** (WP8 / R-M28) — validation
-      takes days to weeks; it is on the critical path to the first signed
-      release.
+- [ ] **OV certificate procurement — DEFERRED (user faisla 2026-11-13).**
+      Validation takes days to weeks; jab cert kharidna ho tab shuru karo —
+      tab ye first signed release ke critical path par hoga.
 - [ ] Decide the legal organization name that will appear as the publisher
       (it must never change afterwards — §5).
 - [ ] Confirm the organization is formally registered / verifiable; if not,

@@ -24,10 +24,18 @@ internal sealed class SimWheel : ISampleSource
     public LinkStatistics Statistics { get; } = new();
     public long? LastValidAgeMs => _has ? NowMs - _lastEmitMs : null;
 
-    /// <summary>Wheel ek packet bhejta hai — raw values bilkul firmware jese.</summary>
-    public void Emit(ushort steering, ushort accel, ushort brake, byte buttons = 0, bool inMillivolts = false)
+    /// <summary>
+    /// Wheel ek packet bhejta hai. Qeematein mV-domain mein di jati
+    /// hain (calibration ki units — test mein parhne mein aasan):
+    /// steering wire par mV hi jata hai (flag true), pedals v1 mein
+    /// wire par raw ADC hote hain, is liye Emit unhein mV→raw badal
+    /// kar bhejta hai (clamp 0..4095). Is tarah pipeline ko asal
+    /// firmware jesa packet milta hai aur raw→mV rasta test hota hai.
+    /// </summary>
+    public void Emit(ushort steering, ushort accel, ushort brake, byte buttons = 0)
     {
-        _latest = new WheelPacket(_seq++, (uint)(NowMs * 1000), steering, accel, brake, buttons, inMillivolts);
+        ushort pedalRaw(ushort mv) => (ushort)Math.Clamp((int)Math.Round(Math.Clamp((int)mv, 0, 3300) * 4095.0 / 3300.0), 0, 4095);
+        _latest = new WheelPacket(_seq++, (uint)(NowMs * 1000), steering, pedalRaw(accel), pedalRaw(brake), buttons, true);
         _has = true;
         _lastEmitMs = NowMs;
         Statistics.Record(PacketParseResult.Ok, _latest.Sequence);
@@ -80,12 +88,15 @@ internal sealed class Harness : IDisposable
     public WheelEngine Engine { get; }
     public long NowMs;
 
-    // Calibrated profile: steering raw 1000..3100 (center 2050), pedals 200..3900
+    // Calibrated profile: steering 1000..3100 mV (center 2050), pedals
+    // 200..3300 mV (P9/D10: full-scale 0–3300 mV, span ≥ 660 mV).
+    // Pehle pedals 200..3900 thay (raw-ADC numbers) — mV range se
+    // bahar hone par IsSane reject karta hai, is liye mV values hain.
     public static WheelProfile CalibratedProfile() => WheelProfile.CreateDefault() with
     {
-        SteeringCalibration = new RSH.Core.Processing.SteeringCalibration { RawMin = 1000, RawCenter = 2050, RawMax = 3100, IsSet = true },
-        AccelCalibration = new RSH.Core.Processing.PedalCalibration { RawMin = 200, RawMax = 3900, IsSet = true },
-        BrakeCalibration = new RSH.Core.Processing.PedalCalibration { RawMin = 200, RawMax = 3900, IsSet = true },
+        SteeringCalibration = new RSH.Core.Processing.SteeringCalibration { RawMin = 1000, RawCenter = 2050, RawMax = 3100, IsSet = true, IsMillivolts = true },
+        AccelCalibration = new RSH.Core.Processing.PedalCalibration { RawMin = 200, RawMax = 3300, IsSet = true, IsMillivolts = true },
+        BrakeCalibration = new RSH.Core.Processing.PedalCalibration { RawMin = 200, RawMax = 3300, IsSet = true, IsMillivolts = true },
         Smoothing = 0,
     };
 
@@ -144,7 +155,7 @@ public class UserScenarioTests
         h.Drive(5, 2050, accel: 3900, brake: 3900);
         Assert.Equal(32768, h.Output.Last.AccelAxis);
         Assert.Equal(32768, h.Output.Last.BrakeAxis);
-        h.Drive(5, 2050, accel: 2050, brake: 200);         // aadha accel
+        h.Drive(5, 2050, accel: 1750, brake: 200);         // aadha accel (200..3300 ka midpoint)
         Assert.InRange(h.Output.Last.AccelAxis, 15000, 18000);
     }
 

@@ -1,0 +1,37 @@
+# RSH — secure-build sdkconfig defaults (Phase H, OPEN-3 / SEC-E-01).
+# Sirf [env:esp32dev-secure] is file ko istemal karta hai
+# (platformio.ini: board_build.esp-idf.sdkconfig_path).
+# Normal dev build (esp32dev) is se mutasir NAHI hota.
+#
+# ZAROORI: plain `framework = arduino` mein ye flags kuch nahi karte —
+# Arduino framework precompiled ESP-IDF istemal karta hai, sdkconfig
+# badli nahi ja sakti. Is liye secure env `framework = arduino, espidf`
+# hai (IDF source se build hota hai) — tab hi ye flags laagu hote hain.
+# Procedure ka step 0 build ke baad generated sdkconfig mein in flags ko
+# verify karta hai (kisi bhi irreversible eFuse step se pehle).
+#
+# Chip revision: Secure Boot V2 ESP32 par sirf ECO3 (rev 3+) par hai
+# (ESP-IDF docs) — is liye CONFIG_ESP32_REV_MIN_3=y lazmi hai. Agar
+# sacrificial board rev < 3 ho to procedure §3 mein STOP hai (Secure
+# Boot V2 us board par mumkin nahi — flash encryption akela phir bhi
+# ho sakta hai, residual note ke saath).
+#
+# Secure Boot V2 (RSA-3072, KEY-LIFECYCLE.md §9)
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_V2_ENABLED=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="secure-boot-key.pem"
+CONFIG_SECURE_BOOTLOADER_MODE_RELEASE=y
+CONFIG_SECURE_BOOT_ALLOW_JTAG=n
+CONFIG_ESP32_REV_MIN_3=y
+# Flash encryption — RELEASE mode (development mode kabhi production
+# par nahi: wo UART download khula chhorta hai)
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y
+CONFIG_SECURE_FLASH_ENCRYPTION_AES256=y
+CONFIG_SECURE_DISABLE_ROM_DL_MODE=y
+# Encrypted NVS (nvs_keys partition — partitions-secure.csv)
+CONFIG_NVS_ENCRYPTION=y
+# Custom partition table (nvs_keys ke saath)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-secure.csv"

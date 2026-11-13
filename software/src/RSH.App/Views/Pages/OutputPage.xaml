@@ -2,23 +2,77 @@
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
-             xmlns:ctl="clr-namespace:RSH.App.Controls">
+             xmlns:ctl="clr-namespace:RSH.App.Controls"
+             xmlns:res="clr-namespace:RSH.App.Resources">
     <UserControl.Resources>
         <ctl:BoolToStatusBrushConverter x:Key="StatusBrush" />
     </UserControl.Resources>
 
     <ScrollViewer VerticalScrollBarVisibility="Auto">
         <StackPanel Margin="24" MaxWidth="980">
-            <ui:TextBlock Text="Output (vJoy)" FontTypography="Title" Margin="0,0,0,4" />
-            <ui:TextBlock Text="Install the BrunnerInnovation vJoy v2.2.2.0 driver once."
+            <ui:TextBlock Text="{Binding PageOutput, Source={x:Static res:UiStrings.Instance}}" FontTypography="Title" Margin="0,0,0,4" />
+            <ui:TextBlock Text="{Binding InstallTheBrunnerInnovationVJoyV2, Source={x:Static res:UiStrings.Instance}}"
                           Appearance="Secondary" Margin="0,0,0,16" TextWrapping="Wrap" />
+
+            <ui:Card x:Name="VjoyWarningCard" Padding="16" Margin="0,0,0,12" Visibility="Collapsed">
+                <StackPanel>
+                    <ui:TextBlock Text="{Binding VJoyDriverNotFound, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,4" />
+                    <ui:TextBlock Text="{Binding GamesCannotSeeTheWheel, Source={x:Static res:UiStrings.Instance}}"
+                                  TextWrapping="Wrap" Margin="0,0,0,8" />
+                    <ui:Button Content="{Binding GetVJoyDriver, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding GetVJoyDriver, Source={x:Static res:UiStrings.Instance}}" Appearance="Primary" Click="GetVJoy_Click" HorizontalAlignment="Left" />
+                </StackPanel>
+            </ui:Card>
+
+            <ui:Card Padding="16" Margin="0,0,0,12">
+                <StackPanel>
+                    <ui:TextBlock Text="{Binding LiveOutputWhatGamesSee, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <Grid Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="130" />
+                        </Grid.ColumnDefinitions>
+                        <ui:TextBlock Text="{Binding Steering, Source={x:Static res:UiStrings.Instance}}" VerticalAlignment="Center" />
+                        <ProgressBar x:Name="SteerBar" Grid.Column="1" Minimum="1" Maximum="32768" Height="10" VerticalAlignment="Center" Margin="8,0" />
+                        <ui:TextBlock x:Name="SteerValueText" Grid.Column="2" VerticalAlignment="Center" Text="—" />
+                    </Grid>
+                    <Grid Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="130" />
+                        </Grid.ColumnDefinitions>
+                        <ui:TextBlock Text="{Binding Accelerator, Source={x:Static res:UiStrings.Instance}}" VerticalAlignment="Center" />
+                        <ProgressBar x:Name="AccelBar" Grid.Column="1" Minimum="1" Maximum="32768" Height="10" VerticalAlignment="Center" Margin="8,0" />
+                        <ui:TextBlock x:Name="AccelValueText" Grid.Column="2" VerticalAlignment="Center" Text="—" />
+                    </Grid>
+                    <Grid Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="130" />
+                        </Grid.ColumnDefinitions>
+                        <ui:TextBlock Text="{Binding Brake, Source={x:Static res:UiStrings.Instance}}" VerticalAlignment="Center" />
+                        <ProgressBar x:Name="BrakeBar" Grid.Column="1" Minimum="1" Maximum="32768" Height="10" VerticalAlignment="Center" Margin="8,0" />
+                        <ui:TextBlock x:Name="BrakeValueText" Grid.Column="2" VerticalAlignment="Center" Text="—" />
+                    </Grid>
+                    <ui:TextBlock x:Name="LiveMaskText" Text="{Binding ButtonsPressed0, Source={x:Static res:UiStrings.Instance}}" />
+                </StackPanel>
+            </ui:Card>
+
+            <ui:Card Padding="16" Margin="0,0,0,12">
+                <StackPanel>
+                    <ui:TextBlock Text="{Binding AxesAndButtons, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <ui:TextBlock x:Name="AxisGuideText" Text="{Binding CheckingVJoyConfiguration, Source={x:Static res:UiStrings.Instance}}" TextWrapping="Wrap" />
+                </StackPanel>
+            </ui:Card>
 
             <ui:Card Padding="16" Margin="0,0,0,12">
                 <StackPanel>
                     <StackPanel Orientation="Horizontal">
                         <Ellipse Width="12" Height="12" VerticalAlignment="Center"
                                  Fill="{Binding Connected, Converter={StaticResource StatusBrush}}" />
-                        <ui:TextBlock Text="Device status" FontTypography="BodyStrong" Margin="8,0,0,0" />
+                        <ui:TextBlock Text="{Binding DeviceStatus, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="8,0,0,0" />
                     </StackPanel>
                     <ui:TextBlock Text="{Binding StatusText}" Appearance="Secondary" Margin="0,8,0,0" TextWrapping="Wrap" />
                     <ui:TextBlock Text="{Binding DetailsText}" Margin="0,4,0,0" TextWrapping="Wrap" />
@@ -27,20 +81,20 @@
 
             <ui:Card Padding="16" Margin="0,0,0,12">
                 <StackPanel>
-                    <ui:TextBlock Text="vJoy device" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <ui:TextBlock Text="{Binding VJoyDevice, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
                     <StackPanel Orientation="Horizontal">
-                        <ui:NumberBox Value="{Binding DeviceId, Mode=TwoWay}" Minimum="1" Maximum="16"
+                        <ui:NumberBox Value="{Binding DeviceId, Mode=TwoWay}" Minimum="1" Maximum="16" AutomationProperties.Name="{Binding VJoyDeviceNumber, Source={x:Static res:UiStrings.Instance}}"
                                       SpinButtonPlacementMode="Inline" Width="160" Margin="0,0,8,0" />
-                        <ui:Button Content="Apply device" Command="{Binding ApplyDeviceCommand}" />
+                        <ui:Button Content="{Binding ApplyDevice, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding ApplyDevice, Source={x:Static res:UiStrings.Instance}}" Command="{Binding ApplyDeviceCommand}" />
                     </StackPanel>
-                    <ui:TextBlock Text="In vJoyConf, enable axes X, Y, Z and 2+ buttons."
+                    <ui:TextBlock Text="{Binding InVJoyConfEnableAxesX, Source={x:Static res:UiStrings.Instance}}"
                                   Appearance="Secondary" Margin="0,8,0,0" TextWrapping="Wrap" />
                 </StackPanel>
             </ui:Card>
 
             <StackPanel Orientation="Horizontal">
-                <ui:Button Content="Open Game Controllers (joy.cpl)" Command="{Binding OpenGameControllersCommand}" Margin="0,0,8,0" />
-                <ui:Button Content="Open vJoyConf" Command="{Binding OpenVJoyConfCommand}" />
+                <ui:Button Content="{Binding OpenGameControllersJoyCpl, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding OpenGameControllers, Source={x:Static res:UiStrings.Instance}}" Command="{Binding OpenGameControllersCommand}" Margin="0,0,8,0" />
+                <ui:Button Content="{Binding OpenVJoyConf, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding OpenVJoyConf, Source={x:Static res:UiStrings.Instance}}" Command="{Binding OpenVJoyConfCommand}" />
             </StackPanel>
         </StackPanel>
     </ScrollViewer>

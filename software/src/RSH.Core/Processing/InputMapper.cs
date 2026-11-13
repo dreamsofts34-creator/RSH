@@ -13,32 +13,59 @@ public static class InputMapper
     public const int AxisCenter = 16384;
 
     /// <summary>
-    /// Steering raw → -1..1, center ke dono taraf alag scale (piecewise),
+    /// Raw ADC counts (12-bit, 0..4095) → milliVolts (0..3300 mV).
+    /// ADC reference 3300 mV hai (D10) — is liye raw * 3300 / 4095,
+    /// round karke. v1 packets mein pedals hamesha raw hote hain aur
+    /// steering raw hota hai jab packet flag set na ho; calibration
+    /// hamesha mV mein hoti hai (D6/D10), is liye mapper pehle value
+    /// ko mV mein normalize karta hai, phir sane cal ya defaults lagte hain.
+    /// </summary>
+    public static int RawToMillivolts(int raw) =>
+        (int)Math.Round(Math.Clamp(raw, 0, 4095) * 3300.0 / 4095.0);
+
+    /// <summary>
+    /// Steering raw/mV → -1..1, center ke dono taraf alag scale (piecewise),
     /// taake center hamesha bilkul 0 aye chahe min/max ghair-mutawazan hon.
+    /// V-C2: value pehle mV mein normalize hoti hai
+    /// (<paramref name="inMillivolts"/> false ho to
+    /// <see cref="RawToMillivolts"/>), phir sane mV cal ya defaults —
+    /// mV mode defaults 900/2050/3200, raw mode defaults 0/1650/3300
+    /// (purane raw defaults 0/2048/4095 ka mV conversion — purana
+    /// behaviour mehfooz: raw 2048 → 1650 mV = center = 0).
     /// </summary>
     public static double MapSteering(int raw, SteeringCalibration cal, bool inMillivolts, bool invert)
     {
+        double value = inMillivolts ? raw : RawToMillivolts(raw);
         double min, center, max;
         if (cal.IsSane)
         {
             min = cal.RawMin; center = cal.RawCenter; max = cal.RawMax;
         }
         else if (inMillivolts) { min = 900; center = 2050; max = 3200; }
-        else { min = 0; center = 2048; max = 4095; }
+        else { min = 0; center = 1650; max = 3300; }
 
-        double x = raw <= center
-            ? -(center - raw) / Math.Max(1, center - min)
-            : (raw - center) / Math.Max(1, max - center);
+        double x = value <= center
+            ? -(center - value) / Math.Max(1, center - min)
+            : (value - center) / Math.Max(1, max - center);
         x = Math.Clamp(x, -1.0, 1.0);
         return invert ? -x : x;
     }
 
-    /// <summary>Pedal raw → 0..1 (min..max ke darmiyan clamp).</summary>
-    public static double MapPedal(int raw, PedalCalibration cal, bool invert)
+    /// <summary>
+    /// Pedal raw/mV → 0..1 (min..max ke darmiyan clamp). V-C2:
+    /// <paramref name="inMillivolts"/> false (default — v1 pedals
+    /// hamesha raw 0..4095) ho to value pehle
+    /// <see cref="RawToMillivolts"/> se mV mein badalti hai; v2 stream
+    /// path baad mein true pass karega (Phase D). Sane cal hamesha mV
+    /// mein hoti hai; defaults 0..3300 mV (purane 0..4095 raw ke
+    /// barabar — behaviour mehfooz, ratio wahi rehta hai).
+    /// </summary>
+    public static double MapPedal(int raw, PedalCalibration cal, bool invert, bool inMillivolts = false)
     {
+        double value = inMillivolts ? raw : RawToMillivolts(raw);
         double min = cal.IsSane ? cal.RawMin : 0;
-        double max = cal.IsSane ? cal.RawMax : 4095;
-        double x = Math.Clamp((raw - min) / Math.Max(1, max - min), 0.0, 1.0);
+        double max = cal.IsSane ? cal.RawMax : 3300;
+        double x = Math.Clamp((value - min) / Math.Max(1, max - min), 0.0, 1.0);
         return invert ? 1.0 - x : x;
     }
 

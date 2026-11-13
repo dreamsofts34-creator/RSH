@@ -22,6 +22,11 @@
     <Version>2.0.0</Version>
   </PropertyGroup>
 
+  <!-- Phase F (W3): RSH.App.Tests ko internals (GameLauncher test seams) dikhte hain. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="RSH.App.Tests" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="WPF-UI" Version="4.3.0" />
     <PackageReference Include="WPF-UI.Tray" Version="4.3.0" />
@@ -34,6 +39,7 @@
   <ItemGroup>
     <ProjectReference Include="..\RSH.Core\RSH.Core.csproj" />
     <ProjectReference Include="..\RSH.Output.VJoy\RSH.Output.VJoy.csproj" />
+    <ProjectReference Include="..\RSH.Output.HIDMaestro\RSH.Output.HIDMaestro.csproj" />
   </ItemGroup>
 
 </Project>

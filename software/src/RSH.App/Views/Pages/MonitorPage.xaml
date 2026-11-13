@@ -3,7 +3,8 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
              xmlns:ctl="clr-namespace:RSH.App.Controls"
-             xmlns:sp="clr-namespace:ScottPlot.WPF;assembly=ScottPlot.WPF">
+             xmlns:sp="clr-namespace:ScottPlot.WPF;assembly=ScottPlot.WPF"
+             xmlns:res="clr-namespace:RSH.App.Resources">
     <UserControl.Resources>
         <ctl:BoolToStatusBrushConverter x:Key="StatusBrush" />
         <ctl:BoolToVisibilityConverter x:Key="BoolVis" />
@@ -11,8 +12,8 @@
 
     <ScrollViewer VerticalScrollBarVisibility="Auto">
         <StackPanel Margin="24" MaxWidth="980">
-            <ui:TextBlock Text="Input Monitor" FontTypography="Title" Margin="0,0,0,4" />
-            <ui:TextBlock Text="Raw live data from the wheel."
+            <ui:TextBlock Text="{Binding PageMonitor, Source={x:Static res:UiStrings.Instance}}" FontTypography="Title" Margin="0,0,0,4" />
+            <ui:TextBlock Text="{Binding RawLiveDataFromThe, Source={x:Static res:UiStrings.Instance}}"
                           Appearance="Secondary" Margin="0,0,0,16" TextWrapping="Wrap" />
 
             <!-- AUDIT FIX (F11): pehle "koi data nahi" ki halat hi nazar
@@ -21,8 +22,8 @@
             <ui:Card Padding="16" Margin="0,0,0,12"
                      Visibility="{Binding HasData, Converter={StaticResource BoolVis}, ConverterParameter=Invert}">
                 <ui:TextBlock TextWrapping="Wrap">
-                    <Run Text="No data — wheel not connected. " FontWeight="SemiBold" />
-                    <Run Text="Connect this PC to the RSH WiFi." />
+                    <Run Text="{Binding NoDataWheelNotConnected2, Source={x:Static res:UiStrings.Instance}}" FontWeight="SemiBold" />
+                    <Run Text="{Binding ConnectThisPCToThe, Source={x:Static res:UiStrings.Instance}}" />
                 </ui:TextBlock>
             </ui:Card>
 
@@ -35,7 +36,7 @@
                         <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
                     <StackPanel Grid.Column="0">
-                        <ui:TextBlock Text="Steering (raw)" Appearance="Secondary" />
+                        <ui:TextBlock Text="{Binding SteeringRaw, Source={x:Static res:UiStrings.Instance}}" Appearance="Secondary" />
                         <Grid>
                             <ui:TextBlock Text="{Binding RawSteering}" FontTypography="Title"
                                           Visibility="{Binding HasData, Converter={StaticResource BoolVis}}" />
@@ -46,7 +47,7 @@
                                       Visibility="{Binding HasData, Converter={StaticResource BoolVis}}" />
                     </StackPanel>
                     <StackPanel Grid.Column="1">
-                        <ui:TextBlock Text="Accelerator (raw)" Appearance="Secondary" />
+                        <ui:TextBlock Text="{Binding AcceleratorRaw, Source={x:Static res:UiStrings.Instance}}" Appearance="Secondary" />
                         <Grid>
                             <ui:TextBlock Text="{Binding RawAccel}" FontTypography="Title"
                                           Visibility="{Binding HasData, Converter={StaticResource BoolVis}}" />
@@ -55,7 +56,7 @@
                         </Grid>
                     </StackPanel>
                     <StackPanel Grid.Column="2">
-                        <ui:TextBlock Text="Brake (raw)" Appearance="Secondary" />
+                        <ui:TextBlock Text="{Binding BrakeRaw, Source={x:Static res:UiStrings.Instance}}" Appearance="Secondary" />
                         <Grid>
                             <ui:TextBlock Text="{Binding RawBrake}" FontTypography="Title"
                                           Visibility="{Binding HasData, Converter={StaticResource BoolVis}}" />
@@ -64,7 +65,7 @@
                         </Grid>
                     </StackPanel>
                     <StackPanel Grid.Column="3">
-                        <ui:TextBlock Text="Sequence" Appearance="Secondary" />
+                        <ui:TextBlock Text="{Binding Sequence, Source={x:Static res:UiStrings.Instance}}" Appearance="Secondary" />
                         <Grid>
                             <ui:TextBlock Text="{Binding Sequence}" FontTypography="Title"
                                           Visibility="{Binding HasData, Converter={StaticResource BoolVis}}" />
@@ -77,27 +78,73 @@
 
             <ui:Card Padding="16" Margin="0,0,0,12">
                 <StackPanel>
-                    <ui:TextBlock Text="Wheel buttons" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <ui:TextBlock Text="{Binding WheelButtons, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
                     <!-- AUDIT FIX (F9): WrapPanel — tang window par kataar
                          clip nahi hoti, neeche wali line par aa jati hai. -->
                     <WrapPanel>
                         <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding GearUp, Converter={StaticResource StatusBrush}}" />
-                        <ui:TextBlock Text="Gear up" Margin="6,0,20,0" VerticalAlignment="Center" />
+                        <ui:TextBlock Text="{Binding GearUp, Source={x:Static res:UiStrings.Instance}}" Margin="6,0,20,0" VerticalAlignment="Center" />
                         <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding GearDown, Converter={StaticResource StatusBrush}}" />
-                        <ui:TextBlock Text="Gear down" Margin="6,0,20,0" VerticalAlignment="Center" />
+                        <ui:TextBlock Text="{Binding GearDown, Source={x:Static res:UiStrings.Instance}}" Margin="6,0,20,0" VerticalAlignment="Center" />
                         <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding AccelBtn, Converter={StaticResource StatusBrush}}" />
-                        <ui:TextBlock Text="Accel button" Margin="6,0,20,0" VerticalAlignment="Center" />
+                        <ui:TextBlock Text="{Binding AccelButton, Source={x:Static res:UiStrings.Instance}}" Margin="6,0,20,0" VerticalAlignment="Center" />
                         <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding BrakeBtn, Converter={StaticResource StatusBrush}}" />
-                        <ui:TextBlock Text="Brake button" Margin="6,0,0,0" VerticalAlignment="Center" />
+                        <ui:TextBlock Text="{Binding BrakeButton, Source={x:Static res:UiStrings.Instance}}" Margin="6,0,0,0" VerticalAlignment="Center" />
                     </WrapPanel>
                     <ui:TextBlock Text="{Binding CountersText}" Appearance="Secondary" Margin="0,12,0,0" TextWrapping="Wrap" />
                 </StackPanel>
             </ui:Card>
 
+            <ui:Card Padding="16" Margin="0,0,0,12">
+                <StackPanel>
+                    <ui:TextBlock Text="{Binding ProcessedOutputWhatTheGame, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <sp:WpfPlot x:Name="LivePlot" Height="260" />
+                </StackPanel>
+            </ui:Card>
+
+            <ui:Card Padding="16" Margin="0,0,0,12">
+                <StackPanel>
+                    <ui:TextBlock Text="{Binding PacketStats, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,6" />
+                    <ui:TextBlock Text="{Binding PacketStatsText}" TextWrapping="Wrap" />
+                    <ui:TextBlock Text="{Binding CountersText}" Appearance="Secondary" Margin="0,6,0,0" TextWrapping="Wrap" />
+                </StackPanel>
+            </ui:Card>
+
+            <ui:Card Padding="16" Margin="0,0,0,12">
+                <StackPanel>
+                    <ui:TextBlock Text="{Binding Performance, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,6" />
+                    <ui:TextBlock Text="{Binding Link, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,8,0,2" />
+                    <ui:TextBlock Text="{Binding Diagnostics.LinkText}" TextWrapping="Wrap" />
+                    <ui:TextBlock Text="{Binding Engine200HzPipeline, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,12,0,2" />
+                    <ui:TextBlock Text="{Binding Diagnostics.EngineText}" TextWrapping="Wrap" />
+                    <ui:TextBlock Text="{Binding ThisAppOnYourPC, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,12,0,2" />
+                    <ui:TextBlock Text="{Binding Diagnostics.ProcessText}" TextWrapping="Wrap" />
+                    <ui:TextBlock Text="{Binding Diagnostics.StatusText}" Appearance="Secondary" Margin="0,6,0,0" TextWrapping="Wrap" />
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                        <ui:Button Content="{Binding ExportDiagnostics, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding ExportDiagnostics, Source={x:Static res:UiStrings.Instance}}" Appearance="Primary" Command="{Binding Diagnostics.ExportBundleCommand}" Margin="0,0,8,0" />
+                        <ui:Button Content="{Binding OpenLogsFolder, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding OpenLogsFolder, Source={x:Static res:UiStrings.Instance}}" Command="{Binding Diagnostics.OpenLogsFolderCommand}" />
+                    </StackPanel>
+                </StackPanel>
+            </ui:Card>
+
             <ui:Card Padding="16">
                 <StackPanel>
-                    <ui:TextBlock Text="Processed output (what the game receives)" FontTypography="BodyStrong" Margin="0,0,0,8" />
-                    <sp:WpfPlot x:Name="LivePlot" Height="260" />
+                    <StackPanel Orientation="Horizontal">
+                        <ui:TextBlock Text="{Binding Logs, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                        <ui:Button Content="{Binding Refresh, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding Refresh, Source={x:Static res:UiStrings.Instance}}" Command="{Binding Diagnostics.RefreshLogsCommand}" Margin="12,0,0,8" />
+                    </StackPanel>
+                    <!-- U-P5: virtualized log list — 200 lines, no full redraw. -->
+                    <ListBox ItemsSource="{Binding Diagnostics.LogLines}" MaxHeight="260" AutomationProperties.Name="{Binding Logs, Source={x:Static res:UiStrings.Instance}}"
+                             VirtualizingStackPanel.IsVirtualizing="True"
+                             VirtualizingStackPanel.VirtualizationMode="Recycling"
+                             ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding}" FontFamily="Consolas, monospace" FontSize="12" TextWrapping="NoWrap" />
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                    <ui:TextBlock Text="{Binding Diagnostics.LogStatusText}" Appearance="Secondary" Margin="0,8,0,0" TextWrapping="Wrap" />
                 </StackPanel>
             </ui:Card>
         </StackPanel>

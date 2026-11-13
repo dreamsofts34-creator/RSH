@@ -1,5 +1,6 @@
 using RSH.Core.Output;
 using RSH.Core.Pipeline;
+using RSH.Core.Processing;
 using RSH.Core.Profiles;
 using RSH.Core.Protocol;
 using RSH.Core.Transport;
@@ -70,17 +71,82 @@ public class ProfileStoreTests
     [Fact]
     public void Sanitized_HadSeBahirQeemateinTheekKartaHai()
     {
+        // P2 (D9) ke baad: button numbers is test mein nahi — wo clamp
+        // nahi hote, reject hote hain (neeche wale tests dekho).
         var p = WheelProfile.CreateDefault() with
         {
             Deadzone = 5, CurveStrength = -9, Smoothing = 3,
-            GearUpVJoyButton = 0, GearDownVJoyButton = 999,
         };
         var s = p.Sanitized();
         Assert.Equal(0.5, s.Deadzone);
         Assert.Equal(-1.0, s.CurveStrength);
         Assert.Equal(1.0, s.Smoothing);
-        Assert.Equal(1, s.GearUpVJoyButton);
-        Assert.Equal(128, s.GearDownVJoyButton);
+    }
+
+    // P2 (D9): vJoy buttons sirf 1..32. 33, 128, 0 → error (reject),
+    // clamp/alias kabhi nahi. 32 → theek hai.
+    [Theory]
+    [InlineData(33)]
+    [InlineData(128)]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public void Sanitized_VJoyButtonHadSeBahir_RejectHotaHai(int button)
+    {
+        var up = WheelProfile.CreateDefault() with { GearUpVJoyButton = button };
+        Assert.Throws<ArgumentOutOfRangeException>(() => { _ = up.Sanitized(); });
+        var down = WheelProfile.CreateDefault() with { GearDownVJoyButton = button };
+        Assert.Throws<ArgumentOutOfRangeException>(() => { _ = down.Sanitized(); });
+    }
+
+    [Theory]
+    [InlineData(1, 2)]
+    [InlineData(32, 2)]
+    [InlineData(1, 32)]
+    public void Sanitized_VJoyButton1Se32_OK(int up, int down)
+    {
+        var s = (WheelProfile.CreateDefault() with { GearUpVJoyButton = up, GearDownVJoyButton = down }).Sanitized();
+        Assert.Equal(up, s.GearUpVJoyButton);
+        Assert.Equal(down, s.GearDownVJoyButton);
+    }
+
+    [Fact]
+    public void Load_Button33WaliFile_DefaultsParGirtiHai_AppBandNahiHota()
+    {
+        // Purani/haath se badli file mein button 33 ho to Load throw
+        // nahi karta — backup/defaults milte hain.
+        string file = TempFile();
+        var store = new ProfileStore(file);
+        store.Save(new ProfileFile
+        {
+            Profiles = [WheelProfile.CreateDefault() with { GearUpVJoyButton = 33 }],
+            ActiveProfileName = "Default",
+        });
+        var loaded = store.Load();
+        Assert.Single(loaded.Profiles);
+        Assert.Equal("Default", loaded.ActiveProfileName);
+        Assert.Equal(1, loaded.Profiles[0].GearUpVJoyButton);
+    }
+
+    [Fact]
+    public void Pipeline_GearButton33_RejectHotaHai_AliasNahiBanta()
+    {
+        // Pehle `1u << (33-1)` wrap hokar button 1 par alias banta tha.
+        var profile = WheelProfile.CreateDefault() with { GearUpVJoyButton = 33, Smoothing = 0 };
+        Assert.Throws<ArgumentOutOfRangeException>(() => { _ = new ProcessingPipeline(profile); });
+    }
+
+    [Fact]
+    public void Pipeline_GearButton32_Bit31ParMapHotaHai()
+    {
+        var profile = WheelProfile.CreateDefault() with
+        {
+            GearUpVJoyButton = 32, Smoothing = 0, Deadzone = 0,
+            SteeringCalibration = new SteeringCalibration
+            { RawMin = 1000, RawCenter = 2050, RawMax = 3100, IsSet = true, IsMillivolts = true },
+        };
+        var pipeline = new ProcessingPipeline(profile);
+        var state = pipeline.Process(new WheelPacket(1, 0, 2050, 300, 300, WheelPacket.ButtonGearUp, true), 0.005);
+        Assert.Equal(1u << 31, state.ButtonsMask);   // vJoy button 32 = bit 31
     }
 }
 
@@ -141,7 +207,7 @@ public class EngineTests
             Smoothing = 0,
             Deadzone = 0,
             SteeringCalibration = new RSH.Core.Processing.SteeringCalibration
-            { RawMin = 1000, RawCenter = 2050, RawMax = 3100, IsSet = true },
+            { RawMin = 1000, RawCenter = 2050, RawMax = 3100, IsSet = true, IsMillivolts = true },
         };
         using var engine = new WheelEngine(source, output, profile);
 
@@ -200,5 +266,30 @@ public class EngineTests
 
         Assert.Equal(1u << 4, output.LastState.ButtonsMask);   // vJoy button 5 = bit 4
         Assert.Equal(16384, output.LastState.SteeringAxis);    // center steering
+    }
+
+    [Fact]
+    public void Engine_GearButton32_Bit31ParMapHotaHai()
+    {
+        // P2 (D9): button 32 aakhri jaiz button hai — bit 31, alias nahi.
+        var source = new FakeSource { Packet = Packet(2050, WheelPacket.ButtonGearUp), AgeMs = 5 };
+        var output = new FakeOutput();
+        var profile = WheelProfile.CreateDefault() with { GearUpVJoyButton = 32, Smoothing = 0 };
+        using var engine = new WheelEngine(source, output, profile);
+
+        engine.TickOnce(0.005, 1000);
+        engine.TickOnce(0.005, 1005);
+
+        Assert.Equal(1u << 31, output.LastState.ButtonsMask);   // vJoy button 32 = bit 31
+    }
+
+    [Fact]
+    public void Engine_GearButton33_ProfileRejectKartaHai()
+    {
+        // P2 (D9): button 33 wala profile engine tak nahi pahunchta.
+        var source = new FakeSource { Packet = Packet(2050, WheelPacket.ButtonGearUp), AgeMs = 5 };
+        var output = new FakeOutput();
+        var profile = WheelProfile.CreateDefault() with { GearUpVJoyButton = 33, Smoothing = 0 };
+        Assert.Throws<ArgumentOutOfRangeException>(() => { _ = new WheelEngine(source, output, profile); });
     }
 }

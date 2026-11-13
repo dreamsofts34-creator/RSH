@@ -6,7 +6,12 @@ using System.Windows.Media;
 using System.Windows.Threading;
 using RSH.App.Services;
 using RSH.App.ViewModels;
+using RSH.Core.Firmware;
+using RSH.Core.Net;
+using RSH.Core.Output;
 using RSH.Core.Processing;
+using RSH.Output.HIDMaestro;
+using RSH.Output.VJoy;
 using Microsoft.Win32;
 using Wpf.Ui.Controls;
 
@@ -53,6 +58,7 @@ public partial class WizardWindow : FluentWindow
         "Welcome to RSH",
         "Check the virtual joystick (vJoy)",
         "Connect to your wheel",
+        "Check the wiring (pins)",
         "Firmware update (optional)",
         "Calibrate steering — automatically",
         "Calibrate pedals — automatically",
@@ -63,6 +69,7 @@ public partial class WizardWindow : FluentWindow
     {
         _services = services;
         InitializeComponent();
+        StepPins.DataContext = ViewModelStore.Setup;
         _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
         _timer.Tick += (_, _) => RefreshStep();
         Loaded += (_, _) => { _timer.Start(); ShowStep(0); };
@@ -76,23 +83,25 @@ public partial class WizardWindow : FluentWindow
         if (_calib.CapturingSteering) _calib.ToggleCaptureSteeringCommand.Execute(null);
         if (_calib.CapturingPedals) _calib.ToggleCapturePedalsCommand.Execute(null);
 
-        _step = Math.Clamp(step, 0, 6);
+        _step = Math.Clamp(step, 0, 7);
         StepWelcome.Visibility = _step == 0 ? Visibility.Visible : Visibility.Collapsed;
         StepVJoy.Visibility = _step == 1 ? Visibility.Visible : Visibility.Collapsed;
         StepLink.Visibility = _step == 2 ? Visibility.Visible : Visibility.Collapsed;
-        StepFirmware.Visibility = _step == 3 ? Visibility.Visible : Visibility.Collapsed;
-        StepSteering.Visibility = _step == 4 ? Visibility.Visible : Visibility.Collapsed;
-        StepPedals.Visibility = _step == 5 ? Visibility.Visible : Visibility.Collapsed;
-        StepTest.Visibility = _step == 6 ? Visibility.Visible : Visibility.Collapsed;
+        StepPins.Visibility = _step == 3 ? Visibility.Visible : Visibility.Collapsed;
+        StepFirmware.Visibility = _step == 4 ? Visibility.Visible : Visibility.Collapsed;
+        StepSteering.Visibility = _step == 5 ? Visibility.Visible : Visibility.Collapsed;
+        StepPedals.Visibility = _step == 6 ? Visibility.Visible : Visibility.Collapsed;
+        StepTest.Visibility = _step == 7 ? Visibility.Visible : Visibility.Collapsed;
         StepTitle.Text = Titles[_step];
-        StepCounter.Text = $"Step {_step + 1} of 7";
+        StepCounter.Text = $"Step {_step + 1} of 8";
         BackButton.IsEnabled = _step > 0;
-        NextButton.Content = _step == 6 ? "Finish" : "Next";
+        NextButton.Content = _step == 7 ? "Finish" : "Next";
         _vjoyPassTicks = 0;
         _linkPassTicks = 0;
         _advanceTicks = -1;
-        if (_step == 4) { _steerCal.Reset(); _steerPhase = 0; _advancedFromCalib = false; }
-        if (_step == 5) { _pedalCal.Reset(); _pedalsDone = false; _advancedFromCalib = false; }
+        if (_step == 3) _ = ViewModelStore.Setup.RefreshPinsAsync();
+        if (_step == 5) { _steerCal.Reset(); _steerPhase = 0; _advancedFromCalib = false; }
+        if (_step == 6) { _pedalCal.Reset(); _pedalsDone = false; _advancedFromCalib = false; }
         RefreshStep();
     }
 
@@ -104,12 +113,14 @@ public partial class WizardWindow : FluentWindow
                 bool ok = _services.Engine.OutputConnected;
                 VJoyDot.Fill = ok ? OkBrush : BadBrush;
                 VJoyStatus.Text = ok
-                    ? $"vJoy feeding on device {_services.Settings.VJoyDeviceId}."
+                    ? _services.Output switch
+                    {
+                        VJoyOutput => $"vJoy feeding on device {_services.Settings.VJoyDeviceId}.",
+                        HidMaestroOutput hm => $"HIDMaestro feeding (experimental, profile {hm.ProfileId}).",
+                        var other => $"{other.Name} feeding.",
+                    }
                     : _services.Engine.LastOutputError ?? "vJoy not connected yet — the engine keeps retrying.";
-                var o = _services.Output;
-                VJoyDetails.Text = ok
-                    ? $"DLL v{o.DllVersionText} · Driver v{o.DriverVersionText} · Axes X:{(o.HasAxisX ? "yes" : "NO")} Y:{(o.HasAxisY ? "yes" : "NO")} Z:{(o.HasAxisZ ? "yes" : "NO")} · {o.ButtonCount} buttons"
-                    : "";
+                VJoyDetails.Text = ok ? OutputViewModel.OutputDetails(_services.Output) : "";
                 // Check pass rahe to wizard khud aage barhta hai (1.5 s)
                 if (ok && ++_vjoyPassTicks >= 15) ShowStep(2);
                 else if (!ok) _vjoyPassTicks = 0;
@@ -129,7 +140,7 @@ public partial class WizardWindow : FluentWindow
                 else if (!live) _linkPassTicks = 0;
                 break;
 
-            case 4:
+            case 5:
                 _calib.Tick();
                 LiveSteerRun.Text = _calib.HasData ? _calib.LiveSteering.ToString() : "no data";
                 SteerMinRun.Text = _calib.SteerMin.ToString();
@@ -138,14 +149,14 @@ public partial class WizardWindow : FluentWindow
                 FeedSteering();
                 break;
 
-            case 5:
+            case 6:
                 _calib.Tick();
                 LiveAccelRun.Text = _calib.HasData ? _calib.LiveAccel.ToString() : "no data";
                 LiveBrakeRun.Text = _calib.HasData ? _calib.LiveBrake.ToString() : "no data";
                 FeedPedals();
                 break;
 
-            case 6:
+            case 7:
                 FeedTest();
                 break;
         }
@@ -154,19 +165,19 @@ public partial class WizardWindow : FluentWindow
     // --- Auto-calibration: steering ---
     private void FeedSteering()
     {
-        if (_steerPhase == 2) { TickAutoAdvance(5); return; }
+        if (_steerPhase == 2) { TickAutoAdvance(6); return; }
         if (!_services.Source.TryGetLatest(out var p, out _, 1000)) return;
 
         if (_steerPhase == 0)
         {
             _steerCal.AddCenterSample(p.Steering);
-            SteerAutoStatus.Text = $"Centre pakar raha hai… {_steerCal.CenterSampleCount}/20 samples. Wheel ko bilkul still rakho.";
+            SteerAutoStatus.Text = $"Capturing centre… {_steerCal.CenterSampleCount}/20 samples. Hold the wheel still.";
             if (_steerCal.TryGetCenter(out var center))
             {
                 _calib.SteerCenter = center;
                 _steerPhase = 1;
-                SteerPhaseText.Text = "Centre set ho gaya. Ab wheel ko aahista full left aur full right ghumao — har lock par ek lamha ruko.";
-                SteerAutoStatus.Text = "Endpoints pakar raha hai…";
+                SteerPhaseText.Text = "Centre set. Now turn slowly to full left and full right — pause briefly at each end.";
+                SteerAutoStatus.Text = "Capturing endpoints… turn to both locks.";
             }
         }
         else
@@ -178,11 +189,11 @@ public partial class WizardWindow : FluentWindow
                 _calib.SteerMax = max;
                 _calib.SaveCommand.Execute(null);
                 _steerPhase = 2;
-                SteerAutoStatus.Text = $"Ho gaya ✓ Min {min} · Centre {_calib.SteerCenter} · Max {max} — save ho gaya.";
+                SteerAutoStatus.Text = $"Done ✓ Min {min} · Centre {_calib.SteerCenter} · Max {max} — saved.";
             }
             else
             {
-                SteerAutoStatus.Text = "Endpoints pakar raha hai… dono lock tak ghumao.";
+                SteerAutoStatus.Text = "Capturing endpoints… turn to both locks.";
             }
         }
     }
@@ -190,7 +201,7 @@ public partial class WizardWindow : FluentWindow
     // --- Auto-calibration: pedals ---
     private void FeedPedals()
     {
-        if (_pedalsDone) { TickAutoAdvance(6); return; }
+        if (_pedalsDone) { TickAutoAdvance(7); return; }
         if (!_services.Source.TryGetLatest(out var p, out _, 1000)) return;
 
         _pedalCal.AddAccelSample(p.Accel);
@@ -203,11 +214,11 @@ public partial class WizardWindow : FluentWindow
             _calib.BrakeMin = bMin; _calib.BrakeMax = bMax;
             _calib.SaveCommand.Execute(null);
             _pedalsDone = true;
-            PedalAutoStatus.Text = $"Ho gaya ✓ Accel {aMin}–{aMax} · Brake {bMin}–{bMax} — save ho gaya.";
+            PedalAutoStatus.Text = $"Done ✓ Accel {aMin}–{aMax} · Brake {bMin}–{bMax} — saved.";
         }
         else
         {
-            PedalAutoStatus.Text = $"Pakarna jaari hai… Accel {(a ? "✓" : "…")} · Brake {(b ? "✓" : "…")} — jo baqi hai use poora dabao.";
+            PedalAutoStatus.Text = $"Capturing… Accel {(a ? "✓" : "…")} · Brake {(b ? "✓" : "…")} — press the remaining pedal fully.";
         }
     }
 
@@ -261,36 +272,179 @@ public partial class WizardWindow : FluentWindow
     private async void UploadFw_Click(object sender, RoutedEventArgs e)
     {
         if (_fwFilePath is null) return;
+        // SEC-C-08: dialog filter enforcement nahi — extension yahan check karo.
+        if (!string.Equals(System.IO.Path.GetExtension(_fwFilePath), ".bin", StringComparison.OrdinalIgnoreCase))
+        {
+            FwStatus.Text = "Only .bin firmware files can be uploaded.";
+            return;
+        }
+        // SEC-C-03 / A12: EspIp upload se pehle dobara validate karo —
+        // settings.json haath se badli ho to bhi hostname/URL yahan kabhi
+        // nahi chalega (warna firmware + password attacker host par jata).
+        if (!EspAddress.TryValidate(_services.Settings.EspIp, out var espIp, out string? ipError))
+        {
+            FwStatus.Text = $"Wheel address is invalid: {ipError} Fix it in Settings.";
+            return;
+        }
+        // SEC-C-04: OTA password kabhi pre-fill nahi hota (PasswordBox,
+        // khaali shuru hota hai) — khaali ho to upload hi nahi hota.
+        if (string.IsNullOrWhiteSpace(FwPasswordBox.Password))
+        {
+            FwStatus.Text = "OTA password is empty — enter the board's per-device password (from pairing / first boot).";
+            return;
+        }
         UploadFwButton.IsEnabled = false;
         FwProgress.Visibility = Visibility.Visible;
-        FwStatus.Text = "Upload ho raha hai — wheel ka data is doran rukega…";
+        FwStatus.Text = "Checking the file…";
         try
         {
-            byte[] bytes = await System.IO.File.ReadAllBytesAsync(_fwFilePath);
+            // SEC-C-09 (TOCTOU) + SEC-C-07 (OOM): file EK dafa parho —
+            // size cap parhne se pehle — validation aur upload dono isi
+            // in-memory buffer par hote hain, file dobara kabhi nahi parhi jati.
+            string path = _fwFilePath;
+            var (bytes, validated, readError) = await Task.Run(() => ReadAndValidateFirmware(path));
+            if (bytes is null || validated is null)
+            {
+                FwStatus.Text = $"Firmware reject: {readError ?? validated?.Error ?? "unknown error"}";
+                return;
+            }
+            FwStatus.Text = $"Firmware v{validated.FirmwareVersion} verified (SHA-256 {validated.ImageSha256Hex?.Substring(0, 12)}…) — checking the board version…";
+            // SEC-C-05 (anti-downgrade, Phase D): upload se pehle GET_CAPS
+            // se board ka current version lo aur image se milao. Session
+            // key na ho (na session mein, na DPAPI key store mein — SEC-D-05)
+            // to caps nahi milte: gate warning de kar floor check par upload
+            // hoti hai, aur upload ke baad confirm lazmi rehta hai (neeche).
+            var (caps, capsError) = await _services.BoardSession.GetCapsAsync(espIp.ToString());
+            var gate = FirmwareUploadGate.CheckUpload(validated, caps);
+            if (!gate.Allowed)
+            {
+                FwStatus.Text = $"Firmware reject: {gate.Error}";
+                return;
+            }
+            string gateNote = gate.Warning is null ? "" : $" {gate.Warning}";
+            if (caps is null)
+                FwStatus.Text = $"Firmware v{validated.FirmwareVersion} verified (SHA-256 {validated.ImageSha256Hex?.Substring(0, 12)}…) — board version check failed ({capsError}).{gateNote} Uploading…";
+            else
+                FwStatus.Text = $"Firmware v{validated.FirmwareVersion} verified (SHA-256 {validated.ImageSha256Hex?.Substring(0, 12)}…) — this upgrades board v{caps.FirmwareVersion}.{gateNote} Uploading — wheel data will pause…";
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(90) };
-            string auth = Convert.ToBase64String(Encoding.ASCII.GetBytes($"admin:{FwPasswordBox.Text.Trim()}"));
+            string auth = Convert.ToBase64String(Encoding.ASCII.GetBytes($"admin:{FwPasswordBox.Password.Trim()}"));
             http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", auth);
+            // SEC-D-12 (CSRF): /update ko per-boot token header chahiye —
+            // WebOTA page (GET /) ke <meta name="csrf-token"> se nikalo.
+            // Token na mile to legacy board samjho aur header ke baghair
+            // bhejo (purana board token mangta hi nahi); naya board token
+            // ke baghair POST reject karta hai — GET fail ho to POST wahi
+            // error dega, is liye yahan fail nahi karte.
+            try
+            {
+                string page = await http.GetStringAsync(new UriBuilder(Uri.UriSchemeHttp, espIp.ToString()).Uri);
+                string? csrf = WebOta.TryExtractCsrfToken(page);
+                if (csrf is not null)
+                    http.DefaultRequestHeaders.Add(WebOta.CsrfHeaderName, csrf);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
+            {
+                // Board se page nahi mila — POST koshish phir bhi karo.
+            }
             using var form = new MultipartFormDataContent();
             var part = new ByteArrayContent(bytes);
             part.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-            form.Add(part, "firmware", System.IO.Path.GetFileName(_fwFilePath));
-            var resp = await http.PostAsync($"http://{_services.Settings.EspIp}/update", form);
+            form.Add(part, "firmware", System.IO.Path.GetFileName(path));
+            // SEC-C-03: URL string interpolation se nahi — UriBuilder,
+            // host sirf validated IP hota hai (userinfo/port/path kabhi nahi).
+            var uri = new UriBuilder(Uri.UriSchemeHttp, espIp.ToString()) { Path = "/update" }.Uri;
+            var resp = await http.PostAsync(uri, form);
             string body = await resp.Content.ReadAsStringAsync();
-            FwStatus.Text = resp.IsSuccessStatusCode && body.StartsWith("OK", StringComparison.Ordinal)
-                ? "Update ho gaya ✓ Board restart ho raha hai — Link dobara zinda hone mein chand second lagenge."
-                : $"Board ne inkar kiya: {body.Trim()} (password check karo — default rsh-ota hai).";
+            if (resp.IsSuccessStatusCode && body.StartsWith("OK", StringComparison.Ordinal))
+            {
+                // SEC-C-02: HTTP 200 + "OK" akela kamyabi NAHI — board
+                // restart ke baad GET_CAPS se naya version confirm ho to
+                // hi kamyabi. Confirm na ho to UNKNOWN (kabhi success nahi).
+                // "OK" ka matlab hai board ne image ki signature verify
+                // ki (SEC-C-06, board-side verify-before-apply, Phase D).
+                FwStatus.Text = "Board is restarting — verifying the new version (up to 30 s)…";
+                var confirmed = await TryConfirmFirmwareVersionAsync(validated.FirmwareVersion!);
+                FwStatus.Text = confirmed.Confirmed
+                    ? $"{confirmed.Message} The board verified the image signature."
+                    : confirmed.Message;
+            }
+            else
+            {
+                FwStatus.Text = $"The board refused it: {body.Trim()} (check the password).";
+            }
         }
-        catch (Exception)
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException or System.IO.IOException)
         {
-            // Upload ke aakhir mein board restart par connection tootna
-            // aam hai — fail aur success ka farq yahan se pakarna mushkil,
-            // is liye wazeh likha hai ke dobara check karo.
-            FwStatus.Text = "Connection band ho gaya — aksar is ka matlab hai board restart ho raha hai (update kamyab). Kuch second baad Next karke link check karo; na ho to dobara koshish karo.";
+            // SEC-C-02: connection tootna KABHI "success" nahi — UNKNOWN hai.
+            // Upload ke aakhir mein board restart par connection tootna aam
+            // hai, lekin confirm kiye baghair "kamyab" kehna user ko ghalat
+            // (purani/aadhi) firmware par aage barhne ka rasta kholta hai.
+            FwStatus.Text = "Connection lost — update NOT VERIFIED. The board may be restarting, or the upload may have failed. " +
+                "Press Next in a few seconds and check the link + firmware version; if the version is still old, try again.";
         }
         finally
         {
             FwProgress.Visibility = Visibility.Collapsed;
             UploadFwButton.IsEnabled = true;
+            // SEC-C-04: password use ke baad saaf karo — string der tak na rakho.
+            FwPasswordBox.Password = "";
+        }
+    }
+
+    /// <summary>
+    /// SEC-C-02 (Phase D): upload ke baad board restart ka intezar karo
+    /// aur GET_CAPS se naya version confirm karo (30 s tak, har 2 s).
+    /// Confirm ho to hi kamyabi — warna UNKNOWN. Board reboot ke baad
+    /// nonce badalta hai; BoardSession HELLO reply se nonce khud update
+    /// karta hai (counter 0 se), is liye har poll naya client banta hai.
+    /// </summary>
+    private async Task<PostUploadCheck> TryConfirmFirmwareVersionAsync(Version imageVersion)
+    {
+        PostUploadCheck last = FirmwareUploadGate.CheckPostUpload(null, imageVersion);
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < deadline)
+        {
+            var (caps, _) = await _services.BoardSession.GetCapsAsync(_services.Settings.EspIp);
+            last = FirmwareUploadGate.CheckPostUpload(caps, imageVersion);
+            if (last.Confirmed) return last;
+            await Task.Delay(TimeSpan.FromSeconds(2));
+        }
+        return last;
+    }
+
+    /// <summary>
+    /// File ek dafa (capped) parho aur usi buffer ko validate karo (A1 +
+    /// SEC-C-01/05/07/09). Background thread par chalao (U-P1: UI thread par I/O nahi).
+    /// </summary>
+    private static (byte[]? Bytes, FirmwareImageValidator.ValidationResult? Validated, string? Error) ReadAndValidateFirmware(string path)
+    {
+        try
+        {
+            using var stream = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.Read);
+            if (stream.Length > FirmwareImageValidator.MaxFileSizeBytes)
+                return (null, null, $"File is too large ({stream.Length:N0} bytes, cap {FirmwareImageValidator.MaxFileSizeBytes:N0}) — it will not be uploaded.");
+            if (stream.Length == 0)
+                return (null, null, "File is empty.");
+            byte[] buffer = new byte[stream.Length];
+            int read = 0;
+            while (read < buffer.Length)
+            {
+                int n = stream.Read(buffer, read, buffer.Length - read);
+                if (n == 0) break;
+                read += n;
+            }
+            if (read != buffer.Length)
+                return (null, null, "The file ended while reading — it looks incomplete.");
+            if (stream.Length != buffer.Length)
+                return (null, null, "The file changed while reading — choose it again.");
+            var validated = FirmwareImageValidator.Validate(buffer);
+            if (!validated.IsValid)
+                return (null, validated, validated.Error);
+            return (buffer, validated, null);
+        }
+        catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            return (null, null, $"Could not read the file: {ex.Message}");
         }
     }
 
@@ -298,10 +452,20 @@ public partial class WizardWindow : FluentWindow
 
     private async void ConnectWifi_Click(object sender, RoutedEventArgs e)
     {
+        // SEC-C-04: password khaali ho (abhi pair nahi hua) to netsh ko
+        // khaali password mat do — pehle password darj karne ko kaho.
+        // SEC-E-04: GetWheelPassword — pehle DPAPI KeyStore, warna
+        // in-memory buffer; settings.json se kabhi nahi.
+        string password = _services.GetWheelPassword();
+        if (string.IsNullOrWhiteSpace(password))
+        {
+            WifiStatusText.Text = "Wheel password is not set — enter the board's per-device password (from pairing / first boot).";
+            return;
+        }
         WifiConnectButton.IsEnabled = false;
         WifiStatusText.Text = "Working…";
         var r = await System.Threading.Tasks.Task.Run(
-            () => WindowsIntegration.ConnectToWheelWifi(_services.Settings.WheelWifiPassword));
+            () => WindowsIntegration.ConnectToWheelWifi(password));
         WifiStatusText.Text = r.Ok ? "Connecting… packets should follow in seconds." : r.Message;
         WifiConnectButton.IsEnabled = true;
     }
@@ -309,7 +473,7 @@ public partial class WizardWindow : FluentWindow
     private void OpenVJoyConf_Click(object sender, RoutedEventArgs e)
     {
         VJoyActionStatus.Text = WindowsIntegration.OpenVJoyConfigure()
-            ? "vJoy Configure opened — enable Device 1 with axes X, Y, Z, then come back."
+            ? "vJoy Configure opened — enable Device 1 with axes X, Y, Z + Slider, then come back."
             : "vJoy Configure not found — install the driver first (button on the right).";
     }
 
@@ -338,9 +502,12 @@ public partial class WizardWindow : FluentWindow
 
     private void Next_Click(object sender, RoutedEventArgs e)
     {
-        if (_step < 6) { ShowStep(_step + 1); return; }
+        if (_step < 7) { ShowStep(_step + 1); return; }
         Finish();
     }
+
+    private void RefreshPins_Click(object sender, RoutedEventArgs e) =>
+        _ = ViewModelStore.Setup.RefreshPinsAsync();
 
     private void Skip_Click(object sender, RoutedEventArgs e)
     {

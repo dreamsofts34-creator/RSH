@@ -1,0 +1,20 @@
+# RSH — secure partition table (Phase H, OPEN-3 / SEC-E-01).
+# Arduino default.csv jaisi hai, sirf do farq:
+#   1. nvs_keys partition (data / nvs_keys, 0x1000) — encrypted NVS ki
+#      keys ka ghar. CONFIG_NVS_ENCRYPTION=y ke saath Arduino core ki
+#      nvs_flash_init() is partition se keys parhti / banati hai
+#      (nvs_flash.h doc). Is partition ke baghair encrypted NVS nahi.
+#   2. spiffs 0x1000 chhota (0x160000 -> 0x15F000) taake nvs_keys ke liye
+#      jagah bane — app slots (OTA) bilkul wahi hain.
+# encrypted flag: flash encryption on hone par ye partitions encrypt
+# hoti hain. otadata par flag NAHI (bootloader use plaintext parhta hai).
+# Sirf [env:esp32dev-secure] is file ko istemal karta hai (platformio.ini).
+# Validate: gen_esp32part.py (sandbox mein verify hua — § docs dekho).
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x5000,  encrypted
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x140000, encrypted
+app1,     app,  ota_1,   0x150000,0x140000, encrypted
+spiffs,   data, spiffs,  0x290000,0x15F000, encrypted
+nvs_keys, data, nvs_keys,0x3EF000,0x1000,  encrypted
+coredump, data, coredump,0x3F0000,0x10000, encrypted

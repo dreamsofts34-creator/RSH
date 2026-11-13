@@ -1,0 +1,1072 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+    <xsd:import namespace="http://www.w3.org/XML/1998/namespace" />
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="metadata">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" />
+              </xsd:sequence>
+              <xsd:attribute name="name" use="required" type="xsd:string" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="assembly">
+            <xsd:complexType>
+              <xsd:attribute name="alias" type="xsd:string" />
+              <xsd:attribute name="name" type="xsd:string" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="NavDashboard" xml:space="preserve">
+    <value>Dashboard</value>
+  </data>
+  <data name="NavTuning" xml:space="preserve">
+    <value>Tuning</value>
+  </data>
+  <data name="NavSetup" xml:space="preserve">
+    <value>Setup</value>
+  </data>
+  <data name="NavButtons" xml:space="preserve">
+    <value>Buttons</value>
+  </data>
+  <data name="NavOutput" xml:space="preserve">
+    <value>Output</value>
+  </data>
+  <data name="NavProfiles" xml:space="preserve">
+    <value>Profiles</value>
+  </data>
+  <data name="NavMonitor" xml:space="preserve">
+    <value>Monitor</value>
+  </data>
+  <data name="NavSettings" xml:space="preserve">
+    <value>Settings</value>
+  </data>
+  <data name="PageDashboard" xml:space="preserve">
+    <value>Dashboard</value>
+  </data>
+  <data name="PageTuning" xml:space="preserve">
+    <value>Tuning</value>
+  </data>
+  <data name="PageSetup" xml:space="preserve">
+    <value>Setup</value>
+  </data>
+  <data name="PageButtons" xml:space="preserve">
+    <value>Buttons</value>
+  </data>
+  <data name="PageOutput" xml:space="preserve">
+    <value>Output</value>
+  </data>
+  <data name="PageProfiles" xml:space="preserve">
+    <value>Profiles</value>
+  </data>
+  <data name="PageMonitor" xml:space="preserve">
+    <value>Monitor</value>
+  </data>
+  <data name="PageSettings" xml:space="preserve">
+    <value>Settings</value>
+  </data>
+  <data name="GameOutput" xml:space="preserve">
+    <value>Game output</value>
+  </data>
+  <data name="RestartWheel" xml:space="preserve">
+    <value>Restart wheel</value>
+  </data>
+  <data name="StartSetup" xml:space="preserve">
+    <value>Start setup</value>
+  </data>
+  <data name="OpenSetup" xml:space="preserve">
+    <value>Open Setup</value>
+  </data>
+  <data name="Dismiss" xml:space="preserve">
+    <value>Dismiss</value>
+  </data>
+  <data name="RecalibrateNow" xml:space="preserve">
+    <value>Recalibrate now</value>
+  </data>
+  <data name="Launch" xml:space="preserve">
+    <value>Launch</value>
+  </data>
+  <data name="Stop" xml:space="preserve">
+    <value>Stop</value>
+  </data>
+  <data name="GameLauncher" xml:space="preserve">
+    <value>Game launcher</value>
+  </data>
+  <data name="ConnectWifi" xml:space="preserve">
+    <value>Connect to wheel Wi-Fi</value>
+  </data>
+  <data name="Retry" xml:space="preserve">
+    <value>Retry</value>
+  </data>
+  <data name="RefreshPinTable" xml:space="preserve">
+    <value>Refresh pin table</value>
+  </data>
+  <data name="Back" xml:space="preserve">
+    <value>Back</value>
+  </data>
+  <data name="Restart" xml:space="preserve">
+    <value>Restart</value>
+  </data>
+  <data name="Linear" xml:space="preserve">
+    <value>Linear</value>
+  </data>
+  <data name="Progressive" xml:space="preserve">
+    <value>Progressive</value>
+  </data>
+  <data name="TestPattern" xml:space="preserve">
+    <value>Test pattern</value>
+  </data>
+  <data name="LedPattern" xml:space="preserve">
+    <value>Pattern</value>
+  </data>
+  <data name="LedBrightness" xml:space="preserve">
+    <value>Brightness</value>
+  </data>
+  <data name="Activate" xml:space="preserve">
+    <value>Activate</value>
+  </data>
+  <data name="Duplicate" xml:space="preserve">
+    <value>Duplicate</value>
+  </data>
+  <data name="Export" xml:space="preserve">
+    <value>Export…</value>
+  </data>
+  <data name="Import" xml:space="preserve">
+    <value>Import…</value>
+  </data>
+  <data name="Delete" xml:space="preserve">
+    <value>Delete</value>
+  </data>
+  <data name="CreateProfile" xml:space="preserve">
+    <value>Create profile</value>
+  </data>
+  <data name="AddGtPreset" xml:space="preserve">
+    <value>Add GT 540° preset</value>
+  </data>
+  <data name="AddF1Preset" xml:space="preserve">
+    <value>Add F1 360° preset</value>
+  </data>
+  <data name="ExportDiagnostics" xml:space="preserve">
+    <value>Export diagnostics (.zip)</value>
+  </data>
+  <data name="OpenLogsFolder" xml:space="preserve">
+    <value>Open logs folder</value>
+  </data>
+  <data name="Refresh" xml:space="preserve">
+    <value>Refresh</value>
+  </data>
+  <data name="ApplyPinMap" xml:space="preserve">
+    <value>Apply pin map</value>
+  </data>
+  <data name="Reset" xml:space="preserve">
+    <value>Reset</value>
+  </data>
+  <data name="BackupNow" xml:space="preserve">
+    <value>Backup now</value>
+  </data>
+  <data name="Restore" xml:space="preserve">
+    <value>Restore…</value>
+  </data>
+  <data name="OpenConfigFolder" xml:space="preserve">
+    <value>Open config folder</value>
+  </data>
+  <data name="ChangeWheelPassword" xml:space="preserve">
+    <value>Change wheel password…</value>
+  </data>
+  <data name="RunSetupWizard" xml:space="preserve">
+    <value>Run setup wizard again</value>
+  </data>
+  <data name="Modules" xml:space="preserve">
+    <value>Modules</value>
+  </data>
+  <data name="GpioPins" xml:space="preserve">
+    <value>GPIO pins</value>
+  </data>
+  <data name="Appearance" xml:space="preserve">
+    <value>Appearance</value>
+  </data>
+  <data name="Data" xml:space="preserve">
+    <value>Data</value>
+  </data>
+  <data name="Connected" xml:space="preserve">
+    <value>Connected</value>
+  </data>
+  <data name="NotConnected" xml:space="preserve">
+    <value>Not connected</value>
+  </data>
+  <data name="Cancel" xml:space="preserve">
+    <value>Cancel</value>
+  </data>
+  <data name="Close" xml:space="preserve">
+    <value>Close</value>
+  </data>
+  <data name="Next" xml:space="preserve">
+    <value>Next</value>
+  </data>
+  <data name="SkipWizard" xml:space="preserve">
+    <value>Skip wizard</value>
+  </data>
+  <data name="CalibStep1CentreWheelPress" xml:space="preserve">
+    <value>1. Centre the wheel, press</value>
+  </data>
+  <data name="WizardStep1VJoyCheck" xml:space="preserve">
+    <value>1. vJoy driver check</value>
+  </data>
+  <data name="CalibStep2Press" xml:space="preserve">
+    <value>. 2. Press</value>
+  </data>
+  <data name="WizardStep2WifiConnect" xml:space="preserve">
+    <value>2. Wi-Fi connect — automatic</value>
+  </data>
+  <data name="WizardStep3WiringCheck" xml:space="preserve">
+    <value>3. Wiring check (pins)</value>
+  </data>
+  <data name="WizardStep4FirmwareUpdate" xml:space="preserve">
+    <value>4. Firmware update (optional)</value>
+  </data>
+  <data name="Rotation540SuitsGtCars" xml:space="preserve">
+    <value>540° suits GT cars, 900° road cars. The game should match this number.</value>
+  </data>
+  <data name="WizardStep5SteeringCalibration" xml:space="preserve">
+    <value>5. Steering calibration — automatic</value>
+  </data>
+  <data name="WizardStep6PedalCalibration" xml:space="preserve">
+    <value>6. Pedal calibration — automatic</value>
+  </data>
+  <data name="WizardStep7ButtonOutputTest" xml:space="preserve">
+    <value>7. Button and output test</value>
+  </data>
+  <data name="AButtonHasNoTravel" xml:space="preserve">
+    <value>A button has no travel, so there is no curve or deadzone to tune. Assign the horn button on the Buttons screen.</value>
+  </data>
+  <data name="About" xml:space="preserve">
+    <value>About</value>
+  </data>
+  <data name="Accel" xml:space="preserve">
+    <value> · accel </value>
+  </data>
+  <data name="AccelBtnLabel" xml:space="preserve">
+    <value> · Accel btn: </value>
+  </data>
+  <data name="AccelButton" xml:space="preserve">
+    <value>Accel button</value>
+  </data>
+  <data name="AccelLabel" xml:space="preserve">
+    <value>Accel: </value>
+  </data>
+  <data name="Accelerator" xml:space="preserve">
+    <value>Accelerator</value>
+  </data>
+  <data name="Accelerator2" xml:space="preserve">
+    <value>Accelerator </value>
+  </data>
+  <data name="AcceleratorLabel" xml:space="preserve">
+    <value>Accelerator: </value>
+  </data>
+  <data name="AcceleratorRaw" xml:space="preserve">
+    <value>Accelerator (raw)</value>
+  </data>
+  <data name="ActiveRulesGameProcessProfile" xml:space="preserve">
+    <value>Active rules (game process → profile)</value>
+  </data>
+  <data name="AllVJoyButtonsPressTo" xml:space="preserve">
+    <value>All vJoy buttons — press to test</value>
+  </data>
+  <data name="AnOffModuleNeverReaches" xml:space="preserve">
+    <value>An off module never reaches the game — no ghost readings from unconnected pins.</value>
+  </data>
+  <data name="AnalogPedalAndButtonCombine" xml:space="preserve">
+    <value>Analog pedal and button combine — higher value wins.</value>
+  </data>
+  <data name="AndStillForTwoSeconds" xml:space="preserve">
+    <value>and still for two seconds — the centre sets itself.</value>
+  </data>
+  <data name="Apply" xml:space="preserve">
+    <value>Apply</value>
+  </data>
+  <data name="ApplyDevice" xml:space="preserve">
+    <value>Apply device</value>
+  </data>
+  <data name="AutoSwitchProfilePerGame" xml:space="preserve">
+    <value>Auto-switch profile per game</value>
+  </data>
+  <data name="ResumeAutoSwitch" xml:space="preserve">
+    <value>Resume auto-switch</value>
+  </data>
+  <data name="UseCurrentCar" xml:space="preserve">
+    <value>Use current car</value>
+  </data>
+  <data name="AxesAndButtons" xml:space="preserve">
+    <value>Axes and buttons</value>
+  </data>
+  <data name="Bin" xml:space="preserve">
+    <value>.bin</value>
+  </data>
+  <data name="BrakeFrag" xml:space="preserve">
+    <value> · brake </value>
+  </data>
+  <data name="Brake" xml:space="preserve">
+    <value>Brake</value>
+  </data>
+  <data name="BrakeSpace" xml:space="preserve">
+    <value>Brake </value>
+  </data>
+  <data name="BrakeBtnLabel" xml:space="preserve">
+    <value> · Brake btn: </value>
+  </data>
+  <data name="BrakeButton" xml:space="preserve">
+    <value>Brake button</value>
+  </data>
+  <data name="BrakeLabel" xml:space="preserve">
+    <value>Brake: </value>
+  </data>
+  <data name="BrakeRaw" xml:space="preserve">
+    <value>Brake (raw)</value>
+  </data>
+  <data name="ButtonsMaskLabel" xml:space="preserve">
+    <value>Buttons mask: </value>
+  </data>
+  <data name="ButtonsPressed0" xml:space="preserve">
+    <value>Buttons pressed: 0</value>
+  </data>
+  <data name="ButtonsPressedLabel" xml:space="preserve">
+    <value>Buttons pressed: </value>
+  </data>
+  <data name="CalibrateYourWheelAndPedals" xml:space="preserve">
+    <value>Calibrate your wheel and pedals. Guided, takes about 1 minute.</value>
+  </data>
+  <data name="Calibration" xml:space="preserve">
+    <value>Calibration</value>
+  </data>
+  <data name="CaptureCentre" xml:space="preserve">
+    <value>Capture centre</value>
+  </data>
+  <data name="Centre" xml:space="preserve">
+    <value> · Centre </value>
+  </data>
+  <data name="CentreLabel" xml:space="preserve">
+    <value>Centre: </value>
+  </data>
+  <data name="ChangeTheMappingOnThe" xml:space="preserve">
+    <value>Change the mapping on the Buttons screen.</value>
+  </data>
+  <data name="ChangesSaveAutomaticallyToThis" xml:space="preserve">
+    <value>Changes save automatically to this profile.</value>
+  </data>
+  <data name="ChangesTheBoardSWi" xml:space="preserve">
+    <value>Changes the board's Wi-Fi / WebOTA password. The board restarts its access point afterwards.</value>
+  </data>
+  <data name="CheckTheWiringTheBoard" xml:space="preserve">
+    <value>Check the wiring the board reports. Pins are read-only here — change them in Settings → GPIO pins.</value>
+  </data>
+  <data name="Checking" xml:space="preserve">
+    <value>Checking…</value>
+  </data>
+  <data name="CheckingVJoyConfiguration" xml:space="preserve">
+    <value>Checking vJoy configuration…</value>
+  </data>
+  <data name="ChooseBin" xml:space="preserve">
+    <value>Choose .bin…</value>
+  </data>
+  <data name="ClearCalibration" xml:space="preserve">
+    <value>Clear calibration</value>
+  </data>
+  <data name="CloseButtonHidesToTray" xml:space="preserve">
+    <value>Close button hides to tray</value>
+  </data>
+  <data name="ConfigFolderLabel" xml:space="preserve">
+    <value>Config folder: </value>
+  </data>
+  <data name="ConnectAutomatically" xml:space="preserve">
+    <value>Connect automatically</value>
+  </data>
+  <data name="ConnectThisPCToThe" xml:space="preserve">
+    <value>Connect this PC to the RSH WiFi.</value>
+  </data>
+  <data name="ConnectToRSH" xml:space="preserve">
+    <value>Connect to RSH</value>
+  </data>
+  <data name="ConnectToYourWheel" xml:space="preserve">
+    <value>Connect to your wheel</value>
+  </data>
+  <data name="ConnectYourWheelCheckThe" xml:space="preserve">
+    <value>Connect your wheel, check the wiring, then calibrate — about a minute.</value>
+  </data>
+  <data name="Connection" xml:space="preserve">
+    <value>Connection</value>
+  </data>
+  <data name="CopiesTheActiveProfileAt" xml:space="preserve">
+    <value>Copies the active profile at a shorter rotation.</value>
+  </data>
+  <data name="Create" xml:space="preserve">
+    <value>Create</value>
+  </data>
+  <data name="CumulativeEncoderCountsFromThe" xml:space="preserve">
+    <value>Cumulative encoder counts from the wheel (protocol v2.1). Encoder assignment is configured in Tuning → Encoders.</value>
+  </data>
+  <data name="CurrentGateLabel" xml:space="preserve">
+    <value>Current gate: </value>
+  </data>
+  <data name="CurrentVJoyButtonMaskLabel" xml:space="preserve">
+    <value>Current vJoy button mask: </value>
+  </data>
+  <data name="DeadCentre" xml:space="preserve">
+    <value>dead centre</value>
+  </data>
+  <data name="Deadzone" xml:space="preserve">
+    <value>Deadzone</value>
+  </data>
+  <data name="Detail" xml:space="preserve">
+    <value>Detail</value>
+  </data>
+  <data name="DeviceStatus" xml:space="preserve">
+    <value>Device status</value>
+  </data>
+  <data name="DigitalPedalRamp" xml:space="preserve">
+    <value>Digital pedal ramp</value>
+  </data>
+  <data name="DonTForceItPast" xml:space="preserve">
+    <value>• Don't force it past the stop.</value>
+  </data>
+  <data name="EGAssettoCorsa" xml:space="preserve">
+    <value>e.g. AssettoCorsa</value>
+  </data>
+  <data name="EGAssettoCorsaGT3" xml:space="preserve">
+    <value>e.g. Assetto Corsa — GT3</value>
+  </data>
+  <data name="ESP32DevKitV1WiringAnalog" xml:space="preserve">
+    <value>ESP32 DevKit V1 wiring. Analog inputs need an ADC1 pin (32, 33, 34, 35, 36, 39). The board keeps its own wiring — this map is shown in Setup → Pins.</value>
+  </data>
+  <data name="Encoder1" xml:space="preserve">
+    <value>Encoder 1: —</value>
+  </data>
+  <data name="Encoder1Label" xml:space="preserve">
+    <value>Encoder 1: </value>
+  </data>
+  <data name="Encoder2" xml:space="preserve">
+    <value>Encoder 2: —</value>
+  </data>
+  <data name="Encoder2Label" xml:space="preserve">
+    <value> · Encoder 2: </value>
+  </data>
+  <data name="Encoder3Label" xml:space="preserve">
+    <value>Encoder 3: </value>
+  </data>
+  <data name="Encoder4Label" xml:space="preserve">
+    <value> · Encoder 4: </value>
+  </data>
+  <data name="EncodersLive" xml:space="preserve">
+    <value>Encoders (live)</value>
+  </data>
+  <data name="Endpoints" xml:space="preserve">
+    <value>Endpoints</value>
+  </data>
+  <data name="EndpointsComeFromCalibrationAdjust" xml:space="preserve">
+    <value>Endpoints come from calibration — adjust them in Setup.</value>
+  </data>
+  <data name="Engine" xml:space="preserve">
+    <value>Engine</value>
+  </data>
+  <data name="Engine200HzPipeline" xml:space="preserve">
+    <value>Engine (200 Hz pipeline)</value>
+  </data>
+  <data name="EveryVJoyButton132" xml:space="preserve">
+    <value>Every vJoy button 1–32 lights up while it is pressed. Outlined buttons are the assigned gear buttons.</value>
+  </data>
+  <data name="ExitFullyFromTheTray" xml:space="preserve">
+    <value>Exit fully from the tray menu.</value>
+  </data>
+  <data name="ForAMomentThenPress" xml:space="preserve">
+    <value>for a moment, then press each one</value>
+  </data>
+  <data name="Fully" xml:space="preserve">
+    <value>fully</value>
+  </data>
+  <data name="Function" xml:space="preserve">
+    <value>Function</value>
+  </data>
+  <data name="GameProcessName" xml:space="preserve">
+    <value>Game process name</value>
+  </data>
+  <data name="GamesCannotSeeTheWheel" xml:space="preserve">
+    <value>Games cannot see the wheel until the vJoy driver is installed. Install BrunnerInnovation vJoy v2.2.2.0, then restart RSH.</value>
+  </data>
+  <data name="GamesReadA" xml:space="preserve">
+    <value>Games read a</value>
+  </data>
+  <data name="GateModeFollowsTheWheel" xml:space="preserve">
+    <value>Gate mode follows the wheel wiring (GET_CAPS). There is no app setting for Sequential / H-pattern yet.</value>
+  </data>
+  <data name="GateTest" xml:space="preserve">
+    <value>Gate test</value>
+  </data>
+  <data name="GearAndPedalButtonsMapped" xml:space="preserve">
+    <value>Gear and pedal buttons, mapped to vJoy.</value>
+  </data>
+  <data name="GearButtonsVJoy" xml:space="preserve">
+    <value>Gear buttons → vJoy</value>
+  </data>
+  <data name="GearDown" xml:space="preserve">
+    <value>Gear down</value>
+  </data>
+  <data name="GearDownLabel" xml:space="preserve">
+    <value> · Gear down: </value>
+  </data>
+  <data name="GearDownVJoyButton" xml:space="preserve">
+    <value> · Gear down → vJoy button </value>
+  </data>
+  <data name="GearDownVJoyButtonNumber" xml:space="preserve">
+    <value>Gear down vJoy button number</value>
+  </data>
+  <data name="GearDownVJoyButtonNumber2" xml:space="preserve">
+    <value>Gear down → vJoy button number</value>
+  </data>
+  <data name="GearUp" xml:space="preserve">
+    <value>Gear up</value>
+  </data>
+  <data name="GearUpAndDownShare" xml:space="preserve">
+    <value>Gear up and down share one button — use different numbers.</value>
+  </data>
+  <data name="GearUpLabel" xml:space="preserve">
+    <value>Gear up: </value>
+  </data>
+  <data name="GearUpVJoy1Gear" xml:space="preserve">
+    <value>Gear up → vJoy 1 · Gear down → vJoy 2 · Buttons 1–32 live</value>
+  </data>
+  <data name="GearUpVJoyButton" xml:space="preserve">
+    <value>Gear up → vJoy button </value>
+  </data>
+  <data name="GearUpVJoyButtonNumber" xml:space="preserve">
+    <value>Gear up vJoy button number</value>
+  </data>
+  <data name="GearUpVJoyButtonNumber2" xml:space="preserve">
+    <value>Gear up → vJoy button number</value>
+  </data>
+  <data name="GetVJoyDriver" xml:space="preserve">
+    <value>Get vJoy driver</value>
+  </data>
+  <data name="HigherCalmerAtCentreLower" xml:space="preserve">
+    <value>Higher = calmer at centre. Lower = sharper. 0 = linear.</value>
+  </data>
+  <data name="HigherSteadierSlightlySlower" xml:space="preserve">
+    <value>Higher = steadier, slightly slower.</value>
+  </data>
+  <data name="HoldTheWheelByThe" xml:space="preserve">
+    <value>• Hold the wheel by the rim.</value>
+  </data>
+  <data name="Horn" xml:space="preserve">
+    <value>Horn</value>
+  </data>
+  <data name="In" xml:space="preserve">
+    <value> in → </value>
+  </data>
+  <data name="InVJoyConfEnableAxesX" xml:space="preserve">
+    <value>In vJoyConf, enable axes X, Y, Z and 2+ buttons.</value>
+  </data>
+  <data name="InYourGameBindThe" xml:space="preserve">
+    <value>In your game, bind the vJoy device. Finish — and drive.</value>
+  </data>
+  <data name="InstallTheBrunnerInnovationVJoyV2" xml:space="preserve">
+    <value>Install the BrunnerInnovation vJoy v2.2.2.0 driver once.</value>
+  </data>
+  <data name="InvertAxis" xml:space="preserve">
+    <value>Invert axis</value>
+  </data>
+  <data name="KeepBothPedals" xml:space="preserve">
+    <value>Keep both pedals</value>
+  </data>
+  <data name="KeepPedalsReleasedBrieflyThen" xml:space="preserve">
+    <value>, keep pedals released briefly, then press each fully. Press again to stop.</value>
+  </data>
+  <data name="LEDTestLEDTESTNeeds" xml:space="preserve">
+    <value>LED test (LED_TEST) needs a connected board with a session key. Pick a pattern and brightness below, then send the test — the strip runs it for 5 seconds.</value>
+  </data>
+  <data name="Language" xml:space="preserve">
+    <value>Language</value>
+  </data>
+  <data name="LanguageNote" xml:space="preserve">
+    <value>Applies immediately — no restart needed.</value>
+  </data>
+  <data name="LaunchingAGameActivatesIts" xml:space="preserve">
+    <value>Launching a game activates its bound profile. One game at a time.</value>
+  </data>
+  <data name="LeaveTheWheel" xml:space="preserve">
+    <value>Leave the wheel</value>
+  </data>
+  <data name="Link" xml:space="preserve">
+    <value>Link</value>
+  </data>
+  <data name="Live" xml:space="preserve">
+    <value>Live</value>
+  </data>
+  <data name="LiveAccel" xml:space="preserve">
+    <value>Live: accel </value>
+  </data>
+  <data name="LiveButtons" xml:space="preserve">
+    <value>Live buttons</value>
+  </data>
+  <data name="LiveLink" xml:space="preserve">
+    <value>Live link</value>
+  </data>
+  <data name="LiveOutputWhatGamesSee" xml:space="preserve">
+    <value>Live output — what games see</value>
+  </data>
+  <data name="LiveReadingLabel" xml:space="preserve">
+    <value>Live reading: </value>
+  </data>
+  <data name="LiveResponse" xml:space="preserve">
+    <value>Live response</value>
+  </data>
+  <data name="LiveSteeringLabel" xml:space="preserve">
+    <value>Live steering: </value>
+  </data>
+  <data name="LiveSteps" xml:space="preserve">
+    <value>Live steps</value>
+  </data>
+  <data name="LiveTest" xml:space="preserve">
+    <value>Live test</value>
+  </data>
+  <data name="LiveValues" xml:space="preserve">
+    <value>Live values</value>
+  </data>
+  <data name="LoadingPinTable" xml:space="preserve">
+    <value>Loading pin table…</value>
+  </data>
+  <data name="LogLevel" xml:space="preserve">
+    <value>Log level</value>
+  </data>
+  <data name="Logging" xml:space="preserve">
+    <value>Logging</value>
+  </data>
+  <data name="Logs" xml:space="preserve">
+    <value>Logs</value>
+  </data>
+  <data name="LogsKeep7DaysIn" xml:space="preserve">
+    <value>Logs keep 7 days, in the config folder.</value>
+  </data>
+  <data name="MaskLabel" xml:space="preserve">
+    <value> · Mask: </value>
+  </data>
+  <data name="Max" xml:space="preserve">
+    <value> · Max </value>
+  </data>
+  <data name="MaxLabel" xml:space="preserve">
+    <value>Max: </value>
+  </data>
+  <data name="Min" xml:space="preserve">
+    <value>Min </value>
+  </data>
+  <data name="MinLabel" xml:space="preserve">
+    <value>Min: </value>
+  </data>
+  <data name="ModuleButtons" xml:space="preserve">
+    <value>Wheel Buttons</value>
+  </data>
+  <data name="ModuleClutch" xml:space="preserve">
+    <value>Clutch</value>
+  </data>
+  <data name="ModuleEncoders" xml:space="preserve">
+    <value>Encoders</value>
+  </data>
+  <data name="ModuleHandbrake" xml:space="preserve">
+    <value>Handbrake</value>
+  </data>
+  <data name="ModuleShifter" xml:space="preserve">
+    <value>Shifter</value>
+  </data>
+  <data name="ModuleSubAccelerator" xml:space="preserve">
+    <value>Analog pedal · vJoy Axis Y</value>
+  </data>
+  <data name="ModuleSubBrake" xml:space="preserve">
+    <value>Analog pedal · vJoy Axis Z</value>
+  </data>
+  <data name="ModuleSubButtons" xml:space="preserve">
+    <value>Wheel buttons · vJoy 1–32</value>
+  </data>
+  <data name="ModuleSubClutch" xml:space="preserve">
+    <value>Analog pedal · vJoy WClutch</value>
+  </data>
+  <data name="ModuleSubEncoders" xml:space="preserve">
+    <value>Rotary encoders · cumulative steps</value>
+  </data>
+  <data name="ModuleSubHandbrake" xml:space="preserve">
+    <value>Analog lever · vJoy Slider</value>
+  </data>
+  <data name="ModuleSubHorn" xml:space="preserve">
+    <value>Momentary button</value>
+  </data>
+  <data name="ModuleSubLed" xml:space="preserve">
+    <value>Status LED strip</value>
+  </data>
+  <data name="ModuleSubShifter" xml:space="preserve">
+    <value>Digital gates · Sequential / H-pattern</value>
+  </data>
+  <data name="ModuleSubSteering" xml:space="preserve">
+    <value>Wheel axis · vJoy Axis X</value>
+  </data>
+  <data name="Ms" xml:space="preserve">
+    <value> ms</value>
+  </data>
+  <data name="NewProfileName" xml:space="preserve">
+    <value>New profile name</value>
+  </data>
+  <data name="NextStep" xml:space="preserve">
+    <value>Next step</value>
+  </data>
+  <data name="NoDataFor250Ms" xml:space="preserve">
+    <value>no data for 250 ms. The safety watchdog is holding the controls centred.</value>
+  </data>
+  <data name="NoDataWheelNotConnected" xml:space="preserve">
+    <value>No data — wheel not connected, live values are not updating.</value>
+  </data>
+  <data name="NoDataWheelNotConnected2" xml:space="preserve">
+    <value>No data — wheel not connected. </value>
+  </data>
+  <data name="NoEncoderDataInThe" xml:space="preserve">
+    <value>No encoder data in the current stream — the v1 stream carries no encoders.</value>
+  </data>
+  <data name="NoFileChosen" xml:space="preserve">
+    <value>No file chosen</value>
+  </data>
+  <data name="NoInternetWhileOnRSH" xml:space="preserve">
+    <value>No internet while on RSH — normal.</value>
+  </data>
+  <data name="OTAPasswordLabel" xml:space="preserve">
+    <value>OTA password:</value>
+  </data>
+  <data name="OnOffSettings" xml:space="preserve">
+    <value>On/off: Settings.</value>
+  </data>
+  <data name="OneAtATimeAnd" xml:space="preserve">
+    <value>, one at a time, and hold it a second. The endpoints set themselves.</value>
+  </data>
+  <data name="OneProfilePerGameSelecting" xml:space="preserve">
+    <value>One profile per game. Selecting activates it.</value>
+  </data>
+  <data name="OpenGameControllers" xml:space="preserve">
+    <value>Open Game Controllers</value>
+  </data>
+  <data name="OpenGameControllersJoyCpl" xml:space="preserve">
+    <value>Open Game Controllers (joy.cpl)</value>
+  </data>
+  <data name="OpenVJoyConf" xml:space="preserve">
+    <value>Open vJoyConf</value>
+  </data>
+  <data name="OpenVJoyConfigure" xml:space="preserve">
+    <value>Open vJoy Configure</value>
+  </data>
+  <data name="OptionalSendAFirmware" xml:space="preserve">
+    <value>Optional. Send a firmware</value>
+  </data>
+  <data name="Out" xml:space="preserve">
+    <value> out</value>
+  </data>
+  <data name="OutputNeutralLabel" xml:space="preserve">
+    <value>Output neutral: </value>
+  </data>
+  <data name="PacketStats" xml:space="preserve">
+    <value>Packet stats</value>
+  </data>
+  <data name="Password" xml:space="preserve">
+    <value>Password</value>
+  </data>
+  <data name="PatternsTheBoardSupportsOFF" xml:space="preserve">
+    <value>Patterns the board supports: OFF · SOLID · BLINK · CHASE · RAINBOW.</value>
+  </data>
+  <data name="Pedals" xml:space="preserve">
+    <value>Pedals</value>
+  </data>
+  <data name="PerGameAutoSwitch" xml:space="preserve">
+    <value>Per-game auto-switch</value>
+  </data>
+  <data name="Performance" xml:space="preserve">
+    <value>Performance</value>
+  </data>
+  <data name="PickAModuleToTune" xml:space="preserve">
+    <value>Pick a module to tune it. Changes apply instantly in the game.</value>
+  </data>
+  <data name="Pin" xml:space="preserve">
+    <value>Pin</value>
+  </data>
+  <data name="PowerTheWheelJoinIts" xml:space="preserve">
+    <value>Power the wheel, join its Wi-Fi, and wait for packets.</value>
+  </data>
+  <data name="PowerTheWheelOneClick" xml:space="preserve">
+    <value>Power the wheel. One click joins this PC to the</value>
+  </data>
+  <data name="Press" xml:space="preserve">
+    <value>Press</value>
+  </data>
+  <data name="PressEachButtonOnceOutput" xml:space="preserve">
+    <value>Press each button once. Output below is what games see.</value>
+  </data>
+  <data name="PressRamp" xml:space="preserve">
+    <value>Press ramp</value>
+  </data>
+  <data name="Pressed" xml:space="preserve">
+    <value> pressed</value>
+  </data>
+  <data name="ProcessNameOnlyNoExe" xml:space="preserve">
+    <value>Process name only, no .exe — see Task Manager → Details.</value>
+  </data>
+  <data name="ProcessedOutputWhatTheGame" xml:space="preserve">
+    <value>Processed output (what the game receives)</value>
+  </data>
+  <data name="ProfileLabel" xml:space="preserve">
+    <value>Profile: </value>
+  </data>
+  <data name="PulsesPerStepIsAssignment" xml:space="preserve">
+    <value>Pulses per step is assignment — set it in Settings.</value>
+  </data>
+  <data name="R" xml:space="preserve">
+    <value>R</value>
+  </data>
+  <data name="RSH" xml:space="preserve">
+    <value>RSH</value>
+  </data>
+  <data name="RSHRealSimHub" xml:space="preserve">
+    <value>RSH — Real Sim Hub</value>
+  </data>
+  <data name="RSHSetsItselfUpLabel" xml:space="preserve">
+    <value>RSH sets itself up:</value>
+  </data>
+  <data name="RSHSetup" xml:space="preserve">
+    <value>RSH Setup</value>
+  </data>
+  <data name="RangeFoundLabel" xml:space="preserve">
+    <value>Range found: </value>
+  </data>
+  <data name="RawLiveDataFromThe" xml:space="preserve">
+    <value>Raw live data from the wheel.</value>
+  </data>
+  <data name="RealSimHub" xml:space="preserve">
+    <value>Real Sim Hub</value>
+  </data>
+  <data name="ReleaseRamp" xml:space="preserve">
+    <value>Release ramp</value>
+  </data>
+  <data name="Released" xml:space="preserve">
+    <value>released</value>
+  </data>
+  <data name="RemovesTinyShakeAtCentre" xml:space="preserve">
+    <value>Removes tiny shake at centre. Set the game's own deadzone to 0.</value>
+  </data>
+  <data name="ResponseCurve" xml:space="preserve">
+    <value>Response curve</value>
+  </data>
+  <data name="RotationPresets" xml:space="preserve">
+    <value>Rotation presets</value>
+  </data>
+  <data name="SaveCalibration" xml:space="preserve">
+    <value>Save calibration</value>
+  </data>
+  <data name="SavedToTheActiveProfile" xml:space="preserve">
+    <value>Saved to the active profile.</value>
+  </data>
+  <data name="Sequence" xml:space="preserve">
+    <value>Sequence</value>
+  </data>
+  <data name="SetEachProfileSGame" xml:space="preserve">
+    <value>Set each profile's game on the Profiles page.</value>
+  </data>
+  <data name="SetYourWheelSReal" xml:space="preserve">
+    <value>Set your wheel's real steering and pedal ranges.</value>
+  </data>
+  <data name="ShiftDown" xml:space="preserve">
+    <value>Shift down</value>
+  </data>
+  <data name="ShiftUp" xml:space="preserve">
+    <value>Shift up</value>
+  </data>
+  <data name="Smoothing" xml:space="preserve">
+    <value>Smoothing</value>
+  </data>
+  <data name="StartMinimisedToTray" xml:space="preserve">
+    <value>Start minimised to tray</value>
+  </data>
+  <data name="StartOver" xml:space="preserve">
+    <value>Start over</value>
+  </data>
+  <data name="StartPedalCapture" xml:space="preserve">
+    <value>Start pedal capture</value>
+  </data>
+  <data name="StartRangeCapture" xml:space="preserve">
+    <value>Start range capture</value>
+  </data>
+  <data name="StartWithWindows" xml:space="preserve">
+    <value>Start with Windows</value>
+  </data>
+  <data name="StartupTray" xml:space="preserve">
+    <value>Startup &amp; tray</value>
+  </data>
+  <data name="StatusLED" xml:space="preserve">
+    <value>Status LED</value>
+  </data>
+  <data name="Steering" xml:space="preserve">
+    <value>Steering</value>
+  </data>
+  <data name="SteeringLabel" xml:space="preserve">
+    <value>Steering: </value>
+  </data>
+  <data name="SteeringRange" xml:space="preserve">
+    <value>Steering range</value>
+  </data>
+  <data name="SteeringRaw" xml:space="preserve">
+    <value>Steering (raw)</value>
+  </data>
+  <data name="Step1Of7" xml:space="preserve">
+    <value>Step 1 of 7</value>
+  </data>
+  <data name="StepsAdvanceOnTheirOwn" xml:space="preserve">
+    <value>Steps advance on their own when ready.</value>
+  </data>
+  <data name="StopCapture" xml:space="preserve">
+    <value>Stop capture</value>
+  </data>
+  <data name="SystemFollowsWindows" xml:space="preserve">
+    <value>System follows Windows.</value>
+  </data>
+  <data name="TheBoardSPerDevice" xml:space="preserve">
+    <value>The board's per-device password (from pairing / first boot). Never a default.</value>
+  </data>
+  <data name="TheWheelIsNotSending" xml:space="preserve">
+    <value>The wheel is not sending this axis yet — tuning is saved and will apply when the wheel reports it.</value>
+  </data>
+  <data name="TheWheelSWiFi" xml:space="preserve">
+    <value>The wheel's Wi-Fi address is 192.168.4.1 (rsh.local). Only a private IPv4 address is accepted.</value>
+  </data>
+  <data name="Theme" xml:space="preserve">
+    <value>Theme</value>
+  </data>
+  <data name="ThisAppOnYourPC" xml:space="preserve">
+    <value>This app on your PC</value>
+  </data>
+  <data name="ThisModuleIsOffTurn" xml:space="preserve">
+    <value>This module is off. Turn it on in Settings → Modules.</value>
+  </data>
+  <data name="Tips" xml:space="preserve">
+    <value>Tips</value>
+  </data>
+  <data name="ToTheWheelNow" xml:space="preserve">
+    <value>to the wheel now.</value>
+  </data>
+  <data name="TotalStepsLabel" xml:space="preserve">
+    <value>Total steps: </value>
+  </data>
+  <data name="TurnFullyLeftAndRight" xml:space="preserve">
+    <value>, turn fully left and right, press again to stop.</value>
+  </data>
+  <data name="Type" xml:space="preserve">
+    <value>Type</value>
+  </data>
+  <data name="UploadToWheel" xml:space="preserve">
+    <value>Upload to wheel</value>
+  </data>
+  <data name="UseUniqueNumbersFrom1" xml:space="preserve">
+    <value>Use unique numbers from 1–32. Buttons 33–128 are not supported in this app — they are rejected, never remapped to 1–32.</value>
+  </data>
+  <data name="VJoy" xml:space="preserve">
+    <value>vJoy</value>
+  </data>
+  <data name="VJoyDevice" xml:space="preserve">
+    <value>vJoy device</value>
+  </data>
+  <data name="VJoyDeviceNumber" xml:space="preserve">
+    <value>vJoy device number</value>
+  </data>
+  <data name="VJoyDriverNotFound" xml:space="preserve">
+    <value>vJoy driver not found</value>
+  </data>
+  <data name="VJoyOutSteering" xml:space="preserve">
+    <value>vJoy out — steering </value>
+  </data>
+  <data name="VirtualJoystick" xml:space="preserve">
+    <value>virtual joystick.</value>
+  </data>
+  <data name="WaitingForPackets" xml:space="preserve">
+    <value>Waiting for packets…</value>
+  </data>
+  <data name="WelcomeToRSH" xml:space="preserve">
+    <value>Welcome to RSH</value>
+  </data>
+  <data name="WhatTheBoardReportsPins" xml:space="preserve">
+    <value>What the board reports. Pins are read-only here — to change them, go to Settings → GPIO pins.</value>
+  </data>
+  <data name="WheelAddress" xml:space="preserve">
+    <value>Wheel address</value>
+  </data>
+  <data name="WheelButtons" xml:space="preserve">
+    <value>Wheel buttons</value>
+  </data>
+  <data name="WheelNotConnectedPowerThe" xml:space="preserve">
+    <value>Wheel not connected. Power the wheel and join the RSH WiFi network.</value>
+  </data>
+  <data name="WheelPassword" xml:space="preserve">
+    <value>Wheel password</value>
+  </data>
+  <data name="WheelWiFi" xml:space="preserve">
+    <value>Wheel Wi-Fi</value>
+  </data>
+  <data name="WheelWiFiPassword" xml:space="preserve">
+    <value>Wheel Wi-Fi password</value>
+  </data>
+  <data name="WhenAGameLaunchedFrom" xml:space="preserve">
+    <value>When a game launched from the Dashboard closes, its previous profile is restored automatically.</value>
+  </data>
+  <data name="WiFi" xml:space="preserve">
+    <value>Wi-Fi.</value>
+  </data>
+  <data name="WiringPinTable" xml:space="preserve">
+    <value>Wiring — pin table</value>
+  </data>
+  <data name="WrittenToTheSparePartition" xml:space="preserve">
+    <value>Written to the spare partition first — a failed upload changes nothing.</value>
+  </data>
+  <data name="WrongDirectionLaterUseInvert" xml:space="preserve">
+    <value>• Wrong direction later? Use Invert steering in Tune.</value>
+  </data>
+  <data name="YourProfiles" xml:space="preserve">
+    <value>Your profiles</value>
+  </data>
+</root>

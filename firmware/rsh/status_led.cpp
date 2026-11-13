@@ -29,5 +29,11 @@ void led_update(uint32_t nowMs) {
     case LedState::Updating:                 // 5 Hz: 100 ms on / 100 ms off
       led_write((nowMs / 100) % 2 == 0);
       break;
+    case LedState::SafeMode:                 // 1 Hz: 500 ms on / 500 ms off (§4.4)
+      led_write((nowMs / 500) % 2 == 0);
+      break;
+    case LedState::KeyResetArmed:            // 4 Hz: 125 ms on / 125 ms off (§4.4)
+      led_write((nowMs / 125) % 2 == 0);
+      break;
   }
 }

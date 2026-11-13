@@ -6,7 +6,8 @@ namespace RSH.App.Themes;
 /// <summary>
 /// Theme switch ka mechanism (UI-1, Settings → Appearance se badlega — UI-11).
 /// Sirf resource dictionaries badalta hai: RSHTheme.xaml ke andar merged
-/// palette (RSHTheme.Light.xaml / RSHTheme.Dark.xaml) replace hoti hai.
+/// palette (RSHTheme.Light.xaml / RSHTheme.Dark.xaml / RSHTheme.HighContrast.xaml)
+/// replace hoti hai.
 /// Koi layout rebuild nahi, koi heavy kaam nahi (U-P10). Saare theme-dependent
 /// brushes RSHTheme.xaml mein DynamicResource se bandhe hain, is liye swap
 /// foran poori window par lagta hai. UI thread par koi I/O nahi (U-P1) —
@@ -17,13 +18,24 @@ public static class RSHThemeManager
     public const string Light = "Light";
     public const string Dark = "Dark";
     public const string System = "System";
+    /// <summary>Phase F a11y: Windows High Contrast palette (SystemColors).</summary>
+    public const string HighContrast = "HighContrast";
 
-    /// <summary>Is waqt ka active RSH palette: "Light" ya "Dark".</summary>
+    /// <summary>Is waqt ka active RSH palette: "Light", "Dark" ya "HighContrast".</summary>
     public static string CurrentTheme { get; private set; } = Light;
 
     /// <summary>
-    /// Theme lagao: "Light" | "Dark" | "System" (system = OS theme, WPF-UI se).
-    /// Ghalat/empty value par "System" jaisa sulook hota hai.
+    /// Theme badalne par uthta hai (resolved theme naam ke saath) — ScottPlot
+    /// pages (MonitorPage) is par apne chart ke rang live badalte hain, page
+    /// dobara khole baghair (U-P10: sirf dictionaries + plot recolours).
+    /// </summary>
+    public static event EventHandler<string>? ThemeChanged;
+
+    /// <summary>
+    /// Theme lagao: "Light" | "Dark" | "HighContrast" | "System" (system = OS
+    /// theme, WPF-UI se). "System" par Windows High Contrast on ho to
+    /// HighContrast palette lagti hai (HC ka ehteram). Ghalat/empty value
+    /// par "System" jaisa sulook hota hai.
     /// </summary>
     public static void ApplyTheme(string? theme)
     {
@@ -31,10 +43,16 @@ public static class RSHThemeManager
         {
             Dark => Dark,
             Light => Light,
-            _ => ApplicationThemeManager.GetSystemTheme() == SystemTheme.Dark ? Dark : Light,
+            HighContrast => HighContrast,
+            _ => SystemParameters.HighContrast
+                ? HighContrast
+                : ApplicationThemeManager.GetSystemTheme() == SystemTheme.Dark ? Dark : Light,
         };
         if (SwapPalette(resolved))
+        {
             CurrentTheme = resolved;
+            ThemeChanged?.Invoke(null, resolved);
+        }
     }
 
     private static bool SwapPalette(string theme)
@@ -78,7 +96,8 @@ public static class RSHThemeManager
         {
             var source = themeDictionary.MergedDictionaries[i].Source?.OriginalString ?? string.Empty;
             if (source.EndsWith("RSHTheme.Light.xaml", StringComparison.OrdinalIgnoreCase) ||
-                source.EndsWith("RSHTheme.Dark.xaml", StringComparison.OrdinalIgnoreCase))
+                source.EndsWith("RSHTheme.Dark.xaml", StringComparison.OrdinalIgnoreCase) ||
+                source.EndsWith("RSHTheme.HighContrast.xaml", StringComparison.OrdinalIgnoreCase))
             {
                 themeDictionary.MergedDictionaries[i] = palette;
                 return true;

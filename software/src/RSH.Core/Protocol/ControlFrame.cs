@@ -20,7 +20,7 @@ public enum ControlParseResult
 /// payload (len bytes) | tag[16]. Total = 13 + len + 16, max 1053 B.
 /// Tag = HMAC-SHA256(key32, nonce16 ‖ counter_LE ‖ cmd ‖ payload)[0:16] (§3.2).
 /// Frame header (magic/reqId/len) HMAC mein NAHI hai — sirf nonce, counter, cmd, payload.
-/// Key DPAPI se aayegi (WP4/KEY-LIFECYCLE.md) — yahan key parameter hai, kabhi hard-code nahi.
+/// Key BoardSession/KeyStore (DPAPI, Phase E WS5) se aati hai — yahan key parameter hai, kabhi hard-code nahi.
 /// </summary>
 public readonly struct ControlFrame
 {
@@ -171,7 +171,12 @@ public sealed class ControlSession
             if (_recent[i].ReqId == reqId && _recent[i].Counter == counter)
                 return ControlSessionDecision.Duplicate;
         }
-        if (_hasSeen && counter <= _maxSeen) return ControlSessionDecision.Replay;
+        // Counter-wrap rule (Phase D, SEC-D-07c — PROTOCOL-V2.1.md §3.2
+        // amendment): "naya" counter wahi hai jis ka (int)(counter - maxSeen)
+        // > 0 ho (RFC 1982 serial arithmetic). 0xFFFFFFFF ke baad 0 bhi naya
+        // hai; purana counter wrap ke baad bhi Replay hai. C++ (protocol.h)
+        // ke rsh_ctrl_session_classify se byte-identical behaviour.
+        if (_hasSeen && (int)(counter - _maxSeen) <= 0) return ControlSessionDecision.Replay;
 
         _maxSeen = counter;
         _hasSeen = true;

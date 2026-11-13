@@ -1,9 +1,13 @@
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Media;
+using RSH.App.Resources;
 using RSH.App.Services;
+using RSH.App.Themes;
 using RSH.App.ViewModels;
 using RSH.App.Views;
+using RSH.Core.Windows;
 using Serilog;
 using Serilog.Events;
 using Wpf.Ui.Appearance;
@@ -12,22 +16,24 @@ namespace RSH.App;
 
 public partial class App : Application
 {
-    private static Mutex? _singleInstance;
+    private SingleInstanceCoordinator? _singleInstance;
     private AppServices? _services;
 
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
 
-        // Single instance — do engine kabhi nahi (docs ka usool)
-        _singleInstance = new Mutex(initiallyOwned: true, "Global\\RSH.SingleInstance", out bool isFirst);
-        if (!isFirst)
+        // A4 — Single instance: do engine kabhi nahi. Doosri instance
+        // pehli ko named pipe se activate karti hai (bring-to-front),
+        // phir khud band ho jati hai — koi duplicate engine nahi.
+        _singleInstance = new SingleInstanceCoordinator();
+        if (!_singleInstance.TryAcquire())
         {
-            MessageBox.Show("RSH pehle se chal raha hai (system tray dekho).", "RSH",
-                MessageBoxButton.OK, MessageBoxImage.Information);
+            SingleInstanceCoordinator.SignalExisting();
             Shutdown();
             return;
         }
+        _singleInstance.StartListening(() => Dispatcher.Invoke(BringMainWindowToFront));
 
         _services = new AppServices();
 
@@ -73,6 +79,9 @@ public partial class App : Application
         // Brand accent — reference wala violet, poori app mein ek hi.
         ApplicationAccentColorManager.Apply(Color.FromRgb(0x6C, 0x4C, 0xF1));
         ApplyTheme(_services.Settings.Theme);
+        // Phase F i18n: mehfooz language startup par lagao — MainWindow
+        // banne se pehle, taake pehli render hi sahi language mein ho.
+        UiStrings.ApplyLanguage(_services.Settings.Language);
 
         var mainWindow = new MainWindow(_services);
         MainWindow = mainWindow;
@@ -125,6 +134,9 @@ public partial class App : Application
 
     public static void ApplyTheme(string theme)
     {
+        // Phase F: "HighContrast" par WPF-UI chrome system theme (Light/Dark)
+        // par rehta hai — RSH palette RSHThemeManager mein HighContrast
+        // (SystemColors) hoti hai; baqi themes pehle jaisi.
         var t = theme switch
         {
             "Dark" => ApplicationTheme.Dark,
@@ -134,15 +146,30 @@ public partial class App : Application
         };
         ApplicationThemeManager.Apply(t);
 
-        // Reference-style backdrop: halka pastel (light) / gehri indigo
-        // (dark) — cards is par saaf ubhar kar aate hain.
-        var bg = new SolidColorBrush(t == ApplicationTheme.Light
-            ? Color.FromRgb(0xE9, 0xED, 0xFB)
-            : Color.FromRgb(0x17, 0x19, 0x26));
-        bg.Freeze();
-        foreach (Window w in Current.Windows)
-            if (w is MainWindow) w.Background = bg;
+        // UI-12 BUG FIX: pehle sirf WPF-UI theme badalta tha — RSH palette
+        // (sidebar, nav, Ax* page content) Light par atka rehta tha, aur
+        // MainWindow.Background par seedha brush lagane se
+        // DynamicResource RSHBackgroundBrush mar jata tha (spec bg
+        // #F5F3FF / #0B0E13 kabhi nahi lagta tha). Ab dono ek saath.
+        RSHThemeManager.ApplyTheme(theme);
     }
+
+    /// <summary>A4 — pehli instance ko samne lao: tray se nikalo, restore karo, foreground mein lao.</summary>
+    private void BringMainWindowToFront()
+    {
+        var w = MainWindow;
+        if (w is null) return;
+        if (!w.IsVisible) w.Show();
+        if (w.WindowState == WindowState.Minimized) w.WindowState = WindowState.Normal;
+        w.Activate();
+        // Activate() kabhi kabhi taskbar flash tak mehdood rehta hai —
+        // foreground window ki darkhwast Windows par seedha karo.
+        if (OperatingSystem.IsWindows())
+            SetForegroundWindow(new System.Windows.Interop.WindowInteropHelper(w).Handle);
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
 
     protected override void OnExit(ExitEventArgs e)
     {

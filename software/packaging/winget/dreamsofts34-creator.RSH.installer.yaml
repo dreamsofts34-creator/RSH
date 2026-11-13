@@ -1,0 +1,16 @@
+# RSH — winget installer manifest draft (Phase H / SW-16)
+# DRAFT — InstallerUrl/InstallerSha256 release MSIX ke baad bharo.
+# MSIX signed hona chahiye (Publisher == OV cert Subject, SIGNING.md §3.1) —
+# USER DECISION 2026-11-13: OV cert abhi nahi, v2.0.0 unsigned; winget
+# submit cert khareedne + signed MSIX ke baad.
+PackageIdentifier: dreamsofts34-creator.RSH
+PackageVersion: 2.0.0
+InstallerType: msix
+Architecture: x64
+InstallerUrl: TODO-RELEASE-MSIX-URL
+InstallerSha256: TODO-RELEASE-MSIX-SHA256
+Scope: user
+UpgradeBehavior: install
+ReleaseDate: TODO-RELEASE-DATE
+ManifestType: installer
+ManifestVersion: 1.10.0

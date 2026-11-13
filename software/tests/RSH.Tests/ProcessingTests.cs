@@ -1,11 +1,13 @@
 using RSH.Core.Processing;
+using RSH.Core.Profiles;
+using RSH.Core.Protocol;
 
 namespace RSH.Tests;
 
 public class ProcessingTests
 {
     private static readonly SteeringCalibration Cal = new()
-    { RawMin = 1000, RawCenter = 2050, RawMax = 3100, IsSet = true };
+    { RawMin = 1000, RawCenter = 2050, RawMax = 3100, IsSet = true, IsMillivolts = true };
 
     [Fact]
     public void SteeringMapping_CenterMinMax()
@@ -25,10 +27,11 @@ public class ProcessingTests
     [Fact]
     public void PedalMapping_AndDeadzone()
     {
-        var cal = new PedalCalibration { RawMin = 300, RawMax = 2600, IsSet = true };
-        Assert.Equal(0.0, InputMapper.MapPedal(300, cal, false), 6);
-        Assert.Equal(1.0, InputMapper.MapPedal(2600, cal, false), 6);
-        Assert.Equal(0.5, InputMapper.MapPedal(1450, cal, false), 6);
+        var cal = new PedalCalibration { RawMin = 300, RawMax = 2600, IsSet = true, IsMillivolts = true };
+        // Ye qeematein mV mein hain (sane mV cal) — inMillivolts: true.
+        Assert.Equal(0.0, InputMapper.MapPedal(300, cal, false, inMillivolts: true), 6);
+        Assert.Equal(1.0, InputMapper.MapPedal(2600, cal, false, inMillivolts: true), 6);
+        Assert.Equal(0.5, InputMapper.MapPedal(1450, cal, false, inMillivolts: true), 6);
 
         Assert.Equal(0.0, InputMapper.ApplyDeadzone(0.05, 0.1), 6);
         Assert.Equal(0.0, InputMapper.ApplyDeadzone(-0.1, 0.1), 6);
@@ -88,6 +91,35 @@ public class ProcessingTests
     }
 
     [Fact]
+    public void OneEuro_InvalidParameters_Rejected()
+    {
+        // T14: freq=0 C# mein crash nahi karta — double Infinity deta hai aur
+        // filter degenerate ho jata hai. Ab ctor hi reject karta hai.
+        Assert.Throws<ArgumentOutOfRangeException>(() => new OneEuroFilter(0, 5.0, 0.1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new OneEuroFilter(-200, 5.0, 0.1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new OneEuroFilter(double.NaN, 5.0, 0.1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new OneEuroFilter(double.PositiveInfinity, 5.0, 0.1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new OneEuroFilter(200, 0, 0.1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new OneEuroFilter(200, -1, 0.1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new OneEuroFilter(200, 5.0, -0.1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new OneEuroFilter(200, 5.0, 0.1, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new OneEuroFilter(200, 5.0, 0.1, double.NaN));
+    }
+
+    [Fact]
+    public void OneEuro_NonFiniteDt_FiniteOutput()
+    {
+        // T14: NaN/Infinity dt pehle Math.Clamp se guzar kar filter ko NaN
+        // kar deta tha. Ab nominal 5 ms mana jata hai — output finite rehta hai.
+        var filter = new OneEuroFilter(200, 5.0, 0.1);
+        Assert.Equal(0.5, filter.Filter(0.5, double.NaN), 6);   // pehla sample seedha guzarta hai
+        double next = filter.Filter(0.6, double.PositiveInfinity);
+        Assert.True(double.IsFinite(next), $"dt=Infinity par output finite hona chahiye, mila {next}");
+        double next2 = filter.Filter(0.6, -1.0);
+        Assert.True(double.IsFinite(next2), $"dt<0 par output finite hona chahiye, mila {next2}");
+    }
+
+    [Fact]
     public void PedalRamp_DabnaAurChornaWaqtPar()
     {
         var ramp = new PedalRamp(pressMs: 150, releaseMs: 100);
@@ -102,5 +134,59 @@ public class ProcessingTests
         // Chorna: 100 ms mein 0
         for (int i = 0; i < 20; i++) ramp2.Update(false, false, 0.005);
         Assert.Equal(0.0, ramp2.Accel, 6);
+    }
+
+    // P1 (D7): steering scale DIVIDE hota hai. Cal 1000/2050/3100 par
+    // raw 2470 → mapped +0.4; scale 0.4 (F1 360°) par 0.4 / 0.4 = 1.0
+    // → full lock (axis 32768). Multiply hota to 0.16 → axis 19006 milta.
+    [Fact]
+    public void SteeringScale_Divide_Scale04_Steer04_FullLock()
+    {
+        var profile = WheelProfile.CreateDefault() with
+        {
+            SteeringScale = 0.4, Deadzone = 0, CurveStrength = 0, Smoothing = 0,
+            SteeringCalibration = Cal,
+        };
+        var pipeline = new ProcessingPipeline(profile);
+
+        var right = pipeline.Process(new WheelPacket(1, 0, 2470, 300, 300, 0, true), 0.005);
+        Assert.Equal(1.0, right.SteeringNorm, 6);
+        Assert.Equal(32768, right.SteeringAxis);
+
+        // Ulti taraf bhi: raw 1630 → mapped -0.4 → -0.4 / 0.4 = -1.0
+        var left = pipeline.Process(new WheelPacket(2, 0, 1630, 300, 300, 0, true), 0.005);
+        Assert.Equal(-1.0, left.SteeringNorm, 6);
+        Assert.Equal(1, left.SteeringAxis);
+    }
+
+    [Fact]
+    public void SteeringScale_Divide_Scale10_Steer04_AadhaNahi()
+    {
+        // Scale 1.0 (Full 900°) par 0.4 waisa hi 0.4 rehta hai —
+        // axis 16384 + round(0.4 × 16384) = 22938.
+        var profile = WheelProfile.CreateDefault() with
+        {
+            SteeringScale = 1.0, Deadzone = 0, CurveStrength = 0, Smoothing = 0,
+            SteeringCalibration = Cal,
+        };
+        var pipeline = new ProcessingPipeline(profile);
+        var state = pipeline.Process(new WheelPacket(1, 0, 2470, 300, 300, 0, true), 0.005);
+        Assert.Equal(0.4, state.SteeringNorm, 6);
+        Assert.Equal(22938, state.SteeringAxis);
+    }
+
+    [Fact]
+    public void SteeringScale_Divide_Scale06_Steer06_FullLock()
+    {
+        // GT 540° preset: raw 2680 → mapped +0.6; 0.6 / 0.6 = 1.0.
+        var profile = WheelProfile.CreateDefault() with
+        {
+            SteeringScale = 0.6, Deadzone = 0, CurveStrength = 0, Smoothing = 0,
+            SteeringCalibration = Cal,
+        };
+        var pipeline = new ProcessingPipeline(profile);
+        var state = pipeline.Process(new WheelPacket(1, 0, 2680, 300, 300, 0, true), 0.005);
+        Assert.Equal(1.0, state.SteeringNorm, 6);
+        Assert.Equal(32768, state.SteeringAxis);
     }
 }

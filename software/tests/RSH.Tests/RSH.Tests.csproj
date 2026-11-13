@@ -24,4 +24,17 @@
     <ProjectReference Include="..\..\src\RSH.Core\RSH.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- SEC-E-12/13 (Phase F W2): PinMapStore.cs pure hai (System.IO +
+         System.Text.Json) — is liye test assembly mein link hota hai
+         taake pin-map validation ke xUnit tests chal sakein (RSH.App
+         WPF hai, Linux par test project se reference nahi ho sakta). -->
+    <Compile Include="..\..\src\RSH.App\ViewModels\PinMapStore.cs" Link="Linked\PinMapStore.cs" />
+
+    <!-- Phase H WS5: TransportSwitchController bhi WPF-free hai (BCL +
+         RSH.Core) — wahi pattern: Settings → Connection toggle ki asal
+         logic fake ITransportSwitchTarget se Linux par test hoti hai. -->
+    <Compile Include="..\..\src\RSH.App\Services\TransportSwitchController.cs" Link="Linked\TransportSwitchController.cs" />
+  </ItemGroup>
+
 </Project>

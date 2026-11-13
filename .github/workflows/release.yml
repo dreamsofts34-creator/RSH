@@ -36,34 +36,107 @@ jobs:
           key: pio-${{ hashFiles('firmware/rsh/platformio.ini') }}
       - name: Install PlatformIO
         run: pip install -U platformio
-      - name: Build firmware
+      # SEC-H-03 (Phase H): release kabhi unsigned ship nahi karti.
+      # Ed25519 release private key GitHub secret RSH_SIGNING_KEY_PEM mein
+      # hai (poori PEM content — repo Settings -> Secrets and variables ->
+      # Actions; key kabhi repo mein nahi — KEY-LIFECYCLE.md §9). Secret
+      # missing/empty ho to job FAIL hogi (fail closed — unsigned build
+      # release mein nahi jata). Key sirf is job ke temp file mein rehti
+      # hai (0600) aur step ke aakhir mein mit jati hai; CI log mein
+      # kabhi print nahi hoti.
+      - name: Build firmware (signed)
         working-directory: firmware/rsh
-        run: pio run
-      - name: Check merged factory bin EXISTS (silent-merge bug guard)
+        env:
+          RSH_SIGNING_KEY_PEM: ${{ secrets.RSH_SIGNING_KEY_PEM }}
+        run: |
+          if [ -z "$RSH_SIGNING_KEY_PEM" ]; then
+            echo "MISSING SECRET: RSH_SIGNING_KEY_PEM set nahi — release signing ke baghair build nahi hoga (SEC-H-03)."
+            exit 1
+          fi
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          umask 077
+          printf '%s' "$RSH_SIGNING_KEY_PEM" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          RSH_SIGNING_KEY="$KEY_FILE" pio run
+      - name: Check merged factory bin + SIGNED bin EXISTS (silent-merge bug guard + SEC-H-03)
         # merge_bin.py (post: script) koi input missing ho to stderr par
         # "skipping merge" likh kar KHAMOSHI se return karta hai — pio run
         # phir bhi green rehta hai aur merged bin bane baghair reh jata hai.
         # Is liye yahan merged bin ka existence check LAZMI hai: agar
         # RSH-Firmware-DevKitV1-v*.bin na bana ho to job FAIL hogi.
         # (CI workflow ci.yml se copy — wahi guard.)
+        # SEC-H-03: firmware-signed.bin bhi LAZMI hai aur raw firmware.bin
+        # se exactly 68 bytes bara hona chahiye (64 B signature + "RSHS").
+        # Signed bin na ho ya size ghalat ho to job FAIL — unsigned image
+        # release mein kabhi nahi jati.
         run: |
           BUILD_DIR="firmware/rsh/.pio/build/esp32dev"
           ls -la "$BUILD_DIR"
           test -f "$BUILD_DIR/firmware.bin" || { echo "MISSING: firmware.bin (app-only OTA image)"; exit 1; }
+          test -f "$BUILD_DIR/firmware-signed.bin" || { echo "MISSING: firmware-signed.bin — signing step nahi chala (RSH_SIGNING_KEY set tha?)"; exit 1; }
+          RAW_SIZE=$(stat -c%s "$BUILD_DIR/firmware.bin")
+          SIGNED_SIZE=$(stat -c%s "$BUILD_DIR/firmware-signed.bin")
+          if [ "$SIGNED_SIZE" -ne $((RAW_SIZE + 68)) ]; then
+            echo "BAD SIZE: firmware-signed.bin $SIGNED_SIZE bytes, expected $RAW_SIZE + 68 = $((RAW_SIZE + 68))"
+            exit 1
+          fi
+          if [ "$(tail -c 4 "$BUILD_DIR/firmware-signed.bin")" != "RSHS" ]; then
+            echo "BAD TRAILER: firmware-signed.bin ke aakhri 4 bytes 'RSHS' nahi"
+            exit 1
+          fi
+          echo "Signed bin OK: firmware-signed.bin ($SIGNED_SIZE bytes = firmware.bin + 68)"
+          # BUG-W1-1 (Phase H W10): size+trailer kaafi nahi — cryptographic
+          # verify + hash compare lazmi hain, warna purani version ki
+          # (valid signature wali) stale signed image bhi pass ho jati.
+          # (a) sign-image.py --verify, public key firmware mein baked
+          #     signing_pubkey.h se (board jis key par trust karta hai,
+          #     wahi) — signature ghalat ho ya key mismatch ho to FAIL.
+          # (b) signed-region (pehle RAW_SIZE bytes) ka SHA-256
+          #     firmware.bin se milna lazmi — stale signed bin FAIL.
+          PUB_DER="$(mktemp)"; PUB_PEM="$(mktemp)"
+          trap 'rm -f "$PUB_DER" "$PUB_PEM"' EXIT
+          python3 -c "import re,sys; hdr=open('firmware/rsh/signing_pubkey.h').read(); raw=bytes(int(x,16) for x in re.findall(r'0x([0-9a-fA-F]{2})',hdr)); assert len(raw)==32, 'signing_pubkey.h: 32 bytes chahiye'; open(sys.argv[1],'wb').write(bytes.fromhex('302a300506032b6570032100')+raw); print('pubkey DER likha (32 bytes raw Ed25519 key)')" "$PUB_DER"
+          openssl pkey -pubin -inform DER -in "$PUB_DER" -out "$PUB_PEM"
+          python3 firmware/rsh/sign-image.py --verify "$PUB_PEM" "$BUILD_DIR/firmware-signed.bin"
+          RAW_SHA=$(sha256sum "$BUILD_DIR/firmware.bin" | cut -d' ' -f1)
+          SIGNED_SHA=$(head -c "$RAW_SIZE" "$BUILD_DIR/firmware-signed.bin" | sha256sum | cut -d' ' -f1)
+          if [ "$RAW_SHA" != "$SIGNED_SHA" ]; then
+            echo "STALE SIGNED BIN: firmware-signed.bin ka signed region firmware.bin se match nahi karta"
+            echo "  firmware.bin SHA-256:        $RAW_SHA"
+            echo "  signed-region SHA-256:       $SIGNED_SHA"
+            echo "  (purani version ki signed image — dobara sign karo)"
+            exit 1
+          fi
+          echo "Signed bin VERIFIED: signature OK (baked pubkey) + signed-region hash == firmware.bin"
           MERGED=$(ls "$BUILD_DIR"/RSH-Firmware-DevKitV1-v*.bin 2>/dev/null | head -n 1)
           if [ -z "$MERGED" ]; then
             echo "MISSING: merged factory bin RSH-Firmware-DevKitV1-v*.bin — merge_bin.py khamoshi se fail hua?"
             exit 1
           fi
           echo "Merged factory bin OK: $MERGED"
-      - name: Checksums
+      - name: Checksums (release set only — raw bins NAHI)
+        # SEC-H-03 / BUG-W1-1: release set sirf firmware-signed.bin +
+        # merged factory bin hai. Raw firmware.bin pehle hi hata diya gaya
+        # tha; bootloader.bin + partitions.bin bhi release asset NAHI
+        # hain (BUG-W1-1, checklist §5(b)) — merged factory bin mein
+        # teeno byte-exact maujood hain (bootloader @0x1000, partitions
+        # @0x8000, app @0x10000 — verify: merge_bin.py + local check),
+        # is liye factory flash ke liye alag raw bins ki zaroorat nahi.
         working-directory: firmware/rsh/.pio/build/esp32dev
-        run: sha256sum *.bin > SHA256SUMS.txt
+        run: |
+          sha256sum firmware-signed.bin RSH-Firmware-DevKitV1-v*.bin > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
           name: firmware
+          # SEC-H-03 / BUG-W1-1: raw firmware.bin yahan NAHI — unsigned
+          # OTA image kabhi artifact/release mein nahi jati. Raw
+          # bootloader.bin + partitions.bin bhi NAHI — merged factory
+          # bin mein teeno hain (checklist §5(b)).
           path: |
-            firmware/rsh/.pio/build/esp32dev/*.bin
+            firmware/rsh/.pio/build/esp32dev/firmware-signed.bin
+            firmware/rsh/.pio/build/esp32dev/RSH-Firmware-DevKitV1-v*.bin
             firmware/rsh/.pio/build/esp32dev/SHA256SUMS.txt
 
   software:
@@ -138,8 +211,25 @@ jobs:
           TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}
         run: |
           ls -R artifacts
-          gh release create "$TAG" --prerelease --target "$GITHUB_SHA" --title "RSH $TAG" --generate-notes \
-            artifacts/firmware/*.bin \
+          # SEC-H-03 / BUG-W1-1: OTA image SIRF firmware-signed.bin hai —
+          # raw (unsigned) firmware.bin kabhi release asset nahi banti.
+          # Raw bootloader.bin + partitions.bin bhi NAHI — merged
+          # factory bin mein teeno hain (checklist §5(b)).
+          # Is liye yahan explicit file list hai, `*.bin` glob nahi.
+          test -f artifacts/firmware/firmware-signed.bin || { echo "MISSING: firmware-signed.bin artifact"; exit 1; }
+          if [ -f artifacts/firmware/firmware.bin ]; then
+            echo "UNEXPECTED: raw firmware.bin artifact mein hai — unsigned image release mein nahi jani chahiye"
+            exit 1
+          fi
+          for f in bootloader.bin partitions.bin; do
+            if [ -f "artifacts/firmware/$f" ]; then
+              echo "UNEXPECTED: raw $f artifact mein hai — merged factory bin mein ye pehle se hai (checklist §5(b))"
+              exit 1
+            fi
+          done
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "RSH $TAG" --notes-file docs/RELEASE-NOTES-v2.0.0.md \
+            artifacts/firmware/firmware-signed.bin \
+            artifacts/firmware/RSH-Firmware-DevKitV1-v*.bin \
             artifacts/firmware/SHA256SUMS.txt \
             artifacts/software/RSH-windows-x64.zip \
             artifacts/software/SHA256SUMS-app.txt

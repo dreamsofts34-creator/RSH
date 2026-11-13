@@ -8,6 +8,15 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="RSH.Tests" />
+    <!-- Phase F (SEC-E-14): RSH.App.Tests ko UdpWheelSource.ProcessDatagram
+         chahiye (HELLO injection, in-memory) — sandbox mein UDP loopback
+         sendto EPERM se block hota hai, is liye auto-fetch ka gate test
+         HELLO ko socket ke bajaye yahin se chalata hai. -->
+    <InternalsVisibleTo Include="RSH.App.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IO.Ports" Version="10.0.0" />
   </ItemGroup>
 
 </Project>

@@ -1,5 +1,8 @@
 # RSH — User Guide
 
+**Version 2.0.0 — for RSH app v2.0.0 / firmware v4.0.0 / protocol v2.1.**
+(Previous guide version: 1.2.2 / firmware v3.3 — this guide is for v2.0.0 only.)
+
 Wireless DIY sim-racing wheel: an ESP32 in the wheel sends its movement over
 its own WiFi; RSH on the PC turns that into a standard game controller
 (a vJoy virtual joystick) that every racing game understands.
@@ -12,8 +15,8 @@ where you can change it without reflashing anything.
 
 ## 1. What you need
 
-- The wheel, flashed with the RSH firmware (ESP32 DevKit V1 build).
-- Windows 10 or 11 (64-bit).
+- The wheel, flashed with the RSH firmware v4.0.0 (ESP32 DevKit V1 build).
+- Windows 11 (64-bit). Windows 10 is end-of-life (14 Oct 2025) — best-effort only, no guarantee.
 - The **vJoy driver, BrunnerInnovation v2.2.2.0** — this is the signed
   release that works on Windows 11. Get the driver and `vJoyInterface.dll`
   from the same release; mixing versions does not work (RSH checks and
@@ -24,7 +27,8 @@ where you can change it without reflashing anything.
 
 1. Run the vJoy 2.2.2.0 installer (it needs admin — it's a driver).
 2. Open **vJoyConf** (Configure vJoy).
-3. Select device **1**. Enable axes **X**, **Y** and **Z**. Set the number
+3. Select device **1**. Enable axes **X**, **Y**, **Z** and **Slider**
+   (Slider = handbrake, Phase G C8 — docs/HANDBRAKE-MAPPING.md). Set the number
    of buttons to at least 2 (32 gives you room for the future).
 4. Click **Apply**. Leave "Enable vJoy" ticked.
 5. Optional check: open **joy.cpl** (Set up USB game controllers) — you
@@ -40,10 +44,23 @@ the app first, then in the vJoy install folder
 
 ## 3. Install RSH
 
-Run **RSH-Setup-1.0.0.exe**. It installs per-user (no admin) into
-`%LOCALAPPDATA%\Programs\RSH` and can add a desktop shortcut and
-Windows autostart. A portable build (just run `RSH.exe` from the
-folder) works exactly the same.
+**v2.0.0 app UNSIGNED hai** (user faisla 2026-11-13 — OV code-signing
+certificate abhi nahi khareeda gaya, baad mein aayega). Is liye:
+
+- **Portable build (recommended):** `RSH-windows-x64.zip` download karo,
+  unzip karo, `RSH.exe` chalao — is ko signing ki zaroorat nahi, install
+  bhi nahi hota. Yehi tareeqa v2.0.0 ke liye primary hai.
+- **MSIX (`RSH-2.0.0.msix`):** unsigned package hai — Windows SmartScreen
+  **"Windows protected your PC" / "Unknown publisher"** warning dikhayega
+  (package par koi verified publisher nahi hai). Install karne ke liye
+  Developer Mode (sideloading) chahiye ho sakta hai; pehla install test
+  Windows PC par baaqi hai — us ke baad yahan exact steps likhe jayenge.
+- **Download ki tasdeeq:** zip/MSIX chalane se pehle SHA-256 check karo —
+  GitHub Release page par `SHA256SUMS-app.txt` se milao. Sirf official
+  GitHub release (`github.com/dreamsofts34-creator/RSH/releases`) se
+  download karo; kisi aur link se mila file mat chalao.
+- **Firmware signed hai** (Ed25519) — app ka unsigned hona firmware
+  signing se mutaliq nahi; board sirf signed firmware accept karta hai.
 
 Your settings and profiles live in `%APPDATA%\RSH` and survive
 updating — uninstall/reinstall never loses your calibration.
@@ -60,6 +77,15 @@ The wizard opens automatically the first time:
    (you should see ~200 packets/sec).
    *While you race you are on the wheel's network, so this PC has no
    internet on that adapter. That is expected.*
+   > **Pair immediately, at home.** Before the first pairing the `RSH`
+   > network is **open (no password)** for 60 seconds so the app can
+   > receive the wheel's per-device key and Wi-Fi password. During that
+   > window anyone in Wi-Fi range could listen in — so pair in your own
+   > room, right after flashing, and do not leave the board unpaired.
+   > As soon as pairing succeeds the network becomes WPA2 with the
+   > per-device password and the key is never sent again. If the window
+   > expires before you pair, hold BOOT on the board for ≥ 10 s
+   > (KEY_RESET) and pair again. Full detail: `docs/FLASH-GUIDE.md` step 6.
 3. **Calibrate steering** — capture the centre, then the full range.
 4. **Calibrate pedals** — capture released, then fully pressed.
 
@@ -78,6 +104,12 @@ and fine-tune later on the Calibration page.
   never keeps "holding" a stuck input.
 - **Profiles:** one per game. Calibration, processing and button mapping
   all live in the profile; switching is instant, even mid-session.
+- **Updates:** Settings → About → **Check for updates**. RSH checks the
+  GitHub Releases page for a newer stable version — it never downloads or
+  installs anything by itself. Install updates only from the GitHub
+  Releases page or the Microsoft Store, never from anywhere else.
+  Firmware updates come through the setup wizard (Firmware step) or the
+  board's update page — only signed official releases are accepted.
 - **Processing defaults that work:** deadzone 2%, curve 0%, smoothing 30%.
   Set every in-game steering deadzone to **zero** and linearity to 100% —
   RSH does that job once, properly.
@@ -85,10 +117,10 @@ and fine-tune later on the Calibration page.
 ### In your game
 
 1. Make sure joy.cpl shows the vJoy axes moving (steering = X,
-   accelerator = Y, brake = Z).
-2. Bind: steering → vJoy X, throttle → vJoy Y, brake → vJoy Z
-   (separate axes), gear up/down → the vJoy buttons you chose on the
-   Buttons page (defaults 1 and 2).
+   accelerator = Y, brake = Z, handbrake = Slider).
+2. Bind: steering → vJoy X, throttle → vJoy Y, brake → vJoy Z,
+   handbrake → vJoy Slider (separate axes), gear up/down → the vJoy
+   buttons you chose on the Buttons page (defaults 1 and 2).
 3. Set the in-game steering lock/range to your wheel's real physical
    range, deadzone 0, linearity 100%.
 4. Old game that only offers one shared throttle/brake axis? Turn on
@@ -101,13 +133,13 @@ and fine-tune later on the Calibration page.
 | Dashboard: "Wheel not connected" | PC not on RSH WiFi, wheel off, or HELO blocked | Join RSH, check wheel LED (solid = connected), check firewall allows RSH |
 | Packets arrive but stop after 2 s | Windows dropped the WiFi (power saving) | In Device Manager, disable "allow the computer to turn off this device" for the WiFi adapter |
 | Output red: "device BUSY" | Another feeder app holds the vJoy device | Close the other app (or pick a different device on the Output page) |
-| Output red: "device missing" | Device not enabled in vJoyConf | vJoyConf → enable device 1 with X/Y/Z → Apply |
+| Output red: "device missing" | Device not enabled in vJoyConf | vJoyConf → enable device 1 with X/Y/Z + Slider → Apply |
 | Output red: DLL/driver version mismatch | vJoy pieces from different releases | Reinstall vJoy 2.2.2.0 completely |
 | Steering drifts/jitters at centre | Sensor noise | Raise smoothing a little, or deadzone to 3–4% |
 | Steering feels floaty | Too much smoothing | Lower smoothing toward 15–20% |
 | Car pulls to one side | Centre moved (pot shifted) | Re-capture centre on the Calibration page |
 | Pedals never reach 100% / always on | Range changed | Re-run pedal capture |
-| High packet loss % on Diagnostics | WiFi congestion/interference | Move closer; firmware v3 auto-picks the quietest channel at boot — restart the wheel |
+| High packet loss % on Diagnostics | WiFi congestion/interference | Move closer; firmware v4.0.0 auto-picks the quietest channel at boot — restart the wheel |
 
 Something else? Open **Diagnostics → Export diagnostics (.zip)** and keep
 the file — it contains the logs and the counters that explain what the

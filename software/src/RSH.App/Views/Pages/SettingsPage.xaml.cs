@@ -9,5 +9,7 @@ public partial class SettingsPage : UserControl
     {
         InitializeComponent();
         DataContext = ViewModelStore.Settings;
+        // Modules + GPIO pins ka init (VM primary-ctor hai — page se ek dafa).
+        ViewModelStore.Settings.EnsureLoaded();
     }
 }

@@ -24,6 +24,18 @@ public sealed class OneEuroFilter
 
     public OneEuroFilter(double freq, double minCutoff, double beta, double dCutoff = 1.0)
     {
+        // T14 guard: freq=0 C# mein crash NAHI karta — 1/0 = +Infinity deta
+        // hai aur filter degenerate ho jata hai (alpha NaN/Infinity, output
+        // beqarar). Ghalat parameters ab banne se pehle hi reject hote hain
+        // taake aisi halat kabhi chalti hui pipeline mein na pahunche.
+        if (!double.IsFinite(freq) || freq <= 0)
+            throw new ArgumentOutOfRangeException(nameof(freq), freq, "Sample rate (Hz) lazmi finite aur > 0 hai.");
+        if (!double.IsFinite(minCutoff) || minCutoff <= 0)
+            throw new ArgumentOutOfRangeException(nameof(minCutoff), minCutoff, "mincutoff lazmi finite aur > 0 hai.");
+        if (!double.IsFinite(beta) || beta < 0)
+            throw new ArgumentOutOfRangeException(nameof(beta), beta, "beta lazmi finite aur >= 0 hai.");
+        if (!double.IsFinite(dCutoff) || dCutoff <= 0)
+            throw new ArgumentOutOfRangeException(nameof(dCutoff), dCutoff, "dcutoff lazmi finite aur > 0 hai.");
         _freq = freq;
         _minCutoff = minCutoff;
         _beta = beta;
@@ -47,7 +59,10 @@ public sealed class OneEuroFilter
     /// </summary>
     public double Filter(double x, double dtSeconds)
     {
-        double dt = Math.Clamp(dtSeconds, 0.0005, 0.1);
+        // T14 guard: NaN/Infinity dt clamp se guzar jata tha (NaN comparisons
+        // false hote hain) aur filter ko NaN kar deta tha. Na-mumkin dt ko
+        // nominal 5 ms mana jata hai — crash nahi, degenerate bhi nahi.
+        double dt = double.IsFinite(dtSeconds) ? Math.Clamp(dtSeconds, 0.0005, 0.1) : 0.005;
         double freq = 1.0 / dt;
         if (!_initialized)
         {

@@ -10,6 +10,19 @@
     <SolidColorBrush x:Key="AxTrack" Color="#ECE8FA" />
     <SolidColorBrush x:Key="AxLine" Color="#E7E3F7" />
 
+    <!-- UI-12: keyboard focus — dashed accent outline (AxPrimary / AxGhost /
+         AxWhiteBtn / AxSlider ki custom templates mein koi focus indicator
+         nahi tha — keyboard user ko focus nazar hi nahi aata tha). -->
+    <Style x:Key="AxFocusVisualStyle">
+        <Setter Property="Control.Template">
+            <Setter.Value>
+                <ControlTemplate>
+                    <Rectangle Margin="2" StrokeThickness="2" Stroke="{StaticResource AxAccent}" StrokeDashArray="2 2" />
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <Style x:Key="AxCard" TargetType="Border">
         <Setter Property="Background" Value="White" />
         <Setter Property="CornerRadius" Value="16" />
@@ -44,6 +57,7 @@
     </Style>
 
     <Style x:Key="AxPrimary" TargetType="Button">
+        <Setter Property="FocusVisualStyle" Value="{StaticResource AxFocusVisualStyle}" />
         <Setter Property="Foreground" Value="White" />
         <Setter Property="FontSize" Value="14" />
         <Setter Property="FontWeight" Value="SemiBold" />
@@ -68,6 +82,7 @@
     </Style>
 
     <Style x:Key="AxGhost" TargetType="Button">
+        <Setter Property="FocusVisualStyle" Value="{StaticResource AxFocusVisualStyle}" />
         <Setter Property="Foreground" Value="{StaticResource AxAccentDeep}" />
         <Setter Property="FontSize" Value="14" />
         <Setter Property="FontWeight" Value="SemiBold" />
@@ -92,6 +107,7 @@
     </Style>
 
     <Style x:Key="AxWhiteBtn" TargetType="Button">
+        <Setter Property="FocusVisualStyle" Value="{StaticResource AxFocusVisualStyle}" />
         <Setter Property="Foreground" Value="{StaticResource AxAccentDeep}" />
         <Setter Property="FontSize" Value="14" />
         <Setter Property="FontWeight" Value="SemiBold" />
@@ -128,7 +144,7 @@
                         </Trigger>
                         <Trigger Property="IsChecked" Value="True">
                             <Setter TargetName="Bd" Property="Background" Value="#EEE9FF" />
-                            <Setter TargetName="Dot" Property="Background" Value="#6C4CF1" />
+                            <Setter TargetName="Dot" Property="Background" Value="{StaticResource AxAccent}" />
                             <Setter Property="Foreground" Value="#4B2FD0" />
                             <Setter Property="FontWeight" Value="SemiBold" />
                         </Trigger>
@@ -202,12 +218,13 @@
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="Thumb">
-                    <Ellipse Width="20" Height="20" Fill="White" Stroke="#6C4CF1" StrokeThickness="3" />
+                    <Ellipse Width="20" Height="20" Fill="White" Stroke="{StaticResource AxAccent}" StrokeThickness="3" />
                 </ControlTemplate>
             </Setter.Value>
         </Setter>
     </Style>
     <Style x:Key="AxSlider" TargetType="Slider">
+        <Setter Property="FocusVisualStyle" Value="{StaticResource AxFocusVisualStyle}" />
         <Setter Property="Height" Value="24" />
         <Setter Property="Template">
             <Setter.Value>

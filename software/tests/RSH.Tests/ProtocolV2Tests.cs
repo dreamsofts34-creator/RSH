@@ -341,6 +341,20 @@ public class ProtocolV2Tests
     }
 
     [Fact]
+    public void CtrlSession_CounterWrap_Rfc1982()
+    {
+        // SEC-D-07c: 0xFFFFFFFF ke baad 0 naya counter hai (wrap accept);
+        // purana counter wrap ke baad bhi Replay hai. C++ host test (§19)
+        // ka aaina — dono taraf wahi rule.
+        var session = new ControlSession();
+        Assert.Equal(ControlSessionDecision.Accept, session.Classify(10, 0xFFFFFFFE));
+        Assert.Equal(ControlSessionDecision.Accept, session.Classify(11, 0xFFFFFFFF));
+        Assert.Equal(ControlSessionDecision.Accept, session.Classify(12, 0));          // wrap accept
+        Assert.Equal(ControlSessionDecision.Replay, session.Classify(13, 0xFFFFFFFF));  // purana counter
+        Assert.Equal(ControlSessionDecision.Duplicate, session.Classify(11, 0xFFFFFFFF));
+    }
+
+    [Fact]
     public void CtrlSession_ReplayFrame_VerifiesCryptographically_ButIsRejectedByState()
     {
         // NEGATIVE["neg_replay_same_counter_new_reqid"]: tag valid hai (reqId HMAC mein nahi),

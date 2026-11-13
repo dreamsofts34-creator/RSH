@@ -22,4 +22,21 @@
     <SolidColorBrush x:Key="RSHNavActiveForegroundBrush" Color="#C4B5FD" />
     <SolidColorBrush x:Key="RSHNavDotBrush" Color="#4A445F" />
     <SolidColorBrush x:Key="RSHShadowColorBrush" Color="#000000" />
+    <!-- UI-12: theme-aware Color keys — dark counterparts (WCAG-AA audit:
+         error #FF9D94 8.9:1, warning #F5B544 9.8:1, banner #3A2C10 12.3:1,
+         sab dark card #14181F / dark bg #0B0E13 par). -->
+    <Color x:Key="RSHBackgroundColor">#0B0E13</Color>
+    <Color x:Key="RSHCardColor">#14181F</Color>
+    <Color x:Key="RSHTextColor">#F2F4F7</Color>
+    <Color x:Key="RSHSecondaryTextColor">#9AA3AF</Color>
+    <Color x:Key="RSHTrackColor">#232936</Color>
+    <Color x:Key="RSHBorderColor">#262C36</Color>
+    <Color x:Key="RSHAccentSoftColor">#2A2350</Color>
+    <Color x:Key="RSHAccentDeepColor">#C4B5FD</Color>
+    <Color x:Key="RSHAccentColor">#6C4CF1</Color>
+    <Color x:Key="RSHAccentHoverColor">#5A3BE0</Color>
+    <Color x:Key="RSHErrorColor">#FF9D94</Color>
+    <Color x:Key="RSHWarningTextColor">#F5B544</Color>
+    <Color x:Key="RSHBannerColor">#3A2C10</Color>
+    <Color x:Key="RSHSuccessTextColor">#146C35</Color>
 </ResourceDictionary>

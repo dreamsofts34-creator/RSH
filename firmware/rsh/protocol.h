@@ -14,9 +14,11 @@
 #define RSH_BTN_GEAR_DOWN  0x02
 #define RSH_BTN_ACCEL      0x04
 #define RSH_BTN_BRAKE      0x08
+#define RSH_BTN_HORN       0x10   // FW-11: horn button (PIN_HORN_BTN, GPIO4)
 
 // flags byte (offset 15)
-#define RSH_FLAG_STEER_MV  0x01   // bit0: steering value millivolts mein hai (warna raw counts)
+#define RSH_FLAG_STEER_MV      0x01   // bit0: steering value millivolts mein hai (warna raw counts)
+#define RSH_FLAG_AXIS_INVALID  0x02   // bit1: koi axis invalid hai (F2 floating/disconnected) — v2 stream flag bit3 (0x08) se alag, ye v1 packet ka bit hai
 
 // CRC16-CCITT: poly 0x1021, init 0xFFFF (koi final XOR nahi)
 // Table-driven (F14 — bit-by-bit nahi). Table pehli call par banti hai;
@@ -91,6 +93,7 @@ static inline size_t rsh_build_packet(uint8_t *buf, uint16_t seq, uint32_t times
 #define RSH_V2_CTRL_TAG_SIZE      16
 #define RSH_V2_CTRL_MAX_PAYLOAD   1024
 #define RSH_V2_CTRL_MAX_FRAME     (RSH_V2_CTRL_HEADER_SIZE + RSH_V2_CTRL_MAX_PAYLOAD + RSH_V2_CTRL_TAG_SIZE) // 1053
+#define RSH_V2_PING_SIZE          34     // NTP-style ping frame, fixed (§9.1)
 
 // Stream flags (§1.3, D4)
 #define RSH_V2_FLAG_CONFIG_CHANGED 0x01
@@ -152,6 +155,13 @@ static inline uint16_t rsh_get_u16(const uint8_t *p) {
 }
 static inline uint32_t rsh_get_u32(const uint8_t *p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static inline uint64_t rsh_get_u64(const uint8_t *p) {
+  return (uint64_t)rsh_get_u32(p) | ((uint64_t)rsh_get_u32(p + 4) << 32);
+}
+static inline void rsh_put_u64(uint8_t *p, uint64_t v) {
+  rsh_put_u32(p, (uint32_t)(v & 0xFFFFFFFFu));
+  rsh_put_u32(p + 4, (uint32_t)(v >> 32));
 }
 static inline int16_t rsh_get_i16(const uint8_t *p) {
   return (int16_t)rsh_get_u16(p);
@@ -358,6 +368,30 @@ static inline rsh_v2_result_t rsh_v2_parse_hello(const uint8_t *data, size_t len
   return RSH_V2_OK;
 }
 
+/// HELLO reply banao (parser ka aaina, §2.2). device_key/wifi_password
+/// sirf unpaired + window-open hon to bharo, warna sab 0x00 (caller ki
+/// zimmedari — builder jo diya jaye wahi likhta hai, khud faisla nahi
+/// karta). Hamesha RSH_V2_HELLO_SIZE (92) return, 0 = bad input.
+static inline size_t rsh_v2_build_hello(uint8_t *buf, uint8_t flags, uint8_t session_echo,
+                                        const uint8_t *board_mac,
+                                        uint8_t fw_major, uint8_t fw_minor, uint8_t fw_patch,
+                                        const uint8_t *nonce16,
+                                        const uint8_t *device_key32,
+                                        const uint8_t *wifi_password24) {
+  if (!buf || !board_mac || !nonce16 || !device_key32 || !wifi_password24) return 0;
+  buf[0] = 'R'; buf[1] = 'S'; buf[2] = 'H'; buf[3] = 'R';
+  buf[4] = 2; buf[5] = 1;
+  buf[6] = flags; buf[7] = session_echo;
+  memcpy(buf + 8, board_mac, 6);
+  buf[14] = fw_major; buf[15] = fw_minor; buf[16] = fw_patch;
+  buf[17] = 0;  // reserved
+  memcpy(buf + 18, nonce16, 16);
+  memcpy(buf + 34, device_key32, 32);
+  memcpy(buf + 66, wifi_password24, 24);
+  rsh_put_u16(buf + 90, rsh_crc16_ccitt(buf, 90));
+  return RSH_V2_HELLO_SIZE;
+}
+
 // ---- PIN_PROBE frame (§3.8) ----
 typedef struct {
   uint16_t seq;
@@ -486,9 +520,9 @@ static inline size_t rsh_v2_ctrl_build(uint8_t *buf, size_t buf_len, uint8_t cmd
 
 // ---- Control session: duplicate / replay (§2.3/§3.2) ----
 typedef enum {
-  RSH_DEC_ACCEPT = 0,   // naya pair, counter > max-seen — execute karo
+  RSH_DEC_ACCEPT = 0,   // naya pair, counter max-seen se naya (serial arithmetic) — execute karo
   RSH_DEC_DUPLICATE,    // wahi (reqId, counter) dobara — cached reply, dobara execute nahi
-  RSH_DEC_REPLAY        // naya reqId lekin counter <= max-seen — status REPLAY (2)
+  RSH_DEC_REPLAY        // naya reqId lekin counter purana (serial arithmetic se <= max-seen) — status REPLAY (2)
 } rsh_ctrl_decision_t;
 
 typedef struct {
@@ -511,7 +545,12 @@ static inline rsh_ctrl_decision_t rsh_ctrl_session_classify(rsh_ctrl_session_t *
     if (s->req_ids[i] == req_id && s->counters[i] == counter)
       return RSH_DEC_DUPLICATE;
   }
-  if (s->has_seen && counter <= s->max_seen) return RSH_DEC_REPLAY;
+  // Counter-wrap rule (Phase D, SEC-D-07c — PROTOCOL-V2.1.md §3.2 amendment):
+  // "naya" counter wahi hai jis ka (int32_t)(counter - max_seen) > 0 ho
+  // (RFC 1982 serial arithmetic). 0xFFFFFFFF ke baad 0 bhi naya hai; koi
+  // bhi purana counter (wrap ke baad bhi) REPLAY hai. Naya session (naya
+  // nonce) par session reset hota hai — purane counters dobara valid nahi.
+  if (s->has_seen && (int32_t)(counter - s->max_seen) <= 0) return RSH_DEC_REPLAY;
   s->max_seen = counter;
   s->has_seen = 1;
   s->req_ids[s->next] = req_id;

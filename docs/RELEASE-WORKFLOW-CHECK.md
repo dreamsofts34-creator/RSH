@@ -1,3 +1,25 @@
+# ⚠️ SUPERSEDED — ye document ab authority NAHI hai (Phase H W10, 2026-11-13)
+
+**Current authority: `.github/workflows/release.yml` + `docs/RELEASE-CHECKLIST.md`.**
+Is file ko sirf tareekhi record ke tor par rakha gaya hai — neeche likhi
+har version/finding ko maujooda haalat na samjho.
+
+**Kyun superseded:** ye check 2026-11-12 ko `release.yml` ke purane draft par
+likha gaya tha (app v1.2.2 / firmware v3.3, dispatch default `v1.2.2`,
+F11 open). Us ke baad: version bump ho chuka hai (**app v2.0.0 /
+firmware v4.0.0**, `FIRMWARE_VERSION "4.0.0"`), dispatch default
+**`v2.0.0`** hai, **F1–F4 fix ho chuke hain** (merged-bin guard,
+`v*`+`fw-v*` tags, SDK pin `10.0.100` + verify, `--target` + checkout),
+aur **SEC-H-03 ka firmware hissa Phase H W10 (BUG-W1-1) mein fix hua**
+(`sign-image.py --verify` + hash compare, raw `bootloader.bin` /
+`partitions.bin` release assets se hata diye gaye). Neeche §5 ki
+"pehli green run" checklist bhi us waqt ki hai (rig tayyar nahi tha,
+push mana tha) — ab rig tayyar hai aur release v2.0.0 ki tayyari
+`RELEASE-CHECKLIST.md` mein track hoti hai. **Nayi findings is file mein
+mat likho — `RELEASE-CHECKLIST.md` ya seedha `release.yml` mein.**
+
+---
+
 # Release Workflow Check — WP10 (Plan v2.3)
 
 - **File under review:** `.github/workflows/release.yml` (100 lines, `name: Build and Release`)

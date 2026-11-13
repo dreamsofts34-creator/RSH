@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  RSH — MSIX package manifest (D22, Phase H / SW-16).
+  Authority: docs/SIGNING.md §3.1 — <Identity Publisher="..."> MUST match
+  the OV code-signing certificate Subject EXACTLY, character for character,
+  when the package IS signed.
+
+  USER DECISION 2026-11-13: OV certificate abhi NAHI khareeda jayega —
+  v2.0.0 UNSIGNED ship hoga (cert baad mein). Is liye Publisher abhi
+  CN=RSH hai (unsigned identity, final for v2.0.0). Cert milne ke din:
+  Publisher ko exact certificate Subject se badlo, package ko -Sign se
+  sign karo (build-msix.ps1), aur SIGNING.md §3.1 ka CI check lagao.
+  Firmware signing (Ed25519, local key) is faisle se mutaliq nahi — wo
+  waisa hi hai jaisa Phase H scope mein hai (docs/RELEASE-CHECKLIST.md §5).
+  Unsigned package par Windows SmartScreen warning aayega — USER-GUIDE §3
+  dekho; portable zip (RSH-windows-x64.zip) ko signing ki zaroorat nahi.
+
+  Build: software/packaging/msix/build-msix.ps1 (Windows only).
+  Verify (any OS): python3 software/packaging/msix/verify-manifest.py
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+  <Identity
+    Name="RSH"
+    Publisher="CN=RSH"
+    Version="2.0.0.0" />
+  <Properties>
+    <DisplayName>RSH</DisplayName>
+    <PublisherDisplayName>RSH</PublisherDisplayName>
+    <Description>Real Sim Hub — wireless DIY sim-racing wheel (ESP32 + vJoy).</Description>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Resources>
+    <Resource Language="en-US" />
+  </Resources>
+  <Applications>
+    <Application Id="RSH" Executable="RSH.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="RSH"
+        Description="Real Sim Hub — wireless DIY sim-racing wheel."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+  <Capabilities>
+    <!-- Wheel AP (private network) + update check (internet). -->
+    <Capability Name="internetClient" />
+    <Capability Name="privateNetworkClientServer" />
+  </Capabilities>
+</Package>

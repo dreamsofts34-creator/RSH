@@ -1,0 +1,19 @@
+{
+  "e2eAgeP99MsMax": 10.0,
+  "e2eLostMax": 0,
+  "e2eSendGapP99MsMax": 7.5,
+  "notes": "RSH Benchmarks gate thresholds (T13). Source: RSH-PLAN-v2.3 section 3 SLOs (engine+receive 0 B/tick, process-wide soak growth <= 1 MB/10 min, output latency p99 <= 2 ms) + VM-measured baseline 2026-11-13 (shared-CPU Linux VM \u2014 numbers is VM ke hain, Windows PC par dobara baseline lo). Baseline (3 runs, --soak-sec 30, E2E connected socket): Parse 202-204 ns, Pipe 471-505 ns, E2E sent=valid=2000, lost=0, send-gap p99 5.04-5.71 ms, age avg 2.5-2.7 ms, soak 200 ticks/s, late 0-4, alloc 0.0 B/tick, heap growth 0.00 MB, WS ~50-58 MB. Gates p99 par hain, max par nahi \u2014 max ek hi VM scheduling stall se banta hai (ek run mein age max 33 ms / max tick 12.3 ms jabke p99 5.7 ms / avg 2.3 us tha). soakTicksPerSecMin=80 collapse floor hai (200 Hz SLO rig soak assert karta hai, rate>=195 pps); contention mein 93/s dekha gaya tha. soakAlloc threshold 8 B/tick hai \u2014 SLO 0 hai, 8 sirf runtime background noise ki gunjaish hai; engine-tick alloc ki asal enforcing check unit test Soak_EngineTicks_ZeroAlloc hai (thread-local counter, <=1 B/tick). CI mein breach = exit code 1 = red.",
+  "parseAllocBytesPerPacketMax": 1.0,
+  "parseNsPerPacketMax": 8000,
+  "pipeAllocBytesPerTickMax": 1.0,
+  "pipeNsPerTickMax": 6000,
+  "soakAllocBytesPerTickSecondHalfMax": 8,
+  "soakAvgTickUsMax": 500,
+  "soakGen2CollectionsMax": 2,
+  "soakHeapGrowthMbMax": 1.0,
+  "soakLateTickRatioMax": 0.25,
+  "soakMaxTickUsMax": 50000,
+  "soakTicksPerSecMin": 80,
+  "soakWorkingSetMbMax": 150,
+  "version": 1
+}

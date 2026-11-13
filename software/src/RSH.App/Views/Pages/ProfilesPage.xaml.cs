@@ -9,5 +9,8 @@ public partial class ProfilesPage : UserControl
     {
         InitializeComponent();
         DataContext = ViewModelStore.Profiles;
+        // Singleton VM hai — launcher / doosri jagah se profile badla ho
+        // to navigation par taaza list dikhao (UI-9 sync fix).
+        ViewModelStore.Profiles.RefreshOnNavigate();
     }
 }

@@ -42,10 +42,18 @@ Recommendation (faisla nahi): 32 byte (256-bit), HMAC-SHA256 ke liye.
 
 1. User firmware v4.0.0 board par flash karta hai (USB-serial; wired transport
    spec Phase G, D26 — is doc ka topic nahi).
-2. **Pehle boot par** firmware encrypted NVS mein device key dhoondta hai.
+2. **Pehle boot par** firmware NVS mein device key dhoondta hai.
 3. **Key na mile to:**
    - Board hardware RNG se nayi random key generate karta hai.
-   - Key ko **encrypted NVS** mein likhta hai — plain flash mein kabhi nahi.
+   - Key ko **NVS** mein likhta hai.
+   > **Sach (Phase F W1 correction — SEC-E-01):** upar "encrypted NVS"
+   > likha tha — ye ghalat tha. Asal code (`firmware/rsh/keystore.cpp`)
+   > plaintext `Preferences` (NVS) istemal karta hai; flash encryption /
+   > encrypted NVS **implement nahi hai** — wo OPEN-3 hai (neeche design
+   > notes + §9). Phase F mein sirf **password** ke liye obfuscation aayi
+   > hai (`"wifipw2"`, device key se keystream XOR — `pw_obfuscate.h`);
+   > device key khud abhi bhi NVS mein plaintext hai. Encryption ka daawa
+   > tab tak mat karo jab tak OPEN-3 band na ho (Phase H).
    - Board khud ko **unpaired** mark karta hai aur **pairing window (60 s)** kholta hai.
    - Board AP up karta hai (boot fail = 15 s ke andar AP up na ho, D29).
 4. **Key mil jaye to:** board paired state mein boot hota hai; koi nayi key nahi
@@ -56,9 +64,16 @@ Recommendation (faisla nahi): 32 byte (256-bit), HMAC-SHA256 ke liye.
 
 **Design notes / limits:**
 - NVS encryption ka exact mechanism (flash encryption enablement samet) WP3 /
-  Phase D mein define hoga (OPEN-3). Secure Boot ke bagair flash encryption ka
-  matlab samajhna zaroori hai: agar flash encryption enable nahi, to flash dump
-  se NVS parha ja sakta hai — ye residual risk hai (`THREAT-MODEL.md`, TM-W07).
+  Phase D mein define hoga (OPEN-3). **Halat (Phase H W1): OPEN-3 abhi bhi
+  khula hai — flash encryption enable nahi, NVS plaintext hai.** Secure Boot
+  ke bagair flash encryption ka matlab samajhna zaroori hai: agar flash
+  encryption enable nahi, to flash dump se NVS parha ja sakta hai — ye
+  residual risk hai (`THREAT-MODEL.md`, TM-W07). Password ke liye Phase F
+  obfuscation (`"wifipw2"`) sirf casual `strings` scan rokta hai — asal hal
+  Phase H mein hai (procedure `docs/FLASH-ENCRYPTION-PROCEDURE.md` mein —
+  Secure Boot v2 RSA-3072 + flash encryption release mode + encrypted NVS;
+  secure-build files + runtime check `secure_nvs.h` ban gaye, board
+  execution A7 gate mein hoga).
 - Pehle boot par RNG ki tayyari (entropy) aur key-generation failure ka
   behaviour (retry? boot rok do? error blink?) WP3 / Phase D mein define hoga
   (OPEN-4). Rule: **kamzor ya repeat key ke saath boot kabhi aage nahi barhega**
@@ -73,7 +88,7 @@ ek-dafa tabadla. Sirf unpaired board pairing karta hai, sirf 60 s window mein.
 
 | Step | Kaun | Kya hota hai |
 |---|---|---|
-| 1 | Board | Pehla boot (§2): key generate, encrypted NVS mein save, unpaired state, 60 s pairing window khulti hai. |
+| 1 | Board | Pehla boot (§2): key generate, NVS mein save (plaintext — encrypted NVS OPEN-3, Phase H), unpaired state, 60 s pairing window khulti hai. |
 | 2 | User / app | PC board ke SoftAP se connect hota hai. **Bootstrap masla:** pehli dafa AP password app ko abhi maloom nahi — ye password bhi isi pairing mein board se milna hai. Is circular dependency ka hal plan mein define nahi — **OPEN-6 (§10)**. WP3 ko decide karna hoga (misal: pehli pairing ke liye waqti tor par khula AP, ya koi aur bootstrap). Jab tak OPEN-6 band na ho, pairing implement nahi ho sakti. |
 | 3 | App | App board ko HELLO bhejti hai, **session flag = naya session** (D30). |
 | 4 | Board | Board HELLO reply deta hai: **naya nonce** + (sirf is pehli HELLO mein, sirf window ke andar) **device key** + **per-device Wi-Fi/OTA password**. |
@@ -210,9 +225,14 @@ valid nahi hoti; koi "purani key recover karo" ka rasta nahi hai.
   ka hai; is doc mein dono ko ek hi credential mana **nahi** gaya.
 - **OPEN-14 (WP3):** Password ki length / character set / generation ka tareeqa
   (recommendation, faisla nahi: kam az kam 20 characters, random — WP3 band kare).
-- **Storage:** Board password ko encrypted NVS mein rakhta hai (§2 jaisi hifazat).
-  App password ko plain file mein nahi rakhti — OS Wi-Fi profile is ka ghar hai;
-  exact handling Phase E mein (OPEN-15).
+- **Storage:** Board password ko NVS mein **obfuscated** rakhta hai
+  (`"wifipw2"` — device key se keystream XOR, `pw_obfuscate.h`; Phase F
+  W1, SEC-E-01). Ye **encryption nahi** hai — device key khud usi NVS
+  mein plaintext hai, is liye poora flash dump + open-source scheme =
+  recoverable. Asal hal encrypted NVS / flash encryption hai (OPEN-3,
+  Phase H). App password ko plain file mein nahi rakhti — DPAPI KeyStore
+  blob is ka ghar hai (PROTOCOL §5.3; Phase F mein SEC-E-04 fix hua —
+  OPEN-15 CLOSED).
 - **Password bhool jaye to:** WebOTA / AP password bhoolne par hal KEY_RESET
   jaisa physical rasta hai ya FACTORY_RESET — dono mein se kaun sa password ko
   reset karta hai, ye WP3 decide karega (OPEN-16). Note: FACTORY_RESET key ko
@@ -233,16 +253,23 @@ valid nahi hoti; koi "purani key recover karo" ka rasta nahi hai.
   dono lazmi hain; ek doosre ka badal nahi.
 - **Signing key offline rakho, kabhi repo / git / image mein nahi.** Signing
   sirf offline machine / release process se (Phase H release checklist).
-  App signing (OV certificate, D23) is se alag hai — us ka certificate
-  procurement Phase A mein shuru (WP8).
+  **Phase H W1 — PROVISIONED 2026-11-13:** Ed25519 release keypair ban gaya
+  hai (`~/workspace/projects/rsh/signing-keys/signing-key.pem`, repo se
+  bahar; public-key fingerprint
+  `387764a4529337c437b233a148b48f9b2ffe3f3b5015e14c95737cb3a67a6411`);
+  Secure Boot RSA-3072 keypair bhi ban gaya hai (SBV2 digest
+  `1bb10ab7aef15449d89a930d678b25e8fe4673857aa69b9a82cd07b27bf551e9`).
+  Release workflow `RSH_SIGNING_KEY_PEM` secret se sign karta hai
+  (`.github/workflows/release.yml`).
+- **Key compromise:** Secure Boot ya image-signing key compromise hone par kya
+  hota hai (revocation? naye key se dobara sign? purane boards ka kya hoga?) —
+  **likha gaya hai (OPEN-19 CLOSED — doc):** `docs/FLASH-ENCRYPTION-PROCEDURE.md`
+  §7 (Ed25519 rotation + USB reflash, Secure Boot key revoke, flash-encryption
+  key per-board response, key loss).
 - **Anti-downgrade:** purani version wali image reject hogi. Version scheme:
   firmware v4.0.0 (D27); sirf barabar ya nayi version accept hoti hai.
   Anti-downgrade counter / eFuse version field ka exact mechanism WP3 /
   Phase D mein define hoga (OPEN-18).
-- **Key compromise:** Secure Boot ya image-signing key compromise hone par kya
-  hota hai (revocation? naye key se dobara sign? purane boards ka kya hoga?) —
-  plan mein define nahi. **OPEN-19 (Phase H):** release process mein compromise
-  response likhna hoga; is doc mein guess nahi kiya gaya.
 - **Flash encryption:** §2 (OPEN-3) dekho — Secure Boot ke saath flash
   encryption enable karna hai ya nahi, Phase D ka faisla hai.
 
@@ -254,7 +281,7 @@ Ye list is doc ka hissa hai; koi bhi item guess kar ke implement **mat** karo.
 |---|---|---|
 | OPEN-1 | Purani `PROTOCOL-V2.md` (key = OTA password ka hash) superseded hai — WP3 us file ko is design ke mutabiq update kare; jab tak update na ho, us file ko authority mat mano | WP3, Phase A |
 | OPEN-2 | Control-channel key ki length (recommendation: 32 byte; faisla WP3 ka) | WP3, Phase A |
-| OPEN-3 | Encrypted NVS ka exact mechanism + flash encryption enable karna hai ya nahi | WP3 / Phase D |
+| OPEN-3 | Encrypted NVS ka exact mechanism + flash encryption enable karna hai ya nahi | **OPEN — Phase H** (procedure + secure-build files Phase H W1 mein ban gaye: `docs/FLASH-ENCRYPTION-PROCEDURE.md`, `partitions-secure.csv`, `sdkconfig.secure.defaults`, `[env:esp32dev-secure]`, `secure_nvs.h` runtime check; board execution + closure criteria procedure §5/§8 mein — sacrificial board par pehle, phir production) |
 | OPEN-4 | Pehle boot par RNG tayyari + key-generation failure ka behaviour (fail closed — tareeqa WP3 ka) | WP3 / Phase D |
 | OPEN-5 | Pairing window ka exact start trigger (AP-up se 60 s — confirm) + window khatam hone ki nishani | WP3, Phase A |
 | OPEN-6 | **Pehli pairing ka bootstrap:** PC pehli dafa AP se kaise jure jab AP password abhi app ko maloom nahi (circular dependency) | WP3, Phase A — pairing implement karne se pehle lazmi |
@@ -266,19 +293,19 @@ Ye list is doc ka hissa hai; koi bhi item guess kar ke implement **mat** karo.
 | OPEN-12 | Forced password change ka exact UX / flow (app + board) | Phase D / E |
 | OPEN-13 | Wi-Fi password aur OTA password: ek credential ya do alag | WP3, Phase A |
 | OPEN-14 | Wi-Fi/OTA password ki length / character set / generation | WP3, Phase A |
-| OPEN-15 | App side AP password storage ka exact tareeqa (OS Wi-Fi profile — confirm) | Phase E |
+| OPEN-15 | App side AP password storage ka exact tareeqa (OS Wi-Fi profile — confirm) | **CLOSED** (Phase F W1 — PROTOCOL §7 se mutabiq: Phase E ka "CLOSED" daawa ghalat tha; code Phase F mein doc ke mutabiq hua — DPAPI KeyStore read/write, migration, backup fix) |
 | OPEN-16 | AP/OTA password bhoolne par reset ka rasta (KEY_RESET ya FACTORY_RESET — kaun sa) | WP3, Phase A |
 | OPEN-17 | App-level signature algorithm: Ed25519 ya ECDSA P-256 — ek chunna hai | WP3 / Phase D |
 | OPEN-18 | Anti-downgrade ka exact mechanism (version field / eFuse counter) | WP3 / Phase D |
-| OPEN-19 | Signing / Secure Boot key compromise hone par response (revocation, re-sign) | Phase H |
-| OPEN-20 | Wired transport (USB-serial) par pairing / key transfer hota hai ya sirf Wi-Fi par — spec TBD (D26) | Phase G |
+| OPEN-19 | Signing / Secure Boot key compromise hone par response (revocation, re-sign) | **CLOSED (doc) — Phase H W1** (`docs/FLASH-ENCRYPTION-PROCEDURE.md` §7: Ed25519 rotation + USB reflash, Secure Boot key revoke, flash-encryption key per-board response, key loss) |
+| OPEN-20 | Wired transport (USB-serial) par pairing / key transfer hota hai ya sirf Wi-Fi par — **DECIDED (D26, Phase G)**: dono — Wi-Fi primary, wired optional/alternate. Wired dual transport hai (PROTOCOL-V2.1 §10): wahi v2.1 payloads, wahi session/auth rules — HELLO (kind 3, §2.2 92 B, deviceKey sirf unpaired + 60 s pairing window mein) wired par bhi wahi chalti hai; pehli pairing ke liye SoftAP khula rehta hai (PROTOCOL §4.2), USB-serial pairing optional rasta hai. | Phase G |
 
 ## 11. Traceability — Plan v2.3 §2 ka har point kahan cover hai
 
 | Plan §2 point | Is doc mein |
 |---|---|
 | Koi factory nahi, user ghar par flash karta hai | §0.1, §2 |
-| Key pehle boot par board khud random generate, encrypted NVS | §2 |
+| Key pehle boot par board khud random generate, NVS (plaintext — encrypted NVS OPEN-3, Phase H) | §2 |
 | Pehle HELLO mein app ko deta hai, ek dafa, 60 s window | §3 |
 | App key DPAPI se store karti hai | §4 |
 | FACTORY_RESET key nahi wipe karta; KEY_RESET alag, BOOT-hold | §5 |

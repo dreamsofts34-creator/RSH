@@ -1,5 +1,7 @@
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
+using RSH.Core.Security;
+using RSH.Core.Windows;
 
 namespace RSH.App.Services;
 
@@ -9,34 +11,46 @@ public static class WindowsIntegration
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string RunValueName = "RSH";
 
-    public static bool GetAutostart()
+    /// <summary>Registry par mabni autostart store (A5 — testable AutostartService ke peeche).</summary>
+    private sealed class RegistryAutostartStore : IAutostartStore
     {
-        try
+        public string? ReadValue()
         {
             using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);
-            return key?.GetValue(RunValueName) is string;
+            return key?.GetValue(RunValueName) as string;
         }
-        catch { return false; }
-    }
 
-    public static void SetAutostart(bool enabled)
-    {
-        try
+        public void WriteValue(string value)
         {
             using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true)
-                            ?? Registry.CurrentUser.CreateSubKey(RunKeyPath);
-            if (enabled)
-            {
-                string exe = Environment.ProcessPath ?? "";
-                if (exe.Length > 0) key.SetValue(RunValueName, $"\"{exe}\" --minimized");
-            }
-            else
-            {
-                key.DeleteValue(RunValueName, throwOnMissingValue: false);
-            }
+                            ?? Registry.CurrentUser.CreateSubKey(RunKeyPath)
+                            ?? throw new InvalidOperationException("Run registry key khol/bana nahi sakte.");
+            key.SetValue(RunValueName, value);
         }
-        catch { /* registry na mile to app phir bhi chalta hai */ }
+
+        public void DeleteValue()
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true);
+            key?.DeleteValue(RunValueName, throwOnMissingValue: false);
+        }
     }
+
+    private static AutostartService Autostart => new(new RegistryAutostartStore(),
+        () => Environment.ProcessPath ?? "");
+
+    public static bool GetAutostart() => Autostart.GetAutostart();
+
+    /// <summary>
+    /// Autostart lagao/hatao — A5: kamyabi sirf tab jab registry write ke
+    /// baad read-back match kare. <c>false</c> = UI ON nahi dikhaye, error
+    /// dikhaye. Khaali <c>catch {}</c> nahi — failure wajah ke saath wapas.
+    /// </summary>
+    /// <param name="error">Failure ki wajah; kamyabi par <c>null</c>.</param>
+    public static bool SetAutostart(bool enabled, out string? error) =>
+        Autostart.TrySetAutostart(enabled, out error);
+
+    /// <summary>Compatibility overload — error chahiye ho to <see cref="SetAutostart(bool, out string?)"/> istemal karo.</summary>
+    public static bool SetAutostart(bool enabled) => SetAutostart(enabled, out _);
 
     // Engine ka 5 ms tick Windows ke default 15.6 ms timer par sust par
     // sakta hai — process ke liye 1 ms resolution mango (games bhi yahi
@@ -78,6 +92,11 @@ public static class WindowsIntegration
     /// RSH network ka WLAN profile bana kar connect karta hai —
     /// user ko Windows ki Wi-Fi list se haath se nahi jorna parta.
     /// Background thread se chalana (process calls hain).
+    /// C9: password wala XML ab <see cref="WlanProfileTempFile"/> mein
+    /// jata hai — unique naam, owner-only permissions, secure delete
+    /// (overwrite + delete, `using` se har raste par), aur crash par reh
+    /// jane wali files agle connect par sweep hoti hain. Fixed naam
+    /// `%TEMP%\rsh-wlan.xml` + best-effort delete khatam.
     /// </summary>
     public static (bool Ok, string Message) ConnectToWheelWifi(string password)
     {
@@ -97,10 +116,12 @@ public static class WindowsIntegration
                   </security></MSM>
                 </WLANProfile>
                 """;
-            string tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "rsh-wlan.xml");
-            System.IO.File.WriteAllText(tmp, xml);
-            var add = RunNetsh($"wlan add profile filename=\"{tmp}\" user=current");
-            try { System.IO.File.Delete(tmp); } catch { /* temp safai best-effort */ }
+            // Crash-safe: pichli crash ki reh jane wali profile files saaf karo.
+            WlanProfileTempFile.DeleteStaleFiles();
+            using var tmp = WlanProfileTempFile.Create(xml);
+            var add = RunNetsh($"wlan add profile filename=\"{tmp.Path}\" user=current");
+            // tmp yahin scope ke end par secure-delete hota hai (using) —
+            // add ke baad bhi, aur return/exception ke har raste par.
             if (add.ExitCode != 0) return (false, "Wi-Fi profile could not be created.");
             var con = RunNetsh($"wlan connect name={ssid} ssid={ssid}");
             if (con.ExitCode != 0) return (false, "Connect command failed — is the wheel powered and in range?");

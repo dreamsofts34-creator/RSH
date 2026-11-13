@@ -1,0 +1,371 @@
+<Grid x:Class="RSH.App.Views.Pages.TuningPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+      xmlns:ctl="clr-namespace:RSH.App.Controls"
+      xmlns:sp="clr-namespace:ScottPlot.WPF;assembly=ScottPlot.WPF"
+      xmlns:res="clr-namespace:RSH.App.Resources">
+    <!--
+        UI-5/UI-6: 10 module cards (grid) + ek waqt mein ek module ka panel.
+        Root Grid hai (UserControl nahi) taake MainWindow ki Func<Grid>
+        navigation factory `() => new TuningPage()` baghair tabdeeli ke
+        compile ho. Card tap -> sirf us module ka panel; on/off toggle
+        yahan nahi (sirf Settings -> Modules), is liye band module ka
+        panel disabled dikhta hai.
+    -->
+    <Grid.Resources>
+        <ctl:BoolToVisibilityConverter x:Key="BoolVis" />
+        <Style x:Key="ModuleCard" TargetType="Button">
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{StaticResource RSHFocusVisualStyle}" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" Background="{DynamicResource RSHCardBackgroundBrush}" CornerRadius="16" Padding="18,16"
+                                BorderThickness="2" BorderBrush="Transparent">
+                            <ContentPresenter />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#CFC4FA" />
+                            </Trigger>
+                            <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource TemplatedParent}}" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource AxAccent}" />
+                            </DataTrigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Enabled}" Value="False">
+                    <Setter Property="Opacity" Value="0.55" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="OnChip" TargetType="Border">
+            <Setter Property="CornerRadius" Value="10" />
+            <Setter Property="Padding" Value="8,2" />
+            <Setter Property="Margin" Value="8,0,0,0" />
+            <Setter Property="Background" Value="#E3F6EA" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Enabled}" Value="False">
+                    <Setter Property="Background" Value="#EDEBF5" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="OnChipText" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Foreground" Value="{StaticResource RSHSuccessTextBrush}" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Enabled}" Value="False">
+                    <Setter Property="Foreground" Value="{StaticResource AxMutedBrush}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+        <Style x:Key="LiveDot" TargetType="Border">
+            <Setter Property="Width" Value="14" />
+            <Setter Property="Height" Value="14" />
+            <Setter Property="CornerRadius" Value="7" />
+            <Setter Property="Background" Value="{StaticResource AxTrack}" />
+        </Style>
+    </Grid.Resources>
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="32,28">
+            <TextBlock Text="{Binding PageTuning, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxH1}" />
+            <TextBlock Text="{Binding PickAModuleToTune, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxSub}" />
+
+            <!-- UI-5: 10 module cards -->
+            <ItemsControl ItemsSource="{Binding Cards}">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <UniformGrid Columns="2" />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Button Style="{StaticResource ModuleCard}" Margin="0,0,16,16" AutomationProperties.Name="{Binding Name}"
+                                Tag="{Binding IsSelected}"
+                                Command="{Binding DataContext.SelectModuleCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                CommandParameter="{Binding Module}">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <Border Grid.Column="0" Width="46" Height="46" CornerRadius="13"
+                                        Background="{StaticResource AxAccent}" Margin="0,0,14,0">
+                                    <TextBlock Text="{Binding Initials}" Foreground="White" FontWeight="Bold"
+                                               FontSize="15" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                </Border>
+                                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock Text="{Binding Name}" FontWeight="Bold" FontSize="16" Foreground="{StaticResource AxInk}" />
+                                        <Border Style="{StaticResource OnChip}">
+                                            <TextBlock Text="{Binding StateText}" Style="{StaticResource OnChipText}" />
+                                        </Border>
+                                    </StackPanel>
+                                    <TextBlock Text="{Binding Subtitle}" Style="{StaticResource AxMuted}" Margin="0,2,0,0" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="2" VerticalAlignment="Center" HorizontalAlignment="Right" Margin="12,0,0,0">
+                                    <TextBlock Text="{Binding MiniText}" FontWeight="Bold" FontSize="19" HorizontalAlignment="Right" Foreground="{StaticResource AxInk}" />
+                                    <TextBlock Text="{Binding MiniUnit}" Style="{StaticResource AxMuted}" FontSize="11" HorizontalAlignment="Right" />
+                                </StackPanel>
+                            </Grid>
+                        </Button>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
+            <!-- UI-6: ek waqt mein ek module ka panel -->
+            <Border Style="{StaticResource AxCard}" IsEnabled="{Binding SelectedEnabled}">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="{Binding SelectedName}" Style="{StaticResource AxH2}" Margin="0,0,0,0" />
+                        <Border CornerRadius="10" Padding="8,2" Margin="8,0,0,0" Background="{StaticResource AxAccentSoft}" VerticalAlignment="Center">
+                            <TextBlock Text="{Binding SelectedStateText}" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource AxAccentDeep}" />
+                        </Border>
+                    </StackPanel>
+                    <TextBlock Text="{Binding SelectedSubtitle}" Style="{StaticResource AxMuted}" Margin="0,2,0,16" />
+
+                    <!-- Band module: section disabled (toggle sirf Settings mein hai) -->
+                    <Border Background="{StaticResource AxAccentSoft}" CornerRadius="8" Padding="12,10" Margin="0,0,0,16"
+                            Visibility="{Binding SelectedDisabled, Converter={StaticResource BoolVis}}">
+                        <TextBlock Text="{Binding ThisModuleIsOffTurn, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" />
+                    </Border>
+
+                    <!-- Analog modules: Steering / Accelerator / Brake / Clutch / Handbrake -->
+                    <StackPanel Visibility="{Binding IsAnalog, Converter={StaticResource BoolVis}}">
+                        <TextBlock Text="{Binding LiveResponse, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxH2}" />
+                        <Border Background="{StaticResource AxBg}" CornerRadius="8" Padding="10">
+                            <sp:WpfPlot x:Name="CurvePlot" Height="200" />
+                        </Border>
+                        <StackPanel Orientation="Horizontal" Margin="0,8,0,16">
+                            <TextBlock Text="{Binding Live, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" VerticalAlignment="Center" />
+                            <TextBlock FontWeight="SemiBold" FontSize="14" Margin="8,0,0,0" VerticalAlignment="Center">
+                                <Run Text="{Binding LiveInText, Mode=OneWay}" /><Run Text="{Binding In, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding LiveOutText, Mode=OneWay}" /><Run Text="{Binding Out, Source={x:Static res:UiStrings.Instance}}" />
+                            </TextBlock>
+                        </StackPanel>
+
+                        <!-- Clutch / Handbrake: wheel abhi axis nahi bhejta -->
+                        <Border Background="{StaticResource AxAccentSoft}" CornerRadius="8" Padding="12,10" Margin="0,0,0,16"
+                                Visibility="{Binding ShowNoInputNote, Converter={StaticResource BoolVis}}">
+                            <TextBlock Text="{Binding TheWheelIsNotSending, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" />
+                        </Border>
+
+                        <StackPanel Margin="0,0,0,16" Visibility="{Binding IsSteering, Converter={StaticResource BoolVis}}">
+                            <Grid>
+                                <TextBlock Text="{Binding SteeringRange, Source={x:Static res:UiStrings.Instance}}" FontWeight="SemiBold" FontSize="14" />
+                                <TextBlock HorizontalAlignment="Right" FontWeight="SemiBold" FontSize="14">
+                                    <Run Text="{Binding RotationDeg, StringFormat={}{0:F0}, Mode=OneWay}" /><Run Text="°" />
+                                </TextBlock>
+                            </Grid>
+                            <Slider Style="{StaticResource AxSlider}" Minimum="180" Maximum="900" TickFrequency="30" IsSnapToTickEnabled="True" AutomationProperties.Name="{Binding SteeringRange, Source={x:Static res:UiStrings.Instance}}"
+                                    Value="{Binding RotationDeg, Mode=TwoWay}" Margin="0,8,0,4" />
+                            <TextBlock Text="{Binding Rotation540SuitsGtCars, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" />
+                        </StackPanel>
+
+                        <StackPanel Margin="0,0,0,16">
+                            <Grid>
+                                <TextBlock Text="{Binding DeadzoneLabel}" FontWeight="SemiBold" FontSize="14" />
+                                <TextBlock HorizontalAlignment="Right" FontWeight="SemiBold" FontSize="14">
+                                    <Run Text="{Binding DeadzonePct, StringFormat={}{0:F0}, Mode=OneWay}" /><Run Text="%" />
+                                </TextBlock>
+                            </Grid>
+                            <Slider Style="{StaticResource AxSlider}" Minimum="0" Maximum="20" Value="{Binding DeadzonePct, Mode=TwoWay}" Margin="0,8,0,4" AutomationProperties.Name="{Binding Deadzone, Source={x:Static res:UiStrings.Instance}}" />
+                            <TextBlock Text="{Binding RemovesTinyShakeAtCentre, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" />
+                        </StackPanel>
+
+                        <StackPanel Margin="0,0,0,16">
+                            <Grid>
+                                <TextBlock Text="{Binding ResponseCurve, Source={x:Static res:UiStrings.Instance}}" FontWeight="SemiBold" FontSize="14" />
+                                <TextBlock HorizontalAlignment="Right" FontWeight="SemiBold" FontSize="14">
+                                    <Run Text="{Binding CurvePct, StringFormat={}{0:F0}, Mode=OneWay}" /><Run Text="%" /><Run Text=" · " /><Run Text="{Binding CurvePresetText, Mode=OneWay}" />
+                                </TextBlock>
+                            </Grid>
+                            <Slider Style="{StaticResource AxSlider}" Minimum="-100" Maximum="100" Value="{Binding CurvePct, Mode=TwoWay}" Margin="0,8,0,4" AutomationProperties.Name="{Binding ResponseCurve, Source={x:Static res:UiStrings.Instance}}" />
+                            <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                <Button Content="{Binding Linear, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding Linear, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxGhost}" Command="{Binding PresetLinearCommand}" Padding="14,8" />
+                                <Button Content="{Binding Progressive, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding Progressive, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxGhost}" Command="{Binding PresetProgressiveCommand}" Padding="14,8" Margin="8,0,0,0" />
+                                <TextBlock Text="{Binding HigherCalmerAtCentreLower, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" VerticalAlignment="Center" Margin="14,0,0,0" />
+                            </StackPanel>
+                        </StackPanel>
+
+                        <StackPanel Margin="0,0,0,16">
+                            <Grid>
+                                <TextBlock Text="{Binding Smoothing, Source={x:Static res:UiStrings.Instance}}" FontWeight="SemiBold" FontSize="14" />
+                                <TextBlock HorizontalAlignment="Right" FontWeight="SemiBold" FontSize="14">
+                                    <Run Text="{Binding SmoothingPct, StringFormat={}{0:F0}, Mode=OneWay}" /><Run Text="%" />
+                                </TextBlock>
+                            </Grid>
+                            <Slider Style="{StaticResource AxSlider}" Minimum="0" Maximum="100" Value="{Binding SmoothingPct, Mode=TwoWay}" Margin="0,8,0,4" AutomationProperties.Name="{Binding Smoothing, Source={x:Static res:UiStrings.Instance}}" />
+                            <TextBlock Text="{Binding HigherSteadierSlightlySlower, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+                            <TextBlock Text="{Binding InvertAxis, Source={x:Static res:UiStrings.Instance}}" FontWeight="SemiBold" FontSize="14" VerticalAlignment="Center" Margin="0,0,12,0" />
+                            <ui:ToggleSwitch IsChecked="{Binding Invert}" AutomationProperties.Name="{Binding InvertAxis, Source={x:Static res:UiStrings.Instance}}" />
+                        </StackPanel>
+
+                        <StackPanel Visibility="{Binding HasCalibration, Converter={StaticResource BoolVis}}">
+                            <TextBlock Text="{Binding Endpoints, Source={x:Static res:UiStrings.Instance}}" FontWeight="SemiBold" FontSize="14" />
+                            <TextBlock Text="{Binding EndpointText}" Style="{StaticResource AxMuted}" Margin="0,4,0,0" />
+                            <TextBlock Text="{Binding EndpointsWarning}" Foreground="#B42318" FontSize="13" FontWeight="SemiBold" Margin="0,4,0,0"
+                                       Visibility="{Binding HasEndpointsWarning, Converter={StaticResource BoolVis}}" />
+                            <TextBlock Text="{Binding EndpointsComeFromCalibrationAdjust, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" Margin="0,4,0,0" />
+                        </StackPanel>
+                    </StackPanel>
+
+                    <!-- Wheel Buttons: live state + mapping (edit Buttons screen par hai) -->
+                    <StackPanel Visibility="{Binding IsButtons, Converter={StaticResource BoolVis}}">
+                        <TextBlock Text="{Binding LiveButtons, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxH2}" />
+                        <Grid Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="{Binding GearUp, Source={x:Static res:UiStrings.Instance}}" FontSize="14" VerticalAlignment="Center" />
+                            <Border Grid.Column="2">
+                                <Border.Style>
+                                    <Style TargetType="Border" BasedOn="{StaticResource LiveDot}">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding GearUpPressed}" Value="True">
+                                                <Setter Property="Background" Value="{StaticResource AxAccent}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
+                            </Border>
+                        </Grid>
+                        <Grid Margin="0,0,0,16">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="{Binding GearDown, Source={x:Static res:UiStrings.Instance}}" FontSize="14" VerticalAlignment="Center" />
+                            <Border Grid.Column="2">
+                                <Border.Style>
+                                    <Style TargetType="Border" BasedOn="{StaticResource LiveDot}">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding GearDownPressed}" Value="True">
+                                                <Setter Property="Background" Value="{StaticResource AxAccent}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
+                            </Border>
+                        </Grid>
+                        <TextBlock FontSize="14" Margin="0,0,0,4">
+                            <Run Text="{Binding ButtonsMaskLabel, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding ButtonsMaskText, Mode=OneWay}" FontWeight="SemiBold" />
+                            <Run Text=" · " /><Run Text="{Binding PressedCount, Mode=OneWay}" FontWeight="SemiBold" /><Run Text="{Binding Pressed, Source={x:Static res:UiStrings.Instance}}" />
+                        </TextBlock>
+                        <TextBlock FontSize="14" Margin="0,0,0,4">
+                            <Run Text="{Binding GearUpVJoyButton, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding GearUpVJoyText, Mode=OneWay}" FontWeight="SemiBold" />
+                            <Run Text="{Binding GearDownVJoyButton, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding GearDownVJoyText, Mode=OneWay}" FontWeight="SemiBold" />
+                        </TextBlock>
+                        <TextBlock Text="{Binding ChangeTheMappingOnThe, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" />
+                    </StackPanel>
+
+                    <!-- Encoders: live cumulative steps (v2 stream) -->
+                    <StackPanel Visibility="{Binding IsEncoders, Converter={StaticResource BoolVis}}">
+                        <TextBlock Text="{Binding LiveSteps, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxH2}" />
+                        <TextBlock FontSize="14" Margin="0,0,0,4">
+                            <Run Text="{Binding Encoder1Label, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding Encoder1Text, Mode=OneWay}" FontWeight="SemiBold" />
+                            <Run Text="{Binding Encoder2Label, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding Encoder2Text, Mode=OneWay}" FontWeight="SemiBold" />
+                        </TextBlock>
+                        <TextBlock FontSize="14" Margin="0,0,0,4">
+                            <Run Text="{Binding Encoder3Label, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding Encoder3Text, Mode=OneWay}" FontWeight="SemiBold" />
+                            <Run Text="{Binding Encoder4Label, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding Encoder4Text, Mode=OneWay}" FontWeight="SemiBold" />
+                        </TextBlock>
+                        <TextBlock FontSize="14" Margin="0,0,0,4">
+                            <Run Text="{Binding TotalStepsLabel, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding EncoderSummaryText, Mode=OneWay}" FontWeight="SemiBold" />
+                        </TextBlock>
+                        <TextBlock Text="{Binding NoEncoderDataInThe, Source={x:Static res:UiStrings.Instance}}"
+                                   Style="{StaticResource AxMuted}" Visibility="{Binding HasNoV2Stream, Converter={StaticResource BoolVis}}" />
+                        <TextBlock Text="{Binding PulsesPerStepIsAssignment, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" />
+                    </StackPanel>
+
+                    <!-- Shifter: live gate test (mode firmware wiring se hai) -->
+                    <StackPanel Visibility="{Binding IsShifter, Converter={StaticResource BoolVis}}">
+                        <TextBlock Text="{Binding GateTest, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxH2}" />
+                        <Grid Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="{Binding ShiftUp, Source={x:Static res:UiStrings.Instance}}" FontSize="14" VerticalAlignment="Center" />
+                            <Border Grid.Column="2">
+                                <Border.Style>
+                                    <Style TargetType="Border" BasedOn="{StaticResource LiveDot}">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding GearUpPressed}" Value="True">
+                                                <Setter Property="Background" Value="{StaticResource AxAccent}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
+                            </Border>
+                        </Grid>
+                        <Grid Margin="0,0,0,16">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="{Binding ShiftDown, Source={x:Static res:UiStrings.Instance}}" FontSize="14" VerticalAlignment="Center" />
+                            <Border Grid.Column="2">
+                                <Border.Style>
+                                    <Style TargetType="Border" BasedOn="{StaticResource LiveDot}">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding GearDownPressed}" Value="True">
+                                                <Setter Property="Background" Value="{StaticResource AxAccent}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
+                            </Border>
+                        </Grid>
+                        <TextBlock FontSize="14" Margin="0,0,0,4">
+                            <Run Text="{Binding CurrentGateLabel, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding ShifterGateText, Mode=OneWay}" FontWeight="SemiBold" />
+                        </TextBlock>
+                        <TextBlock Text="{Binding GateModeFollowsTheWheel, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" />
+                    </StackPanel>
+
+                    <!-- Horn: live activity + assignment note -->
+                    <StackPanel Visibility="{Binding IsHorn, Converter={StaticResource BoolVis}}">
+                        <TextBlock Text="{Binding Horn, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxH2}" />
+                        <TextBlock FontSize="14" Margin="0,0,0,4">
+                            <Run Text="{Binding ButtonsPressedLabel, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding PressedCount, Mode=OneWay}" FontWeight="SemiBold" />
+                            <Run Text="{Binding MaskLabel, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding ButtonsMaskText, Mode=OneWay}" FontWeight="SemiBold" />
+                        </TextBlock>
+                        <TextBlock Text="{Binding AButtonHasNoTravel, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" />
+                    </StackPanel>
+
+                    <!-- Status LED: supported patterns (test board link se hai) -->
+                    <StackPanel Visibility="{Binding IsLed, Converter={StaticResource BoolVis}}">
+                        <TextBlock Text="{Binding StatusLED, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxH2}" />
+                        <TextBlock Text="{Binding PatternsTheBoardSupportsOFF, Source={x:Static res:UiStrings.Instance}}" FontSize="14" Margin="0,0,0,4" />
+                        <TextBlock Text="{Binding LEDTestLEDTESTNeeds, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" />
+                        <!-- Phase H WS2: pattern + brightness (LED_TEST, §3.7) -->
+                        <TextBlock Text="{Binding LedPattern, Source={x:Static res:UiStrings.Instance}}" FontSize="14" Margin="0,12,0,0" />
+                        <ComboBox ItemsSource="{Binding LedPatternNames}" SelectedIndex="{Binding LedPatternIndex, Mode=TwoWay}" HorizontalAlignment="Left" MinWidth="160" Margin="0,4,0,0" AutomationProperties.Name="{Binding LedPattern, Source={x:Static res:UiStrings.Instance}}" />
+                        <TextBlock FontSize="14" Margin="0,12,0,0">
+                            <Run Text="{Binding LedBrightness, Source={x:Static res:UiStrings.Instance}}" /><Run Text=" " /><Run Text="{Binding LedBrightnessPct, Mode=OneWay, StringFormat={}{0:F0}%}" FontWeight="SemiBold" />
+                        </TextBlock>
+                        <Slider Style="{StaticResource AxSlider}" Minimum="0" Maximum="100" TickFrequency="10" IsSnapToTickEnabled="True" Value="{Binding LedBrightnessPct, Mode=TwoWay}" Margin="0,8,0,4" AutomationProperties.Name="{Binding LedBrightness, Source={x:Static res:UiStrings.Instance}}" />
+                        <Button Content="{Binding TestPattern, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding TestPattern, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxPrimary}" Command="{Binding LedTestCommand}" HorizontalAlignment="Left" Margin="0,12,0,0" />
+                        <TextBlock Text="{Binding LedTestStatusText, Mode=OneWay}" Style="{StaticResource AxMuted}" Margin="0,8,0,0" TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <TextBlock Text="{Binding ChangesSaveAutomaticallyToThis, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" Margin="0,16,0,0" />
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Grid>

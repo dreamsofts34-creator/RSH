@@ -6,6 +6,7 @@ using RSH.App.Services;
 using RSH.App.Themes;
 using RSH.App.ViewModels;
 using RSH.App.Views;
+using RSH.App.Views.Pages;
 using Wpf.Ui.Controls;
 
 namespace RSH.App;
@@ -47,19 +48,23 @@ public partial class MainWindow : FluentWindow
         };
     }
 
-    // UI-2: 8 screens, spec §0.2 order. Asal screens UI-3+ mein banengi —
-    // abhi har screen ke liye sirf khaali placeholder grid hai (sirf screen
-    // ka naam, koi button/slider/control nahi — khaali jagah khaali rahegi).
-    private readonly Dictionary<string, Func<Grid>> _pages = new()
+    // UI-2: 8 screens, spec §0.2 order — har entry asal page hai
+    // (UI-3 Dashboard, UI-5/UI-6 Tuning, UI-7 Setup, UI-8 Buttons +
+    // Output, UI-9 Profiles, UI-10 Monitor, UI-11 Settings).
+    // Tuning ki factory Workstream 2 ki hai — usay mat chhedo.
+    // Dict Func<FrameworkElement> hai (Func<UserControl> NAHI):
+    // TuningPage ka root Grid hai, baqi pages UserControl — dono
+    // FrameworkElement hain, is liye yahi type dono ko leta hai.
+    private readonly Dictionary<string, Func<FrameworkElement>> _pages = new()
     {
-        ["Dashboard"] = () => MakePlaceholder("Dashboard"),
-        ["Tuning"] = () => MakePlaceholder("Tuning"),
-        ["Setup"] = () => MakePlaceholder("Setup"),
-        ["Buttons"] = () => MakePlaceholder("Buttons"),
-        ["Output"] = () => MakePlaceholder("Output"),
-        ["Profiles"] = () => MakePlaceholder("Profiles"),
-        ["Monitor"] = () => MakePlaceholder("Monitor"),
-        ["Settings"] = () => MakePlaceholder("Settings"),
+        ["Dashboard"] = () => new DashboardPage(),
+        ["Tuning"] = () => new RSH.App.Views.Pages.TuningPage(),
+        ["Setup"] = () => new SetupPage(),
+        ["Buttons"] = () => new ButtonsPage(),
+        ["Output"] = () => new OutputPage(),
+        ["Profiles"] = () => new ProfilesPage(),
+        ["Monitor"] = () => new MonitorPage(),
+        ["Settings"] = () => new SettingsPage(),
     };
 
     private static Grid MakePlaceholder(string title)

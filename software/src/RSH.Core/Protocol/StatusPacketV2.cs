@@ -15,7 +15,7 @@ public enum StatusPacketV2ParseResult
 }
 
 /// <summary>
-/// Status packet v2.1 (§1.2), 1 Hz, port 4211.
+/// Status packet v2.1 (§1.2), 1 Hz, arrives on the data port.
 /// Base 34 B (nBtn ≤ 32). Extended 38 B (nBtn 33–64): btnsEx u32 bytes 28–31 mein,
 /// seqGap 32–33, txFail 34–35, CRC 36–37.
 /// Base offsets (coordinator decision — PROTOCOL-V2.1.md §1.2 hi authority):

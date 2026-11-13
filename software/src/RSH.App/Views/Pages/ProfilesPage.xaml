@@ -1,65 +1,88 @@
 <UserControl x:Class="RSH.App.Views.Pages.ProfilesPage"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml">
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             xmlns:res="clr-namespace:RSH.App.Resources">
     <ScrollViewer VerticalScrollBarVisibility="Auto">
         <StackPanel Margin="24" MaxWidth="980">
-            <ui:TextBlock Text="Profiles" FontTypography="Title" Margin="0,0,0,4" />
-            <ui:TextBlock Text="One profile per game. Selecting activates it."
+            <ui:TextBlock Text="{Binding PageProfiles, Source={x:Static res:UiStrings.Instance}}" FontTypography="Title" Margin="0,0,0,4" />
+            <ui:TextBlock Text="{Binding OneProfilePerGameSelecting, Source={x:Static res:UiStrings.Instance}}"
                           Appearance="Secondary" Margin="0,0,0,16" TextWrapping="Wrap" />
 
             <ui:Card Padding="16" Margin="0,0,0,12">
                 <StackPanel>
-                    <ui:TextBlock Text="Your profiles" FontTypography="BodyStrong" Margin="0,0,0,8" />
-                    <ListBox ItemsSource="{Binding ProfileNames}" SelectedItem="{Binding SelectedProfile, Mode=TwoWay}"
-                             MinHeight="140" MaxHeight="260" />
+                    <ui:TextBlock Text="{Binding YourProfiles, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <!-- U-P5: virtualized list — 100+ profiles bhi slow nahi. -->
+                    <ListBox ItemsSource="{Binding ProfileNames}" SelectedItem="{Binding SelectedProfile, Mode=TwoWay}" AutomationProperties.Name="{Binding PageProfiles, Source={x:Static res:UiStrings.Instance}}"
+                             MinHeight="140" MaxHeight="260"
+                             VirtualizingStackPanel.IsVirtualizing="True"
+                             VirtualizingStackPanel.VirtualizationMode="Recycling" />
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                        <ui:Button Content="{Binding Activate, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding Activate, Source={x:Static res:UiStrings.Instance}}" Appearance="Primary" Command="{Binding ActivateCommand}" Margin="0,0,8,0" />
+                        <ui:Button Content="{Binding Duplicate, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding Duplicate, Source={x:Static res:UiStrings.Instance}}" Command="{Binding DuplicateCommand}" Margin="0,0,8,0" />
+                        <ui:Button Content="{Binding Export, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding Export, Source={x:Static res:UiStrings.Instance}}" Command="{Binding ExportCommand}" Margin="0,0,8,0" />
+                        <ui:Button Content="{Binding Import, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding Import, Source={x:Static res:UiStrings.Instance}}" Command="{Binding ImportCommand}" Margin="0,0,8,0" />
+                        <ui:Button Content="{Binding Delete, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding Delete, Source={x:Static res:UiStrings.Instance}}" Command="{Binding DeleteCommand}" />
+                    </StackPanel>
                     <ui:TextBlock Text="{Binding StatusText}" Appearance="Secondary" Margin="0,8,0,0" TextWrapping="Wrap" />
                 </StackPanel>
             </ui:Card>
 
             <ui:Card Padding="16" Margin="0,0,0,12">
                 <StackPanel>
-                    <ui:TextBlock Text="Create" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <ui:TextBlock Text="{Binding Create, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
                     <StackPanel Orientation="Horizontal">
-                        <ui:TextBox Text="{Binding NewName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                    PlaceholderText="e.g. Assetto Corsa — GT3" Width="320" Margin="0,0,8,0" />
-                        <ui:Button Content="Create profile" Appearance="Primary" Command="{Binding CreateCommand}" />
+                        <ui:TextBox Text="{Binding NewName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="{Binding NewProfileName, Source={x:Static res:UiStrings.Instance}}"
+                                    PlaceholderText="{Binding EGAssettoCorsaGT3, Source={x:Static res:UiStrings.Instance}}" Width="320" Margin="0,0,8,0" />
+                        <ui:Button Content="{Binding CreateProfile, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding CreateProfile, Source={x:Static res:UiStrings.Instance}}" Appearance="Primary" Command="{Binding CreateCommand}" />
                     </StackPanel>
                 </StackPanel>
             </ui:Card>
 
             <ui:Card Padding="16" Margin="0,0,0,12">
                 <StackPanel>
-                    <ui:TextBlock Text="Per-game auto-switch" FontTypography="BodyStrong" Margin="0,0,0,8" />
-                    <ui:TextBlock Text="Process name only, no .exe — see Task Manager → Details."
+                    <ui:TextBlock Text="{Binding PerGameAutoSwitch, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <ui:TextBlock Text="{Binding ProcessNameOnlyNoExe, Source={x:Static res:UiStrings.Instance}}"
                                   Appearance="Secondary" Margin="0,0,8,0" TextWrapping="Wrap" />
                     <StackPanel Orientation="Horizontal">
-                        <ui:TextBox Text="{Binding ActiveGameProcess, Mode=TwoWay}"
-                                    PlaceholderText="e.g. AssettoCorsa" Width="320" Margin="0,0,8,0" />
-                        <ui:TextBlock Text="On/off: Settings."
+                        <ui:TextBox Text="{Binding ActiveGameProcess, Mode=TwoWay}" AutomationProperties.Name="{Binding GameProcessName, Source={x:Static res:UiStrings.Instance}}"
+                                    PlaceholderText="{Binding EGAssettoCorsa, Source={x:Static res:UiStrings.Instance}}" Width="320" Margin="0,0,8,0" />
+                        <ui:TextBlock Text="{Binding OnOffSettings, Source={x:Static res:UiStrings.Instance}}"
                                       Appearance="Secondary" VerticalAlignment="Center" />
                     </StackPanel>
+                    <ui:TextBlock Text="{Binding ActiveRulesGameProcessProfile, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,16,0,8" />
+                    <ItemsControl ItemsSource="{Binding AutoSwitchRules}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Orientation="Horizontal" Margin="0,2">
+                                    <ui:TextBlock Text="{Binding GameProcess}" FontWeight="SemiBold" />
+                                    <ui:TextBlock Text="  →  " Appearance="Secondary" />
+                                    <ui:TextBlock Text="{Binding ProfileName}" />
+                                    <ui:TextBlock Text="{Binding CarLabel}" Appearance="Secondary" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                        <ui:Button Content="{Binding UseCurrentCar, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding UseCurrentCar, Source={x:Static res:UiStrings.Instance}}" Command="{Binding FillCarFromTelemetryCommand}" Margin="0,0,8,0" />
+                        <ui:Button Content="{Binding ResumeAutoSwitch, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding ResumeAutoSwitch, Source={x:Static res:UiStrings.Instance}}" Command="{Binding ResumeAutoSwitchCommand}" IsEnabled="{Binding AutoSwitchLocked}" />
+                    </StackPanel>
+                    <ui:TextBlock Text="{Binding WhenAGameLaunchedFrom, Source={x:Static res:UiStrings.Instance}}"
+                                  Appearance="Secondary" Margin="0,8,0,0" TextWrapping="Wrap" />
                 </StackPanel>
             </ui:Card>
 
             <ui:Card Padding="16" Margin="0,0,0,12">
                 <StackPanel>
-                    <ui:TextBlock Text="Rotation presets" FontTypography="BodyStrong" Margin="0,0,0,8" />
-                    <ui:TextBlock Text="Copies the active profile at a shorter rotation."
+                    <ui:TextBlock Text="{Binding RotationPresets, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <ui:TextBlock Text="{Binding CopiesTheActiveProfileAt, Source={x:Static res:UiStrings.Instance}}"
                                   Appearance="Secondary" Margin="0,0,8,0" TextWrapping="Wrap" />
                     <StackPanel Orientation="Horizontal">
-                        <ui:Button Content="Add GT 540° preset" Command="{Binding AddPresetGtCommand}" Margin="0,0,8,0" />
-                        <ui:Button Content="Add F1 360° preset" Command="{Binding AddPresetF1Command}" />
+                        <ui:Button Content="{Binding AddGtPreset, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding AddGtPreset, Source={x:Static res:UiStrings.Instance}}" Command="{Binding AddPresetGtCommand}" Margin="0,0,8,0" />
+                        <ui:Button Content="{Binding AddF1Preset, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding AddF1Preset, Source={x:Static res:UiStrings.Instance}}" Command="{Binding AddPresetF1Command}" />
                     </StackPanel>
                 </StackPanel>
             </ui:Card>
-
-            <StackPanel Orientation="Horizontal">
-                <ui:Button Content="Duplicate" Command="{Binding DuplicateCommand}" Margin="0,0,8,0" />
-                <ui:Button Content="Export…" Command="{Binding ExportCommand}" Margin="0,0,8,0" />
-                <ui:Button Content="Import…" Command="{Binding ImportCommand}" Margin="0,0,8,0" />
-                <ui:Button Content="Delete" Command="{Binding DeleteCommand}" />
-            </StackPanel>
         </StackPanel>
     </ScrollViewer>
 </UserControl>

@@ -7,5 +7,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <LangVersion>latest</LangVersion>
+    <!-- Product version (T13): har assembly isi version se print hoti hai —
+         benchmarks date/version chhapte hain; RSH.App.csproj mein wahi
+         2.0.0 dobara likha hai (release workflow wahan se parhta hai). -->
+    <Version>2.0.0</Version>
   </PropertyGroup>
 </Project>

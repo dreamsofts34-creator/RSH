@@ -28,6 +28,13 @@ public static class ProtocolV2
     public const int ControlMaxPayload = 1024;
     public const int ControlMaxFrame = ControlHeaderSize + ControlMaxPayload + ControlTagSize; // 1053 (§3.1)
 
+    /// <summary>Ping port — control port 4212 hi hai, magic "RSHN" se demux (§9).</summary>
+    public const int PingPort = 4212;
+    /// <summary>Control port — HELO (4210) aur data (4211) se alag; ping bhi isi par hai (§3.1/§9).</summary>
+    public const int ControlPort = 4212;
+    /// <summary>Ping frame fixed size: magic(4) + ver + type + seq(2) + t0/t1/t2 (8×3) + CRC16(2) = 34 (§9).</summary>
+    public const int PingFrameSize = 34;
+
     /// <summary>Stream header size: magic(4) + ver + flags + seq + ts + mask + nEnc + buttons(4) + rsv(2) = 20 (§1.1).</summary>
     public const int StreamHeaderSize = 20;
 
@@ -98,6 +105,7 @@ public enum PacketKind
     HelloV2,
     ControlV2,
     ProbeV2,
+    PingV2,
 }
 
 /// <summary>
@@ -120,6 +128,7 @@ public static class PacketRouter
                 (byte)'R' => PacketKind.HelloV2,
                 (byte)'C' => PacketKind.ControlV2,
                 (byte)'P' => PacketKind.ProbeV2,
+                (byte)'N' => PacketKind.PingV2,
                 _ => PacketKind.Unknown,
             };
         }

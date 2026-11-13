@@ -19,12 +19,18 @@
         <ResourceDictionary Source="RSHTheme.Light.xaml" />
     </ResourceDictionary.MergedDictionaries>
 
-    <!-- Accent family (§0.1) — theme-independent -->
-    <Color x:Key="RSHAccentColor">#6C4CF1</Color>
-    <SolidColorBrush x:Key="RSHAccentBrush" Color="{StaticResource RSHAccentColor}" />
-    <SolidColorBrush x:Key="RSHAccentDeepBrush" Color="#4B2FD0" />
-    <SolidColorBrush x:Key="RSHAccentHoverBrush" Color="#5A3BE0" />
-    <SolidColorBrush x:Key="RSHAccentSoftBrush" Color="#EEE9FF" />
+    <!-- Accent family (§0.1) — theme-independent values Light/Dark
+         palettes mein hain (RSHAccentColor #6C4CF1); High Contrast
+         palette mein ye SystemColors.Highlight hota hai. DynamicResource
+         is liye ke palette swap (Light/Dark/HighContrast) par accent
+         bhi live badle — StaticResource swap par atka rehta.
+         RSHAccentColor yahan define NAHI hota: apni dictionary ki key
+         merged palette ki key ko chhupa leti (shadowing), is liye
+         accent ka rang hamesha palette se aata hai. -->
+    <SolidColorBrush x:Key="RSHAccentBrush" Color="{DynamicResource RSHAccentColor}" />
+    <SolidColorBrush x:Key="RSHAccentDeepBrush" Color="{DynamicResource RSHAccentDeepColor}" />
+    <SolidColorBrush x:Key="RSHAccentHoverBrush" Color="{DynamicResource RSHAccentHoverColor}" />
+    <SolidColorBrush x:Key="RSHAccentSoftBrush" Color="{DynamicResource RSHAccentSoftColor}" />
 
     <!-- Status colours (§0.1) — theme-independent. Warning sirf chhote
          warning dots ke liye hai, accent nahi. -->
@@ -34,6 +40,42 @@
     <SolidColorBrush x:Key="RSHCyanBrush" Color="#22D3EE" />
     <!-- Accent surfaces par text -->
     <SolidColorBrush x:Key="RSHOnAccentBrush" Color="#FFFFFF" />
+
+    <!-- UI-12: Ax* aliases — page content (Dashboard/Tuning/Setup) Theme.xaml
+         ke static light brushes ke bajaye in theme-aware brushes ko parhta
+         hai: MainWindow ke resources mein ye keys App-level Theme.xaml se
+         pehle milti hain, aur in ka Color palette swap par DynamicResource
+         se badalta hai (U-P10: sirf dictionaries badalti hain).
+         AxAccent theme-independent hai (accent dono themes mein #6C4CF1). -->
+    <SolidColorBrush x:Key="AxBg" Color="{DynamicResource RSHBackgroundColor}" />
+    <SolidColorBrush x:Key="AxInk" Color="{DynamicResource RSHTextColor}" />
+    <SolidColorBrush x:Key="AxMutedBrush" Color="{DynamicResource RSHSecondaryTextColor}" />
+    <SolidColorBrush x:Key="AxAccent" Color="{DynamicResource RSHAccentColor}" />
+    <SolidColorBrush x:Key="AxAccentSoft" Color="{DynamicResource RSHAccentSoftColor}" />
+    <SolidColorBrush x:Key="AxAccentDeep" Color="{DynamicResource RSHAccentDeepColor}" />
+    <SolidColorBrush x:Key="AxTrack" Color="{DynamicResource RSHTrackColor}" />
+    <SolidColorBrush x:Key="AxLine" Color="{DynamicResource RSHBorderColor}" />
+    <!-- Status text — WCAG-AA dono themes mein (UI-12 contrast audit):
+         error light #B42318 (6.6:1) / dark #FF9D94 (8.9:1),
+         warning light #B54708 (5.4:1) / dark #F5B544 (9.8:1),
+         banner light #FFF4E5 / dark #3A2C10 (inherited text se 12-15:1),
+         success #146C35 halki pill #E3F6EA par 5.2:1 (pehle #17803D 4.45:1 tha). -->
+    <SolidColorBrush x:Key="RSHErrorBrush" Color="{DynamicResource RSHErrorColor}" />
+    <SolidColorBrush x:Key="RSHWarningTextBrush" Color="{DynamicResource RSHWarningTextColor}" />
+    <SolidColorBrush x:Key="RSHBannerBrush" Color="{DynamicResource RSHBannerColor}" />
+    <SolidColorBrush x:Key="RSHSuccessTextBrush" Color="{DynamicResource RSHSuccessTextColor}" />
+
+    <!-- UI-12: keyboard focus — dashed accent outline, har focusable
+         custom control par (WPF-UI controls ki apni focus visual hai). -->
+    <Style x:Key="RSHFocusVisualStyle">
+        <Setter Property="Control.Template">
+            <Setter.Value>
+                <ControlTemplate>
+                    <Rectangle Margin="2" StrokeThickness="2" Stroke="{StaticResource RSHAccentBrush}" StrokeDashArray="2 2" />
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
 
     <!-- Font (§0.1: Inter; Inter na ho to Segoe UI fallback) -->
     <FontFamily x:Key="RSHFontFamily">Inter, Segoe UI</FontFamily>
@@ -60,6 +102,7 @@
 
     <!-- Sidebar navigation — violet active state (§0.1 accent). -->
     <Style x:Key="RSHNavStyle" TargetType="RadioButton">
+        <Setter Property="FocusVisualStyle" Value="{StaticResource RSHFocusVisualStyle}" />
         <Setter Property="Foreground" Value="{DynamicResource RSHSecondaryTextBrush}" />
         <Setter Property="FontSize" Value="{StaticResource RSHFontSizeBody}" />
         <Setter Property="FontFamily" Value="{StaticResource RSHFontFamily}" />
@@ -133,6 +176,7 @@
 
     <!-- Primary button — accent -->
     <Style x:Key="RSHPrimaryButtonStyle" TargetType="Button">
+        <Setter Property="FocusVisualStyle" Value="{StaticResource RSHFocusVisualStyle}" />
         <Setter Property="Foreground" Value="{StaticResource RSHOnAccentBrush}" />
         <Setter Property="FontSize" Value="{StaticResource RSHFontSizeBody}" />
         <Setter Property="FontWeight" Value="SemiBold" />
@@ -160,6 +204,60 @@
 
     <!-- Ghost button — theme-dependent tint, active-nav jaisi surface -->
     <Style x:Key="RSHGhostButtonStyle" TargetType="Button">
+        <Setter Property="FocusVisualStyle" Value="{StaticResource RSHFocusVisualStyle}" />
+        <Setter Property="Foreground" Value="{DynamicResource RSHNavActiveForegroundBrush}" />
+        <Setter Property="FontSize" Value="{StaticResource RSHFontSizeBody}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="FontFamily" Value="{StaticResource RSHFontFamily}" />
+        <Setter Property="Cursor" Value="Hand" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="Bd" Background="{DynamicResource RSHNavActiveBackgroundBrush}"
+                            CornerRadius="10" Padding="20,12">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background" Value="{DynamicResource RSHNavHoverBackgroundBrush}" />
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="Bd" Property="Opacity" Value="0.45" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- UI-12: Ax* style overrides — App-level Theme.xaml wale styles static
+         light hain; ye window-level versions theme-aware hain (Dark mein
+         card #14181F, muted #9AA3AF, ghost fg #C4B5FD bg #2A2350).
+         AxPrimary / AxWhiteBtn ko override ki zaroorat nahi: white text
+         accent par dono themes mein 5.3:1 hai. -->
+    <Style x:Key="AxCard" TargetType="Border">
+        <Setter Property="Background" Value="{DynamicResource RSHCardBackgroundBrush}" />
+        <Setter Property="CornerRadius" Value="{StaticResource RSHCardCornerRadius}" />
+        <Setter Property="Padding" Value="20" />
+        <Setter Property="Effect">
+            <Setter.Value>
+                <DropShadowEffect BlurRadius="8" ShadowDepth="1" Opacity="0.10" Color="#3C288C" />
+            </Setter.Value>
+        </Setter>
+    </Style>
+    <Style x:Key="AxMuted" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="{StaticResource RSHFontSizeSmall}" />
+        <Setter Property="Foreground" Value="{DynamicResource RSHSecondaryTextBrush}" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+    <Style x:Key="AxSub" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="{StaticResource RSHFontSizeBody}" />
+        <Setter Property="Foreground" Value="{DynamicResource RSHSecondaryTextBrush}" />
+        <Setter Property="Margin" Value="0,0,0,20" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+    <Style x:Key="AxGhost" TargetType="Button">
+        <Setter Property="FocusVisualStyle" Value="{StaticResource RSHFocusVisualStyle}" />
         <Setter Property="Foreground" Value="{DynamicResource RSHNavActiveForegroundBrush}" />
         <Setter Property="FontSize" Value="{StaticResource RSHFontSizeBody}" />
         <Setter Property="FontWeight" Value="SemiBold" />

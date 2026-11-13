@@ -65,6 +65,12 @@ def merge_bin(source, target, env):  # noqa: F811
     subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
     if not os.path.isfile(out):
         raise RuntimeError("merge_bin: output nahi bana: %s" % out)
+    # F15: khaali ya na-mukammal merged bin bhi build fail hai — sirf
+    # "file mojood hai" kaafi nahi (bootloader 0x1000 + partitions 0x8000
+    # + boot_app0 0xe000 + app 0x10000 se neeche kuch nahi ho sakta).
+    if os.path.getsize(out) < 0x10000 + 1024:
+        raise RuntimeError("merge_bin: output na-mukammal (size %d): %s"
+                           % (os.path.getsize(out), out))
     print("merge_bin: wrote %s" % out)
 
 

@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Windows;
 using System.Windows.Data;
 using System.Windows.Media;
+using RSH.App.Resources;
 using Wpf.Ui.Controls;
 
 namespace RSH.App.Controls;
@@ -74,11 +75,18 @@ public sealed class SteeringPercentConverter : IValueConverter
 /// <summary>
 /// F12: capture chal raha ho to button ka label "Stop capture", warna
 /// ConverterParameter mein diya gaya shuru label.
+/// Phase F i18n: parameter ab resx KEY hai (misal "StartRangeCapture"),
+/// kham English text nahi — label resx se aata hai. (Purana kham text
+/// bhi kaam karega: UiStrings.GetString missing key par wahi text lotata hai.)
+/// Note: converter sirf Capturing* badalne par chalta hai — language switch
+/// par ye do labels agle capture toggle / page revisit par badalte hain.
 /// </summary>
 public sealed class CaptureButtonTextConverter : IValueConverter
 {
     public object Convert(object value, Type targetType, object parameter, CultureInfo culture) =>
-        value is true ? "Stop capture" : parameter as string ?? "Start capture";
+        value is true
+            ? UiStrings.GetString("StopCapture")
+            : UiStrings.GetString(parameter as string ?? "StartRangeCapture");
 
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture) =>
         throw new NotSupportedException();

@@ -1,0 +1,1072 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+    <xsd:import namespace="http://www.w3.org/XML/1998/namespace" />
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="metadata">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" />
+              </xsd:sequence>
+              <xsd:attribute name="name" use="required" type="xsd:string" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="assembly">
+            <xsd:complexType>
+              <xsd:attribute name="alias" type="xsd:string" />
+              <xsd:attribute name="name" type="xsd:string" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="NavDashboard" xml:space="preserve">
+    <value>डैशबोर्ड</value>
+  </data>
+  <data name="NavTuning" xml:space="preserve">
+    <value>ट्यूनिंग</value>
+  </data>
+  <data name="NavSetup" xml:space="preserve">
+    <value>सेटअप</value>
+  </data>
+  <data name="NavButtons" xml:space="preserve">
+    <value>बटन</value>
+  </data>
+  <data name="NavOutput" xml:space="preserve">
+    <value>आउटपुट</value>
+  </data>
+  <data name="NavProfiles" xml:space="preserve">
+    <value>प्रोफ़ाइल</value>
+  </data>
+  <data name="NavMonitor" xml:space="preserve">
+    <value>मॉनिटर</value>
+  </data>
+  <data name="NavSettings" xml:space="preserve">
+    <value>सेटिंग्स</value>
+  </data>
+  <data name="PageDashboard" xml:space="preserve">
+    <value>डैशबोर्ड</value>
+  </data>
+  <data name="PageTuning" xml:space="preserve">
+    <value>ट्यूनिंग</value>
+  </data>
+  <data name="PageSetup" xml:space="preserve">
+    <value>सेटअप</value>
+  </data>
+  <data name="PageButtons" xml:space="preserve">
+    <value>बटन</value>
+  </data>
+  <data name="PageOutput" xml:space="preserve">
+    <value>आउटपुट</value>
+  </data>
+  <data name="PageProfiles" xml:space="preserve">
+    <value>प्रोफ़ाइल</value>
+  </data>
+  <data name="PageMonitor" xml:space="preserve">
+    <value>मॉनिटर</value>
+  </data>
+  <data name="PageSettings" xml:space="preserve">
+    <value>सेटिंग्स</value>
+  </data>
+  <data name="GameOutput" xml:space="preserve">
+    <value>गेम आउटपुट</value>
+  </data>
+  <data name="RestartWheel" xml:space="preserve">
+    <value>व्हील पुनः आरंभ करें</value>
+  </data>
+  <data name="StartSetup" xml:space="preserve">
+    <value>सेटअप शुरू करें</value>
+  </data>
+  <data name="OpenSetup" xml:space="preserve">
+    <value>सेटअप खोलें</value>
+  </data>
+  <data name="Dismiss" xml:space="preserve">
+    <value>खारिज करें</value>
+  </data>
+  <data name="RecalibrateNow" xml:space="preserve">
+    <value>अभी पुनः कैलिब्रेट करें</value>
+  </data>
+  <data name="Launch" xml:space="preserve">
+    <value>लॉन्च करें</value>
+  </data>
+  <data name="Stop" xml:space="preserve">
+    <value>रोकें</value>
+  </data>
+  <data name="GameLauncher" xml:space="preserve">
+    <value>गेम लॉन्चर</value>
+  </data>
+  <data name="ConnectWifi" xml:space="preserve">
+    <value>व्हील वाई-फ़ाई से जुड़ें</value>
+  </data>
+  <data name="Retry" xml:space="preserve">
+    <value>पुनः प्रयास करें</value>
+  </data>
+  <data name="RefreshPinTable" xml:space="preserve">
+    <value>पिन तालिका ताज़ा करें</value>
+  </data>
+  <data name="Back" xml:space="preserve">
+    <value>पीछे</value>
+  </data>
+  <data name="Restart" xml:space="preserve">
+    <value>पुनः आरंभ करें</value>
+  </data>
+  <data name="Linear" xml:space="preserve">
+    <value>रैखिक</value>
+  </data>
+  <data name="Progressive" xml:space="preserve">
+    <value>प्रगतिशील</value>
+  </data>
+  <data name="TestPattern" xml:space="preserve">
+    <value>पैटर्न जाँचें</value>
+  </data>
+  <data name="LedPattern" xml:space="preserve">
+    <value>पैटर्न</value>
+  </data>
+  <data name="LedBrightness" xml:space="preserve">
+    <value>चमक</value>
+  </data>
+  <data name="Activate" xml:space="preserve">
+    <value>सक्रिय करें</value>
+  </data>
+  <data name="Duplicate" xml:space="preserve">
+    <value>प्रतिलिपि बनाएँ</value>
+  </data>
+  <data name="Export" xml:space="preserve">
+    <value>निर्यात करें…</value>
+  </data>
+  <data name="Import" xml:space="preserve">
+    <value>आयात करें…</value>
+  </data>
+  <data name="Delete" xml:space="preserve">
+    <value>हटाएँ</value>
+  </data>
+  <data name="CreateProfile" xml:space="preserve">
+    <value>प्रोफ़ाइल बनाएँ</value>
+  </data>
+  <data name="AddGtPreset" xml:space="preserve">
+    <value>GT 540° प्रीसेट जोड़ें</value>
+  </data>
+  <data name="AddF1Preset" xml:space="preserve">
+    <value>F1 360° प्रीसेट जोड़ें</value>
+  </data>
+  <data name="ExportDiagnostics" xml:space="preserve">
+    <value>निदान निर्यात करें (.zip)</value>
+  </data>
+  <data name="OpenLogsFolder" xml:space="preserve">
+    <value>लॉग फ़ोल्डर खोलें</value>
+  </data>
+  <data name="Refresh" xml:space="preserve">
+    <value>ताज़ा करें</value>
+  </data>
+  <data name="ApplyPinMap" xml:space="preserve">
+    <value>पिन मानचित्र लागू करें</value>
+  </data>
+  <data name="Reset" xml:space="preserve">
+    <value>रीसेट करें</value>
+  </data>
+  <data name="BackupNow" xml:space="preserve">
+    <value>अभी बैकअप लें</value>
+  </data>
+  <data name="Restore" xml:space="preserve">
+    <value>पुनर्स्थापित करें…</value>
+  </data>
+  <data name="OpenConfigFolder" xml:space="preserve">
+    <value>कॉन्फ़िग फ़ोल्डर खोलें</value>
+  </data>
+  <data name="ChangeWheelPassword" xml:space="preserve">
+    <value>व्हील पासवर्ड बदलें…</value>
+  </data>
+  <data name="RunSetupWizard" xml:space="preserve">
+    <value>सेटअप विज़ार्ड फिर से चलाएँ</value>
+  </data>
+  <data name="Modules" xml:space="preserve">
+    <value>मॉड्यूल</value>
+  </data>
+  <data name="GpioPins" xml:space="preserve">
+    <value>GPIO पिन</value>
+  </data>
+  <data name="Appearance" xml:space="preserve">
+    <value>दिखावट</value>
+  </data>
+  <data name="Data" xml:space="preserve">
+    <value>डेटा</value>
+  </data>
+  <data name="Connected" xml:space="preserve">
+    <value>जुड़ा हुआ</value>
+  </data>
+  <data name="NotConnected" xml:space="preserve">
+    <value>जुड़ा नहीं है</value>
+  </data>
+  <data name="Cancel" xml:space="preserve">
+    <value>रद्द करें</value>
+  </data>
+  <data name="Close" xml:space="preserve">
+    <value>बंद करें</value>
+  </data>
+  <data name="Next" xml:space="preserve">
+    <value>आगे</value>
+  </data>
+  <data name="SkipWizard" xml:space="preserve">
+    <value>विज़ार्ड छोड़ें</value>
+  </data>
+  <data name="CalibStep1CentreWheelPress" xml:space="preserve">
+    <value>1. व्हील को केंद्र में रखें, दबाएँ</value>
+  </data>
+  <data name="WizardStep1VJoyCheck" xml:space="preserve">
+    <value>1. vJoy ड्राइवर जाँच</value>
+  </data>
+  <data name="CalibStep2Press" xml:space="preserve">
+    <value>. 2. दबाएँ</value>
+  </data>
+  <data name="WizardStep2WifiConnect" xml:space="preserve">
+    <value>2. वाई-फ़ाई कनेक्ट — स्वचालित</value>
+  </data>
+  <data name="WizardStep3WiringCheck" xml:space="preserve">
+    <value>3. वायरिंग जाँच (पिन)</value>
+  </data>
+  <data name="WizardStep4FirmwareUpdate" xml:space="preserve">
+    <value>4. फ़र्मवेयर अपडेट (वैकल्पिक)</value>
+  </data>
+  <data name="Rotation540SuitsGtCars" xml:space="preserve">
+    <value>540° GT कारों के लिए, 900° सड़क कारों के लिए है। गेम में यही संख्या होनी चाहिए।</value>
+  </data>
+  <data name="WizardStep5SteeringCalibration" xml:space="preserve">
+    <value>5. स्टीयरिंग कैलिब्रेशन — स्वचालित</value>
+  </data>
+  <data name="WizardStep6PedalCalibration" xml:space="preserve">
+    <value>6. पैडल कैलिब्रेशन — स्वचालित</value>
+  </data>
+  <data name="WizardStep7ButtonOutputTest" xml:space="preserve">
+    <value>7. बटन और आउटपुट जाँच</value>
+  </data>
+  <data name="AButtonHasNoTravel" xml:space="preserve">
+    <value>बटन की कोई यात्रा नहीं होती, इसलिए ट्यून करने के लिए कोई वक्र या डेडज़ोन नहीं है। हॉर्न बटन Buttons स्क्रीन पर असाइन करें।</value>
+  </data>
+  <data name="About" xml:space="preserve">
+    <value>के बारे में</value>
+  </data>
+  <data name="Accel" xml:space="preserve">
+    <value> · एक्सेल </value>
+  </data>
+  <data name="AccelBtnLabel" xml:space="preserve">
+    <value> · एक्सेल बटन: </value>
+  </data>
+  <data name="AccelButton" xml:space="preserve">
+    <value>एक्सेल बटन</value>
+  </data>
+  <data name="AccelLabel" xml:space="preserve">
+    <value>एक्सेल: </value>
+  </data>
+  <data name="Accelerator" xml:space="preserve">
+    <value>एक्सेलरेटर</value>
+  </data>
+  <data name="Accelerator2" xml:space="preserve">
+    <value>एक्सेलरेटर </value>
+  </data>
+  <data name="AcceleratorLabel" xml:space="preserve">
+    <value>एक्सेलरेटर: </value>
+  </data>
+  <data name="AcceleratorRaw" xml:space="preserve">
+    <value>एक्सेलरेटर (कच्चा)</value>
+  </data>
+  <data name="ActiveRulesGameProcessProfile" xml:space="preserve">
+    <value>सक्रिय नियम (गेम प्रक्रिया → प्रोफ़ाइल)</value>
+  </data>
+  <data name="AllVJoyButtonsPressTo" xml:space="preserve">
+    <value>सभी vJoy बटन — जाँचने के लिए दबाएँ</value>
+  </data>
+  <data name="AnOffModuleNeverReaches" xml:space="preserve">
+    <value>बंद मॉड्यूल गेम तक नहीं पहुँचता — असंबद्ध पिनों से कोई गलत रीडिंग नहीं।</value>
+  </data>
+  <data name="AnalogPedalAndButtonCombine" xml:space="preserve">
+    <value>एनालॉग पैडल और बटन मिल जाते हैं — अधिक मान जीतता है।</value>
+  </data>
+  <data name="AndStillForTwoSeconds" xml:space="preserve">
+    <value>और दो सेकंड तक स्थिर रखें — केंद्र स्वयं सेट हो जाता है।</value>
+  </data>
+  <data name="Apply" xml:space="preserve">
+    <value>लागू करें</value>
+  </data>
+  <data name="ApplyDevice" xml:space="preserve">
+    <value>डिवाइस लागू करें</value>
+  </data>
+  <data name="AutoSwitchProfilePerGame" xml:space="preserve">
+    <value>प्रति गेम स्वचालित प्रोफ़ाइल बदलें</value>
+  </data>
+  <data name="ResumeAutoSwitch" xml:space="preserve">
+    <value>स्वचालित बदलाव फिर से शुरू करें</value>
+  </data>
+  <data name="UseCurrentCar" xml:space="preserve">
+    <value>वर्तमान कार उपयोग करें</value>
+  </data>
+  <data name="AxesAndButtons" xml:space="preserve">
+    <value>अक्ष और बटन</value>
+  </data>
+  <data name="Bin" xml:space="preserve">
+    <value>.bin</value>
+  </data>
+  <data name="BrakeFrag" xml:space="preserve">
+    <value> · ब्रेक </value>
+  </data>
+  <data name="Brake" xml:space="preserve">
+    <value>ब्रेक</value>
+  </data>
+  <data name="BrakeSpace" xml:space="preserve">
+    <value>ब्रेक </value>
+  </data>
+  <data name="BrakeBtnLabel" xml:space="preserve">
+    <value> · ब्रेक बटन: </value>
+  </data>
+  <data name="BrakeButton" xml:space="preserve">
+    <value>ब्रेक बटन</value>
+  </data>
+  <data name="BrakeLabel" xml:space="preserve">
+    <value>ब्रेक: </value>
+  </data>
+  <data name="BrakeRaw" xml:space="preserve">
+    <value>ब्रेक (कच्चा)</value>
+  </data>
+  <data name="ButtonsMaskLabel" xml:space="preserve">
+    <value>बटन मास्क: </value>
+  </data>
+  <data name="ButtonsPressed0" xml:space="preserve">
+    <value>दबाए गए बटन: 0</value>
+  </data>
+  <data name="ButtonsPressedLabel" xml:space="preserve">
+    <value>दबाए गए बटन: </value>
+  </data>
+  <data name="CalibrateYourWheelAndPedals" xml:space="preserve">
+    <value>अपने व्हील और पैडल कैलिब्रेट करें। निर्देशित, लगभग 1 मिनट लगता है।</value>
+  </data>
+  <data name="Calibration" xml:space="preserve">
+    <value>कैलिब्रेशन</value>
+  </data>
+  <data name="CaptureCentre" xml:space="preserve">
+    <value>केंद्र सहेजें</value>
+  </data>
+  <data name="Centre" xml:space="preserve">
+    <value> · केंद्र </value>
+  </data>
+  <data name="CentreLabel" xml:space="preserve">
+    <value>केंद्र: </value>
+  </data>
+  <data name="ChangeTheMappingOnThe" xml:space="preserve">
+    <value>बटन स्क्रीन पर मैपिंग बदलें।</value>
+  </data>
+  <data name="ChangesSaveAutomaticallyToThis" xml:space="preserve">
+    <value>बदलाव इस प्रोफ़ाइल में स्वचालित रूप से सहेजे जाते हैं।</value>
+  </data>
+  <data name="ChangesTheBoardSWi" xml:space="preserve">
+    <value>बोर्ड का वाई-फ़ाई / WebOTA पासवर्ड बदलता है। इसके बाद बोर्ड अपना एक्सेस पॉइंट पुनः आरंभ करता है।</value>
+  </data>
+  <data name="CheckTheWiringTheBoard" xml:space="preserve">
+    <value>बोर्ड द्वारा बताई गई वायरिंग देखें। यहाँ पिन केवल पढ़ने के लिए हैं — उन्हें Settings → GPIO pins में बदलें।</value>
+  </data>
+  <data name="Checking" xml:space="preserve">
+    <value>जाँच हो रही है…</value>
+  </data>
+  <data name="CheckingVJoyConfiguration" xml:space="preserve">
+    <value>vJoy कॉन्फ़िगरेशन जाँचा जा रहा है…</value>
+  </data>
+  <data name="ChooseBin" xml:space="preserve">
+    <value>.bin चुनें…</value>
+  </data>
+  <data name="ClearCalibration" xml:space="preserve">
+    <value>कैलिब्रेशन साफ़ करें</value>
+  </data>
+  <data name="CloseButtonHidesToTray" xml:space="preserve">
+    <value>बंद बटन ट्रे में छिपाता है</value>
+  </data>
+  <data name="ConfigFolderLabel" xml:space="preserve">
+    <value>कॉन्फ़िग फ़ोल्डर: </value>
+  </data>
+  <data name="ConnectAutomatically" xml:space="preserve">
+    <value>स्वचालित रूप से जुड़ें</value>
+  </data>
+  <data name="ConnectThisPCToThe" xml:space="preserve">
+    <value>इस PC को RSH WiFi से जोड़ें।</value>
+  </data>
+  <data name="ConnectToRSH" xml:space="preserve">
+    <value>RSH से जुड़ें</value>
+  </data>
+  <data name="ConnectToYourWheel" xml:space="preserve">
+    <value>अपने व्हील से जुड़ें</value>
+  </data>
+  <data name="ConnectYourWheelCheckThe" xml:space="preserve">
+    <value>अपना व्हील जोड़ें, वायरिंग देखें, फिर कैलिब्रेट करें — लगभग एक मिनट।</value>
+  </data>
+  <data name="Connection" xml:space="preserve">
+    <value>कनेक्शन</value>
+  </data>
+  <data name="CopiesTheActiveProfileAt" xml:space="preserve">
+    <value>सक्रिय प्रोफ़ाइल की प्रतिलिपि छोटी घूर्णन पर बनाता है।</value>
+  </data>
+  <data name="Create" xml:space="preserve">
+    <value>बनाएँ</value>
+  </data>
+  <data name="CumulativeEncoderCountsFromThe" xml:space="preserve">
+    <value>व्हील से संचयी एन्कोडर गणना (प्रोटोकॉल v2.1)। एन्कोडर असाइनमेंट Tuning → Encoders में कॉन्फ़िगर किया जाता है।</value>
+  </data>
+  <data name="CurrentGateLabel" xml:space="preserve">
+    <value>वर्तमान गेट: </value>
+  </data>
+  <data name="CurrentVJoyButtonMaskLabel" xml:space="preserve">
+    <value>वर्तमान vJoy बटन मास्क: </value>
+  </data>
+  <data name="DeadCentre" xml:space="preserve">
+    <value>बिल्कुल केंद्र</value>
+  </data>
+  <data name="Deadzone" xml:space="preserve">
+    <value>डेड ज़ोन</value>
+  </data>
+  <data name="Detail" xml:space="preserve">
+    <value>विवरण</value>
+  </data>
+  <data name="DeviceStatus" xml:space="preserve">
+    <value>डिवाइस स्थिति</value>
+  </data>
+  <data name="DigitalPedalRamp" xml:space="preserve">
+    <value>डिजिटल पैडल रैंप</value>
+  </data>
+  <data name="DonTForceItPast" xml:space="preserve">
+    <value>• इसे स्टॉप से आगे ज़बरदस्ती न धकेलें।</value>
+  </data>
+  <data name="EGAssettoCorsa" xml:space="preserve">
+    <value>जैसे AssettoCorsa</value>
+  </data>
+  <data name="EGAssettoCorsaGT3" xml:space="preserve">
+    <value>जैसे Assetto Corsa — GT3</value>
+  </data>
+  <data name="ESP32DevKitV1WiringAnalog" xml:space="preserve">
+    <value>ESP32 DevKit V1 वायरिंग। एनालॉग इनपुट के लिए ADC1 पिन (32, 33, 34, 35, 36, 39) चाहिए। बोर्ड अपनी वायरिंग स्वयं रखता है — यह मानचित्र Setup → Pins में दिखाया जाता है।</value>
+  </data>
+  <data name="Encoder1" xml:space="preserve">
+    <value>एन्कोडर 1: —</value>
+  </data>
+  <data name="Encoder1Label" xml:space="preserve">
+    <value>एन्कोडर 1: </value>
+  </data>
+  <data name="Encoder2" xml:space="preserve">
+    <value>एन्कोडर 2: —</value>
+  </data>
+  <data name="Encoder2Label" xml:space="preserve">
+    <value> · एन्कोडर 2: </value>
+  </data>
+  <data name="Encoder3Label" xml:space="preserve">
+    <value>एन्कोडर 3: </value>
+  </data>
+  <data name="Encoder4Label" xml:space="preserve">
+    <value> · एन्कोडर 4: </value>
+  </data>
+  <data name="EncodersLive" xml:space="preserve">
+    <value>एन्कोडर (लाइव)</value>
+  </data>
+  <data name="Endpoints" xml:space="preserve">
+    <value>अंतिम सीमाएँ</value>
+  </data>
+  <data name="EndpointsComeFromCalibrationAdjust" xml:space="preserve">
+    <value>अंतिम सीमाएँ कैलिब्रेशन से आती हैं — उन्हें Setup में समायोजित करें।</value>
+  </data>
+  <data name="Engine" xml:space="preserve">
+    <value>इंजन</value>
+  </data>
+  <data name="Engine200HzPipeline" xml:space="preserve">
+    <value>इंजन (200 Hz पाइपलाइन)</value>
+  </data>
+  <data name="EveryVJoyButton132" xml:space="preserve">
+    <value>हर vJoy बटन 1–32 दबाने पर जलता है। आउटलाइन वाले बटन असाइन किए गए गियर बटन हैं।</value>
+  </data>
+  <data name="ExitFullyFromTheTray" xml:space="preserve">
+    <value>ट्रे मेनू से पूरी तरह बाहर निकलें।</value>
+  </data>
+  <data name="ForAMomentThenPress" xml:space="preserve">
+    <value>एक क्षण के लिए, फिर प्रत्येक को दबाएँ</value>
+  </data>
+  <data name="Fully" xml:space="preserve">
+    <value>पूरी तरह</value>
+  </data>
+  <data name="Function" xml:space="preserve">
+    <value>फ़ंक्शन</value>
+  </data>
+  <data name="GameProcessName" xml:space="preserve">
+    <value>गेम प्रक्रिया का नाम</value>
+  </data>
+  <data name="GamesCannotSeeTheWheel" xml:space="preserve">
+    <value>जब तक vJoy ड्राइवर इंस्टॉल न हो, गेम व्हील को नहीं देख सकते। BrunnerInnovation vJoy v2.2.2.0 इंस्टॉल करें, फिर RSH पुनः आरंभ करें।</value>
+  </data>
+  <data name="GamesReadA" xml:space="preserve">
+    <value>गेम पढ़ते हैं एक</value>
+  </data>
+  <data name="GateModeFollowsTheWheel" xml:space="preserve">
+    <value>गेट मोड व्हील की वायरिंग (GET_CAPS) के अनुसार है। Sequential / H-pattern के लिए अभी कोई ऐप सेटिंग नहीं है।</value>
+  </data>
+  <data name="GateTest" xml:space="preserve">
+    <value>गेट जाँच</value>
+  </data>
+  <data name="GearAndPedalButtonsMapped" xml:space="preserve">
+    <value>गियर और पैडल बटन, vJoy से मैप किए गए।</value>
+  </data>
+  <data name="GearButtonsVJoy" xml:space="preserve">
+    <value>गियर बटन → vJoy</value>
+  </data>
+  <data name="GearDown" xml:space="preserve">
+    <value>गियर नीचे</value>
+  </data>
+  <data name="GearDownLabel" xml:space="preserve">
+    <value> · गियर नीचे: </value>
+  </data>
+  <data name="GearDownVJoyButton" xml:space="preserve">
+    <value> · गियर नीचे → vJoy बटन </value>
+  </data>
+  <data name="GearDownVJoyButtonNumber" xml:space="preserve">
+    <value>गियर नीचे vJoy बटन संख्या</value>
+  </data>
+  <data name="GearDownVJoyButtonNumber2" xml:space="preserve">
+    <value>गियर नीचे → vJoy बटन संख्या</value>
+  </data>
+  <data name="GearUp" xml:space="preserve">
+    <value>गियर ऊपर</value>
+  </data>
+  <data name="GearUpAndDownShare" xml:space="preserve">
+    <value>गियर ऊपर और नीचे एक ही बटन साझा करते हैं — अलग संख्याएँ उपयोग करें।</value>
+  </data>
+  <data name="GearUpLabel" xml:space="preserve">
+    <value>गियर ऊपर: </value>
+  </data>
+  <data name="GearUpVJoy1Gear" xml:space="preserve">
+    <value>गियर ऊपर → vJoy 1 · गियर नीचे → vJoy 2 · बटन 1–32 लाइव</value>
+  </data>
+  <data name="GearUpVJoyButton" xml:space="preserve">
+    <value>गियर ऊपर → vJoy बटन </value>
+  </data>
+  <data name="GearUpVJoyButtonNumber" xml:space="preserve">
+    <value>गियर ऊपर vJoy बटन संख्या</value>
+  </data>
+  <data name="GearUpVJoyButtonNumber2" xml:space="preserve">
+    <value>गियर ऊपर → vJoy बटन संख्या</value>
+  </data>
+  <data name="GetVJoyDriver" xml:space="preserve">
+    <value>vJoy ड्राइवर प्राप्त करें</value>
+  </data>
+  <data name="HigherCalmerAtCentreLower" xml:space="preserve">
+    <value>अधिक = केंद्र पर शांत। कम = तेज़। 0 = रैखिक।</value>
+  </data>
+  <data name="HigherSteadierSlightlySlower" xml:space="preserve">
+    <value>अधिक = स्थिर, थोड़ा धीमा।</value>
+  </data>
+  <data name="HoldTheWheelByThe" xml:space="preserve">
+    <value>• व्हील को रिम से पकड़ें।</value>
+  </data>
+  <data name="Horn" xml:space="preserve">
+    <value>हॉर्न</value>
+  </data>
+  <data name="In" xml:space="preserve">
+    <value> में → </value>
+  </data>
+  <data name="InVJoyConfEnableAxesX" xml:space="preserve">
+    <value>vJoyConf में अक्ष X, Y, Z और 2+ बटन सक्षम करें।</value>
+  </data>
+  <data name="InYourGameBindThe" xml:space="preserve">
+    <value>अपने गेम में vJoy डिवाइस बाँधें। समाप्त — और चलाएँ।</value>
+  </data>
+  <data name="InstallTheBrunnerInnovationVJoyV2" xml:space="preserve">
+    <value>BrunnerInnovation vJoy v2.2.2.0 ड्राइवर एक बार इंस्टॉल करें।</value>
+  </data>
+  <data name="InvertAxis" xml:space="preserve">
+    <value>अक्ष उलटें</value>
+  </data>
+  <data name="KeepBothPedals" xml:space="preserve">
+    <value>दोनों पैडल रखें</value>
+  </data>
+  <data name="KeepPedalsReleasedBrieflyThen" xml:space="preserve">
+    <value>, पैडल को थोड़ी देर छोड़ा हुआ रखें, फिर प्रत्येक को पूरी तरह दबाएँ। रोकने के लिए फिर से दबाएँ।</value>
+  </data>
+  <data name="LEDTestLEDTESTNeeds" xml:space="preserve">
+    <value>LED जाँच (LED_TEST) के लिए सत्र कुंजी के साथ जुड़ा बोर्ड चाहिए। नीचे पैटर्न और चमक चुनें, फिर जाँच भेजें — स्ट्रिप उसे 5 सेकंड चलाएगी।</value>
+  </data>
+  <data name="Language" xml:space="preserve">
+    <value>भाषा</value>
+  </data>
+  <data name="LanguageNote" xml:space="preserve">
+    <value>तुरंत लागू होती है — पुनः आरंभ की आवश्यकता नहीं।</value>
+  </data>
+  <data name="LaunchingAGameActivatesIts" xml:space="preserve">
+    <value>गेम लॉन्च करने पर उसकी बाध्य प्रोफ़ाइल सक्रिय होती है। एक समय में एक गेम।</value>
+  </data>
+  <data name="LeaveTheWheel" xml:space="preserve">
+    <value>व्हील को छोड़ दें</value>
+  </data>
+  <data name="Link" xml:space="preserve">
+    <value>लिंक</value>
+  </data>
+  <data name="Live" xml:space="preserve">
+    <value>लाइव</value>
+  </data>
+  <data name="LiveAccel" xml:space="preserve">
+    <value>लाइव: एक्सेल </value>
+  </data>
+  <data name="LiveButtons" xml:space="preserve">
+    <value>लाइव बटन</value>
+  </data>
+  <data name="LiveLink" xml:space="preserve">
+    <value>लाइव लिंक</value>
+  </data>
+  <data name="LiveOutputWhatGamesSee" xml:space="preserve">
+    <value>लाइव आउटपुट — गेम क्या देखते हैं</value>
+  </data>
+  <data name="LiveReadingLabel" xml:space="preserve">
+    <value>लाइव रीडिंग: </value>
+  </data>
+  <data name="LiveResponse" xml:space="preserve">
+    <value>लाइव प्रतिक्रिया</value>
+  </data>
+  <data name="LiveSteeringLabel" xml:space="preserve">
+    <value>लाइव स्टीयरिंग: </value>
+  </data>
+  <data name="LiveSteps" xml:space="preserve">
+    <value>लाइव चरण</value>
+  </data>
+  <data name="LiveTest" xml:space="preserve">
+    <value>लाइव जाँच</value>
+  </data>
+  <data name="LiveValues" xml:space="preserve">
+    <value>लाइव मान</value>
+  </data>
+  <data name="LoadingPinTable" xml:space="preserve">
+    <value>पिन तालिका लोड हो रही है…</value>
+  </data>
+  <data name="LogLevel" xml:space="preserve">
+    <value>लॉग स्तर</value>
+  </data>
+  <data name="Logging" xml:space="preserve">
+    <value>लॉगिंग</value>
+  </data>
+  <data name="Logs" xml:space="preserve">
+    <value>लॉग</value>
+  </data>
+  <data name="LogsKeep7DaysIn" xml:space="preserve">
+    <value>लॉग 7 दिन तक कॉन्फ़िग फ़ोल्डर में रहते हैं।</value>
+  </data>
+  <data name="MaskLabel" xml:space="preserve">
+    <value> · मास्क: </value>
+  </data>
+  <data name="Max" xml:space="preserve">
+    <value> · अधिकतम </value>
+  </data>
+  <data name="MaxLabel" xml:space="preserve">
+    <value>अधिकतम: </value>
+  </data>
+  <data name="Min" xml:space="preserve">
+    <value>न्यूनतम </value>
+  </data>
+  <data name="MinLabel" xml:space="preserve">
+    <value>न्यूनतम: </value>
+  </data>
+  <data name="ModuleButtons" xml:space="preserve">
+    <value>व्हील बटन</value>
+  </data>
+  <data name="ModuleClutch" xml:space="preserve">
+    <value>क्लच</value>
+  </data>
+  <data name="ModuleEncoders" xml:space="preserve">
+    <value>एन्कोडर</value>
+  </data>
+  <data name="ModuleHandbrake" xml:space="preserve">
+    <value>हैंडब्रेक</value>
+  </data>
+  <data name="ModuleShifter" xml:space="preserve">
+    <value>शिफ़्टर</value>
+  </data>
+  <data name="ModuleSubAccelerator" xml:space="preserve">
+    <value>एनालॉग पैडल · vJoy Axis Y</value>
+  </data>
+  <data name="ModuleSubBrake" xml:space="preserve">
+    <value>एनालॉग पैडल · vJoy Axis Z</value>
+  </data>
+  <data name="ModuleSubButtons" xml:space="preserve">
+    <value>व्हील बटन · vJoy 1–32</value>
+  </data>
+  <data name="ModuleSubClutch" xml:space="preserve">
+    <value>एनालॉग पैडल · vJoy WClutch</value>
+  </data>
+  <data name="ModuleSubEncoders" xml:space="preserve">
+    <value>रोटरी एन्कोडर · संचयी चरण</value>
+  </data>
+  <data name="ModuleSubHandbrake" xml:space="preserve">
+    <value>एनालॉग लीवर · vJoy Slider</value>
+  </data>
+  <data name="ModuleSubHorn" xml:space="preserve">
+    <value>क्षणिक बटन</value>
+  </data>
+  <data name="ModuleSubLed" xml:space="preserve">
+    <value>स्थिति LED स्ट्रिप</value>
+  </data>
+  <data name="ModuleSubShifter" xml:space="preserve">
+    <value>डिजिटल गेट · Sequential / H-pattern</value>
+  </data>
+  <data name="ModuleSubSteering" xml:space="preserve">
+    <value>व्हील अक्ष · vJoy Axis X</value>
+  </data>
+  <data name="Ms" xml:space="preserve">
+    <value> ms</value>
+  </data>
+  <data name="NewProfileName" xml:space="preserve">
+    <value>नई प्रोफ़ाइल का नाम</value>
+  </data>
+  <data name="NextStep" xml:space="preserve">
+    <value>अगला चरण</value>
+  </data>
+  <data name="NoDataFor250Ms" xml:space="preserve">
+    <value>250 ms से कोई डेटा नहीं। सुरक्षा वॉचडॉग नियंत्रणों को केंद्र में रखे हुए है।</value>
+  </data>
+  <data name="NoDataWheelNotConnected" xml:space="preserve">
+    <value>कोई डेटा नहीं — व्हील जुड़ा नहीं है, लाइव मान अपडेट नहीं हो रहे हैं।</value>
+  </data>
+  <data name="NoDataWheelNotConnected2" xml:space="preserve">
+    <value>कोई डेटा नहीं — व्हील जुड़ा नहीं है। </value>
+  </data>
+  <data name="NoEncoderDataInThe" xml:space="preserve">
+    <value>वर्तमान स्ट्रीम में कोई एन्कोडर डेटा नहीं है — v1 स्ट्रीम में एन्कोडर नहीं होते।</value>
+  </data>
+  <data name="NoFileChosen" xml:space="preserve">
+    <value>कोई फ़ाइल नहीं चुनी गई</value>
+  </data>
+  <data name="NoInternetWhileOnRSH" xml:space="preserve">
+    <value>RSH पर रहते हुए इंटरनेट नहीं — सामान्य है।</value>
+  </data>
+  <data name="OTAPasswordLabel" xml:space="preserve">
+    <value>OTA पासवर्ड:</value>
+  </data>
+  <data name="OnOffSettings" xml:space="preserve">
+    <value>चालू/बंद: Settings।</value>
+  </data>
+  <data name="OneAtATimeAnd" xml:space="preserve">
+    <value>, एक समय में एक, और एक सेकंड थामे रखें। अंतिम सीमाएँ स्वयं सेट हो जाती हैं।</value>
+  </data>
+  <data name="OneProfilePerGameSelecting" xml:space="preserve">
+    <value>प्रति गेम एक प्रोफ़ाइल। चुनने पर यह सक्रिय होती है।</value>
+  </data>
+  <data name="OpenGameControllers" xml:space="preserve">
+    <value>गेम नियंत्रक खोलें</value>
+  </data>
+  <data name="OpenGameControllersJoyCpl" xml:space="preserve">
+    <value>गेम नियंत्रक खोलें (joy.cpl)</value>
+  </data>
+  <data name="OpenVJoyConf" xml:space="preserve">
+    <value>vJoyConf खोलें</value>
+  </data>
+  <data name="OpenVJoyConfigure" xml:space="preserve">
+    <value>vJoy Configure खोलें</value>
+  </data>
+  <data name="OptionalSendAFirmware" xml:space="preserve">
+    <value>वैकल्पिक। फ़र्मवेयर भेजें</value>
+  </data>
+  <data name="Out" xml:space="preserve">
+    <value> बाहर</value>
+  </data>
+  <data name="OutputNeutralLabel" xml:space="preserve">
+    <value>आउटपुट तटस्थ: </value>
+  </data>
+  <data name="PacketStats" xml:space="preserve">
+    <value>पैकेट आँकड़े</value>
+  </data>
+  <data name="Password" xml:space="preserve">
+    <value>पासवर्ड</value>
+  </data>
+  <data name="PatternsTheBoardSupportsOFF" xml:space="preserve">
+    <value>बोर्ड जिन पैटर्न का समर्थन करता है: OFF · SOLID · BLINK · CHASE · RAINBOW।</value>
+  </data>
+  <data name="Pedals" xml:space="preserve">
+    <value>पैडल</value>
+  </data>
+  <data name="PerGameAutoSwitch" xml:space="preserve">
+    <value>प्रति गेम स्वचालित बदलें</value>
+  </data>
+  <data name="Performance" xml:space="preserve">
+    <value>प्रदर्शन</value>
+  </data>
+  <data name="PickAModuleToTune" xml:space="preserve">
+    <value>ट्यून करने के लिए एक मॉड्यूल चुनें। बदलाव गेम में तुरंत लागू होते हैं।</value>
+  </data>
+  <data name="Pin" xml:space="preserve">
+    <value>पिन</value>
+  </data>
+  <data name="PowerTheWheelJoinIts" xml:space="preserve">
+    <value>व्हील को बिजली दें, उसके वाई-फ़ाई से जुड़ें, और पैकेट की प्रतीक्षा करें।</value>
+  </data>
+  <data name="PowerTheWheelOneClick" xml:space="preserve">
+    <value>व्हील को बिजली दें। एक क्लिक से यह PC जुड़ जाता है</value>
+  </data>
+  <data name="Press" xml:space="preserve">
+    <value>दबाएँ</value>
+  </data>
+  <data name="PressEachButtonOnceOutput" xml:space="preserve">
+    <value>प्रत्येक बटन एक बार दबाएँ। नीचे आउटपुट वही है जो गेम देखते हैं।</value>
+  </data>
+  <data name="PressRamp" xml:space="preserve">
+    <value>दबाने का रैंप</value>
+  </data>
+  <data name="Pressed" xml:space="preserve">
+    <value> दबाया गया</value>
+  </data>
+  <data name="ProcessNameOnlyNoExe" xml:space="preserve">
+    <value>केवल प्रक्रिया का नाम, .exe नहीं — Task Manager → Details देखें।</value>
+  </data>
+  <data name="ProcessedOutputWhatTheGame" xml:space="preserve">
+    <value>संसाधित आउटपुट (गेम को क्या मिलता है)</value>
+  </data>
+  <data name="ProfileLabel" xml:space="preserve">
+    <value>प्रोफ़ाइल: </value>
+  </data>
+  <data name="PulsesPerStepIsAssignment" xml:space="preserve">
+    <value>प्रति चरण पल्स असाइनमेंट है — इसे Settings में सेट करें।</value>
+  </data>
+  <data name="R" xml:space="preserve">
+    <value>R</value>
+  </data>
+  <data name="RSH" xml:space="preserve">
+    <value>RSH</value>
+  </data>
+  <data name="RSHRealSimHub" xml:space="preserve">
+    <value>RSH — Real Sim Hub</value>
+  </data>
+  <data name="RSHSetsItselfUpLabel" xml:space="preserve">
+    <value>RSH स्वयं सेटअप होता है:</value>
+  </data>
+  <data name="RSHSetup" xml:space="preserve">
+    <value>RSH Setup</value>
+  </data>
+  <data name="RangeFoundLabel" xml:space="preserve">
+    <value>सीमा मिली: </value>
+  </data>
+  <data name="RawLiveDataFromThe" xml:space="preserve">
+    <value>व्हील से कच्चा लाइव डेटा।</value>
+  </data>
+  <data name="RealSimHub" xml:space="preserve">
+    <value>Real Sim Hub</value>
+  </data>
+  <data name="ReleaseRamp" xml:space="preserve">
+    <value>छोड़ने का रैंप</value>
+  </data>
+  <data name="Released" xml:space="preserve">
+    <value>छोड़ा हुआ</value>
+  </data>
+  <data name="RemovesTinyShakeAtCentre" xml:space="preserve">
+    <value>केंद्र पर हल्की कंपन हटाता है। गेम का अपना डेडज़ोन 0 पर सेट करें।</value>
+  </data>
+  <data name="ResponseCurve" xml:space="preserve">
+    <value>प्रतिक्रिया वक्र</value>
+  </data>
+  <data name="RotationPresets" xml:space="preserve">
+    <value>घूर्णन प्रीसेट</value>
+  </data>
+  <data name="SaveCalibration" xml:space="preserve">
+    <value>कैलिब्रेशन सहेजें</value>
+  </data>
+  <data name="SavedToTheActiveProfile" xml:space="preserve">
+    <value>सक्रिय प्रोफ़ाइल में सहेजा गया।</value>
+  </data>
+  <data name="Sequence" xml:space="preserve">
+    <value>क्रम</value>
+  </data>
+  <data name="SetEachProfileSGame" xml:space="preserve">
+    <value>प्रत्येक प्रोफ़ाइल का गेम Profiles पृष्ठ पर सेट करें।</value>
+  </data>
+  <data name="SetYourWheelSReal" xml:space="preserve">
+    <value>अपने व्हील की वास्तविक स्टीयरिंग और पैडल सीमाएँ सेट करें।</value>
+  </data>
+  <data name="ShiftDown" xml:space="preserve">
+    <value>शिफ़्ट नीचे</value>
+  </data>
+  <data name="ShiftUp" xml:space="preserve">
+    <value>शिफ़्ट ऊपर</value>
+  </data>
+  <data name="Smoothing" xml:space="preserve">
+    <value>स्मूदिंग</value>
+  </data>
+  <data name="StartMinimisedToTray" xml:space="preserve">
+    <value>ट्रे में छोटा करके शुरू करें</value>
+  </data>
+  <data name="StartOver" xml:space="preserve">
+    <value>फिर से शुरू करें</value>
+  </data>
+  <data name="StartPedalCapture" xml:space="preserve">
+    <value>पैडल कैप्चर शुरू करें</value>
+  </data>
+  <data name="StartRangeCapture" xml:space="preserve">
+    <value>सीमा कैप्चर शुरू करें</value>
+  </data>
+  <data name="StartWithWindows" xml:space="preserve">
+    <value>Windows के साथ शुरू करें</value>
+  </data>
+  <data name="StartupTray" xml:space="preserve">
+    <value>स्टार्टअप और ट्रे</value>
+  </data>
+  <data name="StatusLED" xml:space="preserve">
+    <value>स्थिति LED</value>
+  </data>
+  <data name="Steering" xml:space="preserve">
+    <value>स्टीयरिंग</value>
+  </data>
+  <data name="SteeringLabel" xml:space="preserve">
+    <value>स्टीयरिंग: </value>
+  </data>
+  <data name="SteeringRange" xml:space="preserve">
+    <value>स्टीयरिंग सीमा</value>
+  </data>
+  <data name="SteeringRaw" xml:space="preserve">
+    <value>स्टीयरिंग (कच्चा)</value>
+  </data>
+  <data name="Step1Of7" xml:space="preserve">
+    <value>7 में से चरण 1</value>
+  </data>
+  <data name="StepsAdvanceOnTheirOwn" xml:space="preserve">
+    <value>चरण तैयार होने पर अपने आप आगे बढ़ते हैं।</value>
+  </data>
+  <data name="StopCapture" xml:space="preserve">
+    <value>कैप्चर रोकें</value>
+  </data>
+  <data name="SystemFollowsWindows" xml:space="preserve">
+    <value>सिस्टम Windows के अनुसार है।</value>
+  </data>
+  <data name="TheBoardSPerDevice" xml:space="preserve">
+    <value>बोर्ड का प्रति-डिवाइस पासवर्ड (पेयरिंग / पहली बूट से)। कभी डिफ़ॉल्ट नहीं।</value>
+  </data>
+  <data name="TheWheelIsNotSending" xml:space="preserve">
+    <value>व्हील अभी यह अक्ष नहीं भेज रहा है — ट्यूनिंग सहेजी गई है और जब व्हील बताएगा तो लागू होगी।</value>
+  </data>
+  <data name="TheWheelSWiFi" xml:space="preserve">
+    <value>व्हील का वाई-फ़ाई पता 192.168.4.1 (rsh.local) है। केवल निजी IPv4 पता स्वीकार किया जाता है।</value>
+  </data>
+  <data name="Theme" xml:space="preserve">
+    <value>थीम</value>
+  </data>
+  <data name="ThisAppOnYourPC" xml:space="preserve">
+    <value>यह ऐप आपके PC पर</value>
+  </data>
+  <data name="ThisModuleIsOffTurn" xml:space="preserve">
+    <value>यह मॉड्यूल बंद है। इसे Settings → Modules में चालू करें।</value>
+  </data>
+  <data name="Tips" xml:space="preserve">
+    <value>सुझाव</value>
+  </data>
+  <data name="ToTheWheelNow" xml:space="preserve">
+    <value>अभी व्हील को।</value>
+  </data>
+  <data name="TotalStepsLabel" xml:space="preserve">
+    <value>कुल चरण: </value>
+  </data>
+  <data name="TurnFullyLeftAndRight" xml:space="preserve">
+    <value>, पूरी तरह बाएँ और दाएँ घुमाएँ, रोकने के लिए फिर से दबाएँ।</value>
+  </data>
+  <data name="Type" xml:space="preserve">
+    <value>प्रकार</value>
+  </data>
+  <data name="UploadToWheel" xml:space="preserve">
+    <value>व्हील पर अपलोड करें</value>
+  </data>
+  <data name="UseUniqueNumbersFrom1" xml:space="preserve">
+    <value>1–32 में से अद्वितीय संख्याएँ उपयोग करें। बटन 33–128 इस ऐप में समर्थित नहीं हैं — वे अस्वीकार कर दिए जाते हैं, कभी 1–32 पर पुनः मैप नहीं किए जाते।</value>
+  </data>
+  <data name="VJoy" xml:space="preserve">
+    <value>vJoy</value>
+  </data>
+  <data name="VJoyDevice" xml:space="preserve">
+    <value>vJoy डिवाइस</value>
+  </data>
+  <data name="VJoyDeviceNumber" xml:space="preserve">
+    <value>vJoy डिवाइस संख्या</value>
+  </data>
+  <data name="VJoyDriverNotFound" xml:space="preserve">
+    <value>vJoy ड्राइवर नहीं मिला</value>
+  </data>
+  <data name="VJoyOutSteering" xml:space="preserve">
+    <value>vJoy आउट — स्टीयरिंग </value>
+  </data>
+  <data name="VirtualJoystick" xml:space="preserve">
+    <value>वर्चुअल जॉयस्टिक।</value>
+  </data>
+  <data name="WaitingForPackets" xml:space="preserve">
+    <value>पैकेट की प्रतीक्षा है…</value>
+  </data>
+  <data name="WelcomeToRSH" xml:space="preserve">
+    <value>RSH में स्वागत है</value>
+  </data>
+  <data name="WhatTheBoardReportsPins" xml:space="preserve">
+    <value>बोर्ड जो बताता है। यहाँ पिन केवल पढ़ने के लिए हैं — बदलने के लिए Settings → GPIO pins पर जाएँ।</value>
+  </data>
+  <data name="WheelAddress" xml:space="preserve">
+    <value>व्हील पता</value>
+  </data>
+  <data name="WheelButtons" xml:space="preserve">
+    <value>व्हील बटन</value>
+  </data>
+  <data name="WheelNotConnectedPowerThe" xml:space="preserve">
+    <value>व्हील जुड़ा नहीं है। व्हील को बिजली दें और RSH WiFi नेटवर्क से जुड़ें।</value>
+  </data>
+  <data name="WheelPassword" xml:space="preserve">
+    <value>व्हील पासवर्ड</value>
+  </data>
+  <data name="WheelWiFi" xml:space="preserve">
+    <value>व्हील वाई-फ़ाई</value>
+  </data>
+  <data name="WheelWiFiPassword" xml:space="preserve">
+    <value>व्हील वाई-फ़ाई पासवर्ड</value>
+  </data>
+  <data name="WhenAGameLaunchedFrom" xml:space="preserve">
+    <value>जब Dashboard से लॉन्च किया गया गेम बंद होता है, तो उसकी पिछली प्रोफ़ाइल स्वचालित रूप से बहाल हो जाती है।</value>
+  </data>
+  <data name="WiFi" xml:space="preserve">
+    <value>वाई-फ़ाई से।</value>
+  </data>
+  <data name="WiringPinTable" xml:space="preserve">
+    <value>वायरिंग — पिन तालिका</value>
+  </data>
+  <data name="WrittenToTheSparePartition" xml:space="preserve">
+    <value>पहले अतिरिक्त पार्टीशन पर लिखा जाता है — असफल अपलोड से कुछ नहीं बदलता।</value>
+  </data>
+  <data name="WrongDirectionLaterUseInvert" xml:space="preserve">
+    <value>• बाद में दिशा गलत हो? Tune में Invert steering उपयोग करें।</value>
+  </data>
+  <data name="YourProfiles" xml:space="preserve">
+    <value>आपकी प्रोफ़ाइल</value>
+  </data>
+</root>
