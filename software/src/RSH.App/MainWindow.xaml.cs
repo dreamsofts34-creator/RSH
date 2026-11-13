@@ -1,5 +1,7 @@
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
+using System.Windows.Data;
 using System.Windows.Media;
 using System.Windows.Threading;
 using RSH.App.Services;
@@ -25,15 +27,27 @@ public partial class MainWindow : FluentWindow
         _services = services;
         InitializeComponent();
 
-        // v2.0.2 diagnostic flag --classic-window: FluentWindow ka
-        // ExtendsContentIntoTitleBar chrome band karke plain WPF title
-        // bar use karo (WPF-UI #1594 jaisa blank-window case).
-        // WindowBackdropType ko nahi chherte — None hi rehta hai.
+        // v2.0.2 diagnostic flag --classic-window, v2.0.3 Win10 par
+        // AUTOMATIC: FluentWindow ka ExtendsContentIntoTitleBar chrome
+        // band karke plain WPF title bar use karo (WPF-UI #1594 jaisa
+        // blank-window case). TitleBar row ki height 0 + in-content
+        // TitleBar collapse — warna OS title bar + in-content TitleBar
+        // double dikhenge. WindowBackdropType ko nahi chherte — None hi
+        // rehta hai. Classic false ho (Win11+) to yahan kuch nahi hota.
         if (App.ClassicWindowRequested)
         {
             ExtendsContentIntoTitleBar = false;
-            Log.Information("Classic window chrome applied (ExtendsContentIntoTitleBar=False)");
+            TitleBarRow.Height = new GridLength(0);
+            WindowTitleBar.Visibility = Visibility.Collapsed;
+            Log.Information("Classic window chrome applied (ExtendsContentIntoTitleBar=False, TitleBar collapsed)");
         }
+
+        // v2.0.3 HOTFIX — Win10 par AUTOMATIC plain navigation (classic
+        // ke saath; user koi flag test nahi karega): sidebar ko
+        // original-style saada banao. --plain-nav force karta hai,
+        // --fluent-window isay bhi off karta hai. Classic se independent
+        // faisla hai — is liye alag if, classic block ke baad.
+        if (App.PlainNavigationRequested) ApplyPlainNavigation();
 
         Log.Information("Main window created (InitializeComponent done)");
 
@@ -103,6 +117,97 @@ public partial class MainWindow : FluentWindow
                 ShowNavigationFallback("Dashboard");
             }
         };
+    }
+
+    /// <summary>v2.0.3 HOTFIX — plain navigation: sidebar ko original-style
+    /// saada banao (literal text + system brushes + default RadioButton
+    /// style). UiStrings Content/Name bindings aur RSHNavStyle /
+    /// DynamicResource brushes hatao — Win10 blank-window ka doosra
+    /// suspect. 8/8 nav buttons rehte hain (Tag + Checked handler
+    /// barkarar — parity): sirf un ki presentation badalti hai.
+    /// Har step alag try/catch mein — ek element na mile to baaqi phir
+    /// bhi hon; poori method kabhi startup nahi todti.</summary>
+    private void ApplyPlainNavigation()
+    {
+        try
+        {
+            RadioButton[] navButtons = [NavDashboard, NavTuning, NavSetup, NavButtons, NavOutput, NavProfiles, NavMonitor, NavSettings];
+            foreach (var btn in navButtons)
+            {
+                try
+                {
+                    if (btn is null) continue;
+                    BindingOperations.ClearBinding(btn, ContentControl.ContentProperty);
+                    BindingOperations.ClearBinding(btn, AutomationProperties.NameProperty);
+                    if (btn.Tag is string tag)
+                    {
+                        btn.Content = tag;
+                        AutomationProperties.SetName(btn, tag);
+                    }
+                    btn.Style = null;
+                    btn.Foreground = SystemColors.ControlTextBrush;
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "Plain navigation: nav button {Button} could not be simplified — continuing", btn?.Name ?? "?");
+                }
+            }
+
+            try
+            {
+                if (SidebarBorder is not null)
+                {
+                    SidebarBorder.Background = SystemColors.WindowBrush;
+                    SidebarBorder.BorderBrush = SystemColors.ControlDarkBrush;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Plain navigation: sidebar brushes could not be simplified — continuing");
+            }
+
+            try
+            {
+                if (LogoBadge is not null)
+                    LogoBadge.Background = new SolidColorBrush(Color.FromRgb(0x6C, 0x4C, 0xF1));
+                if (LogoLetter is not null)
+                {
+                    LogoLetter.Text = "R";
+                    LogoLetter.Foreground = Brushes.White;
+                }
+                if (LogoTitle is not null)
+                {
+                    LogoTitle.Text = "RSH";
+                    LogoTitle.Foreground = SystemColors.ControlTextBrush;
+                }
+                if (LogoSubtitle is not null)
+                {
+                    LogoSubtitle.Text = "Real Sim Hub";
+                    LogoSubtitle.Foreground = SystemColors.ControlTextBrush;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Plain navigation: logo could not be simplified — continuing");
+            }
+
+            try
+            {
+                Background = SystemColors.WindowBrush;
+                FontFamily = new FontFamily("Segoe UI");
+                PageHost.ClearValue(Control.ForegroundProperty);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Plain navigation: window brushes could not be simplified — continuing");
+            }
+
+            Log.Information("Plain navigation applied (original-style sidebar, no UiStrings/DynamicResource bindings)");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Plain navigation failed — continuing with modern sidebar");
+        }
     }
 
     // UI-2: 8 screens, spec §0.2 order — har entry asal page hai

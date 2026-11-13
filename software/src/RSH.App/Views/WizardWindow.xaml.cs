@@ -4,6 +4,7 @@ using System.Text;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Threading;
+using Microsoft.Win32;
 using RSH.App.Services;
 using RSH.App.ViewModels;
 using RSH.Core.Firmware;
@@ -12,7 +13,8 @@ using RSH.Core.Output;
 using RSH.Core.Processing;
 using RSH.Output.HIDMaestro;
 using RSH.Output.VJoy;
-using Microsoft.Win32;
+using Serilog;
+using Wpf.Ui.Appearance;
 using Wpf.Ui.Controls;
 
 namespace RSH.App.Views;
@@ -69,6 +71,25 @@ public partial class WizardWindow : FluentWindow
     {
         _services = services;
         InitializeComponent();
+
+        // v2.0.3 HOTFIX — Win10 par AUTOMATIC classic window (MainWindow
+        // jaisa hi): FluentWindow ka ExtendsContentIntoTitleBar chrome
+        // band karke plain WPF title bar use karo, TitleBar row 0 +
+        // in-content TitleBar collapse (warna double title bar).
+        // Classic false ho (Win11+) to yahan kuch nahi hota.
+        if (App.ClassicWindowRequested)
+        {
+            ExtendsContentIntoTitleBar = false;
+            // Win10 par Mica unsupported hai — classic mode mein None
+            // karo, warna wizard ka background bhi paint nahi hota
+            // (WizardWindow.xaml mein WindowBackdropType="Mica" hai).
+            if (WindowBackdropType == WindowBackdropType.Mica)
+                WindowBackdropType = WindowBackdropType.None;
+            WizardTitleBarRow.Height = new GridLength(0);
+            WizardTitleBar.Visibility = Visibility.Collapsed;
+            Log.Information("Wizard classic window chrome applied (ExtendsContentIntoTitleBar=False, TitleBar collapsed)");
+        }
+
         StepPins.DataContext = ViewModelStore.Setup;
         _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
         _timer.Tick += (_, _) => RefreshStep();

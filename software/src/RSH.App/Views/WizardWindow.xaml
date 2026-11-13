@@ -8,13 +8,13 @@
         WindowStartupLocation="CenterOwner" ResizeMode="NoResize">
     <Grid>
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />
+            <RowDefinition x:Name="WizardTitleBarRow" Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <ui:TitleBar Grid.Row="0" Title="{Binding RSHSetup, Source={x:Static res:UiStrings.Instance}}" />
+        <ui:TitleBar x:Name="WizardTitleBar" Grid.Row="0" Title="{Binding RSHSetup, Source={x:Static res:UiStrings.Instance}}" />
         <StackPanel Grid.Row="1" Margin="28,10,28,0">
             <ui:TextBlock x:Name="StepTitle" Text="{Binding WelcomeToRSH, Source={x:Static res:UiStrings.Instance}}" FontTypography="Title" />
             <ui:TextBlock x:Name="StepCounter" Text="{Binding Step1Of7, Source={x:Static res:UiStrings.Instance}}" Appearance="Secondary" Margin="0,2,0,0" />

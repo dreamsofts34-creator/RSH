@@ -22,9 +22,21 @@ public partial class App : Application
 
     /// <summary>v2.0.2 diagnostic flag --classic-window: true ho to
     /// MainWindow FluentWindow chrome ke bajaye plain WPF title bar use
-    /// karta hai (ExtendsContentIntoTitleBar=False). Default false —
-    /// flag na ho to behaviour bilkul waisa hi jaisa pehle tha.</summary>
+    /// karta hai (ExtendsContentIntoTitleBar=False). v2.0.3: Win10
+    /// (build &lt; 22000) par AUTOMATIC true — flag ki zaroorat nahi;
+    /// --fluent-window isay override karke Fluent force karta hai.
+    /// Default Win11+ par false — behaviour bilkul waisa hi jaisa pehle tha.</summary>
     internal static bool ClassicWindowRequested { get; private set; }
+
+    /// <summary>v2.0.3 diagnostic flag --plain-nav: true ho to MainWindow
+    /// ki sidebar original-style saada hoti hai (literal text + system
+    /// brushes + default RadioButton style — UiStrings/DynamicResource
+    /// bindings nahi). Win10 (build &lt; 22000) par AUTOMATIC true —
+    /// classic chrome ke saath (user koi flag test nahi karega, is liye
+    /// Win10 par dono fallbacks ek saath auto ON); Win11+ par false.
+    /// --fluent-window dono ko off karta hai (poora modern UI).
+    /// Default Win11+ par false — behaviour bilkul waisa hi jaisa pehle tha.</summary>
+    internal static bool PlainNavigationRequested { get; private set; }
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -133,16 +145,47 @@ public partial class App : Application
         // --classic-window: FluentWindow chrome ke bajaye plain WPF
         // title bar (WPF-UI #1594 jaisa blank-window case) — flag
         // MainWindow tak static holder se pohchta hai.
+        // --plain-nav: sidebar original-style saada (literal text +
+        // system brushes, UiStrings/DynamicResource bindings nahi) —
+        // Win10 par auto ON (classic ke saath), flag bhi static
+        // holder se MainWindow tak pohchta hai.
         if (e.Args.Contains("--software-render"))
         {
             RenderOptions.ProcessRenderMode = RenderMode.SoftwareOnly;
             Log.Information("Software rendering requested (Render Tier: {Tier})", RenderCapability.Tier);
         }
-        if (e.Args.Contains("--classic-window"))
-        {
-            ClassicWindowRequested = true;
-            Log.Information("Classic window chrome requested");
-        }
+        // v2.0.3 HOTFIX — Win10 par AUTOMATIC classic window: FluentWindow +
+        // ExtendsContentIntoTitleBar Win10 (build < 22000) par paint nahi
+        // hota (blank window), jabke plain WPF window usi PC par render
+        // hoti hai — is liye Win10 par flag ke baghair hi classic; Win11
+        // par FluentWindow waisa hi. --classic-window force karta hai,
+        // --fluent-window (escape hatch) Fluent force karta hai.
+        // Non-Windows par classic=false (OS version sirf Windows par parho).
+        bool classicFlag = e.Args.Contains("--classic-window");
+        bool fluentFlag = e.Args.Contains("--fluent-window");
+        bool plainNavFlag = e.Args.Contains("--plain-nav");
+        Version osVersion = OperatingSystem.IsWindows()
+            ? Environment.OSVersion.Version
+            : new Version(0, 0);
+        ClassicWindowRequested = OperatingSystem.IsWindows()
+            && WindowChromePolicy.ShouldUseClassicWindow(osVersion, classicFlag, fluentFlag);
+        // v2.0.3 HOTFIX — Win10 par AUTOMATIC plain navigation: classic
+        // chrome ke saath sidebar bhi original-style saada ho (literal
+        // text + system brushes, UiStrings/DynamicResource bindings
+        // nahi) — user koi flag test nahi karega, is liye Win10 par
+        // dono fallbacks ek saath auto ON. Win11+ par modern sidebar
+        // waisa hi. --plain-nav force-on, --fluent-window dono ko off.
+        PlainNavigationRequested = OperatingSystem.IsWindows()
+            && WindowChromePolicy.ShouldUsePlainNavigation(osVersion, plainNavFlag, fluentFlag);
+        string chromeReason = OperatingSystem.IsWindows()
+            ? WindowChromePolicy.DescribeDecision(osVersion, ClassicWindowRequested)
+            : "non-Windows — classic window not applicable";
+        Log.Information("Window chrome: {Mode} (OS {OSVersion}, classic-flag={ClassicFlag}, fluent-flag={FluentFlag}, reason: {Reason})",
+            ClassicWindowRequested ? "classic window" : "FluentWindow",
+            osVersion, classicFlag, fluentFlag, chromeReason);
+        Log.Information("Navigation: {NavMode} (OS {OSVersion}, plain-nav-flag={PlainNavFlag}, fluent-flag={FluentFlag})",
+            PlainNavigationRequested ? "plain navigation (original-style sidebar)" : "modern navigation",
+            osVersion, plainNavFlag, fluentFlag);
 
         // (Purana unversioned single-instance + duplicate AppServices block
         // yahan tha — v2.0.2 mein upar versioned block se replace ho gaya;
