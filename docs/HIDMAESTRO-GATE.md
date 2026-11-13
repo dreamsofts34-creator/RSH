@@ -126,8 +126,10 @@ H-HID-4 (sleep/resume), H-HID-5 (MSIX), H-HID-6 (anti-cheat), H-HID-7
 
 ### Catalog discrepancy (verification mein mili)
 
-- Evaluation mein 337 profiles likhe thay; **asal v2.1.0 DLL 336 load
-  karta hai** (`LoadDefaultProfiles()` = 336 — test mein assert hai).
+- Evaluation mein 337 profiles likhe thay; **asal v2.1.0 DLL 336–337 load
+  karta hai** (ek sandbox measurement mein 336, GitHub Windows runner
+  par 337 — count environment par munhasir hai; test mein range assert
+  hai).
   `logitech-g29`: Buttons 25, Axes 4, `RequiresUsbipBackend` false.
 
 ## 5. H-HID-1..H-HID-8 checklist (Windows PC — sab NOT VERIFIED)
