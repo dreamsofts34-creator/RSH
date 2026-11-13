@@ -53,7 +53,10 @@ public class PhaseFWorkstream6Tests
     {
         string? path = FindRepoFile(relative);
         if (path is null) Assert.Skip($"Repo file nahi mili (test run ki layout alag hai): {relative}");
-        return File.ReadAllText(path);
+        // Windows checkout (autocrlf) CRLF deta hai, Linux LF — newline
+        // par mabni assertions (masalan "[JsonIgnore]\n    public ...")
+        // ke liye normalize karo, warna Windows runner par fail hota hai.
+        return File.ReadAllText(path).Replace("\r\n", "\n");
     }
 
     private static int CountOccurrences(string text, string needle, StringComparison comparison = StringComparison.OrdinalIgnoreCase)
