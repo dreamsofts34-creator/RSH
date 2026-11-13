@@ -1,0 +1,94 @@
+<UserControl x:Class="RSH.App.Views.Pages.ButtonsPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             xmlns:ctl="clr-namespace:RSH.App.Controls">
+    <UserControl.Resources>
+        <ctl:BoolToStatusBrushConverter x:Key="StatusBrush" />
+        <ctl:BoolToVisibilityConverter x:Key="BoolVis" />
+    </UserControl.Resources>
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="24" MaxWidth="980">
+            <ui:TextBlock Text="Buttons" FontTypography="Title" Margin="0,0,0,4" />
+            <ui:TextBlock Text="Gear and pedal buttons, mapped to vJoy."
+                          Appearance="Secondary" Margin="0,0,0,16" TextWrapping="Wrap" />
+
+            <ui:Card Padding="16" Margin="0,0,0,12">
+                <StackPanel>
+                    <ui:TextBlock Text="Gear buttons → vJoy" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="24" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0">
+                            <ui:TextBlock Text="Gear up → vJoy button number" Margin="0,0,0,4" />
+                            <ui:NumberBox Value="{Binding GearUpButton, Mode=TwoWay}" Minimum="1" Maximum="128" SpinButtonPlacementMode="Inline" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="2">
+                            <ui:TextBlock Text="Gear down → vJoy button number" Margin="0,0,0,4" />
+                            <ui:NumberBox Value="{Binding GearDownButton, Mode=TwoWay}" Minimum="1" Maximum="128" SpinButtonPlacementMode="Inline" />
+                        </StackPanel>
+                    </Grid>
+                    <ui:TextBlock Text="Use unique numbers within the vJoyConf button count."
+                                  Appearance="Secondary" Margin="0,8,0,0" TextWrapping="Wrap" />
+                    <!-- AUDIT FIX (F14): dono gear ek hi number par hon to
+                         fori warning — warna profile chup chaap save ho
+                         jata tha aur game mein dono gear ek button par
+                         girte thay. -->
+                    <ui:TextBlock Text="Gear up and down share one button — use different numbers."
+                                  Foreground="#F85149" Margin="0,8,0,0" TextWrapping="Wrap"
+                                  Visibility="{Binding GearButtonsConflict, Converter={StaticResource BoolVis}}" />
+                </StackPanel>
+            </ui:Card>
+
+            <ui:Card Padding="16" Margin="0,0,0,12">
+                <StackPanel>
+                    <ui:TextBlock Text="Digital pedal ramp" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="220" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="70" />
+                        </Grid.ColumnDefinitions>
+                        <ui:TextBlock Text="Press ramp" VerticalAlignment="Center" />
+                        <Slider Grid.Column="1" Minimum="0" Maximum="500" Value="{Binding PressMs, Mode=TwoWay}" VerticalAlignment="Center" Margin="12,0" />
+                        <ui:TextBlock Grid.Column="2" VerticalAlignment="Center"><Run Text="{Binding PressMs, StringFormat={}{0:F0}}" /><Run Text=" ms" /></ui:TextBlock>
+                    </Grid>
+                    <Grid Margin="0,8,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="220" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="70" />
+                        </Grid.ColumnDefinitions>
+                        <ui:TextBlock Text="Release ramp" VerticalAlignment="Center" />
+                        <Slider Grid.Column="1" Minimum="0" Maximum="500" Value="{Binding ReleaseMs, Mode=TwoWay}" VerticalAlignment="Center" Margin="12,0" />
+                        <ui:TextBlock Grid.Column="2" VerticalAlignment="Center"><Run Text="{Binding ReleaseMs, StringFormat={}{0:F0}}" /><Run Text=" ms" /></ui:TextBlock>
+                    </Grid>
+                    <ui:TextBlock Text="Analog pedal and button combine — higher value wins."
+                                  Appearance="Secondary" Margin="0,8,0,0" TextWrapping="Wrap" />
+                </StackPanel>
+            </ui:Card>
+
+            <ui:Card Padding="16">
+                <StackPanel>
+                    <ui:TextBlock Text="Live test" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <!-- AUDIT FIX (F9): WrapPanel — tang window par clip nahi hoti. -->
+                    <WrapPanel Margin="0,0,0,8">
+                        <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding GearUpPressed, Converter={StaticResource StatusBrush}}" />
+                        <ui:TextBlock Text="Gear up" Margin="6,0,20,0" VerticalAlignment="Center" />
+                        <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding GearDownPressed, Converter={StaticResource StatusBrush}}" />
+                        <ui:TextBlock Text="Gear down" Margin="6,0,20,0" VerticalAlignment="Center" />
+                        <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding AccelBtnPressed, Converter={StaticResource StatusBrush}}" />
+                        <ui:TextBlock Text="Accel button" Margin="6,0,20,0" VerticalAlignment="Center" />
+                        <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding BrakeBtnPressed, Converter={StaticResource StatusBrush}}" />
+                        <ui:TextBlock Text="Brake button" Margin="6,0,0,0" VerticalAlignment="Center" />
+                    </WrapPanel>
+                    <ui:TextBlock><Run Text="Current vJoy button mask: " /><Run Text="{Binding MaskText}" FontWeight="SemiBold" /></ui:TextBlock>
+                </StackPanel>
+            </ui:Card>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

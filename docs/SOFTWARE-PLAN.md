@@ -1,4 +1,4 @@
-# ApexLink — PC Software Plan (2026-11-10)
+# RSH — PC Software Plan (2026-11-10)
 
 Usool: research first (stack facts official sources se verify ho rahe hain),
 phir milestone-by-milestone build, har milestone ke apne tests. Firmware dumb,
@@ -16,19 +16,19 @@ bilkul waisa hi implement karega.
   published nahi — asal PC par test hoga.
 - xUnit tests; Simulator = ESP ki jagah UDP par wahi packets bhejne wala tool
 
-## Solution layout (docs 04, naam ApexLink)
+## Solution layout (docs 04, naam RSH)
 ```
 software/
-  ApexLink.sln
+  RSH.sln
   src/
-    ApexLink.Core/        net10.0 — protocol, CRC, transport, pipeline,
+    RSH.Core/        net10.0 — protocol, CRC, transport, pipeline,
                           processing, profiles, diagnostics (NO UI, NO vJoy)
-    ApexLink.Output.VJoy/ net10.0-windows — vJoy P/Invoke backend
-    ApexLink.App/         net10.0-windows — WPF GUI
+    RSH.Output.VJoy/ net10.0-windows — vJoy P/Invoke backend
+    RSH.App/         net10.0-windows — WPF GUI
   tools/
-    ApexLink.Simulator/   net10.0 console — fake ESP (auto/manual/replay)
+    RSH.Simulator/   net10.0 console — fake ESP (auto/manual/replay)
   tests/
-    ApexLink.Tests/       xUnit — Core ke tamam tests
+    RSH.Tests/       xUnit — Core ke tamam tests
 ```
 
 ## Pipeline (docs 02 section 6)
@@ -71,7 +71,7 @@ Extras: first-run wizard (vJoy check + calibration), global pause hotkey
 (optional), theme Windows ke sath, window state yaad rakhta hai.
 
 ## Data & stability rules
-- Profiles: %AppData%/ApexLink/profiles.json — atomic write (temp + replace)
+- Profiles: %AppData%/RSH/profiles.json — atomic write (temp + replace)
   + .bak backup; kharab file → backup se restore, warna defaults; app
   corrupt profile par band nahi hoga
 - Calibration profiles ke andar; har profile: calibration, deadzone, curve,
@@ -131,7 +131,7 @@ Extras: first-run wizard (vJoy check + calibration), global pause hotkey
 
 ## Performance budget (owner directive 2026-11-10 — low-end PCs par stable)
 Owner ka PC AMD A8-7600 (2014) hai; software halka hona lazmi hai.
-"Dawa nahi, number" — har release par `tools/ApexLink.Benchmarks`
+"Dawa nahi, number" — har release par `tools/RSH.Benchmarks`
 (Release build) chalega aur actual vs budget report mein ayega.
 
 | Halat | Budget |

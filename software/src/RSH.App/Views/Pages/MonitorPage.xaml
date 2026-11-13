@@ -1,0 +1,105 @@
+<UserControl x:Class="RSH.App.Views.Pages.MonitorPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+             xmlns:ctl="clr-namespace:RSH.App.Controls"
+             xmlns:sp="clr-namespace:ScottPlot.WPF;assembly=ScottPlot.WPF">
+    <UserControl.Resources>
+        <ctl:BoolToStatusBrushConverter x:Key="StatusBrush" />
+        <ctl:BoolToVisibilityConverter x:Key="BoolVis" />
+    </UserControl.Resources>
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="24" MaxWidth="980">
+            <ui:TextBlock Text="Input Monitor" FontTypography="Title" Margin="0,0,0,4" />
+            <ui:TextBlock Text="Raw live data from the wheel."
+                          Appearance="Secondary" Margin="0,0,0,16" TextWrapping="Wrap" />
+
+            <!-- AUDIT FIX (F11): pehle "koi data nahi" ki halat hi nazar
+                 nahi aati thi — raw values 0 bilkul asal data jese lagte
+                 thay. Ab banner bhi hai aur values ki jagah "—" hai. -->
+            <ui:Card Padding="16" Margin="0,0,0,12"
+                     Visibility="{Binding HasData, Converter={StaticResource BoolVis}, ConverterParameter=Invert}">
+                <ui:TextBlock TextWrapping="Wrap">
+                    <Run Text="No data — wheel not connected. " FontWeight="SemiBold" />
+                    <Run Text="Connect this PC to the RSH WiFi." />
+                </ui:TextBlock>
+            </ui:Card>
+
+            <ui:Card Padding="16" Margin="0,0,0,12">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0">
+                        <ui:TextBlock Text="Steering (raw)" Appearance="Secondary" />
+                        <Grid>
+                            <ui:TextBlock Text="{Binding RawSteering}" FontTypography="Title"
+                                          Visibility="{Binding HasData, Converter={StaticResource BoolVis}}" />
+                            <ui:TextBlock Text="—" FontTypography="Title"
+                                          Visibility="{Binding HasData, Converter={StaticResource BoolVis}, ConverterParameter=Invert}" />
+                        </Grid>
+                        <ui:TextBlock Text="{Binding SteeringModeText}" Appearance="Secondary"
+                                      Visibility="{Binding HasData, Converter={StaticResource BoolVis}}" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="1">
+                        <ui:TextBlock Text="Accelerator (raw)" Appearance="Secondary" />
+                        <Grid>
+                            <ui:TextBlock Text="{Binding RawAccel}" FontTypography="Title"
+                                          Visibility="{Binding HasData, Converter={StaticResource BoolVis}}" />
+                            <ui:TextBlock Text="—" FontTypography="Title"
+                                          Visibility="{Binding HasData, Converter={StaticResource BoolVis}, ConverterParameter=Invert}" />
+                        </Grid>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2">
+                        <ui:TextBlock Text="Brake (raw)" Appearance="Secondary" />
+                        <Grid>
+                            <ui:TextBlock Text="{Binding RawBrake}" FontTypography="Title"
+                                          Visibility="{Binding HasData, Converter={StaticResource BoolVis}}" />
+                            <ui:TextBlock Text="—" FontTypography="Title"
+                                          Visibility="{Binding HasData, Converter={StaticResource BoolVis}, ConverterParameter=Invert}" />
+                        </Grid>
+                    </StackPanel>
+                    <StackPanel Grid.Column="3">
+                        <ui:TextBlock Text="Sequence" Appearance="Secondary" />
+                        <Grid>
+                            <ui:TextBlock Text="{Binding Sequence}" FontTypography="Title"
+                                          Visibility="{Binding HasData, Converter={StaticResource BoolVis}}" />
+                            <ui:TextBlock Text="—" FontTypography="Title"
+                                          Visibility="{Binding HasData, Converter={StaticResource BoolVis}, ConverterParameter=Invert}" />
+                        </Grid>
+                    </StackPanel>
+                </Grid>
+            </ui:Card>
+
+            <ui:Card Padding="16" Margin="0,0,0,12">
+                <StackPanel>
+                    <ui:TextBlock Text="Wheel buttons" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <!-- AUDIT FIX (F9): WrapPanel — tang window par kataar
+                         clip nahi hoti, neeche wali line par aa jati hai. -->
+                    <WrapPanel>
+                        <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding GearUp, Converter={StaticResource StatusBrush}}" />
+                        <ui:TextBlock Text="Gear up" Margin="6,0,20,0" VerticalAlignment="Center" />
+                        <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding GearDown, Converter={StaticResource StatusBrush}}" />
+                        <ui:TextBlock Text="Gear down" Margin="6,0,20,0" VerticalAlignment="Center" />
+                        <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding AccelBtn, Converter={StaticResource StatusBrush}}" />
+                        <ui:TextBlock Text="Accel button" Margin="6,0,20,0" VerticalAlignment="Center" />
+                        <Ellipse Width="14" Height="14" VerticalAlignment="Center" Fill="{Binding BrakeBtn, Converter={StaticResource StatusBrush}}" />
+                        <ui:TextBlock Text="Brake button" Margin="6,0,0,0" VerticalAlignment="Center" />
+                    </WrapPanel>
+                    <ui:TextBlock Text="{Binding CountersText}" Appearance="Secondary" Margin="0,12,0,0" TextWrapping="Wrap" />
+                </StackPanel>
+            </ui:Card>
+
+            <ui:Card Padding="16">
+                <StackPanel>
+                    <ui:TextBlock Text="Processed output (what the game receives)" FontTypography="BodyStrong" Margin="0,0,0,8" />
+                    <sp:WpfPlot x:Name="LivePlot" Height="260" />
+                </StackPanel>
+            </ui:Card>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

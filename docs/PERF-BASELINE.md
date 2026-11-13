@@ -7,16 +7,16 @@
 ## A. App (Windows PC) — 3 commands
 
 1. **Engine + pipeline benchmark** (needs .NET 10 SDK):
-   `dotnet run -c Release --project software/tools/ApexLink.Benchmarks -- --soak-sec 600`
+   `dotnet run -c Release --project software/tools/RSH.Benchmarks -- --soak-sec 600`
    Copy the printed lines (Parse, Pipe, e2e loopback, soak memory).
 2. **Idle footprint** (run v1.2.2 as you normally use it, wheel connected if possible):
-   `powershell -ExecutionPolicy Bypass -File tools-perf\Measure-RSH.ps1 -ExePath "<path>\ApexLink.exe" -IdleSeconds 120`
+   `powershell -ExecutionPolicy Bypass -File tools-perf\Measure-RSH.ps1 -ExePath "<path>\RSH.exe" -IdleSeconds 120`
    Produces `perf-baseline-<time>.txt` (startup ms, idle CPU, memory, threads).
 3. **While driving/moving the wheel** (30 s): note Task Manager CPU % and whether any UI hitch/lag is visible on Dashboard/Monitor pages (yes/no).
 
 ## B. Firmware (real board)
 
-Set `APEXLINK_DEBUG 1` in `config.h`, flash, open serial monitor 115200 for 10 min with the app connected. Record from the 1 Hz line: `sent/s` (should be ≈200), `overrun` per window, `maxCycleUs`, steering std-dev. Put debug back to 0 afterwards.
+Set `RSH_DEBUG 1` in `config.h`, flash, open serial monitor 115200 for 10 min with the app connected. Record from the 1 Hz line: `sent/s` (should be ≈200), `overrun` per window, `maxCycleUs`, steering std-dev. Put debug back to 0 afterwards.
 
 ## C. Results table (fill in)
 

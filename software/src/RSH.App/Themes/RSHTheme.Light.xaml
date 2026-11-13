@@ -1,0 +1,21 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- RSH light palette (UI-1, spec §0.1). Theme-independent accent
+         family RSHTheme.xaml mein hai; yahan sirf woh brushes hain jo
+         theme ke saath badalte hain. Dark counterpart: RSHTheme.Dark.xaml. -->
+    <SolidColorBrush x:Key="RSHBackgroundBrush" Color="#F5F3FF" />
+    <SolidColorBrush x:Key="RSHCardBackgroundBrush" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="RSHRaisedBackgroundBrush" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="RSHSidebarBackgroundBrush" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="RSHBorderBrush" Color="#E7E3F7" />
+    <SolidColorBrush x:Key="RSHTextBrush" Color="#1F1B2E" />
+    <SolidColorBrush x:Key="RSHSecondaryTextBrush" Color="#5F5A7A" />
+    <SolidColorBrush x:Key="RSHTrackBrush" Color="#ECE8FA" />
+    <!-- Active nav = AccentSoft (#EEE9FF, §0.1) — yahan literal is liye
+         ke palette dictionaries theme-dependent keys ki ek jagah hain. -->
+    <SolidColorBrush x:Key="RSHNavActiveBackgroundBrush" Color="#EEE9FF" />
+    <SolidColorBrush x:Key="RSHNavHoverBackgroundBrush" Color="#F5F3FF" />
+    <SolidColorBrush x:Key="RSHNavActiveForegroundBrush" Color="#4B2FD0" />
+    <SolidColorBrush x:Key="RSHNavDotBrush" Color="#C9C1EE" />
+    <SolidColorBrush x:Key="RSHShadowColorBrush" Color="#3C288C" />
+</ResourceDictionary>

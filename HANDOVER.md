@@ -1,13 +1,13 @@
-# RSH (Real Sim Hub, formerly ApexLink) — Project Handover (updated)
+# RSH (Real Sim Hub, formerly RSH) — Project Handover (updated)
 
-**Product:** ApexLink — wireless DIY sim-racing steering wheel, by **Dreamsofts** (Ali hamza).
+**Product:** RSH — wireless DIY sim-racing steering wheel, by **Dreamsofts** (Ali hamza).
 **Status at handover (2026-11-11, updated round):** Software **v1.2.2**, Firmware **v3.3**. Built and code-level tested; delivered via Google Drive. On-PC / on-board live verdict still pending from the owner (flashing was in progress — board connects and is detected correctly).
 
 This package contains everything: all project documents, the flashing guide, the complete firmware source, the complete PC software source at v1.2.2, the owner's two UI-update patch zips, host test source, source backups of v1.2.0 and v1.2.1, and the ready release files.
 
 ---
 
-## 1. What ApexLink is
+## 1. What RSH is
 
 An ESP32 board reads a steering potentiometer, two hall-effect pedals and four buttons, and streams the state over its own Wi-Fi access point (UDP) to a Windows companion app. The app calibrates and processes the signal (filtering, curves, deadzones) and feeds a **vJoy** virtual joystick, which any racing game can bind like a real wheel.
 
@@ -19,20 +19,20 @@ Design principle: **firmware dumb, PC smart.** All calibration and processing li
 [Steering pot] [Accel hall] [Brake hall] [4 buttons]
         \           |            |           /
               ESP32 DevKit V1  (firmware)
-              Wi-Fi AP "APEXLINK" · UDP 200 packets/s
+              Wi-Fi AP "RSH" · UDP 200 packets/s
                         |
-              Windows PC (ApexLink app)
+              Windows PC (RSH app)
               calibration → filtering → curves
                         |
               vJoy virtual joystick → racing game
 ```
 
-- PC joins the `APEXLINK` Wi-Fi network, runs the app, runs the setup wizard once, then binds the vJoy device in the game.
+- PC joins the `RSH` Wi-Fi network, runs the app, runs the setup wizard once, then binds the vJoy device in the game.
 - The app's wizard can join the wheel Wi-Fi itself ("Connect automatically"), open vJoy Configure, walk through firmware update, auto-calibration, button test and output test.
 
 ## 3. Hardware
 
-- **Board:** ESP32 DevKit V1 (original ESP32, chip ESP32-D0WD-V3 as detected on the owner's board). The ESP32-C3 Super Mini was dropped: its ADC needed a series resistor the owner does not have; the DevKit V1 reads the 3.3 V steering pot directly. C3 firmware source is preserved in `firmware/apexlink-c3/` for reference.
+- **Board:** ESP32 DevKit V1 (original ESP32, chip ESP32-D0WD-V3 as detected on the owner's board). The ESP32-C3 Super Mini was dropped: its ADC needed a series resistor the owner does not have; the DevKit V1 reads the 3.3 V steering pot directly. C3 firmware source is preserved in `firmware/rsh-c3/` for reference.
 - **Pin map (DevKit V1):**
   - Steering potentiometer → **GPIO34**
   - Accelerator hall sensor → **GPIO35**
@@ -65,10 +65,10 @@ Design principle: **firmware dumb, PC smart.** All calibration and processing li
 
 ## 5. Firmware (ESP32, Arduino framework via PlatformIO)
 
-Source: `firmware/apexlink/` (`apexlink.ino`, `config.h`, `protocol.h`, `inputs`, `net`, `status_led`, `webota`).
+Source: `firmware/rsh/` (`rsh.ino`, `config.h`, `protocol.h`, `inputs`, `net`, `status_led`, `webota`).
 
 Features (v3.3):
-- Wi-Fi SoftAP `APEXLINK` with automatic channel selection; up to 4 stations.
+- Wi-Fi SoftAP `RSH` with automatic channel selection; up to 4 stations.
 - Adaptive sampling governor, trimmed-mean steering read, mV steering mode.
 - ArduinoOTA **and** a browser Web OTA page at `192.168.4.1` (HTTP Basic Auth, dual-partition safe, progress UI in the v3.3 light theme).
 - Remote restart command, low-heap safety restart, status LED patterns.
@@ -81,23 +81,23 @@ Features (v3.3):
 
 ## 6. PC software (C# · .NET 10 LTS · WPF + WPF-UI 4.3)
 
-Solution: `software/ApexLink.slnx` (source in this package is **v1.2.2**)
+Solution: `software/RSH.slnx` (source in this package is **v1.2.2**)
 
 | Project | Purpose |
 |---|---|
-| `src/ApexLink.Core` | Protocol, UDP link, calibration, signal processing (One Euro filter, curves, deadzones), profiles, auto-calibrator. No UI, fully unit-tested. |
-| `src/ApexLink.Output.VJoy` | vJoy feeder (P/Invoke, cdecl, axis range 1–32768, centre 16384). Requires the vJoy driver (BrunnerInnovation build, device enabled in vJoyConf with axes X/Y/Z). |
-| `src/ApexLink.App` | WPF app: pages (Dashboard/Home, Connection, Calibration, Processing/Tune, Buttons, Profiles, Monitor, Output, Diagnostics, Settings, Setup), 7-step auto-setup wizard, tray icon, autostart, single-instance, per-game auto profile switching by foreground process. |
-| `tools/ApexLink.Simulator` | Fake board for testing without hardware. |
-| `tools/ApexLink.Benchmarks` | Pipeline benchmarks. |
-| `tests/ApexLink.Tests` | Core test suite. |
-| `tests/ApexLink.VJoy.Tests` | vJoy interop tests. |
+| `src/RSH.Core` | Protocol, UDP link, calibration, signal processing (One Euro filter, curves, deadzones), profiles, auto-calibrator. No UI, fully unit-tested. |
+| `src/RSH.Output.VJoy` | vJoy feeder (P/Invoke, cdecl, axis range 1–32768, centre 16384). Requires the vJoy driver (BrunnerInnovation build, device enabled in vJoyConf with axes X/Y/Z). |
+| `src/RSH.App` | WPF app: pages (Dashboard/Home, Connection, Calibration, Processing/Tune, Buttons, Profiles, Monitor, Output, Diagnostics, Settings, Setup), 7-step auto-setup wizard, tray icon, autostart, single-instance, per-game auto profile switching by foreground process. |
+| `tools/RSH.Simulator` | Fake board for testing without hardware. |
+| `tools/RSH.Benchmarks` | Pipeline benchmarks. |
+| `tests/RSH.Tests` | Core test suite. |
+| `tests/RSH.VJoy.Tests` | vJoy interop tests. |
 
 Design history: v1.2.0 introduced the light pastel theme (white rounded cards, violet accent `#6C4CF1`, minimal one-line professional-English copy). The owner then supplied two UI-update patches (authored with another Claude) that were applied and shipped as v1.2.1 (Setup page, Home/Setup/Tune) and v1.2.2 (new sidebar design, `Themes/Theme.xaml`). The patch zips are in `patches/`; pre-patch sources are in `backups/`.
 
 **Build & run**
-- Needs the .NET 10 SDK. `dotnet build software/ApexLink.slnx -c Release`, tests via `dotnet test`.
-- Shipping build is the framework-dependent "LITE" publish (win-x64, ~28 MB folder): `dotnet publish src/ApexLink.App -c Release -r win-x64 --self-contained false`. The target PC needs the one-time **.NET 10 Desktop Runtime**.
+- Needs the .NET 10 SDK. `dotnet build software/RSH.slnx -c Release`, tests via `dotnet test`.
+- Shipping build is the framework-dependent "LITE" publish (win-x64, ~28 MB folder): `dotnet publish src/RSH.App -c Release -r win-x64 --self-contained false`. The target PC needs the one-time **.NET 10 Desktop Runtime**.
 - No installer ships by the owner's decision (download size); the essentials zip is the distribution format.
 
 ## 7. Versions & delivery history
@@ -106,7 +106,7 @@ Design history: v1.2.0 introduced the light pastel theme (white rounded cards, v
 - **Firmware v3.2 / Software v1.1.0** — audit round 2 (30+ fixes), advanced auto-setup wizard, per-game profiles, rotation presets.
 - **Firmware v3.3 / Software v1.2.0** — design round: light theme per the owner's reference image, minimal copy, auto-setup that acts (self Wi-Fi connect, vJoy Configure launcher), Web OTA page restyled.
 - **Software v1.2.1** — owner's UI Update v1 patch applied (Setup page, Home/Setup/Tune). Build 0/0, tests 42 passed + 1 skipped.
-- **Software v1.2.2** — owner's UI Update v2 patch applied (new sidebar design). Build 0/0, tests 42 passed + 1 skipped. Release: `ApexLink-Essentials-v1.2.2.zip` (in `release/`).
+- **Software v1.2.2** — owner's UI Update v2 patch applied (new sidebar design). Build 0/0, tests 42 passed + 1 skipped. Release: `RSH-Essentials-v1.2.2.zip` (in `release/`).
 
 Full detail: `docs/DELIVERY-NOTE.md`, `docs/FINAL-REPORT.md`, `docs/TEST-REPORT.md`, `docs/USER-GUIDE.md`, `docs/PROJECT.md`, `docs/SOFTWARE-PLAN.md`, and the original spec set in `docs/sim-wheel-docs/`.
 
@@ -143,10 +143,10 @@ HANDOVER.md                  <- this file
 docs/                        FIRMWARE-PLAN, SOFTWARE-PLAN-v2, PROJECT, SOFTWARE-PLAN, DELIVERY-NOTE,
                              FINAL-REPORT, TEST-REPORT, USER-GUIDE, FLASH-GUIDE,
                              ui-reference/ (UI preview), sim-wheel-docs/ (original specs)
-firmware/apexlink/           DevKit V1 firmware source (v3.3) + platformio.ini + merge_bin.py (merged 0x0 image)
+firmware/rsh/           DevKit V1 firmware source (v3.3) + platformio.ini + merge_bin.py (merged 0x0 image)
 software/                    full C# solution source (v1.2.2), no bin/obj
 tests-host/                  firmware host tests (test_main.cpp, run_tests.sh, verify_packet.py) + protocol_v2_vectors.py, pin_rules_ref.py
 tools-perf/                  Measure-RSH.ps1 (app perf baseline script)
 ```
 
-Removed from the original handover (rebuild or ignore): `release/` (firmware .bin + Essentials zip), `backups/` (v1.2.0 / v1.2.1 source), `patches/` (UI-update zips, already applied in v1.2.2), `firmware/apexlink-c3/`, `firmware/step0-ap-test/`, and compiled `tests-host/run_tests*` binaries. Older docs under `docs/` may still mention those paths — historical.
+Removed from the original handover (rebuild or ignore): `release/` (firmware .bin + Essentials zip), `backups/` (v1.2.0 / v1.2.1 source), `patches/` (UI-update zips, already applied in v1.2.2), `firmware/rsh-c3/`, `firmware/step0-ap-test/`, and compiled `tests-host/run_tests*` binaries. Older docs under `docs/` may still mention those paths — historical.

@@ -1,0 +1,9 @@
+# RSH — build outputs aur local files (commit mat karo)
+bin/
+obj/
+.pio/
+TestResults/
+.vs/
+__pycache__/
+*.user
+tests-host/run_tests

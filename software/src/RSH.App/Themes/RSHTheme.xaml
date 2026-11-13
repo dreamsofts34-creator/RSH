@@ -1,0 +1,187 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=System.Runtime">
+    <!-- ================================================================
+         RSH design tokens (UI-1) — spec §0.1, FINAL.
+         Ye file poori app ki design bunyaad hai:
+           * Accent family + status colours (theme-independent, §0.1)
+           * Font Inter, corner radius 12px, 8-pt grid spacing
+           * Shared styles (nav, card, headings, buttons) — theme-dependent
+             brushes hamesha DynamicResource se, taake theme switch
+             (RSHThemeManager.ApplyTheme) sirf palettes badle, koi layout
+             rebuild na ho (U-P10).
+         Theme palettes: RSHTheme.Light.xaml (default, neeche merged) aur
+         RSHTheme.Dark.xaml. Switch ka mechanism: Themes/RSHThemeManager.cs.
+         Gate: hard-coded colour sirf is file + palette files mein hai;
+         baaki XAML mein sirf RSH* resource keys istemal hoti hain.
+         ================================================================ -->
+    <ResourceDictionary.MergedDictionaries>
+        <ResourceDictionary Source="RSHTheme.Light.xaml" />
+    </ResourceDictionary.MergedDictionaries>
+
+    <!-- Accent family (§0.1) — theme-independent -->
+    <Color x:Key="RSHAccentColor">#6C4CF1</Color>
+    <SolidColorBrush x:Key="RSHAccentBrush" Color="{StaticResource RSHAccentColor}" />
+    <SolidColorBrush x:Key="RSHAccentDeepBrush" Color="#4B2FD0" />
+    <SolidColorBrush x:Key="RSHAccentHoverBrush" Color="#5A3BE0" />
+    <SolidColorBrush x:Key="RSHAccentSoftBrush" Color="#EEE9FF" />
+
+    <!-- Status colours (§0.1) — theme-independent. Warning sirf chhote
+         warning dots ke liye hai, accent nahi. -->
+    <SolidColorBrush x:Key="RSHSuccessBrush" Color="#34D399" />
+    <SolidColorBrush x:Key="RSHWarningBrush" Color="#F59E0B" />
+    <SolidColorBrush x:Key="RSHDangerBrush" Color="#FF4D4F" />
+    <SolidColorBrush x:Key="RSHCyanBrush" Color="#22D3EE" />
+    <!-- Accent surfaces par text -->
+    <SolidColorBrush x:Key="RSHOnAccentBrush" Color="#FFFFFF" />
+
+    <!-- Font (§0.1: Inter; Inter na ho to Segoe UI fallback) -->
+    <FontFamily x:Key="RSHFontFamily">Inter, Segoe UI</FontFamily>
+    <sys:Double x:Key="RSHFontSizeTitle">26</sys:Double>
+    <sys:Double x:Key="RSHFontSizeBody">14</sys:Double>
+    <sys:Double x:Key="RSHFontSizeSmall">13</sys:Double>
+    <sys:Double x:Key="RSHFontSizeCaption">11</sys:Double>
+
+    <!-- Corner radius (§0.1: 12px) -->
+    <CornerRadius x:Key="RSHCornerRadius">12</CornerRadius>
+    <CornerRadius x:Key="RSHCornerRadiusSmall">8</CornerRadius>
+    <CornerRadius x:Key="RSHCardCornerRadius">16</CornerRadius>
+
+    <!-- Spacing — 8-pt grid (§0.1) -->
+    <sys:Double x:Key="RSHSpacing4">4</sys:Double>
+    <sys:Double x:Key="RSHSpacing8">8</sys:Double>
+    <sys:Double x:Key="RSHSpacing12">12</sys:Double>
+    <sys:Double x:Key="RSHSpacing16">16</sys:Double>
+    <sys:Double x:Key="RSHSpacing20">20</sys:Double>
+    <sys:Double x:Key="RSHSpacing24">24</sys:Double>
+    <sys:Double x:Key="RSHSpacing32">32</sys:Double>
+
+    <!-- ======================= Shared styles ======================= -->
+
+    <!-- Sidebar navigation — violet active state (§0.1 accent). -->
+    <Style x:Key="RSHNavStyle" TargetType="RadioButton">
+        <Setter Property="Foreground" Value="{DynamicResource RSHSecondaryTextBrush}" />
+        <Setter Property="FontSize" Value="{StaticResource RSHFontSizeBody}" />
+        <Setter Property="FontFamily" Value="{StaticResource RSHFontFamily}" />
+        <Setter Property="Cursor" Value="Hand" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="RadioButton">
+                    <Border x:Name="Bd" CornerRadius="{StaticResource RSHCornerRadiusSmall}"
+                            Padding="12,11" Margin="0,0,0,4" Background="Transparent">
+                        <StackPanel Orientation="Horizontal">
+                            <Border x:Name="Dot" Width="8" Height="8" CornerRadius="3"
+                                    Background="{DynamicResource RSHNavDotBrush}"
+                                    VerticalAlignment="Center" Margin="0,0,10,0" />
+                            <ContentPresenter VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background" Value="{DynamicResource RSHNavHoverBackgroundBrush}" />
+                        </Trigger>
+                        <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="Bd" Property="Background" Value="{DynamicResource RSHNavActiveBackgroundBrush}" />
+                            <Setter TargetName="Dot" Property="Background" Value="{StaticResource RSHAccentBrush}" />
+                            <Setter Property="Foreground" Value="{DynamicResource RSHNavActiveForegroundBrush}" />
+                            <Setter Property="FontWeight" Value="SemiBold" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Card -->
+    <Style x:Key="RSHCardStyle" TargetType="Border">
+        <Setter Property="Background" Value="{DynamicResource RSHCardBackgroundBrush}" />
+        <Setter Property="CornerRadius" Value="{StaticResource RSHCardCornerRadius}" />
+        <Setter Property="Padding" Value="20" />
+        <Setter Property="Effect">
+            <Setter.Value>
+                <DropShadowEffect BlurRadius="8" ShadowDepth="1" Opacity="0.10" Color="#3C288C" />
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Headings / body copy — professional English, koi faltu lines nahi -->
+    <Style x:Key="RSHH1Style" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="{StaticResource RSHFontSizeTitle}" />
+        <Setter Property="FontWeight" Value="Bold" />
+        <Setter Property="FontFamily" Value="{StaticResource RSHFontFamily}" />
+        <Setter Property="Foreground" Value="{DynamicResource RSHTextBrush}" />
+        <Setter Property="Margin" Value="0,0,0,4" />
+    </Style>
+    <Style x:Key="RSHSubStyle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="{StaticResource RSHFontSizeBody}" />
+        <Setter Property="Foreground" Value="{DynamicResource RSHSecondaryTextBrush}" />
+        <Setter Property="Margin" Value="0,0,0,20" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+    <Style x:Key="RSHH2Style" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="15" />
+        <Setter Property="FontWeight" Value="Bold" />
+        <Setter Property="FontFamily" Value="{StaticResource RSHFontFamily}" />
+        <Setter Property="Foreground" Value="{DynamicResource RSHTextBrush}" />
+        <Setter Property="Margin" Value="0,0,0,12" />
+    </Style>
+    <Style x:Key="RSHMutedStyle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="{StaticResource RSHFontSizeSmall}" />
+        <Setter Property="Foreground" Value="{DynamicResource RSHSecondaryTextBrush}" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+
+    <!-- Primary button — accent -->
+    <Style x:Key="RSHPrimaryButtonStyle" TargetType="Button">
+        <Setter Property="Foreground" Value="{StaticResource RSHOnAccentBrush}" />
+        <Setter Property="FontSize" Value="{StaticResource RSHFontSizeBody}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="FontFamily" Value="{StaticResource RSHFontFamily}" />
+        <Setter Property="Cursor" Value="Hand" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="Bd" Background="{StaticResource RSHAccentBrush}"
+                            CornerRadius="10" Padding="20,12">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background" Value="{StaticResource RSHAccentHoverBrush}" />
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="Bd" Property="Opacity" Value="0.45" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Ghost button — theme-dependent tint, active-nav jaisi surface -->
+    <Style x:Key="RSHGhostButtonStyle" TargetType="Button">
+        <Setter Property="Foreground" Value="{DynamicResource RSHNavActiveForegroundBrush}" />
+        <Setter Property="FontSize" Value="{StaticResource RSHFontSizeBody}" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="FontFamily" Value="{StaticResource RSHFontFamily}" />
+        <Setter Property="Cursor" Value="Hand" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Button">
+                    <Border x:Name="Bd" Background="{DynamicResource RSHNavActiveBackgroundBrush}"
+                            CornerRadius="10" Padding="20,12">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Bd" Property="Background" Value="{DynamicResource RSHNavHoverBackgroundBrush}" />
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="Bd" Property="Opacity" Value="0.45" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+</ResourceDictionary>

@@ -1,6 +1,6 @@
 # RSH (Real Sim Hub) — PC Software Plan (v2.0 track)
 
-Starting point: **ApexLink v1.2.2** (C# · .NET 10 · WPF + WPF-UI, vJoy output, 42 tests) — the version the owner tested and found working and reasonably optimized. The product is renamed **RSH — Real Sim Hub**.
+Starting point: **RSH v1.2.2** (C# · .NET 10 · WPF + WPF-UI, vJoy output, 42 tests) — the version the owner tested and found working and reasonably optimized. The product is renamed **RSH — Real Sim Hub**.
 
 **Universal by design (owner requirement):** the whole wheel is one ESP32 and the user attaches only what they want. The app has no fixed "rig" — it shows, tunes and maps **only the modules the user has added**. Power source (USB / battery / SMPS) is irrelevant to the app; battery display appears only if a battery module exists.
 
@@ -15,10 +15,10 @@ UI reference: the owner's **"RSH — Real Sim Hub" preview** (`rsh-ui-polished.h
 
 ### 0.1 What v1.2.2 already does right (must be preserved)
 
-- The **engine runs on its own dedicated thread** (`ApexLink-Engine`, above-normal priority, drift-free 5 ms scheduler) — completely independent of the UI.
+- The **engine runs on its own dedicated thread** (`RSH-Engine`, above-normal priority, drift-free 5 ms scheduler) — completely independent of the UI.
 - Network receive/hello run on background tasks, never on the UI thread.
 - The UI refreshes from **one 33 ms timer (~30 fps)** and **only the visible page ticks** (`IUpdatableView`) — hidden pages cost nothing.
-- Hot path (packet parse + pipeline) is **allocation-free**; a benchmark tool (`tools/ApexLink.Benchmarks`) already measures ns/packet, allocations, loopback loss and soak memory growth.
+- Hot path (packet parse + pipeline) is **allocation-free**; a benchmark tool (`tools/RSH.Benchmarks`) already measures ns/packet, allocations, loopback loss and soak memory growth.
 - Framework-dependent "LITE" publish (~28 MB), workstation concurrent GC.
 
 ### 0.2 Rules for all new code
@@ -40,7 +40,7 @@ UI reference: the owner's **"RSH — Real Sim Hub" preview** (`rsh-ui-polished.h
 
 The owner cannot run measurements and the development sandbox has no Windows/.NET runtime, so a numeric before/after baseline **cannot be collected**. (Decision: baseline measurement is *optional*, not a blocker — `docs/PERF-BASELINE.md` and `tools-perf/` stay available if it is ever done.) Performance is protected by construction instead:
 
-1. **Do-not-touch zone.** The v1.2.2 hot path — `WheelEngine` loop, `UdpWheelSource`, `WheelPacket` parse/CRC, `ProcessingPipeline`, `OneEuroFilter`, `PedalRamp`, `VJoyOutput` — is **frozen**: only additive changes, no refactors, no reordering of work. Anything that must change there needs a written reason in the PR/commit and a micro-benchmark in the existing `ApexLink.Benchmarks`.
+1. **Do-not-touch zone.** The v1.2.2 hot path — `WheelEngine` loop, `UdpWheelSource`, `WheelPacket` parse/CRC, `ProcessingPipeline`, `OneEuroFilter`, `PedalRamp`, `VJoyOutput` — is **frozen**: only additive changes, no refactors, no reordering of work. Anything that must change there needs a written reason in the PR/commit and a micro-benchmark in the existing `RSH.Benchmarks`.
 2. **New features are off-by-default and zero-cost when unused.** A module that is not added does not exist at runtime (no object, no tick work). The game launcher, config sync and LED/battery features have **no timer or thread running until the user opens/uses them** (watcher excepted — one 1.5 s poll, already in v1.2.2).
 3. **Static review checklist on every change** (rules P1–P10 above): not on the engine thread, no allocation per tick, no I/O on the UI thread, no extra timers, virtualized lists, bounded buffers. Each phase's completion note states pass/fail per rule.
 4. **Tests that run anywhere:** new allocation-free transforms get unit tests plus a micro-benchmark with a hard **0 B/tick assertion** (`GC.GetAllocatedBytesForCurrentThread`) — this check is deterministic and does not need a reference machine. Soak test asserts bounded memory (existing tool).
@@ -61,13 +61,13 @@ The owner cannot run measurements and the development sandbox has no Windows/.NE
 ## 2. Architecture changes
 
 ```
-ApexLink.Core            (keep) protocol, link, calibration, filters, profiles
+RSH.Core            (keep) protocol, link, calibration, filters, profiles
   + Modules/             NEW  module model: type, enabled, pin binding, vJoy mapping, tuning schema
   + Profiles v2/         NEW  per-module tuning objects + game bindings + migration from v1
   + Device/              NEW  control-channel client (caps, get/set config, probe, commit/confirm)
   + Games/               NEW  game catalog, detection, launcher, process watcher
-ApexLink.Output.*        (keep) IJoystickOutput; vJoy stays; second backend possible later
-ApexLink.App             UI (WPF, decided — section 5)
+RSH.Output.*        (keep) IJoystickOutput; vJoy stays; second backend possible later
+RSH.App             UI (WPF, decided — section 5)
 ```
 
 - **Universal module system:** the user builds the rig by **adding modules** (Settings → Modules → *Add module*): Steering, Throttle, Brake, Clutch, Handbrake, Generic axis, Shifter (sequential / H-pattern), Horn / Button, Button matrix, Encoder, LED strip, Battery monitor, I²C expander. Nothing is mandatory except at least one input. **Hardware presets** pre-fill common builds (Minimal: steering + 2 pedals + 4 buttons · Full rig · Empty/custom) but the user can add/remove anything afterwards. Removing a module removes its Tune card, Dashboard bar and vJoy mapping instantly.
@@ -179,17 +179,17 @@ No final visual design is produced until the owner says "go". Sequence once appr
 | **S5 — Polish & release** | Light theme/accessibility, wizard update for new modules, docs, LITE publish (framework-dependent, ~30 MB), installer decision | Release checklist (§8) |
 | **S6 — Extended features (in scope)** | LED strip + display page (needs firmware F5), battery/signal tiles, per-car profiles (needs game telemetry), encoders/expanders UI, latency tools; driver-free HID dongle output studied separately | Each sub-feature passes its own perf checklist + owner check |
 
-### 6.1 Rename ApexLink → RSH (controlled, so nothing breaks)
+### 6.1 Rename RSH → RSH (controlled, so nothing breaks)
 
 | Layer | Plan |
 |---|---|
 | **User-visible** (window title, tray, wizard, docs, installer text, exe name `RSH.exe`) | Renamed in S1 |
-| **User data** (`%AppData%\ApexLink` profiles/settings/logs, autostart registry value, single-instance mutex) | One-time **migration** to `%AppData%\RSH` on first run: copy, verify, keep the old folder untouched; autostart entry re-created under the new name |
-| **Code namespaces / project names** (`ApexLink.Core` …) | Renamed mechanically in one dedicated commit with tests green before and after (no behaviour change allowed in that commit) |
-| **Wire/firmware identifiers** (Wi-Fi SSID `APEXLINK`, OTA hostname `apexlink`, UDP magic) | **Left unchanged by default** — changing the SSID makes already-flashed boards invisible to the app. Optional: a later firmware release adds a configurable SSID; the app would accept both names during transition |
-| Branding assets (icon `apexlink.ico`, "RSH" mark from the preview) | Replaced in S1 |
+| **User data** (`%AppData%\RSH` profiles/settings/logs, autostart registry value, single-instance mutex) | One-time **migration** from the old app-data folder to `%AppData%\RSH` on first run: copy, verify, keep the old folder untouched; autostart entry re-created under the new name |
+| **Code namespaces / project names** (`RSH.Core` …) | Renamed mechanically in one dedicated commit with tests green before and after (no behaviour change allowed in that commit) |
+| **Wire/firmware identifiers** (Wi-Fi SSID `RSH`, OTA hostname `rsh`, UDP magic) | **Renamed in Step 0** together with the app, so new app + new firmware stay in sync. Boards flashed with old firmware must be reflashed — the new app only joins the `RSH` network |
+| Branding assets (icon `rsh.ico`, "RSH" mark from the preview) | Replaced in S1 |
 
-Simulator (`tools/ApexLink.Simulator`) is extended to speak protocol v2 + the control channel, so S1–S3 can be built and tested **without** waiting for firmware.
+Simulator (`tools/RSH.Simulator`) is extended to speak protocol v2 + the control channel, so S1–S3 can be built and tested **without** waiting for firmware.
 
 ---
 

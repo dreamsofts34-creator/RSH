@@ -1,41 +1,829 @@
 {
+  "_limits_note": "D6 bounds (Plan v2.3 / FW-2): axes <= 8, buttons <= 128, encoders <= 4 -- totals across direct + ADS1115 + matrix + expander kinds. Direct-pin buttons are pin-limited to 11 anyway; 128 is reachable only via button_matrix / expanders. batteries <= 1 (one supply per board); led_strips <= 1, <= 60 LEDs per strip (WS2812). The old buttons limit (32) was the pre-D6 direct-only bound.",
+  "_note": "ADC2 pins (0,2,4,12,13,14,15,25,26,27) are unusable for analog while Wi-Fi is on, hence adc=null. Verify on the real board before freezing (F0 exit).",
+  "_presets_note": "Presets are validated by tests-host/pin_rules_ref.py (single source of truth). The direct full rig fits only because GPIO21 is used as a digital LED pin (R-L9); with expanders, 21/22 are I2C and the LED moves to a freed digital pin (GPIO4 in the MCP23017 preset).",
   "board": "esp32-devkit-v1",
   "chip": "ESP32 (WROOM)",
-  "limits": { "axes": 8, "buttons": 32, "encoders": 4, "led_strips": 1 },
-  "reserved": { "status_led": 2, "i2c_sda": 21, "i2c_scl": 22 },
-  "pins": {
-    "0":  { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "avoid",     "reason": "Strapping pin (boot mode)" },
-    "1":  { "digital_in": false, "digital_out": false, "pullup": false, "adc": null, "class": "forbidden", "reason": "UART0 TX" },
-    "2":  { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "reserved",  "reason": "Status LED / strapping" },
-    "3":  { "digital_in": false, "digital_out": false, "pullup": false, "adc": null, "class": "forbidden", "reason": "UART0 RX" },
-    "4":  { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "5":  { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "caution",   "reason": "Strapping pin (boot log)" },
-    "6":  { "class": "forbidden", "reason": "Connected to flash" },
-    "7":  { "class": "forbidden", "reason": "Connected to flash" },
-    "8":  { "class": "forbidden", "reason": "Connected to flash" },
-    "9":  { "class": "forbidden", "reason": "Connected to flash" },
-    "10": { "class": "forbidden", "reason": "Connected to flash" },
-    "11": { "class": "forbidden", "reason": "Connected to flash" },
-    "12": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "avoid",     "reason": "Strapping: must be LOW at boot (flash voltage)" },
-    "13": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "14": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "15": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "avoid",     "reason": "Strapping pin (boot log)" },
-    "16": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "17": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "18": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "19": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "21": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "22": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "23": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "25": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "26": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "27": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": null, "class": "ok" },
-    "32": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": "ADC1_CH4", "class": "ok" },
-    "33": { "digital_in": true,  "digital_out": true,  "pullup": true,  "adc": "ADC1_CH5", "class": "ok" },
-    "34": { "digital_in": true,  "digital_out": false, "pullup": false, "adc": "ADC1_CH6", "class": "ok", "reason": "Input-only, no internal pull-up" },
-    "35": { "digital_in": true,  "digital_out": false, "pullup": false, "adc": "ADC1_CH7", "class": "ok", "reason": "Input-only, no internal pull-up" },
-    "36": { "digital_in": true,  "digital_out": false, "pullup": false, "adc": "ADC1_CH0", "class": "ok", "reason": "Input-only, no internal pull-up" },
-    "39": { "digital_in": true,  "digital_out": false, "pullup": false, "adc": "ADC1_CH3", "class": "ok", "reason": "Input-only, no internal pull-up" }
+  "kinds": {
+    "axis": {
+      "counts_toward": "axes",
+      "gpio_pins": 1,
+      "requires": "ADC1 pin (32, 33, 34, 35, 36, 39)"
+    },
+    "axis_ads1115": {
+      "counts_toward": "axes",
+      "gpio_pins": 0,
+      "requires": "I2C expander, ADS1115 channel 0-3; expanders=true"
+    },
+    "battery": {
+      "counts_toward": "batteries",
+      "gpio_pins": 1,
+      "requires": "ADC1 pin; NOT counted as an axis (T7 fix)"
+    },
+    "button": {
+      "counts_toward": "buttons",
+      "gpio_pins": 1,
+      "requires": "pull-up pin, or input-only pin with external pull-up"
+    },
+    "button_matrix": {
+      "counts_toward": "buttons",
+      "gpio_pins": "rows+cols",
+      "requires": "rows x cols keys, default 4x4 = 16 buttons on 8 pins"
+    },
+    "encoder": {
+      "counts_toward": "encoders",
+      "gpio_pins": 2,
+      "requires": "2 pull-up pins (A, B); push is a separate button module"
+    },
+    "expander_button": {
+      "counts_toward": "buttons",
+      "gpio_pins": 0,
+      "requires": "I2C expander, MCP23017 pin 0-15 / PCF8574 pin 0-7; expanders=true"
+    },
+    "led": {
+      "counts_toward": "led_strips",
+      "gpio_pins": 1,
+      "requires": "digital-out pin; max 60 LEDs per strip (WS2812)"
+    }
   },
-  "_note": "ADC2 pins (0,2,4,12,13,14,15,25,26,27) are unusable for analog while Wi-Fi is on, hence adc=null. Verify on the real board before freezing (F0 exit)."
+  "limits": {
+    "axes": 8,
+    "batteries": 1,
+    "buttons": 128,
+    "encoders": 4,
+    "led_strips": 1,
+    "leds_per_strip": 60
+  },
+  "pins": {
+    "0": {
+      "adc": null,
+      "allowed": [],
+      "class": "avoid",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "reason": "Strapping pin (boot mode)",
+      "type": "strapping"
+    },
+    "1": {
+      "adc": null,
+      "allowed": [],
+      "class": "forbidden",
+      "digital_in": false,
+      "digital_out": false,
+      "pullup": false,
+      "reason": "UART0 TX",
+      "type": "uart"
+    },
+    "10": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "Connected to flash",
+      "type": "forbidden"
+    },
+    "11": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "Connected to flash",
+      "type": "forbidden"
+    },
+    "12": {
+      "adc": null,
+      "allowed": [],
+      "class": "avoid",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "reason": "Strapping: must be LOW at boot (flash voltage)",
+      "type": "strapping"
+    },
+    "13": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "type": "digital"
+    },
+    "14": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "type": "digital"
+    },
+    "15": {
+      "adc": null,
+      "allowed": [],
+      "class": "avoid",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "reason": "Strapping pin (boot log)",
+      "type": "strapping"
+    },
+    "16": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "note": "PSRAM on WROVER modules; free on WROOM-32 (DevKit V1)",
+      "pullup": true,
+      "type": "digital"
+    },
+    "17": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "note": "PSRAM on WROVER modules; free on WROOM-32 (DevKit V1)",
+      "pullup": true,
+      "type": "digital"
+    },
+    "18": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "type": "digital"
+    },
+    "19": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "type": "digital"
+    },
+    "2": {
+      "adc": null,
+      "allowed": [],
+      "class": "reserved",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "reason": "Status LED / strapping",
+      "type": "reserved"
+    },
+    "20": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "No such GPIO on ESP32",
+      "type": "nonexistent"
+    },
+    "21": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "note": "Default I2C SDA -- digital only when no expanders; LED data pin in the direct full rig (R-L9)",
+      "pullup": true,
+      "type": "digital+i2c"
+    },
+    "22": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "note": "Default I2C SCL -- digital only when no expanders",
+      "pullup": true,
+      "type": "digital+i2c"
+    },
+    "23": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "type": "digital"
+    },
+    "24": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "No such GPIO on ESP32",
+      "type": "nonexistent"
+    },
+    "25": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "type": "digital"
+    },
+    "26": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "type": "digital"
+    },
+    "27": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "type": "digital"
+    },
+    "28": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "No such GPIO on ESP32",
+      "type": "nonexistent"
+    },
+    "29": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "No such GPIO on ESP32",
+      "type": "nonexistent"
+    },
+    "3": {
+      "adc": null,
+      "allowed": [],
+      "class": "forbidden",
+      "digital_in": false,
+      "digital_out": false,
+      "pullup": false,
+      "reason": "UART0 RX",
+      "type": "uart"
+    },
+    "30": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "No such GPIO on ESP32",
+      "type": "nonexistent"
+    },
+    "31": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "No such GPIO on ESP32",
+      "type": "nonexistent"
+    },
+    "32": {
+      "adc": "ADC1_CH4",
+      "allowed": [
+        "axis",
+        "battery",
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "type": "analog+digital"
+    },
+    "33": {
+      "adc": "ADC1_CH5",
+      "allowed": [
+        "axis",
+        "battery",
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "type": "analog+digital"
+    },
+    "34": {
+      "adc": "ADC1_CH6",
+      "allowed": [
+        "axis",
+        "battery",
+        "button",
+        "button_matrix",
+        "encoder"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": false,
+      "pullup": false,
+      "reason": "Input-only, no internal pull-up",
+      "type": "input-only analog"
+    },
+    "35": {
+      "adc": "ADC1_CH7",
+      "allowed": [
+        "axis",
+        "battery",
+        "button",
+        "button_matrix",
+        "encoder"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": false,
+      "pullup": false,
+      "reason": "Input-only, no internal pull-up",
+      "type": "input-only analog"
+    },
+    "36": {
+      "adc": "ADC1_CH0",
+      "allowed": [
+        "axis",
+        "battery",
+        "button",
+        "button_matrix",
+        "encoder"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": false,
+      "pullup": false,
+      "reason": "Input-only, no internal pull-up",
+      "type": "input-only analog"
+    },
+    "37": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "Exists on ESP32 die (ADC1_CH1) but not broken out on ESP32-WROOM-32 / DevKit V1",
+      "type": "not-broken-out"
+    },
+    "38": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "Exists on ESP32 die (ADC1_CH2) but not broken out on ESP32-WROOM-32 / DevKit V1",
+      "type": "not-broken-out"
+    },
+    "39": {
+      "adc": "ADC1_CH3",
+      "allowed": [
+        "axis",
+        "battery",
+        "button",
+        "button_matrix",
+        "encoder"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": false,
+      "pullup": false,
+      "reason": "Input-only, no internal pull-up",
+      "type": "input-only analog"
+    },
+    "4": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "ok",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "type": "digital"
+    },
+    "5": {
+      "adc": null,
+      "allowed": [
+        "button",
+        "button_matrix",
+        "encoder",
+        "led"
+      ],
+      "class": "caution",
+      "digital_in": true,
+      "digital_out": true,
+      "pullup": true,
+      "reason": "Strapping pin (boot log)",
+      "type": "strapping"
+    },
+    "6": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "Connected to flash",
+      "type": "forbidden"
+    },
+    "7": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "Connected to flash",
+      "type": "forbidden"
+    },
+    "8": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "Connected to flash",
+      "type": "forbidden"
+    },
+    "9": {
+      "allowed": [],
+      "class": "forbidden",
+      "reason": "Connected to flash",
+      "type": "forbidden"
+    }
+  },
+  "presets": {
+    "full_rig_direct": {
+      "expanders": false,
+      "expected_free_pins": [
+        22
+      ],
+      "modules": [
+        {
+          "kind": "axis",
+          "pins": [
+            32
+          ],
+          "role": "steering"
+        },
+        {
+          "kind": "axis",
+          "pins": [
+            33
+          ],
+          "role": "throttle"
+        },
+        {
+          "kind": "axis",
+          "pins": [
+            34
+          ],
+          "role": "brake"
+        },
+        {
+          "kind": "axis",
+          "pins": [
+            35
+          ],
+          "role": "clutch"
+        },
+        {
+          "kind": "axis",
+          "pins": [
+            36
+          ],
+          "role": "handbrake"
+        },
+        {
+          "kind": "battery",
+          "pins": [
+            39
+          ],
+          "role": "battery"
+        },
+        {
+          "kind": "button",
+          "pins": [
+            4
+          ],
+          "role": "shift_up"
+        },
+        {
+          "kind": "button",
+          "pins": [
+            13
+          ],
+          "role": "shift_down"
+        },
+        {
+          "kind": "button",
+          "pins": [
+            14
+          ],
+          "role": "horn"
+        },
+        {
+          "kind": "button",
+          "pins": [
+            16
+          ],
+          "role": "button_4"
+        },
+        {
+          "kind": "button",
+          "pins": [
+            17
+          ],
+          "role": "button_5"
+        },
+        {
+          "kind": "button",
+          "pins": [
+            18
+          ],
+          "role": "button_6"
+        },
+        {
+          "kind": "button",
+          "pins": [
+            19
+          ],
+          "role": "button_7"
+        },
+        {
+          "kind": "encoder",
+          "pins": [
+            23,
+            25
+          ],
+          "role": "encoder_1"
+        },
+        {
+          "kind": "encoder",
+          "pins": [
+            26,
+            27
+          ],
+          "role": "encoder_2"
+        },
+        {
+          "kind": "led",
+          "pins": [
+            21
+          ],
+          "role": "led_strip"
+        }
+      ],
+      "name": "Full rig -- direct pins (no expanders)"
+    },
+    "full_rig_mcp23017": {
+      "expanders": true,
+      "expected_free_pins": [
+        13,
+        14,
+        16,
+        17,
+        18,
+        19
+      ],
+      "modules": [
+        {
+          "kind": "axis",
+          "pins": [
+            32
+          ],
+          "role": "steering"
+        },
+        {
+          "kind": "axis",
+          "pins": [
+            33
+          ],
+          "role": "throttle"
+        },
+        {
+          "kind": "axis",
+          "pins": [
+            34
+          ],
+          "role": "brake"
+        },
+        {
+          "kind": "axis",
+          "pins": [
+            35
+          ],
+          "role": "clutch"
+        },
+        {
+          "kind": "axis",
+          "pins": [
+            36
+          ],
+          "role": "handbrake"
+        },
+        {
+          "kind": "battery",
+          "pins": [
+            39
+          ],
+          "role": "battery"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 0,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_1"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 1,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_2"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 2,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_3"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 3,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_4"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 4,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_5"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 5,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_6"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 6,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_7"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 7,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_8"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 8,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_9"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 9,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_10"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 10,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_11"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 11,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_12"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 12,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_13"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 13,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_14"
+        },
+        {
+          "addr": 32,
+          "expander": "MCP23017",
+          "expander_pin": 14,
+          "kind": "expander_button",
+          "pins": [],
+          "role": "button_15"
+        },
+        {
+          "kind": "encoder",
+          "pins": [
+            23,
+            25
+          ],
+          "role": "encoder_1"
+        },
+        {
+          "kind": "encoder",
+          "pins": [
+            26,
+            27
+          ],
+          "role": "encoder_2"
+        },
+        {
+          "kind": "led",
+          "pins": [
+            4
+          ],
+          "role": "led_strip"
+        }
+      ],
+      "name": "Full rig -- 15 buttons via MCP23017 (I2C)"
+    }
+  },
+  "reserved": {
+    "i2c_scl": 22,
+    "i2c_sda": 21,
+    "status_led": 2
+  }
 }

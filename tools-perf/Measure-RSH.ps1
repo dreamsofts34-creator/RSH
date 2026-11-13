@@ -1,7 +1,7 @@
 <#
- RSH / ApexLink performance baseline — run on the Windows PC where the app is tested.
+ RSH / RSH performance baseline — run on the Windows PC where the app is tested.
  Usage (PowerShell, from this folder):
-   .\Measure-RSH.ps1 -ExePath "C:\path\to\ApexLink.exe" -IdleSeconds 120
+   .\Measure-RSH.ps1 -ExePath "C:\path\to\RSH.exe" -IdleSeconds 120
  It starts the app, records time-to-window, then samples CPU % and memory every second
  while the window is open and idle, and writes perf-baseline-<timestamp>.txt.
  (Not yet tested by the author - no Windows machine available. If it errors, send me the message.)

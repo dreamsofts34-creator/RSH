@@ -1,9 +1,9 @@
-# ApexLink Firmware — Test Report (2026-11-10, DevKit V1, v3 — advanced features)
+# RSH Firmware — Test Report (2026-11-10, DevKit V1, v3 — advanced features)
 
 ## v3 advanced features (owner ki request par)
 | Feature | Tafseel | Hifazat/notes |
 |---|---|---|
-| OTA update | WiFi par firmware update, hostname `apexlink`, ArduinoOTA | Password lazmi (config mein badlo); update ke doran sampling band, LED 5 Hz |
+| OTA update | WiFi par firmware update, hostname `rsh`, ArduinoOTA | Password lazmi (config mein badlo); update ke doran sampling band, LED 5 Hz |
 | Auto WiFi channel | Boot par scan, 1/6/11 mein sab se khaali (padosi overlap score ke sath) | `WIFI_CHANNEL` 1-13 rakho to fix channel; scan sirf boot/retry par |
 | Adaptive sampling | Governor: overruns zyada hon to samples 16/8 → 12/6 → 8/4; 5 saaf windows par wapas upar | Host tests se transitions verify; packet format/protocol bilkul tabdeel nahi |
 | Remote restart | Port 4210 par `RSTX` packet → saaf restart | Sirf WPA2 AP se jura device bhej sakta hai; flag se band ho sakta hai |
@@ -71,7 +71,7 @@
 - setSleep(false) rakha hai lekin AP-mode latency is par munhasir nahi (research: ye STA mechanism hai).
 
 ## Sirf board par verify hoga (abhi दावा nahi)
-1. **Cycle timing:** ek analogRead ka asal waqt C3/ESP32 par koi published bharosemand number nahi mila. Firmware debug mode (`APEXLINK_DEBUG 1`) har second `sent/s`, `overrun`, `maxCycleUs`, steering stddev print karta hai — board par pehla test yehi hai. Hadaf: sent/s ≈ 200, overrun 0.
+1. **Cycle timing:** ek analogRead ka asal waqt C3/ESP32 par koi published bharosemand number nahi mila. Firmware debug mode (`RSH_DEBUG 1`) har second `sent/s`, `overrun`, `maxCycleUs`, steering stddev print karta hai — board par pehla test yehi hai. Hadaf: sent/s ≈ 200, overrun 0.
 2. **ADC noise WiFi on** par (docs threshold ±6 counts raw mode mein; mV mode mein muqabla board par).
 3. **LED polarity:** DevKit V1 ki onboard LED aam tor par GPIO2 active-HIGH hoti hai; clone boards mein farq ho sakta hai — ulti chale to `config.h` mein `LED_ACTIVE_LOW 1` kar do.
 4. **AP connect/range** full power par tumhare mahol mein.

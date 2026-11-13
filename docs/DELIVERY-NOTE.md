@@ -1,14 +1,14 @@
-# ApexLink — FINAL DELIVERY (Audit Build, 10 Nov 2026)
+# RSH — FINAL DELIVERY (Audit Build, 10 Nov 2026)
 
 Ali bhai, deep analysis + fixes + virtual user testing mukammal hai.
 Ye final package hai — firmware v3.1 aur software v1.0.0 (audit build).
 
 ## Setup installer — ban gaya hai
 
-**ApexLink-Setup-1.0.0.exe (54.7 MB)** — asal setup installer hai,
+**RSH-Setup-1.0.0.exe (54.7 MB)** — asal setup installer hai,
 professional software ki tarah: install wizard, Start Menu + Desktop
 shortcut, Add/Remove Programs entry, uninstaller. Per-user install hai,
-admin rights nahi chahiye. Andar wahi self-contained ApexLink hai, to
+admin rights nahi chahiye. Andar wahi self-contained RSH hai, to
 .NET waghera kuch install nahi karna parega. Bas vJoy driver alag se
 chahiye hoga (neeche dekho).
 
@@ -57,12 +57,12 @@ use karta hai — nakli wheel se packets andar, joystick output record:
 
 ## Files jo mil rahi hain
 
-1. **ApexLink-Setup-1.0.0.exe** (54.7 MB) — recommended, yahi chalao
-2. **ApexLink-Software-v1.0.0-LITE.zip** (10.5 MB) — halka download;
+1. **RSH-Setup-1.0.0.exe** (54.7 MB) — recommended, yahi chalao
+2. **RSH-Software-v1.0.0-LITE.zip** (10.5 MB) — halka download;
    pehle ek dafa .NET 10 Desktop Runtime (free, Microsoft) chahiye
-3. **ApexLink-Software-v1.0.0.zip** (132 MB) — portable exe + setup +
+3. **RSH-Software-v1.0.0.zip** (132 MB) — portable exe + setup +
    guide + report + dono installer scripts, sab ek jagah
-4. **ApexLink-Firmware-DevKitV1-v3.1.zip** — firmware ka naya version
+4. **RSH-Firmware-DevKitV1-v3.1.zip** — firmware ka naya version
    (clamp fix ke sath); purani v3 ki jagah yahi flash karna
 
 ## Sirf ye cheezein aap ke PC/board par hi test ho sakti hain
@@ -78,9 +78,9 @@ par test ho sakta tha, ho chuka hai.
 
 1. vJoy driver install karo — **BrunnerInnovation v2.2.2.0** (driver aur
    DLL same version). Ye ek dafa ka kaam hai.
-2. ApexLink-Setup chalao, app kholo — pehli dafa 5-step wizard ayega
+2. RSH-Setup chalao, app kholo — pehli dafa 5-step wizard ayega
    (vJoy check, wheel connect, calibration, buttons, finish).
-3. ESP32 ko **APEXLINK** Wi-Fi se joro (firmware ma password config.h
+3. ESP32 ko **RSH** Wi-Fi se joro (firmware ma password config.h
    ma hai — flash se pehle `change-me-123` aur OTA password lazmi badlo).
 4. Calibration wizard se steering centre/left/right aur pedals set karo,
    phir game ma vJoy device bind karo.
@@ -159,7 +159,7 @@ auto-calibration 7) Button + output test.
 
 ## Is dafa ki files
 
-1. **ApexLink-Essentials-v1.1.0.zip** (11.3 MB) — updated LITE app
+1. **RSH-Essentials-v1.1.0.zip** (11.3 MB) — updated LITE app
    (v1.1.0) + firmware v3.2 .bin + README. Setup installer owner ke
    kehne par deferred hai (download slow tha); essentials hi
    current tareeqa hai.
@@ -185,7 +185,7 @@ ke style ma poora redesign:
 - **Design v2:** light theme default (ek-dafa migration; Settings se
   badal sakte ho), pastel background, bara ControlCornerRadius (12)
   — cards/buttons/inputs ek hi golai; brand violet accent (#6C4CF1)
-  poori app ma; sidebar ma brand header (violet A tile + ApexLink);
+  poori app ma; sidebar ma brand header (violet A tile + RSH);
   Dashboard par reference-style icon chips; Monitor plot ab theme ke
   sath (light ma safed/violet); gauges pehle se theme resources par
   thay, khud naye rangon par aa gaye.
@@ -193,7 +193,7 @@ ke style ma poora redesign:
   labels khatam — 30+ text blocks ek line ya us se kam, professional
   English. Sirf wohi lines rahi jo kaam ki hain.
 - **Auto setup ab asal ma setup karta hai:** Wizard ke Link step par
-  "Connect automatically" — app netsh se APEXLINK ka profile bana
+  "Connect automatically" — app netsh se RSH ka profile bana
   kar PC ko khud jor deta hai (password Connection page par editable,
   settings ma save). vJoy step par action buttons: "Open vJoy
   Configure" aur "Get vJoy driver" — sirf check nahi, hal bhi wahi.
@@ -216,14 +216,14 @@ vJoy Configure button ka asal behaviour, game ma binding.
 ## UI UPDATE ROUNDS (owner-supplied patches, built + delivered by assistant)
 
 ### Software v1.2.1 — UI Update v1 (2026-11-11)
-- Owner uploaded `ApexLink-UI-Update.zip` (8 files, authored with another Claude): new Setup page + SetupViewModel, Home/Setup/Tune changes in MainWindow, ViewModelStore, CalibrationTuning, ProcessingPage.
+- Owner uploaded `RSH-UI-Update.zip` (8 files, authored with another Claude): new Setup page + SetupViewModel, Home/Setup/Tune changes in MainWindow, ViewModelStore, CalibrationTuning, ProcessingPage.
 - Applied over the v1.2.0 source (backup: `software-backup-v1.2.0/`). Build 0 errors / 0 warnings; tests 42 passed + 1 skipped. Version bumped to 1.2.1.
-- Delivered as `ApexLink-Essentials-v1.2.1.zip` via Google Drive (shared to owner) + email with the link.
+- Delivered as `RSH-Essentials-v1.2.1.zip` via Google Drive (shared to owner) + email with the link.
 
 ### Software v1.2.2 — UI Update v2 (2026-11-11)
-- Owner uploaded `ApexLink-UI-Update-v2.zip` (13 files): new design round — sidebar, Home, Setup, Tune; new `Themes/Theme.xaml`, App.xaml, Dashboard + Processing + Setup pages reworked.
+- Owner uploaded `RSH-UI-Update-v2.zip` (13 files): new design round — sidebar, Home, Setup, Tune; new `Themes/Theme.xaml`, App.xaml, Dashboard + Processing + Setup pages reworked.
 - Applied over v1.2.1 (backup: `software-backup-v1.2.1/`). Build 0/0; tests 42 passed + 1 skipped. Version 1.2.2.
-- Delivered as `ApexLink-Essentials-v1.2.2.zip` via Google Drive + email.
+- Delivered as `RSH-Essentials-v1.2.2.zip` via Google Drive + email.
 
 ### Delivery route (standing)
 Chat and Gmail both block the release zips (Gmail policy on archives containing executables; app is unsigned). Working route: upload to Google Drive, share reader access to the owner's Gmail (coder6171@gmail.com), email the Drive link. Firmware flashing: owner connected the board on 2026-11-11 (ESP32-D0WD-V3 detected in the Adafruit web flasher) and was guided to the first offset row at 0x0; flash completion not yet confirmed.

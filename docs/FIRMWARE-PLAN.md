@@ -1,7 +1,7 @@
 # RSH (Real Sim Hub) — Firmware Plan (v4.0 track)
 
 Target board: **ESP32 DevKit V1** (original ESP32). Starting point: firmware **v3.3** (fixed pins in `config.h`, 18-byte protocol v1, SoftAP + UDP, Web OTA).
-Product name is now **RSH — Real Sim Hub**; on-air identifiers (SSID `APEXLINK`, OTA hostname) stay as they are so already-flashed boards keep working (rename of these is optional, later). **All requested features are in scope** (battery, LED/display, encoders, expanders, other boards via capability tables).
+Product name is now **RSH — Real Sim Hub**; on-air identifiers were renamed with it in Step 0 (SSID `RSH`, OTA hostname `rsh`) — boards flashed with the old firmware must be reflashed, since the new app only joins the `RSH` network. **All requested features are in scope** (battery, LED/display, encoders, expanders, other boards via capability tables).
 
 **Universal, modular wheel (owner requirement):** *everything runs on ONE ESP32* — steering, throttle, brake, clutch, handbrake, shifter, horn, buttons, encoders, LEDs. The user attaches only the parts they want; whatever is not attached simply does not exist (no module, no pin, no packet field, no UI). Power can come from **any source** (USB, battery, SMPS/buck converter) — the firmware does not care.
 
@@ -257,6 +257,6 @@ Dependency: **F1 + F2 unblock the software Settings → pins UI** (software plan
 
 ## 11. Decisions
 
-**All decided** (owner delegated the remaining choices): everything on **one ESP32**; modules optional and user-chosen; power source irrelevant, battery monitor optional; runtime GPIO assignment with pin-budget helper; all features in scope; "race" = throttle; 10 s rollback confirm; SSID/OTA names unchanged for now; **protocol v2 frozen as drafted**; LED strip default WS2812 ≤ 60 LEDs; full-rig preset = 15 buttons + 2 encoders (matrix or MCP23017 once direct pins run out); performance protected by construction (§0), no measured baseline required.
+**All decided** (owner delegated the remaining choices): everything on **one ESP32**; modules optional and user-chosen; power source irrelevant, battery monitor optional; runtime GPIO assignment with pin-budget helper; all features in scope; "race" = throttle; 10 s rollback confirm; SSID/OTA names renamed in Step 0 (SSID `RSH`, hostname `rsh`); **protocol v2 frozen as drafted**; LED strip default WS2812 ≤ 60 LEDs; full-rig preset = 15 buttons + 2 encoders (matrix or MCP23017 once direct pins run out); performance protected by construction (§0), no measured baseline required.
 
 Nothing is waiting on the owner. **No firmware code is written until the owner says "start F1".**

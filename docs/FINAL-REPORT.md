@@ -1,4 +1,4 @@
-# ApexLink — Final Delivery Report (Software v1.0.0)
+# RSH — Final Delivery Report (Software v1.0.0)
 
 Date: 2026-11-10 · By Dreamsofts · Companion to firmware v3 (DevKit V1, delivered separately)
 
@@ -6,11 +6,11 @@ Date: 2026-11-10 · By Dreamsofts · Companion to firmware v3 (DevKit V1, delive
 
 | Deliverable | Where |
 |---|---|
-| **ApexLink.exe** (portable, self-contained, single file — no .NET install needed) | `release/win-x64/ApexLink.exe` (195 MB — includes the .NET 10 runtime + WPF; runs on any Win10/11 x64) |
-| Installer script (per-user, no admin) | `release-assets/ApexLink-Setup.iss` + `build-release.ps1` |
+| **RSH.exe** (portable, self-contained, single file — no .NET install needed) | `release/win-x64/RSH.exe` (195 MB — includes the .NET 10 runtime + WPF; runs on any Win10/11 x64) |
+| Installer script (per-user, no admin) | `release-assets/RSH-Setup.iss` + `build-release.ps1` |
 | User guide | `USER-GUIDE.md` (install → vJoy → wizard → calibrate → game → troubleshooting) |
 | Source | `software/` (Core + VJoy output + WPF app + Simulator + Benchmarks + tests) |
-| Firmware | `ApexLink-Firmware-DevKitV1-v3.zip` (already delivered) |
+| Firmware | `RSH-Firmware-DevKitV1-v3.zip` (already delivered) |
 
 ## The app (10 pages, all functional)
 
@@ -44,7 +44,7 @@ backup + defaults fallback).
   real-UDP loopback test: this build machine's sandbox forbids UDP
   loopback by policy; the identical logic is covered socket-free, and
   the test runs fully on Windows.
-- Benchmarks (`tools/ApexLink.Benchmarks`, Release): packet parse
+- Benchmarks (`tools/RSH.Benchmarks`, Release): packet parse
   **382 ns, 0.00 B allocated/packet** · processing pipeline **446 ns/tick,
   0.00 B/tick** · engine soak at exactly 200 ticks/s: max tick 637 µs,
   **0 late ticks, 0 Gen2 collections**, heap flat 0.4→0.6 MB, working set
@@ -82,7 +82,7 @@ claimed as tested:
    mincutoff 1.0 / beta 0.1 are the author's pattern, tuned-by-feel on
    hardware — the smoothing slider maps onto them).
 4. A real game binding pass (any title) and the 8-hour soak budget on
-   your PC (`ApexLink.Benchmarks` prints the numbers there in ~1 minute
+   your PC (`RSH.Benchmarks` prints the numbers there in ~1 minute
    plus soak time).
 5. The Inno installer — build it on Windows with `build-release.ps1`
    (needs Inno Setup installed); the portable exe needs nothing.
@@ -135,6 +135,6 @@ its logic is covered socket-free), firmware host suite 536 checks /
 firmware PlatformIO esp32dev compile SUCCESS, full solution Release
 build clean.
 
-**Installer:** a compiled `ApexLink-Setup-1.0.0.exe` (NSIS, per-user,
+**Installer:** a compiled `RSH-Setup-1.0.0.exe` (NSIS, per-user,
 LZMA) now ships alongside the portable exe; the Inno script and this
 NSIS script both remain in `release-assets/` for rebuilds.
