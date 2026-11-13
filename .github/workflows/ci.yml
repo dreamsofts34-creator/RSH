@@ -1,0 +1,221 @@
+# RSH — CI (WP6 / Software Plan SW-1, Plan v2.3 WP6/T6)
+#
+# Har push / pull request par: dotnet build + test, C++ host tests,
+# Python reference scripts, firmware build, benchmark gate.
+# CI ke baghair kisi phase ka "tests pass" gate count nahi hoga.
+#
+# !!! PEHLI RUN — VIRTUAL TEST RIG MEIN !!!
+# GitHub par push abhi MANA hai (local-only rule), is liye ye workflow
+# GitHub Actions par run NAHI hoga. Pehli green run Virtual Test Rig
+# (~/workspace/projects/rsh/test-env/) ke andar hogi — har job ke header
+# comment mein likha hai ke wo rig ke andar kaise chalega. Jab push allow
+# hoga, ye workflow bina tabdeeli ke GitHub par bhi chalega.
+#
+# Release workflow (.github/workflows/release.yml) se farq:
+# release.yml sirf tag v* par release banata hai; ye CI har push/PR par
+# chalta hai aur kuch release nahi karta.
+#
+# NOTE (QA correction — brief mein ubuntu-latest likha tha):
+# `dotnet` job windows-latest par hai, kyunke RSH.App WPF hai
+# (net10.0-windows, UseWPF) aur RSH.VJoy.Tests bhi net10.0-windows hai.
+# `dotnet build` Linux par bhi compile ho jata (EnableWindowsTargeting),
+# lekin `dotnet test` Windows-targeted test assembly ko ubuntu-latest par
+# EXECUTE nahi kar sakta — ubuntu par dotnet job pehle din se red hota.
+# release.yml ka software job bhi windows-latest use karta hai.
+# Host tests, firmware aur benchmark-gate ubuntu-latest par hain.
+
+name: RSH — CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------
+  # dotnet — RSH app + tests (Windows runner; WPF ki wajah se)
+  # Rig mein: Windows runner/VM par yehi steps chalenge
+  #   (setup-dotnet 10.0.100 -> dotnet build -> dotnet test x2).
+  # ------------------------------------------------------------------
+  dotnet:
+    name: .NET build + tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET SDK 10.0.100
+        uses: actions/setup-dotnet@v4
+        with:
+          # software/global.json bhi 10.0.100 pin karta hai
+          # (rollForward latestPatch); yahan explicit pin taake
+          # global.json ke baghair bhi SDK wahi rahe.
+          dotnet-version: "10.0.100"
+
+      - name: Verify SDK pin matches global.json
+        shell: pwsh
+        run: |
+          $sdk = (dotnet --version).Trim()
+          $pinned = (Get-Content software/global.json | ConvertFrom-Json).sdk.version
+          Write-Host "SDK: $sdk, global.json pin: $pinned"
+          if ($sdk -ne $pinned) { throw "SDK $sdk != global.json pin $pinned" }
+
+      - name: Build solution
+        # Warnings-as-errors: production code (src/) ke liye pehle se ON hai
+        # via software/src/Directory.Build.props (TreatWarningsAsErrors=true),
+        # is liye plain build hi src warnings par fail hoga.
+        # Solution-wide `-p:TreatWarningsAsErrors=true` yahan NAHI lagaya:
+        # test projects mein pehle se 2 mojood warnings hain — wo fix hone
+        # tak solution-wide flag CI ko red kar dega. Un 2 warnings ka fix
+        # alag follow-up hai; us ke baad solution-wide flag lagaya ja sakta hai.
+        run: dotnet build software/RSH.slnx -c Release --nologo
+
+      # Test counts (T5): har test project apne step mein — breakdown ke
+      # saath, koi single gumrah-kun aggregate number nahi ("536 checks"
+      # jaisa). Har step ka console summary us project ki Passed/Failed/
+      # Skipped ginti hai; fail hone par pata chalta hai kaunsa project fail hua.
+      - name: Test RSH.Tests (Core)
+        run: dotnet test software/tests/RSH.Tests/RSH.Tests.csproj -c Release --no-build --nologo
+
+      - name: Test RSH.VJoy.Tests (vJoy layout)
+        run: dotnet test software/tests/RSH.VJoy.Tests/RSH.VJoy.Tests.csproj -c Release --no-build --nologo
+
+  # ------------------------------------------------------------------
+  # host-tests — C++ host tests + Python reference scripts (Linux)
+  # Rig mein: Linux runner par yehi steps; koi Arduino/board nahi chahiye.
+  # ------------------------------------------------------------------
+  host-tests:
+    name: C++ host tests + Python scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: C++ host tests (run_tests.sh)
+        run: sh tests-host/run_tests.sh
+
+      - name: C++ host tests — strict flags (T6)
+        # NOTE: run_tests.sh khud sakht flags ke baghair compile karta hai
+        # (plain `g++ -std=c++17 -O1`). Script ko chhede baghair CI yahan
+        # apna strict compile + run karta hai; run_tests.sh mein flags
+        # dalna firmware/host-test team ka follow-up hai.
+        run: |
+          g++ -std=c++17 -O1 -Wall -Wextra -Werror -fsanitize=address,undefined \
+            -I firmware/rsh -o /tmp/rsh_host_tests_strict tests-host/test_main.cpp
+          /tmp/rsh_host_tests_strict
+
+      # Har Python script apne step mein taake fail hone par pata chale
+      # kaunsi fail hui (ek combined step mein attribution kho jati).
+      - name: Python — pin rules reference
+        run: python3 -I tests-host/pin_rules_ref.py
+
+      - name: Python — protocol v2 golden vectors
+        run: python3 -I tests-host/protocol_v2_vectors.py
+
+      - name: Python — packet cross-verify
+        run: python3 -I tests-host/verify_packet.py
+
+  # ------------------------------------------------------------------
+  # firmware — ESP32 build + merged-bin check (Linux)
+  # Rig mein: Linux runner par pio run; board/flash ki zaroorat nahi.
+  # ------------------------------------------------------------------
+  firmware:
+    name: Firmware (ESP32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio
+          key: pio-${{ hashFiles('firmware/rsh/platformio.ini') }}
+
+      - name: Verify platform pin (espressif32@6.9.0)
+        run: grep -Fq 'platform = espressif32@6.9.0' firmware/rsh/platformio.ini
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      - name: Build firmware
+        working-directory: firmware/rsh
+        run: pio run
+
+      - name: Check merged factory bin EXISTS (silent-merge bug guard)
+        # merge_bin.py (post: script) koi input missing ho to stderr par
+        # "skipping merge" likh kar KHAMOSHI se return karta hai — pio run
+        # phir bhi green rehta hai aur merged bin bane baghair reh jata hai.
+        # Is liye CI mein merged bin ka existence check LAZMI hai: agar
+        # RSH-Firmware-DevKitV1-v*.bin na bana ho to job FAIL hogi.
+        run: |
+          BUILD_DIR="firmware/rsh/.pio/build/esp32dev"
+          ls -la "$BUILD_DIR"
+          test -f "$BUILD_DIR/firmware.bin" || { echo "MISSING: firmware.bin (app-only OTA image)"; exit 1; }
+          MERGED=$(ls "$BUILD_DIR"/RSH-Firmware-DevKitV1-v*.bin 2>/dev/null | head -n 1)
+          if [ -z "$MERGED" ]; then
+            echo "MISSING: merged factory bin RSH-Firmware-DevKitV1-v*.bin — merge_bin.py khamoshi se fail hua?"
+            exit 1
+          fi
+          echo "Merged factory bin OK: $MERGED"
+          sha256sum "$BUILD_DIR"/*.bin
+
+  # ------------------------------------------------------------------
+  # benchmark-gate — benchmarks + thresholds (Linux)
+  # Rig mein: Linux runner par; dotnet job green hone ke baad hi chalega.
+  # ------------------------------------------------------------------
+  benchmark-gate:
+    name: Benchmark gate
+    runs-on: ubuntu-latest
+    needs: [dotnet]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET SDK 10.0.100
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.100"
+
+      - name: Run benchmarks (short CI soak)
+        # Full soak (60 s default) local/manual run ke liye hai;
+        # CI mein --soak-sec 10 taake gate halka rahe.
+        run: dotnet run --project software/tools/RSH.Benchmarks -c Release -- --soak-sec 10
+
+      - name: Threshold gate
+        # Thresholds TBD — Phase B (P13/P14/T13).
+        # Structure tayyar hai: jab software/tools/RSH.Benchmarks/
+        # thresholds.json maujood hoga, gate us ke khilaf assert karega
+        # aur breach par FAIL hoga. Jab tak file nahi hai, gate PASS
+        # karta hai (jaan-boojh kar fail nahi karwaya — thresholds abhi
+        # final nahi hue). Phase B mein is step ko enforcing banao.
+        run: |
+          THRESHOLDS="software/tools/RSH.Benchmarks/thresholds.json"
+          if [ ! -f "$THRESHOLDS" ]; then
+            echo "Benchmark thresholds TBD — Phase B (file $THRESHOLDS nahi hai); gate abhi enforce nahi ho raha."
+            exit 0
+          fi
+          python3 - "$THRESHOLDS" <<'EOF'
+          import json, sys
+          print("thresholds file maujood hai — Phase B gate yahan assert karega:", sys.argv[1])
+          print(json.load(open(sys.argv[1])))
+          # TODO (Phase B): benchmark output ko thresholds se compare karo
+          # aur breach par sys.exit(1) karo.
+          EOF

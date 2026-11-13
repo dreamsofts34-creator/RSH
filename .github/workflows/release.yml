@@ -1,0 +1,141 @@
+# RSH — Build + Release
+# Tag push (v* / fw-v*) par chalta hai, ya Actions tab se manual.
+# Banata hai: ESP32 firmware bins + RSH Windows app (zip) -> GitHub Release.
+name: Build and Release
+
+on:
+  push:
+    # App tags vX.Y.Z hain (masalan v2.0.0), firmware tags fw-vX.Y.Z
+    # (masalan fw-v4.0.0, D27) — fw-v* sirf "v*" se match nahi karta,
+    # is liye dono patterns lazmi hain.
+    tags: ["v*", "fw-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (jaise v2.0.0)"
+        required: true
+        default: "v2.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  firmware:
+    name: Firmware (ESP32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio
+          key: pio-${{ hashFiles('firmware/rsh/platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install -U platformio
+      - name: Build firmware
+        working-directory: firmware/rsh
+        run: pio run
+      - name: Check merged factory bin EXISTS (silent-merge bug guard)
+        # merge_bin.py (post: script) koi input missing ho to stderr par
+        # "skipping merge" likh kar KHAMOSHI se return karta hai — pio run
+        # phir bhi green rehta hai aur merged bin bane baghair reh jata hai.
+        # Is liye yahan merged bin ka existence check LAZMI hai: agar
+        # RSH-Firmware-DevKitV1-v*.bin na bana ho to job FAIL hogi.
+        # (CI workflow ci.yml se copy — wahi guard.)
+        run: |
+          BUILD_DIR="firmware/rsh/.pio/build/esp32dev"
+          ls -la "$BUILD_DIR"
+          test -f "$BUILD_DIR/firmware.bin" || { echo "MISSING: firmware.bin (app-only OTA image)"; exit 1; }
+          MERGED=$(ls "$BUILD_DIR"/RSH-Firmware-DevKitV1-v*.bin 2>/dev/null | head -n 1)
+          if [ -z "$MERGED" ]; then
+            echo "MISSING: merged factory bin RSH-Firmware-DevKitV1-v*.bin — merge_bin.py khamoshi se fail hua?"
+            exit 1
+          fi
+          echo "Merged factory bin OK: $MERGED"
+      - name: Checksums
+        working-directory: firmware/rsh/.pio/build/esp32dev
+        run: sha256sum *.bin > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            firmware/rsh/.pio/build/esp32dev/*.bin
+            firmware/rsh/.pio/build/esp32dev/SHA256SUMS.txt
+
+  software:
+    name: RSH app (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          # software/global.json bhi 10.0.100 pin karta hai
+          # (rollForward latestPatch); yahan explicit pin taake
+          # global.json ke baghair bhi SDK wahi rahe — ye step repo
+          # root par chalta hai, jahan global.json maujood nahi hai.
+          dotnet-version: "10.0.100"
+      - name: Verify SDK pin matches global.json
+        shell: pwsh
+        run: |
+          $sdk = (dotnet --version).Trim()
+          $pinned = (Get-Content software/global.json | ConvertFrom-Json).sdk.version
+          Write-Host "SDK: $sdk, global.json pin: $pinned"
+          if ($sdk -ne $pinned) { throw "SDK $sdk != global.json pin $pinned" }
+      - name: Restore + test
+        working-directory: software
+        run: |
+          dotnet test RSH.slnx -c Release --nologo
+      - name: Publish app
+        working-directory: software
+        run: >
+          dotnet publish src/RSH.App/RSH.App.csproj
+          -c Release -r win-x64 --self-contained true
+          -o publish/RSH
+      - name: Zip app
+        shell: pwsh
+        run: |
+          Compress-Archive -Path software/publish/RSH/* -DestinationPath RSH-windows-x64.zip
+          Get-FileHash RSH-windows-x64.zip -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  RSH-windows-x64.zip" } |
+            Out-File -Encoding ascii SHA256SUMS-app.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: software
+          path: |
+            RSH-windows-x64.zip
+            SHA256SUMS-app.txt
+
+  release:
+    name: GitHub Release
+    needs: [firmware, software]
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout lazmi hai: gh release create --target "$GITHUB_SHA" ko
+      # usi commit par tag lagana hai jis par ye workflow chala — baghair
+      # checkout/target ke dispatch par release default branch ke HEAD
+      # par lagti, jo galat commit ho sakta hai.
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      # Re-run behaviour: agar is tag ki release pehle se maujood ho to
+      # `gh release create` "already exists" par FAIL hogi — ye EXPECTED
+      # hai (purani release ko khamoshi se overwrite/clobber nahi karna).
+      # Dobara release ke liye pehle purani release delete karo, phir
+      # workflow dobara chalao.
+      - name: Create release + upload files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.tag }}
+        run: |
+          ls -R artifacts
+          gh release create "$TAG" --prerelease --target "$GITHUB_SHA" --title "RSH $TAG" --generate-notes \
+            artifacts/firmware/*.bin \
+            artifacts/firmware/SHA256SUMS.txt \
+            artifacts/software/RSH-windows-x64.zip \
+            artifacts/software/SHA256SUMS-app.txt
