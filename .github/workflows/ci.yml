@@ -66,7 +66,11 @@ jobs:
           $sdk = (dotnet --version).Trim()
           $pinned = (Get-Content software/global.json | ConvertFrom-Json).sdk.version
           Write-Host "SDK: $sdk, global.json pin: $pinned"
-          if ($sdk -ne $pinned) { throw "SDK $sdk != global.json pin $pinned" }
+          # NOTE (2026-11-13): ye check pehle exact-equality tha, lekin
+          # global.json mein rollForward latestPatch hai — runner par naye
+          # patches preinstalled hote hain, is liye dotnet --version pin se
+          # naya de sakta hai. Pin minimum version hai, exact nahi.
+          if ([System.Version]$sdk -lt [System.Version]$pinned) { throw "SDK $sdk < global.json pin $pinned" }
 
       - name: Build solution
         # Warnings-as-errors: production code (src/) ke liye pehle se ON hai
