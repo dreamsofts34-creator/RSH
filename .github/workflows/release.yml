@@ -163,10 +163,33 @@ jobs:
           # patches preinstalled hote hain, is liye dotnet --version pin se
           # naya de sakta hai. Pin minimum version hai, exact nahi.
           if ([System.Version]$sdk -lt [System.Version]$pinned) { throw "SDK $sdk < global.json pin $pinned" }
-      - name: Restore + test
+      # Har test project apne step mein (CI jaisa breakdown) — xUnit v3/MTP
+      # console par fail hone wale test ka naam NAHI chhapta, is liye har
+      # step `--report-xunit-trx` se TRX likhta hai; fail hone par
+      # "Upload test results" step use artifact ke tor par upload karta hai.
+      - name: Test RSH.Tests (Core)
         working-directory: software
-        run: |
-          dotnet test RSH.slnx -c Release --nologo
+        run: dotnet test tests/RSH.Tests/RSH.Tests.csproj -c Release --nologo -- --report-xunit-trx --report-xunit-trx-filename RSH.Tests.trx --results-directory ${{ github.workspace }}/test-results
+
+      - name: Test RSH.VJoy.Tests (vJoy layout)
+        working-directory: software
+        run: dotnet test tests/RSH.VJoy.Tests/RSH.VJoy.Tests.csproj -c Release --nologo -- --report-xunit-trx --report-xunit-trx-filename RSH.VJoy.Tests.trx --results-directory ${{ github.workspace }}/test-results
+
+      - name: Test RSH.HIDMaestro.Tests (experimental backend)
+        working-directory: software
+        run: dotnet test tests/RSH.HIDMaestro.Tests/RSH.HIDMaestro.Tests.csproj -c Release --nologo -- --report-xunit-trx --report-xunit-trx-filename RSH.HIDMaestro.Tests.trx --results-directory ${{ github.workspace }}/test-results
+
+      - name: Test RSH.App.Tests (app services)
+        working-directory: software
+        run: dotnet test tests/RSH.App.Tests/RSH.App.Tests.csproj -c Release --nologo -- --report-xunit-trx --report-xunit-trx-filename RSH.App.Tests.trx --results-directory ${{ github.workspace }}/test-results
+
+      - name: Upload test results (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-test-results-release
+          path: test-results/*.trx
+          if-no-files-found: warn
       - name: Publish app
         working-directory: software
         run: >

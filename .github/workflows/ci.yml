@@ -86,11 +86,23 @@ jobs:
       # saath, koi single gumrah-kun aggregate number nahi ("536 checks"
       # jaisa). Har step ka console summary us project ki Passed/Failed/
       # Skipped ginti hai; fail hone par pata chalta hai kaunsa project fail hua.
+      # TRX report: xUnit v3/MTP console par fail hone wale test ka naam
+      # NAHI chhapta (sirf summary) — is liye har step `--report-xunit-trx`
+      # se TRX likhta hai aur "Upload test results" step fail hone par use
+      # artifact ke tor par upload karta hai (naamon ke saath diagnosis).
       - name: Test RSH.Tests (Core)
-        run: dotnet test software/tests/RSH.Tests/RSH.Tests.csproj -c Release --no-build --nologo
+        run: dotnet test software/tests/RSH.Tests/RSH.Tests.csproj -c Release --no-build --nologo -- --report-xunit-trx --report-xunit-trx-filename RSH.Tests.trx --results-directory ${{ github.workspace }}/test-results
 
       - name: Test RSH.VJoy.Tests (vJoy layout)
-        run: dotnet test software/tests/RSH.VJoy.Tests/RSH.VJoy.Tests.csproj -c Release --no-build --nologo
+        run: dotnet test software/tests/RSH.VJoy.Tests/RSH.VJoy.Tests.csproj -c Release --no-build --nologo -- --report-xunit-trx --report-xunit-trx-filename RSH.VJoy.Tests.trx --results-directory ${{ github.workspace }}/test-results
+
+      - name: Upload test results (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-test-results-ci
+          path: test-results/*.trx
+          if-no-files-found: warn
 
   # ------------------------------------------------------------------
   # host-tests — C++ host tests + Python reference scripts (Linux)
@@ -115,9 +127,20 @@ jobs:
         # (plain `g++ -std=c++17 -O1`). Script ko chhede baghair CI yahan
         # apna strict compile + run karta hai; run_tests.sh mein flags
         # dalna firmware/host-test team ka follow-up hai.
+        # test_main.cpp ko Ed25519 (FW-9 §20) ke liye libsodium chahiye —
+        # run_tests.sh jaisa versioned .so dhoondho (dev symlink nahi hota).
+        # Is ke baghair link fail hota hai (undefined reference to
+        # crypto_sign_* — release v2.0.0 ki pehli CI run, 2026-11-13).
         run: |
+          SODIUM_LIB=""
+          for d in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib /lib; do
+            for f in "$d"/libsodium.so*; do
+              [ -e "$f" ] && SODIUM_LIB="$f" && break 2
+            done
+          done
+          [ -n "$SODIUM_LIB" ] || { echo "libsodium nahi mila — Ed25519 host tests ke liye chahiye"; exit 1; }
           g++ -std=c++17 -O1 -Wall -Wextra -Werror -fsanitize=address,undefined \
-            -I firmware/rsh -o /tmp/rsh_host_tests_strict tests-host/test_main.cpp
+            -I firmware/rsh -o /tmp/rsh_host_tests_strict tests-host/test_main.cpp "$SODIUM_LIB"
           /tmp/rsh_host_tests_strict
 
       # Har Python script apne step mein taake fail hone par pata chale
