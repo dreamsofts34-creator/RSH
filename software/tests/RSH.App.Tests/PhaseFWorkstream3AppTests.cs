@@ -228,8 +228,14 @@ public sealed class PhaseFWorkstream3AppTests : IDisposable
             Profiles = [WheelProfile.CreateDefault("Default"), WheelProfile.CreateDefault("Restored")],
             ActiveProfileName = "Restored",
         };
+        string activeBefore = services.ActiveProfile.Name;
         await services.ProfileStore.SaveAsync(restored, TestContext.Current.CancellationToken);
-        Assert.Equal("Default", services.ActiveProfile.Name); // abhi bhi purani in-memory
+        // Windows par AppServices %AppData% istemal karta hai (XDG_CONFIG_HOME
+        // sirf Linux par) — pehle wale tests ki saved profiles (masalan
+        // "Drift") is test ki fresh AppServices mein load hoti hain, is liye
+        // hardcoded "Default" ghalat hai. Jo bhi active tha, SaveAsync ke
+        // baad wahi rehna chahiye (in-memory tabdeel nahi hoti).
+        Assert.Equal(activeBefore, services.ActiveProfile.Name); // abhi bhi purani in-memory
 
         var (ok, active, error) = await services.ReloadProfilesAsync(TestContext.Current.CancellationToken);
         Assert.True(ok, error);
@@ -297,8 +303,17 @@ public sealed class PhaseFWorkstream3AppTests : IDisposable
             cancellationToken: TestContext.Current.CancellationToken);
         Assert.True(ok, error);
         Assert.Equal(1, chunks);
-        Assert.Equal(new[] { ControlCommand.SetCfg, ControlCommand.Commit, ControlCommand.Confirm },
-            peer.ReceivedCommands);
+        // SEC-E-14: HELLO par app background mein khud GET_CAPS bhejta hai
+        // (Task.Run — async, is liye GetCaps push sequence ke pehle, beech
+        // mein ya baad mein bhi aa sakta hai). Push ka sequence SetCfg ->
+        // Commit -> Confirm hona chahiye — subsequence ke tor par assert
+        // karo, exact list nahi.
+        var seq = peer.ReceivedCommands;
+        int iSet = seq.IndexOf(ControlCommand.SetCfg);
+        int iCommit = seq.IndexOf(ControlCommand.Commit);
+        int iConfirm = seq.IndexOf(ControlCommand.Confirm);
+        Assert.True(iSet >= 0 && iCommit > iSet && iConfirm > iCommit,
+            $"Push sequence ghalat: [{string.Join(", ", seq)}]");
         Assert.NotNull(peer.CommittedBlob);
         Assert.True(ConfigBlob.TryValidateStructure(peer.CommittedBlob!, out string? blobError), blobError);
         Assert.True(peer.Confirmed);
@@ -494,8 +509,17 @@ public sealed class PhaseFWorkstream3AppTests : IDisposable
             cancellationToken: TestContext.Current.CancellationToken);
         Assert.True(ok, error);
         Assert.Equal(1, chunks);
-        Assert.Equal(new[] { ControlCommand.SetCfg, ControlCommand.Commit, ControlCommand.Confirm },
-            peer.ReceivedCommands);
+        // SEC-E-14: HELLO par app background mein khud GET_CAPS bhejta hai
+        // (Task.Run — async, is liye GetCaps push sequence ke pehle, beech
+        // mein ya baad mein bhi aa sakta hai). Push ka sequence SetCfg ->
+        // Commit -> Confirm hona chahiye — subsequence ke tor par assert
+        // karo, exact list nahi.
+        var seq = peer.ReceivedCommands;
+        int iSet = seq.IndexOf(ControlCommand.SetCfg);
+        int iCommit = seq.IndexOf(ControlCommand.Commit);
+        int iConfirm = seq.IndexOf(ControlCommand.Confirm);
+        Assert.True(iSet >= 0 && iCommit > iSet && iConfirm > iCommit,
+            $"Push sequence ghalat: [{string.Join(", ", seq)}]");
         Assert.NotNull(peer.CommittedBlob);
         var records = ReadRecords(peer.CommittedBlob!);
         Assert.Contains(records, r => r.Type == 1 && r.Slot == 0 && r.PinA == 34);
