@@ -282,6 +282,27 @@ impl QueueDepth {
     }
 }
 
+/// Enqueue one parsed frame for the engine, counting it in the queue
+/// depth. The count MUST happen-before the frame becomes visible to
+/// the consumer: the old `try_send` + count-after let the engine
+/// dequeue the frame in between, wrapping `current` to `usize::MAX`
+/// when the queue was empty — the next enqueue's `+ 1` then panics in
+/// debug and kills the transport task (CI rig-gate + local repro:
+/// 26/27, soak/fault-reboot failing on the dead transport). Reserving
+/// the permit first acquires the slot WITHOUT publishing the frame, so
+/// the count lands before any dequeue can observe it; `Permit::send`
+/// publishes afterwards. A failed reserve (full / closed) is a counted
+/// drop, exactly as before.
+fn enqueue_frame(tx: &mpsc::Sender<StreamFrame>, depth: &QueueDepth, frame: StreamFrame) {
+    match tx.try_reserve() {
+        Ok(permit) => {
+            depth.on_enqueue();
+            permit.send(frame);
+        }
+        Err(_) => depth.on_drop(),
+    }
+}
+
 /// Queue capacity: mirrors the product forwarder's bounded `mpsc`
 /// (256, drop-newest on full — see the module docs). The engine
 /// drains every 5 ms and the wheel emits every 5.1 ms, so a healthy
@@ -648,10 +669,10 @@ async fn transport_task(
                     // drop-newest on full, counted — never silent.
                     // `try_send` is synchronous, so no `.await` runs
                     // while the transport lock is held (M-12).
-                    match frame_tx.try_send(frame) {
-                        Ok(()) => queue_depth.on_enqueue(),
-                        Err(_) => queue_depth.on_drop(),
-                    }
+                    // `enqueue_frame` reserves the permit BEFORE
+                    // counting: count-after-send wraps `current` when
+                    // the engine dequeues in between (see its docs).
+                    enqueue_frame(&frame_tx, &queue_depth, frame);
                 }
             }
             WireMsg::Status(pkt) => {
@@ -1411,7 +1432,7 @@ fn self_check_pin_map_push() -> (bool, String) {
 mod tests {
     use super::{
         FRAME_QUEUE_CAPACITY, PacketSource, QueueDepth, QueuedSource, coalesced_frames,
-        loss_percent,
+        enqueue_frame, loss_percent,
     };
     use rsh_protocol::StreamFrame;
     use std::sync::Arc;
@@ -1527,5 +1548,96 @@ mod tests {
         depth.on_enqueue();
         let got = timeout(Duration::from_millis(100), src.next_frame()).await;
         assert!(matches!(got, Ok(Some(f)) if f.seq == 11));
+    }
+
+    /// H-1 regression: the queue-depth count must happen-before the
+    /// frame becomes visible (see `enqueue_frame`). The old `try_send` +
+    /// count-after shape wrapped `current` to `usize::MAX` whenever the
+    /// engine dequeued the frame in the gap while the queue was empty —
+    /// the next enqueue's `+ 1` then panicked in debug and killed the
+    /// transport task (CI rig-gate + local repro: 26/27). This test runs
+    /// the exact shape that fired it: the queue is EMPTY at every send
+    /// (the producer waits for `current == 0` before sending the next
+    /// frame) while the consumer spins on the engine's zero-timeout
+    /// polls, so a dequeue landing in the send/count gap is likely —
+    /// on the old code it panics with "attempt to add with overflow";
+    /// on the fixed code the books balance exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queue_depth_count_before_publish_regression() {
+        use std::sync::atomic::Ordering as O;
+        const FRAMES: u64 = 30_000;
+        let (tx, rx) = mpsc::channel::<StreamFrame>(FRAME_QUEUE_CAPACITY);
+        let depth = Arc::new(QueueDepth::default());
+        let rx = Arc::new(AsyncMutex::new(rx));
+
+        // Producer: one frame at a time through the production helper,
+        // waiting for the queue to drain to empty before the next send
+        // (the racy shape — a tight loop keeps the queue full, which
+        // hides the wrap).
+        let prod_depth = Arc::clone(&depth);
+        let producer = tokio::spawn(async move {
+            let mut n: u16 = 0;
+            for _ in 0..FRAMES {
+                n = n.wrapping_add(1);
+                let frame = StreamFrame::new(
+                    n,
+                    (n as u32).wrapping_mul(5000),
+                    rsh_protocol::StreamFlags::default(),
+                    &[],
+                    &[0; 4],
+                    0,
+                );
+                enqueue_frame(&tx, &prod_depth, frame);
+                // Wait for the consumer to drain it (bounded: a wrapped
+                // counter never returns to 0, so bail out loudly instead
+                // of hanging — the panic in the producer already fails
+                // the test in that case).
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while prod_depth.current.load(O::Relaxed) != 0 {
+                    assert!(
+                        tokio::time::Instant::now() <= deadline,
+                        "queue did not drain to empty within 5 s"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        // Consumer: the engine's drain shape — zero-timeout polls,
+        // spinning (no sleep) so it is polling when the next frame
+        // lands, exactly like the 200 Hz tick polling an empty queue.
+        let mut src = QueuedSource {
+            rx: Arc::clone(&rx),
+            depth: Arc::clone(&depth),
+        };
+        let mut drained = 0u64;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while drained < FRAMES && tokio::time::Instant::now() < deadline {
+            let mut got_this_tick = 0;
+            while got_this_tick < 32 {
+                match timeout(Duration::ZERO, src.next_frame()).await {
+                    Ok(Some(_)) => {
+                        drained += 1;
+                        got_this_tick += 1;
+                    }
+                    _ => break,
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        producer.await.expect("producer alive");
+        // Drain whatever is left, then the books must balance exactly.
+        while let Ok(Some(_)) = timeout(Duration::from_millis(100), src.next_frame()).await {
+            drained += 1;
+        }
+        let dropped = depth.dropped.load(O::Relaxed);
+        let cur = depth.current.load(O::Relaxed);
+        assert_eq!(
+            drained + dropped,
+            FRAMES,
+            "every frame is either drained or counted dropped (drained {drained}, dropped {dropped})"
+        );
+        assert_eq!(cur, 0, "queue must be empty after a full drain");
+        assert_eq!(dropped, 0, "a draining consumer must not drop frames");
     }
 }

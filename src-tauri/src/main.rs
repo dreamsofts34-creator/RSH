@@ -926,12 +926,11 @@ fn main() {
         }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(
-                system::AUTOSTART_ARGS
-                    .iter()
-                    .map(std::string::ToString::to_string)
-                    .collect(),
-            ),
+            // `init` takes `Option<Vec<&'static str>>` (CI Windows,
+            // 2026-11-14: E0277 `Vec<&str>` cannot be built from
+            // `String`s) — `AUTOSTART_ARGS` already is `&[&str]`, so
+            // copy it; mapping through `to_string` built `Vec<String>`.
+            Some(system::AUTOSTART_ARGS.to_vec()),
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         // M13 (deep-scan Round 2): native file picker for the Setup

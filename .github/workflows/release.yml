@@ -169,6 +169,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.100.0"
+          # Dry-run #3 (2026-11-14): `cargo fmt --check` failed with
+          # "'cargo-fmt.exe' is not installed for the toolchain
+          # '1.100.0-...'" — dtolnay installs only the default
+          # components; rustfmt + clippy must be requested explicitly
+          # (CI already does this per job: `components: rustfmt` /
+          # `components: clippy`). Without them this workflow fails at
+          # fmt (and clippy would fail the same way right after).
+          components: rustfmt, clippy
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
