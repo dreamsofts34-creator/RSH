@@ -1,41 +1,162 @@
-# RSH — ESP32 Flashing Guide (step by step)
+# RSH — Flash Guide (firmware v4.0.1)
 
-**Version 2.0.4 — app v2.0.4 · firmware v4.0.1 · protocol v2.1**
+**Board:** ESP32 DevKit V1 (original ESP32, 4 MB flash) ·
+**Firmware:** C++ v4.0.1 · **Protocol:** v2.1 ·
+**App:** Rust v1.0.0
 
-First flash is via USB. Every later update is wireless (Web OTA page or the app wizard) — no cable needed again.
+> **Do you need this guide at all?** Probably not. The Rust app
+> v1.0.0 talks to the same C++ v4.0.1 board — **if your wheel already
+> runs firmware v4.0.1, no reflash is needed** to use the Rust app
+> (you only need to [re-pair](USER-GUIDE.md#re-pairing-after-the-c-rust-switch-mandatory)).
+> This guide is only for a **new/blank board** or a **board that will
+> not boot**. The detailed companion (signing internals, source build,
+> host-mock checks) is [REFLASH-GUIDE.md](REFLASH-GUIDE.md).
 
-## What flashes
-- File: `RSH-Firmware-DevKitV1-v4.0.1.bin` (build it from `firmware/rsh/`; not included in the cleaned package).
-- It is a **merged** image (bootloader + partitions + app), so it always flashes at address **0x0**.
+## 1. Before you start — which file?
 
-## You need
-- ESP32 DevKit V1 board and a **data** USB cable (charge-only cables never show a COM port).
-- Chrome or Edge (the web flasher needs Web Serial; Firefox will not work).
+| Situation | Action |
+|---|---|
+| Rust app v1.0.0 install / update | **Do NOT reflash** — an app update never changes firmware |
+| New (blank) ESP32 DevKit V1 | Flash the merged factory image (§3) |
+| Board seems bricked (no Wi-Fi, will not boot) | Flash the merged factory image (§5 recovery) |
+| Config broken / board behaving oddly | Try app **FACTORY_RESET** first (keeps key + Wi-Fi password); or BOOT-hold safe mode (§4) — **not** a reflash |
+| Reflash v4.0.1 → v4.0.1 again | No-op — only if the image looks corrupt |
 
-## Steps
-1. **Plug the board in.** Open Device Manager → *Ports (COM & LPT)*. A COM port should appear (CP210x or CH340 name). If none: change the cable first, then install the CP2102/CH340 USB driver for your board's chip.
-2. **Flash the merged bin — pick one method:**
-   - **A (recommended): esptool.py** (same tool as `docs/BRICK-RECOVERY.md`):
-     ```bash
-     esptool.py --chip esp32 --port COM3 --baud 921600 write_flash 0x0 RSH-Firmware-DevKitV1-v4.0.1.bin
-     ```
-     Linux par port `/dev/ttyUSB0` hota hai. Baud fail ho to `115200` try karo.
-     Offset **0x0** hona chahiye.
-   - **B: PlatformIO** (from `firmware/rsh/`):
-     ```bash
-     pio run -t upload
-     ```
-   - **C (alternative): Adafruit WebSerial ESPTool** (`adafruit.github.io/Adafruit_WebSerial_ESPTool`, Chrome/Edge — Web Serial chahiye, Firefox nahi chalega): Connect, pick the board's COM port, baud **921600** (fall back to 115200 if flashing fails). If you get "Failed to connect": hold the board's **BOOT** button, click Connect, release BOOT once "Connecting..." starts (on some boards also tap **EN/RST** while holding BOOT).
-3. **Give the file (method C only).** In the **first (top) row only**, click *Choose a file...* and select `RSH-Firmware-DevKitV1-v4.0.1.bin`. Leave its offset at **0**. Leave the other three rows empty.
-4. **Program (method C only).** Click *Program*. Erasing → Writing runs (~30–60 s). Do not touch the cable or board. (Methods A/B finish on their own — esptool aakhir mein `Hash of data verified` likhta hai.)
-5. **Restart & confirm.** When done, press **EN/RST** on the board (or replug USB). Check the Wi-Fi list on PC/phone: a network named **RSH** should appear — that confirms the firmware is running.
-6. **Pair immediately — first pairing is over an OPEN network (read this).** The board's Wi-Fi password is per-device and random — there is no default password. Before the first pairing the `RSH` network is **open (no password)** so the app can connect and receive the key + password in the first HELLO (pairing window: 60 s from AP-up; PROTOCOL-V2.1 §4.2, OPEN-6 — CLOSED decision). **Security warning (TM-W02 residual risk):** during that open window there is no link-layer encryption — anyone in Wi-Fi range could listen to the pairing exchange. So: **pair at home, in your own room, immediately after flashing — do not leave the board unpaired.** As soon as pairing succeeds (first HMAC-signed GET_CAPS), the AP switches to WPA2 with the per-device password and the key is never sent again. If the 60 s window expires before you pair, the AP stays visible but pairing is refused (HELLO sends a zero key) — re-pairing then needs KEY_RESET (hold BOOT ≥ 10 s, then pair again). If you ever suspect the pairing was overheard, do a KEY_RESET for a fresh key + password. After pairing, the Wi-Fi password lives in the app (DPAPI KeyStore) — never write it down in chat or docs.
+**Use the merged factory image only:**
 
-## If something goes wrong
-- **No COM port:** data cable → driver (CP2102/CH340) → another USB port (rear ports are more stable).
-- **Repeated connect failures:** BOOT-button trick + baud 115200.
-- **Flashed but no RSH Wi-Fi:** press EN/RST; if still nothing, reflash and double-check the offset is 0.
-- **Flash stalls mid-way:** change USB port/cable and retry; nothing is damaged — the board only boots a complete image.
+| File | Size | Use |
+|---|---|---|
+| `RSH-Firmware-DevKitV1-v4.0.1.bin` (merged) | **955,056 B** | ✅ USB flashing — this is the file for this guide |
+| `firmware.bin` (app-only) | 889,520 B | ❌ **Never** for USB flashing / recovery — it has no bootloader and will not boot |
+| `firmware-signed.bin` | 889,588 B (app + 68 B trailer) | ❌ **OTA only** (WebOTA / app upload) — not for USB flashing |
 
-## Later updates (no cable)
-With v4.0.1 running, upload a new app `.bin` either from the PC app's setup wizard (Firmware step) or in a browser on the board's update page at `192.168.4.1` while connected to the RSH Wi-Fi (login: user `admin`, password = board ka per-device password). **Sirf signed official release upload karo** — board image ki Ed25519 signature verify karta hai (docs/SIGNED-OTA.md); unsigned ya purani image reject ho jati hai. Dual-partition OTA keeps the previous image as a fallback if an update is interrupted. Update ke baad app GET_CAPS se naya version confirm karti hai — confirm na ho to update kamyab nahi mani jati.
+The merged image contains bootloader (`0x1000`) + partitions (`0x8000`)
++ boot_app0 (`0xe000`) + app (`0x10000`) in one file, flashed at
+**offset `0x0`**. A wrong offset or the wrong file means the board will
+not boot — check the size before flashing.
+
+**Signed firmware only.** Every firmware image is Ed25519-signed
+(64-byte signature + 4-byte magic `RSHS` trailer, 68 B total). The
+board verifies the signature **before applying** any image, and
+rejects unsigned, tampered, or **downgrade** images — the board will
+never run an older firmware than the one it already has. There is no
+way to force an unsigned or older image onto the board, by USB or by
+OTA.
+
+## 2. What you need
+
+| Item | Where from |
+|---|---|
+| Merged factory bin `RSH-Firmware-DevKitV1-v4.0.1.bin` (**955,056 B**) | GitHub Release v1.0.0 assets, or a local `pio run` (`.pio/build/esp32dev/`) |
+| `SHA256SUMS` (from the same release) | GitHub Release assets — verify before flashing (§3, step 1) |
+| `esptool.py` | With PlatformIO (`tool-esptoolpy`), or `pip install esptool` |
+| USB **data** cable (charge-only will not work) | — |
+| CP210x / CH340 USB-serial driver (match your board's chip) | Vendor site / OS update |
+| PC (Windows or Linux) | — |
+
+## 3. Flashing (new board or re-flash)
+
+1. **Verify the file first.**
+   ```powershell
+   # Windows (PowerShell)
+   Get-FileHash RSH-Firmware-DevKitV1-v4.0.1.bin -Algorithm SHA256
+   ```
+   ```bash
+   # Linux
+   sha256sum RSH-Firmware-DevKitV1-v4.0.1.bin
+   ```
+   Compare with `SHA256SUMS` from the release, and check the size is
+   **955,056 B**. A hash mismatch or a smaller file (e.g. 889,520 B
+   `firmware.bin`) means the wrong file — **do not flash it**,
+   download it again.
+2. **Connect the board by USB.** It must appear as a COM port
+   (Windows Device Manager) or `/dev/ttyUSB*` (Linux). If it does not:
+   change the cable, install the driver, try a rear USB port.
+3. **Download mode:** hold **BOOT**, press-and-release **EN/RST** once,
+   then release BOOT. (On some boards, BOOT-hold + plug-in is enough.)
+4. **Flash** (put in your own port — `COM3`, `COM4`, … on Windows):
+   ```bash
+   esptool.py --chip esp32 --port COM3 --baud 921600 \
+     write_flash 0x0 RSH-Firmware-DevKitV1-v4.0.1.bin
+   ```
+   ```bash
+   # Linux example
+   esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 921600 \
+     write_flash 0x0 RSH-Firmware-DevKitV1-v4.0.1.bin
+   ```
+   If the baud rate fails, retry at `115200`. **Offset `0x0` is
+   mandatory** — any other offset and the board will not boot.
+5. **Verify:** esptool ends with `Hash of data verified`. If it does
+   not, flash again (try another cable/port first).
+6. **Restart:** press EN/RST or unplug/replug USB.
+7. **Confirm:** the **`RSH`** Wi-Fi network appears on your PC/phone —
+   the firmware is running. Then connect from the Rust app: it reports
+   firmware **v4.0.1** + protocol **v2.1**. First pairing after a fresh
+   flash (or after `erase_flash`) must happen inside the **60-second**
+   pairing window after the SoftAP comes up — see
+   [USER-GUIDE.md](USER-GUIDE.md#pairing-60-second-window).
+
+## 4. BOOT-hold safe mode & key reset (no reflash needed)
+
+Safe mode is detected **at runtime** (the loop reads GPIO0 / BOOT every
+iteration — not only at power-up):
+
+| Hold | Result |
+|---|---|
+| 5 s ≤ hold < 10 s | **Safe mode** — factory pin map + AP; no config is applied (stage + commit are blocked with `BUSY (7)`) |
+| hold ≥ 10 s | **Key-reset-armed** — only in this state does `KEY_RESET` (opcode `0x0B`) run: the board generates a fresh key + fresh Wi-Fi password, and the old key stops working immediately |
+
+- **Bad config can never brick the board.** A reboot never confirms an
+  unconfirmed config — on boot it rolls back (Last-Known-Good, then
+  factory fallback). Reboot, use safe mode or the fallback config, then
+  send a good config from the app.
+- In safe mode only AP + WebOTA run — a signed `firmware-signed.bin`
+  can also be uploaded by WebOTA from safe mode (the board still
+  verifies before applying; unsigned images are rejected).
+- After a **KEY_RESET** you must **re-pair** from the app within the
+  60-second window (the new key is disclosed exactly once).
+
+## 5. Recovery — when flashing fails
+
+The board is effectively never bricked: the ESP32 ROM bootloader
+always survives, so a USB re-flash of the factory image always brings
+it back.
+
+| Problem | What to do |
+|---|---|
+| No COM port / device not seen | Cable → driver → USB port (try rear ports) |
+| `Failed to connect` | BOOT-button trick (§3 step 3) + retry at baud `115200` |
+| Flash stalls mid-way | Change cable/port, flash again — a partial flash cannot damage the board (bootloader is in ROM) |
+| Flashed, but no `RSH` Wi-Fi | Press EN/RST; still nothing → check the offset is `0` and the file is the **merged** bin, not `firmware.bin` |
+| Everything fails | **Last resort:** `esptool.py erase_flash`, then §3 again. This wipes everything including NVS/config — the board returns to factory state and **pairing must be done again** |
+
+## 6. After flashing — checklist
+
+- [ ] `RSH` Wi-Fi network is visible
+- [ ] Rust app v1.0.0 connects (HELLO OK)
+- [ ] App shows firmware **v4.0.1** + protocol **v2.1**
+- [ ] Output page shows live axes/buttons (200 Hz stream)
+- [ ] First pairing done inside the 60-second window (new board /
+      `erase_flash` only)
+
+## 7. For developers — building from source
+
+```bash
+export TMPDIR=~/tmp   # /tmp is a 512 MB tmpfs — large builds need this
+cd <firmware copy>    # never build inside reference/ — use a scratch copy
+pio run               # output: .pio/build/esp32dev/RSH-Firmware-DevKitV1-v4.0.1.bin (955,056 B)
+pio run -t upload     # board must be in download mode (§3 step 3)
+```
+
+Signing (release only): with `RSH_SIGNING_KEY=<path to the Ed25519
+private-key PEM>` set, the build produces `firmware-signed.bin`
+(`firmware.bin` + 68 B trailer). Key unset → signing skipped (dev build
+stays unsigned) and any stale signed bin is deleted. Key set but
+missing / sign fails → the build fails hard. The private key never
+enters the repo — it lives in `signing-keys/` outside the repo (0600)
+and in the CI secret `RSH_SIGNING_KEY_PEM`; public-key fingerprint
+(SHA-256) `387764a4529337c437b233a148b48f9b2ffe3f3b5015e14c95737cb3a67a6411`.
+Never print, copy, or share the key — use only its path. The Tauri
+updater keypair is a **separate** keypair; firmware key, updater key,
+and the (deferred) OV code-signing certificate are three different
+things — see [KEY-LIFECYCLE-RUST.md](KEY-LIFECYCLE-RUST.md).

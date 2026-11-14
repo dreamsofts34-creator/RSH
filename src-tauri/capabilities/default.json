@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2/capability",
+  "description": "Default capabilities for the RSH shell. Default-deny: this is the only capability file, and it grants nothing beyond the Tauri-provided minimal base set (see capabilities/README.md). No fs, shell, dialog, opener, updater, store, or http permission is granted in this phase.",
+  "identifier": "default",
+  "permissions": [
+    "core:default"
+  ],
+  "windows": [
+    "main"
+  ]
+}

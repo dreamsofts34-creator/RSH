@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsh-protocol",
+    "crates/rsh-engine",
+    "crates/rsh-transport",
+    "crates/rsh-security",
+    "crates/rsh-profiles",
+    "crates/rsh-telemetry",
+    "crates/rsh-output",
+    "crates/rsh-output-hidmaestro",
+    "crates/rsh-led",
+    "crates/rsh-app-core",
+    # A6 baseline harness (criterion benches, rsh-protocol only).
+    "tools/rsh-benchmarks",
+    # Virtual Test Rig (Phase H2, SW-R8.2).
+    "tools/rsh-rig",
+    # Tauri shell. It IS a workspace member (single Cargo.lock), but it can
+    # only compile where the WebView2/webkit system libraries exist (Windows,
+    # or Linux with the Tauri system dependencies installed). This Linux
+    # sandbox has no webkit2gtk dev libraries, so `cargo build --workspace`
+    # fails here on `rsh-app` only — see README.md. `default-members` below
+    # keeps the plain `cargo build` / `cargo test` commands working on Linux
+    # for the nine library crates.
+    "src-tauri",
+]
+default-members = [
+    "crates/rsh-protocol",
+    "crates/rsh-engine",
+    "crates/rsh-transport",
+    "crates/rsh-security",
+    "crates/rsh-profiles",
+    "crates/rsh-telemetry",
+    "crates/rsh-output",
+    "crates/rsh-output-hidmaestro",
+    "crates/rsh-led",
+    "crates/rsh-app-core",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Exact pins (Cargo.lock committed). Never float: upgrades are deliberate PRs.
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+mdns-sd = "=0.19.1"
+keyring = "=4.2.0"
+serialport = "=4.10.1"
+dirs = "=7.0.0"
+tauri = { version = "=2.12.5", features = ["tray-icon"] }
+criterion = "=0.8.2"
+tauri-plugin-single-instance = "=2.5.5"
+tauri-plugin-autostart = "=2.7.0"
+tauri-plugin-updater = "=2.14.1"
+tauri-build = "=2.7.4"
+# Windows-only (DECISIONS.md §4 — the `windows` crate does NOT compile on
+# Linux, so it is only ever a `[target.'cfg(windows)'.dependencies]`
+# entry; never a plain dependency). Features are named per use site.
+windows = { version = "=0.62.2", default-features = false }
+semver = "=1.0.28"
+# H1 sidecar trust boundary: OS CSPRNG for the loopback token and
+# constant-time comparison for its echo (both already in Cargo.lock
+# as transitive deps; pinned exactly like every other workspace dep).
+getrandom = "=0.3.4"
+subtle = "=2.6.1"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[workspace.lints.rust]
+missing_docs = "warn"

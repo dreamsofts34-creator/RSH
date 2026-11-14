@@ -1,0 +1,22 @@
+[package]
+name = "rsh-rig"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RSH Virtual Test Rig (Phase H2, SW-R8.2): seeded virtual wheel + real WheelEngine + recording output, 26 scenarios, quick/full/long modes including the 4-hour soak."
+publish = false
+
+[[bin]]
+name = "rsh-rig"
+path = "src/main.rs"
+
+[dependencies]
+rsh-protocol = { path = "../../crates/rsh-protocol" }
+rsh-engine = { path = "../../crates/rsh-engine" }
+rsh-benchmarks = { path = "../rsh-benchmarks" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

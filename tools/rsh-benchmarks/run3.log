@@ -1,0 +1,307 @@
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+  --> tools/rsh-benchmarks/benches/protocol.rs:12:28
+   |
+12 | use criterion::{Criterion, black_box, criterion_group, criterion_main};
+   |                            ^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+  --> tools/rsh-benchmarks/benches/protocol.rs:81:38
+   |
+81 |         b.iter(|| StreamFrame::parse(black_box(&stream)).expect("parses"));
+   |                                      ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+  --> tools/rsh-benchmarks/benches/protocol.rs:84:19
+   |
+84 |         b.iter(|| black_box(stream_frame.encode()));
+   |                   ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+  --> tools/rsh-benchmarks/benches/protocol.rs:87:39
+   |
+87 |         b.iter(|| StatusPacket::parse(black_box(&status_base)).expect("parses"));
+   |                                       ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+  --> tools/rsh-benchmarks/benches/protocol.rs:90:39
+   |
+90 |         b.iter(|| StatusPacket::parse(black_box(&status_ext)).expect("parses"));
+   |                                       ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+  --> tools/rsh-benchmarks/benches/protocol.rs:93:37
+   |
+93 |         b.iter(|| HelloReply::parse(black_box(&hello)).expect("parses"));
+   |                                     ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+  --> tools/rsh-benchmarks/benches/protocol.rs:97:34
+   |
+97 |             assert!(verify_frame(black_box(&ctrl), &TEST_KEY, &TEST_NONCE));
+   |                                  ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+  --> tools/rsh-benchmarks/benches/protocol.rs:98:34
+   |
+98 |             ControlFrame::verify(black_box(&ctrl), &TEST_KEY, &TEST_NONCE).expect("verifies")
+   |                                  ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:103:55
+    |
+103 |             build_frame(&TEST_KEY, &TEST_NONCE, 0x01, black_box(1), black_box(0), b"")
+    |                                                       ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:103:69
+    |
+103 |             build_frame(&TEST_KEY, &TEST_NONCE, 0x01, black_box(1), black_box(0), b"")
+    |                                                                     ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:108:61
+    |
+108 |         b.iter(|| compute_tag(&TEST_KEY, &TEST_NONCE, 0x01, black_box(0), b""));
+    |                                                             ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:116:17
+    |
+116 |                 black_box(0),
+    |                 ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:118:17
+    |
+118 |                 black_box(&tag)
+    |                 ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:123:25
+    |
+123 |         b.iter(|| crc16(black_box(&stream)));
+    |                         ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:126:25
+    |
+126 |         b.iter(|| crc16(black_box(b"123456789")));
+    |                         ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:129:19
+    |
+129 |         b.iter(|| black_box(blob.encode()).expect("encodes"));
+    |                   ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:132:38
+    |
+132 |         b.iter(|| ConfigBlob::decode(black_box(&blob_bytes)).expect("decodes"));
+    |                                      ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:135:19
+    |
+135 |         b.iter(|| black_box(validate(black_box(&modules), false)));
+    |                   ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:135:38
+    |
+135 |         b.iter(|| black_box(validate(black_box(&modules), false)));
+    |                                      ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:138:19
+    |
+138 |         b.iter(|| black_box(validate_blob(black_box(&blob))));
+    |                   ^^^^^^^^^
+
+warning: use of deprecated function `criterion::black_box`: use `std::hint::black_box()` instead
+   --> tools/rsh-benchmarks/benches/protocol.rs:138:43
+    |
+138 |         b.iter(|| black_box(validate_blob(black_box(&blob))));
+    |                                           ^^^^^^^^^
+
+warning: `rsh-benchmarks` (bench "protocol") generated 21 warnings
+    Finished `bench` profile [optimized] target(s) in 1.57s
+     Running unittests src/lib.rs (target/release/build/rsh-benchmarks/eb90e41a2579f924/out/rsh_benchmarks-eb90e41a2579f924)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running benches/protocol.rs (target/release/build/rsh-benchmarks/527150b21d3e67d4/out/protocol-527150b21d3e67d4)
+Gnuplot not found, using plotters backend
+Benchmarking stream_parse_36b
+Benchmarking stream_parse_36b: Warming up for 3.0000 s
+Benchmarking stream_parse_36b: Collecting 100 samples in estimated 5.0004 s (39M iterations)
+Benchmarking stream_parse_36b: Analyzing
+stream_parse_36b        time:   [127.05 ns 127.32 ns 127.63 ns]
+                        change: [−1.8768% −1.5521% −1.2102%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+
+Benchmarking stream_encode_36b
+Benchmarking stream_encode_36b: Warming up for 3.0000 s
+Benchmarking stream_encode_36b: Collecting 100 samples in estimated 5.0006 s (28M iterations)
+Benchmarking stream_encode_36b: Analyzing
+stream_encode_36b       time:   [174.12 ns 176.24 ns 178.99 ns]
+                        change: [−1.3217% +0.1170% +1.5806%] (p = 0.88 > 0.05)
+                        No change in performance detected.
+Found 14 outliers among 100 measurements (14.00%)
+  3 (3.00%) high mild
+  11 (11.00%) high severe
+
+Benchmarking status_parse_34b
+Benchmarking status_parse_34b: Warming up for 3.0000 s
+Benchmarking status_parse_34b: Collecting 100 samples in estimated 5.0001 s (53M iterations)
+Benchmarking status_parse_34b: Analyzing
+status_parse_34b        time:   [93.269 ns 93.446 ns 93.606 ns]
+                        change: [−6.7473% −6.1687% −5.5992%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+
+Benchmarking status_parse_38b
+Benchmarking status_parse_38b: Warming up for 3.0000 s
+Benchmarking status_parse_38b: Collecting 100 samples in estimated 5.0002 s (45M iterations)
+Benchmarking status_parse_38b: Analyzing
+status_parse_38b        time:   [111.70 ns 113.23 ns 115.00 ns]
+                        change: [−1.3866% −0.5638% +0.4150%] (p = 0.21 > 0.05)
+                        No change in performance detected.
+Found 12 outliers among 100 measurements (12.00%)
+  5 (5.00%) high mild
+  7 (7.00%) high severe
+
+Benchmarking hello_parse_92b
+Benchmarking hello_parse_92b: Warming up for 3.0000 s
+Benchmarking hello_parse_92b: Collecting 100 samples in estimated 5.0000 s (14M iterations)
+Benchmarking hello_parse_92b: Analyzing
+hello_parse_92b         time:   [349.69 ns 351.02 ns 352.86 ns]
+                        change: [−0.4712% +0.7208% +2.1158%] (p = 0.39 > 0.05)
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  3 (3.00%) high mild
+  4 (4.00%) high severe
+
+Benchmarking control_verify_get_caps_29b
+Benchmarking control_verify_get_caps_29b: Warming up for 3.0000 s
+Benchmarking control_verify_get_caps_29b: Collecting 100 samples in estimated 5.0020 s (6.7M iterations)
+Benchmarking control_verify_get_caps_29b: Analyzing
+control_verify_get_caps_29b
+                        time:   [738.85 ns 740.88 ns 743.60 ns]
+                        change: [−1.6259% −0.7027% +0.2398%] (p = 0.13 > 0.05)
+                        No change in performance detected.
+Found 14 outliers among 100 measurements (14.00%)
+  2 (2.00%) high mild
+  12 (12.00%) high severe
+
+Benchmarking control_build_frame_get_caps
+Benchmarking control_build_frame_get_caps: Warming up for 3.0000 s
+Benchmarking control_build_frame_get_caps: Collecting 100 samples in estimated 5.0008 s (12M iterations)
+Benchmarking control_build_frame_get_caps: Analyzing
+control_build_frame_get_caps
+                        time:   [385.64 ns 386.81 ns 388.01 ns]
+                        change: [−11.595% −9.4233% −7.3383%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking hmac_compute_tag_empty_payload
+Benchmarking hmac_compute_tag_empty_payload: Warming up for 3.0000 s
+Benchmarking hmac_compute_tag_empty_payload: Collecting 100 samples in estimated 5.0017 s (14M iterations)
+Benchmarking hmac_compute_tag_empty_payload: Analyzing
+hmac_compute_tag_empty_payload
+                        time:   [355.06 ns 356.18 ns 357.37 ns]
+                        change: [−1.6319% −1.0582% −0.5066%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+
+Benchmarking hmac_verify_tag
+Benchmarking hmac_verify_tag: Warming up for 3.0000 s
+Benchmarking hmac_verify_tag: Collecting 100 samples in estimated 5.0003 s (13M iterations)
+Benchmarking hmac_verify_tag: Analyzing
+hmac_verify_tag         time:   [385.83 ns 398.42 ns 414.51 ns]
+                        change: [+0.2634% +4.0862% +7.6416%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+Found 8 outliers among 100 measurements (8.00%)
+  4 (4.00%) high mild
+  4 (4.00%) high severe
+
+Benchmarking crc16_stream_36b
+Benchmarking crc16_stream_36b: Warming up for 3.0000 s
+Benchmarking crc16_stream_36b: Collecting 100 samples in estimated 5.0002 s (30M iterations)
+Benchmarking crc16_stream_36b: Analyzing
+crc16_stream_36b        time:   [165.74 ns 166.68 ns 167.72 ns]
+                        change: [−1.0697% −0.0883% +0.6262%] (p = 0.87 > 0.05)
+                        No change in performance detected.
+Found 10 outliers among 100 measurements (10.00%)
+  2 (2.00%) high mild
+  8 (8.00%) high severe
+
+Benchmarking crc16_check_9b
+Benchmarking crc16_check_9b: Warming up for 3.0000 s
+Benchmarking crc16_check_9b: Collecting 100 samples in estimated 5.0002 s (114M iterations)
+Benchmarking crc16_check_9b: Analyzing
+crc16_check_9b          time:   [42.489 ns 42.744 ns 43.062 ns]
+                        change: [+0.9738% +2.0847% +3.3936%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 12 outliers among 100 measurements (12.00%)
+  2 (2.00%) high mild
+  10 (10.00%) high severe
+
+Benchmarking config_blob_encode_factory
+Benchmarking config_blob_encode_factory: Warming up for 3.0000 s
+Benchmarking config_blob_encode_factory: Collecting 100 samples in estimated 5.0036 s (6.1M iterations)
+Benchmarking config_blob_encode_factory: Analyzing
+config_blob_encode_factory
+                        time:   [818.04 ns 819.22 ns 820.55 ns]
+                        change: [−0.8356% −0.1733% +0.3683%] (p = 0.61 > 0.05)
+                        No change in performance detected.
+Found 8 outliers among 100 measurements (8.00%)
+  4 (4.00%) high mild
+  4 (4.00%) high severe
+
+Benchmarking config_blob_decode_factory
+Benchmarking config_blob_decode_factory: Warming up for 3.0000 s
+Benchmarking config_blob_decode_factory: Collecting 100 samples in estimated 5.0034 s (5.9M iterations)
+Benchmarking config_blob_decode_factory: Analyzing
+config_blob_decode_factory
+                        time:   [846.83 ns 861.24 ns 878.47 ns]
+                        change: [+0.2131% +1.3922% +3.0166%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+Found 13 outliers among 100 measurements (13.00%)
+  2 (2.00%) high mild
+  11 (11.00%) high severe
+
+Benchmarking pin_validate_factory_modules
+Benchmarking pin_validate_factory_modules: Warming up for 3.0000 s
+Benchmarking pin_validate_factory_modules: Collecting 100 samples in estimated 5.0018 s (1.0M iterations)
+Benchmarking pin_validate_factory_modules: Analyzing
+pin_validate_factory_modules
+                        time:   [4.9441 µs 5.0078 µs 5.0864 µs]
+                        change: [+17.732% +19.018% +20.292%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+
+Benchmarking pin_validate_blob_factory
+Benchmarking pin_validate_blob_factory: Warming up for 3.0000 s
+Benchmarking pin_validate_blob_factory: Collecting 100 samples in estimated 5.0338 s (717k iterations)
+Benchmarking pin_validate_blob_factory: Analyzing
+pin_validate_blob_factory
+                        time:   [7.1219 µs 7.2343 µs 7.3664 µs]
+                        change: [+15.128% +17.123% +19.771%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 7 outliers among 100 measurements (7.00%)
+  4 (4.00%) high mild
+  3 (3.00%) high severe
+

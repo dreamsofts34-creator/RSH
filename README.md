@@ -1,185 +1,205 @@
 # RSH — Real Sim Hub
 
-[![CI](https://github.com/dreamsofts34-creator/RSH/actions/workflows/ci.yml/badge.svg)](https://github.com/dreamsofts34-creator/RSH/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/dreamsofts34-creator/RSH)](https://github.com/dreamsofts34-creator/RSH/releases/latest)
-[![.NET](https://img.shields.io/badge/.NET-10.0-512BD4)](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)
-[![Firmware](https://img.shields.io/badge/firmware-v4.0.1-blue)](docs/RELEASE-NOTES-v2.0.4.md)
-[![Protocol](https://img.shields.io/badge/protocol-v2.1-blue)](docs/PROTOCOL.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Version: v1.0.0](https://img.shields.io/badge/version-v1.0.0-6C4CF1.svg)](https://github.com/dreamsofts34-creator/RSH/releases)
+[![Platform: Windows 10 / 11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue.svg)](docs/USER-GUIDE.md)
+[![Firmware: v4.0.1](https://img.shields.io/badge/firmware-v4.0.1-green.svg)](docs/FIRMWARE-COMPAT.md)
 
-**RSH is a DIY sim-racing steering wheel system: an ESP32 board reads
-your wheel hardware and streams it to a Windows app, which feeds a
-vJoy virtual joystick that any racing game can bind like a real wheel.**
+**RSH (Real Sim Hub)** connects an ESP32 sim-racing wheel to Windows racing
+games over Wi-Fi or USB-serial. The PC app is a **Tauri 2 (Rust + web
+frontend)** application; the wheel firmware is **C++ v4.0.1** and the wire
+protocol is **v2.1 (frozen)**.
 
-- **App v2.0.4** · **Firmware v4.0.1** · **Protocol v2.1** — see
-  [docs/RELEASE-NOTES-v2.0.4.md](docs/RELEASE-NOTES-v2.0.4.md)
-- Modular: attach only the modules you want, assign pins from the app,
-  tune each module separately
-- Principle: **firmware dumb, PC smart** — all calibration and
-  processing live on the PC
-
----
+> **This is a full Rust recreation, fresh start — not a port of the C# app.**
+> The C# series (v2.0.4 and earlier) is superseded. The Rust app talks to
+> the **same** C++ v4.0.1 board — if your wheel already runs firmware
+> v4.0.1, **no reflash is needed** to use the Rust app. What you *do* need
+> is a **fresh pairing**: the Rust app stores its device key in Windows
+> Credential Manager and cannot read the C# app's DPAPI key, so every
+> C# → Rust upgrader must re-pair (see [USER-GUIDE](docs/USER-GUIDE.md#re-pairing-after-the-c-rust-switch-mandatory)).
 
 ## Features
 
-- **Modular wheel** — Steering, Accelerator, Brake, Clutch, Handbrake,
-  Shifter, Horn, Buttons, Encoders, LED — each with its own on/off
-  toggle and tuning (deadzone, curve, smoothing, invert)
-- **200 Hz end to end** — the board samples at 200 Hz, the PC engine
-  runs at 200 Hz, with a 250 ms watchdog that sends NEUTRAL if data
-  goes stale
-- **Two transports** — Wi-Fi UDP (board SoftAP `RSH`) or wired
-  USB-serial at 921600 baud; switch in Settings → Connection
-- **Runtime pin assignment** — pins are configured from the app and
-  pushed to the board; a config transaction (stage → commit → confirm
-  → rollback) means a bad pin map can never brick the wheel
-- **Per-game and per-car profiles** — profiles switch automatically
-  by foreground game and by car (Assetto Corsa / ACC / iRacing
-  telemetry), with 3-generation backup
-- **Game launcher** — launch Assetto Corsa, ACC, iRacing and
-  Dirt Rally 2.0 from the Dashboard
-- **vJoy output (default)** with an experimental HIDMaestro backend
-- **Signed firmware** — Ed25519 signature verified before apply,
-  with anti-downgrade; control channel authenticated with HMAC-SHA256
-  and a per-device key
-- **Modern WPF UI** — 8 screens, Light + Dark + High Contrast themes,
-  game launcher on the Dashboard, GPIO pin map in Settings.
-  On Windows 10 the app opens a real plain window
-  (`ClassicMainWindow`); on Windows 11 it uses the FluentWindow UI
-- **Safe mode** — BOOT-hold at power-on recovers a bad config
+- **200 Hz wheel engine** — steering, pedals (accel / brake / clutch),
+  handbrake, shifter, buttons, encoders, horn, LED strip, all processed
+  at 200 Hz with per-module tuning.
+- **Wi-Fi (UDP) + USB-serial** transports, HMAC-authenticated control
+  channel (protocol v2.1), 60-second pairing window, per-device key.
+- **Output backends** — HIDMaestro (default, user-mode UMDF2 driver via
+  an elevated sidecar; UAC prompt on every launch while active) with
+  **vJoy fallback** (Rust FFI, no UAC prompt). No force feedback — the
+  wheel has no FFB motor.
+- **Per-game + per-car profiles** — automatic switching from Assetto
+  Corsa / ACC / iRacing telemetry (read-only shared memory), game
+  launcher (Steam + iRacing), 3-generation profile backup.
+- **8 screens** — Dashboard, Setup, Tuning, Buttons, Output, Profiles,
+  Monitor, Settings — light/dark themes, English/Urdu/Hindi UI.
+- **Signed firmware only** — Ed25519-signed OTA images, verify-before-
+  apply, anti-downgrade. The app itself ships **unsigned** (OV code-
+  signing certificate deferred — expect a Windows SmartScreen warning;
+  see [USER-GUIDE](docs/USER-GUIDE.md#unsigned-app-smartscreen)).
 
-## Quickstart (users)
+## Quickstart
 
-1. **Download the latest release:**
-   [RSH v2.0.4](https://github.com/dreamsofts34-creator/RSH/releases/tag/v2.0.4)
-   — get `RSH-windows-x64.zip` (~16.7 MB, 43 files) and extract it to
-   a new folder.
-2. **Install the .NET 10 Desktop Runtime (x64) — required:**
-   <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>
-   (Run apps → **.NET Desktop Runtime 10.0.x**), or
-   `winget install Microsoft.DotNet.DesktopRuntime.10`.
-   Check with `dotnet --list-runtimes` — it must list
-   `Microsoft.WindowsDesktop.App 10.x`.
-3. **Install the vJoy driver (once, as administrator):**
-   BrunnerInnovation **v2.2.2.0**, device enabled in vJoyConf with
-   axes X/Y/Z.
-4. **Flash the firmware (v4.0.1) if your board runs v4.0.0:**
-   the merged image `RSH-Firmware-DevKitV1-v4.0.1.bin` is in the
-   release — v4.0.1 is **not** byte-identical to v4.0.0, so reflash.
-   Steps: [docs/FLASH-GUIDE.md](docs/FLASH-GUIDE.md).
-5. **Run `RSH.exe`** (no flags needed), join the `RSH` Wi-Fi network,
-   and run the setup wizard once (Connect → Pins → Calibrate).
-   Then bind the vJoy device in your game.
+### Install (users)
 
-> **Unsigned app:** RSH is not code-signed yet, so Windows
-> SmartScreen will warn on first run — click "More info" → "Run
-> anyway". Firmware signing (Ed25519) is unaffected.
-> Full user guide: [docs/USER-GUIDE.md](docs/USER-GUIDE.md).
+1. Download **`RSH_1.0.0_x64-setup.exe`** (primary) or
+   **`RSH_1.0.0_x64_en-US.msi`** (secondary) from the
+   [v1.0.0 GitHub Release](https://github.com/dreamsofts34-creator/RSH/releases/tag/v1.0.0).
+2. Verify the SHA-256 against `SHA256SUMS` in the same release before
+   running it.
+3. Run the installer — no admin prompt at install time (current-user
+   install). SmartScreen will warn because the app is unsigned; choose
+   "Run anyway".
+4. Launch RSH, run the **Setup wizard**: connect to the wheel, pair it
+   (60-second window), calibrate, set your pins.
+5. Pick your output backend on the **Output** page (HIDMaestro default;
+   vJoy fallback if you prefer no UAC prompt), then launch a game from
+   the **Dashboard**.
 
-## Architecture
+Full steps, including first-run pairing and troubleshooting, are in the
+[User Guide](docs/USER-GUIDE.md). **No .NET runtime is needed** — the app
+is a native Tauri binary. The HIDMaestro sidecar ships inside the
+installer; **vJoy is not bundled** — install it yourself only if you
+want the vJoy fallback.
 
-```
-[Steering pot] [Hall pedals] [Buttons] [Encoders] [LED strip]
-        \            |            |          |          /
-              ESP32 DevKit V1 — firmware v4.0.1
-              200 Hz loop · Wi-Fi UDP 200 pps / USB-serial
-                        |
-              Windows PC — app v2.0.4
-              WheelEngine (200 Hz) → ProcessingPipeline
-              (map → deadzone → curve → One Euro → pedal ramp)
-                        |
-              vJoy virtual joystick → racing game
-```
+### Firmware — do you need to reflash?
 
-Read the full architecture docs in [`docs/`](docs/README.md):
+- **Wheel already on firmware v4.0.1** (the C# v2.0.4 release shipped
+  it): **no reflash**. The Rust app speaks protocol v2.1 to the same
+  board.
+- **New / blank ESP32 DevKit V1 board, or a board that will not boot**:
+  flash the merged factory image `RSH-Firmware-DevKitV1-v4.0.1.bin`
+  (955,056 B) — see the [Flash Guide](docs/FLASH-GUIDE.md) (user
+  procedure) and the detailed [Reflash Guide](docs/REFLASH-GUIDE.md).
+- Firmware images are **signed only** — unsigned or downgrade images
+  are rejected by the board.
 
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — system overview
-- [FIRMWARE.md](docs/FIRMWARE.md) — firmware internals
-- [SOFTWARE.md](docs/SOFTWARE.md) — PC app internals
-- [PROTOCOL.md](docs/PROTOCOL.md) — protocol v2.1 summary
-  (authority: [PROTOCOL-V2.1.md](docs/PROTOCOL-V2.1.md))
-- [SECURITY.md](docs/SECURITY.md) — security model
-- [TESTING.md](docs/TESTING.md) — Virtual Test Rig, suites, gates
-
-## Repository structure
+## Architecture (summary)
 
 ```
-README.md                  <- this file
-docs/                      <- documentation (index: docs/README.md)
-firmware/rsh/              <- ESP32 firmware (PlatformIO, env esp32dev)
-software/
-  RSH.slnx                 <- solution (.NET 10, WPF)
-  src/RSH.Core/            <- protocol, engine, pipeline, profiles (no UI)
-  src/RSH.App/             <- WPF app (8 screens, wizard, tray)
-  src/RSH.Output.VJoy/     <- vJoy backend (default)
-  src/RSH.Output.HIDMaestro/ <- HIDMaestro backend (experimental)
-  src/RSH.RenderTest/      <- minimal plain-Window render test
-  tests/                   <- RSH.Tests, RSH.VJoy.Tests,
-                              RSH.HIDMaestro.Tests, RSH.App.Tests
-  tools/                   <- RSH.Simulator, RSH.Benchmarks
-  packaging/               <- MSIX, winget, firewall, SBOM
-tests-host/                <- firmware host tests (C++17, no Arduino)
-tools-perf/                <- Measure-RSH.ps1 (perf baseline)
-.github/workflows/         <- ci.yml (per push/PR),
-                              release.yml (tag v* → GitHub Release)
+ESP32 wheel (C++ firmware v4.0.1, protocol v2.1)
+        │  Wi-Fi UDP 4210/4211/4212  or  USB-serial
+        ▼
+┌─────────────────────────────────────────────────┐
+│  RSH app v1.0.0 — Tauri 2 (Rust core + web UI)  │
+│  crates/rsh-transport  UDP + serial + pairing   │
+│  crates/rsh-engine     200 Hz WheelEngine       │
+│  crates/rsh-security   keystore, HMAC, Ed25519  │
+│  crates/rsh-profiles   Profile v2, 3-gen backup │
+│  crates/rsh-telemetry  AC / ACC / iRacing       │
+│  crates/rsh-output     HIDMaestro + vJoy        │
+│  frontend/             React + Tailwind UI       │
+└─────────────────────────────────────────────────┘
+        │  HIDMaestro sidecar (elevated) or vJoy FFI
+        ▼
+   Windows DirectInput device → racing game
+```
+
+- **OS floor:** Windows 10 22H2 (build 19045) and Windows 11, x64 only.
+  ARM64 is unsupported.
+- **Data directory:** `%AppData%\RSH` (profiles, settings, logs
+  `logs\rsh-YYYYMMDD.log`). Secrets live only in Windows Credential
+  Manager (service `RSH`), never in files or logs.
+- **Updater:** check-only in v1.0.0 — the app can check for updates
+  against `latest.json` but cannot download/install one. Updater
+  signatures are minisign/Ed25519 (public key in
+  `src-tauri/tauri.conf.json`).
+- Full architecture: [docs/ARCHITECTURE](docs/README.md#architecture-design)
+  (index) and the plan tree in `rust-recreation/` (outside this repo).
+
+## Repo tree
+
+```
+.
+├── Cargo.toml / Cargo.lock     Rust workspace (Rust 1.100.0, Tauri 2.12.5)
+├── crates/                     10 library crates (protocol, engine,
+│                               transport, security, profiles, telemetry,
+│                               output, output-hidmaestro, led, app-core)
+├── src-tauri/                  Tauri 2 shell (rsh-app v1.0.0, NSIS + MSI)
+├── frontend/                   React 19 + Vite + Tailwind v4 UI
+├── tools/                      rsh-rig (Virtual Test Rig), rsh-benchmarks,
+│                               rsh-hm-sidecar (C# NativeAOT, source)
+├── docs/                       user + developer docs (see docs/README.md)
+├── sbom/                       CycloneDX SBOMs (rust / frontend / sidecar)
+├── .github/workflows/          ci.yml, release.yml (v1.* tags)
+├── LICENSE                     MIT
+└── THIRD-PARTY-LICENSES.md     license inventory + policy
 ```
 
 ## Development
 
-Prerequisites: **.NET 10 SDK (10.0.100)** and **PlatformIO**
-(ESP32 platform) for firmware.
+```sh
+cargo build                    # library crates (Linux OK)
+cargo test                     # library crates
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo bench -p rsh-benchmarks  # criterion benches
 
-```powershell
-# Build the app
-dotnet build software/RSH.slnx -c Release
+cd frontend && npm ci && npm test && npm run build   # vitest + tsc + vite
 
-# Run the tests (RSH.App.Tests is Windows-only; the rest run on Linux too)
-dotnet test software/RSH.slnx -c Release
-
-# Build the firmware
-cd firmware/rsh
-pio run -e esp32dev
-
-# Firmware host tests (no Arduino needed)
-tests-host/run_tests.sh
+# Windows only (needs WebView2 / Windows SDK):
+cargo tauri dev                 # run the app
+cargo tauri build               # NSIS + MSI (release.yml does this on CI)
 ```
 
-Tests run in the **Virtual Test Rig** on local builds
-(`~/workspace/projects/rsh/test-env/` in the project workspace) —
-25 scenarios, fuzz, fault injection, soaks. Real-board tests happen
-once, at the final production release (A7 runbook:
-[docs/A7-RUNBOOK.md](docs/A7-RUNBOOK.md)). See
-[docs/TESTING.md](docs/TESTING.md).
+The Tauri shell (`src-tauri`) is a workspace member but only compiles
+where the system webview libraries exist — on this Linux sandbox it does
+not (no webkit2gtk dev libraries), which is a Windows-only verification
+gap, not a code defect. `cargo build` / `cargo test` default to the ten
+library crates on Linux.
 
-**Latest gate (v2.0.4, 2026-11-14):** build 0 errors ·
-917 .NET tests pass, 0 fail (RSH.Tests 783 + VJoy 56 + HIDMaestro 78) ·
-host tests 4430 checks, 0 failures · rig 25/25 scenarios (soak 200/s) ·
-benchmarks 15/15 · `pio run` SUCCESS.
+## Documentation
+
+| Doc | What it is |
+|---|---|
+| [docs/README.md](docs/README.md) | Index of every doc in `docs/` |
+| [docs/USER-GUIDE.md](docs/USER-GUIDE.md) | Install, pairing, tuning, profiles, launcher, troubleshooting |
+| [docs/FLASH-GUIDE.md](docs/FLASH-GUIDE.md) | Flashing firmware v4.0.1 (new board / recovery) |
+| [docs/REFLASH-GUIDE.md](docs/REFLASH-GUIDE.md) | Detailed reflash + signing reference |
+| [docs/GAME-MATRIX.md](docs/GAME-MATRIX.md) | Game compatibility — **0 of 16 backend–game pairs verified in-game** (Windows-only, pending) |
+| [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) | Final release checklist + open gates |
+| [docs/SUPPORT-PERIOD.md](docs/SUPPORT-PERIOD.md) | Support window for v1.0.0 |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | Frozen decisions, incl. the 4-hour soak SKIPPED by user order |
+| [docs/FIRMWARE-COMPAT.md](docs/FIRMWARE-COMPAT.md) | App v1.0.0 × firmware v4.0.1 × protocol v2.1 compat |
+| [docs/THREAT-MODEL-RUST.md](docs/THREAT-MODEL-RUST.md) | STRIDE threat model (Rust series) |
+| [docs/SECURITY-RESCAN-H1.md](docs/SECURITY-RESCAN-H1.md) | Phase H1 security re-scan: CONDITIONAL PASS, 0 Critical / 0 High |
+| [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) | License inventory (no GPL/AGPL/LGPL anywhere) |
+
+## Release status (v1.0.0, 2026-11-14)
+
+- **Phase G gate: CONDITIONAL PASS** — `cargo test --workspace
+  --exclude rsh-app`: **716 passed / 0 failed**
+  ([docs/PHASE-G-GATE.md](docs/PHASE-G-GATE.md)). Phase H (final) is in
+  progress; see [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md)
+  for the open gates.
+- **Known open release gates:** pid.codes PR for VID `0x1209` / PID
+  `0x5253` (not yet merged); vJoy DLL SHA-256 not yet measured on
+  Windows; `firmware/` must be restored in the repo before tagging;
+  `RSH_UPDATER_PRIVATE_KEY` secret must be created; first
+  `release.yml` dry-run not yet run; A7 real-board run pending;
+  **4-hour soak SKIPPED by user decision 2026-11-14 14:54 — recorded
+  as SKIPPED, never as passed** (60 s + 10 min soaks still run).
+- **Game verification: 0 of 16 backend–game pairs verified in-game.**
+  No game is claimed to work until the procedure in
+  [docs/GAME-MATRIX.md](docs/GAME-MATRIX.md) has run on a real Windows
+  PC with the real game, on that backend.
 
 ## Contributing
 
-This is a personal DIY project by Dreamsofts. Issues and pull
-requests are welcome:
-
-- Keep the phase discipline: **build → test (rig) → find bugs →
-  fix → gate → next step**. No step is skipped.
-- Do not send release zips in chat/issues — builds go to
-  [GitHub Releases](https://github.com/dreamsofts34-creator/RSH/releases).
-- Never commit signing keys, passwords or `*.pem` files
-  (`.gitignore` blocks them) — the release signing key lives
-  outside this repo.
-- UI changes must respect the locked design in
-  [docs/UI-LOCKED.md](docs/UI-LOCKED.md).
-
-## Security
-
-See [docs/SECURITY.md](docs/SECURITY.md) and
-[docs/THREAT-MODEL.md](docs/THREAT-MODEL.md). To report a
-vulnerability, open a GitHub issue with "SECURITY:" in the title and
-do not publish an exploit before it is fixed.
+- Rust 1.100.0 stable (`rust-toolchain.toml`), `cargo fmt` +
+  `cargo clippy -- -D warnings` clean, tests for new behaviour.
+- No fake implementations: unimplemented commands stay
+  `NOT_YET_IMPLEMENTED`, unmeasured claims stay "Windows-only /
+  not yet measured". Do not mark anything verified without evidence
+  on a real Windows PC / real board.
+- Builds, tests and releases stay local until a project is complete;
+  push to GitHub only when a complete build is done. Never send build
+  zips in chat — builds go to GitHub Releases.
+- Signing keys live outside the repo
+  (`~/workspace/projects/rsh/signing-keys/`, never committed).
 
 ## License
 
-**TBD — no license file yet.** The project is public on GitHub but
-no licence has been chosen; until one is added, the code is
-source-available for viewing only. (Suggested: MIT — to be confirmed
-with the owner.)
+**MIT** — see [LICENSE](LICENSE). Third-party licenses:
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).

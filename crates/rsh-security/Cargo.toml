@@ -1,0 +1,15 @@
+[package]
+name = "rsh-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+keyring.workspace = true
+# Ed25519 firmware-image verify (SEC-C-06 / SEC-D-04, Phase E3).
+# Exact pins, per repo convention (Cargo.lock committed).
+ed25519-dalek = "=3.0.0"
+sha2 = "=0.11.1"

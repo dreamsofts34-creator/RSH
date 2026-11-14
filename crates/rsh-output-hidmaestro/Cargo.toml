@@ -1,0 +1,25 @@
+[package]
+name = "rsh-output-hidmaestro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HIDMaestro output backend (G2 / SW-R6.3): C# NativeAOT sidecar process manager + IJoystickOutput impl"
+
+[lints]
+workspace = true
+
+[dependencies]
+rsh-output = { path = "../rsh-output" }
+rsh-engine = { path = "../rsh-engine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# H1 sidecar trust boundary: OS CSPRNG token + constant-time echo
+# comparison (getrandom/subtle, workspace-pinned).
+getrandom = { workspace = true }
+subtle = { workspace = true }
+
+# Windows-only: elevated sidecar spawn (ShellExecuteEx "runas").
+# The `windows` crate does not compile on Linux, so this is strictly a
+# target-gated dependency (workspace convention, root Cargo.toml).
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Shell"] }

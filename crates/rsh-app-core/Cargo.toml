@@ -1,0 +1,35 @@
+[package]
+name = "rsh-app-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dirs.workspace = true
+rsh-engine = { path = "../rsh-engine" }
+rsh-output = { path = "../rsh-output" }
+# G4: AppStateCore constructs the real backends (HIDMaestro default,
+# vJoy fallback) for the selector. No cycle: this crate never feeds
+# back into `rsh-output-hidmaestro`.
+rsh-output-hidmaestro = { path = "../rsh-output-hidmaestro" }
+rsh-profiles = { path = "../rsh-profiles" }
+rsh-protocol = { path = "../rsh-protocol" }
+rsh-security = { path = "../rsh-security" }
+rsh-telemetry = { path = "../rsh-telemetry" }
+# Phase G gate wiring: the engine supervisor owns live transports
+# (UDP/serial `PacketSource`s) and feeds them to the engine.
+rsh-transport = { path = "../rsh-transport" }
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Phase G gate wiring: the engine supervisor runs the `WheelEngine`
+# tokio task on a current-thread runtime owned by its own std thread.
+tokio.workspace = true
+
+[dev-dependencies]
+# Test-only: build throwaway-signed firmware images (never the production key).
+ed25519-dalek = "=3.0.0"
+sha2 = "=0.11.1"
+
+[lints]
+workspace = true

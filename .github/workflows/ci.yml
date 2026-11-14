@@ -1,356 +1,534 @@
-# RSH — CI (WP6 / Software Plan SW-1, Plan v2.3 WP6/T6)
+# RSH Rust — CI
 #
-# Har push / pull request par: dotnet build + test, C++ host tests,
-# Python reference scripts, firmware build, benchmark gate.
-# CI ke baghair kisi phase ka "tests pass" gate count nahi hoga.
+# Phase A4 (CI first). Triggers on push + pull_request to main.
+# Source of truth for the job list: TESTING-INPUT.md §9.1.
 #
-# !!! PEHLI RUN — VIRTUAL TEST RIG MEIN !!!
-# GitHub par push abhi MANA hai (local-only rule), is liye ye workflow
-# GitHub Actions par run NAHI hoga. Pehli green run Virtual Test Rig
-# (~/workspace/projects/rsh/test-env/) ke andar hogi — har job ke header
-# comment mein likha hai ke wo rig ke andar kaise chalega. Jab push allow
-# hoga, ye workflow bina tabdeeli ke GitHub par bhi chalega.
+# ---- SKIP MAP — a skip here is NEVER a pass. Read before trusting green. ----
+# Jobs skip cleanly (loud ::notice, exit 0) ONLY while their phase has not
+# landed yet. As soon as the prerequisite file/dir exists, the job runs for
+# real and can fail. Current expected skips (2026-11-14, Phase A):
+#   fmt / clippy / test-linux / test-windows / audit
+#       skip while there is no Cargo.toml at the repo root (Phase A2 lands
+#       the Cargo workspace skeleton). Audit additionally FAILS (not skips)
+#       if Cargo.toml exists but Cargo.lock is missing — the lockfile must
+#       be committed (SECURITY-INPUT §0).
+#   fuzz-quick   — skips while fuzz/ has no targets (Phase A1 creates them).
+#   bench-gate   — FAIL-CLOSED while thresholds.json is missing (Phase B
+#       creates it at tools/rsh-benchmarks/thresholds.json): the job
+#       exits 1 with "thresholds not yet defined (Phase B)". It never
+#       claims a bench pass without thresholds. Enforcement is
+#       tools/rsh-benchmarks/check-thresholds.py over the criterion
+#       estimates from `cargo bench -p rsh-benchmarks` (plain
+#       `cargo bench` would NOT run this crate: rsh-benchmarks is a
+#       workspace member but not a default member).
+#   firmware     — skips while firmware/ is absent (restored in Phase D from
+#       reference/firmware-v4.0.1). Runs `pio run` + merged-bin check.
+#   frontend     — skips while frontend/package.json is absent (Phase E).
+#   rig-gate     — skips while run-rig.sh is absent (Rust rig, Phase B/C).
+#   tauri-build  — skips while src-tauri/ is absent (Phase A2/E).
 #
-# Release workflow (.github/workflows/release.yml) se farq:
-# release.yml sirf tag v* par release banata hai; ye CI har push/PR par
-# chalta hai aur kuch release nahi karta.
+# ---- What this workflow does NOT do (deliberately) ----
+#   * No release workflow: .github/workflows/release.yml is Phase H
+#     (SW-R8.4/SW-R8.5), NOT A4. No bundling/signing here — tauri-build
+#     uses `tauri build --no-bundle` only.
+#   * No OV code signing: deferred by user decision D-R11 (RSH-RUST-PLAN.md).
+#     The app ships unsigned in v1.0.0; firmware Ed25519 signing stays
+#     mandatory and lives in the Phase H release workflow, not here.
+#     (CI firmware builds run WITHOUT RSH_SIGNING_KEY, so they are unsigned
+#     dev builds — sign_firmware.py skips signing and does not fail.)
+#   * No 4-hour soak in CI: the long soak is a release blocker (D-R14) and
+#     runs in the rig (--long), not in CI.
+#   * No `cargo test --workspace --release`: per TESTING-INPUT §9.1 that run
+#     is required at least once before the release gate, not on every push.
 #
-# NOTE (QA correction — brief mein ubuntu-latest likha tha):
-# `dotnet` job windows-latest par hai, kyunke RSH.App WPF hai
-# (net10.0-windows, UseWPF) aur RSH.VJoy.Tests bhi net10.0-windows hai.
-# `dotnet build` Linux par bhi compile ho jata (EnableWindowsTargeting),
-# lekin `dotnet test` Windows-targeted test assembly ko ubuntu-latest par
-# EXECUTE nahi kar sakta — ubuntu par dotnet job pehle din se red hota.
-# release.yml ka software job bhi windows-latest use karta hai.
-# Host tests, firmware aur benchmark-gate ubuntu-latest par hain.
+# Toolchain: Rust stable 1.100.0 (pinned; rust-toolchain.toml in Phase A2
+# pins the same). Actions verified 2026-11-14: actions/checkout@v4,
+# dtolnay/rust-toolchain@stable, Swatinem/rust-cache@v2 (Marketplace),
+# actions/setup-node@v4, actions/setup-python@v5.
+# Linux jobs that compile Rust (clippy, test-linux) install the Tauri 2
+# system libraries first (libwebkit2gtk-4.1-dev, libgtk-3-dev,
+# libappindicator3-dev, librsvg2-dev, patchelf, libssl-dev): compiling the
+# workspace links the Tauri/GTK stack even when no app is bundled, and
+# without them gdk-sys fails with "Package gdk-3.0 was not found"
+# (proven locally 2026-11-14: cargo test failed on gdk-sys in a sandbox
+# without those -dev packages). No display server is needed — tests do
+# not open a window.
 
-name: RSH — CI
+name: RSH Rust — CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
-    branches: ["**"]
-  workflow_dispatch:
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  # ------------------------------------------------------------------
-  # dotnet — RSH app + tests (Windows runner; WPF ki wajah se)
-  # Rig mein: Windows runner/VM par yehi steps chalenge
-  #   (setup-dotnet 10.0.100 -> dotnet build -> dotnet test x2).
-  # ------------------------------------------------------------------
-  dotnet:
-    name: .NET build + tests
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Rust workspace present
+        id: check
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SKIP: no Cargo.toml yet — Rust workspace lands in Phase A2; nothing to format. This is a skip, not a pass."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust 1.100.0
+        if: steps.check.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          components: rustfmt
+      - name: Cache Cargo dependencies
+        if: steps.check.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        if: steps.check.outputs.run == 'true'
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Rust workspace present
+        id: check
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SKIP: no Cargo.toml yet — Rust workspace lands in Phase A2; nothing to lint. This is a skip, not a pass."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust 1.100.0
+        if: steps.check.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          components: clippy
+      - name: Install Tauri Linux system libraries
+        if: steps.check.outputs.run == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+      - name: Cache Cargo dependencies
+        if: steps.check.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+      - name: cargo clippy (warnings denied)
+        if: steps.check.outputs.run == 'true'
+        run: cargo clippy --all-targets -- -D warnings
+
+  test-linux:
+    name: test (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Rust workspace present
+        id: check
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SKIP: no Cargo.toml yet — Rust workspace lands in Phase A2; no tests to run. This is a skip, not a pass."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust 1.100.0
+        if: steps.check.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - name: Install Tauri Linux system libraries
+        if: steps.check.outputs.run == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+      - name: Cache Cargo dependencies
+        if: steps.check.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+      - name: cargo test --workspace
+        if: steps.check.outputs.run == 'true'
+        run: cargo test --workspace
+
+  test-windows:
+    name: test (Windows)
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup .NET SDK 10.0.100
-        uses: actions/setup-dotnet@v4
-        with:
-          # software/global.json bhi 10.0.100 pin karta hai
-          # (rollForward latestPatch); yahan explicit pin taake
-          # global.json ke baghair bhi SDK wahi rahe.
-          dotnet-version: "10.0.100"
-
-      - name: Verify SDK pin matches global.json
-        shell: pwsh
+      - name: Check Rust workspace present
+        id: check
+        shell: bash
         run: |
-          $sdk = (dotnet --version).Trim()
-          $pinned = (Get-Content software/global.json | ConvertFrom-Json).sdk.version
-          Write-Host "SDK: $sdk, global.json pin: $pinned"
-          # NOTE (2026-11-13): ye check pehle exact-equality tha, lekin
-          # global.json mein rollForward latestPatch hai — runner par naye
-          # patches preinstalled hote hain, is liye dotnet --version pin se
-          # naya de sakta hai. Pin minimum version hai, exact nahi.
-          if ([System.Version]$sdk -lt [System.Version]$pinned) { throw "SDK $sdk < global.json pin $pinned" }
-
-      - name: Build solution
-        # Warnings-as-errors: production code (src/) ke liye pehle se ON hai
-        # via software/src/Directory.Build.props (TreatWarningsAsErrors=true),
-        # is liye plain build hi src warnings par fail hoga.
-        # Solution-wide `-p:TreatWarningsAsErrors=true` yahan NAHI lagaya:
-        # test projects mein pehle se 2 mojood warnings hain — wo fix hone
-        # tak solution-wide flag CI ko red kar dega. Un 2 warnings ka fix
-        # alag follow-up hai; us ke baad solution-wide flag lagaya ja sakta hai.
-        run: dotnet build software/RSH.slnx -c Release --nologo
-
-      # Test counts (T5): har test project apne step mein — breakdown ke
-      # saath, koi single gumrah-kun aggregate number nahi ("536 checks"
-      # jaisa). Har step ka console summary us project ki Passed/Failed/
-      # Skipped ginti hai; fail hone par pata chalta hai kaunsa project fail hua.
-      # TRX report: xUnit v3/MTP console par fail hone wale test ka naam
-      # NAHI chhapta (sirf summary) — is liye har step `--report-xunit-trx`
-      # se TRX likhta hai aur "Upload test results" step fail hone par use
-      # artifact ke tor par upload karta hai (naamon ke saath diagnosis).
-      - name: Test RSH.Tests (Core)
-        run: dotnet test software/tests/RSH.Tests/RSH.Tests.csproj -c Release --no-build --nologo -- --report-xunit-trx --report-xunit-trx-filename RSH.Tests.trx --results-directory ${{ github.workspace }}/test-results
-
-      - name: Test RSH.VJoy.Tests (vJoy layout)
-        run: dotnet test software/tests/RSH.VJoy.Tests/RSH.VJoy.Tests.csproj -c Release --no-build --nologo -- --report-xunit-trx --report-xunit-trx-filename RSH.VJoy.Tests.trx --results-directory ${{ github.workspace }}/test-results
-
-      - name: Upload test results (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
+          if [ -f Cargo.toml ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SKIP: no Cargo.toml yet — Rust workspace lands in Phase A2; no tests to run. This is a skip, not a pass."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust 1.100.0
+        if: steps.check.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
         with:
-          name: dotnet-test-results-ci
-          path: test-results/*.trx
-          if-no-files-found: warn
+          toolchain: "1.100.0"
+      - name: Cache Cargo dependencies
+        if: steps.check.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+      # Windows-only tests run here; on Linux they skip with a reason
+      # (TESTING-INPUT §9.1).
+      - name: cargo test --workspace
+        if: steps.check.outputs.run == 'true'
+        run: cargo test --workspace
 
-  # ------------------------------------------------------------------
-  # host-tests — C++ host tests + Python reference scripts (Linux)
-  # Rig mein: Linux runner par yehi steps; koi Arduino/board nahi chahiye.
-  # ------------------------------------------------------------------
-  host-tests:
-    name: C++ host tests + Python scripts
+  fuzz-quick:
+    name: fuzz-quick
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: C++ host tests (run_tests.sh)
-        run: sh tests-host/run_tests.sh
-
-      - name: C++ host tests — strict flags (T6)
-        # NOTE: run_tests.sh khud sakht flags ke baghair compile karta hai
-        # (plain `g++ -std=c++17 -O1`). Script ko chhede baghair CI yahan
-        # apna strict compile + run karta hai; run_tests.sh mein flags
-        # dalna firmware/host-test team ka follow-up hai.
-        # test_main.cpp ko Ed25519 (FW-9 §20) ke liye libsodium chahiye —
-        # run_tests.sh jaisa versioned .so dhoondho (dev symlink nahi hota).
-        # Is ke baghair link fail hota hai (undefined reference to
-        # crypto_sign_* — release v2.0.0 ki pehli CI run, 2026-11-13).
+      - name: Check fuzz targets present
+        id: check
+        shell: bash
         run: |
-          SODIUM_LIB=""
-          for d in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib /lib; do
-            for f in "$d"/libsodium.so*; do
-              [ -e "$f" ] && SODIUM_LIB="$f" && break 2
-            done
+          if [ -f fuzz/Cargo.toml ] && compgen -G "fuzz/fuzz_targets/*.rs" > /dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SKIP: no fuzz targets yet — Phase A1 creates fuzz/ (targets: parse_stream, parse_control, pin_validator, config_blob_validator). This is a skip, not a pass; a fuzz run is never faked green."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install nightly Rust (cargo-fuzz needs nightly)
+        if: steps.check.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+      - name: Cache Cargo dependencies
+        if: steps.check.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        if: steps.check.outputs.run == 'true'
+        run: cargo install cargo-fuzz --locked
+      # cargo-fuzz is Unix-only (TESTING-INPUT §0.1) — Linux job only.
+      # 60 s per target (Phase A4 spec). TESTING-INPUT Phase 1 mentions
+      # 5 min per target in CI; the 60 s quick run is what this job does
+      # — lengthening it is a Phase B/C decision, not an A4 one.
+      - name: cargo fuzz (60 s per target)
+        if: steps.check.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in fuzz/fuzz_targets/*.rs; do
+            name="$(basename "$target" .rs)"
+            echo "::group::fuzz target: $name"
+            cargo +nightly fuzz run "$name" -- -max_total_time=60
+            echo "::endgroup::"
           done
-          [ -n "$SODIUM_LIB" ] || { echo "libsodium nahi mila — Ed25519 host tests ke liye chahiye"; exit 1; }
-          g++ -std=c++17 -O1 -Wall -Wextra -Werror -fsanitize=address,undefined \
-            -I firmware/rsh -o /tmp/rsh_host_tests_strict tests-host/test_main.cpp "$SODIUM_LIB"
-          /tmp/rsh_host_tests_strict
 
-      # Har Python script apne step mein taake fail hone par pata chale
-      # kaunsi fail hui (ek combined step mein attribution kho jati).
-      - name: Python — pin rules reference
-        run: python3 -I tests-host/pin_rules_ref.py
-
-      - name: Python — protocol v2 golden vectors
-        run: python3 -I tests-host/protocol_v2_vectors.py
-
-      - name: Python — packet cross-verify
-        run: python3 -I tests-host/verify_packet.py
-
-  # ------------------------------------------------------------------
-  # firmware — ESP32 build + merged-bin check (Linux)
-  # Rig mein: Linux runner par pio run; board/flash ki zaroorat nahi.
-  # ------------------------------------------------------------------
-  firmware:
-    name: Firmware (ESP32)
+  bench-gate:
+    name: bench-gate
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Check bench prerequisites
+        id: check
+        shell: bash
+        run: |
+          if [ ! -f Cargo.toml ]; then
+            echo "::notice::SKIP: no Cargo.toml yet — Rust workspace lands in Phase A2; nothing to benchmark. This is a skip, not a pass."
+            echo "state=skip" >> "$GITHUB_OUTPUT"
+          elif [ -f tools/rsh-benchmarks/thresholds.json ]; then
+            echo "state=run" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=missing-thresholds" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fail closed — thresholds not yet defined
+        if: steps.check.outputs.state == 'missing-thresholds'
+        shell: bash
+        run: |
+          echo "::error::thresholds not yet defined (Phase B) — bench-gate is FAIL-CLOSED: no tools/rsh-benchmarks/thresholds.json exists, so no benchmark pass can be claimed. Phase B must create thresholds.json (SW-R8.1) plus the enforcement script (tools/rsh-benchmarks/check-thresholds.py). Do not invent threshold values."
+          exit 1
+      - name: Install Rust 1.100.0
+        if: steps.check.outputs.state == 'run'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - name: Cache Cargo dependencies
+        if: steps.check.outputs.state == 'run'
+        uses: Swatinem/rust-cache@v2
+      - name: cargo bench + thresholds enforcement
+        if: steps.check.outputs.state == 'run'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench -p rsh-benchmarks
+          python3 tools/rsh-benchmarks/check-thresholds.py
 
-      - name: Setup Python 3.12
+  firmware:
+    name: firmware
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check firmware present
+        id: check
+        shell: bash
+        run: |
+          if [ -d firmware ] && [ -f firmware/platformio.ini ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SKIP: no firmware/ yet — restored in Phase D from reference/firmware-v4.0.1 (Track A, C++ v4.0.1). This is a skip, not a pass."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Python 3.12
+        if: steps.check.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Cache PlatformIO
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/pip
-            ~/.platformio
-          key: pio-${{ hashFiles('firmware/rsh/platformio.ini') }}
-
-      - name: Verify platform pin (espressif32@6.9.0)
-        run: grep -Fq 'platform = espressif32@6.9.0' firmware/rsh/platformio.ini
-
       - name: Install PlatformIO
+        if: steps.check.outputs.run == 'true'
         run: pip install -U platformio
-
-      - name: Build firmware
-        working-directory: firmware/rsh
+      # Track A: `pio run` in firmware/. No RSH_SIGNING_KEY is set here,
+      # so sign_firmware.py skips signing (dev build stays unsigned and
+      # the build does NOT fail); signed release builds are Phase H.
+      - name: pio run
+        if: steps.check.outputs.run == 'true'
+        working-directory: firmware
         run: pio run
-
-      - name: Check merged factory bin EXISTS (silent-merge bug guard)
-        # merge_bin.py (post: script) koi input missing ho to stderr par
-        # "skipping merge" likh kar KHAMOSHI se return karta hai — pio run
-        # phir bhi green rehta hai aur merged bin bane baghair reh jata hai.
-        # Is liye CI mein merged bin ka existence check LAZMI hai: agar
-        # RSH-Firmware-DevKitV1-v*.bin na bana ho to job FAIL hogi.
+      # Merged factory image: .pio/build/esp32dev/RSH-Firmware-DevKitV1-v<version>.bin
+      # (merge_bin.py post script; bootloader + partitions + app, flash at 0x0).
+      - name: Merged-bin check
+        if: steps.check.outputs.run == 'true'
+        shell: bash
         run: |
-          BUILD_DIR="firmware/rsh/.pio/build/esp32dev"
-          ls -la "$BUILD_DIR"
-          test -f "$BUILD_DIR/firmware.bin" || { echo "MISSING: firmware.bin (app-only OTA image)"; exit 1; }
-          MERGED=$(ls "$BUILD_DIR"/RSH-Firmware-DevKitV1-v*.bin 2>/dev/null | head -n 1)
-          if [ -z "$MERGED" ]; then
-            echo "MISSING: merged factory bin RSH-Firmware-DevKitV1-v*.bin — merge_bin.py khamoshi se fail hua?"
+          set -euo pipefail
+          shopt -s nullglob
+          merged=(firmware/.pio/build/esp32dev/RSH-Firmware-DevKitV1-v*.bin)
+          if [ "${#merged[@]}" -eq 0 ]; then
+            echo "::error::merged factory image missing: expected firmware/.pio/build/esp32dev/RSH-Firmware-DevKitV1-v<version>.bin after 'pio run' (see firmware/platformio.ini + merge_bin.py). If Phase D changes the merged-bin name/path, update this check — do not delete it."
             exit 1
           fi
-          echo "Merged factory bin OK: $MERGED"
-          sha256sum "$BUILD_DIR"/*.bin
+          for f in "${merged[@]}"; do
+            echo "merged bin: $f ($(stat -c%s "$f") bytes)"
+          done
 
-  # ------------------------------------------------------------------
-  # benchmark-gate — benchmarks + thresholds (Linux)
-  # Rig mein: Linux runner par; dotnet job green hone ke baad hi chalega.
-  # ------------------------------------------------------------------
-  benchmark-gate:
-    name: Benchmark gate
+  # Phase E gate: runs the full frontend gate — lint, vitest (includes
+  # the AppShell render test, the blank-window regression test: the root
+  # renders with literal text present), vite build (tsc + bundle), and
+  # the locale-merge parity check. No Playwright step: the frontend has
+  # no playwright config/tests (E2E is a Phase F/H item, not Phase E) —
+  # a Playwright step here would fail on "No tests found" and is not a
+  # real gate. Do not re-add it without landing playwright tests first.
+  frontend:
+    name: frontend
     runs-on: ubuntu-latest
-    needs: [dotnet]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup .NET SDK 10.0.100
-        uses: actions/setup-dotnet@v4
+      - name: Check frontend present
+        id: check
+        shell: bash
+        run: |
+          if [ -f frontend/package.json ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SKIP: no frontend/package.json yet — frontend lands in Phase E (Vite + Tailwind + shadcn/ui). This is a skip, not a pass."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Node.js 24
+        if: steps.check.outputs.run == 'true'
+        uses: actions/setup-node@v4
         with:
-          dotnet-version: "10.0.100"
+          node-version: "24"
+      - name: npm ci
+        if: steps.check.outputs.run == 'true'
+        working-directory: frontend
+        run: npm ci
+      - name: eslint
+        if: steps.check.outputs.run == 'true'
+        working-directory: frontend
+        run: npm run lint
+      - name: vitest run
+        if: steps.check.outputs.run == 'true'
+        working-directory: frontend
+        run: npm test
+      # Blank-window regression gate (D-R15): the bundle must build and
+      # the AppShell render test (above) must pass — a window that cannot
+      # build or cannot render text is a fail, never a skip.
+      - name: vite build (tsc + bundle)
+        if: steps.check.outputs.run == 'true'
+        working-directory: frontend
+        run: npm run build
+      # Locale parity: merged locales must match the per-screen sources.
+      - name: merge-locales --check
+        if: steps.check.outputs.run == 'true'
+        working-directory: frontend
+        run: node scripts/merge-locales.mjs --check
+      # Frontend supply-chain gate (SECURITY-INPUT §9 / TM-R03):
+      # fail on High/Critical npm advisories.
+      - name: npm audit (High/Critical fail)
+        if: steps.check.outputs.run == 'true'
+        working-directory: frontend
+        run: npm audit --audit-level=high
 
-      - name: Run benchmarks (short CI soak)
-        # Full soak (60 s default) local/manual run ke liye hai;
-        # CI mein --soak-sec 10 taake gate halka rahe.
-        # Output benchmarks.log mein bhi jata hai — agla step (Threshold gate)
-        # usi log ko thresholds.json se dobara milata hai (sirf Program.cs ke
-        # apne exit code par bharosa nahi — gate step khud enforcing hai).
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check audit prerequisites
+        id: check
+        shell: bash
         run: |
-          dotnet run --project software/tools/RSH.Benchmarks -c Release -- --soak-sec 10 > benchmarks.log 2>&1
-          rc=$?
-          cat benchmarks.log
-          exit $rc
-
-      - name: Threshold gate
-        # ENFORCING (Phase C QA — pehle sirf print karta tha, TODO ke sath).
-        # 1) thresholds.json lazmi hai (TBD era khatam — file na ho to FAIL).
-        # 2) benchmarks.log mein "--- Gate ---" section lazmi hai, aur us mein
-        #    koi [FAIL] nahi hona chahiye + "GATE PASS" lazmi hai.
-        # 3) Aazad dobara-jaanch: log ki [Parse]/[Pipe]/[E2E]/[Soak] lines se
-        #    numbers nikal kar thresholds.json ke khilaf compare karo — taake
-        #    Program.cs ka exit code khamoshi se badal bhi jaye to gate phir
-        #    bhi breach par FAIL ho. Koi bhi breach = exit 1 = job red.
-        # E2E checks sirf tab jab E2E chala ho (UDP loopback band mahol mein
-        # SKIP hota hai — us surat mein wo checks SKIP, baqi sab enforcing).
+          if [ ! -f Cargo.toml ]; then
+            echo "::notice::SKIP: no Cargo.toml yet — Rust workspace lands in Phase A2; nothing to audit. This is a skip, not a pass."
+            echo "state=skip" >> "$GITHUB_OUTPUT"
+          elif [ ! -f Cargo.lock ]; then
+            echo "state=missing-lock" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=run" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fail — Cargo.lock missing
+        if: steps.check.outputs.state == 'missing-lock'
+        shell: bash
         run: |
-          python3 - <<'EOF'
-          import json, re, sys
-          from pathlib import Path
+          echo "::error::Cargo.lock missing — the lockfile must be committed (SECURITY-INPUT §0: binary crate, lockfile mandatory). cargo audit / cargo deny cannot run without it."
+          exit 1
+      - name: Install Rust 1.100.0
+        if: steps.check.outputs.state == 'run'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - name: Cache Cargo dependencies
+        if: steps.check.outputs.state == 'run'
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit and cargo-deny
+        if: steps.check.outputs.state == 'run'
+        run: cargo install cargo-audit cargo-deny --locked
+      # --deny warnings also fails on unmaintained/unsound advisories
+      # (TESTING-INPUT §6). Ignores, if ever needed, go in audit.toml
+      # with an expiry + reason — never silently.
+      - name: cargo audit --deny warnings
+        if: steps.check.outputs.state == 'run'
+        run: cargo audit --deny warnings
+      # Policy in deny.toml (repo root): sources = crates.io only, git
+      # denied; licenses = permissive allow-list (MIT/Apache-2.0/BSD
+      # + narrow ecosystem extras, see deny.toml header).
+      - name: cargo deny check
+        if: steps.check.outputs.state == 'run'
+        run: |
+          test -f deny.toml || { echo "::error::deny.toml missing at repo root (Phase A4 created it — do not delete)."; exit 1; }
+          cargo deny check
 
-          failures, skips, passes = [], [], []
-          def check(name, ok, detail):
-              (passes if ok else failures).append(f"{name}: {detail}")
-          def skip(name, detail):
-              skips.append(f"{name}: {detail}")
+  rig-gate:
+    name: rig-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check rig present
+        id: check
+        shell: bash
+        run: |
+          if [ -f run-rig.sh ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SKIP: no run-rig.sh yet — Rust Virtual Test Rig lands in Phase B/C (TESTING-INPUT §8). This is a skip, not a pass."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust 1.100.0
+        if: steps.check.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - name: Cache Cargo dependencies
+        if: steps.check.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+      # Quick rig gate (60 s soak + scenarios), per TESTING-INPUT §9.1.
+      # Full (10-min) and long (4-h, release blocker D-R14) soaks run
+      # outside CI, in the rig itself.
+      - name: ./run-rig.sh (quick)
+        if: steps.check.outputs.run == 'true'
+        run: ./run-rig.sh
 
-          thresholds_path = Path("software/tools/RSH.Benchmarks/thresholds.json")
-          log_path = Path("benchmarks.log")
-          if not thresholds_path.is_file():
-              print(f"FAIL: thresholds.json nahi hai ({thresholds_path}) — gate enforce nahi ho sakta.")
-              sys.exit(1)
-          try:
-              thresholds = json.loads(thresholds_path.read_text())
-          except Exception as e:
-              print(f"FAIL: thresholds.json parse nahi hua: {e}")
-              sys.exit(1)
-          if not log_path.is_file():
-              print("FAIL: benchmarks.log nahi hai — 'Run benchmarks' step chala hi nahi?")
-              sys.exit(1)
-          log = log_path.read_text(errors="replace")
-
-          # --- Gate section (Program.cs ki apni verdict) ---
-          if "--- Gate ---" not in log:
-              print("FAIL: benchmarks.log mein '--- Gate ---' section nahi — benchmarks mukammal nahi chale.")
-              sys.exit(1)
-          gate_section = log.split("--- Gate ---", 1)[1]
-          fail_lines = re.findall(r"\[FAIL\] (.+)", gate_section)
-          if fail_lines:
-              failures.append(f"benchmark gate FAIL lines: {'; '.join(fail_lines)}")
-          if "GATE PASS" not in gate_section:
-              failures.append("benchmark gate mein 'GATE PASS' nahi — gate FAIL ya adhura.")
-
-          # --- Aazad dobara-jaanch: numbers vs thresholds.json ---
-          def num(pat, text, label):
-              m = re.search(pat, text)
-              if not m:
-                  failures.append(f"{label}: log mein number nahi mila (pattern {pat!r}) — benchmark adhura?")
-                  return None
-              return float(m.group(1))
-          def need(key):
-              if key not in thresholds:
-                  failures.append(f"thresholds.json mein '{key}' nahi — fail-closed.")
-                  return None
-              return float(thresholds[key])
-
-          v = num(r"\((\d+) ns/packet\)", log, "parse-ns")
-          t = need("parseNsPerPacketMax")
-          if v is not None and t is not None: check("parse-ns", v <= t, f"{v:.0f} ns/packet <= {t:.0f}")
-          v = num(r"\(([\d.]+) B/packet\)", log, "parse-alloc")
-          t = need("parseAllocBytesPerPacketMax")
-          if v is not None and t is not None: check("parse-alloc", v <= t, f"{v:.2f} B/packet <= {t:.2f}")
-          v = num(r"\((\d+) ns/tick\)", log, "pipe-ns")
-          t = need("pipeNsPerTickMax")
-          if v is not None and t is not None: check("pipe-ns", v <= t, f"{v:.0f} ns/tick <= {t:.0f}")
-          v = num(r"\(([\d.]+) B/tick\)", log, "pipe-alloc")
-          t = need("pipeAllocBytesPerTickMax")
-          if v is not None and t is not None: check("pipe-alloc", v <= t, f"{v:.2f} B/tick <= {t:.2f}")
-
-          if "[E2E]    SKIP" in log:
-              skip("e2e-loss/e2e-age/e2e-pacing", "UDP loopback is mahol mein band — E2E SKIP (fail nahi)")
-          else:
-              v = num(r"lost=(\d+)", log, "e2e-loss")
-              t = need("e2eLostMax")
-              if v is not None and t is not None: check("e2e-loss", v <= t, f"lost={v:.0f} <= {t:.0f}")
-              v = num(r"latest-age avg=[\d.]+ ms p99=([\d.]+) ms", log, "e2e-age")
-              t = need("e2eAgeP99MsMax")
-              if v is not None and t is not None: check("e2e-age", v <= t, f"age p99={v:.1f} ms <= {t:.0f} ms")
-              v = num(r"send-gap avg=[\d.]+ ms p99=([\d.]+) ms", log, "e2e-pacing")
-              t = need("e2eSendGapP99MsMax")
-              if v is not None and t is not None: check("e2e-pacing", v <= t, f"send-gap p99={v:.2f} ms <= {t:.2f} ms")
-
-          v = num(r"\(~([\d.]+)/s\)", log, "soak-rate")
-          t = need("soakTicksPerSecMin")
-          if v is not None and t is not None: check("soak-rate", v >= t, f"{v:.0f} ticks/s >= {t:.0f}")
-          v = num(r"avg tick \(soak-only\)=([\d.]+) us", log, "soak-avg-tick")
-          t = need("soakAvgTickUsMax")
-          if v is not None and t is not None: check("soak-avg-tick", v <= t, f"avg tick {v:.1f} us <= {t:.0f} us")
-          v = num(r"max tick \(lifetime, warm-up samet\)=(\d+) us", log, "soak-max-tick")
-          t = need("soakMaxTickUsMax")
-          if v is not None and t is not None: check("soak-max-tick", v <= t, f"max tick {v:.0f} us <= {t:.0f} us")
-          v = num(r"late=\d+ \(([\d.]+) ?%\)", log, "soak-late")
-          t = need("soakLateTickRatioMax")
-          if v is not None and t is not None: check("soak-late", v / 100.0 <= t, f"late {v:.1f}% <= {t * 100:.0f}%")
-          v = num(r"steady-state \(2nd half\)=([\d.]+) B", log, "soak-alloc")
-          t = need("soakAllocBytesPerTickSecondHalfMax")
-          if v is not None and t is not None: check("soak-alloc", v <= t, f"steady-state alloc {v:.1f} B/tick <= {t:.0f} B/tick")
-          v = num(r"\(growth ([\d.\-]+) MB\)", log, "soak-heap")
-          t = need("soakHeapGrowthMbMax")
-          if v is not None and t is not None: check("soak-heap", v <= t, f"heap growth {v:.2f} MB <= {t:.1f} MB")
-          v = num(r"Gen2 collections=(\d+)", log, "soak-gen2")
-          t = need("soakGen2CollectionsMax")
-          if v is not None and t is not None: check("soak-gen2", v <= t, f"Gen2 collections {v:.0f} <= {t:.0f}")
-          v = num(r"working set [\d.]+ MB -> ([\d.]+) MB", log, "soak-ws")
-          t = need("soakWorkingSetMbMax")
-          if v is not None and t is not None: check("soak-ws", v <= t, f"WS end {v:.1f} MB <= {t:.0f} MB")
-
-          print("--- Threshold gate (enforcing, Phase C QA) ---")
-          for p in passes: print(f"[PASS] {p}")
-          for s in skips: print(f"[SKIP] {s}")
-          for f in failures: print(f"[FAIL] {f}")
-          if failures:
-              print(f"=== THRESHOLD GATE FAIL ({len(failures)} breach, {len(passes)} pass, {len(skips)} skip) ===")
-              sys.exit(1)
-          print(f"=== THRESHOLD GATE PASS ({len(passes)} pass, {len(skips)} skip) ===")
-          EOF
+  tauri-build:
+    name: tauri-build
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Tauri shell present
+        id: check
+        shell: bash
+        run: |
+          if [ -d src-tauri ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SKIP: no src-tauri/ yet — Tauri shell lands in Phase A2/E. This is a skip, not a pass."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Node.js 24
+        if: steps.check.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install Rust 1.100.0
+        if: steps.check.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - name: Cache Cargo dependencies
+        if: steps.check.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+      # H4 finding #1 (fixed H5): this job used to run
+      # `npm run tauri build` in `frontend/`, but there is no `tauri`
+      # npm script and no `@tauri-apps/cli` in `frontend/package.json`
+      # — the job could never work as written. It now installs the
+      # Tauri CLI with cargo exactly like the release workflow does
+      # (`cargo install tauri-cli --locked`), and runs
+      # `cargo tauri build` from `src-tauri/` (the CLI resolves
+      # `tauri.conf.json` there; its `beforeBuildCommand` runs
+      # `npm run build` in `../frontend`, so `npm ci` below must run
+      # first). No npm script or dependency was added: the CLI is a
+      # build tool, not a frontend dependency.
+      - name: Install Tauri CLI (cargo, like the release workflow)
+        if: steps.check.outputs.run == 'true'
+        shell: bash
+        run: |
+          cargo install tauri-cli --locked
+          cargo tauri --version
+      # Build only — no bundling, no signing in CI. Release workflow
+      # (Phase H) does the bundling + installer + signed updater.
+      # --no-bundle verified against the Tauri 2 CLI reference
+      # (v2.tauri.app/reference/cli): "Skip the bundling step even if
+      # bundle > active is true in tauri config".
+      - name: npm ci (frontend dependencies for the Tauri build)
+        if: steps.check.outputs.run == 'true'
+        working-directory: frontend
+        shell: bash
+        run: |
+          if [ ! -f package.json ]; then
+            echo "::error::src-tauri/ exists but frontend/package.json is missing — the Tauri frontend (Phase E) is incomplete."
+            exit 1
+          fi
+          npm ci
+      - name: cargo tauri build --no-bundle
+        if: steps.check.outputs.run == 'true'
+        working-directory: src-tauri
+        shell: bash
+        run: cargo tauri build --no-bundle

@@ -1,0 +1,29 @@
+[package]
+name = "rsh-benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RSH criterion benchmarks (Phase A6 protocol baseline + Phase B5 engine hot-path gate). Benches the rsh-protocol parse/encode path and the rsh-engine pipeline tick / full hot path, with a counting-allocator 0 B/tick gate and thresholds.json enforcement."
+publish = false
+
+[dependencies]
+# Used by src/fixture.rs (shared bench/gate input).
+rsh-protocol = { path = "../../crates/rsh-protocol" }
+# Used by src/soak.rs (the headless soak runner, also run by the
+# `rsh-soak` helper binary) and by benches/tests.
+rsh-engine = { path = "../../crates/rsh-engine" }
+
+[dev-dependencies]
+# Used only by benches/ and tests/ (bench targets see dev-dependencies).
+criterion.workspace = true
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "engine"
+harness = false
+
+[lints]
+workspace = true

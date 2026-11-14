@@ -1,277 +1,305 @@
-# RSH — User Guide
+# RSH — User Guide (Rust app v1.0.0)
 
-**Version 2.0.4 — for RSH app v2.0.4 / firmware v4.0.1 / protocol v2.1.**
-(Previous guide version: 2.0.3 / firmware v4.0.0 — v2.0.4 adds
-the final polish sweep (bug fixes across app + firmware — see
-`docs/RELEASE-NOTES-v2.0.4.md`). Firmware v4.0.1 (blob validator +
-ping/NVS fixes); if your board already runs v4.0.0, reflash to v4.0.1.)
+**App:** RSH v1.0.0 (Tauri 2, Windows 10 22H2 / Windows 11, x64) ·
+**Wheel firmware:** C++ v4.0.1 · **Protocol:** v2.1 ·
+**Board:** ESP32 DevKit V1
 
-Wireless DIY sim-racing wheel: an ESP32 in the wheel sends its movement over
-its own WiFi; RSH on the PC turns that into a standard game controller
-(a vJoy virtual joystick) that every racing game understands.
+This guide is for the **Rust recreation** of RSH. If you used the old
+C# app (v2.0.4 or earlier), read
+[Re-pairing after the C# → Rust switch](#re-pairing-after-the-c-rust-switch-mandatory)
+first — your old pairing does **not** carry over.
 
-**Principle:** the firmware stays dumb and fast (sample → send, 200 times a
-second). Everything smart — calibration, smoothing, curves — happens here,
-where you can change it without reflashing anything.
+## Contents
 
----
+- [Install](#install)
+- [Unsigned app — SmartScreen](#unsigned-app--smartscreen)
+- [First run — the Setup wizard](#first-run--the-setup-wizard)
+- [Pairing (60-second window)](#pairing-60-second-window)
+- [Re-pairing after the C# → Rust switch (mandatory)](#re-pairing-after-the-c-rust-switch-mandatory)
+- [Connecting — Wi-Fi or USB](#connecting--wi-fi-or-usb)
+- [The 8 screens](#the-8-screens)
+- [Per-module tuning](#per-module-tuning)
+- [Profiles](#profiles)
+- [Game launcher](#game-launcher)
+- [Output backend — HIDMaestro or vJoy](#output-backend--hidmaestro-or-vjoy)
+- [Updating](#updating)
+- [Troubleshooting](#troubleshooting)
+- [Uninstall](#uninstall)
 
-## 1. What you need
+## Install
 
-- The wheel, flashed with the RSH firmware v4.0.1 (ESP32 DevKit V1 build).
-- Windows 11 (64-bit). Windows 10 22H2 (64-bit, build 19045+) also works —
-  v2.0.4 automatically uses a classic window there (see §6). Windows 10
-  is end-of-life (14 Oct 2025) — floor ke andar (19045+) support hai;
-  is se purana build (masalan 19041) supported nahi.
-- **.NET 10 Desktop Runtime 10.x (x64) — REQUIRED from v2.0.1.**
-  The v2.0.4 app is framework-dependent: it does NOT bundle .NET
-  anymore, so without this runtime `RSH.exe` will not start at all.
-  Download it from the official Microsoft page
-  <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>
-  (Run apps → **.NET Desktop Runtime 10.0.x**, Windows x64 installer),
-  or run `winget install Microsoft.DotNet.DesktopRuntime.10`.
-  The plain ".NET Runtime" alone is NOT enough (RSH is a WPF app),
-  and .NET 8/9 does NOT count — it must be 10.x. Check with
-  `dotnet --list-runtimes` — the output must contain a line
-  `Microsoft.WindowsDesktop.App 10.x.x`.
-- The **vJoy driver, BrunnerInnovation v2.2.2.0** — this is the signed
-  release that works on Windows 11. Get the driver and `vJoyInterface.dll`
-  from the same release; mixing versions does not work (RSH checks and
-  tells you if they don't match).
-- A game. Any game that accepts a standard joystick works.
+1. Download **`RSH_1.0.0_x64-setup.exe`** (primary installer) or
+   **`RSH_1.0.0_x64_en-US.msi`** (secondary, for managed installs)
+   from the
+   [v1.0.0 GitHub Release](https://github.com/dreamsofts34-creator/RSH/releases/tag/v1.0.0).
+2. **Verify the download** before running it — compare the SHA-256
+   with `SHA256SUMS` in the same release:
+   - PowerShell: `Get-FileHash RSH_1.0.0_x64-setup.exe -Algorithm SHA256`
+   - If the hash does not match, delete the file and download it again.
+     Never run a mismatched installer.
+3. Double-click the installer. It installs for the current user only —
+   **no admin prompt at install time**. It creates a Start Menu
+   shortcut and an entry in "Apps & features".
+4. **No .NET runtime is needed.** The app is a native Tauri binary.
+   On a machine without WebView2, the installer downloads it silently
+   (internet required at install time).
+5. **Firmware:** if your wheel already runs firmware **v4.0.1**, you do
+   **not** need to reflash anything — the Rust app talks to the same
+   board. Only a new/blank board or a board that will not boot needs
+   flashing: see [FLASH-GUIDE.md](FLASH-GUIDE.md).
 
-## 2. Install the vJoy driver (once, as administrator)
+### Unsigned app — SmartScreen
 
-1. Run the vJoy 2.2.2.0 installer (it needs admin — it's a driver).
-2. Open **vJoyConf** (Configure vJoy).
-3. Select device **1**. Enable axes **X**, **Y**, **Z** and **Slider**
-   (Slider = handbrake, Phase G C8 — docs/HANDBRAKE-MAPPING.md). Set the number
-   of buttons to at least 2 (32 gives you room for the future).
-4. Click **Apply**. Leave "Enable vJoy" ticked.
-5. Optional check: open **joy.cpl** (Set up USB game controllers) — you
-   should see a vJoy device listed.
+v1.0.0 ships **unsigned** (the OV code-signing certificate is deferred
+to a later release). Windows SmartScreen will warn when you run the
+installer — this is expected. Click "More info" → "Run anyway".
+Firmware signing is unaffected: the firmware image is still
+Ed25519-signed and verified by the board.
 
-RSH itself finds `vJoyInterface.dll` automatically: it looks next to
-the app first, then in the vJoy install folder
-(`C:\Program Files\vJoy\x64`). No manual copying needed.
+## First run — the Setup wizard
 
-> Memory Integrity / HVCI note: if Windows blocks the driver, the Output
-> page in RSH will say the driver is not enabled. This is a Windows
-> policy on your machine, not an RSH fault.
+The first launch opens the **Setup wizard**:
 
-## 3. Install RSH
+1. **Connect** — find your wheel (Wi-Fi or USB-serial).
+2. **Pair** — exchange the per-device key (60-second window, below).
+3. **Wi-Fi password** — the board's password for your home network.
+4. **Pins** — assign GPIO pins to steering, pedals, buttons, LED, etc.
+   (validated against the board's pin rules before anything is sent).
+5. **Calibrate** — steering lock-to-lock, pedal ranges.
+6. **Firmware** — the wizard shows the board's firmware version and
+   refuses a downgrade upload.
+7. **Finish** — you land on the Dashboard.
 
-**v2.0.4 app UNSIGNED hai** (user faisla 2026-11-13 — OV code-signing
-certificate abhi nahi khareeda gaya, baad mein aayega). Is liye:
+You can re-run Setup any time from Settings. Skipping calibration is
+possible, but steering/pedals will read uncalibrated until you do it.
 
-0. **Pehle .NET 10 Desktop Runtime install karo (v2.0.1 se REQUIRED).**
-   `RSH.exe` chalane se pehle check karo: Command Prompt / PowerShell
-   mein `dotnet --list-runtimes` chalao — output mein
-   `Microsoft.WindowsDesktop.App 10.x.x` hona chahiye. Agar nahi hai
-   (ya `dotnet` command hi nahi milti) to Microsoft se install karo:
-   <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>
-   (Run apps → **.NET Desktop Runtime 10.0.x**, Windows x64 installer),
-   ya `winget install Microsoft.DotNet.DesktopRuntime.10`. Sirf
-   ".NET Runtime" kaafi nahi (WPF app hai), aur .NET 8/9 nahi chalega —
-   10.x chahiye. v2.0.0 mein runtime zip ke andar bundled tha; v2.0.1
-   mein nahi hai — yehi is hotfix ki packaging tabdeeli hai.
-- **Portable build (recommended):** `RSH-windows-x64.zip` download karo,
-  unzip karo, `RSH.exe` chalao — is ko signing ki zaroorat nahi, install
-  bhi nahi hota. Yehi tareeqa v2.0.4 ke liye primary hai. Zip mein ab
-  RSH.exe + us ki app DLLs hain (41 files) — framework-dependent (loose).
-- **MSIX (`RSH-2.0.3.msix`):** unsigned package hai — Windows SmartScreen
-  **"Windows protected your PC" / "Unknown publisher"** warning dikhayega
-  (package par koi verified publisher nahi hai). Install karne ke liye
-  Developer Mode (sideloading) chahiye ho sakta hai; pehla install test
-  Windows PC par baaqi hai — us ke baad yahan exact steps likhe jayenge.
-- **Download ki tasdeeq:** zip/MSIX chalane se pehle SHA-256 check karo —
-  GitHub Release page par `SHA256SUMS-app.txt` se milao. Sirf official
-  GitHub release (`github.com/dreamsofts34-creator/RSH/releases`) se
-  download karo; kisi aur link se mila file mat chalao.
-- **Firmware signed hai** (Ed25519) — app ka unsigned hona firmware
-  signing se mutaliq nahi; board sirf signed firmware accept karta hai.
+## Pairing (60-second window)
 
-Your settings and profiles live in `%APPDATA%\RSH` and survive
-updating — uninstall/reinstall never loses your calibration.
+Pairing is how the app and the wheel agree on a secret key. The board
+generates one random 32-byte key per board, and discloses it **exactly
+once, inside a 60-second window** after its SoftAP (`RSH` Wi-Fi
+network) comes up.
 
-## 4. First run — the setup wizard
+1. Power the wheel (or reboot it) so the `RSH` network appears.
+2. In the app, start pairing **within those 60 seconds**.
+3. The app stores the key in **Windows Credential Manager**
+   (service `RSH`) — never in a file, never in a log.
+4. Done. The app and the wheel now authenticate every control message
+   with HMAC (protocol v2.1).
 
-The wizard opens automatically the first time:
+**If the window closes before pairing finishes**, pairing is over for
+that boot: reboot the wheel to open a fresh 60-second window and try
+again. There is no way to read the key out of the board after the
+window closes — that is by design.
 
-1. **vJoy check** — it turns green when the driver is feeding. If it stays
-   red, the message on screen says exactly why (not installed, wrong
-   version, device busy in another app, device not enabled in vJoyConf).
-2. **Connect to the wheel** — power the wheel and join this PC's WiFi to
-   the **RSH** network. The page goes green when packets arrive
-   (you should see ~200 packets/sec).
-   *While you race you are on the wheel's network, so this PC has no
-   internet on that adapter. That is expected.*
-   > **Pair immediately, at home.** Before the first pairing the `RSH`
-   > network is **open (no password)** for 60 seconds so the app can
-   > receive the wheel's per-device key and Wi-Fi password. During that
-   > window anyone in Wi-Fi range could listen in — so pair in your own
-   > room, right after flashing, and do not leave the board unpaired.
-   > As soon as pairing succeeds the network becomes WPA2 with the
-   > per-device password and the key is never sent again. If the window
-   > expires before you pair, hold BOOT on the board for ≥ 10 s
-   > (KEY_RESET) and pair again. Full detail: `docs/FLASH-GUIDE.md` step 6.
-3. **Calibrate steering** — capture the centre, then the full range.
-4. **Calibrate pedals** — capture released, then fully pressed.
+### Re-pairing after the C# → Rust switch (mandatory)
 
-You can re-run the wizard any time from **Settings → Run setup wizard**,
-and fine-tune later on the Calibration page.
+If you are moving from the C# app (v2.0.4 or earlier) to the Rust app,
+**you must re-pair your wheel**. The C# app stored its key as a DPAPI
+blob in `%AppData%\RSH`; the Rust app stores its key as a `keyring`
+entry in Windows Credential Manager. These are different stores and
+the Rust app **cannot read the C# key** — there is deliberately no
+"import the old key" path (that path would itself be a key-leak
+vector).
 
-## 5. Everyday use
+Steps:
 
-- Start RSH (or let autostart do it). It lives in the system tray;
-  closing the window hides it there. Exit fully from the tray menu.
-- The **Dashboard** shows the live wheel, pedals, link rate and whether
-  the output is being fed. The toggle there pauses output instantly.
-- **Safety watchdog:** if the wheel goes silent for 250 ms (out of range,
-  battery, crash), the output snaps to neutral — centred steering, pedals
-  off, no buttons — and recovers by itself when data returns. Your car
-  never keeps "holding" a stuck input.
-- **Profiles:** one per game. Calibration, processing and button mapping
-  all live in the profile; switching is instant, even mid-session.
-- **Updates:** Settings → About → **Check for updates**. RSH checks the
-  GitHub Releases page for a newer stable version — it never downloads or
-  installs anything by itself. Install updates only from the GitHub
-  Releases page or the Microsoft Store, never from anywhere else.
-  Firmware updates come through the setup wizard (Firmware step) or the
-  board's update page — only signed official releases are accepted.
-- **Processing defaults that work:** deadzone 2%, curve 0%, smoothing 30%.
-  Set every in-game steering deadzone to **zero** and linearity to 100% —
-  RSH does that job once, properly.
+1. **KEY_RESET on the board:** hold the **BOOT** button for **10
+   seconds or more** (hold ≥ 10 s arms key-reset; 5–10 s is safe mode,
+   not key-reset — see [FLASH-GUIDE.md](FLASH-GUIDE.md#4-boot-hold-safe-mode-key-reset-no-reflash-needed)).
+   The board generates a fresh key and a fresh Wi-Fi password.
+2. Pair again from the app within the new 60-second window (above).
+3. Your old C# key stops working the moment you move to the Rust app.
 
-### In your game
+**Profiles and settings are separate from keys.** The Rust app starts
+fresh and never auto-migrates C# data; a read-only importer for C#
+profiles exists for manual use only. Keys and Wi-Fi passwords are
+**never** carried across by any import — only re-pairing creates them.
 
-1. Make sure joy.cpl shows the vJoy axes moving (steering = X,
-   accelerator = Y, brake = Z, handbrake = Slider).
-2. Bind: steering → vJoy X, throttle → vJoy Y, brake → vJoy Z,
-   handbrake → vJoy Slider (separate axes), gear up/down → the vJoy
-   buttons you chose on the Buttons page (defaults 1 and 2).
-3. Set the in-game steering lock/range to your wheel's real physical
-   range, deadzone 0, linearity 100%.
-4. Old game that only offers one shared throttle/brake axis? Turn on
-   **Processing → Combine pedals** for that game's profile.
+## Connecting — Wi-Fi or USB
 
-## 6. Troubleshooting
+- **Wi-Fi (default):** the wheel joins your home network (or the app
+  talks to the wheel's own `RSH` SoftAP during setup). Stream traffic
+  is UDP; control traffic is HMAC-authenticated.
+- **USB-serial:** plug the wheel in with a **data** cable
+  (charge-only cables do not work). The app auto-detects the COM port
+  (COM10+ supported). Opening the port never resets the board.
+- If the wheel is unreachable, the Dashboard shows the connection
+  state and the Output page shows live axes/buttons only while a
+  session is up. A failed `GET_CAPS` inside the pairing window may be
+  retried; after the window closes, pairing is over until the next
+  reboot.
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `RSH.exe` won't start / "You must install or update .NET" | .NET 10 Desktop Runtime missing (v2.0.4 is framework-dependent) | Install .NET Desktop Runtime 10.x (x64) from <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>, then check `dotnet --list-runtimes` shows `Microsoft.WindowsDesktop.App 10.x.x` |
-| Blank window (no content, no tray icon) | v2.0.3's "classic window" was not a classic window at all — MainWindow stayed FluentWindow; v2.0.4 opens a real plain Window on Windows 10 (build < 22000), no flag needed | On Windows 10 just run v2.0.4 normally. If it is still blank, try in this order and note which step first shows content: **(a)** `RSH.exe --software-render` — forces software rendering; **(b)** `RSH.exe --fluent-window` — forces the FluentWindow chrome on Windows 10, to test whether it paints after all; **(c)** report the result (which step worked, or that none did) together with the title-bar version, `%AppData%\RSH\logs\rsh-YYYYMMDD.log` (no dashes in the date, e.g. `rsh-20261111.log` — Roaming folder, not Local) and `%TEMP%\RSH\startup-status.txt`. On Windows 11 the extra diagnostic is `RSH.exe --plain-nav` (plain sidebar instead of the styled one). |
-| Dashboard: "Wheel not connected" | PC not on RSH WiFi, wheel off, or HELO blocked | Join RSH, check wheel LED (solid = connected), check firewall allows RSH |
-| Packets arrive but stop after 2 s | Windows dropped the WiFi (power saving) | In Device Manager, disable "allow the computer to turn off this device" for the WiFi adapter |
-| Output red: "device BUSY" | Another feeder app holds the vJoy device | Close the other app (or pick a different device on the Output page) |
-| Output red: "device missing" | Device not enabled in vJoyConf | vJoyConf → enable device 1 with X/Y/Z + Slider → Apply |
-| Output red: DLL/driver version mismatch | vJoy pieces from different releases | Reinstall vJoy 2.2.2.0 completely |
-| Steering drifts/jitters at centre | Sensor noise | Raise smoothing a little, or deadzone to 3–4% |
-| Steering feels floaty | Too much smoothing | Lower smoothing toward 15–20% |
-| Car pulls to one side | Centre moved (pot shifted) | Re-capture centre on the Calibration page |
-| Pedals never reach 100% / always on | Range changed | Re-run pedal capture |
-| High packet loss % on Diagnostics | WiFi congestion/interference | Move closer; firmware v4.0.1 auto-picks the quietest channel at boot — restart the wheel |
+## The 8 screens
 
-Something else? Open **Diagnostics → Export diagnostics (.zip)** and keep
-the file — it contains the logs and the counters that explain what the
-link was doing.
-
-### Blank window — the app opens but shows nothing
-
-**Windows 10 (build < 22000): v2.0.4 fixes this automatically.** The
-blank window was the FluentWindow chrome (custom title bar) or the
-navigation-area styling failing to paint on Windows 10 — a plain WPF
-window on the same PC rendered fine (RenderTest: Render Tier 2,
-hardware acceleration working), so the GPU and driver are ruled out.
-The original v1.2.2 app used the same FluentWindow chrome and worked
-on this PC, so the chrome alone is not proven to be the cause — that
-is why v2.0.4 removes **both** suspects together on Windows 10: it
-opens a **classic window** (plain OS title bar) **with a plain
-sidebar** (literal text, system colours, default styling) by itself
-— no flag needed, no setting to change. All 8 screens stay reachable
-from the plain sidebar. On Windows 11 nothing changes: the app still
-opens the normal FluentWindow with the styled sidebar.
-
-If `RSH.exe` starts (you may see it in Task Manager) but the window is
-still completely blank and no tray icon appears, the window is most
-likely failing to *render* — the app itself is running. Try these in
-order, one at a time:
-
-1. **Software rendering:** close RSH completely, then start it from
-   a Command Prompt with
-   `RSH.exe --software-render`
-   This forces WPF to draw without the GPU. If the window appears now,
-   the GPU driver (or its render thread) is the problem — update the
-   GPU driver from the manufacturer's site and try again without the
-   flag. The log line `Software rendering requested (Render Tier: X)`
-   in `%APPDATA%\RSH\logs` confirms the flag was active.
-2. **Classic window chrome:** close RSH, then start it with
-   `RSH.exe --classic-window`
-   This keeps the same app but uses a plain Windows title bar instead
-   of the custom FluentWindow chrome. On Windows 10 this is already
-   the default in v2.0.4 — the flag forces it on Windows 11 too, to
-   test whether the FluentWindow chrome is what fails there.
-3. **Plain sidebar:** close RSH, then start it with
-   `RSH.exe --plain-nav`
-   This keeps the FluentWindow chrome but replaces the styled sidebar
-   with a plain one (literal text, system colours, default styling —
-   like the original v1.2.2 sidebar). On Windows 10 this is already
-   the default in v2.0.4 — the flag forces it on Windows 11 too, to
-   test whether the sidebar styling is what fails there.
-4. **FluentWindow escape hatch:** close RSH, then start it with
-   `RSH.exe --fluent-window`
-   This forces the FluentWindow chrome even on Windows 10 — use it
-   only to test whether FluentWindow paints after all (for example
-   after a Windows update). If both `--classic-window` and
-   `--fluent-window` are given, classic wins. `--fluent-window` also
-   turns the plain sidebar off (full modern UI).
-5. **All together:** `RSH.exe --software-render --classic-window --plain-nav`
-   narrows it further — if even this stays blank, the problem is below
-   WPF itself (GPU/OS level).
-6. **Disable hardware acceleration for all WPF apps** (manual test):
-   in Registry Editor create DWORD
-   `HKEY_CURRENT_USER\SOFTWARE\Microsoft\Avalon.Graphics\DisableHWAcceleration`
-   = `1`, restart RSH, and remove the value afterwards if it made no
-   difference.
-7. **Render test:** the release ships a tiny separate tool,
-   `RSH.RenderTest.exe` — a plain window with one button and no
-   WPF-UI at all (it also accepts `--software-render`). If *that*
-   window renders but RSH stays blank, the WPF-UI window chrome is
-   the culprit; if it is blank too, the problem is the GPU/OS, not RSH.
-
-No flag changes any setting — they only affect that one launch.
-If a flag fixes it, tell us which one (Diagnostics → Export
-diagnostics) so the fix can be made permanent.
-
-> **Stale-process note:** agar update ke baad bhi purani blank window
-> dikhe to Task Manager mein check karo ke koi purani `RSH.exe` to nahi
-> chal rahi — v2.0.2 ka version-aware single instance purane-version
-> process ko khud terminate karke start hota hai, is liye aam tor par ye
-> karne ki zaroorat nahi parni chahiye.
-
-## 7. Performance (by design)
-
-RSH is built to disappear on low-end PCs:
-
-- The 200 Hz pipeline allocates **zero bytes per tick** on its hot path
-  (measured: ~0.45 µs of work per tick).
-- Idle: ~1 keepalive packet per second, UI asleep, engine waiting.
-- The interface redraws at 30 Hz and only for the page you are looking
-  at; graphs pause when you leave the page or minimise.
-- Budgets it is held to: ≤1% CPU idle, ≤3% while racing, ≤120–150 MB
-  working set. The bundled `RSH.Benchmarks` tool prints the real
-  numbers on your machine.
-
-## 8. Files and folders
-
-| What | Where |
+| Screen | What you do there |
 |---|---|
-| App | `%LOCALAPPDATA%\Programs\RSH` |
-| Settings | `%APPDATA%\RSH\settings.json` |
-| Profiles | `%APPDATA%\RSH\profiles.json` (a `.bak` is kept automatically) |
-| Logs | `%APPDATA%\RSH\logs` (daily, 7 days kept) |
+| **Dashboard** | Connection + device status, live input overview, game launcher |
+| **Setup** | The first-run wizard (connect → pair → pins → calibrate → firmware) |
+| **Tuning** | Per-module live tuning (steering, pedals, …) — see below |
+| **Buttons** | Button / encoder mapping |
+| **Output** | Output backend choice (HIDMaestro / vJoy), live axes/buttons, device state |
+| **Profiles** | Game + car profiles, backup / restore |
+| **Monitor** | Engine, transport and stream health (rate, loss, jitter) |
+| **Settings** | Modules on/off, pins, system (firewall, autostart, tray, updates), diagnostics export, language (English / Urdu / Hindi), light / dark theme |
 
-Settings and profiles are saved atomically with a backup — a crash or
-power cut mid-save cannot corrupt them; on any read failure RSH
-falls back to the backup, then to sane defaults. It never crashes because
-of a broken config file.
+## Per-module tuning
+
+Every input module has its own tuning card on the **Tuning** screen:
+Steering, Accelerator, Brake, Clutch, Handbrake, Shifter, Horn,
+Buttons, Encoders, LED.
+
+- **Tuning shows a live On / Off / Unknown badge** per module. Tuning
+  does **not** have an enable toggle — module on/off lives **only in
+  Settings** (single source of truth), so a module you turn off in
+  Settings is off everywhere.
+- Tuning values (deadzone, sensitivity, ranges, …) apply live to the
+  200 Hz engine pipeline. Changes are stored in the active profile.
+- If a module is off, its tuning card shows it as off — it is not a
+  bug and not a missing feature.
+
+## Profiles
+
+- **Profile v2** — one profile per game, with optional per-car
+  overrides. When Assetto Corsa / ACC / iRacing is running, the app
+  reads the game's telemetry (read-only shared memory) and switches
+  automatically: game profile → car profile once the car is stable
+  (4 polls / 2 s), back to the pre-game profile when the game closes.
+  Manual override always wins; a failed switch leaves the current
+  profile unchanged.
+- **Backup / restore** — 3-generation backup
+  (`current → .bak1 → .bak2`). If the profile store is corrupt at
+  startup, the app fails closed (exits) and the backups survive —
+  restore from Settings.
+- Profiles live in `%AppData%\RSH`. Uninstalling the app does **not**
+  delete them (they live outside the install directory).
+
+## Game launcher
+
+From the **Dashboard** you can launch a detected game (Steam library
+scan + iRacing default path) and stop it again. Rules:
+
+- **One game at a time.** Launching a second game is refused while
+  one is tracked.
+- **Stop kills only the tracked process** (the game exe you launched),
+  never anything else.
+- Detected games: Assetto Corsa, Assetto Corsa Competizione, iRacing,
+  DiRT Rally 2.0. Other games are not in the launcher catalogue yet —
+  see [GAME-MATRIX.md](GAME-MATRIX.md).
+- **No game is verified to work with RSH in-game yet** (0 of 16
+  backend–game pairs verified). The launcher launching a game does not
+  mean the wheel is confirmed working in that game — that needs the
+  in-game verification procedure in the game matrix.
+
+## Output backend — HIDMaestro or vJoy
+
+The Output page lets you choose how the wheel appears to games as a
+DirectInput device. **Each backend presents a different device to the
+game** — a game that has seen the vJoy wheel sees the HIDMaestro wheel
+as a brand-new device, and its bindings must be made again from
+scratch.
+
+| Backend | Default? | Notes |
+|---|---|---|
+| **HIDMaestro** | **Yes (default)** | User-mode UMDF2 driver, installed by an elevated sidecar (`rsh-hm-sidecar.exe`, ships inside the installer). **Windows asks (UAC) on every launch while this backend is active** — that is expected, not an error. Driver install happens on first run (admin). |
+| **vJoy** | Fallback | Rust FFI, **no UAC prompt** at runtime. **vJoy is not bundled** — install it yourself (one-time admin install) if you want this backend. If vJoy is missing, the Output page shows "vJoy not found — [Install vJoy] [Open Diagnostics]" instead of crashing or faking output. |
+
+- If **neither** backend is available, output is disabled, the
+  Dashboard warns, and the app keeps running.
+- **No force feedback.** The wheel has no FFB motor, so no game's FFB
+  features work on RSH — "FFB does not work" is the expected result
+  for every game, never a failure.
+- **XInput-only titles will not see an RSH wheel** on either backend
+  (they only read Xbox-style controllers). That is a "not detected —
+  XInput-only" result, not a bug.
+- Handbrake is mapped to the Slider axis on either backend (analog).
+
+## Updating
+
+v1.0.0 is **check-only**: Settings can check for a new version
+against the release `latest.json`, but the app cannot download or
+install an update by itself. When an update ships, download the new
+installer from GitHub Releases and install it over the old one —
+profiles and settings survive (same `%AppData%\RSH`, same upgrade
+code, single "Apps & features" entry). Firmware is never changed by
+an app update, and the board rejects firmware downgrades.
+
+## Troubleshooting
+
+### The window is blank / a page shows no text
+
+This is the lesson of the old C# app, and the Rust app is built
+against it: **every screen renders literal text with a CSS fallback**,
+so a missing theme or a failed binding can no longer produce a blank
+window. If you still see a blank window or an empty page:
+
+1. Check the app is actually the latest release (`RSH — Real Sim Hub
+   v1.0.0` in the title bar). An older or mixed install can paint
+   oddly — uninstall, then install the release installer cleanly.
+2. Look at the log: `%AppData%\RSH\logs\rsh-YYYYMMDD.log` (today's
+   date, no dashes). If that folder is empty or unwritable, the app
+   falls back to `%TEMP%\RSH\logs`.
+3. Export diagnostics from **Settings → Diagnostics** (redacted bundle:
+   app version, OS, last 200 log lines — no settings, no keys, no
+   passwords) and keep it for a bug report.
+4. If a single page fails to load (e.g. "Dashboard could not be
+   loaded"), the other pages still work — the failure is logged, not
+   silent. Restart the app once; if the same page fails twice, export
+   diagnostics and report it with the log lines.
+
+### Wheel not found / will not connect
+
+1. USB: use a **data** cable, try a rear USB port, check the COM port
+   appears in Device Manager (CP210x / CH340 driver installed).
+2. Wi-Fi: is the wheel on the same network? During setup, is the
+   `RSH` network visible? If the wheel never appears, reboot it and
+   check the `RSH` network shows up.
+3. Firewall: on first run Windows asks to allow RSH through the
+   firewall — allow it. Settings shows the firewall rule state
+   (rule name `RSH`, inbound, program-scoped). If you declined it,
+   allow RSH manually in Windows Firewall.
+4. Pairing window: if you missed the 60 seconds, reboot the wheel for
+   a fresh window.
+
+### "vJoy not found"
+
+Install vJoy yourself (one-time admin install), then restart the app
+and select vJoy on the Output page. HIDMaestro remains the default
+and needs no vJoy.
+
+### HIDMaestro UAC prompt every launch
+
+Expected while HIDMaestro is the active backend — the sidecar must run
+elevated for the whole session (the input shared section is read-only
+to non-elevated processes). To stop the prompts, switch the Output
+backend to vJoy.
+
+### Factory reset (config gone wrong)
+
+Try **FACTORY_RESET** from the app first (keeps your key + Wi-Fi
+password). If the board misbehaves badly, hold **BOOT 5–10 s** for
+safe mode (factory pin map + AP, no config applied), then send a good
+config from the app. A bad config can never brick the board: on boot,
+an unconfirmed config rolls back (Last-Known-Good, then factory
+fallback). Full reflash is the last resort — see
+[FLASH-GUIDE.md](FLASH-GUIDE.md).
+
+### Where things live
+
+| Thing | Location |
+|---|---|
+| App data (profiles, settings) | `%AppData%\RSH` |
+| Logs | `%AppData%\RSH\logs\rsh-YYYYMMDD.log` (fallback `%TEMP%\RSH\logs`) |
+| Secrets (device key) | Windows Credential Manager, service `RSH` — never in a file |
+| Install | Current-user profile (NSIS) / WiX default (MSI) |
+| Startup status | `%TEMP%\RSH\startup-status.txt` |
+
+## Uninstall
+
+Uninstall from "Apps & features" — the app and shortcut are removed.
+Your profiles, settings and logs in `%AppData%\RSH` **survive** the
+uninstall, so a reinstall finds them again. To wipe everything,
+delete `%AppData%\RSH` yourself after uninstalling (this does **not**
+delete the key from Credential Manager — remove the `RSH` entry there
+too if you want the pairing gone; the board still holds its key until
+you KEY_RESET it).

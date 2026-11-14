@@ -1,17 +1,23 @@
-# RSH — build outputs aur local files (commit mat karo)
-bin/
-obj/
+# Rust build outputs. Cargo.lock is intentionally NOT ignored — it is committed.
+target/
+**/target/
+
+# Node / frontend build outputs.
+node_modules/
+*.tsbuildinfo
+# Vite build output — except the committed static shell placeholder
+# (frontend/dist/index.html), which the Tauri shell serves until Phase E.
+frontend/dist/*
+!frontend/dist/index.html
+
+# Firmware / embedded build outputs.
 .pio/
-TestResults/
-.vs/
-__pycache__/
-*.user
-tests-host/run_tests
-# Signing / Secure Boot keys — kabhi commit mat karo (SEC-C-06, OPEN-19).
-# Release keys repo ke BAHAR hain: ~/workspace/projects/rsh/signing-keys/
+
+# Secrets — never commit.
 *.pem
 signing-keys/
-secure-boot-key.pem
+.env
 
-# Local publish output (dotnet publish -o publish/) — verify ke baad delete karo.
-publish/
+# OS / editor leftovers.
+.DS_Store
+Thumbs.db

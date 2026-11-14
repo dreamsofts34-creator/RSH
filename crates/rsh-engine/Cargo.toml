@@ -1,0 +1,16 @@
+[package]
+name = "rsh-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rsh-protocol = { path = "../rsh-protocol" }
+serde.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,102 @@
+//! `rsh-output`: the `IJoystickOutput` trait and the output backends.
+//!
+//! The engine only ever talks to the trait, never to a concrete backend,
+//! so it can be tested with a mock backend and no driver installed.
+//!
+//! Backends: `HIDMaestro` (default, interop path decided by the Phase G
+//! spike — G2) and vJoy (fallback, hand-written FFI — G3, see
+//! [`vjoy`]; the DLL is never bundled).
+//!
+//! The backend selector lives in [`selector`] (G4): [`BackendKind`]
+//! (default `HIDMaestro`, fallback vJoy, `None`) +
+//! [`switch_backend`] (runtime switch without restart, failed connect
+//! rolls back to the previous backend, `HIDMaestro` failure falls back
+//! to vJoy). The shared error type is [`OutputError`] (see
+//! [`error`] for why the trait itself still returns [`VJoyError`]).
+
+pub mod error;
+pub mod selector;
+pub mod vjoy;
+
+use rsh_engine::pipeline::{OutputState, PipelinePlan};
+
+pub use error::OutputError;
+pub use selector::{BackendFactories, BackendKind, SwitchOutcome, switch_backend};
+pub use vjoy::{VJoyError, VJoyOutput, VJoyStateKind, VJoyStatus};
+
+/// The processed state the engine hands to an output backend.
+///
+/// The plans call this type `ProcessedState`; the engine type is
+/// [`OutputState`] (`rsh_engine::pipeline`). They are the same type —
+/// this alias exists so backend code can use the plan's name.
+pub type ProcessedState = OutputState;
+
+/// Joystick output: the one door every backend goes through.
+///
+/// The engine calls [`update`](IJoystickOutput::update) at 200 Hz and
+/// [`send_neutral`](IJoystickOutput::send_neutral) when the watchdog
+/// goes stale or the engine stops. An update error never kills the
+/// loop: the engine counts it, falls back to neutral, and keeps
+/// ticking (same contract as the engine's `OutputSink`).
+pub trait IJoystickOutput: Send {
+    /// Backend name for logs and the Output page (`"vJoy"`,
+    /// `"HIDMaestro"`).
+    fn name(&self) -> &'static str;
+
+    /// True after a successful [`try_connect`](IJoystickOutput::try_connect)
+    /// until [`disconnect`](IJoystickOutput::disconnect).
+    fn is_connected(&self) -> bool;
+
+    /// Acquire the device. On failure the returned error carries the
+    /// human-readable reason (the C# `out string error`); the app
+    /// never crashes on a missing driver — output is simply disabled
+    /// and the Dashboard shows the warning state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VJoyError`] (or the backend's equivalent) when the
+    /// driver is missing, disabled, version-mismatched, busy, or the
+    /// device cannot be acquired.
+    fn try_connect(&mut self) -> Result<(), VJoyError>;
+
+    /// Connect with the enabled modules validated against the device's
+    /// capabilities (D11): a steering-only wheel is valid, a disabled
+    /// module imposes no requirement. On validation failure the device
+    /// is relinquished and the error names the missing capability.
+    /// The default implementation ignores the plan and calls
+    /// [`try_connect`](IJoystickOutput::try_connect) (test fakes and
+    /// backends without capability data).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`try_connect`](IJoystickOutput::try_connect), plus a
+    /// capabilities error when the device cannot serve the plan.
+    fn try_connect_with_plan(&mut self, plan: &PipelinePlan) -> Result<(), VJoyError> {
+        let _ = plan;
+        self.try_connect()
+    }
+
+    /// Best-effort neutral send, then release the device. Never
+    /// panics; calling it while disconnected is a no-op.
+    fn disconnect(&mut self);
+
+    /// Send one processed tick (200 Hz).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when not connected or when the driver refuses
+    /// the update. The caller (engine) treats this as "send neutral
+    /// and keep ticking", never as fatal.
+    fn update(&mut self, state: &ProcessedState) -> Result<(), VJoyError>;
+
+    /// Send the safe neutral state (watchdog / shutdown). A no-op
+    /// while disconnected; best-effort while connected (a failed
+    /// neutral send is swallowed, never fatal).
+    ///
+    /// # Errors
+    ///
+    /// Backends report errors here only for programming mistakes
+    /// (e.g. misuse after a failed connect); driver failures during
+    /// the neutral send itself are swallowed by design.
+    fn send_neutral(&mut self) -> Result<(), VJoyError>;
+}

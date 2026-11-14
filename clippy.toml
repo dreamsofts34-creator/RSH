@@ -1,0 +1,3 @@
+# Clippy configuration. MSRV floor 1.90: the single-instance plugin needs
+# Rust >= 1.90 (see RSH-RUST-SOFTWARE-PLAN.md SW-R1.1).
+msrv = "1.90"

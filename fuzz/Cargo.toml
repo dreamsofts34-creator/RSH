@@ -1,0 +1,32 @@
+[package]
+name = "rsh-protocol-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rsh-protocol = { path = "../crates/rsh-protocol" }
+
+# cargo-fuzz needs a nightly toolchain (`cargo +nightly fuzz ...`).
+# This crate is not a workspace member: it is only built by cargo-fuzz.
+[workspace]
+
+[[bin]]
+name = "parse_stream"
+path = "fuzz_targets/parse_stream.rs"
+
+[[bin]]
+name = "parse_control"
+path = "fuzz_targets/parse_control.rs"
+
+[[bin]]
+name = "pin_validator"
+path = "fuzz_targets/pin_validator.rs"
+
+[[bin]]
+name = "config_blob_validator"
+path = "fuzz_targets/config_blob_validator.rs"

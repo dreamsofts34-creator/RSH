@@ -1,0 +1,44 @@
+# cargo-audit configuration — RSH Rust v1.0.0
+#
+# LOCATION NOTE (verified 2026-11-14): cargo-audit 0.23.0 reads ONLY
+# `.cargo/audit.toml` — a project-root `audit.toml` is silently IGNORED
+# (proven: same ignores at repo root left 5 denied warnings; here they
+# pass). Keep this file here; do NOT move it to the repo root.
+#
+# Gate: `cargo audit --deny warnings` (CI job `audit`, TESTING-INPUT §9.1).
+# Ignores below are DOCUMENTED, not hidden: each entry names the advisory,
+# why it is ignored, and a review date. Re-check on the review date whether
+# a Tauri / dependency bump has removed the warning; if yes, drop the entry.
+# No ignore here covers a vulnerability in RSH's own code — all five are
+# transitive dependencies of Tauri 2.12.5's Linux/GTK stack (tao → gtk →
+# zbus/zvariant/glib). None is a direct dependency of any rsh-* crate.
+# Plain `cargo audit` (no --deny) already exits 0; these ignores exist only
+# so the stricter --deny warnings gate is green and stays honest.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2024-0370 — proc-macro-error 1.0.4, unmaintained.
+    # Transitive via Tauri's Linux stack. No fixed upgrade exists.
+    # Review: 2027-02-14 (check whether Tauri bumped past proc-macro-error).
+    "RUSTSEC-2024-0370",
+    # RUSTSEC-2026-0371 — zbus_names 4.3.5, unmaintained.
+    # Transitive via zbus (Tauri Linux/DBus). No fixed upgrade exists.
+    # Review: 2027-02-14.
+    "RUSTSEC-2026-0371",
+    # RUSTSEC-2026-0370 — zvariant 5.15.1, unmaintained.
+    # Transitive via zbus (Tauri Linux/DBus). No fixed upgrade exists.
+    # Review: 2027-02-14.
+    "RUSTSEC-2026-0370",
+    # RUSTSEC-2026-0372 — zvariant_derive 5.15.1, unmaintained.
+    # Transitive via zvariant (Tauri Linux/DBus). No fixed upgrade exists.
+    # Review: 2027-02-14.
+    "RUSTSEC-2026-0372",
+    # RUSTSEC-2024-0429 — glib 0.18.5, unsound (VariantStrIter).
+    # Transitive via gtk (Tauri Linux). Fixed in glib >= 0.20.0, but that
+    # version is not in Tauri 2.12.5's dependency tree — upgrading it alone
+    # would break the tree. The unsound API (VariantStrIter) is not used by
+    # RSH code (our crates never touch glib directly). Re-check when Tauri
+    # bumps its gtk/glib versions.
+    # Review: 2027-02-14.
+    "RUSTSEC-2024-0429",
+]

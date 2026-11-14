@@ -1,0 +1,29 @@
+[package]
+name = "rsh-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tauri-plugin-single-instance.workspace = true
+tauri-plugin-autostart.workspace = true
+tauri-plugin-updater.workspace = true
+rsh-app-core = { path = "../crates/rsh-app-core" }
+
+# Windows-only: the `windows` crate does not compile on Linux
+# (DECISIONS.md §4), so it is gated to Windows targets only.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_System_Com",
+] }
+
+[lints]
+workspace = true

@@ -1,0 +1,6561 @@
+//! App state (Phase G0 — the Phase G entry item, SW-R6.1).
+//!
+//! [`AppStateCore`] is the testable half of the Tauri app state: it owns
+//! the engine metrics + [`LoopRateTracker`](crate::snapshot::LoopRateTracker)
+//! + [`EncoderState`](crate::snapshot::EncoderState), the installed output
+//! backend (a boxed [`IJoystickOutput`](rsh_output::IJoystickOutput)), the
+//! game launcher, and the profile store. The Tauri shell
+//! (`src-tauri/src/app_state.rs`) wraps this in the Tauri-managed
+//! `AppState`, registers it with `.manage()`, and owns the snapshot
+//! emitter thread; all logic and tests live here, because this crate
+//! compiles in the Linux sandbox and `src-tauri` does not.
+//!
+//! # The installed backend
+//!
+//! The slot holds G3's [`IJoystickOutput`](rsh_output::IJoystickOutput)
+//! trait object (`try_connect` / `try_connect_with_plan` / `disconnect` /
+//! `update` / `send_neutral`, all `Result`-based;
+//! `ProcessedState = rsh_engine::pipeline::OutputState`). The G4
+//! selector swaps the backend in this slot at runtime — `HIDMaestro`
+//! (default, G2), vJoy (fallback, G3), or the [`NullSink`](crate::system::NullSink)
+//! (no device) — via `AppStateCore::set_output_backend`. At launch the
+//! shell calls [`AppStateCore::activate_startup_backend`], which
+//! activates the persisted `AppSettings.output_backend` choice through
+//! the same selector (default `HIDMaestro`); the [`NullSink`] is only
+//! the fallback base when activation fails, and the failure reason is
+//! recorded in the backend detail and in the startup outcome — never
+//! silently. Until activation runs the installed backend is the
+//! [`NullSink`](crate::system::NullSink) — the no-device sink — speaking the trait via the
+//! [`IJoystickOutput` implementation below](NullSink): `try_connect`
+//! fails honestly (no driver to acquire), `update` fails as not
+//! connected, and `send_neutral` is the trait's disconnected no-op, so
+//! every send is attempted and honestly reported as not delivered
+//! (D-F3) — never claimed as sent. "Sent" is only ever reported when
+//! the backend was connected (`is_connected`) and the call succeeded:
+//! `send_neutral` returning `Ok` while disconnected means "nothing to
+//! send", not "neutral delivered".
+//!
+//! # The engine task (Phase G gate wiring)
+//!
+//! [`AppStateCore::start_engine`] spawns the engine supervisor thread,
+//! which runs one [`WheelEngine`](rsh_engine::engine::WheelEngine) task
+//! (200 Hz, 250 ms watchdog → NEUTRAL) on a current-thread tokio
+//! runtime. The engine's source is a fixed channel-backed
+//! [`PacketSource`](rsh_engine::engine::PacketSource): transports feed
+//! frames into the channel, so the engine task itself never restarts
+//! when a transport connects, drops, or reconnects. With no transport
+//! connected the engine still exists and ticks in a clean idle state
+//! (no frames, watchdog stale → neutral, nothing faked). The engine's
+//! output sink is the state itself: every tick feeds
+//! [`AppStateCore::ingest_frame`] (snapshot + loop-rate) and the
+//! installed backend's `update`.
+//!
+//! Honest gaps in this wiring (not stubs — the behaviour is what it
+//! says, the missing pieces are named):
+//! - **Live engine metrics are measured per tick.** The engine hands
+//!   its live [`EngineMetrics`](rsh_engine::metrics::EngineMetrics) to
+//!   the sink on every tick ([`OutputSink::send_with_metrics`](rsh_engine::engine::OutputSink::send_with_metrics),
+//!   H1 condition 11), so the sink feeds [`ingest_frame`](AppStateCore::ingest_frame)
+//!   with real metrics: jitter / output-latency / E2E p99s are `Some`
+//!   once measured (still `null` while unmeasured — never a fake 0)
+//!   and `seqGap` / `txFail` come from the status pump below. The loop
+//!   rate is measured too (one tick per sink send, ~200 Hz).
+//! - **Status packets are forwarded.** The forwarder drains the
+//!   transport's status channel after every stream frame and pumps
+//!   the packets into the engine's `status_sender` (H1 condition 12),
+//!   so `btnsEx` and the board loss counters reach the engine. While
+//!   no stream frame arrives the pump waits with it (status only
+//!   moves while frames flow); the engine still drains its own
+//!   status channel on every tick.
+//! - **The HMAC session gate is enforced (SEC-E-14, H1 condition 13).**
+//!   Stream frames are HELD at the forwarder until the session gate
+//!   is open: the gate opens only when a `BoardSession` has completed
+//!   its HMAC-verified `GET_CAPS` (pairing or resume) and the session
+//!   owner calls [`AppStateCore::open_session_gate`]. The gate closes
+//!   again on transport loss or disconnect — a new transport is a new
+//!   session and must re-authenticate. The session owner is the
+//!   **activator (H5)**: [`activate_session_on`] runs inside the
+//!   forwarder, on the forwarder's own transport, before the frame
+//!   loop — it sends a flag-1 HELO for a fresh nonce (D30), runs
+//!   `BoardSession::pair` / `resume` (signed `GET_CAPS` first), opens
+//!   the gate on success, and hands the transport back via
+//!   [`BoardSession::take_transport`](rsh_transport::session::BoardSession::take_transport)
+//!   so the same transport streams frames. A failed activation leaves
+//!   the gate exactly as it was (closed in production) and records
+//!   the reason — never silently opened. The board enforces the same
+//!   rule (`sessionAuthenticated` in firmware v4.0.1 `net.cpp`), so
+//!   this is defence in depth against a rogue board streaming
+//!   without auth.
+//! - **The pipeline runs the default plan.** Per-module tunings from
+//!   the active profile are not yet pushed into the pipeline; the
+//!   engine runs [`PipelinePlan::default`](rsh_engine::pipeline::PipelinePlan::default)
+//!   (clutch disabled, everything else enabled). Pushing tunings
+//!   needs an engine plan-update channel (H1 condition 14, deferred
+//!   to v1.0.1 with reason in `docs/SECURITY-RESCAN-H1.md`).
+//!
+//! # What is NOT here (honest gaps, not stubs)
+//!
+//! - **Live control commands run under a fresh session (H5-control).**
+//!   [`run_control_session`] opens a fresh session the same way the
+//!   activator does (flag-1 HELO → fresh nonce → signed `GET_CAPS`
+//!   first, fail-closed), runs one control operation, then closes
+//!   the session and zeroizes the key. The 11 remaining commands
+//!   (`set_password`, config staging, pin-map get/set, firmware
+//!   upload, `restart_wheel`) are thin sync wrappers over it — logic
+//!   lives in the crates, never in `src-tauri`.
+//!
+//! # Honest gaps that remain (not stubs — the behaviour is what it
+//! # says, the missing pieces are named)
+//!
+//! - **Serial control while streaming needs disconnect-first.** A
+//!   control command over serial refuses while the live transport
+//!   holds the port (a second open fails on Windows and would split
+//!   reads between two readers on Linux) — the user disconnects the
+//!   transport first, then retries. UDP control works alongside the
+//!   live forwarder (ephemeral local port; the stream is fixed to
+//!   port 4211 and unauthenticated, so the fresh session cannot
+//!   disturb it).
+//! - **Arbitrary button→action rebinding is not a board feature.**
+//!   The board stores only the three fixed `BUTTON` slot roles
+//!   (1 shifter-up, 2 shifter-down, 3 horn); `stage_config` rejects a
+//!   cross-role rebind loudly instead of pretending to stage it. A
+//!   PC-side binding store + output remap (or a firmware extension)
+//!   needs a design decision outside H5-control.
+//! - **No re-activation retry after a reboot.** `restart_wheel`
+//!   reboots the board and closes the gate; the user reconnects once
+//!   the board is back (the forwarder has no re-activation retry —
+//!   a pre-existing H5-activator limitation).
+//! - **Pin map get/set** reads/writes the board's config blob (there
+//!   is no local pin-map store), so both need a live board session;
+//!   with no board they fail honestly instead of returning a guess.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
+use std::net::IpAddr;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver as StdReceiver, Sender as StdSender};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use rsh_engine::engine::{
+    EngineReport, OutputSink, PacketSource, SinkError, StopHandle, WheelEngine,
+};
+use rsh_engine::metrics::EngineMetrics;
+use rsh_engine::pipeline::OutputState as PipelineOutputState;
+use rsh_engine::pipeline::{PipelinePlan, ProcessingPipeline};
+use rsh_output::selector::{BackendFactories, BackendKind, SwitchOutcome, switch_backend};
+use rsh_output::vjoy::{VJOY_DOWNLOAD_URL, VJoyOutput, resolve_dll_path};
+use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
+use rsh_output_hidmaestro::HidMaestroOutput;
+use rsh_output_hidmaestro::backend::UAC_NOTE;
+use rsh_output_hidmaestro::manager::resolve_sidecar_path;
+use rsh_profiles::csharp_import::{PedalCalibration, PerModuleTuning, SteeringCalibration};
+use rsh_profiles::store::{BackupGeneration, BackupInfo, ProfileStore, game_slug};
+use rsh_protocol::config::ConfigBlob;
+use rsh_protocol::hello::PAIRING_WINDOW_SECS;
+use rsh_protocol::stream::MAX_ENCODERS;
+use rsh_protocol::stream::StatusPacket;
+use rsh_protocol::stream::StreamFrame;
+use rsh_protocol::{GetCapsReply, HelloReply};
+use rsh_security::firmware_verify::verify_firmware_image;
+use rsh_security::keystore::{KeyStore, KeystoreError};
+use rsh_transport::ControlTransport;
+use rsh_transport::config::{ConfigState, ConfigTransaction, ConfigTxnSnapshot};
+use rsh_transport::serial::{SerialConfig, SerialTransport, detect_board_port};
+use rsh_transport::session::{BoardSession, KeyStoreLike, SessionError};
+use rsh_transport::udp::{UdpConfig, UdpTransport};
+use serde::{Deserialize, Serialize};
+
+use crate::commands::{
+    BackendStatus, OutputState as CommandOutputState, PinAssignment, PinMapValidation, ShifterGate,
+    TuningSettings, config_blob_to_json, config_json_to_blob,
+    get_snapshot as build_snapshot_command, merge_pin_map_into_blob, records_to_pin_assignments,
+    validate_pin_map, validate_tuning,
+};
+use crate::launcher::{
+    GameLauncher, SystemSpawner, default_steam_roots, detect_all_games, detect_game, game_by_id,
+};
+use crate::snapshot::{
+    ConnectionState, EncoderState, EngineSnapshot, EngineStats, LoopRateTracker, PedalSnapshot,
+    SnapshotInput, build_engine_stats,
+};
+use crate::system::{NullSink, ShutdownOutcome};
+use crate::webota::upload_firmware_image;
+
+/// App settings, re-exported for the Tauri shell (`src-tauri` does not
+/// depend on `rsh-profiles` directly).
+pub use rsh_profiles::csharp_import::AppSettings;
+/// Profile list-row summaries, re-exported for the Tauri shell.
+pub use rsh_profiles::store::ProfileSummary;
+
+/// Locks a mutex, recovering the guard if a previous holder panicked
+/// while holding it. The critical sections in this module are short
+/// and contain no panicking code (except a backend's `send`, which is
+/// foreign code), so poisoning means "a backend panicked mid-send":
+/// the state survives that instead of turning one backend panic into
+/// a panic in every later command.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The existing [`NullSink`](crate::system::NullSink) as an
+/// [`IJoystickOutput`]: the no-device backend installed until a G2/G3
+/// backend replaces this slot.
+///
+/// `NullSink` itself is the engine's [`OutputSink`](rsh_engine::engine::OutputSink)
+/// (defined in `crate::system`, local to this crate, so this impl is
+/// legal here); this impl is its voice on the output trait. It never
+/// claims a device: `try_connect` fails with the honest reason (no
+/// backend installed), `update` fails as not connected, and
+/// `send_neutral` is the trait's disconnected no-op (`Ok`, meaning
+/// "nothing to send" — callers must check `is_connected` before
+/// reporting a neutral send as delivered; see
+/// [`AppStateCore::shutdown`]).
+impl IJoystickOutput for NullSink {
+    fn name(&self) -> &'static str {
+        "NullSink"
+    }
+
+    fn is_connected(&self) -> bool {
+        false
+    }
+
+    fn try_connect(&mut self) -> Result<(), VJoyError> {
+        Err(VJoyError::DriverNotFound(
+            "no output backend installed yet — sends are attempted and reported as not delivered (Phase G2/G3 install the real backend)".to_string(),
+        ))
+    }
+
+    fn disconnect(&mut self) {}
+
+    fn update(&mut self, _state: &ProcessedState) -> Result<(), VJoyError> {
+        Err(VJoyError::NotConnected)
+    }
+
+    fn send_neutral(&mut self) -> Result<(), VJoyError> {
+        Ok(())
+    }
+}
+
+/// Event name for the 30 Hz engine snapshot feed (UI plan §6.1).
+pub const SNAPSHOT_EVENT: &str = "rsh://snapshot";
+
+/// Event name for button-press highlight events (target < 50 ms).
+pub const BUTTON_PRESS_EVENT: &str = "rsh://button-press";
+
+/// Snapshot emission interval: 30 Hz ≈ 33 ms between emissions.
+pub const SNAPSHOT_EMIT_INTERVAL: Duration = Duration::from_millis(SNAPSHOT_EMIT_INTERVAL_MS);
+
+/// Snapshot emission interval in milliseconds (30 Hz).
+pub const SNAPSHOT_EMIT_INTERVAL_MS: u64 = 33;
+
+/// One button-press event, as the frontend's `subscribeButtonPress`
+/// handler consumes it (`{ button, pressed }`).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ButtonPressEvent {
+    /// Button number: 1–32 physical, 33–64 extended, 65–72 encoder virtual.
+    pub button: u8,
+    /// True on press, false on release. Encoder virtual buttons are
+    /// momentary pulses: only the `pressed: true` edge is emitted.
+    pub pressed: bool,
+}
+
+/// One catalogue game, as the frontend's `GameInfo` shape consumes it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GameInfo {
+    /// Game id (one of the `GAME_*` constants, e.g. `"assetto_corsa"`).
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Id of the profile bound to this game, if any.
+    pub bound_profile_id: Option<String>,
+    /// True when this game is the currently tracked running game.
+    pub running: bool,
+    /// True when the game exe was found on disk.
+    pub installed: bool,
+}
+
+/// Calibration, as the frontend's `Calibration` shape consumes it.
+///
+/// Steering carries only its centre here (the frontend shape has no
+/// steering min/max); pedal entries carry min/max per pedal
+/// (`"accel"`, `"brake"`, `"clutch"` keys). Values are millivolts.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Calibration {
+    /// Steering centre in mV.
+    pub steering_center_mv: f64,
+    /// Pedal minimums in mV, keyed by pedal (`"accel"`, `"brake"`, `"clutch"`).
+    pub pedal_min_mv: BTreeMap<String, f64>,
+    /// Pedal maximums in mV, keyed by pedal.
+    pub pedal_max_mv: BTreeMap<String, f64>,
+}
+
+/// One emission from the snapshot emitter loop: either the latest
+/// snapshot (30 Hz) or a queued button-press event. The snapshot is
+/// boxed: the payload is ~216 bytes and the button event is 2, and an
+/// unboxed enum would pay the large variant's size on every event.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SnapshotEmit {
+    /// The latest snapshot, sampled at 30 Hz.
+    Snapshot(Box<EngineSnapshot>),
+    /// A button-press edge from the engine pipeline.
+    ButtonPress(ButtonPressEvent),
+}
+
+/// Inputs for one engine tick, as [`AppStateCore::ingest_frame`] consumes
+/// them. The caller is the engine task (or a test driving it): steering
+/// and pedals are the pipeline's processed values, encoder counts are
+/// the board's cumulative `i16` counts, `output` is the pipeline's
+/// [`PipelineOutputState`] for this tick (button edges are diffed from
+/// it), and `metrics` is the engine's current metrics snapshot.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameInput {
+    /// Steering angle in degrees, -450..450.
+    pub steering_deg: f64,
+    /// Pedal positions 0..1.
+    pub pedals: PedalSnapshot,
+    /// Cumulative encoder counts from the latest stream frame.
+    pub encoder_counts: [i16; MAX_ENCODERS],
+    /// How many encoders the frame carries (`n_enc <= 4`).
+    pub n_enc: usize,
+    /// The pipeline's processed output for this tick.
+    pub output: PipelineOutputState,
+    /// The engine's current metrics.
+    pub metrics: EngineMetrics,
+}
+
+/// Which live transport feeds the engine (Phase G gate wiring).
+///
+/// There is no persisted transport choice in settings yet, so the
+/// shell starts the engine on UDP (Wi-Fi `SoftAP`, the primary path)
+/// and serial is connected on demand through
+/// [`AppStateCore::connect_transport`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportKind {
+    /// Wi-Fi UDP transport (`UdpTransport`, board at the configured
+    /// `esp_ip`, default `192.168.4.1`).
+    Udp,
+    /// Wired USB-serial transport (`SerialTransport`, board port
+    /// auto-detected).
+    Serial,
+}
+
+impl TransportKind {
+    /// Short id for logs and diagnostics (`"udp"` / `"serial"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Serial => "serial",
+        }
+    }
+
+    /// Parse a transport name (`"udp"` / `"wifi"`, `"serial"` /
+    /// `"wired"`; case-insensitive). Returns [`None`] for an unknown
+    /// name — the caller errors honestly instead of guessing.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "udp" | "wifi" | "wi-fi" => Some(Self::Udp),
+            "serial" | "wired" | "usb" => Some(Self::Serial),
+            _ => None,
+        }
+    }
+}
+
+/// What the engine task is doing (Phase G gate wiring).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngineTaskStatus {
+    /// The engine task has never been started.
+    Idle,
+    /// The engine task is running. `transport` is [`None`] while it
+    /// ticks with no transport (clean idle: watchdog stale → neutral,
+    /// no fake frames) and [`Some`] once a transport is feeding it.
+    Running {
+        /// The live transport, when one is connected.
+        transport: Option<TransportKind>,
+    },
+    /// The engine task stopped (bounded stop joined, or it was never
+    /// started and a stop was requested).
+    Stopped,
+    /// The engine task failed to start or ended abnormally. The
+    /// reason is in [`AppStateCore::engine_status_detail`].
+    Failed {
+        /// What went wrong.
+        reason: String,
+    },
+}
+
+/// Live transport + session state, as the `get_transport_state`
+/// command reports it (H1 condition 15): which transport is live,
+/// whether its frames reach the engine, and why not. `session_active`
+/// is the SEC-E-14 gate: `false` means stream frames are being held
+/// (counted in `frames_held_by_gate`), never silently dropped. The
+/// two gate fields extend the Phase G shape (the frontend
+/// `TransportState` carries the first four fields; the gate fields
+/// are extra JSON fields the frontend reads when present).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TransportState {
+    /// `"wifi"` (UDP) or `"usb"` (serial).
+    pub transport: String,
+    /// Live connection state.
+    pub state: ConnectionState,
+    /// Board address actually used (Wi-Fi: persisted `esp_ip`).
+    pub address: String,
+    /// Failure reason, when the state is `error`.
+    pub error: Option<String>,
+    /// True only once a `BoardSession` completed its HMAC-verified
+    /// `GET_CAPS` and the session owner opened the gate (SEC-E-14).
+    pub session_active: bool,
+    /// Stream frames held by the closed session gate since engine start.
+    pub frames_held_by_gate: u64,
+}
+
+impl TransportState {
+    /// The UI-facing id for a kind (`"wifi"` / `"usb"`).
+    #[must_use]
+    pub const fn kind_id(kind: TransportKind) -> &'static str {
+        match kind {
+            TransportKind::Udp => "wifi",
+            TransportKind::Serial => "usb",
+        }
+    }
+}
+
+/// The outcome of one successful session activation (H5): the board
+/// the session belongs to plus the `GET_CAPS` reply that authenticated
+/// it. Recorded on the state by the activator so the pairing-status
+/// and firmware-version commands have a real backend to read — the
+/// record exists only while a session is live (disconnect, transport
+/// loss, and engine stop clear it; a later reconnect is a new
+/// session and must re-authenticate).
+#[derive(Clone, Debug)]
+pub struct SessionActivation {
+    /// Board MAC as reported by `HELLO` (`"AA:BB:CC:DD:EE:FF"`).
+    pub board_id: String,
+    /// Board firmware version from `GET_CAPS` (major, minor, patch).
+    pub firmware: (u8, u8, u8),
+    /// Board protocol version from `GET_CAPS` (major, minor).
+    pub protocol: (u8, u8),
+    /// The full `GET_CAPS` reply that authenticated the session.
+    pub caps: GetCapsReply,
+}
+
+/// Pairing status, as the `begin_pairing` / `get_pairing_status`
+/// commands report it (H5): how long the 60 s pairing window has
+/// left, the one-time Wi-Fi password while the window is open, and
+/// the last activation failure, if any. The password is held only
+/// while the window is open — it is cleared when the window expires,
+/// when pairing completes, and on disconnect — and it never appears
+/// in a log line or an error message.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingStatus {
+    /// Seconds left in the 60 s pairing window; 0 when no window is open.
+    pub seconds_left: u64,
+    /// The one-time device password, shown once, or [`None`] when no
+    /// pairing window is open.
+    pub password: Option<String>,
+    /// The last session-activation failure, if any (cleared on the
+    /// next successful activation).
+    pub error: Option<String>,
+}
+
+/// One `HELLO` reply as the activator last observed it (H5): enough
+/// to report the pairing window without re-asking the board. The
+/// password is the transient one-time Wi-Fi password from the
+/// `HELLO` — held only while the window is open (see
+/// [`PairingStatus`]).
+#[derive(Clone, Debug)]
+struct ObservedHello {
+    /// The board reported itself unpaired.
+    unpaired: bool,
+    /// The 60 s pairing window was open when observed.
+    window_open: bool,
+    /// The one-time Wi-Fi password, when credentials were disclosed.
+    password: Option<String>,
+    /// When the `HELLO` was observed (the window runs 60 s from here).
+    observed_at: Instant,
+}
+
+/// The outcome of one [`AppStateCore::activate_startup_backend`] call:
+/// what was requested (the persisted choice), what is actually live,
+/// and — when nothing is live — why. Recorded on the state (see
+/// [`AppStateCore::startup_backend_outcome`]) so a silent stay on the
+/// [`NullSink`](crate::system::NullSink) is impossible: `active` is
+/// [`None`] exactly when activation failed, and `reason` names the
+/// failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupBackendOutcome {
+    /// The backend the persisted settings asked for.
+    pub requested: BackendKind,
+    /// The backend that is actually live now ([`None`] when activation
+    /// failed outright and the [`NullSink`](crate::system::NullSink)
+    /// stayed installed).
+    pub active: Option<BackendKind>,
+    /// True when the requested backend failed and the fallback backend
+    /// was installed instead.
+    pub fell_back: bool,
+    /// The activation failure, verbatim, when the requested backend
+    /// (and its fallback) could not connect — or the fallback reason
+    /// when [`fell_back`](Self::fell_back) is set.
+    pub reason: Option<String>,
+}
+
+/// The outcome of one [`AppStateCore::stop_engine`] call: whether the
+/// engine task joined within the ~5 s bound, and its final
+/// [`EngineReport`] when one was delivered.
+#[derive(Clone, Copy, Debug)]
+pub struct EngineStopOutcome {
+    /// True when the engine task joined within the bound.
+    pub joined: bool,
+    /// The engine's final report, when the task delivered one.
+    pub report: Option<EngineReport>,
+}
+
+/// The testable app state (Phase G0).
+///
+/// Owns the engine metrics + loop-rate tracker + encoder state, the
+/// installed output backend, the game launcher, and the profile store.
+/// Every command the Tauri shell exposes reads/writes this state — no
+/// command invents data, and no command succeeds without its backing
+/// store or backend having done the work.
+///
+/// Locking: every field is a short-held `Mutex`; the emitter thread
+/// only ever takes one lock at a time (snapshot clone, event drain),
+/// so the engine never blocks on the UI — it hands
+/// [`FrameInput`] to [`AppStateCore::ingest_frame`] and returns.
+pub struct AppStateCore {
+    /// Engine metrics, as last reported by the engine task.
+    metrics: Mutex<EngineMetrics>,
+    /// Measured engine loop rate (sliding 1 s window).
+    loop_rate: Mutex<LoopRateTracker>,
+    /// Encoder baselines + virtual-button derivation.
+    encoders: Mutex<EncoderState>,
+    /// The installed output backend ([`IJoystickOutput`]). Starts as
+    /// the [`NullSink`]; the G4 selector swaps this slot at runtime
+    /// (`HIDMaestro` default, vJoy fallback, none) — see
+    /// [`AppStateCore::set_output_backend`].
+    backend: Mutex<Box<dyn IJoystickOutput>>,
+    /// Backend name, exactly as the backend reports it (`name()` at
+    /// construction; `"NullSink"` until the selector installs a real
+    /// backend). Behind a lock because the selector changes it.
+    backend_name: Mutex<String>,
+    /// Human-readable backend detail (what the backend is / is not).
+    /// Behind a lock because the selector changes it.
+    backend_detail: Mutex<String>,
+    /// The backend the user selected in settings (persisted in
+    /// `AppSettings.output_backend`). May differ from the live backend
+    /// after a fallback — the Output page shows both.
+    selected_backend: Mutex<BackendKind>,
+    /// Whether output is enabled (the Output screen toggle).
+    output_enabled: Mutex<bool>,
+    /// Last pipeline output (resent on re-enable; neutral on disable).
+    last_output: Mutex<PipelineOutputState>,
+    /// Last button bitmask seen (`buttons | buttons_ex << 32`), for edge diffing.
+    last_buttons: Mutex<u64>,
+    /// Outcome of the most recent backend send (`None` = never attempted).
+    last_send_ok: Mutex<Option<bool>>,
+    /// Human-readable note on the most recent backend send.
+    last_send_note: Mutex<String>,
+    /// Latest snapshot (built by `ingest_frame`, sampled by the emitter).
+    latest_snapshot: Mutex<EngineSnapshot>,
+    /// Monotonic snapshot sequence number.
+    seq: Mutex<u64>,
+    /// Transport connection state, as last reported.
+    connection: Mutex<ConnectionState>,
+    /// The transport the UI last asked for (kind + typed address).
+    /// The live state is derived from the engine status, never from
+    /// this record alone — this only remembers what was requested, so
+    /// `transport_state()` can report the kind and address even while
+    /// the engine is idle.
+    transport_choice: Mutex<(TransportKind, String)>,
+    /// Queued button-press edges, drained by the emitter.
+    button_events: Mutex<VecDeque<ButtonPressEvent>>,
+    /// Profile + settings store.
+    store: Mutex<ProfileStore>,
+    /// Game launcher (one game at a time, tracked pid only).
+    launcher: Mutex<GameLauncher<SystemSpawner>>,
+    /// Validated per-module tunings for this session (see
+    /// [`AppStateCore::set_tuning`]).
+    tunings: Mutex<BTreeMap<String, TuningSettings>>,
+    /// Engine stop handle, when the engine task is running.
+    stop_handle: Mutex<Option<StopHandle>>,
+    /// Engine task status (Phase G gate wiring): `Idle` until
+    /// [`AppStateCore::start_engine`] runs.
+    engine_status: Mutex<EngineTaskStatus>,
+    /// Human-readable engine status detail (transport state, retry
+    /// notes, failure reasons — never silently empty on failure).
+    engine_status_detail: Mutex<String>,
+    /// Command channel into the engine supervisor thread, while the
+    /// engine task is running ([`None`] before start / after stop).
+    engine_cmd_tx: Mutex<Option<tokio::sync::mpsc::Sender<EngineCommand>>>,
+    /// Report channel from the engine supervisor thread, while the
+    /// engine task is running ([`None`] before start / after stop).
+    engine_report_rx: Mutex<Option<StdReceiver<EngineReport>>>,
+    /// The engine supervisor std thread, while the engine task is
+    /// running ([`None`] before start / after stop).
+    engine_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Frame channel into the running engine (the forwarder and test
+    /// feeders send here), while the engine task is running.
+    engine_frame_tx: Mutex<Option<tokio::sync::mpsc::Sender<StreamFrame>>>,
+    /// The last [`EngineReport`] a stopped engine delivered, if any.
+    engine_last_report: Mutex<Option<EngineReport>>,
+    /// Cumulative encoder counts reconstructed from the engine's
+    /// per-tick deltas (see [`EngineSink`]).
+    engine_encoders: Mutex<EngineEncoderAccum>,
+    /// Outcome of the most recent
+    /// [`AppStateCore::activate_startup_backend`] call ([`None`] until
+    /// the shell activates the persisted backend at launch).
+    startup_backend: Mutex<Option<StartupBackendOutcome>>,
+    /// HMAC session gate (SEC-E-14, H1 condition 13): `true` only
+    /// once a `BoardSession` has completed its HMAC-verified
+    /// `GET_CAPS` and the session owner opened the gate. Starts
+    /// closed; the forwarder holds stream frames while it is closed.
+    session_gate_open: Mutex<bool>,
+    /// Stream frames held by the closed session gate, since the
+    /// engine started (diagnostics: proves the gate is enforcing
+    /// rather than silently dropping).
+    session_gate_held_frames: Mutex<u64>,
+    /// The last successful session activation (H5): board id + the
+    /// `GET_CAPS` reply that authenticated it. [`None`] while no
+    /// session is live — disconnect, transport loss, and engine stop
+    /// clear it, so a dead session is never presented as live.
+    session_activation: Mutex<Option<SessionActivation>>,
+    /// The last session-activation failure, if any (H5): the
+    /// fail-closed reason the pairing status reports. Cleared on the
+    /// next successful activation and on disconnect.
+    session_last_error: Mutex<Option<String>>,
+    /// The last `HELLO` the activator observed (H5): the pairing
+    /// window + transient one-time password for the pairing status.
+    /// Cleared when the window is consumed or on disconnect.
+    session_last_hello: Mutex<Option<ObservedHello>>,
+    /// The config-transaction record (H5-control): the resumable
+    /// snapshot of the stage → commit → confirm → rollback flow
+    /// (`stage_config` → `commit_config` → `confirm_config` /
+    /// `rollback_config`), kept between commands because every
+    /// command runs under its own fresh session (D30) and the
+    /// transaction client itself cannot survive. In memory only: an
+    /// app restart loses it, and the board then self-rolls-back
+    /// within 30 s — the next `rollback_config` (or a fresh
+    /// `stage_config`) re-syncs the record.
+    config_txn: Mutex<ConfigTxnSnapshot>,
+}
+
+impl AppStateCore {
+    /// Builds the state over an installed backend. The backend's name
+    /// is taken from the backend itself (`name()`); `backend_detail`
+    /// is the state's own human-readable note about the backend
+    /// (never invented by the backend — see `with_null_sink`).
+    #[must_use]
+    pub fn new(
+        store: ProfileStore,
+        backend: Box<dyn IJoystickOutput>,
+        backend_detail: impl Into<String>,
+    ) -> Self {
+        let backend_name = backend.name().to_string();
+        let output_enabled = store.settings().output_enabled;
+        let selected_backend =
+            BackendKind::parse(&store.settings().output_backend).unwrap_or(BackendKind::DEFAULT);
+        let esp_ip = store.settings().esp_ip.clone();
+        Self {
+            metrics: Mutex::new(EngineMetrics::new()),
+            loop_rate: Mutex::new(LoopRateTracker::new()),
+            encoders: Mutex::new(EncoderState::new()),
+            backend: Mutex::new(backend),
+            backend_name: Mutex::new(backend_name),
+            backend_detail: Mutex::new(backend_detail.into()),
+            selected_backend: Mutex::new(selected_backend),
+            output_enabled: Mutex::new(output_enabled),
+            last_output: Mutex::new(PipelineOutputState::neutral()),
+            last_buttons: Mutex::new(0),
+            last_send_ok: Mutex::new(None),
+            last_send_note: Mutex::new("not attempted yet".to_string()),
+            latest_snapshot: Mutex::new(EngineSnapshot::default()),
+            seq: Mutex::new(0),
+            connection: Mutex::new(ConnectionState::Disconnected),
+            transport_choice: Mutex::new((TransportKind::Udp, esp_ip)),
+            button_events: Mutex::new(VecDeque::new()),
+            store: Mutex::new(store),
+            launcher: Mutex::new(GameLauncher::new(SystemSpawner)),
+            tunings: Mutex::new(BTreeMap::new()),
+            stop_handle: Mutex::new(None),
+            engine_status: Mutex::new(EngineTaskStatus::Idle),
+            engine_status_detail: Mutex::new("engine not started yet".to_string()),
+            engine_cmd_tx: Mutex::new(None),
+            engine_report_rx: Mutex::new(None),
+            engine_thread: Mutex::new(None),
+            engine_frame_tx: Mutex::new(None),
+            engine_last_report: Mutex::new(None),
+            engine_encoders: Mutex::new(EngineEncoderAccum::default()),
+            startup_backend: Mutex::new(None),
+            session_gate_open: Mutex::new(false),
+            session_gate_held_frames: Mutex::new(0),
+            session_activation: Mutex::new(None),
+            session_last_error: Mutex::new(None),
+            session_last_hello: Mutex::new(None),
+            config_txn: Mutex::new(ConfigTxnSnapshot::default()),
+        }
+    }
+
+    /// Builds the state with the [`NullSink`] installed: no output
+    /// device. Every send is attempted and reported as not delivered
+    /// (D-F3) until the G4 selector installs a real backend.
+    #[must_use]
+    pub fn with_null_sink(store: ProfileStore) -> Self {
+        Self::new(
+            store,
+            Box::new(NullSink),
+            "no output backend installed yet — sends are attempted and reported as not delivered (select a backend on the Output page)",
+        )
+    }
+
+    /// Opens the profile store in `dir` and builds the state with the
+    /// [`NullSink`] installed. This is the constructor the Tauri shell
+    /// uses — and the [`NullSink`] is the *fallback base*, not the
+    /// startup default: the shell calls
+    /// [`AppStateCore::activate_startup_backend`] right after opening,
+    /// which activates the persisted backend choice through the
+    /// selector (default `HIDMaestro`, fallback vJoy, reason recorded
+    /// on failure). A missing store file means defaults (one `Default`
+    /// profile, default settings); a corrupt file is an error, never
+    /// silently dropped data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a present store file cannot be parsed or
+    /// read.
+    pub fn open_with_null_sink(dir: &Path) -> Result<Self, String> {
+        let store = ProfileStore::open(dir).map_err(|error| error.to_string())?;
+        Ok(Self::with_null_sink(store))
+    }
+
+    /// Opens the store like [`AppStateCore::open_with_null_sink`], but
+    /// a corrupt store is repaired from its 3-generation backups first
+    /// (H3, Phase G condition 16) instead of exiting with no recourse.
+    ///
+    /// Returns the opened state and, when a repair happened, the
+    /// human-readable repair note for the startup notice — the shell
+    /// shows it in the UI so a silent restore never happens. When the
+    /// store opens cleanly the note is [`None`]; when repair fails
+    /// the error names the file and the generations that were tried.
+    pub fn open_with_null_sink_repair(dir: &Path) -> (Result<Self, String>, Option<String>) {
+        match Self::open_with_null_sink(dir) {
+            Ok(state) => (Ok(state), None),
+            Err(first_error) => {
+                match rsh_profiles::store::try_repair_store_from_backup(dir) {
+                    Ok(Some(notice)) => match Self::open_with_null_sink(dir) {
+                        Ok(state) => (Ok(state), Some(notice)),
+                        Err(error) => (
+                            Err(format!(
+                                "store repair reported success but the store still \
+                                 will not open: {error}"
+                            )),
+                            Some(notice),
+                        ),
+                    },
+                    Ok(None) => {
+                        // The store opened during the repair check
+                        // (transient failure) — retry the open for real.
+                        match Self::open_with_null_sink(dir) {
+                            Ok(state) => (Ok(state), None),
+                            Err(_) => (Err(first_error), None),
+                        }
+                    }
+                    Err(repair_error) => (Err(repair_error), None),
+                }
+            }
+        }
+    }
+
+    /// The installed backend's name, exactly as reported.
+    #[must_use]
+    pub fn backend_name(&self) -> String {
+        lock(&self.backend_name).clone()
+    }
+
+    /// The backend the user selected in settings (persisted choice;
+    /// may differ from the live backend after a fallback).
+    #[must_use]
+    pub fn selected_backend(&self) -> BackendKind {
+        *lock(&self.selected_backend)
+    }
+
+    /// Registers the engine's stop handle (called by whoever spawns
+    /// the engine task; `None` until then — shutdown still sends
+    /// neutral, it just has no engine to signal).
+    pub fn set_stop_handle(&self, handle: StopHandle) {
+        *lock(&self.stop_handle) = Some(handle);
+    }
+
+    /// Reports the transport connection state (called by the transport
+    /// layer when it exists; `Disconnected` until then).
+    pub fn set_connection(&self, connection: ConnectionState) {
+        *lock(&self.connection) = connection;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* HMAC session gate (SEC-E-14, H1 condition 13)                      */
+    /* ------------------------------------------------------------------ */
+
+    /// Whether the session gate is open: a `BoardSession` completed
+    /// its HMAC-verified `GET_CAPS` and the session owner opened the
+    /// gate. While closed, the forwarder holds stream frames instead
+    /// of feeding them to the engine.
+    #[must_use]
+    pub fn session_gate_open(&self) -> bool {
+        *lock(&self.session_gate_open)
+    }
+
+    /// Stream frames held by the closed session gate since the engine
+    /// started (diagnostics counter).
+    #[must_use]
+    pub fn session_gate_held_frames(&self) -> u64 {
+        *lock(&self.session_gate_held_frames)
+    }
+
+    /// Opens the session gate: call only after a `BoardSession` has
+    /// completed its HMAC-verified `GET_CAPS` (pairing or resume) for
+    /// the live transport. From here on the forwarder feeds stream
+    /// frames to the engine. The gate closes again on transport loss
+    /// or disconnect — a new transport is a new session and must
+    /// re-authenticate.
+    pub fn open_session_gate(&self) {
+        *lock(&self.session_gate_open) = true;
+        self.note_engine_detail(
+            "session authenticated (SEC-E-14) — stream frames flowing".to_string(),
+        );
+    }
+
+    /// Closes the session gate: stream frames are held again until a
+    /// session re-authenticates. Called by the forwarder on transport
+    /// loss and by disconnect handling; idempotent.
+    pub fn close_session_gate(&self) {
+        *lock(&self.session_gate_open) = false;
+    }
+
+    /// Counts one stream frame held by the closed session gate.
+    /// Called by the forwarder only (never by tests driving the frame
+    /// channel directly — that channel bypasses the transport gate).
+    fn note_gate_held_frame(&self) {
+        *lock(&self.session_gate_held_frames) += 1;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Session activation records (H5 — the session-owner activator)     */
+    /* ------------------------------------------------------------------ */
+
+    /// The last successful session activation, if a session is live.
+    #[must_use]
+    pub fn session_activation(&self) -> Option<SessionActivation> {
+        lock(&self.session_activation).clone()
+    }
+
+    /// The last session-activation failure, if any.
+    #[must_use]
+    pub fn session_last_error(&self) -> Option<String> {
+        lock(&self.session_last_error).clone()
+    }
+
+    /// Records a successful activation: the board id + the `GET_CAPS`
+    /// reply that authenticated it. Clears the last activation error
+    /// and the transient pairing password (the window is consumed —
+    /// the one-time password must not linger in memory).
+    fn record_session_activation(&self, activation: SessionActivation) {
+        *lock(&self.session_activation) = Some(activation);
+        *lock(&self.session_last_error) = None;
+        if let Some(observed) = lock(&self.session_last_hello).as_mut() {
+            observed.password = None;
+        }
+    }
+
+    /// Records a failed activation: the fail-closed reason the
+    /// pairing status reports, plus the engine detail (frames stay
+    /// held until a session authenticates). The gate is left exactly
+    /// as it was — a failed `GET_CAPS` never opens it.
+    fn note_session_error(&self, reason: &str) {
+        *lock(&self.session_last_error) = Some(reason.to_string());
+        self.note_engine_detail(format!(
+            "{reason} — stream frames held until a session authenticates (SEC-E-14)"
+        ));
+    }
+
+    /// Records one `HELLO` as observed by the activator: the pairing
+    /// window + the transient one-time Wi-Fi password (only when the
+    /// `HELLO` actually discloses credentials — see
+    /// [`HelloReply::wifi_password_str`]).
+    fn note_observed_hello(&self, hello: &HelloReply) {
+        *lock(&self.session_last_hello) = Some(ObservedHello {
+            unpaired: hello.unpaired(),
+            window_open: hello.pairing_window_open(),
+            password: hello.wifi_password_str().map(str::to_string),
+            observed_at: Instant::now(),
+        });
+    }
+
+    /// Clears the live session records: the activation (caps /
+    /// firmware), the last observed `HELLO` (including any transient
+    /// pairing password), and the last activation error. Called on
+    /// disconnect, transport loss, and engine stop — a later
+    /// reconnect is a new session and must re-authenticate (SEC-E-14);
+    /// stale records must never present a dead session as live.
+    fn clear_session_records(&self) {
+        *lock(&self.session_activation) = None;
+        *lock(&self.session_last_hello) = None;
+        *lock(&self.session_last_error) = None;
+    }
+
+    /// The pairing status for the `begin_pairing` /
+    /// `get_pairing_status` commands: seconds left in the 60 s window
+    /// (0 when no window is open), the one-time password while the
+    /// window is open, and the last activation failure, if any. When
+    /// the window has expired the transient password is dropped from
+    /// the record here, so it never lingers in memory past the
+    /// window.
+    #[must_use]
+    pub fn pairing_status(&self) -> PairingStatus {
+        let mut hello = lock(&self.session_last_hello);
+        let (seconds_left, password) = match hello.as_ref() {
+            Some(observed) if observed.unpaired && observed.window_open => {
+                let elapsed = observed.observed_at.elapsed().as_secs();
+                if elapsed >= PAIRING_WINDOW_SECS {
+                    (0, None)
+                } else {
+                    (PAIRING_WINDOW_SECS - elapsed, observed.password.clone())
+                }
+            }
+            _ => (0, None),
+        };
+        if seconds_left == 0
+            && let Some(observed) = hello.as_mut()
+        {
+            observed.password = None;
+        }
+        drop(hello);
+        PairingStatus {
+            seconds_left,
+            password,
+            error: self.session_last_error(),
+        }
+    }
+
+    /// The board firmware version from the live session's `GET_CAPS`
+    /// reply (`"4.0.1"`), for the `get_firmware_version` command.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no session is live — the version comes
+    /// from the authenticated board, never from a local guess, so
+    /// there is nothing truthful to return until the activator has
+    /// run.
+    pub fn firmware_version(&self) -> Result<String, String> {
+        match self.session_activation() {
+            Some(activation) => Ok(format!(
+                "{}.{}.{}",
+                activation.firmware.0, activation.firmware.1, activation.firmware.2
+            )),
+            None => Err(
+                "no authenticated session yet — connect the wheel and let the session \
+                 activate (SEC-E-14) before reading the firmware version"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Retries session activation on the live transport (the explicit
+    /// user action: connect / retry). Re-issues the connect for the
+    /// currently requested transport kind — the supervisor aborts the
+    /// old forwarder and spawns a new one, which runs the activator
+    /// again — and returns the current transport state. Activation
+    /// itself is asynchronous (the forwarder runs it); the caller
+    /// polls `transport_state` / `pairing_status` for the outcome —
+    /// `session_active` turns true only once a signed `GET_CAPS`
+    /// succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no transport can be (re)connected (for
+    /// example no serial board port is detected).
+    pub fn activate_session(self: &Arc<Self>) -> Result<TransportState, String> {
+        let (kind, _) = self.transport_request();
+        self.connect_transport(kind)?;
+        Ok(self.transport_state())
+    }
+
+    /// Begins pairing: triggers a session-activation attempt (the
+    /// forwarder runs `BoardSession::pair` when the board reports
+    /// itself unpaired with the window open, `resume` otherwise) and
+    /// returns the pairing status. When a session is already active
+    /// this is a no-op returning the current status — it never tears
+    /// down a live session to re-pair. The returned status is the
+    /// last-known one; the frontend polls `get_pairing_status` while
+    /// the window is open, because the `HELLO` arrives
+    /// asynchronously in the forwarder. This waits up to ~3 s for the
+    /// attempt to produce a window or a failure, so the wizard gets a
+    /// useful synchronous answer instead of a stale empty one; after
+    /// the wait it returns whatever is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no transport can be (re)connected.
+    pub fn begin_pairing(self: &Arc<Self>) -> Result<PairingStatus, String> {
+        if self.session_gate_open() {
+            return Ok(self.pairing_status());
+        }
+        self.activate_session()?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = self.pairing_status();
+            if self.session_gate_open()
+                || status.error.is_some()
+                || status.seconds_left > 0
+                || Instant::now() >= deadline
+            {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* H5-control: the 11 remaining commands (live-session control)      */
+    /*                                                                     */
+    /* Every command below runs under a fresh session via                */
+    /* [`run_control_session`] (flag-1 HELO → fresh nonce → signed      */
+    /* `GET_CAPS` first, fail-closed, session closed + key zeroized     */
+    /* afterwards). They are synchronous, like `begin_pairing`: each     */
+    /* builds a short-lived current-thread runtime and blocks on the    */
+    /* helper — call only outside a tokio runtime (Tauri sync commands   */
+    /* satisfy this). The transport comes from the requested kind        */
+    /* (`transport_request().0`, default UDP): UDP uses an ephemeral     */
+    /* local port (coexists with the forwarder's stream-port socket);    */
+    /* serial refuses while the live transport holds the port (see       */
+    /* [`build_serial_control_transport`](Self::build_serial_control_transport)). */
+    /* ------------------------------------------------------------------ */
+
+    /// Build a fresh UDP transport for one control session: the
+    /// configured board IP, standard ports, local port 0 (ephemeral —
+    /// coexists with the forwarder's stream-port socket; HELO/control
+    /// replies return to the sender's port).
+    fn build_udp_control_transport(&self) -> Result<UdpTransport, String> {
+        let mut config = udp_config_for(self);
+        config.local_port = 0;
+        UdpTransport::bind(config).map_err(|error| error.to_string())
+    }
+
+    /// Build a fresh serial transport for one control session.
+    /// Refuses while the live transport holds the serial port: a
+    /// second open fails on Windows and would split reads between two
+    /// readers on Linux — fail-closed, deterministic,
+    /// platform-independent. The user disconnects the transport
+    /// first, then retries.
+    fn build_serial_control_transport(&self) -> Result<SerialTransport, String> {
+        if matches!(
+            self.engine_status(),
+            EngineTaskStatus::Running {
+                transport: Some(TransportKind::Serial)
+            }
+        ) {
+            return Err(
+                "the serial port is held by the live transport — disconnect the transport \
+                 first, then retry"
+                    .to_string(),
+            );
+        }
+        let port = detect_board_port().ok_or_else(|| {
+            "no board serial port detected — connect the wheel over USB and retry".to_string()
+        })?;
+        SerialTransport::open(SerialConfig::new(port)).map_err(|error| error.to_string())
+    }
+
+    /// The recorded config-transaction snapshot, with a completed
+    /// (`Confirmed`) transaction normalized to `Idle`: a confirmed
+    /// transaction is complete, so the next stage starts a new cycle.
+    /// (Stage is illegal from `Committed` — the caller must confirm
+    /// or roll back first — and legal from `Idle` / `Staged` /
+    /// `RolledBack`.)
+    fn config_snapshot_for_stage(&self) -> ConfigTxnSnapshot {
+        let mut snapshot = lock(&self.config_txn).clone();
+        if snapshot.state == ConfigState::Confirmed {
+            snapshot.state = ConfigState::Idle;
+            snapshot.staged_blob = None;
+            snapshot.committed_at = None;
+        }
+        snapshot
+    }
+
+    /// Change the board AP password (`set_password`): the new
+    /// password is stored as the Wi-Fi / OTA password too (one
+    /// credential for both). On success the session gate closes and
+    /// the session records clear — the board restarts its AP after
+    /// replying, so the session is dead. The OS Wi-Fi profile still
+    /// holds the OLD password: the user must rejoin the board's AP
+    /// with the new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no board answers, the session fails to
+    /// activate, the password violates the 8–63 printable-ASCII
+    /// rules, or the new password could not be stored (in the last
+    /// case the board password DID change — the error says so).
+    pub fn set_password(self: &Arc<Self>, password: &str) -> Result<(), String> {
+        // Owned here so the control future borrows only the session
+        // (its other inputs are moved in — see `run_control_session`).
+        let password = password.to_string();
+        let result = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_set_password(session, password)),
+            )),
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_set_password(session, password)),
+            )),
+        };
+        if result.is_ok() {
+            self.close_session_gate();
+            self.clear_session_records();
+        }
+        result
+    }
+
+    /// Read the board's live config blob (`get_config`) as the JSON
+    /// shape `stage_config` accepts: `cfgVersion`, the full
+    /// `records` list, and the derived `buttons` view of the three
+    /// fixed `BUTTON` slot roles.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no board answers, the session fails to
+    /// activate, or the board returns a blob that does not decode.
+    pub fn get_config(self: &Arc<Self>) -> Result<serde_json::Value, String> {
+        let blob = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_read_config_blob(session)),
+            )),
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_read_config_blob(session)),
+            )),
+        }?;
+        let decoded = ConfigBlob::decode(&blob).map_err(|error| {
+            format!("board returned a config blob that does not decode: {error}")
+        })?;
+        Ok(config_blob_to_json(&decoded))
+    }
+
+    /// Stage a config blob (`stage_config`): rebuild the blob from
+    /// the JSON shape (records authoritative; `buttons` reconciled
+    /// against the three fixed `BUTTON` slot roles — a cross-role
+    /// rebind is rejected, see [`config_json_to_blob`]), then stage
+    /// it under a fresh session (client-side PIN-RULES validation
+    /// first, live config saved for rollback). The staged blob is
+    /// NOT live until `commit_config` + `confirm_config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for a malformed config, a blob that fails
+    /// board validation, a `buttons` inconsistency, no board answer,
+    /// or a failed session activation.
+    pub fn stage_config(self: &Arc<Self>, config: &serde_json::Value) -> Result<(), String> {
+        let blob = config_json_to_blob(config)?;
+        let blob_bytes = blob
+            .encode()
+            .map_err(|error| format!("config blob could not be encoded: {error}"))?;
+        let snapshot = self.config_snapshot_for_stage();
+        let (result, new_snapshot) = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_stage_config(session, snapshot, blob_bytes)),
+            ))?,
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_stage_config(session, snapshot, blob_bytes)),
+            ))?,
+        };
+        *lock(&self.config_txn) = new_snapshot;
+        result
+    }
+
+    /// `COMMIT` the staged config (`commit_config`): the board
+    /// validates the staged blob, live-applies it, and starts the
+    /// 30 s confirm window. Only legal after `stage_config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when nothing is staged, the board rejects
+    /// the commit (pin conflict / unsupported, with its errCodes),
+    /// no board answers, or the session fails to activate.
+    pub fn commit_config(self: &Arc<Self>) -> Result<(), String> {
+        let snapshot = lock(&self.config_txn).clone();
+        let (result, new_snapshot) = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_commit_config(session, snapshot)),
+            ))?,
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_commit_config(session, snapshot)),
+            ))?,
+        };
+        *lock(&self.config_txn) = new_snapshot;
+        result
+    }
+
+    /// `CONFIRM` the committed config (`confirm_config`): makes the
+    /// new config permanent. Only legal inside the 30 s window after
+    /// `commit_config`. The wall clock is checked first: an expired
+    /// window errors WITHOUT sending `CONFIRM` (the board has already
+    /// rolled back on its own) — the state stays `Committed` until
+    /// `rollback_config` verifies the board is back on the previous
+    /// config.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when nothing is committed, the window has
+    /// expired, the confirm is not acknowledged, no board answers,
+    /// or the session fails to activate.
+    pub fn confirm_config(self: &Arc<Self>) -> Result<(), String> {
+        let snapshot = lock(&self.config_txn).clone();
+        if snapshot.state == ConfigState::Committed
+            && let Some(committed_at) = snapshot.committed_at
+            && committed_at.elapsed() >= snapshot.commit_deadline
+        {
+            return Err(
+                "the 30 s confirm window has expired — the board has already rolled back on \
+                 its own; run rollback_config to verify the board is back on the previous config"
+                    .to_string(),
+            );
+        }
+        let (result, new_snapshot) = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_confirm_config(session, snapshot)),
+            ))?,
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_confirm_config(session, snapshot)),
+            ))?,
+        };
+        *lock(&self.config_txn) = new_snapshot;
+        result
+    }
+
+    /// Roll back (`rollback_config`): send `REVERT` and verify the
+    /// board reports the last-good config (read back via `GET_CFG`
+    /// and compared against the pre-stage blob). Legal from `Staged`
+    /// (explicit cancel) and `Committed` (confirm timeout / late
+    /// confirm / expired window).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when nothing is staged or committed, the
+    /// read-back does not match the last-good blob, no board answers,
+    /// or the session fails to activate.
+    pub fn rollback_config(self: &Arc<Self>) -> Result<(), String> {
+        let snapshot = lock(&self.config_txn).clone();
+        let (result, new_snapshot) = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_rollback_config(session, snapshot)),
+            ))?,
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_rollback_config(session, snapshot)),
+            ))?,
+        };
+        *lock(&self.config_txn) = new_snapshot;
+        result
+    }
+
+    /// The config transaction state (`get_config_state`) — the
+    /// recorded state, with no board call. Frontend names: `Idle` /
+    /// `Confirmed` → `"clean"`, `Staged` → `"staged"`, `Committed` →
+    /// `"pending_confirm"`, `RolledBack` → `"rolled_back"`. After the
+    /// 30 s window expires the board has self-rolled-back but the
+    /// record still says `"pending_confirm"` until `rollback_config`
+    /// verifies — the record is the last verified state, not a guess
+    /// about the board.
+    #[must_use]
+    pub fn config_state(&self) -> &'static str {
+        match lock(&self.config_txn).state {
+            ConfigState::Idle | ConfigState::Confirmed => "clean",
+            ConfigState::Staged => "staged",
+            ConfigState::Committed => "pending_confirm",
+            ConfigState::RolledBack => "rolled_back",
+        }
+    }
+
+    /// Read the pin map (`get_pin_map`): the single-pin functions
+    /// the Settings editor can round-trip (steering, accelerator,
+    /// brake, clutch, handbrake, horn, led). Multi-pin records
+    /// (shifter, encoders, button matrix), the shifter up/down
+    /// `BUTTON` slots, and battery / I²C records are omitted — the
+    /// editor cannot express them, and `set_pin_map` preserves them
+    /// untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no board answers, the session fails to
+    /// activate, or the board returns a blob that does not decode.
+    pub fn get_pin_map(self: &Arc<Self>) -> Result<Vec<PinAssignment>, String> {
+        let blob = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_read_config_blob(session)),
+            )),
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_read_config_blob(session)),
+            )),
+        }?;
+        let decoded = ConfigBlob::decode(&blob).map_err(|error| {
+            format!("board returned a config blob that does not decode: {error}")
+        })?;
+        Ok(records_to_pin_assignments(&decoded.records))
+    }
+
+    /// Set the pin map (`set_pin_map`): the submission is the
+    /// COMPLETE map (the Settings editor always submits its full
+    /// draft). It is validated first (an invalid map touches no
+    /// board), then merged into the live blob by role and staged +
+    /// committed under one fresh session, so the editor's 30 s
+    /// confirm bar follows immediately. A merge failure is a
+    /// validation verdict (`valid: false` with the reason), not an
+    /// error — nothing is staged. Omitted expressible functions are
+    /// removed from the blob (replace semantics); multi-pin and
+    /// other unexpressible live records are preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no board answers, the session fails to
+    /// activate, or stage/commit fails on the board.
+    pub fn set_pin_map(
+        self: &Arc<Self>,
+        pins: Vec<PinAssignment>,
+    ) -> Result<PinMapValidation, String> {
+        let validation = validate_pin_map(&pins);
+        if !validation.valid {
+            return Ok(validation);
+        }
+        let snapshot = self.config_snapshot_for_stage();
+        let (result, new_snapshot) = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_stage_and_commit_pin_map(session, snapshot, pins)),
+            ))?,
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_stage_and_commit_pin_map(session, snapshot, pins)),
+            ))?,
+        };
+        *lock(&self.config_txn) = new_snapshot;
+        result
+    }
+
+    /// Upload a firmware image (`upload_firmware`) over the board's
+    /// `WebOTA` server — the real board OTA path, never a fake upload:
+    ///
+    /// 1. A fresh session reads the live firmware version from the
+    ///    session's `GET_CAPS` (either transport — the version check
+    ///    works over serial too).
+    /// 2. The image is verified: Ed25519 signature + format +
+    ///    anti-downgrade vs the live version (an older image is
+    ///    rejected; an equal version is a reinstall).
+    /// 3. The Wi-Fi password comes from the keystore (missing →
+    ///    "pair the board first").
+    /// 4. The image uploads over HTTP to the board's AP address
+    ///    (settings `esp_ip`, default `192.168.4.1`) — the PC must be
+    ///    joined to the board's Wi-Fi network for this leg; over
+    ///    serial the session works but the HTTP leg fails honestly
+    ///    when the PC is not on the board AP.
+    /// 5. On success the gate closes and the session records clear —
+    ///    the board restarts about a second later. The post-upload
+    ///    version confirm is the caller's job on reconnect, via
+    ///    `get_firmware_version` (per SIGNED-OTA §3: HTTP 200 +
+    ///    `"OK"` alone is not a version confirm).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the image file cannot be read, no
+    /// board answers, the image fails verification, no Wi-Fi
+    /// password is stored, or the board rejects the upload.
+    pub fn upload_firmware(self: &Arc<Self>, path: &Path) -> Result<(), String> {
+        let bytes = std::fs::read(path).map_err(|error| {
+            format!(
+                "could not read the firmware image at {}: {error}",
+                path.display()
+            )
+        })?;
+        let info: LiveBoardInfo = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(std::future::ready(op_live_board_info(session))),
+            ))?,
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(std::future::ready(op_live_board_info(session))),
+            ))?,
+        };
+        verify_firmware_image(&bytes, info.firmware)
+            .map_err(|error| format!("firmware image failed verification: {error}"))?;
+        let password = match KeyStore::new().get_wifi_password(&info.board_id) {
+            Ok(password) => password,
+            Err(KeystoreError::NotFound) => {
+                return Err(
+                    "no Wi-Fi password stored for this board — pair the board first, then \
+                     retry the upload"
+                        .to_string(),
+                );
+            }
+            Err(error) => {
+                return Err(format!("could not read the stored Wi-Fi password: {error}"));
+            }
+        };
+        let host = udp_config_for(self).board_ip;
+        upload_firmware_image(host, &password, &bytes)?;
+        self.close_session_gate();
+        self.clear_session_records();
+        Ok(())
+    }
+
+    /// Reboot the board (`restart_wheel`). On success the gate closes
+    /// and the session records clear — the board takes seconds to
+    /// reboot, and the forwarder has no re-activation retry, so there
+    /// is NO auto reconnect: the user reconnects once the board is
+    /// back (a pre-existing H5-activator limitation, not a gap in
+    /// this command).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no board answers or the session fails
+    /// to activate.
+    pub fn restart_wheel(self: &Arc<Self>) -> Result<(), String> {
+        let result = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_reboot(session)),
+            )),
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_reboot(session)),
+            )),
+        };
+        if result.is_ok() {
+            self.close_session_gate();
+            self.clear_session_records();
+        }
+        result
+    }
+
+    /// Live transport + session state for the `get_transport_state`
+    /// command: which transport is live, whether frames reach the
+    /// engine, and how many the gate has held. While idle the
+    /// transport reports the last requested kind (startup default
+    /// `"wifi"`) with the persisted `esp_ip` as its address, so the
+    /// shape is always complete; `state` is `disconnected` there. A
+    /// failed engine reports `error` with the failure reason verbatim
+    /// instead of a silent `disconnected`.
+    #[must_use]
+    pub fn transport_state(&self) -> TransportState {
+        let status = self.engine_status();
+        let live = match status {
+            EngineTaskStatus::Running { transport } => transport,
+            _ => None,
+        };
+        let kind = live.unwrap_or_else(|| self.transport_request().0);
+        let address = match kind {
+            TransportKind::Udp => self.settings().esp_ip,
+            TransportKind::Serial => detect_board_port().unwrap_or_default(),
+        };
+        let mut state = *lock(&self.connection);
+        let mut error = None;
+        if let EngineTaskStatus::Failed { .. } = status {
+            state = ConnectionState::Error;
+            error = Some(self.engine_status_detail());
+        } else if state == ConnectionState::Error {
+            error = Some(self.engine_status_detail());
+        }
+        TransportState {
+            transport: TransportState::kind_id(kind).to_string(),
+            state,
+            address,
+            error,
+            session_active: self.session_gate_open(),
+            frames_held_by_gate: self.session_gate_held_frames(),
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Engine stats + snapshots                                            */
+    /* ------------------------------------------------------------------ */
+
+    /// Current engine stats, from the stored metrics + the measured
+    /// loop rate (`None` p99s while unmeasured — never a fake 0).
+    #[must_use]
+    pub fn engine_stats(&self) -> EngineStats {
+        let metrics = *lock(&self.metrics);
+        let loop_hz = lock(&self.loop_rate).rate_hz();
+        build_engine_stats(&metrics, loop_hz)
+    }
+
+    /// The latest snapshot (built by the most recent `ingest_frame`;
+    /// the default all-zero snapshot until the first engine tick).
+    #[must_use]
+    pub fn snapshot(&self) -> EngineSnapshot {
+        lock(&self.latest_snapshot).clone()
+    }
+
+    /// Feeds one engine tick into the state: ticks the loop-rate
+    /// tracker, stores the metrics, updates the encoders, diffs the
+    /// button bits into `rsh://button-press` edges, and builds + stores
+    /// the next snapshot. Returns the snapshot built for this tick.
+    /// Short-held locks only — the engine never waits on the UI.
+    #[must_use]
+    pub fn ingest_frame(&self, input: FrameInput) -> EngineSnapshot {
+        lock(&self.loop_rate).tick();
+        *lock(&self.metrics) = input.metrics;
+        *lock(&self.last_output) = input.output;
+
+        let encoders = lock(&self.encoders).update(&input.encoder_counts, input.n_enc);
+        let seq = {
+            let mut guard = lock(&self.seq);
+            *guard += 1;
+            *guard
+        };
+
+        let stats = self.engine_stats();
+        let connection = *lock(&self.connection);
+        let active_profile_id = lock(&self.store).active().map(|stored| stored.id.clone());
+        let snapshot = build_snapshot_command(SnapshotInput {
+            steering_deg: input.steering_deg,
+            pedals: input.pedals,
+            connection,
+            stats,
+            active_profile_id,
+            seq,
+            encoders,
+            seq_gap: input.metrics.seq_gap,
+            tx_fail: input.metrics.tx_fail,
+        });
+        self.push_button_edges(&input.output, &snapshot);
+        *lock(&self.latest_snapshot) = snapshot.clone();
+        snapshot
+    }
+
+    /// Diffs `output`'s button bits against the previous tick and
+    /// queues the edges; encoder virtual-button pulses (65–72) from
+    /// the snapshot are momentary, so only the press edge is queued.
+    fn push_button_edges(&self, output: &PipelineOutputState, snapshot: &EngineSnapshot) {
+        let combined = u64::from(output.buttons) | (u64::from(output.buttons_ex) << 32);
+        let mut last = lock(&self.last_buttons);
+        let changed = combined ^ *last;
+        *last = combined;
+        drop(last);
+        if changed != 0 {
+            let mut events = lock(&self.button_events);
+            for button in 1..=64_u8 {
+                let bit = 1_u64 << (u64::from(button) - 1);
+                if changed & bit != 0 {
+                    events.push_back(ButtonPressEvent {
+                        button,
+                        pressed: combined & bit != 0,
+                    });
+                }
+            }
+        }
+        let mut events = lock(&self.button_events);
+        for &button in &snapshot.encoder_buttons {
+            events.push_back(ButtonPressEvent {
+                button,
+                pressed: true,
+            });
+        }
+    }
+
+    /// Drains the queued button-press edges (oldest first). The
+    /// snapshot emitter calls this after each snapshot emission.
+    #[must_use]
+    pub fn drain_button_presses(&self) -> Vec<ButtonPressEvent> {
+        lock(&self.button_events).drain(..).collect()
+    }
+
+    /// Runs the 30 Hz snapshot emitter loop on the calling thread:
+    /// emits the latest snapshot every [`SNAPSHOT_EMIT_INTERVAL`],
+    /// then drains + emits queued button-press events, until `stop`
+    /// is set. Missed ticks are skipped, never burst-caught-up, so a
+    /// slow emit can never flood the frontend. The engine is never
+    /// involved here — this only samples what `ingest_frame` stored.
+    pub fn run_snapshot_emitter(
+        state: &Arc<Self>,
+        emit: impl Fn(SnapshotEmit) + Send,
+        stop: &AtomicBool,
+    ) {
+        let mut next = Instant::now();
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            emit(SnapshotEmit::Snapshot(Box::new(state.snapshot())));
+            for event in state.drain_button_presses() {
+                emit(SnapshotEmit::ButtonPress(event));
+            }
+            next += SNAPSHOT_EMIT_INTERVAL;
+            let now = Instant::now();
+            if next > now {
+                std::thread::sleep(next - now);
+            } else {
+                // Behind schedule: skip the missed ticks instead of
+                // bursting to catch up.
+                next = now + SNAPSHOT_EMIT_INTERVAL;
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Output backend                                                      */
+    /* ------------------------------------------------------------------ */
+
+    /// Records the outcome of one backend interaction honestly:
+    /// `accepted` is true only when the backend actually took the
+    /// state. `note` names the interaction for the human-readable
+    /// detail in [`AppStateCore::output_state`].
+    fn record_send(&self, accepted: bool, note: String) {
+        *lock(&self.last_send_ok) = Some(accepted);
+        *lock(&self.last_send_note) = note;
+    }
+
+    /// Current output state, exactly as the backend reports it: the
+    /// installed backend's name, `connected` from the backend's live
+    /// `is_connected()`, and a detail that names the backend plus the
+    /// last send's outcome. `enabled` is the toggle state. When the
+    /// live backend is `HIDMaestro` the detail carries the UAC note
+    /// (elevated helper for the whole session); after a fallback it
+    /// also names the requested backend and the failure reason.
+    #[must_use]
+    pub fn output_state(&self) -> CommandOutputState {
+        let connected = lock(&self.backend).is_connected();
+        let enabled = *lock(&self.output_enabled);
+        let detail = format!(
+            "{} | last send: {}",
+            lock(&self.backend_detail),
+            lock(&self.last_send_note)
+        );
+        crate::commands::get_output_state(&self.backend_name(), connected, &detail, Some(enabled))
+    }
+
+    /// Applies the Output screen toggle — and actually actuates it:
+    /// enabling acquires the device (`try_connect`, idempotent when
+    /// already connected) and resends the last pipeline output;
+    /// disabling sends neutral and releases the device. The returned
+    /// state reports whether the backend accepted the send (with the
+    /// [`NullSink`] installed: the connect fails honestly, nothing is
+    /// delivered — D-F3).
+    #[must_use]
+    pub fn set_output_enabled(&self, enabled: bool) -> CommandOutputState {
+        *lock(&self.output_enabled) = enabled;
+        if enabled {
+            let mut backend = lock(&self.backend);
+            match backend.try_connect() {
+                Ok(()) => {
+                    let last = *lock(&self.last_output);
+                    match backend.update(&last) {
+                        Ok(()) => {
+                            self.record_send(true, "output enabled: sent to backend".to_string());
+                        }
+                        Err(error) => {
+                            self.record_send(
+                                false,
+                                format!("output enabled: update failed ({error})"),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.record_send(false, format!("output enabled: connect failed ({error})"));
+                }
+            }
+        } else {
+            let mut backend = lock(&self.backend);
+            let was_connected = backend.is_connected();
+            let neutral = backend.send_neutral();
+            backend.disconnect();
+            match (was_connected, neutral) {
+                (true, Ok(())) => {
+                    self.record_send(true, "output disabled: neutral sent to backend".to_string());
+                }
+                (true, Err(error)) => {
+                    self.record_send(false, format!("output disabled: neutral failed ({error})"));
+                }
+                (false, _) => {
+                    self.record_send(
+                        false,
+                        "output disabled: backend not connected, nothing sent".to_string(),
+                    );
+                }
+            }
+        }
+        self.output_state()
+    }
+
+    /// Selects the output backend by name (`"HIDMaestro"`, `"vJoy"`,
+    /// `"none"` / `"null"` / `"NullSink"`; case-insensitive) and
+    /// switches the live slot at runtime — no restart. Default is
+    /// `HIDMaestro`; a failed `HIDMaestro` connect falls back to vJoy
+    /// with the reason recorded in the returned state's detail, and a
+    /// failed connect of any kind leaves the previous backend exactly
+    /// as it was (see [`switch_backend`]).
+    ///
+    /// The requested choice is persisted in settings first (a save
+    /// failure errors out before anything switches). The persisted
+    /// choice is the *requested* backend even after a fallback, so the
+    /// next launch retries the user's choice instead of silently
+    /// keeping the fallback; the Output page shows the live backend
+    /// separately (see [`AppStateCore::list_output_backends`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the name is unknown, the settings save
+    /// fails, or the requested backend (and its fallback, if any)
+    /// could not connect.
+    pub fn set_output_backend(&self, name: &str) -> Result<CommandOutputState, String> {
+        let requested = BackendKind::parse(name).ok_or_else(|| {
+            format!("unknown output backend '{name}' (expected HIDMaestro, vJoy, or none)")
+        })?;
+        // Persist the choice first: a save failure errors out before
+        // anything switches, and a failed switch still leaves the
+        // user's choice recorded for the next launch.
+        {
+            let mut settings = lock(&self.store).settings().clone();
+            settings.output_backend = requested.settings_value().to_string();
+            let mut store = lock(&self.store);
+            store.set_settings(settings);
+            store.save().map_err(|error| error.to_string())?;
+        }
+        let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
+        let factories = real_backend_factories(vjoy_device_id);
+        self.apply_backend_switch(requested, &factories)
+            .map_err(|error| {
+                format!(
+                    "could not switch output backend to {}: {error}",
+                    requested.display_name()
+                )
+            })
+            .map(|_| self.output_state())
+    }
+
+    /// Applies a backend switch through the selector with the given
+    /// factories, and updates the live name / detail / selected choice
+    /// on success. Shared by [`AppStateCore::set_output_backend`]
+    /// (which persists first) and
+    /// [`AppStateCore::activate_startup_backend`] (which does not —
+    /// the choice is already persisted). On failure the slot is
+    /// untouched (see [`switch_backend`]) and the error is returned;
+    /// the caller records it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the selector's failure (no factory, or the requested
+    /// backend and its fallback both failed to connect).
+    fn apply_backend_switch(
+        &self,
+        requested: BackendKind,
+        factories: &BackendFactories,
+    ) -> Result<SwitchOutcome, String> {
+        let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
+        let outcome = {
+            let mut backend = lock(&self.backend);
+            switch_backend(&mut backend, requested, factories, None)
+        };
+        let outcome = outcome.map_err(|error| error.to_string())?;
+        *lock(&self.selected_backend) = requested;
+        let live_name = lock(&self.backend).name().to_string();
+        let mut detail = live_backend_detail(outcome.active, vjoy_device_id);
+        if outcome.fell_back {
+            detail.push(' ');
+            detail.push_str(&outcome.detail);
+            if let Some(reason) = &outcome.fallback_reason {
+                detail.push_str(" Reason: ");
+                detail.push_str(reason);
+            }
+        }
+        *lock(&self.backend_name) = live_name;
+        *lock(&self.backend_detail) = detail;
+        Ok(outcome)
+    }
+
+    /// Activates the persisted output backend choice at launch
+    /// (coordinator decision under delegation): reads
+    /// `AppSettings.output_backend` (default `HIDMaestro`), switches
+    /// the live slot through the selector, and falls back
+    /// (`HIDMaestro` → vJoy → [`NullSink`](crate::system::NullSink))
+    /// with the reason recorded. Activating `HIDMaestro` implies the
+    /// UAC prompt (the elevated helper runs for the whole session) —
+    /// expected, not an error. This never fails the launch: when both
+    /// backends fail, the outcome records `active: None` and the
+    /// reason, the [`NullSink`](crate::system::NullSink) stays
+    /// installed, and the backend detail names the failure — the app
+    /// keeps running with output disabled instead of crashing or
+    /// silently pretending a backend is live. The choice is NOT
+    /// re-persisted here (it is already the persisted choice); the
+    /// next launch retries it.
+    #[must_use]
+    pub fn activate_startup_backend(&self) -> StartupBackendOutcome {
+        let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
+        let factories = real_backend_factories(vjoy_device_id);
+        self.activate_startup_backend_with_factories(&factories)
+    }
+
+    /// [`AppStateCore::activate_startup_backend`] with injectable
+    /// factories (the test seam: tests build mock backends here, the
+    /// shell uses the real factories through
+    /// [`AppStateCore::activate_startup_backend`]).
+    #[must_use]
+    pub fn activate_startup_backend_with_factories(
+        &self,
+        factories: &BackendFactories,
+    ) -> StartupBackendOutcome {
+        let requested = self.selected_backend();
+        match self.apply_backend_switch(requested, factories) {
+            Ok(outcome) => {
+                let result = StartupBackendOutcome {
+                    requested,
+                    active: Some(outcome.active),
+                    fell_back: outcome.fell_back,
+                    reason: outcome.fallback_reason.clone(),
+                };
+                *lock(&self.startup_backend) = Some(result.clone());
+                result
+            }
+            Err(reason) => {
+                // Both backends failed: the slot is untouched (still
+                // the NullSink), but the failure must be visible in
+                // diagnostics — record it in the backend detail.
+                *lock(&self.backend_detail) = format!(
+                    "startup backend activation failed for {}: {reason} — output disabled (NullSink); no backend was silently installed",
+                    requested.display_name()
+                );
+                let result = StartupBackendOutcome {
+                    requested,
+                    active: None,
+                    fell_back: false,
+                    reason: Some(reason),
+                };
+                *lock(&self.startup_backend) = Some(result.clone());
+                result
+            }
+        }
+    }
+
+    /// The outcome of the most recent
+    /// [`AppStateCore::activate_startup_backend`] call ([`None`] until
+    /// the shell activates the persisted backend at launch).
+    #[must_use]
+    pub fn startup_backend_outcome(&self) -> Option<StartupBackendOutcome> {
+        lock(&self.startup_backend).clone()
+    }
+
+    /// Every selectable backend with honest per-backend status for the
+    /// Output page picker: which is selected, which is live, whether
+    /// each is connected, whether its driver/sidecar file was found,
+    /// whether it needs elevation (with the UAC note), and the vJoy
+    /// install link when vJoy is missing. Nothing here is invented:
+    /// `installed` is a file probe, `connected` is the live backend's
+    /// `is_connected()`, and non-live backends report `connected:
+    /// false`.
+    #[must_use]
+    pub fn list_output_backends(&self) -> Vec<BackendStatus> {
+        let live_kind =
+            BackendKind::from_backend_name(&self.backend_name()).unwrap_or(BackendKind::None);
+        let connected = lock(&self.backend).is_connected();
+        let selected = self.selected_backend();
+        let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
+        let live_detail = lock(&self.backend_detail).clone();
+        let vjoy_installed = resolve_dll_path().is_some();
+        let hidmaestro_installed = resolve_sidecar_path().is_file();
+        vec![
+            BackendStatus {
+                id: BackendKind::HidMaestro.as_str().to_string(),
+                name: BackendKind::HidMaestro.display_name().to_string(),
+                is_default: true,
+                selected: selected == BackendKind::HidMaestro,
+                active: live_kind == BackendKind::HidMaestro,
+                connected: live_kind == BackendKind::HidMaestro && connected,
+                installed: Some(hidmaestro_installed),
+                elevation_required: true,
+                uac_note: Some(UAC_NOTE.to_string()),
+                detail: if live_kind == BackendKind::HidMaestro {
+                    live_detail.clone()
+                } else if hidmaestro_installed {
+                    "HIDMaestro sidecar found. Default backend — runs its helper elevated for the whole session, so Windows asks (UAC) on every launch while it is active.".to_string()
+                } else {
+                    "HIDMaestro sidecar not found — reinstall RSH to use the default backend."
+                        .to_string()
+                },
+                download_url: None,
+            },
+            BackendStatus {
+                id: BackendKind::VJoy.as_str().to_string(),
+                name: BackendKind::VJoy.display_name().to_string(),
+                is_default: false,
+                selected: selected == BackendKind::VJoy,
+                active: live_kind == BackendKind::VJoy,
+                connected: live_kind == BackendKind::VJoy && connected,
+                installed: Some(vjoy_installed),
+                elevation_required: false,
+                uac_note: None,
+                detail: if live_kind == BackendKind::VJoy {
+                    live_detail.clone()
+                } else if vjoy_installed {
+                    format!(
+                        "vJoy driver found (device {vjoy_device_id}). Fallback backend — needs no UAC prompt."
+                    )
+                } else {
+                    "vJoy not found — install vJoy 2.2.2.0 to enable the fallback backend."
+                        .to_string()
+                },
+                download_url: if vjoy_installed {
+                    None
+                } else {
+                    Some(VJOY_DOWNLOAD_URL.to_string())
+                },
+            },
+            BackendStatus {
+                id: BackendKind::None.as_str().to_string(),
+                name: BackendKind::None.display_name().to_string(),
+                is_default: false,
+                selected: selected == BackendKind::None,
+                active: live_kind == BackendKind::None,
+                connected: false,
+                installed: Some(true),
+                elevation_required: false,
+                uac_note: None,
+                detail: if live_kind == BackendKind::None {
+                    live_detail
+                } else {
+                    "No output device — the wheel sends nothing to games.".to_string()
+                },
+                download_url: None,
+            },
+        ]
+    }
+
+    /// Real shutdown-neutral actuation (D-F3 / F4): signals the engine
+    /// to stop when a stop handle is registered, then sends neutral
+    /// through the installed backend. Same ordering contract as
+    /// `system::shutdown_output`, for the output trait instead of the
+    /// engine sink. The outcome reports honestly whether neutral was
+    /// sent — with the [`NullSink`] installed: attempted,
+    /// `neutral_sent: false`. Note `send_neutral` returning `Ok`
+    /// while disconnected is the trait's no-op, not a delivery: only
+    /// a backend that was connected can have delivered neutral.
+    #[must_use]
+    pub fn shutdown(&self) -> ShutdownOutcome {
+        let stop = lock(&self.stop_handle).clone();
+        let stop_signalled = match stop.as_ref() {
+            Some(handle) => {
+                handle.stop();
+                true
+            }
+            None => false,
+        };
+        let neutral_sent = {
+            let mut backend = lock(&self.backend);
+            let was_connected = backend.is_connected();
+            let neutral = backend.send_neutral();
+            backend.disconnect();
+            was_connected && neutral.is_ok()
+        };
+        *lock(&self.output_enabled) = false;
+        *lock(&self.last_send_ok) = Some(neutral_sent);
+        *lock(&self.last_send_note) = if neutral_sent {
+            "shutdown: neutral sent to backend".to_string()
+        } else {
+            "shutdown: neutral not sent (backend not connected)".to_string()
+        };
+        ShutdownOutcome {
+            stop_signalled,
+            neutral_sent,
+        }
+    }
+}
+
+impl AppStateCore {
+    /* ------------------------------------------------------------------ */
+    /* Engine task + transports (Phase G gate wiring)                      */
+    /* ------------------------------------------------------------------ */
+
+    /// Current engine task status (see [`EngineTaskStatus`]).
+    #[must_use]
+    pub fn engine_status(&self) -> EngineTaskStatus {
+        lock(&self.engine_status).clone()
+    }
+
+    /// Human-readable engine status detail: the transport state,
+    /// retry notes, and failure reasons. Never silently empty when
+    /// the status is [`EngineTaskStatus::Failed`].
+    #[must_use]
+    pub fn engine_status_detail(&self) -> String {
+        lock(&self.engine_status_detail).clone()
+    }
+
+    /// The last [`EngineReport`] a stopped engine delivered, if any.
+    #[must_use]
+    pub fn engine_last_report(&self) -> Option<EngineReport> {
+        *lock(&self.engine_last_report)
+    }
+
+    /// The frame channel into the running engine, when the engine task
+    /// is running. Transports feed frames here through the supervisor's
+    /// forwarder; tests drive it directly with a fake frame stream.
+    /// Whoever feeds frames must also call
+    /// [`AppStateCore::note_frame_encoders`] per frame, or the
+    /// snapshot's encoder counts stay at their defaults.
+    /// [`None`] until [`AppStateCore::start_engine`] runs.
+    #[must_use]
+    pub fn engine_frame_sender(&self) -> Option<tokio::sync::mpsc::Sender<StreamFrame>> {
+        lock(&self.engine_frame_tx).clone()
+    }
+
+    /// Records one frame's encoder counts, as reported by whoever
+    /// feeds frames into the engine (the transport forwarder calls
+    /// this per frame; a test feeder driving
+    /// [`AppStateCore::engine_frame_sender`] directly calls it too).
+    /// The engine's sink only ever sees pipeline *deltas*, and the
+    /// engine repeats the last output — deltas included — on ticks
+    /// with no new frame, so deltas must never be accumulated in the
+    /// sink (that over-counts). The board's cumulative counts are the
+    /// truth: the snapshot tracker diffs them into deltas itself, and
+    /// repeats diff to zero. `n_enc` is clamped to `MAX_ENCODERS`.
+    pub fn note_frame_encoders(&self, counts: [i16; MAX_ENCODERS], n_enc: usize) {
+        let mut accum = lock(&self.engine_encoders);
+        accum.counts = counts;
+        accum.n_enc = n_enc.min(MAX_ENCODERS);
+    }
+
+    /// Starts the engine task (idempotent: a second call while the
+    /// task is running is a no-op `Ok`). Spawns the supervisor std
+    /// thread, which runs one [`WheelEngine`](rsh_engine::engine::WheelEngine)
+    /// (200 Hz, 250 ms watchdog → NEUTRAL) on a current-thread tokio
+    /// runtime, and waits until the supervisor reports the engine
+    /// task running (bounded: 5 s — normally a few ms). The engine
+    /// starts with **no transport**: it ticks in a clean idle state
+    /// (watchdog stale → neutral, no fake frames) until
+    /// [`AppStateCore::connect_transport`] feeds it. The engine
+    /// never blocks on the UI: the sink hands each tick to
+    /// [`AppStateCore::ingest_frame`] and the installed backend under
+    /// short-held locks and returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the supervisor thread cannot be spawned
+    /// or does not report ready within 5 s.
+    pub fn start_engine(self: &Arc<Self>) -> Result<(), String> {
+        if lock(&self.engine_thread).is_some() {
+            return Ok(());
+        }
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(ENGINE_COMMAND_CAPACITY);
+        let (report_tx, report_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        *lock(&self.engine_cmd_tx) = Some(cmd_tx);
+        *lock(&self.engine_report_rx) = Some(report_rx);
+        let state = Arc::clone(self);
+        match std::thread::Builder::new()
+            .name("rsh-engine-supervisor".to_string())
+            .spawn(move || engine_supervisor_main(state, cmd_rx, report_tx, ready_tx))
+        {
+            Ok(thread) => {
+                *lock(&self.engine_thread) = Some(thread);
+                if let Ok(()) = ready_rx.recv_timeout(Duration::from_secs(5)) {
+                    self.set_engine_status(
+                        EngineTaskStatus::Running { transport: None },
+                        "engine running, no transport — idle (watchdog neutral)".to_string(),
+                    );
+                    Ok(())
+                } else {
+                    let reason = "engine supervisor did not report ready within 5 s".to_string();
+                    self.set_engine_status(
+                        EngineTaskStatus::Failed {
+                            reason: reason.clone(),
+                        },
+                        reason.clone(),
+                    );
+                    Err(reason)
+                }
+            }
+            Err(error) => {
+                *lock(&self.engine_cmd_tx) = None;
+                *lock(&self.engine_report_rx) = None;
+                self.set_engine_status(
+                    EngineTaskStatus::Failed {
+                        reason: format!("could not spawn engine supervisor thread: {error}"),
+                    },
+                    format!("could not spawn engine supervisor thread: {error}"),
+                );
+                Err(format!("could not spawn engine supervisor thread: {error}"))
+            }
+        }
+    }
+
+    /// Records what the UI asked for (kind + typed address) so
+    /// the Tauri shell can report it even while the engine is idle.
+    /// The live connection state is never taken from this record —
+    /// only the requested kind/address are (see `transport_state`,
+    /// which merges this with the live session-gate state).
+    pub fn set_transport_request(&self, kind: TransportKind, address: String) {
+        *lock(&self.transport_choice) = (kind, address);
+    }
+
+    /// What the UI last asked for (kind + typed address).
+    #[must_use]
+    pub fn transport_request(&self) -> (TransportKind, String) {
+        lock(&self.transport_choice).clone()
+    }
+
+    /// Connects a transport to the running engine, starting the engine
+    /// first (idle) when it is not running yet. The transport's
+    /// forwarder feeds the engine's frame channel; on source loss it
+    /// retries every 2 s (the engine keeps ticking neutral meanwhile)
+    /// until [`AppStateCore::disconnect_transport`] or the engine
+    /// stops. UDP is the startup default (board at the configured
+    /// `esp_ip`); serial auto-detects the board port — when no port
+    /// is detected this errors honestly and the engine stays idle.
+    ///
+    /// Connecting a transport does NOT open the session gate: stream
+    /// frames are held (SEC-E-14) until a `BoardSession` completes
+    /// its HMAC-verified `GET_CAPS` and the session owner calls
+    /// [`AppStateCore::open_session_gate`]. Use
+    /// [`AppStateCore::transport_state`] to report that honestly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no serial board port is detected, or
+    /// when the engine command channel is gone. A UDP bind failure is
+    /// NOT an error here: the forwarder retries every 2 s and the
+    /// reason is recorded in [`AppStateCore::engine_status_detail`].
+    pub fn connect_transport(self: &Arc<Self>, kind: TransportKind) -> Result<(), String> {
+        if kind == TransportKind::Serial && detect_board_port().is_none() {
+            let reason =
+                "no board serial port detected — connect a board over USB and retry".to_string();
+            self.note_engine_detail(reason.clone());
+            return Err(reason);
+        }
+        if lock(&self.engine_cmd_tx).is_none() {
+            self.start_engine()?;
+        }
+        let tx = lock(&self.engine_cmd_tx)
+            .clone()
+            .ok_or_else(|| "engine command channel is gone".to_string())?;
+        tx.try_send(EngineCommand::Connect(kind)).map_err(|error| {
+            format!(
+                "could not queue transport connect for {}: {error}",
+                kind.as_str()
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Disconnects the live transport (aborts its forwarder). The
+    /// engine keeps ticking in its clean idle state (watchdog stale →
+    /// neutral) — disconnecting never stops the engine. The session
+    /// gate closes too, and the session records are cleared: a later
+    /// reconnect is a new session and must re-authenticate (SEC-E-14).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the engine is not running.
+    pub fn disconnect_transport(&self) -> Result<(), String> {
+        self.close_session_gate();
+        self.clear_session_records();
+        let tx = lock(&self.engine_cmd_tx)
+            .clone()
+            .ok_or_else(|| "engine is not running".to_string())?;
+        tx.try_send(EngineCommand::Disconnect)
+            .map_err(|error| format!("could not queue transport disconnect: {error}"))?;
+        self.set_connection(ConnectionState::Disconnected);
+        Ok(())
+    }
+
+    /// Stops the engine task with a bounded wait: signals the stop
+    /// handle, then waits at most ~5 s for the engine's final report
+    /// and joins the supervisor thread. The engine itself returns
+    /// within one 5 ms tick of the stop signal (its `finish()` sends
+    /// a final neutral), so the bound is only ever approached when
+    /// something is already wrong. When the engine was never started
+    /// this is a no-op returning the last delivered report, if any.
+    /// A timed-out stop never blocks the caller past the bound: the
+    /// thread is detached and the outcome reports `joined: false`.
+    #[must_use]
+    pub fn stop_engine(&self) -> EngineStopOutcome {
+        let stop = lock(&self.stop_handle).clone();
+        let Some(handle) = stop else {
+            return EngineStopOutcome {
+                joined: false,
+                report: self.engine_last_report(),
+            };
+        };
+        handle.stop();
+        // Stopping the engine ends the session: the gate closes and
+        // the session records are cleared with it.
+        self.close_session_gate();
+        self.clear_session_records();
+        let report_rx = lock(&self.engine_report_rx).take();
+        let outcome = match report_rx {
+            Some(rx) => {
+                if let Ok(report) = rx.recv_timeout(ENGINE_STOP_TIMEOUT) {
+                    *lock(&self.engine_last_report) = Some(report);
+                    EngineStopOutcome {
+                        joined: true,
+                        report: Some(report),
+                    }
+                } else {
+                    let reason =
+                        "engine stop timed out after 5 s — thread detached, outcome unknown"
+                            .to_string();
+                    self.set_engine_status(
+                        EngineTaskStatus::Failed {
+                            reason: reason.clone(),
+                        },
+                        reason,
+                    );
+                    // Detach the stuck thread so a later start can
+                    // retry instead of no-op-ing on a dead handle.
+                    let _ = lock(&self.engine_thread).take();
+                    EngineStopOutcome {
+                        joined: false,
+                        report: self.engine_last_report(),
+                    }
+                }
+            }
+            None => EngineStopOutcome {
+                joined: false,
+                report: self.engine_last_report(),
+            },
+        };
+        if outcome.joined {
+            // The report arrives as the supervisor thread's last act,
+            // so the join below returns promptly; a panicked thread
+            // still reports `joined: false` instead of hanging exit.
+            let thread = lock(&self.engine_thread).take();
+            if let Some(thread) = thread {
+                if thread.join().is_ok() {
+                    self.set_engine_status(EngineTaskStatus::Stopped, "engine stopped".to_string());
+                } else {
+                    let reason = "engine supervisor thread panicked".to_string();
+                    self.set_engine_status(
+                        EngineTaskStatus::Failed {
+                            reason: reason.clone(),
+                        },
+                        reason,
+                    );
+                    return EngineStopOutcome {
+                        joined: false,
+                        report: outcome.report,
+                    };
+                }
+            } else {
+                self.set_engine_status(EngineTaskStatus::Stopped, "engine stopped".to_string());
+            }
+        }
+        *lock(&self.stop_handle) = None;
+        *lock(&self.engine_cmd_tx) = None;
+        *lock(&self.engine_frame_tx) = None;
+        outcome
+    }
+
+    /// Records the engine status + detail together.
+    fn set_engine_status(&self, status: EngineTaskStatus, detail: String) {
+        *lock(&self.engine_status) = status;
+        *lock(&self.engine_status_detail) = detail;
+    }
+
+    /// Records an engine note in the status detail without changing
+    /// the status itself (transport retries, disconnects).
+    fn note_engine_detail(&self, detail: String) {
+        *lock(&self.engine_status_detail) = detail;
+    }
+
+    /// Records an engine failure: status + detail both name the
+    /// reason, so a failed engine is never silent.
+    fn note_engine_failure(&self, reason: String) {
+        self.set_engine_status(
+            EngineTaskStatus::Failed {
+                reason: reason.clone(),
+            },
+            reason,
+        );
+    }
+
+    /// Records a transport failure / retry note and, when the engine
+    /// is running, keeps the status `Running` (a transport loss is
+    /// not an engine failure — the loop keeps ticking neutral).
+    fn note_engine_transport_error(&self, kind: TransportKind, reason: &str) {
+        // Status stays Running: the engine is alive, only the
+        // transport is down — a transport loss is not an engine
+        // failure, and the loop keeps ticking neutral.
+        *lock(&self.engine_status_detail) = format!(
+            "transport {} unavailable: {reason} — retrying every 2 s (engine keeps ticking, watchdog neutral)",
+            kind.as_str()
+        );
+    }
+
+    /// Feeds one engine tick into the state: the sink's view of the
+    /// pipeline output becomes a snapshot tick (steering in degrees,
+    /// pedals, encoder counts reconstructed from the per-tick
+    /// deltas) plus the installed backend's send (below). The
+    /// engine's live metrics are not observable per tick (see the
+    /// module docs), so the snapshot's p99s stay unmeasured and
+    /// `seqGap` / `txFail` stay 0 — the loop rate is measured from
+    /// these ticks and is real.
+    /// The engine's metrics as last reported by a per-tick send.
+    /// The plain-`send` path (the engine's final neutral) reuses
+    /// these instead of resetting them to "unmeasured".
+    fn live_metrics(&self) -> EngineMetrics {
+        *lock(&self.metrics)
+    }
+
+    fn ingest_engine_output(&self, output: &PipelineOutputState, metrics: &EngineMetrics) {
+        // Encoder counts come from the latest frame (reported by the
+        // feeder via `note_frame_encoders`), not from the output's
+        // deltas: the engine repeats the last output on ticks with no
+        // new frame, so accumulating deltas here would over-count.
+        let (encoder_counts, n_enc) = {
+            let accum = lock(&self.engine_encoders);
+            (accum.counts, accum.n_enc)
+        };
+        // The default pipeline plan disables the clutch module, so a
+        // clutch reading of exactly 0 means "no clutch module" here;
+        // a moved clutch is reported with its value.
+        let clutch = if output.clutch > 0.0 {
+            Some(f64::from(output.clutch))
+        } else {
+            None
+        };
+        let _ = self.ingest_frame(FrameInput {
+            steering_deg: f64::from(output.steering) * STEERING_FULL_LOCK_DEG,
+            pedals: PedalSnapshot {
+                accel: f64::from(output.accelerator),
+                brake: f64::from(output.brake),
+                clutch,
+            },
+            encoder_counts,
+            n_enc,
+            output: *output,
+            metrics: *metrics,
+        });
+    }
+
+    /// Sends one engine tick to the installed backend. When the
+    /// backend is not connected (output disabled, or no backend
+    /// installed) this is a success with nothing to send — output
+    /// disabled is a legitimate state, not a sink failure, so the
+    /// engine must not count it as an error 200 times a second. When
+    /// connected, a refused update is a real sink error and the engine
+    /// counts it and falls back to neutral, per its contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SinkError`] when the connected backend refuses the
+    /// state.
+    fn send_engine_output(&self, output: &PipelineOutputState) -> Result<(), SinkError> {
+        let mut backend = lock(&self.backend);
+        if !backend.is_connected() {
+            return Ok(());
+        }
+        backend
+            .update(output)
+            .map_err(|_| SinkError::new("output backend refused the state"))
+    }
+}
+
+impl AppStateCore {
+    /* ------------------------------------------------------------------ */
+    /* Profiles + settings                                                 */
+    /* ------------------------------------------------------------------ */
+
+    /// List-row summaries for the Profiles screen, in store order.
+    #[must_use]
+    pub fn list_profiles(&self) -> Vec<ProfileSummary> {
+        lock(&self.store).list_summaries()
+    }
+
+    /// The active profile's summary, if one is active.
+    #[must_use]
+    pub fn active_profile(&self) -> Option<ProfileSummary> {
+        self.list_profiles()
+            .into_iter()
+            .find(|summary| summary.active)
+    }
+
+    /// Summary for one profile id from an already-locked store.
+    fn summary(store: &ProfileStore, id: &str) -> Result<ProfileSummary, String> {
+        store
+            .list_summaries()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .ok_or_else(|| format!("no profile with id '{id}'"))
+    }
+
+    /// Activates a profile (a manual choice: auto-switch locks off
+    /// until re-enabled) and persists the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an unknown id or a store save failure.
+    pub fn activate_profile(&self, id: &str) -> Result<ProfileSummary, String> {
+        let mut store = lock(&self.store);
+        store
+            .activate(id, true)
+            .map_err(|error| error.to_string())?;
+        store.save().map_err(|error| error.to_string())?;
+        Self::summary(&store, id)
+    }
+
+    /// Creates a profile with default tuning under `name` and persists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the name is invalid or saving fails.
+    pub fn create_profile(&self, name: &str) -> Result<ProfileSummary, String> {
+        let mut store = lock(&self.store);
+        let created = store.create(name).map_err(|error| error.to_string())?;
+        store.save().map_err(|error| error.to_string())?;
+        Self::summary(&store, &created.id)
+    }
+
+    /// Duplicates a profile (new id, `"copy"` name) and persists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an unknown id or a store save failure.
+    pub fn duplicate_profile(&self, id: &str) -> Result<ProfileSummary, String> {
+        let mut store = lock(&self.store);
+        let created = store.duplicate(id).map_err(|error| error.to_string())?;
+        store.save().map_err(|error| error.to_string())?;
+        Self::summary(&store, &created.id)
+    }
+
+    /// Deletes a profile and persists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an unknown id or a store save failure.
+    pub fn delete_profile(&self, id: &str) -> Result<(), String> {
+        let mut store = lock(&self.store);
+        store.delete(id).map_err(|error| error.to_string())?;
+        store.save().map_err(|error| error.to_string())
+    }
+
+    /// Imports a profile file (size-capped, schema-checked by the
+    /// store) and persists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the file cannot be read, is too large,
+    /// fails schema checks, or saving fails.
+    pub fn import_profile(&self, path: &str) -> Result<ProfileSummary, String> {
+        let mut store = lock(&self.store);
+        let imported = store
+            .import_profile(Path::new(path))
+            .map_err(|error| error.to_string())?;
+        store.save().map_err(|error| error.to_string())?;
+        Self::summary(&store, &imported.id)
+    }
+
+    /// Exports a profile to a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an unknown id or a write failure.
+    pub fn export_profile(&self, id: &str, path: &str) -> Result<(), String> {
+        lock(&self.store)
+            .export_profile(id, Path::new(path))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Current app settings.
+    #[must_use]
+    pub fn settings(&self) -> AppSettings {
+        lock(&self.store).settings().clone()
+    }
+
+    /// Replaces the app settings and persists them. When the settings
+    /// flip the output flag, the change is actuated through the same
+    /// path as the Output toggle (disable → neutral send).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when saving fails.
+    pub fn set_settings(&self, settings: AppSettings) -> Result<AppSettings, String> {
+        let apply_output = settings.output_enabled;
+        {
+            let mut store = lock(&self.store);
+            store.set_settings(settings.clone());
+            store.save().map_err(|error| error.to_string())?;
+        }
+        let current = *lock(&self.output_enabled);
+        if current != apply_output {
+            let _ = self.set_output_enabled(apply_output);
+        }
+        Ok(settings)
+    }
+
+    /// Forces a backup rotation now and returns the backup list.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a backup file cannot be moved.
+    pub fn backup_now(&self) -> Result<Vec<BackupInfo>, String> {
+        lock(&self.store)
+            .backup_now()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Restores one backup generation over the live profiles file.
+    /// `path` names the generation file (`profiles.json`,
+    /// `profiles.json.bak1`, `profiles.json.bak2`); restoring the live
+    /// file itself is a no-op. The in-memory state reloads from the
+    /// restored generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the path names no known generation, the
+    /// generation file does not exist, or it cannot be read/parsed.
+    pub fn restore_backup(&self, path: &str) -> Result<(), String> {
+        let generation = match Path::new(path).file_name().and_then(|name| name.to_str()) {
+            Some("profiles.json") => BackupGeneration::Current,
+            Some("profiles.json.bak1") => BackupGeneration::Bak1,
+            Some("profiles.json.bak2") => BackupGeneration::Bak2,
+            _ => {
+                return Err(format!(
+                    "cannot restore backup from '{path}': expected profiles.json, \
+                     profiles.json.bak1, or profiles.json.bak2"
+                ));
+            }
+        };
+        lock(&self.store)
+            .restore_backup(generation)
+            .map_err(|error| error.to_string())
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Games                                                               */
+    /* ------------------------------------------------------------------ */
+
+    /// Every catalogue game with its install state, bound profile, and
+    /// running state (the tracked game only — refresh first, so a game
+    /// that exited on its own stops showing as running).
+    #[must_use]
+    pub fn list_games(&self) -> Vec<GameInfo> {
+        let detected = detect_all_games(&default_steam_roots());
+        let store = lock(&self.store);
+        let mut launcher = lock(&self.launcher);
+        let _ = launcher.refresh();
+        let running_id = launcher.running().map(|running| running.game_id.clone());
+        detected
+            .into_iter()
+            .map(|game| {
+                // Launcher ids are hyphenated (`assetto-corsa`) while
+                // profile game slugs are underscored (`assetto_corsa`):
+                // normalize before comparing, or no profile ever binds.
+                let slug = game.game_id.replace('-', "_");
+                let bound_profile_id = store
+                    .list()
+                    .iter()
+                    .find(|stored| game_slug(stored.profile.game).is_some_and(|s| s == slug))
+                    .map(|stored| stored.id.clone());
+                GameInfo {
+                    id: game.game_id.clone(),
+                    name: game.name.clone(),
+                    bound_profile_id,
+                    running: running_id.as_deref() == Some(game.game_id.as_str()),
+                    installed: game.installed,
+                }
+            })
+            .collect()
+    }
+
+    /// One game's info, or an error for an unknown game id.
+    fn game_info(&self, id: &str) -> Result<GameInfo, String> {
+        self.list_games()
+            .into_iter()
+            .find(|game| game.id == id)
+            .ok_or_else(|| format!("unknown game '{id}'"))
+    }
+
+    /// Launches a game (exactly one at a time; the launcher tracks the
+    /// pid). The running record is what `stop_game` kills — never any
+    /// other same-name process.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the game is unknown, not installed,
+    /// another game is already running, or the OS refuses to start it.
+    pub fn launch_game(&self, id: &str) -> Result<GameInfo, String> {
+        use crate::launcher::LaunchError;
+        let game = game_by_id(id).ok_or_else(|| format!("unknown game '{id}'"))?;
+        let detected = detect_game(game, &default_steam_roots());
+        {
+            let mut launcher = lock(&self.launcher);
+            launcher.launch(&detected).map_err(|error| match error {
+                LaunchError::NotInstalled(game_id) => {
+                    format!("game '{game_id}' is not installed")
+                }
+                LaunchError::AlreadyRunning(game_id) => {
+                    format!("game '{game_id}' is already running")
+                }
+                LaunchError::SpawnFailed(message) => {
+                    format!("failed to launch game: {message}")
+                }
+                LaunchError::UnsupportedPlatform(detail) => {
+                    format!("game launch is not supported on this platform: {detail}")
+                }
+            })?;
+        }
+        self.game_info(id)
+    }
+
+    /// Stops the tracked running game (only the tracked pid).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when nothing is running, another game is
+    /// running, or the tracked process could not be terminated.
+    pub fn stop_game(&self, id: &str) -> Result<GameInfo, String> {
+        let running_id = {
+            let mut launcher = lock(&self.launcher);
+            launcher.refresh().map(|running| running.game_id.clone())
+        };
+        match running_id.as_deref() {
+            None => return Err("no game is running".to_string()),
+            Some(running) if running != id => {
+                return Err(format!(
+                    "game '{id}' is not running (running game is '{running}')"
+                ));
+            }
+            Some(_) => {}
+        }
+        let mut launcher = lock(&self.launcher);
+        launcher.stop()?;
+        drop(launcher);
+        self.game_info(id)
+    }
+
+    /// One game's current state (installed / running / bound profile).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an unknown game id.
+    pub fn get_game_state(&self, id: &str) -> Result<GameInfo, String> {
+        self.game_info(id)
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Tuning + calibration                                                */
+    /* ------------------------------------------------------------------ */
+
+    /// The tuning for one module: the session's validated tuning when
+    /// one was set, else the active profile's stored tuning converted
+    /// to the frontend shape, else the neutral default (deadzone 0,
+    /// linear curve, full 0–3300 mV span, no smoothing). Nothing here
+    /// is invented data — the default is the documented neutral tuning.
+    #[must_use]
+    pub fn get_tuning(&self, module: &str) -> TuningSettings {
+        if let Some(tuning) = lock(&self.tunings).get(module) {
+            return tuning.clone();
+        }
+        if let Some(active) = lock(&self.store).active()
+            && let Some(stored) = active.profile.module_tunings.get(module)
+        {
+            return TuningSettings {
+                module: module.to_string(),
+                deadzone: stored.deadzone * 100.0,
+                curve: 1.0 + stored.curve_strength,
+                min_mv: 0.0,
+                max_mv: 3300.0,
+                smoothing: stored.smoothing * 100.0,
+                bite_point: None,
+                shifter_gate: if module == "shifter" {
+                    Some(if stored.gate_mode.eq_ignore_ascii_case("h-pattern") {
+                        ShifterGate::HPattern
+                    } else {
+                        ShifterGate::Sequential
+                    })
+                } else {
+                    None
+                },
+                horn_button: None,
+                led_brightness: None,
+                led_pattern: None,
+            };
+        }
+        TuningSettings {
+            module: module.to_string(),
+            deadzone: 0.0,
+            curve: 1.0,
+            min_mv: 0.0,
+            max_mv: 3300.0,
+            smoothing: 0.0,
+            bite_point: None,
+            shifter_gate: None,
+            horn_button: None,
+            led_brightness: None,
+            led_pattern: None,
+        }
+    }
+
+    /// Validates and stores one module's tuning for this session, and
+    /// writes its core fields through to the active profile's stored
+    /// tuning (deadzone %, curve exponent → strength, smoothing %),
+    /// so the tuning survives a restart. The curve mapping is
+    /// approximate (exponent 1.0 = linear strength 0.0); the LED /
+    /// horn / bite-point extensions have no home in the stored profile
+    /// shape and live in the session map only.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the tuning fails validation, there is no
+    /// active profile to write through to is NOT an error (the session
+    /// map still holds it), or the profile save fails.
+    pub fn set_tuning(&self, tuning: TuningSettings) -> Result<TuningSettings, String> {
+        let errors = validate_tuning(&tuning);
+        if !errors.is_empty() {
+            return Err(format!("invalid tuning: {}", errors.join("; ")));
+        }
+        lock(&self.tunings).insert(tuning.module.clone(), tuning.clone());
+        let mut store = lock(&self.store);
+        if let Some(active) = store.active() {
+            let mut profile = active.profile.clone();
+            let id = active.id.clone();
+            let entry = profile
+                .module_tunings
+                .entry(tuning.module.clone())
+                .or_insert_with(|| PerModuleTuning {
+                    deadzone: 0.0,
+                    curve_strength: 0.0,
+                    smoothing: 0.0,
+                    invert: false,
+                    scale: 1.0,
+                    enabled: true,
+                    gate_mode: "Sequential".to_string(),
+                });
+            entry.deadzone = tuning.deadzone / 100.0;
+            entry.curve_strength = (tuning.curve - 1.0).clamp(-1.0, 1.0);
+            entry.smoothing = tuning.smoothing / 100.0;
+            if let Some(gate) = tuning.shifter_gate {
+                entry.gate_mode = match gate {
+                    ShifterGate::Sequential => "Sequential".to_string(),
+                    ShifterGate::HPattern => "H-pattern".to_string(),
+                };
+            }
+            store
+                .update(&id, profile)
+                .map_err(|error| error.to_string())?;
+            store.save().map_err(|error| error.to_string())?;
+        }
+        Ok(tuning)
+    }
+
+    /// The active profile's captured calibration. Errors honestly when
+    /// there is no active profile or no calibration was captured yet —
+    /// an unset calibration is never reported as zeros.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no active profile exists or no steering
+    /// calibration was captured.
+    pub fn get_calibration(&self) -> Result<Calibration, String> {
+        let store = lock(&self.store);
+        let active = store
+            .active()
+            .ok_or_else(|| "no active profile".to_string())?;
+        let profile = &active.profile;
+        let steering = profile
+            .steering_calibration
+            .as_ref()
+            .filter(|calibration| calibration.is_set)
+            .ok_or_else(|| "no steering calibration captured yet".to_string())?;
+        let mut pedal_min_mv = BTreeMap::new();
+        let mut pedal_max_mv = BTreeMap::new();
+        for (key, calibration) in [
+            ("accel", &profile.accel_calibration),
+            ("brake", &profile.brake_calibration),
+            ("clutch", &profile.clutch_calibration),
+        ] {
+            if let Some(calibration) = calibration.as_ref().filter(|c| c.is_set) {
+                pedal_min_mv.insert(key.to_string(), f64::from(calibration.raw_min));
+                pedal_max_mv.insert(key.to_string(), f64::from(calibration.raw_max));
+            }
+        }
+        Ok(Calibration {
+            steering_center_mv: f64::from(steering.raw_center),
+            pedal_min_mv,
+            pedal_max_mv,
+        })
+    }
+
+    /// Saves a captured calibration into the active profile. Steering
+    /// keeps its existing min/max when present (the frontend shape
+    /// carries only the centre); with no steering calibration yet, the
+    /// centre is stored with min = max = centre, which the profile's
+    /// own sanity rules flag as needing recalibration — a centre-only
+    /// capture is incomplete, and the store says so instead of hiding it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when there is no active profile, a value is
+    /// out of range, a pedal key is unknown, or the save fails.
+    pub fn save_calibration(&self, calibration: Calibration) -> Result<Calibration, String> {
+        if !(0.0..=3300.0).contains(&calibration.steering_center_mv) {
+            return Err(format!(
+                "steering_center_mv {} is outside 0..=3300 mV",
+                calibration.steering_center_mv
+            ));
+        }
+        let mut pedals: Vec<(&str, i32, i32)> = Vec::new();
+        for (key, min, max) in Self::pedal_entries(&calibration)? {
+            pedals.push((key, min, max));
+        }
+        let mut store = lock(&self.store);
+        let active = store
+            .active()
+            .ok_or_else(|| "no active profile".to_string())?;
+        let mut profile = active.profile.clone();
+        let id = active.id.clone();
+        let center = mv_to_i32(calibration.steering_center_mv);
+        profile.steering_calibration = Some(match profile.steering_calibration {
+            Some(existing) => SteeringCalibration {
+                raw_min: existing.raw_min,
+                raw_center: center,
+                raw_max: existing.raw_max,
+                is_set: true,
+                is_millivolts: true,
+            },
+            None => SteeringCalibration {
+                raw_min: center,
+                raw_center: center,
+                raw_max: center,
+                is_set: true,
+                is_millivolts: true,
+            },
+        });
+        for (key, min, max) in pedals {
+            let slot = match key {
+                "accel" => &mut profile.accel_calibration,
+                "brake" => &mut profile.brake_calibration,
+                _ => &mut profile.clutch_calibration,
+            };
+            *slot = Some(PedalCalibration {
+                raw_min: min,
+                raw_max: max,
+                is_set: true,
+                is_millivolts: true,
+            });
+        }
+        store
+            .update(&id, profile)
+            .map_err(|error| error.to_string())?;
+        store.save().map_err(|error| error.to_string())?;
+        Ok(calibration)
+    }
+
+    /// Validates + normalizes the pedal entries of a calibration
+    /// (`"accelerator"` is accepted as `"accel"`). Returns the
+    /// normalized `(key, min_mv, max_mv)` triples.
+    fn pedal_entries(calibration: &Calibration) -> Result<Vec<(&'static str, i32, i32)>, String> {
+        let mut out: Vec<(&'static str, i32, i32)> = Vec::new();
+        for (raw_key, min, max) in calibration
+            .pedal_min_mv
+            .iter()
+            .map(|(key, min)| (key, min, calibration.pedal_max_mv.get(key)))
+        {
+            let key = match raw_key.to_ascii_lowercase().as_str() {
+                "accel" | "accelerator" => "accel",
+                "brake" => "brake",
+                "clutch" => "clutch",
+                other => return Err(format!("unknown pedal '{other}' in calibration")),
+            };
+            let Some(max) = max else {
+                return Err(format!("pedal '{key}' has a minimum but no maximum"));
+            };
+            if !(0.0..=3300.0).contains(min) || !(0.0..=3300.0).contains(max) {
+                return Err(format!(
+                    "pedal '{key}' range {min}..={max} mV is outside 0..=3300 mV"
+                ));
+            }
+            if min > max {
+                return Err(format!(
+                    "pedal '{key}' minimum {min} mV is above its maximum {max} mV"
+                ));
+            }
+            out.push((key, mv_to_i32(*min), mv_to_i32(*max)));
+        }
+        Ok(out)
+    }
+}
+
+/// Capacity of the engine supervisor's command channel (connect /
+/// disconnect commands are rare; a full channel is an error, never a
+/// block — see [`AppStateCore::connect_transport`]).
+const ENGINE_COMMAND_CAPACITY: usize = 16;
+
+/// Bounded engine stop: [`AppStateCore::stop_engine`] waits at most
+/// this long for the engine's final report (the engine itself returns
+/// within one 5 ms tick of the stop signal).
+const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Steering full lock in degrees: the pipeline's steering is `-1..=1`
+/// and the snapshot's steering is `-450..=450` (900° lock-to-lock).
+const STEERING_FULL_LOCK_DEG: f64 = 450.0;
+
+/// Capacity of the engine's frame channel (200 Hz; the engine drains
+/// the latest frame per tick, so a full channel drops the newest
+/// frame instead of blocking the transport).
+const ENGINE_FRAME_CHANNEL_CAPACITY: usize = 256;
+
+/// Commands the state sends the engine supervisor thread.
+#[derive(Clone, Copy, Debug)]
+enum EngineCommand {
+    /// Connect a transport and feed the engine from it.
+    Connect(TransportKind),
+    /// Disconnect the live transport; the engine keeps ticking idle.
+    Disconnect,
+}
+
+/// Cumulative encoder counts from the latest frame, as reported by
+/// the frame feeder (see
+/// [`AppStateCore::note_frame_encoders`]). The sink reads these when
+/// it feeds [`AppStateCore::ingest_frame`]; the snapshot tracker
+/// diffs them into deltas itself.
+#[derive(Clone, Copy, Debug, Default)]
+struct EngineEncoderAccum {
+    /// Cumulative counts from the latest frame, one per encoder.
+    counts: [i16; MAX_ENCODERS],
+    /// How many encoders the latest frame carries (`0..=4`).
+    n_enc: usize,
+}
+
+/// The engine's [`PacketSource`](rsh_engine::engine::PacketSource):
+/// a tokio `mpsc` channel the transports feed. Awaiting the channel
+/// is cancellation-safe, so the engine's zero-timeout polls never lose
+/// a frame; [`None`] (every sender dropped) means the supervisor is
+/// gone and the engine parks until stopped.
+struct ChannelPacketSource {
+    /// Frame channel receiver.
+    rx: tokio::sync::mpsc::Receiver<StreamFrame>,
+}
+
+impl PacketSource for ChannelPacketSource {
+    /// Await the next frame from the channel.
+    fn next_frame(&mut self) -> impl std::future::Future<Output = Option<StreamFrame>> + Send {
+        self.rx.recv()
+    }
+}
+
+/// The engine's [`OutputSink`](rsh_engine::engine::OutputSink): the
+/// app state itself. Every tick feeds the snapshot (via
+/// [`AppStateCore::ingest_frame`]) and the installed backend's
+/// `update`. The sink holds the state by [`Arc`] — the engine task
+/// owns it until it stops, and the state drops its end of the cycle
+/// in [`AppStateCore::stop_engine`].
+struct EngineSink {
+    /// The state this sink feeds.
+    state: Arc<AppStateCore>,
+}
+
+impl OutputSink for EngineSink {
+    /// Send one processed tick: snapshot feed first (never fails the
+    /// send — a snapshot is bookkeeping), then the backend send.
+    fn send(&mut self, state: &PipelineOutputState) -> Result<(), SinkError> {
+        // The plain-`send` path (the engine's final neutral in
+        // `finish()`) has no live metrics of its own — it reuses the
+        // last measured ones instead of resetting them to "unmeasured".
+        let metrics = self.state.live_metrics();
+        self.state.ingest_engine_output(state, &metrics);
+        self.state.send_engine_output(state)
+    }
+
+    /// Send one processed tick with the engine's live per-tick
+    /// metrics (H1 condition 11): the snapshot carries real jitter /
+    /// latency / loss p99s instead of "unmeasured".
+    fn send_with_metrics(
+        &mut self,
+        state: &PipelineOutputState,
+        metrics: &EngineMetrics,
+    ) -> Result<(), SinkError> {
+        self.state.ingest_engine_output(state, metrics);
+        self.state.send_engine_output(state)
+    }
+}
+
+/// Builds the real backend factories for the selector: `HIDMaestro`
+/// (default), vJoy (fallback, this settings' device id), and the
+/// no-device sink.
+fn real_backend_factories(vjoy_device_id: u32) -> BackendFactories {
+    BackendFactories {
+        hidmaestro: Some(Box::new(|| {
+            Box::new(HidMaestroOutput::new()) as Box<dyn IJoystickOutput>
+        })),
+        vjoy: Some(Box::new(move || {
+            Box::new(VJoyOutput::new(vjoy_device_id)) as Box<dyn IJoystickOutput>
+        })),
+        none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
+    }
+}
+
+/// The supervisor thread's entry point: builds a current-thread tokio
+/// runtime (timers only — the transports use std sockets + std reader
+/// threads, no tokio net) and blocks on the supervisor loop. A runtime
+/// build failure is recorded on the state; the app keeps running
+/// without an engine instead of crashing at startup.
+fn engine_supervisor_main(
+    state: Arc<AppStateCore>,
+    cmd_rx: tokio::sync::mpsc::Receiver<EngineCommand>,
+    report_tx: StdSender<EngineReport>,
+    ready_tx: StdSender<()>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            state.note_engine_failure(format!("could not build engine runtime: {error}"));
+            return;
+        }
+    };
+    runtime.block_on(engine_supervisor_run(state, cmd_rx, report_tx, ready_tx));
+}
+
+/// The supervisor loop: runs the engine task, applies transport
+/// connect/disconnect commands to the forwarder, and delivers the
+/// engine's final report to the state when the engine stops. The loop
+/// exits only when the engine task ends (stop signalled through its
+/// [`StopHandle`]); a closed command channel alone never ends it —
+/// the engine keeps ticking idle until stopped.
+async fn engine_supervisor_run(
+    state: Arc<AppStateCore>,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<EngineCommand>,
+    report_tx: StdSender<EngineReport>,
+    ready_tx: StdSender<()>,
+) {
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(ENGINE_FRAME_CHANNEL_CAPACITY);
+    *lock(&state.engine_frame_tx) = Some(frame_tx.clone());
+    let sink = EngineSink {
+        state: Arc::clone(&state),
+    };
+    let engine = WheelEngine::new(
+        ProcessingPipeline::new(PipelinePlan::default()),
+        ChannelPacketSource { rx: frame_rx },
+        Box::new(sink),
+    );
+    // Status pump (H1 condition 12): the forwarder drains the
+    // transport's status channel into this sender after every stream
+    // frame, so board loss counters and `btnsEx` reach the engine.
+    let status_tx = engine.status_sender();
+    let stop = engine.stop_handle();
+    state.set_stop_handle(stop);
+    let mut engine_join = tokio::spawn(engine.run());
+    // The engine task is running: tell `start_engine` the supervisor
+    // is up (the frame channel is live from here on).
+    let _ = ready_tx.send(());
+    let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
+    // Assigned on the only path that leaves the loop (the engine
+    // task ending), so no initializer is needed or wanted.
+    let report: Option<EngineReport>;
+    // The command branch is disabled (pending forever) once the
+    // sender is gone, so a closed channel cannot spin the select.
+    let mut commands_open = true;
+    loop {
+        tokio::select! {
+            cmd = async {
+                if commands_open {
+                    cmd_rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                match cmd {
+                    Some(EngineCommand::Connect(kind)) => {
+                        if let Some(running) = forwarder.take() {
+                            running.abort();
+                        }
+                        state.set_connection(ConnectionState::Connecting);
+                        state.note_engine_detail(format!(
+                            "transport {} connecting — engine running",
+                            kind.as_str()
+                        ));
+                        forwarder = Some(spawn_forwarder(
+                            Arc::clone(&state),
+                            kind,
+                            frame_tx.clone(),
+                            status_tx.clone(),
+                        ));
+                    }
+                    Some(EngineCommand::Disconnect) => {
+                        if let Some(running) = forwarder.take() {
+                            running.abort();
+                        }
+                        // A disconnect ends the session: the gate
+                        // closes, so a later reconnect must
+                        // re-authenticate (SEC-E-14).
+                        state.close_session_gate();
+                        state.set_connection(ConnectionState::Disconnected);
+                        state.note_engine_detail(
+                            "transport disconnected — engine idle (watchdog neutral)"
+                                .to_string(),
+                        );
+                    }
+                    None => {
+                        commands_open = false;
+                    }
+                }
+            }
+            done = &mut engine_join => {
+                match done {
+                    Ok(finished) => report = Some(finished),
+                    Err(error) => {
+                        state.note_engine_failure(format!(
+                            "engine task ended abnormally: {error}"
+                        ));
+                        report = Some(zero_engine_report());
+                    }
+                }
+                break;
+            }
+        }
+    }
+    if let Some(running) = forwarder.take() {
+        running.abort();
+    }
+    *lock(&state.engine_frame_tx) = None;
+    state.set_connection(ConnectionState::Disconnected);
+    if let Some(finished) = report {
+        let _ = report_tx.send(finished);
+    }
+}
+
+/// A zeroed [`EngineReport`] for the join-error path: the engine task
+/// ended abnormally, so there are no real counters — but the state
+/// still gets a report (all zeros) instead of a stop that never
+/// returns.
+fn zero_engine_report() -> EngineReport {
+    EngineReport {
+        counters: rsh_engine::engine::EngineCounters::default(),
+        metrics: EngineMetrics::new(),
+        sequence_accepted: 0,
+        sequence_gaps: 0,
+        sequence_duplicates: 0,
+        sequence_rebaselines: 0,
+        ping_timeouts: 0,
+        ping_last_delay_us: None,
+    }
+}
+
+/// How long the activator waits for one `HELLO` reply per attempt
+/// (H5): the board answers a HELO within milliseconds on a local
+/// link, so 500 ms covers a lost first reply and the board's 500 ms
+/// `HELLO`-reply rate limit (H1-10); two attempts bound the whole
+/// activation wait to ~1 s before the forwarder falls through to the
+/// frame loop with the gate closed. The wait ends as soon as a
+/// `HELLO` arrives — the timeout only matters when no board answers
+/// at all. (Kept short deliberately: the supervisor runtime shares
+/// one thread with the 200 Hz engine loop, and sandbox timers run
+/// ~2–5× slow under parallel load — a longer wait would stall the
+/// frame loop for many seconds in tests with no board.)
+const SESSION_HELLO_WAIT: Duration = Duration::from_millis(500);
+
+/// `HELLO` wait attempts per activation (H5): the first request plus
+/// one retry.
+const SESSION_HELLO_ATTEMPTS: usize = 2;
+
+/// A transport that can both stream frames and run a session (H5).
+///
+/// Both live transports satisfy this: [`UdpTransport`] and
+/// [`SerialTransport`] each implement [`PacketSource`] (stream),
+/// [`ControlTransport`] (HMAC control channel), and `next_hello`
+/// (the `HELLO` reply channel). The activator needs all three on the
+/// *same* transport instance — stream + control share one socket /
+/// one serial port, demuxed into channels, and a second socket cannot
+/// receive control replies (H1 §2) — so the forwarder hands its own
+/// transport to the activator and takes it back afterwards.
+trait SessionTransport: PacketSource + ControlTransport {
+    /// Await the next `HELLO` reply. Returns [`None`] once the
+    /// transport is shut down. Cancellation-safe: dropping the
+    /// future must not lose a `HELLO` (both transports back this
+    /// with a tokio `mpsc` receive, which is cancellation-safe), so
+    /// the activator can time-box each wait and retry.
+    fn recv_hello(&mut self) -> impl Future<Output = Option<HelloReply>> + Send;
+
+    /// Send one HELO requesting a session (protocol §2.1).
+    ///
+    /// `session_flag 1` asks for a **new** session (fresh nonce);
+    /// `0` resumes (old nonce back). The activator always asks for a
+    /// new session: D30 forbids reusing an old nonce/counter after a
+    /// session ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the HELO cannot be sent. Callers treat
+    /// this as non-fatal (the transport's own HELO path may still
+    /// deliver a `HELLO`; a dead link surfaces as a `HELLO` timeout).
+    fn request_hello(&mut self, session_flag: u8) -> Result<(), String>;
+}
+
+impl SessionTransport for UdpTransport {
+    fn recv_hello(&mut self) -> impl Future<Output = Option<HelloReply>> + Send {
+        self.next_hello()
+    }
+
+    fn request_hello(&mut self, session_flag: u8) -> Result<(), String> {
+        // One-shot HELO: the 1 Hz HELO thread always sends flag 0
+        // (resume), so a new session needs this explicit flag-1 HELO.
+        self.send_helo(session_flag)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl SessionTransport for SerialTransport {
+    fn recv_hello(&mut self) -> impl Future<Output = Option<HelloReply>> + Send {
+        self.next_hello()
+    }
+
+    fn request_hello(&mut self, session_flag: u8) -> Result<(), String> {
+        // Serial has no automatic HELO thread: the session layer
+        // drives HELO on demand (connect / pair / reconnect).
+        self.send_helo(session_flag)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Outcome of awaiting a new-session `HELLO` (H5-control).
+enum NewSessionHello {
+    /// A `HELLO` arrived: an echo-1 reply answering the new-session
+    /// HELO when one came, else the most recent echo-0 reply.
+    Found(HelloReply),
+    /// No `HELLO` arrived within the wait attempts.
+    None,
+    /// The transport died while waiting (its `HELLO` channel closed).
+    TransportClosed,
+}
+
+/// Await a `HELLO` answering a new-session request (H5, shared by the
+/// activator and the H5-control helper — the same code path, not a
+/// copy).
+///
+/// Sends a flag-1 HELO first (D30: only a new session gets a fresh
+/// nonce; a failed one-shot HELO is not fatal — the transport's own
+/// HELO path may still deliver a `HELLO`, and a dead link surfaces as
+/// a `HELLO` timeout), then waits up to
+/// [`SESSION_HELLO_ATTEMPTS`] × [`SESSION_HELLO_WAIT`], preferring a
+/// reply with `session_echo 1` and keeping the most recent echo-0
+/// reply as a fallback (pairing works under any fresh nonce, and a
+/// stale-nonce resume fails loudly with `BAD_TAG` instead of silently
+/// opening the gate). A stale echo-0 reply triggers one more explicit
+/// flag-1 HELO; a timeout re-requests a new session once, then waits
+/// again.
+async fn await_new_session_hello<T: SessionTransport>(transport: &mut T) -> NewSessionHello {
+    let _ = transport.request_hello(1);
+    let mut fallback: Option<HelloReply> = None;
+    for _ in 0..SESSION_HELLO_ATTEMPTS {
+        match tokio::time::timeout(SESSION_HELLO_WAIT, transport.recv_hello()).await {
+            Ok(Some(reply)) => {
+                if reply.session_echo == 1 {
+                    return NewSessionHello::Found(reply);
+                }
+                fallback = Some(reply);
+                // The board answered a routine flag-0 HELO with the
+                // old nonce: ask for a new session explicitly, then
+                // keep waiting for its answer.
+                let _ = transport.request_hello(1);
+            }
+            Ok(None) => {
+                // The transport closed while awaiting HELLO.
+                return NewSessionHello::TransportClosed;
+            }
+            Err(_) => {
+                // No HELLO in this window: re-request a new session
+                // once, then wait again.
+                let _ = transport.request_hello(1);
+            }
+        }
+    }
+    match fallback {
+        Some(hello) => NewSessionHello::Found(hello),
+        None => NewSessionHello::None,
+    }
+}
+
+/// Open a session from a `HELLO` (H5, shared by the activator and the
+/// H5-control helper): `BoardSession::pair` for an unpaired board
+/// with the window open, `resume` otherwise — either way a signed
+/// `GET_CAPS` goes first and only its success activates the session.
+/// The device key + Wi-Fi password are stored in the OS credential
+/// store by `pair`; the in-memory key is zeroized by
+/// [`BoardSession::close`], which the caller runs.
+///
+/// Returns the session (live or not) plus the `GET_CAPS` outcome, so
+/// the caller keeps the session on failure and can still close it
+/// cleanly instead of dropping a half-open one.
+async fn open_session_for_hello<T, K>(
+    transport: T,
+    keystore: K,
+    hello: &HelloReply,
+) -> (BoardSession<K, T>, Result<GetCapsReply, SessionError>)
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let board_id = hello
+        .board_mac
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<String>>()
+        .join(":");
+    let mut session = BoardSession::new(&board_id, keystore, transport);
+    let outcome = if hello.unpaired() {
+        session.pair(hello).await
+    } else {
+        session.resume(hello).await
+    };
+    (session, outcome)
+}
+
+/// One session-activation attempt on `transport` (H5, SEC-E-14).
+///
+/// The SEC-E-14 flow: transport up → session established via the
+/// HMAC control channel → signed `GET_CAPS` first →
+/// `open_session_gate()` → frames flow to the engine/output.
+///
+/// 1. Awaits a new-session `HELLO` via [`await_new_session_hello`]
+///    (flag-1 HELO — D30: only a new session gets a fresh nonce).
+/// 2. Runs [`open_session_for_hello`] (`pair` / `resume` — either
+///    way a signed `GET_CAPS` goes first and only its success
+///    activates the session). The device key + Wi-Fi password are
+///    stored in the OS credential store by `pair`; the in-memory key
+///    is zeroized on every exit path.
+/// 3. On success records the activation and opens the session gate;
+///    on any failure records the reason and leaves the gate exactly
+///    as it was (closed in production) — fail-closed, never silently
+///    opened.
+/// 4. Hands the transport back via `BoardSession::take_transport`
+///    (the session itself does not survive: the in-memory key was
+///    zeroized, and a later control operation starts a fresh session
+///    with a fresh nonce, exactly as D30 requires), so the forwarder
+///    can stream frames on the same transport.
+///
+/// Returns [`None`] only when the transport died mid-activation (its
+/// `HELLO` channel closed): the caller treats that as transport loss
+/// and rebuilds. A failed activation (no `HELLO`, bad tag, no stored
+/// key, closed window, unavailable credential store) returns
+/// [`Some`] — the transport is alive, the gate stays closed, and the
+/// forwarder falls through to the frame loop, where frames are held
+/// and counted until a later activation succeeds.
+async fn activate_session_on<T, K>(
+    state: &Arc<AppStateCore>,
+    transport: T,
+    keystore: K,
+) -> Option<T>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let mut transport = transport;
+    match await_new_session_hello(&mut transport).await {
+        NewSessionHello::TransportClosed => {
+            state.note_session_error("transport closed while awaiting the board HELLO");
+            None
+        }
+        NewSessionHello::None => {
+            state.note_session_error(
+                "no HELLO reply from the board within 1 s — board not responding \
+                 on this transport",
+            );
+            Some(transport)
+        }
+        NewSessionHello::Found(hello) => {
+            state.note_observed_hello(&hello);
+            let (mut session, outcome) = open_session_for_hello(transport, keystore, &hello).await;
+            match outcome {
+                Ok(caps) => {
+                    state.record_session_activation(SessionActivation {
+                        board_id: session.board_id().to_string(),
+                        firmware: caps.firmware,
+                        protocol: caps.protocol,
+                        caps,
+                    });
+                    state.open_session_gate();
+                }
+                Err(error) => {
+                    state.note_session_error(&format!("session activation failed: {error}"));
+                    // Fail-closed: the gate stays exactly as it was
+                    // (closed in production — never opened on a
+                    // failed GET_CAPS).
+                }
+            }
+            session.close();
+            session.take_transport()
+        }
+    }
+}
+
+/// Run one control operation under a fresh session (H5-control).
+///
+/// The helper the 11 remaining commands are built on: it opens a
+/// session exactly the way the activator does — [`await_new_session_hello`]
+/// (flag-1 HELO, fresh nonce, D30) then [`open_session_for_hello`]
+/// (signed `GET_CAPS` first) — runs the single operation `op` under
+/// that session, then closes the session and zeroizes the key. The
+/// session never survives the call, and the gate is never touched:
+/// this is a transient control session, not an activation — a
+/// successful op does not open the gate, and a failed op does not
+/// close a gate that was already open (the forwarder owns the gate).
+/// The transport is dropped afterwards: UDP control uses an ephemeral
+/// local port, and a serial control session holds the port only for
+/// the duration of the op.
+///
+/// Fail-closed throughout: no `HELLO`, a transport that died, a bad
+/// tag, a closed pairing window, or any op failure returns an
+/// [`Err`] with the reason (also recorded via
+/// [`AppStateCore::note_session_error`] so the pairing status shows
+/// it) — never a partial success. A successful activation whose op
+/// then fails still closes the session cleanly before returning.
+///
+/// The `HELLO` answering the fresh HELO rotates the board's nonce
+/// (D30) — harmless to a live forwarder: the stream is
+/// unauthenticated and goes to the fixed port 4211, and the forwarder
+/// holds no control session of its own.
+async fn run_control_session<T, K, F, R>(
+    state: &Arc<AppStateCore>,
+    transport: T,
+    keystore: K,
+    op: F,
+) -> Result<R, String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+    // The op's future borrows the `&mut BoardSession` it is handed,
+    // so its type depends on that borrow's lifetime — a plain
+    // `FnOnce(&mut BoardSession) -> Fut` bound cannot express it.
+    // The boxed future carries the borrow lifetime (`'s`) instead.
+    F: for<'s> FnOnce(
+        &'s mut BoardSession<K, T>,
+    ) -> Pin<Box<dyn Future<Output = Result<R, String>> + 's>>,
+{
+    let mut transport = transport;
+    match await_new_session_hello(&mut transport).await {
+        NewSessionHello::TransportClosed => {
+            let reason = "transport closed while awaiting the board HELLO";
+            state.note_session_error(reason);
+            Err(reason.to_string())
+        }
+        NewSessionHello::None => {
+            let reason = "no HELLO reply from the board within 1 s — board not responding \
+                 on this transport";
+            state.note_session_error(reason);
+            Err(reason.to_string())
+        }
+        NewSessionHello::Found(hello) => {
+            let (mut session, outcome) = open_session_for_hello(transport, keystore, &hello).await;
+            let result = match outcome {
+                Ok(_) => op(&mut session).await,
+                Err(error) => Err(format!("session activation failed: {error}")),
+            };
+            if let Err(error) = &result {
+                state.note_session_error(error);
+            }
+            session.close();
+            let _ = session.take_transport();
+            result
+        }
+    }
+}
+
+/// Block the calling thread on a control future (H5-control).
+///
+/// The control commands are synchronous (like `begin_pairing`), so
+/// each builds a short-lived current-thread tokio runtime and blocks
+/// on [`run_control_session`]. Contract: call only OUTSIDE a tokio
+/// runtime — Tauri sync commands satisfy this; a call from inside a
+/// runtime panics (a runtime cannot be built inside one), so tests
+/// must be plain `#[test]`, never `#[tokio::test]`.
+fn block_on_control<R>(future: impl Future<Output = Result<R, String>>) -> Result<R, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not start the control runtime: {error}"))?;
+    runtime.block_on(future)
+}
+
+/// The live board identity + firmware version, read under a fresh
+/// session (H5-control, `upload_firmware` step 1).
+struct LiveBoardInfo {
+    /// Board id (`AA:BB:…` MAC), as the session recorded it.
+    board_id: String,
+    /// Live firmware version from the session's `GET_CAPS`.
+    firmware: (u8, u8, u8),
+}
+
+/// Read the live board identity + firmware version under a fresh
+/// session (H5-control, `upload_firmware` step 1). Synchronous on
+/// purpose: it only reads what the session already authenticated —
+/// the caller wraps it in [`std::future::ready`] at the call site.
+fn op_live_board_info<T, K>(session: &mut BoardSession<K, T>) -> Result<LiveBoardInfo, String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let Some(caps) = session.caps() else {
+        return Err("session has no GET_CAPS reply — the session did not activate".to_string());
+    };
+    Ok(LiveBoardInfo {
+        board_id: session.board_id().to_string(),
+        firmware: caps.firmware,
+    })
+}
+
+/// `SET_PASSWORD` under a fresh session (H5-control): change the
+/// board AP password, then store the same password as the Wi-Fi / OTA
+/// password (the AP password and the `WebOTA` password are one
+/// credential — a stale stored password would 401 later uploads).
+/// If the keystore update fails the error says so plainly: the board
+/// password DID change, only the local record failed.
+async fn op_set_password<T, K>(
+    session: &mut BoardSession<K, T>,
+    password: String,
+) -> Result<(), String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    {
+        let Some(client) = session.control_client_mut() else {
+            return Err("session has no control client — the session did not activate".to_string());
+        };
+        client
+            .set_password(password.as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let board_id = session.board_id().to_string();
+    session
+        .keystore()
+        .store_wifi_password(&board_id, &password)
+        .map_err(|error| {
+            format!(
+                "board password changed, but the new password could not be stored ({error}) — \
+                 re-pair the board before the next firmware upload"
+            )
+        })?;
+    Ok(())
+}
+
+/// `REBOOT` under a fresh session (H5-control). The reply arrives
+/// before the reboot.
+async fn op_reboot<T, K>(session: &mut BoardSession<K, T>) -> Result<(), String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let Some(client) = session.control_client_mut() else {
+        return Err("session has no control client — the session did not activate".to_string());
+    };
+    client.reboot().await.map_err(|error| error.to_string())
+}
+
+/// Read the board's whole live config blob under a fresh session
+/// (H5-control, `get_config` / `get_pin_map`): chunked `GET_CFG`
+/// via a throwaway transaction client (no state change).
+async fn op_read_config_blob<T, K>(session: &mut BoardSession<K, T>) -> Result<Vec<u8>, String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let Some(client) = session.take_control_client() else {
+        return Err("session has no control client — the session did not activate".to_string());
+    };
+    let mut txn = ConfigTransaction::new(client);
+    let result = txn
+        .read_current_blob()
+        .await
+        .map_err(|error| error.to_string());
+    let client = txn.into_inner();
+    session.restore_control_client(client);
+    result
+}
+
+/// Run one config-transaction step under a fresh session, taking the
+/// control client out of the session for the step and handing it back
+/// before the session closes (so the key is still zeroized exactly
+/// once, by [`BoardSession::close`]).
+///
+/// Every step returns the new snapshot alongside its outcome — the
+/// snapshot is saved even when the step fails, so a failed stage
+/// (state back to `Idle`) or a timed-out confirm (state still
+/// `Committed`) is recorded too, never lost.
+async fn op_stage_config<T, K>(
+    session: &mut BoardSession<K, T>,
+    snapshot: ConfigTxnSnapshot,
+    blob: Vec<u8>,
+) -> Result<(Result<(), String>, ConfigTxnSnapshot), String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let Some(client) = session.take_control_client() else {
+        return Ok((
+            Err("session has no control client — the session did not activate".to_string()),
+            snapshot,
+        ));
+    };
+    let mut txn = ConfigTransaction::resume(client, snapshot);
+    let result = txn.stage(&blob).await.map_err(|error| error.to_string());
+    let snapshot = txn.snapshot();
+    let client = txn.into_inner();
+    session.restore_control_client(client);
+    Ok((result, snapshot))
+}
+
+/// `COMMIT` under a fresh session (H5-control, `commit_config`).
+async fn op_commit_config<T, K>(
+    session: &mut BoardSession<K, T>,
+    snapshot: ConfigTxnSnapshot,
+) -> Result<(Result<(), String>, ConfigTxnSnapshot), String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let Some(client) = session.take_control_client() else {
+        return Ok((
+            Err("session has no control client — the session did not activate".to_string()),
+            snapshot,
+        ));
+    };
+    let mut txn = ConfigTransaction::resume(client, snapshot);
+    let result = txn.commit().await.map_err(|error| error.to_string());
+    let snapshot = txn.snapshot();
+    let client = txn.into_inner();
+    session.restore_control_client(client);
+    Ok((result, snapshot))
+}
+
+/// `CONFIRM` under a fresh session (H5-control, `confirm_config`).
+async fn op_confirm_config<T, K>(
+    session: &mut BoardSession<K, T>,
+    snapshot: ConfigTxnSnapshot,
+) -> Result<(Result<(), String>, ConfigTxnSnapshot), String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let Some(client) = session.take_control_client() else {
+        return Ok((
+            Err("session has no control client — the session did not activate".to_string()),
+            snapshot,
+        ));
+    };
+    let mut txn = ConfigTransaction::resume(client, snapshot);
+    let result = txn.confirm().await.map_err(|error| error.to_string());
+    let snapshot = txn.snapshot();
+    let client = txn.into_inner();
+    session.restore_control_client(client);
+    Ok((result, snapshot))
+}
+
+/// `REVERT` + read-back verify under a fresh session (H5-control,
+/// `rollback_config`).
+async fn op_rollback_config<T, K>(
+    session: &mut BoardSession<K, T>,
+    snapshot: ConfigTxnSnapshot,
+) -> Result<(Result<(), String>, ConfigTxnSnapshot), String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let Some(client) = session.take_control_client() else {
+        return Ok((
+            Err("session has no control client — the session did not activate".to_string()),
+            snapshot,
+        ));
+    };
+    let mut txn = ConfigTransaction::resume(client, snapshot);
+    let result = txn.rollback().await.map_err(|error| error.to_string());
+    let snapshot = txn.snapshot();
+    let client = txn.into_inner();
+    session.restore_control_client(client);
+    Ok((result, snapshot))
+}
+
+/// Stage + `COMMIT` a pin map under one fresh session (H5-control,
+/// `set_pin_map`): read the live blob, merge the submitted map into
+/// it (role-based, see [`merge_pin_map_into_blob`]), then stage +
+/// commit, so the editor's 30 s confirm bar follows immediately.
+///
+/// A merge failure is not a control error — it is a validation
+/// verdict: the returned [`PinMapValidation`] is `valid: false` with
+/// the reason, and nothing is staged. A stage/commit failure is an
+/// [`Err`] (the board was touched and the outcome is unknown).
+async fn op_stage_and_commit_pin_map<T, K>(
+    session: &mut BoardSession<K, T>,
+    snapshot: ConfigTxnSnapshot,
+    pins: Vec<PinAssignment>,
+) -> Result<(Result<PinMapValidation, String>, ConfigTxnSnapshot), String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let Some(client) = session.take_control_client() else {
+        return Ok((
+            Err("session has no control client — the session did not activate".to_string()),
+            snapshot,
+        ));
+    };
+    let mut txn = ConfigTransaction::resume(client, snapshot);
+    let result = async {
+        let live = txn
+            .read_current_blob()
+            .await
+            .map_err(|error| error.to_string())?;
+        let live_blob = ConfigBlob::decode(&live).map_err(|error| {
+            format!("board returned a config blob that does not decode: {error}")
+        })?;
+        let merged = match merge_pin_map_into_blob(&live_blob, &pins) {
+            Ok(blob) => blob,
+            Err(error) => {
+                return Ok(PinMapValidation {
+                    valid: false,
+                    errors: vec![error],
+                    warnings: Vec::new(),
+                });
+            }
+        };
+        let merged_bytes = merged
+            .encode()
+            .map_err(|error| format!("merged pin map could not be encoded: {error}"))?;
+        txn.stage(&merged_bytes)
+            .await
+            .map_err(|error| error.to_string())?;
+        txn.commit().await.map_err(|error| error.to_string())?;
+        Ok(PinMapValidation {
+            valid: true,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
+    .await;
+    let snapshot = txn.snapshot();
+    let client = txn.into_inner();
+    session.restore_control_client(client);
+    Ok((result, snapshot))
+}
+
+/// Spawns the transport forwarder task for `kind`: it builds the
+/// transport, runs the session activator on it (H5 — signed
+/// `GET_CAPS` first, gate opens only on success), forwards stream
+/// frames into the engine's frame channel, pumps status packets into
+/// the engine's status channel (H1 condition 12), and rebuilds the
+/// transport every 2 s after a loss until aborted (disconnect /
+/// engine stop). The task never panics on transport errors — every
+/// failure is noted on the state and retried.
+/// Stream frames are held while the HMAC session gate is closed
+/// (SEC-E-14, H1 condition 13) — see [`forward_with_retry`].
+fn spawn_forwarder(
+    state: Arc<AppStateCore>,
+    kind: TransportKind,
+    frame_tx: tokio::sync::mpsc::Sender<StreamFrame>,
+    status_tx: tokio::sync::mpsc::Sender<StatusPacket>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        match kind {
+            TransportKind::Udp => {
+                let config = udp_config_for(&state);
+                forward_with_retry(state, kind, frame_tx, status_tx, || {
+                    UdpTransport::bind(config).ok()
+                })
+                .await;
+            }
+            TransportKind::Serial => {
+                forward_with_retry(state, kind, frame_tx, status_tx, || {
+                    detect_board_port()
+                        .and_then(|port| SerialTransport::open(SerialConfig::new(port)).ok())
+                })
+                .await;
+            }
+        }
+    })
+}
+
+/// Builds the UDP config from settings: the board IP is the
+/// configured `esp_ip` when it parses as an IP literal, else the
+/// `192.168.4.1` default (settings validation already clamps a
+/// non-private `esp_ip` to the default on load, so the fallback here
+/// only fires for a hand-edited store).
+fn udp_config_for(state: &AppStateCore) -> UdpConfig {
+    let esp_ip = state.settings().esp_ip;
+    if let Ok(ip) = esp_ip.parse::<IpAddr>() {
+        UdpConfig::new(ip)
+    } else {
+        state.note_engine_detail(format!(
+            "configured esp_ip '{esp_ip}' is not an IP literal — using default 192.168.4.1"
+        ));
+        UdpConfig::default()
+    }
+}
+
+/// Forwards frames from a transport built by `factory` into the
+/// engine's frame channel, rebuilding the transport every 2 s after
+/// a build failure or a source loss. A full frame channel drops the
+/// newest frame (the engine keeps only the latest frame per tick
+/// anyway) instead of blocking the forwarder. Status packets are
+/// pumped into the engine's status channel after every stream frame
+/// (H1 condition 12) — but only while the session gate is open: the
+/// gate (SEC-E-14, H1 condition 13) holds ALL board data, stream
+/// frames and status packets alike, until a `BoardSession` has
+/// completed its HMAC-verified `GET_CAPS`. Held frames are counted
+/// (never silently dropped) and the gate closes again on transport
+/// loss, so a rebuilt transport must re-authenticate.
+///
+/// Before the frame loop, the session activator (H5) runs on the
+/// freshly built transport ([`activate_session_on`]): flag-1 HELO →
+/// `HELLO` → `pair`/`resume` with a signed `GET_CAPS` first → gate
+/// opens on success. A failed activation does not stop the loop —
+/// the transport is alive and frames are held + counted until a
+/// later activation (reconnect / `begin_pairing`) succeeds. The loop
+/// ends only when the task is aborted.
+async fn forward_with_retry<T, F>(
+    state: Arc<AppStateCore>,
+    kind: TransportKind,
+    frame_tx: tokio::sync::mpsc::Sender<StreamFrame>,
+    status_tx: tokio::sync::mpsc::Sender<StatusPacket>,
+    mut factory: F,
+) where
+    T: SessionTransport,
+    F: FnMut() -> Option<T> + Send,
+{
+    loop {
+        let Some(transport) = factory() else {
+            state.note_engine_transport_error(kind, "transport could not be opened");
+            tokio::time::sleep(rsh_engine::engine::RECONNECT_INTERVAL).await;
+            continue;
+        };
+        state.set_connection(ConnectionState::Connected);
+        state.set_engine_status(
+            EngineTaskStatus::Running {
+                transport: Some(kind),
+            },
+            format!(
+                "transport {} connected — authenticating session (SEC-E-14); frames held until the session gate opens",
+                kind.as_str()
+            ),
+        );
+        // Session activation (H5): signed GET_CAPS first, gate opens
+        // only on success, transport handed back for streaming. A
+        // failed activation returns the transport (gate stays closed,
+        // frames held + counted below); only a transport that died
+        // mid-activation returns None, and that rebuilds like a loss.
+        let Some(mut transport) = activate_session_on(&state, transport, KeyStore::new()).await
+        else {
+            state.close_session_gate();
+            state.clear_session_records();
+            state.set_connection(ConnectionState::Disconnected);
+            state.set_engine_status(
+                EngineTaskStatus::Running { transport: None },
+                format!(
+                    "transport {} lost during session activation — retrying in 2 s (engine keeps ticking, watchdog neutral)",
+                    kind.as_str()
+                ),
+            );
+            tokio::time::sleep(rsh_engine::engine::RECONNECT_INTERVAL).await;
+            continue;
+        };
+        // Event-driven drain: awaiting the source blocks until a frame
+        // arrives; `None` means the source dropped.
+        while let Some(frame) = transport.next_frame().await {
+            // Session gate (SEC-E-14): hold unauthenticated frames —
+            // counted, never silently dropped — before they can reach
+            // the engine, the snapshots, or the output backend.
+            if !state.session_gate_open() {
+                state.note_gate_held_frame();
+                continue;
+            }
+            // Status pump (H1 condition 12): board loss counters and
+            // `btnsEx` reach the engine. A full/closed engine status
+            // channel drops the packet (the engine drains its own
+            // channel every tick; a stale counter is never fatal).
+            while let Some(status) = transport.try_next_status() {
+                let _ = status_tx.try_send(status);
+            }
+            // The frame's cumulative encoder counts are the snapshot's
+            // truth (see `note_frame_encoders`); report them before
+            // handing the frame to the engine.
+            state.note_frame_encoders(frame.encoders, frame.n_enc);
+            if frame_tx.try_send(frame).is_err() {
+                // Channel full (engine behind) or closed (engine
+                // stopping): drop the newest frame, never block.
+            }
+        }
+        // Transport loss ends the session: the gate closes and the
+        // session records are cleared, so the rebuilt transport must
+        // re-authenticate (SEC-E-14).
+        state.close_session_gate();
+        state.clear_session_records();
+        state.set_connection(ConnectionState::Disconnected);
+        state.set_engine_status(
+            EngineTaskStatus::Running { transport: None },
+            format!(
+                "transport {} lost — retrying in 2 s (engine keeps ticking, watchdog neutral)",
+                kind.as_str()
+            ),
+        );
+        tokio::time::sleep(rsh_engine::engine::RECONNECT_INTERVAL).await;
+    }
+}
+
+/// Human-readable detail for a live backend kind, as
+/// [`AppStateCore::output_state`] reports it. The `HIDMaestro` line
+/// always carries the UAC note: the elevated helper runs for the whole
+/// session, so Windows asks on every launch while it is active.
+#[must_use]
+fn live_backend_detail(kind: BackendKind, vjoy_device_id: u32) -> String {
+    match kind {
+        BackendKind::HidMaestro => format!("HIDMaestro — default backend. {UAC_NOTE}"),
+        BackendKind::VJoy => {
+            format!("vJoy device {vjoy_device_id} — fallback backend, no UAC prompt needed.")
+        }
+        BackendKind::None => "No output backend — output is disabled.".to_string(),
+    }
+}
+
+/// Millivolts (`f64`, already range-checked by the caller) to the
+/// profile's `i32` millivolt fields. The value is clamped to the ADC
+/// scale first, so the truncating cast below cannot overflow.
+#[allow(clippy::cast_possible_truncation)]
+fn mv_to_i32(value: f64) -> i32 {
+    value.round().clamp(0.0, 3300.0) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    use rsh_protocol::PinTableEntry;
+    use rsh_security::keystore::KeystoreError;
+
+    /// A test-only recording backend (lives in this test module, never
+    /// in `rsh-output` and never in production code): implements the
+    /// real [`IJoystickOutput`] trait, records every state it is sent,
+    /// and fails every update when `fail` is set.
+    #[derive(Clone)]
+    struct RecordingBackend {
+        sent: Arc<Mutex<Vec<PipelineOutputState>>>,
+        connected: Arc<Mutex<bool>>,
+        fail: Arc<Mutex<bool>>,
+        fail_connect: Arc<Mutex<bool>>,
+    }
+
+    impl RecordingBackend {
+        /// Test-only constructor: the backend plus handles to its
+        /// recorded states and its fail flag.
+        #[allow(clippy::type_complexity)]
+        fn new() -> (Self, Arc<Mutex<Vec<PipelineOutputState>>>, Arc<Mutex<bool>>) {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let connected = Arc::new(Mutex::new(false));
+            let fail = Arc::new(Mutex::new(false));
+            (
+                Self {
+                    sent: Arc::clone(&sent),
+                    connected: Arc::clone(&connected),
+                    fail: Arc::clone(&fail),
+                    fail_connect: Arc::new(Mutex::new(false)),
+                },
+                sent,
+                fail,
+            )
+        }
+
+        /// Makes every later `try_connect` fail (mock driver missing).
+        fn set_fail_connect(&self, fail: bool) {
+            *self
+                .fail_connect
+                .lock()
+                .expect("fail_connect lock poisoned") = fail;
+        }
+    }
+
+    impl IJoystickOutput for RecordingBackend {
+        fn name(&self) -> &'static str {
+            "RecordingBackend"
+        }
+
+        fn is_connected(&self) -> bool {
+            *self.connected.lock().expect("connected lock poisoned")
+        }
+
+        fn try_connect(&mut self) -> Result<(), VJoyError> {
+            if *self
+                .fail_connect
+                .lock()
+                .expect("fail_connect lock poisoned")
+            {
+                return Err(VJoyError::DriverNotFound("mock connect failed".to_string()));
+            }
+            *self.connected.lock().expect("connected lock poisoned") = true;
+            Ok(())
+        }
+
+        fn disconnect(&mut self) {
+            *self.connected.lock().expect("connected lock poisoned") = false;
+        }
+
+        fn update(&mut self, state: &ProcessedState) -> Result<(), VJoyError> {
+            if !self.is_connected() {
+                return Err(VJoyError::NotConnected);
+            }
+            if *self.fail.lock().expect("fail lock poisoned") {
+                return Err(VJoyError::UpdateFailed(1));
+            }
+            self.sent.lock().expect("sent lock poisoned").push(*state);
+            Ok(())
+        }
+
+        fn send_neutral(&mut self) -> Result<(), VJoyError> {
+            if !self.is_connected() {
+                return Ok(());
+            }
+            self.sent
+                .lock()
+                .expect("sent lock poisoned")
+                .push(PipelineOutputState::neutral());
+            Ok(())
+        }
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        // Unique per call: tests run in parallel and must never share a
+        // store directory (a shared dir races `remove_dir_all` against
+        // another test's live store).
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rsh-g0-state-test-{}-{name}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    fn test_state() -> (Arc<AppStateCore>, PathBuf) {
+        let dir = test_dir("main");
+        let store = ProfileStore::open(&dir).expect("open test store");
+        (Arc::new(AppStateCore::with_null_sink(store)), dir)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn test_state_with_recording() -> (
+        Arc<AppStateCore>,
+        Arc<Mutex<Vec<PipelineOutputState>>>,
+        Arc<Mutex<bool>>,
+    ) {
+        let dir = test_dir("recording");
+        let store = ProfileStore::open(&dir).expect("open test store");
+        let (backend, sent, fail) = RecordingBackend::new();
+        let state = Arc::new(AppStateCore::new(
+            store,
+            Box::new(backend),
+            "test recording backend",
+        ));
+        (state, sent, fail)
+    }
+
+    fn test_frame(steering_deg: f64) -> FrameInput {
+        FrameInput {
+            steering_deg,
+            pedals: PedalSnapshot {
+                accel: 0.5,
+                brake: 0.0,
+                clutch: None,
+            },
+            encoder_counts: [0; MAX_ENCODERS],
+            n_enc: 0,
+            output: PipelineOutputState::neutral(),
+            metrics: EngineMetrics::new(),
+        }
+    }
+
+    fn activate_first_profile(state: &AppStateCore) -> String {
+        let first = state
+            .list_profiles()
+            .into_iter()
+            .next()
+            .expect("default profile exists");
+        let activated = state
+            .activate_profile(&first.id)
+            .expect("activate default profile");
+        assert!(activated.active);
+        activated.id
+    }
+
+    #[test]
+    fn null_sink_state_reports_not_connected_and_not_sent() {
+        let (state, _dir) = test_state();
+        assert_eq!(state.backend_name(), "NullSink");
+        let initial = state.output_state();
+        assert_eq!(initial.backend, "NullSink");
+        assert!(!initial.connected);
+        assert_eq!(initial.enabled, Some(true)); // settings default
+        assert!(initial.detail.contains("no output backend installed"));
+
+        // Disabling with no device connected sends nothing, and says
+        // so honestly.
+        let disabled = state.set_output_enabled(false);
+        assert_eq!(disabled.enabled, Some(false));
+        assert!(!disabled.connected);
+        assert!(
+            disabled.detail.contains("not connected"),
+            "detail: {}",
+            disabled.detail
+        );
+        // Enabling attempts a connect, which fails honestly — nothing
+        // is delivered.
+        let enabled = state.set_output_enabled(true);
+        assert_eq!(enabled.enabled, Some(true));
+        assert!(!enabled.connected);
+        assert!(
+            enabled.detail.contains("connect failed"),
+            "detail: {}",
+            enabled.detail
+        );
+    }
+
+    #[test]
+    fn recording_backend_actuation_is_real() {
+        let (state, sent, fail) = test_state_with_recording();
+        // Enable acquires the device and sends the last output (neutral).
+        let enabled = state.set_output_enabled(true);
+        assert!(enabled.connected);
+        assert_eq!(sent.lock().expect("sent lock").len(), 1);
+        assert_eq!(
+            *sent.lock().expect("sent lock").last().unwrap(),
+            PipelineOutputState::neutral()
+        );
+        // Ingest a deflected output, re-enable: the last output is resent.
+        let mut last = PipelineOutputState::neutral();
+        last.steering = 0.5;
+        let _ = state.ingest_frame(FrameInput {
+            output: last,
+            ..test_frame(45.0)
+        });
+        let _ = state.set_output_enabled(true);
+        let sent_states = sent.lock().expect("sent lock").clone();
+        assert_eq!(sent_states.len(), 2);
+        assert_eq!(sent_states[1], last);
+        // Disable → neutral reaches the backend, device released.
+        let disabled = state.set_output_enabled(false);
+        assert!(!disabled.connected);
+        assert_eq!(disabled.enabled, Some(false));
+        let sent_states = sent.lock().expect("sent lock").clone();
+        assert_eq!(sent_states.len(), 3);
+        assert_eq!(sent_states[2], PipelineOutputState::neutral());
+        // A failing update is reported, not hidden (the connect still
+        // succeeds, so the backend stays connected).
+        *fail.lock().expect("fail lock") = true;
+        let enabled = state.set_output_enabled(true);
+        assert!(enabled.connected);
+        assert!(
+            enabled.detail.contains("update failed"),
+            "detail: {}",
+            enabled.detail
+        );
+    }
+
+    #[test]
+    fn shutdown_neutral_is_attempted_and_honestly_reported() {
+        // Recording backend, connected: neutral IS sent, stop was not
+        // signalled (no engine task registered — the None path), and
+        // the device is released afterwards.
+        let (state, sent, _fail) = test_state_with_recording();
+        let _ = state.set_output_enabled(true); // connect
+        let outcome = state.shutdown();
+        assert!(!outcome.stop_signalled);
+        assert!(outcome.neutral_sent);
+        assert_eq!(
+            *sent.lock().expect("sent lock").last().unwrap(),
+            PipelineOutputState::neutral()
+        );
+        assert!(!state.output_state().connected);
+        // Recording backend, never connected: neutral NOT sent — there
+        // is no device to send it to, and the trait's disconnected
+        // no-op must not be reported as a delivery.
+        let (cold_state, _sent, _fail) = test_state_with_recording();
+        let outcome = cold_state.shutdown();
+        assert!(!outcome.stop_signalled);
+        assert!(!outcome.neutral_sent);
+        // NullSink: neutral attempted, honestly NOT sent, no panic.
+        let (null_state, _dir) = test_state();
+        let outcome = null_state.shutdown();
+        assert!(!outcome.stop_signalled);
+        assert!(!outcome.neutral_sent);
+        assert_eq!(null_state.output_state().enabled, Some(false));
+    }
+
+    #[test]
+    fn set_output_backend_rejects_unknown_names_and_persists_none() {
+        let (state, _dir) = test_state();
+        let error = state
+            .set_output_backend("Sideways")
+            .expect_err("unknown backend must error");
+        assert!(error.contains("unknown output backend"), "{error}");
+        // "none" is a real selection: it succeeds and is persisted.
+        let switched = state
+            .set_output_backend("none")
+            .expect("none is selectable");
+        assert_eq!(switched.backend, "NullSink");
+        assert_eq!(state.settings().output_backend, "None");
+        assert_eq!(state.selected_backend(), BackendKind::None);
+    }
+
+    #[test]
+    fn set_output_backend_without_drivers_fails_honestly_and_keeps_the_old_backend() {
+        let (state, _dir) = test_state();
+        // Linux sandbox: no HIDMaestro sidecar, no vJoy DLL — both the
+        // requested backend and the vJoy fallback fail, and the slot
+        // must be left exactly as it was.
+        let error = state
+            .set_output_backend("HIDMaestro")
+            .expect_err("HIDMaestro must fail without a sidecar");
+        assert!(
+            error.contains("could not switch output backend to HIDMaestro"),
+            "{error}"
+        );
+        assert!(error.contains("vJoy fallback also failed"), "{error}");
+        // The choice is still persisted (the next launch retries it)…
+        assert_eq!(state.settings().output_backend, "HIDMaestro");
+        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
+        // …but the live backend is untouched: still the sink, still
+        // disconnected.
+        assert_eq!(state.backend_name(), "NullSink");
+        assert!(!state.output_state().connected);
+        let error = state
+            .set_output_backend("vJoy")
+            .expect_err("vJoy must fail without a driver");
+        assert!(
+            error.contains("could not switch output backend to vJoy"),
+            "{error}"
+        );
+        assert_eq!(state.backend_name(), "NullSink");
+    }
+
+    #[test]
+    fn list_output_backends_reports_honest_status_on_linux() {
+        let (state, _dir) = test_state();
+        let backends = state.list_output_backends();
+        assert_eq!(backends.len(), 3);
+        let hidmaestro = &backends[0];
+        assert_eq!(hidmaestro.id, "hidmaestro");
+        assert_eq!(hidmaestro.name, "HIDMaestro");
+        assert!(hidmaestro.is_default);
+        assert!(hidmaestro.selected, "settings default is HIDMaestro");
+        assert!(hidmaestro.elevation_required);
+        assert!(
+            hidmaestro
+                .uac_note
+                .as_deref()
+                .is_some_and(|note| note.contains("UAC")),
+            "UAC note is present for HIDMaestro"
+        );
+        assert_eq!(
+            hidmaestro.installed,
+            Some(false),
+            "no sidecar in the sandbox"
+        );
+        assert!(!hidmaestro.active);
+        assert!(!hidmaestro.connected);
+        assert_eq!(hidmaestro.download_url, None);
+        let vjoy = &backends[1];
+        assert_eq!(vjoy.id, "vjoy");
+        assert!(!vjoy.is_default);
+        assert_eq!(vjoy.installed, Some(false), "no vJoy DLL in the sandbox");
+        assert_eq!(vjoy.download_url.as_deref(), Some(VJOY_DOWNLOAD_URL));
+        assert!(!vjoy.elevation_required);
+        assert_eq!(vjoy.uac_note, None);
+        let none = &backends[2];
+        assert_eq!(none.id, "none");
+        assert!(
+            none.active,
+            "the sink is live until a real backend is selected"
+        );
+        assert_eq!(none.installed, Some(true));
+        assert!(!none.connected);
+        assert!(!none.elevation_required);
+    }
+
+    #[test]
+    fn output_state_reports_the_uac_note_for_hidmaestro() {
+        // The detail string is built from the live kind, so even the
+        // sink state documents the rule; the live HIDMaestro detail
+        // (after a real switch on Windows) carries the same note.
+        assert!(live_backend_detail(BackendKind::HidMaestro, 1).contains("UAC"));
+        assert!(live_backend_detail(BackendKind::HidMaestro, 1).contains("every launch"));
+        // vJoy names the absence of a prompt, not the presence of one.
+        assert!(live_backend_detail(BackendKind::VJoy, 1).contains("no UAC prompt"));
+    }
+
+    #[test]
+    fn ingest_builds_snapshots_with_measured_loop_rate_and_encoders() {
+        let (state, _dir) = test_state();
+        // No ticks yet: stats unmeasured, snapshot is the default.
+        let measured = state.engine_stats();
+        assert_eq!(measured.loop_hz, None);
+        assert_eq!(measured.loss_pct, 0.0);
+        assert_eq!(state.snapshot().seq, 0);
+
+        // Two ticks: the loop rate is measured from real tick spacing.
+        let first = state.ingest_frame(test_frame(0.0));
+        assert_eq!(first.seq, 1);
+        assert_eq!(first.stats.loop_hz, None); // one tick cannot define a rate
+        let second = state.ingest_frame(FrameInput {
+            encoder_counts: [10, 0, 0, 0],
+            n_enc: 1,
+            ..test_frame(12.5)
+        });
+        assert_eq!(second.seq, 2);
+        assert_eq!(second.stats.loop_hz, Some(2.0));
+        assert_eq!(second.steering_deg, 12.5);
+        assert_eq!(second.encoders.len(), 1);
+        assert_eq!(second.encoders[0].count, 10);
+        assert_eq!(second.encoders[0].delta, 0); // first sample: baseline
+        // Third tick: encoder +3 → CW press, virtual button 65.
+        let third = state.ingest_frame(FrameInput {
+            encoder_counts: [13, 0, 0, 0],
+            n_enc: 1,
+            ..test_frame(15.0)
+        });
+        assert_eq!(third.seq, 3);
+        assert_eq!(third.encoders[0].delta, 3);
+        assert!(third.encoders[0].cw_pressed);
+        assert_eq!(third.encoder_buttons, vec![65]);
+        assert_eq!(state.snapshot(), third);
+    }
+
+    #[test]
+    fn button_press_edges_come_from_pipeline_diffs() {
+        let (state, _dir) = test_state();
+        let mut pressed = PipelineOutputState::neutral();
+        pressed.buttons = 0b101; // buttons 1 and 3
+        let _ = state.ingest_frame(FrameInput {
+            output: pressed,
+            ..test_frame(0.0)
+        });
+        assert_eq!(
+            state.drain_button_presses(),
+            vec![
+                ButtonPressEvent {
+                    button: 1,
+                    pressed: true
+                },
+                ButtonPressEvent {
+                    button: 3,
+                    pressed: true
+                },
+            ]
+        );
+        // Release button 1 only: exactly one release edge.
+        let mut released = PipelineOutputState::neutral();
+        released.buttons = 0b100;
+        let _ = state.ingest_frame(FrameInput {
+            output: released,
+            ..test_frame(0.0)
+        });
+        assert_eq!(
+            state.drain_button_presses(),
+            vec![ButtonPressEvent {
+                button: 1,
+                pressed: false
+            }]
+        );
+        // No change: no events.
+        let _ = state.ingest_frame(FrameInput {
+            output: released,
+            ..test_frame(0.0)
+        });
+        assert_eq!(state.drain_button_presses(), Vec::<ButtonPressEvent>::new());
+        // Encoder pulse: momentary press edge only (65, true). The
+        // output stays `released` so no physical-button edge sneaks in.
+        let _ = state.ingest_frame(FrameInput {
+            encoder_counts: [0, 0, 0, 0],
+            n_enc: 1,
+            output: released,
+            ..test_frame(0.0)
+        });
+        assert_eq!(state.drain_button_presses(), Vec::<ButtonPressEvent>::new());
+        let _ = state.ingest_frame(FrameInput {
+            encoder_counts: [2, 0, 0, 0],
+            n_enc: 1,
+            output: released,
+            ..test_frame(0.0)
+        });
+        assert_eq!(
+            state.drain_button_presses(),
+            vec![ButtonPressEvent {
+                button: 65,
+                pressed: true
+            }]
+        );
+    }
+
+    #[test]
+    fn snapshot_emitter_runs_at_30hz_without_blocking_ingest() {
+        let (state, _dir) = test_state();
+        let count = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let emitter_state = Arc::clone(&state);
+        let emitter_count = Arc::clone(&count);
+        let emitter_stop = Arc::clone(&stop);
+        let emitter = std::thread::spawn(move || {
+            AppStateCore::run_snapshot_emitter(
+                &emitter_state,
+                |_| {
+                    emitter_count.fetch_add(1, Ordering::Relaxed);
+                },
+                &emitter_stop,
+            );
+        });
+        // 200 engine ticks while the emitter runs: ingest must stay fast.
+        let ingest_start = Instant::now();
+        for _ in 0..200 {
+            let _ = state.ingest_frame(test_frame(0.0));
+        }
+        let ingest_elapsed = ingest_start.elapsed();
+        std::thread::sleep(Duration::from_millis(1000));
+        stop.store(true, Ordering::Relaxed);
+        emitter.join().expect("emitter thread joins");
+        let snapshot_count = count.load(Ordering::Relaxed);
+        assert!(
+            (24..=38).contains(&snapshot_count),
+            "emitted {snapshot_count} snapshots in ~1 s, expected ~30"
+        );
+        assert!(
+            ingest_elapsed < Duration::from_millis(500),
+            "200 ingests took {ingest_elapsed:?} while emitting — engine blocked on UI"
+        );
+    }
+
+    #[test]
+    fn snapshot_emitter_forwards_button_press_events() {
+        let (state, _dir) = test_state();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let emitter_state = Arc::clone(&state);
+        let emitter_events = Arc::clone(&events);
+        let emitter_stop = Arc::clone(&stop);
+        let emitter = std::thread::spawn(move || {
+            AppStateCore::run_snapshot_emitter(
+                &emitter_state,
+                |emit| {
+                    if let SnapshotEmit::ButtonPress(event) = emit {
+                        emitter_events.lock().expect("events lock").push(event);
+                    }
+                },
+                &emitter_stop,
+            );
+        });
+        let mut output = PipelineOutputState::neutral();
+        output.buttons = 0b10; // button 2
+        let _ = state.ingest_frame(FrameInput {
+            output,
+            ..test_frame(0.0)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+        emitter.join().expect("emitter thread joins");
+        let collected = events.lock().expect("events lock").clone();
+        assert_eq!(
+            collected,
+            vec![ButtonPressEvent {
+                button: 2,
+                pressed: true
+            }]
+        );
+    }
+
+    #[test]
+    fn profiles_crud_round_trip_through_state() {
+        let (state, dir) = test_state();
+        assert_eq!(state.list_profiles().len(), 1); // the Default profile
+        assert_eq!(state.active_profile(), None); // nothing active yet
+        let created = state.create_profile("Track Day").expect("create");
+        assert_eq!(created.name, "Track Day");
+        assert_eq!(state.list_profiles().len(), 2);
+        let activated = state
+            .activate_profile(&created.id)
+            .expect("activate created");
+        assert!(activated.active);
+        assert_eq!(state.active_profile().expect("active").id, created.id);
+        let copy = state
+            .duplicate_profile(&created.id)
+            .expect("duplicate created");
+        assert_ne!(copy.id, created.id);
+        assert_eq!(state.list_profiles().len(), 3);
+        state.delete_profile(&copy.id).expect("delete copy");
+        assert_eq!(state.list_profiles().len(), 2);
+        // Unknown ids fail honestly, never silently.
+        assert!(state.activate_profile("nope").is_err());
+        assert!(state.delete_profile("nope").is_err());
+        // Mutations persisted: a fresh store over the same dir sees them.
+        let reopened = ProfileStore::open(&dir).expect("reopen store");
+        assert_eq!(reopened.list().len(), 2);
+        assert_eq!(
+            reopened.active().expect("active after reopen").id,
+            created.id
+        );
+        // Import/export round-trip through real files.
+        let export_path = dir.join("exported-profile.json");
+        state
+            .export_profile(&created.id, export_path.to_str().expect("utf8 path"))
+            .expect("export");
+        assert!(export_path.exists());
+        let imported = state
+            .import_profile(export_path.to_str().expect("utf8 path"))
+            .expect("import");
+        // The store dedups names on import: "Track Day" already exists,
+        // so the import lands as "Track Day (2)".
+        assert_eq!(imported.name, "Track Day (2)");
+        assert_eq!(state.list_profiles().len(), 3);
+    }
+
+    #[test]
+    fn settings_round_trip_and_output_flag_actuates() {
+        let (state, _sent, _fail) = test_state_with_recording();
+        let mut settings = state.settings();
+        assert!(settings.output_enabled);
+        settings.theme = "Dark".to_string();
+        settings.output_enabled = false;
+        let saved = state.set_settings(settings).expect("set settings");
+        assert_eq!(saved.theme, "Dark");
+        assert_eq!(state.settings().theme, "Dark");
+        // Flipping the flag actuated the backend (neutral sent).
+        assert_eq!(state.output_state().enabled, Some(false));
+    }
+
+    #[test]
+    fn backups_and_restore_round_trip() {
+        let (state, dir) = test_state();
+        let created = state.create_profile("Backup Me").expect("create");
+        let backups = state.backup_now().expect("backup now");
+        assert_eq!(backups.len(), 3);
+        // `backup_now` rotates the live file into .bak1 and leaves no
+        // live file behind until the next save.
+        assert!(!backups[0].present);
+        assert!(backups[1].present);
+        // Delete the profile (this save rotates .bak1 into .bak2), then
+        // restore the generation that still holds it.
+        state.delete_profile(&created.id).expect("delete");
+        assert_eq!(state.list_profiles().len(), 1);
+        let bak2 = dir.join("profiles.json.bak2");
+        assert!(bak2.exists());
+        state
+            .restore_backup(bak2.to_str().expect("utf8 path"))
+            .expect("restore bak2");
+        assert_eq!(state.list_profiles().len(), 2);
+        assert!(state.restore_backup("/tmp/not-a-backup.txt").is_err());
+    }
+
+    #[test]
+    fn games_list_and_unknown_game_errors() {
+        let (state, _dir) = test_state();
+        let games = state.list_games();
+        assert_eq!(games.len(), 4); // the catalogue: AC, ACC, iRacing, DR2
+        assert!(games.iter().all(|game| !game.installed)); // Linux sandbox
+        assert!(games.iter().all(|game| !game.running));
+        assert!(games.iter().any(|game| game.id == "assetto-corsa"));
+        let game = state.get_game_state("assetto-corsa").expect("known game");
+        assert!(!game.installed);
+        assert!(state.get_game_state("no-such-game").is_err());
+        // Nothing installed here, so launch fails honestly.
+        let error = state
+            .launch_game("assetto-corsa")
+            .expect_err("launch of a not-installed game must fail");
+        assert!(error.contains("not installed"), "{error}");
+        assert!(state.stop_game("assetto-corsa").is_err());
+    }
+
+    #[test]
+    fn tuning_validates_stores_and_falls_back_to_neutral() {
+        let (state, _dir) = test_state();
+        // Neutral default for a module with no tuning anywhere.
+        let neutral = state.get_tuning("steering");
+        assert_eq!(neutral.deadzone, 0.0);
+        assert_eq!(neutral.curve, 1.0);
+        assert_eq!(neutral.max_mv, 3300.0);
+        // Invalid tuning is rejected, never stored.
+        let mut bad = neutral.clone();
+        bad.module = "brake".to_string();
+        bad.deadzone = 99.0;
+        assert!(state.set_tuning(bad).is_err());
+        assert_eq!(state.get_tuning("brake").deadzone, 0.0);
+        // Valid tuning stores, survives a get, and writes through to
+        // the active profile's stored tuning.
+        let _ = activate_first_profile(&state);
+        let mut tuning = neutral.clone();
+        tuning.module = "brake".to_string();
+        tuning.deadzone = 5.0;
+        tuning.curve = 1.2;
+        tuning.bite_point = Some(0.35);
+        let saved = state.set_tuning(tuning).expect("valid tuning");
+        assert_eq!(saved.bite_point, Some(0.35));
+        assert_eq!(state.get_tuning("brake").deadzone, 5.0);
+        assert_eq!(state.get_tuning("brake").bite_point, Some(0.35));
+    }
+
+    #[test]
+    fn calibration_errors_when_unset_and_round_trips_when_saved() {
+        let (state, _dir) = test_state();
+        assert!(state.get_calibration().is_err()); // no active profile
+        let _ = activate_first_profile(&state);
+        assert!(state.get_calibration().is_err()); // nothing captured yet
+        let mut pedal_min = BTreeMap::new();
+        pedal_min.insert("accel".to_string(), 100.0);
+        pedal_min.insert("brake".to_string(), 120.0);
+        let mut pedal_max = BTreeMap::new();
+        pedal_max.insert("accel".to_string(), 3200.0);
+        pedal_max.insert("brake".to_string(), 3100.0);
+        let calibration = Calibration {
+            steering_center_mv: 1650.0,
+            pedal_min_mv: pedal_min,
+            pedal_max_mv: pedal_max,
+        };
+        let saved = state
+            .save_calibration(calibration)
+            .expect("save calibration");
+        assert_eq!(saved.steering_center_mv, 1650.0);
+        let read_back = state.get_calibration().expect("read calibration");
+        assert_eq!(read_back.steering_center_mv, 1650.0);
+        assert_eq!(read_back.pedal_min_mv.get("accel"), Some(&100.0));
+        assert_eq!(read_back.pedal_max_mv.get("brake"), Some(&3100.0));
+        // Bad ranges fail honestly.
+        let mut bad = read_back.clone();
+        bad.pedal_min_mv.insert("accel".to_string(), 4000.0);
+        assert!(state.save_calibration(bad).is_err());
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Phase G gate wiring: engine spawn + startup backend               */
+    /* ------------------------------------------------------------------ */
+
+    /// Mock backend factories for the startup-activation tests: the
+    /// `HIDMaestro` and vJoy factories build clones of two recording
+    /// backends (shared record), each failing to connect when its flag
+    /// is set.
+    fn mock_factories(hm_fail_connect: bool, vjoy_fail_connect: bool) -> BackendFactories {
+        let (hm, _hm_sent, _hm_fail) = RecordingBackend::new();
+        hm.set_fail_connect(hm_fail_connect);
+        let (vj, _vj_sent, _vj_fail) = RecordingBackend::new();
+        vj.set_fail_connect(vjoy_fail_connect);
+        BackendFactories {
+            hidmaestro: Some(Box::new(move || {
+                Box::new(hm.clone()) as Box<dyn IJoystickOutput>
+            })),
+            vjoy: Some(Box::new(move || {
+                Box::new(vj.clone()) as Box<dyn IJoystickOutput>
+            })),
+            none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
+        }
+    }
+
+    /// Polls `cond` every 20 ms until it holds or `timeout` elapses.
+    fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if cond() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// One stream frame: steering on slot 0, two encoders, the given
+    /// sequence and board timestamp (5 ms apart, 200 Hz spacing).
+    fn test_stream_frame(seq: u16, steer_mv: u16, encoders: &[i16]) -> StreamFrame {
+        StreamFrame::new(
+            seq,
+            u32::from(seq) * 5_000,
+            rsh_protocol::StreamFlags::default(),
+            &[(0, steer_mv)],
+            encoders,
+            0,
+        )
+    }
+
+    /// States the recording backend was sent, cloned out.
+    fn recorded_states(sent: &Arc<Mutex<Vec<PipelineOutputState>>>) -> Vec<PipelineOutputState> {
+        sent.lock().expect("sent lock poisoned").clone()
+    }
+
+    #[test]
+    fn transport_kind_parses_names() {
+        assert_eq!(TransportKind::parse("udp"), Some(TransportKind::Udp));
+        assert_eq!(TransportKind::parse("WiFi"), Some(TransportKind::Udp));
+        assert_eq!(TransportKind::parse("serial"), Some(TransportKind::Serial));
+        assert_eq!(TransportKind::parse("wired"), Some(TransportKind::Serial));
+        assert_eq!(TransportKind::parse("bluetooth"), None);
+        assert_eq!(TransportKind::Udp.as_str(), "udp");
+        assert_eq!(TransportKind::Serial.as_str(), "serial");
+    }
+
+    #[test]
+    fn startup_activation_honors_persisted_hidmaestro_with_mock_backend() {
+        let (state, _dir) = test_state();
+        assert_eq!(
+            state.selected_backend(),
+            BackendKind::HidMaestro,
+            "settings default is HIDMaestro"
+        );
+        let factories = mock_factories(false, false);
+        let outcome = state.activate_startup_backend_with_factories(&factories);
+        assert_eq!(outcome.requested, BackendKind::HidMaestro);
+        assert_eq!(outcome.active, Some(BackendKind::HidMaestro));
+        assert!(!outcome.fell_back);
+        assert_eq!(outcome.reason, None);
+        assert_eq!(state.startup_backend_outcome(), Some(outcome));
+        assert!(state.output_state().connected, "mock backend connected");
+        assert_eq!(state.backend_name(), "RecordingBackend");
+    }
+
+    #[test]
+    fn startup_activation_falls_back_to_vjoy_with_reason_recorded() {
+        let (state, _dir) = test_state();
+        let factories = mock_factories(true, false);
+        let outcome = state.activate_startup_backend_with_factories(&factories);
+        assert_eq!(outcome.requested, BackendKind::HidMaestro);
+        assert_eq!(outcome.active, Some(BackendKind::VJoy));
+        assert!(outcome.fell_back);
+        let reason = outcome.reason.clone().expect("fallback reason recorded");
+        assert!(reason.contains("mock connect failed"), "{reason}");
+        assert_eq!(
+            state
+                .startup_backend_outcome()
+                .expect("outcome recorded")
+                .reason,
+            Some(reason.clone())
+        );
+        let output = state.output_state();
+        assert!(output.connected, "vJoy mock connected after fallback");
+        assert!(
+            output.detail.contains("mock connect failed"),
+            "{}",
+            output.detail
+        );
+        // The persisted choice is still HIDMaestro: the next launch
+        // retries it instead of silently keeping the fallback.
+        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
+        assert_eq!(state.settings().output_backend, "HIDMaestro");
+    }
+
+    #[test]
+    fn startup_activation_both_backends_failing_records_reason_and_stays_on_null_sink() {
+        let (state, _dir) = test_state();
+        let factories = mock_factories(true, true);
+        let outcome = state.activate_startup_backend_with_factories(&factories);
+        assert_eq!(outcome.requested, BackendKind::HidMaestro);
+        assert_eq!(outcome.active, None);
+        let reason = outcome.reason.clone().expect("failure reason recorded");
+        assert!(reason.contains("mock connect failed"), "{reason}");
+        assert_eq!(state.backend_name(), "NullSink");
+        assert!(!state.output_state().connected);
+        assert!(
+            state
+                .output_state()
+                .detail
+                .contains("startup backend activation failed"),
+            "{}",
+            state.output_state().detail
+        );
+        assert!(
+            state.output_state().detail.contains("mock connect failed"),
+            "{}",
+            state.output_state().detail
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn startup_activation_without_drivers_records_failure_honestly() {
+        // Linux sandbox: no HIDMaestro sidecar, no vJoy DLL — the
+        // real factories both fail, and the outcome must say so
+        // instead of silently staying on the NullSink.
+        let (state, _dir) = test_state();
+        let outcome = state.activate_startup_backend();
+        assert_eq!(outcome.requested, BackendKind::HidMaestro);
+        assert_eq!(outcome.active, None);
+        assert!(outcome.reason.is_some(), "reason recorded: {outcome:?}");
+        assert_eq!(state.backend_name(), "NullSink");
+        assert!(!state.output_state().connected);
+    }
+
+    #[test]
+    fn stop_engine_without_start_is_a_noop() {
+        let (state, _dir) = test_state();
+        assert_eq!(state.engine_status(), EngineTaskStatus::Idle);
+        let outcome = state.stop_engine();
+        assert!(!outcome.joined);
+        assert!(outcome.report.is_none());
+    }
+
+    #[test]
+    fn engine_spawn_flows_frames_to_backend_watchdog_neutral_and_bounded_stop() {
+        let (state, sent, _fail) = test_state_with_recording();
+        // Connect the recording backend first: the sink only sends to
+        // a connected backend (output disabled is not a sink error).
+        let _ = state.set_output_enabled(true);
+        state.start_engine().expect("engine starts");
+        // Starting twice is a no-op, not a second engine.
+        state.start_engine().expect("second start is a no-op");
+        assert_eq!(
+            state.engine_status(),
+            EngineTaskStatus::Running { transport: None },
+            "engine runs idle with no transport"
+        );
+        let frame_tx = state
+            .engine_frame_sender()
+            .expect("frame sender after start");
+        for (seq, encoders) in [(0, [0, 0]), (1, [10, -5]), (2, [10, -5])] {
+            let frame = test_stream_frame(seq, 3300, &encoders);
+            // The forwarder reports each frame's encoder counts; a
+            // direct feeder does the same per frame.
+            state.note_frame_encoders(frame.encoders, frame.n_enc);
+            frame_tx.try_send(frame).expect("frame channel open");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            wait_until(Duration::from_secs(5), || recorded_states(&sent)
+                .iter()
+                .any(|s| s.steering > 0.9)),
+            "live frame reached the backend: {:?}",
+            recorded_states(&sent)
+        );
+        assert!(
+            state.snapshot().steering_deg > 400.0,
+            "snapshot shows full-right steering: {:?}",
+            state.snapshot()
+        );
+        let encoders = state.snapshot().encoders;
+        assert_eq!(encoders.len(), 2, "both encoders reported: {encoders:?}");
+        assert_eq!(encoders[0].count, 10, "encoder 0 count: {encoders:?}");
+        assert_eq!(encoders[1].count, -5, "encoder 1 count: {encoders:?}");
+        // Stop feeding: after the 250 ms watchdog the engine sends
+        // neutral on every tick.
+        assert!(
+            wait_until(Duration::from_secs(5), || recorded_states(&sent)
+                .iter()
+                .any(|s| *s == PipelineOutputState::neutral())),
+            "watchdog went NEUTRAL on stale data: {:?}",
+            recorded_states(&sent)
+        );
+        let outcome = state.stop_engine();
+        assert!(outcome.joined, "bounded stop joined");
+        let report = outcome.report.expect("final report delivered");
+        assert!(
+            report.counters.frames_processed >= 3,
+            "frames processed: {}",
+            report.counters.frames_processed
+        );
+        assert_eq!(state.engine_status(), EngineTaskStatus::Stopped);
+        assert_eq!(
+            state
+                .engine_last_report()
+                .expect("last report kept")
+                .counters
+                .frames_processed,
+            report.counters.frames_processed
+        );
+    }
+
+    #[test]
+    fn engine_idle_without_transport_sends_no_fake_frames() {
+        let (state, sent, _fail) = test_state_with_recording();
+        let _ = state.set_output_enabled(true);
+        state.start_engine().expect("engine starts");
+        // The loop rate counts ticks inside a 1 s window, so a full
+        // second of idle ticks must pass before the rate reads ~200.
+        std::thread::sleep(Duration::from_millis(1200));
+        let recorded = recorded_states(&sent);
+        assert!(
+            recorded
+                .iter()
+                .all(|s| *s == PipelineOutputState::neutral()),
+            "idle engine sends only neutral, never fake input: {recorded:?}"
+        );
+        // The loop rate is measured from the real ticks, even idle.
+        let engine_stats = state.engine_stats();
+        assert!(
+            engine_stats.loop_hz.is_some_and(|hz| hz > 150.0),
+            "idle loop rate measured (~200 Hz): {engine_stats:?}"
+        );
+        assert_eq!(
+            state.engine_status(),
+            EngineTaskStatus::Running { transport: None }
+        );
+        assert_eq!(
+            state.snapshot().connection,
+            ConnectionState::Disconnected,
+            "no transport, no fake connection"
+        );
+        let outcome = state.stop_engine();
+        assert!(outcome.joined, "idle engine stops bounded");
+        assert_eq!(
+            outcome.report.expect("report").counters.frames_processed,
+            0,
+            "no frames were ever processed"
+        );
+    }
+
+    /// The forwarder binds the fixed stream port 4211, so the two
+    /// UDP forwarder tests serialize on this lock — without it they
+    /// run in parallel, one fails to bind, and its loopback frames
+    /// (UDP, sent while unbound) are lost. Held for the whole test,
+    /// including the bounded engine stop.
+    static UDP_FORWARDER_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Waits until the fixed UDP stream port (4211) is free: the
+    /// previous forwarder test's socket lingers ~100–150 ms after its
+    /// engine stops (the reader thread exits on the shutdown flag),
+    /// and frames sent while the dead socket still holds the port are
+    /// swallowed by it instead of reaching the new forwarder. Probing
+    /// with a throwaway bind is the direct check — a successful probe
+    /// bind means nobody holds the port. Returns false after ~5 s
+    /// (the caller fails loudly instead of testing against a stale
+    /// socket).
+    fn wait_for_stream_port_free() -> bool {
+        wait_until(Duration::from_secs(5), || {
+            std::net::UdpSocket::bind("0.0.0.0:4211").is_ok()
+        })
+    }
+
+    /// Sends one loopback datagram, retrying while the forwarder has
+    /// not bound the stream port yet: a *connected* UDP socket
+    /// reports `ConnectionRefused` until something listens, and the
+    /// supervisor binds asynchronously, so a fixed sleep is a race
+    /// under load. Panics after ~5 s or on any other send error.
+    fn send_loopback_frame(board: &std::net::UdpSocket, frame: &[u8]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match board.send(frame) {
+                Ok(_) => return,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ConnectionRefused
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("fake board sends: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn udp_forwarder_delivers_loopback_frames_to_backend() {
+        let _port = UDP_FORWARDER_PORT.lock().expect("port lock");
+        assert!(
+            wait_for_stream_port_free(),
+            "stream port 4211 still held by a previous test's transport"
+        );
+        let (state, sent, _fail) = test_state_with_recording();
+        // Point the board at loopback so the fake board below is the
+        // expected sender (the sender filter compares IP only).
+        let mut settings = state.settings();
+        settings.esp_ip = "127.0.0.1".to_string();
+        state.set_settings(settings).expect("settings save");
+        let _ = state.set_output_enabled(true);
+        state
+            .connect_transport(TransportKind::Udp)
+            .expect("UDP connect queues");
+        // H1 (SEC-E-14): frames only flow once the session gate is
+        // open — the test stands in for the session owner here.
+        state.open_session_gate();
+        assert!(
+            state.transport_state().session_active,
+            "gate open: {}",
+            state.engine_status_detail()
+        );
+        // Give the forwarder time to bind the stream port.
+        std::thread::sleep(Duration::from_millis(300));
+        // Fake board: a loopback socket sending stream frames at the
+        // transport's fixed stream port (4211).
+        let board = std::net::UdpSocket::bind("127.0.0.1:0").expect("fake board binds");
+        board
+            .connect("127.0.0.1:4211")
+            .expect("fake board connects");
+        let sender = std::thread::spawn(move || {
+            for seq in 0..50u16 {
+                let frame = test_stream_frame(seq, 3300, &[]);
+                send_loopback_frame(&board, &frame.encode());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        assert!(
+            wait_until(Duration::from_secs(20), || recorded_states(&sent)
+                .iter()
+                .any(|s| s.steering > 0.9)),
+            "loopback UDP frames reached the backend: {:?}",
+            recorded_states(&sent)
+        );
+        assert_eq!(
+            state.engine_status(),
+            EngineTaskStatus::Running {
+                transport: Some(TransportKind::Udp),
+            },
+            "UDP transport live: {}",
+            state.engine_status_detail()
+        );
+        sender.join().expect("sender thread joins");
+        let outcome = state.stop_engine();
+        assert!(outcome.joined, "engine stops bounded after UDP");
+        assert!(
+            outcome.report.expect("report").counters.frames_processed >= 1,
+            "at least one loopback frame processed"
+        );
+    }
+
+    /// H1 (SEC-E-14 + conditions 11/12): one loopback run proving
+    /// the session gate, the status pump, and the gate lifecycle.
+    /// Serialized against `udp_forwarder_delivers_loopback_frames_to_backend`
+    /// by `UDP_FORWARDER_PORT` — both bind the fixed stream port 4211.
+    #[test]
+    fn session_gate_holds_frames_status_pump_and_disconnect() {
+        use rsh_protocol::stream::StatusPacket;
+        let _port = UDP_FORWARDER_PORT.lock().expect("port lock");
+        assert!(
+            wait_for_stream_port_free(),
+            "stream port 4211 still held by a previous test's transport"
+        );
+        let (state, sent, _fail) = test_state_with_recording();
+        let mut settings = state.settings();
+        settings.esp_ip = "127.0.0.1".to_string();
+        state.set_settings(settings).expect("settings save");
+        let _ = state.set_output_enabled(true);
+        state
+            .connect_transport(TransportKind::Udp)
+            .expect("UDP connect queues");
+        std::thread::sleep(Duration::from_millis(300));
+        let board = std::net::UdpSocket::bind("127.0.0.1:0").expect("fake board binds");
+        board
+            .connect("127.0.0.1:4211")
+            .expect("fake board connects");
+        // Phase 1 — gate closed: frames are held, counted, and reach
+        // neither the backend nor the engine.
+        for seq in 0..10u16 {
+            let frame = test_stream_frame(seq, 3300, &[]);
+            send_loopback_frame(&board, &frame.encode());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        // The engine still emits its own neutral idle ticks while the
+        // gate is closed — the gate proof is that every recorded
+        // state is neutral (no transport frame reached the engine).
+        assert!(
+            recorded_states(&sent)
+                .iter()
+                .all(|s| *s == PipelineOutputState::neutral()),
+            "closed gate must hold every frame: {:?}",
+            recorded_states(&sent)
+        );
+        // H5: the forwarder runs the session activator first (~1 s
+        // HELLO wait with no board answering), so the held count
+        // lands once the frame loop starts — the frames sit in the
+        // transport channel until then, still held, never leaked.
+        // The 20 s bound is sandbox margin (timers run ~2–5× slow
+        // under parallel load); the assertion itself is unchanged.
+        assert!(
+            wait_until(Duration::from_secs(20), || state.session_gate_held_frames()
+                >= 10),
+            "held frames must be counted: {}",
+            state.session_gate_held_frames()
+        );
+        assert!(
+            !state.transport_state().session_active,
+            "gate closed until a session authenticates"
+        );
+        // Phase 2 — gate open: frames flow to the backend, and a
+        // status packet pumped after a frame reaches the snapshot.
+        state.open_session_gate();
+        let status = StatusPacket {
+            seq: 0,
+            uptime_ms: 0,
+            rssi: 0,
+            battery_pct: 255,
+            supply_mv: 0,
+            heap: 0,
+            overruns: 0,
+            max_cycle_us: 0,
+            governor: 0,
+            reset_reason: 1,
+            cfg_crc: 0,
+            cfg_ver: 0,
+            seq_gap: 7,
+            tx_fail: 3,
+            btns_ex: None,
+        };
+        send_loopback_frame(&board, &status.encode());
+        for seq in 10..30u16 {
+            let frame = test_stream_frame(seq, 3300, &[]);
+            send_loopback_frame(&board, &frame.encode());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            wait_until(Duration::from_secs(20), || recorded_states(&sent)
+                .iter()
+                .any(|s| s.steering > 0.9)),
+            "open gate must deliver frames: {:?}",
+            recorded_states(&sent)
+        );
+        assert!(
+            wait_until(Duration::from_secs(20), || state.snapshot().seq_gap == 7
+                && state.snapshot().tx_fail == 3),
+            "status pump must forward seq_gap/tx_fail: seq_gap={} tx_fail={}",
+            state.snapshot().seq_gap,
+            state.snapshot().tx_fail
+        );
+        // Phase 3 — disconnect closes the gate: a later reconnect is
+        // a new session and must re-authenticate.
+        let _ = state.disconnect_transport();
+        assert!(
+            !state.session_gate_open(),
+            "disconnect must close the session gate"
+        );
+        let outcome = state.stop_engine();
+        assert!(outcome.joined, "engine stops bounded after UDP");
+    }
+
+    /// H1 condition 11: the sink feeds the engine's live per-tick
+    /// metrics into the snapshot (not "unmeasured" forever).
+    #[test]
+    fn per_tick_metrics_reach_the_snapshot() {
+        let (state, _sent, _fail) = test_state_with_recording();
+        let mut metrics = EngineMetrics::new();
+        metrics.record_inter_arrival_jitter(100);
+        metrics.record_output_latency(200);
+        let output = PipelineOutputState::neutral();
+        state.ingest_engine_output(&output, &metrics);
+        let snapshot_stats = state.snapshot().stats;
+        assert_eq!(
+            snapshot_stats.jitter_ms_p99,
+            Some(0.1),
+            "jitter p99 100 µs must read 0.1 ms: {snapshot_stats:?}"
+        );
+        assert_eq!(
+            snapshot_stats.output_latency_ms,
+            Some(0.2),
+            "output latency p99 200 µs must read 0.2 ms: {snapshot_stats:?}"
+        );
+    }
+
+    #[test]
+    fn serial_connect_without_board_fails_honestly_or_runs_idle() {
+        // Sandbox/CI machines usually have no serial board: the
+        // connect errors honestly and the engine never starts. On a
+        // machine with a serial port it starts the engine instead —
+        // either way the outcome is honest and the stop is bounded.
+        let (state, _sent, _fail) = test_state_with_recording();
+        if let Err(error) = state.connect_transport(TransportKind::Serial) {
+            assert!(error.contains("no board serial port"), "{error}");
+            assert_eq!(state.engine_status(), EngineTaskStatus::Idle);
+            let outcome = state.stop_engine();
+            assert!(!outcome.joined, "never started, nothing to join");
+        } else {
+            assert_eq!(
+                state.engine_status(),
+                EngineTaskStatus::Running { transport: None },
+                "serial forwarder retries with no board yet: {}",
+                state.engine_status_detail()
+            );
+            let _ = state.disconnect_transport();
+            let outcome = state.stop_engine();
+            assert!(outcome.joined, "engine stops bounded");
+        }
+    }
+
+    // --- H3: transport request record for the Settings / Setup screens. ---
+
+    #[test]
+    fn transport_request_defaults_to_udp_with_esp_ip() {
+        let (state, _dir) = test_state();
+        assert_eq!(
+            state.transport_request(),
+            (TransportKind::Udp, "192.168.4.1".to_string())
+        );
+    }
+
+    #[test]
+    fn transport_request_records_requested_serial_address() {
+        let (state, _dir) = test_state();
+        state.set_transport_request(TransportKind::Serial, "COM3".to_string());
+        assert_eq!(
+            state.transport_request(),
+            (TransportKind::Serial, "COM3".to_string())
+        );
+    }
+
+    // --- H3: get_transport_state shape (merged UI + session gate). ---
+
+    #[test]
+    fn transport_state_fresh_is_disconnected_wifi_with_esp_ip() {
+        let (state, _dir) = test_state();
+        let reported = state.transport_state();
+        assert_eq!(reported.transport, "wifi");
+        assert_eq!(reported.state, ConnectionState::Disconnected);
+        assert_eq!(reported.address, "192.168.4.1");
+        assert_eq!(reported.error, None);
+        assert!(!reported.session_active);
+        assert_eq!(reported.frames_held_by_gate, 0);
+    }
+
+    #[test]
+    fn transport_state_idle_reports_requested_serial_kind() {
+        let (state, _dir) = test_state();
+        state.set_transport_request(TransportKind::Serial, "COM3".to_string());
+        let reported = state.transport_state();
+        assert_eq!(reported.transport, "usb");
+        assert_eq!(reported.state, ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn transport_state_failed_engine_reports_error_verbatim() {
+        let (state, _dir) = test_state();
+        state.set_engine_status(
+            EngineTaskStatus::Failed {
+                reason: "engine supervisor died".to_string(),
+            },
+            "engine supervisor died".to_string(),
+        );
+        let reported = state.transport_state();
+        assert_eq!(reported.state, ConnectionState::Error);
+        assert_eq!(reported.error.as_deref(), Some("engine supervisor died"));
+    }
+
+    #[test]
+    fn transport_state_serializes_to_frontend_shape() {
+        let (state, _dir) = test_state();
+        let json = serde_json::to_string(&state.transport_state()).expect("serialize");
+        assert!(json.contains("\"transport\":\"wifi\""), "{json}");
+        assert!(json.contains("\"state\":\"disconnected\""), "{json}");
+        assert!(json.contains("\"address\":\"192.168.4.1\""), "{json}");
+        assert!(json.contains("\"error\":null"), "{json}");
+    }
+
+    // --- H3: corrupt-store repair at open (Phase G condition 16). ---
+
+    #[test]
+    fn open_with_repair_repairs_corrupt_store_from_bak1() {
+        let dir = test_dir("repair");
+        {
+            let mut store = ProfileStore::open(&dir).expect("open test store");
+            store.create("GT3 Setup").expect("create profile");
+            store.save().expect("save");
+        }
+        std::fs::copy(dir.join("profiles.json"), dir.join("profiles.json.bak1"))
+            .expect("stage bak1");
+        std::fs::write(dir.join("profiles.json"), "{not json").expect("corrupt");
+        assert!(ProfileStore::open(&dir).is_err());
+        let (opened, notice) = AppStateCore::open_with_null_sink_repair(&dir);
+        let state = opened.expect("repaired open succeeds");
+        let notice = notice.expect("repair notice");
+        assert!(notice.contains("bak1"), "{notice}");
+        assert!(state.list_profiles().iter().any(|p| p.name == "GT3 Setup"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_with_repair_fails_honestly_without_backups() {
+        let dir = test_dir("repair-none");
+        std::fs::write(dir.join("profiles.json"), "{not json").expect("corrupt");
+        let (opened, notice) = AppStateCore::open_with_null_sink_repair(&dir);
+        assert!(opened.is_err());
+        assert_eq!(notice, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- H5: session-owner activator (SEC-E-14). ---
+
+    /// Board MAC used by the activator tests (and the matching board id).
+    const ACT_BOARD_ID: &str = "AA:BB:CC:DD:EE:FF";
+    /// Board MAC bytes.
+    const ACT_BOARD_MAC: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    /// First-boot device key disclosed by the board.
+    const ACT_KEY_ONE: [u8; 32] = [0x11; 32];
+    /// A different key (wrong board / evil twin).
+    const ACT_KEY_TWO: [u8; 32] = [0x22; 32];
+    /// First session nonce.
+    const ACT_NONCE_ONE: [u8; 16] = [0xA1; 16];
+    /// Fresh nonce after a reboot / new session.
+    const ACT_NONCE_TWO: [u8; 16] = [0xA2; 16];
+    /// Wi-Fi password disclosed on first pairing (24 ASCII bytes).
+    const ACT_WIFI_PASSWORD: &[u8; 24] = b"Ab3dEf6hJk9mNp2rSt5vXy8z";
+
+    /// In-memory [`KeyStoreLike`] for the activator tests (never
+    /// touches the OS store). Entries live behind an [`Arc`] so the
+    /// test keeps a handle to the store the activator consumed.
+    /// One entry per (service, account) pair, keyed exactly like the
+    /// real `KeyStore` (`"RSH"`, `"board:<BOARD_ID>"`).
+    type ActStoreEntries = HashMap<(String, String), Vec<u8>>;
+
+    #[derive(Clone)]
+    struct ActKeyStore {
+        entries: Arc<Mutex<ActStoreEntries>>,
+    }
+
+    impl ActKeyStore {
+        fn new() -> Self {
+            Self {
+                entries: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+
+        fn seed_device_key(&self, board_id: &str, key: [u8; 32]) {
+            let account = format!("board:{}", board_id.trim().to_ascii_uppercase());
+            self.entries
+                .lock()
+                .expect("test store lock")
+                .insert(("RSH".to_owned(), account), key.to_vec());
+        }
+
+        /// The stored Wi-Fi password for `board_id`, if one was stored
+        /// (test inspection — the [`KeyStoreLike`] trait has no getter).
+        fn wifi_password(&self, board_id: &str) -> Option<String> {
+            let account = format!("board:{}:wifi", board_id.trim().to_ascii_uppercase());
+            self.entries
+                .lock()
+                .expect("test store lock")
+                .get(&("RSH".to_owned(), account))
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        }
+    }
+
+    impl KeyStoreLike for ActKeyStore {
+        fn store_device_key(&self, board_id: &str, key: &[u8; 32]) -> Result<(), KeystoreError> {
+            let account = format!("board:{}", board_id.trim().to_ascii_uppercase());
+            self.entries
+                .lock()
+                .expect("test store lock")
+                .insert(("RSH".to_owned(), account), key.to_vec());
+            Ok(())
+        }
+
+        fn get_device_key(&self, board_id: &str) -> Result<[u8; 32], KeystoreError> {
+            let account = format!("board:{}", board_id.trim().to_ascii_uppercase());
+            let entries = self.entries.lock().expect("test store lock");
+            let blob = entries
+                .get(&("RSH".to_owned(), account))
+                .ok_or(KeystoreError::NotFound)?;
+            let mut key = [0u8; 32];
+            key.copy_from_slice(blob);
+            Ok(key)
+        }
+
+        fn delete_device_key(&self, board_id: &str) -> Result<(), KeystoreError> {
+            let account = format!("board:{}", board_id.trim().to_ascii_uppercase());
+            self.entries
+                .lock()
+                .expect("test store lock")
+                .remove(&("RSH".to_owned(), account))
+                .map_or(Err(KeystoreError::NotFound), |_| Ok(()))
+        }
+
+        fn store_wifi_password(&self, board_id: &str, password: &str) -> Result<(), KeystoreError> {
+            let account = format!("board:{}:wifi", board_id.trim().to_ascii_uppercase());
+            self.entries
+                .lock()
+                .expect("test store lock")
+                .insert(("RSH".to_owned(), account), password.as_bytes().to_vec());
+            Ok(())
+        }
+
+        fn delete_wifi_password(&self, board_id: &str) -> Result<(), KeystoreError> {
+            let account = format!("board:{}:wifi", board_id.trim().to_ascii_uppercase());
+            self.entries
+                .lock()
+                .expect("test store lock")
+                .remove(&("RSH".to_owned(), account))
+                .map_or(Err(KeystoreError::NotFound), |_| Ok(()))
+        }
+    }
+
+    /// The fake board's config state, shared across the fresh sessions
+    /// of one test (one board, many sessions — D30): what `GET_CFG`
+    /// returns, the last-good blob `REVERT` restores, and the staged
+    /// buffer `SET_CFG` accumulates into. `COMMIT` live-applies the
+    /// staged blob (so `GET_CFG` returns it while the confirm window
+    /// runs); `CONFIRM` makes it the last-good blob; `REVERT`
+    /// restores the last-good blob and discards the staged buffer.
+    struct FakeBoardConfig {
+        /// What `GET_CFG` returns.
+        current: Vec<u8>,
+        /// The last-good blob (`CONFIRM` saves it, `REVERT` restores it).
+        last_good: Vec<u8>,
+        /// Bytes staged by `SET_CFG` so far.
+        staged: Vec<u8>,
+        /// Total length the staged blob will have (0 = nothing staged).
+        staged_total: usize,
+    }
+
+    impl FakeBoardConfig {
+        /// The factory blob as both the live and the last-good config.
+        fn new() -> Self {
+            let blob = rsh_protocol::factory_default_blob()
+                .encode()
+                .expect("factory blob encodes");
+            Self {
+                current: blob.clone(),
+                last_good: blob,
+                staged: Vec::new(),
+                staged_total: 0,
+            }
+        }
+    }
+
+    /// A fake board as a session transport: answers `HELLO`s from a
+    /// configured reply, verifies control tags with its own key/nonce
+    /// (like the `FakeBoard` in `rsh-transport/src/session.rs`), and
+    /// serves stream frames from a channel. The `HELLO` behaviour is
+    /// switchable per test: answer always, never answer (forces the
+    /// activator's timeout), or report the transport closed.
+    ///
+    /// The sent control frames and the board config live behind
+    /// [`Arc`]s so a test keeps them after the transport is consumed
+    /// by a control session (the helper drops the transport when the
+    /// session closes): [`FakeSessionTransport::sent_log`] for the
+    /// frames, [`FakeSessionTransport::board`] for the config — the
+    /// board handle can also be shared across several fresh sessions
+    /// against the "same" board via [`FakeSessionTransport::new_with_board`].
+    struct FakeSessionTransport {
+        key: [u8; 32],
+        nonce: [u8; 16],
+        hello: Option<HelloReply>,
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        board: Arc<Mutex<FakeBoardConfig>>,
+        pending: VecDeque<Vec<u8>>,
+        frame_rx: tokio::sync::mpsc::Receiver<StreamFrame>,
+        status_rx: tokio::sync::mpsc::Receiver<StatusPacket>,
+        helo_requests: Vec<u8>,
+        never_answer_hello: bool,
+        hello_closed: bool,
+    }
+
+    impl FakeSessionTransport {
+        fn new(key: [u8; 32], nonce: [u8; 16], hello: Option<HelloReply>) -> Self {
+            Self::new_with_board(
+                key,
+                nonce,
+                hello,
+                Arc::new(Mutex::new(FakeBoardConfig::new())),
+            )
+        }
+
+        /// Build a fake transport against a shared board (several
+        /// fresh sessions, one board — the H5-control tests use this
+        /// to run stage → commit → confirm across sessions).
+        fn new_with_board(
+            key: [u8; 32],
+            nonce: [u8; 16],
+            hello: Option<HelloReply>,
+            board: Arc<Mutex<FakeBoardConfig>>,
+        ) -> Self {
+            let (_frame_tx, frame_rx) = tokio::sync::mpsc::channel(16);
+            let (_status_tx, status_rx) = tokio::sync::mpsc::channel(16);
+            Self {
+                key,
+                nonce,
+                hello,
+                sent: Arc::new(Mutex::new(Vec::new())),
+                board,
+                pending: VecDeque::new(),
+                frame_rx,
+                status_rx,
+                helo_requests: Vec::new(),
+                never_answer_hello: false,
+                hello_closed: false,
+            }
+        }
+
+        /// The sent control frames (shared: survives the transport).
+        fn sent_log(&self) -> Arc<Mutex<Vec<Vec<u8>>>> {
+            Arc::clone(&self.sent)
+        }
+
+        /// The control frames the activator sent, parsed.
+        fn sent_frames(&self) -> Vec<rsh_protocol::ControlFrame> {
+            let sent = self.sent.lock().expect("sent log lock");
+            sent.iter()
+                .map(|bytes| {
+                    rsh_protocol::ControlFrame::parse_structure(bytes).expect("sent frame parses")
+                })
+                .collect()
+        }
+
+        /// Answer one `GET_CFG` from the board's live blob: the reply
+        /// body is `totalLen u16 | offset u16 | data…`, data clamped
+        /// to the request and to the board's 1019 B per-reply cap.
+        fn board_get_cfg(&self, payload: &[u8]) -> Vec<u8> {
+            if payload.len() < 4 {
+                return Vec::new();
+            }
+            let offset = usize::from(u16::from_le_bytes([payload[0], payload[1]]));
+            let want = usize::from(u16::from_le_bytes([payload[2], payload[3]]));
+            let board = self.board.lock().expect("board lock");
+            let total = board.current.len();
+            let available = total.saturating_sub(offset);
+            let take = want.min(available).min(1019);
+            let mut body = Vec::with_capacity(4 + take);
+            body.extend_from_slice(&u16::try_from(total).unwrap_or(u16::MAX).to_le_bytes());
+            body.extend_from_slice(&u16::try_from(offset).unwrap_or(u16::MAX).to_le_bytes());
+            body.extend_from_slice(&board.current[offset..offset + take]);
+            body
+        }
+
+        /// Stage one `SET_CFG` chunk into the board's staged buffer
+        /// (offset 0 opens a fresh staging buffer of `total` bytes).
+        fn board_set_cfg(&self, payload: &[u8]) {
+            if payload.len() < 8 {
+                return;
+            }
+            let offset = usize::from(u16::from_le_bytes([payload[0], payload[1]]));
+            let total = usize::from(u16::from_le_bytes([payload[2], payload[3]]));
+            let len = usize::from(u16::from_le_bytes([payload[4], payload[5]]));
+            let data = &payload[8..];
+            if data.len() < len {
+                return;
+            }
+            let mut board = self.board.lock().expect("board lock");
+            if offset == 0 {
+                board.staged = vec![0u8; total];
+                board.staged_total = total;
+            }
+            if offset + len <= board.staged.len() {
+                board.staged[offset..offset + len].copy_from_slice(&data[..len]);
+            }
+        }
+
+        /// `COMMIT`: live-apply the staged blob (the board runs it
+        /// while the confirm window is open).
+        fn board_commit(&self) {
+            let mut board = self.board.lock().expect("board lock");
+            if board.staged_total > 0 && board.staged.len() >= board.staged_total {
+                board.current = board.staged[..board.staged_total].to_vec();
+            }
+        }
+
+        /// `CONFIRM`: the live blob becomes the last-good blob.
+        fn board_confirm(&self) {
+            let mut board = self.board.lock().expect("board lock");
+            board.last_good = board.current.clone();
+        }
+
+        /// `REVERT`: restore the last-good blob, discard the staged buffer.
+        fn board_revert(&self) {
+            let mut board = self.board.lock().expect("board lock");
+            board.current = board.last_good.clone();
+            board.staged.clear();
+            board.staged_total = 0;
+        }
+    }
+
+    impl PacketSource for FakeSessionTransport {
+        fn next_frame(&mut self) -> impl Future<Output = Option<StreamFrame>> + Send {
+            self.frame_rx.recv()
+        }
+
+        fn try_next_status(&mut self) -> Option<StatusPacket> {
+            self.status_rx.try_recv().ok()
+        }
+    }
+
+    impl rsh_transport::ControlTransport for FakeSessionTransport {
+        fn send_control(
+            &mut self,
+            bytes: &[u8],
+        ) -> impl Future<Output = Result<(), rsh_transport::TransportError>> + Send {
+            let owned = bytes.to_vec();
+            async move {
+                self.sent.lock().expect("sent log lock").push(owned.clone());
+                let Ok(frame) = rsh_protocol::ControlFrame::parse_structure(&owned) else {
+                    return Ok(());
+                };
+                // A tag that fails under the board's key/nonce is
+                // answered BAD_TAG (tagged with the board's key/nonce,
+                // so the client sees a tag failure too).
+                if rsh_protocol::ControlFrame::verify(&owned, &self.key, &self.nonce).is_err() {
+                    let reply = rsh_protocol::control::build_reply(
+                        &self.key,
+                        &self.nonce,
+                        frame.cmd,
+                        frame.req_id,
+                        frame.counter,
+                        rsh_protocol::control::ErrorCode::BadTag,
+                        &[],
+                    )
+                    .expect("fake-board BAD_TAG reply builds");
+                    self.pending.push_back(reply);
+                    return Ok(());
+                }
+                let body = match frame.cmd {
+                    cmd if cmd == rsh_protocol::control::Opcode::GetCaps as u8 => act_caps_body(),
+                    cmd if cmd == rsh_protocol::control::Opcode::GetCfg as u8 => {
+                        self.board_get_cfg(&frame.payload)
+                    }
+                    cmd if cmd == rsh_protocol::control::Opcode::SetCfg as u8 => {
+                        self.board_set_cfg(&frame.payload);
+                        Vec::new()
+                    }
+                    cmd if cmd == rsh_protocol::control::Opcode::Commit as u8 => {
+                        self.board_commit();
+                        vec![30]
+                    }
+                    cmd if cmd == rsh_protocol::control::Opcode::Confirm as u8 => {
+                        self.board_confirm();
+                        Vec::new()
+                    }
+                    cmd if cmd == rsh_protocol::control::Opcode::Revert as u8 => {
+                        self.board_revert();
+                        Vec::new()
+                    }
+                    _ => Vec::new(),
+                };
+                let reply = rsh_protocol::control::build_reply(
+                    &self.key,
+                    &self.nonce,
+                    frame.cmd,
+                    frame.req_id,
+                    frame.counter,
+                    rsh_protocol::control::ErrorCode::Ok,
+                    &body,
+                )
+                .expect("fake-board reply builds");
+                self.pending.push_back(reply);
+                Ok(())
+            }
+        }
+
+        fn recv_control(
+            &mut self,
+            _timeout: Duration,
+        ) -> impl Future<Output = Result<Vec<u8>, rsh_transport::TransportError>> + Send {
+            std::future::ready(
+                self.pending
+                    .pop_front()
+                    .ok_or(rsh_transport::TransportError::Timeout),
+            )
+        }
+    }
+
+    impl SessionTransport for FakeSessionTransport {
+        fn recv_hello(&mut self) -> impl Future<Output = Option<HelloReply>> + Send {
+            let hello = self.hello.clone();
+            let closed = self.hello_closed;
+            let never = self.never_answer_hello;
+            async move {
+                if closed {
+                    None
+                } else if never {
+                    std::future::pending().await
+                } else {
+                    hello
+                }
+            }
+        }
+
+        fn request_hello(&mut self, session_flag: u8) -> Result<(), String> {
+            self.helo_requests.push(session_flag);
+            Ok(())
+        }
+    }
+
+    /// A `GET_CAPS` body *after* the status byte: fw 4.0.1, proto 2.1,
+    /// 8 axes / 64 buttons / 4 encoders, Wi-Fi channel 6, one pin-table
+    /// entry (pin 34). Mirrors the helper in
+    /// `rsh-transport/src/session.rs` tests.
+    fn act_caps_body() -> Vec<u8> {
+        let mut body = GetCapsReply {
+            status: rsh_protocol::control::ErrorCode::Ok,
+            board_mac: ACT_BOARD_MAC,
+            firmware: (4, 0, 1),
+            protocol: (2, 1),
+            n_axes_max: 8,
+            n_btn_max: 64,
+            n_enc_max: 4,
+            wifi_channel: 6,
+            caps_flags: 0,
+            pin_table: vec![PinTableEntry {
+                pin: 34,
+                kind: 1,
+                module: 1,
+                caps: 0x05,
+            }],
+        }
+        .encode_body();
+        body.remove(0);
+        body
+    }
+
+    /// A `HELLO` reply. `flags` bit0 unpaired, bit3 window open.
+    /// `session_echo` is 1 (answers the activator's new-session HELO)
+    /// unless the test overrides it afterwards.
+    fn act_hello(flags: u8, nonce: [u8; 16], key: [u8; 32], wifi: [u8; 24]) -> HelloReply {
+        HelloReply {
+            flags,
+            session_echo: 1,
+            board_mac: ACT_BOARD_MAC,
+            firmware: (4, 0, 1),
+            nonce,
+            device_key: key,
+            wifi_password: wifi,
+        }
+    }
+
+    /// Unpaired board, window open, disclosing `key`.
+    fn act_pairing_hello(key: [u8; 32], nonce: [u8; 16]) -> HelloReply {
+        act_hello(0x09, nonce, key, *ACT_WIFI_PASSWORD)
+    }
+
+    /// Paired board (no credentials disclosed).
+    fn act_paired_hello(nonce: [u8; 16]) -> HelloReply {
+        act_hello(0x00, nonce, [0u8; 32], [0u8; 24])
+    }
+
+    /// A `GET_CAPS` reply for direct `SessionActivation` construction.
+    fn act_caps() -> GetCapsReply {
+        GetCapsReply {
+            status: rsh_protocol::control::ErrorCode::Ok,
+            board_mac: ACT_BOARD_MAC,
+            firmware: (4, 0, 1),
+            protocol: (2, 1),
+            n_axes_max: 8,
+            n_btn_max: 64,
+            n_enc_max: 4,
+            wifi_channel: 6,
+            caps_flags: 0,
+            pin_table: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn activator_resume_opens_gate_after_signed_get_caps() {
+        let (state, _dir) = test_state();
+        assert!(!state.session_gate_open(), "gate starts closed");
+        let store = ActKeyStore::new();
+        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
+        let transport = FakeSessionTransport::new(
+            ACT_KEY_ONE,
+            ACT_NONCE_TWO,
+            Some(act_paired_hello(ACT_NONCE_TWO)),
+        );
+        let transport = activate_session_on(&state, transport, store)
+            .await
+            .expect("transport survives successful activation");
+        assert!(
+            state.session_gate_open(),
+            "gate opens after signed GET_CAPS: {:?}",
+            state.session_last_error()
+        );
+        let activation = state.session_activation().expect("activation recorded");
+        assert_eq!(activation.board_id, ACT_BOARD_ID);
+        assert_eq!(activation.firmware, (4, 0, 1));
+        assert_eq!(activation.protocol, (2, 1));
+        assert_eq!(state.firmware_version().expect("firmware version"), "4.0.1");
+        assert_eq!(state.session_last_error(), None);
+        // Signed GET_CAPS was the first (and only) control command.
+        let frames = transport.sent_frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].cmd, rsh_protocol::control::Opcode::GetCaps as u8);
+        assert_eq!(frames[0].counter, 0);
+        // The activator asked for a new session (flag-1 HELO) so the
+        // resume runs under a fresh nonce (D30).
+        assert!(
+            transport.helo_requests.contains(&1),
+            "new-session HELO requested: {:?}",
+            transport.helo_requests
+        );
+    }
+
+    #[tokio::test]
+    async fn activator_pair_opens_gate_and_stores_key() {
+        let (state, _dir) = test_state();
+        let store = ActKeyStore::new();
+        let transport = FakeSessionTransport::new(
+            ACT_KEY_ONE,
+            ACT_NONCE_ONE,
+            Some(act_pairing_hello(ACT_KEY_ONE, ACT_NONCE_ONE)),
+        );
+        let _transport = activate_session_on(&state, transport, store.clone())
+            .await
+            .expect("transport survives pairing");
+        assert!(
+            state.session_gate_open(),
+            "gate opens after pairing GET_CAPS: {:?}",
+            state.session_last_error()
+        );
+        assert_eq!(
+            store.get_device_key(ACT_BOARD_ID).expect("key stored"),
+            ACT_KEY_ONE
+        );
+        // The pairing window is consumed: no transient password lingers.
+        assert_eq!(state.pairing_status().password, None);
+    }
+
+    #[tokio::test]
+    async fn activator_stale_echo_zero_hello_is_used_as_fallback() {
+        // The board only ever answers routine flag-0 HELOs (echo 0):
+        // the activator falls back to that HELLO instead of failing
+        // outright, and the resume still succeeds under its nonce.
+        let (state, _dir) = test_state();
+        let store = ActKeyStore::new();
+        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
+        let mut hello = act_paired_hello(ACT_NONCE_TWO);
+        hello.session_echo = 0;
+        let transport = FakeSessionTransport::new(ACT_KEY_ONE, ACT_NONCE_TWO, Some(hello));
+        let _transport = activate_session_on(&state, transport, store)
+            .await
+            .expect("transport survives fallback activation");
+        assert!(
+            state.session_gate_open(),
+            "gate opens on fallback HELLO: {:?}",
+            state.session_last_error()
+        );
+    }
+
+    #[tokio::test]
+    async fn activator_bad_tag_keeps_gate_closed() {
+        let (state, _dir) = test_state();
+        let store = ActKeyStore::new();
+        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
+        // Board key differs from the stored key: GET_CAPS fails BAD_TAG.
+        let transport = FakeSessionTransport::new(
+            ACT_KEY_TWO,
+            ACT_NONCE_TWO,
+            Some(act_paired_hello(ACT_NONCE_TWO)),
+        );
+        let _transport = activate_session_on(&state, transport, store)
+            .await
+            .expect("transport survives failed activation");
+        assert!(!state.session_gate_open(), "gate stays closed on BAD_TAG");
+        assert!(state.session_activation().is_none());
+        let error = state.session_last_error().expect("failure recorded");
+        assert!(
+            error.contains("HMAC tag verification failed"),
+            "bad-tag reason recorded: {error}"
+        );
+        assert!(
+            state.firmware_version().is_err(),
+            "no firmware version without a session"
+        );
+    }
+
+    #[tokio::test]
+    async fn activator_no_hello_keeps_gate_closed() {
+        let (state, _dir) = test_state();
+        let mut transport = FakeSessionTransport::new(ACT_KEY_ONE, ACT_NONCE_ONE, None);
+        transport.never_answer_hello = true;
+        let started = Instant::now();
+        let _transport = activate_session_on(&state, transport, ActKeyStore::new())
+            .await
+            .expect("transport survives HELLO timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "activation is bounded: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !state.session_gate_open(),
+            "gate stays closed with no HELLO"
+        );
+        let error = state.session_last_error().expect("failure recorded");
+        assert!(
+            error.contains("no HELLO"),
+            "timeout reason recorded: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn activator_transport_closed_returns_none() {
+        let (state, _dir) = test_state();
+        let mut transport = FakeSessionTransport::new(ACT_KEY_ONE, ACT_NONCE_ONE, None);
+        transport.hello_closed = true;
+        let result = activate_session_on(&state, transport, ActKeyStore::new()).await;
+        assert!(result.is_none(), "dead transport returns None");
+        assert!(!state.session_gate_open());
+        assert!(
+            state
+                .session_last_error()
+                .expect("failure recorded")
+                .contains("transport closed"),
+            "closed reason recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn activator_disconnect_closes_gate_and_clears_activation() {
+        let (state, _dir) = test_state();
+        state.start_engine().expect("engine starts");
+        let store = ActKeyStore::new();
+        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
+        let transport = FakeSessionTransport::new(
+            ACT_KEY_ONE,
+            ACT_NONCE_TWO,
+            Some(act_paired_hello(ACT_NONCE_TWO)),
+        );
+        let _transport = activate_session_on(&state, transport, store)
+            .await
+            .expect("activation succeeds");
+        assert!(state.session_gate_open());
+        assert!(state.session_activation().is_some());
+        state.disconnect_transport().expect("disconnect queues");
+        assert!(!state.session_gate_open(), "disconnect closes the gate");
+        assert!(
+            state.session_activation().is_none(),
+            "disconnect clears the activation"
+        );
+        assert!(
+            state.firmware_version().is_err(),
+            "no firmware version after disconnect"
+        );
+        let outcome = state.stop_engine();
+        assert!(outcome.joined, "engine stops bounded");
+    }
+
+    #[test]
+    fn pairing_status_reports_window_and_password_then_clears_on_activation() {
+        let (state, _dir) = test_state();
+        let status = state.pairing_status();
+        assert_eq!(status.seconds_left, 0);
+        assert_eq!(status.password, None);
+        assert_eq!(status.error, None);
+        state.note_observed_hello(&act_pairing_hello(ACT_KEY_ONE, ACT_NONCE_ONE));
+        let status = state.pairing_status();
+        assert!(
+            (1..=60).contains(&status.seconds_left),
+            "window counts down from 60: {}",
+            status.seconds_left
+        );
+        assert_eq!(status.password.as_deref(), Some("Ab3dEf6hJk9mNp2rSt5vXy8z"));
+        // Activation consumes the window: the transient password is dropped.
+        state.record_session_activation(SessionActivation {
+            board_id: ACT_BOARD_ID.to_string(),
+            firmware: (4, 0, 1),
+            protocol: (2, 1),
+            caps: act_caps(),
+        });
+        assert_eq!(state.pairing_status().password, None);
+        assert_eq!(
+            state.firmware_version().expect("version after activation"),
+            "4.0.1"
+        );
+    }
+
+    #[test]
+    fn begin_pairing_without_board_fails_closed_and_reports() {
+        // Full startup path (engine start → UDP connect → activator
+        // attempt) with no board answering: the gate stays closed and
+        // the failure is recorded instead of silently opening.
+        let _port = UDP_FORWARDER_PORT.lock().expect("port lock");
+        assert!(
+            wait_for_stream_port_free(),
+            "stream port 4211 still held by a previous test's transport"
+        );
+        let (state, _dir) = test_state();
+        let mut settings = state.settings();
+        settings.esp_ip = "127.0.0.1".to_string();
+        state.set_settings(settings).expect("settings save");
+        let status = state
+            .begin_pairing()
+            .expect("begin_pairing triggers an attempt");
+        assert_eq!(status.seconds_left, 0);
+        assert_eq!(status.password, None);
+        assert!(
+            wait_until(Duration::from_secs(10), || state
+                .session_last_error()
+                .is_some()),
+            "activation failure must be recorded"
+        );
+        assert!(
+            !state.session_gate_open(),
+            "gate stays closed with no board"
+        );
+        assert!(state.session_activation().is_none());
+        let outcome = state.stop_engine();
+        assert!(outcome.joined, "engine stops bounded");
+    }
+
+    /* H5-control: run-a-control-command-under-a-fresh-session. */
+
+    /// Drive one control op under a fresh fake session — the exact
+    /// path the sync commands take (`block_on_control` +
+    /// `run_control_session`). Plain `#[test]`, never `#[tokio::test]`
+    /// (`block_on_control` builds its own runtime).
+    fn drive_control<T, K, F, R>(
+        state: &Arc<AppStateCore>,
+        transport: T,
+        keystore: K,
+        op: F,
+    ) -> Result<R, String>
+    where
+        T: SessionTransport,
+        K: KeyStoreLike,
+        F: for<'s> FnOnce(
+            &'s mut BoardSession<K, T>,
+        ) -> Pin<Box<dyn Future<Output = Result<R, String>> + 's>>,
+    {
+        block_on_control(run_control_session(state, transport, keystore, op))
+    }
+
+    /// A paired fake transport against `board` (key seeded in the
+    /// store), answering a fresh-nonce `HELLO`. Each call is a new
+    /// session — the caller picks the nonce, like D30 requires.
+    fn paired_transport(
+        board: &Arc<Mutex<FakeBoardConfig>>,
+        nonce: [u8; 16],
+    ) -> (ActKeyStore, FakeSessionTransport) {
+        let store = ActKeyStore::new();
+        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
+        let transport = FakeSessionTransport::new_with_board(
+            ACT_KEY_ONE,
+            nonce,
+            Some(act_paired_hello(nonce)),
+            Arc::clone(board),
+        );
+        (store, transport)
+    }
+
+    /// The board's live config blob (what `GET_CFG` returns).
+    fn board_current(board: &Arc<Mutex<FakeBoardConfig>>) -> Vec<u8> {
+        board.lock().expect("board lock").current.clone()
+    }
+
+    /// The factory blob with the horn pin moved 4 → 5 (a visible,
+    /// valid change for the transaction tests).
+    fn horn_moved_blob() -> Vec<u8> {
+        let mut blob = rsh_protocol::factory_default_blob();
+        for record in &mut blob.records {
+            if record.rec_type == rsh_protocol::config::record_type::BUTTON && record.slot == 2 {
+                record.pin_a = 5;
+            }
+        }
+        blob.encode().expect("horn-moved blob encodes")
+    }
+
+    /// Stage + commit `blob` across two fresh sessions; returns the
+    /// `Committed` snapshot (saved into the state).
+    fn stage_and_commit(
+        state: &Arc<AppStateCore>,
+        board: &Arc<Mutex<FakeBoardConfig>>,
+        blob: Vec<u8>,
+    ) -> ConfigTxnSnapshot {
+        let (store, transport) = paired_transport(board, ACT_NONCE_ONE);
+        let (result, snapshot) = drive_control(state, transport, store, |session| {
+            Box::pin(op_stage_config(session, ConfigTxnSnapshot::default(), blob))
+        })
+        .expect("stage helper succeeds");
+        result.expect("stage succeeds");
+        assert_eq!(snapshot.state, ConfigState::Staged);
+        let (store, transport) = paired_transport(board, ACT_NONCE_TWO);
+        let (result, snapshot) = drive_control(state, transport, store, |session| {
+            Box::pin(op_commit_config(session, snapshot))
+        })
+        .expect("commit helper succeeds");
+        result.expect("commit succeeds");
+        assert_eq!(snapshot.state, ConfigState::Committed);
+        *lock(&state.config_txn) = snapshot.clone();
+        snapshot
+    }
+
+    #[test]
+    fn control_session_runs_set_password_under_a_fresh_session() {
+        let (state, _dir) = test_state();
+        assert!(!state.session_gate_open(), "gate starts closed");
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let sent_log = transport.sent_log();
+        drive_control(&state, transport, store.clone(), |session| {
+            Box::pin(op_set_password(session, "new-password-123".to_string()))
+        })
+        .expect("set_password succeeds");
+        // Signed GET_CAPS first (counter 0), then SET_PASSWORD (counter 1).
+        let sent = sent_log.lock().expect("sent log lock");
+        let frames: Vec<rsh_protocol::ControlFrame> = sent
+            .iter()
+            .map(|bytes| {
+                rsh_protocol::ControlFrame::parse_structure(bytes).expect("sent frame parses")
+            })
+            .collect();
+        assert_eq!(frames.len(), 2, "only GET_CAPS + SET_PASSWORD sent");
+        assert_eq!(frames[0].cmd, rsh_protocol::control::Opcode::GetCaps as u8);
+        assert_eq!(frames[0].counter, 0);
+        assert_eq!(
+            frames[1].cmd,
+            rsh_protocol::control::Opcode::SetPassword as u8
+        );
+        assert_eq!(frames[1].counter, 1);
+        // The SET_PASSWORD payload is length-prefixed (1 length byte +
+        // the password bytes).
+        assert_eq!(frames[1].payload[0], 16);
+        assert_eq!(&frames[1].payload[1..], b"new-password-123");
+        // The new password is stored as the Wi-Fi password (one credential).
+        assert_eq!(
+            store.wifi_password(ACT_BOARD_ID).as_deref(),
+            Some("new-password-123")
+        );
+        // A transient control session never activates or opens the gate.
+        assert!(!state.session_gate_open(), "gate stays closed");
+        assert!(state.session_activation().is_none());
+        assert_eq!(state.session_last_error(), None);
+    }
+
+    #[test]
+    fn control_session_set_password_rejects_a_short_password() {
+        let (state, _dir) = test_state();
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let sent_log = transport.sent_log();
+        let error = drive_control(&state, transport, store, |session| {
+            Box::pin(op_set_password(session, "short".to_string()))
+        })
+        .expect_err("short password must fail");
+        assert!(error.contains("8..=63"), "{error}");
+        // Only GET_CAPS went out — no SET_PASSWORD reached the board.
+        assert_eq!(
+            sent_log.lock().expect("sent log lock").len(),
+            1,
+            "only GET_CAPS sent"
+        );
+        assert!(!state.session_gate_open(), "gate stays closed");
+        assert!(state.session_last_error().is_some(), "failure is recorded");
+    }
+
+    #[test]
+    fn control_session_fails_closed_with_no_hello() {
+        let (state, _dir) = test_state();
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let (store, mut transport) = paired_transport(&board, ACT_NONCE_TWO);
+        transport.never_answer_hello = true;
+        let error = drive_control(&state, transport, store, |session| {
+            Box::pin(op_reboot(session))
+        })
+        .expect_err("no HELLO must fail");
+        assert!(error.contains("no HELLO"), "{error}");
+        assert!(!state.session_gate_open(), "gate stays closed");
+        assert!(state.session_last_error().is_some(), "failure is recorded");
+    }
+
+    #[test]
+    fn control_session_fails_closed_when_the_transport_dies() {
+        let (state, _dir) = test_state();
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let (store, mut transport) = paired_transport(&board, ACT_NONCE_TWO);
+        transport.hello_closed = true;
+        let error = drive_control(&state, transport, store, |session| {
+            Box::pin(op_reboot(session))
+        })
+        .expect_err("closed transport must fail");
+        assert!(error.contains("transport closed"), "{error}");
+        assert!(!state.session_gate_open(), "gate stays closed");
+    }
+
+    #[test]
+    fn control_session_runs_reboot_under_a_fresh_session() {
+        let (state, _dir) = test_state();
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let sent_log = transport.sent_log();
+        drive_control(&state, transport, store, |session| {
+            Box::pin(op_reboot(session))
+        })
+        .expect("reboot succeeds");
+        let sent = sent_log.lock().expect("sent log lock");
+        let frames: Vec<rsh_protocol::ControlFrame> = sent
+            .iter()
+            .map(|bytes| {
+                rsh_protocol::ControlFrame::parse_structure(bytes).expect("sent frame parses")
+            })
+            .collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].cmd, rsh_protocol::control::Opcode::Reboot as u8);
+        assert!(!state.session_gate_open(), "gate stays closed");
+    }
+
+    #[test]
+    fn config_flow_runs_across_fresh_sessions() {
+        let (state, _dir) = test_state();
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let factory = board_current(&board);
+        let staged = horn_moved_blob();
+        // Stage: the board still runs the factory blob until commit.
+        let (store, transport) = paired_transport(&board, ACT_NONCE_ONE);
+        let (result, snapshot) = drive_control(&state, transport, store, |session| {
+            Box::pin(op_stage_config(
+                session,
+                ConfigTxnSnapshot::default(),
+                staged.clone(),
+            ))
+        })
+        .expect("stage helper succeeds");
+        result.expect("stage succeeds");
+        assert_eq!(snapshot.state, ConfigState::Staged);
+        *lock(&state.config_txn) = snapshot.clone();
+        assert_eq!(state.config_state(), "staged");
+        assert_eq!(board_current(&board), factory, "stage does not go live");
+        // Commit on a fresh session: the board live-applies the blob.
+        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let (result, snapshot) = drive_control(&state, transport, store, |session| {
+            Box::pin(op_commit_config(session, snapshot))
+        })
+        .expect("commit helper succeeds");
+        result.expect("commit succeeds");
+        assert_eq!(snapshot.state, ConfigState::Committed);
+        assert!(
+            snapshot.committed_at.is_some(),
+            "commit records when the window started"
+        );
+        *lock(&state.config_txn) = snapshot.clone();
+        assert_eq!(state.config_state(), "pending_confirm");
+        assert_eq!(board_current(&board), staged, "commit goes live");
+        // Confirm on a third fresh session: the new config is permanent.
+        let (store, transport) = paired_transport(&board, ACT_NONCE_ONE);
+        let (result, snapshot) = drive_control(&state, transport, store, |session| {
+            Box::pin(op_confirm_config(session, snapshot))
+        })
+        .expect("confirm helper succeeds");
+        result.expect("confirm succeeds");
+        assert_eq!(snapshot.state, ConfigState::Confirmed);
+        *lock(&state.config_txn) = snapshot;
+        assert_eq!(state.config_state(), "clean");
+        assert_eq!(board_current(&board), staged);
+    }
+
+    #[test]
+    fn config_rollback_restores_the_last_good_blob() {
+        let (state, _dir) = test_state();
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let factory = board_current(&board);
+        let staged = horn_moved_blob();
+        let snapshot = stage_and_commit(&state, &board, staged.clone());
+        assert_eq!(board_current(&board), staged, "commit went live");
+        assert_eq!(state.config_state(), "pending_confirm");
+        let (store, transport) = paired_transport(&board, ACT_NONCE_ONE);
+        let (result, snapshot) = drive_control(&state, transport, store, |session| {
+            Box::pin(op_rollback_config(session, snapshot))
+        })
+        .expect("rollback helper succeeds");
+        result.expect("rollback succeeds");
+        assert_eq!(snapshot.state, ConfigState::RolledBack);
+        *lock(&state.config_txn) = snapshot;
+        assert_eq!(state.config_state(), "rolled_back");
+        assert_eq!(
+            board_current(&board),
+            factory,
+            "rollback restores the last-good blob"
+        );
+    }
+
+    #[test]
+    fn get_config_and_get_pin_map_read_the_live_blob() {
+        let (state, _dir) = test_state();
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let blob = drive_control(&state, transport, store, |session| {
+            Box::pin(op_read_config_blob(session))
+        })
+        .expect("read succeeds");
+        let decoded = ConfigBlob::decode(&blob).expect("board blob decodes");
+        let json = config_blob_to_json(&decoded);
+        assert_eq!(json["cfgVersion"], 1);
+        assert_eq!(
+            json["buttons"],
+            serde_json::json!({"1": "shifter_up", "2": "shifter_down", "3": "horn"})
+        );
+        let pins = records_to_pin_assignments(&decoded.records);
+        assert_eq!(
+            pins,
+            vec![
+                PinAssignment {
+                    function: "steering".to_string(),
+                    pin: 34,
+                    pins: Vec::new(),
+                },
+                PinAssignment {
+                    function: "accelerator".to_string(),
+                    pin: 35,
+                    pins: Vec::new(),
+                },
+                PinAssignment {
+                    function: "brake".to_string(),
+                    pin: 36,
+                    pins: Vec::new(),
+                },
+                PinAssignment {
+                    function: "handbrake".to_string(),
+                    pin: 32,
+                    pins: Vec::new(),
+                },
+                PinAssignment {
+                    function: "horn".to_string(),
+                    pin: 4,
+                    pins: Vec::new(),
+                },
+                PinAssignment {
+                    function: "led".to_string(),
+                    pin: 21,
+                    pins: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn set_pin_map_merges_and_commits_then_confirms() {
+        let (state, _dir) = test_state();
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let pins = vec![
+            PinAssignment {
+                function: "steering".to_string(),
+                pin: 34,
+                pins: Vec::new(),
+            },
+            PinAssignment {
+                function: "accelerator".to_string(),
+                pin: 35,
+                pins: Vec::new(),
+            },
+            PinAssignment {
+                function: "brake".to_string(),
+                pin: 36,
+                pins: Vec::new(),
+            },
+            PinAssignment {
+                function: "handbrake".to_string(),
+                pin: 32,
+                pins: Vec::new(),
+            },
+            PinAssignment {
+                function: "horn".to_string(),
+                pin: 4,
+                pins: Vec::new(),
+            },
+            PinAssignment {
+                function: "led".to_string(),
+                pin: 21,
+                pins: Vec::new(),
+            },
+        ];
+        let (store, transport) = paired_transport(&board, ACT_NONCE_ONE);
+        let (result, snapshot) = drive_control(&state, transport, store, |session| {
+            Box::pin(op_stage_and_commit_pin_map(
+                session,
+                ConfigTxnSnapshot::default(),
+                pins,
+            ))
+        })
+        .expect("helper succeeds");
+        let validation = result.expect("stage+commit succeeds");
+        assert!(validation.valid, "errors: {:?}", validation.errors);
+        assert_eq!(snapshot.state, ConfigState::Committed);
+        *lock(&state.config_txn) = snapshot.clone();
+        assert_eq!(state.config_state(), "pending_confirm");
+        // The merged blob on the board: handbrake in AXIS_ADC slot 4
+        // (no clutch slot 3 added), shifter up/down + battery kept.
+        let merged = ConfigBlob::decode(&board_current(&board)).expect("merged blob decodes");
+        let find = |rec_type: u8, slot: u8| {
+            merged
+                .records
+                .iter()
+                .find(|r| r.rec_type == rec_type && r.slot == slot)
+                .map(|r| r.pin_a)
+        };
+        assert_eq!(find(rsh_protocol::config::record_type::AXIS_ADC, 3), None);
+        assert_eq!(
+            find(rsh_protocol::config::record_type::AXIS_ADC, 4),
+            Some(32)
+        );
+        assert_eq!(
+            find(rsh_protocol::config::record_type::BUTTON, 0),
+            Some(27),
+            "shifter-up kept"
+        );
+        assert_eq!(
+            find(rsh_protocol::config::record_type::BATTERY, 0),
+            Some(39),
+            "battery kept"
+        );
+        // Confirm on a fresh session.
+        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let (result, snapshot) = drive_control(&state, transport, store, |session| {
+            Box::pin(op_confirm_config(session, snapshot))
+        })
+        .expect("helper succeeds");
+        result.expect("confirm succeeds");
+        assert_eq!(snapshot.state, ConfigState::Confirmed);
+    }
+
+    #[test]
+    fn set_pin_map_generic_buttons_row_is_a_validation_verdict() {
+        let (state, _dir) = test_state();
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let pins = vec![
+            PinAssignment {
+                function: "steering".to_string(),
+                pin: 34,
+                pins: Vec::new(),
+            },
+            PinAssignment {
+                function: "buttons".to_string(),
+                pin: 5,
+                pins: Vec::new(),
+            },
+        ];
+        let (store, transport) = paired_transport(&board, ACT_NONCE_ONE);
+        let (result, snapshot) = drive_control(&state, transport, store, |session| {
+            Box::pin(op_stage_and_commit_pin_map(
+                session,
+                ConfigTxnSnapshot::default(),
+                pins,
+            ))
+        })
+        .expect("helper succeeds");
+        let validation = result.expect("merge failure is a verdict, not an error");
+        assert!(!validation.valid);
+        assert!(
+            validation.errors.iter().any(|e| e.contains("no board pin")),
+            "errors: {:?}",
+            validation.errors
+        );
+        assert_eq!(snapshot.state, ConfigState::Idle, "nothing was staged");
+        assert_eq!(
+            board_current(&board),
+            rsh_protocol::factory_default_blob()
+                .encode()
+                .expect("factory blob encodes"),
+            "board untouched"
+        );
+    }
+
+    #[test]
+    fn confirm_after_expiry_errors_without_a_board_call() {
+        let (state, _dir) = test_state();
+        let snapshot = ConfigTxnSnapshot {
+            state: ConfigState::Committed,
+            committed_at: Some(
+                Instant::now()
+                    .checked_sub(Duration::from_secs(31))
+                    .expect("31 s ago is representable"),
+            ),
+            commit_deadline: Duration::from_secs(30),
+            ..ConfigTxnSnapshot::default()
+        };
+        *lock(&state.config_txn) = snapshot;
+        let error = state
+            .confirm_config()
+            .expect_err("expired confirm must fail");
+        assert!(error.contains("expired"), "{error}");
+        assert_eq!(
+            lock(&state.config_txn).state,
+            ConfigState::Committed,
+            "record stays Committed until rollback verifies"
+        );
+    }
+
+    #[test]
+    fn serial_control_refuses_while_the_live_transport_holds_the_port() {
+        let (state, _dir) = test_state();
+        *lock(&state.engine_status) = EngineTaskStatus::Running {
+            transport: Some(TransportKind::Serial),
+        };
+        let error = state
+            .build_serial_control_transport()
+            .expect_err("serial held must fail");
+        assert!(error.contains("disconnect the transport first"), "{error}");
+    }
+
+    #[test]
+    fn sync_get_config_without_board_fails_honestly() {
+        // The sync command path end to end (transport build + fresh
+        // session + honest failure) with no board answering: ~1 s of
+        // HELLO waits, then a plain error — never a guessed config.
+        let (state, _dir) = test_state();
+        let error = state.get_config().expect_err("no board must fail");
+        assert!(error.contains("no HELLO"), "{error}");
+        assert!(!state.session_gate_open(), "gate stays closed");
+        assert_eq!(state.config_state(), "clean");
+    }
+
+    #[test]
+    fn sync_upload_firmware_without_board_fails_before_any_upload() {
+        // Missing file first (no board contact at all), then a garbage
+        // file with no board: the session fails before verification
+        // or any HTTP attempt — the upload leg is never reached.
+        let (state, dir) = test_state();
+        let missing = dir.join("missing.bin");
+        let error = state
+            .upload_firmware(&missing)
+            .expect_err("missing file must fail");
+        assert!(error.contains("could not read"), "{error}");
+        let garbage = dir.join("garbage.bin");
+        std::fs::write(&garbage, b"not a firmware image").expect("write garbage image");
+        let error = state
+            .upload_firmware(&garbage)
+            .expect_err("no board must fail");
+        assert!(error.contains("no HELLO"), "{error}");
+    }
+}

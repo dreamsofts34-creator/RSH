@@ -1,0 +1,17 @@
+[package]
+name = "rsh-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RSH protocol v2.1 — pure parse/encode (stream, status, HELLO, control/HMAC, ping, config blob, PIN-RULES). No I/O, no tokio, no std-net."
+
+[dependencies]
+hmac = "=0.13.0"
+sha2 = "=0.11.1"
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest = "=1.12.0"
+
+[lints]
+workspace = true

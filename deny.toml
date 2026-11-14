@@ -1,0 +1,87 @@
+# deny.toml — RSH Rust supply-chain policy (Phase A4, SW-R1.3 / SECURITY-INPUT §6.3, §9)
+#
+# Enforced in CI by `cargo deny check` (.github/workflows/ci.yml, audit job).
+# Schema verified 2026-11-14 against the cargo-deny docs
+# (embarkstudios.github.io/cargo-deny/checks/cfg.html and the
+# advisories/licenses/sources cfg pages). Notes on the CURRENT schema:
+#   * [advisories] `vulnerability` was REMOVED — all vulnerability advisories
+#     now emit errors by default. Do not re-add it; it errors.
+#   * [licenses] `unlicensed`, `deny`, `copyleft`, `default` were REMOVED —
+#     every license NOT in `allow` is denied by default. Do not re-add them.
+#   * [licenses] `confidence-threshold` default is 0.8.
+#
+# License allow-list — permissive only (SECURITY-INPUT §6.3: MIT/Apache-2.0/
+# BSD; GPL/AGPL/LGPL denied by default because they are not listed):
+#   * MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause — the required core.
+#   * Apache-2.0 WITH LLVM-exception, ISC, Unicode-3.0, Unicode-DFS-2016,
+#     Zlib — narrow permissive extras the Rust ecosystem itself needs
+#     (e.g. unicode-ident is "(MIT OR Apache-2.0) AND Unicode-DFS-2016";
+#     without Unicode-DFS-2016 the license check would fail on a ubiquitous
+#     crate on day one). All five are permissive, none is copyleft. If the
+#     coordinator wants the list tightened to the four core IDs only, delete
+#     these five lines — that is a one-line policy change, not a schema fix.
+#   * Anything else (including all strong copyleft: GPL/AGPL/LGPL) is denied.
+#     A crate that needs a different license gets a per-crate
+#     [[licenses.exceptions]] entry with a reason, or it does not ship.
+#   * MPL-2.0 is the ONE weak-copyleft exception (added Phase A gate,
+#     2026-11-14): it is a file-level copyleft, and it enters the tree only
+#     via Tauri 2.12.5's cssparser/dom_query chain (cssparser, cssparser-macros,
+#     dtoa-short, option-ext, ...). Depending on an MPL-2.0 crate does not
+#     impose copyleft on RSH's own MIT code. Strong copyleft stays denied.
+#
+# Sources — crates.io only (SECURITY-INPUT §0, §9): git dependencies are
+# denied; a git dependency needs an explicit allow-git entry + justification.
+
+[graph]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+yanked = "warn"
+unmaintained = "all"
+unsound = "workspace"
+# Ignores (TESTING-INPUT §9.1: ignore only with id + reason + expiry).
+# All five are transitive dependencies of Tauri 2.12.5's Linux/GTK stack
+# (tao → gtk → zbus/zvariant/glib); none is a direct dependency of any
+# rsh-* crate and none is a vulnerability in RSH code. Plain `cargo audit`
+# already exits 0 on these (they are warnings, not errors); they are
+# ignored here only so the stricter deny checks stay green and honest.
+# Review date for all five: 2027-02-14 (re-check whether a Tauri bump
+# removed them; if yes, drop the entry).
+ignore = [
+    # RUSTSEC-2024-0370 — proc-macro-error 1.0.4, unmaintained. No fixed upgrade exists.
+    "RUSTSEC-2024-0370",
+    # RUSTSEC-2026-0371 — zbus_names 4.3.5, unmaintained. No fixed upgrade exists.
+    "RUSTSEC-2026-0371",
+    # RUSTSEC-2026-0370 — zvariant 5.15.1, unmaintained. No fixed upgrade exists.
+    "RUSTSEC-2026-0370",
+    # RUSTSEC-2026-0372 — zvariant_derive 5.15.1, unmaintained. No fixed upgrade exists.
+    "RUSTSEC-2026-0372",
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+]
+# Workspace crates are MIT-licensed (LICENSE, user decision); do not
+# license-check unpublished workspace members.
+private = { ignore = true }
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

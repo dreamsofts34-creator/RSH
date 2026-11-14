@@ -1,0 +1,217 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/*
+ * RSH design tokens — same-to-same from the C# theme
+ * (rust-recreation/reference/themes/RSHTheme.{Light,Dark,HighContrast}.xaml
+ * + RSHTheme.xaml). Every colour in the app comes from these variables;
+ * components must NOT hard-code a hex value.
+ *
+ * Themes are class/attribute-based: `data-theme` on <html>
+ * (light | dark | high-contrast), plus a matching `dark` /
+ * `high-contrast` class for the shadcn dark variant. Switching the theme
+ * only flips the attribute — no DOM rebuild, no layout shift (R-P10).
+ * Every value below has a literal fallback where it is consumed, so a
+ * missing variable can never leave text invisible (C# blank-window lesson).
+ *
+ * Verified values (from the reference XAML files):
+ * - Light: bg #F5F3FF, card #FFFFFF, ink #1F1B2E, muted #5F5A7A,
+ *   track #ECE8FA, line #E7E3F7, accent-soft #EEE9FF, nav-active-fg #4B2FD0.
+ * - Dark: bg #0B0E13, card #14181F, raised #1A1F27, ink #F2F4F7,
+ *   muted #9AA3AF, track #232936, line #262C36, accent-soft #2A2350,
+ *   nav-active-fg #C4B5FD, nav-hover #1A1F27.
+ * - Accent family (both themes): accent #6C4CF1, deep #4B2FD0 (light) /
+ *   #C4B5FD (dark — the Dark XAML's text-safe deep variant; the UI plan
+ *   §2 table lists #4B2FD0 for both, which is unreadable as text on dark),
+ *   hover #5A3BE0.
+ * - Status (both themes): success #34D399, warning #F59E0B, danger #FF4D4F,
+ *   info #22D3EE, on-accent #FFFFFF.
+ * - Status text, WCAG-AA (C# UI-12 / Round 2 W1 audit):
+ *   light error #B42318 (6.6:1 on card), warning #B54708 (5.4:1),
+ *   success #146C35 (5.8:1 on its pill #E3F6EA);
+ *   dark error #FF9D94 (8.9:1), warning #F5B544 (9.8:1),
+ *   success #7ED491 (6.9:1 on its pill #1D3A28).
+ * - Pills: light success #E3F6EA / danger #FDE8E8 / muted #EDEBF5;
+ *   dark success #1D3A28 / danger #3D1F1F / muted #232936.
+ * - Banner: light #FFF4E5, dark #3A2C10.
+ *
+ * High Contrast: the C# palette maps to Windows SystemColors (no hex
+ * values exist to copy), so these values are CHOSEN here, not verified
+ * from the reference: pure black background, white text/borders, yellow
+ * accent (#FFFF00, the conventional HC highlight), black text on accent.
+ * They are recorded as chosen values in the Phase E1 report.
+ */
+
+:root {
+  --accent: #6c4cf1;
+  --accent-deep: #4b2fd0;
+  --accent-hover: #5a3be0;
+  --accent-soft: #eee9ff;
+  --bg: #f5f3ff;
+  --card: #ffffff;
+  --raised: #ffffff;
+  --ink: #1f1b2e;
+  --muted: #5f5a7a;
+  --track: #ece8fa;
+  --line: #e7e3f7;
+  --success: #34d399;
+  --success-text: #146c35;
+  --success-pill: #e3f6ea;
+  --warning: #f59e0b;
+  --warning-text: #b54708;
+  --danger: #ff4d4f;
+  --error-text: #b42318;
+  --danger-pill: #fde8e8;
+  --muted-pill: #edebf5;
+  --info: #22d3ee;
+  --on-accent: #ffffff;
+  --banner: #fff4e5;
+  --nav-active-bg: #eee9ff;
+  --nav-hover-bg: #f5f3ff;
+  --nav-active-fg: #4b2fd0;
+  --nav-dot: #c9c1ee;
+  --shadow-color: #3c288c;
+  --radius: 0.75rem;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --accent: #6c4cf1;
+  --accent-deep: #c4b5fd;
+  --accent-hover: #5a3be0;
+  --accent-soft: #2a2350;
+  --bg: #0b0e13;
+  --card: #14181f;
+  --raised: #1a1f27;
+  --ink: #f2f4f7;
+  --muted: #9aa3af;
+  --track: #232936;
+  --line: #262c36;
+  --success: #34d399;
+  --success-text: #7ed491;
+  --success-pill: #1d3a28;
+  --warning: #f59e0b;
+  --warning-text: #f5b544;
+  --danger: #ff4d4f;
+  --error-text: #ff9d94;
+  --danger-pill: #3d1f1f;
+  --muted-pill: #232936;
+  --info: #22d3ee;
+  --on-accent: #ffffff;
+  --banner: #3a2c10;
+  --nav-active-bg: #2a2350;
+  --nav-hover-bg: #1a1f27;
+  --nav-active-fg: #c4b5fd;
+  --nav-dot: #4a445f;
+  --shadow-color: #000000;
+  --radius: 0.75rem;
+  color-scheme: dark;
+}
+
+/* High Contrast — chosen values (see header note); the C# reference uses
+   Windows SystemColors, which have no hex equivalent. */
+:root[data-theme="high-contrast"] {
+  --accent: #ffff00;
+  --accent-deep: #ffffff;
+  --accent-hover: #ffff00;
+  --accent-soft: #1a1a1a;
+  --bg: #000000;
+  --card: #000000;
+  --raised: #1a1a1a;
+  --ink: #ffffff;
+  --muted: #ffffff;
+  --track: #3a3a3a;
+  --line: #ffffff;
+  --success: #00e676;
+  --success-text: #ffffff;
+  --success-pill: #1a1a1a;
+  --warning: #ffc107;
+  --warning-text: #ffffff;
+  --danger: #ff5252;
+  --error-text: #ffffff;
+  --danger-pill: #1a1a1a;
+  --muted-pill: #1a1a1a;
+  --info: #40c4ff;
+  --on-accent: #000000;
+  --banner: #000000;
+  --nav-active-bg: #ffff00;
+  --nav-hover-bg: #1a1a1a;
+  --nav-active-fg: #000000;
+  --nav-dot: #ffffff;
+  --shadow-color: #000000;
+  --radius: 0.75rem;
+  color-scheme: dark;
+}
+
+/* Map RSH tokens onto Tailwind v4 theme keys + shadcn theme variables. */
+@theme inline {
+  --color-accent: var(--accent);
+  --color-accent-deep: var(--accent-deep);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+  --color-background: var(--bg);
+  --color-card: var(--card);
+  --color-raised: var(--raised);
+  --color-foreground: var(--ink);
+  --color-muted: var(--muted);
+  --color-track: var(--track);
+  --color-border: var(--line);
+  --color-success: var(--success);
+  --color-success-text: var(--success-text);
+  --color-warning: var(--warning);
+  --color-warning-text: var(--warning-text);
+  --color-danger: var(--danger);
+  --color-error-text: var(--error-text);
+  --color-info: var(--info);
+  --color-on-accent: var(--on-accent);
+  --color-banner: var(--banner);
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--on-accent);
+  --color-secondary: var(--accent-soft);
+  --color-secondary-foreground: var(--accent-deep);
+  --color-muted-foreground: var(--muted);
+  --color-accent-foreground: var(--on-accent);
+  --color-destructive: var(--danger);
+  --color-destructive-foreground: var(--on-accent);
+  --color-input: var(--line);
+  --color-ring: var(--accent);
+  --font-sans: Inter, system-ui, "Segoe UI", sans-serif;
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-xl: 1rem;
+}
+
+/* shadcn dark variant: `.dark` class on <html> (set together with
+   data-theme="dark" by src/lib/theme.ts). */
+@custom-variant dark (&:is(.dark *));
+
+@layer base {
+  * {
+    border-color: var(--line, #e7e3f7);
+  }
+  html,
+  body {
+    height: 100%;
+  }
+  body {
+    background-color: var(--bg, #f5f3ff);
+    color: var(--ink, #1f1b2e);
+    font-family: Inter, system-ui, "Segoe UI", sans-serif;
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Visible keyboard focus on every interactive element (UI-12 lesson). */
+  :focus-visible {
+    outline: 2px dashed var(--accent, #6c4cf1);
+    outline-offset: 2px;
+  }
+}
+
+/* Respect the OS High Contrast mode even if the app theme is Light/Dark:
+   forced-colors keeps text readable when Windows HC is on. */
+@media (forced-colors: active) {
+  :root {
+    --line: CanvasText;
+  }
+}

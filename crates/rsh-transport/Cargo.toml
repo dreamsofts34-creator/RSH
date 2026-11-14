@@ -1,0 +1,16 @@
+[package]
+name = "rsh-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+mdns-sd.workspace = true
+rsh-engine = { path = "../rsh-engine" }
+rsh-protocol = { path = "../rsh-protocol" }
+rsh-security = { path = "../rsh-security" }
+serialport.workspace = true
+tokio.workspace = true
