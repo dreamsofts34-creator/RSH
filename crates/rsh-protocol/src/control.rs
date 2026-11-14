@@ -233,13 +233,41 @@ impl ControlFrame {
         nonce: &[u8; 16],
     ) -> Result<Self, ControlParseError> {
         let frame = Self::parse_structure(data)?;
-        let tag_off = CONTROL_HEADER_LEN + frame.payload.len();
+        frame.verify_tag(key, nonce, data)?;
+        Ok(frame)
+    }
+
+    /// Verify the HMAC tag of an already-parsed frame against the raw
+    /// wire bytes it was parsed from.
+    ///
+    /// This is the H1/M-8 split: callers first run
+    /// [`ControlFrame::parse_structure`] and match `cmd`/`req_id`
+    /// against the command in flight, and only then call this — so a
+    /// stray frame for another command is skipped *without* spending
+    /// (or failing) a tag verification on it. A stray frame with a
+    /// corrupted tag must never kill the in-flight command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlParseError::BadLength`] when the raw bytes do
+    /// not carry a full tag for this frame, and
+    /// [`ControlParseError::BadTag`] on a tag mismatch.
+    pub fn verify_tag(
+        &self,
+        key: &[u8; 32],
+        nonce: &[u8; 16],
+        data: &[u8],
+    ) -> Result<(), ControlParseError> {
+        let tag_off = CONTROL_HEADER_LEN + self.payload.len();
+        if data.len() < tag_off + TAG_LEN {
+            return Err(ControlParseError::BadLength);
+        }
         let mut tag = [0u8; TAG_LEN];
         tag.copy_from_slice(&data[tag_off..tag_off + TAG_LEN]);
-        if !verify_tag(key, nonce, frame.cmd, frame.counter, &frame.payload, &tag) {
+        if !verify_tag(key, nonce, self.cmd, self.counter, &self.payload, &tag) {
             return Err(ControlParseError::BadTag);
         }
-        Ok(frame)
+        Ok(())
     }
 
     /// Parse + verify, bumping the matching counter in `counters`.

@@ -41,6 +41,11 @@ pub mod system;
 /// Diagnostics export + crash-dump support (Phase F-sys / SW-R7.6).
 pub mod diagnostics;
 
+/// Zeroizing secret strings (Security L-2): Wi-Fi passwords and other
+/// short-lived secrets are zeroed on drop instead of lingering in
+/// heap memory.
+pub mod secrets;
+
 /// Telemetry adapter: F1 readers → F2 watcher `CarSource` (Phase F gate).
 pub mod telemetry_adapter;
 

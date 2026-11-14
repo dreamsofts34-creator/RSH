@@ -40,16 +40,27 @@ targets = [
 all-features = true
 
 [advisories]
-yanked = "warn"
+# H2 (deep-scan Round 2): yanked = "deny". It used to be "warn" because
+# `cargo audit` exits 0 even when the yanked check never completed
+# (612× "couldn't check if the package is yanked" in the Phase H gate) —
+# a warn there is no verdict at all. The CI audit job now retries the
+# audit up to 3 times and FAILS if the yanked verdict is still missing,
+# which makes the registry check reliable in CI (registry reachable);
+# on that basis the deny policy is deny, not warn. Verified locally
+# 2026-11-14: `cargo deny check` passes with yanked = "deny" (exit 0,
+# "advisories ok, bans ok, licenses ok, sources ok") — cargo-deny
+# resolves yanked status from its local advisory data, so unlike
+# `cargo audit` it does not need the sandbox-blocked registry fetch.
+yanked = "deny"
 unmaintained = "all"
 unsound = "workspace"
 # Ignores (TESTING-INPUT §9.1: ignore only with id + reason + expiry).
-# All five are transitive dependencies of Tauri 2.12.5's Linux/GTK stack
+# All four are transitive dependencies of Tauri 2.12.5's Linux/GTK stack
 # (tao → gtk → zbus/zvariant/glib); none is a direct dependency of any
 # rsh-* crate and none is a vulnerability in RSH code. Plain `cargo audit`
 # already exits 0 on these (they are warnings, not errors); they are
 # ignored here only so the stricter deny checks stay green and honest.
-# Review date for all five: 2027-02-14 (re-check whether a Tauri bump
+# Review date for all four: 2027-02-14 (re-check whether a Tauri bump
 # removed them; if yes, drop the entry).
 ignore = [
     # RUSTSEC-2024-0370 — proc-macro-error 1.0.4, unmaintained. No fixed upgrade exists.

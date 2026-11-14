@@ -6,15 +6,31 @@
 #
 # What it does, in order (every step fail-closed — a missing asset, a bad
 # signature, or a version mismatch fails the run, never a silent partial release):
-#   1. Gates: `cargo test --workspace`, `cargo deny check`, frontend tests + build.
-#   2. Firmware: PlatformIO build of `firmware/` (C++ v4.0.1) + Ed25519 signing
+#   1. Sidecar FIRST: fetch HIDMaestro v2.1.0, verify ZIP + DLL SHA-256,
+#      `dotnet publish` NativeAOT win-x64, stage as
+#      `src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe`
+#      (Tauri `bundle.externalBin` — lands beside RSH.exe). It runs first
+#      because the rsh-app build script validates bundle.externalBin at
+#      build time — without the staged sidecar, `cargo test --workspace`
+#      fails (dry runs #1/#2 + first CI run, 2026-11-14).
+#   2. Gates: `cargo fmt --check`, `cargo clippy --workspace` (Windows —
+#      the sidecar is already staged, so the rsh-app build script passes),
+#      `cargo test --workspace`, `cargo test --workspace --release`,
+#      `cargo deny check`, frontend lint + tests + locale check + audit +
+#      build. A tag push does NOT trigger CI, so the release workflow
+#      must be a superset of the CI gates (deep-scan Round 2, H4) —
+#      a tag must never ship what CI would have rejected.
+#   3. Firmware: PlatformIO build of `firmware/` (C++ v4.0.1) + Ed25519 signing
 #      with the `RSH_SIGNING_KEY_PEM` secret + fail-closed verify
 #      (`sign-image.py --verify` + image-region == `firmware.bin` + size check).
-#   3. Sidecar: fetch HIDMaestro v2.1.0, verify ZIP + DLL SHA-256, `dotnet publish`
-#      NativeAOT win-x64, stage as `src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe`
-#      (Tauri `bundle.externalBin` — lands beside RSH.exe).
-#   4. SBOMs regenerated fresh (`cargo cyclonedx`, `npm sbom`; sidecar SBOM is
-#      hand-written, re-verified against docs/HIDMAESTRO-SPIKE.md pins).
+#      The merged-bin size check FAILS on mismatch — the only exception is
+#      a firmware version bump, done by updating the expected size in the
+#      same change (deep-scan Round 2, L8).
+#   4. SBOMs regenerated fresh (`.github/scripts/generate-rust-sbom.py`
+#      from the full Cargo.lock resolve — `cargo cyclonedx` does NOT
+#      reproduce this file, see the step comment + DECISIONS §16;
+#      `npm sbom` for the frontend at CycloneDX 1.5; sidecar SBOM is
+#      hand-written, re-verified against the MEASURED sidecar hashes).
 #   5. `cargo tauri build` — NSIS + MSI installers, updater `.sig` artifacts
 #      (signed with the `RSH_UPDATER_PRIVATE_KEY` secret via TAURI_SIGNING_PRIVATE_KEY).
 #   6. `latest.json` (updater manifest) generated from the real `.sig` contents +
@@ -50,8 +66,8 @@
 # in `frontend/`, but there is no `tauri` npm script and no
 # `@tauri-apps/cli` in `frontend/package.json`, so that job could not work
 # as written. H5 fixed it the same way this workflow does it: the CI job
-# now installs the CLI with `cargo install tauri-cli --locked` and runs
-# `cargo tauri build --no-bundle` from `src-tauri/`.
+# now installs the CLI with `cargo install tauri-cli --version 2.12.4
+# --locked` and runs `cargo tauri build --no-bundle` from `src-tauri/`.
 
 name: RSH Rust — Release
 
@@ -113,8 +129,18 @@ jobs:
           }
           $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
           if ($conf.version -ne $version) { Write-Error "tauri.conf.json version $($conf.version) != $version."; exit 1 }
+          # L6: the frontend is versioned independently in package.json —
+          # a drifted frontend version would ship a bundle that reports a
+          # different version than the tag.
+          $pkg = Get-Content frontend/package.json -Raw | ConvertFrom-Json
+          if ($pkg.version -ne $version) { Write-Error "frontend/package.json version $($pkg.version) != $version."; exit 1 }
+          # L5: tauri.conf.json cannot derive the window title from the
+          # version (static JSON), so the title carries a hardcoded
+          # "v<version>" and this check keeps it in sync with the tag.
+          $expectedTitle = "RSH — Real Sim Hub v$version"
+          if ($conf.app.windows[0].title -ne $expectedTitle) { Write-Error "tauri.conf.json window title '$($conf.app.windows[0].title)' != '$expectedTitle'."; exit 1 }
           if ($conf.bundle.createUpdaterArtifacts -ne $true) { Write-Error "bundle.createUpdaterArtifacts must be true for a release build."; exit 1 }
-          Write-Host "Version $version consistent across Cargo.toml and tauri.conf.json."
+          Write-Host "Version $version consistent across Cargo.toml, tauri.conf.json, frontend/package.json and the window title."
 
       - name: Firmware source present (fail closed)
         shell: pwsh
@@ -161,23 +187,58 @@ jobs:
         shell: pwsh
         run: |
           pip install -U platformio
-          cargo install cargo-cyclonedx cargo-deny --locked
-          cargo install tauri-cli --locked
+          # Pinned (M2): 0.20.2 / 2.12.4 are the latest stable versions on
+          # crates.io, 2026-11-14 (tauri-cli 3.0.0-alpha.6 exists — do NOT
+          # pin a 3.0 alpha for a 2.x app). cargo-cyclonedx is NOT
+          # installed: it cannot reproduce sbom/rust.cdx.json (see the
+          # SBOM step + DECISIONS §16) — the metadata script does that.
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install tauri-cli --version 2.12.4 --locked
           cargo tauri --version
 
-      # ---- Gates (same gates CI runs on main; a tag push does not trigger CI) ----
+      # ---- Sidecar FIRST: fetch pinned HIDMaestro, verify hashes, AOT publish ----
+      # The rsh-app build script (Tauri) validates bundle.externalBin at build
+      # time, so the sidecar must be staged BEFORE `cargo test --workspace` —
+      # otherwise the test step fails with "resource path
+      # `binaries\\rsh-hm-sidecar-x86_64-pc-windows-msvc.exe` doesn't exist"
+      # (release dry runs #1/#2 + first CI run, 2026-11-14). Shared script
+      # (M6) — the same script CI test-windows / tauri-build / clippy-windows
+      # call. Its measured hashes are step outputs for the M4 SBOM check.
+      - name: Fetch + verify HIDMaestro v2.1.0, publish sidecar (AOT)
+        id: sidecar
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
+
+      # ---- Gates (a superset of the CI gates — H4: a tag push does not trigger CI) ----
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy --workspace (warnings denied)
+        # Windows runner + sidecar already staged, so the rsh-app build
+        # script passes here (unlike Linux CI, which excludes rsh-app).
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: cargo test --workspace
         run: cargo test --workspace
+
+      - name: cargo test --workspace --release
+        # TESTING-INPUT §9.1: the --release test run is required at least
+        # once before the release gate — this is that run, before the
+        # Tauri build. (H4)
+        run: cargo test --workspace --release
 
       - name: cargo deny check
         run: cargo deny check
 
-      - name: Frontend tests + build
+      - name: Frontend gates (lint + tests + locales + audit + build)
         working-directory: frontend
         shell: pwsh
         run: |
           npm ci
+          npm run lint
           npm test
+          node scripts/merge-locales.mjs --check
+          npm audit --audit-level=high
           npm run build
 
       # ---- Firmware: build + sign + fail-closed verify ----
@@ -203,7 +264,20 @@ jobs:
           $buildDir = ".pio/build/esp32dev"
           $merged = Get-ChildItem "$buildDir/RSH-Firmware-DevKitV1-v*.bin" -ErrorAction SilentlyContinue
           if ($merged.Count -ne 1) { Write-Error "Expected exactly one merged bin in $buildDir."; exit 1 }
-          if ($merged[0].Length -ne 955056) { Write-Warning "Merged bin size is $($merged[0].Length) B, expected 955056 B (v4.0.1). Recorded, not failed — size changes only with a firmware change." }
+          # L8 (deep-scan Round 2): the merged-bin size check FAILS on
+          # mismatch — a warning let a wrong-size image sail into a
+          # release. Documented exception: a FIRMWARE version bump
+          # changes the size legitimately. In that case update
+          # $expectedMergedBinSize HERE and the v4.0.1 size note in
+          # docs/RELEASE-CHECKLIST-H4.md in the SAME change (the bump
+          # commit), never by weakening this check alone.
+          # Same-version code changes count too: deep-scan Round 2
+          # (SEC-R2-03 AP auto-lock, SEC-R2-04 session rate-limit,
+          # M-5 FACTORY_RESET) grew the app by 928 B, so the gate
+          # updated this to 955984 with a clean-rebuild re-measure
+          # (SHA-256 1a132de9…6f8368, deterministic across rebuilds).
+          $expectedMergedBinSize = 955984
+          if ($merged[0].Length -ne $expectedMergedBinSize) { Write-Error "Merged bin size is $($merged[0].Length) B, expected $expectedMergedBinSize B (firmware v4.0.1). If this is a firmware version bump, update `$expectedMergedBinSize in this workflow and docs/RELEASE-CHECKLIST-H4.md in the same change; otherwise the image is wrong — failing closed."; exit 1 }
           $app = "$buildDir/firmware.bin"
           $signed = "$buildDir/firmware-signed.bin"
           if (-not (Test-Path $signed)) { Write-Error "firmware-signed.bin missing — signing did not run (RSH_SIGNING_KEY unset or sign step failed). An unsigned release is never published."; exit 1 }
@@ -218,44 +292,53 @@ jobs:
           python sign-image.py --verify $env:RSH_SIGNING_KEY_PATH $signed
           Write-Host "Firmware signed + verified: $($merged[0].Name) + firmware-signed.bin."
 
-      # ---- Sidecar: fetch pinned HIDMaestro, verify hashes, AOT publish ----
-      - name: Fetch + verify HIDMaestro v2.1.0, publish sidecar (AOT)
-        shell: pwsh
-        run: |
-          $zipUrl = "https://github.com/hifihedgehog/HIDMaestro/releases/download/v2.1.0/HIDMaestro-v2.1.0.zip"
-          $zip = Join-Path $env:RUNNER_TEMP "HIDMaestro-v2.1.0.zip"
-          Invoke-WebRequest -Uri $zipUrl -OutFile $zip
-          $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          if ($zipHash -ne "7fe349f163864b8dfc36117af260d51bac94a2263b6cdfa719cb364a808397b4") { Write-Error "HIDMaestro ZIP SHA-256 mismatch: $zipHash"; exit 1 }
-          $dllDir = Join-Path $env:RUNNER_TEMP "hidmaestro"
-          Expand-Archive $zip -DestinationPath $dllDir -Force
-          $dll = Get-ChildItem -Recurse $dllDir -Filter "HIDMaestro.Core.dll" | Select-Object -First 1
-          if (-not $dll) { Write-Error "HIDMaestro.Core.dll not found in the release ZIP."; exit 1 }
-          $dllHash = (Get-FileHash $dll.FullName -Algorithm SHA256).Hash.ToLower()
-          if ($dllHash -ne "f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5") { Write-Error "HIDMaestro.Core.dll SHA-256 mismatch: $dllHash"; exit 1 }
-          dotnet publish tools/rsh-hm-sidecar/rsh-hm-sidecar.csproj -c Release -r win-x64 -p:PublishAot=true -p:HidMaestroDllPath=$($dll.FullName)
-          $exe = "tools/rsh-hm-sidecar/bin/Release/net10.0-windows/win-x64/publish/rsh-hm-sidecar.exe"
-          if (-not (Test-Path $exe)) { Write-Error "Sidecar AOT publish produced no exe at $exe."; exit 1 }
-          New-Item -ItemType Directory -Force -Path "src-tauri/binaries" | Out-Null
-          Copy-Item $exe "src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe"
-          Write-Host "Sidecar staged for Tauri externalBin."
-
       # ---- SBOMs regenerated fresh ----
+      # M1 (deep-scan Round 2): `cargo cyclonedx --format json` does NOT
+      # produce what the old step assumed. Proven locally 2026-11-14 with
+      # cargo-cyclonedx 0.5.10: it writes one `<crate>.cdx.json` PER member
+      # next to that member's Cargo.toml (14 files), never a root bom.json
+      # (the old `Copy-Item bom.json` failed fail-closed on a missing file);
+      # its default spec is 1.3, not 1.6; and even merged, its union is
+      # only the shipped graph (420 host-target / 589 with `--target all`)
+      # — dev-deps are excluded, so it can never reproduce the committed
+      # full-lockfile SBOM (626 packages). The Rust SBOM is therefore
+      # generated by .github/scripts/generate-rust-sbom.py (`cargo
+      # metadata`, full resolve, CycloneDX 1.6), which reproduces the
+      # committed file exactly (verified: 0 changed components + rsh-rig).
+      # Frontend: `npm sbom --sbom-version 1.6` is a silent no-op on npm
+      # 10.9.4 — it still emits CycloneDX 1.5 (proven locally). 1.6 needs
+      # npm 11, which is not pinned; so the release requests 1.5
+      # explicitly and the 1.5/1.6 split is documented (DECISIONS §16).
       - name: Regenerate SBOMs
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "release-staging" | Out-Null
-          # cargo-cyclonedx writes bom.json next to the workspace Cargo.toml
-          # (one file per Cargo.toml; --format json selects JSON). There is no
-          # --output-file flag — copy the root bom.json to the staging name.
-          cargo cyclonedx --format json
-          if (-not (Test-Path "bom.json")) { Write-Error "cargo cyclonedx produced no bom.json at the workspace root."; exit 1 }
-          Copy-Item bom.json release-staging/sbom-rust.cdx.json
+          python .github/scripts/generate-rust-sbom.py release-staging/sbom-rust.cdx.json
           Push-Location frontend
-          npm sbom --sbom-format cyclonedx --sbom-version 1.6 > ../release-staging/sbom-frontend.cdx.json
+          npm sbom --sbom-format cyclonedx --sbom-version 1.5 > ../release-staging/sbom-frontend.cdx.json
           Pop-Location
           Copy-Item sbom/sidecar.cdx.json release-staging/sbom-sidecar.cdx.json
-          Write-Host "SBOMs regenerated (sidecar SBOM is hand-written; pins re-verified above)."
+          Write-Host "SBOMs regenerated (sidecar SBOM is hand-written; pins verified in the next step)."
+
+      # M4 (deep-scan Round 2): the hand-written sidecar SBOM is only as
+      # good as its recorded hashes. Verify them against the MEASURED
+      # hashes from the staging step above (step outputs, not re-typed
+      # constants) and the pinned version — a drifted SBOM fails the run.
+      - name: Verify sidecar SBOM against staged hashes (M4)
+        shell: pwsh
+        run: |
+          $sbom = Get-Content release-staging/sbom-sidecar.cdx.json -Raw | ConvertFrom-Json
+          $dllEntry = $sbom.components | Where-Object { $_.name -eq "HIDMaestro.Core.dll" }
+          $driverEntry = $sbom.components | Where-Object { $_.name -eq "HIDMaestro UMDF2 driver" }
+          if (-not $dllEntry) { Write-Error "Sidecar SBOM has no HIDMaestro.Core.dll component."; exit 1 }
+          if (-not $driverEntry) { Write-Error "Sidecar SBOM has no HIDMaestro UMDF2 driver component."; exit 1 }
+          $dllHash = ($dllEntry.hashes | Where-Object { $_.alg -eq "SHA-256" }).content
+          $zipHash = ($driverEntry.hashes | Where-Object { $_.alg -eq "SHA-256" }).content
+          if ($dllEntry.version -ne "2.1.0") { Write-Error "Sidecar SBOM DLL version is $($dllEntry.version), expected 2.1.0."; exit 1 }
+          if ($driverEntry.version -ne "2.1.0") { Write-Error "Sidecar SBOM driver version is $($driverEntry.version), expected 2.1.0."; exit 1 }
+          if ($dllHash -ne "${{ steps.sidecar.outputs.dll_sha256 }}") { Write-Error "Sidecar SBOM DLL SHA-256 $dllHash != measured ${{ steps.sidecar.outputs.dll_sha256 }}."; exit 1 }
+          if ($zipHash -ne "${{ steps.sidecar.outputs.zip_sha256 }}") { Write-Error "Sidecar SBOM ZIP SHA-256 $zipHash != measured ${{ steps.sidecar.outputs.zip_sha256 }}."; exit 1 }
+          Write-Host "Sidecar SBOM verified: v2.1.0, DLL + ZIP hashes match the staged artifacts."
 
       # ---- Tauri build (NSIS + MSI + updater .sig) ----
       - name: cargo tauri build
@@ -346,7 +429,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ steps.tag.outputs.tag }}"
-          gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes "RSH v${{ steps.tag.outputs.version }} — Tauri 2 app (NSIS + MSI) + C++ firmware v4.0.1 (signed). See docs/RELEASE-CHECKLIST-H4.md. App ships unsigned (OV cert deferred, D-R11); firmware is Ed25519-signed and verified." release-staging/*
+          # M5 (deep-scan Round 2): enumerate the staged files explicitly
+          # instead of `release-staging/*` — a glob also matches
+          # directories and can silently pick up (or miss) files if the
+          # staging layout changes; the verify step above already proved
+          # exactly which files are staged.
+          $files = Get-ChildItem release-staging -File | ForEach-Object { $_.FullName }
+          if ($files.Count -eq 0) { Write-Error "No files staged in release-staging/ — refusing to create an empty release."; exit 1 }
+          Write-Host "Releasing $($files.Count) files:"
+          $files | ForEach-Object { Write-Host "  $_" }
+          gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes "RSH v${{ steps.tag.outputs.version }} — Tauri 2 app (NSIS + MSI) + C++ firmware v4.0.1 (signed). See docs/RELEASE-CHECKLIST-H4.md. App ships unsigned (OV cert deferred, D-R11); firmware is Ed25519-signed and verified." $files
 
       - name: Dry run — release NOT created
         if: ${{ github.ref_type != 'tag' && inputs.dry_run != 'false' }}

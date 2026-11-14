@@ -34,7 +34,7 @@ import type { EngineSnapshot } from "@/lib/tauri";
 
 export type ModuleId =
   | "steering"
-  | "accel"
+  | "accelerator"
   | "brake"
   | "clutch"
   | "handbrake"
@@ -71,9 +71,9 @@ export const MODULES: readonly ModuleDef[] = [
     liveValueOf: (snapshot) => clamp01((snapshot.steeringDeg + 450) / 900),
   },
   {
-    id: "accel",
-    labelKey: "tuning.modules.accel.label",
-    hintKey: "tuning.modules.accel.hint",
+    id: "accelerator",
+    labelKey: "tuning.modules.accelerator.label",
+    hintKey: "tuning.modules.accelerator.hint",
     icon: Gauge,
     liveValueOf: (snapshot) => clamp01(snapshot.pedals.accel),
   },
@@ -151,6 +151,10 @@ export function isModuleId(value: unknown): value is ModuleId {
  * Read per-module on/off state from a `get_settings` record. Returns only
  * the entries that are present and boolean; anything else is "Unknown"
  * (absent key), never guessed.
+ *
+ * Legacy alias (C-MOD-1): records written before the canonical rename
+ * may still carry the old `"accel"` key — it maps to `"accelerator"`.
+ * The canonical key wins when both are present.
  */
 export function parseModuleStates(
   settings: Record<string, unknown>,
@@ -160,9 +164,11 @@ export function parseModuleStates(
     return {};
   }
   const states: Partial<Record<ModuleId, boolean>> = {};
-  for (const [key, value] of Object.entries(
-    raw as Record<string, unknown>,
-  )) {
+  const record = raw as Record<string, unknown>;
+  if (typeof record["accel"] === "boolean") {
+    states["accelerator"] = record["accel"];
+  }
+  for (const [key, value] of Object.entries(record)) {
     if (isModuleId(key) && typeof value === "boolean") {
       states[key] = value;
     }

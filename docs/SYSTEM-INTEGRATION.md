@@ -143,15 +143,29 @@ Tauri startup error, not something this check probes.
 `https://github.com/dreamsofts34-creator/RSH/releases/latest/download/latest.json`
 (the `latest.json` manifest the release workflow publishes).
 
-**Deferred to Phase H (H4) — do NOT do now:**
-- Updater **signing keypair** (`cargo tauri signer generate`,
+**Done in Phase H (H4/G-4) — keypair exists; what is still open:**
+- Updater **signing keypair EXISTS** (`cargo tauri signer generate`,
   Ed25519, dedicated — separate from the firmware key and from the
   OV code-signing certificate; private key in the GitHub Actions
-  secret, public key baked into `tauri.conf.json`
-  `plugins.updater.pubkey`). `pubkey` is currently `""` and the
-  updater is `active: false` on purpose: an unsigned updater must
-  never offer an install. H4 fills the real public key, flips
-  `active: true`, and adds the bad-signature-rejects-update test.
+  secret `RSH_UPDATER_PRIVATE_KEY`, public key baked into
+  `tauri.conf.json` `plugins.updater.pubkey` =
+  `RWRU7xMj5S9Eodnz8HNKEz8LacETwEFxkttjZLnCbopqmAdFYT2S7DGb`).
+  The old text here ("`pubkey` is currently `""`", "H4 fills the real
+  public key, flips `active: true`") was stale — corrected deep-scan
+  Round 2 (L2).
+- There is **no `active` field to flip**: verified in
+  `tauri-plugin-updater` 2.14.1 source, its `Config` has no `active`
+  or `dialog` field — both are Tauri v1 leftovers in `tauri.conf.json`,
+  silently ignored. The real gates that keep updates off before
+  v1.0.0 ships are: (1) no `latest.json` is published until the
+  v1.0.0 GitHub Release creates it, and (2) the app code is
+  check-only (no `download_and_install` call anywhere).
+- **OPEN GAP — bad-signature-rejects-update test:** the test that a
+  tampered/unsigned update is rejected was never written (G-6 dry-run
+  proof). It needs a Windows run (owner PC / Windows CI): publish a
+  `latest.json` pointing at a bad signature and assert the updater
+  refuses it. Until that test exists, the updater must stay
+  check-only. (Deep-scan Round 2, L2 — see DECISIONS §16.)
 - Download + install (`update.download_and_install`) — check-only
   in this phase.
 - No `updater:allow-*` capability is granted in

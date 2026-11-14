@@ -123,7 +123,7 @@ export function TuningScreen() {
               aria-label={`${label}: ${hint} (${stateText})`}
               onClick={() => setSelected(isSelected ? null : module.id)}
               className={cn(
-                "rounded-2xl border bg-[var(--card)] p-5 text-left shadow-[0_1px_8px_rgba(60,40,140,0.10)] transition-colors",
+                "rounded-2xl border bg-[var(--card)] p-5 text-left shadow-[var(--shadow)] transition-colors",
                 isSelected
                   ? "border-[var(--accent)] ring-2 ring-[var(--accent)]"
                   : "border-[var(--line)] hover:border-[var(--accent)]",

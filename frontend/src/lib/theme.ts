@@ -57,6 +57,13 @@ export const THEME_TOKENS: Record<
     "--nav-hover-bg": "#F5F3FF",
     "--nav-active-fg": "#4B2FD0",
     "--nav-dot": "#C9C1EE",
+    /**
+     * Clutch series colour for the Monitor charts (H8): the `--info`
+     * cyan (#22D3EE) is only ~1.9:1 on the light card, so charts use
+     * this darker teal instead (≥3:1 on the light card, the minimum
+     * for a non-text chart line). Dark/HC keep the bright cyan.
+     */
+    "--chart-clutch": "#0E7490",
   },
   dark: {
     "--accent": "#6C4CF1",
@@ -86,6 +93,7 @@ export const THEME_TOKENS: Record<
     "--nav-hover-bg": "#1A1F27",
     "--nav-active-fg": "#C4B5FD",
     "--nav-dot": "#4A445F",
+    "--chart-clutch": "#22D3EE",
   },
   "high-contrast": {
     "--accent": "#FFFF00",
@@ -115,6 +123,7 @@ export const THEME_TOKENS: Record<
     "--nav-hover-bg": "#1A1A1A",
     "--nav-active-fg": "#000000",
     "--nav-dot": "#FFFFFF",
+    "--chart-clutch": "#40C4FF",
   },
 };
 
@@ -176,6 +185,38 @@ export function setTheme(theme: ThemeId): ResolvedTheme {
   const resolved = applyTheme(theme);
   storeTheme(theme);
   return resolved;
+}
+
+let systemWatcherInstalled = false;
+
+/**
+ * Follow the OS colour scheme while the stored theme is `system`
+ * (M14): when the OS flips light/dark, re-resolve and re-apply without
+ * a reload. Idempotent — safe to call on every startup. Returns a
+ * cleanup function; the app never unregisters it (it lives for the
+ * whole session).
+ */
+export function installSystemThemeWatcher(): () => void {
+  if (systemWatcherInstalled) return () => {};
+  systemWatcherInstalled = true;
+  if (typeof window === "undefined" || !window.matchMedia) {
+    return () => {};
+  }
+  const query = window.matchMedia("(prefers-color-scheme: dark)");
+  const onChange = () => {
+    if (loadStoredTheme() === "system") applyTheme("system");
+  };
+  if (typeof query.addEventListener === "function") {
+    query.addEventListener("change", onChange);
+    return () => query.removeEventListener("change", onChange);
+  }
+  // Older WebView2: the legacy listener API.
+  const legacy = query as unknown as {
+    addListener?: (fn: () => void) => void;
+    removeListener?: (fn: () => void) => void;
+  };
+  legacy.addListener?.(onChange);
+  return () => legacy.removeListener?.(onChange);
 }
 
 /* ------------------------------------------------------------------ */

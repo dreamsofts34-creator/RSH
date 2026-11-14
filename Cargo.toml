@@ -56,6 +56,11 @@ criterion = "=0.8.2"
 tauri-plugin-single-instance = "=2.5.5"
 tauri-plugin-autostart = "=2.7.0"
 tauri-plugin-updater = "=2.14.1"
+# M13 (deep-scan Round 2): native file picker for the Setup firmware
+# step — Rust crate version matches the frontend
+# `@tauri-apps/plugin-dialog@2.8.4` exactly (JS/Rust pairs ship in
+# lock-step for the official plugins).
+tauri-plugin-dialog = "=2.8.4"
 tauri-build = "=2.7.4"
 # Windows-only (DECISIONS.md §4 — the `windows` crate does NOT compile on
 # Linux, so it is only ever a `[target.'cfg(windows)'.dependencies]`

@@ -519,3 +519,235 @@ scenarios. No failure or bug is carried into v1.0.0.
 FIX-A (soak proxy 594 bytes) and FIX-RIG (soak/long-soak loss +
 ntp-ping + jitter p99 5001). After their fixes land: full gate re-run,
 then the verdict, then the Phase H commit.
+
+## 16. Deep-scan Round 2 decisions — Architecture + Packaging/CI fixes (2026-11-14, pre-release)
+
+**Scope:** `.github/**`, `deny.toml`, `.gitignore`, `sbom/**`,
+`docs/DECISIONS.md`, `docs/RELEASE-CHECKLIST.md`,
+`docs/RELEASE-CHECKLIST-H4.md`, `docs/SYSTEM-INTEGRATION.md`,
+`src-tauri/tauri.conf.json`, `src-tauri/src/main.rs` (doc comments only).
+No code, frontend, or firmware touched; no commit, push, tag, or release
+made by this worker. **CI PROOF PENDING (after push)** — every workflow
+change below is YAML-validated and locally verified as far as the Linux
+sandbox allows; the real CI proof comes from the first CI + release
+dry-run after push.
+
+### 16.1 H1 — rig-gate is fail-closed, `run-rig.sh` does not exist
+The old job skipped while `run-rig.sh` was absent — but there never was
+a `run-rig.sh`; the rig is the `rsh-rig` crate at `tools/rsh-rig`.
+Decision: no wrapper script added; the predicate is now
+`[ -d tools/rsh-rig ]` and the job runs
+`cargo run -p rsh-rig -- --mode quick`. If the rig crate disappears the
+job FAILS (missing-rig branch), it never skips again. Local check:
+`cargo check -p rsh-rig` passes at HEAD 9690064 (verified in a clean
+worktree); in the working tree the rig currently does not compile
+because sibling deep-scan workers are mid-edit in `tools/rsh-rig/`
+(`rss_slope_from` / use-after-move) — NOT this worker's files, NOT
+caused by this change. Full `--mode quick` proof is deferred to the
+gate re-run on a clean tree.
+
+### 16.2 H2 — yanked check is fail-closed; `deny.toml` yanked = "deny"
+Root cause: `cargo audit` exits 0 even when the yanked check never
+completed (612× "couldn't check if the package is yanked" in the Phase
+H gate; reproduced locally 2026-11-14, exit 0). Decision: the CI audit
+job retries `cargo audit --deny warnings` up to 3 times (30 s apart)
+and FAILS if the yanked verdict is still missing after the last
+attempt; `deny.toml` sets `yanked = "deny"` (was `"warn"`) on the same
+basis. Verified locally: `cargo deny check` passes with yanked =
+"deny" (exit 0, all four checks ok) — cargo-deny resolves yanked
+status from local advisory data and does not need the sandbox-blocked
+registry fetch.
+
+### 16.3 H3 — clippy scope is split Linux / Windows (deliberate deviation)
+The audit asked for `cargo clippy --workspace --all-targets` on Linux.
+That literal command is WRONG and was NOT implemented as written:
+`tauri_build::build()` copies the `bundle.externalBin` sidecar at
+build-script time and fails with `ResourcePathNotFound` when the staged
+file for the current target triple is missing (proven from
+tauri-build 2.7.4 `copy_binaries` + tauri-utils 2.10.2
+`resource_from_path` sources). The sidecar is a Windows NativeAOT exe
+and can only be staged on Windows, so a bare `--workspace` on Linux
+would fail at the rsh-app build script. Decision: Linux clippy is
+`cargo clippy --workspace --exclude rsh-app --all-targets` (covers all
+12 other members, incl. the non-default rsh-benchmarks + rsh-rig) and
+a NEW `clippy-windows` job runs `cargo clippy -p rsh-app
+--all-targets` on windows-latest with the sidecar staged first.
+Same root cause found in `test-linux` (`cargo test --workspace`
+would also build rsh-app on Linux): fixed the same way
+(`--exclude rsh-app`; rsh-app is tested on Windows). Both deviations
+are documented in the `ci.yml` header so the next reader does not
+"fix" them back.
+
+### 16.4 H4 — release.yml is now a superset of the CI gates
+A tag push does not trigger CI, so a tag could previously ship what CI
+would have rejected. Decision: the release workflow now runs, before
+the Tauri build, `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets -- -D warnings` (Windows
+runner, sidecar already staged), `cargo test --workspace`,
+`cargo test --workspace --release` (the TESTING-INPUT §9.1 once-before-
+release run), `cargo deny check`, and the full frontend gate
+(`npm run lint`, `npm test`, `merge-locales --check`,
+`npm audit --audit-level=high`, `npm run build`).
+
+### 16.5 M1 — `cargo cyclonedx` does NOT produce the Rust SBOM (proven)
+Local proof with cargo-cyclonedx 0.5.10 (installed pinned for the
+check): `cargo cyclonedx --format json` writes one `<crate>.cdx.json`
+PER member next to that member's Cargo.toml (14 files), never a root
+`bom.json` — the old release step (`Copy-Item bom.json ...`) would
+have failed fail-closed on a missing file. Its default spec is 1.3,
+not 1.6; and even merged, its union tops out at 420 packages
+(host target) / 589 (`--target all`) because dev-deps are excluded
+by design — it can never reproduce the committed full-lockfile SBOM
+(626 packages). Decision: the release workflow generates the Rust
+SBOM with the new checked-in script
+`.github/scripts/generate-rust-sbom.py` (`cargo metadata`, full
+resolve, CycloneDX 1.6). Verified: the script reproduces the
+committed file exactly (0 changed components) plus the missing
+`rsh-rig` (see §16.11). Frontend SBOM split is deliberate: npm
+10.9.4 caps at CycloneDX 1.5 — `--sbom-version 1.6` silently still
+emits 1.5 (proven locally); 1.6 needs npm 11, which is not pinned.
+The release requests 1.5 explicitly. Fresh `npm sbom` output matches
+the committed frontend SBOM exactly (320 entries, same set), so no
+regeneration was needed. Spec split, recorded: Rust 1.6, frontend
+1.5, sidecar 1.6.
+
+### 16.6 M2 — all `cargo install` tool installs pinned; nightly pinned
+Unpinned installs float — a new tool release can break CI without any
+repo change. Pinned (latest stable on crates.io, verified 2026-11-14):
+cargo-deny 0.20.2, cargo-audit 0.23.0, cargo-fuzz 0.13.2,
+cargo-cyclonedx 0.5.10 (install no longer used by any workflow —
+kept as the proven version for ad-hoc use), tauri-cli 2.12.4
+(3.0.0-alpha.6 exists — deliberately NOT pinned: a 3.0 alpha for a
+2.x app). Fuzz nightly pinned to `nightly-2026-11-13` (channel
+manifest verified to exist at static.rust-lang.org); the fuzz run
+uses `cargo +nightly-2026-11-13`.
+
+### 16.7 M6 — one shared sidecar script + a `gate` job
+The fetch/verify/AOT-publish/stage block existed in three copies (CI
+test-windows, CI tauri-build, release.yml) and had already drifted
+once. Decision: single source of truth `tools/ci/stage-sidecar.ps1`
+(pins + hashes as parameters, measured hashes emitted as step
+outputs for M4); all three call sites + the new `clippy-windows`
+job call it. New `gate` job aggregates all 12 CI jobs and fails
+unless every one reports `success` — the single required check for
+branch protection. (Note: the script lives under `tools/ci/`, outside
+the original file-ownership list, because M6 names that exact path;
+it is CI-only support code, not app/firmware code.)
+
+### 16.8 M4 / M5 / M7 — SBOM verification, release enumeration, gitignore
+- M4: the release verifies `sbom/sidecar.cdx.json` against the
+  MEASURED staging hashes (step outputs, not re-typed constants) and
+  the pinned version 2.1.0 — a drifted SBOM fails the run.
+- M5: `gh release create` enumerates staged files explicitly
+  (`Get-ChildItem release-staging -File`) instead of the
+  `release-staging/*` glob.
+- M7: `.gitignore` now covers `src-tauri/binaries/`,
+  `release-staging/`, `bom.json`, and the per-crate
+  `*.cdx.json` outputs (`crates/*`, `tools/*`, `src-tauri/*`).
+
+### 16.9 L8 — merged-bin size check fails (documented exception only)
+`Write-Warning` let a wrong-size firmware image sail into a release.
+Decision: the check FAILS on mismatch. Exception: a firmware version
+bump changes the size legitimately — then the expected size
+(`$expectedMergedBinSize` in `release.yml`, 955,056 B for v4.0.1)
+and the H4 §7 asset row are updated in the SAME change; the check
+itself is never weakened alone.
+
+### 16.10 L2 / L5 / L6 — stale updater docs, version checks
+- L2: `docs/SYSTEM-INTEGRATION.md` §5 and `src-tauri/src/main.rs`
+  `check_for_update` claimed the minisign keypair did not exist yet
+  (`pubkey ""`, "flips `active: true`"). Reality: the keypair EXISTS
+  (H4/G-4; pubkey in `tauri.conf.json`, private key in the
+  `RSH_UPDATER_PRIVATE_KEY` secret), and there is NO `active` field
+  to flip — `tauri-plugin-updater` 2.14.1 `Config` has no `active`/
+  `dialog` field (Tauri v1 leftovers, silently ignored). The real
+  gates are check-only app code + no `latest.json` published yet.
+  OPEN GAP (deferred to the Windows/human gate): the
+  bad-signature-rejects-update test was never written — it needs a
+  Windows run asserting the updater refuses a tampered signature.
+  Until it exists, the updater stays check-only.
+- L5: `tauri.conf.json` cannot derive the window title from the
+  version (static JSON), so the release version check now also
+  asserts the title equals `RSH — Real Sim Hub v<version>`.
+- L6: the release version check now also asserts
+  `frontend/package.json` version matches the tag.
+
+### 16.11 L7 — package recount: 626, not 625 (L1 fixed alongside)
+Recount (2026-11-14): `Cargo.lock` has 626 `[[package]]` entries
+(`cargo metadata` agrees: 626 packages); the committed Rust SBOM
+listed 625 — the one missing package was `rsh-rig` (the test rig,
+not shipped). Decision: the SBOM was regenerated with the §16.5
+script to 626 components (0 other changes); `docs/RELEASE-CHECKLIST.md`
+and `docs/RELEASE-CHECKLIST-H4.md` now say 626. NOT fixed here:
+`THIRD-PARTY-LICENSES.md` still says 625 — it is outside this
+worker's file ownership; the coordinator must update it to 626 in
+the same change (same for `docs/PHASE-H-GATE.md`, which also says
+625). Frontend count is 320 entries (318 unique name@version —
+`magic-string@0.30.21` legitimately appears 3× at different install
+paths); that number was already correct.
+- L1 (same edit round): `deny.toml` said "All five are transitive"
+  and "Review date for all five" for the advisory ignores, but the
+  list has FOUR entries — corrected to "four" (the other "five" in
+  the file, the five permissive license extras, is correct and kept).
+
+### 16.12 L3 / L4 — CI header rewritten; interim icons noted
+- L3: the `ci.yml` skip-map header described Phase A (jobs skipping
+  while phases had not landed). Rewritten to Phase H reality: every
+  prerequisite has landed, NO job is expected to skip anymore, the
+  remaining check steps are tripwires, and the Linux/Windows split
+  (§16.3) is documented in the header.
+- L4 (no action): the icons in `src-tauri/icons/` are H4-generated
+  interim assets (PIL, violet `#6C4CF1` rounded square + white `R`) —
+  a brand mark, not a final logo. No action taken; if the UI plan
+  ever ships a real logo, replace the files and rebuild (H4 §2).
+
+### 16.13 Deferred to the Windows / human gate (not fixed here)
+- First CI run + first release dry-run after push (the actual proof
+  for H1–H4/M2/M6 — see "CI PROOF PENDING" above).
+- Bad-signature-rejects-update test (L2 gap, §16.10).
+- 4-hour soak: SKIPPED by user order (§13) — unchanged, never
+  presented as passed.
+- `THIRD-PARTY-LICENSES.md` 625 → 626 (outside this worker's
+  ownership, §16.11).
+- Real updater end-to-end (manifest fetch, signature verify, install)
+  on the owner PC; `cargo tauri build` producing NSIS + MSI on
+  windows-latest (already listed as Windows-only in H4 §8).
+
+## 17. Deep-scan gate decisions (2026-11-14, gate worker — see `docs/DEEP-SCAN-GATE.md`)
+
+Gate verdict: **CONDITIONAL PASS** — zero failing tests and zero failing rig scenarios locally (Rust 901/0, frontend 241/241, rig full 27/27 seed 42 + multi-seed 54/54, firmware host tests 4444/0, fuzz 500,000 runs 0 crashes). The conditions are exactly the ones every phase carried: first green CI + release dry-run after push (post-push proof), and the Windows/human gates (§17.6). Nothing local is left unproven.
+
+### 17.1 4-hour soak: SKIPPED by user decision — never as passed (§13 unchanged)
+The 4-hour soak stays SKIPPED by the user order of 2026-11-14 14:54 PKT. It is recorded as SKIPPED in the release notes, never as passed. The 10-min rig soak (long-soak, 600 s) PASSED this gate (loss 0%, coalesced 0%, heap slope 0.001 MB/10 min) and the 60 s soak proxy in `cargo test` PASSED — those are the measurements that exist; they do not stand in for the 4-hour run.
+
+### 17.2 CI proof is a POST-PUSH condition (as in all previous phases)
+The gate verdict rests on LOCAL evidence only. First green CI run + first release dry-run after push remain the proof for the CI/release-workflow fixes (H1–H4, M2, M6, L8). The gate does not claim them proven. `cargo audit`'s yanked check and `npm audit` could not complete in this sandbox (registry timeouts / 403 policy_denied) — carried to CI the same way (Phase H F-4). `cargo deny check` with yanked = "deny" PASSED locally and is the fail-closed authority for the yanked verdict (§16.2).
+
+### 17.3 Dialog plugin compile is a Windows gate (W-1)
+Round 2 registered `tauri-plugin-dialog` (Cargo.toml 2.8.4, `main.rs` init, capability, README). The Linux sandbox cannot compile the Windows target (`lib.exe` missing — `cargo check -p rsh-app --target x86_64-pc-windows-msvc` fails in `cc-rs` exactly there, as expected). The dialog compile is Windows gate W-1: proven by the first Windows CI build / `cargo tauri build`, not by this gate.
+
+### 17.4 Merged-bin size moved 955,056 → 955,984 B (same-version code change)
+Round 2 firmware changes (SEC-R2-03 AP auto-lock, SEC-R2-04 session rate-limit, M-5 FACTORY_RESET handler) grew the app by 928 B. The gate clean-rebuilt twice (deterministic SHA-256 `1a132de9fbd4363e3d674f751b054b1a522d8c45f2543823109515e37b6f8368`) and updated `$expectedMergedBinSize` in `release.yml` (955984) plus every live size note (RELEASE-CHECKLIST-H4, RELEASE-CHECKLIST, FLASH-GUIDE, REFLASH-GUIDE, README, FIRMWARE-COMPAT §7) in the same change, per the L8 rule (§16.9). Historical run records (PHASE-H-GATE, FIRMWARE-COMPAT §5) keep the old size — they describe that run. Signed bin is now 890,516 B (app 890,448 + 68 B trailer).
+
+### 17.5 SBOM recount: 629, not 626 (dialog plugin deps)
+`Cargo.lock` has 629 `[[package]]` entries; the committed Rust SBOM was regenerated with the §16.5 script to 629 components (added exactly `rfd` 0.17.2, `tauri-plugin-dialog` 2.8.4, `tauri-plugin-fs` 2.7.1; 0 removed). `THIRD-PARTY-LICENSES.md` now says 629 with a corrected license table (rows sum to 629: MIT 148 incl. all 13 RSH crates, `Apache-2.0 OR MIT` 65; the old table's rows summed to 623 — `r-efi`'s 2 packages lived only in §1.3, now listed in the 2-each row). Frontend stays 320, sidecar 2.
+
+### 17.6 Windows / human gates carried (not proven by this gate)
+- W-1: dialog plugin compile on Windows (`cargo check -p rsh-app --target x86_64-pc-windows-msvc` / first `cargo tauri build`).
+- W-2: foreground-detector E2E (property test exists; live Windows E2E outstanding).
+- A7: real-board run, once, at final production release (owner PC).
+- Clean-PC install Win10 22H2 + Win11 (NSIS + MSI produced by the Windows build; config dry-checked only).
+- Game matrix 0/16 — no pair verified without evidence.
+- Real-Wi-Fi ping (rig NTP-ping is loopback-equivalent; p99 6,438 µs in-process).
+- C# sidecar compile against the real HIDMaestro DLL (DLL absent in sandbox; ZIP/DLL SHA-256 pins verified against the SBOM, staging script read-through PASS).
+- src-tauri Windows compile (tauri_build sidecar copy; `--workspace` on Linux is wrong per H3 — `--exclude rsh-app` used).
+- HAT_NEUTRAL_RAW 0x08 verify (board-side).
+- ACC map-name live confirm.
+- Security M-4: flash encryption, board-side (open).
+- vJoy DLL SHA-256 pin unmeasured (`PINNED_DLL_SHA256_HEX` still deliberately `None`).
+
+### 17.7 Threshold re-measure, not a baseline change
+The benchmark gate first failed on the regression gate only: `pin_validate_blob_factory` 9,201.6 ns vs the 1.25x limit 8,232.1 ns (plan cap 9,879 ns still passed). The script's own instruction is "re-measure and explain". Re-measure on the quiet host: 7,567.9 ns — inside the 1.25x limit and inside the documented ~18% run-to-run spread for pin_validate. No product code touches pin validation (`crates/rsh-protocol/src/pin.rs` untouched by any deep-scan change), so this was host noise, not a regression. No baseline or threshold was raised. All thresholds PASS after the re-measure.
+
+### 17.8 H-2 196 Hz limitation is now historical for coalescing
+The old latest-wins drain coalesced ~3–14% of frames at exactly 200 Hz, which is why the soak emits at 196 Hz. After the Round 2 multi-frame drain, `emit-200hz` at true 200 Hz recorded **coalesced 0%** (6,047 valid packets, 6,048 ticks, loss 0%, rate 201.35/s) on all three seeds (42, 7, 1337). The 196 Hz soak emit is kept as the documented soak default by design, not because the drain needs it. Stale "latest-wins" wording in the rig (harness/scenarios/main/wheel) was corrected to the multi-frame drain in this gate.

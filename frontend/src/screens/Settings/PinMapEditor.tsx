@@ -13,6 +13,7 @@ import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
 import {
   confirmConfig,
+  getConfigState,
   getPinMap,
   rollbackConfig,
   setPinMap,
@@ -52,7 +53,30 @@ type LoadStatus = "loading" | "ready" | "error";
 
 interface DraftPin {
   fn: ModuleId;
+  /** Single-pin functions: the one pin (null = unassigned). */
   pin: number | null;
+  /**
+   * Multi-pin functions (M1): the pin list. Present only for the
+   * multi-pin functions below; `pin` mirrors `pins[0]` for them.
+   * Slots are `number | null` so an empty row can be added before a
+   * pin is chosen; `assignedPins` drops the empty slots.
+   */
+  pins?: (number | null)[];
+}
+
+/**
+ * Functions with more than one GPIO pin (PinAssignment `pins`,
+ * tauri.ts): shifter (gear pins), encoders (2 pins per encoder),
+ * buttons (matrix rows + cols). Every other function is single-pin.
+ */
+const MULTI_PIN_FUNCTIONS: readonly ModuleId[] = [
+  "shifter",
+  "encoders",
+  "buttons",
+];
+
+function isMultiPin(fn: ModuleId): boolean {
+  return (MULTI_PIN_FUNCTIONS as readonly string[]).includes(fn);
 }
 
 const GPIO_PINS: readonly number[] = Array.from({ length: 40 }, (_, i) => i);
@@ -60,16 +84,38 @@ const VALIDATION_DEBOUNCE_MS = 400;
 const CONFIRM_WINDOW_SECONDS = 30;
 
 function draftFromAssignments(list: PinAssignment[]): DraftPin[] {
-  const byFn = new Map<string, number>(
-    list.map((a) => [a.function, a.pin] as [string, number]),
+  const byFn = new Map<string, PinAssignment>(
+    list.map((a) => [a.function, a] as [string, PinAssignment]),
   );
-  return MODULE_IDS.map((fn) => ({ fn, pin: byFn.get(fn) ?? null }));
+  return MODULE_IDS.map((fn) => {
+    const found = byFn.get(fn);
+    if (!found) {
+      return isMultiPin(fn) ? { fn, pin: null, pins: [] } : { fn, pin: null };
+    }
+    if (isMultiPin(fn)) {
+      const pins =
+        found.pins && found.pins.length > 0 ? [...found.pins] : [found.pin];
+      return { fn, pin: pins[0] ?? null, pins };
+    }
+    return { fn, pin: found.pin };
+  });
 }
 
-function assignedPins(draft: DraftPin[]): PinAssignment[] {
-  return draft
-    .filter((d): d is { fn: ModuleId; pin: number } => d.pin !== null)
-    .map((d) => ({ function: d.fn, pin: d.pin }));
+  function assignedPins(draft: DraftPin[]): PinAssignment[] {
+  const out: PinAssignment[] = [];
+  for (const d of draft) {
+    if (isMultiPin(d.fn)) {
+      const pins = (d.pins ?? []).filter(
+        (pin): pin is number => pin !== null,
+      );
+      if (pins.length > 0) {
+        out.push({ function: d.fn, pin: pins[0], pins });
+      }
+    } else if (d.pin !== null) {
+      out.push({ function: d.fn, pin: d.pin });
+    }
+  }
+  return out;
 }
 
 /**
@@ -117,10 +163,31 @@ export function PinMapEditor() {
   const [confirmVisible, setConfirmVisible] = useState(false);
   const [secondsLeft, setSecondsLeft] = useState(CONFIRM_WINDOW_SECONDS);
   const [status, setStatus] = useState<string | null>(null);
+  /** Reset is a two-step confirm (M1): first click arms it. */
+  const [resetArmed, setResetArmed] = useState(false);
   const seqRef = useRef(0);
 
   const loadPinMap = useCallback(async () => {
     setLoadStatus("loading");
+    // H3/M1: on (re)mount, check whether the backend is holding an
+    // unconfirmed change — a remount must not hide a live confirm
+    // window the user still has to answer.
+    try {
+      const state = await getConfigState();
+      if (state === "pending_confirm" || state === "staged") {
+        setConfirmVisible(true);
+        setSecondsLeft(CONFIRM_WINDOW_SECONDS);
+        setStatus(
+          st(
+            t,
+            "settings.pins.configStatePending",
+            "A pin change is waiting for confirmation.",
+          ),
+        );
+      }
+    } catch {
+      // get_config_state failing must not block the pin map load.
+    }
     try {
       const pins = await getPinMap();
       setDraft(draftFromAssignments(pins));
@@ -138,7 +205,7 @@ export function PinMapEditor() {
         setLoadStatus("error");
       }
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     void loadPinMap();
@@ -178,7 +245,10 @@ export function PinMapEditor() {
     return () => window.clearTimeout(timer);
   }, [draft, loadStatus, validationUnavailable, t]);
 
-  // 30 s confirm countdown; expiry means the backend rolled back.
+  // 30 s confirm countdown, synced with the backend window (M1):
+  // the local timer counts down, and a 5 s poll of `get_config_state`
+  // hides the bar as soon as the backend leaves `pending_confirm`
+  // (confirmed elsewhere, expired, or rolled back).
   useEffect(() => {
     if (!confirmVisible) return;
     if (secondsLeft <= 0) {
@@ -195,10 +265,25 @@ export function PinMapEditor() {
       if (!boardMapUnavailable) void loadPinMap();
       return;
     }
-    const id = window.setInterval(() => {
+    const countdown = window.setInterval(() => {
       setSecondsLeft((s) => Math.max(0, s - 1));
     }, 1000);
-    return () => window.clearInterval(id);
+    const sync = window.setInterval(() => {
+      void getConfigState()
+        .then((state) => {
+          if (state !== "pending_confirm" && state !== "staged") {
+            setConfirmVisible(false);
+            if (!boardMapUnavailable) void loadPinMap();
+          }
+        })
+        .catch(() => {
+          // Poll failing: keep the local countdown as the fallback.
+        });
+    }, 5000);
+    return () => {
+      window.clearInterval(countdown);
+      window.clearInterval(sync);
+    };
   }, [confirmVisible, secondsLeft, boardMapUnavailable, loadPinMap, t]);
 
   const applyEnabled =
@@ -288,6 +373,40 @@ export function PinMapEditor() {
   const errors = validation?.errors ?? [];
   const warnings = validation?.warnings ?? [];
 
+  /** Set one pin of a row: single-pin rows use index null. */
+  function updateRowPin(row: DraftPin, index: number | null, pin: number | null) {
+    setDraft((prev) =>
+      prev.map((d) => {
+        if (d.fn !== row.fn) return d;
+        if (!isMultiPin(d.fn) || index === null) {
+          return { ...d, pin };
+        }
+        const pins = [...(d.pins ?? [])];
+        if (pin === null) pins.splice(index, 1);
+        else pins[index] = pin;
+        return { ...d, pin: pins[0] ?? null, pins };
+      }),
+    );
+  }
+
+  function addRowPin(row: DraftPin) {
+    if ((row.pins ?? []).length >= 8) return;
+    setDraft((prev) =>
+      prev.map((d) =>
+        d.fn === row.fn ? { ...d, pins: [...(d.pins ?? []), null] } : d,
+      ),
+    );
+  }
+
+  async function handleReset() {
+    if (!resetArmed) {
+      setResetArmed(true);
+      return;
+    }
+    setResetArmed(false);
+    await loadPinMap();
+  }
+
   return (
     <Card>
       <CardHeader>
@@ -355,41 +474,127 @@ export function PinMapEditor() {
                   >
                     <div className="flex items-center justify-between gap-3">
                       <Label htmlFor={`pin-${row.fn}`}>{label}</Label>
-                      <select
-                        id={`pin-${row.fn}`}
-                        aria-label={st(
-                          t,
-                          "settings.pins.selectPin",
-                          "GPIO pin for {{module}}",
-                          { module: label },
-                        )}
-                        value={row.pin === null ? "" : String(row.pin)}
-                        disabled={applying}
-                        onChange={(event) => {
-                          const value = event.target.value;
-                          const pin =
-                            value === "" ? null : Number.parseInt(value, 10);
-                          setDraft((prev) =>
-                            prev.map((d) =>
-                              d.fn === row.fn ? { ...d, pin } : d,
-                            ),
-                          );
-                        }}
-                        className="h-10 rounded-[10px] border border-[var(--line)] bg-[var(--card)] px-3 py-2 text-sm text-[var(--ink)] focus-visible:outline-2 focus-visible:outline-dashed focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        <option value="">
-                          {st(
+                      {isMultiPin(row.fn) ? (
+                        <div className="flex flex-col items-end gap-2">
+                          {(row.pins ?? []).map((pin, index) => (
+                            <span
+                              key={index}
+                              className="flex items-center gap-2"
+                            >
+                              <select
+                                id={
+                                  index === 0
+                                    ? `pin-${row.fn}`
+                                    : `pin-${row.fn}-${index}`
+                                }
+                                aria-label={st(
+                                  t,
+                                  "settings.pins.selectPin",
+                                  "GPIO pin for {{module}}",
+                                  { module: `${label} ${index + 1}` },
+                                )}
+                                value={pin === null ? "" : String(pin)}
+                                disabled={applying}
+                                onChange={(event) => {
+                                  const value = event.target.value;
+                                  updateRowPin(
+                                    row,
+                                    index,
+                                    value === ""
+                                      ? null
+                                      : Number.parseInt(value, 10),
+                                  );
+                                }}
+                                className="h-10 rounded-[10px] border border-[var(--line)] bg-[var(--card)] px-3 py-2 text-sm text-[var(--ink)] focus-visible:outline-2 focus-visible:outline-dashed focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                <option value="">
+                                  {st(
+                                    t,
+                                    "settings.pins.unassigned",
+                                    "Not assigned",
+                                  )}
+                                </option>
+                                {GPIO_PINS.map((gpio) => (
+                                  <option key={gpio} value={gpio}>
+                                    GPIO {gpio}
+                                  </option>
+                                ))}
+                              </select>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                disabled={applying}
+                                onClick={() =>
+                                  updateRowPin(row, index, null)
+                                }
+                                aria-label={st(
+                                  t,
+                                  "settings.pins.removePin",
+                                  "Remove pin",
+                                )}
+                              >
+                                ×
+                              </Button>
+                            </span>
+                          ))}
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={
+                              applying || (row.pins ?? []).length >= 8
+                            }
+                            onClick={() => addRowPin(row)}
+                          >
+                            {st(
+                              t,
+                              "settings.pins.addPin",
+                              "Add pin",
+                            )}
+                          </Button>
+                          <span className="text-[13px] text-[var(--muted)]">
+                            {st(
+                              t,
+                              "settings.pins.multiPin",
+                              "Multi-pin function — {{count}} pins",
+                              { count: (row.pins ?? []).length },
+                            )}
+                          </span>
+                        </div>
+                      ) : (
+                        <select
+                          id={`pin-${row.fn}`}
+                          aria-label={st(
                             t,
-                            "settings.pins.unassigned",
-                            "Not assigned",
+                            "settings.pins.selectPin",
+                            "GPIO pin for {{module}}",
+                            { module: label },
                           )}
-                        </option>
-                        {GPIO_PINS.map((pin) => (
-                          <option key={pin} value={pin}>
-                            GPIO {pin}
+                          value={row.pin === null ? "" : String(row.pin)}
+                          disabled={applying}
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            const pin =
+                              value === "" ? null : Number.parseInt(value, 10);
+                            updateRowPin(row, null, pin);
+                          }}
+                          className="h-10 rounded-[10px] border border-[var(--line)] bg-[var(--card)] px-3 py-2 text-sm text-[var(--ink)] focus-visible:outline-2 focus-visible:outline-dashed focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <option value="">
+                            {st(
+                              t,
+                              "settings.pins.unassigned",
+                              "Not assigned",
+                            )}
                           </option>
-                        ))}
-                      </select>
+                          {GPIO_PINS.map((pin) => (
+                            <option key={pin} value={pin}>
+                              GPIO {pin}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                     </div>
                     {rowErrors.map((message) => (
                       <p
@@ -514,9 +719,15 @@ export function PinMapEditor() {
                 type="button"
                 variant="outline"
                 disabled={applying}
-                onClick={() => void loadPinMap()}
+                onClick={() => void handleReset()}
               >
-                {st(t, "settings.pins.reset", "Reset changes")}
+                {resetArmed
+                  ? st(
+                      t,
+                      "settings.pins.resetConfirm",
+                      "Click again to confirm reset",
+                    )
+                  : st(t, "settings.pins.reset", "Reset changes")}
               </Button>
             </div>
           </>

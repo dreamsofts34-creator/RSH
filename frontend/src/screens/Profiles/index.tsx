@@ -21,7 +21,9 @@ import {
   deleteProfile,
   duplicateProfile,
   getActiveProfile,
+  listBackups,
   listProfiles,
+  type BackupInfo,
   type ProfileSummary,
 } from "@/lib/tauri";
 
@@ -53,6 +55,24 @@ export function ProfilesScreen() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ProfileSummary | null>(null);
+  // M6: the backup generations come from `list_backups` — real data,
+  // not the static three-row list this card used to render.
+  const [backups, setBackups] = useState<BackupInfo[] | null>(null);
+  const [backupsFailed, setBackupsFailed] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    void listBackups()
+      .then((rows) => {
+        if (alive) setBackups(rows);
+      })
+      .catch(() => {
+        if (alive) setBackupsFailed(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const loadProfiles = useCallback(async () => {
     setLoad({ status: "loading" });
@@ -338,24 +358,74 @@ export function ProfilesScreen() {
                     "Every save rotates current → .bak1 → .bak2. Only the current generation is live; older generations are kept as backups.",
                 })}
               </p>
-              <ul className="space-y-2">
-                {[
-                  { key: "current", live: true },
-                  { key: ".bak1", live: false },
-                  { key: ".bak2", live: false },
-                ].map((gen) => (
-                  <li key={gen.key} className="flex items-center gap-2 text-sm">
-                    <Badge variant={gen.live ? "success" : "outline"}>
-                      {gen.live
-                        ? t("profiles.live", { defaultValue: "Live" })
-                        : t("profiles.generationsUnknown", {
-                            defaultValue: "Not reported yet",
-                          })}
-                    </Badge>
-                    <span className="font-mono text-[13px]">{gen.key}</span>
-                  </li>
-                ))}
-              </ul>
+              {backupsFailed ? (
+                <p role="alert" className="text-sm text-[var(--error-text)]">
+                  {t("profiles.backupLoadFailed", {
+                    defaultValue: "Could not load the backup list.",
+                  })}
+                </p>
+              ) : backups === null ? (
+                <p className="text-sm text-[var(--muted)]">
+                  {t("profiles.loading", { defaultValue: "Loading…" })}
+                </p>
+              ) : backups.length === 0 ? (
+                <p className="text-sm text-[var(--muted)]">
+                  {t("profiles.noBackups", {
+                    defaultValue: "No backups saved yet.",
+                  })}
+                </p>
+              ) : (
+                <ul className="space-y-2">
+                  {backups.map((backup) => {
+                    const live = backup.generation === "current";
+                    const savedAt =
+                      backup.savedAt === null
+                        ? null
+                        : new Date(backup.savedAt);
+                    const savedAtText =
+                      savedAt !== null && !Number.isNaN(savedAt.getTime())
+                        ? savedAt.toLocaleString()
+                        : backup.savedAt;
+                    return (
+                      <li
+                        key={backup.generation}
+                        className="flex flex-wrap items-center gap-2 text-sm"
+                      >
+                        <Badge
+                          variant={
+                            live
+                              ? "success"
+                              : backup.present
+                                ? "outline"
+                                : "secondary"
+                          }
+                        >
+                          {live
+                            ? t("profiles.live", { defaultValue: "Live" })
+                            : backup.present
+                              ? t("profiles.backupPresent", {
+                                  defaultValue: "Saved",
+                                })
+                              : t("profiles.generationsUnknown", {
+                                  defaultValue: "Not reported yet",
+                                })}
+                        </Badge>
+                        <span className="font-mono text-[13px]">
+                          {backup.generation}
+                        </span>
+                        {savedAtText !== null ? (
+                          <span className="text-[13px] text-[var(--muted)]">
+                            {t("profiles.backupSavedAt", {
+                              date: savedAtText,
+                              defaultValue: `Saved ${savedAtText}.`,
+                            })}
+                          </span>
+                        ) : null}
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
             </CardContent>
           </Card>
         </>

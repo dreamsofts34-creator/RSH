@@ -78,6 +78,10 @@ pub struct TelemetrySnapshot {
     pub state: SessionState,
     /// Monotonic read time, for the watcher's debounce (Phase F2).
     pub seen_at: Instant,
+    /// Graphics `packetId` the identity was paired with (M3), when the
+    /// reader paired static + graphics by packet id (`0` = unpaired /
+    /// reader does not pair, e.g. iRacing).
+    pub packet_id: i32,
 }
 
 impl TelemetrySnapshot {
@@ -91,7 +95,17 @@ impl TelemetrySnapshot {
             track_name: track_name.trim().to_string(),
             state,
             seen_at: Instant::now(),
+            packet_id: 0,
         }
+    }
+
+    /// Records the graphics `packetId` this snapshot's static +
+    /// graphics blocks were paired by (M3). Returns `self` for
+    /// chaining.
+    #[must_use]
+    pub fn with_packet_id(mut self, packet_id: i32) -> Self {
+        self.packet_id = packet_id;
+        self
     }
 
     /// Whether this snapshot may trigger a profile switch.

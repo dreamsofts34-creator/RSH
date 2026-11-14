@@ -54,7 +54,9 @@ pub use mapping::{
     build_raw_report, check_button_number, neutral_gamepad_frame, neutral_raw_report,
     validate_capabilities,
 };
-pub use protocol::{AxesJson, Command, Reply, bytes_to_hex, encode_command, parse_reply};
+pub use protocol::{
+    AxesJson, CapabilitiesJson, Command, Reply, bytes_to_hex, encode_command, parse_reply,
+};
 
 /// `HIDMaestro` SDK release pinned for this backend (spike §3.1, re-verified
 /// 2026-11-14: still the latest release).
@@ -114,6 +116,12 @@ pub const SIDECAR_EXE_NAME: &str = "rsh-hm-sidecar";
 /// Bump only with a matching sidecar change; the manager refuses a
 /// hello whose `protocol` is newer than this.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Environment variable carrying the loopback token to the sidecar
+/// (C-TOK-1 — the token is NEVER on the command line; argv is
+/// world-readable via WMI / Process Explorer). Set by the manager
+/// just for the elevated spawn; read by the sidecar at startup.
+pub const SIDECAR_TOKEN_ENV: &str = "RSH_HM_SIDECAR_TOKEN";
 
 /// Environment variable overriding the sidecar path (dev/tests only).
 pub const SIDECAR_PATH_ENV: &str = "RSH_HM_SIDECAR";

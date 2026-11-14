@@ -11,8 +11,10 @@
 //!    configured, and drops ping rounds older than 500 ms;
 //! 3. reconnects the source every 2 s after a drop, if a
 //!    [`SourceFactory`] is configured;
-//! 4. drains the source, keeping only the **latest** frame (stale
-//!    frames are dropped, never queued up);
+//! 4. drains the source, processing **every** queued frame in
+//!    arrival order (H-1 multi-frame drain, bounded to
+//!    `MAX_FRAMES_PER_TICK` frames per tick — frames past the cap
+//!    stay queued for the next tick, never dropped);
 //! 5. runs the sequence check (duplicates dropped silently, gaps
 //!    counted), ticks the watchdog, runs the pipeline, and sends the
 //!    output — or [`OutputState::neutral()`] when the watchdog
@@ -107,6 +109,24 @@ pub fn inter_arrival_jitter_us(new: u32, old: u32) -> u64 {
 const STATUS_CHANNEL_CAPACITY: usize = 16;
 /// Capacity of the ping-reply channel (bounded; unbounded never).
 const PING_REPLY_CHANNEL_CAPACITY: usize = 8;
+/// Max stream frames drained (and processed) in one 5 ms tick (H-1:
+/// multi-frame drain).
+///
+/// The nominal load is 1 frame/tick. A delayed tick can find 2+
+/// frames queued; draining them all instead of keeping only the
+/// latest is what removes the ~3.5% coalesced loss. The cap bounds
+/// the worst-case tick work: 32 frames clear 160 ms of backlog per
+/// tick, and frames past the cap stay queued for the next tick —
+/// deferred, never dropped — so the cap cannot reintroduce
+/// coalescing, it only bounds drain latency.
+const MAX_FRAMES_PER_TICK: usize = 32;
+/// Max status packets drained per tick (L-1: 2× the 16-slot channel
+/// capacity — a racing producer cannot make one tick drain
+/// unboundedly).
+const MAX_STATUS_PER_TICK: usize = 2 * STATUS_CHANNEL_CAPACITY;
+/// Max ping replies drained per tick (L-1: 2× the 8-slot channel
+/// capacity).
+const MAX_PING_REPLIES_PER_TICK: usize = 2 * PING_REPLY_CHANNEL_CAPACITY;
 
 /// Source of decoded stream frames for the engine.
 ///
@@ -140,7 +160,11 @@ pub trait PacketSource: Send {
 /// Builds a fresh [`PacketSource`] after the previous one dropped.
 ///
 /// The engine calls this at most once per [`RECONNECT_INTERVAL`]
-/// while it has no source.
+/// while it has no source. The call runs on a blocking thread
+/// (L7: [`tokio::task::spawn_blocking`]), so it may open a serial
+/// port or do discovery without blocking the 200 Hz tick — but it
+/// must still be cancellation-safe in the sense that a panic in the
+/// factory loses the factory and parks the engine.
 pub trait SourceFactory: Send {
     /// The source type this factory builds. It must be the same type
     /// the engine was constructed with: [`PacketSource`] uses an
@@ -240,6 +264,8 @@ pub struct EngineCounters {
     /// Reconnect attempts: one per [`SourceFactory::create_source`]
     /// call after the source dropped.
     pub source_reconnects: u64,
+    /// Encoder glitch jumps dropped by the filter so far (M4).
+    pub encoder_glitch_dropped: u64,
 }
 
 /// What [`WheelEngine::run`] returns when the loop stops: the final
@@ -332,6 +358,13 @@ pub struct WheelEngine<S: PacketSource> {
     /// `timestamp_us` of the last processed frame, for the
     /// inter-arrival jitter metric.
     last_frame_ts: Option<u32>,
+    /// `uptime_ms` of the last status packet seen, for detecting a
+    /// board uptime reset (L8 reboot evidence).
+    last_status_uptime_ms: Option<u32>,
+    /// A status packet since the last frame showed the board uptime
+    /// jumping backwards (reboot evidence, L8); consumed by the next
+    /// [`Self::handle_frame`].
+    status_uptime_reset: bool,
     /// Monotonic clock origin for ping `t0` timestamps.
     started_at: Instant,
     /// Next instant a ping request is due (first ping immediately).
@@ -353,7 +386,7 @@ pub struct WheelEngine<S: PacketSource> {
     stop_rx: watch::Receiver<bool>,
 }
 
-impl<S: PacketSource> WheelEngine<S> {
+impl<S: PacketSource + 'static> WheelEngine<S> {
     /// Build an engine from a pipeline, a frame source and an output
     /// sink. Ping is disabled and there is no reconnect factory until
     /// [`Self::with_ping_sender`] / [`Self::with_source_factory`]
@@ -378,6 +411,8 @@ impl<S: PacketSource> WheelEngine<S> {
             last_output: OutputState::neutral(),
             last_btns_ex: 0,
             last_frame_ts: None,
+            last_status_uptime_ms: None,
+            status_uptime_reset: false,
             started_at: now,
             next_ping_at: now,
             next_reconnect_at: None,
@@ -474,27 +509,28 @@ impl<S: PacketSource> WheelEngine<S> {
     }
 
     /// One 5 ms tick: status/ping drains, ping send, reconnect, drain
-    /// the latest frame, process, and send the output (neutral when
-    /// the watchdog reports stale data).
+    /// every queued frame, process them in arrival order, and send
+    /// the output (neutral when the watchdog reports stale data).
+    /// Only one output is sent per tick — the state of the last
+    /// processed frame — so the output rate stays 200 Hz even when
+    /// a delayed tick drains several frames.
     async fn on_tick(&mut self) {
         let now = Instant::now();
         self.drain_status();
         self.drain_ping_replies(now);
         self.maybe_send_ping(now);
-        self.maybe_reconnect(now);
-        let frame = self.drain_source().await;
-        let had_frame = frame.is_some();
+        self.maybe_reconnect(now).await;
+        let frames = self.drain_source().await;
+        let had_frame = !frames.is_empty();
         let started = Instant::now();
-        let out = match frame {
-            Some(frame) => self.handle_frame(&frame, now),
-            None => {
-                if self.watchdog.is_stale(now) {
-                    OutputState::neutral()
-                } else {
-                    self.last_output
-                }
-            }
+        let mut out = if self.watchdog.is_stale(now) {
+            OutputState::neutral()
+        } else {
+            self.last_output
         };
+        for frame in &frames {
+            out = self.handle_frame(frame, now);
+        }
         let out = if self.watchdog.is_stale(now) {
             OutputState::neutral()
         } else {
@@ -507,9 +543,24 @@ impl<S: PacketSource> WheelEngine<S> {
     }
 
     /// Drain all queued status packets: board loss counters, metrics
-    /// pass-through, and the `btnsEx` merge value.
+    /// pass-through, and the `btnsEx` merge value. Also watches the
+    /// board uptime: a backward jump of more than 1 s is a reboot
+    /// (uptime only ever increases, apart from the ~49-day `u32`
+    /// wrap, which is a jump of ~2³² ms — far past the threshold too),
+    /// and arms the rebaseline evidence for the next frame (L8).
     fn drain_status(&mut self) {
-        while let Ok(status) = self.status_rx.try_recv() {
+        let mut drained = 0;
+        while drained < MAX_STATUS_PER_TICK {
+            let Ok(status) = self.status_rx.try_recv() else {
+                break;
+            };
+            drained += 1;
+            if let Some(last) = self.last_status_uptime_ms
+                && last.wrapping_sub(status.uptime_ms) > 1_000
+            {
+                self.status_uptime_reset = true;
+            }
+            self.last_status_uptime_ms = Some(status.uptime_ms);
             self.sequence.ingest_status(&status);
             self.metrics.update_status_counters(
                 self.sequence.board_seq_gap(),
@@ -526,7 +577,12 @@ impl<S: PacketSource> WheelEngine<S> {
     /// ignored by the tracker and never measured.
     fn drain_ping_replies(&mut self, now: Instant) {
         let now_us = monotonic_us(self.started_at, now);
-        while let Ok(frame) = self.ping_rx.try_recv() {
+        let mut drained = 0;
+        while drained < MAX_PING_REPLIES_PER_TICK {
+            let Ok(frame) = self.ping_rx.try_recv() else {
+                break;
+            };
+            drained += 1;
             if let Some(measurement) = self.ping.on_reply(frame, now_us) {
                 self.metrics.record_ping_measurement(&measurement);
             }
@@ -552,7 +608,16 @@ impl<S: PacketSource> WheelEngine<S> {
     /// If the source is gone and a reconnect is due, ask the factory
     /// for a fresh source. With no factory the engine stays parked:
     /// it keeps ticking and sending neutral until stopped.
-    fn maybe_reconnect(&mut self, now: Instant) {
+    ///
+    /// L7: the factory call runs on a blocking thread
+    /// ([`tokio::task::spawn_blocking`]) — `create_source` may open a
+    /// serial port or do discovery, which must never block the 200 Hz
+    /// tick. The factory is taken out of the engine for the call and
+    /// restored afterwards; if the blocking task panics the factory is
+    /// lost and the engine parks (a retry is still scheduled, but with
+    /// no factory it stays parked — a panicking factory must not wedge
+    /// the loop into a spawn storm).
+    async fn maybe_reconnect(&mut self, now: Instant) {
         if self.source.is_some() {
             return;
         }
@@ -562,28 +627,42 @@ impl<S: PacketSource> WheelEngine<S> {
         if now < due {
             return;
         }
-        let Some(factory) = self.factory.as_mut() else {
+        let Some(mut factory) = self.factory.take() else {
             return;
         };
         self.counters.source_reconnects += 1;
-        match factory.create_source() {
-            Some(source) => {
+        let spawned = tokio::task::spawn_blocking(move || {
+            let source = factory.create_source();
+            (factory, source)
+        })
+        .await;
+        match spawned {
+            Ok((factory, Some(source))) => {
+                self.factory = Some(factory);
                 self.source = Some(source);
                 self.next_reconnect_at = None;
             }
-            None => {
+            Ok((factory, None)) => {
+                self.factory = Some(factory);
+                self.next_reconnect_at = Some(now + RECONNECT_INTERVAL);
+            }
+            Err(_) => {
                 self.next_reconnect_at = Some(now + RECONNECT_INTERVAL);
             }
         }
     }
 
-    /// Drain the source, keeping only the newest frame. Polls are
-    /// zero-timeout, so a stuck source can never block the tick; a
-    /// `None` marks the source dropped and schedules a reconnect.
-    async fn drain_source(&mut self) -> Option<StreamFrame> {
-        let mut latest = None;
+    /// Drain the source, returning every frame queued right now, in
+    /// arrival order, up to `MAX_FRAMES_PER_TICK` (H-1 multi-frame
+    /// drain). Polls are zero-timeout, so a stuck source can never
+    /// block the tick; a `None` marks the source dropped and schedules
+    /// a reconnect. Frames already collected are still returned when
+    /// the source drops mid-drain, and frames past the cap stay
+    /// queued for the next tick — deferred, never dropped.
+    async fn drain_source(&mut self) -> Vec<StreamFrame> {
+        let mut frames = Vec::new();
         let mut dropped = false;
-        loop {
+        while frames.len() < MAX_FRAMES_PER_TICK {
             let polled = {
                 let Some(source) = self.source.as_mut() else {
                     break;
@@ -591,7 +670,7 @@ impl<S: PacketSource> WheelEngine<S> {
                 timeout(Duration::ZERO, source.next_frame()).await
             };
             match polled {
-                Ok(Some(frame)) => latest = Some(frame),
+                Ok(Some(frame)) => frames.push(frame),
                 Ok(None) => {
                     dropped = true;
                     break;
@@ -604,40 +683,57 @@ impl<S: PacketSource> WheelEngine<S> {
             self.source = None;
             self.next_reconnect_at = Some(Instant::now() + RECONNECT_INTERVAL);
         }
-        latest
+        frames
     }
 
     /// Handle one drained frame: watchdog tick, jitter sample, the
     /// sequence decision, and the pipeline. Duplicates are dropped
     /// silently (the current output is repeated); gaps are counted
     /// in the metrics loss window and processing continues.
+    ///
+    /// L1: jitter is sampled only for accepted frames — a duplicate
+    /// retransmission's timestamp is stale by definition and must not
+    /// pollute the jitter p99. A gap is recorded as one batch
+    /// ([`EngineMetrics::record_gap`]), not a per-packet loop.
+    /// L8: a large backward sequence jump rebaselines only with
+    /// reboot evidence — a stale watchdog (no frame for ≥ 250 ms) or
+    /// a status-packet uptime reset since the last frame.
     fn handle_frame(&mut self, frame: &StreamFrame, now: Instant) -> OutputState {
+        // Reboot evidence is read before the watchdog tick: a frame
+        // arriving after ≥ 250 ms of silence is evidence the board
+        // may have restarted.
+        let reboot_evidence = self.watchdog.is_stale(now) || self.status_uptime_reset;
+        self.status_uptime_reset = false;
         // Any frame arrival proves the link is alive, even a
         // duplicate retransmission.
         self.watchdog.tick(now);
+        let decision = self
+            .sequence
+            .check_with_evidence(frame.seq, reboot_evidence);
+        if decision == SeqDecision::Duplicate {
+            self.counters.frames_dropped_duplicate += 1;
+            return self.last_output;
+        }
         if let Some(prev_ts) = self.last_frame_ts {
             self.metrics
                 .record_inter_arrival_jitter(inter_arrival_jitter_us(frame.timestamp_us, prev_ts));
         }
         self.last_frame_ts = Some(frame.timestamp_us);
-        match self.sequence.check(frame.seq) {
-            SeqDecision::Duplicate => {
-                self.counters.frames_dropped_duplicate += 1;
-                return self.last_output;
-            }
+        let skipped = match decision {
             SeqDecision::Gap(skipped) => {
-                for _ in 0..skipped {
-                    self.metrics.record_packet(false);
-                }
-                self.metrics.record_packet(true);
+                self.metrics.record_gap(skipped);
+                skipped
             }
             SeqDecision::Accept => {
                 self.metrics.record_packet(true);
+                0
             }
-        }
-        let mut out = self.pipeline.process(frame);
+            SeqDecision::Duplicate => unreachable!("duplicates returned above"),
+        };
+        let mut out = self.pipeline.process_with_gap(frame, skipped);
         out.buttons_ex = self.last_btns_ex;
         self.counters.frames_processed += 1;
+        self.counters.encoder_glitch_dropped = self.pipeline.encoder_glitch_dropped();
         self.last_output = out;
         out
     }
@@ -965,6 +1061,63 @@ mod tests {
         assert!(states.iter().any(|s| s.steering > 0.9), "{states:?}");
     }
 
+    #[tokio::test]
+    async fn multi_frame_drain_processes_every_queued_frame() {
+        // H-1 regression: three frames queued before a single tick
+        // must ALL be processed — the old latest-wins drain kept only
+        // the last one and the other two counted as coalesced gaps.
+        // Driving `on_tick` directly (no ticker) makes the queueing
+        // deterministic: all three frames are waiting when the tick runs.
+        let (tx, rx) = mpsc::channel(32);
+        let (sink, states) = RecordingSink::new(false);
+        let mut engine = WheelEngine::new(
+            ProcessingPipeline::new(PipelinePlan::default()),
+            ChannelSource::new(rx),
+            Box::new(sink),
+        );
+        for (seq, ts) in [(0, 0), (1, 5_000), (2, 10_000)] {
+            tx.send(frame(seq, ts, 3300))
+                .await
+                .expect("source channel open");
+        }
+        engine.on_tick().await;
+        let report = engine.report();
+        assert_eq!(report.counters.frames_processed, 3);
+        assert_eq!(report.sequence_gaps, 0);
+        assert_eq!(report.counters.frames_dropped_duplicate, 0);
+        // One output per tick, from the LAST frame (steering full right).
+        let states = recorded(&states);
+        assert_eq!(states.len(), 1, "one send per tick: {states:?}");
+        assert!(states[0].steering > 0.9, "{states:?}");
+    }
+
+    #[tokio::test]
+    async fn drain_source_is_bounded_and_defers_the_rest() {
+        // H-1 bound: one tick drains at most MAX_FRAMES_PER_TICK
+        // frames; the rest stay queued for the next tick — deferred,
+        // never dropped.
+        let (tx, rx) = mpsc::channel(64);
+        let (sink, _states) = RecordingSink::new(false);
+        let mut engine = WheelEngine::new(
+            ProcessingPipeline::new(PipelinePlan::default()),
+            ChannelSource::new(rx),
+            Box::new(sink),
+        );
+        let cap_u16 = u16::try_from(MAX_FRAMES_PER_TICK).expect("cap fits u16");
+        for seq in 0..(cap_u16 + 8) {
+            tx.send(frame(seq, u32::from(seq) * 5_000, 3300))
+                .await
+                .expect("source channel open");
+        }
+        let first = engine.drain_source().await;
+        assert_eq!(first.len(), MAX_FRAMES_PER_TICK);
+        assert_eq!(first.first().map(|f| f.seq), Some(0));
+        assert_eq!(first.last().map(|f| f.seq), Some(cap_u16 - 1));
+        let rest = engine.drain_source().await;
+        assert_eq!(rest.len(), 8);
+        assert_eq!(rest.first().map(|f| f.seq), Some(cap_u16));
+    }
+
     #[test]
     fn signed_timestamp_delta_handles_reorder_and_wrap() {
         assert_eq!(signed_timestamp_delta_us(5_000, 0), 5_000);
@@ -996,8 +1149,8 @@ mod tests {
             sleep(Duration::from_millis(50)).await;
         }
         // Retransmission of seq 1, timestamp 5000 — 5000 µs behind
-        // the previous frame. Jitter is recorded before the
-        // sequence check, so this duplicate still yields a sample.
+        // the previous frame. L1: jitter is recorded only for
+        // accepted frames, so this duplicate yields NO sample.
         harness
             .tx
             .send(frame(1, 5_000, 3300))
@@ -1006,9 +1159,102 @@ mod tests {
         sleep(Duration::from_millis(50)).await;
         let report = stop_and_report(&mut harness).await;
         assert_eq!(report.counters.frames_dropped_duplicate, 1);
-        // Samples: 0, 0, |−5000 − 5000| = 10_000. Nearest-rank p99
-        // is the largest sample — 10_000, never ~2³².
-        assert_eq!(report.metrics.jitter_p99(), Some(10_000));
+        // Samples: 0, 0 — the duplicate contributed nothing.
+        // Nearest-rank p99 is 0, never ~2³² and never 10_000.
+        assert_eq!(report.metrics.jitter_p99(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn gap_records_loss_batch_and_duplicate_skips_jitter() {
+        // L1: seq 0 then seq 5 (4 skipped) records 4 lost + 1
+        // received in one batch (loss 4/6); the duplicate of seq 5
+        // with a reordered timestamp adds no jitter sample.
+        let mut harness = start(false);
+        harness
+            .tx
+            .send(frame(0, 0, 3300))
+            .await
+            .expect("send seq 0");
+        sleep(Duration::from_millis(50)).await;
+        harness
+            .tx
+            .send(frame(5, 25_000, 3300))
+            .await
+            .expect("send seq 5");
+        sleep(Duration::from_millis(50)).await;
+        harness
+            .tx
+            .send(frame(5, 20_000, 3300))
+            .await
+            .expect("send duplicate seq 5");
+        sleep(Duration::from_millis(50)).await;
+        let report = stop_and_report(&mut harness).await;
+        assert_eq!(report.counters.frames_processed, 2);
+        assert_eq!(report.counters.frames_dropped_duplicate, 1);
+        assert_eq!(report.sequence_gaps, 4);
+        assert!((report.metrics.loss_fraction() - 4.0 / 6.0).abs() < f64::EPSILON);
+        // Jitter samples: only the accepted seq-5 frame, |25000-0-5000|.
+        assert_eq!(report.metrics.jitter_p99(), Some(20_000));
+    }
+
+    #[tokio::test]
+    async fn large_backward_jump_after_silence_rebaselines() {
+        // L8: seq 1000, 1001, then silence > 250 ms (stale watchdog),
+        // then seq 0 — the board rebooted, so seq 0 accepts and
+        // rebaselines instead of counting as a duplicate.
+        let mut harness = start(false);
+        harness
+            .tx
+            .send(frame(1000, 0, 3300))
+            .await
+            .expect("send seq 1000");
+        sleep(Duration::from_millis(50)).await;
+        harness
+            .tx
+            .send(frame(1001, 5_000, 3300))
+            .await
+            .expect("send seq 1001");
+        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(300)).await; // watchdog goes stale
+        harness
+            .tx
+            .send(frame(0, 10_000, 3300))
+            .await
+            .expect("send seq 0 after reboot");
+        sleep(Duration::from_millis(50)).await;
+        let report = stop_and_report(&mut harness).await;
+        assert_eq!(report.counters.frames_processed, 3);
+        assert_eq!(report.counters.frames_dropped_duplicate, 0);
+        assert_eq!(report.sequence_rebaselines, 1);
+    }
+
+    #[tokio::test]
+    async fn large_backward_jump_without_silence_is_duplicate() {
+        // L8 without evidence: seq 0 right after seq 1001 (no
+        // silence, no uptime reset) is a duplicate, not a reboot.
+        let mut harness = start(false);
+        harness
+            .tx
+            .send(frame(1000, 0, 3300))
+            .await
+            .expect("send seq 1000");
+        sleep(Duration::from_millis(50)).await;
+        harness
+            .tx
+            .send(frame(1001, 5_000, 3300))
+            .await
+            .expect("send seq 1001");
+        sleep(Duration::from_millis(50)).await;
+        harness
+            .tx
+            .send(frame(0, 10_000, 3300))
+            .await
+            .expect("send seq 0");
+        sleep(Duration::from_millis(50)).await;
+        let report = stop_and_report(&mut harness).await;
+        assert_eq!(report.counters.frames_processed, 2);
+        assert_eq!(report.counters.frames_dropped_duplicate, 1);
+        assert_eq!(report.sequence_rebaselines, 0);
     }
 
     /// Sink recording the per-tick metrics the engine offers (H1

@@ -79,6 +79,12 @@ export function TuningPanel({ module, enabled, onClose }: TuningPanelProps) {
 
   const savedRef = useRef<TuningSettings | null>(null);
   const saveTimerRef = useRef<number | undefined>(undefined);
+  /**
+   * Autosave sequence token (H6): each save attempt takes a number;
+   * a late response from an older attempt must never overwrite the
+   * draft a newer save already produced.
+   */
+  const saveSeqRef = useRef(0);
 
   const label = t(module.labelKey, { defaultValue: module.id });
   const controlsDisabled = enabled === false || status !== "ready";
@@ -114,17 +120,21 @@ export function TuningPanel({ module, enabled, onClose }: TuningPanelProps) {
     };
   }, [module, loadNonce]);
 
-  // Persist one draft through set_tuning.
+  // Persist one draft through set_tuning. Only the latest save
+  // attempt may apply its result (H6 sequence token).
   const saveNow = useCallback(async (values: TuningSettings) => {
     window.clearTimeout(saveTimerRef.current);
+    const seq = ++saveSeqRef.current;
     setSaveState("saving");
     setSaveError(null);
     try {
       const saved = await setTuning(values);
+      if (saveSeqRef.current !== seq) return;
       savedRef.current = saved;
       setDraft(saved);
       setSaveState("saved");
     } catch (error) {
+      if (saveSeqRef.current !== seq) return;
       setSaveState("error");
       setSaveError(errorMessage(error));
     }
@@ -181,6 +191,19 @@ export function TuningPanel({ module, enabled, onClose }: TuningPanelProps) {
     }
     setSpanGuard(clamped);
     setDraft(next);
+  }
+
+  /**
+   * Module-specific extension fields (C-TUNE-1): shifter gate,
+   * horn button, LED pattern. They persist through the same autosave
+   * as the base sliders — a save never drops them.
+   */
+  function updateExtension(
+    field: "shifterGate" | "hornButton" | "ledPattern",
+    value: TuningSettings[typeof field],
+  ) {
+    if (!draft) return;
+    setDraft({ ...draft, [field]: value });
   }
 
   function handleReset() {
@@ -347,6 +370,138 @@ export function TuningPanel({ module, enabled, onClose }: TuningPanelProps) {
                 onChange={(value) => updateField("smoothing", value)}
               />
             </div>
+
+            {/* Module-specific extensions (C-TUNE-1): only the fields
+                this module owns render here; the rest stay unset and
+                are never invented. */}
+            {(module.id === "clutch" || module.id === "brake") && (
+              <div className="grid gap-5 sm:grid-cols-2">
+                <FieldSlider
+                  label={t("tuning.bitePoint", { defaultValue: "Bite point" })}
+                  value={Math.round((draft.bitePoint ?? 0) * 100)}
+                  min={0}
+                  max={100}
+                  step={1}
+                  disabled={controlsDisabled}
+                  valueText={`${Math.round((draft.bitePoint ?? 0) * 100)}%`}
+                  onChange={(value) => updateField("bitePoint", value / 100)}
+                />
+              </div>
+            )}
+
+            {module.id === "shifter" && (
+              <div className="space-y-2">
+                <label
+                  htmlFor="tuning-shifter-gate"
+                  className="text-sm font-semibold"
+                >
+                  {t("tuning.shifterGate", { defaultValue: "Shifter gate" })}
+                </label>
+                <select
+                  id="tuning-shifter-gate"
+                  value={draft.shifterGate ?? ""}
+                  disabled={controlsDisabled}
+                  onChange={(event) =>
+                    updateExtension(
+                      "shifterGate",
+                      event.target.value === ""
+                        ? undefined
+                        : (event.target.value as "sequential" | "h-pattern"),
+                    )
+                  }
+                  className="h-10 w-full max-w-xs rounded-[10px] border border-[var(--line)] bg-[var(--card)] px-3 py-2 text-sm text-[var(--ink)] focus-visible:outline-2 focus-visible:outline-dashed focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <option value="">
+                    {t("tuning.shifterGateUnset", { defaultValue: "Not set" })}
+                  </option>
+                  <option value="sequential">
+                    {t("tuning.shifterGateSequential", { defaultValue: "Sequential" })}
+                  </option>
+                  <option value="h-pattern">
+                    {t("tuning.shifterGateHPattern", { defaultValue: "H-pattern" })}
+                  </option>
+                </select>
+              </div>
+            )}
+
+            {module.id === "horn" && (
+              <div className="space-y-2">
+                <label
+                  htmlFor="tuning-horn-button"
+                  className="text-sm font-semibold"
+                >
+                  {t("tuning.hornButton", { defaultValue: "Horn button" })}
+                </label>
+                <input
+                  id="tuning-horn-button"
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  max={32}
+                  value={draft.hornButton ?? ""}
+                  disabled={controlsDisabled}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    updateExtension(
+                      "hornButton",
+                      value === "" ? undefined : Number(value),
+                    );
+                  }}
+                  className="h-10 w-full max-w-xs rounded-[10px] border border-[var(--line)] bg-[var(--card)] px-3 py-2 text-sm text-[var(--ink)] focus-visible:outline-2 focus-visible:outline-dashed focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                />
+              </div>
+            )}
+
+            {module.id === "led" && (
+              <div className="grid gap-5 sm:grid-cols-2">
+                <FieldSlider
+                  label={t("tuning.ledBrightness", { defaultValue: "LED brightness" })}
+                  value={draft.ledBrightness ?? 100}
+                  min={0}
+                  max={100}
+                  step={1}
+                  disabled={controlsDisabled}
+                  valueText={`${draft.ledBrightness ?? 100}%`}
+                  onChange={(value) => updateField("ledBrightness", value)}
+                />
+                <div className="space-y-2">
+                  <label
+                    htmlFor="tuning-led-pattern"
+                    className="text-sm font-semibold"
+                  >
+                    {t("tuning.ledPattern", { defaultValue: "LED pattern" })}
+                  </label>
+                  <select
+                    id="tuning-led-pattern"
+                    value={draft.ledPattern ?? ""}
+                    disabled={controlsDisabled}
+                    onChange={(event) =>
+                      updateExtension(
+                        "ledPattern",
+                        event.target.value === ""
+                          ? undefined
+                          : (event.target.value as NonNullable<TuningSettings["ledPattern"]>),
+                      )
+                    }
+                    className="h-10 w-full max-w-xs rounded-[10px] border border-[var(--line)] bg-[var(--card)] px-3 py-2 text-sm text-[var(--ink)] focus-visible:outline-2 focus-visible:outline-dashed focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <option value="">
+                      {t("tuning.shifterGateUnset", { defaultValue: "Not set" })}
+                    </option>
+                    {(
+                      ["off", "solid", "blink", "chase", "rainbow"] as const
+                    ).map((pattern) => (
+                      <option key={pattern} value={pattern}>
+                        {t(`tuning.ledPattern${pattern[0].toUpperCase()}${pattern.slice(1)}`, {
+                          defaultValue:
+                            pattern[0].toUpperCase() + pattern.slice(1),
+                        })}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            )}
 
             {spanGuard && (
               <p role="status" className="text-sm text-[var(--warning-text)]">

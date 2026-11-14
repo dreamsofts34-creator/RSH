@@ -23,7 +23,10 @@
 //! `get_active_profile`, `activate_profile`, `create_profile`,
 //! `duplicate_profile`, `delete_profile`, `import_profile`,
 //! `export_profile`, `list_games`, `launch_game`, `stop_game`,
-//! `get_game_state`, `get_settings`, `set_settings`, `backup_now`,
+//! `get_game_state`, `get_settings`, `set_settings` (PATCH),
+//! `enable_auto_switch`, `led_test`, `key_reset`, `factory_reset`,
+//! `confirm_pairing_replacement`, `import_csharp_profiles`,
+//! `import_csharp_settings`, `backup_now`,
 //! `restore_backup`, `get_tuning`, `set_tuning`, `get_calibration`,
 //! `save_calibration` (Phase G0) + `get_transport_state`,
 //! `connect_transport`, `disconnect_transport`, `switch_transport`,
@@ -78,15 +81,17 @@ use std::sync::Arc;
 
 use app_state::AppState;
 use rsh_app_core::commands::{
-    BackendStatus, BackupInfo, FirewallState, FirmwareValidation, OutputState, PinAssignment,
-    PinMapValidation, TuningSettings,
+    BackendStatus, BackupInfo, FirewallState, FirmwareValidation, LedPattern, OutputState,
+    PinAssignment, PinMapValidation, TuningSettings,
 };
 use rsh_app_core::snapshot::{EngineSnapshot, EngineStats};
-use rsh_app_core::state::{AppSettings, ProfileSummary};
+use rsh_app_core::state::{AppSettings, AppSettingsPatch, ProfileSummary, is_allowed_board_ip};
 use rsh_app_core::state::{
     AppStateCore, Calibration, GameInfo, PairingStatus, TransportKind, TransportState,
 };
-use rsh_app_core::system::UpdateInfo;
+use rsh_app_core::system::{
+    InstanceDecision, UpdateInfo, parse_instance_version_arg, resolve_instance,
+};
 use tauri::Manager;
 
 /// Application version (new Rust series: v1.0.0).
@@ -158,8 +163,14 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
 }
 
 /// Asks the Tauri updater plugin whether a newer release exists.
-/// Check-only: download/install is a Phase H action (the updater is
-/// configured `active: false` until the minisign keypair exists).
+/// Check-only: download/install is a Windows-gate action, not a code
+/// change — the minisign keypair already exists (pubkey baked into
+/// `tauri.conf.json`, private key in the `RSH_UPDATER_PRIVATE_KEY`
+/// secret) and the `active: false` in the config is a Tauri v1 leftover
+/// the updater plugin ignores (its `Config` has no `active` field).
+/// What keeps updates off is check-only app code + no `latest.json`
+/// published yet; the bad-signature-rejects-update test is still an
+/// open gap (deep-scan Round 2, L2 — see docs/SYSTEM-INTEGRATION.md §5).
 #[tauri::command]
 async fn check_for_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
     system::check_for_update(&app).await
@@ -208,11 +219,25 @@ fn get_transport_state(state: tauri::State<'_, AppState>) -> TransportState {
 /// Persists a typed Wi-Fi address as `esp_ip` when it parses as an
 /// IP literal. A hostname such as `rsh.local` is left alone — the
 /// forwarder only ever dials the IP literal, so persisting a hostname
-/// would silently change the board the app dials.
+/// would silently change the board the app dials. M-1: a public
+/// (non-private, non-loopback) IP literal is refused loudly instead
+/// of persisted — the board only ever lives on the local network, so
+/// a public address is a typo or a spoofed hint, never a real board.
 fn persist_esp_ip(state: &AppState, address: &str) -> Result<(), String> {
     let Ok(ip) = address.parse::<std::net::IpAddr>() else {
         return Ok(());
     };
+    let std::net::IpAddr::V4(ipv4) = ip else {
+        return Err(format!(
+            "refusing to persist non-IPv4 board address '{address}'"
+        ));
+    };
+    if !is_allowed_board_ip(&ipv4) {
+        return Err(format!(
+            "refusing to persist public board IP '{address}' — the board \
+             only ever lives on the local network"
+        ));
+    }
     let mut settings = state.core().settings();
     if settings.esp_ip != ip.to_string() {
         settings.esp_ip = ip.to_string();
@@ -586,14 +611,93 @@ fn get_settings(state: tauri::State<'_, AppState>) -> AppSettings {
     state.core().settings()
 }
 
-/// Replaces the app settings and persists them. Flipping the output
-/// flag actuates the backend through the same path as the toggle.
+/// Applies a settings PATCH and persists it (C-SET-1): only the
+/// fields the frontend provides overwrite; absent fields keep their
+/// stored values, so a partial save can never wipe the rest of the
+/// settings. Flipping the output flag actuates the backend through
+/// the same path as the toggle; flipping `auto_switch_profiles` on
+/// starts the auto-switch watcher.
 #[tauri::command]
 fn set_settings(
     state: tauri::State<'_, AppState>,
-    settings: AppSettings,
+    settings: AppSettingsPatch,
 ) -> Result<AppSettings, String> {
-    state.core().set_settings(settings)
+    state.core().set_settings_patch(settings)
+}
+
+/// Enables car-profile auto-switching (H3): clears any lock, persists
+/// the setting, and starts the 2 Hz watcher thread when it is not
+/// already running. Returns the updated settings.
+#[tauri::command]
+fn enable_auto_switch(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
+    state.core().enable_auto_switch()
+}
+
+/// Runs an LED test pattern on the board at a brightness (C-LED-1):
+/// `pattern` is one of `off` / `solid` / `blink` / `chase` /
+/// `rainbow`; `brightness` is 0–100 (default: the stored LED tuning,
+/// else 100); `period_ms` is 100–5000 (default 1000). The brightness
+/// scales the pattern's RGB values before the command is encoded.
+#[tauri::command]
+fn led_test(
+    state: tauri::State<'_, AppState>,
+    pattern: String,
+    brightness: Option<u8>,
+    period_ms: Option<u16>,
+) -> Result<(), String> {
+    let pattern = LedPattern::parse_name(&pattern)
+        .ok_or_else(|| format!("unknown LED pattern '{pattern}'"))?;
+    state.core().led_test(pattern, brightness, period_ms)
+}
+
+/// Resets the board's stored pairing key (M-6). Only works while the
+/// board has armed a key reset (the HELLO flag); otherwise it refuses
+/// loudly. On success the session gate closes and the session
+/// records are cleared, so the board can be paired again.
+#[tauri::command]
+fn key_reset(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.core().key_reset()
+}
+
+/// Factory-resets the board (M-6): same session cleanup as
+/// `key_reset` on success.
+#[tauri::command]
+fn factory_reset(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.core().factory_reset()
+}
+
+/// Confirms a pairing replacement (M-7): the board already holds a
+/// key for a different PC, and the user has seen the warning
+/// (board MAC in `get_pairing_status`). Re-triggers activation with
+/// the replacement allowed exactly once, and returns the resulting
+/// transport state.
+#[tauri::command]
+fn confirm_pairing_replacement(
+    state: tauri::State<'_, AppState>,
+) -> Result<TransportState, String> {
+    state.core().confirm_pairing_replacement()
+}
+
+/// Imports profiles from a C# ApexLink/RSH export file (M-6).
+/// Imported profiles are validated on load; the returned summaries
+/// are the profiles that were actually added.
+#[tauri::command]
+fn import_csharp_profiles(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<Vec<ProfileSummary>, String> {
+    state.core().import_csharp_profiles(&path)
+}
+
+/// Imports settings from a C# ApexLink/RSH settings file as a MERGE
+/// (M-6): only the fields present in the file overwrite; the Wi-Fi
+/// password is ignored (it is never stored in a C# export).
+#[tauri::command]
+fn import_csharp_settings(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<AppSettings, String> {
+    state.core().import_csharp_settings(&path)
 }
 
 /// Forces a backup rotation now and returns the backup list.
@@ -602,9 +706,10 @@ fn backup_now(state: tauri::State<'_, AppState>) -> Result<Vec<BackupInfo>, Stri
     state.core().backup_now()
 }
 
-/// Restores one backup generation over the live profiles file.
-/// `path` names the generation file (`profiles.json`,
-/// `profiles.json.bak1`, `profiles.json.bak2`).
+/// Restores one backup generation over the live file (M9: accepts a
+/// real path — a bare generation name such as `profiles.json.bak1`
+/// resolves against the store directory, an absolute path must lie
+/// inside it; settings generations restore the settings too).
 #[tauri::command]
 fn restore_backup(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
     state.core().restore_backup(&path)
@@ -657,7 +762,7 @@ fn set_tuning(
     state: tauri::State<'_, AppState>,
     tuning: TuningSettings,
 ) -> Result<TuningSettings, String> {
-    state.core().set_tuning(tuning)
+    state.core().set_tuning(&tuning)
 }
 
 /// The active profile's captured calibration. Errors honestly when
@@ -780,17 +885,62 @@ fn main() {
     }
     let app = tauri::Builder::default()
         // Single instance (registered FIRST): a second launch focuses the
-        // existing window instead of opening another one.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        // existing window instead of opening another one. L-4: the
+        // second instance's argv carries `--rsh-version <a.b.c>`
+        // (AUTOSTART_ARGS puts it there for autostart launches), and
+        // the version is compared with `resolve_instance` — an older
+        // second instance is refused, a newer one is logged loudly,
+        // and the same-version case just focuses. `TakeOver` is NEVER
+        // a silent kill of this instance: the plugin has already
+        // exited the second instance, so exiting here would leave
+        // zero instances running.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let second_version = parse_instance_version_arg(&args);
+            match second_version.as_deref() {
+                Some(version) => match resolve_instance(Some(APP_VERSION), version) {
+                    InstanceDecision::TakeOver => {
+                        eprintln!(
+                            "[RSH] a newer instance (v{version}) tried to launch; \
+                             single-instance handover is unsupported — keeping this \
+                             instance (v{APP_VERSION}) focused"
+                        );
+                    }
+                    InstanceDecision::YieldFailClosed => {
+                        eprintln!(
+                            "[RSH] an older or unparseable instance (v{version}) tried \
+                             to launch; refused, keeping this instance (v{APP_VERSION}) focused"
+                        );
+                    }
+                    InstanceDecision::FocusExisting => {}
+                },
+                None => {
+                    eprintln!(
+                        "[RSH] a second instance launched without --rsh-version; \
+                         focusing this instance (v{APP_VERSION})"
+                    );
+                }
+            }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_focus();
             }
         }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec!["--tray"]),
+            Some(
+                system::AUTOSTART_ARGS
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect(),
+            ),
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // M13 (deep-scan Round 2): native file picker for the Setup
+        // firmware step (`@tauri-apps/plugin-dialog` 2.8.4). Without
+        // this registration the frontend's `open()` rejects and the
+        // step falls back to the typed path. Capability:
+        // `dialog:default` in `capabilities/default.json` — the
+        // frontend only ever calls `open()` (single `.bin` file).
+        .plugin(tauri_plugin_dialog::init())
         // The stateful core: engine metrics + output backend + game
         // launcher + profile store. Registered before `setup` starts
         // the snapshot emitter thread.
@@ -806,6 +956,11 @@ fn main() {
             // failure here never fails startup — `start_engine` logs
             // it and the app keeps running without wheel input.
             state.start_engine();
+            // C1: when auto-switch is persisted on, start the 2 Hz
+            // car-profile watcher thread (no-op when already running).
+            if state.core().settings().auto_switch_profiles {
+                state.core().start_auto_switch();
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -835,6 +990,13 @@ fn main() {
             export_profile,
             get_settings,
             set_settings,
+            enable_auto_switch,
+            led_test,
+            key_reset,
+            factory_reset,
+            confirm_pairing_replacement,
+            import_csharp_profiles,
+            import_csharp_settings,
             backup_now,
             restore_backup,
             list_games,

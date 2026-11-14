@@ -56,14 +56,15 @@ fn caps_json() -> serde_json::Value {
     {
         return parsed;
     }
+    // C2: the REAL sidecar shape (PROTOCOL.md `create` reply) — a
+    // count of axes, not per-axis booleans.
     serde_json::json!({
-        "has_axis_x": true,
-        "has_axis_y": true,
-        "has_axis_z": true,
-        "has_axis_rx": true,
-        "has_axis_slider": true,
-        "button_count": 32,
-        "has_hat": true
+        "axes": 5,
+        "buttons": 32,
+        "has_hat": true,
+        "input_report_size": 15,
+        "submit_state_max_button": 25,
+        "submit_state_button_mask": 33_554_431
     })
 }
 
@@ -240,25 +241,47 @@ fn main() -> ExitCode {
                 if submits > crash_after_submits {
                     std::process::exit(1);
                 }
-                let hex = parsed.get("report").and_then(|r| r.as_str()).unwrap_or("");
-                if hex.len() != 30 {
+                // C1: the field is `bytes` (what the real sidecar
+                // reads); a `report` field is rejected, never read.
+                if parsed.get("report").is_some() {
                     emit(
-                        &serde_json::json!({"ok": false, "code": "bad-report-size", "error": format!("expected 15-byte report (30 hex chars), got {} chars", hex.len())}),
+                        &serde_json::json!({"ok": false, "code": "bad-command", "error": "submit-raw uses 'bytes', not 'report'"}),
                         &mut out,
                     );
-                } else if created {
-                    emit(
-                        &serde_json::json!({"ok": true, "submit_us": latency_us}),
-                        &mut out,
-                    );
+                } else if let Some(hex) = parsed.get("bytes").and_then(|r| r.as_str()) {
+                    if hex.len() != 30 {
+                        emit(
+                            &serde_json::json!({"ok": false, "code": "bad-report-size", "error": format!("expected 15-byte report (30 hex chars), got {} chars", hex.len())}),
+                            &mut out,
+                        );
+                    } else if created {
+                        emit(
+                            &serde_json::json!({"ok": true, "submit_us": latency_us, "on_submit_latency_us": 9}),
+                            &mut out,
+                        );
+                    } else {
+                        emit(
+                            &serde_json::json!({"ok": false, "code": "no-controller", "error": "no controller"}),
+                            &mut out,
+                        );
+                    }
                 } else {
                     emit(
-                        &serde_json::json!({"ok": false, "code": "no-controller", "error": "no controller"}),
+                        &serde_json::json!({"ok": false, "code": "bad-command", "error": "submit-raw needs hex string 'bytes'"}),
                         &mut out,
                     );
                 }
             }
             "neutral" => {
+                // Neutral IS a driver submit on the real sidecar
+                // (SubmitState / SubmitRawReport), so it counts toward
+                // the crash-after-submits fault injection — otherwise
+                // the backend's connect-time neutral would shift every
+                // crash test by one submit.
+                submits += 1;
+                if submits > crash_after_submits {
+                    std::process::exit(1);
+                }
                 if created {
                     emit(&serde_json::json!({"ok": true}), &mut out);
                 } else {

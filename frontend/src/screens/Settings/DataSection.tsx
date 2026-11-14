@@ -82,18 +82,54 @@ export function DataSection() {
     }
   }
 
+  /** Format an RFC 3339 `savedAt` for display (M6): a raw ISO
+   *  string is not a readable date. Falls back to the raw value when
+   *  it does not parse. */
+  function formatSavedAt(savedAt: string): string {
+    const date = new Date(savedAt);
+    if (Number.isNaN(date.getTime())) return savedAt;
+    return date.toLocaleString();
+  }
+
   async function handleRestore(path: string) {
     const trimmed = path.trim();
     if (trimmed === "") return;
+    // M6: restoring the CURRENT generation is a no-op — it is already
+    // live. Say so instead of calling the backend and reporting a
+    // success that changed nothing.
+    if (trimmed === GENERATION_FILE["current"]) {
+      setStatus(
+        st(
+          t,
+          "settings.data.restoreCurrentNoop",
+          "The current generation is already live — nothing to restore.",
+        ),
+      );
+      return;
+    }
     setBusy(true);
     setStatus(null);
     try {
       await restoreBackup({ path: trimmed });
       await refreshBackups();
       setStatus(st(t, "settings.data.restored", "Backup restored."));
-    } catch {
+    } catch (error) {
+      // M6: show the backend's reason, not just a generic failure.
+      const detail =
+        error instanceof Error ? error.message : null;
       setStatus(
-        st(t, "settings.data.restoreFailed", "Could not restore the backup."),
+        detail
+          ? st(
+              t,
+              "settings.data.restoreFailedDetail",
+              "Could not restore the backup: {{error}}",
+              { error: detail },
+            )
+          : st(
+              t,
+              "settings.data.restoreFailed",
+              "Could not restore the backup.",
+            ),
       );
     } finally {
       setBusy(false);
@@ -183,7 +219,7 @@ export function DataSection() {
                     {backup.savedAt !== null ? (
                       <span className="block truncate text-[13px] text-[var(--muted)]">
                         {st(t, "settings.data.savedAt", "Saved {{date}}.", {
-                          date: backup.savedAt,
+                          date: formatSavedAt(backup.savedAt),
                         })}
                       </span>
                     ) : null}

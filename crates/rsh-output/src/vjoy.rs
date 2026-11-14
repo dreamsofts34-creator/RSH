@@ -1017,7 +1017,7 @@ type AcquireVjdFn = unsafe extern "C" fn(u32) -> i32;
 type RelinquishVjdFn = unsafe extern "C" fn(u32);
 type ResetVjdFn = unsafe extern "C" fn(u32) -> i32;
 type UpdateVjdFn = unsafe extern "C" fn(u32, *const JoystickPosition) -> i32;
-type GetVjdAxisExistFn = unsafe extern "C" fn(u32, u16) -> i32;
+type GetVjdAxisExistFn = unsafe extern "C" fn(u32, u32) -> i32;
 type GetVjdButtonNumberFn = unsafe extern "C" fn(u32) -> i32;
 
 /// The real DLL, loaded with `libloading`.
@@ -1173,8 +1173,10 @@ impl VJoyInterface for RealVJoyDll {
     }
 
     fn get_vjd_axis_exist(&self, device_id: u32, usage: u16) -> bool {
-        // SAFETY: as above.
-        unsafe { (self.get_vjd_axis_exist)(device_id, usage) != 0 }
+        // SAFETY: as above. M10: the SDK header declares
+        // `GetVJDAxisExist(UINT, UINT)` — both params are `u32`;
+        // the `u16` usage widens here, it was never a 16-bit param.
+        unsafe { (self.get_vjd_axis_exist)(device_id, u32::from(usage)) != 0 }
     }
 
     fn get_vjd_button_number(&self, device_id: u32) -> i32 {
@@ -1208,7 +1210,18 @@ pub struct VJoyOutput {
     caps_known: bool,
     capabilities: VJoyCapabilities,
     status: VJoyStatus,
+    /// Consecutive failed `UpdateVJD` calls (M2). Reset on every
+    /// successful update; at [`MAX_CONSECUTIVE_UPDATE_FAILURES`] the
+    /// backend marks itself disconnected (status `Error`) instead of
+    /// reporting success-then-failure forever on a lost device.
+    consecutive_update_failures: u32,
 }
+
+/// Consecutive failed updates after which vJoy marks itself
+/// disconnected (M2). One or two failures are transient (the old
+/// behaviour: stay connected, report the error); three in a row means
+/// the device is gone.
+pub const MAX_CONSECUTIVE_UPDATE_FAILURES: u32 = 3;
 
 impl VJoyOutput {
     /// Create the backend for a vJoy device id (1–16; the default
@@ -1225,6 +1238,7 @@ impl VJoyOutput {
             caps_known: false,
             capabilities: VJoyCapabilities::unknown(),
             status: VJoyStatus::idle(),
+            consecutive_update_failures: 0,
         }
     }
 
@@ -1298,35 +1312,42 @@ impl VJoyOutput {
             return Err(err);
         }
         // Load the DLL (lazy on first connect; injected DLLs skip this).
+        // M1 + L5: the path is resolved ONCE, the SHA-256 (when a pin
+        // is set) is verified against that SAME path BEFORE the DLL is
+        // loaded — the old code loaded first and verified afterwards
+        // (and resolved the path twice, so the verified file and the
+        // loaded file could differ — load-before-verify + TOCTOU).
         if self.dll.is_none() {
-            match RealVJoyDll::load() {
-                Ok(dll) => {
-                    self.dll_path = resolve_dll_path();
-                    self.dll = Some(Box::new(dll));
-                }
-                Err(err) => {
-                    self.fail(&err);
-                    return Err(err);
-                }
-            }
-        }
-        // Optional SHA-256 pin: refuse an untrusted DLL before any
-        // call into it beyond the load itself.
-        if let Some(expected) = self.expected_dll_sha256.clone() {
-            let Some(path) = self.dll_path.clone().or_else(resolve_dll_path) else {
-                let err = VJoyError::DllHashUnavailable(
-                    "DLL path unknown — cannot verify SHA-256".to_string(),
-                );
+            let Some(path) = resolve_dll_path() else {
+                let err = VJoyError::DriverNotFound(format!(
+                    "vJoy not found — vJoyInterface.dll could not be located. Install vJoy (BrunnerInnovation {PINNED_DRIVER_VERSION_FULL}): {VJOY_DOWNLOAD_URL}"
+                ));
                 self.fail(&err);
                 return Err(err);
             };
-            match verify_dll_sha256(&path, &expected) {
-                Ok(true) => {}
-                Ok(false) => {
-                    let actual = sha256_hex(&path).unwrap_or_else(|_| "?".to_string());
-                    let err = VJoyError::DllHashMismatch { expected, actual };
-                    self.fail(&err);
-                    return Err(err);
+            let expected = self
+                .expected_dll_sha256
+                .clone()
+                .or_else(|| PINNED_DLL_SHA256_HEX.map(str::to_string));
+            if let Some(expected) = expected {
+                match verify_dll_sha256(&path, &expected) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let actual = sha256_hex(&path).unwrap_or_else(|_| "?".to_string());
+                        let err = VJoyError::DllHashMismatch { expected, actual };
+                        self.fail(&err);
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        self.fail(&err);
+                        return Err(err);
+                    }
+                }
+            }
+            match RealVJoyDll::load_from(&path) {
+                Ok(dll) => {
+                    self.dll_path = Some(path);
+                    self.dll = Some(Box::new(dll));
                 }
                 Err(err) => {
                     self.fail(&err);
@@ -1347,6 +1368,7 @@ impl VJoyOutput {
                 self.capabilities = caps;
                 self.caps_known = true;
                 self.connected = true;
+                self.consecutive_update_failures = 0;
                 self.status = VJoyStatus {
                     kind: VJoyStateKind::Ready,
                     message: format!(
@@ -1397,6 +1419,7 @@ impl VJoyOutput {
             return;
         }
         self.connected = false;
+        self.consecutive_update_failures = 0;
         if let Some(dll) = self.dll.as_mut() {
             let neutral = neutral_position(self.device_id);
             let _ = dll.update_vjd(self.device_id, &neutral);
@@ -1512,9 +1535,33 @@ impl IJoystickOutput for VJoyOutput {
         };
         let position = build_position(state, &caps, self.device_id);
         let dll = self.dll.as_mut().expect("connected implies a DLL");
-        if dll.update_vjd(self.device_id, &position) {
+        let updated = dll.update_vjd(self.device_id, &position);
+        if updated {
+            self.consecutive_update_failures = 0;
             Ok(())
         } else {
+            // M2: N consecutive failures = the device is gone — mark
+            // disconnected (status `Error`, device relinquished) so
+            // the selector / engine stops treating a dead device as
+            // live. Fewer than N failures keep the old behaviour
+            // (stay connected, report the error).
+            self.consecutive_update_failures += 1;
+            if self.consecutive_update_failures >= MAX_CONSECUTIVE_UPDATE_FAILURES {
+                self.connected = false;
+                if let Some(dll) = self.dll.as_mut() {
+                    dll.relinquish_vjd(self.device_id);
+                }
+                self.status = VJoyStatus {
+                    kind: VJoyStateKind::Error,
+                    message: format!(
+                        "vJoy device {} lost after {MAX_CONSECUTIVE_UPDATE_FAILURES} consecutive failed updates — disconnected.",
+                        self.device_id
+                    ),
+                    dll_version: None,
+                    driver_version: None,
+                    download_url: None,
+                };
+            }
             Err(VJoyError::UpdateFailed(self.device_id))
         }
     }
@@ -2707,6 +2754,72 @@ mod tests {
         assert_eq!(handle.positions().len(), 2);
     }
 
+    /// M2: three consecutive failed updates mark the backend
+    /// disconnected (status `Error`, device relinquished); one or two
+    /// failures keep the old behaviour (stay connected).
+    #[test]
+    fn three_consecutive_update_failures_disconnect() {
+        let (mock, handle) = MockDll::with_state(MockState {
+            update_ok: false,
+            ..MockState::default()
+        });
+        let mut out = VJoyOutput::with_dll(1, Box::new(mock));
+        out.try_connect()
+            .expect("connect succeeds (neutral is best-effort)");
+        assert!(out.is_connected());
+        for _ in 0..2 {
+            let err = out
+                .update(&state(1.0, 0.0, 0.0))
+                .expect_err("failed UpdateVJD must surface");
+            assert_eq!(err, VJoyError::UpdateFailed(1));
+            assert!(out.is_connected(), "1–2 failures stay connected");
+        }
+        let err = out
+            .update(&state(1.0, 0.0, 0.0))
+            .expect_err("third failure must surface");
+        assert_eq!(err, VJoyError::UpdateFailed(1));
+        assert!(!out.is_connected(), "3 failures disconnect");
+        assert_eq!(out.status().kind, VJoyStateKind::Error);
+        assert!(
+            out.status().message.contains("3 consecutive"),
+            "status names the cause: {}",
+            out.status().message
+        );
+        assert!(
+            handle.calls().contains(&MockCall::Relinquish(1)),
+            "device relinquished on disconnect: {:?}",
+            handle.calls()
+        );
+        assert_eq!(
+            out.update(&state(0.0, 0.0, 0.0)).unwrap_err(),
+            VJoyError::NotConnected
+        );
+    }
+
+    /// M2: a successful update resets the consecutive-failure count —
+    /// two failures, a success, then two more failures still leave
+    /// the backend connected.
+    #[test]
+    fn successful_update_resets_consecutive_failure_count() {
+        let (mock, handle) = MockDll::with_state(MockState {
+            update_ok: false,
+            ..MockState::default()
+        });
+        let mut out = VJoyOutput::with_dll(1, Box::new(mock));
+        out.try_connect().expect("mock connect succeeds");
+        for _ in 0..2 {
+            assert!(out.update(&state(1.0, 0.0, 0.0)).is_err());
+        }
+        assert!(out.is_connected());
+        handle.state.lock().expect("mock lock").update_ok = true;
+        out.update(&state(0.0, 0.0, 0.0)).expect("update succeeds");
+        handle.state.lock().expect("mock lock").update_ok = false;
+        for _ in 0..2 {
+            assert!(out.update(&state(1.0, 0.0, 0.0)).is_err());
+        }
+        assert!(out.is_connected(), "counter reset by the success");
+    }
+
     #[test]
     fn send_neutral_when_disconnected_is_noop() {
         let (mock, handle) = MockDll::with_defaults();
@@ -2735,7 +2848,9 @@ mod tests {
     fn driver_missing_is_a_clean_error_not_a_crash() {
         // No vJoy DLL exists on Linux: connect must fail with the
         // NotInstalled warning state, and a retry must fail the same
-        // way (no panic, no fake success).
+        // way (no panic, no fake success). Takes the env guard so a
+        // parallel M1 test cannot make a fake DLL resolvable here.
+        let _guard = ENV_GUARD.lock().expect("env guard");
         let mut out = VJoyOutput::new(1);
         let err = out.try_connect().expect_err("no driver on Linux");
         assert!(
@@ -2782,21 +2897,21 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn expected_sha256_without_dll_path_cannot_verify() {
-        // A hash is pinned but there is no DLL to measure (mock DLL,
-        // no path): connect refuses with a hash error, never with a
-        // fake success.
+        // M1: hash verification is a LOAD-path concern (verify the
+        // file before loading it). An injected DLL is never loaded
+        // from disk, so there is nothing to verify — the pin simply
+        // does not apply, and connect proceeds on the injected DLL.
+        // (The old test expected `DllHashUnavailable` here; that was
+        // the load-first ordering, which M1 removed.)
         let (mock, _) = MockDll::with_defaults();
         let mut out = VJoyOutput::with_dll(1, Box::new(mock));
         out.set_expected_dll_sha256(
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         )
         .expect("valid hash");
-        let err = out.try_connect().expect_err("unverifiable DLL must fail");
-        assert!(
-            matches!(err, VJoyError::DllHashUnavailable(_)),
-            "unexpected error: {err}"
-        );
-        assert!(!out.is_connected());
+        out.try_connect()
+            .expect("injected DLL skips the load-path hash check");
+        assert!(out.is_connected());
     }
 
     fn temp_file_with(content: &[u8], name: &str) -> std::path::PathBuf {
@@ -2805,6 +2920,61 @@ mod tests {
         let path = dir.join("vJoyInterface.dll");
         std::fs::write(&path, content).expect("write temp DLL stand-in");
         path
+    }
+
+    // Serialises the two tests that mutate the process environment
+    // (`ProgramFiles`): the test harness runs tests in parallel, and
+    // a stray `ProgramFiles` would change what the missing-driver
+    // test resolves.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// M1: the DLL hash is verified BEFORE the DLL is loaded, on the
+    /// same resolved path. The fixture file is not a DLL at all — with
+    /// a wrong pin the failure must be `DllHashMismatch` (a
+    /// load-first implementation would report `LoadFailed` instead),
+    /// and with the right pin the failure moves to the load step.
+    #[test]
+    #[cfg(unix)]
+    fn dll_hash_is_verified_before_load() {
+        let _guard = ENV_GUARD.lock().expect("env guard");
+        let base = std::env::temp_dir().join(format!("rsh-vjoy-m1-{}", std::process::id()));
+        let dll_dir = base.join("vJoy").join("x64");
+        std::fs::create_dir_all(&dll_dir).expect("create fake install dir");
+        let dll_path = dll_dir.join(VJOY_DLL_FILE_NAME);
+        std::fs::write(&dll_path, b"not a real dll").expect("write fake DLL");
+        let actual = sha256_hex(&dll_path).expect("hash the fake DLL");
+        let wrong = format!(
+            "{}{}",
+            if actual.starts_with('0') { '1' } else { '0' },
+            &actual[1..]
+        );
+        // SAFETY: edition-2024 env mutation is `unsafe`; the guard
+        // above serialises it against the other env-mutating test,
+        // and the variable is removed before this test returns.
+        unsafe {
+            std::env::set_var("ProgramFiles", base.to_str().expect("temp path is UTF-8"));
+        }
+        let mut out = VJoyOutput::new(1);
+        out.set_expected_dll_sha256(&wrong)
+            .expect("wrong pin is valid hex");
+        let err = out.try_connect().expect_err("wrong pin must fail");
+        assert!(
+            matches!(err, VJoyError::DllHashMismatch { .. }),
+            "M1: expected DllHashMismatch (verify-before-load), got {err}"
+        );
+        assert!(!out.is_connected());
+        let mut out2 = VJoyOutput::new(1);
+        out2.set_expected_dll_sha256(&actual)
+            .expect("right pin is valid hex");
+        let err2 = out2.try_connect().expect_err("fake DLL must fail to load");
+        assert!(
+            matches!(err2, VJoyError::LoadFailed(_)),
+            "M1: right pin passes verification, load fails second: got {err2}"
+        );
+        unsafe {
+            std::env::remove_var("ProgramFiles");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

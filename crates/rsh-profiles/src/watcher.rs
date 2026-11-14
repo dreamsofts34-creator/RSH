@@ -143,8 +143,10 @@ pub fn game_id_for_exe(exe_file_name: &str) -> Option<&'static str> {
 ///   Win32 FFI (`GetForegroundWindow` → `GetWindowThreadProcessId` →
 ///   `OpenProcess` → `QueryFullProcessImageNameW`). No `windows`-crate
 ///   dependency yet — the exact crate choice is the SW-R7.1 spike's call.
-///   This path is **not compiled on Linux and has no test coverage here**;
-///   it needs Windows CI + a real foreground game (see the ignored test).
+///   The property test `windows_foreground_detector_result_is_a_known_game_id`
+///   runs on Windows CI; the end-to-end check (a known game in the
+///   foreground returns that game's id) is a Windows human gate
+///   (`SECURITY-INPUT.md` §11, gate W-2).
 /// * Any other OS: stub that always returns [`None`] — foreground
 ///   detection is Windows-only.
 #[derive(Clone, Copy, Debug, Default)]
@@ -277,7 +279,9 @@ where
     /// Switch that failed or was blocked; retried on later polls.
     pending: PendingSwitch,
     /// When false, closing a game leaves the last profile active
-    /// (DATA-INPUT §3 rule 6). Default true per the Phase F task.
+    /// (DATA-INPUT §3 rule 6). Default false: the launcher owns
+    /// restore (H4 decision); the watcher never restores unless the
+    /// app explicitly opts in.
     restore_on_game_close: bool,
     /// Last activation failure, if any.
     last_error: Option<String>,
@@ -385,7 +389,7 @@ where
         }
     }
 
-    /// Turns restore-on-game-close on/off (default on; see module docs).
+    /// Turns restore-on-game-close on/off (default off; see module docs).
     pub fn set_restore_on_game_close(&mut self, on: bool) {
         self.restore_on_game_close = on;
     }
@@ -1125,15 +1129,25 @@ mod tests {
         assert_eq!(game_id_for_exe("notepad.exe"), None);
     }
 
-    /// Windows-only: the real foreground detector needs a Windows desktop
-    /// with a game in the foreground. This sandbox has neither.
+    /// The foreground detector never reports a game id it cannot
+    /// map: on Linux this is the stub (always `None`); on Windows
+    /// this runs the real Win32 detector, and any id it returns must
+    /// be one of the known game ids. This is the Windows-CI version
+    /// of the old ignored placeholder test (which asserted the stub
+    /// result and could never pass on a Windows desktop with a game
+    /// in the foreground): it runs everywhere, including Windows CI,
+    /// with no game needed. The end-to-end check — a known game in
+    /// the foreground returns that game's id — is still a Windows
+    /// human gate (see `SECURITY-INPUT.md` §11, gate W-2), because
+    /// no CI runner can guarantee which window is in the foreground.
     #[test]
-    #[ignore = "Windows-only: needs a real foreground game window on a Windows PC (Windows CI)"]
-    fn windows_foreground_detector_needs_windows_ci() {
+    fn windows_foreground_detector_result_is_a_known_game_id() {
         let detector = WindowsForegroundDetector;
-        // On Linux this is the stub (always None); on Windows CI this
-        // test must be run with a known game in the foreground and the
-        // assertion below replaced by the expected game id.
-        assert_eq!(detector.foreground_game(), None);
+        if let Some(game) = detector.foreground_game() {
+            assert!(
+                GAME_EXE_NAMES.iter().any(|(_, id)| *id == game),
+                "detector returned an unmapped game id: {game}"
+            );
+        }
     }
 }

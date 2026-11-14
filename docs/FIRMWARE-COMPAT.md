@@ -94,12 +94,12 @@ nahi kiye gaye — parser dono ko theek parse karta hai.
 
 | Side | File | Vectors |
 |---|---|---|
-| Rust | `crates/rsh-protocol/tests/golden_vectors.rs` | 10 positive + 6 negative (hex literals, Python output se verbatim copy) |
+| Rust | `crates/rsh-protocol/tests/golden_vectors.rs` | 18 tests — 11 positive + 7 negative (hex literals, Python output se verbatim copy). Note: doc pehle "10 + 6" kehta tha — ghalat tha; file mein 11 positive (`vector_stream_v2_1`, `vector_status_v2_1_base`, `vector_status_v2_1_extended`, `vector_hello_unpaired`, `vector_hello_paired`, `vector_ctrl_get_caps`, `vector_ctrl_set_cfg`, `vector_ctrl_get_caps_reply`, `vector_serial_stream`, `vector_serial_helo`, `vector_crc16_v1_golden`) + 7 negative (`negative_bad_tag`, `negative_wrong_key`, `negative_truncated_control_is_bad_length_not_too_short`, `negative_replay_and_duplicate_are_state_rules_not_tag_rules`, `negative_bad_magic_control`, `negative_stream_rejects_counted_per_reason`, `negative_serial_crc_flip_rejected`) hain; total 18 sahi hai. |
 | Rust (unit) | `crates/rsh-protocol/src/{crc,stream,hello,control,config,ping,probe,caps,pin}.rs` | round-trip + property tests |
-| C++ / Python | `reference/tests-host/protocol_v2_vectors.py` | `VECTORS` (10) + `NEGATIVE` (6); `python3 -I protocol_v2_vectors.py` se regenerate hota hai |
-| C++ / Python | `reference/tests-host/verify_packet.py` | 3-language cross-verify (stream/status/hello/control/probe + negatives) |
+| C++ / Python | `firmware/tests-host/protocol_v2_vectors.py` (vendored, M9) | `VECTORS` (10) + `NEGATIVE` (6); `python3 -I protocol_v2_vectors.py` se regenerate hota hai |
+| C++ / Python | `firmware/tests-host/verify_packet.py` (vendored, M9) | 3-language cross-verify (stream/status/hello/control/probe + negatives) |
 | C++ / Python | `reference/tests-host/pin_rules_ref.py` | pin-rules reference validator + 62 PASS checks |
-| C++ | `reference/tests-host/test_main.cpp` (§1–§22) | host tests, 4430 checks |
+| C++ | `firmware/tests-host/test_main.cpp` (vendored, M9; §1–§25b) | host tests, 4444 checks (incl. Phase 2 `FACTORY_RESET` block §25b) |
 
 ## 5. FW-A2 — Interop verification (baghair board) — evidence
 
@@ -126,7 +126,7 @@ FW-A4/A7 hai, §8).
 
 | Section | Result |
 |---|---|
-| 1. C++ host tests (`test_main.cpp`) | **4430 checks, 0 failures** (C# series se barabar) |
+| 1. C++ host tests (`test_main.cpp`) | **4444 checks, 0 failures** (vendored copy `firmware/tests-host/`, incl. Phase 2 `FACTORY_RESET` block §25b; scratch copy run at FW-A2 was 4430 checks, 0 failures) |
 | 2. Firmware `.cpp` on host (`inputs.cpp` + `status_led.cpp`) | **50 + 50 checks, 0 failures** (mv-ok + mv-fallback) |
 | 3. Python pin-rules reference | **62 PASS, 0 FAIL** (`ALL PASS`) |
 | 4. Python protocol v2.1 golden vectors | self-consistent, `OK` |
@@ -380,8 +380,8 @@ accepts, C++ rejects). All three are now fixed in `pin.rs` too:
   fingerprint hai.
 - Board + app unsigned image ko reject karte hain (SEC-C-06, verify-before-
   apply + anti-downgrade). Release assets: merged bin
-  `RSH-Firmware-DevKitV1-v4.0.1.bin` (955,056 B) + `firmware-signed.bin`
-  (889,588 B) + `SHA256SUMS`. Release workflow mein fail-closed verify hai
+  `RSH-Firmware-DevKitV1-v4.0.1.bin` (955,984 B) + `firmware-signed.bin`
+  (890,516 B) + `SHA256SUMS`. Release workflow mein fail-closed verify hai
   (signature + signed-region hash vs `firmware.bin`).
 - **Rust app v1.0.0 ko koi reflash nahi chahiye** — wahi board, wahi
   firmware v4.0.1, protocol frozen. Reflash sirf naye board ya brick

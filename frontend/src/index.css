@@ -70,7 +70,9 @@
   --nav-hover-bg: #f5f3ff;
   --nav-active-fg: #4b2fd0;
   --nav-dot: #c9c1ee;
+  --chart-clutch: #0e7490;
   --shadow-color: #3c288c;
+  --shadow: 0 1px 8px rgb(60 40 140 / 0.10);
   --radius: 0.75rem;
   color-scheme: light;
 }
@@ -103,7 +105,9 @@
   --nav-hover-bg: #1a1f27;
   --nav-active-fg: #c4b5fd;
   --nav-dot: #4a445f;
+  --chart-clutch: #22d3ee;
   --shadow-color: #000000;
+  --shadow: 0 1px 8px rgb(0 0 0 / 0.45);
   --radius: 0.75rem;
   color-scheme: dark;
 }
@@ -138,7 +142,9 @@
   --nav-hover-bg: #1a1a1a;
   --nav-active-fg: #000000;
   --nav-dot: #ffffff;
+  --chart-clutch: #40c4ff;
   --shadow-color: #000000;
+  --shadow: 0 1px 8px rgb(255 255 255 / 0.25);
   --radius: 0.75rem;
   color-scheme: dark;
 }

@@ -140,11 +140,13 @@ All verified by reading files on disk this session:
   `cargo tauri build --no-bundle` from `src-tauri/` — the old `npm run
   tauri` (no such script) is gone. Proof is still pending: the job
   has never run (first green CI run only after the GitHub push).
-- SBOMs: `sbom/rust.cdx.json` CycloneDX 1.6, **625 components**;
+- SBOMs: `sbom/rust.cdx.json` CycloneDX 1.6, **629 components**;
   `sbom/frontend.cdx.json` CycloneDX 1.5, **320 components**;
   `sbom/sidecar.cdx.json` CycloneDX 1.6, **2 components** (sidecar exe
-  + HIDMaestro.Core.dll v2.1.0). Counts match the H4 snapshot exactly
-  (625 / 320 / 2).
+  + HIDMaestro.Core.dll v2.1.0). Counts match the committed SBOMs
+  exactly (629 / 320 / 2) — the Rust count moved 625 → 629 across the
+  deep scan (rsh-rig was missing at 625; +3 dialog-plugin deps after
+  Round 2), verified by `cargo metadata` full resolve at the gate.
 - `THIRD-PARTY-LICENSES.md` present (9,241 B); `LICENSE` present (MIT).
 - Secret scan: no `.pem` / `.key` / `.p12` / `.pfx` / `*secret*`
   files anywhere in the repo (excluding `target/`,

@@ -111,6 +111,22 @@ pub struct WheelConfig {
     pub ping_delay_base_us: u64,
     /// Ping delay jitter σ (µs).
     pub ping_delay_jitter_us: u64,
+    /// Wheel emit period (µs). Default 5100 = 196 Hz — a DOCUMENTED
+    /// HARNESS LIMITATION (H-2), not a product rate: the engine ticks
+    /// at 200 Hz and the OLD drain took at most one frame per tick
+    /// (latest-wins), so a wheel emitting at exactly 200 Hz coalesced
+    /// ~3–14% of frames by phase drift and the soak SLOs (loss < 0.5%,
+    /// coalesced ≤ 0.5%) could not be read off it. The Round 2
+    /// multi-frame drain processes every frame (deep-scan gate:
+    /// emit-200hz coalesced 0% at 200 Hz), so the 196 Hz default is
+    /// kept as the documented soak default, not because the drain
+    /// needs it. At 196 Hz at most one frame lands per tick window,
+    /// so every emit is drained exactly once regardless of phase,
+    /// and the 195/s rate SLO still holds. The true 200 Hz
+    /// coalescing rate is measured by the `emit-200hz` scenario
+    /// (5000 µs), which reports `coalescedPercent` with no ≤ 0.5%
+    /// assertion on it.
+    pub tick_interval_us: u64,
 }
 
 impl Default for WheelConfig {
@@ -135,6 +151,7 @@ impl Default for WheelConfig {
             require_auth: true,
             ping_delay_base_us: 300,
             ping_delay_jitter_us: 150,
+            tick_interval_us: 5100,
         }
     }
 }
@@ -150,7 +167,7 @@ pub struct TickOut {
 }
 
 /// End-of-run wheel summary (shared with the harness).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct WheelSummary {
     /// Accepted control frames (`GET_CAPS` verifies).
     pub ctrl_accepted: u64,
@@ -174,8 +191,58 @@ pub struct WheelSummary {
     pub tx_fail: u64,
     /// Last reset reason (1 power-on, 4 software).
     pub reset_reason: u8,
-    /// Timestamped event log (faults, glitches, gate opens).
-    pub events: Vec<String>,
+    /// Timestamped event log, one line per event. A single
+    /// pre-reserved `String` (8 KiB, reserved at construction —
+    /// BEFORE the run's `reset_counts()`), appended to in place:
+    /// logging an event during the run allocates nothing, so the
+    /// rig's `allocBytesDelta` stays a product measurement, not a
+    /// harness-logging artefact (M-1). Lines past 8 KiB are dropped
+    /// (counted in `events_dropped`). Read it back with [`Self::events`].
+    pub events_log: String,
+    /// Events dropped because the log buffer was full.
+    pub events_dropped: u64,
+}
+
+impl Default for WheelSummary {
+    fn default() -> Self {
+        Self {
+            ctrl_accepted: 0,
+            frames_generated: 0,
+            frames_dropped_net: 0,
+            bad_crc_sent: 0,
+            duplicates_sent: 0,
+            fuzz_sent: 0,
+            glitches: 0,
+            gated_dropped: 0,
+            seq_gap: 0,
+            tx_fail: 0,
+            reset_reason: 0,
+            events_log: String::with_capacity(8192),
+            events_dropped: 0,
+        }
+    }
+}
+
+impl WheelSummary {
+    /// Append one event line to the pre-reserved log (no allocation
+    /// while capacity remains — see the `events_log` docs).
+    pub fn log_event(&mut self, args: std::fmt::Arguments<'_>) {
+        use std::fmt::Write as _;
+        if self.events_log.len() > 8000 {
+            self.events_dropped += 1;
+            return;
+        }
+        let _ = self.events_log.write_fmt(args);
+        self.events_log.push('\n');
+    }
+
+    /// Event lines, oldest first. Allocates at call time — the
+    /// harness calls it AFTER reading `heap_end`, so the allocation
+    /// never lands in the measured `allocBytesDelta` window (M-1).
+    #[must_use]
+    pub fn events(&self) -> Vec<String> {
+        self.events_log.lines().map(str::to_string).collect()
+    }
 }
 
 /// The virtual wheel: deterministic board model.
@@ -257,6 +324,20 @@ impl VirtualWheel {
         !self.gated
     }
 
+    /// Wheel emit period (µs) — [`WheelConfig::tick_interval_us`]:
+    /// 5100 (196 Hz) by default, 5000 for the `emit-200hz` probe.
+    #[must_use]
+    pub fn tick_interval_us(&self) -> u64 {
+        self.cfg.tick_interval_us
+    }
+
+    /// Elapsed board seconds (tick * 5 ms) — public for the harness
+    /// task's drain-cap diagnostics.
+    #[must_use]
+    pub fn now_s_pub(&self) -> f64 {
+        self.now_s()
+    }
+
     /// Current board time in µs (the clock ping replies stamp `t1`/`t2`
     /// with). Only differences are ever used, so the epoch is the
     /// wheel's own.
@@ -291,8 +372,7 @@ impl VirtualWheel {
                 self.gated = false;
                 let now_s = self.now_s();
                 self.summary
-                    .events
-                    .push(format!("t={now_s:.1}s auth gate opened (GET_CAPS)"));
+                    .log_event(format_args!("t={now_s:.1}s auth gate opened (GET_CAPS)"));
             }
         }
     }
@@ -326,14 +406,14 @@ impl VirtualWheel {
                 match fault {
                     Fault::Reboot(_) | Fault::PowerCut(_) => {
                         self.reboot_until_tick = self.tick + 400; // 2 s.
-                        self.summary.events.push(format!(
+                        self.summary.log_event(format_args!(
                             "t={now_s:.1}s fault {kind}: 2 s silence, seq/ts reset after"
                         ));
                     }
                     Fault::WifiDrop(_, dur) => {
                         let ticks = (dur * 200.0) as u64;
                         self.drop_until_tick = self.tick + ticks;
-                        self.summary.events.push(format!(
+                        self.summary.log_event(format_args!(
                             "t={now_s:.1}s fault wifi-drop: {dur} s silence, seq continues"
                         ));
                     }
@@ -348,7 +428,7 @@ impl VirtualWheel {
             self.ts_us = 0.0;
             self.encoders = [0; 4];
             self.summary.reset_reason = 4;
-            self.summary.events.push(format!(
+            self.summary.log_event(format_args!(
                 "t={now_s:.1}s board back after reboot (seq 0, ts 0)"
             ));
         }
@@ -486,12 +566,18 @@ impl VirtualWheel {
     }
 
     /// Frames held for reorder whose release tick has arrived.
+    /// Capped at 64 per tick (L-1): the reorder queue is bounded by
+    /// construction (5% hold chance, 1–3 tick hold ≈ ≤ 1 frame/tick
+    /// in practice), so the cap never binds on a healthy run — it is
+    /// a backstop so a pathological queue cannot stall the 5 ms tick.
+    /// Unreleased frames stay queued for the next tick.
     fn release_due(&mut self) -> Vec<Vec<u8>> {
         let mut released = Vec::new();
-        while self
-            .reorder
-            .front()
-            .is_some_and(|(tick, _)| *tick <= self.tick)
+        while released.len() < 64
+            && self
+                .reorder
+                .front()
+                .is_some_and(|(tick, _)| *tick <= self.tick)
         {
             if let Some((_, bytes)) = self.reorder.pop_front() {
                 released.push(bytes);
@@ -513,9 +599,9 @@ impl VirtualWheel {
         if self.interference.is_none() && self.rng.chance(0.0007) {
             self.interference = Some((self.tick, self.tick + 40));
             let now_s = self.now_s();
-            self.summary
-                .events
-                .push(format!("t={now_s:.1}s interference: 200 ms drop window"));
+            self.summary.log_event(format_args!(
+                "t={now_s:.1}s interference: 200 ms drop window"
+            ));
         }
         if let Some((start, end)) = self.interference {
             if self.tick >= start && self.tick < end {
@@ -575,8 +661,7 @@ impl VirtualWheel {
                 self.float_until_tick = self.tick + 400; // ~2 s burst.
                 let now_s = self.now_s();
                 self.summary
-                    .events
-                    .push(format!("t={now_s:.1}s floating sensor burst (2 s)"));
+                    .log_event(format_args!("t={now_s:.1}s floating sensor burst (2 s)"));
             }
             let sigma_steer = if floating { 80.0 } else { 3.0 };
             let sigma_pedal = if floating { 80.0 } else { 5.0 };
@@ -629,7 +714,7 @@ impl VirtualWheel {
                 self.encoders[idx] = self.encoders[idx].wrapping_add(d);
                 self.summary.glitches += 1;
                 let now_s = self.now_s();
-                self.summary.events.push(format!(
+                self.summary.log_event(format_args!(
                     "t={now_s:.1}s enc-glitch: encoder {idx} jump {d:+}"
                 ));
             }
@@ -736,7 +821,16 @@ impl VirtualWheel {
                     axes[2] = Some(trap(1000));
                 }
                 if !disabled(4) {
-                    axes[4] = Some(handbrake_soak);
+                    // Handbrake trapezoid too (M-10): the old
+                    // sawtooth touched each rail for ONE tick, so
+                    // with coalescing + pipeline smoothing the
+                    // output never reached the rails (baseline:
+                    // handbrake min 602 / max 30987 in
+                    // calibration-span — both outside the rail
+                    // assertions). The trapezoid dwells 1 s at each
+                    // rail like every other calibration axis, so the
+                    // filter settles and the rails are observable.
+                    axes[4] = Some(trap(1500));
                 }
                 (axes, buttons_soak, enc_step)
             }
@@ -940,5 +1034,38 @@ mod tests {
             }
         }
         assert!(saw_zero_seq, "seq restarts at 0 after power-cut");
+    }
+
+    #[test]
+    fn reorder_release_is_capped_per_tick() {
+        // L-1 backstop: even with 100 frames held for reorder, one
+        // `release_due` returns at most 64 and keeps the rest queued
+        // for the next tick — a pathological queue cannot stall the
+        // 5 ms tick, and nothing is dropped by the cap.
+        let mut wheel = VirtualWheel::new(WheelConfig {
+            require_auth: false,
+            ..WheelConfig::default()
+        });
+        for n in 0..100u64 {
+            wheel.reorder.push_back((0, vec![n as u8]));
+        }
+        let first = wheel.release_due();
+        assert_eq!(first.len(), 64, "cap is 64 per tick");
+        assert_eq!(wheel.reorder.len(), 36, "remainder stays queued");
+        let second = wheel.release_due();
+        assert_eq!(second.len(), 36, "remainder releases next tick");
+        assert!(wheel.reorder.is_empty());
+    }
+
+    #[test]
+    fn event_log_is_allocation_free_after_construction() {
+        // M-1: the wheel summary's event buffer is pre-reserved, so
+        // logging events during a run grows nothing — the rig's
+        // `allocBytesDelta` measures the product, not its own log.
+        let mut summary = super::WheelSummary::default();
+        assert!(summary.events_log.capacity() >= 8192);
+        summary.log_event(format_args!("t=1.0s test event"));
+        assert_eq!(summary.events(), vec!["t=1.0s test event".to_string()]);
+        assert_eq!(summary.events_dropped, 0);
     }
 }

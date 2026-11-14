@@ -134,6 +134,9 @@ pub struct VarHeaderRaw {
 /// inside the map (SEC-H-05c).
 #[derive(Clone, Debug)]
 struct Header {
+    /// `sessionInfoUpdate` generation counter: the YAML read is
+    /// guarded by this value before and after (L11 single read).
+    session_info_update: i32,
     session_info_len: usize,
     session_info_offset: usize,
     num_vars: i32,
@@ -178,6 +181,7 @@ fn parse_header(map: &dyn MapAccessor) -> Option<Header> {
     };
     let ver = get(0)?;
     let status = get(4)?;
+    let session_info_update = get(12)?;
     let session_info_len = get(16)?;
     let session_info_offset = get(20)?;
     let num_vars = get(24)?;
@@ -200,6 +204,7 @@ fn parse_header(map: &dyn MapAccessor) -> Option<Header> {
     let var_headers_len = num_vars.checked_mul(VAR_HEADER_LEN_I32)?;
     let (var_header_offset, _) = checked_range(var_header_offset, var_headers_len, map.len())?;
     Some(Header {
+        session_info_update,
         session_info_len: usize::try_from(session_info_len).ok()?,
         session_info_offset,
         num_vars,
@@ -237,8 +242,27 @@ fn latest_buffer(map: &dyn MapAccessor, header: &Header) -> Option<Buffer> {
     best
 }
 
-/// Finds the `SessionState` variable header: `(offset_in_buffer,)`.
-fn find_session_state_var(map: &dyn MapAccessor, header: &Header) -> Option<i32> {
+/// A cached `SessionState` variable location: the var-header layout
+/// it was found under, plus the var-header index and buffer offset.
+/// The cache is only trusted while the layout matches; a mismatch
+/// falls back to a full scan (L6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CachedSessionStateVar {
+    /// `var_header_offset` of the header the entry was found under.
+    var_header_offset: usize,
+    /// `num_vars` of that header.
+    num_vars: i32,
+    /// Index of the `SessionState` var header in the array.
+    var_index: i32,
+    /// `offset` field of that var header (offset into the data buffer).
+    var_offset: i32,
+}
+
+/// Finds the `SessionState` variable header: `(var_index, offset_in_buffer)`.
+/// Scans the var-header array linearly; the offset is cached by the
+/// reader (see [`IRacingReader`]) so the scan runs once per session,
+/// not once per 2 Hz poll.
+fn find_session_state_var(map: &dyn MapAccessor, header: &Header) -> Option<(i32, i32)> {
     for index in 0..header.num_vars {
         let offset = header
             .var_header_offset
@@ -255,10 +279,37 @@ fn find_session_state_var(map: &dyn MapAccessor, header: &Header) -> Option<i32>
             if var_offset < 0 || var_offset.checked_add(4)? > header.buf_len {
                 return None;
             }
-            return Some(var_offset);
+            return Some((index, var_offset));
         }
     }
     None
+}
+
+/// Validates a cached `SessionState` var location against the current
+/// header: the layout must match and the var header at the cached
+/// index must still name `SessionState` with the same buffer offset.
+/// Returns the buffer offset when valid.
+fn validate_cached_session_state_var(
+    map: &dyn MapAccessor,
+    header: &Header,
+    cached: CachedSessionStateVar,
+) -> Option<i32> {
+    if cached.var_header_offset != header.var_header_offset || cached.num_vars != header.num_vars {
+        return None;
+    }
+    let offset = header.var_header_offset.checked_add(
+        usize::try_from(cached.var_index)
+            .ok()?
+            .checked_mul(VAR_HEADER_LEN)?,
+    )?;
+    let bytes = read_consistent(map, offset, VAR_HEADER_LEN)?;
+    let var_offset = i32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let name = parse_ascii_name(&bytes[16..48]);
+    if name == "SessionState" && var_offset == cached.var_offset {
+        Some(var_offset)
+    } else {
+        None
+    }
 }
 
 /// Reads one `i32` telemetry variable from the newest buffer, verifying
@@ -282,10 +333,44 @@ fn read_latest_var_i32(map: &dyn MapAccessor, header: &Header, var_offset: i32) 
 
 /// Reads the `SessionState` variable; `None` when the variable is
 /// absent (state then stays [`SessionState::Unknown`]).
-fn read_session_state(map: &dyn MapAccessor, header: &Header) -> Option<SessionState> {
-    let var_offset = find_session_state_var(map, header)?;
+///
+/// `cache` is the reader's var-offset cache: the first read scans the
+/// var-header array and stores the location; later reads validate the
+/// one cached header instead of scanning all `num_vars` headers.
+fn read_session_state(
+    map: &dyn MapAccessor,
+    header: &Header,
+    cache: &std::sync::Arc<std::sync::Mutex<Option<CachedSessionStateVar>>>,
+) -> Option<SessionState> {
+    let var_offset = {
+        let cached = cache.lock().ok().and_then(|guard| *guard);
+        match cached {
+            Some(cached) => validate_cached_session_state_var(map, header, cached)
+                .or_else(|| find_and_cache_session_state_var(map, header, cache)),
+            None => find_and_cache_session_state_var(map, header, cache),
+        }
+    }?;
     let raw = read_latest_var_i32(map, header, var_offset)?;
     Some(session_state_from_raw(raw))
+}
+
+/// Scans for the `SessionState` var and stores the location in the
+/// reader's cache for the next poll.
+fn find_and_cache_session_state_var(
+    map: &dyn MapAccessor,
+    header: &Header,
+    cache: &std::sync::Arc<std::sync::Mutex<Option<CachedSessionStateVar>>>,
+) -> Option<i32> {
+    let (var_index, var_offset) = find_session_state_var(map, header)?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(CachedSessionStateVar {
+            var_header_offset: header.var_header_offset,
+            num_vars: header.num_vars,
+            var_index,
+            var_offset,
+        });
+    }
+    Some(var_offset)
 }
 
 /// Maps a raw `irsdk_SessionState` value to a [`SessionState`].
@@ -342,7 +427,7 @@ struct DriverEntry {
 /// `Key: Value` lines, and adding a YAML dependency for it would pull a
 /// whole parser into a fail-safe reader.
 fn parse_session_yaml(text: &str) -> Option<(String, String)> {
-    let mut section = "";
+    let mut section = String::new();
     let mut in_drivers = false;
     let mut driver_car_idx: Option<i32> = None;
     let mut track_name = String::new();
@@ -356,7 +441,11 @@ fn parse_session_yaml(text: &str) -> Option<(String, String)> {
         }
     };
 
-    for line in text.lines() {
+    for raw_line in text.lines() {
+        // L6: leading tabs are expanded to spaces (2 per tab) before
+        // indent is measured — a tab-indented line used to read as
+        // indent 0 and silently drop its `CarPath`/`CarScreenName`.
+        let line = expand_leading_tabs(raw_line);
         let indent = line.len() - line.trim_start_matches(' ').len();
         let stripped = line.trim_start_matches(' ');
         if stripped.is_empty() || stripped.starts_with('#') {
@@ -364,7 +453,7 @@ fn parse_session_yaml(text: &str) -> Option<(String, String)> {
         }
         if indent == 0 && stripped.ends_with(':') {
             flush(&mut current, &mut entries);
-            section = stripped.trim_end_matches(':');
+            section = stripped.trim_end_matches(':').to_string();
             in_drivers = false;
             continue;
         }
@@ -425,6 +514,19 @@ fn parse_session_yaml(text: &str) -> Option<(String, String)> {
     Some((car, track_name))
 }
 
+/// Expands leading tabs to two spaces each (the indent unit this
+/// parser measures in). Only leading whitespace is touched.
+fn expand_leading_tabs(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(stripped) = rest.strip_prefix('\t') {
+        out.push_str("  ");
+        rest = stripped;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Reads one iRacing identity snapshot from a map accessor.
 ///
 /// Pure and platform-independent: on Windows the caller passes the live
@@ -432,18 +534,61 @@ fn parse_session_yaml(text: &str) -> Option<(String, String)> {
 /// over a recorded fixture image. Returns `None` when the sim is not
 /// connected, the header fails validation, the YAML is missing/oversize,
 /// or no car name resolves — never panics.
+///
+/// The YAML is read with a single copy (L11): `sessionInfoUpdate` is
+/// read before and after, and a changed generation rejects the
+/// snapshot (the sim rewrote the YAML mid-copy). A `SessionState`
+/// var-offset cache is shared across polls by
+/// [`IracingSnapshotReader`]; this entry point uses a fresh cache per
+/// call, so prefer the reader for repeated polls.
 #[must_use]
 pub fn read_iracing_snapshot(map: &dyn MapAccessor) -> Option<TelemetrySnapshot> {
-    let header = parse_header(map)?;
-    let yaml_bytes = read_consistent(map, header.session_info_offset, header.session_info_len)?;
-    let yaml_end = yaml_bytes
-        .iter()
-        .rposition(|b| *b != 0)
-        .map_or(0, |last| last + 1);
-    let yaml_text = String::from_utf8_lossy(&yaml_bytes[..yaml_end]).into_owned();
-    let (car, track) = parse_session_yaml(&yaml_text)?;
-    let state = read_session_state(map, &header).unwrap_or(SessionState::Unknown);
-    Some(TelemetrySnapshot::new(GameId::IRacing, &car, &track, state))
+    IracingSnapshotReader::default().read_snapshot(map)
+}
+
+/// Stateful iRacing snapshot reader: caches the `SessionState`
+/// var-header offset across polls (L6), so the var-header array is
+/// scanned once per session instead of once per 2 Hz poll. Cheap to
+/// clone (the cache is shared); `Default` starts uncached.
+#[derive(Clone, Debug, Default)]
+pub struct IracingSnapshotReader {
+    session_state_var: std::sync::Arc<std::sync::Mutex<Option<CachedSessionStateVar>>>,
+}
+
+impl IracingSnapshotReader {
+    /// Creates a reader with an empty var-offset cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reads one snapshot; see [`read_iracing_snapshot`].
+    #[must_use]
+    pub fn read_snapshot(&self, map: &dyn MapAccessor) -> Option<TelemetrySnapshot> {
+        let header = parse_header(map)?;
+        // L11: one copy of the YAML, guarded by the generation
+        // counter. A second mismatch after one retry rejects.
+        for _ in 0..2 {
+            let yaml_bytes = crate::access::read_single(
+                map,
+                header.session_info_offset,
+                header.session_info_len,
+            )?;
+            let after = parse_header(map)?;
+            if after.session_info_update == header.session_info_update {
+                let yaml_end = yaml_bytes
+                    .iter()
+                    .rposition(|b| *b != 0)
+                    .map_or(0, |last| last + 1);
+                let yaml_text = String::from_utf8_lossy(&yaml_bytes[..yaml_end]).into_owned();
+                let (car, track) = parse_session_yaml(&yaml_text)?;
+                let state = read_session_state(map, &header, &self.session_state_var)
+                    .unwrap_or(SessionState::Unknown);
+                return Some(TelemetrySnapshot::new(GameId::IRacing, &car, &track, state));
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -530,6 +675,39 @@ mod tests {
         let (car, track) = parse_session_yaml(YAML).expect("YAML must parse");
         assert_eq!(car, "Ferrari 488 GT3 Evo 2020");
         assert_eq!(track, "Spa-Francorchamps");
+    }
+
+    #[test]
+    fn session_yaml_tab_indent_parses() {
+        // L6: tabs in the YAML used to break indent detection and
+        // drop the driver entries entirely.
+        let yaml = "WeekendInfo:\n\tTrackName: Spa-Francorchamps\nDriverInfo:\n\tDriverCarIdx: 0\n\tDrivers:\n\t- CarIdx: 0\n\t\tCarPath: ferrari488gt3\n\t\tCarScreenName: Ferrari 488 GT3 Evo 2020\n";
+        let (car, track) = parse_session_yaml(yaml).expect("tab-indented YAML must parse");
+        assert_eq!(car, "Ferrari 488 GT3 Evo 2020");
+        assert_eq!(track, "Spa-Francorchamps");
+    }
+
+    #[test]
+    fn snapshot_reader_caches_session_state_var_offset() {
+        // L6: after one poll the var offset is cached, so the next
+        // poll validates one header instead of scanning the array.
+        let reader = IracingSnapshotReader::new();
+        let image = build_image(4, YAML);
+        let snap = reader
+            .read_snapshot(&SliceMap::new(&image))
+            .expect("image must parse");
+        assert_eq!(snap.state, SessionState::OnTrack);
+        let cached = reader
+            .session_state_var
+            .lock()
+            .expect("cache lock")
+            .expect("var offset must be cached after a read");
+        assert_eq!(cached.var_offset, 0);
+        // A second poll reuses the cache and still parses.
+        let snap2 = reader
+            .read_snapshot(&SliceMap::new(&image))
+            .expect("second poll must parse");
+        assert_eq!(snap2.car_display, "Ferrari 488 GT3 Evo 2020");
     }
 
     #[test]

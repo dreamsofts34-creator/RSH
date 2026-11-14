@@ -13,13 +13,17 @@ import {
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import { EncoderPulseTimers } from "@/lib/encoderPulse";
 import {
   TauriCommandError,
   commitConfig,
   confirmConfig,
   getConfig,
+  getConfigState,
+  rollbackConfig,
   stageConfig,
   subscribeButtonPress,
+  type ConfigState,
 } from "@/lib/tauri";
 import {
   ASSIGNABLE_ACTIONS,
@@ -53,8 +57,20 @@ export function ButtonsScreen() {
   const [capturing, setCapturing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  /** Seconds left in the backend confirm window after commit (H7). */
+  const [confirmSeconds, setConfirmSeconds] = useState<number | null>(null);
+  /** True when a step failed after the config changed: offer rollback. */
+  const [rollbackOffer, setRollbackOffer] = useState(false);
+  const [rollingBack, setRollingBack] = useState(false);
   const capturingRef = useRef(false);
   const rebindRef = useRef<number | null>(null);
+  /** Mirror of `load` for the subscription (M11: no re-subscribe on load change). */
+  const loadRef = useRef(load);
+  loadRef.current = load;
+  const pulseTimersRef = useRef<EncoderPulseTimers | null>(null);
+  if (pulseTimersRef.current === null) {
+    pulseTimersRef.current = new EncoderPulseTimers();
+  }
 
   const actionLabel = (action: string): string =>
     t(`buttons.actions.${action}`, { defaultValue: action });
@@ -84,38 +100,72 @@ export function ButtonsScreen() {
   }, [loadBindings]);
 
   // Live highlight + press-to-capture from the button-press event feed.
+  // M11: subscribed ONCE (no `load.status` dep — the handler reads the
+  // load mirror ref instead, so saving a binding never re-subscribes
+  // and drops a press mid-capture). C5: encoder buttons 65–72 are
+  // pulses and auto-clear ~200 ms after the press.
   useEffect(() => {
+    let done = false;
     let unlisten: (() => void) | undefined;
-    let cancelled = false;
+    const pulses = pulseTimersRef.current;
     void subscribeButtonPress(({ button, pressed: isPressed }) => {
-      if (cancelled) return;
+      if (done) return;
       setPressed((prev) => {
         const next = new Set(prev);
         if (isPressed) next.add(button);
         else next.delete(button);
         return next;
       });
+      if (isPressed) {
+        pulses?.arm(button, () => {
+          if (done) return;
+          setPressed((prev) => {
+            const next = new Set(prev);
+            next.delete(button);
+            return next;
+          });
+        });
+      }
       // Press-to-capture: the next pressed button becomes the rebind target.
       if (isPressed && capturingRef.current) {
         capturingRef.current = false;
         setCapturing(false);
         rebindRef.current = button;
         setRebindButton(button);
-        if (load.status === "ready") {
-          setChosenAction(load.bindings[button] ?? "unbound");
+        const current = loadRef.current;
+        if (current.status === "ready") {
+          setChosenAction(current.bindings[button] ?? "unbound");
         }
       }
-    }).then((fn) => {
-      unlisten = fn;
-    }).catch(() => {
-      // No event feed yet (backend not emitting): the grid still works;
-      // live highlight and capture just stay idle. Never fake presses.
-    });
+    })
+      .then((stop) => {
+        if (done) stop();
+        else unlisten = stop;
+      })
+      .catch(() => {
+        // No event feed yet (backend not emitting): the grid still works;
+        // live highlight and capture just stay idle. Never fake presses.
+      });
     return () => {
-      cancelled = true;
+      done = true;
+      pulses?.disarmAll();
       unlisten?.();
     };
-  }, [load.status]);
+  }, []);
+
+  // Confirm-window countdown (H7): ticks down from the 30 s backend
+  // window while a rebind is being confirmed.
+  useEffect(() => {
+    if (confirmSeconds === null) return undefined;
+    if (confirmSeconds <= 0) {
+      setConfirmSeconds(null);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      setConfirmSeconds((s) => (s === null ? null : Math.max(0, s - 1)));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [confirmSeconds]);
 
   const openRebind = (button: number) => {
     rebindRef.current = button;
@@ -133,12 +183,29 @@ export function ButtonsScreen() {
     setCapturing(false);
     capturingRef.current = false;
     setSaveError(null);
+    setRollbackOffer(false);
+    setConfirmSeconds(null);
   };
+
+  /** Verify the backend config state after a step (H3/H7): the
+   *  step commands return nothing, so the state is the proof. */
+  async function expectConfigState(
+    step: string,
+    expected: ConfigState,
+  ): Promise<void> {
+    const state = await getConfigState();
+    if (state !== expected) {
+      throw new Error(
+        `${step}: expected config state "${expected}" but the backend reports "${state}".`,
+      );
+    }
+  }
 
   const saveBinding = async () => {
     if (load.status !== "ready" || rebindButton === null) return;
     setSaving(true);
     setSaveError(null);
+    setRollbackOffer(false);
     try {
       const nextConfig = withBinding(
         load.config,
@@ -146,9 +213,39 @@ export function ButtonsScreen() {
         chosenAction === "unbound" ? null : chosenAction,
       );
       await stageConfig({ config: nextConfig });
+      await expectConfigState("stage", "staged");
       await commitConfig();
+      await expectConfigState("commit", "pending_confirm");
+      // The backend confirm window is 30 s: show the countdown while
+      // confirming so a slow confirm is visible, not silent.
+      setConfirmSeconds(30);
       await confirmConfig();
+      await expectConfigState("confirm", "clean");
+      setConfirmSeconds(null);
       setLoad({ status: "ready", config: nextConfig, bindings: parseBindings(nextConfig) });
+      closeRebind();
+    } catch (error) {
+      setConfirmSeconds(null);
+      // The config may already have changed: offer a rollback instead
+      // of leaving a half-applied binding (H7).
+      setRollbackOffer(true);
+      setSaveError(
+        error instanceof Error
+          ? error.message
+          : t("buttons.saveError", { defaultValue: "Could not save the binding." }),
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleRollback = async () => {
+    setRollingBack(true);
+    setSaveError(null);
+    try {
+      await rollbackConfig();
+      await loadBindings();
+      setRollbackOffer(false);
       closeRebind();
     } catch (error) {
       setSaveError(
@@ -157,7 +254,7 @@ export function ButtonsScreen() {
           : t("buttons.saveError", { defaultValue: "Could not save the binding." }),
       );
     } finally {
-      setSaving(false);
+      setRollingBack(false);
     }
   };
 
@@ -370,10 +467,41 @@ export function ButtonsScreen() {
               </Badge>
             ) : null}
 
+            {confirmSeconds !== null ? (
+              <p role="status" className="text-sm text-[var(--muted)]">
+                {t("buttons.confirmCountdown", {
+                  seconds: confirmSeconds,
+                  defaultValue: `${confirmSeconds} seconds left to confirm`,
+                })}
+              </p>
+            ) : null}
+
             {saveError ? (
               <p role="alert" className="text-sm text-[var(--error-text)]">
                 {saveError}
               </p>
+            ) : null}
+
+            {rollbackOffer ? (
+              <div className="space-y-2 rounded-[10px] border border-[var(--line)] bg-[var(--banner)] p-3">
+                <p className="text-sm">
+                  {t("buttons.rollbackOffer", {
+                    defaultValue:
+                      "The binding may not have saved. Roll back to the previous bindings?",
+                  })}
+                </p>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={rollingBack}
+                  onClick={() => void handleRollback()}
+                >
+                  {rollingBack
+                    ? t("buttons.rollingBack", { defaultValue: "Rolling back…" })
+                    : t("buttons.rollback", { defaultValue: "Roll back" })}
+                </Button>
+              </div>
             ) : null}
           </div>
 

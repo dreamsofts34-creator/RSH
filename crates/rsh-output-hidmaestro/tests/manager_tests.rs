@@ -331,11 +331,112 @@ fn unknown_command_is_bad_reply() {
     // Unknown commands come back ok:false; request_checked maps them.
     let err = m
         .request_checked(&Command::SubmitRaw {
-            report: "zz".to_string(),
+            bytes: "zz".to_string(),
         })
         .unwrap_err();
     assert!(matches!(err, HidMaestroError::BadReply(_)));
     m.shutdown();
+}
+
+/// C2 contract test: the verbatim real-sidecar `create` reply
+/// (PROTOCOL.md capabilities example) flows through `parse_reply` →
+/// `manager.create()` and yields the custom-wheel caps — the exact
+/// path a real sidecar's reply takes.
+#[test]
+fn create_verbatim_real_sidecar_caps_parse_to_custom_wheel() {
+    let caps = r#"{"axes":5,"buttons":32,"has_hat":true,"input_report_size":15,"submit_state_max_button":25,"submit_state_button_mask":33554431}"#;
+    let mut m = manager(&[("HM_STUB_CAPS_JSON", caps)]);
+    m.connect().unwrap();
+    let created = m.create().unwrap();
+    assert_eq!(
+        created.capabilities,
+        rsh_output_hidmaestro::HidMaestroCapabilities::custom_wheel()
+    );
+    m.shutdown();
+}
+
+/// C2: a partial axis count derives partial caps (`axes == 1` is
+/// steering only) — the manager no longer falls back to the full
+/// custom wheel when the sidecar reports fewer axes.
+#[test]
+fn create_partial_axis_count_derives_partial_caps() {
+    let caps = r#"{"axes":1,"buttons":0,"has_hat":false,"input_report_size":15,"submit_state_max_button":25,"submit_state_button_mask":33554431}"#;
+    let mut m = manager(&[("HM_STUB_CAPS_JSON", caps)]);
+    m.connect().unwrap();
+    let created = m.create().unwrap();
+    assert_eq!(
+        created.capabilities,
+        rsh_output_hidmaestro::HidMaestroCapabilities::new(
+            true, false, false, false, false, 0, false
+        )
+    );
+    m.shutdown();
+}
+
+/// C1: the stub rejects the old `report` field at the process level
+/// — spawn it, feed the old wire line, read the refusal. A Rust
+/// build that still sends `report` fails loudly here instead of
+/// silently dropping raw reports against the real sidecar.
+#[test]
+fn submit_raw_old_report_field_is_rejected_by_stub() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command as Proc, Stdio};
+    let mut child = Proc::new(stub_path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("stub spawns");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("hello line");
+    assert!(line.contains("rsh-hm-sidecar"), "hello: {line}");
+    writeln!(stdin, r#"{{"cmd":"submit-raw","report":"00ff"}}"#).unwrap();
+    stdin.flush().unwrap();
+    line.clear();
+    stdout.read_line(&mut line).expect("refusal line");
+    assert!(
+        line.contains(r#""ok":false"#) && line.contains("bad-command"),
+        "old `report` field must be refused as bad-command, got: {line}"
+    );
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// M8: a second `connect()` notices a sidecar that died since the
+/// last call (EOF already queued) and respawns instead of reporting
+/// the dead transport as connected.
+#[test]
+fn connect_after_sidecar_exit_respawns() {
+    let mut m = manager(&[("HM_STUB_EXIT_AFTER", "1")]);
+    m.connect().unwrap();
+    // First command: the stub answers, then exits (EOF queued).
+    let reply = m.request(&Command::Ping).unwrap();
+    assert!(reply.ok);
+    // Second connect: liveness drain sees the EOF and respawns a
+    // fresh stub — this must succeed, not return the dead session.
+    let info = m.connect().expect("respawn after sidecar exit");
+    assert_eq!(info.sdk_version.as_deref(), Some(PINNED_VERSION));
+    assert!(m.is_running());
+    m.shutdown();
+}
+
+/// H4: shutdown never waits for the `exit` reply — a sidecar that
+/// answers `exit` slowly (or never) must not stall the caller.
+#[test]
+fn shutdown_does_not_wait_for_slow_exit_reply() {
+    let mut cfg = config(&[("HM_STUB_SLOW_MS", "300")]);
+    cfg.reply_timeout = Duration::from_millis(50);
+    let mut m = SidecarManager::new(cfg);
+    m.connect().unwrap();
+    let start = std::time::Instant::now();
+    m.shutdown();
+    assert!(
+        start.elapsed() < Duration::from_millis(250),
+        "shutdown took {:?} — it waited for the exit reply",
+        start.elapsed()
+    );
+    assert!(!m.is_running());
 }
 
 #[test]

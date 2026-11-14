@@ -9,7 +9,7 @@ import {
   validateFirmwareImage,
   type FirmwareValidation,
 } from "@/lib/tauri";
-import { Notice, NotImplementedNotice, StepIntro, describeError } from "./components";
+import { Notice, NotImplementedNotice, StepIntro, describeError, type StepProps } from "./components";
 
 /**
  * Step 6 — Firmware upload gate (closes the C# classic-mode gap
@@ -24,7 +24,16 @@ import { Notice, NotImplementedNotice, StepIntro, describeError } from "./compon
  * unvalidated.
  */
 
-/** Parse "a.b.c" into a triple, or null when it is not a version. */
+/**
+ * Parse "a.b.c" into a triple, or null when it is not a version.
+ *
+ * The ≤255 cap is the contract, not an arbitrary limit: the backend
+ * verifier parses versions as a `(u8, u8, u8)` triple
+ * (`crates/rsh-security/src/firmware_verify.rs::parse_version`,
+ * matching `ota_validate.h`), so a component above 255 can never be
+ * a real firmware version — accepting it here would only let the
+ * downgrade gate pass an image the backend then rejects.
+ */
 export function parseVersion(value: string): [number, number, number] | null {
   const parts = value.trim().split(".");
   if (parts.length !== 3) return null;
@@ -49,10 +58,12 @@ export function compareVersions(
   return 0;
 }
 
-export function FirmwareStep() {
+export function FirmwareStep({ onSuccessChange }: StepProps) {
   const { t } = useTranslation();
   const [currentVersion, setCurrentVersion] = useState<string | null>(null);
   const [versionUnknown, setVersionUnknown] = useState(false);
+  const [versionFailed, setVersionFailed] = useState(false);
+  const [versionNonce, setVersionNonce] = useState(0);
   const [path, setPath] = useState("");
   const [validation, setValidation] = useState<FirmwareValidation | null>(null);
   const [busy, setBusy] = useState<"validating" | "uploading" | null>(null);
@@ -60,27 +71,39 @@ export function FirmwareStep() {
     null,
   );
   const [uploaded, setUploaded] = useState(false);
+  const [pickerUnavailable, setPickerUnavailable] = useState(false);
+
+  // H5: the step succeeds once a firmware image has uploaded.
+  useEffect(() => {
+    onSuccessChange?.(uploaded);
+  }, [uploaded, onSuccessChange]);
 
   // The installed version is the downgrade baseline; without it the
   // upload gate cannot prove "not a downgrade", so it stays closed.
+  // M13: a failed version read can be retried (versionNonce).
   useEffect(() => {
     let cancelled = false;
+    setVersionFailed(false);
     getFirmwareVersion()
       .then((version) => {
-        if (!cancelled) setCurrentVersion(version);
+        if (!cancelled) {
+          setCurrentVersion(version);
+          setVersionUnknown(false);
+        }
       })
       .catch((caught: unknown) => {
         if (cancelled) return;
         if (describeError(caught).notImplemented) {
           setVersionUnknown(true);
         } else {
+          setVersionFailed(true);
           setError(describeError(caught));
         }
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [versionNonce]);
 
   function handleValidate() {
     setBusy("validating");
@@ -93,6 +116,37 @@ export function FirmwareStep() {
         setError(describeError(caught));
       })
       .finally(() => setBusy(null));
+  }
+
+  /**
+   * M13: native file picker (`@tauri-apps/plugin-dialog`). The plugin
+   * must also be registered on the Rust side
+   * (`tauri_plugin_dialog::init()` + the `dialog:default` capability)
+   * before this succeeds — until then the import resolves but `open()`
+   * rejects, and the step falls back to the typed path with an honest
+   * note instead of a dead button.
+   */
+  async function handleBrowse() {
+    setPickerUnavailable(false);
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        multiple: false,
+        filters: [
+          {
+            name: "Firmware image",
+            extensions: ["bin"],
+          },
+        ],
+      });
+      if (typeof selected === "string" && selected.length > 0) {
+        setPath(selected);
+        setValidation(null);
+        setUploaded(false);
+      }
+    } catch {
+      setPickerUnavailable(true);
+    }
   }
 
   function handleUpload() {
@@ -137,17 +191,36 @@ export function FirmwareStep() {
 
       <div className="space-y-2">
         <Label htmlFor="setup-firmware-path">{t("setup.firmware.filePath")}</Label>
-        <Input
-          id="setup-firmware-path"
-          value={path}
-          onChange={(event) => {
-            setPath(event.target.value);
-            setValidation(null);
-            setUploaded(false);
-          }}
-          placeholder={t("setup.firmware.filePlaceholder")}
-        />
+        <div className="flex flex-wrap gap-2">
+          <Input
+            id="setup-firmware-path"
+            value={path}
+            onChange={(event) => {
+              setPath(event.target.value);
+              setValidation(null);
+              setUploaded(false);
+            }}
+            placeholder={t("setup.firmware.filePlaceholder")}
+            className="max-w-md flex-1"
+          />
+          <Button type="button" variant="outline" onClick={() => void handleBrowse()}>
+            {t("setup.firmware.browse")}
+          </Button>
+        </div>
+        {pickerUnavailable ? (
+          <Notice tone="warn">{t("setup.firmware.pickerUnavailable")}</Notice>
+        ) : null}
       </div>
+
+      {(versionUnknown || versionFailed) && (
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() => setVersionNonce((n) => n + 1)}
+        >
+          {t("setup.firmware.retry")}
+        </Button>
+      )}
 
       <div className="flex flex-wrap gap-2">
         <Button

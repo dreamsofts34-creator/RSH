@@ -68,6 +68,25 @@ export function TransportSection() {
       const state = await switchTransport({ transport, address });
       setConnection(state.state);
       setBackendError(state.error);
+      // H11: a switch reports "connecting" first — poll until it
+      // settles (connected / error / disconnected) instead of showing
+      // a stale "connecting" forever. 10 polls × 500 ms, then stop.
+      if (state.state === "connecting") {
+        setStatus(
+          st(t, "settings.transport.connecting", "Connecting…"),
+        );
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          try {
+            const polled = await getTransportState();
+            setConnection(polled.state);
+            setBackendError(polled.error);
+            if (polled.state !== "connecting") break;
+          } catch {
+            break;
+          }
+        }
+      }
       setStatus(st(t, "settings.transport.saved", "Transport saved."));
     } catch (error) {
       if (error instanceof TauriCommandError && error.notImplemented) {
@@ -174,22 +193,39 @@ export function TransportSection() {
                 value={address}
                 disabled={saving}
                 onChange={(event) => setAddress(event.target.value)}
-                placeholder="192.168.4.1"
+                placeholder={
+                  transport === "usb"
+                    ? st(
+                        t,
+                        "settings.transport.addressPlaceholderUsb",
+                        "Auto-detected",
+                      )
+                    : "192.168.4.1"
+                }
               />
               <p className="text-[13px] text-[var(--muted)]">
-                {st(
-                  t,
-                  "settings.transport.addressHint",
-                  "IP address for Wi-Fi, serial port for USB.",
-                )}
+                {transport === "usb"
+                  ? st(
+                      t,
+                      "settings.transport.addressHintUsb",
+                      "Leave empty — the serial port is auto-detected.",
+                    )
+                  : st(
+                      t,
+                      "settings.transport.addressHint",
+                      "IP address for Wi-Fi, serial port for USB.",
+                    )}
               </p>
             </div>
             <Button
               type="button"
-              disabled={saving || address.trim() === ""}
+              disabled={
+                saving ||
+                (transport === "wifi" && address.trim() === "")
+              }
               onClick={() => void handleSave()}
             >
-              {st(t, "settings.transport.save", "Save transport")}
+              {st(t, "settings.transport.save", "Connect")}
             </Button>
           </>
         )}

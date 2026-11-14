@@ -6,7 +6,7 @@ import {
   getPairingStatus,
   type PairingStatus,
 } from "@/lib/tauri";
-import { Notice, NotImplementedNotice, StepIntro, describeError } from "./components";
+import { Notice, NotImplementedNotice, StepIntro, describeError, type StepProps } from "./components";
 
 /**
  * Step 2 — Pairing (UI plan P5.2, Security plan contract).
@@ -23,7 +23,7 @@ export function groupPassword(password: string): string {
   return password.replace(/(.{6})/g, "$1 ").trim();
 }
 
-export function PairingStep() {
+export function PairingStep({ onSuccessChange }: StepProps) {
   const { t } = useTranslation();
   const [status, setStatus] = useState<PairingStatus | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(0);
@@ -33,6 +33,11 @@ export function PairingStep() {
     null,
   );
 
+  // H5: the step succeeds once the user has seen and saved the password.
+  useEffect(() => {
+    onSuccessChange?.(acknowledged);
+  }, [acknowledged, onSuccessChange]);
+
   // Local 1 s countdown from the window the backend reported.
   useEffect(() => {
     if (secondsLeft <= 0) return undefined;
@@ -41,6 +46,24 @@ export function PairingStep() {
     }, 1000);
     return () => window.clearInterval(timer);
   }, [secondsLeft]);
+
+  // M3: re-poll the countdown from the backend every 5 s while the
+  // window is open — the local timer drifts, and only the backend
+  // knows when the window really closes.
+  useEffect(() => {
+    if (secondsLeft <= 0 || acknowledged) return undefined;
+    const timer = window.setInterval(() => {
+      void getPairingStatus()
+        .then((next) => {
+          setStatus(next);
+          setSecondsLeft(next.secondsLeft);
+        })
+        .catch(() => {
+          // Poll failing: the local countdown keeps running.
+        });
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [secondsLeft, acknowledged]);
 
   function handleBegin() {
     setBusy(true);
@@ -85,7 +108,14 @@ export function PairingStep() {
       />
 
       <div className="flex flex-wrap gap-2">
-        <Button type="button" onClick={handleBegin} disabled={busy}>
+        <Button
+          type="button"
+          onClick={handleBegin}
+          disabled={busy || secondsLeft > 0}
+          title={
+            secondsLeft > 0 ? t("setup.pairing.windowOpen") : undefined
+          }
+        >
           {t("setup.pairing.begin")}
         </Button>
         {!acknowledged && status !== null && (
@@ -106,6 +136,9 @@ export function PairingStep() {
           </p>
           <p aria-live="polite" className="text-sm text-[var(--ink)]">
             {t("setup.pairing.secondsLeft", { seconds: secondsLeft })}
+          </p>
+          <p className="text-sm text-[var(--muted)]">
+            {t("setup.pairing.noSpaces")}
           </p>
           <Button type="button" variant="secondary" onClick={handleSaved}>
             {t("setup.pairing.savedButton")}

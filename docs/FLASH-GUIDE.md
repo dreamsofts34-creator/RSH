@@ -26,9 +26,9 @@
 
 | File | Size | Use |
 |---|---|---|
-| `RSH-Firmware-DevKitV1-v4.0.1.bin` (merged) | **955,056 B** | ✅ USB flashing — this is the file for this guide |
-| `firmware.bin` (app-only) | 889,520 B | ❌ **Never** for USB flashing / recovery — it has no bootloader and will not boot |
-| `firmware-signed.bin` | 889,588 B (app + 68 B trailer) | ❌ **OTA only** (WebOTA / app upload) — not for USB flashing |
+| `RSH-Firmware-DevKitV1-v4.0.1.bin` (merged) | **955,984 B** | ✅ USB flashing — this is the file for this guide |
+| `firmware.bin` (app-only) | 890,448 B | ❌ **Never** for USB flashing / recovery — it has no bootloader and will not boot |
+| `firmware-signed.bin` | 890,516 B (app + 68 B trailer) | ❌ **OTA only** (WebOTA / app upload) — not for USB flashing |
 
 The merged image contains bootloader (`0x1000`) + partitions (`0x8000`)
 + boot_app0 (`0xe000`) + app (`0x10000`) in one file, flashed at
@@ -47,7 +47,7 @@ OTA.
 
 | Item | Where from |
 |---|---|
-| Merged factory bin `RSH-Firmware-DevKitV1-v4.0.1.bin` (**955,056 B**) | GitHub Release v1.0.0 assets, or a local `pio run` (`.pio/build/esp32dev/`) |
+| Merged factory bin `RSH-Firmware-DevKitV1-v4.0.1.bin` (**955,984 B**) | GitHub Release v1.0.0 assets, or a local `pio run` (`.pio/build/esp32dev/`) |
 | `SHA256SUMS` (from the same release) | GitHub Release assets — verify before flashing (§3, step 1) |
 | `esptool.py` | With PlatformIO (`tool-esptoolpy`), or `pip install esptool` |
 | USB **data** cable (charge-only will not work) | — |
@@ -66,7 +66,7 @@ OTA.
    sha256sum RSH-Firmware-DevKitV1-v4.0.1.bin
    ```
    Compare with `SHA256SUMS` from the release, and check the size is
-   **955,056 B**. A hash mismatch or a smaller file (e.g. 889,520 B
+   **955,984 B**. A hash mismatch or a smaller file (e.g. 890,448 B
    `firmware.bin`) means the wrong file — **do not flash it**,
    download it again.
 2. **Connect the board by USB.** It must appear as a COM port
@@ -144,7 +144,7 @@ it back.
 ```bash
 export TMPDIR=~/tmp   # /tmp is a 512 MB tmpfs — large builds need this
 cd <firmware copy>    # never build inside reference/ — use a scratch copy
-pio run               # output: .pio/build/esp32dev/RSH-Firmware-DevKitV1-v4.0.1.bin (955,056 B)
+pio run               # output: .pio/build/esp32dev/RSH-Firmware-DevKitV1-v4.0.1.bin (955,984 B)
 pio run -t upload     # board must be in download mode (§3 step 3)
 ```
 

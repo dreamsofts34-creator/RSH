@@ -39,6 +39,14 @@
 //              hai; test accept karke strip na chalana false PASS hota).
 //              Pattern galat ho to UNSUPPORTED, R-L9 pin rule toote to
 //              PIN_CONFLICT, LED module configured na ho to UNSUPPORTED.
+//   FACTORY_RESET -> status (khaali body). Payload: koi nahi (len != 0
+//              -> UNSUPPORTED). Config factory defaults par wapas
+//              (factory blob load + persist); key/password ko haath NAHI
+//              lagta (keystore alag hai — KEY_RESET alag command hai).
+//              Staged/previous state saaf ho jata hai (load_current
+//              has_previous=0, state IDLE). Reboot ki zaroorat nahi —
+//              live blob badalte hi caller ka blob-change detector
+//              modules + inputs dobara lagata hai.
 //   Unknown cmd -> UNSUPPORTED (execute nahi hota).
 //
 // Malformed payload (SET_CFG len != 8+chunkLen, GET_CFG len != 4,
@@ -185,6 +193,24 @@ static inline uint8_t rsh_fw34_handler(uint8_t cmd, const uint8_t *payload, uint
       if (st == RSH_CTRL_OK && was_pending && c->cfg_persist)
         c->cfg_persist(c->user, 0);
       return st;
+    }
+    case RSH_CMD_FACTORY_RESET: {
+      // M-5: config factory defaults par wapas — key/password ko haath
+      // nahi lagta (keystore alag hai; KEY_RESET alag command hai).
+      // Factory blob load hota hai (validate hota hai — ghalat blob
+      // load nahi hota, caller factory fallback le); load_current
+      // staged/previous saaf kar deta hai (state IDLE,
+      // has_previous=0). Persist karo taake reboot ke baad bhi
+      // defaults rahen; live blob badalte hi rsh.ino ka detector
+      // modules + inputs dobara lagata hai (reboot nahi chahiye).
+      if (!c || !c->txn) return RSH_CTRL_UNSUPPORTED;
+      if (len != 0) return RSH_CTRL_UNSUPPORTED;
+      uint8_t factory[RSH_CFG_MAX_TOTAL];
+      size_t flen = rsh_cfg_factory_blob(factory);
+      uint8_t st = rsh_cfg_txn_load_current(c->txn, factory, flen);
+      if (st != RSH_CTRL_OK) return st;
+      if (c->cfg_persist) c->cfg_persist(c->user, 0);
+      return RSH_CTRL_OK;
     }
     case RSH_CMD_KEY_RESET: {
       if (len != 0) return RSH_CTRL_UNSUPPORTED;

@@ -31,11 +31,12 @@
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::thread::{self, Builder};
+use std::thread::{self, Builder, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rsh_engine::engine::PacketSource;
@@ -102,6 +103,11 @@ struct AtomicCounters {
     hello_received: AtomicU64,
     /// Status packets parsed and handed to the status channel.
     status_received: AtomicU64,
+    /// Reader-thread panics caught by the `catch_unwind` guard (M6:
+    /// a panicking reader must be visible in `counters()`, not silent).
+    reader_panics: AtomicU64,
+    /// HELO-thread panics caught by the `catch_unwind` guard (M6).
+    helo_panics: AtomicU64,
 }
 
 impl AtomicCounters {
@@ -122,6 +128,8 @@ impl AtomicCounters {
             control_received: load(&self.control_received),
             hello_received: load(&self.hello_received),
             status_received: load(&self.status_received),
+            reader_panics: load(&self.reader_panics),
+            helo_panics: load(&self.helo_panics),
         }
     }
 }
@@ -155,6 +163,10 @@ pub struct UdpCounters {
     pub hello_received: u64,
     /// Status packets parsed and handed to the status channel.
     pub status_received: u64,
+    /// Reader-thread panics caught by the `catch_unwind` guard (M6).
+    pub reader_panics: u64,
+    /// HELO-thread panics caught by the `catch_unwind` guard (M6).
+    pub helo_panics: u64,
 }
 
 /// Configuration for [`UdpTransport::bind`].
@@ -236,6 +248,13 @@ pub struct UdpTransport {
     counters: Arc<AtomicCounters>,
     /// Set by [`Self::shutdown`] / [`Drop`]; the threads exit promptly.
     shutdown: Arc<AtomicBool>,
+    /// Reader-thread handle (M6): polled by [`Self::reader_alive`]
+    /// so a dead reader is observable instead of silent. The handle
+    /// is never joined — the thread is detached and exits on
+    /// shutdown; joining on drop could block the caller.
+    reader_handle: Option<JoinHandle<()>>,
+    /// HELO-thread handle (M6), same contract as `reader_handle`.
+    helo_handle: Option<JoinHandle<()>>,
 }
 
 impl UdpTransport {
@@ -269,13 +288,16 @@ impl UdpTransport {
             hello: hello_tx,
             status: status_tx,
         };
+        let mut reader_handle = None;
+        let mut helo_handle = None;
         spawn_reader(
             Arc::clone(&socket),
             Arc::clone(&expected_remote),
             senders,
             Arc::clone(&counters),
             Arc::clone(&shutdown),
-        )?;
+        )
+        .map(|handle| reader_handle = Some(handle))?;
         spawn_helo(
             Arc::clone(&socket),
             Arc::clone(&expected_remote),
@@ -283,7 +305,8 @@ impl UdpTransport {
             config.helo_interval,
             Arc::clone(&counters),
             Arc::clone(&shutdown),
-        )?;
+        )
+        .map(|handle| helo_handle = Some(handle))?;
         Ok(Self {
             socket,
             expected_remote,
@@ -294,6 +317,8 @@ impl UdpTransport {
             status_rx,
             counters,
             shutdown,
+            reader_handle,
+            helo_handle,
         })
     }
 
@@ -371,8 +396,37 @@ impl UdpTransport {
     }
 
     /// Stop the reader + HELO threads. Idempotent; [`Drop`] calls this.
+    ///
+    /// L11: besides setting the flag, the socket is poked with an
+    /// empty datagram to its own bound address — a reader blocked in
+    /// `recv_from` wakes immediately instead of waiting out its
+    /// 100 ms read timeout. (`std::net::UdpSocket` has no
+    /// `shutdown()`/`close()`; the poke is the std-only equivalent.
+    /// The reader checks the flag before counting, so the poke never
+    /// pollutes the counters. If the poke fails, the 100 ms read
+    /// timeout still bounds the exit.)
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        if let Ok(addr) = self.socket.local_addr() {
+            let _ = self.socket.send_to(&[], addr);
+        }
+    }
+
+    /// `true` while the reader thread is still running (M6 health
+    /// check — poll this alongside `counters().reader_panics`).
+    #[must_use]
+    pub fn reader_alive(&self) -> bool {
+        self.reader_handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
+    /// `true` while the HELO thread is still running (M6).
+    #[must_use]
+    pub fn helo_alive(&self) -> bool {
+        self.helo_handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
     }
 
     /// Await the next HELLO reply. Returns [`None`] once the transport
@@ -460,19 +514,26 @@ fn read_expected_addr(expected: &RwLock<SocketAddr>) -> SocketAddr {
 }
 
 /// Spawn the reader thread (detached; it exits on shutdown).
+/// Returns the thread handle so the transport can poll its health
+/// (M6). A reader panic is caught and counted in `reader_panics`
+/// instead of silently killing the stream.
 fn spawn_reader(
     socket: Arc<UdpSocket>,
     expected: Arc<RwLock<SocketAddr>>,
     senders: DemuxSenders,
     counters: Arc<AtomicCounters>,
     shutdown: Arc<AtomicBool>,
-) -> io::Result<()> {
+) -> io::Result<JoinHandle<()>> {
     Builder::new()
         .name("rsh-udp-reader".to_owned())
         .spawn(move || {
-            reader_loop(&socket, &expected, &senders, &counters, &shutdown);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                reader_loop(&socket, &expected, &senders, &counters, &shutdown);
+            }));
+            if result.is_err() {
+                counters.reader_panics.fetch_add(1, Ordering::Relaxed);
+            }
         })
-        .map(|_| ())
 }
 
 /// The reader loop: `recv`, sender-filter, demux by magic, parse, forward.
@@ -491,6 +552,11 @@ fn reader_loop(
     while !shutdown.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
+                // L11: the shutdown poke (an empty datagram to our own
+                // address) wakes recv — exit before counting it.
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 counters.datagrams_received.fetch_add(1, Ordering::Relaxed);
                 if src.ip() != read_expected_addr(expected).ip() {
                     counters
@@ -520,8 +586,13 @@ fn handle_datagram(data: &[u8], senders: &DemuxSenders, counters: &AtomicCounter
     if data.starts_with(b"RSH2") {
         match StreamFrame::parse(data) {
             Ok(frame) => {
-                counters.frames_delivered.fetch_add(1, Ordering::Relaxed);
-                if senders.frame.try_send(frame).is_err() {
+                // L10: delivered means it actually reached the
+                // channel — a full channel drops the frame, and the
+                // counter must say so (it used to count first, then
+                // drop silently on overflow).
+                if senders.frame.try_send(frame).is_ok() {
+                    counters.frames_delivered.fetch_add(1, Ordering::Relaxed);
+                } else {
                     count_overflow(counters);
                 }
             }
@@ -575,6 +646,8 @@ fn count_overflow(counters: &AtomicCounters) {
 }
 
 /// Spawn the HELO thread (detached; it exits on shutdown).
+/// Returns the thread handle (M6); a HELO panic is caught and
+/// counted in `helo_panics`.
 fn spawn_helo(
     socket: Arc<UdpSocket>,
     expected: Arc<RwLock<SocketAddr>>,
@@ -582,20 +655,24 @@ fn spawn_helo(
     interval: Duration,
     counters: Arc<AtomicCounters>,
     shutdown: Arc<AtomicBool>,
-) -> io::Result<()> {
+) -> io::Result<JoinHandle<()>> {
     Builder::new()
         .name("rsh-udp-helo".to_owned())
         .spawn(move || {
-            helo_loop(
-                &socket,
-                &expected,
-                session_flag,
-                interval,
-                &counters,
-                &shutdown,
-            );
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                helo_loop(
+                    &socket,
+                    &expected,
+                    session_flag,
+                    interval,
+                    &counters,
+                    &shutdown,
+                );
+            }));
+            if result.is_err() {
+                counters.helo_panics.fetch_add(1, Ordering::Relaxed);
+            }
         })
-        .map(|_| ())
 }
 
 /// The HELO loop: send immediately, then once per `interval`, reading the
@@ -719,6 +796,62 @@ mod tests {
         /// Compile-time assertion: the transport must be spawnable.
         fn assert_send<T: Send>() {}
         assert_send::<UdpTransport>();
+    }
+
+    #[test]
+    fn reader_and_helo_threads_alive_then_stop_on_shutdown() {
+        // M6/L11: handles are stored and pollable; shutdown wakes the
+        // reader out of recv promptly (socket shutdown, not just the
+        // 100 ms read timeout).
+        let config = UdpConfig {
+            local_port: 0, // ephemeral: no clash with other tests
+            ..UdpConfig::default()
+        };
+        let transport = UdpTransport::bind(config).expect("bind succeeds");
+        assert!(transport.reader_alive(), "reader running after bind");
+        assert!(transport.helo_alive(), "helo running after bind");
+        assert_eq!(transport.counters().reader_panics, 0);
+        assert_eq!(transport.counters().helo_panics, 0);
+        let started = Instant::now();
+        transport.shutdown();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (transport.reader_alive() || transport.helo_alive()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!transport.reader_alive(), "reader stopped after shutdown");
+        assert!(!transport.helo_alive(), "helo stopped after shutdown");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn frames_delivered_counts_only_channel_accepted_frames() {
+        // L10: a parsed frame dropped by a full channel is an
+        // overflow, not a delivery.
+        let (frame_tx, _frame_rx) = mpsc::channel(1);
+        let (control_tx, _control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
+        let (hello_tx, _hello_rx) = mpsc::channel(HELLO_CHANNEL_CAPACITY);
+        let (status_tx, _status_rx) = mpsc::channel(STATUS_CHANNEL_CAPACITY);
+        let senders = DemuxSenders {
+            frame: frame_tx,
+            control: control_tx,
+            hello: hello_tx,
+            status: status_tx,
+        };
+        let counters = AtomicCounters::default();
+        // Fill the 1-capacity frame channel with a first frame.
+        let first = StreamFrame::new(1, 5_000, StreamFlags::default(), &[(0, 1650)], &[], 0);
+        handle_datagram(&first.encode(), &senders, &counters);
+        assert_eq!(counters.snapshot().frames_delivered, 1);
+        // Second frame: parses fine but the channel is full.
+        let second = StreamFrame::new(2, 10_000, StreamFlags::default(), &[(0, 1650)], &[], 0);
+        handle_datagram(&second.encode(), &senders, &counters);
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.frames_delivered, 1, "overflow is not a delivery");
+        assert_eq!(snapshot.dropped_overflow, 1);
     }
 
     #[tokio::test]
@@ -857,7 +990,10 @@ mod tests {
     /// with `EPERM`, so the transport's HELOs can never leave. Run on
     /// Windows or CI, where UDP `sendto` works.
     #[tokio::test]
-    #[ignore = "sandbox blocks UDP sendto (EPERM); run where UDP send works"]
+    #[cfg_attr(
+        not(windows),
+        ignore = "sandbox blocks UDP sendto (EPERM); run where UDP send works"
+    )]
     async fn helo_received_by_board_at_one_hertz() {
         let board = FakeBoard::new(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let transport = UdpTransport::bind(test_config(
@@ -907,7 +1043,10 @@ mod tests {
     /// with `EPERM`, so the transport's control send can never leave. Run
     /// on Windows or CI, where UDP `sendto` works.
     #[tokio::test]
-    #[ignore = "sandbox blocks UDP sendto (EPERM); run where UDP send works"]
+    #[cfg_attr(
+        not(windows),
+        ignore = "sandbox blocks UDP sendto (EPERM); run where UDP send works"
+    )]
     async fn control_send_and_reply_round_trip() {
         let board = FakeBoard::new(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let mut transport = UdpTransport::bind(test_config(

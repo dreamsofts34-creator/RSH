@@ -13,7 +13,7 @@
 //! splitting either would hurt readability without helping review.
 //!
 //! Seeded virtual wheel + real `WheelEngine` + recording output,
-//! 26 scenarios, three modes:
+//! 27 scenarios, three modes:
 //!
 //! * `quick` — every scenario at its short duration (~8 min total).
 //! * `full` — longer durations incl. the 10-minute soak (~15 min).
@@ -54,6 +54,7 @@ struct ScenarioResult {
     id: String,
     description: String,
     duration_sec: f64,
+    seed: u64,
     passed: bool,
     /// Per-assertion outcomes (`metric: actual op expected (PASS|FAIL|SKIPPED)`).
     assertions: Vec<String>,
@@ -66,6 +67,9 @@ struct RunReport {
     tool: String,
     mode: String,
     seed: u64,
+    /// Every seed this run executed (M-3 multi-seed support:
+    /// `--seeds 42,7,1337`; single-seed runs list one seed).
+    seeds: Vec<u64>,
     started_utc: String,
     host: String,
     rustc: String,
@@ -163,9 +167,12 @@ fn evaluate(scenario: &scenarios::Scenario, m: &Metrics) -> (bool, Vec<String>) 
 /// Print usage to stderr.
 fn usage() {
     eprintln!(
-        "Usage: rsh-rig [--mode quick|full|long] [--only <id>] [--seed N] [--out DIR] [--list]\n\
+        "Usage: rsh-rig [--mode quick|full|long] [--only <id>] [--seed N] [--seeds 42,7,1337] [--out DIR] [--list]\n\
          \n\
          Modes: quick (~8 min), full (~15 min, 10-min soak), long (4-hour soak with --only long-soak).\n\
+         --seed N runs every selected scenario once with seed N (default 42).\n\
+         --seeds 42,7,1337 runs every selected scenario once per seed (M-3 multi-seed gate support;\n\
+         the gate phase runs the full rig on seeds 42, 7 and 1337) and overrides --seed.\n\
          --out DIR writes results.json + REPORT.md there (default: <repo>/../rig-runs/<timestamp>/ is NOT used;\n\
          default is $HOME/workspace/goals/rsh-real-sim-hub-project/hidden_files/rig-runs/<timestamp>/)."
     );
@@ -177,6 +184,7 @@ async fn main() {
     let mut mode = "quick".to_string();
     let mut only: Option<String> = None;
     let mut seed: u64 = 42;
+    let mut seeds: Option<Vec<u64>> = None;
     let mut out: Option<PathBuf> = None;
     let mut list = false;
     let mut i = 0;
@@ -193,6 +201,20 @@ async fn main() {
             "--seed" => {
                 i += 1;
                 seed = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(42);
+            }
+            "--seeds" => {
+                i += 1;
+                let raw = args.get(i).cloned().unwrap_or_default();
+                let parsed: Vec<u64> = raw
+                    .split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect();
+                if parsed.is_empty() {
+                    eprintln!("--seeds needs a comma-separated list, e.g. --seeds 42,7,1337");
+                    usage();
+                    std::process::exit(2);
+                }
+                seeds = Some(parsed);
             }
             "--out" => {
                 i += 1;
@@ -216,6 +238,8 @@ async fn main() {
         usage();
         std::process::exit(2);
     }
+    // M-3: --seeds overrides --seed; default is the single --seed value.
+    let seeds: Vec<u64> = seeds.unwrap_or_else(|| vec![seed]);
 
     let registry = scenarios::registry();
     if list {
@@ -245,7 +269,8 @@ async fn main() {
         std::process::exit(2);
     }
     println!(
-        "rsh-rig mode={mode} seed={seed} out={out}",
+        "rsh-rig mode={mode} seeds={seeds:?} out={out}",
+        seeds = seeds,
         out = out_dir.display()
     );
 
@@ -254,50 +279,55 @@ async fn main() {
     let mut results: Vec<ScenarioResult> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
 
-    for scenario in selected {
-        let duration = scenarios::duration_for(scenario, &mode);
-        let t0 = Instant::now();
-        println!(
-            "--- {id} ({duration} s, {desc})",
-            id = scenario.id,
-            desc = scenario.description
-        );
-        let metrics = if duration == 0 {
-            harness::run_contract(scenario)
-        } else {
-            let (m, _sampler) =
-                harness::run_live(scenario, duration, seed, |line| println!("{line}")).await;
-            m
-        };
-        let (passed, assertion_lines) = evaluate(scenario, &metrics);
-        for line in &assertion_lines {
-            println!("    {line}");
+    for seed in &seeds {
+        let seed = *seed;
+        for scenario in &selected {
+            let duration = scenarios::duration_for(scenario, &mode);
+            let t0 = Instant::now();
+            println!(
+                "--- {id} (seed {seed}, {duration} s, {desc})",
+                id = scenario.id,
+                desc = scenario.description
+            );
+            let metrics = if duration == 0 {
+                harness::run_contract(scenario)
+            } else {
+                let (m, _sampler) =
+                    harness::run_live(scenario, duration, seed, |line| println!("{line}")).await;
+                m
+            };
+            let (passed, assertion_lines) = evaluate(scenario, &metrics);
+            for line in &assertion_lines {
+                println!("    {line}");
+            }
+            if !metrics.events.is_empty() {
+                let ev = metrics.events.join(" | ");
+                println!("    events: {ev}");
+            }
+            let verdict = if passed { "PASS" } else { "FAIL" };
+            let wall_s = t0.elapsed().as_secs_f64();
+            println!("    {verdict} in {wall_s:.1} s (wall)");
+            if !passed {
+                failed.push(format!("{} (seed {seed})", scenario.id));
+            }
+            results.push(ScenarioResult {
+                id: scenario.id.to_string(),
+                description: scenario.description.to_string(),
+                duration_sec: metrics.duration_sec,
+                seed,
+                passed,
+                assertions: assertion_lines,
+                metrics,
+            });
         }
-        if !metrics.events.is_empty() {
-            let ev = metrics.events.join(" | ");
-            println!("    events: {ev}");
-        }
-        let verdict = if passed { "PASS" } else { "FAIL" };
-        let wall_s = t0.elapsed().as_secs_f64();
-        println!("    {verdict} in {wall_s:.1} s (wall)");
-        if !passed {
-            failed.push(scenario.id.to_string());
-        }
-        results.push(ScenarioResult {
-            id: scenario.id.to_string(),
-            description: scenario.description.to_string(),
-            duration_sec: metrics.duration_sec,
-            passed,
-            assertions: assertion_lines,
-            metrics,
-        });
     }
 
     let passed_count = results.iter().filter(|r| r.passed).count();
     let report = RunReport {
         tool: "rsh-rig 1.0.0 (Phase H2)".to_string(),
         mode: mode.clone(),
-        seed,
+        seed: seeds[0],
+        seeds: seeds.clone(),
         started_utc,
         host: host_string(),
         rustc: rustc_string(),
@@ -327,9 +357,15 @@ fn write_reports(out_dir: &Path, report: &RunReport, wall: Duration) {
     let mut md = String::new();
     let _ = write!(md, "# RSH Rust Rig Report — mode `{}`\n\n", report.mode);
     let wall_s = wall.as_secs_f64();
+    let seeds_s = report
+        .seeds
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
     let _ = write!(
         md,
-        "- Started (UTC): {started}\n- Host: {host}\n- Toolchain: {toolchain}\n- Seed: {seed}\n- Result: **{passed}/{total} PASS** in {wall_s:.1} s wall\n\n",
+        "- Started (UTC): {started}\n- Host: {host}\n- Toolchain: {toolchain}\n- Seed: {seed} (seeds run: {seeds_s})\n- Result: **{passed}/{total} PASS** in {wall_s:.1} s wall\n\n",
         started = report.started_utc,
         host = report.host,
         toolchain = report.rustc,
@@ -340,6 +376,28 @@ fn write_reports(out_dir: &Path, report: &RunReport, wall: Duration) {
     if !report.scenarios_failed.is_empty() {
         let names = report.scenarios_failed.join(", ");
         let _ = write!(md, "- FAILED: {names}\n\n");
+    }
+    // M-6: a stuck engine stop is LOUD — it fails its scenario, and
+    // the report calls it out here too, not just in the per-scenario
+    // lines. (The run already exits non-zero on any failed scenario.)
+    let stuck: Vec<&str> = report
+        .results
+        .iter()
+        .filter(|r| r.metrics.get("engineStopFailed") == Some(1.0))
+        .map(|r| r.id.as_str())
+        .collect();
+    if !stuck.is_empty() {
+        let names = stuck.join(", ");
+        md.push_str(
+            "## ⚠️ WARNING — engine did not stop in 5 s\n\n\
+             The engine leg failed to stop within the 5 s timeout in: ",
+        );
+        let _ = write!(md, "{names}. ");
+        md.push_str(
+            "Those scenarios FAILED (`engineStopFailed == 1`); a stop\n\
+             that hangs is a hang, not a slow teardown — investigate\n\
+             before release.\n\n",
+        );
     }
     md.push_str("## Honest limits\n\n");
     md.push_str(
@@ -352,20 +410,58 @@ fn write_reports(out_dir: &Path, report: &RunReport, wall: Duration) {
          to the transport over a channel and the real `StreamFrame::parse` runs on them.\n\
          The rig's job is to catch bugs, not to claim to be a real board.\n\
          `loss` is TRUE TRANSPORT LOSS (sequence gaps at arrival); frames that arrived\n\
-         but were superseded by the engine's latest-wins drain are reported separately\n\
-         as `coalesced` (never hidden). `jitterP99` is PC-RECEIVE inter-arrival jitter\n\
-         (wall-clock arrival spacing vs 5000 us — the plan SLO's basis); the engine's\n\
-         board-timestamp jitter is `engineJitterP99` (informational). Ping raw samples\n\
-         are in `results.json` (`e2e_samples_us`) with max / second-max / over-SLO count.\n\n",
+         but were never processed by the engine are reported separately\n\
+         as `coalesced` (never hidden) — a \"0% loss\" line is only honest next to its\n\
+         `coalesced` number, which every per-scenario line below carries. `jitterP99` is\n\
+         PC-RECEIVE inter-arrival jitter (wall-clock arrival spacing vs 5000 us — the plan\n\
+         SLO's basis); the engine's board-timestamp jitter is `engineJitterP99`\n\
+         (asserted ≤ 1000 us on soak / long-soak against the real target, not\n\
+         informational-only). Ping raw samples are in `results.json` (`e2e_samples_us`)\n\
+         with max / second-max / over-SLO count and a bootstrap 95% CI for the p99.\n\
+         The wheel emits at 196 Hz by default — a DOCUMENTED HARNESS LIMITATION (H-2):\n\
+         at exactly 200 Hz the OLD latest-wins drain coalesced ~3–14% of frames\n\
+         by phase drift; the Round 2 multi-frame drain processes every frame
+         (deep-scan gate: emit-200hz recorded 0% coalesced at 200 Hz). The soak
+         still emits at 196 Hz by design, and the true 200 Hz\n\
+         coalescing rate is measured by the `emit-200hz` scenario instead.\n\
+         Startup ≤ 1200 ms SLO: UNMEASURED in this rig (M-5 — a Tauri window launch\n\
+         cannot be measured in-process; see the Windows/human gates below).\n\n",
+    );
+    md.push_str("## Windows / human gates\n\n");
+    md.push_str(
+        "The following are NOT proven by this rig and need a Windows PC / human gate —\n\
+         they are listed here so a green rig run is never read as proof of them:\n\n\
+         - WINDOWS/CI GATE (H-7): UDP socket coverage — the 2 ignored `UdpTransport`\n\
+         send tests (`helo_received_by_board_at_one_hertz`,\n\
+         `control_send_and_reply_round_trip`, `crates/rsh-transport/src/udp.rs`) are\n\
+         ignored in this sandbox because it blocks `sendto` (EPERM); they must run\n\
+         on Windows CI before the socket path is called covered.\n\
+         - Real-Wi-Fi NTP re-measure (H-8): the rig's E2E ping p99 is a LOOPBACK p99\n\
+         (in-process channel); the 10 ms Wi-Fi SLO needs a re-measure over real\n\
+         Wi-Fi on Windows hardware.\n\
+         - Startup ≤ 1200 ms (M-5): launch-to-window time on the owner PC.\n\
+         - LED output (M-10): the engine's `OutputState` carries no LED field, so\n\
+         the rig cannot observe LED output at all — needs a firmware/app change to\n\
+         expose LED state plus a Windows observation.\n\
+         - FFB, per-game telemetry, profiles UI, serial transport, OTA, output\n\
+         backends (`vJoy`/`HIDMaestro`), game detection / foreground detector\n\
+         (incl. the `windows_foreground_detector_needs_windows_ci` test, which\n\
+         needs a real foreground game window on Windows CI) — all Windows/human\n\
+         gates (M-10, L-2).\n\
+         - Multi-seed gate (M-3): this run's seeds are listed at the top; the gate\n\
+         phase runs the full rig on seeds 42, 7 and 1337\n\
+         (`cargo run -p rsh-rig -- --mode full --seeds 42,7,1337`).\n\n",
     );
     md.push_str("## Per-scenario\n\n");
     for r in &report.results {
         let verdict = if r.passed { "PASS" } else { "FAIL" };
         let _ = write!(
             md,
-            "### {id} — {verdict} ({dur:.0} s)\n\n",
+            "### {id} — {desc} — {verdict} ({dur:.0} s, seed {seed})\n\n",
             id = r.id,
-            dur = r.duration_sec
+            desc = r.description,
+            dur = r.duration_sec,
+            seed = r.seed,
         );
         for a in &r.assertions {
             let _ = writeln!(md, "- {a}");
@@ -383,9 +479,17 @@ fn write_reports(out_dir: &Path, report: &RunReport, wall: Duration) {
         let coalesced = get("coalescedPercent");
         let engine_loss = get("engineLossPercent");
         let engine_jitter = get("engineTickJitterP99Us");
+        let blackout = get("blackoutExpectedFrames");
+        let silence_max = get("silenceMaxMs");
+        let restart_ms = get("engineRestartMs");
+        let queue_drop = get("queueDropped");
+        let alloc = get("allocBytesDelta");
+        let heap_slope = get("heapSlope60sMBPer10Min");
+        let ci_lo = get("e2eDelayP99CiLowUs");
+        let ci_hi = get("e2eDelayP99CiHighUs");
         let _ = write!(
             md,
-            "\nKey metrics: loss={loss}% (true transport loss at arrival) rate={rate}/s jitterP99={jitter}us (PC receive) outP99={out_p99}us valid={valid} dup={dup} watchdog={wd} ctrlAccepted={ctrl} coalesced={coalesced}% engineLoss={engine_loss}% engineJitterP99={engine_jitter}us\n\n",
+            "\nKey metrics: loss={loss}% (true transport loss at arrival) rate={rate}/s jitterP99={jitter}us (PC receive) outP99={out_p99}us valid={valid} dup={dup} watchdog={wd} ctrlAccepted={ctrl} coalesced={coalesced}% engineLoss={engine_loss}% engineJitterP99={engine_jitter}us blackout={blackout}f silenceMax={silence_max}ms restartMs={restart_ms}ms queueDrop={queue_drop} allocDelta={alloc}B heapSlope60s={heap_slope}MB/10min e2eP99CI=[{ci_lo},{ci_hi}]us\n\n",
         );
         if !m.events.is_empty() {
             md.push_str("Events:\n\n");
@@ -396,11 +500,24 @@ fn write_reports(out_dir: &Path, report: &RunReport, wall: Duration) {
         }
     }
     md.push_str("## Reproduce\n\n```sh\n");
+    let seeds_arg = if report.seeds.len() == 1 {
+        format!("--seed {}", report.seeds[0])
+    } else {
+        format!(
+            "--seeds {}",
+            report
+                .seeds
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
     let _ = write!(
         md,
-        "cargo run -p rsh-rig -- --mode {mode} --seed {seed}\n```\n",
+        "cargo run -p rsh-rig -- --mode {mode} {seeds_arg}\n```\n",
         mode = report.mode,
-        seed = report.seed,
+        seeds_arg = seeds_arg,
     );
     if let Err(e) = std::fs::write(out_dir.join("REPORT.md"), &md) {
         eprintln!("cannot write REPORT.md: {e}");

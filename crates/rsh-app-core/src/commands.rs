@@ -894,6 +894,48 @@ pub enum LedPattern {
     Rainbow,
 }
 
+impl LedPattern {
+    /// The protocol pattern id (`LedTestPattern.pattern_id`): 0 OFF,
+    /// 1 SOLID, 2 BLINK, 3 CHASE, 4 RAINBOW.
+    #[must_use]
+    pub const fn pattern_id(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Solid => 1,
+            Self::Blink => 2,
+            Self::Chase => 3,
+            Self::Rainbow => 4,
+        }
+    }
+
+    /// The lowercase name as stored in profiles (`"off"`, `"solid"`,
+    /// …) — the same spelling the serde form uses.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Solid => "solid",
+            Self::Blink => "blink",
+            Self::Chase => "chase",
+            Self::Rainbow => "rainbow",
+        }
+    }
+
+    /// Parses a stored pattern name (case-insensitive); [`None`] for
+    /// an unknown name — the caller keeps `None` instead of guessing.
+    #[must_use]
+    pub fn parse_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "solid" => Some(Self::Solid),
+            "blink" => Some(Self::Blink),
+            "chase" => Some(Self::Chase),
+            "rainbow" => Some(Self::Rainbow),
+            _ => None,
+        }
+    }
+}
+
 /// Per-module tuning (`TuningSettings` in `frontend/src/lib/tauri.ts`).
 ///
 /// Units are the frontend's units, not the C# profile's: `deadzone` is
@@ -1211,11 +1253,13 @@ pub fn set_output_state(enabled: bool, current: &OutputState) -> OutputState {
 /* Backups + firewall.                                                 */
 /* ------------------------------------------------------------------ */
 
-/// The 3-generation backup list for `profiles.json` in `data_dir`
-/// (`list_backups` command logic). Never fails on a corrupt
-/// `profiles.json`: a missing generation reports `present: false`.
-/// Re-exported from `rsh_profiles::store` — this wrapper exists so the
-/// command surface is one import (`rsh_app_core::commands::*`).
+/// The 3-generation backup list for `profiles.json` and
+/// `settings.json` in `data_dir` (M5: six rows — three generations ×
+/// two files) for the `list_backups` command. Never fails on a
+/// corrupt `profiles.json`: a missing generation reports
+/// `present: false`. Re-exported from `rsh_profiles::store` — this
+/// wrapper exists so the command surface is one import
+/// (`rsh_app_core::commands::*`).
 #[must_use]
 pub fn list_backups(data_dir: &Path) -> Vec<BackupInfo> {
     list_backups_in(data_dir)
@@ -1239,6 +1283,11 @@ pub struct FirewallState {
 /// *reads* rule presence, and creating/repairing the rule is a later
 /// spike item. A `netsh` failure is reported honestly in `detail`,
 /// never as a fake "rule present".
+///
+/// M8: presence is decided by the exit code + the rule name in the
+/// output — never by the English string `"No rules match"`, which a
+/// localized Windows never prints (a German install used to report a
+/// missing rule as present).
 #[cfg(windows)]
 #[must_use]
 pub fn get_firewall_state() -> FirewallState {
@@ -1249,30 +1298,44 @@ pub fn get_firewall_state() -> FirewallState {
     match output {
         Ok(output) => {
             let text = String::from_utf8_lossy(&output.stdout);
-            if text.contains("No rules match") {
-                FirewallState {
-                    rule_present: false,
-                    detail: "no firewall rule named \"RSH\"".to_string(),
-                }
-            } else if output.status.success() && !text.trim().is_empty() {
-                FirewallState {
-                    rule_present: true,
-                    detail: "firewall rule \"RSH\" exists".to_string(),
-                }
-            } else {
-                FirewallState {
-                    rule_present: false,
-                    detail: format!(
-                        "firewall rule check returned an unexpected result (exit {})",
-                        output.status
-                    ),
-                }
-            }
+            parse_netsh_rule_output(output.status.success(), &text)
         }
         Err(error) => FirewallState {
             rule_present: false,
             detail: format!("could not run the firewall rule check: {error}"),
         },
+    }
+}
+
+/// Parses `netsh advfirewall firewall show rule name=RSH` output
+/// (M8, pure — testable on any platform).
+///
+/// `netsh` exits 0 and prints the rule block (`Rule Name: RSH`) when
+/// the rule exists, and exits non-zero with a localized "no rules
+/// match" message when it does not. The decision uses only the exit
+/// code and the rule name — no locale-dependent string.
+#[must_use]
+pub fn parse_netsh_rule_output(success: bool, text: &str) -> FirewallState {
+    // The rule block prints the rule's name; the no-match message
+    // never contains it — and neither string depends on the Windows
+    // display language (even `Rule Name:` itself is localized).
+    let names_rule = text.contains("RSH");
+    if success && names_rule {
+        FirewallState {
+            rule_present: true,
+            detail: "firewall rule \"RSH\" exists".to_string(),
+        }
+    } else if !success {
+        FirewallState {
+            rule_present: false,
+            detail: "no firewall rule named \"RSH\"".to_string(),
+        }
+    } else {
+        FirewallState {
+            rule_present: false,
+            detail: "firewall rule check returned an unexpected result (exit 0, no rule block)"
+                .to_string(),
+        }
     }
 }
 
@@ -1747,15 +1810,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let backups = list_backups(&dir);
-        assert_eq!(backups.len(), 3);
+        // M5: 3 generations per file — profiles first, then settings.
+        assert_eq!(backups.len(), 6);
         assert!(backups.iter().all(|b| !b.present));
         assert_eq!(backups[0].generation, "current");
+        assert_eq!(backups[0].file, "profiles.json");
+        assert_eq!(backups[3].file, "settings.json");
         std::fs::write(dir.join("profiles.json"), "{}").expect("write profiles");
         let backups = list_backups(&dir);
         assert!(backups[0].present);
         assert!(backups[0].saved_at.is_some());
         assert!(!backups[1].present);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn firewall_parser_uses_exit_code_not_locale() {
+        // M8: a localized "no rules" message (German here) must not
+        // read as "rule present" — the old code matched the English
+        // string "No rules match".
+        let missing_de = parse_netsh_rule_output(
+            false,
+            "Es gibt keine Regeln, die den angegebenen Kriterien entsprechen.\n",
+        );
+        assert!(!missing_de.rule_present);
+        let present = parse_netsh_rule_output(
+            true,
+            "Rule Name:                            RSH\nEnabled:                              Yes\n",
+        );
+        assert!(present.rule_present);
+        let unexpected = parse_netsh_rule_output(true, "\n");
+        assert!(!unexpected.rule_present);
+        assert!(
+            unexpected.detail.contains("unexpected"),
+            "{}",
+            unexpected.detail
+        );
     }
 
     #[test]

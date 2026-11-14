@@ -13,6 +13,18 @@ frontend/dist/*
 # Firmware / embedded build outputs.
 .pio/
 
+# Build / staging outputs that must never be committed (deep-scan Round 2, M7).
+# src-tauri/binaries/ holds the staged HIDMaestro sidecar exe (fetched +
+# hash-verified at build time — never committed); release-staging/ holds the
+# release assets (installers, SBOMs, SHA256SUMS); bom.json / *.cdx.json are
+# cargo-cyclonedx outputs (per-crate files next to each member Cargo.toml).
+src-tauri/binaries/
+release-staging/
+bom.json
+crates/*/*.cdx.json
+tools/*/*.cdx.json
+src-tauri/*.cdx.json
+
 # Secrets — never commit.
 *.pem
 signing-keys/
@@ -21,3 +33,5 @@ signing-keys/
 # OS / editor leftovers.
 .DS_Store
 Thumbs.db
+__pycache__/
+*.pyc

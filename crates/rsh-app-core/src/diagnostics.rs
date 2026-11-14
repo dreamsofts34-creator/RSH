@@ -102,6 +102,47 @@ fn redact_line(line: &str) -> String {
     if lower.contains("private key") && !lower.contains('=') && !lower.contains(':') {
         return REDACTED.to_string();
     }
+    // L-3: `Authorization: Basic/Bearer <token>` — the generic
+    // key/separator check below misses this (`auth` in
+    // `authorization` fails the between-check, and `Bearer` has no
+    // separator). Any line naming the Authorization header redacts
+    // from the `:` on.
+    if lower.contains("authorization") {
+        if let Some(colon) = line.find(':') {
+            return format!("{} {REDACTED}", &line[..=colon]);
+        }
+        return REDACTED.to_string();
+    }
+    // L-3: a bare `Bearer <token>` / `Basic <base64>` anywhere (a
+    // header value pasted into a log without its header name). The
+    // token must look like a credential (≥ 12 chars, base64/JWT
+    // alphabet with a digit or separator) so benign words such as
+    // "basic settings" are not redacted.
+    for scheme in ["bearer", "basic"] {
+        let mut search_from = 0;
+        while let Some(at) = lower[search_from..]
+            .find(scheme)
+            .map(|offset| offset + search_from)
+        {
+            search_from = at + scheme.len();
+            let before_ok = at == 0 || !lower.as_bytes()[at - 1].is_ascii_alphanumeric();
+            let after = &line[at + scheme.len()..];
+            let Some(rest) = after.strip_prefix([' ', '\t']) else {
+                continue;
+            };
+            let token: &str = rest.split_whitespace().next().unwrap_or("");
+            let looks_like_credential = token.len() >= 12
+                && token
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || "+/=_.-".contains(ch))
+                && token
+                    .chars()
+                    .any(|ch| ch.is_ascii_digit() || "+/=_.-".contains(ch));
+            if before_ok && looks_like_credential {
+                return format!("{} {REDACTED}", &line[..at + scheme.len()]);
+            }
+        }
+    }
     for key in SECRET_KEYS {
         let mut search_from = 0;
         while let Some(key_at) = lower[search_from..]
@@ -328,6 +369,25 @@ mod tests {
         let text = "author: Jane Doe\nkey binding: F13\nconnected to board";
         let redacted = redact_secrets(text);
         assert_eq!(redacted, text);
+    }
+
+    #[test]
+    fn redact_authorization_header_and_bare_bearer() {
+        // L-3: the old redactor missed both of these.
+        let redacted = redact_secrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig");
+        assert!(!redacted.contains("eyJhbGci"), "{redacted}");
+        assert_eq!(redacted, "Authorization: [REDACTED]");
+        let redacted = redact_secrets("Authorization: Basic dXNlcjpwYXNzd29yZA==");
+        assert!(!redacted.contains("dXNlcjpw"), "{redacted}");
+        assert_eq!(redacted, "Authorization: [REDACTED]");
+        let redacted = redact_secrets("retrying with Bearer abcdefgh1234.token");
+        assert!(!redacted.contains("abcdefgh1234"), "{redacted}");
+        assert!(redacted.contains("Bearer [REDACTED]"), "{redacted}");
+        // Benign "basic" stays untouched.
+        assert_eq!(
+            redact_secrets("basic settings loaded"),
+            "basic settings loaded"
+        );
     }
 
     #[test]

@@ -10,8 +10,8 @@ import type { TuningSettings } from "@/lib/tauri";
  * brightness/pattern). The base five sliders render for every module;
  * the extension fields are carried through `defaultTuning` /
  * `sameTuning` / `normalizeTuning` untouched (validated, never
- * invented) so a save never drops them — the panel itself does not
- * render extension controls yet.
+ * invented) so a save never drops them — and the panel renders
+ * controls for them on the modules that own them (C-TUNE-1).
  *
  * Chosen values (documented, not backend-verified — the backend commands
  * are NOT_IMPLEMENTED in src-tauri today):

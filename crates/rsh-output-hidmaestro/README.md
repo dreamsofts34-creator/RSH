@@ -29,10 +29,9 @@ OutputState (rsh_engine) ──► mapping (this crate) ──► JSON-lines ─
 - **Frame mapping** (`mapping.rs`): routes through the vJoy-unit
   axis ints (`rsh_output::vjoy::steering_to_axis` /
   `pedal_to_axis`, banker's rounding) so both backends agree
-  exactly. Default submit path is `SubmitState` (buttons 1–25);
-  the 15-byte raw report (buttons 1–32) is opt-in via
-  `use_raw_report`. Which path ships is decided by the Windows
-  gate H-HID-2. Buttons 33–64 (`buttons_ex`) and encoder pulses
+  exactly. Default submit path is the 15-byte raw report (buttons
+  1–32) via `use_raw_report` (M3); `SubmitState` (buttons 1–25) is
+  available by opting out. Buttons 33–64 (`buttons_ex`) and encoder pulses
   65–72 have **no wire slot** on the 32-button custom profile on
   either path (same gap as the C# app).
 - **Protocol** (`protocol.rs`): commands `ping` / `version` /

@@ -20,7 +20,7 @@ file is the gate list the coordinator ticks before tagging.
 | Piece | Version | Source of truth |
 |---|---|---|
 | App | Rust **v1.0.0** | `Cargo.toml` `[workspace.package] version`, `src-tauri/tauri.conf.json` `version` — both `1.0.0`, checked by `release.yml` |
-| Firmware | C++ **v4.0.1** | `FIRMWARE-COMPAT.md`; merged bin `RSH-Firmware-DevKitV1-v4.0.1.bin`, 955,056 B |
+| Firmware | C++ **v4.0.1** | `FIRMWARE-COMPAT.md`; merged bin `RSH-Firmware-DevKitV1-v4.0.1.bin`, 955,984 B |
 | Protocol | **v2.1** (frozen) | Wire contract; Rust app talks to the same board — **no reflash needed** for wheels already on v4.0.1 |
 
 ## 2. What H4 already proved (evidence in RELEASE-CHECKLIST-H4.md)
@@ -40,10 +40,14 @@ file is the gate list the coordinator ticks before tagging.
       crate sources (NSIS/MSI targets, icons exist, upgrade code is a
       valid UUID, updater pubkey decodes to 42 bytes starting `Ed`) —
       H4 §2.
-- [x] **SBOMs + licenses:** `sbom/rust.cdx.json` (CycloneDX 1.6, **625
-      packages**), `sbom/frontend.cdx.json` (CycloneDX 1.5, **320
-      components**), `sbom/sidecar.cdx.json` (hand-written, pins
-      re-verified); `cargo deny check licenses` PASS; **no GPL/AGPL/LGPL
+- [x] **SBOMs + licenses:** `sbom/rust.cdx.json` (CycloneDX 1.6, **626
+      packages** — full `Cargo.lock` resolve; deep-scan Round 2 recount:
+      the lockfile has 626, the old SBOM listed 625 because `rsh-rig`
+      was missing), `sbom/frontend.cdx.json` (CycloneDX 1.5, **320
+      components** — 318 unique name@version; `magic-string@0.30.21`
+      appears 3× at different install paths, which is legitimate),
+      `sbom/sidecar.cdx.json` (hand-written, pins re-verified);
+      `cargo deny check licenses` PASS; **no GPL/AGPL/LGPL
       anywhere** — H4 §3 + `THIRD-PARTY-LICENSES.md`.
 - [x] **Updater keypair (NEW, separate from the firmware keypair):**
       minisign public key
@@ -78,7 +82,7 @@ What `release.yml` stages and publishes (H4 §7):
 | 3 | `RSH_1.0.0_x64_en-US.msi` | Tauri WiX bundle (secondary installer) |
 | 4 | `RSH_1.0.0_x64_en-US.msi.sig` | Updater signature for the MSI |
 | 5 | `latest.json` | Generated in `release.yml` from the real `.sig` + real release URLs |
-| 6 | `RSH-Firmware-DevKitV1-v4.0.1.bin` | `pio run` merged image, 955,056 B |
+| 6 | `RSH-Firmware-DevKitV1-v4.0.1.bin` | `pio run` merged image, 955,984 B |
 | 7 | `firmware-signed.bin` | `firmware.bin` + 68 B trailer, Ed25519-signed |
 | 8 | `SHA256SUMS` | SHA-256 of every asset above, re-verified in-workflow |
 | 9 | `sbom-rust.cdx.json` | `cargo cyclonedx` (release-time) |
@@ -95,7 +99,7 @@ rather than publishing the wrong file.
 |---|---|---|---|
 | G-1 | **pid.codes PR** for VID `0x1209` / PID `0x5253` | **OPEN — release gate** | Must merge before v1.0.0; human gate, not in the workflow (Phase G D-G3) |
 | G-2 | **vJoy DLL SHA-256** (`PINNED_DLL_SHA256_HEX`) | **OPEN — not measured** | Measure on the Windows release machine; never invented (Phase G G-G3). `release.yml` only records whether the runner happens to have vJoy (it will not) |
-| G-3 | **`firmware/` restore in the repo** | **CLOSED 2026-11-14** — restored from `reference/firmware-v4.0.1/` (flat copy, 44 files + `rsh/signing_pubkey.h`); all 4 `release.yml` fail-closed paths present; local `pio run` SUCCESS 32.96 s, merged bin 955,056 B, signed bin 889,588 B, Ed25519 verify OK |
+| G-3 | **`firmware/` restore in the repo** | **CLOSED 2026-11-14** — restored from `reference/firmware-v4.0.1/` (flat copy, 44 files + `rsh/signing_pubkey.h`); all 4 `release.yml` fail-closed paths present; local `pio run` SUCCESS 32.96 s, merged bin 955,984 B, signed bin 889,588 B, Ed25519 verify OK |
 | G-4 | **Secret `RSH_UPDATER_PRIVATE_KEY`** | **CLOSED 2026-11-14** — created via libsodium sealed-box from `signing-keys/updater-minisign.key` (whole `.key` file, 259 B); verified listed alongside `RSH_SIGNING_KEY_PEM` (value never printed/logged) |
 | G-5 | **Secret `RSH_SIGNING_KEY_PEM`** | Pre-existing (C# series) — **verify present** | Verify before the first release dry-run |
 | G-6 | **First `release.yml` dry-run** (`workflow_dispatch`, `dry_run: true`) | **OPEN — never run** | Must pass end-to-end before any tag is pushed. It is also the first proof of: `cargo cyclonedx` flags, `cargo tauri build` output filenames, sidecar staging path, `cargo tauri signer sign` E2E of the new updater keypair |

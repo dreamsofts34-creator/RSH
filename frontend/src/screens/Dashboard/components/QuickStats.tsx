@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { useTranslation } from "react-i18next";
 import type { EngineStats } from "@/lib/tauri";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -29,7 +30,7 @@ interface QuickStatsProps {
 }
 
 /** Quick stats — renders only numbers the backend reported. */
-export function QuickStats({ stats }: QuickStatsProps) {
+function QuickStatsInner({ stats }: QuickStatsProps) {
   const { t } = useTranslation();
   const notMeasured = t("dashboard.stats.notMeasured");
 
@@ -82,3 +83,7 @@ export function QuickStats({ stats }: QuickStatsProps) {
     </Card>
   );
 }
+
+/** Memoised: the Dashboard re-renders at 30 Hz from the snapshot feed
+ *  (H4) — this component only re-renders when its own props change. */
+export const QuickStats = memo(QuickStatsInner);

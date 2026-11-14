@@ -11,6 +11,14 @@ import { cn } from "@/lib/utils";
  * instead of fake data, and any other failure renders its message.
  */
 
+/** Props every wizard step accepts (H5): steps report whether their
+ *  success condition holds, so the wizard can gate "Next" on real
+ *  success instead of on merely visiting the step. */
+export interface StepProps {
+  /** Called whenever the step's success state changes. */
+  onSuccessChange?: (ok: boolean) => void;
+}
+
 /** Split a `TauriCommandError` into "not implemented" vs. a message. */
 export function describeError(error: unknown): {
   notImplemented: boolean;
@@ -43,11 +51,11 @@ export function Notice({
         tone === "error" &&
           "border-[var(--danger)]/40 bg-[var(--danger)]/10 text-[var(--ink)]",
         tone === "warn" &&
-          "border-amber-500/40 bg-amber-500/10 text-[var(--ink)]",
+          "border-[var(--warning)]/40 bg-[var(--warning)]/10 text-[var(--ink)]",
         tone === "info" &&
           "border-[var(--line)] bg-[var(--accent-soft)] text-[var(--ink)]",
         tone === "ok" &&
-          "border-emerald-500/40 bg-emerald-500/10 text-[var(--ink)]",
+          "border-[var(--success)]/40 bg-[var(--success)]/10 text-[var(--ink)]",
       )}
     >
       {children}

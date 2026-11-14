@@ -80,6 +80,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * Parse the untyped `get_settings` payload defensively: unknown or
  * missing fields fall back to the defaults instead of crashing the
  * screen or inventing a state the backend never reported.
+ *
+ * Theme accepts BOTH vocabularies: the frontend ids
+ * (`light`/`dark`/`high-contrast`/`system`) and the backend canonical
+ * vocabulary (`Light`/`Dark`/`HighContrast`/`System`, C-SET-1) — the
+ * backend record may arrive in either form depending on which side
+ * wrote it last.
  */
 export function parseSettings(raw: unknown): SettingsState {
   const next: SettingsState = {
@@ -96,15 +102,77 @@ export function parseSettings(raw: unknown): SettingsState {
     }
   }
   if (isThemeId(raw.theme)) next.theme = raw.theme;
+  else {
+    const fromBackend = themeFromBackend(raw.theme);
+    if (fromBackend !== null) next.theme = fromBackend;
+  }
   if (isSupportedLanguage(raw.language)) next.language = raw.language;
   return next;
 }
 
-/** Serialisable payload for `set_settings`. */
+/**
+ * Backend theme vocabulary (C-SET-1, canonical in `AppSettings`):
+ * `System` | `Dark` | `Light` | `HighContrast`.
+ */
+export const BACKEND_THEME_IDS = [
+  "System",
+  "Dark",
+  "Light",
+  "HighContrast",
+] as const;
+
+export type BackendThemeId = (typeof BACKEND_THEME_IDS)[number];
+
+const TO_BACKEND: Record<ThemeId, BackendThemeId> = {
+  light: "Light",
+  dark: "Dark",
+  "high-contrast": "HighContrast",
+  system: "System",
+};
+
+const FROM_BACKEND: Record<BackendThemeId, ThemeId> = {
+  Light: "light",
+  Dark: "dark",
+  HighContrast: "high-contrast",
+  System: "system",
+};
+
+/** Frontend theme id -> backend canonical vocabulary. */
+export function themeToBackend(theme: ThemeId): BackendThemeId {
+  return TO_BACKEND[theme];
+}
+
+/** Backend canonical vocabulary -> frontend theme id, or null when unknown. */
+export function themeFromBackend(value: unknown): ThemeId | null {
+  if (typeof value !== "string") return null;
+  return (FROM_BACKEND as Record<string, ThemeId>)[value] ?? null;
+}
+
+/**
+ * Serialisable payload for `set_settings` (C1/C-SET-1).
+ *
+ * The backend merges this record (PATCH semantics): the caller must
+ * pass the FULL record — see `fullSettingsPayload` — so fields this
+ * screen does not own (esp_ip, autostart, …) are never dropped by an
+ * older non-merge backend. The theme is sent in the backend canonical
+ * vocabulary and the `modules` map is always sent in full.
+ */
 export function settingsPayload(state: SettingsState): Record<string, unknown> {
   return {
     modules: { ...state.modules },
-    theme: state.theme,
+    theme: themeToBackend(state.theme),
     language: state.language,
   };
+}
+
+/**
+ * Full-record payload: the raw record last returned by `get_settings`
+ * with this screen's fields overlaid. Unknown backend fields ride
+ * along untouched, so a save can never wipe a setting it never saw.
+ */
+export function fullSettingsPayload(
+  raw: Record<string, unknown> | null,
+  state: SettingsState,
+): Record<string, unknown> {
+  return { ...(raw ?? {}), ...settingsPayload(state) };
 }

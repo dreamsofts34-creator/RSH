@@ -54,6 +54,8 @@ const SNAPSHOT = {
   },
   activeProfileId: null,
   seq: 1,
+  seqGap: 0,
+  txFail: 0,
 };
 
 const BACKENDS = [
@@ -172,6 +174,28 @@ describe("Output screen", () => {
       );
     });
     expect(await screen.findByText("Disabled")).toBeInTheDocument();
+  });
+
+  it("an absent enabled flag is Unknown, never inferred from connected (M5)", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_output_state") {
+        // No `enabled` key: the backend has not reported it.
+        return Promise.resolve({
+          backend: "vJoy",
+          connected: true,
+          detail: "vJoy device 1 ready",
+        });
+      }
+      if (cmd === "get_snapshot") return Promise.resolve(SNAPSHOT);
+      if (cmd === "list_output_backends") return Promise.resolve(BACKENDS);
+      return Promise.reject(new Error(`unknown command "${cmd}"`));
+    });
+    render(<OutputScreen />);
+    expect(await screen.findByText("Unknown")).toBeInTheDocument();
+    expect(screen.queryByText("Output enabled")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("switch", { name: "Enable output" }),
+    ).toBeDisabled();
   });
 
   it("shows live steering and pedal values from the snapshot", async () => {

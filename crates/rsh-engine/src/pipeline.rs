@@ -142,8 +142,12 @@ impl ModuleTuning {
         if validate_pedal_range(self.min_mv, self.max_mv).is_err() {
             out.min_mv = DEFAULT_MIN_MV;
             out.max_mv = DEFAULT_MAX_MV;
-        }
-        if !(out.min_mv < self.center_mv && self.center_mv < out.max_mv) {
+            // The range was replaced, so the old centre no longer
+            // belongs to it: reset to the new range's midpoint (the
+            // mapper's fallback uses the default centre 1800, which
+            // is exactly this midpoint).
+            out.center_mv = out.min_mv + (out.max_mv - out.min_mv) / 2;
+        } else if !(out.min_mv < self.center_mv && self.center_mv < out.max_mv) {
             out.center_mv = out.min_mv + (out.max_mv - out.min_mv) / 2;
         }
         out
@@ -179,6 +183,29 @@ pub struct PipelinePlan {
     /// True = accelerator and brake share one axis
     /// ([`OutputState::pedals_combined`]).
     pub combine_pedals: bool,
+}
+
+impl PipelinePlan {
+    /// A copy with every module tuning sanitized (L2: the single
+    /// source of truth — [`ProcessingPipeline::new`] and
+    /// [`ProcessingPipeline::set_plan`] both apply this, so the
+    /// pipeline never runs an unsanitized plan and `process` never
+    /// has to re-sanitize per frame).
+    #[must_use]
+    pub fn sanitized(&self) -> Self {
+        Self {
+            steering: self.steering.sanitized(),
+            accelerator: self.accelerator.sanitized(),
+            brake: self.brake.sanitized(),
+            clutch: self.clutch.sanitized(),
+            handbrake: self.handbrake.sanitized(),
+            shifter: self.shifter.sanitized(),
+            horn: self.horn.sanitized(),
+            buttons: self.buttons.sanitized(),
+            encoders: self.encoders.sanitized(),
+            combine_pedals: self.combine_pedals,
+        }
+    }
 }
 
 impl Default for PipelinePlan {
@@ -480,8 +507,11 @@ impl Default for ProcessingPipeline {
 impl ProcessingPipeline {
     /// Build a pipeline from a plan. Filters are built from each
     /// module's `smoothing` value; ramps and encoders start empty.
+    /// The plan is sanitized on entry (L2), so an insane tuning can
+    /// never reach the mappers.
     #[must_use]
     pub fn new(plan: PipelinePlan) -> Self {
+        let plan = plan.sanitized();
         Self {
             steering_filter: OneEuroFilter::from_smoothing(plan.steering.smoothing, INPUT_FREQ_HZ),
             accel_filter: OneEuroFilter::from_smoothing(plan.accelerator.smoothing, INPUT_FREQ_HZ),
@@ -504,6 +534,12 @@ impl ProcessingPipeline {
     #[must_use]
     pub const fn plan(&self) -> &PipelinePlan {
         &self.plan
+    }
+
+    /// Encoder glitch jumps dropped by the filter so far (M4).
+    #[must_use]
+    pub const fn encoder_glitch_dropped(&self) -> u64 {
+        self.encoders.glitch_dropped()
     }
 
     /// Replace the plan. All filter, ramp, and encoder state is reset:
@@ -540,6 +576,15 @@ impl ProcessingPipeline {
     /// analog value to skip.
     #[must_use]
     pub fn process(&mut self, frame: &StreamFrame) -> OutputState {
+        self.process_with_gap(frame, 0)
+    }
+
+    /// Process one stream frame with the sequence gap since the
+    /// previous frame (`skipped` stream frames were lost in between).
+    /// The gap scales the encoder glitch filter (M4) so legitimate
+    /// motion during the gap is not dropped as a glitch.
+    #[must_use]
+    pub fn process_with_gap(&mut self, frame: &StreamFrame, skipped: u16) -> OutputState {
         let mut out = OutputState::neutral();
 
         let steering_tuning = self.plan.steering;
@@ -581,12 +626,12 @@ impl ProcessingPipeline {
             out.pedals_combined = (out.accelerator - out.brake).clamp(-1.0, 1.0);
         }
 
-        self.process_buttons(frame, &mut out);
+        self.process_buttons(frame, skipped, &mut out);
         out
     }
 
     /// Buttons, gear decode, horn, and encoders.
-    fn process_buttons(&mut self, frame: &StreamFrame, out: &mut OutputState) {
+    fn process_buttons(&mut self, frame: &StreamFrame, skipped: u16, out: &mut OutputState) {
         let mut buttons = frame.buttons;
 
         // Shifter: H-pattern gear decode (bits 5–10) or sequential
@@ -627,9 +672,11 @@ impl ProcessingPipeline {
 
         // Encoders: the baseline keeps tracking even while disabled
         // (no output), so re-enabling cannot emit a stale jump.
-        let deltas = self
-            .encoders
-            .update_all(&frame.encoders, frame.n_enc.min(MAX_ENCODERS));
+        let deltas = self.encoders.update_all_with_gap(
+            &frame.encoders,
+            frame.n_enc.min(MAX_ENCODERS),
+            skipped,
+        );
         if self.plan.encoders.enabled {
             out.encoder_deltas = deltas;
             out.encoder_buttons = deltas_to_buttons(&deltas);
@@ -1153,6 +1200,32 @@ mod tests {
         assert!(approx(sane.scale, 1.0));
         assert_eq!((sane.min_mv, sane.max_mv), (300, 3300));
         assert_eq!(sane.center_mv, 1800);
+    }
+
+    #[test]
+    fn set_plan_sanitizes_insane_tuning() {
+        // L2: set_plan (and new) sanitize — one source of truth, so
+        // process() never sees an insane tuning.
+        let mut pipe = ProcessingPipeline::new(PipelinePlan::default());
+        let mut plan = PipelinePlan::default();
+        plan.steering.deadzone = 2.0; // clamps to 0.5
+        plan.steering.scale = f32::NAN; // NaN -> 1.0
+        plan.brake.min_mv = 3000;
+        plan.brake.max_mv = 300; // insane range -> default 300..3300
+        pipe.set_plan(plan);
+        assert_eq!(pipe.plan().steering.deadzone, 0.5);
+        assert_eq!(pipe.plan().steering.scale, 1.0);
+        assert_eq!(pipe.plan().brake.min_mv, 300);
+        assert_eq!(pipe.plan().brake.max_mv, 3300);
+        // And the stored plan is what process() uses: a full-right
+        // steering sample still maps to ~+1 with the sanitized plan.
+        let frame = StreamFrame::new(0, 0, StreamFlags::default(), &[(0, 3300)], &[], 0);
+        let out = pipe.process(&frame);
+        assert!(
+            out.steering > 0.9,
+            "sanitized plan still maps: {}",
+            out.steering
+        );
     }
 
     #[test]

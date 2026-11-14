@@ -20,11 +20,14 @@ export function formatStat(
 
 interface PacketStatsProps {
   stats: EngineStats | null;
-  seqGaps: number;
+  /** Board-reported sequence gaps (snapshot.seqGap); null = not reported yet. */
+  seqGap: number | null;
+  /** Board-reported TX failures (snapshot.txFail); null = not reported yet. */
+  txFail: number | null;
 }
 
 /** Packet stats from the live snapshot stats (backend-reported only). */
-export function PacketStats({ stats, seqGaps }: PacketStatsProps) {
+export function PacketStats({ stats, seqGap, txFail }: PacketStatsProps) {
   const { t } = useTranslation();
   const notMeasured = t("monitor.stats.notMeasured");
 
@@ -78,9 +81,19 @@ export function PacketStats({ stats, seqGaps }: PacketStatsProps) {
             </div>
             <div className="space-y-0.5">
               <dt className="text-xs text-[var(--muted)]">
-                {t("monitor.stats.seqGaps")}
+                {t("monitor.stats.seqGap")}
               </dt>
-              <dd className="font-mono text-sm font-semibold">{seqGaps}</dd>
+              <dd className="font-mono text-sm font-semibold">
+                {seqGap === null ? notMeasured : seqGap}
+              </dd>
+            </div>
+            <div className="space-y-0.5">
+              <dt className="text-xs text-[var(--muted)]">
+                {t("monitor.stats.txFail")}
+              </dt>
+              <dd className="font-mono text-sm font-semibold">
+                {txFail === null ? notMeasured : txFail}
+              </dd>
             </div>
           </dl>
         ) : (

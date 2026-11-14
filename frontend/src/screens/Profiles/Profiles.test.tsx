@@ -67,6 +67,20 @@ describe("Profiles screen", () => {
           });
         case "delete_profile":
           return Promise.resolve(undefined);
+        case "list_backups":
+          return Promise.resolve([
+            {
+              generation: "current",
+              present: true,
+              savedAt: "2026-11-14T10:00:00Z",
+            },
+            {
+              generation: "bak1",
+              present: true,
+              savedAt: "2026-11-13T10:00:00Z",
+            },
+            { generation: "bak2", present: false, savedAt: null },
+          ]);
         default:
           return Promise.reject(new Error(`unknown command "${cmd}"`));
       }
@@ -85,10 +99,15 @@ describe("Profiles screen", () => {
     expect(screen.getByText("Assetto Corsa")).toBeInTheDocument();
     expect(screen.getByText("No game bound")).toBeInTheDocument();
     expect(screen.getByText("Active")).toBeInTheDocument();
-    // Backup indicator: current is live; older generations not reported.
+    // Backup indicator: current is live; bak1 was saved (real date,
+    // never a raw ISO string) and bak2 has not been reported yet.
     expect(screen.getByText("Backup generations")).toBeInTheDocument();
     expect(screen.getByText("Live")).toBeInTheDocument();
-    expect(screen.getAllByText("Not reported yet")).toHaveLength(2);
+    expect(screen.getByText("Saved")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/2026-11-13T10:00:00Z/),
+    ).not.toBeInTheDocument();
+    expect(screen.getAllByText("Not reported yet")).toHaveLength(1);
   });
 
   it("create calls create_profile with the entered name", async () => {
@@ -178,6 +197,19 @@ describe("Profiles screen", () => {
     expect(
       await screen.findByText(/not available yet/i),
     ).toBeInTheDocument();
+  });
+
+  it("backup generations come from list_backups with real dates", async () => {
+    render(<ProfilesScreen />);
+    await screen.findByText("Backup generations");
+    expect(await screen.findByText("bak1")).toBeInTheDocument();
+    expect(screen.getByText("bak2")).toBeInTheDocument();
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    // savedAt is formatted for display, never shown as a raw ISO string.
+    expect(screen.queryByText("2026-11-14T10:00:00Z")).not.toBeInTheDocument();
+    expect(
+      mockInvoke.mock.calls.some((c) => c[0] === "list_backups"),
+    ).toBe(true);
   });
 
   it("strings have key parity across en/ur/hi", () => {

@@ -136,7 +136,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, Sender as StdSender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use rsh_engine::engine::{
@@ -151,9 +151,18 @@ use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
 use rsh_output_hidmaestro::HidMaestroOutput;
 use rsh_output_hidmaestro::backend::UAC_NOTE;
 use rsh_output_hidmaestro::manager::resolve_sidecar_path;
-use rsh_profiles::csharp_import::{PedalCalibration, PerModuleTuning, SteeringCalibration};
-use rsh_profiles::store::{BackupGeneration, BackupInfo, ProfileStore, game_slug};
+use rsh_profiles::csharp_import::{
+    PedalCalibration, PerModuleTuning, SteeringCalibration, canonical_module_id,
+};
+use rsh_profiles::resolver::{
+    CarProfileResolver, PROFILE_SWITCHED_EVENT, ProfileId, ProfileSource, ProfileSwitchEvent,
+};
+use rsh_profiles::store::{BackupInfo, ProfileStore, game_slug};
+use rsh_profiles::watcher::{
+    CarSource, ForegroundDetector, TelemetryWatcher, WindowsForegroundDetector,
+};
 use rsh_protocol::config::ConfigBlob;
+use rsh_protocol::control::LedTestPattern;
 use rsh_protocol::hello::PAIRING_WINDOW_SECS;
 use rsh_protocol::stream::MAX_ENCODERS;
 use rsh_protocol::stream::StatusPacket;
@@ -169,24 +178,27 @@ use rsh_transport::udp::{UdpConfig, UdpTransport};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::{
-    BackendStatus, OutputState as CommandOutputState, PinAssignment, PinMapValidation, ShifterGate,
-    TuningSettings, config_blob_to_json, config_json_to_blob,
+    BackendStatus, LedPattern, OutputState as CommandOutputState, PinAssignment, PinMapValidation,
+    ShifterGate, TuningSettings, config_blob_to_json, config_json_to_blob,
     get_snapshot as build_snapshot_command, merge_pin_map_into_blob, records_to_pin_assignments,
     validate_pin_map, validate_tuning,
 };
 use crate::launcher::{
-    GameLauncher, SystemSpawner, default_steam_roots, detect_all_games, detect_game, game_by_id,
+    GameLauncher, SystemSpawner, detect_all_games_with, detect_game_with, game_by_id,
+    iracing_paths_for, steam_roots_for,
 };
+use crate::secrets::ZeroizingString;
 use crate::snapshot::{
     ConnectionState, EncoderState, EngineSnapshot, EngineStats, LoopRateTracker, PedalSnapshot,
     SnapshotInput, build_engine_stats,
 };
 use crate::system::{NullSink, ShutdownOutcome};
+use crate::telemetry_adapter::TelemetryCarSource;
 use crate::webota::upload_firmware_image;
 
 /// App settings, re-exported for the Tauri shell (`src-tauri` does not
 /// depend on `rsh-profiles` directly).
-pub use rsh_profiles::csharp_import::AppSettings;
+pub use rsh_profiles::csharp_import::{AppSettings, AppSettingsPatch, is_allowed_board_ip};
 /// Profile list-row summaries, re-exported for the Tauri shell.
 pub use rsh_profiles::store::ProfileSummary;
 
@@ -196,6 +208,19 @@ pub use rsh_profiles::store::ProfileSummary;
 /// foreign code), so poisoning means "a backend panicked mid-send":
 /// the state survives that instead of turning one backend panic into
 /// a panic in every later command.
+///
+/// M-12 audit (deep-scan Round 2, 2026-11-14): every `Mutex` in this
+/// module is a `std::sync::Mutex`, and NO guard is ever held across
+/// an `.await`. All 17 async fns were checked: only 4 `lock()` sites
+/// sit inside an async fn (`engine_supervisor_run` × 2,
+/// `activate_session_on` × 2), and each is either a statement-local
+/// temporary (dropped at the `;`) or — the one `let`-bound guard in
+/// `activate_session_on` — scoped inside a block that ends before
+/// the following `.await`. Every other `lock()` site is in a sync
+/// fn, where no `.await` exists. No `tokio::sync::Mutex` migration
+/// was needed; re-run this audit if an async fn gains a `lock()`
+/// call (the `let`-bound-guard-then-`.await` shape is the one that
+/// would block the executor).
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -246,6 +271,15 @@ pub const SNAPSHOT_EVENT: &str = "rsh://snapshot";
 
 /// Event name for button-press highlight events (target < 50 ms).
 pub const BUTTON_PRESS_EVENT: &str = "rsh://button-press";
+
+/// Event name for game launch/stop state changes (C-EVT-1).
+pub const GAME_STATE_EVENT: &str = "rsh://game-state";
+
+/// Event name for config rollback completions (C-EVT-1).
+pub const CONFIG_ROLLBACK_EVENT: &str = "rsh://config-rollback";
+
+/// Event name for pairing-window open/close transitions (C-EVT-1).
+pub const PAIRING_WINDOW_EVENT: &str = "rsh://pairing-window";
 
 /// Snapshot emission interval: 30 Hz ≈ 33 ms between emissions.
 pub const SNAPSHOT_EMIT_INTERVAL: Duration = Duration::from_millis(SNAPSHOT_EMIT_INTERVAL_MS);
@@ -307,6 +341,9 @@ pub enum SnapshotEmit {
     Snapshot(Box<EngineSnapshot>),
     /// A button-press edge from the engine pipeline.
     ButtonPress(ButtonPressEvent),
+    /// A backend event queued by the core (C-EVT-1): the first field
+    /// is the `rsh://…` event name, the second its JSON payload.
+    AppEvent(String, serde_json::Value),
 }
 
 /// Inputs for one engine tick, as [`AppStateCore::ingest_frame`] consumes
@@ -456,6 +493,11 @@ pub struct SessionActivation {
 /// while the window is open — it is cleared when the window expires,
 /// when pairing completes, and on disconnect — and it never appears
 /// in a log line or an error message.
+///
+/// M-9: the password is single-use — the first `pairing_status()`
+/// read returns it and every later read returns `None` until a new
+/// `HELLO` discloses a fresh one, so a second poll (or a second
+/// client) cannot re-read the same password.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingStatus {
@@ -467,6 +509,19 @@ pub struct PairingStatus {
     /// The last session-activation failure, if any (cleared on the
     /// next successful activation).
     pub error: Option<String>,
+    /// True when the board's key-reset is armed (M-6): the `key_reset`
+    /// / `factory_reset` commands are meaningful now.
+    #[serde(default)]
+    pub key_reset_armed: bool,
+    /// Board MAC (`"AA:BB:CC:DD:EE:FF"`) of the board that sent the
+    /// last `HELLO`, when one was observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_mac: Option<String>,
+    /// True when the last activation failed with `StoredKeyExists`
+    /// (M-7): the board already has a stored key and re-pairing needs
+    /// the user's explicit confirmation (`confirm_pairing_replacement`).
+    #[serde(default)]
+    pub replacement_required: bool,
 }
 
 /// One `HELLO` reply as the activator last observed it (H5): enough
@@ -480,8 +535,13 @@ struct ObservedHello {
     unpaired: bool,
     /// The 60 s pairing window was open when observed.
     window_open: bool,
-    /// The one-time Wi-Fi password, when credentials were disclosed.
-    password: Option<String>,
+    /// The board's key-reset is armed (M-6).
+    key_reset_armed: bool,
+    /// Board MAC (`"AA:BB:CC:DD:EE:FF"`) that sent this `HELLO`.
+    board_mac: String,
+    /// The one-time Wi-Fi password, when credentials were disclosed
+    /// (L-2: zeroized on drop, never logged).
+    password: Option<ZeroizingString>,
     /// When the `HELLO` was observed (the window runs 60 s from here).
     observed_at: Instant,
 }
@@ -648,6 +708,105 @@ pub struct AppStateCore {
     /// within 30 s — the next `rollback_config` (or a fresh
     /// `stage_config`) re-syncs the record.
     config_txn: Mutex<ConfigTxnSnapshot>,
+    /// App-level events queued for the frontend (C-EVT-1):
+    /// `rsh://profile-switched`, `rsh://game-state`,
+    /// `rsh://config-rollback`, `rsh://pairing-window`. Drained by
+    /// the emitter thread (`drain_app_events`), which emits each
+    /// through the Tauri window.
+    pending_events: Mutex<Vec<(String, serde_json::Value)>>,
+    /// The installed auto-switch poller (C1): a
+    /// [`TelemetryWatcher`](rsh_profiles::watcher::TelemetryWatcher)
+    /// over a [`StoreProfileSource`] (the store as a
+    /// [`ProfileSource`]), installed by [`AppStateCore::start_auto_switch`].
+    /// [`None`] until auto-switch is enabled.
+    auto_switch: Mutex<Option<Box<dyn AutoSwitchPoller + Send>>>,
+    /// Whether the auto-switch thread is running (C1). Set by
+    /// `start_auto_switch`, cleared by `stop_auto_switch`; the
+    /// thread polls while this is true.
+    auto_switch_running: AtomicBool,
+    /// The active profile before the currently running game launched
+    /// (H4): `stop_game` restores it. [`None`] when no game is running.
+    pre_game_profile: Mutex<Option<String>>,
+    /// Whether the mid-session failover already fired (C-FAIL-1):
+    /// the backend auto-switches to the fallback at most once until
+    /// an explicit user re-select calls [`AppStateCore::reset_fallback`].
+    fallback_used: AtomicBool,
+    /// When the last failover attempt ran (C-FAIL-1 rate limit: at
+    /// most one attempt per 30 s, even after a reset).
+    fallback_last_attempt: Mutex<Option<Instant>>,
+    /// Whether the user confirmed a key replacement (M-7): consumed
+    /// once by the next activation attempt, which then pairs with
+    /// replacement instead of failing with `StoredKeyExists`.
+    pairing_replacement_allowed: Mutex<bool>,
+    /// Board MAC the last activation failed with `StoredKeyExists`
+    /// for (M-7): the board the confirm dialog must name.
+    replacement_required: Mutex<Option<String>>,
+    /// Whether the one-time pairing password was already read (M-9):
+    /// the first `pairing_status()` read returns the password and
+    /// sets this; later reads return `None` until a new `HELLO`
+    /// discloses a fresh one.
+    password_consumed: Mutex<bool>,
+    /// Board IP the live session authenticated against (M-1):
+    /// `upload_firmware`'s HTTP leg is bound to this IP, never to a
+    /// stale settings value.
+    session_board_ip: Mutex<Option<IpAddr>>,
+}
+
+/// One auto-switch poller (C1): the [`TelemetryWatcher`] behind a
+/// trait object, so the state can hold the real watcher (live car
+/// source + foreground detector) or a test watcher (fake source) in
+/// the same slot. `poll` runs one 2 Hz tick and returns the switch
+/// events that tick produced.
+pub trait AutoSwitchPoller {
+    /// Runs one poll tick at `now`; returns the switch events.
+    fn poll(&mut self, now: Instant) -> Vec<ProfileSwitchEvent>;
+}
+
+impl<C, F, A> AutoSwitchPoller for TelemetryWatcher<'static, C, F, A>
+where
+    C: CarSource,
+    F: ForegroundDetector,
+    A: FnMut(&ProfileId) -> Result<(), String>,
+{
+    fn poll(&mut self, now: Instant) -> Vec<ProfileSwitchEvent> {
+        TelemetryWatcher::poll(self, now)
+    }
+}
+
+/// The profile store as a [`ProfileSource`] (C1): the auto-switch
+/// watcher resolves profiles by reading the live store through a
+/// [`Weak`] to the state, so the watcher thread never keeps the state
+/// alive and never deadlocks the store (each call locks, reads, and
+/// releases). When the state is gone the source resolves nothing.
+pub struct StoreProfileSource {
+    state: Weak<AppStateCore>,
+}
+
+impl StoreProfileSource {
+    /// Runs `f` against the live store, or returns [`None`] when the
+    /// state is gone.
+    fn with_store<T>(&self, f: impl FnOnce(&ProfileStore) -> Option<T>) -> Option<T> {
+        let state = self.state.upgrade()?;
+        f(&lock(&state.store))
+    }
+}
+
+impl ProfileSource for StoreProfileSource {
+    fn profile_for_game(&self, game_id: &str) -> Option<ProfileId> {
+        self.with_store(|store| store.profile_for_game(game_id))
+    }
+
+    fn profile_for_car(&self, car_name: &str) -> Option<ProfileId> {
+        self.with_store(|store| store.profile_for_car(car_name))
+    }
+
+    fn profile_for_game_car(&self, game_id: &str, car_name: &str) -> Option<ProfileId> {
+        self.with_store(|store| store.profile_for_game_car(game_id, car_name))
+    }
+
+    fn default_profile(&self) -> Option<ProfileId> {
+        self.with_store(ProfileSource::default_profile)
+    }
 }
 
 impl AppStateCore {
@@ -703,6 +862,16 @@ impl AppStateCore {
             session_last_error: Mutex::new(None),
             session_last_hello: Mutex::new(None),
             config_txn: Mutex::new(ConfigTxnSnapshot::default()),
+            pending_events: Mutex::new(Vec::new()),
+            auto_switch: Mutex::new(None),
+            auto_switch_running: AtomicBool::new(false),
+            pre_game_profile: Mutex::new(None),
+            fallback_used: AtomicBool::new(false),
+            fallback_last_attempt: Mutex::new(None),
+            pairing_replacement_allowed: Mutex::new(false),
+            replacement_required: Mutex::new(None),
+            password_consumed: Mutex::new(false),
+            session_board_ip: Mutex::new(None),
         }
     }
 
@@ -868,10 +1037,13 @@ impl AppStateCore {
     /// Records a successful activation: the board id + the `GET_CAPS`
     /// reply that authenticated it. Clears the last activation error
     /// and the transient pairing password (the window is consumed —
-    /// the one-time password must not linger in memory).
+    /// the one-time password must not linger in memory). Also clears
+    /// the replacement requirement: the board now has a live session.
     fn record_session_activation(&self, activation: SessionActivation) {
         *lock(&self.session_activation) = Some(activation);
         *lock(&self.session_last_error) = None;
+        *lock(&self.replacement_required) = None;
+        *lock(&self.password_consumed) = true;
         if let Some(observed) = lock(&self.session_last_hello).as_mut() {
             observed.password = None;
         }
@@ -891,14 +1063,36 @@ impl AppStateCore {
     /// Records one `HELLO` as observed by the activator: the pairing
     /// window + the transient one-time Wi-Fi password (only when the
     /// `HELLO` actually discloses credentials — see
-    /// [`HelloReply::wifi_password_str`]).
+    /// [`HelloReply::wifi_password_str`]). A fresh `HELLO` re-arms
+    /// the single-use password (M-9): a new window discloses a new
+    /// password, readable once. A window-open transition queues the
+    /// `rsh://pairing-window` event (C-EVT-1).
     fn note_observed_hello(&self, hello: &HelloReply) {
+        let was_open = lock(&self.session_last_hello)
+            .as_ref()
+            .is_some_and(|observed| observed.window_open);
+        let board_mac = hello
+            .board_mac
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<String>>()
+            .join(":");
         *lock(&self.session_last_hello) = Some(ObservedHello {
             unpaired: hello.unpaired(),
             window_open: hello.pairing_window_open(),
-            password: hello.wifi_password_str().map(str::to_string),
+            key_reset_armed: hello.key_reset_armed(),
+            board_mac: board_mac.clone(),
+            password: hello.wifi_password_str().map(ZeroizingString::new),
             observed_at: Instant::now(),
         });
+        // A fresh HELLO discloses a fresh password: re-arm single-use.
+        *lock(&self.password_consumed) = false;
+        if hello.pairing_window_open() && !was_open {
+            self.queue_app_event(
+                PAIRING_WINDOW_EVENT,
+                serde_json::json!({ "open": true, "boardMac": board_mac }),
+            );
+        }
     }
 
     /// Clears the live session records: the activation (caps /
@@ -907,10 +1101,14 @@ impl AppStateCore {
     /// disconnect, transport loss, and engine stop — a later
     /// reconnect is a new session and must re-authenticate (SEC-E-14);
     /// stale records must never present a dead session as live.
+    /// Also clears the board-IP binding (M-1) and the replacement
+    /// requirement (M-7).
     fn clear_session_records(&self) {
         *lock(&self.session_activation) = None;
         *lock(&self.session_last_hello) = None;
         *lock(&self.session_last_error) = None;
+        *lock(&self.replacement_required) = None;
+        *lock(&self.session_board_ip) = None;
     }
 
     /// The pairing status for the `begin_pairing` /
@@ -920,16 +1118,46 @@ impl AppStateCore {
     /// the window has expired the transient password is dropped from
     /// the record here, so it never lingers in memory past the
     /// window.
+    ///
+    /// M-9 single-use: the first read returns the password and marks
+    /// it consumed; every later read returns `None` until a new
+    /// `HELLO` discloses a fresh one. Internal callers that must not
+    /// consume (e.g. `begin_pairing`'s wait loop) use
+    /// [`pairing_status_peek`](Self::pairing_status_peek).
     #[must_use]
     pub fn pairing_status(&self) -> PairingStatus {
+        let status = self.pairing_status_peek();
+        if status.password.is_some() {
+            // First read consumed the password; the next read (via
+            // the peek's consumed check) returns `None`.
+            *lock(&self.password_consumed) = true;
+        }
+        status
+    }
+
+    /// The pairing status without consuming the one-time password
+    /// (M-9): for internal polling (`begin_pairing`'s wait loop).
+    /// The password is still hidden once consumed by a real
+    /// `pairing_status()` read.
+    #[must_use]
+    pub fn pairing_status_peek(&self) -> PairingStatus {
         let mut hello = lock(&self.session_last_hello);
         let (seconds_left, password) = match hello.as_ref() {
             Some(observed) if observed.unpaired && observed.window_open => {
                 let elapsed = observed.observed_at.elapsed().as_secs();
                 if elapsed >= PAIRING_WINDOW_SECS {
                     (0, None)
+                } else if *lock(&self.password_consumed) {
+                    (PAIRING_WINDOW_SECS - elapsed, None)
                 } else {
-                    (PAIRING_WINDOW_SECS - elapsed, observed.password.clone())
+                    (
+                        PAIRING_WINDOW_SECS - elapsed,
+                        observed
+                            .password
+                            .as_ref()
+                            .map(ZeroizingString::as_str)
+                            .map(str::to_string),
+                    )
                 }
             }
             _ => (0, None),
@@ -939,11 +1167,18 @@ impl AppStateCore {
         {
             observed.password = None;
         }
+        let (key_reset_armed, board_mac) = match hello.as_ref() {
+            Some(observed) => (observed.key_reset_armed, Some(observed.board_mac.clone())),
+            None => (false, None),
+        };
         drop(hello);
         PairingStatus {
             seconds_left,
             password,
             error: self.session_last_error(),
+            key_reset_armed,
+            board_mac,
+            replacement_required: lock(&self.replacement_required).is_some(),
         }
     }
 
@@ -1013,7 +1248,7 @@ impl AppStateCore {
         self.activate_session()?;
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let status = self.pairing_status();
+            let status = self.pairing_status_peek();
             if self.session_gate_open()
                 || status.error.is_some()
                 || status.seconds_left > 0
@@ -1023,6 +1258,155 @@ impl AppStateCore {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Auto-switch (C1): watcher + store source + 2 Hz poll task        */
+    /* ------------------------------------------------------------------ */
+
+    /// Queues an app-level event for the frontend (C-EVT-1). The
+    /// emitter thread drains the queue (`drain_app_events`) and emits
+    /// each through the Tauri window. Queueing never fails: a full
+    /// queue drops the oldest event rather than blocking the engine.
+    pub fn queue_app_event(&self, name: &str, payload: serde_json::Value) {
+        let mut events = lock(&self.pending_events);
+        if events.len() >= 64 {
+            events.remove(0);
+        }
+        events.push((name.to_string(), payload));
+    }
+
+    /// Drains the queued app-level events (C-EVT-1), oldest first.
+    /// The emitter thread calls this and emits each entry.
+    #[must_use]
+    pub fn drain_app_events(&self) -> Vec<(String, serde_json::Value)> {
+        std::mem::take(&mut *lock(&self.pending_events))
+    }
+
+    /// Applies one auto-switch decision from the watcher: activates
+    /// the profile as an *automatic* switch (`manual = false`, so the
+    /// manual-override lock clears) and persists the store. This is
+    /// the watcher's apply closure — it never queues the event itself;
+    /// the watcher returns the [`ProfileSwitchEvent`] and
+    /// `poll_auto_switch_once` queues it.
+    fn apply_auto_switch(&self, profile_id: &ProfileId) -> Result<(), String> {
+        let mut store = lock(&self.store);
+        store
+            .activate(profile_id.as_str(), false)
+            .map_err(|error| error.to_string())?;
+        store.save().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Installs an auto-switch poller (test seam + the real wiring
+    /// below). Replaces any installed poller. Used by
+    /// `start_auto_switch` and by tests, which install a watcher over
+    /// a fake source.
+    pub fn install_auto_switch_poller(&self, poller: Box<dyn AutoSwitchPoller + Send>) {
+        *lock(&self.auto_switch) = Some(poller);
+    }
+
+    /// Polls the installed auto-switch watcher once and queues any
+    /// switch events for the frontend (C1 / C-EVT-1). A no-op when no
+    /// poller is installed. Returns the number of events queued.
+    pub fn poll_auto_switch_once(&self) -> usize {
+        let events = {
+            let mut slot = lock(&self.auto_switch);
+            let Some(poller) = slot.as_mut() else {
+                return 0;
+            };
+            poller.poll(Instant::now())
+        };
+        let count = events.len();
+        for event in events {
+            let payload = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
+            self.queue_app_event(PROFILE_SWITCHED_EVENT, payload);
+        }
+        count
+    }
+
+    /// Installs the real auto-switch watcher (C1) and spawns its 2 Hz
+    /// poll thread: a [`TelemetryWatcher`] over a
+    /// [`StoreProfileSource`] (the profile store as a
+    /// [`ProfileSource`]), fed by the live [`TelemetryCarSource`] and
+    /// the Windows foreground detector. The apply closure activates
+    /// through this state (`manual = false`). The thread holds only a
+    /// [`Weak`] to the state, so dropping the state ends the thread
+    /// (it also stops when `stop_auto_switch` clears the flag).
+    /// A no-op when a poller is already installed.
+    pub fn start_auto_switch(self: &Arc<Self>) {
+        if lock(&self.auto_switch).is_some() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let source: Box<dyn ProfileSource + Send> = Box::new(StoreProfileSource {
+            state: weak.clone(),
+        });
+        let resolver = CarProfileResolver::new_owned(source);
+        let current = lock(&self.store)
+            .active()
+            .map(|active| ProfileId::new(active.id.clone()));
+        let apply_weak = weak.clone();
+        let watcher = TelemetryWatcher::new(
+            resolver,
+            TelemetryCarSource::new(),
+            WindowsForegroundDetector,
+            move |profile_id: &ProfileId| {
+                let Some(state) = apply_weak.upgrade() else {
+                    return Err("app state dropped".to_string());
+                };
+                state.apply_auto_switch(profile_id)
+            },
+            current,
+        );
+        self.install_auto_switch_poller(Box::new(watcher));
+        self.auto_switch_running.store(true, Ordering::SeqCst);
+        let thread_weak = weak;
+        std::thread::Builder::new()
+            .name("rsh-auto-switch".to_string())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let Some(state) = thread_weak.upgrade() else {
+                        break;
+                    };
+                    if !state.auto_switch_running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    state.poll_auto_switch_once();
+                }
+            })
+            .ok();
+    }
+
+    /// Stops the auto-switch poll thread (C1). The installed poller
+    /// stays, so a later `start_auto_switch` resumes polling without
+    /// rebuilding the watcher.
+    pub fn stop_auto_switch(&self) {
+        self.auto_switch_running.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the auto-switch poll thread is running.
+    #[must_use]
+    pub fn auto_switch_running(&self) -> bool {
+        self.auto_switch_running.load(Ordering::SeqCst)
+    }
+
+    /// Enables auto-switch (H3): turns the setting on, clears the
+    /// manual-override lock, persists, and starts the watcher thread
+    /// when it is not running.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the store save fails.
+    pub fn enable_auto_switch(self: &Arc<Self>) -> Result<AppSettings, String> {
+        {
+            let mut store = lock(&self.store);
+            store.enable_auto_switch();
+            store.save().map_err(|error| error.to_string())?;
+        }
+        self.start_auto_switch();
+        Ok(self.settings())
     }
 
     /* ------------------------------------------------------------------ */
@@ -1048,6 +1432,10 @@ impl AppStateCore {
     fn build_udp_control_transport(&self) -> Result<UdpTransport, String> {
         let mut config = udp_config_for(self);
         config.local_port = 0;
+        // M-1: bind the board IP this control session talks to, so
+        // `upload_firmware`'s HTTP leg uses the authenticated board's
+        // IP instead of a stale settings value.
+        *lock(&self.session_board_ip) = Some(config.board_ip);
         UdpTransport::bind(config).map_err(|error| error.to_string())
     }
 
@@ -1129,6 +1517,144 @@ impl AppStateCore {
             self.clear_session_records();
         }
         result
+    }
+
+    /// Runs an LED test pattern on the board strip (C-LED-1): the
+    /// pattern + brightness from the LED tuning screen (or the
+    /// settings-apply path). Brightness defaults to the stored LED
+    /// tuning's brightness, else 100; the period defaults to 1000 ms
+    /// and must be 100–5000 ms. The brightness scales the RGB values
+    /// before the payload is encoded (see [`build_led_test_pattern`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the period is out of range, no board
+    /// answers, or the session fails to activate.
+    pub fn led_test(
+        self: &Arc<Self>,
+        pattern: LedPattern,
+        brightness: Option<u8>,
+        period_ms: Option<u16>,
+    ) -> Result<(), String> {
+        let brightness = brightness.unwrap_or_else(|| {
+            lock(&self.store)
+                .active()
+                .and_then(|active| {
+                    active
+                        .profile
+                        .module_tunings
+                        .get("led")
+                        .and_then(|tuning| tuning.led_brightness)
+                })
+                .unwrap_or(100)
+        });
+        let payload = build_led_test_pattern(pattern, brightness, period_ms)?;
+        match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_led_test(session, payload)),
+            )),
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_led_test(session, payload)),
+            )),
+        }
+    }
+
+    /// Rotates the board's device key (`key_reset`, M-6): only
+    /// meaningful while the board's key-reset is armed
+    /// (`PairingStatus.key_reset_armed`). On success the gate closes
+    /// and the session records clear — the new key arrives via a
+    /// fresh `HELLO`, so the user must re-pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when key-reset is not armed, no board
+    /// answers, or the session fails to activate.
+    pub fn key_reset(self: &Arc<Self>) -> Result<(), String> {
+        if !self.pairing_status_peek().key_reset_armed {
+            return Err(
+                "key reset is not armed on the board — the board must report key_reset_armed \
+                 in its HELLO first (pairing window)"
+                    .to_string(),
+            );
+        }
+        let result = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_key_reset(session)),
+            )),
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_key_reset(session)),
+            )),
+        };
+        if result.is_ok() {
+            self.close_session_gate();
+            self.clear_session_records();
+        }
+        result
+    }
+
+    /// Factory-resets the board (`factory_reset`, M-6): clears the
+    /// board's stored key, config, and Wi-Fi credentials. On success
+    /// the gate closes and the session records clear — the board is
+    /// unpaired afterwards and must be paired again.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no board answers or the session fails
+    /// to activate.
+    pub fn factory_reset(self: &Arc<Self>) -> Result<(), String> {
+        let result = match self.transport_request().0 {
+            TransportKind::Udp => block_on_control(run_control_session(
+                self,
+                self.build_udp_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_factory_reset(session)),
+            )),
+            TransportKind::Serial => block_on_control(run_control_session(
+                self,
+                self.build_serial_control_transport()?,
+                KeyStore::new(),
+                |session| Box::pin(op_factory_reset(session)),
+            )),
+        };
+        if result.is_ok() {
+            self.close_session_gate();
+            self.clear_session_records();
+        }
+        result
+    }
+
+    /// Confirms a key replacement (M-7): arms the one-time flag the
+    /// next activation attempt consumes to pair with replacement
+    /// instead of failing with `StoredKeyExists`, then triggers the
+    /// activation attempt. The dialog must name the board MAC from
+    /// `pairing_status().board_mac`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no replacement is currently required
+    /// or the activation attempt cannot start.
+    pub fn confirm_pairing_replacement(self: &Arc<Self>) -> Result<TransportState, String> {
+        if lock(&self.replacement_required).is_none() {
+            return Err(
+                "no key replacement is pending — activation did not report StoredKeyExists \
+                 for any board"
+                    .to_string(),
+            );
+        }
+        *lock(&self.pairing_replacement_allowed) = true;
+        self.activate_session()
     }
 
     /// Read the board's live config blob (`get_config`) as the JSON
@@ -1274,7 +1800,8 @@ impl AppStateCore {
     /// board reports the last-good config (read back via `GET_CFG`
     /// and compared against the pre-stage blob). Legal from `Staged`
     /// (explicit cancel) and `Committed` (confirm timeout / late
-    /// confirm / expired window).
+    /// confirm / expired window). On success the
+    /// `rsh://config-rollback` event is queued (C-EVT-1).
     ///
     /// # Errors
     ///
@@ -1298,6 +1825,12 @@ impl AppStateCore {
             ))?,
         };
         *lock(&self.config_txn) = new_snapshot;
+        if result.is_ok() {
+            self.queue_app_event(
+                CONFIG_ROLLBACK_EVENT,
+                serde_json::json!({ "state": "rolled_back" }),
+            );
+        }
         result
     }
 
@@ -1422,26 +1955,29 @@ impl AppStateCore {
     /// board answers, the image fails verification, no Wi-Fi
     /// password is stored, or the board rejects the upload.
     pub fn upload_firmware(self: &Arc<Self>, path: &Path) -> Result<(), String> {
+        // M-1: the HTTP upload leg needs the board's Wi-Fi interface.
+        // Over USB-serial the PC may not reach the board's WebOTA
+        // server at all, so the serial leg is refused outright — the
+        // user connects over Wi-Fi (board AP) and retries.
+        if self.transport_request().0 == TransportKind::Serial {
+            return Err(
+                "firmware upload over USB-serial is refused: the HTTP upload leg needs the \
+                 board's Wi-Fi interface — connect over Wi-Fi (board AP) and retry"
+                    .to_string(),
+            );
+        }
         let bytes = std::fs::read(path).map_err(|error| {
             format!(
                 "could not read the firmware image at {}: {error}",
                 path.display()
             )
         })?;
-        let info: LiveBoardInfo = match self.transport_request().0 {
-            TransportKind::Udp => block_on_control(run_control_session(
-                self,
-                self.build_udp_control_transport()?,
-                KeyStore::new(),
-                |session| Box::pin(std::future::ready(op_live_board_info(session))),
-            ))?,
-            TransportKind::Serial => block_on_control(run_control_session(
-                self,
-                self.build_serial_control_transport()?,
-                KeyStore::new(),
-                |session| Box::pin(std::future::ready(op_live_board_info(session))),
-            ))?,
-        };
+        let info: LiveBoardInfo = block_on_control(run_control_session(
+            self,
+            self.build_udp_control_transport()?,
+            KeyStore::new(),
+            |session| Box::pin(std::future::ready(op_live_board_info(session))),
+        ))?;
         verify_firmware_image(&bytes, info.firmware)
             .map_err(|error| format!("firmware image failed verification: {error}"))?;
         let password = match KeyStore::new().get_wifi_password(&info.board_id) {
@@ -1457,7 +1993,10 @@ impl AppStateCore {
                 return Err(format!("could not read the stored Wi-Fi password: {error}"));
             }
         };
-        let host = udp_config_for(self).board_ip;
+        // M-1: the HTTP host is the IP the live session authenticated
+        // against (recorded when the control transport was built), not
+        // a settings value that may have changed since.
+        let host = lock(&self.session_board_ip).unwrap_or_else(|| udp_config_for(self).board_ip);
         upload_firmware_image(host, &password, &bytes)?;
         self.close_session_gate();
         self.clear_session_records();
@@ -1649,6 +2188,9 @@ impl AppStateCore {
             for event in state.drain_button_presses() {
                 emit(SnapshotEmit::ButtonPress(event));
             }
+            for (name, payload) in state.drain_app_events() {
+                emit(SnapshotEmit::AppEvent(name, payload));
+            }
             next += SNAPSHOT_EMIT_INTERVAL;
             let now = Instant::now();
             if next > now {
@@ -1771,6 +2313,10 @@ impl AppStateCore {
         let requested = BackendKind::parse(name).ok_or_else(|| {
             format!("unknown output backend '{name}' (expected HIDMaestro, vJoy, or none)")
         })?;
+        // C-FAIL-1: an explicit user re-select re-arms the
+        // mid-session failover, so the next failure can fall over
+        // once more.
+        self.reset_fallback();
         // Persist the choice first: a save failure errors out before
         // anything switches, and a failed switch still leaves the
         // user's choice recorded for the next launch.
@@ -1793,6 +2339,35 @@ impl AppStateCore {
             .map(|_| self.output_state())
     }
 
+    /// Re-arms the mid-session failover (C-FAIL-1): after an explicit
+    /// user re-select the next backend failure may fall over to the
+    /// fallback once more. Called by `set_output_backend`; the
+    /// 30 s rate limit still applies to the next attempt.
+    ///
+    /// This clears only the app-core flag. The backend's own latch
+    /// (the `HIDMaestro` `SidecarManager::fallback_needed` latch — the
+    /// "H2 latch") lives behind the [`IJoystickOutput`] trait, which
+    /// exposes no reset hook, so this method cannot call the
+    /// backend's `reset_fallback` directly. The backend side of the
+    /// re-arm happens in [`Self::apply_backend_switch`]: a
+    /// disconnected same-kind re-select replaces the installed
+    /// instance with a fresh factory build, whose manager latch is
+    /// clear — the same state `HidMaestroBackend::reset_fallback`
+    /// produces. Without that step the selector's same-kind path
+    /// would reconnect the latched instance, fail fast with
+    /// `FallbackNeeded`, and the re-select could never succeed
+    /// (deep-scan Round 2, item 5).
+    pub fn reset_fallback(&self) {
+        self.fallback_used.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the mid-session failover already fired since the last
+    /// explicit re-select (C-FAIL-1).
+    #[must_use]
+    pub fn fallback_used(&self) -> bool {
+        self.fallback_used.load(Ordering::SeqCst)
+    }
+
     /// Applies a backend switch through the selector with the given
     /// factories, and updates the live name / detail / selected choice
     /// on success. Shared by [`AppStateCore::set_output_backend`]
@@ -1812,6 +2387,29 @@ impl AppStateCore {
         factories: &BackendFactories,
     ) -> Result<SwitchOutcome, String> {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
+        // H2 latch, deep-scan Round 2 item 5: the selector's
+        // same-kind path reconnects the INSTALLED instance, so a
+        // re-select of a disconnected backend whose manager latch is
+        // set (`fallback_needed`, after its retry budget is spent)
+        // would fail fast with `FallbackNeeded` forever — the
+        // same-kind re-select trap. The trait exposes no reset hook,
+        // so re-arm the backend by replacing a DISCONNECTED same-kind
+        // instance with a fresh factory build before the selector
+        // runs: a fresh `HidMaestroBackend` has a fresh
+        // `SidecarManager` (latch clear), which is exactly what the
+        // backend's own `reset_fallback` does. A connected instance
+        // is never replaced (its live sidecar session survives), and
+        // a missing factory falls through to the selector's old
+        // behaviour. `set_output_backend` calls `reset_fallback`
+        // first, so by the time this runs the app-core flag is clear
+        // too — both latches re-arm on one explicit re-select.
+        if requested != BackendKind::None
+            && BackendKind::from_backend_name(&self.backend_name()) == Some(requested)
+            && !lock(&self.backend).is_connected()
+            && let Some(fresh) = factories.build(requested)
+        {
+            *lock(&self.backend) = fresh;
+        }
         let outcome = {
             let mut backend = lock(&self.backend);
             switch_backend(&mut backend, requested, factories, None)
@@ -2372,10 +2970,22 @@ impl AppStateCore {
             let accum = lock(&self.engine_encoders);
             (accum.counts, accum.n_enc)
         };
-        // The default pipeline plan disables the clutch module, so a
-        // clutch reading of exactly 0 means "no clutch module" here;
-        // a moved clutch is reported with its value.
-        let clutch = if output.clutch > 0.0 {
+        // L8: clutch presence comes from the active profile's clutch
+        // module, not from the reading: a present-but-released clutch
+        // reads exactly 0.0 and must still report `Some(0.0)`. With
+        // no clutch tuning (the Default profile) the old rule stands
+        // — a moved clutch is reported, a still one is `None`.
+        let clutch_enabled = lock(&self.store)
+            .active()
+            .and_then(|active| {
+                active
+                    .profile
+                    .module_tunings
+                    .get("clutch")
+                    .map(|tuning| tuning.enabled)
+            })
+            .unwrap_or(false);
+        let clutch = if clutch_enabled || output.clutch > 0.0 {
             Some(f64::from(output.clutch))
         } else {
             None
@@ -2411,9 +3021,82 @@ impl AppStateCore {
         if !backend.is_connected() {
             return Ok(());
         }
-        backend
-            .update(output)
-            .map_err(|_| SinkError::new("output backend refused the state"))
+        if backend.update(output).is_err() {
+            drop(backend);
+            // C-FAIL-1: the live backend refused a mid-session update
+            // — try the fallback once (rate-limited), then retry the
+            // update there.
+            return self.try_mid_session_fallback(output);
+        }
+        Ok(())
+    }
+
+    /// Mid-session failover (C-FAIL-1): on a refused backend update,
+    /// switch the live slot to the fallback backend
+    /// (`HIDMaestro` → vJoy) and retry the update once there. Fires
+    /// at most once until an explicit user re-select calls
+    /// [`reset_fallback`](Self::reset_fallback), and at most once
+    /// per 30 s even after a reset. The switch is logged in the
+    /// engine detail; the persisted backend choice is untouched (the
+    /// next launch retries the selected backend). Returns the retry's
+    /// outcome, or the original refusal when no fallback exists, the
+    /// switch fails, or the rate limit bites.
+    fn try_mid_session_fallback(&self, output: &PipelineOutputState) -> Result<(), SinkError> {
+        let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
+        self.try_mid_session_fallback_with_factories(
+            output,
+            &real_backend_factories(vjoy_device_id),
+        )
+    }
+
+    /// [`try_mid_session_fallback`](Self::try_mid_session_fallback)
+    /// with injectable factories (the test seam: tests drive the
+    /// failover with mock backends; production uses the real ones).
+    fn try_mid_session_fallback_with_factories(
+        &self,
+        output: &PipelineOutputState,
+        factories: &BackendFactories,
+    ) -> Result<(), SinkError> {
+        const REFUSED: &str = "output backend refused the state";
+        if self.fallback_used.load(Ordering::SeqCst) {
+            return Err(SinkError::new(REFUSED));
+        }
+        let now = Instant::now();
+        if let Some(last) = *lock(&self.fallback_last_attempt)
+            && now.duration_since(last) < Duration::from_secs(30)
+        {
+            return Err(SinkError::new(REFUSED));
+        }
+        let live =
+            BackendKind::from_backend_name(&self.backend_name()).unwrap_or(BackendKind::None);
+        let Some(fallback) = live.fallback() else {
+            return Err(SinkError::new(REFUSED));
+        };
+        *lock(&self.fallback_last_attempt) = Some(now);
+        self.fallback_used.store(true, Ordering::SeqCst);
+        match self.apply_backend_switch(fallback, factories) {
+            Ok(outcome) => {
+                self.note_engine_detail(format!(
+                    "mid-session failover: {} refused an update, switched to {} \
+                     (C-FAIL-1: once until an explicit re-select)",
+                    live.display_name(),
+                    outcome.active.display_name()
+                ));
+                let mut backend = lock(&self.backend);
+                if !backend.is_connected() {
+                    return Err(SinkError::new(REFUSED));
+                }
+                backend.update(output).map_err(|_| SinkError::new(REFUSED))
+            }
+            Err(reason) => {
+                self.note_engine_detail(format!(
+                    "mid-session failover to {} failed: {reason} — staying on {}",
+                    fallback.display_name(),
+                    live.display_name()
+                ));
+                Err(SinkError::new(REFUSED))
+            }
+        }
     }
 }
 
@@ -2530,23 +3213,132 @@ impl AppStateCore {
 
     /// Replaces the app settings and persists them. When the settings
     /// flip the output flag, the change is actuated through the same
-    /// path as the Output toggle (disable → neutral send).
+    /// path as the Output toggle (disable → neutral send). The
+    /// settings are sanitized on the way in (M10), so a public
+    /// `esp_ip` or a non-canonical theme never persists; the returned
+    /// settings are the sanitized ones actually stored.
     ///
     /// # Errors
     ///
     /// Returns a message when saving fails.
-    pub fn set_settings(&self, settings: AppSettings) -> Result<AppSettings, String> {
+    pub fn set_settings(self: &Arc<Self>, settings: AppSettings) -> Result<AppSettings, String> {
         let apply_output = settings.output_enabled;
-        {
+        let sanitized = {
             let mut store = lock(&self.store);
-            store.set_settings(settings.clone());
+            store.set_settings(settings);
             store.save().map_err(|error| error.to_string())?;
-        }
+            store.settings().clone()
+        };
         let current = *lock(&self.output_enabled);
         if current != apply_output {
             let _ = self.set_output_enabled(apply_output);
         }
-        Ok(settings)
+        self.sync_auto_switch_from_settings(&sanitized);
+        Ok(sanitized)
+    }
+
+    /// Applies a partial settings update (C-SET-1): only the fields
+    /// present in `patch` overwrite the stored settings; absent
+    /// fields keep their values, so a partial save can never wipe a
+    /// setting the caller did not send. The result is sanitized
+    /// (M10) and persisted, and the output flag / auto-switch flag
+    /// are actuated the same way as a full replace. Returns the
+    /// merged, sanitized settings actually stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when saving fails.
+    pub fn set_settings_patch(
+        self: &Arc<Self>,
+        patch: AppSettingsPatch,
+    ) -> Result<AppSettings, String> {
+        let merged = {
+            let mut store = lock(&self.store);
+            let merged = store.set_settings_patch(patch);
+            store.save().map_err(|error| error.to_string())?;
+            merged
+        };
+        let current = *lock(&self.output_enabled);
+        if current != merged.output_enabled {
+            let _ = self.set_output_enabled(merged.output_enabled);
+        }
+        self.sync_auto_switch_from_settings(&merged);
+        Ok(merged)
+    }
+
+    /// Syncs the auto-switch watcher with the stored settings
+    /// (C-SET-1 / H3): when `auto_switch_profiles` is on, the
+    /// manual-override lock is cleared and the watcher thread starts
+    /// (when it is not running); when off, the thread stops. Called
+    /// after every settings write.
+    fn sync_auto_switch_from_settings(self: &Arc<Self>, settings: &AppSettings) {
+        if settings.auto_switch_profiles {
+            let cleared = {
+                let mut store = lock(&self.store);
+                if store.auto_switch_locked() {
+                    store.clear_auto_switch_lock();
+                    true
+                } else {
+                    false
+                }
+            };
+            if cleared {
+                // Persist the cleared lock, or the next launch
+                // re-locks auto-switch.
+                let _ = lock(&self.store).save();
+            }
+            self.start_auto_switch();
+        } else {
+            self.stop_auto_switch();
+        }
+    }
+
+    /// Imports C# profiles from a file (M6): validates each imported
+    /// profile and persists the store. Returns summaries of the
+    /// profiles that were actually added (diffed by id, so a
+    /// renamed duplicate reports its real stored name). See
+    /// [`ProfileStore::import_csharp_profiles`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the file cannot be read or no profile
+    /// validates.
+    pub fn import_csharp_profiles(&self, path: &str) -> Result<Vec<ProfileSummary>, String> {
+        let mut store = lock(&self.store);
+        let before: std::collections::HashSet<String> = store
+            .list()
+            .iter()
+            .map(|stored| stored.id.clone())
+            .collect();
+        store
+            .import_csharp_profiles(Path::new(path))
+            .map_err(|error| error.to_string())?;
+        store.save().map_err(|error| error.to_string())?;
+        Ok(store
+            .list()
+            .iter()
+            .filter(|stored| !before.contains(&stored.id))
+            .filter_map(|stored| Self::summary(&store, &stored.id).ok())
+            .collect())
+    }
+
+    /// Imports C# settings from a file as a MERGE (M6): only the
+    /// fields present in the file overwrite the stored settings.
+    /// Returns the merged, sanitized settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the file cannot be read or saving fails.
+    pub fn import_csharp_settings(&self, path: &str) -> Result<AppSettings, String> {
+        let merged = {
+            let mut store = lock(&self.store);
+            let merged = store
+                .import_csharp_settings(Path::new(path))
+                .map_err(|error| error.to_string())?;
+            store.save().map_err(|error| error.to_string())?;
+            merged
+        };
+        Ok(merged)
     }
 
     /// Forces a backup rotation now and returns the backup list.
@@ -2560,30 +3352,21 @@ impl AppStateCore {
             .map_err(|error| error.to_string())
     }
 
-    /// Restores one backup generation over the live profiles file.
-    /// `path` names the generation file (`profiles.json`,
-    /// `profiles.json.bak1`, `profiles.json.bak2`); restoring the live
-    /// file itself is a no-op. The in-memory state reloads from the
-    /// restored generation.
+    /// Restores one backup over the live store file (M9): `path` is
+    /// the real path of a backup file — a generation file
+    /// (`profiles.json`, `profiles.json.bak1`, `profiles.json.bak2`,
+    /// `settings.json`, `settings.json.bak1`, `settings.json.bak2`)
+    /// in the store directory, or a bare generation name resolved
+    /// against the store directory. Restoring the live file itself is
+    /// a no-op. The in-memory state reloads from the restored file.
     ///
     /// # Errors
     ///
-    /// Returns a message when the path names no known generation, the
-    /// generation file does not exist, or it cannot be read/parsed.
+    /// Returns a message when the path names no known file, the file
+    /// does not exist, or it cannot be read/parsed.
     pub fn restore_backup(&self, path: &str) -> Result<(), String> {
-        let generation = match Path::new(path).file_name().and_then(|name| name.to_str()) {
-            Some("profiles.json") => BackupGeneration::Current,
-            Some("profiles.json.bak1") => BackupGeneration::Bak1,
-            Some("profiles.json.bak2") => BackupGeneration::Bak2,
-            _ => {
-                return Err(format!(
-                    "cannot restore backup from '{path}': expected profiles.json, \
-                     profiles.json.bak1, or profiles.json.bak2"
-                ));
-            }
-        };
         lock(&self.store)
-            .restore_backup(generation)
+            .restore_backup_path(Path::new(path))
             .map_err(|error| error.to_string())
     }
 
@@ -2593,10 +3376,16 @@ impl AppStateCore {
 
     /// Every catalogue game with its install state, bound profile, and
     /// running state (the tracked game only — refresh first, so a game
-    /// that exited on its own stops showing as running).
+    /// that exited on its own stops showing as running). Detection
+    /// uses the configured Steam / iRacing paths (M2) plus the
+    /// Registry and the defaults.
     #[must_use]
     pub fn list_games(&self) -> Vec<GameInfo> {
-        let detected = detect_all_games(&default_steam_roots());
+        let settings = self.settings();
+        let detected = detect_all_games_with(
+            &steam_roots_for(Some(settings.steam_path.as_str())),
+            &iracing_paths_for(Some(settings.iracing_path.as_str())),
+        );
         let store = lock(&self.store);
         let mut launcher = lock(&self.launcher);
         let _ = launcher.refresh();
@@ -2634,7 +3423,9 @@ impl AppStateCore {
 
     /// Launches a game (exactly one at a time; the launcher tracks the
     /// pid). The running record is what `stop_game` kills — never any
-    /// other same-name process.
+    /// other same-name process. H4: the active profile before the
+    /// launch is captured, so `stop_game` can restore it when the
+    /// game closes (the watcher never restores).
     ///
     /// # Errors
     ///
@@ -2643,7 +3434,12 @@ impl AppStateCore {
     pub fn launch_game(&self, id: &str) -> Result<GameInfo, String> {
         use crate::launcher::LaunchError;
         let game = game_by_id(id).ok_or_else(|| format!("unknown game '{id}'"))?;
-        let detected = detect_game(game, &default_steam_roots());
+        let settings = self.settings();
+        let detected = detect_game_with(
+            game,
+            &steam_roots_for(Some(settings.steam_path.as_str())),
+            &iracing_paths_for(Some(settings.iracing_path.as_str())),
+        );
         {
             let mut launcher = lock(&self.launcher);
             launcher.launch(&detected).map_err(|error| match error {
@@ -2661,32 +3457,69 @@ impl AppStateCore {
                 }
             })?;
         }
+        // H4: capture the pre-game profile for the stop-time restore.
+        let pre_game = lock(&self.store).active().map(|active| active.id.clone());
+        *lock(&self.pre_game_profile) = pre_game;
+        self.queue_app_event(
+            GAME_STATE_EVENT,
+            serde_json::json!({ "gameId": id, "state": "launched" }),
+        );
         self.game_info(id)
     }
 
-    /// Stops the tracked running game (only the tracked pid).
+    /// Stops the tracked running game (only the tracked pid). H4:
+    /// after a successful stop the pre-game profile captured by
+    /// `launch_game` is restored (automatic activation, persisted).
+    /// The refresh + stop run under one launcher lock (M12), so the
+    /// record cannot change between the check and the kill.
     ///
     /// # Errors
     ///
     /// Returns a message when nothing is running, another game is
     /// running, or the tracked process could not be terminated.
     pub fn stop_game(&self, id: &str) -> Result<GameInfo, String> {
-        let running_id = {
+        {
             let mut launcher = lock(&self.launcher);
-            launcher.refresh().map(|running| running.game_id.clone())
-        };
-        match running_id.as_deref() {
-            None => return Err("no game is running".to_string()),
-            Some(running) if running != id => {
-                return Err(format!(
-                    "game '{id}' is not running (running game is '{running}')"
-                ));
+            let running_id = launcher.refresh().map(|running| running.game_id.clone());
+            match running_id.as_deref() {
+                None => return Err("no game is running".to_string()),
+                Some(running) if running != id => {
+                    return Err(format!(
+                        "game '{id}' is not running (running game is '{running}')"
+                    ));
+                }
+                Some(_) => {}
             }
-            Some(_) => {}
+            launcher.stop()?;
         }
-        let mut launcher = lock(&self.launcher);
-        launcher.stop()?;
-        drop(launcher);
+        // H4: restore the pre-game profile (best effort — a failed
+        // restore must not turn a successful stop into an error).
+        if let Some(pre_game) = lock(&self.pre_game_profile).take() {
+            let restored = {
+                let mut store = lock(&self.store);
+                store.activate(&pre_game, false).is_ok() && store.save().is_ok()
+            };
+            if restored {
+                self.queue_app_event(
+                    GAME_STATE_EVENT,
+                    serde_json::json!({
+                        "gameId": id,
+                        "state": "stopped",
+                        "restoredProfileId": pre_game,
+                    }),
+                );
+            } else {
+                self.queue_app_event(
+                    GAME_STATE_EVENT,
+                    serde_json::json!({ "gameId": id, "state": "stopped" }),
+                );
+            }
+        } else {
+            self.queue_app_event(
+                GAME_STATE_EVENT,
+                serde_json::json!({ "gameId": id, "state": "stopped" }),
+            );
+        }
         self.game_info(id)
     }
 
@@ -2708,22 +3541,28 @@ impl AppStateCore {
     /// to the frontend shape, else the neutral default (deadzone 0,
     /// linear curve, full 0–3300 mV span, no smoothing). Nothing here
     /// is invented data — the default is the documented neutral tuning.
+    /// The module id is canonicalized first (C-MOD-1: `"accel"` →
+    /// `"accelerator"`), so a caller using either spelling reads the
+    /// same tuning. The extended fields (C-TUNE-1: min/max mV, bite
+    /// point, horn button, LED brightness/pattern) are read back from
+    /// the stored tuning instead of hardcoded `None`/0–3300.
     #[must_use]
     pub fn get_tuning(&self, module: &str) -> TuningSettings {
-        if let Some(tuning) = lock(&self.tunings).get(module) {
+        let module = canonical_module_id(module);
+        if let Some(tuning) = lock(&self.tunings).get(&module) {
             return tuning.clone();
         }
         if let Some(active) = lock(&self.store).active()
-            && let Some(stored) = active.profile.module_tunings.get(module)
+            && let Some(stored) = active.profile.module_tunings.get(&module)
         {
             return TuningSettings {
-                module: module.to_string(),
+                module: module.clone(),
                 deadzone: stored.deadzone * 100.0,
                 curve: 1.0 + stored.curve_strength,
-                min_mv: 0.0,
-                max_mv: 3300.0,
+                min_mv: stored.min_mv.unwrap_or(0.0),
+                max_mv: stored.max_mv.unwrap_or(3300.0),
                 smoothing: stored.smoothing * 100.0,
-                bite_point: None,
+                bite_point: stored.bite_point,
                 shifter_gate: if module == "shifter" {
                     Some(if stored.gate_mode.eq_ignore_ascii_case("h-pattern") {
                         ShifterGate::HPattern
@@ -2733,13 +3572,16 @@ impl AppStateCore {
                 } else {
                     None
                 },
-                horn_button: None,
-                led_brightness: None,
-                led_pattern: None,
+                horn_button: stored.horn_button,
+                led_brightness: stored.led_brightness,
+                led_pattern: stored
+                    .led_pattern
+                    .as_deref()
+                    .and_then(LedPattern::parse_name),
             };
         }
         TuningSettings {
-            module: module.to_string(),
+            module,
             deadzone: 0.0,
             curve: 1.0,
             min_mv: 0.0,
@@ -2754,23 +3596,29 @@ impl AppStateCore {
     }
 
     /// Validates and stores one module's tuning for this session, and
-    /// writes its core fields through to the active profile's stored
-    /// tuning (deadzone %, curve exponent → strength, smoothing %),
-    /// so the tuning survives a restart. The curve mapping is
-    /// approximate (exponent 1.0 = linear strength 0.0); the LED /
-    /// horn / bite-point extensions have no home in the stored profile
-    /// shape and live in the session map only.
+    /// writes it through to the active profile's stored tuning, so
+    /// the tuning survives a restart (C-TUNE-1: deadzone, curve,
+    /// smoothing, gate mode, min/max mV, bite point, horn button, LED
+    /// brightness/pattern — all of them, not just the core three).
+    /// The curve mapping is approximate (exponent 1.0 = linear
+    /// strength 0.0). The module id is canonicalized (C-MOD-1). When
+    /// the module is `"led"` and a pattern is set, the LED test is
+    /// applied best-effort (C-LED-1): a board that is not connected
+    /// never fails the tuning save.
     ///
     /// # Errors
     ///
-    /// Returns a message when the tuning fails validation, there is no
-    /// active profile to write through to is NOT an error (the session
-    /// map still holds it), or the profile save fails.
-    pub fn set_tuning(&self, tuning: TuningSettings) -> Result<TuningSettings, String> {
-        let errors = validate_tuning(&tuning);
+    /// Returns a message when the tuning fails validation, or the
+    /// profile save fails.
+    pub fn set_tuning(self: &Arc<Self>, tuning: &TuningSettings) -> Result<TuningSettings, String> {
+        let errors = validate_tuning(tuning);
         if !errors.is_empty() {
             return Err(format!("invalid tuning: {}", errors.join("; ")));
         }
+        let tuning = TuningSettings {
+            module: canonical_module_id(&tuning.module),
+            ..tuning.clone()
+        };
         lock(&self.tunings).insert(tuning.module.clone(), tuning.clone());
         let mut store = lock(&self.store);
         if let Some(active) = store.active() {
@@ -2787,10 +3635,22 @@ impl AppStateCore {
                     scale: 1.0,
                     enabled: true,
                     gate_mode: "Sequential".to_string(),
+                    min_mv: None,
+                    max_mv: None,
+                    bite_point: None,
+                    horn_button: None,
+                    led_brightness: None,
+                    led_pattern: None,
                 });
             entry.deadzone = tuning.deadzone / 100.0;
             entry.curve_strength = (tuning.curve - 1.0).clamp(-1.0, 1.0);
             entry.smoothing = tuning.smoothing / 100.0;
+            entry.min_mv = Some(tuning.min_mv);
+            entry.max_mv = Some(tuning.max_mv);
+            entry.bite_point = tuning.bite_point;
+            entry.horn_button = tuning.horn_button;
+            entry.led_brightness = tuning.led_brightness;
+            entry.led_pattern = tuning.led_pattern.map(|pattern| pattern.name().to_string());
             if let Some(gate) = tuning.shifter_gate {
                 entry.gate_mode = match gate {
                     ShifterGate::Sequential => "Sequential".to_string(),
@@ -2801,6 +3661,15 @@ impl AppStateCore {
                 .update(&id, profile)
                 .map_err(|error| error.to_string())?;
             store.save().map_err(|error| error.to_string())?;
+        }
+        drop(store);
+        // C-LED-1: apply the LED pattern best-effort — a board that
+        // is not connected never fails the tuning save.
+        if tuning.module == "led"
+            && let Some(pattern) = tuning.led_pattern
+        {
+            let brightness = tuning.led_brightness.unwrap_or(100);
+            let _ = self.led_test(pattern, Some(brightness), None);
         }
         Ok(tuning)
     }
@@ -3350,6 +4219,7 @@ async fn open_session_for_hello<T, K>(
     transport: T,
     keystore: K,
     hello: &HelloReply,
+    allow_replacement: bool,
 ) -> (BoardSession<K, T>, Result<GetCapsReply, SessionError>)
 where
     T: SessionTransport,
@@ -3363,7 +4233,11 @@ where
         .join(":");
     let mut session = BoardSession::new(&board_id, keystore, transport);
     let outcome = if hello.unpaired() {
-        session.pair(hello).await
+        if allow_replacement {
+            session.pair_with_replacement(hello).await
+        } else {
+            session.pair(hello).await
+        }
     } else {
         session.resume(hello).await
     };
@@ -3424,7 +4298,20 @@ where
         }
         NewSessionHello::Found(hello) => {
             state.note_observed_hello(&hello);
-            let (mut session, outcome) = open_session_for_hello(transport, keystore, &hello).await;
+            // M-7: a user-confirmed replacement is consumed once by
+            // this activation attempt — later attempts go back to the
+            // safe `pair` path until the user confirms again.
+            // M-12: this guard is scoped inside the block and dropped
+            // before the `.await` below — no `std::sync::Mutex` guard
+            // is ever held across an await in this module.
+            let allow_replacement = {
+                let mut flag = lock(&state.pairing_replacement_allowed);
+                let allowed = *flag;
+                *flag = false;
+                allowed
+            };
+            let (mut session, outcome) =
+                open_session_for_hello(transport, keystore, &hello, allow_replacement).await;
             match outcome {
                 Ok(caps) => {
                     state.record_session_activation(SessionActivation {
@@ -3434,6 +4321,17 @@ where
                         caps,
                     });
                     state.open_session_gate();
+                }
+                Err(SessionError::StoredKeyExists) => {
+                    // M-7: the board already has a stored key — record
+                    // which board needs the user's explicit
+                    // confirmation instead of failing silently.
+                    *lock(&state.replacement_required) = Some(session.board_id().to_string());
+                    state.note_session_error(
+                        "session activation failed: a device key is already stored for this \
+                         board; re-pairing with a different key needs user confirmation \
+                         (confirm_pairing_replacement)",
+                    );
                 }
                 Err(error) => {
                     state.note_session_error(&format!("session activation failed: {error}"));
@@ -3505,7 +4403,10 @@ where
             Err(reason.to_string())
         }
         NewSessionHello::Found(hello) => {
-            let (mut session, outcome) = open_session_for_hello(transport, keystore, &hello).await;
+            // Control sessions never replace a stored key (M-7):
+            // replacement is an activation-time, user-confirmed act.
+            let (mut session, outcome) =
+                open_session_for_hello(transport, keystore, &hello, false).await;
             let result = match outcome {
                 Ok(_) => op(&mut session).await,
                 Err(error) => Err(format!("session activation failed: {error}")),
@@ -3597,6 +4498,92 @@ where
             )
         })?;
     Ok(())
+}
+
+/// Builds the `LED_TEST` payload for a pattern + brightness
+/// (C-LED-1): the brightness (0–100 %) scales the base RGB before
+/// encoding, so a 50 % brightness halves every channel. The base
+/// colour is white (255, 255, 255) for SOLID / BLINK / CHASE; the
+/// rainbow pattern ignores the colour bytes board-side, and OFF sends
+/// pattern id 0. The period is validated to 100–5000 ms (the
+/// protocol's range) and defaults to 1000 ms; `repeats` is 0 (run
+/// 5 s, then stop).
+///
+/// # Errors
+///
+/// Returns a message when the period is outside 100–5000 ms.
+///
+/// # Panics
+///
+/// Never in practice: the scaled channel is `(255 * brightness +
+/// 50) / 100` with brightness clamped to 0–100, so it is always in
+/// 0–255 and the `u8` conversion cannot fail.
+pub fn build_led_test_pattern(
+    pattern: LedPattern,
+    brightness: u8,
+    period_ms: Option<u16>,
+) -> Result<LedTestPattern, String> {
+    let period_ms = period_ms.unwrap_or(1000);
+    if !(100..=5000).contains(&period_ms) {
+        return Err(format!(
+            "LED test period {period_ms} ms is outside 100..=5000 ms"
+        ));
+    }
+    let brightness = brightness.min(100);
+    // Integer scaling (rounds to nearest): 255 * brightness / 100,
+    // exact — no float cast, so no truncation/sign-loss lint.
+    let channel = u8::try_from((255u32 * u32::from(brightness) + 50) / 100)
+        .expect("255 * brightness <= 25500, / 100 <= 255");
+    Ok(LedTestPattern {
+        pattern_id: pattern.pattern_id(),
+        r: channel,
+        g: channel,
+        b: channel,
+        period_ms,
+        repeats: 0,
+    })
+}
+
+/// `LED_TEST` under a fresh session (C-LED-1).
+async fn op_led_test<T, K>(
+    session: &mut BoardSession<K, T>,
+    pattern: LedTestPattern,
+) -> Result<(), String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let Some(client) = session.control_client_mut() else {
+        return Err("session has no control client — the session did not activate".to_string());
+    };
+    client
+        .led_test(&pattern)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// `KEY_RESET` under a fresh session (M-6).
+async fn op_key_reset<T, K>(session: &mut BoardSession<K, T>) -> Result<(), String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    session.key_reset().await.map_err(|error| error.to_string())
+}
+
+/// `FACTORY_RESET` under a fresh session (M-6).
+async fn op_factory_reset<T, K>(session: &mut BoardSession<K, T>) -> Result<(), String>
+where
+    T: SessionTransport,
+    K: KeyStoreLike,
+{
+    let Some(client) = session.control_client_mut() else {
+        return Err("session has no control client — the session did not activate".to_string());
+    };
+    client
+        .factory_reset()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// `REBOOT` under a fresh session (H5-control). The reply arrives
@@ -3803,9 +4790,10 @@ where
 /// `GET_CAPS` first, gate opens only on success), forwards stream
 /// frames into the engine's frame channel, pumps status packets into
 /// the engine's status channel (H1 condition 12), and rebuilds the
-/// transport every 2 s after a loss until aborted (disconnect /
-/// engine stop). The task never panics on transport errors — every
-/// failure is noted on the state and retried.
+/// transport with exponential backoff (M-11) after a loss until
+/// aborted or the circuit breaker trips (user reconnect required).
+/// The task never panics on transport errors — every failure is
+/// noted on the state and retried.
 /// Stream frames are held while the HMAC session gate is closed
 /// (SEC-E-14, H1 condition 13) — see [`forward_with_retry`].
 fn spawn_forwarder(
@@ -3841,28 +4829,42 @@ fn spawn_forwarder(
 /// only fires for a hand-edited store).
 fn udp_config_for(state: &AppStateCore) -> UdpConfig {
     let esp_ip = state.settings().esp_ip;
-    if let Ok(ip) = esp_ip.parse::<IpAddr>() {
-        UdpConfig::new(ip)
+    // M-1: only a private-range or loopback board IP is accepted; a
+    // public IP (or a non-literal) falls back to the board AP default
+    // and notes why, so a mistyped settings value can never point
+    // the transport at a public host.
+    if let Ok(ip) = esp_ip.parse::<std::net::Ipv4Addr>()
+        && is_allowed_board_ip(&ip)
+    {
+        UdpConfig::new(IpAddr::V4(ip))
     } else {
         state.note_engine_detail(format!(
-            "configured esp_ip '{esp_ip}' is not an IP literal — using default 192.168.4.1"
+            "configured esp_ip '{esp_ip}' is not a private/loopback IP literal — using default 192.168.4.1"
         ));
         UdpConfig::default()
     }
 }
 
 /// Forwards frames from a transport built by `factory` into the
-/// engine's frame channel, rebuilding the transport every 2 s after
-/// a build failure or a source loss. A full frame channel drops the
-/// newest frame (the engine keeps only the latest frame per tick
-/// anyway) instead of blocking the forwarder. Status packets are
-/// pumped into the engine's status channel after every stream frame
-/// (H1 condition 12) — but only while the session gate is open: the
-/// gate (SEC-E-14, H1 condition 13) holds ALL board data, stream
-/// frames and status packets alike, until a `BoardSession` has
-/// completed its HMAC-verified `GET_CAPS`. Held frames are counted
-/// (never silently dropped) and the gate closes again on transport
-/// loss, so a rebuilt transport must re-authenticate.
+/// engine's frame channel, rebuilding the transport after a build
+/// failure or a source loss with exponential backoff (M-11): the
+/// first rebuild waits 2 s ([`RECONNECT_INTERVAL`]), each
+/// consecutive failure doubles the wait up to a 30 s cap, and a
+/// transport that connects and authenticates resets the streak. After
+/// 10 consecutive failures the circuit breaker opens: retrying stops,
+/// the connection reports `Disconnected`, and the user must reconnect
+/// (a new forwarder starts on the next connect — a dead board must
+/// not spin the app forever on a fixed 2 s loop). A full frame
+/// channel drops the newest frame (the engine keeps only the latest
+/// frame per tick anyway) instead of blocking the forwarder. Status
+/// packets are pumped into the engine's status channel after every
+/// stream frame (H1 condition 12) — but only while the session gate
+/// is open: the gate (SEC-E-14, H1 condition 13) holds ALL board
+/// data, stream frames and status packets alike, until a
+/// `BoardSession` has completed its HMAC-verified `GET_CAPS`. Held
+/// frames are counted (never silently dropped) and the gate closes
+/// again on transport loss, so a rebuilt transport must
+/// re-authenticate.
 ///
 /// Before the frame loop, the session activator (H5) runs on the
 /// freshly built transport ([`activate_session_on`]): flag-1 HELO →
@@ -3870,21 +4872,190 @@ fn udp_config_for(state: &AppStateCore) -> UdpConfig {
 /// opens on success. A failed activation does not stop the loop —
 /// the transport is alive and frames are held + counted until a
 /// later activation (reconnect / `begin_pairing`) succeeds. The loop
-/// ends only when the task is aborted.
+/// ends only when the task is aborted or the circuit breaker trips.
 async fn forward_with_retry<T, F>(
     state: Arc<AppStateCore>,
     kind: TransportKind,
     frame_tx: tokio::sync::mpsc::Sender<StreamFrame>,
     status_tx: tokio::sync::mpsc::Sender<StatusPacket>,
-    mut factory: F,
+    factory: F,
 ) where
     T: SessionTransport,
     F: FnMut() -> Option<T> + Send,
 {
+    forward_with_retry_with_policy(
+        state,
+        kind,
+        frame_tx,
+        status_tx,
+        factory,
+        ForwarderRetryPolicy::default_policy(),
+    )
+    .await;
+}
+
+/// Base retry delay for the transport forwarder (M-11): the first
+/// rebuild waits the engine's [`RECONNECT_INTERVAL`] (2 s).
+const FORWARDER_BACKOFF_BASE: Duration = rsh_engine::engine::RECONNECT_INTERVAL;
+
+/// Cap on the forwarder retry delay (M-11): the wait never exceeds
+/// 30 s however long the failure streak runs.
+const FORWARDER_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Consecutive forwarder failures that open the circuit breaker
+/// (M-11): after this many failures in a row retrying stops and the
+/// user must reconnect. With the 2 s → 30 s backoff the breaker
+/// trips after ~3 min of retries (2 + 4 + 8 + 16 + 5 × 30 s) —
+/// long enough to ride out a board reboot and Wi-Fi reassociation,
+/// short enough that a dead board does not retry forever.
+const FORWARDER_MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
+/// Exponential-backoff + circuit-breaker policy for one
+/// [`forward_with_retry`] run (M-11). Pure data: the delay math is
+/// unit-tested without sleeping.
+#[derive(Clone, Copy, Debug)]
+struct ForwarderRetryPolicy {
+    /// Delay before the first retry.
+    base: Duration,
+    /// Delay cap.
+    max_delay: Duration,
+    /// Consecutive failures that trip the breaker.
+    max_consecutive_failures: u32,
+}
+
+impl ForwarderRetryPolicy {
+    /// The production policy: 2 s base, 30 s cap, breaker at 10.
+    const fn default_policy() -> Self {
+        Self {
+            base: FORWARDER_BACKOFF_BASE,
+            max_delay: FORWARDER_BACKOFF_MAX,
+            max_consecutive_failures: FORWARDER_MAX_CONSECUTIVE_FAILURES,
+        }
+    }
+
+    /// Delay before the next attempt after `consecutive_failures`
+    /// failures (1-based): the base doubled once per failure after
+    /// the first, capped at [`Self::max_delay`].
+    fn delay_after(self, consecutive_failures: u32) -> Duration {
+        let doublings = consecutive_failures.saturating_sub(1).min(30);
+        self.base
+            .saturating_mul(1u32 << doublings)
+            .min(self.max_delay)
+    }
+}
+
+/// Backoff state for one [`forward_with_retry`] run (M-11): counts
+/// the current consecutive-failure streak against a
+/// [`ForwarderRetryPolicy`].
+#[derive(Clone, Copy, Debug)]
+struct ForwarderBackoff {
+    policy: ForwarderRetryPolicy,
+    consecutive_failures: u32,
+}
+
+impl ForwarderBackoff {
+    /// A fresh streak under `policy`.
+    const fn new(policy: ForwarderRetryPolicy) -> Self {
+        Self {
+            policy,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// A transport that connected and authenticated breaks the
+    /// streak: the next failure starts again at the base delay.
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    /// Records one failure: the delay before the next attempt, or
+    /// [`None`] when the streak reached
+    /// [`FORWARDER_MAX_CONSECUTIVE_FAILURES`] and the circuit
+    /// breaker trips.
+    fn record_failure(&mut self) -> Option<Duration> {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= self.policy.max_consecutive_failures {
+            None
+        } else {
+            Some(self.policy.delay_after(self.consecutive_failures))
+        }
+    }
+
+    /// The current consecutive-failure streak (for status text).
+    const fn consecutive_failures(self) -> u32 {
+        self.consecutive_failures
+    }
+}
+
+/// Sleeps the M-11 backoff delay after one forwarder failure, or
+/// opens the circuit breaker when the streak is spent. Returns
+/// `true` when the caller should retry, `false` when retrying stops
+/// (breaker open — the caller returns, the connection stays
+/// `Disconnected`, and the user must reconnect).
+async fn forwarder_retry_after_failure(
+    state: &AppStateCore,
+    kind: TransportKind,
+    backoff: &mut ForwarderBackoff,
+    detail: String,
+) -> bool {
+    if let Some(delay) = backoff.record_failure() {
+        state.set_connection(ConnectionState::Disconnected);
+        state.set_engine_status(
+            EngineTaskStatus::Running { transport: None },
+            format!(
+                "{detail} — retrying in {delay:?} (consecutive failure {})",
+                backoff.consecutive_failures()
+            ),
+        );
+        tokio::time::sleep(delay).await;
+        true
+    } else {
+        state.set_connection(ConnectionState::Disconnected);
+        state.set_engine_status(
+            EngineTaskStatus::Running { transport: None },
+            format!(
+                "{detail} — circuit breaker open after {} consecutive failures; reconnect required (connect again from the UI)",
+                backoff.consecutive_failures()
+            ),
+        );
+        state.note_engine_detail(format!(
+            "transport {} circuit breaker open after {} consecutive failures — forwarder stopped, user reconnect required",
+            kind.as_str(),
+            backoff.consecutive_failures()
+        ));
+        false
+    }
+}
+
+/// [`forward_with_retry`] with an injectable [`ForwarderRetryPolicy`]
+/// (the test seam: tests trip the breaker with millisecond delays
+/// instead of waiting out the production ~3 min; production uses
+/// [`ForwarderRetryPolicy::default_policy`]).
+async fn forward_with_retry_with_policy<T, F>(
+    state: Arc<AppStateCore>,
+    kind: TransportKind,
+    frame_tx: tokio::sync::mpsc::Sender<StreamFrame>,
+    status_tx: tokio::sync::mpsc::Sender<StatusPacket>,
+    mut factory: F,
+    policy: ForwarderRetryPolicy,
+) where
+    T: SessionTransport,
+    F: FnMut() -> Option<T> + Send,
+{
+    let mut backoff = ForwarderBackoff::new(policy);
     loop {
         let Some(transport) = factory() else {
             state.note_engine_transport_error(kind, "transport could not be opened");
-            tokio::time::sleep(rsh_engine::engine::RECONNECT_INTERVAL).await;
+            if !forwarder_retry_after_failure(
+                &state,
+                kind,
+                &mut backoff,
+                format!("transport {} could not be opened", kind.as_str()),
+            )
+            .await
+            {
+                return;
+            }
             continue;
         };
         state.set_connection(ConnectionState::Connected);
@@ -3906,17 +5077,21 @@ async fn forward_with_retry<T, F>(
         else {
             state.close_session_gate();
             state.clear_session_records();
-            state.set_connection(ConnectionState::Disconnected);
-            state.set_engine_status(
-                EngineTaskStatus::Running { transport: None },
-                format!(
-                    "transport {} lost during session activation — retrying in 2 s (engine keeps ticking, watchdog neutral)",
-                    kind.as_str()
-                ),
-            );
-            tokio::time::sleep(rsh_engine::engine::RECONNECT_INTERVAL).await;
+            if !forwarder_retry_after_failure(
+                &state,
+                kind,
+                &mut backoff,
+                format!("transport {} lost during session activation", kind.as_str()),
+            )
+            .await
+            {
+                return;
+            }
             continue;
         };
+        // A connected + authenticated transport breaks the failure
+        // streak (M-11): the next loss starts again at the 2 s base.
+        backoff.record_success();
         // Event-driven drain: awaiting the source blocks until a frame
         // arrives; `None` means the source dropped.
         while let Some(frame) = transport.next_frame().await {
@@ -3948,15 +5123,16 @@ async fn forward_with_retry<T, F>(
         // re-authenticate (SEC-E-14).
         state.close_session_gate();
         state.clear_session_records();
-        state.set_connection(ConnectionState::Disconnected);
-        state.set_engine_status(
-            EngineTaskStatus::Running { transport: None },
-            format!(
-                "transport {} lost — retrying in 2 s (engine keeps ticking, watchdog neutral)",
-                kind.as_str()
-            ),
-        );
-        tokio::time::sleep(rsh_engine::engine::RECONNECT_INTERVAL).await;
+        if !forwarder_retry_after_failure(
+            &state,
+            kind,
+            &mut backoff,
+            format!("transport {} lost", kind.as_str()),
+        )
+        .await
+        {
+            return;
+        }
     }
 }
 
@@ -4004,6 +5180,9 @@ mod tests {
         connected: Arc<Mutex<bool>>,
         fail: Arc<Mutex<bool>>,
         fail_connect: Arc<Mutex<bool>>,
+        /// Reported by `name()`; the failover test needs a backend
+        /// that reports `"HIDMaestro"` / `"vJoy"`.
+        name: &'static str,
     }
 
     impl RecordingBackend {
@@ -4011,6 +5190,15 @@ mod tests {
         /// recorded states and its fail flag.
         #[allow(clippy::type_complexity)]
         fn new() -> (Self, Arc<Mutex<Vec<PipelineOutputState>>>, Arc<Mutex<bool>>) {
+            Self::new_named("RecordingBackend")
+        }
+
+        /// Test-only constructor with a reported backend name
+        /// (C-FAIL-1: the failover keys off the live backend's name).
+        #[allow(clippy::type_complexity)]
+        fn new_named(
+            name: &'static str,
+        ) -> (Self, Arc<Mutex<Vec<PipelineOutputState>>>, Arc<Mutex<bool>>) {
             let sent = Arc::new(Mutex::new(Vec::new()));
             let connected = Arc::new(Mutex::new(false));
             let fail = Arc::new(Mutex::new(false));
@@ -4020,6 +5208,7 @@ mod tests {
                     connected: Arc::clone(&connected),
                     fail: Arc::clone(&fail),
                     fail_connect: Arc::new(Mutex::new(false)),
+                    name,
                 },
                 sent,
                 fail,
@@ -4037,7 +5226,7 @@ mod tests {
 
     impl IJoystickOutput for RecordingBackend {
         fn name(&self) -> &'static str {
-            "RecordingBackend"
+            self.name
         }
 
         fn is_connected(&self) -> bool {
@@ -4596,7 +5785,8 @@ mod tests {
         let (state, dir) = test_state();
         let created = state.create_profile("Backup Me").expect("create");
         let backups = state.backup_now().expect("backup now");
-        assert_eq!(backups.len(), 3);
+        // M5: 3 generations per file — profiles first, then settings.
+        assert_eq!(backups.len(), 6);
         // `backup_now` rotates the live file into .bak1 and leaves no
         // live file behind until the next save.
         assert!(!backups[0].present);
@@ -4645,7 +5835,7 @@ mod tests {
         let mut bad = neutral.clone();
         bad.module = "brake".to_string();
         bad.deadzone = 99.0;
-        assert!(state.set_tuning(bad).is_err());
+        assert!(state.set_tuning(&bad).is_err());
         assert_eq!(state.get_tuning("brake").deadzone, 0.0);
         // Valid tuning stores, survives a get, and writes through to
         // the active profile's stored tuning.
@@ -4655,10 +5845,343 @@ mod tests {
         tuning.deadzone = 5.0;
         tuning.curve = 1.2;
         tuning.bite_point = Some(0.35);
-        let saved = state.set_tuning(tuning).expect("valid tuning");
+        let saved = state.set_tuning(&tuning).expect("valid tuning");
         assert_eq!(saved.bite_point, Some(0.35));
         assert_eq!(state.get_tuning("brake").deadzone, 5.0);
         assert_eq!(state.get_tuning("brake").bite_point, Some(0.35));
+    }
+
+    // -- Deep-scan Phase 2 regressions -----------------------------------
+
+    /// C2 / C-SET-1: a partial settings patch never wipes the fields
+    /// it does not mention.
+    #[test]
+    fn settings_patch_merges_without_wiping() {
+        let (state, _dir) = test_state();
+        let mut settings = state.settings();
+        settings.esp_ip = "10.0.0.5".to_string();
+        settings.theme = "Dark".to_string();
+        state.set_settings(settings).expect("set settings");
+        let patch = AppSettingsPatch {
+            theme: Some("light".to_string()),
+            ..AppSettingsPatch::default()
+        };
+        let merged = state.set_settings_patch(patch).expect("patch applies");
+        assert_eq!(merged.theme, "Light", "lowercase theme maps to canonical");
+        assert_eq!(merged.esp_ip, "10.0.0.5", "absent esp_ip is kept");
+        assert_eq!(merged.output_backend, "HIDMaestro");
+    }
+
+    /// M-1: a public `esp_ip` is sanitized to the board AP default on
+    /// save, while a loopback address (the tests' UDP forwarder) is kept.
+    #[test]
+    fn settings_sanitize_rejects_public_esp_ip_keeps_loopback() {
+        let (state, _dir) = test_state();
+        let mut settings = state.settings();
+        settings.esp_ip = "8.8.8.8".to_string();
+        let saved = state.set_settings(settings).expect("set settings");
+        assert_eq!(saved.esp_ip, "192.168.4.1");
+        let mut settings = state.settings();
+        settings.esp_ip = "127.0.0.1".to_string();
+        let saved = state.set_settings(settings).expect("set settings");
+        assert_eq!(saved.esp_ip, "127.0.0.1");
+    }
+
+    /// M-9: the one-time pairing password is readable exactly once —
+    /// the first `pairing_status()` returns it, the second returns
+    /// `None`, and a fresh `HELLO` re-arms it.
+    #[test]
+    fn pairing_password_is_single_use() {
+        let (state, _dir) = test_state();
+        let hello = act_pairing_hello([7u8; 32], [9u8; 16]);
+        state.note_observed_hello(&hello);
+        let first = state.pairing_status();
+        assert!(first.seconds_left > 0);
+        assert!(first.password.is_some(), "first read shows the password");
+        assert!(
+            !first.key_reset_armed,
+            "pairing HELLO does not arm key-reset"
+        );
+        assert_eq!(first.board_mac.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
+        let second = state.pairing_status();
+        assert_eq!(second.password, None, "second read hides the password");
+        assert!(second.seconds_left > 0, "the window itself is still open");
+        // A fresh HELLO discloses a fresh password: readable once more.
+        state.note_observed_hello(&hello);
+        assert!(state.pairing_status().password.is_some());
+        assert_eq!(state.pairing_status().password, None);
+        // The internal peek never consumes.
+        state.note_observed_hello(&hello);
+        assert!(state.pairing_status_peek().password.is_some());
+        assert!(state.pairing_status_peek().password.is_some());
+        assert!(state.pairing_status().password.is_some());
+    }
+
+    /// C-LED-1: the LED payload scales RGB by brightness and the
+    /// period is validated to 100–5000 ms.
+    #[test]
+    fn led_test_pattern_scales_brightness_and_validates_period() {
+        let full = build_led_test_pattern(LedPattern::Solid, 100, None).expect("100%");
+        assert_eq!((full.r, full.g, full.b), (255, 255, 255));
+        assert_eq!(full.pattern_id, 1);
+        assert_eq!(full.period_ms, 1000);
+        assert_eq!(full.repeats, 0);
+        let half = build_led_test_pattern(LedPattern::Blink, 50, Some(500)).expect("50%");
+        assert_eq!((half.r, half.g, half.b), (128, 128, 128));
+        assert_eq!(half.pattern_id, 2);
+        let off = build_led_test_pattern(LedPattern::Off, 0, Some(100)).expect("off");
+        assert_eq!((off.r, off.g, off.b), (0, 0, 0));
+        assert_eq!(off.pattern_id, 0);
+        let rainbow = build_led_test_pattern(LedPattern::Rainbow, 80, Some(5000)).expect("max");
+        assert_eq!(rainbow.pattern_id, 4);
+        assert!(build_led_test_pattern(LedPattern::Solid, 100, Some(99)).is_err());
+        assert!(build_led_test_pattern(LedPattern::Solid, 100, Some(5001)).is_err());
+        // Brightness above 100 clamps instead of overflowing.
+        let clamped = build_led_test_pattern(LedPattern::Solid, 200, None).expect("clamp");
+        assert_eq!((clamped.r, clamped.g, clamped.b), (255, 255, 255));
+    }
+
+    /// C-TUNE-1 / C-MOD-1: the extended tuning fields persist through
+    /// `set_tuning`/`get_tuning`, and the `"accel"` spelling reads the
+    /// same `"accelerator"` tuning.
+    #[test]
+    fn tuning_extended_fields_persist_and_accel_canonicalizes() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        let mut tuning = state.get_tuning("accel");
+        assert_eq!(tuning.module, "accelerator", "module id is canonicalized");
+        tuning.deadzone = 4.0;
+        tuning.min_mv = 120.0;
+        tuning.max_mv = 3100.0;
+        tuning.horn_button = Some(7);
+        tuning.led_brightness = Some(60);
+        tuning.led_pattern = Some(LedPattern::Blink);
+        state.set_tuning(&tuning).expect("set tuning");
+        let read_back = state.get_tuning("accelerator");
+        assert_eq!(read_back.min_mv, 120.0);
+        assert_eq!(read_back.max_mv, 3100.0);
+        assert_eq!(read_back.horn_button, Some(7));
+        assert_eq!(read_back.led_brightness, Some(60));
+        assert_eq!(read_back.led_pattern, Some(LedPattern::Blink));
+        // The legacy spelling reads the same stored tuning.
+        assert_eq!(state.get_tuning("accel").min_mv, 120.0);
+    }
+
+    /// L8: a present-but-released clutch (0.0) reports `Some(0.0)`
+    /// when the clutch module is enabled, and `None` with no clutch
+    /// tuning (the Default profile).
+    #[test]
+    fn clutch_zero_reports_present_when_module_enabled() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        let output = PipelineOutputState::neutral();
+        let metrics = EngineMetrics::new();
+        state.ingest_engine_output(&output, &metrics);
+        assert_eq!(
+            state.snapshot().pedals.clutch,
+            None,
+            "no clutch tuning: 0.0 means 'no clutch module'"
+        );
+        // Enabling the clutch module (any tuning write does) makes
+        // the released clutch report `Some(0.0)`.
+        let mut tuning = state.get_tuning("clutch");
+        tuning.deadzone = 2.0;
+        state.set_tuning(&tuning).expect("set clutch tuning");
+        state.ingest_engine_output(&output, &metrics);
+        assert_eq!(state.snapshot().pedals.clutch, Some(0.0));
+    }
+
+    /// H3: `enable_auto_switch` turns the setting on and starts the
+    /// watcher thread.
+    #[test]
+    fn enable_auto_switch_starts_watcher() {
+        let (state, _dir) = test_state();
+        let settings = state.enable_auto_switch().expect("enable");
+        assert!(settings.auto_switch_profiles);
+        assert!(state.auto_switch_running());
+        assert!(!lock(&state.store).auto_switch_locked());
+        state.stop_auto_switch();
+        assert!(!state.auto_switch_running());
+    }
+
+    /// C-FAIL-1: a refused mid-session update fails over to vJoy
+    /// once, a second failure errors without a second switch, and
+    /// `reset_fallback` re-arms the flag (the 30 s rate limit still
+    /// holds the next attempt).
+    #[test]
+    fn mid_session_failover_switches_once_and_rearms() {
+        let (hm, _hm_sent, hm_fail) = RecordingBackend::new_named("HIDMaestro");
+        let (vj, vj_sent, vj_fail) = RecordingBackend::new_named("vJoy");
+        let factories = BackendFactories {
+            hidmaestro: Some(Box::new(move || {
+                Box::new(hm.clone()) as Box<dyn IJoystickOutput>
+            })),
+            vjoy: Some(Box::new(move || {
+                Box::new(vj.clone()) as Box<dyn IJoystickOutput>
+            })),
+            none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
+        };
+        let (state, _dir) = test_state();
+        state
+            .apply_backend_switch(BackendKind::HidMaestro, &factories)
+            .expect("install HIDMaestro mock");
+        assert_eq!(state.backend_name(), "HIDMaestro");
+        let output = PipelineOutputState::neutral();
+        // The live backend refuses the update: fail over to vJoy and
+        // retry there — the send succeeds on the fallback.
+        *hm_fail.lock().expect("hm fail lock") = true;
+        assert!(
+            state
+                .try_mid_session_fallback_with_factories(&output, &factories)
+                .is_ok()
+        );
+        assert!(state.fallback_used());
+        assert_eq!(state.backend_name(), "vJoy");
+        assert_eq!(vj_sent.lock().expect("vj sent lock").len(), 1);
+        // The fallback refusing too: `send_engine_output` routes the
+        // refusal into the failover, which is already used — an
+        // honest error, no second switch.
+        *vj_fail.lock().expect("vj fail lock") = true;
+        assert!(state.send_engine_output(&output).is_err());
+        assert_eq!(state.backend_name(), "vJoy", "no second switch happened");
+        // An explicit re-select re-arms the flag — but the 30 s rate
+        // limit still holds the next attempt.
+        state.reset_fallback();
+        assert!(!state.fallback_used());
+        assert!(state.send_engine_output(&output).is_err());
+        assert_eq!(state.backend_name(), "vJoy", "rate limit held the retry");
+    }
+
+    /// Deep-scan Round 2 item 5 (H2 latch): re-selecting a
+    /// disconnected `HIDMaestro` whose manager latch is set must
+    /// succeed — the re-select rebuilds the installed instance with
+    /// a fresh factory build (latch clear) instead of reconnecting
+    /// the latched instance, which would fail fast with
+    /// `FallbackNeeded` and fall back to vJoy. The latched instance
+    /// is modelled by a mock whose `try_connect` always fails; the
+    /// factory builds a fresh mock per call whose connect succeeds.
+    #[test]
+    fn reselect_disconnected_hidmaestro_rebuilds_latched_instance() {
+        let (latched, _latched_sent, _latched_fail) = RecordingBackend::new_named("HIDMaestro");
+        latched.set_fail_connect(true);
+        let dir = test_dir("latched-reselect");
+        let store = ProfileStore::open(&dir).expect("open test store");
+        let state = Arc::new(AppStateCore::new(
+            store,
+            Box::new(latched),
+            "test latched backend",
+        ));
+        let factories = BackendFactories {
+            hidmaestro: Some(Box::new(|| {
+                let (backend, _, _) = RecordingBackend::new_named("HIDMaestro");
+                Box::new(backend) as Box<dyn IJoystickOutput>
+            })),
+            vjoy: Some(Box::new(|| {
+                let (backend, _, _) = RecordingBackend::new_named("vJoy");
+                Box::new(backend) as Box<dyn IJoystickOutput>
+            })),
+            none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
+        };
+        // Without the rebuild this re-select would reconnect the
+        // latched instance, fail, and fall back to vJoy.
+        state.reset_fallback();
+        let outcome = state
+            .apply_backend_switch(BackendKind::HidMaestro, &factories)
+            .expect("re-select of a latched backend must succeed on the fresh instance");
+        assert_eq!(outcome.active, BackendKind::HidMaestro);
+        assert!(!outcome.fell_back);
+        assert_eq!(state.backend_name(), "HIDMaestro");
+        assert!(state.output_state().connected, "fresh instance connected");
+    }
+
+    /// C1: the real auto-switch wiring — a fake car source + fake
+    /// foreground over the store-backed source switches the active
+    /// profile and queues the `rsh://profile-switched` event.
+    #[test]
+    fn auto_switch_fake_source_switches_and_queues_event() {
+        use rsh_profiles::resolver::{GAME_ASSETTO_CORSA_COMPETIZIONE, MapProfileSource};
+        use rsh_profiles::watcher::{CarReading, CarSource, ForegroundDetector};
+
+        /// Fake car source: always the same on-track car.
+        #[derive(Clone)]
+        struct StubCarSource {
+            reading: Option<CarReading>,
+        }
+
+        impl CarSource for StubCarSource {
+            fn current_car(&self) -> Option<CarReading> {
+                self.reading.clone()
+            }
+        }
+
+        /// Fake foreground: always the same game.
+        #[derive(Clone)]
+        struct StubForeground {
+            game: Option<String>,
+        }
+
+        impl ForegroundDetector for StubForeground {
+            fn foreground_game(&self) -> Option<String> {
+                self.game.clone()
+            }
+        }
+
+        let (state, _dir) = test_state();
+        let created = state.create_profile("ACC Ferrari").expect("create");
+        let source = MapProfileSource::new().with_car_profile(
+            GAME_ASSETTO_CORSA_COMPETIZIONE,
+            // Same spelling as the reading below: `MapProfileSource`
+            // normalises by trim + lowercase only (the production
+            // store source uses the canonical separator normalizer
+            // on both sides instead).
+            "Ferrari 488 GT3",
+            ProfileId::new(created.id.clone()),
+        );
+        let resolver = CarProfileResolver::new_owned(Box::new(source));
+        let weak = Arc::downgrade(&state);
+        let watcher = TelemetryWatcher::new(
+            resolver,
+            StubCarSource {
+                reading: Some(CarReading::new(
+                    GAME_ASSETTO_CORSA_COMPETIZIONE,
+                    "Ferrari 488 GT3",
+                    true,
+                )),
+            },
+            StubForeground {
+                game: Some(GAME_ASSETTO_CORSA_COMPETIZIONE.to_string()),
+            },
+            move |profile_id: &ProfileId| {
+                let Some(state) = weak.upgrade() else {
+                    return Err("app state dropped".to_string());
+                };
+                state.apply_auto_switch(profile_id)
+            },
+            state
+                .active_profile()
+                .map(|active| ProfileId::new(active.id)),
+        );
+        state.install_auto_switch_poller(Box::new(watcher));
+        // 2 Hz polls for 5 s: the 400 ms debounce + 4-poll / 2 s car
+        // stability both clear well inside this window.
+        for _ in 0..10 {
+            state.poll_auto_switch_once();
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert_eq!(
+            state.active_profile().map(|active| active.id),
+            Some(created.id.clone()),
+            "the watcher must switch to the Ferrari profile"
+        );
+        let events = state.drain_app_events();
+        assert!(
+            events
+                .iter()
+                .any(|(name, payload)| name == PROFILE_SWITCHED_EVENT
+                    && payload.get("newProfileId").and_then(|value| value.as_str())
+                        == Some(created.id.as_str())),
+            "profile-switched event must be queued: {events:?}"
+        );
     }
 
     #[test]
@@ -5975,6 +7498,76 @@ mod tests {
         );
         let outcome = state.stop_engine();
         assert!(outcome.joined, "engine stops bounded");
+    }
+
+    /// M-11: the backoff delay doubles per consecutive failure
+    /// (2, 4, 8, 16 s) and caps at 30 s.
+    #[test]
+    fn forwarder_backoff_delay_doubles_to_30s_cap() {
+        let policy = ForwarderRetryPolicy::default_policy();
+        assert_eq!(policy.delay_after(1), Duration::from_secs(2));
+        assert_eq!(policy.delay_after(2), Duration::from_secs(4));
+        assert_eq!(policy.delay_after(3), Duration::from_secs(8));
+        assert_eq!(policy.delay_after(4), Duration::from_secs(16));
+        assert_eq!(policy.delay_after(5), Duration::from_secs(30));
+        assert_eq!(policy.delay_after(9), Duration::from_secs(30));
+        assert_eq!(policy.delay_after(100), Duration::from_secs(30));
+    }
+
+    /// M-11: the breaker trips on the 10th consecutive failure, and
+    /// a success resets the streak.
+    #[test]
+    fn forwarder_backoff_trips_after_max_consecutive_failures() {
+        let mut backoff = ForwarderBackoff::new(ForwarderRetryPolicy::default_policy());
+        for failure in 1..FORWARDER_MAX_CONSECUTIVE_FAILURES {
+            assert!(
+                backoff.record_failure().is_some(),
+                "failure {failure} still retries"
+            );
+        }
+        assert!(
+            backoff.record_failure().is_none(),
+            "10th failure trips the breaker"
+        );
+        assert!(backoff.record_failure().is_none(), "breaker stays open");
+        backoff.record_success();
+        assert_eq!(
+            backoff.record_failure(),
+            Some(Duration::from_secs(2)),
+            "success resets the streak to the base delay"
+        );
+    }
+
+    /// M-11: a transport that can never be opened stops retrying
+    /// instead of looping forever — the breaker trips, the run
+    /// returns, and the connection reports Disconnected.
+    #[tokio::test]
+    async fn forwarder_with_retry_trips_circuit_breaker_when_transport_never_opens() {
+        let (state, _dir) = test_state();
+        let (frame_tx, _frame_rx) = tokio::sync::mpsc::channel(8);
+        let (status_tx, _status_rx) = tokio::sync::mpsc::channel(8);
+        let policy = ForwarderRetryPolicy {
+            base: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            max_consecutive_failures: 3,
+        };
+        let run = forward_with_retry_with_policy(
+            Arc::clone(&state),
+            TransportKind::Udp,
+            frame_tx,
+            status_tx,
+            || Option::<FakeSessionTransport>::None,
+            policy,
+        );
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("breaker must trip promptly, not retry forever");
+        assert_eq!(state.transport_state().state, ConnectionState::Disconnected);
+        assert!(
+            state.engine_status_detail().contains("circuit breaker"),
+            "breaker named in the status: {}",
+            state.engine_status_detail()
+        );
     }
 
     #[test]

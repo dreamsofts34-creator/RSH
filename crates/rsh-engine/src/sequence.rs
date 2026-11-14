@@ -73,9 +73,15 @@ pub struct SequenceTracker {
 
 impl SequenceTracker {
     /// Create an empty tracker (no packet seen yet).
+    ///
+    /// The loss window is pre-allocated to [`LOSS_WINDOW`] (M-1), so
+    /// the steady-state packet path performs no allocation.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            window: VecDeque::with_capacity(LOSS_WINDOW),
+            ..Self::default()
+        }
     }
 
     /// Classify one incoming sequence number.
@@ -84,10 +90,16 @@ impl SequenceTracker {
     /// * Same or old sequence, backward jump `<= REBASELINE_THRESHOLD` →
     ///   [`SeqDecision::Duplicate`].
     /// * Forward jump → [`SeqDecision::Gap`] with the skipped count.
-    /// * Backward jump `> REBASELINE_THRESHOLD` → board reboot signature:
-    ///   rebaseline to the new sequence and [`SeqDecision::Accept`].
+    /// * Backward jump `> REBASELINE_THRESHOLD` → board reboot signature
+    ///   **only when `reboot_evidence` is true** (L8): the caller must
+    ///   have independent evidence the board restarted — a stale
+    ///   watchdog (no frame for ≥ 250 ms) or a status-packet uptime
+    ///   reset. Without that evidence a large backward jump is a
+    ///   retransmission burst / out-of-order delivery, not a reboot,
+    ///   and is counted [`SeqDecision::Duplicate`] with the baseline
+    ///   left alone. Use [`Self::check`] when no evidence is available.
     #[must_use]
-    pub fn check(&mut self, seq: u16) -> SeqDecision {
+    pub fn check_with_evidence(&mut self, seq: u16, reboot_evidence: bool) -> SeqDecision {
         let Some(last) = self.last else {
             self.last = Some(seq);
             self.accepted += 1;
@@ -115,12 +127,15 @@ impl SequenceTracker {
             // Backward jump (`delta` past half the `u16` range means
             // `seq < last`): how far back did it go?
             let backward = last.wrapping_sub(seq);
-            if backward <= REBASELINE_THRESHOLD {
+            if backward <= REBASELINE_THRESHOLD || !reboot_evidence {
                 // Small backward jump: retransmission / old packet.
+                // A large backward jump with no reboot evidence is
+                // the same: an out-of-order burst, not a reboot —
+                // never rebaseline on the sequence alone (L8).
                 self.duplicates += 1;
                 SeqDecision::Duplicate
             } else {
-                // Large backward jump: board reboot signature — the
+                // Large backward jump with reboot evidence: the
                 // sequence restarted near 0. Rebaseline instead of
                 // counting every subsequent valid packet as a duplicate
                 // (C# P3 fix).
@@ -131,6 +146,15 @@ impl SequenceTracker {
                 SeqDecision::Accept
             }
         }
+    }
+
+    /// Classify one incoming sequence number with no reboot evidence:
+    /// a large backward jump is a duplicate, never a rebaseline (L8).
+    /// Callers that know the board restarted (stale watchdog / uptime
+    /// reset) must use [`Self::check_with_evidence`].
+    #[must_use]
+    pub fn check(&mut self, seq: u16) -> SeqDecision {
+        self.check_with_evidence(seq, false)
     }
 
     /// Ingest a board status packet's loss counters (`seqGap`/`txFail`,
@@ -258,7 +282,7 @@ fn accumulate_board_counter(total: u64, last: &mut Option<u16>, value: u16) -> u
 
 #[cfg(test)]
 mod tests {
-    use super::{REBASELINE_THRESHOLD, SeqDecision, SequenceTracker};
+    use super::{LOSS_WINDOW, REBASELINE_THRESHOLD, SeqDecision, SequenceTracker};
     use rsh_protocol::StatusPacket;
 
     /// Build a status packet carrying only the loss counters we care about.
@@ -283,19 +307,34 @@ mod tests {
     }
 
     #[test]
+    fn new_preallocates_loss_window() {
+        // M-1: the loss window is pre-allocated, so the steady-state
+        // packet path performs no allocation.
+        let tracker = SequenceTracker::new();
+        assert!(tracker.window.capacity() >= LOSS_WINDOW);
+    }
+
+    #[test]
     fn p3_reboot_does_not_count_valid_packets_as_duplicates() {
         // C# P3 regression: board reboots, sequence restarts near 0, and
         // the old tracker counted ~1000 subsequent VALID packets as
         // duplicates because the delta<=0 branch never updated the
         // baseline. Zero of the post-reboot valid packets may be
-        // duplicates.
+        // duplicates. The reboot is signalled with evidence (stale
+        // watchdog / uptime reset, L8) — the first post-reboot packet
+        // carries it, the rest are ordinary +1 accepts.
         let mut tracker = SequenceTracker::new();
         assert_eq!(tracker.check(1000), SeqDecision::Accept);
         assert_eq!(tracker.check(1001), SeqDecision::Accept);
         // Board reboots: sequence restarts near 0.
         let mut post_reboot_duplicates = 0u64;
-        for seq in 0..=999u16 {
-            if tracker.check(seq) == SeqDecision::Duplicate {
+        for (i, seq) in (0..=999u16).enumerate() {
+            let decision = if i == 0 {
+                tracker.check_with_evidence(seq, true)
+            } else {
+                tracker.check(seq)
+            };
+            if decision == SeqDecision::Duplicate {
                 post_reboot_duplicates += 1;
             }
         }
@@ -303,6 +342,25 @@ mod tests {
         assert_eq!(tracker.duplicates(), 0);
         assert_eq!(tracker.accepted(), 1002);
         assert_eq!(tracker.rebaselines(), 1);
+    }
+
+    #[test]
+    fn large_backward_jump_without_evidence_is_duplicate_not_rebaseline() {
+        // L8: sequence alone never proves a reboot — a large backward
+        // jump with no stale-watchdog / uptime-reset evidence is an
+        // out-of-order burst. The baseline must not move, so the next
+        // in-order packet still accepts.
+        let mut tracker = SequenceTracker::new();
+        assert_eq!(tracker.check(1000), SeqDecision::Accept);
+        assert_eq!(tracker.check(1001), SeqDecision::Accept);
+        assert_eq!(tracker.check(0), SeqDecision::Duplicate);
+        assert_eq!(tracker.rebaselines(), 0);
+        assert_eq!(tracker.last_seq(), Some(1001));
+        assert_eq!(tracker.check(1002), SeqDecision::Accept);
+        // Same jump WITH evidence rebaselines.
+        assert_eq!(tracker.check_with_evidence(5, true), SeqDecision::Accept);
+        assert_eq!(tracker.rebaselines(), 1);
+        assert_eq!(tracker.last_seq(), Some(5));
     }
 
     #[test]
@@ -358,9 +416,10 @@ mod tests {
             tracker.check(1000 - REBASELINE_THRESHOLD),
             SeqDecision::Duplicate
         );
-        // One past the threshold: reboot signature, rebaseline + accept.
+        // One past the threshold with reboot evidence: reboot
+        // signature, rebaseline + accept.
         assert_eq!(
-            tracker.check(1000 - REBASELINE_THRESHOLD - 1),
+            tracker.check_with_evidence(1000 - REBASELINE_THRESHOLD - 1, true),
             SeqDecision::Accept
         );
         assert_eq!(tracker.rebaselines(), 1);

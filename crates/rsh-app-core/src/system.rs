@@ -545,16 +545,6 @@ impl OutputSink for NullSink {
     }
 }
 
-/// Exit-path shutdown with no output backend yet (Phase F gate).
-/// Phase G wires the real backend + engine stop handle into `AppState`
-/// and replaces this call; until then the shutdown path is wired and
-/// its outcome is reported honestly (`neutral_sent: false`).
-#[must_use]
-pub fn shutdown_with_no_backend() -> ShutdownOutcome {
-    let mut sink = NullSink;
-    shutdown_output(None, &mut sink)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

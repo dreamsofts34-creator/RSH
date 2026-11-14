@@ -44,7 +44,7 @@ export function FinishStep({ completed, stepIds, done, onFinish }: FinishStepPro
             {stepIds.map((id) => (
               <li key={id} className="flex items-center gap-2 text-sm text-[var(--ink)]">
                 {doneSet.has(id) ? (
-                  <Check className="size-4 text-emerald-600" aria-label="completed" />
+                  <Check className="size-4 text-[var(--success-text)]" aria-label="completed" />
                 ) : (
                   <Circle className="size-4 text-[var(--muted)]" aria-label="not completed" />
                 )}

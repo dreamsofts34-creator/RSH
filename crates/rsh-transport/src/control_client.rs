@@ -34,6 +34,20 @@ use rsh_protocol::{ConfigError, ControlParseError, GetCapsReply, SetCfgChunk};
 
 use crate::{ControlTransport, TransportError};
 
+/// Overwrite `buf` with zeros in a way the compiler must not optimise
+/// away (volatile writes plus `black_box`, same primitive as
+/// `session.rs`). Used only by the `Drop` impls below.
+fn zeroize(buf: &mut [u8]) {
+    for byte in buf.iter_mut() {
+        // SAFETY: `byte` is a valid `&mut u8` borrowed from a live slice,
+        // so the derived raw pointer is valid for a volatile write.
+        unsafe {
+            std::ptr::write_volatile(byte, 0);
+        }
+    }
+    std::hint::black_box(buf);
+}
+
 /// Per-session control-channel context: the 32-byte device key, the
 /// 16-byte nonce, and the next counter to use.
 ///
@@ -73,6 +87,28 @@ impl Session {
     pub fn reset(&mut self, nonce: [u8; 16]) {
         self.nonce = nonce;
         self.counter = 0;
+    }
+}
+
+impl Drop for Session {
+    /// Zeroize the device key when the session is dropped, so a key
+    /// never lingers in memory after the session ends (M1). The nonce
+    /// is not key material and is left alone. Callers that take the
+    /// session out via [`ControlClient::into_inner`] move the key out
+    /// whole, so this drop does not run for the moved-out copy — the
+    /// new owner (e.g. [`BoardSession::close`]) zeroizes it instead.
+    fn drop(&mut self) {
+        zeroize(&mut self.key);
+    }
+}
+
+impl<T: ControlTransport> Drop for ControlClient<T> {
+    /// Zeroize the session key when the client is dropped (M1) — a
+    /// dropped client must never leave the device key in memory.
+    /// [`ControlClient::into_inner`] moves the session out whole, so
+    /// this drop does not run for a taken-out client.
+    fn drop(&mut self) {
+        zeroize(&mut self.session.key);
     }
 }
 
@@ -226,9 +262,20 @@ impl<T: ControlTransport> ControlClient<T> {
     }
 
     /// Consume the client, returning the transport and the session.
+    /// The session (and its key) moves out whole, so the client's
+    /// `Drop` impl does not run for it — the new owner zeroizes it.
     #[must_use]
     pub fn into_inner(self) -> (T, Session) {
-        (self.transport, self.session)
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped (it is `ManuallyDrop`), so
+        // reading the fields out by pointer copy is the only access
+        // and no value is used twice.
+        unsafe {
+            (
+                std::ptr::read(std::ptr::addr_of!(this.transport)),
+                std::ptr::read(std::ptr::addr_of!(this.session)),
+            )
+        }
     }
 
     /// Send one command and return the reply body (status byte stripped).
@@ -485,6 +532,15 @@ impl<T: ControlTransport> ControlClient<T> {
     /// Returns `Ok(None)` on timeout (caller retries), `Ok(Some(frame))`
     /// for a verified, matching, non-replay reply. Stray frames for other
     /// commands/`reqId`s are skipped while time remains.
+    ///
+    /// H1/M-8: match first, verify second. The frame is parsed
+    /// structurally and matched on `cmd`/`reqId` *before* any HMAC
+    /// check; a stray frame (another command, another `reqId`, or a
+    /// late reply to a previous command) is skipped without verifying
+    /// its tag — so a stray frame with a corrupted tag can never kill
+    /// the in-flight command with a spurious `BadTag`. Only the
+    /// matching frame's tag is verified, and a bad tag on *that*
+    /// frame still fails at once.
     async fn wait_for_reply(
         &mut self,
         cmd: u8,
@@ -503,13 +559,22 @@ impl<T: ControlTransport> ControlClient<T> {
                 Ok(Err(e)) => return Err(ControlError::Transport(e)),
                 Ok(Ok(raw)) => raw,
             };
-            let frame = match ControlFrame::verify(&raw, &self.session.key, &self.session.nonce) {
+            // Structure first: a frame too short / bad magic / bad
+            // length has no trustworthy cmd/reqId to match on, so it
+            // fails like before. A structurally sound frame is
+            // matched before its tag is touched.
+            let frame = match ControlFrame::parse_structure(&raw) {
                 Ok(frame) => frame,
-                Err(ControlParseError::BadTag) => return Err(ControlError::BadTag),
                 Err(e) => return Err(ControlError::Parse(e)),
             };
             if frame.cmd != (cmd | 0x80) || frame.req_id != req_id {
                 continue;
+            }
+            if let Err(e) = frame.verify_tag(&self.session.key, &self.session.nonce, &raw) {
+                return Err(match e {
+                    ControlParseError::BadTag => ControlError::BadTag,
+                    other => ControlError::Parse(other),
+                });
             }
             if self.replay.is_replay(frame.counter) {
                 return Err(ControlError::Replay);
@@ -1044,6 +1109,52 @@ mod tests {
             .expect_err("stray reply must not satisfy the request");
         assert!(matches!(err, ControlError::Timeout), "got {err:?}");
         assert_eq!(c.transport().sent.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn stray_corrupt_tag_frame_does_not_kill_in_flight_command() {
+        // H1/M-8 regression: a stray frame for another reqId whose tag
+        // is corrupted must be skipped WITHOUT verification — the old
+        // code verified first and failed the in-flight command with
+        // BadTag. Here the stray frame arrives first, then the valid
+        // reply for reqId 0, and GET_CAPS must still succeed.
+        let transport = ScriptedTransport::new(vec![
+            ScriptedRecv::Bytes(reply_bad_tag(
+                Opcode::GetCaps as u8,
+                999,
+                0,
+                ErrorCode::Ok,
+                &caps_body(),
+            )),
+            ScriptedRecv::Bytes(reply(
+                Opcode::GetCaps as u8,
+                0,
+                0,
+                ErrorCode::Ok,
+                &caps_body(),
+            )),
+        ]);
+        let mut c = client(transport);
+        let caps = c.get_caps().await.expect("valid reply still wins");
+        assert_eq!(caps.firmware, (4, 0, 1));
+        assert_eq!(c.transport().sent.len(), 1, "no retry was needed");
+    }
+
+    #[tokio::test]
+    async fn matching_reply_with_bad_tag_still_fails() {
+        // The H1 split only skips non-matching frames: a bad tag on
+        // the MATCHING reply is still a hard BadTag, no retry.
+        let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(reply_bad_tag(
+            Opcode::GetCaps as u8,
+            0,
+            0,
+            ErrorCode::Ok,
+            &caps_body(),
+        ))]);
+        let mut c = client(transport);
+        let err = c.get_caps().await.expect_err("matching bad tag must fail");
+        assert!(matches!(err, ControlError::BadTag), "got {err:?}");
+        assert_eq!(c.transport().sent.len(), 1);
     }
 
     #[tokio::test]

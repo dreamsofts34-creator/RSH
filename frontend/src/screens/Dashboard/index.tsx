@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Gauge } from "lucide-react";
 import {
@@ -64,62 +64,108 @@ export function DashboardScreen() {
   const [stoppingId, setStoppingId] = useState<string | null>(null);
   const [gameError, setGameError] = useState<string | null>(null);
   const [restartState, setRestartState] = useState<RestartState>("idle");
+  // M8: profiles / active profile / stats failures are shown, not
+  // swallowed — each section reports its own load failure.
+  const [profilesFailed, setProfilesFailed] = useState(false);
+  const [activeFailed, setActiveFailed] = useState(false);
+  const [statsFailed, setStatsFailed] = useState(false);
+  // M8 staleness: the last time a snapshot arrived (null = never).
+  const [stale, setStale] = useState(false);
+  const lastSnapshotAtRef = useRef(0);
+  const restartTimerRef = useRef<number | undefined>(undefined);
 
-  // Initial load: transport, games, profiles, active profile, engine stats.
+  // Load: transport, games, profiles, active profile, engine stats.
+  // Re-polled every 30 s (M8) so a failed section recovers on its own
+  // and the launcher/profile data never goes silently stale.
+  const loadAll = useCallback(async () => {
+    const [transportResult, gamesResult, profilesResult, activeResult, statsResult] =
+      await Promise.allSettled([
+        getTransportState(),
+        listGames(),
+        listProfiles(),
+        getActiveProfile(),
+        getEngineStats(),
+      ]);
+    if (transportResult.status === "fulfilled") {
+      setTransport(transportResult.value);
+      setTransportLoad(null);
+    } else {
+      setTransportLoad(loadStateOf(transportResult.reason));
+    }
+    if (gamesResult.status === "fulfilled") {
+      setGames(gamesResult.value);
+      setGamesLoad(null);
+    } else {
+      setGamesLoad(loadStateOf(gamesResult.reason));
+    }
+    if (profilesResult.status === "fulfilled") {
+      setProfiles(profilesResult.value);
+      setProfilesFailed(false);
+    } else {
+      setProfilesFailed(true);
+    }
+    if (activeResult.status === "fulfilled") {
+      setActiveProfile(activeResult.value);
+      setActiveFailed(false);
+    } else {
+      setActiveFailed(true);
+    }
+    if (statsResult.status === "fulfilled") {
+      setEngineStats(statsResult.value);
+      setStatsFailed(false);
+    } else {
+      setStatsFailed(true);
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const [transportResult, gamesResult, profilesResult, activeResult, statsResult] =
-        await Promise.allSettled([
-          getTransportState(),
-          listGames(),
-          listProfiles(),
-          getActiveProfile(),
-          getEngineStats(),
-        ]);
-      if (cancelled) return;
-      if (transportResult.status === "fulfilled") {
-        setTransport(transportResult.value);
-        setTransportLoad(null);
-      } else {
-        setTransportLoad(loadStateOf(transportResult.reason));
-      }
-      if (gamesResult.status === "fulfilled") {
-        setGames(gamesResult.value);
-        setGamesLoad(null);
-      } else {
-        setGamesLoad(loadStateOf(gamesResult.reason));
-      }
-      if (profilesResult.status === "fulfilled") {
-        setProfiles(profilesResult.value);
-      }
-      if (activeResult.status === "fulfilled") {
-        setActiveProfile(activeResult.value);
-      }
-      if (statsResult.status === "fulfilled") {
-        setEngineStats(statsResult.value);
-      }
+      if (!cancelled) await loadAll();
     })();
+    const timer = window.setInterval(() => {
+      void loadAll();
+    }, 30_000);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
     };
+  }, [loadAll]);
+
+  // Staleness check: no snapshot for >3 s means the live feed is stale.
+  useEffect(() => {
+    if (snapshot) lastSnapshotAtRef.current = Date.now();
+  }, [snapshot]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setStale(
+        lastSnapshotAtRef.current !== 0 &&
+          Date.now() - lastSnapshotAtRef.current > 3000,
+      );
+    }, 1000);
+    return () => window.clearInterval(timer);
   }, []);
 
   // Game running/stopped changes arrive on `rsh://game-state`.
   useEffect(() => {
+    let done = false;
     let unlisten: (() => void) | undefined;
-    subscribeGameState((game) => {
+    void subscribeGameState((game) => {
+      if (done) return;
       setGames((prev) =>
         prev ? prev.map((g) => (g.id === game.id ? game : g)) : prev,
       );
     })
-      .then((fn) => {
-        unlisten = fn;
+      .then((stop) => {
+        if (done) stop();
+        else unlisten = stop;
       })
       .catch(() => {
         // Event not available yet; the launcher still works via commands.
       });
     return () => {
+      done = true;
       unlisten?.();
     };
   }, []);
@@ -162,6 +208,16 @@ export function DashboardScreen() {
     }
   }, []);
 
+  // M4: the "done" state resets after 8 s so the button is usable
+  // again — a stuck "done" used to hide the reboot guidance forever.
+  useEffect(() => {
+    if (restartState !== "done") return undefined;
+    restartTimerRef.current = window.setTimeout(() => {
+      setRestartState("idle");
+    }, 8000);
+    return () => window.clearTimeout(restartTimerRef.current);
+  }, [restartState]);
+
   const handleRestart = useCallback(async () => {
     setRestartState("busy");
     try {
@@ -188,6 +244,22 @@ export function DashboardScreen() {
         <p className="mt-1 text-sm text-[var(--muted)]">
           {t("dashboard.subtitle")}
         </p>
+        {stale ? (
+          <p role="status" className="mt-1 text-sm text-[var(--warning-text)]">
+            {t("dashboard.stale")}
+          </p>
+        ) : null}
+        {profilesFailed || activeFailed || statsFailed ? (
+          <p role="alert" className="mt-1 text-sm text-[var(--error-text)]">
+            {[
+              profilesFailed ? t("dashboard.profilesLoadFailed") : null,
+              activeFailed ? t("dashboard.activeLoadFailed") : null,
+              statsFailed ? t("dashboard.statsLoadFailed") : null,
+            ]
+              .filter(Boolean)
+              .join(" ")}
+          </p>
+        ) : null}
       </header>
 
       <div className="grid gap-5 lg:grid-cols-3">

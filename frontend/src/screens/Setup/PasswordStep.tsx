@@ -1,10 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { setPassword } from "@/lib/tauri";
-import { Notice, NotImplementedNotice, StepIntro, describeError } from "./components";
+import { Notice, NotImplementedNotice, StepIntro, describeError, type StepProps } from "./components";
 
 /**
  * Step 3 — Change password.
@@ -19,7 +19,7 @@ function isPrintableAscii(value: string): boolean {
   return /^[\x20-\x7e]*$/.test(value);
 }
 
-export function PasswordStep() {
+export function PasswordStep({ onSuccessChange }: StepProps) {
   const { t } = useTranslation();
   const [password, setPasswordValue] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -28,6 +28,11 @@ export function PasswordStep() {
     null,
   );
   const [saved, setSaved] = useState(false);
+
+  // H5: the step succeeds once the new password is saved.
+  useEffect(() => {
+    onSuccessChange?.(saved);
+  }, [saved, onSuccessChange]);
 
   function handleChange() {
     setSaved(false);

@@ -29,7 +29,7 @@ describe("tuning value model", () => {
     const a = defaultTuning("brake");
     expect(sameTuning(a, { ...a })).toBe(true);
     expect(sameTuning(a, { ...a, deadzone: 1 })).toBe(false);
-    expect(sameTuning(a, { ...a, module: "accel" })).toBe(false);
+    expect(sameTuning(a, { ...a, module: "accelerator" })).toBe(false);
   });
 
   it("clampNumber clamps and treats non-finite as the minimum", () => {
@@ -83,7 +83,7 @@ describe("tuning value model", () => {
 
   it("normalizeTuning clamps out-of-range backend values", () => {
     const normalised = normalizeTuning({
-      module: "accel",
+      module: "accelerator",
       deadzone: 99,
       curve: 9,
       minMv: -50,
@@ -91,7 +91,7 @@ describe("tuning value model", () => {
       smoothing: -1,
     });
     expect(normalised).toEqual({
-      module: "accel",
+      module: "accelerator",
       deadzone: 30,
       curve: 2,
       minMv: 0,
@@ -165,7 +165,7 @@ describe("module registry", () => {
   it("has exactly the 10 approved modules, in order", () => {
     expect(MODULES.map((m) => m.id)).toEqual([
       "steering",
-      "accel",
+      "accelerator",
       "brake",
       "clutch",
       "handbrake",
@@ -181,7 +181,7 @@ describe("module registry", () => {
     const live = MODULES.filter((m) => m.liveValueOf !== null).map(
       (m) => m.id,
     );
-    expect(live).toEqual(["steering", "accel", "brake", "clutch"]);
+    expect(live).toEqual(["steering", "accelerator", "brake", "clutch"]);
   });
 
   it("steering live value maps -450..450 deg to 0..1", () => {
@@ -199,6 +199,8 @@ describe("module registry", () => {
       },
       activeProfileId: null,
       seq: 1,
+      seqGap: 0,
+      txFail: 0,
     });
     expect(steering?.liveValueOf?.(snapshot(-450))).toBe(0);
     expect(steering?.liveValueOf?.(snapshot(0))).toBe(0.5);
@@ -220,6 +222,8 @@ describe("module registry", () => {
       },
       activeProfileId: null,
       seq: 1,
+      seqGap: 0,
+      txFail: 0,
     };
     expect(clutch?.liveValueOf?.(snapshot)).toBeNull();
   });
@@ -289,5 +293,29 @@ describe("tuning extension fields (bite point, gate, horn, LED)", () => {
     // Out-of-range brightness is clamped, not dropped.
     expect(normalised.ledBrightness).toBe(100);
     expect(normalised.ledPattern).toBeUndefined();
+  });
+});
+
+describe("module id parity with Settings (C-MOD-1 / C2)", () => {
+  it("Tuning and Settings agree on the canonical module ids", async () => {
+    const { MODULE_IDS: tuningIds } = await import("./modules");
+    const { MODULE_IDS: settingsIds } = await import(
+      "../Settings/settings"
+    );
+    expect([...tuningIds]).toEqual([...settingsIds]);
+    expect(tuningIds).toContain("accelerator");
+    expect(tuningIds).not.toContain("accel");
+  });
+
+  it("parseModuleStates maps the legacy 'accel' key to 'accelerator'", async () => {
+    const { parseModuleStates } = await import("./modules");
+    expect(
+      parseModuleStates({ modules: { accel: false } }),
+    ).toEqual({ accelerator: false });
+    expect(
+      parseModuleStates({
+        modules: { accel: false, accelerator: true },
+      }),
+    ).toEqual({ accelerator: true });
   });
 });

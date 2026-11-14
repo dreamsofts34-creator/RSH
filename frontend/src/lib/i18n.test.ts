@@ -81,4 +81,18 @@ describe("i18n infrastructure", () => {
     expect(directionFor("en")).toBe("ltr");
     expect(directionFor("hi")).toBe("ltr");
   });
+
+  it("persists the language in localStorage like the theme (H2)", async () => {
+    const { loadStoredLanguage, LANGUAGE_STORAGE_KEY } = await import(
+      "./i18n"
+    );
+    window.localStorage.removeItem(LANGUAGE_STORAGE_KEY);
+    expect(loadStoredLanguage()).toBe("en");
+    await changeLanguage("ur");
+    expect(window.localStorage.getItem(LANGUAGE_STORAGE_KEY)).toBe("ur");
+    expect(loadStoredLanguage()).toBe("ur");
+    window.localStorage.setItem(LANGUAGE_STORAGE_KEY, "xx");
+    expect(loadStoredLanguage()).toBe("en");
+    await changeLanguage("en");
+  });
 });

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,7 +12,7 @@ import {
   type TransportKind,
   type TransportState,
 } from "@/lib/tauri";
-import { Notice, NotImplementedNotice, StepIntro, describeError } from "./components";
+import { Notice, NotImplementedNotice, StepIntro, describeError, type StepProps } from "./components";
 
 /**
  * Step 1 — Connect (UI plan P5.2).
@@ -45,20 +45,50 @@ function stateLabel(state: ConnectionState, t: (key: string) => string): string 
   }
 }
 
-export function ConnectStep() {
+export function ConnectStep({ onSuccessChange }: StepProps) {
   const { t } = useTranslation();
   const [transport, setTransport] = useState<TransportKind>("wifi");
   const [address, setAddress] = useState(DEFAULT_ADDRESS.wifi);
   const [status, setStatus] = useState<TransportState | null>(null);
   const [busy, setBusy] = useState(false);
+  const [polling, setPolling] = useState(false);
   const [error, setError] = useState<{ notImplemented: boolean; message: string } | null>(
     null,
   );
+
+  // H5: report step success to the wizard (Next stays gated until the
+  // wheel is actually connected).
+  const connected = status?.state === "connected";
+  useEffect(() => {
+    onSuccessChange?.(connected);
+  }, [connected, onSuccessChange]);
 
   function pickTransport(next: TransportKind) {
     setTransport(next);
     setAddress(DEFAULT_ADDRESS[next]);
     setError(null);
+  }
+
+  /**
+   * M2: after a connect/switch, poll `get_transport_state` (and the
+   * snapshot feed is not available here) until the state settles —
+   * the command returns while the transport is still "connecting",
+   * and the step must not claim success before the board answers.
+   */
+  async function pollUntilSettled(): Promise<void> {
+    setPolling(true);
+    try {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const polled = await getTransportState();
+        setStatus(polled);
+        if (polled.state !== "connecting") return;
+      }
+    } catch (caught) {
+      setError(describeError(caught));
+    } finally {
+      setPolling(false);
+    }
   }
 
   async function run(action: () => Promise<TransportState>) {
@@ -72,7 +102,9 @@ export function ConnectStep() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await action());
+      const next = await action();
+      setStatus(next);
+      if (next.state === "connecting") await pollUntilSettled();
     } catch (caught) {
       setError(describeError(caught));
     } finally {
@@ -174,7 +206,7 @@ export function ConnectStep() {
         </Button>
         {status?.state === "connected" && (
           <Button type="button" variant="outline" onClick={handleDisconnect} disabled={busy}>
-            {t("setup.connect.disconnected")}
+            {t("setup.connect.disconnect")}
           </Button>
         )}
       </div>
@@ -191,6 +223,12 @@ export function ConnectStep() {
         {status?.address ? ` — ${status.address}` : ""}
         {status?.error ? ` — ${status.error}` : ""}
       </p>
+
+      {polling ? (
+        <p aria-live="polite" className="text-sm text-[var(--muted)]">
+          {t("setup.connect.polling")}
+        </p>
+      ) : null}
 
       {error?.notImplemented ? (
         <NotImplementedNotice />

@@ -59,8 +59,11 @@ function pushPoint(buffers: RingBuffers, snap: EngineSnapshot): void {
 
 interface ChartColors {
   accent: string;
+  accentDeep: string;
   success: string;
-  info: string;
+  /** Clutch line colour — a dedicated token, NOT `--info` (H8): the
+   *  cyan is ~1.9:1 on the light card; `--chart-clutch` is ≥3:1. */
+  clutch: string;
   muted: string;
   ink: string;
   line: string;
@@ -72,8 +75,9 @@ function readColors(): ChartColors {
     cs.getPropertyValue(name).trim() || fallback;
   return {
     accent: pick("--accent", "violet"),
+    accentDeep: pick("--accent-deep", "indigo"),
     success: pick("--success", "green"),
-    info: pick("--info", "cyan"),
+    clutch: pick("--chart-clutch", "teal"),
     muted: pick("--muted", "gray"),
     ink: pick("--ink", "black"),
     line: pick("--line", "lightgray"),
@@ -106,6 +110,11 @@ export function LiveCharts({ snapshotRef }: LiveChartsProps) {
   const uPlotCtorRef = useRef<typeof uPlot | null>(null);
   const buffersRef = useRef<RingBuffers>(createBuffers());
   const [unavailable, setUnavailable] = useState(false);
+  /** True when the snapshot `seq` has not advanced for >1.5 s (H8):
+   *  the charts are frozen on stale data, not live. */
+  const [stale, setStale] = useState(false);
+  const lastSeqRef = useRef<number | null>(null);
+  const lastAdvanceRef = useRef(0);
   const [legend, setLegend] = useState<LegendValues>({
     steering: null,
     accel: null,
@@ -157,7 +166,7 @@ export function LiveCharts({ snapshotRef }: LiveChartsProps) {
             series: [
               {},
               {
-                label: "Steering",
+                label: t("monitor.charts.steering"),
                 stroke: colors.accent,
                 width: 2,
               },
@@ -173,9 +182,26 @@ export function LiveCharts({ snapshotRef }: LiveChartsProps) {
             height: 180,
             series: [
               {},
-              { label: "Accel", stroke: colors.accent, width: 2 },
-              { label: "Brake", stroke: colors.success, width: 2 },
-              { label: "Clutch", stroke: colors.info, width: 2 },
+              // L7: four series, four distinct strokes. Steering keeps
+              // the accent; Accel uses the deeper accent (same family,
+              // visibly darker on light) so the two violet lines are
+              // never confused, Brake is the success green and Clutch
+              // the dedicated chart token (H8, >=3:1 on light).
+              {
+                label: t("monitor.charts.accel"),
+                stroke: colors.accentDeep,
+                width: 2,
+              },
+              {
+                label: t("monitor.charts.brake"),
+                stroke: colors.success,
+                width: 2,
+              },
+              {
+                label: t("monitor.charts.clutch"),
+                stroke: colors.clutch,
+                width: 2,
+              },
             ],
             axes: [
               axes[0],
@@ -207,11 +233,35 @@ export function LiveCharts({ snapshotRef }: LiveChartsProps) {
       attributeFilter: ["data-theme", "class"],
     });
 
+    // Rebuild (debounced) when the container resizes (H8): uPlot
+    // needs explicit pixels, and an un-debounced rebuild per resize
+    // event would thrash the charts during a window drag.
+    let resizeTimer: number | undefined;
+    const resizeObserver =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(() => {
+            window.clearTimeout(resizeTimer);
+            resizeTimer = window.setTimeout(() => {
+              void buildCharts();
+            }, 150);
+          })
+        : null;
+    if (steeringHostRef.current) resizeObserver?.observe(steeringHostRef.current);
+
     // 10 Hz redraw: pull the latest snapshot from the ref, push one
     // point, redraw. The 30 Hz ingest never touches React state.
+    // H8: when `seq` has not advanced the snapshot is a repeat — push
+    // nothing (a flat line of duplicates is not data) and flag stale.
     const timer = window.setInterval(() => {
       const snap = snapshotRef.current;
       if (!snap) return;
+      if (snap.seq === lastSeqRef.current) {
+        if (Date.now() - lastAdvanceRef.current > 1500) setStale(true);
+        return;
+      }
+      lastSeqRef.current = snap.seq;
+      lastAdvanceRef.current = Date.now();
+      setStale(false);
       pushPoint(buffersRef.current, snap);
       const buffers = buffersRef.current;
       chartsRef.current.steering?.setData([buffers.xs, buffers.steering]);
@@ -232,12 +282,14 @@ export function LiveCharts({ snapshotRef }: LiveChartsProps) {
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      window.clearTimeout(resizeTimer);
+      resizeObserver?.disconnect();
       observer.disconnect();
       chartsRef.current.steering?.destroy();
       chartsRef.current.pedals?.destroy();
       chartsRef.current = { steering: null, pedals: null };
     };
-  }, [snapshotRef]);
+  }, [snapshotRef, t]);
 
   const fmtPct = (v: number | null): string =>
     v === null ? "—" : `${Math.round(v * 100)} %`;
@@ -288,6 +340,11 @@ export function LiveCharts({ snapshotRef }: LiveChartsProps) {
         {legend.steering === null ? (
           <p className="text-sm text-[var(--muted)]">
             {t("monitor.charts.noData")}
+          </p>
+        ) : null}
+        {stale ? (
+          <p role="status" className="text-sm text-[var(--warning-text)]">
+            {t("monitor.charts.stale")}
           </p>
         ) : null}
       </CardContent>

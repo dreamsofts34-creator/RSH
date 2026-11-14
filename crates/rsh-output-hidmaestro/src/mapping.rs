@@ -5,7 +5,7 @@
 //! [`OutputState`](rsh_engine::pipeline::OutputState), whose axes are
 //! already floats):
 //!
-//! 1. **`SubmitState` path** (default): the SDK's documented abstract frame
+//! 1. **`SubmitState` path** (opt-out): the SDK's documented abstract frame
 //!    (`HMGamepadState`). Axes are `[0, 1]` floats — `0.5` = centre on
 //!    the signed steering axis, `0.0` = released on unsigned pedals /
 //!    slider. Buttons: `HMButton` is 25 named bits (measured by
@@ -13,7 +13,7 @@
 //!    `RightTriggerClick = 0x1000000`), so wheel buttons **1–25** travel
 //!    this way; buttons 26–32, `buttons_ex` (33–64) and encoder pulses
 //!    (65–72) do NOT — documented gap, same as the C# series.
-//! 2. **Raw-report path** (opt-in, `use_raw_report`): the custom
+//! 2. **Raw-report path** (default, `use_raw_report`): the custom
 //!    `rsh-wheel-custom` profile's real input report, derived from its
 //!    124-byte descriptor (measured in this task — see below). It carries
 //!    all 32 wheel buttons. `buttons_ex` and encoder pulses still have
@@ -333,7 +333,10 @@ pub fn build_gamepad_frame(state: &OutputState, caps: &HidMaestroCapabilities) -
     if caps.has_axis_slider {
         frame.slider = pedal_to_float(state.handbrake);
     }
-    frame.buttons = state.buttons & SUBMIT_STATE_BUTTON_MASK;
+    // L1: the `SubmitState` mask (buttons 1–25) AND the device's own
+    // button mask both apply — a 10-button device must never report
+    // buttons 11–25 as pressed on this path.
+    frame.buttons = state.buttons & SUBMIT_STATE_BUTTON_MASK & caps.button_mask();
     frame
 }
 
@@ -537,6 +540,21 @@ mod tests {
         s.buttons = 1u32 << 25 | 1u32 << 31; // buttons 26 and 32
         let frame = build_gamepad_frame(&s, &HidMaestroCapabilities::custom_wheel());
         assert_eq!(frame.buttons, 0);
+    }
+
+    /// L1: the device button mask applies on the `SubmitState` path
+    /// too — a 10-button device reports only buttons 1–10, even
+    /// though `HMButton` has bits up to 25.
+    #[test]
+    fn gamepad_frame_buttons_masked_by_device_button_count() {
+        let caps = HidMaestroCapabilities::new(true, true, true, true, true, 10, true);
+        let mut s = OutputState::neutral();
+        s.buttons = u32::MAX;
+        let frame = build_gamepad_frame(&s, &caps);
+        assert_eq!(frame.buttons, 0x3FF); // buttons 1–10 only
+        let caps0 = HidMaestroCapabilities::new(true, true, true, true, true, 0, false);
+        let frame0 = build_gamepad_frame(&s, &caps0);
+        assert_eq!(frame0.buttons, 0);
     }
 
     #[test]

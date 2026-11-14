@@ -8,7 +8,7 @@ import {
   saveCalibration,
   type Calibration,
 } from "@/lib/tauri";
-import { Notice, NotImplementedNotice, StepIntro, describeError } from "./components";
+import { Notice, NotImplementedNotice, StepIntro, describeError, type StepProps } from "./components";
 
 /**
  * Step 5 — Calibrate (UI plan P5.3).
@@ -28,6 +28,69 @@ interface CalibrationForm {
   steeringCenterMv: string;
   pedalMinMv: Record<PedalKey, string>;
   pedalMaxMv: Record<PedalKey, string>;
+}
+
+export interface CalibrationValidation {
+  /** Field-level errors, keyed by field id (`steering`, `accel.min`, …). */
+  errors: Record<string, string>;
+  /**
+   * Pedals with BOTH fields empty: not errors — the pedal is missing
+   * and is omitted from the save instead of being saved as 0/0 (H10).
+   */
+  omittedPedals: PedalKey[];
+}
+
+export const CALIBRATION_MIN_MV = 0;
+export const CALIBRATION_MAX_MV = 3300;
+
+/**
+ * Validate a calibration form (H10, pure — unit-tested):
+ * - an empty field is invalid (an empty string used to parse as 0);
+ * - every value must be a number in 0..3300 mV;
+ * - each pedal's min must be below its max;
+ * - a pedal with both fields empty is omitted, never saved as 0/0.
+ * Error values are message keys into `setup.calibrate.*` (`empty`,
+ * `range`, `minMax`); the component translates them.
+ */
+export function validateCalibrationForm(
+  form: CalibrationForm,
+): CalibrationValidation {
+  const errors: Record<string, string> = {};
+  const omittedPedals: PedalKey[] = [];
+  const read = (raw: string): number | null => {
+    const trimmed = raw.trim();
+    if (trimmed === "") return null;
+    const value = Number(trimmed);
+    return Number.isFinite(value) ? value : null;
+  };
+  const steering = read(form.steeringCenterMv);
+  if (steering === null) {
+    errors["steering"] = "empty";
+  } else if (steering < CALIBRATION_MIN_MV || steering > CALIBRATION_MAX_MV) {
+    errors["steering"] = "range";
+  }
+  for (const pedal of PEDALS) {
+    const minRaw = form.pedalMinMv[pedal].trim();
+    const maxRaw = form.pedalMaxMv[pedal].trim();
+    if (minRaw === "" && maxRaw === "") {
+      omittedPedals.push(pedal);
+      continue;
+    }
+    const min = read(form.pedalMinMv[pedal]);
+    const max = read(form.pedalMaxMv[pedal]);
+    if (min === null) errors[`${pedal}.min`] = "empty";
+    else if (min < CALIBRATION_MIN_MV || min > CALIBRATION_MAX_MV) {
+      errors[`${pedal}.min`] = "range";
+    }
+    if (max === null) errors[`${pedal}.max`] = "empty";
+    else if (max < CALIBRATION_MIN_MV || max > CALIBRATION_MAX_MV) {
+      errors[`${pedal}.max`] = "range";
+    }
+    if (min !== null && max !== null && min >= max) {
+      errors[pedal] = "minMax";
+    }
+  }
+  return { errors, omittedPedals };
 }
 
 function emptyForm(): CalibrationForm {
@@ -54,7 +117,7 @@ function toForm(calibration: Calibration): CalibrationForm {
   };
 }
 
-export function CalibrateStep() {
+export function CalibrateStep({ onSuccessChange }: StepProps) {
   const { t } = useTranslation();
   const [loaded, setLoaded] = useState<Calibration | null>(null);
   const [form, setForm] = useState<CalibrationForm>(emptyForm);
@@ -63,6 +126,11 @@ export function CalibrateStep() {
     null,
   );
   const [saved, setSaved] = useState(false);
+
+  // H5: the step succeeds once a calibration has been saved.
+  useEffect(() => {
+    onSuccessChange?.(saved);
+  }, [saved, onSuccessChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -80,19 +148,41 @@ export function CalibrateStep() {
     };
   }, []);
 
+  const [formErrors, setFormErrors] = useState<Record<string, string>>({});
+  const [omittedNote, setOmittedNote] = useState<string | null>(null);
+
   function handleSave() {
+    const { errors, omittedPedals } = validateCalibrationForm(form);
+    setFormErrors(errors);
+    if (Object.keys(errors).length > 0) {
+      const first = Object.values(errors)[0];
+      setError({
+        notImplemented: false,
+        message:
+          first === "range"
+            ? t("setup.calibrate.rangeError")
+            : first === "minMax"
+              ? t("setup.calibrate.minMaxError")
+              : t("setup.calibrate.emptyError"),
+      });
+      return;
+    }
     const steeringCenterMv = Number(form.steeringCenterMv);
     const pedalMinMv: Record<string, number> = {};
     const pedalMaxMv: Record<string, number> = {};
     for (const pedal of PEDALS) {
+      // H10: a pedal left entirely empty is omitted, never saved as 0/0.
+      if (omittedPedals.includes(pedal)) continue;
       pedalMinMv[pedal] = Number(form.pedalMinMv[pedal]);
       pedalMaxMv[pedal] = Number(form.pedalMaxMv[pedal]);
     }
-    const allNumbers = [steeringCenterMv, ...Object.values(pedalMinMv), ...Object.values(pedalMaxMv)];
-    if (allNumbers.some((value) => !Number.isFinite(value))) {
-      setError({ notImplemented: false, message: t("setup.calibrate.invalidNumber") });
-      return;
-    }
+    setOmittedNote(
+      omittedPedals.length > 0
+        ? t("setup.calibrate.omittedPedals", {
+            pedals: omittedPedals.join(", "),
+          })
+        : null,
+    );
     setBusy(true);
     setError(null);
     setSaved(false);
@@ -109,7 +199,18 @@ export function CalibrateStep() {
   function handleCancel() {
     setSaved(false);
     setError(null);
+    setFormErrors({});
+    setOmittedNote(null);
     setForm(loaded === null ? emptyForm() : toForm(loaded));
+  }
+
+  /** Translate a validation error key for one field. */
+  function fieldError(field: string): string | null {
+    const key = formErrors[field];
+    if (!key) return null;
+    if (key === "range") return t("setup.calibrate.rangeError");
+    if (key === "minMax") return t("setup.calibrate.minMaxError");
+    return t("setup.calibrate.emptyError");
   }
 
   return (
@@ -125,11 +226,17 @@ export function CalibrateStep() {
           id="setup-steering-center"
           type="number"
           inputMode="numeric"
+          aria-invalid={formErrors["steering"] !== undefined}
           value={form.steeringCenterMv}
           onChange={(event) =>
             setForm((current) => ({ ...current, steeringCenterMv: event.target.value }))
           }
         />
+        {fieldError("steering") ? (
+          <p role="alert" className="text-[13px] text-[var(--error-text)]">
+            {fieldError("steering")}
+          </p>
+        ) : null}
       </div>
 
       {PEDALS.map((pedal) => (
@@ -144,6 +251,7 @@ export function CalibrateStep() {
                 id={`setup-${pedal}-min`}
                 type="number"
                 inputMode="numeric"
+                aria-invalid={formErrors[`${pedal}.min`] !== undefined}
                 value={form.pedalMinMv[pedal]}
                 onChange={(event) =>
                   setForm((current) => ({
@@ -152,6 +260,11 @@ export function CalibrateStep() {
                   }))
                 }
               />
+              {fieldError(`${pedal}.min`) ? (
+                <p role="alert" className="text-[13px] text-[var(--error-text)]">
+                  {fieldError(`${pedal}.min`)}
+                </p>
+              ) : null}
             </div>
             <div className="space-y-2">
               <Label htmlFor={`setup-${pedal}-max`}>{t("setup.calibrate.max")}</Label>
@@ -159,6 +272,7 @@ export function CalibrateStep() {
                 id={`setup-${pedal}-max`}
                 type="number"
                 inputMode="numeric"
+                aria-invalid={formErrors[`${pedal}.max`] !== undefined}
                 value={form.pedalMaxMv[pedal]}
                 onChange={(event) =>
                   setForm((current) => ({
@@ -167,8 +281,18 @@ export function CalibrateStep() {
                   }))
                 }
               />
+              {fieldError(`${pedal}.max`) ? (
+                <p role="alert" className="text-[13px] text-[var(--error-text)]">
+                  {fieldError(`${pedal}.max`)}
+                </p>
+              ) : null}
             </div>
           </div>
+          {fieldError(pedal) ? (
+            <p role="alert" className="text-[13px] text-[var(--error-text)]">
+              {fieldError(pedal)}
+            </p>
+          ) : null}
         </fieldset>
       ))}
 
@@ -182,6 +306,9 @@ export function CalibrateStep() {
       </div>
 
       {saved && <Notice tone="ok">{t("setup.calibrate.saved")}</Notice>}
+      {omittedNote !== null ? (
+        <Notice tone="info">{omittedNote}</Notice>
+      ) : null}
       {error?.notImplemented ? (
         <NotImplementedNotice />
       ) : error ? (

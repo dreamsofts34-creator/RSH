@@ -31,6 +31,9 @@ pub struct PingTracker {
     last_measurement: Option<PingMeasurement>,
     /// Rounds dropped because no reply arrived within the timeout.
     timeouts: u64,
+    /// Rounds superseded by a newer request before their reply arrived
+    /// (L6: also counted in [`Self::timeouts`]).
+    superseded: u64,
     /// Replies ignored because they were invalid (wrong `t0`, bad
     /// timestamps, wrong type).
     invalid_replies: u64,
@@ -45,6 +48,7 @@ impl PingTracker {
             outstanding: None,
             last_measurement: None,
             timeouts: 0,
+            superseded: 0,
             invalid_replies: 0,
         }
     }
@@ -54,9 +58,15 @@ impl PingTracker {
     /// Sequence is +1 per call and wraps past `u16::MAX`; `t1`/`t2`
     /// are 0 (the board fills them in). If a previous round is still
     /// outstanding it is superseded: its reply, if it ever arrives, is
-    /// stale and ignored.
+    /// stale and ignored — and the superseded round is counted as a
+    /// timeout (L6: a round that never got its reply is a timeout,
+    /// whether it was dropped by the 500 ms poll or by supersede).
     #[must_use]
     pub fn next_request(&mut self, now_us: u64) -> PingFrame {
+        if self.outstanding.is_some() {
+            self.timeouts += 1;
+            self.superseded += 1;
+        }
         let frame = PingFrame::request(self.next_seq, now_us);
         self.next_seq = self.next_seq.wrapping_add(1);
         self.outstanding = Some(frame);
@@ -144,6 +154,13 @@ impl PingTracker {
     #[must_use]
     pub const fn timeouts(&self) -> u64 {
         self.timeouts
+    }
+
+    /// Number of rounds superseded by a newer request (a subset of
+    /// [`Self::timeouts`]).
+    #[must_use]
+    pub const fn superseded(&self) -> u64 {
+        self.superseded
     }
 
     /// Number of replies ignored for invalid timestamps/type.
@@ -291,5 +308,27 @@ mod tests {
         let old_reply = PingFrame::reply(0, 1000, 1100, 1150);
         assert_eq!(tracker.on_reply(old_reply, 2_000_300), None);
         assert_eq!(tracker.last_measurement(), None);
+    }
+
+    #[test]
+    fn superseded_round_counts_as_timeout() {
+        // L6: superseding an outstanding round drops it — it never got
+        // a reply, so it is a timeout, not a silent disappearance.
+        let mut tracker = PingTracker::new();
+        assert_eq!(tracker.timeouts(), 0);
+        assert_eq!(tracker.superseded(), 0);
+        let _ = tracker.next_request(1000);
+        let _ = tracker.next_request(2_000_000); // supersedes seq 0
+        assert_eq!(tracker.timeouts(), 1);
+        assert_eq!(tracker.superseded(), 1);
+        // A reply for the live round still works and does not add more.
+        let reply = PingFrame::reply(1, 2_000_000, 2_000_100, 2_000_200);
+        assert!(tracker.on_reply(reply, 2_000_500).is_some());
+        assert_eq!(tracker.timeouts(), 1);
+        assert_eq!(tracker.superseded(), 1);
+        // No outstanding round: the next request supersedes nothing.
+        let _ = tracker.next_request(3_000_000);
+        assert_eq!(tracker.timeouts(), 1);
+        assert_eq!(tracker.superseded(), 1);
     }
 }

@@ -283,14 +283,19 @@ impl JitterHistogram {
     }
 }
 
-/// Least-squares slope of `values` over `times` (both seconds-based):
-/// units of value-per-second. Used for the soak memory-growth slope
-/// (bytes/second → MiB per 10 min). Returns 0.0 for < 2 samples.
+/// Least-squares slope plus its standard error (units of
+/// value-per-second). The standard error comes from the residual
+/// variance (`s² / Σ(t − t̄)²`, `n − 2` degrees of freedom); it is
+/// `0.0` when the fit is exact or the slope is undefined (< 3
+/// samples, or all times equal). A 60 s soak slope over ~6 samples is
+/// noisy — the SE is what says whether the slope is distinguishable
+/// from flat, so the rig reports it next to every slope (M-8).
+/// The slope alone is the first element (`slope_with_se(..).0`).
 #[must_use]
-pub fn slope_per_sec(times_s: &[f64], values: &[f64]) -> f64 {
+pub fn slope_with_se(times_s: &[f64], values: &[f64]) -> (f64, f64) {
     let n = times_s.len().min(values.len());
     if n < 2 {
-        return 0.0;
+        return (0.0, 0.0);
     }
     let n_f = n as f64;
     let mean_t = times_s[..n].iter().sum::<f64>() / n_f;
@@ -302,7 +307,64 @@ pub fn slope_per_sec(times_s: &[f64], values: &[f64]) -> f64 {
         num += dt * (values[i] - mean_v);
         den += dt * dt;
     }
-    if den == 0.0 { 0.0 } else { num / den }
+    if den == 0.0 {
+        return (0.0, 0.0);
+    }
+    let slope = num / den;
+    if n < 3 {
+        return (slope, 0.0);
+    }
+    // Residual variance: Σ(v − (v̄ + slope·(t − t̄)))² / (n − 2).
+    let mut rss = 0.0;
+    for i in 0..n {
+        let fit = mean_v + slope * (times_s[i] - mean_t);
+        let r = values[i] - fit;
+        rss += r * r;
+    }
+    let s2 = rss / (n_f - 2.0);
+    (slope, (s2 / den).sqrt())
+}
+
+/// Deterministic bootstrap confidence interval for the nearest-rank
+/// p99 of `samples` (µs): resample with replacement `resamples`
+/// times (seeded LCG — same input, same interval), take the p99 of
+/// each resample, and return the 2.5th / 97.5th percentiles of those
+/// p99s. Returns `None` for an empty slice. With ~200 ping samples
+/// the single p99 hides how wide the tail estimate is; the interval
+/// is the evidence (H-8). The interval is descriptive, not an SLO:
+/// the SLO still asserts on the p99 itself.
+#[must_use]
+pub fn bootstrap_p99_ci(samples: &[u64], resamples: usize, seed: u64) -> Option<(u64, u64)> {
+    if samples.is_empty() || resamples == 0 {
+        return None;
+    }
+    // LCG (Numerical Recipes constants); deterministic per seed.
+    let mut state = seed | 1;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 33) as usize
+    };
+    let n = samples.len();
+    let mut p99s: Vec<u64> = Vec::with_capacity(resamples);
+    let mut draw: Vec<u64> = Vec::with_capacity(n);
+    for _ in 0..resamples {
+        draw.clear();
+        for _ in 0..n {
+            draw.push(samples[next() % n]);
+        }
+        if let Some(p) = percentile_us(&draw, 99) {
+            p99s.push(p);
+        }
+    }
+    if p99s.is_empty() {
+        return None;
+    }
+    p99s.sort_unstable();
+    let lo = p99s[(p99s.len() * 25 / 1000).min(p99s.len() - 1)];
+    let hi = p99s[(p99s.len() * 975 / 1000).min(p99s.len() - 1)];
+    Some((lo, hi))
 }
 
 /// Resident set size in bytes, read from `/proc/self/status`
@@ -343,13 +405,17 @@ pub struct Sampler {
 
 impl Sampler {
     /// Create a sampler ticking every `interval` from now.
+    /// The sample buffer is pre-allocated (2048 entries ≈ 5.7 h at
+    /// 10 s) BEFORE the run's `reset_counts()`: sampling must add no
+    /// net heap growth inside the measured window (M-1), and a 4-hour
+    /// soak needs 1440 samples.
     #[must_use]
     pub fn new(interval: Duration) -> Self {
         Self {
             start: Instant::now(),
             interval,
             next: interval,
-            samples: Vec::new(),
+            samples: Vec::with_capacity(2048),
         }
     }
 
@@ -375,6 +441,33 @@ impl Sampler {
     /// (least squares). Used for the soak leak check.
     #[must_use]
     pub fn heap_slope_from(&self, from_s: f64) -> f64 {
+        self.heap_slope_se_from(from_s).0
+    }
+
+    /// RSS slope in bytes/second over samples at/after `from_s`.
+    #[must_use]
+    pub fn rss_slope_from(&self, from_s: f64) -> f64 {
+        self.rss_slope_se_from(from_s).0
+    }
+
+    /// Heap slope + standard error in bytes/second over samples
+    /// at/after `from_s` (least squares + residual SE, M-8).
+    #[must_use]
+    pub fn heap_slope_se_from(&self, from_s: f64) -> (f64, f64) {
+        let (times, vals) = self.heap_series_from(from_s);
+        slope_with_se(&times, &vals)
+    }
+
+    /// RSS slope + standard error in bytes/second over samples
+    /// at/after `from_s` (M-8).
+    #[must_use]
+    pub fn rss_slope_se_from(&self, from_s: f64) -> (f64, f64) {
+        let (times, vals) = self.rss_series_from(from_s);
+        slope_with_se(&times, &vals)
+    }
+
+    /// (times, heap values) at/after `from_s`.
+    fn heap_series_from(&self, from_s: f64) -> (Vec<f64>, Vec<f64>) {
         let times: Vec<f64> = self
             .samples
             .iter()
@@ -387,12 +480,11 @@ impl Sampler {
             .filter(|s| s.0 >= from_s)
             .map(|s| s.2 as f64)
             .collect();
-        slope_per_sec(&times, &vals)
+        (times, vals)
     }
 
-    /// RSS slope in bytes/second over samples at/after `from_s`.
-    #[must_use]
-    pub fn rss_slope_from(&self, from_s: f64) -> f64 {
+    /// (times, RSS values) at/after `from_s`.
+    fn rss_series_from(&self, from_s: f64) -> (Vec<f64>, Vec<f64>) {
         let times: Vec<f64> = self
             .samples
             .iter()
@@ -405,13 +497,13 @@ impl Sampler {
             .filter(|s| s.0 >= from_s)
             .map(|s| s.1 as f64)
             .collect();
-        slope_per_sec(&times, &vals)
+        (times, vals)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{JitterHistogram, Metrics, percentile_us, slope_per_sec};
+    use super::{JitterHistogram, Metrics, bootstrap_p99_ci, percentile_us, slope_with_se};
 
     #[test]
     fn percentile_nearest_rank() {
@@ -465,8 +557,50 @@ mod tests {
 
     #[test]
     fn slope_flat_is_zero() {
-        assert!(slope_per_sec(&[0.0, 1.0, 2.0], &[5.0, 5.0, 5.0]).abs() < 1e-9);
-        assert!((slope_per_sec(&[0.0, 1.0, 2.0], &[0.0, 2.0, 4.0]) - 2.0).abs() < 1e-9);
+        assert!(slope_with_se(&[0.0, 1.0, 2.0], &[5.0, 5.0, 5.0]).0.abs() < 1e-9);
+        assert!((slope_with_se(&[0.0, 1.0, 2.0], &[0.0, 2.0, 4.0]).0 - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn slope_se_is_zero_on_an_exact_line_and_positive_on_noise() {
+        // Exact line: residuals are 0, so the SE is 0.
+        let (slope, se) = slope_with_se(&[0.0, 1.0, 2.0, 3.0], &[0.0, 2.0, 4.0, 6.0]);
+        assert!((slope - 2.0).abs() < 1e-9);
+        assert!(se < 1e-9, "SE on an exact line: {se}");
+        // Noisy data around a flat line: slope ~0 but SE > 0.
+        let (_, se) = slope_with_se(&[0.0, 1.0, 2.0, 3.0], &[0.0, 10.0, 0.0, 10.0]);
+        assert!(se > 0.0, "SE on noisy data must be positive");
+        // < 3 samples: slope defined, SE reported as 0 (undefined).
+        let (slope, se) = slope_with_se(&[0.0, 1.0], &[0.0, 2.0]);
+        assert!((slope - 2.0).abs() < 1e-9);
+        assert_eq!(se, 0.0);
+    }
+
+    #[test]
+    fn bootstrap_p99_ci_brackets_the_p99_and_is_deterministic() {
+        // 200 samples, one slow tail value: nearest-rank p99 is the
+        // 198th value (ceil(0.99 * 200)) = 3000, so the single p99
+        // HIDES the 9000 tail — the bootstrap interval's upper bound
+        // (9000: ~63% of resamples draw the tail value at least once)
+        // is what reveals it. That is the whole point of the CI.
+        let mut samples: Vec<u64> = vec![3000; 199];
+        samples.push(9000);
+        let (lo, hi) = bootstrap_p99_ci(&samples, 200, 42).expect("CI");
+        let p99 = percentile_us(&samples, 99).expect("p99");
+        assert_eq!(p99, 3000);
+        assert_eq!((lo, hi), (3000, 9000));
+        assert!(
+            lo <= p99 && p99 <= hi,
+            "CI [{lo}, {hi}] must contain p99 {p99}"
+        );
+        assert_eq!(
+            bootstrap_p99_ci(&samples, 200, 42),
+            bootstrap_p99_ci(&samples, 200, 42),
+            "same seed, same interval"
+        );
+        assert_eq!(bootstrap_p99_ci(&[], 200, 42), None);
+        // Flat samples: the interval collapses to the single value.
+        assert_eq!(bootstrap_p99_ci(&[5000; 50], 200, 7), Some((5000, 5000)));
     }
 
     #[test]

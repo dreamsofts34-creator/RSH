@@ -88,11 +88,15 @@ pub enum Command {
     /// Submit one raw report (`SubmitRawReport` path). Hex-encoded bytes;
     /// length must equal the derived report size.
     SubmitRaw {
-        /// Base64-encoded report bytes.
-        report: String,
+        /// Hex-encoded report bytes (see [`bytes_to_hex`]).
+        bytes: String,
     },
-    /// Submit the neutral frame.
-    Neutral,
+    /// Submit the neutral frame. `raw: true` sends the 15-byte neutral
+    /// raw report instead of the `SubmitState` neutral frame.
+    Neutral {
+        /// True: neutral raw report; false: `SubmitState` neutral.
+        raw: bool,
+    },
     /// Dispose the controller + context (device removal).
     Dispose,
     /// Clean shutdown: reply `bye`, dispose, exit 0.
@@ -180,27 +184,56 @@ pub struct Reply {
     pub submit_count: Option<u64>,
 }
 
-/// Capabilities as the sidecar reports them after `create`.
-// Seven boolean flags are the honest shape of a capability set (see
-// `mapping::HidMaestroCapabilities`).
-#[allow(clippy::struct_excessive_bools)]
+/// Capabilities as the sidecar reports them after `create` — the REAL
+/// sidecar shape (`tools/rsh-hm-sidecar/PROTOCOL.md`, `create` reply):
+/// ```json
+/// {"axes":5,"buttons":32,"has_hat":true,"input_report_size":15,
+///  "submit_state_max_button":25,"submit_state_button_mask":33554431}
+/// ```
+/// `axes` is a COUNT (1 = X only, 5 = X/Y/Z/Rx/Slider all present);
+/// there are no per-axis booleans on the wire. The old shape
+/// (`has_axis_x` / … / `button_count`) never existed on the real
+/// sidecar — it was a Rust-side invention, and parsing it silently
+/// produced `axes: 0` caps for every real `create` reply (C2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct CapabilitiesJson {
-    /// X axis present.
-    pub has_axis_x: bool,
-    /// Y axis present.
-    pub has_axis_y: bool,
-    /// Z axis present.
-    pub has_axis_z: bool,
-    /// Rx axis present.
-    pub has_axis_rx: bool,
-    /// Slider axis present.
-    pub has_axis_slider: bool,
+    /// Axis count (0–5): 1 = X, 2 = +Y, 3 = +Z, 4 = +Rx, 5 = +Slider.
+    pub axes: i32,
     /// Button count.
-    pub button_count: i32,
+    pub buttons: i32,
     /// Hat present.
     pub has_hat: bool,
+    /// Derived input-report size in bytes (15 for `rsh-wheel-custom`).
+    pub input_report_size: Option<usize>,
+    /// Highest wheel button the `SubmitState` path carries (25).
+    pub submit_state_max_button: Option<i32>,
+    /// Bitmask for the `SubmitState` buttons (25 bits, `0x01FF_FFFF`).
+    pub submit_state_button_mask: Option<u32>,
+}
+
+impl CapabilitiesJson {
+    /// Derive [`crate::mapping::HidMaestroCapabilities`] from the
+    /// wire counts: axis `i` (0-based) is present exactly when
+    /// `axes > i` — so `axes == 5` means all five axes are present.
+    /// Out-of-range counts clamp (negative → no axes, > 5 → all five);
+    /// a `submit_state_max_button` / mask that contradicts the known
+    /// `SubmitState` limits (25 / `0x01FF_FFFF`) is ignored — the
+    /// derived caps describe the profile, not the sidecar's claim
+    /// about the submit path.
+    #[must_use]
+    pub fn to_capabilities(self) -> crate::mapping::HidMaestroCapabilities {
+        let axes = self.axes.clamp(0, 5);
+        crate::mapping::HidMaestroCapabilities::new(
+            axes >= 1,
+            axes >= 2,
+            axes >= 3,
+            axes >= 4,
+            axes >= 5,
+            self.buttons,
+            self.has_hat,
+        )
+    }
 }
 
 /// Encode bytes as lowercase hex (used for `submit-raw` reports —
@@ -247,14 +280,19 @@ pub fn parse_reply(line: &str) -> Result<Reply, HidMaestroError> {
 /// pin. On the TCP connect-back path the echoed token must match the
 /// token we issued.
 ///
+/// STRICT (C-SEC-1 / Security H-2): `ok`, `sdk` and `dll_sha256` are
+/// all REQUIRED — a hello that omits any of them is refused, so a
+/// compromised sidecar cannot dodge verification by staying silent.
+/// `ok` must be `true`; `sdk` must equal the pinned version;
+/// `dll_sha256` must equal the pinned DLL hash (case-insensitive);
+/// `dll_sha256_ok` must be `true` as well (the measurement is the
+/// evidence, the verdict is only the sidecar's claim about it — both
+/// must agree with the pin).
+///
 /// Identity is exact: at least one of `hello` / `sidecar` must be
 /// exactly `"rsh-hm-sidecar"` — any other value (including a
-/// present-but-wrong `sidecar`) fails. The DLL-hash verdict is
-/// required: a sidecar that omits `dll_sha256_ok` (and therefore the
-/// whole measurement) is refused, so a compromised sidecar cannot
-/// dodge verification by staying silent; and a measured hash that
-/// contradicts the pin fails even when the sidecar claims `ok: true`.
-/// The token echo is compared in constant time.
+/// present-but-wrong `sidecar`) fails. The token echo is compared in
+/// constant time.
 ///
 /// # Errors
 ///
@@ -263,6 +301,12 @@ pub fn parse_reply(line: &str) -> Result<Reply, HidMaestroError> {
 /// `VersionMismatch`) — never a bare boolean, so the caller can show
 /// the reason.
 pub fn validate_hello(reply: &Reply, expected_token: Option<&str>) -> Result<(), HidMaestroError> {
+    // C-SEC-1: a hello that reports failure is not a hello at all.
+    if !reply.ok {
+        return Err(HidMaestroError::BadHello(
+            "sidecar hello reported ok:false".to_string(),
+        ));
+    }
     let identified = reply.hello.as_deref() == Some("rsh-hm-sidecar")
         || reply.sidecar.as_deref() == Some("rsh-hm-sidecar");
     if !identified {
@@ -277,26 +321,38 @@ pub fn validate_hello(reply: &Reply, expected_token: Option<&str>) -> Result<(),
             "sidecar protocol v{protocol} is newer than supported v{PROTOCOL_VERSION} — update RSH"
         )));
     }
-    if let Some(sdk) = reply.sdk.as_deref()
-        && sdk != PINNED_VERSION
-    {
-        return Err(HidMaestroError::VersionMismatch {
-            found: sdk.to_string(),
-            pinned: PINNED_VERSION.to_string(),
-        });
+    // C-SEC-1: `sdk` is REQUIRED and must equal the pin — a hello
+    // without it has not proven which SDK build it runs.
+    match reply.sdk.as_deref() {
+        Some(sdk) if sdk == PINNED_VERSION => {}
+        Some(sdk) => {
+            return Err(HidMaestroError::VersionMismatch {
+                found: sdk.to_string(),
+                pinned: PINNED_VERSION.to_string(),
+            });
+        }
+        None => {
+            return Err(HidMaestroError::BadHello(
+                "sidecar did not report an SDK version".to_string(),
+            ));
+        }
     }
-    // The DLL-hash verdict is mandatory: a sidecar that reports no
-    // verdict (and no measurement) has not proven the DLL it loaded.
-    // When a measurement is present it must match the pin even if the
-    // sidecar claims `ok: true` — the measurement is the evidence,
-    // the verdict is only its claim about it.
-    if let Some(measured) = reply.dll_sha256.as_deref()
-        && !measured.eq_ignore_ascii_case(PINNED_DLL_SHA256)
-    {
-        return Err(HidMaestroError::DllHashMismatch {
-            expected: PINNED_DLL_SHA256.to_string(),
-            actual: measured.to_string(),
-        });
+    // C-SEC-1: `dll_sha256` is REQUIRED and must match the pin — the
+    // measurement is the evidence; a missing measurement is a refusal,
+    // not a pass. The verdict (`dll_sha256_ok`) must agree too.
+    match reply.dll_sha256.as_deref() {
+        Some(measured) if measured.eq_ignore_ascii_case(PINNED_DLL_SHA256) => {}
+        Some(measured) => {
+            return Err(HidMaestroError::DllHashMismatch {
+                expected: PINNED_DLL_SHA256.to_string(),
+                actual: measured.to_string(),
+            });
+        }
+        None => {
+            return Err(HidMaestroError::BadHello(
+                "sidecar did not report a DLL hash measurement".to_string(),
+            ));
+        }
     }
     match reply.dll_sha256_ok {
         Some(true) => {}
@@ -415,17 +471,33 @@ mod tests {
 
     #[test]
     fn encode_submit_raw_and_exit() {
+        // C1: the field is `bytes` (what the real sidecar reads) —
+        // `report` is rejected by the sidecar.
         assert_eq!(
             encode_command(&Command::SubmitRaw {
-                report: "AAEC".to_string()
+                bytes: "AAEC".to_string()
             })
             .unwrap(),
-            r#"{"cmd":"submit-raw","report":"AAEC"}"#
+            r#"{"cmd":"submit-raw","bytes":"AAEC"}"#
         );
         assert_eq!(encode_command(&Command::Exit).unwrap(), r#"{"cmd":"exit"}"#);
         assert_eq!(
             encode_command(&Command::InstallDriver).unwrap(),
             r#"{"cmd":"install-driver"}"#
+        );
+    }
+
+    #[test]
+    fn encode_neutral_carries_raw_flag() {
+        // L2: Rust sends `neutral` (watchdog / shutdown) with the raw
+        // flag, so the sidecar knows which neutral frame to send.
+        assert_eq!(
+            encode_command(&Command::Neutral { raw: false }).unwrap(),
+            r#"{"cmd":"neutral","raw":false}"#
+        );
+        assert_eq!(
+            encode_command(&Command::Neutral { raw: true }).unwrap(),
+            r#"{"cmd":"neutral","raw":true}"#
         );
     }
 
@@ -464,7 +536,7 @@ mod tests {
     #[test]
     fn validate_hello_good_passes() {
         let reply = parse_reply(
-            r#"{"ok":true,"hello":"rsh-hm-sidecar","sidecar":"rsh-hm-sidecar","sdk":"2.1.0","protocol":1,"dll_sha256_ok":true,"admin":true}"#,
+            r#"{"ok":true,"hello":"rsh-hm-sidecar","sidecar":"rsh-hm-sidecar","sdk":"2.1.0","protocol":1,"dll_sha256":"f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5","dll_sha256_ok":true,"admin":true}"#,
         )
         .unwrap();
         assert!(validate_hello(&reply, None).is_ok());
@@ -492,11 +564,13 @@ mod tests {
     }
 
     /// H1: the `sidecar` field alone identifies, but only with the
-    /// exact value.
+    /// exact value — and the strict hello still needs sdk + DLL hash.
     #[test]
     fn validate_hello_sidecar_field_alone_identifies() {
-        let reply =
-            parse_reply(r#"{"ok":true,"sidecar":"rsh-hm-sidecar","dll_sha256_ok":true}"#).unwrap();
+        let reply = parse_reply(
+            r#"{"ok":true,"sidecar":"rsh-hm-sidecar","sdk":"2.1.0","dll_sha256":"f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5","dll_sha256_ok":true}"#,
+        )
+        .unwrap();
         assert!(validate_hello(&reply, None).is_ok());
     }
 
@@ -517,7 +591,7 @@ mod tests {
     #[test]
     fn validate_hello_dll_hash_contradicts_verdict_fails() {
         let reply = parse_reply(
-            r#"{"ok":true,"hello":"rsh-hm-sidecar","dll_sha256_ok":true,"dll_sha256":"00"}"#,
+            r#"{"ok":true,"hello":"rsh-hm-sidecar","sdk":"2.1.0","dll_sha256_ok":true,"dll_sha256":"00"}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -538,7 +612,7 @@ mod tests {
     #[test]
     fn validate_hello_older_protocol_passes() {
         let reply = parse_reply(
-            r#"{"ok":true,"hello":"rsh-hm-sidecar","protocol":1,"dll_sha256_ok":true}"#,
+            r#"{"ok":true,"hello":"rsh-hm-sidecar","protocol":1,"sdk":"2.1.0","dll_sha256":"f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5","dll_sha256_ok":true}"#,
         )
         .unwrap();
         assert!(validate_hello(&reply, None).is_ok());
@@ -571,7 +645,7 @@ mod tests {
     #[test]
     fn validate_hello_token_checked_on_tcp_path() {
         let reply = parse_reply(
-            r#"{"ok":true,"hello":"rsh-hm-sidecar","dll_sha256_ok":true,"token":"abc"}"#,
+            r#"{"ok":true,"hello":"rsh-hm-sidecar","sdk":"2.1.0","dll_sha256":"f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5","dll_sha256_ok":true,"token":"abc"}"#,
         )
         .unwrap();
         assert!(validate_hello(&reply, Some("abc")).is_ok());
@@ -581,9 +655,114 @@ mod tests {
 
     #[test]
     fn validate_hello_missing_token_on_tcp_path_fails() {
-        let reply =
-            parse_reply(r#"{"ok":true,"hello":"rsh-hm-sidecar","dll_sha256_ok":true}"#).unwrap();
+        let reply = parse_reply(
+            r#"{"ok":true,"hello":"rsh-hm-sidecar","sdk":"2.1.0","dll_sha256":"f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5","dll_sha256_ok":true}"#,
+        )
+        .unwrap();
         assert!(validate_hello(&reply, Some("abc")).is_err());
+    }
+
+    /// C-SEC-1 / H-2: `ok: false` is refused even when every other
+    /// field is perfect — a hello that reports failure is not a hello.
+    #[test]
+    fn validate_hello_ok_false_fails() {
+        let reply = parse_reply(
+            r#"{"ok":false,"hello":"rsh-hm-sidecar","sdk":"2.1.0","dll_sha256":"f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5","dll_sha256_ok":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_hello(&reply, None),
+            Err(HidMaestroError::BadHello(_))
+        ));
+    }
+
+    /// C-SEC-1 / H-2: a missing `sdk` is refused — the sidecar must
+    /// prove which SDK build it runs, not stay silent about it.
+    #[test]
+    fn validate_hello_missing_sdk_fails() {
+        let reply = parse_reply(
+            r#"{"ok":true,"hello":"rsh-hm-sidecar","dll_sha256":"f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5","dll_sha256_ok":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_hello(&reply, None),
+            Err(HidMaestroError::BadHello(_))
+        ));
+    }
+
+    /// C-SEC-1 / H-2: a missing `dll_sha256` measurement is refused
+    /// even when the sidecar claims `dll_sha256_ok: true` — the
+    /// verdict without a measurement is not evidence.
+    #[test]
+    fn validate_hello_missing_dll_measurement_fails() {
+        let reply = parse_reply(
+            r#"{"ok":true,"hello":"rsh-hm-sidecar","sdk":"2.1.0","dll_sha256_ok":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_hello(&reply, None),
+            Err(HidMaestroError::BadHello(_))
+        ));
+    }
+
+    /// C2: the verbatim real-sidecar `create` capabilities shape
+    /// (PROTOCOL.md) parses, and `axes == 5` derives all five axes.
+    #[test]
+    fn capabilities_real_sidecar_shape_parses() {
+        let reply = parse_reply(
+            r#"{"ok":true,"created":true,"capabilities":{"axes":5,"buttons":32,"has_hat":true,"input_report_size":15,"submit_state_max_button":25,"submit_state_button_mask":33554431}}"#,
+        )
+        .unwrap();
+        let caps = reply.capabilities.expect("capabilities present");
+        assert_eq!(caps.axes, 5);
+        assert_eq!(caps.buttons, 32);
+        assert!(caps.has_hat);
+        assert_eq!(caps.input_report_size, Some(15));
+        assert_eq!(caps.submit_state_max_button, Some(25));
+        assert_eq!(caps.submit_state_button_mask, Some(0x01FF_FFFF));
+        assert_eq!(
+            caps.to_capabilities(),
+            crate::mapping::HidMaestroCapabilities::custom_wheel()
+        );
+    }
+
+    /// C2: axis counts derive per-axis presence (`axes == 1` is X
+    /// only; `axes == 3` is X/Y/Z); the old per-axis-boolean shape is
+    /// gone — an old-shape object parses as zero axes, never as a
+    /// full wheel.
+    #[test]
+    fn capabilities_axis_count_derives_axes() {
+        let one =
+            parse_reply(r#"{"ok":true,"capabilities":{"axes":1,"buttons":0,"has_hat":false}}"#)
+                .unwrap()
+                .capabilities
+                .unwrap()
+                .to_capabilities();
+        assert_eq!(
+            one,
+            crate::mapping::HidMaestroCapabilities::new(true, false, false, false, false, 0, false)
+        );
+        let three =
+            parse_reply(r#"{"ok":true,"capabilities":{"axes":3,"buttons":8,"has_hat":true}}"#)
+                .unwrap()
+                .capabilities
+                .unwrap()
+                .to_capabilities();
+        assert!(three.has_axis_x && three.has_axis_y && three.has_axis_z);
+        assert!(!three.has_axis_rx && !three.has_axis_slider);
+        assert_eq!(three.button_count, 8);
+        assert!(three.has_hat);
+        // Old shape (never sent by the real sidecar): no `axes` field
+        // → 0 axes, so a stale fixture can never masquerade as a wheel.
+        let stale = parse_reply(
+            r#"{"ok":true,"capabilities":{"has_axis_x":true,"has_axis_y":true,"has_axis_z":true,"has_axis_rx":true,"has_axis_slider":true,"button_count":32,"has_hat":true}}"#,
+        )
+        .unwrap()
+        .capabilities
+        .unwrap()
+        .to_capabilities();
+        assert!(!stale.has_axis_x);
+        assert_eq!(stale.button_count, 0);
     }
 
     #[test]

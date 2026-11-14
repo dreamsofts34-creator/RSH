@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rsh-telemetry = { path = "../rsh-telemetry" }
 serde.workspace = true
 serde_json.workspace = true
 

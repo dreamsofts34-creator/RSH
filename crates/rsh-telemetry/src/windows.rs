@@ -17,7 +17,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Memory::{
-    FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
+    FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    OpenFileMappingW, UnmapViewOfFile, VirtualQuery,
 };
 use windows::core::PCWSTR;
 
@@ -25,10 +26,14 @@ use crate::access::MapAccessor;
 
 /// A read-only view of one named file mapping.
 ///
-/// Opens with `OpenFileMappingW(FILE_MAP_READ)` and maps exactly `len`
-/// bytes (a partial view is legal — the view may be smaller than the
-/// mapping). The game memory is never written. `Drop` unmaps the view
-/// and closes the handle.
+/// Opens with `OpenFileMappingW(FILE_MAP_READ)` and maps the whole
+/// mapping, then probes its real size with `VirtualQuery` (L5): the
+/// requested `len` is a *minimum* — when the mapping is smaller than
+/// `len` the open fails instead of mapping a truncated view, so
+/// readers can never read past the end of a short mapping (a game
+/// update shrinking a shared block used to surface as garbage reads).
+/// The game memory is never written. `Drop` unmaps the view and closes
+/// the handle.
 pub(crate) struct SharedMemoryMap {
     handle: HANDLE,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
@@ -36,10 +41,11 @@ pub(crate) struct SharedMemoryMap {
 }
 
 impl SharedMemoryMap {
-    /// Opens the named file mapping read-only and maps `len` bytes.
+    /// Opens the named file mapping read-only and maps it.
     ///
     /// Returns `None` when the mapping does not exist (game not running
-    /// / session not loaded) or the view cannot be mapped.
+    /// / session not loaded), the view cannot be mapped, or the mapping
+    /// is smaller than the requested minimum `len`.
     pub(crate) fn open(name: &str, len: usize) -> Option<Self> {
         if len == 0 {
             return None;
@@ -48,12 +54,37 @@ impl SharedMemoryMap {
         let handle =
             unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR::from_raw(wide.as_ptr())) }
                 .ok()?;
-        let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, len) };
+        // Map the whole mapping (length 0) and probe the real size:
+        // a partial view hides a too-small mapping from the reader.
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ, 0, 0, 0) };
         if view.Value.is_null() {
             let _ = unsafe { CloseHandle(handle) };
             return None;
         }
-        Some(Self { handle, view, len })
+        let actual = unsafe {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            let queried = VirtualQuery(
+                Some(view.Value.cast_const()),
+                &mut info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+            if queried == 0 {
+                let _ = UnmapViewOfFile(view);
+                let _ = CloseHandle(handle);
+                return None;
+            }
+            info.RegionSize
+        };
+        if actual < len {
+            let _ = unsafe { UnmapViewOfFile(view) };
+            let _ = unsafe { CloseHandle(handle) };
+            return None;
+        }
+        Some(Self {
+            handle,
+            view,
+            len: actual,
+        })
     }
 
     /// Base pointer of the mapped view.

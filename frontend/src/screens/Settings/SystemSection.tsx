@@ -8,7 +8,10 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import {
+  checkForUpdate,
+  exportDiagnostics,
   getAutostart,
   getFirewallState,
   setAutostart,
@@ -42,6 +45,11 @@ export function SystemSection() {
     detail: string;
   } | null>(null);
   const [firewallFailed, setFirewallFailed] = useState(false);
+  // H9: update check + diagnostics export live here (Settings -> System).
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<string | null>(null);
+  const [exportingDiagnostics, setExportingDiagnostics] = useState(false);
+  const [diagnosticsStatus, setDiagnosticsStatus] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -80,6 +88,57 @@ export function SystemSection() {
       alive = false;
     };
   }, []);
+
+  async function handleCheckForUpdate() {
+    setCheckingUpdate(true);
+    setUpdateStatus(null);
+    try {
+      const update = await checkForUpdate();
+      setUpdateStatus(
+        update === null
+          ? st(t, "settings.system.updateUpToDate", "You are up to date.")
+          : st(t, "settings.system.updateAvailable", "Update {{version}} is available.", {
+              version: update.version,
+            }),
+      );
+    } catch {
+      setUpdateStatus(
+        st(
+          t,
+          "settings.system.updateCheckFailed",
+          "Could not check for updates.",
+        ),
+      );
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
+  async function handleExportDiagnostics() {
+    setExportingDiagnostics(true);
+    setDiagnosticsStatus(null);
+    try {
+      const path = await exportDiagnostics();
+      setDiagnosticsStatus(
+        st(
+          t,
+          "settings.system.diagnosticsExported",
+          "Diagnostics saved to {{path}}.",
+          { path },
+        ),
+      );
+    } catch {
+      setDiagnosticsStatus(
+        st(
+          t,
+          "settings.system.diagnosticsFailed",
+          "Could not export diagnostics.",
+        ),
+      );
+    } finally {
+      setExportingDiagnostics(false);
+    }
+  }
 
   async function handleToggle(enabled: boolean) {
     const previous = autostart;
@@ -214,6 +273,51 @@ export function SystemSection() {
             </span>
           )}
         </div>
+
+        <div className="flex flex-wrap gap-2 border-t border-[var(--line)] pt-4">
+          <Button
+            type="button"
+            variant="outline"
+            disabled={checkingUpdate}
+            onClick={() => void handleCheckForUpdate()}
+          >
+            {checkingUpdate
+              ? st(
+                  t,
+                  "settings.system.checkingUpdate",
+                  "Checking for updates…",
+                )
+              : st(t, "settings.system.checkUpdate", "Check for updates")}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={exportingDiagnostics}
+            onClick={() => void handleExportDiagnostics()}
+          >
+            {exportingDiagnostics
+              ? st(
+                  t,
+                  "settings.system.exportingDiagnostics",
+                  "Exporting diagnostics…",
+                )
+              : st(
+                  t,
+                  "settings.system.exportDiagnostics",
+                  "Export diagnostics",
+                )}
+          </Button>
+        </div>
+        {updateStatus !== null ? (
+          <p aria-live="polite" className="text-sm text-[var(--muted)]">
+            {updateStatus}
+          </p>
+        ) : null}
+        {diagnosticsStatus !== null ? (
+          <p aria-live="polite" className="text-sm text-[var(--muted)]">
+            {diagnosticsStatus}
+          </p>
+        ) : null}
 
         {status !== null ? (
           <p aria-live="polite" className="text-sm text-[var(--muted)]">

@@ -58,7 +58,10 @@ impl CarSource for TelemetryCarSource {
                 GameId::Unknown => continue,
             };
             let on_track = snapshot.state == SessionState::OnTrack;
-            return Some(CarReading::new(game_id, snapshot.car_display, on_track));
+            // H2: the canonical model (normalized by the reader), not
+            // the raw display string — the resolver matches on the
+            // canonical form.
+            return Some(CarReading::new(game_id, snapshot.car_model, on_track));
         }
         None
     }
@@ -109,7 +112,9 @@ mod tests {
         ]);
         let reading = source.current_car().expect("ACC snapshot read");
         assert_eq!(reading.game_id, GAME_ASSETTO_CORSA_COMPETIZIONE);
-        assert_eq!(reading.car_name, "Ferrari 488 GT3 Evo");
+        // H2: the adapter passes the canonical model, not the raw
+        // display string — the resolver matches on this form.
+        assert_eq!(reading.car_name, "ferrari_488_gt3_evo");
         assert!(reading.on_track);
     }
 

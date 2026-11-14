@@ -22,7 +22,7 @@ use crate::error::HidMaestroError;
 use crate::manager::{CreateInfo, HelloInfo, SidecarConfig, SidecarManager};
 use crate::mapping::{
     CUSTOM_RAW_REPORT_SIZE, HidMaestroCapabilities, build_gamepad_frame, build_raw_report,
-    neutral_gamepad_frame, neutral_raw_report, validate_capabilities,
+    validate_capabilities,
 };
 use crate::{IDENTITY_KEY, PINNED_VERSION, PROFILE_ID};
 
@@ -35,15 +35,24 @@ use crate::{IDENTITY_KEY, PINNED_VERSION, PROFILE_ID};
 pub const UAC_NOTE: &str = "HIDMaestro runs its helper elevated for the whole session — Windows will ask (UAC) on every launch while this backend is active. vJoy needs no prompt.";
 
 /// Configuration for [`HidMaestroOutput`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct HidMaestroConfig {
     /// Sidecar process config (path, elevation, timeouts).
     pub sidecar: SidecarConfig,
     /// Submit the 15-byte raw report instead of the `SubmitState` frame.
-    /// Default `false` (`SubmitState` — the SDK's documented abstract
-    /// frame). The raw path carries all 32 buttons; which path ships is
-    /// decided by the Windows gate H-HID-2.
+    /// Default `true` (M3 — the raw path carries all 32 buttons plus
+    /// encoder pulses' wire slot; the `SubmitState` path drops buttons
+    /// 26–32). The Output page shows which path is active.
     pub use_raw_report: bool,
+}
+
+impl Default for HidMaestroConfig {
+    fn default() -> Self {
+        Self {
+            sidecar: SidecarConfig::default(),
+            use_raw_report: true,
+        }
+    }
 }
 
 impl HidMaestroConfig {
@@ -52,7 +61,7 @@ impl HidMaestroConfig {
     pub fn with_sidecar_path(path: std::path::PathBuf) -> Self {
         Self {
             sidecar: SidecarConfig::with_path(path),
-            use_raw_report: false,
+            use_raw_report: true,
         }
     }
 }
@@ -204,8 +213,8 @@ impl HidMaestroOutput {
         self.last_error = None;
     }
 
-    /// Whether this backend submits raw reports (`true`) or `SubmitState`
-    /// frames (`false`, default).
+    /// Whether this backend submits raw reports (`true`, default) or
+    /// `SubmitState` frames (`false`).
     #[must_use]
     pub const fn use_raw_report(&self) -> bool {
         self.config.use_raw_report
@@ -278,12 +287,18 @@ impl HidMaestroOutput {
         self.status = HidMaestroStatus {
             kind: HidMaestroStateKind::Ready,
             message: format!(
-                "HIDMaestro ready — {} (driver {}, transport {}).",
+                "HIDMaestro ready — {} (driver {}, transport {}, {}).",
                 PROFILE_ID,
                 created.driver_version.as_deref().unwrap_or("?"),
                 created
                     .transport_index
-                    .map_or("?".to_string(), |i| i.to_string())
+                    .map_or("?".to_string(), |i| i.to_string()),
+                // M3: the Output page shows which submit path is live.
+                if self.config.use_raw_report {
+                    "raw-report submit (buttons 1–32)"
+                } else {
+                    "SubmitState submit (buttons 1–25)"
+                },
             ),
             sdk_version: self.manager.sdk_version(),
             driver_version: created.driver_version,
@@ -336,15 +351,11 @@ impl HidMaestroOutput {
     }
 
     fn send_neutral_inner(&mut self) -> Result<(), HidMaestroError> {
-        if self.config.use_raw_report {
-            neutral_raw_report(&self.current_caps(), &mut self.raw_report);
-            let report = self.raw_report;
-            self.manager.submit_raw(&report)?;
-        } else {
-            let frame = neutral_gamepad_frame(&self.current_caps());
-            self.manager.submit(frame)?;
-        }
-        Ok(())
+        // L2: Rust USES the sidecar's `neutral` command (with the raw
+        // flag matching the active submit path) instead of
+        // re-submitting a neutral frame — the sidecar owns the neutral
+        // frame for its own submit path.
+        self.manager.neutral(self.config.use_raw_report)
     }
 
     fn current_caps(&self) -> HidMaestroCapabilities {

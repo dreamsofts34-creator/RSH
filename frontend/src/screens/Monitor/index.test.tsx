@@ -50,6 +50,8 @@ function makeSnapshot(overrides: Partial<EngineSnapshot> = {}): EngineSnapshot {
     stats: engineStats,
     activeProfileId: "p1",
     seq: 1,
+    seqGap: 0,
+    txFail: 0,
     ...overrides,
   };
 }
@@ -100,19 +102,34 @@ describe("MonitorScreen", () => {
     await expect(screen.findByText("200 Hz")).resolves.toBeInTheDocument();
     expect(screen.getByText("0.5 %")).toBeInTheDocument();
     expect(screen.getByText("3.4 ms")).toBeInTheDocument();
-    const seqCell = screen.getByText("Sequence gaps").parentElement;
+    // C3: the board-reported counters render, never a locally counted gap.
+    const seqCell = screen.getByText("Board sequence gaps").parentElement;
     expect(seqCell?.textContent).toContain("0");
+    const txCell = screen.getByText("TX failures").parentElement;
+    expect(txCell?.textContent).toContain("0");
   });
 
-  it("sequence gaps are counted from seq jumps on the raw stream", async () => {
+  it("shows the board-reported seqGap/txFail from the snapshot (C3)", async () => {
     render(<MonitorScreen />);
-    fireSnapshot(makeSnapshot({ seq: 1 }));
+    fireSnapshot(makeSnapshot({ seqGap: 7, txFail: 3 }));
+    await screen.findByText("200 Hz");
+    await waitFor(() => {
+      const seqCell = screen.getByText("Board sequence gaps").parentElement;
+      expect(seqCell?.textContent).toContain("7");
+      const txCell = screen.getByText("TX failures").parentElement;
+      expect(txCell?.textContent).toContain("3");
+    });
+  });
+
+  it("a seq jump without a board counter change is NOT counted as loss (C3)", async () => {
+    render(<MonitorScreen />);
+    fireSnapshot(makeSnapshot({ seq: 1, seqGap: 0, txFail: 0 }));
     await screen.findByText("200 Hz");
     await sleep(150);
-    fireSnapshot(makeSnapshot({ seq: 4 }));
+    fireSnapshot(makeSnapshot({ seq: 4, seqGap: 0, txFail: 0 }));
     await waitFor(() => {
-      const seqCell = screen.getByText("Sequence gaps").parentElement;
-      expect(seqCell?.textContent).toContain("2");
+      const seqCell = screen.getByText("Board sequence gaps").parentElement;
+      expect(seqCell?.textContent).toContain("0");
     });
   });
 
@@ -158,6 +175,28 @@ describe("MonitorScreen", () => {
     expect(
       screen.getByText(/Encoder data is not available yet/),
     ).toBeInTheDocument();
+  });
+
+  it("encoders render from the snapshot when present (M12)", async () => {
+    render(<MonitorScreen />);
+    fireSnapshot(
+      makeSnapshot({
+        encoders: [
+          {
+            index: 0,
+            count: 12,
+            delta: 2,
+            cwButton: 65,
+            ccwButton: 66,
+            cwPressed: true,
+            ccwPressed: false,
+          },
+        ],
+        encoderButtons: [65],
+      }),
+    );
+    await expect(screen.findByText(/Encoder 1/)).resolves.toBeInTheDocument();
+    expect(screen.getByText(/12/)).toBeInTheDocument();
   });
 
   it("event log records connection changes from snapshots", async () => {

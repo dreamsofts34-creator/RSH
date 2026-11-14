@@ -181,7 +181,8 @@ fn try_connect_create_failed_then_fallback() {
 
 #[test]
 fn try_connect_with_plan_steering_only_minimal_caps() {
-    let caps = r#"{"has_axis_x":true,"has_axis_y":false,"has_axis_z":false,"has_axis_rx":false,"has_axis_slider":false,"button_count":0,"has_hat":false}"#;
+    // C2: real sidecar shape — `axes == 1` is steering (X) only.
+    let caps = r#"{"axes":1,"buttons":0,"has_hat":false,"input_report_size":15,"submit_state_max_button":25,"submit_state_button_mask":33554431}"#;
     let mut b = backend(&[("HM_STUB_CAPS_JSON", caps)]);
     let mut plan = PipelinePlan::default();
     plan.accelerator.enabled = false;
@@ -196,7 +197,10 @@ fn try_connect_with_plan_steering_only_minimal_caps() {
 
 #[test]
 fn try_connect_with_plan_missing_x_fails_and_relinquishes() {
-    let caps = r#"{"has_axis_x":false,"has_axis_y":true,"has_axis_z":true,"has_axis_rx":true,"has_axis_slider":true,"button_count":32,"has_hat":true}"#;
+    // C2: real sidecar shape — `axes == 0` means no steering axis at
+    // all (a count cannot express "every axis except X", and the real
+    // sidecar never sends that anyway: it is 5 or nothing).
+    let caps = r#"{"axes":0,"buttons":32,"has_hat":true,"input_report_size":15,"submit_state_max_button":25,"submit_state_button_mask":33554431}"#;
     let mut b = backend(&[("HM_STUB_CAPS_JSON", caps)]);
     let err = b
         .try_connect_with_plan(&PipelinePlan::default())
@@ -205,6 +209,17 @@ fn try_connect_with_plan_missing_x_fails_and_relinquishes() {
     assert!(!b.is_connected());
     assert_eq!(b.status().kind, HidMaestroStateKind::CreateFailed);
     assert!(b.status().message.contains("Steering"));
+}
+
+#[test]
+fn raw_report_path_is_the_default() {
+    // M3: raw reports ship by default, so buttons 26–32 + encoder
+    // pulses reach the game without any setting change.
+    let b = HidMaestroOutput::new();
+    assert!(b.use_raw_report());
+    assert!(HidMaestroConfig::default().use_raw_report);
+    let b2 = backend(&[]);
+    assert!(b2.use_raw_report());
 }
 
 #[test]
@@ -220,10 +235,24 @@ fn raw_report_path_submits_15_bytes() {
 }
 
 #[test]
+fn submit_state_path_still_available_when_opted_out() {
+    // Opting out of raw keeps the `SubmitState` path working (the
+    // neutral goes through the sidecar's `neutral` command either way).
+    let mut cfg = config(&[]);
+    cfg.use_raw_report = false;
+    let mut b = HidMaestroOutput::with_config(cfg);
+    assert!(!b.use_raw_report());
+    b.try_connect().unwrap();
+    b.update(&full_state()).unwrap();
+    assert_eq!(b.status().submit_count, 2, "neutral + one update");
+    b.disconnect();
+}
+
+#[test]
 fn crash_mid_session_marks_disconnected_then_fallback() {
     let mut b = backend(&[("HM_STUB_CRASH_AFTER_SUBMITS", "1")]);
-    b.try_connect().unwrap(); // neutral submit #1 lands
-    let err = b.update(&full_state()).unwrap_err(); // submit #2 crashes
+    b.try_connect().unwrap(); // neutral (Neutral cmd) lands
+    let err = b.update(&full_state()).unwrap_err(); // submit #1 crashes
     assert!(matches!(err, VJoyError::DriverNotFound(_)));
     assert!(!b.is_connected());
     assert_eq!(b.status().kind, HidMaestroStateKind::SidecarFailed);

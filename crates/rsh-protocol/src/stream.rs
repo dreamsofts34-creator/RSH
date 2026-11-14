@@ -92,11 +92,56 @@ pub struct StreamFrame {
 impl StreamFrame {
     /// Build a frame from axis values given as `(slot, mV)` pairs.
     ///
+    /// Non-panicking constructor: returns
+    /// [`StreamError::BadFrame`] when an axis slot is `>= 8`, more
+    /// than 4 encoders are given, or the same slot appears twice.
+    /// Prefer this over [`StreamFrame::new`] for any input that is
+    /// not already proven in-range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamError::BadFrame`] for an out-of-range axis
+    /// slot, more than 4 encoders, or a duplicated axis slot.
+    pub fn try_new(
+        seq: u16,
+        timestamp_us: u32,
+        flags: StreamFlags,
+        axes: &[(usize, u16)],
+        encoders: &[i16],
+        buttons: u32,
+    ) -> Result<Self, StreamError> {
+        if axes.len() > MAX_AXES || encoders.len() > MAX_ENCODERS {
+            return Err(StreamError::BadFrame);
+        }
+        let mut axes_mv = [None; MAX_AXES];
+        for &(slot, mv) in axes {
+            if slot >= MAX_AXES || axes_mv[slot].is_some() {
+                return Err(StreamError::BadFrame);
+            }
+            axes_mv[slot] = Some(mv);
+        }
+        let mut enc = [0i16; MAX_ENCODERS];
+        enc[..encoders.len()].copy_from_slice(encoders);
+        Ok(Self {
+            seq,
+            timestamp_us,
+            flags,
+            axes_mv,
+            encoders: enc,
+            n_enc: encoders.len(),
+            buttons,
+        })
+    }
+
+    /// Build a frame from axis values given as `(slot, mV)` pairs.
+    ///
     /// # Panics
     ///
     /// Panics if a slot is `>= 8` or more than 4 encoders are given.
     /// Callers that take untrusted input must check bounds first; the
-    /// parser never calls this with out-of-range data.
+    /// parser never calls this with out-of-range data. Prefer
+    /// [`StreamFrame::try_new`] — this constructor is kept only for
+    /// existing callers outside the engine/transport crates.
     #[must_use]
     pub fn new(
         seq: u16,
@@ -106,24 +151,8 @@ impl StreamFrame {
         encoders: &[i16],
         buttons: u32,
     ) -> Self {
-        assert!(axes.len() <= MAX_AXES, "at most 8 axes");
-        assert!(encoders.len() <= MAX_ENCODERS, "at most 4 encoders");
-        let mut axes_mv = [None; MAX_AXES];
-        for &(slot, mv) in axes {
-            assert!(slot < MAX_AXES, "axis slot out of range");
-            axes_mv[slot] = Some(mv);
-        }
-        let mut enc = [0i16; MAX_ENCODERS];
-        enc[..encoders.len()].copy_from_slice(encoders);
-        Self {
-            seq,
-            timestamp_us,
-            flags,
-            axes_mv,
-            encoders: enc,
-            n_enc: encoders.len(),
-            buttons,
-        }
+        Self::try_new(seq, timestamp_us, flags, axes, encoders, buttons)
+            .expect("StreamFrame::new called with out-of-range axes/encoders")
     }
 
     /// Bitmask of the axes present in this frame.
@@ -429,7 +458,55 @@ impl StatusPacket {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamFlags, is_legacy};
+    use super::{StreamError, StreamFlags, StreamFrame, is_legacy};
+
+    #[test]
+    fn try_new_accepts_valid_and_rejects_out_of_range() {
+        // L4: the non-panicking constructor.
+        assert!(
+            StreamFrame::try_new(1, 5000, StreamFlags::default(), &[(0, 1650)], &[10], 0).is_ok()
+        );
+        assert_eq!(
+            StreamFrame::try_new(1, 5000, StreamFlags::default(), &[(8, 1650)], &[], 0),
+            Err(StreamError::BadFrame)
+        );
+        assert_eq!(
+            StreamFrame::try_new(1, 5000, StreamFlags::default(), &[], &[1, 2, 3, 4, 5], 0),
+            Err(StreamError::BadFrame)
+        );
+        assert_eq!(
+            StreamFrame::try_new(
+                1,
+                5000,
+                StreamFlags::default(),
+                &[(0, 100), (0, 200)],
+                &[],
+                0
+            ),
+            Err(StreamError::BadFrame)
+        );
+        // Boundary: 8 axes / 4 encoders are fine.
+        assert!(
+            StreamFrame::try_new(
+                1,
+                5000,
+                StreamFlags::default(),
+                &[
+                    (0, 1),
+                    (1, 2),
+                    (2, 3),
+                    (3, 4),
+                    (4, 5),
+                    (5, 6),
+                    (6, 7),
+                    (7, 8)
+                ],
+                &[1, 2, 3, 4],
+                0
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn flags_round_trip() {

@@ -93,6 +93,8 @@ function makeSnapshot(overrides: Partial<EngineSnapshot> = {}): EngineSnapshot {
     stats: engineStats,
     activeProfileId: "p1",
     seq: 1,
+    seqGap: 0,
+    txFail: 0,
     ...overrides,
   };
 }

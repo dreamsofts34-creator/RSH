@@ -24,7 +24,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -104,26 +104,64 @@ pub fn spawn_stdio(
     let (tx, rx) = channel();
     spawn_line_reader(BufReader::new(stdout), tx);
 
+    // The child's stdin + handle are shared with the writer thread
+    // (H4): the thread owns the writes, the manager-side kill path
+    // owns the terminate — either side can end the child, and killing
+    // the child unblocks a writer thread stuck on a full pipe.
+    let stdin_shared: Arc<Mutex<Option<ChildStdin>>> = Arc::new(Mutex::new(Some(stdin)));
+    let child_shared: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
+    let inner: Box<dyn TransportWriter> = Box::new(StdioWriter {
+        stdin: Arc::clone(&stdin_shared),
+        child: Arc::clone(&child_shared),
+    });
+    let stdin_kill = Arc::clone(&stdin_shared);
+    let child_kill = Arc::clone(&child_shared);
+    let writer = queue_writer(
+        inner,
+        Box::new(move || kill_stdio(&stdin_kill, &child_kill)),
+    );
+
     Ok(LiveTransport {
-        writer: Box::new(StdioWriter {
-            stdin: Some(stdin),
-            child: Some(child),
-        }),
+        writer,
         events: rx,
         stderr_lines,
     })
 }
 
+/// Close a stdio child's stdin (EOF → clean sidecar exit) and
+/// terminate + reap the child. Idempotent: both handles are `take()`n.
+fn kill_stdio(stdin: &Arc<Mutex<Option<ChildStdin>>>, child: &Arc<Mutex<Option<Child>>>) {
+    // A poisoned mutex still holds the handle — recover it rather
+    // than leaving a child alive because a writer thread panicked.
+    let mut stdin_guard = stdin
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    drop(stdin_guard.take());
+    drop(stdin_guard);
+    let mut child_guard = child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(mut child) = child_guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// The write half of a stdio transport: the child's stdin plus the
-/// child handle (for kill/reap).
+/// child handle (for kill/reap). Both are shared with the manager-side
+/// kill closure ([`kill_stdio`]) — see [`spawn_stdio`].
 struct StdioWriter {
-    stdin: Option<ChildStdin>,
-    child: Option<Child>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 impl TransportWriter for StdioWriter {
     fn write_line(&mut self, line: &str) -> std::io::Result<()> {
-        let Some(stdin) = self.stdin.as_mut() else {
+        let mut guard = self
+            .stdin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(stdin) = guard.as_mut() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "sidecar stdin is closed",
@@ -135,13 +173,7 @@ impl TransportWriter for StdioWriter {
     }
 
     fn kill(&mut self) {
-        // Close stdin first: a well-behaved sidecar sees EOF, disposes
-        // the device and exits cleanly on its own.
-        drop(self.stdin.take());
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        kill_stdio(&self.stdin, &self.child);
     }
 }
 
@@ -163,6 +195,14 @@ pub fn listen_loopback() -> std::io::Result<(TcpListener, u16)> {
 /// live transport. The peer must be the sidecar we just spawned; the
 /// token check happens at the `hello` layer ([`crate::protocol`]).
 ///
+/// L4: the peer address must be loopback — a non-loopback connection
+/// is dropped and the wait continues (the listener only binds
+/// `127.0.0.1`, so this is defence in depth). On Windows,
+/// `expected_pid` (the spawned sidecar's PID) is additionally verified
+/// against the TCP table ([`verify_loopback_peer_pid`]) — a foreign
+/// local process that guesses the port + token window cannot pose as
+/// the sidecar (C-TOK-1 / Security H-1).
+///
 /// # Errors
 ///
 /// Returns [`std::io::ErrorKind::TimedOut`] when nobody connects in
@@ -170,12 +210,26 @@ pub fn listen_loopback() -> std::io::Result<(TcpListener, u16)> {
 pub fn accept_loopback(
     listener: &TcpListener,
     timeout: Duration,
+    expected_pid: Option<u32>,
 ) -> std::io::Result<LiveTransport> {
     listener.set_nonblocking(true)?;
     let deadline = Instant::now() + timeout;
     let stream = loop {
         match listener.accept() {
-            Ok((stream, _)) => break stream,
+            Ok((stream, addr)) => {
+                // L4: loopback only.
+                if !addr.ip().is_loopback() {
+                    drop(stream);
+                    continue;
+                }
+                #[cfg(windows)]
+                if let Some(pid) = expected_pid {
+                    verify_loopback_peer_pid(&stream, pid)?;
+                }
+                #[cfg(not(windows))]
+                let _ = expected_pid;
+                break stream;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     return Err(std::io::Error::new(
@@ -190,20 +244,127 @@ pub fn accept_loopback(
     };
     stream.set_nodelay(true)?;
     let read_half = stream.try_clone()?;
+    // The write half shares the socket for shutdown: killing the
+    // transport shuts the socket down, which unblocks a writer thread
+    // stuck on a hung sidecar (H4, TCP side).
+    let peer = Arc::new(stream.try_clone()?);
     let (tx, rx) = channel();
     spawn_line_reader(BufReader::new(read_half), tx);
-    Ok(LiveTransport {
-        writer: Box::new(TcpWriter {
+    let peer_kill = Arc::clone(&peer);
+    let writer = queue_writer(
+        Box::new(TcpWriter {
             stream: Some(BufWriter::new(stream)),
+            peer,
         }),
+        Box::new(move || {
+            let _ = peer_kill.shutdown(std::net::Shutdown::Both);
+        }),
+    );
+    Ok(LiveTransport {
+        writer,
         events: rx,
         stderr_lines: Arc::new(Mutex::new(VecDeque::new())),
     })
 }
 
+/// Windows-only (C-TOK-1): verify that the accepted loopback socket's
+/// remote peer is the process `expected_pid` — via
+/// `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_CONNECTIONS)`. Fail closed:
+/// no matching row, or a different owner PID, refuses the connection.
+#[cfg(windows)]
+fn verify_loopback_peer_pid(stream: &TcpStream, expected_pid: u32) -> std::io::Result<()> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_CONNECTIONS,
+    };
+    use windows::Win32::Networking::WinSock::AF_INET;
+
+    let local_port = stream.local_addr()?.port();
+    let remote_port = stream.peer_addr()?.port();
+    // Ports in the TCP table are network byte order in the low 16 bits.
+    let table_port = |raw: u32| -> u16 { (raw as u16).swap_bytes() };
+    // `127.0.0.1` as a little-endian u32, as the table stores it.
+    const LOOPBACK_ADDR: u32 = 0x0100_007F;
+    // `MIB_TCP_STATE_ESTABLISHED`.
+    const ESTABLISHED: u32 = 5;
+
+    let mut size: u32 = 0;
+    // SAFETY: first call with a null table only queries the size
+    // (`ERROR_INSUFFICIENT_BUFFER` is the expected outcome).
+    let rc = unsafe {
+        GetExtendedTcpTable(
+            None,
+            &mut size,
+            false,
+            AF_INET.0 as u32,
+            TCP_TABLE_OWNER_PID_CONNECTIONS,
+            0,
+        )
+    };
+    if rc != 122 && rc != 0 {
+        return Err(std::io::Error::other(format!(
+            "GetExtendedTcpTable size query failed (Win32 {rc})"
+        )));
+    }
+    if size == 0 {
+        return Err(std::io::Error::other(
+            "GetExtendedTcpTable returned an empty table",
+        ));
+    }
+    let mut buf = vec![0u8; size as usize];
+    // SAFETY: `buf` is a live byte buffer of the declared size; the
+    // table is read back through `MIB_TCPROW_OWNER_PID` rows below.
+    let rc = unsafe {
+        GetExtendedTcpTable(
+            Some(buf.as_mut_ptr().cast::<std::ffi::c_void>()),
+            &mut size,
+            false,
+            AF_INET.0 as u32,
+            TCP_TABLE_OWNER_PID_CONNECTIONS,
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::other(format!(
+            "GetExtendedTcpTable failed (Win32 {rc})"
+        )));
+    }
+    let count = u32::from_ne_bytes(buf[0..4].try_into().unwrap_or([0; 4])) as usize;
+    let row_size = std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
+    for i in 0..count {
+        let offset = 4 + i * row_size;
+        if offset + row_size > buf.len() {
+            break;
+        }
+        // SAFETY: bounds-checked above; the row is `#[repr(C)]` and
+        // `Copy`, so an unaligned read is sound.
+        let row: MIB_TCPROW_OWNER_PID =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset).cast()) };
+        if row.dwState == ESTABLISHED
+            && table_port(row.dwLocalPort) == local_port
+            && table_port(row.dwRemotePort) == remote_port
+            && row.dwRemoteAddr == LOOPBACK_ADDR
+        {
+            if row.dwOwningPid == expected_pid {
+                return Ok(());
+            }
+            return Err(std::io::Error::other(format!(
+                "loopback peer is PID {}, not the spawned sidecar PID {expected_pid}",
+                row.dwOwningPid
+            )));
+        }
+    }
+    Err(std::io::Error::other(
+        "no TCP table row for the loopback peer — refusing the connection",
+    ))
+}
+
 /// The write half of a TCP-loopback transport.
 struct TcpWriter {
     stream: Option<BufWriter<TcpStream>>,
+    /// A second handle to the same socket, used only to shut it down
+    /// from the kill path (unblocks a writer thread stuck on a hung
+    /// sidecar — H4, TCP side).
+    peer: Arc<TcpStream>,
 }
 
 impl TransportWriter for TcpWriter {
@@ -225,7 +386,80 @@ impl TransportWriter for TcpWriter {
                 .into_inner()
                 .map(|s| s.shutdown(std::net::Shutdown::Both));
         }
+        let _ = self.peer.shutdown(std::net::Shutdown::Both);
     }
+}
+
+/// H4 — a dedicated writer thread + bounded queue, so the engine
+/// thread never blocks on a hung sidecar's pipe.
+///
+/// Commands are queued (capacity [`WRITER_QUEUE_CAPACITY`]) and a
+/// single writer thread drains them in order. `write_line` enqueues
+/// without blocking: a full queue fails fast with `TimedOut` instead
+/// of stalling the 200 Hz tick — the manager treats that as a sidecar
+/// death and fails over. `kill` drops the queue and runs `on_kill`
+/// (close stdin / shut the socket / terminate the child), which
+/// unblocks a writer thread stuck mid-write; the thread then calls
+/// the inner writer's `kill` (idempotent) and exits.
+const WRITER_QUEUE_CAPACITY: usize = 4;
+
+struct QueuedWriter {
+    tx: Option<SyncSender<String>>,
+    on_kill: Option<Box<dyn Fn() + Send>>,
+}
+
+impl TransportWriter for QueuedWriter {
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sidecar writer is gone",
+            ));
+        };
+        // Non-blocking enqueue (`send_timeout` is unstable on this
+        // toolchain): a full queue means the sidecar stopped reading,
+        // and the engine thread must fail fast — not wait — so the
+        // manager can treat it as a sidecar death and fail over.
+        tx.try_send(line.to_string()).map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(_) => std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "sidecar write queue full — sidecar is not reading",
+            ),
+            std::sync::mpsc::TrySendError::Disconnected(_) => std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sidecar writer thread is gone",
+            ),
+        })
+    }
+
+    fn kill(&mut self) {
+        // Drop the queue first: the writer thread sees the disconnect
+        // after its current write, then kills the inner writer.
+        drop(self.tx.take());
+        if let Some(on_kill) = self.on_kill.take() {
+            on_kill();
+        }
+    }
+}
+
+fn queue_writer(
+    inner: Box<dyn TransportWriter>,
+    on_kill: Box<dyn Fn() + Send>,
+) -> Box<dyn TransportWriter> {
+    let (tx, rx) = sync_channel::<String>(WRITER_QUEUE_CAPACITY);
+    std::thread::spawn(move || {
+        let mut inner = inner;
+        while let Ok(line) = rx.recv() {
+            if inner.write_line(&line).is_err() {
+                break;
+            }
+        }
+        inner.kill();
+    });
+    Box::new(QueuedWriter {
+        tx: Some(tx),
+        on_kill: Some(on_kill),
+    })
 }
 
 /// Maximum bytes of one sidecar line (protocol or stderr). A
@@ -403,9 +637,32 @@ mod tests {
     #[test]
     fn loopback_accept_times_out_without_peer() {
         let (listener, _port) = listen_loopback().unwrap();
-        match accept_loopback(&listener, Duration::from_millis(50)) {
+        match accept_loopback(&listener, Duration::from_millis(50), None) {
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
             Ok(_) => panic!("expected a timeout, got a connection"),
         }
+    }
+
+    /// L4: a non-loopback peer cannot be tested from this process
+    /// (the listener binds 127.0.0.1), but a loopback peer IS
+    /// accepted — the happy path the PID check builds on.
+    #[test]
+    fn loopback_accept_accepts_loopback_peer() {
+        let (listener, port) = listen_loopback().unwrap();
+        let handle =
+            std::thread::spawn(move || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let transport = accept_loopback(&listener, Duration::from_secs(5), None).unwrap();
+        let _peer = handle.join().unwrap();
+        drop(transport);
+    }
+
+    /// H4: the writer thread + bounded queue accept lines without
+    /// blocking the caller, even when the reader never reads.
+    #[test]
+    fn queued_writer_does_not_block_on_unread_pipe() {
+        // `/bin/cat` reads stdin but never replies — the queue must
+        // still accept lines (the reader thread is irrelevant here).
+        let transport = spawn_stdio(Path::new("/bin/cat"), &[], &[]).unwrap();
+        drop(transport);
     }
 }

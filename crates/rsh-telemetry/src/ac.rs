@@ -48,6 +48,8 @@ pub const STATIC_MIN_LEN: usize = STATIC_TRACK_OFFSET + WSTR_LEN * 2;
 pub const GRAPHICS_STATUS_OFFSET: usize = 4;
 /// Minimum graphics-block size: must cover the `status` field (4 + 4).
 pub const GRAPHICS_MIN_LEN: usize = GRAPHICS_STATUS_OFFSET + 4;
+/// Byte offset of `packetId` in the graphics block (M3 pairing key).
+pub const GRAPHICS_PACKET_ID_OFFSET: usize = 0;
 
 /// `AC_STATUS` values (Kunos docs; shared by AC and ACC).
 pub const AC_STATUS_OFF: i32 = 0;
@@ -118,21 +120,38 @@ fn parse_graphics_state(map: &dyn MapAccessor) -> Option<SessionState> {
     Some(ac_status_to_state(status))
 }
 
+/// Reads the graphics `packetId` (M3 pairing key).
+fn read_packet_id(map: &dyn MapAccessor) -> Option<i32> {
+    read_i32(map, GRAPHICS_PACKET_ID_OFFSET)
+}
+
 /// Reads one Kunos (AC or ACC) identity snapshot from two map accessors.
 ///
 /// Pure and platform-independent: on Windows the caller passes the live
 /// mapped views; in tests it passes [`SliceMap`](crate::access::SliceMap)
 /// over recorded fixture bytes. Returns `None` when either map is
 /// missing/short/torn, or when no car name is present — never panics.
+///
+/// M3 pairing: the static and graphics blocks are paired by the
+/// graphics `packetId` — the id is read before the static block and
+/// again after it, and a changed id rejects the snapshot (the game
+/// wrote a new frame between the two reads, so the car and the state
+/// may belong to different frames). The paired id is carried on the
+/// snapshot (`packet_id`) for diagnostics.
 #[must_use]
 pub fn read_kunos_snapshot(
     static_map: &dyn MapAccessor,
     graphics_map: &dyn MapAccessor,
     game: GameId,
 ) -> Option<TelemetrySnapshot> {
+    let packet_before = read_packet_id(graphics_map)?;
     let (car, track) = parse_static(static_map)?;
     let state = parse_graphics_state(graphics_map)?;
-    Some(TelemetrySnapshot::new(game, &car, &track, state))
+    let packet_after = read_packet_id(graphics_map)?;
+    if packet_before != packet_after {
+        return None;
+    }
+    Some(TelemetrySnapshot::new(game, &car, &track, state).with_packet_id(packet_after))
 }
 
 #[cfg(test)]
@@ -278,5 +297,58 @@ mod tests {
             .expect("menu snapshot must still parse");
         assert_eq!(snap.state, SessionState::Menu);
         assert!(!snap.is_on_track());
+    }
+
+    #[test]
+    fn kunos_snapshot_carries_paired_packet_id() {
+        let static_bytes = static_block("ferrari_488_gt3", "monza");
+        let graphics_bytes = graphics_block(AC_STATUS_LIVE);
+        let snap = snapshot(&static_bytes, &graphics_bytes, GameId::AssettoCorsa)
+            .expect("fixture must parse");
+        assert_eq!(snap.packet_id, 1, "graphics fixture packetId is 1");
+    }
+
+    /// Accessor whose graphics `packetId` flips mid-read: the game
+    /// wrote a new frame between the static and graphics reads.
+    struct FlippingPacketMap {
+        bytes: Vec<u8>,
+        reads: std::cell::Cell<u32>,
+    }
+
+    impl crate::access::MapAccessor for FlippingPacketMap {
+        fn len(&self) -> usize {
+            self.bytes.len()
+        }
+
+        fn read_into(&self, offset: usize, buf: &mut [u8]) -> bool {
+            let n = self.reads.get();
+            self.reads.set(n + 1);
+            // The first 4 reads see packetId 1 (two consistent reads
+            // for the pre-static check); later reads see packetId 2.
+            let mut bytes = self.bytes.clone();
+            if n >= 4 {
+                bytes[0..4].copy_from_slice(&2_i32.to_le_bytes());
+            }
+            let Some(slice) = bytes.get(offset..offset + buf.len()) else {
+                return false;
+            };
+            buf.copy_from_slice(slice);
+            true
+        }
+    }
+
+    #[test]
+    fn kunos_snapshot_rejects_packet_id_change_between_blocks() {
+        let static_bytes = static_block("ferrari_488_gt3", "monza");
+        let graphics_bytes = graphics_block(AC_STATUS_LIVE);
+        let static_map = SliceMap::new(&static_bytes);
+        let graphics_map = FlippingPacketMap {
+            bytes: graphics_bytes,
+            reads: std::cell::Cell::new(0),
+        };
+        assert!(
+            read_kunos_snapshot(&static_map, &graphics_map, GameId::AssettoCorsa).is_none(),
+            "M3: a packetId change between static and graphics rejects the snapshot"
+        );
     }
 }

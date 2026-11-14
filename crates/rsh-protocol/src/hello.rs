@@ -194,6 +194,15 @@ impl HelloReply {
         if data[4] != 2 || data[5] != 1 {
             return Err(HelloError::BadVersion);
         }
+        // L3: reserved flag bits (4–7) must be 0, and the session echo
+        // is a single bit (0/1) — anything else is a malformed HELLO,
+        // not a board to pair with.
+        if data[6] & 0xF0 != 0 {
+            return Err(HelloError::RsvNonzero);
+        }
+        if data[7] > 1 {
+            return Err(HelloError::BadVersion);
+        }
         if data[17] != 0 {
             return Err(HelloError::RsvNonzero);
         }
@@ -388,5 +397,45 @@ mod tests {
         assert!(!reply.credentials_present());
         reply.flags = 0x08; // paired, window open
         assert!(!reply.credentials_present());
+    }
+
+    #[test]
+    fn reserved_flag_bits_rejected_as_rsv_nonzero() {
+        use super::HelloError;
+        // L3: flags bits 4–7 are reserved and must be 0.
+        for flags in [0x10u8, 0x20, 0x80, 0xF0, 0x19] {
+            let mut reply = paired_reply();
+            reply.flags = flags;
+            let bytes = reply.encode();
+            assert_eq!(
+                HelloReply::parse(&bytes),
+                Err(HelloError::RsvNonzero),
+                "flags {flags:#04x} must be rejected"
+            );
+        }
+        // Defined bits (0–3) still parse.
+        let mut reply = paired_reply();
+        reply.flags = 0x0F;
+        assert!(HelloReply::parse(&reply.encode()).is_ok());
+    }
+
+    #[test]
+    fn session_echo_above_one_rejected_as_bad_version() {
+        use super::HelloError;
+        for echo in [2u8, 3, 255] {
+            let mut reply = paired_reply();
+            reply.session_echo = echo;
+            let bytes = reply.encode();
+            assert_eq!(
+                HelloReply::parse(&bytes),
+                Err(HelloError::BadVersion),
+                "session_echo {echo} must be rejected"
+            );
+        }
+        for echo in [0u8, 1] {
+            let mut reply = paired_reply();
+            reply.session_echo = echo;
+            assert!(HelloReply::parse(&reply.encode()).is_ok());
+        }
     }
 }

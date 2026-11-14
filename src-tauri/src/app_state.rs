@@ -102,6 +102,9 @@ impl AppState {
                         SnapshotEmit::ButtonPress(event) => {
                             let _ = handle.emit(BUTTON_PRESS_EVENT, event);
                         }
+                        SnapshotEmit::AppEvent(name, payload) => {
+                            let _ = handle.emit(name.as_str(), payload);
+                        }
                     },
                     &stop,
                 );

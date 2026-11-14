@@ -220,6 +220,24 @@ static uint8_t pick_channel() {
 #endif
 }
 
+// SEC-R2-03 (Phase 2 M-2): khula AP (pairing window) abhi chal raha hai?
+static bool apIsOpen = false;
+
+// Pairing window (AP-up se 60 s) guzar jaye aur board abhi tak pair na
+// hua ho to khula AP band karo aur WPA2 par le jao (generated password,
+// keystore se). Har net_poll() par check hota hai.
+static void net_lock_ap_after_pairing_window() {
+  if (!apIsOpen || !keystore_unpaired()) return;
+  if (keystore_pairing_open(millis())) return;
+  udpHello.stop();
+  udpCtrl.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.softAP(WIFI_SSID, keystore_password(), currentChannel, 0, 4);
+  udpHello.begin(PORT_HELLO);
+  udpCtrl.begin(PORT_CTRL);
+  apIsOpen = false;
+}
+
 // AP + sockets ek channel par shuru karo. Pehli pairing tak AP KHULA hai
 // (§4.2 — pairing ke baad WPA2, password per-device keystore se).
 // keystore_begin() setup mein pehle ho chuka hona chahiye.
@@ -231,6 +249,7 @@ static bool net_start_ap_and_sockets(uint8_t ch) {
   else apOk = WiFi.softAP(WIFI_SSID, keystore_password(), ch, 0, 4);
   // max 4 stations: PC (data) + phone/PC browser (Web OTA) ek saath jur saken
   if (!apOk) return false;
+  apIsOpen = open;  // M-2: WPA2 AP khula nahi kehlata
 #if RSH_SET_TX_POWER
   WiFi.setTxPower(TX_POWER);   // softAP ke BAAD (vendor doc ke mutabiq)
 #endif
@@ -269,7 +288,22 @@ static bool net_start_ap_and_sockets(uint8_t ch) {
 // doosre peer ko dobara HELLO (naya session) + GET_CAPS karna hoga.
 // Yehi wajah hai ke dual-transport mein aam tor par ek waqt mein ek hi
 // transport istemal hota hai (§10).
-static void net_new_session() {
+//
+// SEC-R2-04 (Phase 2 M-3): rate limit — jab koi authenticated session
+// active ho to naya session sirf 10 s mein ek dafa ban sakta hai.
+// Baghair is ke ek peer har packet par sessionFlag=1 bhej kar nonce
+// rotate karwa sakta hai aur doosre peer (ya khud ke purane counters)
+// ko bar bar invalid kar sakta hai — DoS. Unauthenticated peer (pairing
+// ke waqt) par limit nahi lagti, taake pehli HELLO kabhi block na ho.
+static void net_new_session(uint32_t nowMs) {
+  static uint32_t lastNewSessionMs = 0;
+  static bool haveNewSession = false;
+  if (haveNewSession && (sessionAuthenticated || serialSessionAuthenticated) &&
+      (uint32_t)(nowMs - lastNewSessionMs) < 10000u) {
+    return;
+  }
+  lastNewSessionMs = nowMs;
+  haveNewSession = true;
   keystore_rotate_nonce();
   rsh_ctrl_session_init(&ctrlSession);
   rsh_ctrl_cache_init(&ctrlCache);
@@ -410,6 +444,8 @@ void net_maybe_rescan(uint32_t nowMs) {
 }
 
 void net_poll() {
+  // M-2: pairing window guzar jaye to khula AP WPA2 par lock ho jaye.
+  net_lock_ap_after_pairing_window();
   // Per call cap: datagram flood sampler ko starve na kare (audit fix).
   // Har datagram ke baad flush() lazmi hai — core mein jab tak pichla
   // rx_buffer mojood ho, parsePacket() hamesha 0 deta hai; sirf 128 byte
@@ -457,7 +493,7 @@ void net_poll() {
 
     // Naya session: nonce rotate + control session reset (§2.3/§3.2).
     // Routine HELO (sessionFlag 0) purana nonce wapas deta hai.
-    if (sessionFlag == 1) net_new_session();
+    if (sessionFlag == 1) net_new_session(nowMs);
 
     // HELLO reply rate limit (SEC-D-08): 500 ms mein ek se zyada nahi.
     if (!rsh_hello_reply_allowed((uint32_t)(nowMs - lastHelloReplyMs))) continue;
@@ -500,7 +536,8 @@ bool net_send(const uint8_t *buf, size_t len) {
 // table hi jeet-ti hai; fallback compiled default) + capsFlags.
 // REBOOT (0x09): reply ke BAAD restart (SEC-D-01 — RSTX khatam).
 // SET_CFG / COMMIT / CONFIRM / REVERT / GET_CFG (FW-4), KEY_RESET
-// (FW-3, 0x0B), SET_PASSWORD (Phase E WS5, 0x0C) aur LED_TEST
+// (FW-3, 0x0B), SET_PASSWORD (Phase E WS5, 0x0C), FACTORY_RESET
+// (Phase 2 M-5, 0x08 — config defaults, key ko haath nahi) aur LED_TEST
 // (Phase F WS5, 0x0A): ctrl_handlers.h ko delegate (rsh_fw34_handler) —
 // txn + armed state rsh.ino se, NVS persist + clock callbacks se.
 static uint8_t net_ctrl_handler(uint8_t cmd, const uint8_t *payload, uint16_t len,
@@ -523,6 +560,7 @@ static uint8_t net_ctrl_handler(uint8_t cmd, const uint8_t *payload, uint16_t le
     case RSH_CMD_COMMIT:
     case RSH_CMD_CONFIRM:
     case RSH_CMD_REVERT:
+    case RSH_CMD_FACTORY_RESET:  // Phase 2 M-5: config defaults, key untouched
     case RSH_CMD_KEY_RESET:
     case RSH_CMD_SET_PASSWORD:  // Phase E WS5: fw34_password_cb -> deferred NVS + AP restart
     case RSH_CMD_LED_TEST: {    // Phase F WS5: LED_TEST 0x0A — pattern validate;
@@ -655,6 +693,7 @@ static void net_restart_ap_with_new_password() {
   udpCtrl.stop();
   WiFi.softAPdisconnect(true);
   WiFi.softAP(WIFI_SSID, keystore_password(), currentChannel, 0, 4);
+  apIsOpen = false;  // M-2: password set ke baad AP hamesha WPA2 hai
   udpHello.begin(PORT_HELLO);
   udpCtrl.begin(PORT_CTRL);
   // udpData send-only hai (begin nahi hota) — dobara begin ki zaroorat nahi.
@@ -818,7 +857,7 @@ size_t net_serial_helo(const uint8_t *helo, size_t len, uint32_t nowMs,
   serialLastHelloMs = nowMs;
   serialLastHelloProto = proto;
   if (proto != 0x02) return 0;  // legacy v1: koi HELLO reply nahi (§2.1)
-  if (sessionFlag == 1) net_new_session();  // naya nonce + dono sessions reset
+  if (sessionFlag == 1) net_new_session(nowMs);  // naya nonce + dono sessions reset
   // HELLO reply rate limit (SEC-D-08 jaisa): 500 ms mein ek se zyada nahi.
   if (!rsh_hello_reply_allowed((uint32_t)(nowMs - serialLastHelloReplyMs))) return 0;
   serialLastHelloReplyMs = nowMs;

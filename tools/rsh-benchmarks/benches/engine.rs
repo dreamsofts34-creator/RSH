@@ -76,6 +76,17 @@ fn run_pipeline_ticks(
 
 /// Run `iters` full hot-path ticks (parse + sequence check + watchdog
 /// + pipeline) over the cycling inputs, returning an output checksum.
+///
+/// `seq` is the tracker's monotonic sequence counter, advanced once
+/// per tick: the fixture cycles 1024 frames whose seqs repeat
+/// (0..1023), and feeding `frame.seq` to the tracker replays old
+/// seqs — which L8 correctly classifies as duplicates, so after the
+/// first cycle the bench would measure the cheap duplicate path
+/// (early return, no loss-window push) instead of the real accept
+/// path. The frame itself still goes through the pipeline unchanged.
+// The 8 args are the full hot-path state; a struct would only hide
+// the call sites. (clippy: too_many_arguments)
+#[allow(clippy::too_many_arguments)]
 fn run_hot_path_ticks(
     pipeline: &mut ProcessingPipeline,
     tracker: &mut SequenceTracker,
@@ -83,6 +94,7 @@ fn run_hot_path_ticks(
     now: Instant,
     inputs: &[rsh_benchmarks::fixture::TickInput],
     index: &mut usize,
+    seq: &mut u16,
     iters: u64,
 ) -> u64 {
     let mut checksum: u64 = 0;
@@ -90,7 +102,8 @@ fn run_hot_path_ticks(
         let input = &inputs[*index % INPUT_COUNT];
         *index += 1;
         let frame = StreamFrame::parse(black_box(&input.bytes)).expect("fixed input parses");
-        let _decision = tracker.check(frame.seq);
+        let _decision = tracker.check(*seq);
+        *seq = seq.wrapping_add(1);
         watchdog.tick(now);
         let _stale = watchdog.is_stale(now);
         let out = pipeline.process(black_box(&frame));
@@ -122,6 +135,7 @@ fn bench_timing(c: &mut Criterion, inputs: &[rsh_benchmarks::fixture::TickInput]
         let mut watchdog = Watchdog::new();
         let now = Instant::now();
         let mut index = 0usize;
+        let mut seq: u16 = 0;
         let _warmup = run_hot_path_ticks(
             &mut pipeline,
             &mut tracker,
@@ -129,6 +143,7 @@ fn bench_timing(c: &mut Criterion, inputs: &[rsh_benchmarks::fixture::TickInput]
             now,
             inputs,
             &mut index,
+            &mut seq,
             64,
         );
         b.iter(|| {
@@ -139,6 +154,7 @@ fn bench_timing(c: &mut Criterion, inputs: &[rsh_benchmarks::fixture::TickInput]
                 now,
                 inputs,
                 &mut index,
+                &mut seq,
                 1,
             );
             black_box(checksum);
@@ -162,6 +178,39 @@ fn bench_timing(c: &mut Criterion, inputs: &[rsh_benchmarks::fixture::TickInput]
             seq = seq.wrapping_add(1);
             watchdog.tick(now);
             black_box(watchdog.is_stale(now));
+        });
+    });
+
+    // M-7: the maximum-size sequence gap, timed. A forward jump of
+    // delta 32767 is the largest `check()` classifies as a gap
+    // (`delta <= u16::MAX / 2`); it yields `Gap(32766)` — a
+    // `Gap(32767)` can never occur, because delta 32768 crosses the
+    // half-range boundary and is a reboot rebaseline instead. The
+    // tracker records the gap arithmetically (`record_outcome` fills
+    // the 1000-entry window in one shot for `lost >= 1000`), so one
+    // max-gap check must cost ~a microsecond, not 32766 loop
+    // iterations. The per-skipped-packet loop that DID exist is in
+    // the engine (`handle_frame`, `for _ in 0..skipped`), NOT the
+    // tracker — the engine side is already fixed
+    // (`EngineMetrics::record_gap` → `LossWindow::record_many`, L1;
+    // see the Phase 2 report).
+    c.bench_function("sequence_gap_max", |b| {
+        let mut tracker = SequenceTracker::new();
+        // Warm the loss window so the timed check measures the
+        // steady-state arithmetic path, not window fill.
+        let mut seq: u16 = 0;
+        for _ in 0..2000 {
+            let _decision = tracker.check(seq);
+            seq = seq.wrapping_add(1);
+        }
+        b.iter(|| {
+            // Jump from the last ACCEPTED seq (`seq - 1`): the
+            // warm-up accepted 0..=1999, so `seq` is 2000 and the
+            // first target is 1999 + 32767.
+            let target = seq.wrapping_sub(1).wrapping_add(32767);
+            let decision = tracker.check(black_box(target));
+            assert_eq!(decision, rsh_engine::sequence::SeqDecision::Gap(32766));
+            seq = target.wrapping_add(1);
         });
     });
 }
@@ -198,6 +247,7 @@ fn bench_alloc_probes(c: &mut Criterion, inputs: &[rsh_benchmarks::fixture::Tick
         let mut watchdog = Watchdog::new();
         let now = Instant::now();
         let mut index = 0usize;
+        let mut seq: u16 = 0;
         // Warm up pipeline state AND the tracker's loss window, so the
         // probe measures steady-state ticks (see module docs).
         let _warmup = run_hot_path_ticks(
@@ -207,6 +257,7 @@ fn bench_alloc_probes(c: &mut Criterion, inputs: &[rsh_benchmarks::fixture::Tick
             now,
             inputs,
             &mut index,
+            &mut seq,
             2000,
         );
         b.iter_custom(|iters| {
@@ -219,6 +270,7 @@ fn bench_alloc_probes(c: &mut Criterion, inputs: &[rsh_benchmarks::fixture::Tick
                 now,
                 inputs,
                 &mut index,
+                &mut seq,
                 iters,
             );
             let elapsed = start.elapsed();

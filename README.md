@@ -70,7 +70,7 @@ want the vJoy fallback.
   board.
 - **New / blank ESP32 DevKit V1 board, or a board that will not boot**:
   flash the merged factory image `RSH-Firmware-DevKitV1-v4.0.1.bin`
-  (955,056 B) — see the [Flash Guide](docs/FLASH-GUIDE.md) (user
+  (955,984 B) — see the [Flash Guide](docs/FLASH-GUIDE.md) (user
   procedure) and the detailed [Reflash Guide](docs/REFLASH-GUIDE.md).
 - Firmware images are **signed only** — unsigned or downgrade images
   are rejected by the board.

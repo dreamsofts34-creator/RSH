@@ -14,6 +14,11 @@ tauri.workspace = true
 tauri-plugin-single-instance.workspace = true
 tauri-plugin-autostart.workspace = true
 tauri-plugin-updater.workspace = true
+# M13 (deep-scan Round 2): native file picker (Setup firmware step).
+# The frontend imports `@tauri-apps/plugin-dialog` 2.8.4; without
+# this registration `open()` rejects and the step falls back to the
+# typed path. Capability: `dialog:default` (see capabilities/).
+tauri-plugin-dialog.workspace = true
 rsh-app-core = { path = "../crates/rsh-app-core" }
 
 # Windows-only: the `windows` crate does not compile on Linux

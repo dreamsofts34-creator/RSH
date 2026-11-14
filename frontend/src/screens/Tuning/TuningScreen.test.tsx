@@ -58,6 +58,8 @@ function makeSnapshot(
     },
     activeProfileId: null,
     seq: 1,
+    seqGap: 0,
+    txFail: 0,
     ...overrides,
   };
 }
@@ -109,7 +111,7 @@ beforeEach(() => {
   settingsResponse = {
     modules: {
       steering: true,
-      accel: true,
+      accelerator: true,
       brake: true,
       clutch: true,
       handbrake: true,
@@ -223,7 +225,9 @@ describe("TuningScreen cards", () => {
       await screen.findByRole("heading", { name: "Brake" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Steering" })).toBeNull();
-    expect(screen.getAllByRole("slider")).toHaveLength(5);
+    // C4: Brake has one more slider than Steering — the bite-point
+    // control (deadzone, curve, smoothing, min, max, bite point).
+    expect(screen.getAllByRole("slider")).toHaveLength(6);
 
     fireEvent.click(cardButton("Brake"));
     await waitFor(() =>

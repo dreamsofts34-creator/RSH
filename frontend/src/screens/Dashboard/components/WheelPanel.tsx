@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { useTranslation } from "react-i18next";
 import type { EngineSnapshot } from "@/lib/tauri";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -36,7 +37,7 @@ function PedalRow({
  * The clutch bar renders only when the snapshot carries a clutch channel
  * (a null clutch means the board has no clutch — never a fake bar).
  */
-export function WheelPanel({ snapshot }: WheelPanelProps) {
+function WheelPanelInner({ snapshot }: WheelPanelProps) {
   const { t } = useTranslation();
   const angle = snapshot ? clampAngle(snapshot.steeringDeg) : 0;
 
@@ -96,3 +97,7 @@ export function WheelPanel({ snapshot }: WheelPanelProps) {
     </Card>
   );
 }
+
+/** Memoised: the Dashboard re-renders at 30 Hz from the snapshot feed
+ *  (H4) — this component only re-renders when its own props change. */
+export const WheelPanel = memo(WheelPanelInner);

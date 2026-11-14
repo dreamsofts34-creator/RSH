@@ -103,13 +103,17 @@ impl Discovery {
         }
     }
 
-    /// The cached mDNS answer, if one is still fresh.
+    /// The cached mDNS answer, if one is still fresh. An expired
+    /// entry is dropped (L5: the next `resolve_board` re-resolves
+    /// instead of serving a stale address — the cache never outlives
+    /// its TTL).
     fn cached_mdns(&self) -> Option<IpAddr> {
-        let guard = self.cache.lock().ok()?;
+        let mut guard = self.cache.lock().ok()?;
         let (ip, at) = (*guard)?;
         if at.elapsed() < self.cache_ttl {
             Some(ip)
         } else {
+            *guard = None;
             None
         }
     }
@@ -159,12 +163,15 @@ impl Discovery {
 }
 
 /// Prefer an IPv4 answer (the board is IPv4); otherwise take any address.
+///
+/// L5: the answer set is a `HashSet`, whose iteration order is
+/// nondeterministic — the pick is sorted (IPv4 first, then by
+/// address) so the same mDNS answer always resolves to the same IP
+/// instead of a different one per run.
 fn pick_board_ip(addresses: &HashSet<ScopedIp>) -> Option<IpAddr> {
-    addresses
-        .iter()
-        .find(|ip| ip.is_ipv4())
-        .or_else(|| addresses.iter().next())
-        .map(ScopedIp::to_ip_addr)
+    let mut sorted: Vec<IpAddr> = addresses.iter().map(ScopedIp::to_ip_addr).collect();
+    sorted.sort_by_key(|ip| (!ip.is_ipv4(), *ip));
+    sorted.into_iter().next()
 }
 
 impl Default for Discovery {
@@ -213,5 +220,52 @@ mod tests {
             "resolve took {:?} with a 100 ms mDNS timeout",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn pick_board_ip_prefers_ipv4_and_sorts_deterministically() {
+        // L5: same answer set, same pick, every run — IPv4 first,
+        // then lowest address.
+        use std::net::Ipv6Addr;
+        let mut addresses = HashSet::new();
+        addresses.insert(ScopedIp::from(IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1,
+        ))));
+        addresses.insert(ScopedIp::from(IpAddr::V4(Ipv4Addr::new(192, 168, 4, 2))));
+        addresses.insert(ScopedIp::from(IpAddr::V4(Ipv4Addr::new(192, 168, 4, 1))));
+        for _ in 0..10 {
+            assert_eq!(
+                pick_board_ip(&addresses),
+                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 4, 1)))
+            );
+        }
+        // IPv6 only: lowest IPv6 wins, deterministically.
+        let mut v6only = HashSet::new();
+        v6only.insert(ScopedIp::from(IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 2,
+        ))));
+        v6only.insert(ScopedIp::from(IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1,
+        ))));
+        assert_eq!(
+            pick_board_ip(&v6only),
+            Some(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)))
+        );
+        assert_eq!(pick_board_ip(&HashSet::new()), None);
+    }
+
+    #[test]
+    fn expired_cache_is_dropped_and_re_resolves() {
+        // L5: after the TTL the cached answer is gone — the next
+        // resolve re-queries instead of serving the stale IP.
+        let discovery =
+            Discovery::new(IpAddr::V4(DEFAULT_BOARD_IP)).with_cache_ttl(Duration::from_millis(10));
+        discovery.store_cache(IpAddr::V4(Ipv4Addr::new(192, 168, 4, 9)));
+        assert_eq!(
+            discovery.cached_mdns(),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 4, 9)))
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(discovery.cached_mdns(), None);
     }
 }

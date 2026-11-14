@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 rsh-protocol = { path = "../crates/rsh-protocol" }
+rsh-engine = { path = "../crates/rsh-engine" }
 
 # cargo-fuzz needs a nightly toolchain (`cargo +nightly fuzz ...`).
 # This crate is not a workspace member: it is only built by cargo-fuzz.
@@ -30,3 +31,7 @@ path = "fuzz_targets/pin_validator.rs"
 [[bin]]
 name = "config_blob_validator"
 path = "fuzz_targets/config_blob_validator.rs"
+
+[[bin]]
+name = "sequence_pipeline"
+path = "fuzz_targets/sequence_pipeline.rs"

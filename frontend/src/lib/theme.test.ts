@@ -81,6 +81,54 @@ describe("theme switching", () => {
       "system",
     ]);
   });
+
+  it("follows the OS scheme while the theme is 'system' (M14)", async () => {
+    // Fresh module state per test file: the watcher installs once.
+    const { installSystemThemeWatcher } = await import("./theme");
+    // Boxed: TS control-flow analysis does not track assignments made
+    // inside the matchMedia mock's callback, so a plain `let` narrows
+    // to `null` and can never be called.
+    const box: { handler: (() => void) | null } = { handler: null };
+    let dark = false;
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query === "(prefers-color-scheme: dark)" ? dark : false,
+      media: query,
+      addEventListener: (_event: string, fn: () => void) => {
+        box.handler = fn;
+      },
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    try {
+      storeTheme("system");
+      installSystemThemeWatcher();
+      expect(box.handler).not.toBeNull();
+      // OS flips to dark: the resolved theme follows without a reload.
+      dark = true;
+      window.matchMedia = ((query: string) => ({
+        matches: query === "(prefers-color-scheme: dark)",
+        media: query,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      })) as unknown as typeof window.matchMedia;
+      if (box.handler === null) {
+        throw new Error("system theme watcher did not register");
+      }
+      box.handler();
+      expect(document.documentElement.getAttribute("data-theme")).toBe(
+        "dark",
+      );
+    } finally {
+      window.matchMedia = original;
+      storeTheme("light");
+      applyTheme("light");
+    }
+  });
+
+  it("clutch chart colour is >= 3:1 on the light card (H8)", () => {
+    const tokens = THEME_TOKENS.light;
+    expect(contrastRatio(tokens["--chart-clutch"], tokens["--card"])).toBeGreaterThanOrEqual(3);
+  });
 });
 
 describe("theme tokens resolve + WCAG-AA contrast", () => {

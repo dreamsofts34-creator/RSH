@@ -82,7 +82,15 @@ fn hot_path_allocates_zero_bytes_per_tick() {
         let _decision = tracker.check(seq);
         seq = seq.wrapping_add(1);
     }
-    let _warmup = run_hot_path(&mut pipeline, &mut tracker, &mut watchdog, now, &inputs, 64);
+    let _warmup = run_hot_path(
+        &mut pipeline,
+        &mut tracker,
+        &mut watchdog,
+        now,
+        &inputs,
+        &mut seq,
+        64,
+    );
     reset_counts();
     let measured = run_hot_path(
         &mut pipeline,
@@ -90,6 +98,7 @@ fn hot_path_allocates_zero_bytes_per_tick() {
         &mut watchdog,
         now,
         &inputs,
+        &mut seq,
         MEASURED_TICKS,
     );
     checksum = checksum.wrapping_add(measured);
@@ -128,13 +137,20 @@ fn hot_path_allocates_zero_bytes_per_tick() {
 }
 
 /// Run `ticks` full hot-path ticks over the fixture inputs, cycling
-/// from index 0, and return an output checksum.
+/// from index 0, and return an output checksum. `seq` is the
+/// tracker's monotonic sequence counter, advanced once per tick: the
+/// fixture cycles 1024 frames whose seqs repeat (0..1023), and
+/// feeding `frame.seq` to the tracker replays old seqs — which L8
+/// correctly classifies as duplicates, so the accept path (and its
+/// loss-window push) would never be exercised in steady state. The
+/// frame itself still goes through the pipeline unchanged.
 fn run_hot_path(
     pipeline: &mut ProcessingPipeline,
     tracker: &mut SequenceTracker,
     watchdog: &mut Watchdog,
     now: Instant,
     inputs: &[rsh_benchmarks::fixture::TickInput],
+    seq: &mut u16,
     ticks: u64,
 ) -> u64 {
     let mut checksum: u64 = 0;
@@ -142,7 +158,8 @@ fn run_hot_path(
         let idx = usize::try_from(i).expect("tick count fits usize");
         let input = &inputs[idx % inputs.len()];
         let frame = StreamFrame::parse(black_box(&input.bytes)).expect("fixed input parses");
-        let _decision = tracker.check(frame.seq);
+        let _decision = tracker.check(*seq);
+        *seq = seq.wrapping_add(1);
         watchdog.tick(now);
         let _stale = watchdog.is_stale(now);
         let out = pipeline.process(black_box(&frame));

@@ -418,6 +418,23 @@ severity, mitigations, and fixing phase.
   / signing key are never returned to the frontend; the frontend shows
   only masked/status information ("paired ✓" — not even the last 2
   characters of a password).
+  **Carve-out (deep-scan Round 2 — TM-R01(d) vs KEY-LIFECYCLE):** the ONE
+  exception is the transient one-time pairing Wi-Fi password. It IS
+  disclosed to the frontend, exactly once, because the user must see it
+  to join the board's AP on the first pairing (KEY-LIFECYCLE-RUST §3 —
+  the 60 s pairing window; OPEN-6 wired-primary bootstrap). The
+  disclosure is bounded by the implementation's single-use consume flag
+  (M-9, `crates/rsh-app-core/src/state.rs`: `PairingStatus` /
+  `pairing_status()`): the first read returns the password and every
+  later read returns `None` until a new `HELLO` discloses a fresh one;
+  the password is cleared when the window expires, when pairing
+  completes, and on disconnect; it never appears in a log line or an
+  error message. What stays under (d) with no exception: the 32-byte
+  device key never leaves the keystore / frontend IPC, and the STORED
+  (non-one-time) Wi-Fi password is never returned (`get_wifi_password`
+  has no production callers — SECURITY-RESCAN-H1 §1, checked-clean).
+  TM-R01(d) therefore reads as "no secret reaches the frontend except
+  the single-use pairing password, consumed on first read".
 - **Fix phase:** Foundation (CSP + capability template) + UI/Tauri (per-command
   validation with each command).
 - **Residual risk:** Medium (mitigated, not eliminated — a compromised

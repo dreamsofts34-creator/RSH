@@ -117,7 +117,125 @@ pub fn default_steam_roots() -> Vec<PathBuf> {
     }
 }
 
-/// Default iRacing install paths (Windows only; iRacing is not on Steam).
+/// Steam install roots for a configured path plus the system sources.
+///
+/// Order: the user's configured `steam_path` (settings, when non-empty
+/// and a directory), the Registry `SteamPath` (Windows), then the two
+/// standard install locations. M2: a non-default Steam install used to
+/// be invisible to detection.
+#[must_use]
+pub fn steam_roots_for(configured: Option<&str>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(path) = configured
+        && !path.trim().is_empty()
+    {
+        let path = PathBuf::from(path.trim());
+        if path.is_dir() {
+            roots.push(path);
+        }
+    }
+    if let Some(registry) = steam_root_from_registry() {
+        roots.push(registry);
+    }
+    roots.extend(default_steam_roots());
+    roots
+}
+
+/// iRacing install paths for a configured path plus the defaults.
+///
+/// The user's configured `iracing_path` (settings, when non-empty)
+/// wins over the default install locations (M2).
+#[must_use]
+pub fn iracing_paths_for(configured: Option<&str>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(path) = configured
+        && !path.trim().is_empty()
+    {
+        paths.push(PathBuf::from(path.trim()));
+    }
+    paths.extend(default_iracing_paths());
+    paths
+}
+
+/// Parses the `SteamPath` value out of `reg query` output (M2).
+///
+/// `reg query HKCU\Software\Valve\Steam /v SteamPath` prints lines like
+/// `    SteamPath    REG_SZ    C:\Program Files (x86)\Steam`.
+/// Returns the first value whose key is exactly `SteamPath`.
+#[must_use]
+pub fn parse_steam_registry_path(output: &str) -> Option<PathBuf> {
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 3 && parts[0] == "SteamPath" && parts[1] == "REG_SZ" {
+            // The path itself may contain spaces: rejoin from the 3rd token.
+            let path = parts[2..].join(" ");
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+    None
+}
+
+/// Reads the Steam install root from the Windows Registry (M2).
+///
+/// Runs `reg query HKCU\Software\Valve\Steam /v SteamPath` and parses
+/// it with [`parse_steam_registry_path`]. `None` on non-Windows, when
+/// `reg` is unavailable, or when the key is absent.
+#[must_use]
+pub fn steam_root_from_registry() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("reg")
+            .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_steam_registry_path(&String::from_utf8_lossy(&output.stdout))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Parses `tasklist` output: true when a line names `exe` (M2).
+///
+/// `tasklist /FI "IMAGENAME eq Steam.exe"` prints the image name as
+/// the first token of each process line.
+#[must_use]
+pub fn parse_tasklist_running(output: &str, exe: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(exe))
+}
+
+/// Whether the Steam client process is running (M2).
+///
+/// Windows only; `false` elsewhere (a running client is only used as
+/// a *hint* that Steam's install is live — detection never depends on
+/// it, so a false negative only loses the hint).
+#[must_use]
+pub fn is_steam_running() -> bool {
+    #[cfg(windows)]
+    {
+        let Ok(output) = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq Steam.exe", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+        parse_tasklist_running(&String::from_utf8_lossy(&output.stdout), "Steam.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+/// Default iRacing install locations (M2): the two standard
+/// `Program Files` paths, used when no custom path is configured.
 #[must_use]
 pub fn default_iracing_paths() -> Vec<PathBuf> {
     #[cfg(windows)]
@@ -147,16 +265,22 @@ pub fn default_iracing_paths() -> Vec<PathBuf> {
 #[must_use]
 pub fn discover_steam_libraries(steam_root: &Path) -> Vec<PathBuf> {
     let mut libraries: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let push = |path: PathBuf, libraries: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>| {
-        if path.is_dir() && seen.insert(path.clone()) {
+    // Dedupe key is the lowercased path: Windows paths are
+    // case-insensitive, and the same library can appear once from the
+    // VDF (`C:\Games`) and once as the root (`c:\games`) (L2).
+    let mut seen: HashSet<String> = HashSet::new();
+    let push = |path: PathBuf, libraries: &mut Vec<PathBuf>, seen: &mut HashSet<String>| {
+        if path.is_dir() && seen.insert(path.to_string_lossy().to_lowercase()) {
             libraries.push(path);
         }
     };
     push(steam_root.to_path_buf(), &mut libraries, &mut seen);
 
     let vdf = steam_root.join("steamapps").join("libraryfolders.vdf");
-    if let Ok(text) = std::fs::read_to_string(vdf) {
+    // L2: read bytes, not `read_to_string` — a VDF with a non-UTF8
+    // byte used to drop the whole file (and its libraries) outright.
+    if let Ok(bytes) = std::fs::read(vdf) {
+        let text = String::from_utf8_lossy(&bytes);
         for path in parse_libraryfolders_vdf(&text) {
             push(path, &mut libraries, &mut seen);
         }
@@ -255,6 +379,17 @@ impl DetectedGame {
 /// when the game is iRacing.
 #[must_use]
 pub fn detect_game(game: &Game, steam_roots: &[PathBuf]) -> DetectedGame {
+    detect_game_with(game, steam_roots, &default_iracing_paths())
+}
+
+/// Detects one game with explicit iRacing install paths (M2: the
+/// user's configured `iracing_path` feeds this list).
+#[must_use]
+pub fn detect_game_with(
+    game: &Game,
+    steam_roots: &[PathBuf],
+    iracing_paths: &[PathBuf],
+) -> DetectedGame {
     let mut libraries: Vec<PathBuf> = Vec::new();
     for root in steam_roots {
         libraries.extend(discover_steam_libraries(root));
@@ -270,7 +405,7 @@ pub fn detect_game(game: &Game, steam_roots: &[PathBuf]) -> DetectedGame {
         };
     }
     if game.id == GAME_IRACING {
-        for candidate in default_iracing_paths() {
+        for candidate in iracing_paths {
             if candidate.is_file() {
                 return DetectedGame {
                     game_id: game.id.to_owned(),
@@ -289,9 +424,19 @@ pub fn detect_game(game: &Game, steam_roots: &[PathBuf]) -> DetectedGame {
 /// Detects every catalogue game for the given Steam roots.
 #[must_use]
 pub fn detect_all_games(steam_roots: &[PathBuf]) -> Vec<DetectedGame> {
+    detect_all_games_with(steam_roots, &default_iracing_paths())
+}
+
+/// Detects every catalogue game for the given Steam roots and iRacing
+/// install paths (M2: configured paths feed this list).
+#[must_use]
+pub fn detect_all_games_with(
+    steam_roots: &[PathBuf],
+    iracing_paths: &[PathBuf],
+) -> Vec<DetectedGame> {
     KNOWN_GAMES
         .iter()
-        .map(|game| detect_game(game, steam_roots))
+        .map(|game| detect_game_with(game, steam_roots, iracing_paths))
         .collect()
 }
 
@@ -356,6 +501,15 @@ pub trait ProcessSpawner {
     ///
     /// Returns an error message when the process could not be terminated.
     fn terminate(&mut self, pid: u32) -> Result<(), String>;
+
+    /// Full path of the exe image for a pid, when the spawner can
+    /// determine it (L10: binds the tracked record to the actual
+    /// process, so a reused pid is not mistaken for the game).
+    /// The default returns `None` — a spawner that cannot answer
+    /// leaves the pid-only liveness check unchanged.
+    fn exe_path(&self, _pid: u32) -> Option<PathBuf> {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -374,6 +528,13 @@ mod win32 {
         pub fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
         /// Terminates a process; returns non-zero on success.
         pub fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
+        /// Writes the full image path; returns non-zero on success.
+        pub fn QueryFullProcessImageNameW(
+            process: Handle,
+            flags: u32,
+            exe_name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
         /// Closes a handle; returns non-zero on success.
         pub fn CloseHandle(handle: Handle) -> i32;
     }
@@ -466,6 +627,36 @@ impl ProcessSpawner for SystemSpawner {
             }
         }
     }
+
+    fn exe_path(&self, pid: u32) -> Option<PathBuf> {
+        #[cfg(windows)]
+        {
+            // SAFETY: plain Win32 query with checked returns; the
+            // handle and the stack buffer are always valid.
+            unsafe {
+                let handle = win32::OpenProcess(win32::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if handle == 0 {
+                    return None;
+                }
+                let mut buffer = [0_u16; 4096];
+                let mut size = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+                let ok =
+                    win32::QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size);
+                win32::CloseHandle(handle);
+                if ok == 0 {
+                    return None;
+                }
+                let len = usize::try_from(size).unwrap_or(0);
+                Some(PathBuf::from(String::from_utf16_lossy(
+                    &buffer[..len.min(buffer.len())],
+                )))
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::read_link(Path::new("/proc").join(pid.to_string()).join("exe")).ok()
+        }
+    }
 }
 
 /// Launches and tracks games: exactly one at a time.
@@ -528,11 +719,22 @@ impl<S: ProcessSpawner> GameLauncher<S> {
     }
 
     /// Re-checks whether the tracked game is still alive; clears the
-    /// record when it exited on its own. Returns the current record.
+    /// record when it exited on its own, or when the pid now belongs to
+    /// a different exe (L10 pid-reuse guard). Returns the current record.
     #[must_use]
     pub fn refresh(&mut self) -> Option<&RunningGame> {
         let dead = match &self.running {
-            Some(running) => !self.spawner.is_alive(running.pid),
+            Some(running) => {
+                if !self.spawner.is_alive(running.pid) {
+                    true
+                } else if let Some(exe) = self.spawner.exe_path(running.pid) {
+                    // The pid is alive but runs a different exe: the
+                    // game exited and the OS reused its pid.
+                    exe != Path::new(&running.exe_path)
+                } else {
+                    false
+                }
+            }
             None => false,
         };
         if dead {
@@ -544,18 +746,36 @@ impl<S: ProcessSpawner> GameLauncher<S> {
     /// Stops the tracked game (only the tracked pid — never any other
     /// same-name process) and returns its record.
     ///
+    /// M1: the record is cleared only on a successful terminate, or
+    /// when a refresh confirms the process is already dead. A failed
+    /// terminate on a still-alive process keeps the record, so the
+    /// stop can be retried instead of losing the game.
+    ///
     /// # Errors
     ///
     /// Returns an error message when nothing is running or the tracked
-    /// process could not be terminated. The record is cleared either way
-    /// when termination was attempted and the process is gone.
+    /// process could not be terminated.
     pub fn stop(&mut self) -> Result<RunningGame, String> {
         let running = self
             .running
-            .take()
+            .clone()
             .ok_or_else(|| "no game is running".to_owned())?;
-        self.spawner.terminate(running.pid)?;
-        Ok(running)
+        match self.spawner.terminate(running.pid) {
+            Ok(()) => {
+                self.running = None;
+                Ok(running)
+            }
+            Err(error) => {
+                if self.spawner.is_alive(running.pid) {
+                    Err(error)
+                } else {
+                    // It exited between the last refresh and the
+                    // terminate — the stop still happened.
+                    self.running = None;
+                    Ok(running)
+                }
+            }
+        }
     }
 }
 
@@ -572,6 +792,7 @@ mod tests {
         alive: RefCell<HashMap<u32, PathBuf>>,
         spawned: RefCell<Vec<PathBuf>>,
         killed: RefCell<Vec<u32>>,
+        fail_terminate: RefCell<bool>,
     }
 
     impl FakeSpawner {
@@ -581,11 +802,16 @@ mod tests {
                 alive: RefCell::new(HashMap::new()),
                 spawned: RefCell::new(Vec::new()),
                 killed: RefCell::new(Vec::new()),
+                fail_terminate: RefCell::new(false),
             }
         }
 
         fn kill_from_outside(&self, pid: u32) {
             self.alive.borrow_mut().remove(&pid);
+        }
+
+        fn set_fail_terminate(&self, fail: bool) {
+            *self.fail_terminate.borrow_mut() = fail;
         }
     }
 
@@ -603,12 +829,19 @@ mod tests {
         }
 
         fn terminate(&mut self, pid: u32) -> Result<(), String> {
+            if *self.fail_terminate.borrow() {
+                return Err("simulated terminate failure".to_owned());
+            }
             if self.alive.borrow_mut().remove(&pid).is_some() {
                 self.killed.borrow_mut().push(pid);
                 Ok(())
             } else {
                 Err(format!("pid {pid} is not alive"))
             }
+        }
+
+        fn exe_path(&self, pid: u32) -> Option<PathBuf> {
+            self.alive.borrow().get(&pid).cloned()
         }
     }
 
@@ -823,5 +1056,146 @@ mod tests {
     fn stop_with_nothing_running_is_an_error() {
         let mut launcher = GameLauncher::new(FakeSpawner::new());
         assert!(launcher.stop().is_err());
+    }
+
+    /// M1: a failed terminate on a still-alive process keeps the
+    /// record, so the stop can be retried.
+    #[test]
+    fn stop_failed_terminate_keeps_record() {
+        let (root, _lib2) = steam_fixture();
+        let games = detect_all_games(std::slice::from_ref(&root));
+        let ac = games
+            .iter()
+            .find(|game| game.game_id == GAME_ASSETTO_CORSA)
+            .unwrap()
+            .clone();
+        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        launcher.launch(&ac).expect("AC launches");
+        launcher.spawner.set_fail_terminate(true);
+        assert!(launcher.stop().is_err());
+        assert!(
+            launcher.running().is_some(),
+            "record must survive a failed stop"
+        );
+        launcher.spawner.set_fail_terminate(false);
+        assert!(
+            launcher.stop().is_ok(),
+            "retry succeeds once terminate works"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M1: when the process already died, stop still succeeds and
+    /// clears the record (the game is gone either way).
+    #[test]
+    fn stop_when_process_already_dead_clears_record() {
+        let (root, _lib2) = steam_fixture();
+        let games = detect_all_games(std::slice::from_ref(&root));
+        let ac = games
+            .iter()
+            .find(|game| game.game_id == GAME_ASSETTO_CORSA)
+            .unwrap()
+            .clone();
+        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let running = launcher.launch(&ac).expect("AC launches");
+        launcher.spawner.kill_from_outside(running.pid);
+        assert!(launcher.stop().is_ok());
+        assert!(launcher.running().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// L10: a pid reused by a different exe is not mistaken for the game.
+    #[test]
+    fn refresh_clears_on_exe_path_mismatch() {
+        let (root, _lib2) = steam_fixture();
+        let games = detect_all_games(std::slice::from_ref(&root));
+        let ac = games
+            .iter()
+            .find(|game| game.game_id == GAME_ASSETTO_CORSA)
+            .unwrap()
+            .clone();
+        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let running = launcher.launch(&ac).expect("AC launches");
+        launcher
+            .spawner
+            .alive
+            .borrow_mut()
+            .insert(running.pid, PathBuf::from("other-game.exe"));
+        assert!(launcher.refresh().is_none(), "pid now runs another exe");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M2: the `reg query` parser finds `SteamPath` even when the
+    /// path contains spaces, and returns `None` without the key.
+    #[test]
+    fn steam_registry_path_parses_reg_query_output() {
+        let output = "\r\nHKEY_CURRENT_USER\\Software\\Valve\\Steam\r\n    SteamPath    REG_SZ    C:\\Program Files (x86)\\Steam\r\n";
+        assert_eq!(
+            parse_steam_registry_path(output),
+            Some(PathBuf::from(r"C:\Program Files (x86)\Steam"))
+        );
+        assert_eq!(
+            parse_steam_registry_path("    Other    REG_SZ    X\r\n"),
+            None
+        );
+    }
+
+    /// M2: the tasklist parser matches the image name in the first column.
+    #[test]
+    fn tasklist_parser_detects_steam() {
+        let output = "Steam.exe                   1234 Console                    1     50,000 K\n";
+        assert!(parse_tasklist_running(output, "Steam.exe"));
+        assert!(!parse_tasklist_running(
+            "INFO: No tasks are running.\n",
+            "Steam.exe"
+        ));
+    }
+
+    /// L2: a VDF with a non-UTF8 byte still yields its libraries, and
+    /// the same library in a different case is not listed twice.
+    #[test]
+    fn vdf_non_utf8_and_case_insensitive_dedupe() {
+        let root = test_dir("vdf-nonascii");
+        let lib2 = root.join("lib2");
+        std::fs::create_dir_all(lib2.join("steamapps").join("common")).expect("fixture dir");
+        std::fs::create_dir_all(root.join("steamapps")).expect("fixture dir");
+        let mut vdf = format!(
+            "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n",
+            lib2.to_string_lossy().replace('\\', "\\\\")
+        )
+        .into_bytes();
+        vdf.extend_from_slice(b"// comment with a non-UTF8 byte: \xff\n");
+        // Same library again, uppercased — must not duplicate.
+        vdf.extend_from_slice(
+            format!(
+                "\"1\"\n{{\n\t\"path\"\t\t\"{}\"\n}}\n",
+                lib2.to_string_lossy().to_uppercase().replace('\\', "\\\\")
+            )
+            .as_bytes(),
+        );
+        std::fs::write(root.join("steamapps").join("libraryfolders.vdf"), vdf)
+            .expect("write fixture vdf");
+        let libraries = discover_steam_libraries(&root);
+        assert_eq!(
+            libraries.len(),
+            2,
+            "root + lib2, no duplicate: {libraries:?}"
+        );
+        assert!(libraries.contains(&lib2));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M2: a configured iRacing path is detected even when the
+    /// defaults do not exist on this machine.
+    #[test]
+    fn configured_iracing_path_is_detected() {
+        let dir = test_dir("iracing-custom");
+        let exe = dir.join("iRacingSim64DX11.exe");
+        std::fs::write(&exe, b"fake exe").expect("write fixture exe");
+        let game = game_by_id(GAME_IRACING).expect("iRacing in catalogue");
+        let found = detect_game_with(game, &[], std::slice::from_ref(&exe));
+        assert!(found.installed);
+        assert_eq!(found.exe_path.as_deref(), Some(exe.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

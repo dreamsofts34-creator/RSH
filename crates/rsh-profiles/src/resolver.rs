@@ -76,7 +76,7 @@ impl From<String> for ProfileId {
 /// reads, never writes. Keys are matched case-insensitively after
 /// trimming (car names arrive from telemetry exactly as the game reports
 /// them, e.g. `"Ferrari 488 GT3"` vs `"ferrari 488 gt3"`).
-pub trait ProfileSource {
+pub trait ProfileSource: Send + Sync {
     /// Profile bound to a game, if any (`game_id` is one of the
     /// `GAME_*` constants, e.g. [`GAME_ASSETTO_CORSA_COMPETIZIONE`]).
     fn profile_for_game(&self, game_id: &str) -> Option<ProfileId>;
@@ -244,15 +244,49 @@ impl ProfileSwitchEvent {
 /// Pure lookup over a [`ProfileSource`]; it never applies a switch and
 /// never touches the store. The [`crate::watcher::TelemetryWatcher`]
 /// owns the timing (debounce, car stability) and the fail-safe apply.
+/// The source is either borrowed ([`CarProfileResolver::new`], tests
+/// and the watcher unit tests) or owned
+/// ([`CarProfileResolver::new_owned`], the app-core auto-switch
+/// wiring, where the source must outlive the watcher thread).
 pub struct CarProfileResolver<'a> {
-    source: &'a dyn ProfileSource,
+    source: ResolverSource<'a>,
+}
+
+/// Where a resolver's [`ProfileSource`] lives.
+enum ResolverSource<'a> {
+    /// Borrowed for the caller's lifetime (tests, short-lived use).
+    Borrowed(&'a dyn ProfileSource),
+    /// Owned (the auto-switch watcher holds this for the app lifetime).
+    Owned(Box<dyn ProfileSource + Send>),
+}
+
+impl ResolverSource<'_> {
+    /// Borrows the source as a trait object.
+    fn as_ref(&self) -> &dyn ProfileSource {
+        match self {
+            Self::Borrowed(source) => *source,
+            Self::Owned(source) => source.as_ref(),
+        }
+    }
 }
 
 impl<'a> CarProfileResolver<'a> {
     /// Creates a resolver over a profile source.
     #[must_use]
     pub fn new(source: &'a dyn ProfileSource) -> Self {
-        Self { source }
+        Self {
+            source: ResolverSource::Borrowed(source),
+        }
+    }
+
+    /// Creates a resolver over an owned profile source (the source
+    /// lives as long as the resolver — the auto-switch watcher holds
+    /// one for the whole app lifetime, so it cannot borrow the store).
+    #[must_use]
+    pub fn new_owned(source: Box<dyn ProfileSource + Send>) -> Self {
+        Self {
+            source: ResolverSource::Owned(source),
+        }
     }
 
     /// Resolves the profile for a game and optional car, in order:
@@ -265,22 +299,23 @@ impl<'a> CarProfileResolver<'a> {
         let car_name = car_name.map(str::trim).filter(|name| !name.is_empty());
         let game_id = game_id.map(str::trim).filter(|id| !id.is_empty());
 
+        let source = self.source.as_ref();
         if let (Some(game), Some(car)) = (game_id, car_name)
-            && let Some(profile) = self.source.profile_for_game_car(game, car)
+            && let Some(profile) = source.profile_for_game_car(game, car)
         {
             return Some(profile);
         }
         if let Some(car) = car_name
-            && let Some(profile) = self.source.profile_for_car(car)
+            && let Some(profile) = source.profile_for_car(car)
         {
             return Some(profile);
         }
         if let Some(game) = game_id
-            && let Some(profile) = self.source.profile_for_game(game)
+            && let Some(profile) = source.profile_for_game(game)
         {
             return Some(profile);
         }
-        self.source.default_profile()
+        source.default_profile()
     }
 }
 

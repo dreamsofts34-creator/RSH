@@ -56,16 +56,29 @@ const CONFIG_WITH_BINDINGS = {
   buttons: { "1": "horn", "5": "shifter_up", "65": "gear_1" },
 };
 
+/** Backend config-transaction state modelled by the mock. */
+let mockConfigState = "clean";
+
 function mockInvokeImpl(cmd: string) {
   switch (cmd) {
     case "get_config":
       return Promise.resolve({ ...CONFIG_WITH_BINDINGS });
+    case "get_config_state":
+      // Models the backend transaction record: stage -> staged,
+      // commit -> pending_confirm, confirm/rollback -> clean.
+      return Promise.resolve(mockConfigState);
     case "stage_config":
+      mockConfigState = "staged";
       return Promise.resolve("staged");
     case "commit_config":
+      mockConfigState = "pending_confirm";
       return Promise.resolve("pending_confirm");
     case "confirm_config":
+      mockConfigState = "clean";
       return Promise.resolve("clean");
+    case "rollback_config":
+      mockConfigState = "rolled_back";
+      return Promise.resolve("rolled_back");
     default:
       return Promise.reject(new Error(`unknown command "${cmd}"`));
   }
@@ -79,6 +92,7 @@ describe("Buttons screen", () => {
   });
 
   beforeEach(() => {
+    mockConfigState = "clean";
     mockInvoke.mockReset();
     mockListen.mockReset();
     for (const key of Object.keys(handlers)) delete handlers[key];

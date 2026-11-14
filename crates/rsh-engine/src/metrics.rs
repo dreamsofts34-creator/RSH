@@ -131,19 +131,47 @@ impl LossWindow {
 
     /// Record one packet outcome: `received` is `true` when it arrived.
     pub fn record_packet(&mut self, received: bool) {
-        if self.len as usize == LOSS_WINDOW {
-            // Window full: the evicted slot stops counting.
-            if self.lost[self.head] {
-                self.lost_count -= 1;
+        self.record_many(u32::from(!received), u32::from(received));
+    }
+
+    /// Record a batch of outcomes at once: `lost` lost packets followed
+    /// by `received` received packets (L1 — a sequence gap of `n`
+    /// skipped packets is one batch, not `n` per-packet calls). The
+    /// window contents are identical to recording the same outcomes
+    /// one by one; the ring is filled with slice writes instead of a
+    /// per-packet loop.
+    pub fn record_many(&mut self, mut lost: u32, mut received: u32) {
+        // Fill in two runs (lost first, then received); each run is
+        // written with slice fills, evicting the oldest entries as the
+        // ring wraps. Saturating arithmetic keeps the counts exact
+        // when the window is already full.
+        for (value, count) in [(true, &mut lost), (false, &mut received)] {
+            let mut remaining = *count;
+            while remaining > 0 {
+                // Space to the end of the ring from `head`.
+                let to_end = (LOSS_WINDOW - self.head).min(remaining as usize);
+                // Evicted entries stop counting (only when full).
+                if self.len as usize == LOSS_WINDOW {
+                    let evicted = self.lost[self.head..self.head + to_end]
+                        .iter()
+                        .filter(|lost_entry| **lost_entry)
+                        .count();
+                    self.lost_count -= u32::try_from(evicted).unwrap_or(u32::MAX);
+                } else {
+                    // Window not full yet: only the part that fits
+                    // before the window fills grows `len`.
+                    let room = LOSS_WINDOW - self.len as usize;
+                    let grown = to_end.min(room);
+                    self.len += u32::try_from(grown).unwrap_or(u32::MAX);
+                }
+                self.lost[self.head..self.head + to_end].fill(value);
+                if value {
+                    self.lost_count += u32::try_from(to_end).unwrap_or(u32::MAX);
+                }
+                self.head = (self.head + to_end) % LOSS_WINDOW;
+                remaining -= u32::try_from(to_end).unwrap_or(u32::MAX);
             }
-        } else {
-            self.len += 1;
         }
-        self.lost[self.head] = !received;
-        if !received {
-            self.lost_count += 1;
-        }
-        self.head = (self.head + 1) % LOSS_WINDOW;
     }
 
     /// Loss fraction over the window (`0.0` when nothing recorded yet).
@@ -233,6 +261,12 @@ impl EngineMetrics {
     /// Record one stream packet outcome for the loss window.
     pub fn record_packet(&mut self, received: bool) {
         self.packet_loss.record_packet(received);
+    }
+
+    /// Record a sequence gap as one batch: `skipped` lost packets plus
+    /// the one packet that arrived after them (L1).
+    pub fn record_gap(&mut self, skipped: u16) {
+        self.packet_loss.record_many(u32::from(skipped), 1);
     }
 
     /// Pass through the `seqGap`/`txFail` counters from a status packet.
@@ -417,6 +451,34 @@ mod tests {
         assert!(json.contains("\"packet_loss\":0.1"), "{json}");
         assert!(json.contains("\"seq_gap\":7"), "{json}");
         assert!(json.contains("\"tx_fail\":3"), "{json}");
+    }
+
+    #[test]
+    fn loss_window_record_many_matches_per_packet() {
+        // L1: a batch must be identical to recording the same outcomes
+        // one by one — including across the ring wrap.
+        use super::LossWindow;
+        let mut batched = LossWindow::new();
+        let mut single = LossWindow::new();
+        // Fill, wrap, and evict: 2500 outcomes in mixed batches.
+        for (lost, received) in [(0u32, 900u32), (250, 1), (700, 49), (0, 600)] {
+            batched.record_many(lost, received);
+            for _ in 0..lost {
+                single.record_packet(false);
+            }
+            for _ in 0..received {
+                single.record_packet(true);
+            }
+            assert_eq!(batched.packets_tracked(), single.packets_tracked());
+            assert_eq!(batched.packets_lost(), single.packets_lost());
+            assert_eq!(batched.loss_fraction(), single.loss_fraction());
+        }
+        // record_gap: skipped lost + the arriving packet.
+        let mut metrics = EngineMetrics::new();
+        metrics.record_gap(4);
+        assert_eq!(metrics.packet_loss.packets_tracked(), 5);
+        assert_eq!(metrics.packet_loss.packets_lost(), 4);
+        assert_eq!(metrics.loss_fraction(), 4.0 / 5.0);
     }
 
     #[test]

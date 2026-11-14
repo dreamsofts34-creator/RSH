@@ -461,13 +461,18 @@ impl<K: KeyStoreLike, T: ControlTransport> BoardSession<K, T> {
             }
             if self.window_nonce != Some(hello.nonce) {
                 self.expired_window_nonce = None;
+                // M2: the window opens only on a NEW nonce. A repeat
+                // HELLO for the same window must not refresh
+                // `window_opened_at` — otherwise a board re-sending
+                // HELLO every second would keep the 60 s window open
+                // forever.
+                self.window_opened_at = Some(Instant::now());
+                self.window_nonce = Some(hello.nonce);
             }
             self.pending = Some(PendingCredentials {
                 key: hello.device_key,
                 wifi_password: hello.wifi_password,
             });
-            self.window_opened_at = Some(Instant::now());
-            self.window_nonce = Some(hello.nonce);
             if self.state == SessionState::Unpaired {
                 self.state = SessionState::Pairing;
             }
@@ -596,9 +601,25 @@ impl<K: KeyStoreLike, T: ControlTransport> BoardSession<K, T> {
                 "disclosed device key is all zero",
             ));
         }
-        let password = std::str::from_utf8(&hello.wifi_password).map_err(|_| {
-            SessionError::InvalidHello("disclosed Wi-Fi password is not valid UTF-8")
-        })?;
+        let password = {
+            // M3: the 24-byte field is NUL-padded — trim trailing
+            // 0x00 before storing, so the stored password is the
+            // password the board meant, not the password plus padding.
+            // An empty / all-zero password is not a password at all.
+            let end = hello
+                .wifi_password
+                .iter()
+                .rposition(|&byte| byte != 0)
+                .map_or(0, |last| last + 1);
+            if end == 0 {
+                return Err(SessionError::InvalidHello(
+                    "disclosed Wi-Fi password is empty or all zero",
+                ));
+            }
+            std::str::from_utf8(&hello.wifi_password[..end]).map_err(|_| {
+                SessionError::InvalidHello("disclosed Wi-Fi password is not valid UTF-8")
+            })?
+        };
         // SEC-R2-06 board-binding gate: a stored key that differs from
         // the disclosed one is refused unless the caller confirmed the
         // replacement. Checked before anything is stored or any state
@@ -885,9 +906,13 @@ impl<K: KeyStoreLike, T: ControlTransport> BoardSession<K, T> {
     }
 
     /// Drop any pending credentials (zeroized by their `Drop` impl) and
-    /// clear the window-open tracking.
+    /// clear the window-open tracking (L9 — a closed/discarded window
+    /// must not leave a stale `window_opened_at`/`window_nonce`
+    /// behind for a later HELLO to be measured against).
     fn discard_pending(&mut self) {
         self.pending = None;
+        self.window_opened_at = None;
+        self.window_nonce = None;
     }
 
     /// The first delete error that is not "already gone": a missing entry
@@ -2026,5 +2051,75 @@ mod tests {
     fn session_state_transitions() {
         assert_ne!(SessionState::Unpaired, SessionState::Pairing);
         assert_ne!(SessionState::Paired, SessionState::SessionActive);
+    }
+
+    #[test]
+    fn repeat_hello_same_nonce_does_not_refresh_window() {
+        // M2: the 60 s window opens on a new nonce only. A repeat
+        // HELLO for the same window leaves window_opened_at alone.
+        let mut session = machine(MemKeyStore::new(), FakeBoard::new(KEY_ONE, NONCE_ONE));
+        session.observe_hello(&pairing_hello(KEY_ONE, NONCE_ONE));
+        let opened = session.window_opened_at.expect("window opened");
+        std::thread::sleep(Duration::from_millis(2));
+        session.observe_hello(&pairing_hello(KEY_ONE, NONCE_ONE));
+        assert_eq!(
+            session.window_opened_at,
+            Some(opened),
+            "repeat HELLO must not refresh"
+        );
+        assert_eq!(session.window_nonce, Some(NONCE_ONE));
+        // A fresh nonce opens a new window (refreshed).
+        std::thread::sleep(Duration::from_millis(2));
+        session.observe_hello(&pairing_hello(KEY_ONE, NONCE_TWO));
+        let reopened = session.window_opened_at.expect("new window opened");
+        assert!(reopened > opened, "new nonce must open a new window");
+        assert_eq!(session.window_nonce, Some(NONCE_TWO));
+    }
+
+    #[test]
+    fn close_clears_window_tracking() {
+        // L9: close() (via discard_pending) clears window_opened_at
+        // and window_nonce, not just the pending credentials.
+        let mut session = machine(MemKeyStore::new(), FakeBoard::new(KEY_ONE, NONCE_ONE));
+        session.observe_hello(&pairing_hello(KEY_ONE, NONCE_ONE));
+        assert!(session.window_opened_at.is_some());
+        assert!(session.window_nonce.is_some());
+        session.close();
+        assert_eq!(session.window_opened_at, None);
+        assert_eq!(session.window_nonce, None);
+        assert!(!session.has_pending_credentials());
+    }
+
+    #[tokio::test]
+    async fn pair_rejects_all_zero_wifi_password() {
+        // M3: an all-zero Wi-Fi password is not a password.
+        let mut session = machine(MemKeyStore::new(), FakeBoard::new(KEY_ONE, NONCE_ONE));
+        let hello = hello(0x09, NONCE_ONE, KEY_ONE, [0u8; 24]);
+        let err = session
+            .pair(&hello)
+            .await
+            .expect_err("all-zero password must fail");
+        assert!(matches!(err, SessionError::InvalidHello(_)), "got {err:?}");
+        assert_eq!(session.state(), SessionState::Unpaired);
+    }
+
+    #[tokio::test]
+    async fn pair_trims_trailing_nul_wifi_password() {
+        // M3: the 24-byte field is NUL-padded — "secret" + padding
+        // stores as "secret", not "secret\0\0…".
+        let store = MemKeyStore::new();
+        let mut session = machine(store, FakeBoard::new(KEY_ONE, NONCE_ONE));
+        let mut wifi = [0u8; 24];
+        wifi[..6].copy_from_slice(b"secret");
+        let hello = hello(0x09, NONCE_ONE, KEY_ONE, wifi);
+        session
+            .pair(&hello)
+            .await
+            .expect("pairing with padded password succeeds");
+        let entries = session.keystore().entries.lock().expect("test store lock");
+        let stored = entries
+            .get(&("RSH".to_owned(), format!("board:{BOARD_ID}:wifi")))
+            .expect("wifi password stored");
+        assert_eq!(stored, b"secret", "trailing NULs must be trimmed");
     }
 }

@@ -27,7 +27,7 @@
 //! migration. A plaintext Wi-Fi password found in a C# `settings.json` is
 //! ignored here and never carried into Rust storage.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
@@ -195,6 +195,25 @@ pub struct PerModuleTuning {
     /// are invented here. A typed enum is a later-phase (SW-R4) item.
     #[serde(default = "default_gate_mode")]
     pub gate_mode: String,
+    /// Raw minimum in mV for this module's axis, when the tuning screen
+    /// captured one (`None` = never captured, never a fake 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_mv: Option<f64>,
+    /// Raw maximum in mV for this module's axis, when captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mv: Option<f64>,
+    /// Pedal bite point, 0..1 (clutch / brake only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bite_point: Option<f64>,
+    /// Button number (1–32) the horn is bound to (horn module only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horn_button: Option<u8>,
+    /// LED strip brightness in percent, 0–100 (LED module only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub led_brightness: Option<u8>,
+    /// LED strip pattern name (LED module only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub led_pattern: Option<String>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -359,6 +378,23 @@ pub struct AppSettings {
     /// Whether profiles auto-switch per game/car.
     #[serde(default = "default_true")]
     pub auto_switch_profiles: bool,
+    /// Per-module on/off switches, keyed by canonical module id
+    /// (`"steering"`, `"accelerator"`, `"brake"`, `"clutch"`,
+    /// `"handbrake"`, `"shifter"`, `"horn"`, `"buttons"`,
+    /// `"encoders"`, `"led"`). Absent keys mean "on" (see
+    /// [`sanitize_settings`]); a disabled module never reaches the
+    /// pipeline. Unknown keys are preserved verbatim.
+    #[serde(default = "default_modules")]
+    pub modules: HashMap<String, bool>,
+    /// User-configured Steam install root (empty = auto-detect via the
+    /// registry + the standard install locations). Used by game
+    /// detection when set.
+    #[serde(default)]
+    pub steam_path: String,
+    /// User-configured iRacing exe path (empty = the standard install
+    /// locations). Used by game detection when set.
+    #[serde(default)]
+    pub iracing_path: String,
 }
 
 fn default_profile_name() -> String {
@@ -436,6 +472,12 @@ impl Default for PerModuleTuning {
             scale: default_scale(),
             enabled: true,
             gate_mode: default_gate_mode(),
+            min_mv: None,
+            max_mv: None,
+            bite_point: None,
+            horn_button: None,
+            led_brightness: None,
+            led_pattern: None,
         }
     }
 }
@@ -491,7 +533,182 @@ impl Default for AppSettings {
             wizard_completed: false,
             first_run_done: false,
             auto_switch_profiles: true,
+            modules: default_modules(),
+            steam_path: String::new(),
+            iracing_path: String::new(),
         }
+    }
+}
+
+/// The canonical module ids (C-MOD-1): `"accelerator"` is canonical,
+/// never `"accel"`. Every tuning / module-tuning / settings lookup
+/// normalizes through [`canonical_module_id`].
+pub const KNOWN_MODULES: &[&str] = &[
+    "steering",
+    "accelerator",
+    "brake",
+    "clutch",
+    "handbrake",
+    "shifter",
+    "horn",
+    "buttons",
+    "encoders",
+    "led",
+];
+
+/// Default per-module switches: every known module on.
+#[must_use]
+pub fn default_modules() -> HashMap<String, bool> {
+    KNOWN_MODULES
+        .iter()
+        .map(|module| ((*module).to_string(), true))
+        .collect()
+}
+
+/// Canonicalizes a module id: trims, lowercases, and maps the legacy
+/// `"accel"` spelling to the canonical `"accelerator"` (C-MOD-1).
+/// Unknown ids pass through unchanged (lowercased + trimmed).
+#[must_use]
+pub fn canonical_module_id(id: &str) -> String {
+    match id.trim().to_ascii_lowercase().as_str() {
+        "accel" => "accelerator".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether an IPv4 address may be used as the board address
+/// (`esp_ip`, M-1): a private-range address, or loopback (local
+/// testing / the loopback forwarder tests). Anything else — a public
+/// address, a hostname, unparseable text — is refused and the caller
+/// falls back to the default `192.168.4.1`.
+#[must_use]
+pub fn is_allowed_board_ip(ip: &Ipv4Addr) -> bool {
+    ip.is_private() || ip.is_loopback()
+}
+
+/// Canonical theme for a theme string, accepting both vocabularies:
+/// the backend canonical `"System"` | `"Dark"` | `"Light"` |
+/// `"HighContrast"` and the frontend lowercase spellings (`"system"`,
+/// `"dark"`, `"light"`, `"highcontrast"` / `"high-contrast"`).
+/// Returns [`None`] for anything else (the caller falls back to
+/// `"System"`).
+#[must_use]
+pub fn canonical_theme(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "system" => Some("System"),
+        "dark" => Some("Dark"),
+        "light" => Some("Light"),
+        "highcontrast" | "high-contrast" | "high_contrast" => Some("HighContrast"),
+        _ => None,
+    }
+}
+
+/// A partial settings update (C-SET-1, PATCH semantics): only the
+/// fields that are `Some` overwrite the stored settings; absent fields
+/// keep their existing values. This is what the `set_settings` Tauri
+/// command accepts — the frontend sends only the fields it changed,
+/// and a partial save can never wipe the settings it did not mention.
+/// `modules` merges per key (a provided key overwrites that module's
+/// switch; absent keys keep their values).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case", default)]
+pub struct AppSettingsPatch {
+    /// Theme preference (either vocabulary, see [`canonical_theme`]).
+    pub theme: Option<String>,
+    /// Language preference.
+    pub language: Option<String>,
+    /// Whether the app starts with Windows.
+    pub autostart: Option<bool>,
+    /// Whether the app starts minimized.
+    pub start_minimized: Option<bool>,
+    /// Whether closing the window hides to the tray.
+    pub close_to_tray: Option<bool>,
+    /// Whether the output backend is enabled.
+    pub output_enabled: Option<bool>,
+    /// Wheel address (private IPv4 literal only).
+    pub esp_ip: Option<String>,
+    /// vJoy device id, clamped to 1..=16.
+    pub vjoy_device_id: Option<u32>,
+    /// Output backend (`HIDMaestro` / `VJoy` / `None`).
+    pub output_backend: Option<String>,
+    /// `HIDMaestro` profile id.
+    pub hid_maestro_profile_id: Option<String>,
+    /// Log level.
+    pub log_level: Option<String>,
+    /// Whether the setup wizard has been completed.
+    pub wizard_completed: Option<bool>,
+    /// Whether the first run has finished.
+    pub first_run_done: Option<bool>,
+    /// Whether profiles auto-switch per game/car.
+    pub auto_switch_profiles: Option<bool>,
+    /// Per-module switches, merged per key.
+    pub modules: Option<HashMap<String, bool>>,
+    /// User-configured Steam install root.
+    pub steam_path: Option<String>,
+    /// User-configured iRacing exe path.
+    pub iracing_path: Option<String>,
+}
+
+impl AppSettings {
+    /// Applies a [`AppSettingsPatch`]: only `Some` fields overwrite.
+    /// The result is sanitized ([`sanitize_settings`]) before it is
+    /// returned, so a patch can never store an invalid theme, a
+    /// public `esp_ip`, or an out-of-range vJoy device id.
+    pub fn apply_patch(&mut self, patch: AppSettingsPatch) {
+        if let Some(theme) = patch.theme {
+            self.theme = theme;
+        }
+        if let Some(language) = patch.language {
+            self.language = language;
+        }
+        if let Some(autostart) = patch.autostart {
+            self.autostart = autostart;
+        }
+        if let Some(start_minimized) = patch.start_minimized {
+            self.start_minimized = start_minimized;
+        }
+        if let Some(close_to_tray) = patch.close_to_tray {
+            self.close_to_tray = close_to_tray;
+        }
+        if let Some(output_enabled) = patch.output_enabled {
+            self.output_enabled = output_enabled;
+        }
+        if let Some(esp_ip) = patch.esp_ip {
+            self.esp_ip = esp_ip;
+        }
+        if let Some(vjoy_device_id) = patch.vjoy_device_id {
+            self.vjoy_device_id = vjoy_device_id;
+        }
+        if let Some(output_backend) = patch.output_backend {
+            self.output_backend = output_backend;
+        }
+        if let Some(hid_maestro_profile_id) = patch.hid_maestro_profile_id {
+            self.hid_maestro_profile_id = hid_maestro_profile_id;
+        }
+        if let Some(log_level) = patch.log_level {
+            self.log_level = log_level;
+        }
+        if let Some(wizard_completed) = patch.wizard_completed {
+            self.wizard_completed = wizard_completed;
+        }
+        if let Some(first_run_done) = patch.first_run_done {
+            self.first_run_done = first_run_done;
+        }
+        if let Some(auto_switch_profiles) = patch.auto_switch_profiles {
+            self.auto_switch_profiles = auto_switch_profiles;
+        }
+        if let Some(modules) = patch.modules {
+            for (module, enabled) in modules {
+                self.modules.insert(canonical_module_id(&module), enabled);
+            }
+        }
+        if let Some(steam_path) = patch.steam_path {
+            self.steam_path = steam_path;
+        }
+        if let Some(iracing_path) = patch.iracing_path {
+            self.iracing_path = iracing_path;
+        }
+        sanitize_settings(self);
     }
 }
 
@@ -510,7 +727,10 @@ struct ProfileFileRaw {
 /// that brand-name sequence is folded to `Vjoy` before conversion; other
 /// acronym boundaries follow the usual rule (`HIDMaestro` -> `hid_maestro`,
 /// `EspIp` -> `esp_ip`).
-fn normalize_keys(value: Value) -> Value {
+///
+/// `pub(crate)` so the store can parse a C# settings file into a
+/// *patch* (merge import, M6) instead of a full replace.
+pub(crate) fn normalize_keys(value: Value) -> Value {
     match value {
         Value::Object(map) => {
             let normalized = map
@@ -590,22 +810,23 @@ fn pedal_calibration_sane(calibration: &PedalCalibration) -> bool {
 
 /// Applies the C# load-time sanitizing for settings allowlists and ranges
 /// (`DATA-INPUT.md` §2.1): unknown enum strings fall back to their defaults,
-/// a non-private `esp_ip` falls back to `192.168.4.1`, and the vJoy device id
-/// is clamped to 1..=16.
-fn sanitize_settings(settings: &mut AppSettings) {
-    if !matches!(
-        settings.theme.as_str(),
-        "System" | "Dark" | "Light" | "HighContrast"
-    ) {
-        "System".clone_into(&mut settings.theme);
-    }
+/// a non-private/non-loopback `esp_ip` falls back to `192.168.4.1`, and the
+/// vJoy device id is clamped to 1..=16. Both theme vocabularies are
+/// accepted (backend canonical + frontend lowercase, see
+/// [`canonical_theme`]), and absent known-module switches are filled
+/// in as on. Applied on every load path (C# import, Rust load) and on
+/// every write path (`set_settings`, patch apply) — M10.
+pub fn sanitize_settings(settings: &mut AppSettings) {
+    settings.theme = canonical_theme(&settings.theme)
+        .unwrap_or("System")
+        .to_string();
     if !matches!(settings.language.as_str(), "System" | "en" | "ur" | "hi") {
         "System".clone_into(&mut settings.language);
     }
     let esp_ok = settings
         .esp_ip
         .parse::<Ipv4Addr>()
-        .is_ok_and(|ip| ip.is_private());
+        .is_ok_and(|ip| is_allowed_board_ip(&ip));
     if !esp_ok {
         settings.esp_ip = default_esp_ip();
     }
@@ -621,6 +842,16 @@ fn sanitize_settings(settings: &mut AppSettings) {
         "Debug" | "Information" | "Warning" | "Error"
     ) {
         settings.log_level = default_log_level();
+    }
+    for module in KNOWN_MODULES {
+        settings
+            .modules
+            .entry((*module).to_string())
+            .or_insert(true);
+    }
+    // Legacy "accel" module keys migrate to the canonical id (C-MOD-1).
+    if let Some(enabled) = settings.modules.remove("accel") {
+        settings.modules.insert("accelerator".to_string(), enabled);
     }
 }
 

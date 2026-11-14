@@ -176,7 +176,16 @@ pub fn run_soak() -> SoakOutcome {
         let input = &inputs[index % inputs.len()];
         index += 1;
         let frame = StreamFrame::parse(&input.bytes).expect("fixed input parses");
-        let _decision = tracker.check(frame.seq);
+        // Monotonic tracker seq (L8): the fixture cycles 1024 frames
+        // whose seqs repeat (0..1023), and feeding `frame.seq` to the
+        // tracker replays old seqs — which L8 correctly classifies as
+        // duplicates, so `accepted` would stall after the first cycle
+        // and the soak would fail its tick count. The soak measures
+        // heap growth over realistic hot-path work, so the tracker
+        // gets the same monotonic stream the wheel emits in the rig;
+        // the frame itself still goes through the pipeline unchanged.
+        let _decision = tracker.check(seq);
+        seq = seq.wrapping_add(1);
         watchdog.tick(now);
         let _out = pipeline.process(&frame);
     }
@@ -195,7 +204,8 @@ pub fn run_soak() -> SoakOutcome {
         let input = &inputs[index % inputs.len()];
         index += 1;
         let frame = StreamFrame::parse(black_box(&input.bytes)).expect("fixed input parses");
-        let _decision = tracker.check(frame.seq);
+        let _decision = tracker.check(seq);
+        seq = seq.wrapping_add(1);
         let tick_now = Instant::now();
         watchdog.tick(tick_now);
         let _stale = watchdog.is_stale(tick_now);

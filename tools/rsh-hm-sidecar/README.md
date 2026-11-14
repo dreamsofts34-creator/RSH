@@ -66,8 +66,10 @@ dotnet publish -c Release -r win-x64 --self-contained true
 ```sh
 # stdio (dev / when RSH itself runs elevated)
 rsh-hm-sidecar.exe
-# TCP connect-back (production; RSH listens on loopback first)
-rsh-hm-sidecar.exe --connect-back 127.0.0.1:54321 --token <128-bit hex>
+# TCP connect-back (production; RSH listens on loopback first).
+# The token comes from the environment, never argv (C-TOK-1):
+$env:RSH_HM_SIDECAR_TOKEN = "<128-bit hex>"
+rsh-hm-sidecar.exe --connect-back 127.0.0.1:54321
 ```
 
 > Sandbox note: the TCP connect-back path is **sandbox-blocked**

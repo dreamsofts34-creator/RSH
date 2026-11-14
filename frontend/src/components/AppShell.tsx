@@ -7,6 +7,7 @@ import {
   type ScreenDefinition,
 } from "@/lib/screens";
 import { getStartupNotice } from "@/lib/tauri";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
@@ -32,14 +33,27 @@ export interface AppShellProps {
   screens?: ScreenDefinition[];
 }
 
+/** localStorage key for the last-open screen (M15). */
+export const LAST_SCREEN_STORAGE_KEY = "rsh-shell.lastScreen";
+
+function readLastScreen(paths: readonly string[]): string | null {
+  try {
+    const stored = window.localStorage.getItem(LAST_SCREEN_STORAGE_KEY);
+    if (stored !== null && paths.includes(stored)) return stored;
+  } catch {
+    // Storage unavailable — fall through to the first screen.
+  }
+  return null;
+}
+
 export function AppShell({ screens }: AppShellProps) {
   const { t } = useTranslation();
   const navScreens = useMemo(
     () => sortScreens(screens ?? discoveredScreens),
     [screens],
   );
-  const [activePath, setActivePath] = useState<string | null>(
-    navScreens[0]?.path ?? null,
+  const [activePath, setActivePath] = useState<string | null>(() =>
+    readLastScreen(navScreens.map((s) => s.path)) ?? navScreens[0]?.path ?? null,
   );
   const navRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const [startupNotice, setStartupNotice] = useState<string | null>(null);
@@ -71,6 +85,16 @@ export function AppShell({ screens }: AppShellProps) {
     }
   }, [navScreens, activePath]);
 
+  // M15: remember the last screen across restarts.
+  useEffect(() => {
+    if (activePath === null) return;
+    try {
+      window.localStorage.setItem(LAST_SCREEN_STORAGE_KEY, activePath);
+    } catch {
+      // Storage unavailable — the shell still works for this session.
+    }
+  }, [activePath]);
+
   const activeScreen = navScreens.find((s) => s.path === activePath) ?? null;
 
   const focusNavItem = useCallback((index: number) => {
@@ -88,6 +112,13 @@ export function AppShell({ screens }: AppShellProps) {
       } else if (event.key === "ArrowUp") {
         event.preventDefault();
         focusNavItem(index - 1);
+      } else if (event.key === "Home") {
+        // M15: Home/End jump to the first/last nav item.
+        event.preventDefault();
+        focusNavItem(0);
+      } else if (event.key === "End") {
+        event.preventDefault();
+        focusNavItem(navRefs.current.length - 1);
       }
     },
     [focusNavItem],
@@ -117,7 +148,7 @@ export function AppShell({ screens }: AppShellProps) {
         <Separator />
 
         <nav
-          aria-label="Screens"
+          aria-label={t("shell.nav", { defaultValue: "Screens" })}
           className="flex-1 overflow-y-auto px-3 py-3"
         >
           {navScreens.length === 0 ? null : (
@@ -182,7 +213,14 @@ export function AppShell({ screens }: AppShellProps) {
           </div>
         ) : null}
         {activeScreen ? (
-          <activeScreen.component />
+          <ErrorBoundary
+            key={activeScreen.path}
+            label={t(activeScreen.labelKey, {
+              defaultValue: activeScreen.label,
+            })}
+          >
+            <activeScreen.component />
+          </ErrorBoundary>
         ) : (
           <section
             aria-label={t("shell.emptyTitle")}

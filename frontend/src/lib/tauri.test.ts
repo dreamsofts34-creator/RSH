@@ -81,7 +81,7 @@ describe("tauri.ts wrappers", () => {
     expect((error as TauriCommandError).code).toBe("NOT_IN_TAURI");
   });
 
-  it("only the Phase H5-control command set is implemented in src-tauri today", () => {
+  it("only the Phase H5-control + deep-scan Round 2 command set is implemented in src-tauri today", () => {
     expect([...IMPLEMENTED_COMMANDS]).toEqual([
       "ping",
       "get_version",
@@ -107,14 +107,21 @@ describe("tauri.ts wrappers", () => {
       "delete_profile",
       "import_profile",
       "export_profile",
+      "get_settings",
+      "set_settings",
+      "enable_auto_switch",
+      "led_test",
+      "key_reset",
+      "factory_reset",
+      "confirm_pairing_replacement",
+      "import_csharp_profiles",
+      "import_csharp_settings",
+      "backup_now",
+      "restore_backup",
       "list_games",
       "launch_game",
       "stop_game",
       "get_game_state",
-      "get_settings",
-      "set_settings",
-      "backup_now",
-      "restore_backup",
       "get_tuning",
       "set_tuning",
       "get_calibration",

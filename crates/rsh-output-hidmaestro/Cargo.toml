@@ -18,8 +18,10 @@ serde_json = { workspace = true }
 getrandom = { workspace = true }
 subtle = { workspace = true }
 
-# Windows-only: elevated sidecar spawn (ShellExecuteEx "runas").
+# Windows-only: elevated sidecar spawn (ShellExecuteEx "runas",
+# TerminateProcess for the kept process handle) + loopback peer-PID
+# verification (GetExtendedTcpTable).
 # The `windows` crate does not compile on Linux, so this is strictly a
 # target-gated dependency (workspace convention, root Cargo.toml).
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Shell"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }

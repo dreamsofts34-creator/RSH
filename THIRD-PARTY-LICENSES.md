@@ -21,9 +21,9 @@ HIDMaestro sidecar, hand-written — the sidecar has no lockfile).
   (CI `frontend` job). The release workflow regenerates all three SBOMs fresh at release
   time (`.github/workflows/release.yml`) — the committed SBOMs are the H4 snapshot.
 
-## 1. Rust workspace — 625 packages in `Cargo.lock`
+## 1. Rust workspace — 629 packages in `Cargo.lock`
 
-`cargo deny check licenses` **passes** (2026-11-14, H4 re-run; only two warnings, both
+`cargo deny check licenses` **passes** (2026-11-14, deep-scan gate re-run; only two warnings, both
 "license was not encountered" for allow-list entries `BSD-2-Clause` and `Unicode-DFS-2016`
 that no crate currently uses — the allow-list is kept as-is, the warnings are not failures).
 
@@ -32,8 +32,8 @@ that no crate currently uses — the allow-list is kept as-is, the warnings are 
 | Declared license | Packages | Note |
 |---|---|---|
 | `MIT OR Apache-2.0` | 286 | standard dual |
-| `MIT` | 146 | incl. all 12 RSH workspace crates |
-| `Apache-2.0 OR MIT` | 63 | same pair, reversed |
+| `MIT` | 148 | incl. all 13 RSH workspace crates |
+| `Apache-2.0 OR MIT` | 65 | same pair, reversed |
 | `Zlib OR Apache-2.0 OR MIT` | 20 | |
 | `MIT/Apache-2.0` | 19 | old slash notation = dual |
 | `Unicode-3.0` | 18 | ICU data crates |
@@ -44,9 +44,11 @@ that no crate currently uses — the allow-list is kept as-is, the warnings are 
 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | 5 | |
 | `Apache-2.0/MIT` | 4 | old slash notation = dual |
 | `Apache-2.0 OR ISC OR MIT` / `ISC` | 3 + 3 | |
-| `CC0-1.0 OR MIT-0 OR Apache-2.0` / `Zlib` / `MIT OR Zlib OR Apache-2.0` / `BSD-3-Clause OR MIT OR Apache-2.0` / `MIT OR Apache-2.0 OR Zlib` / `Unlicense/MIT` / `BSD-2-Clause OR Apache-2.0 OR MIT` | 2 each | all permissive options |
-| Single-package expressions (1 each) | 14 | `0BSD OR MIT OR Apache-2.0`, `BSD-3-Clause AND MIT`, `BSD-3-Clause/MIT`, `Apache-2.0 AND MIT`, `MIT OR Apache-2.0 OR BSD-1-Clause`, `Apache-2.0 / MIT`, `MIT OR BSD-3-Clause`, `MIT / Apache-2.0`, `BSD-2-Clause OR MIT OR Apache-2.0`, `Apache-2.0 AND ISC`, `Apache-2.0 WITH LLVM-exception`, `(MIT OR Apache-2.0) AND Unicode-3.0`, plus the two §1.3 rows below and `CDLA-Permissive-2.0` (§1.4) |
+| `CC0-1.0 OR MIT-0 OR Apache-2.0` / `Zlib` / `MIT OR Zlib OR Apache-2.0` / `BSD-3-Clause OR MIT OR Apache-2.0` / `MIT OR Apache-2.0 OR Zlib` / `Unlicense/MIT` / `BSD-2-Clause OR Apache-2.0 OR MIT` / `MIT OR Apache-2.0 OR LGPL-2.1-or-later` | 2 each | all permissive options (`MIT OR Apache-2.0 OR LGPL-2.1-or-later` is `r-efi` 5.3.0 + 6.0.0, §1.3 — MIT option taken) |
+| Single-package expressions (1 each) | 14 | `0BSD OR MIT OR Apache-2.0`, `BSD-3-Clause AND MIT`, `BSD-3-Clause/MIT`, `Apache-2.0 AND MIT`, `MIT OR Apache-2.0 OR BSD-1-Clause`, `Apache-2.0 / MIT`, `MIT OR BSD-3-Clause`, `MIT / Apache-2.0`, `BSD-2-Clause OR MIT OR Apache-2.0`, `Apache-2.0 AND ISC`, `Apache-2.0 WITH LLVM-exception`, `(MIT OR Apache-2.0) AND Unicode-3.0`, plus `MIT OR GPL-3.0-only` (unescaper, §1.3) and `CDLA-Permissive-2.0` (§1.4) |
 | **No license field missing** | 0 | every package declares a license |
+
+Rows sum to 629 (286 + 148 + 65 + 20 + 19 + 18 + 9 + 8 + 6 + 5 + 5 + 4 + 6 + 16 + 14), verified against `cargo metadata` full resolve, 2026-11-14 deep-scan gate. Count history: 625 at Phase H (rsh-rig missing from the SBOM, §16.11), 626 after the SBOM regen (+ rsh-rig), 629 now (+ `rfd` 0.17.2 MIT, `tauri-plugin-dialog` 2.8.4 + `tauri-plugin-fs` 2.7.1, both `Apache-2.0 OR MIT` — the dialog plugin, deep-scan Round 2).
 
 Per-package detail (name, version, purl, declared license) is `sbom/rust.cdx.json`.
 
@@ -142,5 +144,5 @@ hand-written; verify the pins at release time against `docs/HIDMAESTRO-SPIKE.md`
 1. `cargo deny check` (CI `audit` job) — must be green; any new license failure blocks release.
 2. Regenerate `sbom/rust.cdx.json` with `cargo cyclonedx` and `sbom/frontend.cdx.json`
    with `npm sbom` in `release.yml`; diff the component counts against this file
-   (Rust 625 lockfile / 299 Windows-tree, frontend 320) and explain any delta.
+   (Rust 629 lockfile / 299 Windows-tree, frontend 320) and explain any delta.
 3. Re-verify the HIDMaestro pins (ZIP + DLL SHA-256) before publishing the sidecar.

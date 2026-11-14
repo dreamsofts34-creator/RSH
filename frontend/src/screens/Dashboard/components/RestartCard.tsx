@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { useTranslation } from "react-i18next";
 import { RotateCcw } from "lucide-react";
 import type { ProfileSummary } from "@/lib/tauri";
@@ -16,7 +17,7 @@ interface RestartCardProps {
  * Active profile + Restart wheel. This is the ONLY place the Restart
  * wheel control lives (UI plan golden rule 2).
  */
-export function RestartCard({
+function RestartCardInner({
   activeProfile,
   restartState,
   onRestart,
@@ -50,9 +51,14 @@ export function RestartCard({
             : t("dashboard.restart.button")}
         </Button>
         {restartState === "done" ? (
-          <p role="status" className="text-sm text-[var(--success-text)]">
-            {t("dashboard.restart.done")}
-          </p>
+          <>
+            <p role="status" className="text-sm text-[var(--success-text)]">
+              {t("dashboard.restart.done")}
+            </p>
+            <p className="text-sm text-[var(--muted)]">
+              {t("dashboard.restart.rebootGuidance")}
+            </p>
+          </>
         ) : null}
         {restartState === "error" ? (
           <p role="alert" className="text-sm text-[var(--error-text)]">
@@ -68,3 +74,7 @@ export function RestartCard({
     </Card>
   );
 }
+
+/** Memoised: the Dashboard re-renders at 30 Hz from the snapshot feed
+ *  (H4) — this component only re-renders when its own props change. */
+export const RestartCard = memo(RestartCardInner);

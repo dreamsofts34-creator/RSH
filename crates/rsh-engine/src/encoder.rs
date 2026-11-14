@@ -149,6 +149,8 @@ pub struct EncoderTracker {
     /// Last seen cumulative count per encoder, or `None` before the
     /// first sample.
     previous: [Option<i16>; MAX_ENCODERS],
+    /// Glitch jumps dropped by the filter (M4: gap-aware, counted).
+    glitch_dropped: u64,
 }
 
 impl EncoderTracker {
@@ -157,6 +159,7 @@ impl EncoderTracker {
     pub const fn new() -> Self {
         Self {
             previous: [None; MAX_ENCODERS],
+            glitch_dropped: 0,
         }
     }
 
@@ -167,6 +170,19 @@ impl EncoderTracker {
     /// [`MAX_ENCODER_DELTA_PER_TICK`]) returns 0 and is never
     /// applied — but the baseline still advances to the new count.
     pub fn update(&mut self, index: usize, count: i16) -> i16 {
+        self.update_with_gap(index, count, 0)
+    }
+
+    /// Update one encoder with the sequence gap since the previous
+    /// sample (`skipped` stream frames were lost in between, M4).
+    ///
+    /// The per-tick limit scales with the gap: a wheel that kept
+    /// turning while `skipped` frames were lost may legitimately move
+    /// `32 * (skipped + 1)` counts, so the glitch threshold is
+    /// `32 * (skipped + 1)` (capped at the `i16` range). A jump past
+    /// that is still a glitch: dropped, counted in
+    /// [`Self::glitch_dropped`], baseline still advances.
+    pub fn update_with_gap(&mut self, index: usize, count: i16, skipped: u16) -> i16 {
         if index >= MAX_ENCODERS {
             return 0;
         }
@@ -175,7 +191,13 @@ impl EncoderTracker {
             None => 0,
         };
         self.previous[index] = Some(count);
-        if delta.unsigned_abs() > MAX_ENCODER_DELTA_PER_TICK.unsigned_abs() {
+        // 32 counts/tick × (skipped + 1) ticks of legitimate motion,
+        // saturating so a huge gap can never overflow the limit.
+        let limit = u32::from(MAX_ENCODER_DELTA_PER_TICK.unsigned_abs())
+            .saturating_mul(u32::from(skipped) + 1)
+            .min(u32::from(i16::MAX.unsigned_abs()) + 1);
+        if u32::from(delta.unsigned_abs()) > limit {
+            self.glitch_dropped += 1;
             0
         } else {
             delta
@@ -191,11 +213,29 @@ impl EncoderTracker {
         counts: &[i16; MAX_ENCODERS],
         n_enc: usize,
     ) -> [i16; MAX_ENCODERS] {
+        self.update_all_with_gap(counts, n_enc, 0)
+    }
+
+    /// [`Self::update_all`] with the sequence gap since the previous
+    /// frame (M4): the glitch limit scales with the gap, see
+    /// [`Self::update_with_gap`].
+    pub fn update_all_with_gap(
+        &mut self,
+        counts: &[i16; MAX_ENCODERS],
+        n_enc: usize,
+        skipped: u16,
+    ) -> [i16; MAX_ENCODERS] {
         let mut deltas = [0i16; MAX_ENCODERS];
         for (i, &count) in counts.iter().enumerate().take(n_enc.min(MAX_ENCODERS)) {
-            deltas[i] = self.update(i, count);
+            deltas[i] = self.update_with_gap(i, count, skipped);
         }
         deltas
+    }
+
+    /// Glitch jumps dropped so far by the filter.
+    #[must_use]
+    pub const fn glitch_dropped(&self) -> u64 {
+        self.glitch_dropped
     }
 
     /// Forget all baselines; the next sample for each encoder is a
@@ -310,5 +350,36 @@ mod tests {
         assert!(buttons.clockwise(3));
         assert!(buttons.any());
         assert_eq!(deltas_to_buttons(&[0, 0, 0, 0]), EncoderButtons::none());
+    }
+
+    #[test]
+    fn gap_aware_filter_scales_limit_and_counts_glitches() {
+        // M4: after a gap of 3 skipped frames the wheel may legitimately
+        // have moved 32 * (3 + 1) = 128 counts.
+        let mut tracker = EncoderTracker::new();
+        assert_eq!(tracker.update(0, 0), 0);
+        assert_eq!(tracker.update_with_gap(0, 128, 3), 128);
+        assert_eq!(tracker.glitch_dropped(), 0);
+        // One count past the gap-scaled limit is still a glitch.
+        assert_eq!(tracker.update_with_gap(0, 128 + 129, 3), 0);
+        assert_eq!(tracker.glitch_dropped(), 1);
+        // Baseline advanced past the glitch, so normal steps apply.
+        assert_eq!(tracker.update(0, 128 + 129 + 2), 2);
+        // Without a gap the same 129-count jump is a glitch.
+        let mut tracker = EncoderTracker::new();
+        assert_eq!(tracker.update(0, 0), 0);
+        assert_eq!(tracker.update(0, 129), 0);
+        assert_eq!(tracker.glitch_dropped(), 1);
+        // update_all_with_gap passes the gap through per encoder:
+        // gap 2 allows 96, so +100 passes and +100 on the second
+        // encoder... use +97 (dropped) to show the per-encoder limit.
+        let mut tracker = EncoderTracker::new();
+        assert_eq!(tracker.update_all(&[0, 0, 0, 0], 2), [0, 0, 0, 0]);
+        assert_eq!(
+            tracker.update_all_with_gap(&[96, 97, 0, 0], 2, 2),
+            [96, 0, 0, 0],
+            "gap 2 allows 96 counts per encoder"
+        );
+        assert_eq!(tracker.glitch_dropped(), 1);
     }
 }

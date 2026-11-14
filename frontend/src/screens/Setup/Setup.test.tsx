@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, within } from "@testing-library/react";
+import { render, screen, fireEvent, within, act } from "@testing-library/react";
 import i18n from "@/lib/i18n";
 import { toScreenDefinition } from "@/lib/screens";
 import {
@@ -173,6 +173,14 @@ describe("Setup wizard (E3 / UI plan P5)", () => {
 
   it("advancing marks the step complete, checkmarks it, and persists progress", async () => {
     const { unmount } = render(<SetupScreen />);
+    // H5: Next is gated on the step's success — connect first.
+    const panel = screen.getByRole("region", { name: "Connect" });
+    fireEvent.click(within(panel).getByRole("button", { name: "Connect" }));
+    await within(panel).findByText(/Status: Connected/);
+    // The step reports success in a passive effect after the async
+    // connect resolves; flush it before clicking Next, or the wizard
+    // still sees the step as incomplete (flaky under full-suite load).
+    await act(async () => {});
     fireEvent.click(screen.getByRole("button", { name: "Next" }));
     expect(screen.getByText("Step 2 of 7")).toBeInTheDocument();
     expect(
@@ -183,6 +191,18 @@ describe("Setup wizard (E3 / UI plan P5)", () => {
     unmount();
     render(<SetupScreen />);
     expect(screen.getByText("Step 2 of 7")).toBeInTheDocument();
+  });
+
+  it("Next stays gated until the current step succeeds", async () => {
+    render(<SetupScreen />);
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("Step 1 of 7")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Complete this step before continuing/),
+    ).toBeInTheDocument();
+    expect(
+      window.localStorage.getItem("rsh.setup.completed"),
+    ).not.toContain("connect");
   });
 
   it("future steps are locked until reached in order", () => {

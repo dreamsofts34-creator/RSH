@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { useTranslation } from "react-i18next";
 import { Wifi, Usb, PlugZap } from "lucide-react";
 import type { ConnectionState, TransportState } from "@/lib/tauri";
@@ -28,7 +29,7 @@ function stateVariant(state: ConnectionState): "default" | "secondary" | "destru
 }
 
 /** Connection status card: transport kind, board address, session state. */
-export function ConnectionCard({
+function ConnectionCardInner({
   transport,
   loadState,
   liveConnection,
@@ -104,3 +105,7 @@ export function ConnectionCard({
 function capitalize(state: ConnectionState): string {
   return state.charAt(0).toUpperCase() + state.slice(1);
 }
+
+/** Memoised: the Dashboard re-renders at 30 Hz from the snapshot feed
+ *  (H4) — this component only re-renders when its own props change. */
+export const ConnectionCard = memo(ConnectionCardInner);

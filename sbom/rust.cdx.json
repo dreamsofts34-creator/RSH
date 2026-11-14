@@ -2,15 +2,15 @@
   "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:a15a201c-180d-4c1e-938c-068403557e3e",
+  "serialNumber": "urn:uuid:7b6b312d-f05f-4c79-b2a0-fba448430a19",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-11-14T09:48:51Z",
+    "timestamp": "2026-11-14T18:25:48Z",
     "tools": [
       {
         "vendor": "RSH",
-        "name": "cargo-metadata SBOM generator (H4)",
-        "version": "1.0"
+        "name": "cargo-metadata SBOM generator",
+        "version": "1.1"
       }
     ],
     "component": {
@@ -18,7 +18,7 @@
       "bom-ref": "pkg:cargo/rsh-app@1.0.0",
       "name": "rsh-app",
       "version": "1.0.0",
-      "description": "RSH (Real Sim Hub) v1.0.0 \u2014 Tauri 2 app; Rust workspace SBOM generated from Cargo.lock via cargo metadata (full lockfile resolve, 625 packages). The Windows release tree (cargo tree -p rsh-app --target x86_64-pc-windows-msvc) is a 299-package subset; see THIRD-PARTY-LICENSES.md. Regenerate at release time with cargo cyclonedx (see .github/workflows/release.yml)."
+      "description": "RSH (Real Sim Hub) v1.0.0 \u2014 Tauri 2 app; Rust workspace SBOM generated from Cargo.lock via cargo metadata (full lockfile resolve, 629 packages). The Windows release tree (cargo tree -p rsh-app --target x86_64-pc-windows-msvc) is a 299-package subset; see THIRD-PARTY-LICENSES.md. Regenerate at release time with .github/scripts/generate-rust-sbom.py (cargo cyclonedx does NOT reproduce this file \u2014 per-crate BOMs, host-target only, dev-deps excluded; see docs/DECISIONS.md \u00a716)."
     },
     "licenses": [
       {
@@ -4661,6 +4661,20 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/rfd@0.17.2",
+      "name": "rfd",
+      "version": "0.17.2",
+      "purl": "pkg:cargo/rfd@0.17.2",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/ring@0.17.14",
       "name": "ring",
       "version": "0.17.14",
@@ -4789,6 +4803,20 @@
       "name": "rsh-protocol",
       "version": "1.0.0",
       "purl": "pkg:cargo/rsh-protocol@1.0.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/rsh-rig@1.0.0",
+      "name": "rsh-rig",
+      "version": "1.0.0",
+      "purl": "pkg:cargo/rsh-rig@1.0.0",
       "licenses": [
         {
           "license": {
@@ -5895,6 +5923,30 @@
       "name": "tauri-plugin-autostart",
       "version": "2.7.0",
       "purl": "pkg:cargo/tauri-plugin-autostart@2.7.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tauri-plugin-dialog@2.8.4",
+      "name": "tauri-plugin-dialog",
+      "version": "2.8.4",
+      "purl": "pkg:cargo/tauri-plugin-dialog@2.8.4",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tauri-plugin-fs@2.7.1",
+      "name": "tauri-plugin-fs",
+      "version": "2.7.1",
+      "purl": "pkg:cargo/tauri-plugin-fs@2.7.1",
       "licenses": [
         {
           "expression": "Apache-2.0 OR MIT"

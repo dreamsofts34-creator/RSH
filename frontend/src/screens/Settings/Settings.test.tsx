@@ -208,7 +208,8 @@ describe("Settings screen", () => {
     await screen.findByText("Appearance");
     fireEvent.click(screen.getByRole("button", { name: "Dark" }));
     await waitFor(() => {
-      expect(setSettingsCall()).toMatchObject({ theme: "dark" });
+      // C-SET-1: the payload carries the backend canonical vocabulary.
+      expect(setSettingsCall()).toMatchObject({ theme: "Dark" });
     }, { timeout: 5000 });
     expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
   });
@@ -297,7 +298,7 @@ describe("Settings screen", () => {
     fireEvent.change(screen.getByLabelText("Wheel address"), {
       target: { value: "192.168.4.2" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Save transport" }));
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith(
         "switch_transport",
@@ -360,6 +361,15 @@ describe("parseSettings", () => {
     expect(parsed.modules.brake).toBe(true);
     expect(parsed.theme).toBe("dark");
     expect(parsed.language).toBe("ur");
+  });
+
+  it("parses the backend canonical theme vocabulary (C-SET-1)", () => {
+    expect(parseSettings({ theme: "Dark" }).theme).toBe("dark");
+    expect(parseSettings({ theme: "HighContrast" }).theme).toBe(
+      "high-contrast",
+    );
+    expect(parseSettings({ theme: "System" }).theme).toBe("system");
+    expect(parseSettings({ theme: "Light" }).theme).toBe("light");
   });
 
   it("falls back to defaults on garbage input", () => {

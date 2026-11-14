@@ -3,29 +3,26 @@
 # Phase A4 (CI first). Triggers on push + pull_request to main.
 # Source of truth for the job list: TESTING-INPUT.md §9.1.
 #
-# ---- SKIP MAP — a skip here is NEVER a pass. Read before trusting green. ----
-# Jobs skip cleanly (loud ::notice, exit 0) ONLY while their phase has not
-# landed yet. As soon as the prerequisite file/dir exists, the job runs for
-# real and can fail. Current expected skips (2026-11-14, Phase A):
-#   fmt / clippy / test-linux / test-windows / audit
-#       skip while there is no Cargo.toml at the repo root (Phase A2 lands
-#       the Cargo workspace skeleton). Audit additionally FAILS (not skips)
-#       if Cargo.toml exists but Cargo.lock is missing — the lockfile must
-#       be committed (SECURITY-INPUT §0).
-#   fuzz-quick   — skips while fuzz/ has no targets (Phase A1 creates them).
-#   bench-gate   — FAIL-CLOSED while thresholds.json is missing (Phase B
-#       creates it at tools/rsh-benchmarks/thresholds.json): the job
-#       exits 1 with "thresholds not yet defined (Phase B)". It never
-#       claims a bench pass without thresholds. Enforcement is
-#       tools/rsh-benchmarks/check-thresholds.py over the criterion
-#       estimates from `cargo bench -p rsh-benchmarks` (plain
-#       `cargo bench` would NOT run this crate: rsh-benchmarks is a
-#       workspace member but not a default member).
-#   firmware     — skips while firmware/ is absent (restored in Phase D from
-#       reference/firmware-v4.0.1). Runs `pio run` + merged-bin check.
-#   frontend     — skips while frontend/package.json is absent (Phase E).
-#   rig-gate     — skips while run-rig.sh is absent (Rust rig, Phase B/C).
-#   tauri-build  — skips while src-tauri/ is absent (Phase A2/E).
+# ---- PHASE H REALITY (rewritten deep-scan Round 2, L3) ----
+# Every phase has landed. The prerequisites below are all present in the
+# tree, so NO job is expected to skip anymore:
+#   fmt / clippy / clippy-windows / test-linux / test-windows / audit
+#       Cargo.toml + Cargo.lock committed (Phase A2/H).
+#   fuzz-quick   — fuzz/fuzz_targets/*.rs landed (Phase A1).
+#   bench-gate   — tools/rsh-benchmarks/thresholds.json landed (Phase B).
+#   firmware     — firmware/platformio.ini restored (Phase D).
+#   frontend     — frontend/package.json landed (Phase E).
+#   rig-gate     — tools/rsh-rig landed (Phase B/C); the job is FAIL-CLOSED
+#       (deep-scan Round 2, H1): if the rig crate disappears, the job
+#       FAILS, it never goes back to skipping.
+#   tauri-build  — src-tauri/ landed (Phase A2/E).
+# The `Check ... present` steps are kept as tripwires: a skip in Phase H
+# means a landed artifact vanished from the tree, and the loud ::notice
+# is the signal to investigate — it is NOT a pass and NOT normal.
+# (bench-gate and audit keep their fail-closed missing-prerequisite
+# branches for the same reason: thresholds.json / Cargo.lock must exist.)
+# The `gate` job (last job) aggregates all 12 jobs and fails unless every
+# one of them reports success — it is the single required check.
 #
 # ---- What this workflow does NOT do (deliberately) ----
 #   * No release workflow: .github/workflows/release.yml is Phase H
@@ -37,9 +34,26 @@
 #     (CI firmware builds run WITHOUT RSH_SIGNING_KEY, so they are unsigned
 #     dev builds — sign_firmware.py skips signing and does not fail.)
 #   * No 4-hour soak in CI: the long soak is a release blocker (D-R14) and
-#     runs in the rig (--long), not in CI.
+#     runs in the rig (--long), not in CI. The 4-hour soak itself is
+#     SKIPPED by user order 2026-11-14 14:54 (DECISIONS §13) — never
+#     presented as passed.
 #   * No `cargo test --workspace --release`: per TESTING-INPUT §9.1 that run
 #     is required at least once before the release gate, not on every push.
+#     The release workflow runs it (deep-scan Round 2, H4).
+#
+# ---- Linux / Windows split (deep-scan Round 2, H3) ----
+# `rsh-app` (src-tauri) is a workspace member, but its build script
+# (`tauri_build::build()`) copies the `bundle.externalBin` sidecar at
+# build-script time and fails with `ResourcePathNotFound` when the staged
+# file for the CURRENT target triple is missing (tauri-build 2.7.4
+# `copy_binaries` + tauri-utils 2.10.2 `resource_from_path` — proven
+# from the bundled crate sources). The sidecar is a Windows NativeAOT
+# exe and can only be staged on Windows, so NO Linux job may build
+# `rsh-app`: Linux clippy/test use `--workspace --exclude rsh-app`,
+# and the shell is covered by the Windows jobs (`clippy-windows`,
+# `test-windows`, `tauri-build`). A bare `--workspace` on Linux would
+# fail at the rsh-app build script — that is why the scope is split
+# this way, not an oversight.
 #
 # Toolchain: Rust stable 1.100.0 (pinned; rust-toolchain.toml in Phase A2
 # pins the same). Actions verified 2026-11-14: actions/checkout@v4,
@@ -126,13 +140,62 @@ jobs:
           components: clippy
       - name: Install Tauri Linux system libraries
         if: steps.check.outputs.run == 'true'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libudev-dev
       - name: Cache Cargo dependencies
         if: steps.check.outputs.run == 'true'
         uses: Swatinem/rust-cache@v2
+      # H3 (deep-scan Round 2): `--workspace` WITHOUT `--exclude rsh-app`
+      # would fail on Linux — the rsh-app build script needs the staged
+      # Windows sidecar (see the header split note). `--exclude rsh-app`
+      # still covers every other member, including the non-default ones
+      # (rsh-benchmarks, rsh-rig); the shell itself is covered by the
+      # `clippy-windows` job (-p rsh-app, sidecar staged).
       - name: cargo clippy (warnings denied)
         if: steps.check.outputs.run == 'true'
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude rsh-app --all-targets -- -D warnings
+
+  clippy-windows:
+    name: clippy (Windows, rsh-app)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Rust workspace present
+        id: check
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ] && [ -d src-tauri ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SKIP: no Cargo.toml / src-tauri yet — Tauri shell lands in Phase A2/E. This is a skip, not a pass."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust 1.100.0
+        if: steps.check.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+          components: clippy
+      - name: Cache Cargo dependencies
+        if: steps.check.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+      # The rsh-app build script validates bundle.externalBin at build
+      # time, so the HIDMaestro sidecar must be staged BEFORE clippy
+      # builds the shell — otherwise it fails with "resource path
+      # `binaries\\rsh-hm-sidecar-...exe` doesn't exist" (same failure
+      # as the release dry runs #1/#2). Shared script (M6).
+      - name: Set up .NET 10 SDK
+        if: steps.check.outputs.run == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Stage HIDMaestro sidecar (shared script)
+        if: steps.check.outputs.run == 'true'
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
+      - name: cargo clippy -p rsh-app (warnings denied)
+        if: steps.check.outputs.run == 'true'
+        run: cargo clippy -p rsh-app --all-targets -- -D warnings
 
   test-linux:
     name: test (Linux)
@@ -157,13 +220,19 @@ jobs:
           toolchain: "1.100.0"
       - name: Install Tauri Linux system libraries
         if: steps.check.outputs.run == 'true'
-        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libudev-dev
       - name: Cache Cargo dependencies
         if: steps.check.outputs.run == 'true'
         uses: Swatinem/rust-cache@v2
-      - name: cargo test --workspace
+      - name: cargo test --workspace (excluding rsh-app on Linux)
         if: steps.check.outputs.run == 'true'
-        run: cargo test --workspace
+        # Same split as clippy (header note): a bare --workspace would
+        # build rsh-app, whose build script fails on Linux without the
+        # staged Windows sidecar. rsh-app is tested on Windows
+        # (test-windows, sidecar staged); the Linux run covers the
+        # other 12 members. (Deep-scan Round 2 — same root cause as H3;
+        # found while fixing the clippy scope, not in the audit list.)
+        run: cargo test --workspace --exclude rsh-app
 
   test-windows:
     name: test (Windows)
@@ -191,6 +260,20 @@ jobs:
         uses: Swatinem/rust-cache@v2
       # Windows-only tests run here; on Linux they skip with a reason
       # (TESTING-INPUT §9.1).
+      # The rsh-app build script (Tauri) validates bundle.externalBin at
+      # build time, so the HIDMaestro sidecar must be staged BEFORE any
+      # cargo build of the app — otherwise `cargo test --workspace` fails
+      # with "resource path `binaries\\rsh-hm-sidecar-...exe` doesn't
+      # exist" (release dry runs #1/#2 + first CI run, 2026-11-14).
+      - name: Set up .NET 10 SDK
+        if: steps.check.outputs.run == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Stage HIDMaestro sidecar (shared script)
+        if: steps.check.outputs.run == 'true'
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
       - name: cargo test --workspace
         if: steps.check.outputs.run == 'true'
         run: cargo test --workspace
@@ -215,13 +298,19 @@ jobs:
         if: steps.check.outputs.run == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly
+          # Pinned nightly (M2): an unpinned `nightly` floats — a new
+          # nightly can break cargo-fuzz without any repo change. Date
+          # verified 2026-11-14 (channel manifest exists at
+          # static.rust-lang.org/dist/2026-11-13/channel-rust-nightly.toml).
+          toolchain: nightly-2026-11-13
       - name: Cache Cargo dependencies
         if: steps.check.outputs.run == 'true'
         uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
         if: steps.check.outputs.run == 'true'
-        run: cargo install cargo-fuzz --locked
+        # Pinned (M2): 0.13.2 is the latest stable on crates.io, and the
+        # version installed in the sandbox, 2026-11-14.
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
       # cargo-fuzz is Unix-only (TESTING-INPUT §0.1) — Linux job only.
       # 60 s per target (Phase A4 spec). TESTING-INPUT Phase 1 mentions
       # 5 min per target in CI; the 60 s quick run is what this job does
@@ -234,7 +323,7 @@ jobs:
           for target in fuzz/fuzz_targets/*.rs; do
             name="$(basename "$target" .rs)"
             echo "::group::fuzz target: $name"
-            cargo +nightly fuzz run "$name" -- -max_total_time=60
+            cargo +nightly-2026-11-13 fuzz run "$name" -- -max_total_time=60
             echo "::endgroup::"
           done
 
@@ -419,13 +508,51 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit and cargo-deny
         if: steps.check.outputs.state == 'run'
-        run: cargo install cargo-audit cargo-deny --locked
+        # Pinned (M2): 0.23.0 / 0.20.2 are the latest stable versions on
+        # crates.io, and the versions installed in the sandbox, 2026-11-14.
+        # One install per tool: `cargo install --version` applies to a
+        # single crate, so a combined install cannot pin both.
+        run: |
+          cargo install cargo-audit --version 0.23.0 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
       # --deny warnings also fails on unmaintained/unsound advisories
       # (TESTING-INPUT §6). Ignores, if ever needed, go in audit.toml
       # with an expiry + reason — never silently.
-      - name: cargo audit --deny warnings
+      # H2 (deep-scan Round 2): `cargo audit` exits 0 even when the yanked
+      # check never completed — the output then contains 612×
+      # "error: couldn't check if the package is yanked: registry: request
+      # could not be completed in the allotted timeframe" (Phase H gate,
+      # 7th consecutive phase; reproduced locally 2026-11-14). Exit 0 is
+      # NOT a pass for the yanked check, so this step retries (3 attempts,
+      # 30 s apart — the timeouts are transient registry slowness) and
+      # FAILS if the yanked verdict is still missing after the last
+      # attempt. `deny.toml` sets yanked = "deny" on the same basis: the
+      # retry makes the registry check reliable in CI, where the registry
+      # is reachable (the sandbox timeouts are a sandbox-network limit).
+      - name: cargo audit --deny warnings (fail-closed yanked check)
         if: steps.check.outputs.state == 'run'
-        run: cargo audit --deny warnings
+        shell: bash
+        run: |
+          set -euo pipefail
+          audit_out="$(mktemp)"
+          trap 'rm -f "$audit_out"' EXIT
+          attempt=0
+          while [ "$attempt" -lt 3 ]; do
+            attempt=$((attempt + 1))
+            echo "cargo audit attempt $attempt/3"
+            audit_rc=0
+            cargo audit --deny warnings >"$audit_out" 2>&1 || audit_rc=$?
+            if grep -q "couldn't check if the package is yanked" "$audit_out"; then
+              echo "::warning::cargo audit attempt $attempt: yanked check incomplete (registry timeout) — retrying..."
+              sleep 30
+              continue
+            fi
+            cat "$audit_out"
+            exit "$audit_rc"
+          done
+          echo "::error::cargo audit yanked check incomplete after 3 attempts — no yanked verdict, failing closed (see deny.toml yanked = \"deny\")."
+          cat "$audit_out"
+          exit 1
       # Policy in deny.toml (repo root): sources = crates.io only, git
       # denied; licenses = permissive allow-list (MIT/Apache-2.0/BSD
       # + narrow ecosystem extras, see deny.toml header).
@@ -441,16 +568,28 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Check rig present
+      # H1 (deep-scan Round 2): the old job skipped while `run-rig.sh`
+      # was absent — but there never was a run-rig.sh; the rig lives at
+      # tools/rsh-rig (Phase B/C). The predicate now checks the real rig
+      # crate, and the job is FAIL-CLOSED: if the rig disappears from
+      # the tree, the job FAILS instead of silently skipping. No
+      # run-rig.sh wrapper was added — `cargo run -p rsh-rig` is the
+      # rig's own entry point (tools/rsh-rig/src/main.rs).
+      - name: Check rig present (fail closed)
         id: check
         shell: bash
         run: |
-          if [ -f run-rig.sh ]; then
+          if [ -d tools/rsh-rig ] && [ -f tools/rsh-rig/Cargo.toml ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::SKIP: no run-rig.sh yet — Rust Virtual Test Rig lands in Phase B/C (TESTING-INPUT §8). This is a skip, not a pass."
-            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "state=missing-rig" >> "$GITHUB_OUTPUT"
           fi
+      - name: Fail closed — rig missing
+        if: steps.check.outputs.state == 'missing-rig'
+        shell: bash
+        run: |
+          echo "::error::tools/rsh-rig is missing — the Virtual Test Rig (Phase B/C) is a landed artifact. rig-gate is FAIL-CLOSED (deep-scan Round 2, H1): a missing rig fails the job, it never skips. Restore tools/rsh-rig; do not re-add a skip."
+          exit 1
       - name: Install Rust 1.100.0
         if: steps.check.outputs.run == 'true'
         uses: dtolnay/rust-toolchain@stable
@@ -461,10 +600,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
       # Quick rig gate (60 s soak + scenarios), per TESTING-INPUT §9.1.
       # Full (10-min) and long (4-h, release blocker D-R14) soaks run
-      # outside CI, in the rig itself.
-      - name: ./run-rig.sh (quick)
+      # outside CI, in the rig itself. (The 4-h soak is SKIPPED by user
+      # order 2026-11-14 14:54 — DECISIONS §13 — never claimed as passed.)
+      - name: cargo run -p rsh-rig -- --mode quick
         if: steps.check.outputs.run == 'true'
-        run: ./run-rig.sh
+        run: cargo run -p rsh-rig -- --mode quick
 
   tauri-build:
     name: tauri-build
@@ -500,7 +640,7 @@ jobs:
       # npm script and no `@tauri-apps/cli` in `frontend/package.json`
       # — the job could never work as written. It now installs the
       # Tauri CLI with cargo exactly like the release workflow does
-      # (`cargo install tauri-cli --locked`), and runs
+      # (`cargo install tauri-cli --version 2.12.4 --locked`), and runs
       # `cargo tauri build` from `src-tauri/` (the CLI resolves
       # `tauri.conf.json` there; its `beforeBuildCommand` runs
       # `npm run build` in `../frontend`, so `npm ci` below must run
@@ -510,7 +650,9 @@ jobs:
         if: steps.check.outputs.run == 'true'
         shell: bash
         run: |
-          cargo install tauri-cli --locked
+          # Pinned (M2): 2.12.4 is the latest stable 2.x on crates.io
+          # (3.0.0-alpha.6 exists — do NOT pin a 3.0 alpha for a 2.x app).
+          cargo install tauri-cli --version 2.12.4 --locked
           cargo tauri --version
       # Build only — no bundling, no signing in CI. Release workflow
       # (Phase H) does the bundling + installer + signed updater.
@@ -527,8 +669,64 @@ jobs:
             exit 1
           fi
           npm ci
+      # The rsh-app build script (Tauri) validates bundle.externalBin at
+      # build time, so the HIDMaestro sidecar must be staged BEFORE the
+      # build — otherwise `cargo tauri build` fails with "resource path
+      # `binaries\\rsh-hm-sidecar-...exe` doesn't exist" (first CI run,
+      # 2026-11-14). Shared script (M6) — same staging as test-windows
+      # and the release workflow.
+      - name: Set up .NET 10 SDK
+        if: steps.check.outputs.run == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Stage HIDMaestro sidecar (shared script)
+        if: steps.check.outputs.run == 'true'
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
       - name: cargo tauri build --no-bundle
         if: steps.check.outputs.run == 'true'
         working-directory: src-tauri
         shell: bash
         run: cargo tauri build --no-bundle
+
+  # M6 (deep-scan Round 2): single aggregator for branch protection.
+  # GitHub runs `needs` jobs independently; without this job a PR could
+  # look green while a required job was skipped or failed. The gate
+  # fails unless EVERY needed job reports success — a skip, failure or
+  # cancellation anywhere fails the gate (in Phase H no job is expected
+  # to skip; see the header note).
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - fmt
+      - clippy
+      - clippy-windows
+      - test-linux
+      - test-windows
+      - fuzz-quick
+      - bench-gate
+      - firmware
+      - frontend
+      - audit
+      - rig-gate
+      - tauri-build
+    if: always()
+    steps:
+      - name: All CI jobs must have succeeded
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c "
+          import json, os, sys
+          needs = json.loads(os.environ['NEEDS_JSON'])
+          bad = {name: job['result'] for name, job in needs.items() if job['result'] != 'success'}
+          if bad:
+              print('::error::CI gate FAILED — these jobs did not succeed: ' + ', '.join(f'{n}={r}' for n, r in sorted(bad.items())))
+              sys.exit(1)
+          print(f\"CI gate PASSED — all {len(needs)} jobs succeeded.\")
+          "
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}

@@ -50,7 +50,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
  *     signed `GET_CAPS` first, then closes it and zeroizes the key)
  *   - 30 Hz `rsh://snapshot` events + `rsh://button-press` events,
  *     emitted by the AppState snapshot emitter thread.
- * 56 commands in `IMPLEMENTED_COMMANDS` below; the
+ * 63 commands in `IMPLEMENTED_COMMANDS` below; the
  * NOT_YET_IMPLEMENTED list is empty — every command the screens need
  * has a live backend now.
  * ------------------------------------------------------------------
@@ -95,7 +95,7 @@ export class TauriCommandError extends Error {
  */
 export const NOT_YET_IMPLEMENTED_COMMANDS: readonly string[] = [];
 
-/** Commands that exist in src-tauri today (Phase H5-control: 56). */
+/** Commands that exist in src-tauri today (63: 56 Phase H5-control + 7 deep-scan Round 2 — `enable_auto_switch`, `led_test`, `key_reset`, `factory_reset`, `confirm_pairing_replacement`, `import_csharp_profiles`, `import_csharp_settings`). */
 export const IMPLEMENTED_COMMANDS: readonly string[] = [
   "ping",
   "get_version",
@@ -121,14 +121,21 @@ export const IMPLEMENTED_COMMANDS: readonly string[] = [
   "delete_profile",
   "import_profile",
   "export_profile",
+  "get_settings",
+  "set_settings",
+  "enable_auto_switch",
+  "led_test",
+  "key_reset",
+  "factory_reset",
+  "confirm_pairing_replacement",
+  "import_csharp_profiles",
+  "import_csharp_settings",
+  "backup_now",
+  "restore_backup",
   "list_games",
   "launch_game",
   "stop_game",
   "get_game_state",
-  "get_settings",
-  "set_settings",
-  "backup_now",
-  "restore_backup",
   "get_tuning",
   "set_tuning",
   "get_calibration",
@@ -343,6 +350,15 @@ export interface EngineSnapshot {
   encoders?: EncoderSnapshot[];
   /** Virtual buttons pressed this tick (subset of 65–72). */
   encoderButtons?: number[];
+  /**
+   * Board-reported `seqGap` counter from the latest status packet
+   * (C3: the backend sends this — the frontend must NOT invent its own
+   * gap count from `seq` jumps; a `seq` jump on the throttled display
+   * copy is not packet loss).
+   */
+  seqGap: number;
+  /** Board-reported `txFail` counter from the latest status packet. */
+  txFail: number;
 }
 
 export type TuningSettings = {
@@ -791,8 +807,9 @@ export function getSnapshot(): Promise<EngineSnapshot> {
 /* pushes, the UI reads. Subscribe once per component and unsubscribe  */
 /* on unmount. `rsh://snapshot` and `rsh://button-press` ARE emitted  */
 /* by src-tauri now (Phase G0 emitter thread); `rsh://game-state`,     */
-/* `rsh://config-rollback` and `rsh://pairing-window` are NOT YET     */
-/* EMITTED (no watcher / staging / pairing owner yet).                 */
+/* `rsh://config-rollback`, `rsh://pairing-window` and                  */
+/* `rsh://profile-switched` are emitted by the backend (C-EVT-1) —    */
+/* screens subscribe to them and never invent the events themselves.   */
 /* ------------------------------------------------------------------ */
 
 /** Subscribe to the 30 Hz engine snapshot feed (`rsh://snapshot`). */
@@ -839,6 +856,15 @@ export async function subscribePairingWindow(
   handler: (status: PairingStatus) => void,
 ): Promise<UnlistenFn> {
   return listen<PairingStatus>("rsh://pairing-window", (event) => {
+    handler(event.payload);
+  });
+}
+
+/** Profile-switch notifications (C-EVT-1). */
+export async function subscribeProfileSwitched(
+  handler: (profile: ProfileSummary) => void,
+): Promise<UnlistenFn> {
+  return listen<ProfileSummary>("rsh://profile-switched", (event) => {
     handler(event.payload);
   });
 }

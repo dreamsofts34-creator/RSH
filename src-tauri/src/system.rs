@@ -49,9 +49,11 @@ use tauri::{AppHandle, Manager, RunEvent};
 
 /// Args the app is launched with from autostart: start hidden to the
 /// tray (the window is only shown when the user clicks the tray icon
-/// or launches the app by hand). Passed to
-/// `tauri_plugin_autostart::init` — see the module docs.
-pub const AUTOSTART_ARGS: &[&str] = &["--tray"];
+/// or launches the app by hand), plus the `--rsh-version` flag so a
+/// second launch can be compared by the single-instance callback
+/// (L-4). Passed to `tauri_plugin_autostart::init` — see the module
+/// docs.
+pub const AUTOSTART_ARGS: &[&str] = &["--tray", "--rsh-version", rsh_app_core::system::APP_VERSION];
 
 // ---------------------------------------------------------------------------
 // Autostart (SW-R7.4)

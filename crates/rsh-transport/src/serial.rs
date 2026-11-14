@@ -43,24 +43,21 @@
 //! [`detect_board_port`] enumerates ports, ranks them by USB metadata
 //! (CP2102 first — the `DevKit V1` bridge — then CH340 clones, then any
 //! Espressif VID, then any USB serial whose manufacturer/product names
-//! the board), and returns the first candidate that actually opens
-//! with the standard settings. A port that fails to open is skipped
-//! silently — an open failure is never fatal to detection. This is the
-//! metadata half of protocol §10.6: the HELO-probe half (open each
-//! candidate, send HELO, keep the first port that answers a valid
-//! 92-byte HELLO within 500 ms) is **not** implemented here — it
-//! belongs to the session layer, which owns the HELO exchange — and
-//! stays an open item for the final-release gate.
+//! the board), and HELO-probes each candidate in rank order (protocol
+//! §10.6, M7): it opens the port, sends `HELO`, and keeps the first
+//! port that answers a valid 92-byte `HELLO` within 500 ms. A port
+//! that fails to open or never answers the probe is skipped silently.
 
 use std::fmt;
 use std::future::Future;
 use std::io::{self, Read, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::thread::{self, Builder};
-use std::time::Duration;
+use std::thread::{self, Builder, JoinHandle};
+use std::time::{Duration, Instant};
 
 use rsh_engine::engine::PacketSource;
 use rsh_protocol::{
@@ -81,6 +78,9 @@ pub const SERIAL_BAUD_RATE: u32 = 921_600;
 /// Reader-thread `read` timeout: how promptly shutdown is noticed, and
 /// how long an idle port waits between reads.
 pub const READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// How long [`detect_board_port`] waits per candidate for a valid
+/// 92-byte HELLO after sending the HELO probe (protocol §10.6).
+pub const HELO_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Largest read chunk from the port (max frame 1062 B, with slack).
 pub const MAX_READ_LEN: usize = 2048;
 /// Stream-frame channel capacity (200 Hz; the engine drains each tick).
@@ -147,6 +147,9 @@ struct AtomicCounters {
     status_received: AtomicU64,
     /// Ping frames parsed and handed to the ping channel.
     ping_received: AtomicU64,
+    /// Reader-thread panics caught by the `catch_unwind` guard (M6:
+    /// a panicking reader must be visible in `counters()`, not silent).
+    reader_panics: AtomicU64,
 }
 
 impl AtomicCounters {
@@ -176,6 +179,7 @@ impl AtomicCounters {
             hello_bad: load(&self.hello_bad),
             status_received: load(&self.status_received),
             ping_received: load(&self.ping_received),
+            reader_panics: load(&self.reader_panics),
         }
     }
 }
@@ -220,6 +224,8 @@ pub struct SerialCounters {
     pub status_received: u64,
     /// Ping frames parsed and handed to the ping channel.
     pub ping_received: u64,
+    /// Reader-thread panics caught by the `catch_unwind` guard (M6).
+    pub reader_panics: u64,
 }
 
 /// Configuration for [`SerialTransport::open`].
@@ -287,6 +293,10 @@ pub struct SerialTransport {
     counters: Arc<AtomicCounters>,
     /// Set by [`Self::shutdown`] / [`Drop`]; the reader exits promptly.
     shutdown: Arc<AtomicBool>,
+    /// Reader-thread handle (M6): polled by [`Self::reader_alive`]
+    /// so a dead reader is observable instead of silent. Never
+    /// joined — the thread is detached and exits on shutdown.
+    reader_handle: Option<JoinHandle<()>>,
 }
 
 impl fmt::Debug for SerialTransport {
@@ -330,12 +340,14 @@ impl SerialTransport {
             status: status_tx,
             ping: ping_tx,
         };
+        let mut reader_handle = None;
         spawn_reader(
             reader_port,
             senders,
             Arc::clone(&counters),
             Arc::clone(&shutdown),
-        )?;
+        )
+        .map(|handle| reader_handle = Some(handle))?;
         Ok(Self {
             port_name: config.port_name,
             port: Arc::new(Mutex::new(port)),
@@ -346,6 +358,7 @@ impl SerialTransport {
             ping_rx,
             counters,
             shutdown,
+            reader_handle,
         })
     }
 
@@ -373,6 +386,15 @@ impl SerialTransport {
     /// Stop the reader thread. Idempotent; [`Drop`] calls this.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// `true` while the reader thread is still running (M6 health
+    /// check — poll this alongside `counters().reader_panics`).
+    #[must_use]
+    pub fn reader_alive(&self) -> bool {
+        self.reader_handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
     }
 
     /// Send a HELO request (protocol §2.1) over the serial link,
@@ -455,6 +477,11 @@ impl PacketSource for SerialTransport {
 impl ControlTransport for SerialTransport {
     /// Send one raw control frame, wrapped as an `RSHS` kind-4 frame.
     ///
+    /// M5: the blocking serial write runs on a `spawn_blocking`
+    /// thread — never on the async task that called this, so a slow
+    /// or stuck port cannot stall the control client (or the engine).
+    /// A cancelled / panicking write task surfaces as an I/O error.
+    ///
     /// # Errors
     ///
     /// Returns [`TransportError::Io`] when the payload exceeds 1053
@@ -467,11 +494,20 @@ impl ControlTransport for SerialTransport {
         let counters = Arc::clone(&self.counters);
         let owned = bytes.to_vec();
         async move {
-            write_frame_to(
-                &port,
-                &counters,
-                &SerialFrame::new(SerialKind::Control, owned),
-            )
+            tokio::task::spawn_blocking(move || {
+                write_frame_to(
+                    &port,
+                    &counters,
+                    &SerialFrame::new(SerialKind::Control, owned),
+                )
+            })
+            .await
+            .map_err(|_| {
+                TransportError::Io(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "serial write task was cancelled",
+                ))
+            })?
         }
     }
 
@@ -510,20 +546,43 @@ pub fn available_ports() -> Vec<SerialPortInfo> {
 ///
 /// Ports are ranked by [`board_match_score`] (CP2102 first, then
 /// CH340, then Espressif VID, then any USB serial naming the board,
-/// then any USB serial); ties keep enumeration order. Candidates are
-/// tried in rank order and the first one that opens with the standard
-/// settings (921600 baud, DTR/RTS off — the open is closed again
-/// immediately, so the board is not reset) wins. A port that fails to
-/// open is skipped, never fatal. Returns [`None`] when no port
-/// matches or none opens.
+/// then any USB serial); ties keep enumeration order. Each candidate
+/// is opened with the standard settings (921600 baud, DTR/RTS off)
+/// and HELO-probed (protocol §10.6, M7): a `HELO` is sent and the
+/// port is kept only if a valid 92-byte `HELLO` arrives within
+/// [`HELO_PROBE_TIMEOUT`] (500 ms). A port that fails to open, or
+/// that opens but never answers the probe, is skipped — metadata
+/// alone is no longer enough to claim a port is the board, so a
+/// same-bridge device (or a board in the bootloader) is never
+/// mis-detected. Returns [`None`] when no candidate answers.
 ///
-/// This is the metadata half of protocol §10.6 auto-detect. It does
-/// **not** send a HELO probe: a port that opens and matches is
-/// returned on metadata alone, and the session layer confirms it is
-/// an RSH board with the HELO/HELLO exchange after opening it for
-/// real.
+/// The probe opens are closed again immediately, so the board is not
+/// reset by the detection itself.
 #[must_use]
 pub fn detect_board_port() -> Option<String> {
+    let mut ports = available_ports();
+    ports.sort_by_key(|info| std::cmp::Reverse(board_match_score(info)));
+    for info in ports {
+        if board_match_score(&info) == 0 {
+            continue;
+        }
+        let Ok(mut port) = open_serial_port(&info.port_name, SERIAL_BAUD_RATE, HELO_PROBE_TIMEOUT)
+        else {
+            continue;
+        };
+        if probe_port_for_hello(&mut port) {
+            return Some(info.port_name);
+        }
+    }
+    None
+}
+
+/// Metadata-only detection (the pre-M7 behaviour): the first ranked
+/// candidate that opens. Kept for callers that only need "a port
+/// exists" without the HELO round-trip — the session layer still
+/// confirms the board with its own HELO/HELLO exchange afterwards.
+#[must_use]
+pub fn detect_board_port_metadata_only() -> Option<String> {
     let mut ports = available_ports();
     ports.sort_by_key(|info| std::cmp::Reverse(board_match_score(info)));
     for info in ports {
@@ -535,6 +594,45 @@ pub fn detect_board_port() -> Option<String> {
         }
     }
     None
+}
+
+/// Send a `HELO` on an open port and wait up to
+/// [`HELO_PROBE_TIMEOUT`] for a valid 92-byte `HELLO` reply
+/// (M7, protocol §10.6). Only a `SerialKind::Hello` envelope whose
+/// payload parses as a [`HelloReply`] counts — boot-log garbage, a
+/// stream frame, or a corrupt HELLO does not. The port's read
+/// timeout (set to the probe timeout by the caller) bounds every
+/// single read; the deadline bounds the whole wait.
+fn probe_port_for_hello(port: &mut Box<dyn SerialPort>) -> bool {
+    let Ok(helo) = SerialFrame::new(SerialKind::Helo, HeloRequest::new_v2(0).encode()).encode()
+    else {
+        return false;
+    };
+    if port.write_all(&helo).and_then(|()| port.flush()).is_err() {
+        return false;
+    }
+    let deadline = Instant::now() + HELO_PROBE_TIMEOUT;
+    let mut decoder = SerialDecoder::new();
+    let mut buf = [0u8; MAX_READ_LEN];
+    while Instant::now() < deadline {
+        match port.read(&mut buf) {
+            Ok(0) => thread::sleep(Duration::from_millis(1)),
+            Ok(n) => {
+                for frame in decoder.feed(&buf[..n]) {
+                    if frame.kind == SerialKind::Hello && HelloReply::parse(&frame.payload).is_ok()
+                    {
+                        return true;
+                    }
+                }
+            }
+            Err(ref e)
+                if e.kind() == io::ErrorKind::TimedOut
+                    || e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Rank a port by how likely it is the RSH board (higher is better).
@@ -595,6 +693,10 @@ fn open_serial_port(
         .dtr_on_open(false)
         .open()
         .map_err(|e| TransportError::Io(io::Error::from(e)))?;
+    // NOTE (M5): serialport 4.10 exposes no write-timeout API (only
+    // the read timeout above), so the blocking-write protection is
+    // the `spawn_blocking` call in `ControlTransport::send_control`,
+    // not a timeout here.
     let _ = port.write_data_terminal_ready(false);
     let _ = port.write_request_to_send(false);
     Ok(port)
@@ -610,6 +712,11 @@ fn lock_port(port: &Mutex<Box<dyn SerialPort>>) -> MutexGuard<'_, Box<dyn Serial
 
 /// Encode `frame` as `RSHS` bytes and write them to the shared port.
 /// A write failure is counted in `send_errors`.
+///
+/// M5: the write and the flush take the port lock separately — the
+/// flush does not hold the lock across the whole write, so a second
+/// writer is not blocked behind a slow flush. (A flush between two
+/// writers is harmless: it only pushes already-written bytes out.)
 fn write_frame_to(
     port: &Arc<Mutex<Box<dyn SerialPort>>>,
     counters: &Arc<AtomicCounters>,
@@ -621,8 +728,19 @@ fn write_frame_to(
             "serial payload exceeds 1053 bytes",
         ))
     })?;
-    let mut guard = lock_port(port);
-    match guard.write_all(&bytes).and_then(|()| guard.flush()) {
+    let write_result = {
+        let mut guard = lock_port(port);
+        guard.write_all(&bytes)
+    };
+    if let Err(e) = write_result {
+        counters.send_errors.fetch_add(1, Ordering::Relaxed);
+        return Err(TransportError::Io(e));
+    }
+    let flush_result = {
+        let mut guard = lock_port(port);
+        guard.flush()
+    };
+    match flush_result {
         Ok(()) => Ok(()),
         Err(e) => {
             counters.send_errors.fetch_add(1, Ordering::Relaxed);
@@ -632,18 +750,25 @@ fn write_frame_to(
 }
 
 /// Spawn the reader thread (detached; it exits on shutdown).
+/// Returns the thread handle so the transport can poll its health
+/// (M6). A reader panic is caught and counted in `reader_panics`
+/// instead of silently killing the stream.
 fn spawn_reader(
     port: Box<dyn SerialPort>,
     senders: DemuxSenders,
     counters: Arc<AtomicCounters>,
     shutdown: Arc<AtomicBool>,
-) -> Result<(), TransportError> {
+) -> Result<JoinHandle<()>, TransportError> {
     Builder::new()
         .name("rsh-serial-reader".to_owned())
         .spawn(move || {
-            reader_loop(port, &senders, &counters, &shutdown);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                reader_loop(port, &senders, &counters, &shutdown);
+            }));
+            if result.is_err() {
+                counters.reader_panics.fetch_add(1, Ordering::Relaxed);
+            }
         })
-        .map(|_| ())
         .map_err(TransportError::Io)
 }
 
@@ -714,8 +839,12 @@ fn handle_serial_frame(frame: SerialFrame, senders: &DemuxSenders, counters: &At
     match frame.kind {
         SerialKind::Stream => match StreamFrame::parse(&frame.payload) {
             Ok(parsed) => {
-                counters.frames_delivered.fetch_add(1, Ordering::Relaxed);
-                if senders.frame.try_send(parsed).is_err() {
+                // L10: delivered means it actually reached the
+                // channel — a full channel drops the frame, and the
+                // counter must say so.
+                if senders.frame.try_send(parsed).is_ok() {
+                    counters.frames_delivered.fetch_add(1, Ordering::Relaxed);
+                } else {
                     count_overflow(counters);
                 }
             }
@@ -1124,7 +1253,10 @@ mod tests {
         assert_eq!(frame_rx.try_recv().expect("first frame kept").seq, 1);
         assert!(frame_rx.try_recv().is_err(), "second frame dropped");
         let snapshot = counters.snapshot();
-        assert_eq!(snapshot.frames_delivered, 2, "both parsed, one dropped");
+        assert_eq!(
+            snapshot.frames_delivered, 1,
+            "only the accepted frame counts"
+        );
         assert_eq!(snapshot.dropped_overflow, 1);
         assert_eq!(snapshot.frames_dropped, 1);
     }

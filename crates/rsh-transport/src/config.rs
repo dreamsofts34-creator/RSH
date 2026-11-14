@@ -232,6 +232,13 @@ pub enum ConfigTransactionError {
     /// Rollback could not be verified: `REVERT` failed, or the config
     /// read back after `REVERT` does not match the saved last-good blob.
     RollbackFailed,
+    /// Rollback was refused before anything was sent: there is no
+    /// saved last-good blob to verify against (M8 — e.g. a transaction
+    /// resumed from a snapshot that carries no `last_good_blob`), so
+    /// sending `REVERT` would leave the board in an unverifiable
+    /// state. Distinct from [`Self::RollbackFailed`], which means a
+    /// `REVERT` was sent and its read-back did not match.
+    NoLastGoodBlob,
 }
 
 impl std::fmt::Display for ConfigTransactionError {
@@ -275,6 +282,11 @@ impl std::fmt::Display for ConfigTransactionError {
                 f,
                 "rollback could not be verified: REVERT failed or the config read back \
                  after REVERT does not match the saved last-good blob"
+            ),
+            Self::NoLastGoodBlob => write!(
+                f,
+                "rollback refused: no last-good config is saved to verify against, \
+                 so REVERT was not sent"
             ),
         }
     }
@@ -334,7 +346,10 @@ fn parse_get_cfg_body(
     }
     let total = usize::from(u16::from_le_bytes([body[0], body[1]]));
     let offset = usize::from(u16::from_le_bytes([body[2], body[3]]));
-    if offset != expected_offset || total > MAX_CONFIG_LEN || offset > total {
+    // L12: a board reporting a zero-length live config is malformed —
+    // a real blob is never empty, and accepting total == 0 would let
+    // read_current_blob return an empty blob as "the live config".
+    if total == 0 || offset != expected_offset || total > MAX_CONFIG_LEN || offset > total {
         return Err(bad_length());
     }
     let data = &body[GET_CFG_HEADER_LEN..];
@@ -690,25 +705,35 @@ impl<T: ControlTransport> ConfigTransaction<T> {
     /// `REVERT` is idempotent on the board, so rolling back when
     /// nothing is pending is still a verified no-op.
     ///
+    /// M8: the saved last-good blob is checked *before* `REVERT` is
+    /// sent — with no blob to verify against, the rollback is refused
+    /// with [`ConfigTransactionError::NoLastGoodBlob`] and nothing is
+    /// sent, instead of sending `REVERT` and then failing verification
+    /// with a misleading [`ConfigTransactionError::RollbackFailed`].
+    ///
     /// # Errors
     ///
     /// Returns [`ConfigTransactionError::InvalidState`] when not
-    /// `Staged`/`Committed`, [`ConfigTransactionError::Control`] when
-    /// `REVERT` or the read-back fails, and
+    /// `Staged`/`Committed`, [`ConfigTransactionError::NoLastGoodBlob`]
+    /// when no last-good blob is saved,
+    /// [`ConfigTransactionError::Control`] when `REVERT` or the
+    /// read-back fails, and
     /// [`ConfigTransactionError::RollbackFailed`] when the read-back
     /// does not match the saved last-good blob.
     pub async fn rollback(&mut self) -> Result<(), ConfigTransactionError> {
         self.require_state(&[ConfigState::Staged, ConfigState::Committed], "rollback")?;
+        let Some(last_good) = self.last_good_blob.clone() else {
+            return Err(ConfigTransactionError::NoLastGoodBlob);
+        };
         self.client.revert().await?;
         let current = self.read_current_blob().await?;
-        match &self.last_good_blob {
-            Some(last_good) if *last_good == current => {
-                self.staged_blob = None;
-                self.committed_at = None;
-                self.state = ConfigState::RolledBack;
-                Ok(())
-            }
-            _ => Err(ConfigTransactionError::RollbackFailed),
+        if last_good == current {
+            self.staged_blob = None;
+            self.committed_at = None;
+            self.state = ConfigState::RolledBack;
+            Ok(())
+        } else {
+            Err(ConfigTransactionError::RollbackFailed)
         }
     }
 
@@ -718,12 +743,15 @@ impl<T: ControlTransport> ConfigTransaction<T> {
     /// On a confirm failure (timeout, late confirm, or any other
     /// confirm error) this automatically rolls back and returns the
     /// original confirm error when the rollback verifies — so a bad
-    /// config can never be left live unconfirmed. If the rollback
-    /// itself cannot be verified, the rollback error is returned
-    /// instead (the board may be in an unknown state — surface it,
-    /// do not hide it behind the confirm error). A failed `commit`
-    /// needs no rollback: the board never live-applied the blob, so
-    /// the error is returned as-is.
+    /// config can never be left live unconfirmed. Exception (H2): on
+    /// a confirm *timeout* the live config is read back first, and if
+    /// the staged blob is already live (the confirm executed but its
+    /// reply was lost) the transaction is confirmed instead of rolled
+    /// back. If the rollback itself cannot be verified, the rollback
+    /// error is returned instead (the board may be in an unknown
+    /// state — surface it, do not hide it behind the confirm error).
+    /// A failed `commit` needs no rollback: the board never
+    /// live-applied the blob, so the error is returned as-is.
     ///
     /// # Errors
     ///
@@ -750,10 +778,43 @@ impl<T: ControlTransport> ConfigTransaction<T> {
         };
         match confirm_result {
             Ok(()) => Ok(()),
-            Err(confirm_err) => match self.rollback().await {
-                Ok(()) => Err(confirm_err),
-                Err(rollback_err) => Err(rollback_err),
-            },
+            Err(confirm_err) => {
+                // H2: a confirm timeout is ambiguous — the board may
+                // have applied the new config and only its reply was
+                // lost (dropped datagram / late retry), in which case
+                // blindly reverting would throw away a good config the
+                // board is already running. Read the live config back
+                // first: if it is already the staged (new) blob, the
+                // confirm really happened and the transaction is
+                // confirmed; only when the live config is still the
+                // old one (or the read-back itself fails) do we roll
+                // back. This check runs only for a timeout — any other
+                // confirm error (board rejection, late confirm) still
+                // rolls back immediately.
+                if matches!(confirm_err, ConfigTransactionError::ConfirmTimeout)
+                    && self.confirm_applied_via_readback().await
+                {
+                    self.last_good_blob = self.staged_blob.take();
+                    self.committed_at = None;
+                    self.state = ConfigState::Confirmed;
+                    return Ok(());
+                }
+                match self.rollback().await {
+                    Ok(()) => Err(confirm_err),
+                    Err(rollback_err) => Err(rollback_err),
+                }
+            }
+        }
+    }
+
+    /// H2 helper: `true` when a `GET_CFG` read-back shows the staged
+    /// blob is already the board's live config (the confirm executed
+    /// but its reply was lost). `false` on any read-back failure or
+    /// when the live config is anything else.
+    async fn confirm_applied_via_readback(&mut self) -> bool {
+        match self.read_current_blob().await {
+            Ok(live) => Some(&live) == self.staged_blob.as_ref(),
+            Err(_) => false,
         }
     }
 
@@ -799,8 +860,8 @@ mod tests {
 
     use rsh_protocol::config::record_type;
     use rsh_protocol::{
-        ConfigBlob, ConfigError, ConfigRecord, ControlFrame, ErrorCode, Opcode, PinProbeRequest,
-        SetCfgChunk, build_reply, factory_default_blob,
+        ConfigBlob, ConfigError, ConfigRecord, ControlFrame, ControlParseError, ErrorCode, Opcode,
+        PinProbeRequest, SetCfgChunk, build_reply, factory_default_blob,
     };
 
     use super::{
@@ -858,6 +919,10 @@ mod tests {
         commit_deadline: u8,
         confirm_behavior: ConfirmBehavior,
         corrupt_on_revert: bool,
+        /// H2 test hook: `CONFIRM` executes (the new config goes
+        /// live) but its reply is dropped on EVERY attempt, so the
+        /// client always times out even though the board applied it.
+        apply_silent_confirm: bool,
         cached: HashMap<u16, Vec<u8>>,
     }
 
@@ -876,6 +941,7 @@ mod tests {
                 commit_deadline: 30,
                 confirm_behavior: ConfirmBehavior::Answer,
                 corrupt_on_revert: false,
+                apply_silent_confirm: false,
                 cached: HashMap::new(),
             }
         }
@@ -1061,13 +1127,20 @@ mod tests {
                 }
                 // Duplicate cache: same reqId re-answered, never re-executed.
                 if let Some(cached) = self.cached.get(&frame.req_id) {
-                    self.pending = Some(cached.clone());
+                    // H2 hook: a confirm whose reply is lost every time
+                    // is never delivered, even from the cache.
+                    if !(self.apply_silent_confirm && frame.cmd == Opcode::Confirm as u8) {
+                        self.pending = Some(cached.clone());
+                    }
                     return Ok(());
                 }
                 match self.execute_command(&frame) {
                     BoardReply::Answer(reply) => {
                         self.cached.insert(frame.req_id, reply.clone());
-                        self.pending = Some(reply);
+                        // H2 hook: see the duplicate-cache branch above.
+                        if !(self.apply_silent_confirm && frame.cmd == Opcode::Confirm as u8) {
+                            self.pending = Some(reply);
+                        }
                     }
                     BoardReply::DropOnce(reply) => {
                         self.cached.insert(frame.req_id, reply);
@@ -1396,10 +1469,84 @@ mod tests {
         assert_eq!(txn.last_good_blob(), Some(good_blob().as_slice()));
         let board = txn.client().transport();
         assert_eq!(board.count_cmd(Opcode::Revert as u8), 1);
-        // Two GET_CFGs: one reading last-good at stage, one verifying
-        // the rollback. Three CONFIRMs: the client retried twice.
-        assert_eq!(board.count_cmd(Opcode::GetCfg as u8), 2);
+        // Three GET_CFGs: one reading last-good at stage, one H2
+        // read-back after the confirm timeout (live config still the
+        // old blob, so the rollback proceeds), one verifying the
+        // rollback. Three CONFIRMs: the client retried twice.
+        assert_eq!(board.count_cmd(Opcode::GetCfg as u8), 3);
         assert_eq!(board.count_cmd(Opcode::Confirm as u8), 3);
+    }
+
+    #[tokio::test]
+    async fn confirm_timeout_but_new_config_live_is_confirmed_not_rolled_back() {
+        // H2 regression: the confirm executed on the board (the new
+        // config is live) but every reply was lost, so the client
+        // times out. apply() must read the live config back, see the
+        // staged blob is already live, and confirm — never REVERT a
+        // good config that is already running.
+        let mut board = FakeBoard::new(good_blob());
+        board.apply_silent_confirm = true;
+        let mut txn = txn(board);
+        txn.apply(&good_blob_v2())
+            .await
+            .expect("confirm timeout with live new config is a success");
+        assert_eq!(txn.state(), ConfigState::Confirmed);
+        assert_eq!(txn.client().transport().stored, good_blob_v2());
+        assert_eq!(txn.last_good_blob(), Some(good_blob_v2().as_slice()));
+        let board = txn.client().transport();
+        assert_eq!(board.count_cmd(Opcode::Revert as u8), 0, "no REVERT sent");
+        assert_eq!(board.count_cmd(Opcode::Confirm as u8), 3);
+    }
+
+    #[tokio::test]
+    async fn rollback_without_last_good_blob_sends_no_revert() {
+        // M8: a transaction resumed from a snapshot with no saved
+        // last-good blob refuses to roll back BEFORE sending REVERT,
+        // with the distinct NoLastGoodBlob error.
+        use super::ConfigTxnSnapshot;
+        let board = FakeBoard::new(good_blob());
+        let client = ControlClient::new(board, Session::new(KEY, NONCE))
+            .with_timeout(Duration::from_millis(10));
+        let snapshot = ConfigTxnSnapshot {
+            state: ConfigState::Committed,
+            staged_blob: Some(good_blob_v2()),
+            last_good_blob: None,
+            commit_deadline: Duration::from_secs(30),
+            committed_at: Some(std::time::Instant::now()),
+        };
+        let mut txn = ConfigTransaction::resume(client, snapshot);
+        let err = txn
+            .rollback()
+            .await
+            .expect_err("rollback without last-good must fail");
+        assert!(
+            matches!(err, ConfigTransactionError::NoLastGoodBlob),
+            "got {err:?}"
+        );
+        assert_eq!(
+            txn.client().transport().count_cmd(Opcode::Revert as u8),
+            0,
+            "REVERT must not be sent without a blob to verify against"
+        );
+        assert_eq!(txn.state(), ConfigState::Committed);
+    }
+
+    #[tokio::test]
+    async fn read_current_blob_rejects_zero_total() {
+        // L12: a board reporting totalLen 0 has no live config to
+        // read — BadLength, never an empty "live" blob.
+        let mut txn = txn_with(Vec::new());
+        let err = txn
+            .read_current_blob()
+            .await
+            .expect_err("zero-total GET_CFG must fail");
+        assert!(
+            matches!(
+                err,
+                ConfigTransactionError::Control(ControlError::Parse(ControlParseError::BadLength))
+            ),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

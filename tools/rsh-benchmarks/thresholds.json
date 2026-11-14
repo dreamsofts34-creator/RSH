@@ -13,6 +13,12 @@
     "measured_host": "htch-runtime (shared Linux sandbox, 1.5 CPU)",
     "note": "Mean-of-means of 3 `cargo bench -p rsh-benchmarks --bench engine` runs, 2026-11-14. Runs: pipeline 154.5 / 176.6 / 157.2 ns; hot path 335.0 / 330.9 / 340.8 ns; seq+watchdog 13.9 / 14.0 / 13.8 ns. Pipeline spread ~14% run-to-run on this shared host; all runs far under the 1100 ns plan cap."
   },
+  "pin_validate_blob_factory_ns_max": 9879,
+  "pin_validate_blob_factory_ns_source": "H-6: 1.5x the measured baseline (mean-of-means 6585.6 ns, 3 runs 2026-11-14, baseline/runs-summary.json). Pin validation is a cold path (config time, not the 200 Hz hot path) but it still gets a threshold — exempt in writing is not a threshold. Re-measure on a new machine; do not raise without a new measurement.",
+  "pin_validate_factory_modules_ns_max": 6801,
+  "pin_validate_factory_modules_ns_source": "H-6: 1.5x the measured baseline (mean-of-means 4533.8 ns, 3 runs 2026-11-14, baseline/runs-summary.json). Same rule as pin_validate_blob_factory_ns_max.",
+  "regression_factor_max": 1.25,
+  "regression_factor_source": "M-2/H-6: any criterion bench whose mean exceeds 1.25x its measured baseline (baseline/runs-summary.json mean_of_means_ns for protocol benches, measured_baseline_ns for engine benches) FAILS the gate. The 1.25x factor is tighter than the 1.5x plan-SLO headroom on purpose: it catches regressions early, on this shared host where run-to-run spread is up to ~18% (pin_validate). A failure here means re-measure and explain, not silently raise.",
   "pipeline_tick_ns_max": 1100,
   "pipeline_tick_ns_source": "C# baseline (RSH-RUST-ARCHITECTURE.md Phase B / RSH-RUST-SOFTWARE-PLAN.md SW-R8.1): pipeline tick <= 1.1 us/tick. Measured Rust baseline on this machine (3 runs, 2026-11-14): mean-of-means 162.8 ns \u2014 6.8x under the cap; the cap is the plan SLO, not the measured number.",
   "soak_growth_mb_per_10min_max": 1,

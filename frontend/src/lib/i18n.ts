@@ -23,6 +23,28 @@ export type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
 export const DEFAULT_LANGUAGE: SupportedLanguage = "en";
 
+/** localStorage key for the persisted language (H2: same pattern as the theme). */
+export const LANGUAGE_STORAGE_KEY = "rsh-language";
+
+/** Read the persisted language; defaults to English on bad/missing data. */
+export function loadStoredLanguage(): SupportedLanguage {
+  try {
+    const stored = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+    if (isSupportedLanguage(stored)) return stored;
+  } catch {
+    // Storage unavailable — fall through to the default.
+  }
+  return DEFAULT_LANGUAGE;
+}
+
+export function storeLanguage(language: SupportedLanguage): void {
+  try {
+    window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
+  } catch {
+    // Storage unavailable — the language still applies for this session.
+  }
+}
+
 /** Urdu is RTL; English and Hindi render LTR. */
 export function directionFor(language: string): "ltr" | "rtl" {
   return language === "ur" ? "rtl" : "ltr";
@@ -50,15 +72,30 @@ void i18n.use(initReactI18next).init({
   react: { useSuspense: false },
 });
 
-/** Switch language at runtime (no restart) and set document direction. */
+/** Switch language at runtime (no restart), persist it, and set document direction. */
 export async function changeLanguage(
   language: SupportedLanguage,
 ): Promise<void> {
   await i18n.changeLanguage(language);
+  storeLanguage(language);
   if (typeof document !== "undefined") {
     document.documentElement.lang = language;
     document.documentElement.dir = directionFor(language);
   }
+}
+
+/**
+ * Apply the stored language BEFORE first paint (H2, main.tsx): sets
+ * `lang`/`dir` synchronously so the first frame is already in the
+ * right language and direction, then switches i18next itself.
+ */
+export function applyStoredLanguage(): void {
+  const stored = loadStoredLanguage();
+  if (typeof document !== "undefined") {
+    document.documentElement.lang = stored;
+    document.documentElement.dir = directionFor(stored);
+  }
+  void changeLanguage(stored);
 }
 
 export default i18n;

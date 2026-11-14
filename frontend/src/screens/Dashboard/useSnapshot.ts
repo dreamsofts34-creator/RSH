@@ -16,20 +16,21 @@ export function useEngineSnapshot(): EngineSnapshot | null {
   const [snapshot, setSnapshot] = useState<EngineSnapshot | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
+    let done = false;
     let unlisten: (() => void) | undefined;
-    subscribeEngineSnapshot((snap) => {
-      if (!cancelled) setSnapshot(snap);
+    void subscribeEngineSnapshot((snap) => {
+      if (!done) setSnapshot(snap);
     })
-      .then((fn) => {
-        unlisten = fn;
+      .then((stop) => {
+        if (done) stop();
+        else unlisten = stop;
       })
       .catch(() => {
         // Event not available (outside Tauri / backend not emitting yet).
         // Snapshot stays null; the screen shows its honest empty state.
       });
     return () => {
-      cancelled = true;
+      done = true;
       unlisten?.();
     };
   }, []);

@@ -66,7 +66,18 @@ internal static class Program
 
     static int Run(string[] args)
     {
-        var (connectBack, token) = ParseArgs(args);
+        var connectBack = ParseArgs(args);
+        // C-TOK-1: the loopback token comes from the ENVIRONMENT
+        // (`RSH_HM_SIDECAR_TOKEN`, set by RSH just for the spawn),
+        // never from argv — argv is world-readable via WMI / Process
+        // Explorer. `--token` is rejected by ParseArgs (above).
+        var token = Environment.GetEnvironmentVariable("RSH_HM_SIDECAR_TOKEN");
+        if (connectBack is not null && string.IsNullOrEmpty(token))
+        {
+            Console.Error.WriteLine(
+                "[sidecar] bad-args: --connect-back needs RSH_HM_SIDECAR_TOKEN in the environment (the token is never passed on the command line)");
+            return 2;
+        }
 
         TextReader reader;
         TextWriter writer;
@@ -155,24 +166,58 @@ internal static class Program
         return 0;
     }
 
-    static (string? ConnectBack, string? Token) ParseArgs(string[] args)
+    /// <summary>
+    /// Parse the command line (M5 — strict). Only
+    /// `--connect-back 127.0.0.1:&lt;port&gt;` is accepted. Anything else —
+    /// an unknown flag, a missing value, a non-loopback host, a bad
+    /// port, a duplicate flag, or the removed `--token` flag (the
+    /// token now travels in `RSH_HM_SIDECAR_TOKEN`, C-TOK-1) — is a
+    /// distinctive stderr message + fast exit 2, never a silent
+    /// fallback to stdio with a half-parsed address.
+    /// </summary>
+    static string? ParseArgs(string[] args)
     {
         string? connectBack = null;
-        string? token = null;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
             {
                 case "--connect-back" when i + 1 < args.Length:
-                    connectBack = args[++i];
+                    if (connectBack is not null)
+                    {
+                        throw new InvalidOperationException(
+                            "[sidecar] bad-args: --connect-back given twice");
+                    }
+                    connectBack = ValidateConnectBack(args[++i]);
                     break;
-                case "--token" when i + 1 < args.Length:
-                    token = args[++i];
-                    break;
+                case "--connect-back":
+                    throw new InvalidOperationException(
+                        "[sidecar] bad-args: --connect-back needs a value (127.0.0.1:<port>)");
+                case "--token":
+                    throw new InvalidOperationException(
+                        "[sidecar] bad-args: --token is no longer accepted — the loopback token comes from the RSH_HM_SIDECAR_TOKEN environment variable");
+                default:
+                    throw new InvalidOperationException(
+                        $"[sidecar] bad-args: unknown argument '{args[i]}' (only --connect-back 127.0.0.1:<port> is accepted)");
             }
         }
 
-        return (connectBack, token);
+        return connectBack;
+    }
+
+    static string ValidateConnectBack(string value)
+    {
+        var parts = value.Split(':');
+        if (parts.Length != 2 || parts[0] != "127.0.0.1"
+            || !int.TryParse(parts[1], System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture, out var port)
+            || port < 1 || port > 65535)
+        {
+            throw new InvalidOperationException(
+                $"[sidecar] bad-args: --connect-back must be 127.0.0.1:<port> (1-65535), got '{value}'");
+        }
+
+        return value;
     }
 
     static void WriteReply(TextWriter writer, SidecarReply reply)
@@ -419,7 +464,18 @@ internal static class Program
             {
                 if (Enum.TryParse<HMAxis>(a.Name, ignoreCase: true, out var ax))
                 {
-                    axes[ax] = (float)a.Value.GetDouble();
+                    // L3: clamp every axis to 0..1 — the Rust side
+                    // already clamps, but the sidecar is the trust
+                    // boundary for the driver: a NaN / out-of-range
+                    // float must never reach SubmitState. Non-finite
+                    // input maps to the axis neutral (X = 0.5 centre,
+                    // everything else = 0.0 released).
+                    var v = (float)a.Value.GetDouble();
+                    if (!float.IsFinite(v))
+                    {
+                        v = ax == HMAxis.X ? 0.5f : 0.0f;
+                    }
+                    axes[ax] = Math.Clamp(v, 0.0f, 1.0f);
                 }
             }
         }

@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { useTranslation } from "react-i18next";
 import { Gamepad2 } from "lucide-react";
 import type { GameInfo, ProfileSummary } from "@/lib/tauri";
@@ -25,7 +26,7 @@ interface GameLauncherProps {
  * Launch still works — it is never a dead button. A game the backend
  * reports as not installed cannot be launched.
  */
-export function GameLauncher({
+function GameLauncherInner({
   games,
   loadState,
   profiles,
@@ -55,7 +56,7 @@ export function GameLauncher({
           </p>
         ) : games.length === 0 ? (
           <p className="text-sm text-[var(--muted)]">
-            {t("dashboard.games.notAvailable")}
+            {t("dashboard.games.empty")}
           </p>
         ) : (
           <ul className="space-y-3">
@@ -91,7 +92,8 @@ export function GameLauncher({
                       {t("dashboard.games.boundProfile")}:{" "}
                       {game.boundProfileId === null
                         ? t("dashboard.games.noProfile")
-                        : (boundProfile?.name ?? game.boundProfileId)}
+                        : (boundProfile?.name ??
+                          t("dashboard.games.unknownProfile"))}
                       {game.boundProfileId === null ? (
                         <>
                           {" — "}
@@ -149,3 +151,7 @@ export function GameLauncher({
     </Card>
   );
 }
+
+/** Memoised: the Dashboard re-renders at 30 Hz from the snapshot feed
+ *  (H4) — this component only re-renders when its own props change. */
+export const GameLauncher = memo(GameLauncherInner);

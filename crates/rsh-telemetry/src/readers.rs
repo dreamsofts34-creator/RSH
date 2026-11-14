@@ -152,14 +152,23 @@ impl TelemetryReader for AccReader {
 }
 
 /// iRacing reader: `iRacingSim64DX11.exe`, `Local\IRSDKMemMapFileName`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct IRacingReader;
+///
+/// Holds an [`IracingSnapshotReader`](crate::iracing::IracingSnapshotReader)
+/// so the `SessionState` var-header offset is cached across 2 Hz
+/// polls (L6). Cloning shares the cache.
+#[derive(Clone, Debug, Default)]
+pub struct IRacingReader {
+    // Read only on Windows (`read` is a no-op elsewhere), so the
+    // field looks dead to the Linux build.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    snapshot_reader: crate::iracing::IracingSnapshotReader,
+}
 
 impl IRacingReader {
     /// Creates the reader.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Pure entry point: parses a snapshot from one map accessor.
@@ -188,7 +197,7 @@ impl TelemetryReader for IRacingReader {
                 crate::iracing::MAP_NAME,
                 crate::iracing::MAP_SIZE,
             )?;
-            Self::read_from_map(&map)
+            self.snapshot_reader.read_snapshot(&map)
         }
         #[cfg(not(windows))]
         {

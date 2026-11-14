@@ -1,5 +1,6 @@
-//! Scenario registry — the 26 C# rig scenarios, same IDs, same
-//! durations, same assertion shapes (`TESTING-INPUT.md` §8.4,
+//! Scenario registry — the 26 C# rig scenarios plus `emit-200hz`
+//! (H-2, the 200 Hz coalescing probe), same IDs, same durations,
+//! same assertion shapes (`TESTING-INPUT.md` §8.4,
 //! `test-env/scenarios/scenarios.json` v1).
 //!
 //! # Rust adaptations (all deliberate, all documented here)
@@ -122,13 +123,37 @@ const fn ctrl_accepted() -> Assertion {
     )
 }
 
+/// Shorthand for the `engineStopFailed == 0` assertion every live
+/// scenario carries (M-6): a leg that did not stop in 5 s FAILS the
+/// scenario — a stuck stop is a hang, not a slow teardown, and must
+/// never hide behind an event line.
+const fn stop_ok() -> Assertion {
+    num(
+        "engineStopFailed",
+        "==",
+        0.0,
+        "M-6: every engine leg stopped within the 5 s timeout.",
+    )
+}
+
+/// Shorthand for the `allocBytesDelta` assertion (M-1, L-5): the
+/// net heap growth over the run. `bound` is 0 for clean scenarios
+/// (steady-state hot path allocates nothing; the harness
+/// pre-allocates its own bookkeeping before the measured window, so
+/// a clean run must show exactly 0) and a small documented allowance
+/// for fault/restart scenarios, where one-time window fills and
+/// episode bookkeeping legitimately grow the heap once.
+const fn alloc_bound(bound: f64, note: &'static str) -> Assertion {
+    num("allocBytesDelta", "<=", bound, note)
+}
+
 /// The full registry, in C# order.
 #[must_use]
 pub fn registry() -> Vec<Scenario> {
     vec![
         Scenario {
             id: "soak",
-            description: "Clean 60 s / 10 min soak at 200 Hz (quick/full).",
+            description: "Clean 60 s / 10 min soak at 196 Hz emit (documented harness limitation — see emit-200hz).",
             durations: (60, 600, 600),
             wheel: WheelConfig {
                 kind: WheelKind::Soak,
@@ -142,6 +167,12 @@ pub fn registry() -> Vec<Scenario> {
                     0.5,
                     "SLO: TRUE transport loss < 0.5% Wi-Fi (arrival seq gaps; engine-coalesced frames reported separately as coalescedPercent, never hidden).",
                 ),
+                num(
+                    "coalescedPercent",
+                    "<=",
+                    0.5,
+                    "H-1: at 196 Hz emit the engine's multi-frame drain must process every arrived frame; coalesced stays <= 0.5% of arrived frames. The 200 Hz rate is measured by emit-200hz, not here.",
+                ),
                 num("currentRatePerSecond", ">=", 195.0, "SLO: ~200 pps"),
                 num(
                     "tickJitterP99Us",
@@ -150,12 +181,71 @@ pub fn registry() -> Vec<Scenario> {
                     "PC-receive inter-arrival jitter p99 (plan SLO basis); sandbox threshold 5000 us, real target 1000 us. Engine board-ts jitter is engineTickJitterP99Us.",
                 ),
                 num(
+                    "engineTickJitterP99Us",
+                    "<=",
+                    1000.0,
+                    "H-3: engine board-timestamp jitter p99 against the REAL 1000 us target (asserted, not informational-only). The sample is |board-ts delta - 5000 us| (engine.rs inter_arrival_jitter_us), so a p99 of ~5001 us is the DOUBLE-STEP signature: two wheel emits (~5100 us apart) landing in one engine tick after a delayed tokio timer fires, delta ~10001 us. On a quiet host the wheel's 5100 us spacing means <= 1 frame per 5000 us engine tick and p99 ~= 100 us; under host load the timer bursts and ~1% double-steps pin the 256-sample ring's p99 at ~5001. Do NOT weaken this bound to pass under load — the gate phase re-runs it on a quiet host.",
+                ),
+                num(
                     "outputLatencyP99Us",
                     "<=",
                     2000.0,
                     "Rust: engine-measured output-latency p99 replaces C# avgTickUs (see header).",
                 ),
+                num(
+                    "heapSlope60sMBPer10Min",
+                    "<=",
+                    1.0,
+                    "M-8: heap slope over the 60 s window (samples from 10 s onward), pro-rated to MB/10 min against the SW-R8.3 1 MB/10 min bound; see heapSlope60sStdErrMBPer10Min for the fit's standard error.",
+                ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
+            ],
+        },
+        Scenario {
+            id: "emit-200hz",
+            description: "200 Hz emit probe: the REAL coalescing rate at the true tick rate (record-only).",
+            durations: (20, 30, 30),
+            wheel: WheelConfig {
+                kind: WheelKind::Soak,
+                // True 200 Hz emit (H-2): the wheel ticks at exactly
+                // the engine's 200 Hz. The OLD latest-wins drain
+                // coalesced a visible share of frames by phase drift;
+                // the Round 2 multi-frame drain processes every frame
+                // (deep-scan gate: coalesced 0% at 200 Hz). This
+                // scenario RECORDS that rate — it carries NO
+                // coalescedPercent / lossPercent /
+                // engineTickJitterP99Us assertions, because at 200 Hz
+                // those were expected to exceed the 196 Hz SLOs under
+                // the old drain. Its job is to make the real number
+                // visible, not to pass.
+                tick_interval_us: 5000,
+                ..WheelConfig::default()
+            },
+            harness: HarnessConfig::default(),
+            assertions: vec![
+                num(
+                    "validPackets",
+                    ">",
+                    1000.0,
+                    "Valid flow continues at 200 Hz emit",
+                ),
+                num(
+                    "engineTicks",
+                    ">=",
+                    3000.0,
+                    "Engine kept ticking at 200 Hz emit (20 s x 200 = 4000, 25% margin)",
+                ),
+                ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -174,12 +264,23 @@ pub fn registry() -> Vec<Scenario> {
                 num("validPackets", ">", 1000.0, "Valid flow continues"),
                 num("badCrc", ">", 0.0, "Bad-CRC packets seen and rejected"),
                 num(
+                    "lossPercent",
+                    "<",
+                    15.0,
+                    "H-4: loss ceiling from the injected fault model — 5% iid loss + 3% bad CRC unusable = ~7.9% expected; 15% is ~2x model (baseline measured 8.2%). A storm that loses more than the model injects is a product defect, not weather.",
+                ),
+                num(
                     "engineTicks",
                     ">=",
                     3000.0,
                     "Engine kept ticking in the storm (20 s x 200 = 4000, 25% margin)",
                 ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: clean fault-injection run — net heap growth must be exactly 0 (steady-state hot path allocates nothing; harness bookkeeping is pre-allocated before the measured window).",
+                ),
             ],
         },
         Scenario {
@@ -203,6 +304,11 @@ pub fn registry() -> Vec<Scenario> {
                 num("accelAxisMax", ">=", 32000.0, "Accel full range"),
                 num("brakeAxisMax", ">=", 32000.0, "Brake full range"),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -239,8 +345,25 @@ pub fn registry() -> Vec<Scenario> {
                     32000.0,
                     "Brake fully pressed = full range",
                 ),
+                num(
+                    "handbrakeAxisMin",
+                    "<=",
+                    100.0,
+                    "M-10: handbrake released = axis min (soak sweep reaches the 300 mV rail)",
+                ),
+                num(
+                    "handbrakeAxisMax",
+                    ">=",
+                    32000.0,
+                    "M-10: handbrake fully pulled = full range (soak sweep reaches the 3300 mV rail)",
+                ),
                 num("validPackets", ">", 1000.0, "Valid flow during calibration"),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -275,7 +398,36 @@ pub fn registry() -> Vec<Scenario> {
                     "Watchdog fired during silence",
                 ),
                 num("validPackets", ">", 1000.0, "Data back after resume"),
+                num(
+                    "neutralSends",
+                    ">=",
+                    100.0,
+                    "H-4: safe-mode must emit NEUTRAL output while silent (3 s silence x 200 Hz = ~600 neutral sends; >= 100 leaves margin for tick phase). A watchdog that fires but never drives neutral is not safe.",
+                ),
+                num(
+                    "lossPercent",
+                    "<",
+                    30.0,
+                    "H-4: loss ceiling from the injected fault model — 3 s silence of 15 s, seq keeps counting = 20% expected; 30% is 1.5x model (baseline measured 20.1%).",
+                ),
+                num(
+                    "blackoutExpectedFrames",
+                    "<=",
+                    750.0,
+                    "H-5: the 3 s silence costs ~600 frames at the nominal 200 Hz emit rate (750 = 600 + 25% margin), reported separately from lossPercent.",
+                ),
+                num(
+                    "silenceMaxMs",
+                    "<=",
+                    3500.0,
+                    "H-5: no single silence episode longer than the 3 s injected silence + 500 ms margin.",
+                ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    4096.0,
+                    "M-1: fault-scenario allowance (<= 4096 B) — one-time silence-episode + neutral-send bookkeeping may grow the heap once; the pre-fix run showed 1352 B here, all of it the rig's own neutral_times Vec growth, now pre-allocated.",
+                ),
             ],
         },
         Scenario {
@@ -300,6 +452,11 @@ pub fn registry() -> Vec<Scenario> {
                 ),
                 num("steeringAxisMax", ">=", 30000.0, "Steering still works"),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -321,7 +478,18 @@ pub fn registry() -> Vec<Scenario> {
                     "Engine kept ticking through fuzz",
                 ),
                 num("badCrc", ">", 0.0, "Bad-CRC fuzz packets rejected"),
+                num(
+                    "lossPercent",
+                    "<",
+                    45.0,
+                    "H-4: loss ceiling from the injected fault model — 15% corrupt-CRC + 10% truncated + 5% garbage = ~30% of ticks unusable; 45% is 1.5x model (baseline measured 30.2%).",
+                ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -342,7 +510,18 @@ pub fn registry() -> Vec<Scenario> {
                     "Engine kept ticking in chaos (30 s x 200 = 6000, 25% margin)",
                 ),
                 num("validPackets", ">", 1000.0, "Valid flow continues"),
+                num(
+                    "lossPercent",
+                    "<",
+                    20.0,
+                    "H-4: loss ceiling from the injected fault model — Gilbert-Elliott bursts + ~200 ms interference windows every ~7 s ≈ 5–11% expected; 20% is ~2x the baseline measurement (10.5%).",
+                ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -362,12 +541,23 @@ pub fn registry() -> Vec<Scenario> {
                     "Engine kept ticking through user chaos",
                 ),
                 num(
+                    "lossPercent",
+                    "<",
+                    20.0,
+                    "H-4: loss ceiling from the injected fault model — 0.5 s dropout every 5 s = 10% of ticks silent, seq keeps counting; 20% is 2x model (baseline measured 10.1%).",
+                ),
+                num(
                     "outputLatencyP99Us",
                     "<=",
                     2000.0,
                     "Rust: output-latency p99 replaces C# avgTickUs (see header).",
                 ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -394,7 +584,24 @@ pub fn registry() -> Vec<Scenario> {
                     "P3 REGRESSION: duplicates must not explode after reboot",
                 ),
                 num("validPackets", ">", 1500.0, "Data back after reboot"),
+                num(
+                    "blackoutExpectedFrames",
+                    "<=",
+                    500.0,
+                    "H-5: the 2 s reboot silence costs ~400 frames at the nominal 200 Hz emit rate (500 = 400 + 25% margin). The reboot rebaselines the sequence, so this blackout does NOT count as transport loss — this number is where it is visible.",
+                ),
+                num(
+                    "silenceMaxMs",
+                    "<=",
+                    2500.0,
+                    "H-5: no single silence episode longer than the 2 s reboot silence + 500 ms margin.",
+                ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    4096.0,
+                    "M-1: fault-scenario allowance (<= 4096 B) — one-time reboot bookkeeping may grow the heap once.",
+                ),
             ],
         },
         Scenario {
@@ -415,7 +622,36 @@ pub fn registry() -> Vec<Scenario> {
                     "Watchdog fired during drop",
                 ),
                 num("validPackets", ">", 1000.0, "Data back after drop"),
+                num(
+                    "lossPercent",
+                    "<",
+                    45.0,
+                    "H-4: loss ceiling from the injected fault model — 5 s drop of 15 s, seq keeps counting = 33.3% expected; 45% is ~1.35x model (baseline measured 33.5%).",
+                ),
+                num(
+                    "neutralSends",
+                    ">=",
+                    100.0,
+                    "H-4: the 5 s drop must emit NEUTRAL output while silent (baseline measured 934 neutral sends).",
+                ),
+                num(
+                    "blackoutExpectedFrames",
+                    "<=",
+                    1100.0,
+                    "H-5: the 5 s drop costs ~1000 frames at the nominal 200 Hz emit rate (1100 = 1000 + 10% margin), reported separately from lossPercent.",
+                ),
+                num(
+                    "silenceMaxMs",
+                    "<=",
+                    5500.0,
+                    "H-5: no single silence episode longer than the 5 s injected drop + 500 ms margin.",
+                ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    4096.0,
+                    "M-1: fault-scenario allowance (<= 4096 B) — one-time drop bookkeeping may grow the heap once; the pre-fix run showed 558 B here, all of it the rig's own neutral_times Vec growth, now pre-allocated.",
+                ),
             ],
         },
         Scenario {
@@ -444,6 +680,11 @@ pub fn registry() -> Vec<Scenario> {
                 ),
                 num("updateCalls", ">", 500.0, "Updates resume after reconnect"),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -466,12 +707,23 @@ pub fn registry() -> Vec<Scenario> {
                     800.0,
                     "Packets still flow after restart",
                 ),
+                num(
+                    "engineRestartMs",
+                    "<=",
+                    5000.0,
+                    "H-5: the engine restart blackout (stop -> new leg spawned) must fit inside the 5 s stop timeout. Arrival lossPercent is 0.0% across a restart by construction — this number, not lossPercent, is the restart's cost.",
+                ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    4096.0,
+                    "M-1: restart-scenario allowance (<= 4096 B) — the second engine leg's one-time setup may grow the heap once.",
+                ),
             ],
         },
         Scenario {
             id: "long-soak",
-            description: "Long soak: 60 s quick / 10 min full / 4 h long (release blocker).",
+            description: "Long soak (600 s proxy): 60 s quick / 10 min full / 4 h long (release blocker).",
             durations: (60, 600, 14400),
             wheel: WheelConfig {
                 kind: WheelKind::Soak,
@@ -487,7 +739,25 @@ pub fn registry() -> Vec<Scenario> {
                     0.5,
                     "SLO: TRUE transport loss < 0.5% (arrival seq gaps; coalesced reported separately as coalescedPercent).",
                 ),
+                num(
+                    "coalescedPercent",
+                    "<=",
+                    0.5,
+                    "H-1: at 196 Hz emit the engine's multi-frame drain must process every arrived frame; coalesced stays <= 0.5% of arrived frames (same rule as soak).",
+                ),
                 num("currentRatePerSecond", ">=", 195.0, "SLO: ~200 pps"),
+                num(
+                    "engineTickJitterP99Us",
+                    "<=",
+                    1000.0,
+                    "H-3: engine board-timestamp jitter p99 against the REAL 1000 us target (asserted, not informational-only).",
+                ),
+                num(
+                    "heapSlope60sMBPer10Min",
+                    "<=",
+                    1.0,
+                    "M-8: heap slope over the 60 s window (samples from 10 s onward), pro-rated to MB/10 min against the SW-R8.3 1 MB/10 min bound; the 600 s slope below is the binding one on long runs.",
+                ),
                 num_min(
                     "heapSlopeMBPer10Min",
                     "<=",
@@ -503,6 +773,11 @@ pub fn registry() -> Vec<Scenario> {
                     600.0,
                 ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -556,9 +831,14 @@ pub fn registry() -> Vec<Scenario> {
                     "e2eDelayP99Us",
                     "<=",
                     10000.0,
-                    "SLO: E2E p99 <= 10 ms Wi-Fi (loopback measurement — see PERF-H2.md). p99 over ~201 samples is the 3rd slowest, so one VM stall cannot fail it.",
+                    "SLO: E2E p99 <= 10 ms Wi-Fi — LOOPBACK p99 (H-8, in-process channel, no real Wi-Fi; the p99 carries a bootstrap 95% CI in e2eDelayP99CiLowUs/HighUs). p99 over ~201 samples is the 3rd slowest, so one VM stall cannot fail it. Real-Wi-Fi re-measure is a Windows/human gate.",
                 ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -596,7 +876,18 @@ pub fn registry() -> Vec<Scenario> {
                     "Packets still flow after restart",
                 ),
                 num("lossPercent", "<", 5.0, "Loss sane after restart"),
+                num(
+                    "engineRestartMs",
+                    "<=",
+                    5000.0,
+                    "H-5: the engine restart blackout (stop -> new leg spawned) must fit inside the 5 s stop timeout. Arrival lossPercent is 0.0% across a restart by construction — this number, not lossPercent, is the restart's cost.",
+                ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    4096.0,
+                    "M-1: restart-scenario allowance (<= 4096 B) — the second engine leg's one-time setup may grow the heap once.",
+                ),
             ],
         },
         Scenario {
@@ -633,6 +924,11 @@ pub fn registry() -> Vec<Scenario> {
                 ),
                 num("validPackets", ">", 1000.0, "Valid flow continues"),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -661,6 +957,11 @@ pub fn registry() -> Vec<Scenario> {
                     "V2-FIRST: disabled clutch stays neutral (C# v1 could not observe clutch).",
                 ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -685,6 +986,11 @@ pub fn registry() -> Vec<Scenario> {
                 ),
                 num("validPackets", ">", 1000.0, "Valid flow continues"),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -714,6 +1020,11 @@ pub fn registry() -> Vec<Scenario> {
                     "Engine kept ticking (30 s x 200 = 6000, 25% margin)",
                 ),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -740,6 +1051,11 @@ pub fn registry() -> Vec<Scenario> {
                 ),
                 num("validPackets", ">", 1000.0, "Valid flow continues"),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -769,6 +1085,11 @@ pub fn registry() -> Vec<Scenario> {
                 ),
                 num("validPackets", ">", 1000.0, "Valid flow continues"),
                 ctrl_accepted(),
+                stop_ok(),
+                alloc_bound(
+                    0.0,
+                    "M-1: net heap growth must be exactly 0 (see dropout-storm).",
+                ),
             ],
         },
         Scenario {
@@ -801,6 +1122,11 @@ pub fn registry() -> Vec<Scenario> {
                     "==",
                     0.0,
                     "Harness sent no GET_CAPS (--no-auto-get-caps)",
+                ),
+                stop_ok(),
+                alloc_bound(
+                    4096.0,
+                    "M-1/L-5: auth-gate allowance (<= 4096 B). The pre-fix run showed 15456 B here — measured to be the rig's own neutral_times Vec growth (2001 neutral sends while gated, capacity doubling), NOT engine startup: the engine allocates nothing per tick (alloc gate) and its one-time setup happens before the measured window. The rig's neutral_times buffer is now pre-allocated (8192), so this allowance is a backstop, not an expectation.",
                 ),
             ],
         },

@@ -46,6 +46,7 @@ function removeTauriMock() {
 
 describe("AppShell", () => {
   beforeEach(() => {
+    window.localStorage.clear();
     mockInvoke.mockReset();
     mockInvoke.mockResolvedValue(null);
     installTauriMock();
@@ -113,5 +114,31 @@ describe("AppShell", () => {
     expect(
       screen.queryByRole("button", { name: "Dismiss" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("remembers the last screen across mounts (M15)", () => {
+    const first = render(<AppShell screens={fakeScreens} />);
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByText("Settings content")).toBeInTheDocument();
+    first.unmount();
+    // Re-mount: the stored screen is restored instead of the first one.
+    render(<AppShell screens={fakeScreens} />);
+    expect(screen.getByText("Settings content")).toBeInTheDocument();
+  });
+
+  it("Home/End keys jump to the first/last nav item (M15)", () => {
+    render(<AppShell screens={fakeScreens} />);
+    const settingsButton = screen.getByRole("button", { name: "Settings" });
+    fireEvent.click(settingsButton);
+    fireEvent.keyDown(settingsButton, { key: "Home" });
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Dashboard" }),
+    );
+    fireEvent.keyDown(screen.getByRole("button", { name: "Dashboard" }), {
+      key: "End",
+    });
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Settings" }),
+    );
   });
 });

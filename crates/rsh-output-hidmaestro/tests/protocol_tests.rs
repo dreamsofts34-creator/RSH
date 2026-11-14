@@ -35,11 +35,12 @@ fn every_command_encodes_with_the_right_cmd_name() {
         ),
         (
             Command::SubmitRaw {
-                report: "00".to_string(),
+                bytes: "00".to_string(),
             },
             "submit-raw",
         ),
-        (Command::Neutral, "neutral"),
+        (Command::Neutral { raw: false }, "neutral"),
+        (Command::Neutral { raw: true }, "neutral"),
         (Command::Dispose, "dispose"),
         (Command::Exit, "exit"),
     ];
@@ -97,16 +98,34 @@ fn axes_json_round_trip() {
 
 #[test]
 fn parse_full_create_reply_with_caps() {
+    // C2: verbatim real-sidecar `create` reply (PROTOCOL.md
+    // capabilities example) — the old per-axis-boolean shape is gone.
     let reply = parse_reply(
-        r#"{"ok":true,"created":true,"profile":"rsh-wheel-custom","transport_index":0,"driver":"2.1.0","capabilities":{"has_axis_x":true,"has_axis_y":true,"has_axis_z":true,"has_axis_rx":true,"has_axis_slider":true,"button_count":32,"has_hat":true}}"#,
+        r#"{"ok":true,"created":true,"profile":"rsh-wheel-custom","transport_index":0,"driver":"2.1.0","capabilities":{"axes":5,"buttons":32,"has_hat":true,"input_report_size":15,"submit_state_max_button":25,"submit_state_button_mask":33554431}}"#,
     )
     .unwrap();
     assert!(reply.ok);
     assert_eq!(reply.transport_index, Some(0));
     let caps = reply.capabilities.unwrap();
-    assert!(caps.has_axis_x);
-    assert_eq!(caps.button_count, 32);
+    assert_eq!(caps.axes, 5);
+    assert_eq!(caps.buttons, 32);
     assert!(caps.has_hat);
+    assert_eq!(
+        caps.to_capabilities(),
+        rsh_output_hidmaestro::HidMaestroCapabilities::custom_wheel()
+    );
+}
+
+#[test]
+fn submit_raw_uses_bytes_field_not_report() {
+    // C1: `bytes` parses; a `report` field is not the submit-raw
+    // field at all (the stub sidecar rejects it as bad-command).
+    let line = encode_command(&Command::SubmitRaw {
+        bytes: "00ff".to_string(),
+    })
+    .unwrap();
+    assert!(line.contains(r#""bytes":"00ff""#));
+    assert!(!line.contains("report"));
 }
 
 #[test]

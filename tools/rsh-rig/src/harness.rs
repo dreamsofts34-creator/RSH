@@ -9,9 +9,27 @@
 //!
 //! ```text
 //! VirtualWheel --wire bytes--> transport task --StreamFrame-->
-//!   watch channel (latest-wins) --> WheelEngine --> RecordingSink
-//!   (wheel also answers pings via PingBridge, and sends 1 Hz status)
+//!   bounded mpsc queue (256, drop-newest on full — the product
+//!   forwarder's shape) --> QueuedSource --> WheelEngine -->
+//!   RecordingSink (wheel also answers pings via PingBridge, and
+//!   sends 1 Hz status)
 //! ```
+//!
+//! # Multi-frame drain support (H-1)
+//!
+//! The handoff is a QUEUE, not a latest-wins `watch` channel: every
+//! parsed frame is enqueued (up to 256; overflows are counted as
+//! `queueDropped`, never silently lost), and the engine's
+//! `drain_source` polls it repeatedly with a zero timeout —
+//! draining up to `MAX_FRAMES_PER_TICK` (32) frames per tick in
+//! arrival order and processing every one of them (deep-scan
+//! Round 2, R2-ENGINE). Frames past the cap stay queued for the
+//! next tick (deferred, never dropped); the engine emits one output
+//! per tick (200 Hz). `coalescedPercent` (≤ 0.5% asserted on soak /
+//! long-soak) therefore measures rig-side watch-channel coalescing
+//! only, never engine drops, and the `emit-200hz` scenario shows
+//! the true 200 Hz rate.
+
 //!
 //! Metrics use the C# `metrics.json` key names (`TESTING-INPUT.md`
 //! §8.3). Axis metrics are recorded in `vJoy` units (0..32767) so the
@@ -25,28 +43,34 @@
 //! # What `lossPercent` and `tickJitterP99Us` measure (Phase H fix)
 //!
 //! The product's forwarder queues frames on a bounded `mpsc` (256,
-//! drop-newest on full) and the engine drains at most one frame per
-//! 5 ms tick, keeping the latest (`state.rs` `forward_with_retry` +
-//! `engine.rs` `drain_source`). The rig's `watch` channel is the
-//! same latest-wins behaviour at the engine boundary — the collapse
-//! just happens in the channel instead of the drain loop, which is
-//! unobservable at the engine. So the engine's sequence gaps conflate
-//! TWO different things, and the SLOs are about only one of them:
+//! drop-newest on full) and the engine drains up to
+//! `MAX_FRAMES_PER_TICK` (32) frames per 5 ms tick in arrival order,
+//! processing every one (`state.rs` `forward_with_retry` +
+//! `engine.rs` `drain_source`). There is no latest-wins collapse
+//! left at the engine boundary: the engine processes every drained
+//! frame, so `coalescedPercent` is expected to be ~0% on a healthy
+//! run (verified 0% on soak after the Round 2 drain fix); a nonzero
+//! value means frames that arrived but were genuinely never
+//! processed (queue-overflow drops, counted as `queueDropped`, or
+//! restart-rebaseline artefacts), reported separately, never hidden.
+//! So the engine's sequence gaps conflate TWO different things, and
+//! the SLOs are about only one of them:
 //!
 //! * `lossPercent` — TRUE TRANSPORT LOSS: sequence gaps counted at
 //!   ARRIVAL, in the transport task, on parsed frames, with the
 //!   engine's own [`SequenceTracker`] rules (wrap, duplicate,
 //!   reboot rebaseline) so the two counters are directly comparable.
 //!   A frame that never arrives (net loss, bad CRC, channel drop)
-//!   is lost; a frame that arrives but is superseded by latest-wins
-//!   is NOT transport loss. The SLO (`< 0.5% Wi-Fi`) is about the
+//!   is lost; a frame that arrives but the engine never processes
+//!   is NOT transport loss (it is `coalesced`, reported separately).
+//!   The SLO (`< 0.5% Wi-Fi`) is about the
 //!   transport, so it is measured at the transport.
 //! * `coalescedFrames` / `coalescedPercent` — frames that DID arrive
 //!   but the engine never processed (engine gaps minus arrival gaps).
-//!   Reported separately in every run, never hidden: latest-wins
-//!   still drops ~3% of frames per tick on this VM, and that is real
-//!   product behaviour (the engine processes the latest frame per
-//!   tick). `engineLossPercent` / `engineSequenceGaps` keep the old
+//!   Reported separately in every run, never hidden: on a healthy
+//!   run this is 0% (the multi-frame drain processes every frame);
+//!   a nonzero value is a real signal, not a measurement artefact.
+//!   `engineLossPercent` / `engineSequenceGaps` keep the old
 //!   engine-side numbers for comparison.
 //! * `tickJitterP99Us` — PC-RECEIVE inter-arrival jitter p99: the
 //!   wall-clock spacing between consecutive frame ARRIVALS at the
@@ -62,7 +86,9 @@
 //!   still recorded, not hidden.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rsh_benchmarks::alloc::net_live_bytes;
@@ -75,7 +101,7 @@ use rsh_protocol::control::{ControlFrame, DuplicateCache, ReplayTracker, build_f
 use rsh_protocol::error::RejectCounters;
 use rsh_protocol::ping::{PingFrame, measure};
 use rsh_protocol::stream::{StatusPacket, StreamFrame};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::metrics::{JitterHistogram, Metrics, Sampler};
 use crate::scenarios::{HarnessConfig, Scenario};
@@ -129,6 +155,13 @@ struct SinkState {
 
 impl SinkState {
     /// Fresh state (extremes start inverted so "no data" is visible).
+    /// Buffers are pre-allocated BEFORE the run's `reset_counts()`:
+    /// `neutral_times` (8192 Instants ≈ 41 s of continuous neutral
+    /// output) and `distinct_masks` (256) must not grow inside the
+    /// measured window, or the rig's `allocBytesDelta` measures its
+    /// own bookkeeping instead of the product (M-1). A 4-hour soak
+    /// with a stuck watchdog would pass 8192 neutral sends — pushes
+    /// past the cap are dropped (the count is still exact).
     fn new() -> Self {
         Self {
             steering_min: i64::MAX,
@@ -141,6 +174,8 @@ impl SinkState {
             clutch_max: i64::MIN,
             handbrake_min: i64::MAX,
             handbrake_max: i64::MIN,
+            neutral_times: Vec::with_capacity(8192),
+            distinct_masks: Vec::with_capacity(256),
             ..Self::default()
         }
     }
@@ -179,7 +214,11 @@ impl OutputSink for RecordingSink {
         s.update_calls += 1;
         if *state == OutputState::neutral() {
             s.neutral_sends += 1;
-            if s.neutral_times.len() < 100_000 {
+            // Capped at the pre-allocated capacity (see `SinkState::new`):
+            // pushing past it would grow the buffer inside the measured
+            // window (M-1). Watchdog detection only needs neutral times
+            // inside silence episodes, which are seconds long.
+            if s.neutral_times.len() < 8192 {
                 s.neutral_times.push(Instant::now());
             }
             return Ok(());
@@ -217,57 +256,97 @@ impl OutputSink for RecordingSink {
     }
 }
 
-/// `PacketSource` over the latest-wins watch channel: the transport
-/// overwrites with each parsed frame; the engine takes the newest.
-struct WatchSource {
-    rx: watch::Receiver<Option<StreamFrame>>,
+/// Depth of the transport→engine frame queue (H-1 drain support):
+/// live depth + high-water mark + frames dropped on a full queue.
+/// The transport increments on every successful enqueue, the source
+/// decrements on every dequeue; a drop is counted, never silent.
+#[derive(Debug, Default)]
+struct QueueDepth {
+    current: AtomicUsize,
+    max: AtomicUsize,
+    dropped: AtomicU64,
 }
 
-impl PacketSource for WatchSource {
+impl QueueDepth {
+    fn on_enqueue(&self) {
+        let cur = self.current.fetch_add(1, Ordering::Relaxed) + 1;
+        self.max.fetch_max(cur, Ordering::Relaxed);
+    }
+
+    fn on_dequeue(&self) {
+        self.current.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn on_drop(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Queue capacity: mirrors the product forwarder's bounded `mpsc`
+/// (256, drop-newest on full — see the module docs). The engine
+/// drains every 5 ms and the wheel emits every 5.1 ms, so a healthy
+/// run holds ~0–1 frames; a full queue means the engine is stuck,
+/// and the drop count says so.
+const FRAME_QUEUE_CAPACITY: usize = 256;
+
+/// `PacketSource` over the bounded mpsc queue: the transport
+/// enqueues every parsed frame; the engine drains them in arrival
+/// order, up to `MAX_FRAMES_PER_TICK` (32) per tick (H-1 multi-frame
+/// drain, deep-scan Round 2). Unlike the old `watch` (latest-wins)
+/// handoff, no frame is collapsed anywhere — frames past the cap
+/// stay queued for the next tick (deferred, never dropped), and the
+/// engine processes every drained frame but emits one output per
+/// tick (200 Hz). `coalescedPercent` (engine gaps minus arrival gaps)
+/// is therefore expected to be 0% on a healthy run; a nonzero value
+/// means frames the engine never processed, never a hidden drop.
+/// The receiver lives behind an async `Mutex` shared by both engine
+/// legs: on restart the new leg reuses the same queue and resumes
+/// with the frames that arrived mid-restart instead of losing them.
+struct QueuedSource {
+    rx: Arc<AsyncMutex<mpsc::Receiver<StreamFrame>>>,
+    depth: Arc<QueueDepth>,
+}
+
+impl PacketSource for QueuedSource {
     async fn next_frame(&mut self) -> Option<StreamFrame> {
-        loop {
-            // Fast path: a frame is already waiting — take it.
-            match self.rx.has_changed() {
-                Ok(true) => {
-                    if let Some(frame) = self.rx.borrow_and_update().clone() {
-                        return Some(frame);
-                    }
-                    // Version changed but the value is still the
-                    // initial None — fall through and wait for a frame.
-                }
-                Ok(false) => {}
-                Err(_) => return None, // sender dropped
-            }
-            // Wait for the next send. NOTE: `changed()` marks the new
-            // version as seen when it fires, so after it returns
-            // `has_changed()` is FALSE — the old code looped back to
-            // `has_changed()` here and the frame was silently dropped
-            // (it was marked seen but never borrowed). That lost
-            // 74–96% of frames in the rig (H2: standalone soak loss
-            // 11.1% / 26.5% / 95.7% / 96.0% across runs; minimal
-            // repro in tests/watch_repro.rs: 0/400 received with the
-            // old shape, 399/400 with the direct poll). So after
-            // `changed()` fires we borrow the value DIRECTLY.
-            if self.rx.changed().await.is_err() {
-                return None; // sender dropped
-            }
-            if let Some(frame) = self.rx.borrow_and_update().clone() {
-                return Some(frame);
-            }
-            // Value was None — loop and wait for a real frame.
+        // The guard is a tokio `MutexGuard`: it may be held across the
+        // `recv().await` (async-aware mutex, never a blocking wait),
+        // and the engine's zero-timeout poll drops this future — and
+        // the guard — as soon as the tick moves on (M-12: no
+        // `std::sync::Mutex` is ever held across an `.await` in this
+        // file; the `std` locks below are only ever held across
+        // synchronous code).
+        let mut rx = self.rx.lock().await;
+        let frame = rx.recv().await;
+        if frame.is_some() {
+            self.depth.on_dequeue();
         }
+        frame
     }
 }
 
 /// Shared ping state between the engine-side sender half and the
 /// reply half (the engine owns the sender half; the transport owns
 /// the reply half).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PingShared {
     /// seq -> (t0 in engine-epoch µs, wall time the request left).
     pending: HashMap<u16, (u64, Instant)>,
     /// Measured E2E delays (µs), one per accepted reply.
     samples: Vec<u64>,
+}
+
+impl Default for PingShared {
+    /// Pre-allocated BEFORE the run's `reset_counts()`: the 200 s
+    /// `ntp-ping` run holds ~201 samples, so 512 never grows inside
+    /// the measured window (M-1); `pending` holds ≤ a few entries
+    /// (1 Hz ping, 500 ms timeout) and 16 is ample.
+    fn default() -> Self {
+        Self {
+            pending: HashMap::with_capacity(16),
+            samples: Vec::with_capacity(512),
+        }
+    }
 }
 
 /// Engine-side half: implements `PingSender`, forwards requests to
@@ -319,7 +398,7 @@ impl PingReplyHalf {
 }
 
 /// Shared transport counters.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TransportState {
     /// Datagrams received from the wheel.
     received: u64,
@@ -344,6 +423,25 @@ struct TransportState {
     /// PC-receive inter-arrival jitter histogram (wall-clock arrival
     /// spacing vs the 5000 µs nominal — the SLO's defined basis).
     arrival_jitter: JitterHistogram,
+}
+
+impl Default for TransportState {
+    /// `silence_episodes` pre-allocated (16) BEFORE the run's
+    /// `reset_counts()`: episodes are rare (a fault run has 1–5), so
+    /// the buffer never grows inside the measured window (M-1).
+    fn default() -> Self {
+        Self {
+            received: 0,
+            parsed_ok: 0,
+            rejects: RejectCounters::default(),
+            last_arrival: None,
+            first_frame: None,
+            last_frame: None,
+            silence_episodes: Vec::with_capacity(16),
+            arrival_seq: SequenceTracker::new(),
+            arrival_jitter: JitterHistogram::default(),
+        }
+    }
 }
 
 /// Current leg's channel senders (swapped on engine restart).
@@ -372,7 +470,8 @@ fn plan_for(h: &HarnessConfig) -> PipelinePlan {
 /// Returns the join handle, stop handle, and the ping sender half.
 fn spawn_leg(
     plan: &PipelinePlan,
-    frame_tx: &watch::Sender<Option<StreamFrame>>,
+    frame_rx: &Arc<AsyncMutex<mpsc::Receiver<StreamFrame>>>,
+    queue_depth: &Arc<QueueDepth>,
     sink: RecordingSink,
     senders: &LegSenders,
     ping: Option<(Arc<Mutex<PingShared>>, mpsc::Sender<PingFrame>)>,
@@ -380,8 +479,9 @@ fn spawn_leg(
     tokio::task::JoinHandle<EngineReport>,
     rsh_engine::engine::StopHandle,
 ) {
-    let source = WatchSource {
-        rx: frame_tx.subscribe(),
+    let source = QueuedSource {
+        rx: Arc::clone(frame_rx),
+        depth: Arc::clone(queue_depth),
     };
     let mut engine = WheelEngine::new(ProcessingPipeline::new(*plan), source, Box::new(sink));
     if let Some((shared, to_wheel)) = ping {
@@ -394,7 +494,12 @@ fn spawn_leg(
     (handle, stop)
 }
 
-/// Wheel task: 200 Hz ticks, control + ping handling, wire output.
+/// Wheel task: ticks at the wheel's emit period, control + ping
+/// handling, wire output. Per-tick channel drains are capped at 32
+/// (L-1: 2× the 16-slot channel capacity) — a stuck producer cannot
+/// make one tick drain unboundedly; the cap is far above anything a
+/// healthy run produces (≤ 1 control frame + ≤ 1 ping per tick) and
+/// a hit is logged in the wheel summary.
 async fn wheel_task(
     mut wheel: VirtualWheel,
     mut ctrl_rx: mpsc::Receiver<Vec<u8>>,
@@ -403,30 +508,77 @@ async fn wheel_task(
     summary: Arc<Mutex<WheelSummary>>,
 ) {
     // H2 experiment (2026-11-14): wheel tick 5.1 ms (196 Hz) instead of
-    // 5.0 ms. The engine ticks at 200 Hz and its drain takes at most
-    // one frame per tick (latest-wins); when the wheel emits at exactly
-    // the tick rate, the drain/send phase cycles and a bad phase
-    // coalesces ~10–15% of frames (10-min soak loss 14.19% at 200 Hz).
+    // 5.0 ms. The engine ticks at 200 Hz; the OLD drain took at most
+    // one frame per tick (latest-wins), so when the wheel emitted at
+    // exactly the tick rate, the drain/send phase cycled and a bad phase
+    // coalesced ~10–15% of frames (10-min soak loss 14.19% at 200 Hz).
+    // The Round 2 multi-frame drain (up to 32 frames/tick) processes
+    // every frame, so that failure mode is gone (deep-scan gate:
+    // emit-200hz coalesced 0% at 200 Hz) — the 196 Hz emit is kept as
+    // the documented soak default, not because the drain needs it.
     // A 196 Hz emit is strictly slower than the 200 Hz tick, so at
     // most one frame lands per tick window and every emit is drained
     // exactly once regardless of phase. Rate SLO is >= 195/s, so
-    // 196 Hz still satisfies it. Revert if the soak re-test does not
-    // show loss < 0.5%.
-    let mut interval = tokio::time::interval(Duration::from_micros(5100));
+    // 196 Hz still satisfies it. This is a DOCUMENTED HARNESS
+    // LIMITATION (H-2): the true 200 Hz coalescing rate is measured
+    // by the `emit-200hz` scenario (WheelConfig tick_interval_us
+    // 5000), not hidden by the 196 Hz default.
+    //
+    // Missed-tick behavior is SKIP (same as the engine's own loop):
+    // the default BURST catch-up fires all missed ticks at once after
+    // a stall, which (a) emits a burst of frames that queue up for the
+    // multi-frame drain (up to 32/tick; the excess is deferred to the
+    // next tick, never dropped), and (b) compresses a
+    // 2 s reboot blackout into < 250 ms of wall time, so the
+    // engine's reboot evidence (stale watchdog) never fires and the
+    // post-reboot stream counts ~1000 duplicates (baseline quick run:
+    // fault-reboot duplicatesOrLate 944). A real board clock does not
+    // burst-fire ticks — Skip is the faithful model, and it keeps
+    // time-based faults (reboot/wifi-drop/silence) at their real
+    // wall-clock lengths.
+    let emit_us = wheel.tick_interval_us();
+    let mut interval = tokio::time::interval(Duration::from_micros(emit_us));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        while let Ok(bytes) = ctrl_rx.try_recv() {
-            wheel.handle_control(&bytes);
+        let mut drained = 0usize;
+        while drained < 32 {
+            match ctrl_rx.try_recv() {
+                Ok(bytes) => {
+                    drained += 1;
+                    wheel.handle_control(&bytes);
+                }
+                Err(_) => break,
+            }
         }
-        while let Ok(req) = ping_req_rx.try_recv() {
-            let t1 = wheel.board_now_us();
-            let reply = PingFrame::reply(req.seq, req.t0, t1, t1 + 50);
-            let delay = wheel.ping_delay();
-            let tx = wire_tx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                let _ = tx.send(WireMsg::PingReply(reply)).await;
-            });
+        if drained >= 32 {
+            wheel.summary.log_event(format_args!(
+                "t={:.1}s control drain hit the 32/tick cap (L-1 backstop)",
+                wheel.now_s_pub()
+            ));
+        }
+        let mut drained = 0usize;
+        while drained < 32 {
+            match ping_req_rx.try_recv() {
+                Ok(req) => {
+                    drained += 1;
+                    let t1 = wheel.board_now_us();
+                    let reply = PingFrame::reply(req.seq, req.t0, t1, t1 + 50);
+                    let delay = wheel.ping_delay();
+                    let tx = wire_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = tx.send(WireMsg::PingReply(reply)).await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+        if drained >= 32 {
+            wheel.summary.log_event(format_args!(
+                "t={:.1}s ping drain hit the 32/tick cap (L-1 backstop)",
+                wheel.now_s_pub()
+            ));
         }
         let out = wheel.next_tick();
         for bytes in out.frames {
@@ -442,10 +594,11 @@ async fn wheel_task(
 }
 
 /// Transport task: parse wire bytes with the real parser, forward
-/// frames (latest-wins), status, and ping replies.
+/// frames (bounded queue, drop-newest on full), status, and ping replies.
 async fn transport_task(
     mut wire_rx: mpsc::Receiver<WireMsg>,
-    frame_tx: watch::Sender<Option<StreamFrame>>,
+    frame_tx: mpsc::Sender<StreamFrame>,
+    queue_depth: Arc<QueueDepth>,
     senders: Arc<LegSenders>,
     ping_reply: PingReplyHalf,
     state: Arc<Mutex<TransportState>>,
@@ -491,7 +644,14 @@ async fn transport_task(
                         st.first_frame = Some(now);
                     }
                     st.last_frame = Some(now);
-                    let _ = frame_tx.send(Some(frame));
+                    // Enqueue for the engine (bounded queue, H-1):
+                    // drop-newest on full, counted — never silent.
+                    // `try_send` is synchronous, so no `.await` runs
+                    // while the transport lock is held (M-12).
+                    match frame_tx.try_send(frame) {
+                        Ok(()) => queue_depth.on_enqueue(),
+                        Err(_) => queue_depth.on_drop(),
+                    }
                 }
             }
             WireMsg::Status(pkt) => {
@@ -563,7 +723,9 @@ pub async fn run_live(
     let wheel_summary = Arc::new(Mutex::new(WheelSummary::default()));
     let ping_shared = Arc::new(Mutex::new(PingShared::default()));
     let senders = Arc::new(LegSenders::default());
-    let (frame_tx, _) = watch::channel::<Option<StreamFrame>>(None);
+    let (frame_tx, frame_rx) = mpsc::channel::<StreamFrame>(FRAME_QUEUE_CAPACITY);
+    let frame_rx = Arc::new(AsyncMutex::new(frame_rx));
+    let queue_depth = Arc::new(QueueDepth::default());
     let (wire_tx, wire_rx) = mpsc::channel::<WireMsg>(1024);
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<Vec<u8>>(16);
     let (ping_req_tx, ping_req_rx) = mpsc::channel::<PingFrame>(16);
@@ -593,7 +755,7 @@ pub async fn run_live(
         None
     };
     let (mut engine_handle, mut stop_handle) =
-        spawn_leg(&plan, &frame_tx, sink, &senders, ping_arg);
+        spawn_leg(&plan, &frame_rx, &queue_depth, sink, &senders, ping_arg);
 
     // Transport + wheel tasks.
     let ping_reply = PingReplyHalf {
@@ -602,7 +764,8 @@ pub async fn run_live(
     };
     let transport_handle = tokio::spawn(transport_task(
         wire_rx,
-        frame_tx.clone(),
+        frame_tx,
+        Arc::clone(&queue_depth),
         Arc::clone(&senders),
         ping_reply,
         Arc::clone(&transport_state),
@@ -627,6 +790,14 @@ pub async fn run_live(
     let mut restarts = 0u64;
     let mut drop_started = false;
     let mut restarted = false;
+    // M-6: a leg that does not stop in 5 s fails the scenario (see
+    // `engineStopFailed`), it is not just an event line.
+    let mut stop_failed = false;
+    // H-5: wall-clock blackout of the engine restart (stop → new leg
+    // spawned). Arrival `lossPercent` is 0.0% across a restart by
+    // construction (arrivals never stop), so this is the number that
+    // says the restart actually happened and how long output was dark.
+    let mut engine_restart_ms: u64 = 0;
     let mut next_log = Duration::from_secs(60);
     let mut reports: Vec<EngineReport> = Vec::new();
     let duration = Duration::from_secs(duration_s);
@@ -668,6 +839,7 @@ pub async fn run_live(
                 "[{id}] restarting engine (leg 2)",
                 id = scenario.id
             ));
+            let restart_t0 = Instant::now();
             stop_handle.stop();
             match tokio::time::timeout(Duration::from_secs(5), &mut engine_handle).await {
                 Ok(Ok(report)) => reports.push(report),
@@ -675,6 +847,7 @@ pub async fn run_live(
                     metrics.events.push(format!("engine leg 1 panicked: {e}"));
                 }
                 Err(_) => {
+                    stop_failed = true;
                     metrics
                         .events
                         .push("engine leg 1 did not stop in 5 s".to_string());
@@ -690,7 +863,9 @@ pub async fn run_live(
             } else {
                 None
             };
-            let (handle2, stop2) = spawn_leg(&plan, &frame_tx, sink2, &senders, ping_arg2);
+            let (handle2, stop2) =
+                spawn_leg(&plan, &frame_rx, &queue_depth, sink2, &senders, ping_arg2);
+            engine_restart_ms = u64::try_from(restart_t0.elapsed().as_millis()).unwrap_or(u64::MAX);
             engine_handle = handle2;
             stop_handle = stop2;
         }
@@ -703,9 +878,12 @@ pub async fn run_live(
     match tokio::time::timeout(Duration::from_secs(5), engine_handle).await {
         Ok(Ok(report)) => reports.push(report),
         Ok(Err(e)) => metrics.events.push(format!("engine panicked: {e}")),
-        Err(_) => metrics
-            .events
-            .push("engine did not stop in 5 s".to_string()),
+        Err(_) => {
+            stop_failed = true;
+            metrics
+                .events
+                .push("engine did not stop in 5 s".to_string());
+        }
     }
     wheel_handle.abort();
     transport_handle.abort();
@@ -757,7 +935,8 @@ pub async fn run_live(
     metrics.set("badFrame", transport.rejects.bad_frame as f64);
     // TRUE TRANSPORT LOSS (see the module docs): sequence gaps counted
     // at ARRIVAL, not at the engine. The engine's gaps conflate
-    // transport loss with latest-wins coalescing; the SLO is about
+    // transport loss with coalescing (frames that arrived but were
+    // never processed); the SLO is about
     // the transport, so `lossPercent` is the arrival number and the
     // engine number is kept separately, never hidden.
     let arrival_gaps = transport.arrival_seq.gaps();
@@ -783,7 +962,7 @@ pub async fn run_live(
     metrics.set("engineSequenceGaps", gaps as f64);
     metrics.set("coalescedFrames", coalesced as f64);
     // Share of the arrived stream's sequence span that arrived but
-    // was superseded by latest-wins (denominator = arrival span,
+    // was never processed by the engine (denominator = arrival span,
     // not accepted + coalesced — coalesced frames are a subset of
     // the arrivals, not additional to them).
     let arrival_span = arrival_accepted + arrival_gaps;
@@ -841,6 +1020,17 @@ pub async fn run_live(
         if let Some(p99) = crate::metrics::percentile_us(&ping.samples, 99) {
             metrics.set("e2eDelayP99Us", p99 as f64);
         }
+        // H-8: bootstrap 95% CI for the p99 (200 resamples, seeded
+        // by the run seed — deterministic). The SLO still asserts on
+        // the p99 itself; the interval says how wide the tail
+        // estimate is. This is a LOOPBACK p99 (in-process channel,
+        // no real Wi-Fi): a real-Wi-Fi re-measure is a Windows/human
+        // gate, recorded in the report — the number here must never
+        // be quoted as a Wi-Fi measurement.
+        if let Some((lo, hi)) = crate::metrics::bootstrap_p99_ci(&ping.samples, 200, seed) {
+            metrics.set("e2eDelayP99CiLowUs", lo as f64);
+            metrics.set("e2eDelayP99CiHighUs", hi as f64);
+        }
     }
     metrics.set(
         "watchdogActivations",
@@ -862,6 +1052,46 @@ pub async fn run_live(
         },
     );
     metrics.set("restarts", restarts as f64);
+    // M-6: 1.0 when a leg (or the final engine) did not stop in 5 s —
+    // every live scenario asserts this is 0, so a stuck stop FAILS
+    // the scenario instead of leaving an event line behind.
+    metrics.set("engineStopFailed", if stop_failed { 1.0 } else { 0.0 });
+    // H-5: engine-restart blackout (ms, stop → new leg spawned;
+    // 0 when the scenario restarts nothing). Stands next to the
+    // restart scenarios' `lossPercent` (0.0% by construction), so the
+    // restart is visible as a blackout, not as a perfect loss number.
+    metrics.set("engineRestartMs", engine_restart_ms as f64);
+    // H-5: reboot/silence blackout, reported separately from
+    // `lossPercent`: every silence episode's wall-clock length and
+    // the frames it cost at the nominal 200 Hz emit rate. A reboot
+    // rebaselines the sequence, so its 2 s of silence costs ~400
+    // frames WITHOUT counting as transport loss — the blackout
+    // number is where that loss is visible, with its own bound.
+    let mut silence_total_ms: u64 = 0;
+    let mut silence_max_ms: u64 = 0;
+    for (start, end) in &transport.silence_episodes {
+        let ms = u64::try_from(end.duration_since(*start).as_millis()).unwrap_or(u64::MAX);
+        silence_total_ms = silence_total_ms.saturating_add(ms);
+        silence_max_ms = silence_max_ms.max(ms);
+    }
+    metrics.set("silenceEpisodes", transport.silence_episodes.len() as f64);
+    metrics.set("silenceTotalMs", silence_total_ms as f64);
+    metrics.set("silenceMaxMs", silence_max_ms as f64);
+    metrics.set(
+        "blackoutExpectedFrames",
+        silence_total_ms as f64 * 200.0 / 1000.0,
+    );
+    // H-1 drain support, observed: frames the queue dropped (full)
+    // and its high-water mark. Healthy runs show 0 dropped and a
+    // depth of ~0–2.
+    metrics.set(
+        "queueDropped",
+        queue_depth.dropped.load(Ordering::Relaxed) as f64,
+    );
+    metrics.set(
+        "queueDepthMax",
+        queue_depth.max.load(Ordering::Relaxed) as f64,
+    );
     metrics.set("wheelCtrlAccepted", wheel_sum.ctrl_accepted as f64);
     metrics.set("authGetCapsOk", auth_get_caps_ok);
     // Axis extremes (only when non-neutral output was observed).
@@ -904,7 +1134,32 @@ pub async fn run_live(
         "rssSlopeMBPer10Min",
         sampler.rss_slope_from(60.0) * MB_PER_10MIN,
     );
-    metrics.events.extend(wheel_sum.events.iter().cloned());
+    // M-8: the same slopes over the 60 s window (samples from 10 s
+    // onward — the first sample is warm-up), pro-rated to MB/10 min
+    // against the same 1 MB/10 min bound, PLUS the slope standard
+    // error: a 60 s slope over ~6 samples is noisy, and the SE says
+    // whether it is distinguishable from flat.
+    let (heap_slope_60, heap_se_60) = sampler.heap_slope_se_from(10.0);
+    let (rss_slope_60, rss_se_60) = sampler.rss_slope_se_from(10.0);
+    metrics.set("heapSlope60sMBPer10Min", heap_slope_60 * MB_PER_10MIN);
+    metrics.set("heapSlope60sStdErrMBPer10Min", heap_se_60 * MB_PER_10MIN);
+    metrics.set("rssSlope60sMBPer10Min", rss_slope_60 * MB_PER_10MIN);
+    metrics.set("rssSlope60sStdErrMBPer10Min", rss_se_60 * MB_PER_10MIN);
+    let (heap_se_600, rss_se_600) = (
+        sampler.heap_slope_se_from(60.0).1,
+        sampler.rss_slope_se_from(60.0).1,
+    );
+    metrics.set("heapSlopeStdErrMBPer10Min", heap_se_600 * MB_PER_10MIN);
+    metrics.set("rssSlopeStdErrMBPer10Min", rss_se_600 * MB_PER_10MIN);
+    // Wheel events are read AFTER `heap_end`, so the `events()`
+    // allocation never lands in the measured window (M-1).
+    metrics.events.extend(wheel_sum.events());
+    if wheel_sum.events_dropped > 0 {
+        metrics.events.push(format!(
+            "wheel event log dropped {} events (8 KiB buffer full)",
+            wheel_sum.events_dropped
+        ));
+    }
     (metrics, sampler)
 }
 
@@ -1154,11 +1409,15 @@ fn self_check_pin_map_push() -> (bool, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PacketSource, WatchSource, coalesced_frames, loss_percent};
+    use super::{
+        FRAME_QUEUE_CAPACITY, PacketSource, QueueDepth, QueuedSource, coalesced_frames,
+        loss_percent,
+    };
     use rsh_protocol::StreamFrame;
+    use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::watch;
-    use tokio::time::{MissedTickBehavior, interval, timeout};
+    use tokio::sync::{Mutex as AsyncMutex, mpsc};
+    use tokio::time::timeout;
 
     /// True-loss vs coalesced arithmetic (Phase H fix): the gate
     /// soak shape is 117,695 arrivals, 0 arrival gaps, ~4,060
@@ -1175,60 +1434,98 @@ mod tests {
         assert_eq!(loss_percent(0, 0), 0.0);
     }
 
-    /// Regression test for the H2 watch-handoff bug: the old
-    /// `WatchSource::next_frame` looped back to `has_changed()` after
-    /// `changed()` fired, and `changed()` marks the version seen —
-    /// so frames arriving during the await were silently dropped
-    /// (a minimal repro received 0/400 with the old shape). The fixed
-    /// shape borrows the value directly after `changed()` fires and
-    /// receives ~all frames.
+    /// H-1 drain support: the queue handoff preserves EVERY frame,
+    /// in order — unlike the old latest-wins `watch` channel, which
+    /// collapsed frames in the channel (the H2 repro received 0/400
+    /// with the old `WatchSource` shape). A burst of 200 frames
+    /// (under the 256-frame capacity) enqueued at once must all come
+    /// back out, in sequence order; any coalescing is then frames
+    /// the engine never processed, measured as `coalescedPercent`
+    /// — never a channel loss.
+    /// Also proves the depth accounting: max depth hits 200, drops 0.
     #[tokio::test]
-    async fn watch_source_delivers_nearly_all_frames() {
-        let (tx, _) = watch::channel::<Option<StreamFrame>>(None);
-        let mut src = WatchSource { rx: tx.subscribe() };
-        let sender = tokio::spawn(async move {
-            let mut iv = interval(Duration::from_millis(5));
-            let mut n: u64 = 0;
-            loop {
-                iv.tick().await;
-                n += 1;
-                if n > 400 {
-                    break;
-                }
-                let frame = StreamFrame::new(
-                    n as u16,
-                    (n * 5000) as u32,
-                    rsh_protocol::StreamFlags::default(),
-                    &[],
-                    &[0; 4],
-                    0,
-                );
-                let _ = tx.send(Some(frame));
-            }
-            n
-        });
-        let mut iv = interval(Duration::from_millis(5));
-        iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut received: u64 = 0;
-        let mut ticks: u64 = 0;
-        while ticks < 400 {
-            iv.tick().await;
-            ticks += 1;
-            // Same shape as the engine's drain_source: zero-timeout
-            // poll, keep the latest, stop on timeout.
-            let got = timeout(Duration::ZERO, src.next_frame()).await;
-            if let Ok(Some(_)) = got {
-                received += 1;
+    async fn queued_source_delivers_every_frame_in_order() {
+        let (tx, rx) = mpsc::channel::<StreamFrame>(FRAME_QUEUE_CAPACITY);
+        let depth = Arc::new(QueueDepth::default());
+        let mut src = QueuedSource {
+            rx: Arc::new(AsyncMutex::new(rx)),
+            depth: Arc::clone(&depth),
+        };
+        for n in 1..=200u64 {
+            let frame = StreamFrame::new(
+                n as u16,
+                (n * 5000) as u32,
+                rsh_protocol::StreamFlags::default(),
+                &[],
+                &[0; 4],
+                0,
+            );
+            tx.try_send(frame).expect("queue holds 200");
+            depth.on_enqueue();
+        }
+        let mut received: Vec<u16> = Vec::new();
+        while received.len() < 200 {
+            let got = timeout(Duration::from_millis(100), src.next_frame()).await;
+            match got {
+                Ok(Some(frame)) => received.push(frame.seq),
+                other => panic!("queue stalled after {} frames: {other:?}", received.len()),
             }
         }
-        let sent = sender.await.unwrap_or(0);
-        assert!(sent >= 400, "sender sent {sent}");
-        // The old shape received 0/400 here; the fix must deliver
-        // nearly all (a few coalesced frames are expected — the
-        // engine's latest-wins drain takes at most one per tick).
-        assert!(
-            received >= 380,
-            "watch handoff lost frames: received {received}/400"
+        let expected: Vec<u16> = (1..=200).collect();
+        assert_eq!(received, expected, "frames must arrive in order, none lost");
+        assert_eq!(depth.max.load(std::sync::atomic::Ordering::Relaxed), 200);
+        assert_eq!(depth.dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// The engine's drain shape (zero-timeout poll, keep the latest)
+    /// over the queue still takes the newest when several frames are
+    /// queued — the coalescing is the engine's per-tick choice, and
+    /// the frames it skipped are still IN the queue for a future
+    /// multi-frame drain (they were not collapsed by the channel).
+    #[tokio::test]
+    async fn queued_source_keeps_backlog_for_multi_frame_drain() {
+        let (tx, rx) = mpsc::channel::<StreamFrame>(FRAME_QUEUE_CAPACITY);
+        let depth = Arc::new(QueueDepth::default());
+        let mut src = QueuedSource {
+            rx: Arc::new(AsyncMutex::new(rx)),
+            depth: Arc::clone(&depth),
+        };
+        for n in 1..=10u64 {
+            let frame = StreamFrame::new(
+                n as u16,
+                (n * 5000) as u32,
+                rsh_protocol::StreamFlags::default(),
+                &[],
+                &[0; 4],
+                0,
+            );
+            tx.try_send(frame).expect("enqueue");
+            depth.on_enqueue();
+        }
+        // Queue drain shape: zero-timeout polls until empty; the last
+        // frame polled is the newest (the engine's multi-frame drain
+        // collects ALL of them — see `drain_source`).
+        let mut latest: Option<u16> = None;
+        let mut polled = 0u64;
+        while let Ok(Some(frame)) = timeout(Duration::ZERO, src.next_frame()).await {
+            latest = Some(frame.seq);
+            polled += 1;
+        }
+        assert_eq!(polled, 10, "drain saw all 10 queued frames");
+        assert_eq!(latest, Some(10), "last polled frame is the newest");
+        // And a second consumer over the same queue (leg 2 after a
+        // restart) still sees frames enqueued after the swap.
+        let frame = StreamFrame::new(
+            11,
+            11 * 5000,
+            rsh_protocol::StreamFlags::default(),
+            &[],
+            &[0; 4],
+            0,
         );
+        tx.try_send(frame).expect("enqueue after drain");
+        depth.on_enqueue();
+        let got = timeout(Duration::from_millis(100), src.next_frame()).await;
+        assert!(matches!(got, Ok(Some(f)) if f.seq == 11));
     }
 }

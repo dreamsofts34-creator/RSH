@@ -26,6 +26,7 @@
 //! until the user re-enables "Auto". On duplicate process names the
 //! first profile in list order wins.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,9 +35,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::csharp_import::{
-    AppSettings, GameId, MAX_PROFILES_FILE_BYTES, MAX_SETTINGS_FILE_BYTES, ProfileFile,
-    WheelProfile, read_csharp_profiles_file, read_csharp_settings_file,
+    AppSettings, AppSettingsPatch, GameId, MAX_PROFILES_FILE_BYTES, MAX_SETTINGS_FILE_BYTES,
+    ProfileFile, WheelProfile, canonical_module_id, read_csharp_profiles_file, sanitize_settings,
 };
+use crate::resolver::{ProfileId, ProfileSource};
+
+/// The canonical car-model normalizer (H2): one normalizer everywhere.
+/// Re-exported from `rsh-telemetry` (`types.rs`) — lowercase with runs
+/// of space / `_` / `-` unified to a single `_`, so `ferrari_488_gt3`
+/// (AC) and `Ferrari 488 GT3` (ACC) match the same profile key.
+pub use rsh_telemetry::normalize_car_model as canonical_normalize_car_model;
 
 /// Store file schema version (Profile v2).
 pub const STORE_SCHEMA_VERSION: u32 = 2;
@@ -156,6 +164,8 @@ impl BackupGeneration {
 pub struct BackupInfo {
     /// Generation (`"current"`, `"bak1"`, `"bak2"`).
     pub generation: String,
+    /// File this row describes (`"profiles.json"` or `"settings.json"`).
+    pub file: String,
     /// True when the file for this generation exists on disk.
     pub present: bool,
     /// When the generation was last saved (RFC 3339 UTC), or `None`.
@@ -227,10 +237,15 @@ pub fn normalize_process_name(name: &str) -> String {
         .unwrap_or(lowered)
 }
 
-/// Normalize a car model for matching: trim + lowercase.
+/// Normalize a car model for matching: the canonical normalizer
+/// (H2 — `rsh-telemetry` `types.rs`): trim, lowercase, and unify runs
+/// of space / `_` / `-` to a single `_`, so `ferrari_488_gt3` (AC)
+/// and `Ferrari 488 GT3` (ACC) are the same key. Every lookup in this
+/// crate (store resolution, watcher, adapter) goes through this one
+/// function — never a local variant.
 #[must_use]
 pub fn normalize_car_model(model: &str) -> String {
-    model.trim().to_ascii_lowercase()
+    rsh_telemetry::normalize_car_model(model)
 }
 
 /// Validate a profile name (SEC-C-15): non-empty after trimming, at most
@@ -372,6 +387,11 @@ pub struct ProfileStore {
     /// True when the user picked a profile by hand: auto-switch stays
     /// off until the user re-enables "Auto".
     auto_switch_locked: bool,
+    /// Load-time validation notes (H5): entries rejected, duplicates
+    /// dropped, or the Default profile recreated on load. Empty on a
+    /// clean load; surfaced by the app as a startup notice, never
+    /// silently swallowed.
+    load_warnings: Vec<String>,
 }
 
 impl ProfileStore {
@@ -392,6 +412,13 @@ impl ProfileStore {
         } else {
             (vec![StoredProfile::default_profile()], None, false)
         };
+        // H5: validate the loaded list — an invalid entry is rejected
+        // (never loaded as a live profile), a duplicate id/name is
+        // dropped (first wins), and an empty list recreates Default.
+        // A corrupt file (bad JSON / oversize / bad schema) is still
+        // an error above — validation only ever drops *entries*, never
+        // invents data.
+        let (profiles, load_warnings) = Self::validate_loaded(profiles);
         let active_profile_id = active_profile_id.filter(|id| profiles.iter().any(|p| &p.id == id));
         let settings_path = dir.join("settings.json");
         let settings = if settings_path.exists() {
@@ -405,7 +432,80 @@ impl ProfileStore {
             active_profile_id,
             settings,
             auto_switch_locked,
+            load_warnings,
         })
+    }
+
+    /// Load-time validation for a `profiles.json` list (H5).
+    ///
+    /// Returns the kept profiles plus one warning per dropped entry:
+    /// invalid entries (failing [`validate_profile`]) are rejected,
+    /// duplicate ids and duplicate names (case-insensitive) keep the
+    /// first entry, and an empty result recreates the `Default`
+    /// profile so the store is never profile-less. Module-tuning keys
+    /// are canonicalized (`"accel"` → `"accelerator"`, C-MOD-1).
+    fn validate_loaded(profiles: Vec<StoredProfile>) -> (Vec<StoredProfile>, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut kept: Vec<StoredProfile> = Vec::with_capacity(profiles.len());
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for mut stored in profiles {
+            // Canonicalize module-tuning keys first (C-MOD-1).
+            let mut migrated: BTreeMap<String, crate::csharp_import::PerModuleTuning> =
+                BTreeMap::new();
+            for (key, tuning) in std::mem::take(&mut stored.profile.module_tunings) {
+                let canonical = canonical_module_id(&key);
+                if canonical != key && migrated.contains_key(&canonical) {
+                    warnings.push(format!(
+                        "profile '{}': duplicate module tuning '{key}' dropped (canonical '{canonical}' already present)",
+                        stored.profile.name
+                    ));
+                    continue;
+                }
+                migrated.insert(canonical, tuning);
+            }
+            stored.profile.module_tunings = migrated;
+            let errors = validate_profile(&stored.profile);
+            if !errors.is_empty() {
+                warnings.push(format!(
+                    "profile '{}' (id '{}') rejected on load: {}",
+                    stored.profile.name,
+                    stored.id,
+                    errors.join("; ")
+                ));
+                continue;
+            }
+            if !seen_ids.insert(stored.id.clone()) {
+                warnings.push(format!(
+                    "profile '{}' (id '{}') rejected on load: duplicate id",
+                    stored.profile.name, stored.id
+                ));
+                continue;
+            }
+            let name_key = stored.profile.name.trim().to_ascii_lowercase();
+            if !seen_names.insert(name_key) {
+                warnings.push(format!(
+                    "profile '{}' (id '{}') rejected on load: duplicate name",
+                    stored.profile.name, stored.id
+                ));
+                continue;
+            }
+            kept.push(stored);
+        }
+        if kept.is_empty() {
+            warnings
+                .push("no valid profiles on load — the Default profile was recreated".to_string());
+            kept.push(StoredProfile::default_profile());
+        }
+        (kept, warnings)
+    }
+
+    /// Load-time validation notes from [`ProfileStore::open`] (H5):
+    /// rejected entries, dropped duplicates, Default recreation.
+    /// Empty on a clean load.
+    #[must_use]
+    pub fn load_warnings(&self) -> &[String] {
+        &self.load_warnings
     }
 
     /// The directory this store reads from / writes to.
@@ -464,14 +564,26 @@ impl ProfileStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Validation`] when the name is invalid.
+    /// Returns [`StoreError::Validation`] when the name is invalid or
+    /// already taken (case-insensitive — L3: two profiles must never
+    /// share a name, or resolution and the UI cannot tell them apart).
     pub fn create(&mut self, name: &str) -> Result<StoredProfile, StoreError> {
         let errors = validate_profile_name(name);
         if !errors.is_empty() {
             return Err(StoreError::Validation(errors));
         }
+        let trimmed = name.trim();
+        if self
+            .profiles
+            .iter()
+            .any(|p| p.profile.name.eq_ignore_ascii_case(trimmed))
+        {
+            return Err(StoreError::Validation(vec![format!(
+                "a profile named '{trimmed}' already exists"
+            )]));
+        }
         let profile = WheelProfile {
-            name: name.trim().to_string(),
+            name: trimmed.to_string(),
             ..WheelProfile::default()
         };
         let id = self.unique_id(&profile.name);
@@ -484,17 +596,23 @@ impl ProfileStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`] for an unknown id.
+    /// Returns [`StoreError::NotFound`] for an unknown id. The copy's
+    /// name is truncated so the `"<name> copy"` / `" (2)"` suffix
+    /// never pushes it past [`MAX_PROFILE_NAME_LEN`] (L3: a 64-char
+    /// name duplicated cleanly instead of failing validation).
     pub fn duplicate(&mut self, id: &str) -> Result<StoredProfile, StoreError> {
         let source = self
             .get(id)
             .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
         let mut profile = source.profile.clone();
-        profile.name = format!("{} copy", profile.name);
-        let name_errors = validate_profile_name(&profile.name);
-        if !name_errors.is_empty() {
-            profile.name = format!("{} (2)", source.profile.name);
+        let base = source.profile.name.clone();
+        let mut candidate = Self::copy_name(&base);
+        let mut n = 2;
+        while self.profiles.iter().any(|p| p.profile.name == candidate) {
+            candidate = Self::copy_name_numbered(&base, n);
+            n += 1;
         }
+        profile.name = candidate;
         let new_id = self.unique_id(&profile.name);
         let stored = StoredProfile {
             id: new_id,
@@ -502,6 +620,31 @@ impl ProfileStore {
         };
         self.profiles.push(stored.clone());
         Ok(stored)
+    }
+
+    /// Name for a duplicate of `name`: `"<name> copy"`, or
+    /// `"<name> (2)"` when that is taken / too long — always within
+    /// [`MAX_PROFILE_NAME_LEN`] characters.
+    fn copy_name(name: &str) -> String {
+        Self::copy_name_numbered(name, 0)
+    }
+
+    /// Numbered duplicate name: `"<name> copy"` for `n == 0`, else
+    /// `"<name> (n+1)"` — truncated to fit [`MAX_PROFILE_NAME_LEN`].
+    fn copy_name_numbered(name: &str, n: u32) -> String {
+        fn fit(base: &str, suffix: &str) -> String {
+            let room = MAX_PROFILE_NAME_LEN.saturating_sub(suffix.chars().count());
+            let truncated: String = base.chars().take(room).collect();
+            format!("{}{suffix}", truncated.trim_end())
+        }
+        if n == 0 {
+            let copy = fit(name, " copy");
+            if validate_profile_name(&copy).is_empty() {
+                return copy;
+            }
+            return fit(name, " (2)");
+        }
+        fit(name, &format!(" ({})", n + 1))
     }
 
     /// Delete a profile. Deleting the active profile clears the active id.
@@ -543,7 +686,9 @@ impl ProfileStore {
 
     /// Activate a profile. A manual activation locks auto-switch off
     /// (manual override wins — see the module docs); pass
-    /// `manual: false` when the activation itself came from auto-switch.
+    /// `manual: false` when the activation itself came from auto-switch
+    /// — an automatic activation clears the lock (H3: the lock is the
+    /// manual override, so an auto-switch must not leave it set).
     ///
     /// # Errors
     ///
@@ -553,14 +698,21 @@ impl ProfileStore {
             return Err(StoreError::NotFound(id.to_string()));
         }
         self.active_profile_id = Some(id.to_string());
-        if manual {
-            self.auto_switch_locked = true;
-        }
+        self.auto_switch_locked = manual;
         Ok(())
     }
 
     /// Re-enable automatic profile switching after a manual override.
     pub fn enable_auto_switch(&mut self) {
+        self.auto_switch_locked = false;
+    }
+
+    /// Clears the manual-override lock without changing the
+    /// `auto_switch_profiles` setting (H3): a settings write that
+    /// turns auto-switch on uses this instead of
+    /// [`enable_auto_switch`](Self::enable_auto_switch) when the
+    /// setting itself was already on.
+    pub fn clear_auto_switch_lock(&mut self) {
         self.auto_switch_locked = false;
     }
 
@@ -614,10 +766,22 @@ impl ProfileStore {
             .find(|stored| stored.profile.name.eq_ignore_ascii_case("Default"))
     }
 
-    /// Replace the in-memory settings (validated by the caller through
-    /// the settings allowlists; the store persists verbatim).
+    /// Replace the in-memory settings, sanitized first (M10: the
+    /// allowlists / ranges are enforced on the Rust write path too,
+    /// not only on C# import — a hand-edited or frontend-sent bad
+    /// value can never be persisted).
     pub fn set_settings(&mut self, settings: AppSettings) {
+        let mut settings = settings;
+        sanitize_settings(&mut settings);
         self.settings = settings;
+    }
+
+    /// Apply a partial settings update (C-SET-1, PATCH semantics):
+    /// only the provided fields overwrite; absent fields keep their
+    /// existing values. The result is sanitized and returned.
+    pub fn set_settings_patch(&mut self, patch: AppSettingsPatch) -> AppSettings {
+        self.settings.apply_patch(patch);
+        self.settings.clone()
     }
 
     /// Path of the profiles file.
@@ -641,19 +805,31 @@ impl ProfileStore {
 
     /// Save profiles + settings (atomic, with backup rotation).
     ///
+    /// All-or-nothing is impossible across two files with rotation,
+    /// so a half failure is reported honestly instead (H6): when the
+    /// profiles save succeeds but the settings save fails, the error
+    /// names the half that was already written, so the caller knows
+    /// the store is in a partial state instead of assuming a clean
+    /// failure.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Io`] when a file cannot be written.
     pub fn save(&self) -> Result<(), StoreError> {
         self.save_profiles()?;
-        self.save_settings()
+        self.save_settings().map_err(|error| {
+            StoreError::Io(io::Error::other(format!(
+                "settings save failed after profiles were already saved (partial state — profiles are new, settings are old): {error}"
+            )))
+        })
     }
 
     /// Save `profiles.json` atomically, rotating the 3 generations first.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Io`] when a file cannot be written.
+    /// Returns [`StoreError::Io`] when a file cannot be written or a
+    /// backup rotation fails.
     pub fn save_profiles(&self) -> Result<(), StoreError> {
         let file = ProfilesFile {
             schema_version: STORE_SCHEMA_VERSION,
@@ -663,7 +839,7 @@ impl ProfileStore {
         };
         let json = serde_json::to_string_pretty(&file)?;
         fs::create_dir_all(&self.dir)?;
-        rotate_backups(&self.profiles_path());
+        rotate_backups(&self.profiles_path())?;
         write_atomic(&self.profiles_path(), json.as_bytes())
     }
 
@@ -671,11 +847,12 @@ impl ProfileStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Io`] when a file cannot be written.
+    /// Returns [`StoreError::Io`] when a file cannot be written or a
+    /// backup rotation fails.
     pub fn save_settings(&self) -> Result<(), StoreError> {
         let json = serde_json::to_string_pretty(&self.settings)?;
         fs::create_dir_all(&self.dir)?;
-        rotate_backups(&self.settings_path());
+        rotate_backups(&self.settings_path())?;
         write_atomic(&self.settings_path(), json.as_bytes())
     }
 
@@ -688,12 +865,14 @@ impl ProfileStore {
     /// Returns [`StoreError::Io`] when a backup file cannot be moved.
     pub fn backup_now(&self) -> Result<Vec<BackupInfo>, StoreError> {
         fs::create_dir_all(&self.dir)?;
-        rotate_backups(&self.profiles_path());
-        rotate_backups(&self.settings_path());
+        rotate_backups(&self.profiles_path())?;
+        rotate_backups(&self.settings_path())?;
         Ok(self.list_backups())
     }
 
-    /// The 3-generation backup list for `profiles.json`.
+    /// The backup list: 3 generations for `profiles.json` plus 3 for
+    /// `settings.json` (M5 — the Profiles backup card shows both
+    /// files; each row names its `file`).
     #[must_use]
     pub fn list_backups(&self) -> Vec<BackupInfo> {
         list_backups_in(&self.dir)
@@ -710,30 +889,96 @@ impl ProfileStore {
         if generation == BackupGeneration::Current {
             return Ok(());
         }
-        let path = self.backup_path(generation);
+        self.restore_backup_path(&self.backup_path(generation))
+    }
+
+    /// Restore from a real backup path (M9): `path` must name one of
+    /// the six store files in this store's directory —
+    /// `profiles.json[.bak1|.bak2]` or `settings.json[.bak1|.bak2]`.
+    /// A profiles file reloads the profiles + active id + lock; a
+    /// settings file reloads (and sanitizes) the settings. Restoring
+    /// the live file itself is a no-op. Any other path is rejected —
+    /// the caller passes the path the backup list reported, never an
+    /// arbitrary file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] when the path names no known
+    /// store file or the file does not exist, and the read/parse
+    /// errors when it cannot be restored.
+    pub fn restore_backup_path(&mut self, path: &Path) -> Result<(), StoreError> {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let (is_profiles, generation) = match file_name {
+            "profiles.json" => (true, BackupGeneration::Current),
+            "profiles.json.bak1" => (true, BackupGeneration::Bak1),
+            "profiles.json.bak2" => (true, BackupGeneration::Bak2),
+            "settings.json" => (false, BackupGeneration::Current),
+            "settings.json.bak1" => (false, BackupGeneration::Bak1),
+            "settings.json.bak2" => (false, BackupGeneration::Bak2),
+            _ => {
+                return Err(StoreError::NotFound(format!(
+                    "cannot restore backup from '{path}': expected a profiles.json / settings.json generation in the store directory",
+                    path = path.display()
+                )));
+            }
+        };
+        if generation == BackupGeneration::Current {
+            return Ok(());
+        }
+        // The path must name a file inside this store's directory: a
+        // same-named file elsewhere is never a backup of this store.
+        // A bare file name (or a relative path) resolves against the
+        // store directory, which is what the backup list reports.
+        let full_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.dir.join(path)
+        };
+        let in_store_dir = full_path.parent().is_some_and(|parent| parent == self.dir);
+        if !in_store_dir {
+            return Err(StoreError::NotFound(format!(
+                "cannot restore backup from '{}': not in this store's directory",
+                path.display()
+            )));
+        }
+        let path = full_path.as_path();
         if !path.exists() {
             return Err(StoreError::NotFound(format!(
                 "backup generation '{}' does not exist",
                 generation.as_str()
             )));
         }
-        let (profiles, active_profile_id, auto_switch_locked) = Self::read_profiles_file(&path)?;
-        // The restored content becomes the live file (atomically, and
-        // the pre-restore live file rotates into .bak1 first).
-        let file = ProfilesFile {
-            schema_version: STORE_SCHEMA_VERSION,
-            profiles: profiles.clone(),
-            active_profile_id: active_profile_id.clone(),
-            auto_switch_locked,
-        };
-        let json = serde_json::to_string_pretty(&file)?;
-        rotate_backups(&self.profiles_path());
-        write_atomic(&self.profiles_path(), json.as_bytes())?;
-        self.profiles = profiles;
-        self.active_profile_id =
-            active_profile_id.filter(|id| self.profiles.iter().any(|p| &p.id == id));
-        self.auto_switch_locked = auto_switch_locked;
-        Ok(())
+        if is_profiles {
+            let (profiles, active_profile_id, auto_switch_locked) = Self::read_profiles_file(path)?;
+            // The restored content becomes the live file (atomically, and
+            // the pre-restore live file rotates into .bak1 first).
+            let file = ProfilesFile {
+                schema_version: STORE_SCHEMA_VERSION,
+                profiles: profiles.clone(),
+                active_profile_id: active_profile_id.clone(),
+                auto_switch_locked,
+            };
+            let json = serde_json::to_string_pretty(&file)?;
+            rotate_backups(&self.profiles_path())?;
+            write_atomic(&self.profiles_path(), json.as_bytes())?;
+            let (profiles, warnings) = Self::validate_loaded(profiles);
+            self.load_warnings = warnings;
+            self.profiles = profiles;
+            self.active_profile_id =
+                active_profile_id.filter(|id| self.profiles.iter().any(|p| &p.id == id));
+            self.auto_switch_locked = auto_switch_locked;
+            Ok(())
+        } else {
+            let settings = Self::read_settings_file(path)?;
+            let json = serde_json::to_string_pretty(&settings)?;
+            rotate_backups(&self.settings_path())?;
+            write_atomic(&self.settings_path(), json.as_bytes())?;
+            self.settings = settings;
+            Ok(())
+        }
     }
 
     /// Export one profile to `path` (single-profile export format,
@@ -829,20 +1074,30 @@ impl ProfileStore {
 
     /// Import settings from a C# `settings.json` (manual import step
     /// only). The Wi-Fi password is never carried over — the importer
-    /// ignores it (see `csharp_import`).
+    /// ignores it (see `csharp_import`). The import is a MERGE (M6):
+    /// only the fields the C# file actually contains overwrite the
+    /// current settings; absent fields keep their Rust values — a
+    /// partial C# file can never wipe settings it does not mention.
     ///
     /// # Errors
     ///
     /// Returns the importer's errors when the file cannot be read or parsed.
     pub fn import_csharp_settings(&mut self, path: &Path) -> Result<AppSettings, StoreError> {
-        let settings = read_csharp_settings_file(path).map_err(|error| match error {
-            crate::csharp_import::ImportError::Io(error) => StoreError::Io(error),
-            crate::csharp_import::ImportError::Json(error) => StoreError::Json(error),
-            crate::csharp_import::ImportError::TooLarge { limit } => StoreError::TooLarge { limit },
-            crate::csharp_import::ImportError::Schema(message) => StoreError::Schema(message),
-        })?;
-        self.settings = settings.clone();
-        Ok(settings)
+        let text = fs::read_to_string(path)?;
+        if text.len() as u64 > MAX_SETTINGS_FILE_BYTES {
+            return Err(StoreError::TooLarge {
+                limit: MAX_SETTINGS_FILE_BYTES,
+            });
+        }
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        // Only the keys present in the C# file are applied: normalize
+        // the PascalCase keys, parse into a patch (unknown keys such
+        // as the Wi-Fi password are ignored, values are sanitized by
+        // apply_patch), never a full replace.
+        let normalized = crate::csharp_import::normalize_keys(value);
+        let settings_patch: AppSettingsPatch =
+            serde_json::from_value(normalized).map_err(StoreError::Json)?;
+        Ok(self.set_settings_patch(settings_patch))
     }
 
     /// Read + validate a `profiles.json`-shaped file.
@@ -875,7 +1130,9 @@ impl ProfileStore {
         ))
     }
 
-    /// Read + validate a `settings.json` file.
+    /// Read + validate a `settings.json` file (M10: sanitized on the
+    /// Rust load path too — a hand-edited bad value can never be
+    /// loaded into memory unsanitized).
     fn read_settings_file(path: &Path) -> Result<AppSettings, StoreError> {
         let text = fs::read_to_string(path)?;
         if text.len() as u64 > MAX_SETTINGS_FILE_BYTES {
@@ -883,7 +1140,8 @@ impl ProfileStore {
                 limit: MAX_SETTINGS_FILE_BYTES,
             });
         }
-        let settings: AppSettings = serde_json::from_str(&text)?;
+        let mut settings: AppSettings = serde_json::from_str(&text)?;
+        sanitize_settings(&mut settings);
         Ok(settings)
     }
 
@@ -939,6 +1197,65 @@ impl ProfileStore {
     }
 }
 
+/// Normalizes a resolver game id for store comparison: the
+/// resolver's `GAME_*` constants are hyphenated
+/// (`"assetto-corsa-competizione"`) while the store's slugs are
+/// underscored (`"assetto_corsa_competizione"`).
+fn game_id_to_slug(game_id: &str) -> String {
+    game_id.replace('-', "_")
+}
+
+impl ProfileSource for ProfileStore {
+    /// Profile bound to a game: the first profile in list order whose
+    /// game matches `game_id` and which binds no car.
+    fn profile_for_game(&self, game_id: &str) -> Option<ProfileId> {
+        let wanted = game_id_to_slug(game_id);
+        self.profiles
+            .iter()
+            .find(|stored| {
+                game_slug(stored.profile.game).is_some_and(|slug| slug == wanted)
+                    && stored.profile.car_model.trim().is_empty()
+            })
+            .map(|stored| ProfileId::new(stored.id.clone()))
+    }
+
+    /// Profile bound to a car name in any game.
+    fn profile_for_car(&self, car_name: &str) -> Option<ProfileId> {
+        let wanted = normalize_car_model(car_name);
+        if wanted.is_empty() {
+            return None;
+        }
+        self.profiles
+            .iter()
+            .find(|stored| normalize_car_model(&stored.profile.car_model) == wanted)
+            .map(|stored| ProfileId::new(stored.id.clone()))
+    }
+
+    /// Profile bound to a specific car in a specific game (the first
+    /// lookup the resolver tries). Falls back to the car-only binding.
+    fn profile_for_game_car(&self, game_id: &str, car_name: &str) -> Option<ProfileId> {
+        let wanted = normalize_car_model(car_name);
+        let wanted_game = game_id_to_slug(game_id);
+        if !wanted.is_empty()
+            && let Some(stored) = self.profiles.iter().find(|stored| {
+                game_slug(stored.profile.game).is_some_and(|slug| slug == wanted_game)
+                    && normalize_car_model(&stored.profile.car_model) == wanted
+            })
+        {
+            return Some(ProfileId::new(stored.id.clone()));
+        }
+        self.profile_for_car(car_name)
+    }
+
+    /// The profile named `Default`, when one exists.
+    fn default_profile(&self) -> Option<ProfileId> {
+        self.profiles
+            .iter()
+            .find(|stored| stored.profile.name.eq_ignore_ascii_case("Default"))
+            .map(|stored| ProfileId::new(stored.id.clone()))
+    }
+}
+
 impl StoredProfile {
     /// The factory `Default` profile.
     #[must_use]
@@ -954,36 +1271,39 @@ impl StoredProfile {
     }
 }
 
-/// The 3-generation backup list for `profiles.json` in `dir`, without
-/// opening the store (so `list_backups` never fails on a corrupt
-/// `profiles.json` — a missing generation simply reports `present: false`).
+/// The backup list for `profiles.json` + `settings.json` in `dir`
+/// (M5 — 6 rows: 3 generations per file), without opening the store
+/// (so `list_backups` never fails on a corrupt `profiles.json` — a
+/// missing generation simply reports `present: false`).
 #[must_use]
 pub fn list_backups_in(dir: &Path) -> Vec<BackupInfo> {
-    [
-        BackupGeneration::Current,
-        BackupGeneration::Bak1,
-        BackupGeneration::Bak2,
-    ]
-    .iter()
-    .map(|generation| {
-        let path = dir.join(format!("profiles.json{}", generation.suffix()));
-        let (present, saved_at) = match fs::metadata(&path) {
-            Ok(metadata) => (
-                true,
-                metadata
-                    .modified()
-                    .ok()
-                    .and_then(format_system_time_rfc3339),
-            ),
-            Err(_) => (false, None),
-        };
-        BackupInfo {
-            generation: generation.as_str().to_string(),
-            present,
-            saved_at,
+    let mut out = Vec::with_capacity(6);
+    for file in ["profiles.json", "settings.json"] {
+        for generation in [
+            BackupGeneration::Current,
+            BackupGeneration::Bak1,
+            BackupGeneration::Bak2,
+        ] {
+            let path = dir.join(format!("{file}{}", generation.suffix()));
+            let (present, saved_at) = match fs::metadata(&path) {
+                Ok(metadata) => (
+                    true,
+                    metadata
+                        .modified()
+                        .ok()
+                        .and_then(format_system_time_rfc3339),
+                ),
+                Err(_) => (false, None),
+            };
+            out.push(BackupInfo {
+                generation: generation.as_str().to_string(),
+                file: file.to_string(),
+                present,
+                saved_at,
+            });
         }
-    })
-    .collect()
+    }
+    out
 }
 
 /// Repair a corrupt store from its 3-generation backups (H3, Phase G
@@ -1012,17 +1332,40 @@ pub fn list_backups_in(dir: &Path) -> Vec<BackupInfo> {
 /// backup generations were tried, or when a quarantine move fails.
 pub fn try_repair_store_from_backup(dir: &Path) -> Result<Option<String>, String> {
     /// Quarantine `path` (if it exists) and record the move so the
-    /// original can be put back when repair fails outright.
-    fn quarantine(path: &Path, moved: &mut Vec<(PathBuf, PathBuf)>) -> Result<(), String> {
+    /// original can be put back when repair fails outright. The
+    /// quarantine name is unique per attempt (unix seconds + process
+    /// id + attempt counter, L7): two quarantines in the same second
+    /// — or of the profiles and the settings file — can never collide
+    /// and clobber each other.
+    fn quarantine(
+        path: &Path,
+        moved: &mut Vec<(PathBuf, PathBuf)>,
+        attempt: &mut u32,
+    ) -> Result<(), String> {
         if !path.exists() {
             return Ok(());
         }
-        let mut target = PathBuf::from(format!("{}.corrupt", path.display()));
-        if target.exists() {
-            let secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            target = PathBuf::from(format!("{}.corrupt-{secs}", path.display()));
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut target = PathBuf::from(format!(
+            "{}.corrupt-{}-{}-{}",
+            path.display(),
+            secs,
+            std::process::id(),
+            *attempt
+        ));
+        *attempt += 1;
+        // Extremely defensive: if even that name exists, keep bumping.
+        while target.exists() {
+            target = PathBuf::from(format!(
+                "{}.corrupt-{}-{}-{}",
+                path.display(),
+                secs,
+                std::process::id(),
+                *attempt
+            ));
+            *attempt += 1;
         }
         fs::rename(path, &target)
             .map_err(|error| format!("could not quarantine {}: {error}", path.display()))?;
@@ -1041,17 +1384,18 @@ pub fn try_repair_store_from_backup(dir: &Path) -> Result<Option<String>, String
     let profiles = dir.join("profiles.json");
     let settings = dir.join("settings.json");
     let mut quarantined: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut attempt: u32 = 0;
 
     for generation in [BackupGeneration::Bak1, BackupGeneration::Bak2] {
         let profiles_backup = dir.join(format!("profiles.json{}", generation.suffix()));
         let settings_backup = dir.join(format!("settings.json{}", generation.suffix()));
         // Attempt 1: profiles only.
         if profiles_backup.exists() {
-            quarantine(&profiles, &mut quarantined)?;
+            quarantine(&profiles, &mut quarantined, &mut attempt)?;
             if fs::copy(&profiles_backup, &profiles).is_ok() && ProfileStore::open(dir).is_ok() {
                 return Ok(Some(format!(
                     "Store repaired from backup '{}': profiles.json restored; \
-                     the unreadable file was kept as {}.corrupt",
+                     the unreadable file was quarantined (kept as {}.corrupt-*)",
                     generation.as_str(),
                     profiles.display()
                 )));
@@ -1059,12 +1403,12 @@ pub fn try_repair_store_from_backup(dir: &Path) -> Result<Option<String>, String
         }
         // Attempt 2: profiles + settings.
         if settings_backup.exists() {
-            quarantine(&settings, &mut quarantined)?;
+            quarantine(&settings, &mut quarantined, &mut attempt)?;
             if fs::copy(&settings_backup, &settings).is_ok() && ProfileStore::open(dir).is_ok() {
                 return Ok(Some(format!(
                     "Store repaired from backup '{}': profiles.json and \
-                     settings.json restored; the unreadable files were kept \
-                     as *.corrupt",
+                     settings.json restored; the unreadable files were \
+                     quarantined (kept as *.corrupt-*)",
                     generation.as_str()
                 )));
             }
@@ -1085,38 +1429,53 @@ pub fn try_repair_store_from_backup(dir: &Path) -> Result<Option<String>, String
 
 /// Rotate the 3 generations for `path`: `path.bak1` → `path.bak2`,
 /// then `path` → `path.bak1`. Missing files are skipped; a failed
-/// rename is ignored only when the source did not exist (anything else
-/// is a real error the caller must see — so rotation failures are
-/// surfaced by removing the destination first, then renaming).
-fn rotate_backups(path: &Path) {
+/// rename is an error the caller must see (H6 — a silent rotation
+/// failure used to leave the generations stale while the save
+/// reported success). A failed `remove_file` of a stale `.bak2` is
+/// also an error: the rotation cannot proceed safely without it.
+fn rotate_backups(path: &Path) -> Result<(), StoreError> {
     let bak1 = PathBuf::from(format!("{}.bak1", path.display()));
     let bak2 = PathBuf::from(format!("{}.bak2", path.display()));
     if bak1.exists() {
-        let _ = fs::remove_file(&bak2);
-        let _ = fs::rename(&bak1, &bak2);
+        if bak2.exists() {
+            fs::remove_file(&bak2)?;
+        }
+        fs::rename(&bak1, &bak2)?;
     }
     if path.exists() {
-        let _ = fs::rename(path, &bak1);
+        fs::rename(path, &bak1)?;
     }
+    Ok(())
 }
 
 /// Write `bytes` to `path` atomically: temp file in the same directory,
-/// then rename over the target.
+/// then rename over the target. The temp file is `fsync`ed before the
+/// rename and the directory is `fsync`ed after it (H6 — without both,
+/// a power cut can lose the rename itself, not just the bytes).
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    use std::io::Write as _;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let temp = parent.join(format!(
         ".{}.tmp-{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
         std::process::id()
     ));
-    fs::write(&temp, bytes)?;
-    match fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&temp);
-            Err(StoreError::Io(error))
+    let result = (|| -> Result<(), StoreError> {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)?;
+        // Directory sync: makes the rename itself durable.
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
         }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
     }
+    result
 }
 
 /// Re-export of the parsed C# profiles file type, for import reports.
@@ -1182,7 +1541,7 @@ mod tests {
             normalize_process_name("iRacingSim64DX11.exe"),
             "iracingsim64dx11"
         );
-        assert_eq!(normalize_car_model("  Ferrari 488 GT3 "), "ferrari 488 gt3");
+        assert_eq!(normalize_car_model("  Ferrari 488 GT3 "), "ferrari_488_gt3");
     }
 
     #[test]
@@ -1349,14 +1708,17 @@ mod tests {
         store.save().expect("save v3");
 
         let backups = store.list_backups();
-        assert_eq!(backups.len(), 3);
+        // M5: 3 generations per file — profiles first, then settings.
+        assert_eq!(backups.len(), 6);
         assert!(backups[0].present);
         assert!(backups[1].present);
         assert!(backups[2].present);
         assert!(backups[0].saved_at.is_some());
         assert_eq!(backups[0].generation, "current");
+        assert_eq!(backups[0].file, "profiles.json");
         assert_eq!(backups[1].generation, "bak1");
-        assert_eq!(backups[2].generation, "bak2");
+        assert_eq!(backups[3].file, "settings.json");
+        assert_eq!(backups[3].generation, "current");
 
         // bak1 holds V2 (2 profiles + Default), bak2 holds V1.
         let bak1 = ProfileStore::read_profiles_file(&store.backup_path(BackupGeneration::Bak1))
@@ -1543,11 +1905,13 @@ mod tests {
     fn backup_info_serializes_to_frontend_shape() {
         let info = BackupInfo {
             generation: "bak1".to_string(),
+            file: "profiles.json".to_string(),
             present: true,
             saved_at: Some("2026-11-14T12:00:00Z".to_string()),
         };
         let json = serde_json::to_string(&info).expect("serialize");
         assert!(json.contains("\"generation\":\"bak1\""), "{json}");
+        assert!(json.contains("\"file\":\"profiles.json\""), "{json}");
         assert!(
             json.contains("\"savedAt\":\"2026-11-14T12:00:00Z\""),
             "{json}"
@@ -1580,7 +1944,18 @@ mod tests {
             .expect("repair succeeds")
             .expect("repair reports a notice");
         assert!(notice.contains("bak1"), "{notice}");
-        assert!(dir.join("profiles.json.corrupt").exists());
+        // Quarantine name is unique per attempt (L7):
+        // `profiles.json.corrupt-<secs>-<pid>-<n>`.
+        let quarantined = fs::read_dir(&dir)
+            .expect("read dir")
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("profiles.json.corrupt-")
+            });
+        assert!(quarantined, "corrupt file must be quarantined");
         let repaired = ProfileStore::open(&dir).expect("repaired store opens");
         assert!(
             repaired
@@ -1628,6 +2003,260 @@ mod tests {
             fs::read_to_string(dir.join("profiles.json")).expect("original back"),
             "{not json"
         );
+        cleanup(&dir);
+    }
+
+    // -- Deep-scan Phase 2 regressions -----------------------------------
+
+    /// H5: an invalid entry is rejected on load (with a warning), a
+    /// duplicate id/name is dropped (first wins), and an all-invalid
+    /// list recreates the Default profile instead of opening empty.
+    #[test]
+    fn load_validation_rejects_invalid_and_duplicates_recreates_default() {
+        let dir = temp_dir();
+        let good = profile_with_game("Good", "acs.exe", "");
+        let mut bad = profile_with_game("Bad", "acs.exe", "");
+        bad.deadzone = 9.9; // outside 0..=0.5
+        let mut dup_name = profile_with_game("good", "acc.exe", "");
+        dup_name.deadzone = 0.1;
+        let file = serde_json::json!({
+            "schema_version": 2,
+            "profiles": [
+                {"id": "good", "profile": good},
+                {"id": "bad", "profile": bad},
+                {"id": "good-2", "profile": dup_name},
+                {"id": "good", "profile": profile_with_game("Also Good", "acs.exe", "")},
+            ],
+            "active_profile_id": "bad",
+            "auto_switch_locked": false,
+        });
+        fs::write(
+            dir.join("profiles.json"),
+            serde_json::to_string(&file).expect("fixture json"),
+        )
+        .expect("write fixture");
+        let store = ProfileStore::open(&dir).expect("open validates, never errors on entries");
+        assert_eq!(store.list().len(), 1, "only the valid entry survives");
+        assert_eq!(store.list()[0].profile.name, "Good");
+        assert!(
+            store.active().is_none(),
+            "active id pointed at a rejected entry"
+        );
+        assert!(
+            store.load_warnings().len() >= 3,
+            "warnings: {:?}",
+            store.load_warnings()
+        );
+
+        // All-invalid list recreates Default.
+        let dir2 = temp_dir();
+        let mut only_bad = profile_with_game("Bad", "acs.exe", "");
+        only_bad.deadzone = 9.9;
+        let file2 = serde_json::json!({
+            "schema_version": 2,
+            "profiles": [{"id": "bad", "profile": only_bad}],
+            "active_profile_id": null,
+            "auto_switch_locked": false,
+        });
+        fs::write(
+            dir2.join("profiles.json"),
+            serde_json::to_string(&file2).expect("fixture json"),
+        )
+        .expect("write fixture");
+        let store2 = ProfileStore::open(&dir2).expect("open recreates Default");
+        assert_eq!(store2.list().len(), 1);
+        assert_eq!(store2.list()[0].profile.name, "Default");
+        assert!(
+            store2
+                .load_warnings()
+                .iter()
+                .any(|w| w.contains("Default profile was recreated")),
+            "{:?}",
+            store2.load_warnings()
+        );
+        cleanup(&dir);
+        cleanup(&dir2);
+    }
+
+    /// L3: creating a second profile with the same name (any case) is
+    /// rejected, and duplicating a 64-char name stays within the cap.
+    #[test]
+    fn create_rejects_duplicate_name_and_duplicate_fits_64_chars() {
+        let dir = temp_dir();
+        let mut store = ProfileStore::open(&dir).expect("open");
+        store.create("GT3 Setup").expect("create");
+        assert!(matches!(
+            store.create("gt3 setup"),
+            Err(StoreError::Validation(_))
+        ));
+        let long = "x".repeat(64);
+        let created = store.create(&long).expect("64-char name creates");
+        let dup = store.duplicate(&created.id).expect("duplicate fits");
+        assert!(dup.profile.name.chars().count() <= MAX_PROFILE_NAME_LEN);
+        assert!(dup.profile.name.ends_with("copy") || dup.profile.name.ends_with(')'));
+        cleanup(&dir);
+    }
+
+    /// C-SET-1: a patch overwrites only the provided fields; absent
+    /// fields keep their values (a partial save never wipes settings).
+    #[test]
+    fn settings_patch_merges_without_wiping() {
+        let dir = temp_dir();
+        let mut store = ProfileStore::open(&dir).expect("open");
+        store.set_settings(AppSettings {
+            theme: "Dark".to_string(),
+            esp_ip: "10.0.0.5".to_string(),
+            ..AppSettings::default()
+        });
+        let patch = AppSettingsPatch {
+            theme: Some("light".to_string()),
+            ..AppSettingsPatch::default()
+        };
+        let merged = store.set_settings_patch(patch);
+        assert_eq!(merged.theme, "Light", "lowercase theme maps to canonical");
+        assert_eq!(merged.esp_ip, "10.0.0.5", "absent esp_ip is kept");
+        assert_eq!(merged.output_backend, "HIDMaestro");
+        cleanup(&dir);
+    }
+
+    /// M10: the Rust load path sanitizes — a hand-edited public
+    /// `esp_ip` and a lowercase theme are corrected on open.
+    #[test]
+    fn rust_load_sanitizes_settings() {
+        let dir = temp_dir();
+        fs::write(
+            dir.join("settings.json"),
+            r#"{"theme": "dark", "esp_ip": "8.8.8.8", "vjoy_device_id": 99}"#,
+        )
+        .expect("write settings");
+        let store = ProfileStore::open(&dir).expect("open sanitizes");
+        assert_eq!(store.settings().theme, "Dark");
+        assert_eq!(store.settings().esp_ip, "192.168.4.1");
+        assert_eq!(store.settings().vjoy_device_id, 16);
+        cleanup(&dir);
+    }
+
+    /// C1: the store implements `ProfileSource` — car-in-game beats
+    /// game-only beats Default, with the canonical normalizer.
+    #[test]
+    fn store_implements_profile_source() {
+        use crate::resolver::{
+            CarProfileResolver, GAME_ASSETTO_CORSA_COMPETIZIONE, MapProfileSource, ProfileId,
+            ProfileSource as _,
+        };
+        let dir = temp_dir();
+        let mut store = ProfileStore::open(&dir).expect("open");
+        let mut game = profile_with_game("ACC Game", "acc.exe", "");
+        game.game = GameId::Acc;
+        store.insert_imported(game);
+        let mut car = profile_with_game("ACC Ferrari", "acc.exe", "Ferrari 488 GT3");
+        car.game = GameId::Acc;
+        let car_id = store.insert_imported(car).id;
+        let _ = MapProfileSource::new();
+        assert_eq!(
+            store.profile_for_game_car(GAME_ASSETTO_CORSA_COMPETIZIONE, "Ferrari 488 GT3 Evo"),
+            None,
+            "different car must not match the Ferrari binding"
+        );
+        assert_eq!(
+            store.profile_for_game_car(GAME_ASSETTO_CORSA_COMPETIZIONE, "Ferrari 488 GT3"),
+            Some(ProfileId::new(car_id.clone()))
+        );
+        assert_eq!(
+            store.profile_for_car("  FERRARI--488__GT3 "),
+            Some(ProfileId::new(car_id)),
+            "canonical normalizer unifies separators"
+        );
+        assert!(
+            store
+                .profile_for_game(GAME_ASSETTO_CORSA_COMPETIZIONE)
+                .is_some()
+        );
+        assert_eq!(
+            store.default_profile(),
+            Some(ProfileId::new("default".to_string()))
+        );
+        // The resolver drives the same source end to end.
+        let resolver = CarProfileResolver::new(&store);
+        assert_eq!(
+            resolver.resolve(
+                Some(GAME_ASSETTO_CORSA_COMPETIZIONE),
+                Some("Ferrari 488 GT3")
+            ),
+            store.profile_for_game_car(GAME_ASSETTO_CORSA_COMPETIZIONE, "Ferrari 488 GT3")
+        );
+        cleanup(&dir);
+    }
+
+    /// M5/M9: the backup list covers settings generations too, and a
+    /// real settings backup path restores the settings.
+    #[test]
+    fn backups_cover_settings_and_real_path_restore_works() {
+        let dir = temp_dir();
+        let mut store = ProfileStore::open(&dir).expect("open");
+        store.set_settings(AppSettings {
+            theme: "Dark".to_string(),
+            ..AppSettings::default()
+        });
+        store.save().expect("save");
+        store.set_settings(AppSettings {
+            theme: "Light".to_string(),
+            ..AppSettings::default()
+        });
+        store.save().expect("save again");
+        let backups = store.list_backups();
+        assert_eq!(backups.len(), 6);
+        assert!(
+            backups
+                .iter()
+                .any(|b| b.file == "settings.json" && b.present)
+        );
+        let settings_bak1 = dir.join("settings.json.bak1");
+        assert!(settings_bak1.exists());
+        store
+            .restore_backup_path(&settings_bak1)
+            .expect("restore settings bak1");
+        assert_eq!(store.settings().theme, "Dark");
+        // A path outside the store directory is refused.
+        let outside = std::env::temp_dir().join("rsh-outside-settings.json.bak1");
+        assert!(matches!(
+            store.restore_backup_path(&outside),
+            Err(StoreError::NotFound(_))
+        ));
+        cleanup(&dir);
+    }
+
+    /// M6: a C# settings import merges — only present fields win.
+    #[test]
+    fn csharp_settings_import_merges() {
+        let dir = temp_dir();
+        let mut store = ProfileStore::open(&dir).expect("open");
+        store.set_settings(AppSettings {
+            theme: "Dark".to_string(),
+            esp_ip: "10.0.0.5".to_string(),
+            ..AppSettings::default()
+        });
+        let csharp = dir.join("csharp-settings.json");
+        fs::write(&csharp, r#"{"Theme": "Light", "VJoyDeviceId": 4}"#).expect("write csharp");
+        let merged = store
+            .import_csharp_settings(&csharp)
+            .expect("import merges");
+        assert_eq!(merged.theme, "Light");
+        assert_eq!(merged.vjoy_device_id, 4);
+        assert_eq!(merged.esp_ip, "10.0.0.5", "absent field is kept");
+        cleanup(&dir);
+    }
+
+    /// H3: an automatic activation clears the manual-override lock.
+    #[test]
+    fn auto_activation_clears_manual_lock() {
+        let dir = temp_dir();
+        let mut store = ProfileStore::open(&dir).expect("open");
+        let created = store.create("Manual").expect("create");
+        store.activate(&created.id, true).expect("manual");
+        assert!(store.auto_switch_locked());
+        store.activate(&created.id, false).expect("auto");
+        assert!(!store.auto_switch_locked());
         cleanup(&dir);
     }
 }

@@ -7,7 +7,7 @@ import {
   type PinAssignment,
   type PinMapValidation,
 } from "@/lib/tauri";
-import { Notice, NotImplementedNotice, StepIntro, describeError } from "./components";
+import { Notice, NotImplementedNotice, StepIntro, describeError, type StepProps } from "./components";
 
 /**
  * Step 4 — Pins (UI plan P5.3).
@@ -17,7 +17,7 @@ import { Notice, NotImplementedNotice, StepIntro, describeError } from "./compon
  * GPIO (P9.2); this step never writes pins.
  */
 
-export function PinsStep() {
+export function PinsStep({ onSuccessChange }: StepProps) {
   const { t } = useTranslation();
   const [pins, setPins] = useState<PinAssignment[] | null>(null);
   const [validation, setValidation] = useState<PinMapValidation | null>(null);
@@ -25,6 +25,11 @@ export function PinsStep() {
   const [error, setError] = useState<{ notImplemented: boolean; message: string } | null>(
     null,
   );
+
+  // H5: the step succeeds once the map loads and validates clean.
+  useEffect(() => {
+    onSuccessChange?.(pins !== null && validation?.valid === true);
+  }, [pins, validation, onSuccessChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -81,7 +86,11 @@ export function PinsStep() {
             {pins.map((pin) => (
               <tr key={pin.function} className="border-b border-[var(--line)]">
                 <td className="py-2 pr-2">{pin.function}</td>
-                <td className="py-2">GPIO {pin.pin}</td>
+                <td className="py-2">
+                  {pin.pins && pin.pins.length > 0
+                    ? pin.pins.map((gpio) => `GPIO ${gpio}`).join(", ")
+                    : `GPIO ${pin.pin}`}
+                </td>
               </tr>
             ))}
           </tbody>

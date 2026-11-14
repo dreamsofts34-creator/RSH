@@ -99,6 +99,29 @@ pub fn read_consistent(map: &dyn MapAccessor, offset: usize, len: usize) -> Opti
     None
 }
 
+/// Reads `len` bytes at `offset` exactly once (L11).
+///
+/// Use only when the caller verifies consistency another way (e.g. a
+/// generation counter read before and after, as the iRacing YAML read
+/// does with `sessionInfoUpdate`): a single copy halves the
+/// allocation of [`read_consistent`] for large blocks (the session
+/// YAML is up to 256 KiB, read at 2 Hz). Out-of-bounds ranges and
+/// over-long reads return `None`. Never panics.
+#[must_use]
+pub fn read_single(map: &dyn MapAccessor, offset: usize, len: usize) -> Option<Vec<u8>> {
+    if len == 0 || len > MAX_SINGLE_READ_BYTES {
+        return None;
+    }
+    if offset.checked_add(len)? > map.len() {
+        return None;
+    }
+    let mut buf = vec![0_u8; len];
+    if !map.read_into(offset, &mut buf) {
+        return None;
+    }
+    Some(buf)
+}
+
 /// Reads a little-endian `i32` at `offset`, double-read for consistency.
 pub(crate) fn read_i32(map: &dyn MapAccessor, offset: usize) -> Option<i32> {
     let bytes = read_consistent(map, offset, 4)?;

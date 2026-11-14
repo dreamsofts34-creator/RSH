@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Plug, AlertTriangle, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -7,6 +7,7 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
+import { EncoderPulseTimers } from "@/lib/encoderPulse";
 import {
   TauriCommandError,
   getOutputState,
@@ -34,6 +35,99 @@ type LoadState =
 export function component() {
   return <OutputScreen />;
 }
+
+/**
+ * Live output values (H4, memoised): re-renders only when the snapshot
+ * or the pressed set changes, so the 30 Hz feed does not re-render the
+ * backend picker and state cards that share this screen.
+ */
+const LiveValuesCard = memo(function LiveValuesCard({
+  snapshot,
+  pressed,
+}: {
+  snapshot: EngineSnapshot | null;
+  pressed: ReadonlySet<number>;
+}) {
+  const { t } = useTranslation();
+  const pedals = snapshot?.pedals;
+  const steeringPct = snapshot
+    ? Math.min(100, Math.abs(snapshot.steeringDeg) / 450) * 100
+    : 0;
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>
+          {t("output.liveValues", { defaultValue: "Live output values" })}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {snapshot && pedals ? (
+          <>
+            <div className="space-y-1">
+              <div className="flex justify-between text-sm">
+                <span>{t("output.steering", { defaultValue: "Steering" })}</span>
+                <span className="font-semibold">
+                  {snapshot.steeringDeg.toFixed(0)}°
+                </span>
+              </div>
+              <Progress value={steeringPct} aria-label={t("output.steering", { defaultValue: "Steering" })} />
+            </div>
+            <div className="space-y-1">
+              <div className="flex justify-between text-sm">
+                <span>{t("output.accel", { defaultValue: "Accelerator" })}</span>
+                <span className="font-semibold">
+                  {Math.round(pedals.accel * 100)}%
+                </span>
+              </div>
+              <Progress value={pedals.accel * 100} aria-label={t("output.accel", { defaultValue: "Accelerator" })} />
+            </div>
+            <div className="space-y-1">
+              <div className="flex justify-between text-sm">
+                <span>{t("output.brake", { defaultValue: "Brake" })}</span>
+                <span className="font-semibold">
+                  {Math.round(pedals.brake * 100)}%
+                </span>
+              </div>
+              <Progress value={pedals.brake * 100} aria-label={t("output.brake", { defaultValue: "Brake" })} />
+            </div>
+            {pedals.clutch !== null ? (
+              <div className="space-y-1">
+                <div className="flex justify-between text-sm">
+                  <span>{t("output.clutch", { defaultValue: "Clutch" })}</span>
+                  <span className="font-semibold">
+                    {Math.round(pedals.clutch * 100)}%
+                  </span>
+                </div>
+                <Progress value={pedals.clutch * 100} aria-label={t("output.clutch", { defaultValue: "Clutch" })} />
+              </div>
+            ) : (
+              <p className="text-sm text-[var(--muted)]">
+                {t("output.clutch", { defaultValue: "Clutch" })} —{" "}
+                {t("output.notPresent", { defaultValue: "Not present" })}
+              </p>
+            )}
+          </>
+        ) : (
+          <p className="text-sm text-[var(--muted)]">
+            {t("output.loading", { defaultValue: "Loading output state…" })}
+          </p>
+        )}
+        <div className="border-t border-[var(--line)] pt-3">
+          <p className="text-sm font-semibold">
+            {t("output.pressedButtons", { defaultValue: "Buttons pressed" })}
+          </p>
+          {pressed.size > 0 ? (
+            <p className="mt-1 text-sm">
+              {[...pressed].sort((a, b) => a - b).map((b) => `#${b}`).join(", ")}
+            </p>
+          ) : (
+            <p className="mt-1 text-sm text-[var(--muted)]">—</p>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+});
 
 export function OutputScreen() {
   const { t } = useTranslation();
@@ -94,44 +188,72 @@ export function OutputScreen() {
 
   // Live monitor: 30 Hz snapshot feed + button-press events. No fake data —
   // before the first snapshot arrives the monitor shows nothing live.
+  // M11 done-pattern: a subscription resolving after unmount is stopped
+  // at once, never leaked. C5: encoder buttons 65–72 are pulses and
+  // auto-clear ~200 ms after the press (no release event ever arrives).
+  const pulseTimersRef = useRef<EncoderPulseTimers | null>(null);
+  if (pulseTimersRef.current === null) {
+    pulseTimersRef.current = new EncoderPulseTimers();
+  }
   useEffect(() => {
-    let cancelled = false;
+    let done = false;
     const unlistens: (() => void)[] = [];
+    const collect = (promise: Promise<() => void>) => {
+      void promise
+        .then((fn) => {
+          if (done) fn();
+          else unlistens.push(fn);
+        })
+        .catch(() => {});
+    };
+    const pulses = pulseTimersRef.current;
     void getSnapshot()
       .then((snap) => {
-        if (!cancelled) setSnapshot(snap);
+        if (!done) setSnapshot(snap);
       })
       .catch(() => {
         // Snapshot on demand unavailable; the event feed below may still work.
       });
-    void subscribeEngineSnapshot((snap) => {
-      if (!cancelled) setSnapshot(snap);
-    })
-      .then((fn) => unlistens.push(fn))
-      .catch(() => {});
-    void subscribeButtonPress(({ button, pressed: isPressed }) => {
-      if (cancelled) return;
-      setPressed((prev) => {
-        const next = new Set(prev);
-        if (isPressed) next.add(button);
-        else next.delete(button);
-        return next;
-      });
-    })
-      .then((fn) => unlistens.push(fn))
-      .catch(() => {});
+    collect(
+      subscribeEngineSnapshot((snap) => {
+        if (!done) setSnapshot(snap);
+      }),
+    );
+    collect(
+      subscribeButtonPress(({ button, pressed: isPressed }) => {
+        if (done) return;
+        setPressed((prev) => {
+          const next = new Set(prev);
+          if (isPressed) next.add(button);
+          else next.delete(button);
+          return next;
+        });
+        if (isPressed) {
+          pulses?.arm(button, () => {
+            if (done) return;
+            setPressed((prev) => {
+              const next = new Set(prev);
+              next.delete(button);
+              return next;
+            });
+          });
+        }
+      }),
+    );
     return () => {
-      cancelled = true;
+      done = true;
+      pulses?.disarmAll();
       for (const fn of unlistens) fn();
     };
   }, []);
 
   const outputState = load.status === "ready" ? load.state : null;
-  // `enabled` when the backend reports it; otherwise `connected` is the
-  // only backend-reported on/off signal available.
-  const enabled = outputState
-    ? (outputState.enabled ?? outputState.connected)
-    : false;
+  // M5: `enabled` is unknown until the backend reports it — falling
+  // back to `connected` would claim output is on when it is not (or
+  // off when it is on). Unknown disables the toggle and shows "Unknown".
+  const enabled: boolean | null = outputState
+    ? (outputState.enabled ?? null)
+    : null;
   // Fallback in effect: the user selected one backend, a different one
   // is live (the detail string carries the failure reason verbatim).
   const fallbackBackend =
@@ -177,11 +299,6 @@ export function OutputScreen() {
       setSwitching(null);
     }
   };
-
-  const pedals = snapshot?.pedals;
-  const steeringPct = snapshot
-    ? Math.min(100, Math.abs(snapshot.steeringDeg) / 450) * 100
-    : 0;
 
   return (
     <section aria-label={t("output.title", { defaultValue: "Output" })} className="space-y-6">
@@ -239,10 +356,20 @@ export function OutputScreen() {
                   ? t("output.connected", { defaultValue: "Connected" })
                   : t("output.disconnected", { defaultValue: "Disconnected" })}
               </Badge>
-              <Badge variant={enabled ? "success" : "outline"}>
-                {enabled
-                  ? t("output.enabled", { defaultValue: "Output enabled" })
-                  : t("output.disabled", { defaultValue: "Disabled" })}
+              <Badge
+                variant={
+                  enabled === null
+                    ? "secondary"
+                    : enabled
+                      ? "success"
+                      : "outline"
+                }
+              >
+                {enabled === null
+                  ? t("output.enabledUnknown", { defaultValue: "Unknown" })
+                  : enabled
+                    ? t("output.enabled", { defaultValue: "Output enabled" })
+                    : t("output.disabled", { defaultValue: "Disabled" })}
               </Badge>
             </div>
             {outputState.detail ? (
@@ -261,8 +388,10 @@ export function OutputScreen() {
             <div className="flex items-center gap-3 border-t border-[var(--line)] pt-4">
               <Switch
                 id="output-enabled"
-                checked={enabled}
-                disabled={toggling || !outputState.connected}
+                checked={enabled ?? false}
+                disabled={
+                  toggling || enabled === null || !outputState.connected
+                }
                 onCheckedChange={(next) => void onToggle(next)}
                 aria-label={t("output.enableToggle", { defaultValue: "Enable output" })}
               />
@@ -398,77 +527,7 @@ export function OutputScreen() {
         </p>
       ) : null}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>
-            {t("output.liveValues", { defaultValue: "Live output values" })}
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {snapshot && pedals ? (
-            <>
-              <div className="space-y-1">
-                <div className="flex justify-between text-sm">
-                  <span>{t("output.steering", { defaultValue: "Steering" })}</span>
-                  <span className="font-semibold">
-                    {snapshot.steeringDeg.toFixed(0)}°
-                  </span>
-                </div>
-                <Progress value={steeringPct} aria-label={t("output.steering", { defaultValue: "Steering" })} />
-              </div>
-              <div className="space-y-1">
-                <div className="flex justify-between text-sm">
-                  <span>Accel</span>
-                  <span className="font-semibold">
-                    {Math.round(pedals.accel * 100)}%
-                  </span>
-                </div>
-                <Progress value={pedals.accel * 100} aria-label="Accel" />
-              </div>
-              <div className="space-y-1">
-                <div className="flex justify-between text-sm">
-                  <span>Brake</span>
-                  <span className="font-semibold">
-                    {Math.round(pedals.brake * 100)}%
-                  </span>
-                </div>
-                <Progress value={pedals.brake * 100} aria-label="Brake" />
-              </div>
-              {pedals.clutch !== null ? (
-                <div className="space-y-1">
-                  <div className="flex justify-between text-sm">
-                    <span>Clutch</span>
-                    <span className="font-semibold">
-                      {Math.round(pedals.clutch * 100)}%
-                    </span>
-                  </div>
-                  <Progress value={pedals.clutch * 100} aria-label="Clutch" />
-                </div>
-              ) : (
-                <p className="text-sm text-[var(--muted)]">
-                  Clutch — {t("output.notPresent", { defaultValue: "Not present" })}
-                </p>
-              )}
-            </>
-          ) : (
-            <p className="text-sm text-[var(--muted)]">
-              {t("output.loading", { defaultValue: "Loading output state…" })}
-            </p>
-          )}
-          <div className="border-t border-[var(--line)] pt-3">
-            <p className="text-sm font-semibold">
-              {t("output.pressedButtons", { defaultValue: "Buttons pressed" })}
-            </p>
-            {pressed.size > 0 ? (
-              <p className="mt-1 text-sm">
-                {[...pressed].sort((a, b) => a - b).map((b) => `#${b}`).join(", ")}
-              </p>
-            ) : (
-              <p className="mt-1 text-sm text-[var(--muted)]">—</p>
-            )}
-          </div>
-        </CardContent>
-      </Card>
+      <LiveValuesCard snapshot={snapshot} pressed={pressed} />
     </section>
   );
 }

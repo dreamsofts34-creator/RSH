@@ -210,9 +210,12 @@ impl LoopRateTracker {
     /// The measured loop rate in Hz at `now`, or `None` when fewer than
     /// 2 ticks are inside the window.
     ///
-    /// The `usize → f64` cast cannot lose precision here: the count is
-    /// the number of engine ticks inside a 1 s window (hundreds at
-    /// most), far below 2^53.
+    /// The window is half-open (L1): a tick exactly 1 s old is
+    /// *outside* the window, so 201 ticks at 5 ms over `[0, 1000]`
+    /// measure 200 Hz, not 201 — the old `<=` counted both endpoints
+    /// of a full second. The `usize → f64` cast cannot lose precision
+    /// here: the count is the number of engine ticks inside a 1 s
+    /// window (hundreds at most), far below 2^53.
     #[allow(clippy::cast_precision_loss)]
     #[must_use]
     pub fn rate_hz_at(&self, now: Instant) -> Option<f64> {
@@ -221,7 +224,7 @@ impl LoopRateTracker {
             // A tick stamped after `now` (clock misuse) counts as
             // in-window rather than panicking `duration_since`.
             let age = now.checked_duration_since(tick).unwrap_or(Duration::ZERO);
-            if age <= LOOP_RATE_WINDOW {
+            if age < LOOP_RATE_WINDOW {
                 count += 1;
             }
         }
@@ -240,11 +243,12 @@ impl LoopRateTracker {
         self.ticks.len()
     }
 
-    /// Drop ticks older than the window relative to `now`.
+    /// Drop ticks older than the window relative to `now`. The window
+    /// is half-open (L1): a tick exactly 1 s old is pruned.
     fn prune(&mut self, now: Instant) {
         while let Some(&oldest) = self.ticks.front() {
             let age = now.checked_duration_since(oldest).unwrap_or(Duration::ZERO);
-            if age > LOOP_RATE_WINDOW {
+            if age >= LOOP_RATE_WINDOW {
                 self.ticks.pop_front();
             } else {
                 break;
@@ -499,6 +503,21 @@ mod tests {
             tracker.rate_hz_at(fresh + Duration::from_millis(5)),
             Some(2.0)
         );
+    }
+
+    #[test]
+    fn loop_rate_full_second_counts_200_not_201() {
+        // L1: 201 ticks at 5 ms span exactly [0, 1000] ms. The window
+        // is half-open, so the tick at t=0 is outside at t=1000 ms
+        // and the rate is 200 Hz — the old `<=` counted both
+        // endpoints and reported 201.
+        let mut tracker = LoopRateTracker::new();
+        let start = Instant::now();
+        for i in 0..201_u32 {
+            tracker.tick_at(start + Duration::from_millis(5) * i);
+        }
+        let end = start + Duration::from_secs(1);
+        assert_eq!(tracker.rate_hz_at(end), Some(200.0));
     }
 
     #[test]
