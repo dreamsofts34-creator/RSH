@@ -31,6 +31,33 @@ public class Round2BackendTests
     private const string TestBoardId = "aabbccddeeff";
     private const string TestPassword = "Ab1!Cd2@Ef3#Gh4$Ij5%Kl6^"; // exactly 24 printable ASCII
 
+    /// <summary>Isolated KeyStore — har test ko apna temp root.
+    /// Windows par default store PERSISTENT hai (DPAPI blobs
+    /// %AppData%\RSH\keys mein rehte hain): ek test ki saved key doosre
+    /// test ki "store khaali hai" assert ko fail kar deti thi — Windows CI
+    /// par `UpdateFromHello_WindowOpenButPaired_NonzeroKey_Ignored` (line 150)
+    /// isi liye fail hua, jabke Linux par store in-memory per-instance hai
+    /// aur wahan kabhi fail nahi hua. Har test apna Guid temp dir istemal
+    /// karta hai; Dispose par dir mit jata hai — koi cross-test pollution
+    /// nahi, koi shared `%AppData%\RSH\keys` touch nahi hota.</summary>
+    private sealed class IsolatedKeyStore : IDisposable
+    {
+        public KeyStore Store { get; }
+        private readonly string _root;
+        public IsolatedKeyStore()
+        {
+            _root = Path.Combine(Path.GetTempPath(), "rsh-test-keys-" + Guid.NewGuid().ToString("N"));
+            Store = new KeyStore(_root);
+        }
+        public void Dispose()
+        {
+            Store.Dispose();
+            try { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    }
+
     private sealed class FakeControlTransport : IControlTransport
     {
         private readonly Func<byte[], byte[]?> _responder;
@@ -128,7 +155,8 @@ public class Round2BackendTests
     [Fact]
     public void UpdateFromHello_WindowClosed_NonzeroKey_Ignored_StoredKeyUntouched()
     {
-        using var store = new KeyStore();
+        using var isolated = new IsolatedKeyStore();
+        using var store = isolated.Store;
         using var session1 = new BoardSession(store);
         session1.UpdateFromHello(HelloReplyFrom(BuildHelloReply(0x09, TestNonce, TestKey)));
         Assert.True(store.TryLoadKey(TestBoardId, out byte[]? stored) && stored!.AsSpan().SequenceEqual(TestKey));
@@ -143,7 +171,8 @@ public class Round2BackendTests
     [Fact]
     public void UpdateFromHello_WindowOpenButPaired_NonzeroKey_Ignored()
     {
-        using var store = new KeyStore();
+        using var isolated = new IsolatedKeyStore();
+        using var store = isolated.Store;
         using var session = new BoardSession(store);
         session.UpdateFromHello(HelloReplyFrom(BuildHelloReply(0x08, TestNonce, TestKey)));
         Assert.False(session.HasKey);
@@ -153,7 +182,8 @@ public class Round2BackendTests
     [Fact]
     public void UpdateFromHello_WindowOpen_NonzeroKey_Accepted()
     {
-        using var store = new KeyStore();
+        using var isolated = new IsolatedKeyStore();
+        using var store = isolated.Store;
         using var session = new BoardSession(store);
         session.UpdateFromHello(HelloReplyFrom(BuildHelloReply(0x09, TestNonce, TestKey)));
         Assert.True(session.HasKey);
@@ -165,7 +195,8 @@ public class Round2BackendTests
     [Fact]
     public void UpdateFromHello_WindowOpen_WifiPassword_SavedToStore()
     {
-        using var store = new KeyStore();
+        using var isolated = new IsolatedKeyStore();
+        using var store = isolated.Store;
         using var session = new BoardSession(store);
         session.UpdateFromHello(HelloReplyFrom(BuildHelloReply(0x09, TestNonce, TestKey, TestPassword)));
         Assert.True(store.TryLoadPassword(TestBoardId, out string? pw));
@@ -175,7 +206,8 @@ public class Round2BackendTests
     [Fact]
     public void UpdateFromHello_ZeroPasswordField_DoesNotOverwriteStoredPassword()
     {
-        using var store = new KeyStore();
+        using var isolated = new IsolatedKeyStore();
+        using var store = isolated.Store;
         using var session = new BoardSession(store);
         session.UpdateFromHello(HelloReplyFrom(BuildHelloReply(0x09, TestNonce, TestKey, TestPassword)));
         // Dobara HELLO, password field zero (user-set password case) — stored password waisa hi.
@@ -189,7 +221,8 @@ public class Round2BackendTests
     [Fact]
     public async Task SendKeyReset_NotArmed_FailsWithoutFrame()
     {
-        using var session = new BoardSession();
+        using var isolated = new IsolatedKeyStore();
+        using var session = new BoardSession(isolated.Store);
         session.UpdateFromHello(HelloReplyFrom(BuildHelloReply(0x09, TestNonce, TestKey)));
         Assert.False(session.LastHelloKeyResetArmed);
         var transport = new FakeControlTransport(req => ReplyFor(req, [0x00], TestKey, TestNonce));
@@ -202,7 +235,8 @@ public class Round2BackendTests
     [Fact]
     public async Task SendKeyReset_Armed_SucceedsAndClearsCredentials()
     {
-        using var store = new KeyStore();
+        using var isolated = new IsolatedKeyStore();
+        using var store = isolated.Store;
         using var session = new BoardSession(store);
         // flags 0x0B = unpaired + armed + window open; password bhi HELLO se.
         session.UpdateFromHello(HelloReplyFrom(BuildHelloReply(0x0B, TestNonce, TestKey, TestPassword)));
@@ -225,7 +259,8 @@ public class Round2BackendTests
     [Fact]
     public async Task SendKeyReset_BoardRejects_ReturnsStatusError()
     {
-        using var session = new BoardSession();
+        using var isolated = new IsolatedKeyStore();
+        using var session = new BoardSession(isolated.Store);
         session.UpdateFromHello(HelloReplyFrom(BuildHelloReply(0x0B, TestNonce, TestKey)));
         var transport = new FakeControlTransport(req => ReplyFor(req, [(byte)ControlStatus.Unsupported], TestKey, TestNonce));
         var (sent, error) = await session.SendKeyResetAsync("127.0.0.1", transport, TestContext.Current.CancellationToken);
@@ -239,7 +274,8 @@ public class Round2BackendTests
     [Fact]
     public async Task ConcurrentControlSends_Serialized_UniqueCounters()
     {
-        using var session = new BoardSession();
+        using var isolated = new IsolatedKeyStore();
+        using var session = new BoardSession(isolated.Store);
         session.UpdateFromHello(HelloReplyFrom(BuildHelloReply(0x09, TestNonce, TestKey)));
         var transport = new DelayedFakeControlTransport(req => ReplyFor(req, [0x00], TestKey, TestNonce));
         var tasks = Enumerable.Range(0, 8).Select(_ =>
