@@ -598,6 +598,15 @@ public sealed class AppServices : IDisposable, ITransportSwitchTarget
 
     public void StartRuntime()
     {
+        // Round 2 B2-06 follow-up: sender filter ko CURRENT EspIp se taaza
+        // karo — ctor ke waqt ka filter purana ho sakta hai (Settings.EspIp
+        // ctor ke baad badla ho — jaise loopback test / Setup flow mein
+        // 127.0.0.1). Purana filter rehne par HELLO replies galat sender
+        // samajh kar drop ho jate thay (Windows CI:
+        // AutoCapsFetch_LoopbackUdp 15 s timeout — filter 192.168.4.1 par
+        // atka tha, HELLO 127.0.0.1 se aata tha; in-process sibling test
+        // is liye pass hota tha ke us ka remote null hota hai).
+        ApplyUdpSenderFilter(Settings.EspIp);
         Source.Start();
         Hello.Start();
         Engine.Start();
