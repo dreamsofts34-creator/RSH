@@ -897,9 +897,8 @@ pub fn resolve_dll_path_from_env(
 /// `ProgramFiles` fallback still finds the DLL.
 #[cfg(windows)]
 fn registry_dll_path() -> Option<PathBuf> {
-    use windows::Win32::Foundation::HKEY;
     use windows::Win32::System::Registry::{
-        HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
     };
     use windows::core::PCWSTR;
 
@@ -917,7 +916,7 @@ fn registry_dll_path() -> Option<PathBuf> {
             RegOpenKeyExW(
                 HKEY_LOCAL_MACHINE,
                 PCWSTR::from_raw(subkey_w.as_ptr()),
-                0,
+                Some(0),
                 KEY_READ,
                 &mut key,
             )

@@ -294,7 +294,7 @@ pub fn ensure_firewall_rule(exe_path: &std::path::Path) -> Result<(), String> {
                 // Program-scoped: no port is named. ANY protocol so
                 // both the UDP board traffic and any future TCP
                 // control traffic are covered by the one rule.
-                rule.SetProtocol(NET_FW_IP_PROTOCOL_ANY.0)
+                rule.SetProtocol(NET_FW_IP_PROTOCOL_ANY)
                     .map_err(|error| error.to_string())?;
                 rule.SetDirection(NET_FW_RULE_DIR_IN)
                     .map_err(|error| error.to_string())?;

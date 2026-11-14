@@ -664,7 +664,7 @@ fn spawn_elevated_runas(
     port: u16,
     token: &str,
 ) -> Result<(), HidMaestroError> {
-    use windows::Win32::Foundation::{BOOL, GetLastError};
+    use windows::Win32::Foundation::{ERROR_CANCELLED, WIN32_ERROR};
     use windows::Win32::UI::Shell::{SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, ShellExecuteExW};
     use windows::core::PCWSTR;
 
@@ -692,18 +692,21 @@ fn spawn_elevated_runas(
         ..Default::default()
     };
     // SAFETY: `ShellExecuteExW` with valid pointers (see above); the
-    // struct is stack-allocated for the call.
-    let ok: BOOL = unsafe { ShellExecuteExW(&mut info) };
-    if ok.as_bool() {
-        Ok(())
-    } else {
-        let code = unsafe { GetLastError() }.0;
-        if code == 1223 {
-            // ERROR_CANCELLED — the user declined the UAC prompt.
-            return Err(HidMaestroError::NotAdmin);
+    // struct is stack-allocated for the call. windows 0.62 returns
+    // `Result<()>`; the Win32 error is recovered from the `Error`
+    // (FACILITY_WIN32 HRESULT) via `WIN32_ERROR::from_error`.
+    match unsafe { ShellExecuteExW(&mut info) } {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let win32 = WIN32_ERROR::from_error(&e);
+            if win32 == Some(ERROR_CANCELLED) {
+                // ERROR_CANCELLED — the user declined the UAC prompt.
+                return Err(HidMaestroError::NotAdmin);
+            }
+            Err(HidMaestroError::SpawnFailed(format!(
+                "ShellExecuteEx (runas) failed, Win32 error {}",
+                win32.map(|w| w.0).unwrap_or_else(|| e.code().0 as u32)
+            )))
         }
-        Err(HidMaestroError::SpawnFailed(format!(
-            "ShellExecuteEx (runas) failed, Win32 error {code}"
-        )))
     }
 }
