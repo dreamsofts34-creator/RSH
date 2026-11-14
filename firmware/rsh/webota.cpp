@@ -103,6 +103,13 @@ static RshSignHash signHash;         // signed-region digest (streaming)
 static crypto_hash_sha256_state shaState;
 static RshVersion currentVersion{};
 static bool currentVersionOk = false;
+// Round 2 W3 (FIX-3): upload inactivity timeout — adhoora/ruka hua
+// upload `active` latka kar sampling hamesha ke liye band kar deta tha
+// (webota_active() par loop early-return karta hai). 30 s mein koi
+// chunk na aaye to upload abort + sampling wapas. Aakhri chunk ka waqt
+// START + har WRITE par update hota hai (webota_handle mein check).
+static uint32_t lastUploadMs = 0;
+static constexpr uint32_t kUploadTimeoutMs = 30000;
 
 static void sha_sink(void *ctx, const uint8_t *data, size_t len) {
   crypto_hash_sha256_update((crypto_hash_sha256_state *)ctx, data, (unsigned long long)len);
@@ -245,6 +252,7 @@ static void handleUpload() {
     uploadCap = ESP.getFreeSketchSpace();
     if (uploadCap == 0 || uploadCap > kOtaMaxBytes) uploadCap = kOtaMaxBytes;
     active = true;
+    lastUploadMs = millis();  // FIX-3: timeout clock shuru
     led_set(LedState::Updating);
     updateOk = Update.begin(uploadCap);
     if (!updateOk) uploadError = "update begin failed";
@@ -268,6 +276,7 @@ static void handleUpload() {
     }
     rsh_version_scan_feed(&versionScan, up.buf, up.currentSize);
     rsh_sign_hash_feed(&signHash, up.buf, up.currentSize);
+    lastUploadMs = millis();  // FIX-3: chunk mila — timeout clock dobara
     if (Update.write(up.buf, up.currentSize) != up.currentSize) {
       updateOk = false;
       uploadError = "update write failed";
@@ -352,6 +361,16 @@ void webota_begin() {
 
 void webota_handle() {
   server.handleClient();
+  // FIX-3: ruka hua upload (30 s koi chunk nahi) abort karo — warna
+  // `active` latka rehta aur rsh.ino loop sampling kabhi wapas nahi
+  // karta (webota_active() early-return). Abort ke baad purana firmware
+  // chalta rehta hai (verify-before-apply — Update.end kabhi nahi hua).
+  if (active && (uint32_t)(millis() - lastUploadMs) >= kUploadTimeoutMs) {
+    Update.abort();
+    updateOk = false;
+    active = false;
+    uploadError = "upload timeout (30 s koi data nahi)";
+  }
   if (restartPending && (int32_t)(millis() - restartAtMs) >= 0) {
     restartPending = false;
     ESP.restart();

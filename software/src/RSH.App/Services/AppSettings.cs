@@ -105,12 +105,18 @@ public sealed class AppSettingsStore
     }
     public string FilePath => _filePath;
     private string BackupPath => _filePath + ".bak";
+    private string Backup1Path => _filePath + ".bak1";
+    private string Backup2Path => _filePath + ".bak2";
 
     public AppSettings Load()
     {
         lock (_ioLock)
         {
-            foreach (string path in new[] { _filePath, BackupPath })
+            // DATA-AI FIX (Round 2 W7-5): sirf ek .bak tha — current +
+            // .bak dono kharab hon to settings hamesha ke liye defaults
+            // ho jati thin. Ab ProfileStore jaisi 3-generation chain
+            // (.bak → .bak1 → .bak2).
+            foreach (string path in new[] { _filePath, BackupPath, Backup1Path, Backup2Path })
             {
                 try
                 {
@@ -228,8 +234,31 @@ public sealed class AppSettingsStore
             {
                 // SEC-C-13: backup sirf tab jab maujooda file theek ho —
                 // kharab settings achay .bak ko overwrite nahi karti.
+                // DATA-AI FIX (Round 2 W7-5): 3-generation rotation
+                // (ProfileStore wala pattern) — kharab .bak aage nahi
+                // barhta; kharab .bak1 achi .bak2 ko overwrite nahi karta.
                 if (File.Exists(_filePath) && ParsesOk(_filePath))
+                {
+                    if (File.Exists(BackupPath))
+                    {
+                        if (ParsesOk(BackupPath))
+                        {
+                            if (File.Exists(Backup1Path))
+                            {
+                                if (ParsesOk(Backup1Path))
+                                    File.Copy(Backup1Path, Backup2Path, overwrite: true);
+                                else
+                                    File.Delete(Backup1Path);
+                            }
+                            File.Move(BackupPath, Backup1Path, overwrite: true);
+                        }
+                        else
+                        {
+                            File.Delete(BackupPath);
+                        }
+                    }
                     File.Copy(_filePath, BackupPath, overwrite: true);
+                }
                 else if (File.Exists(_filePath))
                     PreserveCorruptCopy(_filePath);
                 File.Move(tempPath, _filePath, overwrite: true);

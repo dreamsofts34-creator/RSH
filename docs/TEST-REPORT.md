@@ -1,3 +1,9 @@
+# ⚠️ SUPERSEDED — ye document ab authority NAHI hai (Architecture polish sweep, 2026-11-13)
+
+**Ye firmware v3 (2026-11-10) ki test report hai — tareekhi record ke tor par rakhi gayi hai.
+Current test evidence: `docs/RELEASE-CHECKLIST.md` (RUN LOGs: RSH.Tests 699 pass v2.0.3 gate,
+rig 25/25, host tests 4374 checks 0 failures) + `test-env/REPORT.md`.**
+
 # RSH Firmware — Test Report (2026-11-10, DevKit V1, v3 — advanced features)
 
 ## v3 advanced features (owner ki request par)

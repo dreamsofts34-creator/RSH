@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Text.Json;
+using RSH.Core.Firmware;
 using RSH.Core.Output;
 using RSH.Core.Pipeline;
 using RSH.Core.Profiles;
@@ -56,7 +57,12 @@ string coreVersion = typeof(WheelPacket).Assembly
 
 Console.WriteLine("=== RSH Benchmarks (Release build mein chalao) ===");
 Console.WriteLine($"Date (UTC):   {DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss} UTC (local {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz})");
-Console.WriteLine($"Version:      RSH.Core {coreVersion} (app v2.0.0 / firmware v4.0.0 — release train)");
+// W4 (Round 2): header kabhi hard-code nahi — app version assembly
+// informational version se (coreVersion ka display hissa, "+hash" se
+// pehle), firmware version FirmwareImageValidator.CurrentFirmwareVersion
+// se (firmware/rsh/config.h FIRMWARE_VERSION se match lazmi).
+string appVersion = coreVersion.Split('+', 2)[0];
+Console.WriteLine($"Version:      RSH.Core {coreVersion} (app v{appVersion} / firmware v{FirmwareImageValidator.CurrentFirmwareVersion})");
 Console.WriteLine($"Runtime:      .NET {Environment.Version} ({config})");
 Console.WriteLine($"Machine: {Environment.MachineName}, CPUs: {Environment.ProcessorCount}, OS: {Environment.OSVersion}");
 Console.WriteLine($"Thresholds:   {thresholdsSource}");

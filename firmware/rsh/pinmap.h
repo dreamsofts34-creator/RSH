@@ -104,6 +104,27 @@ static inline void rsh_pinmap_defaults(RshPinMap *out) {
   out->shifterMode = RSH_SHIFTER_MODE;
 }
 
+// Kya ye GPIO live pin table mein kisi function ko diya gaya hai?
+// Round 2 W3 (FIX-2): pedal button-mode ke fixed pins GPIO25/26
+// (PIN_ACCEL_BTN/PIN_BRAKE_BTN) blob ke kisi aur function ko bhi diye ja
+// sakte hain (misal full-rig preset mein encoder B pins 23/25, 26/27) —
+// inputs.cpp un pins ko fixed button ke tor par parhna band karta hai
+// jab wo yahan maujood hon, warna ek hi press do button bits deta
+// (encoder B LOW = accel-button bit). Factory/default map mein 25/26
+// kisi function ko nahi diye gaye, is liye default behaviour waisa hi.
+static inline uint8_t rsh_pinmap_uses_pin(const RshPinMap *map, uint8_t pin) {
+  if (!map || pin == RSH_PINMAP_ABSENT) return 0;
+  if (map->steer == pin || map->accel == pin || map->brake == pin ||
+      map->clutch == pin || map->handbrake == pin || map->battery == pin ||
+      map->gearUp == pin || map->gearDown == pin || map->horn == pin ||
+      map->enc1A == pin || map->enc1B == pin || map->enc2A == pin ||
+      map->enc2B == pin || map->ledStrip == pin)
+    return 1;
+  for (int i = 0; i < 6; i++)
+    if (map->shiftH[i] == pin) return 1;
+  return 0;
+}
+
 // Blob se pin table banao (replace semantics — upar dekho).
 // Return 1 = theek (out bhari hui), 0 = blob invalid (out ko haath nahi
 // lagta — caller purani table rakhta hai, fail closed). NULL blob/len 0

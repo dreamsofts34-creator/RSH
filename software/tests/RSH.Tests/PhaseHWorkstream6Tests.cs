@@ -163,6 +163,36 @@ public class PhaseHWorkstream6Tests
         if (!OperatingSystem.IsWindows()) Assert.False(ok);
     }
 
+    // ================= GAP-02 — Win10 22H2 (19045) floor =================
+
+    [Fact]
+    public void RuntimeCheck_Floor_IsWin10_19045()
+    {
+        // v2.0.3 Win10 (build 19045, user ka PC) ko officially support
+        // karta hai — update-check floor bhi wahi hai, Win11 (22000) nahi.
+        Assert.Equal(19045, RuntimeCheck.MinimumWindowsBuild);
+    }
+
+    [Theory]
+    [InlineData(10, 0, 19045, true)]   // Win10 22H2 — user ka PC, boundary
+    [InlineData(10, 0, 19044, false)]  // Win10 21H2 — ek build neeche
+    [InlineData(10, 0, 19041, false)]  // Win10 2004
+    [InlineData(10, 0, 22000, true)]   // Win11 21H2
+    [InlineData(10, 0, 22621, true)]   // Win11 22H2
+    [InlineData(11, 0, 22000, true)]   // Mustaqbil major version
+    [InlineData(6, 3, 9600, false)]    // Win8.1
+    public void RuntimeCheck_IsSupportedOsVersion_Boundaries(int major, int minor, int build, bool expected)
+    {
+        Assert.Equal(expected, RuntimeCheck.IsSupportedOsVersion(new Version(major, minor, build)));
+    }
+
+    [Fact]
+    public void RuntimeCheck_RequirementsText_NamesWin10Floor()
+    {
+        Assert.Contains("19045", RuntimeCheck.RequirementsText);
+        Assert.Contains(".NET 10+", RuntimeCheck.RequirementsText);
+    }
+
     // ================= A11 — FirewallRule builder =================
 
     [Fact]
@@ -245,19 +275,19 @@ public class PhaseHWorkstream6Tests
     }
 
     [Fact]
-    public void Artifact_UserGuide_Version_IsV203()
+    public void Artifact_UserGuide_Version_IsV204()
     {
         string text = ReadRepoFileOrSkip("docs/USER-GUIDE.md");
-        Assert.Contains("Version 2.0.3", text);
-        Assert.Contains("v4.0.0", text);
+        Assert.Contains("Version 2.0.4", text);
+        Assert.Contains("v4.0.1", text);
         Assert.DoesNotContain("RSH-Setup-1.0.0.exe", text);
     }
 
     [Fact]
-    public void Artifact_FlashGuide_Version_IsV400()
+    public void Artifact_FlashGuide_Version_IsV401()
     {
         string text = ReadRepoFileOrSkip("docs/FLASH-GUIDE.md");
-        Assert.Contains("RSH-Firmware-DevKitV1-v4.0.0.bin", text);
+        Assert.Contains("RSH-Firmware-DevKitV1-v4.0.1.bin", text);
         Assert.DoesNotContain("v3.3.bin", text);
     }
 
@@ -266,7 +296,7 @@ public class PhaseHWorkstream6Tests
     {
         string text = ReadRepoFileOrSkip("software/packaging/msix/Package.appxmanifest");
         Assert.Contains("Name=\"RSH\"", text);
-        Assert.Contains("Version=\"2.0.3.0\"", text);
+        Assert.Contains("Version=\"2.0.4.0\"", text);
         Assert.Contains("MinVersion=\"10.0.22000.0\"", text);
         Assert.Contains("RSH.exe", text);
         Assert.Contains("privateNetworkClientServer", text);
@@ -299,13 +329,13 @@ public class PhaseHWorkstream6Tests
     }
 
     [Fact]
-    public void Artifact_WingetManifests_Version203()
+    public void Artifact_WingetManifests_Version204()
     {
         string installer = ReadRepoFileOrSkip("software/packaging/winget/dreamsofts34-creator.RSH.installer.yaml");
-        Assert.Contains("PackageVersion: 2.0.3", installer);
+        Assert.Contains("PackageVersion: 2.0.4", installer);
         Assert.Contains("msix", installer);
         string version = ReadRepoFileOrSkip("software/packaging/winget/dreamsofts34-creator.RSH.yaml");
-        Assert.Contains("PackageVersion: 2.0.3", version);
+        Assert.Contains("PackageVersion: 2.0.4", version);
     }
 
     [Fact]
@@ -371,7 +401,7 @@ public class PhaseHWorkstream6Tests
     public void Artifact_FlashGuide_SecH12_OpenApWarning()
     {
         string text = ReadRepoFileOrSkip("docs/FLASH-GUIDE.md");
-        Assert.Contains("RSH-Firmware-DevKitV1-v4.0.0.bin", text);
+        Assert.Contains("RSH-Firmware-DevKitV1-v4.0.1.bin", text);
         Assert.Contains("esptool.py --chip esp32", text);
         // Step 6 open-AP bootstrap warning (OPEN-6 / TM-W02 residual).
         Assert.Contains("TM-W02", text);

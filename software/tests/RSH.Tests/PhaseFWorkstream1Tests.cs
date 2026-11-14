@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Security.Cryptography;
+using NSec.Cryptography;
 using RSH.Core.Protocol;
 using RSH.Core.Security;
 using RSH.Core.Transport;
@@ -289,6 +291,12 @@ public class PhaseFWorkstream1Tests
 
     // ================= Validator regression (gate mein mila bug) =================
 
+    /// <summary>Test signing keypair (throwaway — SEC-C-06 app-side verify
+    /// ke baad random trailer reject hota hai, is liye test images sahi
+    /// sign karni parti hain; PhaseCAppTests wala keypair alag hai).</summary>
+    private static readonly Key TestSigningKey = Key.Create(SignatureAlgorithm.Ed25519);
+    private static byte[] TestPublicKey => TestSigningKey.PublicKey.Export(KeyBlobFormat.RawPublicKey);
+
     /// <summary>
     /// Esptool-layout image banao: header + 1 segment + checksum byte (16-byte
     /// block ka aakhri byte) + SHA-256 + signed trailer. segmentDataSize aisa
@@ -322,7 +330,11 @@ public class PhaseFWorkstream1Tests
         if (corruptSha) sha[0] ^= 0xFF;
         byte[] withSha = image.Concat(sha).ToArray();
         byte[] trailer = new byte[RSH.Core.Firmware.FirmwareImageValidator.SignatureTrailerSizeBytes];
-        Random.Shared.NextBytes(trailer.AsSpan(0, 64));
+        // SEC-C-06 app-side verify ke baad random trailer reject hota hai —
+        // test image ko test keypair se sahi sign karo (sign-image.py wali
+        // construction: Ed25519(SHA-256(image))).
+        byte[] sig = SignatureAlgorithm.Ed25519.Sign(TestSigningKey, SHA256.HashData(withSha));
+        sig.CopyTo(trailer, 0);
         System.Text.Encoding.ASCII.GetBytes("RSHS").CopyTo(trailer, 64);
         return withSha.Concat(trailer).ToArray();
     }
@@ -332,7 +344,7 @@ public class PhaseFWorkstream1Tests
     {
         // cursor = 24 + 8 + 70000 = 70032, % 16 == 0 — purana validator
         // yahan "SHA-256 mismatch" deta tha (asal firmware.bin jaisa).
-        var r = RSH.Core.Firmware.FirmwareImageValidator.Validate(BuildEsptoolLayoutImage(70_000));
+        var r = RSH.Core.Firmware.FirmwareImageValidator.Validate(BuildEsptoolLayoutImage(70_000), TestPublicKey);
         Assert.True(r.IsValid, r.Error);
         Assert.Equal(new Version(4, 0, 0), r.FirmwareVersion);
     }
@@ -349,7 +361,7 @@ public class PhaseFWorkstream1Tests
     {
         // cursor = 24 + 8 + 70001 = 70033, % 16 == 1 — purana code bhi
         // yahan pass karta tha (regression guard: fix ne is case ko nahi tora).
-        var r = RSH.Core.Firmware.FirmwareImageValidator.Validate(BuildEsptoolLayoutImage(70_001));
+        var r = RSH.Core.Firmware.FirmwareImageValidator.Validate(BuildEsptoolLayoutImage(70_001), TestPublicKey);
         Assert.True(r.IsValid, r.Error);
     }
 

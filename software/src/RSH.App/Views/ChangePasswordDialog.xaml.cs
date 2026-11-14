@@ -22,7 +22,7 @@ namespace RSH.App.Views;
 /// (Window hai, ObservableObject nahi — is liye MVVM source generator
 /// attributes nahi, plain INotifyPropertyChanged + RelayCommand fields.)
 /// </summary>
-public partial class ChangePasswordDialog : Wpf.Ui.Controls.FluentWindow, INotifyPropertyChanged
+public partial class ChangePasswordDialog : Wpf.Ui.Controls.FluentWindow, INotifyPropertyChanged, IChangePasswordDialogResult
 {
     private readonly AppServices _services;
     private bool _changing;

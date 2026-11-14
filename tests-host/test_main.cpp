@@ -872,6 +872,13 @@ int main() {
     CHECK(heap_policy_update(&hp, 180000, 100000, 10000) == 0);
     CHECK(heap_policy_update(&hp, 0, 0, 20000) == 0);  // largest 0 -> streak 1
 
+    // --- Round 2 W3 FIX-1: GET_CAPS/HELLO version FIRMWARE_VERSION se match ---
+    // RSH_CAPS_FW_* hi net.cpp HELLO reply ka bhi source hai (single source
+    // of truth) — 4.0.0 hard-code dobara na aaye, is liye constants + string
+    // dono yahan bandhe hain.
+    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 1);
+    CHECK(strcmp(FIRMWARE_VERSION, "4.0.1") == 0);
+
     // --- FW-11: default pin table mein naye modules ki rows ---
     RshCapsEntry table[20];
     uint8_t ntab = rsh_caps_default_table(table, 20);
@@ -911,7 +918,7 @@ int main() {
       CHECK(blen == 18 + 8u * ntab);
       CHECK(body[0] == RSH_CTRL_OK);
       CHECK(memcmp(body + 1, mac, 6) == 0);
-      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 0);   // fw 4.0.0
+      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 1);   // fw 4.0.1 (Round 2 W3 FIX-1)
       CHECK(body[10] == 2 && body[11] == 1);                 // proto 2.1
       CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
       CHECK(body[15] == 6 && body[16] == 0 && body[17] == ntab);
@@ -1375,6 +1382,120 @@ int main() {
       CHECK(blen == 1052);
       CHECK(rsh_cfg_blob_validate(btnb, blen, errs, &nerr) == RSH_CTRL_UNSUPPORTED);
       CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
+    }
+
+    // --- M1 (final polish): PIN-RULES port — blob validator pin rules ---
+    // Accept: factory blob (upar) + PC default pin-map blob
+    // (PinMapBoardPush.BuildBlob defaults) + direct full-rig blob
+    // (pin_rules_ref.py make_full_rig + LED 21) — teeno OK hone chahiye.
+    // Reject: ADC2 axis, barred pins (strapping/flash/UART/reserved/
+    // nonexistent), input-only digital/LED, I2C-reserved 21/22, 2 batteries,
+    // 2 LED strips, I2C kind par GPIO pin.
+    {
+      uint8_t errs[8];
+      uint8_t nerr = 0;
+      uint8_t blob[512];
+      auto v = [&](const uint8_t *recs, uint8_t n) {
+        size_t l = rsh_cfg_blob_build(blob, recs, n, 1);
+        nerr = 0;
+        return rsh_cfg_blob_validate(blob, l, errs, &nerr);
+      };
+      // PC default pin-map blob (PinMapBoardPush defaults): steering 34,
+      // accel 35, brake 36, handbrake 32, battery 39, gear-up 27,
+      // gear-down 33, horn 4, enc1 23/19, enc2 16/17, LED 21.
+      uint8_t pc[11 * 16];
+      rsh_cfg_record(pc + 0 * 16, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 34, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(pc + 1 * 16, RSH_CFG_TYPE_AXIS_ADC, 1, 0, 35, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(pc + 2 * 16, RSH_CFG_TYPE_AXIS_ADC, 2, 0, 36, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(pc + 3 * 16, RSH_CFG_TYPE_AXIS_ADC, 4, 0, 32, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(pc + 4 * 16, RSH_CFG_TYPE_BATTERY, 0, 0, 39, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(pc + 5 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 27, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(pc + 6 * 16, RSH_CFG_TYPE_BUTTON, 1, 0, 33, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(pc + 7 * 16, RSH_CFG_TYPE_BUTTON, 2, 0, 4, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(pc + 8 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 19, 0xFF, NULL);
+      rsh_cfg_record(pc + 9 * 16, RSH_CFG_TYPE_ENCODER, 1, 0, 16, 17, 0xFF, NULL);
+      rsh_cfg_record(pc + 10 * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
+      CHECK(v(pc, 11) == RSH_CTRL_OK);
+      // Direct full rig (pin_rules_ref.py): 5 axes + battery + 7 buttons
+      // + 2 encoders + LED 21.
+      uint8_t rig[16 * 16];
+      rsh_cfg_record(rig + 0 * 16, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 32, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 1 * 16, RSH_CFG_TYPE_AXIS_ADC, 1, 0, 33, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 2 * 16, RSH_CFG_TYPE_AXIS_ADC, 2, 0, 34, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 3 * 16, RSH_CFG_TYPE_AXIS_ADC, 3, 0, 35, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 4 * 16, RSH_CFG_TYPE_AXIS_ADC, 4, 0, 36, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 5 * 16, RSH_CFG_TYPE_BATTERY, 0, 0, 39, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 6 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 4, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 7 * 16, RSH_CFG_TYPE_BUTTON, 1, 0, 13, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 8 * 16, RSH_CFG_TYPE_BUTTON, 2, 0, 14, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 9 * 16, RSH_CFG_TYPE_BUTTON, 3, 0, 16, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 10 * 16, RSH_CFG_TYPE_BUTTON, 4, 0, 17, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 11 * 16, RSH_CFG_TYPE_BUTTON, 5, 0, 18, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 12 * 16, RSH_CFG_TYPE_BUTTON, 6, 0, 19, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(rig + 13 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 25, 0xFF, NULL);
+      rsh_cfg_record(rig + 14 * 16, RSH_CFG_TYPE_ENCODER, 1, 0, 26, 27, 0xFF, NULL);
+      rsh_cfg_record(rig + 15 * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
+      CHECK(v(rig, 16) == RSH_CTRL_OK);
+      // GPIO5 (caution, boot log) allowed hai — PC + ref dono allow karte hain.
+      uint8_t one[16];
+      rsh_cfg_record(one, RSH_CFG_TYPE_BUTTON, 0, 0, 5, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_OK);
+      // ADC2 axis (GPIO25) reject — ADC1-only rule.
+      rsh_cfg_record(one, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 25, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      // Barred pins (BUTTON par): strapping 0/12/15, UART 1/3, flash 6,
+      // reserved 2, nonexistent 20/37 — sab err 2.
+      const uint8_t barred[] = {0, 1, 2, 3, 6, 12, 15, 20, 37};
+      for (size_t bi = 0; bi < sizeof(barred); bi++) {
+        rsh_cfg_record(one, RSH_CFG_TYPE_BUTTON, 0, 0, barred[bi], 0xFF, 0xFF, NULL);
+        CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+        CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      }
+      // Input-only pin par digital: encoder 34/35, button 34 — pull-up
+      // wahan maujood hi nahi (INPUT_PULLUP), is liye reject.
+      rsh_cfg_record(one, RSH_CFG_TYPE_ENCODER, 0, 0, 34, 35, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      rsh_cfg_record(one, RSH_CFG_TYPE_BUTTON, 0, 0, 34, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      // Input-only pin par LED (digital-out chahiye) reject.
+      rsh_cfg_record(one, RSH_CFG_TYPE_LED_STRIP, 0, 0, 39, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      // I2C kinds hon to GPIO21/22 I2C hain: LED 21 + expander reject,
+      // LED 4 + expander OK; AS5600 (I2C) + LED 21 bhi reject.
+      uint8_t two[2 * 16];
+      rsh_cfg_record(two + 0, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(two + 16, RSH_CFG_TYPE_EXP_MCP23017, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
+      CHECK(v(two, 2) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_PIN_CONFLICT);
+      rsh_cfg_record(two + 0, RSH_CFG_TYPE_LED_STRIP, 0, 0, 4, 0xFF, 0xFF, NULL);
+      CHECK(v(two, 2) == RSH_CTRL_OK);
+      rsh_cfg_record(two + 0, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(two + 16, RSH_CFG_TYPE_AXIS_AS5600, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
+      CHECK(v(two, 2) == RSH_CTRL_PIN_CONFLICT);
+      // I2C kind par GPIO pin reject (ADS1115 pinA 32, expander pinA 4).
+      rsh_cfg_record(one, RSH_CFG_TYPE_AXIS_ADS1115, 0, 0, 32, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      rsh_cfg_record(one, RSH_CFG_TYPE_AXIS_ADS1115, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_OK);
+      // 2 batteries / 2 LED strips (pin wale) reject.
+      rsh_cfg_record(two + 0, RSH_CFG_TYPE_BATTERY, 0, 0, 39, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(two + 16, RSH_CFG_TYPE_BATTERY, 1, 0, 36, 0xFF, 0xFF, NULL);
+      CHECK(v(two, 2) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      rsh_cfg_record(two + 0, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(two + 16, RSH_CFG_TYPE_LED_STRIP, 1, 0, 4, 0xFF, 0xFF, NULL);
+      CHECK(v(two, 2) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      // H-pattern gear pin input-only ho to reject (pull-up rule).
+      uint8_t hp[10] = {1, 17, 18, 19, 0, 0, 0, 0, 0, 0};
+      rsh_cfg_record(one, RSH_CFG_TYPE_SHIFTER, 0, 0, 34, 14, 16, hp);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
     }
 
     // --- Staging: out-of-order chunks + idempotent resend + naya session ---
@@ -1921,7 +2042,7 @@ int main() {
     CHECK(rsh_caps_build_body(body, 100, mac, 6, 0, table, 15) == 0);
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 41) == 0);
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 15) == 138);
-    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 0);
+    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 1);  // fw 4.0.1 (Round 2 W3 FIX-1)
     CHECK(body[10] == 2 && body[11] == 1);  // proto 2.1
     CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
     CHECK(body[15] == 6 && body[17] == 15);
@@ -3427,6 +3548,30 @@ int main() {
     dlen = rsh_cfg_blob_build(dblob, drec, 1, 1);
     CHECK(rsh_pinmap_from_blob(dblob, dlen, &dm) == 1);
     CHECK(dm.enc1A == RSH_PINMAP_ABSENT && dm.enc1B == RSH_PINMAP_ABSENT);
+
+    // --- Round 2 W3 FIX-2: rsh_pinmap_uses_pin — fixed pedal-button pins
+    // (25/26) blob ke kisi aur function ko diye gaye hon to 1 (inputs.cpp
+    // unhein fixed button ke tor par parhna band karta hai — warna ek hi
+    // pin do button bits deta). Factory blob mein 25/26 kisi ko nahi.
+    {
+      RshPinMap fm;
+      CHECK(rsh_pinmap_from_blob(factory, flen, &fm) == 1);
+      CHECK(rsh_pinmap_uses_pin(&fm, 25) == 0);
+      CHECK(rsh_pinmap_uses_pin(&fm, 26) == 0);
+      CHECK(rsh_pinmap_uses_pin(&fm, 34) == 1);   // steering
+      CHECK(rsh_pinmap_uses_pin(&fm, 21) == 1);   // LED strip
+      CHECK(rsh_pinmap_uses_pin(&fm, 0xFF) == 0);
+      CHECK(rsh_pinmap_uses_pin(NULL, 25) == 0);
+      // Full-rig style: encoder 1 pins 23/25 — pin 25 istemal mein hai.
+      rsh_cfg_record(drec + 0 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 25, 0xFF, NULL);
+      dlen = rsh_cfg_blob_build(dblob, drec, 1, 1);
+      RshPinMap em;
+      CHECK(rsh_pinmap_from_blob(dblob, dlen, &em) == 1);
+      CHECK(rsh_pinmap_uses_pin(&em, 25) == 1);
+      CHECK(rsh_pinmap_uses_pin(&em, 23) == 1);
+      CHECK(rsh_pinmap_uses_pin(&em, 26) == 0);
+      CHECK(rsh_pinmap_uses_pin(&em, 27) == 0);
+    }
 
     // --- H-pattern blob: mode 1, gear pins, encoders off ---
     uint8_t hparams[10] = {1, 17, 18, 19, 0, 0, 0, 0, 0, 0};

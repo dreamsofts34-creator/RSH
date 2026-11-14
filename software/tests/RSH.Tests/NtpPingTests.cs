@@ -267,6 +267,28 @@ public class NtpPingTests
         Assert.Equal(0L, client.ThrottledSends);
     }
 
+    [Fact]
+    public async Task PingClient_ConcurrentCalls_OnlyOnePingSent()
+    {
+        // DATA-AI FIX (Round 2 W7-2): pehle check-then-Exchange race mein
+        // do concurrent PingAsync calls ek hi 250 ms window mein do pings
+        // bhej sakti thin (SEC-C-24 flood guard bypass) aur `_nextSeq++`
+        // se ek hi seq bhi mil sakta tha. Ab claim atomic hai.
+        var clock = new FakeClock { NowUs = 1_000_000 };
+        var counting = new CountingTransport(new SimulatedBoardTransport(clock, offsetUs: 0, netOutUs: 100, netBackUs: 100, processingUs: 50));
+        using var client = new NtpPingClient(counting, clock.Now);
+
+        var tasks = Enumerable.Range(0, 8)
+            .Select(_ => client.PingAsync(TimeSpan.FromMilliseconds(500), TestContext.Current.CancellationToken))
+            .ToArray();
+        var results = await Task.WhenAll(tasks);
+
+        Assert.Equal(1, counting.Exchanges); // sirf ek ping gaya
+        Assert.Equal(1L, client.PingsSent);
+        Assert.Equal(7L, client.ThrottledSends);
+        Assert.Single(results.Where(r => r is not null));
+    }
+
     private sealed class CountingTransport : IPingTransport
     {
         private readonly IPingTransport _inner;

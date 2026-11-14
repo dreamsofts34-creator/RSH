@@ -36,14 +36,14 @@
 
 - `AutomationProperties.Name`: **98/98 interactive controls** (MainWindow nav 8, 8 pages, WizardWindow, ChangePasswordDialog) + ButtonsPage ke 32 vJoy cells (code-behind `SetName`). Audit script: `grep`-based XAML scan — 0 missing.
 - Keyboard-only flow: nav RadioButtons, module cards (Button), sab buttons/sliders/toggles/combos focusable hain; Tab order = document order (nav upar-se-neeche, phir content); focus visual (B-UI12-6) har custom control par.
-- High Contrast: **PARTIAL — Windows PC par verify karna baqi hai.** Focus outline + screen-reader names hain, lekin koi `SystemColors`-based High Contrast theme nahi hai (custom brushes HC mode mein auto-adapt nahi hote). Windows PC par HC on karke check karna hai.
+- High Contrast: **theme maujood hai** — `RSHTheme.HighContrast.xaml` (`SystemColors`-based; `RSHThemeManager` palette `"HighContrast"`, OS HC on hone par auto). Focus outline + screen-reader names hain. **Runtime verify Windows PC par baqi hai** (HC on karke readability check).
 - WCAG-AA contrast: text vs background ≥ 4.5:1 — dono themes mein pass (audit table upar; full pairs UI-12 workstream report mein).
 
 ## i18n status
 
-- `Resources/Strings.resx` (English, default) + `Strings.ur.resx` (Urdu) + `Strings.hi.resx` (Hindi) — **61 keys, teeno cultures mein barabar** (generator: `Resources/gen_strings.py`); `Resources/UiStrings.cs` (`{x:Static res:UiStrings.Key}`) — build mein `.resources` embed hote hain (verified: `RSH.App.Resources.Strings[.ur/.hi].resources`).
+- `Resources/Strings.resx` (English, default) + `Strings.ur.resx` (Urdu) + `Strings.hi.resx` (Hindi) — **337 keys, teeno cultures mein barabar** (generator: `Resources/gen_strings.py`; verified: har file mein 337 `<data>` entries); `Resources/UiStrings.cs` (`{x:Static res:UiStrings.Key}`) — build mein `.resources` embed hote hain (verified: `RSH.App.Resources.Strings[.ur/.hi].resources`).
 - Coverage: **52 Text/Content attributes resx se** aate hain (nav 8, headings, main actions — Dashboard/Setup/Profiles/Monitor/Settings/Tuning); ~283 hard-coded literal strings XAML mein baqi hain + VM strings (code-behind) — poori string-by-string rewrite UI-12 scope se bahar thi.
-- Runtime language switch **nahi hai**: `x:Static` culture change par update nahi hota; abhi koi language setting nahi — default OS UI culture istemal hoti hai, Urdu/Hindi strings tayaar hain (`UiStrings.Culture` se override ho sakti hai). Language setting + live switch agle version ka kaam hai.
+- Runtime language switch **hai**: Settings → Appearance → Language combo (System/en/ur/hi) — `UiStrings.ApplyLanguage` (`App.xaml.cs:273` startup par + Settings change par, restart nahi). `x:Static` bindings `UiStrings.Instance` se refresh hoti hain (`UiStrings.cs:58`).
 - Urdu/Hindi translations is workstream mein likhe gaye hain — professional review nahi hua.
 
 ## Tests (Linux, 2026-11-13)
@@ -61,7 +61,7 @@
 4. **Soak + startup:** U-P8 startup ≤ 1200 ms, U-P9 10-min soak memory flat, 30-min real use — koi freeze/lag/crash nahi.
 5. **Real Steam/game launch:** game launcher asal games ke saath (Steam paths), profile auto-switch + restore-on-exit.
 6. **Language setting:** Urdu/Hindi switch ke liye Settings mein option + restart/live reload (resx tayaar hai).
-7. **Kept pages note:** `ConnectionPage`/`CalibrationPage` ka koi navigation reference nahi hai (Setup flow unke VMs reuse karta hai, pages nahi) — WS3 ke mutabiq chhede nahi gaye; agle version mein decide karna hai ke ye pages delete hon ya Setup se link hon.
+7. **Kept pages note:** `ConnectionPage`/`CalibrationPage` ka koi navigation reference nahi hai (Setup flow unke VMs reuse karta hai, pages nahi) — WS3 ke mutabiq chhede nahi gaye. **FAISLA (Round 2 W7, 2026-11-14, GAP-05): DELETE v2.0.5 mein** (coordinator execute kare, build gate se verify ho) — link karna Setup mein nayi navigation (UI change) hota aur VMs pehle se reuse ho rahe hain, is liye link ka koi faida nahi. Round 2 mein files delete nahi ki gayin (UI LOCKED — sirf faisla).
 8. **ScottPlot runtime theme:** theme switch par plots ko dobara rangne ka kaam (constructor-only theme) — chhota follow-up.
 
 ## Files changed (UI-12)

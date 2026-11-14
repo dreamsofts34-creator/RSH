@@ -114,7 +114,21 @@ public sealed class TelemetryWatcher : IDisposable
             if (snap is null || snap.CarModel.Length == 0)
             {
                 // Game band / identity aadhi — candidate reset.
+                // DATA-AI FIX (Round 2 W7-1): stable snapshot ke saath
+                // LatestRawSnapshot bhi saaf karo — Round 1 mein sirf
+                // stable saaf hota tha; raw purani car dikhata rehta tha
+                // aur ProfilesSystem "current car" button game band hone
+                // ke baad bhi purani car bhar deta tha (stale identity).
+                // _hasEmitted bhi reset
+                // taake wahi car dobara aaye to dobara emit ho (warna
+                // LatestStableSnapshot dobara kabhi set hi na hota);
+                // dobara emit par auto-switch nuksan nahi deta — profile
+                // pehle se active ho to TrySwitch null deta hai.
                 _candidate = null;
+                LatestRawSnapshot = null;
+                LatestStableSnapshot = null;
+                _hasEmitted = false;
+                _lastEmittedKey = default;
                 return;
             }
             var key = (snap.Game, snap.CarModel, snap.State);

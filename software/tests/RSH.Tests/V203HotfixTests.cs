@@ -21,7 +21,7 @@ namespace RSH.Tests;
 /// ke liye test Linux par bhi chal sakta hai. Version bump source-text
 /// par assert hota hai (V202 pattern): RSH.Tests sirf RSH.Core ko
 /// reference karta hai, aur Core ki assembly ka version
-/// Directory.Build.props (stale 2.0.0) se aata hai — app version nahi.
+/// Directory.Build.props (2.0.4) se aata hai — app version nahi.
 /// </summary>
 public class V203HotfixTests
 {
@@ -197,58 +197,58 @@ public class V203HotfixTests
         Assert.DoesNotContain("FluentWindow", text, StringComparison.Ordinal);
     }
 
-    // ================= 4. Version 2.0.3 (IsV203 / Version203) =================
+    // ================= 4. Version 2.0.4 (IsV204 / Version204) =================
 
     [Fact]
-    public void IsV203_AppCsproj_Version_Is203()
+    public void IsV204_AppCsproj_Version_Is204()
     {
         // App version source-text par (V202 pattern): RSH.Tests ka
         // Core assembly version app version nahi hota (stale 2.0.0).
         string csproj = ReadRepoFileOrSkip(Path.Combine("software", "src", "RSH.App", "RSH.App.csproj"));
-        Assert.Contains("<Version>2.0.3</Version>", csproj, StringComparison.Ordinal);
-        Assert.DoesNotContain("<Version>2.0.2</Version>", csproj, StringComparison.Ordinal);
+        Assert.Contains("<Version>2.0.4</Version>", csproj, StringComparison.Ordinal);
+        Assert.DoesNotContain("<Version>2.0.3</Version>", csproj, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Version203_MutexAndPipeNames_Contain203_AndDifferFrom202()
+    public void Version204_MutexAndPipeNames_Contain204_AndDifferFrom203()
     {
-        var v203 = new Version(2, 0, 3, 0);
-        Assert.Equal("2.0.3", AppVersionInfo.VersionSuffix(v203));
-        Assert.Equal(@"Global\RSH.SingleInstance.2.0.3", AppVersionInfo.MutexNameForVersion(v203));
-        Assert.Equal("RSH.SingleInstance.2.0.3", AppVersionInfo.PipeNameForVersion(v203));
-        // v2.0.2 ke naamon se mukhtalif hon — warna version-aware
+        var v204 = new Version(2, 0, 4, 0);
+        Assert.Equal("2.0.4", AppVersionInfo.VersionSuffix(v204));
+        Assert.Equal(@"Global\RSH.SingleInstance.2.0.4", AppVersionInfo.MutexNameForVersion(v204));
+        Assert.Equal("RSH.SingleInstance.2.0.4", AppVersionInfo.PipeNameForVersion(v204));
+        // v2.0.3 ke naamon se mukhtalif hon — warna version-aware
         // single instance purani instance ko naya samajh lega.
-        Assert.NotEqual(AppVersionInfo.MutexNameForVersion(new Version(2, 0, 2, 0)),
-            AppVersionInfo.MutexNameForVersion(v203));
-        Assert.NotEqual(AppVersionInfo.PipeNameForVersion(new Version(2, 0, 2, 0)),
-            AppVersionInfo.PipeNameForVersion(v203));
+        Assert.NotEqual(AppVersionInfo.MutexNameForVersion(new Version(2, 0, 3, 0)),
+            AppVersionInfo.MutexNameForVersion(v204));
+        Assert.NotEqual(AppVersionInfo.PipeNameForVersion(new Version(2, 0, 3, 0)),
+            AppVersionInfo.PipeNameForVersion(v204));
     }
 
     [Fact]
-    public void IsV203_MsixManifest_Version_Is203()
+    public void IsV204_MsixManifest_Version_Is204()
     {
         string manifest = ReadRepoFileOrSkip(Path.Combine("software", "packaging", "msix", "Package.appxmanifest"));
-        Assert.Contains("Version=\"2.0.3.0\"", manifest, StringComparison.Ordinal);
-        Assert.DoesNotContain("Version=\"2.0.2.0\"", manifest, StringComparison.Ordinal);
+        Assert.Contains("Version=\"2.0.4.0\"", manifest, StringComparison.Ordinal);
+        Assert.DoesNotContain("Version=\"2.0.3.0\"", manifest, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void IsV203_WingetManifests_Version203()
+    public void IsV204_WingetManifests_Version204()
     {
         string installer = ReadRepoFileOrSkip(Path.Combine("software", "packaging", "winget", "dreamsofts34-creator.RSH.installer.yaml"));
-        Assert.Contains("PackageVersion: 2.0.3", installer, StringComparison.Ordinal);
+        Assert.Contains("PackageVersion: 2.0.4", installer, StringComparison.Ordinal);
         string version = ReadRepoFileOrSkip(Path.Combine("software", "packaging", "winget", "dreamsofts34-creator.RSH.yaml"));
-        Assert.Contains("PackageVersion: 2.0.3", version, StringComparison.Ordinal);
+        Assert.Contains("PackageVersion: 2.0.4", version, StringComparison.Ordinal);
         string locale = ReadRepoFileOrSkip(Path.Combine("software", "packaging", "winget", "dreamsofts34-creator.RSH.locale.en-US.yaml"));
-        Assert.Contains("PackageVersion: 2.0.3", locale, StringComparison.Ordinal);
-        Assert.Contains("releases/tag/v2.0.3", locale, StringComparison.Ordinal);
+        Assert.Contains("PackageVersion: 2.0.4", locale, StringComparison.Ordinal);
+        Assert.Contains("releases/tag/v2.0.4", locale, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void IsV203_UserGuide_Version_Is203_AndDocumentsAutoClassic()
+    public void IsV204_UserGuide_Version_Is204_AndDocumentsAutoClassic()
     {
         string guide = ReadRepoFileOrSkip(Path.Combine("docs", "USER-GUIDE.md"));
-        Assert.Contains("Version 2.0.3", guide, StringComparison.Ordinal);
+        Assert.Contains("Version 2.0.4", guide, StringComparison.Ordinal);
         Assert.Contains("classic window", guide, StringComparison.Ordinal);
         Assert.Contains("--fluent-window", guide, StringComparison.Ordinal);
         Assert.Contains("build < 22000", guide, StringComparison.Ordinal);

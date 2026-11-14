@@ -334,8 +334,15 @@ InputSample inputs_read() {
     if (pinMap.gearDown != RSH_PINMAP_ABSENT &&
         dbGearDown.update(digitalRead(pinMap.gearDown) == LOW, nowMs)) b |= RSH_BTN_GEAR_DOWN;
   }
-  if (dbAccel.update(digitalRead(PIN_ACCEL_BTN) == LOW, nowMs))  b |= RSH_BTN_ACCEL;
-  if (dbBrake.update(digitalRead(PIN_BRAKE_BTN) == LOW, nowMs))  b |= RSH_BTN_BRAKE;
+  // Round 2 W3 (FIX-2): fixed pedal button pins (25/26) sirf tab parho
+  // jab blob ne unhein kisi aur function ko na diya ho — warna ek hi
+  // physical pin do button bits deta (misal encoder B pin 25 LOW hone
+  // par accel-button bit bhi lag jata). rsh_pinmap_uses_pin pure hai,
+  // host tests mein covered hai.
+  if (!rsh_pinmap_uses_pin(&pinMap, PIN_ACCEL_BTN) &&
+      dbAccel.update(digitalRead(PIN_ACCEL_BTN) == LOW, nowMs))  b |= RSH_BTN_ACCEL;
+  if (!rsh_pinmap_uses_pin(&pinMap, PIN_BRAKE_BTN) &&
+      dbBrake.update(digitalRead(PIN_BRAKE_BTN) == LOW, nowMs))  b |= RSH_BTN_BRAKE;
   if (rsh_modules_horn_enabled() && pinMap.horn != RSH_PINMAP_ABSENT &&
       dbHorn.update(digitalRead(pinMap.horn) == LOW, nowMs))    b |= RSH_BTN_HORN;
   s.buttons = b;

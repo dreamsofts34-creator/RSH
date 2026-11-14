@@ -208,8 +208,14 @@ public sealed class ControlClient : IDisposable
             }
             if (reply.Cmd != ((byte)command | 0x80) || reply.ReqId != reqId || reply.Counter != counter)
             {
+                // Stale/ghalat reply (kisi aur request ki — UDP par purani
+                // reply der se aa sakti hai): is request ki nahi hai, is
+                // liye IGNORE karo aur dobara koshish karo (§3.2 "ignore")
+                // — pehle foran fail ho jata tha, ek stale datagram poora
+                // command maar deta tha. Retry naya counter bhejta hai,
+                // is liye board ise naya execution samajhta hai.
                 lastError = "Reply is request se match nahi karti (cmd/reqId/counter) — ghalat/paraani reply, ignore ki gayi.";
-                return new ControlResult(null, null, lastError, attempt);
+                continue;
             }
             var verified = ControlFrameCodec.TryParse(replyBytes, _key, _nonce, out reply);
             if (verified == ControlParseResult.BadTag)

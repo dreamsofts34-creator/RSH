@@ -37,9 +37,25 @@ public static class WindowChromePolicy
     /// </summary>
     public static bool ShouldUseClassicWindow(Version osVersion, bool classicFlag, bool fluentFlag)
     {
+        ArgumentNullException.ThrowIfNull(osVersion);
+        return ShouldUseClassicWindow(!RequiresClassicWindow(osVersion), classicFlag, fluentFlag);
+    }
+
+    /// <summary>
+    /// v2.0.4 — wahi faisla, lekin OS version ke bajaye Win11 boundary
+    /// (RtlGetVersion-based <c>OperatingSystem.IsWindowsVersionAtLeast</c>)
+    /// se: <paramref name="windows11OrNewer"/> true = Win11+ (build &gt;=
+    /// 22000), false = Win10 ya purana. Manifest-independent rasta —
+    /// <c>Environment.OSVersion</c> manifest par inhisar karta hai (shipped
+    /// exe mein manifest verify hai, lekin agar kabhi jhoot bole to
+    /// faisla phir bhi sahi ho). Flag precedence wahi: classicFlag
+    /// jeet-ta hai, phir fluentFlag, phir OS boundary.
+    /// </summary>
+    public static bool ShouldUseClassicWindow(bool windows11OrNewer, bool classicFlag, bool fluentFlag)
+    {
         if (classicFlag) return true;
         if (fluentFlag) return false;
-        return RequiresClassicWindow(osVersion);
+        return !windows11OrNewer;
     }
 
     /// <summary>
@@ -53,9 +69,22 @@ public static class WindowChromePolicy
     /// </summary>
     public static bool ShouldUsePlainNavigation(Version osVersion, bool plainNavFlag, bool fluentFlag)
     {
+        ArgumentNullException.ThrowIfNull(osVersion);
+        return ShouldUsePlainNavigation(!RequiresClassicWindow(osVersion), plainNavFlag, fluentFlag);
+    }
+
+    /// <summary>
+    /// v2.0.4 — wahi plain-nav faisla, Win11 boundary (RtlGetVersion-based)
+    /// se — <see cref="ShouldUseClassicWindow(bool, bool, bool)"/> wala
+    /// rasta. Precedence: plainNavFlag jeet-ta hai (force-on), phir
+    /// fluentFlag (force-off), phir OS boundary: Win10 par auto ON,
+    /// Win11+ par auto OFF.
+    /// </summary>
+    public static bool ShouldUsePlainNavigation(bool windows11OrNewer, bool plainNavFlag, bool fluentFlag)
+    {
         if (plainNavFlag) return true;
         if (fluentFlag) return false;
-        return RequiresClassicWindow(osVersion);
+        return !windows11OrNewer;
     }
 
     /// <summary>
@@ -72,7 +101,13 @@ public static class WindowChromePolicy
     {
         ArgumentNullException.ThrowIfNull(osVersion);
         string mode = useClassic ? "classic window" : "FluentWindow";
-        string osReason = useClassic
+        // OS reason hamesha OS se aaye (RequiresClassicWindow), useClassic
+        // se nahi — warna flag override par jhoot likhta hai: Win10 (19045)
+        // + --fluent-window par "build 19045 >= 22000", ya Win11 (22621)
+        // + --classic-window par "build 22621 < 22000" (dono ghalat;
+        // V203 tests ke comment mein sahi string darj hai).
+        bool osWantsClassic = RequiresClassicWindow(osVersion);
+        string osReason = osWantsClassic
             ? osVersion.Major < 10
                 ? $"Windows major {osVersion.Major} < 10"
                 : $"build {osVersion.Build} < {Windows11Build}"

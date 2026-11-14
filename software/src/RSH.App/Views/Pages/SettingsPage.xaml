@@ -43,11 +43,11 @@
                     <ui:TextBlock Text="Wi-Fi or a wired USB-serial cable — the wheel works on either. Switching restarts the wheel link; a failed switch stays on Wi-Fi."
                                   Appearance="Secondary" Margin="0,0,0,8" TextWrapping="Wrap" />
                     <StackPanel Orientation="Horizontal">
-                        <ui:TextBlock Text="USB-serial (wired)" VerticalAlignment="Center" Width="260" />
+                        <ui:TextBlock Text="USB-serial (wired)" VerticalAlignment="Center" Width="260" TextWrapping="Wrap" />
                         <ui:ToggleSwitch IsChecked="{Binding Transport.IsUsbSerial, Mode=TwoWay}" AutomationProperties.Name="USB-serial (wired)" />
                     </StackPanel>
                     <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
-                        <ui:TextBlock Text="Serial port" VerticalAlignment="Center" Width="160" />
+                        <ui:TextBlock Text="Serial port" VerticalAlignment="Center" Width="160" TextWrapping="Wrap" />
                         <ComboBox ItemsSource="{Binding Transport.AvailablePorts}" SelectedItem="{Binding Transport.SelectedPortName, Mode=TwoWay}" Width="180" AutomationProperties.Name="Serial port" />
                         <ui:Button Content="{Binding Refresh, Source={x:Static res:UiStrings.Instance}}" AutomationProperties.Name="{Binding Refresh, Source={x:Static res:UiStrings.Instance}}" Command="{Binding RefreshTransportPortsCommand}" Margin="8,0,0,0" />
                     </StackPanel>
@@ -108,14 +108,14 @@
                 <StackPanel>
                     <ui:TextBlock Text="{Binding Appearance, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
                     <StackPanel Orientation="Horizontal">
-                        <ui:TextBlock Text="{Binding Theme, Source={x:Static res:UiStrings.Instance}}" VerticalAlignment="Center" Width="160" />
+                        <ui:TextBlock Text="{Binding Theme, Source={x:Static res:UiStrings.Instance}}" VerticalAlignment="Center" Width="160" TextWrapping="Wrap" />
                         <ComboBox ItemsSource="{Binding Themes}" SelectedItem="{Binding Theme, Mode=TwoWay}" Width="180" AutomationProperties.Name="{Binding Theme, Source={x:Static res:UiStrings.Instance}}" />
                     </StackPanel>
                     <ui:TextBlock Text="{Binding SystemFollowsWindows, Source={x:Static res:UiStrings.Instance}}"
                                   Appearance="Secondary" Margin="0,8,0,0" TextWrapping="Wrap" />
                     <!-- Phase F i18n: runtime language switch — restart nahi (UiStrings.ApplyLanguage). -->
                     <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
-                        <ui:TextBlock Text="{Binding Language, Source={x:Static res:UiStrings.Instance}}" VerticalAlignment="Center" Width="160" />
+                        <ui:TextBlock Text="{Binding Language, Source={x:Static res:UiStrings.Instance}}" VerticalAlignment="Center" Width="160" TextWrapping="Wrap" />
                         <ComboBox ItemsSource="{Binding Languages}" DisplayMemberPath="Display" SelectedValuePath="Value" SelectedValue="{Binding Language, Mode=TwoWay}" Width="180" AutomationProperties.Name="{Binding Language, Source={x:Static res:UiStrings.Instance}}" />
                     </StackPanel>
                     <ui:TextBlock Text="{Binding LanguageNote, Source={x:Static res:UiStrings.Instance}}"
@@ -153,15 +153,15 @@
                             <ColumnDefinition Width="*" />
                         </Grid.ColumnDefinitions>
                         <StackPanel Grid.Column="0">
-                            <ui:TextBlock Text="{Binding StartWithWindows, Source={x:Static res:UiStrings.Instance}}" Margin="0,0,0,4" />
+                            <ui:TextBlock Text="{Binding StartWithWindows, Source={x:Static res:UiStrings.Instance}}" Margin="0,0,0,4" TextWrapping="Wrap" />
                             <ui:ToggleSwitch IsChecked="{Binding Autostart}" AutomationProperties.Name="{Binding StartWithWindows, Source={x:Static res:UiStrings.Instance}}" />
                         </StackPanel>
                         <StackPanel Grid.Column="1">
-                            <ui:TextBlock Text="{Binding StartMinimisedToTray, Source={x:Static res:UiStrings.Instance}}" Margin="0,0,0,4" />
+                            <ui:TextBlock Text="{Binding StartMinimisedToTray, Source={x:Static res:UiStrings.Instance}}" Margin="0,0,0,4" TextWrapping="Wrap" />
                             <ui:ToggleSwitch IsChecked="{Binding StartMinimized}" AutomationProperties.Name="{Binding StartMinimisedToTray, Source={x:Static res:UiStrings.Instance}}" />
                         </StackPanel>
                         <StackPanel Grid.Column="2">
-                            <ui:TextBlock Text="{Binding CloseButtonHidesToTray, Source={x:Static res:UiStrings.Instance}}" Margin="0,0,0,4" />
+                            <ui:TextBlock Text="{Binding CloseButtonHidesToTray, Source={x:Static res:UiStrings.Instance}}" Margin="0,0,0,4" TextWrapping="Wrap" />
                             <ui:ToggleSwitch IsChecked="{Binding CloseToTray}" AutomationProperties.Name="{Binding CloseButtonHidesToTray, Source={x:Static res:UiStrings.Instance}}" />
                         </StackPanel>
                     </Grid>
@@ -174,7 +174,7 @@
                 <StackPanel>
                     <ui:TextBlock Text="{Binding PageProfiles, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
                     <StackPanel Orientation="Horizontal">
-                        <ui:TextBlock Text="{Binding AutoSwitchProfilePerGame, Source={x:Static res:UiStrings.Instance}}" VerticalAlignment="Center" Width="260" />
+                        <ui:TextBlock Text="{Binding AutoSwitchProfilePerGame, Source={x:Static res:UiStrings.Instance}}" VerticalAlignment="Center" Width="260" TextWrapping="Wrap" />
                         <ui:ToggleSwitch IsChecked="{Binding AutoSwitchProfiles}" AutomationProperties.Name="{Binding AutoSwitchProfilePerGame, Source={x:Static res:UiStrings.Instance}}" />
                     </StackPanel>
                     <ui:TextBlock Text="{Binding SetEachProfileSGame, Source={x:Static res:UiStrings.Instance}}"
@@ -186,7 +186,7 @@
                 <StackPanel>
                     <ui:TextBlock Text="{Binding Logging, Source={x:Static res:UiStrings.Instance}}" FontTypography="BodyStrong" Margin="0,0,0,8" />
                     <StackPanel Orientation="Horizontal">
-                        <ui:TextBlock Text="{Binding LogLevel, Source={x:Static res:UiStrings.Instance}}" VerticalAlignment="Center" Width="160" />
+                        <ui:TextBlock Text="{Binding LogLevel, Source={x:Static res:UiStrings.Instance}}" VerticalAlignment="Center" Width="160" TextWrapping="Wrap" />
                         <ComboBox ItemsSource="{Binding LogLevels}" SelectedItem="{Binding LogLevel, Mode=TwoWay}" Width="180" AutomationProperties.Name="{Binding LogLevel, Source={x:Static res:UiStrings.Instance}}" />
                     </StackPanel>
                     <ui:TextBlock Text="{Binding LogsKeep7DaysIn, Source={x:Static res:UiStrings.Instance}}"

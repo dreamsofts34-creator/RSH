@@ -74,8 +74,9 @@
 // Sequential mode mein is record ki zaroorat nahi (default sequential);
 // H-pattern ke liye ye record lazmi hai — baghair is ke mode sequential
 // rehta hai. Gear pins 1..6 PIN_SHIFT_H1..H6 hone chahiye (validation
-// sirf range + uniqueness + H+encoder conflict check karti hai — pin
-// numbers ki exact match caller/config ki zimmedari hai).
+// range + uniqueness + pull-up (digital input) + H+encoder conflict
+// check karti hai — pin numbers ki exact match caller/config ki
+// zimmedari hai).
 #define RSH_CFG_TYPE_SHIFTER         11
 #define RSH_CFG_SHIFTER_GATE_PARAM   0   // params[0] = gate mode
 #define RSH_CFG_SHIFTER_GEAR_PIN_PARAM_FIRST 1  // params[1..3] = gear pins 4..6
@@ -190,6 +191,72 @@ static inline size_t rsh_cfg_factory_blob(uint8_t *out) {
   return rsh_cfg_blob_build(out, rec, 11, 1);
 }
 
+// ---------- PIN-RULES (docs/PIN-RULES.md + docs/board-esp32-devkitv1.json) ----------
+// Validator PC builder (software PinMap.ValidatePin) + reference validator
+// (tests-host/pin_rules_ref.py) wali rules enforce karta hai — wire format
+// waisa hi hai, sirf galat blob reject hota hai:
+//   * ADC1-only axes/battery: AXIS_ADC/GENERIC + BATTERY pin sirf
+//     {32, 33, 34, 35, 36, 39} (ADC2 pin Wi-Fi on par garbage deta hai).
+//   * Barred pins kabhi nahi: flash 6-11, UART0 1/3, strapping 0/12/15,
+//     status LED 2, maujood hi nahi 20/24/28-31/37/38.
+//   * Digital input (BUTTON/ENCODER/MATRIX + H-pattern gear pins) ko
+//     internal pull-up chahiye: input-only pins 34-39 reject (inputs.cpp
+//     hamesha INPUT_PULLUP lagata hai — wahan pull-up maujood hi nahi).
+//     NOTE (PC-builder farq): PC ValidatePin input-only digital par sirf
+//     WARNING deta hai (ext_pullup user ki zimmedari), lekin blob mein
+//     ext-pullup ka koi flag/field nahi — firmware farq nahi kar sakta,
+//     is liye COMMIT par reject (fail closed). PC default blob aur
+//     factory blob mein digital pins pull-up wale hain, wo pass hote hain.
+//   * LED_STRIP ko digital-out chahiye: input-only pins reject.
+//   * GPIO5 (caution, boot log) ALLOWED hai — PC + ref dono allow karte hain.
+//   * I2C kinds (ADS1115/expander/AS5600) maujood hon to GPIO21/22 I2C
+//     hain — direct pin istemal reject (R-L9).
+//   * I2C kinds (ADS1115/expander) ka koi GPIO pin nahi (0xFF lazmi).
+//   * Battery <= 1, LED strip (pin wala) <= 1. LED gin'ti sirf pin wale
+//     records ki hoti hai — pinless (0xFF) LED records no-op hain (GET_CFG
+//     clamp test 127 pinless LED records wala max-size blob banata hai).
+// Err codes: pin-rule violation -> err 2 (OUT_OF_RANGE), duplicate/I2C
+//   conflict -> err 1 (PIN_CONFLICT); dono ka status PIN_CONFLICT hai.
+static inline uint8_t rsh_pin_is_adc1_(uint8_t pin) {
+  return pin == 32 || pin == 33 || pin == 34 || pin == 35 || pin == 36 || pin == 39;
+}
+static inline uint8_t rsh_pin_is_input_only_(uint8_t pin) {
+  return pin == 34 || pin == 35 || pin == 36 || pin == 39;
+}
+// Forbidden (flash 6-11, UART 1/3, nonexistent 20/24/28-31/37/38),
+// avoid/strapping (0/12/15), reserved (status LED 2).
+static inline uint8_t rsh_pin_is_barred_(uint8_t pin) {
+  return pin == 0 || pin == 1 || pin == 2 || pin == 3 ||
+         (pin >= 6 && pin <= 12) || pin == 15 || pin == 20 || pin == 24 ||
+         (pin >= 28 && pin <= 31) || pin == 37 || pin == 38;
+}
+
+// Pin-rule kinds (rsh_cfg_pin_check_ ka `rule`).
+#define RSH_PIN_RULE_CLASS_ONLY 0  // istemal nahi hone wala pin: sirf barred + I2C + dup
+#define RSH_PIN_RULE_ADC1       1  // analog axis/battery
+#define RSH_PIN_RULE_PULLUP     2  // digital input: internal pull-up lazmi
+#define RSH_PIN_RULE_DIGOUT     3  // digital output (LED): input-only nahi
+
+// Ek pin check karo. Return 0 = theek (used_pin mark ho gaya),
+// RSH_CFG_ERR_PIN_CONFLICT (1) = duplicate ya I2C-reserved,
+// RSH_CFG_ERR_OUT_OF_RANGE (2) = barred / galat kind.
+// pin == 0xFF caller pehle hi skip karta hai (istemal nahi).
+static inline uint8_t rsh_cfg_pin_check_(uint8_t pin, uint8_t rule,
+                                         uint8_t has_i2c, uint8_t *used_pin) {
+  if (pin > 39) return RSH_CFG_ERR_OUT_OF_RANGE;
+  if (rsh_pin_is_barred_(pin)) return RSH_CFG_ERR_OUT_OF_RANGE;
+  if (has_i2c && (pin == 21 || pin == 22)) return RSH_CFG_ERR_PIN_CONFLICT;
+  if (rule == RSH_PIN_RULE_ADC1 && !rsh_pin_is_adc1_(pin))
+    return RSH_CFG_ERR_OUT_OF_RANGE;
+  if (rule == RSH_PIN_RULE_PULLUP && rsh_pin_is_input_only_(pin))
+    return RSH_CFG_ERR_OUT_OF_RANGE;
+  if (rule == RSH_PIN_RULE_DIGOUT && rsh_pin_is_input_only_(pin))
+    return RSH_CFG_ERR_OUT_OF_RANGE;
+  if (used_pin[pin]) return RSH_CFG_ERR_PIN_CONFLICT;
+  used_pin[pin] = 1;
+  return 0;
+}
+
 // Blob validate karo. err_codes_out (capacity 8 tak) mein err codes aur
 // err_count_out mein kul ghaltiyon ki tadaad (8 se zyada bhi ho sakti hai).
 // Return: control status (§3.9) — OK (0) ya pehli ghalti ka mapped status.
@@ -198,7 +265,13 @@ static inline size_t rsh_cfg_factory_blob(uint8_t *out) {
 //   CRC32 trailer mismatch                          -> BAD_CRC, err 4
 //   unknown type (1..11 ke bahar)                   -> UNSUPPORTED, err 3
 //   pin 0xFF ke ilawa 0..39 ke bahar                -> PIN_CONFLICT, err 2
+//   pin barred (flash/UART/strapping/LED/nonexistent)
+//     ya kind-ghalat (ADC2 axis, input-only digital/LED)
+//     ya I2C kind (ADS/expander/AS5600) par GPIO pin -> PIN_CONFLICT, err 2
+//   I2C kinds maujood hon to direct pin 21/22       -> PIN_CONFLICT, err 1
 //   ek GPIO do records mein                          -> PIN_CONFLICT, err 1
+//   axes > 8 / encoders > 4 / batteries > 1 /
+//     pin wale LED strips > 1                        -> PIN_CONFLICT, err 2
 //   axes > 8 / encoders > 4                         -> PIN_CONFLICT, err 2
 //   button records 65..128                          -> UNSUPPORTED, err 3 (N1)
 //   button records > 128                            -> PIN_CONFLICT, err 2
@@ -213,6 +286,16 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
 #define RSH_CFG_ADD_ERR(code) do { \
     total_errs++; \
     if (nerr < 8) errs[nerr++] = (code); \
+  } while (0)
+// Ek pin PIN-RULES se check karo (rsh_cfg_pin_check_): ghalti ho to err
+// record karo + pehla status PIN_CONFLICT. has_i2c/used_pin neeche ke
+// record-scan scope mein hain (macro use site par expand hota hai).
+#define RSH_CFG_CHECK_PIN(pin, rule) do { \
+    uint8_t _perr = rsh_cfg_pin_check_((pin), (rule), has_i2c, used_pin); \
+    if (_perr) { \
+      RSH_CFG_ADD_ERR(_perr); \
+      if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT; \
+    } \
   } while (0)
   uint8_t status = RSH_CTRL_OK;
 
@@ -248,8 +331,19 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
     // overflow kar jata (T14 jaisa wrap bug) — yahan wrap nahi hona chahiye.
     uint8_t used_pin[40];
     memset(used_pin, 0, sizeof(used_pin));
-    uint16_t n_axes = 0, n_enc = 0, n_btn = 0, n_as5600 = 0;
+    uint16_t n_axes = 0, n_enc = 0, n_btn = 0, n_as5600 = 0, n_bat = 0, n_led = 0;
     uint8_t has_hpattern = 0;
+    // Pre-scan: I2C kinds (ADS1115/expander/AS5600) hon to GPIO21/22 I2C
+    // hain (R-L9) — direct pin istemal neeche reject hota hai.
+    uint8_t has_i2c = 0;
+    for (uint8_t j = 0; j < mc; j++) {
+      uint8_t tj = blob[RSH_CFG_HEADER_SIZE + (size_t)j * RSH_CFG_RECORD_SIZE];
+      if (tj == RSH_CFG_TYPE_AXIS_ADS1115 || tj == RSH_CFG_TYPE_EXP_MCP23017 ||
+          tj == RSH_CFG_TYPE_EXP_PCF8574 || tj == RSH_CFG_TYPE_AXIS_AS5600) {
+        has_i2c = 1;
+        break;
+      }
+    }
     for (uint8_t i = 0; i < mc; i++) {
       const uint8_t *r = blob + RSH_CFG_HEADER_SIZE + (size_t)i * RSH_CFG_RECORD_SIZE;
       uint8_t type = r[0];
@@ -280,6 +374,10 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
       else if (type == RSH_CFG_TYPE_ENCODER) n_enc++;
       else if (type == RSH_CFG_TYPE_BUTTON) n_btn++;
       else if (type == RSH_CFG_TYPE_BUTTON_MATRIX) n_btn += 16;  // default 4x4
+      else if (type == RSH_CFG_TYPE_BATTERY) n_bat++;
+      else if (type == RSH_CFG_TYPE_LED_STRIP) {
+        if (r[3] != 0xFF) n_led++;  // pinless LED record no-op hai (upar dekho)
+      }
       else if (type == RSH_CFG_TYPE_SHIFTER) {
         // Phase F WS5: gate mode params[0] mein (record offset 6).
         uint8_t mode = r[6];
@@ -290,49 +388,79 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
         }
         if (mode == 1) {
           has_hpattern = 1;
-          // Gear pins 1..3 (pinA/B/C) 0xFF nahi ho sakte — range +
-          // uniqueness neeche generic loop mein check hoti hai (0xFF
-          // generic loop mein skip hota hai, is liye yahan pakro).
+          // Gear pins 1..3 (pinA/B/C) 0xFF nahi ho sakte; maujood hon to
+          // digital input hain (INPUT_PULLUP — PIN-RULES pullup rule).
           for (int gp = 3; gp <= 5; gp++) {
             if (r[gp] == 0xFF) {
               RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
               if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
+            } else {
+              RSH_CFG_CHECK_PIN(r[gp], RSH_PIN_RULE_PULLUP);
             }
           }
           // Gear pins 4..6 (params[1..3], record offsets 7..9):
-          // range + uniqueness — generic loop inhein nahi dekhta.
+          // generic loop inhein nahi dekhta — yahin check karo.
           for (int gp = 7; gp <= 9; gp++) {
             uint8_t pin = r[gp];
             if (pin == 0xFF) {
               RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
               if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
-            } else if (pin > 39) {
-              RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
-              if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
-            } else if (used_pin[pin]) {
-              RSH_CFG_ADD_ERR(RSH_CFG_ERR_PIN_CONFLICT);
-              if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
             } else {
-              used_pin[pin] = 1;
+              RSH_CFG_CHECK_PIN(pin, RSH_PIN_RULE_PULLUP);
             }
           }
+          continue;  // generic loop skip — gear pins pehle hi check ho chuke
         }
       }
+      // I2C kinds (ADS1115/expander): koi GPIO pin nahi (0xFF lazmi,
+      // PIN-RULES I2C kind rule). AS5600 ke pins upar wali branch mein
+      // pehle hi check ho chuke — generic loop bhi skip karo.
+      if (type == RSH_CFG_TYPE_AXIS_ADS1115 ||
+          type == RSH_CFG_TYPE_EXP_MCP23017 ||
+          type == RSH_CFG_TYPE_EXP_PCF8574) {
+        for (int p = 3; p <= 5; p++) {
+          if (r[p] != 0xFF) {
+            RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
+            if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
+          }
+        }
+        continue;
+      }
+      if (type == RSH_CFG_TYPE_AXIS_AS5600) continue;
+      // Har maujood pin PIN-RULES se check karo — rule type + position
+      // par munhasir hai (pinA = asal function pin; pinB/pinC aksar
+      // istemal nahi hote, un par sirf barred/I2C/dup check).
       for (int p = 3; p <= 5; p++) {
         uint8_t pin = r[p];
         if (pin == 0xFF) continue;
-        if (pin > 39) {
-          RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
-          if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
-        } else if (used_pin[pin]) {
-          RSH_CFG_ADD_ERR(RSH_CFG_ERR_PIN_CONFLICT);
-          if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
-        } else {
-          used_pin[pin] = 1;
+        uint8_t rule = RSH_PIN_RULE_CLASS_ONLY;
+        if (p == 3) {
+          if (type == RSH_CFG_TYPE_AXIS_ADC ||
+              type == RSH_CFG_TYPE_AXIS_GENERIC ||
+              type == RSH_CFG_TYPE_BATTERY)
+            rule = RSH_PIN_RULE_ADC1;
+          else if (type == RSH_CFG_TYPE_BUTTON ||
+                   type == RSH_CFG_TYPE_BUTTON_MATRIX ||
+                   type == RSH_CFG_TYPE_ENCODER)
+            rule = RSH_PIN_RULE_PULLUP;
+          else if (type == RSH_CFG_TYPE_LED_STRIP)
+            rule = RSH_PIN_RULE_DIGOUT;
+        } else if (p == 4) {
+          if (type == RSH_CFG_TYPE_ENCODER ||
+              type == RSH_CFG_TYPE_BUTTON_MATRIX)
+            rule = RSH_PIN_RULE_PULLUP;
+        } else {  // p == 5 (pinC)
+          if (type == RSH_CFG_TYPE_BUTTON_MATRIX)
+            rule = RSH_PIN_RULE_PULLUP;
         }
+        RSH_CFG_CHECK_PIN(pin, rule);
       }
     }
     if (n_axes > 8 || n_enc > 4) {
+      RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
+      if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
+    }
+    if (n_bat > 1 || n_led > 1) {
       RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
       if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
     }
@@ -357,6 +485,7 @@ done:
   if (err_count_out) *err_count_out = total_errs > 255 ? 255 : (uint8_t)total_errs;
   return status;
 #undef RSH_CFG_ADD_ERR
+#undef RSH_CFG_CHECK_PIN
 }
 
 // ---------- Blob queries (Phase F WS5) ----------

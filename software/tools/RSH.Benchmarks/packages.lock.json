@@ -2,6 +2,19 @@
   "version": 1,
   "dependencies": {
     "net10.0": {
+      "libsodium": {
+        "type": "Transitive",
+        "resolved": "1.0.19",
+        "contentHash": "tupm/HViwBN6Knd/gckR+cLaJGR39GLmiU4iDMM5hp/1BoczMr8fwJhSU+3/C2V4hi9nBK/4FICRKtTLU30TCA=="
+      },
+      "NSec.Cryptography": {
+        "type": "Transitive",
+        "resolved": "24.4.0",
+        "contentHash": "R89OF0T5OY9QnPRoTsMCaPKMqtXcWKZSWAO4zyUaFHI+ZRMgXU7WaIwg/rPP3vOfdaLl8HdUHWkDB+2B9FOO7g==",
+        "dependencies": {
+          "libsodium": "[1.0.19, 1.0.20)"
+        }
+      },
       "runtime.android-arm.runtime.native.System.IO.Ports": {
         "type": "Transitive",
         "resolved": "10.0.0",
@@ -105,11 +118,6 @@
         "resolved": "10.0.0",
         "contentHash": "kggkJk7S8OcoOLa9OyrP2zQ/eStiKHOytWVK8lJuRckzcz52eUgDo66+d9n2KciukcNmeAbmSHEY6fh2n394Jg=="
       },
-      "System.IO.FileSystem.AccessControl": {
-        "type": "Transitive",
-        "resolved": "5.0.0",
-        "contentHash": "SxHB3nuNrpptVk+vZ/F+7OHEpoHUIKKMl02bUmYHQr1r+glbZQxs7pRtsf4ENO29TVm2TH3AEeep2fJcy92oYw=="
-      },
       "System.IO.Ports": {
         "type": "Transitive",
         "resolved": "10.0.0",
@@ -121,7 +129,7 @@
       "rsh.core": {
         "type": "Project",
         "dependencies": {
-          "System.IO.FileSystem.AccessControl": "[5.0.0, )",
+          "NSec.Cryptography": "[24.4.0, )",
           "System.IO.Ports": "[10.0.0, )"
         }
       }

@@ -177,6 +177,20 @@ public sealed class UdpWheelSource : ISampleSource, IV2SampleSource, IStatusSour
 
     public LinkStatistics Statistics => _stats;
 
+    /// <summary>
+    /// HELLO / stream / status datagrams sirf is sender se qabool karo
+    /// (Round 2 B2-06): data socket unconnected hai, is liye LAN par koi
+    /// bhi station is port par HELLO (nonce/key — pairing trust) ya fake
+    /// "RSH2" stream packets (wheel input!) bhej sakta tha. Control /
+    /// ping transports connected sockets hain (OS khud filter karta hai),
+    /// lekin data socket par ye check nahi tha. Set ho (AppServices —
+    /// Settings.EspIp se) to kisi aur sender ka datagram drop + gina
+    /// jata hai; null (default) = koi filter nahi (rig / tests / hostname
+    /// EspIp). ProcessDatagram(data) seam (remote null) kabhi filter nahi
+    /// hoti — tests baghair endpoint ke yahin se chalte hain.
+    /// </summary>
+    public IPAddress? ExpectedRemoteAddress { get; set; }
+
     /// <summary>Receive loop chal raha hai?</summary>
     public bool IsRunning
     {
@@ -220,7 +234,7 @@ public sealed class UdpWheelSource : ISampleSource, IV2SampleSource, IStatusSour
     public long V2ValidPackets => Interlocked.Read(ref _v2Valid);
     /// <summary>Ab tak kitne v2.1 stream packets reject hue.</summary>
     public long V2BadPackets => Interlocked.Read(ref _v2Bad);
-    /// <summary>Is (data) port par aane wale control/probe/ping datagrams — sirf ginay jate hain.</summary>
+    /// <summary>Is (data) port par aane wale control/probe/ping datagrams + sender-filter se gire datagrams — sirf ginay jate hain.</summary>
     public long UnknownDatagrams => Interlocked.Read(ref _unknownDatagrams);
 
     /// <summary>
@@ -359,6 +373,15 @@ public sealed class UdpWheelSource : ISampleSource, IV2SampleSource, IStatusSour
     /// <summary>ProcessDatagram + sender endpoint (HELLO reply ka remote record karne ke liye).</summary>
     internal void ProcessDatagram(ReadOnlySpan<byte> data, IPEndPoint? remoteEndPoint)
     {
+        // Round 2 B2-06: sender filter — expected board ke ilawa kisi ka
+        // datagram drop (HELLO spoof / fake stream). Remote null ho (test
+        // seam) ya filter unset ho to koi filtering nahi.
+        if (ExpectedRemoteAddress is not null && remoteEndPoint is not null
+            && !remoteEndPoint.Address.Equals(ExpectedRemoteAddress))
+        {
+            Interlocked.Increment(ref _unknownDatagrams);
+            return;
+        }
         switch (PacketRouter.Classify(data))
         {
             case PacketKind.StreamV2:

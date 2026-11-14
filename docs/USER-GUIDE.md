@@ -1,11 +1,10 @@
 # RSH — User Guide
 
-**Version 2.0.3 — for RSH app v2.0.3 / firmware v4.0.0 / protocol v2.1.**
-(Previous guide version: 2.0.2 / firmware v4.0.0 — v2.0.3 adds
-automatic classic window on Windows 10 (build < 22000, see §6) —
-no flag needed — plus a `--fluent-window` escape hatch. Firmware
-v4.0.0 is unchanged; if your board already runs v4.0.0, do not
-reflash it.)
+**Version 2.0.4 — for RSH app v2.0.4 / firmware v4.0.1 / protocol v2.1.**
+(Previous guide version: 2.0.3 / firmware v4.0.0 — v2.0.4 adds
+the final polish sweep (bug fixes across app + firmware — see
+`docs/RELEASE-NOTES-v2.0.4.md`). Firmware v4.0.1 (blob validator +
+ping/NVS fixes); if your board already runs v4.0.0, reflash to v4.0.1.)
 
 Wireless DIY sim-racing wheel: an ESP32 in the wheel sends its movement over
 its own WiFi; RSH on the PC turns that into a standard game controller
@@ -19,12 +18,13 @@ where you can change it without reflashing anything.
 
 ## 1. What you need
 
-- The wheel, flashed with the RSH firmware v4.0.0 (ESP32 DevKit V1 build).
-- Windows 11 (64-bit). Windows 10 (64-bit, build 19041+) also works —
-  v2.0.3 automatically uses a classic window there (see §6). Windows 10
-  is end-of-life (14 Oct 2025) — best-effort only, no guarantee.
+- The wheel, flashed with the RSH firmware v4.0.1 (ESP32 DevKit V1 build).
+- Windows 11 (64-bit). Windows 10 22H2 (64-bit, build 19045+) also works —
+  v2.0.4 automatically uses a classic window there (see §6). Windows 10
+  is end-of-life (14 Oct 2025) — floor ke andar (19045+) support hai;
+  is se purana build (masalan 19041) supported nahi.
 - **.NET 10 Desktop Runtime 10.x (x64) — REQUIRED from v2.0.1.**
-  The v2.0.3 app is framework-dependent: it does NOT bundle .NET
+  The v2.0.4 app is framework-dependent: it does NOT bundle .NET
   anymore, so without this runtime `RSH.exe` will not start at all.
   Download it from the official Microsoft page
   <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>
@@ -61,7 +61,7 @@ the app first, then in the vJoy install folder
 
 ## 3. Install RSH
 
-**v2.0.3 app UNSIGNED hai** (user faisla 2026-11-13 — OV code-signing
+**v2.0.4 app UNSIGNED hai** (user faisla 2026-11-13 — OV code-signing
 certificate abhi nahi khareeda gaya, baad mein aayega). Is liye:
 
 0. **Pehle .NET 10 Desktop Runtime install karo (v2.0.1 se REQUIRED).**
@@ -77,7 +77,7 @@ certificate abhi nahi khareeda gaya, baad mein aayega). Is liye:
    mein nahi hai — yehi is hotfix ki packaging tabdeeli hai.
 - **Portable build (recommended):** `RSH-windows-x64.zip` download karo,
   unzip karo, `RSH.exe` chalao — is ko signing ki zaroorat nahi, install
-  bhi nahi hota. Yehi tareeqa v2.0.3 ke liye primary hai. Zip mein ab
+  bhi nahi hota. Yehi tareeqa v2.0.4 ke liye primary hai. Zip mein ab
   RSH.exe + us ki app DLLs hain (41 files) — framework-dependent (loose).
 - **MSIX (`RSH-2.0.3.msix`):** unsigned package hai — Windows SmartScreen
   **"Windows protected your PC" / "Unknown publisher"** warning dikhayega
@@ -159,8 +159,8 @@ and fine-tune later on the Calibration page.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `RSH.exe` won't start / "You must install or update .NET" | .NET 10 Desktop Runtime missing (v2.0.3 is framework-dependent) | Install .NET Desktop Runtime 10.x (x64) from <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>, then check `dotnet --list-runtimes` shows `Microsoft.WindowsDesktop.App 10.x.x` |
-| Blank window (no content, no tray icon) | FluentWindow chrome or navigation-area styling does not paint on Windows 10 (build < 22000) — v2.0.3 opens a classic window with a plain sidebar there automatically, no flag needed | On Windows 10 just run v2.0.3 normally. If it is still blank, try in this order and note which step first shows content: **(a)** `RSH.exe --software-render` — forces software rendering; **(b)** `RSH.exe --fluent-window` — forces the FluentWindow chrome on Windows 10, to test whether it paints after all; **(c)** the plain-Window test build (see `docs/RELEASE-NOTES-v2.0.3.md`) — a minimal window with no FluentWindow at all; **(d)** report the result (which step worked, or that none did) together with `%AppData%\RSH\logs\rsh-<today>.log`. On Windows 11 the extra diagnostic is `RSH.exe --plain-nav` (plain sidebar instead of the styled one). |
+| `RSH.exe` won't start / "You must install or update .NET" | .NET 10 Desktop Runtime missing (v2.0.4 is framework-dependent) | Install .NET Desktop Runtime 10.x (x64) from <https://dotnet.microsoft.com/en-us/download/dotnet/10.0>, then check `dotnet --list-runtimes` shows `Microsoft.WindowsDesktop.App 10.x.x` |
+| Blank window (no content, no tray icon) | v2.0.3's "classic window" was not a classic window at all — MainWindow stayed FluentWindow; v2.0.4 opens a real plain Window on Windows 10 (build < 22000), no flag needed | On Windows 10 just run v2.0.4 normally. If it is still blank, try in this order and note which step first shows content: **(a)** `RSH.exe --software-render` — forces software rendering; **(b)** `RSH.exe --fluent-window` — forces the FluentWindow chrome on Windows 10, to test whether it paints after all; **(c)** report the result (which step worked, or that none did) together with the title-bar version, `%AppData%\RSH\logs\rsh-YYYYMMDD.log` (no dashes in the date, e.g. `rsh-20261111.log` — Roaming folder, not Local) and `%TEMP%\RSH\startup-status.txt`. On Windows 11 the extra diagnostic is `RSH.exe --plain-nav` (plain sidebar instead of the styled one). |
 | Dashboard: "Wheel not connected" | PC not on RSH WiFi, wheel off, or HELO blocked | Join RSH, check wheel LED (solid = connected), check firewall allows RSH |
 | Packets arrive but stop after 2 s | Windows dropped the WiFi (power saving) | In Device Manager, disable "allow the computer to turn off this device" for the WiFi adapter |
 | Output red: "device BUSY" | Another feeder app holds the vJoy device | Close the other app (or pick a different device on the Output page) |
@@ -170,7 +170,7 @@ and fine-tune later on the Calibration page.
 | Steering feels floaty | Too much smoothing | Lower smoothing toward 15–20% |
 | Car pulls to one side | Centre moved (pot shifted) | Re-capture centre on the Calibration page |
 | Pedals never reach 100% / always on | Range changed | Re-run pedal capture |
-| High packet loss % on Diagnostics | WiFi congestion/interference | Move closer; firmware v4.0.0 auto-picks the quietest channel at boot — restart the wheel |
+| High packet loss % on Diagnostics | WiFi congestion/interference | Move closer; firmware v4.0.1 auto-picks the quietest channel at boot — restart the wheel |
 
 Something else? Open **Diagnostics → Export diagnostics (.zip)** and keep
 the file — it contains the logs and the counters that explain what the
@@ -178,14 +178,14 @@ link was doing.
 
 ### Blank window — the app opens but shows nothing
 
-**Windows 10 (build < 22000): v2.0.3 fixes this automatically.** The
+**Windows 10 (build < 22000): v2.0.4 fixes this automatically.** The
 blank window was the FluentWindow chrome (custom title bar) or the
 navigation-area styling failing to paint on Windows 10 — a plain WPF
 window on the same PC rendered fine (RenderTest: Render Tier 2,
 hardware acceleration working), so the GPU and driver are ruled out.
 The original v1.2.2 app used the same FluentWindow chrome and worked
 on this PC, so the chrome alone is not proven to be the cause — that
-is why v2.0.3 removes **both** suspects together on Windows 10: it
+is why v2.0.4 removes **both** suspects together on Windows 10: it
 opens a **classic window** (plain OS title bar) **with a plain
 sidebar** (literal text, system colours, default styling) by itself
 — no flag needed, no setting to change. All 8 screens stay reachable
@@ -209,14 +209,14 @@ order, one at a time:
    `RSH.exe --classic-window`
    This keeps the same app but uses a plain Windows title bar instead
    of the custom FluentWindow chrome. On Windows 10 this is already
-   the default in v2.0.3 — the flag forces it on Windows 11 too, to
+   the default in v2.0.4 — the flag forces it on Windows 11 too, to
    test whether the FluentWindow chrome is what fails there.
 3. **Plain sidebar:** close RSH, then start it with
    `RSH.exe --plain-nav`
    This keeps the FluentWindow chrome but replaces the styled sidebar
    with a plain one (literal text, system colours, default styling —
    like the original v1.2.2 sidebar). On Windows 10 this is already
-   the default in v2.0.3 — the flag forces it on Windows 11 too, to
+   the default in v2.0.4 — the flag forces it on Windows 11 too, to
    test whether the sidebar styling is what fails there.
 4. **FluentWindow escape hatch:** close RSH, then start it with
    `RSH.exe --fluent-window`

@@ -44,6 +44,15 @@ public sealed class EncoderTracker
     /// allocate nahi hota. EncoderCount 0 ho to deltas 0 aur baseline
     /// reset (dobara enable par jump nahi).
     /// </summary>
+    /// <summary>
+    /// DATA-AI FIX (Round 2 W7-3): cumulative span chhoti ho (caller ne
+    /// encoderCount se kam values di hon) to IndexOutOfRange ke bajaye
+    /// maujooda values tak clamp karo — pipeline tick kabhi crash nahi
+    /// karta. Packet path par ye kabhi nahi hota (WheelPacketV2 parse
+    /// Encoders ki lambai = EncoderCount pakka karta hai); ye sirf
+    /// defense in depth hai. n == 0 (khaali span) par baseline nahi
+    /// banti — agla poora packet baseline banayega.
+    /// </summary>
     public void Update(ReadOnlySpan<short> cumulative, int encoderCount, Span<short> deltas)
     {
         if (deltas.Length < MaxEncoders)
@@ -55,6 +64,8 @@ public sealed class EncoderTracker
             return;
         }
         int n = Math.Min(encoderCount, MaxEncoders);
+        n = Math.Min(n, cumulative.Length);
+        if (n <= 0) return;
         if (!_hasBaseline)
         {
             cumulative[..n].CopyTo(_last.AsSpan(0, n));

@@ -395,7 +395,12 @@ public sealed class NtpPingClient : IDisposable
     // Throttle ka waqt measurement clock se ALAG hai: measurement clock
     // tests mein fake ho sakta hai, throttle hamesha asal waqt se naapta hai.
     private long _lastSendTimestamp;
-    private ushort _nextSeq;
+    // DATA-AI FIX (Round 2 W7-2): seq + throttle claim atomic hone
+    // chahiye — pehle `_nextSeq++` aur check-then-Exchange do concurrent
+    // PingAsync calls ko ek hi seq / ek hi 250 ms window mein do pings
+    // bhejane dete thay (SEC-C-24 flood guard bypass). Seq counter int
+    // hai (ushort mein cast par wrap waisa hi hai jaisa pehle tha).
+    private int _nextSeqCounter;
     private bool _disposed;
 
     /// <summary>E2E latency metric — Performance panel yahi parhega (read-only exposure).</summary>
@@ -433,16 +438,23 @@ public sealed class NtpPingClient : IDisposable
     {
         if (_disposed) throw new ObjectDisposedException(nameof(NtpPingClient));
         // PC-side flood guard (SEC-C-24) — asal waqt se, measurement clock se nahi.
+        // DATA-AI FIX (Round 2 W7-2): claim atomic hai — CompareExchange
+        // loop: sirf wahi caller bhejta hai jis ne _lastSendTimestamp ko
+        // kamyabi se badla; doosra caller throttle hota hai (pehle
+        // check-then-Exchange race mein dono guzar sakte thay).
         long sendStamp = Stopwatch.GetTimestamp();
-        long last = Interlocked.Read(ref _lastSendTimestamp);
-        if (last != 0 && sendStamp - last < _minSendIntervalTicks)
+        while (true)
         {
-            ThrottledSends++;
-            return null;
+            long last = Interlocked.Read(ref _lastSendTimestamp);
+            if (last != 0 && sendStamp - last < _minSendIntervalTicks)
+            {
+                ThrottledSends++;
+                return null;
+            }
+            if (Interlocked.CompareExchange(ref _lastSendTimestamp, sendStamp, last) == last) break;
         }
-        Interlocked.Exchange(ref _lastSendTimestamp, sendStamp);
 
-        ushort seq = _nextSeq++;
+        ushort seq = (ushort)Interlocked.Increment(ref _nextSeqCounter);
         long t0 = _nowUs();
         byte[] request = PingFrame.BuildRequest(seq, t0);
         PingsSent++;

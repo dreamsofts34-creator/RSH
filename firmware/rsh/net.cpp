@@ -307,7 +307,11 @@ static size_t net_build_hello_reply(uint8_t sessionEcho, uint8_t *out) {
   if (rsh_fw34_safe_mode_active()) flags |= RSH_V2_HELLO_SAFE_MODE;  // FW-3 bit2
   uint8_t mac[6];
   WiFi.softAPmacAddress(mac);
-  return rsh_v2_build_hello(out, flags, sessionEcho, mac, 4, 0, 0,
+  // Round 2 W3: version modules.h ke RSH_CAPS_FW_* constants se aati hai
+  // (FIRMWARE_VERSION "4.0.1" se match) — hard-coded 4,0,0 HELLO mein
+  // ghalat version batata tha (GET_CAPS wala bug bhi yahi tha).
+  return rsh_v2_build_hello(out, flags, sessionEcho, mac, RSH_CAPS_FW_MAJOR,
+                            RSH_CAPS_FW_MINOR, RSH_CAPS_FW_PATCH,
                             keystore_nonce(), dk, pw);
 }
 
@@ -595,7 +599,11 @@ static uint8_t net_ctrl_handler(uint8_t cmd, const uint8_t *payload, uint16_t le
 static size_t net_ping_build_reply(const uint8_t *req, int len, uint32_t srcKey,
                                    uint8_t *reply_out) {
   uint64_t t1 = net_micros64();  // receive ka waqt (pehle lo)
-  if (len != 34 || req[4] != RSH_V2_VERSION || req[5] != 0) {
+  // L1: magic check SHARED hai — UDP demux (neeche, "RSHN" check) aur
+  // serial rasta (net_serial_ping — frame kind se aata hai, payload ka
+  // magic nahi dekhta) dono yahin se guzarte hain. Baghair "RSHN" magic
+  // ke frame drop (PROTOCOL-V2.1 §9: magic bytes 0-3).
+  if (len != 34 || memcmp(req, "RSHN", 4) != 0 || req[4] != RSH_V2_VERSION || req[5] != 0) {
     pingDropped++;
     return 0;
   }

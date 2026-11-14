@@ -11,33 +11,69 @@
 //    Offline ho, API fail ho, ya tag parse na ho to result "unknown" hai
 //    (Error field mein wajah) — app kabhi crash nahi karti, update check
 //    kabhi startup nahi rokti (caller background par chalata hai).
-//  - RuntimeCheck: .NET runtime >= 10 aur Windows 11 (build >= 22000)
-//    — plan §6 floor: Windows 11. Sandbox/Linux par IsSupportedOs()
-//    false deta hai (koi exception nahi) — tests isi liye platform-aware
-//    hain, "Windows 11 chahiye" ka daawa Linux par nahi karte.
+//  - RuntimeCheck: .NET runtime >= 10 aur Windows 10 22H2 (build >= 19045)
+//    — v2.0.3 shipped floor (GAP-02): v2.0.3 Win10 (build 19045, user ka PC)
+//    ko officially support karta hai (auto-classic + plain-nav), is liye
+//    update check ka floor bhi wahi hai — pehle wala Windows 11 floor
+//    (build >= 22000) Win10 par update check rok deta tha. NOTE: plan
+//    v2.3 §6 ka "Windows 11 floor" text FINAL hai — use nahi chhera gaya;
+//    ye shipped-support floor hai, plan ka text nahi.
+//    Sandbox/Linux par IsSupportedOs() false deta hai (koi exception nahi)
+//    — tests isi liye platform-aware hain, "Windows 11 chahiye" ka daawa
+//    Linux par nahi karte.
 using System.Net.Http.Headers;
 using System.Text.Json;
 
 namespace RSH.Core.Utilities;
 
-/// <summary>.NET runtime + OS floor check (A13, plan §6: Windows 11 floor, .NET 10 LTS).</summary>
+/// <summary>.NET runtime + OS floor check (A13). Shipped floor (v2.0.3, GAP-02):
+/// Windows 10 22H2 (build 19045) ya naya + .NET 10 LTS. Plan v2.3 §6 ka
+/// "Windows 11 floor" text FINAL hai — use nahi chhera gaya.</summary>
 public static class RuntimeCheck
 {
     /// <summary>Minimum .NET runtime major version (plan: .NET 10 LTS).</summary>
     public const int MinimumDotNetMajor = 10;
 
-    /// <summary>Minimum Windows 11 build (21H2 = 22000).</summary>
+    /// <summary>
+    /// Minimum Windows build (GAP-02, v2.0.3 shipped floor): Windows 10 22H2
+    /// = build 19045 — user ka PC aur auto-classic/ plain-nav support ka
+    /// floor. Is se purana Windows (masalan Win10 2004 = 19041) supported nahi.
+    /// </summary>
+    public const int MinimumWindowsBuild = 19045;
+
+    /// <summary>Windows 11 ka pehla build (21H2 = 22000) — Win10/Win11 boundary (FluentWindow policy jaisa).</summary>
     public const int MinimumWindows11Build = 22000;
 
     /// <summary>Chal raha runtime supported hai? (.NET major >= 10.)</summary>
     public static bool IsSupportedRuntime() => Environment.Version.Major >= MinimumDotNetMajor;
 
-    /// <summary>OS Windows 11 ya naya hai? (Non-Windows par false — koi exception nahi.)</summary>
+    /// <summary>
+    /// OS version supported hai? Pure logic (testable — Linux sandbox par bhi):
+    /// Windows major &gt; 10 (mustaqbil) ya major 10 + build &gt;= <see cref="MinimumWindowsBuild"/>.
+    /// Build maloom na ho (Version.Build &lt; 0) to false.
+    /// </summary>
+    public static bool IsSupportedOsVersion(Version osVersion)
+    {
+        ArgumentNullException.ThrowIfNull(osVersion);
+        if (osVersion.Major > 10) return true;
+        if (osVersion.Major < 10) return false;
+        return osVersion.Build >= MinimumWindowsBuild;
+    }
+
+    /// <summary>OS Windows 10 22H2 (build 19045) ya naya hai? (Non-Windows par false — koi exception nahi.)</summary>
     public static bool IsSupportedOs()
     {
         if (!OperatingSystem.IsWindows()) return false;
-        return OperatingSystem.IsWindowsVersionAtLeast(10, 0, MinimumWindows11Build);
+        return IsSupportedOsVersion(Environment.OSVersion.Version);
     }
+
+    /// <summary>
+    /// Minimum requirements ka user ko dikhane qaabil text — update-check gate
+    /// (DiagnosticsSettings) yahi istemal kare ("Windows 11" wali purani
+    /// wording Win10 19045 par ghalat thi — GAP-02).
+    /// </summary>
+    public const string RequirementsText =
+        "RSH needs .NET 10+ on Windows 10 22H2 (build 19045) or newer.";
 
     /// <summary>Dono checks ek saath — app start par About/diagnostics mein dikhane ke liye.</summary>
     public static (bool RuntimeOk, bool OsOk) CheckAll() => (IsSupportedRuntime(), IsSupportedOs());

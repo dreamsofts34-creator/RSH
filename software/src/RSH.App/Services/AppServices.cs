@@ -46,6 +46,7 @@ public sealed class AppServices : IDisposable, ITransportSwitchTarget
         // remotePort na bhejne lage. Ye switch task ke mutabiq hai;
         // real-board compat firmware side ke saath aayega.
         _udpSource = new UdpWheelSource();
+        ApplyUdpSenderFilter(Settings.EspIp);
         Source = _udpSource;
         BoardSession = new BoardSession();
         Source.HelloReplyReceived += OnHelloReply;
@@ -270,10 +271,23 @@ public sealed class AppServices : IDisposable, ITransportSwitchTarget
         return Settings.WheelWifiPassword;
     }
 
+    /// <summary>
+    /// Round 2 B2-06: UDP data socket ka sender filter lagao — HELLO /
+    /// stream datagrams sirf Settings.EspIp se qabool hon. EspIp IP
+    /// address na ho (hostname) to filter nahi lagta (fail-open — purana
+    /// behaviour). Simulator (loopback) ke liye user EspIp ko 127.0.0.1
+    /// rakhe to filter usi se match karta hai.
+    /// </summary>
+    private void ApplyUdpSenderFilter(string espIp)
+    {
+        _udpSource.ExpectedRemoteAddress = System.Net.IPAddress.TryParse(espIp, out var ip) ? ip : null;
+    }
+
     /// <summary>ESP IP badalna = naya HELO client (wahi data socket, naya destination). Sirf Wi-Fi mode mein — serial HELO ka koi IP nahi hota, is liye serial mode mein kuch nahi hota.</summary>
     public void RestartHello(string espIp)
     {
         if (ActiveTransport != TransportKind.Wifi) return; // serial mode: IP ka koi matlab nahi
+        ApplyUdpSenderFilter(espIp);
         Hello.Dispose();
         Hello = new HelloClient(
             token => _udpSource.SendHelloV2Async(espIp, HelloClient.EspHelloPort, newSession: false, token),
@@ -388,6 +402,7 @@ public sealed class AppServices : IDisposable, ITransportSwitchTarget
 
         Source = _udpSource;
         ActiveTransport = TransportKind.Wifi;
+        ApplyUdpSenderFilter(Settings.EspIp); // serial par rehte hue EspIp badla ho to filter taaza karo
         Hello.Dispose();
         Hello = new HelloClient(
             token => _udpSource.SendHelloV2Async(Settings.EspIp, HelloClient.EspHelloPort, newSession: false, token),

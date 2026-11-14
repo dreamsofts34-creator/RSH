@@ -19,7 +19,7 @@
                     <Setter Property="TextElement.Foreground" Value="White" />
                 </DataTrigger>
                 <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource Self}}" Value="2">
-                    <Setter Property="Background" Value="#E3F6EA" />
+                    <Setter Property="Background" Value="{StaticResource RSHSuccessPillBrush}" />
                     <Setter Property="TextElement.Foreground" Value="{StaticResource RSHSuccessTextBrush}" />
                 </DataTrigger>
             </Style.Triggers>

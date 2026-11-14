@@ -7,7 +7,7 @@
 # Runtime 10.x dependency declare karni hogi (msix/README.md dekho),
 # warna install ke baad app runtime ke baghair nahi chalegi.
 PackageIdentifier: dreamsofts34-creator.RSH
-PackageVersion: 2.0.3
+PackageVersion: 2.0.4
 InstallerType: msix
 Architecture: x64
 InstallerUrl: TODO-RELEASE-MSIX-URL

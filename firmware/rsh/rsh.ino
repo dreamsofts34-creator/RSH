@@ -19,6 +19,7 @@
 #include "config_transaction.h"  // FW-4 (Workstream 1): config transaction
 #include "fw34_state.h"    // FW-7/8 wiring: net.cpp/keystore.cpp se accessors
 #include <Preferences.h>   // FW-3/FW-4 NVS glue (boot counter + config slots)
+#include <esp_system.h>  // Round 2 W3 (FIX-4): esp_reset_reason() (status packet)
 #include "net.h"
 #include "webota.h"
 #include "status_led.h"
@@ -68,17 +69,32 @@ static uint8_t fw34_lkg[RSH_CFG_MAX_TOTAL];
 static uint16_t fw34_lkg_len = 0;
 
 // Ek config slot save karo: "<pfx>Len" u16 + "<pfx>0"/"<pfx>1" 1024 B chunks.
-static void fw34_slot_save(Preferences &p, const char *pfx,
+// Return 1 = tamam NVS writes OK, 0 = koi write fail (L3: Preferences
+// putUShort/putBytes ka return pehle ignore hota tha — ab har write check
+// hoti hai; fail par fw34_cfg_save_failed flag lagta hai + RSH_DEBUG par
+// log. Behaviour waisa hi hai: in-RAM config chalti rehti hai, agle boot
+// par LKG/factory fallback pehle se hai).
+static uint8_t fw34_cfg_save_failed = 0;  // L3: aakhri slot save fail hua
+static uint8_t fw34_slot_save(Preferences &p, const char *pfx,
                            const uint8_t *blob, uint16_t len) {
+  uint8_t ok = 1;
   char key[16];
   snprintf(key, sizeof(key), "%sLen", pfx);
-  p.putUShort(key, len);
+  if (p.putUShort(key, len) != sizeof(uint16_t)) ok = 0;
+  uint16_t first = len > 1024 ? 1024 : len;
   snprintf(key, sizeof(key), "%s0", pfx);
-  p.putBytes(key, blob, len > 1024 ? 1024 : len);
+  if (p.putBytes(key, blob, first) != first) ok = 0;
   if (len > 1024) {
     snprintf(key, sizeof(key), "%s1", pfx);
-    p.putBytes(key, blob + 1024, len - 1024);
+    if (p.putBytes(key, blob + 1024, len - 1024) != (size_t)(len - 1024)) ok = 0;
   }
+  if (!ok) {
+    fw34_cfg_save_failed = 1;
+#if RSH_DEBUG
+    Serial.println("RSH: NVS config slot save FAILED");
+#endif
+  }
+  return ok;
 }
 
 // Ek config slot load karo. Return length, ya 0 (maujood nahi / kharab).
@@ -272,6 +288,23 @@ static uint16_t dbgSteerMin = 0xFFFF, dbgSteerMax = 0;
 static uint64_t dbgSteerSum = 0, dbgSteerSqSum = 0;
 static uint32_t dbgSteerN = 0;
 #endif
+
+// Round 2 W3 (FIX-4): status packet ka reset_reason asal wajah bataye —
+// pehle hamesha 1 (power-on) likha jata tha, watchdog/software reboot
+// bhi power-on dikhte thay. Mapping PROTOCOL-V2.1.md §1.2 ke mutabiq:
+// 1 power-on, 2 brown-out, 3 watchdog, 4 software; baaqi 0 (reserved).
+static uint8_t rsh_reset_reason_code() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return 1;
+    case ESP_RST_BROWNOUT: return 2;
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_WDT: return 3;
+    case ESP_RST_SW:
+    case ESP_RST_PANIC: return 4;
+    default: return 0;
+  }
+}
 
 void setup() {
 #if RSH_WIRED_SERIAL
@@ -524,7 +557,7 @@ void loop() {
     st.overruns = (uint16_t)overrunCount;
     st.max_cycle_us = maxCycleUs > 0xFFFF ? 0xFFFF : (uint16_t)maxCycleUs;
     st.governor = inputs_governor().level;
-    st.reset_reason = 1;   // power-on (FW-3: reset-reason mapping baad mein)
+    st.reset_reason = rsh_reset_reason_code();  // FIX-4: asal wajah (pehle hamesha 1)
     st.cfg_crc = rsh_crc32(cfgTxn.current, cfgTxn.current_len);  // Phase G (C3):
     st.cfg_ver = cfgTxn.cfg_version;  // live config ki pehchan — PC push ke
                                       // baad board-apply status packet se nazar aata hai

@@ -12,9 +12,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (jaise v2.0.3)"
+        description: "Release tag (jaise v2.0.4)"
         required: true
-        default: "v2.0.3"
+        default: "v2.0.4"
 
 permissions:
   contents: write
@@ -286,7 +286,7 @@ jobs:
               exit 1
             fi
           done
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "RSH $TAG" --notes-file docs/RELEASE-NOTES-v2.0.3.md \
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "RSH $TAG" --notes-file docs/RELEASE-NOTES-v2.0.4.md \
             artifacts/firmware/firmware-signed.bin \
             artifacts/firmware/RSH-Firmware-DevKitV1-v*.bin \
             artifacts/firmware/SHA256SUMS.txt \

@@ -72,7 +72,9 @@
 // ---- GET_CAPS fixed fields (§3.4) ----
 #define RSH_CAPS_FW_MAJOR 4
 #define RSH_CAPS_FW_MINOR 0
-#define RSH_CAPS_FW_PATCH 0
+#define RSH_CAPS_FW_PATCH 1   // Round 2 W3: 4.0.1 — FIRMWARE_VERSION (config.h) se match lazmi;
+// GET_CAPS/HELLO mein ghalat 4.0.0 PC ki downgrade gate + calibration
+// freshness ko dhoka deta tha (board 4.0.1, PC samajhta 4.0.0).
 #define RSH_CAPS_PROTO_MAJOR 2
 #define RSH_CAPS_PROTO_MINOR 1
 #define RSH_CAPS_N_AXES_MAX 8

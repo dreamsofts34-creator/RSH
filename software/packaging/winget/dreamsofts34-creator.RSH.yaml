@@ -8,7 +8,7 @@
 # Authority: Plan v2.3 §5 Phase H (winget manifest), D22 (MSIX primary).
 # Installer URL + SHA256 release ke baad bharo — yahan guess mat likho.
 PackageIdentifier: dreamsofts34-creator.RSH
-PackageVersion: 2.0.3
+PackageVersion: 2.0.4
 PackageLocale: en-US
 Publisher: RSH
 PublisherUrl: https://github.com/dreamsofts34-creator/RSH
@@ -17,7 +17,7 @@ License: MIT
 ShortDescription: Real Sim Hub — wireless DIY sim-racing wheel (ESP32 + vJoy)
 Description: >-
   RSH turns an ESP32-based DIY sim-racing wheel into a standard game
-  controller (vJoy virtual joystick) on Windows 11. App v2.0.3, firmware
+  controller (vJoy virtual joystick) on Windows 11. App v2.0.4, firmware
   v4.0.0, protocol v2.1.
 Moniker: rsh
 Tags:

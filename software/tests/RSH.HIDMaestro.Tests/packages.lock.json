@@ -11,6 +11,11 @@
           "xunit.v3.mtp-v1": "[3.2.2]"
         }
       },
+      "libsodium": {
+        "type": "Transitive",
+        "resolved": "1.0.19",
+        "contentHash": "tupm/HViwBN6Knd/gckR+cLaJGR39GLmiU4iDMM5hp/1BoczMr8fwJhSU+3/C2V4hi9nBK/4FICRKtTLU30TCA=="
+      },
       "Microsoft.ApplicationInsights": {
         "type": "Transitive",
         "resolved": "2.23.0",
@@ -55,6 +60,14 @@
         "type": "Transitive",
         "resolved": "5.0.0",
         "contentHash": "dDoKi0PnDz31yAyETfRntsLArTlVAVzUzCIvvEDsDsucrl33Dl8pIJG06ePTJTI3tGpeyHS9Cq7Foc/s4EeKcg=="
+      },
+      "NSec.Cryptography": {
+        "type": "Transitive",
+        "resolved": "24.4.0",
+        "contentHash": "R89OF0T5OY9QnPRoTsMCaPKMqtXcWKZSWAO4zyUaFHI+ZRMgXU7WaIwg/rPP3vOfdaLl8HdUHWkDB+2B9FOO7g==",
+        "dependencies": {
+          "libsodium": "[1.0.19, 1.0.20)"
+        }
       },
       "runtime.android-arm.runtime.native.System.IO.Ports": {
         "type": "Transitive",
@@ -237,19 +250,20 @@
       "rsh.core": {
         "type": "Project",
         "dependencies": {
+          "NSec.Cryptography": "[24.4.0, )",
           "System.IO.Ports": "[10.0.0, )"
         }
       },
       "rsh.output.hidmaestro": {
         "type": "Project",
         "dependencies": {
-          "RSH.Core": "[2.0.0, )"
+          "RSH.Core": "[2.0.4, )"
         }
       },
       "rsh.output.vjoy": {
         "type": "Project",
         "dependencies": {
-          "RSH.Core": "[2.0.0, )"
+          "RSH.Core": "[2.0.4, )"
         }
       }
     }

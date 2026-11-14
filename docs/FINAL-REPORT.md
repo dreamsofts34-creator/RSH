@@ -1,3 +1,10 @@
+# ⚠️ SUPERSEDED — ye document ab authority NAHI hai (Architecture polish sweep, 2026-11-13)
+
+**Ye v1.0.0 (2026-11-10, firmware v3, single-file 195 MB exe) ki delivery report hai —
+tareekhi record ke tor par rakhi gayi hai. Current authority: `docs/RELEASE-NOTES-v2.0.3.md`
+(app v2.0.3 / firmware v4.0.0 / protocol v2.1) + `docs/RELEASE-CHECKLIST.md` (v2.0.3 addendum).
+Is file ke version/asset/size ke daawe (v1.0.0, 10 pages, 195 MB) current release par laagu nahi hote.**
+
 # RSH — Final Delivery Report (Software v1.0.0)
 
 Date: 2026-11-10 · By Dreamsofts · Companion to firmware v3 (DevKit V1, delivered separately)

@@ -8,7 +8,7 @@ namespace RSH.Core.Transport;
 /// ESP ko zinda rakhne wala hissa: har 1 second HELO bhejta hai
 /// (firmware 2 s tak intezar karta hai, phir khamosh ho jata hai).
 ///
-/// SEC-D-08 (Phase D): HELO 5 byte ka hota hai — "HELO" + proto
+/// SEC-D-08 (Phase D): HELO 6 byte ka hota hai — "HELO" + proto
 /// <c>0x02</c> + sessionFlag (PROTOCOL-V2.1.md §2.1). Purana 4-byte
 /// HELO (na proto, na sessionFlag) hijack ka rasta tha: firmware
 /// pehle 4 bytes dekhte hi pcIp overwrite kar deta tha. Ab board
@@ -45,7 +45,7 @@ public sealed class HelloClient : IDisposable
     public const int EspHelloPort = 4210;
 
     /// <summary>
-    /// v2 HELO frame (5 B, §2.1): "HELO" | proto 0x02 | sessionFlag
+    /// v2 HELO frame (6 B, §2.1): "HELO" | proto 0x02 | sessionFlag
     /// (0 = resume, 1 = naya session). 4-byte HELO legacy v1 hai —
     /// us ka koi reply nahi aata aur firmware use hijack kar sakta
     /// tha (SEC-D-08), is liye naya code hamesha yahi bhejta hai.

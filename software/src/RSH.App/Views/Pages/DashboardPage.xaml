@@ -10,13 +10,13 @@
         <Style x:Key="Pill" TargetType="Border">
             <Setter Property="CornerRadius" Value="20" />
             <Setter Property="Padding" Value="12,5" />
-            <Setter Property="Background" Value="#FDE8E8" />
-            <Setter Property="TextElement.Foreground" Value="#B42318" />
+            <Setter Property="Background" Value="{StaticResource RSHDangerPillBrush}" />
+            <Setter Property="TextElement.Foreground" Value="{StaticResource RSHErrorBrush}" />
             <Setter Property="TextElement.FontWeight" Value="SemiBold" />
             <Setter Property="TextElement.FontSize" Value="12" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding WheelConnected}" Value="True">
-                    <Setter Property="Background" Value="#E3F6EA" />
+                    <Setter Property="Background" Value="{StaticResource RSHSuccessPillBrush}" />
                     <Setter Property="TextElement.Foreground" Value="{StaticResource RSHSuccessTextBrush}" />
                 </DataTrigger>
             </Style.Triggers>

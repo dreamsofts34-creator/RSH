@@ -131,7 +131,7 @@
 #define HELLO_TIMEOUT_MS 2000   // itni der HELO na aye to bhejna band
 
 // ---------- Advanced features ----------
-#define FIRMWARE_VERSION "4.0.0"
+#define FIRMWARE_VERSION "4.0.1"
 
 // OTA: WiFi par firmware update (USB cable ke baghair). Arduino IDE mein
 // network port "rsh" nazar ayega. Update ke doran sampling ruk jati

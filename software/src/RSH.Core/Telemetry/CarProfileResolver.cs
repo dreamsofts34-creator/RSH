@@ -41,11 +41,23 @@ public static class CarProfileResolver
             var ordered = profiles.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase).ToList();
 
             // 1) Car-specific: CarModel mile + Game mile (ya profile kisi bhi game ki ho).
+            // DATA-AI FIX (Medium): pehle EXACT game match, phir any-game —
+            // warna naam se pehle aane wala any-game profile game-specific
+            // profile ko hara deta tha (misal "A Generic" vs "Z AC Only":
+            // AC snapshot par generic jeet jata tha, user ki AC-specific
+            // tuning kabhi lagti hi nahi thi).
             foreach (var p in ordered)
             {
                 if (p.CarModel.Length == 0) continue;
                 if (!string.Equals(TelemetryNormalization.NormalizeCarKey(p.CarModel), carKey, StringComparison.Ordinal)) continue;
-                if (p.Game != GameId.Unknown && p.Game != snap.Game) continue;
+                if (p.Game != snap.Game) continue;
+                return p;
+            }
+            foreach (var p in ordered)
+            {
+                if (p.CarModel.Length == 0) continue;
+                if (!string.Equals(TelemetryNormalization.NormalizeCarKey(p.CarModel), carKey, StringComparison.Ordinal)) continue;
+                if (p.Game != GameId.Unknown) continue;
                 return p;
             }
 

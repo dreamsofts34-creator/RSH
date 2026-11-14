@@ -1,3 +1,9 @@
+# ⚠️ SUPERSEDED — ye document ab authority NAHI hai (Architecture polish sweep, 2026-11-13)
+
+**Ye v1-era plan hai (2026-11-10, protocol v1 18-byte) — tareekhi record ke tor par rakha
+gaya hai. Current authority: `~/workspace/projects/rsh/RSH-SOFTWARE-PLAN.md` (FINAL, SW-1–SW-16)
++ `RSH-PLAN-v2.3.md` §5. Is file ke protocol/architecture ke daawe current code par laagu nahi hote.**
+
 # RSH — PC Software Plan (2026-11-10)
 
 Usool: research first (stack facts official sources se verify ho rahe hain),

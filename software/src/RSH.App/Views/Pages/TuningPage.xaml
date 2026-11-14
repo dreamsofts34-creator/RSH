@@ -47,10 +47,10 @@
             <Setter Property="CornerRadius" Value="10" />
             <Setter Property="Padding" Value="8,2" />
             <Setter Property="Margin" Value="8,0,0,0" />
-            <Setter Property="Background" Value="#E3F6EA" />
+            <Setter Property="Background" Value="{StaticResource RSHSuccessPillBrush}" />
             <Style.Triggers>
                 <DataTrigger Binding="{Binding Enabled}" Value="False">
-                    <Setter Property="Background" Value="#EDEBF5" />
+                    <Setter Property="Background" Value="{StaticResource RSHMutedPillBrush}" />
                 </DataTrigger>
             </Style.Triggers>
         </Style>
@@ -213,7 +213,7 @@
                         <StackPanel Visibility="{Binding HasCalibration, Converter={StaticResource BoolVis}}">
                             <TextBlock Text="{Binding Endpoints, Source={x:Static res:UiStrings.Instance}}" FontWeight="SemiBold" FontSize="14" />
                             <TextBlock Text="{Binding EndpointText}" Style="{StaticResource AxMuted}" Margin="0,4,0,0" />
-                            <TextBlock Text="{Binding EndpointsWarning}" Foreground="#B42318" FontSize="13" FontWeight="SemiBold" Margin="0,4,0,0"
+                            <TextBlock Text="{Binding EndpointsWarning}" Foreground="{StaticResource RSHErrorBrush}" FontSize="13" FontWeight="SemiBold" Margin="0,4,0,0"
                                        Visibility="{Binding HasEndpointsWarning, Converter={StaticResource BoolVis}}" />
                             <TextBlock Text="{Binding EndpointsComeFromCalibrationAdjust, Source={x:Static res:UiStrings.Instance}}" Style="{StaticResource AxMuted}" Margin="0,4,0,0" />
                         </StackPanel>

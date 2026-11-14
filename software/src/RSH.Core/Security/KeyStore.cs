@@ -81,6 +81,16 @@ public sealed class KeyStore : IKeyStore, IDisposable
     private readonly ConcurrentDictionary<string, string> _memoryPasswords = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
 
+    /// <summary>
+    /// DATA-AI FIX: DPAPI blob ki size cap (64 KB — asal blob chand sau
+    /// bytes ka hota hai). Pehle File.ReadAllBytes uncapped tha: koi bhi
+    /// local process keys folder mein GBs ka planted blob rakh kar OOM
+    /// kara sakta tha, aur OutOfMemoryException BoardSession ke catch
+    /// (sirf ObjectDisposed/InvalidOperation) se bahir nikal jata tha.
+    /// Cap se bara blob kharab mana jata hai (false — re-pairing).
+    /// </summary>
+    public const long MaxBlobBytes = 65_536;
+
     public bool IsPersistent { get; }
 
     /// <summary>Default root: Windows `%AppData%\RSH\keys`, warna `~/.config/RSH/keys` (sirf naam — non-Windows par file banti hi nahi).</summary>
@@ -264,10 +274,25 @@ public sealed class KeyStore : IKeyStore, IDisposable
         {
             string path = Path.Combine(_root, boardId + suffix);
             if (!File.Exists(path)) return false;
-            blob = File.ReadAllBytes(path);
+            // Capped read (MaxBlobBytes) — File.ReadAllBytes kabhi poori
+            // file RAM mein na laye (upar dekho).
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (stream.Length > MaxBlobBytes) return false;
+            using var capped = new MemoryStream();
+            byte[] buffer = new byte[8192];
+            int read;
+            long total = 0;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                total += read;
+                if (total > MaxBlobBytes) return false;
+                capped.Write(buffer, 0, read);
+            }
+            blob = capped.ToArray();
         }
         catch (IOException) { return false; }
         catch (UnauthorizedAccessException) { return false; }
+        catch (OutOfMemoryException) { return false; }
         plain = Unprotect(blob);
         Clear(blob);
         return plain is not null;

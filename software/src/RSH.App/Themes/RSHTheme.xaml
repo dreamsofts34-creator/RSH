@@ -59,11 +59,18 @@
          error light #B42318 (6.6:1) / dark #FF9D94 (8.9:1),
          warning light #B54708 (5.4:1) / dark #F5B544 (9.8:1),
          banner light #FFF4E5 / dark #3A2C10 (inherited text se 12-15:1),
-         success #146C35 halki pill #E3F6EA par 5.2:1 (pehle #17803D 4.45:1 tha). -->
+         success light #146C35 pill #E3F6EA par 5.8:1 / dark #7ED491 pill
+         #1D3A28 par 6.9:1 (Round 2 W1 — pehle Dark mein #146C35 tha,
+         dark card par 2.7:1). -->
     <SolidColorBrush x:Key="RSHErrorBrush" Color="{DynamicResource RSHErrorColor}" />
     <SolidColorBrush x:Key="RSHWarningTextBrush" Color="{DynamicResource RSHWarningTextColor}" />
     <SolidColorBrush x:Key="RSHBannerBrush" Color="{DynamicResource RSHBannerColor}" />
     <SolidColorBrush x:Key="RSHSuccessTextBrush" Color="{DynamicResource RSHSuccessTextColor}" />
+    <!-- Round 2 W1: theme-aware status pills (Dashboard Pill / Setup Chip /
+         Tuning OnChip — pehle hard-coded halke rang Dark mein dhabbe thay). -->
+    <SolidColorBrush x:Key="RSHSuccessPillBrush" Color="{DynamicResource RSHSuccessPillColor}" />
+    <SolidColorBrush x:Key="RSHDangerPillBrush" Color="{DynamicResource RSHDangerPillColor}" />
+    <SolidColorBrush x:Key="RSHMutedPillBrush" Color="{DynamicResource RSHMutedPillColor}" />
 
     <!-- UI-12: keyboard focus — dashed accent outline, har focusable
          custom control par (WPF-UI controls ki apni focus visual hai). -->

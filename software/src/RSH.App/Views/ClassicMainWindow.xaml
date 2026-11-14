@@ -1,0 +1,78 @@
+<Window x:Class="RSH.App.Views.ClassicMainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="RSH — Real Sim Hub" Height="700" Width="1100" MinHeight="580" MinWidth="920"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="Segoe UI" FontSize="14"
+        Background="{x:Static SystemColors.WindowBrush}">
+    <!-- v2.0.4 — REAL classic window: plain System.Windows.Window, OS title
+         bar. Koi ui:FluentWindow, koi ui:TitleBar, koi WindowBackdropType /
+         ExtendsContentIntoTitleBar, koi WPF-UI window chrome nahi.
+         v2.0.3 ka "classic" asal mein FluentWindow hi rehta tha (sirf 3
+         properties flip hoti thin) — is liye Win10 par blank rehta tha.
+         SHELL (neeche) mein koi UiStrings binding, koi DynamicResource
+         RSH* aur koi StaticResource RSH* nahi — sirf literal English
+         text + x:Static SystemColors + literal accent #6C4CF1 (wahi jo
+         ApplyPlainNavigation code-behind mein lagata hai). Missing
+         DynamicResource = null = invisible content — shell is se aazaad hai.
+         RSHTheme.xaml merge SIRF hosted PAGES ke liye hai (un ke
+         StaticResource RSHBannerBrush/RSHTextBrush/RSHBackgroundBrush
+         sirf isi merge mein define hain — App-level Theme.xaml mein
+         nahi; merge hataya to har page StaticResource-not-found par
+         throw karega). Pages shared hain, unhein nahi chheda. -->
+    <Window.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="../Themes/RSHTheme.xaml" />
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </Window.Resources>
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="206" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <Border Grid.Column="0" x:Name="SidebarBorder" Background="{x:Static SystemColors.WindowBrush}"
+                BorderBrush="{x:Static SystemColors.ControlDarkBrush}"
+                BorderThickness="0,0,1,0" Padding="14,20">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                    <StackPanel>
+                        <StackPanel Orientation="Horizontal" Margin="6,0,0,18">
+                            <Border x:Name="LogoBadge" Width="32" Height="32" CornerRadius="10"
+                                    Background="#6C4CF1">
+                                <TextBlock x:Name="LogoLetter" Text="R" Foreground="White"
+                                           FontWeight="Bold" FontSize="16"
+                                           HorizontalAlignment="Center" VerticalAlignment="Center" />
+                            </Border>
+                            <StackPanel VerticalAlignment="Center" Margin="10,0,0,0">
+                                <TextBlock x:Name="LogoTitle" Text="RSH" FontSize="16" FontWeight="Bold"
+                                           Foreground="{x:Static SystemColors.ControlTextBrush}" />
+                                <TextBlock x:Name="LogoSubtitle" Text="Real Sim Hub" FontSize="11"
+                                           Foreground="{x:Static SystemColors.ControlTextBrush}" />
+                            </StackPanel>
+                        </StackPanel>
+
+                        <!-- 8 screens, spec §0.2 order — MainWindow jaisi hi -->
+                        <RadioButton x:Name="NavDashboard" Content="Dashboard" AutomationProperties.Name="Dashboard" Tag="Dashboard" GroupName="nav" Foreground="{x:Static SystemColors.ControlTextBrush}" Checked="Nav_Checked" />
+                        <RadioButton x:Name="NavTuning" Content="Tuning" AutomationProperties.Name="Tuning" Tag="Tuning" GroupName="nav" Foreground="{x:Static SystemColors.ControlTextBrush}" Checked="Nav_Checked" />
+                        <RadioButton x:Name="NavSetup" Content="Setup" AutomationProperties.Name="Setup" Tag="Setup" GroupName="nav" Foreground="{x:Static SystemColors.ControlTextBrush}" Checked="Nav_Checked" />
+                        <RadioButton x:Name="NavButtons" Content="Buttons" AutomationProperties.Name="Buttons" Tag="Buttons" GroupName="nav" Foreground="{x:Static SystemColors.ControlTextBrush}" Checked="Nav_Checked" />
+                        <RadioButton x:Name="NavOutput" Content="Output" AutomationProperties.Name="Output" Tag="Output" GroupName="nav" Foreground="{x:Static SystemColors.ControlTextBrush}" Checked="Nav_Checked" />
+                        <RadioButton x:Name="NavProfiles" Content="Profiles" AutomationProperties.Name="Profiles" Tag="Profiles" GroupName="nav" Foreground="{x:Static SystemColors.ControlTextBrush}" Checked="Nav_Checked" />
+                        <RadioButton x:Name="NavMonitor" Content="Monitor" AutomationProperties.Name="Monitor" Tag="Monitor" GroupName="nav" Foreground="{x:Static SystemColors.ControlTextBrush}" Checked="Nav_Checked" />
+                    </StackPanel>
+                </ScrollViewer>
+                <RadioButton Grid.Row="1" x:Name="NavSettings" Content="Settings" AutomationProperties.Name="Settings" Tag="Settings" GroupName="nav" Foreground="{x:Static SystemColors.ControlTextBrush}" Checked="Nav_Checked" />
+            </Grid>
+        </Border>
+
+        <ContentControl Grid.Column="1" x:Name="PageHost" Focusable="False"
+                        Foreground="{x:Static SystemColors.ControlTextBrush}" />
+    </Grid>
+</Window>

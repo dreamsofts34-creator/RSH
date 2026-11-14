@@ -34,4 +34,10 @@
     <Color x:Key="RSHWarningTextColor">#B54708</Color>
     <Color x:Key="RSHBannerColor">#FFF4E5</Color>
     <Color x:Key="RSHSuccessTextColor">#146C35</Color>
+    <!-- Round 2 W1: status pills theme-aware hon — pehle #E3F6EA / #FDE8E8 /
+         #EDEBF5 pages mein hard-coded thay, Dark mein halke dhabbe lagte
+         thay. Light values wahi purani hain (koi visual change nahi). -->
+    <Color x:Key="RSHSuccessPillColor">#E3F6EA</Color>
+    <Color x:Key="RSHDangerPillColor">#FDE8E8</Color>
+    <Color x:Key="RSHMutedPillColor">#EDEBF5</Color>
 </ResourceDictionary>

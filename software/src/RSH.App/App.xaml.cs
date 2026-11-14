@@ -46,15 +46,17 @@ public partial class App : Application
         // ya MainWindow banne se pehle bhi koi failure ho to file mein likha
         // ho. Pehle Log.Logger sirf AppServices ke baad banta tha — us se
         // pehle ki exception bilkul invisible thi (koi log, koi crash nahi).
-        var bootstrapLogDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RSH", "logs");
-        Directory.CreateDirectory(bootstrapLogDir);
-        Log.Logger = new LoggerConfiguration()
-            .MinimumLevel.Is(LogEventLevel.Information)
-            .WriteTo.File(Path.Combine(bootstrapLogDir, "rsh-.log"),
-                rollingInterval: RollingInterval.Day, retainedFileCountLimit: 7, shared: true,
-                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
-            .CreateLogger();
+        // v2.0.4 — NO-LOGS AUDIT ka hal: BootstrapLogging helper (ek hi
+        // logic, dono logger-config jagah): primary %AppData%\RSH\logs
+        // likhne-layak na ho to %TEMP%\RSH\logs fallback, aur Serilog
+        // SelfLog ON (%TEMP%\RSH\serilog-selflog.txt) taake sink ki
+        // khamosh failure nazar aaye. Pehle: na fallback tha, na SelfLog,
+        // aur Directory.CreateDirectory try/catch ke bahar tha.
+        BootstrapLogging.ConfigureLogger(
+            LogEventLevel.Information, out bool bootstrapFallback);
+        if (bootstrapFallback)
+            Log.Warning("Primary log directory not writable — bootstrap logs going to fallback {FallbackDir}",
+                BootstrapLogging.FallbackLogDirectory);
         // v2.0.2 HOTFIX: version assembly se lo (hard-code nahi) — taake
         // agle report se foran pata chale kaunsi binary chali thi. Dono
         // likho agar farq ho (informational mein commit hash bhi hota hai).
@@ -66,6 +68,17 @@ public partial class App : Application
         else
             Log.Information("RSH started v{DisplayVersion} (assembly {AssemblyVersion})",
                 appVersion.DisplayVersion, appVersion.AssemblyVersion);
+        // v2.0.4 — startup milestones ka second channel (Serilog se azaad):
+        // %TEMP%\RSH\startup-status.txt — fresh file har run, taake log na
+        // bhi mile to pata chale startup kahan tak pohancha tha.
+        StartupStatus.Reset(appVersion.DisplayVersion);
+        // v2.0.4 — log ki FULL PATH likho (log + status file dono mein):
+        // Serilog rolling naam mein dashes NAHI hote (rsh-20261111.log,
+        // rsh-2026-11-11.log nahi) — user dashed naam dhoondh raha tha.
+        // Exact path likhne se agle run par koi andaza nahi lagana parega.
+        string logFilePath = BootstrapLogging.CurrentLogFilePath;
+        Log.Information("Log file: {LogFile}", logFilePath);
+        StartupStatus.Write($"log file: {logFilePath}");
 
         // v2.0.2 HOTFIX — version-aware single instance: mutex/pipe naam
         // mein version hai (Global\RSH.SingleInstance.2.0.2 jaisa), is liye
@@ -74,6 +87,18 @@ public partial class App : Application
         // file version < current — SingleInstanceCoordinator dekho); cleanup
         // fail ho to bhi startup nahi rukti, versioned mutex phir bhi
         // same-version duplicates rokta hai.
+        // QA F4 (LOW) NOTE — is scan ko Show() ke baad / background par
+        // NAHI le jaya gaya (jaan-boojh kar): ye purane version ko is
+        // liye PEHLE maarta hai taake neeche AppServices ctor shared
+        // settings.json / profiles.json parhne se pehle purana instance
+        // mar chuka ho — warna purana instance (tray toggle /
+        // auto-switch timer) naye instance ke stale in-memory snapshot
+        // ke saath file par likh sakta hai (lost update) aur dono
+        // engines thodi der saath chalte. Aam case mein cost sirf
+        // legacy-mutex probe hai (process enum + Kill/Wait tabhi jab
+        // purana instance asal mein mojood ho — tab correctness
+        // delay se zyada ahem hai). TryAcquire / settings load se
+        // pehle rehna lazmi hai; is block ko neeche mat sarkao.
         if (OperatingSystem.IsWindows())
         {
             try
@@ -164,11 +189,28 @@ public partial class App : Application
         bool classicFlag = e.Args.Contains("--classic-window");
         bool fluentFlag = e.Args.Contains("--fluent-window");
         bool plainNavFlag = e.Args.Contains("--plain-nav");
+        // v2.0.4 — OS version DO zariyon se (belt-and-braces): Environment.OSVersion
+        // (manifest par inhisar — shipped exe mein manifest verify hai: RT_MANIFEST
+        // maujood, source se byte-identical — aur .NET 5+ waise bhi sahi version
+        // deta hai) aur RtlGetVersion-based OperatingSystem.IsWindowsVersionAtLeast
+        // (manifest-independent). Faisla RtlGetVersion se hota hai — Win11
+        // boundary (build 22000) ke liye wahi authority. Dono mein farq ho to
+        // WARNING log karo — yehi asal diagnostic hai (agar Environment.OSVersion
+        // kabhi jhoot bole to log mein nazar aaye).
         Version osVersion = OperatingSystem.IsWindows()
             ? Environment.OSVersion.Version
             : new Version(0, 0);
+        bool rtlWin11OrNewer = OperatingSystem.IsWindows()
+            && OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000);
+        bool envWin11OrNewer = OperatingSystem.IsWindows()
+            && !WindowChromePolicy.RequiresClassicWindow(osVersion);
+        if (OperatingSystem.IsWindows() && rtlWin11OrNewer != envWin11OrNewer)
+        {
+            Log.Warning("OS version sources disagree: Environment.OSVersion={OSVersion} (Win11+={EnvWin11}) vs RtlGetVersion Win11+={RtlWin11} — using RtlGetVersion for the window decision",
+                osVersion, envWin11OrNewer, rtlWin11OrNewer);
+        }
         ClassicWindowRequested = OperatingSystem.IsWindows()
-            && WindowChromePolicy.ShouldUseClassicWindow(osVersion, classicFlag, fluentFlag);
+            && WindowChromePolicy.ShouldUseClassicWindow(rtlWin11OrNewer, classicFlag, fluentFlag);
         // v2.0.3 HOTFIX — Win10 par AUTOMATIC plain navigation: classic
         // chrome ke saath sidebar bhi original-style saada ho (literal
         // text + system brushes, UiStrings/DynamicResource bindings
@@ -176,7 +218,7 @@ public partial class App : Application
         // dono fallbacks ek saath auto ON. Win11+ par modern sidebar
         // waisa hi. --plain-nav force-on, --fluent-window dono ko off.
         PlainNavigationRequested = OperatingSystem.IsWindows()
-            && WindowChromePolicy.ShouldUsePlainNavigation(osVersion, plainNavFlag, fluentFlag);
+            && WindowChromePolicy.ShouldUsePlainNavigation(rtlWin11OrNewer, plainNavFlag, fluentFlag);
         string chromeReason = OperatingSystem.IsWindows()
             ? WindowChromePolicy.DescribeDecision(osVersion, ClassicWindowRequested)
             : "non-Windows — classic window not applicable";
@@ -186,6 +228,9 @@ public partial class App : Application
         Log.Information("Navigation: {NavMode} (OS {OSVersion}, plain-nav-flag={PlainNavFlag}, fluent-flag={FluentFlag})",
             PlainNavigationRequested ? "plain navigation (original-style sidebar)" : "modern navigation",
             osVersion, plainNavFlag, fluentFlag);
+        StartupStatus.Write(OperatingSystem.IsWindows()
+            ? $"OS {osVersion} — {(ClassicWindowRequested ? "classic window" : "FluentWindow")} / {(PlainNavigationRequested ? "plain navigation" : "modern navigation")}"
+            : "non-Windows — classic window not applicable");
 
         // (Purana unversioned single-instance + duplicate AppServices block
         // yahan tha — v2.0.2 mein upar versioned block se replace ho gaya;
@@ -197,6 +242,13 @@ public partial class App : Application
         DispatcherUnhandledException += (_, args) =>
         {
             Log.Error(args.Exception, "Unhandled UI exception (handled, app continues)");
+            // v2.0.4 — handler HATAO mat (v2.0.1 resilience: crash se
+            // bachata hai), lekin swallowed exception ko status file mein
+            // bhi likho — warna UI-thread exception (render/layout pass
+            // se aane wali bhi) nigal kar app "khaali shell" ki tarah
+            // chalti rehti hai aur diagnostics mein kuch nazar nahi aata.
+            // StartupStatus.WriteException kabhi throw nahi karta.
+            StartupStatus.WriteException("Unhandled UI exception (handled, app continues)", args.Exception);
             args.Handled = true;
         };
 
@@ -223,15 +275,14 @@ public partial class App : Application
             // sakta tha. Default ab Information hai.
             _ => LogEventLevel.Information,
         };
-        Log.Logger = new LoggerConfiguration()
-            .MinimumLevel.Is(level)
-            // AUDIT FIX (F4): shared: true — Diagnostics zip export aaj ki
-            // log file ko likhte hue bhi parh sake (warna sharing
-            // violation par export aksar fail hota tha).
-            .WriteTo.File(Path.Combine(_services.LogDirectory, "rsh-.log"),
-                rollingInterval: RollingInterval.Day, retainedFileCountLimit: 7, shared: true,
-                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
-            .CreateLogger();
+        // v2.0.4 — DOBARA CONFIG NAHI: logger EK dafa bootstrap par ban
+        // chuka hai; yahan sirf settings wala level lagao
+        // (LoggingLevelSwitch — logger replace nahi hota). REPRO NOTE:
+        // replace se lines nahi khotin (shared:true sink foran likhta
+        // hai) — single-config hygiene hai, no-logs ka root cause nahi.
+        BootstrapLogging.SetMinimumLevel(level);
+        Log.Information("Log directory: {LogDirectory} (today's log file: {LogFile})",
+            BootstrapLogging.CurrentLogDirectory, BootstrapLogging.CurrentLogFilePath);
 
         WindowsIntegration.BeginHighResolutionTimer();
 
@@ -242,7 +293,14 @@ public partial class App : Application
         {
             _services.Settings.Theme = "Light";
             _services.Settings.ThemeMigratedV12 = true;
-            _services.SaveSettings();
+            // QA F3 (LOW, U-P1): sync SaveSettings() UI thread par file
+            // likhta tha — async rasta (file I/O background par; fail ho
+            // to log, startup nahi rukti). In-memory theme pehle se set
+            // hai (neeche ApplyTheme), save sirf persist karta hai.
+            _ = _services.SaveSettingsAsync().ContinueWith(
+                static t => Log.Error(t.Exception, "Theme migration save failed"),
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
         }
 
         // Brand accent — reference wala violet, poori app mein ek hi.
@@ -261,9 +319,19 @@ public partial class App : Application
         // hai (behaviour waisa hi — sirf diagnose ho sakta hai).
         try
         {
-            var mainWindow = new MainWindow(_services);
+            // v2.0.4 — REAL classic window: ClassicWindowRequested ho to
+            // plain System.Windows.Window (ClassicMainWindow), warna
+            // MainWindow (FluentWindow) bilkul waisa hi. v2.0.3 ka
+            // "classic" asal mein FluentWindow hi rehta tha (sirf 3
+            // properties flip hoti thin) — is liye Win10 par blank rehta
+            // tha. MainWindow property type Window hai — dono fit hote
+            // hain; Show()/WindowState/wizard Owner sab base type par.
+            Window mainWindow = App.ClassicWindowRequested
+                ? new ClassicMainWindow(_services)
+                : new MainWindow(_services);
             MainWindow = mainWindow;
-            Log.Information("Main window created");
+            Log.Information("Main window created ({WindowType})", mainWindow.GetType().Name);
+            StartupStatus.Write($"window created ({mainWindow.GetType().Name})");
 
             bool startMinimized = _services.Settings.StartMinimized
                                   || e.Args.Contains("--minimized");
@@ -318,6 +386,9 @@ public partial class App : Application
         mainWindow.Show();
         Log.Information("Main window shown{Minimized}",
             startMinimized && _services.Settings.WizardCompleted ? " minimized" : "");
+        StartupStatus.Write(startMinimized && _services.Settings.WizardCompleted
+            ? "window shown (minimized)"
+            : "window shown");
 
         _ = Task.Run(() =>
         {
@@ -325,6 +396,7 @@ public partial class App : Application
             {
                 _services.StartRuntime();
                 Log.Information("RSH runtime started");
+                StartupStatus.Write("runtime started");
             }
             catch (Exception ex)
             {
@@ -334,11 +406,26 @@ public partial class App : Application
 
         if (!_services.Settings.WizardCompleted)
         {
-            // Pehli dafa wizard lazmi hai — minimized start par bhi.
-            Log.Information("Showing first-run wizard");
-            var wizard = new WizardWindow(_services) { Owner = mainWindow };
-            wizard.ShowDialog();
-            Log.Information("First-run wizard closed");
+            if (App.ClassicWindowRequested)
+            {
+                // v2.0.4 — classic mode mein FluentWindow wizard NA kholo:
+                // wizard bhi FluentWindow hai (Views/WizardWindow.xaml:1)
+                // aur classic path ka maqsad hi Fluent chrome se bachna
+                // hai. Setup screen mein wahi steps hain (Connect → Pins
+                // → Calibrate), is liye skip safe degradation hai, feature
+                // change nahi. Win11 par wizard waisa hi.
+                Log.Warning("First-run wizard skipped in classic mode — use Setup screen");
+                StartupStatus.Write("wizard skipped (classic mode — use Setup screen)");
+            }
+            else
+            {
+                // Pehli dafa wizard lazmi hai — minimized start par bhi.
+                Log.Information("Showing first-run wizard");
+                var wizard = new WizardWindow(_services) { Owner = mainWindow };
+                wizard.ShowDialog();
+                Log.Information("First-run wizard closed");
+                StartupStatus.Write("wizard closed");
+            }
         }
         }
         catch (Exception ex)

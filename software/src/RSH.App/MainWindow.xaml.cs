@@ -9,6 +9,7 @@ using RSH.App.Themes;
 using RSH.App.ViewModels;
 using RSH.App.Views;
 using RSH.App.Views.Pages;
+using RSH.Core.Windows;
 using Serilog;
 using Wpf.Ui.Controls;
 
@@ -26,6 +27,11 @@ public partial class MainWindow : FluentWindow
     {
         _services = services;
         InitializeComponent();
+
+        // v2.0.4 — version window title mein (assembly se, hard-code nahi)
+        // taake user ki photo se hi version confirm ho. XAML ki Title
+        // binding ko override karta hai — jaan-boojh kar.
+        Title = WindowTitle.ForAssembly(typeof(App).Assembly);
 
         // v2.0.2 diagnostic flag --classic-window, v2.0.3 Win10 par
         // AUTOMATIC: FluentWindow ka ExtendsContentIntoTitleBar chrome
@@ -67,6 +73,9 @@ public partial class MainWindow : FluentWindow
 
         Loaded += (_, _) =>
         {
+            // v2.0.4 — Loaded milestone (ClassicMainWindow jaisa): status
+            // file bataye ke Loaded fire hua ya nahi.
+            StartupStatus.Write("main window loaded (Loaded fired)");
             // v2.0.1 HOTFIX (P0 blank window): pehle ye ek hi lambda tha —
             // kisi ek step mein exception (khaas taur par SetupTray mein
             // NotifyIcon.Register fail) baaqi sab maar deti thi: na tray,
@@ -261,6 +270,7 @@ public partial class MainWindow : FluentWindow
             PageHost.Content = page;
             _currentPage = page;
             Log.Information("Navigated to {Page}", tag);
+            StartupStatus.Write($"navigated to {tag}");
         }
         catch (Exception ex)
         {
@@ -306,7 +316,14 @@ public partial class MainWindow : FluentWindow
         outputItem.Click += (_, _) =>
         {
             _services.Settings.OutputEnabled = outputItem.IsChecked;
-            _services.SaveSettings();
+            // QA F3 (LOW, U-P1): sync SaveSettings() UI thread par file
+            // likhta tha — async rasta; in-memory setting foran lagti
+            // hai, engine apply (OutputEnabled) file write ke baad
+            // background par hota hai (SaveSettingsAsync dekho).
+            _ = _services.SaveSettingsAsync().ContinueWith(
+                static t => Log.Error(t.Exception, "Tray output toggle save failed"),
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
         };
         menu.Items.Add(outputItem);
 

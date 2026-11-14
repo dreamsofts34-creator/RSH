@@ -38,5 +38,13 @@
     <Color x:Key="RSHErrorColor">#FF9D94</Color>
     <Color x:Key="RSHWarningTextColor">#F5B544</Color>
     <Color x:Key="RSHBannerColor">#3A2C10</Color>
-    <Color x:Key="RSHSuccessTextColor">#146C35</Color>
+    <!-- Round 2 W1: success text Dark mein #146C35 tha — dark card par
+         2.7:1, na-parhne-layak. #7ED491 apni pill #1D3A28 par 6.9:1 hai.
+         Pill rang Dark mein gehre tints hain (Light values Light palette
+         mein wahi purani hain); success text sirf pill par istemal hota
+         hai (Dashboard/Setup/Tuning), is liye ye tabdeeli mehfooz hai. -->
+    <Color x:Key="RSHSuccessTextColor">#7ED491</Color>
+    <Color x:Key="RSHSuccessPillColor">#1D3A28</Color>
+    <Color x:Key="RSHDangerPillColor">#3D1F1F</Color>
+    <Color x:Key="RSHMutedPillColor">#232936</Color>
 </ResourceDictionary>

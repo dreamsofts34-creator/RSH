@@ -171,6 +171,15 @@ public static class PinMap
                     return (null, $"GPIO {p} is input-only — a button here needs an external pull-up resistor.");
                 if (p is 21 or 22)
                     return (null, "GPIO 21/22 is the I²C bus — unavailable while expanders are used.");
+                // W3 FIX-2 (Round 2 W2, PC-side warning): GPIO 25/26 fixed
+                // pedal button-mode pins hain (config.h PIN_ACCEL_BTN 25,
+                // PIN_BRAKE_BTN 26). Koi bhi digital function (horn, gear,
+                // encoder) in par assign ho to board us pedal button ko
+                // suppress karta hai (inputs.cpp: pinmap-uses-pin check) —
+                // sahi behaviour hai, lekin user ko pata hona chahiye.
+                // Warning hai, error nahi — Apply phir bhi allowed hai.
+                if (p is 25 or 26)
+                    return (null, $"GPIO {p} is the fixed {(p == 25 ? "accelerator" : "brake")} pedal button pin — assigning '{function.Name}' here suppresses that pedal button.");
                 break;
             case PinFunctionKind.StatusLed:
                 if (InputOnlyPins.Contains(p))
@@ -232,26 +241,60 @@ public sealed class PinMapStore
 
     public string FilePath => _filePath;
 
+    /// <summary>SEC-C-11 jaisi size cap (pin-map chand KB ka hota hai) — is se bari file kharab mani jati hai.</summary>
+    public const long MaxFileBytes = 65_536;
+
     public Dictionary<string, int?> Load()
     {
         try
         {
             if (!File.Exists(_filePath)) return PinMap.Defaults();
-            string json = File.ReadAllText(_filePath);
-            var raw = JsonSerializer.Deserialize<Dictionary<string, int?>>(json);
-            if (raw is null) return PinMap.Defaults();
+            // DATA-AI FIX (Medium): pehle File.ReadAllText (uncapped) +
+            // poori-dict deserialize tha — ek kharab entry (misal pin ki
+            // jagah string) poori file ko defaults par gira deti thi aur
+            // user ka saara pin map kho jata tha (ProfileStore ka F3
+            // tolerance yahan nahi tha). Ab capped read + har entry alag
+            // se parse: kharab/na-maloom entry skip, baqi mehfooz rehti hain.
+            string? json = TryReadCapped(_filePath);
+            if (json is null) return PinMap.Defaults();
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return PinMap.Defaults();
             var map = PinMap.Defaults();
-            foreach (var (name, pin) in raw)
+            foreach (var prop in doc.RootElement.EnumerateObject())
             {
-                if (!PinMap.Functions.Any(f => f.Name == name)) continue; // na-maloom function ignore
+                if (!PinMap.Functions.Any(f => f.Name == prop.Name)) continue; // na-maloom function ignore
+                if (prop.Value.ValueKind == JsonValueKind.Null) { map[prop.Name] = null; continue; }
+                if (prop.Value.ValueKind != JsonValueKind.Number || !prop.Value.TryGetInt32(out int pin)) continue; // kharab entry — default rehta hai
                 // SEC-E-12: range se bahir pin (haath se badli file) kabhi
                 // memory mein nahi aata — us function ka default rehta hai.
-                if (pin is { } p && (p < 0 || p > 39)) continue;
-                map[name] = pin;
+                if (pin < 0 || pin > 39) continue;
+                map[prop.Name] = pin;
             }
             return map;
         }
         catch (Exception) { return PinMap.Defaults(); }
+    }
+
+    /// <summary>File ko cap ke saath parho — cap se zyada bytes milen to null (file kabhi poori RAM mein nahi aati).</summary>
+    private static string? TryReadCapped(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (stream.Length > MaxFileBytes) return null;
+            using var capped = new MemoryStream();
+            byte[] buffer = new byte[8192];
+            int read;
+            long total = 0;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                total += read;
+                if (total > MaxFileBytes) return null;
+                capped.Write(buffer, 0, read);
+            }
+            return System.Text.Encoding.UTF8.GetString(capped.ToArray());
+        }
+        catch (Exception) { return null; }
     }
 
     /// <summary>File ko parho aur batao ke wo theek JSON map hai ya nahi (Restore validation ke liye).</summary>
@@ -261,8 +304,19 @@ public sealed class PinMapStore
         try
         {
             if (!File.Exists(path)) return false;
-            var raw = JsonSerializer.Deserialize<Dictionary<string, int?>>(File.ReadAllText(path));
+            // DATA-AI FIX: uncapped ReadAllText tha — capped read (restore
+            // path pehle se size check karta hai, ye defense in depth hai).
+            string? json = TryReadCapped(path);
+            if (json is null) return false;
+            var raw = JsonSerializer.Deserialize<Dictionary<string, int?>>(json);
             if (raw is null) return false;
+            // DATA-AI FIX (Round 2 W7-4): sirf parse hona kaafi nahi —
+            // range se bahir GPIO (999) ya 15 se zyada entries wali file
+            // bhi "valid" lagti thi, is liye Save ka backup guard use
+            // achi backup bana leta tha. Restore path
+            // (DiagnosticsSettings.TryValidatePinMap) ye check pehle se
+            // karta hai — yahan bhi lagao taake guard ek jaisa ho.
+            if (!PinMap.TryValidateEntries(raw, out _)) return false;
             map = raw;
             return true;
         }
@@ -289,6 +343,18 @@ public sealed class PinMapStore
         try
         {
             File.WriteAllText(tempPath, JsonSerializer.Serialize(pins, new JsonSerializerOptions { WriteIndented = true }));
+            // DATA-AI FIX (Medium): pehle koi backup nahi tha — kharab
+            // pin-map.json Load par defaults deti thi aur agla Save
+            // asal map hamesha ke liye mita deta tha. Ab guarded .bak:
+            // sirf theek parse hone wali file backup banti hai (kharab
+            // file achi backup ko overwrite nahi karti — ProfileStore/
+            // AppSettingsStore wala SEC-C-13 pattern).
+            if (File.Exists(_filePath) && TryParseFile(_filePath, out _))
+            {
+                try { File.Copy(_filePath, _filePath + ".bak", overwrite: true); }
+                catch (IOException) { /* backup best-effort — save nahi rukti */ }
+                catch (UnauthorizedAccessException) { /* backup best-effort */ }
+            }
             File.Move(tempPath, _filePath, overwrite: true);
         }
         catch
@@ -438,6 +504,16 @@ public static class PinMapBoardPush
     /// Poora push: validate → SET_CFG chunks → COMMIT → CONFIRM.
     /// Kamyabi par (true, null, chunks); nakami par (false, wajah, bheje
     /// gaye chunks) aur staged transaction REVERT se discard hoti hai.
+    /// CONFIRM-retry edge (final polish): CONFIRM ki pehli koshish
+    /// kamyab ho kar reply kho de (timeout) to dobara CONFIRM par board
+    /// UNSUPPORTED deta hai (config_transaction.h: pending na ho to
+    /// CONFIRM unsupported — pehle se confirmed transaction IDLE hai) —
+    /// ye "fail" NAHI, "already confirmed" hai: success report hoti hai,
+    /// REVERT nahi bheja jata (REVERT yahan nuksan-deh hota — config
+    /// apply ho chuki hoti hai). ControlClient andar hi 3× retry karta
+    /// hai (wahi reqId, naya counter), is liye ye UNSUPPORTED reply
+    /// aksar usi ke andar se aata hai; PushAsync-level ek retry sirf
+    /// no-reply (timeout) par hoti hai.
     /// </summary>
     public static async Task<(bool Ok, string? Error, int ChunksSent)> PushAsync(
         IReadOnlyDictionary<string, int?> pins,
@@ -475,9 +551,24 @@ public static class PinMapBoardPush
             if (!commit.Succeeded)
                 return await FailAsync($"COMMIT reject hua: {commit.Error ?? "jawab nahi aaya"}", chunks.Count).ConfigureAwait(false);
             var confirm = await sendCommand(ControlCommand.Confirm, ReadOnlyMemory<byte>.Empty, cancellationToken).ConfigureAwait(false);
-            if (!confirm.Succeeded)
-                return await FailAsync($"CONFIRM reject hua: {confirm.Error ?? "jawab nahi aaya"}", chunks.Count).ConfigureAwait(false);
-            return (true, null, chunks.Count);
+            if (confirm.Succeeded)
+                return (true, null, chunks.Count);
+            if (IsAlreadyConfirmed(confirm))
+                return (true, null, chunks.Count);
+            if (confirm.ReplyPayload is null && !cancellationToken.IsCancellationRequested)
+            {
+                // No-reply (timeout): pehli koshish board tak pohanch kar
+                // confirm kar chuki ho sakti hai, reply raaste mein kho
+                // gaya ho — ek retry: Ok ya UNSUPPORTED (already
+                // confirmed) dono success hain; dobara no-reply ya asal
+                // reject hi fail hai (phir REVERT — config 30 s deadline
+                // par waise bhi rollback hoti).
+                var retry = await sendCommand(ControlCommand.Confirm, ReadOnlyMemory<byte>.Empty, cancellationToken).ConfigureAwait(false);
+                if (retry.Succeeded || IsAlreadyConfirmed(retry))
+                    return (true, null, chunks.Count);
+                return await FailAsync($"CONFIRM reject hua: {retry.Error ?? "jawab nahi aaya"}", chunks.Count).ConfigureAwait(false);
+            }
+            return await FailAsync($"CONFIRM reject hua: {confirm.Error ?? "jawab nahi aaya"}", chunks.Count).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -499,6 +590,21 @@ public static class PinMapBoardPush
             return (false, error, chunksSent);
         }
     }
+
+    /// <summary>
+    /// CONFIRM ka "already confirmed" pehchano: board ne asal reply diya
+    /// aur status UNSUPPORTED hai. Isi PushAsync call mein COMMIT kamyab
+    /// hua tha, is liye board CONFIRM ke waqt COMMITTED state mein tha —
+    /// UNSUPPORTED ka matlab hai koi pehli CONFIRM koshish (jis ka reply
+    /// kho gaya) pehle hi confirm kar chuki hai aur transaction IDLE hai
+    /// (config_transaction.h rsh_cfg_confirm: state != COMMITTED →
+    /// UNSUPPORTED). No-reply (timeout) is mein nahi aata — us ka faisla
+    /// retry karta hai. Sirf yehi ek jagah hai jahan UNSUPPORTED ko
+    /// success samjha jata hai: SET_CFG/COMMIT par UNSUPPORTED abhi bhi
+    /// fail hai (wahan FailAsync hi chalta hai).
+    /// </summary>
+    internal static bool IsAlreadyConfirmed(ControlResult confirm) =>
+        confirm.ReplyPayload is not null && confirm.ReplyStatus == ControlStatus.Unsupported;
 
     /// <summary>SET_CFG reply check (§3.5): status Ok + stagedBytes == offset+chunkLen + totalExpected == total.</summary>
     internal static bool TryParseSetCfgReply(byte[]? payload, int offset, int chunkDataLen, int total, out string? error)

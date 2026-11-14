@@ -14,6 +14,9 @@
 
   <ItemGroup>
     <PackageReference Include="xunit.v3" Version="3.2.2" />
+    <!-- v2.0.4: BootstrapLogging (Serilog, WPF-free) ka single-config test. -->
+    <PackageReference Include="Serilog" Version="4.4.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -35,6 +38,19 @@
          RSH.Core) — wahi pattern: Settings → Connection toggle ki asal
          logic fake ITransportSwitchTarget se Linux par test hoti hai. -->
     <Compile Include="..\..\src\RSH.App\Services\TransportSwitchController.cs" Link="Linked\TransportSwitchController.cs" />
+
+    <!-- v2.0.4: BootstrapLogging bhi WPF-free hai (Serilog + RSH.Core) —
+         single-config test (dobara ConfigureLogger sirf level badle,
+         logger replace na ho) isi pattern se Linux par chalta hai. -->
+    <Compile Include="..\..\src\RSH.App\Services\BootstrapLogging.cs" Link="Linked\BootstrapLogging.cs" />
+
+    <!-- Round 2 W7: AppSettingsStore bhi WPF-free hai (BCL + RSH.Core) —
+         3-generation backup tests isi pattern se Linux par chalte hain. -->
+    <Compile Include="..\..\src\RSH.App\Services\AppSettings.cs" Link="Linked\AppSettings.cs" />
+
+    <!-- Round 2 W2 (O-1): ChangePasswordDialogPicker bhi WPF-free hai —
+         classic/Fluent selection logic isi pattern se Linux par test hoti hai. -->
+    <Compile Include="..\..\src\RSH.App\Services\ChangePasswordDialogPicker.cs" Link="Linked\ChangePasswordDialogPicker.cs" />
   </ItemGroup>
 
 </Project>

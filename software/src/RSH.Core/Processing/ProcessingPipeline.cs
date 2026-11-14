@@ -338,6 +338,10 @@ public sealed class ProcessingPipeline
                 // HPattern mein gear bits mask se hata do (wo gear state
                 // hain, buttons nahi).
                 mask = packet.Buttons & ~gearBits;
+                // Round 2 B2-08: Horn module band ho to horn bit (bit 4)
+                // bhi hata do — Horn toggle pehle no-op tha.
+                if (!plan.IsEnabled(ModuleKind.Horn))
+                    mask &= ~HornButtonBit;
                 // T11/Ex: BtnsEx word (0-based buttons 32..63) seedha
                 // ButtonsMaskEx ke neeche 32 bits mein (vJoy 33..64 → Ex1).
                 // Oopar 32 bits (65..96 → Ex2) aur Ex3 (97..128) ka v2.1
@@ -397,6 +401,16 @@ public sealed class ProcessingPipeline
 
     /// <summary>H-pattern gear bits: stream buttons bit 5..10 (gear 1..6).</summary>
     public const uint GearBitsMask = 0x7E0u;
+
+    /// <summary>
+    /// Horn button bit (firmware protocol.h RSH_BTN_HORN = 0x10 — stream
+    /// buttons bit 4, vJoy button 5). Round 2 B2-08: Horn module band ho
+    /// to ye bit mask se hata di jati hai — pehle Horn toggle ka pipeline
+    /// par koi asar hi nahi tha (bit Buttons module se guzar kar hamesha
+    /// output tak pahunchti thi; v1 path mein bit kabhi nikli hi nahi —
+    /// wahan sirf gear bits map hote hain, legacy parity note).
+    /// </summary>
+    public const uint HornButtonBit = 0x10u;
 
     /// <summary>
     /// Encoder → vJoy pulse buttons (Phase F WS5): encoder i CW

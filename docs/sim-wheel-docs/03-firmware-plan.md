@@ -1,3 +1,7 @@
+# ⚠️ SUPERSEDED — ye document ab authority NAHI hai (final polish sweep, 2026-11-13)
+
+**Ye v1-era firmware plan hai (ESP32-C3 Super Mini — ghalat board; RSH ESP32 DevKit V1 par hai) — tareekhi record ke tor par rakhi gayi hai. Current authority: `RSH-FIRMWARE-PLAN.md` (FW-1–FW-14) + `docs/PROTOCOL-V2.1.md`. Is file ke defaults (SIMWHEEL SSID, "change-me-123" password) current firmware par laagu nahi hote — default passwords Phase D mein hataye ja chuke hain.**
+
 # 03 - Firmware Plan (ESP32-C3 Super Mini, Arduino)
 
 ## Toolchain

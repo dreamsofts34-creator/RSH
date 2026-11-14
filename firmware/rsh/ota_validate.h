@@ -104,9 +104,12 @@ static inline bool ota_total_size_ok(size_t total_bytes) {
 
 // ---- Version marker scanner (streaming) ----
 // WebOTA page mein version chip hoti hai: "Version <b>" + FIRMWARE_VERSION.
-// Firmware .rodata mein ye do alag string literals hain, is liye marker aur
-// version ke darmiyan NUL byte hota hai: "Version <b>\0 4.0.0\0" (C#
-// FirmwareImageValidator wahi tareeqa istemal karta hai).
+// Ye ek hi chip hai — webota.cpp mein adjacent string literals
+// (R"HTML(...)HTML" FIRMWARE_VERSION R"HTML(</b>...)HTML") compile time par
+// concatenate hote hain, is liye marker aur version ke darmiyan koi NUL
+// byte NAHI hota (purana comment ghalat tha). Scanner marker ke baad
+// version digits dhoondta hai, darmiyan mein 8 non-digit bytes tak skip
+// karke (markup badle to bhi); version 16 chars tak.
 // Scanner chunks mein feed hota hai; marker chunk boundary par bhi mile to
 // pakra jata hai (aakhri 35 bytes hamesha window mein rehte hain — match ki
 // max length marker 11 + skip 8 + version 16 = 35 hai).

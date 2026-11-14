@@ -565,6 +565,35 @@ public class PhaseDWorkstream7Tests
     }
 
     [Fact]
+    public async Task GetCapsClient_StaleReplyIgnored_RetrySucceeds()
+    {
+        // Pehli reply stale hai (kisi aur reqId ki — UDP par purani reply
+        // der se aa sakti hai): ignore honi chahiye aur retry kamyab hona
+        // chahiye — pehle ek stale datagram poora command maar deta tha.
+        int calls = 0;
+        var transport = new FakeControlTransport(req =>
+        {
+            calls++;
+            if (calls == 1)
+            {
+                byte[] stale = ReplyFor(req, CapsPayload(), TestKey, TestNonce);
+                BinaryPrimitives.WriteUInt16LittleEndian(stale.AsSpan(5, 2), 9999);
+                byte[] tag = ControlFrameCodec.ComputeTag(TestKey, TestNonce,
+                    BinaryPrimitives.ReadUInt32LittleEndian(stale.AsSpan(7, 4)), stale[4], stale.AsSpan(13, stale.Length - 29));
+                tag.CopyTo(stale, stale.Length - 16);
+                return stale;
+            }
+            return ReplyFor(req, CapsPayload(), TestKey, TestNonce);
+        });
+        using var control = new ControlClient("127.0.0.1", TestKey, TestNonce, transport);
+        using var client = new GetCapsClient(control);
+        var caps = await client.GetCapsAsync(TestContext.Current.CancellationToken);
+        Assert.NotNull(caps);
+        Assert.Equal(2, client.LastAttempts);
+        Assert.Equal(2, calls);
+    }
+
+    [Fact]
     public async Task GetCapsClient_WrongReqIdReply_Rejected()
     {
         var transport = new FakeControlTransport(req =>

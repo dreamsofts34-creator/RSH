@@ -40,4 +40,9 @@
     <x:Static Member="SystemColors.WindowTextColor" x:Key="RSHWarningTextColor" />
     <x:Static Member="SystemColors.WindowColor" x:Key="RSHBannerColor" />
     <x:Static Member="SystemColors.WindowTextColor" x:Key="RSHSuccessTextColor" />
+    <!-- Round 2 W1: pills HC mein ControlColor — WindowColor se alag nazar
+         aayen, rang par inhisar kiye baghair. -->
+    <x:Static Member="SystemColors.ControlColor" x:Key="RSHSuccessPillColor" />
+    <x:Static Member="SystemColors.ControlColor" x:Key="RSHDangerPillColor" />
+    <x:Static Member="SystemColors.ControlColor" x:Key="RSHMutedPillColor" />
 </ResourceDictionary>

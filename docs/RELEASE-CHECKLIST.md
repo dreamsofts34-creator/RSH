@@ -10,6 +10,37 @@ board run pass hone + user ki confirmation ke baad.
 Legend: `[x]` PASS/done · `[ ]` PENDING (kya baaqi hai + owner) ·
 `[~]` PARTIAL (kuch hua, kuch baaqi).
 
+## ADDENDUM — v2.0.3 (2026-11-13, Architecture & Planning polish sweep)
+
+**Ye checklist v2.0.0 ke liye likhi gayi thi; neeche ka status v2.0.3 tak ka hai.
+Upar wale sections ka body v2.0.0-era record hai — is addendum se badla nahi gaya,
+sirf ye section naya hai. Koi pending item is addendum se tick nahi hua.**
+
+- **Current version: app v2.0.3 / firmware v4.0.0 (unchanged) / protocol v2.1.**
+  App version `software/src/RSH.App/RSH.App.csproj` mein `<Version>2.0.3</Version>`
+  hai; firmware `firmware/rsh/config.h` mein `FIRMWARE_VERSION "4.0.0"` hai.
+- **Releases shipped (parent):** v2.0.1 (17:59), v2.0.2 (18:49), v2.0.3 (19:27) —
+  `github.com/dreamsofts34-creator/RSH/releases/tag/v2.0.3` (release id 444324754).
+  Har release par dono Actions runs SUCCESS (v2.0.3: Build and Release 43442136416,
+  CI 43442105445, head 02fdab53). **Is liye §2 ka "CI green — PENDING" item ab
+  STALE hai: CI tag releases par green ho chuka hai** (local-only rule khatam —
+  push ho chuka hai). Agle release par CI phir green hona chahiye, lekin v2.0.3
+  tak ka record green hai.
+- **Upar wali "Push/tag/GitHub Release mat karo" hidayat tareekhi hai** — releases
+  parent kar chuka hai. Agli release ke liye wahi flow (tag → Actions → verify).
+- **Abhi bhi PENDING (koi tabdeeli nahi):** A7 board run + freeze (§11), 4-hour
+  long soak INCOMPLETE (~16 min / 240 min, user order se roka gaya — §2),
+  SEC-H-04 review (§10), OPEN-3 flash encryption board-side (§10), unsigned MSIX
+  install test (Windows PC), winget submit (signed MSIX par blocked), rollback
+  E2E test, update-check live test, firewall-rule Settings wiring, SPDX SBOM
+  (optional). OV cert abhi bhi DEFERRED hai (user faisla) — blocker nahi.
+- **Naya note (v2.0.3):** user ka PC Windows 10 22H2 (build 19045) hai — plan ka
+  "Windows 11 floor" ab asal support se match nahi karta (v2.0.3 mein Win10
+  auto-classic + plain-nav). `RuntimeCheck` (Windows 11 build ≥ 22000) abhi bhi
+  sirf update-check ko gate karta hai (`DiagnosticsSettings.cs:759`) — Win10 par
+  update check "needs Windows 11" kehta hai. Ye code gap hai, coordinator ko
+  route kiya gaya hai (dekho `docs/POLISH-SWEEP-2026-11-13.md` GAP-02).
+
 ## 1. Build — 0 errors / 0 warnings
 
 - [x] `dotnet build` (software) — 0 errors / 0 warnings (Phase H gate run mein verify).

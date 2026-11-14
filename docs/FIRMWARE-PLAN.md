@@ -1,3 +1,10 @@
+# ⚠️ SUPERSEDED — ye document ab authority NAHI hai (Architecture polish sweep, 2026-11-13)
+
+**Ye v1-era plan hai (starting point firmware v3.3, protocol v1) — tareekhi record ke tor par
+rakha gaya hai. Current authority: `~/workspace/projects/rsh/RSH-FIRMWARE-PLAN.md` (FINAL, FW-1–FW-14)
++ `RSH-PLAN-v2.3.md` §1/§2/§5. Is file ke protocol/key-derivation ke daawe current firmware par
+laagu nahi hote (key lifecycle ab `docs/KEY-LIFECYCLE.md` + plan v2.3 §2 mein hai).**
+
 # RSH (Real Sim Hub) — Firmware Plan (v4.0 track)
 
 Target board: **ESP32 DevKit V1** (original ESP32). Starting point: firmware **v3.3** (fixed pins in `config.h`, 18-byte protocol v1, SoftAP + UDP, Web OTA).

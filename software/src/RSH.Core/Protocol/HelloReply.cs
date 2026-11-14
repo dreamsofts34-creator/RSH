@@ -17,7 +17,7 @@ public enum HelloReplyParseResult
 
 /// <summary>
 /// HELLO reply (§2.2): "RSHR" | proto 2.1 | flags | sessionEcho | boardMac 6 B |
-/// fw 4.0.0 | rsv | nonce 16 B | deviceKey 32 B | wifiPassword 24 B | CRC16. Total 92 B fixed.
+/// fw 4.0.1 | rsv | nonce 16 B | deviceKey 32 B | wifiPassword 24 B | CRC16. Total 92 B fixed.
 /// deviceKey/wifiPassword sirf unpaired + pairing window ke andar valid hain,
 /// warna sab 0x00 (§2.2/§2.3). Key/password is se derive kabhi nahi hote (R-H10).
 /// </summary>

@@ -60,11 +60,15 @@ public sealed partial class DiagnosticsViewModel(AppServices services) : Observa
             $"Ticks {e.TickCount:N0} · avg tick {avgTick} µs · max tick {e.MaxTickDurationUs} µs · tick jitter {_tickJitterEmaMs:F2} ms · late ticks {e.LateTickCount:N0} · " +
             $"watchdog {(e.WatchdogActive ? "ACTIVE (neutral output)" : "off")} · output {(e.OutputConnected ? "connected" : "not connected")}";
 
-        _process.Refresh();
+        // W4 (Round 2): Refresh() sirf CPU% sample par — har 33 ms Tick
+        // par Refresh() bekaar tha (CPU% sirf 0.5 s par recompute hota
+        // hai); WorkingSet64 display 0.5 s stale bhi theek hai (diagnostics
+        // panel, 30 Hz par number waise bhi parha nahi jata).
         var now = DateTime.UtcNow;
         double elapsed = (now - _lastCpuAt).TotalSeconds;
         if (elapsed >= 0.5)
         {
+            _process.Refresh();
             var cpu = _process.TotalProcessorTime;
             _cpuPct = (cpu - _lastCpu).TotalSeconds / elapsed / Environment.ProcessorCount * 100;
             _lastCpu = cpu;
@@ -690,7 +694,11 @@ public sealed partial class SettingsViewModel(AppServices services) : Observable
                 error = $"settings.json in this backup has an invalid vJoy device id ({settings.VJoyDeviceId} — must be 1–16).";
                 return false;
             }
-            if (settings.Theme is not ("System" or "Dark" or "Light"))
+            // DATA-AI FIX: "HighContrast" bhi valid theme hai (AppSettings.
+            // Sanitize allow karta hai) — pehle restore validator sirf
+            // System/Dark/Light qabool karta tha, is liye HighContrast
+            // wali backup restore par reject ho jati thi.
+            if (settings.Theme is not ("System" or "Dark" or "Light" or "HighContrast"))
             {
                 error = $"settings.json in this backup has an unknown theme '{settings.Theme}'.";
                 return false;
@@ -759,7 +767,7 @@ public sealed partial class SettingsViewModel(AppServices services) : Observable
             var (runtimeOk, osOk) = RuntimeCheck.CheckAll();
             if (!runtimeOk || !osOk)
             {
-                UpdateStatusText = $"This PC does not meet the minimum requirements ({RuntimeCheck.DescribeCurrent()}). RSH needs .NET 10+ on Windows 11.";
+                UpdateStatusText = $"This PC does not meet the minimum requirements ({RuntimeCheck.DescribeCurrent()}). {RuntimeCheck.RequirementsText}";
                 return;
             }
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
@@ -786,16 +794,24 @@ public sealed partial class SettingsViewModel(AppServices services) : Observable
     /// SEC-E-04: naya password settings.json mein <b>kabhi nahi</b> likha
     /// jata — BoardSession.SetPasswordAsync khud DPAPI KeyStore mein save
     /// karta hai. Dialog ki SaveWarning (store save fail) ho to use
-    /// StatusText mein dikhao — khamoshi se nigalna mana hai.</summary>
+    /// StatusText mein dikhao — khamoshi se nigalna mana hai.
+    /// O-1 (Round 2 W2): classic mode mein plain-Window variant khulti hai
+    /// (ChangePasswordDialogClassic — FluentWindow dialog modal hang jaisa
+    /// lag sakta tha); Win11 par FluentWindow dialog waisi hi. Dono
+    /// IChangePasswordDialogResult deti hain, is liye aage ka rasta ek hai.</summary>
     [RelayCommand]
     private async Task ChangePassword()
     {
-        var dialog = new ChangePasswordDialog(services) { Owner = System.Windows.Application.Current?.MainWindow };
+        System.Windows.Window dialog = ChangePasswordDialogPicker.Pick(App.ClassicWindowRequested) == ChangePasswordDialogKind.Classic
+            ? new ChangePasswordDialogClassic(services)
+            : new ChangePasswordDialog(services);
+        dialog.Owner = System.Windows.Application.Current?.MainWindow;
         dialog.ShowDialog();
-        if (!dialog.Succeeded || dialog.NewPassword is null) return;
-        if (dialog.SaveWarning is not null)
+        var result = (IChangePasswordDialogResult)dialog;
+        if (!result.Succeeded || result.NewPassword is null) return;
+        if (result.SaveWarning is not null)
         {
-            StatusText = $"Wheel password changed. {dialog.SaveWarning}";
+            StatusText = $"Wheel password changed. {result.SaveWarning}";
             return;
         }
         StatusText = "Wheel password changed. Reconnect to the wheel Wi-Fi with the new password — the stored Wi-Fi password was updated too.";

@@ -1,3 +1,7 @@
+# ⚠️ SUPERSEDED — ye document ab authority NAHI hai (final polish sweep, 2026-11-13)
+
+**Ye 10 Nov 2026 ki audit-build delivery note hai (software v1.0.0 / firmware v3.1) — tareekhi record ke tor par rakhi gayi hai. Current authority: `docs/RELEASE-NOTES-v2.0.4.md` (app v2.0.4 / firmware v4.0.1 / protocol v2.1) + `docs/RELEASE-CHECKLIST.md`. Is file ke version/asset/password ke daawe (RSH-Setup-1.0.0.exe, "change-me-123") current release par laagu nahi hote.**
+
 # RSH — FINAL DELIVERY (Audit Build, 10 Nov 2026)
 
 Ali bhai, deep analysis + fixes + virtual user testing mukammal hai.

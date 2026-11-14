@@ -1,6 +1,7 @@
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using NSec.Cryptography;
 
 namespace RSH.Core.Firmware;
 
@@ -38,10 +39,12 @@ namespace RSH.Core.Firmware;
 /// <item>Signature trailer — file ke aakhir mein 68 bytes
 /// (<c>[Ed25519 sig 64 B]["RSHS"]</c>, docs/SIGNED-OTA.md). Trailer na
 /// ho to image unsigned hai → reject. Signature ki cryptographic
-/// verify board-side hoti hai (webota.cpp, verify-before-apply); app
-/// yahan sirf trailer ki maujoodgi + format check karta hai (BCL mein
-/// Ed25519 verify nahi), taake unsigned image fail-fast reject ho
-/// (board waise bhi reject karega).</item>
+/// verify AB board-side (webota.cpp, verify-before-apply) AUR app-side
+/// dono hoti hai (SEC-C-06 app-side, defense-in-depth): app
+/// <see cref="VerifySignature"/> se baked release public key se
+/// signature check karta hai — ghalat signature wali image fail-closed
+/// reject hoti hai, board tak kabhi nahi pahunchti. BCL (.NET 10) mein
+/// Ed25519 verify nahi hai, is liye NSec (libsodium) istemal hota hai.</item>
 /// </list>
 /// </summary>
 public static class FirmwareImageValidator
@@ -58,6 +61,13 @@ public static class FirmwareImageValidator
     /// <summary>Anti-downgrade floor (SEC-C-05) — is se purani firmware kabhi upload nahi hoti.</summary>
     public static readonly Version MinimumFirmwareVersion = new(4, 0, 0);
 
+    /// <summary>Current shipping firmware version — PC-side source of
+    /// truth. <c>firmware/rsh/config.h</c> ke <c>FIRMWARE_VERSION</c> se
+    /// match lazmi hai; firmware bump par dono badlo (W4 Round 2: header
+    /// jaisi hard-coded version strings dobara stale na hon — version
+    /// yahan se lo, literal kahin aur na likho).</summary>
+    public static readonly Version CurrentFirmwareVersion = new(4, 0, 1);
+
     /// <summary>Merged/factory image mein app image ka offset (partitions.csv: app0 @ 0x10000).</summary>
     public const int MergedAppOffset = 0x10000;
 
@@ -69,6 +79,24 @@ public static class FirmwareImageValidator
 
     /// <summary>Signature trailer ke aakhri 4 bytes.</summary>
     public static readonly byte[] SignatureMagicBytes = Encoding.ASCII.GetBytes("RSHS");
+
+    /// <summary>
+    /// Release signing public key (Ed25519, 32 B) — wahi jo
+    /// <c>firmware/rsh/signing_pubkey.h</c> mein <c>kRshSigningPubkey</c> hai.
+    /// Public key hai (secret nahi) — app mein bake karna mehfooz hai.
+    /// SHA-256 fingerprint: 387764a4529337c437b233a148b48f9b2ffe3f3b5015e14c95737cb3a67a6411.
+    /// *** KEY ROTATION: key badle to DONO jagah lazmi update karo —
+    /// firmware/rsh/signing_pubkey.h AUR ye field — warna board aur app
+    /// alag keys se verify karenge aur signed images ek taraf reject
+    /// hongi. Nayi key par fingerprint test
+    /// (PhaseCAppTests.ReleasePubkey_Fingerprint_Matches) bhi update karo.
+    /// </summary>
+    internal static readonly byte[] ReleaseSigningPublicKey = Convert.FromHexString(
+        "ba6f53e0adaf98295c86fef5819e85028def02b320b89955d9dee09afdce2ce7");
+
+    /// <summary>Release signing public key ka SHA-256 fingerprint (hex, lowercase) — key-copy typo / rotation drift ka guard.</summary>
+    internal const string ReleaseSigningPublicKeyFingerprintHex =
+        "387764a4529337c437b233a148b48f9b2ffe3f3b5015e14c95737cb3a67a6411";
 
     private const byte EspImageMagic = 0xE9;
     private const int ImageHeaderSize = 24;
@@ -90,8 +118,38 @@ public static class FirmwareImageValidator
         int SizeBytes,
         bool IsSigned);
 
-    /// <summary>Buffer validate karo. Koi file I/O nahi — caller buffer ek dafa parh kar de.</summary>
-    public static ValidationResult Validate(byte[] image)
+    /// <summary>
+    /// Ed25519 signature verify karo (sign-image.py / ota_validate.h wali
+    /// construction): signature <c>Ed25519(privkey, SHA-256(image bytes))</c>
+    /// hai — is liye pehle image ka SHA-256 nikalo, phir us digest par
+    /// signature verify karo (digest hi signed message hai, poori image nahi).
+    /// Ghalat length / ghalat key / crypto exception → false (fail-closed,
+    /// kabhi throw nahi).
+    /// </summary>
+    internal static bool VerifySignature(ReadOnlySpan<byte> imageBytes, ReadOnlySpan<byte> signature, ReadOnlySpan<byte> publicKey)
+    {
+        if (signature.Length != 64 || publicKey.Length != 32) return false;
+        try
+        {
+            byte[] digest = SHA256.HashData(imageBytes);
+            var key = PublicKey.Import(SignatureAlgorithm.Ed25519, publicKey, KeyBlobFormat.RawPublicKey);
+            return SignatureAlgorithm.Ed25519.Verify(key, digest, signature);
+        }
+        catch (Exception ex) when (ex is FormatException or CryptographicException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Buffer validate karo (baked release public key se signature verify). Koi file I/O nahi — caller buffer ek dafa parh kar de.</summary>
+    public static ValidationResult Validate(byte[] image) => Validate(image, ReleaseSigningPublicKey);
+
+    /// <summary>
+    /// Buffer validate karo, di hui public key se signature verify (tests ke
+    /// liye — throwaway keypair se signed test images; production rasta
+    /// <see cref="Validate(byte[])"/> hai jo baked release key istemal karta hai).
+    /// </summary>
+    internal static ValidationResult Validate(byte[] image, ReadOnlySpan<byte> publicKey)
     {
         string fileSha = Convert.ToHexString(SHA256.HashData(image)).ToLowerInvariant();
         ValidationResult Fail(string error, ImageLayout layout, Version? version = null, string? imageSha = null) =>
@@ -176,14 +234,18 @@ public static class FirmwareImageValidator
             return Fail($"Downgrade reject: file firmware v{version} hai, minimum v{MinimumFirmwareVersion} chahiye (purani firmware mein maloom bugs hain).", layout, version, imageShaHex);
 
         // Signed trailer (SEC-C-06 / SEC-D-04): file ke aakhir mein 68 bytes
-        // [Ed25519 sig 64 B]["RSHS"] hone chahiye. App sirf maujoodgi +
-        // format check karta hai — cryptographic verify board-side hoti hai
-        // (webota.cpp). Trailer na ho to image unsigned hai → reject
-        // (board waise bhi reject karega; yahan fail-fast behtar hai).
+        // [Ed25519 sig 64 B]["RSHS"] hone chahiye. Trailer na ho to image
+        // unsigned hai → reject (board waise bhi reject karega; yahan
+        // fail-fast behtar hai). Trailer ho to signature CRYPTOGRAPHICALLY
+        // verify hoti hai (app-side, defense-in-depth — board-side verify
+        // webota.cpp mein rehti hai): ghalat signature → fail-closed reject.
         if (image.Length < digestStart + ImageShaSize + SignatureTrailerSizeBytes
             || !image.AsSpan(image.Length - SignatureMagicBytes.Length, SignatureMagicBytes.Length)
                 .SequenceEqual(SignatureMagicBytes))
             return Fail("Image signed nahi hai — sirf signed official RSH release upload karo (signature trailer nahi mila).", layout, version, imageShaHex);
+        if (!VerifySignature(image.AsSpan(0, image.Length - SignatureTrailerSizeBytes),
+                image.AsSpan(image.Length - SignatureTrailerSizeBytes, 64), publicKey))
+            return Fail("Image ki Ed25519 signature verify nahi hui — file badli hui ya kisi aur key se signed hai. Sirf official RSH release upload karo.", layout, version, imageShaHex);
 
         return new ValidationResult(true, null, layout, version, fileSha, imageShaHex, image.Length, true);
     }

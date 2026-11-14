@@ -313,7 +313,10 @@ public sealed class WheelEngine : IDisposable
             if (nowMs - _lastReconnectAttemptMs >= 2000)
             {
                 _lastReconnectAttemptMs = nowMs;
-                if (!_output.TryConnect(out var error))
+                // Round 2 B2-05: plan ke saath connect — P12/D11 caps
+                // validation (pehle plan-less TryConnect tha, is liye
+                // kami wala device khamoshi se connect ho jata tha).
+                if (!_output.TryConnect(out var error, _pipeline.Plan))
                     _lastOutputError = error;
                 else
                     _lastOutputError = null;

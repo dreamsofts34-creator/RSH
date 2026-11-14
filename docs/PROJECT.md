@@ -1,3 +1,10 @@
+# ⚠️ SUPERSEDED — ye document ab authority NAHI hai (Architecture polish sweep, 2026-11-13)
+
+**Ye 2026-11-10 ke project notes hain (v1.0.0-era; board ghalat "ESP32-C3 Super Mini" likha hai —
+asal board ESP32 DevKit V1 original ESP32 hai; "SimWheel" rename pending wala note bhi purana hai,
+rename Phase A/C/E mein mukammal ho chuka hai). Tareekhi record ke tor par rakha gaya hai.
+Current authority: `RSH-PLAN-v2.3.md` + `docs/RELEASE-CHECKLIST.md` (v2.0.3 addendum).**
+
 # RSH — project notes
 
 - **Naam (final, owner 2026-11-10):** RSH — by Dreamsofts. Is chat ("Naya Project") ka naya project; fresh start ke baad pehla project.

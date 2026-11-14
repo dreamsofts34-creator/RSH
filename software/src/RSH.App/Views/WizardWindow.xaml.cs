@@ -10,6 +10,7 @@ using RSH.App.ViewModels;
 using RSH.Core.Firmware;
 using RSH.Core.Net;
 using RSH.Core.Output;
+using RSH.Core.Protocol;
 using RSH.Core.Processing;
 using RSH.Output.HIDMaestro;
 using RSH.Output.VJoy;
@@ -191,7 +192,11 @@ public partial class WizardWindow : FluentWindow
 
         if (_steerPhase == 0)
         {
-            _steerCal.AddCenterSample(p.Steering);
+            // V-C2 follow-up (final polish): AutoCalibrator mV-domain
+            // mein kaam karta hai (span gate 660 mV) — raw packet value
+            // seedha daalna ghalat calibration save kar deta jab firmware
+            // raw-steering fallback mein ho. Intake par hi mV mein lao.
+            _steerCal.AddCenterSample(WizardCalibrationIntake.SteeringToMillivolts(p));
             SteerAutoStatus.Text = $"Capturing centre… {_steerCal.CenterSampleCount}/20 samples. Hold the wheel still.";
             if (_steerCal.TryGetCenter(out var center))
             {
@@ -203,7 +208,7 @@ public partial class WizardWindow : FluentWindow
         }
         else
         {
-            _steerCal.AddSteeringRangeSample(p.Steering);
+            _steerCal.AddSteeringRangeSample(WizardCalibrationIntake.SteeringToMillivolts(p));
             if (_steerCal.TryGetSteeringRange(out var min, out var max))
             {
                 _calib.SteerMin = min;
@@ -225,8 +230,12 @@ public partial class WizardWindow : FluentWindow
         if (_pedalsDone) { TickAutoAdvance(7); return; }
         if (!_services.Source.TryGetLatest(out var p, out _, 1000)) return;
 
-        _pedalCal.AddAccelSample(p.Accel);
-        _pedalCal.AddBrakeSample(p.Brake);
+        // V-C2 follow-up (final polish): pedals v1 mein hamesha raw ADC
+        // hote hain — AutoCalibrator (mV-domain, span gate 660 mV) ko
+        // dene se pehle mV mein lao (CalibrationTuning.PedalToMillivolts
+        // jaisa hi — wahan bhi capture-time conversion hoti hai).
+        _pedalCal.AddAccelSample(WizardCalibrationIntake.PedalToMillivolts(p.Accel));
+        _pedalCal.AddBrakeSample(WizardCalibrationIntake.PedalToMillivolts(p.Brake));
         bool a = _pedalCal.TryGetAccelRange(out var aMin, out var aMax);
         bool b = _pedalCal.TryGetBrakeRange(out var bMin, out var bMax);
         if (a && b)
@@ -541,7 +550,40 @@ public partial class WizardWindow : FluentWindow
     {
         _services.Settings.WizardCompleted = true;
         _services.Settings.FirstRunDone = true;
-        _services.SaveSettings();
+        // QA F3 (LOW, U-P1): sync SaveSettings() UI thread par file
+        // likhta tha — async rasta; wizard band hone ke baad bhi app
+        // chalti rehti hai, is liye background save ke liye waqt hai.
+        // Fail ho to log, wizard band hona nahi rukta.
+        _ = _services.SaveSettingsAsync().ContinueWith(
+            static t => Log.Error(t.Exception, "Wizard finish save failed"),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
         Close();
     }
+}
+
+/// <summary>
+/// Wizard calibration intake — packet units → mV-domain (V-C2 follow-up,
+/// final polish). AutoCalibrator aur CalibrationViewModel ke fields
+/// hamesha mV-domain mein hote hain (D10: span gate 660 mV, Save
+/// IsMillivolts=true) — is liye conversion intake par hoti hai, save
+/// par nahi (save-time conversion ghalat hoti: aadhi-captured mV values
+/// dobara convert ho jati — CalibrationTuning.cs mein yahi faisla hai).
+/// Alag WPF-free static class hai taake unit tests bina window ke is
+/// rasta ko chala sakein (WizardWindow khud FluentWindow hai).
+/// </summary>
+internal static class WizardCalibrationIntake
+{
+    /// <summary>
+    /// Steering packet value → mV. Flag true ho to pehle se mV hai;
+    /// false ho to firmware raw-steering fallback mein hai (inputs.cpp:
+    /// mV probe fail par useMv=false) — raw ADC (0..4095) ko
+    /// <see cref="InputMapper.RawToMillivolts"/> se mV (0..3300) mein lao.
+    /// </summary>
+    internal static ushort SteeringToMillivolts(WheelPacket p) =>
+        (ushort)(p.SteeringInMillivolts ? p.Steering : InputMapper.RawToMillivolts(p.Steering));
+
+    /// <summary>Pedal packet value → mV. v1 pedals hamesha raw ADC hote hain.</summary>
+    internal static ushort PedalToMillivolts(ushort raw) =>
+        (ushort)InputMapper.RawToMillivolts(raw);
 }

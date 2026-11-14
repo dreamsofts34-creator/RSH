@@ -30,6 +30,21 @@ public sealed class BoardSession : IDisposable
     private readonly bool _ownsKeyStore;
 
     /// <summary>
+    /// Control sends ka gate (Round 2 B2-04): ek waqt mein ek hi signed
+    /// control command chalti hai. Do kaam: (1) _nextCounter ka read /
+    /// write-back serialize hota hai — concurrent sends ek hi counter
+    /// se do commands bana kar board se REPLAY nahi khate; (2) serial
+    /// transport (SerialLink) ek waqt mein ek hi exchange allow karta
+    /// hai — concurrent exchange InvalidOperationException phenkta tha.
+    /// UDP par alag socket per client hota hai, is liye wahan sirf (1)
+    /// matter karta hai. SemaphoreSlim hai (async-compatible); koi bhi
+    /// control send is ke andar doosra control send nahi bulata, is
+    /// liye re-entrancy/deadlock nahi (SendKeyResetAsync core rasta
+    /// istemal karta hai, public SendControlAsync nahi).
+    /// </summary>
+    private readonly SemaphoreSlim _controlGate = new(1, 1);
+
+    /// <summary>
     /// Board session banao. <paramref name="keyStore"/> null ho to default
     /// store (Windows: DPAPI; non-Windows: in-memory) banta hai aur is
     /// session ki malkiyat mein rehta hai (Dispose par band hota hai).
@@ -58,6 +73,29 @@ public sealed class BoardSession : IDisposable
     public byte[]? BoardMac { get; private set; }
     /// <summary>Aakhri HELLO reply ka firmware version — null jab HELLO na aaya ho.</summary>
     public Version? HelloFirmwareVersion { get; private set; }
+    /// <summary>
+    /// Aakhri HELLO reply mein board key-reset-armed tha ya nahi
+    /// (flags bit1, §4.4 — BOOT-hold ≥10 s). Sirf armed state mein
+    /// KEY_RESET bheja ja sakta hai; yehi <see cref="SendKeyResetAsync"/>
+    /// ka guard hai. HELLO na aaya ho to false.
+    /// </summary>
+    public bool LastHelloKeyResetArmed { get; private set; }
+
+    /// <summary>
+    /// Control gate hasil karo (Round 2 B2-04). Cancel/dispose par false —
+    /// caller "cancel hui" result de, exception na phenke (ControlClient
+    /// ka OperationCanceledException → ControlResult pattern jaisa).
+    /// </summary>
+    private async Task<bool> AcquireControlGateAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _controlGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException) { return false; }
+        catch (ObjectDisposedException) { return false; }
+    }
 
     /// <summary>
     /// Wi-Fi/OTA password key store se nikalo (SEC-E-04 — PROTOCOL §5.3:
@@ -196,6 +234,23 @@ public sealed class BoardSession : IDisposable
     }
 
     /// <summary>HELLO reply se session update karo: nonce hamesha, key sirf jab nonzero ho (paired board zero bhejta hai — purani key kabhi overwrite nahi hoti). Naya nonce mile to counter 0 se shuru (§2.3). Nonzero key milte hi key store mein save hoti hai (SEC-D-05) — save fail ho to session phir bhi chalti hai (key memory mein hai).
+    /// Round 2 B2-01 (pairing-window gate, PROTOCOL §2.2/§4.1): key sirf
+    /// tab valid hoti hai jab HELLO flags kahein ke board unpaired HAI
+    /// AUR pairing window khuli hai (bit0 + bit3). Pehle koi bhi nonzero
+    /// key (window band ho to bhi) store ho jati thi — firmware aisi key
+    /// kabhi bhejta hi nahi (net.cpp: window ke baad zero), lekin PC-side
+    /// check na hone se ek ghalat/malicious HELLO achhi stored key ko
+    /// overwrite kar sakta tha (phir har signed command BAD_TAG).
+    /// Window band + nonzero key ab ignore hoti hai (na session, na store).
+    /// Round 2 B2-02: HELLO ka Wi-Fi password field bhi yahin se store
+    /// hota hai — pehle ye field kahin parha hi nahi jata tha, is liye
+    /// pairing ke baad board ka AP WPA2 hote hi PC dobara join nahi kar
+    /// sakta tha (password board par koi display nahi — HELLO hi wahid
+    /// source hai, §5.1/KEY-LIFECYCLE §4). Generated password hamesha
+    /// 24 printable ASCII chars hota hai; field zero ho (user ne
+    /// SET_PASSWORD se alag length ka password set kiya — firmware tab
+    /// field zero bhejta hai) to stored password ko haath nahi lagta
+    /// (app ke paas wo pehle se hai).
     /// SEC-E-09 (rotation hygiene): nayi key purani stored key se mukhtalif
     /// ho to ye KEY_RESET / nayi pairing hai — board ne password bhi naya
     /// generate kiya hai (§5.4), is liye purana stored password STALE hai
@@ -211,8 +266,12 @@ public sealed class BoardSession : IDisposable
         _nonce = reply.Nonce.ToArray();
         BoardMac = reply.BoardMac.ToArray();
         HelloFirmwareVersion = new Version(reply.FwMajor, reply.FwMinor, reply.FwPatch);
+        LastHelloKeyResetArmed = reply.KeyResetArmed;
+        // B2-01: key sirf pairing window ke andar valid hai (§2.2).
         if (reply.DeviceKey.AsSpan().IndexOfAnyExcept((byte)0) >= 0)
         {
+            if (!reply.Unpaired || !reply.PairingWindowOpen)
+                return; // window band + nonzero key — ignore (na session, na store)
             string boardId = RSH.Core.Security.KeyStore.BoardIdForMac(BoardMac);
             bool rotated = false;
             try
@@ -227,7 +286,29 @@ public sealed class BoardSession : IDisposable
             ClearKey();
             _key = reply.DeviceKey.ToArray();
             _keyStore.TrySaveKey(boardId, _key);
+            // B2-02: HELLO ka per-device Wi-Fi password (24 printable
+            // ASCII) bhi store karo — warna pairing ke baad WPA2 AP par
+            // dobara join ka koi rasta nahi (password kahin nazar nahi aata).
+            string? helloPassword = HelloWifiPassword(reply.WifiPassword);
+            if (helloPassword is not null)
+                _keyStore.TrySavePassword(boardId, helloPassword);
         }
+    }
+
+    /// <summary>
+    /// HELLO reply ka Wi-Fi password field (24 B, §2.2/§5.1) parho:
+    /// generated password hamesha exactly 24 printable ASCII chars
+    /// (0x21–0x7E) hota hai. Field zero ho ya koi byte printable na ho
+    /// (user-set password — firmware tab field zero bhejta hai) to null —
+    /// stored password ko haath nahi lagana.
+    /// </summary>
+    internal static string? HelloWifiPassword(ReadOnlySpan<byte> field)
+    {
+        if (field.Length != 24) return null;
+        foreach (byte b in field)
+            if (b < 0x21 || b > 0x7E)
+                return null;
+        return System.Text.Encoding.ASCII.GetString(field);
     }
 
     private void ClearKey()
@@ -236,7 +317,14 @@ public sealed class BoardSession : IDisposable
         _key = null;
     }
 
-    /// <summary>GET_CAPS client banao — key/nonce na hon to null + wajah (caller upload gate ko bataye). <paramref name="transport"/> sirf tests ke liye (fake transport); null ho to asal UDP transport banta hai.</summary>
+    /// <summary>GET_CAPS client banao — key/nonce na hon to null + wajah (caller upload gate ko bataye). <paramref name="transport"/> sirf tests ke liye (fake transport); null ho to asal UDP transport banta hai.
+    /// Round 2 B2-04 note: is client se bheja gaya command BoardSession
+    /// ke control gate ke BAHAR chalta hai — is liye is client ko
+    /// BoardSession ke send methods (SendControlAsync / SendRebootAsync /
+    /// GetCapsAsync) ke saath CONCURRENTLY istemal mat karo (serial
+    /// transport ek waqt mein ek hi exchange allow karta hai; counter bhi
+    /// share hota hai). Aaj ek hi caller hai (GetCapsAsync, gated) — naya
+    /// caller banaye to ya gate ke andar rakhe ya GetCapsAsync jaisa rasta istemal kare.</summary>
     public GetCapsClient? CreateGetCapsClient(string boardHost, out string? error, IControlTransport? transport = null)
     {
         error = null;
@@ -268,12 +356,67 @@ public sealed class BoardSession : IDisposable
                 ? "Restart nahi ho saka: session key maujood nahi (na session mein, na key store mein — RSTX hata diya gaya, SEC-D-01; restart ke liye HMAC-signed REBOOT chahiye aur us ke liye pairing/key chahiye)."
                 : "Restart nahi ho saka: abhi tak HELLO reply nahi aaya — board session nahi mila (RSTX hata diya gaya — SEC-D-01; restart sirf HMAC-signed REBOOT se hota hai).");
         }
-        TryGetKey(out byte[] key);
-        using var control = new ControlClient(boardHost, key, _nonce!, transport, firstCounter: _nextCounter);
-        var result = await control.SendCommandAsync(ControlCommand.Reboot, ReadOnlyMemory<byte>.Empty, cancellationToken).ConfigureAwait(false);
-        _nextCounter = control.NextCounter;
-        if (result.ReplyPayload is null) return (false, result.Error ?? "REBOOT ka jawab nahi aaya.");
-        if (result.ReplyStatus != ControlStatus.Ok) return (false, $"Board ne REBOOT par {result.ReplyStatus} diya.");
+        if (!await AcquireControlGateAsync(cancellationToken).ConfigureAwait(false))
+            return (false, "REBOOT cancel hui.");
+        try
+        {
+            TryGetKey(out byte[] key);
+            using var control = new ControlClient(boardHost, key, _nonce!, transport, firstCounter: _nextCounter);
+            var result = await control.SendCommandAsync(ControlCommand.Reboot, ReadOnlyMemory<byte>.Empty, cancellationToken).ConfigureAwait(false);
+            _nextCounter = control.NextCounter;
+            if (result.ReplyPayload is null) return (false, result.Error ?? "REBOOT ka jawab nahi aaya.");
+            if (result.ReplyStatus != ControlStatus.Ok) return (false, $"Board ne REBOOT par {result.ReplyStatus} diya.");
+            return (true, null);
+        }
+        finally
+        {
+            _controlGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// HMAC-signed KEY_RESET (cmd 0x0B, §4.4) bhejo — Round 2 B2-03:
+    /// pehle app mein is command ka koi sender hi nahi tha (ControlCommand
+    /// enum + firmware handler maujood thay, lekin Diagnostics wipe sirf
+    /// PC-side store mitata tha — board ki key kabhi rotate nahi hoti thi).
+    /// Sirf armed state mein: board BOOT-hold ≥10 s se armed hota hai
+    /// (LED fast blink 4 Hz, HELLO flags bit1 — <see cref="LastHelloKeyResetArmed"/>);
+    /// armed na ho to board UNSUPPORTED deta hai, is liye yahan pehle hi
+    /// saaf error milta hai (board tak kuch nahi jata). Kamyabi par board
+    /// purani key mitata hai, nayi key + naya password generate karta hai
+    /// aur restart hota hai — is liye PC-side purani key/password bhi
+    /// foran mitaye jate hain (stale key se agli command BAD_TAG khati),
+    /// counter 0 aur nonce saaf (naya session naye HELLO se banega).
+    /// Safe mode mein KEY_RESET nahi hota (§4.4) — armed flag hi authority hai.
+    /// </summary>
+    public async Task<(bool Sent, string? Error)> SendKeyResetAsync(string boardHost, IControlTransport? transport = null, CancellationToken cancellationToken = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(BoardSession));
+        if (!LastHelloKeyResetArmed)
+        {
+            return (false, "Board key-reset-armed nahi hai — pehle board par BOOT-hold ≥10 s karo (LED fast blink 4 Hz), phir dobara koshish karo (§4.4).");
+        }
+        if (!CanSendControl)
+        {
+            return (false, HasNonce
+                ? "KEY_RESET nahi bheja ja saka: session key maujood nahi (na session mein, na key store mein — KEY_RESET ke liye HMAC-signed control chahiye)."
+                : "KEY_RESET nahi bheja ja saka: abhi tak HELLO reply nahi aaya — board session nahi mila.");
+        }
+        var result = await SendControlCoreAsync(boardHost, ControlCommand.KeyReset, ReadOnlyMemory<byte>.Empty, transport, cancellationToken).ConfigureAwait(false);
+        if (result.ReplyPayload is null) return (false, result.Error ?? "KEY_RESET ka jawab nahi aaya.");
+        if (result.ReplyStatus != ControlStatus.Ok) return (false, $"Board ne KEY_RESET par {result.ReplyStatus} diya.");
+        // Kamyabi: board rotate + restart — purani credentials dead hain.
+        ClearKey();
+        if (BoardMac is not null)
+        {
+            try { _keyStore.Delete(RSH.Core.Security.KeyStore.BoardIdForMac(BoardMac)); }
+            catch (ObjectDisposedException) { /* store band — session key saaf hai, kaafi hai */ }
+            catch (InvalidOperationException) { /* store band — session key saaf hai, kaafi hai */ }
+        }
+        _nextCounter = 0;
+        if (_nonce is not null) Array.Clear(_nonce);
+        _nonce = null;
+        LastHelloKeyResetArmed = false;
         return (true, null);
     }
 
@@ -284,7 +427,9 @@ public sealed class BoardSession : IDisposable
     /// command kabhi nahi — SendRebootAsync jaisa guard). Counter session
     /// ke saath monotonic rehta hai (har call ke baad _nextCounter taaza).
     /// <paramref name="transport"/> sirf tests ke liye (fake transport);
-    /// null ho to asal UDP transport banta hai.</summary>
+    /// null ho to asal UDP transport banta hai. Round 2 B2-04: sends
+    /// control gate se serialize hote hain (counter race + serial
+    /// single-exchange).</summary>
     public async Task<ControlResult> SendControlAsync(
         string boardHost, ControlCommand command, ReadOnlyMemory<byte> payload,
         IControlTransport? transport = null, CancellationToken cancellationToken = default)
@@ -292,11 +437,29 @@ public sealed class BoardSession : IDisposable
         if (_disposed) throw new ObjectDisposedException(nameof(BoardSession));
         if (!CanSendControl) return new ControlResult(null, null,
             "Board session key/nonce maujood nahi — pehle HELLO/pairing chahiye.", 0);
-        TryGetKey(out byte[] key);
-        using var control = new ControlClient(boardHost, key, _nonce!, transport, firstCounter: _nextCounter);
-        var result = await control.SendCommandAsync(command, payload, cancellationToken).ConfigureAwait(false);
-        _nextCounter = control.NextCounter;
-        return result;
+        return await SendControlCoreAsync(boardHost, command, payload, transport, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>SendControlAsync / SendKeyResetAsync ka gated core — gate
+    /// ke baghair kabhi seedha mat bulao (sirf in dono methods se).</summary>
+    private async Task<ControlResult> SendControlCoreAsync(
+        string boardHost, ControlCommand command, ReadOnlyMemory<byte> payload,
+        IControlTransport? transport, CancellationToken cancellationToken)
+    {
+        if (!await AcquireControlGateAsync(cancellationToken).ConfigureAwait(false))
+            return new ControlResult(null, null, "Control request cancel hui.", 0);
+        try
+        {
+            TryGetKey(out byte[] key);
+            using var control = new ControlClient(boardHost, key, _nonce!, transport, firstCounter: _nextCounter);
+            var result = await control.SendCommandAsync(command, payload, cancellationToken).ConfigureAwait(false);
+            _nextCounter = control.NextCounter;
+            return result;
+        }
+        finally
+        {
+            _controlGate.Release();
+        }
     }
 
     /// HMAC-signed SET_PASSWORD (cmd 0x0C, §5.2) bhejo — board ka Wi-Fi/OTA
@@ -323,19 +486,28 @@ public sealed class BoardSession : IDisposable
                 ? "Password nahi badla ja saka: session key maujood nahi (na session mein, na key store mein — SET_PASSWORD ke liye HMAC-signed control chahiye)."
                 : "Password nahi badla ja saka: abhi tak HELLO reply nahi aaya — board session nahi mila.");
         }
-        TryGetKey(out byte[] key);
-        using var control = new ControlClient(boardHost, key, _nonce!, transport, firstCounter: _nextCounter);
-        var result = await control.SetPasswordAsync(newPassword, cancellationToken).ConfigureAwait(false);
-        _nextCounter = control.NextCounter;
-        if (result.ReplyPayload is null) return (false, result.Error ?? "SET_PASSWORD ka jawab nahi aaya.");
-        if (result.ReplyStatus != ControlStatus.Ok) return (false, $"Board ne SET_PASSWORD par {result.ReplyStatus} diya.");
-        if (BoardMac is not null)
+        if (!await AcquireControlGateAsync(cancellationToken).ConfigureAwait(false))
+            return (false, "SET_PASSWORD cancel hui.");
+        try
         {
-            bool saved = _keyStore.TrySavePassword(RSH.Core.Security.KeyStore.BoardIdForMac(BoardMac), newPassword);
-            if (!saved)
-                return (true, "Password board par badal gaya, lekin naya password secure store mein save nahi ho saka — WebOTA auth / Wi-Fi join ke liye password dobara darj karna hoga. Agar password bhool jaye to KEY_RESET (BOOT-hold ≥10 s) se naya password lo (PROTOCOL §5.4).");
+            TryGetKey(out byte[] key);
+            using var control = new ControlClient(boardHost, key, _nonce!, transport, firstCounter: _nextCounter);
+            var result = await control.SetPasswordAsync(newPassword, cancellationToken).ConfigureAwait(false);
+            _nextCounter = control.NextCounter;
+            if (result.ReplyPayload is null) return (false, result.Error ?? "SET_PASSWORD ka jawab nahi aaya.");
+            if (result.ReplyStatus != ControlStatus.Ok) return (false, $"Board ne SET_PASSWORD par {result.ReplyStatus} diya.");
+            if (BoardMac is not null)
+            {
+                bool saved = _keyStore.TrySavePassword(RSH.Core.Security.KeyStore.BoardIdForMac(BoardMac), newPassword);
+                if (!saved)
+                    return (true, "Password board par badal gaya, lekin naya password secure store mein save nahi ho saka — WebOTA auth / Wi-Fi join ke liye password dobara darj karna hoga. Agar password bhool jaye to KEY_RESET (BOOT-hold ≥10 s) se naya password lo (PROTOCOL §5.4).");
+            }
+            return (true, null);
         }
-        return (true, null);
+        finally
+        {
+            _controlGate.Release();
+        }
     }
 
     /// <summary>
@@ -365,40 +537,58 @@ public sealed class BoardSession : IDisposable
                 ? "LED test nahi bheja ja saka: session key maujood nahi (na session mein, na key store mein — LED_TEST ke liye HMAC-signed control chahiye)."
                 : "LED test nahi bheja ja saka: abhi tak HELLO reply nahi aaya — board session nahi mila.");
         }
-        TryGetKey(out byte[] key);
-        // Brightness (Phase H WS2): PC-side scaling — r/g/b ko
-        // brightnessPct% se zarb de kar bheja jata hai (integer math);
-        // wire format mein koi brightness field nahi (§3.7), is liye
-        // firmware ko tabdeeli nahi chahiye. 0% = strip kaali (pattern
-        // phir bhi chalta hai). SEC-H-10: firmware total run time
-        // 60 s par cap karta hai (repeats 255 bhi ~21 min nahi).
-        byte[] payload = new byte[8];
-        payload[0] = patternId;
-        payload[1] = (byte)(r * brightnessPct / 100);
-        payload[2] = (byte)(g * brightnessPct / 100);
-        payload[3] = (byte)(b * brightnessPct / 100);
-        payload[4] = (byte)(periodMs & 0xFF);
-        payload[5] = (byte)(periodMs >> 8);
-        payload[6] = repeats;
-        payload[7] = 0;
-        using var control = new ControlClient(boardHost, key, _nonce!, transport, firstCounter: _nextCounter);
-        var result = await control.SendCommandAsync(ControlCommand.LedTest, payload, cancellationToken).ConfigureAwait(false);
-        _nextCounter = control.NextCounter;
-        if (result.ReplyPayload is null) return (false, result.Error ?? "LED_TEST ka jawab nahi aaya.");
-        if (result.ReplyStatus != ControlStatus.Ok) return (false, $"Board ne LED_TEST par {result.ReplyStatus} diya.");
-        return (true, null);
+        if (!await AcquireControlGateAsync(cancellationToken).ConfigureAwait(false))
+            return (false, "LED_TEST cancel hui.");
+        try
+        {
+            TryGetKey(out byte[] key);
+            // Brightness (Phase H WS2): PC-side scaling — r/g/b ko
+            // brightnessPct% se zarb de kar bheja jata hai (integer math);
+            // wire format mein koi brightness field nahi (§3.7), is liye
+            // firmware ko tabdeeli nahi chahiye. 0% = strip kaali (pattern
+            // phir bhi chalta hai). SEC-H-10: firmware total run time
+            // 60 s par cap karta hai (repeats 255 bhi ~21 min nahi).
+            byte[] payload = new byte[8];
+            payload[0] = patternId;
+            payload[1] = (byte)(r * brightnessPct / 100);
+            payload[2] = (byte)(g * brightnessPct / 100);
+            payload[3] = (byte)(b * brightnessPct / 100);
+            payload[4] = (byte)(periodMs & 0xFF);
+            payload[5] = (byte)(periodMs >> 8);
+            payload[6] = repeats;
+            payload[7] = 0;
+            using var control = new ControlClient(boardHost, key, _nonce!, transport, firstCounter: _nextCounter);
+            var result = await control.SendCommandAsync(ControlCommand.LedTest, payload, cancellationToken).ConfigureAwait(false);
+            _nextCounter = control.NextCounter;
+            if (result.ReplyPayload is null) return (false, result.Error ?? "LED_TEST ka jawab nahi aaya.");
+            if (result.ReplyStatus != ControlStatus.Ok) return (false, $"Board ne LED_TEST par {result.ReplyStatus} diya.");
+            return (true, null);
+        }
+        finally
+        {
+            _controlGate.Release();
+        }
     }
 
-    /// <summary>GET_CAPS ek call mein: client banao, caps mango, client band karo. Na mile to (null, wajah). <paramref name="transport"/> sirf tests ke liye (fake transport).</summary>
+    /// <summary>GET_CAPS ek call mein: client banao, caps mango, client band karo. Na mile to (null, wajah). <paramref name="transport"/> sirf tests ke liye (fake transport). Round 2 B2-04: control gate ke andar (counter + serial single-exchange).</summary>
     public async Task<(BoardCaps? Caps, string? Error)> GetCapsAsync(string boardHost, IControlTransport? transport = null, CancellationToken cancellationToken = default)
     {
-        var client = CreateGetCapsClient(boardHost, out string? error, transport);
-        if (client is null) return (null, error);
-        using (client)
+        if (!await AcquireControlGateAsync(cancellationToken).ConfigureAwait(false))
+            return (null, "GET_CAPS cancel hui.");
+        try
         {
-            var caps = await client.GetCapsAsync(cancellationToken).ConfigureAwait(false);
-            _nextCounter = client.NextCounter;
-            return (caps, caps is null ? client.LastError : null);
+            var client = CreateGetCapsClient(boardHost, out string? error, transport);
+            if (client is null) return (null, error);
+            using (client)
+            {
+                var caps = await client.GetCapsAsync(cancellationToken).ConfigureAwait(false);
+                _nextCounter = client.NextCounter;
+                return (caps, caps is null ? client.LastError : null);
+            }
+        }
+        finally
+        {
+            _controlGate.Release();
         }
     }
 
@@ -411,6 +601,8 @@ public sealed class BoardSession : IDisposable
         _nonce = null;
         BoardMac = null;
         HelloFirmwareVersion = null;
+        LastHelloKeyResetArmed = false;
+        _controlGate.Dispose();
         if (_ownsKeyStore && _keyStore is IDisposable disposable) disposable.Dispose();
     }
 }

@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using NSec.Cryptography;
 using RSH.Core.Firmware;
 using RSH.Core.Net;
 using RSH.Core.Utilities;
@@ -12,9 +13,17 @@ public class PhaseCAppTests
 {
     // ---------- A1: FirmwareImageValidator ----------
 
+    /// <summary>Test signing keypair (throwaway — sirf tests ke liye).
+    /// Production Validate() baked RELEASE key istemal karta hai; test
+    /// images is key se sign hoti hain aur internal overload
+    /// Validate(image, TestPublicKey) se check hoti hain.</summary>
+    private static readonly Key TestSigningKey = Key.Create(SignatureAlgorithm.Ed25519);
+    private static byte[] TestPublicKey => TestSigningKey.PublicKey.Export(KeyBlobFormat.RawPublicKey);
+
     /// <summary>Synthetic valid ESP32 app image banayo (header + 1 segment + trailing SHA-256 + signed trailer).</summary>
     private static byte[] BuildImage(string version, byte magic = 0xE9, bool corruptSha = false,
-        bool includeVersionMarker = true, int segmentDataSize = 70_000, bool signed = true)
+        bool includeVersionMarker = true, int segmentDataSize = 70_000, bool signed = true,
+        int tamperAt = -1, byte[]? signatureOverride = null)
     {
         // Asal firmware jaisa: webota.cpp alag string literals jorta hai,
         // is liye marker aur version ke darmiyan NUL byte hota hai.
@@ -22,6 +31,7 @@ public class PhaseCAppTests
         byte[] payload = Encoding.ASCII.GetBytes("<html>" + marker + "</html>");
         byte[] data = new byte[segmentDataSize];
         Array.Copy(payload, data, Math.Min(payload.Length, data.Length));
+        if (tamperAt >= 0 && tamperAt < data.Length) data[tamperAt] ^= 0xFF; // payload tamper (ESP-IDF SHA dobara banta hai)
         using var ms = new MemoryStream();
         byte[] header = new byte[24];
         header[0] = magic;
@@ -48,26 +58,33 @@ public class PhaseCAppTests
         byte[] sha = SHA256.HashData(image);
         if (corruptSha) sha[0] ^= 0xFF;
         byte[] withSha = image.Concat(sha).ToArray();
-        return signed ? WithTestTrailer(withSha) : withSha;
+        return signed ? WithTestTrailer(withSha, signatureOverride) : withSha;
     }
 
     /// <summary>Format-valid signed trailer lagao (test-signing flow).
-    /// Signature yahan random bytes hain — app validator sirf trailer
-    /// format check karta hai; crypto authenticity board-side hai
-    /// (host §20 + sign-image.py --verify). Asal signed artifact
-    /// firmware-signed.bin hota hai (sign_firmware.py, RSH_SIGNING_KEY).</summary>
-    private static byte[] WithTestTrailer(byte[] image)
+    /// Signature asal Ed25519 hai: test keypair se SHA-256(image) par
+    /// (sign-image.py wali construction) — app-side verify (SEC-C-06)
+    /// ke baad random bytes wali trailer ab reject hoti hai, is liye
+    /// test images sahi sign karni parti hain.
+    /// <paramref name="signatureOverride"/> diya jaye to wahi 64 bytes
+    /// trailer mein jate hain (tamper/wrong-key tests).</summary>
+    private static byte[] WithTestTrailer(byte[] image, byte[]? signatureOverride = null)
     {
         byte[] trailer = new byte[FirmwareImageValidator.SignatureTrailerSizeBytes];
-        Random.Shared.NextBytes(trailer.AsSpan(0, 64));
+        byte[] sig = signatureOverride ?? SignatureAlgorithm.Ed25519.Sign(TestSigningKey, SHA256.HashData(image));
+        sig.CopyTo(trailer, 0);
         Encoding.ASCII.GetBytes("RSHS").CopyTo(trailer, 64);
         return image.Concat(trailer).ToArray();
     }
 
+    /// <summary>Test images validate karo (throwaway test pubkey se).</summary>
+    private static FirmwareImageValidator.ValidationResult ValidateTest(byte[] image) =>
+        FirmwareImageValidator.Validate(image, TestPublicKey);
+
     [Fact]
     public void ValidImage_Passes_WithVersionAndSha()
     {
-        var r = FirmwareImageValidator.Validate(BuildImage("4.0.0"));
+        var r = ValidateTest(BuildImage("4.0.0"));
         Assert.True(r.IsValid, r.Error);
         Assert.Equal(FirmwareImageValidator.ImageLayout.AppOnly, r.Layout);
         Assert.Equal(new Version(4, 0, 0), r.FirmwareVersion);
@@ -78,8 +95,70 @@ public class PhaseCAppTests
     [Fact]
     public void NewerVersion_Passes()
     {
-        Assert.True(FirmwareImageValidator.Validate(BuildImage("4.0.1")).IsValid);
-        Assert.True(FirmwareImageValidator.Validate(BuildImage("4.1.0")).IsValid);
+        Assert.True(ValidateTest(BuildImage("4.0.1")).IsValid);
+        Assert.True(ValidateTest(BuildImage("4.1.0")).IsValid);
+    }
+
+    // ---------- SEC-C-06 app-side Ed25519 verify (defense-in-depth) ----------
+
+    [Fact]
+    public void Ed25519_ValidSignedImage_Passes()
+    {
+        var r = ValidateTest(BuildImage("4.0.0"));
+        Assert.True(r.IsValid, r.Error);
+        Assert.True(r.IsSigned);
+    }
+
+    [Fact]
+    public void Ed25519_TamperedSignature_Rejected()
+    {
+        byte[] good = BuildImage("4.0.0");
+        good[good.Length - 68] ^= 0xFF; // signature ka pehla byte — ESP-IDF SHA abhi bhi sahi hai
+        var r = ValidateTest(good);
+        Assert.False(r.IsValid);
+        Assert.Contains("signature", r.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Ed25519_TamperedPayload_RecomputedSha_Rejected()
+    {
+        // Payload ka 1 byte badlo, ESP-IDF SHA dobara sahi banao — SHA
+        // check pass karta hai, sirf Ed25519 signature pakarti hai.
+        byte[] good = BuildImage("4.0.0");
+        byte[] sig = good.AsSpan(good.Length - 68, 64).ToArray();
+        byte[] tampered = BuildImage("4.0.0", tamperAt: 100, signatureOverride: sig);
+        var r = ValidateTest(tampered);
+        Assert.False(r.IsValid);
+        Assert.Contains("signature", r.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Ed25519_UnsignedImage_Rejected_Unchanged()
+    {
+        // Legacy/unsigned bin ka behaviour waisa hi hai jaisa pehle tha.
+        var r = FirmwareImageValidator.Validate(BuildImage("4.0.0", signed: false));
+        Assert.False(r.IsValid);
+        Assert.Contains("signed nahi hai", r.Error);
+    }
+
+    [Fact]
+    public void Ed25519_WrongKey_Rejected()
+    {
+        using var other = Key.Create(SignatureAlgorithm.Ed25519);
+        byte[] otherPub = other.PublicKey.Export(KeyBlobFormat.RawPublicKey);
+        var r = FirmwareImageValidator.Validate(BuildImage("4.0.0"), otherPub);
+        Assert.False(r.IsValid);
+        Assert.Contains("signature", r.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ReleasePubkey_Fingerprint_Matches()
+    {
+        // Baked release pubkey (signing_pubkey.h wali) ki copy sahi hai —
+        // typo / rotation drift foran pakra jata hai.
+        Assert.Equal(32, FirmwareImageValidator.ReleaseSigningPublicKey.Length);
+        string fp = Convert.ToHexString(SHA256.HashData(FirmwareImageValidator.ReleaseSigningPublicKey)).ToLowerInvariant();
+        Assert.Equal(FirmwareImageValidator.ReleaseSigningPublicKeyFingerprintHex, fp);
     }
 
     [Fact]
@@ -150,7 +229,7 @@ public class PhaseCAppTests
     [Fact]
     public void SignedImage_Passes_AndIsSigned()
     {
-        var r = FirmwareImageValidator.Validate(BuildImage("4.0.0"));
+        var r = ValidateTest(BuildImage("4.0.0"));
         Assert.True(r.IsValid, r.Error);
         Assert.True(r.IsSigned);
     }
@@ -214,6 +293,28 @@ public class PhaseCAppTests
         return null;
     }
 
+    /// <summary>Round 2 W4 QA fix: asal firmware version hard-code nahi —
+    /// <c>firmware/rsh/config.h</c> ka <c>FIRMWARE_VERSION</c> hi source of
+    /// truth hai. Round 1 ne firmware 4.0.0 → 4.0.1 bump kiya lekin ye test
+    /// 4.0.0 expect karta raha — is liye <c>RealFirmwareBin_Passes</c>
+    /// Round 1 ke baad fail hone laga (stale .pio bin se Round 1 ka run
+    /// pass dikha tha). Agle bump par ye test dobara nahi tootega.</summary>
+    private static Version ExpectedFirmwareVersion()
+    {
+        string? config = FindRepoFile(Path.Combine("firmware", "rsh", "config.h"));
+        if (config is null) Assert.Skip("firmware/rsh/config.h nahi mila — expected firmware version tay nahi ho sakta.");
+        foreach (string line in File.ReadLines(config))
+        {
+            string t = line.Trim();
+            if (!t.StartsWith("#define FIRMWARE_VERSION", StringComparison.Ordinal)) continue;
+            int q1 = t.IndexOf('"');
+            int q2 = t.IndexOf('"', q1 + 1);
+            if (q1 >= 0 && q2 > q1 && Version.TryParse(t[(q1 + 1)..q2], out Version? v)) return v;
+        }
+        Assert.Fail("config.h mein FIRMWARE_VERSION parse nahi hua.");
+        throw new InvalidOperationException("unreachable");
+    }
+
     [Fact]
     public void RealFirmwareBin_Passes()
     {
@@ -222,11 +323,13 @@ public class PhaseCAppTests
         // pio ka firmware.bin raw app image hai (unsigned — signing build
         // step firmware-signed.bin banata hai). Test-signing flow: asal
         // binary ki structure (magic, ESP SHA, version marker) check
-        // karne ke liye format-valid trailer in-memory lagao.
-        var r = FirmwareImageValidator.Validate(WithTestTrailer(File.ReadAllBytes(path)));
+        // karne ke liye test keypair se signed trailer in-memory lagao
+        // (public Validate baked RELEASE key mangta hai — yahan test key
+        // se sign hua hai, is liye internal overload).
+        var r = FirmwareImageValidator.Validate(WithTestTrailer(File.ReadAllBytes(path)), TestPublicKey);
         Assert.True(r.IsValid, r.Error);
         Assert.True(r.IsSigned);
-        Assert.Equal(new Version(4, 0, 0), r.FirmwareVersion);
+        Assert.Equal(ExpectedFirmwareVersion(), r.FirmwareVersion);
     }
 
     [Fact]
@@ -242,13 +345,14 @@ public class PhaseCAppTests
         var r = FirmwareImageValidator.Validate(File.ReadAllBytes(path));
         Assert.True(r.IsValid, r.Error);
         Assert.True(r.IsSigned);
-        Assert.Equal(new Version(4, 0, 0), r.FirmwareVersion);
+        Assert.Equal(ExpectedFirmwareVersion(), r.FirmwareVersion);
     }
 
     [Fact]
     public void RealMergedBin_RejectedAsMerged()
     {
-        string? path = FindRepoFile(Path.Combine("firmware", "rsh", ".pio", "build", "esp32dev", "RSH-Firmware-DevKitV1-v4.0.0.bin"));
+        string mergedName = $"RSH-Firmware-DevKitV1-v{ExpectedFirmwareVersion()}.bin";
+        string? path = FindRepoFile(Path.Combine("firmware", "rsh", ".pio", "build", "esp32dev", mergedName));
         if (path is null) Assert.Skip("Real merged bin maujood nahi — synthetic merged test cover karta hai.");
         var r = FirmwareImageValidator.Validate(File.ReadAllBytes(path));
         Assert.False(r.IsValid);

@@ -75,8 +75,8 @@
                                Appearance="{Binding CapturingPedals, Converter={StaticResource CaptureAppearance}}"
                                Command="{Binding ToggleCapturePedalsCommand}" Margin="0,0,0,8" HorizontalAlignment="Left" />
                     <StackPanel Orientation="Horizontal">
-                        <ui:TextBlock Width="230"><Run Text="{Binding AccelLabel, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding AccelMin}" /><Run Text=" → " /><Run Text="{Binding AccelMax}" /></ui:TextBlock>
-                        <ui:TextBlock><Run Text="{Binding BrakeLabel, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding BrakeMin}" /><Run Text=" → " /><Run Text="{Binding BrakeMax}" /></ui:TextBlock>
+                        <ui:TextBlock Width="230" TextWrapping="Wrap"><Run Text="{Binding AccelLabel, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding AccelMin}" /><Run Text=" → " /><Run Text="{Binding AccelMax}" /></ui:TextBlock>
+                        <ui:TextBlock TextWrapping="Wrap"><Run Text="{Binding BrakeLabel, Source={x:Static res:UiStrings.Instance}}" /><Run Text="{Binding BrakeMin}" /><Run Text=" → " /><Run Text="{Binding BrakeMax}" /></ui:TextBlock>
                     </StackPanel>
                 </StackPanel>
             </ui:Card>

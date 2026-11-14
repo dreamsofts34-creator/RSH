@@ -177,7 +177,10 @@ public sealed class ProfileStore
 
             // SEC-C-12/SEC-C-18: na-maloom (mustaqbil ka) schema version
             // khamoshi se ignore nahi hota — file reject, backup/defaults.
-            if (data.SchemaVersion > ProfileFile.CurrentSchemaVersion) return null;
+            // DATA-AI FIX: manfi version bhi reject (import path pehle se
+            // <0 reject karta tha — Load ka qabool karna inconsistent tha
+            // aur manfi file ko "v1 migration" bana deta tha).
+            if (data.SchemaVersion < 0 || data.SchemaVersion > ProfileFile.CurrentSchemaVersion) return null;
 
             if (!root.TryGetProperty("Profiles", out var profilesEl) ||
                 profilesEl.ValueKind != JsonValueKind.Array)
@@ -303,12 +306,26 @@ public sealed class ProfileStore
 
             // SEC-C-11: save-side count cap — 64 se zyada profiles kabhi
             // disk par nahi jati (pehli 64 mehfooz rehti hain).
-            if (data.Profiles.Count > MaxProfiles)
-                data.Profiles = data.Profiles.Take(MaxProfiles).ToList();
+            // DATA-AI FIX: caller ki list mutate mat karo — pehle
+            // data.Profiles ko Take(64) se badal diya jata tha, is liye
+            // live ProfileFile se 64 se zyada profiles khamoshi se ghayab
+            // ho jati thin (in-memory data loss). Ab sirf save hone wali
+            // copy kaati jati hai; caller ki list waisi hi rehti hai.
+            // Round 2 B2-07: hamesha snapshot lo (Take(64).ToList() bhi
+            // jab ≤64 ho to live list hi deta tha) — SaveAsync background
+            // par serialize karta hai jab ke UI thread list mein Add/Remove
+            // kar sakta hai (InvalidOperationException: collection modified
+            // → save fail). Snapshot se enumeration stable rehti hai.
+            var saveData = new ProfileFile
+            {
+                SchemaVersion = ProfileFile.CurrentSchemaVersion,
+                Profiles = data.Profiles.Take(MaxProfiles).ToList(),
+                ActiveProfileName = data.ActiveProfileName,
+            };
 
             // A10: hamesha maujooda schema likho.
             data.SchemaVersion = ProfileFile.CurrentSchemaVersion;
-            string json = JsonSerializer.Serialize(data, JsonOptions);
+            string json = JsonSerializer.Serialize(saveData, JsonOptions);
 
             // SEC-C-14: unique temp naam — do concurrent Save (UI +
             // auto-save) ek hi .tmp par nahi likhte; purana fixed .tmp
@@ -333,9 +350,13 @@ public sealed class ProfileStore
                 // pehle se mojood v1 backup kabhi overwrite nahi hota).
                 // Yehi backup downgrade par RestoreV1Backup() istemal karta hai.
                 // SEC-C-11: bari file ki .v1.bak copy nahi banti.
+                // DATA-AI FIX: OnDiskSchemaVersion ab parse-failure par -1
+                // deta hai (pehle 0 — kharab file bhi "v1" lagti thi aur
+                // kharab bytes .v1.bak mein mehfooz ho jate thay). Sirf
+                // asal v1 (0/1) ki copy banti hai.
                 if (File.Exists(_filePath) && !File.Exists(V1BackupPath) &&
                     new FileInfo(_filePath).Length <= MaxFileBytes &&
-                    OnDiskSchemaVersion(_filePath) < ProfileFile.CurrentSchemaVersion)
+                    OnDiskSchemaVersion(_filePath) is 0 or 1)
                 {
                     try { File.Copy(_filePath, V1BackupPath); } catch (IOException) { /* backup best-effort hai — save nahi rukti */ }
                 }
@@ -353,8 +374,17 @@ public sealed class ProfileStore
                     {
                         if (ParsesOk(BackupPath))
                         {
+                            // DATA-AI FIX: .bak1 ko .bak2 par sirf tab barhao
+                            // jab .bak1 khud theek ho — pehle kharab .bak1
+                            // achi .bak2 ko overwrite kar ke aakhri achi
+                            // generation mita deta tha.
                             if (File.Exists(Backup1Path))
-                                File.Copy(Backup1Path, Backup2Path, overwrite: true);
+                            {
+                                if (ParsesOk(Backup1Path))
+                                    File.Copy(Backup1Path, Backup2Path, overwrite: true);
+                                else
+                                    File.Delete(Backup1Path); // kharab generation — aage nahi barhegi
+                            }
                             File.Move(BackupPath, Backup1Path, overwrite: true);
                         }
                         else
@@ -436,16 +466,17 @@ public sealed class ProfileStore
         }
     }
 
+    /// <summary>On-disk file ka schema version — parse na ho to -1 (DATA-AI FIX: pehle 0 milta tha, is liye kharab file v1 lagti thi).</summary>
     private static int OnDiskSchemaVersion(string path)
     {
         try
         {
             string? json = TryReadCapped(path);
-            if (json is null) return 0;
+            if (json is null) return -1;
             using var doc = JsonDocument.Parse(json);
             return TryGetInt(doc.RootElement, "SchemaVersion");
         }
-        catch { return 0; }
+        catch { return -1; }
     }
 
     private static bool ParsesOk(string path)

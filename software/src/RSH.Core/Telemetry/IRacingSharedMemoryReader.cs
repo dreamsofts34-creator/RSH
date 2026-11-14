@@ -221,7 +221,11 @@ public sealed class IRacingSharedMemoryReader : ITelemetryReader
             return false;
         }
 
-        SessionState state = sessionStateRaw switch
+        // DATA-AI FIX: SessionState var hi na mile (purana/naya SDK layout)
+        // to state Unknown hai — raw 0 ko Menu samajhna khamoshi se ghalat
+        // state deta tha (sessionStateOffset -1 par sessionStateRaw 0 rehta
+        // tha → Menu). Unknown kabhi switch nahi karta (fail-closed).
+        SessionState state = sessionStateOffset < 0 ? SessionState.Unknown : sessionStateRaw switch
         {
             4 => SessionState.OnTrack,  // Racing
             3 => SessionState.OnTrack,  // ParadeLaps — gaari track par hai
