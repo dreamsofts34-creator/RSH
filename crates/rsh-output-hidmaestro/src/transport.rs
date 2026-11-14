@@ -278,14 +278,17 @@ fn verify_loopback_peer_pid(stream: &TcpStream, expected_pid: u32) -> std::io::R
     };
     use windows::Win32::Networking::WinSock::AF_INET;
 
-    let local_port = stream.local_addr()?.port();
-    let remote_port = stream.peer_addr()?.port();
-    // Ports in the TCP table are network byte order in the low 16 bits.
-    let table_port = |raw: u32| -> u16 { (raw as u16).swap_bytes() };
     // `127.0.0.1` as a little-endian u32, as the table stores it.
     const LOOPBACK_ADDR: u32 = 0x0100_007F;
     // `MIB_TCP_STATE_ESTABLISHED`.
     const ESTABLISHED: u32 = 5;
+
+    let local_port = stream.local_addr()?.port();
+    let remote_port = stream.peer_addr()?.port();
+    // Ports in the TCP table are network byte order in the low 16 bits
+    // (the low 16 bits of the stored u32, masked explicitly so the
+    // truncation is intentional, not a silent `as` cast).
+    let table_port = |raw: u32| -> u16 { u16::try_from(raw & 0xFFFF).unwrap_or(0).swap_bytes() };
 
     let mut size: u32 = 0;
     // SAFETY: first call with a null table only queries the size
@@ -293,9 +296,9 @@ fn verify_loopback_peer_pid(stream: &TcpStream, expected_pid: u32) -> std::io::R
     let rc = unsafe {
         GetExtendedTcpTable(
             None,
-            &mut size,
+            &raw mut size,
             false,
-            AF_INET.0 as u32,
+            u32::from(AF_INET.0),
             TCP_TABLE_OWNER_PID_CONNECTIONS,
             0,
         )
@@ -316,9 +319,9 @@ fn verify_loopback_peer_pid(stream: &TcpStream, expected_pid: u32) -> std::io::R
     let rc = unsafe {
         GetExtendedTcpTable(
             Some(buf.as_mut_ptr().cast::<std::ffi::c_void>()),
-            &mut size,
+            &raw mut size,
             false,
-            AF_INET.0 as u32,
+            u32::from(AF_INET.0),
             TCP_TABLE_OWNER_PID_CONNECTIONS,
             0,
         )

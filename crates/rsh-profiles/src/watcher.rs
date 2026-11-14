@@ -195,7 +195,7 @@ impl ForegroundDetector for WindowsForegroundDetector {
                 return None;
             }
             let mut pid: u32 = 0;
-            win32::GetWindowThreadProcessId(hwnd, &mut pid);
+            win32::GetWindowThreadProcessId(hwnd, &raw mut pid);
             if pid == 0 {
                 return None;
             }
@@ -205,7 +205,8 @@ impl ForegroundDetector for WindowsForegroundDetector {
             }
             let mut buffer = [0_u16; 260];
             let mut size: u32 = 260;
-            let ok = win32::QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size);
+            let ok =
+                win32::QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &raw mut size);
             win32::CloseHandle(handle);
             if ok == 0 {
                 return None;

@@ -918,7 +918,7 @@ fn registry_dll_path() -> Option<PathBuf> {
                 PCWSTR::from_raw(subkey_w.as_ptr()),
                 Some(0),
                 KEY_READ,
-                &mut key,
+                &raw mut key,
             )
         };
         if opened.0 != 0 {
@@ -934,9 +934,9 @@ fn registry_dll_path() -> Option<PathBuf> {
                 key,
                 PCWSTR::from_raw(value_w.as_ptr()),
                 None,
-                Some(&mut value_type),
+                Some(&raw mut value_type),
                 Some(buf.as_mut_ptr().cast::<u8>()),
-                Some(&mut byte_len),
+                Some(&raw mut byte_len),
             )
         };
         // SAFETY: closing an open key.
@@ -2926,6 +2926,7 @@ mod tests {
     // (`ProgramFiles`): the test harness runs tests in parallel, and
     // a stray `ProgramFiles` would change what the missing-driver
     // test resolves.
+    #[cfg(unix)]
     static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// M1: the DLL hash is verified BEFORE the DLL is loaded, on the

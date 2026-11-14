@@ -65,7 +65,7 @@ impl SharedMemoryMap {
             let mut info = MEMORY_BASIC_INFORMATION::default();
             let queried = VirtualQuery(
                 Some(view.Value.cast_const()),
-                &mut info,
+                &raw mut info,
                 std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
             );
             if queried == 0 {

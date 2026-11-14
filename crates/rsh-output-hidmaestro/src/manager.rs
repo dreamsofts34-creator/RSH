@@ -812,7 +812,7 @@ fn outcome_static(outcome: &str) -> &'static str {
 /// publish job / owner-PC gate (H-HID-5).
 #[cfg(windows)]
 fn spawn_elevated_runas(path: &std::path::Path, port: u16) -> Result<usize, HidMaestroError> {
-    use windows::Win32::Foundation::{ERROR_CANCELLED, WIN32_ERROR};
+    use windows::Win32::Foundation::{ERROR_CANCELLED, HINSTANCE, HWND, WIN32_ERROR};
     use windows::Win32::UI::Shell::{
         SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
     };
@@ -834,20 +834,20 @@ fn spawn_elevated_runas(path: &std::path::Path, port: u16) -> Result<usize, HidM
     let mut info = SHELLEXECUTEINFOW {
         cbSize: u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>()).unwrap_or(0),
         fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_NOCLOSEPROCESS,
-        hwnd: Default::default(),
+        hwnd: HWND::default(),
         lpVerb: PCWSTR::from_raw(verb.as_ptr()),
         lpFile: PCWSTR::from_raw(file.as_ptr()),
         lpParameters: PCWSTR::from_raw(params.as_ptr()),
         lpDirectory: PCWSTR::null(),
         nShow: 0, // SW_HIDE — the sidecar has no window
-        hInstApp: Default::default(),
+        hInstApp: HINSTANCE::default(),
         ..Default::default()
     };
     // SAFETY: `ShellExecuteExW` with valid pointers (see above); the
     // struct is stack-allocated for the call. windows 0.62 returns
     // `Result<()>`; the Win32 error is recovered from the `Error`
     // (FACILITY_WIN32 HRESULT) via `WIN32_ERROR::from_error`.
-    match unsafe { ShellExecuteExW(&mut info) } {
+    match unsafe { ShellExecuteExW(&raw mut info) } {
         // The handle address (not the `HANDLE` itself — it is not
         // `Send`, and the backend must stay `Send`); the manager
         // reconstructs it only to terminate + close it.
@@ -860,7 +860,7 @@ fn spawn_elevated_runas(path: &std::path::Path, port: u16) -> Result<usize, HidM
             }
             Err(HidMaestroError::SpawnFailed(format!(
                 "ShellExecuteEx (runas) failed, Win32 error {}",
-                win32.map(|w| w.0).unwrap_or_else(|| e.code().0 as u32)
+                win32.map_or_else(|| e.code().0.cast_unsigned(), |w| w.0)
             )))
         }
     }

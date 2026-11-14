@@ -585,7 +585,7 @@ impl ProcessSpawner for SystemSpawner {
                     return false;
                 }
                 let mut exit_code: u32 = 0;
-                let ok = win32::GetExitCodeProcess(handle, &mut exit_code);
+                let ok = win32::GetExitCodeProcess(handle, &raw mut exit_code);
                 win32::CloseHandle(handle);
                 ok != 0 && exit_code == win32::STILL_ACTIVE
             }
@@ -640,8 +640,12 @@ impl ProcessSpawner for SystemSpawner {
                 }
                 let mut buffer = [0_u16; 4096];
                 let mut size = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
-                let ok =
-                    win32::QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size);
+                let ok = win32::QueryFullProcessImageNameW(
+                    handle,
+                    0,
+                    buffer.as_mut_ptr(),
+                    &raw mut size,
+                );
                 win32::CloseHandle(handle);
                 if ok == 0 {
                     return None;
