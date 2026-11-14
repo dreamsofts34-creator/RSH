@@ -8,10 +8,14 @@
 //!
 //! Commands are thin wrappers over `rsh_app_core` — all logic and tests
 //! live there, because this crate cannot be compiled in the Linux
-//! sandbox (Tauri needs WebKitGTK); Windows CI compiles it. Every
+//! sandbox (Tauri needs `WebKitGTK`); Windows CI compiles it. Every
 //! wrapper reads/writes the real `AppState` (registered with
 //! `.manage()`): engine metrics + loop-rate tracker + output backend +
 //! game launcher + profile store. No wrapper stubs or fakes a result.
+//! Command signatures take `AppHandle` / `State` / owned args by value because
+//! the `#[tauri::command]` macro requires it, so `clippy::needless_pass_by_value` is
+//! allowed on the command fns below (not a skipped check — the signatures
+//! cannot take references).
 //!
 //! Implemented here (56): `ping`, `get_version`, `validate_pin_map`,
 //! `validate_firmware_image` (Phase E) + `list_backups`,
@@ -33,17 +37,17 @@
 //! `open_config_folder`, `get_startup_notice` (Phase H3: thin
 //! wrappers over the `AppStateCore` transport state / store repair)
 //! + `begin_pairing`, `get_pairing_status`, `get_firmware_version`
-//! (Phase H5: thin wrappers over the `AppStateCore` session
-//! activator — the pairing status and the firmware version read the
-//! activator's records, which exist only while a session is live)
+//!   (Phase H5: thin wrappers over the `AppStateCore` session
+//!   activator — the pairing status and the firmware version read the
+//!   activator's records, which exist only while a session is live)
 //! + `set_password`, `get_config`, `stage_config`, `commit_config`,
-//! `confirm_config`, `rollback_config`, `get_config_state`,
-//! `get_pin_map`, `set_pin_map`, `upload_firmware`, `restart_wheel`
-//! (Phase H5-control: thin wrappers over the
-//! run-a-control-command-under-a-fresh-session helper in
-//! `rsh_app_core::state` — every command opens its own fresh session
-//! with a fresh nonce and a signed `GET_CAPS` first, then closes it
-//! and zeroizes the key).
+//!   `confirm_config`, `rollback_config`, `get_config_state`,
+//!   `get_pin_map`, `set_pin_map`, `upload_firmware`, `restart_wheel`
+//!   (Phase H5-control: thin wrappers over the
+//!   run-a-control-command-under-a-fresh-session helper in
+//!   `rsh_app_core::state` — every command opens its own fresh session
+//!   with a fresh nonce and a signed `GET_CAPS` first, then closes it
+//!   and zeroizes the key).
 //!
 //! Honest limits of the H5-control commands (the behaviour is what it
 //! says — see the `rsh-app-core` docs for the full reasoning):
@@ -113,6 +117,7 @@ fn get_version() -> &'static str {
 /// Thin wrapper over `rsh_app_core::commands::validate_pin_map` — the
 /// logic and the tests live there.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn validate_pin_map(pins: Vec<PinAssignment>) -> PinMapValidation {
     rsh_app_core::commands::validate_pin_map(&pins)
 }
@@ -125,6 +130,7 @@ fn validate_pin_map(pins: Vec<PinAssignment>) -> PinMapValidation {
 /// command docs) — the wizard compares the returned `version` against
 /// the installed version from `get_firmware_version`.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn validate_firmware_image(path: String) -> FirmwareValidation {
     rsh_app_core::commands::validate_firmware_image(std::path::Path::new(&path))
 }
@@ -141,8 +147,7 @@ fn list_backups() -> Vec<BackupInfo> {
 
 /// Windows Firewall rule state (read-only probe; see
 /// `rsh_app_core::commands::get_firewall_state`). The COM-based rule
-/// management path (`system::firewall_rule_state`) is used by the
-/// startup ensure path, not by this command — the frontend contract
+/// `rsh_app_core::commands::get_firewall_state`). The frontend contract
 /// is `{ rulePresent, detail }`.
 #[tauri::command]
 fn get_firewall_state() -> FirewallState {
@@ -151,6 +156,7 @@ fn get_firewall_state() -> FirewallState {
 
 /// Autostart state (via the `tauri-plugin-autostart` manager).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_autostart(app: tauri::AppHandle) -> Result<bool, String> {
     system::get_autostart(&app)
 }
@@ -158,6 +164,7 @@ fn get_autostart(app: tauri::AppHandle) -> Result<bool, String> {
 /// Enable or disable autostart (via the `tauri-plugin-autostart`
 /// manager). Returns the resulting enabled state.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
     system::set_autostart(&app, enabled)
 }
@@ -194,6 +201,7 @@ fn export_diagnostics() -> Result<String, String> {
 /// Current engine stats (loop rate measured, p99s `null` while
 /// unmeasured — never a fake 0).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_engine_stats(state: tauri::State<'_, AppState>) -> EngineStats {
     state.core().engine_stats()
 }
@@ -201,6 +209,7 @@ fn get_engine_stats(state: tauri::State<'_, AppState>) -> EngineStats {
 /// The latest 30 Hz snapshot on demand (the live feed is the
 /// `rsh://snapshot` event).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_snapshot(state: tauri::State<'_, AppState>) -> EngineSnapshot {
     state.core().snapshot()
 }
@@ -212,6 +221,7 @@ fn get_snapshot(state: tauri::State<'_, AppState>) -> EngineSnapshot {
 /// The live transport + session state for the Settings / Setup
 /// screens. Thin wrapper over `AppStateCore::transport_state`.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_transport_state(state: tauri::State<'_, AppState>) -> TransportState {
     state.core().transport_state()
 }
@@ -269,6 +279,7 @@ fn connect_transport_inner(
 /// first; for USB the address is only a hint — the board port is
 /// auto-detected, and a missing board errors honestly.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn connect_transport(
     state: tauri::State<'_, AppState>,
     transport: String,
@@ -279,6 +290,7 @@ fn connect_transport(
 
 /// Disconnects the live transport (the engine keeps ticking idle).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn disconnect_transport(state: tauri::State<'_, AppState>) -> Result<TransportState, String> {
     state.core().disconnect_transport()?;
     Ok(state.core().transport_state())
@@ -288,6 +300,7 @@ fn disconnect_transport(state: tauri::State<'_, AppState>) -> Result<TransportSt
 /// never blocks the switch — there may be nothing live), then
 /// connects the requested one.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn switch_transport(
     state: tauri::State<'_, AppState>,
     transport: String,
@@ -318,6 +331,7 @@ fn open_config_folder() -> Result<(), String> {
 /// outcome), if startup had anything to report. The shell shows it
 /// once as a dismissible banner; `None` on a clean start.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_startup_notice(state: tauri::State<'_, AppState>) -> Option<String> {
     state.startup_notice()
 }
@@ -337,6 +351,7 @@ fn get_startup_notice(state: tauri::State<'_, AppState>) -> Option<String> {
 /// asynchronously in the forwarder); the frontend polls
 /// `get_pairing_status` while the window is open.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn begin_pairing(state: tauri::State<'_, AppState>) -> Result<PairingStatus, String> {
     state.core().begin_pairing()
 }
@@ -345,6 +360,7 @@ fn begin_pairing(state: tauri::State<'_, AppState>) -> Result<PairingStatus, Str
 /// password while the window is open, and the last activation
 /// failure, if any. Thin wrapper over `AppStateCore::pairing_status`.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_pairing_status(state: tauri::State<'_, AppState>) -> PairingStatus {
     state.core().pairing_status()
 }
@@ -354,6 +370,7 @@ fn get_pairing_status(state: tauri::State<'_, AppState>) -> PairingStatus {
 /// — the version comes from the board, never from a local guess.
 /// Thin wrapper over `AppStateCore::firmware_version`.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_firmware_version(state: tauri::State<'_, AppState>) -> Result<String, String> {
     state.core().firmware_version()
 }
@@ -375,6 +392,7 @@ fn get_firmware_version(state: tauri::State<'_, AppState>) -> Result<String, Str
 /// with the new password (the OS Wi-Fi profile still holds the old
 /// one).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn set_password(state: tauri::State<'_, AppState>, password: String) -> Result<(), String> {
     state.core().set_password(&password)
 }
@@ -385,6 +403,7 @@ fn set_password(state: tauri::State<'_, AppState>, password: String) -> Result<(
 /// and the derived `buttons` view of the three fixed `BUTTON` slot
 /// roles).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_config(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
     state.core().get_config()
 }
@@ -397,6 +416,7 @@ fn get_config(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, St
 /// under a fresh session. The staged blob is NOT live until
 /// `commit_config` + `confirm_config`.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn stage_config(
     state: tauri::State<'_, AppState>,
     config: serde_json::Value,
@@ -409,6 +429,7 @@ fn stage_config(
 /// blob, live-applies it, and starts the 30 s confirm window. Only
 /// legal after `stage_config`.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn commit_config(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.core().commit_config()
 }
@@ -419,6 +440,7 @@ fn commit_config(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// sending `CONFIRM` (the board has already rolled back on its own;
 /// run `rollback_config` to verify).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn confirm_config(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.core().confirm_config()
 }
@@ -428,6 +450,7 @@ fn confirm_config(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// from `Staged` (explicit cancel) and `Committed` (confirm timeout
 /// / late confirm / expired window).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn rollback_config(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.core().rollback_config()
 }
@@ -437,6 +460,7 @@ fn rollback_config(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// `AppStateCore::config_state`: the recorded state, with no board
 /// call.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_config_state(state: tauri::State<'_, AppState>) -> &'static str {
     state.core().config_state()
 }
@@ -448,6 +472,7 @@ fn get_config_state(state: tauri::State<'_, AppState>) -> &'static str {
 /// the shifter up/down `BUTTON` slots, and battery / I²C records are
 /// omitted — `set_pin_map` preserves them untouched.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_pin_map(state: tauri::State<'_, AppState>) -> Result<Vec<PinAssignment>, String> {
     state.core().get_pin_map()
 }
@@ -461,6 +486,7 @@ fn get_pin_map(state: tauri::State<'_, AppState>) -> Result<Vec<PinAssignment>, 
 /// a validation verdict (`valid: false` with the reason), not an
 /// error — nothing is staged.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn set_pin_map(
     state: tauri::State<'_, AppState>,
     pins: Vec<PinAssignment>,
@@ -468,7 +494,7 @@ fn set_pin_map(
     state.core().set_pin_map(pins)
 }
 
-/// Upload a firmware image over the board's WebOTA server (Setup
+/// Upload a firmware image over the board's `WebOTA` server (Setup
 /// wizard). Thin wrapper over `AppStateCore::upload_firmware`: the
 /// real board OTA path — a fresh session reads the live version,
 /// the image is verified (Ed25519 signature + format + anti-downgrade
@@ -478,6 +504,7 @@ fn set_pin_map(
 /// version confirm is the caller's job on reconnect, via
 /// `get_firmware_version`.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn upload_firmware(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
     state.core().upload_firmware(std::path::Path::new(&path))
 }
@@ -488,12 +515,14 @@ fn upload_firmware(state: tauri::State<'_, AppState>, path: String) -> Result<()
 /// board takes seconds to reboot and the forwarder has no
 /// re-activation retry); the user reconnects once the board is back.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn restart_wheel(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.core().restart_wheel()
 }
 
 /// Output backend state, exactly as the backend reports it.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_output_state(state: tauri::State<'_, AppState>) -> OutputState {
     state.core().output_state()
 }
@@ -503,6 +532,7 @@ fn get_output_state(state: tauri::State<'_, AppState>) -> OutputState {
 /// enabling resends the last pipeline output. The returned state
 /// reports whether the backend accepted the send.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn set_output_state(state: tauri::State<'_, AppState>, enabled: bool) -> OutputState {
     state.core().set_output_enabled(enabled)
 }
@@ -517,6 +547,7 @@ fn set_output_state(state: tauri::State<'_, AppState>, enabled: bool) -> OutputS
 /// backend exactly as it was. Errors honestly on an unknown name or a
 /// failed switch instead of pretending the switch happened.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn set_output_backend(
     state: tauri::State<'_, AppState>,
     backend: String,
@@ -531,6 +562,7 @@ fn set_output_backend(
 /// vJoy is missing. Thin wrapper over
 /// `rsh_app_core::state::AppStateCore::list_output_backends`.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn list_output_backends(state: tauri::State<'_, AppState>) -> Vec<BackendStatus> {
     state.core().list_output_backends()
 }
@@ -541,12 +573,14 @@ fn list_output_backends(state: tauri::State<'_, AppState>) -> Vec<BackendStatus>
 
 /// List-row summaries for the Profiles screen, in store order.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn list_profiles(state: tauri::State<'_, AppState>) -> Vec<ProfileSummary> {
     state.core().list_profiles()
 }
 
 /// The active profile's summary, if one is active.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_active_profile(state: tauri::State<'_, AppState>) -> Option<ProfileSummary> {
     state.core().active_profile()
 }
@@ -554,6 +588,7 @@ fn get_active_profile(state: tauri::State<'_, AppState>) -> Option<ProfileSummar
 /// Activates a profile (a manual choice: auto-switch locks off until
 /// re-enabled) and persists the store.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn activate_profile(
     state: tauri::State<'_, AppState>,
     id: String,
@@ -563,6 +598,7 @@ fn activate_profile(
 
 /// Creates a profile with default tuning under `name` and persists.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn create_profile(
     state: tauri::State<'_, AppState>,
     name: String,
@@ -572,6 +608,7 @@ fn create_profile(
 
 /// Duplicates a profile (new id, `"copy"` name) and persists.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn duplicate_profile(
     state: tauri::State<'_, AppState>,
     id: String,
@@ -581,6 +618,7 @@ fn duplicate_profile(
 
 /// Deletes a profile and persists.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn delete_profile(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     state.core().delete_profile(&id)
 }
@@ -588,6 +626,7 @@ fn delete_profile(state: tauri::State<'_, AppState>, id: String) -> Result<(), S
 /// Imports a profile file (size-capped, schema-checked by the store)
 /// and persists.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn import_profile(
     state: tauri::State<'_, AppState>,
     path: String,
@@ -597,6 +636,7 @@ fn import_profile(
 
 /// Exports a profile to a file.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn export_profile(
     state: tauri::State<'_, AppState>,
     id: String,
@@ -607,6 +647,7 @@ fn export_profile(
 
 /// Current app settings.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_settings(state: tauri::State<'_, AppState>) -> AppSettings {
     state.core().settings()
 }
@@ -618,6 +659,7 @@ fn get_settings(state: tauri::State<'_, AppState>) -> AppSettings {
 /// the same path as the toggle; flipping `auto_switch_profiles` on
 /// starts the auto-switch watcher.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn set_settings(
     state: tauri::State<'_, AppState>,
     settings: AppSettingsPatch,
@@ -629,6 +671,7 @@ fn set_settings(
 /// the setting, and starts the 2 Hz watcher thread when it is not
 /// already running. Returns the updated settings.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn enable_auto_switch(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
     state.core().enable_auto_switch()
 }
@@ -639,6 +682,7 @@ fn enable_auto_switch(state: tauri::State<'_, AppState>) -> Result<AppSettings, 
 /// else 100); `period_ms` is 100–5000 (default 1000). The brightness
 /// scales the pattern's RGB values before the command is encoded.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn led_test(
     state: tauri::State<'_, AppState>,
     pattern: String,
@@ -655,6 +699,7 @@ fn led_test(
 /// loudly. On success the session gate closes and the session
 /// records are cleared, so the board can be paired again.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn key_reset(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.core().key_reset()
 }
@@ -662,6 +707,7 @@ fn key_reset(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// Factory-resets the board (M-6): same session cleanup as
 /// `key_reset` on success.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn factory_reset(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.core().factory_reset()
 }
@@ -672,6 +718,7 @@ fn factory_reset(state: tauri::State<'_, AppState>) -> Result<(), String> {
 /// the replacement allowed exactly once, and returns the resulting
 /// transport state.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn confirm_pairing_replacement(
     state: tauri::State<'_, AppState>,
 ) -> Result<TransportState, String> {
@@ -682,6 +729,7 @@ fn confirm_pairing_replacement(
 /// Imported profiles are validated on load; the returned summaries
 /// are the profiles that were actually added.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn import_csharp_profiles(
     state: tauri::State<'_, AppState>,
     path: String,
@@ -693,6 +741,7 @@ fn import_csharp_profiles(
 /// (M-6): only the fields present in the file overwrite; the Wi-Fi
 /// password is ignored (it is never stored in a C# export).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn import_csharp_settings(
     state: tauri::State<'_, AppState>,
     path: String,
@@ -702,6 +751,7 @@ fn import_csharp_settings(
 
 /// Forces a backup rotation now and returns the backup list.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn backup_now(state: tauri::State<'_, AppState>) -> Result<Vec<BackupInfo>, String> {
     state.core().backup_now()
 }
@@ -711,6 +761,7 @@ fn backup_now(state: tauri::State<'_, AppState>) -> Result<Vec<BackupInfo>, Stri
 /// resolves against the store directory, an absolute path must lie
 /// inside it; settings generations restore the settings too).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn restore_backup(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
     state.core().restore_backup(&path)
 }
@@ -722,24 +773,28 @@ fn restore_backup(state: tauri::State<'_, AppState>, path: String) -> Result<(),
 /// Every catalogue game with install state, bound profile, and running
 /// state.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn list_games(state: tauri::State<'_, AppState>) -> Vec<GameInfo> {
     state.core().list_games()
 }
 
 /// Launches a game (exactly one at a time; the launcher tracks the pid).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn launch_game(state: tauri::State<'_, AppState>, id: String) -> Result<GameInfo, String> {
     state.core().launch_game(&id)
 }
 
 /// Stops the tracked running game (only the tracked pid).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn stop_game(state: tauri::State<'_, AppState>, id: String) -> Result<GameInfo, String> {
     state.core().stop_game(&id)
 }
 
 /// One game's current state (installed / running / bound profile).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_game_state(state: tauri::State<'_, AppState>, id: String) -> Result<GameInfo, String> {
     state.core().get_game_state(&id)
 }
@@ -751,6 +806,7 @@ fn get_game_state(state: tauri::State<'_, AppState>, id: String) -> Result<GameI
 /// The tuning for one module (session tuning, else the active
 /// profile's stored tuning, else the neutral default).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_tuning(state: tauri::State<'_, AppState>, module: String) -> TuningSettings {
     state.core().get_tuning(&module)
 }
@@ -758,6 +814,7 @@ fn get_tuning(state: tauri::State<'_, AppState>, module: String) -> TuningSettin
 /// Validates and stores one module's tuning (and writes its core
 /// fields through to the active profile).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn set_tuning(
     state: tauri::State<'_, AppState>,
     tuning: TuningSettings,
@@ -768,12 +825,14 @@ fn set_tuning(
 /// The active profile's captured calibration. Errors honestly when
 /// there is no active profile or nothing was captured yet.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn get_calibration(state: tauri::State<'_, AppState>) -> Result<Calibration, String> {
     state.core().get_calibration()
 }
 
 /// Saves a captured calibration into the active profile.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 fn save_calibration(
     state: tauri::State<'_, AppState>,
     calibration: Calibration,
@@ -835,10 +894,9 @@ fn build_app_state() -> AppState {
                         active.display_name()
                     );
                     if outcome.fell_back {
-                        line.push_str(&format!(
-                            " (fell back: {})",
-                            outcome.reason.as_deref().unwrap_or("unknown reason")
-                        ));
+                        line.push_str(" (fell back: ");
+                        line.push_str(outcome.reason.as_deref().unwrap_or("unknown reason"));
+                        line.push(')');
                     }
                     eprintln!("{line}");
                 }
@@ -867,6 +925,47 @@ fn build_app_state() -> AppState {
     }
 }
 
+/// Second-instance callback (single-instance plugin): a second launch
+/// focuses the existing window instead of opening another one. L-4:
+/// the second instance's argv carries `--rsh-version <a.b.c>`
+/// (`AUTOSTART_ARGS` puts it there for autostart launches), and the
+/// version is compared with `resolve_instance` — an older second
+/// instance is refused, a newer one is logged loudly, and the
+/// same-version case just focuses. `TakeOver` is NEVER a silent kill
+/// of this instance: the plugin has already exited the second
+/// instance, so exiting here would leave zero instances running.
+#[allow(clippy::needless_pass_by_value)]
+fn on_second_instance(app: &tauri::AppHandle, args: Vec<String>, _cwd: String) {
+    let second_version = parse_instance_version_arg(&args);
+    match second_version.as_deref() {
+        Some(version) => match resolve_instance(Some(APP_VERSION), version) {
+            InstanceDecision::TakeOver => {
+                eprintln!(
+                    "[RSH] a newer instance (v{version}) tried to launch; \
+                     single-instance handover is unsupported — keeping this \
+                     instance (v{APP_VERSION}) focused"
+                );
+            }
+            InstanceDecision::YieldFailClosed => {
+                eprintln!(
+                    "[RSH] an older or unparseable instance (v{version}) tried \
+                     to launch; refused, keeping this instance (v{APP_VERSION}) focused"
+                );
+            }
+            InstanceDecision::FocusExisting => {}
+        },
+        None => {
+            eprintln!(
+                "[RSH] a second instance launched without --rsh-version; \
+                 focusing this instance (v{APP_VERSION})"
+            );
+        }
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_focus();
+    }
+}
+
 fn main() {
     // Repair a stale autostart entry before Settings reads the state.
     // A failure is not silent any more: it joins the startup notice
@@ -884,46 +983,8 @@ fn main() {
         state.set_startup_notice(notice);
     }
     let app = tauri::Builder::default()
-        // Single instance (registered FIRST): a second launch focuses the
-        // existing window instead of opening another one. L-4: the
-        // second instance's argv carries `--rsh-version <a.b.c>`
-        // (AUTOSTART_ARGS puts it there for autostart launches), and
-        // the version is compared with `resolve_instance` — an older
-        // second instance is refused, a newer one is logged loudly,
-        // and the same-version case just focuses. `TakeOver` is NEVER
-        // a silent kill of this instance: the plugin has already
-        // exited the second instance, so exiting here would leave
-        // zero instances running.
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            let second_version = parse_instance_version_arg(&args);
-            match second_version.as_deref() {
-                Some(version) => match resolve_instance(Some(APP_VERSION), version) {
-                    InstanceDecision::TakeOver => {
-                        eprintln!(
-                            "[RSH] a newer instance (v{version}) tried to launch; \
-                             single-instance handover is unsupported — keeping this \
-                             instance (v{APP_VERSION}) focused"
-                        );
-                    }
-                    InstanceDecision::YieldFailClosed => {
-                        eprintln!(
-                            "[RSH] an older or unparseable instance (v{version}) tried \
-                             to launch; refused, keeping this instance (v{APP_VERSION}) focused"
-                        );
-                    }
-                    InstanceDecision::FocusExisting => {}
-                },
-                None => {
-                    eprintln!(
-                        "[RSH] a second instance launched without --rsh-version; \
-                         focusing this instance (v{APP_VERSION})"
-                    );
-                }
-            }
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_focus();
-            }
-        }))
+        // Single instance (registered FIRST): see `on_second_instance`.
+        .plugin(tauri_plugin_single_instance::init(on_second_instance))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             // `init` takes `Option<Vec<&'static str>>` (CI Windows,
@@ -1030,6 +1091,6 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building RSH");
     app.run(|app, event| {
-        system::handle_run_event(event, || app.state::<AppState>().shutdown());
+        system::handle_run_event(&event, || app.state::<AppState>().shutdown());
     });
 }

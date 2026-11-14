@@ -3,7 +3,7 @@
 //! The testable logic lives in `rsh_app_core::system` /
 //! `rsh_app_core::diagnostics`; this file is the thin Tauri/Windows
 //! glue over it. It **cannot be compile-checked in the Linux
-//! sandbox** (Tauri needs WebKitGTK there, and the `windows` crate
+//! sandbox** (Tauri needs `WebKitGTK` there, and the `windows` crate
 //! does not compile on Linux at all) — Windows CI compiles it. Every
 //! Windows-only item is `#[cfg(windows)]`-gated with a non-Windows
 //! stub that fails loudly instead of silently doing nothing.
@@ -24,7 +24,7 @@
 //! // Shutdown: build the app, then run it with the event handler:
 //! let app = tauri::Builder::default() /* …plugins… */ .build(tauri::generate_context!())?;
 //! app.run(|_app, event| {
-//!     system::handle_run_event(event, || {
+//!     system::handle_run_event(&event, || {
 //!         // Coordinator-owned: signal the engine stop handle and
 //!         // hand over the output sink, e.g.
 //!         // rsh_app_core::system::shutdown_output(Some(&stop), &mut sink)
@@ -37,15 +37,15 @@
 //! wrappers in `main.rs` (logic here or in `rsh-app-core`):
 //! - `get_autostart` / `set_autostart` → [`set_autostart`] (+ a
 //!   `get_` wrapper over `AutostartManager::is_enabled`);
-//! - `get_firewall_state` → [`firewall_rule_state`];
+//! - `get_firewall_state` → `rsh_app_core::commands::get_firewall_state`;
 //! - `check_for_update` → [`check_for_update`] then
 //!   `rsh_app_core::system::check_update` against the running
 //!   version;
 //! - `export_diagnostics` → `rsh_app_core::diagnostics::export_diagnostics`.
 
 use rsh_app_core::diagnostics;
-use rsh_app_core::system::{FirewallState, RunKeyStore, ShutdownOutcome, SystemError, UpdateInfo};
-use tauri::{AppHandle, Manager, RunEvent};
+use rsh_app_core::system::{RunKeyStore, ShutdownOutcome, SystemError, UpdateInfo};
+use tauri::{AppHandle, RunEvent};
 
 /// Args the app is launched with from autostart: start hidden to the
 /// tray (the window is only shown when the user clicks the tray icon
@@ -210,164 +210,6 @@ pub fn parse_reg_query_value(stdout: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Tray-hide guard (SW-R7.4)
-// ---------------------------------------------------------------------------
-
-/// Hide the main window to the tray, guarded: the hide is refused
-/// when no tray icon exists (the C# v2.0.1 trap — see
-/// `rsh_app_core::system::TrayGuard`).
-///
-/// # Errors
-///
-/// Returns [`SystemError::TrayMissing`] (as a message) when no tray
-/// icon exists, or a message when the window cannot be hidden.
-pub fn hide_to_tray(
-    app: &AppHandle,
-    guard: &rsh_app_core::system::TrayGuard,
-) -> Result<(), String> {
-    guard.authorise_hide().map_err(|error| error.to_string())?;
-    let Some(window) = app.get_webview_window("main") else {
-        return Err("main window not found".to_string());
-    };
-    window.hide().map_err(|error| error.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Firewall, program-scoped (SW-R7.4 spike — VERIFIED path)
-// ---------------------------------------------------------------------------
-
-/// Ensure the program-scoped inbound-allow firewall rule for the
-/// running exe exists and is enabled (Windows Firewall API
-/// `INetFwPolicy2` / `INetFwRule` — no `netsh`, per A11).
-///
-/// Verified against the `windows` 0.62.2 crate source (see
-/// `docs/SYSTEM-INTEGRATION.md` §4): `NetFwPolicy2` CLSID
-/// `e2b3c97f-6ae1-41ac-817a-f6f92166d7dd`, `NetFwRule` CLSID
-/// `2c5bc43e-3369-4c33-ab0c-be9469677af4`,
-/// `INetFwRules::Add` / `Item` / `Remove`,
-/// `INetFwRule::SetName` / `SetApplicationName` / `SetDirection` /
-/// `SetProfiles` / `SetAction` / `SetEnabled` / `SetProtocol`.
-/// Idempotent: an existing `RSH` rule is re-pointed at the current
-/// exe instead of duplicated. Needs elevation — a non-elevated call
-/// fails and the caller must surface that (the app keeps working
-/// without the rule).
-///
-/// # Errors
-///
-/// Returns a message when COM / the firewall API fails, or on
-/// non-Windows platforms.
-#[cfg(windows)]
-pub fn ensure_firewall_rule(exe_path: &std::path::Path) -> Result<(), String> {
-    use windows::Win32::Foundation::VARIANT_TRUE;
-    use windows::Win32::NetworkManagement::WindowsFirewall::{
-        INetFwPolicy2, INetFwRule, NET_FW_ACTION_ALLOW, NET_FW_IP_PROTOCOL_ANY,
-        NET_FW_PROFILE2_ALL, NET_FW_RULE_DIR_IN, NetFwPolicy2, NetFwRule,
-    };
-    use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-    };
-    use windows::core::BSTR;
-
-    unsafe {
-        // Tauri may already have initialised COM on this thread;
-        // a second init reports RPC_E_CHANGED_MODE — ignore it.
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let policy: INetFwPolicy2 =
-            CoCreateInstance(&NetFwPolicy2, None, CLSCTX_ALL).map_err(|error| error.to_string())?;
-        let rules = policy.Rules().map_err(|error| error.to_string())?;
-        let name = BSTR::from(rsh_app_core::system::FIREWALL_RULE_NAME);
-        let exe = BSTR::from(exe_path.as_os_str().to_string_lossy().as_ref());
-        match rules.Item(&name) {
-            Ok(existing) => {
-                existing
-                    .SetApplicationName(&exe)
-                    .map_err(|error| error.to_string())?;
-                existing
-                    .SetEnabled(VARIANT_TRUE)
-                    .map_err(|error| error.to_string())?;
-                Ok(())
-            }
-            Err(_) => {
-                let rule: INetFwRule = CoCreateInstance(&NetFwRule, None, CLSCTX_ALL)
-                    .map_err(|error| error.to_string())?;
-                rule.SetName(&name).map_err(|error| error.to_string())?;
-                rule.SetApplicationName(&exe)
-                    .map_err(|error| error.to_string())?;
-                // Program-scoped: no port is named. ANY protocol so
-                // both the UDP board traffic and any future TCP
-                // control traffic are covered by the one rule.
-                // `SetProtocol` takes a raw `i32`, not the
-                // `NET_FW_IP_PROTOCOL` newtype (CI Windows, 2026-11-14:
-                // E0308 expected `i32`, found `NET_FW_IP_PROTOCOL`) —
-                // same `.0` shape as `SetProfiles` below.
-                rule.SetProtocol(NET_FW_IP_PROTOCOL_ANY.0)
-                    .map_err(|error| error.to_string())?;
-                rule.SetDirection(NET_FW_RULE_DIR_IN)
-                    .map_err(|error| error.to_string())?;
-                rule.SetProfiles(NET_FW_PROFILE2_ALL.0)
-                    .map_err(|error| error.to_string())?;
-                rule.SetAction(NET_FW_ACTION_ALLOW)
-                    .map_err(|error| error.to_string())?;
-                rule.SetEnabled(VARIANT_TRUE)
-                    .map_err(|error| error.to_string())?;
-                rules.Add(&rule).map_err(|error| error.to_string())
-            }
-        }
-    }
-}
-
-/// Non-Windows stub: the firewall rule is Windows-only.
-#[cfg(not(windows))]
-pub fn ensure_firewall_rule(_exe_path: &std::path::Path) -> Result<(), String> {
-    Err(SystemError::UnsupportedPlatform("Windows Firewall rule").to_string())
-}
-
-/// Read the current RSH firewall state for the Settings page.
-///
-/// # Errors
-///
-/// Returns a message when the firewall API cannot be queried, or on
-/// non-Windows platforms.
-#[cfg(windows)]
-pub fn firewall_rule_state() -> Result<FirewallState, String> {
-    use windows::Win32::NetworkManagement::WindowsFirewall::{INetFwPolicy2, NetFwPolicy2};
-    use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-    };
-    use windows::core::BSTR;
-
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let policy: INetFwPolicy2 =
-            CoCreateInstance(&NetFwPolicy2, None, CLSCTX_ALL).map_err(|error| error.to_string())?;
-        let rules = policy.Rules().map_err(|error| error.to_string())?;
-        let name = BSTR::from(rsh_app_core::system::FIREWALL_RULE_NAME);
-        match rules.Item(&name) {
-            Ok(rule) => {
-                let enabled = rule.Enabled().map(|value| value.0 != 0).unwrap_or(false);
-                let exe_path = rule.ApplicationName().map(|value| value.to_string()).ok();
-                // Profiles are not read back: the rule is created
-                // with ALL profiles and the state page reports
-                // presence + enabled + exe, which is what the user
-                // acts on.
-                Ok(FirewallState {
-                    rule_present: true,
-                    rule_enabled: enabled,
-                    exe_path,
-                })
-            }
-            Err(_) => Ok(FirewallState::absent()),
-        }
-    }
-}
-
-/// Non-Windows stub: no firewall state exists off Windows.
-#[cfg(not(windows))]
-pub fn firewall_rule_state() -> Result<FirewallState, String> {
-    Err(SystemError::UnsupportedPlatform("Windows Firewall state").to_string())
-}
-
-// ---------------------------------------------------------------------------
 // Update check (SW-R7.5)
 // ---------------------------------------------------------------------------
 
@@ -412,11 +254,11 @@ pub async fn check_for_update(app: &AppHandle) -> Result<Option<UpdateInfo>, Str
 /// engine must never strand the exit.
 ///
 /// Wire-up (coordinator, `main.rs`): build the app and call
-/// `app.run(|_app, event| system::handle_run_event(event, || …))`
+/// `app.run(|_app, event| system::handle_run_event(&event, || …))`
 /// — see the module docs. The engine stop handle + output sink live
 /// in the app state the coordinator owns; this function deliberately
 /// takes them as a closure instead of inventing a state type here.
-pub fn handle_run_event<F>(event: RunEvent, shutdown: F)
+pub fn handle_run_event<F>(event: &RunEvent, shutdown: F)
 where
     F: FnOnce() -> ShutdownOutcome,
 {
@@ -498,7 +340,7 @@ mod tests {
         // wildcard match only cares about the variant, so construct
         // via the non-exhaustive-friendly path: any non-exit event
         // must NOT run the shutdown. Ready is constructible.
-        handle_run_event(RunEvent::Ready, move || {
+        handle_run_event(&RunEvent::Ready, move || {
             moved.fetch_add(1, Ordering::SeqCst);
             ShutdownOutcome {
                 stop_signalled: true,

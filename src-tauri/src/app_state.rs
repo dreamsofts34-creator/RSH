@@ -2,11 +2,11 @@
 //!
 //! A thin shell over [`AppStateCore`](rsh_app_core::state::AppStateCore):
 //! it owns the snapshot emitter thread, which samples the core at 30 Hz
-//! and emits `rsh://snapshot` / `rsh://button-press` into the WebView,
+//! and emits `rsh://snapshot` / `rsh://button-press` into the `WebView`,
 //! starts the engine task at launch (idle + best-effort UDP connect),
 //! and it runs the real shutdown-neutral path on exit. All state logic
 //! and tests live in `rsh-app-core`; this file cannot be compiled in
-//! the Linux sandbox (Tauri needs WebKitGTK) — Windows CI compiles it.
+//! the Linux sandbox (Tauri needs `WebKitGTK`) — Windows CI compiles it.
 
 use std::sync::{
     Arc, Mutex, MutexGuard,
@@ -78,7 +78,7 @@ impl AppState {
 
     /// Starts the 30 Hz snapshot emitter thread (once; later calls are
     /// no-ops). The thread samples the core's latest snapshot and
-    /// drains its button-press queue, emitting both into the WebView;
+    /// drains its button-press queue, emitting both into the `WebView`;
     /// a failed emit is ignored (the frontend re-reads via
     /// `get_snapshot` — a dropped event is never retried into a
     /// burst). If the thread cannot be spawned, this logs loudly and
