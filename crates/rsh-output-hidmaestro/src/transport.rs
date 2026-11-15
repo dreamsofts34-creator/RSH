@@ -576,6 +576,36 @@ pub fn generate_token() -> String {
 mod tests {
     use super::*;
 
+    /// A process that exits immediately with no output, for the stdio
+    /// EOF test: `/bin/true` on Unix; `cmd /c exit 0` on Windows
+    /// (`cmd` resolves via PATH — `Command::new` does the lookup
+    /// there). The Unix paths do not exist on Windows, so the tests
+    /// that spawned them failed there with NotFound (dry run #7).
+    #[cfg(unix)]
+    fn immediate_exit_helper() -> (std::path::PathBuf, Vec<String>) {
+        (std::path::PathBuf::from("/bin/true"), Vec::new())
+    }
+    #[cfg(windows)]
+    fn immediate_exit_helper() -> (std::path::PathBuf, Vec<String>) {
+        (
+            std::path::PathBuf::from("cmd"),
+            vec!["/c".to_string(), "exit".to_string(), "0".to_string()],
+        )
+    }
+
+    /// A process that reads stdin but never replies, for the
+    /// queued-writer test: `/bin/cat` on Unix; bare `cmd` on Windows
+    /// (reads commands from stdin until it closes, and the test
+    /// sends nothing). Dropped like `cat`, the transport ends it.
+    #[cfg(unix)]
+    fn stdin_sink_helper() -> (std::path::PathBuf, Vec<String>) {
+        (std::path::PathBuf::from("/bin/cat"), Vec::new())
+    }
+    #[cfg(windows)]
+    fn stdin_sink_helper() -> (std::path::PathBuf, Vec<String>) {
+        (std::path::PathBuf::from("cmd"), Vec::new())
+    }
+
     #[test]
     fn token_is_32_hex_and_unique() {
         let a = generate_token();
@@ -621,9 +651,10 @@ mod tests {
 
     #[test]
     fn stdio_spawn_and_eof_detection() {
-        // `/bin/true` exits immediately with no output: the reader
+        // The helper exits immediately with no output: the reader
         // must report EOF promptly.
-        let transport = spawn_stdio(Path::new("/bin/true"), &[], &[]).unwrap();
+        let (path, args) = immediate_exit_helper();
+        let transport = spawn_stdio(&path, &args, &[]).unwrap();
         match transport.events.recv_timeout(Duration::from_secs(5)) {
             Ok(TransportEvent::Eof) => {}
             other => panic!("expected EOF, got {other:?}"),
@@ -663,9 +694,10 @@ mod tests {
     /// blocking the caller, even when the reader never reads.
     #[test]
     fn queued_writer_does_not_block_on_unread_pipe() {
-        // `/bin/cat` reads stdin but never replies — the queue must
+        // The helper reads stdin but never replies — the queue must
         // still accept lines (the reader thread is irrelevant here).
-        let transport = spawn_stdio(Path::new("/bin/cat"), &[], &[]).unwrap();
+        let (path, args) = stdin_sink_helper();
+        let transport = spawn_stdio(&path, &args, &[]).unwrap();
         drop(transport);
     }
 }
