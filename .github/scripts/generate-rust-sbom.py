@@ -62,18 +62,30 @@ def main() -> None:
     lock_text = lock_path.read_text(encoding="utf-8")
     lock_count = len(re.findall(r"^\[\[package\]\]", lock_text, re.MULTILINE))
 
+    # Dry run #10 (2026-11-15): `text=True` decoded cargo metadata with
+    # the Windows locale codec (cp1252) and crashed on byte 0x81
+    # (UnicodeDecodeError, then json.loads(None) TypeError) — and the
+    # PowerShell step swallowed it and printed "SBOMs regenerated"
+    # anyway, so no sbom-rust.cdx.json was ever written. Capture BYTES
+    # and decode UTF-8 explicitly (cargo metadata is JSON, UTF-8 by
+    # spec); a decode failure is fail-closed here, never
+    # errors="replace" on the data. stderr is only ever shown inside
+    # an error message, so replace there is fine.
     try:
         result = subprocess.run(
             ["cargo", "metadata", "--format-version", "1", "--locked"],
             cwd=root,
             capture_output=True,
-            text=True,
         )
     except FileNotFoundError:
         fail("cargo not found on PATH")
     if result.returncode != 0:
-        fail(f"cargo metadata failed:\n{result.stderr}")
-    metadata = json.loads(result.stdout)
+        fail(f"cargo metadata failed:\n{result.stderr.decode('utf-8', errors='replace')}")
+    try:
+        stdout_text = result.stdout.decode("utf-8")
+    except UnicodeDecodeError as e:
+        fail(f"cargo metadata output is not valid UTF-8: {e}")
+    metadata = json.loads(stdout_text)
     packages = metadata["packages"]
 
     if len(packages) != lock_count:

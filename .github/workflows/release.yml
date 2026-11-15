@@ -11,15 +11,22 @@
 #      `src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe`
 #      (Tauri `bundle.externalBin` — lands beside RSH.exe). It runs first
 #      because the rsh-app build script validates bundle.externalBin at
-#      build time — without the staged sidecar, `cargo test --workspace`
-#      fails (dry runs #1/#2 + first CI run, 2026-11-14).
+#      build time — without the staged sidecar, `cargo test --workspace
+#      --release` fails (dry runs #1/#2 + first CI run, 2026-11-14).
 #   2. Gates: `cargo fmt --check`, `cargo clippy --workspace` (Windows —
 #      the sidecar is already staged, so the rsh-app build script passes),
-#      `cargo test --workspace`, `cargo test --workspace --release`,
+#      `cargo test --workspace --release`,
 #      `cargo deny check`, frontend lint + tests + locale check + audit +
 #      build. A tag push does NOT trigger CI, so the release workflow
 #      must be a superset of the CI gates (deep-scan Round 2, H4) —
 #      a tag must never ship what CI would have rejected.
+#      (Debug `cargo test --workspace` is NOT re-run here — user order
+#      2026-11-15: dry runs must not repeat the full suite. CI already
+#      proved the debug suite green on this tree: run 43673557870,
+#      head 48b7aa0, 13/13 jobs incl. test (Windows) + test (Linux);
+#      run 43669130447, head 49f011a9, also 13/13. The --release run
+#      below stays — CI never runs --release tests, so only this
+#      workflow proves them on Windows.)
 #   3. Firmware: PlatformIO build of `firmware/` (C++ v4.0.1) + Ed25519 signing
 #      with the `RSH_SIGNING_KEY_PEM` secret + fail-closed verify
 #      (`sign-image.py --verify` + image-region == `firmware.bin` + size check).
@@ -206,8 +213,8 @@ jobs:
 
       # ---- Sidecar FIRST: fetch pinned HIDMaestro, verify hashes, AOT publish ----
       # The rsh-app build script (Tauri) validates bundle.externalBin at build
-      # time, so the sidecar must be staged BEFORE `cargo test --workspace` —
-      # otherwise the test step fails with "resource path
+      # time, so the sidecar must be staged BEFORE `cargo test --workspace
+      # --release` — otherwise the test step fails with "resource path
       # `binaries\\rsh-hm-sidecar-x86_64-pc-windows-msvc.exe` doesn't exist"
       # (release dry runs #1/#2 + first CI run, 2026-11-14). Shared script
       # (M6) — the same script CI test-windows / tauri-build / clippy-windows
@@ -226,9 +233,12 @@ jobs:
         # script passes here (unlike Linux CI, which excludes rsh-app).
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
-
+      # Debug `cargo test --workspace` REMOVED (user order 2026-11-15):
+      # dry runs must not repeat the full suite — CI already proved the
+      # debug suite green on this tree (run 43673557870, head 48b7aa0,
+      # 13/13 incl. test Windows + test Linux; run 43669130447, head
+      # 49f011a9, also 13/13). The --release run below stays: CI never
+      # runs --release tests, so only this workflow proves them.
       - name: cargo test --workspace --release
         # TESTING-INPUT §9.1: the --release test run is required at least
         # once before the release gate — this is that run, before the
@@ -337,11 +347,23 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "release-staging" | Out-Null
+          # Fail-closed (dry run #10): pwsh does NOT fail a step when a
+          # native command exits non-zero — the SBOM script crashed on a
+          # cp1252 decode and the step still printed "SBOMs regenerated"
+          # with no sbom-rust.cdx.json written. Check $LASTEXITCODE after
+          # every native call, and verify all three files exist + parse.
           python .github/scripts/generate-rust-sbom.py release-staging/sbom-rust.cdx.json
+          if ($LASTEXITCODE -ne 0) { Write-Error "generate-rust-sbom.py failed (exit $LASTEXITCODE) — no Rust SBOM, failing closed."; exit 1 }
           Push-Location frontend
           npm sbom --sbom-format cyclonedx --sbom-version 1.5 > ../release-staging/sbom-frontend.cdx.json
+          if ($LASTEXITCODE -ne 0) { Write-Error "npm sbom failed (exit $LASTEXITCODE)."; Pop-Location; exit 1 }
           Pop-Location
           Copy-Item sbom/sidecar.cdx.json release-staging/sbom-sidecar.cdx.json
+          foreach ($f in @("sbom-rust.cdx.json", "sbom-frontend.cdx.json", "sbom-sidecar.cdx.json")) {
+            if (-not (Test-Path "release-staging/$f")) { Write-Error "Missing SBOM after regenerate: $f."; exit 1 }
+            $bom = Get-Content "release-staging/$f" -Raw | ConvertFrom-Json
+            if (-not $bom.components -or $bom.components.Count -eq 0) { Write-Error "SBOM $f has no components — not a fresh valid SBOM."; exit 1 }
+          }
           Write-Host "SBOMs regenerated (sidecar SBOM is hand-written; pins verified in the next step)."
 
       # M4 (deep-scan Round 2): the hand-written sidecar SBOM is only as
