@@ -147,6 +147,20 @@ fn init_startup_logging() {
 /// `Win32_UI_WindowsAndMessaging`, and a last-resort dialog must not
 /// depend on a new dependency. Windows CI compile is the gate for
 /// this function (it cannot compile in the Linux sandbox).
+/// Raw `user32` binding for the fatal dialog (see `show_fatal_dialog`).
+/// Module level on purpose: an `extern` block after statements trips
+/// `clippy::items-after-statements`.
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn MessageBoxW(
+        hwnd: *mut std::ffi::c_void,
+        text: *const u16,
+        caption: *const u16,
+        utype: u32,
+    ) -> i32;
+}
+
 #[cfg(windows)]
 fn show_fatal_dialog(title: &str, message: &str) {
     use std::os::windows::ffi::OsStrExt;
@@ -158,15 +172,6 @@ fn show_fatal_dialog(title: &str, message: &str) {
     }
     let text = to_wide_nul(message);
     let caption = to_wide_nul(title);
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn MessageBoxW(
-            hwnd: *mut std::ffi::c_void,
-            text: *const u16,
-            caption: *const u16,
-            utype: u32,
-        ) -> i32;
-    }
     // 0x10 = MB_ICONERROR (MB_OK is 0x0).
     unsafe {
         MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), 0x10);
@@ -187,6 +192,7 @@ fn show_fatal_dialog(_title: &str, _message: &str) {}
 /// when the data dir is unwritable the `%TEMP%\RSH\logs` fallback
 /// is what is shown (review bugs C/D).
 fn fatal_startup(reason: &str) -> ! {
+    use std::fmt::Write;
     let written = log_fatal(reason);
     let mut detail = reason.to_string();
     if written.is_empty() {
@@ -196,7 +202,7 @@ fn fatal_startup(reason: &str) -> ! {
     } else {
         detail.push_str("\n\nDetails were written to:");
         for path in &written {
-            detail.push_str(&format!("\n{}", path.display()));
+            let _ = write!(detail, "\n{}", path.display());
         }
     }
     show_fatal_dialog("RSH — Startup Error", &detail);
@@ -965,14 +971,13 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<tauri::tray::TrayIcon> {
         .icon(icon)
         .tooltip("RSH — Real Sim Hub")
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click { button, .. } = event {
-                if button == MouseButton::Left {
-                    if let Some(window) = tray.app_handle().get_webview_window("main") {
-                        let _ = window.unminimize();
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
-                }
+            if let TrayIconEvent::Click { button, .. } = event
+                && button == MouseButton::Left
+                && let Some(window) = tray.app_handle().get_webview_window("main")
+            {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
             }
         })
         .build(app)
@@ -1121,6 +1126,62 @@ fn fold_autostart_error(state: &AppState, error: Option<String>) {
     }
 }
 
+/// `setup` for the Tauri shell — extracted from `main()` so `main()`
+/// stays under clippy's 100-line limit.
+///
+/// Bug 5 (v1.0.2): `--tray` (see `AUTOSTART_ARGS`) used to be parsed
+/// by nobody — autostart launches showed the window anyway and
+/// `build_tray` was dead code. An autostart launch now builds the
+/// tray icon and starts hidden; a left-click on the icon (or a second
+/// launch — see `on_second_instance`) shows the window again. The
+/// tray build MUST succeed before the window is hidden: a failed tray
+/// with a hidden window would leave the user with no way to reach the
+/// app at all.
+fn setup_shell(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().any(|arg| arg == "--tray") {
+        match build_tray(app.handle()) {
+            Ok(icon) => {
+                // `TrayIcon` is reference-counted and removed
+                // from the tray when dropped — and it is
+                // `!Send` (its inner handle is `Rc`), so it
+                // cannot live in managed state. It is
+                // intentionally leaked here: its lifetime IS
+                // the process lifetime.
+                std::mem::forget(icon);
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+                log_startup("--tray launch: window hidden, tray icon active");
+            }
+            Err(error) => {
+                let line = format!(
+                    "[RSH] --tray launch: tray icon failed to build: {error}; starting with the window visible"
+                );
+                eprintln!("{line}");
+                log_startup(&line);
+            }
+        }
+    }
+    let state = app.state::<AppState>();
+    state.start_snapshot_emitter(app.handle());
+    // Phase G gate wiring: start the engine task (idle + the
+    // best-effort UDP connect). The UDP connect runs the H5
+    // session activator on the forwarder: flag-1 HELO →
+    // `HELLO` → `pair`/`resume` with a signed `GET_CAPS`
+    // first → the session gate opens only on success. A
+    // failure here never fails startup — `start_engine` logs
+    // it and the app keeps running without wheel input.
+    state.start_engine();
+    // C1: when auto-switch is persisted on, start the 2 Hz
+    // car-profile watcher thread (no-op when already running).
+    if state.core().settings().auto_switch_profiles {
+        state.core().start_auto_switch();
+    }
+    // v1.0.2: this line proves startup reached the end of setup.
+    log_startup("setup complete");
+    Ok(())
+}
+
 fn main() {
     // v1.0.2: panic hook + process-start log first, before anything
     // else can panic (see `init_startup_logging`).
@@ -1159,59 +1220,7 @@ fn main() {
         // launcher + profile store. Registered before `setup` starts
         // the snapshot emitter thread.
         .manage(state)
-        .setup(|app| {
-            // Bug 5 (v1.0.2): `--tray` (see `AUTOSTART_ARGS`) used to
-            // be parsed by nobody — autostart launches showed the
-            // window anyway and `build_tray` was dead code. An
-            // autostart launch now builds the tray icon and starts
-            // hidden; a left-click on the icon (or a second launch —
-            // see `on_second_instance`) shows the window again. The
-            // tray build MUST succeed before the window is hidden: a
-            // failed tray with a hidden window would leave the user
-            // with no way to reach the app at all.
-            if std::env::args().any(|arg| arg == "--tray") {
-                match build_tray(app.handle()) {
-                    Ok(icon) => {
-                        // `TrayIcon` is reference-counted and removed
-                        // from the tray when dropped — and it is
-                        // `!Send` (its inner handle is `Rc`), so it
-                        // cannot live in managed state. It is
-                        // intentionally leaked here: its lifetime IS
-                        // the process lifetime.
-                        std::mem::forget(icon);
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.hide();
-                        }
-                        log_startup("--tray launch: window hidden, tray icon active");
-                    }
-                    Err(error) => {
-                        let line = format!(
-                            "[RSH] --tray launch: tray icon failed to build: {error}; starting with the window visible"
-                        );
-                        eprintln!("{line}");
-                        log_startup(&line);
-                    }
-                }
-            }
-            let state = app.state::<AppState>();
-            state.start_snapshot_emitter(app.handle());
-            // Phase G gate wiring: start the engine task (idle + the
-            // best-effort UDP connect). The UDP connect runs the H5
-            // session activator on the forwarder: flag-1 HELO →
-            // `HELLO` → `pair`/`resume` with a signed `GET_CAPS`
-            // first → the session gate opens only on success. A
-            // failure here never fails startup — `start_engine` logs
-            // it and the app keeps running without wheel input.
-            state.start_engine();
-            // C1: when auto-switch is persisted on, start the 2 Hz
-            // car-profile watcher thread (no-op when already running).
-            if state.core().settings().auto_switch_profiles {
-                state.core().start_auto_switch();
-            }
-            // v1.0.2: this line proves startup reached the end of setup.
-            log_startup("setup complete");
-            Ok(())
-        })
+        .setup(setup_shell)
         .invoke_handler(tauri::generate_handler![
             ping,
             get_version,

@@ -50,7 +50,7 @@ use tauri::{AppHandle, RunEvent};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-/// `CREATE_NO_WINDOW` (0x0800_0000): a console `reg.exe` spawned
+/// `CREATE_NO_WINDOW` (`0x0800_0000`): a console `reg.exe` spawned
 /// without it flashes a console window on every autostart repair
 /// (review bug 4 — the v1.0.1 user-visible console flash; the same
 /// flag the sidecar spawn already uses, see
