@@ -22,6 +22,13 @@ fn stub_path() -> PathBuf {
 
 fn config(envs: &[(&str, &str)]) -> HidMaestroConfig {
     let mut cfg = HidMaestroConfig::with_sidecar_path(stub_path());
+    // The stub speaks stdio only: on Windows the default config would
+    // take the elevated `runas` + TCP connect-back path, which the stub
+    // can never serve ("sidecar did not connect back in time"). These
+    // are backend-logic tests (spawn/hello/create/submit/crash/fallback)
+    // against the stdio stub, so select the stdio path explicitly — the
+    // same path Linux takes. The elevated path stays production-only.
+    cfg.sidecar.elevated = false;
     cfg.sidecar.spawn_timeout = Duration::from_secs(5);
     cfg.sidecar.reply_timeout = Duration::from_secs(2);
     cfg.sidecar.heartbeat_interval = Duration::from_secs(60);

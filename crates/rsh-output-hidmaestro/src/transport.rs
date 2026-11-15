@@ -580,7 +580,7 @@ mod tests {
     /// EOF test: `/bin/true` on Unix; `cmd /c exit 0` on Windows
     /// (`cmd` resolves via PATH — `Command::new` does the lookup
     /// there). The Unix paths do not exist on Windows, so the tests
-    /// that spawned them failed there with NotFound (dry run #7).
+    /// that spawned them failed there with `NotFound` (dry run #7).
     #[cfg(unix)]
     fn immediate_exit_helper() -> (std::path::PathBuf, Vec<String>) {
         (std::path::PathBuf::from("/bin/true"), Vec::new())

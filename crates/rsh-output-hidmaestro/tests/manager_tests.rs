@@ -22,6 +22,11 @@ fn stub_path() -> PathBuf {
 
 fn config(envs: &[(&str, &str)]) -> SidecarConfig {
     let mut cfg = SidecarConfig::with_path(stub_path());
+    // Same as backend_tests: the stub speaks stdio only — on Windows
+    // the default config would take the elevated `runas` + TCP
+    // connect-back path, which the stub can never serve. These tests
+    // assert `transport == "stdio"`, so select the stdio path here.
+    cfg.elevated = false;
     cfg.spawn_timeout = Duration::from_secs(5);
     cfg.reply_timeout = Duration::from_secs(2);
     cfg.heartbeat_interval = Duration::from_secs(60);
