@@ -136,20 +136,10 @@ fn init_startup_logging() {
     let _ = append_startup_log_both(&format!("RSH v{APP_VERSION} starting"));
 }
 
-/// Shows a native Windows error dialog (`MessageBoxW`, `MB_OK |
-/// MB_ICONERROR`) so a fatal startup failure is VISIBLE even when no
-/// console exists and the user never finds the logs — the v1.0.1
-/// launch failure showed nothing at all. Windows-only; a no-op on
-/// other platforms (where the console + logs are the evidence).
-///
-/// Implemented as a raw `extern "system"` call on purpose: the
-/// `windows` crate features enabled for this shell do not include
-/// `Win32_UI_WindowsAndMessaging`, and a last-resort dialog must not
-/// depend on a new dependency. Windows CI compile is the gate for
-/// this function (it cannot compile in the Linux sandbox).
-/// Raw `user32` binding for the fatal dialog (see `show_fatal_dialog`).
-/// Module level on purpose: an `extern` block after statements trips
-/// `clippy::items-after-statements`.
+// Raw `user32` binding for the fatal dialog (see `show_fatal_dialog`).
+// Module level on purpose: an `extern` block after statements trips
+// `clippy::items-after-statements`. Plain `//` comments here: rustdoc
+// does not document `extern` blocks, so `///` would be unused.
 #[cfg(windows)]
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -161,6 +151,17 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+/// Shows a native Windows error dialog (`MessageBoxW`, `MB_OK |
+/// MB_ICONERROR`) so a fatal startup failure is VISIBLE even when no
+/// console exists and the user never finds the logs — the v1.0.1
+/// launch failure showed nothing at all. Windows-only; a no-op on
+/// other platforms (where the console + logs are the evidence).
+///
+/// Implemented as a raw `extern "system"` call on purpose: the
+/// `windows` crate features enabled for this shell do not include
+/// `Win32_UI_WindowsAndMessaging`, and a last-resort dialog must not
+/// depend on a new dependency. Windows CI compile is the gate for
+/// this function (it cannot compile in the Linux sandbox).
 #[cfg(windows)]
 fn show_fatal_dialog(title: &str, message: &str) {
     use std::os::windows::ffi::OsStrExt;
@@ -1137,7 +1138,7 @@ fn fold_autostart_error(state: &AppState, error: Option<String>) {
 /// tray build MUST succeed before the window is hidden: a failed tray
 /// with a hidden window would leave the user with no way to reach the
 /// app at all.
-fn setup_shell(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+fn setup_shell(app: &mut tauri::App) {
     if std::env::args().any(|arg| arg == "--tray") {
         match build_tray(app.handle()) {
             Ok(icon) => {
@@ -1179,7 +1180,6 @@ fn setup_shell(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
     // v1.0.2: this line proves startup reached the end of setup.
     log_startup("setup complete");
-    Ok(())
 }
 
 fn main() {
@@ -1220,7 +1220,7 @@ fn main() {
         // launcher + profile store. Registered before `setup` starts
         // the snapshot emitter thread.
         .manage(state)
-        .setup(setup_shell)
+        .setup(|app| Ok(setup_shell(app)))
         .invoke_handler(tauri::generate_handler![
             ping,
             get_version,
