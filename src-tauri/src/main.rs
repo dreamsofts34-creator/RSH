@@ -1,8 +1,8 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! RSH v1.0.1 — Tauri shell entry point (Phase G0).
+//! RSH v1.0.2 — Tauri shell entry point (Phase G0).
 //!
-//! The window shows the literal text `RSH v1.0.1` (see
+//! The window shows the literal text `RSH v1.0.2` (see
 //! `frontend/dist/index.html`). The text is literal on purpose: the C#
 //! blank-window lesson (v2.0.0–v2.0.4) was that silently-failing dynamic
 //! bindings can leave a window alive but blank, so nothing in this shell
@@ -90,7 +90,7 @@ use rsh_app_core::commands::{
     BackendStatus, BackupInfo, FirewallState, FirmwareValidation, LedPattern, OutputState,
     PinAssignment, PinMapValidation, TuningSettings,
 };
-use rsh_app_core::diagnostics::{append_startup_log, install_panic_hook};
+use rsh_app_core::diagnostics::{append_startup_log_both, install_panic_hook, log_fatal};
 use rsh_app_core::snapshot::{EngineSnapshot, EngineStats};
 use rsh_app_core::state::{AppSettings, AppSettingsPatch, ProfileSummary, is_allowed_board_ip};
 use rsh_app_core::state::{
@@ -101,8 +101,8 @@ use rsh_app_core::system::{
 };
 use tauri::Manager;
 
-/// Application version (new Rust series: v1.0.1).
-const APP_VERSION: &str = "1.0.1";
+/// Application version (new Rust series: v1.0.2).
+const APP_VERSION: &str = "1.0.2";
 
 /// The startup-log directory: `<data-dir>/logs` (`%AppData%\RSH\logs`
 /// on Windows). `None` when the data directory does not resolve.
@@ -110,25 +110,97 @@ fn startup_log_dir() -> Option<std::path::PathBuf> {
     rsh_app_core::data_dir().map(|dir| dir.join("logs"))
 }
 
-/// Append one line to the daily startup log (`rsh-YYYYMMDD.log`).
-/// Never fails startup: a missing/unwritable directory is silently
-/// ignored inside `append_startup_log`, and every line is flushed
-/// to disk before the call returns, so the log survives a crash
-/// right after the write.
+/// Append one line to the daily startup log (`rsh-YYYYMMDD.log`) in
+/// BOTH log locations — the data-dir logs and the `%TEMP%\RSH\logs`
+/// fallback (v1.0.2: the v1.0.1 launch failure left the data-dir logs
+/// empty, so a single-location log is no evidence at all). Never
+/// fails startup: an unwritable directory is silently ignored
+/// inside `append_startup_log_both`, and every line is flushed to
+/// disk before the call returns, so the log survives a crash right
+/// after the write.
 fn log_startup(message: &str) {
-    if let Some(dir) = startup_log_dir() {
-        let _ = append_startup_log(&dir, message);
-    }
+    let _ = append_startup_log_both(message);
 }
 
-/// Install the panic hook and log process start (v1.0.1). Called first
+/// Install the panic hook and log process start (v1.0.2). Called first
 /// in `main()`, before anything else can panic — the file log is the
 /// evidence for the next run when the window never paints.
 fn init_startup_logging() {
     if let Some(log_dir) = startup_log_dir() {
-        install_panic_hook(log_dir.clone());
-        let _ = append_startup_log(&log_dir, &format!("RSH v{APP_VERSION} starting"));
+        install_panic_hook(log_dir);
     }
+    // Dual-location on purpose (see `log_startup`): even with no
+    // data dir at all (review bug D) the start line reaches the
+    // %TEMP% fallback — a run with no trace anywhere must never
+    // happen again.
+    let _ = append_startup_log_both(&format!("RSH v{APP_VERSION} starting"));
+}
+
+/// Shows a native Windows error dialog (`MessageBoxW`, `MB_OK |
+/// MB_ICONERROR`) so a fatal startup failure is VISIBLE even when no
+/// console exists and the user never finds the logs — the v1.0.1
+/// launch failure showed nothing at all. Windows-only; a no-op on
+/// other platforms (where the console + logs are the evidence).
+///
+/// Implemented as a raw `extern "system"` call on purpose: the
+/// `windows` crate features enabled for this shell do not include
+/// `Win32_UI_WindowsAndMessaging`, and a last-resort dialog must not
+/// depend on a new dependency. Windows CI compile is the gate for
+/// this function (it cannot compile in the Linux sandbox).
+#[cfg(windows)]
+fn show_fatal_dialog(title: &str, message: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    fn to_wide_nul(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+    let text = to_wide_nul(message);
+    let caption = to_wide_nul(title);
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut std::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            utype: u32,
+        ) -> i32;
+    }
+    // 0x10 = MB_ICONERROR (MB_OK is 0x0).
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), 0x10);
+    }
+}
+
+/// Non-Windows stub: no native dialog, the console + logs carry it.
+#[cfg(not(windows))]
+fn show_fatal_dialog(_title: &str, _message: &str) {}
+
+/// Last-resort startup failure: write the reason to both log
+/// locations ([`log_fatal`]), show it in a native dialog so the
+/// failure is visible even when no console exists and the logs
+/// cannot be found, then exit(1).
+///
+/// The dialog names the log files actually written, so the next
+/// report can quote a path instead of "logs folder khaali hai" —
+/// when the data dir is unwritable the `%TEMP%\RSH\logs` fallback
+/// is what is shown (review bugs C/D).
+fn fatal_startup(reason: &str) -> ! {
+    let written = log_fatal(reason);
+    let mut detail = reason.to_string();
+    if written.is_empty() {
+        detail.push_str(
+            "\n\n(No log file could be written — neither the data directory nor the %TEMP% fallback was writable.)",
+        );
+    } else {
+        detail.push_str("\n\nDetails were written to:");
+        for path in &written {
+            detail.push_str(&format!("\n{}", path.display()));
+        }
+    }
+    show_fatal_dialog("RSH — Startup Error", &detail);
+    std::process::exit(1);
 }
 
 /// Liveness probe for the frontend. Returns the literal string `pong`.
@@ -137,7 +209,7 @@ fn ping() -> &'static str {
     "pong"
 }
 
-/// Returns the application version, `1.0.1`.
+/// Returns the application version, `1.0.2`.
 #[tauri::command]
 fn get_version() -> &'static str {
     APP_VERSION
@@ -872,13 +944,19 @@ fn save_calibration(
 
 /// Builds the tray icon for the shell.
 ///
-/// The caller must keep the returned icon alive (store it in `AppState` —
-/// Phase P2.3 scope): dropping the icon removes it from the tray, and the
-/// window must never be hidden without a tray icon present (C# v2.0.1
-/// lesson). P2.3 wires this into `setup`; until then it is an explicit
-/// skeleton, not dead code by accident.
-#[allow(dead_code)]
+/// Left-clicking the icon shows the (possibly hidden/minimized)
+/// window again — the way back from a `--tray` autostart launch,
+/// besides launching the app a second time (see
+/// `on_second_instance`).
+///
+/// The caller must keep the returned icon alive for as long as the
+/// tray should be shown: dropping the icon removes it from the
+/// tray, and the window must never be hidden without a tray icon
+/// present (C# v2.0.1 lesson). The icon is `!Send`, so it cannot
+/// live in managed state — `setup` leaks it for the process
+/// lifetime (see the `--tray` block there).
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<tauri::tray::TrayIcon> {
+    use tauri::tray::{MouseButton, TrayIconEvent};
     let icon = app
         .default_window_icon()
         .cloned()
@@ -886,6 +964,17 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<tauri::tray::TrayIcon> {
     tauri::tray::TrayIconBuilder::with_id("main")
         .icon(icon)
         .tooltip("RSH — Real Sim Hub")
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click { button, .. } = event {
+                if button == MouseButton::Left {
+                    if let Some(window) = tray.app_handle().get_webview_window("main") {
+                        let _ = window.unminimize();
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+        })
         .build(app)
 }
 
@@ -907,11 +996,19 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<tauri::tray::TrayIcon> {
 /// `NullSink` and never crashed at startup.
 fn build_app_state() -> AppState {
     let Some(dir) = rsh_app_core::data_dir() else {
-        eprintln!(
-            "[RSH] cannot resolve the data directory; refusing to start without a profile store"
+        // Provenance verdict (v1.0.2, hypothesis #1): this silent
+        // `exit(1)` is the exact match for the v1.0.1 launch
+        // failure — `%APPDATA%` not resolving means no log, no
+        // window, no trace. It now logs to the %TEMP% fallback and
+        // shows a dialog naming the cause.
+        fatal_startup(
+            "cannot resolve the data directory (%APPDATA% did not resolve, so no profile store path exists); refusing to start without a profile store",
         );
-        std::process::exit(1);
     };
+    // Breadcrumb (v1.0.2): the next run states what the data dir
+    // resolved to, so a wrong-user / redirected %APPDATA% shows up
+    // in the log instead of needing a user-side check.
+    log_startup(&format!("data dir resolved: {}", dir.display()));
     match AppStateCore::open_with_null_sink_repair(&dir) {
         (Ok(core), repair_notice) => {
             let core = Arc::new(core);
@@ -956,12 +1053,11 @@ fn build_app_state() -> AppState {
             state
         }
         (Err(error), _) => {
-            eprintln!(
-                "[RSH] profile store in {} failed to open: {error}; \
+            fatal_startup(&format!(
+                "profile store in {} failed to open: {error}; \
                  refusing to start without profiles (backups are next to it)",
                 dir.display()
-            );
-            std::process::exit(1);
+            ));
         }
     }
 }
@@ -1003,6 +1099,12 @@ fn on_second_instance(app: &tauri::AppHandle, args: Vec<String>, _cwd: String) {
         }
     }
     if let Some(window) = app.get_webview_window("main") {
+        // v1.0.2 (review bug 3): a minimized window ignores
+        // `set_focus` — the second launch appeared to do nothing
+        // when the first instance was minimized. Unminimize + show
+        // first, then focus.
+        let _ = window.unminimize();
+        let _ = window.show();
         let _ = window.set_focus();
     }
 }
@@ -1020,7 +1122,7 @@ fn fold_autostart_error(state: &AppState, error: Option<String>) {
 }
 
 fn main() {
-    // v1.0.1: panic hook + process-start log first, before anything
+    // v1.0.2: panic hook + process-start log first, before anything
     // else can panic (see `init_startup_logging`).
     init_startup_logging();
     // Repair a stale autostart entry before Settings reads the state.
@@ -1031,8 +1133,10 @@ fn main() {
         eprintln!("[RSH] autostart repair failed: {error}");
     }
     let state = build_app_state();
+    log_startup("app state built");
     fold_autostart_error(&state, autostart_repair_error);
-    let app = tauri::Builder::default()
+    log_startup("building tauri app");
+    let app = match tauri::Builder::default()
         // Single instance (registered FIRST): see `on_second_instance`.
         .plugin(tauri_plugin_single_instance::init(on_second_instance))
         .plugin(tauri_plugin_autostart::init(
@@ -1056,6 +1160,39 @@ fn main() {
         // the snapshot emitter thread.
         .manage(state)
         .setup(|app| {
+            // Bug 5 (v1.0.2): `--tray` (see `AUTOSTART_ARGS`) used to
+            // be parsed by nobody — autostart launches showed the
+            // window anyway and `build_tray` was dead code. An
+            // autostart launch now builds the tray icon and starts
+            // hidden; a left-click on the icon (or a second launch —
+            // see `on_second_instance`) shows the window again. The
+            // tray build MUST succeed before the window is hidden: a
+            // failed tray with a hidden window would leave the user
+            // with no way to reach the app at all.
+            if std::env::args().any(|arg| arg == "--tray") {
+                match build_tray(app.handle()) {
+                    Ok(icon) => {
+                        // `TrayIcon` is reference-counted and removed
+                        // from the tray when dropped — and it is
+                        // `!Send` (its inner handle is `Rc`), so it
+                        // cannot live in managed state. It is
+                        // intentionally leaked here: its lifetime IS
+                        // the process lifetime.
+                        std::mem::forget(icon);
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                        log_startup("--tray launch: window hidden, tray icon active");
+                    }
+                    Err(error) => {
+                        let line = format!(
+                            "[RSH] --tray launch: tray icon failed to build: {error}; starting with the window visible"
+                        );
+                        eprintln!("{line}");
+                        log_startup(&line);
+                    }
+                }
+            }
             let state = app.state::<AppState>();
             state.start_snapshot_emitter(app.handle());
             // Phase G gate wiring: start the engine task (idle + the
@@ -1071,7 +1208,7 @@ fn main() {
             if state.core().settings().auto_switch_profiles {
                 state.core().start_auto_switch();
             }
-            // v1.0.1: this line proves startup reached the end of setup.
+            // v1.0.2: this line proves startup reached the end of setup.
             log_startup("setup complete");
             Ok(())
         })
@@ -1141,8 +1278,22 @@ fn main() {
             restart_wheel
         ])
         .build(tauri::generate_context!())
-        .expect("error while building RSH");
+    {
+        Ok(app) => app,
+        // v1.0.2 (review bug 2): `.expect()` panicked here — a
+        // panic before the event loop with no window and (on a GUI
+        // subsystem binary) no console. A build failure now logs to
+        // both locations and shows a dialog naming the cause.
+        Err(error) => fatal_startup(&format!("could not build the RSH app window: {error}")),
+    };
+    log_startup("tauri app built");
     app.run(|app, event| {
+        if matches!(event, tauri::RunEvent::Ready) {
+            // The event loop is live: if the log ends here, the
+            // process died after the loop started (not during
+            // startup) — the breadcrumb separates the two.
+            log_startup("event loop ready");
+        }
         system::handle_run_event(&event, || app.state::<AppState>().shutdown());
     });
 }

@@ -1,4 +1,4 @@
-# RSH Rust — Release (hotfix v1.0.1, SINGLE-ASSET)
+# RSH Rust — Release (hotfix v1.0.2, SINGLE-ASSET)
 #
 # SINGLE-ASSET RELEASE (user order 2026-11-15 14:00, STANDING RULE for
 # every release from now on — see docs/DECISIONS.md §18): the release
@@ -53,6 +53,12 @@
 #      binary would pop a terminal window on launch. Fails the run.
 #   5. Stage the single NSIS exe, verify exactly one file is staged,
 #      then `gh release create` with that one file (skipped on dry-run).
+#   6. Headless launch smoke test (hotfix v1.0.2): silently install
+#      the staged NSIS exe, start it, and prove the process stays
+#      alive + the startup log reaches "event loop ready" (with the
+#      right version). Cannot prove window paint on a headless
+#      runner — process + log is the strongest launch evidence in
+#      CI; real paint stays a human gate.
 #
 # PREREQUISITES (human gates — NOT checked by this workflow, see docs/RELEASE-CHECKLIST.md):
 #   * pid.codes PR claiming VID 0x1209 / PID 0x5253 merged (Phase G gate, D-G3).
@@ -62,7 +68,7 @@
 #   * App ships UNSIGNED (OV cert deferred, D-R11).
 #
 # Release assets (exact list — ONE asset, see docs/RELEASE-CHECKLIST.md §3):
-#   RSH_1.0.1_x64-setup.exe            (NSIS installer — the ONLY asset)
+#   RSH_1.0.2_x64-setup.exe            (NSIS installer — the ONLY asset)
 #
 # REMOVED in the v1.0.1 single-asset rewrite (2026-11-15, DECISIONS §18)
 # — these steps no longer exist in this file:
@@ -106,7 +112,7 @@ on:
           - "true"
           - "false"
       tag:
-        description: "Tag to release (workflow_dispatch only, e.g. v1.0.1)"
+        description: "Tag to release (workflow_dispatch only, e.g. v1.0.2)"
         required: false
         default: ""
         type: string
@@ -301,7 +307,7 @@ jobs:
           # Bundler output lives in the WORKSPACE-ROOT target dir, not
           # src-tauri/target: src-tauri is a workspace member, so Cargo
           # puts target/ at the repo root (proven by run 43687032820:
-          # D:\a\RSH\RSH\target\...\bundle\nsis\RSH_1.0.1_x64-setup.exe).
+          # D:\a\RSH\RSH\target\...\bundle\nsis\RSH_1.0.2_x64-setup.exe).
           $bundleDir = "target/x86_64-pc-windows-msvc/release/bundle"
           $nsis = Get-ChildItem "$bundleDir/nsis/*-setup.exe" -ErrorAction SilentlyContinue
           if ($nsis.Count -ne 1) { Write-Error "Expected exactly one NSIS setup exe in $bundleDir/nsis."; exit 1 }
@@ -318,6 +324,74 @@ jobs:
           if ($files.Count -ne 1) { Write-Error "Expected exactly ONE staged asset (the NSIS exe), found $($files.Count). Single-asset release — refusing to publish anything else."; exit 1 }
           if ($files[0].Name -notmatch '-setup\.exe$') { Write-Error "Staged file '$($files[0].Name)' is not the NSIS setup exe."; exit 1 }
           Write-Host "Single asset verified: $($files[0].Name) ($($files[0].Length) B)."
+
+      # ---- Hotfix v1.0.2: headless launch smoke test ----
+      # The v1.0.1 launch failure (user PC: double-click → nothing,
+      # empty logs) was never caught by any gate — every check until
+      # now proved the BUILD, never the LAUNCH. This step installs
+      # the staged NSIS exe silently, starts it, and proves the
+      # launch path: the process must stay alive AND the startup log
+      # must reach "event loop ready" (which also proves the v1.0.2
+      # breadcrumbs + dual-location logging work). A process that
+      # dies in the first seconds fails the run with its exit code.
+      #
+      # What it CANNOT prove (headless runner, stated plainly): the
+      # window actually painting — a GitHub runner has no interactive
+      # desktop to look at. Process-alive + log-file is the strongest
+      # launch evidence available in CI; real paint is a human gate
+      # (docs/RELEASE-CHECKLIST.md).
+      - name: Headless launch smoke test (install + start + log check)
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem release-staging/*-setup.exe).FullName
+          $installDir = "C:\rsh-smoke-test"
+          if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
+          # NSIS silent install (/S); /D must be last, unquoted.
+          Start-Process -FilePath $installer -ArgumentList "/S", "/D=$installDir" -Wait
+          $exe = Join-Path $installDir "rsh-app.exe"
+          if (-not (Test-Path $exe)) { Write-Error "Smoke test: installed exe not found at $exe after silent install."; exit 1 }
+          Write-Host "Installed to $installDir — launching $exe"
+          $proc = Start-Process -FilePath $exe -PassThru
+          # The startup log is UTC-dated (rsh-YYYYMMDD.log); it must
+          # appear in %APPDATA%\RSH\logs, or — when the data dir
+          # fails (hypothesis #1) — in %TEMP%\RSH\logs.
+          $date = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
+          $logNames = @(
+            (Join-Path $env:APPDATA "RSH\logs\rsh-$date.log"),
+            (Join-Path $env:TEMP "RSH\logs\rsh-$date.log")
+          )
+          $ready = $false
+          for ($i = 0; $i -lt 18 -and -not $ready; $i++) {
+            Start-Sleep -Seconds 5
+            if ($proc.HasExited) {
+              Write-Error "Smoke test: RSH exited after $($i * 5)s with exit code $($proc.ExitCode) before the event loop was ready — see the startup log."
+              exit 1
+            }
+            foreach ($log in $logNames) {
+              if (Test-Path $log) {
+                $text = Get-Content $log -Raw -ErrorAction SilentlyContinue
+                if ($text -and $text.Contains("event loop ready")) { $ready = $true; Write-Host "Startup log reached 'event loop ready': $log"; break }
+              }
+            }
+          }
+          if (-not $ready) {
+            Write-Host "Startup logs found:"
+            foreach ($log in $logNames) { if (Test-Path $log) { Write-Host "--- $log"; Get-Content $log } else { Write-Host "--- $log (missing)" } }
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { }
+            Write-Error "Smoke test: no startup log reached 'event loop ready' within 90 s (process was alive). The dumped log above is the evidence."
+            exit 1
+          }
+          # Version breadcrumb: the running build must report this version.
+          $logText = ""
+          foreach ($log in $logNames) { if (Test-Path $log) { $logText += Get-Content $log -Raw } }
+          if ($logText -notmatch "RSH v${{ steps.tag.outputs.version }} starting") {
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { }
+            Write-Error "Smoke test: startup log does not contain 'RSH v${{ steps.tag.outputs.version }} starting' — wrong version launched?"
+            exit 1
+          }
+          Write-Host "Smoke test PASS: process alive, event loop ready, version v${{ steps.tag.outputs.version }}."
+          try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { Write-Host "Smoke test process already gone (exit code $($proc.ExitCode))." }
+          Remove-Item $installDir -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: vJoy DLL hash (record only — never invented)
         shell: pwsh
@@ -342,7 +416,7 @@ jobs:
           if ($files.Count -ne 1) { Write-Error "Expected exactly one staged file (the NSIS exe) — refusing to create a multi-asset or empty release."; exit 1 }
           Write-Host "Releasing 1 file:"
           $files | ForEach-Object { Write-Host "  $_" }
-          gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes "RSH v${{ steps.tag.outputs.version }} — NSIS installer only (single-asset release). Hotfix: no console window on launch (app + sidecar are GUI-subsystem). Auto-update is off for this release: no latest.json is published — download and install manually. Firmware v4.0.1 is not included — no reflash needed (protocol v2.1, boards already on v4.0.1). App ships unsigned (OV cert deferred, D-R11)." $files
+          gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes "RSH v${{ steps.tag.outputs.version }} — NSIS installer only (single-asset release). Hotfix v1.0.2: startup failures are now visible (native error dialog + dual-location startup log) and the launch path is smoke-tested in CI; no console window on launch (app + sidecar are GUI-subsystem). Auto-update is off for this release: no latest.json is published — download and install manually. Firmware v4.0.1 is not included — no reflash needed (protocol v2.1, boards already on v4.0.1). App ships unsigned (OV cert deferred, D-R11)." $files
 
       - name: Dry run — release NOT created
         if: ${{ github.ref_type != 'tag' && inputs.dry_run != 'false' }}

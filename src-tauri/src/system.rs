@@ -47,6 +47,17 @@ use rsh_app_core::diagnostics;
 use rsh_app_core::system::{RunKeyStore, ShutdownOutcome, SystemError, UpdateInfo};
 use tauri::{AppHandle, RunEvent};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+/// `CREATE_NO_WINDOW` (0x0800_0000): a console `reg.exe` spawned
+/// without it flashes a console window on every autostart repair
+/// (review bug 4 — the v1.0.1 user-visible console flash; the same
+/// flag the sidecar spawn already uses, see
+/// `rsh-output-hidmaestro/src/transport.rs`).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Args the app is launched with from autostart: start hidden to the
 /// tray (the window is only shown when the user clicks the tray icon
 /// or launches the app by hand), plus the `--rsh-version` flag so a
@@ -138,6 +149,7 @@ impl RunKeyStore for RegExeStore {
                 "/v",
                 rsh_app_core::system::AUTOSTART_VALUE_NAME,
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .ok()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -157,6 +169,7 @@ impl RunKeyStore for RegExeStore {
                 command,
                 "/f",
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .status()
             .map_err(|error| SystemError::Store(error.to_string()))?;
         if status.success() {
@@ -175,6 +188,7 @@ impl RunKeyStore for RegExeStore {
                 rsh_app_core::system::AUTOSTART_VALUE_NAME,
                 "/f",
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .status()
             .map_err(|error| SystemError::Store(error.to_string()))?;
         if status.success() {

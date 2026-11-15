@@ -5,10 +5,13 @@ target/
 # Node / frontend build outputs.
 node_modules/
 *.tsbuildinfo
-# Vite build output — except the committed static shell placeholder
-# (frontend/dist/index.html), which the Tauri shell serves until Phase E.
+# Vite build output — ALL of it, including index.html (v1.0.2, bug 6):
+# the old committed `frontend/dist/index.html` pointed at hashed
+# assets that were never in the repo, so any build that skipped
+# `npm run build` served a broken shell. `vite build` regenerates
+# dist from scratch (`emptyOutDir: true`) on every Tauri build
+# (`beforeBuildCommand`), so nothing in dist is ever committed.
 frontend/dist/*
-!frontend/dist/index.html
 
 # Firmware / embedded build outputs.
 .pio/

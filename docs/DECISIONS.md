@@ -860,3 +860,144 @@ env on the build step (signing step is gone).
   `bundle.targets` change cannot affect it; no CI job expects an
   MSI, `.sig`, `latest.json`, or SBOM. `ci.yml` was NOT touched
   (coordinator owns it).
+
+## 19. Hotfix v1.0.2 — Priority 3 hardening: all 8 review bugs fixed (2026-11-15)
+
+Context: v1.0.1 was LIVE but double-click on the user PC did nothing
+— no window, no terminal, empty `%AppData%\RSH\logs`, no process in
+Task Manager. An external developer review listed 8 confirmed bugs
+(real, but not proven causes). The user ordered (16:00 PKT): fix per
+the report, the app must run properly this time — no bug left as
+"document-only". The user will NOT run PC-side checks (version, exit
+code, Event Viewer), so every fix is designed to produce its own
+evidence on the next run instead of asking the user.
+
+### 19.1 Hypothesis #1 — data-directory failure → silent exit(1) (PROVENANCE VERDICT)
+
+The provenance worker RULED OUT possibility A (released binary IS the
+b12824c hotfix — SHA exact, ProductVersion 1.0.1, x64, GUI, sidecar
+commit hash embedded, release run 21/21 success, zero errors) and
+found NO loader-level cause (all imports are old stable system/UCRT
+APIs, zero delay-load DLLs, WebView2Loader resolves dynamically, no
+Win11-only API). The reviewer's "main() never ran" conclusion is
+CORRECTED: an empty logs folder does NOT prove main() never ran.
+
+The mechanism that exactly matches the observed symptoms:
+`init_startup_logging()` silently skipped when `data_dir()` is `None`
+(`if let Some`, errors swallowed with `let _ =`), and
+`build_app_state()` exits silently with `exit(1)` when the data dir
+does not resolve. `data_dir()` is `%APPDATA%\RSH`. If roaming
+`%AppData%` does not resolve or `%APPDATA%\RSH` is unwritable: no
+log, stderr invisible (GUI subsystem), process exits immediately —
+no window, no Task Manager trace. Exact symptom match.
+
+v1.0.2 removes every silent exit on the startup path (see §19.2).
+
+### 19.2 Fail-open logging + visible dialogs (the #1 priority)
+
+- `log_fatal()` (`crates/rsh-app-core/src/diagnostics.rs`): a fatal
+  failure is written to BOTH `%AppData%\RSH\logs` AND `%TEMP%\RSH\logs`
+  (fallback chain — bug C: data dir unwritable; bug D: `%AppData%`
+  of another user / not resolving), plus stderr. Both writes are
+  best-effort and never panic. `append_startup_log_both()` does the
+  same for every startup line, so ALL breadcrumbs are dual-location
+  now; the panic hook also writes to both locations.
+- `fatal_startup()` (`src-tauri/src/main.rs`): every fatal startup
+  branch (data dir unresolvable, profile store unopenable, Tauri
+  build failure) now calls `log_fatal` + shows a native `MessageBoxW`
+  dialog naming the cause AND the log files actually written — so
+  the next failure is visible even with no console and no found
+  logs, and the report can quote a path instead of "logs folder
+  khaali hai".
+- `MessageBoxW` is a raw `extern "system"` call (no new `windows`
+  crate feature — the enabled features do not include
+  `Win32_UI_WindowsAndMessaging`). Windows CI compile is its gate.
+- Breadcrumbs (`log_startup`, dual-location): `RSH v1.0.2 starting`,
+  `data dir resolved: <path>`, `app state built`, `building tauri
+  app`, `tauri app built`, `setup complete`, `event loop ready`
+  (in the `RunEvent::Ready` handler). A log ending before `event
+  loop ready` now proves WHERE startup died; a log WITH it proves
+  the loop was live.
+
+### 19.3 The 8 bugs — all FIXED (none left document-only)
+
+1. **Silent `exit(1)` branches** (`build_app_state`): FIXED — both
+   fatal branches use `fatal_startup()` (dual log + dialog + exit).
+2. **`.build(...).expect()` panic** (`main.rs`): FIXED — replaced
+   with `match` + `fatal_startup()`; a build failure now logs and
+   shows a dialog instead of panicking before the event loop.
+3. **`on_second_instance` only `set_focus()`**: FIXED — now
+   `unminimize()` + `show()` + `set_focus()` (a minimized window
+   ignores focus, so the second launch looked dead).
+4. **`reg.exe` without `CREATE_NO_WINDOW`** (`system.rs`): FIXED —
+   all three `RegExeStore` spawns (query/add/delete) pass
+   `creation_flags(0x0800_0000)` via `CommandExt`.
+5. **`--tray` dead code** (`AUTOSTART_ARGS` / `build_tray`): FIXED —
+   `setup` parses `--tray`, builds the tray (left-click shows the
+   window again) and hides the window ONLY after the tray builds
+   successfully; a failed tray leaves the window visible (a hidden
+   window with no tray would be unreachable). The icon is `!Send`
+   (`Rc` inside), so it cannot live in managed state — it is
+   intentionally leaked for the process lifetime.
+6. **Stale committed `frontend/dist/index.html`**: FIXED — the file
+   is DELETED from git and the `.gitignore` exception is removed
+   (`frontend/dist/*` fully ignored). Verified: `vite build`
+   regenerates dist from scratch (`emptyOutDir: true`) on every
+   Tauri build (`beforeBuildCommand`), and `tauri_build::build()`
+   does NOT require dist to exist (it only emits `rerun-if-changed`
+   when present — verified against tauri-build 2.7.4 source), so
+   `clippy-windows` / `test-windows` (plain `cargo` runs, no
+   frontend build) keep working. A build can never serve the stale
+   shell again.
+7. **Sidecar gitignored, CI-only staging**: FIXED for the local path
+   — `src-tauri/build.rs` now fails fast on Windows with the exact
+   fix (`pwsh … tools/ci/stage-sidecar.ps1`) when the staged
+   sidecar is missing, instead of Tauri's cryptic
+   `ResourcePathNotFound`. Release/CI already stage it first
+   (verified: `release.yml` + `ci.yml` run `stage-sidecar.ps1`
+   before any cargo build of `rsh-app`). Auto-staging inside the
+   build was NOT done: it would need a network fetch + .NET
+   publish on every build; the explicit script stays the
+   sanctioned path.
+8. **`start_engine` 5 s ready timeout on the setup path**: FIXED —
+   `AppState::start_engine` now spawns the engine start on its own
+   thread (`rsh-engine-starter`); setup returns immediately and
+   the window appears first. The core's 5 s supervisor-ready wait
+   is UNCHANGED inside that thread (the supervisor reports ready
+   in ms when healthy; the wait only matters when it is dead), and
+   a failure is now logged to both log locations, not just stderr.
+   `start_auto_switch` (called from setup right after) does not
+   depend on the engine thread — it only installs the watcher.
+
+### 19.4 Headless launch smoke test (release.yml)
+
+A new step AFTER "Verify staged asset", BEFORE `gh release create`:
+silently installs the staged NSIS exe (`/S /D=C:\rsh-smoke-test`),
+starts `rsh-app.exe`, and proves (≤ 90 s) the process stays alive
+AND a startup log reaches `event loop ready` with the right version
+(log checked in `%APPDATA%\RSH\logs` first, then `%TEMP%\RSH\logs`
+— the hypothesis-#1 fallback). Early exit fails the run with the
+exit code; a timeout fails with the log contents dumped. The process
+is killed afterwards; the install dir is removed.
+
+Stated limit: a headless runner cannot prove the window PAINTS — no
+interactive desktop. Process-alive + log-file is the strongest
+launch evidence available in CI; real paint stays a human gate
+(`docs/RELEASE-CHECKLIST.md`).
+
+### 19.5 What v1.0.2 does NOT prove (gates for the release worker)
+
+- `MessageBoxW` / tray / `CREATE_NO_WINDOW` / `build.rs` sidecar
+  check compile ONLY on Windows CI (`rsh-app` cannot compile in
+  the Linux sandbox — no webkit2gtk). Green Windows CI
+  (`clippy-windows`, `test-windows`, `tauri-build`) + a green
+  release dry-run are the gates for this code; the local gate below
+  covers everything else.
+- The data-dir hypothesis itself is proven only by the next run on
+  the user PC: if it still fails, v1.0.2 WILL show a dialog + leave
+  a log in `%TEMP%\RSH\logs` naming the cause — no user-side
+  checks are needed to find out.
+- Loader-level death (possibility B) has no code fix by definition;
+  the provenance verdict found no loader cause in the released
+  binary, and v1.0.2's dialog + dual log is the evidence mechanism
+  if it ever recurs.

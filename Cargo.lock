@@ -3795,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-app"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "rsh-app-core",
  "serde",
@@ -3811,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-app-core"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "dirs 7.0.0",
  "ed25519-dalek",
@@ -3832,7 +3832,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-benchmarks"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "criterion",
  "rsh-engine",
@@ -3841,7 +3841,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-engine"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "rsh-protocol",
  "serde",
@@ -3852,11 +3852,11 @@ dependencies = [
 
 [[package]]
 name = "rsh-led"
-version = "1.0.1"
+version = "1.0.2"
 
 [[package]]
 name = "rsh-output"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "libloading",
  "rsh-engine",
@@ -3866,7 +3866,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-output-hidmaestro"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "getrandom 0.3.4",
  "rsh-engine",
@@ -3879,7 +3879,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-profiles"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "rsh-telemetry",
  "serde",
@@ -3888,7 +3888,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-protocol"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "hmac",
  "proptest",
@@ -3898,7 +3898,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-rig"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "rsh-benchmarks",
  "rsh-engine",
@@ -3910,7 +3910,7 @@ dependencies = [
 
 [[package]]
 name = "rsh-security"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "ed25519-dalek",
  "keyring",
@@ -3919,14 +3919,14 @@ dependencies = [
 
 [[package]]
 name = "rsh-telemetry"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "rsh-transport"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "mdns-sd",
  "rsh-engine",

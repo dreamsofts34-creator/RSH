@@ -305,6 +305,12 @@ pub const PANIC_LOG_NAME: &str = "diagnostics-panic.log";
 /// writes secret values (panic payloads are code strings, but the
 /// line is redacted anyway). Native Windows crash dumps
 /// (`MiniDumpWriteDump`) are documented in `docs/DIAGNOSTICS.md` §2.
+///
+/// v1.0.2: the report is written to BOTH log locations — the given
+/// `log_dir` and the `%TEMP%` fallback ([`temp_log_dir`]) — so a
+/// panic still leaves evidence when the data dir is unwritable or
+/// resolves under a different user (the v1.0.1 launch failure left
+/// `%AppData%\RSH\logs` empty).
 pub fn install_panic_hook(log_dir: PathBuf) {
     std::panic::set_hook(Box::new(move |info| {
         let location = info.location().map_or_else(
@@ -319,16 +325,27 @@ pub fn install_panic_hook(log_dir: PathBuf) {
             "non-string panic payload".to_string()
         };
         let line = redact_secrets(&format!("panic at {location}: {payload}\n"));
-        let path = log_dir.join(PANIC_LOG_NAME);
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-            // Flush before returning: the process may die right after
-            // the hook runs, and a buffered line lost in a crash is
-            // no evidence at all (v1.0.1 acceptance: the file log is
-            // the evidence for the next run).
-            let _ = file.write_all(line.as_bytes());
-            let _ = file.flush();
+        append_panic_line(&log_dir.join(PANIC_LOG_NAME), &line);
+        let fallback_path = temp_log_dir().join(PANIC_LOG_NAME);
+        if fallback_path != log_dir.join(PANIC_LOG_NAME) {
+            append_panic_line(&fallback_path, &line);
         }
     }));
+}
+
+/// One best-effort append for the panic hook: the line is flushed
+/// before returning (the process may die right after the hook runs,
+/// and a buffered line lost in a crash is no evidence at all), and
+/// a failed write is silently dropped — the hook never panics.
+fn append_panic_line(path: &Path, line: &str) {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        // Flush before returning: the process may die right after
+        // the hook runs, and a buffered line lost in a crash is
+        // no evidence at all (v1.0.1 acceptance: the file log is
+        // the evidence for the next run).
+        let _ = file.write_all(line.as_bytes());
+        let _ = file.flush();
+    }
 }
 
 /// Daily startup-log file name: `rsh-YYYYMMDD.log` (the S-11
@@ -408,6 +425,84 @@ fn append_startup_log_at(log_dir: &Path, message: &str, now: SystemTime) -> Opti
     file.write_all(line.as_bytes()).ok()?;
     let _ = file.flush();
     Some(path)
+}
+
+/// The fallback log directory: `%TEMP%\RSH\logs` on Windows
+/// (`std::env::temp_dir()` + `RSH/logs` everywhere else).
+///
+/// The data directory is the primary log home, but the v1.0.1 launch
+/// failure left `%AppData%\RSH\logs` EMPTY — either the data dir was
+/// not writable (review bug C) or it resolved under a different user
+/// (bug D). A fatal log that only ever tries the data dir can vanish
+/// exactly when it matters most, so every fatal/startup write goes to
+/// BOTH locations (see [`append_startup_log_both`] / [`log_fatal`]).
+#[must_use]
+pub fn temp_log_dir() -> PathBuf {
+    std::env::temp_dir().join("RSH").join("logs")
+}
+
+/// Append one line to today's startup log in BOTH log locations —
+/// the data-dir logs and the `%TEMP%` fallback ([`temp_log_dir`]).
+/// Best-effort and never panicking: a location that cannot be
+/// written is skipped, and the write is done once (not duplicated)
+/// when both locations resolve to the same directory. Returns the
+/// files actually written.
+#[must_use]
+pub fn append_startup_log_both(message: &str) -> Vec<PathBuf> {
+    let mut written = Vec::new();
+    let primary = crate::data_dir().map(|dir| dir.join("logs"));
+    if let Some(dir) = &primary
+        && let Some(path) = append_startup_log(dir, message)
+    {
+        written.push(path);
+    }
+    let fallback = temp_log_dir();
+    if primary.as_deref() != Some(fallback.as_path())
+        && let Some(path) = append_startup_log(&fallback, message)
+    {
+        written.push(path);
+    }
+    written
+}
+
+/// Write a fatal startup failure to both log locations and stderr.
+///
+/// The message is prefixed `FATAL: ` so it stands out in the log
+/// tail. Both writes are best-effort (see [`append_startup_log_both`])
+/// — this function never panics and never fails the caller, so it is
+/// safe to call on the exit path right before `process::exit`.
+/// Returns the files actually written (empty when neither location
+/// was writable — the stderr line is still emitted).
+#[must_use]
+pub fn log_fatal(message: &str) -> Vec<PathBuf> {
+    let line = format!("FATAL: {message}");
+    eprintln!("[RSH] {line}");
+    append_startup_log_both(&line)
+}
+
+/// [`log_fatal`] with injectable log directories (the test seam:
+/// tests pin both locations to temp dirs so the real data dir is
+/// never touched).
+#[must_use]
+pub fn log_fatal_to(
+    message: &str,
+    primary_log_dir: Option<&Path>,
+    fallback_log_dir: &Path,
+) -> Vec<PathBuf> {
+    let line = format!("FATAL: {message}");
+    eprintln!("[RSH] {line}");
+    let mut written = Vec::new();
+    if let Some(dir) = primary_log_dir
+        && let Some(path) = append_startup_log(dir, &line)
+    {
+        written.push(path);
+    }
+    if primary_log_dir != Some(fallback_log_dir)
+        && let Some(path) = append_startup_log(fallback_log_dir, &line)
+    {
+        written.push(path);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -663,6 +758,73 @@ mod tests {
         let written =
             append_startup_log_at(&file_as_dir, "cannot be written", fixed_time(1_794_700_800));
         assert_eq!(written, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temp_log_dir_is_named_rsh_logs() {
+        let dir = temp_log_dir();
+        assert_eq!(dir.file_name().and_then(|name| name.to_str()), Some("logs"));
+        assert_eq!(
+            dir.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str()),
+            Some("RSH")
+        );
+    }
+
+    #[test]
+    fn log_fatal_writes_both_locations() {
+        let dir = temp_dir("fatal-both");
+        let primary = dir.join("primary");
+        let fallback = dir.join("fallback");
+        let written = log_fatal_to("data dir missing", Some(&primary), &fallback);
+        assert_eq!(written.len(), 2, "{written:?}");
+        for path in &written {
+            let contents = fs::read_to_string(path).expect("read fatal log");
+            assert!(contents.contains("FATAL: data dir missing"), "{contents}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_fatal_falls_back_when_primary_unwritable() {
+        // Bug C: the data-dir logs are unwritable — the %TEMP%
+        // fallback must still carry the trace.
+        let dir = temp_dir("fatal-fallback");
+        let blocker = dir.join("not-a-dir");
+        fs::write(&blocker, "in the way").expect("write blocker file");
+        let fallback = dir.join("fallback");
+        let written = log_fatal_to("profile store failed", Some(&blocker), &fallback);
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert!(written[0].starts_with(&fallback), "{written:?}");
+        let contents = fs::read_to_string(&written[0]).expect("read fallback log");
+        assert!(
+            contents.contains("FATAL: profile store failed"),
+            "{contents}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_fatal_without_primary_writes_fallback_only() {
+        // Bug D: no data dir resolves at all — the fallback is the
+        // only trace.
+        let dir = temp_dir("fatal-noprimary");
+        let fallback = dir.join("fallback");
+        let written = log_fatal_to("no data dir", None, &fallback);
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert!(written[0].starts_with(&fallback), "{written:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_fatal_same_dir_writes_once() {
+        let dir = temp_dir("fatal-same");
+        let written = log_fatal_to("dedup check", Some(&dir), &dir);
+        assert_eq!(written.len(), 1, "{written:?}");
+        let contents = fs::read_to_string(&written[0]).expect("read fatal log");
+        assert_eq!(contents.lines().count(), 1, "{contents}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

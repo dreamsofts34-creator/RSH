@@ -14,6 +14,7 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
+use rsh_app_core::diagnostics::append_startup_log_both;
 use rsh_app_core::state::TransportKind;
 use rsh_app_core::state::{AppStateCore, BUTTON_PRESS_EVENT, SNAPSHOT_EVENT, SnapshotEmit};
 use rsh_app_core::system::ShutdownOutcome;
@@ -129,17 +130,51 @@ impl AppState {
     /// just does not flow until a transport connects and a session
     /// authenticates. The engine status detail names the reason (see
     /// `AppStateCore::engine_status`).
+    ///
+    /// Bug 8 (v1.0.2): this used to run ON the setup path, where the
+    /// core's 5 s supervisor-ready wait held the window back for up
+    /// to 5 s on a slow/loaded machine — and a slow supervisor made
+    /// startup look hung. The start now runs on its own thread, so
+    /// setup returns immediately and the window appears first; the
+    /// core's 5 s ready wait still applies inside that thread, and a
+    /// failure is logged loudly in both log locations (stderr +
+    /// startup log) instead of only stderr. `start_auto_switch`
+    /// (called from setup right after this) does not depend on the
+    /// engine thread — it only installs the watcher.
     pub fn start_engine(&self) {
-        if let Err(error) = self.core.start_engine() {
-            eprintln!(
-                "[RSH] engine failed to start: {error}; snapshots and output switching still work, wheel input will not flow"
-            );
-            return;
-        }
-        if let Err(error) = self.core.connect_transport(TransportKind::Udp) {
-            eprintln!(
-                "[RSH] UDP transport connect failed: {error}; engine idle until a transport connects"
-            );
+        let core = Arc::clone(&self.core);
+        match std::thread::Builder::new()
+            .name("rsh-engine-starter".to_string())
+            .spawn(move || {
+                if let Err(error) = core.start_engine() {
+                    let line = format!(
+                        "[RSH] engine failed to start: {error}; snapshots and output switching still work, wheel input will not flow"
+                    );
+                    eprintln!("{line}");
+                    let _ = append_startup_log_both(&line);
+                    return;
+                }
+                if let Err(error) = core.connect_transport(TransportKind::Udp) {
+                    let line = format!(
+                        "[RSH] UDP transport connect failed: {error}; engine idle until a transport connects"
+                    );
+                    eprintln!("{line}");
+                    let _ = append_startup_log_both(&line);
+                }
+            }) {
+            Ok(_) => {}
+            Err(error) => {
+                // A thread-spawn failure here is near-impossible (the
+                // process just spawned threads for the emitter and
+                // the runtime); failing startup over it would be
+                // worse than running without an engine, so log loudly
+                // and carry on.
+                let line = format!(
+                    "[RSH] could not spawn engine starter thread: {error}; engine not started, wheel input will not flow"
+                );
+                eprintln!("{line}");
+                let _ = append_startup_log_both(&line);
+            }
         }
     }
 
