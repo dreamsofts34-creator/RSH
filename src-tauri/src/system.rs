@@ -275,7 +275,7 @@ where
         // v1.0.1: the shutdown line in the file log proves a clean exit;
         // start line present + shutdown line absent = abnormal exit.
         if let Some(log_dir) = rsh_app_core::data_dir().map(|dir| dir.join("logs")) {
-            diagnostics::append_startup_log(&log_dir, &line);
+            let _ = diagnostics::append_startup_log(&log_dir, &line);
         }
     }
 }

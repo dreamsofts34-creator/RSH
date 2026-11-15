@@ -117,7 +117,17 @@ fn startup_log_dir() -> Option<std::path::PathBuf> {
 /// right after the write.
 fn log_startup(message: &str) {
     if let Some(dir) = startup_log_dir() {
-        append_startup_log(&dir, message);
+        let _ = append_startup_log(&dir, message);
+    }
+}
+
+/// Install the panic hook and log process start (v1.0.1). Called first
+/// in `main()`, before anything else can panic — the file log is the
+/// evidence for the next run when the window never paints.
+fn init_startup_logging() {
+    if let Some(log_dir) = startup_log_dir() {
+        install_panic_hook(log_dir.clone());
+        let _ = append_startup_log(&log_dir, &format!("RSH v{APP_VERSION} starting"));
     }
 }
 
@@ -906,41 +916,38 @@ fn build_app_state() -> AppState {
         (Ok(core), repair_notice) => {
             let core = Arc::new(core);
             let outcome = core.activate_startup_backend();
-            match outcome.active {
-                Some(active) => {
-                    let mut line = format!(
-                        "[RSH] startup output backend: requested {} → live {}",
+            if let Some(active) = outcome.active {
+                let mut line = format!(
+                    "[RSH] startup output backend: requested {} → live {}",
+                    outcome.requested.display_name(),
+                    active.display_name()
+                );
+                if outcome.fell_back {
+                    line.push_str(" (fell back: ");
+                    line.push_str(outcome.reason.as_deref().unwrap_or("unknown reason"));
+                    line.push(')');
+                }
+                eprintln!("{line}");
+                log_startup(&line);
+            } else {
+                let reason = outcome.reason.as_deref().unwrap_or("unknown reason");
+                // A deliberate deferral (HIDMaestro needs elevation)
+                // is not a failure — say so in the log.
+                let line = if reason.contains("deferred") {
+                    format!(
+                        "[RSH] startup output backend: {} deferred at startup: {}; output disabled (NullSink)",
                         outcome.requested.display_name(),
-                        active.display_name()
-                    );
-                    if outcome.fell_back {
-                        line.push_str(" (fell back: ");
-                        line.push_str(outcome.reason.as_deref().unwrap_or("unknown reason"));
-                        line.push(')');
-                    }
-                    eprintln!("{line}");
-                    log_startup(&line);
-                }
-                None => {
-                    let reason = outcome.reason.as_deref().unwrap_or("unknown reason");
-                    // A deliberate deferral (HIDMaestro needs elevation)
-                    // is not a failure — say so in the log.
-                    let line = if reason.contains("deferred") {
-                        format!(
-                            "[RSH] startup output backend: {} deferred at startup: {}; output disabled (NullSink)",
-                            outcome.requested.display_name(),
-                            reason
-                        )
-                    } else {
-                        format!(
-                            "[RSH] startup output backend: {} activation failed: {}; output disabled (NullSink)",
-                            outcome.requested.display_name(),
-                            reason
-                        )
-                    };
-                    eprintln!("{line}");
-                    log_startup(&line);
-                }
+                        reason
+                    )
+                } else {
+                    format!(
+                        "[RSH] startup output backend: {} activation failed: {}; output disabled (NullSink)",
+                        outcome.requested.display_name(),
+                        reason
+                    )
+                };
+                eprintln!("{line}");
+                log_startup(&line);
             }
             let state = AppState::new(core);
             if let Some(notice) = repair_notice {
@@ -1000,14 +1007,22 @@ fn on_second_instance(app: &tauri::AppHandle, args: Vec<String>, _cwd: String) {
     }
 }
 
-fn main() {
-    // v1.0.1: install the panic hook FIRST, before anything else can
-    // panic, and log process start — the file log is the evidence
-    // for the next run when the window never paints.
-    if let Some(log_dir) = startup_log_dir() {
-        install_panic_hook(log_dir.clone());
-        append_startup_log(&log_dir, &format!("RSH v{APP_VERSION} starting"));
+/// Folds an autostart-repair failure into the startup notice (H3):
+/// a failure is not silent any more, the shell shows it once.
+fn fold_autostart_error(state: &AppState, error: Option<String>) {
+    if let Some(error) = error {
+        let notice = match state.startup_notice() {
+            Some(existing) => format!("{existing} Autostart repair failed: {error}."),
+            None => format!("Autostart repair failed: {error}."),
+        };
+        state.set_startup_notice(notice);
     }
+}
+
+fn main() {
+    // v1.0.1: panic hook + process-start log first, before anything
+    // else can panic (see `init_startup_logging`).
+    init_startup_logging();
     // Repair a stale autostart entry before Settings reads the state.
     // A failure is not silent any more: it joins the startup notice
     // the shell shows once (H3).
@@ -1016,13 +1031,7 @@ fn main() {
         eprintln!("[RSH] autostart repair failed: {error}");
     }
     let state = build_app_state();
-    if let Some(error) = autostart_repair_error {
-        let notice = match state.startup_notice() {
-            Some(existing) => format!("{existing} Autostart repair failed: {error}."),
-            None => format!("Autostart repair failed: {error}."),
-        };
-        state.set_startup_notice(notice);
-    }
+    fold_autostart_error(&state, autostart_repair_error);
     let app = tauri::Builder::default()
         // Single instance (registered FIRST): see `on_second_instance`.
         .plugin(tauri_plugin_single_instance::init(on_second_instance))
