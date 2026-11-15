@@ -51,10 +51,13 @@ file is the gate list the coordinator ticks before tagging.
       anywhere** — H4 §3 + `THIRD-PARTY-LICENSES.md`.
 - [x] **Updater keypair (NEW, separate from the firmware keypair):**
       minisign public key
-      `RWRU7xMj5S9Eodnz8HNKEz8LacETwEFxkttjZLnCbopqmAdFYT2S7DGb`
-      (keynum `54ef1323e52f44a1`, fingerprint
-      `ce5f3210927e7ada3efc2ce843c2ac1dc81762fd2d09e4f46f8ccabf94f260bd`),
-      in `tauri.conf.json`; crate-level sign/verify cross-check PASS —
+      `RWTeanojSpk/AqwtLj5+ShAZPbWWzRmQugDCs9fJUjVrtNkCJ2+llrE2`
+      (keynum `de6a7a234a993f02`, fingerprint
+      `ecb5a3106e30468090ea39c90f69498e2ae646f13b8cace256bcfea6267fc1f1`),
+      in `tauri.conf.json` as base64 of the `.pub` file; password-protected
+      keypair generated with `cargo tauri signer generate` (DECISIONS §17.11
+      — the H4 unencrypted keypair was retired 2026-11-15, it could never
+      sign); crate-level sign/verify cross-check PASS —
       H4 §4. **Updater is check-only in v1.0.0** (no
       download/install code path); `active: false` in the config is a
       Tauri-v1 leftover the plugin ignores — the real gates are "no

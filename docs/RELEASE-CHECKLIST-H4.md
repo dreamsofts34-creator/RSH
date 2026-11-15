@@ -192,15 +192,23 @@ Every item is ticked, explicitly deferred with a reason, or marked Windows-only.
 ## 4. Updater + minisign keypair
 
 - [x] **NEW keypair generated 2026-11-14, SEPARATE from the firmware Ed25519
-  keypair (never reused, D-R10).**
+  keypair (never reused, D-R10).** ROTATED 2026-11-15 (DECISIONS §17.11):
+  the H4 keypair was unencrypted (kdf none) and Tauri's bundler only takes
+  the encrypted path — it could never sign. New keypair generated with
+  `cargo tauri signer generate` + 32-char password (password in
+  `signing-keys/updater-password.txt`, 0600; GitHub secrets
+  `RSH_UPDATER_PRIVATE_KEY` = contents of the CLI `.key` file as-is,
+  `RSH_UPDATER_PRIVATE_KEY_PASSWORD` = password).
   - Private: `~/workspace/projects/rsh/signing-keys/updater-minisign.key` (0600)
   - Public: `~/workspace/projects/rsh/signing-keys/updater-minisign.pub` (0644)
-  - Public key (also `tauri.conf.json → plugins.updater.pubkey`):
-    `RWRU7xMj5S9Eodnz8HNKEz8LacETwEFxkttjZLnCbopqmAdFYT2S7DGb`
-  - Keynum (hex): `54ef1323e52f44a1`
+  - Public key line:
+    `RWTeanojSpk/AqwtLj5+ShAZPbWWzRmQugDCs9fJUjVrtNkCJ2+llrE2`
+  - `tauri.conf.json → plugins.updater.pubkey` (base64 of the .pub file):
+    `dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAyM0Y5OTRBMjM3QTZBREUKUldUZWFub2pTcGsvQXF3dExqNStTaEFaUGJXV3pSbVF1Z0RDczlmSlVqVnJ0TmtDSjIrbGxyRTIK`
+  - Keynum (hex): `de6a7a234a993f02` (comment `023F994A237A6ADE`)
   - Fingerprint (SHA-256 of raw 32-byte pubkey):
-    `ce5f3210927e7ada3efc2ce843c2ac1dc81762fd2d09e4f46f8ccabf94f260bd`
-  - Public key (hex): `d9f3f0734a133f0b69c113c0417192db6364b9c26e8a6a980745613d92ec319b`
+    `ecb5a3106e30468090ea39c90f69498e2ae646f13b8cace256bcfea6267fc1f1`
+  - Public key (hex): `ac2d2e3e7e4a10193db596cd1990ba00c2b3d7c952356bb4d902276fa596b136`
   - No password. Recorded in `signing-keys/README.md` (public key + fingerprint
     + purpose only — **no key material anywhere in the repo, chat, or docs**).
   - Self-check PASS: minisign format (74 B secret / 42 B public, `Ed` prefix,
