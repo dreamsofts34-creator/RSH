@@ -74,6 +74,45 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(1);
 /// the inter-arrival jitter metric.
 pub const EXPECTED_FRAME_INTERVAL_US: u32 = 5_000;
 
+/// Windows timer-resolution guard: the 200 Hz loop ticks on a
+/// `tokio::time::interval(5 ms)`, but Windows timers (and
+/// `std::thread::sleep`) only resolve to the OS timer period —
+/// ~15.6 ms by default — so the loop would tick at ~64 Hz instead
+/// of 200 Hz (release dry run #6: idle rate measured 73 Hz on the
+/// Windows runner and the `loop_hz > 150` assertion failed, while
+/// the same test passes on Linux). While the engine runs, request
+/// 1 ms resolution with `timeBeginPeriod(1)` (winmm — the standard
+/// mechanism games and media apps use) and release it on drop with
+/// the matching `timeEndPeriod(1)`. No-op off Windows.
+#[cfg(windows)]
+struct TimerResolutionGuard;
+#[cfg(windows)]
+impl TimerResolutionGuard {
+    fn acquire() -> Self {
+        // SAFETY: `timeBeginPeriod(1)` is a plain winmm call with a
+        // valid period (1 ms is the minimum); the result only reports
+        // failure, the call itself cannot fault. The matching
+        // `timeEndPeriod(1)` runs in `Drop` below.
+        let _ = unsafe { windows::Win32::Media::timeBeginPeriod(1) };
+        Self
+    }
+}
+#[cfg(windows)]
+impl Drop for TimerResolutionGuard {
+    fn drop(&mut self) {
+        // SAFETY: paired with the `timeBeginPeriod(1)` in `acquire`.
+        let _ = unsafe { windows::Win32::Media::timeEndPeriod(1) };
+    }
+}
+#[cfg(not(windows))]
+struct TimerResolutionGuard;
+#[cfg(not(windows))]
+impl TimerResolutionGuard {
+    fn acquire() -> Self {
+        Self
+    }
+}
+
 /// Signed inter-arrival delta (µs) between two board timestamps
 /// (`u32` µs, wraps every ~71.6 min).
 ///
@@ -485,6 +524,9 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
     /// a source/sink error: errors are counted, output goes neutral,
     /// and the loop keeps ticking.
     pub async fn run(mut self) -> EngineReport {
+        // Windows timer resolution (see `TimerResolutionGuard`):
+        // without it the 5 ms interval ticks at ~64 Hz there.
+        let _timer_resolution = TimerResolutionGuard::acquire();
         let mut ticker = interval(TICK_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         if !*self.stop_rx.borrow() {

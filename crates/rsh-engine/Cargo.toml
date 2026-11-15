@@ -12,5 +12,10 @@ rsh-protocol = { path = "../rsh-protocol" }
 serde.workspace = true
 tokio.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# The `windows` crate does not compile on Linux, so this is strictly
+# a target-gated dependency (workspace convention, root Cargo.toml).
+windows = { workspace = true, features = ["Win32_Media"] }
+
 [dev-dependencies]
 serde_json.workspace = true
