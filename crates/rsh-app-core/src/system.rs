@@ -33,7 +33,7 @@ use rsh_engine::pipeline::OutputState;
 use serde::{Deserialize, Serialize};
 
 /// Application version of this Rust series.
-pub const APP_VERSION: &str = "1.0.0";
+pub const APP_VERSION: &str = "1.0.1";
 
 /// Errors from the system-integration logic in this module.
 #[derive(Clone, Debug, PartialEq, Eq)]

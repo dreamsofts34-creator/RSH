@@ -16,6 +16,12 @@
 //! unhandled exception) is a Windows-only design documented in
 //! `docs/DIAGNOSTICS.md` §2; it needs the `windows` crate `dbghelp`
 //! feature and is a Phase H / Windows-CI item, not compiled here.
+//!
+//! Startup log: [`append_startup_log`] appends timestamped lines to
+//! the daily-rotated `rsh-YYYYMMDD.log` in the log directory, so a
+//! startup failure leaves a trace on disk even when the console is
+//! gone (the v1.0.0 launch failure left `%AppData%\RSH\logs` empty
+//! because startup only ever used `eprintln`).
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -315,9 +321,93 @@ pub fn install_panic_hook(log_dir: PathBuf) {
         let line = redact_secrets(&format!("panic at {location}: {payload}\n"));
         let path = log_dir.join(PANIC_LOG_NAME);
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            // Flush before returning: the process may die right after
+            // the hook runs, and a buffered line lost in a crash is
+            // no evidence at all (v1.0.1 acceptance: the file log is
+            // the evidence for the next run).
             let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
         }
     }));
+}
+
+/// Daily startup-log file name: `rsh-YYYYMMDD.log` (the S-11
+/// daily-rotation name [`collect_log_tail`] already reads, so the
+/// diagnostics export picks these lines up).
+///
+/// Timestamps are UTC: `std` has no local-time API and this crate
+/// takes no `chrono` dependency, so the file name and the line
+/// timestamp use the same UTC civil date.
+fn startup_log_path_for(log_dir: &Path, now: SystemTime) -> PathBuf {
+    let (year, month, day, _, _, _) = utc_civil_parts(now);
+    log_dir.join(format!("rsh-{year:04}{month:02}{day:02}.log"))
+}
+
+/// `(year, month, day, hour, minute, second)` in UTC for `now`
+/// (Howard Hinnant's days-from-civil algorithm; std-only).
+fn utc_civil_parts(now: SystemTime) -> (i64, u32, u32, u32, u32, u32) {
+    let secs = i64::try_from(
+        now.duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs()),
+    )
+    .unwrap_or(i64::MAX);
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let hour = u32::try_from(secs_of_day / 3_600).unwrap_or(23);
+    let minute = u32::try_from((secs_of_day % 3_600) / 60).unwrap_or(59);
+    let second = u32::try_from(secs_of_day % 60).unwrap_or(59);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = u32::try_from(z.rem_euclid(146_097)).unwrap_or(0);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = i64::from(yoe) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day, hour, minute, second)
+}
+
+/// Append one timestamped line to today's startup log
+/// (`log_dir/rsh-YYYYMMDD.log`):
+/// `[YYYY-MM-DD HH:MM:SS] <message>`.
+///
+/// The log directory is created when missing. A message is redacted
+/// ([`redact_secrets`]) and flattened to one line before it is
+/// written, so a secret can never reach the file through this
+/// helper. Any failure (unwritable directory, disk full, …) is
+/// silently ignored — startup must never fail because logging did.
+///
+/// Returns the path written, or [`None`] when nothing could be
+/// written.
+#[must_use]
+pub fn append_startup_log(log_dir: &Path, message: &str) -> Option<PathBuf> {
+    append_startup_log_at(log_dir, message, SystemTime::now())
+}
+
+/// [`append_startup_log`] with an injectable clock (the test seam:
+/// tests pin the time to prove the date rollover).
+fn append_startup_log_at(log_dir: &Path, message: &str, now: SystemTime) -> Option<PathBuf> {
+    let _ = fs::create_dir_all(log_dir);
+    let path = startup_log_path_for(log_dir, now);
+    let (year, month, day, hour, minute, second) = utc_civil_parts(now);
+    let single_line: String = message
+        .chars()
+        .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+        .collect();
+    let line = format!(
+        "[{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}] {}\n",
+        redact_secrets(&single_line)
+    );
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    file.write_all(line.as_bytes()).ok()?;
+    let _ = file.flush();
+    Some(path)
 }
 
 #[cfg(test)]
@@ -473,6 +563,106 @@ mod tests {
         assert!(log.contains("test panic"), "{log}");
         assert!(!log.contains("planted-panic-secret"), "{log}");
         assert!(log.contains(REDACTED), "{log}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utc_civil_parts_known_dates() {
+        assert_eq!(utc_civil_parts(UNIX_EPOCH), (1970, 1, 1, 0, 0, 0));
+        // 2026-11-15 00:00:00 UTC (verified with `date -u -d @1794700800`).
+        assert_eq!(
+            utc_civil_parts(UNIX_EPOCH + std::time::Duration::from_secs(1_794_700_800)),
+            (2026, 11, 15, 0, 0, 0)
+        );
+        // 2026-11-15 23:59:59 UTC.
+        assert_eq!(
+            utc_civil_parts(UNIX_EPOCH + std::time::Duration::from_secs(1_794_787_199)),
+            (2026, 11, 15, 23, 59, 59)
+        );
+    }
+
+    fn fixed_time(secs: u64) -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn startup_log_creates_file_and_appends_timestamped_lines() {
+        let dir = temp_dir("startup");
+        let log_dir = dir.join("logs");
+        let first =
+            append_startup_log_at(&log_dir, "RSH v1.0.0 starting", fixed_time(1_794_701_220));
+        let second = append_startup_log_at(&log_dir, "setup complete", fixed_time(1_794_701_225));
+        assert_eq!(first, second);
+        let path = first.expect("log written");
+        assert_eq!(path, log_dir.join("rsh-20261115.log"));
+        let contents = fs::read_to_string(&path).expect("read log");
+        assert_eq!(
+            contents,
+            "[2026-11-15 00:07:00] RSH v1.0.0 starting\n\
+             [2026-11-15 00:07:05] setup complete\n",
+            "{contents}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_log_creates_missing_dir() {
+        let dir = temp_dir("startup-missing");
+        let log_dir = dir.join("deep").join("logs");
+        assert!(!log_dir.exists());
+        let written = append_startup_log_at(&log_dir, "first line", fixed_time(1_794_700_800));
+        assert_eq!(written, Some(log_dir.join("rsh-20261115.log")));
+        assert!(log_dir.join("rsh-20261115.log").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_log_rolls_over_at_midnight() {
+        let dir = temp_dir("startup-rollover");
+        // 2026-11-15 23:59:59 UTC, then 2026-11-16 00:00:00 UTC.
+        let before = append_startup_log_at(&dir, "last line of the day", fixed_time(1_794_787_199));
+        let after =
+            append_startup_log_at(&dir, "first line of the new day", fixed_time(1_794_787_200));
+        assert_eq!(before, Some(dir.join("rsh-20261115.log")));
+        assert_eq!(after, Some(dir.join("rsh-20261116.log")));
+        let old = fs::read_to_string(dir.join("rsh-20261115.log")).expect("old log");
+        let new = fs::read_to_string(dir.join("rsh-20261116.log")).expect("new log");
+        assert!(
+            old.contains("[2026-11-15 23:59:59] last line of the day"),
+            "{old}"
+        );
+        assert!(!old.contains("new day"), "{old}");
+        assert!(
+            new.contains("[2026-11-16 00:00:00] first line of the new day"),
+            "{new}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_log_never_writes_secrets_and_flattens_lines() {
+        let dir = temp_dir("startup-secrets");
+        let written = append_startup_log_at(
+            &dir,
+            "password=hunter2-secret\nsecond line stays one line",
+            fixed_time(1_794_700_800),
+        );
+        let path = written.expect("log written");
+        let contents = fs::read_to_string(&path).expect("read log");
+        assert!(!contents.contains("hunter2-secret"), "{contents}");
+        assert!(contents.contains(REDACTED), "{contents}");
+        assert_eq!(contents.lines().count(), 1, "{contents}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_log_failure_is_silent() {
+        let dir = temp_dir("startup-fail");
+        let file_as_dir = dir.join("not-a-dir");
+        fs::write(&file_as_dir, "in the way").expect("write blocker file");
+        let written =
+            append_startup_log_at(&file_as_dir, "cannot be written", fixed_time(1_794_700_800));
+        assert_eq!(written, None);
         let _ = fs::remove_dir_all(&dir);
     }
 }

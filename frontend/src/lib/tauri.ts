@@ -13,7 +13,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
  * ------------------------------------------------------------------
  * WHAT EXISTS IN src-tauri TODAY (2026-11-14, Phase H3):
  *   - `ping`            -> "pong"
- *   - `get_version`     -> "1.0.0"
+ *   - `get_version`     -> "1.0.1"
  *   - `validate_pin_map`      -> PinMapValidation (rsh-protocol::validate_blob)
  *   - `validate_firmware_image` -> FirmwareValidation (rsh-security::verify_firmware_image)
  *   - `list_backups`, `get_firewall_state`, `get_autostart`,
@@ -404,7 +404,7 @@ export function ping(): Promise<string> {
   return invokeCommand<string>("ping");
 }
 
-/** Application version, e.g. "1.0.0". */
+/** Application version, e.g. "1.0.1". */
 export function getVersion(): Promise<string> {
   return invokeCommand<string>("get_version");
 }

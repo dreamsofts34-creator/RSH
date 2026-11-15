@@ -1,6 +1,6 @@
-# RSH — User Guide (Rust app v1.0.0)
+# RSH — User Guide (Rust app v1.0.1)
 
-**App:** RSH v1.0.0 (Tauri 2, Windows 10 22H2 / Windows 11, x64) ·
+**App:** RSH v1.0.1 (Tauri 2, Windows 10 22H2 / Windows 11, x64) ·
 **Wheel firmware:** C++ v4.0.1 · **Protocol:** v2.1 ·
 **Board:** ESP32 DevKit V1
 
@@ -28,13 +28,13 @@ first — your old pairing does **not** carry over.
 
 ## Install
 
-1. Download **`RSH_1.0.0_x64-setup.exe`** (primary installer) or
-   **`RSH_1.0.0_x64_en-US.msi`** (secondary, for managed installs)
+1. Download **`RSH_1.0.1_x64-setup.exe`** (primary installer) or
+   **`RSH_1.0.1_x64_en-US.msi`** (secondary, for managed installs)
    from the
-   [v1.0.0 GitHub Release](https://github.com/dreamsofts34-creator/RSH/releases/tag/v1.0.0).
+   [v1.0.1 GitHub Release](https://github.com/dreamsofts34-creator/RSH/releases/tag/v1.0.1).
 2. **Verify the download** before running it — compare the SHA-256
    with `SHA256SUMS` in the same release:
-   - PowerShell: `Get-FileHash RSH_1.0.0_x64-setup.exe -Algorithm SHA256`
+   - PowerShell: `Get-FileHash RSH_1.0.1_x64-setup.exe -Algorithm SHA256`
    - If the hash does not match, delete the file and download it again.
      Never run a mismatched installer.
 3. Double-click the installer. It installs for the current user only —
@@ -50,7 +50,7 @@ first — your old pairing does **not** carry over.
 
 ### Unsigned app — SmartScreen
 
-v1.0.0 ships **unsigned** (the OV code-signing certificate is deferred
+v1.0.1 ships **unsigned** (the OV code-signing certificate is deferred
 to a later release). Windows SmartScreen will warn when you run the
 installer — this is expected. Click "More info" → "Run anyway".
 Firmware signing is unaffected: the firmware image is still
@@ -216,7 +216,7 @@ scratch.
 
 ## Updating
 
-v1.0.0 is **check-only**: Settings can check for a new version
+v1.0.1 is **check-only**: Settings can check for a new version
 against the release `latest.json`, but the app cannot download or
 install an update by itself. When an update ships, download the new
 installer from GitHub Releases and install it over the old one —
@@ -234,7 +234,7 @@ so a missing theme or a failed binding can no longer produce a blank
 window. If you still see a blank window or an empty page:
 
 1. Check the app is actually the latest release (`RSH — Real Sim Hub
-   v1.0.0` in the title bar). An older or mixed install can paint
+   v1.0.1` in the title bar). An older or mixed install can paint
    oddly — uninstall, then install the release installer cleanly.
 2. Look at the log: `%AppData%\RSH\logs\rsh-YYYYMMDD.log` (today's
    date, no dashes). If that folder is empty or unwritable, the app

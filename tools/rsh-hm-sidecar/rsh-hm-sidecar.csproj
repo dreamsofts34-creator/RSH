@@ -1,6 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <!-- Hotfix v1.0.1 (BUG #2): `WinExe` — Windows GUI subsystem, so
+         the sidecar NEVER opens a console window when spawned, neither
+         over stdio (`CreateProcess`) nor elevated via `runas`
+         (`ShellExecuteEx` — which takes no creation flags, so the
+         subsystem is the only thing hiding the window there). The
+         piped stdio protocol is unaffected: `Program.cs` talks through
+         `Console.OpenStandardInput/Output`, which wrap the redirected
+         pipe handles regardless of subsystem (the subsystem only
+         controls whether Windows allocates a console). NativeAOT
+         supports `WinExe` — ILCompiler sets `LinkerSubsystem`
+         `WINDOWS` for it (vs `CONSOLE` for `Exe`). -->
+    <OutputType>WinExe</OutputType>
     <!-- net10.0-windows (not a 26100.0 TFM): the sidecar must also run on
          the owner's Windows 10 22H2 PC. The HIDMaestro SDK's members are
          annotated windows10.0.26100.0, which is advisory here — CA1416 is

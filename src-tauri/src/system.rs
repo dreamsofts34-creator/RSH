@@ -221,7 +221,10 @@ pub fn parse_reg_query_value(stdout: &str) -> Option<String> {
 /// signing keypair is generated there; see `docs/SYSTEM-INTEGRATION.md`
 /// §5). The caller compares the result with the running version via
 /// `rsh_app_core::system::check_update` and shows the update UI; the
-/// check runs at startup in the background and never blocks the UI.
+/// check runs only when the user asks for it (Settings "Check for
+/// updates") — never at startup — and never blocks the UI. Since
+/// v1.0.1 the release ships no `latest.json`, so the check reports
+/// "could not check" (auto-update is off by design).
 ///
 /// # Errors
 ///
@@ -264,10 +267,16 @@ where
 {
     if let RunEvent::ExitRequested { .. } = event {
         let outcome = shutdown();
-        eprintln!(
+        let line = format!(
             "[RSH] shutdown: stop_signalled={} neutral_sent={}",
             outcome.stop_signalled, outcome.neutral_sent
         );
+        eprintln!("{line}");
+        // v1.0.1: the shutdown line in the file log proves a clean exit;
+        // start line present + shutdown line absent = abnormal exit.
+        if let Some(log_dir) = rsh_app_core::data_dir().map(|dir| dir.join("logs")) {
+            diagnostics::append_startup_log(&log_dir, &line);
+        }
     }
 }
 

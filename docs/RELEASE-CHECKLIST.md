@@ -74,26 +74,26 @@ file is the gate list the coordinator ticks before tagging.
 - [x] **Release workflow created** (`.github/workflows/release.yml`),
       YAML-valid — H4 §6, re-verified read-only in H5 (§6 below).
 
-## 3. Release asset list (exact — 11 assets)
+## 3. Release asset list (exact — ONE asset, hotfix v1.0.1)
 
-What `release.yml` stages and publishes (H4 §7):
+**Single-asset release (user order 2026-11-15 14:00, standing rule —
+see docs/DECISIONS.md §18):** what `release.yml` stages and publishes
+is exactly one file:
 
 | # | Asset | Source |
 |---|---|---|
-| 1 | `RSH_1.0.0_x64-setup.exe` | Tauri NSIS bundle (primary installer) |
-| 2 | `RSH_1.0.0_x64-setup.exe.sig` | Updater signature for the NSIS installer |
-| 3 | `RSH_1.0.0_x64_en-US.msi` | Tauri WiX bundle (secondary installer) |
-| 4 | `RSH_1.0.0_x64_en-US.msi.sig` | Updater signature for the MSI |
-| 5 | `latest.json` | Generated in `release.yml` from the real `.sig` + real release URLs |
-| 6 | `RSH-Firmware-DevKitV1-v4.0.1.bin` | `pio run` merged image, 956,032 B (Windows release runner; Linux: 955,984 B) |
-| 7 | `firmware-signed.bin` | `firmware.bin` + 68 B trailer, Ed25519-signed |
-| 8 | `SHA256SUMS` | SHA-256 of every asset above, re-verified in-workflow |
-| 9 | `sbom-rust.cdx.json` | `cargo cyclonedx` (release-time) |
-| 10 | `sbom-frontend.cdx.json` | `npm sbom` (release-time) |
-| 11 | `sbom-sidecar.cdx.json` | Committed `sbom/sidecar.cdx.json` (hand-written) |
+| 1 | `RSH_1.0.1_x64-setup.exe` | Tauri NSIS bundle (the ONLY installer, the ONLY asset) |
 
-Installer filenames follow Tauri 2.12 defaults — the first dry-run
-confirms them; if they differ, the workflow's globbing fails loudly
+NOT published in this release: MSI, `.sig` files, `latest.json`
+(auto-update is OFF — no manifest is published, so
+`check_for_update` fails gracefully with "Could not check for
+updates."), firmware bins (merged + signed), `SHA256SUMS`, SBOMs.
+The v1.0.0 11-asset list above is superseded — it is kept only in
+the H4 record ([RELEASE-CHECKLIST-H4.md](RELEASE-CHECKLIST-H4.md) §7)
+and in git history, never as the current list.
+
+Installer filename follows Tauri 2.12 defaults — the first dry-run
+confirms it; if it differs, the workflow's globbing fails loudly
 rather than publishing the wrong file.
 
 ## 4. Open release gates (all carried honestly — none is silently passed)
@@ -159,11 +159,14 @@ Read `.github/workflows/release.yml` (361 lines) and `.github/workflows/ci.yml`
       checked present (fail closed) before any build step; values
       never printed; temp firmware-key file deleted in an
       `if: always()` step.
-- [x] **11-asset list** (§3) matches the staging + verify steps in the
-      workflow: NSIS + MSI + both `.sig` files + `latest.json` +
-      merged firmware bin + `firmware-signed.bin` + `SHA256SUMS` +
-      3 SBOMs. The verify step re-checks every staged asset,
-      re-verifies `SHA256SUMS`, and re-verifies the signed firmware.
+- [x] **Single-asset list** (§3, hotfix v1.0.1 — DECISIONS §18)
+      matches the staging + verify steps in the workflow: exactly
+      one NSIS exe is staged, the verify step refuses anything other
+      than that one file, and `gh release create` uploads only it.
+      (The old 11-asset list — NSIS + MSI + both `.sig` files +
+      `latest.json` + merged firmware bin + `firmware-signed.bin` +
+      `SHA256SUMS` + 3 SBOMs — is superseded; those steps no longer
+      exist in `release.yml`.)
 - [x] **Fail-closed steps:** version consistency (tag == Cargo
       workspace version == `tauri.conf.json` version,
       `createUpdaterArtifacts` true) → firmware presence → secrets

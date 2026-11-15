@@ -2,10 +2,10 @@
 
 **Board:** ESP32 DevKit V1 (original ESP32, 4 MB flash) ·
 **Firmware:** C++ v4.0.1 · **Protocol:** v2.1 ·
-**App:** Rust v1.0.0
+**App:** Rust v1.0.1
 
 > **Do you need this guide at all?** Probably not. The Rust app
-> v1.0.0 talks to the same C++ v4.0.1 board — **if your wheel already
+> v1.0.1 talks to the same C++ v4.0.1 board — **if your wheel already
 > runs firmware v4.0.1, no reflash is needed** to use the Rust app
 > (you only need to [re-pair](USER-GUIDE.md#re-pairing-after-the-c-rust-switch-mandatory)).
 > This guide is only for a **new/blank board** or a **board that will
@@ -16,7 +16,7 @@
 
 | Situation | Action |
 |---|---|
-| Rust app v1.0.0 install / update | **Do NOT reflash** — an app update never changes firmware |
+| Rust app v1.0.1 install / update | **Do NOT reflash** — an app update never changes firmware |
 | New (blank) ESP32 DevKit V1 | Flash the merged factory image (§3) |
 | Board seems bricked (no Wi-Fi, will not boot) | Flash the merged factory image (§5 recovery) |
 | Config broken / board behaving oddly | Try app **FACTORY_RESET** first (keeps key + Wi-Fi password); or BOOT-hold safe mode (§4) — **not** a reflash |
@@ -52,7 +52,7 @@ OTA.
 
 | Item | Where from |
 |---|---|
-| Merged factory bin `RSH-Firmware-DevKitV1-v4.0.1.bin` (**955,984 B**) | GitHub Release v1.0.0 assets, or a local `pio run` (`.pio/build/esp32dev/`) |
+| Merged factory bin `RSH-Firmware-DevKitV1-v4.0.1.bin` (**955,984 B**) | GitHub Release v1.0.1 assets, or a local `pio run` (`.pio/build/esp32dev/`) |
 | `SHA256SUMS` (from the same release) | GitHub Release assets — verify before flashing (§3, step 1) |
 | `esptool.py` | With PlatformIO (`tool-esptoolpy`), or `pip install esptool` |
 | USB **data** cable (charge-only will not work) | — |
@@ -138,7 +138,7 @@ it back.
 ## 6. After flashing — checklist
 
 - [ ] `RSH` Wi-Fi network is visible
-- [ ] Rust app v1.0.0 connects (HELLO OK)
+- [ ] Rust app v1.0.1 connects (HELLO OK)
 - [ ] App shows firmware **v4.0.1** + protocol **v2.1**
 - [ ] Output page shows live axes/buttons (200 Hz stream)
 - [ ] First pairing done inside the 60-second window (new board /

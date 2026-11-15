@@ -28,6 +28,14 @@ use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Win32 `CREATE_NO_WINDOW` (`0x08000000`): suppress the console
+/// window for a child process. Used by [`spawn_stdio`] (hotfix
+/// v1.0.1, BUG #2 — belt-and-braces with the sidecar's `WinExe`
+/// output type). The value is pinned by the `#[cfg(windows)]` test
+/// below against the `windows` crate constant.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// One event from the reader thread.
 #[derive(Debug)]
 pub enum TransportEvent {
@@ -78,13 +86,26 @@ pub fn spawn_stdio(
     args: &[String],
     extra_env: &[(String, String)],
 ) -> std::io::Result<LiveTransport> {
-    let mut child = Command::new(path)
-        .args(args)
+    let mut cmd = Command::new(path);
+    cmd.args(args)
         .envs(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    // Hotfix v1.0.1 (BUG #2, belt-and-braces with the sidecar's
+    // `WinExe` output type): on Windows, never let a console-subsystem
+    // sidecar binary flash a console window when spawned over stdio.
+    // `CREATE_NO_WINDOW` only suppresses the window — the piped stdio
+    // handles above are unaffected. The production `runas` path does
+    // not go through here (`ShellExecuteEx` takes no creation flags),
+    // so it relies on `WinExe` alone — see
+    // `manager::spawn_elevated_runas`.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn()?;
     let stdin = child
         .stdin
         .take()
@@ -647,6 +668,20 @@ mod tests {
     fn stdio_spawn_missing_exe_fails() {
         let result = spawn_stdio(Path::new("/nonexistent/rsh-hm-sidecar"), &[], &[]);
         assert!(result.is_err());
+    }
+
+    /// Hotfix v1.0.1: the `CREATE_NO_WINDOW` value passed to the
+    /// stdio spawn must be the real Win32 flag — a typo here would
+    /// silently spawn a console-subsystem sidecar with a visible
+    /// console window. Windows-only (the `windows` crate does not
+    /// compile on Linux); runs on Windows CI.
+    #[cfg(windows)]
+    #[test]
+    fn create_no_window_matches_win32_constant() {
+        assert_eq!(
+            CREATE_NO_WINDOW,
+            windows::Win32::System::Threading::CREATE_NO_WINDOW.0
+        );
     }
 
     #[test]

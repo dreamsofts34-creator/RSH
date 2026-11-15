@@ -21,10 +21,16 @@
 //! (no device) — via `AppStateCore::set_output_backend`. At launch the
 //! shell calls [`AppStateCore::activate_startup_backend`], which
 //! activates the persisted `AppSettings.output_backend` choice through
-//! the same selector (default `HIDMaestro`); the [`NullSink`] is only
-//! the fallback base when activation fails, and the failure reason is
-//! recorded in the backend detail and in the startup outcome — never
-//! silently. Until activation runs the installed backend is the
+//! the same selector — except an elevated backend (`HIDMaestro`), which
+//! is NEVER activated at startup (hotfix v1.0.1: its `runas` launch
+//! would pop a UAC prompt on every launch). A persisted `HIDMaestro`
+//! choice is deferred instead: the [`NullSink`] stays installed, the
+//! outcome records `active: None` with the reason, and the user
+//! activates it by enabling output or picking it on the Output page
+//! (user-initiated, so the UAC prompt there is expected). The
+//! [`NullSink`] is only the fallback base when activation fails, and
+//! the failure reason is recorded in the backend detail and in the
+//! startup outcome — never silently. Until activation runs the installed backend is the
 //! [`NullSink`](crate::system::NullSink) — the no-device sink — speaking the trait via the
 //! [`IJoystickOutput` implementation below](NullSink): `try_connect`
 //! fails honestly (no driver to acquire), `update` fails as not
@@ -893,8 +899,10 @@ impl AppStateCore {
     /// startup default: the shell calls
     /// [`AppStateCore::activate_startup_backend`] right after opening,
     /// which activates the persisted backend choice through the
-    /// selector (default `HIDMaestro`, fallback vJoy, reason recorded
-    /// on failure). A missing store file means defaults (one `Default`
+    /// selector (vJoy when selected; a persisted `HIDMaestro` choice
+    /// is deferred at startup — no UAC prompt — until the user enables
+    /// output or picks it on the Output page), with the reason
+    /// recorded on failure. A missing store file means defaults (one `Default`
     /// profile, default settings); a corrupt file is an error, never
     /// silently dropped data.
     ///
@@ -2244,8 +2252,47 @@ impl AppStateCore {
     /// delivered — D-F3).
     #[must_use]
     pub fn set_output_enabled(&self, enabled: bool) -> CommandOutputState {
+        let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
+        let factories = real_backend_factories(vjoy_device_id);
+        self.set_output_enabled_with_factories(enabled, &factories)
+    }
+
+    /// [`AppStateCore::set_output_enabled`] with injectable factories
+    /// (the test seam: tests drive the deferred-activation path with
+    /// mock backends here, the shell and settings paths use the real
+    /// factories through [`AppStateCore::set_output_enabled`]).
+    ///
+    /// When output is enabled while the [`NullSink`] is installed and
+    /// a real backend is selected, this is the user-initiated moment
+    /// the deferred startup backend is activated: startup never
+    /// activates an elevated backend (hotfix v1.0.1 — no UAC prompt at
+    /// launch), so without this step the toggle would only
+    /// `try_connect` the [`NullSink`] and output would stay dead until
+    /// the user re-picked the backend on the Output page. The switch
+    /// runs here because enabling output is an explicit user action —
+    /// the UAC prompt for `HIDMaestro` at this point is expected, not
+    /// a startup surprise. A failed switch is recorded honestly in the
+    /// returned state's detail and the [`NullSink`] stays installed.
+    #[must_use]
+    pub fn set_output_enabled_with_factories(
+        &self,
+        enabled: bool,
+        factories: &BackendFactories,
+    ) -> CommandOutputState {
         *lock(&self.output_enabled) = enabled;
         if enabled {
+            if BackendKind::from_backend_name(&self.backend_name()) == Some(BackendKind::None)
+                && self.selected_backend() != BackendKind::None
+            {
+                let requested = self.selected_backend();
+                if let Err(error) = self.apply_backend_switch(requested, factories) {
+                    self.record_send(
+                        false,
+                        format!("output enabled: backend activation failed ({error})"),
+                    );
+                    return self.output_state();
+                }
+            }
             let mut backend = lock(&self.backend);
             match backend.try_connect() {
                 Ok(()) => {
@@ -2433,19 +2480,31 @@ impl AppStateCore {
 
     /// Activates the persisted output backend choice at launch
     /// (coordinator decision under delegation): reads
-    /// `AppSettings.output_backend` (default `HIDMaestro`), switches
-    /// the live slot through the selector, and falls back
-    /// (`HIDMaestro` → vJoy → [`NullSink`](crate::system::NullSink))
-    /// with the reason recorded. Activating `HIDMaestro` implies the
-    /// UAC prompt (the elevated helper runs for the whole session) —
-    /// expected, not an error. This never fails the launch: when both
-    /// backends fail, the outcome records `active: None` and the
-    /// reason, the [`NullSink`](crate::system::NullSink) stays
-    /// installed, and the backend detail names the failure — the app
-    /// keeps running with output disabled instead of crashing or
-    /// silently pretending a backend is live. The choice is NOT
-    /// re-persisted here (it is already the persisted choice); the
-    /// next launch retries it.
+    /// `AppSettings.output_backend` (default `HIDMaestro`) and switches
+    /// the live slot through the selector — EXCEPT an elevated backend,
+    /// which is NEVER activated at startup (hotfix v1.0.1, coordinator
+    /// Option A — defer): activating `HIDMaestro` would launch its
+    /// sidecar elevated via `runas` and pop a UAC consent prompt on
+    /// every launch. A persisted `HIDMaestro` choice is therefore
+    /// deferred: the outcome records `active: None` with a reason
+    /// naming the deferral, the [`NullSink`](crate::system::NullSink)
+    /// stays installed, and the backend detail shows the reason on the
+    /// Output page. The user activates it by enabling output
+    /// ([`AppStateCore::set_output_enabled`], which switches the
+    /// deferred backend in on the explicit toggle) or by picking it on
+    /// the Output page ([`AppStateCore::set_output_backend`]) — both
+    /// user-initiated, so the UAC prompt there is expected. A
+    /// non-elevated choice (vJoy, driver present) IS activated at
+    /// startup through the selector, with the usual fallback to the
+    /// [`NullSink`](crate::system::NullSink) and the reason recorded.
+    /// This never fails the launch: when activation fails, the outcome
+    /// records `active: None` and the reason, the
+    /// [`NullSink`](crate::system::NullSink) stays installed, and the
+    /// backend detail names the failure — the app keeps running with
+    /// output disabled instead of crashing or silently pretending a
+    /// backend is live. The choice is NOT re-persisted here (it is
+    /// already the persisted choice); the next launch defers / retries
+    /// it the same way.
     #[must_use]
     pub fn activate_startup_backend(&self) -> StartupBackendOutcome {
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
@@ -2463,6 +2522,28 @@ impl AppStateCore {
         factories: &BackendFactories,
     ) -> StartupBackendOutcome {
         let requested = self.selected_backend();
+        // UAC deferral (hotfix v1.0.1): only HIDMaestro needs
+        // elevation — its sidecar is launched elevated via `runas`
+        // (`rsh-output-hidmaestro` manager `spawn_elevated_runas`)
+        // and its status reports `elevation_required: true`; vJoy
+        // needs none. Never touch a factory for an elevated backend
+        // here: even building it must not start the elevated launch,
+        // and no UAC prompt may appear at startup.
+        if requested == BackendKind::HidMaestro {
+            let reason = "HIDMaestro deferred at startup — it needs elevation (UAC). Enable output to activate it."
+                .to_string();
+            *lock(&self.backend_detail) = format!(
+                "{reason} Selected backend stays HIDMaestro; no UAC prompt was shown at startup."
+            );
+            let result = StartupBackendOutcome {
+                requested,
+                active: None,
+                fell_back: false,
+                reason: Some(reason),
+            };
+            *lock(&self.startup_backend) = Some(result.clone());
+            return result;
+        }
         match self.apply_backend_switch(requested, factories) {
             Ok(outcome) => {
                 let result = StartupBackendOutcome {
@@ -2534,7 +2615,7 @@ impl AppStateCore {
                 detail: if live_kind == BackendKind::HidMaestro {
                     live_detail.clone()
                 } else if hidmaestro_installed {
-                    "HIDMaestro sidecar found. Default backend — runs its helper elevated for the whole session, so Windows asks (UAC) on every launch while it is active.".to_string()
+                    "HIDMaestro sidecar found. Default backend — activation is deferred at startup (no UAC prompt on launch); enable output to activate it, and Windows will ask (UAC) then.".to_string()
                 } else {
                     "HIDMaestro sidecar not found — reinstall RSH to use the default backend."
                         .to_string()
@@ -5293,6 +5374,19 @@ mod tests {
         (Arc::new(AppStateCore::with_null_sink(store)), dir)
     }
 
+    /// State whose persisted `output_backend` setting is `backend`
+    /// (e.g. `"VJoy"`), for startup-activation tests of a non-default
+    /// choice. The store is mutated before the state is built, so the
+    /// state reads the choice exactly as a real launch would.
+    fn test_state_with_backend_setting(backend: &str) -> (Arc<AppStateCore>, PathBuf) {
+        let dir = test_dir("backend-setting");
+        let mut store = ProfileStore::open(&dir).expect("open test store");
+        let mut settings = store.settings().clone();
+        settings.output_backend = backend.to_string();
+        store.set_settings(settings);
+        (Arc::new(AppStateCore::with_null_sink(store)), dir)
+    }
+
     #[allow(clippy::type_complexity)]
     fn test_state_with_recording() -> (
         Arc<AppStateCore>,
@@ -5359,12 +5453,15 @@ mod tests {
             disabled.detail
         );
         // Enabling attempts a connect, which fails honestly — nothing
-        // is delivered.
+        // is delivered. (Hotfix v1.0.1: the enable now activates the
+        // selected backend through the selector instead of only
+        // `try_connect`-ing the NullSink, so the failure names the
+        // backend activation, not a bare connect.)
         let enabled = state.set_output_enabled(true);
         assert_eq!(enabled.enabled, Some(true));
         assert!(!enabled.connected);
         assert!(
-            enabled.detail.contains("connect failed"),
+            enabled.detail.contains("backend activation failed"),
             "detail: {}",
             enabled.detail
         );
@@ -6283,7 +6380,12 @@ mod tests {
     }
 
     #[test]
-    fn startup_activation_honors_persisted_hidmaestro_with_mock_backend() {
+    fn startup_activation_defers_hidmaestro_at_startup() {
+        // Hotfix v1.0.1 (UAC deferral): a persisted HIDMaestro choice
+        // is NEVER activated at startup — even when the mock backend
+        // would connect fine, no factory is touched, no UAC prompt
+        // could appear. The outcome records the deferral, the NullSink
+        // stays installed, and the persisted choice is untouched.
         let (state, _dir) = test_state();
         assert_eq!(
             state.selected_backend(),
@@ -6293,7 +6395,35 @@ mod tests {
         let factories = mock_factories(false, false);
         let outcome = state.activate_startup_backend_with_factories(&factories);
         assert_eq!(outcome.requested, BackendKind::HidMaestro);
-        assert_eq!(outcome.active, Some(BackendKind::HidMaestro));
+        assert_eq!(outcome.active, None);
+        assert!(!outcome.fell_back);
+        let reason = outcome.reason.clone().expect("deferral reason recorded");
+        assert!(reason.contains("deferred"), "{reason}");
+        assert!(reason.contains("elevation"), "{reason}");
+        assert_eq!(state.startup_backend_outcome(), Some(outcome));
+        assert_eq!(state.backend_name(), "NullSink");
+        assert!(!state.output_state().connected);
+        assert!(
+            state.output_state().detail.contains("deferred"),
+            "{}",
+            state.output_state().detail
+        );
+        // The persisted choice is still HIDMaestro: the next launch
+        // defers it the same way, and enabling output retries it.
+        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
+        assert_eq!(state.settings().output_backend, "HIDMaestro");
+    }
+
+    #[test]
+    fn startup_activation_activates_vjoy_when_selected() {
+        // A non-elevated choice IS activated at startup: vJoy needs
+        // no UAC prompt, so the persisted vJoy choice goes live.
+        let (state, _dir) = test_state_with_backend_setting("VJoy");
+        assert_eq!(state.selected_backend(), BackendKind::VJoy);
+        let factories = mock_factories(false, false);
+        let outcome = state.activate_startup_backend_with_factories(&factories);
+        assert_eq!(outcome.requested, BackendKind::VJoy);
+        assert_eq!(outcome.active, Some(BackendKind::VJoy));
         assert!(!outcome.fell_back);
         assert_eq!(outcome.reason, None);
         assert_eq!(state.startup_backend_outcome(), Some(outcome));
@@ -6302,41 +6432,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_activation_falls_back_to_vjoy_with_reason_recorded() {
-        let (state, _dir) = test_state();
-        let factories = mock_factories(true, false);
+    fn startup_activation_vjoy_failing_records_reason_and_stays_on_null_sink() {
+        // vJoy has no fallback: when its connect fails, the outcome
+        // records `active: None` and the reason, and the NullSink
+        // stays installed.
+        let (state, _dir) = test_state_with_backend_setting("VJoy");
+        let factories = mock_factories(false, true);
         let outcome = state.activate_startup_backend_with_factories(&factories);
-        assert_eq!(outcome.requested, BackendKind::HidMaestro);
-        assert_eq!(outcome.active, Some(BackendKind::VJoy));
-        assert!(outcome.fell_back);
-        let reason = outcome.reason.clone().expect("fallback reason recorded");
-        assert!(reason.contains("mock connect failed"), "{reason}");
-        assert_eq!(
-            state
-                .startup_backend_outcome()
-                .expect("outcome recorded")
-                .reason,
-            Some(reason.clone())
-        );
-        let output = state.output_state();
-        assert!(output.connected, "vJoy mock connected after fallback");
-        assert!(
-            output.detail.contains("mock connect failed"),
-            "{}",
-            output.detail
-        );
-        // The persisted choice is still HIDMaestro: the next launch
-        // retries it instead of silently keeping the fallback.
-        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
-        assert_eq!(state.settings().output_backend, "HIDMaestro");
-    }
-
-    #[test]
-    fn startup_activation_both_backends_failing_records_reason_and_stays_on_null_sink() {
-        let (state, _dir) = test_state();
-        let factories = mock_factories(true, true);
-        let outcome = state.activate_startup_backend_with_factories(&factories);
-        assert_eq!(outcome.requested, BackendKind::HidMaestro);
+        assert_eq!(outcome.requested, BackendKind::VJoy);
         assert_eq!(outcome.active, None);
         let reason = outcome.reason.clone().expect("failure reason recorded");
         assert!(reason.contains("mock connect failed"), "{reason}");
@@ -6355,19 +6458,68 @@ mod tests {
             "{}",
             state.output_state().detail
         );
+        // The persisted choice is still vJoy for the next launch.
+        assert_eq!(state.selected_backend(), BackendKind::VJoy);
+        assert_eq!(state.settings().output_backend, "VJoy");
+    }
+
+    #[test]
+    fn enabling_output_after_deferred_startup_activates_hidmaestro() {
+        // The deferred backend is activated on the first user-initiated
+        // enable: startup defers, then `set_output_enabled(true)`
+        // switches the selected HIDMaestro backend in and connects it.
+        let (state, _dir) = test_state();
+        let factories = mock_factories(false, false);
+        let deferred = state.activate_startup_backend_with_factories(&factories);
+        assert_eq!(deferred.active, None, "startup defers HIDMaestro");
+        let enabled = state.set_output_enabled_with_factories(true, &factories);
+        assert!(enabled.connected, "backend connected after enable");
+        assert_eq!(state.backend_name(), "RecordingBackend");
+        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
+        assert_eq!(state.settings().output_backend, "HIDMaestro");
+    }
+
+    #[test]
+    fn enabling_output_with_failing_backends_reports_failure_honestly() {
+        // Enable after a deferred startup, with both mock backends
+        // failing to connect: no backend goes live, the NullSink stays
+        // installed, and the returned state says why.
+        let (state, _dir) = test_state();
+        let factories = mock_factories(true, true);
+        let deferred = state.activate_startup_backend_with_factories(&factories);
+        assert_eq!(deferred.active, None, "startup defers HIDMaestro");
+        let enabled = state.set_output_enabled_with_factories(true, &factories);
+        assert!(!enabled.connected);
+        assert_eq!(state.backend_name(), "NullSink");
+        assert!(
+            enabled.detail.contains("backend activation failed"),
+            "{}",
+            enabled.detail
+        );
+        assert!(
+            enabled.detail.contains("mock connect failed"),
+            "{}",
+            enabled.detail
+        );
     }
 
     #[test]
     #[cfg(not(windows))]
-    fn startup_activation_without_drivers_records_failure_honestly() {
+    fn startup_activation_without_drivers_defers_hidmaestro_honestly() {
         // Linux sandbox: no HIDMaestro sidecar, no vJoy DLL — the
-        // real factories both fail, and the outcome must say so
-        // instead of silently staying on the NullSink.
+        // persisted HIDMaestro choice is deferred at startup (not a
+        // connect failure: no factory is touched, nothing is probed),
+        // and the outcome must say so instead of silently staying on
+        // the NullSink.
         let (state, _dir) = test_state();
         let outcome = state.activate_startup_backend();
         assert_eq!(outcome.requested, BackendKind::HidMaestro);
         assert_eq!(outcome.active, None);
-        assert!(outcome.reason.is_some(), "reason recorded: {outcome:?}");
+        let reason = outcome
+            .reason
+            .clone()
+            .expect("reason recorded: {outcome:?}");
+        assert!(reason.contains("deferred"), "{reason}");
         assert_eq!(state.backend_name(), "NullSink");
         assert!(!state.output_state().connected);
     }

@@ -763,3 +763,100 @@ Real release run 43678000277 (tag v1.0.0, head ef72d973) failed TWICE at step 24
 
 ### 17.12 Real release run 43687032820: SIGNING PROVEN on the runner — stage step had the wrong bundle path
 Run 43687032820 (tag v1.0.0 moved to de7e3902, the §17.11 keypair-rotation commit) got PAST `cargo tauri build` for the first time: the bundler printed "Finished 2 updater signatures" (`RSH_1.0.0_x64-setup.exe.sig` + `RSH_1.0.0_x64_en-US.msi.sig`) — the password-protected keypair + both secrets + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` env work end-to-end on the real Windows runner. CI on the same head (run 43687008080) also completed success. The run then failed ONLY at step 25 "Stage release assets": `Expected exactly one NSIS setup exe in src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis`. Root cause: the stage step assumed the bundle dir is under `src-tauri/target/`, but src-tauri is a workspace member, so Cargo writes the bundle to the WORKSPACE-ROOT target dir — the log shows `D:\a\RSH\RSH\target\x86_64-pc-windows-msvc\release\bundle\nsis\RSH_1.0.0_x64-setup.exe` (both exe + msi + both .sig files existed there). This path was never exercised before: every earlier run died at signing (step 24), so the stage step never ran. Fix: `$bundleDir = "target/x86_64-pc-windows-msvc/release/bundle"` (one line + comment). No other step references `src-tauri/target`.
+
+## 18. Hotfix v1.0.1 — single-asset release: NSIS exe only (user order 2026-11-15 14:00)
+
+**Decision (user order, 2026-11-15 ~14:00 PKT — STANDING RULE for every
+release from now on):** a release contains EXACTLY ONE asset, the NSIS
+installer `RSH_<version>_x64-setup.exe`. Nothing else is built, staged,
+or uploaded: no MSI, no firmware bins (merged + signed), no `.sig`
+files, no `latest.json`, no `SHA256SUMS`, no SBOMs. The build itself is
+NSIS-only, so no build time is spent on anything that is not shipped.
+
+**What changed (hotfix worker F, 2026-11-15, no commit — coordinator owns
+the commit/tag):**
+- `src-tauri/tauri.conf.json`: `bundle.targets` = `["nsis"]` only (was
+  `["nsis", "msi"]`); `bundle.createUpdaterArtifacts` = `false` (was
+  `true`). Version `1.0.1`, window title, and the updater pubkey were
+  NOT touched (Worker D owns those).
+- `.github/workflows/release.yml`: rewritten, 29 steps → 21 steps.
+  Kept: checkout, tag resolution + version-consistency check (now
+  also asserts `targets == ["nsis"]` and `createUpdaterArtifacts ==
+  false`), Node 24 / Rust 1.100.0 / .NET 10 setup, cargo tools
+  (cargo-deny 0.20.2 + tauri-cli 2.12.4, pins kept), sidecar staging
+  (HIDMaestro v2.1.0 via `tools/ci/stage-sidecar.ps1` — the sidecar
+  still ships INSIDE the NSIS bundle via `bundle.externalBin`),
+  `cargo fmt --check`, `cargo clippy --workspace`, `cargo test
+  --workspace --release` (Windows gate), `cargo deny check`,
+  frontend gates (lint + tests + locales + audit + build),
+  `cargo tauri build`, vJoy DLL hash (record-only), `gh release
+  create` (single file), dry-run note. Trigger stays `v1.*` tag +
+  `workflow_dispatch`.
+- NEW step, immediately after `cargo tauri build` and before any
+  staging: **PE-subsystem check** — the app exe and the staged
+  sidecar must both be `IMAGE_SUBSYSTEM_WINDOWS_GUI` (2); a
+  console-subsystem (3) binary fails the run. This is the gate for
+  the v1.0.0 launch failure (console window on launch). Paths
+  verified against the workflow + staging script: sidecar
+  `src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe`
+  (stage-sidecar.ps1 line 60); app exe
+  `target/x86_64-pc-windows-msvc/release/rsh-app.exe` — the
+  WORKSPACE-ROOT target dir, NOT `src-tauri/target/` (src-tauri is a
+  workspace member; proven by run 43687032820, same as the bundle
+  dir in the stage step). Worker A's spec had the `src-tauri/target/`
+  path; corrected here before use.
+- `docs/RELEASE-CHECKLIST.md` §3 is now the single-asset list
+  (one NSIS exe); §6's asset-list bullet updated the same way.
+
+**Removed from `release.yml` (step names, for the record):**
+"Firmware source present (fail closed)", "Secrets present (fail
+closed)" (`RSH_SIGNING_KEY_PEM` + `RSH_UPDATER_PRIVATE_KEY`), "Set up
+Python 3.12", "Install PlatformIO + cargo tools" (replaced by
+"Install cargo tools" — PlatformIO dropped), "Write firmware signing
+key to temp file", "PlatformIO build (signed)", "Verify signed
+firmware (fail closed)" (incl. the merged-bin size pin, 956,032 B),
+"Regenerate SBOMs", "Verify sidecar SBOM against staged hashes
+(M4)", MSI staging + `.sig` handling + `latest.json` generation +
+`SHA256SUMS` (old "Stage release assets"), old "Verify staged assets
+(fail closed)", "Delete temp firmware signing key (always)", and the
+`TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+env on the build step (signing step is gone).
+
+**Consequences:**
+- **Auto-update is OFF for this release.** No `latest.json` is
+  published, so there is nothing for the updater to fetch. Verified
+  graceful handling (no code change needed): `check_for_update`
+  (`src-tauri/src/system.rs:231`) returns `Err(String)` when
+  `updater.check()` fails (e.g. 404 on the missing manifest); the
+  ONLY frontend call site is the Settings "Check for updates" button
+  (`frontend/src/screens/Settings/SystemSection.tsx:92-113`,
+  `handleCheckForUpdate`, try/catch → "Could not check for
+  updates." status). No startup check exists anywhere: the updater
+  plugin is registered (`src-tauri/src/main.rs:998`) but
+  tauri-plugin-updater never checks on its own — only the explicit
+  `check()` call, which nothing invokes at startup (grep: no other
+  call site). No crash, no unhandled rejection. Users install by
+  manual download, as now. NOTE (stale doc, not fixed here —
+  `system.rs` is another worker's file): the `check_for_update` doc
+  comment in `system.rs` still says "the check runs at startup in
+  the background" — that was never true in code; coordinator to
+  correct the comment.
+- **Firmware v4.0.1 is NOT shipped.** No reflash needed: protocol
+  v2.1, boards already on v4.0.1. Firmware is rebuilt/shipped only
+  when firmware itself changes (coordinator decision). The merged-bin
+  size pin (956,032 B) is gone with the firmware steps — it must be
+  restored with the firmware build if firmware shipping ever returns.
+- **No SBOMs published.** Committed SBOMs under `sbom/` are unchanged
+  and remain the source of truth; the release-time regeneration is
+  gone (incl. the §17.10 fail-closed SBOM fix — moot while no SBOM
+  is generated).
+- **Updater secrets NOT deleted.** `RSH_UPDATER_PRIVATE_KEY` +
+  `RSH_UPDATER_PRIVATE_KEY_PASSWORD` stay in the repo settings,
+  unused by this workflow, in case auto-update is ever re-enabled.
+  The pubkey stays in `tauri.conf.json` for the same reason. No
+  secret value was printed or touched.
+- **CI impact: none.** `ci.yml` `tauri-build` runs `cargo tauri
+  build --no-bundle` (no bundling in CI at all), so the
+  `bundle.targets` change cannot affect it; no CI job expects an
+  MSI, `.sig`, `latest.json`, or SBOM. `ci.yml` was NOT touched
+  (coordinator owns it).

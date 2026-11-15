@@ -1,8 +1,8 @@
-# RSH — Reflash Guide (C++ firmware v4.0.1, Rust app v1.0.0)
+# RSH — Reflash Guide (C++ firmware v4.0.1, Rust app v1.0.1)
 
 **Tareekh:** 2026-11-14 · **Scope:** FW-A3
 **Board:** ESP32 DevKit V1 (asal ESP32, 4 MB flash) · **Firmware:** C++ v4.0.1
-**Rust app v1.0.0 ko koi reflash nahi chahiye** — protocol v2.1 frozen hai,
+**Rust app v1.0.1 ko koi reflash nahi chahiye** — protocol v2.1 frozen hai,
 wahi board wahi firmware ke saath chalta rehta hai. Ye guide sirf **naye
 board** (pehli dafa flash) ya **brick recovery** ke liye hai. Detail aur
 authority: `docs/FIRMWARE-COMPAT.md` (compat matrix + verification evidence)
@@ -12,7 +12,7 @@ aur `reference/docs/BRICK-RECOVERY.md`.
 
 | Haalat | Reflash? |
 |---|---|
-| Rust app v1.0.0 install / update kar rahe ho | **NAHI** — app update se firmware nahi badalta; board v4.0.1 par hi chalta hai |
+| Rust app v1.0.1 install / update kar rahe ho | **NAHI** — app update se firmware nahi badalta; board v4.0.1 par hi chalta hai |
 | Naya (blank) ESP32 DevKit V1 board | **HAAN** — pehli dafa factory image flash karo (§3) |
 | Board brick lagta hai (koi Wi-Fi nahi, boot nahi hota) | **HAAN** — §5 recovery, wahi factory image |
 | Firmware v4.0.1 → v4.0.1 dobara flash | No-op — version wahi rehti hai; sirf tab karo jab image corrupt lage |
@@ -22,7 +22,7 @@ aur `reference/docs/BRICK-RECOVERY.md`.
 
 | Cheez | Kahan se |
 |---|---|
-| Merged factory bin `RSH-Firmware-DevKitV1-v4.0.1.bin` (**955,984 B**) | GitHub Release (Rust v1.0.0 / RSH v2.0.4 assets) ya local `pio run` (`.pio/build/esp32dev/`) |
+| Merged factory bin `RSH-Firmware-DevKitV1-v4.0.1.bin` (**955,984 B**) | GitHub Release (Rust v1.0.1 / RSH v2.0.4 assets) ya local `pio run` (`.pio/build/esp32dev/`) |
 | `SHA256SUMS` (release ke saath) | GitHub Release assets — flash se pehle verify karo (§2) |
 | `esptool.py` | PlatformIO ke saath (`~/workspace/projects/rsh/build/.venv-pio/bin/` mein `tool-esptoolpy`) ya `pip install esptool` |
 | USB **data** cable (charge-only nahi) | — |
@@ -83,7 +83,7 @@ Get-FileHash RSH-Firmware-DevKitV1-v4.0.1.bin -Algorithm SHA256
    likhe to dobara flash karo (cable/port badal kar).
 5. **Restart:** EN/RST dabao ya USB dobara lagao.
 6. **Confirm:** PC/phone ki Wi-Fi list mein **`RSH`** network nazar aaye —
-   matlab firmware chal raha hai. Phir Rust app v1.0.0 se connect karo:
+   matlab firmware chal raha hai. Phir Rust app v1.0.1 se connect karo:
    app HELLO karegi, board firmware **v4.0.1** + protocol **v2.1** report
    karega (app ke Device/Output page par nazar aata hai).
 
@@ -167,7 +167,7 @@ iteration GPIO0 / BOOT button parhta hai):
 ## 7. Flash ke baad checklist
 
 - [ ] `RSH` Wi-Fi nazar aata hai
-- [ ] Rust app v1.0.0 connect hoti hai (HELLO OK)
+- [ ] Rust app v1.0.1 connect hoti hai (HELLO OK)
 - [ ] App firmware **v4.0.1** + protocol **v2.1** dikhati hai
 - [ ] Output page par axes/buttons live update hote hain (200 Hz stream)
 - [ ] Pehli pairing (agar nayi board / `erase_flash` ke baad): pairing

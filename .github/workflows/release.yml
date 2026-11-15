@@ -1,11 +1,32 @@
-# RSH Rust — Release (Phase H, SW-R8.4 / SW-R8.5)
+# RSH Rust — Release (hotfix v1.0.1, SINGLE-ASSET)
 #
-# PREP ONLY — this workflow has never run. The parent (coordinator) executes the
-# release by pushing a tag `v1.*` AFTER the Phase H gate is green. Nothing in this
-# file runs on a normal push to main (CI covers that).
+# SINGLE-ASSET RELEASE (user order 2026-11-15 14:00, STANDING RULE for
+# every release from now on — see docs/DECISIONS.md §18): the release
+# contains EXACTLY ONE asset, the NSIS installer
+# `RSH_<version>_x64-setup.exe`. Nothing else is built, staged, or
+# uploaded: no MSI, no firmware bins (merged + signed), no `.sig`
+# files, no `latest.json`, no `SHA256SUMS`, no SBOMs. The build is
+# NSIS-only (`bundle.targets: ["nsis"]`, `createUpdaterArtifacts:
+# false` in `src-tauri/tauri.conf.json`), so there is no updater
+# signing step and NO secret is needed by this workflow at all
+# (the updater secrets stay in the repo settings — NOT deleted —
+# in case auto-update is ever re-enabled; they are simply unused).
 #
-# What it does, in order (every step fail-closed — a missing asset, a bad
-# signature, or a version mismatch fails the run, never a silent partial release):
+# Consequences, stated plainly:
+#   * Auto-update is OFF for this release: no `latest.json` is
+#     published, so `check_for_update` fails gracefully (backend
+#     returns Err, Settings shows "Could not check for updates." —
+#     verified, see DECISIONS §18). Users install by downloading
+#     the exe manually, as they do now.
+#   * Firmware v4.0.1 is NOT shipped in this release. No reflash is
+#     needed: the app talks protocol v2.1 to boards already on
+#     v4.0.1. Firmware is rebuilt/shipped only when firmware itself
+#     changes (coordinator decision, not this workflow).
+#   * No SBOMs are published with this release. The committed SBOMs
+#     under `sbom/` are unchanged and remain the source of truth.
+#
+# What it does, in order (every step fail-closed — a missing asset
+# or a version mismatch fails the run, never a silent partial release):
 #   1. Sidecar FIRST: fetch HIDMaestro v2.1.0, verify ZIP + DLL SHA-256,
 #      `dotnet publish` NativeAOT win-x64, stage as
 #      `src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe`
@@ -22,64 +43,51 @@
 #      a tag must never ship what CI would have rejected.
 #      (Debug `cargo test --workspace` is NOT re-run here — user order
 #      2026-11-15: dry runs must not repeat the full suite. CI already
-#      proved the debug suite green on this tree: run 43673557870,
-#      head 48b7aa0, 13/13 jobs incl. test (Windows) + test (Linux);
-#      run 43669130447, head 49f011a9, also 13/13. The --release run
+#      proved the debug suite green on this tree. The --release run
 #      below stays — CI never runs --release tests, so only this
 #      workflow proves them on Windows.)
-#   3. Firmware: PlatformIO build of `firmware/` (C++ v4.0.1) + Ed25519 signing
-#      with the `RSH_SIGNING_KEY_PEM` secret + fail-closed verify
-#      (`sign-image.py --verify` + image-region == `firmware.bin` + size check).
-#      The merged-bin size check FAILS on mismatch — the only exception is
-#      a firmware version bump, done by updating the expected size in the
-#      same change (deep-scan Round 2, L8).
-#   4. SBOMs regenerated fresh (`.github/scripts/generate-rust-sbom.py`
-#      from the full Cargo.lock resolve — `cargo cyclonedx` does NOT
-#      reproduce this file, see the step comment + DECISIONS §16;
-#      `npm sbom` for the frontend at CycloneDX 1.5; sidecar SBOM is
-#      hand-written, re-verified against the MEASURED sidecar hashes).
-#   5. `cargo tauri build` — NSIS + MSI installers, updater `.sig` artifacts
-#      (signed with the `RSH_UPDATER_PRIVATE_KEY` secret via TAURI_SIGNING_PRIVATE_KEY).
-#   6. `latest.json` (updater manifest) generated from the real `.sig` contents +
-#      the real GitHub release download URLs. `SHA256SUMS` over every asset.
-#   7. Verify pass over the staged assets, then `gh release create` (skipped on dry-run).
-#   8. The temp firmware signing-key file is deleted in an `if: always()` step.
+#   3. `cargo tauri build` — NSIS installer ONLY. No signing env, no
+#      `.sig` artifacts (`createUpdaterArtifacts: false`).
+#   4. PE-subsystem check (hotfix v1.0.1): the app exe AND the staged
+#      sidecar must be GUI-subsystem (2) — a console-subsystem (3)
+#      binary would pop a terminal window on launch. Fails the run.
+#   5. Stage the single NSIS exe, verify exactly one file is staged,
+#      then `gh release create` with that one file (skipped on dry-run).
 #
-# PREREQUISITES (human gates — NOT checked by this workflow, see docs/RELEASE-CHECKLIST-H4.md):
-#   * `firmware/` restored in the repo from `reference/firmware-v4.0.1/` (Phase D).
-#     If it is absent, this workflow FAILS with instructions (it never builds a
-#     firmware-less release).
+# PREREQUISITES (human gates — NOT checked by this workflow, see docs/RELEASE-CHECKLIST.md):
 #   * pid.codes PR claiming VID 0x1209 / PID 0x5253 merged (Phase G gate, D-G3).
 #   * vJoy DLL SHA-256 measured on a Windows machine and filled into
 #     `PINNED_DLL_SHA256_HEX` (Phase G gate, G-G3) — this workflow only records
 #     whether the runner happens to have vJoy installed (it will not).
-#   * Secrets present in the repo settings: `RSH_SIGNING_KEY_PEM` (whole Ed25519
-#     private-key PEM), `RSH_UPDATER_PRIVATE_KEY` (contents of the .key file as
-#     generated by `cargo tauri signer generate` — that file already holds
-#     base64(2-line key file); the bundler base64-decodes it, so do NOT
-#     base64-encode it again) + `RSH_UPDATER_PRIVATE_KEY_PASSWORD` (the key
-#     password; the bundler always takes the ENCRYPTED path, so an
-#     unencrypted key can never work — see docs/DECISIONS.md §17.11).
-#     Keypair lives in signing-keys/ OUTSIDE the repo.
-#   * App ships UNSIGNED (OV cert deferred, D-R11). Firmware signing is unaffected.
+#   * App ships UNSIGNED (OV cert deferred, D-R11).
 #
-# Release assets (exact list — see docs/RELEASE-CHECKLIST-H4.md §7):
-#   RSH_1.0.0_x64-setup.exe            (NSIS installer — primary)
-#   RSH_1.0.0_x64-setup.exe.sig        (updater signature for the NSIS installer)
-#   RSH_1.0.0_x64_en-US.msi           (MSI installer — secondary)
-#   RSH_1.0.0_x64_en-US.msi.sig        (updater signature for the MSI)
-#   latest.json                        (updater manifest — published with the release)
-#   RSH-Firmware-DevKitV1-v4.0.1.bin   (merged factory firmware image)
-#   firmware-signed.bin                (signed app-only image, firmware.bin + 68 B trailer)
-#   SHA256SUMS                         (SHA-256 of every asset above)
-#   sbom-rust.cdx.json, sbom-frontend.cdx.json, sbom-sidecar.cdx.json
+# Release assets (exact list — ONE asset, see docs/RELEASE-CHECKLIST.md §3):
+#   RSH_1.0.1_x64-setup.exe            (NSIS installer — the ONLY asset)
 #
-# Note on the CI `tauri-build` job: H4 found it ran `npm run tauri build`
-# in `frontend/`, but there is no `tauri` npm script and no
-# `@tauri-apps/cli` in `frontend/package.json`, so that job could not work
-# as written. H5 fixed it the same way this workflow does it: the CI job
-# now installs the CLI with `cargo install tauri-cli --version 2.12.4
-# --locked` and runs `cargo tauri build --no-bundle` from `src-tauri/`.
+# REMOVED in the v1.0.1 single-asset rewrite (2026-11-15, DECISIONS §18)
+# — these steps no longer exist in this file:
+#   * "Firmware source present (fail closed)"
+#   * "Secrets present (fail closed)" (RSH_SIGNING_KEY_PEM + RSH_UPDATER_PRIVATE_KEY)
+#   * "Set up Python 3.12" (only the firmware/SBOM steps used Python)
+#   * "Install PlatformIO + cargo tools" → replaced by "Install cargo tools"
+#     (PlatformIO install dropped; cargo-deny + tauri-cli pins kept)
+#   * "Write firmware signing key to temp file"
+#   * "PlatformIO build (signed — RSH_SIGNING_KEY set)"
+#   * "Verify signed firmware (fail closed)" (incl. the merged-bin size pin)
+#   * "Regenerate SBOMs" (Rust + frontend + sidecar SBOM generation)
+#   * "Verify sidecar SBOM against staged hashes (M4)"
+#   * MSI staging + `.sig` handling + `latest.json` generation + `SHA256SUMS`
+#     (all inside the old "Stage release assets" step — now NSIS-only)
+#   * Old "Verify staged assets (fail closed)" (latest.json / SHA256SUMS /
+#     firmware / MSI checks — replaced by the single-asset verify step)
+#   * "Delete temp firmware signing key (always)" (no temp key file anymore)
+#   * `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+#     env on the `cargo tauri build` step (signing step is gone)
+#
+# Note on the CI `tauri-build` job: it runs `cargo tauri build
+# --no-bundle`, so the `bundle.targets` change does not affect it
+# (no bundling happens in CI at all). It has no MSI / .sig /
+# latest.json / SBOM expectation.
 
 name: RSH Rust — Release
 
@@ -98,7 +106,7 @@ on:
           - "true"
           - "false"
       tag:
-        description: "Tag to release (workflow_dispatch only, e.g. v1.0.0)"
+        description: "Tag to release (workflow_dispatch only, e.g. v1.0.1)"
         required: false
         default: ""
         type: string
@@ -151,26 +159,12 @@ jobs:
           # "v<version>" and this check keeps it in sync with the tag.
           $expectedTitle = "RSH — Real Sim Hub v$version"
           if ($conf.app.windows[0].title -ne $expectedTitle) { Write-Error "tauri.conf.json window title '$($conf.app.windows[0].title)' != '$expectedTitle'."; exit 1 }
-          if ($conf.bundle.createUpdaterArtifacts -ne $true) { Write-Error "bundle.createUpdaterArtifacts must be true for a release build."; exit 1 }
-          Write-Host "Version $version consistent across Cargo.toml, tauri.conf.json, frontend/package.json and the window title."
-
-      - name: Firmware source present (fail closed)
-        shell: pwsh
-        run: |
-          foreach ($f in @("firmware/platformio.ini", "firmware/sign_firmware.py", "firmware/sign-image.py", "firmware/rsh/signing_pubkey.h")) {
-            if (-not (Test-Path $f)) {
-              Write-Error "Missing $f — firmware/ is not restored in the repo. Restore it from reference/firmware-v4.0.1/ (Phase D) before tagging. A firmware-less release is never built."
-              exit 1
-            }
-          }
-          Write-Host "Firmware source present."
-
-      - name: Secrets present (fail closed)
-        shell: pwsh
-        run: |
-          if ("${{ secrets.RSH_SIGNING_KEY_PEM }}" -eq "") { Write-Error "Secret RSH_SIGNING_KEY_PEM is not set (firmware Ed25519 private key PEM)."; exit 1 }
-          if ("${{ secrets.RSH_UPDATER_PRIVATE_KEY }}" -eq "") { Write-Error "Secret RSH_UPDATER_PRIVATE_KEY is not set (Tauri updater minisign private key)."; exit 1 }
-          Write-Host "Both signing secrets are present (values never printed)."
+          # Single-asset release (DECISIONS §18): NSIS only, no updater
+          # artifacts. If either flag drifts back, the build would
+          # produce an MSI and/or .sig files this workflow never uploads.
+          if ($conf.bundle.targets.Count -ne 1 -or $conf.bundle.targets[0] -ne "nsis") { Write-Error "bundle.targets must be exactly [""nsis""] for a single-asset release."; exit 1 }
+          if ($conf.bundle.createUpdaterArtifacts -ne $false) { Write-Error "bundle.createUpdaterArtifacts must be false for a single-asset release (no .sig / latest.json)."; exit 1 }
+          Write-Host "Version $version consistent across Cargo.toml, tauri.conf.json, frontend/package.json and the window title. Single-asset config confirmed (targets: nsis only, no updater artifacts)."
 
       - name: Set up Node.js 24
         uses: actions/setup-node@v4
@@ -193,25 +187,19 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Set up .NET 10 SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
 
-      - name: Install PlatformIO + cargo tools
+      - name: Install cargo tools
         shell: pwsh
         run: |
-          pip install -U platformio
           # Pinned (M2): 0.20.2 / 2.12.4 are the latest stable versions on
           # crates.io, 2026-11-14 (tauri-cli 3.0.0-alpha.6 exists — do NOT
-          # pin a 3.0 alpha for a 2.x app). cargo-cyclonedx is NOT
-          # installed: it cannot reproduce sbom/rust.cdx.json (see the
-          # SBOM step + DECISIONS §16) — the metadata script does that.
+          # pin a 3.0 alpha for a 2.x app). PlatformIO is NOT installed
+          # anymore: the single-asset release builds no firmware
+          # (DECISIONS §18).
           cargo install cargo-deny --version 0.20.2 --locked
           cargo install tauri-cli --version 2.12.4 --locked
           cargo tauri --version
@@ -223,7 +211,7 @@ jobs:
       # `binaries\\rsh-hm-sidecar-x86_64-pc-windows-msvc.exe` doesn't exist"
       # (release dry runs #1/#2 + first CI run, 2026-11-14). Shared script
       # (M6) — the same script CI test-windows / tauri-build / clippy-windows
-      # call. Its measured hashes are step outputs for the M4 SBOM check.
+      # call.
       - name: Fetch + verify HIDMaestro v2.1.0, publish sidecar (AOT)
         id: sidecar
         shell: pwsh
@@ -240,10 +228,8 @@ jobs:
 
       # Debug `cargo test --workspace` REMOVED (user order 2026-11-15):
       # dry runs must not repeat the full suite — CI already proved the
-      # debug suite green on this tree (run 43673557870, head 48b7aa0,
-      # 13/13 incl. test Windows + test Linux; run 43669130447, head
-      # 49f011a9, also 13/13). The --release run below stays: CI never
-      # runs --release tests, so only this workflow proves them.
+      # debug suite green on this tree. The --release run below stays:
+      # CI never runs --release tests, so only this workflow proves them.
       - name: cargo test --workspace --release
         # TESTING-INPUT §9.1: the --release test run is required at least
         # once before the release gate — this is that run, before the
@@ -264,212 +250,74 @@ jobs:
           npm audit --audit-level=high
           npm run build
 
-      # ---- Firmware: build + sign + fail-closed verify ----
-      - name: Write firmware signing key to temp file (deleted in `always()` step)
-        shell: pwsh
-        run: |
-          $keyPath = Join-Path $env:RUNNER_TEMP "rsh-signing-key.pem"
-          "${{ secrets.RSH_SIGNING_KEY_PEM }}" | Out-File -FilePath $keyPath -Encoding ascii -NoNewline
-          "RSH_SIGNING_KEY_PATH=$keyPath" >> $env:GITHUB_ENV
-          Write-Host "Signing key written to temp file (path only, never printed)."
-
-      - name: PlatformIO build (signed — RSH_SIGNING_KEY set)
-        working-directory: firmware
-        shell: pwsh
-        env:
-          RSH_SIGNING_KEY: ${{ env.RSH_SIGNING_KEY_PATH }}
-        run: pio run
-
-      - name: Verify signed firmware (fail closed)
-        working-directory: firmware
-        shell: pwsh
-        run: |
-          $buildDir = ".pio/build/esp32dev"
-          $merged = Get-ChildItem "$buildDir/RSH-Firmware-DevKitV1-v*.bin" -ErrorAction SilentlyContinue
-          if ($merged.Count -ne 1) { Write-Error "Expected exactly one merged bin in $buildDir."; exit 1 }
-          # L8 (deep-scan Round 2): the merged-bin size check FAILS on
-          # mismatch — a warning let a wrong-size image sail into a
-          # release. Documented exception: a FIRMWARE version bump
-          # changes the size legitimately. In that case update
-          # $expectedMergedBinSize HERE and the v4.0.1 size note in
-          # docs/RELEASE-CHECKLIST-H4.md in the SAME change (the bump
-          # commit), never by weakening this check alone.
-          # Same-version code changes count too: deep-scan Round 2
-          # (SEC-R2-03 AP auto-lock, SEC-R2-04 session rate-limit,
-          # M-5 FACTORY_RESET) grew the app by 928 B, so the gate
-          # updated this to 955984 with a clean-rebuild re-measure
-          # (SHA-256 1a132de9…6f8368, deterministic across rebuilds).
-          # HOST VARIANCE (dry run #9, 2026-11-15): the Windows runner
-          # builds the SAME source 48 B larger — merged 956032 B
-          # (0xe9680, app firmware.bin 890496 B, image SHA-256
-          # d6d15d3d…) vs Linux 955984 B (SHA 1a132de9…6f8368,
-          # reproduced by a local clean rebuild AND the CI firmware
-          # job on the same head). No firmware/ change since af4cb53
-          # (git log empty); both hosts used PIO 6.2.0 + pinned
-          # espressif32@6.9.0 / toolchain-xtensa 8.4.0+2021r2-patch5 /
-          # framework 3.20017.241212 / esptool 4.5.1 — so the delta is
-          # host-toolchain codegen, not a code change or a wrong
-          # image. This workflow runs ONLY on windows-latest, so the
-          # Windows-runner value is the correct pin; the check stays
-          # exact and fail-closed. Dry run #10 must reproduce exactly
-          # 956032 on a fresh runner (2nd independent measurement) —
-          # if it differs, STOP and investigate non-determinism
-          # instead of moving the pin again.
-          $expectedMergedBinSize = 956032
-          if ($merged[0].Length -ne $expectedMergedBinSize) { Write-Error "Merged bin size is $($merged[0].Length) B, expected $expectedMergedBinSize B (firmware v4.0.1). If this is a firmware version bump, update `$expectedMergedBinSize in this workflow and docs/RELEASE-CHECKLIST-H4.md in the same change; otherwise the image is wrong — failing closed."; exit 1 }
-          $app = "$buildDir/firmware.bin"
-          $signed = "$buildDir/firmware-signed.bin"
-          if (-not (Test-Path $signed)) { Write-Error "firmware-signed.bin missing — signing did not run (RSH_SIGNING_KEY unset or sign step failed). An unsigned release is never published."; exit 1 }
-          $appSize = (Get-Item $app).Length
-          $signedSize = (Get-Item $signed).Length
-          if ($signedSize -ne ($appSize + 68)) { Write-Error "firmware-signed.bin is $signedSize B, expected $appSize + 68."; exit 1 }
-          # Image region of the signed file must be byte-identical to the fresh firmware.bin
-          # (guards against a stale signed bin surviving from an earlier build).
-          python -c "import sys; a=open(r'$app','rb').read(); b=open(r'$signed','rb').read(); sys.exit(0 if b[:-68]==a else 1)"
-          if ($LASTEXITCODE -ne 0) { Write-Error "Signed image region != fresh firmware.bin (stale signed bin)."; exit 1 }
-          # Signature verify (Ed25519 over SHA-256 of the image, 68 B trailer). Non-zero exit fails.
-          python sign-image.py --verify $env:RSH_SIGNING_KEY_PATH $signed
-          Write-Host "Firmware signed + verified: $($merged[0].Name) + firmware-signed.bin."
-
-      # ---- SBOMs regenerated fresh ----
-      # M1 (deep-scan Round 2): `cargo cyclonedx --format json` does NOT
-      # produce what the old step assumed. Proven locally 2026-11-14 with
-      # cargo-cyclonedx 0.5.10: it writes one `<crate>.cdx.json` PER member
-      # next to that member's Cargo.toml (14 files), never a root bom.json
-      # (the old `Copy-Item bom.json` failed fail-closed on a missing file);
-      # its default spec is 1.3, not 1.6; and even merged, its union is
-      # only the shipped graph (420 host-target / 589 with `--target all`)
-      # — dev-deps are excluded, so it can never reproduce the committed
-      # full-lockfile SBOM (626 packages). The Rust SBOM is therefore
-      # generated by .github/scripts/generate-rust-sbom.py (`cargo
-      # metadata`, full resolve, CycloneDX 1.6), which reproduces the
-      # committed file exactly (verified: 0 changed components + rsh-rig).
-      # Frontend: `npm sbom --sbom-version 1.6` is a silent no-op on npm
-      # 10.9.4 — it still emits CycloneDX 1.5 (proven locally). 1.6 needs
-      # npm 11, which is not pinned; so the release requests 1.5
-      # explicitly and the 1.5/1.6 split is documented (DECISIONS §16).
-      - name: Regenerate SBOMs
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path "release-staging" | Out-Null
-          # Fail-closed (dry run #10): pwsh does NOT fail a step when a
-          # native command exits non-zero — the SBOM script crashed on a
-          # cp1252 decode and the step still printed "SBOMs regenerated"
-          # with no sbom-rust.cdx.json written. Check $LASTEXITCODE after
-          # every native call, and verify all three files exist + parse.
-          python .github/scripts/generate-rust-sbom.py release-staging/sbom-rust.cdx.json
-          if ($LASTEXITCODE -ne 0) { Write-Error "generate-rust-sbom.py failed (exit $LASTEXITCODE) — no Rust SBOM, failing closed."; exit 1 }
-          Push-Location frontend
-          npm sbom --sbom-format cyclonedx --sbom-version 1.5 > ../release-staging/sbom-frontend.cdx.json
-          if ($LASTEXITCODE -ne 0) { Write-Error "npm sbom failed (exit $LASTEXITCODE)."; Pop-Location; exit 1 }
-          Pop-Location
-          Copy-Item sbom/sidecar.cdx.json release-staging/sbom-sidecar.cdx.json
-          foreach ($f in @("sbom-rust.cdx.json", "sbom-frontend.cdx.json", "sbom-sidecar.cdx.json")) {
-            if (-not (Test-Path "release-staging/$f")) { Write-Error "Missing SBOM after regenerate: $f."; exit 1 }
-            $bom = Get-Content "release-staging/$f" -Raw | ConvertFrom-Json
-            if (-not $bom.components -or $bom.components.Count -eq 0) { Write-Error "SBOM $f has no components — not a fresh valid SBOM."; exit 1 }
-          }
-          Write-Host "SBOMs regenerated (sidecar SBOM is hand-written; pins verified in the next step)."
-
-      # M4 (deep-scan Round 2): the hand-written sidecar SBOM is only as
-      # good as its recorded hashes. Verify them against the MEASURED
-      # hashes from the staging step above (step outputs, not re-typed
-      # constants) and the pinned version — a drifted SBOM fails the run.
-      - name: Verify sidecar SBOM against staged hashes (M4)
-        shell: pwsh
-        run: |
-          $sbom = Get-Content release-staging/sbom-sidecar.cdx.json -Raw | ConvertFrom-Json
-          $dllEntry = $sbom.components | Where-Object { $_.name -eq "HIDMaestro.Core.dll" }
-          $driverEntry = $sbom.components | Where-Object { $_.name -eq "HIDMaestro UMDF2 driver" }
-          if (-not $dllEntry) { Write-Error "Sidecar SBOM has no HIDMaestro.Core.dll component."; exit 1 }
-          if (-not $driverEntry) { Write-Error "Sidecar SBOM has no HIDMaestro UMDF2 driver component."; exit 1 }
-          $dllHash = ($dllEntry.hashes | Where-Object { $_.alg -eq "SHA-256" }).content
-          $zipHash = ($driverEntry.hashes | Where-Object { $_.alg -eq "SHA-256" }).content
-          if ($dllEntry.version -ne "2.1.0") { Write-Error "Sidecar SBOM DLL version is $($dllEntry.version), expected 2.1.0."; exit 1 }
-          if ($driverEntry.version -ne "2.1.0") { Write-Error "Sidecar SBOM driver version is $($driverEntry.version), expected 2.1.0."; exit 1 }
-          if ($dllHash -ne "${{ steps.sidecar.outputs.dll_sha256 }}") { Write-Error "Sidecar SBOM DLL SHA-256 $dllHash != measured ${{ steps.sidecar.outputs.dll_sha256 }}."; exit 1 }
-          if ($zipHash -ne "${{ steps.sidecar.outputs.zip_sha256 }}") { Write-Error "Sidecar SBOM ZIP SHA-256 $zipHash != measured ${{ steps.sidecar.outputs.zip_sha256 }}."; exit 1 }
-          Write-Host "Sidecar SBOM verified: v2.1.0, DLL + ZIP hashes match the staged artifacts."
-
-      # ---- Tauri build (NSIS + MSI + updater .sig) ----
+      # ---- Tauri build (NSIS ONLY — single-asset release, DECISIONS §18) ----
+      # No TAURI_SIGNING_PRIVATE_KEY env: with createUpdaterArtifacts
+      # false the bundler writes no .sig files and signs nothing.
       - name: cargo tauri build
         shell: pwsh
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.RSH_UPDATER_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.RSH_UPDATER_PRIVATE_KEY_PASSWORD }}
         run: cargo tauri build --target x86_64-pc-windows-msvc
         working-directory: src-tauri
 
-      # ---- Stage assets, latest.json, SHA256SUMS, verify ----
-      - name: Stage release assets
+      # ---- Hotfix v1.0.1: no console window — PE subsystem must be GUI ----
+      # The v1.0.0 launch failure (user PC, 2026-11-15 ~13:50 PKT): the
+      # app opened behind a visible console window and then vanished.
+      # Causes were a console-subsystem app binary (missing
+      # `windows_subsystem = "windows"`) and a console-subsystem
+      # sidecar spawned without CREATE_NO_WINDOW. This step proves,
+      # before anything is published, that BOTH binaries are
+      # IMAGE_SUBSYSTEM_WINDOWS_GUI (2) — a CUI binary (3) fails the run.
+      #
+      # Paths: the sidecar path is where stage-sidecar.ps1 stages it
+      # (`src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe`).
+      # The app exe path is the WORKSPACE-ROOT target dir, NOT
+      # `src-tauri/target/` — src-tauri is a workspace member, so Cargo
+      # puts target/ at the repo root (proven by run 43687032820, same
+      # as the bundle dir in the stage step below).
+      - name: No console window — PE subsystem must be GUI (hotfix v1.0.1)
+        shell: pwsh
+        run: |
+          function Get-PESubsystem([string]$Path) {
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            return [BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68)
+          }
+          $bins = @(
+            "src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe",
+            "target/x86_64-pc-windows-msvc/release/rsh-app.exe"
+          )
+          foreach ($b in $bins) {
+            if (-not (Test-Path $b)) { throw "missing binary: $b" }
+            $sub = Get-PESubsystem $b
+            # 2 = IMAGE_SUBSYSTEM_WINDOWS_GUI, 3 = IMAGE_SUBSYSTEM_WINDOWS_CUI
+            if ($sub -ne 2) { throw "$b has PE subsystem $sub, expected 2 (GUI) — a console window would open" }
+            Write-Host "$b : subsystem 2 (GUI) OK"
+          }
+
+      # ---- Stage the single asset + verify (fail closed) ----
+      - name: Stage release asset (NSIS only)
         shell: pwsh
         run: |
           $tag = "${{ steps.tag.outputs.tag }}"
-          $version = "${{ steps.tag.outputs.version }}"
           # Bundler output lives in the WORKSPACE-ROOT target dir, not
           # src-tauri/target: src-tauri is a workspace member, so Cargo
           # puts target/ at the repo root (proven by run 43687032820:
-          # D:\a\RSH\RSH\target\...\bundle\nsis\RSH_1.0.0_x64-setup.exe).
+          # D:\a\RSH\RSH\target\...\bundle\nsis\RSH_1.0.1_x64-setup.exe).
           $bundleDir = "target/x86_64-pc-windows-msvc/release/bundle"
           $nsis = Get-ChildItem "$bundleDir/nsis/*-setup.exe" -ErrorAction SilentlyContinue
-          $msi = Get-ChildItem "$bundleDir/msi/*.msi" -ErrorAction SilentlyContinue
           if ($nsis.Count -ne 1) { Write-Error "Expected exactly one NSIS setup exe in $bundleDir/nsis."; exit 1 }
-          if ($msi.Count -ne 1) { Write-Error "Expected exactly one MSI in $bundleDir/msi."; exit 1 }
-          $nsisSig = "$($nsis.FullName).sig"; $msiSig = "$($msi.FullName).sig"
-          if (-not (Test-Path $nsisSig)) { Write-Error "Missing updater signature: $nsisSig (createUpdaterArtifacts must be true and TAURI_SIGNING_PRIVATE_KEY set)."; exit 1 }
-          if (-not (Test-Path $msiSig)) { Write-Error "Missing updater signature: $msiSig."; exit 1 }
           $staging = "release-staging"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
           Copy-Item $nsis.FullName "$staging/$($nsis.Name)"
-          Copy-Item $nsisSig "$staging/$($nsis.Name).sig"
-          Copy-Item $msi.FullName "$staging/$($msi.Name)"
-          Copy-Item $msiSig "$staging/$($msi.Name).sig"
-          # Firmware version is 4.0.1 (NOT the app version) — glob the merged bin.
-          $merged = Get-ChildItem "firmware/.pio/build/esp32dev/RSH-Firmware-DevKitV1-v*.bin" | Select-Object -First 1
-          Copy-Item $merged.FullName "$staging/$($merged.Name)"
-          Copy-Item "firmware/.pio/build/esp32dev/firmware-signed.bin" "$staging/firmware-signed.bin"
-          # latest.json — generated from the real .sig contents + real release URLs.
-          # (The bundler also writes a latest.json; this one is authoritative because
-          # the download URL must be the GitHub release URL, which only exists now.)
-          $nsisSigText = (Get-Content $nsisSig -Raw).Trim()
-          $baseUrl = "https://github.com/dreamsofts34-creator/RSH/releases/download/$tag"
-          $latest = @{
-            version = $version
-            notes = "RSH v$version — see the GitHub Release notes."
-            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-            platforms = @{ "windows-x86_64" = @{ signature = $nsisSigText; url = "$baseUrl/$($nsis.Name)" } }
-          }
-          $latest | ConvertTo-Json -Depth 5 | Out-File "$staging/latest.json" -Encoding utf8
-          # SHA256SUMS over every staged asset (deterministic order, two-column format).
-          $lines = Get-ChildItem $staging -File | Where-Object { $_.Name -ne "SHA256SUMS" } | Sort-Object Name | ForEach-Object {
-            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-            "$h  $($_.Name)"
-          }
-          $lines | Out-File "$staging/SHA256SUMS" -Encoding ascii
-          Write-Host "Staged assets:"; Get-ChildItem $staging -File | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) B)" }
+          Write-Host "Staged the single release asset:"; Get-ChildItem $staging -File | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) B)" }
 
-      - name: Verify staged assets (fail closed)
+      - name: Verify staged asset (fail closed — exactly one file)
         shell: pwsh
         run: |
           $staging = "release-staging"
-          $expected = @("latest.json", "SHA256SUMS", "firmware-signed.bin", "sbom-rust.cdx.json", "sbom-frontend.cdx.json", "sbom-sidecar.cdx.json")
-          foreach ($f in $expected) { if (-not (Test-Path "$staging/$f")) { Write-Error "Missing staged asset: $f"; exit 1 } }
-          if ((Get-ChildItem "$staging/*-setup.exe").Count -ne 1) { Write-Error "Missing NSIS setup exe in staging."; exit 1 }
-          if ((Get-ChildItem "$staging/*.msi").Count -ne 1) { Write-Error "Missing MSI in staging."; exit 1 }
-          if ((Get-ChildItem "$staging/RSH-Firmware-DevKitV1-v*.bin").Count -ne 1) { Write-Error "Missing merged firmware bin in staging."; exit 1 }
-          $latest = Get-Content "$staging/latest.json" -Raw | ConvertFrom-Json
-          if (-not $latest.platforms."windows-x86_64".signature) { Write-Error "latest.json has no Windows signature."; exit 1 }
-          if (-not $latest.platforms."windows-x86_64".url) { Write-Error "latest.json has no Windows URL."; exit 1 }
-          # SHA256SUMS re-verification (recompute every entry).
-          Push-Location $staging
-          foreach ($line in (Get-Content SHA256SUMS)) {
-            $h, $name = $line -split '\s+', 2
-            $actual = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
-            if ($actual -ne $h) { Write-Error "SHA256SUMS mismatch for $name."; exit 1 }
-          }
-          Pop-Location
-          # Re-verify the staged signed firmware with the temp public key derived from the secret.
-          python firmware/sign-image.py --verify $env:RSH_SIGNING_KEY_PATH "$staging/firmware-signed.bin"
-          Write-Host "All staged assets verified."
+          $files = Get-ChildItem $staging -File
+          if ($files.Count -ne 1) { Write-Error "Expected exactly ONE staged asset (the NSIS exe), found $($files.Count). Single-asset release — refusing to publish anything else."; exit 1 }
+          if ($files[0].Name -notmatch '-setup\.exe$') { Write-Error "Staged file '$($files[0].Name)' is not the NSIS setup exe."; exit 1 }
+          Write-Host "Single asset verified: $($files[0].Name) ($($files[0].Length) B)."
 
       - name: vJoy DLL hash (record only — never invented)
         shell: pwsh
@@ -489,23 +337,14 @@ jobs:
           # instead of `release-staging/*` — a glob also matches
           # directories and can silently pick up (or miss) files if the
           # staging layout changes; the verify step above already proved
-          # exactly which files are staged.
+          # exactly one file is staged.
           $files = Get-ChildItem release-staging -File | ForEach-Object { $_.FullName }
-          if ($files.Count -eq 0) { Write-Error "No files staged in release-staging/ — refusing to create an empty release."; exit 1 }
-          Write-Host "Releasing $($files.Count) files:"
+          if ($files.Count -ne 1) { Write-Error "Expected exactly one staged file (the NSIS exe) — refusing to create a multi-asset or empty release."; exit 1 }
+          Write-Host "Releasing 1 file:"
           $files | ForEach-Object { Write-Host "  $_" }
-          gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes "RSH v${{ steps.tag.outputs.version }} — Tauri 2 app (NSIS + MSI) + C++ firmware v4.0.1 (signed). See docs/RELEASE-CHECKLIST-H4.md. App ships unsigned (OV cert deferred, D-R11); firmware is Ed25519-signed and verified." $files
+          gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes "RSH v${{ steps.tag.outputs.version }} — NSIS installer only (single-asset release). Hotfix: no console window on launch (app + sidecar are GUI-subsystem). Auto-update is off for this release: no latest.json is published — download and install manually. Firmware v4.0.1 is not included — no reflash needed (protocol v2.1, boards already on v4.0.1). App ships unsigned (OV cert deferred, D-R11)." $files
 
       - name: Dry run — release NOT created
         if: ${{ github.ref_type != 'tag' && inputs.dry_run != 'false' }}
         shell: pwsh
-        run: Write-Host "Dry run complete — assets verified in release-staging/, no GitHub Release created."
-
-      - name: Delete temp firmware signing key (always)
-        if: always()
-        shell: pwsh
-        run: |
-          if ($env:RSH_SIGNING_KEY_PATH -and (Test-Path $env:RSH_SIGNING_KEY_PATH)) {
-            Remove-Item $env:RSH_SIGNING_KEY_PATH -Force
-            Write-Host "Temp signing key deleted."
-          }
+        run: Write-Host "Dry run complete — single asset verified in release-staging/, no GitHub Release created."

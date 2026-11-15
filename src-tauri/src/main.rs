@@ -1,6 +1,8 @@
-//! RSH v1.0.0 — Tauri shell entry point (Phase G0).
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//! RSH v1.0.1 — Tauri shell entry point (Phase G0).
 //!
-//! The window shows the literal text `RSH v1.0.0` (see
+//! The window shows the literal text `RSH v1.0.1` (see
 //! `frontend/dist/index.html`). The text is literal on purpose: the C#
 //! blank-window lesson (v2.0.0–v2.0.4) was that silently-failing dynamic
 //! bindings can leave a window alive but blank, so nothing in this shell
@@ -88,6 +90,7 @@ use rsh_app_core::commands::{
     BackendStatus, BackupInfo, FirewallState, FirmwareValidation, LedPattern, OutputState,
     PinAssignment, PinMapValidation, TuningSettings,
 };
+use rsh_app_core::diagnostics::{append_startup_log, install_panic_hook};
 use rsh_app_core::snapshot::{EngineSnapshot, EngineStats};
 use rsh_app_core::state::{AppSettings, AppSettingsPatch, ProfileSummary, is_allowed_board_ip};
 use rsh_app_core::state::{
@@ -98,8 +101,25 @@ use rsh_app_core::system::{
 };
 use tauri::Manager;
 
-/// Application version (new Rust series: v1.0.0).
-const APP_VERSION: &str = "1.0.0";
+/// Application version (new Rust series: v1.0.1).
+const APP_VERSION: &str = "1.0.1";
+
+/// The startup-log directory: `<data-dir>/logs` (`%AppData%\RSH\logs`
+/// on Windows). `None` when the data directory does not resolve.
+fn startup_log_dir() -> Option<std::path::PathBuf> {
+    rsh_app_core::data_dir().map(|dir| dir.join("logs"))
+}
+
+/// Append one line to the daily startup log (`rsh-YYYYMMDD.log`).
+/// Never fails startup: a missing/unwritable directory is silently
+/// ignored inside `append_startup_log`, and every line is flushed
+/// to disk before the call returns, so the log survives a crash
+/// right after the write.
+fn log_startup(message: &str) {
+    if let Some(dir) = startup_log_dir() {
+        append_startup_log(&dir, message);
+    }
+}
 
 /// Liveness probe for the frontend. Returns the literal string `pong`.
 #[tauri::command]
@@ -107,7 +127,7 @@ fn ping() -> &'static str {
     "pong"
 }
 
-/// Returns the application version, `1.0.0`.
+/// Returns the application version, `1.0.1`.
 #[tauri::command]
 fn get_version() -> &'static str {
     APP_VERSION
@@ -899,13 +919,27 @@ fn build_app_state() -> AppState {
                         line.push(')');
                     }
                     eprintln!("{line}");
+                    log_startup(&line);
                 }
                 None => {
-                    eprintln!(
-                        "[RSH] startup output backend: {} activation failed: {}; output disabled (NullSink)",
-                        outcome.requested.display_name(),
-                        outcome.reason.as_deref().unwrap_or("unknown reason")
-                    );
+                    let reason = outcome.reason.as_deref().unwrap_or("unknown reason");
+                    // A deliberate deferral (HIDMaestro needs elevation)
+                    // is not a failure — say so in the log.
+                    let line = if reason.contains("deferred") {
+                        format!(
+                            "[RSH] startup output backend: {} deferred at startup: {}; output disabled (NullSink)",
+                            outcome.requested.display_name(),
+                            reason
+                        )
+                    } else {
+                        format!(
+                            "[RSH] startup output backend: {} activation failed: {}; output disabled (NullSink)",
+                            outcome.requested.display_name(),
+                            reason
+                        )
+                    };
+                    eprintln!("{line}");
+                    log_startup(&line);
                 }
             }
             let state = AppState::new(core);
@@ -967,6 +1001,13 @@ fn on_second_instance(app: &tauri::AppHandle, args: Vec<String>, _cwd: String) {
 }
 
 fn main() {
+    // v1.0.1: install the panic hook FIRST, before anything else can
+    // panic, and log process start — the file log is the evidence
+    // for the next run when the window never paints.
+    if let Some(log_dir) = startup_log_dir() {
+        install_panic_hook(log_dir.clone());
+        append_startup_log(&log_dir, &format!("RSH v{APP_VERSION} starting"));
+    }
     // Repair a stale autostart entry before Settings reads the state.
     // A failure is not silent any more: it joins the startup notice
     // the shell shows once (H3).
@@ -1021,6 +1062,8 @@ fn main() {
             if state.core().settings().auto_switch_profiles {
                 state.core().start_auto_switch();
             }
+            // v1.0.1: this line proves startup reached the end of setup.
+            log_startup("setup complete");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
