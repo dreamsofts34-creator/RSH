@@ -193,6 +193,24 @@ jobs:
         if: steps.check.outputs.run == 'true'
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
+      # v1.0.2 Bug 6 follow-up: the stale committed frontend/dist is
+      # gone, so dist must be built before any cargo build of rsh-app —
+      # tauri::generate_context!() panics at compile time when
+      # frontendDist does not exist (CI run 43708228362: clippy-windows
+      # + test-windows failed on exactly this). The frontend job gates
+      # lint/tests separately; here only the build output is needed.
+      - name: Set up Node.js 24
+        if: steps.check.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build frontend (dist required to compile rsh-app)
+        if: steps.check.outputs.run == 'true'
+        working-directory: frontend
+        shell: bash
+        run: |
+          npm ci
+          npm run build
       - name: cargo clippy -p rsh-app (warnings denied)
         if: steps.check.outputs.run == 'true'
         run: cargo clippy -p rsh-app --all-targets -- -D warnings
@@ -274,6 +292,24 @@ jobs:
         if: steps.check.outputs.run == 'true'
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
+      # v1.0.2 Bug 6 follow-up: the stale committed frontend/dist is
+      # gone, so dist must be built before any cargo build of rsh-app —
+      # tauri::generate_context!() panics at compile time when
+      # frontendDist does not exist (CI run 43708228362: clippy-windows
+      # + test-windows failed on exactly this). The frontend job gates
+      # lint/tests separately; here only the build output is needed.
+      - name: Set up Node.js 24
+        if: steps.check.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build frontend (dist required to compile rsh-app)
+        if: steps.check.outputs.run == 'true'
+        working-directory: frontend
+        shell: bash
+        run: |
+          npm ci
+          npm run build
       - name: cargo test --workspace
         if: steps.check.outputs.run == 'true'
         run: cargo test --workspace

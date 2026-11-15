@@ -227,6 +227,27 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
+      # Frontend gates run FIRST, before any cargo build of rsh-app:
+      # tauri::generate_context!() panics at compile time when
+      # frontendDist (../frontend/dist) does not exist, and the stale
+      # committed dist was deleted in v1.0.2 (Bug 6) — so `npm run build`
+      # here is what makes clippy / the --release tests able to compile
+      # rsh-app at all. (v1.0.2 release run 43708235724 + CI run
+      # 43708228362 failed on exactly this: `frontendDist ... doesn't
+      # exist`.) The `cargo tauri build` step below still rebuilds via
+      # beforeBuildCommand; this build is not redundant, it is the one
+      # the Rust gates compile against.
+      - name: Frontend gates (lint + tests + locales + audit + build)
+        working-directory: frontend
+        shell: pwsh
+        run: |
+          npm ci
+          npm run lint
+          npm test
+          node scripts/merge-locales.mjs --check
+          npm audit --audit-level=high
+          npm run build
+
       - name: cargo clippy --workspace (warnings denied)
         # Windows runner + sidecar already staged, so the rsh-app build
         # script passes here (unlike Linux CI, which excludes rsh-app).
@@ -244,17 +265,6 @@ jobs:
 
       - name: cargo deny check
         run: cargo deny check
-
-      - name: Frontend gates (lint + tests + locales + audit + build)
-        working-directory: frontend
-        shell: pwsh
-        run: |
-          npm ci
-          npm run lint
-          npm test
-          node scripts/merge-locales.mjs --check
-          npm audit --audit-level=high
-          npm run build
 
       # ---- Tauri build (NSIS ONLY — single-asset release, DECISIONS §18) ----
       # No TAURI_SIGNING_PRIVATE_KEY env: with createUpdaterArtifacts

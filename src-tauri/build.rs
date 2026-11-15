@@ -16,12 +16,11 @@ fn main() {
         let sidecar = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("binaries")
             .join("rsh-hm-sidecar-x86_64-pc-windows-msvc.exe");
-        if !sidecar.exists() {
-            panic!(
-                "HIDMaestro sidecar not staged: {} is missing. From the repo root, run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1 (needs the .NET 10 SDK; it fetches HIDMaestro v2.1.0, verifies the ZIP + DLL SHA-256, and publishes the NativeAOT sidecar). CI and the release workflow stage it automatically.",
-                sidecar.display()
-            );
-        }
+        assert!(
+            sidecar.exists(),
+            "HIDMaestro sidecar not staged: {} is missing. From the repo root, run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1 (needs the .NET 10 SDK; it fetches HIDMaestro v2.1.0, verifies the ZIP + DLL SHA-256, and publishes the NativeAOT sidecar). CI and the release workflow stage it automatically.",
+            sidecar.display()
+        );
     }
     tauri_build::build();
 }
