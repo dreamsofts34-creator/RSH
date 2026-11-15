@@ -380,6 +380,18 @@ jobs:
             foreach ($log in $logNames) {
               if (Test-Path $log) {
                 $text = Get-Content $log -Raw -ErrorAction SilentlyContinue
+                # Fail fast on a FATAL startup line: the app shows a
+                # modal dialog there (MessageBoxW) and the process
+                # stays alive waiting for a click nobody will give on
+                # a headless runner — waiting the full 90 s would only
+                # delay the same verdict.
+                $fatal = Select-String -Path $log -Pattern "FATAL:" -SimpleMatch | Select-Object -First 1
+                if ($fatal) {
+                  Write-Host "--- $log"; Get-Content $log
+                  try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { }
+                  Write-Error "Smoke test: startup hit a FATAL error: $($fatal.Line)"
+                  exit 1
+                }
                 if ($text -and $text.Contains("event loop ready")) { $ready = $true; Write-Host "Startup log reached 'event loop ready': $log"; break }
               }
             }
