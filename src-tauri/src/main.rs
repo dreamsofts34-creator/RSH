@@ -1220,7 +1220,10 @@ fn main() {
         // launcher + profile store. Registered before `setup` starts
         // the snapshot emitter thread.
         .manage(state)
-        .setup(|app| Ok(setup_shell(app)))
+        .setup(|app| {
+            setup_shell(app);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             ping,
             get_version,
@@ -1296,6 +1299,13 @@ fn main() {
         Err(error) => fatal_startup(&format!("could not build the RSH app window: {error}")),
     };
     log_startup("tauri app built");
+    run_app(app);
+}
+
+/// Runs the Tauri event loop — extracted from `main()` so `main()`
+/// stays under clippy's 100-line limit. The `Ready` breadcrumb
+/// separates "died during startup" from "died after the loop started".
+fn run_app(app: tauri::App) {
     app.run(|app, event| {
         if matches!(event, tauri::RunEvent::Ready) {
             // The event loop is live: if the log ends here, the
