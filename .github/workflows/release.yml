@@ -406,7 +406,11 @@ jobs:
         run: |
           $tag = "${{ steps.tag.outputs.tag }}"
           $version = "${{ steps.tag.outputs.version }}"
-          $bundleDir = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
+          # Bundler output lives in the WORKSPACE-ROOT target dir, not
+          # src-tauri/target: src-tauri is a workspace member, so Cargo
+          # puts target/ at the repo root (proven by run 43687032820:
+          # D:\a\RSH\RSH\target\...\bundle\nsis\RSH_1.0.0_x64-setup.exe).
+          $bundleDir = "target/x86_64-pc-windows-msvc/release/bundle"
           $nsis = Get-ChildItem "$bundleDir/nsis/*-setup.exe" -ErrorAction SilentlyContinue
           $msi = Get-ChildItem "$bundleDir/msi/*.msi" -ErrorAction SilentlyContinue
           if ($nsis.Count -ne 1) { Write-Error "Expected exactly one NSIS setup exe in $bundleDir/nsis."; exit 1 }
