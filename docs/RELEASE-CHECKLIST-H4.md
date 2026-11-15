@@ -257,7 +257,9 @@ Every item is ticked, explicitly deferred with a reason, or marked Windows-only.
     fingerprint `387764a4529337c437b233a148b48f9b2ffe3f3b5015e14c95737cb3a67a6411`.
   - Board + app reject unsigned images (SEC-C-06, verify-before-apply +
     anti-downgrade). Merged factory image `RSH-Firmware-DevKitV1-v4.0.1.bin`,
-    **955,984 B**.
+    **956,032 B on the Windows release runner** (Linux builds measure
+    955,984 B, SHA `1a132de9…6f8368` — same source, host-toolchain codegen
+    variance; see `release.yml` L8 comment, dry run #9).
 - [x] **`release.yml` adds the fail-closed verify the post-action cannot do:**
   `sign-image.py --verify <key> firmware-signed.bin` (Ed25519 verify, non-zero
   exit fails) **plus** image-region byte-compare against the fresh
@@ -313,7 +315,7 @@ Every item is ticked, explicitly deferred with a reason, or marked Windows-only.
 | `RSH_1.0.0_x64_en-US.msi` | Tauri WiX bundle | Secondary installer |
 | `RSH_1.0.0_x64_en-US.msi.sig` | Tauri updater artifacts | Minisign signature (updater) |
 | `latest.json` | Generated in `release.yml` | Updater manifest; `windows-x86_64.url` = release download URL of the `-setup.exe`; `signature` = contents of its `.sig` |
-| `RSH-Firmware-DevKitV1-v4.0.1.bin` | `pio run` merged image | 955,984 B factory image — `release.yml` FAILS if the size differs (L8); on a firmware version bump update the expected size in the workflow AND this row in the same change |
+| `RSH-Firmware-DevKitV1-v4.0.1.bin` | `pio run` merged image | 956,032 B factory image on the Windows release runner (Linux builds: 955,984 B — host-toolchain variance, same source; see `release.yml` L8 comment) — `release.yml` FAILS if the size differs (L8); on a firmware version bump update the expected size in the workflow AND this row in the same change |
 | `firmware-signed.bin` | `sign_firmware.py` | `firmware.bin` + 68 B trailer, Ed25519-signed |
 | `SHA256SUMS` | Generated in `release.yml` | SHA-256 of every asset above, two-column format, re-verified in-workflow |
 | `sbom-rust.cdx.json` | `.github/scripts/generate-rust-sbom.py` (release-time) | Full Cargo.lock resolve, CycloneDX 1.6, 626 packages (NOT cargo cyclonedx — see §3) |

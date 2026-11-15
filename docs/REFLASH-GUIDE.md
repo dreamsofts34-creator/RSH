@@ -29,12 +29,13 @@ aur `reference/docs/BRICK-RECOVERY.md`.
 | CP210x / CH340 USB-serial driver (board ke chip ke mutabiq) | Vendor site / OS update |
 | PC (Windows/Linux) | — |
 
-**Ghalat file se recovery nahi hoti:** app-only `firmware.bin` (890,448 B)
+**Ghalat file se recovery nahi hoti:** app-only `firmware.bin` (890,496 B
+release build; local Linux `pio run`: 890,448 B)
 se brick recovery **NAHI** hoti — wo `0x10000` par jati hai aur bootloader
 ke baghair boot nahi hoti. Hamesha **merged** bin use karo (bootloader
 `0x1000` + partitions `0x8000` + boot_app0 `0xe000` + app `0x10000`, ek hi
 file, **offset `0x0`** par flash hoti hai). `firmware-signed.bin`
-(890,516 B) sirf **OTA** ke liye hai (WebOTA/app se upload) — USB flashing
+(890,564 B) sirf **OTA** ke liye hai (WebOTA/app se upload) — USB flashing
 ke liye merged bin chahiye.
 
 ## 2. Flash se pehle — verify karo
@@ -47,8 +48,9 @@ sha256sum RSH-Firmware-DevKitV1-v4.0.1.bin
 Get-FileHash RSH-Firmware-DevKitV1-v4.0.1.bin -Algorithm SHA256
 ```
 
-- Size **955,984 B** hona chahiye. Chhoti file (e.g. 890,448 B
-  `firmware.bin`) = ghalat file, flash mat karo.
+- Size **956,032 B** hona chahiye (release file — Windows runner build;
+  local Linux `pio run` se 955,984 B banta hai, wahi source). Chhoti file
+  (e.g. 890,496 B `firmware.bin`) = ghalat file, flash mat karo.
 - Release build ka SHA-256 GitHub Release page par `SHA256SUMS` mein hota
   hai. Local `pio run` se bani file ka hash is doc mein darj run se mukhtalif
   ho sakta hai (build environment) — size + structure (§5 ka host-mock)
@@ -146,8 +148,9 @@ iteration GPIO0 / BOOT button parhta hai):
 
 ## 6. Release process (signed firmware)
 
-1. `pio run` — build + merged bin (955,984 B) + `firmware-signed.bin`
-   (890,516 B, sirf key maujood ho to).
+1. `pio run` — build + merged bin (956,032 B Windows release runner;
+   local Linux `pio run`: 955,984 B) + `firmware-signed.bin`
+   (890,564 B, sirf key maujood ho to).
 2. Release workflow mein **fail-closed verify**: signature verify hoti hai
    aur signed-region hash `firmware.bin` se milaya jata hai — verify fail →
    release ruk jati hai. Tampered ya downgrade image board par reject hoti

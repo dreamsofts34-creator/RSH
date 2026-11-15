@@ -284,7 +284,23 @@ jobs:
           # M-5 FACTORY_RESET) grew the app by 928 B, so the gate
           # updated this to 955984 with a clean-rebuild re-measure
           # (SHA-256 1a132de9…6f8368, deterministic across rebuilds).
-          $expectedMergedBinSize = 955984
+          # HOST VARIANCE (dry run #9, 2026-11-15): the Windows runner
+          # builds the SAME source 48 B larger — merged 956032 B
+          # (0xe9680, app firmware.bin 890496 B, image SHA-256
+          # d6d15d3d…) vs Linux 955984 B (SHA 1a132de9…6f8368,
+          # reproduced by a local clean rebuild AND the CI firmware
+          # job on the same head). No firmware/ change since af4cb53
+          # (git log empty); both hosts used PIO 6.2.0 + pinned
+          # espressif32@6.9.0 / toolchain-xtensa 8.4.0+2021r2-patch5 /
+          # framework 3.20017.241212 / esptool 4.5.1 — so the delta is
+          # host-toolchain codegen, not a code change or a wrong
+          # image. This workflow runs ONLY on windows-latest, so the
+          # Windows-runner value is the correct pin; the check stays
+          # exact and fail-closed. Dry run #10 must reproduce exactly
+          # 956032 on a fresh runner (2nd independent measurement) —
+          # if it differs, STOP and investigate non-determinism
+          # instead of moving the pin again.
+          $expectedMergedBinSize = 956032
           if ($merged[0].Length -ne $expectedMergedBinSize) { Write-Error "Merged bin size is $($merged[0].Length) B, expected $expectedMergedBinSize B (firmware v4.0.1). If this is a firmware version bump, update `$expectedMergedBinSize in this workflow and docs/RELEASE-CHECKLIST-H4.md in the same change; otherwise the image is wrong — failing closed."; exit 1 }
           $app = "$buildDir/firmware.bin"
           $signed = "$buildDir/firmware-signed.bin"

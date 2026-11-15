@@ -380,8 +380,9 @@ accepts, C++ rejects). All three are now fixed in `pin.rs` too:
   fingerprint hai.
 - Board + app unsigned image ko reject karte hain (SEC-C-06, verify-before-
   apply + anti-downgrade). Release assets: merged bin
-  `RSH-Firmware-DevKitV1-v4.0.1.bin` (955,984 B) + `firmware-signed.bin`
-  (890,516 B) + `SHA256SUMS`. Release workflow mein fail-closed verify hai
+  `RSH-Firmware-DevKitV1-v4.0.1.bin` (956,032 B, Windows release runner;
+  Linux `pio run`: 955,984 B — host-toolchain variance, same source) +
+  `firmware-signed.bin` (890,564 B) + `SHA256SUMS`. Release workflow mein fail-closed verify hai
   (signature + signed-region hash vs `firmware.bin`).
 - **Rust app v1.0.0 ko koi reflash nahi chahiye** — wahi board, wahi
   firmware v4.0.1, protocol frozen. Reflash sirf naye board ya brick

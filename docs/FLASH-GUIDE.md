@@ -26,9 +26,14 @@
 
 | File | Size | Use |
 |---|---|---|
-| `RSH-Firmware-DevKitV1-v4.0.1.bin` (merged) | **955,984 B** | ✅ USB flashing — this is the file for this guide |
-| `firmware.bin` (app-only) | 890,448 B | ❌ **Never** for USB flashing / recovery — it has no bootloader and will not boot |
-| `firmware-signed.bin` | 890,516 B (app + 68 B trailer) | ❌ **OTA only** (WebOTA / app upload) — not for USB flashing |
+| `RSH-Firmware-DevKitV1-v4.0.1.bin` (merged) | **956,032 B** | ✅ USB flashing — this is the file for this guide |
+| `firmware.bin` (app-only) | 890,496 B | ❌ **Never** for USB flashing / recovery — it has no bootloader and will not boot |
+| `firmware-signed.bin` | 890,564 B (app + 68 B trailer) | ❌ **OTA only** (WebOTA / app upload) — not for USB flashing |
+
+> Sizes are the Windows release-runner build (the shipped file). A local
+> Linux `pio run` of the same source builds 48 B smaller (merged 955,984 B,
+> app 890,448 B, signed 890,516 B) — host-toolchain codegen variance, same
+> source; see `release.yml` L8 comment (dry run #9).
 
 The merged image contains bootloader (`0x1000`) + partitions (`0x8000`)
 + boot_app0 (`0xe000`) + app (`0x10000`) in one file, flashed at
@@ -66,7 +71,7 @@ OTA.
    sha256sum RSH-Firmware-DevKitV1-v4.0.1.bin
    ```
    Compare with `SHA256SUMS` from the release, and check the size is
-   **955,984 B**. A hash mismatch or a smaller file (e.g. 890,448 B
+   **956,032 B**. A hash mismatch or a smaller file (e.g. 890,496 B
    `firmware.bin`) means the wrong file — **do not flash it**,
    download it again.
 2. **Connect the board by USB.** It must appear as a COM port

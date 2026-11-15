@@ -20,7 +20,7 @@ file is the gate list the coordinator ticks before tagging.
 | Piece | Version | Source of truth |
 |---|---|---|
 | App | Rust **v1.0.0** | `Cargo.toml` `[workspace.package] version`, `src-tauri/tauri.conf.json` `version` — both `1.0.0`, checked by `release.yml` |
-| Firmware | C++ **v4.0.1** | `FIRMWARE-COMPAT.md`; merged bin `RSH-Firmware-DevKitV1-v4.0.1.bin`, 955,984 B |
+| Firmware | C++ **v4.0.1** | `FIRMWARE-COMPAT.md`; merged bin `RSH-Firmware-DevKitV1-v4.0.1.bin`, 956,032 B (Windows release runner; Linux `pio run`: 955,984 B — host-toolchain variance, same source) |
 | Protocol | **v2.1** (frozen) | Wire contract; Rust app talks to the same board — **no reflash needed** for wheels already on v4.0.1 |
 
 ## 2. What H4 already proved (evidence in RELEASE-CHECKLIST-H4.md)
@@ -82,7 +82,7 @@ What `release.yml` stages and publishes (H4 §7):
 | 3 | `RSH_1.0.0_x64_en-US.msi` | Tauri WiX bundle (secondary installer) |
 | 4 | `RSH_1.0.0_x64_en-US.msi.sig` | Updater signature for the MSI |
 | 5 | `latest.json` | Generated in `release.yml` from the real `.sig` + real release URLs |
-| 6 | `RSH-Firmware-DevKitV1-v4.0.1.bin` | `pio run` merged image, 955,984 B |
+| 6 | `RSH-Firmware-DevKitV1-v4.0.1.bin` | `pio run` merged image, 956,032 B (Windows release runner; Linux: 955,984 B) |
 | 7 | `firmware-signed.bin` | `firmware.bin` + 68 B trailer, Ed25519-signed |
 | 8 | `SHA256SUMS` | SHA-256 of every asset above, re-verified in-workflow |
 | 9 | `sbom-rust.cdx.json` | `cargo cyclonedx` (release-time) |
