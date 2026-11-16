@@ -55,12 +55,13 @@ yanked = "deny"
 unmaintained = "all"
 unsound = "workspace"
 # Ignores (TESTING-INPUT §9.1: ignore only with id + reason + expiry).
-# All four are transitive dependencies of Tauri 2.12.5's Linux/GTK stack
-# (tao → gtk → zbus/zvariant/glib); none is a direct dependency of any
-# rsh-* crate and none is a vulnerability in RSH code. Plain `cargo audit`
+# The first four are transitive dependencies of Tauri 2.12.5's Linux/GTK stack
+# (tao → gtk → zbus/zvariant/glib); the three below are transitive via
+# Slint 1.18.1 (v2.0 UI). None is a direct dependency of any rsh-* crate
+# and none is a vulnerability in RSH code. Plain `cargo audit`
 # already exits 0 on these (they are warnings, not errors); they are
 # ignored here only so the stricter deny checks stay green and honest.
-# Review date for all four: 2027-02-14 (re-check whether a Tauri bump
+# Review date for all seven: 2027-02-14 (re-check whether a Tauri/Slint bump
 # removed them; if yes, drop the entry).
 ignore = [
     # RUSTSEC-2024-0370 — proc-macro-error 1.0.4, unmaintained. No fixed upgrade exists.
@@ -71,6 +72,15 @@ ignore = [
     "RUSTSEC-2026-0370",
     # RUSTSEC-2026-0372 — zvariant_derive 5.15.1, unmaintained. No fixed upgrade exists.
     "RUSTSEC-2026-0372",
+    # RUSTSEC-2025-0141 — bincode 2.0.1, unmaintained. Transitive (in
+    # Cargo.lock; Windows-target graph, not in the Linux tree). No fixed upgrade exists.
+    "RUSTSEC-2025-0141",
+    # RUSTSEC-2026-0441 — pin-utils 0.1.1, unmaintained. Transitive via
+    # Slint (spin_on <- slint-build). No fixed upgrade exists.
+    "RUSTSEC-2026-0441",
+    # RUSTSEC-2026-0192 — ttf-parser 0.25.1, unmaintained. Transitive via
+    # Slint (ab_glyph <- winit <- i-slint-backend-winit). No fixed upgrade exists.
+    "RUSTSEC-2026-0192",
 ]
 
 [licenses]
@@ -86,6 +96,21 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
     "MPL-2.0",
+    # BSL-1.0 (Boost Software License, OSI-approved, permissive):
+    # clipboard-win + error-code, via arboard <- Slint winit
+    # backend. Added 2026-11-16 (v2.0 release gate): the Slint
+    # tree was never deny-checked before.
+    "BSL-1.0",
+    # Slint royalty-free license (LicenseRef-Slint-Royalty-free-2.0):
+    # all Slint crates are "GPL-3.0-only OR LicenseRef-Slint-
+    # Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0". The
+    # project uses Slint under the Royalty-free 2.0 license
+    # (REDESIGN-PLAN: GPLv3 is NOT used) — allowing the
+    # Royalty-free ref satisfies the OR without allowing GPL.
+    "LicenseRef-Slint-Royalty-free-2.0",
+    # Unlicense (public-domain dedication, permissive): ksni
+    # 0.3.7 (Slint tray backend dependency).
+    "Unlicense",
 ]
 # Workspace crates are MIT-licensed (LICENSE, user decision); do not
 # license-check unpublished workspace members.

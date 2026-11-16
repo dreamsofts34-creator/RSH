@@ -39,7 +39,9 @@
 //!   `~/.config/autostart/rsh-daemon.desktop` file
 //!   (`X-GNOME-Autostart-enabled=true`, `Hidden=false`).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(windows))]
+use std::path::PathBuf;
 
 #[cfg(any(windows, test))]
 use rsh_app_core::system::RunKeyStore;
@@ -54,6 +56,7 @@ use rsh_app_core::system::{
 #[cfg(windows)]
 pub const RUN_KEY_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 /// Linux autostart desktop file name.
+#[cfg(not(windows))]
 pub const DESKTOP_FILE_NAME: &str = "rsh-daemon.desktop";
 
 /// What [`sync_autostart`] did.
@@ -154,6 +157,7 @@ fn autostart_dir() -> Option<PathBuf> {
 }
 
 /// Render the Linux autostart `.desktop` file for `exe`.
+#[cfg(not(windows))]
 #[must_use]
 pub fn desktop_file_contents(exe: &Path) -> String {
     format!(
@@ -206,32 +210,34 @@ impl RegRunKeyStore {
     }
 
     fn open_read() -> Option<windows::Win32::System::Registry::HKEY> {
-        use windows::Win32::System::Registry::{HKEY_CURRENT_USER, KEY_READ, RegOpenKeyExW};
+        use windows::Win32::System::Registry::{HKEY, HKEY_CURRENT_USER, KEY_READ, RegOpenKeyExW};
         use windows::core::HSTRING;
-        let mut key = Default::default();
+        let mut key = HKEY::default();
         let result = unsafe {
             RegOpenKeyExW(
                 HKEY_CURRENT_USER,
                 &HSTRING::from(RUN_KEY_SUBKEY),
                 None,
                 KEY_READ,
-                &mut key,
+                &raw mut key,
             )
         };
         if result.0 == 0 { Some(key) } else { None }
     }
 
     fn open_write() -> Option<windows::Win32::System::Registry::HKEY> {
-        use windows::Win32::System::Registry::{HKEY_CURRENT_USER, KEY_SET_VALUE, RegOpenKeyExW};
+        use windows::Win32::System::Registry::{
+            HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, RegOpenKeyExW,
+        };
         use windows::core::HSTRING;
-        let mut key = Default::default();
+        let mut key = HKEY::default();
         let result = unsafe {
             RegOpenKeyExW(
                 HKEY_CURRENT_USER,
                 &HSTRING::from(RUN_KEY_SUBKEY),
                 None,
                 KEY_SET_VALUE,
-                &mut key,
+                &raw mut key,
             )
         };
         if result.0 == 0 { Some(key) } else { None }
@@ -252,14 +258,16 @@ impl RunKeyStore for RegRunKeyStore {
                 None,
                 None,
                 None,
-                Some(&mut size_bytes),
+                Some(&raw mut size_bytes),
             )
         };
         if size_result.0 != 0 || size_bytes == 0 {
-            unsafe { RegCloseKey(key) };
+            unsafe {
+                let _ = RegCloseKey(key);
+            };
             return None;
         }
-        let mut buffer = vec![0u16; (size_bytes as usize + 1) / 2];
+        let mut buffer = vec![0u16; (size_bytes as usize).div_ceil(2)];
         let mut value_type = REG_SZ;
         let mut read_bytes = size_bytes;
         let result = unsafe {
@@ -267,12 +275,14 @@ impl RunKeyStore for RegRunKeyStore {
                 key,
                 &HSTRING::from(AUTOSTART_VALUE_NAME),
                 None,
-                Some(&mut value_type),
+                Some(&raw mut value_type),
                 Some(buffer.as_mut_ptr().cast::<u8>()),
-                Some(&mut read_bytes),
+                Some(&raw mut read_bytes),
             )
         };
-        unsafe { RegCloseKey(key) };
+        unsafe {
+            let _ = RegCloseKey(key);
+        };
         if result.0 != 0 || value_type != REG_SZ {
             return None;
         }
@@ -301,7 +311,9 @@ impl RunKeyStore for RegRunKeyStore {
                 Some(bytes),
             )
         };
-        unsafe { RegCloseKey(key) };
+        unsafe {
+            let _ = RegCloseKey(key);
+        };
         if result.0 == 0 {
             Ok(())
         } else {
@@ -321,7 +333,9 @@ impl RunKeyStore for RegRunKeyStore {
             ));
         };
         let result = unsafe { RegDeleteValueW(key, &HSTRING::from(AUTOSTART_VALUE_NAME)) };
-        unsafe { RegCloseKey(key) };
+        unsafe {
+            let _ = RegCloseKey(key);
+        };
         // 2 = ERROR_FILE_NOT_FOUND: already absent is a successful
         // delete (the app-core contract: delete is a no-op when
         // absent).
@@ -344,6 +358,7 @@ mod tests {
     };
 
     #[test]
+    #[cfg(not(windows))]
     fn desktop_file_renders_exec_and_autostart_flag() {
         let contents = desktop_file_contents(Path::new("/usr/bin/rsh-daemon"));
         assert!(contents.contains("Exec=\"/usr/bin/rsh-daemon\""));

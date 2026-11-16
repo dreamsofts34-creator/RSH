@@ -16,6 +16,7 @@
 //! and exits — the running daemon logs the signal. Phase 3 adds an
 //! `open-ui` IPC method the second instance will call instead.
 
+#[cfg(unix)]
 use std::path::PathBuf;
 
 /// The running-daemon lock, held for the daemon's lifetime.
@@ -96,7 +97,7 @@ pub fn acquire(_data_dir: &std::path::Path) -> Result<AcquireOutcome, String> {
         CreateMutexW(None, true, PCWSTR(name.as_ptr()))
             .map_err(|e| format!("cannot create daemon mutex: {e}"))?
     };
-    let already = windows::Win32::Foundation::GetLastError()
+    let already = unsafe { windows::Win32::Foundation::GetLastError() }
         == windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
     if already {
         let _ = unsafe { CloseHandle(handle) };
@@ -119,8 +120,10 @@ impl SingleInstance {
         }
         #[cfg(windows)]
         {
-            // The mutex handle is closed by dropping `self`.
-            drop(self);
+            // Close the mutex handle: HANDLE has no Drop impl, so
+            // dropping `self` alone would leak it.
+            let SingleInstance::Mutex { handle } = self;
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
         }
     }
 }

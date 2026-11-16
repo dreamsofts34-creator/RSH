@@ -3,6 +3,10 @@
 //! delivered to a subscriber. (The Windows named-pipe path is the
 //! same dispatch over a different listener; it is verified on
 //! Windows — see the gate doc.)
+//!
+//! Unix-only: the crate doc stays above the `cfg` so the crate is
+//! documented even where the tests are compiled out (Windows).
+#![cfg(unix)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};

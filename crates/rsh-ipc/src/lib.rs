@@ -145,9 +145,11 @@ pub mod client;
 pub mod server;
 
 pub use client::IpcClient;
+pub use server::IpcServer;
 #[cfg(unix)]
 pub use server::bind_unix_socket;
-pub use server::{IpcServer, serve_listener};
+#[cfg(unix)]
+pub use server::serve_listener;
 
 /// Parse + version-check one request line. Shared by the server and
 /// the tests so both sides enforce the version the same way.

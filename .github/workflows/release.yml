@@ -173,6 +173,16 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Install NSIS (makensis)
+        shell: pwsh
+        run: |
+          # windows-latest no longer ships NSIS on PATH (release run
+          # 43870249083 failed the makensis check below) — install it
+          # via Chocolatey and put it on PATH for the later steps.
+          choco install nsis -y --no-progress
+          $nsis = "C:\Program Files (x86)\NSIS"
+          if (Test-Path "$nsis\makensis.exe") { "$nsis" >> $env:GITHUB_PATH }
+
       - name: Check makensis present (fail closed)
         shell: pwsh
         run: |

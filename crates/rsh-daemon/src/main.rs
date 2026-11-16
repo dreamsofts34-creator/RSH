@@ -47,7 +47,9 @@ use std::time::{Duration, Instant};
 use rsh_api::{AppApi, AppEvent, ConnEvent, ConnectionError, ManagerAction};
 use rsh_app_core::diagnostics::append_startup_log_both;
 use rsh_app_core::state::{AppStateCore, TransportKind};
-use rsh_ipc::{IpcServer, serve_listener, socket_path};
+#[cfg(unix)]
+use rsh_ipc::serve_listener;
+use rsh_ipc::{IpcServer, socket_path};
 use slint::ComponentHandle;
 use tokio::sync::broadcast;
 
@@ -490,7 +492,7 @@ fn main() {
                     .build()
                     .ok()?;
                 runtime.block_on(async move {
-                    let client = rsh_ipc::IpcClient::connect_unix(&socket).await.ok()?;
+                    let client = rsh_ipc::IpcClient::connect(&socket).await.ok()?;
                     client.ping().await.ok()
                 })
             })
@@ -618,7 +620,7 @@ fn main() {
         let ok = runtime.block_on(async move {
             // Give the listener a moment to bind.
             for _ in 0..20 {
-                if let Ok(client) = rsh_ipc::IpcClient::connect_unix(&socket).await
+                if let Ok(client) = rsh_ipc::IpcClient::connect(&socket).await
                     && let Ok(true) = client.ping().await
                 {
                     let version = client.version().await.unwrap_or_default();
@@ -885,7 +887,7 @@ fn create_tray(
                                 .get()
                                 .is_some_and(|shown| shown.elapsed() > Duration::from_millis(500))
                                 && let Some(hwnd) = tray_geometry::popup_hwnd("RSH Wheel — Tray")
-                                && tray_geometry::is_foreground(hwnd) == Some(false)
+                                && !tray_geometry::is_foreground(hwnd)
                             {
                                 handle.hide();
                             }

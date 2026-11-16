@@ -28,6 +28,9 @@ use crate::tray_popup::Rect;
 /// The tray icon's screen rect, when Windows can report it.
 #[cfg(windows)]
 #[must_use]
+#[allow(clippy::cast_possible_truncation)]
+// cbSize: NOTIFYICONIDENTIFIER is a small fixed struct (tens of
+// bytes); its size always fits in a u32.
 pub fn tray_icon_rect() -> Option<Rect> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -50,7 +53,7 @@ pub fn tray_icon_rect() -> Option<Rect> {
         }
         candidate = found;
         let mut pid = 0u32;
-        unsafe { GetWindowThreadProcessId(found, Some(&mut pid as *mut u32)) };
+        unsafe { GetWindowThreadProcessId(found, Some(&raw mut pid)) };
         if pid == own_pid {
             let identifier = NOTIFYICONIDENTIFIER {
                 cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
@@ -58,7 +61,7 @@ pub fn tray_icon_rect() -> Option<Rect> {
                 uID: 1,
                 guidItem: windows::core::GUID::zeroed(),
             };
-            let rect = unsafe { Shell_NotifyIconGetRect(&identifier) }.ok()?;
+            let rect = unsafe { Shell_NotifyIconGetRect(&raw const identifier) }.ok()?;
             return Some(Rect {
                 left: rect.left,
                 top: rect.top,
@@ -86,15 +89,16 @@ pub fn tray_icon_rect() -> Option<Rect> {
 pub fn work_area() -> Rect {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA, SystemParametersInfoW,
+        GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA,
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
     };
     let mut rect = RECT::default();
     let ok = unsafe {
         SystemParametersInfoW(
             SPI_GETWORKAREA,
             0,
-            Some(&mut rect as *mut RECT as *mut std::ffi::c_void),
-            Default::default(),
+            Some((&raw mut rect).cast::<std::ffi::c_void>()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
         )
     };
     if ok.is_ok() && rect.right > rect.left && rect.bottom > rect.top {
@@ -148,7 +152,7 @@ pub fn popup_hwnd(title: &str) -> Option<isize> {
         return None;
     }
     let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32)) };
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
     if pid == unsafe { GetCurrentProcessId() } {
         Some(hwnd.0 as isize)
     } else {
@@ -157,12 +161,13 @@ pub fn popup_hwnd(title: &str) -> Option<isize> {
 }
 
 /// Whether `hwnd` (a raw `HWND` value from [`popup_hwnd`]) is the
-/// current foreground window. `None` when Windows cannot tell.
+/// current foreground window. `false` when Windows cannot tell
+/// (no foreground window).
 #[cfg(windows)]
 #[must_use]
-pub fn is_foreground(hwnd_value: isize) -> Option<bool> {
+pub fn is_foreground(hwnd_value: isize) -> bool {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     let foreground = unsafe { GetForegroundWindow() };
-    Some(foreground == HWND(hwnd_value as *mut std::ffi::c_void))
+    foreground == HWND(hwnd_value as *mut std::ffi::c_void)
 }

@@ -25,8 +25,10 @@ use crate::{IPC_PROTOCOL_VERSION, IpcError, IpcRequest, IpcResponse};
 /// A connected IPC client.
 pub struct IpcClient {
     /// Line writer (guarded: one in-flight call at a time, and the
-    /// response wait happens under the same guard).
-    writer: Mutex<tokio::net::unix::OwnedWriteHalf>,
+    /// response wait happens under the same guard). Boxed so the
+    /// same code serves the Unix socket (Linux) and the named pipe
+    /// (Windows) — both are `AsyncRead + AsyncWrite`.
+    writer: Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>,
     /// Response receiver, guarded by the same mutex as the writer
     /// (one in-flight call, so one waiter).
     responses: Mutex<mpsc::Receiver<IpcResponse>>,
@@ -39,27 +41,15 @@ pub struct IpcClient {
 }
 
 impl IpcClient {
-    /// Connect to the daemon's Unix socket at `path` (Linux).
-    ///
-    /// # Errors
-    ///
-    /// [`IpcError::Io`] when the socket cannot be reached (daemon
-    /// not running).
-    pub async fn connect_unix(path: &Path) -> Result<Arc<Self>, IpcError> {
-        let stream = tokio::net::UnixStream::connect(path).await.map_err(|e| {
-            IpcError::Io(format!(
-                "cannot connect to daemon IPC {}: {e}",
-                path.display()
-            ))
-        })?;
-        Ok(Self::from_unix_stream(stream))
-    }
-
-    /// Build a client over an already-connected Unix stream (also
-    /// the seam the round-trip test uses).
+    /// Build a client over any connected byte stream (Unix socket
+    /// or named pipe). Shared by the per-platform `connect_*`
+    /// constructors and the round-trip test.
     #[must_use]
-    pub fn from_unix_stream(stream: tokio::net::UnixStream) -> Arc<Self> {
-        let (reader, writer) = stream.into_split();
+    pub fn from_stream<S>(stream: S) -> Arc<Self>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (reader, writer) = tokio::io::split(stream);
         let (event_tx, event_rx) = mpsc::channel(64);
         let (resp_tx, resp_rx) = mpsc::channel::<IpcResponse>(64);
         // Reader task: demuxes response frames from event pushes.
@@ -88,12 +78,76 @@ impl IpcClient {
             }
         });
         Arc::new(Self {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(Box::new(writer)),
             responses: Mutex::new(resp_rx),
             next_id: Mutex::new(1),
             events: Mutex::new(event_rx),
             _reader: reader_task,
         })
+    }
+
+    /// Connect to the daemon: Unix socket at `path` on Linux,
+    /// named pipe on Windows (`path` is ignored there — the pipe
+    /// name is fixed, [`crate::IPC_PIPE_NAME`]).
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::Io`] when the daemon cannot be reached (daemon
+    /// not running).
+    pub async fn connect(path: &Path) -> Result<Arc<Self>, IpcError> {
+        #[cfg(unix)]
+        {
+            Self::connect_unix(path).await
+        }
+        #[cfg(windows)]
+        {
+            let _ = path;
+            Self::connect_named_pipe().await
+        }
+    }
+
+    /// Connect to the daemon's Unix socket at `path` (Linux).
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::Io`] when the socket cannot be reached (daemon
+    /// not running).
+    #[cfg(unix)]
+    pub async fn connect_unix(path: &Path) -> Result<Arc<Self>, IpcError> {
+        let stream = tokio::net::UnixStream::connect(path).await.map_err(|e| {
+            IpcError::Io(format!(
+                "cannot connect to daemon IPC {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Self::from_stream(stream))
+    }
+
+    /// Connect to the daemon's named pipe (Windows). The pipe open
+    /// itself is synchronous in Tokio's API, so this returns a
+    /// ready future instead of an `async fn` (clippy's
+    /// `unused_async` fires on an `async fn` with no `.await`).
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError::Io`] when the pipe cannot be reached (daemon
+    /// not running).
+    #[cfg(windows)]
+    pub fn connect_named_pipe() -> impl std::future::Future<Output = Result<Arc<Self>, IpcError>> {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let result = ClientOptions::new()
+            .open(crate::IPC_PIPE_NAME)
+            .map_err(|e| IpcError::Io(format!("cannot connect to daemon IPC pipe: {e}")))
+            .map(Self::from_stream);
+        std::future::ready(result)
+    }
+
+    /// Build a client over an already-connected Unix stream (also
+    /// the seam the round-trip test uses).
+    #[cfg(unix)]
+    #[must_use]
+    pub fn from_unix_stream(stream: tokio::net::UnixStream) -> Arc<Self> {
+        Self::from_stream(stream)
     }
 
     /// Receive the next pushed event, if one is waiting.

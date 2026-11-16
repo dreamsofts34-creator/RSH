@@ -52,7 +52,7 @@ impl IpcApi {
             .enable_all()
             .build()
             .map_err(|e| IpcError::Io(e.to_string()))?;
-        let client = rt.block_on(IpcClient::connect_unix(path))?;
+        let client = rt.block_on(IpcClient::connect(path))?;
         rt.block_on(client.call("subscribe", serde_json::json!({})))?;
         Ok(Arc::new(Self {
             client,
@@ -337,6 +337,7 @@ mod tests {
         // The server thread owns its runtime: it binds the socket
         // (needs a reactor) and signals readiness before accepting.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        #[cfg(unix)]
         let sock_clone = sock.clone();
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -344,10 +345,25 @@ mod tests {
                 .build()
                 .expect("server runtime");
             rt.block_on(async move {
-                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
-                ready_tx.send(()).expect("ready signal");
-                if let Ok((stream, _)) = listener.accept().await {
-                    server.serve_stream(stream).await;
+                #[cfg(unix)]
+                {
+                    let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                    ready_tx.send(()).expect("ready signal");
+                    if let Ok((stream, _)) = listener.accept().await {
+                        server.serve_stream(stream).await;
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    use tokio::net::windows::named_pipe::ServerOptions;
+                    let pipe = ServerOptions::new()
+                        .first_pipe_instance(true)
+                        .create(rsh_ipc::IPC_PIPE_NAME)
+                        .expect("pipe");
+                    ready_tx.send(()).expect("ready signal");
+                    if pipe.connect().await.is_ok() {
+                        server.serve_stream(pipe).await;
+                    }
                 }
             });
         });

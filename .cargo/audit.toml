@@ -41,4 +41,18 @@ ignore = [
     # bumps its gtk/glib versions.
     # Review: 2027-02-14.
     "RUSTSEC-2024-0429",
+    # RUSTSEC-2025-0141 — bincode 2.0.1, unmaintained.
+    # Transitive (in Cargo.lock; Windows-target graph, not in the Linux
+    # tree). No fixed upgrade exists.
+    # Review: 2027-02-14.
+    "RUSTSEC-2025-0141",
+    # RUSTSEC-2026-0441 — pin-utils 0.1.1, unmaintained.
+    # Transitive via Slint (spin_on <- slint-build). No fixed upgrade exists.
+    # Review: 2027-02-14.
+    "RUSTSEC-2026-0441",
+    # RUSTSEC-2026-0192 — ttf-parser 0.25.1, unmaintained.
+    # Transitive via Slint (ab_glyph <- winit <- i-slint-backend-winit).
+    # No fixed upgrade exists.
+    # Review: 2027-02-14.
+    "RUSTSEC-2026-0192",
 ]

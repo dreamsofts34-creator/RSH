@@ -9,8 +9,10 @@
 //! * Windows: a tokio named-pipe server on `\\.\pipe\rsh-daemon`
 //!   (one instance per connection; the pipe is local-only).
 
-use std::path::Path;
 use std::sync::Arc;
+
+#[cfg(unix)]
+use std::path::Path;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
@@ -180,6 +182,9 @@ impl IpcServer {
 
 /// Serve a Unix listener forever (Linux): accept connections and
 /// spawn one task per client. Returns only on listener error.
+/// Unix-only: `tokio::net::UnixListener` does not exist on Windows
+/// (the daemon serves a named pipe there instead).
+#[cfg(unix)]
 pub async fn serve_listener(server: Arc<IpcServer>, listener: tokio::net::UnixListener) {
     loop {
         match listener.accept().await {
