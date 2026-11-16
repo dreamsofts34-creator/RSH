@@ -220,6 +220,12 @@ jobs:
         # workflow proves the ship crates in release mode.
         run: cargo test -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc --release
 
+      - name: Install cargo-deny
+        # cargo-deny is not preinstalled on the runner (release run
+        # 43875439798 failed here with "no such command: `deny`").
+        # Pinned to 0.20.2 --locked, same as CI (ci.yml audit job).
+        run: cargo install cargo-deny --version 0.20.2 --locked
+
       - name: cargo deny check
         run: cargo deny check
 
