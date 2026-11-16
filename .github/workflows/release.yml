@@ -394,7 +394,14 @@ jobs:
           if ($ruleAfter -match "Rule Name:\s*RSH") { Write-Error "Smoke test: firewall rule 'RSH' still present after uninstall."; exit 1 }
           if (Test-Path $installDir) { Write-Error "Smoke test: install dir $installDir still present after uninstall."; exit 1 }
           Write-Host "Smoke test PASS: uninstall removed the firewall rule and the install dir."
-          Remove-Item $dataDir -Recurse -Force -ErrorAction SilentlyContinue
+          # The data dir may never exist on Windows (named-pipe IPC
+          # leaves no socket file, single-instance is a mutex, and
+          # the startup logger writes to the default data dir, not
+          # this --data-dir) — an unconditional Remove-Item on a
+          # missing path fails the step's last statement and pwsh
+          # exits 1 even though every check above passed (release
+          # run 43881476168). Only remove it when it exists.
+          if (Test-Path $dataDir) { Remove-Item $dataDir -Recurse -Force }
 
       - name: vJoy DLL hash (record only — never invented)
         shell: pwsh
