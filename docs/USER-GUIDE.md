@@ -14,7 +14,7 @@ first — your old pairing does **not** carry over.
 - [Install](#install)
 - [Unsigned app — SmartScreen](#unsigned-app--smartscreen)
 - [First run — the Setup wizard](#first-run--the-setup-wizard)
-- [Pairing (60-second window)](#pairing-60-second-window)
+- [Pairing](#pairing)
 - [Re-pairing after the C# → Rust switch (mandatory)](#re-pairing-after-the-c-rust-switch-mandatory)
 - [Connecting — Wi-Fi or USB](#connecting--wi-fi-or-usb)
 - [The 8 screens](#the-8-screens)
@@ -61,8 +61,11 @@ Ed25519-signed and verified by the board.
 The first launch opens the **Setup wizard**:
 
 1. **Connect** — find your wheel (Wi-Fi or USB-serial).
-2. **Pair** — exchange the per-device key (60-second window, below).
-3. **Wi-Fi password** — the board's password for your home network.
+2. **Pair** — exchange the per-device key (pair button or USB, below).
+3. **Wi-Fi password** — the password for the wheel's own `RSH`
+   Wi-Fi network. The wheel is a Wi-Fi access point only — it never
+   joins your home network, and this password is for its network,
+   not your home router's.
 4. **Pins** — assign GPIO pins to steering, pedals, buttons, LED, etc.
    (validated against the board's pin rules before anything is sent).
 5. **Calibrate** — steering lock-to-lock, pedal ranges.
@@ -73,24 +76,75 @@ The first launch opens the **Setup wizard**:
 You can re-run Setup any time from Settings. Skipping calibration is
 possible, but steering/pedals will read uncalibrated until you do it.
 
-## Pairing (60-second window)
+## Pairing
 
 Pairing is how the app and the wheel agree on a secret key. The board
 generates one random 32-byte key per board, and discloses it **exactly
-once, inside a 60-second window** after its SoftAP (`RSH` Wi-Fi
-network) comes up.
+once, inside a pairing window**. The app stores the key in **Windows
+Credential Manager** (service `RSH`) — never in a file, never in a log.
+Once paired, the app and the wheel authenticate every control message
+with HMAC (protocol v2.1).
 
-1. Power the wheel (or reboot it) so the `RSH` network appears.
-2. In the app, start pairing **within those 60 seconds**.
-3. The app stores the key in **Windows Credential Manager**
-   (service `RSH`) — never in a file, never in a log.
-4. Done. The app and the wheel now authenticate every control message
-   with HMAC (protocol v2.1).
+**The wheel is a Wi-Fi access point only.** It creates its own `RSH`
+Wi-Fi network, and your PC joins that network to talk to the wheel.
+The wheel **never joins your home network** — there is no home-network
+setup step, and no home-network password is ever asked for or stored.
+The only Wi-Fi password in RSH is the password of the wheel's own
+`RSH` network.
 
-**If the window closes before pairing finishes**, pairing is over for
-that boot: reboot the wheel to open a fresh 60-second window and try
-again. There is no way to read the key out of the board after the
-window closes — that is by design.
+### Pairing over USB (recommended)
+
+Plug the wheel in with a **data** USB cable (charge-only cables do not
+work). If the board is unpaired, the app opens a pairing window
+**on demand** as soon as it sees the board over serial — there is no
+countdown to race against, because physical access to the board is the
+trust anchor. Pair from the app and you are done.
+
+### Pairing over Wi-Fi — the pair button (firmware v4.0.2)
+
+On firmware v4.0.2, an **unpaired** board has a pair button: hold the
+board's **BOOT** button for **3 seconds** (and release before 5
+seconds — 5 seconds is safe mode, see below). The board's LED blinks
+(3 Hz) while the pairing window is open, and the window stays open
+for **120 seconds**. Pair from the app inside that window.
+
+- The **3-second hold works only on an unpaired board.** On a board
+  that is already paired, holding BOOT for 3 seconds does nothing —
+  that is by design, so nobody can re-pair a wheel that is not theirs.
+  To re-pair an already-paired board, reset its pairing first (hold
+  BOOT for **10 seconds or more** — KEY_RESET, below) and then pair
+  it as a fresh board.
+- The app shows the **real remaining time** of the window. Never start
+  pairing after the countdown reaches zero — the window is closed and
+  the key cannot be read out of the board any more.
+- A board that has just booted also opens a **60-second** pairing
+  window on its own, from the moment its `RSH` network comes up. The
+  pair button is the way to open a fresh window later, without
+  rebooting the wheel.
+
+### The Wi-Fi password — shown once
+
+When pairing succeeds, the app shows the password of the wheel's
+`RSH` network **once**. Save it somewhere safe before you confirm —
+the app drops it after you confirm you saved it, and the board never
+shows it again. (If you lose it, the password lives in the Windows
+Credential Manager entry for the wheel, and the app can show it again
+from there after a confirmation dialog.)
+
+After pairing, the wheel locks its network with WPA2 using that
+password, and the app **rejoins the `RSH` network itself** (it creates
+a Windows Wi-Fi profile for `RSH` and connects to it), so you do not
+have to switch networks by hand. If the automatic rejoin does not
+work, the app shows a card with the exact steps to join `RSH`
+manually — the password you just saved is the one to use.
+
+### If the window closes before pairing finishes
+
+Pairing is over for that attempt: open a fresh window — hold BOOT for
+3 seconds (unpaired board, firmware v4.0.2), plug in USB, or reboot
+the wheel for a fresh 60-second boot window — and try again. There is
+no way to read the key out of the board after the window closes —
+that is by design.
 
 ### Re-pairing after the C# → Rust switch (mandatory)
 
@@ -105,10 +159,12 @@ vector).
 Steps:
 
 1. **KEY_RESET on the board:** hold the **BOOT** button for **10
-   seconds or more** (hold ≥ 10 s arms key-reset; 5–10 s is safe mode,
-   not key-reset — see [FLASH-GUIDE.md](FLASH-GUIDE.md#4-boot-hold-safe-mode-key-reset-no-reflash-needed)).
+   seconds or more** (hold ≥ 10 s arms key-reset; 3 s is the pair
+   button on firmware v4.0.2, 5–10 s is safe mode — see
+   [FLASH-GUIDE.md](FLASH-GUIDE.md#4-boot-hold-safe-mode-key-reset-no-reflash-needed)).
    The board generates a fresh key and a fresh Wi-Fi password.
-2. Pair again from the app within the new 60-second window (above).
+2. Pair again from the app — USB, or the 3-second pair-button hold
+   (firmware v4.0.2), or within the 60-second boot window.
 3. Your old C# key stops working the moment you move to the Rust app.
 
 **Profiles and settings are separate from keys.** The Rust app starts
@@ -118,17 +174,21 @@ profiles exists for manual use only. Keys and Wi-Fi passwords are
 
 ## Connecting — Wi-Fi or USB
 
-- **Wi-Fi (default):** the wheel joins your home network (or the app
-  talks to the wheel's own `RSH` SoftAP during setup). Stream traffic
-  is UDP; control traffic is HMAC-authenticated.
+- **Wi-Fi (default):** the wheel is a **Wi-Fi access point only** —
+  it creates its own `RSH` network and your PC joins it. The wheel
+  never joins your home network. Stream traffic is UDP; control
+  traffic is HMAC-authenticated. After pairing, the wheel locks the
+  `RSH` network with WPA2 and the app rejoins it itself (see
+  [Pairing](#pairing)).
 - **USB-serial:** plug the wheel in with a **data** cable
   (charge-only cables do not work). The app auto-detects the COM port
   (COM10+ supported). Opening the port never resets the board.
 - If the wheel is unreachable, the Dashboard shows the connection
   state and the Output page shows live axes/buttons only while a
   session is up. A failed `GET_CAPS` inside the pairing window may be
-  retried; after the window closes, pairing is over until the next
-  reboot.
+  retried; after the window closes, pairing is over until a fresh
+  window is opened (pair button, USB, or reboot — see
+  [Pairing](#pairing)).
 
 ## The 8 screens
 
@@ -251,15 +311,19 @@ window. If you still see a blank window or an empty page:
 
 1. USB: use a **data** cable, try a rear USB port, check the COM port
    appears in Device Manager (CP210x / CH340 driver installed).
-2. Wi-Fi: is the wheel on the same network? During setup, is the
-   `RSH` network visible? If the wheel never appears, reboot it and
-   check the `RSH` network shows up.
+2. Wi-Fi: is your PC joined to the wheel's `RSH` network? The wheel
+   is a Wi-Fi access point only — it never joins your home network,
+   so "same home network" is not the check: look for the `RSH`
+   network in your Wi-Fi list. If the wheel never appears, reboot it
+   and check the `RSH` network shows up.
 3. Firewall: on first run Windows asks to allow RSH through the
    firewall — allow it. Settings shows the firewall rule state
    (rule name `RSH`, inbound, program-scoped). If you declined it,
    allow RSH manually in Windows Firewall.
-4. Pairing window: if you missed the 60 seconds, reboot the wheel for
-   a fresh window.
+4. Pairing window: if you missed the window, open a fresh one — hold
+   BOOT for 3 seconds on an unpaired board (firmware v4.0.2, 120 s
+   window), plug in USB, or reboot the wheel (60 s boot window).
+   See [Pairing](#pairing).
 
 ### "vJoy not found"
 

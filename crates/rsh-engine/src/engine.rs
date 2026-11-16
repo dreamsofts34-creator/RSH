@@ -60,7 +60,7 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::metrics::EngineMetrics;
 use crate::ping_client::PingTracker;
-use crate::pipeline::{OutputState, ProcessingPipeline};
+use crate::pipeline::{OutputState, PipelinePlan, ProcessingPipeline};
 use crate::sequence::{SeqDecision, SequenceTracker};
 use crate::watchdog::Watchdog;
 
@@ -423,6 +423,12 @@ pub struct WheelEngine<S: PacketSource> {
     stop_tx: watch::Sender<bool>,
     /// Receiver side of the stop `watch` channel.
     stop_rx: watch::Receiver<bool>,
+    /// Receiver for live pipeline plans (L4 pipeline push), [`None`]
+    /// when no plan sender is attached. A `watch` channel carries
+    /// only the latest plan, so a slider drag that sends ten plans
+    /// between ticks applies exactly the newest one — no queue, no
+    /// backlog, no stale plan.
+    plan_rx: Option<watch::Receiver<PipelinePlan>>,
 }
 
 impl<S: PacketSource + 'static> WheelEngine<S> {
@@ -461,7 +467,18 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
             ping_tx,
             stop_tx,
             stop_rx,
+            plan_rx: None,
         }
+    }
+
+    /// Attach a live-plan receiver (L4 pipeline push): the newest
+    /// plan on the channel is applied at the start of the next tick
+    /// via `set_plan_live` (no filter/ramp reset), so tuning sliders
+    /// take effect live without stepping the output.
+    #[must_use]
+    pub fn with_plan_receiver(mut self, rx: watch::Receiver<PipelinePlan>) -> Self {
+        self.plan_rx = Some(rx);
+        self
     }
 
     /// Add a factory for reconnects after the source drops (at most
@@ -558,6 +575,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
     /// a delayed tick drains several frames.
     async fn on_tick(&mut self) {
         let now = Instant::now();
+        self.drain_plan();
         self.drain_status();
         self.drain_ping_replies(now);
         self.maybe_send_ping(now);
@@ -581,6 +599,21 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
         if self.send_output(&out) && had_frame {
             self.metrics
                 .record_output_latency(duration_us(started.elapsed()));
+        }
+    }
+
+    /// Drain a pending live plan, if any (L4 pipeline push): the
+    /// `watch` channel holds only the latest plan, so this applies
+    /// exactly one swap per tick, before any frame is processed —
+    /// never mid-frame. A dropped sender is ignored (the last plan
+    /// stays active); a closed channel never stops the tick.
+    fn drain_plan(&mut self) {
+        let Some(rx) = self.plan_rx.as_mut() else {
+            return;
+        };
+        if rx.has_changed().unwrap_or(false) {
+            let plan = *rx.borrow_and_update();
+            self.pipeline.set_plan_live(plan);
         }
     }
 
@@ -1101,6 +1134,51 @@ mod tests {
         assert!(report.metrics.output_latency_p99().is_some());
         let states = recorded(&harness.states);
         assert!(states.iter().any(|s| s.steering > 0.9), "{states:?}");
+    }
+
+    #[tokio::test]
+    async fn plan_receiver_applies_latest_plan_before_next_tick() {
+        // L4 pipeline push: a plan sent on the watch channel takes
+        // effect on the next tick, before the frame is processed —
+        // and only the latest plan applies when several are sent
+        // between ticks.
+        use tokio::sync::watch;
+        let (tx, rx) = mpsc::channel(32);
+        let (sink, states) = RecordingSink::new(false);
+        let (plan_tx, plan_rx) = watch::channel(PipelinePlan::default());
+        let mut engine = WheelEngine::new(
+            ProcessingPipeline::new(PipelinePlan::default()),
+            ChannelSource::new(rx),
+            Box::new(sink),
+        )
+        .with_plan_receiver(plan_rx);
+        // Steering at 2550 mV maps to +0.5; the default deadzone
+        // (0.02) leaves ~0.49.
+        tx.send(frame(0, 0, 2550)).await.expect("source open");
+        engine.on_tick().await;
+        let first = recorded(&states).into_iter().last().expect("one output");
+        assert!(first.steering > 0.4, "default plan passes: {first:?}");
+        // Two rapid pushes: only the latest (deadzone 0.5) may apply.
+        let mut mid = PipelinePlan::default();
+        mid.steering.deadzone = 0.1;
+        plan_tx.send(mid).expect("plan channel open");
+        let mut latest = PipelinePlan::default();
+        latest.steering.deadzone = 0.5;
+        plan_tx.send(latest).expect("plan channel open");
+        tx.send(frame(1, 5_000, 2550)).await.expect("source open");
+        engine.on_tick().await;
+        // The new plan zeroes the raw value, but the smoothing filter
+        // decays from its previous state instead of jumping — drive
+        // a dozen more ticks at the same input so it settles near 0.
+        for (seq, ts) in (2..=13_u16).map(|s| (s, u32::from(s) * 5_000)) {
+            tx.send(frame(seq, ts, 2550)).await.expect("source open");
+            engine.on_tick().await;
+        }
+        let second = recorded(&states).into_iter().last().expect("outputs");
+        assert!(
+            second.steering.abs() < 0.05,
+            "latest plan (deadzone 0.5) swallows +0.5: {second:?}"
+        );
     }
 
     #[tokio::test]

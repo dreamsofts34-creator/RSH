@@ -1,7 +1,7 @@
 # RSH — Real Sim Hub
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version: v1.0.0](https://img.shields.io/badge/version-v1.0.0-6C4CF1.svg)](https://github.com/dreamsofts34-creator/RSH/releases)
+[![Version: v1.0.2](https://img.shields.io/badge/version-v1.0.2-6C4CF1.svg)](https://github.com/dreamsofts34-creator/RSH/releases)
 [![Platform: Windows 10 / 11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue.svg)](docs/USER-GUIDE.md)
 [![Firmware: v4.0.1](https://img.shields.io/badge/firmware-v4.0.1-green.svg)](docs/FIRMWARE-COMPAT.md)
 

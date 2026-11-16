@@ -386,6 +386,15 @@ fn utc_civil_parts(now: SystemTime) -> (i64, u32, u32, u32, u32, u32) {
     (year, month, day, hour, minute, second)
 }
 
+/// Current UTC time as an ISO-8601 `Z` timestamp
+/// (`2026-11-16T06:30:00Z`) — the timestamp on pairing/connection
+/// log lines (Phase 0 gate §6.2).
+#[must_use]
+pub fn utc_now_iso() -> String {
+    let (year, month, day, hour, minute, second) = utc_civil_parts(SystemTime::now());
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 /// Append one timestamped line to today's startup log
 /// (`log_dir/rsh-YYYYMMDD.log`):
 /// `[YYYY-MM-DD HH:MM:SS] <message>`.

@@ -90,6 +90,9 @@ static inline void rsh_scan_load(const rsh_scan_entry_t *entries, size_t n, int 
 // Degraded = RSSI <= -80 dBm (naapa ja sake to) YA aakhri scan se txFail
 // mein 20+ izafa. Channel tabdeel sirf tab jab naya score sakhti se
 // behtar ho AUR aakhri tabdeeli ko 5 min guzar gaye hon (flap rok).
+// F-07 (v4.0.2): rescan default OFF hai (RSH_AUTO_CHANNEL) aur sirf jab
+// koi PC active na ho — active stream ke beech AP band karna stream
+// drop + PC disassociate hai.
 #define RSH_RESCAN_MIN_INTERVAL_MS 60000u
 #define RSH_RESCAN_SWITCH_MIN_MS   300000u
 #define RSH_RESCAN_RSSI_BAD_DBM    (-80)
@@ -108,6 +111,12 @@ static inline uint8_t rsh_channel_switch_allowed(int new_score, int cur_score,
                                                  uint32_t ms_since_switch) {
   if (ms_since_switch < RSH_RESCAN_SWITCH_MIN_MS) return 0;
   return new_score < cur_score ? 1 : 0;
+}
+
+// F-07: rescan ki ijazat? Sirf jab auto-channel ON ho AUR koi PC active
+// na ho (Wi-Fi ya serial — koi bhi active peer rescan rokta hai).
+static inline uint8_t rsh_rescan_allowed(uint8_t auto_channel, uint8_t pc_active) {
+  return (auto_channel && !pc_active) ? 1 : 0;
 }
 
 // ---- HELO acceptance (SEC-D-08) ------------------------------------------
@@ -129,9 +138,29 @@ static inline uint8_t rsh_helo_accept(uint8_t have_pc, uint8_t pc_active, uint8_
 }
 
 // HELLO reply rate limit (SEC-D-08): 92 B reply vs 5 B request = 18x
-// amplification; flood par board reflector na bane — 500 ms mein ek reply.
+// amplification; flood par board reflector na bane — 250 ms mein ek reply
+// (F-04, v4.0.2: 500 ms se 250 ms — app 700-800 ms wait karti hai, is
+// liye reply drop ka chance kam; amplification cap phir bhi barqarar).
 static inline uint8_t rsh_hello_reply_allowed(uint32_t ms_since_last_reply) {
-  return ms_since_last_reply >= 500u ? 1 : 0;
+  return ms_since_last_reply >= 250u ? 1 : 0;
+}
+
+// ---- New-session rate limit (SEC-R2-04, F-05 v4.0.2) ----------------------
+// Purana rule: authenticated session active ho to naya session (HELO
+// sessionFlag=1 → nonce rotate) 10 s mein ek dafa — app restart/crash
+// recovery isi mein phans jati thi. Naya rule: WAHI PC (same IP / serial
+// point-to-point) jis ka purana session 2 s se zyada stale ho (HELLO
+// timeout ke baad — board ne use pehle hi inactive mana) dobara session
+// bana sakta hai; DOOSRA IP abhi bhi 10 s ka paband hai (nonce-rotate DoS
+// se bachao barqarar).
+static inline uint8_t rsh_new_session_allowed(uint8_t session_authenticated,
+                                              uint32_t ms_since_last_new_session,
+                                              uint8_t same_ip,
+                                              uint8_t old_session_stale) {
+  if (!session_authenticated) return 1;
+  if (ms_since_last_new_session >= 10000u) return 1;
+  if (same_ip && old_session_stale) return 1;
+  return 0;
 }
 
 // ---- Ping rate limiter (PROTOCOL §9.4, SEC-C-21) --------------------------

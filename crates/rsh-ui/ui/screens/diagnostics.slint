@@ -1,0 +1,216 @@
+// RSH v2.0 — Diagnostics drawer (REDESIGN-PLAN §8.3, old Monitor screen
+// as a tab no more). Right-side drawer, 420px wide, opened from
+// Overview "Connection quality" or Settings "Open diagnostics". Content
+// only — the shell places it at the right edge of the window, above the
+// page, and shows/hides it; it does NOT own the Window.
+//
+// Live data: the AppApi exposes no packet-stat or event-log methods
+// yet, so every value below is a Rust-owned prop (sim feed until the
+// daemon/telemetry push lands — the props are the integration seam).
+// Charts take Path command strings (same approach as the steering
+// curve in components.slint: Rust builds the polyline from the ring
+// buffer; defaults draw a flat sample line so the drawer renders
+// without Rust data). Close button + Esc (Esc via a FocusScope
+// key-pressed handler, `event.text == Key.Escape`; the shell must call
+// focus() on the drawer when opening it. `@keys(Escape)` on a callback
+// is NOT valid Slint 1.18.1 syntax — the compiler rejects it, verified
+// 2026-11-16.)
+
+import { Theme } from "../tokens.slint";
+import { Btn, HBar } from "../components.slint";
+import { ScrollView } from "std-widgets.slint";
+
+// Small live line chart: title + polyline + readout (viewBox 380x90).
+component LiveChart inherits VerticalLayout {
+    in property <string> title;
+    in property <string> chart-commands: "M 0 45 L 60 45 L 120 43 L 180 47 L 240 44 L 300 46 L 380 45";
+    in property <string> readout;
+    spacing: 6px;
+    HorizontalLayout {
+        Text { text: title; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+        Rectangle { horizontal-stretch: 1; }
+        Text { text: readout; font-family: Theme.font-mono; font-size: 12px; color: Theme.mute; }
+    }
+    Rectangle {
+        height: 90px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.line;
+        background: Theme.bg;
+        Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 380;
+            viewbox-height: 90;
+            commands: "M 0 45 L 380 45";
+            fill: transparent;
+            stroke: Theme.line;
+            stroke-width: 1px;
+        }
+        Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 380;
+            viewbox-height: 90;
+            commands: chart-commands;
+            fill: transparent;
+            stroke: Theme.accent;
+            stroke-width: 2px;
+        }
+    }
+    Text { text: "Last 10 s"; font-size: 11px; color: Theme.faint; }
+}
+
+// One packet stat: label + mono value.
+component StatCell inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> bad: false;
+    spacing: 1px;
+    Text { text: value; font-family: Theme.font-mono; font-size: 18px; font-weight: 600; color: bad ? Theme.bad : Theme.text; }
+    Text { text: label; font-size: 11.5px; color: Theme.mute; }
+}
+
+export component DiagnosticsDrawer inherits FocusScope {
+    // ---- live values (Rust-owned props; sim until telemetry lands)
+    in property <string> steer-chart: "M 0 45 L 60 45 L 120 43 L 180 47 L 240 44 L 300 46 L 380 45";
+    in property <string> steer-readout: "0°";
+    in property <string> pedals-chart: "M 0 70 L 60 68 L 120 60 L 180 55 L 240 62 L 300 70 L 380 70";
+    in property <string> pedals-readout: "Throttle 0%";
+    in property <string> delay-text: "4 ms";
+    in property <string> jitter-text: "1 ms";
+    in property <string> lost-text: "0%";
+    in property <string> loop-rate-text: "200 Hz";
+    in property <string> tx-failures-text: "0";
+    in property <string> seq-gaps-text: "0";
+    in property <bool> stats-bad: false;
+    in property <[string]> events;
+    in property <[bool]> buttons-pressed;
+    in property <string> knob-1-text: "Knob 1 · 0";
+    in property <string> knob-2-text: "Knob 2 · 0";
+    in property <float> throttle-pct: 0;
+    in property <float> brake-pct: 0;
+    in property <float> clutch-pct: 0;
+
+    callback closed();
+    // Esc: FocusScope key handler (the stock-widget pattern:
+    // `event.text == Key.Escape`). The shell must call focus() on the
+    // drawer when opening it — keyboard focus is what makes this fire.
+    // (`@keys(Escape)` on a callback is NOT valid Slint 1.18.1 syntax:
+    // the compiler rejects it — verified 2026-11-16.)
+
+    width: 420px;
+    key-pressed(event) => {
+        if (event.text == Key.Escape) {
+            closed();
+            return accept;
+        }
+        return reject;
+    }
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.side;
+        Rectangle { width: 1px; height: 100%; background: Theme.line; }
+        VerticalLayout {
+            spacing: 0px;
+            // header
+            HorizontalLayout {
+                padding-top: 14px;
+                padding-bottom: 12px;
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 10px;
+                Text { text: "Diagnostics"; font-size: 17px; font-weight: 600; color: Theme.text; }
+                Rectangle { horizontal-stretch: 1; }
+                Text { text: "Esc to close"; font-size: 11.5px; color: Theme.faint; vertical-alignment: center; }
+                Btn { label: "Close"; clicked => { closed(); } }
+            }
+            Rectangle { height: 1px; background: Theme.line; }
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    padding-top: 14px;
+                    padding-bottom: 14px;
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    spacing: 14px;
+                    // live charts (§8.3)
+                    LiveChart { title: "Steering"; chart-commands: steer-chart; readout: steer-readout; }
+                    LiveChart { title: "Pedals"; chart-commands: pedals-chart; readout: pedals-readout; }
+                    HBar { label: "Throttle"; pct: throttle-pct; bar-color: Theme.ok; }
+                    HBar { label: "Brake"; pct: brake-pct; bar-color: Theme.bad; }
+                    HBar { label: "Clutch"; pct: clutch-pct; bar-color: Theme.accent; }
+                    // packet stats (§8.3)
+                    Text { text: "Packet stats"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        StatCell { horizontal-stretch: 1; label: "Delay"; value: delay-text; bad: stats-bad; }
+                        StatCell { horizontal-stretch: 1; label: "Jitter (p99)"; value: jitter-text; bad: stats-bad; }
+                        StatCell { horizontal-stretch: 1; label: "Lost data"; value: lost-text; bad: stats-bad; }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        StatCell { horizontal-stretch: 1; label: "Loop rate"; value: loop-rate-text; }
+                        StatCell { horizontal-stretch: 1; label: "TX failures"; value: tx-failures-text; bad: tx-failures-text != "0"; }
+                        StatCell { horizontal-stretch: 1; label: "Sequence gaps"; value: seq-gaps-text; bad: seq-gaps-text != "0"; }
+                    }
+                    // event log (§8.3)
+                    Text { text: "Event log"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    Rectangle {
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.line;
+                        background: Theme.bg;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 4px;
+                            if events.length == 0 : Text { text: "No events yet."; font-size: 12px; color: Theme.faint; }
+                            for e in events : Text {
+                                text: e;
+                                font-family: Theme.font-mono;
+                                font-size: 11.5px;
+                                color: Theme.mute;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                    // button grid live state (§8.3)
+                    Text { text: "Buttons — live"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    VerticalLayout {
+                        spacing: 6px;
+                        for row in 3 : HorizontalLayout {
+                            spacing: 6px;
+                            for col in 4 : Rectangle {
+                                horizontal-stretch: 1;
+                                height: 32px;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: buttons-pressed.length > row * 4 + col && buttons-pressed[row * 4 + col] ? Theme.ok : Theme.line;
+                                background: buttons-pressed.length > row * 4 + col && buttons-pressed[row * 4 + col] ? Theme.ok-bg : Theme.panel2;
+                                Text {
+                                    width: 100%;
+                                    height: 100%;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    text: (row * 4 + col + 1) + "";
+                                    font-family: Theme.font-mono;
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                    color: buttons-pressed.length > row * 4 + col && buttons-pressed[row * 4 + col] ? Theme.ok : Theme.mute;
+                                }
+                            }
+                        }
+                    }
+                    // encoders live (§8.3)
+                    Text { text: "Encoders — live"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text { horizontal-stretch: 1; text: knob-1-text; font-family: Theme.font-mono; font-size: 12.5px; color: Theme.text; }
+                        Text { horizontal-stretch: 1; text: knob-2-text; font-family: Theme.font-mono; font-size: 12.5px; color: Theme.text; }
+                    }
+                }
+            }
+        }
+    }
+}

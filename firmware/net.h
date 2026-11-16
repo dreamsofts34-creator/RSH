@@ -41,3 +41,9 @@ int8_t net_rssi_dbm();               // PC link RSSI (dBm); -128 = unknown
 uint8_t net_channel();               // current SoftAP channel (0 = AP down)
 void net_set_stream_busy(bool busy); // ping drop-when-busy ke liye (stream loop peeche ho)
 uint32_t net_ping_dropped_count();   // §9.4: rate-limit/busy par drop hue pings
+// v4.0.2:
+// HORN_TEST (D-5) abhi active hai? (rsh.ino har sample par poochta hai.)
+uint8_t net_horn_test_active(uint32_t nowMs);
+// Persistent LED config (F-14) current blob se driver par lagao
+// (rsh.ino dirty-flag apply se bulata hai).
+void net_led_apply_persistent(const uint8_t *blob, size_t len);

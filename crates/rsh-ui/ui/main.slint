@@ -1,0 +1,442 @@
+// RSH v2.0 — Phase 3 main window (REDESIGN-PLAN §3-§5).
+// 920x580 window, 184px sidebar, 56px top bar. Fonts embedded at compile
+// time (Inter + JetBrains Mono, OFL). The tray icon/menu live in the
+// daemon (crates/rsh-daemon/ui/tray.slint) — this crate owns only the main
+// app window. Data comes from the Rust side through the rsh-api surface
+// (simulated until the daemon IPC is live — see src/sim_api.rs).
+import "../assets/Inter.ttf";
+import "../assets/JetBrainsMono.ttf";
+import { Theme } from "tokens.slint";
+import { SegmentedControl, ProfileButton, AutoProfileChip, Btn } from "components.slint";
+import { Sidebar, ExtrasPage, AboutPage } from "shell.slint";
+import { OverviewPage } from "screens/overview.slint";
+import { SteeringPage } from "screens/steering.slint";
+import { PedalsPage } from "screens/pedals.slint";
+import { ButtonsPage } from "screens/buttons.slint";
+// Compare-fix: the full Settings screen (screens/settings.slint)
+// replaces the shell placeholder — Reconnect, pairing-window text,
+// Duplicate/Use, Restore and per-item Check buttons only exist there.
+// SetupWizard likewise replaces the shell layout while setup runs.
+import { SettingsScreen } from "screens/settings.slint";
+import { SetupWizard } from "screens/setup.slint";
+import { BellButton, NotificationsDrawer, NotificationItem } from "notifications.slint";
+
+export component MainWindow inherits Window {
+    title: "RSH — Real Sim Hub";
+    icon: @image-url("../assets/tray.png");
+    preferred-width: Theme.window-width;
+    preferred-height: Theme.window-height;
+    // min-width MUST equal the design width (920px). Slint opens the window
+    // at the content's preferred size clamped to [min-width, preferred-width],
+    // so min-width 840px opened narrow pages at 840px (audit FIX-1: Extras/
+    // Settings windows measured 839px, right edge clipped). The window can
+    // still be enlarged; it just never opens (or shrinks) below the design.
+    min-width: 920px;
+    min-height: 540px;
+    background: Theme.bg;
+    default-font-family: Theme.font-text;
+    default-font-size: 13px;
+
+    in-out property <int> page: 0; // 0 Overview, 1 Steering, 2 Pedals, 3 Buttons, 4 Extras, 5 Settings, 6 About
+    in-out property <bool> send-to-game: true;
+    in-out property <bool> advanced: false;
+    in-out property <bool> unsaved: false;
+    in-out property <bool> auto-paused: false;
+    in-out property <int> transport: 0;   // 0 Wi-Fi, 1 USB
+    in-out property <int> controller: 0;  // 0 HIDMaestro, 1 vJoy
+    in-out property <int> theme: 0;       // 0 Dark, 1 Auto (Light removed, audit FIX-6)
+    in-out property <int> pressed-index: -1;
+    in-out property <int> selected-index: 0;
+    in property <string> profile-name: "GT3 Sprint";
+    in property <string> app-version: "2.0.0";
+    in property <bool> daemon-live: false;
+    in property <bool> connected: true;
+    in property <string> conn-label: "Connected";
+    in property <string> conn-sub: "Wi-Fi · 4 ms";
+    in property <angle> steer-angle;
+    in property <string> steer-text;
+    in property <float> throttle;
+    in property <float> brake;
+    in property <float> clutch;
+    in property <float> handbrake;
+    in property <string> gear: "N";
+    in property <float> input-pct;
+    in property <float> output-pct;
+    in property <float> marker-vx;
+    in property <float> marker-vy;
+    in property <string> dashed-line;
+    in property <string> crosshair;
+    in property <string> curve-commands;
+    in property <float> deadzone;
+    in property <string> deadzone-text;
+    in property <float> curve-val;
+    in property <string> curve-text;
+    in property <int> preset;
+    // Notification center (Phase 6): bell badge + drawer model.
+    in-out property <bool> notif-open: false;
+    in-out property <int> notif-unread: 0;
+    in-out property <[NotificationItem]> notifications;
+    // Setup wizard (compare-fix): shown instead of the shell layout
+    // while first-time setup runs; --page setup opens it (main.rs).
+    in-out property <bool> setup-mode: false;
+    in-out property <int> setup-step: 1;
+
+    callback toggled-send();
+    callback reconnect();
+    callback deadzone-changed(float);
+    callback curve-changed(float);
+    callback deadzone-edited(string);
+    callback curve-edited(string);
+    callback preset-selected(int);
+    callback reset-defaults();
+    callback set-centre();
+    callback save-profile();
+    callback profile-clicked();
+    callback launch-game(string);
+    callback pedal-action(string);
+    callback pedal-set-up(int);
+    callback pedal-set-down(int);
+    callback pedal-feel-selected(int, int);
+    callback pedal-deadzone-changed(int, float);
+    callback pedal-deadzone-edited(int, string);
+    callback pedal-bite-changed(float);
+    callback pedal-bite-edited(string);
+    callback knob-selected(int);
+    callback knob-row-selected(int);
+    callback learn-clicked();
+    callback edit-cancel();
+    callback edit-save();
+    callback extras-action(string);
+    callback settings-action(string);
+    callback tile-selected(int);
+    callback action-chip(string);
+    callback open-diagnostics();
+    callback auto-pause-toggled();
+    // FIX-4 keyboard: the root FocusScope below captures Return (Save),
+    // Up/Down (navigator) and Escape (close drawer/popover); Rust owns
+    // what each does (wire_keyboard in src/main.rs).
+    callback keyboard-save();
+    callback keyboard-nav(int);
+    callback keyboard-escape();
+    callback focus-keyboard();
+    callback bell-clicked();
+    callback notif-close();
+    callback notif-mark-all-read();
+    callback notif-clear();
+    // Setup wizard (compare-fix): Rust owns step advance/finish;
+    // begin-pairing etc. are stubs until the Pairing Manager lands.
+    callback setup-back();
+    callback setup-next();
+    callback setup-skip();
+    callback setup-begin-pairing();
+    callback setup-use-usb();
+    callback setup-retry-pairing();
+    callback setup-reset-pairing();
+    callback setup-connect(string);
+    callback setup-calibrate(string);
+    callback setup-find-games();
+
+    // FIX-4: root keyboard scope - ancestor of every control, so keys a
+    // focused control rejects (Up/Down/Return/Escape) bubble up here.
+    // Tab order itself is automatic: Tab/Shift+Tab move between the
+    // FocusScopes in the tree, in document order.
+    focus-keyboard => { kb.focus(); }
+    kb := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return) {
+                keyboard-save();
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                keyboard-escape();
+                return accept;
+            }
+            if (event.text == Key.UpArrow) {
+                keyboard-nav(-1);
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                keyboard-nav(1);
+                return accept;
+            }
+            return reject;
+        }
+        if !setup-mode : HorizontalLayout {
+            width: 100%;
+            height: 100%;
+        Sidebar {
+            page: page;
+            connected: connected;
+            conn-label: conn-label;
+            conn-sub: conn-sub;
+            send-to-game: send-to-game;
+            nav(p) => { page = p; }
+            toggled-send => { toggled-send(); }
+            open-about => { page = 6; }
+        }
+        VerticalLayout {
+            // The column must fill the window (920px) minus the 184px
+            // sidebar: min-width 736px. Without it the column takes the
+            // current page's preferred width (Slint 1.18.1: the root
+            // layout sizes to content, horizontal-stretch: 1 only shares
+            // space the layout already has) — measured before this fix:
+            // Pedals 712px, Buttons 684px, Extras 550px, Settings 522px,
+            // so the top-bar divider and Save ended short of the right
+            // edge on every narrow page. A "width: parent.width - 184px"
+            // binding was tried by Phase 3 and reverted (binding loop);
+            // a constant min-width has no cycle: the window itself is
+            // pinned to 920px by min-width = preferred-width, so the
+            // column can never ask for more than the window gives.
+            min-width: 736px;
+            horizontal-stretch: 1;
+            // top bar (56px). The inner row is 30px tall and offset by
+            // 13px so its contents are vertically centred in the bar:
+            // Slint layouts top-align fixed-height children, so an
+            // un-offset row would sit at the top edge (as in the spike).
+            Rectangle {
+                height: Theme.topbar-height;
+                HorizontalLayout {
+                    y: 13px;
+                    height: 30px;
+                    width: parent.width;
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    spacing: 12px;
+                    if page == 0 : Text { vertical-alignment: center; text: "Overview"; font-size: 17px; font-weight: 600; color: Theme.text; }
+                    if page == 1 : HorizontalLayout {
+                        spacing: 0px;
+                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: 17px; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: "/ Steering"; font-size: 17px; font-weight: 500; color: Theme.faint; }
+                    }
+                    if page == 2 : HorizontalLayout {
+                        spacing: 0px;
+                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: 17px; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: "/ Pedals"; font-size: 17px; font-weight: 500; color: Theme.faint; }
+                    }
+                    if page == 3 : HorizontalLayout {
+                        spacing: 0px;
+                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: 17px; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: "/ Buttons"; font-size: 17px; font-weight: 500; color: Theme.faint; }
+                    }
+                    if page == 4 : HorizontalLayout {
+                        spacing: 0px;
+                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: 17px; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: "/ Extras"; font-size: 17px; font-weight: 500; color: Theme.faint; }
+                    }
+                    if page == 5 : Text { vertical-alignment: center; text: "Settings"; font-size: 17px; font-weight: 600; color: Theme.text; }
+                    if page == 6 : Text { vertical-alignment: center; text: "About"; font-size: 17px; font-weight: 600; color: Theme.text; }
+                    Rectangle { horizontal-stretch: 1; }
+                    if page == 0 : AutoProfileChip {
+                        game-profile: "Assetto Corsa → GT3 Sprint";
+                        paused: auto-paused;
+                        pause-toggled => { auto-pause-toggled(); }
+                    }
+                    if page >= 1 && page <= 4 : HorizontalLayout {
+                        horizontal-stretch: 0;
+                        spacing: 8px;
+                        SegmentedControl {
+                            option-0: "Basic";
+                            option-1: "Advanced";
+                            selected: advanced ? 1 : 0;
+                            selected-changed(i) => { advanced = i == 1; }
+                        }
+                        ProfileButton {
+                            name: profile-name;
+                            unsaved: unsaved;
+                            clicked => { profile-clicked(); }
+                        }
+                        Btn { label: "Save"; primary: true; clicked => { save-profile(); } }
+                    }
+                    BellButton {
+                        unread: notif-unread;
+                        clicked => { bell-clicked(); }
+                    }
+                }
+                Rectangle { y: 55px; width: 100%; height: 1px; background: Theme.line; }
+            }
+            // body - pages are sized to their preferred width (explicit
+            // width / min-width on the page, and on the row, are ignored:
+            // cross-axis sizes are capped at the container). The shortfall
+            // (Pedals cards x=874, Buttons panel x=886, Settings x=683) is
+            // fixed per-page by explicit content widths (see the FIX notes
+            // in pedals/buttons/settings), so every page prefers the full
+            // 736px column here.
+            if page == 0 : OverviewPage {
+                steer-angle: steer-angle;
+                steer-text: steer-text;
+                throttle: throttle;
+                brake: brake;
+                clutch: clutch;
+                daemon-live: daemon-live;
+                connected: connected;
+                configure => { page = 1; }
+                launch-game(g) => { launch-game(g); }
+                open-diagnostics => { open-diagnostics(); }
+                reconnect => { reconnect(); }
+            }
+            if page == 1 : SteeringPage {
+                input-pct: input-pct;
+                output-pct: output-pct;
+                marker-vx: marker-vx;
+                marker-vy: marker-vy;
+                dashed-line: dashed-line;
+                crosshair: crosshair;
+                curve-commands: curve-commands;
+                deadzone: deadzone;
+                deadzone-text: deadzone-text;
+                curve-val: curve-val;
+                curve-text: curve-text;
+                preset: preset;
+                unsaved: unsaved;
+                deadzone-changed(v) => { deadzone-changed(v); }
+                curve-changed(v) => { curve-changed(v); }
+                deadzone-edited(t) => { deadzone-edited(t); }
+                curve-edited(t) => { curve-edited(t); }
+                preset-selected(i) => { preset-selected(i); }
+                reset-defaults => { reset-defaults(); }
+                set-centre => { set-centre(); }
+            }
+            if page == 2 : PedalsPage {
+                // Live values come from the window (Rust drives them);
+                // the rest are the preview defaults (PEDALS-BUTTONS-
+                // PORTING.md §3) until main.rs wires the profile data
+                // through — the page renders correctly either way.
+                throttle-pct: throttle;
+                throttle-up-mv: "410 mV";
+                throttle-down-mv: "2890 mV";
+                throttle-feel: 0;
+                throttle-deadzone: 0.2;
+                throttle-deadzone-text: "2%";
+                throttle-curve: "M 6 104 Q 40 90 104 6";
+                throttle-dashed: "M 6 104 L 104 6";
+                throttle-marker-x: 77;
+                throttle-marker-y: 40;
+                brake-pct: brake;
+                brake-up-mv: "380 mV";
+                brake-down-mv: "3010 mV";
+                brake-feel: 1;
+                brake-deadzone: 0.1;
+                brake-deadzone-text: "1%";
+                brake-curve: "M 6 104 Q 70 100 104 6";
+                brake-dashed: "M 6 104 L 104 6";
+                brake-marker-x: 6;
+                brake-marker-y: 104;
+                clutch-pct: clutch;
+                clutch-up-mv: "420 mV";
+                clutch-down-mv: "2760 mV";
+                clutch-feel: 0;
+                clutch-deadzone: 0.2;
+                clutch-deadzone-text: "2%";
+                clutch-bite: 0.4;
+                clutch-bite-text: "40%";
+                clutch-curve: "M 6 104 Q 55 55 104 6";
+                clutch-dashed: "";
+                clutch-marker-x: 21;
+                clutch-marker-y: 89;
+                set-up(i) => { pedal-set-up(i); }
+                set-down(i) => { pedal-set-down(i); }
+                feel-selected(p, f) => { pedal-feel-selected(p, f); }
+                deadzone-changed(p, v) => { pedal-deadzone-changed(p, v); }
+                deadzone-edited(p, t) => { pedal-deadzone-edited(p, t); }
+                bite-changed(v) => { pedal-bite-changed(v); }
+                bite-edited(t) => { pedal-bite-edited(t); }
+            }
+            if page == 3 : ButtonsPage {
+                button-actions: ["Shift up", "Shift down", "Horn", "Gear 1", "Gear 2", "Gear 3", "Gear 4", "Gear 5", "Gear 6", "Handbrake", "Not set", "Not set"];
+                pressed-index: pressed-index;
+                selected-index: selected-index;
+                selected-action: "Gear 3";
+                knob1-left: "Gear 1";
+                knob1-right: "Gear 2";
+                knob1-press: "Not set";
+                knob2-left: "Not set";
+                knob2-right: "Not set";
+                knob2-press: "Not set";
+                knob-flash-index: -1;
+                knob-flash-text: "";
+                knob-row-action: "Gear 1";
+                tile-selected(i) => { tile-selected(i); }
+                knob-selected(i) => { knob-selected(i); }
+                knob-row-selected(i) => { knob-row-selected(i); }
+                action-selected(a) => { action-chip(a); }
+                learn-clicked => { learn-clicked(); }
+                edit-cancel => { edit-cancel(); }
+                edit-save => { edit-save(); }
+            }
+            if page == 4 : ExtrasPage {
+                handbrake: handbrake;
+                gear: gear;
+                extras-action(a) => { extras-action(a); }
+            }
+            if page == 5 : SettingsScreen {
+                connected: connected;
+                connection-type: transport;
+                address: "rsh.local";
+                backend: controller;
+                // Main theme is 0 Dark / 1 Auto; the screen is
+                // 0 Dark / 1 Light / 2 Auto (Light/Auto disabled).
+                theme: theme == 1 ? 2 : 0;
+                profiles: [
+                    { name: "GT3 Sprint", games: "Assetto Corsa", active: true },
+                    { name: "Drift", games: "Assetto Corsa", active: false },
+                    { name: "Rally", games: "Dirt Rally 2.0", active: false },
+                ];
+                app-version: "RSH " + app-version;
+                firmware-text: "Version 4.0.2 · up to date";
+                app-update-text: "You have the latest version";
+                backup-text: "Last saved today, 09:12";
+                connection-selected(i) => { transport = i; }
+                address-changed(a) => { settings-action("address"); }
+                reconnect => { reconnect(); }
+                pair-requested => { settings-action("pair"); }
+                backend-selected(i) => { controller = i; }
+                toggled-start-windows(b) => { settings-action("autostart"); }
+                toggled-keep-tray(b) => { settings-action("tray"); }
+                theme-selected(i) => { theme = i == 2 ? 1 : 0; }
+                new-profile => { settings-action("new-profile"); }
+                use-profile(i) => { settings-action("use-profile"); }
+                duplicate-profile(i) => { settings-action("duplicate-profile"); }
+                check-firmware => { settings-action("check-firmware"); }
+                check-app-updates => { settings-action("update-check"); }
+                backup => { settings-action("backup"); }
+                restore => { settings-action("restore"); }
+                open-diagnostics => { open-diagnostics(); }
+            }
+            if page == 6 : AboutPage {
+                app-version: app-version;
+                back => { page = 5; }
+            }
+        }
+    }
+    // Setup wizard (compare-fix): full-window, replaces the shell
+    // layout while setup-mode is on. Step state lives on the window
+    // (setup-step) so Rust drives Back/Next; the wizard itself only
+    // reads it. The notifications drawer below still overlays it.
+    if setup-mode : SetupWizard {
+        step: setup-step;
+        back => { setup-back(); }
+        next => { setup-next(); }
+        skip => { setup-skip(); }
+        begin-pairing => { setup-begin-pairing(); }
+        use-usb => { setup-use-usb(); }
+        retry-pairing => { setup-retry-pairing(); }
+        reset-pairing => { setup-reset-pairing(); }
+        connect-action(a) => { setup-connect(a); }
+        calibrate-action(a) => { setup-calibrate(a); }
+        find-games => { setup-find-games(); }
+    }
+    // Notification drawer overlay (right edge, above the page).
+    // Esc is owned by the keyboard worker (clears `notif-open`).
+    if notif-open : NotificationsDrawer {
+        x: parent.width - 356px;
+        y: 64px;
+        items: notifications;
+        unread: notif-unread;
+        close-requested => { notif-close(); }
+        mark-all-read => { notif-mark-all-read(); }
+        clear-all => { notif-clear(); }
+    }
+    }
+}

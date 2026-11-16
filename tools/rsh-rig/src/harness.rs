@@ -1193,6 +1193,9 @@ pub fn run_contract(scenario: &Scenario) -> Metrics {
         "config-transaction" => self_check_config_transaction(),
         "control-channel" => self_check_control_channel(),
         "pin-map-push" => self_check_pin_map_push(),
+        "pairing-window-open" => self_check_pairing_window_open(),
+        "pairing-window-expired" => self_check_pairing_window_expired(),
+        "pairing-unreachable" => self_check_pairing_unreachable(),
         _ => (
             false,
             format!("no self-check defined for {id}", id = scenario.id),
@@ -1426,6 +1429,116 @@ fn self_check_pin_map_push() -> (bool, String) {
         n = errors.len()
     ));
     (true, notes.join("; "))
+}
+
+/// Pairing self-checks (Phase 2, Phase 0 §4.4 gap): the L1
+/// Connection Manager driven through the three pairing outcomes.
+/// Pure logic — no wheel, no UDP — so these run as contract
+/// scenarios (duration 0) in every rig mode.
+fn self_check_pairing_window_open() -> (bool, String) {
+    use rsh_api::{ConnEvent, ConnectionManager, ManagerAction};
+    let mut manager = ConnectionManager::new();
+    let now = Instant::now();
+    manager.on_event(ConnEvent::Connect, now);
+    let action = manager.on_event(
+        ConnEvent::HelloReceived {
+            unpaired: true,
+            window_open: true,
+        },
+        now,
+    );
+    if action != ManagerAction::StartAuthentication {
+        return (
+            false,
+            format!("window-open HELLO must start auth, got {action:?}"),
+        );
+    }
+    manager.on_event(ConnEvent::Authenticating, now);
+    manager.on_event(ConnEvent::CapsOk, now);
+    if !manager.state().is_active() {
+        return (
+            false,
+            format!(
+                "must be Active after GET_CAPS ok, got {:?}",
+                manager.state()
+            ),
+        );
+    }
+    if manager.state().label() != "Connected" {
+        return (false, "Active must label Connected".into());
+    }
+    (
+        true,
+        "window-open pairing: Idle -> LinkUp -> Hello -> Authenticating -> Active (Connected)"
+            .into(),
+    )
+}
+
+fn self_check_pairing_window_expired() -> (bool, String) {
+    use rsh_api::{ConnEvent, ConnectionError, ConnectionManager, ManagerAction};
+    let mut manager = ConnectionManager::new();
+    let now = Instant::now();
+    manager.on_event(ConnEvent::Connect, now);
+    let action = manager.on_event(
+        ConnEvent::HelloReceived {
+            unpaired: true,
+            window_open: false,
+        },
+        now,
+    );
+    if action != ManagerAction::NeedsPairing(ConnectionError::WindowClosed) {
+        return (
+            false,
+            format!("expired window must fail closed NeedsPairing(WindowClosed), got {action:?}"),
+        );
+    }
+    if manager.state().is_active() {
+        return (false, "expired window must never reach Active".into());
+    }
+    if !matches!(
+        manager.state(),
+        rsh_api::ConnectionState::Error {
+            retry_in_ms: None,
+            ..
+        }
+    ) {
+        return (
+            false,
+            format!(
+                "expired window must stop auto-retry (retry None), got {:?}",
+                manager.state()
+            ),
+        );
+    }
+    (
+        true,
+        "window-expired pairing: fails closed with typed reason WindowClosed, auto-retry stopped"
+            .into(),
+    )
+}
+
+fn self_check_pairing_unreachable() -> (bool, String) {
+    use rsh_api::{ConnEvent, ConnectionError, ConnectionManager};
+    let mut manager = ConnectionManager::new();
+    let now = Instant::now();
+    manager.on_event(ConnEvent::Connect, now);
+    for _ in 0..3 {
+        manager.on_event(ConnEvent::HelloTimeout, now);
+    }
+    match manager.state() {
+        rsh_api::ConnectionState::Error { reason, .. }
+            if *reason == ConnectionError::Unreachable => {}
+        other => {
+            return (
+                false,
+                format!("3 HELLO timeouts must end in Error(Unreachable), got {other:?}"),
+            );
+        }
+    }
+    if manager.state().is_active() {
+        return (false, "unreachable board must never reach Active".into());
+    }
+    (true, "unreachable board: fails closed with typed reason Unreachable (distinct from WindowClosed)".into())
 }
 
 #[cfg(test)]

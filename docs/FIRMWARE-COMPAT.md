@@ -79,6 +79,44 @@ parse hota hai); live v4.0.1 board HELLO/GET_CAPS mein `(4, 0, 1)` bhejta hai
 (Rust `caps.rs` round-trip test isi value par hai). Fixture ke bytes tabdeel
 nahi kiye gaye — parser dono ko theek parse karta hai.
 
+### 2.1 v4.0.2 (RSH v2.0) — additive changes, wire UNCHANGED
+
+- Firmware **v4.0.2** (`FIRMWARE_VERSION "4.0.2"`, single source
+  `firmware/version.h`; `RSH_CAPS_FW_*` wahi se aate hain — F-12). Protocol
+  **v2.1 frozen** — koi frame layout, opcode range, HMAC/CRC ya blob layout
+  tabdeeli nahi; golden vectors dobara run hue, koi vector tabdeel nahi
+  (`firmware/tests-host/verify_packet.py` 51 checks PASS).
+- Additive control opcodes: `GET_DIAG 0x0D`, `HORN_TEST 0x0E` (purane
+  opcodes 0x01–0x0C waisay hi). Purana app inhein kabhi nahi bhejta; purana
+  firmware (4.0.1) unknown cmd par `UNSUPPORTED` deta hai (`ctrl.h`).
+- Config blob: naya record type 13 `LED_CONFIG` (max 1, slot 0, flags 0,
+  pins 0xFF, pattern 0..4, brightness 0..100); shifter sensitivity
+  `params[4]` (0..100, default 50); handbrake AXIS slot-4 `flags` bit0 =
+  button mode (baaqi flag bits reject; button pin par PULLUP rule, axis
+  pin par ADC1 rule). Factory blob UNCHANGED (11 records, 188 B, koi
+  type-13 record nahi — strip default off).
+- HELLO mein pairing window ki jagah NAHI hai (F-16): byte 17 reserved
+  hai aur parser nonzero reject karta hai — app conservative countdown
+  istemal karti hai; asal `window_remaining_s` GET_DIAG se milta hai.
+
+| Rust app / daemon | C++ firmware | Protocol | Status |
+|---|---|---|---|
+| v2.0 daemon/app | **v4.0.2** | v2.1 | **SUPPORTED — full** (pair button, GET_DIAG, HORN_TEST, LED persistent, handbrake button mode, shifter sensitivity) |
+| v2.0 daemon/app | v4.0.1 | v2.1 | DEGRADED — pair-button screen "Use USB or reboot wheel" fallback; GET_DIAG/HORN_TEST UNSUPPORTED; LED persistent / handbrake button mode unavailable (app ko blob mein type 13 ya handbrake flag bit0 nahi bhejna chahiye) |
+| v1.0.x app | v4.0.2 | v2.1 | SUPPORTED — purana app naye firmware se kaam karta hai (naye opcodes kabhi nahi bhejta; HELLO/GET_CAPS fw bytes `(4, 0, 2)`) |
+
+- **F-13 single-PC model:** ek waqt mein sirf ek PC board se paired /
+  stream karta hai (HELO session rules + F-05 same-IP relax: wahi PC,
+  purana session >2 s stale ho to dobara session bana sakta hai; doosra IP
+  10 s ka paband hai). Doosra PC "Observer" mode mein sirf dekh sakta hai
+  — Observer mode abhi implement NAHI hua (baad ka feature); doosre PC ki
+  stream request live session par reject hoti hai (SEC-D-08).
+- **Rust-side dependency (Phase 5):** `crates/rsh-protocol/src/pin.rs`
+  unknown record types reject karta hai — type 13, handbrake flag bit,
+  aur shifter sensitivity ke liye Rust blob parser update chahiye, warna
+  app aise blob push/read nahi kar sakti. Firmware side GET_CFG raw bytes
+  deta hai (wire read-back kaam karta hai).
+
 ## 3. Version-bump rule (frozen contract ki hifazat)
 
 1. **Wire format mein koi bhi tabdeeli** (frame layout, opcode, error code,
@@ -99,7 +137,7 @@ nahi kiye gaye — parser dono ko theek parse karta hai.
 | C++ / Python | `firmware/tests-host/protocol_v2_vectors.py` (vendored, M9) | `VECTORS` (10) + `NEGATIVE` (6); `python3 -I protocol_v2_vectors.py` se regenerate hota hai |
 | C++ / Python | `firmware/tests-host/verify_packet.py` (vendored, M9) | 3-language cross-verify (stream/status/hello/control/probe + negatives) |
 | C++ / Python | `reference/tests-host/pin_rules_ref.py` | pin-rules reference validator + 62 PASS checks |
-| C++ | `firmware/tests-host/test_main.cpp` (vendored, M9; §1–§25b) | host tests, 4444 checks (incl. Phase 2 `FACTORY_RESET` block §25b) |
+| C++ | `firmware/tests-host/test_main.cpp` (vendored, M9; §1–§34) | host tests, 4705 checks (incl. Phase 2 `FACTORY_RESET` block §25b + v4.0.2 block §34, 261 checks) |
 
 ## 5. FW-A2 — Interop verification (baghair board) — evidence
 

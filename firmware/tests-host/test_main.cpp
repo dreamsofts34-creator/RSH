@@ -28,6 +28,12 @@
 #include "stream_emit.h"     // v2.1 stream emission (§1.1, Phase E WS5)
 #include "serial_transport.h" // wired USB-serial framing (§10, Phase G WS1)
 #include "as5600.h"          // Phase G WS4: AS5600 magnetic encoder (D34)
+#include "version.h"         // F-12 (v4.0.2): single version source
+#include "pairing_window.h"  // F-02/F-03: transport-independent pair window
+#include "diag_log.h"        // F-10: diagnostics ring log + GET_DIAG body
+#include "webota_auth.h"     // F-08: WebOTA per-IP auth lockout
+#include "horn_test.h"       // D-5: HORN_TEST synthetic pulse
+#include "sample_task.h"     // F-06: sampling-task mailbox
 
 static int failures = 0, checks = 0;
 #define CHECK(cond) do { checks++; if (!(cond)) { failures++; \
@@ -876,8 +882,8 @@ int main() {
     // RSH_CAPS_FW_* hi net.cpp HELLO reply ka bhi source hai (single source
     // of truth) — 4.0.0 hard-code dobara na aaye, is liye constants + string
     // dono yahan bandhe hain.
-    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 1);
-    CHECK(strcmp(FIRMWARE_VERSION, "4.0.1") == 0);
+    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 2);
+    CHECK(strcmp(FIRMWARE_VERSION, "4.0.2") == 0);
 
     // --- FW-11: default pin table mein naye modules ki rows ---
     RshCapsEntry table[20];
@@ -918,7 +924,7 @@ int main() {
       CHECK(blen == 18 + 8u * ntab);
       CHECK(body[0] == RSH_CTRL_OK);
       CHECK(memcmp(body + 1, mac, 6) == 0);
-      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 1);   // fw 4.0.1 (Round 2 W3 FIX-1)
+      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 2);   // fw 4.0.2 (Round 2 W3 FIX-1)
       CHECK(body[10] == 2 && body[11] == 1);                 // proto 2.1
       CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
       CHECK(body[15] == 6 && body[16] == 0 && body[17] == ntab);
@@ -1333,8 +1339,8 @@ int main() {
       CHECK(rsh_cfg_blob_validate(factory, 8, errs, &nerr) == RSH_CTRL_TOO_BIG);
       // Unknown module type (CRC dobara lagao taake sirf type fail ho)
       uint8_t rec[16];
-      rsh_cfg_record(rec, 13, 0, 0, 21, 0xFF, 0xFF, NULL);  // type 13 maujood nahi
-      // (Phase G WS4: type 12 ab AXIS_AS5600 hai — unknown type ab 13 se shuru)
+      rsh_cfg_record(rec, 14, 0, 0, 21, 0xFF, 0xFF, NULL);  // type 14 maujood nahi
+      // (v4.0.2: type 13 ab LED_CONFIG hai — unknown type ab 14 se shuru)
       uint8_t one[64];
       size_t olen = rsh_cfg_blob_build(one, rec, 1, 1);
       CHECK(olen == 28 && rsh_cfg_blob_validate(one, olen, errs, &nerr) == RSH_CTRL_UNSUPPORTED);
@@ -2042,7 +2048,7 @@ int main() {
     CHECK(rsh_caps_build_body(body, 100, mac, 6, 0, table, 15) == 0);
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 41) == 0);
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 15) == 138);
-    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 1);  // fw 4.0.1 (Round 2 W3 FIX-1)
+    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 2);  // fw 4.0.2 (Round 2 W3 FIX-1)
     CHECK(body[10] == 2 && body[11] == 1);  // proto 2.1
     CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
     CHECK(body[15] == 6 && body[17] == 15);
@@ -2284,10 +2290,10 @@ int main() {
       CHECK(rsh_helo_accept(1, 0, 0, 6000) == 1);     // idle + 6 s -> qabool
       CHECK(rsh_helo_accept(1, 0, 0, 4000) == 0);     // idle lekin 4 s -> flap
       CHECK(rsh_helo_accept(1, 0, 1, 0) == 1);        // wahi IP hamesha
-      // HELLO reply throttle: 500 ms.
+      // HELLO reply throttle: 250 ms (F-04, v4.0.2: 500 ms se 250 ms).
       CHECK(rsh_hello_reply_allowed(0) == 0);
-      CHECK(rsh_hello_reply_allowed(499) == 0);
-      CHECK(rsh_hello_reply_allowed(500) == 1);
+      CHECK(rsh_hello_reply_allowed(249) == 0);
+      CHECK(rsh_hello_reply_allowed(250) == 1);
       // Ping limiter (§9.4): burst 5, phir drop; refill 10/s; alag IP
       // alag bucket; 64 sources ke baad LRU evict.
       rsh_ping_limiter_t lim;
@@ -4368,6 +4374,517 @@ int main() {
     CHECK(dec.bad_length == 1);
     CHECK(rsh_serial_decoder_feed_buf(&dec, frame, flen) == 1);
     CHECK(dec.frames_ok == 1);
+  }
+
+  // ============ §34: firmware v4.0.2 (F-01..F-16) ============
+  // Net.cpp / rsh.ino wiring (AP lock after GET_CAPS, serial HELO window,
+  // LED PairWindow state, horn OR) host par nahi chalti — wo pio build +
+  // real-board HIL se cover hoti hai (gate doc). Yahan pure logic hai.
+  {
+    // --- F-02: pair-button thresholds (safemode.h, 3/5/10 s) ---
+    rsh_boothold_t h;
+    // 2 s hold + release -> kuch nahi.
+    rsh_boothold_init(&h);
+    CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 1, 2000) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 0, 2001) == RSH_HOLD_NONE);
+    // 2.999 s hold + release -> abhi bhi kuch nahi (3 s poora nahi).
+    rsh_boothold_init(&h);
+    CHECK(rsh_boothold_update(&h, 1, 1000) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 1, 3999) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 0, 4000) == RSH_HOLD_NONE);
+    // 3 s hold + 3.5 s par release -> PAIR_WINDOW (ek dafa).
+    rsh_boothold_init(&h);
+    CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 1, 3000) == RSH_HOLD_NONE);  // arm, koi event nahi
+    CHECK(rsh_boothold_update(&h, 1, 3500) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 0, 3501) == RSH_HOLD_PAIR_WINDOW);
+    CHECK(rsh_boothold_update(&h, 0, 3600) == RSH_HOLD_NONE);  // dobara release: kuch nahi
+    // 4.999 s hold + release -> PAIR_WINDOW (5 s se pehle chhora).
+    rsh_boothold_init(&h);
+    CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 1, 4999) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 0, 4999) == RSH_HOLD_PAIR_WINDOW);
+    // 5 s hold -> SAFE_MODE, release par pair CANCEL (kuch nahi).
+    rsh_boothold_init(&h);
+    CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 1, 5000) == RSH_HOLD_SAFE_MODE);
+    CHECK(rsh_boothold_update(&h, 1, 6000) == RSH_HOLD_NONE);  // ek dafa hi fire
+    CHECK(rsh_boothold_update(&h, 0, 6001) == RSH_HOLD_NONE);
+    // 10 s hold -> KEY_RESET_ARMED, release par kuch nahi.
+    rsh_boothold_init(&h);
+    CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 1, 5000) == RSH_HOLD_SAFE_MODE);
+    CHECK(rsh_boothold_update(&h, 1, 10000) == RSH_HOLD_KEY_RESET_ARMED);
+    CHECK(rsh_boothold_update(&h, 1, 11000) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 0, 11001) == RSH_HOLD_NONE);
+    // Dobara press: pehla pair ke baad detector phir 0 se shuru.
+    rsh_boothold_init(&h);
+    CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 1, 3500) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 0, 3501) == RSH_HOLD_PAIR_WINDOW);
+    CHECK(rsh_boothold_update(&h, 1, 5000) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 1, 7000) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 0, 7001) == RSH_HOLD_NONE);  // sirf 2 s hold
+    // Wrap-around: 0xFFFFFF00 se shuru, 3 s hold + release -> PAIR_WINDOW.
+    rsh_boothold_init(&h);
+    CHECK(rsh_boothold_update(&h, 1, 0xFFFFFF00u) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 1, 0xFFFFFF00u + 3000) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 0, 0xFFFFFF00u + 3500) == RSH_HOLD_PAIR_WINDOW);
+
+    // --- F-02/F-03: pairing window (pairing_window.h) ---
+    RshPairWindow w;
+    rsh_pair_window_init(&w);
+    CHECK(rsh_pair_window_is_open(&w, 0, 1) == 0);
+    CHECK(rsh_pair_window_remaining_s(&w, 0, 1) == 0);
+    // Boot window 60 s: 59999 ms par khuli (59 s baqi), 60000 par band.
+    rsh_pair_window_open(&w, 1000, RSH_PAIR_WINDOW_BOOT_MS, 1);
+    CHECK(rsh_pair_window_is_open(&w, 1000 + 59999, 1) == 1);
+    CHECK(rsh_pair_window_remaining_s(&w, 1000 + 1000, 1) == 59);
+    CHECK(rsh_pair_window_is_open(&w, 1000 + 60000, 1) == 0);
+    CHECK(rsh_pair_window_remaining_s(&w, 1000 + 60000, 1) == 0);
+    // Button window 120 s: 119999 ms par khuli, 120000 par band.
+    rsh_pair_window_open(&w, 70000, RSH_PAIR_WINDOW_BUTTON_MS, 1);
+    CHECK(rsh_pair_window_is_open(&w, 70000 + 119999, 1) == 1);
+    CHECK(rsh_pair_window_remaining_s(&w, 70000 + 1000, 1) == 119);
+    CHECK(rsh_pair_window_is_open(&w, 70000 + 120000, 1) == 0);
+    // Refresh (serial HELO): dobara kholne se deadline aage barhti hai.
+    rsh_pair_window_open(&w, 200000, RSH_PAIR_WINDOW_BUTTON_MS, 1);
+    rsh_pair_window_open(&w, 250000, RSH_PAIR_WINDOW_BUTTON_MS, 1);
+    CHECK(rsh_pair_window_is_open(&w, 200000 + 120000, 1) == 1);  // purani deadline guzar gayi
+    CHECK(rsh_pair_window_is_open(&w, 250000 + 120000, 1) == 0);
+    // Paired board: open no-op, kabhi khuli nahi.
+    rsh_pair_window_init(&w);
+    rsh_pair_window_open(&w, 0, RSH_PAIR_WINDOW_BUTTON_MS, 0);
+    CHECK(rsh_pair_window_is_open(&w, 1000, 0) == 0);
+    CHECK(rsh_pair_window_remaining_s(&w, 1000, 0) == 0);
+    // Wrap-around: 0xFFFFFF00 + 120 s window, deadline ke paar bhi khuli.
+    rsh_pair_window_init(&w);
+    rsh_pair_window_open(&w, 0xFFFFFF00u, RSH_PAIR_WINDOW_BUTTON_MS, 1);
+    CHECK(rsh_pair_window_is_open(&w, 0xFFFFFF00u + 60000, 1) == 1);
+    CHECK(rsh_pair_window_is_open(&w, 0xFFFFFF00u + 120000, 1) == 0);
+
+    // --- F-04/F-05/F-07: rate limits + rescan gate (net_logic.h) ---
+    CHECK(rsh_hello_reply_allowed(0) == 0);
+    CHECK(rsh_hello_reply_allowed(249) == 0);
+    CHECK(rsh_hello_reply_allowed(250) == 1);   // 500 ms -> 250 ms (F-04)
+    CHECK(rsh_hello_reply_allowed(10000) == 1);
+    // New session: unauthenticated hamesha OK; authenticated + 10 s OK.
+    CHECK(rsh_new_session_allowed(0, 0, 0, 0) == 1);
+    CHECK(rsh_new_session_allowed(1, 10000, 0, 0) == 1);
+    CHECK(rsh_new_session_allowed(1, 10001, 0, 0) == 1);
+    // Same IP + stale (>2 s) -> OK; same IP + live -> reject.
+    CHECK(rsh_new_session_allowed(1, 5000, 1, 1) == 1);
+    CHECK(rsh_new_session_allowed(1, 5000, 1, 0) == 0);
+    // Different IP -> 10 s paband, stale bhi nahi bacha sakta.
+    CHECK(rsh_new_session_allowed(1, 5000, 0, 1) == 0);
+    CHECK(rsh_new_session_allowed(1, 5000, 0, 0) == 0);
+    CHECK(rsh_new_session_allowed(1, 9999, 1, 1) == 1);
+    // Rescan: sirf auto-channel ON + koi PC active nahi.
+    CHECK(rsh_rescan_allowed(0, 0) == 0);
+    CHECK(rsh_rescan_allowed(0, 1) == 0);
+    CHECK(rsh_rescan_allowed(1, 1) == 0);
+    CHECK(rsh_rescan_allowed(1, 0) == 1);
+
+    // --- F-08: WebOTA per-IP lockout (webota_auth.h) ---
+    RshWebotaAuth auth;
+    rsh_webota_auth_init(&auth);
+    uint32_t ipA = 0xC0A80402u;  // 192.168.4.2
+    uint32_t ipB = 0xC0A80403u;  // 192.168.4.3
+    CHECK(rsh_webota_auth_allowed(&auth, ipA, 0) == 1);
+    for (int i = 0; i < 4; i++) rsh_webota_auth_note(&auth, ipA, 1000, 0);
+    CHECK(rsh_webota_auth_allowed(&auth, ipA, 1000) == 1);  // 4 fails: abhi khula
+    rsh_webota_auth_note(&auth, ipA, 1000, 0);              // 5th fail -> lock
+    CHECK(rsh_webota_auth_allowed(&auth, ipA, 1000) == 0);
+    CHECK(rsh_webota_auth_allowed(&auth, ipB, 1000) == 1);  // doosra IP mutasir nahi
+    CHECK(rsh_webota_auth_allowed(&auth, ipA, 1000 + 59999) == 0);  // 60 s se pehle
+    CHECK(rsh_webota_auth_allowed(&auth, ipA, 1000 + 60000) == 1);  // lock khatam
+    CHECK(rsh_webota_auth_allowed(&auth, ipA, 1000 + 60001) == 1);  // fails reset
+    // Kamyab login fails reset karta hai: 4 fails, phir OK, phir 4 fails -> khula.
+    rsh_webota_auth_init(&auth);
+    for (int i = 0; i < 4; i++) rsh_webota_auth_note(&auth, ipA, 2000, 0);
+    rsh_webota_auth_note(&auth, ipA, 2000, 1);
+    for (int i = 0; i < 4; i++) rsh_webota_auth_note(&auth, ipA, 2000, 0);
+    CHECK(rsh_webota_auth_allowed(&auth, ipA, 2000) == 1);
+    rsh_webota_auth_note(&auth, ipA, 2000, 0);
+    CHECK(rsh_webota_auth_allowed(&auth, ipA, 2000) == 0);
+    // LRU eviction: 4 IPs bharo, 5th IP sab se purana (ipA) nikalta hai.
+    rsh_webota_auth_init(&auth);
+    rsh_webota_auth_note(&auth, ipA, 1000, 0);
+    rsh_webota_auth_note(&auth, ipB, 2000, 0);
+    rsh_webota_auth_note(&auth, 0xC0A80404u, 3000, 0);
+    rsh_webota_auth_note(&auth, 0xC0A80405u, 4000, 0);
+    rsh_webota_auth_note(&auth, 0xC0A80406u, 5000, 0);  // 5th IP -> ipA evict
+    CHECK(rsh_webota_auth_allowed(&auth, 0xC0A80406u, 5000) == 1);
+    CHECK(rsh_webota_auth_allowed(&auth, ipB, 5000) == 1);  // baaqi IPs barqarar
+
+    // --- F-14: persistent LED config record (type 13) ---
+    uint8_t recs[3 * 16];
+    uint8_t blob[256];
+    uint8_t ledp[10] = {1, 10, 20, 30, 50, 0, 0, 0, 0, 0};  // SOLID, rgb 10/20/30, 50%
+    rsh_cfg_record(recs, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 34, 0xFF, 0xFF, NULL);
+    rsh_cfg_record(recs + 16, RSH_CFG_TYPE_LED_CONFIG, 0, 0, 0xFF, 0xFF, 0xFF, ledp);
+    size_t llen = rsh_cfg_blob_build(blob, recs, 2, 1);
+    CHECK(rsh_cfg_blob_validate(blob, llen, NULL, NULL) == RSH_CTRL_OK);
+    RshLedConfig lc;
+    CHECK(rsh_cfg_led_config(blob, llen, &lc) == 1);
+    CHECK(lc.pattern_id == 1 && lc.r == 10 && lc.g == 20 && lc.b == 30);
+    CHECK(lc.brightness == 50);
+    // Factory blob (11 records, 188 B) mein LED_CONFIG nahi -> strip off.
+    uint8_t fblob[256];
+    size_t flen2 = rsh_cfg_factory_blob(fblob);
+    CHECK(flen2 == 188);
+    CHECK(rsh_cfg_led_config(fblob, flen2, &lc) == 0);
+    // Negative: pattern 5, brightness 101, duplicate, pins set -> reject.
+    uint8_t badp[10] = {5, 10, 20, 30, 50, 0, 0, 0, 0, 0};
+    rsh_cfg_record(recs + 16, RSH_CFG_TYPE_LED_CONFIG, 0, 0, 0xFF, 0xFF, 0xFF, badp);
+    llen = rsh_cfg_blob_build(blob, recs, 2, 1);
+    CHECK(rsh_cfg_blob_validate(blob, llen, NULL, NULL) != RSH_CTRL_OK);
+    uint8_t badb[10] = {1, 10, 20, 30, 101, 0, 0, 0, 0, 0};
+    rsh_cfg_record(recs + 16, RSH_CFG_TYPE_LED_CONFIG, 0, 0, 0xFF, 0xFF, 0xFF, badb);
+    llen = rsh_cfg_blob_build(blob, recs, 2, 1);
+    CHECK(rsh_cfg_blob_validate(blob, llen, NULL, NULL) != RSH_CTRL_OK);
+    rsh_cfg_record(recs + 16, RSH_CFG_TYPE_LED_CONFIG, 0, 0, 21, 0xFF, 0xFF, ledp);
+    llen = rsh_cfg_blob_build(blob, recs, 2, 1);
+    CHECK(rsh_cfg_blob_validate(blob, llen, NULL, NULL) != RSH_CTRL_OK);
+    rsh_cfg_record(recs + 16, RSH_CFG_TYPE_LED_CONFIG, 1, 0, 0xFF, 0xFF, 0xFF, ledp);
+    llen = rsh_cfg_blob_build(blob, recs, 2, 1);
+    CHECK(rsh_cfg_blob_validate(blob, llen, NULL, NULL) != RSH_CTRL_OK);  // slot != 0
+    rsh_cfg_record(recs + 16, RSH_CFG_TYPE_LED_CONFIG, 0, 0, 0xFF, 0xFF, 0xFF, ledp);
+    rsh_cfg_record(recs + 32, RSH_CFG_TYPE_LED_CONFIG, 0, 0, 0xFF, 0xFF, 0xFF, ledp);
+    llen = rsh_cfg_blob_build(blob, recs, 3, 1);
+    CHECK(rsh_cfg_blob_validate(blob, llen, NULL, NULL) != RSH_CTRL_OK);  // duplicate
+    // Type 14 (range se bahar) -> reject (validator type range 1..13).
+    rsh_cfg_record(recs + 16, 14, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
+    llen = rsh_cfg_blob_build(blob, recs, 2, 1);
+    CHECK(rsh_cfg_blob_validate(blob, llen, NULL, NULL) != RSH_CTRL_OK);
+
+    // --- F-15: handbrake button mode + GET_CAPS kind ---
+    uint8_t hbrec[2 * 16];
+    uint8_t hbblob[256];
+    rsh_cfg_record(hbrec, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 34, 0xFF, 0xFF, NULL);
+    // Button mode, pin 25 (pullup-capable): flags bit0, pinA 25.
+    rsh_cfg_record(hbrec + 16, RSH_CFG_TYPE_AXIS_ADC, 4, 0x01, 25, 0xFF, 0xFF, NULL);
+    size_t hblen = rsh_cfg_blob_build(hbblob, hbrec, 2, 1);
+    CHECK(rsh_cfg_blob_validate(hbblob, hblen, NULL, NULL) == RSH_CTRL_OK);
+    uint8_t hbpin = 0xFF;
+    CHECK(rsh_cfg_handbrake_button_mode(hbblob, hblen, &hbpin) == 1);
+    CHECK(hbpin == 25);
+    RshPinMap pmap;
+    CHECK(rsh_pinmap_from_blob(hbblob, hblen, &pmap) == 1);
+    CHECK(pmap.handbrake == 25 && pmap.handbrakeButtonMode == 1);
+    RshCapsEntry captab[20];
+    uint8_t ncap = rsh_caps_table_from_pinmap(&pmap, captab, 20);
+    CHECK(ncap > 0);
+    int hbrow = -1;
+    for (int i = 0; i < ncap; i++)
+      if (captab[i].module == RSH_MOD_HANDBRAKE) hbrow = i;
+    CHECK(hbrow >= 0);
+    CHECK(captab[hbrow].kind == RSH_KIND_DIGITAL_IN);
+    CHECK(captab[hbrow].pin == 25);
+    CHECK((captab[hbrow].caps & RSH_CAP_PULLUP) != 0);
+    CHECK((captab[hbrow].caps & RSH_CAP_ADC) == 0);  // pin 25 ADC1 nahi
+    // Axis mode (flags 0, pin 32): kind ADC, mode 0.
+    rsh_cfg_record(hbrec + 16, RSH_CFG_TYPE_AXIS_ADC, 4, 0x00, 32, 0xFF, 0xFF, NULL);
+    hblen = rsh_cfg_blob_build(hbblob, hbrec, 2, 1);
+    CHECK(rsh_cfg_blob_validate(hbblob, hblen, NULL, NULL) == RSH_CTRL_OK);
+    CHECK(rsh_cfg_handbrake_button_mode(hbblob, hblen, &hbpin) == 0);
+    CHECK(rsh_pinmap_from_blob(hbblob, hblen, &pmap) == 1);
+    CHECK(pmap.handbrake == 32 && pmap.handbrakeButtonMode == 0);
+    ncap = rsh_caps_table_from_pinmap(&pmap, captab, 20);
+    hbrow = -1;
+    for (int i = 0; i < ncap; i++)
+      if (captab[i].module == RSH_MOD_HANDBRAKE) hbrow = i;
+    CHECK(hbrow >= 0 && captab[hbrow].kind == RSH_KIND_ADC_NATIVE);
+    // Negative: flags ke baaqi bits (0x03) -> reject; button pin 34
+    // (input-only, pullup nahi) -> reject; factory blob -> axis mode.
+    rsh_cfg_record(hbrec + 16, RSH_CFG_TYPE_AXIS_ADC, 4, 0x03, 25, 0xFF, 0xFF, NULL);
+    hblen = rsh_cfg_blob_build(hbblob, hbrec, 2, 1);
+    CHECK(rsh_cfg_blob_validate(hbblob, hblen, NULL, NULL) != RSH_CTRL_OK);
+    rsh_cfg_record(hbrec + 16, RSH_CFG_TYPE_AXIS_ADC, 4, 0x01, 34, 0xFF, 0xFF, NULL);
+    hblen = rsh_cfg_blob_build(hbblob, hbrec, 2, 1);
+    CHECK(rsh_cfg_blob_validate(hbblob, hblen, NULL, NULL) != RSH_CTRL_OK);
+    CHECK(rsh_cfg_handbrake_button_mode(fblob, flen2, &hbpin) == 0);
+
+    // --- D-4: shifter sensitivity (params[4]) + debounce mapping ---
+    uint8_t shrec[16];
+    uint8_t shblob[256];
+    uint8_t sparams[10] = {0, 0xFF, 0xFF, 0xFF, 75, 0, 0, 0, 0, 0};  // seq, sens 75
+    rsh_cfg_record(shrec, RSH_CFG_TYPE_SHIFTER, 0, 0, 0xFF, 0xFF, 0xFF, sparams);
+    size_t shlen = rsh_cfg_blob_build(shblob, shrec, 1, 1);
+    CHECK(rsh_cfg_blob_validate(shblob, shlen, NULL, NULL) == RSH_CTRL_OK);
+    CHECK(rsh_cfg_shifter_sensitivity(shblob, shlen) == 75);
+    // No shifter record -> default 50; invalid blob -> default 50.
+    CHECK(rsh_cfg_shifter_sensitivity(fblob, flen2) == 50);
+    CHECK(rsh_cfg_shifter_sensitivity(NULL, 0) == 50);
+    // Sensitivity > 100 -> reject.
+    sparams[4] = 101;
+    rsh_cfg_record(shrec, RSH_CFG_TYPE_SHIFTER, 0, 0, 0xFF, 0xFF, 0xFF, sparams);
+    shlen = rsh_cfg_blob_build(shblob, shrec, 1, 1);
+    CHECK(rsh_cfg_blob_validate(shblob, shlen, NULL, NULL) != RSH_CTRL_OK);
+    // Debounce mapping (formula: 20 - sens*15/100): 0->20, 50->13, 100->5.
+    CHECK(rsh_shifter_debounce_ms(0) == 20);
+    CHECK(rsh_shifter_debounce_ms(25) == 17);
+    CHECK(rsh_shifter_debounce_ms(50) == 13);
+    CHECK(rsh_shifter_debounce_ms(75) == 9);
+    CHECK(rsh_shifter_debounce_ms(100) == 5);
+    CHECK(rsh_shifter_debounce_ms(200) == 5);  // clamp 100 par
+
+    // --- F-06: config dirty flag (txn mutation points) ---
+    {
+      rsh_cfg_txn_t t;
+      rsh_cfg_txn_init(&t);
+      CHECK(t.cfg_dirty == 0);
+      CHECK(rsh_cfg_txn_load_current(&t, fblob, flen2) == RSH_CTRL_OK);
+      CHECK(t.cfg_dirty == 1);  // boot/factory load apply mangta hai
+      t.cfg_dirty = 0;          // loop ne apply kar liya
+      // Nayi config stage + commit -> dirty 1.
+      uint8_t newblob[256];
+      size_t nlen2 = rsh_cfg_factory_blob(newblob);
+      rsh_put_u16(newblob + 6, 2);
+      rsh_put_u32(newblob + nlen2 - 4, rsh_crc32(newblob, nlen2 - 4));
+      uint16_t sb = 0, tot = 0;
+      CHECK(rsh_cfg_stage_chunk(&t, 0, (uint16_t)nlen2, (uint16_t)nlen2,
+                                rsh_crc16_ccitt(newblob, (uint16_t)nlen2),
+                                newblob, &sb, &tot) == RSH_CTRL_OK);
+      CHECK(t.state == RSH_TXN_STAGED && t.cfg_dirty == 0);  // stage se dirty nahi
+      CHECK(rsh_cfg_commit(&t, 1000, NULL, NULL) == RSH_CTRL_OK);
+      CHECK(t.cfg_dirty == 1 && t.state == RSH_TXN_COMMITTED);
+      // Waqt par confirm -> dirty NAHI lagta (current bytes wahi).
+      t.cfg_dirty = 0;
+      CHECK(rsh_cfg_confirm(&t, 2000) == RSH_CTRL_OK);
+      CHECK(t.cfg_dirty == 0 && t.state == RSH_TXN_IDLE);
+      // Teesri config (v3): is ke baad har rollback current ko v2 par
+      // wapas lata hai (pehla confirm v2 ko permanent kar chuka hai).
+      uint8_t blob3[256];
+      size_t len3 = rsh_cfg_factory_blob(blob3);
+      rsh_put_u16(blob3 + 6, 3);
+      rsh_put_u32(blob3 + len3 - 4, rsh_crc32(blob3, len3 - 4));
+      CHECK(memcmp(t.current, newblob, nlen2) == 0);  // current ab v2 hai
+      // Dobara commit, phir REVERT -> dirty 1, current wapas v2.
+      CHECK(rsh_cfg_stage_chunk(&t, 0, (uint16_t)len3, (uint16_t)len3,
+                                rsh_crc16_ccitt(blob3, (uint16_t)len3),
+                                blob3, &sb, &tot) == RSH_CTRL_OK);
+      CHECK(rsh_cfg_commit(&t, 5000, NULL, NULL) == RSH_CTRL_OK);
+      CHECK(memcmp(t.current, blob3, len3) == 0);  // commit ke baad v3 live
+      t.cfg_dirty = 0;
+      CHECK(rsh_cfg_revert(&t) == RSH_CTRL_OK);
+      CHECK(t.cfg_dirty == 1 && t.current_len == nlen2);
+      CHECK(memcmp(t.current, newblob, nlen2) == 0);
+      // Commit, phir tick deadline ke baad -> rollback + dirty 1.
+      CHECK(rsh_cfg_stage_chunk(&t, 0, (uint16_t)len3, (uint16_t)len3,
+                                rsh_crc16_ccitt(blob3, (uint16_t)len3),
+                                blob3, &sb, &tot) == RSH_CTRL_OK);
+      CHECK(rsh_cfg_commit(&t, 10000, NULL, NULL) == RSH_CTRL_OK);
+      t.cfg_dirty = 0;
+      CHECK(rsh_cfg_tick(&t, 10000 + 29999) == 0);   // deadline se 1 ms pehle: nahi
+      CHECK(t.cfg_dirty == 0);
+      CHECK(rsh_cfg_tick(&t, 10000 + 30000) == 1);   // deadline par hi rollback
+      CHECK(t.cfg_dirty == 1 && t.current_len == nlen2);
+      CHECK(memcmp(t.current, newblob, nlen2) == 0);
+      // Late confirm (tick kiye baghair) -> rollback + UNSUPPORTED + dirty 1.
+      CHECK(rsh_cfg_stage_chunk(&t, 0, (uint16_t)len3, (uint16_t)len3,
+                                rsh_crc16_ccitt(blob3, (uint16_t)len3),
+                                blob3, &sb, &tot) == RSH_CTRL_OK);
+      CHECK(rsh_cfg_commit(&t, 50000, NULL, NULL) == RSH_CTRL_OK);
+      t.cfg_dirty = 0;
+      CHECK(rsh_cfg_confirm(&t, 50000 + 30001) == RSH_CTRL_UNSUPPORTED);
+      CHECK(t.cfg_dirty == 1 && t.current_len == nlen2);
+      CHECK(memcmp(t.current, newblob, nlen2) == 0);
+      // Boot recover: pending + previous -> rollback + dirty 1.
+      CHECK(rsh_cfg_stage_chunk(&t, 0, (uint16_t)len3, (uint16_t)len3,
+                                rsh_crc16_ccitt(blob3, (uint16_t)len3),
+                                blob3, &sb, &tot) == RSH_CTRL_OK);
+      CHECK(rsh_cfg_commit(&t, 90000, NULL, NULL) == RSH_CTRL_OK);
+      t.cfg_dirty = 0;
+      CHECK(rsh_cfg_boot_recover(&t, 1) == 1);
+      CHECK(t.cfg_dirty == 1 && t.current_len == nlen2);
+      CHECK(memcmp(t.current, newblob, nlen2) == 0);
+      // Boot recover: pending nahi -> kuch nahi.
+      CHECK(rsh_cfg_boot_recover(&t, 0) == 0);
+      CHECK(t.cfg_dirty == 1);  // pehle wala flag barqarar (caller clear karta hai)
+    }
+
+    // --- F-10: diagnostics ring log + GET_DIAG body + error blinks ---
+    RshDiagLog dl;
+    rsh_diag_init(&dl);
+    CHECK(dl.heap_min_kb == 0xFFFF && dl.count == 0 && dl.boot_reason == 0);
+    rsh_diag_set_boot_reason(&dl, 2);  // brown-out
+    CHECK(rsh_diag_set_heap_min(&dl, 200) == 1);
+    CHECK(rsh_diag_set_heap_min(&dl, 250) == 0);  // zyada heap: naya min nahi
+    CHECK(rsh_diag_set_heap_min(&dl, 100) == 1);
+    CHECK(dl.heap_min_kb == 100);
+    rsh_diag_record(&dl, RSH_DIAG_BOOT, 2, 0);
+    rsh_diag_record(&dl, RSH_DIAG_AP_UP, 6, 1000);
+    rsh_diag_record(&dl, RSH_DIAG_WINDOW_OPEN, 0, 2000);
+    CHECK(dl.count == 3 && dl.total == 3);
+    uint8_t db[230];
+    size_t dlen = rsh_diag_build_body(&dl, 45, db, sizeof(db));
+    CHECK(dlen == 6 + 3 * 7);
+    CHECK(db[0] == 2);                    // boot reason
+    CHECK(db[1] == 100 && db[2] == 0);    // heap_min_kb LE
+    CHECK(db[3] == 45 && db[4] == 0);     // window_remaining_s LE
+    CHECK(db[5] == 3);                    // event count
+    CHECK(db[6] == 0 && db[7] == 0 && db[8] == 0 && db[9] == 0);  // ts 0
+    CHECK(db[10] == RSH_DIAG_BOOT && db[11] == 2 && db[12] == 0);  // code + value LE
+    CHECK(db[13] == 0xE8 && db[14] == 0x03 && db[15] == 0 && db[16] == 0);  // ts 1000
+    CHECK(db[17] == RSH_DIAG_AP_UP && db[18] == 6 && db[19] == 0);
+    CHECK(db[20] == 0xD0 && db[21] == 0x07 && db[22] == 0 && db[23] == 0);  // ts 2000
+    CHECK(db[24] == RSH_DIAG_WINDOW_OPEN && db[25] == 0 && db[26] == 0);
+    // Ring wrap: 35 events -> count 32, total 35, oldest-first #4 se shuru.
+    RshDiagLog dl2;
+    rsh_diag_init(&dl2);
+    for (int i = 0; i < 35; i++)
+      rsh_diag_record(&dl2, (uint8_t)(1 + (i % 11)), (uint16_t)i, (uint32_t)(i * 100));
+    CHECK(dl2.count == 32 && dl2.total == 35);
+    dlen = rsh_diag_build_body(&dl2, 0, db, sizeof(db));
+    CHECK(dlen == 6 + 32 * 7);
+    CHECK(db[5] == 32);
+    CHECK(db[6] == 0x2C && db[7] == 0x01 && db[8] == 0 && db[9] == 0);  // ts 300 (event #4)
+    CHECK(db[10] == (uint8_t)(1 + (3 % 11)) && db[11] == 3 && db[12] == 0);
+    // Body errors: NULL log, chhota buffer.
+    CHECK(rsh_diag_build_body(NULL, 0, db, sizeof(db)) == 0);
+    CHECK(rsh_diag_build_body(&dl, 0, db, 10) == 0);
+    CHECK(rsh_diag_build_body(&dl, 0, NULL, sizeof(db)) == 0);
+    // Error blink pattern (3 blinks: 150 ms on/off, phir 1 s pause, cycle 1900 ms).
+    CHECK(rsh_error_blink_on(3, 0) == 1);
+    CHECK(rsh_error_blink_on(3, 149) == 1);
+    CHECK(rsh_error_blink_on(3, 150) == 0);
+    CHECK(rsh_error_blink_on(3, 300) == 1);   // 2nd blink
+    CHECK(rsh_error_blink_on(3, 600) == 1);   // 3rd blink
+    CHECK(rsh_error_blink_on(3, 750) == 0);
+    CHECK(rsh_error_blink_on(3, 900) == 0);   // pause shuru
+    CHECK(rsh_error_blink_on(3, 1899) == 0);
+    CHECK(rsh_error_blink_on(3, 1900) == 1);  // agla cycle
+    CHECK(rsh_error_blink_on(0, 0) == 0);
+    CHECK(rsh_error_blink_on(2, 0) == 1 && rsh_error_blink_on(2, 600) == 0);
+
+    // --- D-5: HORN_TEST (horn_test.h) ---
+    RshHornTest ht;
+    rsh_horn_test_init(&ht);
+    CHECK(rsh_horn_test_active(&ht, 0) == 0);
+    CHECK(rsh_horn_test_start(&ht, 99, 0) == 0);    // 100 se kam -> reject
+    CHECK(rsh_horn_test_start(&ht, 5001, 0) == 0);  // 5000 se zyada -> reject
+    CHECK(rsh_horn_test_start(&ht, 0, 0) == 0);
+    CHECK(rsh_horn_test_start(&ht, 100, 0) == 1);
+    CHECK(rsh_horn_test_active(&ht, 99) == 1);
+    CHECK(rsh_horn_test_active(&ht, 100) == 0);     // expiry par khud saaf
+    CHECK(rsh_horn_test_active(&ht, 101) == 0);
+    CHECK(rsh_horn_test_start(&ht, 5000, 1000) == 1);
+    CHECK(rsh_horn_test_active(&ht, 5999) == 1);
+    CHECK(rsh_horn_test_active(&ht, 6000) == 0);
+    // Dobara start timer dobara shuru karta hai.
+    CHECK(rsh_horn_test_start(&ht, 100, 7000) == 1);
+    CHECK(rsh_horn_test_start(&ht, 5000, 7050) == 1);
+    CHECK(rsh_horn_test_active(&ht, 7100) == 1);
+    CHECK(rsh_horn_test_active(&ht, 12050) == 0);
+
+    // --- F-06: sample mailbox (sample_task.h) ---
+    RshSampleMailbox mb;
+    rsh_sample_mailbox_init(&mb);
+    RshSampleMailbox out;
+    CHECK(rsh_sample_mailbox_consume(&mb, &out) == 0);  // khaali
+    uint8_t v2[36], v1[18];
+    for (int i = 0; i < 36; i++) v2[i] = (uint8_t)i;
+    for (int i = 0; i < 18; i++) v1[i] = (uint8_t)(0xA0 + i);
+    rsh_sample_mailbox_produce(&mb, v2, 36, v1, 18, 42, 2, 1);
+    CHECK(mb.ready == 1 && mb.skipped == 0);
+    CHECK(rsh_sample_mailbox_consume(&mb, &out) == 1);
+    CHECK(out.seq == 42 && out.v2len == 36 && out.v1len == 18);
+    CHECK(out.emit_wifi == 2 && out.emit_serial == 1);
+    CHECK(memcmp(out.v2pkt, v2, 36) == 0 && memcmp(out.v1pkt, v1, 18) == 0);
+    CHECK(out.skipped == 0 && mb.ready == 0);
+    CHECK(rsh_sample_mailbox_consume(&mb, &out) == 0);  // dobara khaali
+    // Overwrite: drain kiye baghair produce -> skipped 1, naya frame jeet-ta hai.
+    rsh_sample_mailbox_produce(&mb, v2, 36, NULL, 0, 100, 2, 0);
+    rsh_sample_mailbox_produce(&mb, v2, 20, v1, 18, 101, 1, 2);
+    CHECK(mb.skipped == 1);
+    CHECK(rsh_sample_mailbox_consume(&mb, &out) == 1);
+    CHECK(out.seq == 101 && out.v2len == 20 && out.v1len == 18 && out.skipped == 1);
+    CHECK(out.emit_wifi == 1 && out.emit_serial == 2);
+    // Oversize len -> us side ka len 0 (buffer overflow nahi).
+    rsh_sample_mailbox_produce(&mb, v2, 37, v1, 19, 200, 2, 1);
+    CHECK(rsh_sample_mailbox_consume(&mb, &out) == 1);
+    CHECK(out.v2len == 0 && out.v1len == 0);
+    CHECK(rsh_sample_mailbox_consume(NULL, &out) == 0);
+    CHECK(rsh_sample_mailbox_consume(&mb, NULL) == 0);
+
+    // --- F-12: version single source (version.h + modules.h + config.h) ---
+    CHECK(RSH_FW_VERSION_MAJOR == 4 && RSH_FW_VERSION_MINOR == 0 &&
+          RSH_FW_VERSION_PATCH == 2);
+    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.2") == 0);
+    CHECK(strcmp(FIRMWARE_VERSION, RSH_FW_VERSION_STRING) == 0);
+    CHECK(RSH_CAPS_FW_MAJOR == RSH_FW_VERSION_MAJOR &&
+          RSH_CAPS_FW_MINOR == RSH_FW_VERSION_MINOR &&
+          RSH_CAPS_FW_PATCH == RSH_FW_VERSION_PATCH);
+    // String parse karke triple se milao (merge_bin.py wala rasta bhi yahi hai).
+    int vmaj = 0, vmin = 0, vpat = 0;
+    CHECK(sscanf(FIRMWARE_VERSION, "%d.%d.%d", &vmaj, &vmin, &vpat) == 3);
+    CHECK(vmaj == RSH_CAPS_FW_MAJOR && vmin == RSH_CAPS_FW_MINOR &&
+          vpat == RSH_CAPS_FW_PATCH);
+    // Naye control opcodes additive hain (protocol.h) — purane frames waisay hi.
+    CHECK(RSH_CMD_GET_DIAG == 0x0D && RSH_CMD_HORN_TEST == 0x0E);
+    CHECK(RSH_CMD_GET_CAPS == 0x01);  // maujooda opcodes nahi badle
+
+    // --- F-14: LED driver persistent pattern (led_driver.h) ---
+    RshLedDriver drv;
+    CHECK(rsh_led_driver_init(&drv, 4, led_sink_rec, NULL) == 1);
+    CHECK(rsh_led_driver_has_persistent(&drv) == 0);
+    CHECK(drv.brightness == 100);
+    RshLedPattern pers = {RSH_LED_SOLID, 255, 0, 0, 1000, 0, 0};
+    rsh_led_driver_set_persistent(&drv, &pers, 50, 1000);
+    CHECK(rsh_led_driver_has_persistent(&drv) == 1);
+    CHECK(drv.brightness == 50);
+    led_sink_writes = 0;
+    CHECK(rsh_led_driver_tick(&drv, 1000) == 1);
+    CHECK(led_sink_writes == 1 && led_sink_counts[0] == 4);
+    // Brightness 50%: 255 -> (255*50+50)/100 = 128.
+    CHECK(led_sink_frames[0][0].r == 128 && led_sink_frames[0][0].g == 0);
+    CHECK(led_sink_frames[0][3].r == 128);
+    CHECK(rsh_led_driver_tick(&drv, 1001) == 0);  // SOLID frame waisa hi
+    // Brightness 0 -> off; 100 -> full; >100 clamp.
+    rsh_led_driver_set_brightness(&drv, 0);
+    CHECK(rsh_led_driver_tick(&drv, 1002) == 1);
+    CHECK(led_sink_frames[1][0].r == 0);
+    rsh_led_driver_set_brightness(&drv, 100);
+    CHECK(rsh_led_driver_tick(&drv, 1003) == 1);
+    CHECK(led_sink_frames[2][0].r == 255);
+    rsh_led_driver_set_brightness(&drv, 200);
+    CHECK(drv.brightness == 100);
+    // Test pattern persistent ko override karta hai, khatam hote hi
+    // persistent USI tick se wapas (beech mein all-off flash nahi).
+    RshLedPattern test = {RSH_LED_SOLID, 0, 255, 0, 1000, 0, 0};
+    CHECK(rsh_led_driver_start(&drv, &test, 2000, 21, 0, 1) == RSH_CTRL_OK);
+    led_sink_writes = 0;
+    CHECK(rsh_led_driver_tick(&drv, 2000) == 1);  // test frame (green)
+    CHECK(led_sink_frames[0][0].g == 255 && led_sink_frames[0][0].r == 0);
+    CHECK(rsh_led_driver_tick(&drv, 2001) == 0);  // test frame waisa hi
+    // Test 5 s chalta hai (repeats 0 -> 5 s): 7000 par khatam, persistent wapas.
+    CHECK(rsh_led_driver_tick(&drv, 6999) == 0);  // abhi test chal raha hai
+    int w_before = led_sink_writes;
+    CHECK(rsh_led_driver_tick(&drv, 7000) == 1);  // test done + persistent frame
+    CHECK(led_sink_writes == w_before + 1);
+    CHECK(led_sink_frames[w_before][0].r == 255);  // persistent red, no off flash
+    CHECK(led_sink_frames[w_before][0].g == 0);
+    // Persistent hatane ke baad test khatam -> all-off ek dafa.
+    rsh_led_driver_set_persistent(&drv, NULL, 100, 8000);
+    CHECK(rsh_led_driver_has_persistent(&drv) == 0);
+    RshLedPattern test2 = {RSH_LED_SOLID, 0, 0, 255, 1000, 0, 0};
+    CHECK(rsh_led_driver_start(&drv, &test2, 8000, 21, 0, 1) == RSH_CTRL_OK);
+    led_sink_writes = 0;
+    CHECK(rsh_led_driver_tick(&drv, 8000) == 1);  // blue test frame
+    CHECK(led_sink_frames[0][0].b == 255);
+    CHECK(rsh_led_driver_tick(&drv, 12999) == 0);
+    CHECK(rsh_led_driver_tick(&drv, 13000) == 1);  // aakhri all-off frame
+    CHECK(led_sink_frames[led_sink_writes - 1][0].r == 0);
+    CHECK(led_sink_frames[led_sink_writes - 1][0].b == 0);
+    CHECK(rsh_led_driver_tick(&drv, 13001) == 0);  // dobara kuch nahi
+    // OFF pattern set karne se bhi persistent hat jata hai.
+    rsh_led_driver_set_persistent(&drv, &pers, 100, 14000);
+    CHECK(rsh_led_driver_has_persistent(&drv) == 1);
+    RshLedPattern offp = {RSH_LED_OFF, 0, 0, 0, 1000, 0, 0};
+    rsh_led_driver_set_persistent(&drv, &offp, 100, 14000);
+    CHECK(rsh_led_driver_has_persistent(&drv) == 0);
   }
 
   printf("%s — %d checks, %d failures\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", checks, failures);

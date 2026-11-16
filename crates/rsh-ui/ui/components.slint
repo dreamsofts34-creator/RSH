@@ -1,0 +1,957 @@
+// RSH v2.0 — Phase 3 component library (REDESIGN-PLAN §6).
+// Every screen is built from these components; no screen invents its own
+// switch, card, or slider. Tokens live in tokens.slint. Layout rules from
+// the Phase 1 spike apply throughout: never put a non-stretch `alignment`
+// on a layout that has a stretch child (it collapses the stretch), and
+// give fixed-size siblings an explicit `horizontal-stretch: 0` where they
+// would otherwise share freed space.
+import { Theme } from "tokens.slint";
+
+// ---------------------------------------------------------------- card shell (§6: radius 12px, 1px border, 14px 16px padding via content)
+export component Card inherits Rectangle {
+    border-radius: Theme.card-radius;
+    border-width: 1px;
+    border-color: Theme.line;
+    background: Theme.panel;
+}
+
+// ---------------------------------------------------------------- switch (§6: 34x20 cards/top bar, 40x22 tray)
+export component Switch inherits Rectangle {
+    in property <bool> on;
+    in property <string> accessible-name: "Toggle";
+    accessible-label: accessible-name;
+    accessible-role: switch;
+    in property <length> sw-w: 34px;
+    in property <length> sw-h: 20px;
+    callback toggled();
+    width: sw-w;
+    height: sw-h;
+    border-radius: sw-h / 2;
+    background: on ? Theme.accent : Theme.switch-off;
+    // FIX-4: accent border while keyboard-focused.
+    border-width: fs.has-focus ? 1px : 0px;
+    border-color: Theme.accent-text;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                toggled();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    // Visible focus ring (compare-fix): a 2px accent outline around
+    // the switch while keyboard-focused — the 1px border alone is too
+    // subtle, and invisible against the accent on-state.
+    if fs.has-focus : Rectangle {
+        x: -3px;
+        y: -3px;
+        width: sw-w + 6px;
+        height: sw-h + 6px;
+        border-radius: (sw-h + 6px) / 2;
+        border-width: 2px;
+        border-color: Theme.accent-text;
+    }
+    knob := Rectangle {
+        width: sw-h - 6px;
+        height: sw-h - 6px;
+        x: on ? sw-w - (sw-h - 6px) - 3px : 3px;
+        y: 3px;
+        border-radius: (sw-h - 6px) / 2;
+        background: white;
+        animate x { duration: 120ms; easing: ease-out; }
+    }
+    TouchArea { clicked => { toggled(); } }
+}
+
+// ---------------------------------------------------------------- pill (§6: Ok / warn / neutral / accent)
+export component Pill inherits Rectangle {
+    in property <string> label;
+    in property <color> bg: Theme.panel2;
+    in property <color> fg: Theme.mute;
+    width: lbl.width + 16px;
+    height: 20px;
+    border-radius: 10px;
+    background: bg;
+    lbl := Text {
+        x: 8px;
+        y: 0px;
+        height: 20px;
+        vertical-alignment: center;
+        text: label;
+        font-size: 11px;
+        font-weight: 600;
+        color: fg;
+    }
+}
+
+// ---------------------------------------------------------------- button (primary accent / secondary panel2)
+export component Btn inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary;
+    accessible-label: label;
+    accessible-role: button;
+    in property <length> btn-w: 0px;
+    callback clicked();
+    width: btn-w > 0px ? btn-w : lbl.width + 24px;
+    height: 30px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : (primary ? Theme.accent : Theme.line);
+    background: primary ? Theme.accent : Theme.panel2;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    lbl := Text {
+        x: (parent.width - self.width) / 2;
+        height: 100%;
+        vertical-alignment: center;
+        text: label;
+        font-size: 12px;
+        font-weight: 600;
+        // White on accent (4.50:1); Theme.text on accent is 3.83:1 (audit FIX-2).
+        color: primary ? #FFFFFF : Theme.text;
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- nav item (§6: 36px, icon 17px + label; active = accent tint)
+export component NavItem inherits Rectangle {
+    in property <string> label;
+    accessible-label: label;
+    accessible-role: button;
+    in property <image> icon;
+    in property <bool> active;
+    in property <bool> show-dot;
+    callback clicked();
+    height: 36px;
+    border-radius: 8px;
+    background: fs.has-focus || active ? Theme.acc-bg : transparent;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 10px;
+        Image {
+            width: 17px;
+            height: 17px;
+            source: icon;
+            colorize: active ? Theme.accent-text : Theme.mute;
+        }
+        Text {
+            vertical-alignment: center;
+            text: label;
+            font-size: 13px;
+            font-weight: 500;
+            color: active ? white : Theme.mute;
+        }
+        Rectangle { horizontal-stretch: 1; }
+        if show-dot : Rectangle {
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: Theme.ok;
+        }
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- nav sub-item (§6: 30px, left padding 38px)
+export component SubItem inherits Rectangle {
+    in property <string> label;
+    accessible-label: label;
+    accessible-role: button;
+    in property <bool> active;
+    callback clicked();
+    height: 30px;
+    border-radius: 8px;
+    background: fs.has-focus || active ? Theme.acc-bg : transparent;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    Text {
+        x: 38px;
+        height: 100%;
+        vertical-alignment: center;
+        text: label;
+        font-size: 12.5px;
+        font-weight: 500;
+        color: active ? white : Theme.mute;
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- status card (§6: sidebar bottom, on every screen)
+export component StatusCard inherits Rectangle {
+    in property <bool> connected;
+    in property <string> label;
+    in property <string> sub;
+    in property <bool> send-to-game;
+    callback toggled-send();
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.line;
+    background: Theme.panel;
+    VerticalLayout {
+        padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px;
+        spacing: 9px;
+        HorizontalLayout {
+            spacing: 8px;
+            // Halo disc is a pre-blended solid (Theme.halo-ok / halo-bad);
+            // the dot is a solid disc on top. Do NOT use opacity here — an
+            // opacity rect dims its child dot too (spike bug, Phase 3 fix).
+            Rectangle {
+                width: 14px;
+                height: 14px;
+                border-radius: 7px;
+                background: connected ? Theme.halo-ok : Theme.halo-bad;
+                Rectangle {
+                    x: 3px;
+                    y: 3px;
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: connected ? Theme.ok : Theme.bad;
+                }
+            }
+            VerticalLayout {
+                Text { text: label; font-size: 12px; font-weight: 600; color: Theme.text; }
+                Text { text: sub; font-size: 11px; color: Theme.mute; }
+            }
+        }
+        HorizontalLayout {
+            Text { text: "Send to game"; font-size: 12px; color: Theme.text; }
+            Rectangle { horizontal-stretch: 1; }
+            Switch { accessible-name: "Send to game"; on: send-to-game; toggled => { toggled-send(); } }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- segmented control (§6: Basic/Advanced, Dark/Light/Auto, Wi-Fi/USB)
+export component SegmentedControl inherits Rectangle {
+    in property <string> option-0;
+    in property <string> option-1;
+    in property <string> option-2: "";
+    in property <int> selected: 0;
+    callback selected-changed(int);
+    height: 30px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.line;
+    background: Theme.panel;
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 0px;
+        Rectangle {
+            width: 62px;
+            height: 24px;
+            border-radius: 6px;
+            accessible-label: option-0;
+            accessible-role: button;
+            background: fs0.has-focus ? Theme.line : (selected == 0 ? Theme.panel2 : transparent);
+            fs0 := FocusScope {
+                width: 100%;
+                height: 100%;
+                key-pressed(event) => {
+                    if (event.text == Key.Return || event.text == Key.Space) {
+                        selected-changed(0);
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-0; font-size: 12px; font-weight: 600; color: selected == 0 ? white : Theme.mute; }
+            TouchArea { clicked => { selected-changed(0); } }
+        }
+        Rectangle {
+            width: 78px;
+            height: 24px;
+            border-radius: 6px;
+            accessible-label: option-1;
+            accessible-role: button;
+            background: fs1.has-focus ? Theme.line : (selected == 1 ? Theme.panel2 : transparent);
+            fs1 := FocusScope {
+                width: 100%;
+                height: 100%;
+                key-pressed(event) => {
+                    if (event.text == Key.Return || event.text == Key.Space) {
+                        selected-changed(1);
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-1; font-size: 12px; font-weight: 600; color: selected == 1 ? white : Theme.mute; }
+            TouchArea { clicked => { selected-changed(1); } }
+        }
+        if option-2 != "" : Rectangle {
+            width: 62px;
+            height: 24px;
+            border-radius: 6px;
+            accessible-label: option-2;
+            accessible-role: button;
+            background: fs2.has-focus ? Theme.line : (selected == 2 ? Theme.panel2 : transparent);
+            fs2 := FocusScope {
+                width: 100%;
+                height: 100%;
+                key-pressed(event) => {
+                    if (event.text == Key.Return || event.text == Key.Space) {
+                        selected-changed(2);
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-2; font-size: 12px; font-weight: 600; color: selected == 2 ? white : Theme.mute; }
+            TouchArea { clicked => { selected-changed(2); } }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- profile button (§6: name + chevron, orange dot when unsaved)
+export component ProfileButton inherits Rectangle {
+    in property <string> name;
+    in property <bool> unsaved;
+    callback clicked();
+    accessible-label: name;
+    accessible-role: button;
+    height: 30px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : Theme.line;
+    background: Theme.panel;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        if unsaved : Rectangle { width: 8px; height: 8px; border-radius: 4px; background: Theme.warn; }
+        Text { text: name; font-size: 12px; font-weight: 600; color: Theme.text; }
+        Image { width: 12px; height: 12px; source: @image-url("../assets/icons/chevron.svg"); }
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- auto-profile chip (§6: "Auto profile  Game → Profile" + pause switch)
+export component AutoProfileChip inherits Rectangle {
+    in property <string> game-profile;
+    in property <bool> paused;
+    callback pause-toggled();
+    height: 30px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.line;
+    background: Theme.panel;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        Rectangle { width: 7px; height: 7px; border-radius: 4px; background: paused ? Theme.warn : Theme.accent-text; }
+        Text { text: "Auto profile"; font-size: 12px; color: Theme.mute; }
+        Text { text: game-profile; font-size: 12px; font-weight: 600; color: Theme.text; }
+        Switch { accessible-name: "Pause auto profile"; on: !paused; toggled => { pause-toggled(); } }
+    }
+}
+
+// ---------------------------------------------------------------- slider + number box (§6: accent slider + 54-60px mono box, typeable)
+export component SliderRow inherits VerticalLayout {
+    in property <string> label;
+    in property <string> hint;
+    in property <string> value-text;
+    in property <float> value;      // 0..1 normalised
+    callback changed(float);
+    callback value-edited(string);
+    spacing: 6px;
+    HorizontalLayout {
+        VerticalLayout {
+            Text { text: label; font-size: 13px; font-weight: 500; color: Theme.text; }
+            Text { text: hint; font-size: 11.5px; color: Theme.faint; }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Rectangle {
+            width: 60px;
+            height: 26px;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.line;
+            background: Theme.bg;
+            // Raw TextInput (not the std LineEdit widget): the Fluent
+            // widget hardcodes its own palette and a 160px min-width.
+            num := TextInput {
+                width: 100%;
+                height: 100%;
+                horizontal-alignment: right;
+                accessible-label: label;
+                text: value-text;
+                font-family: Theme.font-mono;
+                font-size: 12px;
+                font-weight: 500;
+                color: Theme.text;
+                edited => { value-edited(num.text); }
+            }
+        }
+    }
+    track := Rectangle {
+        height: 20px;
+        accessible-label: label;
+        accessible-role: slider;
+        // FIX-4: keyboard slider - arrows adjust by 5%. Enter/Space are
+        // left alone here (Return = Save is handled at the window).
+        fs := FocusScope {
+            width: 100%;
+            height: 100%;
+            key-pressed(event) => {
+                if (event.text == Key.LeftArrow || event.text == Key.DownArrow) {
+                    changed(Math.max(0, value - 0.05));
+                    return accept;
+                }
+                if (event.text == Key.RightArrow || event.text == Key.UpArrow) {
+                    changed(Math.min(1, value + 0.05));
+                    return accept;
+                }
+                return reject;
+            }
+        }
+        Rectangle {
+            y: 8px;
+            width: 100%;
+            height: 4px;
+            border-radius: 2px;
+            background: Theme.switch-off;
+        }
+        Rectangle {
+            y: 8px;
+            width: parent.width * value;
+            height: 4px;
+            border-radius: 2px;
+            background: Theme.accent;
+        }
+        Rectangle {
+            x: parent.width * value - 7px;
+            y: 3px;
+            width: 14px;
+            height: 14px;
+            border-radius: 7px;
+            border-width: fs.has-focus ? 2px : 1px;
+            border-color: Theme.accent;
+            background: white;
+        }
+        TouchArea {
+            clicked => { changed(Math.max(0, Math.min(1, self.mouse-x / track.width))); }
+            moved => { if self.pressed { changed(Math.max(0, Math.min(1, self.mouse-x / track.width))); } }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- preset chips (§6: Soft / Balanced / Sharp / Custom)
+export component PresetChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback clicked();
+    accessible-label: label;
+    accessible-role: button;
+    height: 30px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : (active ? Theme.accent : Theme.line);
+    background: active ? Theme.acc-bg : Theme.panel2;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    Text {
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: label;
+        font-size: 12px;
+        font-weight: 600;
+        color: active ? white : Theme.mute;
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- curve graph (§6: grid + dashed straight line + accent curve + live marker)
+// ViewBox 330x232 (preview Wheel.html): plot x 30..290, y 20..190.
+export component CurveGraph inherits VerticalLayout {
+    in property <string> title: "Response curve";
+    in property <string> subtitle: "How much you turn vs. what the game gets";
+    in property <float> input-pct;
+    in property <float> output-pct;
+    in property <float> marker-vx;
+    in property <float> marker-vy;
+    in property <string> dashed-line;
+    in property <string> crosshair;
+    in property <string> curve-commands;
+    spacing: 10px;
+    HorizontalLayout {
+        Text { text: title; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+        Rectangle { horizontal-stretch: 1; }
+        Text { text: subtitle; font-size: 12px; color: Theme.mute; }
+    }
+    curve-box := Rectangle {
+        height: self.width * 232 / 330;
+        Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 330;
+            viewbox-height: 232;
+            commands: "M 30 20 L 30 190 M 95 20 L 95 190 M 160 20 L 160 190 M 225 20 L 225 190 M 290 20 L 290 190 M 30 20 L 290 20 M 30 62.5 L 290 62.5 M 30 105 L 290 105 M 30 147.5 L 290 147.5 M 30 190 L 290 190";
+            fill: transparent;
+            stroke: Theme.line;
+            stroke-width: 1px;
+        }
+        Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 330;
+            viewbox-height: 232;
+            commands: dashed-line;
+            fill: transparent;
+            stroke: Theme.grid-line;
+            stroke-width: 1.5px;
+        }
+        Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 330;
+            viewbox-height: 232;
+            commands: curve-commands;
+            fill: transparent;
+            stroke: Theme.accent;
+            stroke-width: 3px;
+        }
+        Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 330;
+            viewbox-height: 232;
+            commands: crosshair;
+            fill: transparent;
+            stroke: Theme.accent-text;
+            stroke-width: 1px;
+        }
+        Rectangle {
+            x: curve-box.width * marker-vx / 330 - 6px;
+            y: curve-box.height * marker-vy / 232 - 6px;
+            width: 12px;
+            height: 12px;
+            border-radius: 6px;
+            border-width: 3px;
+            border-color: Theme.accent-text;
+            background: Theme.bg;
+        }
+        Text { x: curve-box.width * 30 / 330 - 10px; y: curve-box.height * 196 / 232; width: 20px; horizontal-alignment: center; text: "0"; font-size: 10px; color: Theme.faint; }
+        Text { x: curve-box.width * 160 / 330 - 10px; y: curve-box.height * 196 / 232; width: 20px; horizontal-alignment: center; text: "50"; font-size: 10px; color: Theme.faint; }
+        // "100%" is 4 glyphs (~24px at 10px font) — a 20px box clipped
+        // it to "100:" (compare-fix). 30px centred on the 290 tick.
+        Text { x: curve-box.width * 290 / 330 - 15px; y: curve-box.height * 196 / 232; width: 30px; horizontal-alignment: center; text: "100%"; font-size: 10px; color: Theme.faint; }
+        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 183 / 232; width: 20px; horizontal-alignment: right; text: "0"; font-size: 10px; color: Theme.faint; }
+        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 99 / 232; width: 20px; horizontal-alignment: right; text: "50"; font-size: 10px; color: Theme.faint; }
+        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 14 / 232; width: 20px; horizontal-alignment: right; text: "100"; font-size: 10px; color: Theme.faint; }
+        Text { x: curve-box.width * 160 / 330 - 40px; y: curve-box.height * 214 / 232; width: 80px; horizontal-alignment: center; text: "Wheel input"; font-size: 10px; color: Theme.faint; }
+    }
+    HorizontalLayout {
+        spacing: 20px;
+        HorizontalLayout {
+            spacing: 4px;
+            Text { text: "Input"; font-size: 12px; color: Theme.mute; }
+            Text { text: Math.round(input-pct) + "%"; font-family: Theme.font-mono; font-size: 12px; font-weight: 600; color: Theme.text; }
+        }
+        HorizontalLayout {
+            spacing: 4px;
+            Text { text: "Output"; font-size: 12px; color: Theme.mute; }
+            Text { text: Math.round(output-pct) + "%"; font-family: Theme.font-mono; font-size: 12px; font-weight: 600; color: Theme.text; }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        HorizontalLayout {
+            spacing: 6px;
+            Path {
+                width: 22px;
+                height: 2px;
+                viewbox-width: 22;
+                viewbox-height: 2;
+                commands: "M 0 1 L 4 1 M 8 1 L 12 1 M 16 1 L 20 1";
+                fill: transparent;
+                stroke: Theme.grid-line;
+                stroke-width: 2px;
+            }
+            Text { text: "Straight line"; font-size: 12px; color: Theme.mute; }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- pedal bars (§6: vertical 16px; throttle ok, brake bad, clutch accent)
+export component PedalBar inherits VerticalLayout {
+    in property <float> pct;
+    in property <color> bar-color;
+    in property <string> label;
+    spacing: 6px;
+    Rectangle {
+        width: 16px;
+        height: 92px;
+        border-radius: 8px;
+        background: Theme.track;
+        clip: true;
+        Rectangle {
+            width: 16px;
+            height: parent.height * pct / 100;
+            y: parent.height - self.height;
+            border-radius: 8px;
+            background: bar-color;
+        }
+    }
+    Text {
+        horizontal-alignment: center;
+        text: Math.round(pct) + "%";
+        font-family: Theme.font-mono;
+        font-size: 12px;
+        font-weight: 600;
+        color: Theme.text;
+    }
+    Text {
+        horizontal-alignment: center;
+        text: label;
+        font-size: 11px;
+        color: Theme.mute;
+    }
+}
+
+// Horizontal pedal bar (§6: 6-8px, tray + diagnostics)
+export component HBar inherits HorizontalLayout {
+    in property <string> label;
+    in property <float> pct;
+    in property <color> bar-color;
+    spacing: 8px;
+    Text {
+        width: 46px;
+        text: label;
+        font-size: 11.5px;
+        color: Theme.mute;
+    }
+    Rectangle {
+        horizontal-stretch: 1;
+        height: 6px;
+        border-radius: 3px;
+        background: Theme.track;
+        clip: true;
+        Rectangle {
+            width: parent.width * pct / 100;
+            height: 6px;
+            border-radius: 3px;
+            background: bar-color;
+        }
+    }
+    Text {
+        width: 30px;
+        horizontal-alignment: right;
+        text: Math.round(pct) + "%";
+        font-family: Theme.font-mono;
+        font-size: 11.5px;
+        color: Theme.text;
+    }
+}
+
+// ---------------------------------------------------------------- range block (§6: "Pedal up / Pedal down" + Set buttons)
+export component RangeBlock inherits VerticalLayout {
+    in property <string> up-label: "Pedal up";
+    in property <string> down-label: "Pedal down";
+    in property <string> up-value;
+    in property <string> down-value;
+    callback set-up();
+    callback set-down();
+    spacing: 8px;
+    HorizontalLayout {
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 1px;
+            Text { text: up-label; font-size: 11.5px; color: Theme.mute; }
+            Text { text: up-value; font-family: Theme.font-mono; font-size: 13px; font-weight: 600; color: Theme.text; }
+        }
+        Btn { label: "Set up"; clicked => { set-up(); } }
+    }
+    HorizontalLayout {
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 1px;
+            Text { text: down-label; font-size: 11.5px; color: Theme.mute; }
+            Text { text: down-value; font-family: Theme.font-mono; font-size: 13px; font-weight: 600; color: Theme.text; }
+        }
+        Btn { label: "Set down"; clicked => { set-down(); } }
+    }
+}
+
+// ---------------------------------------------------------------- button tile (§6: BUTTON n + action; normal / selected / live pressed / not set)
+export component ButtonTile inherits Rectangle {
+    in property <string> label;
+    in property <string> action;
+    in property <bool> selected;
+    in property <bool> pressed;
+    in property <bool> not-set;
+    callback clicked();
+    accessible-label: label + ": " + action;
+    accessible-role: button;
+    height: 52px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : Theme.line);
+    background: pressed ? Theme.ok-bg : (selected ? Theme.acc-bg : Theme.panel2);
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    VerticalLayout {
+        padding-left: 10px;
+        padding-top: 8px;
+        spacing: 1px;
+        Text { text: label; font-size: 10.5px; font-weight: 600; color: Theme.mute; }
+        Text { text: action; font-size: 12.5px; font-weight: 600; color: not-set ? Theme.mute : Theme.text; }
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- game tile (§6: icon square + name + profile + status pill + Launch/Stop/Locate)
+export component GameTile inherits Rectangle {
+    in property <string> code;
+    in property <string> name;
+    in property <string> sub;
+    in property <bool> sub-warn;
+    in property <string> action;
+    in property <bool> action-primary;
+    callback action-clicked();
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.line;
+    background: Theme.panel2;
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 10px;
+        Rectangle {
+            width: 34px;
+            height: 34px;
+            border-radius: 8px;
+            background: Theme.panel;
+            Text {
+                width: 100%;
+                height: 100%;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                text: code;
+                font-size: 12px;
+                font-weight: 700;
+                color: Theme.accent-text;
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 1px;
+            Text {
+                text: name;
+                font-size: 12.5px;
+                font-weight: 600;
+                color: Theme.text;
+            }
+            Text {
+                text: sub;
+                font-size: 11px;
+                color: sub-warn ? Theme.warn : Theme.mute;
+            }
+        }
+        Btn { label: action; primary: action-primary; clicked => { action-clicked(); } }
+    }
+}
+
+// ---------------------------------------------------------------- checklist row (§6: green tick circle + text + right hint)
+export component CheckRow inherits Rectangle {
+    in property <string> label;
+    in property <string> hint;
+    in property <bool> warn;
+    height: 26px;
+    HorizontalLayout {
+        spacing: 9px;
+        Rectangle {
+            width: 18px;
+            height: 18px;
+            border-radius: 9px;
+            background: warn ? Theme.warn-bg : Theme.check-bg;
+            Text {
+                width: 100%;
+                height: 100%;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                text: warn ? "!" : "✓";
+                font-size: 10px;
+                font-weight: 700;
+                color: warn ? Theme.warn : Theme.ok;
+            }
+        }
+        Text {
+            vertical-alignment: center;
+            text: label;
+            font-size: 12.5px;
+            color: Theme.text;
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Text {
+            vertical-alignment: center;
+            text: hint;
+            font-size: 11.5px;
+            color: Theme.mute;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- radio option card (§6: game controller choice)
+export component RadioOptionCard inherits Rectangle {
+    in property <string> title;
+    in property <string> desc;
+    in property <bool> selected;
+    callback clicked();
+    accessible-label: title;
+    accessible-role: radio-button;
+    height: 64px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : Theme.line);
+    background: selected ? Theme.acc-bg : Theme.panel2;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    HorizontalLayout {
+        padding: 12px;
+        spacing: 10px;
+        Rectangle {
+            width: 18px;
+            height: 18px;
+            border-radius: 9px;
+            border-width: 2px;
+            border-color: selected ? Theme.accent : Theme.faint;
+            background: transparent;
+            Rectangle {
+                x: 3px;
+                y: 3px;
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: selected ? Theme.accent : transparent;
+            }
+        }
+        VerticalLayout {
+            spacing: 1px;
+            Text { text: title; font-size: 13px; font-weight: 600; color: Theme.text; }
+            Text { text: desc; font-size: 11.5px; color: Theme.mute; }
+        }
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- empty / error banner (§6: one line + one action button)
+export component EmptyBanner inherits Rectangle {
+    in property <string> text;
+    in property <string> action-label: "";
+    in property <bool> is-error;
+    callback action-clicked();
+    height: 36px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: is-error ? Theme.bad : Theme.line;
+    background: is-error ? #2E1F26 : Theme.panel2;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 10px;
+        Text {
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+            text: text;
+            font-size: 12px;
+            color: is-error ? Theme.bad : Theme.mute;
+        }
+        if action-label != "" : Btn { label: action-label; clicked => { action-clicked(); } }
+    }
+}
+
+// ---------------------------------------------------------------- wheel graphic (rotates with steer angle; Rectangle has no
+// rotation in Slint 1.18, so the wheel is one SVG image rotated as a whole)
+export component WheelGraphic inherits Rectangle {
+    in property <angle> steer-angle;
+    in property <length> size: 112px;
+    width: size;
+    height: size;
+    Image {
+        width: size;
+        height: size;
+        source: @image-url("../assets/icons/wheel-large.svg");
+        transform-rotation: steer-angle;
+        transform-origin: { x: size / 2, y: size / 2 };
+    }
+}

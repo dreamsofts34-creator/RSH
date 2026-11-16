@@ -70,11 +70,11 @@
 #define RSH_CAP_PULLUP 0x10
 
 // ---- GET_CAPS fixed fields (§3.4) ----
-#define RSH_CAPS_FW_MAJOR 4
-#define RSH_CAPS_FW_MINOR 0
-#define RSH_CAPS_FW_PATCH 1   // Round 2 W3: 4.0.1 — FIRMWARE_VERSION (config.h) se match lazmi;
-// GET_CAPS/HELLO mein ghalat 4.0.0 PC ki downgrade gate + calibration
-// freshness ko dhoka deta tha (board 4.0.1, PC samajhta 4.0.0).
+// F-12: version triple version.h se aata hai (FIRMWARE_VERSION jaisa hi
+// source) — HELLO/GET_CAPS kabhi dobara alag version nahi batayenge.
+#define RSH_CAPS_FW_MAJOR RSH_FW_VERSION_MAJOR
+#define RSH_CAPS_FW_MINOR RSH_FW_VERSION_MINOR
+#define RSH_CAPS_FW_PATCH RSH_FW_VERSION_PATCH
 #define RSH_CAPS_PROTO_MAJOR 2
 #define RSH_CAPS_PROTO_MINOR 1
 #define RSH_CAPS_N_AXES_MAX 8
@@ -215,8 +215,15 @@ static inline uint8_t rsh_caps_table_from_pinmap(const RshPinMap *map,
     RSH_CAPS_ADD(map->clutch, RSH_KIND_ADC_NATIVE, RSH_MOD_CLUTCH,
                  rsh_caps_pin_caps_(map->clutch, 1));
   if (map->handbrake != RSH_PINMAP_ABSENT)
-    RSH_CAPS_ADD(map->handbrake, RSH_KIND_ADC_NATIVE, RSH_MOD_HANDBRAKE,
-                 rsh_caps_pin_caps_(map->handbrake, 1));
+    // F-15: button mode mein handbrake digital input hai (ADC nahi) —
+    // GET_CAPS mein wahi kind/caps aate hain.
+    RSH_CAPS_ADD(map->handbrake,
+                 map->handbrakeButtonMode ? RSH_KIND_DIGITAL_IN
+                                          : RSH_KIND_ADC_NATIVE,
+                 RSH_MOD_HANDBRAKE,
+                 map->handbrakeButtonMode
+                     ? rsh_caps_pin_caps_(map->handbrake, 0)
+                     : rsh_caps_pin_caps_(map->handbrake, 1));
   if (map->battery != RSH_PINMAP_ABSENT)
     RSH_CAPS_ADD(map->battery, RSH_KIND_ADC_NATIVE, RSH_MOD_BATTERY,
                  rsh_caps_pin_caps_(map->battery, 1));

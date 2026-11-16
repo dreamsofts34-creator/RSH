@@ -5,7 +5,10 @@
 //   * BOOT-hold detection RUNTIME hoti hai (C1 fix) — power-up par nahi.
 //     Loop har iteration GPIO0 (BOOT button, active-LOW) parhta hai; hold
 //     ki muddat se faisla hota hai:
-//       hold < 5 s            -> normal boot (BOOT ignore)
+//       hold < 3 s            -> normal boot (BOOT ignore)
+//       3 s hold, 5 s se pehle release -> PAIR_WINDOW_OPEN (F-02, v4.0.2:
+//                                sirf unpaired board, 120 s window, LED
+//                                pattern; paired board ignore karta hai)
 //       5 s <= hold < 10 s    -> safe mode (factory pin map + AP; config
 //                                apply nahi hoti; LED slow blink 1 Hz)
 //       hold >= 10 s          -> key-reset-armed (LED fast blink 4 Hz,
@@ -28,6 +31,8 @@
 // ---------- Constants (plan + contract) ----------
 #define RSH_BOOT_AP_UP_DEADLINE_MS   15000u   // FW-3: AP up na ho to boot fail
 #define RSH_BOOT_MAX_CONSEC_FAILURES 3u       // itne lagatar fail -> fallback
+#define RSH_BOOTHOLD_PAIR_MS         3000u    // F-02 (v4.0.2): 3 s hold + 5 s se
+                                              // pehle release -> pair window (120 s)
 #define RSH_BOOTHOLD_SAFE_MS         5000u    // 5 s hold -> safe mode (§4.4)
 #define RSH_BOOTHOLD_KEYRESET_MS     10000u   // 10 s hold -> key-reset-armed
 #define RSH_KEYRESET_ARMED_WINDOW_MS 120000u  // armed window boot se 120 s
@@ -115,6 +120,7 @@ static inline rsh_boot_tick_t rsh_boot_tick(rsh_boot_counter_t *c, uint8_t ap_up
 // ---------- Runtime BOOT-hold detector (C1 fix: runtime, power-up nahi) ----------
 typedef enum {
   RSH_HOLD_NONE = 0,
+  RSH_HOLD_PAIR_WINDOW = 3,  // F-02: 3 s hold + 5 s se pehle release
   RSH_HOLD_SAFE_MODE = 1,        // 5 s hold paar — safe mode mein jao
   RSH_HOLD_KEY_RESET_ARMED = 2   // 10 s hold paar — key-reset-armed mein jao
 } rsh_hold_event_t;
@@ -122,6 +128,7 @@ typedef enum {
 typedef struct {
   uint32_t hold_start_ms;  // musalsal press kab se hai
   uint8_t pressed;         // pichli sample mein BOOT daba hua tha
+  uint8_t pair_armed;      // 3 s paar — release par pair window khulegi
   uint8_t safe_fired;      // 5 s event is hold mein ja chuka hai
   uint8_t armed_fired;     // 10 s event is hold mein ja chuka hai
 } rsh_boothold_t;
@@ -131,16 +138,25 @@ static inline void rsh_boothold_init(rsh_boothold_t *d) {
 }
 
 // Har loop mein call karo: pressed = BOOT daba hua hai (GPIO0 LOW).
-// Release hote hi detector reset — chhoti dabao (bounce / < 5 s) kuch nahi karti.
-// Har threshold apne hold mein sirf ek dafa fire hota hai.
+// Release hote hi detector reset — chhoti dabao (bounce / < 3 s) kuch nahi karti.
+// Har threshold apne hold mein sirf ek dafa fire hota hai. Pair window
+// RELEASE par fire hoti hai (3 s paar, lekin 5 s safe mode se pehle) —
+// is liye 3 s cross karne par koi event nahi aata, sirf pair_armed lagta
+// hai; 5 s paar hote hi safe mode fire ho jata hai aur pair cancel.
 static inline rsh_hold_event_t rsh_boothold_update(rsh_boothold_t *d, uint8_t pressed,
                                                     uint32_t now_ms) {
   if (!d) return RSH_HOLD_NONE;
   if (!pressed) {
+    rsh_hold_event_t ev = RSH_HOLD_NONE;
+    if (d->pressed && d->pair_armed && !d->safe_fired && !d->armed_fired) {
+      // 3 s hold poora, 5 s se pehle chhora — pair window (F-02).
+      ev = RSH_HOLD_PAIR_WINDOW;
+    }
     d->pressed = 0;
+    d->pair_armed = 0;
     d->safe_fired = 0;
     d->armed_fired = 0;
-    return RSH_HOLD_NONE;
+    return ev;
   }
   if (!d->pressed) {
     d->pressed = 1;
@@ -156,6 +172,7 @@ static inline rsh_hold_event_t rsh_boothold_update(rsh_boothold_t *d, uint8_t pr
     d->safe_fired = 1;
     return RSH_HOLD_SAFE_MODE;
   }
+  if (held_ms >= RSH_BOOTHOLD_PAIR_MS) d->pair_armed = 1;
   return RSH_HOLD_NONE;
 }
 

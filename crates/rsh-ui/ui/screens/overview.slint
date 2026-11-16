@@ -1,0 +1,157 @@
+// RSH v2.0 — Overview screen (REDESIGN-PLAN §7.1, preview Overview.html).
+// Phase 4 port: extracted verbatim from the Phase 3 shell
+// (ui/shell.slint OverviewPage), which the shell imports at integration
+// instead of defining inline. No design change.
+//
+// L4: the "Pedals calibrated" hint is a property now (calibrated-label),
+// fed from get_calibration().calibrated_at — never a hardcoded date.
+// The firmware line reads v4.0.2 (the shipped firmware).
+import { Theme } from "../tokens.slint";
+import { EmptyBanner, Card, WheelGraphic, PedalBar, Pill, Btn, GameTile, CheckRow } from "../components.slint";
+
+export component OverviewPage inherits VerticalLayout {
+    in property <angle> steer-angle;
+    in property <string> steer-text;
+    in property <float> throttle;
+    in property <float> brake;
+    in property <float> clutch;
+    in property <bool> daemon-live;
+    in property <bool> connected;
+    in property <string> calibrated-label: "Not yet";
+    callback configure();
+    callback launch-game(string);
+    callback open-diagnostics();
+    callback reconnect();
+    padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
+    spacing: 12px;
+    if !daemon-live : EmptyBanner { text: "Simulated data — the daemon is not running yet. Live data lands when Phase 2 IPC is connected."; is-error: false; }
+    // REDESIGN-PLAN §8.6 disconnected state: banner + Reconnect.
+    if daemon-live && !connected : EmptyBanner { text: "Wheel not connected — check the RSH Wi-Fi is joined (or the USB cable is plugged in), then retry."; action-label: "Reconnect"; is-error: true; action-clicked => { reconnect(); } }
+    Card {
+        HorizontalLayout {
+            padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
+            spacing: 28px;
+            HorizontalLayout {
+                horizontal-stretch: 0;
+                spacing: 14px;
+                WheelGraphic { steer-angle: steer-angle; }
+                VerticalLayout {
+                    Text { text: steer-text; font-family: Theme.font-mono; font-size: 30px; font-weight: 600; color: Theme.text; }
+                    Text { text: "Steering"; font-size: 12px; color: Theme.mute; }
+                }
+            }
+            HorizontalLayout {
+                horizontal-stretch: 0;
+                spacing: 18px;
+                PedalBar { pct: throttle; bar-color: Theme.ok; label: "Throttle"; }
+                PedalBar { pct: brake; bar-color: Theme.bad; label: "Brake"; }
+                PedalBar { pct: clutch; bar-color: Theme.accent; label: "Clutch"; }
+            }
+            Rectangle { width: 1px; vertical-stretch: 1; horizontal-stretch: 0; background: Theme.line; }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 4px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text { text: "RSH Wheel"; font-size: 14px; font-weight: 600; color: Theme.text; }
+                    Pill { label: connected ? "Online" : "Offline"; bg: connected ? Theme.ok-bg : #2E1F26; fg: connected ? Theme.ok : Theme.bad; }
+                }
+                Text { text: "Firmware 4.0.2 · rsh.local · 200 updates/s"; font-size: 12px; color: Theme.mute; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 30px;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.line;
+                        background: Theme.panel2;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            Text { text: "GT3 Sprint"; font-size: 12px; font-weight: 600; color: Theme.text; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Image { width: 12px; height: 12px; source: @image-url("../../assets/icons/chevron.svg"); }
+                        }
+                    }
+                    Btn { label: "Configure"; primary: true; clicked => { configure(); } }
+                }
+            }
+        }
+    }
+    Card {
+        VerticalLayout {
+            padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
+            spacing: 10px;
+            HorizontalLayout {
+                Text { text: "Games"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                Rectangle { horizontal-stretch: 1; }
+                Text { text: "Launch from here. RSH switches profile automatically."; font-size: 12px; color: Theme.mute; }
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                GameTile { horizontal-stretch: 1; code: "AC"; name: "Assetto Corsa"; sub: "GT3 Sprint"; action: "Launch"; action-primary: true; action-clicked => { launch-game("Assetto Corsa"); } }
+                GameTile { horizontal-stretch: 1; code: "ACC"; name: "AC Competizione"; sub: "Running · GT3 Sprint"; sub-warn: true; action: "Stop"; action-clicked => { launch-game("AC Competizione"); } }
+                GameTile { horizontal-stretch: 1; code: "iR"; name: "iRacing"; sub: "Not found"; action: "Locate"; action-clicked => { launch-game("iRacing"); } }
+            }
+        }
+    }
+    HorizontalLayout {
+        spacing: 12px;
+        Card {
+            horizontal-stretch: 1;
+            VerticalLayout {
+                padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
+                spacing: 4px;
+                HorizontalLayout {
+                    Text { text: "Ready to race"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Pill { label: connected ? "All good" : "Check needed"; bg: connected ? Theme.ok-bg : Theme.warn-bg; fg: connected ? Theme.ok : Theme.warn; }
+                }
+                CheckRow { label: "Wheel connected"; hint: "Wi-Fi"; warn: !connected; }
+                CheckRow { label: "Pedals calibrated"; hint: calibrated-label; }
+                CheckRow { label: "Game controller ready"; hint: "HIDMaestro"; }
+            }
+        }
+        Card {
+            horizontal-stretch: 1;
+            VerticalLayout {
+                padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
+                spacing: 10px;
+                HorizontalLayout {
+                    Text { text: "Connection quality"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: "Last 10 s"; font-size: 12px; color: Theme.mute; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout { horizontal-stretch: 1; Text { text: "4 ms"; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Delay"; font-size: 11.5px; color: Theme.mute; } }
+                    VerticalLayout { horizontal-stretch: 1; Text { text: "0%"; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Lost data"; font-size: 11.5px; color: Theme.mute; } }
+                    VerticalLayout { horizontal-stretch: 1; Text { text: "1 ms"; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Jitter"; font-size: 11.5px; color: Theme.mute; } }
+                }
+                Text {
+                    text: "Open diagnostics";
+                    font-size: 12px;
+                    color: fs.has-focus ? white : Theme.accent-text;
+                    accessible-label: "Open diagnostics";
+                    accessible-role: button;
+                    // FIX-4: keyboard activation for this text link.
+                    fs := FocusScope {
+                        width: 100%;
+                        height: 100%;
+                        key-pressed(event) => {
+                            if (event.text == Key.Return || event.text == Key.Space) {
+                                open-diagnostics();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                    TouchArea { clicked => { open-diagnostics(); } }
+                }
+            }
+        }
+    }
+}
+

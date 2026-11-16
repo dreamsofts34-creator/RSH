@@ -3,9 +3,18 @@
 #include <Arduino.h>
 
 static Debouncer dbGearUp, dbGearDown, dbAccel, dbBrake, dbHorn;  // FW-11: horn
+static Debouncer dbHandbrake;  // F-15 (v4.0.2): handbrake button mode
 static RshEncoder enc1, enc2;   // FW-12: quadrature decoders (cumulative i16)
 static uint16_t lastHandbrakeDiag = 0;   // FW-11: handbrake trimmed-mean state
 static uint16_t lastClutchDiag = 0;      // Phase F WS5: clutch trimmed-mean state
+// D-4 (v4.0.2): shifter sensitivity (0..100, default 50) — sequential
+// gear debounce aur H-pattern stability dono isi se chalte hain.
+static uint8_t shifterSensitivity = RSH_CFG_SHIFTER_SENSITIVITY_DEFAULT;
+static uint8_t shifterDebounceMs =
+    13;  // rsh_shifter_debounce_ms(50) = 20 - 50*15/100 = 13 (formula se)
+static uint8_t lastRawGear = 0;         // H-pattern: aakhri raw gear
+static uint8_t reportedGear = 0;        // H-pattern: stable gear (report hota hai)
+static uint32_t gearStableSinceMs = 0;  // H-pattern: raw gear kab se stable hai
 static bool useMv = (STEER_USE_MILLIVOLTS != 0);
 static SampleGovernor governor;   // .ino window ke hisaab se update karta hai
 static uint32_t lastMvCheckMs = 0;
@@ -55,6 +64,13 @@ static void pinmap_apply_pinmodes_(void) {
 uint8_t inputs_apply_config_blob(const uint8_t *blob, size_t len) {
   RshPinMap next;
   if (!rsh_pinmap_from_blob(blob, len, &next)) return 0;  // invalid — kuch nahi badla
+  // D-4: sensitivity blob se aati hai (pin map waisa hi ho to bhi badal
+  // sakti hai — is liye memcmp early-return se PEHLE update karo).
+  shifterSensitivity = rsh_cfg_shifter_sensitivity(blob, len);
+  shifterDebounceMs = rsh_shifter_debounce_ms(shifterSensitivity);
+  dbGearUp.debounceMs = shifterDebounceMs;
+  dbGearDown.debounceMs = shifterDebounceMs;
+  dbHandbrake.debounceMs = shifterDebounceMs;
   pinmap_ensure_defaults_();
   if (memcmp(&next, &pinMap, sizeof(next)) == 0) return 1;  // wahi map — re-init nahi
   pinMap = next;
@@ -67,6 +83,13 @@ uint8_t inputs_apply_config_blob(const uint8_t *blob, size_t len) {
   dbAccel = Debouncer{};
   dbBrake = Debouncer{};
   dbHorn = Debouncer{};
+  dbHandbrake = Debouncer{};
+  dbGearUp.debounceMs = shifterDebounceMs;
+  dbGearDown.debounceMs = shifterDebounceMs;
+  dbHandbrake.debounceMs = shifterDebounceMs;
+  lastRawGear = 0;
+  reportedGear = 0;
+  gearStableSinceMs = 0;
   rsh_encoder_init(&enc1);
   rsh_encoder_init(&enc2);
   healthSteer = AxisHealth{};
@@ -200,9 +223,20 @@ InputSample inputs_read() {
   // FW-11 (F7): band module ka ADC read NAHI hota — handbrake band ho to
   // avg_pedal call hi nahi hota (koi ADC conversion, koi dummy read nahi),
   // value 0 rehti hai aur axis mask bit bhi clear hoti hai (modules.h).
-  s.handbrake = (rsh_modules_handbrake_enabled() &&
-                 pinMap.handbrake != RSH_PINMAP_ABSENT)
-      ? avg_pedal(pinMap.handbrake, true, lastHandbrakeDiag) : 0;
+  // F-15 (v4.0.2): button mode mein pin DIGITAL button hai — daba hua =
+  // axis 4095 (full), chhora hua = 0 (debounced, sensitivity ke mutabiq).
+  if (rsh_modules_handbrake_enabled() &&
+      pinMap.handbrake != RSH_PINMAP_ABSENT) {
+    if (pinMap.handbrakeButtonMode) {
+      s.handbrake =
+          dbHandbrake.update(digitalRead(pinMap.handbrake) == LOW, nowMs)
+              ? 4095 : 0;
+    } else {
+      s.handbrake = avg_pedal(pinMap.handbrake, true, lastHandbrakeDiag);
+    }
+  } else {
+    s.handbrake = 0;
+  }
   // Phase F WS5 (F7): clutch band ho to ADC read nahi hota (value 0,
   // axis mask bit bhi clear — modules.h). Clutch pin GPIO33 default
   // map mein gear-down bhi hai — clutch on ho to gear-down ka digital
@@ -249,6 +283,8 @@ InputSample inputs_read() {
   // Phase F WS5: runtime mode check (compile-time #if nahi) — SET_CFG
   // blob se mode badalne par agle hi cycle se gear decode badal jata hai.
   // Phase G (C3): gear pins blob se; 0xFF pin daba hua nahi mana jata.
+  // D-4 (v4.0.2): gear tab report hota hai jab raw gear debounce waqt
+  // (sensitivity) tak stable rahe — bounce se ghalat gear nahi jata.
   s.shifterGear = 0;
   if (rsh_modules_shifter_mode() == RSH_SHIFTER_HPATTERN &&
       rsh_modules_shifter_enabled()) {
@@ -265,7 +301,17 @@ InputSample inputs_read() {
         digitalRead(pinMap.shiftH[4]) == LOW) bits6 |= 0x10;
     if (pinMap.shiftH[5] != RSH_PINMAP_ABSENT &&
         digitalRead(pinMap.shiftH[5]) == LOW) bits6 |= 0x20;
-    s.shifterGear = rsh_shifter_hpattern_gear(bits6);
+    uint8_t rawGear = rsh_shifter_hpattern_gear(bits6);
+    if (rawGear != lastRawGear) {
+      lastRawGear = rawGear;
+      gearStableSinceMs = nowMs;
+    } else if ((uint32_t)(nowMs - gearStableSinceMs) >= shifterDebounceMs) {
+      reportedGear = rawGear;
+    }
+    s.shifterGear = reportedGear;
+  } else {
+    lastRawGear = 0;
+    reportedGear = 0;
   }
 
   // Floating/disconnected detection (F2/D12): rail-stuck + doosre axes

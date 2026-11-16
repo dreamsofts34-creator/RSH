@@ -1,0 +1,44 @@
+// RSH v2.0 — design tokens (REDESIGN-PLAN §5). Single source of truth for
+// all Slint screens. The Phase 3 worker adopts this file into
+// crates/rsh-ui/ui/ as tokens.slint; staging screens import it from here.
+// Colors are the approved dark theme. Light theme is NOT designed yet —
+// do not invent light tokens.
+export global Theme {
+    in-out property <color> bg: #0D1118;
+    in-out property <color> side: #10151D;
+    in-out property <color> panel: #161C27;
+    in-out property <color> panel2: #1D2533;
+    in-out property <color> line: #262F40;
+    in-out property <color> text: #E9EDF4;
+    in-out property <color> mute: #9AA5B8;
+    in-out property <color> faint: #7C879B;
+    in-out property <color> accent: #2F6BFF;
+    in-out property <color> accent-text: #8EB0FF;
+    in-out property <color> ok: #3DD68C;
+    in-out property <color> warn: #F5B84A;
+    in-out property <color> bad: #FF6B6B;
+    in-out property <length> window-width: 920px;
+    in-out property <length> window-height: 580px;
+    in-out property <length> sidebar-width: 184px;
+    in-out property <length> topbar-height: 56px;
+    in-out property <length> card-radius: 12px;
+    in-out property <length> card-gap: 12px;
+    in-out property <string> font-text: "Inter";
+    in-out property <string> font-mono: "JetBrains Mono";
+    // Derived fills (Phase 1 spike): pre-blended translucent fills, since
+    // Slint has no rgba() helper. Each is the §5 token blended over the
+    // background it sits on — no new hues, no design change.
+    in-out property <color> track: #232C3C;
+    in-out property <color> switch-off: #2B3547;
+    in-out property <color> grid-line: #4A566C;
+    in-out property <color> acc-bg: #152341;   // rgba(47,107,255,.16) over #10151D
+    in-out property <color> ok-bg: #1B3635;    // rgba(61,214,140,.14) over #161C27
+    in-out property <color> warn-bg: #35322C;  // rgba(245,184,74,.14) over #161C27
+    in-out property <color> check-bg: #1C3A37; // rgba(61,214,140,.16) over #161C27
+    // Status-dot halos: rgba(ok,.18) / rgba(bad,.18) over #161C27, pre-blended
+    // so the dot itself stays solid. Never nest the dot in an opacity rect.
+    in-out property <color> halo-ok: #1D3E39;
+    in-out property <color> halo-bad: #402A33;
+    in-out property <color> tray-bg: #11161F;  // Tray.html popup background
+    in-out property <color> tray-line: #2A3345;
+}

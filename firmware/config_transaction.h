@@ -89,6 +89,32 @@
 #define RSH_CFG_TYPE_AXIS_AS5600     12
 #define RSH_CFG_AS5600_MULTITURN_FLAG 0x01
 #define RSH_CFG_AS5600_ROT_PARAM     1   // params[1] = rotation
+// v4.0.2 (F-14): persistent LED config record (type 13). Layout (16 B):
+//   slot = 0, flags = 0, pinA/pinB/pinC = 0xFF (koi pin nahi — strip pin
+//   type-6 record se aata hai), params[0] = patternId (0 OFF / 1 SOLID /
+//   2 BLINK / 3 CHASE / 4 RAINBOW — led_patterns.h), params[1..3] = r/g/b,
+//   params[4] = brightness 0..100 (default 100), params[5..9] = 0.
+// Max 1 record. LED_TEST (0x0A) is se ALAG aur time-limited rehta hai
+// (D-6): test chalte hue persistent pattern pause hota hai, test khatam
+// hote hi wapas aata hai (led_driver.h).
+#define RSH_CFG_TYPE_LED_CONFIG      13
+#define RSH_CFG_LED_CONFIG_PATTERN_PARAM 0   // params[0] = patternId
+#define RSH_CFG_LED_CONFIG_R_PARAM   1
+#define RSH_CFG_LED_CONFIG_G_PARAM   2
+#define RSH_CFG_LED_CONFIG_B_PARAM   3
+#define RSH_CFG_LED_CONFIG_BRIGHTNESS_PARAM 4  // params[4] = brightness 0..100
+// v4.0.2 (D-4): shifter sensitivity — type-11 record params[4]
+// (0..100, default 50): sequential gear buttons ka debounce
+// 20 ms (0) .. 5 ms (100) hota hai; H-pattern gear ko bhi utni hi der
+// stable rehna hota hai. params[5..9] = 0 (reserved).
+#define RSH_CFG_SHIFTER_SENSITIVITY_PARAM 4
+#define RSH_CFG_SHIFTER_SENSITIVITY_DEFAULT 50
+// v4.0.2 (F-15/D-3): handbrake button mode — AXIS_ADC/GENERIC record
+// (type 1/10) jis ka slot == 4 (handbrake) ho, us ke flags bit0 = 1 ka
+// matlab hai pinA DIGITAL button hai (analog nahi): daba hua = axis
+// 4095, chhora hua = 0. Button mode mein pinA par PULLUP rule lagta hai
+// (ADC1 rule nahi). Flags ke baaqi bits 0 hone chahiye.
+#define RSH_CFG_HANDBRAKE_BUTTON_FLAG 0x01
 
 // Validation err codes (§3.6)
 #define RSH_CFG_ERR_PIN_CONFLICT 1
@@ -263,7 +289,7 @@ static inline uint8_t rsh_cfg_pin_check_(uint8_t pin, uint8_t rule,
 //   len < 12 ya > 2048 ya moduleCount se size na mile -> TOO_BIG, err 5
 //   magic != "RSHG" ya schema != 2                 -> UNSUPPORTED, err 3
 //   CRC32 trailer mismatch                          -> BAD_CRC, err 4
-//   unknown type (1..11 ke bahar)                   -> UNSUPPORTED, err 3
+//   unknown type (1..13 ke bahar)                   -> UNSUPPORTED, err 3
 //   pin 0xFF ke ilawa 0..39 ke bahar                -> PIN_CONFLICT, err 2
 //   pin barred (flash/UART/strapping/LED/nonexistent)
 //     ya kind-ghalat (ADC2 axis, input-only digital/LED)
@@ -276,7 +302,12 @@ static inline uint8_t rsh_cfg_pin_check_(uint8_t pin, uint8_t rule,
 //   button records 65..128                          -> UNSUPPORTED, err 3 (N1)
 //   button records > 128                            -> PIN_CONFLICT, err 2
 //   SHIFTER record: mode params[0] > 1              -> PIN_CONFLICT, err 2
+//   SHIFTER record: sensitivity params[4] > 100      -> PIN_CONFLICT, err 2 (D-4)
 //   SHIFTER H-pattern + ENCODER record              -> PIN_CONFLICT, err 1
+//   LED_CONFIG record (type 13): > 1, patternId > 4, brightness > 100,
+//     flags != 0 ya koi pin set                     -> PIN_CONFLICT, err 2 (F-14)
+//   Handbrake AXIS slot 4 flags bit0 (button mode): pinA par PULLUP rule
+//     (ADC1 rule nahi); flags ke baaqi bits != 0    -> PIN_CONFLICT, err 2 (F-15)
 static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
                                             uint8_t *err_codes_out,
                                             uint8_t *err_count_out) {
@@ -332,6 +363,7 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
     uint8_t used_pin[40];
     memset(used_pin, 0, sizeof(used_pin));
     uint16_t n_axes = 0, n_enc = 0, n_btn = 0, n_as5600 = 0, n_bat = 0, n_led = 0;
+    uint16_t n_ledcfg = 0;  // F-14: persistent LED config records (max 1)
     uint8_t has_hpattern = 0;
     // Pre-scan: I2C kinds (ADS1115/expander/AS5600) hon to GPIO21/22 I2C
     // hain (R-L9) — direct pin istemal neeche reject hota hai.
@@ -347,13 +379,36 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
     for (uint8_t i = 0; i < mc; i++) {
       const uint8_t *r = blob + RSH_CFG_HEADER_SIZE + (size_t)i * RSH_CFG_RECORD_SIZE;
       uint8_t type = r[0];
-      if (type < 1 || type > 12) {
+      if (type < 1 || type > 13) {
         RSH_CFG_ADD_ERR(RSH_CFG_ERR_UNKNOWN_TYPE);
         if (status == RSH_CTRL_OK) status = RSH_CTRL_UNSUPPORTED;
         continue;
       }
+      if (type == RSH_CFG_TYPE_LED_CONFIG) {
+        // F-14: persistent LED config — koi pin nahi, flags 0, pattern
+        // 0..4, brightness 0..100. Generic pin loop is record ko skip
+        // karta hai (neeche continue se pehle check hota hai).
+        n_ledcfg++;
+        if (n_ledcfg > 1 || r[1] != 0 || r[2] != 0 || r[3] != 0xFF ||
+            r[4] != 0xFF || r[5] != 0xFF ||
+            r[6 + RSH_CFG_LED_CONFIG_PATTERN_PARAM] > 4 ||
+            r[6 + RSH_CFG_LED_CONFIG_BRIGHTNESS_PARAM] > 100) {
+          RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
+          if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
+        }
+        continue;
+      }
       if (type == RSH_CFG_TYPE_AXIS_ADC || type == RSH_CFG_TYPE_AXIS_ADS1115
           || type == RSH_CFG_TYPE_AXIS_GENERIC) n_axes++;
+      // F-15: handbrake AXIS slot 4 ke flags mein sirf bit0 (button mode)
+      // allowed hai — baaqi bits set hon to reject (pin ho ya na ho).
+      if ((type == RSH_CFG_TYPE_AXIS_ADC ||
+           type == RSH_CFG_TYPE_AXIS_GENERIC) &&
+          r[1] == 4 &&
+          (r[2] & (uint8_t)~RSH_CFG_HANDBRAKE_BUTTON_FLAG) != 0) {
+        RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
+        if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
+      }
       else if (type == RSH_CFG_TYPE_AXIS_AS5600) {
         // Phase G WS4: AS5600 axis hai (axes limit mein gina jata hai);
         // fixed I2C addr 0x36 ki wajah se max 1 per board.
@@ -381,6 +436,13 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
       else if (type == RSH_CFG_TYPE_SHIFTER) {
         // Phase F WS5: gate mode params[0] mein (record offset 6).
         uint8_t mode = r[6];
+        // D-4 (v4.0.2): sensitivity params[4] mein (record offset 10),
+        // 0..100 — dono modes par check hota hai.
+        if (r[6 + RSH_CFG_SHIFTER_SENSITIVITY_PARAM] > 100) {
+          RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
+          if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
+          continue;
+        }
         if (mode > 1) {
           RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
           if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
@@ -445,6 +507,14 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
             rule = RSH_PIN_RULE_PULLUP;
           else if (type == RSH_CFG_TYPE_LED_STRIP)
             rule = RSH_PIN_RULE_DIGOUT;
+          // F-15 (v4.0.2): handbrake button mode — AXIS slot 4, flags
+          // bit0 set ho to pinA DIGITAL button hai (ADC1 rule nahi,
+          // PULLUP rule lagta hai).
+          if ((type == RSH_CFG_TYPE_AXIS_ADC ||
+               type == RSH_CFG_TYPE_AXIS_GENERIC) &&
+              r[1] == 4 && (r[2] & RSH_CFG_HANDBRAKE_BUTTON_FLAG)) {
+            rule = RSH_PIN_RULE_PULLUP;
+          }
         } else if (p == 4) {
           if (type == RSH_CFG_TYPE_ENCODER ||
               type == RSH_CFG_TYPE_BUTTON_MATRIX)
@@ -560,6 +630,80 @@ static inline uint8_t rsh_cfg_has_clutch(const uint8_t *blob, size_t len,
   return 0;
 }
 
+// ---------- v4.0.2 getters (F-14 / F-15 / D-4) ----------
+// Sab pehle blob validate karte hain — kharab blob se kabhi value nahi.
+
+// Persistent LED config (F-14, type-13 record). Return 1 = record mila
+// (out bhari hui: patternId, rgb, brightness), 0 = record nahi / blob
+// invalid (caller default = strip off rakhe).
+typedef struct {
+  uint8_t pattern_id;  // 0 OFF / 1 SOLID / 2 BLINK / 3 CHASE / 4 RAINBOW
+  uint8_t r, g, b;
+  uint8_t brightness;  // 0..100
+} RshLedConfig;
+
+static inline uint8_t rsh_cfg_led_config(const uint8_t *blob, size_t len,
+                                         RshLedConfig *out) {
+  if (!blob || !out) return 0;
+  if (rsh_cfg_blob_validate(blob, len, NULL, NULL) != RSH_CTRL_OK) return 0;
+  uint8_t mc = blob[5];
+  for (uint8_t i = 0; i < mc; i++) {
+    const uint8_t *r = blob + RSH_CFG_HEADER_SIZE + (size_t)i * RSH_CFG_RECORD_SIZE;
+    if (r[0] == RSH_CFG_TYPE_LED_CONFIG) {
+      out->pattern_id = r[6 + RSH_CFG_LED_CONFIG_PATTERN_PARAM];
+      out->r = r[6 + RSH_CFG_LED_CONFIG_R_PARAM];
+      out->g = r[6 + RSH_CFG_LED_CONFIG_G_PARAM];
+      out->b = r[6 + RSH_CFG_LED_CONFIG_B_PARAM];
+      out->brightness = r[6 + RSH_CFG_LED_CONFIG_BRIGHTNESS_PARAM];
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// Handbrake button mode (F-15): AXIS slot-4 record flags bit0 set ho to
+// 1 + pin_out mein pinA (digital button pin). Axis mode ho to 0.
+static inline uint8_t rsh_cfg_handbrake_button_mode(const uint8_t *blob, size_t len,
+                                                    uint8_t *pin_out) {
+  if (!blob) return 0;
+  if (rsh_cfg_blob_validate(blob, len, NULL, NULL) != RSH_CTRL_OK) return 0;
+  uint8_t mc = blob[5];
+  for (uint8_t i = 0; i < mc; i++) {
+    const uint8_t *r = blob + RSH_CFG_HEADER_SIZE + (size_t)i * RSH_CFG_RECORD_SIZE;
+    uint8_t type = r[0];
+    if ((type == RSH_CFG_TYPE_AXIS_ADC ||
+         type == RSH_CFG_TYPE_AXIS_GENERIC) &&
+        r[1] == 4 && (r[2] & RSH_CFG_HANDBRAKE_BUTTON_FLAG) && r[3] != 0xFF) {
+      if (pin_out) *pin_out = r[3];
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// Shifter sensitivity (D-4): type-11 record params[4], 0..100; record
+// na ho to default 50. Blob invalid ho to bhi default 50 (fail closed —
+// slider ki kami se shifter kabhi band nahi hota).
+static inline uint8_t rsh_cfg_shifter_sensitivity(const uint8_t *blob, size_t len) {
+  if (!blob) return RSH_CFG_SHIFTER_SENSITIVITY_DEFAULT;
+  if (rsh_cfg_blob_validate(blob, len, NULL, NULL) != RSH_CTRL_OK)
+    return RSH_CFG_SHIFTER_SENSITIVITY_DEFAULT;
+  uint8_t mc = blob[5];
+  for (uint8_t i = 0; i < mc; i++) {
+    const uint8_t *r = blob + RSH_CFG_HEADER_SIZE + (size_t)i * RSH_CFG_RECORD_SIZE;
+    if (r[0] == RSH_CFG_TYPE_SHIFTER)
+      return r[6 + RSH_CFG_SHIFTER_SENSITIVITY_PARAM];
+  }
+  return RSH_CFG_SHIFTER_SENSITIVITY_DEFAULT;
+}
+
+// Sensitivity (0..100) -> gear debounce (ms): 0 → 20 ms (sust),
+// 50 → 13 ms (default, purane 10 ms ke qareeb), 100 → 5 ms (tez).
+static inline uint8_t rsh_shifter_debounce_ms(uint8_t sensitivity) {
+  if (sensitivity > 100) sensitivity = 100;
+  return (uint8_t)(20u - (uint16_t)sensitivity * 15u / 100u);
+}
+
 // ---------- Transaction state machine ----------
 typedef enum {
   RSH_TXN_IDLE = 0,       // kuch staged nahi, koi confirm window nahi
@@ -584,6 +728,12 @@ typedef struct {
   uint32_t commit_ms;                         // COMMIT kab hua (millis)
   uint32_t confirm_deadline_ms;               // commit_ms + 30000 (wrap-safe compare)
   uint16_t cfg_version;                       // current config ki version
+  // F-06 (v4.0.2): dirty flag — current blob badla ho to 1. rsh.ino ka
+  // loop is par modules/inputs/LED dobara lagata hai aur flag saaf karta
+  // hai. Pehle har loop mein poora blob memcmp hota tha (<= 2 KB) — ab
+  // sirf mutation points (load/commit/revert/boot-recover) flag lagate
+  // hain; CONFIRM current bytes nahi badalta, is liye flag nahi lagata.
+  uint8_t cfg_dirty;
 } rsh_cfg_txn_t;
 
 static inline void rsh_cfg_txn_init(rsh_cfg_txn_t *t) {
@@ -609,6 +759,7 @@ static inline uint8_t rsh_cfg_txn_load_current(rsh_cfg_txn_t *t, const uint8_t *
   t->cfg_version = rsh_get_u16(blob + 6);
   t->state = RSH_TXN_IDLE;
   t->has_previous = 0;
+  t->cfg_dirty = 1;  // F-06: boot/factory load bhi apply mangta hai
   return RSH_CTRL_OK;
 }
 
@@ -693,6 +844,7 @@ static inline uint8_t rsh_cfg_commit(rsh_cfg_txn_t *t, uint32_t now_ms,
   t->commit_ms = now_ms;
   t->confirm_deadline_ms = now_ms + RSH_CFG_CONFIRM_TIMEOUT_MS;
   t->state = RSH_TXN_COMMITTED;
+  t->cfg_dirty = 1;  // F-06: nayi config live — loop apply karega
   return RSH_CTRL_OK;
 }
 
@@ -710,6 +862,7 @@ static inline uint8_t rsh_cfg_confirm(rsh_cfg_txn_t *t, uint32_t now_ms) {
       memcpy(t->current, t->previous, t->previous_len);
       t->current_len = t->previous_len;
       t->cfg_version = rsh_get_u16(t->current + 6);
+      t->cfg_dirty = 1;  // F-06: rollback apply mangta hai
     }
     t->has_previous = 0;
     memset(t->staged, 0, sizeof(t->staged));
@@ -737,6 +890,7 @@ static inline uint8_t rsh_cfg_revert(rsh_cfg_txn_t *t) {
     memcpy(t->current, t->previous, t->previous_len);
     t->current_len = t->previous_len;
     t->cfg_version = rsh_get_u16(t->current + 6);
+    t->cfg_dirty = 1;  // F-06: purani config wapas — loop apply karega
   }
   t->has_previous = 0;
   memset(t->staged, 0, sizeof(t->staged));
@@ -758,6 +912,7 @@ static inline uint8_t rsh_cfg_tick(rsh_cfg_txn_t *t, uint32_t now_ms) {
     memcpy(t->current, t->previous, t->previous_len);
     t->current_len = t->previous_len;
     t->cfg_version = rsh_get_u16(t->current + 6);
+    t->cfg_dirty = 1;  // F-06: timeout rollback apply mangta hai
   }
   t->has_previous = 0;
   memset(t->staged, 0, sizeof(t->staged));
@@ -784,6 +939,7 @@ static inline uint8_t rsh_cfg_boot_recover(rsh_cfg_txn_t *t, uint8_t pending_con
     memcpy(t->current, t->previous, t->previous_len);
     t->current_len = t->previous_len;
     t->cfg_version = rsh_get_u16(t->current + 6);
+    t->cfg_dirty = 1;  // F-06: boot rollback apply mangta hai
   }
   t->has_previous = 0;
   memset(t->staged, 0, sizeof(t->staged));

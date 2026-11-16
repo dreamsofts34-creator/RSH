@@ -1,0 +1,478 @@
+// RSH v2.0 — Setup wizard (REDESIGN-PLAN §7.6, preview Setup.html;
+// LOGIC-FIX-PLAN §4.2 Pairing Manager). First-time setup: 4 steps
+// (Connect, Pair, Calibrate, Games), 920x580, dark theme.
+//
+// Wiring note (Phase 6): this screen is standalone — the shell
+// (Phase 3, main.slint) shows it instead of the main pages while
+// setup is unfinished, and the Rust side drives it from the
+// Pairing Manager + AppApi. All live values arrive as properties;
+// the screen never polls. The countdown ring arc comes from the
+// Rust side as `ring-commands` (Pairing Manager
+// `countdown_ring_commands`, board-clamped — never longer than the
+// board reports). Password/key, pin map, and firmware are
+// deliberately NOT in this screen: advanced-only, shown only when
+// needed (§7.6). "Skip for now" is always present (left column).
+
+import { Theme } from "../tokens.slint";
+import { Btn } from "../components.slint";
+
+component StepRow inherits HorizontalLayout {
+    in property <int> num;
+    in property <string> label;
+    in property <string> sub;
+    in property <bool> done;
+    in property <bool> now;
+    spacing: 12px;
+    Rectangle {
+        width: 26px;
+        height: 26px;
+        border-radius: 13px;
+        border-width: 2px;
+        border-color: done ? transparent : now ? Theme.accent : #34405A;
+        background: done ? Theme.check-bg : now ? Theme.accent : transparent;
+        Text {
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: done ? "✓" : "" + num;
+            font-size: 12px;
+            font-weight: 700;
+            color: done ? Theme.ok : now ? #ffffff : Theme.mute;
+        }
+    }
+    VerticalLayout {
+        spacing: 0px;
+        Text { text: label; font-size: 13px; font-weight: 500; color: now ? #ffffff : Theme.mute; }
+        Text { text: sub; font-size: 11.5px; color: Theme.faint; }
+    }
+}
+
+component PairStepLine inherits HorizontalLayout {
+    in property <int> num;
+    in property <string> text;
+    spacing: 10px;
+    Rectangle {
+        width: 22px;
+        height: 22px;
+        border-radius: 11px;
+        background: Theme.panel2;
+        Text {
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: "" + num;
+            font-size: 11.5px;
+            font-weight: 700;
+            color: Theme.accent-text;
+        }
+    }
+    Text {
+        horizontal-stretch: 1;
+        // Explicit 344px (steps column 376 - circle 22 - gap 10):
+        // same content-sizing note as the steps column above.
+        width: 344px;
+        text: text;
+        font-size: 13.5px;
+        color: Theme.text;
+        wrap: word-wrap;
+    }
+}
+
+export component SetupWizard inherits Rectangle {
+    width: Theme.window-width;
+    height: Theme.window-height;
+    background: Theme.bg;
+
+    // 0 Connect, 1 Pair, 2 Calibrate, 3 Games.
+    in-out property <int> step: 1;
+    // Step 0 — Connect.
+    in property <bool> connect-done: false;
+    in property <bool> wifi-joined: false;
+    in property <int> transport: 0; // 0 Wi-Fi, 1 USB
+    in property <string> address: "rsh.local";
+    // Step 1 — Pair (driven by the Pairing Manager).
+    in property <int> pair-seconds-left: 48;
+    in property <int> pair-total: 120;
+    in property <string> ring-commands: "";
+    in property <string> pair-status: "Waiting for the wheel…";
+    in property <string> pair-error: "";
+    in property <bool> pairing-active: false;
+    in property <bool> usb-available: false;
+    in property <bool> paired: false;
+    in property <bool> reset-required: false;
+    // Step 2 — Calibrate.
+    in property <bool> centre-done: false;
+    in property <bool> pedals-done: false;
+    // Step 3 — Games.
+    in property <string> games-text: "No games found yet.";
+    in property <bool> games-done: false;
+
+    callback back();
+    callback next();
+    callback skip();
+    callback begin-pairing();
+    callback use-usb();
+    callback retry-pairing();
+    callback reset-pairing();
+    callback connect-action(string);
+    callback calibrate-action(string);
+    callback find-games();
+
+    property <bool> next-enabled: step == 0 ? connect-done : step == 1 ? paired : step == 2 ? (centre-done && pedals-done) : true;
+    property <string> step-title: step == 0 ? "Connect your wheel" : step == 1 ? "Pair your wheel" : step == 2 ? "Calibrate your wheel" : "Find your games";
+    property <string> step-lead: step == 0 ? "Join the wheel's Wi-Fi, or plug in a USB cable." : step == 1 ? "Pairing keeps your wheel safe, so only this PC can control it." : step == 2 ? "Centre the wheel and set the pedals, so the game gets true inputs." : "RSH finds your racing games and switches profile automatically.";
+
+    HorizontalLayout {
+        // Explicit 920px (not 100%): the wizard is a fixed-size
+        // 920x580 screen. (Layout note: the right column sizes to
+        // content here, so full-width elements carry explicit 584px
+        // widths — (920 - 264 - 2*36) — the same explicit-width
+        // pattern as the Pedals/Settings fixes.)
+        width: 920px;
+        height: 100%;
+        // Left column: logo + steps + Skip (preview: 264px).
+        Rectangle {
+            width: 264px;
+            height: 100%;
+            background: Theme.side;
+            VerticalLayout {
+                width: 100%;
+                height: 100%;
+                padding-top: 24px;
+                padding-bottom: 24px;
+                padding-left: 22px;
+                padding-right: 22px;
+                spacing: 6px;
+                Rectangle {
+                    width: 36px;
+                    height: 36px;
+                    border-radius: 10px;
+                    background: Theme.accent;
+                    Image {
+                        x: 7px;
+                        y: 7px;
+                        width: 22px;
+                        height: 22px;
+                        source: @image-url("../../assets/icons/wheel.svg");
+                    }
+                }
+                Text { text: "Set up your wheel"; font-size: 20px; font-weight: 700; color: Theme.text; }
+                Text { text: "About 3 minutes. You only do this once."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
+                Rectangle { height: 16px; }
+                StepRow { num: 1; label: "Connect"; sub: "Wi-Fi · rsh.local"; done: step > 0 || connect-done; now: step == 0; }
+                StepRow { num: 2; label: "Pair"; sub: "Link this PC to your wheel"; done: paired; now: step == 1; }
+                StepRow { num: 3; label: "Calibrate"; sub: "Centre and pedals"; done: step > 2; now: step == 2; }
+                StepRow { num: 4; label: "Games"; sub: "Find your racing games"; done: games-done; now: step == 3; }
+                Rectangle { vertical-stretch: 1; }
+                TouchArea {
+                    width: 100%;
+                    height: 20px;
+                    accessible-label: "Skip for now";
+                    accessible-role: button;
+                    clicked => { skip(); }
+                    // (was `fs` — duplicated id in this component, see below)
+                    skip-fs := FocusScope {
+                        width: 100%;
+                        height: 100%;
+                        key-pressed(event) => {
+                            if (event.text == Key.Return || event.text == Key.Space) {
+                                skip();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                    Text { text: "Skip for now"; font-size: 12.5px; font-weight: 600; color: Theme.accent-text; }
+                }
+            }
+            Rectangle { x: 263px; width: 1px; height: 100%; background: Theme.line; }
+        }
+        // Right column: step content.
+        VerticalLayout {
+            horizontal-stretch: 1;
+            padding-top: 28px;
+            padding-bottom: 28px;
+            padding-left: 36px;
+            padding-right: 36px;
+            spacing: 0px;
+            Text { text: "Step " + (step + 1) + " of 4"; font-size: 11.5px; font-weight: 700; color: Theme.accent-text; }
+            Text { text: step-title; font-size: 22px; font-weight: 700; color: Theme.text; }
+            Text { text: step-lead; font-size: 13.5px; color: Theme.mute; }
+
+            // ---- Step 0: Connect ----
+            // (horizontal-stretch: the right column is 656px wide, but
+            // a VerticalLayout child takes its preferred width unless
+            // stretched — without this the cards sat at ~384px and the
+            // footer at ~420px, ending x=684 instead of x=884.)
+            if step == 0 : VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 12px;
+                Rectangle { height: 10px; }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    height: 64px;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel;
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 12px;
+                        Text { vertical-alignment: center; text: "Wi-Fi"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: wifi-joined ? "Joined the RSH network" : "Join the RSH Wi-Fi network on this PC"; font-size: 12.5px; color: Theme.mute; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Btn { label: transport == 0 ? "Connected" : "Use Wi-Fi"; primary: transport == 0; clicked => { connect-action("wifi"); } }
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    height: 64px;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel;
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 12px;
+                        Text { vertical-alignment: center; text: "USB"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: usb-available ? "USB cable connected" : "Plug in a USB cable for the fastest setup"; font-size: 12.5px; color: Theme.mute; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Btn { label: transport == 1 ? "Connected" : "Use USB"; primary: transport == 1; clicked => { connect-action("usb"); } }
+                    }
+                }
+                Text { text: "Wheel address: " + address; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
+            }
+
+            // ---- Step 1: Pair ----
+            if step == 1 : VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 0px;
+                Rectangle { height: 22px; }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel;
+                    HorizontalLayout {
+                        padding-top: 24px;
+                        padding-bottom: 24px;
+                        padding-left: 24px;
+                        padding-right: 24px;
+                        spacing: 28px;
+                        // Countdown ring (132px, preview geometry).
+                        Rectangle {
+                            width: 132px;
+                            height: 132px;
+                            Path {
+                                width: 100%;
+                                height: 100%;
+                                viewbox-width: 132;
+                                viewbox-height: 132;
+                                commands: "M 66 8 A 58 58 0 1 1 66 124 A 58 58 0 1 1 66 8";
+                                fill: transparent;
+                                stroke: Theme.track;
+                                stroke-width: 9px;
+                            }
+                            Path {
+                                width: 100%;
+                                height: 100%;
+                                viewbox-width: 132;
+                                viewbox-height: 132;
+                                commands: ring-commands;
+                                fill: transparent;
+                                stroke: Theme.accent;
+                                stroke-width: 9px;
+                            }
+                            Text {
+                                width: 100%;
+                                height: 100%;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                text: "" + pair-seconds-left;
+                                font-family: Theme.font-mono;
+                                font-size: 30px;
+                                font-weight: 600;
+                                color: Theme.text;
+                            }
+                        }
+                        VerticalLayout {
+                            // Explicit 376px (card 584 - padding 48 -
+                            // ring 132 - gap 28): layouts in this
+                            // subtree size to content, so the step
+                            // lines wrapped at ~60px without it.
+                            width: 376px;
+                            horizontal-stretch: 1;
+                            spacing: 12px;
+                            vertical-stretch: 1;
+                            if reset-required : PairStepLine { num: 1; text: "This wheel is already paired."; }
+                            if reset-required : PairStepLine { num: 2; text: "Reset pairing: hold BOOT for 10 seconds."; }
+                            if reset-required : PairStepLine { num: 3; text: "Then pair again — the window opens by itself."; }
+                            if !reset-required : PairStepLine { num: 1; text: "Turn on the wheel and wait for the light to blink."; }
+                            if !reset-required : PairStepLine { num: 2; text: "Hold the pair button on the wheel for 3 seconds."; }
+                            if !reset-required : PairStepLine { num: 3; text: "Keep this window open. It finishes by itself."; }
+                            if !pairing-active && !paired && !reset-required : Btn { label: "Begin pairing"; primary: true; clicked => { begin-pairing(); } }
+                            if !pairing-active && !paired && reset-required : Btn { label: "Reset pairing"; primary: true; clicked => { reset-pairing(); } }
+                            if pairing-active && !paired && pair-error == "" : Btn { label: "Retry"; clicked => { retry-pairing(); } }
+                        }
+                    }
+                }
+                Rectangle { height: 14px; }
+                // Live status bar.
+                Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    height: 40px;
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        spacing: 10px;
+                        Rectangle {
+                            width: 9px;
+                            height: 9px;
+                            border-radius: 5px;
+                            background: paired ? Theme.ok : Theme.warn;
+                        }
+                        Text { vertical-alignment: center; text: paired ? "Paired — wheel connected." : pair-status; font-size: 12.5px; color: Theme.mute; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { vertical-alignment: center; text: paired ? "" : pair-seconds-left + " seconds left"; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
+                    }
+                }
+                if pair-error != "" : Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    height: 34px;
+                    Text {
+                        vertical-alignment: center;
+                        text: pair-error;
+                        font-size: 12.5px;
+                        color: Theme.bad;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            // ---- Step 2: Calibrate ----
+            if step == 2 : VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 12px;
+                Rectangle { height: 10px; }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    height: 64px;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel;
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 12px;
+                        Text { vertical-alignment: center; text: "Centre"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: centre-done ? "Centre set" : "Hold the wheel straight, then set the centre"; font-size: 12.5px; color: Theme.mute; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Btn { label: centre-done ? "Set ✓" : "Set centre"; primary: !centre-done; clicked => { calibrate-action("centre"); } }
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    height: 64px;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel;
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 12px;
+                        Text { vertical-alignment: center; text: "Pedals"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: pedals-done ? "Pedals set" : "Press each pedal fully, then set"; font-size: 12.5px; color: Theme.mute; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Btn { label: pedals-done ? "Set ✓" : "Set pedals"; primary: !pedals-done; clicked => { calibrate-action("pedals"); } }
+                    }
+                }
+            }
+
+            // ---- Step 3: Games ----
+            if step == 3 : VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 12px;
+                Rectangle { height: 10px; }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    height: 64px;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel;
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 12px;
+                        Text { vertical-alignment: center; text: games-text; font-size: 13.5px; color: Theme.mute; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Btn { label: "Find games"; primary: true; clicked => { find-games(); } }
+                    }
+                }
+                Text { text: "RSH switches profile automatically when a game starts."; font-size: 12.5px; color: Theme.mute; }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+            // Footer: USB hint + Back / Next. Next is gated: Pair
+            // only completes when the session is Active (never on
+            // "password saved" alone).
+            HorizontalLayout {
+                horizontal-stretch: 1;
+                width: 584px;
+                spacing: 8px;
+                TouchArea {
+                    height: 36px;
+                    accessible-label: "Wheel not found? Use a USB cable";
+                    accessible-role: button;
+                    clicked => { use-usb(); }
+                    // (was `fs` — ids are component-scoped, so the Skip
+                    // link's FocusScope above must not share the name)
+                    usb-fs := FocusScope {
+                        width: 100%;
+                        height: 100%;
+                        key-pressed(event) => {
+                            if (event.text == Key.Return || event.text == Key.Space) {
+                                use-usb();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+                    Text { vertical-alignment: center; text: "Wheel not found? Use a USB cable"; font-size: 12.5px; font-weight: 600; color: Theme.accent-text; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                if step > 0 : Btn { label: "Back"; clicked => { back(); } }
+                if next-enabled : Btn { label: step == 3 ? "Finish" : "Next"; primary: true; clicked => { next(); } }
+                if !next-enabled : Rectangle {
+                    width: 76px;
+                    height: 30px;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel2;
+                    opacity: 0.45;
+                    Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: "Next"; font-size: 12px; font-weight: 600; color: Theme.text; }
+                }
+            }
+        }
+    }
+}

@@ -13,7 +13,7 @@
 //! splitting either would hurt readability without helping review.
 //!
 //! Seeded virtual wheel + real `WheelEngine` + recording output,
-//! 27 scenarios, three modes:
+//! 30 scenarios, three modes:
 //!
 //! * `quick` — every scenario at its short duration (~8 min total).
 //! * `full` — longer durations incl. the 10-minute soak (~15 min).

@@ -1,0 +1,192 @@
+// RSH v2.0 — Profile popover (REDESIGN-PLAN §8.4). Opens from the
+// profile button in the top bar. Content only — the shell positions
+// this card under the profile button and hides it on outside click /
+// Esc; it does NOT own the Window.
+//
+// Sections: Presets (read-only, duplicable) + My profiles. Each row:
+// name, linked game, Active tick. Footer: New / Duplicate / Rename /
+// Delete / Link to game act on the selected row. Switching profiles
+// with unsaved changes shows the Save / Discard prompt first (§8.4):
+// Rust sets `show-unsaved-prompt` + `pending-name` when the user picks
+// a different profile while `unsaved` is true; the prompt callbacks
+// resolve the pending switch. Rename opens the rename UI on the Rust
+// side (no inline editor here — the popover is 300px wide and the
+// rename flow lives with the profile store at integration).
+// The profile store itself is NOT an AppApi method yet, so the lists
+// are Rust-owned props (sim data until the store lands).
+
+import { Theme } from "../tokens.slint";
+import { Card, Btn, Pill } from "../components.slint";
+
+export struct ProfileItem {
+    name: string,
+    game: string,
+    active: bool,
+}
+
+// One profile row: name + linked game + Active tick + Use button.
+component ProfileRowItem inherits Rectangle {
+    in property <string> name;
+    in property <string> game;
+    in property <bool> active;
+    in property <bool> selected;
+    in property <bool> is-preset;
+    callback clicked();
+    callback use-clicked();
+    accessible-label: name + ", " + game;
+    accessible-role: list-item;
+    height: 44px;
+    border-radius: 8px;
+    background: fs.has-focus || selected ? Theme.acc-bg : transparent;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        // Active tick
+        Rectangle {
+            width: 18px;
+            height: 18px;
+            border-radius: 9px;
+            background: active ? Theme.check-bg : transparent;
+            border-width: active ? 0px : 1px;
+            border-color: Theme.line;
+            Text {
+                width: 100%;
+                height: 100%;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                text: active ? "✓" : "";
+                font-size: 10px;
+                font-weight: 700;
+                color: Theme.ok;
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 0px;
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: start;
+                Text { text: name; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                if is-preset : Pill { label: "Preset"; bg: Theme.panel2; fg: Theme.faint; }
+            }
+            Text { text: game; font-size: 11.5px; color: Theme.mute; }
+        }
+        if !active : Btn { label: "Use"; clicked => { use-clicked(); } }
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+export component ProfilePopover inherits Card {
+    in property <[ProfileItem]> presets;
+    in property <[ProfileItem]> profiles;
+    in property <bool> unsaved: false;
+    in property <bool> show-unsaved-prompt: false;
+    in property <string> pending-name: "";
+    // selected row: 0..presets.length-1 = preset, presets.length.. = my profile
+    in-out property <int> selected: 0;
+
+    callback use-preset(int);
+    callback use-profile(int);
+    callback new-profile();
+    callback duplicate-selected();
+    callback rename-selected();
+    callback delete-selected();
+    callback link-selected();
+    callback save-and-switch();
+    callback discard-and-switch();
+    callback cancel-switch();
+    callback closed();
+
+    width: 300px;
+    // Esc target (stock-widget pattern): a zero-size FocusScope; the
+    // shell focuses the popover on open so Esc reaches it.
+    FocusScope {
+        width: 0px;
+        height: 0px;
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                closed();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    VerticalLayout {
+        padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
+        spacing: 10px;
+        HorizontalLayout {
+            Text { text: "Profiles"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+            Rectangle { horizontal-stretch: 1; }
+            if unsaved : Text { text: "● Unsaved changes"; font-size: 11.5px; font-weight: 600; color: Theme.warn; }
+        }
+        Text { text: "Presets"; font-size: 10.5px; font-weight: 600; color: Theme.faint; }
+        VerticalLayout {
+            spacing: 2px;
+            for p[i] in presets : ProfileRowItem {
+                name: p.name;
+                game: p.game;
+                active: p.active;
+                selected: selected == i;
+                is-preset: true;
+                clicked => { selected = i; }
+                use-clicked => { use-preset(i); }
+            }
+        }
+        Text { text: "My profiles"; font-size: 10.5px; font-weight: 600; color: Theme.faint; }
+        VerticalLayout {
+            spacing: 2px;
+            if profiles.length == 0 : Text { text: "No profiles yet — press New to create one."; font-size: 12px; color: Theme.faint; wrap: word-wrap; }
+            for p[i] in profiles : ProfileRowItem {
+                name: p.name;
+                game: p.game;
+                active: p.active;
+                selected: selected == presets.length + i;
+                is-preset: false;
+                clicked => { selected = presets.length + i; }
+                use-clicked => { use-profile(i); }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.line; }
+        HorizontalLayout {
+            spacing: 6px;
+            Btn { label: "New"; clicked => { new-profile(); } }
+            Btn { label: "Duplicate"; clicked => { duplicate-selected(); } }
+            Btn { label: "Rename"; clicked => { rename-selected(); } }
+            Btn { label: "Delete"; clicked => { delete-selected(); } }
+        }
+        Btn { label: "Link to game"; clicked => { link-selected(); } }
+        Text { text: "Presets are read-only — duplicate one to edit it."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+        // Save / Discard prompt (§8.4): switching with unsaved changes
+        if show-unsaved-prompt : Rectangle {
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.warn;
+            background: Theme.warn-bg;
+            VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                Text { text: "Unsaved changes"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                Text { text: "Save your changes before switching to “" + pending-name + "”?"; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
+                HorizontalLayout {
+                    spacing: 6px;
+                    Btn { label: "Save"; primary: true; clicked => { save-and-switch(); } }
+                    Btn { label: "Discard"; clicked => { discard-and-switch(); } }
+                    Btn { label: "Cancel"; clicked => { cancel-switch(); } }
+                }
+            }
+        }
+    }
+}

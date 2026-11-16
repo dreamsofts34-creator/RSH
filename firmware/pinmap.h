@@ -75,6 +75,8 @@ typedef struct {
   uint8_t ledStrip;   // LED_STRIP slot 0
   uint8_t shiftH[6];  // H-pattern gear pins 1..6 (mode 1 mein)
   uint8_t shifterMode;  // 0 sequential, 1 H-pattern
+  uint8_t handbrakeButtonMode;  // F-15 (v4.0.2): 1 = handbrake pin digital
+                                // button hai (axis nahi) — inputs.cpp dekho
 } RshPinMap;
 
 // Compiled defaults (config.h PIN_* + naye modules) — factory blob ke
@@ -102,6 +104,7 @@ static inline void rsh_pinmap_defaults(RshPinMap *out) {
   out->shiftH[4] = PIN_SHIFT_H5;
   out->shiftH[5] = PIN_SHIFT_H6;
   out->shifterMode = RSH_SHIFTER_MODE;
+  out->handbrakeButtonMode = 0;  // F-15: default axis mode
 }
 
 // Kya ye GPIO live pin table mein kisi function ko diya gaya hai?
@@ -137,6 +140,7 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
   RshPinMap m;
   memset(&m, RSH_PINMAP_ABSENT, sizeof(m));
   m.shifterMode = RSH_SHIFTER_MODE;  // SHIFTER record na ho to sequential
+  m.handbrakeButtonMode = 0;  // F-15: default axis mode (memset 0xFF ke baad saaf karo)
   // H-pattern gear pins bhi default rakho — sequential mode mein istemal
   // nahi hote, lekin GET_CAPS/debug mein kabhi kachra na dikhe.
   m.shiftH[0] = PIN_SHIFT_H1;
@@ -161,6 +165,11 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
         else if (slot == RSH_PINMAP_AXIS_BRAKE) dst = &m.brake;
         else if (slot == RSH_PINMAP_AXIS_CLUTCH) dst = &m.clutch;
         else if (slot == RSH_PINMAP_AXIS_HANDBRAKE) dst = &m.handbrake;
+        // F-15: handbrake button mode — pehla slot-4 record jeet-ta hai
+        // (pin ki tarah); mode sirf usi record se aata hai.
+        if (slot == RSH_PINMAP_AXIS_HANDBRAKE && dst && *dst == RSH_PINMAP_ABSENT)
+          m.handbrakeButtonMode =
+              (r[2] & RSH_CFG_HANDBRAKE_BUTTON_FLAG) ? 1 : 0;
         if (dst && *dst == RSH_PINMAP_ABSENT) *dst = pinA;  // pehla jeetta hai
         break;
       }

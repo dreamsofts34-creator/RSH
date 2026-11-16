@@ -11,6 +11,7 @@ name = "rsh-rig"
 path = "src/main.rs"
 
 [dependencies]
+rsh-api = { path = "../../crates/rsh-api" }
 rsh-protocol = { path = "../../crates/rsh-protocol" }
 rsh-engine = { path = "../../crates/rsh-engine" }
 rsh-benchmarks = { path = "../rsh-benchmarks" }

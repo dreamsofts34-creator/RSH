@@ -9,8 +9,12 @@
 //   alag command hai — FW-3/§4.4 owns armed state; yahan sirf read API).
 // - Nonce (16 B) SIRF RAM mein hai — har boot par naya (reboot = naya
 //   session, §2.3). NVS mein kabhi nahi.
-// - Pairing window: AP-up se 60 s, sirf unpaired board par. Window ke
-//   baad HELLO mein key/password ZERO bheje jate hain.
+// - Pairing window: transport-independent deadline (F-02/F-03, v4.0.2 —
+//   pairing_window.h): AP-up se 60 s (purana), pair button (BOOT 3 s
+//   hold) se 120 s, ya serial HELO (unpaired board) se 120 s. Window
+//   sirf unpaired board par khulti hai; paired board par open_* no-op.
+// - RNG/NVS fail → begin() false → board normal boot mein aage NAHI
+//   barhta (fail closed, §4.6 — kamzor/repeat key ke saath boot kabhi nahi).
 // - RNG/NVS fail → begin() false → board normal boot mein aage NAHI
 //   barhta (fail closed, §4.6 — kamzor/repeat key ke saath boot kabhi nahi).
 //
@@ -39,7 +43,14 @@ const char *keystore_password(void);     // 24 ASCII chars + NUL (AP + WebOTA)
 const uint8_t *keystore_nonce(void);     // 16 B session nonce (RAM only)
 void keystore_rotate_nonce(void);        // naya session (HELO sessionFlag=1)
 bool keystore_unpaired(void);            // true = abhi tak pair nahi hua
-bool keystore_pairing_open(uint32_t now_ms);  // unpaired + AP-up se 60 s andar
+bool keystore_pairing_open(uint32_t now_ms);  // unpaired + window deadline ke andar
+// Pairing window kholo (F-02/F-03): pair button ya serial HELO se —
+// 120 s, sirf unpaired board par (paired par no-op). Har call deadline
+// dobara set karta hai (serial HELO har dafa refresh karta hai).
+void keystore_open_pair_window(uint32_t now_ms);
+// Window baqi waqt, poore seconds mein (0 = band) — GET_DIAG (F-10) ke
+// liye; HELLO mein jagah nahi hai (F-16: reserved byte, protocol frozen).
+uint16_t keystore_window_remaining_s(uint32_t now_ms);
 void keystore_mark_paired(void);         // pehli HMAC GET_CAPS OK par (§3 step 7)
 void keystore_mark_ap_up(uint32_t now_ms);    // AP up hote hi — window yahin se
 bool keystore_key_reset_armed(void);     // FW-3 owns armed state (§4.4 — rsh.ino se)

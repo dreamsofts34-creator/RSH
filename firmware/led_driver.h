@@ -36,6 +36,12 @@
 //     mein nahi jata jahan pattern "chal raha" ho lekin likha na jaye.
 //   - Pattern khatam hone par driver aakhri frame ke tor par all-off
 //     ek dafa likhta hai (strip purani state par — §3.7), phir inactive.
+//
+// F-14 (v4.0.2): PERSISTENT pattern — config blob ka type-13 record
+// (pattern + rgb + brightness). LED_TEST ke muqable mein ye kabhi
+// khatam nahi hota: test chal raha ho to test dikhta hai, test khatam
+// hote hi persistent pattern wapas aata hai (us ka clock chalta rehta
+// hai). Brightness 0..100 har frame par scale hoti hai (0 = off).
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -57,6 +63,10 @@ typedef void (*rsh_led_sink_fn)(void *user, const RshLedRgb *pixels,
 
 typedef struct {
   RshLedPatternState state;   // chalta hua pattern (led_patterns.h)
+  RshLedPatternState persistentState;  // F-14: persistent pattern state
+  RshLedPattern persistentCfg;         // F-14: persistent pattern config
+  uint8_t hasPersistent;      // 1 = persistent pattern set hai (OFF nahi)
+  uint8_t brightness;         // F-14: 0..100 (default 100)
   RshLedRgb last[RSH_LED_DRIVER_MAX];  // aakhri likha hua frame
   uint8_t ledCount;           // strip mein LEDs (1..60)
   uint8_t frameValid;         // last[] mein frame hai (pehli write ke baad 1)
@@ -74,7 +84,44 @@ static inline uint8_t rsh_led_driver_init(RshLedDriver *drv, uint8_t ledCount,
   drv->ledCount = ledCount;
   drv->sink = sink;
   drv->user = user;
+  drv->brightness = 100;  // F-14: default full brightness
   return 1;
+}
+
+// F-14: persistent pattern set karo (config blob type-13 record se).
+// cfg NULL ya pattern OFF ho to persistent hat jata hai (strip test ke
+// baad off rehti hai). Brightness 0..100 (100 se zyada clamp hoti hai).
+// Persistent pattern kabhi khatam nahi hota (totalMs = 0) — LED_TEST
+// isay pause karta hai, khatam nahi.
+static inline void rsh_led_driver_set_persistent(RshLedDriver *drv,
+                                                 const RshLedPattern *cfg,
+                                                 uint8_t brightness,
+                                                 uint32_t nowMs) {
+  if (!drv) return;
+  if (brightness > 100) brightness = 100;
+  drv->brightness = brightness;
+  if (!cfg || cfg->patternId == RSH_LED_OFF) {
+    drv->hasPersistent = 0;
+    drv->persistentState.active = 0;
+    return;
+  }
+  drv->persistentCfg = *cfg;
+  rsh_led_pattern_start(&drv->persistentState, cfg, nowMs);
+  drv->persistentState.totalMs = 0;  // kabhi khatam nahi (upar dekho)
+  drv->hasPersistent = 1;
+  drv->frameValid = 0;  // agle tick par frame dobara likho
+}
+
+// F-14: sirf brightness badlo (pattern waisa hi).
+static inline void rsh_led_driver_set_brightness(RshLedDriver *drv,
+                                                 uint8_t brightness) {
+  if (!drv) return;
+  drv->brightness = brightness > 100 ? 100 : brightness;
+  drv->frameValid = 0;  // agle tick par frame dobara likho (scale badla)
+}
+
+static inline uint8_t rsh_led_driver_has_persistent(const RshLedDriver *drv) {
+  return (drv && drv->hasPersistent) ? 1 : 0;
 }
 
 // Pattern shuru karo (LED_TEST handler se — callback ki jagah).
@@ -99,13 +146,43 @@ static inline uint8_t rsh_led_driver_start(RshLedDriver *drv,
 // sink likho. Return 1 (sink likha) / 0 (frame waisa hi, ya inactive).
 // Pattern khatam ho to aakhri frame all-off hoti hai (ek dafa), phir
 // driver inactive ho jata hai — agle ticks kuch nahi karte.
+// F-14: test pattern (state) na chal raha ho to persistent pattern
+// (persistentState) render hota hai; test khatam hote hi persistent
+// wapas aata hai. Brightness har pixel par scale hoti hai.
 static inline uint8_t rsh_led_driver_tick(RshLedDriver *drv, uint32_t nowMs) {
-  if (!drv || !drv->sink || !drv->state.active) return 0;
-  uint8_t done = rsh_led_pattern_done(&drv->state, nowMs);
+  if (!drv || !drv->sink) return 0;
+  // Kaun sa pattern render ho: test pehle, warna persistent. Test
+  // khatam hote hi persistent USI tick se wapas aata hai (beech mein
+  // all-off flash nahi); persistent na ho to aakhri all-off frame ek
+  // dafa likhi jati hai (purana behaviour).
+  RshLedPatternState *active = NULL;
+  uint8_t testJustDone = 0;
+  if (drv->state.active) {
+    if (rsh_led_pattern_done(&drv->state, nowMs)) {
+      testJustDone = 1;
+      if (drv->hasPersistent && drv->persistentState.active) {
+        drv->state.active = 0;
+        drv->finalOffSent = 1;
+        active = &drv->persistentState;
+      } else {
+        active = &drv->state;  // aakhri all-off frame (pixel done par 0 deta hai)
+      }
+    } else {
+      active = &drv->state;
+    }
+  } else if (drv->hasPersistent && drv->persistentState.active) {
+    active = &drv->persistentState;
+  }
+  if (!active) return 0;
   RshLedRgb frame[RSH_LED_DRIVER_MAX];
-  for (uint8_t i = 0; i < drv->ledCount; i++)
-    rsh_led_pattern_pixel(&drv->state, nowMs, i, drv->ledCount,
+  for (uint8_t i = 0; i < drv->ledCount; i++) {
+    rsh_led_pattern_pixel(active, nowMs, i, drv->ledCount,
                           &frame[i].r, &frame[i].g, &frame[i].b);
+    // F-14 brightness scale (integer math, round-half-up).
+    frame[i].r = (uint8_t)(((uint16_t)frame[i].r * drv->brightness + 50u) / 100u);
+    frame[i].g = (uint8_t)(((uint16_t)frame[i].g * drv->brightness + 50u) / 100u);
+    frame[i].b = (uint8_t)(((uint16_t)frame[i].b * drv->brightness + 50u) / 100u);
+  }
   uint8_t changed = !drv->frameValid ||
       (memcmp(frame, drv->last, (size_t)drv->ledCount * sizeof(RshLedRgb)) != 0);
   if (changed) {
@@ -113,9 +190,7 @@ static inline uint8_t rsh_led_driver_tick(RshLedDriver *drv, uint32_t nowMs) {
     memcpy(drv->last, frame, (size_t)drv->ledCount * sizeof(RshLedRgb));
     drv->frameValid = 1;
   }
-  if (done) {
-    // Aakhri frame all-off hai (pixel() done par (0,0,0) deta hai) —
-    // wo upar likhi ja chuki (changed ho to) ya pehle se off thi.
+  if (testJustDone && active == &drv->state) {
     drv->finalOffSent = 1;
     drv->state.active = 0;
   }

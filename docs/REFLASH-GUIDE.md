@@ -18,6 +18,35 @@ aur `reference/docs/BRICK-RECOVERY.md`.
 | Firmware v4.0.1 → v4.0.1 dobara flash | No-op — version wahi rehti hai; sirf tab karo jab image corrupt lage |
 | Config kharab ho gayi / board ajeeb behave karta hai | Pehle app se **FACTORY_RESET** (opcode `0x08`) try karo — reflash nahi; factory reset key + Wi-Fi password **barkarar** rakhta hai |
 
+## 0.1 Firmware v4.0.2 notes (v2.0 app)
+
+Firmware **v4.0.2** is the v2.0 firmware. It adds the pair button and
+the v2.0 features, and changes nothing about how firmware is
+delivered or verified:
+
+- **Pair button (new):** on an **unpaired** board, hold **BOOT for 3
+  seconds** (release before 5 s) to open a **120-second** pairing
+  window — the LED blinks (3 Hz) while it is open. On a paired board
+  the 3-second hold does nothing; re-pairing a paired board still
+  needs a 10-second KEY_RESET first. See
+  [USER-GUIDE.md](USER-GUIDE.md#pairing).
+- **Degraded mode with firmware v4.0.1:** the v2.0 app works with a
+  v4.0.1 board, but the pairing experience stays the old one — no
+  pair button, only the 60-second boot window (or USB pairing). The
+  app detects the firmware version from `GET_CAPS` and shows the
+  matching instructions. To get the pair button, flash v4.0.2.
+- **Signed OTA unchanged:** firmware updates still go through signed
+  WebOTA / app upload, Ed25519 verify-before-apply, anti-downgrade.
+  Nothing about signing, the key, or the OTA flow changed.
+- **Protocol v2.1 unchanged:** the wire protocol is frozen — v4.0.2
+  speaks exactly the same protocol as v4.0.1.
+- **Merged factory image v4.0.2:** `RSH-Firmware-DevKitV1-v4.0.2.bin`,
+  **960,112 B** (SHA-256
+  `c47f564111e0aa5d69b952110c366ffc877e09bb89a2857026a9094d91237924`).
+  Same flashing procedure as §3 below — only the file name, size and
+  hash differ. The v4.0.1 sizes in this guide still apply to v4.0.1
+  images.
+
 ## 1. Kya chahiye
 
 | Cheez | Kahan se |
@@ -132,6 +161,7 @@ iteration GPIO0 / BOOT button parhta hai):
 
 | Hold | Natija |
 |---|---|
+| 3 s ≤ hold < 5 s | **Pair button** (firmware v4.0.2 only, **unpaired** board) — 120-second pairing window khulti hai (LED 3 Hz blink). Paired board par is hold ka koi asar nahi. v4.0.1 par pair button nahi hai: is hold se kuch nahi hota |
 | 5 s ≤ hold < 10 s | **Safe mode** — factory pin map + AP; config apply nahi hoti (stage + commit `BUSY (7)` se roke jate hain) |
 | hold ≥ 10 s | **Key-reset-armed** (KEY_RESET ke liye — sirf is state mein `0x0B` chalta hai) |
 

@@ -24,6 +24,8 @@
 #include "webota.h"
 #include "status_led.h"
 #include "serial_link.h"  // Phase G: wired USB-serial transport (D26/OPEN-20)
+#include "sample_task.h"  // F-06: dedicated sampling task mailbox (pure)
+#include "diag_log.h"    // F-10: diagnostics ring log + GET_DIAG
 
 // Fail closed: RSH_DEBUG prints aur wired transport ek hi Serial istemal
 // karte hain — dono ek saath on hon to prints "RSHS" frame stream kharab
@@ -35,16 +37,22 @@
 static uint16_t seq = 0;
 static uint16_t statusSeq = 0;   // status packet sequence (data seq se alag)
 static uint32_t lastStatusMs = 0;
-static uint16_t seqGap = 0;      // D5: boot se skip hue stream ticks
+static volatile uint16_t seqGap = 0;      // D5: boot se skip hue stream ticks
 static uint16_t lastSentSeqGap = 0;  // v2 tick-skipped flag ke liye (Phase E WS5)
 static bool keyOk = false;       // FW-8: keystore (key/nonce) tayyar hai?
 static uint32_t nextTickUs = 0;
-static uint32_t overrunCount = 0;     // cycles jin ka kaam period se zyada lamba hua
-static uint32_t maxCycleUs = 0;       // sab se lamba cycle kaam (board par timing test ke liye)
+static volatile uint32_t overrunCount = 0;     // cycles jin ka kaam period se zyada lamba hua
+static volatile uint32_t maxCycleUs = 0;       // sab se lamba cycle kaam (board par timing test ke liye)
 static bool netOk = false;            // latched: fail ho to loop sirf retry karta hai
 static uint32_t lastRetryMs = 0;
-static bool prevCycleOverran = false;
+static volatile bool prevCycleOverran = false;
 static bool otaActive = false;
+static bool pairWindowLed = false;  // F-02: pair-button window khuli hai (LED pattern)
+#if RSH_SAMPLE_TASK
+static RshSampleMailbox sampleMailbox;  // F-06: sampling task -> loop handoff
+static TaskHandle_t sampleTaskHandle = NULL;
+static bool sampleTaskActive = false;   // task chal rahi hai (warna legacy loop sampling)
+#endif
 static uint32_t govWindowStartMs = 0; // adaptive sampling governor ki window
 static uint32_t govOverrunAtStart = 0;
 static uint32_t heapCheckMs = 0;
@@ -182,7 +190,18 @@ static void fw34_boot_setup() {
 // tick karo. Net down ho tab bhi chalta hai (is liye !netOk branch se pehle).
 static void fw34_loop_tick(uint32_t nowMs) {
   rsh_hold_event_t ev = rsh_boothold_update(&bootHold, digitalRead(0) == LOW, nowMs);
-  if (ev == RSH_HOLD_SAFE_MODE) {
+  if (ev == RSH_HOLD_PAIR_WINDOW) {
+    // F-02: 3 s hold + 5 s se pehle release = pair window (120 s).
+    // Sirf UNPAIRED board par — paired board ignore karta hai (UI "10 s
+    // reset" guide karta hai). LED pattern loop mein lagta hai.
+    if (keystore_unpaired()) {
+      uint8_t wasOpen = keystore_pairing_open(nowMs) ? 1 : 0;
+      keystore_open_pair_window(nowMs);
+      if (!wasOpen)
+        rsh_diag_record_global(RSH_DIAG_WINDOW_OPEN, 1, nowMs);  // pair button
+      pairWindowLed = true;
+    }
+  } else if (ev == RSH_HOLD_SAFE_MODE) {
     rsh_safe_mode_enter(&safeMode, 0, nowMs);
     rsh_cfg_set_safe_mode(&cfgTxn, 1);
     led_set(LedState::SafeMode);
@@ -190,6 +209,7 @@ static void fw34_loop_tick(uint32_t nowMs) {
     rsh_safe_mode_enter(&safeMode, 1, nowMs);
     rsh_cfg_set_safe_mode(&cfgTxn, 1);
     led_set(LedState::KeyResetArmed);
+    rsh_diag_record_global(RSH_DIAG_KEY_RESET_ARMED, 0, nowMs);
   }
   if (rsh_safe_mode_tick(&safeMode, nowMs)) ESP.restart();  // armed window khatam
   rsh_boot_tick_t bt = rsh_boot_tick(&bootCounter, netOk ? 1 : 0, nowMs, bootStartMs);
@@ -211,28 +231,19 @@ static void fw34_loop_tick(uint32_t nowMs) {
   }
   if (rsh_cfg_tick(&cfgTxn, nowMs)) {
     // Confirm timeout -> rollback: restored current persist karo, pend clear.
+    rsh_diag_record_global(RSH_DIAG_CFG_ROLLBACK, 0, nowMs);  // F-10
     rsh_fw34_cfg_persist(0);
   }
-  // Phase F WS5: config badli ho (SET_CFG COMMIT / confirm / revert /
-  // boot recover) to clutch enable + shifter gate mode dobara lagao.
-  // Phase G (C3): inputs pin table bhi yahin lagti hai (COMMIT par
-  // inputs re-init, rollback par purani pins wapas — dono isi detector
-  // se guzarte hain: COMMIT/REVERT/tick-rollback sab cfgTxn.current
-  // badalte hain). Pehli loop tick par bhi chalta hai (boot config
-  // apply — sentinel).
-  // Detector POORA BLOB compare karta hai (memcmp) — version+length
-  // kaafi nahi: PC har push par version 1 bhej sakta hai, aur do mukhtalif
-  // maps ki length aksar barabar hoti hai (Phase G mein pakda gaya
-  // latent bug: version+length sentinel same-length re-push par apply
-  // chhor deta tha — pin badle hue, inputs purane rehte).
-  static uint8_t lastAppliedBlob[RSH_CFG_MAX_TOTAL];
-  static uint16_t lastAppliedLen = 0xFFFF;  // sentinel: pehli tick par apply ho
-  if (cfgTxn.current_len != lastAppliedLen ||
-      memcmp(cfgTxn.current, lastAppliedBlob, cfgTxn.current_len) != 0) {
-    lastAppliedLen = cfgTxn.current_len;
-    memcpy(lastAppliedBlob, cfgTxn.current, cfgTxn.current_len);
+  // F-06: config apply DIRTY FLAG se — pehle har loop mein poora blob
+  // memcmp hota tha (<= 2 KB). Ab sirf mutation points (load/commit/
+  // revert/boot-recover/confirm-rollback) flag lagate hain; yahan ek
+  // dafa apply hota hai (modules + inputs + persistent LED), phir flag
+  // saaf. Apply functions khud validate karte hain (fail closed).
+  if (cfgTxn.cfg_dirty) {
+    cfgTxn.cfg_dirty = 0;
     rsh_modules_apply_config_blob(cfgTxn.current, cfgTxn.current_len);
     inputs_apply_config_blob(cfgTxn.current, cfgTxn.current_len);
+    net_led_apply_persistent(cfgTxn.current, cfgTxn.current_len);
   }
 }
 
@@ -306,7 +317,164 @@ static uint8_t rsh_reset_reason_code() {
   }
 }
 
+// ---- F-06: sampling helpers (dedicated task + legacy loop dono yahi istemal karte hain) ----
+
+// Link state ke mutabiq status LED set karo. Safe mode ki LED ko overwrite
+// nahi karta (fw34_loop_tick ne set ki hai). Pair window khuli ho to
+// PairWindow pattern (F-02), warna PcConnected / ApUpWaitingPc.
+static void led_set_for_link_(uint8_t active, uint32_t nowMs) {
+  if (rsh_safe_mode_blocks_config(&safeMode)) return;
+  if (pairWindowLed && keystore_pairing_open(nowMs)) {
+    led_set(LedState::PairWindow);
+    return;
+  }
+  pairWindowLed = false;
+  led_set(active ? LedState::PcConnected : LedState::ApUpWaitingPc);
+}
+
+// Ek sample cycle: inputs parho, horn-test OR karo (D-5), emit faisla
+// karo (SEC-E-14: sirf active + authenticated session), packet(s) banao.
+// frame mein bharo (v2len/v1len 0 = is cycle mein koi packet nahi).
+// seq tabhi barhta hai jab packet bana ho (purana behaviour).
+// sample_out NULL na ho to aakhri InputSample bhi deta hai (RSH_DEBUG
+// stats ke liye — legacy loop istemal karta hai, task NULL deta hai).
+// Return 1 = frame mein packet hai, 0 = koi packet nahi (inputs_read
+// phir bhi hua — debouncer/health/mV probe zinda rehte hain).
+static uint8_t sample_once_(RshSampleMailbox *frame, uint32_t nowMs,
+                            InputSample *sample_out) {
+  if (!frame) return 0;
+  memset(frame, 0, sizeof(*frame));
+  InputSample s = inputs_read();
+  if (sample_out) *sample_out = s;
+  // F4/D13: timestamp ADC read ke BAAD (midpoint).
+  uint32_t tsUs = micros();
+  // D-5: HORN_TEST active ho to horn bit set karo (synthetic press).
+  if (net_horn_test_active(nowMs)) s.buttons |= RSH_BTN_HORN;
+
+  // SEC-E-14: stream emission sirf authenticated session ko — HELO
+  // (unauthenticated bootstrap) se stream nahi khulta; pehle ek
+  // HMAC-verified control command (aam tor par GET_CAPS) lazmi hai.
+  // Status packet (1 Hz) is se alag hai — neeche waisa hi rehta hai.
+  // Phase G: DUAL transport — Wi-Fi aur serial ke alag emit faisle hain
+  // (alag peer, alag auth). Packet ek dafa banta hai, dono transports ko
+  // jata hai (har transport ko sirf us ka version).
+  rsh_emit_kind_t emitKind = rsh_stream_emit_kind(
+      net_pc_active(nowMs) ? 1 : 0, net_pc_is_v2(nowMs) ? 1 : 0,
+      net_session_authenticated(nowMs) ? 1 : 0);
+  rsh_emit_kind_t serialEmitKind = RSH_EMIT_NONE;
+#if RSH_WIRED_SERIAL
+  serialEmitKind = rsh_stream_emit_kind(
+      net_serial_pc_active(nowMs) ? 1 : 0, net_serial_pc_is_v2(nowMs) ? 1 : 0,
+      net_serial_session_authenticated(nowMs) ? 1 : 0);
+#endif
+  frame->emit_wifi = (uint8_t)emitKind;
+  frame->emit_serial = (uint8_t)serialEmitKind;
+  if (emitKind == RSH_EMIT_NONE && serialEmitKind == RSH_EMIT_NONE) return 0;
+
+  // Phase E WS5 — v2.1 stream emission (§1.1): v2 peer ko v2 stream
+  // packet (axes mV, cumulative encoders), legacy v1 peer ko v1 packet.
+  if (emitKind == RSH_EMIT_V2 || serialEmitKind == RSH_EMIT_V2) {
+    uint8_t flags2 = 0;
+    if (inputs_axis_invalid()) flags2 |= RSH_V2_FLAG_AXIS_INVALID;  // F2
+    if (seqGap != lastSentSeqGap) flags2 |= RSH_V2_FLAG_TICK_SKIPPED;  // D5
+    size_t n2 = rsh_build_v2_stream_packet(
+        frame->v2pkt, sizeof(frame->v2pkt), seq, tsUs, flags2, s.steering,
+        inputs_steering_is_mv() ? 1 : 0, s.accelAnalog, s.brakeAnalog,
+        s.handbrake, s.enc, rsh_modules_encoders_enabled() ? 2 : 0,
+        s.buttons, rsh_modules_enabled(), s.clutch, s.shifterGear);
+    if (n2 > 0) frame->v2len = (uint8_t)n2;
+    lastSentSeqGap = seqGap;
+  }
+  if (emitKind == RSH_EMIT_V1 || serialEmitKind == RSH_EMIT_V1) {
+    uint8_t flags = inputs_steering_is_mv() ? RSH_FLAG_STEER_MV : 0;
+    if (inputs_axis_invalid()) flags |= RSH_FLAG_AXIS_INVALID;  // F2
+    rsh_build_packet(frame->v1pkt, seq, tsUs, s.steering, s.accelAnalog,
+                     s.brakeAnalog, s.buttons, flags);
+    frame->v1len = RSH_PACKET_SIZE;
+  }
+  frame->seq = seq;
+  seq++;   // uint16 khud wrap hota hai — PC wrap-safe tareeqe se parhta hai
+  return (frame->v2len > 0 || frame->v1len > 0) ? 1 : 0;
+}
+
+// Frame ke packet(s) bhejo (Wi-Fi unicast + serial frame, emit kind ke
+// mutabiq). SEND loop task mein rehta hai — WiFiUDP thread-safe nahi
+// (sample_task.h), is liye sampling task sirf produce karta hai.
+static void sample_send_frame_(const RshSampleMailbox *frame) {
+  if (!frame) return;
+  if (frame->v2len > 0) {
+    if (frame->emit_wifi == RSH_EMIT_V2 && net_send(frame->v2pkt, frame->v2len)) {
+#if RSH_DEBUG
+      dbgSentInWindow++;
+#endif
+    }
+#if RSH_WIRED_SERIAL
+    if (frame->emit_serial == RSH_EMIT_V2)
+      serial_link_send_frame(RSH_SERIAL_KIND_STREAM, frame->v2pkt, frame->v2len);
+#endif
+  }
+  if (frame->v1len > 0) {
+    if (frame->emit_wifi == RSH_EMIT_V1 && net_send(frame->v1pkt, frame->v1len)) {
+#if RSH_DEBUG
+      dbgSentInWindow++;
+#endif
+    }
+#if RSH_WIRED_SERIAL
+    if (frame->emit_serial == RSH_EMIT_V1)
+      serial_link_send_frame(RSH_SERIAL_KIND_STREAM, frame->v1pkt, frame->v1len);
+#endif
+  }
+}
+
+#if RSH_SAMPLE_TASK
+// F-06: dedicated sampling task (core 1, loop task se zyada priority).
+// vTaskDelayUntil se 5 ms (governor level 3 par 10 ms) period. NVS /
+// WebServer / net_poll loop task mein rehte hain — un ka stall sampling
+// ko nahi rokta. Cycle timing (overrun/maxCycle) task khud napta hai;
+// loop task status packet mein wahi numbers parhta hai.
+static void sample_task_fn(void *arg) {
+  (void)arg;
+  TickType_t lastWake = xTaskGetTickCount();
+  for (;;) {
+    uint32_t cycleStartUs = micros();
+    uint32_t nowMs = millis();
+    RshSampleMailbox frame;
+    sample_once_(&frame, nowMs, NULL);
+    if (frame.v2len > 0 || frame.v1len > 0) {
+      rsh_sample_mailbox_produce(&sampleMailbox, frame.v2pkt, frame.v2len,
+                                 frame.v1pkt, frame.v1len, frame.seq,
+                                 frame.emit_wifi, frame.emit_serial);
+    }
+    uint32_t cycleUs = micros() - cycleStartUs;
+    if (cycleUs > maxCycleUs) maxCycleUs = cycleUs;
+    uint32_t periodUs = inputs_governor().sendPeriodUs();
+    prevCycleOverran = cycleUs > periodUs;
+    if (prevCycleOverran) overrunCount++;
+    net_set_stream_busy(prevCycleOverran);  // FW-8: ping drop-when-busy (§9.3)
+    // Peeche reh gaye (lamba block) to burst catch-up mat karo — agla
+    // tick ab se gino (loop task wala rule, yahan task ke liye).
+    TickType_t ticks = pdMS_TO_TICKS(periodUs / 1000u);
+    if (ticks == 0) ticks = 1;  // tick rate 100 Hz ho to bhi kam az kam 1 tick
+    TickType_t nowTicks = xTaskGetTickCount();
+    if ((TickType_t)(nowTicks - lastWake) >= ticks) lastWake = nowTicks;
+    vTaskDelayUntil(&lastWake, ticks);
+  }
+}
+
+// Sampling task ek dafa shuru karo (setup + net-retry dono yahin se).
+// Dobara call no-op hai (task pehle se chal rahi ho to).
+static void sample_task_start_() {
+  if (sampleTaskActive || sampleTaskHandle != NULL) return;
+  rsh_sample_mailbox_init(&sampleMailbox);
+  BaseType_t created = xTaskCreatePinnedToCore(
+      sample_task_fn, "rsh-sample", 4096, NULL, 2, &sampleTaskHandle, 1);
+  sampleTaskActive = (created == pdPASS && sampleTaskHandle != NULL);
+  if (!sampleTaskActive) sampleTaskHandle = NULL;  // legacy fallback
+}
+#endif
+
 void setup() {
+  rsh_diag_init(rsh_diag_log());  // F-10: ring log tayyar (heap_min 0xFFFF se)
 #if RSH_WIRED_SERIAL
   serial_link_begin();  // Serial = wired transport (921600) — debug prints band
 #elif RSH_DEBUG
@@ -319,11 +487,16 @@ void setup() {
   // boot nahi, plaintext NVS kabhi istemal nahi hota). Normal build mein
   // rsh_secure_boot_check() no-op true hai.
   if (!rsh_secure_boot_check()) {
-    led_set(LedState::Error);
+    led_set_error_blinks(RSH_DIAG_BLINKS_CFG_ROLLBACK);  // F-10: 3 blinks
     for (;;) { led_update(millis()); delay(100); }
   }
 #endif
   fw34_boot_setup();   // FW-3/FW-4: boot counter + config source + boot recover
+  // F-10: boot reason + pehla heap-min snapshot diagnostics mein.
+  rsh_diag_set_boot_reason(rsh_diag_log(), rsh_reset_reason_code());
+  rsh_diag_record(rsh_diag_log(), RSH_DIAG_BOOT, rsh_reset_reason_code(),
+                  millis());
+  rsh_diag_set_heap_min(rsh_diag_log(), (uint16_t)(ESP.getFreeHeap() / 1024));
   inputs_begin();
   // Phase G (C3): boot-from-NVS — NVS pin map (ya factory fallback)
   // inputs par lagao. inputs_begin sirf compiled defaults lagata hai;
@@ -342,8 +515,14 @@ void setup() {
 #endif
     led_set(LedState::ApUpWaitingPc);
     nextTickUs = micros() + SEND_PERIOD_US;
+#if RSH_SAMPLE_TASK
+    // F-06: sampling task shuru karo (core 1, priority 2 — loop task se
+    // upar). Create fail ho to sampleTaskActive false rehta hai aur loop
+    // legacy in-loop sampling karta hai (neeche loop() mein).
+    sample_task_start_();
+#endif
   } else {
-    led_set(LedState::Error);   // loop() is state ko overwrite nahi karega
+    led_set_error_blinks(RSH_DIAG_BLINKS_NET_FAIL);  // F-10: 4 blinks (AP fail)
   }
 #if RSH_DEBUG
   dbgWindowStartMs = millis();
@@ -376,6 +555,9 @@ void loop() {
 #endif
         led_set(LedState::ApUpWaitingPc);
         nextTickUs = micros() + SEND_PERIOD_US;
+#if RSH_SAMPLE_TASK
+        sample_task_start_();  // F-06: retry recovery par bhi task chahiye
+#endif
       }
     }
     return;
@@ -387,6 +569,11 @@ void loop() {
   // heap check early return ke baad tha aur OTA mein kabhi nahi chalta tha.
   if (nowMs - heapCheckMs >= 10000) {
     heapCheckMs = nowMs;
+    // F-10: free-heap minimum diagnostics mein (naya min + 32 KB se kam
+    // ho to HEAP_LOW event — ring spam nahi, sirf naya minimum par).
+    uint16_t heapKb = (uint16_t)(ESP.getFreeHeap() / 1024);
+    if (rsh_diag_set_heap_min(rsh_diag_log(), heapKb) && heapKb < 32)
+      rsh_diag_record_global(RSH_DIAG_HEAP_LOW, heapKb, nowMs);
     if (heap_policy_update(&heapPolicy, ESP.getFreeHeap(),
                            ESP.getMaxAllocHeap(), nowMs))
       ESP.restart();
@@ -433,6 +620,29 @@ void loop() {
 
   // Governor period: level 3 par 100 pps fallback (D16 — 10 ms period).
   uint32_t periodUs = inputs_governor().sendPeriodUs();
+  // RSH_DEBUG stats ke liye aakhri sample (legacy path bharta hai;
+  // task mode mein zero rehta hai — debug block us mode mein skip hota hai).
+  InputSample s{};
+#if RSH_SAMPLE_TASK
+  if (sampleTaskActive) {
+    // F-06 task mode: sampling task karta hai; yahan sirf mailbox drain
+    // + send (WiFiUDP loop task mein hi — thread-safe nahi).
+    RshSampleMailbox frame;
+    if (rsh_sample_mailbox_consume(&sampleMailbox, &frame)) {
+      // Overwrite hue frames seqGap mein (D5 tick-skipped flag).
+      seqGap = (uint16_t)(seqGap + frame.skipped);
+      sample_send_frame_(&frame);
+    }
+    // LED state har loop iteration par (task mode mein tick-wait nahi).
+    bool active = net_pc_active(nowMs);
+#if RSH_WIRED_SERIAL
+    if (net_serial_pc_active(nowMs)) active = true;
+#endif
+    led_set_for_link_(active, nowMs);
+    // Task mode mein loop jaldi spin kare — delay(1) se CPU yield.
+    delay(1);
+  } else {
+#endif
   // Wrap-safe scheduler: micros() ~71.6 min mein wrap hota hai,
   // signed difference wala tareeqa hi sahi hai (research-verified).
   uint32_t nowUs = micros();
@@ -455,12 +665,12 @@ void loop() {
     if (!prevCycleOverran) overrunCount++;
   }
 
-  InputSample s = inputs_read();
-
-  // F4/D13: timestamp ADC read ke BAAD (midpoint) — pehle cycle shuru
-  // hone par liya jata tha, jis se packet ka waqt asal reading se pehle ka
-  // hota tha aur PC ki latency measurement ghalat hoti thi.
-  uint32_t tsUs = micros();
+  // Legacy in-loop sampling (task create fail ho to fallback — F-06).
+  // Sample + build sample_once_ mein, send sample_send_frame_ mein
+  // (task path wahi helpers istemal karta hai — ek hi code).
+  RshSampleMailbox frame;
+  sample_once_(&frame, nowMs, &s);
+  sample_send_frame_(&frame);
 
   // Koi bhi transport (Wi-Fi ya serial) active ho to PC connected hai (LED).
   bool active = net_pc_active(nowMs);
@@ -468,73 +678,11 @@ void loop() {
   if (net_serial_pc_active(nowMs)) active = true;
 #endif
   // FW-3: safe mode / key-reset-armed ki LED ko normal state overwrite na kare.
-  if (!rsh_safe_mode_blocks_config(&safeMode))
-    led_set(active ? LedState::PcConnected : LedState::ApUpWaitingPc);
-  // SEC-E-14: stream emission sirf authenticated session ko — HELO
-  // (unauthenticated bootstrap) se stream nahi khulta; pehle ek
-  // HMAC-verified control command (aam tor par GET_CAPS) lazmi hai.
-  // Status packet (1 Hz) is se alag hai — neeche waisa hi rehta hai.
-  // Phase G: DUAL transport — Wi-Fi aur serial ke alag emit faisle hain
-  // (alag peer, alag auth). Packet ek dafa banta hai, dono transports ko
-  // jata hai (har transport ko sirf us ka version: v2 peer ko v2 packet,
-  // legacy v1 peer ko v1 packet). Aam tor par ek waqt mein ek hi peer
-  // hota hai; dono hon to seq ek hi rehta hai (ek sequence space).
-  rsh_emit_kind_t emitKind = rsh_stream_emit_kind(
-      net_pc_active(nowMs) ? 1 : 0, net_pc_is_v2(nowMs) ? 1 : 0,
-      net_session_authenticated(nowMs) ? 1 : 0);
-  rsh_emit_kind_t serialEmitKind = RSH_EMIT_NONE;
-#if RSH_WIRED_SERIAL
-  serialEmitKind = rsh_stream_emit_kind(
-      net_serial_pc_active(nowMs) ? 1 : 0, net_serial_pc_is_v2(nowMs) ? 1 : 0,
-      net_serial_session_authenticated(nowMs) ? 1 : 0);
-#endif
-  if (emitKind != RSH_EMIT_NONE || serialEmitKind != RSH_EMIT_NONE) {
-    // Phase E WS5 — v2.1 stream emission (§1.1): v2 peer ko v2 stream
-    // packet (axes mV, cumulative encoders), legacy v1 peer ko v1 packet.
-    if (emitKind == RSH_EMIT_V2 || serialEmitKind == RSH_EMIT_V2) {
-      uint8_t flags2 = 0;
-      if (inputs_axis_invalid()) flags2 |= RSH_V2_FLAG_AXIS_INVALID;  // F2
-      if (seqGap != lastSentSeqGap) flags2 |= RSH_V2_FLAG_TICK_SKIPPED;  // D5
-      uint8_t pkt2[36];  // max v2 stream: 20 + 2*5 axes + 2*2 enc + 2 CRC
-                         // (Phase F WS5: 5 axes — clutch slot 3 + handbrake
-                         // slot 4; pehle 34 B the — 4 axes ke liye kaafi
-                         // the, 5 axes overflow karte the — buffer bug fix)
-      size_t n2 = rsh_build_v2_stream_packet(
-          pkt2, sizeof(pkt2), seq, tsUs, flags2, s.steering,
-          inputs_steering_is_mv() ? 1 : 0, s.accelAnalog, s.brakeAnalog,
-          s.handbrake, s.enc, rsh_modules_encoders_enabled() ? 2 : 0,
-          s.buttons, rsh_modules_enabled(), s.clutch, s.shifterGear);
-      if (n2 > 0) {
-        if (emitKind == RSH_EMIT_V2 && net_send(pkt2, n2)) {
-#if RSH_DEBUG
-          dbgSentInWindow++;
-#endif
-        }
-#if RSH_WIRED_SERIAL
-        if (serialEmitKind == RSH_EMIT_V2)
-          serial_link_send_frame(RSH_SERIAL_KIND_STREAM, pkt2, (uint16_t)n2);
-#endif
-      }
-      lastSentSeqGap = seqGap;
-    }
-    if (emitKind == RSH_EMIT_V1 || serialEmitKind == RSH_EMIT_V1) {
-      uint8_t pkt[RSH_PACKET_SIZE];
-      uint8_t flags = inputs_steering_is_mv() ? RSH_FLAG_STEER_MV : 0;
-      if (inputs_axis_invalid()) flags |= RSH_FLAG_AXIS_INVALID;  // F2
-      rsh_build_packet(pkt, seq, tsUs, s.steering, s.accelAnalog,
-                        s.brakeAnalog, s.buttons, flags);
-      if (emitKind == RSH_EMIT_V1 && net_send(pkt, sizeof(pkt))) {
-#if RSH_DEBUG
-        dbgSentInWindow++;
-#endif
-      }
-#if RSH_WIRED_SERIAL
-      if (serialEmitKind == RSH_EMIT_V1)
-        serial_link_send_frame(RSH_SERIAL_KIND_STREAM, pkt, sizeof(pkt));
-#endif
-    }
-    seq++;   // uint16 khud wrap hota hai — PC wrap-safe tareeqe se parhta hai
+  // F-02: pair window khuli ho to PairWindow pattern (led_set_for_link_).
+  led_set_for_link_(active, nowMs);
+#if RSH_SAMPLE_TASK
   }
+#endif
 
   // Status packet v2.1 (1 Hz, D5/F3): txFail + seqGap + RSSI + heap +
   // governor. Sirf v2 peer ko (legacy v1 app 34 B status nahi samajhti).
@@ -576,34 +724,43 @@ void loop() {
 
   // F11: cycleUs poori iteration hai (loopStartUs loop ke shuru se) —
   // net_poll + OTA/WebServer + LED + inputs + send sab shamil.
-  uint32_t cycleUs = micros() - loopStartUs;
-  if (cycleUs > maxCycleUs) maxCycleUs = cycleUs;
-  prevCycleOverran = cycleUs > periodUs;
-  net_set_stream_busy(prevCycleOverran);  // FW-8: ping drop-when-busy (§9.3)
-  if (prevCycleOverran) overrunCount++;
+  // F-06 task mode mein cycle timing sampling task khud napta hai
+  // (overrunCount/maxCycleUs wahan update hote hain) — yahan sirf
+  // legacy mode mein gino (warna dono paths ek hi counter bigarte).
+  if (!sampleTaskActive) {
+    uint32_t cycleUs = micros() - loopStartUs;
+    if (cycleUs > maxCycleUs) maxCycleUs = cycleUs;
+    prevCycleOverran = cycleUs > periodUs;
+    net_set_stream_busy(prevCycleOverran);  // FW-8: ping drop-when-busy (§9.3)
+    if (prevCycleOverran) overrunCount++;
+  }
 
 #if RSH_DEBUG
-  if (s.steering < dbgSteerMin) dbgSteerMin = s.steering;
-  if (s.steering > dbgSteerMax) dbgSteerMax = s.steering;
-  dbgSteerSum += s.steering;
-  dbgSteerSqSum += (uint64_t)s.steering * s.steering;
-  dbgSteerN++;
+  // F-06 task mode mein s zero rehta hai aur maxCycleUs task ka hai —
+  // debug stats sirf legacy mode mein (yahan maxCycleUs reset bhi hota hai).
+  if (!sampleTaskActive) {
+    if (s.steering < dbgSteerMin) dbgSteerMin = s.steering;
+    if (s.steering > dbgSteerMax) dbgSteerMax = s.steering;
+    dbgSteerSum += s.steering;
+    dbgSteerSqSum += (uint64_t)s.steering * s.steering;
+    dbgSteerN++;
 
-  if (nowMs - dbgWindowStartMs >= 1000) {
-    double mean = dbgSteerN ? (double)dbgSteerSum / dbgSteerN : 0;
-    double var = dbgSteerN ? (double)dbgSteerSqSum / dbgSteerN - mean * mean : 0;
-    if (var < 0) var = 0;
-    Serial.printf("sent/s=%lu seq=%u overrun=%lu maxCycleUs=%lu steer min=%u max=%u mean=%.1f std=%.2f mv=%d\n",
-                  (unsigned long)dbgSentInWindow, seq,
-                  (unsigned long)(overrunCount - dbgOverrunAtWindowStart),
-                  (unsigned long)maxCycleUs, dbgSteerMin, dbgSteerMax, mean, sqrt(var),
-                  inputs_steering_is_mv() ? 1 : 0);
-    dbgWindowStartMs = nowMs;
-    dbgSentInWindow = 0;
-    dbgOverrunAtWindowStart = overrunCount;
-    dbgSteerMin = 0xFFFF; dbgSteerMax = 0;
-    dbgSteerSum = 0; dbgSteerSqSum = 0; dbgSteerN = 0;
-    maxCycleUs = 0;
+    if (nowMs - dbgWindowStartMs >= 1000) {
+      double mean = dbgSteerN ? (double)dbgSteerSum / dbgSteerN : 0;
+      double var = dbgSteerN ? (double)dbgSteerSqSum / dbgSteerN - mean * mean : 0;
+      if (var < 0) var = 0;
+      Serial.printf("sent/s=%lu seq=%u overrun=%lu maxCycleUs=%lu steer min=%u max=%u mean=%.1f std=%.2f mv=%d\n",
+                    (unsigned long)dbgSentInWindow, seq,
+                    (unsigned long)(overrunCount - dbgOverrunAtWindowStart),
+                    (unsigned long)maxCycleUs, dbgSteerMin, dbgSteerMax, mean, sqrt(var),
+                    inputs_steering_is_mv() ? 1 : 0);
+      dbgWindowStartMs = nowMs;
+      dbgSentInWindow = 0;
+      dbgOverrunAtWindowStart = overrunCount;
+      dbgSteerMin = 0xFFFF; dbgSteerMax = 0;
+      dbgSteerSum = 0; dbgSteerSqSum = 0; dbgSteerN = 0;
+      maxCycleUs = 0;
+    }
   }
 #endif
 }

@@ -24,6 +24,10 @@ pub mod snapshot;
 /// thread; all logic and tests live here.
 pub mod state;
 
+/// Profile draft / dirty model (LOGIC-FIX-PLAN §4.4, D-1): the
+/// in-memory draft `set_tuning` edits, saved to disk only on Save.
+pub mod draft;
+
 /// Game detection + launch (Phase F2 / SW-R7.3).
 pub mod launcher;
 

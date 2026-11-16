@@ -1,0 +1,376 @@
+// RSH v2.0 — Pedals screen (REDESIGN-PLAN §7.3, preview-html/Pedals.html).
+// Phase 4 port of ~/workspace/projects/rsh/v2-screens/screens/pedals.slint
+// (pixel census 9/9 vs the preview in staging): the staging Sidebar/top
+// bar are dropped — the shell owns them — and the local Switch/Pill/Btn/
+// Card/SliderRow copies are replaced by the Phase 3 library. Screen-
+// specific components (FeelChip, MiniCurve, PedalCard) stay here.
+// Slider number boxes are the library's real TextInput (value-edited),
+// not the staging display-only Text.
+//
+// NOTE (tokens): FeelChip's active fill is the staging blend
+// rgba(accent,.16) over #161C27 (#1A294A). Theme.acc-bg is the same blend
+// over the sidebar (#152341); tokens.slint is Phase 3-owned, so the
+// panel blend is kept as a literal here until integration folds it into
+// Theme (acc-bg-panel) — one token, no other deviation.
+
+import { Theme } from "../tokens.slint";
+import { Card, Pill, Btn, SliderRow } from "../components.slint";
+
+// ---------------------------------------------------------------- feel chip (§6: active = accent border + tint)
+component FeelChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback clicked();
+    accessible-label: label;
+    accessible-role: button;
+    height: 26px;
+    border-radius: 7px;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : (active ? Theme.accent : Theme.line);
+    background: active ? #1A294A : Theme.panel2;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    Text {
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: label;
+        font-size: 11.5px;
+        font-weight: 600;
+        color: active ? white : Theme.mute;
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- mini curve (preview: 110x110 viewBox, axis + dashed
+// straight line + accent curve + live marker). Path commands come from Rust
+// (feel-dependent); defaults are the preview's exact paths.
+component MiniCurve inherits Rectangle {
+    in property <string> curve-commands;
+    in property <string> dashed-commands;
+    in property <bool> show-dashed;
+    in property <float> marker-vx;
+    in property <float> marker-vy;
+    width: 130px;
+    height: 110px;
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 110;
+        viewbox-height: 110;
+        commands: "M 6 6 L 6 104 L 104 104";
+        fill: transparent;
+        stroke: Theme.line;
+        stroke-width: 1px;
+    }
+    if show-dashed : Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 110;
+        viewbox-height: 110;
+        commands: dashed-commands;
+        fill: transparent;
+        stroke: Theme.grid-line;
+        stroke-width: 1.5px;
+    }
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 110;
+        viewbox-height: 110;
+        commands: curve-commands;
+        fill: transparent;
+        stroke: Theme.accent;
+        stroke-width: 2.5px;
+    }
+    Rectangle {
+        x: marker-vx / 110 * 130px - 5px;
+        y: marker-vy / 110 * 110px - 5px;
+        width: 10px;
+        height: 10px;
+        border-radius: 5px;
+        border-width: 2.5px;
+        border-color: Theme.accent-text;
+        background: Theme.bg;
+    }
+}
+
+// ---------------------------------------------------------------- pedal card (§7.3: live bar + mini curve, Pedal up/down
+// + Set buttons, feel chips, Deadzone; Clutch adds Bite point)
+component PedalCard inherits Card {
+    in property <string> pedal-name;
+    in property <float> pct;
+    in property <color> bar-color;
+    in property <string> up-mv;
+    in property <string> down-mv;
+    in property <int> feel; // 0 linear, 1 soft, 2 sharp
+    in property <bool> show-chips;
+    in property <float> deadzone; // 0..1 (of 10%)
+    in property <string> deadzone-text;
+    in property <bool> show-bite;
+    in property <float> bite; // 0..1
+    in property <string> bite-text;
+    in property <string> curve-commands;
+    in property <string> dashed-commands;
+    in property <bool> show-dashed;
+    in property <float> marker-vx;
+    in property <float> marker-vy;
+    callback set-up();
+    callback set-down();
+    callback feel-selected(int);
+    callback deadzone-changed(float);
+    callback deadzone-edited(string);
+    callback bite-changed(float);
+    callback bite-edited(string);
+
+    VerticalLayout {
+        padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
+        spacing: 12px;
+        HorizontalLayout {
+            alignment: space-between;
+            Text { text: pedal-name; font-size: 13px; font-weight: 600; color: Theme.text; }
+            Pill { label: Math.round(pct) + "%"; bg: pct > 0 ? Theme.ok-bg : Theme.panel2; fg: pct > 0 ? Theme.ok : Theme.mute; }
+        }
+        // live viz: vertical bar (16x110) + mini curve
+        Rectangle {
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.line;
+            background: Theme.bg;
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 12px;
+                alignment: start;
+                Rectangle {
+                    width: 16px;
+                    height: 110px;
+                    border-radius: 8px;
+                    background: Theme.track;
+                    clip: true;
+                    Rectangle {
+                        width: 16px;
+                        height: parent.height * pct / 100;
+                        y: parent.height - self.height;
+                        border-radius: 8px;
+                        background: bar-color;
+                    }
+                }
+                MiniCurve {
+                    curve-commands: curve-commands;
+                    dashed-commands: dashed-commands;
+                    show-dashed: show-dashed;
+                    marker-vx: marker-vx;
+                    marker-vy: marker-vy;
+                }
+            }
+        }
+        // range block (§6): Pedal up / Pedal down + Set buttons
+        HorizontalLayout {
+            spacing: 8px;
+            Rectangle {
+                horizontal-stretch: 1;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: Theme.line;
+                background: Theme.panel2;
+                VerticalLayout {
+                    padding-top: 8px; padding-bottom: 8px; padding-left: 10px; padding-right: 10px;
+                    spacing: 6px;
+                    Text { text: "Pedal up"; font-size: 11px; color: Theme.mute; }
+                    Text { text: up-mv; font-family: Theme.font-mono; font-size: 13px; font-weight: 600; color: Theme.text; }
+                    Btn { horizontal-stretch: 1; label: "Set up"; clicked => { set-up(); } }
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: Theme.line;
+                background: Theme.panel2;
+                VerticalLayout {
+                    padding-top: 8px; padding-bottom: 8px; padding-left: 10px; padding-right: 10px;
+                    spacing: 6px;
+                    Text { text: "Pedal down"; font-size: 11px; color: Theme.mute; }
+                    Text { text: down-mv; font-family: Theme.font-mono; font-size: 13px; font-weight: 600; color: Theme.text; }
+                    Btn { horizontal-stretch: 1; label: "Set down"; clicked => { set-down(); } }
+                }
+            }
+        }
+        if show-chips : HorizontalLayout {
+            spacing: 4px;
+            FeelChip { horizontal-stretch: 1; label: "Linear"; active: feel == 0; clicked => { feel-selected(0); } }
+            FeelChip { horizontal-stretch: 1; label: "Soft"; active: feel == 1; clicked => { feel-selected(1); } }
+            FeelChip { horizontal-stretch: 1; label: "Sharp"; active: feel == 2; clicked => { feel-selected(2); } }
+        }
+        if show-bite : SliderRow { label: "Bite point"; hint: "Where the grip starts"; value-text: bite-text; value: bite; changed(v) => { bite-changed(v); } value-edited(t) => { bite-edited(t); } }
+        SliderRow { label: "Deadzone"; hint: "Ignore tiny movements"; value-text: deadzone-text; value: deadzone; changed(v) => { deadzone-changed(v); } value-edited(t) => { deadzone-edited(t); } }
+    }
+}
+
+// ---------------------------------------------------------------- Pedals page (§7.3). Body only: the shell owns the
+// sidebar, the top bar (Basic/Advanced + profile + Save) and the window.
+// The calibration rule (§7.3): "Set down" needs the pedal fully pressed —
+// the backend enforces it with a UserError (see PEDALS-BUTTONS-PORTING.md
+// §3); this line states the rule, it is not the enforcement.
+export component PedalsPage inherits VerticalLayout {
+    // throttle
+    in property <float> throttle-pct;
+    in property <string> throttle-up-mv;
+    in property <string> throttle-down-mv;
+    in property <int> throttle-feel;
+    in property <float> throttle-deadzone;
+    in property <string> throttle-deadzone-text;
+    in property <string> throttle-curve;
+    in property <string> throttle-dashed;
+    in property <float> throttle-marker-x;
+    in property <float> throttle-marker-y;
+    // brake
+    in property <float> brake-pct;
+    in property <string> brake-up-mv;
+    in property <string> brake-down-mv;
+    in property <int> brake-feel;
+    in property <float> brake-deadzone;
+    in property <string> brake-deadzone-text;
+    in property <string> brake-curve;
+    in property <string> brake-dashed;
+    in property <float> brake-marker-x;
+    in property <float> brake-marker-y;
+    // clutch
+    in property <float> clutch-pct;
+    in property <string> clutch-up-mv;
+    in property <string> clutch-down-mv;
+    in property <int> clutch-feel;
+    in property <float> clutch-deadzone;
+    in property <string> clutch-deadzone-text;
+    in property <float> clutch-bite;
+    in property <string> clutch-bite-text;
+    in property <string> clutch-curve;
+    in property <string> clutch-dashed;
+    in property <float> clutch-marker-x;
+    in property <float> clutch-marker-y;
+
+    callback set-up(int);          // pedal index 0 throttle, 1 brake, 2 clutch
+    callback set-down(int);
+    callback feel-selected(int, int); // (pedal, feel)
+    callback deadzone-changed(int, float); // (pedal, 0..1 of 10%)
+    callback deadzone-edited(int, string); // (pedal, typed value)
+    callback bite-changed(float);
+    callback bite-edited(string);
+
+    padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
+    spacing: 12px;
+    // FIX (inner shortfall): the shell sizes the page to its preferred
+    // width, and the row only shares what the cards prefer - the cards
+    // preferred 215px each (row 671px, ending x=874). Explicit 224px card
+    // widths (preview-exact: (696 - 2*12) / 3) make the row prefer 696px,
+    // so the page spans the full 736px column.
+    HorizontalLayout {
+        spacing: 12px;
+        PedalCard {
+            horizontal-stretch: 1;
+            width: 224px;
+            pedal-name: "Throttle";
+            pct: throttle-pct;
+            bar-color: Theme.ok;
+            up-mv: throttle-up-mv;
+            down-mv: throttle-down-mv;
+            feel: throttle-feel;
+            show-chips: true;
+            deadzone: throttle-deadzone;
+            deadzone-text: throttle-deadzone-text;
+            show-bite: false;
+            bite: 0;
+            bite-text: "";
+            curve-commands: throttle-curve;
+            dashed-commands: throttle-dashed;
+            show-dashed: true;
+            marker-vx: throttle-marker-x;
+            marker-vy: throttle-marker-y;
+            set-up => { set-up(0); }
+            set-down => { set-down(0); }
+            feel-selected(f) => { feel-selected(0, f); }
+            deadzone-changed(v) => { deadzone-changed(0, v); }
+            deadzone-edited(t) => { deadzone-edited(0, t); }
+            bite-changed(v) => { bite-changed(v); }
+            bite-edited(t) => { bite-edited(t); }
+        }
+        PedalCard {
+            horizontal-stretch: 1;
+            width: 224px;
+            pedal-name: "Brake";
+            pct: brake-pct;
+            bar-color: Theme.bad;
+            up-mv: brake-up-mv;
+            down-mv: brake-down-mv;
+            feel: brake-feel;
+            show-chips: true;
+            deadzone: brake-deadzone;
+            deadzone-text: brake-deadzone-text;
+            show-bite: false;
+            bite: 0;
+            bite-text: "";
+            curve-commands: brake-curve;
+            dashed-commands: brake-dashed;
+            show-dashed: true;
+            marker-vx: brake-marker-x;
+            marker-vy: brake-marker-y;
+            set-up => { set-up(1); }
+            set-down => { set-down(1); }
+            feel-selected(f) => { feel-selected(1, f); }
+            deadzone-changed(v) => { deadzone-changed(1, v); }
+            deadzone-edited(t) => { deadzone-edited(1, t); }
+            bite-changed(v) => { bite-changed(v); }
+            bite-edited(t) => { bite-edited(t); }
+        }
+        PedalCard {
+            horizontal-stretch: 1;
+            width: 224px;
+            pedal-name: "Clutch";
+            pct: clutch-pct;
+            bar-color: Theme.accent;
+            up-mv: clutch-up-mv;
+            down-mv: clutch-down-mv;
+            feel: clutch-feel;
+            show-chips: true;
+            deadzone: clutch-deadzone;
+            deadzone-text: clutch-deadzone-text;
+            show-bite: true;
+            bite: clutch-bite;
+            bite-text: clutch-bite-text;
+            curve-commands: clutch-curve;
+            dashed-commands: clutch-dashed;
+            show-dashed: false;
+            marker-vx: clutch-marker-x;
+            marker-vy: clutch-marker-y;
+            set-up => { set-up(2); }
+            set-down => { set-down(2); }
+            feel-selected(f) => { feel-selected(2, f); }
+            deadzone-changed(v) => { deadzone-changed(2, v); }
+            deadzone-edited(t) => { deadzone-edited(2, t); }
+            bite-changed(v) => { bite-changed(v); }
+            bite-edited(t) => { bite-edited(t); }
+        }
+    }
+    // §7.3 calibration rule (not drawn in the preview HTML):
+    // the pedal must be fully pressed before "Set down".
+    Text {
+        text: "To calibrate a pedal: press it fully down, then press Set down.";
+        font-size: 11.5px;
+        color: Theme.faint;
+    }
+    // Slack absorber: the body is stretched to the full height below
+    // the top bar; without this the layout stretches the pedal cards
+    // to fill it (preview keeps them content-height).
+    Rectangle { vertical-stretch: 1; }
+}

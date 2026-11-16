@@ -1,0 +1,478 @@
+// RSH v2.0 — Buttons screen (REDESIGN-PLAN §7.4 + §8.2, preview-html/Buttons.html).
+// Phase 4 port of ~/workspace/projects/rsh/v2-screens/screens/buttons.slint
+// (pixel census 12/12 vs the preview in staging): the staging Sidebar/top
+// bar are dropped — the shell owns them — and the local Switch/Pill/Btn/
+// Card copies are replaced by the Phase 3 library. Screen-specific
+// components (ButtonTile, KnobCell, ActionChip, KnobRow) stay here.
+//
+// DEVIATION (LOGIC-FIX-PLAN D-2, decision, not a bug): the preview's
+// rollback note says "10 s"; the firmware confirm timeout is 30 s
+// (RSH_CFG_CONFIRM_TIMEOUT_MS), so the copy here reads "30 s".
+//
+// NOTE (tokens): the staging blends rgba(accent,.16) over panel2
+// (#1A294A), over the tile bg (#203054), ok .12 over the tile bg
+// (#213A3E), and the learn-box dash (#3A4660) / knob ring (#2F3A50) are
+// kept as literals here — tokens.slint is Phase 3-owned, so they are
+// folded into Theme at integration. No other deviation.
+
+import { Theme } from "../tokens.slint";
+import { Card, Pill, Btn } from "../components.slint";
+
+// ---------------------------------------------------------------- button tile (§6: "BUTTON n" + action; normal /
+// selected (accent) / live pressed (green) / not set (faint))
+component ButtonTile inherits Rectangle {
+    in property <int> index; // 0-based
+    in property <string> action;
+    in property <bool> pressed;
+    in property <bool> selected;
+    callback clicked();
+    accessible-label: "Button " + (index + 1) + ": " + action;
+    accessible-role: button;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : (pressed ? Theme.ok : selected ? Theme.accent : Theme.line);
+    background: pressed ? #213A3E : selected ? #203054 : Theme.panel2;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    VerticalLayout {
+        padding-top: 9px; padding-bottom: 9px; padding-left: 10px; padding-right: 10px;
+        spacing: 2px;
+        // The long state labels ("BUTTON 5 · PRESSED") must NOT force the
+        // tile wider than the grid — in the HTML preview they simply
+        // overflow the tile box, which Slint cannot replicate without
+        // breaking the 4-column grid. A bare Text reports its full
+        // preferred width as its layout minimum (elide/wrap alone do not
+        // shrink it, and binding its width to the tile is a binding loop
+        // that panics at runtime). So the label lives in a clipping
+        // slot at the fixed design content width (70px = 90px tile minus
+        // padding): it wraps to two lines when it has a state suffix
+        // ("BUTTON 5" / "· PRESSED") and never widens the tile.
+        Rectangle {
+            width: 70px;
+            clip: true;
+            Text {
+                width: 70px;
+                text: "BUTTON " + (index + 1) + (pressed ? " · PRESSED" : selected ? " · EDITING" : "");
+                font-size: 11px;
+                font-weight: 600;
+                color: Theme.faint;
+                wrap: word-wrap;
+                overflow: elide;
+            }
+        }
+        Text {
+            text: action;
+            font-size: 12.5px;
+            font-weight: action == "Not set" ? 500 : 600;
+            color: action == "Not set" ? Theme.faint : Theme.text;
+            wrap: word-wrap;
+            overflow: elide;
+        }
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- rotary knob cell (§8.2: knob + left/right actions;
+// click opens the knob in the edit panel; a live turn flashes ↻ + count)
+component KnobCell inherits Rectangle {
+    in property <string> knob-name;
+    in property <string> left-action;
+    in property <string> right-action;
+    in property <bool> selected;
+    in property <bool> flash;
+    in property <string> flash-text;
+    callback clicked();
+    accessible-label: knob-name + ": turn left " + left-action + ", turn right " + right-action;
+    accessible-role: button;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : Theme.line);
+    background: selected ? #203054 : Theme.panel2;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 12px;
+        Rectangle {
+            width: 34px;
+            height: 34px;
+            border-radius: 17px;
+            border-width: 3px;
+            border-color: #2F3A50;
+            background: Theme.panel;
+            Rectangle {
+                x: 13px;
+                y: 3px;
+                width: 3px;
+                height: 8px;
+                border-radius: 2px;
+                background: Theme.accent-text;
+            }
+            if flash : Text {
+                x: 22px;
+                y: -6px;
+                text: flash-text;
+                font-size: 11px;
+                font-weight: 700;
+                color: Theme.ok;
+            }
+        }
+        VerticalLayout {
+            spacing: 0px;
+            Text { text: knob-name; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+            Text {
+                wrap: word-wrap;
+                text: "Turn left: " + left-action + " · Turn right: " + right-action;
+                font-size: 11.5px;
+                color: Theme.mute;
+            }
+        }
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- action chip (§6: active = accent border + tint)
+component ActionChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback clicked();
+    accessible-label: label;
+    accessible-role: button;
+    height: 28px;
+    border-radius: 7px;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : (active ? Theme.accent : Theme.line);
+    background: active ? #1A294A : Theme.panel2;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    Text {
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: label;
+        font-size: 11.5px;
+        font-weight: 600;
+        color: active ? white : Theme.mute;
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- knob action row (knob edit mode, §8.2:
+// Turn left / Turn right / Press — click a row, then pick its action below)
+component KnobRow inherits Rectangle {
+    in property <string> label;
+    in property <string> action;
+    in property <bool> selected;
+    callback clicked();
+    accessible-label: label + ": " + action;
+    accessible-role: button;
+    height: 30px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : Theme.line);
+    background: selected ? #1A294A : Theme.panel2;
+    // FIX-4: keyboard activation - Enter/Space acts, like a click.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        alignment: space-between;
+        Text { text: label; font-size: 12px; font-weight: 600; color: Theme.text; }
+        Text { text: action; font-size: 12px; color: selected ? white : Theme.mute; }
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- Buttons page (§7.4). Body only: the shell owns the
+// sidebar, the top bar (profile button) and the window.
+// Learn mode (L4): `listening` is set by the UI when the learn box is
+// clicked; the backend arms learn mode and the next live button press
+// arrives as the picked button (take_learned_button).
+export component ButtonsPage inherits HorizontalLayout {
+    // 12 button actions, in wheel order (Button 1..12)
+    in property <[string]> button-actions;
+    in property <int> pressed-index: -1; // 0-based live-pressed tile, -1 none
+    in-out property <int> selected-index: 5; // 0-based tile open in the edit panel
+    in property <string> selected-action: "Gear 3";
+    // rotary knobs (§8.2)
+    in property <string> knob1-left;
+    in property <string> knob1-right;
+    in property <string> knob1-press;
+    in property <string> knob2-left;
+    in property <string> knob2-right;
+    in property <string> knob2-press;
+    in property <int> knob-flash-index: -1; // 0/1 while a live turn flashes
+    in property <string> knob-flash-text: "";
+    // edit panel state: 0 = button, 1 = knob
+    in-out property <int> edit-kind: 0;
+    in-out property <int> edit-knob: 0; // 0 knob 1, 1 knob 2
+    in-out property <int> knob-row: 0;  // 0 turn left, 1 turn right, 2 press
+    in property <string> knob-row-action: "Gear 1";
+    in-out property <bool> listening: false;
+
+    callback tile-selected(int);
+    callback knob-selected(int);
+    callback knob-row-selected(int);
+    callback action-selected(string);
+    callback learn-clicked();
+    callback edit-cancel();
+    callback edit-save();
+
+    // Body padding, same as PedalsPage (16px vertical, 20px horizontal).
+    padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
+    // FIX (inner shortfall): the 12px column gap was missing, so the page
+    // stayed 12px short (panel ending x=886) even with 90px tiles.
+    spacing: 12px;
+
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 12px;
+        // wheel buttons card
+        Card {
+            VerticalLayout {
+                padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
+                spacing: 10px;
+                HorizontalLayout {
+                    alignment: space-between;
+                    Text { text: "Wheel buttons"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    Text { text: "Press a button on your wheel and it lights up here"; font-size: 12px; color: Theme.mute; }
+                }
+                // 4-column grid: 3 rows of 4 tiles. Actions come from
+                // the button-actions model by index.
+                // FIX (inner shortfall): the tiles preferred 87px each (panel
+                // ending x=886), so the page stayed 13px short. Explicit 90px
+                // tiles (preview-exact: (384 - 3*8) / 4) make the grid prefer
+                // 384px, the left column 416px, and the page the full 736px.
+                VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 0; action: button-actions[0]; pressed: 0 == pressed-index; selected: 0 == selected-index && edit-kind == 0; clicked => { tile-selected(0); } }
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 1; action: button-actions[1]; pressed: 1 == pressed-index; selected: 1 == selected-index && edit-kind == 0; clicked => { tile-selected(1); } }
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 2; action: button-actions[2]; pressed: 2 == pressed-index; selected: 2 == selected-index && edit-kind == 0; clicked => { tile-selected(2); } }
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 3; action: button-actions[3]; pressed: 3 == pressed-index; selected: 3 == selected-index && edit-kind == 0; clicked => { tile-selected(3); } }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 4; action: button-actions[4]; pressed: 4 == pressed-index; selected: 4 == selected-index && edit-kind == 0; clicked => { tile-selected(4); } }
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 5; action: button-actions[5]; pressed: 5 == pressed-index; selected: 5 == selected-index && edit-kind == 0; clicked => { tile-selected(5); } }
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 6; action: button-actions[6]; pressed: 6 == pressed-index; selected: 6 == selected-index && edit-kind == 0; clicked => { tile-selected(6); } }
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 7; action: button-actions[7]; pressed: 7 == pressed-index; selected: 7 == selected-index && edit-kind == 0; clicked => { tile-selected(7); } }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 8; action: button-actions[8]; pressed: 8 == pressed-index; selected: 8 == selected-index && edit-kind == 0; clicked => { tile-selected(8); } }
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 9; action: button-actions[9]; pressed: 9 == pressed-index; selected: 9 == selected-index && edit-kind == 0; clicked => { tile-selected(9); } }
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 10; action: button-actions[10]; pressed: 10 == pressed-index; selected: 10 == selected-index && edit-kind == 0; clicked => { tile-selected(10); } }
+                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 11; action: button-actions[11]; pressed: 11 == pressed-index; selected: 11 == selected-index && edit-kind == 0; clicked => { tile-selected(11); } }
+                    }
+                }
+            }
+        }
+        // rotary knobs card (§8.2)
+        Card {
+            VerticalLayout {
+                padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
+                spacing: 10px;
+                Text { text: "Rotary knobs"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    KnobCell {
+                        horizontal-stretch: 1;
+                        knob-name: "Knob 1";
+                        left-action: knob1-left;
+                        right-action: knob1-right;
+                        selected: edit-kind == 1 && edit-knob == 0;
+                        flash: knob-flash-index == 0;
+                        flash-text: knob-flash-text;
+                        clicked => { knob-selected(0); }
+                    }
+                    KnobCell {
+                        horizontal-stretch: 1;
+                        knob-name: "Knob 2";
+                        left-action: knob2-left;
+                        right-action: knob2-right;
+                        selected: edit-kind == 1 && edit-knob == 1;
+                        flash: knob-flash-index == 1;
+                        flash-text: knob-flash-text;
+                        clicked => { knob-selected(1); }
+                    }
+                }
+            }
+        }
+        // Slack absorber: the column is stretched to the full body
+        // height; without this the layout stretches the cards (and
+        // their title rows) to fill it. Preview keeps cards
+        // content-height with empty space below.
+        Rectangle { vertical-stretch: 1; }
+    }
+    // edit panel (268px)
+    Card {
+        width: 268px;
+        VerticalLayout {
+            padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
+            spacing: 0px;
+            if edit-kind == 0 : HorizontalLayout {
+                alignment: space-between;
+                Text { text: "Button " + (selected-index + 1); font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                Pill { label: selected-action; }
+            }
+            if edit-kind == 1 : HorizontalLayout {
+                alignment: space-between;
+                Text { text: "Knob " + (edit-knob + 1); font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                Pill { label: knob-row-action; }
+            }
+            Rectangle { height: 10px; }
+            // learn box (§7.4)
+            Rectangle {
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: fs.has-focus ? Theme.accent-text : (listening ? Theme.accent : #3A4660);
+                background: Theme.bg;
+                accessible-label: "Learn button from wheel";
+                accessible-role: button;
+                // FIX-4: keyboard activation - Enter/Space acts, like a click.
+                fs := FocusScope {
+                    width: 100%;
+                    height: 100%;
+                    key-pressed(event) => {
+                        if (event.text == Key.Return || event.text == Key.Space) {
+                            learn-clicked();
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+                HorizontalLayout {
+                    padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px;
+                    spacing: 10px;
+                    alignment: start;
+                    Rectangle {
+                        width: 16px;
+                        height: 16px;
+                        border-radius: 8px;
+                        border-width: 2px;
+                        border-color: listening ? Theme.accent : Theme.mute;
+                        Rectangle {
+                            x: 4px;
+                            y: 4px;
+                            width: 4px;
+                            height: 4px;
+                            border-radius: 2px;
+                            background: listening ? Theme.accent : Theme.mute;
+                        }
+                    }
+                    Text {
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                        text: listening ? "Listening… press a button on the wheel." : "Press any button on the wheel to pick it.";
+                        font-size: 12px;
+                        color: Theme.mute;
+                    }
+                }
+                TouchArea { clicked => { learn-clicked(); } }
+            }
+            if edit-kind == 1 : VerticalLayout {
+                spacing: 5px;
+                Rectangle { height: 9px; }
+                KnobRow { label: "Turn left"; action: edit-knob == 0 ? knob1-left : knob2-left; selected: knob-row == 0; clicked => { knob-row-selected(0); } }
+                KnobRow { label: "Turn right"; action: edit-knob == 0 ? knob1-right : knob2-right; selected: knob-row == 1; clicked => { knob-row-selected(1); } }
+                KnobRow { label: "Press"; action: edit-knob == 0 ? knob1-press : knob2-press; selected: knob-row == 2; clicked => { knob-row-selected(2); } }
+            }
+            Text {
+                text: edit-kind == 0 ? "What should it do?" : "What should this do?";
+                font-size: 12.5px;
+                font-weight: 600;
+                color: Theme.text;
+            }
+            Rectangle { height: 6px; }
+            // action chips (§7.4): 11 actions, 3 per row
+            VerticalLayout {
+                spacing: 5px;
+                HorizontalLayout {
+                    spacing: 5px;
+                    ActionChip { horizontal-stretch: 1; label: "Gear 1"; active: "Gear 1" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 1"); } }
+                    ActionChip { horizontal-stretch: 1; label: "Gear 2"; active: "Gear 2" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 2"); } }
+                    ActionChip { horizontal-stretch: 1; label: "Gear 3"; active: "Gear 3" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 3"); } }
+                }
+                HorizontalLayout {
+                    spacing: 5px;
+                    ActionChip { horizontal-stretch: 1; label: "Gear 4"; active: "Gear 4" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 4"); } }
+                    ActionChip { horizontal-stretch: 1; label: "Gear 5"; active: "Gear 5" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 5"); } }
+                    ActionChip { horizontal-stretch: 1; label: "Gear 6"; active: "Gear 6" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 6"); } }
+                }
+                HorizontalLayout {
+                    spacing: 5px;
+                    ActionChip { horizontal-stretch: 1; label: "Shift up"; active: "Shift up" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Shift up"); } }
+                    ActionChip { horizontal-stretch: 1; label: "Shift down"; active: "Shift down" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Shift down"); } }
+                    ActionChip { horizontal-stretch: 1; label: "Horn"; active: "Horn" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Horn"); } }
+                }
+                HorizontalLayout {
+                    spacing: 5px;
+                    ActionChip { horizontal-stretch: 1; label: "Handbrake"; active: "Handbrake" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Handbrake"); } }
+                    ActionChip { horizontal-stretch: 1; label: "Not set"; active: "Not set" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Not set"); } }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+            Rectangle { height: 16px; }
+            HorizontalLayout {
+                spacing: 8px;
+                Btn { horizontal-stretch: 1; label: "Cancel"; clicked => { edit-cancel(); } }
+                Btn { horizontal-stretch: 1; label: "Save"; primary: true; clicked => { edit-save(); } }
+            }
+            Rectangle { height: 10px; }
+            // D-2: 30 s (firmware confirm timeout), not the preview's 10 s.
+            Text {
+                wrap: word-wrap;
+                text: "If the wheel stops responding, RSH goes back to your old buttons in 30 s.";
+                font-size: 11.5px;
+                color: Theme.faint;
+            }
+            // Slack absorber: the panel is stretched to the full body
+            // height; without this the layout stretches the content
+            // rows to fill it.
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+}

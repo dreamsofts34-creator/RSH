@@ -12,6 +12,37 @@
 > not boot**. The detailed companion (signing internals, source build,
 > host-mock checks) is [REFLASH-GUIDE.md](REFLASH-GUIDE.md).
 
+## Firmware v4.0.2 — what changes (v2.0 app)
+
+Firmware **v4.0.2** is the v2.0 firmware. It adds the pair button and
+the v2.0 features, and changes nothing about how firmware is
+delivered or verified:
+
+- **Pair button (new):** on an **unpaired** board, hold **BOOT for 3
+  seconds** (release before 5 s) to open a **120-second** pairing
+  window — the LED blinks (3 Hz) while it is open. On a paired board
+  the 3-second hold does nothing; re-pairing a paired board still
+  needs a 10-second KEY_RESET first. See
+  [USER-GUIDE.md](USER-GUIDE.md#pairing).
+- **Degraded mode with firmware v4.0.1:** the v2.0 app works with a
+  v4.0.1 board, but the pairing experience stays the old one — no
+  pair button, only the 60-second boot window (or USB pairing). The
+  app detects the firmware version from `GET_CAPS` and shows the
+  matching instructions. To get the pair button, flash v4.0.2.
+- **Signed OTA unchanged:** firmware updates still go through signed
+  WebOTA / app upload, Ed25519 verify-before-apply, anti-downgrade.
+  Nothing about signing, the key, or the OTA flow changed.
+- **Protocol v2.1 unchanged:** the wire protocol is frozen — v4.0.2
+  speaks exactly the same protocol as v4.0.1. New v4.0.2 features are
+  additive (new opcodes / config records) and do not change any
+  existing message.
+- **Merged factory image v4.0.2:** `RSH-Firmware-DevKitV1-v4.0.2.bin`,
+  **960,112 B** (SHA-256
+  `c47f564111e0aa5d69b952110c366ffc877e09bb89a2857026a9094d91237924`).
+  Same flashing procedure as §3 below — only the file name, size and
+  hash differ. The v4.0.1 sizes in this guide still apply to v4.0.1
+  images.
+
 ## 1. Before you start — which file?
 
 | Situation | Action |
@@ -108,6 +139,7 @@ iteration — not only at power-up):
 
 | Hold | Result |
 |---|---|
+| 3 s ≤ hold < 5 s | **Pair button** (firmware v4.0.2 only, **unpaired** board) — opens a 120-second pairing window (LED blinks 3 Hz). On a paired board this hold does nothing. On v4.0.1 there is no pair button: this hold does nothing |
 | 5 s ≤ hold < 10 s | **Safe mode** — factory pin map + AP; no config is applied (stage + commit are blocked with `BUSY (7)`) |
 | hold ≥ 10 s | **Key-reset-armed** — only in this state does `KEY_RESET` (opcode `0x0B`) run: the board generates a fresh key + fresh Wi-Fi password, and the old key stops working immediately |
 
@@ -118,8 +150,10 @@ iteration — not only at power-up):
 - In safe mode only AP + WebOTA run — a signed `firmware-signed.bin`
   can also be uploaded by WebOTA from safe mode (the board still
   verifies before applying; unsigned images are rejected).
-- After a **KEY_RESET** you must **re-pair** from the app within the
-  60-second window (the new key is disclosed exactly once).
+- After a **KEY_RESET** you must **re-pair** from the app: within
+  the 60-second boot window, or — on firmware v4.0.2 — with the
+  3-second pair-button hold (120 s window), or over USB (the new key
+  is disclosed exactly once per window).
 
 ## 5. Recovery — when flashing fails
 

@@ -1,106 +1,107 @@
-# RSH Rust — Release (hotfix v1.0.2, SINGLE-ASSET)
+# RSH v2.0 — Release (SINGLE-ASSET, daemon + Slint UI)
 #
 # SINGLE-ASSET RELEASE (user order 2026-11-15 14:00, STANDING RULE for
-# every release from now on — see docs/DECISIONS.md §18): the release
-# contains EXACTLY ONE asset, the NSIS installer
-# `RSH_<version>_x64-setup.exe`. Nothing else is built, staged, or
-# uploaded: no MSI, no firmware bins (merged + signed), no `.sig`
-# files, no `latest.json`, no `SHA256SUMS`, no SBOMs. The build is
-# NSIS-only (`bundle.targets: ["nsis"]`, `createUpdaterArtifacts:
-# false` in `src-tauri/tauri.conf.json`), so there is no updater
-# signing step and NO secret is needed by this workflow at all
-# (the updater secrets stay in the repo settings — NOT deleted —
-# in case auto-update is ever re-enabled; they are simply unused).
+# every release — see docs/DECISIONS.md §18): the release contains
+# EXACTLY ONE asset, the NSIS installer `RSH_<version>_x64-setup.exe`.
+# Nothing else is built, staged, or uploaded: no MSI, no firmware
+# bins (merged + signed), no `.sig` files, no `latest.json`, no
+# `SHA256SUMS`, no SBOMs. Auto-update is OFF: no `latest.json` is
+# published, users install by downloading the exe manually.
 #
-# Consequences, stated plainly:
-#   * Auto-update is OFF for this release: no `latest.json` is
-#     published, so `check_for_update` fails gracefully (backend
-#     returns Err, Settings shows "Could not check for updates." —
-#     verified, see DECISIONS §18). Users install by downloading
-#     the exe manually, as they do now.
-#   * Firmware v4.0.1 is NOT shipped in this release. No reflash is
-#     needed: the app talks protocol v2.1 to boards already on
-#     v4.0.1. Firmware is rebuilt/shipped only when firmware itself
-#     changes (coordinator decision, not this workflow).
-#   * No SBOMs are published with this release. The committed SBOMs
-#     under `sbom/` are unchanged and remain the source of truth.
+# v2.0 architecture (REDESIGN-PLAN): there is NO Tauri shell anymore.
+# The installer bundles two binaries + the HIDMaestro sidecar, all in
+# one install dir:
+#   rsh-daemon.exe            always-on daemon (engine + transport +
+#                             output + tray + auto profiles)
+#   rsh-ui.exe                Slint main window (spawned from the tray)
+#   rsh-hm-sidecar.exe        HIDMaestro NativeAOT sidecar — MUST sit
+#                             beside rsh-daemon.exe: the daemon resolves
+#                             it as <own exe dir>/rsh-hm-sidecar.exe
+#                             (rsh-output-hidmaestro `resolve_sidecar_path`)
+# Firmware v4.0.2 is NOT shipped in this release: the app talks
+# protocol v2.1 to boards already on v4.0.2, and firmware is
+# flashed from the app (WebOTA), never from the installer.
 #
 # What it does, in order (every step fail-closed — a missing asset
 # or a version mismatch fails the run, never a silent partial release):
 #   1. Sidecar FIRST: fetch HIDMaestro v2.1.0, verify ZIP + DLL SHA-256,
-#      `dotnet publish` NativeAOT win-x64, stage as
-#      `src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe`
-#      (Tauri `bundle.externalBin` — lands beside RSH.exe). It runs first
-#      because the rsh-app build script validates bundle.externalBin at
-#      build time — without the staged sidecar, `cargo test --workspace
-#      --release` fails (dry runs #1/#2 + first CI run, 2026-11-14).
-#   2. Gates: `cargo fmt --check`, `cargo clippy --workspace` (Windows —
-#      the sidecar is already staged, so the rsh-app build script passes),
-#      `cargo test --workspace --release`,
-#      `cargo deny check`, frontend lint + tests + locale check + audit +
-#      build. A tag push does NOT trigger CI, so the release workflow
-#      must be a superset of the CI gates (deep-scan Round 2, H4) —
-#      a tag must never ship what CI would have rejected.
-#      (Debug `cargo test --workspace` is NOT re-run here — user order
-#      2026-11-15: dry runs must not repeat the full suite. CI already
-#      proved the debug suite green on this tree. The --release run
-#      below stays — CI never runs --release tests, so only this
-#      workflow proves them on Windows.)
-#   3. `cargo tauri build` — NSIS installer ONLY. No signing env, no
-#      `.sig` artifacts (`createUpdaterArtifacts: false`).
-#   4. PE-subsystem check (hotfix v1.0.1): the app exe AND the staged
-#      sidecar must be GUI-subsystem (2) — a console-subsystem (3)
-#      binary would pop a terminal window on launch. Fails the run.
-#   5. Stage the single NSIS exe, verify exactly one file is staged,
+#      `dotnet publish` NativeAOT win-x64 (shared script
+#      `tools/ci/stage-sidecar.ps1`; it stages to
+#      `src-tauri/binaries/…` — the v2.0 installer picks the exe up
+#      from there, the Tauri shell itself is not built).
+#   2. Gates: `cargo fmt --check`, `cargo clippy --workspace
+#      --exclude src-tauri` (Windows — every non-Tauri member),
+#      `cargo test -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc
+#      --release` (the ship crates, release mode — the one
+#      release-only proof; the debug full suite is CI's job),
+#      `cargo deny check`.
+#   3. `cargo build --release -p rsh-daemon -p rsh-ui`.
+#   4. PE-subsystem check: daemon + UI + sidecar must ALL be
+#      GUI-subsystem (2) — a console-subsystem (3) binary would pop
+#      a terminal window on launch (v1.0.0 lesson). NOTE: this check
+#      FAILS until Phase 3 adds `windows_subsystem = "windows"` to
+#      rsh-ui (the daemon already has it) — that is the check doing
+#      its job, not a workflow bug.
+#   5. NSIS installer: the `.nsi` script is generated by this
+#      workflow (there is no committed installer script — the
+#      installer IS this workflow's `installer/rsh.nsi` step), built
+#      with `makensis`. The installer:
+#        * requests admin ONCE at install time (`RequestExecutionLevel
+#          admin`) — never at login;
+#        * creates the program-scoped inbound UDP firewall rule for
+#          rsh-daemon.exe (Private + Public, LOGIC-FIX-PLAN §4.3 /
+#          C-10) via `netsh` (hidden, `nsExec`), and removes it on
+#          uninstall;
+#        * does NOT enable autostart: Settings owns that (the daemon
+#          syncs the Run key / .desktop file from
+#          `settings.autostart` on startup).
+#   6. Stage the single NSIS exe, verify exactly one file is staged,
 #      then `gh release create` with that one file (skipped on dry-run).
-#   6. Headless launch smoke test (hotfix v1.0.2): silently install
-#      the staged NSIS exe, start it, and prove the process stays
-#      alive + the startup log reaches "event loop ready" (with the
-#      right version). Cannot prove window paint on a headless
-#      runner — process + log is the strongest launch evidence in
+#   7. Headless launch smoke test: silently install the staged NSIS
+#      exe, prove the firewall rule exists, run
+#      `rsh-daemon --check --no-tray --no-connect` (exit 0 = IPC
+#      answers), uninstall silently, prove the rule and the install
+#      dir are gone. Cannot prove window paint on a headless runner
+#      — process + IPC + rule is the strongest launch evidence in
 #      CI; real paint stays a human gate.
 #
-# PREREQUISITES (human gates — NOT checked by this workflow, see docs/RELEASE-CHECKLIST.md):
-#   * pid.codes PR claiming VID 0x1209 / PID 0x5253 merged (Phase G gate, D-G3).
-#   * vJoy DLL SHA-256 measured on a Windows machine and filled into
-#     `PINNED_DLL_SHA256_HEX` (Phase G gate, G-G3) — this workflow only records
-#     whether the runner happens to have vJoy installed (it will not).
+# PREREQUISITES (human gates — NOT checked by this workflow, see
+# docs/RELEASE-CHECKLIST.md):
+#   * Workspace version bumped to 2.0.0 (Cargo.toml
+#     `[workspace.package]`): the tag check below FAILS CLOSED until
+#     then — the version is still 1.0.2 at the time this workflow
+#     was written (Phase 9 / integration owns the bump).
 #   * App ships UNSIGNED (OV cert deferred, D-R11).
+#   * pid.codes PR for VID 0x1209 / PID 0x5253 merged (Phase G gate).
+#   * vJoy DLL SHA-256 measured on a Windows machine (G-G3) — this
+#     workflow only records whether the runner happens to have vJoy
+#     installed (it will not).
 #
 # Release assets (exact list — ONE asset, see docs/RELEASE-CHECKLIST.md §3):
-#   RSH_1.0.2_x64-setup.exe            (NSIS installer — the ONLY asset)
+#   RSH_2.0.0_x64-setup.exe            (NSIS installer — the ONLY asset)
 #
-# REMOVED in the v1.0.1 single-asset rewrite (2026-11-15, DECISIONS §18)
-# — these steps no longer exist in this file:
-#   * "Firmware source present (fail closed)"
-#   * "Secrets present (fail closed)" (RSH_SIGNING_KEY_PEM + RSH_UPDATER_PRIVATE_KEY)
-#   * "Set up Python 3.12" (only the firmware/SBOM steps used Python)
-#   * "Install PlatformIO + cargo tools" → replaced by "Install cargo tools"
-#     (PlatformIO install dropped; cargo-deny + tauri-cli pins kept)
-#   * "Write firmware signing key to temp file"
-#   * "PlatformIO build (signed — RSH_SIGNING_KEY set)"
-#   * "Verify signed firmware (fail closed)" (incl. the merged-bin size pin)
-#   * "Regenerate SBOMs" (Rust + frontend + sidecar SBOM generation)
-#   * "Verify sidecar SBOM against staged hashes (M4)"
-#   * MSI staging + `.sig` handling + `latest.json` generation + `SHA256SUMS`
-#     (all inside the old "Stage release assets" step — now NSIS-only)
-#   * Old "Verify staged assets (fail closed)" (latest.json / SHA256SUMS /
-#     firmware / MSI checks — replaced by the single-asset verify step)
-#   * "Delete temp firmware signing key (always)" (no temp key file anymore)
-#   * `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
-#     env on the `cargo tauri build` step (signing step is gone)
-#
-# Note on the CI `tauri-build` job: it runs `cargo tauri build
-# --no-bundle`, so the `bundle.targets` change does not affect it
-# (no bundling happens in CI at all). It has no MSI / .sig /
-# latest.json / SBOM expectation.
+# REMOVED in the v2.0 rewrite (2026-11-16) — these v1.x steps no longer
+# exist in this file:
+#   * `cargo tauri build` + the whole Tauri bundler path
+#     (`src-tauri/tauri.conf.json` version/title/bundle-targets checks,
+#     `createUpdaterArtifacts`, updater signing env, `.sig` handling)
+#   * Frontend gates (`frontend/` lint/tests/build — there is no
+#     `frontend/` anymore; the UI is the Slint `rsh-ui` crate)
+#   * `cargo test --workspace --release` (replaced by the four ship
+#     crates; the full debug suite runs in CI, not here — user order:
+#     no repeated full-suite loops)
+#   * Firmware build/sign/verify + SBOM regeneration/verification
+#     (nothing firmware/SBOM is published in a v2.0 release)
+#   * The v1.x headless smoke test that launched `RSH.exe` and waited
+#     for "event loop ready" in `%APPDATA%\RSH\logs` (replaced by the
+#     daemon `--check` + firewall-rule smoke test below)
 
-name: RSH Rust — Release
+name: RSH v2.0 — Release
 
 on:
   push:
     tags:
-      - "v1.*"
+      - "v2.*"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -112,7 +113,7 @@ on:
           - "true"
           - "false"
       tag:
-        description: "Tag to release (workflow_dispatch only, e.g. v1.0.2)"
+        description: "Tag to release (workflow_dispatch only, e.g. v2.0.0)"
         required: false
         default: ""
         type: string
@@ -138,8 +139,8 @@ jobs:
         run: |
           if ("${{ github.ref_type }}" -eq "tag") { $tag = "${{ github.ref_name }}" }
           elseif ("${{ inputs.tag }}" -ne "") { $tag = "${{ inputs.tag }}" }
-          else { Write-Error "No tag: push a v1.* tag or pass inputs.tag."; exit 1 }
-          if ($tag -notmatch '^v1\.\d+\.\d+$') { Write-Error "Tag '$tag' is not v1.x.y."; exit 1 }
+          else { Write-Error "No tag: push a v2.* tag or pass inputs.tag."; exit 1 }
+          if ($tag -notmatch '^v2\.\d+\.\d+$') { Write-Error "Tag '$tag' is not v2.x.y."; exit 1 }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$($tag.TrimStart('v'))" >> $env:GITHUB_OUTPUT
           Write-Host "Releasing $tag"
@@ -150,44 +151,18 @@ jobs:
           $version = "${{ steps.tag.outputs.version }}"
           $toml = Get-Content Cargo.toml -Raw
           if ($toml -notmatch '(?m)^version = "' + [regex]::Escape($version) + '"') {
-            Write-Error "Tag version $version does not match [workspace.package] version in Cargo.toml."
+            Write-Error "Tag version $version does not match [workspace.package] version in Cargo.toml. (v2.0: the version is still 1.0.2 until Phase 9 / integration bumps it to 2.0.0 — bump first, then tag.)"
             exit 1
           }
-          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          if ($conf.version -ne $version) { Write-Error "tauri.conf.json version $($conf.version) != $version."; exit 1 }
-          # L6: the frontend is versioned independently in package.json —
-          # a drifted frontend version would ship a bundle that reports a
-          # different version than the tag.
-          $pkg = Get-Content frontend/package.json -Raw | ConvertFrom-Json
-          if ($pkg.version -ne $version) { Write-Error "frontend/package.json version $($pkg.version) != $version."; exit 1 }
-          # L5: tauri.conf.json cannot derive the window title from the
-          # version (static JSON), so the title carries a hardcoded
-          # "v<version>" and this check keeps it in sync with the tag.
-          $expectedTitle = "RSH — Real Sim Hub v$version"
-          if ($conf.app.windows[0].title -ne $expectedTitle) { Write-Error "tauri.conf.json window title '$($conf.app.windows[0].title)' != '$expectedTitle'."; exit 1 }
-          # Single-asset release (DECISIONS §18): NSIS only, no updater
-          # artifacts. If either flag drifts back, the build would
-          # produce an MSI and/or .sig files this workflow never uploads.
-          if ($conf.bundle.targets.Count -ne 1 -or $conf.bundle.targets[0] -ne "nsis") { Write-Error "bundle.targets must be exactly [""nsis""] for a single-asset release."; exit 1 }
-          if ($conf.bundle.createUpdaterArtifacts -ne $false) { Write-Error "bundle.createUpdaterArtifacts must be false for a single-asset release (no .sig / latest.json)."; exit 1 }
-          Write-Host "Version $version consistent across Cargo.toml, tauri.conf.json, frontend/package.json and the window title. Single-asset config confirmed (targets: nsis only, no updater artifacts)."
-
-      - name: Set up Node.js 24
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
+          # v2.0 has no Tauri shell and no frontend/: there is no
+          # tauri.conf.json / package.json version to check anymore.
+          # The single source of truth is the workspace version above.
+          Write-Host "Version $version matches the Cargo workspace version."
 
       - name: Install Rust 1.100.0
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.100.0"
-          # Dry-run #3 (2026-11-14): `cargo fmt --check` failed with
-          # "'cargo-fmt.exe' is not installed for the toolchain
-          # '1.100.0-...'" — dtolnay installs only the default
-          # components; rustfmt + clippy must be requested explicitly
-          # (CI already does this per job: `components: rustfmt` /
-          # `components: clippy`). Without them this workflow fails at
-          # fmt (and clippy would fail the same way right after).
           components: rustfmt, clippy
 
       - name: Cache Cargo dependencies
@@ -198,98 +173,56 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
-      - name: Install cargo tools
+      - name: Check makensis present (fail closed)
         shell: pwsh
         run: |
-          # Pinned (M2): 0.20.2 / 2.12.4 are the latest stable versions on
-          # crates.io, 2026-11-14 (tauri-cli 3.0.0-alpha.6 exists — do NOT
-          # pin a 3.0 alpha for a 2.x app). PlatformIO is NOT installed
-          # anymore: the single-asset release builds no firmware
-          # (DECISIONS §18).
-          cargo install cargo-deny --version 0.20.2 --locked
-          cargo install tauri-cli --version 2.12.4 --locked
-          cargo tauri --version
+          $makensis = Get-Command makensis -ErrorAction SilentlyContinue
+          if (-not $makensis) { Write-Error "makensis not found on the runner — the NSIS installer cannot be built. Install NSIS (https://nsis.sourceforge.io/) on the runner image."; exit 1 }
+          makensis -VERSION
 
       # ---- Sidecar FIRST: fetch pinned HIDMaestro, verify hashes, AOT publish ----
-      # The rsh-app build script (Tauri) validates bundle.externalBin at build
-      # time, so the sidecar must be staged BEFORE `cargo test --workspace
-      # --release` — otherwise the test step fails with "resource path
-      # `binaries\\rsh-hm-sidecar-x86_64-pc-windows-msvc.exe` doesn't exist"
-      # (release dry runs #1/#2 + first CI run, 2026-11-14). Shared script
-      # (M6) — the same script CI test-windows / tauri-build / clippy-windows
-      # call.
+      # The v2.0 installer bundles the staged sidecar exe beside
+      # rsh-daemon.exe (the daemon resolves it relative to its own
+      # exe). The shared script still stages to
+      # `src-tauri/binaries/…` — the packaging step below copies it
+      # out of there; the Tauri shell itself is never built.
       - name: Fetch + verify HIDMaestro v2.1.0, publish sidecar (AOT)
         id: sidecar
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
 
-      # ---- Gates (a superset of the CI gates — H4: a tag push does not trigger CI) ----
+      # ---- Gates (superset of the CI gates for the ship crates) ----
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      # Frontend gates run FIRST, before any cargo build of rsh-app:
-      # tauri::generate_context!() panics at compile time when
-      # frontendDist (../frontend/dist) does not exist, and the stale
-      # committed dist was deleted in v1.0.2 (Bug 6) — so `npm run build`
-      # here is what makes clippy / the --release tests able to compile
-      # rsh-app at all. (v1.0.2 release run 43708235724 + CI run
-      # 43708228362 failed on exactly this: `frontendDist ... doesn't
-      # exist`.) The `cargo tauri build` step below still rebuilds via
-      # beforeBuildCommand; this build is not redundant, it is the one
-      # the Rust gates compile against.
-      - name: Frontend gates (lint + tests + locales + audit + build)
-        working-directory: frontend
-        shell: pwsh
-        run: |
-          npm ci
-          npm run lint
-          npm test
-          node scripts/merge-locales.mjs --check
-          npm audit --audit-level=high
-          npm run build
+      - name: cargo clippy --workspace --exclude src-tauri (warnings denied)
+        # Windows runner: every non-Tauri member compiles here
+        # (src-tauri is excluded — v2.0 does not build or ship it).
+        run: cargo clippy --workspace --exclude src-tauri --all-targets -- -D warnings
 
-      - name: cargo clippy --workspace (warnings denied)
-        # Windows runner + sidecar already staged, so the rsh-app build
-        # script passes here (unlike Linux CI, which excludes rsh-app).
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      # Debug `cargo test --workspace` REMOVED (user order 2026-11-15):
-      # dry runs must not repeat the full suite — CI already proved the
-      # debug suite green on this tree. The --release run below stays:
-      # CI never runs --release tests, so only this workflow proves them.
-      - name: cargo test --workspace --release
-        # TESTING-INPUT §9.1: the --release test run is required at least
-        # once before the release gate — this is that run, before the
-        # Tauri build. (H4)
-        run: cargo test --workspace --release
+      - name: cargo test (ship crates, --release)
+        # The debug full suite runs in CI on every push (user order:
+        # no repeated full-suite loops in dry runs). The --release run
+        # below stays — CI never runs --release tests, so only this
+        # workflow proves the ship crates in release mode.
+        run: cargo test -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc --release
 
       - name: cargo deny check
         run: cargo deny check
 
-      # ---- Tauri build (NSIS ONLY — single-asset release, DECISIONS §18) ----
-      # No TAURI_SIGNING_PRIVATE_KEY env: with createUpdaterArtifacts
-      # false the bundler writes no .sig files and signs nothing.
-      - name: cargo tauri build
-        shell: pwsh
-        run: cargo tauri build --target x86_64-pc-windows-msvc
-        working-directory: src-tauri
+      # ---- Build the ship binaries ----
+      - name: cargo build --release (daemon + UI)
+        run: cargo build --release -p rsh-daemon -p rsh-ui
 
-      # ---- Hotfix v1.0.1: no console window — PE subsystem must be GUI ----
-      # The v1.0.0 launch failure (user PC, 2026-11-15 ~13:50 PKT): the
-      # app opened behind a visible console window and then vanished.
-      # Causes were a console-subsystem app binary (missing
-      # `windows_subsystem = "windows"`) and a console-subsystem
-      # sidecar spawned without CREATE_NO_WINDOW. This step proves,
-      # before anything is published, that BOTH binaries are
-      # IMAGE_SUBSYSTEM_WINDOWS_GUI (2) — a CUI binary (3) fails the run.
-      #
-      # Paths: the sidecar path is where stage-sidecar.ps1 stages it
-      # (`src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe`).
-      # The app exe path is the WORKSPACE-ROOT target dir, NOT
-      # `src-tauri/target/` — src-tauri is a workspace member, so Cargo
-      # puts target/ at the repo root (proven by run 43687032820, same
-      # as the bundle dir in the stage step below).
-      - name: No console window — PE subsystem must be GUI (hotfix v1.0.1)
+      # ---- No console window — PE subsystem must be GUI ----
+      # The v1.0.0 launch failure (user PC): the app opened behind a
+      # visible console window and then vanished. Causes were
+      # console-subsystem binaries. This step proves, before anything
+      # is published, that ALL THREE binaries are
+      # IMAGE_SUBSYSTEM_WINDOWS_GUI (2) — a CUI binary (3) fails the
+      # run. Paths: the sidecar path is where stage-sidecar.ps1 stages
+      # it; the daemon/UI exes are the workspace-root target dir.
+      - name: No console window — PE subsystem must be GUI
         shell: pwsh
         run: |
           function Get-PESubsystem([string]$Path) {
@@ -299,7 +232,8 @@ jobs:
           }
           $bins = @(
             "src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe",
-            "target/x86_64-pc-windows-msvc/release/rsh-app.exe"
+            "target/release/rsh-daemon.exe",
+            "target/release/rsh-ui.exe"
           )
           foreach ($b in $bins) {
             if (-not (Test-Path $b)) { throw "missing binary: $b" }
@@ -309,48 +243,105 @@ jobs:
             Write-Host "$b : subsystem 2 (GUI) OK"
           }
 
-      # ---- Stage the single asset + verify (fail closed) ----
-      - name: Stage release asset (NSIS only)
+      # ---- NSIS installer (the ONLY release asset) ----
+      # The .nsi script is generated here (no committed installer
+      # script — the installer IS this step). It installs the two
+      # binaries + the sidecar beside the daemon, creates the
+      # program-scoped inbound firewall rule for rsh-daemon.exe
+      # (Private + Public), and removes the rule on uninstall.
+      # Autostart is deliberately NOT enabled by the installer:
+      # Settings owns it (daemon syncs the Run key from
+      # settings.autostart on startup).
+      - name: Write NSIS script
         shell: pwsh
         run: |
-          $tag = "${{ steps.tag.outputs.tag }}"
-          # Bundler output lives in the WORKSPACE-ROOT target dir, not
-          # src-tauri/target: src-tauri is a workspace member, so Cargo
-          # puts target/ at the repo root (proven by run 43687032820:
-          # D:\a\RSH\RSH\target\...\bundle\nsis\RSH_1.0.2_x64-setup.exe).
-          $bundleDir = "target/x86_64-pc-windows-msvc/release/bundle"
-          $nsis = Get-ChildItem "$bundleDir/nsis/*-setup.exe" -ErrorAction SilentlyContinue
-          if ($nsis.Count -ne 1) { Write-Error "Expected exactly one NSIS setup exe in $bundleDir/nsis."; exit 1 }
-          $staging = "release-staging"
-          New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item $nsis.FullName "$staging/$($nsis.Name)"
-          Write-Host "Staged the single release asset:"; Get-ChildItem $staging -File | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) B)" }
+          New-Item -ItemType Directory -Force -Path installer | Out-Null
+          @'
+          ; RSH v2.0 NSIS installer — generated by .github/workflows/release.yml
+          ; (no committed .nsi: the installer is defined by the release workflow).
+          ; Single-asset release: this installer is the ONLY release asset.
+          !include "LogicLib.nsh"
+          !define VERSION "${VERSION}"
+          Name "RSH"
+          OutFile "release-staging\RSH_${VERSION}_x64-setup.exe"
+          InstallDir "$PROGRAMFILES64\RSH"
+          InstallDirRegKey HKLM "Software\RSH" "InstallDir"
+          RequestExecutionLevel admin
+          ; Admin is requested ONCE here, at install time, so the firewall
+          ; rule below can be created. Nothing at login ever prompts (D-7:
+          ; the daemon defers the elevated HIDMaestro sidecar until
+          ; "Send to game" is turned on).
+          Section "RSH"
+            SetOutPath "$INSTDIR"
+            File "target\release\rsh-daemon.exe"
+            File "target\release\rsh-ui.exe"
+            ; Sidecar MUST sit beside rsh-daemon.exe: the daemon resolves it
+            ; as <own exe dir>\rsh-hm-sidecar.exe (resolve_sidecar_path).
+            File "/oname=rsh-hm-sidecar.exe" "src-tauri\binaries\rsh-hm-sidecar-x86_64-pc-windows-msvc.exe"
+            WriteRegStr HKLM "Software\RSH" "InstallDir" "$INSTDIR"
+            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "DisplayName" "RSH ${VERSION}"
+            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "UninstallString" "$INSTDIR\uninstall.exe"
+            WriteUninstaller "$INSTDIR\uninstall.exe"
+            CreateDirectory "$SMPROGRAMS\RSH"
+            CreateShortcut "$SMPROGRAMS\RSH\RSH Wheel.lnk" "$INSTDIR\rsh-ui.exe"
+            CreateShortcut "$SMPROGRAMS\RSH\Uninstall RSH.lnk" "$INSTDIR\uninstall.exe"
+            ; Firewall rule (LOGIC-FIX-PLAN §4.3 / C-10): program-scoped
+            ; inbound UDP for the daemon only (the board's 200 Hz stream
+            ; arrives unsolicited from the board, source port 4211) on
+            ; Private + Public. No port scope: a port-scoped rule would
+            ; also allow other programs on that port. Hidden via nsExec
+            ; (no console flash during install).
+            nsExec::ExecToStack 'netsh advfirewall firewall add rule name="RSH" dir=in action=allow program="$INSTDIR\rsh-daemon.exe" profile=private,public'
+            Pop $0
+            ${If} $0 != 0
+              MessageBox MB_ICONEXCLAMATION "RSH installed, but the Windows Firewall rule could not be created (netsh exit $0). The wheel may not connect over Wi-Fi until you allow RSH through the firewall manually."
+            ${EndIf}
+          SectionEnd
+          Section "Uninstall"
+            ; Remove the firewall rule first (best-effort: a missing rule
+            ; is fine on a machine where the install-time rule failed).
+            nsExec::ExecToStack 'netsh advfirewall firewall delete rule name="RSH"'
+            Pop $0
+            Delete "$INSTDIR\rsh-daemon.exe"
+            Delete "$INSTDIR\rsh-ui.exe"
+            Delete "$INSTDIR\rsh-hm-sidecar.exe"
+            Delete "$INSTDIR\uninstall.exe"
+            Delete "$SMPROGRAMS\RSH\RSH Wheel.lnk"
+            Delete "$SMPROGRAMS\RSH\Uninstall RSH.lnk"
+            RMDir "$SMPROGRAMS\RSH"
+            RMDir "$INSTDIR"
+            DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH"
+            DeleteRegKey HKLM "Software\RSH"
+          SectionEnd
+          '@ -replace '\$\{VERSION\}', "${{ steps.tag.outputs.version }}" | Set-Content -Path installer\rsh.nsi -Encoding ASCII
+          Get-Content installer\rsh.nsi | Select-Object -First 5
 
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-staging | Out-Null
+          makensis installer\rsh.nsi
+          Get-ChildItem release-staging -File | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) B)" }
+
+      # ---- Stage the single asset + verify (fail closed) ----
       - name: Verify staged asset (fail closed — exactly one file)
         shell: pwsh
         run: |
           $staging = "release-staging"
           $files = Get-ChildItem $staging -File
           if ($files.Count -ne 1) { Write-Error "Expected exactly ONE staged asset (the NSIS exe), found $($files.Count). Single-asset release — refusing to publish anything else."; exit 1 }
-          if ($files[0].Name -notmatch '-setup\.exe$') { Write-Error "Staged file '$($files[0].Name)' is not the NSIS setup exe."; exit 1 }
+          if ($files[0].Name -notmatch '^RSH_.*-setup\.exe$') { Write-Error "Staged file '$($files[0].Name)' is not the NSIS setup exe."; exit 1 }
           Write-Host "Single asset verified: $($files[0].Name) ($($files[0].Length) B)."
 
-      # ---- Hotfix v1.0.2: headless launch smoke test ----
-      # The v1.0.1 launch failure (user PC: double-click → nothing,
-      # empty logs) was never caught by any gate — every check until
-      # now proved the BUILD, never the LAUNCH. This step installs
-      # the staged NSIS exe silently, starts it, and proves the
-      # launch path: the process must stay alive AND the startup log
-      # must reach "event loop ready" (which also proves the v1.0.2
-      # breadcrumbs + dual-location logging work). A process that
-      # dies in the first seconds fails the run with its exit code.
-      #
-      # What it CANNOT prove (headless runner, stated plainly): the
-      # window actually painting — a GitHub runner has no interactive
-      # desktop to look at. Process-alive + log-file is the strongest
-      # launch evidence available in CI; real paint is a human gate
-      # (docs/RELEASE-CHECKLIST.md).
-      - name: Headless launch smoke test (install + start + log check)
+      # ---- Headless launch smoke test ----
+      # Installs the staged NSIS exe silently, proves the firewall
+      # rule exists, proves the daemon starts and its IPC answers
+      # (`--check` exits 0), then uninstalls silently and proves the
+      # rule and the install dir are gone. What it CANNOT prove
+      # (headless runner): the window actually painting — process +
+      # IPC + rule is the strongest launch evidence available in CI;
+      # real paint is a human gate (docs/RELEASE-CHECKLIST.md).
+      - name: Headless launch smoke test (install + firewall + daemon check + uninstall)
         shell: pwsh
         run: |
           $installer = (Get-ChildItem release-staging/*-setup.exe).FullName
@@ -358,62 +349,27 @@ jobs:
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
           # NSIS silent install (/S); /D must be last, unquoted.
           Start-Process -FilePath $installer -ArgumentList "/S", "/D=$installDir" -Wait
-          $exe = Join-Path $installDir "rsh-app.exe"
-          if (-not (Test-Path $exe)) { Write-Error "Smoke test: installed exe not found at $exe after silent install."; exit 1 }
-          Write-Host "Installed to $installDir — launching $exe"
-          $proc = Start-Process -FilePath $exe -PassThru
-          # The startup log is UTC-dated (rsh-YYYYMMDD.log); it must
-          # appear in %APPDATA%\RSH\logs, or — when the data dir
-          # fails (hypothesis #1) — in %TEMP%\RSH\logs.
-          $date = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
-          $logNames = @(
-            (Join-Path $env:APPDATA "RSH\logs\rsh-$date.log"),
-            (Join-Path $env:TEMP "RSH\logs\rsh-$date.log")
-          )
-          $ready = $false
-          for ($i = 0; $i -lt 18 -and -not $ready; $i++) {
-            Start-Sleep -Seconds 5
-            if ($proc.HasExited) {
-              Write-Error "Smoke test: RSH exited after $($i * 5)s with exit code $($proc.ExitCode) before the event loop was ready — see the startup log."
-              exit 1
-            }
-            foreach ($log in $logNames) {
-              if (Test-Path $log) {
-                $text = Get-Content $log -Raw -ErrorAction SilentlyContinue
-                # Fail fast on a FATAL startup line: the app shows a
-                # modal dialog there (MessageBoxW) and the process
-                # stays alive waiting for a click nobody will give on
-                # a headless runner — waiting the full 90 s would only
-                # delay the same verdict.
-                $fatal = Select-String -Path $log -Pattern "FATAL:" -SimpleMatch | Select-Object -First 1
-                if ($fatal) {
-                  Write-Host "--- $log"; Get-Content $log
-                  try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { }
-                  Write-Error "Smoke test: startup hit a FATAL error: $($fatal.Line)"
-                  exit 1
-                }
-                if ($text -and $text.Contains("event loop ready")) { $ready = $true; Write-Host "Startup log reached 'event loop ready': $log"; break }
-              }
-            }
+          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "rsh-hm-sidecar.exe")) {
+            if (-not (Test-Path (Join-Path $installDir $exe))) { Write-Error "Smoke test: installed $exe not found in $installDir after silent install."; exit 1 }
           }
-          if (-not $ready) {
-            Write-Host "Startup logs found:"
-            foreach ($log in $logNames) { if (Test-Path $log) { Write-Host "--- $log"; Get-Content $log } else { Write-Host "--- $log (missing)" } }
-            try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { }
-            Write-Error "Smoke test: no startup log reached 'event loop ready' within 90 s (process was alive). The dumped log above is the evidence."
-            exit 1
-          }
-          # Version breadcrumb: the running build must report this version.
-          $logText = ""
-          foreach ($log in $logNames) { if (Test-Path $log) { $logText += Get-Content $log -Raw } }
-          if ($logText -notmatch "RSH v${{ steps.tag.outputs.version }} starting") {
-            try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { }
-            Write-Error "Smoke test: startup log does not contain 'RSH v${{ steps.tag.outputs.version }} starting' — wrong version launched?"
-            exit 1
-          }
-          Write-Host "Smoke test PASS: process alive, event loop ready, version v${{ steps.tag.outputs.version }}."
-          try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { Write-Host "Smoke test process already gone (exit code $($proc.ExitCode))." }
-          Remove-Item $installDir -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "Installed to $installDir — all three binaries present."
+          $rule = netsh advfirewall firewall show rule name="RSH" | Out-String
+          if ($rule -notmatch "RSH") { Write-Error "Smoke test: firewall rule 'RSH' not found after install (netsh show rule)."; exit 1 }
+          Write-Host "Firewall rule 'RSH' present after install."
+          $dataDir = Join-Path $env:TEMP "rsh-smoke-data"
+          $daemon = Join-Path $installDir "rsh-daemon.exe"
+          $proc = Start-Process -FilePath $daemon -ArgumentList "--check", "--no-tray", "--no-connect", "--data-dir", $dataDir -PassThru -Wait
+          if ($proc.ExitCode -ne 0) { Write-Error "Smoke test: rsh-daemon --check exited with code $($proc.ExitCode) (expected 0 — IPC must answer)."; exit 1 }
+          Write-Host "Smoke test PASS: daemon --check exit 0 (IPC answers)."
+          $uninstaller = Join-Path $installDir "uninstall.exe"
+          if (-not (Test-Path $uninstaller)) { Write-Error "Smoke test: uninstaller not found at $uninstaller."; exit 1 }
+          Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait
+          Start-Sleep -Seconds 5
+          $ruleAfter = netsh advfirewall firewall show rule name="RSH" | Out-String
+          if ($ruleAfter -match "Rule Name:\s*RSH") { Write-Error "Smoke test: firewall rule 'RSH' still present after uninstall."; exit 1 }
+          if (Test-Path $installDir) { Write-Error "Smoke test: install dir $installDir still present after uninstall."; exit 1 }
+          Write-Host "Smoke test PASS: uninstall removed the firewall rule and the install dir."
+          Remove-Item $dataDir -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: vJoy DLL hash (record only — never invented)
         shell: pwsh
@@ -429,16 +385,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ steps.tag.outputs.tag }}"
-          # M5 (deep-scan Round 2): enumerate the staged files explicitly
-          # instead of `release-staging/*` — a glob also matches
-          # directories and can silently pick up (or miss) files if the
-          # staging layout changes; the verify step above already proved
-          # exactly one file is staged.
           $files = Get-ChildItem release-staging -File | ForEach-Object { $_.FullName }
           if ($files.Count -ne 1) { Write-Error "Expected exactly one staged file (the NSIS exe) — refusing to create a multi-asset or empty release."; exit 1 }
           Write-Host "Releasing 1 file:"
           $files | ForEach-Object { Write-Host "  $_" }
-          gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes "RSH v${{ steps.tag.outputs.version }} — NSIS installer only (single-asset release). Hotfix v1.0.2: startup failures are now visible (native error dialog + dual-location startup log) and the launch path is smoke-tested in CI; no console window on launch (app + sidecar are GUI-subsystem). Auto-update is off for this release: no latest.json is published — download and install manually. Firmware v4.0.1 is not included — no reflash needed (protocol v2.1, boards already on v4.0.1). App ships unsigned (OV cert deferred, D-R11)." $files
+          gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes "RSH v${{ steps.tag.outputs.version }} — NSIS installer only (single-asset release). v2.0 redesign: Slint UI + always-on daemon (tray popup + menu, autostart, lazy-start — no UAC prompt at login). Auto-update is off for this release: no latest.json is published — download and install manually. Firmware v4.0.2 is not included — no reflash needed (protocol v2.1, boards already on v4.0.2). App ships unsigned (OV cert deferred, D-R11)." $files
 
       - name: Dry run — release NOT created
         if: ${{ github.ref_type != 'tag' && inputs.dry_run != 'false' }}

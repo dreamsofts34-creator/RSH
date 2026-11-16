@@ -42,6 +42,13 @@
 #     The release workflow runs it (deep-scan Round 2, H4).
 #
 # ---- Linux / Windows split (deep-scan Round 2, H3) ----
+# v2.0 crates (REDESIGN-PLAN Phase 2/3/7): `rsh-daemon`, `rsh-ui`,
+# `rsh-api`, `rsh-ipc` are workspace members and are covered by the
+# Linux `--workspace --exclude rsh-app` jobs AND by the explicit
+# `-p` steps in the Windows jobs below (each job also has a
+# fail-closed presence check for the four crates, so a deleted crate
+# fails the job instead of silently dropping out of coverage).
+#
 # `rsh-app` (src-tauri) is a workspace member, but its build script
 # (`tauri_build::build()`) copies the `bundle.externalBin` sidecar at
 # build-script time and fails with `ResourcePathNotFound` when the staged
@@ -150,6 +157,15 @@ jobs:
       # still covers every other member, including the non-default ones
       # (rsh-benchmarks, rsh-rig); the shell itself is covered by the
       # `clippy-windows` job (-p rsh-app, sidecar staged).
+      - name: Check v2.0 crates present (fail closed)
+        if: steps.check.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for crate in rsh-daemon rsh-ui rsh-api rsh-ipc; do
+            test -f "crates/$crate/Cargo.toml" || { echo "::error::crates/$crate/Cargo.toml missing — the v2.0 crate is a landed artifact. Restore it; do not delete this check."; exit 1; }
+          done
+          echo "v2.0 crates present: rsh-daemon, rsh-ui, rsh-api, rsh-ipc"
       - name: cargo clippy (warnings denied)
         if: steps.check.outputs.run == 'true'
         run: cargo clippy --workspace --exclude rsh-app --all-targets -- -D warnings
@@ -214,6 +230,13 @@ jobs:
       - name: cargo clippy -p rsh-app (warnings denied)
         if: steps.check.outputs.run == 'true'
         run: cargo clippy -p rsh-app --all-targets -- -D warnings
+      # v2.0 crates (Phase 2/3/7): the daemon + Slint UI + API + IPC.
+      # Explicit -p run (not covered by the -p rsh-app step above);
+      # the sidecar staging above is for rsh-app only — these crates
+      # do not need it at build time.
+      - name: cargo clippy -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc (warnings denied)
+        if: steps.check.outputs.run == 'true'
+        run: cargo clippy -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc --all-targets -- -D warnings
 
   test-linux:
     name: test (Linux)
@@ -242,14 +265,25 @@ jobs:
       - name: Cache Cargo dependencies
         if: steps.check.outputs.run == 'true'
         uses: Swatinem/rust-cache@v2
+      - name: Check v2.0 crates present (fail closed)
+        if: steps.check.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for crate in rsh-daemon rsh-ui rsh-api rsh-ipc; do
+            test -f "crates/$crate/Cargo.toml" || { echo "::error::crates/$crate/Cargo.toml missing — the v2.0 crate is a landed artifact. Restore it; do not delete this check."; exit 1; }
+          done
+          echo "v2.0 crates present: rsh-daemon, rsh-ui, rsh-api, rsh-ipc"
       - name: cargo test --workspace (excluding rsh-app on Linux)
         if: steps.check.outputs.run == 'true'
         # Same split as clippy (header note): a bare --workspace would
         # build rsh-app, whose build script fails on Linux without the
         # staged Windows sidecar. rsh-app is tested on Windows
         # (test-windows, sidecar staged); the Linux run covers the
-        # other 12 members. (Deep-scan Round 2 — same root cause as H3;
-        # found while fixing the clippy scope, not in the audit list.)
+        # other members, including the four v2.0 crates (rsh-daemon,
+        # rsh-ui, rsh-api, rsh-ipc). (Deep-scan Round 2 — same root
+        # cause as H3; found while fixing the clippy scope, not in the
+        # audit list.)
         run: cargo test --workspace --exclude rsh-app
 
   test-windows:
@@ -310,6 +344,10 @@ jobs:
         run: |
           npm ci
           npm run build
+      # The full --workspace run covers the four v2.0 crates
+      # (rsh-daemon, rsh-ui, rsh-api, rsh-ipc) on Windows, sidecar
+      # staged above; on Linux the same crates are covered by
+      # test-linux (--workspace --exclude rsh-app).
       - name: cargo test --workspace
         if: steps.check.outputs.run == 'true'
         run: cargo test --workspace

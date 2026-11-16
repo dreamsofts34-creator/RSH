@@ -2,6 +2,7 @@
 // RSH firmware — tamam settings ek jagah
 // Board: ESP32 DevKit V1 (asal ESP32). C3 Super Mini wala version
 // ab is package mein shamil nahi (original handover mein tha).
+#include "version.h"   // F-12: FIRMWARE_VERSION ka single source
 
 // ---------- Pins (ESP32 DevKit V1) ----------
 // Tamam ANALOG sirf ADC1 par (GPIO32-39) — ADC2 WiFi ke saath band ho jata hai.
@@ -107,6 +108,20 @@
 #define RSH_WIRED_SERIAL 1
 #define RSH_SERIAL_BAUD 921600
 
+// ---------- Sampling task (F-06, v4.0.2) ----------
+// 1 = sampling+packet-build dedicated FreeRTOS task (core 1,
+// loop task se zyada priority, vTaskDelayUntil 5 ms); SEND loop task
+// mein rehta hai (WiFiUDP thread-safe nahi — sample_task.h dekho).
+// Task create fail ho to legacy in-loop sampling wapas (rsh.ino).
+// 0 = purana behaviour (sab kuch cooperative loop() mein).
+#define RSH_SAMPLE_TASK 1
+
+// ---------- Auto channel rescan (F-07, v4.0.2) ----------
+// 0 = OFF by default (rescan AP ko 1-3 s band karta hai — stream drop +
+// PC disassociate; sirf tab jab koi PC active na ho, tab bhi sirf is
+// setting ke on hone par). 1 = rescan allowed (jab koi PC active na ho).
+#define RSH_AUTO_CHANNEL 0
+
 // ---------- WiFi / Network ----------
 #define WIFI_SSID    "RSH"
 // mDNS hostname (Phase G, C2/D33): board `rsh.local` par announce hota
@@ -131,7 +146,7 @@
 #define HELLO_TIMEOUT_MS 2000   // itni der HELO na aye to bhejna band
 
 // ---------- Advanced features ----------
-#define FIRMWARE_VERSION "4.0.1"
+#define FIRMWARE_VERSION RSH_FW_VERSION_STRING  // F-12: version.h single source
 
 // OTA: WiFi par firmware update (USB cable ke baghair). Arduino IDE mein
 // network port "rsh" nazar ayega. Update ke doran sampling ruk jati

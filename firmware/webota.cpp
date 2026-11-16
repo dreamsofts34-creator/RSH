@@ -49,6 +49,8 @@
 #include "keystore.h"  // FW-8: per-device password (WebOTA auth, SEC-C-04)
 #include "ota_validate.h"
 #include "signing_pubkey.h"
+#include "webota_auth.h"  // F-08: per-IP auth rate limit (pure)
+#include "diag_log.h"     // F-10: OTA fail events
 
 static WebServer server(80);
 static bool active = false;          // upload chal raha hai
@@ -56,28 +58,26 @@ static bool updateOk = false;        // is upload ka result
 static bool restartPending = false;  // success ke baad restart schedule
 static uint32_t restartAtMs = 0;
 
-// ---- Auth rate limit (SEC-D-02 / TM-O03) ----
-static uint8_t authFails = 0;        // lagatar ghalat koshishein
-static uint32_t authLockUntilMs = 0; // lockout khatam hone ka waqt (0 = koi lockout nahi)
-static constexpr uint8_t kAuthMaxFails = 5;
-static constexpr uint32_t kAuthLockoutMs = 60000;
+// WebOTA auth rate limit (SEC-D-02 / TM-O03) — F-08 (v4.0.2): PER-IP.
+// Purana global counter khatam: ek IP ke 5 fails sirf us IP ko 60 s
+// lock karte hain (webota_auth.h, host-testable). Table max 4 IPs
+// (SoftAP max stations).
+static RshWebotaAuth webotaAuth;
 
 static bool authed() {
   uint32_t now = millis();
+  uint32_t ip = (uint32_t)server.client().remoteIP();
   // Lockout ke doran password check hi nahi karte (koi oracle nahi).
-  if ((int32_t)(now - authLockUntilMs) < 0) {
+  if (!rsh_webota_auth_allowed(&webotaAuth, ip, now)) {
     server.requestAuthentication();
     return false;
   }
   if (!server.authenticate(WEB_OTA_USER, keystore_password())) {
     server.requestAuthentication();
-    if (++authFails >= kAuthMaxFails) {
-      authLockUntilMs = now + kAuthLockoutMs;
-      authFails = 0;
-    }
+    rsh_webota_auth_note(&webotaAuth, ip, now, 0);
     return false;
   }
-  authFails = 0;
+  rsh_webota_auth_note(&webotaAuth, ip, now, 1);
   return true;
 }
 
@@ -218,6 +218,7 @@ static void handleUpdateDone() {
   if (ok) {
     server.send(200, "text/plain", "OK - update ho gaya, board restart ho raha hai");
   } else {
+    rsh_diag_record_global(RSH_DIAG_OTA_FAIL, 0, millis());  // F-10
     char body[160];
     snprintf(body, sizeof(body), "FAIL - %s, purana firmware chal raha hai",
              uploadError[0] ? uploadError : "update nahi hua");
@@ -370,6 +371,7 @@ void webota_handle() {
     updateOk = false;
     active = false;
     uploadError = "upload timeout (30 s koi data nahi)";
+    rsh_diag_record_global(RSH_DIAG_OTA_FAIL, 0, millis());  // F-10
   }
   if (restartPending && (int32_t)(millis() - restartAtMs) >= 0) {
     restartPending = false;

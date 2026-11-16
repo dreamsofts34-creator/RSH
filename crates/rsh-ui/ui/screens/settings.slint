@@ -1,0 +1,433 @@
+// RSH v2.0 — Settings screen (REDESIGN-PLAN §7.5, preview-html/Settings.html
+// is the single source of truth). Phase 5 port of the verified staging
+// screen (v2-screens/screens/settings.slint, see SETTINGS-PORTING.md):
+// sidebar/top-bar removed (the Phase 3 shell owns them once for all
+// pages); local staging components replaced one-for-one with the shared
+// library (../components.slint); Derived fills replaced with Theme
+// tokens (Phase 3 folded them in); font/icon imports dropped (the shell
+// embeds the fonts once). One local component remains: Seg, because the
+// shared SegmentedControl has no disabled options and the Light/Auto
+// theme options are disabled until the light theme is designed (§5).
+//
+// Data: connection/backend/startup/theme/profiles come from Rust via the
+// props below. The real AppApi (rsh-api) exposes connection + pairing
+// only — backend choice, startup flags, theme, profiles, firmware/app
+// update checks and backup/restore are NOT AppApi methods yet, so the
+// callbacks below are the integration seam: the shell wires them to the
+// daemon/profile store when it lands, and until then they carry sim
+// data (same values as the staging harness). About card carries the
+// AboutSlint widget (Slint Royalty-free 2.0 attribution, §10).
+// English only; no language selector (§9).
+
+import { Theme } from "../tokens.slint";
+import { Card, Btn, Pill, RadioOptionCard, Switch } from "../components.slint";
+import { AboutSlint, ScrollView } from "std-widgets.slint";
+
+export struct ProfileRow {
+    name: string,
+    games: string,
+    active: bool,
+}
+
+// ---------------------------------------------------------------- segmented control with disabled options
+// (shared SegmentedControl has no disabled state; only the Theme row
+// needs it — Light/Auto are not designed yet, shown faint, clicks ignored).
+// Pure view: never sets `selected` itself; the parent owns the state.
+component Seg inherits Rectangle {
+    in property <[string]> options;
+    in property <[bool]> enabled: [true, true, true];
+    in property <int> selected;
+    callback selected-changed(int);
+    height: 30px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.line;
+    background: Theme.bg;
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 0px;
+        for o[i] in options : Rectangle {
+            horizontal-stretch: 1;
+            border-radius: 6px;
+            accessible-label: o;
+            accessible-role: button;
+            background: fs.has-focus ? Theme.line : (selected == i ? Theme.panel2 : transparent);
+            opacity: enabled[i] ? 1 : 0.45;
+            fs := FocusScope {
+                width: 100%;
+                height: 100%;
+                key-pressed(event) => {
+                    if (event.text == Key.Return || event.text == Key.Space) {
+                        if (enabled[i]) { selected-changed(i); }
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            Text {
+                width: 100%;
+                height: 100%;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                text: o;
+                font-size: 12px;
+                font-weight: 600;
+                color: selected == i ? white : Theme.mute;
+            }
+            TouchArea { clicked => { if (enabled[i]) { selected-changed(i); } } }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Settings page (content only — no Window/sidebar)
+export component SettingsScreen inherits VerticalLayout {
+    // ---- state owned by Rust (simulated defaults; AppApi covers
+    // connection + pairing only — see header)
+    in-out property <bool> connected: true;
+    in-out property <int> connection-type: 0; // 0 Wi-Fi, 1 USB cable
+    in-out property <string> address: "rsh.local";
+    in-out property <int> backend: 0; // 0 HIDMaestro, 1 vJoy
+    in-out property <bool> start-with-windows: true;
+    in-out property <bool> keep-in-tray: true;
+    in-out property <int> theme: 0; // 0 Dark only (Light/Auto not designed yet)
+    in-out property <[ProfileRow]> profiles;
+    in-out property <string> app-version: "RSH 2.0.0";
+    in-out property <string> firmware-text: "Version 4.0.2 · up to date";
+    in-out property <string> app-update-text: "You have the latest version";
+    in-out property <string> backup-text: "Last saved today, 09:12";
+
+    callback connection-selected(int);
+    callback address-changed(string);
+    callback reconnect();
+    callback pair-requested();
+    callback backend-selected(int);
+    callback toggled-start-windows(bool);
+    callback toggled-keep-tray(bool);
+    callback theme-selected(int);
+    callback new-profile();
+    callback use-profile(int);
+    callback duplicate-profile(int);
+    callback check-firmware();
+    callback check-app-updates();
+    callback backup();
+    callback restore();
+    callback open-diagnostics();
+
+    settings-scroll := ScrollView {
+        vertical-stretch: 1;
+        VerticalLayout {
+            padding-top: 14px;
+            padding-left: 20px;
+            padding-right: 20px;
+            spacing: 12px;
+            HorizontalLayout {
+                spacing: 12px;
+                // Equal columns: explicit 342px each (preview-exact:
+                // (736 - 40 pad - 12 gap) / 2 = 342 at 920px). The
+                // staging formula sized them from the ScrollView's
+                // visible-width, but that feeds back into the page's
+                // own preferred width here and the columns came out
+                // ~357px, overflowing the right edge to x=915.
+                // ---- left column
+                VerticalLayout {
+                    width: 342px;
+                    spacing: 12px;
+                    // Connection
+                    Card {
+                        VerticalLayout {
+                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            spacing: 0px;
+                            HorizontalLayout {
+                                alignment: space-between;
+                                Text { text: "Connection"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                                Pill { label: connected ? "Connected" : "Disconnected"; bg: connected ? Theme.ok-bg : Theme.panel2; fg: connected ? Theme.ok : Theme.bad; }
+                            }
+                            Rectangle { height: 8px; }
+                            Seg {
+                                options: ["Wi-Fi", "USB cable"];
+                                enabled: [true, true];
+                                selected: connection-type;
+                                selected-changed(i) => { connection-type = i; connection-selected(i); }
+                            }
+                            Rectangle { height: 6px; }
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 10px;
+                                Text { width: 52px; text: "Address"; font-size: 13px; color: Theme.mute; vertical-alignment: center; }
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: 28px;
+                                    border-radius: 7px;
+                                    border-width: 1px;
+                                    border-color: Theme.line;
+                                    background: Theme.bg;
+                                    TextInput {
+                                        x: 10px;
+                                        width: parent.width - 20px;
+                                        height: 100%;
+                                        vertical-alignment: center;
+                                        text <=> address;
+                                        font-family: Theme.font-mono;
+                                        font-size: 12px;
+                                        font-weight: 500;
+                                        color: Theme.text;
+                                        selection-background-color: Theme.accent;
+                                        edited => { address-changed(self.text); }
+                                    }
+                                }
+                                Btn { label: "Reconnect"; clicked => { reconnect(); } }
+                            }
+                            Rectangle { height: 1px; background: Theme.line; }
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 10px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 0px;
+                                    Text { text: "Pair a new wheel"; font-size: 13px; color: Theme.text; }
+                                    Text { text: "Opens a 60 second pairing window"; font-size: 11.5px; color: Theme.mute; }
+                                }
+                                Btn { label: "Pair"; clicked => { pair-requested(); } }
+                            }
+                        }
+                    }
+                    // Game controller
+                    Card {
+                        VerticalLayout {
+                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            spacing: 0px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                Text { text: "Game controller"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                                Text { text: "How games see your wheel"; font-size: 12px; color: Theme.mute; }
+                            }
+                            Rectangle { height: 8px; }
+                            VerticalLayout {
+                                spacing: 6px;
+                                RadioOptionCard {
+                                    title: "HIDMaestro";
+                                    desc: "Asks for admin permission each time RSH starts.";
+                                    selected: backend == 0;
+                                    clicked => { backend = 0; backend-selected(0); }
+                                }
+                                RadioOptionCard {
+                                    title: "vJoy";
+                                    desc: "No permission prompt. Needs vJoy installed.";
+                                    selected: backend == 1;
+                                    clicked => { backend = 1; backend-selected(1); }
+                                }
+                            }
+                            Text { text: "Recommended: HIDMaestro"; font-size: 11.5px; color: Theme.faint; }
+                        }
+                    }
+                    // Startup
+                    Card {
+                        VerticalLayout {
+                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            spacing: 0px;
+                            Text { text: "Startup"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                            Rectangle { height: 8px; }
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                alignment: space-between;
+                                Text { text: "Start with Windows"; font-size: 13px; color: Theme.text; }
+                                Switch { accessible-name: "Start with Windows"; on: start-with-windows; toggled => { start-with-windows = !start-with-windows; toggled-start-windows(start-with-windows); } }
+                            }
+                            Rectangle { height: 1px; background: Theme.line; }
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                alignment: space-between;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 0px;
+                                    Text { text: "Keep running in the tray"; font-size: 13px; color: Theme.text; }
+                                    Text { text: "Closing the window does not stop the wheel"; font-size: 11.5px; color: Theme.mute; }
+                                }
+                                Switch { accessible-name: "Keep running in tray"; on: keep-in-tray; toggled => { keep-in-tray = !keep-in-tray; toggled-keep-tray(keep-in-tray); } }
+                            }
+                        }
+                    }
+                }
+                // ---- right column
+                VerticalLayout {
+                    width: 342px;
+                    spacing: 12px;
+                    // Profiles
+                    Card {
+                        VerticalLayout {
+                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            spacing: 0px;
+                            HorizontalLayout {
+                                alignment: space-between;
+                                Text { text: "Profiles"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                                Btn { label: "New"; clicked => { new-profile(); } }
+                            }
+                            Rectangle { height: 8px; }
+                            for p[i] in profiles : VerticalLayout {
+                                if i > 0 : Rectangle { height: 1px; background: Theme.line; }
+                                HorizontalLayout {
+                                    padding-top: 6px;
+                                    padding-bottom: 6px;
+                                    spacing: 10px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        spacing: 0px;
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            alignment: start;
+                                            Text { text: p.name; font-size: 13px; font-weight: 600; color: Theme.text; }
+                                            if p.active : Pill { label: "Active"; bg: Theme.ok-bg; fg: Theme.ok; }
+                                        }
+                                        Text { text: p.games; font-size: 11.5px; color: Theme.mute; }
+                                    }
+                                    if p.active : Btn { label: "Duplicate"; clicked => { duplicate-profile(i); } }
+                                    if !p.active : Btn { label: "Use"; clicked => { use-profile(i); } }
+                                }
+                            }
+                        }
+                    }
+                    // Appearance (Dark only: Light/Auto exist in the
+                    // preview but the light theme is NOT designed yet —
+                    // shown faint, clicks ignored)
+                    Card {
+                        VerticalLayout {
+                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            spacing: 0px;
+                            Text { text: "Appearance"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                            Rectangle { height: 8px; }
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 10px;
+                                Text { text: "Theme"; font-size: 13px; color: Theme.mute; vertical-alignment: center; }
+                                Rectangle { horizontal-stretch: 1; }
+                                Seg {
+                                    width: 190px;
+                                    options: ["Dark", "Light", "Auto"];
+                                    enabled: [true, false, false];
+                                    selected: theme;
+                                    selected-changed(i) => { theme = i; theme-selected(i); }
+                                }
+                            }
+                        }
+                    }
+                    // Backup and updates
+                    Card {
+                        VerticalLayout {
+                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            spacing: 0px;
+                            Text { text: "Backup and updates"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                            Rectangle { height: 8px; }
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 10px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 0px;
+                                    Text { text: "Wheel firmware"; font-size: 13px; color: Theme.text; }
+                                    Text { text: firmware-text; font-size: 11.5px; color: Theme.mute; }
+                                }
+                                Btn { label: "Check"; clicked => { check-firmware(); } }
+                            }
+                            Rectangle { height: 1px; background: Theme.line; }
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 10px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 0px;
+                                    Text { text: "App updates"; font-size: 13px; color: Theme.text; }
+                                    Text { text: app-update-text; font-size: 11.5px; color: Theme.mute; }
+                                }
+                                Btn { label: "Check"; clicked => { check-app-updates(); } }
+                            }
+                            Rectangle { height: 1px; background: Theme.line; }
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 10px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 0px;
+                                    Text { text: "Backups"; font-size: 13px; color: Theme.text; }
+                                    Text { text: backup-text; font-size: 11.5px; color: Theme.mute; }
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Btn { label: "Back up"; clicked => { backup(); } }
+                                    Btn { label: "Restore"; clicked => { restore(); } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // ---- About (full width, below the grid)
+            // Slint Royalty-free 2.0 attribution: the AboutSlint widget
+            // lives in this About section. The shell's About page shows
+            // the same widget; this card is the in-Settings attribution
+            // point from the staging screen.
+            Card {
+                VerticalLayout {
+                    padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                    spacing: 0px;
+                    Text { text: "About"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    Rectangle { height: 8px; }
+                    HorizontalLayout {
+                        spacing: 16px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            spacing: 4px;
+                            Text { text: "RSH — Real Sim Hub"; font-size: 13px; font-weight: 600; color: Theme.text; }
+                            Text { text: app-version + " · MIT licence"; font-size: 12px; color: Theme.mute; }
+                            Text { text: "Wheel firmware 4.0.2 · Protocol 2.1"; font-size: 12px; color: Theme.mute; }
+                            Text { text: "Built with Slint 1.18.1 under the Slint Royalty-free Licence 2.0."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                        }
+                        Rectangle {
+                            width: 280px;
+                            height: 112px;
+                            AboutSlint { width: 100%; height: 100%; }
+                        }
+                    }
+                }
+            }
+            Rectangle { height: 2px; }
+        }
+    }
+    // diagnostics link, pinned at the bottom (§7.5)
+    HorizontalLayout {
+        padding-top: 4px;
+        padding-bottom: 12px;
+        padding-left: 20px;
+        padding-right: 20px;
+        Text {
+            text: "Open diagnostics";
+            font-size: 12px;
+            font-weight: 600;
+            color: fs.has-focus ? white : Theme.accent-text;
+            accessible-label: "Open diagnostics";
+            accessible-role: button;
+            // FIX-4: keyboard activation for this text link.
+            fs := FocusScope {
+                width: 100%;
+                height: 100%;
+                key-pressed(event) => {
+                    if (event.text == Key.Return || event.text == Key.Space) {
+                        open-diagnostics();
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+            TouchArea { clicked => { open-diagnostics(); } }
+        }
+        Rectangle { horizontal-stretch: 1; }
+    }
+}

@@ -1,6 +1,7 @@
 // RSH device key store — implementation (keystore.h dekho).
 #include "keystore.h"
 #include "fw34_state.h"  // FW-3 armed state (rsh.ino) — key_reset_armed ke liye
+#include "pairing_window.h"  // F-02/F-03: transport-independent window deadline
 #include "pw_obfuscate.h"  // SEC-E-01 (Phase F): NVS password obfuscation
 #include <Arduino.h>
 #include <Preferences.h>
@@ -21,8 +22,7 @@ static char s_password[RSH_PASSWORD_MAX_LEN + 1];  // generated 24, user-set 8..
 static uint8_t s_nonce[16];
 static bool s_unpaired = true;
 static bool s_haveKey = false;
-static uint32_t s_apUpMs = 0;
-static bool s_apUp = false;
+static RshPairWindow s_window;  // F-02/F-03: pairing window deadline
 
 static bool rng_bytes_(uint8_t *out, size_t n) {
   for (size_t i = 0; i < n; i += 4) {
@@ -188,13 +188,24 @@ void keystore_rotate_nonce(void) { rng_bytes_(s_nonce, sizeof(s_nonce)); }
 bool keystore_unpaired(void) { return s_unpaired; }
 
 void keystore_mark_ap_up(uint32_t now_ms) {
-  s_apUpMs = now_ms;
-  s_apUp = true;
+  // Pehli AP-up: 60 s boot window (F-03 — deadline model; dobara AP-up
+  // (rescan) window dobara NAHI kholta — net.cpp apUpMarked guard).
+  if (!s_window.is_set)
+    rsh_pair_window_open(&s_window, now_ms, RSH_PAIR_WINDOW_BOOT_MS, 1);
 }
 
 bool keystore_pairing_open(uint32_t now_ms) {
-  if (!s_unpaired || !s_apUp) return false;
-  return (uint32_t)(now_ms - s_apUpMs) < 60000u;  // 60 s window (§2.3)
+  return rsh_pair_window_is_open(&s_window, now_ms, s_unpaired ? 1 : 0) ? true : false;
+}
+
+void keystore_open_pair_window(uint32_t now_ms) {
+  // Pair button (F-02) ya serial HELO (F-03): 120 s, sirf unpaired.
+  rsh_pair_window_open(&s_window, now_ms, RSH_PAIR_WINDOW_BUTTON_MS,
+                       s_unpaired ? 1 : 0);
+}
+
+uint16_t keystore_window_remaining_s(uint32_t now_ms) {
+  return rsh_pair_window_remaining_s(&s_window, now_ms, s_unpaired ? 1 : 0);
 }
 
 void keystore_mark_paired(void) {

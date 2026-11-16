@@ -257,6 +257,76 @@ pub struct UdpTransport {
     helo_handle: Option<JoinHandle<()>>,
 }
 
+/// Typed UDP bind failure (C-12): the `io::ErrorKind` behind a
+/// failed [`UdpTransport::bind`], classified so the UI can hint
+/// instead of showing a raw OS string. Maps 1:1 onto
+/// `rsh_api::BindErrorKind` at the app-core boundary.
+#[derive(Debug)]
+pub enum UdpBindError {
+    /// Local port already in use (another RSH, or a stale socket).
+    AddrInUse,
+    /// Bind denied (missing privilege / restricted interface).
+    PermissionDenied,
+    /// No such interface / address not available on this host.
+    NoInterface,
+    /// Any other I/O failure (the error is carried).
+    Other(std::io::Error),
+}
+
+impl UdpBindError {
+    /// Classify an `io::Error` by kind.
+    #[must_use]
+    pub fn from_io(error: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        match error.kind() {
+            ErrorKind::AddrInUse => Self::AddrInUse,
+            ErrorKind::PermissionDenied => Self::PermissionDenied,
+            ErrorKind::AddrNotAvailable => Self::NoInterface,
+            _ => Self::Other(std::io::Error::new(error.kind(), error.to_string())),
+        }
+    }
+
+    /// Short stable code for logs.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::AddrInUse => "AddrInUse",
+            Self::PermissionDenied => "PermissionDenied",
+            Self::NoInterface => "NoInterface",
+            Self::Other(_) => "BindFailed",
+        }
+    }
+
+    /// The `io::ErrorKind` to report when downgrading to a plain
+    /// [`TransportError::Io`](crate::TransportError::Io).
+    #[must_use]
+    pub fn io_kind(&self) -> std::io::ErrorKind {
+        match self {
+            Self::AddrInUse => std::io::ErrorKind::AddrInUse,
+            Self::PermissionDenied => std::io::ErrorKind::PermissionDenied,
+            Self::NoInterface => std::io::ErrorKind::AddrNotAvailable,
+            Self::Other(error) => error.kind(),
+        }
+    }
+}
+
+impl std::fmt::Display for UdpBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Other(error) => write!(f, "UDP bind failed: {error}"),
+            _ => write!(f, "UDP bind failed: {}", self.code()),
+        }
+    }
+}
+
+impl std::error::Error for UdpBindError {}
+
+impl From<std::io::Error> for UdpBindError {
+    fn from(error: std::io::Error) -> Self {
+        Self::from_io(&error)
+    }
+}
+
 impl UdpTransport {
     /// Bind the local stream port and start the reader + HELO threads.
     ///
@@ -268,10 +338,30 @@ impl UdpTransport {
     /// Returns [`TransportError::Io`] when the local socket cannot be
     /// bound or a background thread cannot be spawned.
     pub fn bind(config: UdpConfig) -> Result<Self, TransportError> {
-        let socket = Arc::new(UdpSocket::bind(SocketAddr::new(
-            config.bind_ip,
-            config.local_port,
-        ))?);
+        Self::bind_typed(config).map_err(|error| match error {
+            UdpBindError::Other(io) => TransportError::Io(io),
+            other => TransportError::Io(std::io::Error::new(
+                other.io_kind(),
+                format!("UDP bind failed: {}", other.code()),
+            )),
+        })
+    }
+
+    /// Bind like [`Self::bind`], but with a typed failure (C-12):
+    /// the caller learns *why* the bind failed (`AddrInUse` /
+    /// `PermissionDenied` / `NoInterface`) instead of dropping the
+    /// error with `.ok()`. The [`UdpBindError`] maps 1:1 onto
+    /// `rsh_api::BindErrorKind` at the app-core boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UdpBindError`] when the local socket cannot be
+    /// bound or a background thread cannot be spawned.
+    pub fn bind_typed(config: UdpConfig) -> Result<Self, UdpBindError> {
+        let socket = Arc::new(
+            UdpSocket::bind(SocketAddr::new(config.bind_ip, config.local_port))
+                .map_err(UdpBindError::from)?,
+        );
         let expected_remote = Arc::new(RwLock::new(SocketAddr::new(
             config.board_ip,
             config.helo_port,

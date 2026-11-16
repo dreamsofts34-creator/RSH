@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 dirs.workspace = true
+rsh-api = { path = "../rsh-api" }
 rsh-engine = { path = "../rsh-engine" }
 rsh-output = { path = "../rsh-output" }
 # G4: AppStateCore constructs the real backends (HIDMaestro default,

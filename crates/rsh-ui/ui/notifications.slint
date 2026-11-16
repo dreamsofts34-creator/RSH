@@ -1,0 +1,226 @@
+// RSH v2.0 — Notification center (Phase 6 bell + drawer).
+// Bell button (top bar) with unread badge + right-side drawer listing
+// AppEvent::Notification items, newest first. Content only — the shell
+// (ui/main.slint) places the bell in the top bar and the drawer at the
+// right edge of the window, above the page, and shows/hides it via the
+// `notif-open` window property; Rust owns the store
+// (src/notifications.rs) and pushes the `notifications` model.
+//
+// Esc: NOT handled here — keyboard handling is owned by the keyboard
+// worker. The drawer exposes `close-requested()`; the keyboard worker
+// closes it (e.g. by clearing `notif-open` on the window) the same way
+// the Close button does. No FocusScope / key-pressed handler here.
+
+import { Theme } from "tokens.slint";
+import { Btn } from "components.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export struct NotificationItem {
+    kind: string,
+    title: string,
+    body: string,
+    time: string,
+    unread: bool,
+}
+
+// ---------------------------------------------------------------- bell button (30x30, top bar)
+export component BellButton inherits Rectangle {
+    in property <int> unread;
+    callback clicked();
+    accessible-label: "Notifications";
+    accessible-role: button;
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : Theme.line;
+    background: Theme.panel;
+    // Keyboard (compare-fix): FocusScope so Tab reaches the bell;
+    // Enter/Space opens the drawer like a click. Visible 2px focus
+    // ring while focused. Esc-close is owned by the root keyboard
+    // scope (main.rs wire_keyboard), same as the Close button.
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    if fs.has-focus : Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: 10px;
+        border-width: 2px;
+        border-color: Theme.accent-text;
+    }
+    // Bell glyph (drawn path — no bell icon asset exists).
+    Path {
+        x: 6px;
+        y: 5px;
+        width: 18px;
+        height: 18px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: "M 12 3 C 8.5 3 6 5.5 6 9 C 6 12.5 5 14.5 4 15.5 L 20 15.5 C 19 14.5 18 12.5 18 9 C 18 5.5 15.5 3 12 3 Z M 10 18.5 C 10 19.6 11 20.5 12 20.5 C 13 20.5 14 19.6 14 18.5 Z";
+        fill: unread > 0 ? Theme.accent-text : Theme.mute;
+        stroke: transparent;
+    }
+    if unread > 0 : Rectangle {
+        x: parent.width - 11px;
+        y: -4px;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: Theme.bad;
+        Text {
+            width: 100%;
+            height: 100%;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: unread > 9 ? "9+" : unread + "";
+            font-size: 9px;
+            font-weight: 700;
+            color: white;
+        }
+    }
+    TouchArea { clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- one notification row
+component NotificationRow inherits Rectangle {
+    in property <string> kind;
+    in property <string> title;
+    in property <string> body;
+    in property <string> time;
+    in property <bool> unread;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.line;
+    background: unread ? Theme.acc-bg : Theme.panel2;
+    VerticalLayout {
+        padding-top: 10px;
+        padding-bottom: 10px;
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 3px;
+        HorizontalLayout {
+            spacing: 8px;
+            if unread : Rectangle {
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: Theme.accent-text;
+            }
+            Text {
+                horizontal-stretch: 1;
+                text: kind;
+                font-size: 11px;
+                font-weight: 700;
+                color: Theme.accent-text;
+            }
+            Text {
+                text: time;
+                font-family: Theme.font-mono;
+                font-size: 11px;
+                color: Theme.faint;
+            }
+        }
+        Text {
+            text: title;
+            font-size: 12.5px;
+            font-weight: 600;
+            color: Theme.text;
+            wrap: word-wrap;
+        }
+        Text {
+            text: body;
+            font-size: 12px;
+            color: Theme.mute;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- notifications drawer (344px, right edge)
+export component NotificationsDrawer inherits Rectangle {
+    in property <[NotificationItem]> items;
+    in property <int> unread;
+    callback close-requested();
+    callback mark-all-read();
+    callback clear-all();
+
+    width: 344px;
+    height: 420px;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Theme.line;
+    background: Theme.side;
+    VerticalLayout {
+        spacing: 0px;
+        // header
+        HorizontalLayout {
+            padding-top: 14px;
+            padding-bottom: 12px;
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 10px;
+            Text { text: "Notifications"; font-size: 15px; font-weight: 600; color: Theme.text; }
+            if unread > 0 : Text {
+                vertical-alignment: center;
+                text: unread + " unread";
+                font-size: 11.5px;
+                color: Theme.accent-text;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Btn { label: "Mark all read"; clicked => { mark-all-read(); } }
+            Btn { label: "✕"; clicked => { close-requested(); } }
+        }
+        Rectangle { height: 1px; background: Theme.line; }
+        // list
+        notif-scroll := ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding-top: 12px;
+                padding-bottom: 12px;
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+                if items.length == 0 : Text {
+                    text: "No notifications yet.";
+                    font-size: 12px;
+                    color: Theme.faint;
+                }
+                for n in items : NotificationRow {
+                    kind: n.kind;
+                    title: n.title;
+                    body: n.body;
+                    time: n.time;
+                    unread: n.unread;
+                }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.line; }
+        // footer
+        HorizontalLayout {
+            padding-top: 10px;
+            padding-bottom: 10px;
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 10px;
+            Text {
+                vertical-alignment: center;
+                text: items.length + (items.length == 1 ? " notification" : " notifications");
+                font-size: 11.5px;
+                color: Theme.faint;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Btn { label: "Clear all"; clicked => { clear-all(); } }
+        }
+    }
+}

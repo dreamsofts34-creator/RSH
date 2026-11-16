@@ -95,6 +95,11 @@ pub struct ModuleTuning {
     pub release_ms: f32,
     /// Shifter gate mode (only the shifter module reads this).
     pub gate_mode: ShifterGateMode,
+    /// Clutch bite point, `0..=1` (clutch / brake only; `0.0` =
+    /// none). The pedal output stays `0.0` until the mapped travel
+    /// passes the bite point, then ramps `(value - bite) / (1 - bite)`
+    /// — the clutch engages at the bite, it does not creep before it.
+    pub bite_point: f32,
 }
 
 impl Default for ModuleTuning {
@@ -112,6 +117,7 @@ impl Default for ModuleTuning {
             press_ms: 150.0,
             release_ms: 100.0,
             gate_mode: ShifterGateMode::Sequential,
+            bite_point: 0.0,
         }
     }
 }
@@ -139,6 +145,7 @@ impl ModuleTuning {
         } else {
             clamp_finite(self.release_ms, 10.0, 2000.0, 100.0)
         };
+        out.bite_point = clamp_finite(self.bite_point, 0.0, 1.0, 0.0);
         if validate_pedal_range(self.min_mv, self.max_mv).is_err() {
             out.min_mv = DEFAULT_MIN_MV;
             out.max_mv = DEFAULT_MAX_MV;
@@ -549,6 +556,18 @@ impl ProcessingPipeline {
         *self = Self::new(plan);
     }
 
+    /// Replace the plan for a live tuning change (L4 pipeline push),
+    /// WITHOUT resetting filter, ramp, or encoder state: a slider drag
+    /// must take effect on the next tick, not restart the smoothing
+    /// and ramps (which would step the output). The plan is still
+    /// sanitized on entry. Filter cutoffs track the new smoothing
+    /// per tick (`apply_smoothing`), so kept state stays valid.
+    /// Profile switches and engine start use [`Self::set_plan`]
+    /// (full reset) instead.
+    pub fn set_plan_live(&mut self, plan: PipelinePlan) {
+        self.plan = plan.sanitized();
+    }
+
     /// Forget all filter, ramp, and encoder state (same plan).
     pub fn reset(&mut self) {
         self.steering_filter.reset();
@@ -700,6 +719,24 @@ pub fn map_steering_mv(mv: u16, min_mv: u16, center_mv: u16, max_mv: u16) -> f32
     }
 }
 
+/// Bite-point remap for a mapped pedal value in `0..=1`: below the
+/// bite the output is `0.0`; above it the remaining travel is
+/// stretched to `0..=1`. A bite of `0.0` is the identity. Values
+/// outside `0..=1` clamp (a sanitized plan never sends them, but the
+/// stage must not amplify an insane input).
+#[must_use]
+pub fn apply_bite_point(value: f32, bite: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    let bite = bite.clamp(0.0, 1.0);
+    if bite <= 0.0 {
+        return value;
+    }
+    if value <= bite {
+        return 0.0;
+    }
+    ((value - bite) / (1.0 - bite)).clamp(0.0, 1.0)
+}
+
 /// Map a pedal sample in mV to `0..=1` using a `min / max` range.
 /// Out-of-range samples clamp to the ends. Returns `0.0` for a
 /// degenerate range (`max <= min`).
@@ -834,6 +871,8 @@ fn process_pedal_axis(
     if tuning.invert {
         value = 1.0 - value;
     }
+    // L4 clutch bite point: engages at the bite, silent before it.
+    value = apply_bite_point(value, tuning.bite_point);
     value = apply_deadzone_unipolar(value, tuning.deadzone);
     value = apply_curve(value, tuning.curve_strength);
     value = apply_smoothing(filter, value, tuning.smoothing);
@@ -1237,6 +1276,77 @@ mod tests {
         let out = pipe.process(&frame(&[], &[1005], 0));
         assert_eq!(out.encoder_deltas[0], 0);
         assert_eq!(*pipe.plan(), plain_plan());
+    }
+
+    #[test]
+    fn bite_point_remap_is_silent_below_and_stretched_above() {
+        use super::apply_bite_point;
+        // Bite 0 is the identity.
+        assert!(approx(apply_bite_point(0.3, 0.0), 0.3));
+        assert!(approx(apply_bite_point(1.0, 0.0), 1.0));
+        // Bite 0.4: below/at the bite is 0, the rest stretches.
+        assert!(approx(apply_bite_point(0.2, 0.4), 0.0));
+        assert!(approx(apply_bite_point(0.4, 0.4), 0.0));
+        assert!(approx(apply_bite_point(0.7, 0.4), 0.5));
+        assert!(approx(apply_bite_point(1.0, 0.4), 1.0));
+        // Insane inputs clamp, never amplify.
+        assert!(approx(apply_bite_point(2.0, 0.4), 1.0));
+        assert!(approx(apply_bite_point(0.5, 2.0), 0.0));
+    }
+
+    #[test]
+    fn bite_point_clamps_in_sanitize_and_reaches_clutch_output() {
+        use super::ModuleTuning;
+        let tuning = ModuleTuning {
+            bite_point: 1.5,
+            ..ModuleTuning::default()
+        };
+        assert!(approx(tuning.sanitized().bite_point, 1.0));
+        // Clutch at 30% travel (1200 mV in the 300..3300 default
+        // range) with bite 0.4 stays 0; at 90% travel it is
+        // (0.9 - 0.4) / 0.6 = 0.833.
+        let mut plan = plain_plan();
+        plan.clutch.bite_point = 0.4;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[(3, 1200)], &[], 0));
+        assert!(approx(out.clutch, 0.0));
+        let out = pipe.process(&frame(&[(3, 3000)], &[], 0));
+        assert!(
+            approx(out.clutch, 0.833_333_3),
+            "clutch at 90% with bite 0.4: {}",
+            out.clutch
+        );
+    }
+
+    #[test]
+    fn set_plan_live_swaps_plan_without_resetting_state() {
+        // L4: a live tuning push must not restart smoothing. Drive
+        // the accelerator filter to ~1.0, swap the plan live, then
+        // drop the input to 0: with kept state the output decays
+        // gradually; a reset filter would jump straight to 0.0.
+        let mut plan = plain_plan();
+        plan.accelerator.smoothing = 0.5;
+        let mut pipe = ProcessingPipeline::new(plan);
+        for _ in 0..40 {
+            let _ = pipe.process(&frame(&[(1, 3300)], &[], 0));
+        }
+        let before = pipe.process(&frame(&[(1, 3300)], &[], 0));
+        assert!(before.accelerator > 0.95, "filtered up: {before:?}");
+        let mut next = plain_plan();
+        next.accelerator.smoothing = 0.5;
+        next.accelerator.deadzone = 0.02;
+        pipe.set_plan_live(next);
+        let after = pipe.process(&frame(&[(1, 300)], &[], 0));
+        assert!(
+            after.accelerator > 0.5,
+            "live swap must keep filter state (decays, not jumps): {after:?}"
+        );
+        assert_eq!(pipe.plan().accelerator.deadzone, 0.02);
+        // …while the live path still sanitizes.
+        let mut insane = plain_plan();
+        insane.accelerator.deadzone = 2.0;
+        pipe.set_plan_live(insane);
+        assert_eq!(pipe.plan().accelerator.deadzone, 0.5);
     }
 
     #[test]

@@ -3,6 +3,8 @@
 #include "protocol.h"    // FW-8: v2.1 builders / parsers
 #include "ctrl.h"        // FW-8: HMAC control dispatcher (SEC-D-06)
 #include "ctrl_handlers.h"  // FW-3/FW-4: SET_CFG/COMMIT/.../KEY_RESET handler (pure)
+#include "diag_log.h"    // F-10: diagnostics ring log + GET_DIAG body
+#include "horn_test.h"   // D-5: HORN_TEST timer state (pure)
 #include "led_driver.h"    // Phase G WS5: LED driver abstraction.
                            // Phase H WS2: net.cpp mein wired hai —
                            // led_test_request adapter + net_led_tick().
@@ -55,6 +57,7 @@ static uint8_t serialLastHelloProto = 0;
 static bool rebootPending = false;      // HMAC REBOOT (0x09) mila — reply ke baad restart
 static bool keyResetPending = false;    // HMAC KEY_RESET (0x0B) mila — reply ke baad rotate + restart
 static bool passwordChangePending = false;  // HMAC SET_PASSWORD (0x0C) mila — reply ke baad NVS + AP restart
+static RshHornTest hornTestState;       // D-5 (v4.0.2): HORN_TEST timer state
 static uint8_t pendingPassword[RSH_PASSWORD_MAX_LEN];  // deferred SET_PASSWORD bytes (reply ke baad apply)
 static uint8_t pendingPasswordLen = 0;
 
@@ -220,15 +223,38 @@ static uint8_t pick_channel() {
 #endif
 }
 
+uint8_t net_horn_test_active(uint32_t nowMs) {
+  return rsh_horn_test_active(&hornTestState, nowMs);
+}
+
+// F-14: persistent LED config current blob se driver par lagao.
+// Record na ho to persistent hat jata hai (strip off, LED_TEST ke ilawa).
+// ledDrvReady=0 ho to kuch nahi (driver nahi hai — fail closed).
+void net_led_apply_persistent(const uint8_t *blob, size_t len) {
+  if (!ledDrvReady) return;
+  RshLedConfig cfg;
+  if (!rsh_cfg_led_config(blob, len, &cfg)) {
+    rsh_led_driver_set_persistent(&ledDrv, NULL, 100, millis());
+    return;
+  }
+  RshLedPattern p;
+  p.patternId = cfg.pattern_id;
+  p.r = cfg.r;
+  p.g = cfg.g;
+  p.b = cfg.b;
+  p.periodMs = 1000;  // persistent pattern ka default cycle (record mein nahi)
+  p.repeats = 0;
+  p.reserved = 0;
+  rsh_led_driver_set_persistent(&ledDrv, &p, cfg.brightness, millis());
+}
+
 // SEC-R2-03 (Phase 2 M-2): khula AP (pairing window) abhi chal raha hai?
 static bool apIsOpen = false;
 
-// Pairing window (AP-up se 60 s) guzar jaye aur board abhi tak pair na
-// hua ho to khula AP band karo aur WPA2 par le jao (generated password,
-// keystore se). Har net_poll() par check hota hai.
-static void net_lock_ap_after_pairing_window() {
-  if (!apIsOpen || !keystore_unpaired()) return;
-  if (keystore_pairing_open(millis())) return;
+// Khula AP WPA2 par lock karo (generated password, keystore se).
+// Sirf tab jab AP khula ho — dobara call no-op hai.
+static void net_lock_ap_wpa2_() {
+  if (!apIsOpen) return;
   udpHello.stop();
   udpCtrl.stop();
   WiFi.softAPdisconnect(true);
@@ -236,6 +262,28 @@ static void net_lock_ap_after_pairing_window() {
   udpHello.begin(PORT_HELLO);
   udpCtrl.begin(PORT_CTRL);
   apIsOpen = false;
+}
+
+// AP lock policy (F-01, v4.0.2): do triggers, dono DEFERRED (reply
+// bhejne ke baad, agle net_poll() par — is liye GET_CAPS reply pehle
+// nikal jata hai, phir AP lock hota hai):
+//   (a) pairing complete (GET_CAPS OK → keystore paired) — AP foran
+//       WPA2 ho jata hai, reboot tak khula NAHI rehta (purana bug:
+//       SEC-R2-03 sirf unpaired board par chalta tha, pair hone ke
+//       baad AP reboot tak khula rehta tha). App ka rejoin helper
+//       (Phase 6) naye password se dobara join karta hai.
+//   (b) pairing window guzar jaye aur board abhi tak pair na hua ho
+//       (purana behaviour, barqarar).
+static void net_lock_ap_after_pairing_window() {
+  if (!apIsOpen) return;
+  if (!keystore_unpaired()) {
+    net_lock_ap_wpa2_();
+    rsh_diag_record_global(RSH_DIAG_AP_LOCKED, 1, millis());  // paired (F-01)
+    return;
+  }
+  if (keystore_pairing_open(millis())) return;
+  net_lock_ap_wpa2_();
+  rsh_diag_record_global(RSH_DIAG_AP_LOCKED, 0, millis());  // window expiry
 }
 
 // AP + sockets ek channel par shuru karo. Pehli pairing tak AP KHULA hai
@@ -277,6 +325,8 @@ static bool net_start_ap_and_sockets(uint8_t ch) {
   if (!apUpMarked) {
     keystore_mark_ap_up(millis());
     apUpMarked = true;
+    rsh_diag_record_global(RSH_DIAG_AP_UP, ch, millis());
+    rsh_diag_record_global(RSH_DIAG_WINDOW_OPEN, 0, millis());  // boot 60 s window
   }
   return true;
 }
@@ -295,11 +345,18 @@ static bool net_start_ap_and_sockets(uint8_t ch) {
 // rotate karwa sakta hai aur doosre peer (ya khud ke purane counters)
 // ko bar bar invalid kar sakta hai — DoS. Unauthenticated peer (pairing
 // ke waqt) par limit nahi lagti, taake pehli HELLO kabhi block na ho.
-static void net_new_session(uint32_t nowMs) {
+// F-05 (v4.0.2): WAHI peer jis ka purana session 2 s se zyada stale ho
+// (HELLO timeout ke baad) dobara session bana sakta hai — app restart /
+// crash recovery isi mein phans jati thi. DOOSRA peer abhi bhi 10 s ka
+// paband hai (rsh_new_session_allowed, net_logic.h).
+static void net_new_session(uint32_t nowMs, uint8_t same_ip,
+                            uint8_t old_session_stale) {
   static uint32_t lastNewSessionMs = 0;
   static bool haveNewSession = false;
-  if (haveNewSession && (sessionAuthenticated || serialSessionAuthenticated) &&
-      (uint32_t)(nowMs - lastNewSessionMs) < 10000u) {
+  if (haveNewSession &&
+      !rsh_new_session_allowed(
+          (sessionAuthenticated || serialSessionAuthenticated) ? 1 : 0,
+          (uint32_t)(nowMs - lastNewSessionMs), same_ip, old_session_stale)) {
     return;
   }
   lastNewSessionMs = nowMs;
@@ -342,8 +399,8 @@ static size_t net_build_hello_reply(uint8_t sessionEcho, uint8_t *out) {
   uint8_t mac[6];
   WiFi.softAPmacAddress(mac);
   // Round 2 W3: version modules.h ke RSH_CAPS_FW_* constants se aati hai
-  // (FIRMWARE_VERSION "4.0.1" se match) — hard-coded 4,0,0 HELLO mein
-  // ghalat version batata tha (GET_CAPS wala bug bhi yahi tha).
+  // (FIRMWARE_VERSION "4.0.2" se match, F-12 single source) — hard-coded
+  // 4,0,0 HELLO mein ghalat version batata tha (GET_CAPS wala bug bhi yahi tha).
   return rsh_v2_build_hello(out, flags, sessionEcho, mac, RSH_CAPS_FW_MAJOR,
                             RSH_CAPS_FW_MINOR, RSH_CAPS_FW_PATCH,
                             keystore_nonce(), dk, pw);
@@ -400,7 +457,14 @@ bool net_begin() {
 // Scan STA mode mangta hai — AP 1-3 s ke liye band hota hai, is liye ye
 // sirf tab chalta hai jab link pehle se kharab ho. Channel tabdeel sirf
 // tab jab naya score sakhti se behtar ho AUR 5 min guzar gaye hon.
+// F-07 (v4.0.2): rescan default OFF hai (RSH_AUTO_CHANNEL) aur sirf jab
+// koi PC active na ho (Wi-Fi ya serial) — active stream ke beech AP
+// band karna stream drop + PC disassociate hai.
 void net_maybe_rescan(uint32_t nowMs) {
+  if (!rsh_rescan_allowed(RSH_AUTO_CHANNEL ? 1 : 0,
+                          (net_pc_active(nowMs) || net_serial_pc_active(nowMs))
+                              ? 1 : 0))
+    return;
   if (!currentChannel) return;
   uint16_t delta = (uint16_t)(txStats.tx_fail - txFailAtLastScan);
   if (!rsh_rescan_needed(net_rssi_dbm(), delta, (uint32_t)(nowMs - lastScanMs))) return;
@@ -478,9 +542,15 @@ void net_poll() {
     // sakta (hijack); idle board par bhi 5 s mein ek se zyada change nahi.
     uint32_t nowMs = millis();
     uint8_t sameIp = (havePc && sender == pcIp) ? 1 : 0;
+    // F-05: naya session ka faisla purane session ki staleness par hai —
+    // lastHelloMs update karne se PEHLE napo (update ke baad hamesha 0 hota).
+    uint8_t oldSessionStale = net_pc_active(nowMs) ? 0 : 1;
     if (!rsh_helo_accept(havePc ? 1 : 0, net_pc_active(nowMs) ? 1 : 0, sameIp,
-                         (uint32_t)(nowMs - lastPcChangeMs)))
+                         (uint32_t)(nowMs - lastPcChangeMs))) {
+      rsh_diag_record_global(RSH_DIAG_HELO_REJECT,
+                             net_pc_active(nowMs) ? 0 : 1, nowMs);
       continue;
+    }
     if (!sameIp) {
       pcIp = sender;
       lastPcChangeMs = nowMs;
@@ -493,9 +563,10 @@ void net_poll() {
 
     // Naya session: nonce rotate + control session reset (§2.3/§3.2).
     // Routine HELO (sessionFlag 0) purana nonce wapas deta hai.
-    if (sessionFlag == 1) net_new_session(nowMs);
+    // F-05: same-IP + stale purana session ho to 10 s limit nahi lagti.
+    if (sessionFlag == 1) net_new_session(nowMs, sameIp, oldSessionStale);
 
-    // HELLO reply rate limit (SEC-D-08): 500 ms mein ek se zyada nahi.
+    // HELLO reply rate limit (SEC-D-08): 250 ms mein ek se zyada nahi (F-04).
     if (!rsh_hello_reply_allowed((uint32_t)(nowMs - lastHelloReplyMs))) continue;
     lastHelloReplyMs = nowMs;
 
@@ -579,6 +650,41 @@ static uint8_t net_ctrl_handler(uint8_t cmd, const uint8_t *payload, uint16_t le
             txn ? rsh_cfg_has_expanders(txn->current, txn->current_len) : 0;
       }
       st = rsh_fw34_handler(cmd, payload, len, reply_body, reply_body_len, &fw34Ctx);
+      break;
+    }
+    case RSH_CMD_GET_DIAG: {
+      // F-10 (v4.0.2): diagnostics snapshot — boot reason, heap min,
+      // pairing window baqi waqt, ring-log events (diag_log.h layout).
+      // Koi secret nahi (sirf codes + numeric values). Len != 0 → UNSUPPORTED.
+      if (len != 0) {
+        st = RSH_CTRL_UNSUPPORTED;
+        break;
+      }
+      uint16_t win_s = keystore_window_remaining_s(millis());
+      size_t n = rsh_diag_build_body(rsh_diag_log(), win_s, reply_body,
+                                     RSH_V2_CTRL_MAX_PAYLOAD - 1);
+      if (n == 0) {
+        st = RSH_CTRL_UNSUPPORTED;
+        break;
+      }
+      *reply_body_len = (uint16_t)n;
+      st = RSH_CTRL_OK;
+      break;
+    }
+    case RSH_CMD_HORN_TEST: {
+      // D-5 (v4.0.2): horn button ka synthetic test pulse — payload
+      // duration_ms u16 LE (100..5000). Stream mein horn bit us muddat
+      // tak set rehta hai (net_horn_test_active, rsh.ino poochta hai).
+      if (len != 2) {
+        st = RSH_CTRL_UNSUPPORTED;
+        break;
+      }
+      uint16_t dur = rsh_get_u16(payload);
+      if (!rsh_horn_test_start(&hornTestState, dur, millis())) {
+        st = RSH_CTRL_UNSUPPORTED;
+        break;
+      }
+      st = RSH_CTRL_OK;
       break;
     }
     case RSH_CMD_GET_CAPS: {
@@ -774,8 +880,12 @@ void net_poll_ctrl() {
         replyBuf, sizeof(replyBuf), &replyLen);
     if (d != RSH_CTRL_DISP_REPLY) continue;
     // GET_CAPS OK par pairing complete (§3 step 7): ab HELLO mein key nahi.
-    if (ctrlCtx.lastCmd == RSH_CMD_GET_CAPS && ctrlCtx.lastStatus == RSH_CTRL_OK)
+    if (ctrlCtx.lastCmd == RSH_CMD_GET_CAPS && ctrlCtx.lastStatus == RSH_CTRL_OK) {
+      uint8_t wasUnpaired = keystore_unpaired() ? 1 : 0;
       keystore_mark_paired();
+      if (wasUnpaired)
+        rsh_diag_record_global(RSH_DIAG_PAIRED, 0, millis());
+    }
     if (udpData.beginPacket(sender, senderPort)) {
       udpData.write(replyBuf, replyLen);
       txStats.record(udpData.endPacket() == 1);
@@ -830,11 +940,10 @@ bool net_serial_session_authenticated(uint32_t nowMs) {
 // Serial HELO (serial frame kind=HELO ki payload, §2.1) → HELLO reply
 // (92 B, §2.2) hello_out mein, ya 0 (legacy v1 HELO — koi reply nahi;
 // ghalat proto/sessionFlag — ignore; rate limit — khamoshi).
-// Pairing window ka rule Wi-Fi jaisa hi hai (§2.3: AP-up/boot se 60 s) —
-// window ka waqt keystore_mark_ap_up se chalta hai (net_start_ap_and_
-// sockets), transport se nahi. USB cable physical possession mangta hai,
-// is liye wired pairing Wi-Fi pairing se KAMZOR nahi — window phir bhi
-// 60 s hi hai (conservative reuse, §10).
+// F-03 (v4.0.2): serial HELO unpaired board par pairing window ON-DEMAND
+// kholta hai (120 s, har HELO par refresh) — USB cable physical access
+// mangta hai, is liye wired pairing Wi-Fi pairing se kamzor nahi. AP-up
+// clock par munhasir NAHI (purana rule: window sirf boot ke 60 s).
 size_t net_serial_helo(const uint8_t *helo, size_t len, uint32_t nowMs,
                        uint8_t *hello_out) {
   if (!helo || !hello_out) return 0;
@@ -853,12 +962,21 @@ size_t net_serial_helo(const uint8_t *helo, size_t len, uint32_t nowMs,
   }
   // Serial point-to-point hai — IP takeover ka sawal hi nahi (SEC-D-08
   // sirf Wi-Fi AP par laagu hai). Har HELO peer ko active karta hai.
+  // F-05: staleness lastHello update se PEHLE napo.
+  uint8_t oldSessionStale = net_serial_pc_active(nowMs) ? 0 : 1;
+  // F-03: unpaired board par har serial HELO window kholta/refresh karta hai.
+  if (keystore_unpaired()) {
+    uint8_t wasOpen = keystore_pairing_open(nowMs) ? 1 : 0;
+    keystore_open_pair_window(nowMs);
+    if (!wasOpen)
+      rsh_diag_record_global(RSH_DIAG_WINDOW_OPEN, 2, nowMs);  // serial
+  }
   serialHavePc = true;
   serialLastHelloMs = nowMs;
   serialLastHelloProto = proto;
   if (proto != 0x02) return 0;  // legacy v1: koi HELLO reply nahi (§2.1)
-  if (sessionFlag == 1) net_new_session(nowMs);  // naya nonce + dono sessions reset
-  // HELLO reply rate limit (SEC-D-08 jaisa): 500 ms mein ek se zyada nahi.
+  if (sessionFlag == 1) net_new_session(nowMs, 1, oldSessionStale);  // naya nonce + dono sessions reset
+  // HELLO reply rate limit (SEC-D-08 jaisa): 250 ms mein ek se zyada nahi (F-04).
   if (!rsh_hello_reply_allowed((uint32_t)(nowMs - serialLastHelloReplyMs))) return 0;
   serialLastHelloReplyMs = nowMs;
   return net_build_hello_reply(sessionFlag, hello_out);
@@ -878,8 +996,12 @@ bool net_serial_dispatch_control(const uint8_t *frame, size_t len,
       reply_out, reply_out_len, reply_len_out);
   if (d != RSH_CTRL_DISP_REPLY) return false;
   if (serialCtrlCtx.lastCmd == RSH_CMD_GET_CAPS &&
-      serialCtrlCtx.lastStatus == RSH_CTRL_OK)
+      serialCtrlCtx.lastStatus == RSH_CTRL_OK) {
+    uint8_t wasUnpaired = keystore_unpaired() ? 1 : 0;
     keystore_mark_paired();
+    if (wasUnpaired)
+      rsh_diag_record_global(RSH_DIAG_PAIRED, 0, millis());
+  }
   return true;
 }
 

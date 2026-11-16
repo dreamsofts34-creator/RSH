@@ -129,6 +129,12 @@ static inline size_t rsh_build_packet(uint8_t *buf, uint16_t seq, uint32_t times
 #define RSH_CMD_LED_TEST     0x0A
 #define RSH_CMD_KEY_RESET    0x0B
 #define RSH_CMD_SET_PASSWORD 0x0C
+// v4.0.2 additive commands (F-10 / D-5): maujooda frames nahi badle —
+// purana app inhein kabhi nahi bhejta, naya app purane firmware (4.0.1)
+// se UNSUPPORTED pata hai. GET_DIAG body diag_log.h mein defined hai;
+// HORN_TEST payload: duration_ms u16 LE (100..5000).
+#define RSH_CMD_GET_DIAG     0x0D
+#define RSH_CMD_HORN_TEST    0x0E
 
 typedef enum {
   RSH_V2_OK = 0,

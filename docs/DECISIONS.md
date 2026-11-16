@@ -1001,3 +1001,124 @@ launch evidence available in CI; real paint stays a human gate
   the provenance verdict found no loader cause in the released
   binary, and v1.0.2's dialog + dual log is the evidence mechanism
   if it ever recurs.
+
+---
+
+## 20. v2.0 decisions (2026-11-16, LOGIC-FIX-PLAN §9 + REDESIGN-PLAN §10)
+
+**Scope:** RSH v2.0 redesign — Tauri 2 + React is superseded by Slint UI
++ `rsh-daemon`; firmware v4.0.2; protocol v2.1 **frozen** (no wire
+change). Sources: `REDESIGN-PLAN.md`, `LOGIC-FIX-PLAN.md`,
+`docs/V2-PHASE-0-GATE.md` (pairing root cause, [S] findings, Slint
+licence), `docs/V2-PHASE-1-SPIKE.md` (Slint 1.18.1 GO),
+`docs/V2-FIRMWARE-4.0.2-GATE.md` (F-01…F-16 gate PASS).
+
+### 20.1 Decisions D-1 … D-13 (LOGIC-FIX-PLAN §9)
+
+| # | Question | Decision |
+|---|---|---|
+| D-1 | Draft + explicit Save model (preview: orange unsaved dot) | **Yes.** `ProfileDraft` (in-memory) + `dirty` flag. `set_tuning` changes only the draft and applies live (pipeline push); disk save happens only on "Save". Switching profiles while dirty asks Save / Discard. |
+| D-2 | "10 second rollback" copy vs firmware 30 s confirm timeout | **Copy is 30 s.** The firmware confirm timeout (`RSH_CFG_CONFIRM_TIMEOUT_MS`) is 30 s and stays; the preview's "10 second" note is corrected to 30 s. |
+| D-3 | Handbrake "Axis \| Button" (preview) vs firmware axis-only | **No feature cut — firmware feature built instead.** Handbrake button mode is implemented in firmware v4.0.2 (F-15): axis slot-4 record flag bit0 → digital input + pullup, 4095/0; `GET_CAPS` kind flips to `DIGITAL_IN`. Axis mode unchanged. |
+| D-4 | Shifter sensitivity slider (preview) vs firmware: no such field | **No feature cut — firmware field built instead.** Shifter sensitivity field (0..100, default 50) added to the SHIFTER record `params[4]` in firmware v4.0.2; debounce/stability time 20 ms (0) → 5 ms (100); default 50 → **13 ms** (formula `20 − sens·15/100` is the authority; an old comment claiming 12 ms was fixed in code). |
+| D-5 | Horn "Test" (preview) vs no horn test command | **Built.** `HORN_TEST` command (`0x0E`, duration 100..5000 ms) in firmware v4.0.2 — horn output forced ON for the duration, then restores. |
+| D-6 | LED persistent patterns + brightness + colour (preview) vs time-limited `LED_TEST` only | **Built.** Persistent LED config record (type 13: pattern id 0..4, RGB, brightness 0..100) in the config blob in firmware v4.0.2 (F-14). `LED_TEST` stays separate and time-limited (60 s cap unchanged); the persistent pattern resumes in the same tick when a test ends, with no all-off flash. |
+| D-7 | HIDMaestro UAC + autostart (UAC prompt on every launch / at login) | **Lazy-start + optional elevated helper.** The sidecar starts only when "Send to game" is on (lazy-start); an elevated helper installed once (scheduled task, "run with highest privileges" on logon) is the option for autostart without a login-time UAC prompt. |
+| D-8 | Firmware "Check" meaning (Settings) | **Board version vs bundled signed image.** "Check" compares the board's firmware version against the signed image bundled in the app. No online check. |
+| D-9 | App auto-update in this release? | **No.** With the app still unsigned, no auto-update in v2.0 — "Check" + download link only. (Auto-update stays off; releases are manual download/install.) |
+| D-10 | Home Wi-Fi (STA) support | **No (AP-only).** The board is a Wi-Fi access point only — it never joins a home network. The "home Wi-Fi join" claim in the old docs was wrong and is corrected in `docs/USER-GUIDE.md`. |
+| D-11 | Release firmware: secure (encrypted NVS) vs normal image | **PENDING — not decided.** The secure build (`RSH_SECURE_NVS`, `esp32dev-secure` env) now compiles, but it is **not yet board-verified** and the eFuse steps are manual. A secure image flashed to a board without the matching eFuse/key provisioning breaks the update path. Decision procedure: verify on a sacrificial board first, then decide. **Recommendation (firmware gate): release v2.0 on the normal image (unchanged default, same posture as v4.0.1); revisit the secure image only after the sacrificial-board check passes and the key-provisioning runbook exists.** |
+| D-12 | Slint licence (Royalty-free 2.0, AboutSlint) | **Royalty-free 2.0, with AboutSlint attribution. GPLv3 is FORBIDDEN.** Verified 2026-11-16 from Slint's official FAQ + licence text (Phase 0 gate §5): an MIT-licensed desktop app may use Slint under Royalty-free 2.0 free of charge, provided it shows the `AboutSlint` widget in an About screen/dialog reachable from the top-level menu (or the "Made with Slint" badge on the public download page). GPLv3 would re-licence the distributed product as a whole under GPLv3, contradicting RSH's MIT licence — it must never be selected. |
+| D-13 | 3 s pair button only on unpaired board | **Yes (security).** The 3-second BOOT hold opens a 120 s pairing window only on an **unpaired** board. On a paired board the hold is ignored; re-pairing a paired board needs the guided "Reset pairing: hold BOOT for 10 s" (KEY_RESET) path. |
+
+### 20.2 The Slint choice
+
+**Decision: Slint (1.18.1) for the v2.0 UI; Tauri 2 + React is gone.**
+
+- Phase 1 spike verdict: **GO** (`docs/V2-PHASE-1-SPIKE.md`). Slint
+  1.18.1 (latest stable, 2026-09-21) reproduces the approved preview
+  faithfully (Overview + Steering + tray popup), warm startup 59–100 ms,
+  DPI scaling verified at 125%/150%, `SystemTrayIcon` built in since
+  1.17. One layout bug was found and fixed during the spike
+  (non-stretch `alignment` collapsing stretch children).
+- Why Slint over light Tauri: no WebView2 in the background, far lower
+  background cost, direct Rust reuse. The spike measured ~180 MB idle
+  RSS on Linux/X11 (software rendering) — higher than "Slint is tiny"
+  expectations, recorded as a finding, not a blocker; the Windows
+  head-to-head against the v1.0.2 Tauri baseline is still OPEN.
+- Licence: Royalty-free 2.0 + AboutSlint (D-12 above). GPLv3 forbidden.
+- Open spike items (Windows verification needed): real tray click/menu
+  test, popup positioning near the tray icon (`Shell_NotifyIconGetRect`,
+  no tray geometry in the Slint API), popup close-on-outside-click,
+  per-monitor DPI, rounded tray-popup corners.
+- Light theme is **deferred** — dark only until approved
+  (REDESIGN-PLAN §5/§12). UI language is **English only**; the Urdu/Hindi
+  locale files and language switcher are removed.
+
+### 20.3 Daemon / UI split
+
+**Decision: `rsh-daemon` (always on) + `rsh-ui` (Slint, only when opened),
+connected by local IPC.**
+
+- `rsh-daemon`: engine + transport + output + tray icon + auto profile
+  switch; **no web engine**. It runs from login/first launch and keeps
+  running when the window closes. Single-instance (named mutex); a
+  second launch opens the UI window.
+- `rsh-ui`: Slint window (Overview / Wheel / Settings / Setup / tray
+  popup), 920×580, dark theme, English only. It runs only when opened.
+- **Local IPC:** named pipe (Windows) / local socket, JSON lines,
+  versioned, current-user ACL. Commands are request/response, state is
+  push events — the UI never polls.
+- **Typed boundary:** `AppApi` trait (commands) + `AppEvent` enum
+  (push events) above the UI-agnostic `rsh-app-core`. The tray speaks
+  the same boundary. The old Tauri event queue is gone.
+- **Engine on its own thread.** The 200 Hz engine has a dedicated
+  thread/runtime; network/IO runs on a separate runtime. Blocking work
+  (pairing, firmware upload, config push, restart) is an async job with
+  progress events — never a UI-thread block.
+- **L1 Connection Manager** (state machine) is the single authority on
+  connection state: `Active` only after a signed `GET_CAPS` passes;
+  re-activation loop with backoff (2 s → 30 s); heartbeat watchdog (no
+  frames for 2 s → rebuild + re-activate); user-action reasons
+  (`NoStoredKey`, `WindowClosed`) stop auto-retry and show a "Pairing
+  needed" banner. See `docs/ARCHITECTURE.md` §4.
+- Full architecture: `docs/ARCHITECTURE.md`.
+
+### 20.4 Pairing model (v2.0, firmware v4.0.2)
+
+Recorded here because it replaces the v1.x model the old docs described:
+
+- **USB-first.** Serial pairing on an unpaired board opens the 120 s
+  window on demand per serial HELO (physical access = trust anchor);
+  no countdown to race.
+- **Pair button (Wi-Fi).** BOOT held ≥ 3 s and released < 5 s opens a
+  120 s window on an **unpaired** board only (3 Hz LED blink while
+  open). Thresholds reorganised 3/5/10 s (pair / safe mode / key
+  reset). The 60 s boot window still exists (from AP-up).
+- **Password shown once.** The one-time Wi-Fi password is disclosed a
+  single time; the backend drops it only on explicit "I saved it"
+  confirm, and the keyring copy can be re-shown after a confirmation
+  dialog. The old v1.x bug (password consumed by a 5 s UI poll) is
+  gone with the poll itself.
+- **Rejoin helper.** After pairing, the app joins the PC to the `RSH`
+  network itself (Windows Wi-Fi profile + connect); otherwise it shows
+  an instruction card. (Phase 0 spike confirmation of the
+  user-level-profile mechanism is still OPEN on Windows.)
+- **AP lock after pairing (F-01).** Once pairing completes (GET_CAPS
+  OK), the AP locks to WPA2 (deferred one loop iteration after the
+  reply). The v1.x bug (AP open until reboot) is fixed.
+- **Degraded mode:** the v2.0 app works with firmware v4.0.1, but the
+  pairing UX stays the old one (no pair button; 60 s boot window or
+  USB). Firmware version is detected from `GET_CAPS`.
+- Protocol v2.1 is unchanged; signed OTA is unchanged.
+
+### 20.5 Release gates carried (LOGIC-FIX-PLAN §8, v2.0)
+
+- HIL matrix all PASS; **4-hour soak RUNS this time** (it was skipped
+  for v1.0.0 by user order 2026-11-14 — that skip does not carry to
+  v2.0); game matrix ≥ 6/6 priority pairs; design match checklist
+  (REDESIGN-PLAN §11) PASS; no High finding OPEN; idle RAM/CPU better
+  than baseline (numbers in the gate report); docs true (Wi-Fi AP-only,
+  pairing steps, "no reflash" claim) against the firmware; installer:
+  firewall rule, no surprise UAC (or documented); OV code signing
+  still deferred (SmartScreen warning remains; user knows).

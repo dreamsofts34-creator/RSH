@@ -1,7 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rsh-api",
+    "crates/rsh-ipc",
     "crates/rsh-protocol",
+    "crates/rsh-daemon",
+    "crates/rsh-ui",
     "crates/rsh-engine",
     "crates/rsh-transport",
     "crates/rsh-security",
@@ -25,6 +29,10 @@ members = [
     "src-tauri",
 ]
 default-members = [
+    "crates/rsh-api",
+    "crates/rsh-ipc",
+    "crates/rsh-daemon",
+    "crates/rsh-ui",
     "crates/rsh-protocol",
     "crates/rsh-engine",
     "crates/rsh-transport",
@@ -38,7 +46,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "1.0.2"
+version = "2.0.0"
 edition = "2024"
 license = "MIT"
 

@@ -56,6 +56,10 @@ pub mod record_type {
     pub const SHIFTER: u8 = 11;
     /// `12` — `AXIS_AS5600` (magnetic encoder axis, I²C addr 0x36 fixed).
     pub const AXIS_AS5600: u8 = 12;
+    /// `13` — `LED_CONFIG` (v4.0.2 F-14, persistent LED config:
+    /// `params[0]` pattern 0..4, `params[1..3]` r/g/b,
+    /// `params[4]` brightness 0..100; slot 0, flags 0, no pins).
+    pub const LED_CONFIG: u8 = 13;
 }
 
 /// One 16-byte config module record (§3.6).

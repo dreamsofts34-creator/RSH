@@ -1,80 +1,45 @@
-# Release Checklist — RSH Rust v1.0.0 (FINAL, Phase H5)
+# Release Checklist — RSH v2.0 (daemon + Slint UI)
 
-**Version:** Rust app **v1.0.0** · C++ firmware **v4.0.1** · protocol **v2.1**
-**Date:** 2026-11-14 · **Status: PREP — release NOT executed.**
-The coordinator executes the release by pushing a `v1.*` tag after the
-Phase H gate is green. This is the **final** checklist: it merges the
-Phase H4 packaging evidence
-([RELEASE-CHECKLIST-H4.md](RELEASE-CHECKLIST-H4.md), kept as the H4
-record — **not deleted**) with the Phase H5 docs + release-prep items.
-Where this file and the H4 file disagree, this file wins and the
-disagreement is noted. H4 §1–§12 remain the detailed evidence; this
-file is the gate list the coordinator ticks before tagging.
+**Version:** Slint app + daemon **v2.0.0** · C++ firmware **v4.0.2** · protocol **v2.1**
+**Date:** 2026-11-16 · **Status: PREP — release NOT executed.**
+The coordinator executes the release by pushing a `v2.*` tag after
+the Phase 9 gate is green. This file is the gate list the coordinator
+ticks before tagging. The v1.x checklist it supersedes is in git
+history (the v1.0.0–v1.0.2 Tauri releases, `RSH_1.0.x_x64-setup.exe`,
+single-asset rule DECISIONS §18 — still standing, see §3).
 
-> Honesty rule (from H4, kept): an item is ticked only if it was
-> actually done/verified. Anything needing Windows is marked
-> **[Windows-only]** and unticked until it runs.
+> Honesty rule: an item is ticked only if it was actually
+> done/verified. Anything needing Windows is marked
+> **[Windows-only]** and unticked until it runs. A skipped soak is
+> recorded as SKIPPED, never as passed.
 
 ## 1. Version triple (frozen)
 
 | Piece | Version | Source of truth |
 |---|---|---|
-| App | Rust **v1.0.0** | `Cargo.toml` `[workspace.package] version`, `src-tauri/tauri.conf.json` `version` — both `1.0.0`, checked by `release.yml` |
-| Firmware | C++ **v4.0.1** | `FIRMWARE-COMPAT.md`; merged bin `RSH-Firmware-DevKitV1-v4.0.1.bin`, 956,032 B (Windows release runner; Linux `pio run`: 955,984 B — host-toolchain variance, same source) |
-| Protocol | **v2.1** (frozen) | Wire contract; Rust app talks to the same board — **no reflash needed** for wheels already on v4.0.1 |
+| App + daemon | **v2.0.0** | `Cargo.toml` `[workspace.package] version` — the ONLY version source in v2.0 (no `tauri.conf.json`, no `frontend/package.json` anymore); checked by `release.yml` against the tag |
+| Firmware | C++ **v4.0.2** | `docs/V2-FIRMWARE-4.0.2-GATE.md` (F-01…F-16, 4,705 checks, 0 failures) |
+| Protocol | **v2.1** (frozen) | Wire contract; the app talks to the same board — **no reflash needed** for wheels already on v4.0.2; firmware is flashed from the app (WebOTA), never from the installer |
 
-## 2. What H4 already proved (evidence in RELEASE-CHECKLIST-H4.md)
+## 2. What v2.0 is (architecture)
 
-- [x] **Installer format:** NSIS (primary, `installMode: currentUser`)
-      + MSI (secondary, same `upgradeCode`
-      `9719670d-2902-517d-a1ca-712bb1bf9c3f`). **MSIX deferred with
-      reason** (no Tauri MSIX target; MSIX cannot package drivers;
-      elevated sidecar unproven from MSIX) — H4 §1.1.
-- [x] **Firewall:** installer does nothing; the app applies the rule at
-      runtime (`RSH`, inbound, program-scoped, all profiles) via the
-      Windows Firewall COM API — H4 §1.2.
-- [x] **Sidecar shipping:** HIDMaestro sidecar via Tauri
-      `bundle.externalBin` → `rsh-hm-sidecar.exe` beside `RSH.exe`;
-      NativeAOT single-file publish, no .NET runtime needed — H4 §1.3.
-- [x] **Tauri bundler config** verified key-by-key against the bundled
-      crate sources (NSIS/MSI targets, icons exist, upgrade code is a
-      valid UUID, updater pubkey decodes to 42 bytes starting `Ed`) —
-      H4 §2.
-- [x] **SBOMs + licenses:** `sbom/rust.cdx.json` (CycloneDX 1.6, **626
-      packages** — full `Cargo.lock` resolve; deep-scan Round 2 recount:
-      the lockfile has 626, the old SBOM listed 625 because `rsh-rig`
-      was missing), `sbom/frontend.cdx.json` (CycloneDX 1.5, **320
-      components** — 318 unique name@version; `magic-string@0.30.21`
-      appears 3× at different install paths, which is legitimate),
-      `sbom/sidecar.cdx.json` (hand-written, pins re-verified);
-      `cargo deny check licenses` PASS; **no GPL/AGPL/LGPL
-      anywhere** — H4 §3 + `THIRD-PARTY-LICENSES.md`.
-- [x] **Updater keypair (NEW, separate from the firmware keypair):**
-      minisign public key
-      `RWTeanojSpk/AqwtLj5+ShAZPbWWzRmQugDCs9fJUjVrtNkCJ2+llrE2`
-      (keynum `de6a7a234a993f02`, fingerprint
-      `ecb5a3106e30468090ea39c90f69498e2ae646f13b8cace256bcfea6267fc1f1`),
-      in `tauri.conf.json` as base64 of the `.pub` file; password-protected
-      keypair generated with `cargo tauri signer generate` (DECISIONS §17.11
-      — the H4 unencrypted keypair was retired 2026-11-15, it could never
-      sign); crate-level sign/verify cross-check PASS —
-      H4 §4. **Updater is check-only in v1.0.0** (no
-      download/install code path); `active: false` in the config is a
-      Tauri-v1 leftover the plugin ignores — the real gates are "no
-      `latest.json` published yet" + "check-only app code".
-- [x] **Firmware signing CI flow verified from source:** `pio run` +
-      `sign_firmware.py` → `firmware-signed.bin` = `firmware.bin` + 68 B
-      trailer; key unset → signing skipped and stale signed bin deleted;
-      key set but bad → build fails hard; existing keypair reused
-      (public-key fingerprint
-      `387764a4529337c437b233a148b48f9b2ffe3f3b5015e14c95737cb3a67a6411`) —
-      H4 §5.
-- [x] **App is UNSIGNED (OV cert deferred, D-R11)** — SmartScreen
-      warning expected. Firmware signing is unaffected — H4 §5.
-- [x] **Release workflow created** (`.github/workflows/release.yml`),
-      YAML-valid — H4 §6, re-verified read-only in H5 (§6 below).
+- **Daemon** (`rsh-daemon`, always-on): engine + transport + output
+  + tray + auto profile switch. Creates the tray icon on every
+  launch. No web engine, no console window in release builds
+  (`windows_subsystem = "windows"`).
+- **UI** (`rsh-ui`, Slint): main window (Overview / RSH Wheel /
+  Settings), spawned from the tray; talks to the daemon over local
+  IPC (`rsh-ipc`, typed `rsh-api`).
+- **HIDMaestro sidecar** (`rsh-hm-sidecar.exe`, NativeAOT): ships
+  beside `rsh-daemon.exe` — the daemon resolves it as
+  `<own exe dir>\rsh-hm-sidecar.exe`.
+- **Installer:** NSIS, generated by `.github/workflows/release.yml`
+  (no committed `.nsi` — the installer IS the release workflow's
+  `installer/rsh.nsi` step). `RequestExecutionLevel admin` ONCE at
+  install time, so the firewall rule can be created. Nothing at
+  login ever prompts (D-7, see §4).
 
-## 3. Release asset list (exact — ONE asset, hotfix v1.0.1)
+## 3. Release asset list (exact — ONE asset)
 
 **Single-asset release (user order 2026-11-15 14:00, standing rule —
 see docs/DECISIONS.md §18):** what `release.yml` stages and publishes
@@ -82,145 +47,157 @@ is exactly one file:
 
 | # | Asset | Source |
 |---|---|---|
-| 1 | `RSH_1.0.1_x64-setup.exe` | Tauri NSIS bundle (the ONLY installer, the ONLY asset) |
+| 1 | `RSH_2.0.0_x64-setup.exe` | NSIS installer built by `release.yml` (the ONLY installer, the ONLY asset) |
 
 NOT published in this release: MSI, `.sig` files, `latest.json`
-(auto-update is OFF — no manifest is published, so
-`check_for_update` fails gracefully with "Could not check for
-updates."), firmware bins (merged + signed), `SHA256SUMS`, SBOMs.
-The v1.0.0 11-asset list above is superseded — it is kept only in
-the H4 record ([RELEASE-CHECKLIST-H4.md](RELEASE-CHECKLIST-H4.md) §7)
-and in git history, never as the current list.
+(auto-update is OFF — no manifest is published, users download and
+install manually), firmware bins (merged + signed), `SHA256SUMS`, SBOMs.
+`release.yml` fails closed unless exactly one file is staged.
 
-Installer filename follows Tauri 2.12 defaults — the first dry-run
-confirms it; if it differs, the workflow's globbing fails loudly
-rather than publishing the wrong file.
+## 4. What Phase 7 landed (tray + autostart + installer)
 
-## 4. Open release gates (all carried honestly — none is silently passed)
+- [x] **Tray popup** (`crates/rsh-daemon/src/tray_popup.rs` +
+      `ui/tray.slint` `TrayPopup`, 340×440, same-to-same with
+      `preview-html/Tray.html`): header (name, status, Send-to-game
+      switch), live wheel + 3 bars, profile selector (click cycles
+      to the next profile), 3 games (Launch / Running / Not found),
+      footer Open RSH / Restart wheel. Live data comes from the
+      daemon's `AppApi` (no IPC round-trip — the daemon IS the data
+      source), refreshed at 10 Hz while visible.
+- [x] **Tray geometry** (`tray_geometry.rs`): the popup anchors next
+      to the tray icon via `Shell_NotifyIconGetRect` — verified
+      against the Slint 1.18.1 source (`i-slint-core`
+      `items/system_tray/windows.rs`): Slint's Windows tray backend
+      uses a hidden message-only window of class
+      `SlintSystemTrayWindow` with `uID = 1`, no GUID. The code finds
+      that window for our own process id and queries the rect; on
+      failure (or on Linux) the popup docks bottom-right. Pure
+      anchor math unit-tested (12 daemon tests green on Linux).
+- [x] **Click-outside closes the popup [Windows-only]**: a 100 ms
+      timer hides the popup when another window takes the foreground
+      (500 ms grace after showing). Linux has no foreground query —
+      Escape and the popup's own buttons close it there (documented
+      degradation, not a silent gap).
+- [x] **Tray menu** (§7.8, native platform menu — all 8 items):
+      Open RSH, Send to game (tick), Profile ›, Launch game ›,
+      Restart wheel, Settings, Quit RSH. Menu actions are now REAL
+      in the daemon (were log-only placeholders in Phase 2):
+      profile activates, game launches (id or display name),
+      Restart wheel reboots the board, Open RSH / Settings spawn
+      `rsh-ui` (beside the daemon exe). Known limit: the native menu
+      cannot render the `TrayMenu.html` status header and its Profile
+      submenu is still the static "Default" entry — profile
+      switching beyond Default goes through the popup's cycle row
+      (or the Profiles screen). A model-driven menu is a Phase 8
+      item, not silently claimed here.
+- [x] **Autostart** (`tray_autostart.rs`): Windows Run key
+      `HKCU\…\CurrentVersion\Run`, value `RSH` → `"…\rsh-daemon.exe"`
+      (no arguments — the daemon always creates its tray icon),
+      via the Registry API directly (no `reg.exe`, so no console
+      flash — the v1.0.2 bug class). Linux: `~/.config/autostart/
+      rsh-daemon.desktop`. The daemon syncs the entry from
+      `settings.autostart` on startup; a stale v1 entry (old
+      `RSH.exe`) is migrated to the daemon exe when autostart is on,
+      removed when it is off.
+- [x] **No login-time UAC surprise (D-7, LOGIC-FIX-PLAN §4.6)**:
+      the daemon calls `activate_startup_backend` on startup —
+      HIDMaestro stays deferred until the user turns "Send to game"
+      on (the UAC prompt there is expected, user-initiated); a
+      non-elevated backend (vJoy, driver present) activates at
+      startup, so autostart defaults to vJoy until HIDMaestro is
+      ready. The optional elevated helper (scheduled task, option
+      (a)) is NOT implemented — the deferral already removes the
+      login-time prompt. The installer does NOT enable autostart;
+      Settings owns it.
+- [x] **Installer firewall rule (LOGIC-FIX-PLAN §4.3 / C-10)**:
+      the NSIS installer creates a program-scoped inbound rule
+      named `RSH` for `rsh-daemon.exe` (Private + Public, no port
+      scope — a port-scoped rule would also allow other programs on
+      that port) via hidden `nsExec` `netsh`, and removes it on
+      uninstall. Verified by the release workflow's smoke test
+      (rule present after install, gone after uninstall).
+- [x] **Release workflow rewritten for v2.0**
+      (`.github/workflows/release.yml`): tag `v2.*`, workspace
+      version check, sidecar staging, fmt + clippy (`--workspace
+      --exclude src-tauri`) + `--release` tests of the four ship
+      crates + `cargo deny`, `cargo build --release -p rsh-daemon
+      -p rsh-ui`, PE-subsystem GUI check on all three binaries,
+      NSIS build, single-asset verify (exactly 1 file), smoke test
+      (silent install → firewall rule → `rsh-daemon --check` exit 0
+      → silent uninstall → rule + dir gone). YAML-valid; every
+      referenced path/binary verified to exist in the repo.
+- [x] **CI updated** (`.github/workflows/ci.yml`): the four v2.0
+      crates (`rsh-daemon`, `rsh-ui`, `rsh-api`, `rsh-ipc`) build +
+      clippy + test on Windows and Linux, with fail-closed presence
+      checks; the existing exclusion of `src-tauri` on Linux is kept
+      (its build script needs the staged Windows sidecar).
+
+## 5. Open release gates (none silently passed)
 
 | # | Gate | Status | Owner / next step |
 |---|---|---|---|
-| G-1 | **pid.codes PR** for VID `0x1209` / PID `0x5253` | **OPEN — release gate** | Must merge before v1.0.0; human gate, not in the workflow (Phase G D-G3) |
-| G-2 | **vJoy DLL SHA-256** (`PINNED_DLL_SHA256_HEX`) | **OPEN — not measured** | Measure on the Windows release machine; never invented (Phase G G-G3). `release.yml` only records whether the runner happens to have vJoy (it will not) |
-| G-3 | **`firmware/` restore in the repo** | **CLOSED 2026-11-14** — restored from `reference/firmware-v4.0.1/` (flat copy, 44 files + `rsh/signing_pubkey.h`); all 4 `release.yml` fail-closed paths present; local `pio run` SUCCESS 32.96 s, merged bin 955,984 B, signed bin 889,588 B, Ed25519 verify OK |
-| G-4 | **Secret `RSH_UPDATER_PRIVATE_KEY`** | **CLOSED 2026-11-14** — created via libsodium sealed-box from `signing-keys/updater-minisign.key` (whole `.key` file, 259 B); verified listed alongside `RSH_SIGNING_KEY_PEM` (value never printed/logged) |
-| G-5 | **Secret `RSH_SIGNING_KEY_PEM`** | Pre-existing (C# series) — **verify present** | Verify before the first release dry-run |
-| G-6 | **First `release.yml` dry-run** (`workflow_dispatch`, `dry_run: true`) | **OPEN — never run** | Must pass end-to-end before any tag is pushed. It is also the first proof of: `cargo cyclonedx` flags, `cargo tauri build` output filenames, sidecar staging path, `cargo tauri signer sign` E2E of the new updater keypair |
-| G-7 | **A7 real-board run** | **OPEN — carried Phase H gate item** | Run once, at final production release, on the owner PC (user decision: real-board tests only at final release) |
-| G-8 | **4-hour soak** | **SKIPPED by user decision 2026-11-14 14:54 (time constraint); D-R14 release blocker overridden by the user. Recorded as SKIPPED, NEVER as passed.** 60 s quick soak + 10 min full soak still run (results in `docs/PERF-H2.md`, H2) | User-accepted limitation; carried in the release notes verbatim |
-| G-9 | **Game matrix in-game verification** | **OPEN — 0 of 16 backend–game pairs verified** | Windows-only; procedure in [GAME-MATRIX.md](GAME-MATRIX.md). v1.0.0 ships with the matrix honestly at 0/16 — no game is claimed to work until verified |
-| G-10 | **H1 security re-scan conditions** | **CONDITIONAL PASS** (0 Critical / 0 High) — see [SECURITY-RESCAN-H1.md](SECURITY-RESCAN-H1.md) §7 | Session-owner activator must land before v1.0.0 ships (SEC-E-14); 3 sandbox-timing test failures must re-run green on CI/Windows; `cargo audit` yanked check + `npm audit` re-run on CI (both blocked/timed out in sandbox) |
-| G-11 | **Clean-PC install + rollback plans** | **OPEN — Windows-only** | H4 §8/§9, on Win10 22H2 **and** Win11: NSIS + MSI install, paint check (no blank window), firewall rule, HIDMaestro UAC path, vJoy fallback journey, upgrade-over-install, downgrade rollback (`allowDowngrades: true`), profile restore |
-| G-12 | **CI `tauri-build` job broken** | **CLOSED 2026-11-14 — was already fixed in H5** (this checklist entry was stale): `ci.yml` `tauri-build` installs the CLI with `cargo install tauri-cli --locked` and runs `cargo tauri build --no-bundle` from `src-tauri/` — see the H4-finding-#1 comment in `ci.yml`. `release.yml` is unaffected |
-| G-13 | **MSIX** | Deferred with reason (H4 §1.1) | Future Windows spike only; not a v1.0.0 gate |
+| G-1 | **Workspace version → 2.0.0** | **OPEN** | `Cargo.toml` `[workspace.package]` is still `1.0.2`. Phase 9 / integration bumps it to `2.0.0` before the first `v2.*` tag — `release.yml` FAILS CLOSED until then (by design). |
+| G-2 | **`rsh-ui` PE subsystem = GUI** | **OPEN — Phase 3** | `rsh-ui` has no `windows_subsystem = "windows"` yet (the daemon already has it). The release workflow's PE check will fail the run until Phase 3 adds it. Do NOT weaken the check. |
+| G-3 | **pid.codes PR** for VID `0x1209` / PID `0x5253` | **OPEN — release gate** | Must merge before v2.0.0; human gate, not in the workflow |
+| G-4 | **vJoy DLL SHA-256** (`PINNED_DLL_SHA256_HEX`) | **OPEN — not measured** | Measure on the Windows release machine; never invented. `release.yml` only records whether the runner happens to have vJoy (it will not) |
+| G-5 | **First `release.yml` dry-run** (`workflow_dispatch`, `dry_run: true`) | **OPEN — never run** | Must pass end-to-end before any tag is pushed. It is the first proof of: the generated `.nsi`, the installer filenames, the sidecar staging path, the firewall-rule smoke test, the daemon `--check` smoke test |
+| G-6 | **Tray popup on real Windows** | **OPEN — Windows-only** | Left-click → popup appears next to the tray icon (not bottom-right dock, not off-screen); click-outside closes it; Escape closes it; live bars move; profile row cycles; Launch starts the game. Procedure in §6. |
+| G-7 | **Tray menu on real Windows** | **OPEN — Windows-only** | Right-click → all 8 items present and working (profile activates, game launches, restart reboots, Settings opens the UI on Settings, Quit exits the daemon). |
+| G-8 | **Autostart on real Windows** | **OPEN — Windows-only** | Enable in Settings → `RSH` Run-key value points at `rsh-daemon.exe`; log out/in → daemon runs, tray appears, NO UAC prompt; disable → value gone. |
+| G-9 | **Firewall rule on real Windows** | **OPEN — Windows-only** | After install: `netsh advfirewall firewall show rule name="RSH"` shows the program-scoped inbound rule; wheel connects over Wi-Fi (200 Hz stream arrives); after uninstall the rule is gone. The CI smoke test proves the same steps on the runner — this gate is the real-PC confirmation. |
+| G-10 | **5-minute soak** | **NOT RUN — max 5 min** | **The 4-hour soak is CUT by user order 2026-11-16 14:39 PKT** (was §7/§8 of the plan; recorded as CUT, never as passed). A 5-minute soak runs at the Phase 9 gate instead (rig `--mode quick` + 5-min soak). |
+| G-11 | **Game matrix in-game verification** | **OPEN — 0 of 16 backend–game pairs verified** | Windows-only; procedure in [GAME-MATRIX.md](GAME-MATRIX.md). v2.0.0 ships with the matrix honestly at 0/16 — no game is claimed to work until verified |
+| G-12 | **Clean-PC install + rollback** | **OPEN — Windows-only** | On Win10 22H2 **and** Win11: NSIS install, tray + popup paint check (no blank window), firewall rule, HIDMaestro UAC path (only on Send-to-game), vJoy fallback journey, upgrade-over-install, downgrade rollback, profile restore, uninstall removes rule + files |
+| G-13 | **A7 real-board run** | **OPEN — carried** | Run once, at final production release, on the owner PC (user decision: real-board tests only at final release) |
 | G-14 | **OV code-signing certificate** | Deferred (user decision D-R11) | Buy later ($150–300/year est.); app ships unsigned, SmartScreen expected |
 
-## 5. Docs delivered by H5 (this phase)
+## 6. Windows verification steps (Phase 7 — run on a real PC)
 
-- [x] Professional README (repo root) rewritten for the Rust
-      recreation — badges, features, quickstart, architecture summary,
-      repo tree, dev commands, contributing, unsigned-app note,
-      License: MIT. All relative links verified to resolve (H5
-      verification, §7).
-- [x] Docs pass — `docs/` reviewed as it stands: all files are
-      Rust-series docs; C# mentions are historical context only, never
-      current behaviour. New [docs/README.md](README.md) indexes the
-      current docs accurately.
-- [x] [USER-GUIDE.md](USER-GUIDE.md) — install, first-run pairing
-      (60 s window, re-pairing mandatory — C# DPAPI keys cannot be
-      read from Rust), per-module tuning, profiles, game launcher,
-      output backend choice (HIDMaestro default + UAC note, vJoy
-      fallback), troubleshooting (blank-window lesson, page-load
-      failure, log location, diagnostics export).
-- [x] [FLASH-GUIDE.md](FLASH-GUIDE.md) — firmware v4.0.1 reflash
-      procedure (new board / brick recovery), signed-only,
-      anti-downgrade, BOOT-hold safe mode; detailed companion
-      [REFLASH-GUIDE.md](REFLASH-GUIDE.md) kept.
-- [x] [GAME-MATRIX.md](GAME-MATRIX.md) — Phase H final note added;
-      **0/16 verified, unchanged** — no pair marked verified without
-      evidence.
-- [x] [SUPPORT-PERIOD.md](SUPPORT-PERIOD.md) — support window for
-      v1.0.0 (12 months after release, or 90 days after v1.1.0,
-      whichever is later).
-- [x] This file — final checklist merging H4 (H4 file kept, referenced).
+These are the exact steps the CI run cannot do (headless runner).
+Tick G-6…G-9 only after running them:
 
-## 6. Release workflow verification (H5, read-only)
+1. Install `RSH_2.0.0_x64-setup.exe` (double-click, accept the
+   one-time admin prompt at install — that is the ONLY UAC prompt
+   in the whole flow).
+2. `netsh advfirewall firewall show rule name="RSH"` → rule exists,
+   program `…\rsh-daemon.exe`, direction In, action Allow,
+   profiles Private,Public.
+3. The tray icon appears (no terminal window, no console flash).
+4. Left-click the tray icon → the 340×440 popup opens next to the
+   icon (above the taskbar, right-aligned to the icon); the wheel
+   angle and the 3 bars move live; click the profile row → the
+   profile cycles; click a game's Launch → the game starts.
+5. Click on the desktop (outside the popup) → the popup closes.
+   Press Escape with the popup open → it closes.
+6. Right-click the tray icon → the menu shows all 8 items;
+   Profile / Launch game submenus work; Restart wheel reboots the
+   board; Settings opens the UI on the Settings page; Quit RSH
+   exits the daemon (tray icon disappears).
+7. In Settings, turn autostart ON → check the Run key:
+   `reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v RSH`
+   → `"…\rsh-daemon.exe"`. Sign out and back in → the daemon is
+   running, the tray icon is there, and NO UAC prompt appeared.
+   Turn autostart OFF → the value is gone.
+8. Uninstall from Settings / Apps → the `RSH` firewall rule is
+   gone (`netsh … show rule name="RSH"` → "No rules match") and
+   the install dir is gone.
 
-Read `.github/workflows/release.yml` (361 lines) and `.github/workflows/ci.yml`
-(513 lines) on 2026-11-14:
+## 7. Pre-tag human gates (coordinator checks before pushing `v2.*`)
 
-- [x] **YAML parses** — both workflows (`yaml.safe_load` OK).
-- [x] **Triggers:** push of tag `v1.*` + `workflow_dispatch` with
-      `dry_run` (default `"true"`) and optional `tag` input. Tag
-      validated `^v1\.\d+\.\d+$`. Nothing runs on a normal push to
-      main (CI covers that).
-- [x] **Secret names:** `RSH_SIGNING_KEY_PEM` (firmware Ed25519 PEM)
-      and `RSH_UPDATER_PRIVATE_KEY` (minisign private key) — both
-      checked present (fail closed) before any build step; values
-      never printed; temp firmware-key file deleted in an
-      `if: always()` step.
-- [x] **Single-asset list** (§3, hotfix v1.0.1 — DECISIONS §18)
-      matches the staging + verify steps in the workflow: exactly
-      one NSIS exe is staged, the verify step refuses anything other
-      than that one file, and `gh release create` uploads only it.
-      (The old 11-asset list — NSIS + MSI + both `.sig` files +
-      `latest.json` + merged firmware bin + `firmware-signed.bin` +
-      `SHA256SUMS` + 3 SBOMs — is superseded; those steps no longer
-      exist in `release.yml`.)
-- [x] **Fail-closed steps:** version consistency (tag == Cargo
-      workspace version == `tauri.conf.json` version,
-      `createUpdaterArtifacts` true) → firmware presence → secrets
-      presence → gates (`cargo test --workspace`, `cargo deny check`,
-      frontend tests + build) → firmware build + sign + verify
-      (`--verify` + image-region byte-compare + size `firmware.bin
-      + 68`) → sidecar fetch with ZIP + DLL SHA-256 pins →
-      `cargo tauri build` (updater key via `TAURI_SIGNING_PRIVATE_KEY`
-      env on that step only) → stage → verify → `gh release create`
-      (skipped on dry-run).
-- [x] **Defects found:** none functional. One trivial doc-level error
-      in a workflow comment was fixed by H5: the header's asset-list
-      pointer said "see docs/RELEASE-CHECKLIST-H4.md §5" — the asset
-      list is H4 **§7** (§5 is firmware signing CI). No workflow logic
-      was touched.
-- [ ] **Not verifiable from the sandbox:** the workflow has never run.
-      First dry-run (G-6) is the proof of the installer filenames,
-      `cargo cyclonedx` flags, sidecar staging path, and updater
-      signing E2E.
-
-## 7. H5 verification log (what was actually checked on disk)
-
-- All relative links in the rewritten README, `docs/README.md`,
-  `USER-GUIDE.md`, `FLASH-GUIDE.md`, `SUPPORT-PERIOD.md` and this
-  file were checked against the repo tree — every target exists
-  (script run 2026-11-14; see the H5 final report for the count).
-- `release.yml` + `ci.yml` YAML-parse verified (above).
-- `Cargo.toml` workspace version `1.0.0` and `tauri.conf.json`
-  version `1.0.0` confirmed on disk (release.yml's consistency check
-  has matching values to compare).
-- `docs/` inventory: 16 pre-H5 docs + H4/H1 gate docs, all Rust-era;
-  no stale C# doc presented as current. `docs/README.md` did not
-  exist — created by H5.
-- Numbers cited in H5 docs come only from files read on disk in this
-  session (H4 evidence, Phase G gate doc, `tauri.conf.json`,
-  `release.yml`, `KEY-LIFECYCLE-RUST.md`, `REFLASH-GUIDE.md`,
-  reference `BRICK-RECOVERY.md` / `SIGNED-OTA.md`). No test result
-  was invented; Phase H final numbers belong to the coordinator's
-  gate doc, not to this checklist.
-
-## 8. Pre-tag human gates (coordinator checks before pushing `v1.*`)
-
-- [ ] Phase H gate green (H1–H5, final testing, A7 real-board run).
-- [ ] G-1 pid.codes PR merged.
-- [ ] G-2 vJoy DLL SHA-256 measured on the Windows release machine.
-- [x] G-3 `firmware/` restored in the repo (2026-11-14; local pio build + signed verify OK).
-- [x] G-4 + G-5 secrets set (G-5 `RSH_SIGNING_KEY_PEM` verified present 2026-11-14; G-4 created 2026-11-14, sealed-box, verified listed).
-- [ ] G-6 `release.yml` dry-run (`workflow_dispatch`, `dry_run: true`)
-      green, including the `cargo cyclonedx` step and the installer
-      filename assumptions (§3).
-- [ ] G-11 clean-PC install + rollback plans (§8/§9 of H4) executed on
-      Win10 + Win11, report filed.
-- [x] G-12 `ci.yml` `tauri-build` job fixed in H5 (cargo-installed Tauri CLI; checklist entry was stale).
-- [ ] Release notes written: unsigned-app SmartScreen note; firmware
-      anti-downgrade note; HIDMaestro UAC note; **re-pairing mandatory**
-      (C# → Rust) on the first page; game matrix status (0/16);
-      **4-hour soak SKIPPED** (user decision, not passed).
+- [ ] Phase 9 gate green (all phases, 5-minute soak, rig).
+- [ ] G-1 version bumped to `2.0.0` in `Cargo.toml`.
+- [ ] G-2 `rsh-ui` PE subsystem GUI (Phase 3) — release workflow
+      PE check green.
+- [ ] G-3 pid.codes PR merged.
+- [ ] G-4 vJoy DLL SHA-256 measured on the Windows release machine.
+- [ ] G-5 `release.yml` dry-run (`workflow_dispatch`,
+      `dry_run: true`) green, including the NSIS build and the
+      smoke test (§4).
+- [ ] G-6…G-9 Windows verification (§6) executed on Win10 + Win11,
+      report filed.
+- [ ] G-12 clean-PC install + rollback plans executed, report filed.
+- [ ] Release notes written: unsigned-app SmartScreen note;
+      firmware anti-downgrade note; HIDMaestro UAC note (only on
+      Send-to-game, never at login); **re-pairing note if the key
+      store changed**; game matrix status (0/16);
+      **4-hour soak CUT by user order** (5-minute soak instead).

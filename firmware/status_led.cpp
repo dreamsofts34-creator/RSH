@@ -1,8 +1,10 @@
 #include "status_led.h"
 #include "config.h"
+#include "diag_log.h"  // F-10: rsh_error_blink_on() (pure blink pattern)
 #include <Arduino.h>
 
 static LedState cur = LedState::ApUpWaitingPc;
+static uint8_t errorBlinks = 4;  // ErrorCode state ka blink count
 
 static inline void led_write(bool on) {
   digitalWrite(PIN_LED, LED_ACTIVE_LOW ? (on ? LOW : HIGH) : (on ? HIGH : LOW));
@@ -14,6 +16,11 @@ void led_begin() {
 }
 
 void led_set(LedState s) { cur = s; }
+
+void led_set_error_blinks(uint8_t blinks) {
+  errorBlinks = (blinks == 0 || blinks > 9) ? 4 : blinks;
+  cur = LedState::ErrorCode;
+}
 
 void led_update(uint32_t nowMs) {
   switch (cur) {
@@ -34,6 +41,12 @@ void led_update(uint32_t nowMs) {
       break;
     case LedState::KeyResetArmed:            // 4 Hz: 125 ms on / 125 ms off (§4.4)
       led_write((nowMs / 125) % 2 == 0);
+      break;
+    case LedState::PairWindow:               // F-02: 3 Hz blink (pairing window)
+      led_write((nowMs / 166) % 2 == 0);
+      break;
+    case LedState::ErrorCode:                // F-10: N blinks + 1 s pause
+      led_write(rsh_error_blink_on(errorBlinks, nowMs) != 0);
       break;
   }
 }

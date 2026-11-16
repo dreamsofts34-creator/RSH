@@ -11,12 +11,32 @@ Import("env")  # noqa: F821  (provided by PlatformIO/SCons)
 
 
 def _firmware_version():
-    cfg = os.path.join(env.subst("$PROJECT_DIR"), "config.h")  # noqa: F821
+    # F-12 (v4.0.2): version ka single source version.h hai —
+    # config.h mein FIRMWARE_VERSION sirf RSH_FW_VERSION_STRING ka alias
+    # hai, aur version.h string ko MAJOR/MINOR/PATCH se stringize karta
+    # hai. Pehle literal define dhoondo, phir alias -> version.h ke
+    # teen integer macros se version banao.
+    proj = env.subst("$PROJECT_DIR")  # noqa: F821
     try:
-        with open(cfg, encoding="utf-8") as f:
-            m = re.search(r'#define\s+FIRMWARE_VERSION\s+"([^"]+)"', f.read())
-            if m:
-                return m.group(1)
+        with open(os.path.join(proj, "config.h"), encoding="utf-8") as f:
+            text = f.read()
+        m = re.search(r'#define\s+FIRMWARE_VERSION\s+"([^"]+)"', text)
+        if m:
+            return m.group(1)
+        if re.search(r"#define\s+FIRMWARE_VERSION\s+RSH_FW_VERSION_STRING",
+                     text):
+            with open(os.path.join(proj, "version.h"),
+                      encoding="utf-8") as f:
+                vtext = f.read()
+            parts = []
+            for name in ("RSH_FW_VERSION_MAJOR", "RSH_FW_VERSION_MINOR",
+                         "RSH_FW_VERSION_PATCH"):
+                m2 = re.search(r"#define\s+%s\s+(\d+)" % name, vtext)
+                if not m2:
+                    break
+                parts.append(m2.group(1))
+            if len(parts) == 3:
+                return ".".join(parts)
     except OSError:
         pass
     return "unknown"

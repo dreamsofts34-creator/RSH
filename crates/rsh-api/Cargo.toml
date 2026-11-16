@@ -1,0 +1,16 @@
+[package]
+name = "rsh-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RSH v2.0 typed daemon API: AppApi trait + AppEvent enum + Connection Manager state machine (LOGIC-FIX-PLAN §2/§4.1). UI-agnostic; no transport, engine, or UI dependency."
+publish = false
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

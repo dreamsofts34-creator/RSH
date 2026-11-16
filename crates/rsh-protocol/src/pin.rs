@@ -621,22 +621,63 @@ pub fn free_pins(modules: &[PinModule], expanders: bool) -> Vec<u8> {
     free
 }
 
+/// Handbrake button-mode flag (v4.0.2 F-15): `AXIS_ADC`/`AXIS_GENERIC`
+/// record with `slot == 4` and this bit set is a digital button
+/// (pull-up rule), not an analog axis (ADC1 rule).
+const HANDBRAKE_BUTTON_FLAG: u8 = 0x01;
+
+/// Handbrake slot (axis slot 4 — see §3.6 slot table).
+const HANDBRAKE_SLOT: u8 = 4;
+
+/// Shifter sensitivity: `SHIFTER` record `params[4]` (v4.0.2 D-4),
+/// 0..100; default 50 when no SHIFTER record exists.
+const SHIFTER_SENSITIVITY_PARAM: usize = 4;
+/// Default shifter sensitivity (→ 13 ms debounce, see
+/// [`shifter_debounce_ms`]).
+const SHIFTER_SENSITIVITY_DEFAULT: u8 = 50;
+
 /// Map one config record to its [`PinModule`] (or `None` when the
 /// record carries no pin, e.g. `pinA == 0xFF`). Sets `*expanders` when
 /// the record is an I²C kind. Returns an error string for unknown
 /// record types. SHIFTER records are handled separately by
 /// [`shifter_errors`] and map to no module here.
+// One arm per record type: splitting it would scatter the §3.6
+// record → module mapping across helpers.
+#[allow(clippy::too_many_lines)]
 fn blob_record_module(
     record: &crate::config::ConfigRecord,
     expanders: &mut bool,
 ) -> Result<Option<PinModule>, String> {
     use crate::config::record_type;
     match record.rec_type {
-        record_type::AXIS_ADC | record_type::AXIS_GENERIC => Ok(if record.pin_a == 0xFF {
-            None
-        } else {
-            Some(PinModule::axis(record.pin_a))
-        }),
+        record_type::AXIS_ADC | record_type::AXIS_GENERIC => {
+            // F-15 (v4.0.2): handbrake AXIS slot 4 — flags bit0 is
+            // button mode (digital button, pull-up rule); any other
+            // flag bit is rejected. A button-mode record maps to a
+            // Button module so the pull-up rule applies instead of
+            // the ADC1 rule; the axis limit count is unaffected
+            // (`blob_limit_errors` counts records, not modules).
+            if record.slot == HANDBRAKE_SLOT {
+                if record.flags & !HANDBRAKE_BUTTON_FLAG != 0 {
+                    return Err(format!(
+                        "handbrake axis: flags 0x{:02x} invalid (only bit0 button mode allowed)",
+                        record.flags
+                    ));
+                }
+                if record.flags & HANDBRAKE_BUTTON_FLAG != 0 {
+                    return Ok(if record.pin_a == 0xFF {
+                        None
+                    } else {
+                        Some(PinModule::button(record.pin_a))
+                    });
+                }
+            }
+            Ok(if record.pin_a == 0xFF {
+                None
+            } else {
+                Some(PinModule::axis(record.pin_a))
+            })
+        }
         record_type::AXIS_ADS1115 => {
             *expanders = true;
             // G1: C++ (`rsh_cfg_blob_validate`, I2C-kinds branch) rejects
@@ -736,6 +777,43 @@ fn blob_record_module(
             Ok(Some(PinModule::axis_as5600()))
         }
         record_type::SHIFTER => Ok(None),
+        record_type::LED_CONFIG => {
+            // F-14 (v4.0.2): persistent LED config — no module (the
+            // strip pin comes from the type-6 LED_STRIP record), but
+            // the fields are validated exactly like C++
+            // (`rsh_cfg_blob_validate`, LED_CONFIG branch): slot 0,
+            // flags 0, no pins, pattern 0..4, brightness 0..100.
+            // The max-1-record count is enforced by
+            // `blob_limit_errors`.
+            if record.slot != 0 {
+                return Err(format!(
+                    "LED_CONFIG: slot {} invalid (must be 0)",
+                    record.slot
+                ));
+            }
+            if record.flags != 0 {
+                return Err(format!(
+                    "LED_CONFIG: flags 0x{:02x} invalid (must be 0)",
+                    record.flags
+                ));
+            }
+            if record.pin_a != 0xFF || record.pin_b != 0xFF || record.pin_c != 0xFF {
+                return Err("LED_CONFIG: uses no GPIO pin".to_string());
+            }
+            if record.params[0] > 4 {
+                return Err(format!(
+                    "LED_CONFIG: pattern {} out of range (0-4)",
+                    record.params[0]
+                ));
+            }
+            if record.params[4] > 100 {
+                return Err(format!(
+                    "LED_CONFIG: brightness {} out of range (0-100)",
+                    record.params[4]
+                ));
+            }
+            Ok(None)
+        }
         other => Err(format!("unknown record type {other}")),
     }
 }
@@ -750,6 +828,15 @@ fn shifter_errors(
 ) -> Vec<String> {
     let mut errs = Vec::new();
     let mode = record.params[0];
+    // D-4 (v4.0.2): sensitivity `params[4]` is checked before the
+    // mode — C++ reports it and skips the rest of the record.
+    if record.params[SHIFTER_SENSITIVITY_PARAM] > 100 {
+        errs.push(format!(
+            "SHIFTER: sensitivity {} out of range (0-100)",
+            record.params[SHIFTER_SENSITIVITY_PARAM]
+        ));
+        return errs;
+    }
     if mode > 1 {
         errs.push(format!(
             "SHIFTER: gate mode {mode} invalid (0 Sequential, 1 H-pattern)"
@@ -822,6 +909,7 @@ fn record_type_name(rec_type: u8) -> &'static str {
         record_type::AXIS_GENERIC => "AXIS_GENERIC",
         record_type::SHIFTER => "SHIFTER",
         record_type::AXIS_AS5600 => "AXIS_AS5600",
+        record_type::LED_CONFIG => "LED_CONFIG",
         _ => "UNKNOWN",
     }
 }
@@ -887,6 +975,15 @@ fn blob_limit_errors(blob: &ConfigBlob) -> Vec<String> {
         .count();
     if n_bat > 1 {
         errs.push(format!("too many battery modules ({n_bat} > 1)"));
+    }
+    // F-14 (v4.0.2): at most one persistent LED config record.
+    let n_ledcfg = blob
+        .records
+        .iter()
+        .filter(|r| r.rec_type == record_type::LED_CONFIG)
+        .count();
+    if n_ledcfg > 1 {
+        errs.push(format!("too many LED config records ({n_ledcfg} > 1)"));
     }
     let n_enc = blob
         .records
@@ -962,6 +1059,30 @@ fn shifter_pins(blob: &ConfigBlob) -> (ShifterPins, ShifterPins) {
     (gear, seq)
 }
 
+/// Shifter sensitivity (v4.0.2 D-4) of a blob: the first SHIFTER
+/// record's `params[4]` (0..100), or the default 50 when the blob
+/// has no SHIFTER record. (A record with `params[4] == 0` means 0,
+/// not "default" — the firmware returns the field as-is.)
+#[must_use]
+pub fn shifter_sensitivity(blob: &ConfigBlob) -> u8 {
+    blob.records
+        .iter()
+        .find(|r| r.rec_type == record_type::SHIFTER)
+        .map_or(SHIFTER_SENSITIVITY_DEFAULT, |r| {
+            r.params[SHIFTER_SENSITIVITY_PARAM]
+        })
+}
+
+/// Shifter sensitivity (0..100) → gear debounce / H-pattern
+/// stability time in ms, mirroring firmware
+/// `rsh_shifter_debounce_ms`: 0 → 20 ms, 50 → 13 ms (default),
+/// 100 → 5 ms. Out-of-range input is clamped to 100 first.
+#[must_use]
+pub fn shifter_debounce_ms(sensitivity: u8) -> u8 {
+    let sens = u16::from(sensitivity.min(100));
+    u8::try_from(20 - sens * 15 / 100).unwrap_or(0)
+}
+
 /// Validate a config blob's pin assignments against the board rules.
 ///
 /// Record → module mapping (§3.6): `AXIS_ADC` → axis, `AXIS_ADS1115` →
@@ -972,9 +1093,15 @@ fn shifter_pins(blob: &ConfigBlob) -> (ShifterPins, ShifterPins) {
 /// `BATTERY` → battery, expander records → expander buttons
 /// (`params[0]` expander pin), `AXIS_AS5600` → AS5600 axis.
 /// `SHIFTER` records are validated separately (gate mode, gear pins,
-/// H-pattern/encoder conflict). Records with a `0xFF` pin are treated
-/// as unassigned and skipped. `expanders` is auto-detected from the
-/// records (any I²C kind sets it).
+/// H-pattern/encoder conflict; sensitivity `params[4]` 0..100).
+/// `LED_CONFIG` records carry no pin and map to no module; their
+/// fields are validated (slot 0, flags 0, no pins, pattern 0..4,
+/// brightness 0..100, at most one record). A handbrake `AXIS_ADC` /
+/// `AXIS_GENERIC` record (slot 4) with flags bit0 set maps to a
+/// Button module (pull-up rule, not the ADC1 rule); any other flag
+/// bit on a slot-4 record is rejected. Records with a `0xFF` pin are
+/// treated as unassigned and skipped. `expanders` is auto-detected
+/// from the records (any I²C kind sets it).
 ///
 /// Blob-level counts follow the C++ firmware validator
 /// (`rsh_cfg_blob_validate`), not the module-level [`validate`]:
@@ -1727,5 +1854,193 @@ mod tests {
             errs.iter().any(|e| e == "too many battery modules (2 > 1)"),
             "expected battery limit error, got {errs:?}"
         );
+    }
+
+    // --- v4.0.2 regressions (F-14 LED_CONFIG, F-15 handbrake button
+    // mode, D-4 shifter sensitivity) ---
+    // Record bytes follow the firmware layouts in
+    // `firmware/config_transaction.h` (§3.6, type 13 / slot 4 /
+    // SHIFTER params[4]).
+
+    /// One valid `LED_CONFIG` record next to a valid axis: accepted,
+    /// no errors (previously: "unknown record type 13").
+    #[test]
+    fn led_config_valid_accepted() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "01 00 00 22 ff ff 00 00 00 00 00 00 00 00 00 00",
+            "0d 00 00 ff ff ff 01 0a 14 1e 32 00 00 00 00 00",
+        ]));
+        assert_eq!(errs, Vec::<String>::new(), "got {errs:?}");
+    }
+
+    #[test]
+    fn led_config_pattern_rejected() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "0d 00 00 ff ff ff 05 0a 14 1e 32 00 00 00 00 00",
+        ]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("LED_CONFIG") && e.contains("pattern 5")),
+            "expected LED_CONFIG pattern error, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn led_config_brightness_rejected() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "0d 00 00 ff ff ff 01 0a 14 1e 65 00 00 00 00 00",
+        ]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("LED_CONFIG") && e.contains("brightness 101")),
+            "expected LED_CONFIG brightness error, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn led_config_flags_rejected() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "0d 00 01 ff ff ff 01 0a 14 1e 32 00 00 00 00 00",
+        ]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("LED_CONFIG") && e.contains("flags")),
+            "expected LED_CONFIG flags error, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn led_config_pin_set_rejected() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "0d 00 00 19 ff ff 01 0a 14 1e 32 00 00 00 00 00",
+        ]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("LED_CONFIG") && e.contains("no GPIO pin")),
+            "expected LED_CONFIG pin error, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn led_config_slot_rejected() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "0d 01 00 ff ff ff 01 0a 14 1e 32 00 00 00 00 00",
+        ]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("LED_CONFIG") && e.contains("slot 1")),
+            "expected LED_CONFIG slot error, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn led_config_duplicate_rejected() {
+        let led = "0d 00 00 ff ff ff 01 0a 14 1e 32 00 00 00 00 00";
+        let errs = validate_blob(&blob_from_hex(&[
+            "01 00 00 22 ff ff 00 00 00 00 00 00 00 00 00 00",
+            led,
+            led,
+        ]));
+        assert!(
+            errs.iter()
+                .any(|e| e == "too many LED config records (2 > 1)"),
+            "expected LED_CONFIG duplicate error, got {errs:?}"
+        );
+    }
+
+    /// Handbrake `AXIS_ADC` slot 4, flags bit0, pin 25 (pull-up pin):
+    /// button mode — valid, no errors.
+    #[test]
+    fn handbrake_button_mode_valid() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "01 04 01 19 ff ff 00 00 00 00 00 00 00 00 00 00",
+        ]));
+        assert_eq!(errs, Vec::<String>::new(), "got {errs:?}");
+    }
+
+    /// Same record via `AXIS_GENERIC` (type 10): also button mode.
+    #[test]
+    fn handbrake_generic_button_mode_valid() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "0a 04 01 19 ff ff 00 00 00 00 00 00 00 00 00 00",
+        ]));
+        assert_eq!(errs, Vec::<String>::new(), "got {errs:?}");
+    }
+
+    #[test]
+    fn handbrake_button_mode_flags_rejected() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "01 04 03 19 ff ff 00 00 00 00 00 00 00 00 00 00",
+        ]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("handbrake axis") && e.contains("flags 0x03")),
+            "expected handbrake flags error, got {errs:?}"
+        );
+    }
+
+    /// Button mode on GPIO34 (input-only, no pull-up): the pull-up
+    /// rule rejects it — the ADC1 rule must NOT save it.
+    #[test]
+    fn handbrake_button_mode_no_pullup_rejected() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "01 04 01 22 ff ff 00 00 00 00 00 00 00 00 00 00",
+        ]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("GPIO34") && e.contains("pull-up")),
+            "expected GPIO34 pull-up error, got {errs:?}"
+        );
+    }
+
+    /// Handbrake slot 4, flags 0, pin 32: plain axis mode, unchanged.
+    #[test]
+    fn handbrake_axis_mode_unchanged() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "01 04 00 20 ff ff 00 00 00 00 00 00 00 00 00 00",
+        ]));
+        assert_eq!(errs, Vec::<String>::new(), "got {errs:?}");
+    }
+
+    /// Shifter sensitivity boundary: 100 accepted (sequential mode,
+    /// no gear pins).
+    #[test]
+    fn shifter_sensitivity_boundary_accepted() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "01 00 00 22 ff ff 00 00 00 00 00 00 00 00 00 00",
+            "0b 00 00 ff ff ff 00 00 00 00 64 00 00 00 00 00",
+        ]));
+        assert_eq!(errs, Vec::<String>::new(), "got {errs:?}");
+    }
+
+    #[test]
+    fn shifter_sensitivity_rejected() {
+        let errs = validate_blob(&blob_from_hex(&[
+            "0b 00 00 ff ff ff 00 00 00 00 65 00 00 00 00 00",
+        ]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("SHIFTER") && e.contains("sensitivity 101")),
+            "expected SHIFTER sensitivity error, got {errs:?}"
+        );
+    }
+
+    /// Sensitivity helper: default 50 with no SHIFTER record, the
+    /// record's field when present (0 means 0, not default), and the
+    /// debounce map from the firmware gate doc (0→20, 25→17, 50→13,
+    /// 75→9, 100→5).
+    #[test]
+    fn shifter_sensitivity_default_and_debounce() {
+        use super::{shifter_debounce_ms, shifter_sensitivity};
+        assert_eq!(shifter_sensitivity(&ConfigBlob::new(1, vec![])), 50);
+        let with_75 = blob_from_hex(&["0b 00 00 ff ff ff 00 00 00 00 4b 00 00 00 00 00"]);
+        assert_eq!(shifter_sensitivity(&with_75), 75);
+        let with_0 = blob_from_hex(&["0b 00 00 ff ff ff 00 00 00 00 00 00 00 00 00 00"]);
+        assert_eq!(shifter_sensitivity(&with_0), 0);
+        assert_eq!(shifter_debounce_ms(0), 20);
+        assert_eq!(shifter_debounce_ms(25), 17);
+        assert_eq!(shifter_debounce_ms(50), 13);
+        assert_eq!(shifter_debounce_ms(75), 9);
+        assert_eq!(shifter_debounce_ms(100), 5);
     }
 }

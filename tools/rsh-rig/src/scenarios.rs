@@ -1,6 +1,8 @@
 //! Scenario registry — the 26 C# rig scenarios plus `emit-200hz`
-//! (H-2, the 200 Hz coalescing probe), same IDs, same durations,
-//! same assertion shapes (`TESTING-INPUT.md` §8.4,
+//! (H-2, the 200 Hz coalescing probe) plus the 3 Phase-2 pairing
+//! scenarios (`pairing-window-open`, `pairing-window-expired`,
+//! `pairing-unreachable` — contract-only, duration 0), same IDs,
+//! same durations, same assertion shapes (`TESTING-INPUT.md` §8.4,
 //! `test-env/scenarios/scenarios.json` v1).
 //!
 //! # Rust adaptations (all deliberate, all documented here)
@@ -1129,6 +1131,54 @@ pub fn registry() -> Vec<Scenario> {
                     "M-1/L-5: auth-gate allowance (<= 4096 B). The pre-fix run showed 15456 B here — measured to be the rig's own neutral_times Vec growth (2001 neutral sends while gated, capacity doubling), NOT engine startup: the engine allocates nothing per tick (alloc gate) and its one-time setup happens before the measured window. The rig's neutral_times buffer is now pre-allocated (8192), so this allowance is a backstop, not an expectation.",
                 ),
             ],
+        },
+        // Phase 2 (V2-PHASE-2-GATE): pairing/window scenarios (Phase 0
+        // §4.4 gap — the rig had no pairing scenario). Contract-only
+        // self-checks over the L1 Connection Manager: window-open
+        // pairing succeeds, window-expired pairing fails closed with
+        // the typed reason, board-unreachable fails closed with a
+        // distinct reason. No wheel, no UDP — the manager is pure.
+        Scenario {
+            id: "pairing-window-open",
+            description: "Pairing with the window open: HELLO (unpaired, window open) -> Authenticating -> GET_CAPS ok -> Active.",
+            durations: (0, 0, 0),
+            wheel: WheelConfig::default(),
+            harness: HarnessConfig::default(),
+            assertions: vec![Assertion {
+                metric: "selfCheck",
+                op: "==",
+                value: MetricValue::Str("pass"),
+                note: "Self-check PASS: window-open pairing reaches Active (Connected) via the L1 Connection Manager.",
+                min_duration_s: 0.0,
+            }],
+        },
+        Scenario {
+            id: "pairing-window-expired",
+            description: "Pairing with the window expired: HELLO (unpaired, window closed) -> Error(WindowClosed), auto-retry stopped, never Active.",
+            durations: (0, 0, 0),
+            wheel: WheelConfig::default(),
+            harness: HarnessConfig::default(),
+            assertions: vec![Assertion {
+                metric: "selfCheck",
+                op: "==",
+                value: MetricValue::Str("pass"),
+                note: "Self-check PASS: window-expired pairing fails closed with typed reason WindowClosed and no auto-retry.",
+                min_duration_s: 0.0,
+            }],
+        },
+        Scenario {
+            id: "pairing-unreachable",
+            description: "Pairing with no board: 3 HELLO timeouts -> Error(Unreachable), a reason distinct from WindowClosed, never Active.",
+            durations: (0, 0, 0),
+            wheel: WheelConfig::default(),
+            harness: HarnessConfig::default(),
+            assertions: vec![Assertion {
+                metric: "selfCheck",
+                op: "==",
+                value: MetricValue::Str("pass"),
+                note: "Self-check PASS: unreachable board fails closed with typed reason Unreachable (distinct from WindowClosed).",
+                min_duration_s: 0.0,
+            }],
         },
     ]
 }

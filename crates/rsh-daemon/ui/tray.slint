@@ -1,0 +1,405 @@
+// RSH tray icon + menu (REDESIGN-PLAN §7.7/§7.8, TrayMenu.html).
+// Reuses the Phase 1 spike's SystemTrayIcon approach (docs/
+// V2-PHASE-1-SPIKE.md §3): the built-in `clicked` is forwarded in
+// .slint (`clicked => { tray-clicked(); }`) because it is not
+// exposed as `on_clicked` in the generated Rust API in 1.18.1.
+// The daemon owns this icon from startup (A-09) — it is created on
+// every launch, not only --tray. The tray popup window itself lands
+// in Phase 7; left-click currently signals "open UI" to the daemon
+// (the UI open hook lands in Phase 3).
+
+export component RshTray inherits SystemTrayIcon {
+    icon: @image-url("../assets/tray.png");
+    tooltip: "RSH — Real Sim Hub";
+    title: "RSH Wheel";
+    in property <bool> send-to-game;
+    in property <string> status-text: "Disconnected";
+    callback open-main();
+    callback toggled-send();
+    callback tray-clicked();
+    callback profile-selected(string);
+    callback launch-game(string);
+    callback restart-wheel();
+    callback open-settings();
+    callback quit-app();
+
+    clicked => { tray-clicked(); }
+
+    Menu {
+        MenuItem { title: "Open RSH"; activated => { open-main(); } }
+        MenuItem { title: "Send to game"; checked: send-to-game; activated => { toggled-send(); } }
+        Menu {
+            title: "Profile";
+            MenuItem { title: "Default"; checked: true; activated => { profile-selected("Default"); } }
+        }
+        MenuSeparator {}
+        Menu {
+            title: "Launch game";
+            MenuItem { title: "Assetto Corsa"; activated => { launch-game("Assetto Corsa"); } }
+            MenuItem { title: "AC Competizione"; activated => { launch-game("AC Competizione"); } }
+            MenuItem { title: "iRacing"; activated => { launch-game("iRacing"); } }
+        }
+        MenuItem { title: "Restart wheel"; activated => { restart-wheel(); } }
+        MenuSeparator {}
+        MenuItem { title: "Settings"; activated => { open-settings(); } }
+        MenuItem { title: "Quit RSH"; activated => { quit-app(); } }
+    }
+}
+
+// Tray popup (REDESIGN-PLAN §7.7, preview `Tray.html`), 340x440.
+// Left-click on the tray icon toggles this window; the daemon
+// positions it next to the tray icon (see `tray_geometry.rs` +
+// `tray_popup.rs`) and closes it on click-outside (Windows
+// foreground poll in the daemon; Escape here). The menu above is
+// the platform-native menu (§7.8) — its items are wired in
+// `main.rs`; the status header from `TrayMenu.html` lives here, in
+// the popup header, because a native menu cannot render one.
+// Live values come from the daemon's `AppApi` via `tray_popup.rs`;
+// the Rust side pushes them on a timer while the popup is visible.
+export component TrayPopup inherits Window {
+    title: "RSH Wheel — Tray";
+    no-frame: true;
+    width: 340px;
+    height: 440px;
+    background: #11161f;
+
+    in property <string> conn-label: "Disconnected";
+    in property <string> conn-sub: "Wi-Fi";
+    in property <bool> connected: false;
+    in property <bool> send-to-game: false;
+    in property <angle> steer-angle: 0deg;
+    in property <string> steer-text: "+0°";
+    in property <float> throttle: 0;
+    in property <float> brake: 0;
+    in property <float> clutch: 0;
+    in property <string> throttle-text: "0%";
+    in property <string> brake-text: "0%";
+    in property <string> clutch-text: "0%";
+    in property <string> profile-name: "Default";
+    in property <string> profile-sub: "Auto";
+    in property <string> game0-id: "";
+    in property <string> game0-name: "";
+    in property <string> game0-initials: "";
+    in property <string> game0-state: "";
+    in property <bool> game0-can-launch: false;
+    in property <string> game1-id: "";
+    in property <string> game1-name: "";
+    in property <string> game1-initials: "";
+    in property <string> game1-state: "";
+    in property <bool> game1-can-launch: false;
+    in property <string> game2-id: "";
+    in property <string> game2-name: "";
+    in property <string> game2-initials: "";
+    in property <string> game2-state: "";
+    in property <bool> game2-can-launch: false;
+
+    callback toggled-send();
+    callback open-main();
+    callback restart-wheel();
+    callback launch-game(string);
+    callback cycle-profile();
+    callback close-popup();
+
+    FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.close-popup();
+                accept
+            } else {
+                reject
+            }
+        }
+        VerticalLayout {
+            padding: 14px;
+            spacing: 10px;
+
+            // Header: logo, name + status, Send-to-game switch.
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: start;
+                Rectangle {
+                    width: 30px;
+                    height: 30px;
+                    border-radius: 8px;
+                    background: #2f6bff;
+                    Text {
+                        text: "R";
+                        color: #ffffff;
+                        font-size: 15px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                VerticalLayout {
+                    spacing: 0px;
+                    Text {
+                        text: "RSH Wheel";
+                        color: #e9edf4;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Rectangle {
+                            width: 7px;
+                            height: 7px;
+                            border-radius: 4px;
+                            background: connected ? #3dd68c : #ff6b6b;
+                        }
+                        Text {
+                            text: conn-label + " · " + conn-sub;
+                            color: #9aa5b8;
+                            font-size: 12px;
+                        }
+                    }
+                }
+                Rectangle {
+                    // Send-to-game switch (right-aligned).
+                    width: 40px;
+                    height: 22px;
+                    border-radius: 11px;
+                    background: send-to-game ? #2f6bff : #232c3c;
+                    Rectangle {
+                        x: send-to-game ? 21px : 3px;
+                        y: 3px;
+                        width: 16px;
+                        height: 16px;
+                        border-radius: 8px;
+                        background: #ffffff;
+                    }
+                    TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => { root.toggled-send(); }
+                    }
+                }
+            }
+
+            // Live wheel + 3 bars.
+            Rectangle {
+                background: #161c27;
+                border-width: 1px;
+                border-color: #262f40;
+                border-radius: 12px;
+                height: 88px;
+                HorizontalLayout {
+                    padding: 12px;
+                    spacing: 14px;
+                    Rectangle {
+                        width: 64px;
+                        height: 64px;
+                        border-radius: 32px;
+                        border-width: 6px;
+                        border-color: #2a3446;
+                        Image {
+                            // Steering marker, rotated by the live angle.
+                            // (Rectangle has no rotation in Slint 1.18 —
+                            // same Image + transform-rotation pattern as
+                            // WheelGraphic in rsh-ui.)
+                            width: 64px;
+                            height: 64px;
+                            source: @image-url("../assets/wheel-marker.svg");
+                            transform-rotation: steer-angle;
+                            transform-origin: { x: 32px, y: 32px };
+                        }
+                        Text {
+                            text: steer-text;
+                            color: #e9edf4;
+                            font-size: 11px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 7px;
+                        alignment: center;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text { text: "Throttle"; color: #9aa5b8; font-size: 11px; width: 46px; }
+                            Rectangle {
+                                height: 6px;
+                                background: #232c3c;
+                                border-radius: 3px;
+                                Rectangle {
+                                    width: parent.width * throttle / 100;
+                                    height: 6px;
+                                    background: #3dd68c;
+                                    border-radius: 3px;
+                                }
+                            }
+                            Text { text: throttle-text; color: #e9edf4; font-size: 11px; width: 30px; horizontal-alignment: right; }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text { text: "Brake"; color: #9aa5b8; font-size: 11px; width: 46px; }
+                            Rectangle {
+                                height: 6px;
+                                background: #232c3c;
+                                border-radius: 3px;
+                                Rectangle {
+                                    width: parent.width * brake / 100;
+                                    height: 6px;
+                                    background: #ff6b6b;
+                                    border-radius: 3px;
+                                }
+                            }
+                            Text { text: brake-text; color: #e9edf4; font-size: 11px; width: 30px; horizontal-alignment: right; }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text { text: "Clutch"; color: #9aa5b8; font-size: 11px; width: 46px; }
+                            Rectangle {
+                                height: 6px;
+                                background: #232c3c;
+                                border-radius: 3px;
+                                Rectangle {
+                                    width: parent.width * clutch / 100;
+                                    height: 6px;
+                                    background: #2f6bff;
+                                    border-radius: 3px;
+                                }
+                            }
+                            Text { text: clutch-text; color: #e9edf4; font-size: 11px; width: 30px; horizontal-alignment: right; }
+                        }
+                    }
+                }
+            }
+
+            // Profile selector (click cycles to the next profile).
+            Rectangle {
+                background: #161c27;
+                border-width: 1px;
+                border-color: #262f40;
+                border-radius: 9px;
+                height: 34px;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    Text { text: profile-name; color: #e9edf4; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+                    Text { text: profile-sub; color: #9aa5b8; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                }
+                TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    clicked => { root.cycle-profile(); }
+                }
+            }
+
+            Text { text: "GAMES"; color: #7c879b; font-size: 11px; font-weight: 600; letter-spacing: 1px; }
+            HorizontalLayout {
+                spacing: 10px;
+                height: 38px;
+                Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 6px;
+                    background: #1d2533;
+                    Text { text: game0-initials; color: #8eb0ff; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Text { text: game0-name; color: #e9edf4; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+                if game0-can-launch: Rectangle {
+                    width: 60px;
+                    height: 24px;
+                    border-radius: 6px;
+                    background: #2f6bff;
+                    Text { text: "Launch"; color: #ffffff; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => { root.launch-game(game0-id); }
+                    }
+                }
+                if !game0-can-launch: Text { text: game0-state; color: #9aa5b8; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                height: 38px;
+                Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 6px;
+                    background: #1d2533;
+                    Text { text: game1-initials; color: #8eb0ff; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Text { text: game1-name; color: #e9edf4; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+                if game1-can-launch: Rectangle {
+                    width: 60px;
+                    height: 24px;
+                    border-radius: 6px;
+                    background: #2f6bff;
+                    Text { text: "Launch"; color: #ffffff; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => { root.launch-game(game1-id); }
+                    }
+                }
+                if !game1-can-launch: Text { text: game1-state; color: #9aa5b8; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+            }
+            HorizontalLayout {
+                spacing: 10px;
+                height: 38px;
+                Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 6px;
+                    background: #1d2533;
+                    Text { text: game2-initials; color: #8eb0ff; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Text { text: game2-name; color: #e9edf4; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+                if game2-can-launch: Rectangle {
+                    width: 60px;
+                    height: 24px;
+                    border-radius: 6px;
+                    background: #2f6bff;
+                    Text { text: "Launch"; color: #ffffff; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => { root.launch-game(game2-id); }
+                    }
+                }
+                if !game2-can-launch: Text { text: game2-state; color: #9aa5b8; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+            }
+
+            // Footer.
+            Rectangle {
+                height: 1px;
+                background: #262f40;
+            }
+            HorizontalLayout {
+                Rectangle {
+                    Text {
+                        text: "Open RSH";
+                        color: #8eb0ff;
+                        font-size: 12px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => { root.open-main(); }
+                    }
+                }
+                Rectangle {
+                    Text {
+                        text: "Restart wheel";
+                        color: #9aa5b8;
+                        font-size: 12px;
+                        font-weight: 500;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                    }
+                    TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => { root.restart-wheel(); }
+                    }
+                }
+            }
+        }
+    }
+}
