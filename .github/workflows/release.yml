@@ -30,7 +30,7 @@
 #      `src-tauri/binaries/…` — the v2.0 installer picks the exe up
 #      from there, the Tauri shell itself is not built).
 #   2. Gates: `cargo fmt --check`, `cargo clippy --workspace
-#      --exclude src-tauri` (Windows — every non-Tauri member),
+#      --exclude rsh-app` (Windows — every non-Tauri member),
 #      `cargo test -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc
 #      --release` (the ship crates, release mode — the one
 #      release-only proof; the debug full suite is CI's job),
@@ -205,10 +205,13 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy --workspace --exclude src-tauri (warnings denied)
+      - name: cargo clippy --workspace --exclude rsh-app (warnings denied)
         # Windows runner: every non-Tauri member compiles here
-        # (src-tauri is excluded — v2.0 does not build or ship it).
-        run: cargo clippy --workspace --exclude src-tauri --all-targets -- -D warnings
+        # (rsh-app is excluded — v2.0 does not build or ship it;
+        # the package name is rsh-app, NOT src-tauri: --exclude
+        # src-tauri does not match it and clippy then compiles the
+        # Tauri shell, which panics on the missing frontend/dist).
+        run: cargo clippy --workspace --exclude rsh-app --all-targets -- -D warnings
 
       - name: cargo test (ship crates, --release)
         # The debug full suite runs in CI on every push (user order:
