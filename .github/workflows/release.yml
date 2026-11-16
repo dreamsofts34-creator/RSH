@@ -282,7 +282,13 @@ jobs:
           !include "LogicLib.nsh"
           !define VERSION "${VERSION}"
           Name "RSH"
-          OutFile "release-staging\RSH_${VERSION}_x64-setup.exe"
+          ; NOTE: makensis changes its working directory to the
+          ; script's directory (installer/), so every path below is
+          ; relative to installer/ — hence the ..\ prefix. (Release
+          ; run 43878025293 failed here: "target\release\..." was
+          ; resolved as installer\target\release\..., which does not
+          ; exist.)
+          OutFile "..\release-staging\RSH_${VERSION}_x64-setup.exe"
           InstallDir "$PROGRAMFILES64\RSH"
           InstallDirRegKey HKLM "Software\RSH" "InstallDir"
           RequestExecutionLevel admin
@@ -292,11 +298,11 @@ jobs:
           ; "Send to game" is turned on).
           Section "RSH"
             SetOutPath "$INSTDIR"
-            File "target\release\rsh-daemon.exe"
-            File "target\release\rsh-ui.exe"
+            File "..\target\release\rsh-daemon.exe"
+            File "..\target\release\rsh-ui.exe"
             ; Sidecar MUST sit beside rsh-daemon.exe: the daemon resolves it
             ; as <own exe dir>\rsh-hm-sidecar.exe (resolve_sidecar_path).
-            File "/oname=rsh-hm-sidecar.exe" "src-tauri\binaries\rsh-hm-sidecar-x86_64-pc-windows-msvc.exe"
+            File "/oname=rsh-hm-sidecar.exe" "..\src-tauri\binaries\rsh-hm-sidecar-x86_64-pc-windows-msvc.exe"
             WriteRegStr HKLM "Software\RSH" "InstallDir" "$INSTDIR"
             WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "DisplayName" "RSH ${VERSION}"
             WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "UninstallString" "$INSTDIR\uninstall.exe"
