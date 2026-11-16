@@ -8,22 +8,22 @@
 // Backend state (verified against source, 2026-11-16):
 // - Handbrake button mode EXISTS in firmware v4.0.2 (F-15: pinmap
 //   handbrakeButtonMode, AXIS slot-4 flags bit0). The AppApi exposes NO
-//   method to read/set it yet, so `handbrake-mode` is a Rust-owned prop
-//   (0 Axis, 1 Button) and `handbrake-mode-selected` is the integration
-//   seam for the config push. Button mode shows a live pressed tile
-//   instead of the axis bar/curve.
-// - Shifter: firmware reports H-pattern gear 0=neutral, 1..6 (inputs.h)
-//   and sequential up/down; sensitivity is a UI-side tuning value until
-//   the engine push lands — `sensitivity-changed` is the seam.
-// - Horn: learn/test are callbacks; the horn button mapping itself lives
-//   in the Buttons screen's mapping store.
-// - LEDs: firmware LED record type 13 exists (protocol config.rs) and
-//   rsh-led defines patterns 0–4 Off/Solid/Blink/Chase/Rainbow. No
-//   AppApi method yet — `pattern-selected` / `brightness-changed` /
-//   `color-selected` are the seams; `led-preview` is the live strip
-//   state Rust pushes (8 circles).
+//   method to read/set it, so `handbrake-mode` stays Axis (0) unless
+//   the mode lands — the segmented click explains itself.
+// - Shifter gate IS a set_tuning field (shifter_gate): Rust seeds
+//   `shifter-mode` from get_tuning("shifter"). Sensitivity has NO
+//   backend field — its slider is disabled with a reason (A6).
+// - Horn button IS a set_tuning field (horn_button): Learn arms
+//   start_learn and take_learned_button supplies the picked button.
+// - LEDs ARE set_tuning fields (led_brightness, led_pattern): the
+//   pattern chips + brightness slider push through set_tuning("led").
+//   Colour has NO backend field — swatches show a reason (A6).
+// - Handbrake deadzone/feel/mV come from get_tuning("handbrake");
+//   Set up/down need calibrate_pedal (BACKEND-2 seam) and stay
+//   disabled with a reason until it lands (A2).
 // Live values (handbrake pct, gear) are Rust-owned props fed from the
-// snapshot/sim feed; nothing here talks to the daemon directly.
+// snapshot; the snapshot carries neither, so both read "—" / 0 until
+// the API grows them (A7). Nothing here talks to the daemon directly.
 
 import { Theme } from "../tokens.slint";
 import { Card, Switch, Btn, SliderRow, RangeBlock, PresetChip, ButtonTile, SegmentedControl } from "../components.slint";
@@ -99,22 +99,29 @@ export component ExtrasScreen inherits VerticalLayout {
     in-out property <bool> leds-on: true;
     // ---- handbrake (live)
     in property <float> handbrake-pct: 0;
-    in property <string> handbrake-up-mv: "500 mV";
-    in property <string> handbrake-down-mv: "3050 mV";
+    in property <string> handbrake-up-mv: "—";
+    in property <string> handbrake-down-mv: "—";
     in property <int> handbrake-feel: 0; // 0 Linear, 1 Soft, 2 Sharp
     in property <float> handbrake-deadzone: 0.2; // 0..1 (of 10%)
-    in property <string> handbrake-deadzone-text: "2%";
+    in property <string> handbrake-deadzone-text: "—";
     in property <string> handbrake-curve: "M 6 104 C 30 100, 60 85, 104 6";
     in property <string> handbrake-dashed: "M 6 104 L 104 6";
     in property <float> handbrake-marker-x: 55;
     in property <float> handbrake-marker-y: 55;
+    // A2/A6: Set up/down need the calibration backend — Rust sets
+    // this false only once calibrate_pedal exists; the reason is
+    // shown under the range block.
+    in property <bool> calibration-disabled: true;
     in property <int> handbrake-mode: 0; // 0 Axis, 1 Button (F-15)
     in property <bool> handbrake-pressed: false; // button-mode live state
     // ---- shifter (live)
-    in property <string> gear: "N"; // N / 1..6 (H-pattern) or sequential
+    in property <string> gear: "—"; // "—" until the wheel reports a gear (A7)
     in property <int> shifter-mode: 0; // 0 Sequential, 1 H-pattern
     in property <float> shifter-sensitivity: 0.6; // 0..1
-    in property <string> shifter-sensitivity-text: "60%";
+    // A6: no set_tuning field carries sensitivity, so the slider is
+    // disabled with a reason instead of pretending to work.
+    in property <bool> sensitivity-disabled: true;
+    in property <string> shifter-sensitivity-text: "—";
     // ---- horn
     in property <string> horn-button: "Button 3";
     in property <bool> horn-learning: false;
@@ -122,7 +129,7 @@ export component ExtrasScreen inherits VerticalLayout {
     // ---- LEDs
     in property <int> led-pattern: 1; // 0 Off, 1 Solid, 2 Blink, 3 Chase, 4 Rainbow
     in property <float> led-brightness: 0.8; // 0..1
-    in property <string> led-brightness-text: "80%";
+    in property <string> led-brightness-text: "—";
     in property <int> led-color: 3; // swatch index 0..5
     in property <[color]> led-preview;
 
@@ -130,9 +137,11 @@ export component ExtrasScreen inherits VerticalLayout {
     callback handbrake-mode-selected(int);
     callback handbrake-feel-selected(int);
     callback handbrake-deadzone-changed(float);
+    callback handbrake-deadzone-edited(string);
     callback shifter-sensitivity-changed(float);
     callback led-pattern-selected(int);
     callback led-brightness-changed(float);
+    callback led-brightness-edited(string);
     callback led-color-selected(int);
 
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
@@ -195,14 +204,15 @@ export component ExtrasScreen inherits VerticalLayout {
                                 }
                             }
                         }
-                        RangeBlock { up-value: handbrake-up-mv; down-value: handbrake-down-mv; set-up => { action("handbrake-up"); } set-down => { action("handbrake-down"); } }
+                        RangeBlock { up-value: handbrake-up-mv; down-value: handbrake-down-mv; up-disabled: calibration-disabled; down-disabled: calibration-disabled; set-up => { action("handbrake-up"); } set-down => { action("handbrake-down"); } }
+                        if calibration-disabled : Text { text: "Calibration capture needs a later wheel update."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
                         HorizontalLayout {
                             spacing: 4px;
                             PresetChip { horizontal-stretch: 1; label: "Linear"; active: handbrake-feel == 0; clicked => { handbrake-feel-selected(0); } }
                             PresetChip { horizontal-stretch: 1; label: "Soft"; active: handbrake-feel == 1; clicked => { handbrake-feel-selected(1); } }
                             PresetChip { horizontal-stretch: 1; label: "Sharp"; active: handbrake-feel == 2; clicked => { handbrake-feel-selected(2); } }
                         }
-                        SliderRow { label: "Deadzone"; hint: "Ignore tiny movements"; value-text: handbrake-deadzone-text; value: handbrake-deadzone; changed(v) => { handbrake-deadzone-changed(v); } }
+                        SliderRow { label: "Deadzone"; hint: "Ignores small inputs"; value-text: handbrake-deadzone-text; value: handbrake-deadzone; changed(v) => { handbrake-deadzone-changed(v); } value-edited(t) => { handbrake-deadzone-edited(t); } }
                     }
                     if handbrake-mode == 1 : VerticalLayout {
                         spacing: 10px;
@@ -224,16 +234,17 @@ export component ExtrasScreen inherits VerticalLayout {
                     spacing: 10px;
                     Text { text: gear; font-family: Theme.font-mono; font-size: 44px; font-weight: 600; color: Theme.text; horizontal-alignment: center; }
                     Text { text: shifter-mode == 1 ? "H-pattern · current gear" : "Sequential · current gear"; font-size: 12px; color: Theme.mute; horizontal-alignment: center; }
-                    SliderRow { label: "Sensitivity"; hint: "How firm the shift feels"; value-text: shifter-sensitivity-text; value: shifter-sensitivity; changed(v) => { shifter-sensitivity-changed(v); } }
+                    SliderRow { label: "Sensitivity"; hint: "Shift firmness"; value-text: shifter-sensitivity-text; value: shifter-sensitivity; disabled: sensitivity-disabled; changed(v) => { shifter-sensitivity-changed(v); } }
+                    if sensitivity-disabled : Text { text: "Sensitivity has no wheel setting yet."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
                     Text {
                         text: "Change gear mapping in Buttons";
                         font-size: 12px;
                         font-weight: 600;
-                        color: fs.has-focus ? white : Theme.accent-text;
+                        color: gear-fs.has-focus ? white : Theme.accent-text;
                         accessible-label: "Change gear mapping in Buttons";
                         accessible-role: button;
                         // FIX-4: keyboard activation for this text link.
-                        fs := FocusScope {
+                        gear-fs := FocusScope {
                             width: 100%;
                             height: 100%;
                             key-pressed(event) => {
@@ -301,10 +312,11 @@ export component ExtrasScreen inherits VerticalLayout {
                         PresetChip { horizontal-stretch: 1; label: "Chase"; active: led-pattern == 3; clicked => { led-pattern-selected(3); } }
                         PresetChip { horizontal-stretch: 1; label: "Rainbow"; active: led-pattern == 4; clicked => { led-pattern-selected(4); } }
                     }
-                    SliderRow { label: "Brightness"; hint: "LED strip brightness"; value-text: led-brightness-text; value: led-brightness; changed(v) => { led-brightness-changed(v); } }
+                    SliderRow { label: "Brightness"; hint: "Brightness"; value-text: led-brightness-text; value: led-brightness; changed(v) => { led-brightness-changed(v); } value-edited(t) => { led-brightness-edited(t); } }
                     if led-pattern == 1 : VerticalLayout {
                         spacing: 6px;
                         Text { text: "Colour"; font-size: 12.5px; font-weight: 500; color: Theme.text; }
+                        Text { text: "Colour isn't stored on the wheel yet."; font-size: 11.5px; color: Theme.faint; }
                         HorizontalLayout {
                             spacing: 8px;
                             for s[i] in [#FF6B6B, #F5B84A, #3DD68C, #2F6BFF, #B46CFF, #FFFFFF] : Rectangle {
@@ -316,7 +328,7 @@ export component ExtrasScreen inherits VerticalLayout {
                                 background: s;
                                 accessible-label: "LED colour " + (i + 1);
                                 accessible-role: button;
-                                fs := FocusScope {
+                                color-fs := FocusScope {
                                     width: 100%;
                                     height: 100%;
                                     key-pressed(event) => {

@@ -8,12 +8,27 @@
 // in Phase 7; left-click currently signals "open UI" to the daemon
 // (the UI open hook lands in Phase 3).
 
+struct ProfileMenuItem {
+    name: string,
+    active: bool,
+}
+
+struct GameMenuItem {
+    id: string,
+    name: string,
+}
+
 export component RshTray inherits SystemTrayIcon {
     icon: @image-url("../assets/tray.png");
     tooltip: "RSH — Real Sim Hub";
     title: "RSH Wheel";
     in property <bool> send-to-game;
     in property <string> status-text: "Disconnected";
+    // Real menu models (A25): the daemon fills these from the live
+    // profile/game store at tray creation — no hardcoded "Default"
+    // or game names (a stale "Default" item resolved to nothing).
+    in property <[ProfileMenuItem]> profile-items;
+    in property <[GameMenuItem]> game-items;
     callback open-main();
     callback toggled-send();
     callback tray-clicked();
@@ -30,14 +45,12 @@ export component RshTray inherits SystemTrayIcon {
         MenuItem { title: "Send to game"; checked: send-to-game; activated => { toggled-send(); } }
         Menu {
             title: "Profile";
-            MenuItem { title: "Default"; checked: true; activated => { profile-selected("Default"); } }
+            for item in profile-items: MenuItem { title: item.name; checked: item.active; activated => { profile-selected(item.name); } }
         }
         MenuSeparator {}
         Menu {
             title: "Launch game";
-            MenuItem { title: "Assetto Corsa"; activated => { launch-game("Assetto Corsa"); } }
-            MenuItem { title: "AC Competizione"; activated => { launch-game("AC Competizione"); } }
-            MenuItem { title: "iRacing"; activated => { launch-game("iRacing"); } }
+            for g in game-items: MenuItem { title: g.name; activated => { launch-game(g.id); } }
         }
         MenuItem { title: "Restart wheel"; activated => { restart-wheel(); } }
         MenuSeparator {}

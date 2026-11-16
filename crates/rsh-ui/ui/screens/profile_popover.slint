@@ -101,10 +101,13 @@ export component ProfilePopover inherits Card {
     callback use-preset(int);
     callback use-profile(int);
     callback new-profile();
-    callback duplicate-selected();
-    callback rename-selected();
-    callback delete-selected();
-    callback link-selected();
+    // v2.0.1 hotfix (A8): row actions pass the selected row index —
+    // Rust cannot read the popover's own `selected` property, so the
+    // index rides in the callback (0..presets-1 = preset, rest = profile).
+    callback duplicate-selected(int);
+    callback rename-selected(int);
+    callback delete-selected(int);
+    callback link-selected(int);
     callback save-and-switch();
     callback discard-and-switch();
     callback cancel-switch();
@@ -163,11 +166,11 @@ export component ProfilePopover inherits Card {
         HorizontalLayout {
             spacing: 6px;
             Btn { label: "New"; clicked => { new-profile(); } }
-            Btn { label: "Duplicate"; clicked => { duplicate-selected(); } }
-            Btn { label: "Rename"; clicked => { rename-selected(); } }
-            Btn { label: "Delete"; clicked => { delete-selected(); } }
+            Btn { label: "Duplicate"; clicked => { duplicate-selected(selected); } }
+            Btn { label: "Rename"; clicked => { rename-selected(selected); } }
+            Btn { label: "Delete"; clicked => { delete-selected(selected); } }
         }
-        Btn { label: "Link to game"; clicked => { link-selected(); } }
+        Btn { label: "Link to game"; clicked => { link-selected(selected); } }
         Text { text: "Presets are read-only — duplicate one to edit it."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
         // Save / Discard prompt (§8.4): switching with unsaved changes
         if show-unsaved-prompt : Rectangle {

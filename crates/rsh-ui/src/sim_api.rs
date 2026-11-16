@@ -19,7 +19,8 @@ use std::sync::Mutex;
 
 use rsh_api::{
     app_version, connection::ConnectionState, validate_tuning, ApiTransport, AppApi,
-    ConnectionInfo, DraftStatus, PairingInfo, SnapshotInfo, TuningSettings, UserError,
+    CalibrationInfo, ConnectionError, ConnectionInfo, DiagStats, DraftStatus, GameSummary,
+    PairingInfo, ProfileSummary, SnapshotInfo, TuningSettings, UserError, VjoyStatus,
 };
 
 /// Simulated live state: just a clock and the output flag.
@@ -28,6 +29,8 @@ pub struct SimApi {
     send_to_game: Mutex<bool>,
     tunings: Mutex<BTreeMap<String, TuningSettings>>,
     dirty_modules: Mutex<BTreeSet<String>>,
+    autostart: Mutex<bool>,
+    backend: Mutex<String>,
 }
 
 impl SimApi {
@@ -39,6 +42,10 @@ impl SimApi {
             send_to_game: Mutex::new(true),
             tunings: Mutex::new(BTreeMap::new()),
             dirty_modules: Mutex::new(BTreeSet::new()),
+            // Fresh-store default (v2.0.1): the always-on daemon
+            // autostarts, and vJoy is the default backend.
+            autostart: Mutex::new(true),
+            backend: Mutex::new("vJoy".to_string()),
         }
     }
 
@@ -67,6 +74,15 @@ impl SimApi {
         if let Ok(mut tunings) = self.tunings.lock() {
             tunings.clear();
         }
+    }
+
+    /// Honest error for calls that only the daemon can serve — the
+    /// sim never fakes a success or a value for these.
+    fn needs_daemon(method: &str) -> UserError {
+        UserError::from_connection(
+            ConnectionError::Unknown,
+            format!("{method} needs the daemon"),
+        )
     }
 }
 
@@ -201,6 +217,114 @@ impl AppApi for SimApi {
         }
         had_dirty
     }
+
+    fn autostart(&self) -> bool {
+        self.autostart.lock().map_or(true, |flag| *flag)
+    }
+
+    fn set_autostart(&self, enabled: bool) -> Result<bool, UserError> {
+        if let Ok(mut flag) = self.autostart.lock() {
+            *flag = enabled;
+        }
+        Ok(enabled)
+    }
+
+    fn firmware_version(&self) -> String {
+        "4.0.2".to_string()
+    }
+
+    fn output_backend(&self) -> String {
+        self.backend
+            .lock()
+            .map_or_else(|_| "vJoy".to_string(), |name| name.clone())
+    }
+
+    fn set_output_backend(&self, name: &str) -> Result<String, UserError> {
+        if !matches!(name, "HIDMaestro" | "vJoy") {
+            return Err(UserError::from_connection(
+                rsh_api::ConnectionError::Unknown,
+                format!("unknown output backend '{name}' (expected HIDMaestro or vJoy)"),
+            ));
+        }
+        if let Ok(mut backend) = self.backend.lock() {
+            *backend = name.to_string();
+        }
+        Ok(name.to_string())
+    }
+
+    fn backup_now(&self) -> Result<String, UserError> {
+        // The sim must not pretend a backup happened: there is no
+        // daemon store behind it.
+        Err(UserError::from_connection(
+            rsh_api::ConnectionError::Unknown,
+            "backup needs the daemon",
+        ))
+    }
+
+    // v2.0.1 hotfix: the sim never invents profiles, games, or
+    // learn picks — lists are empty, fallible calls error honestly
+    // (the UI must show "needs the daemon", never fake data).
+    fn list_profiles(&self) -> Vec<ProfileSummary> {
+        Vec::new()
+    }
+
+    fn activate_profile(&self, _id: &str) -> Result<String, UserError> {
+        Err(Self::needs_daemon("activate_profile"))
+    }
+
+    fn create_profile(&self, _name: &str) -> Result<String, UserError> {
+        Err(Self::needs_daemon("create_profile"))
+    }
+
+    fn duplicate_profile(&self, _id: &str) -> Result<String, UserError> {
+        Err(Self::needs_daemon("duplicate_profile"))
+    }
+
+    fn delete_profile(&self, _id: &str) -> Result<bool, UserError> {
+        Err(Self::needs_daemon("delete_profile"))
+    }
+
+    fn list_games(&self) -> Vec<GameSummary> {
+        Vec::new()
+    }
+
+    fn launch_game(&self, _id: &str) -> Result<GameSummary, UserError> {
+        Err(Self::needs_daemon("launch_game"))
+    }
+
+    fn stop_game(&self, _id: &str) -> Result<GameSummary, UserError> {
+        Err(Self::needs_daemon("stop_game"))
+    }
+
+    fn game_state(&self, _id: &str) -> Result<GameSummary, UserError> {
+        Err(Self::needs_daemon("game_state"))
+    }
+
+    fn start_learn(&self) -> Result<bool, UserError> {
+        Err(Self::needs_daemon("start_learn"))
+    }
+
+    fn cancel_learn(&self) -> Result<bool, UserError> {
+        Err(Self::needs_daemon("cancel_learn"))
+    }
+
+    // v2.0.1 hotfix BACKEND-2: the sim never fakes a calibration, a
+    // vJoy install, or diagnostics — all four need the daemon.
+    fn calibration(&self) -> Result<CalibrationInfo, UserError> {
+        Err(Self::needs_daemon("calibration"))
+    }
+
+    fn vjoy_status(&self) -> Result<VjoyStatus, UserError> {
+        Err(Self::needs_daemon("vjoy_status"))
+    }
+
+    fn install_vjoy(&self) -> Result<String, UserError> {
+        Err(Self::needs_daemon("install_vjoy"))
+    }
+
+    fn diag_stats(&self) -> Result<DiagStats, UserError> {
+        Err(Self::needs_daemon("diag_stats"))
+    }
 }
 
 #[cfg(test)]
@@ -230,5 +354,51 @@ mod tests {
         api.set_tuning(&upd).expect("edit again");
         assert!(api.discard_draft());
         assert_eq!(api.get_tuning("steering").deadzone, 0.0);
+    }
+
+    #[test]
+    fn sim_settings_defaults_and_validation() {
+        let api = SimApi::new();
+        // v2.0.1 defaults: autostart on, vJoy backend.
+        assert!(api.autostart());
+        assert!(!api.set_autostart(false).expect("disable autostart"));
+        assert!(!api.autostart());
+        assert!(api.set_autostart(true).expect("enable autostart"));
+        assert!(api.autostart());
+        assert_eq!(api.firmware_version(), "4.0.2");
+        assert_eq!(api.output_backend(), "vJoy");
+        assert_eq!(api.set_output_backend("vJoy").expect("vJoy"), "vJoy");
+        assert_eq!(api.output_backend(), "vJoy");
+        assert!(api.set_output_backend("none").is_err());
+        assert!(api.set_output_backend("bogus").is_err());
+        assert_eq!(api.output_backend(), "vJoy");
+        // The sim never pretends a backup happened.
+        assert!(api.backup_now().is_err());
+    }
+
+    #[test]
+    fn sim_profiles_games_learn_never_fake() {
+        let api = SimApi::new();
+        // Empty lists, never invented rows.
+        assert_eq!(api.list_profiles().len(), 0);
+        assert_eq!(api.list_games().len(), 0);
+        // Every fallible call errors honestly.
+        assert!(api.activate_profile("x").is_err());
+        assert!(api.create_profile("New").is_err());
+        assert!(api.duplicate_profile("x").is_err());
+        assert!(api.delete_profile("x").is_err());
+        assert!(api.launch_game("assetto_corsa").is_err());
+        assert!(api.stop_game("assetto_corsa").is_err());
+        assert!(api.game_state("assetto_corsa").is_err());
+        assert!(api.start_learn().is_err());
+        assert!(api.cancel_learn().is_err());
+        // Calibration / vJoy / diagnostics never fake in the sim.
+        assert!(api.calibration().is_err());
+        assert!(api.vjoy_status().is_err());
+        assert!(api.install_vjoy().is_err());
+        assert!(api.diag_stats().is_err());
+        // Learn is never armed in the sim, and no pick ever appears.
+        assert!(!api.is_learning());
+        assert_eq!(api.take_learned_button(), None);
     }
 }

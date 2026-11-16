@@ -1,6 +1,13 @@
 // RSH v2.0 — Setup wizard (REDESIGN-PLAN §7.6, preview Setup.html;
-// LOGIC-FIX-PLAN §4.2 Pairing Manager). First-time setup: 4 steps
-// (Connect, Pair, Calibrate, Games), 920x580, dark theme.
+// LOGIC-FIX-PLAN §4.2 Pairing Manager). First-time setup: 5 steps
+// (Connect, Drivers, Pair, Calibrate, Games), 920x580, dark theme.
+//
+// v2.0.1 hotfix: the Drivers step (vJoy install / HIDMaestro
+// fallback) is new — the default game controller is vJoy, and the
+// wizard makes sure a driver exists before pairing. The countdown
+// ring arc is driven from Rust (seconds-left/total); Calibrate calls
+// the real calibration backend and its buttons stay disabled with a
+// reason while that backend is unavailable.
 //
 // Wiring note (Phase 6): this screen is standalone — the shell
 // (Phase 3, main.slint) shows it instead of the main pages while
@@ -85,15 +92,16 @@ export component SetupWizard inherits Rectangle {
     height: Theme.window-height;
     background: Theme.bg;
 
-    // 0 Connect, 1 Pair, 2 Calibrate, 3 Games.
-    in-out property <int> step: 1;
+    // 0 Connect, 1 Drivers, 2 Pair, 3 Calibrate, 4 Games (A15:
+    // setup starts at Connect, step 0).
+    in-out property <int> step: 0;
     // Step 0 — Connect.
     in property <bool> connect-done: false;
     in property <bool> wifi-joined: false;
     in property <int> transport: 0; // 0 Wi-Fi, 1 USB
     in property <string> address: "rsh.local";
     // Step 1 — Pair (driven by the Pairing Manager).
-    in property <int> pair-seconds-left: 48;
+    in property <int> pair-seconds-left: 120;
     in property <int> pair-total: 120;
     in property <string> ring-commands: "";
     in property <string> pair-status: "Waiting for the wheel…";
@@ -102,6 +110,17 @@ export component SetupWizard inherits Rectangle {
     in property <bool> usb-available: false;
     in property <bool> paired: false;
     in property <bool> reset-required: false;
+    // Step 1 — Drivers (v2.0.1 hotfix): Rust polls vjoy_status().
+    in property <bool> vjoy-installed: false;
+    in property <bool> vjoy-installing: false;
+    in property <string> vjoy-version: "";
+    in property <string> vjoy-error: "";
+    in property <bool> vjoy-fallback: false;
+    // Step 3 — Calibrate availability (A17): false while the
+    // calibration backend is unavailable; the buttons stay disabled
+    // and Next does not gate on calibration then.
+    in property <bool> calibration-available: false;
+    in property <string> calibration-reason: "Calibration capture needs a later wheel update.";
     // Step 2 — Calibrate.
     in property <bool> centre-done: false;
     in property <bool> pedals-done: false;
@@ -112,6 +131,8 @@ export component SetupWizard inherits Rectangle {
     callback back();
     callback next();
     callback skip();
+    callback install-vjoy();
+    callback use-hidmaestro();
     callback begin-pairing();
     callback use-usb();
     callback retry-pairing();
@@ -120,9 +141,9 @@ export component SetupWizard inherits Rectangle {
     callback calibrate-action(string);
     callback find-games();
 
-    property <bool> next-enabled: step == 0 ? connect-done : step == 1 ? paired : step == 2 ? (centre-done && pedals-done) : true;
-    property <string> step-title: step == 0 ? "Connect your wheel" : step == 1 ? "Pair your wheel" : step == 2 ? "Calibrate your wheel" : "Find your games";
-    property <string> step-lead: step == 0 ? "Join the wheel's Wi-Fi, or plug in a USB cable." : step == 1 ? "Pairing keeps your wheel safe, so only this PC can control it." : step == 2 ? "Centre the wheel and set the pedals, so the game gets true inputs." : "RSH finds your racing games and switches profile automatically.";
+    property <bool> next-enabled: step == 0 ? connect-done : step == 1 ? (vjoy-installed || vjoy-fallback) : step == 2 ? paired : step == 3 ? (!calibration-available || (centre-done && pedals-done)) : true;
+    property <string> step-title: step == 0 ? "Connect your wheel" : step == 1 ? "Install the game controller" : step == 2 ? "Pair your wheel" : step == 3 ? "Calibrate your wheel" : "Find your games";
+    property <string> step-lead: step == 0 ? "Join the wheel's Wi-Fi, or plug in a USB cable." : step == 1 ? "Games need a controller driver — vJoy is the default." : step == 2 ? "Pairing keeps your wheel safe, so only this PC can control it." : step == 3 ? "Centre the wheel and set the pedals, so the game gets true inputs." : "RSH finds your racing games and switches profile automatically.";
 
     HorizontalLayout {
         // Explicit 920px (not 100%): the wizard is a fixed-size
@@ -162,9 +183,10 @@ export component SetupWizard inherits Rectangle {
                 Text { text: "About 3 minutes. You only do this once."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
                 Rectangle { height: 16px; }
                 StepRow { num: 1; label: "Connect"; sub: "Wi-Fi · rsh.local"; done: step > 0 || connect-done; now: step == 0; }
-                StepRow { num: 2; label: "Pair"; sub: "Link this PC to your wheel"; done: paired; now: step == 1; }
-                StepRow { num: 3; label: "Calibrate"; sub: "Centre and pedals"; done: step > 2; now: step == 2; }
-                StepRow { num: 4; label: "Games"; sub: "Find your racing games"; done: games-done; now: step == 3; }
+                StepRow { num: 2; label: "Drivers"; sub: "vJoy controller"; done: step > 1 || vjoy-installed || vjoy-fallback; now: step == 1; }
+                StepRow { num: 3; label: "Pair"; sub: "Link this PC to your wheel"; done: paired; now: step == 2; }
+                StepRow { num: 4; label: "Calibrate"; sub: "Centre and pedals"; done: step > 3; now: step == 3; }
+                StepRow { num: 5; label: "Games"; sub: "Find your racing games"; done: games-done; now: step == 4; }
                 Rectangle { vertical-stretch: 1; }
                 TouchArea {
                     width: 100%;
@@ -197,7 +219,7 @@ export component SetupWizard inherits Rectangle {
             padding-left: 36px;
             padding-right: 36px;
             spacing: 0px;
-            Text { text: "Step " + (step + 1) + " of 4"; font-size: 11.5px; font-weight: 700; color: Theme.accent-text; }
+            Text { text: "Step " + (step + 1) + " of 5"; font-size: 11.5px; font-weight: 700; color: Theme.accent-text; }
             Text { text: step-title; font-size: 22px; font-weight: 700; color: Theme.text; }
             Text { text: step-lead; font-size: 13.5px; color: Theme.mute; }
 
@@ -249,8 +271,54 @@ export component SetupWizard inherits Rectangle {
                 Text { text: "Wheel address: " + address; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
             }
 
-            // ---- Step 1: Pair ----
+            // ---- Step 1: Drivers (v2.0.1 hotfix) ----
             if step == 1 : VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 12px;
+                Rectangle { height: 10px; }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    height: 64px;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel;
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 12px;
+                        Text { vertical-alignment: center; text: "vJoy"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: vjoy-installed ? "Installed" + (vjoy-version == "" ? "" : " · " + vjoy-version) : vjoy-installing ? "Installing…" : "Not installed — games need a controller driver"; font-size: 12.5px; color: vjoy-installed ? Theme.ok : Theme.mute; }
+                        Rectangle { horizontal-stretch: 1; }
+                        if vjoy-installed : Text { vertical-alignment: center; text: "✓"; font-size: 16px; font-weight: 700; color: Theme.ok; }
+                        if !vjoy-installed && !vjoy-installing : Btn { label: "Install vJoy"; primary: true; clicked => { install-vjoy(); } }
+                    }
+                }
+                if vjoy-error != "" : Text { text: vjoy-error; font-size: 12.5px; color: Theme.bad; wrap: word-wrap; }
+                if !vjoy-installed && !vjoy-installing : Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    height: 64px;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel;
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 12px;
+                        Text { vertical-alignment: center; text: "HIDMaestro"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: "Needs admin each start."; font-size: 12.5px; color: Theme.mute; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Btn { label: vjoy-fallback ? "Selected ✓" : "Use HIDMaestro instead"; primary: !vjoy-fallback; clicked => { use-hidmaestro(); } }
+                    }
+                }
+                if vjoy-fallback : Text { text: "HIDMaestro selected — RSH will ask for admin permission on start."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
+            }
+
+            // ---- Step 2: Pair ----
+            if step == 2 : VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 0px;
                 Rectangle { height: 22px; }
@@ -363,8 +431,8 @@ export component SetupWizard inherits Rectangle {
                 }
             }
 
-            // ---- Step 2: Calibrate ----
-            if step == 2 : VerticalLayout {
+            // ---- Step 3: Calibrate ----
+            if step == 3 : VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 12px;
                 Rectangle { height: 10px; }
@@ -383,7 +451,7 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "Centre"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: centre-done ? "Centre set" : "Hold the wheel straight, then set the centre"; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: centre-done ? "Set ✓" : "Set centre"; primary: !centre-done; clicked => { calibrate-action("centre"); } }
+                        Btn { label: centre-done ? "Set ✓" : "Set centre"; primary: !centre-done; disabled: !calibration-available; clicked => { calibrate-action("centre"); } }
                     }
                 }
                 Rectangle {
@@ -401,13 +469,14 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "Pedals"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: pedals-done ? "Pedals set" : "Press each pedal fully, then set"; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: pedals-done ? "Set ✓" : "Set pedals"; primary: !pedals-done; clicked => { calibrate-action("pedals"); } }
+                        Btn { label: pedals-done ? "Set ✓" : "Set pedals"; primary: !pedals-done; disabled: !calibration-available; clicked => { calibrate-action("pedals"); } }
                     }
                 }
+                if !calibration-available : Text { text: calibration-reason; font-size: 12.5px; color: Theme.faint; wrap: word-wrap; }
             }
 
-            // ---- Step 3: Games ----
-            if step == 3 : VerticalLayout {
+            // ---- Step 4: Games ----
+            if step == 4 : VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 12px;
                 Rectangle { height: 10px; }
@@ -439,7 +508,7 @@ export component SetupWizard inherits Rectangle {
                 horizontal-stretch: 1;
                 width: 584px;
                 spacing: 8px;
-                TouchArea {
+                if step == 2 : TouchArea {
                     height: 36px;
                     accessible-label: "Wheel not found? Use a USB cable";
                     accessible-role: button;
@@ -461,7 +530,7 @@ export component SetupWizard inherits Rectangle {
                 }
                 Rectangle { horizontal-stretch: 1; }
                 if step > 0 : Btn { label: "Back"; clicked => { back(); } }
-                if next-enabled : Btn { label: step == 3 ? "Finish" : "Next"; primary: true; clicked => { next(); } }
+                if next-enabled : Btn { label: step == 4 ? "Finish" : "Next"; primary: true; clicked => { next(); } }
                 if !next-enabled : Rectangle {
                     width: 76px;
                     height: 30px;

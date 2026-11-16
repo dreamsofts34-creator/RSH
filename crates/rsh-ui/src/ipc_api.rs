@@ -25,8 +25,9 @@ use std::sync::{Arc, Mutex};
 
 use rsh_api::connection::ConnectionState;
 use rsh_api::{
-    app_version, ApiTransport, AppApi, AppEvent, ConnectionError, ConnectionInfo, DraftStatus,
-    PairingInfo, SnapshotInfo, TuningSettings, UserError,
+    app_version, ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionError, ConnectionInfo,
+    DiagStats, DraftStatus, GameSummary, PairingInfo, ProfileSummary, SnapshotInfo, TuningSettings,
+    UserError, VjoyStatus,
 };
 use rsh_ipc::{IpcClient, IpcError};
 
@@ -37,6 +38,8 @@ pub struct IpcApi {
     last_connection: Mutex<Option<ConnectionInfo>>,
     last_snapshot: Mutex<Option<SnapshotInfo>>,
     last_output: Mutex<Option<bool>>,
+    last_autostart: Mutex<Option<bool>>,
+    last_backend: Mutex<Option<String>>,
 }
 
 impl IpcApi {
@@ -60,6 +63,8 @@ impl IpcApi {
             last_connection: Mutex::new(None),
             last_snapshot: Mutex::new(None),
             last_output: Mutex::new(None),
+            last_autostart: Mutex::new(None),
+            last_backend: Mutex::new(None),
         }))
     }
 
@@ -308,6 +313,348 @@ impl AppApi for IpcApi {
         });
         got.unwrap_or(false)
     }
+
+    fn autostart(&self) -> bool {
+        let got: Result<bool, IpcError> = self.rt.block_on(async {
+            let value = self.client.call("autostart", serde_json::json!({})).await?;
+            value
+                .get("autostart")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| IpcError::Protocol("autostart has no autostart".to_string()))
+        });
+        match got {
+            Ok(enabled) => {
+                if let Ok(mut slot) = self.last_autostart.lock() {
+                    *slot = Some(enabled);
+                }
+                enabled
+            }
+            Err(_) => self
+                .last_autostart
+                .lock()
+                .ok()
+                .and_then(|slot| *slot)
+                .unwrap_or(false),
+        }
+    }
+
+    fn set_autostart(&self, enabled: bool) -> Result<bool, UserError> {
+        let got: Result<bool, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("set_autostart", serde_json::json!({"enabled": enabled}))
+                .await?;
+            value
+                .get("autostart")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| IpcError::Protocol("set_autostart has no autostart".to_string()))
+        });
+        match got {
+            Ok(new_state) => {
+                if let Ok(mut slot) = self.last_autostart.lock() {
+                    *slot = Some(new_state);
+                }
+                Ok(new_state)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
+    }
+
+    fn firmware_version(&self) -> String {
+        let got: Result<String, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("firmware_version", serde_json::json!({}))
+                .await?;
+            value
+                .get("firmware_version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    IpcError::Protocol("firmware_version has no firmware_version".to_string())
+                })
+        });
+        got.unwrap_or_else(|_| "Unknown".to_string())
+    }
+
+    fn output_backend(&self) -> String {
+        let got: Result<String, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("output_backend", serde_json::json!({}))
+                .await?;
+            value
+                .get("output_backend")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    IpcError::Protocol("output_backend has no output_backend".to_string())
+                })
+        });
+        match got {
+            Ok(backend) => {
+                if let Ok(mut slot) = self.last_backend.lock() {
+                    *slot = Some(backend.clone());
+                }
+                backend
+            }
+            Err(_) => self
+                .last_backend
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone())
+                .unwrap_or_else(|| "Unknown".to_string()),
+        }
+    }
+
+    fn set_output_backend(&self, name: &str) -> Result<String, UserError> {
+        let got: Result<String, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("set_output_backend", serde_json::json!({"name": name}))
+                .await?;
+            value
+                .get("output_backend")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    IpcError::Protocol("set_output_backend has no output_backend".to_string())
+                })
+        });
+        match got {
+            Ok(backend) => {
+                if let Ok(mut slot) = self.last_backend.lock() {
+                    *slot = Some(backend.clone());
+                }
+                Ok(backend)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
+    }
+
+    fn backup_now(&self) -> Result<String, UserError> {
+        let got: Result<String, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("backup_now", serde_json::json!({}))
+                .await?;
+            value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| IpcError::Protocol("backup_now has no message".to_string()))
+        });
+        got.map_err(|_| Self::ipc_failed())
+    }
+
+    // v2.0.1 hotfix: profiles / games / learn over the same socket.
+    // Lists are empty (never invented) when the daemon cannot be
+    // reached; fallible calls surface the IPC failure.
+    fn list_profiles(&self) -> Vec<ProfileSummary> {
+        let got: Result<Vec<ProfileSummary>, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("list_profiles", serde_json::json!({}))
+                .await?;
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
+        });
+        got.unwrap_or_default()
+    }
+
+    fn activate_profile(&self, id: &str) -> Result<String, UserError> {
+        self.profile_name_call("activate_profile", "id", id)
+    }
+
+    fn create_profile(&self, name: &str) -> Result<String, UserError> {
+        self.profile_name_call("create_profile", "name", name)
+    }
+
+    fn duplicate_profile(&self, id: &str) -> Result<String, UserError> {
+        self.profile_name_call("duplicate_profile", "id", id)
+    }
+
+    fn delete_profile(&self, id: &str) -> Result<bool, UserError> {
+        let got: Result<bool, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("delete_profile", serde_json::json!({"id": id}))
+                .await?;
+            value
+                .get("deleted")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| IpcError::Protocol("delete_profile has no deleted".to_string()))
+        });
+        got.map_err(|_| Self::ipc_failed())
+    }
+
+    fn list_games(&self) -> Vec<GameSummary> {
+        let got: Result<Vec<GameSummary>, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("list_games", serde_json::json!({}))
+                .await?;
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
+        });
+        got.unwrap_or_default()
+    }
+
+    fn launch_game(&self, id: &str) -> Result<GameSummary, UserError> {
+        self.game_call("launch_game", id)
+    }
+
+    fn stop_game(&self, id: &str) -> Result<GameSummary, UserError> {
+        self.game_call("stop_game", id)
+    }
+
+    fn game_state(&self, id: &str) -> Result<GameSummary, UserError> {
+        self.game_call("game_state", id)
+    }
+
+    fn start_learn(&self) -> Result<bool, UserError> {
+        self.learn_call("start_learn")
+    }
+
+    fn cancel_learn(&self) -> Result<bool, UserError> {
+        self.learn_call("cancel_learn")
+    }
+
+    fn is_learning(&self) -> bool {
+        let got: Result<bool, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("is_learning", serde_json::json!({}))
+                .await?;
+            value
+                .get("learning")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| IpcError::Protocol("is_learning has no learning".to_string()))
+        });
+        got.unwrap_or(false)
+    }
+
+    fn take_learned_button(&self) -> Option<u8> {
+        let got: Result<Option<u8>, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("take_learned_button", serde_json::json!({}))
+                .await?;
+            match value.get("button") {
+                Some(serde_json::Value::Null) | None => Ok(None),
+                Some(v) => v
+                    .as_u64()
+                    .and_then(|n| u8::try_from(n).ok())
+                    .map(Some)
+                    .ok_or_else(|| {
+                        IpcError::Protocol("take_learned_button has no button".to_string())
+                    }),
+            }
+        });
+        got.unwrap_or(None)
+    }
+
+    // v2.0.1 hotfix BACKEND-2: calibration read, vJoy status/install,
+    // diagnostics over the same socket.
+    fn calibration(&self) -> Result<CalibrationInfo, UserError> {
+        let got: Result<CalibrationInfo, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("calibration", serde_json::json!({}))
+                .await?;
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
+        });
+        got.map_err(|_| Self::ipc_failed())
+    }
+
+    fn vjoy_status(&self) -> Result<VjoyStatus, UserError> {
+        let got: Result<VjoyStatus, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("vjoy_status", serde_json::json!({}))
+                .await?;
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
+        });
+        got.map_err(|_| Self::ipc_failed())
+    }
+
+    fn install_vjoy(&self) -> Result<String, UserError> {
+        let got: Result<String, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("install_vjoy", serde_json::json!({}))
+                .await?;
+            value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| IpcError::Protocol("install_vjoy has no message".to_string()))
+        });
+        got.map_err(|_| Self::ipc_failed())
+    }
+
+    fn diag_stats(&self) -> Result<DiagStats, UserError> {
+        let got: Result<DiagStats, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call("diag_stats", serde_json::json!({}))
+                .await?;
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
+        });
+        got.map_err(|_| Self::ipc_failed())
+    }
+}
+
+impl IpcApi {
+    /// Shared `{"name": …}` profile call (`activate` / `create` /
+    /// `duplicate`): one string param in, the profile name out.
+    fn profile_name_call(
+        &self,
+        method: &str,
+        param: &str,
+        value: &str,
+    ) -> Result<String, UserError> {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            param.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+        let got: Result<String, IpcError> = self.rt.block_on(async {
+            let result = self
+                .client
+                .call(method, serde_json::Value::Object(params))
+                .await?;
+            result
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| IpcError::Protocol(format!("{method} has no name")))
+        });
+        got.map_err(|_| Self::ipc_failed())
+    }
+
+    /// Shared `{"id": …}` game call: one game id in, its
+    /// [`GameSummary`] out.
+    fn game_call(&self, method: &str, id: &str) -> Result<GameSummary, UserError> {
+        let got: Result<GameSummary, IpcError> = self.rt.block_on(async {
+            let value = self
+                .client
+                .call(method, serde_json::json!({"id": id}))
+                .await?;
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
+        });
+        got.map_err(|_| Self::ipc_failed())
+    }
+
+    /// Shared no-param learn call: `{"learning": bool}` out.
+    fn learn_call(&self, method: &str) -> Result<bool, UserError> {
+        let got: Result<bool, IpcError> = self.rt.block_on(async {
+            let value = self.client.call(method, serde_json::json!({})).await?;
+            value
+                .get("learning")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| IpcError::Protocol(format!("{method} has no learning")))
+        });
+        got.map_err(|_| Self::ipc_failed())
+    }
 }
 
 #[cfg(test)]
@@ -395,6 +742,40 @@ mod tests {
         client.set_tuning(&upd).expect("edit again");
         assert!(client.discard_draft());
         assert_eq!(client.get_tuning("steering").deadzone, 0.0);
+        // v2.0.1 settings methods over the same socket.
+        assert!(client.autostart());
+        assert!(!client.set_autostart(false).expect("disable autostart"));
+        assert!(!client.autostart());
+        assert!(client.set_autostart(true).expect("enable autostart"));
+        assert_eq!(client.firmware_version(), "4.0.2");
+        assert_eq!(client.output_backend(), "vJoy");
+        assert_eq!(client.set_output_backend("vJoy").expect("vJoy"), "vJoy");
+        assert_eq!(client.output_backend(), "vJoy");
+        assert!(client.set_output_backend("bogus").is_err());
+        assert_eq!(client.output_backend(), "vJoy");
+        // Sim never pretends a backup happened.
+        assert!(client.backup_now().is_err());
+        // v2.0.1 BACKEND-2 over the same socket: the sim never fakes
+        // a calibration, a vJoy install, or diagnostics.
+        assert!(client.calibration().is_err());
+        assert!(client.vjoy_status().is_err());
+        assert!(client.install_vjoy().is_err());
+        assert!(client.diag_stats().is_err());
+        // v2.0.1 profiles / games / learn over the same socket.
+        // The sim invents nothing: empty lists, honest errors.
+        assert_eq!(client.list_profiles().len(), 0);
+        assert_eq!(client.list_games().len(), 0);
+        assert!(client.activate_profile("x").is_err());
+        assert!(client.create_profile("New").is_err());
+        assert!(client.duplicate_profile("x").is_err());
+        assert!(client.delete_profile("x").is_err());
+        assert!(client.launch_game("assetto_corsa").is_err());
+        assert!(client.stop_game("assetto_corsa").is_err());
+        assert!(client.game_state("assetto_corsa").is_err());
+        assert!(client.start_learn().is_err());
+        assert!(client.cancel_learn().is_err());
+        assert!(!client.is_learning());
+        assert_eq!(client.take_learned_button(), None);
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);

@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rsh_api::{AppApi, AppEvent, ConnEvent, ConnectionError, ManagerAction};
-use rsh_app_core::diagnostics::append_startup_log_both;
+use rsh_app_core::diagnostics::{append_startup_log_both, log_fatal};
 use rsh_app_core::state::{AppStateCore, TransportKind};
 #[cfg(unix)]
 use rsh_ipc::serve_listener;
@@ -120,7 +120,10 @@ fn parse_args() -> Args {
                 std::process::exit(0);
             }
             other => {
-                eprintln!("rsh-daemon: unknown argument: {other}");
+                // Log first: under `windows_subsystem = "windows"`
+                // stderr is invisible, so an eprintln-only exit here
+                // would leave no trace of why the daemon died.
+                let _ = log_fatal(&format!("rsh-daemon: unknown argument: {other}"));
                 std::process::exit(2);
             }
         }
@@ -156,6 +159,16 @@ async fn manager_loop(
     let mut last_error: Option<ConnectionError> = None;
     let mut last_window_open = false;
     let mut last_active = false;
+    // Pairing completion tracking (v2.0.1 hotfix): the wizard's Pair
+    // step only completes on `PairingFinished`, and nothing in the
+    // daemon ever published it — so the wizard could never advance
+    // past Pair except via Skip. A pairing is in flight while its
+    // window is open; reaching Active with a window open — or the
+    // first Active since daemon start (a resumed paired session) —
+    // finishes it successfully. A window closing without Active
+    // finishes it as failed.
+    let mut pairing_in_flight = false;
+    let mut first_active_seen = false;
     let mut pending_rejoin_password: Option<String> = None;
     let mut logged_lines = 0usize;
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
@@ -284,6 +297,7 @@ async fn manager_loop(
         }
         let window_open = api.state.pairing_status_peek().seconds_left > 0;
         if window_open && !last_window_open {
+            pairing_in_flight = true;
             let (action, changed) = api.manager_event(ConnEvent::HelloReceived {
                 unpaired: true,
                 window_open: true,
@@ -303,6 +317,21 @@ async fn manager_loop(
                 },
             );
         }
+        if !window_open && last_window_open && pairing_in_flight && !api.manager_state().is_active()
+        {
+            publish(
+                &event_tx,
+                AppEvent::PairingFinished {
+                    ok: false,
+                    error: api.state.session_last_error_typed(),
+                },
+            );
+            log_line(
+                verbose,
+                "pairing: finished — failed (window closed without Active)",
+            );
+            pairing_in_flight = false;
+        }
         last_window_open = window_open;
         // Pairing rejoin (Phase 6): stash the Wi-Fi password while the
         // pairing window is open — it is cleared on activation — and
@@ -312,13 +341,26 @@ async fn manager_loop(
             pending_rejoin_password = Some(password);
         }
         let active_now = api.manager_state().is_active();
-        if active_now
-            && !last_active
-            && let Some(password) = pending_rejoin_password.take()
-        {
-            match rejoin_wifi(RSH_SSID, &password) {
-                Ok(()) => log_line(verbose, "pairing: rejoined RSH Wi-Fi after pairing"),
-                Err(error) => log_line(verbose, &format!("pairing: Wi-Fi rejoin failed: {error}")),
+        if active_now && !last_active {
+            if pairing_in_flight || !first_active_seen {
+                publish(
+                    &event_tx,
+                    AppEvent::PairingFinished {
+                        ok: true,
+                        error: None,
+                    },
+                );
+                log_line(verbose, "pairing: finished — board paired (session Active)");
+            }
+            pairing_in_flight = false;
+            first_active_seen = true;
+            if let Some(password) = pending_rejoin_password.take() {
+                match rejoin_wifi(RSH_SSID, &password) {
+                    Ok(()) => log_line(verbose, "pairing: rejoined RSH Wi-Fi after pairing"),
+                    Err(error) => {
+                        log_line(verbose, &format!("pairing: Wi-Fi rejoin failed: {error}"));
+                    }
+                }
             }
         }
         if !window_open && !active_now {
@@ -410,18 +452,35 @@ fn resolve_game_id(api: &DaemonApi, key: &str) -> Option<String> {
 #[cfg(unix)]
 async fn serve_ipc(server: Arc<IpcServer>, data_dir: &std::path::Path, verbose: bool) {
     let path = socket_path(data_dir);
-    match rsh_ipc::bind_unix_socket(&path) {
-        Ok(listener) => {
-            log_line(
-                verbose,
-                &format!("daemon: IPC listening on {}", path.display()),
-            );
-            serve_listener(server, listener).await;
-        }
-        Err(error) => {
-            log_line(verbose, &format!("daemon: IPC bind failed: {error}"));
+    // A bind can fail transiently (the data dir is still being
+    // created, a stale socket is being reaped) — retry a few times
+    // instead of silently running with no IPC, which would leave
+    // the UI on simulated data forever with no further trace.
+    for attempt in 1..=5 {
+        match rsh_ipc::bind_unix_socket(&path) {
+            Ok(listener) => {
+                log_line(
+                    verbose,
+                    &format!("daemon: IPC listening on {}", path.display()),
+                );
+                serve_listener(server, listener).await;
+                return;
+            }
+            Err(error) => {
+                log_line(
+                    verbose,
+                    &format!("daemon: IPC bind failed (attempt {attempt}/5): {error}"),
+                );
+                if attempt < 5 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
         }
     }
+    let _ = log_fatal(&format!(
+        "daemon: IPC bind failed after 5 attempts — running without IPC (the UI will use simulated data); socket was {}",
+        path.display()
+    ));
 }
 
 /// Serve the IPC named pipe forever (Windows).
@@ -456,6 +515,44 @@ async fn serve_ipc(server: Arc<IpcServer>, _data_dir: &std::path::Path, verbose:
     }
 }
 
+/// Quarantine the unreadable store files (`profiles.json`,
+/// `settings.json`) aside so a fresh-default open can succeed: each
+/// existing file is renamed to `<name>.corrupt-<unix-seconds>-<pid>-<n>`
+/// (a unique suffix per attempt, so two quarantines never collide).
+/// Returns the quarantine paths (empty when neither file existed).
+/// The corrupt bytes are never deleted — only moved — so the
+/// originals can be put back or inspected by hand.
+fn quarantine_corrupt_store_files(data_dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut quarantined = Vec::new();
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    for name in ["profiles.json", "settings.json"] {
+        let path = data_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let mut attempt = 0u32;
+        let mut target = PathBuf::from(format!(
+            "{}.corrupt-{secs}-{}-{attempt}",
+            path.display(),
+            std::process::id()
+        ));
+        while target.exists() {
+            attempt += 1;
+            target = PathBuf::from(format!(
+                "{}.corrupt-{secs}-{}-{attempt}",
+                path.display(),
+                std::process::id()
+            ));
+        }
+        if std::fs::rename(&path, &target).is_ok() {
+            quarantined.push(target);
+        }
+    }
+    quarantined
+}
+
 /// Single-instance check, runtime + IPC + manager loop, engine
 /// start, tray creation, Slint event loop (tray only until Phase 3
 /// adds the window), shutdown.
@@ -466,11 +563,19 @@ async fn serve_ipc(server: Arc<IpcServer>, _data_dir: &std::path::Path, verbose:
 fn main() {
     let args = parse_args();
     let verbose = args.verbose || args.check;
-    let data_dir = args
-        .data_dir
-        .clone()
-        .or_else(rsh_app_core::data_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
+    // A missing platform data dir falls back to the process working
+    // directory — the store, the pid file and (on Linux) the IPC
+    // socket then live in the CWD instead of `%APPDATA%\RSH`, where
+    // the UI looks for them. That must never happen silently: the
+    // fallback is logged loudly below. (`dirs::data_dir()` is
+    // `SHGetKnownFolderPath(RoamingAppData)` on Windows — it only
+    // fails when the user profile is not loaded, e.g. a service /
+    // SYSTEM launch or a login race — and `$HOME` unset on Linux.)
+    let (data_dir, data_dir_fell_back) = match args.data_dir.clone().or_else(rsh_app_core::data_dir)
+    {
+        Some(dir) => (dir, false),
+        None => (PathBuf::from("."), true),
+    };
     log_line(
         verbose,
         &format!(
@@ -479,6 +584,16 @@ fn main() {
             data_dir.display()
         ),
     );
+    if data_dir_fell_back {
+        log_line(
+            verbose,
+            &format!(
+                "daemon: WARNING data dir could not be resolved — using CWD {} instead of the RSH data dir; profiles, pid file and IPC socket live here now (the UI looks in the platform data dir)",
+                std::env::current_dir()
+                    .map_or_else(|_| "?".to_string(), |dir| dir.display().to_string())
+            ),
+        );
+    }
 
     // Single-instance: a second launch signals the running daemon
     // (IPC ping — the UI open hook lands in Phase 3) and exits.
@@ -486,34 +601,65 @@ fn main() {
         Ok(AcquireOutcome::First(lock)) => lock,
         Ok(AcquireOutcome::AlreadyRunning(pid)) => {
             let socket = socket_path(&data_dir);
+            // The lock holder may be a daemon that is still starting
+            // (IPC not bound yet) — give its ping a few tries before
+            // declaring it dead.
             let alive = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .ok()?;
-                runtime.block_on(async move {
-                    let client = rsh_ipc::IpcClient::connect(&socket).await.ok()?;
-                    client.ping().await.ok()
-                })
+                Some(runtime.block_on(async move {
+                    for _ in 0..3 {
+                        if let Ok(client) = rsh_ipc::IpcClient::connect(&socket).await
+                            && let Ok(true) = client.ping().await
+                        {
+                            return true;
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    false
+                }))
             })
             .join()
             .ok()
             .flatten()
             .unwrap_or(false);
-            eprintln!("rsh-daemon: already running (pid {pid:?}, IPC answers: {alive}) — exiting");
-            std::process::exit(0);
+            if alive {
+                log_line(
+                    verbose,
+                    &format!("daemon: already running (pid {pid:?}, IPC answers) — exiting"),
+                );
+                std::process::exit(0);
+            }
+            // The lock is held but the daemon does not answer IPC:
+            // hung, or a stale lock the single-instance check could
+            // not reclaim. Never exit 0 (success) for a broken
+            // daemon, and never leave only an invisible stderr line:
+            // a UI that spawned us falls back to simulated data, so
+            // this failure must be in the dual-location log.
+            let _ = log_fatal(&format!(
+                "daemon: already running (pid {pid:?}) but IPC did not answer after 3 tries — the running daemon is hung or its IPC is dead; not taking over, exiting"
+            ));
+            std::process::exit(1);
         }
         Err(error) => {
-            eprintln!("rsh-daemon: cannot acquire single-instance lock: {error}");
-            log_line(
-                verbose,
-                &format!("daemon: FATAL single-instance lock: {error}"),
-            );
+            let _ = log_fatal(&format!(
+                "daemon: cannot acquire single-instance lock: {error}"
+            ));
             std::process::exit(1);
         }
     };
 
     // Open the app state (repairs a corrupt store from backups).
+    // Last resort when even the backups cannot repair it: quarantine
+    // the unreadable store files aside (bytes preserved for manual
+    // recovery) and open with fresh defaults, instead of dying
+    // before the tray — a daemon that exits here leaves no tray, no
+    // IPC, and a UI on simulated data with no visible reason. Only
+    // when even a fresh open fails (e.g. the data dir is unwritable)
+    // does the daemon exit, and it logs the fatal reason to both
+    // log locations first.
     let state = match AppStateCore::open_with_null_sink_repair(&data_dir) {
         (Ok(state), repair_note) => {
             if let Some(note) = repair_note {
@@ -522,12 +668,42 @@ fn main() {
             Arc::new(state)
         }
         (Err(error), _) => {
-            eprintln!("rsh-daemon: cannot open profile store: {error}");
-            log_line(verbose, &format!("daemon: FATAL store open: {error}"));
-            std::process::exit(1);
+            log_line(
+                verbose,
+                &format!(
+                    "daemon: store open failed ({error}) — quarantining corrupt store files and retrying with defaults"
+                ),
+            );
+            let quarantined = quarantine_corrupt_store_files(&data_dir);
+            log_line(
+                verbose,
+                &format!("daemon: store files quarantined: {quarantined:?}"),
+            );
+            match AppStateCore::open_with_null_sink_repair(&data_dir) {
+                (Ok(state), _) => {
+                    log_line(
+                        verbose,
+                        &format!(
+                            "daemon: store reset to defaults after quarantine (corrupt files kept as {quarantined:?}); profiles/settings were unreadable and have been reset"
+                        ),
+                    );
+                    Arc::new(state)
+                }
+                (Err(retry_error), _) => {
+                    let _ = log_fatal(&format!(
+                        "daemon: cannot open profile store even after quarantine: {retry_error} (first error: {error}; quarantined: {quarantined:?})"
+                    ));
+                    std::process::exit(1);
+                }
+            }
         }
     };
     let api = DaemonApi::new(Arc::clone(&state));
+    // BACKEND-2 migration: log the persisted-backend note (if any)
+    // so a HIDMaestro→vJoy switch is visible in the startup log.
+    if let Some(note) = state.backend_migration_note() {
+        log_line(verbose, &format!("daemon: backend migration: {note}"));
+    }
     let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(256);
     let tray_actions: Arc<Mutex<Vec<TrayAction>>> = Arc::new(Mutex::new(Vec::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -539,7 +715,7 @@ fn main() {
         .enable_all()
         .build()
         .unwrap_or_else(|error| {
-            eprintln!("rsh-daemon: cannot build runtime: {error}");
+            let _ = log_fatal(&format!("rsh-daemon: cannot build runtime: {error}"));
             std::process::exit(1);
         });
     let ipc_server = Arc::new(IpcServer::new(
@@ -601,16 +777,52 @@ fn main() {
     // when autostart is on, and removed when it is off — the old exe
     // no longer exists after the v2.0 install. Best-effort: a failed
     // write is logged, never fatal.
+    //
+    // Heal a stale persisted `autostart = false` FIRST: the v1
+    // default was false, so a machine upgraded from v1.0.2 carries
+    // `settings.json` with autostart off — and the plain sync below
+    // would DELETE the Run key the installer just wrote, so the
+    // daemon would never autostart again (the v2.0.0
+    // no-tray-after-reboot report). A Run entry that already points
+    // at this exe cannot come from a v2 Settings toggle-off (that
+    // deletes the entry immediately), so its presence is newer
+    // evidence than the stale persisted flag: adopt it and persist
+    // the fix. Only when persisting the adoption fails is the sync
+    // skipped this launch, so a stale flag can never delete a live
+    // entry. (A fresh-store default flip alone cannot heal this —
+    // it only affects stores with no `settings.json` yet.)
+    let mut skip_autostart_sync = false;
     if let Ok(exe) = std::env::current_exe() {
-        match tray_autostart::sync_autostart(state.settings().autostart, &exe) {
-            Ok(sync) => log_line(
-                verbose,
-                &format!(
-                    "daemon: autostart sync: {sync:?} (enabled now: {})",
-                    tray_autostart::autostart_enabled(&exe)
+        if !state.settings().autostart && tray_autostart::autostart_enabled(&exe) {
+            let mut settings = state.settings();
+            settings.autostart = true;
+            match state.set_settings(settings) {
+                Ok(_) => log_line(
+                    verbose,
+                    "daemon: autostart adopted from the existing Run entry (persisted autostart was stale off) — Run key kept",
                 ),
-            ),
-            Err(error) => log_line(verbose, &format!("daemon: autostart sync failed: {error}")),
+                Err(error) => {
+                    log_line(
+                        verbose,
+                        &format!(
+                            "daemon: autostart adoption failed ({error}) — leaving the Run entry untouched this launch"
+                        ),
+                    );
+                    skip_autostart_sync = true;
+                }
+            }
+        }
+        if !skip_autostart_sync {
+            match tray_autostart::sync_autostart(state.settings().autostart, &exe) {
+                Ok(sync) => log_line(
+                    verbose,
+                    &format!(
+                        "daemon: autostart sync: {sync:?} (enabled now: {})",
+                        tray_autostart::autostart_enabled(&exe)
+                    ),
+                ),
+                Err(error) => log_line(verbose, &format!("daemon: autostart sync failed: {error}")),
+            }
         }
     }
 
@@ -639,26 +851,42 @@ fn main() {
 
     // Tray on the Slint event loop (main thread). The icon is
     // created on EVERY launch (A-09) — not only --tray.
+    // The tray can fail transiently at login (Explorer / the
+    // notification area is not ready yet) — a single attempt would
+    // leave the daemon headless for the whole session with no way
+    // back to the UI. Retry for ~10 s before giving up; a headless
+    // Linux host fails every attempt (expected, spike §3) and the
+    // daemon keeps running headless.
     let tray_ok = if args.no_tray {
         log_line(verbose, "daemon: tray disabled (--no-tray)");
         false
     } else {
-        match create_tray(&api, &tray_actions, &shutdown, verbose) {
-            Ok(()) => {
-                log_line(verbose, "daemon: tray icon registered");
-                true
-            }
-            Err(error) => {
-                // Linux without a tray host (Xvfb / headless) fails
-                // here — expected (spike §3). The daemon keeps
-                // running headless; Windows is the target.
-                log_line(
-                    verbose,
-                    &format!("daemon: tray unavailable ({error}) — running headless"),
-                );
-                false
+        let mut tray_ok = false;
+        for attempt in 1..=6 {
+            match create_tray(&api, &tray_actions, &shutdown, verbose) {
+                Ok(()) => {
+                    log_line(verbose, "daemon: tray icon registered");
+                    tray_ok = true;
+                    break;
+                }
+                Err(error) => {
+                    log_line(
+                        verbose,
+                        &format!("daemon: tray unavailable (attempt {attempt}/6: {error})"),
+                    );
+                    if attempt < 6 {
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                }
             }
         }
+        if !tray_ok {
+            log_line(
+                verbose,
+                "daemon: tray unavailable after 6 attempts — running headless",
+            );
+        }
+        tray_ok
     };
 
     if tray_ok {
@@ -794,6 +1022,31 @@ fn create_tray(
     verbose: bool,
 ) -> Result<(), slint::PlatformError> {
     let tray = RshTray::new()?;
+    // A25: fill the native menu from the live store (real profiles
+    // + installed games only — never hardcoded names). The menu is
+    // built once at tray creation; profiles created later in the UI
+    // appear after the next daemon start.
+    let profiles = api.state.list_profiles();
+    tray.set_profile_items(slint::ModelRc::new(slint::VecModel::from(
+        profiles
+            .iter()
+            .map(|summary| ProfileMenuItem {
+                name: summary.name.clone().into(),
+                active: summary.active,
+            })
+            .collect::<Vec<_>>(),
+    )));
+    let games = api.state.list_games();
+    tray.set_game_items(slint::ModelRc::new(slint::VecModel::from(
+        games
+            .iter()
+            .filter(|game| game.installed)
+            .map(|game| GameMenuItem {
+                id: game.id.clone().into(),
+                name: game.name.clone().into(),
+            })
+            .collect::<Vec<_>>(),
+    )));
     tray.set_send_to_game(api.output_enabled());
     tray.set_status_text("RSH — Real Sim Hub".into());
     let push = |tray_actions: &Arc<Mutex<Vec<TrayAction>>>, action: TrayAction| {
@@ -953,4 +1206,48 @@ fn create_tray(
     // the Tauri shell leaked its TrayIcon (it must outlive this fn).
     std::mem::forget(tray);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rsh-daemon-quarantine-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn quarantine_moves_corrupt_store_files_and_keeps_other_files() {
+        let dir = temp_dir("moves");
+        std::fs::write(dir.join("profiles.json"), "{corrupt").expect("write");
+        std::fs::write(dir.join("settings.json"), "{corrupt").expect("write");
+        std::fs::write(dir.join("setup-done"), "done\n").expect("write");
+        let quarantined = quarantine_corrupt_store_files(&dir);
+        assert_eq!(quarantined.len(), 2);
+        assert!(!dir.join("profiles.json").exists());
+        assert!(!dir.join("settings.json").exists());
+        assert!(dir.join("setup-done").is_file());
+        for path in &quarantined {
+            assert!(path.is_file());
+            assert!(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".corrupt-"))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantine_is_a_noop_without_store_files() {
+        let dir = temp_dir("noop");
+        assert_eq!(quarantine_corrupt_store_files(&dir).len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

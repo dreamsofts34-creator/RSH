@@ -362,8 +362,9 @@ pub struct AppSettings {
     /// vJoy device id, clamped to 1..=16 on parse.
     #[serde(default = "default_vjoy_device_id")]
     pub vjoy_device_id: u32,
-    /// Output backend: `HIDMaestro` (default, G4), `VJoy` (fallback),
-    /// or `None` (no output device).
+    /// Output backend: `VJoy` (default), `HIDMaestro` (explicit
+    /// choice — elevated, UAC prompt on activation), or `None` (no
+    /// output device).
     #[serde(default = "default_output_backend")]
     pub output_backend: String,
     /// `HIDMaestro` profile id (empty = none selected).
@@ -446,9 +447,11 @@ fn default_vjoy_device_id() -> u32 {
 }
 
 fn default_output_backend() -> String {
-    // G4: the default output backend is HIDMaestro (architecture Phase
-    // G); vJoy is the fallback, "None" is the no-device choice.
-    "HIDMaestro".to_owned()
+    // v2.0.1 hotfix: the default output backend is vJoy — HIDMaestro
+    // was the default until v2.0.0 (architecture Phase G), but its
+    // elevated sidecar pops a UAC prompt on every launch, so it is
+    // now an explicit choice only; "None" is the no-device choice.
+    "VJoy".to_owned()
 }
 
 fn default_log_level() -> String {
@@ -521,7 +524,11 @@ impl Default for AppSettings {
         Self {
             theme: "System".to_string(),
             language: "System".to_string(),
-            autostart: false,
+            // v2.0.1: the v2 daemon is always-on by design
+            // (REDESIGN-PLAN §10), so a fresh store enables
+            // autostart — the installer writes the Run key and the
+            // daemon must not delete it on first launch.
+            autostart: true,
             start_minimized: false,
             close_to_tray: true,
             output_enabled: true,
@@ -1115,7 +1122,7 @@ mod tests {
         assert_eq!(settings.language, "System");
         assert_eq!(settings.esp_ip, "192.168.4.1");
         assert_eq!(settings.vjoy_device_id, 16);
-        assert_eq!(settings.output_backend, "HIDMaestro");
+        assert_eq!(settings.output_backend, "VJoy");
         assert_eq!(settings.log_level, "Warning");
     }
 
@@ -1165,5 +1172,13 @@ mod tests {
         let path = std::env::temp_dir().join("rsh-a2-does-not-exist-000000.json");
         let error = read_csharp_profiles_file(&path).expect_err("missing file errors");
         assert!(matches!(error, ImportError::Io(_)));
+    }
+
+    #[test]
+    fn default_settings_enable_autostart() {
+        // v2.0.1: a fresh store autostarts (always-on daemon,
+        // REDESIGN-PLAN §10) — the installer writes the Run key
+        // and the daemon must not delete it on first launch.
+        assert!(AppSettings::default().autostart);
     }
 }

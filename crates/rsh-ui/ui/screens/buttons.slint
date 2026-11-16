@@ -10,7 +10,8 @@
 // (RSH_CFG_CONFIRM_TIMEOUT_MS), so the copy here reads "30 s".
 //
 // NOTE (tokens): the staging blends rgba(accent,.16) over panel2
-// (#1A294A), over the tile bg (#203054), ok .12 over the tile bg
+// are Theme.acc-bg now (B5: the literal #1A294A is replaced by the
+// token); over the tile bg (#203054), ok .12 over the tile bg
 // (#213A3E), and the learn-box dash (#3A4660) / knob ring (#2F3A50) are
 // kept as literals here — tokens.slint is Phase 3-owned, so they are
 // folded into Theme at integration. No other deviation.
@@ -47,16 +48,9 @@ component ButtonTile inherits Rectangle {
     VerticalLayout {
         padding-top: 9px; padding-bottom: 9px; padding-left: 10px; padding-right: 10px;
         spacing: 2px;
-        // The long state labels ("BUTTON 5 · PRESSED") must NOT force the
-        // tile wider than the grid — in the HTML preview they simply
-        // overflow the tile box, which Slint cannot replicate without
-        // breaking the 4-column grid. A bare Text reports its full
-        // preferred width as its layout minimum (elide/wrap alone do not
-        // shrink it, and binding its width to the tile is a binding loop
-        // that panics at runtime). So the label lives in a clipping
-        // slot at the fixed design content width (70px = 90px tile minus
-        // padding): it wraps to two lines when it has a state suffix
-        // ("BUTTON 5" / "· PRESSED") and never widens the tile.
+        // B1: the label stays on ONE line — the 70px clipping slot
+        // (see below) elides instead of wrapping, so the tile never
+        // grows taller than the grid.
         Rectangle {
             width: 70px;
             clip: true;
@@ -66,7 +60,7 @@ component ButtonTile inherits Rectangle {
                 font-size: 11px;
                 font-weight: 600;
                 color: Theme.faint;
-                wrap: word-wrap;
+                wrap: no-wrap;
                 overflow: elide;
             }
         }
@@ -75,7 +69,7 @@ component ButtonTile inherits Rectangle {
             font-size: 12.5px;
             font-weight: action == "Not set" ? 500 : 600;
             color: action == "Not set" ? Theme.faint : Theme.text;
-            wrap: word-wrap;
+            wrap: no-wrap;
             overflow: elide;
         }
     }
@@ -162,7 +156,7 @@ component ActionChip inherits Rectangle {
     border-radius: 7px;
     border-width: 1px;
     border-color: fs.has-focus ? Theme.accent-text : (active ? Theme.accent : Theme.line);
-    background: active ? #1A294A : Theme.panel2;
+    background: active ? Theme.acc-bg : Theme.panel2;
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -201,7 +195,7 @@ component KnobRow inherits Rectangle {
     border-radius: 8px;
     border-width: 1px;
     border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : Theme.line);
-    background: selected ? #1A294A : Theme.panel2;
+    background: selected ? Theme.acc-bg : Theme.panel2;
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -276,7 +270,7 @@ export component ButtonsPage inherits HorizontalLayout {
                 HorizontalLayout {
                     alignment: space-between;
                     Text { text: "Wheel buttons"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
-                    Text { text: "Press a button on your wheel and it lights up here"; font-size: 12px; color: Theme.mute; }
+                    Text { text: "Live presses light up here"; font-size: 12px; color: Theme.mute; }
                 }
                 // 4-column grid: 3 rows of 4 tiles. Actions come from
                 // the button-actions model by index.
@@ -326,7 +320,7 @@ export component ButtonsPage inherits HorizontalLayout {
                         selected: edit-kind == 1 && edit-knob == 0;
                         flash: knob-flash-index == 0;
                         flash-text: knob-flash-text;
-                        clicked => { knob-selected(0); }
+                        clicked => { edit-kind = 1; edit-knob = 0; knob-selected(0); }
                     }
                     KnobCell {
                         horizontal-stretch: 1;
@@ -336,7 +330,7 @@ export component ButtonsPage inherits HorizontalLayout {
                         selected: edit-kind == 1 && edit-knob == 1;
                         flash: knob-flash-index == 1;
                         flash-text: knob-flash-text;
-                        clicked => { knob-selected(1); }
+                        clicked => { edit-kind = 1; edit-knob = 1; knob-selected(1); }
                     }
                 }
             }
@@ -416,9 +410,9 @@ export component ButtonsPage inherits HorizontalLayout {
             if edit-kind == 1 : VerticalLayout {
                 spacing: 5px;
                 Rectangle { height: 9px; }
-                KnobRow { label: "Turn left"; action: edit-knob == 0 ? knob1-left : knob2-left; selected: knob-row == 0; clicked => { knob-row-selected(0); } }
-                KnobRow { label: "Turn right"; action: edit-knob == 0 ? knob1-right : knob2-right; selected: knob-row == 1; clicked => { knob-row-selected(1); } }
-                KnobRow { label: "Press"; action: edit-knob == 0 ? knob1-press : knob2-press; selected: knob-row == 2; clicked => { knob-row-selected(2); } }
+                KnobRow { label: "Turn left"; action: edit-knob == 0 ? knob1-left : knob2-left; selected: knob-row == 0; clicked => { knob-row = 0; knob-row-selected(0); } }
+                KnobRow { label: "Turn right"; action: edit-knob == 0 ? knob1-right : knob2-right; selected: knob-row == 1; clicked => { knob-row = 1; knob-row-selected(1); } }
+                KnobRow { label: "Press"; action: edit-knob == 0 ? knob1-press : knob2-press; selected: knob-row == 2; clicked => { knob-row = 2; knob-row-selected(2); } }
             }
             Text {
                 text: edit-kind == 0 ? "What should it do?" : "What should this do?";

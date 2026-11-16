@@ -2115,7 +2115,7 @@ mod tests {
         let merged = store.set_settings_patch(patch);
         assert_eq!(merged.theme, "Light", "lowercase theme maps to canonical");
         assert_eq!(merged.esp_ip, "10.0.0.5", "absent esp_ip is kept");
-        assert_eq!(merged.output_backend, "HIDMaestro");
+        assert_eq!(merged.output_backend, "VJoy");
         cleanup(&dir);
     }
 

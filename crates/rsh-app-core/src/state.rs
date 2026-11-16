@@ -16,8 +16,8 @@
 //! trait object (`try_connect` / `try_connect_with_plan` / `disconnect` /
 //! `update` / `send_neutral`, all `Result`-based;
 //! `ProcessedState = rsh_engine::pipeline::OutputState`). The G4
-//! selector swaps the backend in this slot at runtime — `HIDMaestro`
-//! (default, G2), vJoy (fallback, G3), or the [`NullSink`](crate::system::NullSink)
+//! selector swaps the backend in this slot at runtime — vJoy
+//! (default, G3), `HIDMaestro` (explicit choice, G2), or the [`NullSink`](crate::system::NullSink)
 //! (no device) — via `AppStateCore::set_output_backend`. At launch the
 //! shell calls [`AppStateCore::activate_startup_backend`], which
 //! activates the persisted `AppSettings.output_backend` choice through
@@ -137,14 +137,20 @@
 //!   with no board they fail honestly instead of returning a guess.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Write as _;
 use std::future::Future;
 use std::net::IpAddr;
 use std::path::Path;
 use std::pin::Pin;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, Sender as StdSender};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime};
+
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use rsh_api::connection::{BAD_TAG_RETRY_DELAY, HELLO_ATTEMPTS, HELLO_WAIT};
 use rsh_api::errors::ConnectionError;
@@ -348,6 +354,64 @@ pub struct Calibration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibrated_at: Option<String>,
 }
+
+/// The background vJoy install's progress, as
+/// [`AppStateCore::vjoy_status`] reports it (v2.0.1 hotfix
+/// BACKEND-2). The install runs on its own thread
+/// ([`AppStateCore::install_vjoy`]); this is the only shared state
+/// between that thread and the status reader.
+#[derive(Clone, Debug, Default)]
+struct VjoyInstallState {
+    /// True while the download / install thread is running.
+    installing: bool,
+    /// The last install failure, when the last install failed.
+    error: Option<String>,
+}
+
+/// vJoy installer download (v2.0.1 hotfix BACKEND-2).
+///
+/// Verification status (checked 2026-11-16): the pinned driver is
+/// `BrunnerInnovation` vJoy **2.2.2.0** — the repo
+/// (`BrunnerInnovation/vJoy`) and the `v2.2.2.0` release (19 Dec
+/// 2023, EV + attestation signed, Win10/11) were verified on
+/// github.com itself, and the pinned `PINNED_DRIVER_VERSION_FULL`
+/// (`2.2.2.0`) in `rsh-output` already names this build. The asset
+/// file name and the SHA-256 / size below are corroborated by
+/// vjoy.pro (which states its hashes were verified from the actual
+/// upstream files); the asset listing itself was not visible in the
+/// text fetch of the GitHub release page, so the file name is
+/// corroborated, not directly listed. The hash + size check in
+/// [`run_vjoy_install`] is therefore load-bearing: a downloaded file
+/// that does not match is deleted and never executed. The whole
+/// flow still needs a user-PC verify (elevation + silent install
+/// cannot be tested on headless Linux).
+///
+/// The code's existing [`VJOY_DOWNLOAD_URL`] is Brunner's own guide
+/// page (`simux.brunner-innovation.swiss/guide/vjoy/`), NOT a
+/// downloadable file — it is an HTML page, so it cannot be the
+/// download source. The guide itself confirms the model: Simux
+/// downloads the installer, verifies it, then runs it.
+pub const VJOY_INSTALLER_URL: &str = "https://github.com/BrunnerInnovation/vJoy/releases/download/v2.2.2.0/vJoySetup_v2.2.2.0_Win10_Win11.exe";
+/// File name of the pinned installer (matches the URL's last segment).
+pub const VJOY_INSTALLER_FILE_NAME: &str = "vJoySetup_v2.2.2.0_Win10_Win11.exe";
+/// SHA-256 of the pinned installer (vjoy.pro, upstream-verified).
+pub const VJOY_INSTALLER_SHA256_HEX: &str =
+    "ef569a3105cd301b89580f18f60c66b339e95296acf2c0dfcaf4b4bbf8ab68fe";
+/// Size in bytes of the pinned installer (vjoy.pro).
+pub const VJOY_INSTALLER_SIZE_BYTES: u64 = 5_302_312;
+
+/// vJoy installer silent flags (v2.0.1 hotfix BACKEND-2). The vJoy
+/// installer is built with Inno Setup 6.0 (per the vJoy README's
+/// build instructions), so the documented Inno Setup silent flags
+/// apply: `/VERYSILENT` (no wizard, no progress window),
+/// `/SUPPRESSMSGBOXES` (no message boxes),
+/// `/NORESTART` (never reboot unattended — the driver may still need
+/// a restart, which the re-check reports honestly), `/SP-` (skip the
+/// "do you wish to continue?" prompt). The flags themselves are
+/// documented Inno Setup behaviour; the Brunner 2.2.2.0 installer
+/// honouring them still needs a user-PC verify.
+pub const VJOY_INSTALLER_ARGS: &[&str] =
+    &["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"];
 
 /// One emission from the snapshot emitter loop: either the latest
 /// snapshot (30 Hz) or a queued button-press event. The snapshot is
@@ -620,7 +684,7 @@ pub struct AppStateCore {
     encoders: Mutex<EncoderState>,
     /// The installed output backend ([`IJoystickOutput`]). Starts as
     /// the [`NullSink`]; the G4 selector swaps this slot at runtime
-    /// (`HIDMaestro` default, vJoy fallback, none) — see
+    /// (vJoy default, `HIDMaestro` explicit choice, none) — see
     /// [`AppStateCore::set_output_backend`].
     backend: Mutex<Box<dyn IJoystickOutput>>,
     /// Backend name, exactly as the backend reports it (`name()` at
@@ -713,6 +777,15 @@ pub struct AppStateCore {
     /// [`AppStateCore::activate_startup_backend`] call ([`None`] until
     /// the shell activates the persisted backend at launch).
     startup_backend: Mutex<Option<StartupBackendOutcome>>,
+    /// One-time v2.0.0 → v2.0.1 backend-default migration note
+    /// ([`migrate_persisted_backend_default`]): [`Some`] with the
+    /// human-readable note when this launch migrated a persisted
+    /// `HIDMaestro` default to vJoy, [`None`] otherwise. The daemon's
+    /// startup log should print it — a persisted choice must never
+    /// change silently.
+    backend_migration_note: Mutex<Option<String>>,
+    /// Background vJoy install progress (see [`VjoyInstallState`]).
+    vjoy_install: Mutex<VjoyInstallState>,
     /// HMAC session gate (SEC-E-14, H1 condition 13): `true` only
     /// once a `BoardSession` has completed its HMAC-verified
     /// `GET_CAPS` and the session owner opened the gate. Starts
@@ -873,14 +946,19 @@ impl AppStateCore {
     /// is taken from the backend itself (`name()`); `backend_detail`
     /// is the state's own human-readable note about the backend
     /// (never invented by the backend — see `with_null_sink`).
+    ///
+    /// Runs the one-time v2.0.0 → v2.0.1 backend-default migration
+    /// ([`migrate_persisted_backend_default`]) on the store first, so
+    /// `selected_backend` already reflects the migrated choice.
     #[must_use]
     pub fn new(
-        store: ProfileStore,
+        mut store: ProfileStore,
         backend: Box<dyn IJoystickOutput>,
         backend_detail: impl Into<String>,
     ) -> Self {
         let backend_name = backend.name().to_string();
         let output_enabled = store.settings().output_enabled;
+        let backend_migration_note = migrate_persisted_backend_default(&mut store);
         let selected_backend =
             BackendKind::parse(&store.settings().output_backend).unwrap_or(BackendKind::DEFAULT);
         let esp_ip = store.settings().esp_ip.clone();
@@ -919,6 +997,8 @@ impl AppStateCore {
             engine_last_report: Mutex::new(None),
             engine_encoders: Mutex::new(EngineEncoderAccum::default()),
             startup_backend: Mutex::new(None),
+            backend_migration_note: Mutex::new(backend_migration_note),
+            vjoy_install: Mutex::new(VjoyInstallState::default()),
             session_gate_open: Mutex::new(false),
             session_gate_held_frames: Mutex::new(0),
             session_activation: Mutex::new(None),
@@ -1026,6 +1106,15 @@ impl AppStateCore {
     #[must_use]
     pub fn selected_backend(&self) -> BackendKind {
         *lock(&self.selected_backend)
+    }
+
+    /// The one-time backend-default migration note for this launch
+    /// ([`Some`] when [`AppStateCore::new`] migrated a persisted
+    /// `HIDMaestro` default to vJoy). The daemon's startup log
+    /// should print it so the change is visible, never silent.
+    #[must_use]
+    pub fn backend_migration_note(&self) -> Option<String> {
+        lock(&self.backend_migration_note).clone()
     }
 
     /// Registers the engine's stop handle (called by whoever spawns
@@ -2639,7 +2728,7 @@ impl AppStateCore {
     /// Selects the output backend by name (`"HIDMaestro"`, `"vJoy"`,
     /// `"none"` / `"null"` / `"NullSink"`; case-insensitive) and
     /// switches the live slot at runtime — no restart. Default is
-    /// `HIDMaestro`; a failed `HIDMaestro` connect falls back to vJoy
+    /// `vJoy`; a failed `HIDMaestro` connect falls back to vJoy
     /// with the reason recorded in the returned state's detail, and a
     /// failed connect of any kind leaves the previous backend exactly
     /// as it was (see [`switch_backend`]).
@@ -2780,7 +2869,7 @@ impl AppStateCore {
 
     /// Activates the persisted output backend choice at launch
     /// (coordinator decision under delegation): reads
-    /// `AppSettings.output_backend` (default `HIDMaestro`) and switches
+    /// `AppSettings.output_backend` (default `vJoy`) and switches
     /// the live slot through the selector — EXCEPT an elevated backend,
     /// which is NEVER activated at startup (hotfix v1.0.1, coordinator
     /// Option A — defer): activating `HIDMaestro` would launch its
@@ -2905,7 +2994,7 @@ impl AppStateCore {
             BackendStatus {
                 id: BackendKind::HidMaestro.as_str().to_string(),
                 name: BackendKind::HidMaestro.display_name().to_string(),
-                is_default: true,
+                is_default: false,
                 selected: selected == BackendKind::HidMaestro,
                 active: live_kind == BackendKind::HidMaestro,
                 connected: live_kind == BackendKind::HidMaestro && connected,
@@ -2915,17 +3004,16 @@ impl AppStateCore {
                 detail: if live_kind == BackendKind::HidMaestro {
                     live_detail.clone()
                 } else if hidmaestro_installed {
-                    "HIDMaestro sidecar found. Default backend — activation is deferred at startup (no UAC prompt on launch); enable output to activate it, and Windows will ask (UAC) then.".to_string()
+                    "HIDMaestro sidecar found. Explicit-choice backend — activation is deferred at startup (no UAC prompt on launch); enable output to activate it, and Windows will ask (UAC) then.".to_string()
                 } else {
-                    "HIDMaestro sidecar not found — reinstall RSH to use the default backend."
-                        .to_string()
+                    "HIDMaestro sidecar not found — reinstall RSH to use this backend.".to_string()
                 },
                 download_url: None,
             },
             BackendStatus {
                 id: BackendKind::VJoy.as_str().to_string(),
                 name: BackendKind::VJoy.display_name().to_string(),
-                is_default: false,
+                is_default: true,
                 selected: selected == BackendKind::VJoy,
                 active: live_kind == BackendKind::VJoy,
                 connected: live_kind == BackendKind::VJoy && connected,
@@ -2936,10 +3024,10 @@ impl AppStateCore {
                     live_detail.clone()
                 } else if vjoy_installed {
                     format!(
-                        "vJoy driver found (device {vjoy_device_id}). Fallback backend — needs no UAC prompt."
+                        "vJoy driver found (device {vjoy_device_id}). Default backend — needs no UAC prompt."
                     )
                 } else {
-                    "vJoy not found — install vJoy 2.2.2.0 to enable the fallback backend."
+                    "vJoy not found — install vJoy 2.2.2.0 to enable the default backend."
                         .to_string()
                 },
                 download_url: if vjoy_installed {
@@ -2966,6 +3054,81 @@ impl AppStateCore {
                 download_url: None,
             },
         ]
+    }
+
+    /// vJoy driver status (v2.0.1 hotfix BACKEND-2): whether the DLL
+    /// was found (file probe), whether a background install is
+    /// running, the last install failure, and the resolved DLL path.
+    /// `version` is [`None`]: there is no version read without
+    /// loading the DLL, and an unmeasured version is never invented.
+    #[must_use]
+    pub fn vjoy_status(&self) -> rsh_api::VjoyStatus {
+        let install = lock(&self.vjoy_install);
+        rsh_api::VjoyStatus {
+            installed: resolve_dll_path().is_some(),
+            installing: install.installing,
+            install_error: install.error.clone(),
+            dll_path: resolve_dll_path().map(|path| path.to_string_lossy().into_owned()),
+            version: None,
+        }
+    }
+
+    /// Start a vJoy driver install in the background (v2.0.1 hotfix
+    /// BACKEND-2) and return immediately: the download + silent
+    /// install run on their own thread ([`run_vjoy_install`]) and
+    /// progress / failure surface through
+    /// [`AppStateCore::vjoy_status`] polling — never by blocking the
+    /// caller. The installer needs admin once (its own manifest
+    /// triggers the UAC prompt); that is expected and unlike
+    /// `HIDMaestro`, which prompts on every launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message on non-Windows (vJoy is Windows-only) or
+    /// when the install cannot be started. An already-installed
+    /// driver or an install already in progress is not an error —
+    /// the returned message says so.
+    pub fn install_vjoy(self: &Arc<Self>) -> Result<String, String> {
+        if !cfg!(windows) {
+            return Err("vJoy is Windows-only".to_string());
+        }
+        if resolve_dll_path().is_some() {
+            return Ok("vJoy is already installed".to_string());
+        }
+        {
+            let mut install = lock(&self.vjoy_install);
+            if install.installing {
+                return Ok("vJoy install already in progress".to_string());
+            }
+            install.installing = true;
+            install.error = None;
+        }
+        let state = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("rsh-vjoy-install".to_string())
+            .spawn(move || run_vjoy_install(&state))
+            .map_err(|error| format!("could not start the vJoy install thread: {error}"))?;
+        Ok("vJoy install started".to_string())
+    }
+
+    /// Live engine / link diagnostics (v2.0.1 hotfix BACKEND-2): the
+    /// measured engine stats (loop rate, loss, jitter / latency
+    /// p99s) plus the board's `seqGap` / `txFail` counters from the
+    /// latest snapshot. Every field is measured — an unmeasured rate
+    /// is [`None`], never a fake 200 Hz.
+    #[must_use]
+    pub fn diag_stats(&self) -> rsh_api::DiagStats {
+        let stats = self.engine_stats();
+        let snapshot = self.snapshot();
+        rsh_api::DiagStats {
+            loop_hz: stats.loop_hz,
+            loss_pct: stats.loss_pct,
+            jitter_ms_p99: stats.jitter_ms_p99,
+            output_latency_ms: stats.output_latency_ms,
+            e2e_ms: stats.e2e_ms,
+            seq_gap: snapshot.seq_gap,
+            tx_fail: snapshot.tx_fail,
+        }
     }
 
     /// Real shutdown-neutral actuation (D-F3 / F4): signals the engine
@@ -4565,9 +4728,146 @@ impl OutputSink for EngineSink {
     }
 }
 
-/// Builds the real backend factories for the selector: `HIDMaestro`
-/// (default), vJoy (fallback, this settings' device id), and the
-/// no-device sink.
+/// Pure half of [`migrate_persisted_backend_default`]: migrate only
+/// when the persisted choice is the old default (`HIDMaestro`) AND
+/// vJoy is actually installed — a persisted `HIDMaestro` with no vJoy
+/// driver stays put (the setup wizard offers the vJoy install as the
+/// fallback instead), and any other persisted choice is never touched.
+/// There is no way to tell a v2.0.0 default apart from an explicit
+/// user `HIDMaestro` choice — the store records only the value — so
+/// this migration knowingly also moves an explicit `HIDMaestro`
+/// choice when vJoy is installed; the user can re-pick `HIDMaestro` on
+/// the Output page, and the migration note names the change.
+#[must_use]
+pub fn should_migrate_persisted_backend(persisted_backend: &str, vjoy_installed: bool) -> bool {
+    persisted_backend == "HIDMaestro" && vjoy_installed
+}
+
+/// One-time v2.0.0 → v2.0.1 migration (BACKEND-2): v2.0.0 persisted
+/// `HIDMaestro` as the default on every install, so every existing
+/// store carries it. When vJoy is installed, the persisted choice is
+/// switched to `VJoy` and saved, and the human-readable note is
+/// returned for the startup log; otherwise nothing changes and
+/// [`None`] is returned. A save failure reverts the in-memory
+/// settings to `HIDMaestro` (disk and memory must agree) and returns
+/// [`None`] — the next launch retries the migration.
+pub fn migrate_persisted_backend_default(store: &mut ProfileStore) -> Option<String> {
+    if !should_migrate_persisted_backend(
+        &store.settings().output_backend,
+        resolve_dll_path().is_some(),
+    ) {
+        return None;
+    }
+    let mut settings = store.settings().clone();
+    settings.output_backend = "VJoy".to_string();
+    store.set_settings(settings);
+    if let Ok(()) = store.save() {
+        Some(
+            "migrated persisted HIDMaestro default to VJoy (vJoy driver found; re-pick HIDMaestro on the Output page to go back)"
+                .to_string(),
+        )
+    } else {
+        let mut settings = store.settings().clone();
+        settings.output_backend = "HIDMaestro".to_string();
+        store.set_settings(settings);
+        None
+    }
+}
+
+/// Background vJoy install worker (v2.0.1 hotfix BACKEND-2): download
+/// the pinned installer with the inbox `curl.exe` (Windows 10+),
+/// verify size + SHA-256 before executing anything, run it silent
+/// ([`VJOY_INSTALLER_ARGS`]), then re-probe the DLL. Runs on its own
+/// thread; it only ever touches [`AppStateCore::vjoy_install`], and
+/// always clears `installing` — success or failure — so a stuck
+/// "installing" can never wedge the status. The installer exe's own
+/// manifest triggers the one UAC prompt; the download itself runs
+/// without a console window (`CREATE_NO_WINDOW`).
+fn run_vjoy_install(state: &Arc<AppStateCore>) {
+    let result = run_vjoy_install_inner();
+    let mut install = lock(&state.vjoy_install);
+    install.installing = false;
+    install.error = result.err();
+}
+
+/// The fallible half of [`run_vjoy_install`]: `Ok(())` only when the
+/// DLL resolves after the install; every failure path returns the
+/// message the status reports.
+fn run_vjoy_install_inner() -> Result<(), String> {
+    let dir = std::env::temp_dir().join("RSH");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create the vJoy download folder: {error}"))?;
+    let installer = dir.join(VJOY_INSTALLER_FILE_NAME);
+    // Windows 10+ ships curl.exe — no new HTTP dependency. The
+    // download runs windowless; `--fail` makes HTTP errors fail the
+    // command instead of writing an error page to the file.
+    let mut download = Command::new("curl.exe");
+    download.args([
+        "-L",
+        "--fail",
+        "-o",
+        &installer.to_string_lossy(),
+        VJOY_INSTALLER_URL,
+    ]);
+    #[cfg(windows)]
+    download.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let status = download
+        .status()
+        .map_err(|error| format!("could not run curl.exe to download vJoy: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "vJoy download failed (curl exit {}); check the connection and retry",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    let bytes = std::fs::read(&installer)
+        .map_err(|error| format!("downloaded vJoy installer could not be read: {error}"))?;
+    let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if size != VJOY_INSTALLER_SIZE_BYTES {
+        let _ = std::fs::remove_file(&installer);
+        return Err(format!(
+            "downloaded vJoy installer has the wrong size ({size} bytes, expected {VJOY_INSTALLER_SIZE_BYTES}) — deleted, not run"
+        ));
+    }
+    let digest = Sha256::digest(&bytes);
+    let hex = digest
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, byte| {
+            let _ = write!(acc, "{byte:02x}");
+            acc
+        });
+    if hex != VJOY_INSTALLER_SHA256_HEX {
+        let _ = std::fs::remove_file(&installer);
+        return Err(
+            "downloaded vJoy installer failed SHA-256 verification — deleted, not run (download source unverified)"
+                .to_string(),
+        );
+    }
+    // Silent install. The exe's manifest elevates (one UAC prompt —
+    // expected); `/NORESTART` never reboots unattended.
+    let status = Command::new(&installer)
+        .args(VJOY_INSTALLER_ARGS)
+        .status()
+        .map_err(|error| format!("could not run the vJoy installer: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "vJoy installer exited with code {}",
+            status.code().unwrap_or(-1)
+        ));
+    }
+    if resolve_dll_path().is_some() {
+        Ok(())
+    } else {
+        Err(
+            "vJoy installer finished but the driver DLL was not found — a restart may be required"
+                .to_string(),
+        )
+    }
+}
+
+/// Builds the real backend factories for the selector: vJoy
+/// (default), `HIDMaestro` (explicit choice, this settings' device
+/// id), and the no-device sink.
 fn real_backend_factories(vjoy_device_id: u32) -> BackendFactories {
     BackendFactories {
         hidmaestro: Some(Box::new(|| {
@@ -6090,9 +6390,9 @@ async fn forward_with_retry_with_policy<T, F>(
 #[must_use]
 fn live_backend_detail(kind: BackendKind, vjoy_device_id: u32) -> String {
     match kind {
-        BackendKind::HidMaestro => format!("HIDMaestro — default backend. {UAC_NOTE}"),
+        BackendKind::HidMaestro => format!("HIDMaestro — explicit-choice backend. {UAC_NOTE}"),
         BackendKind::VJoy => {
-            format!("vJoy device {vjoy_device_id} — fallback backend, no UAC prompt needed.")
+            format!("vJoy device {vjoy_device_id} — default backend, no UAC prompt needed.")
         }
         BackendKind::None => "No output backend — output is disabled.".to_string(),
     }
@@ -6436,7 +6736,9 @@ mod tests {
         assert!(error.contains("vJoy fallback also failed"), "{error}");
         // The choice is still persisted (the next launch retries it)…
         assert_eq!(state.settings().output_backend, "HIDMaestro");
-        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
+        // …but the failed switch never moved the in-memory selection
+        // off the previous choice (the vJoy default here).
+        assert_eq!(state.selected_backend(), BackendKind::VJoy);
         // …but the live backend is untouched: still the sink, still
         // disconnected.
         assert_eq!(state.backend_name(), "NullSink");
@@ -6459,8 +6761,8 @@ mod tests {
         let hidmaestro = &backends[0];
         assert_eq!(hidmaestro.id, "hidmaestro");
         assert_eq!(hidmaestro.name, "HIDMaestro");
-        assert!(hidmaestro.is_default);
-        assert!(hidmaestro.selected, "settings default is HIDMaestro");
+        assert!(!hidmaestro.is_default, "vJoy is the default since v2.0.1");
+        assert!(!hidmaestro.selected, "settings default is vJoy");
         assert!(hidmaestro.elevation_required);
         assert!(
             hidmaestro
@@ -6479,7 +6781,8 @@ mod tests {
         assert_eq!(hidmaestro.download_url, None);
         let vjoy = &backends[1];
         assert_eq!(vjoy.id, "vjoy");
-        assert!(!vjoy.is_default);
+        assert!(vjoy.is_default, "vJoy is the default since v2.0.1");
+        assert!(vjoy.selected, "settings default is vJoy");
         assert_eq!(vjoy.installed, Some(false), "no vJoy DLL in the sandbox");
         assert_eq!(vjoy.download_url.as_deref(), Some(VJOY_DOWNLOAD_URL));
         assert!(!vjoy.elevation_required);
@@ -6504,6 +6807,75 @@ mod tests {
         assert!(live_backend_detail(BackendKind::HidMaestro, 1).contains("every launch"));
         // vJoy names the absence of a prompt, not the presence of one.
         assert!(live_backend_detail(BackendKind::VJoy, 1).contains("no UAC prompt"));
+        // …and vJoy is the default since v2.0.1, HIDMaestro the
+        // explicit choice.
+        assert!(live_backend_detail(BackendKind::VJoy, 1).contains("default backend"));
+        assert!(!live_backend_detail(BackendKind::HidMaestro, 1).contains("default backend"));
+    }
+
+    // -- v2.0.1 hotfix BACKEND-2: default backend vJoy ----------------
+
+    #[test]
+    fn fresh_store_defaults_to_vjoy_backend() {
+        let (state, _dir) = test_state();
+        assert_eq!(state.selected_backend(), BackendKind::VJoy);
+        assert_eq!(state.settings().output_backend, "VJoy");
+        // Linux sandbox: no vJoy DLL, so no migration ran here.
+        assert_eq!(state.backend_migration_note(), None);
+    }
+
+    #[test]
+    fn persisted_backend_migration_decision() {
+        // Only a persisted HIDMaestro WITH vJoy installed migrates.
+        assert!(should_migrate_persisted_backend("HIDMaestro", true));
+        assert!(!should_migrate_persisted_backend("HIDMaestro", false));
+        assert!(!should_migrate_persisted_backend("VJoy", true));
+        assert!(!should_migrate_persisted_backend("None", true));
+        assert!(!should_migrate_persisted_backend("Sideways", true));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn vjoy_status_reports_not_installed_on_linux() {
+        let (state, _dir) = test_state();
+        let status = state.vjoy_status();
+        assert!(!status.installed, "no vJoy DLL in the sandbox");
+        assert!(!status.installing);
+        assert_eq!(status.install_error, None);
+        assert_eq!(status.dll_path, None);
+        assert_eq!(status.version, None, "version is never invented");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn install_vjoy_is_windows_only_on_linux() {
+        let (state, _dir) = test_state();
+        let error = state
+            .install_vjoy()
+            .expect_err("vJoy install must refuse on Linux");
+        assert!(error.contains("Windows-only"), "{error}");
+        // The refusal leaves no install running.
+        assert!(!state.vjoy_status().installing);
+    }
+
+    #[test]
+    fn diag_stats_reports_measured_values_not_constants() {
+        let (state, _dir) = test_state();
+        // No ticks yet: rate unmeasured, loss a real 0 %, counters 0.
+        let diag = state.diag_stats();
+        assert_eq!(diag.loop_hz, None);
+        assert_eq!(diag.loss_pct, 0.0);
+        assert_eq!(diag.jitter_ms_p99, None);
+        assert_eq!(diag.seq_gap, 0);
+        assert_eq!(diag.tx_fail, 0);
+        // One tick: still unmeasured rate, counters still the
+        // frame's (zero) values — never a fake 200 Hz.
+        let _ = state.ingest_frame(test_frame(0.0));
+        let diag = state.diag_stats();
+        assert_eq!(diag.loop_hz, None);
+        assert_eq!(diag.loss_pct, 0.0);
+        assert_eq!(diag.seq_gap, 0);
+        assert_eq!(diag.tx_fail, 0);
     }
 
     #[test]
@@ -6962,7 +7334,7 @@ mod tests {
         let merged = state.set_settings_patch(patch).expect("patch applies");
         assert_eq!(merged.theme, "Light", "lowercase theme maps to canonical");
         assert_eq!(merged.esp_ip, "10.0.0.5", "absent esp_ip is kept");
-        assert_eq!(merged.output_backend, "HIDMaestro");
+        assert_eq!(merged.output_backend, "VJoy");
     }
 
     /// M-1: a public `esp_ip` is sanitized to the board AP default on
@@ -7387,11 +7759,13 @@ mod tests {
         // would connect fine, no factory is touched, no UAC prompt
         // could appear. The outcome records the deferral, the NullSink
         // stays installed, and the persisted choice is untouched.
-        let (state, _dir) = test_state();
+        // (The fresh-store default is vJoy since v2.0.1, so the
+        // persisted HIDMaestro choice is set explicitly here.)
+        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
         assert_eq!(
             state.selected_backend(),
             BackendKind::HidMaestro,
-            "settings default is HIDMaestro"
+            "persisted HIDMaestro choice is selected"
         );
         let factories = mock_factories(false, false);
         let outcome = state.activate_startup_backend_with_factories(&factories);
@@ -7469,7 +7843,9 @@ mod tests {
         // The deferred backend is activated on the first user-initiated
         // enable: startup defers, then `set_output_enabled(true)`
         // switches the selected HIDMaestro backend in and connects it.
-        let (state, _dir) = test_state();
+        // (Fresh-store default is vJoy since v2.0.1 — the persisted
+        // HIDMaestro choice is set explicitly here.)
+        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
         let factories = mock_factories(false, false);
         let deferred = state.activate_startup_backend_with_factories(&factories);
         assert_eq!(deferred.active, None, "startup defers HIDMaestro");
@@ -7485,7 +7861,9 @@ mod tests {
         // Enable after a deferred startup, with both mock backends
         // failing to connect: no backend goes live, the NullSink stays
         // installed, and the returned state says why.
-        let (state, _dir) = test_state();
+        // (Fresh-store default is vJoy since v2.0.1 — the persisted
+        // HIDMaestro choice is set explicitly here.)
+        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
         let factories = mock_factories(true, true);
         let deferred = state.activate_startup_backend_with_factories(&factories);
         assert_eq!(deferred.active, None, "startup defers HIDMaestro");
@@ -7512,7 +7890,9 @@ mod tests {
         // connect failure: no factory is touched, nothing is probed),
         // and the outcome must say so instead of silently staying on
         // the NullSink.
-        let (state, _dir) = test_state();
+        // (Fresh-store default is vJoy since v2.0.1 — the persisted
+        // HIDMaestro choice is set explicitly here.)
+        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
         let outcome = state.activate_startup_backend();
         assert_eq!(outcome.requested, BackendKind::HidMaestro);
         assert_eq!(outcome.active, None);

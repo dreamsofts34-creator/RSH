@@ -9,10 +9,13 @@ dirs.workspace = true
 rsh-api = { path = "../rsh-api" }
 rsh-engine = { path = "../rsh-engine" }
 rsh-output = { path = "../rsh-output" }
-# G4: AppStateCore constructs the real backends (HIDMaestro default,
-# vJoy fallback) for the selector. No cycle: this crate never feeds
-# back into `rsh-output-hidmaestro`.
+# G4: AppStateCore constructs the real backends (vJoy default,
+# HIDMaestro explicit choice) for the selector. No cycle: this crate
+# never feeds back into `rsh-output-hidmaestro`.
 rsh-output-hidmaestro = { path = "../rsh-output-hidmaestro" }
+# v2.0.1 hotfix BACKEND-2: SHA-256 verification of the downloaded
+# vJoy installer (same pin as rsh-output / dev-deps, 0.11.1).
+sha2 = "=0.11.1"
 rsh-profiles = { path = "../rsh-profiles" }
 rsh-protocol = { path = "../rsh-protocol" }
 rsh-security = { path = "../rsh-security" }

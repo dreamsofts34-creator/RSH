@@ -11,8 +11,11 @@
 //!
 //! # Rules
 //!
-//! * **Default is `HIDMaestro`** ([`BackendKind::DEFAULT`]); vJoy is the
-//!   fallback; `None` is the no-device sink.
+//! * **Default is `vJoy`** ([`BackendKind::DEFAULT`]); `HIDMaestro`
+//!   is the explicit elevated choice; `None` is the no-device sink.
+//!   (v2.0.1 hotfix: `HIDMaestro` was the default until v2.0.0, but its
+//!   sidecar needs elevation, so it popped a UAC prompt on every
+//!   launch — vJoy needs none after its one-time install.)
 //! * **Switch without restart where possible:** the switch below runs
 //!   on the live backend slot — no process restart, no engine restart.
 //!   The engine keeps ticking against whatever backend the slot holds
@@ -51,9 +54,10 @@ use crate::error::OutputError;
 /// The output backend the user can select (Settings/Output page).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BackendKind {
-    /// `HIDMaestro` — the default backend (G2, elevated sidecar).
+    /// `HIDMaestro` — the explicit elevated choice (G2, elevated
+    /// sidecar). Never the default: activating it pops a UAC prompt.
     HidMaestro,
-    /// vJoy — the fallback backend (G3, FFI, no elevation needed).
+    /// vJoy — the default backend (G3, FFI, no elevation needed).
     VJoy,
     /// No output device — the no-device sink. The wheel sends nothing
     /// to games.
@@ -61,8 +65,10 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
-    /// The default backend: `HIDMaestro` (architecture Phase G).
-    pub const DEFAULT: Self = Self::HidMaestro;
+    /// The default backend: `vJoy` (v2.0.1 hotfix — `HIDMaestro`
+    /// was the default until v2.0.0; its per-launch UAC prompt made
+    /// it unfit as the default).
+    pub const DEFAULT: Self = Self::VJoy;
 
     /// Parse a user- or settings-supplied backend name
     /// (case-insensitive; `"null"` / `"NullSink"` also mean [`None`](BackendKind::None)).
@@ -125,7 +131,7 @@ impl BackendKind {
     /// True for the default backend ([`BackendKind::DEFAULT`]).
     #[must_use]
     pub const fn is_default(self) -> bool {
-        matches!(self, Self::HidMaestro)
+        matches!(self, Self::VJoy)
     }
 
     /// Fallback target when this backend's connect fails:
@@ -582,10 +588,10 @@ mod tests {
     }
 
     #[test]
-    fn default_backend_is_hidmaestro() {
-        assert_eq!(BackendKind::DEFAULT, BackendKind::HidMaestro);
-        assert!(BackendKind::HidMaestro.is_default());
-        assert!(!BackendKind::VJoy.is_default());
+    fn default_backend_is_vjoy() {
+        assert_eq!(BackendKind::DEFAULT, BackendKind::VJoy);
+        assert!(BackendKind::VJoy.is_default());
+        assert!(!BackendKind::HidMaestro.is_default());
         assert_eq!(BackendKind::HidMaestro.fallback(), Some(BackendKind::VJoy));
         assert_eq!(BackendKind::VJoy.fallback(), None);
         assert_eq!(BackendKind::None.fallback(), None);

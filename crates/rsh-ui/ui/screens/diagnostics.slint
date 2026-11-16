@@ -4,17 +4,16 @@
 // only — the shell places it at the right edge of the window, above the
 // page, and shows/hides it; it does NOT own the Window.
 //
-// Live data: the AppApi exposes no packet-stat or event-log methods
-// yet, so every value below is a Rust-owned prop (sim feed until the
-// daemon/telemetry push lands — the props are the integration seam).
-// Charts take Path command strings (same approach as the steering
-// curve in components.slint: Rust builds the polyline from the ring
-// buffer; defaults draw a flat sample line so the drawer renders
-// without Rust data). Close button + Esc (Esc via a FocusScope
-// key-pressed handler, `event.text == Key.Escape`; the shell must call
-// focus() on the drawer when opening it. `@keys(Escape)` on a callback
-// is NOT valid Slint 1.18.1 syntax — the compiler rejects it, verified
-// 2026-11-16.)
+// Live data: packet stats come from the daemon telemetry push
+// (diag_stats) when it exists; until then every stat reads "—" and
+// the charts draw the live steering/pedal ring buffers Rust feeds
+// (A20/A21). Nothing here invents a value: no telemetry means an
+// explicit "No telemetry yet" line, never a plausible-looking 4 ms.
+// Connection / versions ride in as props (A21) — they used to live
+// only in the `diag-events` strings.
+import { Theme } from "../tokens.slint";
+import { Btn, HBar } from "../components.slint";
+import { ScrollView } from "std-widgets.slint";
 
 import { Theme } from "../tokens.slint";
 import { Btn, HBar } from "../components.slint";
@@ -72,22 +71,27 @@ component StatCell inherits VerticalLayout {
 }
 
 export component DiagnosticsDrawer inherits FocusScope {
-    // ---- live values (Rust-owned props; sim until telemetry lands)
-    in property <string> steer-chart: "M 0 45 L 60 45 L 120 43 L 180 47 L 240 44 L 300 46 L 380 45";
-    in property <string> steer-readout: "0°";
-    in property <string> pedals-chart: "M 0 70 L 60 68 L 120 60 L 180 55 L 240 62 L 300 70 L 380 70";
-    in property <string> pedals-readout: "Throttle 0%";
-    in property <string> delay-text: "4 ms";
-    in property <string> jitter-text: "1 ms";
-    in property <string> lost-text: "0%";
-    in property <string> loop-rate-text: "200 Hz";
-    in property <string> tx-failures-text: "0";
-    in property <string> seq-gaps-text: "0";
+    // ---- live values (Rust-owned props; "—" until telemetry lands)
+    in property <string> steer-chart: "";
+    in property <string> steer-readout: "—";
+    in property <string> pedals-chart: "";
+    in property <string> pedals-readout: "—";
+    in property <string> delay-text: "—";
+    in property <string> jitter-text: "—";
+    in property <string> lost-text: "—";
+    in property <string> loop-rate-text: "—";
+    in property <string> tx-failures-text: "—";
+    in property <string> seq-gaps-text: "—";
     in property <bool> stats-bad: false;
+    // A21: connection + versions as real props (not event-log strings).
+    in property <string> conn-label: "—";
+    in property <bool> daemon-live: false;
+    in property <string> app-version: "—";
+    in property <string> firmware: "—";
     in property <[string]> events;
     in property <[bool]> buttons-pressed;
-    in property <string> knob-1-text: "Knob 1 · 0";
-    in property <string> knob-2-text: "Knob 2 · 0";
+    in property <string> knob-1-text: "Knob 1 · —";
+    in property <string> knob-2-text: "Knob 2 · —";
     in property <float> throttle-pct: 0;
     in property <float> brake-pct: 0;
     in property <float> clutch-pct: 0;
@@ -135,6 +139,14 @@ export component DiagnosticsDrawer inherits FocusScope {
                     padding-left: 16px;
                     padding-right: 16px;
                     spacing: 14px;
+                    // A21: connection + versions, as props.
+                    Text { text: "Connection"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text { text: "Status: " + conn-label; font-family: Theme.font-mono; font-size: 12px; color: Theme.mute; }
+                        Text { text: "Background service: " + (daemon-live ? "running" : "not running"); font-family: Theme.font-mono; font-size: 12px; color: Theme.mute; }
+                        Text { text: "App: " + app-version + " · Firmware: " + firmware; font-family: Theme.font-mono; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
+                    }
                     // live charts (§8.3)
                     LiveChart { title: "Steering"; chart-commands: steer-chart; readout: steer-readout; }
                     LiveChart { title: "Pedals"; chart-commands: pedals-chart; readout: pedals-readout; }
@@ -143,6 +155,7 @@ export component DiagnosticsDrawer inherits FocusScope {
                     HBar { label: "Clutch"; pct: clutch-pct; bar-color: Theme.accent; }
                     // packet stats (§8.3)
                     Text { text: "Packet stats"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    if delay-text == "—" && lost-text == "—" : Text { text: "No telemetry yet — stats appear once the wheel streams data."; font-size: 12px; color: Theme.faint; wrap: word-wrap; }
                     HorizontalLayout {
                         spacing: 12px;
                         StatCell { horizontal-stretch: 1; label: "Delay"; value: delay-text; bad: stats-bad; }
@@ -152,8 +165,8 @@ export component DiagnosticsDrawer inherits FocusScope {
                     HorizontalLayout {
                         spacing: 12px;
                         StatCell { horizontal-stretch: 1; label: "Loop rate"; value: loop-rate-text; }
-                        StatCell { horizontal-stretch: 1; label: "TX failures"; value: tx-failures-text; bad: tx-failures-text != "0"; }
-                        StatCell { horizontal-stretch: 1; label: "Sequence gaps"; value: seq-gaps-text; bad: seq-gaps-text != "0"; }
+                        StatCell { horizontal-stretch: 1; label: "TX failures"; value: tx-failures-text; bad: tx-failures-text != "0" && tx-failures-text != "—"; }
+                        StatCell { horizontal-stretch: 1; label: "Sequence gaps"; value: seq-gaps-text; bad: seq-gaps-text != "0" && seq-gaps-text != "—"; }
                     }
                     // event log (§8.3)
                     Text { text: "Event log"; font-size: 12.5px; font-weight: 600; color: Theme.text; }

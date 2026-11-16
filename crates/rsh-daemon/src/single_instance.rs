@@ -7,8 +7,10 @@
 //!   A second instance finds the mutex held and exits after
 //!   signalling via IPC.
 //! * Linux: a lock file `<data_dir>/rsh-daemon.pid` holding the
-//!   daemon's pid. A second instance reads the pid, checks the
-//!   process is alive (`/proc/<pid>`), signals via IPC, and exits.
+//!   daemon's pid. A second instance reads the pid and checks the
+//!   process is a live `rsh-daemon` (its `/proc/<pid>/cmdline` must
+//!   name it — a recycled pid belonging to another program, or a
+//!   zombie, is stale and reclaimed), signals via IPC, and exits.
 //!   A stale pid file (dead pid) is reclaimed.
 //!
 //! The UI-open hook lands in Phase 3: for now the second instance
@@ -57,8 +59,7 @@ pub fn acquire(data_dir: &std::path::Path) -> Result<AcquireOutcome, String> {
     let path = data_dir.join("rsh-daemon.pid");
     if let Ok(existing) = std::fs::read_to_string(&path)
         && let Ok(pid) = existing.trim().parse::<u32>()
-        // Alive? (/proc/<pid> exists and is not a zombie we own.)
-        && std::path::Path::new(&format!("/proc/{pid}")).exists()
+        && pid_is_live_rsh_daemon(pid)
     {
         return Ok(AcquireOutcome::AlreadyRunning(Some(pid)));
     }
@@ -106,6 +107,39 @@ pub fn acquire(_data_dir: &std::path::Path) -> Result<AcquireOutcome, String> {
     Ok(AcquireOutcome::First(SingleInstance::Mutex { handle }))
 }
 
+/// Whether `pid` is a live `rsh-daemon` process (Linux pid-file
+/// check). `/proc/<pid>` merely existing is not enough: pids are
+/// recycled, so a stale file can name an unrelated live process
+/// (then the new daemon would exit believing a daemon is running,
+/// with no tray and no IPC), and a zombie still has a `/proc` entry
+/// after its daemon died. Both are stale. The command line must name
+/// `rsh-daemon`; an unreadable command line is treated as live
+/// (conservative — never steal a lock we cannot identify).
+#[cfg(unix)]
+fn pid_is_live_rsh_daemon(pid: u32) -> bool {
+    use std::path::Path;
+    if !Path::new(&format!("/proc/{pid}")).exists() {
+        return false;
+    }
+    // Zombie: dead, but /proc still lists it. The state is the
+    // character after the final `) ` of the comm field.
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        && let Some(state) = stat
+            .rsplit(") ")
+            .next()
+            .and_then(|rest| rest.chars().next())
+        && state == 'Z'
+    {
+        return false;
+    }
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(cmdline) => String::from_utf8_lossy(&cmdline)
+            .split('\0')
+            .any(|arg| arg.contains("rsh-daemon")),
+        Err(_) => true,
+    }
+}
+
 impl SingleInstance {
     /// Release the lock (pid file removed / mutex dropped). Called
     /// on clean shutdown; a crash leaves the pid file behind, and
@@ -125,5 +159,71 @@ impl SingleInstance {
             let SingleInstance::Mutex { handle } = self;
             let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rsh-single-instance-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn write_pid(dir: &std::path::Path, pid: u32) {
+        let mut file = std::fs::File::create(dir.join("rsh-daemon.pid")).expect("pid file");
+        writeln!(file, "{pid}").expect("write pid");
+    }
+
+    #[test]
+    fn stale_pid_file_for_a_dead_process_is_reclaimed() {
+        let dir = temp_dir("stale");
+        // A pid that can never exist (past the kernel pid limit).
+        write_pid(&dir, u32::MAX);
+        assert!(matches!(acquire(&dir), Ok(AcquireOutcome::First(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recycled_pid_belonging_to_another_program_is_reclaimed() {
+        let dir = temp_dir("recycled");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        write_pid(&dir, pid);
+        assert!(matches!(acquire(&dir), Ok(AcquireOutcome::First(_))));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_of_a_process_named_rsh_daemon_is_already_running() {
+        let dir = temp_dir("live");
+        // `exec -a` renames argv[0], so the child's cmdline names
+        // rsh-daemon without running the real daemon.
+        let mut child = std::process::Command::new("bash")
+            .args(["-c", "exec -a rsh-daemon sleep 30"])
+            .spawn()
+            .expect("spawn bash");
+        let pid = child.id();
+        // Give the exec a moment to happen before we read cmdline.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        write_pid(&dir, pid);
+        assert!(matches!(
+            acquire(&dir),
+            Ok(AcquireOutcome::AlreadyRunning(Some(p))) if p == pid
+        ));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

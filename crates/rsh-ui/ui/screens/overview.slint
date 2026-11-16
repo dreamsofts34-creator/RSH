@@ -3,11 +3,25 @@
 // (ui/shell.slint OverviewPage), which the shell imports at integration
 // instead of defining inline. No design change.
 //
-// L4: the "Pedals calibrated" hint is a property now (calibrated-label),
-// fed from get_calibration().calibrated_at — never a hardcoded date.
-// The firmware line reads v4.0.2 (the shipped firmware).
+// v2.0.1 hotfix: nothing here is hardcoded live data any more — the
+// firmware line, delay/jitter/loss, updates/s, calibration label and
+// game tiles all arrive as Rust-owned props (A11/A12/A14). No daemon
+// means "Disconnected" + "—" placeholders, never fake Online (the
+// sim fallback is labelled as unavailable, not live). The GT3 Sprint
+// box opens the profile popover (A13); the pairing-needed banner
+// (§8.6) shows when the wheel is not paired yet.
 import { Theme } from "../tokens.slint";
 import { EmptyBanner, Card, WheelGraphic, PedalBar, Pill, Btn, GameTile, CheckRow } from "../components.slint";
+
+export struct GameItem {
+    id: string,
+    code: string,
+    name: string,
+    sub: string,
+    sub_warn: bool,
+    action: string,
+    action_primary: bool,
+}
 
 export component OverviewPage inherits VerticalLayout {
     in property <angle> steer-angle;
@@ -17,16 +31,31 @@ export component OverviewPage inherits VerticalLayout {
     in property <float> clutch;
     in property <bool> daemon-live;
     in property <bool> connected;
-    in property <string> calibrated-label: "Not yet";
+    in property <bool> paired: true;
+    // Live values from Rust (A11/A12): "—" when there is no telemetry.
+    in property <string> firmware-line: "—";
+    in property <string> delay-text: "—";
+    in property <string> jitter-text: "—";
+    in property <string> lost-text: "—";
+    in property <string> calibrated-label: "Not calibrated";
+    in property <bool> calibrated-warn: true;
+    in property <string> backend-name: "—";
+    in property <bool> backend-ready: false;
+    in property <string> profile-name: "GT3 Sprint";
+    in property <[GameItem]> games;
     callback configure();
     callback launch-game(string);
     callback open-diagnostics();
     callback reconnect();
+    callback open-profile-popover();
+    callback pair-now();
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
     spacing: 12px;
-    if !daemon-live : EmptyBanner { text: "Simulated data — the daemon is not running yet. Live data lands when Phase 2 IPC is connected."; is-error: false; }
+    if !daemon-live : EmptyBanner { text: "Live data unavailable — the background service isn't running. Live data appears once it starts."; is-error: false; }
     // REDESIGN-PLAN §8.6 disconnected state: banner + Reconnect.
     if daemon-live && !connected : EmptyBanner { text: "Wheel not connected — check the RSH Wi-Fi is joined (or the USB cable is plugged in), then retry."; action-label: "Reconnect"; is-error: true; action-clicked => { reconnect(); } }
+    // REDESIGN-PLAN §8.6 pairing-needed state (E): banner + Pair.
+    if daemon-live && connected && !paired : EmptyBanner { text: "Wheel not paired — pair it so only this PC can control it."; action-label: "Pair now"; is-error: true; action-clicked => { pair-now(); } }
     Card {
         HorizontalLayout {
             padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
@@ -56,7 +85,7 @@ export component OverviewPage inherits VerticalLayout {
                     Text { text: "RSH Wheel"; font-size: 14px; font-weight: 600; color: Theme.text; }
                     Pill { label: connected ? "Online" : "Offline"; bg: connected ? Theme.ok-bg : #2E1F26; fg: connected ? Theme.ok : Theme.bad; }
                 }
-                Text { text: "Firmware 4.0.2 · rsh.local · 200 updates/s"; font-size: 12px; color: Theme.mute; }
+                Text { text: firmware-line; font-size: 12px; color: Theme.mute; }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     spacing: 8px;
@@ -67,13 +96,27 @@ export component OverviewPage inherits VerticalLayout {
                         border-width: 1px;
                         border-color: Theme.line;
                         background: Theme.panel2;
+                        accessible-label: "Current profile: " + profile-name;
+                        accessible-role: button;
+                        prof-fs := FocusScope {
+                            width: 100%;
+                            height: 100%;
+                            key-pressed(event) => {
+                                if (event.text == Key.Return || event.text == Key.Space) {
+                                    open-profile-popover();
+                                    return accept;
+                                }
+                                return reject;
+                            }
+                        }
                         HorizontalLayout {
                             padding-left: 12px;
                             padding-right: 12px;
-                            Text { text: "GT3 Sprint"; font-size: 12px; font-weight: 600; color: Theme.text; }
+                            Text { text: profile-name; font-size: 12px; font-weight: 600; color: Theme.text; }
                             Rectangle { horizontal-stretch: 1; }
                             Image { width: 12px; height: 12px; source: @image-url("../../assets/icons/chevron.svg"); }
                         }
+                        TouchArea { clicked => { open-profile-popover(); } }
                     }
                     Btn { label: "Configure"; primary: true; clicked => { configure(); } }
                 }
@@ -87,13 +130,12 @@ export component OverviewPage inherits VerticalLayout {
             HorizontalLayout {
                 Text { text: "Games"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                 Rectangle { horizontal-stretch: 1; }
-                Text { text: "Launch from here. RSH switches profile automatically."; font-size: 12px; color: Theme.mute; }
+                Text { text: "Auto-switches profile."; font-size: 12px; color: Theme.mute; }
             }
-            HorizontalLayout {
+            if games.length == 0 : Text { text: "No games found yet — run setup again to search."; font-size: 12px; color: Theme.faint; }
+            if games.length > 0 : HorizontalLayout {
                 spacing: 10px;
-                GameTile { horizontal-stretch: 1; code: "AC"; name: "Assetto Corsa"; sub: "GT3 Sprint"; action: "Launch"; action-primary: true; action-clicked => { launch-game("Assetto Corsa"); } }
-                GameTile { horizontal-stretch: 1; code: "ACC"; name: "AC Competizione"; sub: "Running · GT3 Sprint"; sub-warn: true; action: "Stop"; action-clicked => { launch-game("AC Competizione"); } }
-                GameTile { horizontal-stretch: 1; code: "iR"; name: "iRacing"; sub: "Not found"; action: "Locate"; action-clicked => { launch-game("iRacing"); } }
+                for g in games : GameTile { horizontal-stretch: 1; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-clicked => { launch-game(g.id); } }
             }
         }
     }
@@ -110,8 +152,8 @@ export component OverviewPage inherits VerticalLayout {
                     Pill { label: connected ? "All good" : "Check needed"; bg: connected ? Theme.ok-bg : Theme.warn-bg; fg: connected ? Theme.ok : Theme.warn; }
                 }
                 CheckRow { label: "Wheel connected"; hint: "Wi-Fi"; warn: !connected; }
-                CheckRow { label: "Pedals calibrated"; hint: calibrated-label; }
-                CheckRow { label: "Game controller ready"; hint: "HIDMaestro"; }
+                CheckRow { label: "Pedals calibrated"; hint: calibrated-label; warn: calibrated-warn; }
+                CheckRow { label: "Game controller ready"; hint: backend-name; warn: !backend-ready; }
             }
         }
         Card {
@@ -126,9 +168,9 @@ export component OverviewPage inherits VerticalLayout {
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    VerticalLayout { horizontal-stretch: 1; Text { text: "4 ms"; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Delay"; font-size: 11.5px; color: Theme.mute; } }
-                    VerticalLayout { horizontal-stretch: 1; Text { text: "0%"; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Lost data"; font-size: 11.5px; color: Theme.mute; } }
-                    VerticalLayout { horizontal-stretch: 1; Text { text: "1 ms"; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Jitter"; font-size: 11.5px; color: Theme.mute; } }
+                    VerticalLayout { horizontal-stretch: 1; Text { text: delay-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Delay"; font-size: 11.5px; color: Theme.mute; } }
+                    VerticalLayout { horizontal-stretch: 1; Text { text: lost-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Lost data"; font-size: 11.5px; color: Theme.mute; } }
+                    VerticalLayout { horizontal-stretch: 1; Text { text: jitter-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Jitter"; font-size: 11.5px; color: Theme.mute; } }
                 }
                 Text {
                     text: "Open diagnostics";
@@ -154,4 +196,3 @@ export component OverviewPage inherits VerticalLayout {
         }
     }
 }
-

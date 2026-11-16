@@ -97,7 +97,13 @@ pub struct IpcRequest {
     /// `disconnect`, `pairing_status`, `begin_pairing`, `snapshot`,
     /// `output_enabled`, `set_output_enabled`, `subscribe`,
     /// `get_tuning`, `set_tuning`, `draft_status`, `save_draft`,
-    /// `discard_draft`).
+    /// `discard_draft`, `autostart`, `set_autostart`,
+    /// `firmware_version`, `output_backend`, `set_output_backend`,
+    /// `backup_now`, `list_profiles`, `activate_profile`,
+    /// `create_profile`, `duplicate_profile`, `delete_profile`,
+    /// `list_games`, `launch_game`, `stop_game`, `game_state`,
+    /// `start_learn`, `cancel_learn`, `is_learning`,
+    /// `take_learned_button`).
     pub method: String,
     /// Method params (object; may be empty).
     #[serde(default)]
@@ -262,6 +268,189 @@ pub fn dispatch(
             .map(|saved| serde_json::json!({"saved": saved}))
             .map_err(|e| IpcError::Api(e.code)),
         "discard_draft" => Ok(serde_json::json!({"discarded": api.discard_draft()})),
+        // v2.0.1 hotfix: Settings toggles/buttons (autostart,
+        // firmware check, backend radio, backup) had no API before.
+        // Dispatched by the helper below so `dispatch` stays under
+        // the clippy line limit.
+        "autostart" | "set_autostart" | "firmware_version" | "output_backend"
+        | "set_output_backend" | "backup_now" => dispatch_settings(api, request),
+        // v2.0.1 hotfix: profiles / games / learn — the UI rows and
+        // buttons that were hardcoded / notification-only before.
+        // Dispatched by the helper below so `dispatch` stays under
+        // the clippy line limit.
+        "list_profiles"
+        | "activate_profile"
+        | "create_profile"
+        | "duplicate_profile"
+        | "delete_profile"
+        | "list_games"
+        | "launch_game"
+        | "stop_game"
+        | "game_state"
+        | "start_learn"
+        | "cancel_learn"
+        | "is_learning"
+        | "take_learned_button" => dispatch_profiles_games_learn(api, request),
+        // v2.0.1 hotfix BACKEND-2: calibration read, vJoy
+        // status/install, diagnostics.
+        "calibration" | "vjoy_status" | "install_vjoy" | "diag_stats" => {
+            dispatch_calibration_vjoy_diag(api, request)
+        }
+        other => Err(IpcError::UnknownMethod(other.to_string())),
+    }
+}
+
+/// Dispatch the v2.0.1 BACKEND-2 calibration / vJoy / diagnostics
+/// methods. Split out of [`dispatch`] so neither function trips
+/// `too_many_lines`.
+fn dispatch_calibration_vjoy_diag(
+    api: &Arc<dyn AppApi>,
+    request: &IpcRequest,
+) -> Result<serde_json::Value, IpcError> {
+    match request.method.as_str() {
+        "calibration" => api
+            .calibration()
+            .map(|info| serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
+            .map_err(|e| IpcError::Api(e.code)),
+        "vjoy_status" => api
+            .vjoy_status()
+            .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
+            .map_err(|e| IpcError::Api(e.code)),
+        "install_vjoy" => api
+            .install_vjoy()
+            .map(|message| serde_json::json!({"message": message}))
+            .map_err(|e| IpcError::Api(e.code)),
+        "diag_stats" => api
+            .diag_stats()
+            .map(|stats| serde_json::to_value(stats).unwrap_or(serde_json::Value::Null))
+            .map_err(|e| IpcError::Api(e.code)),
+        other => Err(IpcError::UnknownMethod(other.to_string())),
+    }
+}
+
+/// Dispatch the v2.0.1 Settings toggles/buttons (autostart,
+/// firmware check, backend radio, backup). Split out of [`dispatch`]
+/// so neither function trips `too_many_lines`.
+fn dispatch_settings(
+    api: &Arc<dyn AppApi>,
+    request: &IpcRequest,
+) -> Result<serde_json::Value, IpcError> {
+    let params = &request.params;
+    match request.method.as_str() {
+        "autostart" => Ok(serde_json::json!({"autostart": api.autostart()})),
+        "set_autostart" => {
+            let enabled = params
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            api.set_autostart(enabled)
+                .map(|new_state| serde_json::json!({"autostart": new_state}))
+                .map_err(|e| IpcError::Api(e.code))
+        }
+        "firmware_version" => Ok(serde_json::json!({"firmware_version": api.firmware_version()})),
+        "output_backend" => Ok(serde_json::json!({"output_backend": api.output_backend()})),
+        "set_output_backend" => {
+            let name = params
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.set_output_backend(name)
+                .map(|backend| serde_json::json!({"output_backend": backend}))
+                .map_err(|e| IpcError::Api(e.code))
+        }
+        "backup_now" => api
+            .backup_now()
+            .map(|message| serde_json::json!({"message": message}))
+            .map_err(|e| IpcError::Api(e.code)),
+        other => Err(IpcError::UnknownMethod(other.to_string())),
+    }
+}
+
+/// Dispatch the v2.0.1 profiles / games / learn methods. Split out
+/// of [`dispatch`] so neither function trips `too_many_lines`.
+fn dispatch_profiles_games_learn(
+    api: &Arc<dyn AppApi>,
+    request: &IpcRequest,
+) -> Result<serde_json::Value, IpcError> {
+    let params = &request.params;
+    match request.method.as_str() {
+        "list_profiles" => Ok(serde_json::to_value(api.list_profiles())
+            .map_err(|e| IpcError::Protocol(e.to_string()))?),
+        "activate_profile" => {
+            let id = params
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.activate_profile(id)
+                .map(|name| serde_json::json!({"name": name}))
+                .map_err(|e| IpcError::Api(e.code))
+        }
+        "create_profile" => {
+            let name = params
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.create_profile(name)
+                .map(|name| serde_json::json!({"name": name}))
+                .map_err(|e| IpcError::Api(e.code))
+        }
+        "duplicate_profile" => {
+            let id = params
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.duplicate_profile(id)
+                .map(|name| serde_json::json!({"name": name}))
+                .map_err(|e| IpcError::Api(e.code))
+        }
+        "delete_profile" => {
+            let id = params
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.delete_profile(id)
+                .map(|deleted| serde_json::json!({"deleted": deleted}))
+                .map_err(|e| IpcError::Api(e.code))
+        }
+        "list_games" => Ok(serde_json::to_value(api.list_games())
+            .map_err(|e| IpcError::Protocol(e.to_string()))?),
+        "launch_game" => {
+            let id = params
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.launch_game(id)
+                .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
+                .map_err(|e| IpcError::Api(e.code))
+        }
+        "stop_game" => {
+            let id = params
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.stop_game(id)
+                .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
+                .map_err(|e| IpcError::Api(e.code))
+        }
+        "game_state" => {
+            let id = params
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.game_state(id)
+                .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
+                .map_err(|e| IpcError::Api(e.code))
+        }
+        "start_learn" => api
+            .start_learn()
+            .map(|learning| serde_json::json!({"learning": learning}))
+            .map_err(|e| IpcError::Api(e.code)),
+        "cancel_learn" => api
+            .cancel_learn()
+            .map(|learning| serde_json::json!({"learning": learning}))
+            .map_err(|e| IpcError::Api(e.code)),
+        "is_learning" => Ok(serde_json::json!({"learning": api.is_learning()})),
+        "take_learned_button" => Ok(serde_json::json!({"button": api.take_learned_button()})),
         other => Err(IpcError::UnknownMethod(other.to_string())),
     }
 }

@@ -306,6 +306,11 @@ jobs:
             WriteRegStr HKLM "Software\RSH" "InstallDir" "$INSTDIR"
             WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "DisplayName" "RSH ${VERSION}"
             WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "UninstallString" "$INSTDIR\uninstall.exe"
+            ; Autostart the daemon at login (HKCU Run): the daemon owns
+            ; the tray + IPC and syncs this key from settings.autostart
+            ; on startup (default true in v2.0.1). The UI spawns the
+            ; daemon on first launch, so the installer never starts it.
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RSH" "$INSTDIR\rsh-daemon.exe"
             WriteUninstaller "$INSTDIR\uninstall.exe"
             CreateDirectory "$SMPROGRAMS\RSH"
             CreateShortcut "$SMPROGRAMS\RSH\RSH Wheel.lnk" "$INSTDIR\rsh-ui.exe"
@@ -337,6 +342,7 @@ jobs:
             RMDir "$INSTDIR"
             DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH"
             DeleteRegKey HKLM "Software\RSH"
+            DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RSH"
           SectionEnd
           '@ -replace '\$\{VERSION\}', "${{ steps.tag.outputs.version }}" | Set-Content -Path installer\rsh.nsi -Encoding ASCII
           Get-Content installer\rsh.nsi | Select-Object -First 5

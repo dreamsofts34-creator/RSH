@@ -10,18 +10,18 @@
 // theme options are disabled until the light theme is designed (§5).
 //
 // Data: connection/backend/startup/theme/profiles come from Rust via the
-// props below. The real AppApi (rsh-api) exposes connection + pairing
-// only — backend choice, startup flags, theme, profiles, firmware/app
-// update checks and backup/restore are NOT AppApi methods yet, so the
-// callbacks below are the integration seam: the shell wires them to the
-// daemon/profile store when it lands, and until then they carry sim
-// data (same values as the staging harness). About card carries the
-// AboutSlint widget (Slint Royalty-free 2.0 attribution, §10).
-// English only; no language selector (§9).
+// props below. v2.0.1 hotfix wires them to the real AppApi: transport
+// switch calls connect(), backend switch calls set_output_backend()
+// (default vJoy), Start with Windows seeds from autost() and calls
+// set_autostart(bool), profiles come from list_profiles(), firmware /
+// update / backup texts are Rust-owned. Restore has no backend call
+// yet, so its button is disabled with a reason. The About card is
+// gone (B3: not in the preview) — attribution lives on the shell
+// About page. English only; no language selector (§9).
 
 import { Theme } from "../tokens.slint";
 import { Card, Btn, Pill, RadioOptionCard, Switch } from "../components.slint";
-import { AboutSlint, ScrollView } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 
 export struct ProfileRow {
     name: string,
@@ -91,10 +91,10 @@ export component SettingsScreen inherits VerticalLayout {
     in-out property <bool> keep-in-tray: true;
     in-out property <int> theme: 0; // 0 Dark only (Light/Auto not designed yet)
     in-out property <[ProfileRow]> profiles;
-    in-out property <string> app-version: "RSH 2.0.0";
-    in-out property <string> firmware-text: "Version 4.0.2 · up to date";
-    in-out property <string> app-update-text: "You have the latest version";
-    in-out property <string> backup-text: "Last saved today, 09:12";
+    in-out property <string> app-version: "RSH 2.0.1";
+    in-out property <string> firmware-text: "—";
+    in-out property <string> app-update-text: "Auto-update is off — new versions are on GitHub Releases";
+    in-out property <string> backup-text: "No backups yet";
 
     callback connection-selected(int);
     callback address-changed(string);
@@ -111,6 +111,7 @@ export component SettingsScreen inherits VerticalLayout {
     callback check-app-updates();
     callback backup();
     callback restore();
+    callback run-setup();
     callback open-diagnostics();
 
     settings-scroll := ScrollView {
@@ -187,9 +188,22 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Pair a new wheel"; font-size: 13px; color: Theme.text; }
-                                    Text { text: "Opens a 60 second pairing window"; font-size: 11.5px; color: Theme.mute; }
+                                    Text { text: "120 s pairing window"; font-size: 11.5px; color: Theme.mute; }
                                 }
                                 Btn { label: "Pair"; clicked => { pair-requested(); } }
+                            }
+                            Rectangle { height: 1px; background: Theme.line; }
+                            HorizontalLayout {
+                                padding-top: 6px;
+                                padding-bottom: 6px;
+                                spacing: 10px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 0px;
+                                    Text { text: "Run setup again"; font-size: 13px; color: Theme.text; }
+                                    Text { text: "Connect, drivers, pair, calibrate, games."; font-size: 11.5px; color: Theme.mute; }
+                                }
+                                Btn { label: "Run setup"; clicked => { run-setup(); } }
                             }
                         }
                     }
@@ -202,25 +216,24 @@ export component SettingsScreen inherits VerticalLayout {
                                 spacing: 8px;
                                 alignment: start;
                                 Text { text: "Game controller"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
-                                Text { text: "How games see your wheel"; font-size: 12px; color: Theme.mute; }
                             }
                             Rectangle { height: 8px; }
                             VerticalLayout {
                                 spacing: 6px;
                                 RadioOptionCard {
                                     title: "HIDMaestro";
-                                    desc: "Asks for admin permission each time RSH starts.";
+                                    desc: "Needs admin each start.";
                                     selected: backend == 0;
                                     clicked => { backend = 0; backend-selected(0); }
                                 }
                                 RadioOptionCard {
                                     title: "vJoy";
-                                    desc: "No permission prompt. Needs vJoy installed.";
+                                    desc: "No admin prompt. Needs vJoy.";
                                     selected: backend == 1;
                                     clicked => { backend = 1; backend-selected(1); }
                                 }
                             }
-                            Text { text: "Recommended: HIDMaestro"; font-size: 11.5px; color: Theme.faint; }
+                            Text { text: "Recommended: vJoy"; font-size: 11.5px; color: Theme.faint; }
                         }
                     }
                     // Startup
@@ -246,7 +259,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Keep running in the tray"; font-size: 13px; color: Theme.text; }
-                                    Text { text: "Closing the window does not stop the wheel"; font-size: 11.5px; color: Theme.mute; }
+                                    Text { text: "Keeps running after close."; font-size: 11.5px; color: Theme.mute; }
                                 }
                                 Switch { accessible-name: "Keep running in tray"; on: keep-in-tray; toggled => { keep-in-tray = !keep-in-tray; toggled-keep-tray(keep-in-tray); } }
                             }
@@ -358,42 +371,14 @@ export component SettingsScreen inherits VerticalLayout {
                                     spacing: 0px;
                                     Text { text: "Backups"; font-size: 13px; color: Theme.text; }
                                     Text { text: backup-text; font-size: 11.5px; color: Theme.mute; }
+                                    Text { text: "Restore isn't supported yet."; font-size: 11.5px; color: Theme.faint; }
                                 }
                                 HorizontalLayout {
                                     spacing: 6px;
                                     Btn { label: "Back up"; clicked => { backup(); } }
-                                    Btn { label: "Restore"; clicked => { restore(); } }
+                                    Btn { label: "Restore"; disabled: true; clicked => { restore(); } }
                                 }
                             }
-                        }
-                    }
-                }
-            }
-            // ---- About (full width, below the grid)
-            // Slint Royalty-free 2.0 attribution: the AboutSlint widget
-            // lives in this About section. The shell's About page shows
-            // the same widget; this card is the in-Settings attribution
-            // point from the staging screen.
-            Card {
-                VerticalLayout {
-                    padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
-                    spacing: 0px;
-                    Text { text: "About"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
-                    Rectangle { height: 8px; }
-                    HorizontalLayout {
-                        spacing: 16px;
-                        VerticalLayout {
-                            horizontal-stretch: 1;
-                            spacing: 4px;
-                            Text { text: "RSH — Real Sim Hub"; font-size: 13px; font-weight: 600; color: Theme.text; }
-                            Text { text: app-version + " · MIT licence"; font-size: 12px; color: Theme.mute; }
-                            Text { text: "Wheel firmware 4.0.2 · Protocol 2.1"; font-size: 12px; color: Theme.mute; }
-                            Text { text: "Built with Slint 1.18.1 under the Slint Royalty-free Licence 2.0."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
-                        }
-                        Rectangle {
-                            width: 280px;
-                            height: 112px;
-                            AboutSlint { width: 100%; height: 100%; }
                         }
                     }
                 }

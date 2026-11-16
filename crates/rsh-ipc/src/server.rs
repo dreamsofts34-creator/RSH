@@ -229,8 +229,8 @@ mod tests {
     use super::*;
     use rsh_api::connection::ConnectionState;
     use rsh_api::{
-        ApiTransport, ConnectionInfo, DraftStatus, PairingInfo, SnapshotInfo, TuningSettings,
-        UserError, validate_tuning,
+        ApiTransport, CalibrationInfo, ConnectionInfo, DiagStats, DraftStatus, PairingInfo,
+        SnapshotInfo, TuningSettings, UserError, VjoyStatus, validate_tuning,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
@@ -357,6 +357,48 @@ mod tests {
                 self.clear_tunings();
             }
             had
+        }
+
+        // v2.0.1 hotfix BACKEND-2: canned values so the dispatch
+        // round-trip tests prove the wire shape (the real daemon
+        // overrides these with measured values).
+        fn calibration(&self) -> Result<CalibrationInfo, UserError> {
+            let mut pedal_min_mv = BTreeMap::new();
+            pedal_min_mv.insert("accel".to_string(), 300.0);
+            let mut pedal_max_mv = BTreeMap::new();
+            pedal_max_mv.insert("accel".to_string(), 3300.0);
+            Ok(CalibrationInfo {
+                steering_center_mv: 1800.0,
+                pedal_min_mv,
+                pedal_max_mv,
+                calibrated_at: Some("2026-11-16T00:00:00Z".to_string()),
+            })
+        }
+
+        fn vjoy_status(&self) -> Result<VjoyStatus, UserError> {
+            Ok(VjoyStatus {
+                installed: true,
+                installing: false,
+                install_error: None,
+                dll_path: Some("C:\\Program Files\\vJoy\\x64\\vJoyInterface.dll".to_string()),
+                version: Some("2.2.2".to_string()),
+            })
+        }
+
+        fn install_vjoy(&self) -> Result<String, UserError> {
+            Ok("vJoy install started".to_string())
+        }
+
+        fn diag_stats(&self) -> Result<DiagStats, UserError> {
+            Ok(DiagStats {
+                loop_hz: Some(200.0),
+                loss_pct: 0.5,
+                jitter_ms_p99: Some(3.4),
+                output_latency_ms: None,
+                e2e_ms: None,
+                seq_gap: 7,
+                tx_fail: 3,
+            })
         }
     }
 
@@ -489,5 +531,187 @@ mod tests {
             resp.result.expect("result").get("deadzone"),
             Some(&serde_json::json!(0.0))
         );
+    }
+
+    #[test]
+    fn profiles_games_learn_round_trip_through_dispatch() {
+        // The stub uses the trait defaults: empty lists, honest
+        // errors, learn never armed, no pick to take.
+        let server = stub_server();
+        let resp = server
+            .handle_line(r#"{"v":1,"id":30,"method":"list_profiles","params":{}}"#)
+            .expect("list_profiles parses");
+        assert!(resp.ok);
+        assert_eq!(
+            resp.result.expect("result"),
+            serde_json::Value::Array(vec![])
+        );
+        let resp = server
+            .handle_line(r#"{"v":1,"id":31,"method":"activate_profile","params":{"id":"x"}}"#)
+            .expect("activate_profile parses");
+        assert!(!resp.ok);
+        assert_eq!(resp.error.expect("error").code, "Unknown");
+        let resp = server
+            .handle_line(r#"{"v":1,"id":32,"method":"create_profile","params":{"name":"New"}}"#)
+            .expect("create_profile parses");
+        assert!(!resp.ok);
+        assert_eq!(resp.error.expect("error").code, "Unknown");
+        let resp = server
+            .handle_line(r#"{"v":1,"id":33,"method":"duplicate_profile","params":{"id":"x"}}"#)
+            .expect("duplicate_profile parses");
+        assert!(!resp.ok);
+        let resp = server
+            .handle_line(r#"{"v":1,"id":34,"method":"delete_profile","params":{"id":"x"}}"#)
+            .expect("delete_profile parses");
+        assert!(!resp.ok);
+        let resp = server
+            .handle_line(r#"{"v":1,"id":35,"method":"list_games","params":{}}"#)
+            .expect("list_games parses");
+        assert!(resp.ok);
+        assert_eq!(
+            resp.result.expect("result"),
+            serde_json::Value::Array(vec![])
+        );
+        let resp = server
+            .handle_line(
+                r#"{"v":1,"id":36,"method":"launch_game","params":{"id":"assetto_corsa"}}"#,
+            )
+            .expect("launch_game parses");
+        assert!(!resp.ok);
+        assert_eq!(resp.error.expect("error").code, "Unknown");
+        let resp = server
+            .handle_line(r#"{"v":1,"id":37,"method":"stop_game","params":{"id":"assetto_corsa"}}"#)
+            .expect("stop_game parses");
+        assert!(!resp.ok);
+        let resp = server
+            .handle_line(r#"{"v":1,"id":38,"method":"game_state","params":{"id":"assetto_corsa"}}"#)
+            .expect("game_state parses");
+        assert!(!resp.ok);
+        let resp = server
+            .handle_line(r#"{"v":1,"id":39,"method":"start_learn","params":{}}"#)
+            .expect("start_learn parses");
+        assert!(!resp.ok);
+        assert_eq!(resp.error.expect("error").code, "Unknown");
+        let resp = server
+            .handle_line(r#"{"v":1,"id":40,"method":"cancel_learn","params":{}}"#)
+            .expect("cancel_learn parses");
+        assert!(!resp.ok);
+        let resp = server
+            .handle_line(r#"{"v":1,"id":41,"method":"is_learning","params":{}}"#)
+            .expect("is_learning parses");
+        assert!(resp.ok);
+        assert_eq!(
+            resp.result.expect("result").get("learning"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        let resp = server
+            .handle_line(r#"{"v":1,"id":42,"method":"take_learned_button","params":{}}"#)
+            .expect("take_learned_button parses");
+        assert!(resp.ok);
+        assert_eq!(
+            resp.result.expect("result").get("button"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn settings_methods_round_trip_through_dispatch() {
+        // The stub uses the trait defaults: autostart off,
+        // firmware/backend unknown, set/backup unsupported.
+        let server = stub_server();
+        let resp = server
+            .handle_line(r#"{"v":1,"id":20,"method":"autostart","params":{}}"#)
+            .expect("autostart parses");
+        assert!(resp.ok);
+        assert_eq!(
+            resp.result.expect("result").get("autostart"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        let resp = server
+            .handle_line(r#"{"v":1,"id":21,"method":"set_autostart","params":{"enabled":true}}"#)
+            .expect("set_autostart parses");
+        assert!(!resp.ok);
+        assert_eq!(resp.error.expect("error").code, "Unknown");
+        let resp = server
+            .handle_line(r#"{"v":1,"id":22,"method":"firmware_version","params":{}}"#)
+            .expect("firmware_version parses");
+        assert!(resp.ok);
+        assert_eq!(
+            resp.result.expect("result").get("firmware_version"),
+            Some(&serde_json::Value::String("Unknown".to_string()))
+        );
+        let resp = server
+            .handle_line(r#"{"v":1,"id":23,"method":"output_backend","params":{}}"#)
+            .expect("output_backend parses");
+        assert!(resp.ok);
+        assert_eq!(
+            resp.result.expect("result").get("output_backend"),
+            Some(&serde_json::Value::String("Unknown".to_string()))
+        );
+        let resp = server
+            .handle_line(
+                r#"{"v":1,"id":24,"method":"set_output_backend","params":{"name":"vJoy"}}"#,
+            )
+            .expect("set_output_backend parses");
+        assert!(!resp.ok);
+        assert_eq!(resp.error.expect("error").code, "Unknown");
+        let resp = server
+            .handle_line(r#"{"v":1,"id":25,"method":"backup_now","params":{}}"#)
+            .expect("backup_now parses");
+        assert!(!resp.ok);
+        assert_eq!(resp.error.expect("error").code, "Unknown");
+    }
+
+    #[test]
+    fn calibration_vjoy_diag_round_trip_through_dispatch() {
+        let server = stub_server();
+        // calibration: wire shape is camelCase, values round-trip.
+        let resp = server
+            .handle_line(r#"{"v":1,"id":30,"method":"calibration","params":{}}"#)
+            .expect("calibration parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        let got = resp.result.expect("result");
+        assert_eq!(
+            got.get("steeringCenterMv"),
+            Some(&serde_json::json!(1800.0))
+        );
+        assert_eq!(
+            got.get("calibratedAt"),
+            Some(&serde_json::json!("2026-11-16T00:00:00Z"))
+        );
+        // vjoy_status: installed + DLL path round-trip.
+        let resp = server
+            .handle_line(r#"{"v":1,"id":31,"method":"vjoy_status","params":{}}"#)
+            .expect("vjoy_status parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        let got = resp.result.expect("result");
+        assert_eq!(got.get("installed"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            got.get("dllPath"),
+            Some(&serde_json::json!(
+                "C:\\Program Files\\vJoy\\x64\\vJoyInterface.dll"
+            ))
+        );
+        // install_vjoy: starts, returns the message.
+        let resp = server
+            .handle_line(r#"{"v":1,"id":32,"method":"install_vjoy","params":{}}"#)
+            .expect("install_vjoy parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(
+            resp.result.expect("result").get("message"),
+            Some(&serde_json::Value::String(
+                "vJoy install started".to_string()
+            ))
+        );
+        // diag_stats: measured values round-trip.
+        let resp = server
+            .handle_line(r#"{"v":1,"id":33,"method":"diag_stats","params":{}}"#)
+            .expect("diag_stats parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        let got = resp.result.expect("result");
+        assert_eq!(got.get("loopHz"), Some(&serde_json::json!(200.0)));
+        assert_eq!(got.get("lossPct"), Some(&serde_json::json!(0.5)));
+        assert_eq!(got.get("seqGap"), Some(&serde_json::json!(7)));
+        assert_eq!(got.get("txFail"), Some(&serde_json::json!(3)));
     }
 }
