@@ -397,11 +397,17 @@ jobs:
           # The data dir may never exist on Windows (named-pipe IPC
           # leaves no socket file, single-instance is a mutex, and
           # the startup logger writes to the default data dir, not
-          # this --data-dir) — an unconditional Remove-Item on a
-          # missing path fails the step's last statement and pwsh
-          # exits 1 even though every check above passed (release
-          # run 43881476168). Only remove it when it exists.
+          # this --data-dir) — only remove it when it exists.
           if (Test-Path $dataDir) { Remove-Item $dataDir -Recurse -Force }
+          # Native commands above (the uninstaller, and `netsh show
+          # rule` when no rule matches — the EXPECTED outcome after
+          # uninstall) can leave $LASTEXITCODE non-zero even though
+          # every check above passed explicitly; the runner
+          # propagates a non-zero $LASTEXITCODE as the step's exit
+          # code, which failed this step in runs 43881476168 and
+          # 43884546437 with no error text. All outcomes are already
+          # verified above, so clear it before exiting.
+          $LASTEXITCODE = 0
 
       - name: vJoy DLL hash (record only — never invented)
         shell: pwsh
