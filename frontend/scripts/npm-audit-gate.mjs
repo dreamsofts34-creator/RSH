@@ -29,15 +29,30 @@ const ALLOWED_GHSA = new Set([
   "GHSA-FC5Q-39XC-VJPF",
 ]);
 
-function ghsaIds(vuln) {
+// The allowlist matches ADVISORY ids, but npm audit's JSON reports one
+// entry per package in the affected tree, and only the root vulnerable
+// package carries the advisory object in `via`. Transitive entries
+// (fdir, vite, vitest, ...) list only dependency NAME strings in `via`
+// (e.g. fdir's `via` is ["picomatch"]). So an entry is explained by
+// resolving its `via` name-chain back to the root package(s) that carry
+// the advisory objects. An entry is allowed only if that resolution
+// yields at least one advisory id AND every id is allowlisted; an
+// unresolvable entry (no advisory id anywhere up its chain) fails
+// closed, as does any entry whose chain reaches a second, non-allowlisted
+// advisory.
+function resolveGhsaIds(name, vulns, visited = new Set()) {
+  if (visited.has(name)) return new Set();
+  visited.add(name);
+  const vuln = vulns[name];
+  if (!vuln) return new Set();
   const ids = new Set();
-  const via = Array.isArray(vuln?.via) ? vuln.via : [];
+  const via = Array.isArray(vuln.via) ? vuln.via : [];
   for (const entry of via) {
-    // `via` mixes advisory objects ({url: ".../GHSA-..."}) with plain
-    // dependency-name strings; only advisory objects carry an id.
     if (entry && typeof entry === "object" && typeof entry.url === "string") {
       const m = entry.url.match(/GHSA-[a-z0-9-]+/i);
       if (m) ids.add(m[0].toUpperCase());
+    } else if (typeof entry === "string") {
+      for (const id of resolveGhsaIds(entry, vulns, visited)) ids.add(id);
     }
   }
   return ids;
@@ -46,7 +61,12 @@ function ghsaIds(vuln) {
 function loadAudit(argv) {
   const flag = argv.indexOf("--audit-json");
   if (flag !== -1 && argv[flag + 1]) {
-    return JSON.parse(readFileSync(argv[flag + 1], "utf8"));
+    try {
+      return JSON.parse(readFileSync(argv[flag + 1], "utf8"));
+    } catch (err) {
+      console.error(`cannot read audit JSON file ${argv[flag + 1]}: ${err.message}; failing closed.`);
+      process.exit(1);
+    }
   }
   try {
     const out = execFileSync("npm", ["audit", "--json"], {
@@ -83,7 +103,7 @@ console.log(
 const offenders = [];
 for (const [name, vuln] of Object.entries(vulns)) {
   if (vuln.severity !== "high" && vuln.severity !== "critical") continue;
-  const ids = ghsaIds(vuln);
+  const ids = resolveGhsaIds(name, vulns);
   const unallowed = [...ids].filter((id) => !ALLOWED_GHSA.has(id));
   if (ids.size === 0 || unallowed.length > 0) {
     offenders.push({ name, severity: vuln.severity, ids: [...ids] });
