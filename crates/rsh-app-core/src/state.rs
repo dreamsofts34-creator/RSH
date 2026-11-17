@@ -3499,6 +3499,10 @@ impl AppStateCore {
             e2e_ms: stats.e2e_ms,
             seq_gap: snapshot.seq_gap,
             tx_fail: snapshot.tx_fail,
+            // DS-82: the core does not know the IPC latency — only
+            // the daemon's `DaemonApi::diag_stats` fills these in.
+            ipc_p50_ms: None,
+            ipc_p99_ms: None,
         }
     }
 

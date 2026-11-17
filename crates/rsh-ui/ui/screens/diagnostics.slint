@@ -78,6 +78,12 @@ export component DiagnosticsDrawer inherits FocusScope {
     in property <string> loop-rate-text: "—";
     in property <string> tx-failures-text: "—";
     in property <string> seq-gaps-text: "—";
+    // DS-82: frame-time histogram (this UI) + IPC dispatch latency
+    // (the daemon); "—" until measured.
+    in property <string> frame-p50-text: "—";
+    in property <string> frame-p99-text: "—";
+    in property <string> ipc-p50-text: "—";
+    in property <string> ipc-p99-text: "—";
     in property <bool> stats-bad: false;
     // A21: connection + versions as real props (not event-log strings).
     in property <string> conn-label: "—";
@@ -163,6 +169,16 @@ export component DiagnosticsDrawer inherits FocusScope {
                         StatCell { horizontal-stretch: 1; label: "Loop rate"; value: loop-rate-text; }
                         StatCell { horizontal-stretch: 1; label: "TX failures"; value: tx-failures-text; bad: tx-failures-text != "0" && tx-failures-text != "—"; }
                         StatCell { horizontal-stretch: 1; label: "Sequence gaps"; value: seq-gaps-text; bad: seq-gaps-text != "0" && seq-gaps-text != "—"; }
+                    }
+                    // DS-82: frame-time histogram (this UI, last
+                    // 30 s) + IPC dispatch latency (the daemon).
+                    Text { text: "Frame + IPC latency"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        StatCell { horizontal-stretch: 1; label: "Frame (p50)"; value: frame-p50-text; }
+                        StatCell { horizontal-stretch: 1; label: "Frame (p99)"; value: frame-p99-text; }
+                        StatCell { horizontal-stretch: 1; label: "IPC (p50)"; value: ipc-p50-text; }
+                        StatCell { horizontal-stretch: 1; label: "IPC (p99)"; value: ipc-p99-text; }
                     }
                     // event log (§8.3)
                     Text { text: "Event log"; font-size: 12.5px; font-weight: 600; color: Theme.text; }

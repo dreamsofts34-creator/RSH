@@ -642,7 +642,14 @@ impl AppApi for DaemonApi {
     }
 
     fn diag_stats(&self) -> Result<DiagStats, UserError> {
-        Ok(self.state.diag_stats())
+        let mut stats = self.state.diag_stats();
+        // DS-82: the IPC dispatch latency aggregate, measured by
+        // the server on every dispatch.
+        if let Some((p50, p99)) = rsh_ipc::ipc_latency_global_p50_p99_ms() {
+            stats.ipc_p50_ms = Some(p50);
+            stats.ipc_p99_ms = Some(p99);
+        }
+        Ok(stats)
     }
 }
 

@@ -441,6 +441,14 @@ pub struct DiagStats {
     pub seq_gap: u64,
     /// `txFail` counter from the latest status packet.
     pub tx_fail: u64,
+    /// IPC dispatch latency p50 in milliseconds, across methods
+    /// (DS-82): the daemon-side cost of one round-trip. [`None`]
+    /// until the daemon has measured a dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_p50_ms: Option<f64>,
+    /// IPC dispatch latency p99 in milliseconds (DS-82).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_p99_ms: Option<f64>,
 }
 
 /// Push events from the daemon to the UI. The UI never polls for

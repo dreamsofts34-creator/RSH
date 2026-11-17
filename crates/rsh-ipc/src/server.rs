@@ -154,7 +154,12 @@ impl IpcServer {
     /// inline cheap path and the `spawn_blocking` path. Returns
     /// `None` when the response itself cannot be encoded.
     fn response_text(&self, line: &str) -> Option<String> {
-        match self.handle_line(line) {
+        // DS-82: the single instrumentation point — every dispatch
+        // (inline or blocking) records its latency per method.
+        let started = std::time::Instant::now();
+        let method = parse_request(line)
+            .map_or_else(|_| "?".to_string(), |request| request.method);
+        let out = match self.handle_line(line) {
             Ok(resp) => encode_response(&resp).ok(),
             Err(error) => {
                 // Unparseable request: answer with a Protocol error
@@ -172,7 +177,9 @@ impl IpcServer {
                 })
                 .ok()
             }
-        }
+        };
+        crate::record_ipc_latency(&method, started.elapsed());
+        out
     }
 
     /// Handle one request line → response (version check, dispatch,
@@ -517,6 +524,8 @@ mod tests {
                 e2e_ms: None,
                 seq_gap: 7,
                 tx_fail: 3,
+                ipc_p50_ms: None,
+                ipc_p99_ms: None,
             })
         }
 
@@ -647,6 +656,37 @@ mod tests {
             resp.result.expect("result").get("version"),
             Some(&serde_json::Value::String("1.0.2".to_string()))
         );
+    }
+
+    /// DS-82: `response_text` records every dispatch's latency —
+    /// the snapshot holds the methods it served, with sane
+    /// percentiles (the global aggregate is `Some` once anything
+    /// was recorded; counts are lower bounds — the snapshot is
+    /// process-global, so other tests in this binary add to it).
+    #[test]
+    fn ds82_response_text_records_dispatch_latency() {
+        let server = stub_server();
+        assert!(server
+            .response_text(r#"{"v":1,"id":60,"method":"ping","params":{}}"#)
+            .is_some());
+        assert!(server
+            .response_text(r#"{"v":1,"id":61,"method":"poll","params":{}}"#)
+            .is_some());
+        let snapshot = crate::ipc_latency_snapshot();
+        let ping = snapshot
+            .iter()
+            .find(|(method, _, _, _)| method == "ping")
+            .expect("ping recorded");
+        assert!(ping.1 >= 1, "ping count: {ping:?}");
+        assert!(ping.2 <= ping.3, "p50 <= p99: {ping:?}");
+        let poll = snapshot
+            .iter()
+            .find(|(method, _, _, _)| method == "poll")
+            .expect("poll recorded");
+        assert!(poll.1 >= 1, "poll count: {poll:?}");
+        let (p50, p99) = crate::ipc_latency_global_p50_p99_ms().expect("global aggregate");
+        assert!(p50 <= p99, "global p50 {p50} <= p99 {p99}");
+        assert!(p50 >= 0.0 && p99 < 500.0, "p50 {p50} p99 {p99} ms");
     }
 
     #[test]

@@ -156,10 +156,13 @@ pub struct IpcEventFrame {
 
 /// The client library the Slint UI (Phase 3) uses.
 pub mod client;
+/// Per-method IPC latency histogram (DS-82).
+pub mod latency;
 /// The methods the IPC server answers, with their params.
 pub mod server;
 
 pub use client::IpcClient;
+pub use latency::{ipc_latency_global_p50_p99_ms, ipc_latency_snapshot, record_ipc_latency};
 pub use server::IpcServer;
 #[cfg(unix)]
 pub use server::bind_unix_socket;

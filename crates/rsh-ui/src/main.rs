@@ -1064,6 +1064,11 @@ struct Ctx {
     /// crosshair / dashed-line strings are rebuilt only when their
     /// inputs move.
     frame_cmds: Rc<RefCell<FrameCmdCache>>,
+    /// Frame times (DS-82): the last 600 `refresh` durations (30 s
+    /// at 20 Hz) for the Diagnostics p50/p99. This is the Rust
+    /// frame work (`push_frame` + capture sync) — the Slint paint
+    /// itself runs async and is not observable from here.
+    frame_times: Rc<RefCell<VecDeque<Duration>>>,
     /// Verbose logging (DS-79): `--verbose` — live events go to
     /// stderr only when this is set.
     verbose: Rc<Cell<bool>>,
@@ -1329,6 +1334,30 @@ impl Ctx {
     /// Cached crosshair commands for the current marker (DS-78).
     fn crosshair_commands_cached(&self, mx: f32, my: f32) -> SharedString {
         self.frame_cmds.borrow_mut().crosshair(mx, my)
+    }
+
+    /// Record one frame's `refresh` time (DS-82): ring of the last
+    /// 600 frames (30 s at 20 Hz).
+    fn record_frame_time(&self, elapsed: Duration) {
+        let mut times = self.frame_times.borrow_mut();
+        times.push_back(elapsed);
+        while times.len() > 600 {
+            times.pop_front();
+        }
+    }
+
+    /// Frame-time p50/p99 over the recorded window (DS-82), in ms.
+    /// `None` until a frame has been recorded.
+    fn frame_time_p50_p99(&self) -> Option<(f64, f64)> {
+        let times = self.frame_times.borrow();
+        if times.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<Duration> = times.iter().copied().collect();
+        sorted.sort();
+        let p50 = sorted[(sorted.len() - 1) / 2];
+        let p99 = sorted[(sorted.len() - 1) * 99 / 100];
+        Some((p50.as_secs_f64() * 1000.0, p99.as_secs_f64() * 1000.0))
     }
 
     /// Push the current API + tuning state into the window (one
@@ -3634,6 +3663,20 @@ impl Ctx {
                 );
                 win.set_diag_tx_failures_text(stats.tx_fail.to_string().into());
                 win.set_diag_seq_gaps_text(stats.seq_gap.to_string().into());
+                // DS-82: IPC dispatch latency (the daemon, all
+                // methods). "—" until measured — never a fake 0.
+                win.set_diag_ipc_p50_text(
+                    stats
+                        .ipc_p50_ms
+                        .map_or_else(|| "—".to_string(), |v| format!("{v:.2} ms"))
+                        .into(),
+                );
+                win.set_diag_ipc_p99_text(
+                    stats
+                        .ipc_p99_ms
+                        .map_or_else(|| "—".to_string(), |v| format!("{v:.2} ms"))
+                        .into(),
+                );
             }
         } else {
             win.set_diag_delay_text("—".into());
@@ -3642,7 +3685,23 @@ impl Ctx {
             win.set_diag_loop_rate_text("—".into());
             win.set_diag_tx_failures_text("—".into());
             win.set_diag_seq_gaps_text("—".into());
+            win.set_diag_ipc_p50_text("—".into());
+            win.set_diag_ipc_p99_text("—".into());
         }
+        // DS-82: frame-time histogram (this UI, last 30 s) — local,
+        // so it is set regardless of whether the daemon answered
+        // `diag_stats` above.
+        let (frame_p50, frame_p99) = self.frame_time_p50_p99().unzip();
+        win.set_diag_frame_p50_text(
+            frame_p50
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
+                .into(),
+        );
+        win.set_diag_frame_p99_text(
+            frame_p99
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
+                .into(),
+        );
         // H10: the live button grid shows the real pressed buttons
         // (bits 1–12 of the snapshot mask) — empty when not live, so
         // the section hides instead of rendering 12 dead tiles.
@@ -7167,7 +7226,11 @@ fn start_frame_timer(
             // M-7: queued slider pushes (150 ms debounce) flush here.
             ctx.flush_steering_push(&w);
             ctx.flush_field_push(&w);
+            // DS-82: time the frame's Rust work for the Diagnostics
+            // frame-time histogram.
+            let frame_started = Instant::now();
             ctx.refresh(&w, t);
+            ctx.record_frame_time(frame_started.elapsed());
             if t.is_multiple_of(20) {
                 // 1 Hz: job timeouts + the `connecting` guard (A9 —
                 // never infinite) + firmware-update poll (H-4) +
@@ -7350,6 +7413,7 @@ fn main() -> Result<(), slint::PlatformError> {
         steer_hist: Rc::new(RefCell::new(VecDeque::new())),
         pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
         frame_cmds: Rc::new(RefCell::new(FrameCmdCache::default())),
+        frame_times: Rc::new(RefCell::new(VecDeque::new())),
         verbose: Rc::new(Cell::new(args.verbose)),
         unsaved: Rc::new(Cell::new(initial_unsaved)),
         // M10: notifications persist across restarts — the drawer is
@@ -7727,6 +7791,29 @@ mod tests {
         assert!(!dashed.is_empty());
     }
 
+    /// DS-82: the frame-time histogram is empty until a frame is
+    /// recorded, then reports p50/p99 over the recorded window in
+    /// ms (1..=100 ms samples: p50 50 ms, p99 99 ms).
+    #[test]
+    fn ds82_frame_time_histogram_reports_p50_p99() {
+        let (ctx, _dir) = fc2_test_ctx();
+        assert_eq!(ctx.frame_time_p50_p99(), None);
+        for ms in 1..=100_u64 {
+            ctx.record_frame_time(Duration::from_millis(ms));
+        }
+        let (p50, p99) = ctx.frame_time_p50_p99().expect("measured");
+        assert!((p50 - 50.0).abs() < 0.001, "p50 {p50}");
+        assert!((p99 - 99.0).abs() < 0.001, "p99 {p99}");
+        // The ring caps at 600: 700 more samples push the first
+        // 200 out (window 201..=800 ms → p50 500 ms).
+        for ms in 101..=800_u64 {
+            ctx.record_frame_time(Duration::from_millis(ms));
+        }
+        assert_eq!(ctx.frame_times.borrow().len(), 600);
+        let (p50, _) = ctx.frame_time_p50_p99().expect("measured");
+        assert!((p50 - 500.0).abs() < 0.001, "p50 {p50}");
+    }
+
     #[test]
     fn countdown_ring_drives_from_seconds() {
         assert_eq!(countdown_ring_commands(0, 120), "");
@@ -7925,6 +8012,7 @@ mod tests {
             steer_hist: Rc::new(RefCell::new(VecDeque::new())),
             pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
             frame_cmds: Rc::new(RefCell::new(FrameCmdCache::default())),
+            frame_times: Rc::new(RefCell::new(VecDeque::new())),
             verbose: Rc::new(Cell::new(false)),
             unsaved: Rc::new(Cell::new(false)),
             notifications: Rc::new(RefCell::new(NotificationCenter::load(Some(&dir)))),
