@@ -168,26 +168,6 @@ pub fn popup_hwnd(_title: &str) -> Option<isize> {
     None
 }
 
-/// Whether `hwnd` (a raw `HWND` value from [`popup_hwnd`]) is the
-/// current foreground window. `false` when Windows cannot tell
-/// (no foreground window).
-#[cfg(windows)]
-#[must_use]
-pub fn is_foreground(hwnd_value: isize) -> bool {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-    let foreground = unsafe { GetForegroundWindow() };
-    foreground == HWND(hwnd_value as *mut std::ffi::c_void)
-}
-
-/// No foreground window on Linux: the click-outside poll never
-/// treats the popup as foreground there.
-#[cfg(not(windows))]
-#[must_use]
-pub fn is_foreground(_hwnd_value: isize) -> bool {
-    false
-}
-
 /// Bring the tray popup to the foreground when it is shown (H-2,
 /// v2.0.2) — the second half of the A4 fix.
 ///
@@ -488,13 +468,16 @@ pub fn restore_ui_window() -> bool {
 #[cfg(not(windows))]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
 
     #[test]
     fn linux_ui_process_scan_finds_rsh_ui_and_ignores_other_programs() {
-        // `exec -a` renames argv[0], so the child's cmdline names
-        // rsh-ui without running the real UI.
-        let mut ui = std::process::Command::new("bash")
-            .args(["-c", "exec -a rsh-ui sleep 30"])
+        // argv[0] set directly — no shell: `sh` here is dash,
+        // which has no `exec -a`, so a `sh -c "exec -a ..."` fake
+        // dies instantly and the scan finds nothing.
+        let mut ui = std::process::Command::new("sleep")
+            .arg("30")
+            .arg0("rsh-ui")
             .spawn()
             .expect("spawn fake ui");
         std::thread::sleep(std::time::Duration::from_millis(200));

@@ -13,6 +13,7 @@ use std::time::Duration;
 pub mod config;
 pub mod control_client;
 pub mod discovery;
+pub mod port_conflict;
 pub mod serial;
 pub mod session;
 pub mod udp;

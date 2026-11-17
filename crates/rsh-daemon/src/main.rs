@@ -37,7 +37,7 @@ mod tray_autostart;
 mod tray_geometry;
 mod tray_popup;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rsh_api::{AppApi, AppEvent, ConnEvent, ConnectionError, ManagerAction};
-use rsh_app_core::diagnostics::{append_startup_log_both, log_fatal};
+use rsh_app_core::diagnostics::{append_startup_log_both, install_panic_hook, log_fatal};
 use rsh_app_core::state::{AppStateCore, BindingAppAction, TransportKind};
 #[cfg(unix)]
 use rsh_ipc::serve_listener;
@@ -56,7 +56,10 @@ use tokio::sync::broadcast;
 use daemon_api::{DaemonApi, connection_changed_event};
 use rejoin::{RSH_SSID, rejoin_wifi};
 use single_instance::{AcquireOutcome, acquire};
-use tray_popup::{PopupGame, TrayPopupData, anchor_popup, next_profile, should_dismiss_popup};
+use tray_popup::{
+    POPUP_ACTIVATION_TIMEOUT, PopupDismissPoll, PopupGame, TrayPopupData, TrayToggleGuard,
+    anchor_popup, next_profile,
+};
 
 slint::include_modules!();
 
@@ -406,7 +409,13 @@ async fn manager_loop(
         }
         last_active = active_now;
         // Heartbeat watchdog (C-04): 2 s silence in Active →
-        // rebuild + re-activate.
+        // rebuild + re-activate. F20: the rebuild is capped inside
+        // `check_watchdog` (5 frameless rebuilds latch
+        // `Error(WatchdogStall)`, which returns `StateChanged`,
+        // not `RebuildTransport`, so this branch simply does not
+        // run for a latched manager) and the tick is fed real frame
+        // freshness by `DaemonApi::watchdog_tick` — a healthy
+        // session never reaches this branch at all.
         if gate && api.watchdog_tick() == ManagerAction::RebuildTransport {
             log_line(
                 verbose,
@@ -452,7 +461,14 @@ fn publish(event_tx: &broadcast::Sender<AppEvent>, event: AppEvent) {
 /// daemon therefore survives an X-close of the UI; what it must
 /// NOT do is spawn a second UI while one is already running — that
 /// is [`open_ui`]'s job.
-fn spawn_ui(page: Option<&str>) {
+///
+/// Detached spawn (F8, v2.0.3): stdio is nulled and, on Windows,
+/// the child is detached (`DETACHED_PROCESS |
+/// CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`) — the same bug
+/// class as the NSIS `Exec` hang fixed in v2.0.2 (b8b9fd4), where a
+/// spawned child inheriting the parent's stdio pipes could block
+/// the parent forever.
+fn spawn_ui(page: Option<&str>, verbose: bool) {
     let Some(exe) = std::env::current_exe().ok().and_then(|exe| {
         exe.parent().map(|dir| {
             dir.join(if cfg!(windows) {
@@ -469,8 +485,24 @@ fn spawn_ui(page: Option<&str>) {
     if let Some(page) = page {
         command.arg("--page").arg(page);
     }
-    if let Err(error) = command.spawn() {
-        eprintln!("rsh-daemon: cannot start UI ({}): {error}", exe.display());
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows::Win32::System::Threading::{
+            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+        };
+        command
+            .creation_flags(DETACHED_PROCESS.0 | CREATE_NEW_PROCESS_GROUP.0 | CREATE_NO_WINDOW.0);
+    }
+    match command.spawn() {
+        Ok(child) => log_line(verbose, &format!("daemon: spawned UI (pid {})", child.id())),
+        Err(error) => {
+            eprintln!("rsh-daemon: cannot start UI ({}): {error}", exe.display());
+        }
     }
 }
 
@@ -506,7 +538,7 @@ fn open_ui(page: Option<&str>, verbose: bool) -> bool {
                 verbose,
                 &format!("tray: forwarding page '{page}' to running UI"),
             );
-            spawn_ui(Some(page));
+            spawn_ui(Some(page), verbose);
         }
         return true;
     }
@@ -525,7 +557,7 @@ fn open_ui(page: Option<&str>, verbose: bool) -> bool {
                     "tray: UI already running (pid {pid}) — forwarding page '{page}' via second instance"
                 ),
             );
-            spawn_ui(Some(page));
+            spawn_ui(Some(page), verbose);
         } else {
             log_line(
                 verbose,
@@ -535,7 +567,7 @@ fn open_ui(page: Option<&str>, verbose: bool) -> bool {
         return true;
     }
     // 3. No UI at all → launch it exactly like a double-click.
-    spawn_ui(page);
+    spawn_ui(page, verbose);
     false
 }
 
@@ -559,18 +591,133 @@ fn resolve_game_id(api: &DaemonApi, key: &str) -> Option<String> {
         .map(|game| game.id.clone())
 }
 
+/// Signal a fatal IPC bind failure (F2, v2.0.3): write the
+/// machine-readable fatal status + the dual-location fatal log,
+/// then ask the MAIN thread to quit cleanly (shutdown flag +
+/// `slint::quit_event_loop()`) instead of `process::exit(1)` from
+/// this background task. Exiting from here used to kill the process
+/// mid-flight — the tray icon was never removed (`NIM_DELETE`) and
+/// the single-instance lock never released — so every death left a
+/// ghost icon and a stale lock behind. The main thread does the
+/// teardown (tray drop, engine stop, lock release) after the event
+/// loop returns; with no event loop running (headless park,
+/// `--check`) the quit call is a harmless no-op and the main thread
+/// exits on the shutdown flag instead.
+///
+/// F24: the signal also sets `ipc_fatal`, so `main` can exit(1)
+/// AFTER that teardown — the `DaemonHung` path exits 1, and a fatal
+/// bind must too (the rig's `gate-ipc-bind-failure` asserts it).
+/// A clean SIGTERM/quit never sets it, so a clean shutdown still
+/// exits 0. The exit-code decision lives in `main`, never in a
+/// background task (F2's rule stands).
+fn signal_ipc_fatal_shutdown(
+    data_dir: &std::path::Path,
+    detail: &str,
+    shutdown: &Arc<AtomicBool>,
+    ipc_fatal: &Arc<AtomicBool>,
+) {
+    write_daemon_status(data_dir, "fatal", "IpcBindFailed", detail);
+    let _ = log_fatal(&format!("daemon: {detail}"));
+    ipc_fatal.store(true, Ordering::Relaxed);
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = slint::quit_event_loop();
+}
+
+/// Whether a Windows named-pipe create failure means "an instance
+/// is already in use" (transient — a live peer holds the pipe) rather
+/// than a real bind error. Log-proven (user log 2026-11-16, 1199
+/// failures): after the UI connects, every further create fails
+/// `Access is denied. (os error 5)`, and treating that as a bind
+/// error killed the daemon ~5 s after every UI connect (v2.0.2 loop
+/// killer). The raw OS codes are Win32 (`ERROR_ACCESS_DENIED` 5,
+/// `ERROR_PIPE_BUSY` 231); this helper is only called on the Windows
+/// path, so the raw-code arm never misfires on Linux.
+// Only called on the Windows IPC path; kept available in test
+// builds so the Linux suite can cover the classifier (F1).
+#[cfg(any(windows, test))]
+fn pipe_create_is_in_use(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::AlreadyExists | ErrorKind::AddrInUse
+    ) || matches!(error.raw_os_error(), Some(5 | 231))
+}
+
+/// Backoff between retries of an in-use pipe create (F1): 100 ms,
+/// doubling, capped at 1 s. The retry itself is unbounded — an
+/// in-use pipe is a live peer, not a broken bind.
+fn pipe_in_use_backoff(failures: u32) -> Duration {
+    // 100 ms, 200 ms, 400 ms, 800 ms, then 1 s forever.
+    let shift = failures.saturating_sub(1).min(4);
+    Duration::from_millis((100u64 << shift).min(1000))
+}
+
+/// Outcome of recording one IPC bind/create failure (F1/F2).
+enum IpcBindRetry {
+    /// Try again after this delay.
+    RetryAfter(Duration),
+    /// Five consecutive real bind failures: fatal.
+    Fatal,
+}
+
+/// Counts CONSECUTIVE IPC bind/create failures (F1/F2): five real
+/// failures in a row are fatal; "pipe in use" failures never count
+/// toward the five (a live peer holds the pipe — that is the v2.0.2
+/// loop killer, where every post-connect create failed
+/// `ERROR_ACCESS_DENIED` and the daemon killed itself ~5 s after the
+/// UI connected); a success resets both counters.
+struct IpcBindTracker {
+    failures: u32,
+    in_use_failures: u32,
+}
+
+impl IpcBindTracker {
+    fn new() -> Self {
+        Self {
+            failures: 0,
+            in_use_failures: 0,
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.failures = 0;
+        self.in_use_failures = 0;
+    }
+
+    fn record_failure(&mut self, in_use: bool) -> IpcBindRetry {
+        if in_use {
+            self.in_use_failures += 1;
+            return IpcBindRetry::RetryAfter(pipe_in_use_backoff(self.in_use_failures));
+        }
+        self.failures += 1;
+        if self.failures >= 5 {
+            IpcBindRetry::Fatal
+        } else {
+            IpcBindRetry::RetryAfter(Duration::from_secs(1))
+        }
+    }
+}
+
 /// Serve the IPC listener forever (Unix socket on Linux, named
 /// pipe on Windows).
 #[cfg(unix)]
-async fn serve_ipc(server: Arc<IpcServer>, data_dir: &std::path::Path, verbose: bool) {
+async fn serve_ipc(
+    server: Arc<IpcServer>,
+    data_dir: &std::path::Path,
+    verbose: bool,
+    shutdown: Arc<AtomicBool>,
+    ipc_fatal: Arc<AtomicBool>,
+) {
     let path = socket_path(data_dir);
     // A bind can fail transiently (the data dir is still being
     // created, a stale socket is being reaped) — retry a few times
     // instead of silently running with no IPC, which would leave
     // the UI on simulated data forever with no further trace.
-    for attempt in 1..=5 {
+    let mut tracker = IpcBindTracker::new();
+    loop {
         match rsh_ipc::bind_unix_socket(&path) {
             Ok(listener) => {
+                tracker.record_success();
                 log_line(
                     verbose,
                     &format!("daemon: IPC listening on {}", path.display()),
@@ -578,71 +725,162 @@ async fn serve_ipc(server: Arc<IpcServer>, data_dir: &std::path::Path, verbose: 
                 serve_listener(server, listener).await;
                 return;
             }
+            Err(error) => match tracker.record_failure(false) {
+                IpcBindRetry::RetryAfter(delay) => {
+                    log_line(
+                        verbose,
+                        &format!(
+                            "daemon: IPC bind failed (attempt {}/5): {error}",
+                            tracker.failures
+                        ),
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                IpcBindRetry::Fatal => {
+                    // M8 (v2.0.2): five failed binds are a VISIBLE
+                    // fatal state, not a quiet headless run — but
+                    // (F2) the fatal is signalled to the main thread
+                    // instead of `process::exit(1)` from this task,
+                    // so the tray is removed and the lock released
+                    // cleanly before the process ends.
+                    let detail = format!(
+                        "daemon IPC bind failed after 5 attempts (socket was {}) — the daemon cannot serve the UI",
+                        path.display()
+                    );
+                    signal_ipc_fatal_shutdown(data_dir, &detail, &shutdown, &ipc_fatal);
+                    return;
+                }
+            },
+        }
+    }
+}
+
+/// Create ONE Windows named-pipe listening instance, retrying
+/// transient failures (F1). Returns `None` only when a fatal bind
+/// failure was signalled (the tracker hit 5) or shutdown was
+/// requested while waiting — the caller then returns.
+#[cfg(windows)]
+async fn create_pipe_listener(
+    first_create: bool,
+    data_dir: &std::path::Path,
+    verbose: bool,
+    shutdown: &Arc<AtomicBool>,
+    ipc_fatal: &Arc<AtomicBool>,
+    tracker: &mut IpcBindTracker,
+) -> Option<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return None;
+        }
+        match ServerOptions::new()
+            .first_pipe_instance(first_create)
+            .create(rsh_ipc::IPC_PIPE_NAME)
+        {
+            Ok(pipe) => {
+                tracker.record_success();
+                return Some(pipe);
+            }
             Err(error) => {
-                log_line(
-                    verbose,
-                    &format!("daemon: IPC bind failed (attempt {attempt}/5): {error}"),
-                );
-                if attempt < 5 {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                let in_use = pipe_create_is_in_use(&error);
+                match tracker.record_failure(in_use) {
+                    IpcBindRetry::RetryAfter(delay) => {
+                        if in_use {
+                            log_line(
+                                verbose,
+                                &format!(
+                                    "daemon: IPC pipe create failed (in use, retry {}): {error} (kind={:?}, os_error={:?})",
+                                    tracker.in_use_failures,
+                                    error.kind(),
+                                    error.raw_os_error()
+                                ),
+                            );
+                        } else {
+                            log_line(
+                                verbose,
+                                &format!(
+                                    "daemon: IPC pipe create failed (attempt {}/5): {error} (kind={:?}, os_error={:?})",
+                                    tracker.failures,
+                                    error.kind(),
+                                    error.raw_os_error()
+                                ),
+                            );
+                        }
+                        tokio::time::sleep(delay).await;
+                    }
+                    IpcBindRetry::Fatal => {
+                        signal_ipc_fatal_shutdown(
+                            data_dir,
+                            "daemon IPC bind failed after 5 attempts — the daemon cannot serve the UI",
+                            shutdown,
+                            ipc_fatal,
+                        );
+                        return None;
+                    }
                 }
             }
         }
     }
-    // M8 (v2.0.2): five failed binds are a VISIBLE fatal state,
-    // not a quiet headless run — the daemon exits(1) after leaving
-    // the machine-readable fatal status + the dual-location fatal
-    // log, so the UI can say the daemon is dead instead of silently
-    // running on simulated data.
-    let detail = format!(
-        "daemon IPC bind failed after 5 attempts (socket was {}) — the daemon cannot serve the UI",
-        path.display()
-    );
-    write_daemon_status(data_dir, "fatal", "IpcBindFailed", &detail);
-    let _ = log_fatal(&format!("daemon: {detail}"));
-    std::process::exit(1);
 }
 
 /// Serve the IPC named pipe forever (Windows).
 #[cfg(windows)]
-async fn serve_ipc(server: Arc<IpcServer>, data_dir: &std::path::Path, verbose: bool) {
-    use tokio::net::windows::named_pipe::ServerOptions;
-    log_line(verbose, "daemon: IPC listening on \\\\.\\pipe\\rsh-daemon");
-    // A pipe create can fail transiently — retry, and count
-    // CONSECUTIVE failures: five in a row are a visible fatal
-    // (M8, v2.0.2), exactly like the Unix bind path, instead of
-    // the old infinite retry that left the daemon headless with no
-    // trace. A successful create resets the count; a failed client
-    // connect just loops for the next client.
-    let mut create_failures = 0u32;
+async fn serve_ipc(
+    server: Arc<IpcServer>,
+    data_dir: &std::path::Path,
+    verbose: bool,
+    shutdown: Arc<AtomicBool>,
+    ipc_fatal: Arc<AtomicBool>,
+) {
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+    let mut tracker = IpcBindTracker::new();
+    // `first_pipe_instance(true)` ONLY on the first create in the
+    // process (F1): after the UI connects, instance #1 stays alive,
+    // so a second `first_pipe_instance(true)` create fails
+    // `ERROR_ACCESS_DENIED` — the v2.0.2 loop killer (user log,
+    // 2026-11-16: 1199 pipe-create failures, daemon dead ~5 s after
+    // every UI connect).
+    let mut first_create = true;
+    // The listening instance carried between iterations: the NEXT
+    // listener is created BEFORE the accepted pipe is handed to
+    // `serve_stream` (tokio NamedPipeServer doc pattern), so a
+    // listener is always available.
+    let mut listener: Option<NamedPipeServer> = None;
+    // NOTE (F10): the "IPC listening" line is logged only after the
+    // first successful create — the old unconditional line, printed
+    // before the loop, claimed the pipe was listening while every
+    // create was in fact failing.
+    let mut listening_logged = false;
     loop {
-        let pipe = match ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(rsh_ipc::IPC_PIPE_NAME)
-        {
-            Ok(pipe) => {
-                create_failures = 0;
-                pipe
-            }
-            Err(error) => {
-                create_failures += 1;
-                log_line(
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let pipe = match listener.take() {
+            Some(pipe) => pipe,
+            None => {
+                match create_pipe_listener(
+                    first_create,
+                    data_dir,
                     verbose,
-                    &format!(
-                        "daemon: IPC pipe create failed (attempt {create_failures}/5): {error}"
-                    ),
-                );
-                if create_failures >= 5 {
-                    let detail =
-                        "daemon IPC bind failed after 5 attempts — the daemon cannot serve the UI";
-                    write_daemon_status(data_dir, "fatal", "IpcBindFailed", detail);
-                    let _ = log_fatal(&format!("daemon: {detail}"));
-                    std::process::exit(1);
+                    &shutdown,
+                    &ipc_fatal,
+                    &mut tracker,
+                )
+                .await
+                {
+                    Some(pipe) => pipe,
+                    // Fatal signalled (or shutdown) inside.
+                    None => return,
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
             }
         };
+        if first_create {
+            first_create = false;
+            if !listening_logged {
+                log_line(verbose, "daemon: IPC listening on \\\\.\\pipe\\rsh-daemon");
+                listening_logged = true;
+            }
+        }
         // NOTE (OPEN, Windows verification): the pipe currently uses
         // the default security descriptor. An explicit
         // current-user-only DACL is a Phase-7 hardening item — see
@@ -651,6 +889,31 @@ async fn serve_ipc(server: Arc<IpcServer>, data_dir: &std::path::Path, verbose: 
         if pipe.connect().await.is_err() {
             continue;
         }
+        // Pre-create the next listener BEFORE handing this pipe to
+        // `serve_stream`. One best-effort attempt: a failure here is
+        // NOT fatal — the loop-top create retries it with the full
+        // backoff/fatal policy, and the accepted client is served
+        // regardless.
+        listener = match ServerOptions::new()
+            .first_pipe_instance(false)
+            .create(rsh_ipc::IPC_PIPE_NAME)
+        {
+            Ok(next) => {
+                tracker.record_success();
+                Some(next)
+            }
+            Err(error) => {
+                log_line(
+                    verbose,
+                    &format!(
+                        "daemon: IPC next-pipe create failed (will retry): {error} (kind={:?}, os_error={:?})",
+                        error.kind(),
+                        error.raw_os_error()
+                    ),
+                );
+                None
+            }
+        };
         let server = Arc::clone(&server);
         tokio::spawn(async move {
             server.serve_stream(pipe).await;
@@ -768,11 +1031,18 @@ fn main() {
         Some(dir) => (dir, false),
         None => (PathBuf::from("."), true),
     };
+    // F16: install the panic hook FIRST, before anything that can
+    // panic leaves no trace — a silent panic used to die with no
+    // log at all. The hook appends to
+    // `<data_dir>/logs/diagnostics-panic.log` (plus the `%TEMP%`
+    // fallback inside `install_panic_hook`).
+    install_panic_hook(data_dir.join("logs"));
     log_line(
         verbose,
         &format!(
-            "daemon: starting rsh-daemon v{} (data dir {})",
+            "daemon: starting rsh-daemon v{} (pid {}, data dir {})",
             rsh_api::app_version(),
+            std::process::id(),
             data_dir.display()
         ),
     );
@@ -793,52 +1063,84 @@ fn main() {
         Ok(AcquireOutcome::First(lock)) => lock,
         Ok(AcquireOutcome::AlreadyRunning(pid)) => {
             let socket = socket_path(&data_dir);
-            // The lock holder may be a daemon that is still starting
-            // (IPC not bound yet) — give its ping a few tries before
-            // declaring it dead.
-            let alive = std::thread::spawn(move || {
+            // F15: the lock holder may be a daemon that is still
+            // starting (IPC not bound yet — store open + runtime
+            // happen before the pipe exists) — give its ping up to
+            // `PING_ATTEMPTS` × `PING_INTERVAL` (~10 s, not the old
+            // 3 × 500 ms), and track whether its IPC endpoint ever
+            // existed: no endpoint yet means "still starting", which
+            // must NOT be reported as hung.
+            let (alive, endpoint_seen) = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .ok()?;
                 Some(runtime.block_on(async move {
-                    for _ in 0..3 {
+                    let mut endpoint_seen = false;
+                    for _ in 0..single_instance::PING_ATTEMPTS {
+                        if single_instance::ipc_endpoint_exists(&socket) {
+                            endpoint_seen = true;
+                        }
                         if let Ok(client) = rsh_ipc::IpcClient::connect(&socket).await
                             && let Ok(true) = client.ping().await
                         {
-                            return true;
+                            return (true, endpoint_seen);
                         }
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        tokio::time::sleep(single_instance::PING_INTERVAL).await;
                     }
-                    false
+                    (false, endpoint_seen)
                 }))
             })
             .join()
             .ok()
             .flatten()
-            .unwrap_or(false);
-            if alive {
-                log_line(
-                    verbose,
-                    &format!("daemon: already running (pid {pid:?}, IPC answers) — exiting"),
-                );
-                std::process::exit(0);
+            .unwrap_or((false, false));
+            match single_instance::classify_already_running(alive, endpoint_seen) {
+                single_instance::AlreadyRunningVerdict::Alive => {
+                    log_line(
+                        verbose,
+                        &format!("daemon: already running (pid {pid:?}, IPC answers) — exiting"),
+                    );
+                    std::process::exit(0);
+                }
+                single_instance::AlreadyRunningVerdict::Hung => {
+                    // The lock is held, the endpoint exists, but the
+                    // daemon does not answer IPC: hung, or a stale
+                    // lock the single-instance check could not
+                    // reclaim. Never exit 0 (success) for a broken
+                    // daemon, and never leave only an invisible
+                    // stderr line: a UI that spawned us falls back to
+                    // simulated data, so this failure must be in the
+                    // dual-location log AND in the machine-readable
+                    // status file (L8, v2.0.2) — the UI reads the
+                    // file and tells the user the running daemon is
+                    // hung instead of silently simulating.
+                    let detail = format!(
+                        "already running (pid {pid:?}) but not responding to IPC after {} tries (endpoint exists) — the running daemon is hung or its IPC is dead; not taking over",
+                        single_instance::PING_ATTEMPTS
+                    );
+                    write_daemon_status(&data_dir, "fatal", "DaemonHung", &detail);
+                    let _ = log_fatal(&format!("daemon: {detail}"));
+                    std::process::exit(1);
+                }
+                single_instance::AlreadyRunningVerdict::Starting => {
+                    // No fatal status: the first daemon is still
+                    // starting (its IPC endpoint never appeared in
+                    // ~10 s). Exiting 1 without writing `DaemonHung`,
+                    // so the UI does not latch a false fatal for a
+                    // daemon that is still coming up — the first
+                    // daemon will either answer or leave its own
+                    // trace.
+                    log_line(
+                        verbose,
+                        &format!(
+                            "daemon: already running (pid {pid:?}) but its IPC endpoint never appeared after {} tries — the first daemon is still starting; not declaring it hung, not taking over",
+                            single_instance::PING_ATTEMPTS
+                        ),
+                    );
+                    std::process::exit(1);
+                }
             }
-            // The lock is held but the daemon does not answer IPC:
-            // hung, or a stale lock the single-instance check could
-            // not reclaim. Never exit 0 (success) for a broken
-            // daemon, and never leave only an invisible stderr line:
-            // a UI that spawned us falls back to simulated data, so
-            // this failure must be in the dual-location log AND in
-            // the machine-readable status file (L8, v2.0.2) — the UI
-            // reads the file and tells the user the running daemon
-            // is hung instead of silently simulating.
-            let detail = format!(
-                "already running (pid {pid:?}) but not responding to IPC after 3 tries — the running daemon is hung or its IPC is dead; not taking over"
-            );
-            write_daemon_status(&data_dir, "fatal", "DaemonHung", &detail);
-            let _ = log_fatal(&format!("daemon: {detail}"));
-            std::process::exit(1);
         }
         Err(error) => {
             let _ = log_fatal(&format!(
@@ -915,6 +1217,11 @@ fn main() {
     let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(256);
     let tray_actions: Arc<Mutex<Vec<TrayAction>>> = Arc::new(Mutex::new(Vec::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
+    // F24: set only by `signal_ipc_fatal_shutdown` (a fatal IPC
+    // bind) — `main` exits 1 for it after the teardown below, so a
+    // fatal bind reports like `DaemonHung` instead of exiting 0.
+    // A clean quit never sets it.
+    let ipc_fatal = Arc::new(AtomicBool::new(false));
 
     // Runtime thread: IPC server + manager loop.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -933,8 +1240,10 @@ fn main() {
     {
         let server = Arc::clone(&ipc_server);
         let dir = data_dir.clone();
+        let shutdown = Arc::clone(&shutdown);
+        let ipc_fatal = Arc::clone(&ipc_fatal);
         runtime.spawn(async move {
-            serve_ipc(server, &dir, verbose).await;
+            serve_ipc(server, &dir, verbose, shutdown, ipc_fatal).await;
         });
     }
     {
@@ -1065,16 +1374,21 @@ fn main() {
     // back to the UI. Retry for ~10 s before giving up; a headless
     // Linux host fails every attempt (expected, spike §3) and the
     // daemon keeps running headless.
-    let tray_ok = if args.no_tray {
+    //
+    // F11: the tray handle is OWNED here for the process lifetime —
+    // dropping it after the event loop sends `NIM_DELETE` and the
+    // icon goes away on a clean quit (the old `mem::forget` leaked
+    // it, so ghosts piled up).
+    let tray: Option<RshTray> = if args.no_tray {
         log_line(verbose, "daemon: tray disabled (--no-tray)");
-        false
+        None
     } else {
-        let mut tray_ok = false;
+        let mut tray: Option<RshTray> = None;
         for attempt in 1..=6 {
             match create_tray(&api, &tray_actions, &shutdown, verbose, &data_dir) {
-                Ok(()) => {
+                Ok(handle) => {
                     log_line(verbose, "daemon: tray icon registered");
-                    tray_ok = true;
+                    tray = Some(handle);
                     break;
                 }
                 Err(error) => {
@@ -1088,14 +1402,15 @@ fn main() {
                 }
             }
         }
-        if !tray_ok {
+        if tray.is_none() {
             log_line(
                 verbose,
                 "daemon: tray unavailable after 6 attempts — running headless",
             );
         }
-        tray_ok
+        tray
     };
+    let tray_ok = tray.is_some();
 
     if tray_ok {
         // The event loop runs until Quit is picked (or the process
@@ -1104,17 +1419,36 @@ fn main() {
             log_line(verbose, &format!("daemon: event loop error: {error}"));
         }
     } else {
-        // No tray, no event loop: park the main thread until killed.
+        // No tray, no event loop: park the main thread until killed
+        // or until a background task signals shutdown (F2: a fatal
+        // IPC bind ends the process this way instead of
+        // `process::exit(1)` from the task).
         // (Ctrl-C / SIGTERM end the process; the pid file is
         // reclaimed by the next launch's /proc check.)
-        loop {
-            std::thread::sleep(Duration::from_secs(3600));
+        while !shutdown.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 
+    // F11/F10: dropping the tray FIRST removes the icon
+    // (`NIM_DELETE`) before the lock is released, then log the exit
+    // with the pid so a start/exit pair brackets every run in the log.
+    drop(tray);
+    log_line(
+        verbose,
+        &format!("daemon: exiting (pid {})", std::process::id()),
+    );
     shutdown.store(true, Ordering::Relaxed);
     let _ = state.stop_engine();
     lock.release();
+    // F24: a fatal IPC bind exits 1 — but only AFTER the teardown
+    // above (tray removed, engine stopped, lock released), so F2's
+    // rule (no `process::exit(1)` from a background task) still
+    // holds and the exit code is decided here, in `main`. A clean
+    // SIGTERM/quit leaves `ipc_fatal` unset and exits 0.
+    if ipc_fatal.load(Ordering::Relaxed) {
+        std::process::exit(1);
+    }
 }
 
 /// The tray popup window + its visibility state. Lives on the Slint
@@ -1123,15 +1457,22 @@ struct PopupHandle {
     popup: TrayPopup,
     visible: Cell<bool>,
     shown_at: Cell<Option<Instant>>,
-    /// The popup was the foreground window at least once since it
-    /// was shown (A4): losing the foreground after that is a real
-    /// click-away. Never-foreground is NOT a click-away — see
-    /// [`tray_popup::should_dismiss_popup`].
-    was_foreground: Cell<bool>,
-    /// The foreground window when the popup was shown (A4): the
-    /// poll dismisses only when the foreground MOVED AWAY from
-    /// this window. `None` on Linux (no foreground query).
-    foreground_at_show: Cell<Option<isize>>,
+    /// `--verbose` passthrough, so the popup show/hide log lines
+    /// (F10) also reach stderr.
+    verbose: bool,
+    /// Click-outside poll state (F9): the foreground baseline is
+    /// re-sampled in the settle window after the grace, and a
+    /// dismiss needs a sustained change — see
+    /// [`tray_popup::PopupDismissPoll`].
+    poll: RefCell<PopupDismissPoll>,
+    /// Show-time activation finished — either the popup became
+    /// foreground or the retry window
+    /// ([`tray_popup::POPUP_ACTIVATION_TIMEOUT`]) expired. While
+    /// false, the timer tick retries activation (F9).
+    activation_done: Cell<bool>,
+    /// The "no popup window yet" retry note was already logged once
+    /// (bounds the activation-retry logging to one line per show).
+    activation_note_logged: Cell<bool>,
 }
 
 impl PopupHandle {
@@ -1207,37 +1548,145 @@ impl PopupHandle {
     fn show(&self, api: &DaemonApi) {
         // A4/H-2: record the foreground window BEFORE showing —
         // the click-outside poll dismisses only when the
-        // foreground moves away from THIS window.
-        self.was_foreground.set(false);
-        self.foreground_at_show
-            .set(tray_geometry::foreground_hwnd());
+        // foreground moves away from the baseline it re-samples
+        // after the grace (F9 — the show-time value is stale by
+        // the time Windows settles, so it is diagnostics only).
+        let foreground_at_show = tray_geometry::foreground_hwnd();
+        *self.poll.borrow_mut() = PopupDismissPoll::new(foreground_at_show);
         let (x, y) = anchor_popup(tray_geometry::tray_icon_rect(), tray_geometry::work_area());
         self.popup
             .window()
             .set_position(slint::PhysicalPosition::new(x, y));
         self.refresh(api);
-        if self.popup.show().is_ok() {
-            self.visible.set(true);
-            self.shown_at.set(Some(Instant::now()));
-            // H-2: activate the popup — a tray-shown window
-            // usually never becomes foreground on its own
-            // (foreground lock), which is what made the old poll
-            // dismiss it ~1 s after the click. Best-effort: a
-            // failed activation leaves the popup visible but
-            // inactive, and the fixed poll
-            // (`should_dismiss_popup`) still keeps it open until
-            // a real click-away.
-            let _ = tray_geometry::activate_popup_window(tray_geometry::POPUP_WINDOW_TITLE);
+        match self.popup.show() {
+            Ok(()) => {
+                self.visible.set(true);
+                self.shown_at.set(Some(Instant::now()));
+                self.activation_done.set(false);
+                self.activation_note_logged.set(false);
+                // H-2/F9: activate the popup — a tray-shown window
+                // usually never becomes foreground on its own
+                // (foreground lock), which is what made the old poll
+                // dismiss it ~1 s after the click. The attempt is
+                // logged (F10) and retried on timer ticks until
+                // the popup is foreground or the timeout expires
+                // (see `tick`): Slint may not have created the
+                // native window yet, so a first attempt that finds
+                // no window is NOT a failure, only a retry.
+                let attempted =
+                    tray_geometry::activate_popup_window(tray_geometry::POPUP_WINDOW_TITLE);
+                log_line(
+                    self.verbose,
+                    &format!(
+                        "tray popup: shown pid={} foreground_at_show={foreground_at_show:?} activation_attempted={attempted}",
+                        std::process::id()
+                    ),
+                );
+            }
+            Err(error) => {
+                log_line(
+                    self.verbose,
+                    &format!(
+                        "tray popup: show failed pid={} foreground_at_show={foreground_at_show:?} error={error}",
+                        std::process::id()
+                    ),
+                );
+            }
         }
     }
 
-    /// Hide the popup (click-outside, Escape, or an action taken).
-    fn hide(&self) {
+    /// Hide the popup, logging why (F10): every hide carries the
+    /// reason + daemon pid + foreground values + elapsed time, so
+    /// a poll dismiss and a process death are distinguishable in
+    /// the log — previously `show()`/`hide()` logged nothing and
+    /// the two looked identical. No log line when the popup was
+    /// not visible (a no-op hide).
+    fn hide(&self, reason: &str) {
+        if self.visible.get() {
+            let poll = self.poll.borrow();
+            log_line(
+                self.verbose,
+                &format!(
+                    "tray popup: hidden reason={reason} pid={} elapsed_ms={} foreground_at_show={:?} baseline={:?} foreground_now={:?} was_foreground_sustained={}",
+                    std::process::id(),
+                    self.shown_at
+                        .get()
+                        .map_or(0, |shown| shown.elapsed().as_millis()),
+                    poll.foreground_at_show(),
+                    poll.baseline(),
+                    tray_geometry::foreground_hwnd(),
+                    poll.was_foreground_sustained(),
+                ),
+            );
+        }
         let _ = self.popup.hide();
         self.visible.set(false);
         self.shown_at.set(None);
-        self.was_foreground.set(false);
-        self.foreground_at_show.set(None);
+        self.activation_done.set(true);
+    }
+
+    /// One 100 ms timer tick while the popup is visible (F9).
+    /// `foreground_now` is this tick's single
+    /// `GetForegroundWindow()` read — both the foreground check
+    /// and the dismiss poll derive from it (no double read).
+    /// Returns `true` when the popup should hide (click-away).
+    fn tick(
+        &self,
+        shown: Instant,
+        foreground_now: Option<isize>,
+        popup_hwnd: Option<isize>,
+    ) -> bool {
+        let elapsed = shown.elapsed();
+        let popup_foreground = popup_hwnd.is_some_and(|hwnd| foreground_now == Some(hwnd));
+        // (c) Activation retry: the show-time attempt runs before
+        // Slint has created the native window, so retry on ticks
+        // until the popup is foreground or the timeout expires.
+        // Success and timeout are logged once each; a missing
+        // window is logged once (it is expected early on).
+        if !self.activation_done.get() {
+            if popup_foreground {
+                self.activation_done.set(true);
+                log_line(
+                    self.verbose,
+                    &format!(
+                        "tray popup: activated pid={} after {}ms",
+                        std::process::id(),
+                        elapsed.as_millis()
+                    ),
+                );
+            } else if elapsed <= POPUP_ACTIVATION_TIMEOUT {
+                let attempted =
+                    tray_geometry::activate_popup_window(tray_geometry::POPUP_WINDOW_TITLE);
+                if !attempted && !self.activation_note_logged.get() {
+                    self.activation_note_logged.set(true);
+                    log_line(
+                        self.verbose,
+                        &format!(
+                            "tray popup: activation retry — no popup window yet pid={} elapsed_ms={}",
+                            std::process::id(),
+                            elapsed.as_millis()
+                        ),
+                    );
+                }
+            } else {
+                self.activation_done.set(true);
+                log_line(
+                    self.verbose,
+                    &format!(
+                        "tray popup: activation not achieved within 1 s pid={} — popup visible but inactive, poll keeps it open until click-away",
+                        std::process::id()
+                    ),
+                );
+            }
+        }
+        // Dismiss poll — only once the native window exists (no
+        // window yet: stay open, never guess).
+        if popup_hwnd.is_none() {
+            return false;
+        }
+        self.poll
+            .borrow_mut()
+            .poll(elapsed, foreground_now, popup_hwnd)
     }
 }
 
@@ -1245,6 +1694,12 @@ impl PopupHandle {
 /// tray popup (§7.7) alongside it. The tray lives on the Slint
 /// event loop (main thread). A popup failure never takes the tray
 /// down: left-click then falls back to opening the UI.
+///
+/// Returns the tray handle: the caller owns it for the process
+/// lifetime (F11) — dropping it sends `NIM_DELETE` (Slint
+/// `PlatformTray::drop`, verified in slint 1.18.1
+/// `i-slint-core/items/system_tray/windows.rs`), which is what
+/// removes the icon on a clean quit.
 // One function: tray + popup creation is a single wiring pass
 // (icon → menu → popup → timer); splitting it would scatter the
 // shared handles across helpers.
@@ -1255,7 +1710,7 @@ fn create_tray(
     shutdown: &Arc<AtomicBool>,
     verbose: bool,
     data_dir: &std::path::Path,
-) -> Result<(), slint::PlatformError> {
+) -> Result<RshTray, slint::PlatformError> {
     let tray = RshTray::new()?;
     // A25: fill the native menu from the live store (real profiles
     // + installed games only — never hardcoded names). The menu is
@@ -1296,8 +1751,10 @@ fn create_tray(
             popup,
             visible: Cell::new(false),
             shown_at: Cell::new(None),
-            was_foreground: Cell::new(false),
-            foreground_at_show: Cell::new(None),
+            verbose,
+            poll: RefCell::new(PopupDismissPoll::new(None)),
+            activation_done: Cell::new(true),
+            activation_note_logged: Cell::new(false),
         })),
         Err(error) => {
             log_line(
@@ -1319,7 +1776,7 @@ fn create_tray(
             let popup = &handle.popup;
             let handle = Rc::clone(handle);
             popup.on_open_main(move || {
-                handle.hide();
+                handle.hide("open-main");
                 push(&actions, TrayAction::OpenMain);
             });
         }
@@ -1328,7 +1785,7 @@ fn create_tray(
             let popup = &handle.popup;
             let handle = Rc::clone(handle);
             popup.on_restart_wheel(move || {
-                handle.hide();
+                handle.hide("restart-wheel");
                 push(&actions, TrayAction::RestartWheel);
             });
         }
@@ -1337,7 +1794,7 @@ fn create_tray(
             let popup = &handle.popup;
             let handle = Rc::clone(handle);
             popup.on_launch_game(move |id| {
-                handle.hide();
+                handle.hide("launch-game");
                 push(&actions, TrayAction::LaunchGame(id.to_string()));
             });
         }
@@ -1350,20 +1807,22 @@ fn create_tray(
         {
             let popup = &handle.popup;
             let handle = Rc::clone(handle);
-            popup.on_close_popup(move || handle.hide());
+            popup.on_close_popup(move || handle.hide("close-button"));
         }
         // Refresh timer (10 Hz while visible) + click-outside poll.
         // The timer lives on the event-loop thread; the popup is
         // refreshed from the live `DaemonApi` (no IPC round-trip —
         // the daemon IS the data source). The poll dismisses only
-        // on a real click-away (see
-        // `tray_popup::should_dismiss_popup`: only when the
-        // foreground MOVES AWAY from the window it had at show
-        // time, or the popup loses a foreground it had — never
-        // merely for not being foreground, which a tray-shown
-        // window usually never is). On Linux `popup_hwnd` is
-        // always `None`, so the poll never dismisses there and
-        // Escape / the popup's own buttons close it instead.
+        // on a real click-away (see `tray_popup::PopupDismissPoll`:
+        // the foreground baseline is re-sampled after the grace
+        // and must move away for 3 consecutive polls, or the popup
+        // must lose a foreground it held for 500 ms — never merely
+        // for not being foreground, which a tray-shown window
+        // usually never is). One `GetForegroundWindow()` read per
+        // tick feeds both the foreground check and the poll (F9).
+        // On Linux `popup_hwnd` is always `None`, so the poll
+        // never dismisses there and Escape / the popup's own
+        // buttons close it instead.
         let timer = slint::Timer::default();
         {
             let handle = Rc::clone(handle);
@@ -1374,26 +1833,17 @@ fn create_tray(
                 move || {
                     if handle.visible.get() {
                         handle.refresh(&api);
-                        if let Some(shown) = handle.shown_at.get()
-                            && let Some(hwnd) =
-                                tray_geometry::popup_hwnd(tray_geometry::POPUP_WINDOW_TITLE)
-                        {
-                            let is_foreground = tray_geometry::is_foreground(hwnd);
-                            if is_foreground {
-                                handle.was_foreground.set(true);
-                            }
-                            if should_dismiss_popup(
-                                shown.elapsed(),
-                                is_foreground,
-                                handle.was_foreground.get(),
-                                tray_geometry::foreground_hwnd(),
-                                handle.foreground_at_show.get(),
-                            ) {
-                                handle.hide();
+                        if let Some(shown) = handle.shown_at.get() {
+                            let foreground_now = tray_geometry::foreground_hwnd();
+                            let hwnd = tray_geometry::popup_hwnd(tray_geometry::POPUP_WINDOW_TITLE);
+                            if handle.tick(shown, foreground_now, hwnd) {
+                                handle.hide("click-away");
                             }
                         }
                         // `popup_hwnd` None: the window cannot be
-                        // found (yet) — stay open, never guess.
+                        // found (yet) — the tick still retries
+                        // activation, but the poll never dismisses.
+                        // Stay open, never guess.
                     }
                 },
             );
@@ -1403,13 +1853,28 @@ fn create_tray(
     {
         // Left-click (§7.7): toggle the popup; without a popup the
         // click opens the UI, as before.
+        // (d) Double-click guard (F9): a second tray click within
+        // ~400 ms of an accepted toggle is ignored, so a
+        // double-click is one show, not show-then-hide.
         let actions = Arc::clone(tray_actions);
         let popup = popup_handle.clone();
         let api = Arc::clone(api);
+        let toggle_started = Instant::now();
+        let toggle_guard = Rc::new(RefCell::new(TrayToggleGuard::new()));
         tray.on_tray_clicked(move || match &popup {
             Some(handle) => {
+                if !toggle_guard.borrow_mut().accept(toggle_started.elapsed()) {
+                    log_line(
+                        verbose,
+                        &format!(
+                            "tray popup: tray click ignored (double-click guard) pid={}",
+                            std::process::id()
+                        ),
+                    );
+                    return;
+                }
                 if handle.visible.get() {
-                    handle.hide();
+                    handle.hide("tray-click toggle");
                 } else {
                     handle.show(&api);
                 }
@@ -1463,10 +1928,17 @@ fn create_tray(
         });
     }
     tray.show()?;
-    // Keep the tray alive for the process lifetime: leak it the way
-    // the Tauri shell leaked its TrayIcon (it must outlive this fn).
-    std::mem::forget(tray);
-    Ok(())
+    // F11: NO `mem::forget` here any more. The old code leaked the
+    // tray deliberately ("the Tauri shell leaked its TrayIcon"),
+    // which meant `Drop` never ran and no `NIM_DELETE` was ever
+    // sent — every dead daemon left a ghost icon until hover. Slint
+    // event-loop ownership does NOT require the leak: the caller
+    // (`main`) holds the returned handle across `run_event_loop()`
+    // and drops it after the loop returns, which is exactly when
+    // the icon must go away. The popup's refresh `Timer` is still
+    // forgotten (its closure owns the popup handle); that leak is
+    // separate from the tray icon and untouched here.
+    Ok(tray)
 }
 
 #[cfg(test)]
@@ -1481,6 +1953,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    #[test]
+    fn pipe_create_in_use_classification() {
+        use std::io::{Error, ErrorKind};
+        assert!(pipe_create_is_in_use(&Error::new(
+            ErrorKind::PermissionDenied,
+            "access denied"
+        )));
+        assert!(pipe_create_is_in_use(&Error::new(
+            ErrorKind::AlreadyExists,
+            "already exists"
+        )));
+        assert!(pipe_create_is_in_use(&Error::new(
+            ErrorKind::AddrInUse,
+            "pipe busy"
+        )));
+        assert!(!pipe_create_is_in_use(&Error::new(
+            ErrorKind::NotFound,
+            "no such pipe"
+        )));
+        assert!(!pipe_create_is_in_use(&Error::new(
+            ErrorKind::InvalidInput,
+            "bad argument"
+        )));
+    }
+
+    #[test]
+    fn pipe_in_use_backoff_ramps_then_caps() {
+        assert_eq!(pipe_in_use_backoff(1), Duration::from_millis(100));
+        assert_eq!(pipe_in_use_backoff(2), Duration::from_millis(200));
+        assert_eq!(pipe_in_use_backoff(3), Duration::from_millis(400));
+        assert_eq!(pipe_in_use_backoff(4), Duration::from_millis(800));
+        assert_eq!(pipe_in_use_backoff(5), Duration::from_secs(1));
+        assert_eq!(pipe_in_use_backoff(100), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn ipc_bind_tracker_fatal_after_five_real_failures_only() {
+        let mut tracker = IpcBindTracker::new();
+        // "In use" never counts toward the five, however often it
+        // fires (F1: the v2.0.2 loop killer — every post-connect
+        // create failed in-use, and the old counter killed the
+        // daemon for it).
+        for _ in 0..50 {
+            assert!(matches!(
+                tracker.record_failure(true),
+                IpcBindRetry::RetryAfter(_)
+            ));
+        }
+        for _ in 1..5 {
+            assert!(matches!(
+                tracker.record_failure(false),
+                IpcBindRetry::RetryAfter(_)
+            ));
+        }
+        assert!(matches!(tracker.record_failure(false), IpcBindRetry::Fatal));
+        // A success resets the count.
+        tracker.record_success();
+        assert!(matches!(
+            tracker.record_failure(false),
+            IpcBindRetry::RetryAfter(_)
+        ));
+    }
+
+    #[test]
+    fn ipc_fatal_shutdown_signals_both_flags_and_writes_fatal_status() {
+        // F24: the fatal-bind signal must set BOTH flags — the
+        // shutdown flag (main quits cleanly, F2) and the fatal flag
+        // (main exits 1 after teardown, like DaemonHung) — and
+        // write the machine-readable `IpcBindFailed` status. A
+        // test that only checked the shutdown flag would still pass
+        // with the old exit-0 behaviour.
+        let dir = temp_dir("ipc-fatal");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let ipc_fatal = Arc::new(AtomicBool::new(false));
+        signal_ipc_fatal_shutdown(&dir, "test detail", &shutdown, &ipc_fatal);
+        assert!(
+            shutdown.load(Ordering::Relaxed),
+            "main must be asked to quit"
+        );
+        assert!(
+            ipc_fatal.load(Ordering::Relaxed),
+            "F24: main must exit(1) for a fatal bind, not 0"
+        );
+        let text = std::fs::read_to_string(dir.join(DAEMON_STATUS_FILE)).expect("read status");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("status is valid JSON");
+        assert_eq!(value["status"], "fatal");
+        assert_eq!(value["code"], "IpcBindFailed");
+        assert_eq!(value["detail"], "test detail");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

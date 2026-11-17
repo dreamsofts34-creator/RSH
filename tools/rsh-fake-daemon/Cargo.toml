@@ -1,0 +1,21 @@
+[package]
+name = "rsh-fake-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RSH v2.0.3 F17 test fixture: a controllable fake rsh-daemon speaking the real IPC wire protocol (crash / silent / slow / flap / live / exit-after-bind). Test-only; never shipped."
+publish = false
+
+[[bin]]
+name = "rsh-fake-daemon"
+path = "src/main.rs"
+
+[dependencies]
+rsh-api = { path = "../../crates/rsh-api" }
+rsh-ipc = { path = "../../crates/rsh-ipc" }
+dirs = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

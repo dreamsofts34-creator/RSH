@@ -30,11 +30,37 @@ pub const POPUP_GAP: i32 = 8;
 /// close it — the first poll after the tray click must not count
 /// as "clicked away".
 pub const POPUP_FOREGROUND_GRACE: Duration = Duration::from_millis(500);
+/// Settle window after the grace during which the poll re-samples
+/// its foreground baseline (F9, v2.0.3): Windows settles back to
+/// the pre-click app after the tray click, and that settle can
+/// finish after the grace expires, so a baseline sampled at show
+/// time is stale. The baseline is armed inside
+/// `grace .. grace + settle` and never before.
+pub const POPUP_BASELINE_SETTLE: Duration = Duration::from_millis(500);
+/// Consecutive 100 ms polls showing the same foreground window
+/// needed to arm the baseline (~300 ms of stability).
+pub const POPUP_BASELINE_STABLE_POLLS: u32 = 3;
+/// Consecutive 100 ms polls showing a foreground window different
+/// from the armed baseline needed to dismiss (~300 ms — a single
+/// fluky `GetForegroundWindow` read never closes the popup).
+pub const POPUP_DISMISS_CHANGED_POLLS: u32 = 3;
+/// Continuous foreground time after which losing the foreground
+/// counts as a click-away (F9): a popup that was foreground for
+/// this long was being used, so the loss was caused by the user.
+pub const POPUP_FOREGROUND_SUSTAINED: Duration = Duration::from_millis(500);
+/// How long the show-time activation is retried on timer ticks
+/// (F9): Slint may not have created the popup's native window yet
+/// when `show()` runs, so the first activation attempt can find no
+/// window to activate.
+pub const POPUP_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(1);
+/// Double-click guard window for the tray-icon toggle (F9): a
+/// second tray click this soon after an accepted toggle is
+/// ignored, so a double-click is one show, not show-then-hide.
+pub const TRAY_TOGGLE_DEBOUNCE: Duration = Duration::from_millis(400);
 
-/// Whether the visible tray popup should auto-dismiss on this
-/// foreground poll (A4, v2.0.2) — the pure decision behind the
-/// daemon's 100 ms click-outside poll in `main.rs`, kept here so
-/// it is unit-testable on Linux.
+/// Whether the visible tray popup should auto-dismiss, decided by
+/// the daemon's 100 ms click-outside poll in `main.rs` — kept here
+/// as pure state so it is unit-testable on Linux.
 ///
 /// Root cause of the v2.0.1 bug: the old poll dismissed the popup
 /// whenever it was not the foreground window after the 500 ms
@@ -48,45 +74,216 @@ pub const POPUP_FOREGROUND_GRACE: Duration = Duration::from_millis(500);
 /// symptom). "Not foreground" on its own therefore says nothing
 /// about the user clicking away.
 ///
-/// The fixed rule dismisses only on a *change* the user caused:
-/// * inside the grace — never (showing cannot instantly close);
-/// * the popup IS foreground — never (the user is in it; the
-///   caller records this in `was_foreground`);
-/// * the popup WAS foreground and lost it — yes (clicked away
-///   after interacting with it);
-/// * the popup was never foreground, but the foreground window
-///   moved away from what it was when the popup was shown
-///   (`foreground_now != foreground_at_show`, both known) — yes
-///   (clicked another window / the desktop while the popup sat
-///   inactive);
-/// * otherwise — no: the foreground is still whatever it was at
-///   show time (normally the taskbar), i.e. the user did nothing,
-///   so the popup stays until they dismiss it, click away, or
-///   press Escape.
+/// The fixed rule (A4, v2.0.2) dismisses only on a *change* the
+/// user caused — and F9 (v2.0.3) hardens it against the transient
+/// the A4 fix still missed: `foreground_at_show` is sampled
+/// during the tray-click transition, and Windows settles back to
+/// the pre-click app after the grace expires, so rule (d) fired at
+/// ~0.6–1 s on a settle the user never caused. This state machine
+/// therefore:
+///
+/// * never dismisses inside the grace;
+/// * never dismisses while the popup IS foreground;
+/// * re-samples the baseline at grace expiry and only arms it
+///   once the foreground has been the same window for
+///   [`POPUP_BASELINE_STABLE_POLLS`] consecutive polls (or at the
+///   end of the settle window, taking the latest value) — a
+///   transient settle (e.g. taskbar → other app → taskbar across
+///   300–700 ms) never becomes the baseline, and a change that
+///   lands during the settle window is absorbed as the settle,
+///   not treated as a click-away;
+/// * after arming, dismisses only on
+///   [`POPUP_DISMISS_CHANGED_POLLS`] consecutive polls showing a
+///   different foreground window (a real, sustained click-away);
+/// * dismisses immediately when the popup loses a foreground it
+///   held continuously for [`POPUP_FOREGROUND_SUSTAINED`] — but
+///   never on a brief foreground blip (a transient activation
+///   does not arm the loss rule, which was the `was_foreground`
+///   trap: the old sticky flag fired on any foreground sighting,
+///   however short);
+/// * never dismisses when the foreground is unknown (`None`).
 ///
 /// Known limit: when the popup was shown while the main UI window
 /// was already foreground, clicking back into that same UI window
 /// leaves the foreground unchanged, so the popup stays open
 /// (Escape / tray-click / "Open RSH" still dismiss it). Detecting
 /// that click would need a mouse hook, which is out of scope.
-#[must_use]
-pub fn should_dismiss_popup(
-    elapsed: Duration,
-    popup_foreground: bool,
-    was_foreground: bool,
-    foreground_now: Option<isize>,
+///
+/// A second honest limit: a click-away that lands inside the
+/// settle window (roughly the first second after showing) is
+/// absorbed as settling and does NOT dismiss — the popup stays
+/// open until the next click-away / Escape / tray-click. The
+/// ~1 s false dismiss is the worse failure, so the poll errs
+/// towards staying open.
+#[derive(Clone, Debug, Default)]
+pub struct PopupDismissPoll {
+    /// Foreground window sampled at show time (diagnostics only —
+    /// the armed baseline comes from the settle window, not this).
     foreground_at_show: Option<isize>,
-) -> bool {
-    if elapsed <= POPUP_FOREGROUND_GRACE {
-        return false;
+    /// Baseline armed in the settle window; `None` until armed.
+    baseline: Option<isize>,
+    /// Foreground value currently being stability-tested for the
+    /// baseline, and how many consecutive polls showed it.
+    candidate: Option<isize>,
+    /// Consecutive polls showing [`Self::candidate`].
+    candidate_streak: u32,
+    /// Consecutive polls (after arming) showing a foreground
+    /// window different from [`Self::baseline`].
+    changed_streak: u32,
+    /// Elapsed time when the popup first became foreground in the
+    /// current continuous run (`None` while it is not foreground).
+    foreground_since: Option<Duration>,
+    /// The popup held the foreground continuously for at least
+    /// [`POPUP_FOREGROUND_SUSTAINED`] at some point since it was
+    /// shown (sticky until the next show).
+    saw_sustained_foreground: bool,
+}
+
+impl PopupDismissPoll {
+    /// Start polling for a freshly shown popup.
+    #[must_use]
+    pub fn new(foreground_at_show: Option<isize>) -> Self {
+        Self {
+            foreground_at_show,
+            ..Self::default()
+        }
     }
-    if popup_foreground {
-        return false;
+
+    /// Foreground window sampled at show time (for the F10 log
+    /// line — the armed baseline may differ after settling).
+    #[must_use]
+    pub fn foreground_at_show(&self) -> Option<isize> {
+        self.foreground_at_show
     }
-    if was_foreground {
-        return true;
+
+    /// Armed baseline, if the settle window has produced one.
+    #[must_use]
+    pub fn baseline(&self) -> Option<isize> {
+        self.baseline
     }
-    matches!((foreground_now, foreground_at_show), (Some(now), Some(at_show)) if now != at_show)
+
+    /// Whether the popup held the foreground continuously for at
+    /// least [`POPUP_FOREGROUND_SUSTAINED`] since it was shown.
+    #[must_use]
+    pub fn was_foreground_sustained(&self) -> bool {
+        self.saw_sustained_foreground
+    }
+
+    /// One 100 ms poll tick. `elapsed` is the time since the popup
+    /// was shown; `foreground_now` is the tick's single
+    /// `GetForegroundWindow()` read (`None` when Windows cannot
+    /// tell); `popup_hwnd` is the popup's native window, if it
+    /// exists yet. Returns `true` when the popup should hide.
+    pub fn poll(
+        &mut self,
+        elapsed: Duration,
+        foreground_now: Option<isize>,
+        popup_hwnd: Option<isize>,
+    ) -> bool {
+        let popup_foreground = popup_hwnd.is_some_and(|hwnd| foreground_now == Some(hwnd));
+        // Track continuous foreground first — grace samples count:
+        // a popup that becomes foreground during the grace and
+        // stays there is being used.
+        if popup_foreground {
+            if self.foreground_since.is_none() {
+                self.foreground_since = Some(elapsed);
+            } else if let Some(since) = self.foreground_since
+                && elapsed.saturating_sub(since) >= POPUP_FOREGROUND_SUSTAINED
+            {
+                self.saw_sustained_foreground = true;
+            }
+        } else {
+            self.foreground_since = None;
+        }
+        if elapsed <= POPUP_FOREGROUND_GRACE {
+            return false;
+        }
+        if popup_foreground {
+            return false;
+        }
+        // The popup held the foreground for a sustained interval
+        // and just lost it to a known window: a real click-away.
+        // A brief foreground blip never sets the flag, and an
+        // unknown foreground never dismisses.
+        if self.saw_sustained_foreground && foreground_now.is_some() {
+            return true;
+        }
+        // Baseline arming: re-sampled in the settle window, only
+        // once the foreground has been stable for
+        // `POPUP_BASELINE_STABLE_POLLS` consecutive polls; at the
+        // settle deadline the latest known value wins so the poll
+        // can still work on a flapping foreground.
+        let Some(baseline) = self.baseline else {
+            match foreground_now {
+                Some(now) => {
+                    if self.candidate == Some(now) {
+                        self.candidate_streak += 1;
+                    } else {
+                        self.candidate = Some(now);
+                        self.candidate_streak = 1;
+                    }
+                    if self.candidate_streak >= POPUP_BASELINE_STABLE_POLLS
+                        || elapsed > POPUP_FOREGROUND_GRACE + POPUP_BASELINE_SETTLE
+                    {
+                        self.baseline = Some(now);
+                        self.changed_streak = 0;
+                    }
+                }
+                None => {
+                    if elapsed > POPUP_FOREGROUND_GRACE + POPUP_BASELINE_SETTLE {
+                        self.baseline = self.foreground_at_show;
+                    }
+                }
+            }
+            return false;
+        };
+        // Armed: dismiss only on a sustained change — N
+        // consecutive polls away from the baseline.
+        match foreground_now {
+            Some(now) if now != baseline => {
+                self.changed_streak += 1;
+                self.changed_streak >= POPUP_DISMISS_CHANGED_POLLS
+            }
+            _ => {
+                self.changed_streak = 0;
+                false
+            }
+        }
+    }
+}
+
+/// Double-click guard for the tray-icon toggle (F9, v2.0.3): the
+/// tray backend can deliver a double-click as two toggles, which
+/// shows the popup and instantly hides it again. The guard keeps
+/// the time of the last accepted toggle; a click inside
+/// [`TRAY_TOGGLE_DEBOUNCE`] of it is ignored. Times are elapsed
+/// durations on one monotonic clock (the caller passes
+/// `started.elapsed()` from a fixed `Instant`); the guard itself
+/// stays pure so the timeline is unit-testable.
+#[derive(Clone, Debug, Default)]
+pub struct TrayToggleGuard {
+    last_accepted: Option<Duration>,
+}
+
+impl TrayToggleGuard {
+    /// A fresh guard (no toggle accepted yet).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` when this click is a real toggle (and
+    /// records it), `false` when it is inside the debounce window
+    /// of the last accepted toggle.
+    pub fn accept(&mut self, now: Duration) -> bool {
+        match self.last_accepted {
+            Some(last) if now.saturating_sub(last) < TRAY_TOGGLE_DEBOUNCE => false,
+            _ => {
+                self.last_accepted = Some(now);
+                true
+            }
+        }
+    }
 }
 
 /// Preview game order in the popup (AC, ACC, iRacing first).
@@ -552,22 +749,56 @@ mod tests {
         assert!(next_profile(&profiles[..1], Some("p1")).is_none());
     }
 
-    // A4 (v2.0.2): the ~1 s auto-dismiss. The foreground window at
-    // show time is the taskbar (Explorer, fake hwnd 100 here); the
-    // popup itself is hwnd 200 when it ever becomes foreground.
+    // A4 (v2.0.2) + F9 (v2.0.3): the ~1 s auto-dismiss. The
+    // foreground window at show time is the taskbar (Explorer,
+    // fake hwnd 100 here); the popup itself is hwnd 200 when it
+    // ever becomes foreground; another app is 300.
+    //
+    // Timelines are sequences of (elapsed_ms, foreground_now)
+    // samples at the daemon's 100 ms tick. `run_timeline` feeds
+    // them to a fresh `PopupDismissPoll` and returns the elapsed
+    // time of the first dismiss, or `None` when the popup stays
+    // open through the whole timeline.
+    fn run_timeline(
+        samples: &[(u64, Option<isize>)],
+        popup_hwnd: Option<isize>,
+    ) -> Option<Duration> {
+        let mut poll = PopupDismissPoll::new(Some(100));
+        for &(t_ms, foreground_now) in samples {
+            let elapsed = Duration::from_millis(t_ms);
+            if poll.poll(elapsed, foreground_now, popup_hwnd) {
+                return Some(elapsed);
+            }
+        }
+        None
+    }
+
+    /// One sample every 100 ms from 0 to `end_ms`, all with the
+    /// same foreground window, except the overrides.
+    fn steady(end_ms: u64, fg: isize, overrides: &[(u64, isize)]) -> Vec<(u64, Option<isize>)> {
+        (0..=end_ms)
+            .step_by(100)
+            .map(|t| {
+                let value = overrides
+                    .iter()
+                    .find(|(at, _)| *at == t)
+                    .map_or(fg, |(_, value)| *value);
+                (t, Some(value))
+            })
+            .collect()
+    }
+
     fn after_grace() -> Duration {
         POPUP_FOREGROUND_GRACE + Duration::from_millis(100)
     }
 
     #[test]
     fn dismiss_never_inside_the_grace() {
-        assert!(!should_dismiss_popup(
-            POPUP_FOREGROUND_GRACE,
-            false,
-            false,
-            Some(300),
-            Some(100)
-        ));
+        // Foreground already moved (300) — still inside the grace,
+        // so no dismiss.
+        let samples = steady(500, 300, &[]);
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+        assert!(after_grace() > POPUP_FOREGROUND_GRACE);
     }
 
     #[test]
@@ -575,66 +806,207 @@ mod tests {
         // THE v2.0.1 BUG: the old poll hid the popup here (not
         // foreground after the grace), even though the foreground
         // never moved — the user just opened it from the tray.
-        assert!(!should_dismiss_popup(
-            after_grace(),
-            false,
-            false,
-            Some(100),
-            Some(100)
-        ));
+        let samples = steady(2000, 100, &[]);
+        assert_eq!(run_timeline(&samples, Some(200)), None);
     }
 
     #[test]
-    fn dismiss_when_foreground_moved_while_popup_never_foreground() {
-        // User clicked another window (300) while the popup sat
-        // inactive: that IS a click-away.
-        assert!(should_dismiss_popup(
-            after_grace(),
-            false,
-            false,
-            Some(300),
-            Some(100)
-        ));
+    fn dismiss_when_foreground_moves_after_baseline_arms() {
+        // Baseline arms on the settled taskbar (100) at ~800 ms;
+        // the user then clicks another window (300) and stays
+        // there: 3 consecutive changed polls dismiss at 1200 ms.
+        let samples = steady(
+            2000,
+            100,
+            &[(1000, 300), (1100, 300), (1200, 300), (1300, 300)],
+        );
+        assert_eq!(
+            run_timeline(&samples, Some(200)),
+            Some(Duration::from_millis(1200))
+        );
     }
 
     #[test]
-    fn dismiss_when_popup_was_foreground_and_lost_it() {
-        assert!(should_dismiss_popup(
-            after_grace(),
-            false,
-            true,
-            Some(100),
-            Some(100)
-        ));
+    fn dismiss_when_popup_was_foreground_sustained_and_lost_it() {
+        // Popup foreground from 600 ms, user clicks away at 1600 ms
+        // (foreground 300): sustained foreground (600–1500 ms)
+        // makes the loss a real click-away — dismiss at once.
+        let mut samples = steady(2000, 100, &[]);
+        for sample in &mut samples {
+            if (600..=1500).contains(&sample.0) {
+                sample.1 = Some(200);
+            } else if sample.0 >= 1600 {
+                sample.1 = Some(300);
+            }
+        }
+        assert_eq!(
+            run_timeline(&samples, Some(200)),
+            Some(Duration::from_millis(1600))
+        );
     }
 
     #[test]
     fn dismiss_never_when_popup_is_foreground() {
-        assert!(!should_dismiss_popup(
-            after_grace(),
-            true,
-            false,
-            Some(200),
-            Some(100)
-        ));
+        let samples = steady(2000, 200, &[]);
+        assert_eq!(run_timeline(&samples, Some(200)), None);
     }
 
     #[test]
     fn dismiss_never_when_foreground_is_unknown() {
         // Cannot tell what the user did — stay open, never guess.
-        assert!(!should_dismiss_popup(
-            after_grace(),
-            false,
-            false,
-            None,
-            Some(100)
-        ));
-        assert!(!should_dismiss_popup(
-            after_grace(),
-            false,
-            false,
-            Some(300),
-            None
-        ));
+        let mut samples = steady(2000, 100, &[]);
+        for sample in &mut samples {
+            if sample.0 >= 600 {
+                sample.1 = None;
+            }
+        }
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+    }
+
+    // F9 (v2.0.3): the transient-baseline hole the A4 fix missed.
+    // Windows settles back to the pre-click app after the grace
+    // expires; the settle must not look like a click-away.
+
+    #[test]
+    fn transient_baseline_switch_stays_open() {
+        // Foreground: taskbar (100) → other app (300) at 300 ms →
+        // back to taskbar (100) by 700 ms. The 300 ms value never
+        // stabilises into a baseline (the 100 ms value does, at
+        // ~900 ms), so the popup stays open.
+        let samples = steady(2000, 100, &[(300, 300), (400, 300), (500, 300)]);
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+    }
+
+    #[test]
+    fn transient_baseline_switch_back_by_700ms_stays_open() {
+        // F17 matrix: the transient lasts longer — other app (300)
+        // from 300 ms until 600 ms, back to the taskbar (100) at
+        // 700 ms. The 300 ms value still never stabilises into a
+        // baseline (3 stable polls of 100 arm it at ~900 ms), so
+        // the popup stays open through 2 s.
+        let samples = steady(2000, 100, &[(300, 300), (400, 300), (500, 300), (600, 300)]);
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+    }
+
+    #[test]
+    fn transient_activation_200_to_250ms_stays_open() {
+        // F17 matrix: the popup is briefly foreground at 200 ms
+        // and still foreground at 250 ms (a transient activation,
+        // e.g. the tray click focusing it for a moment), then the
+        // taskbar is foreground again. 250 ms of foreground is far
+        // below the 500 ms sustained threshold, so the loss rule
+        // never arms and the popup stays open.
+        let samples: Vec<(u64, Option<isize>)> = (0..=2000)
+            .step_by(100)
+            .map(|t| (t, Some(if t == 200 { 200 } else { 100 })))
+            .collect();
+        let mut samples = samples;
+        samples.push((250, Some(200)));
+        samples.sort_by_key(|(t, _)| *t);
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+    }
+
+    #[test]
+    fn sustained_foreground_loss_at_1500ms_dismisses_immediately() {
+        // F17 matrix: the popup is foreground from 900 ms and
+        // holds it continuously — by 1400 ms it has held it for
+        // the 500 ms sustained threshold. The user clicks away at
+        // exactly 1500 ms (foreground 300): a real click-away, so
+        // the popup dismisses at once, at 1500 ms.
+        let mut samples = steady(2000, 100, &[]);
+        for sample in &mut samples {
+            if (900..=1400).contains(&sample.0) {
+                sample.1 = Some(200);
+            } else if sample.0 >= 1500 {
+                sample.1 = Some(300);
+            }
+        }
+        assert_eq!(
+            run_timeline(&samples, Some(200)),
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    #[test]
+    fn transient_activation_blip_does_not_arm_foreground_loss() {
+        // Popup briefly foreground at the 200 ms sample (a
+        // transient activation), never again: the old sticky
+        // `was_foreground` flag would have armed the loss rule on
+        // this blip — the sustained rule must not.
+        let samples = steady(2000, 100, &[(200, 200)]);
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+    }
+
+    #[test]
+    fn single_changed_poll_never_dismisses() {
+        // One fluky read (300) after arming, then back to the
+        // baseline: the changed streak resets, popup stays open.
+        let samples = steady(2000, 100, &[(1000, 300)]);
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+    }
+
+    #[test]
+    fn two_changed_polls_never_dismiss_but_three_do() {
+        // Two changed polls: still open. A third consecutive one
+        // dismisses.
+        let two = steady(2000, 100, &[(1000, 300), (1100, 300)]);
+        assert_eq!(run_timeline(&two, Some(200)), None);
+        let three = steady(2000, 100, &[(1000, 300), (1100, 300), (1200, 300)]);
+        assert_eq!(
+            run_timeline(&three, Some(200)),
+            Some(Duration::from_millis(1200))
+        );
+    }
+
+    #[test]
+    fn click_away_inside_settle_window_is_absorbed() {
+        // Honest limit, documented on `PopupDismissPoll`: a real
+        // click-away at 700 ms — before the baseline arms — is
+        // absorbed as settling (the 300 ms value becomes the
+        // baseline) and the popup stays open. The next click-away
+        // after arming still dismisses.
+        let samples: Vec<(u64, Option<isize>)> = (0..=2000)
+            .step_by(100)
+            .map(|t| (t, Some(if t >= 700 { 300 } else { 100 })))
+            .collect();
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+    }
+
+    #[test]
+    fn baseline_arms_on_latest_value_at_settle_deadline() {
+        // Foreground flaps every poll through the settle window,
+        // so no value stabilises: at the deadline the latest value
+        // (300 at 1100 ms) arms as the baseline, and a later
+        // sustained move away from it dismisses.
+        let mut samples = Vec::new();
+        for t in (0..=2000).step_by(100) {
+            let fg = if (600..=1000).contains(&t) {
+                if (t / 100) % 2 == 0 { 300 } else { 100 }
+            } else if t >= 1500 {
+                400
+            } else if t >= 1100 {
+                300
+            } else {
+                100
+            };
+            samples.push((t, Some(fg)));
+        }
+        // 1500/1600/1700 ms all show 400 ≠ baseline 300.
+        assert_eq!(
+            run_timeline(&samples, Some(200)),
+            Some(Duration::from_millis(1700))
+        );
+    }
+
+    #[test]
+    fn toggle_guard_accepts_first_click_and_ignores_double_click() {
+        let mut guard = TrayToggleGuard::new();
+        let ms = Duration::from_millis;
+        assert!(guard.accept(ms(0))); // first click: show
+        assert!(!guard.accept(ms(200))); // double-click: ignored
+        assert!(!guard.accept(ms(399))); // still inside 400 ms
+        assert!(guard.accept(ms(400))); // debounce expired: hide
+        assert!(!guard.accept(ms(600))); // double-click again
+        assert!(guard.accept(ms(1000))); // next real toggle
     }
 }

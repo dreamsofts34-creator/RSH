@@ -16,8 +16,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ipc_api::IpcApi;
 
@@ -34,6 +35,252 @@ use crate::ipc_api::IpcApi;
 /// is gone.
 #[cfg(test)]
 pub(crate) static TEST_IPC_PIPE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// F3 (v2.0.3): death debounce — the health monitor only declares
+/// the daemon dead after this many consecutive failed pings (~3 s
+/// at its 1 Hz cadence). One failed ping is noise: a slow poll
+/// cycle, or a daemon that recovers on the next tick.
+pub const PING_DEBOUNCE: u32 = 3;
+
+/// F3 (v2.0.3): a fatal `daemon-status.json` this fresh blocks
+/// auto-spawn — the daemon died on purpose (`IpcBindFailed` /
+/// `DaemonHung`) and spawning another one just re-runs the death
+/// loop. Older than this, the fatal condition may have cleared, so
+/// one spawn attempt is allowed (a fresh fatal file will block the
+/// next one if it dies again).
+pub const FATAL_FRESHNESS: Duration = Duration::from_secs(600);
+
+/// F3 (v2.0.3): consecutive failed auto-spawn attempts before the
+/// respawn latch trips — the UI stops auto-spawning and shows the
+/// fatal state with a manual Retry (the Reconnect button) instead.
+pub const MAX_FAILED_SPAWNS: u32 = 5;
+
+/// F25 (v2.0.3): a live link that dies within this long of going
+/// live counts as a failed spawn (see
+/// [`SpawnBudget::record_live_link_lost`]) instead of resetting the
+/// budget — a daemon that answers briefly then dies is flapping,
+/// not healthy. 30 s: a daemon that survives that long has bound
+/// IPC, answered polls and completed a slow refresh (the rig's flap
+/// fixture dies after ~5 s, far inside the window), so a later
+/// death is a new incident and the budget resets. The choice is a
+/// judgement call, not a measurement: a shorter window would let a
+/// slow-starting flap (live 10–20 s per cycle) respawn for longer;
+/// a longer one would punish a genuinely healthy daemon that dies
+/// of an unrelated cause an hour later — but only by counting that
+/// one death, since the next success after it still resets.
+pub const FLAP_WINDOW: Duration = Duration::from_secs(30);
+
+/// F3 (v2.0.3): exponential backoff between auto-spawn attempts:
+/// 1 s, 5 s, 30 s, then 60 s capped. `failed_spawns` is how many
+/// attempts have already failed in a row.
+#[must_use]
+pub fn backoff_delay(failed_spawns: u32) -> Duration {
+    match failed_spawns {
+        0 => Duration::from_secs(1),
+        1 => Duration::from_secs(5),
+        2 => Duration::from_secs(30),
+        _ => Duration::from_secs(60),
+    }
+}
+
+/// F4 (v2.0.3): at most one daemon spawn attempt in flight
+/// process-wide. The health monitor and the Reconnect job both
+/// spawn through [`try_live_api_with_spawn_n`], so the guard
+/// serialises them — a second attempt never spawns a second daemon
+/// while one is starting up.
+static SPAWN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// RAII holder for [`SPAWN_IN_FLIGHT`]: released on drop, so a
+/// spawn attempt that panics or returns early cannot wedge the
+/// guard shut.
+struct SpawnAttemptGuard;
+
+impl SpawnAttemptGuard {
+    fn try_acquire() -> Option<Self> {
+        SPAWN_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for SpawnAttemptGuard {
+    fn drop(&mut self) {
+        SPAWN_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// F3 (v2.0.3): the auto-respawn budget, shared by the health
+/// monitor (which spends it) and the UI thread (whose Reconnect
+/// click resets it once for a single manual retry). The monitor
+/// never spawns while [`SpawnBudget::auto_spawn_allowed`] is false:
+/// latched after [`MAX_FAILED_SPAWNS`] consecutive failures, or
+/// while a manual retry is in flight (the retry is the one attempt
+/// — it must not re-arm the auto loop).
+pub struct SpawnBudget {
+    inner: Mutex<SpawnBudgetInner>,
+}
+
+struct SpawnBudgetInner {
+    failed_spawns: u32,
+    latched: bool,
+    manual_retry_pending: bool,
+    /// Whether the latch was set when the manual retry was armed:
+    /// a failed retry re-latches only then — an ordinary Reconnect
+    /// failure while auto-spawn was healthy costs the monitor
+    /// nothing (its budget is simply fresh again).
+    was_latched: bool,
+    /// When the current live link went live (F25): set by
+    /// [`SpawnBudget::record_success`], cleared by
+    /// [`SpawnBudget::record_live_link_lost`]. `None` while no link
+    /// is live (or the link was never recorded) — a death then is
+    /// not a flap, it is just a failed spawn counted elsewhere.
+    live_since: Option<Instant>,
+}
+
+impl SpawnBudget {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(SpawnBudgetInner {
+                failed_spawns: 0,
+                latched: false,
+                manual_retry_pending: false,
+                was_latched: false,
+                live_since: None,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SpawnBudgetInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Delay before the next auto-spawn attempt, or `None` when the
+    /// monitor must not spawn: budget exhausted (latched) or a
+    /// manual retry in flight.
+    #[must_use]
+    pub fn next_delay(&self) -> Option<Duration> {
+        let inner = self.lock();
+        if inner.latched || inner.manual_retry_pending || inner.failed_spawns >= MAX_FAILED_SPAWNS {
+            None
+        } else {
+            Some(backoff_delay(inner.failed_spawns))
+        }
+    }
+
+    /// Whether the monitor may auto-spawn right now.
+    #[must_use]
+    pub fn auto_spawn_allowed(&self) -> bool {
+        self.next_delay().is_some()
+    }
+
+    /// True once the budget is exhausted (or a failed manual retry
+    /// re-latched it) — the UI latches the visible fatal state.
+    #[must_use]
+    pub fn is_latched(&self) -> bool {
+        self.lock().latched
+    }
+
+    /// One auto-spawn attempt failed: count it, latching at
+    /// [`MAX_FAILED_SPAWNS`].
+    pub fn record_spawn_failure(&self) {
+        let mut inner = self.lock();
+        inner.failed_spawns = inner.failed_spawns.saturating_add(1);
+        if inner.failed_spawns >= MAX_FAILED_SPAWNS {
+            inner.latched = true;
+        }
+    }
+
+    /// A live daemon answered: the link's birth is recorded and
+    /// the latch / manual-retry state clears — but the failure
+    /// count is NOT reset here (F25). The reset is deferred to
+    /// [`SpawnBudget::record_live_link_lost`]: only a link that
+    /// stayed live past [`FLAP_WINDOW`] proves the daemon healthy
+    /// and earns a fresh budget. Resetting here (the old F3
+    /// behaviour) let a flap daemon — live ~5 s, dead, respawned
+    /// at ~7.5 s cadence — respawn forever, each brief life
+    /// wiping the count. While a link is live the monitor never
+    /// consults the budget (it pings instead), so a still-spent
+    /// count during a live link is invisible and harmless.
+    pub fn record_success(&self) {
+        let mut inner = self.lock();
+        inner.live_since = Some(Instant::now());
+        inner.latched = false;
+        inner.manual_retry_pending = false;
+        inner.was_latched = false;
+    }
+
+    /// The live link died (F25): called once per death, by the
+    /// health monitor when it declares the daemon dead — the one
+    /// place that observes a death, so a death is never counted
+    /// twice. A link that died within [`FLAP_WINDOW`] of going
+    /// live counts as a failed spawn (latching at
+    /// [`MAX_FAILED_SPAWNS`], like a crash on start); a link that
+    /// lived longer was genuinely healthy, so the budget resets.
+    /// A death with no recorded live link (never went live, or
+    /// already accounted) is a no-op — crash-on-start deaths are
+    /// counted by [`SpawnBudget::record_spawn_failure`] instead.
+    pub fn record_live_link_lost(&self) {
+        self.record_live_link_lost_at(Instant::now());
+    }
+
+    fn record_live_link_lost_at(&self, now: Instant) {
+        let mut inner = self.lock();
+        let Some(since) = inner.live_since.take() else {
+            return;
+        };
+        if now.saturating_duration_since(since) < FLAP_WINDOW {
+            inner.failed_spawns = inner.failed_spawns.saturating_add(1);
+            if inner.failed_spawns >= MAX_FAILED_SPAWNS {
+                inner.latched = true;
+            }
+        } else {
+            inner.failed_spawns = 0;
+            inner.latched = false;
+        }
+    }
+
+    /// A Reconnect click resets the budget once: the manual retry
+    /// is the single attempt, and the monitor stays out until it
+    /// resolves (success clears, failure re-latches if it was
+    /// latched before).
+    pub fn reset_for_manual_retry(&self) {
+        let mut inner = self.lock();
+        inner.was_latched = inner.latched;
+        inner.failed_spawns = 0;
+        inner.latched = false;
+        inner.manual_retry_pending = true;
+    }
+
+    /// The manual retry finished without a live daemon: re-latch
+    /// only if it was latched before (otherwise the fresh budget
+    /// stands and the monitor resumes). No-op unless a manual retry
+    /// was pending — a late/timeout duplicate cannot latch twice.
+    pub fn record_manual_failure(&self) {
+        let mut inner = self.lock();
+        if !inner.manual_retry_pending {
+            return;
+        }
+        inner.manual_retry_pending = false;
+        if inner.was_latched {
+            inner.latched = true;
+            inner.failed_spawns = MAX_FAILED_SPAWNS;
+        } else {
+            inner.failed_spawns = 0;
+            inner.latched = false;
+        }
+        inner.was_latched = false;
+    }
+}
+
+impl Default for SpawnBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Resolve the RSH data dir: the explicit override wins, otherwise
 /// the platform data dir + `RSH` (`dirs::data_dir().join("RSH")`).
@@ -87,12 +334,28 @@ pub fn try_live_api_with_spawn(data_dir: Option<&Path>) -> Option<Arc<IpcApi>> {
 /// UI's Reconnect path uses a short budget (6 retries ≈ 3 s) on its
 /// background thread, so a dead daemon resolves fast; the health
 /// monitor keeps the full 20-retry budget on its own thread.
+///
+/// F4 (v2.0.3): at most one spawn attempt runs at a time — when
+/// another attempt is already in flight this probes only (no second
+/// daemon is spawned); the in-flight attempt may still bring the
+/// daemon up, so the probe loop still waits the full budget.
 #[must_use]
 pub fn try_live_api_with_spawn_n(data_dir: Option<&Path>, retries: usize) -> Option<Arc<IpcApi>> {
     if let Some(api) = try_live_api(data_dir) {
         eprintln!("RSH-UI daemon already running (live data)");
         return Some(api);
     }
+    let Some(_spawn_guard) = SpawnAttemptGuard::try_acquire() else {
+        eprintln!("RSH-UI daemon spawn already in flight — probing only");
+        for _ in 0..retries {
+            std::thread::sleep(Duration::from_millis(500));
+            if let Some(api) = try_live_api(data_dir) {
+                eprintln!("RSH-UI daemon answered during in-flight spawn (live data)");
+                return Some(api);
+            }
+        }
+        return None;
+    };
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
@@ -119,11 +382,19 @@ pub fn try_live_api_with_spawn_n(data_dir: Option<&Path>, retries: usize) -> Opt
     if let Some(d) = data_dir {
         cmd.arg("--data-dir").arg(d);
     }
+    // F8 (v2.0.3): fully detached — the daemon must not inherit our
+    // stdio (the same hang class as the NSIS `Exec` fix in b8b9fd4:
+    // an inherited pipe keeps a child alive / blocks the parent's
+    // exit) and on Windows must not flash a console, join our
+    // process group, or die with us.
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW: the daemon must never flash a console.
-        cmd.creation_flags(0x0800_0000);
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW.
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
     }
     match cmd.spawn() {
         Ok(_child) => {
@@ -137,6 +408,9 @@ pub fn try_live_api_with_spawn_n(data_dir: Option<&Path>, retries: usize) -> Opt
             return None;
         }
     }
+    // The guard is held for the whole probe loop too: a second
+    // attempt cannot spawn a second daemon while this one is still
+    // starting up.
     for _ in 0..retries {
         std::thread::sleep(Duration::from_millis(500));
         if let Some(api) = try_live_api(data_dir) {
@@ -166,6 +440,12 @@ pub fn read_daemon_status(data_dir: Option<&Path>) -> Option<(String, String)> {
     let dir = resolve_data_dir(data_dir)?;
     let text = std::fs::read_to_string(dir.join("daemon-status.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    fatal_status_of(&value)
+}
+
+/// `(code, detail)` for a parsed `daemon-status.json` value, only
+/// when `status == "fatal"`.
+fn fatal_status_of(value: &serde_json::Value) -> Option<(String, String)> {
     if value.get("status").and_then(serde_json::Value::as_str) != Some("fatal") {
         return None;
     }
@@ -179,6 +459,44 @@ pub fn read_daemon_status(data_dir: Option<&Path>) -> Option<(String, String)> {
         .unwrap_or("")
         .to_string();
     Some((code, detail))
+}
+
+/// Like [`read_daemon_status`], but only when the fatal file is
+/// fresh (F3): the daemon's `at_unix` (or the file mtime when it is
+/// missing) no older than `max_age` — use [`FATAL_FRESHNESS`]. A
+/// stale fatal file means the daemon died long ago and the fatal
+/// condition may have cleared, so one spawn attempt is allowed (a
+/// fresh fatal file will block the next one if it dies again). A
+/// file with no usable timestamp counts as fresh — fail-safe, never
+/// spawn into a known-fatal loop on a guess.
+#[must_use]
+pub fn read_daemon_status_fresh(
+    data_dir: Option<&Path>,
+    max_age: Duration,
+) -> Option<(String, String)> {
+    let dir = resolve_data_dir(data_dir)?;
+    let path = dir.join("daemon-status.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let status = fatal_status_of(&value)?;
+    let fresh = match value.get("at_unix").and_then(serde_json::Value::as_u64) {
+        Some(0) | None => std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map_or(true, |mtime| {
+                mtime.elapsed().map_or(true, |age| age <= max_age)
+            }),
+        Some(at_unix) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            now.saturating_sub(at_unix) <= max_age.as_secs()
+        }
+    };
+    if fresh {
+        Some(status)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +563,229 @@ mod tests {
         assert_eq!(read_daemon_status(Some(&dir)), None);
         std::fs::write(dir.join("daemon-status.json"), "not json at all").expect("status file");
         assert_eq!(read_daemon_status(Some(&dir)), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backoff_delay_grows_then_caps_at_60s() {
+        assert_eq!(backoff_delay(0), Duration::from_secs(1));
+        assert_eq!(backoff_delay(1), Duration::from_secs(5));
+        assert_eq!(backoff_delay(2), Duration::from_secs(30));
+        assert_eq!(backoff_delay(3), Duration::from_secs(60));
+        assert_eq!(backoff_delay(100), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn spawn_budget_delays_are_non_decreasing_across_failures() {
+        // F17: the respawn-bound regression net needs the intervals
+        // between consecutive auto-spawns to grow (1 s → 5 s → 30 s
+        // → 60 s cap), never shrink or stay flat — a flat 1 s
+        // cadence is the v2.0.2 loop (17 spawns in 185 s). Read
+        // through the budget, the way the health monitor spends it.
+        let budget = SpawnBudget::new();
+        let mut delays = Vec::new();
+        while budget.auto_spawn_allowed() {
+            delays.push(budget.next_delay().expect("allowed means a delay"));
+            budget.record_spawn_failure();
+        }
+        assert_eq!(delays.len(), MAX_FAILED_SPAWNS as usize);
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            ]
+        );
+        for pair in delays.windows(2) {
+            assert!(pair[0] <= pair[1], "backoff must never shrink");
+        }
+        assert!(!budget.auto_spawn_allowed());
+        assert!(budget.is_latched());
+    }
+
+    #[test]
+    fn spawn_budget_latches_after_five_failures_then_link_death_decides() {
+        // F25: `record_success` no longer resets the count by
+        // itself — the reset is deferred until the link proves
+        // healthy (see `record_live_link_lost`). A link that dies
+        // at once is a flap and re-latches; a link that lives past
+        // FLAP_WINDOW earns the fresh budget.
+        let budget = SpawnBudget::new();
+        assert!(budget.auto_spawn_allowed());
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(1)));
+        for _ in 0..4 {
+            budget.record_spawn_failure();
+            assert!(budget.auto_spawn_allowed());
+        }
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(60)));
+        budget.record_spawn_failure();
+        assert!(budget.is_latched());
+        assert!(!budget.auto_spawn_allowed());
+        assert_eq!(budget.next_delay(), None);
+        budget.record_success();
+        assert!(!budget.is_latched(), "a live link clears the latch flag");
+        budget.record_live_link_lost();
+        assert!(
+            budget.is_latched(),
+            "a link that dies at once is a flap, not a recovery"
+        );
+        assert!(!budget.auto_spawn_allowed());
+
+        // The same five failures, then a link that lives past the
+        // window: the budget is fresh again.
+        let budget = SpawnBudget::new();
+        for _ in 0..MAX_FAILED_SPAWNS {
+            budget.record_spawn_failure();
+        }
+        assert!(budget.is_latched());
+        budget.record_success();
+        let now = Instant::now();
+        budget.record_live_link_lost_at(now + FLAP_WINDOW + Duration::from_secs(1));
+        assert!(!budget.is_latched());
+        assert!(budget.auto_spawn_allowed());
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn spawn_budget_flap_deaths_consume_the_budget() {
+        // F25: the rig observed 12 spawns in 90 s (~7.5 s
+        // cadence) from a daemon that went live then died quickly
+        // — every brief life reset the budget. Now each flap death
+        // counts, so five flaps latch exactly like five
+        // crash-on-start failures.
+        let budget = SpawnBudget::new();
+        for _ in 0..MAX_FAILED_SPAWNS {
+            budget.record_success();
+            budget.record_live_link_lost();
+            assert!(
+                budget.next_delay().is_some() || budget.is_latched(),
+                "budget must stay spendable until the latch"
+            );
+        }
+        assert!(budget.is_latched());
+        assert!(!budget.auto_spawn_allowed());
+        assert_eq!(budget.next_delay(), None);
+    }
+
+    #[test]
+    fn spawn_budget_flap_after_failures_latches() {
+        // Four failed spawns, then a link that flaps: the flap
+        // spends the last of the budget instead of wiping the four
+        // failures away.
+        let budget = SpawnBudget::new();
+        for _ in 0..4 {
+            budget.record_spawn_failure();
+        }
+        assert!(budget.auto_spawn_allowed());
+        budget.record_success();
+        budget.record_live_link_lost();
+        assert!(budget.is_latched());
+        assert!(!budget.auto_spawn_allowed());
+    }
+
+    #[test]
+    fn spawn_budget_link_death_without_a_live_link_is_a_noop() {
+        // Crash-on-start deaths never record a live link, so they
+        // must not double-count here — they are counted by
+        // `record_spawn_failure` alone.
+        let budget = SpawnBudget::new();
+        budget.record_live_link_lost();
+        assert!(budget.auto_spawn_allowed());
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(1)));
+        budget.record_spawn_failure();
+        budget.record_live_link_lost();
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn spawn_budget_manual_retry_latches_only_when_it_was_latched() {
+        // Latched + manual retry that fails: re-latched.
+        let budget = SpawnBudget::new();
+        for _ in 0..MAX_FAILED_SPAWNS {
+            budget.record_spawn_failure();
+        }
+        assert!(budget.is_latched());
+        budget.reset_for_manual_retry();
+        assert!(!budget.is_latched());
+        assert!(
+            !budget.auto_spawn_allowed(),
+            "monitor stays out during retry"
+        );
+        budget.record_manual_failure();
+        assert!(budget.is_latched());
+        assert!(!budget.auto_spawn_allowed());
+
+        // Healthy + manual retry that fails: fresh budget, no latch.
+        let budget = SpawnBudget::new();
+        budget.reset_for_manual_retry();
+        assert!(
+            !budget.auto_spawn_allowed(),
+            "monitor stays out during retry"
+        );
+        budget.record_manual_failure();
+        assert!(!budget.is_latched());
+        assert!(budget.auto_spawn_allowed());
+
+        // A duplicate failure report (timeout + late job result)
+        // cannot latch: the retry is no longer pending.
+        budget.record_manual_failure();
+        assert!(!budget.is_latched());
+    }
+
+    #[test]
+    fn spawn_attempt_guard_is_exclusive_and_releases_on_drop() {
+        let first = SpawnAttemptGuard::try_acquire();
+        assert!(first.is_some());
+        assert!(SpawnAttemptGuard::try_acquire().is_none());
+        drop(first);
+        assert!(SpawnAttemptGuard::try_acquire().is_some());
+    }
+
+    #[test]
+    fn read_daemon_status_fresh_rejects_stale_fatal() {
+        let dir = std::env::temp_dir().join(format!("rsh-status-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        // Fresh (60 s ago) — blocks spawning.
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            format!(
+                r#"{{"status":"fatal","code":"IpcBindFailed","detail":"bind failed","pid":123,"at_unix":{}}}"#,
+                now - 60
+            ),
+        )
+        .expect("status file");
+        assert_eq!(
+            read_daemon_status_fresh(Some(&dir), FATAL_FRESHNESS),
+            Some(("IpcBindFailed".to_string(), "bind failed".to_string()))
+        );
+        // Stale (one hour ago) — the fatal condition may have
+        // cleared, so spawning is allowed again.
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            format!(
+                r#"{{"status":"fatal","code":"IpcBindFailed","detail":"bind failed","pid":123,"at_unix":{}}}"#,
+                now - 3600
+            ),
+        )
+        .expect("status file");
+        assert_eq!(read_daemon_status_fresh(Some(&dir), FATAL_FRESHNESS), None);
+        // No timestamp at all — fail-safe: counts as fresh.
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            r#"{"status":"fatal","code":"DaemonHung","detail":"hung"}"#,
+        )
+        .expect("status file");
+        assert_eq!(
+            read_daemon_status_fresh(Some(&dir), FATAL_FRESHNESS),
+            Some(("DaemonHung".to_string(), "hung".to_string()))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

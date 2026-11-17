@@ -62,9 +62,9 @@ use std::time::{Duration, Instant};
 use rsh_api::connection::ConnectionState;
 use rsh_api::pairing::countdown_ring_commands;
 use rsh_api::{
-    ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionInfo, FirmwareCheck,
-    FirmwareUpdateStatus, GameSummary, LedPattern, PairingInfo, ProfileSummary, ShifterGate,
-    SnapshotInfo, TuningSettings, UserError,
+    app_version, ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionError, ConnectionInfo,
+    FirmwareCheck, FirmwareUpdateStatus, GameSummary, LedPattern, PairingInfo, ProfileSummary,
+    ShifterGate, SnapshotInfo, TuningSettings, UserError,
 };
 use slint::{Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
@@ -615,12 +615,20 @@ struct PendingField {
 /// [`spawn_health_monitor`] pings the live daemon every second and
 /// re-probes after a death; the frame timer drains these on the UI
 /// thread and applies them — the monitor never touches UI state.
+/// (The shared `Daemon` prefix is the point: every variant is a
+/// daemon-health verdict.)
+#[allow(clippy::enum_variant_names)]
 enum HealthEvent {
     /// The live daemon stopped answering (or the first probe found
     /// none): show Disconnected, clear stale values.
     DaemonDown,
     /// A (new) live daemon answered: swap it in.
     DaemonBack(Arc<IpcApi>),
+    /// The daemon must NOT be auto-respawned (F3): either a fresh
+    /// fatal `daemon-status.json` blocks spawning, or the respawn
+    /// budget is exhausted. The UI latches the visible fatal state
+    /// (reason + manual Retry) instead of spawning another daemon.
+    DaemonFatal { code: String, detail: String },
 }
 
 /// Background-job kinds (A9/B5): one entry per long operation, so the
@@ -644,6 +652,31 @@ enum JobKind {
     RawAvailable,
     /// Pairing reset.
     ResetPairing,
+    /// Slider drag flush (F6, v2.0.3): `set_tuning` runs on a job
+    /// thread, never on the UI thread.
+    TuningPush,
+    /// Profile operations (F6, v2.0.3): activate / create /
+    /// duplicate / delete / rename / link / save / discard.
+    ProfileOp,
+    /// Button / knob mapping (F6, v2.0.3): set / clear binding,
+    /// set knob action.
+    BindingOp,
+    /// Capture (F6, v2.0.3): centre / pedal min-max.
+    CaptureOp,
+    /// Learn (F6, v2.0.3): start / cancel / poll.
+    LearnOp,
+    /// Pairing (F6, v2.0.3): begin pairing, wizard connect.
+    PairingOp,
+    /// Games (F6, v2.0.3): launch / stop / refresh.
+    GameOp,
+    /// Settings (F6, v2.0.3): autostart / backup / restore /
+    /// output toggle / auto-pause / board address / keep-in-tray /
+    /// module enable.
+    SettingsOp,
+    /// Reconnect seed (F5, v2.0.3): the slow-cache seed fetch
+    /// (`LiveSeed::fetch`) runs on a job thread, then applies on
+    /// the UI thread.
+    ReconnectSeed,
 }
 
 impl JobKind {
@@ -653,13 +686,29 @@ impl JobKind {
     /// answer the UAC prompt while the sidecar spawn waits.
     fn timeout(self) -> Duration {
         match self {
-            JobKind::Reconnect => Duration::from_secs(15),
+            // The probe and the seed fetch it follows share the
+            // 15 s bound (the seed is ~35 round-trips on a live
+            // daemon; a dead one fails fast per call).
+            JobKind::Reconnect | JobKind::ReconnectSeed => Duration::from_secs(15),
             JobKind::Backend => Duration::from_secs(80),
-            JobKind::FirmwareUpdate => Duration::from_secs(10),
+            // FirmwareUpdate is 10 s on purpose (A9); settings ops
+            // share it — they can cross a UAC prompt (HIDMaestro
+            // enable), the same bound the old callers tolerated,
+            // but now with a visible timeout.
+            JobKind::FirmwareUpdate | JobKind::SettingsOp => Duration::from_secs(10),
+            // Everything else is a couple of round-trips at most
+            // (F6: a tuning push is one `set_tuning`).
             JobKind::Transport
             | JobKind::FirmwareCheck
             | JobKind::RawAvailable
-            | JobKind::ResetPairing => Duration::from_secs(5),
+            | JobKind::ResetPairing
+            | JobKind::TuningPush
+            | JobKind::ProfileOp
+            | JobKind::BindingOp
+            | JobKind::CaptureOp
+            | JobKind::LearnOp
+            | JobKind::PairingOp
+            | JobKind::GameOp => Duration::from_secs(5),
         }
     }
 
@@ -675,6 +724,17 @@ impl JobKind {
             JobKind::FirmwareUpdate => 4,
             JobKind::RawAvailable => 5,
             JobKind::ResetPairing => 6,
+            // F5/F6: a settings or seed job never hides an
+            // in-flight reconnect / backend switch.
+            JobKind::TuningPush => 7,
+            JobKind::ProfileOp => 8,
+            JobKind::BindingOp => 9,
+            JobKind::CaptureOp => 10,
+            JobKind::LearnOp => 11,
+            JobKind::PairingOp => 12,
+            JobKind::GameOp => 13,
+            JobKind::SettingsOp => 14,
+            JobKind::ReconnectSeed => 15,
         }
     }
 }
@@ -720,6 +780,29 @@ fn clean_profile_name(name: &str) -> Option<String> {
     } else {
         Some(name)
     }
+}
+
+/// F12 (v2.0.3): a down-episode shorter than this is a flap — the
+/// daemon died and came back almost at once, so the "RSH connected"
+/// notify is noise (suppressed by `reconnect_to_live` via
+/// [`Ctx::suppress_connected_notify`]) and the episode counts toward
+/// the burst total instead of earning its own entry.
+const FLAP_DOWN_WINDOW: Duration = Duration::from_secs(10);
+
+/// F12 (v2.0.3): a death within this long after a reconnect belongs
+/// to the same flapping burst — its down-notify is collapsed into
+/// the burst's single entry instead of one entry per death.
+const FLAP_BURST_UPTIME: Duration = Duration::from_secs(30);
+
+/// F12 (v2.0.3): a burst count older than this is stale — a much
+/// later, unrelated death must not claim "flapped ×N".
+const FLAP_COUNT_STALE: Duration = Duration::from_secs(600);
+
+/// F12 (v2.0.3): whether a down-episode of `down` counts as a flap.
+/// `None` (never down since launch — the first connect) is not a
+/// flap: a fast first connect is normal, not a flicker.
+fn is_flap_down_episode(down: Option<Duration>) -> bool {
+    down.is_some_and(|d| d < FLAP_DOWN_WINDOW)
 }
 
 /// Daemon-error banner text (M-2, FC2): empty while the daemon is
@@ -820,7 +903,50 @@ enum JobDone {
         was_armed: bool,
         result: Result<PairingInfo, UserError>,
     },
+    /// Reconnect seed finished (F5): the live API plus its fetched
+    /// seed — applied on the UI thread by `apply_reconnect_seed`.
+    ReconnectSeed {
+        api: Arc<IpcApi>,
+        seed: crate::ipc_api::LiveSeed,
+    },
+    /// Generic job finished (F6): `id` routes the result to the
+    /// `PendingApply` the starter registered; `result` is the job
+    /// thread's answer, applied on the UI thread.
+    Generic { id: u64, result: JobResult },
 }
+
+/// One background-job answer (F6): the job thread's work returns
+/// one of these; the UI-thread `apply` closure turns it into
+/// notifications / re-syncs / property writes. The payloads are
+/// the API's own types, so no result is re-interpreted here.
+enum JobResult {
+    /// A `set_tuning` push: the stored record, or the error.
+    Tuning(Result<TuningSettings, UserError>),
+    /// A yes/no op (module enable, output toggle, auto-pause,
+    /// autostart, keep-in-tray, save / discard draft, …): the new
+    /// state, or the error.
+    Bool(Result<bool, UserError>),
+    /// A text op (board address, backend, profile id, …): the new
+    /// value, or the error.
+    Text(Result<String, UserError>),
+    /// A no-value op (backup, restore, …): success or the error.
+    Unit(Result<(), UserError>),
+    /// A pairing op: the pairing state, or the error.
+    Pairing(Result<PairingInfo, UserError>),
+    /// A game op: `true` = the game is now running, or the error.
+    Game(Result<bool, UserError>),
+    /// A capture op: the captured mV, or the error.
+    Capture(Result<u16, UserError>),
+    /// A learn poll: the learned button, or `None` when learning
+    /// ended with no pick.
+    LearnPoll(Option<u8>),
+}
+
+/// A pending generic-job apply (F6): registered by
+/// `run_generic_job` when a job starts, run once on the UI thread
+/// when its `JobDone::Generic` arrives (or dropped when the job
+/// times out — the late result is then ignored).
+type PendingApply = Box<dyn FnOnce(&Ctx, &MainWindow, JobResult)>;
 
 /// Shared frame context for callbacks: the swappable API state,
 /// tuning state, the unsaved flag, the notification center, and the
@@ -899,6 +1025,18 @@ struct Ctx {
     /// The frame timer times a stale entry out with a visible error
     /// — loading is never infinite (B5).
     busy_jobs: Rc<RefCell<HashMap<JobKind, (String, Instant)>>>,
+    /// Next generic-job id (F6): handed out by `run_generic_job`,
+    /// routed back by `JobDone::Generic`.
+    next_job_id: Rc<Cell<u64>>,
+    /// Pending generic-job applies (F6): id → (kind, apply). The
+    /// apply runs once on the UI thread when the job's result
+    /// arrives; a timed-out job's entry is dropped, so its late
+    /// result is ignored.
+    pending_applies: Rc<RefCell<HashMap<u64, (JobKind, PendingApply)>>>,
+    /// Last slow-cache generation the pages re-synced from (F5):
+    /// the 1 Hz tick re-syncs the pages when the poller bumps it,
+    /// so a daemon-side change reaches the UI within ~1 s.
+    last_cache_generation: Rc<Cell<u64>>,
     /// When the current `connecting` state started (A9): the frame
     /// timer clears a `connecting` older than 15 s with a message
     /// instead of leaving "Connecting…" forever.
@@ -906,6 +1044,40 @@ struct Ctx {
     /// True while a Reconnect job is in flight (A9): a second click
     /// is ignored instead of queueing another ~3 s probe.
     reconnect_in_flight: Rc<Cell<bool>>,
+    /// F3 (v2.0.3): the auto-respawn budget, shared with the health
+    /// monitor thread (which spends it) — the monitor never spawns
+    /// while this is latched or a manual retry is pending.
+    spawn_budget: Arc<live_probe::SpawnBudget>,
+    /// F3 (v2.0.3): latched respawn-failure reason (budget exhausted
+    /// or fresh fatal file) shown in the daemon-error banner until a
+    /// live daemon clears it. `None` = no latch.
+    spawn_latch: Rc<RefCell<Option<String>>>,
+    /// F3 (v2.0.3): the detail `mark_dead` last showed, so
+    /// `mark_spawn_latched` does not notify the same fatal reason
+    /// twice. `None` = the generic "not running" was shown.
+    last_dead_detail: Rc<RefCell<Option<String>>>,
+    /// F12 (v2.0.3): when the current down-episode started (set by
+    /// `mark_dead`, cleared by `swap_to_live`). `None` = never down
+    /// since launch, or back live.
+    down_since: Rc<Cell<Option<Instant>>>,
+    /// F12 (v2.0.3): when the last reconnect happened (set by
+    /// `swap_to_live`); a death soon after it belongs to the same
+    /// flapping burst as the previous one.
+    last_back_at: Rc<Cell<Option<Instant>>>,
+    /// F12 (v2.0.3): when the last flap reconnect happened (set by
+    /// `swap_to_live`); bounds how long a burst count stays
+    /// meaningful before it goes stale.
+    last_flap_at: Rc<Cell<Option<Instant>>>,
+    /// F12 (v2.0.3): how many short down-episodes (flaps) ran in
+    /// the current burst; folded into the next non-burst down
+    /// notification as "flapped ×N".
+    flap_count: Rc<Cell<u32>>,
+    /// F12 (v2.0.3): the last reconnect ended a flap (down-episode
+    /// < [`FLAP_DOWN_WINDOW`]) — the signal for `reconnect_to_live`
+    /// to suppress its "RSH connected" notify (the notify itself
+    /// lives in `reconnect_to_live`, owned by the F5 worker — see
+    /// the note on [`Ctx::swap_to_live`]).
+    suppress_connected_notify: Rc<Cell<bool>>,
     /// Last firmware check (M-8): refreshed by the `FirmwareCheck`
     /// job and on reconnect; `sync_overview` reads the cache, never
     /// the bundled file on the hot path.
@@ -1005,38 +1177,38 @@ impl Ctx {
         win.set_setup_calibration_reason(setup_reason.into());
     }
 
-    /// Capture the steering centre over the live daemon (v2.0.2 —
-    /// the calls live on [`IpcApi`] now, not a second connection).
-    /// Returns the captured mV, or the human reason — never a
-    /// silent failure. Only while live: the sim never captures.
-    fn capture_centre_ipc(&self) -> Result<u16, String> {
-        if !self.is_live() {
-            return Err(Self::capture_unavailable_reason().to_string());
-        }
-        self.api().capture_centre().map_err(|e| e.title.clone())
-    }
-
-    /// Capture one pedal endpoint over the live daemon (`endpoint`
-    /// is `"min"` for the released point, `"max"` for fully
-    /// pressed). Returns the captured mV, or the human reason.
-    fn capture_pedal_ipc(&self, pedal: &str, endpoint: &str) -> Result<u16, String> {
-        if !self.is_live() {
-            return Err(Self::capture_unavailable_reason().to_string());
-        }
-        let api = self.api();
-        let result = if endpoint == "min" {
-            api.capture_pedal_min(pedal)
-        } else {
-            api.capture_pedal_max(pedal)
-        };
-        result.map_err(|e| e.title.clone())
-    }
-
     /// Refresh the cached calibration read (`calibration()`):
     /// `Ok` stores it, `Err` (sim / never captured) clears it.
     /// Called at startup, on reconnect and on the 5 s refresh.
     fn refresh_calibration(&self) {
         *self.calibration.borrow_mut() = self.api().calibration().ok();
+    }
+
+    /// Re-sync the pages from the slow cache when the daemon's
+    /// slow values changed (F5): the poller bumps
+    /// `cache_generation` once per slow cycle, so a daemon-side
+    /// change reaches the UI within ~1 s without any UI-thread
+    /// IPC. Every read here is a cache read. Skipped while not
+    /// live — the sim's generation never moves, and the 5 s tick
+    /// already covers its (unchanging) lists.
+    fn resync_from_cache(&self, win: &MainWindow) {
+        if !self.is_live() {
+            return;
+        }
+        let generation = self.api().cache_generation();
+        if generation == self.last_cache_generation.get() {
+            return;
+        }
+        self.last_cache_generation.set(generation);
+        self.refresh_calibration();
+        self.sync_pedals(win);
+        self.sync_extras(win);
+        self.sync_overview(win);
+        self.refresh_profiles(win);
+        self.refresh_games(win);
+        self.sync_diag(win);
+        self.sync_keep_in_tray(win);
+        self.sync_vjoy(win);
     }
 
     /// Short date ("2026-11-16") from an RFC 3339 capture timestamp.
@@ -1262,6 +1434,12 @@ impl Ctx {
     /// record updates and the profile is marked unsaved; on failure
     /// the error is shown (never silent) and the local state stays —
     /// the push is retried on the next edit.
+    /// Flush a due steering push (frame timer, L4/F6): the push
+    /// runs on a [`JobKind::TuningPush`] job thread — a slow daemon
+    /// can no longer freeze the UI for ~500 ms per drag flush.
+    /// The due flag clears only when the job actually starts (a
+    /// busy kind retries on the next tick); the slider snaps back
+    /// to the stored value on failure, never lies.
     fn flush_steering_push(&self, win: &MainWindow) {
         let Some(due) = self.steer_push_due.get() else {
             return;
@@ -1269,21 +1447,34 @@ impl Ctx {
         if Instant::now() < due {
             return;
         }
-        self.steer_push_due.set(None);
         let settings = {
             let tuning = self.tuning.borrow();
             let base = self.steering.borrow();
             tuning.to_settings(&base)
         };
-        match self.api().set_tuning(&settings) {
-            Ok(stored) => {
-                *self.steering.borrow_mut() = stored;
-                self.unsaved.set(true);
-            }
-            Err(e) => {
-                self.notify_error(win, "Steering", &e);
-                eprintln!("RSH-UI set_tuning failed: {} ({})", e.code, e.title);
-            }
+        let started = self.run_generic_job(
+            win,
+            JobKind::TuningPush,
+            "Saving steering…",
+            move |api| JobResult::Tuning(api.set_tuning(&settings)),
+            |ctx, win, result| {
+                let JobResult::Tuning(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(stored) => {
+                        *ctx.steering.borrow_mut() = stored;
+                        ctx.unsaved.set(true);
+                    }
+                    Err(e) => {
+                        ctx.notify_error(win, "Steering", &e);
+                        eprintln!("RSH-UI set_tuning failed: {} ({})", e.code, e.title);
+                    }
+                }
+            },
+        );
+        if started {
+            self.steer_push_due.set(None);
         }
     }
 
@@ -1302,11 +1493,15 @@ impl Ctx {
         ));
     }
 
-    /// Flush a due field push (frame timer, M-7): read the module's
-    /// stored record, apply the queued field, push it. On success the
-    /// page re-syncs from the daemon; on failure the error is shown
-    /// and the page re-syncs anyway (the slider snaps back to the
-    /// stored value instead of lying).
+    /// Flush a due field push (frame timer, M-7/F6): read the
+    /// module's stored record, apply the queued field, push it —
+    /// the whole push runs on a [`JobKind::TuningPush`] job thread,
+    /// so a drag flush can no longer freeze the UI for ~5 s on a
+    /// slow daemon. The pending flag clears only when the job
+    /// actually starts; on success the page re-syncs from the
+    /// daemon, on failure the error is shown and the page re-syncs
+    /// anyway (the slider snaps back to the stored value instead
+    /// of lying).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn flush_field_push(&self, win: &MainWindow) {
         let Some((pending, due)) = *self.pending_field.borrow() else {
@@ -1315,31 +1510,49 @@ impl Ctx {
         if Instant::now() < due {
             return;
         }
-        *self.pending_field.borrow_mut() = None;
-        let api = self.api();
-        let mut record = api.get_tuning(pending.module);
-        match pending.kind {
-            FieldKind::Deadzone => record.deadzone = pending.value,
-            FieldKind::Bite => record.bite_point = Some(pending.value),
-            FieldKind::Brightness => record.led_brightness = Some(pending.value.round() as u8),
+        let module = pending.module;
+        let kind = pending.kind;
+        let value = pending.value;
+        let started = self.run_generic_job(
+            win,
+            JobKind::TuningPush,
+            "Saving tuning…",
+            move |api| {
+                // `get_tuning` is a cache read on the live API
+                // (F5) — cheap even on the job thread.
+                let mut record = api.get_tuning(module);
+                match kind {
+                    FieldKind::Deadzone => record.deadzone = value,
+                    FieldKind::Bite => record.bite_point = Some(value),
+                    FieldKind::Brightness => record.led_brightness = Some(value.round() as u8),
+                }
+                JobResult::Tuning(api.set_tuning(&record))
+            },
+            move |ctx, win, result| {
+                let JobResult::Tuning(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(_) => {
+                        ctx.unsaved.set(true);
+                    }
+                    Err(e) => {
+                        ctx.notify_error(win, "Tuning", &e);
+                        eprintln!(
+                            "RSH-UI field push {module} failed: {} ({})",
+                            e.code, e.title
+                        );
+                    }
+                }
+                match module {
+                    "throttle" | "brake" | "clutch" => ctx.sync_pedals(win),
+                    _ => ctx.sync_extras(win),
+                }
+            },
+        );
+        if started {
+            *self.pending_field.borrow_mut() = None;
         }
-        match api.set_tuning(&record) {
-            Ok(_) => {
-                self.unsaved.set(true);
-            }
-            Err(e) => {
-                self.notify_error(win, "Tuning", &e);
-                eprintln!(
-                    "RSH-UI field push {} failed: {} ({})",
-                    pending.module, e.code, e.title
-                );
-            }
-        }
-        match pending.module {
-            "throttle" | "brake" | "clutch" => self.sync_pedals(win),
-            _ => self.sync_extras(win),
-        }
-        self.refresh(win, 0);
     }
 
     /// Push a VISIBLE notification and sync the drawer model. Every
@@ -1355,7 +1568,15 @@ impl Ctx {
         // restart (best-effort save; a failed write never blocks
         // the notification itself).
         self.persist_notifications();
-        sync_to_window(&self.notifications.borrow(), win);
+        // F27: the entry is kept in the center + on disk, but the
+        // model write is skipped while the window is hidden — a
+        // model change on a hidden window can drive a draw on the
+        // torn-down drawable (the F17-FINDING-5 close-vs-seed
+        // SIGSEGV class). `resync_after_reopen` syncs the model
+        // when the window comes back, so nothing is lost.
+        if !self.hidden.load(Ordering::SeqCst) {
+            sync_to_window(&self.notifications.borrow(), win);
+        }
     }
 
     /// Show a typed error gracefully (B6): the title is the plain
@@ -1407,11 +1628,61 @@ impl Ctx {
     /// call, so a fatal file that lands without a health event
     /// still reaches the banner.
     fn sync_daemon_error(&self, win: &MainWindow) {
-        let text = daemon_error_for(
-            self.is_live(),
-            live_probe::read_daemon_status(self.data_dir.as_deref()),
-        );
+        let status = live_probe::read_daemon_status(self.data_dir.as_deref());
+        let mut text = daemon_error_for(self.is_live(), status);
+        // F3: a respawn latch has no fatal file to read from — show
+        // its reason instead of an empty banner. A fatal file still
+        // wins when one exists: it is the daemon's own newer word.
+        if text.is_empty() && !self.is_live() {
+            if let Some(latch) = self.spawn_latch.borrow().as_ref() {
+                text.clone_from(latch);
+            }
+        }
         set_daemon_error_prop(win, &text);
+    }
+
+    /// Latch the respawn-failure state (F3): the monitor sent
+    /// `HealthEvent::DaemonFatal` because a fresh fatal file blocks
+    /// spawning or the respawn budget is exhausted. Drives the
+    /// disconnected UI (no-op when already down — the `DaemonDown`
+    /// that preceded this already did it), records the reason so the
+    /// Overview banner shows it until a live daemon clears it, and
+    /// notifies once. A fatal-file reason `mark_dead` already showed
+    /// is not notified twice; the budget-exhausted reason always
+    /// notifies (there is no fatal file behind it). The existing
+    /// Reconnect button is the manual Retry — it resets the budget
+    /// once (see [`Ctx::start_reconnect_job`]).
+    fn mark_spawn_latched(&self, win: &MainWindow, code: &str, detail: &str) {
+        // Only drive the disconnected state when it isn't already
+        // down — in the normal flow the `DaemonDown` that preceded
+        // this already ran `mark_dead` (and notified), so calling it
+        // again would double-notify. At startup (still
+        // `connecting`) there was no `DaemonDown`, so it runs here.
+        let needs_dead = self.is_live() || self.state.borrow().connecting;
+        if needs_dead {
+            self.mark_dead(win);
+        }
+        let text = if detail.trim().is_empty() {
+            format!("RSH stopped unexpectedly ({code}) — try Reconnect.")
+        } else {
+            detail.to_string()
+        };
+        let already_shown = self
+            .last_dead_detail
+            .borrow()
+            .as_deref()
+            .is_some_and(|shown| shown == detail);
+        *self.spawn_latch.borrow_mut() = Some(text.clone());
+        if code == "RespawnBudgetExhausted" || !already_shown {
+            let title = if code == "RespawnBudgetExhausted" {
+                "RSH stopped — automatic restart off"
+            } else {
+                "RSH stopped unexpectedly"
+            };
+            self.notify(win, "Connection", title, &text);
+        }
+        self.sync_daemon_error(win);
+        self.refresh(win, 0);
     }
 
     /// Seed the keep-in-tray switch from the API (FC2): the close
@@ -1461,6 +1732,47 @@ impl Ctx {
         true
     }
 
+    /// Start a generic background job (F6): `work` runs on a job
+    /// thread (it may call the API — never the UI thread), `apply`
+    /// runs once on the UI thread with the result. `apply` may hold
+    /// `Rc` state and window props — it never leaves the UI thread.
+    /// A second job of the same kind is ignored (same rule as
+    /// [`Ctx::run_job`]); the apply is dropped when the job times
+    /// out, so a late result never applies.
+    fn run_generic_job(
+        &self,
+        win: &MainWindow,
+        kind: JobKind,
+        label: &str,
+        work: impl FnOnce(Arc<dyn AppApi>) -> JobResult + Send + 'static,
+        apply: impl FnOnce(&Ctx, &MainWindow, JobResult) + 'static,
+    ) -> bool {
+        if self.busy_jobs.borrow().contains_key(&kind) {
+            eprintln!("RSH-UI job {kind:?} already running — ignoring duplicate start");
+            return false;
+        }
+        let id = self.next_job_id.get();
+        self.next_job_id.set(id + 1);
+        self.pending_applies
+            .borrow_mut()
+            .insert(id, (kind, Box::new(apply)));
+        self.busy_jobs
+            .borrow_mut()
+            .insert(kind, (label.to_string(), Instant::now()));
+        self.sync_busy(win);
+        let api = self.api();
+        let tx = self.job_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name(format!("rsh-job-{kind:?}"))
+            .spawn(move || {
+                let result = work(api);
+                if tx.send(JobDone::Generic { id, result }).is_err() {
+                    eprintln!("RSH-UI job {kind:?} finished after the UI went away");
+                }
+            });
+        true
+    }
+
     /// Drain finished jobs on the UI thread (frame timer): each
     /// result is applied (notify / revert / re-sync) exactly once.
     fn drain_jobs(&self, win: &MainWindow) {
@@ -1491,6 +1803,11 @@ impl Ctx {
                             state.connecting = false;
                         }
                         self.connecting_since.set(None);
+                        // F3: the manual retry failed — re-latch the
+                        // respawn budget when it was latched before
+                        // (no-op otherwise; the monitor resumes its
+                        // bounded attempts with a fresh budget).
+                        self.spawn_budget.record_manual_failure();
                         // M-2: the daemon's fatal file names the
                         // reason (IpcBindFailed / DaemonHung) — show
                         // it instead of the generic "not running".
@@ -1508,6 +1825,37 @@ impl Ctx {
                         self.refresh(win, 0);
                     }
                 }
+            }
+            JobDone::ReconnectSeed { api, seed } => {
+                // F5: the seed fetch finished on its job thread —
+                // apply it exactly like the old `reconnect_to_live`,
+                // but from cached values only.
+                self.reconnect_in_flight.set(false);
+                self.busy_jobs.borrow_mut().remove(&JobKind::ReconnectSeed);
+                self.apply_reconnect_seed(win, api, seed);
+            }
+            JobDone::Generic { id, result } => {
+                // F6: a generic job finished — run its registered
+                // apply once. A missing entry means the job timed
+                // out (the timeout already notified) — ignore the
+                // late result.
+                let Some((kind, apply)) = self.pending_applies.borrow_mut().remove(&id) else {
+                    return;
+                };
+                self.busy_jobs.borrow_mut().remove(&kind);
+                // F27: a job that finished after the window was
+                // hidden must not apply to it — the apply closures
+                // touch the window (props, models, notifies) and
+                // the close-vs-apply race SIGSEGVs under Xvfb
+                // (F17-FINDING-5). The result is dropped; the
+                // frame timer re-derives the display from
+                // state/cache when the window comes back.
+                if self.hidden.load(Ordering::SeqCst) {
+                    eprintln!("RSH-UI job {kind:?} finished while hidden — apply skipped (F27)");
+                    return;
+                }
+                apply(self, win, result);
+                self.refresh(win, 0);
             }
             JobDone::Transport { index, result } => {
                 if self
@@ -1709,7 +2057,27 @@ impl Ctx {
         }
         for (kind, label) in timed_out {
             self.busy_jobs.borrow_mut().remove(&kind);
+            // F6: drop the timed-out kind's pending applies — the
+            // late result must never apply.
+            self.pending_applies
+                .borrow_mut()
+                .retain(|_, (k, _)| *k != kind);
             if kind == JobKind::Reconnect {
+                self.reconnect_in_flight.set(false);
+                // F3: a timed-out manual retry counts as a failed
+                // retry — re-latch when it was latched before (the
+                // late job result, if any, is ignored by
+                // `apply_job_done`, so this is the only accounting).
+                self.spawn_budget.record_manual_failure();
+                {
+                    let mut state = self.state.borrow_mut();
+                    state.connecting = false;
+                }
+                self.connecting_since.set(None);
+            }
+            if kind == JobKind::ReconnectSeed {
+                // F5: the seed fetch never resolved — same cleanup
+                // as a timed-out Reconnect.
                 self.reconnect_in_flight.set(false);
                 {
                     let mut state = self.state.borrow_mut();
@@ -1843,11 +2211,17 @@ impl Ctx {
     /// `connecting` state is set immediately — the Overview shows
     /// "Connecting…" while the probe runs. A second click while one
     /// is in flight is ignored.
+    ///
+    /// F3 (v2.0.3): the click resets the respawn budget once — this
+    /// manual retry is the single attempt, and the health monitor
+    /// stays out until it resolves (success clears the budget,
+    /// failure re-latches it when it was latched before).
     fn start_reconnect_job(&self, win: &MainWindow) {
         if self.reconnect_in_flight.get() {
             return;
         }
         self.reconnect_in_flight.set(true);
+        self.spawn_budget.reset_for_manual_retry();
         {
             let mut state = self.state.borrow_mut();
             state.connecting = true;
@@ -2131,49 +2505,75 @@ impl Ctx {
             self.sync_overview(win);
             return;
         }
-        match self.api().set_board_address(address) {
-            Ok(stored) => {
-                self.notify(
-                    win,
-                    "Settings",
-                    "Address saved",
-                    &format!("Wheel address is now {stored} — it applies on the next reconnect."),
-                );
-                self.sync_overview(win);
-            }
-            Err(e) => {
-                self.notify_error(win, "Settings", &e);
-                self.sync_overview(win);
-            }
-        }
+        let address = address.to_string();
+        self.run_generic_job(
+            win,
+            JobKind::SettingsOp,
+            "Saving address…",
+            move |api| JobResult::Text(api.set_board_address(&address)),
+            move |ctx, win, result| {
+                let JobResult::Text(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(stored) => {
+                        ctx.notify(
+                            win,
+                            "Settings",
+                            "Address saved",
+                            &format!(
+                                "Wheel address is now {stored} — it applies on the next reconnect."
+                            ),
+                        );
+                        ctx.sync_overview(win);
+                    }
+                    Err(e) => {
+                        ctx.notify_error(win, "Settings", &e);
+                        ctx.sync_overview(win);
+                    }
+                }
+            },
+        );
     }
 
     /// Apply the keep-in-tray switch (M-7, FC2): the
     /// `keep-tray-selected` callback carries the NEW state (the
-    /// .slint already flipped the prop). Success confirms the
+    /// .slint already flipped the prop). F6: the persist runs on a
+    /// [`JobKind::SettingsOp`] job thread. Success confirms the
     /// authoritative value; failure reverts the prop to the old
     /// state and explains — the switch never lies about the real
     /// setting.
     fn apply_keep_tray(&self, win: &MainWindow, enabled: bool) {
-        match self.api().set_close_to_tray(enabled) {
-            Ok(new_state) => {
-                win.set_keep_in_tray(new_state);
-                self.notify(
-                    win,
-                    "Settings",
-                    "Keep in tray",
-                    if new_state {
-                        "RSH keeps running in the tray after close."
-                    } else {
-                        "RSH quits when the window closes."
-                    },
-                );
-            }
-            Err(e) => {
-                win.set_keep_in_tray(!enabled);
-                self.notify_error(win, "Settings", &e);
-            }
-        }
+        self.run_generic_job(
+            win,
+            JobKind::SettingsOp,
+            "Saving…",
+            move |api| JobResult::Bool(api.set_close_to_tray(enabled)),
+            move |ctx, win, result| {
+                let JobResult::Bool(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(new_state) => {
+                        win.set_keep_in_tray(new_state);
+                        ctx.notify(
+                            win,
+                            "Settings",
+                            "Keep in tray",
+                            if new_state {
+                                "RSH keeps running in the tray after close."
+                            } else {
+                                "RSH quits when the window closes."
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        win.set_keep_in_tray(!enabled);
+                        ctx.notify_error(win, "Settings", &e);
+                    }
+                }
+            },
+        );
     }
 
     /// Open the setup wizard at the Pair step and start the real
@@ -2210,6 +2610,27 @@ impl Ctx {
         *self.steering.borrow_mut() = stored;
         self.unsaved
             .set(api.draft_status().is_some_and(|s| s.dirty));
+        // F12: measure the down-episode this reconnect ends. A short
+        // one is a flap — count it and arm the "RSH connected"
+        // suppression for `reconnect_to_live` (F5 worker: gate that
+        // notify on `self.suppress_connected_notify.get()` — the flag
+        // is set here and cleared on the next non-flap reconnect).
+        // A long down-episode ends the burst: the count stays for
+        // `mark_dead` to fold into the next down notification.
+        let down = self.down_since.get().map(|t| t.elapsed());
+        self.down_since.set(None);
+        self.last_back_at.set(Some(Instant::now()));
+        if is_flap_down_episode(down) {
+            self.flap_count.set(self.flap_count.get().saturating_add(1));
+            self.last_flap_at.set(Some(Instant::now()));
+            self.suppress_connected_notify.set(true);
+        } else {
+            self.suppress_connected_notify.set(false);
+        }
+        // F3: a live link clears the respawn latch and the budget —
+        // the daemon is back, whatever killed it is over.
+        self.spawn_latch.borrow_mut().take();
+        self.spawn_budget.record_success();
         let mut state = self.state.borrow_mut();
         state.api = api;
         state.live_api = Some(live_api.clone());
@@ -2234,6 +2655,11 @@ impl Ctx {
     /// live link, show Disconnected + Reconnect. No-op when already
     /// down (the monitor only notifies on a transition, and the
     /// Reconnect button cannot kill a live link).
+    ///
+    /// F7 (v2.0.3): the dead `IpcApi` is dropped — `state.api` swaps
+    /// back to a fresh `SimApi`, so the dead link's Tokio runtime +
+    /// ~20 Hz poller die with the last `Arc` instead of spinning
+    /// forever on a dead socket.
     fn mark_dead(&self, win: &MainWindow) {
         let old_api = {
             let mut state = self.state.borrow_mut();
@@ -2242,12 +2668,17 @@ impl Ctx {
             }
             state.live = false;
             state.connecting = false;
+            // F7: swap back to the sim — dropping the last `Arc` of
+            // the dead `IpcApi` shuts its runtime + poller down.
+            state.api = Arc::new(SimApi::new());
             let old = state.live_api.take();
             if let Ok(mut link) = self.live_link.lock() {
                 *link = None;
             }
             old
         };
+        // F12: the down-episode starts now.
+        self.down_since.set(Some(Instant::now()));
         if let Some(api) = old_api {
             api.clear_cached_state();
         }
@@ -2258,21 +2689,51 @@ impl Ctx {
         // banner now, not just the notification drawer.
         self.sync_daemon_error(win);
         self.connecting_since.set(None);
+        // F12: a death that follows a flapping burst — soon after a
+        // reconnect that itself ended a flap — is part of the same
+        // burst: stay silent instead of pushing one "not running"
+        // entry per death. The burst's count is folded into the next
+        // non-burst notification below.
+        let burst_death = self.flap_count.get() > 0
+            && self
+                .last_back_at
+                .get()
+                .is_some_and(|t| t.elapsed() < FLAP_BURST_UPTIME);
+        let mut flap_note = String::new();
+        if !burst_death {
+            let n = self.flap_count.get();
+            let recent = self
+                .last_flap_at
+                .get()
+                .is_some_and(|t| t.elapsed() < FLAP_COUNT_STALE);
+            if n > 0 && recent {
+                flap_note = format!(" Connection flapped ×{n} before this drop.");
+            }
+            self.flap_count.set(0);
+        }
         // M-2: the daemon's fatal file names the reason
         // (IpcBindFailed / DaemonHung) — show it instead of the
         // generic "not running". The detail is the daemon's own plain
         // words; the code goes to the log only.
-        match live_probe::read_daemon_status(self.data_dir.as_deref()) {
-            Some((code, detail)) => {
-                eprintln!("RSH-UI daemon fatal: {code}: {detail}");
-                self.notify(win, "Connection", "RSH stopped unexpectedly", &detail);
+        if let Some((code, detail)) = live_probe::read_daemon_status(self.data_dir.as_deref()) {
+            *self.last_dead_detail.borrow_mut() = Some(detail.clone());
+            eprintln!("RSH-UI daemon fatal: {code}: {detail}");
+            if !burst_death {
+                self.notify(
+                    win,
+                    "Connection",
+                    "RSH stopped unexpectedly",
+                    &format!("{detail}{flap_note}"),
+                );
             }
-            None => {
+        } else {
+            *self.last_dead_detail.borrow_mut() = None;
+            if !burst_death {
                 self.notify(
                     win,
                     "Connection",
                     "RSH not running",
-                    "Live data unavailable — RSH isn't running.",
+                    &format!("Live data unavailable — RSH isn't running.{flap_note}"),
                 );
             }
         }
@@ -2280,9 +2741,10 @@ impl Ctx {
     }
 
     /// Swap a (re)connected daemon in (B2/H1): the shared path for
-    /// the Reconnect button and the health monitor's re-probe —
-    /// seed the sliders from the daemon, reconnect the session on
-    /// the transport it was on, and re-sync every page. A duplicate
+    /// the Reconnect button and the health monitor's re-probe.
+    /// F5: the fetch runs on a background job — this entry only
+    /// dedupes and starts it; [`Ctx::apply_reconnect_seed`] does
+    /// the UI-thread apply once the seed arrives. A duplicate
     /// delivery of the link that is already live is a no-op.
     fn reconnect_to_live(&self, win: &MainWindow, live_api: Arc<IpcApi>) {
         {
@@ -2295,7 +2757,55 @@ impl Ctx {
                 }
             }
         }
+        // A second seed fetch while one is in flight is ignored —
+        // the in-flight one applies when it lands.
+        if self
+            .busy_jobs
+            .borrow()
+            .contains_key(&JobKind::ReconnectSeed)
+        {
+            return;
+        }
         let transport = self.last_transport();
+        self.run_job(win, JobKind::ReconnectSeed, "Reconnecting…", move || {
+            let seed = crate::ipc_api::LiveSeed::fetch(&live_api, transport);
+            JobDone::ReconnectSeed {
+                api: live_api,
+                seed,
+            }
+        });
+    }
+
+    /// Apply a finished reconnect seed (F5, UI thread): the old
+    /// `reconnect_to_live` body, but every value comes from the
+    /// seed or the slow cache — no IPC round-trip runs here.
+    ///
+    /// F27: when the window is hidden to tray (`hidden`), the
+    /// state swap still runs but NO window property is touched.
+    /// Defence-in-depth for the close-vs-seed race: gdb showed the
+    /// actual `SIGSEGV` is the frame timer's per-tick refresh
+    /// racing the hide (the fault is in the `llvmpipe-3` render
+    /// thread ~0.2 s after the close, before the fetch completes
+    /// — the seed apply itself was never the crash site), and the
+    /// timer now writes nothing while hidden; this guard keeps the
+    /// apply safe on any path that drains a job while hidden. The
+    /// live state is already swapped in, and
+    /// [`Ctx::resync_after_reopen`] re-syncs every prop from
+    /// state/cache when the window comes back — nothing the user
+    /// sees is lost, only deferred.
+    fn apply_reconnect_seed(
+        &self,
+        win: &MainWindow,
+        live_api: Arc<IpcApi>,
+        seed: crate::ipc_api::LiveSeed,
+    ) {
+        if self.hidden.load(Ordering::SeqCst) {
+            self.swap_to_live(live_api);
+            eprintln!(
+                "RSH-UI reconnect seed landed while hidden — state swapped, window apply skipped (F27)"
+            );
+            return;
+        }
         self.swap_to_live(live_api);
         win.set_daemon_live(true);
         // FC2: live again — the daemon-error banner clears.
@@ -2303,26 +2813,58 @@ impl Ctx {
         // Seed the controller + autostart switches from the daemon
         // (the startup seeding cannot run — the daemon was not
         // there when the window opened).
-        if self.api().output_backend() == "HIDMaestro" {
+        if seed.backend == "HIDMaestro" {
             win.set_controller(0);
         } else {
             win.set_controller(1);
         }
-        win.set_autostart_enabled(self.api().autostart());
+        win.set_autostart_enabled(seed.autostart);
         // B1 wiring: bindings + knobs + auto-pause + module on/off +
         // the firmware check cache all seed from the daemon now that
-        // it is live (at startup the sim has none of these).
+        // it is live (at startup the sim has none of these). All
+        // cache reads now (F5).
         self.seed_live_state(win);
-        self.notify(win, "Connection", "RSH connected", "Live data is back.");
-        if let Err(e) = self.api().connect(transport) {
-            self.notify(win, "Connection", "Reconnect failed", &e.title);
+        // F12 (v2.0.3): a flap reconnect stays silent — the
+        // "RSH connected" notify is noise when the daemon died
+        // and came back within seconds (`swap_to_live` armed
+        // `suppress_connected_notify`). A non-flap reconnect that
+        // ends a burst folds the count in ("flapped ×N before
+        // stabilising") and resets it — the burst is reported
+        // exactly once, here, not again by the next `mark_dead`.
+        // A stale count (last flap > `FLAP_COUNT_STALE` ago) is
+        // cleared without folding: it belongs to an old burst.
+        if !self.suppress_connected_notify.get() {
+            let n = self.flap_count.get();
+            let recent = self
+                .last_flap_at
+                .get()
+                .is_some_and(|t| t.elapsed() < FLAP_COUNT_STALE);
+            let body = if n > 0 && recent {
+                format!("Live data is back — the connection flapped ×{n} before stabilising.")
+            } else {
+                "Live data is back.".to_string()
+            };
+            self.notify(win, "Connection", "RSH connected", &body);
+            self.flap_count.set(0);
+        }
+        // The session `connect` already ran on the seed job's
+        // thread — report its verdict here.
+        if let Err(e) = seed.connect {
+            // F26: `Unreachable` (no board) is the expected
+            // disconnected state, not a failure to report — the
+            // Overview already shows it, and notifying on every
+            // no-board (re)connect is spam. Anything else (a real
+            // transport failure, `Unknown`, …) still notifies.
+            if e.code != ConnectionError::Unreachable.code() {
+                self.notify(win, "Connection", "Reconnect failed", &e.title);
+            }
             eprintln!("RSH-UI reconnect failed: {} ({})", e.code, e.title);
         }
         // An already-open pairing window / Active session at
         // (re)connect seeds the wizard the same way startup used to
         // (TR §3c: Active session = already paired).
         {
-            let ps = self.api().pairing_status();
+            let ps = &seed.pairing;
             // H-5: the wizard's reset branch (board already paired
             // with another key) only shows when the daemon reports a
             // replacement is required.
@@ -2336,7 +2878,7 @@ impl Ctx {
                 );
                 Ctx::sync_pair_ring(win);
             }
-            if matches!(self.api().connection().state, ConnectionState::Active) {
+            if seed.connection_active {
                 win.set_setup_paired(true);
             }
         }
@@ -2350,33 +2892,67 @@ impl Ctx {
         self.refresh(win, 0);
     }
 
+    /// Re-sync the window after it comes back from tray-hide
+    /// (F27): a seed that landed while hidden swapped the live
+    /// state but skipped every window write, so the props are
+    /// stale until something re-derives them. The live flag +
+    /// the cache-seeded switches (controller, autostart, bindings,
+    /// knobs, firmware cache) are re-applied here, the
+    /// notification model is re-synced (entries pushed while
+    /// hidden were kept in the center + on disk, never drawn),
+    /// then a full refresh re-derives the rest from state/cache.
+    /// Called from [`apply_page_request`] only when the window
+    /// actually was hidden — a page forward while visible needs
+    /// no re-sync (the frame timer already re-derives every tick).
+    fn resync_after_reopen(&self, win: &MainWindow) {
+        if self.is_live() {
+            win.set_daemon_live(true);
+            self.seed_live_state(win);
+        }
+        sync_to_window(&self.notifications.borrow(), win);
+        self.refresh(win, 0);
+    }
+
     /// Apply one pedal-tuning edit (deadzone / bite / feel curve) to
     /// the named module: read the stored record, patch it, push it.
-    /// Success marks the profile unsaved and re-syncs the pedal
-    /// page; failure shows an error notification (never silent).
+    /// F6: the push runs on a [`JobKind::TuningPush`] job thread —
+    /// the UI never blocks on `set_tuning`. The record is patched
+    /// here (the read is a cache read, cheap); only the owned
+    /// record crosses into the job. Success marks the profile
+    /// unsaved and re-syncs the pedal page; failure shows an error
+    /// notification (never silent).
     fn set_pedal_tuning(
         &self,
         win: &MainWindow,
-        module: &str,
+        module: &'static str,
         update: impl FnOnce(&mut TuningSettings),
     ) {
-        let api = self.api();
-        let mut record = api.get_tuning(module);
+        let mut record = self.api().get_tuning(module);
         update(&mut record);
-        match api.set_tuning(&record) {
-            Ok(_) => {
-                self.unsaved.set(true);
-                self.sync_pedals(win);
-                self.refresh(win, 0);
-            }
-            Err(e) => {
-                self.notify(win, "Pedals", "Couldn't save pedal tuning", &e.title);
-                eprintln!(
-                    "RSH-UI pedal set_tuning {module} failed: {} ({})",
-                    e.code, e.title
-                );
-            }
-        }
+        self.run_generic_job(
+            win,
+            JobKind::TuningPush,
+            "Saving pedal tuning…",
+            move |api| JobResult::Tuning(api.set_tuning(&record)),
+            move |ctx, win, result| {
+                let JobResult::Tuning(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(_) => {
+                        ctx.unsaved.set(true);
+                        ctx.sync_pedals(win);
+                    }
+                    Err(e) => {
+                        ctx.notify(win, "Pedals", "Couldn't save pedal tuning", &e.title);
+                        eprintln!(
+                            "RSH-UI pedal set_tuning {module} failed: {} ({})",
+                            e.code, e.title
+                        );
+                    }
+                }
+            },
+        );
     }
 
     /// Apply one tuning edit to a non-pedal module (handbrake / LED /
@@ -2385,26 +2961,35 @@ impl Ctx {
     fn set_module_tuning(
         &self,
         win: &MainWindow,
-        module: &str,
+        module: &'static str,
         update: impl FnOnce(&mut TuningSettings),
     ) {
-        let api = self.api();
-        let mut record = api.get_tuning(module);
+        let mut record = self.api().get_tuning(module);
         update(&mut record);
-        match api.set_tuning(&record) {
-            Ok(_) => {
-                self.unsaved.set(true);
-                self.sync_extras(win);
-                self.refresh(win, 0);
-            }
-            Err(e) => {
-                self.notify(win, "Extras", "Couldn't save setting", &e.title);
-                eprintln!(
-                    "RSH-UI extras set_tuning {module} failed: {} ({})",
-                    e.code, e.title
-                );
-            }
-        }
+        self.run_generic_job(
+            win,
+            JobKind::TuningPush,
+            "Saving setting…",
+            move |api| JobResult::Tuning(api.set_tuning(&record)),
+            move |ctx, win, result| {
+                let JobResult::Tuning(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(_) => {
+                        ctx.unsaved.set(true);
+                        ctx.sync_extras(win);
+                    }
+                    Err(e) => {
+                        ctx.notify(win, "Extras", "Couldn't save setting", &e.title);
+                        eprintln!(
+                            "RSH-UI extras set_tuning {module} failed: {} ({})",
+                            e.code, e.title
+                        );
+                    }
+                }
+            },
+        );
     }
 
     /// Refresh the Pedals page from the stored records (A1/A2):
@@ -2933,19 +3518,41 @@ impl Ctx {
         self.data_dir.as_ref().map(|d| d.join("setup-done"))
     }
 
-    /// True once setup finished or was skipped. No data dir means no
-    /// marker can be read — TR §3 edge: that must NOT count as done,
-    /// or the wizard could never show on a machine without a data dir.
-    fn is_setup_done(&self) -> bool {
+    /// Read the setup marker. No data dir means no marker can be
+    /// read — TR §3 edge: that must NOT count as done, or the wizard
+    /// could never show on a machine without a data dir.
+    fn read_setup_marker(&self) -> SetupMarker {
         let Some(path) = self.setup_marker_path() else {
-            return false;
+            return SetupMarker::Missing;
         };
-        path.is_file()
+        read_setup_marker_file(&path)
     }
 
-    /// Record that setup finished (or was skipped) so the wizard
-    /// never shows again on this machine.
+    /// True when the wizard should show on this launch (F23).
+    /// Replaces the old `is_setup_done` boolean: a bare "done" file
+    /// can no longer tell a Skip from a Finish, so the decision
+    /// needs the marker state + the current version (see
+    /// [`setup_marker_should_show`]).
+    fn setup_should_show(&self) -> bool {
+        setup_marker_should_show(&self.read_setup_marker(), app_version())
+    }
+
+    /// Record that setup finished, so the wizard never shows again
+    /// on this machine (any version — a finished setup stays done).
     fn mark_setup_done(&self) {
+        self.write_setup_marker("done");
+    }
+
+    /// Record that setup was SKIPPED (F23): unlike Finish, a skip
+    /// re-offers the wizard once on the next version, so a skipped
+    /// setup (e.g. the vJoy Drivers step never seen) is not lost
+    /// forever on an update install.
+    fn mark_setup_skipped(&self) {
+        self.write_setup_marker("skipped");
+    }
+
+    /// Write a versioned marker (`<state> <app version>`).
+    fn write_setup_marker(&self, state: &str) {
         let Some(path) = self.setup_marker_path() else {
             return;
         };
@@ -2954,7 +3561,7 @@ impl Ctx {
                 return;
             }
         }
-        match std::fs::write(&path, "done\n") {
+        match std::fs::write(&path, format!("{state} {}\n", app_version())) {
             Ok(()) => eprintln!("RSH-UI setup marker written: {}", path.display()),
             Err(e) => eprintln!("RSH-UI setup marker write failed: {e}"),
         }
@@ -2971,7 +3578,59 @@ impl Ctx {
             }
         }
     }
+}
 
+/// F23 — setup-marker states (file `<data_dir>/setup-done`).
+///
+/// v2.0.2 and earlier wrote the bare word `done` for BOTH Finish
+/// and Skip, so an update install could never tell them apart: a
+/// user who skipped in v2.0.1 never saw the wizard again in v2.0.2,
+/// and with it never got the vJoy Drivers step. v2.0.3+ markers are
+/// versioned (`done <version>` / `skipped <version>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetupMarker {
+    /// No marker file (fresh profile, or no data dir).
+    Missing,
+    /// Setup finished on the recorded version — never re-offer.
+    Done(String),
+    /// Setup skipped on the recorded version — re-offer once the
+    /// app version changes, then the new choice is recorded.
+    Skipped(String),
+    /// Pre-v2.0.3 bare `done` (or unreadable/corrupt content):
+    /// Skip vs Finish is unknowable, so the wizard is offered once
+    /// and the user's new choice writes a versioned marker.
+    Legacy,
+}
+
+/// Parse marker file content into a [`SetupMarker`].
+fn parse_setup_marker(content: &str) -> SetupMarker {
+    let mut parts = content.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some("done"), Some(version)) => SetupMarker::Done(version.to_string()),
+        (Some("skipped"), Some(version)) => SetupMarker::Skipped(version.to_string()),
+        _ => SetupMarker::Legacy,
+    }
+}
+
+/// Read a marker file: missing/unreadable file is [`SetupMarker::Missing`].
+fn read_setup_marker_file(path: &std::path::Path) -> SetupMarker {
+    match std::fs::read_to_string(path) {
+        Ok(content) => parse_setup_marker(&content),
+        Err(_) => SetupMarker::Missing,
+    }
+}
+
+/// Should the wizard show on this launch for this marker state?
+/// `current_version` is [`app_version()`].
+fn setup_marker_should_show(marker: &SetupMarker, current_version: &str) -> bool {
+    match marker {
+        SetupMarker::Done(_) => false,
+        SetupMarker::Skipped(version) => version != current_version,
+        SetupMarker::Missing | SetupMarker::Legacy => true,
+    }
+}
+
+impl Ctx {
     /// Profile row by list index (popover + Settings share the same
     /// `list_profiles()` order; presets are always empty, so the
     /// popover's selected index maps directly).
@@ -3006,31 +3665,47 @@ impl Ctx {
     }
 
     /// Perform the activation (after any save/discard prompt).
+    /// F6: `activate_profile` runs on a [`JobKind::ProfileOp`]
+    /// job thread — the click never blocks on the daemon.
     fn do_activate(&self, win: &MainWindow, p: &ProfileSummary) {
-        match self.api().activate_profile(&p.id) {
-            Ok(name) => {
-                self.unsaved.set(false);
-                self.refresh_profiles(win);
-                self.refresh_games(win);
-                win.set_popover_open(false);
-                win.set_popover_show_prompt(false);
-                *self.pending_profile_id.borrow_mut() = None;
-                self.notify(
-                    win,
-                    "Profile",
-                    "Profile active",
-                    &format!("{name} is now active."),
-                );
-                self.refresh(win, 0);
-            }
-            Err(e) => {
-                self.notify(win, "Profile", "Couldn't switch profile", &e.title);
-                eprintln!("RSH-UI activate_profile failed: {} ({})", e.code, e.title);
-            }
-        }
+        let id = p.id.clone();
+        self.run_generic_job(
+            win,
+            JobKind::ProfileOp,
+            "Switching profile…",
+            move |api| JobResult::Text(api.activate_profile(&id)),
+            move |ctx, win, result| {
+                let JobResult::Text(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(name) => {
+                        ctx.unsaved.set(false);
+                        ctx.refresh_profiles(win);
+                        ctx.refresh_games(win);
+                        win.set_popover_open(false);
+                        win.set_popover_show_prompt(false);
+                        *ctx.pending_profile_id.borrow_mut() = None;
+                        ctx.notify(
+                            win,
+                            "Profile",
+                            "Profile active",
+                            &format!("{name} is now active."),
+                        );
+                    }
+                    Err(e) => {
+                        ctx.notify(win, "Profile", "Couldn't switch profile", &e.title);
+                        eprintln!("RSH-UI activate_profile failed: {} ({})", e.code, e.title);
+                    }
+                }
+            },
+        );
     }
 
     /// Resolve the pending profile switch after the prompt.
+    /// F6: the save/discard runs on a [`JobKind::ProfileOp`] job
+    /// thread; the activation chains from the apply (it starts its
+    /// own job).
     fn resolve_pending_switch(&self, win: &MainWindow, save_first: bool) {
         let pending = self.pending_profile_id.borrow().clone();
         let Some(id) = pending else {
@@ -3038,76 +3713,148 @@ impl Ctx {
             return;
         };
         if save_first {
-            if let Err(e) = self.api().save_draft() {
-                self.notify(win, "Profile", "Couldn't save changes", &e.title);
-                win.set_popover_show_prompt(false);
-                return;
-            }
-            self.unsaved.set(false);
-        } else if self.api().discard_draft() {
-            self.unsaved.set(false);
-        }
-        win.set_popover_show_prompt(false);
-        *self.pending_profile_id.borrow_mut() = None;
-        if let Some(p) = self
-            .profiles_cache
-            .borrow()
-            .iter()
-            .find(|p| p.id == id)
-            .cloned()
-        {
-            self.do_activate(win, &p);
+            let activate_id = id.clone();
+            self.run_generic_job(
+                win,
+                JobKind::ProfileOp,
+                "Saving changes…",
+                move |api| JobResult::Bool(api.save_draft()),
+                move |ctx, win, result| {
+                    let JobResult::Bool(result) = result else {
+                        return;
+                    };
+                    match result {
+                        Ok(_) => {
+                            ctx.unsaved.set(false);
+                        }
+                        Err(e) => {
+                            ctx.notify(win, "Profile", "Couldn't save changes", &e.title);
+                            win.set_popover_show_prompt(false);
+                            return;
+                        }
+                    }
+                    win.set_popover_show_prompt(false);
+                    *ctx.pending_profile_id.borrow_mut() = None;
+                    if let Some(p) = ctx
+                        .profiles_cache
+                        .borrow()
+                        .iter()
+                        .find(|p| p.id == activate_id)
+                        .cloned()
+                    {
+                        ctx.do_activate(win, &p);
+                    }
+                },
+            );
+        } else {
+            let activate_id = id.clone();
+            self.run_generic_job(
+                win,
+                JobKind::ProfileOp,
+                "Discarding changes…",
+                move |api| JobResult::Bool(Ok(api.discard_draft())),
+                move |ctx, win, result| {
+                    let JobResult::Bool(result) = result else {
+                        return;
+                    };
+                    if result.unwrap_or(false) {
+                        ctx.unsaved.set(false);
+                    }
+                    win.set_popover_show_prompt(false);
+                    *ctx.pending_profile_id.borrow_mut() = None;
+                    if let Some(p) = ctx
+                        .profiles_cache
+                        .borrow()
+                        .iter()
+                        .find(|p| p.id == activate_id)
+                        .cloned()
+                    {
+                        ctx.do_activate(win, &p);
+                    }
+                },
+            );
         }
     }
 
     /// Duplicate the profile at `index` (A8).
+    /// F6: `duplicate_profile` runs on a [`JobKind::ProfileOp`]
+    /// job thread.
     fn duplicate_profile_index(&self, win: &MainWindow, index: i32) {
         let Some(p) = self.profile_at(index) else {
             return;
         };
-        match self.api().duplicate_profile(&p.id) {
-            Ok(name) => {
-                self.refresh_profiles(win);
-                self.notify(
-                    win,
-                    "Profile",
-                    "Profile duplicated",
-                    &format!("Duplicated as {name}."),
-                );
-            }
-            Err(e) => self.notify(win, "Profile", "Couldn't duplicate profile", &e.title),
-        }
+        let id = p.id.clone();
+        self.run_generic_job(
+            win,
+            JobKind::ProfileOp,
+            "Duplicating profile…",
+            move |api| JobResult::Text(api.duplicate_profile(&id)),
+            move |ctx, win, result| {
+                let JobResult::Text(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(name) => {
+                        ctx.refresh_profiles(win);
+                        ctx.notify(
+                            win,
+                            "Profile",
+                            "Profile duplicated",
+                            &format!("Duplicated as {name}."),
+                        );
+                    }
+                    Err(e) => ctx.notify(win, "Profile", "Couldn't duplicate profile", &e.title),
+                }
+            },
+        );
     }
 
     /// Delete the profile at `index` (A8).
+    /// F6: `delete_profile` runs on a [`JobKind::ProfileOp`] job
+    /// thread.
     fn delete_profile_index(&self, win: &MainWindow, index: i32) {
         let Some(p) = self.profile_at(index) else {
             return;
         };
-        match self.api().delete_profile(&p.id) {
-            Ok(true) => {
-                self.refresh_profiles(win);
-                self.refresh_games(win);
-                self.notify(
-                    win,
-                    "Profile",
-                    "Profile deleted",
-                    &format!("{} deleted.", p.name),
-                );
-            }
-            Ok(false) => {
-                self.notify(
-                    win,
-                    "Profile",
-                    "Couldn't delete profile",
-                    &format!("{} couldn't be deleted.", p.name),
-                );
-            }
-            Err(e) => self.notify(win, "Profile", "Couldn't delete profile", &e.title),
-        }
+        let id = p.id.clone();
+        let name = p.name.clone();
+        self.run_generic_job(
+            win,
+            JobKind::ProfileOp,
+            "Deleting profile…",
+            move |api| JobResult::Bool(api.delete_profile(&id)),
+            move |ctx, win, result| {
+                let JobResult::Bool(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(true) => {
+                        ctx.refresh_profiles(win);
+                        ctx.refresh_games(win);
+                        ctx.notify(
+                            win,
+                            "Profile",
+                            "Profile deleted",
+                            &format!("{name} deleted."),
+                        );
+                    }
+                    Ok(false) => {
+                        ctx.notify(
+                            win,
+                            "Profile",
+                            "Couldn't delete profile",
+                            &format!("{name} couldn't be deleted."),
+                        );
+                    }
+                    Err(e) => ctx.notify(win, "Profile", "Couldn't delete profile", &e.title),
+                }
+            },
+        );
     }
 
     /// Create a new profile with a fresh unique name (A8).
+    /// F6: `create_profile` runs on a [`JobKind::ProfileOp`] job
+    /// thread.
     fn create_new_profile(&self, win: &MainWindow) {
         let existing: Vec<String> = self
             .profiles_cache
@@ -3123,18 +3870,29 @@ impl Ctx {
             }
             n += 1;
         };
-        match self.api().create_profile(&name) {
-            Ok(created) => {
-                self.refresh_profiles(win);
-                self.notify(
-                    win,
-                    "Profile",
-                    "Profile created",
-                    &format!("{created} created."),
-                );
-            }
-            Err(e) => self.notify(win, "Profile", "Couldn't create profile", &e.title),
-        }
+        self.run_generic_job(
+            win,
+            JobKind::ProfileOp,
+            "Creating profile…",
+            move |api| JobResult::Text(api.create_profile(&name)),
+            move |ctx, win, result| {
+                let JobResult::Text(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(created) => {
+                        ctx.refresh_profiles(win);
+                        ctx.notify(
+                            win,
+                            "Profile",
+                            "Profile created",
+                            &format!("{created} created."),
+                        );
+                    }
+                    Err(e) => ctx.notify(win, "Profile", "Couldn't create profile", &e.title),
+                }
+            },
+        );
     }
 
     /// Convert a popover footer index to a my-profiles index (M1):
@@ -3181,27 +3939,39 @@ impl Ctx {
             name = format!("{} {n}", game.name);
             n += 1;
         }
-        match self.api().create_profile(&name) {
-            Ok(created) => {
-                self.refresh_profiles(win);
-                if let Some(p) = self
-                    .profiles_cache
-                    .borrow()
-                    .iter()
-                    .find(|p| p.name == created)
-                    .cloned()
-                {
-                    self.do_activate(win, &p);
+        let game_name = game.name.clone();
+        self.run_generic_job(
+            win,
+            JobKind::ProfileOp,
+            "Creating profile…",
+            move |api| JobResult::Text(api.create_profile(&name)),
+            move |ctx, win, result| {
+                let JobResult::Text(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(created) => {
+                        ctx.refresh_profiles(win);
+                        if let Some(p) = ctx
+                            .profiles_cache
+                            .borrow()
+                            .iter()
+                            .find(|p| p.name == created)
+                            .cloned()
+                        {
+                            ctx.do_activate(win, &p);
+                        }
+                        ctx.notify(
+                            win,
+                            "Profile",
+                            "Profile created",
+                            &format!("{created} created from the {game_name} preset."),
+                        );
+                    }
+                    Err(e) => ctx.notify_error(win, "Profile", &e),
                 }
-                self.notify(
-                    win,
-                    "Profile",
-                    "Profile created",
-                    &format!("{created} created from the {} preset.", game.name),
-                );
-            }
-            Err(e) => self.notify_error(win, "Profile", &e),
-        }
+            },
+        );
     }
 
     /// Rename the profile at a popover COMBINED index (M1): the new
@@ -3248,18 +4018,30 @@ impl Ctx {
             );
             return;
         }
-        match self.api().rename_profile(&p.id, &game_name) {
-            Ok(name) => {
-                self.refresh_profiles(win);
-                self.notify(
-                    win,
-                    "Profile",
-                    "Profile renamed",
-                    &format!("Renamed to {name}."),
-                );
-            }
-            Err(e) => self.notify_error(win, "Profile", &e),
-        }
+        let id = p.id.clone();
+        self.run_generic_job(
+            win,
+            JobKind::ProfileOp,
+            "Renaming profile…",
+            move |api| JobResult::Text(api.rename_profile(&id, &game_name)),
+            move |ctx, win, result| {
+                let JobResult::Text(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(name) => {
+                        ctx.refresh_profiles(win);
+                        ctx.notify(
+                            win,
+                            "Profile",
+                            "Profile renamed",
+                            &format!("Renamed to {name}."),
+                        );
+                    }
+                    Err(e) => ctx.notify_error(win, "Profile", &e),
+                }
+            },
+        );
     }
 
     /// Rename the profile at a popover COMBINED index to a typed
@@ -3297,18 +4079,30 @@ impl Ctx {
             );
             return;
         }
-        match self.api().rename_profile(&p.id, &name) {
-            Ok(renamed) => {
-                self.refresh_profiles(win);
-                self.notify(
-                    win,
-                    "Profile",
-                    "Profile renamed",
-                    &format!("Renamed to {renamed}."),
-                );
-            }
-            Err(e) => self.notify_error(win, "Profile", &e),
-        }
+        let id = p.id.clone();
+        self.run_generic_job(
+            win,
+            JobKind::ProfileOp,
+            "Renaming profile…",
+            move |api| JobResult::Text(api.rename_profile(&id, &name)),
+            move |ctx, win, result| {
+                let JobResult::Text(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(renamed) => {
+                        ctx.refresh_profiles(win);
+                        ctx.notify(
+                            win,
+                            "Profile",
+                            "Profile renamed",
+                            &format!("Renamed to {renamed}."),
+                        );
+                    }
+                    Err(e) => ctx.notify_error(win, "Profile", &e),
+                }
+            },
+        );
     }
 
     /// Link the profile at a popover COMBINED index to its next game
@@ -3349,112 +4143,188 @@ impl Ctx {
         let current = p.game.as_deref();
         let pos = current.and_then(|slug| games.iter().position(|g| g.id == slug));
         let next = games[pos.map_or(0, |i| i + 1) % games.len()].clone();
-        match self.api().link_profile(&p.id, &next.id) {
-            Ok(name) => {
-                self.refresh_profiles(win);
-                self.refresh_games(win);
-                self.notify(
-                    win,
-                    "Profile",
-                    "Profile linked",
-                    &format!("{name} is now linked to {}.", next.name),
-                );
-            }
-            Err(e) => self.notify_error(win, "Profile", &e),
-        }
+        let id = p.id.clone();
+        let next_id = next.id.clone();
+        let next_name = next.name.clone();
+        self.run_generic_job(
+            win,
+            JobKind::ProfileOp,
+            "Linking profile…",
+            move |api| JobResult::Text(api.link_profile(&id, &next_id)),
+            move |ctx, win, result| {
+                let JobResult::Text(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(name) => {
+                        ctx.refresh_profiles(win);
+                        ctx.refresh_games(win);
+                        ctx.notify(
+                            win,
+                            "Profile",
+                            "Profile linked",
+                            &format!("{name} is now linked to {next_name}."),
+                        );
+                    }
+                    Err(e) => ctx.notify_error(win, "Profile", &e),
+                }
+            },
+        );
     }
 
-    /// Poll a running learn (Buttons / horn): a picked button
-    /// arrives via `take_learned_button()`; learning ending with no
-    /// pick clears the listening state.
-    fn poll_learn(&self, win: &MainWindow) {
+    /// Poll a running learn (Buttons / horn) on a job thread (F6):
+    /// `take_learned_button` / `is_learning` are IPC calls — the
+    /// 1 Hz tick never blocks on them. A learned button applies on
+    /// the UI thread; a horn learn chains a [`JobKind::TuningPush`]
+    /// job to persist it. Still listening = no-op (the next tick
+    /// polls again); ended-with-nothing clears the listening state.
+    fn start_learn_poll_job(&self, win: &MainWindow) {
         let target = self.learn_target.get();
         if target == 0 {
             return;
         }
-        let api = self.api();
-        if let Some(b) = api.take_learned_button() {
-            self.learn_target.set(0);
-            win.set_buttons_listening(false);
-            win.set_horn_learning(false);
-            if target == 2 {
-                let mut record = api.get_tuning("horn");
-                record.horn_button = Some(b);
-                match api.set_tuning(&record) {
-                    Ok(_) => {
-                        self.unsaved.set(true);
-                        self.sync_extras(win);
-                        self.notify(
+        self.run_generic_job(
+            win,
+            JobKind::LearnOp,
+            "Listening…",
+            move |api| {
+                if let Some(b) = api.take_learned_button() {
+                    JobResult::LearnPoll(Some(b))
+                } else if api.is_learning() {
+                    JobResult::Unit(Ok(()))
+                } else {
+                    JobResult::LearnPoll(None)
+                }
+            },
+            move |ctx, win, result| match result {
+                JobResult::LearnPoll(Some(b)) => {
+                    ctx.learn_target.set(0);
+                    win.set_buttons_listening(false);
+                    win.set_horn_learning(false);
+                    if target == 2 {
+                        ctx.run_generic_job(
                             win,
-                            "Horn",
-                            "Horn learned",
-                            &format!("Horn is now Button {b}."),
+                            JobKind::TuningPush,
+                            "Saving horn button…",
+                            move |api| {
+                                let mut record = api.get_tuning("horn");
+                                record.horn_button = Some(b);
+                                JobResult::Tuning(api.set_tuning(&record))
+                            },
+                            move |ctx, win, result| {
+                                let JobResult::Tuning(result) = result else {
+                                    return;
+                                };
+                                match result {
+                                    Ok(_) => {
+                                        ctx.unsaved.set(true);
+                                        ctx.sync_extras(win);
+                                        ctx.notify(
+                                            win,
+                                            "Horn",
+                                            "Horn learned",
+                                            &format!("Horn is now Button {b}."),
+                                        );
+                                    }
+                                    Err(e) => ctx.notify(
+                                        win,
+                                        "Horn",
+                                        "Couldn't save horn button",
+                                        &e.title,
+                                    ),
+                                }
+                            },
+                        );
+                    } else {
+                        let idx = i32::from(b).saturating_sub(1);
+                        if (0..12).contains(&idx) {
+                            ctx.selected_button.set(idx);
+                            win.set_selected_index(idx);
+                            let action = ctx.button_actions.borrow()
+                                [usize::try_from(idx).unwrap_or(0)]
+                            .clone();
+                            *ctx.pending_action.borrow_mut() = None;
+                            win.set_selected_action(action.into());
+                        }
+                        ctx.notify(
+                            win,
+                            "Buttons",
+                            "Button learned",
+                            &format!("Learned Button {b}."),
                         );
                     }
-                    Err(e) => self.notify(win, "Horn", "Couldn't save horn button", &e.title),
                 }
-            } else {
-                let idx = i32::from(b).saturating_sub(1);
-                if (0..12).contains(&idx) {
-                    self.selected_button.set(idx);
-                    win.set_selected_index(idx);
-                    let action =
-                        self.button_actions.borrow()[usize::try_from(idx).unwrap_or(0)].clone();
-                    *self.pending_action.borrow_mut() = None;
-                    win.set_selected_action(action.into());
+                JobResult::LearnPoll(None) => {
+                    ctx.learn_target.set(0);
+                    win.set_buttons_listening(false);
+                    win.set_horn_learning(false);
                 }
-                self.notify(
-                    win,
-                    "Buttons",
-                    "Button learned",
-                    &format!("Learned Button {b}."),
-                );
-            }
-        } else if !api.is_learning() {
-            self.learn_target.set(0);
-            win.set_buttons_listening(false);
-            win.set_horn_learning(false);
-        }
+                _ => {}
+            },
+        );
     }
 
     /// Start (or cancel) learning for `target` (1 Buttons, 2 horn):
-    /// `start_learn` arms the wheel, the frame timer picks the press
-    /// up via [`Ctx::poll_learn`].
+    /// `start_learn` / `cancel_learn` run on a [`JobKind::LearnOp`]
+    /// job thread; the frame timer picks the press up via
+    /// [`Ctx::start_learn_poll_job`].
     fn toggle_learn(&self, win: &MainWindow, target: i32) {
         if self.learn_target.get() == target {
-            match self.api().cancel_learn() {
-                Ok(_) => {
-                    self.learn_target.set(0);
-                    win.set_buttons_listening(false);
-                    win.set_horn_learning(false);
-                    self.notify(win, "Learn", "Learning cancelled", "Learning cancelled.");
-                }
-                Err(e) => self.notify(win, "Learn", "Couldn't cancel learning", &e.title),
-            }
+            self.run_generic_job(
+                win,
+                JobKind::LearnOp,
+                "Cancelling…",
+                move |api| JobResult::Unit(api.cancel_learn().map(|_| ())),
+                move |ctx, win, result| {
+                    let JobResult::Unit(result) = result else {
+                        return;
+                    };
+                    match result {
+                        Ok(()) => {
+                            ctx.learn_target.set(0);
+                            win.set_buttons_listening(false);
+                            win.set_horn_learning(false);
+                            ctx.notify(win, "Learn", "Learning cancelled", "Learning cancelled.");
+                        }
+                        Err(e) => ctx.notify(win, "Learn", "Couldn't cancel learning", &e.title),
+                    }
+                },
+            );
             return;
         }
-        match self.api().start_learn() {
-            Ok(true) => {
-                self.learn_target.set(target);
-                win.set_buttons_listening(target == 1);
-                win.set_horn_learning(target == 2);
-                self.notify(
-                    win,
-                    "Learn",
-                    "Listening…",
-                    "Listening — press a button on the wheel.",
-                );
-            }
-            Ok(false) => {
-                self.notify(
-                    win,
-                    "Learn",
-                    "Couldn't start learning",
-                    "Learning didn't start.",
-                );
-            }
-            Err(e) => self.notify(win, "Learn", "Couldn't start learning", &e.title),
-        }
+        self.run_generic_job(
+            win,
+            JobKind::LearnOp,
+            "Listening…",
+            move |api| JobResult::Bool(api.start_learn()),
+            move |ctx, win, result| {
+                let JobResult::Bool(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(true) => {
+                        ctx.learn_target.set(target);
+                        win.set_buttons_listening(target == 1);
+                        win.set_horn_learning(target == 2);
+                        ctx.notify(
+                            win,
+                            "Learn",
+                            "Listening…",
+                            "Listening — press a button on the wheel.",
+                        );
+                    }
+                    Ok(false) => {
+                        ctx.notify(
+                            win,
+                            "Learn",
+                            "Couldn't start learning",
+                            "Learning didn't start.",
+                        );
+                    }
+                    Err(e) => ctx.notify(win, "Learn", "Couldn't start learning", &e.title),
+                }
+            },
+        );
     }
 }
 
@@ -3525,53 +4395,68 @@ fn wire_fc2_callbacks(win: &MainWindow, ctx: &Rc<Ctx>) {
 }
 
 /// Run one pairing attempt from the wizard (Begin / Retry /
-/// Reset): calls `begin_pairing`, drives the wizard's countdown +
-/// status props, and notifies visibly on success and failure.
+/// Reset): `begin_pairing` runs on a [`JobKind::PairingOp`] job
+/// thread — the click never blocks on the daemon. The apply drives
+/// the wizard's countdown + status props, and notifies visibly on
+/// success and failure.
 fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
-    match ctx.api().begin_pairing() {
-        Ok(info) => {
-            w.set_setup_pair_error("".into());
-            if info.seconds_left > 0 {
-                w.set_setup_pairing_active(true);
-                w.set_setup_pair_seconds_left(i32::try_from(info.seconds_left).unwrap_or(120));
-                w.set_setup_pair_total(i32::try_from(info.seconds_left).unwrap_or(120));
-                w.set_setup_pair_status(
-                    "Pairing window open — hold the pair button on the wheel.".into(),
-                );
-                Ctx::sync_pair_ring(w);
-                ctx.notify(
-                    w,
-                    "Pairing",
-                    "Pairing window open",
-                    &format!("Pairing window open — {}s left", info.seconds_left),
-                );
-            } else {
-                // B-1: no window yet — the board may still open one
-                // (begin_pairing returns immediately now). Start the
-                // 10 s wait clock; the 1 Hz tick expires it, not the
-                // first tick.
-                *ctx.pairing_wait_since.borrow_mut() = Some(Instant::now());
-                w.set_setup_pairing_active(true);
-                w.set_setup_pair_status("Waiting for the wheel…".into());
-                Ctx::sync_pair_ring(w);
-                ctx.notify(
-                    w,
-                    "Pairing",
-                    "Pairing started",
-                    "Waiting for the wheel — hold the pair button for 3 seconds.",
-                );
+    ctx.run_generic_job(
+        w,
+        JobKind::PairingOp,
+        "Starting pairing…",
+        move |api| JobResult::Pairing(api.begin_pairing()),
+        move |ctx, w, result| {
+            let JobResult::Pairing(result) = result else {
+                return;
+            };
+            match result {
+                Ok(info) => {
+                    w.set_setup_pair_error("".into());
+                    if info.seconds_left > 0 {
+                        w.set_setup_pairing_active(true);
+                        w.set_setup_pair_seconds_left(
+                            i32::try_from(info.seconds_left).unwrap_or(120),
+                        );
+                        w.set_setup_pair_total(i32::try_from(info.seconds_left).unwrap_or(120));
+                        w.set_setup_pair_status(
+                            "Pairing window open — hold the pair button on the wheel.".into(),
+                        );
+                        Ctx::sync_pair_ring(w);
+                        ctx.notify(
+                            w,
+                            "Pairing",
+                            "Pairing window open",
+                            &format!("Pairing window open — {}s left", info.seconds_left),
+                        );
+                    } else {
+                        // B-1: no window yet — the board may still open one
+                        // (begin_pairing returns immediately now). Start the
+                        // 10 s wait clock; the 1 Hz tick expires it, not the
+                        // first tick.
+                        *ctx.pairing_wait_since.borrow_mut() = Some(Instant::now());
+                        w.set_setup_pairing_active(true);
+                        w.set_setup_pair_status("Waiting for the wheel…".into());
+                        Ctx::sync_pair_ring(w);
+                        ctx.notify(
+                            w,
+                            "Pairing",
+                            "Pairing started",
+                            "Waiting for the wheel — hold the pair button for 3 seconds.",
+                        );
+                    }
+                    eprintln!("RSH-UI setup begin-pairing ok: {}s left", info.seconds_left);
+                }
+                Err(e) => {
+                    w.set_setup_pair_error(e.title.clone().into());
+                    ctx.notify(w, "Pairing", "Pairing failed", &e.title);
+                    eprintln!(
+                        "RSH-UI setup begin-pairing failed: {} ({})",
+                        e.code, e.title
+                    );
+                }
             }
-            eprintln!("RSH-UI setup begin-pairing ok: {}s left", info.seconds_left);
-        }
-        Err(e) => {
-            w.set_setup_pair_error(e.title.clone().into());
-            ctx.notify(w, "Pairing", "Pairing failed", &e.title);
-            eprintln!(
-                "RSH-UI setup begin-pairing failed: {} ({})",
-                e.code, e.title
-            );
-        }
-    }
+        },
+    );
 }
 
 /// Connect the wizard to one transport and drive its props
@@ -3647,7 +4532,9 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
         win.unwrap().on_setup_skip(move || {
             if let Some(w) = win.upgrade() {
                 w.set_setup_mode(false);
-                ctx.mark_setup_done();
+                // F23: a skip is NOT a finish — record it as skipped
+                // so the wizard is re-offered on the next version.
+                ctx.mark_setup_skipped();
                 eprintln!("RSH-UI setup skipped (wizard closed)");
             }
         });
@@ -3676,26 +4563,39 @@ fn wire_setup_vjoy(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_setup_install_vjoy(move || {
             if let Some(w) = win.upgrade() {
-                match ctx.api().install_vjoy() {
-                    Ok(_) => {
-                        // Background install: the 1 Hz tick polls
-                        // vjoy_status() until it lands or fails.
-                        ctx.vjoy_polling.set(true);
-                        w.set_setup_vjoy_installing(true);
-                        w.set_setup_vjoy_error("".into());
-                        ctx.notify(
-                            &w,
-                            "Drivers",
-                            "vJoy install started",
-                            "Installing vJoy in the background — this takes a minute.",
-                        );
-                    }
-                    Err(e) => {
-                        w.set_setup_vjoy_error(user_text(&e.title).into());
-                        ctx.notify(&w, "Drivers", "vJoy install failed", &e.title);
-                        eprintln!("RSH-UI install_vjoy failed: {} ({})", e.code, e.title);
-                    }
-                }
+                // F6: `install_vjoy` runs on a SettingsOp job
+                // thread — the click never blocks on the daemon.
+                ctx.run_generic_job(
+                    &w,
+                    JobKind::SettingsOp,
+                    "Starting vJoy install…",
+                    move |api| JobResult::Text(api.install_vjoy()),
+                    move |ctx, w, result| {
+                        let JobResult::Text(result) = result else {
+                            return;
+                        };
+                        match result {
+                            Ok(_) => {
+                                // Background install: the 1 Hz tick polls
+                                // vjoy_status() until it lands or fails.
+                                ctx.vjoy_polling.set(true);
+                                w.set_setup_vjoy_installing(true);
+                                w.set_setup_vjoy_error("".into());
+                                ctx.notify(
+                                    w,
+                                    "Drivers",
+                                    "vJoy install started",
+                                    "Installing vJoy in the background — this takes a minute.",
+                                );
+                            }
+                            Err(e) => {
+                                w.set_setup_vjoy_error(user_text(&e.title).into());
+                                ctx.notify(w, "Drivers", "vJoy install failed", &e.title);
+                                eprintln!("RSH-UI install_vjoy failed: {} ({})", e.code, e.title);
+                            }
+                        }
+                    },
+                );
             }
         });
     }
@@ -3796,6 +4696,7 @@ fn wire_setup_pairing(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// endpoint of accelerator + brake (the wizard says "press each
 /// pedal fully, then set" — the clutch is optional and is set on
 /// the Pedals page instead).
+#[allow(clippy::too_many_lines)]
 fn wire_setup_calibrate(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         // A17 (v2.0.2): Calibrate calls the real capture backend.
@@ -3811,49 +4712,113 @@ fn wire_setup_calibrate(win: &MainWindow, ctx: &Rc<Ctx>) {
                 return;
             };
             match a.as_str() {
-                "centre" => match ctx.capture_centre_ipc() {
-                    Ok(mv) => {
-                        w.set_setup_centre_done(true);
-                        ctx.refresh_calibration();
-                        ctx.notify(
+                "centre" => {
+                    // F6: the capture runs on a CaptureOp job
+                    // thread — the click never blocks on the daemon.
+                    if ctx.is_live() {
+                        ctx.run_generic_job(
                             &w,
-                            "Calibration",
-                            "Centre set",
-                            &format!("Centre set at {mv} mV."),
+                            JobKind::CaptureOp,
+                            "Setting centre…",
+                            move |api| JobResult::Capture(api.capture_centre()),
+                            move |ctx, w, result| {
+                                let JobResult::Capture(result) = result else {
+                                    return;
+                                };
+                                match result {
+                                    Ok(mv) => {
+                                        w.set_setup_centre_done(true);
+                                        ctx.refresh_calibration();
+                                        ctx.notify(
+                                            w,
+                                            "Calibration",
+                                            "Centre set",
+                                            &format!("Centre set at {mv} mV."),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        ctx.notify(w, "Calibration", "Couldn't set centre", &e.title);
+                                        eprintln!("RSH-UI setup calibrate centre failed: {}", e.title);
+                                    }
+                                }
+                            },
                         );
-                    }
-                    Err(reason) => {
-                        ctx.notify(&w, "Calibration", "Couldn't set centre", &reason);
+                    } else {
+                        let reason = Ctx::capture_unavailable_reason();
+                        ctx.notify(&w, "Calibration", "Couldn't set centre", reason);
                         eprintln!("RSH-UI setup calibrate centre failed: {reason}");
                     }
-                },
+                }
                 "pedals" => {
-                    let mut captured: Vec<String> = Vec::new();
-                    let mut failed: Option<String> = None;
-                    for (key, name) in [("accel", "Accelerator"), ("brake", "Brake")] {
-                        match ctx.capture_pedal_ipc(key, "max") {
-                            Ok(mv) => captured.push(format!("{name} {mv} mV")),
-                            Err(reason) => {
-                                failed = Some(reason);
-                                break;
-                            }
-                        }
-                    }
-                    match failed {
-                        None => {
-                            w.set_setup_pedals_done(true);
-                            ctx.refresh_calibration();
-                            ctx.notify(
-                                &w,
-                                "Calibration",
-                                "Pedals set",
-                                &format!("Pedals set: {}.", captured.join(", ")),
-                            );
-                        }
-                        Some(reason) => {
-                            ctx.notify(&w, "Calibration", "Couldn't set pedals", &reason);
-                            eprintln!("RSH-UI setup calibrate pedals failed: {reason}");
-                        }
+                    // F6: the two captures run as chained CaptureOp
+                    // jobs (brake starts when the accelerator lands)
+                    // — the click never blocks on the daemon.
+                    if ctx.is_live() {
+                        ctx.run_generic_job(
+                            &w,
+                            JobKind::CaptureOp,
+                            "Setting pedals…",
+                            move |api| JobResult::Capture(api.capture_pedal_max("accel")),
+                            move |ctx, w, result| {
+                                let JobResult::Capture(result) = result else {
+                                    return;
+                                };
+                                match result {
+                                    Ok(accel_mv) => {
+                                        ctx.run_generic_job(
+                                            w,
+                                            JobKind::CaptureOp,
+                                            "Setting pedals…",
+                                            move |api| {
+                                                JobResult::Capture(api.capture_pedal_max("brake"))
+                                            },
+                                            move |ctx, w, result| {
+                                                let JobResult::Capture(result) = result else {
+                                                    return;
+                                                };
+                                                match result {
+                                                    Ok(brake_mv) => {
+                                                        w.set_setup_pedals_done(true);
+                                                        ctx.refresh_calibration();
+                                                        ctx.notify(
+                                                            w,
+                                                            "Calibration",
+                                                            "Pedals set",
+                                                            &format!(
+                                                                "Pedals set: Accelerator {accel_mv} mV, Brake {brake_mv} mV."
+                                                            ),
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        ctx.notify(
+                                                            w,
+                                                            "Calibration",
+                                                            "Couldn't set pedals",
+                                                            &e.title,
+                                                        );
+                                                        eprintln!(
+                                                            "RSH-UI setup calibrate pedals failed: {}",
+                                                            e.title
+                                                        );
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    }
+                                    Err(e) => {
+                                        ctx.notify(w, "Calibration", "Couldn't set pedals", &e.title);
+                                        eprintln!(
+                                            "RSH-UI setup calibrate pedals failed: {}",
+                                            e.title
+                                        );
+                                    }
+                                }
+                            },
+                        );
+                    } else {
+                        let reason = Ctx::capture_unavailable_reason();
+                        ctx.notify(&w, "Calibration", "Couldn't set pedals", reason);
+                        eprintln!("RSH-UI setup calibrate pedals failed: {reason}");
                     }
                 }
                 other => eprintln!("RSH-UI setup calibrate: unknown action {other}"),
@@ -3982,22 +4947,45 @@ fn wire_pedals_set(win: &MainWindow, ctx: &Rc<Ctx>) {
                 let Some((key, name)) = pedal_key(p) else {
                     return;
                 };
-                match ctx.capture_pedal_ipc(key, "min") {
-                    Ok(mv) => {
-                        ctx.refresh_calibration();
-                        ctx.sync_pedals(&w);
-                        ctx.notify(
-                            &w,
-                            "Pedals",
-                            &format!("{name} released point set"),
-                            &format!("{name} up (released) captured at {mv} mV."),
-                        );
-                    }
-                    Err(reason) => {
-                        ctx.notify(&w, "Pedals", &format!("Couldn't set {name} up"), &reason);
-                        eprintln!("RSH-UI pedal set up {key} failed: {reason}");
-                    }
+                // F6: the capture runs on a CaptureOp job thread.
+                if !ctx.is_live() {
+                    let reason = Ctx::capture_unavailable_reason();
+                    ctx.notify(&w, "Pedals", &format!("Couldn't set {name} up"), reason);
+                    eprintln!("RSH-UI pedal set up {key} failed: {reason}");
+                    return;
                 }
+                ctx.run_generic_job(
+                    &w,
+                    JobKind::CaptureOp,
+                    "Capturing…",
+                    move |api| JobResult::Capture(api.capture_pedal_min(key)),
+                    move |ctx, w, result| {
+                        let JobResult::Capture(result) = result else {
+                            return;
+                        };
+                        match result {
+                            Ok(mv) => {
+                                ctx.refresh_calibration();
+                                ctx.sync_pedals(w);
+                                ctx.notify(
+                                    w,
+                                    "Pedals",
+                                    &format!("{name} released point set"),
+                                    &format!("{name} up (released) captured at {mv} mV."),
+                                );
+                            }
+                            Err(e) => {
+                                ctx.notify(
+                                    w,
+                                    "Pedals",
+                                    &format!("Couldn't set {name} up"),
+                                    &e.title,
+                                );
+                                eprintln!("RSH-UI pedal set up {key} failed: {}", e.title);
+                            }
+                        }
+                    },
+                );
             }
         });
     }
@@ -4009,22 +4997,45 @@ fn wire_pedals_set(win: &MainWindow, ctx: &Rc<Ctx>) {
                 let Some((key, name)) = pedal_key(p) else {
                     return;
                 };
-                match ctx.capture_pedal_ipc(key, "max") {
-                    Ok(mv) => {
-                        ctx.refresh_calibration();
-                        ctx.sync_pedals(&w);
-                        ctx.notify(
-                            &w,
-                            "Pedals",
-                            &format!("{name} pressed point set"),
-                            &format!("{name} down (pressed) captured at {mv} mV."),
-                        );
-                    }
-                    Err(reason) => {
-                        ctx.notify(&w, "Pedals", &format!("Couldn't set {name} down"), &reason);
-                        eprintln!("RSH-UI pedal set down {key} failed: {reason}");
-                    }
+                // F6: the capture runs on a CaptureOp job thread.
+                if !ctx.is_live() {
+                    let reason = Ctx::capture_unavailable_reason();
+                    ctx.notify(&w, "Pedals", &format!("Couldn't set {name} down"), reason);
+                    eprintln!("RSH-UI pedal set down {key} failed: {reason}");
+                    return;
                 }
+                ctx.run_generic_job(
+                    &w,
+                    JobKind::CaptureOp,
+                    "Capturing…",
+                    move |api| JobResult::Capture(api.capture_pedal_max(key)),
+                    move |ctx, w, result| {
+                        let JobResult::Capture(result) = result else {
+                            return;
+                        };
+                        match result {
+                            Ok(mv) => {
+                                ctx.refresh_calibration();
+                                ctx.sync_pedals(w);
+                                ctx.notify(
+                                    w,
+                                    "Pedals",
+                                    &format!("{name} pressed point set"),
+                                    &format!("{name} down (pressed) captured at {mv} mV."),
+                                );
+                            }
+                            Err(e) => {
+                                ctx.notify(
+                                    w,
+                                    "Pedals",
+                                    &format!("Couldn't set {name} down"),
+                                    &e.title,
+                                );
+                                eprintln!("RSH-UI pedal set down {key} failed: {}", e.title);
+                            }
+                        }
+                    },
+                );
             }
         });
     }
@@ -4131,6 +5142,7 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
             // Knob edit (edit_kind == 1): persist the knob row's
             // action (M9) — the chip tap already staged it in
             // `knob_actions`; Save writes it to the daemon store.
+            // F6: `set_knob_action` runs on a BindingOp job thread.
             if ctx.edit_kind.get() == 1 {
                 let knob = ctx.edit_knob.get();
                 let row = ctx.knob_row.get();
@@ -4138,76 +5150,111 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                     [usize::try_from(row).unwrap_or(0)]
                 .clone();
                 let action = action_id(&display).unwrap_or("");
-                let saved = ctx.api().set_knob_action(
-                    u8::try_from(knob).unwrap_or(0),
-                    u8::try_from(row).unwrap_or(0),
-                    action,
+                let knob_u8 = u8::try_from(knob).unwrap_or(0);
+                let row_u8 = u8::try_from(row).unwrap_or(0);
+                let action = action.to_string();
+                ctx.run_generic_job(
+                    &w,
+                    JobKind::BindingOp,
+                    "Saving knob mapping…",
+                    move |api| JobResult::Unit(api.set_knob_action(knob_u8, row_u8, &action)),
+                    move |ctx, w, result| {
+                        let JobResult::Unit(result) = result else {
+                            return;
+                        };
+                        match result {
+                            Ok(()) => {
+                                ctx.unsaved
+                                    .set(ctx.api().draft_status().is_some_and(|s| s.dirty));
+                                ctx.load_knobs(w);
+                                ctx.notify(
+                                    w,
+                                    "Buttons",
+                                    "Knob mapping saved",
+                                    &format!("Knob {} → {display}.", knob + 1),
+                                );
+                            }
+                            Err(e) => {
+                                ctx.notify_error(w, "Buttons", &e);
+                                // Revert the staged choice to the stored one.
+                                ctx.load_knobs(w);
+                            }
+                        }
+                    },
                 );
-                match saved {
-                    Ok(()) => {
-                        ctx.unsaved
-                            .set(ctx.api().draft_status().is_some_and(|s| s.dirty));
-                        ctx.load_knobs(&w);
-                        ctx.notify(
-                            &w,
-                            "Buttons",
-                            "Knob mapping saved",
-                            &format!("Knob {} → {display}.", knob + 1),
-                        );
-                    }
-                    Err(e) => {
-                        ctx.notify_error(&w, "Buttons", &e);
-                        // Revert the staged choice to the stored one.
-                        ctx.load_knobs(&w);
-                    }
-                }
                 return;
             }
             // Button edit: persist the pending chip choice (H-3) —
             // "Not set" clears the binding, any other chip sets it.
             // The tile refreshes from the daemon immediately after.
+            // F6: `set_binding` / `clear_binding` run on a
+            // BindingOp job thread.
             if let Some(action) = ctx.pending_action.borrow().clone() {
                 let button = ctx.selected_button.get() + 1;
                 let button_u8 = u8::try_from(button).unwrap_or(0);
-                let saved = match action_id(&action) {
-                    Some(id) => ctx.api().set_binding(button_u8, id).map(|_| ()),
-                    None => ctx.api().clear_binding(button_u8).map(|_| ()),
-                };
-                match saved {
-                    Ok(()) => {
-                        *ctx.pending_action.borrow_mut() = None;
-                        ctx.unsaved
-                            .set(ctx.api().draft_status().is_some_and(|s| s.dirty));
-                        ctx.load_bindings(&w);
-                        ctx.notify(
-                            &w,
-                            "Buttons",
-                            "Button mapping saved",
-                            &format!("Button {button} → {action}."),
-                        );
-                    }
-                    Err(e) => {
-                        ctx.notify_error(&w, "Buttons", &e);
-                        // Revert the tile to the stored action.
-                        ctx.load_bindings(&w);
-                    }
-                }
+                let binding_id = action_id(&action);
+                ctx.run_generic_job(
+                    &w,
+                    JobKind::BindingOp,
+                    "Saving button mapping…",
+                    move |api| {
+                        JobResult::Unit(match binding_id {
+                            Some(id) => api.set_binding(button_u8, id).map(|_| ()),
+                            None => api.clear_binding(button_u8).map(|_| ()),
+                        })
+                    },
+                    move |ctx, w, result| {
+                        let JobResult::Unit(result) = result else {
+                            return;
+                        };
+                        match result {
+                            Ok(()) => {
+                                *ctx.pending_action.borrow_mut() = None;
+                                ctx.unsaved
+                                    .set(ctx.api().draft_status().is_some_and(|s| s.dirty));
+                                ctx.load_bindings(w);
+                                ctx.notify(
+                                    w,
+                                    "Buttons",
+                                    "Button mapping saved",
+                                    &format!("Button {button} → {action}."),
+                                );
+                            }
+                            Err(e) => {
+                                ctx.notify_error(w, "Buttons", &e);
+                                // Revert the tile to the stored action.
+                                ctx.load_bindings(w);
+                            }
+                        }
+                    },
+                );
                 return;
             }
-            match ctx.api().save_draft() {
-                Ok(true) => {
-                    ctx.unsaved.set(false);
-                    ctx.notify(&w, "Buttons", "Changes saved", "Button changes saved.");
-                    ctx.refresh(&w, 0);
-                }
-                Ok(false) => {
-                    ctx.notify(&w, "Buttons", "Nothing to save", "No changes to save.");
-                }
-                Err(e) => {
-                    ctx.notify_error(&w, "Buttons", &e);
-                    eprintln!("RSH-UI buttons edit-save failed: {} ({})", e.code, e.title);
-                }
-            }
+            // F6: `save_draft` runs on a ProfileOp job thread.
+            ctx.run_generic_job(
+                &w,
+                JobKind::ProfileOp,
+                "Saving changes…",
+                move |api| JobResult::Bool(api.save_draft()),
+                move |ctx, w, result| {
+                    let JobResult::Bool(result) = result else {
+                        return;
+                    };
+                    match result {
+                        Ok(true) => {
+                            ctx.unsaved.set(false);
+                            ctx.notify(w, "Buttons", "Changes saved", "Button changes saved.");
+                        }
+                        Ok(false) => {
+                            ctx.notify(w, "Buttons", "Nothing to save", "No changes to save.");
+                        }
+                        Err(e) => {
+                            ctx.notify_error(w, "Buttons", &e);
+                            eprintln!("RSH-UI buttons edit-save failed: {} ({})", e.code, e.title);
+                        }
+                    }
+                },
+            );
         });
     }
     {
@@ -4226,18 +5273,24 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                 .cloned()
                 .unwrap_or_else(|| "Not set".to_string());
             w.set_selected_action(action.into());
-            if ctx.api().discard_draft() {
-                ctx.unsaved.set(false);
-                ctx.notify(&w, "Buttons", "Changes discarded", "Changes discarded.");
-                ctx.refresh(&w, 0);
-            } else {
-                ctx.notify(
-                    &w,
-                    "Buttons",
-                    "Nothing to discard",
-                    "No changes to discard.",
-                );
-            }
+            // F6: `discard_draft` runs on a ProfileOp job thread.
+            ctx.run_generic_job(
+                &w,
+                JobKind::ProfileOp,
+                "Discarding changes…",
+                move |api| JobResult::Bool(Ok(api.discard_draft())),
+                move |ctx, w, result| {
+                    let JobResult::Bool(result) = result else {
+                        return;
+                    };
+                    if result.unwrap_or(false) {
+                        ctx.unsaved.set(false);
+                        ctx.notify(w, "Buttons", "Changes discarded", "Changes discarded.");
+                    } else {
+                        ctx.notify(w, "Buttons", "Nothing to discard", "No changes to discard.");
+                    }
+                },
+            );
         });
     }
 }
@@ -4276,55 +5329,95 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                     };
                     let old_state = ctx.module_states.borrow()[index];
                     let new_state = !old_state;
-                    match ctx.api().set_module_enabled(module, new_state) {
-                        Ok(enabled) => {
-                            ctx.module_states.borrow_mut()[index] = enabled;
-                            // FC2: confirm the prop with the
-                            // authoritative value (`sync_extras` in
-                            // refresh re-seeds it too).
-                            set_extras_on_prop(&w, index, enabled);
-                            ctx.refresh(&w, 0);
-                        }
-                        Err(e) => {
-                            // FC2: the .slint already flipped the
-                            // prop — flip it back so the switch
-                            // never lies about the real module state.
-                            set_extras_on_prop(&w, index, old_state);
-                            ctx.notify_error(&w, "Extras", &e);
-                        }
-                    }
+                    // F6: `set_module_enabled` runs on a SettingsOp
+                    // job thread — the toggle never blocks on the
+                    // daemon.
+                    ctx.run_generic_job(
+                        &w,
+                        JobKind::SettingsOp,
+                        "Saving…",
+                        move |api| JobResult::Bool(api.set_module_enabled(module, new_state)),
+                        move |ctx, w, result| {
+                            let JobResult::Bool(result) = result else {
+                                return;
+                            };
+                            match result {
+                                Ok(enabled) => {
+                                    ctx.module_states.borrow_mut()[index] = enabled;
+                                    // FC2: confirm the prop with the
+                                    // authoritative value (`sync_extras` in
+                                    // refresh re-seeds it too).
+                                    set_extras_on_prop(w, index, enabled);
+                                }
+                                Err(e) => {
+                                    // FC2: the .slint already flipped the
+                                    // prop — flip it back so the switch
+                                    // never lies about the real module state.
+                                    set_extras_on_prop(w, index, old_state);
+                                    ctx.notify_error(w, "Extras", &e);
+                                }
+                            }
+                        },
+                    );
                 }
                 "handbrake-up" | "handbrake-down" => {
                     // v2.0.2: capture the handbrake endpoint from
                     // the live raw reading (up = released, down =
-                    // fully pressed).
+                    // fully pressed). F6: the capture runs on a
+                    // CaptureOp job thread.
                     let endpoint = if a.as_str() == "handbrake-up" {
                         "min"
                     } else {
                         "max"
                     };
-                    match ctx.capture_pedal_ipc("handbrake", endpoint) {
-                        Ok(mv) => {
-                            ctx.refresh_calibration();
-                            ctx.sync_extras(&w);
-                            ctx.notify(
-                                &w,
-                                "Extras",
-                                "Handbrake set",
-                                &format!(
-                                    "Handbrake {} captured at {mv} mV.",
-                                    if endpoint == "min" {
-                                        "up (released)"
-                                    } else {
-                                        "down (pressed)"
+                    if ctx.is_live() {
+                        ctx.run_generic_job(
+                            &w,
+                            JobKind::CaptureOp,
+                            "Capturing…",
+                            move |api| {
+                                JobResult::Capture(if endpoint == "min" {
+                                    api.capture_pedal_min("handbrake")
+                                } else {
+                                    api.capture_pedal_max("handbrake")
+                                })
+                            },
+                            move |ctx, w, result| {
+                                let JobResult::Capture(result) = result else {
+                                    return;
+                                };
+                                match result {
+                                    Ok(mv) => {
+                                        ctx.refresh_calibration();
+                                        ctx.sync_extras(w);
+                                        ctx.notify(
+                                            w,
+                                            "Extras",
+                                            "Handbrake set",
+                                            &format!(
+                                                "Handbrake {} captured at {mv} mV.",
+                                                if endpoint == "min" {
+                                                    "up (released)"
+                                                } else {
+                                                    "down (pressed)"
+                                                }
+                                            ),
+                                        );
                                     }
-                                ),
-                            );
-                        }
-                        Err(reason) => {
-                            ctx.notify(&w, "Extras", "Couldn't set handbrake", &reason);
-                            eprintln!("RSH-UI extras handbrake capture failed: {reason}");
-                        }
+                                    Err(e) => {
+                                        ctx.notify(w, "Extras", "Couldn't set handbrake", &e.title);
+                                        eprintln!(
+                                            "RSH-UI extras handbrake capture failed: {}",
+                                            e.title
+                                        );
+                                    }
+                                }
+                            },
+                        );
+                    } else {
+                        let reason = Ctx::capture_unavailable_reason();
+                        ctx.notify(&w, "Extras", "Couldn't set handbrake", reason);
+                        eprintln!("RSH-UI extras handbrake capture failed: {reason}");
                     }
                 }
                 "horn-learn" => ctx.toggle_learn(&w, 2),
@@ -4675,28 +5768,46 @@ fn wire_reconnect(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// the live centre (v2.0.2). Launch game works off the real games
 /// list: running → Stop, installed → Launch, not installed → honest
 /// refusal.
+#[allow(clippy::too_many_lines)]
 fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_set_centre(move || {
             if let Some(w) = win.upgrade() {
-                // v2.0.2: capture the live centre over IPC.
-                match ctx.capture_centre_ipc() {
-                    Ok(mv) => {
-                        ctx.refresh_calibration();
-                        ctx.refresh(&w, 0);
-                        ctx.notify(
-                            &w,
-                            "Steering",
-                            "Centre set",
-                            &format!("Centre set at {mv} mV."),
-                        );
-                    }
-                    Err(reason) => {
-                        ctx.notify(&w, "Steering", "Couldn't set centre", &reason);
-                        eprintln!("RSH-UI set centre failed: {reason}");
-                    }
+                // v2.0.2: capture the live centre over IPC. F6: the
+                // capture runs on a CaptureOp job thread.
+                if ctx.is_live() {
+                    ctx.run_generic_job(
+                        &w,
+                        JobKind::CaptureOp,
+                        "Setting centre…",
+                        move |api| JobResult::Capture(api.capture_centre()),
+                        move |ctx, w, result| {
+                            let JobResult::Capture(result) = result else {
+                                return;
+                            };
+                            match result {
+                                Ok(mv) => {
+                                    ctx.refresh_calibration();
+                                    ctx.notify(
+                                        w,
+                                        "Steering",
+                                        "Centre set",
+                                        &format!("Centre set at {mv} mV."),
+                                    );
+                                }
+                                Err(e) => {
+                                    ctx.notify(w, "Steering", "Couldn't set centre", &e.title);
+                                    eprintln!("RSH-UI set centre failed: {}", e.title);
+                                }
+                            }
+                        },
+                    );
+                } else {
+                    let reason = Ctx::capture_unavailable_reason();
+                    ctx.notify(&w, "Steering", "Couldn't set centre", reason);
+                    eprintln!("RSH-UI set centre failed: {reason}");
                 }
             }
         });
@@ -4733,36 +5844,56 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                 );
                 return;
             }
-            let api = ctx.api();
-            let result = if game.running {
-                api.stop_game(&game.id)
-            } else {
-                api.launch_game(&game.id)
-            };
-            match result {
-                Ok(updated) => {
-                    ctx.refresh_games(&w);
-                    let body = if updated.running {
-                        format!("{} launched.", updated.name)
+            let game_id = game.id.clone();
+            let game_name = game.name.clone();
+            let running = game.running;
+            // F6: launch / stop runs on a GameOp job thread — the
+            // click never blocks on the daemon.
+            ctx.run_generic_job(
+                &w,
+                JobKind::GameOp,
+                if running {
+                    "Stopping game…"
+                } else {
+                    "Launching game…"
+                },
+                move |api| {
+                    JobResult::Game(if running {
+                        api.stop_game(&game_id).map(|g| g.running)
                     } else {
-                        format!("{} stopped.", updated.name)
+                        api.launch_game(&game_id).map(|g| g.running)
+                    })
+                },
+                move |ctx, w, result| {
+                    let JobResult::Game(result) = result else {
+                        return;
                     };
-                    ctx.notify(
-                        &w,
-                        "Game",
-                        if updated.running {
-                            "Game launched"
-                        } else {
-                            "Game stopped"
-                        },
-                        &body,
-                    );
-                }
-                Err(e) => {
-                    ctx.notify(&w, "Game", "Couldn't launch game", &e.title);
-                    eprintln!("RSH-UI launch-game failed: {} ({})", e.code, e.title);
-                }
-            }
+                    match result {
+                        Ok(is_running) => {
+                            ctx.refresh_games(w);
+                            let body = if is_running {
+                                format!("{game_name} launched.")
+                            } else {
+                                format!("{game_name} stopped.")
+                            };
+                            ctx.notify(
+                                w,
+                                "Game",
+                                if is_running {
+                                    "Game launched"
+                                } else {
+                                    "Game stopped"
+                                },
+                                &body,
+                            );
+                        }
+                        Err(e) => {
+                            ctx.notify(w, "Game", "Couldn't launch game", &e.title);
+                            eprintln!("RSH-UI launch-game failed: {} ({})", e.code, e.title);
+                        }
+                    }
+                },
+            );
         });
     }
 }
@@ -4960,26 +6091,38 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
                 return;
             };
             // A10: the passed bool is the new state — never ignored.
-            match ctx.api().set_autostart(enabled) {
-                Ok(new_state) => {
-                    w.set_autostart_enabled(new_state);
-                    ctx.notify(
-                        &w,
-                        "Startup",
-                        "Start with Windows",
-                        if new_state {
-                            "RSH will start with Windows."
-                        } else {
-                            "RSH will not start with Windows."
-                        },
-                    );
-                }
-                Err(e) => {
-                    w.set_autostart_enabled(!enabled);
-                    ctx.notify(&w, "Startup", "Autostart failed", &e.title);
-                    eprintln!("RSH-UI set_autostart failed: {} ({})", e.code, e.title);
-                }
-            }
+            // F6: `set_autostart` runs on a SettingsOp job thread.
+            ctx.run_generic_job(
+                &w,
+                JobKind::SettingsOp,
+                "Saving…",
+                move |api| JobResult::Bool(api.set_autostart(enabled)),
+                move |ctx, w, result| {
+                    let JobResult::Bool(result) = result else {
+                        return;
+                    };
+                    match result {
+                        Ok(new_state) => {
+                            w.set_autostart_enabled(new_state);
+                            ctx.notify(
+                                w,
+                                "Startup",
+                                "Start with Windows",
+                                if new_state {
+                                    "RSH will start with Windows."
+                                } else {
+                                    "RSH will not start with Windows."
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            w.set_autostart_enabled(!enabled);
+                            ctx.notify(w, "Startup", "Autostart failed", &e.title);
+                            eprintln!("RSH-UI set_autostart failed: {} ({})", e.code, e.title);
+                        }
+                    }
+                },
+            );
         });
     }
     {
@@ -5049,7 +6192,6 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
             let Some(w) = win.upgrade() else {
                 return;
             };
-            let api = ctx.api();
             match a.as_str() {
                 "pair" => settings_pair(&w, &ctx),
                 "address" => {
@@ -5100,27 +6242,54 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
                     "Auto-update is off",
                     "Auto-update is off — new versions are on GitHub Releases",
                 ),
-                "backup" => match api.backup_now() {
-                    Ok(path) => {
-                        // C3: the backup line updates after a backup.
-                        w.set_backup_text("Saved just now".into());
-                        ctx.notify(
-                            &w,
-                            "Backup",
-                            "Backup saved",
-                            &format!("Backup saved to {path}"),
-                        );
-                    }
-                    Err(e) => ctx.notify_error(&w, "Backup", &e),
-                },
-                "restore" => match api.restore_backup() {
-                    Ok(message) => {
-                        ctx.notify(&w, "Backup", "Backup restored", &message);
-                        ctx.refresh_profiles(&w);
-                        ctx.refresh(&w, 0);
-                    }
-                    Err(e) => ctx.notify_error(&w, "Backup", &e),
-                },
+                // F6: backup / restore run on a SettingsOp job
+                // thread — the click never blocks on the daemon.
+                "backup" => {
+                    ctx.run_generic_job(
+                        &w,
+                        JobKind::SettingsOp,
+                        "Saving backup…",
+                        move |api| JobResult::Text(api.backup_now()),
+                        move |ctx, w, result| {
+                            let JobResult::Text(result) = result else {
+                                return;
+                            };
+                            match result {
+                                Ok(path) => {
+                                    // C3: the backup line updates after a backup.
+                                    w.set_backup_text("Saved just now".into());
+                                    ctx.notify(
+                                        w,
+                                        "Backup",
+                                        "Backup saved",
+                                        &format!("Backup saved to {path}"),
+                                    );
+                                }
+                                Err(e) => ctx.notify_error(w, "Backup", &e),
+                            }
+                        },
+                    );
+                }
+                "restore" => {
+                    ctx.run_generic_job(
+                        &w,
+                        JobKind::SettingsOp,
+                        "Restoring backup…",
+                        move |api| JobResult::Text(api.restore_backup()),
+                        move |ctx, w, result| {
+                            let JobResult::Text(result) = result else {
+                                return;
+                            };
+                            match result {
+                                Ok(message) => {
+                                    ctx.notify(w, "Backup", "Backup restored", &message);
+                                    ctx.refresh_profiles(w);
+                                }
+                                Err(e) => ctx.notify_error(w, "Backup", &e),
+                            }
+                        },
+                    );
+                }
                 other => eprintln!("RSH-UI unknown settings-action: {other}"),
             }
         });
@@ -5160,20 +6329,31 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
             let Some(w) = win.upgrade() else {
                 return;
             };
-            match ctx.api().save_draft() {
-                Ok(true) => {
-                    ctx.unsaved.set(false);
-                    ctx.notify(&w, "Profile", "Changes saved", "Changes saved.");
-                }
-                Ok(false) => {
-                    ctx.notify(&w, "Profile", "Nothing to save", "No changes to save.");
-                }
-                Err(e) => {
-                    ctx.notify_error(&w, "Profile", &e);
-                    eprintln!("RSH-UI save-profile failed: {} ({})", e.code, e.title);
-                }
-            }
-            ctx.refresh(&w, 0);
+            // F6: `save_draft` runs on a ProfileOp job thread.
+            ctx.run_generic_job(
+                &w,
+                JobKind::ProfileOp,
+                "Saving changes…",
+                move |api| JobResult::Bool(api.save_draft()),
+                move |ctx, w, result| {
+                    let JobResult::Bool(result) = result else {
+                        return;
+                    };
+                    match result {
+                        Ok(true) => {
+                            ctx.unsaved.set(false);
+                            ctx.notify(w, "Profile", "Changes saved", "Changes saved.");
+                        }
+                        Ok(false) => {
+                            ctx.notify(w, "Profile", "Nothing to save", "No changes to save.");
+                        }
+                        Err(e) => {
+                            ctx.notify_error(w, "Profile", &e);
+                            eprintln!("RSH-UI save-profile failed: {} ({})", e.code, e.title);
+                        }
+                    }
+                },
+            );
         });
     }
     {
@@ -5184,14 +6364,26 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
             // (the trait's `set_output_enabled` is infallible `()`
             // — there is no failure to revert on at this level; the
             // daemon stores it in settings and applies it to the
-            // output path). The old code already called it; the bug
-            // was only the auto-pause toggle next to it.
+            // output path). F6: the persist runs on a SettingsOp
+            // job thread — the toggle never blocks on the daemon.
+            // `output_enabled()` is a cache read (F5).
+            let Some(w) = win.upgrade() else {
+                return;
+            };
             let next = !ctx.api().output_enabled();
-            ctx.api().set_output_enabled(next);
-            eprintln!("RSH-UI send-to-game={next}");
-            if let Some(w) = win.upgrade() {
-                w.set_send_to_game(next);
-            }
+            ctx.run_generic_job(
+                &w,
+                JobKind::SettingsOp,
+                "Updating output…",
+                move |api| {
+                    api.set_output_enabled(next);
+                    JobResult::Unit(Ok(()))
+                },
+                move |_ctx, w, _result| {
+                    eprintln!("RSH-UI send-to-game={next}");
+                    w.set_send_to_game(next);
+                },
+            );
         });
     }
     {
@@ -5201,28 +6393,40 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
             if let Some(w) = win.upgrade() {
                 // M6: auto-pause persists in settings and applies
                 // (the daemon stops auto-switching while paused) —
-                // never a local-only prop flip.
+                // never a local-only prop flip. F6: the persist runs
+                // on a SettingsOp job thread.
                 let next = !w.get_auto_paused();
-                match ctx.api().set_auto_pause(next) {
-                    Ok(stored) => {
-                        w.set_auto_paused(stored);
-                        ctx.notify(
-                            &w,
-                            "Profile",
-                            "Auto-switch",
-                            if stored {
-                                "Auto-switch paused — the active profile stays put."
-                            } else {
-                                "Auto-switch resumed."
-                            },
-                        );
-                        eprintln!("RSH-UI auto-profile paused={stored}");
-                    }
-                    Err(e) => {
-                        w.set_auto_paused(!next);
-                        ctx.notify_error(&w, "Profile", &e);
-                    }
-                }
+                ctx.run_generic_job(
+                    &w,
+                    JobKind::SettingsOp,
+                    "Saving…",
+                    move |api| JobResult::Bool(api.set_auto_pause(next)),
+                    move |ctx, w, result| {
+                        let JobResult::Bool(result) = result else {
+                            return;
+                        };
+                        match result {
+                            Ok(stored) => {
+                                w.set_auto_paused(stored);
+                                ctx.notify(
+                                    w,
+                                    "Profile",
+                                    "Auto-switch",
+                                    if stored {
+                                        "Auto-switch paused — the active profile stays put."
+                                    } else {
+                                        "Auto-switch resumed."
+                                    },
+                                );
+                                eprintln!("RSH-UI auto-profile paused={stored}");
+                            }
+                            Err(e) => {
+                                w.set_auto_paused(!next);
+                                ctx.notify_error(w, "Profile", &e);
+                            }
+                        }
+                    },
+                );
             }
         });
     }
@@ -5325,8 +6529,14 @@ fn handle_live_event(win: &slint::Weak<MainWindow>, ctx: &Ctx, ev: &AppEvent) {
     if pushed {
         // M10: daemon events persist like any other notification.
         ctx.persist_notifications();
+        // F27: same hidden-window guard as `Ctx::notify` — the
+        // model write is skipped while hidden (the entry is kept
+        // in the center + on disk; `resync_after_reopen` syncs it
+        // when the window comes back).
         if let Some(w) = win.upgrade() {
-            sync_to_window(&ctx.notifications.borrow(), &w);
+            if !ctx.hidden.load(Ordering::SeqCst) {
+                sync_to_window(&ctx.notifications.borrow(), &w);
+            }
         }
     }
 }
@@ -5350,8 +6560,72 @@ fn drain_health(
                     ctx.reconnect_to_live(&w, api);
                 }
             }
+            HealthEvent::DaemonFatal { code, detail } => {
+                if let Some(w) = win.upgrade() {
+                    ctx.mark_spawn_latched(&w, &code, &detail);
+                }
+            }
         }
     }
+}
+
+/// Publish a found live API into the shared slot (if still empty)
+/// and report `DaemonBack`; returns false only when the UI went
+/// away (the monitor thread exits then). A slot Reconnect filled
+/// first is not an error — the monitor just stands down.
+fn publish_daemon_back(
+    live_link: &Arc<Mutex<Option<Arc<IpcApi>>>>,
+    tx: &std::sync::mpsc::Sender<HealthEvent>,
+    api: Arc<IpcApi>,
+) -> bool {
+    let mut published = false;
+    if let Ok(mut slot) = live_link.lock() {
+        if slot.is_none() {
+            *slot = Some(api.clone());
+            published = true;
+        }
+    }
+    if published {
+        tx.send(HealthEvent::DaemonBack(api)).is_ok()
+    } else {
+        true
+    }
+}
+
+/// Report `DaemonDown` once per down-episode; returns false only
+/// when the UI went away.
+fn send_daemon_down_once(
+    tx: &std::sync::mpsc::Sender<HealthEvent>,
+    down_notified: &mut bool,
+) -> bool {
+    if *down_notified {
+        return true;
+    }
+    if tx.send(HealthEvent::DaemonDown).is_err() {
+        return false;
+    }
+    *down_notified = true;
+    true
+}
+
+/// Report `DaemonFatal` once per distinct reason; returns false
+/// only when the UI went away. A latched daemon must not spam the
+/// drawer once per poll.
+fn send_daemon_fatal_once(
+    tx: &std::sync::mpsc::Sender<HealthEvent>,
+    fatal_sent: &mut Option<String>,
+    code: String,
+    detail: String,
+) -> bool {
+    let reason = format!("{code}:{detail}");
+    if fatal_sent.as_deref() == Some(&reason) {
+        return true;
+    }
+    if tx.send(HealthEvent::DaemonFatal { code, detail }).is_err() {
+        return false;
+    }
+    *fatal_sent = Some(reason);
+    true
 }
 
 /// Spawn the health-monitor thread (B2/B4): ping the live daemon
@@ -5361,70 +6635,178 @@ fn drain_health(
 /// timer applies the verdicts on the UI thread — and it owns no
 /// `Rc` state, only the shared link. It exits when the UI drops
 /// the receiver (app quit).
+///
+/// F3 (v2.0.3): the respawn is bounded, not a loop —
+/// * death needs [`live_probe::PING_DEBOUNCE`] consecutive failed
+///   pings (~3 s), not one;
+/// * a fresh fatal `daemon-status.json` blocks spawning entirely
+///   (the daemon died on purpose — show it, don't re-run it);
+/// * spawn attempts back off exponentially (1 s → 5 s → 30 s →
+///   60 s cap) and stop after [`live_probe::MAX_FAILED_SPAWNS`]
+///   consecutive failures, latching the visible fatal state
+///   (`DaemonFatal`) with a manual Retry;
+/// * while the latch holds, the monitor only cheap-probes (the
+///   daemon may come back via a manual start) and never spawns.
+#[allow(clippy::too_many_lines)]
 fn spawn_health_monitor(
     data_dir: Option<PathBuf>,
     live_link: Arc<Mutex<Option<Arc<IpcApi>>>>,
     tx: std::sync::mpsc::Sender<HealthEvent>,
     hidden: Arc<AtomicBool>,
+    budget: Arc<live_probe::SpawnBudget>,
 ) {
     let _ = std::thread::Builder::new()
         .name("rsh-health".to_string())
         .spawn(move || {
             let mut down_notified = false;
+            let mut failed_pings = 0_u32;
+            let mut fatal_sent: Option<String> = None;
             loop {
                 let current = live_link
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
                 if let Some(api) = current {
-                    if !api.ping() {
-                        // Only clear the link when it still
-                        // holds the api that died — the user may
-                        // have reconnected while the ping was in
-                        // flight.
-                        if let Ok(mut slot) = live_link.lock() {
-                            if let Some(cur) = slot.as_ref() {
-                                if Arc::ptr_eq(cur, &api) {
-                                    *slot = None;
+                    if api.ping() {
+                        failed_pings = 0;
+                    } else {
+                        failed_pings += 1;
+                        if failed_pings >= live_probe::PING_DEBOUNCE {
+                            failed_pings = 0;
+                            // Only declare death when this api is
+                            // still the live one — Reconnect may have
+                            // swapped in a fresh link while these
+                            // pings were in flight, and a stale
+                            // `DaemonDown` would kill the new link.
+                            let mut still_current = false;
+                            if let Ok(mut slot) = live_link.lock() {
+                                if let Some(cur) = slot.as_ref() {
+                                    if Arc::ptr_eq(cur, &api) {
+                                        *slot = None;
+                                        still_current = true;
+                                    }
+                                }
+                            }
+                            if still_current {
+                                // F25: the link that just died is
+                                // charged against the budget when it
+                                // flapped (died within FLAP_WINDOW
+                                // of going live) — a flap daemon
+                                // must not respawn forever on
+                                // `record_success` resets. This is
+                                // the one place a death is counted,
+                                // so it can never double-count.
+                                budget.record_live_link_lost();
+                                if !send_daemon_down_once(&tx, &mut down_notified) {
+                                    return;
                                 }
                             }
                         }
-                        if !down_notified {
-                            if tx.send(HealthEvent::DaemonDown).is_err() {
-                                return;
-                            }
-                            down_notified = true;
-                        }
                     }
-                } else {
+                } else if let Some(api) = live_probe::try_live_api(data_dir.as_deref()) {
+                    // Cheap probe first (no spawn): the daemon may
+                    // have come back on its own, or via Reconnect.
+                    down_notified = false;
+                    fatal_sent = None;
+                    budget.record_success();
+                    if !publish_daemon_back(&live_link, &tx, api) {
+                        return;
+                    }
+                } else if hidden.load(Ordering::Relaxed) {
                     // H-1/A11: while the window is hidden to tray
                     // the monitor only probes for an EXISTING daemon
                     // — it must never spawn one, or a tray Quit
                     // (daemon gone on purpose) would resurrect it.
-                    let found = if hidden.load(Ordering::Relaxed) {
-                        live_probe::try_live_api(data_dir.as_deref())
-                    } else {
-                        live_probe::try_live_api_with_spawn(data_dir.as_deref())
-                    };
-                    if let Some(api) = found {
-                        // Only publish when the slot is still
-                        // empty — Reconnect may have beaten us.
-                        let mut published = false;
-                        if let Ok(mut slot) = live_link.lock() {
-                            if slot.is_none() {
-                                *slot = Some(api.clone());
-                                published = true;
-                            }
-                        }
+                    if !send_daemon_down_once(&tx, &mut down_notified) {
+                        return;
+                    }
+                } else if let Some((code, detail)) = live_probe::read_daemon_status_fresh(
+                    data_dir.as_deref(),
+                    live_probe::FATAL_FRESHNESS,
+                ) {
+                    // F3: a fresh fatal file means the daemon died
+                    // on purpose — spawning another one just re-runs
+                    // the death loop. Latch it and show the reason.
+                    if !send_daemon_fatal_once(&tx, &mut fatal_sent, code, detail) {
+                        return;
+                    }
+                    if !send_daemon_down_once(&tx, &mut down_notified) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                } else if budget.is_latched() {
+                    // F3: budget exhausted — latch, don't spawn. The
+                    // monitor keeps cheap-probing above: a manually
+                    // started daemon still comes back.
+                    if !send_daemon_fatal_once(
+                        &tx,
+                        &mut fatal_sent,
+                        "RespawnBudgetExhausted".to_string(),
+                        format!(
+                            "RSH keeps failing to start — automatic restarts stopped after {} tries. Use Reconnect to try again.",
+                            live_probe::MAX_FAILED_SPAWNS
+                        ),
+                    ) {
+                        return;
+                    }
+                    if !send_daemon_down_once(&tx, &mut down_notified) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                } else if !budget.auto_spawn_allowed() {
+                    // A manual retry is in flight (Reconnect click):
+                    // stay out of its way — no spawn, no fatal
+                    // event — until it resolves. The cheap probe
+                    // above already ran this cycle.
+                    if !send_daemon_down_once(&tx, &mut down_notified) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                } else {
+                    // F3: exponential backoff before the next spawn
+                    // attempt (1 s → 5 s → 30 s → 60 s cap).
+                    let delay = budget
+                        .next_delay()
+                        .unwrap_or(Duration::from_secs(60));
+                    std::thread::sleep(delay);
+                    // Re-check: Reconnect may have filled the slot
+                    // while we slept, or the daemon may have
+                    // appeared on its own.
+                    let current = live_link
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if current.is_some() {
+                        continue;
+                    }
+                    if let Some(api) = live_probe::try_live_api(data_dir.as_deref()) {
                         down_notified = false;
-                        if published && tx.send(HealthEvent::DaemonBack(api)).is_err() {
+                        fatal_sent = None;
+                        budget.record_success();
+                        if !publish_daemon_back(&live_link, &tx, api) {
                             return;
                         }
-                    } else if !down_notified {
-                        if tx.send(HealthEvent::DaemonDown).is_err() {
+                        continue;
+                    }
+                    // F4: the spawn itself is serialised inside
+                    // `try_live_api_with_spawn` (guard) — a Reconnect
+                    // attempt in flight means this probes only.
+                    if let Some(api) = live_probe::try_live_api_with_spawn(data_dir.as_deref())
+                    {
+                        down_notified = false;
+                        fatal_sent = None;
+                        budget.record_success();
+                        if !publish_daemon_back(&live_link, &tx, api) {
                             return;
                         }
-                        down_notified = true;
+                    } else {
+                        budget.record_spawn_failure();
+                        if !send_daemon_down_once(&tx, &mut down_notified) {
+                            return;
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_secs(1));
@@ -5439,9 +6821,19 @@ fn spawn_health_monitor(
 /// setup mode and selects that page.
 fn apply_page_request(win: &MainWindow, ctx: &Ctx, page: &str) {
     let _ = win.show();
+    // F27: the spinner restarts on the visible window (it was
+    // stopped by the close handler — see there).
+    win.set_window_hidden(false);
     #[cfg(windows)]
     ui_lifecycle::restore_and_foreground();
-    ctx.hidden.store(false, Ordering::SeqCst);
+    // F27: only a window that actually was hidden needs the
+    // reopen re-sync — a seed may have landed while it was hidden
+    // (state swapped, window writes skipped), and notifications
+    // pushed while hidden were never drawn.
+    let was_hidden = ctx.hidden.swap(false, Ordering::SeqCst);
+    if was_hidden {
+        ctx.resync_after_reopen(win);
+    }
     if page == "setup" {
         ctx.clear_setup_marker();
         ctx.learn_target.set(0);
@@ -5513,6 +6905,36 @@ fn start_frame_timer(
     timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
         let t = tick.get();
         tick.set(t + 1);
+        // F27: the `--quit-after` check runs every tick, hidden or
+        // not (the rig's dead/silent closes rely on the timer
+        // firing while hidden) — it is checked first so the hidden
+        // early-return below cannot skip it.
+        if let Some(secs) = quit_after {
+            if t0.elapsed() >= Duration::from_secs(secs) {
+                slint::quit_event_loop().ok();
+            }
+        }
+        // F27: while the window is hidden to tray, this tick writes
+        // NOTHING to the window except `drain_ui_lifecycle` (tray
+        // Quit + page requests — a page request SHOWS the window
+        // first, so its writes are safe). gdb proved the
+        // close-during-seed crash is a redraw racing the hide: the
+        // fault is in the `llvmpipe-3` render thread, not app code
+        // — while the seed fetch is in flight, live data changes a
+        // property on nearly every tick, scheduling a redraw on the
+        // just-hidden window, and the software renderer draws on
+        // the torn-down drawable (SIGSEGV ~0.2 s after the close,
+        // before the fetch completes — so the seed apply itself was
+        // never the crash site; the apply guards stay as
+        // defence-in-depth). Health verdicts, live events and job
+        // completions queue in their channels and drain on reopen,
+        // when the window is visible again.
+        if ctx.hidden.load(Ordering::SeqCst) {
+            if let Some(w) = win.upgrade() {
+                drain_ui_lifecycle(&w, &ctx);
+            }
+            return;
+        }
         // Health verdicts first: a death clears stale values, a
         // re-probe swaps live data in — both on the UI thread.
         drain_health(&health_rx, &win, &ctx);
@@ -5555,6 +6977,10 @@ fn start_frame_timer(
                 ctx.check_job_timeouts(&w);
                 ctx.check_connecting_timeout(&w);
                 ctx.poll_firmware_update(&w);
+                // F5: daemon-side slow changes (profiles, tunings,
+                // firmware, …) reach the pages within ~1 s, from
+                // the cache only — no UI-thread IPC.
+                ctx.resync_from_cache(&w);
                 if w.get_setup_pairing_active() && !w.get_setup_paired() {
                     let left = w.get_setup_pair_seconds_left();
                     match left {
@@ -5595,7 +7021,7 @@ fn start_frame_timer(
                     }
                     Ctx::sync_pair_ring(&w);
                 }
-                ctx.poll_learn(&w);
+                ctx.start_learn_poll_job(&w);
                 // vJoy install polling: until installed or failed.
                 if ctx.vjoy_polling.get() {
                     ctx.sync_vjoy(&w);
@@ -5632,11 +7058,6 @@ fn start_frame_timer(
                 if w.get_diag_open() {
                     ctx.sync_diag(&w);
                 }
-            }
-        }
-        if let Some(secs) = quit_after {
-            if t0.elapsed() >= Duration::from_secs(secs) {
-                slint::quit_event_loop().ok();
             }
         }
     });
@@ -5736,11 +7157,26 @@ fn main() -> Result<(), slint::PlatformError> {
         job_tx,
         job_rx: Rc::new(RefCell::new(job_rx)),
         busy_jobs: Rc::new(RefCell::new(HashMap::new())),
+        // F6: generic-job registry.
+        next_job_id: Rc::new(Cell::new(0)),
+        pending_applies: Rc::new(RefCell::new(HashMap::new())),
+        // F5: slow-cache generation the pages last re-synced from.
+        last_cache_generation: Rc::new(Cell::new(0)),
         // A9: the window starts in "Connecting…" — the clock starts
         // now, so a daemon that never answers is reported after 15 s
         // instead of leaving the Overview on "Connecting…" forever.
         connecting_since: Rc::new(Cell::new(Some(t0))),
         reconnect_in_flight: Rc::new(Cell::new(false)),
+        // F3/F12 (v2.0.3): respawn budget (shared with the health
+        // monitor), latch reason, flap tracking — all start empty.
+        spawn_budget: Arc::new(live_probe::SpawnBudget::new()),
+        spawn_latch: Rc::new(RefCell::new(None)),
+        last_dead_detail: Rc::new(RefCell::new(None)),
+        down_since: Rc::new(Cell::new(None)),
+        last_back_at: Rc::new(Cell::new(None)),
+        last_flap_at: Rc::new(Cell::new(None)),
+        flap_count: Rc::new(Cell::new(0)),
+        suppress_connected_notify: Rc::new(Cell::new(false)),
         firmware_check_cache: Rc::new(RefCell::new(None)),
         raw_available: Rc::new(Cell::new(false)),
         presets_count: Rc::new(Cell::new(0)),
@@ -5753,7 +7189,13 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // The health monitor owns the first probe (B4): it starts now,
     // on its own thread, while the window below opens.
-    spawn_health_monitor(data_dir.clone(), live_link, health_tx, ctx.hidden.clone());
+    spawn_health_monitor(
+        data_dir.clone(),
+        live_link,
+        health_tx,
+        ctx.hidden.clone(),
+        ctx.spawn_budget.clone(),
+    );
 
     let win = MainWindow::new()?;
     // H-1/A11: X hides to tray — the UI process stays alive (the
@@ -5764,9 +7206,18 @@ fn main() -> Result<(), slint::PlatformError> {
     // re-entrant).
     {
         let ctx_close = ctx.clone();
+        let win_close = win.as_weak();
         win.window().on_close_requested(move || {
             let to_tray = ctx_close.api().close_to_tray();
             ctx_close.hidden.store(true, Ordering::SeqCst);
+            // F27: stop the busy spinner BEFORE hiding — its
+            // 90 ms Timer would otherwise keep scheduling redraws
+            // on the hidden window, and the software renderer
+            // draws on the torn-down drawable (llvmpipe SIGSEGV
+            // under Xvfb). Cleared on show (`apply_page_request`).
+            if let Some(w) = win_close.upgrade() {
+                w.set_window_hidden(true);
+            }
             if !to_tray {
                 ctx_close.quit_requested.set(true);
             }
@@ -5776,10 +7227,12 @@ fn main() -> Result<(), slint::PlatformError> {
     // M-5/A1: listen for page forwards from second instances
     // (Windows named pipe; Linux uses the request file).
     ui_lifecycle::listen_for_page_requests(ctx.page_requests.clone());
-    // First-run wizard: --page setup, or no setup-done marker yet.
-    // A19: upgrade users see the wizard once (the marker is new) —
-    // kept on purpose now that the Drivers step is in it.
-    let setup = args.setup || !ctx.is_setup_done();
+    // First-run wizard: --page setup, or the marker says so (F23).
+    // Finished setups never re-show; skipped setups re-show once
+    // per new version; a pre-v2.0.3 bare "done" marker (Skip vs
+    // Finish unknowable) re-shows once so a skipped setup is not
+    // lost on an update install — the v2.0.2 report.
+    let setup = args.setup || ctx.setup_should_show();
     win.set_page(args.page);
     win.set_setup_mode(setup);
     win.set_setup_step(0);
@@ -5845,6 +7298,16 @@ fn main() -> Result<(), slint::PlatformError> {
         let ctx_static = ctx.clone();
         let health_timer = Timer::default();
         health_timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
+            // F27: same hidden-window guard as the frame timer —
+            // while hidden, only the lifecycle drain runs (tray
+            // Quit / page requests); health verdicts and job
+            // completions queue and drain on reopen.
+            if ctx_static.hidden.load(Ordering::SeqCst) {
+                if let Some(w) = win_weak.upgrade() {
+                    drain_ui_lifecycle(&w, &ctx_static);
+                }
+                return;
+            }
             drain_health(&health_rx, &win_weak, &ctx_static);
             if let Some(w) = win_weak.upgrade() {
                 drain_ui_lifecycle(&w, &ctx_static);
@@ -6246,8 +7709,21 @@ mod tests {
             job_tx,
             job_rx: Rc::new(RefCell::new(job_rx)),
             busy_jobs: Rc::new(RefCell::new(HashMap::new())),
+            // F6: generic-job registry.
+            next_job_id: Rc::new(Cell::new(0)),
+            pending_applies: Rc::new(RefCell::new(HashMap::new())),
+            // F5: slow-cache generation the pages last re-synced from.
+            last_cache_generation: Rc::new(Cell::new(0)),
             connecting_since: Rc::new(Cell::new(Some(Instant::now()))),
             reconnect_in_flight: Rc::new(Cell::new(false)),
+            spawn_budget: Arc::new(live_probe::SpawnBudget::new()),
+            spawn_latch: Rc::new(RefCell::new(None)),
+            last_dead_detail: Rc::new(RefCell::new(None)),
+            down_since: Rc::new(Cell::new(None)),
+            last_back_at: Rc::new(Cell::new(None)),
+            last_flap_at: Rc::new(Cell::new(None)),
+            flap_count: Rc::new(Cell::new(0)),
+            suppress_connected_notify: Rc::new(Cell::new(false)),
             firmware_check_cache: Rc::new(RefCell::new(None)),
             raw_available: Rc::new(Cell::new(false)),
             presets_count: Rc::new(Cell::new(0)),
@@ -6258,6 +7734,19 @@ mod tests {
             pending_field: Rc::new(RefCell::new(None)),
         });
         (ctx, dir)
+    }
+
+    /// Drain finished jobs until none is busy (up to ~3 s) — the
+    /// F6 handlers apply on the drain, so tests assert after this,
+    /// not right after the invoke.
+    fn drain_all_jobs(ctx: &Ctx, win: &MainWindow) {
+        for _ in 0..150 {
+            ctx.drain_jobs(win);
+            if ctx.busy_jobs.borrow().is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// FC2 end-to-end on a real `MainWindow` (needs a display — run
@@ -6340,6 +7829,9 @@ mod tests {
         win.invoke_pair_now_requested();
         assert!(win.get_setup_mode(), "pair-now opens the wizard");
         assert_eq!(win.get_setup_step(), 2, "wizard opens at Pair");
+        // F6: the pairing attempt is a job now — drain it so its
+        // failure notify lands before step 4 counts notifies.
+        drain_all_jobs(&ctx, &win);
 
         // 4. A bad address reverts the field + notifies once. The
         // live address is whatever `sync_overview` derives (the sim
@@ -6360,6 +7852,8 @@ mod tests {
         // instead of failing silently.
         let before = unread();
         win.invoke_address_accepted("192.168.4.1".into());
+        // F6: the persist is a job — drain before asserting.
+        drain_all_jobs(&ctx, &win);
         assert_eq!(unread(), before + 1, "unpersistable address notifies");
         assert_eq!(win.get_setup_address().as_str(), live_addr);
 
@@ -6367,6 +7861,8 @@ mod tests {
         win.set_keep_in_tray(true);
         let before = unread();
         win.invoke_keep_tray_selected(false);
+        // F6: the persist is a job — drain before asserting.
+        drain_all_jobs(&ctx, &win);
         assert!(
             win.get_keep_in_tray(),
             "failed persist reverts the switch to on"
@@ -6384,6 +7880,8 @@ mod tests {
         });
         let before = unread();
         win.invoke_popover_rename_confirmed(0, "FC2 Rename".into());
+        // F6: the rename is a job — drain before asserting.
+        drain_all_jobs(&ctx, &win);
         assert_eq!(unread(), before + 1, "rename failure notifies");
         let before = unread();
         win.invoke_popover_rename_confirmed(0, "   ".into());
@@ -6396,6 +7894,8 @@ mod tests {
         // set_module_enabled errors without a daemon).
         win.set_extras_handbrake_on(false); // the .slint flip
         win.invoke_extras_action("handbrake-toggle".into());
+        // F6: the toggle is a job — drain before asserting.
+        drain_all_jobs(&ctx, &win);
         assert!(
             win.get_extras_handbrake_on(),
             "failed toggle reverts the handbrake switch to on"
@@ -6407,6 +7907,387 @@ mod tests {
         assert!(win.get_extras_leds_on());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F6: a generic job shows the busy strip at once, runs its
+    /// work off the UI thread (a 2 s sleep must not block the
+    /// start), applies on the drain, and a duplicate kind is
+    /// ignored while one runs.
+    #[test]
+    fn generic_job_runs_off_thread_and_applies_on_drain() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("generic job test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let started_at = Instant::now();
+        let started = ctx.run_generic_job(
+            &win,
+            JobKind::SettingsOp,
+            "Slow test job…",
+            move |_api| {
+                std::thread::sleep(Duration::from_secs(2));
+                JobResult::Unit(Ok(()))
+            },
+            move |_ctx, _win, _result| {},
+        );
+        assert!(started, "generic job should start");
+        assert!(
+            started_at.elapsed() < Duration::from_secs(1),
+            "start must not block on the work"
+        );
+        assert!(win.get_busy(), "strip shows while the job runs");
+        assert_eq!(win.get_busy_label().as_str(), "Slow test job…");
+        assert!(
+            !ctx.run_generic_job(
+                &win,
+                JobKind::SettingsOp,
+                "Slow test job…",
+                move |_api| JobResult::Unit(Ok(())),
+                move |_ctx, _win, _result| {},
+            ),
+            "duplicate kind must be ignored while one runs"
+        );
+        drain_all_jobs(&ctx, &win);
+        assert!(!win.get_busy(), "strip hides when the job ends");
+        assert_eq!(win.get_busy_label().as_str(), "");
+        assert!(
+            started_at.elapsed() >= Duration::from_secs(2),
+            "the work really ran (2 s sleep)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F12/F5: a flap reconnect (down-episode < 10 s) stays silent
+    /// — no "RSH connected" notify — and the count survives; the
+    /// next non-flap reconnect folds "flapped ×1" into its notify
+    /// and resets the count.
+    #[test]
+    #[cfg(unix)]
+    fn flap_reconnect_suppresses_connected_notify_and_folds_on_stable() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F12 gate test skipped: no usable display/backend");
+            return;
+        };
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-f12-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let server = Arc::new(rsh_ipc::IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let live_api = IpcApi::connect(&sock).expect("connect");
+        let (ctx, ctx_dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+        let last_body = || {
+            ctx.notifications
+                .borrow()
+                .to_model_items()
+                .into_iter()
+                .next_back()
+                .map(|item| item.body.as_str().to_string())
+                .unwrap_or_default()
+        };
+
+        // Flap reconnect: down 5 s ago — silent, count kept.
+        ctx.state.borrow_mut().live = true;
+        ctx.down_since.set(Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .expect("5 s ago exists"),
+        ));
+        let before = unread();
+        ctx.swap_to_live(live_api.clone());
+        assert!(
+            ctx.suppress_connected_notify.get(),
+            "flap must arm suppression"
+        );
+        assert_eq!(ctx.flap_count.get(), 1, "flap must count");
+        ctx.apply_reconnect_seed(
+            &win,
+            live_api.clone(),
+            crate::ipc_api::LiveSeed::fetch(&live_api, ApiTransport::Wifi),
+        );
+        assert_eq!(unread(), before, "flap reconnect must not notify");
+        assert_eq!(
+            ctx.flap_count.get(),
+            1,
+            "count survives a suppressed reconnect"
+        );
+
+        // Stable reconnect: down 60 s ago — notifies with the fold,
+        // count resets.
+        ctx.down_since.set(Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("60 s ago exists"),
+        ));
+        let before = unread();
+        ctx.swap_to_live(live_api.clone());
+        assert!(
+            !ctx.suppress_connected_notify.get(),
+            "long episode must not suppress"
+        );
+        ctx.apply_reconnect_seed(
+            &win,
+            live_api.clone(),
+            crate::ipc_api::LiveSeed::fetch(&live_api, ApiTransport::Wifi),
+        );
+        assert_eq!(unread(), before + 1, "stable reconnect must notify once");
+        assert!(
+            last_body().contains("flapped ×1"),
+            "stable reconnect must fold the count in, got: {}",
+            last_body()
+        );
+        assert_eq!(ctx.flap_count.get(), 0, "count resets after folding");
+
+        // Teardown: `mark_dead` drops the live link (F7) so the
+        // server thread ends when the client goes away.
+        ctx.mark_dead(&win);
+        drop(live_api);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ctx_dir);
+    }
+
+    /// F26: a seed whose session `connect` failed with
+    /// `Unreachable` (no board — the expected disconnected state)
+    /// must not notify "Reconnect failed"; a real transport
+    /// failure still must. The flap-suppressed setup keeps the
+    /// "RSH connected" notify out of the count, so the only
+    /// notify under test is the Reconnect-failed one.
+    #[test]
+    #[cfg(unix)]
+    fn reconnect_seed_unreachable_stays_silent_but_transport_closed_notifies() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F26 gate test skipped: no usable display/backend");
+            return;
+        };
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-f26-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let server = Arc::new(rsh_ipc::IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let live_api = IpcApi::connect(&sock).expect("connect");
+        let (ctx, ctx_dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+        let last_title = || {
+            ctx.notifications
+                .borrow()
+                .to_model_items()
+                .into_iter()
+                .next_back()
+                .map(|item| item.title.as_str().to_string())
+                .unwrap_or_default()
+        };
+        let seed_with = |connect: Result<ConnectionInfo, UserError>| crate::ipc_api::LiveSeed {
+            backend: "vJoy".to_string(),
+            autostart: true,
+            connect,
+            pairing: PairingInfo {
+                seconds_left: 0,
+                password: None,
+                error: None,
+                error_detail: None,
+                board_mac: None,
+                replacement_required: false,
+                key_reset_armed: false,
+            },
+            connection_active: false,
+        };
+
+        // Flap setup: down 5 s ago — the "RSH connected" notify
+        // is suppressed, so only a Reconnect-failed notify could
+        // move the count.
+        ctx.state.borrow_mut().live = true;
+        ctx.down_since.set(Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .expect("5 s ago exists"),
+        ));
+        let before = unread();
+        ctx.swap_to_live(live_api.clone());
+        ctx.apply_reconnect_seed(
+            &win,
+            live_api.clone(),
+            seed_with(Err(UserError::from_connection(
+                ConnectionError::Unreachable,
+                "no board answered",
+            ))),
+        );
+        assert_eq!(
+            unread(),
+            before,
+            "a no-board reconnect must not notify 'Reconnect failed'"
+        );
+
+        ctx.apply_reconnect_seed(
+            &win,
+            live_api.clone(),
+            seed_with(Err(UserError::from_connection(
+                ConnectionError::TransportClosed,
+                "link dropped",
+            ))),
+        );
+        assert_eq!(
+            unread(),
+            before + 1,
+            "a real transport failure must notify once"
+        );
+        assert_eq!(last_title(), "Reconnect failed");
+
+        // Teardown: `mark_dead` drops the live link (F7) so the
+        // server thread ends when the client goes away.
+        ctx.mark_dead(&win);
+        drop(live_api);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ctx_dir);
+    }
+
+    /// F27: a reconnect seed that lands after the window was
+    /// hidden to tray must swap the live state but touch no window
+    /// prop and push no notification — the close-vs-seed-apply
+    /// race `SIGSEGV`ed under Xvfb (F17-FINDING-5). A generic job
+    /// that finishes while hidden must likewise never run its
+    /// apply. Reopening re-syncs the window
+    /// (`resync_after_reopen`): the live flag comes back and no
+    /// deferred notify fires twice.
+    #[test]
+    #[cfg(unix)]
+    fn seed_and_generic_job_landing_while_hidden_skip_the_window() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F27 gate test skipped: no usable display/backend");
+            return;
+        };
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-f27-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let server = Arc::new(rsh_ipc::IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let live_api = IpcApi::connect(&sock).expect("connect");
+        let (ctx, ctx_dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+
+        // Go live while visible, then hide (the close).
+        ctx.swap_to_live(live_api.clone());
+        assert!(!win.get_daemon_live(), "window starts not-live");
+        ctx.hidden.store(true, Ordering::SeqCst);
+        let before = unread();
+        ctx.apply_reconnect_seed(
+            &win,
+            live_api.clone(),
+            crate::ipc_api::LiveSeed::fetch(&live_api, ApiTransport::Wifi),
+        );
+        assert!(ctx.is_live(), "the state still swaps while hidden");
+        assert!(
+            !win.get_daemon_live(),
+            "no window write while hidden — the close-vs-apply race"
+        );
+        assert_eq!(unread(), before, "no notify while hidden");
+
+        // A generic job finishing while hidden never runs its apply.
+        let applied = std::rc::Rc::new(std::cell::Cell::new(false));
+        let applied_in_job = applied.clone();
+        assert!(
+            ctx.run_generic_job(
+                &win,
+                JobKind::SettingsOp,
+                "Hidden test job…",
+                move |_api| JobResult::Unit(Ok(())),
+                move |_ctx, _win, _result| {
+                    applied_in_job.set(true);
+                },
+            ),
+            "job should start"
+        );
+        drain_all_jobs(&ctx, &win);
+        assert!(
+            !applied.get(),
+            "a job that finished while hidden must not apply"
+        );
+
+        // Reopen: the live flag comes back, with no duplicate notify.
+        ctx.hidden.store(false, Ordering::SeqCst);
+        ctx.resync_after_reopen(&win);
+        assert!(
+            win.get_daemon_live(),
+            "reopen re-syncs the live flag the hidden apply skipped"
+        );
+        assert_eq!(unread(), before, "reopen must not re-notify");
+
+        // Teardown: `mark_dead` drops the live link (F7) so the
+        // server thread ends when the client goes away.
+        ctx.mark_dead(&win);
+        drop(live_api);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ctx_dir);
     }
 
     /// H-4 (FD): a flash whose daemon status goes idle mid-update
@@ -6477,6 +8358,305 @@ mod tests {
             unread() > before,
             "the ignored start must tell the user an update is already running"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_flap_down_episode_classifies_by_duration() {
+        assert!(is_flap_down_episode(Some(Duration::from_secs(5))));
+        assert!(is_flap_down_episode(Some(Duration::from_millis(1))));
+        assert!(!is_flap_down_episode(Some(Duration::from_secs(10))));
+        assert!(!is_flap_down_episode(Some(Duration::from_secs(60))));
+        assert!(!is_flap_down_episode(None), "first connect is not a flap");
+    }
+
+    /// F7: `mark_dead` swaps `state.api` back to a fresh `SimApi` —
+    /// the old handle is dropped, so a dead link's runtime + poller
+    /// die with it instead of spinning on a dead socket.
+    #[test]
+    fn mark_dead_swaps_api_back_to_sim() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F7 test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        ctx.state.borrow_mut().live = true;
+        let before = ctx.api();
+        ctx.mark_dead(&win);
+        assert!(!ctx.is_live(), "dead link must not stay live");
+        assert!(
+            ctx.state.borrow().live_api.is_none(),
+            "live link must be dropped"
+        );
+        assert!(
+            !Arc::ptr_eq(&ctx.api(), &before),
+            "the dead API handle must be replaced by a fresh SimApi"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3: the respawn latch shows its reason in the banner (there
+    /// is no fatal file behind a budget exhaustion) and notifies
+    /// once; the Reconnect button stays the manual Retry.
+    #[test]
+    fn mark_spawn_latched_shows_latch_reason_in_banner() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F3 latch test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+        // Already down (the normal flow: `DaemonDown` ran `mark_dead`
+        // first), so the latch itself notifies exactly once.
+        ctx.state.borrow_mut().live = false;
+        ctx.state.borrow_mut().connecting = false;
+        let reason = "RSH keeps failing to start — automatic restarts stopped after 5 tries. Use Reconnect to try again.";
+        let before = unread();
+        ctx.mark_spawn_latched(&win, "RespawnBudgetExhausted", reason);
+        assert_eq!(unread(), before + 1, "latch must notify exactly once");
+        assert_eq!(win.get_daemon_error().as_str(), reason);
+        assert!(
+            ctx.spawn_latch.borrow().is_some(),
+            "latch must be recorded until a live daemon clears it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3: a fatal-file reason `mark_dead` already showed is not
+    /// notified twice by the latch — the banner still carries it.
+    #[test]
+    fn mark_spawn_latched_does_not_repeat_fatal_reason() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F3 latch test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            r#"{"status":"fatal","code":"IpcBindFailed","detail":"daemon IPC bind failed after 5 attempts","pid":123,"at_unix":1}"#,
+        )
+        .expect("fatal status file");
+        let before = unread();
+        ctx.mark_spawn_latched(
+            &win,
+            "IpcBindFailed",
+            "daemon IPC bind failed after 5 attempts",
+        );
+        assert_eq!(
+            unread(),
+            before + 1,
+            "fatal detail must be notified once, by mark_dead, not again by the latch"
+        );
+        assert_eq!(
+            win.get_daemon_error().as_str(),
+            "RSH IPC bind failed after 5 attempts"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3: a `DaemonFatal` health event latches the banner through
+    /// the same drain the frame timer uses.
+    #[test]
+    fn drain_health_fatal_latches_banner() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F3 drain test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let (tx, rx) = std::sync::mpsc::channel::<HealthEvent>();
+        tx.send(HealthEvent::DaemonFatal {
+            code: "RespawnBudgetExhausted".to_string(),
+            detail: "RSH keeps failing to start — automatic restarts stopped.".to_string(),
+        })
+        .expect("send fatal");
+        drain_health(&rx, &win.as_weak(), &ctx);
+        assert_eq!(
+            win.get_daemon_error().as_str(),
+            "RSH keeps failing to start — automatic restarts stopped."
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F12: a burst of flap deaths collapses into the first entry —
+    /// the second death (seconds after a flap reconnect) stays
+    /// silent, and the next death after a stable stretch folds the
+    /// count ("flapped ×1") into its notification.
+    #[test]
+    fn flap_burst_collapses_repeated_deaths() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F12 test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+        let last_body = || {
+            ctx.notifications
+                .borrow()
+                .to_model_items()
+                .into_iter()
+                .next_back()
+                .map(|item| item.body.as_str().to_string())
+                .unwrap_or_default()
+        };
+
+        // Death 1: fresh entry.
+        ctx.state.borrow_mut().live = true;
+        let before = unread();
+        ctx.mark_dead(&win);
+        assert_eq!(unread(), before + 1, "first death notifies");
+
+        // Flap reconnect, then death 2 seconds later: silent.
+        ctx.state.borrow_mut().live = true;
+        ctx.flap_count.set(1);
+        ctx.last_back_at.set(Some(Instant::now()));
+        ctx.last_flap_at.set(Some(Instant::now()));
+        ctx.mark_dead(&win);
+        assert_eq!(unread(), before + 1, "burst death must stay silent");
+
+        // Stable stretch (60 s up), then death 3: notifies with the
+        // folded count, and the count resets.
+        ctx.state.borrow_mut().live = true;
+        ctx.last_back_at.set(Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("60 s ago exists"),
+        ));
+        ctx.mark_dead(&win);
+        assert_eq!(unread(), before + 2, "post-burst death notifies");
+        assert!(
+            last_body().contains("×1"),
+            "post-burst death must fold the flap count in, got: {}",
+            last_body()
+        );
+        assert_eq!(ctx.flap_count.get(), 0, "count resets after folding");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // F23: the v2.0.2 report — a user who skipped setup in v2.0.1
+    // never saw the wizard again after the update install, because
+    // Skip and Finish both wrote the bare word "done".
+    #[test]
+    fn f23_parse_setup_marker() {
+        assert_eq!(
+            parse_setup_marker("done 2.0.2\n"),
+            SetupMarker::Done("2.0.2".to_string())
+        );
+        assert_eq!(
+            parse_setup_marker("skipped 2.0.1"),
+            SetupMarker::Skipped("2.0.1".to_string())
+        );
+        // Pre-v2.0.3 bare marker: Skip vs Finish unknowable.
+        assert_eq!(parse_setup_marker("done\n"), SetupMarker::Legacy);
+        assert_eq!(parse_setup_marker("done"), SetupMarker::Legacy);
+        // Unreadable / corrupt content re-offers once, like legacy.
+        assert_eq!(parse_setup_marker(""), SetupMarker::Legacy);
+        assert_eq!(parse_setup_marker("garbage\n"), SetupMarker::Legacy);
+        assert_eq!(parse_setup_marker("done \n"), SetupMarker::Legacy);
+    }
+
+    #[test]
+    fn f23_should_show_decision_matrix() {
+        // Fresh profile → wizard shows.
+        assert!(setup_marker_should_show(&SetupMarker::Missing, "2.0.3"));
+        // Finished setup never re-shows, any version.
+        assert!(!setup_marker_should_show(
+            &SetupMarker::Done("2.0.2".to_string()),
+            "2.0.3"
+        ));
+        assert!(!setup_marker_should_show(
+            &SetupMarker::Done("2.0.3".to_string()),
+            "2.0.3"
+        ));
+        // Skipped setup re-shows once the version changes, and only
+        // then — same-version skip stays hidden.
+        assert!(setup_marker_should_show(
+            &SetupMarker::Skipped("2.0.2".to_string()),
+            "2.0.3"
+        ));
+        assert!(!setup_marker_should_show(
+            &SetupMarker::Skipped("2.0.3".to_string()),
+            "2.0.3"
+        ));
+        // Legacy bare "done" (the v2.0.2 report) re-shows once.
+        assert!(setup_marker_should_show(&SetupMarker::Legacy, "2.0.3"));
+    }
+
+    #[test]
+    fn f23_marker_round_trip_through_ctx() {
+        let (ctx, dir) = fc2_test_ctx();
+        let marker = dir.join("setup-done");
+        // Fresh profile → wizard shows.
+        assert!(ctx.setup_should_show(), "fresh profile must show wizard");
+        // Finish writes a versioned marker → never re-shows.
+        ctx.mark_setup_done();
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("marker written"),
+            format!("done {}\n", app_version())
+        );
+        assert!(!ctx.setup_should_show(), "finished setup must hide wizard");
+        // Reopen (A1) clears the marker → wizard shows again.
+        ctx.clear_setup_marker();
+        assert!(!marker.is_file(), "reopen must delete the marker");
+        assert!(ctx.setup_should_show(), "cleared marker must show wizard");
+        // Skip writes a versioned skipped marker → hidden on this
+        // version (the skip itself is not re-prompted immediately).
+        ctx.mark_setup_skipped();
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("marker written"),
+            format!("skipped {}\n", app_version())
+        );
+        assert!(
+            !ctx.setup_should_show(),
+            "same-version skip must hide wizard"
+        );
+        // The reported case: a v2.0.1 skip left a bare "done" file,
+        // and the v2.0.2 update install never showed the wizard.
+        // v2.0.3 treats that legacy marker as "show once".
+        std::fs::write(&marker, "done\n").expect("legacy marker");
+        assert_eq!(ctx.read_setup_marker(), SetupMarker::Legacy);
+        assert!(
+            ctx.setup_should_show(),
+            "legacy bare marker must show wizard once"
+        );
+        // And a skip recorded under an OLDER version re-offers on
+        // the current version (the update-install path).
+        std::fs::write(&marker, "skipped 2.0.1\n").expect("old skip marker");
+        assert!(
+            ctx.setup_should_show(),
+            "older-version skip must re-offer wizard on update"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f23_run_setup_again_reopens_wizard() {
+        // A1 reopen, end to end at the callback level: the Settings
+        // "Run setup" button fires `run-setup-again`, which must
+        // clear the marker and open the wizard at step 0 — even
+        // when the marker came from a v2.0.1 skip.
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F23 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let marker = dir.join("setup-done");
+        std::fs::write(&marker, "done\n").expect("legacy marker");
+        assert!(
+            ctx.setup_should_show(),
+            "legacy marker must show wizard on next launch"
+        );
+        win.set_setup_mode(false);
+        win.invoke_run_setup_again();
+        assert!(win.get_setup_mode(), "reopen must open the wizard");
+        assert_eq!(win.get_setup_step(), 0, "reopen starts at step 0");
+        assert!(!marker.is_file(), "reopen must delete the marker");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

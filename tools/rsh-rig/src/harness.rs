@@ -1228,6 +1228,18 @@ pub fn run_contract(scenario: &Scenario) -> Metrics {
         "gate-bindings-ui" => crate::gate_checks::gate_bindings_ui(),
         "gate-ota-flash-caller" => crate::gate_checks::gate_ota_flash_caller(),
         "gate-version-bump" => crate::gate_checks::gate_version_bump(),
+        // v2.0.3 lifecycle checks (F17): real daemon/UI processes
+        // under Xvfb — the checks the v2.0.2 gate was missing.
+        "gate-respawn-bound" => crate::lifecycle_checks::gate_respawn_bound(),
+        "gate-ipc-bind-failure" => crate::lifecycle_checks::gate_ipc_bind_failure(),
+        "gate-hung-daemon" => crate::lifecycle_checks::gate_hung_daemon(),
+        "gate-already-running-race" => crate::lifecycle_checks::gate_already_running_race(),
+        "gate-xvfb-hidden-shown" => crate::lifecycle_checks::gate_xvfb_hidden_shown(),
+        "gate-rapid-reconnect" => crate::lifecycle_checks::gate_rapid_reconnect(),
+        "gate-frame-budget" => crate::lifecycle_checks::gate_frame_budget(),
+        "gate-toast-dedupe-integration" => crate::lifecycle_checks::gate_toast_dedupe_integration(),
+        "gate-lifecycle-soak" => crate::lifecycle_checks::gate_lifecycle_soak(),
+        "gate-tray-popup-timeline" => crate::lifecycle_checks::gate_tray_popup_timeline(),
         _ => (
             false,
             format!("no self-check defined for {id}", id = scenario.id),

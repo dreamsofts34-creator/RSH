@@ -54,7 +54,11 @@ impl BindErrorKind {
     pub const fn hint(self) -> &'static str {
         match self {
             Self::AddrInUse => {
-                "Another app is using the wheel port — close the other RSH or wait, then retry."
+                // F21: name the port and the prime suspect (the legacy
+                // Tauri v1.0.2 app, installed exe `RSH.exe`, binds
+                // the same port at launch) — "close the other RSH"
+                // alone never told the user WHICH app to close.
+                "Another app is using the wheel port (UDP 4211) — close the old RSH app (RSH.exe) or any other RSH, then press Retry."
             }
             Self::PermissionDenied => {
                 "Binding the wheel port was denied — run RSH normally (no admin needed) and retry."
@@ -99,6 +103,12 @@ pub enum ConnectionError {
     AlreadyPaired,
     /// The board is unpaired, so there is no stored key to resume with.
     BoardUnpaired,
+    /// The board authenticated but then stopped streaming frames:
+    /// the heartbeat watchdog rebuilt the transport
+    /// [`MAX_WATCHDOG_REBUILDS`](crate::connection::MAX_WATCHDOG_REBUILDS)
+    /// times with no frame seen and latched (F20, v2.0.3). Not a
+    /// pairing problem — the fix is the user's Retry, not re-pairing.
+    WatchdogStall,
     /// Anything else (detail string carried separately, never a secret).
     Unknown,
 }
@@ -120,8 +130,39 @@ impl ConnectionError {
             Self::BindFailed(kind) => kind.code(),
             Self::AlreadyPaired => "AlreadyPaired",
             Self::BoardUnpaired => "BoardUnpaired",
+            Self::WatchdogStall => "WatchdogStall",
             Self::Unknown => "Unknown",
         }
+    }
+
+    /// Parse a [`ConnectionError::code`] back into the typed error
+    /// (F26): the daemon's IPC error carries only the code string,
+    /// so the UI recovers the kind from it instead of collapsing
+    /// every failure into `TransportClosed`. `None` for codes this
+    /// type never produces (feature codes, typos). `BindFailed`
+    /// codes are the [`BindErrorKind`] codes (`AddrInUse`,
+    /// `PermissionDenied`, `NoInterface`, `BindFailed`).
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "Unreachable" => Self::Unreachable,
+            "WindowClosed" => Self::WindowClosed,
+            "WindowExpired" => Self::WindowExpired,
+            "NoStoredKey" => Self::NoStoredKey,
+            "StoredKeyExists" => Self::StoredKeyExists,
+            "BadTag" => Self::BadTag,
+            "Timeout" => Self::Timeout,
+            "TransportClosed" => Self::TransportClosed,
+            "AddrInUse" => Self::BindFailed(BindErrorKind::AddrInUse),
+            "PermissionDenied" => Self::BindFailed(BindErrorKind::PermissionDenied),
+            "NoInterface" => Self::BindFailed(BindErrorKind::NoInterface),
+            "BindFailed" => Self::BindFailed(BindErrorKind::Other),
+            "AlreadyPaired" => Self::AlreadyPaired,
+            "BoardUnpaired" => Self::BoardUnpaired,
+            "WatchdogStall" => Self::WatchdogStall,
+            "Unknown" => Self::Unknown,
+            _ => return None,
+        })
     }
 
     /// One-line "what to do" for the UI.
@@ -147,6 +188,9 @@ impl ConnectionError {
             Self::BindFailed(kind) => kind.hint(),
             Self::AlreadyPaired => "Wheel is already paired — no need to pair again.",
             Self::BoardUnpaired => "Wheel is not paired yet — pair it first.",
+            Self::WatchdogStall => {
+                "The wheel connected but stopped sending data — rebuilding did not help. Check the wheel, then press Retry."
+            }
             Self::Unknown => "Something went wrong — retry, then check the diagnostics log.",
         }
     }
@@ -219,10 +263,52 @@ impl UserError {
                 ConnectionError::BindFailed(_) => "The wheel port could not be opened.".to_string(),
                 ConnectionError::AlreadyPaired => "The wheel is already paired.".to_string(),
                 ConnectionError::BoardUnpaired => "The wheel is not paired yet.".to_string(),
+                ConnectionError::WatchdogStall => {
+                    "The wheel connected but stopped sending data.".to_string()
+                }
                 ConnectionError::Unknown => "Something went wrong.".to_string(),
             },
             what_to_do: error.hint().to_string(),
             detail: Some(detail.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_error_code_round_trips_through_from_code() {
+        // F26: every code `code()` produces must parse back to the
+        // same error — the UI recovers the kind from the daemon's
+        // bare code string over IPC.
+        for error in [
+            ConnectionError::Unreachable,
+            ConnectionError::WindowClosed,
+            ConnectionError::WindowExpired,
+            ConnectionError::NoStoredKey,
+            ConnectionError::StoredKeyExists,
+            ConnectionError::BadTag,
+            ConnectionError::Timeout,
+            ConnectionError::TransportClosed,
+            ConnectionError::BindFailed(BindErrorKind::AddrInUse),
+            ConnectionError::BindFailed(BindErrorKind::PermissionDenied),
+            ConnectionError::BindFailed(BindErrorKind::NoInterface),
+            ConnectionError::BindFailed(BindErrorKind::Other),
+            ConnectionError::AlreadyPaired,
+            ConnectionError::BoardUnpaired,
+            ConnectionError::WatchdogStall,
+            ConnectionError::Unknown,
+        ] {
+            assert_eq!(
+                ConnectionError::from_code(error.code()),
+                Some(error),
+                "code {} must round-trip",
+                error.code()
+            );
+        }
+        assert_eq!(ConnectionError::from_code("NoSuchCode"), None);
+        assert_eq!(ConnectionError::from_code(""), None);
     }
 }

@@ -351,19 +351,66 @@ fn ensure_single_instance_unix(data_dir: Option<&PathBuf>, page: &str) -> Instan
         return InstanceRole::First(InstanceGuard::with_dir(None));
     };
     let pid_path = dir.join("rsh-ui.pid");
-    if let Ok(text) = std::fs::read_to_string(&pid_path) {
-        if let Ok(pid) = text.trim().parse::<u32>() {
-            if pid != std::process::id() && pid_is_live_rsh_ui(pid) {
-                // Second instance: forward the page and exit — never
-                // a duplicate window.
-                let _ = std::fs::write(dir.join("show-ui.request"), format!("{page}\n"));
-                return InstanceRole::Second;
+    // F17 (v2.0.3): the pid claim is `O_EXCL` create — the old
+    // check-then-`fs::write` (truncate) let two UIs launched at
+    // once both become First (duplicate windows). Same shape as
+    // the daemon's `single_instance::claim_pid_file`: exactly one
+    // caller wins the claim; a loser re-reads (a live winner
+    // forwards the page, a stale file is removed and the claim
+    // retried, bounded).
+    for _ in 0..16 {
+        if pid_file_names_live_ui(&pid_path) {
+            // Second instance: forward the page and exit — never
+            // a duplicate window.
+            let _ = std::fs::write(dir.join("show-ui.request"), format!("{page}\n"));
+            return InstanceRole::Second;
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pid_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                let _ = writeln!(file, "{}", std::process::id());
+                return InstanceRole::First(InstanceGuard::with_dir(Some(dir.clone())));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Lost the claim race. The winner may still be
+                // writing its pid: give it a moment, then re-check
+                // before removing anything — removing a live
+                // winner's file would let two UIs both be First.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                if pid_file_names_live_ui(&pid_path) {
+                    let _ = std::fs::write(dir.join("show-ui.request"), format!("{page}\n"));
+                    return InstanceRole::Second;
+                }
+                let _ = std::fs::remove_file(&pid_path);
+            }
+            Err(_) => {
+                // Cannot determine single-instance state: open the
+                // window anyway (a duplicate is better than no UI).
+                return InstanceRole::First(InstanceGuard::with_dir(Some(dir.clone())));
             }
         }
     }
-    // First instance (or a stale pid file): claim it.
-    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+    // The claim race never settled: open the window anyway (a
+    // duplicate is better than no UI).
     InstanceRole::First(InstanceGuard::with_dir(Some(dir.clone())))
+}
+
+/// Whether the pid file names a live `rsh-ui` process other than
+/// this one (edition 2021: no let-chains, so nested `if let`s).
+#[cfg(not(windows))]
+fn pid_file_names_live_ui(pid_path: &std::path::Path) -> bool {
+    if let Ok(text) = std::fs::read_to_string(pid_path) {
+        if let Ok(pid) = text.trim().parse::<u32>() {
+            if pid != std::process::id() && pid_is_live_rsh_ui(pid) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Consume a pending page request (Linux request file; Windows uses
@@ -414,6 +461,7 @@ pub fn take_quit_request(data_dir: Option<&PathBuf>) -> bool {
 #[cfg(not(windows))]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_dir() -> PathBuf {
@@ -444,11 +492,13 @@ mod tests {
     #[test]
     fn second_instance_forwards_and_first_claims() {
         let dir = tmp_dir();
-        // A live process whose cmdline names rsh-ui (daemon test
-        // pattern: `exec -a` renames argv[0] without running the
-        // real UI).
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "exec -a rsh-ui sleep 30"])
+        // A live process whose cmdline names rsh-ui (argv[0] set
+        // directly — no shell: `sh` here is dash, which has no
+        // `exec -a`, so the old `sh -c "exec -a ..."` form died
+        // instantly and the pid was reclaimed as First).
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .arg0("rsh-ui")
             .spawn()
             .expect("spawn fake rsh-ui");
         let pid = child.id();

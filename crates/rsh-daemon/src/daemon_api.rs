@@ -9,6 +9,7 @@
 //! the session gate is open (C-02).
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rsh_api::connection::ConnectionState as MgrState;
 use rsh_api::errors::{ConnectionError, UserError};
@@ -22,6 +23,16 @@ use rsh_app_core::snapshot::{ConnectionState as CoreState, EngineSnapshot};
 use rsh_app_core::state::{
     AppStateCore, GameInfo, ProfileSummary as CoreProfileSummary, TransportKind, TransportState,
 };
+
+/// Feed window for the F20 watchdog frame feed (see
+/// [`DaemonApi::watchdog_tick`]): a stream frame counts as
+/// "flowing now" when the core saw one within this long — two
+/// manager-loop ticks (250 ms each). Frames normally arrive every
+/// few ms, so a live board refreshes the manager's clock on every
+/// tick; a board streaming slower than ~2 Hz is already effectively
+/// stalled and the watchdog should fire. Worst-case detection
+/// latency is ~2.5 s instead of the nominal 2 s.
+const FRAME_FEED_WINDOW: Duration = Duration::from_millis(500);
 
 /// The daemon's API handle: shared by the IPC server, the tray
 /// callbacks, and the manager loop.
@@ -82,7 +93,30 @@ impl DaemonApi {
     }
 
     /// Run the heartbeat watchdog tick; returns the action.
+    ///
+    /// F20: the tick first feeds real frame freshness into the
+    /// manager (below) — without the feed the watchdog fired 2 s
+    /// after every `CapsOk`, healthy session included, because
+    /// `FrameSeen` was never fed by production code.
     pub fn watchdog_tick(&self) -> rsh_api::ManagerAction {
+        // F20: feed the core's stream-frame clock into the manager.
+        // The forwarder stamps `note_stream_frame()` on every
+        // stream frame (`state.rs`) and the core exposes it as
+        // `seconds_since_last_stream_frame()` — whose docs always
+        // said "the daemon's Connection Manager calls this on its
+        // watchdog tick" — but nothing ever called it, so the
+        // manager's `last_frame_at` was stamped only by `CapsOk`
+        // and the watchdog rebuilt the transport ~4 s after every
+        // activation, forever, even on a healthy board. A frame
+        // inside the feed window refreshes the manager's clock; an
+        // older (or absent) frame leaves the manager to fire on its
+        // own clock, and the F20 cap in `check_watchdog` latches
+        // after 5 frameless rebuilds instead of looping forever.
+        if let Some(since) = self.state.seconds_since_last_stream_frame()
+            && since < FRAME_FEED_WINDOW.as_secs_f64()
+        {
+            let _ = self.manager_event(ConnEvent::FrameSeen);
+        }
         self.manager
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -945,5 +979,37 @@ mod tests {
         assert_eq!(polled.snapshot.steering_deg, 0.0);
         // A second poll is identical while nothing moves.
         assert_eq!(api.poll(), polled);
+    }
+
+    #[test]
+    fn watchdog_tick_feeds_live_frames_and_fires_when_stale() {
+        // F20: the manager reaches Active, a frame is stamped just
+        // now — the tick must NOT rebuild (pre-fix it rebuilt 2 s
+        // after every CapsOk, frames or not, because nothing ever
+        // fed FrameSeen). Then the frame goes stale (>2 s, no new
+        // frame) — the same tick must rebuild, proving the feed
+        // expires instead of masking a dead board forever.
+        let (api, _dir) = live_api_named("watchdog-feed");
+        api.manager_event(ConnEvent::Connect);
+        api.manager_event(ConnEvent::HelloReceived {
+            unpaired: false,
+            window_open: false,
+        });
+        api.manager_event(ConnEvent::Authenticating);
+        api.manager_event(ConnEvent::CapsOk);
+        assert!(api.manager_state().is_active());
+        api.state.note_stream_frame();
+        assert_eq!(
+            api.watchdog_tick(),
+            rsh_api::ManagerAction::None,
+            "a live frame must suppress the watchdog"
+        );
+        assert!(api.manager_state().is_active());
+        std::thread::sleep(Duration::from_millis(2100));
+        assert_eq!(
+            api.watchdog_tick(),
+            rsh_api::ManagerAction::RebuildTransport,
+            "a frame 2.1 s old must not feed the watchdog"
+        );
     }
 }

@@ -41,6 +41,7 @@ use crate::metrics::Metrics;
 
 mod gate_checks;
 mod harness;
+mod lifecycle_checks;
 mod metrics;
 mod ota_checks;
 mod rng;

@@ -201,6 +201,7 @@ use rsh_security::keystore::{KeyStore, KeystoreError};
 use rsh_transport::ControlTransport;
 use rsh_transport::config::{ConfigState, ConfigTransaction, ConfigTxnSnapshot};
 use rsh_transport::discovery::{DEFAULT_BOARD_IP, Discovery};
+use rsh_transport::port_conflict::diagnose_udp_port_holder;
 use rsh_transport::serial::{SerialConfig, SerialTransport, detect_board_port};
 use rsh_transport::session::{BoardSession, KeyStoreLike, SessionError};
 use rsh_transport::udp::{UdpBindError, UdpConfig, UdpTransport};
@@ -7116,6 +7117,7 @@ fn spawn_forwarder(
                     match UdpTransport::bind_typed(config) {
                         Ok(transport) => Some(transport),
                         Err(bind_error) => {
+                            let is_addr_in_use = matches!(bind_error, UdpBindError::AddrInUse);
                             let kind = match bind_error {
                                 UdpBindError::AddrInUse => rsh_api::BindErrorKind::AddrInUse,
                                 UdpBindError::PermissionDenied => {
@@ -7124,13 +7126,45 @@ fn spawn_forwarder(
                                 UdpBindError::NoInterface => rsh_api::BindErrorKind::NoInterface,
                                 UdpBindError::Other(_) => rsh_api::BindErrorKind::Other,
                             };
+                            // F21: name the holder. A port conflict
+                            // is a fact about another process, not a
+                            // transient error — the diagnosis goes
+                            // into the recorded reason so the log and
+                            // the engine status say WHO holds UDP
+                            // 4211 (usually the still-running legacy
+                            // Tauri app, `RSH.exe`).
+                            let holder_detail = if is_addr_in_use {
+                                diagnose_udp_port_holder(config.local_port)
+                                    .map(|holder| {
+                                        if holder.is_legacy_rsh_app() {
+                                            format!(
+                                                " — port held by the old RSH app: {}",
+                                                holder.describe()
+                                            )
+                                        } else if holder.is_current_rsh() {
+                                            format!(
+                                                " — port held by another RSH process: {}",
+                                                holder.describe()
+                                            )
+                                        } else {
+                                            format!(" — port held by {}", holder.describe())
+                                        }
+                                    })
+                                    .unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
                             state_for_bind.note_engine_transport_error(
                                 TransportKind::Udp,
-                                &format!("UDP bind failed: {} — {}", kind.code(), kind.hint()),
+                                &format!(
+                                    "UDP bind failed: {} — {}{holder_detail}",
+                                    kind.code(),
+                                    kind.hint()
+                                ),
                             );
                             state_for_bind.note_session_error_typed(
                                 ConnectionError::BindFailed(kind),
-                                &format!("UDP bind failed: {}", kind.code()),
+                                &format!("UDP bind failed: {}{holder_detail}", kind.code()),
                             );
                             None
                         }
@@ -7402,6 +7436,34 @@ async fn forward_with_retry_with_policy<T, F>(
     let mut bad_tag_retried = false;
     loop {
         let Some(transport) = factory() else {
+            // F21: a UDP port conflict never self-heals — the holder
+            // must be closed by the user. Do not burn the M-11
+            // backoff (10 retries, ~3 min) on it: stop this
+            // forwarder run now; the user reconnects after closing
+            // the other app. Scoped to UDP: the typed error is set
+            // by the UDP factory above on every bind failure, so
+            // within a UDP run it is fresh (a serial run never
+            // sets it and never takes this branch). Other open
+            // failures keep the backoff + breaker — a board reboot
+            // or Wi-Fi flap CAN heal, a port holder cannot.
+            if kind == TransportKind::Udp
+                && matches!(
+                    state.session_last_error_typed(),
+                    Some(ConnectionError::BindFailed(
+                        rsh_api::BindErrorKind::AddrInUse
+                    ))
+                )
+            {
+                state.set_connection(ConnectionState::Disconnected);
+                state.set_engine_status(
+                    EngineTaskStatus::Running { transport: None },
+                    "wheel port (UDP 4211) is held by another app — close the other RSH, then reconnect (no automatic retry)".to_string(),
+                );
+                state.note_engine_detail(
+                    "transport udp port conflict (AddrInUse, UDP 4211) — forwarder stopped, no bind retry; user reconnect required after closing the holder".to_string(),
+                );
+                return;
+            }
             state.note_engine_transport_error(kind, "transport could not be opened");
             if !forwarder_retry_after_failure(
                 &state,
@@ -7636,7 +7698,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::time::Duration;
 
     use rsh_engine::encoder::EncoderButtons;
@@ -10754,6 +10816,56 @@ mod tests {
         assert!(
             state.engine_status_detail().contains("circuit breaker"),
             "breaker named in the status: {}",
+            state.engine_status_detail()
+        );
+    }
+
+    /// F21: a UDP port conflict stops the forwarder immediately —
+    /// no backoff retries. The holder can only be closed by the
+    /// user, so the M-11 retry loop would just re-log the same
+    /// failure (user log: 117× `AddrInUse` over ~35 min). The
+    /// policy here would allow 3 attempts; the run must make
+    /// exactly one and name the port in the status.
+    #[tokio::test]
+    async fn forwarder_stops_immediately_on_addr_in_use() {
+        let (state, _dir) = test_state();
+        let (frame_tx, _frame_rx) = tokio::sync::mpsc::channel(8);
+        let (status_tx, _status_rx) = tokio::sync::mpsc::channel(8);
+        let policy = ForwarderRetryPolicy {
+            base: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            max_consecutive_failures: 3,
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let state_for_factory = Arc::clone(&state);
+        let attempts_for_factory = Arc::clone(&attempts);
+        let run = forward_with_retry_with_policy(
+            Arc::clone(&state),
+            TransportKind::Udp,
+            frame_tx,
+            status_tx,
+            move || {
+                attempts_for_factory.fetch_add(1, Ordering::SeqCst);
+                state_for_factory.note_session_error_typed(
+                    ConnectionError::BindFailed(rsh_api::BindErrorKind::AddrInUse),
+                    "UDP bind failed: AddrInUse",
+                );
+                Option::<FakeSessionTransport>::None
+            },
+            policy,
+        );
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("port-conflict forwarder must stop promptly, not retry");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "exactly one bind attempt — no backoff retries on a port conflict"
+        );
+        assert_eq!(state.transport_state().state, ConnectionState::Disconnected);
+        assert!(
+            state.engine_status_detail().contains("4211"),
+            "status names the port: {}",
             state.engine_status_detail()
         );
     }
