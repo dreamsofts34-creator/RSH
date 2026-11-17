@@ -53,6 +53,16 @@ impl IpcServer {
         let mut lines = BufReader::new(reader).lines();
         let mut subscribed = false;
         let mut event_rx = self.events.subscribe();
+        // B-1 (v2.0.2): responses from blocking handlers travel on
+        // their own channel. Dispatch runs on `spawn_blocking`
+        // (below), so one slow handler — a backend switch waiting
+        // out a UAC prompt, a pairing attempt — never stalls this
+        // connection's event forwarding or its next request. The
+        // channel is bounded (64): `blocking_send` in the handler
+        // task applies backpressure instead of piling up responses
+        // for a client that stopped reading. Responses can arrive
+        // out of order; the client matches them by `id`.
+        let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<String>(64);
         loop {
             tokio::select! {
                 line = lines.next_line() => {
@@ -62,25 +72,55 @@ impl IpcServer {
                     if line.trim().is_empty() {
                         continue;
                     }
-                    let response = self.handle_line(&line);
-                    if let Ok(resp) = &response
-                        && let Some(result) = &resp.result
-                        && result
-                            .get("subscribed")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false)
+                    // Cheap parse here (no I/O, never blocks): the
+                    // subscribe flag is set on request, since the
+                    // response now arrives asynchronously.
+                    if parse_request(&line)
+                        .is_ok_and(|request| request.method == "subscribe")
                     {
                         subscribed = true;
                     }
-                    match response.and_then(|r| encode_response(&r)) {
-                        Ok(text) => {
-                            if writer.write_all(text.as_bytes()).await.is_err()
-                                || writer.write_all(b"\n").await.is_err()
-                            {
-                                break;
+                    let server = Arc::clone(&self);
+                    let tx = resp_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let text = match server.handle_line(&line) {
+                            Ok(resp) => encode_response(&resp).ok(),
+                            Err(error) => {
+                                // Unparseable request: answer with a
+                                // Protocol error instead of dropping
+                                // the connection silently.
+                                let id = serde_json::from_str::<serde_json::Value>(&line)
+                                    .ok()
+                                    .and_then(|value| {
+                                        value.get("id").and_then(serde_json::Value::as_u64)
+                                    })
+                                    .unwrap_or(0);
+                                encode_response(&IpcResponse {
+                                    v: IPC_PROTOCOL_VERSION,
+                                    id,
+                                    ok: false,
+                                    result: None,
+                                    error: Some(IpcErrorBody {
+                                        code: "Protocol".to_string(),
+                                        message: error.to_string(),
+                                    }),
+                                })
+                                .ok()
                             }
+                        };
+                        if let Some(text) = text {
+                            let _ = tx.blocking_send(text);
                         }
-                        Err(_) => break,
+                    });
+                }
+                resp = resp_rx.recv() => {
+                    let Some(text) = resp else {
+                        break; // all handler tasks are gone
+                    };
+                    if writer.write_all(text.as_bytes()).await.is_err()
+                        || writer.write_all(b"\n").await.is_err()
+                    {
+                        break;
                     }
                 }
                 event = event_rx.recv(), if subscribed => {
@@ -229,8 +269,9 @@ mod tests {
     use super::*;
     use rsh_api::connection::ConnectionState;
     use rsh_api::{
-        ApiTransport, CalibrationInfo, ConnectionInfo, DiagStats, DraftStatus, PairingInfo,
-        SnapshotInfo, TuningSettings, UserError, VjoyStatus, validate_tuning,
+        ApiTransport, ButtonBinding, CalibrationInfo, ConnectionError, ConnectionInfo, DiagStats,
+        DraftStatus, PairingInfo, RawMv, SnapshotInfo, TuningSettings, UserError, VjoyStatus,
+        validate_tuning,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
@@ -241,6 +282,7 @@ mod tests {
         output: Mutex<bool>,
         tunings: Mutex<BTreeMap<String, TuningSettings>>,
         dirty: Mutex<BTreeSet<String>>,
+        bindings: Mutex<BTreeMap<u8, String>>,
     }
 
     impl StubApi {
@@ -280,6 +322,7 @@ mod tests {
                 error_detail: None,
                 board_mac: None,
                 replacement_required: false,
+                key_reset_armed: false,
             }
         }
         fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
@@ -400,6 +443,89 @@ mod tests {
                 tx_fail: 3,
             })
         }
+
+        // v2.0.2 capture: canned values so the dispatch round-trip
+        // tests prove the wire shape (the real daemon overrides
+        // these with the live reading).
+        fn raw_mv(&self) -> Result<RawMv, UserError> {
+            Ok(RawMv {
+                steering_mv: Some(1812),
+                accel_mv: Some(320),
+                brake_mv: Some(300),
+                clutch_mv: None,
+                handbrake_mv: Some(250),
+                age_ms: Some(5),
+            })
+        }
+
+        fn capture_centre(&self) -> Result<u16, UserError> {
+            Ok(1812)
+        }
+
+        fn capture_pedal_min(&self, pedal: &str) -> Result<u16, UserError> {
+            match pedal {
+                "accel" => Ok(320),
+                _ => Err(UserError::from_connection(
+                    ConnectionError::Unknown,
+                    format!("unknown pedal '{pedal}' (want accel, brake, clutch, or handbrake)"),
+                )),
+            }
+        }
+
+        fn capture_pedal_max(&self, pedal: &str) -> Result<u16, UserError> {
+            match pedal {
+                "accel" => Ok(3200),
+                _ => Err(UserError::from_connection(
+                    ConnectionError::Unknown,
+                    format!("unknown pedal '{pedal}' (want accel, brake, clutch, or handbrake)"),
+                )),
+            }
+        }
+
+        // v2.0.2 bindings: an in-memory map with the same button
+        // range the real store enforces, so the dispatch round-trip
+        // tests prove the wire shape and the error path.
+        fn list_bindings(&self) -> Vec<ButtonBinding> {
+            self.bindings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(&button, action)| ButtonBinding {
+                    button,
+                    action: action.clone(),
+                })
+                .collect()
+        }
+
+        fn set_binding(&self, button: u8, action: &str) -> Result<ButtonBinding, UserError> {
+            if !((1..=32).contains(&button) || (65..=72).contains(&button)) {
+                return Err(UserError {
+                    code: "InvalidButton".to_string(),
+                    title: "Button cannot be bound".to_string(),
+                    what_happened: format!("button {button} cannot be bound"),
+                    what_to_do: "Bind a physical button (1-32) or an encoder button (65-72)."
+                        .to_string(),
+                    detail: Some(format!("button {button} cannot be bound")),
+                });
+            }
+            self.bindings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(button, action.to_string());
+            Ok(ButtonBinding {
+                button,
+                action: action.to_string(),
+            })
+        }
+
+        fn clear_binding(&self, button: u8) -> Result<bool, UserError> {
+            Ok(self
+                .bindings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&button)
+                .is_some())
+        }
     }
 
     fn stub_server() -> Arc<IpcServer> {
@@ -408,6 +534,7 @@ mod tests {
             output: Mutex::new(false),
             tunings: Mutex::new(BTreeMap::new()),
             dirty: Mutex::new(BTreeSet::new()),
+            bindings: Mutex::new(BTreeMap::new()),
         });
         let (tx, _rx) = broadcast::channel(64);
         Arc::new(IpcServer::new(api, tx))
@@ -713,5 +840,144 @@ mod tests {
         assert_eq!(got.get("lossPct"), Some(&serde_json::json!(0.5)));
         assert_eq!(got.get("seqGap"), Some(&serde_json::json!(7)));
         assert_eq!(got.get("txFail"), Some(&serde_json::json!(3)));
+    }
+
+    #[test]
+    fn capture_methods_round_trip_through_dispatch() {
+        let server = stub_server();
+        // raw_mv: camelCase wire shape, absent slots omitted.
+        let resp = server
+            .handle_line(r#"{"v":1,"id":40,"method":"raw_mv","params":{}}"#)
+            .expect("raw_mv parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        let got = resp.result.expect("result");
+        assert_eq!(got.get("steeringMv"), Some(&serde_json::json!(1812)));
+        assert_eq!(got.get("accelMv"), Some(&serde_json::json!(320)));
+        assert_eq!(got.get("clutchMv"), None, "absent slot is omitted");
+        assert_eq!(got.get("ageMs"), Some(&serde_json::json!(5)));
+        // capture_centre: the captured mV comes back.
+        let resp = server
+            .handle_line(r#"{"v":1,"id":41,"method":"capture_centre","params":{}}"#)
+            .expect("capture_centre parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(
+            resp.result.expect("result").get("mv"),
+            Some(&serde_json::json!(1812))
+        );
+        // capture_pedal_min/max: pedal param in, captured mV out.
+        let resp = server
+            .handle_line(
+                r#"{"v":1,"id":42,"method":"capture_pedal_min","params":{"pedal":"accel"}}"#,
+            )
+            .expect("capture_pedal_min parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(
+            resp.result.expect("result").get("mv"),
+            Some(&serde_json::json!(320))
+        );
+        let resp = server
+            .handle_line(
+                r#"{"v":1,"id":43,"method":"capture_pedal_max","params":{"pedal":"accel"}}"#,
+            )
+            .expect("capture_pedal_max parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(
+            resp.result.expect("result").get("mv"),
+            Some(&serde_json::json!(3200))
+        );
+        // An unknown pedal fails — and the error keeps the reason
+        // (`code|detail`), not a bare "Unknown".
+        let resp = server
+            .handle_line(
+                r#"{"v":1,"id":44,"method":"capture_pedal_min","params":{"pedal":"gear"}}"#,
+            )
+            .expect("capture_pedal_min parses");
+        assert!(!resp.ok, "resp: {resp:?}");
+        let error = resp.error.expect("error body");
+        assert!(
+            error.code.contains("unknown pedal 'gear'"),
+            "error code must carry the reason: {}",
+            error.code
+        );
+        assert!(error.message.contains("unknown pedal 'gear'"));
+    }
+
+    #[test]
+    fn binding_methods_round_trip_through_dispatch() {
+        let server = stub_server();
+        // list_bindings starts empty.
+        let resp = server
+            .handle_line(r#"{"v":1,"id":50,"method":"list_bindings","params":{}}"#)
+            .expect("list_bindings parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(
+            resp.result.expect("result").get("bindings"),
+            Some(&serde_json::json!([]))
+        );
+        // set_binding: button + action in, the stored binding out.
+        let resp = server
+            .handle_line(
+                r#"{"v":1,"id":51,"method":"set_binding","params":{"button":5,"action":"horn"}}"#,
+            )
+            .expect("set_binding parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(
+            resp.result.expect("result").get("binding"),
+            Some(&serde_json::json!({"button": 5, "action": "horn"}))
+        );
+        // list_bindings now shows it (camelCase wire shape).
+        let resp = server
+            .handle_line(r#"{"v":1,"id":52,"method":"list_bindings","params":{}}"#)
+            .expect("list_bindings parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(
+            resp.result.expect("result").get("bindings"),
+            Some(&serde_json::json!([{"button": 5, "action": "horn"}]))
+        );
+        // clear_binding: true when bound, false when absent.
+        let resp = server
+            .handle_line(r#"{"v":1,"id":53,"method":"clear_binding","params":{"button":5}}"#)
+            .expect("clear_binding parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(
+            resp.result.expect("result").get("cleared"),
+            Some(&serde_json::json!(true))
+        );
+        let resp = server
+            .handle_line(r#"{"v":1,"id":54,"method":"clear_binding","params":{"button":5}}"#)
+            .expect("clear_binding parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(
+            resp.result.expect("result").get("cleared"),
+            Some(&serde_json::json!(false))
+        );
+        // An out-of-range button fails — and the error keeps the
+        // reason (`code|detail`), not a bare "Unknown".
+        let resp = server
+            .handle_line(
+                r#"{"v":1,"id":55,"method":"set_binding","params":{"button":33,"action":"horn"}}"#,
+            )
+            .expect("set_binding parses");
+        assert!(!resp.ok, "resp: {resp:?}");
+        let error = resp.error.expect("error body");
+        assert!(
+            error.code.contains("InvalidButton"),
+            "error code must carry the reason: {}",
+            error.code
+        );
+        assert!(error.message.contains("button 33 cannot be bound"));
+        // A missing button param fails the same way, never silently
+        // binds button 0.
+        let resp = server
+            .handle_line(r#"{"v":1,"id":56,"method":"set_binding","params":{"action":"horn"}}"#)
+            .expect("set_binding parses");
+        assert!(!resp.ok, "resp: {resp:?}");
+        assert!(
+            resp.error
+                .expect("error body")
+                .code
+                .contains("InvalidButton"),
+            "missing button must fail as InvalidButton"
+        );
     }
 }

@@ -74,8 +74,21 @@ pub fn try_live_api(data_dir: Option<&Path>) -> Option<Arc<IpcApi>> {
 /// so no console flashes) with the same `--data-dir` when one was
 /// given, then retry the probe up to 20 × 500 ms (~10 s). Returns
 /// the live API, or `None` when the daemon never answered.
+///
+/// A9 (v2.0.2): this is SLOW (up to ~10 s of sleeps + probes) — it
+/// must never run on the UI thread. Callers on the UI thread use
+/// [`try_live_api_with_spawn_n`] on a background thread instead.
 #[must_use]
 pub fn try_live_api_with_spawn(data_dir: Option<&Path>) -> Option<Arc<IpcApi>> {
+    try_live_api_with_spawn_n(data_dir, 20)
+}
+
+/// [`try_live_api_with_spawn`] with a bounded retry count (A9): the
+/// UI's Reconnect path uses a short budget (6 retries ≈ 3 s) on its
+/// background thread, so a dead daemon resolves fast; the health
+/// monitor keeps the full 20-retry budget on its own thread.
+#[must_use]
+pub fn try_live_api_with_spawn_n(data_dir: Option<&Path>, retries: usize) -> Option<Arc<IpcApi>> {
     if let Some(api) = try_live_api(data_dir) {
         eprintln!("RSH-UI daemon already running (live data)");
         return Some(api);
@@ -124,7 +137,7 @@ pub fn try_live_api_with_spawn(data_dir: Option<&Path>) -> Option<Arc<IpcApi>> {
             return None;
         }
     }
-    for _ in 0..20 {
+    for _ in 0..retries {
         std::thread::sleep(Duration::from_millis(500));
         if let Some(api) = try_live_api(data_dir) {
             eprintln!("RSH-UI daemon answered after spawn (live data)");
@@ -133,6 +146,39 @@ pub fn try_live_api_with_spawn(data_dir: Option<&Path>) -> Option<Arc<IpcApi>> {
     }
     eprintln!("RSH-UI daemon did not answer within ~10 s of spawn");
     None
+}
+
+/// Read the daemon's fatal status file (`<data_dir>/daemon-status.json`,
+/// item 27 / M-2): the daemon writes it when it dies fatally
+/// (`{"status": "fatal", "code": "IpcBindFailed"|"DaemonHung",
+/// "detail": "...", ...}`) and clears it on a healthy start, so a
+/// present fatal file IS the last known reason the daemon is down.
+/// Returns `(code, detail)` only for `status == "fatal"` — any other
+/// shape (missing file, healthy status, unparseable bytes) is `None`,
+/// and the UI falls back to its generic "not running" message. The
+/// detail is the daemon's own words, already plain — the UI shows it
+/// verbatim, never a raw error.
+///
+/// Read at startup (probe failed), in `mark_dead`, and on Reconnect
+/// failure — never on the hot path (it is a file read per call).
+#[must_use]
+pub fn read_daemon_status(data_dir: Option<&Path>) -> Option<(String, String)> {
+    let dir = resolve_data_dir(data_dir)?;
+    let text = std::fs::read_to_string(dir.join("daemon-status.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if value.get("status").and_then(serde_json::Value::as_str) != Some("fatal") {
+        return None;
+    }
+    let code = value
+        .get("code")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let detail = value
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some((code, detail))
 }
 
 #[cfg(test)]
@@ -162,6 +208,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         assert!(try_live_api(Some(&dir)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_daemon_status_returns_fatal_code_and_detail() {
+        let dir = std::env::temp_dir().join(format!("rsh-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            r#"{"status":"fatal","code":"IpcBindFailed","detail":"daemon IPC bind failed after 5 attempts","pid":123,"at_unix":1}"#,
+        )
+        .expect("status file");
+        assert_eq!(
+            read_daemon_status(Some(&dir)),
+            Some((
+                "IpcBindFailed".to_string(),
+                "daemon IPC bind failed after 5 attempts".to_string()
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_daemon_status_ignores_missing_and_non_fatal() {
+        let dir = std::env::temp_dir().join(format!("rsh-status-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert_eq!(read_daemon_status(Some(&dir)), None);
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            r#"{"status":"ok","code":"","detail":""}"#,
+        )
+        .expect("status file");
+        assert_eq!(read_daemon_status(Some(&dir)), None);
+        std::fs::write(dir.join("daemon-status.json"), "not json at all").expect("status file");
+        assert_eq!(read_daemon_status(Some(&dir)), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

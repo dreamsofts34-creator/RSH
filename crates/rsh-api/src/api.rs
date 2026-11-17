@@ -91,6 +91,11 @@ pub struct PairingInfo {
     /// True when the board already has a stored key and re-pairing
     /// needs explicit user confirmation.
     pub replacement_required: bool,
+    /// True when the board was booted with BOOT held (`KEY_RESET`
+    /// armed): a pairing reset now rotates the board key instead of
+    /// only clearing the PC-side state (B5).
+    #[serde(default)]
+    pub key_reset_armed: bool,
 }
 
 /// A live snapshot value (steering / pedals), pushed at ~30 Hz only
@@ -106,6 +111,80 @@ pub struct SnapshotInfo {
     /// Clutch 0.0–1.0, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clutch: Option<f64>,
+    /// Live button bitmask (H10, v2.0.2): bit `n - 1` is wheel
+    /// button `n` (buttons 1–64, combined low + extended mask).
+    /// `0` = no button pressed (or no live data).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub button_mask: u64,
+    /// Handbrake position 0.0–1.0 (M-3, v2.0.2): the pipeline's
+    /// handbrake axis. `0.0` = released (or no live data).
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub handbrake: f64,
+    /// Decoded H-pattern gear (M-3, v2.0.2): `0` = neutral, `1..=6`
+    /// = gear. `0` in sequential mode or with no live data.
+    #[serde(default)]
+    pub gear: u8,
+}
+
+/// `skip_serializing_if` for `button_mask`: serde requires the
+/// `&u64` signature (the reference is part of serde's API), so the
+/// trivially-copy lint is silenced here on purpose.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// `skip_serializing_if` for `handbrake`: same serde signature rule
+/// as [`is_zero_u64`].
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// Firmware update check (H3, v2.0.2): the board's live version
+/// against the bundled OTA image's version (parsed from the signed
+/// image's `Version` marker — no signature check here; the OTA flow
+/// verifies the signature before flashing).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FirmwareCheck {
+    /// Board firmware version, or `"Unknown"` when no live session.
+    pub board_version: String,
+    /// Version parsed from the bundled OTA image, when one is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundled_version: Option<String>,
+    /// True when a bundled image exists and is newer than the board.
+    pub update_available: bool,
+}
+
+/// Status of a firmware flash started by [`AppApi::update_firmware`]
+/// (H-4, v2.0.2). The flash runs on a daemon background thread (it
+/// takes minutes: upload + board restart + confirm), so the UI starts
+/// it once and polls [`AppApi::firmware_update_status`] for progress —
+/// the IPC call itself never blocks on the flash.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FirmwareUpdateStatus {
+    /// True while the flash thread is running.
+    pub running: bool,
+    /// Current stage (`"validating"` / `"uploading"` /
+    /// `"waitingForRestart"` / `"confirming"`), while running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// Upload percent (0..100) while uploading, `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<u8>,
+    /// True once the flash finished (success or failure — see
+    /// `success` / `error`). False while running or never started.
+    pub done: bool,
+    /// True only when the board confirmed the new version.
+    pub success: bool,
+    /// The confirmed new firmware version, on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The failure reason, on a finished failure (plain words).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A profile list-row, as the API reports it (v2.0.1 hotfix).
@@ -166,6 +245,51 @@ pub struct CalibrationInfo {
     /// "not yet", never a fake date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibrated_at: Option<String>,
+}
+
+/// Latest raw ADC readings in mV, as the API reports them (v2.0.2).
+/// One field per axis slot (protocol §1.3: 0 steering, 1 accel,
+/// 2 brake, 3 clutch, 4 handbrake). [`None`] = that slot was absent
+/// from the latest frame, or no frame has arrived yet — never a
+/// fake 0. `age_ms` is the age of the sample ([`None`] = no sample
+/// ever seen); a capture refuses a stale sample instead of saving
+/// it, so the UI must never treat an old reading as live.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawMv {
+    /// Steering raw mV (axis slot 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering_mv: Option<u16>,
+    /// Accelerator raw mV (axis slot 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accel_mv: Option<u16>,
+    /// Brake raw mV (axis slot 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brake_mv: Option<u16>,
+    /// Clutch raw mV (axis slot 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clutch_mv: Option<u16>,
+    /// Handbrake raw mV (axis slot 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handbrake_mv: Option<u16>,
+    /// Age of the sample in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+}
+
+/// One persisted button→action binding, as the API reports it
+/// (v2.0.2). `button` is a physical wheel button (1–32) or an
+/// encoder virtual button (65–72); `action` is a game input
+/// (`horn`, `shifter_up`, `shifter_down`, `gear_1`…`gear_6`,
+/// `handbrake`) or an app action (`profile_next`,
+/// `profile_previous`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ButtonBinding {
+    /// Wheel button number.
+    pub button: u8,
+    /// Action id.
+    pub action: String,
 }
 
 /// vJoy driver status, as the API reports it (v2.0.1 hotfix
@@ -320,6 +444,22 @@ pub trait AppApi: Send + Sync {
     /// [`UserError`] when no transport can be started.
     fn begin_pairing(&self) -> Result<PairingInfo, UserError>;
 
+    /// Reset pairing state (B5, v2.0.2): forget the PC-side pairing
+    /// (close the session gate, clear stored HELLO / key records) so
+    /// the wheel can be paired again; when the board has signalled a
+    /// key reset (BOOT held ≥ 10 s) the board rotates its key too.
+    /// Default: error — only the daemon resets pairing.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the reset cannot be performed.
+    fn reset_pairing(&self) -> Result<PairingInfo, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "pairing reset is not supported by this API",
+        ))
+    }
+
     /// Latest live snapshot (steering / pedals).
     fn snapshot(&self) -> SnapshotInfo;
 
@@ -328,6 +468,43 @@ pub trait AppApi: Send + Sync {
 
     /// Set "Send to game" on/off.
     fn set_output_enabled(&self, enabled: bool);
+
+    /// Whether auto-profile switching is paused (M6, v2.0.2).
+    /// Default: not paused — only the daemon overrides it.
+    fn auto_pause(&self) -> bool {
+        false
+    }
+
+    /// Pause / resume auto-profile switching; returns the new state.
+    /// Persists the choice and stops (or restarts) the watcher.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the setting cannot be persisted.
+    fn set_auto_pause(&self, _paused: bool) -> Result<bool, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "auto-pause is not supported by this API",
+        ))
+    }
+
+    /// Whether closing the window keeps RSH in the tray (M7, v2.0.2).
+    /// Default: true — only the daemon overrides it.
+    fn close_to_tray(&self) -> bool {
+        true
+    }
+
+    /// Set "keep running in the tray" on/off; returns the new state.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the setting cannot be persisted.
+    fn set_close_to_tray(&self, _enabled: bool) -> Result<bool, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "close-to-tray is not supported by this API",
+        ))
+    }
 
     /// Current tuning for one module (stored value, or the neutral
     /// default when nothing is stored).
@@ -361,6 +538,27 @@ pub trait AppApi: Send + Sync {
     /// draft was discarded.
     fn discard_draft(&self) -> bool;
 
+    /// Whether a module is enabled (H7, v2.0.2): per-module on/off
+    /// from the stored tuning (`PerModuleTuning.enabled`). Default:
+    /// on — only the daemon overrides it.
+    fn module_enabled(&self, _module: &str) -> bool {
+        true
+    }
+
+    /// Enable / disable a module (H7): persists the flag in the
+    /// stored tuning and rebuilds the live pipeline plan, so a
+    /// disabled module stops feeding the engine. Returns the new state.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the module is unknown or cannot be saved.
+    fn set_module_enabled(&self, _module: &str, _enabled: bool) -> Result<bool, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "module toggles are not supported by this API",
+        ))
+    }
+
     /// Whether the daemon starts with Windows / at login (v2.0.1
     /// hotfix: the Settings toggle had nothing to call before this).
     /// Default: off — only the daemon and the sim override it.
@@ -387,6 +585,47 @@ pub trait AppApi: Send + Sync {
         "Unknown".to_string()
     }
 
+    /// Firmware update check (H3, v2.0.2): board live version vs the
+    /// bundled OTA image version. Default: board version only, no
+    /// bundled image, no update — only the daemon checks the bundle.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the board version cannot be read.
+    fn firmware_check(&self) -> Result<FirmwareCheck, UserError> {
+        Ok(FirmwareCheck {
+            board_version: self.firmware_version(),
+            bundled_version: None,
+            update_available: false,
+        })
+    }
+
+    /// Start a firmware flash from the bundled OTA image (H-4,
+    /// v2.0.2): validates the image + live board, then flashes on a
+    /// background thread and returns the running status immediately —
+    /// the caller polls [`AppApi::firmware_update_status`] for
+    /// progress and the confirmed version. A second start while one
+    /// is running is an error, never a second flash. Default:
+    /// unsupported (sim / test impls).
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when no update can start (already running, no
+    /// live wheel, no bundled image, or the image fails validation).
+    fn update_firmware(&self) -> Result<FirmwareUpdateStatus, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "firmware update is not supported by this API",
+        ))
+    }
+
+    /// Current firmware-flash status (H-4): the running progress, or
+    /// the finished outcome, or the idle default when no flash ever
+    /// started. Default: idle.
+    fn firmware_update_status(&self) -> FirmwareUpdateStatus {
+        FirmwareUpdateStatus::default()
+    }
+
     /// Live output backend name (`"HIDMaestro"` / `"vJoy"`).
     /// Default: `"Unknown"` — only the daemon and the sim override it.
     fn output_backend(&self) -> String {
@@ -403,6 +642,28 @@ pub trait AppApi: Send + Sync {
         Err(UserError::from_connection(
             ConnectionError::Unknown,
             "output backend switching is not supported by this API",
+        ))
+    }
+
+    /// Board address the transport connects to (H4, v2.0.2): the
+    /// persisted `esp_ip` (private/loopback IPv4 literal, default
+    /// `192.168.4.1`). Default: the default address.
+    fn board_address(&self) -> String {
+        "192.168.4.1".to_string()
+    }
+
+    /// Set the board address (H4): validates (IPv4 literal, private
+    /// or loopback — `rsh.local` is not an address) and persists it;
+    /// returns the stored address. The transport uses it on the next
+    /// (re)connect.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the address is invalid or cannot be saved.
+    fn set_board_address(&self, _address: &str) -> Result<String, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "board address is not supported by this API",
         ))
     }
 
@@ -474,6 +735,48 @@ pub trait AppApi: Send + Sync {
         Err(UserError::from_connection(
             ConnectionError::Unknown,
             "profiles are not supported by this API",
+        ))
+    }
+
+    /// Rename a profile; returns the new name. The active profile
+    /// (and its unsaved draft, when one exists) is renamed with it.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the name is invalid, the id is unknown,
+    /// or saving fails.
+    fn rename_profile(&self, _id: &str, _name: &str) -> Result<String, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "profiles are not supported by this API",
+        ))
+    }
+
+    /// Link a profile to a game (`game_slug`, e.g.
+    /// `"assetto_corsa"`); returns the linked game's display name.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] for an unknown id, an unknown game slug, or a
+    /// store save failure.
+    fn link_profile(&self, _id: &str, _game_slug: &str) -> Result<String, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "profiles are not supported by this API",
+        ))
+    }
+
+    /// Restore the newest present profiles backup (Bak1, else Bak2)
+    /// over the live profiles; returns a one-line summary.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when no profiles backup exists or the restore
+    /// fails.
+    fn restore_backup(&self) -> Result<String, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "backup restore is not supported by this API",
         ))
     }
 
@@ -575,20 +878,143 @@ pub trait AppApi: Send + Sync {
     ///
     /// [`UserError`] when there is no active profile or no steering
     /// calibration was captured yet.
-    ///
-    /// NOTE (no backend): there is deliberately NO `set_centre` /
-    /// `calibrate_pedal` on this trait. Capturing a centre or pedal
-    /// endpoint needs the live raw ADC value in mV, and raw mV never
-    /// reaches `AppStateCore`: the engine consumes the frame's
-    /// `axes_mv` inside the pipeline and the state only ever sees the
-    /// processed output (steering degrees, pedals 0..1). Inverting the
-    /// processed values would only reproduce the stored calibration,
-    /// not capture a new one — so no capture method is offered until
-    /// raw mV is plumbed through (a v2.0.2 engine change).
     fn calibration(&self) -> Result<CalibrationInfo, UserError> {
         Err(UserError::from_connection(
             ConnectionError::Unknown,
             "calibration is not supported by this API",
+        ))
+    }
+
+    /// Latest raw ADC readings in mV (v2.0.2): the live values the
+    /// capture methods sample, straight from the latest authenticated
+    /// stream frame — never derived by inverting processed values.
+    /// Default: error — only the daemon sees live frames.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when there is no daemon behind this API.
+    fn raw_mv(&self) -> Result<RawMv, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "raw readings are not supported by this API",
+        ))
+    }
+
+    /// Capture the steering centre from the live raw reading (v2.0.2):
+    /// the wheel must be held straight; the current steering mV is
+    /// saved as the centre of the active profile (persisted) and the
+    /// live pipeline plan is rebuilt from it. Returns the captured
+    /// mV. Default: error — only the daemon captures.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when there is no live wheel data, the reading is
+    /// out of range, there is no active profile, or the save fails.
+    fn capture_centre(&self) -> Result<u16, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "centre capture is not supported by this API",
+        ))
+    }
+
+    /// Capture one pedal's released ("up") endpoint from the live raw
+    /// reading (v2.0.2): `pedal` is `"accel"` (or `"accelerator"`),
+    /// `"brake"`, `"clutch"`, or `"handbrake"`. The current mV is
+    /// saved as that pedal's minimum (persisted, and pushed into the
+    /// live pipeline plan), and the captured mV is returned. Default:
+    /// error — only the daemon captures.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the pedal is unknown, there is no live
+    /// wheel data (or that axis is absent), the captured range would
+    /// be invalid, there is no active profile, or the save fails.
+    fn capture_pedal_min(&self, pedal: &str) -> Result<u16, UserError> {
+        let _ = pedal;
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "pedal capture is not supported by this API",
+        ))
+    }
+
+    /// Capture one pedal's fully-pressed ("down") endpoint from the
+    /// live raw reading (v2.0.2): same pedals as
+    /// [`AppApi::capture_pedal_min`], saved as that pedal's maximum.
+    /// Default: error — only the daemon captures.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] — see [`AppApi::capture_pedal_min`].
+    fn capture_pedal_max(&self, pedal: &str) -> Result<u16, UserError> {
+        let _ = pedal;
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "pedal capture is not supported by this API",
+        ))
+    }
+
+    /// All persisted button→action bindings (v2.0.2), in button
+    /// order. Default: empty — only the daemon owns the store.
+    fn list_bindings(&self) -> Vec<ButtonBinding> {
+        Vec::new()
+    }
+
+    /// Bind `button` (physical 1–32, encoder virtual 65–72) to
+    /// `action` — a game input (`horn`, `shifter_up`, `shifter_down`,
+    /// `gear_1`…`gear_6`, `handbrake`) or an app action
+    /// (`profile_next`, `profile_previous`) — and persist it. The
+    /// daemon applies the binding to every engine tick from the next
+    /// one on. Default: error — only the daemon binds.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] with code `InvalidButton`, `UnknownAction`, or
+    /// `BindingSaveFailed`.
+    fn set_binding(&self, button: u8, action: &str) -> Result<ButtonBinding, UserError> {
+        let _ = (button, action);
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "button bindings are not supported by this API",
+        ))
+    }
+
+    /// Remove the binding for `button` (v2.0.2). Returns `true`
+    /// when a binding was actually removed. Default: error — only
+    /// the daemon binds.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] with code `BindingSaveFailed` when the removal
+    /// cannot be persisted.
+    fn clear_binding(&self, button: u8) -> Result<bool, UserError> {
+        let _ = button;
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "button bindings are not supported by this API",
+        ))
+    }
+
+    /// Persisted knob actions (M9, v2.0.2): two knobs × three rows
+    /// of action ids (`""` = not set). Default: all unset — only the
+    /// daemon overrides it.
+    fn knob_actions(&self) -> [[String; 3]; 2] {
+        [
+            [String::new(), String::new(), String::new()],
+            [String::new(), String::new(), String::new()],
+        ]
+    }
+
+    /// Set one knob row's action (M9): `knob` 0–1, `row` 0–2,
+    /// `action` an assignable action id or `""` to clear. Persists
+    /// the knob table. Returns `true` when stored.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] for a bad knob/row or an unknown action id.
+    fn set_knob_action(&self, _knob: u8, _row: u8, _action: &str) -> Result<(), UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "knob actions are not supported by this API",
         ))
     }
 

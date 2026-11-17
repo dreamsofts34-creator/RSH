@@ -62,7 +62,14 @@ use crate::transport::{accept_loopback, generate_token, listen_loopback};
 use crate::{PROFILE_ID, SIDECAR_EXE_NAME, SIDECAR_PATH_ENV};
 
 /// How long to wait for the sidecar's `hello` line after spawn.
-pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// B-2: 60 s, not 10 s — the elevated sidecar is launched via UAC
+/// (`runas`) and the user needs the 10 s spawn plus thinking time to
+/// read and answer the prompt; a user who takes longer trips
+/// `HelloTimeout` and the switch fails. The UI gives this call a
+/// 75 s IPC bound (see `IpcApi::set_output_backend`), so the wait
+/// never outlives the caller's patience.
+pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long to wait for one reply. H4: 200 ms, not 500 ms — the spike
 /// measured IPC p99 276 µs at 200 Hz, so 200 ms is still generous, and
 /// a reply slower than that would already trip the engine's 250 ms
@@ -203,6 +210,15 @@ pub struct SidecarManager {
     last_hello: Option<HelloInfo>,
     consecutive_failures: u32,
     fallback_needed: bool,
+    /// Whether the user declined the UAC prompt this session
+    /// (B-2/A10, v2.0.2): while set, [`connect`](Self::connect)
+    /// fails fast with [`NotAdmin`](HidMaestroError::NotAdmin)
+    /// instead of spawning (and prompting) again. Only an explicit
+    /// re-select ([`reset_fallback`](Self::reset_fallback)) clears
+    /// it. This is the manager-level latch; the app-core
+    /// `elevation_declined` flag is the primary guard (it survives
+    /// the fresh-factory re-arm that replaces this manager).
+    elevation_declined: bool,
     healthy_submits: u64,
     last_reply: Option<Instant>,
     last_submit_latency_us: Option<f64>,
@@ -226,6 +242,7 @@ impl SidecarManager {
             last_hello: None,
             consecutive_failures: 0,
             fallback_needed: false,
+            elevation_declined: false,
             healthy_submits: 0,
             last_reply: None,
             last_submit_latency_us: None,
@@ -264,11 +281,20 @@ impl SidecarManager {
 
     /// Clear the fallback latch (user explicitly re-selected the
     /// backend in Output settings — G4). Also resets the failure
-    /// counter so the backend gets a fresh initial attempt + retry.
+    /// counter so the backend gets a fresh initial attempt + retry,
+    /// and clears the UAC-decline latch (B-2): an explicit re-select
+    /// is a new action, so one fresh prompt is allowed.
     pub fn reset_fallback(&mut self) {
         self.fallback_needed = false;
+        self.elevation_declined = false;
         self.consecutive_failures = 0;
         self.healthy_submits = 0;
+    }
+
+    /// Whether the user declined the UAC prompt this session.
+    #[must_use]
+    pub fn elevation_declined(&self) -> bool {
+        self.elevation_declined
     }
 
     /// Last submit latency the sidecar reported (`submit_us`), if any.
@@ -325,6 +351,11 @@ impl SidecarManager {
     /// `HelloTimeout` / `BadHello` / `DllHashMismatch` /
     /// `VersionMismatch` / `SidecarDied` on spawn or hello failure.
     pub fn connect(&mut self) -> Result<HelloInfo, HidMaestroError> {
+        // B-2/A10: a declined UAC prompt fails fast — no second
+        // spawn, no second prompt, no retry-budget burn.
+        if self.elevation_declined {
+            return Err(HidMaestroError::NotAdmin);
+        }
         if self.fallback_needed {
             return Err(HidMaestroError::FallbackNeeded);
         }
@@ -446,7 +477,18 @@ impl SidecarManager {
         unsafe {
             std::env::remove_var(SIDECAR_TOKEN_ENV);
         }
-        let process = spawned?;
+        // B-2/A10: a declined UAC prompt latches the decline — the
+        // next `connect()` fails fast with NotAdmin instead of
+        // prompting again.
+        let process = match spawned {
+            Ok(process) => process,
+            Err(error) => {
+                if matches!(error, HidMaestroError::NotAdmin) {
+                    self.elevation_declined = true;
+                }
+                return Err(error);
+            }
+        };
         let pid = {
             use windows::Win32::Foundation::HANDLE;
             use windows::Win32::System::Threading::GetProcessId;
@@ -863,5 +905,40 @@ fn spawn_elevated_runas(path: &std::path::Path, port: u16) -> Result<usize, HidM
                 win32.map_or_else(|| e.code().0.cast_unsigned(), |w| w.0)
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A manager whose UAC prompt was declined (latch set directly —
+    /// same-module test seam; the real path is Windows-only, the
+    /// `runas` spawn).
+    fn declined_manager() -> SidecarManager {
+        let mut config = SidecarConfig::with_path(std::path::PathBuf::from(
+            "/nonexistent/rsh-hidmaestro-sidecar",
+        ));
+        config.spawn_timeout = Duration::from_millis(200);
+        config.reply_timeout = Duration::from_millis(200);
+        let mut manager = SidecarManager::new(config);
+        manager.elevation_declined = true;
+        manager
+    }
+
+    #[test]
+    fn elevation_decline_fails_fast_without_spawn() {
+        let mut manager = declined_manager();
+        let error = manager.connect().expect_err("declined UAC must fail fast");
+        assert!(matches!(error, HidMaestroError::NotAdmin));
+        assert!(manager.elevation_declined());
+        // An explicit re-select clears the latch: the next connect
+        // attempts a real spawn — on Linux the sidecar binary does
+        // not exist, so it fails with anything BUT NotAdmin.
+        manager.reset_fallback();
+        assert!(!manager.elevation_declined());
+        let error = manager.connect().expect_err("no sidecar binary on Linux");
+        assert!(!matches!(error, HidMaestroError::NotAdmin));
     }
 }

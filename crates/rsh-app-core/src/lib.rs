@@ -28,6 +28,11 @@ pub mod state;
 /// in-memory draft `set_tuning` edits, saved to disk only on Save.
 pub mod draft;
 
+/// Bundled OTA image version parsing (H3/M-8, v2.0.2): the
+/// `"Version <b>a.b.c"` marker out of `firmware-signed.bin`,
+/// without signature verification (the flash flow verifies).
+pub mod firmware_image;
+
 /// Game detection + launch (Phase F2 / SW-R7.3).
 pub mod launcher;
 

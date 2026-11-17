@@ -27,6 +27,9 @@ members = [
     # keeps the plain `cargo build` / `cargo test` commands working on Linux
     # for the nine library crates.
     "src-tauri",
+    # v2.0.2 UI gate checks (Slint interpreter + testing backend).
+    # Not in default-members: it is only built by tools/gate-checks/run-gate.sh.
+    "tools/gate-checks/rsh-gate-ui",
 ]
 default-members = [
     "crates/rsh-api",

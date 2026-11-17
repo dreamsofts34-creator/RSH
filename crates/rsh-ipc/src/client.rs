@@ -14,6 +14,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
@@ -21,6 +22,25 @@ use tokio::sync::{Mutex, mpsc};
 use rsh_api::AppEvent;
 
 use crate::{IPC_PROTOCOL_VERSION, IpcError, IpcRequest, IpcResponse};
+
+/// Bound for one IPC round-trip (B3): a daemon that stops
+/// answering must never hang the caller — the UI's frame loop and
+/// the health monitor both depend on every call returning within
+/// this window, even when the daemon process is wedged but its
+/// socket is still open.
+const CALL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Methods whose result arrives via events/polling, not the RPC
+/// reply (B-1, v2.0.2): `begin_pairing` only *starts* a pairing
+/// window — the outcome arrives as `PairingWindow` /
+/// `PairingFinished` events and via `pairing_status`. Waiting for
+/// the RPC reply would time out against a slow board (the daemon
+/// used to wait up to 3 s for the window) and the timeout would
+/// poison the poller's link state, so [`IpcClient::call`] returns
+/// as soon as the request is written for these methods. The late
+/// reply is discarded by the next call's id check (the response
+/// channel holds 64 frames, so it never blocks the reader).
+const FIRE_AND_FORGET_METHODS: &[&str] = &["begin_pairing"];
 
 /// A connected IPC client.
 pub struct IpcClient {
@@ -157,11 +177,41 @@ impl IpcClient {
 
     /// Call one method and await its response.
     ///
+    /// The whole round-trip is bounded by [`CALL_TIMEOUT`] (B3): a
+    /// daemon that never answers surfaces as [`IpcError::Io`]
+    /// ("timed out") instead of hanging the caller forever. The
+    /// call is strictly single-flight — the writer lock is held
+    /// across the write + response wait, so no second call can
+    /// interleave and steal the response.
+    ///
     /// # Errors
     ///
-    /// [`IpcError`] on transport failure, version mismatch, or a
-    /// daemon-side error response (with the daemon's code).
+    /// [`IpcError`] on transport failure, timeout, version
+    /// mismatch, or a daemon-side error response (with the
+    /// daemon's code).
     pub async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, IpcError> {
+        if FIRE_AND_FORGET_METHODS.contains(&method) {
+            return self.call_send_only(method, params).await;
+        }
+        self.call_with_timeout(method, params, CALL_TIMEOUT).await
+    }
+
+    /// Send one request and return as soon as it is written, without
+    /// waiting for the reply (B-1 fire-and-forget start). Only for
+    /// methods whose result arrives via events/polling (see
+    /// [`FIRE_AND_FORGET_METHODS`]); the reply, when it arrives, is
+    /// discarded by the next call's id check. A failed write still
+    /// errors, so a dead daemon surfaces immediately.
+    ///
+    /// # Errors
+    ///
+    /// [`IpcError`] when the request cannot be serialized or
+    /// written.
+    async fn call_send_only(
         &self,
         method: &str,
         params: serde_json::Value,
@@ -180,6 +230,69 @@ impl IpcClient {
         };
         let line =
             serde_json::to_string(&request).map_err(|e| IpcError::Protocol(e.to_string()))?;
+        let mut writer = self.writer.lock().await;
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| IpcError::Io(e.to_string()))?;
+        writer
+            .write_all(b"\n")
+            .await
+            .map_err(|e| IpcError::Io(e.to_string()))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| IpcError::Io(e.to_string()))?;
+        Ok(serde_json::Value::Null)
+    }
+
+    /// [`call`](Self::call) with an explicit bound (B-2, v2.0.2):
+    /// calls whose daemon side legitimately waits on a human —
+    /// `set_output_backend` (the UAC prompt + a 60 s sidecar spawn)
+    /// — use a longer bound instead of the 500 ms default, so the
+    /// UI does not time out while the user is still answering the
+    /// prompt. (`begin_pairing` does not use this path: it is
+    /// fire-and-forget — see [`FIRE_AND_FORGET_METHODS`].)
+    ///
+    /// # Errors
+    ///
+    /// See [`call`](Self::call).
+    pub async fn call_with_timeout(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, IpcError> {
+        let id = {
+            let mut next = self.next_id.lock().await;
+            let id = *next;
+            *next += 1;
+            id
+        };
+        let request = IpcRequest {
+            v: IPC_PROTOCOL_VERSION,
+            id,
+            method: method.to_string(),
+            params,
+        };
+        let line =
+            serde_json::to_string(&request).map_err(|e| IpcError::Protocol(e.to_string()))?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        match tokio::time::timeout_at(deadline, self.call_once(id, line)).await {
+            Ok(result) => result,
+            Err(_) => Err(IpcError::Io(format!(
+                "IPC call '{method}' timed out after {} ms",
+                timeout.as_millis()
+            ))),
+        }
+    }
+
+    /// One round-trip without the timeout: write the line, then
+    /// wait for the response with this `id`. A reply with another
+    /// id is a late answer to a call that already timed out — it
+    /// is discarded, never mistaken for this call's reply (ids are
+    /// unique per call and responses arrive in request order).
+    async fn call_once(&self, id: u64, line: String) -> Result<serde_json::Value, IpcError> {
         // Hold the writer lock across the write + response wait so
         // no second call can interleave and steal the response.
         let mut writer = self.writer.lock().await;
@@ -195,26 +308,23 @@ impl IpcClient {
             .flush()
             .await
             .map_err(|e| IpcError::Io(e.to_string()))?;
-        drop(writer);
         let mut rx = self.responses.lock().await;
-        let resp = rx.recv().await.ok_or(IpcError::Closed)?;
-        if resp.v != IPC_PROTOCOL_VERSION {
-            return Err(IpcError::UnsupportedVersion(resp.v));
-        }
-        if resp.id != id {
-            return Err(IpcError::Protocol(format!(
-                "response id {} does not match request id {id}",
-                resp.id
-            )));
-        }
-        if resp.ok {
-            Ok(resp.result.unwrap_or(serde_json::Value::Null))
-        } else {
+        loop {
+            let resp = rx.recv().await.ok_or(IpcError::Closed)?;
+            if resp.id != id {
+                continue;
+            }
+            if resp.v != IPC_PROTOCOL_VERSION {
+                return Err(IpcError::UnsupportedVersion(resp.v));
+            }
+            if resp.ok {
+                return Ok(resp.result.unwrap_or(serde_json::Value::Null));
+            }
             let body = resp.error.unwrap_or(crate::IpcErrorBody {
                 code: "Protocol".to_string(),
                 message: "daemon returned an error without a body".to_string(),
             });
-            Err(IpcError::Api(format!("{}: {}", body.code, body.message)))
+            return Err(IpcError::Api(format!("{}: {}", body.code, body.message)));
         }
     }
 
@@ -243,5 +353,56 @@ impl IpcClient {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| IpcError::Protocol("version response has no version".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// B3: a peer that accepts the socket but never answers must
+    /// not hang the call — it times out within ~500 ms.
+    ///
+    /// Plain `#[test]` (not `#[tokio::test]`): this crate's tokio
+    /// has no `macros` feature, so the test builds its own
+    /// current-thread runtime.
+    #[test]
+    #[cfg(unix)]
+    fn call_times_out_when_daemon_never_answers() {
+        let dir = std::env::temp_dir().join(format!("rsh-ipc-timeout-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("rsh-daemon.sock");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+            // Accept and hold the stream without ever answering.
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(stream);
+                }
+            });
+            let client = IpcClient::connect(&path).await.expect("connect");
+            let start = Instant::now();
+            let err = client
+                .call("ping", serde_json::json!({}))
+                .await
+                .expect_err("a silent daemon must time out");
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "timeout must bound the call, took {elapsed:?}"
+            );
+            assert!(
+                matches!(&err, IpcError::Io(message) if message.contains("timed out")),
+                "timeout surfaces as an Io error: {err}"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

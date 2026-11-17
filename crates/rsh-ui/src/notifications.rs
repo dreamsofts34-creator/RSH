@@ -11,10 +11,12 @@
 //! that is an explicit user action (`Mark all read`).
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rsh_api::AppEvent;
+use serde::{Deserialize, Serialize};
 use slint::{ModelRc, VecModel};
 
 use crate::{MainWindow, NotificationItem};
@@ -22,8 +24,13 @@ use crate::{MainWindow, NotificationItem};
 /// Maximum notifications kept; older ones are dropped.
 pub const MAX_NOTIFICATIONS: usize = 50;
 
+/// File the center persists to (`<data_dir>/notifications.json`,
+/// M10): notifications survive a restart instead of living only in
+/// memory.
+pub const NOTIFICATIONS_FILE: &str = "notifications.json";
+
 /// One stored notification.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Notification {
     /// Stable kind (`ConnectionLost`, `PairingNeeded`, …).
     pub kind: String,
@@ -62,7 +69,7 @@ fn now_time_string() -> String {
 }
 
 /// UI-side notification store (newest first).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NotificationCenter {
     items: VecDeque<Notification>,
 }
@@ -72,6 +79,43 @@ impl NotificationCenter {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Load the persisted center from `<data_dir>/notifications.json`
+    /// (M10): a missing or unreadable file is an empty center, never
+    /// an error — notifications are a log, not data the app depends
+    /// on. Capped at [`MAX_NOTIFICATIONS`] on load.
+    #[must_use]
+    pub fn load(data_dir: Option<&Path>) -> Self {
+        let Some(dir) = data_dir else {
+            return Self::new();
+        };
+        let Ok(text) = std::fs::read_to_string(dir.join(NOTIFICATIONS_FILE)) else {
+            return Self::new();
+        };
+        let Ok(mut center) = serde_json::from_str::<Self>(&text) else {
+            return Self::new();
+        };
+        while center.items.len() > MAX_NOTIFICATIONS {
+            center.items.pop_back();
+        }
+        center
+    }
+
+    /// Persist the center to `<data_dir>/notifications.json` (M10):
+    /// best-effort — a write failure is silently ignored (the drawer
+    /// still works in memory; the next save retries). Callers save
+    /// after every mutation (push / mark-all-read / clear).
+    pub fn save(&self, data_dir: Option<&Path>) {
+        let Some(dir) = data_dir else {
+            return;
+        };
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        if let Ok(text) = serde_json::to_string(&self) {
+            let _ = std::fs::write(dir.join(NOTIFICATIONS_FILE), text);
+        }
     }
 
     /// Push a notification (newest first, capped at
@@ -233,6 +277,36 @@ mod tests {
         c.clear();
         assert_eq!(c.to_model_items().len(), 0);
         assert_eq!(c.unread_count(), 0);
+    }
+
+    #[test]
+    fn save_and_load_round_trips() {
+        // M10: notifications survive a restart (file, not memory).
+        let dir = std::env::temp_dir().join(format!("rsh-notif-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut c = NotificationCenter::new();
+        c.push_with_time("A", "First", "one", "10:00:01");
+        c.push_with_time("B", "Second", "two", "10:00:02");
+        c.mark_all_read();
+        c.save(Some(&dir));
+        let loaded = NotificationCenter::load(Some(&dir));
+        let rows = loaded.to_model_items();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].title, "Second");
+        assert_eq!(rows[1].title, "First");
+        assert_eq!(loaded.unread_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_missing_file_is_empty_center() {
+        let dir = std::env::temp_dir().join(format!("rsh-notif-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            NotificationCenter::load(Some(&dir)).to_model_items().len(),
+            0
+        );
+        assert_eq!(NotificationCenter::load(None).to_model_items().len(), 0);
     }
 
     #[test]

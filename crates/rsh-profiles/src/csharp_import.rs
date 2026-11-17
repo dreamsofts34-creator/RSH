@@ -109,6 +109,9 @@ pub enum GameId {
     Acc = 2,
     /// iRacing (3).
     IRacing = 3,
+    /// Dirt Rally 2.0 (4, v2.0.2 — M1 link target; old files never
+    /// contain 4, so this is backward compatible).
+    DirtRally2 = 4,
 }
 
 impl GameId {
@@ -118,6 +121,7 @@ impl GameId {
             1 => Self::AssettoCorsa,
             2 => Self::Acc,
             3 => Self::IRacing,
+            4 => Self::DirtRally2,
             _ => Self::Unknown,
         }
     }
@@ -214,6 +218,14 @@ pub struct PerModuleTuning {
     /// LED strip pattern name (LED module only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub led_pattern: Option<String>,
+    /// LED strip colour as `"#RRGGBB"` (M2, v2.0.2 — LED module only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub led_color: Option<String>,
+    /// Handbrake "Button" mode (H8, v2.0.2 — handbrake module only):
+    /// `Some(true)` = the handbrake input acts as a button,
+    /// `Some(false)` = axis; `None` = module default (axis).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handbrake_button_mode: Option<bool>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -379,6 +391,11 @@ pub struct AppSettings {
     /// Whether profiles auto-switch per game/car.
     #[serde(default = "default_true")]
     pub auto_switch_profiles: bool,
+    /// Whether auto-switching is paused (M6, v2.0.2): paused means
+    /// the watcher does not switch, even when `auto_switch_profiles`
+    /// is on. Default `false` (not paused).
+    #[serde(default)]
+    pub auto_switch_paused: bool,
     /// Per-module on/off switches, keyed by canonical module id
     /// (`"steering"`, `"accelerator"`, `"brake"`, `"clutch"`,
     /// `"handbrake"`, `"shifter"`, `"horn"`, `"buttons"`,
@@ -481,6 +498,8 @@ impl Default for PerModuleTuning {
             horn_button: None,
             led_brightness: None,
             led_pattern: None,
+            led_color: None,
+            handbrake_button_mode: None,
         }
     }
 }
@@ -540,6 +559,7 @@ impl Default for AppSettings {
             wizard_completed: false,
             first_run_done: false,
             auto_switch_profiles: true,
+            auto_switch_paused: false,
             modules: default_modules(),
             steam_path: String::new(),
             iracing_path: String::new(),
@@ -648,6 +668,8 @@ pub struct AppSettingsPatch {
     pub first_run_done: Option<bool>,
     /// Whether profiles auto-switch per game/car.
     pub auto_switch_profiles: Option<bool>,
+    /// Whether auto-switching is paused (M6, v2.0.2).
+    pub auto_switch_paused: Option<bool>,
     /// Per-module switches, merged per key.
     pub modules: Option<HashMap<String, bool>>,
     /// User-configured Steam install root.
@@ -703,6 +725,9 @@ impl AppSettings {
         }
         if let Some(auto_switch_profiles) = patch.auto_switch_profiles {
             self.auto_switch_profiles = auto_switch_profiles;
+        }
+        if let Some(auto_switch_paused) = patch.auto_switch_paused {
+            self.auto_switch_paused = auto_switch_paused;
         }
         if let Some(modules) = patch.modules {
             for (module, enabled) in modules {

@@ -223,6 +223,21 @@ pub fn game_slug(game: GameId) -> Option<&'static str> {
         GameId::AssettoCorsa => Some("assetto_corsa"),
         GameId::Acc => Some("assetto_corsa_competizione"),
         GameId::IRacing => Some("iracing"),
+        GameId::DirtRally2 => Some("dirt_rally_2"),
+    }
+}
+
+/// Reverse of [`game_slug`] (M1, v2.0.2): the profile-link path
+/// takes a slug from the UI and stores the matching [`GameId`].
+/// Unknown slugs map to [`GameId::Unknown`] (game-less profile).
+#[must_use]
+pub fn game_id_from_slug(slug: &str) -> GameId {
+    match slug {
+        "assetto_corsa" => GameId::AssettoCorsa,
+        "assetto_corsa_competizione" => GameId::Acc,
+        "iracing" => GameId::IRacing,
+        "dirt_rally_2" => GameId::DirtRally2,
+        _ => GameId::Unknown,
     }
 }
 

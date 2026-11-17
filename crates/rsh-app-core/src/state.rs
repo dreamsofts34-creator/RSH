@@ -125,9 +125,12 @@
 //! - **Arbitrary button→action rebinding is not a board feature.**
 //!   The board stores only the three fixed `BUTTON` slot roles
 //!   (1 shifter-up, 2 shifter-down, 3 horn); `stage_config` rejects a
-//!   cross-role rebind loudly instead of pretending to stage it. A
-//!   PC-side binding store + output remap (or a firmware extension)
-//!   needs a design decision outside H5-control.
+//!   cross-role rebind loudly instead of pretending to stage it. The
+//!   PC-side binding store + output remap landed in v2.0.2 Round 2B
+//!   ([`BindingStore`](rsh_profiles::bindings::BindingStore),
+//!   [`AppStateCore::apply_bindings`]) — bindings live in
+//!   `bindings.json` and are applied to each engine tick before the
+//!   backend sees it.
 //! - **No re-activation retry after a reboot.** `restart_wheel`
 //!   reboots the board and closes the gate; the user reconnects once
 //!   the board is back (the forwarder has no re-activation retry —
@@ -152,8 +155,12 @@ use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+use rsh_api::ButtonBinding;
+use rsh_api::RawMv;
 use rsh_api::connection::{BAD_TAG_RETRY_DELAY, HELLO_ATTEMPTS, HELLO_WAIT};
 use rsh_api::errors::ConnectionError;
+use rsh_api::{FirmwareCheck, FirmwareUpdateStatus};
+use rsh_engine::calibration::{CalibrationError, MIN_SPAN_MV, validate_pedal_range};
 use rsh_engine::engine::{
     EngineReport, OutputSink, PacketSource, SinkError, StopHandle, WheelEngine,
 };
@@ -166,19 +173,25 @@ use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
 use rsh_output_hidmaestro::HidMaestroOutput;
 use rsh_output_hidmaestro::backend::UAC_NOTE;
 use rsh_output_hidmaestro::manager::resolve_sidecar_path;
+use rsh_profiles::bindings::{BindingError, BindingStore, is_app_action};
 use rsh_profiles::csharp_import::{
-    PedalCalibration, PerModuleTuning, SteeringCalibration, WheelProfile, canonical_module_id,
+    GameId, PedalCalibration, PerModuleTuning, SteeringCalibration, WheelProfile,
+    canonical_module_id,
 };
 use rsh_profiles::resolver::{
     CarProfileResolver, PROFILE_SWITCHED_EVENT, ProfileId, ProfileSource, ProfileSwitchEvent,
 };
-use rsh_profiles::store::{BackupInfo, ProfileStore, format_system_time_rfc3339, game_slug};
+use rsh_profiles::store::{
+    BackupGeneration, BackupInfo, ProfileStore, format_system_time_rfc3339, game_id_from_slug,
+    game_slug, validate_profile_name,
+};
 use rsh_profiles::watcher::{
     CarSource, ForegroundDetector, TelemetryWatcher, WindowsForegroundDetector,
 };
 use rsh_protocol::config::ConfigBlob;
 use rsh_protocol::control::LedTestPattern;
 use rsh_protocol::hello::PAIRING_WINDOW_SECS;
+use rsh_protocol::stream::MAX_AXES;
 use rsh_protocol::stream::MAX_ENCODERS;
 use rsh_protocol::stream::StatusPacket;
 use rsh_protocol::stream::StreamFrame;
@@ -196,11 +209,13 @@ use serde::{Deserialize, Serialize};
 use crate::commands::{
     BackendStatus, LedPattern, OutputState as CommandOutputState, PinAssignment, PinMapValidation,
     ShifterGate, TuningSettings, config_blob_to_json, config_json_to_blob,
-    get_snapshot as build_snapshot_command, merge_pin_map_into_blob, records_to_pin_assignments,
+    firmware_validation_user_error, get_snapshot as build_snapshot_command,
+    merge_pin_map_into_blob, records_to_pin_assignments, validate_firmware_image_against,
     validate_pin_map, validate_tuning,
 };
 use crate::diagnostics::{redact_secrets, utc_now_iso};
 use crate::draft::{DraftStatus, ProfileDraft};
+use crate::firmware_image;
 use crate::launcher::{
     GameLauncher, SystemSpawner, detect_all_games_with, detect_game_with, game_by_id,
     iracing_paths_for, steam_roots_for,
@@ -213,6 +228,7 @@ use crate::snapshot::{
 use crate::system::{NullSink, ShutdownOutcome};
 use crate::telemetry_adapter::TelemetryCarSource;
 use crate::webota::upload_firmware_image;
+use crate::webota::{WebOtaTarget, flash_firmware, wait_for_board_version};
 
 /// App settings, re-exported for the Tauri shell (`src-tauri` does not
 /// depend on `rsh-profiles` directly).
@@ -315,6 +331,20 @@ pub struct ButtonPressEvent {
     /// True on press, false on release. Encoder virtual buttons are
     /// momentary pulses: only the `pressed: true` edge is emitted.
     pub pressed: bool,
+}
+
+/// One queued app action from a bound button press (v2.0.2,
+/// Round 2B): the daemon manager loop drains these and runs them —
+/// they never reach the output backend. Game-input bindings are
+/// applied inline by [`AppStateCore::apply_bindings`] instead; only
+/// app actions need a queue, because they run outside the engine
+/// tick (profile activation saves + pushes a pipeline plan).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingAppAction {
+    /// Cycle to the next profile.
+    ProfileNext,
+    /// Cycle to the previous profile.
+    ProfilePrevious,
 }
 
 /// One catalogue game, as the frontend's `GameInfo` shape consumes it.
@@ -748,6 +778,18 @@ pub struct AppStateCore {
     /// Button picked by learn mode, until the UI consumes it with
     /// [`AppStateCore::take_learned_button`].
     learned_button: Mutex<Option<u8>>,
+    /// Persisted button→action bindings (v2.0.2, Round 2B).
+    bindings: Mutex<BindingStore>,
+    /// Load-time warnings from the bindings store (see
+    /// [`AppStateCore::binding_load_warnings`]).
+    binding_load_warnings: Vec<String>,
+    /// Last pressed set for buttons 1–64 (`buttons | buttons_ex <<
+    /// 32`), for app-action edge detection in
+    /// [`AppStateCore::apply_bindings`].
+    last_bound_pressed: Mutex<u64>,
+    /// Queued app actions from bound button presses, drained by the
+    /// daemon manager loop ([`AppStateCore::drain_binding_actions`]).
+    binding_actions: Mutex<VecDeque<BindingAppAction>>,
     /// Engine stop handle, when the engine task is running.
     stop_handle: Mutex<Option<StopHandle>>,
     /// Engine task status (Phase G gate wiring): `Idle` until
@@ -773,6 +815,10 @@ pub struct AppStateCore {
     /// Cumulative encoder counts reconstructed from the engine's
     /// per-tick deltas (see [`EngineSink`]).
     engine_encoders: Mutex<EngineEncoderAccum>,
+    /// Latest raw axis readings in mV (see [`RawAxesSample`]): the
+    /// capture methods sample this slot. Reported per frame by the
+    /// frame feeder ([`AppStateCore::note_raw_axes`]).
+    raw_axes: Mutex<RawAxesSample>,
     /// Outcome of the most recent
     /// [`AppStateCore::activate_startup_backend`] call ([`None`] until
     /// the shell activates the persisted backend at launch).
@@ -844,6 +890,26 @@ pub struct AppStateCore {
     /// When the last failover attempt ran (C-FAIL-1 rate limit: at
     /// most one attempt per 30 s, even after a reset).
     fallback_last_attempt: Mutex<Option<Instant>>,
+    /// Whether the user declined the `HIDMaestro` UAC prompt this
+    /// session (B-2/A10, v2.0.2): while set, an automatic
+    /// (re-)activation of `HIDMaestro` fails fast with the `NotAdmin`
+    /// message instead of prompting again. Only an explicit user
+    /// re-select ([`AppStateCore::set_output_backend`]) clears it —
+    /// a fresh factory build (the H2 re-arm in
+    /// [`Self::apply_backend_switch`]) must NOT clear it, or the
+    /// prompt would loop again.
+    elevation_declined: AtomicBool,
+    /// Serialises backend switches (B-2): a switch already in
+    /// flight (UAC prompt on screen / sidecar spawning, up to ~10 s)
+    /// rejects a second overlapping switch instead of spawning a
+    /// second elevated sidecar. Held across the whole
+    /// [`Self::apply_backend_switch`] by `try_lock`.
+    switch_in_flight: Mutex<()>,
+    /// Firmware-flash status (H-4, v2.0.2): the background flash
+    /// thread's progress / outcome, polled by the UI while a flash
+    /// runs. Idle (`running: false`, `done: false`) until the first
+    /// flash starts.
+    firmware_update: Mutex<FirmwareUpdateStatus>,
     /// Whether the user confirmed a key replacement (M-7): consumed
     /// once by the next activation attempt, which then pairs with
     /// replacement instead of failing with `StoredKeyExists`.
@@ -962,6 +1028,11 @@ impl AppStateCore {
         let selected_backend =
             BackendKind::parse(&store.settings().output_backend).unwrap_or(BackendKind::DEFAULT);
         let esp_ip = store.settings().esp_ip.clone();
+        // The binding store lives beside the profile store; a
+        // corrupt bindings file loads as empty with warnings (never
+        // fails the state open — see `rsh_profiles::bindings`).
+        let bindings = BindingStore::open(store.dir());
+        let binding_load_warnings = bindings.load_warnings().to_vec();
         Self {
             metrics: Mutex::new(EngineMetrics::new()),
             loop_rate: Mutex::new(LoopRateTracker::new()),
@@ -987,6 +1058,10 @@ impl AppStateCore {
             plan_tx: Mutex::new(None),
             learn_armed: Mutex::new(false),
             learned_button: Mutex::new(None),
+            bindings: Mutex::new(bindings),
+            binding_load_warnings,
+            last_bound_pressed: Mutex::new(0),
+            binding_actions: Mutex::new(VecDeque::new()),
             stop_handle: Mutex::new(None),
             engine_status: Mutex::new(EngineTaskStatus::Idle),
             engine_status_detail: Mutex::new("engine not started yet".to_string()),
@@ -996,6 +1071,7 @@ impl AppStateCore {
             engine_frame_tx: Mutex::new(None),
             engine_last_report: Mutex::new(None),
             engine_encoders: Mutex::new(EngineEncoderAccum::default()),
+            raw_axes: Mutex::new(RawAxesSample::default()),
             startup_backend: Mutex::new(None),
             backend_migration_note: Mutex::new(backend_migration_note),
             vjoy_install: Mutex::new(VjoyInstallState::default()),
@@ -1011,6 +1087,9 @@ impl AppStateCore {
             pre_game_profile: Mutex::new(None),
             fallback_used: AtomicBool::new(false),
             fallback_last_attempt: Mutex::new(None),
+            elevation_declined: AtomicBool::new(false),
+            switch_in_flight: Mutex::new(()),
+            firmware_update: Mutex::new(FirmwareUpdateStatus::default()),
             pairing_replacement_allowed: Mutex::new(false),
             replacement_required: Mutex::new(None),
             password_consumed: Mutex::new(false),
@@ -1545,6 +1624,15 @@ impl AppStateCore {
         }
     }
 
+    /// Live button bitmask (H10, v2.0.2): the raw combined mask
+    /// (`buttons | buttons_ex << 32`) from the last button edge
+    /// frame — bit `n - 1` is wheel button `n` (1–64). `0` = none
+    /// pressed / no frame yet.
+    #[must_use]
+    pub fn pressed_button_mask(&self) -> u64 {
+        *lock(&self.last_buttons)
+    }
+
     /// The board firmware version from the live session's `GET_CAPS`
     /// reply (`"4.0.1"`), for the `get_firmware_version` command.
     ///
@@ -1596,10 +1684,16 @@ impl AppStateCore {
     /// down a live session to re-pair. The returned status is the
     /// last-known one; the frontend polls `get_pairing_status` while
     /// the window is open, because the `HELLO` arrives
-    /// asynchronously in the forwarder. This waits up to ~3 s for the
-    /// attempt to produce a window or a failure, so the wizard gets a
-    /// useful synchronous answer instead of a stale empty one; after
-    /// the wait it returns whatever is known.
+    /// asynchronously in the forwarder.
+    ///
+    /// B-1 (v2.0.2): this returns IMMEDIATELY after triggering the
+    /// attempt — it must never wait for the window. The old ~3 s wait
+    /// loop blocked the daemon's IPC connection task (which handles
+    /// one request at a time inline), so the UI's 500 ms call timeout
+    /// fired mid-attempt ("Pairing failed"), the poller's calls queued
+    /// behind it and also timed out, and the UI showed
+    /// "Disconnected". Progress now arrives via `PairingWindow` /
+    /// `PairingFinished` events and the `pairing_status` poll.
     ///
     /// # Errors
     ///
@@ -1618,18 +1712,7 @@ impl AppStateCore {
             ),
         );
         self.activate_session()?;
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let status = self.pairing_status_peek();
-            if self.session_gate_open()
-                || status.error.is_some()
-                || status.seconds_left > 0
-                || Instant::now() >= deadline
-            {
-                return Ok(status);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        Ok(self.pairing_status_peek())
     }
 
     /* ------------------------------------------------------------------ */
@@ -1914,6 +1997,26 @@ impl AppStateCore {
         brightness: Option<u8>,
         period_ms: Option<u16>,
     ) -> Result<(), String> {
+        self.led_test_with_color(pattern, brightness, period_ms, None)
+    }
+
+    /// [`Self::led_test`] with an explicit flash colour (M2, v2.0.2):
+    /// `Some(0xRRGGBB)` tints the flash; `None` reads the stored LED
+    /// colour from the active profile when one is stored, else white.
+    /// Used by `set_tuning` so a colour change flashes its own colour.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the test pattern is invalid (period
+    /// outside 100..=5000 ms) or the board control session cannot be
+    /// built / run.
+    pub fn led_test_with_color(
+        self: &Arc<Self>,
+        pattern: LedPattern,
+        brightness: Option<u8>,
+        period_ms: Option<u16>,
+        color: Option<u32>,
+    ) -> Result<(), String> {
         let brightness = brightness.unwrap_or_else(|| {
             lock(&self.store)
                 .active()
@@ -1926,7 +2029,17 @@ impl AppStateCore {
                 })
                 .unwrap_or(100)
         });
-        let payload = build_led_test_pattern(pattern, brightness, period_ms)?;
+        let color = color.or_else(|| {
+            lock(&self.store).active().and_then(|active| {
+                active
+                    .profile
+                    .module_tunings
+                    .get("led")
+                    .and_then(|tuning| tuning.led_color.as_deref())
+                    .and_then(parse_hex_color)
+            })
+        });
+        let payload = build_led_test_pattern_with_color(pattern, brightness, period_ms, color)?;
         match self.transport_request().0 {
             TransportKind::Udp => block_on_control(run_control_session(
                 self,
@@ -2488,7 +2601,6 @@ impl AppStateCore {
     pub fn ingest_frame(&self, input: FrameInput) -> EngineSnapshot {
         lock(&self.loop_rate).tick();
         *lock(&self.metrics) = input.metrics;
-        *lock(&self.last_output) = input.output;
 
         let encoders = lock(&self.encoders).update(&input.encoder_counts, input.n_enc);
         let seq = {
@@ -2510,10 +2622,138 @@ impl AppStateCore {
             encoders,
             seq_gap: input.metrics.seq_gap,
             tx_fail: input.metrics.tx_fail,
+            // M-3: handbrake + gear come from the pipeline output, so
+            // the Overview always shows the live values, never stale
+            // or hardcoded ones.
+            handbrake: f64::from(input.output.handbrake),
+            gear: input.output.gear,
         });
         self.push_button_edges(&input.output, &snapshot);
+        // Bindings apply AFTER the raw edges are queued (learn mode
+        // + the UI highlight see the physical button) and BEFORE the
+        // output is stored: `last_output` — and the backend send,
+        // via `ingest_engine_output` — carry the bound actions.
+        *lock(&self.last_output) = self.apply_bindings(&input.output);
         *lock(&self.latest_snapshot) = snapshot.clone();
         snapshot
+    }
+
+    /// Apply the persisted button→action bindings to one pipeline
+    /// tick (v2.0.2, Round 2B). A pure per-tick override — no state
+    /// is kept except the app-action edge set below — so releasing
+    /// a button restores the pipeline's own value on the next tick.
+    ///
+    /// * Game action: the source button's bit is cleared and the
+    ///   target is set while the button is held — `horn` sets bit 2
+    ///   (button 3, plus the `horn` flag), `shifter_up` /
+    ///   `shifter_down` set bits 0/1, `gear_N` sets the decoded
+    ///   `gear` field, `handbrake` drives the handbrake axis to
+    ///   1.0. The game never sees the raw button as well.
+    /// * App action: on a press *edge* only (a held button must not
+    ///   repeat at 200 Hz), the action is queued for the daemon
+    ///   manager loop ([`AppStateCore::drain_binding_actions`]); the
+    ///   output is untouched. Encoder pulses (65–72) are momentary
+    ///   by construction, so every pulse is an edge.
+    /// * No binding for a button: the tick passes through unchanged
+    ///   (the pre-binding default behaviour).
+    /// * A binding to `horn` bypasses the horn module gate on
+    ///   purpose: the user explicitly bound the button, so the horn
+    ///   sounds even when the horn module is off. (A binding added
+    ///   while its button is already held fires its app action
+    ///   once on the next tick — the edge baseline only tracks
+    ///   ticks that pass through here.)
+    fn apply_bindings(&self, output: &PipelineOutputState) -> PipelineOutputState {
+        let bindings = lock(&self.bindings).list().clone();
+        let pressed64 = u64::from(output.buttons) | (u64::from(output.buttons_ex) << 32);
+        if bindings.is_empty() {
+            *lock(&self.last_bound_pressed) = pressed64;
+            return *output;
+        }
+        let mut out = *output;
+        let mut queued: Vec<BindingAppAction> = Vec::new();
+        {
+            let mut last_pressed = lock(&self.last_bound_pressed);
+            for (&button, action) in &bindings {
+                if !Self::binding_button_pressed(button, output, pressed64) {
+                    continue;
+                }
+                if is_app_action(action) {
+                    // Edge only — see the method docs.
+                    let edge = if button >= 65 {
+                        true
+                    } else {
+                        let bit = 1_u64 << (u64::from(button) - 1);
+                        *last_pressed & bit == 0
+                    };
+                    if edge {
+                        match action.as_str() {
+                            "profile_next" => queued.push(BindingAppAction::ProfileNext),
+                            "profile_previous" => {
+                                queued.push(BindingAppAction::ProfilePrevious);
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+                // Game action: clear the source bit, set the target.
+                Self::clear_bound_button(&mut out, button);
+                match action.as_str() {
+                    "horn" => {
+                        out.buttons |= 1 << 2;
+                        out.horn = true;
+                    }
+                    "shifter_up" => out.buttons |= 1 << 0,
+                    "shifter_down" => out.buttons |= 1 << 1,
+                    "gear_1" => out.gear = 1,
+                    "gear_2" => out.gear = 2,
+                    "gear_3" => out.gear = 3,
+                    "gear_4" => out.gear = 4,
+                    "gear_5" => out.gear = 5,
+                    "gear_6" => out.gear = 6,
+                    "handbrake" => out.handbrake = 1.0,
+                    // An unknown action can never be stored (the
+                    // store validates on set and on load) — ignore
+                    // it rather than inventing an output.
+                    _ => {}
+                }
+            }
+            *last_pressed = pressed64;
+        }
+        if !queued.is_empty() {
+            lock(&self.binding_actions).extend(queued);
+        }
+        out
+    }
+
+    /// True when wheel button `button` is pressed in this tick's
+    /// output: bits of `buttons` are buttons 1–32, bits of
+    /// `buttons_ex` are buttons 33–64 (pre-combined in
+    /// `pressed64`), and `encoder_buttons` bit `n` is virtual
+    /// button `65 + n`.
+    fn binding_button_pressed(button: u8, output: &PipelineOutputState, pressed64: u64) -> bool {
+        if button >= 65 {
+            let bit = button - 65;
+            bit < 8 && output.encoder_buttons.0 & (1 << bit) != 0
+        } else if button >= 1 {
+            pressed64 & (1_u64 << (u64::from(button) - 1)) != 0
+        } else {
+            false
+        }
+    }
+
+    /// Clear one wheel button's bit from a tick's output (the
+    /// source bit of a bound game action — the game must not see
+    /// the raw button as well as the bound target).
+    fn clear_bound_button(out: &mut PipelineOutputState, button: u8) {
+        match button {
+            1..=32 => out.buttons &= !(1 << (u64::from(button) - 1)),
+            33..=64 => out.buttons_ex &= !(1 << (u64::from(button) - 33)),
+            65..=72 => {
+                out.encoder_buttons.0 &= !(1 << (button - 65));
+            }
+            _ => {}
+        }
     }
 
     /// Diffs `output`'s button bits against the previous tick and
@@ -2753,6 +2993,11 @@ impl AppStateCore {
         // mid-session failover, so the next failure can fall over
         // once more.
         self.reset_fallback();
+        // B-2/A10: an explicit re-select also clears the UAC-decline
+        // latch — the user is choosing HIDMaestro again on purpose,
+        // so one fresh prompt is allowed. Automatic (re-)activation
+        // (`set_output_enabled`, startup) never clears it.
+        self.elevation_declined.store(false, Ordering::SeqCst);
         // Persist the choice first: a save failure errors out before
         // anything switches, and a failed switch still leaves the
         // user's choice recorded for the next launch.
@@ -2804,6 +3049,12 @@ impl AppStateCore {
         self.fallback_used.load(Ordering::SeqCst)
     }
 
+    /// UAC decline message (B-2/A10, v2.0.2): shown once when the user
+    /// declines the `HIDMaestro` elevation prompt. The switch fails with
+    /// this (no silent fallback to vJoy) and the decline latch blocks
+    /// automatic re-prompts until an explicit re-select.
+    pub const HID_NOT_ADMIN: &str = "HIDMaestro needs administrator rights — approve the UAC prompt to switch to it, or run RSH as administrator. vJoy needs no prompt.";
+
     /// Applies a backend switch through the selector with the given
     /// factories, and updates the live name / detail / selected choice
     /// on success. Shared by [`AppStateCore::set_output_backend`]
@@ -2822,6 +3073,19 @@ impl AppStateCore {
         requested: BackendKind,
         factories: &BackendFactories,
     ) -> Result<SwitchOutcome, String> {
+        // B-2: serialise switches — a second overlapping switch
+        // (user double-clicking, a poll-driven re-activation) would
+        // spawn a second elevated sidecar and a second UAC prompt.
+        let _switch_guard = self.switch_in_flight.try_lock().map_err(|_| {
+            "a backend switch is already in progress — wait for it to finish".to_string()
+        })?;
+        // B-2/A10: the user declined the UAC prompt this session.
+        // Fail fast with the NotAdmin message — no new prompt, no
+        // silent fallback. Only an explicit re-select clears this
+        // (see `set_output_backend`).
+        if requested == BackendKind::HidMaestro && self.elevation_declined.load(Ordering::SeqCst) {
+            return Err(Self::HID_NOT_ADMIN.to_string());
+        }
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
         // H2 latch, deep-scan Round 2 item 5: the selector's
         // same-kind path reconnects the INSTALLED instance, so a
@@ -2850,7 +3114,33 @@ impl AppStateCore {
             let mut backend = lock(&self.backend);
             switch_backend(&mut backend, requested, factories, None)
         };
-        let outcome = outcome.map_err(|error| error.to_string())?;
+        // B-2/A10: a UAC decline surfaces as a NotAdmin failure
+        // (or a fallback whose reason names it). Record the decline
+        // and FAIL the switch with the plain message — never silently
+        // fall back to vJoy (the user asked for HIDMaestro and must
+        // know it is not active) and never re-prompt automatically.
+        let outcome = match outcome {
+            Ok(outcome) => {
+                if outcome.fell_back
+                    && outcome
+                        .fallback_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("administrator rights"))
+                {
+                    self.elevation_declined.store(true, Ordering::SeqCst);
+                    return Err(Self::HID_NOT_ADMIN.to_string());
+                }
+                outcome
+            }
+            Err(error) => {
+                let error = error.to_string();
+                if requested == BackendKind::HidMaestro && error.contains("administrator rights") {
+                    self.elevation_declined.store(true, Ordering::SeqCst);
+                    return Err(Self::HID_NOT_ADMIN.to_string());
+                }
+                return Err(error);
+            }
+        };
         *lock(&self.selected_backend) = requested;
         let live_name = lock(&self.backend).name().to_string();
         let mut detail = live_backend_detail(outcome.active, vjoy_device_id);
@@ -3224,6 +3514,287 @@ impl AppStateCore {
         accum.n_enc = n_enc.min(MAX_ENCODERS);
     }
 
+    /// Records one frame's raw axis readings in mV, as reported by
+    /// whoever feeds frames into the engine (the transport forwarder
+    /// calls this per authenticated frame, next to
+    /// [`AppStateCore::note_frame_encoders`]; a test feeder driving
+    /// [`AppStateCore::engine_frame_sender`] directly calls it too).
+    /// This is the v2.0.2 capture plumbing: the pipeline only ever
+    /// sees the frame inside the engine, so without this slot the raw
+    /// values would never reach the state and no centre / pedal
+    /// endpoint could be captured from live data. Only the latest
+    /// frame is kept — capture samples "now", never a history.
+    pub fn note_raw_axes(&self, axes: [Option<u16>; MAX_AXES]) {
+        let mut sample = lock(&self.raw_axes);
+        sample.axes = axes;
+        sample.at = Some(Instant::now());
+    }
+
+    /// The latest raw ADC readings in mV ([`RawMv`](rsh_api::RawMv)):
+    /// one field per axis slot, [`None`] where the slot was absent
+    /// from the latest frame or no frame has arrived yet. The age is
+    /// measured from the sample's arrival — never invented.
+    #[must_use]
+    pub fn raw_mv(&self) -> RawMv {
+        let sample = lock(&self.raw_axes);
+        RawMv {
+            steering_mv: sample.axes[SLOT_STEERING],
+            accel_mv: sample.axes[1],
+            brake_mv: sample.axes[2],
+            clutch_mv: sample.axes[3],
+            handbrake_mv: sample.axes[4],
+            age_ms: sample
+                .at
+                .map(|at| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)),
+        }
+    }
+
+    /// The latest raw axes, but only when the sample is fresh at
+    /// `now` (see [`RAW_MV_FRESH_FOR`]). Takes the clock so tests can
+    /// prove staleness without sleeping. Errors honestly when no
+    /// frame was ever seen or the sample is stale — capture must
+    /// never save a dead wheel's last reading.
+    fn fresh_raw_axes_at(&self, now: Instant) -> Result<[Option<u16>; MAX_AXES], String> {
+        let sample = lock(&self.raw_axes);
+        let Some(at) = sample.at else {
+            return Err(
+                "no live wheel data yet — connect the wheel and wait for live data".to_string(),
+            );
+        };
+        let age = now.checked_duration_since(at).unwrap_or(Duration::ZERO);
+        if age > RAW_MV_FRESH_FOR {
+            return Err(format!(
+                "live wheel data is stale ({} ms since the last frame) — reconnect the wheel",
+                age.as_millis()
+            ));
+        }
+        Ok(sample.axes)
+    }
+
+    /// Capture the steering centre from the live raw reading: the
+    /// wheel must be held straight. The current steering mV is saved
+    /// as the active profile's centre (persisted to disk, and into
+    /// the draft when one exists so the live plan sees it at once),
+    /// the capture time is stamped, and the pipeline plan is pushed
+    /// live to the running engine. The existing steering min/max are
+    /// kept; with no steering calibration yet the centre is stored
+    /// with min = max = centre (same rule as
+    /// [`Self::save_calibration`]). Returns the captured mV.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when there is no fresh live reading, the
+    /// reading is out of range, there is no active profile, or the
+    /// save fails.
+    pub fn capture_centre(&self) -> Result<u16, String> {
+        let axes = self.fresh_raw_axes_at(Instant::now())?;
+        let centre = axes[SLOT_STEERING]
+            .ok_or_else(|| "no steering reading in the latest frame".to_string())?;
+        if centre > 3300 {
+            return Err(format!(
+                "steering reading {centre} mV is outside 0..=3300 mV"
+            ));
+        }
+        let mut store = lock(&self.store);
+        let active = store
+            .active()
+            .ok_or_else(|| "no active profile".to_string())?;
+        let mut profile = active.profile.clone();
+        let id = active.id.clone();
+        profile.calibrated_at_utc = format_system_time_rfc3339(SystemTime::now());
+        profile.steering_calibration = Some(match profile.steering_calibration {
+            Some(existing) => SteeringCalibration {
+                raw_min: existing.raw_min,
+                raw_center: i32::from(centre),
+                raw_max: existing.raw_max,
+                is_set: true,
+                is_millivolts: true,
+            },
+            None => SteeringCalibration {
+                raw_min: i32::from(centre),
+                raw_center: i32::from(centre),
+                raw_max: i32::from(centre),
+                is_set: true,
+                is_millivolts: true,
+            },
+        });
+        store
+            .update(&id, profile.clone())
+            .map_err(|error| error.to_string())?;
+        store.save().map_err(|error| error.to_string())?;
+        drop(store);
+        if let Some(draft) = lock(&self.draft).as_mut() {
+            draft.profile.steering_calibration = profile.steering_calibration;
+            draft
+                .profile
+                .calibrated_at_utc
+                .clone_from(&profile.calibrated_at_utc);
+        }
+        self.push_pipeline_plan();
+        Ok(centre)
+    }
+
+    /// Capture one pedal's released ("up") endpoint from the live raw
+    /// reading. See [`Self::capture_pedal_max`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an unknown pedal, no fresh live reading
+    /// (or that axis absent), an invalid resulting range, no active
+    /// profile, or a save failure.
+    pub fn capture_pedal_min(&self, pedal: &str) -> Result<u16, String> {
+        self.capture_pedal_endpoint(pedal, true)
+    }
+
+    /// Capture one pedal's fully-pressed ("down") endpoint from the
+    /// live raw reading. `pedal` is `"accel"` (or `"accelerator"`),
+    /// `"brake"`, `"clutch"`, or `"handbrake"` (case-insensitive).
+    /// The current mV is saved as that pedal's minimum / maximum:
+    /// into the pedal's calibration record (accel / brake / clutch)
+    /// AND into the module tuning's min/max, so the value reaches the
+    /// live pipeline plan (the plan reads pedal ranges from the
+    /// tuning, not from the calibration record). The handbrake has no
+    /// calibration record — only its module tuning is updated. The
+    /// profile is persisted to disk, the draft (when one exists) gets
+    /// the same values without being marked dirty (the capture is
+    /// already saved), the session tuning is updated so the Pedals
+    /// page shows the new endpoint, and the plan is pushed live.
+    /// Returns the captured mV.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an unknown pedal, no fresh live reading
+    /// (or that axis absent), an invalid resulting range, no active
+    /// profile, or a save failure.
+    pub fn capture_pedal_max(&self, pedal: &str) -> Result<u16, String> {
+        self.capture_pedal_endpoint(pedal, false)
+    }
+
+    /// Canonical pedal key, axis slot, and tuning module for a
+    /// capture pedal name. Unknown names are refused, never guessed.
+    fn pedal_capture_slot(pedal: &str) -> Result<(&'static str, usize, &'static str), String> {
+        match pedal.trim().to_ascii_lowercase().as_str() {
+            "accel" | "accelerator" => Ok(("accel", 1, "accelerator")),
+            "brake" => Ok(("brake", 2, "brake")),
+            "clutch" => Ok(("clutch", 3, "clutch")),
+            "handbrake" => Ok(("handbrake", 4, "handbrake")),
+            other => Err(format!(
+                "unknown pedal '{other}' (want accel, brake, clutch, or handbrake)"
+            )),
+        }
+    }
+
+    /// Shared half of [`Self::capture_pedal_min`] /
+    /// [`Self::capture_pedal_max`]: `is_min` captures the released
+    /// endpoint, otherwise the fully-pressed one. The other endpoint
+    /// comes from the captured record when one exists, else the live
+    /// tuning, else the range default — and the pair is validated with
+    /// the engine's own [`validate_pedal_range`] (min < max, span ≥
+    /// 660 mV), so a half-pressed capture is refused with the reason
+    /// instead of saving a useless range.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn capture_pedal_endpoint(&self, pedal: &str, is_min: bool) -> Result<u16, String> {
+        let (key, slot, module) = Self::pedal_capture_slot(pedal)?;
+        let axes = self.fresh_raw_axes_at(Instant::now())?;
+        let mv = axes[slot].ok_or_else(|| {
+            format!("no live reading for pedal '{key}' (axis not present in the latest frame)")
+        })?;
+        if mv > 3300 {
+            return Err(format!(
+                "pedal '{key}' reading {mv} mV is outside 0..=3300 mV"
+            ));
+        }
+        let tuning = self.get_tuning(module);
+        let mut store = lock(&self.store);
+        let active = store
+            .active()
+            .ok_or_else(|| "no active profile".to_string())?;
+        let mut profile = active.profile.clone();
+        let id = active.id.clone();
+        // The handbrake has no calibration record — only its module
+        // tuning carries the captured endpoints.
+        let record = match key {
+            "accel" => profile.accel_calibration.as_ref(),
+            "brake" => profile.brake_calibration.as_ref(),
+            "clutch" => profile.clutch_calibration.as_ref(),
+            _ => None,
+        };
+        let (current_min, current_max) = match record.filter(|c| c.is_set) {
+            Some(calibration) => (
+                u16::try_from(calibration.raw_min).unwrap_or(0),
+                u16::try_from(calibration.raw_max).unwrap_or(3300),
+            ),
+            None => (
+                tuning.min_mv.clamp(0.0, 3300.0) as u16,
+                tuning.max_mv.clamp(0.0, 3300.0) as u16,
+            ),
+        };
+        let (min_mv, max_mv) = if is_min {
+            (mv, current_max)
+        } else {
+            (current_min, mv)
+        };
+        validate_pedal_range(min_mv, max_mv).map_err(|error| match error {
+            CalibrationError::BadOrder => format!(
+                "pedal '{key}' minimum {min_mv} mV is not below its maximum {max_mv} mV — {} first, then capture the other end",
+                if is_min { "capture the maximum" } else { "capture the minimum" }
+            ),
+            CalibrationError::SpanTooNarrow { span_mv } => format!(
+                "pedal '{key}' range {min_mv}..={max_mv} mV spans only {span_mv} mV (need at least {MIN_SPAN_MV} mV) — move the pedal through its full travel and capture again"
+            ),
+            _ => format!("pedal '{key}' range {min_mv}..={max_mv} mV is invalid"),
+        })?;
+        profile.calibrated_at_utc = format_system_time_rfc3339(SystemTime::now());
+        if key != "handbrake" {
+            let slot = match key {
+                "accel" => &mut profile.accel_calibration,
+                "brake" => &mut profile.brake_calibration,
+                _ => &mut profile.clutch_calibration,
+            };
+            *slot = Some(PedalCalibration {
+                raw_min: i32::from(min_mv),
+                raw_max: i32::from(max_mv),
+                is_set: true,
+                is_millivolts: true,
+            });
+        }
+        // The pipeline reads pedal ranges from the module tuning, so
+        // the captured endpoint lands there too (store + draft +
+        // session tuning below).
+        let mut module_tuning = tuning.clone();
+        module_tuning.min_mv = f64::from(min_mv);
+        module_tuning.max_mv = f64::from(max_mv);
+        Self::apply_tuning_to_profile(&mut profile, &module_tuning);
+        store
+            .update(&id, profile.clone())
+            .map_err(|error| error.to_string())?;
+        store.save().map_err(|error| error.to_string())?;
+        drop(store);
+        if let Some(draft) = lock(&self.draft).as_mut() {
+            Self::apply_tuning_to_profile(&mut draft.profile, &module_tuning);
+            if key != "handbrake" {
+                let slot = match key {
+                    "accel" => &mut draft.profile.accel_calibration,
+                    "brake" => &mut draft.profile.brake_calibration,
+                    _ => &mut draft.profile.clutch_calibration,
+                };
+                *slot = Some(PedalCalibration {
+                    raw_min: i32::from(min_mv),
+                    raw_max: i32::from(max_mv),
+                    is_set: true,
+                    is_millivolts: true,
+                });
+            }
+            draft
+                .profile
+                .calibrated_at_utc
+                .clone_from(&profile.calibrated_at_utc);
+        }
+        lock(&self.tunings).insert(module_tuning.module.clone(), module_tuning);
+        self.push_pipeline_plan();
+        Ok(mv)
+    }
+
     /// Starts the engine task (idempotent: a second call while the
     /// task is running is a no-op `Ok`). Spawns the supervisor std
     /// thread, which runs one [`WheelEngine`](rsh_engine::engine::WheelEngine)
@@ -3505,7 +4076,18 @@ impl AppStateCore {
         *lock(&self.metrics)
     }
 
-    fn ingest_engine_output(&self, output: &PipelineOutputState, metrics: &EngineMetrics) {
+    /// Feed one engine tick into the snapshot + button-edge feed
+    /// and return the tick the backend should send: the pipeline
+    /// output with the persisted bindings applied
+    /// ([`AppStateCore::apply_bindings`]). The caller
+    /// ([`EngineSink`]) must send the returned value, not the raw
+    /// tick — otherwise a bound button would reach the game
+    /// un-remapped.
+    fn ingest_engine_output(
+        &self,
+        output: &PipelineOutputState,
+        metrics: &EngineMetrics,
+    ) -> PipelineOutputState {
         // Encoder counts come from the latest frame (reported by the
         // feeder via `note_frame_encoders`), not from the output's
         // deltas: the engine repeats the last output on ticks with no
@@ -3547,6 +4129,9 @@ impl AppStateCore {
             output: *output,
             metrics: *metrics,
         });
+        // `ingest_frame` stored the binding-remapped output as
+        // `last_output` — that is the tick the backend sends.
+        *lock(&self.last_output)
     }
 
     /// Sends one engine tick to the installed backend. When the
@@ -3695,6 +4280,557 @@ impl AppStateCore {
         Ok(summary)
     }
 
+    /* ------------------------------------------------------------------ */
+    /* Button→action bindings (v2.0.2, Round 2B)                          */
+    /* ------------------------------------------------------------------ */
+
+    /// All persisted button→action bindings, in button order.
+    #[must_use]
+    pub fn list_bindings(&self) -> Vec<ButtonBinding> {
+        lock(&self.bindings)
+            .list()
+            .iter()
+            .map(|(&button, action)| ButtonBinding {
+                button,
+                action: action.clone(),
+            })
+            .collect()
+    }
+
+    /// Bind `button` to `action` and persist it (v2.0.2). The
+    /// binding applies from the next engine tick on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingError`] with code `InvalidButton`,
+    /// `UnknownAction`, or `BindingSaveFailed`.
+    pub fn set_binding(&self, button: u8, action: &str) -> Result<ButtonBinding, BindingError> {
+        lock(&self.bindings).set(button, action)?;
+        Ok(ButtonBinding {
+            button,
+            action: action.to_string(),
+        })
+    }
+
+    /// Remove the binding for `button` and persist the removal.
+    /// Returns `true` when a binding was actually removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingError`] with code `BindingSaveFailed` when
+    /// the removal cannot be persisted.
+    pub fn clear_binding(&self, button: u8) -> Result<bool, BindingError> {
+        lock(&self.bindings).clear(button)
+    }
+
+    /// Load-time warnings from the bindings store (dropped entries,
+    /// corrupt file). Empty on a clean load; the daemon logs them at
+    /// startup so a dropped binding is never silent.
+    #[must_use]
+    pub fn binding_load_warnings(&self) -> Vec<String> {
+        self.binding_load_warnings.clone()
+    }
+
+    /// Drain the app actions queued by bound button presses (oldest
+    /// first). The daemon manager loop runs them — profile cycles
+    /// happen there, not on the 200 Hz engine tick.
+    #[must_use]
+    pub fn drain_binding_actions(&self) -> Vec<BindingAppAction> {
+        lock(&self.binding_actions).drain(..).collect()
+    }
+
+    /// Cycle the active profile to the next (`forward: true`) or
+    /// previous profile (wrap-around; a single profile stays put).
+    /// This is what a button bound to `profile_next` /
+    /// `profile_previous` runs. Activation saves + pushes the new
+    /// profile's pipeline plan, exactly like a manual switch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when there is no profile to switch to, or
+    /// the activation / save fails.
+    pub fn cycle_profile(&self, forward: bool) -> Result<ProfileSummary, String> {
+        let profiles = self.list_profiles();
+        if profiles.is_empty() {
+            return Err("no profiles to cycle through".to_string());
+        }
+        let current = self.active_profile().map(|summary| summary.id);
+        let index = current
+            .as_deref()
+            .and_then(|id| profiles.iter().position(|summary| summary.id == id));
+        let next = match index {
+            Some(i) if forward => (i + 1) % profiles.len(),
+            Some(i) => (i + profiles.len() - 1) % profiles.len(),
+            None => 0,
+        };
+        self.activate_profile(&profiles[next].id)
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* v2.0.2 Round 3: pairing reset, board address, module toggles,    */
+    /* auto-pause, tray, backup, profile rename/link, knobs, firmware   */
+    /* (B5, H2/H3/H4, H7, M1/M6/M7/M9, M-8) — backing impls for the     */
+    /* AppApi trait methods; the daemon maps the String errors to       */
+    /* typed UserError.                                                 */
+    /* ------------------------------------------------------------------ */
+
+    /// Reset pairing (B5): forget the pairing so the board can be
+    /// paired again. When the board reported `key_reset_armed` (the
+    /// user held BOOT ≥ 10 s, so the board's HELLO arms the reset),
+    /// the board rotates its key ([`Self::key_reset`]: gate closes,
+    /// PC-side records clear). Otherwise only the PC-side session
+    /// records clear — the board still holds its key, so the next
+    /// pairing goes through the replacement path, and the UI must tell
+    /// the user to hold BOOT ≥ 10 s for a clean reset. Never
+    /// auto-starts a new pairing: the user presses Pair when ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the board-side key reset fails.
+    pub fn reset_pairing(self: &Arc<Self>) -> Result<PairingStatus, String> {
+        if self.pairing_status_peek().key_reset_armed {
+            self.key_reset()?;
+        } else {
+            self.close_session_gate();
+            self.clear_session_records();
+        }
+        Ok(self.pairing_status_peek())
+    }
+
+    /// The board address the transport uses (H4): the persisted
+    /// `esp_ip` (sanitized to a private/loopback IPv4 literal on
+    /// write, default `192.168.4.1`). The transport reads this on
+    /// every connect, so persisting the address is what makes the
+    /// edit take effect.
+    #[must_use]
+    pub fn board_address(&self) -> String {
+        self.settings().esp_ip
+    }
+
+    /// Persist a new board address (H4). Only a private/loopback
+    /// IPv4 literal is accepted — a hostname such as `rsh.local` or
+    /// a public IP is rejected with a plain message instead of being
+    /// silently replaced by the default, so the user knows the edit
+    /// did not take. Returns the address actually stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the address is not a usable board IP
+    /// or the settings save fails.
+    pub fn set_board_address(self: &Arc<Self>, address: &str) -> Result<String, String> {
+        let address = address.trim();
+        let usable = address
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| is_allowed_board_ip(&ip));
+        if !usable {
+            return Err(format!(
+                "\"{address}\" is not a board address — enter the wheel's Wi-Fi IP \
+                 (for example 192.168.4.1)"
+            ));
+        }
+        let merged = self.set_settings_patch(AppSettingsPatch {
+            esp_ip: Some(address.to_string()),
+            ..Default::default()
+        })?;
+        Ok(merged.esp_ip)
+    }
+
+    /// Whether a module is enabled (H7): the draft's value wins (it
+    /// holds the latest edit), else the stored profile's flag, else
+    /// on — except clutch, whose pipeline default is off (see
+    /// [`Self::module_plan_tuning`]).
+    #[must_use]
+    pub fn module_enabled(&self, module: &str) -> bool {
+        let module = canonical_module_id(module);
+        if let Some(draft) = lock(&self.draft).as_ref()
+            && let Some(entry) = draft.profile.module_tunings.get(&module)
+        {
+            return entry.enabled;
+        }
+        lock(&self.store)
+            .active()
+            .and_then(|active| {
+                active
+                    .profile
+                    .module_tunings
+                    .get(&module)
+                    .map(|entry| entry.enabled)
+            })
+            .unwrap_or(module != "clutch")
+    }
+
+    /// Enable/disable a module (H7): writes the flag into the draft
+    /// (same pattern as [`Self::set_tuning`]) and pushes the rebuilt
+    /// pipeline plan live, so the toggle takes effect on the next
+    /// tick instead of only after Save. Persists on
+    /// [`Self::save_draft`]. LED has no pipeline slot — the flag
+    /// still persists and the card greys out; the toggle never fails
+    /// for a disconnected board.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when there is no active profile to draft
+    /// against.
+    pub fn set_module_enabled(
+        self: &Arc<Self>,
+        module: &str,
+        enabled: bool,
+    ) -> Result<bool, String> {
+        let module = canonical_module_id(module);
+        let active = {
+            lock(&self.store)
+                .active()
+                .map(|active| active.profile.clone())
+                .ok_or_else(|| "no active profile".to_string())?
+        };
+        {
+            let mut draft_slot = lock(&self.draft);
+            let draft = draft_slot.get_or_insert_with(|| ProfileDraft::new(active));
+            let entry = draft
+                .profile
+                .module_tunings
+                .entry(module.clone())
+                .or_default();
+            entry.enabled = enabled;
+            draft.mark_dirty(&module);
+        }
+        self.push_pipeline_plan();
+        Ok(enabled)
+    }
+
+    /// Whether auto-switch is paused (M6): the stored
+    /// `auto_switch_paused` flag.
+    #[must_use]
+    pub fn auto_pause(&self) -> bool {
+        self.settings().auto_switch_paused
+    }
+
+    /// Pause/resume automatic profile switching (M6): persists the
+    /// flag and actuates it — paused stops the auto-switch watcher
+    /// (see [`Self::sync_auto_switch_from_settings`]), resumed
+    /// restarts it when auto-switch is on. Returns the stored value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the settings save fails.
+    pub fn set_auto_pause(self: &Arc<Self>, paused: bool) -> Result<bool, String> {
+        let merged = self.set_settings_patch(AppSettingsPatch {
+            auto_switch_paused: Some(paused),
+            ..Default::default()
+        })?;
+        Ok(merged.auto_switch_paused)
+    }
+
+    /// Whether the window hides to the tray on close (M7 / A11):
+    /// the stored `close_to_tray` flag (default on).
+    #[must_use]
+    pub fn close_to_tray(&self) -> bool {
+        self.settings().close_to_tray
+    }
+
+    /// Persist the "keep running in the tray" choice (M7 / A11): the
+    /// UI's close handler reads this on every close, so the switch
+    /// takes effect immediately. Returns the stored value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the settings save fails.
+    pub fn set_close_to_tray(self: &Arc<Self>, enabled: bool) -> Result<bool, String> {
+        let merged = self.set_settings_patch(AppSettingsPatch {
+            close_to_tray: Some(enabled),
+            ..Default::default()
+        })?;
+        Ok(merged.close_to_tray)
+    }
+
+    /// Restore the newest present profiles backup (M7): `bak1` first,
+    /// else `bak2`. The restored profiles + active id replace the
+    /// live ones; the draft and the session tunings are dropped so no
+    /// stale edit can overwrite the restore on the next save, and the
+    /// pipeline plan is rebuilt from the restored profile. Returns a
+    /// plain summary naming the file and when it was saved.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no profiles backup exists or the
+    /// restore fails.
+    pub fn restore_latest_backup(&self) -> Result<String, String> {
+        let (generation, file, saved_at) = {
+            let store = lock(&self.store);
+            let backups = store.list_backups();
+            let pick = backups
+                .iter()
+                .find(|info| {
+                    info.file == "profiles.json" && info.generation == "bak1" && info.present
+                })
+                .or_else(|| {
+                    backups.iter().find(|info| {
+                        info.file == "profiles.json" && info.generation == "bak2" && info.present
+                    })
+                });
+            match pick {
+                Some(info) => (
+                    if info.generation == "bak1" {
+                        BackupGeneration::Bak1
+                    } else {
+                        BackupGeneration::Bak2
+                    },
+                    info.file.clone(),
+                    info.saved_at.clone(),
+                ),
+                None => {
+                    return Err(
+                        "no profiles backup to restore — backups are made automatically \
+                         when profiles change"
+                            .to_string(),
+                    );
+                }
+            }
+        };
+        {
+            let mut store = lock(&self.store);
+            store
+                .restore_backup(generation)
+                .map_err(|error| error.to_string())?;
+        }
+        *lock(&self.draft) = None;
+        lock(&self.tunings).clear();
+        self.push_pipeline_plan();
+        Ok(match saved_at {
+            Some(when) => format!("Restored {file} backup from {when}"),
+            None => format!("Restored {file} backup"),
+        })
+    }
+
+    /// Rename a profile (M1): validates the name, writes it into the
+    /// stored profile, and persists. When the renamed profile is the
+    /// active one, the draft's name is updated too, so the next Save
+    /// cannot overwrite the rename with the old name. The id never
+    /// changes — a rename is not a new profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an invalid name, an unknown id, or a
+    /// store save failure.
+    pub fn rename_profile(&self, id: &str, name: &str) -> Result<ProfileSummary, String> {
+        let errors = validate_profile_name(name);
+        if !errors.is_empty() {
+            return Err(format!("invalid profile name: {}", errors.join("; ")));
+        }
+        let name = name.trim().to_string();
+        let summary = {
+            let mut store = lock(&self.store);
+            let mut profile = store
+                .list()
+                .iter()
+                .find(|stored| stored.id == id)
+                .map(|stored| stored.profile.clone())
+                .ok_or_else(|| format!("no profile with id '{id}'"))?;
+            profile.name.clone_from(&name);
+            store
+                .update(id, profile)
+                .map_err(|error| error.to_string())?;
+            store.save().map_err(|error| error.to_string())?;
+            Self::summary(&store, id)?
+        };
+        if lock(&self.store)
+            .active()
+            .is_some_and(|active| active.id == id)
+            && let Some(draft) = lock(&self.draft).as_mut()
+        {
+            draft.profile.name = name;
+        }
+        Ok(summary)
+    }
+
+    /// Link a profile to a game (M1): sets the profile's game from
+    /// the slug (`"assetto_corsa"`, `"dirt_rally_2"`, …) and persists.
+    /// When the linked profile is the active one, the draft's game is
+    /// updated too, so the next Save cannot unlink it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an unknown game slug or id, or a store
+    /// save failure.
+    pub fn link_profile(&self, id: &str, game_slug: &str) -> Result<ProfileSummary, String> {
+        let game = game_id_from_slug(game_slug);
+        if game == GameId::Unknown {
+            return Err(format!("unknown game '{game_slug}'"));
+        }
+        let summary = {
+            let mut store = lock(&self.store);
+            let mut profile = store
+                .list()
+                .iter()
+                .find(|stored| stored.id == id)
+                .map(|stored| stored.profile.clone())
+                .ok_or_else(|| format!("no profile with id '{id}'"))?;
+            profile.game = game;
+            store
+                .update(id, profile)
+                .map_err(|error| error.to_string())?;
+            store.save().map_err(|error| error.to_string())?;
+            Self::summary(&store, id)?
+        };
+        if lock(&self.store)
+            .active()
+            .is_some_and(|active| active.id == id)
+            && let Some(draft) = lock(&self.draft).as_mut()
+        {
+            draft.profile.game = game;
+        }
+        Ok(summary)
+    }
+
+    /// Persisted knob actions (M9): `[[action; 3]; 2]` — knob 0/1,
+    /// row 0..=2, action id or `""` for not set.
+    #[must_use]
+    pub fn knob_actions(&self) -> [[String; 3]; 2] {
+        lock(&self.bindings).knobs()
+    }
+
+    /// Persist one knob action (M9): knob 0/1, row 0..=2, action id
+    /// or `""` to clear. Validates the knob/row and the action id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingError`] for an invalid knob, row, or action,
+    /// or a persist failure.
+    pub fn set_knob_action(&self, knob: u8, row: u8, action: &str) -> Result<(), String> {
+        lock(&self.bindings)
+            .set_knob(knob, row, action)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Firmware check (H3/M-8): the board's live version (from the
+    /// authenticated session, `"Unknown"` with no session) against
+    /// the bundled OTA image's version (parsed from the signed
+    /// image's `Version` marker — no signature check here; the flash
+    /// flow verifies before uploading). `update_available` is true
+    /// only when both versions parse and the bundled one is newer —
+    /// an unknown board version never claims an update.
+    #[must_use]
+    pub fn firmware_check(&self) -> FirmwareCheck {
+        let board = self
+            .firmware_version()
+            .unwrap_or_else(|_| "Unknown".to_string());
+        let bundled =
+            crate::data_dir().and_then(|dir| firmware_image::bundled_firmware_version(&dir));
+        let update_available = match &bundled {
+            Some(bundled) => {
+                firmware_image::compare_versions(bundled, &board)
+                    == Some(std::cmp::Ordering::Greater)
+            }
+            None => false,
+        };
+        FirmwareCheck {
+            board_version: board,
+            bundled_version: bundled,
+            update_available,
+        }
+    }
+
+    /// Current firmware-flash status (H-4): the background thread's
+    /// progress / outcome, or the idle default when no flash ever
+    /// started.
+    #[must_use]
+    pub fn firmware_update_status(&self) -> FirmwareUpdateStatus {
+        lock(&self.firmware_update).clone()
+    }
+
+    /// Start a firmware flash from the bundled OTA image (H-4): the
+    /// flash runs on a background thread (upload + board restart +
+    /// confirm takes minutes) and this returns the running status
+    /// immediately — the UI polls
+    /// [`Self::firmware_update_status`] for progress and the
+    /// confirmed version. Requires a live session (the board version
+    /// for the anti-downgrade check and the board id for the keystore
+    /// Wi-Fi password both come from it) and a bundled image. A
+    /// second start while one is running is an error, never a second
+    /// flash. The thread reports every stage into the status slot
+    /// and ends it with success + confirmed version, or failure +
+    /// the plain reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a flash is already running, there is
+    /// no live session, no bundled image, or no stored Wi-Fi
+    /// password for this board.
+    pub fn start_firmware_update(self: &Arc<Self>) -> Result<FirmwareUpdateStatus, String> {
+        if lock(&self.firmware_update).running {
+            return Err("a firmware update is already running — wait for it to finish".to_string());
+        }
+        let activation = self.session_activation().ok_or_else(|| {
+            "no live board session — connect the wheel and let it activate before updating \
+             its firmware"
+                .to_string()
+        })?;
+        let installed = activation.firmware;
+        let board_id = activation.board_id.clone();
+        let data_dir = crate::data_dir()
+            .ok_or_else(|| "could not resolve the RSH data directory".to_string())?;
+        let image_path = firmware_image::bundled_firmware_path(&data_dir).ok_or_else(|| {
+            "no bundled firmware image found — check for updates first".to_string()
+        })?;
+        let bundled = firmware_image::bundled_firmware_version(&data_dir).ok_or_else(|| {
+            "the bundled firmware image has no version — it may be corrupt".to_string()
+        })?;
+        // B6: validate the bundled image against the installed version
+        // before starting the flash — a bad image fails here with the
+        // typed wording, not mid-upload (the flash flow re-validates
+        // before any upload; this is the user-facing wording).
+        let validation = validate_firmware_image_against(&image_path, installed);
+        if let Some(err) = firmware_validation_user_error(&validation) {
+            return Err(format!("{} — {}", err.title, err.what_to_do));
+        }
+        let password = KeyStore::new().get_wifi_password(&board_id).map_err(|_| {
+            "no Wi-Fi password stored for this board — pair the wheel first".to_string()
+        })?;
+        let host: std::net::IpAddr = self
+            .settings()
+            .esp_ip
+            .parse()
+            .map_err(|_| "the stored board address is not an IP address".to_string())?;
+        let target = WebOtaTarget::new(host, password);
+        *lock(&self.firmware_update) = FirmwareUpdateStatus {
+            running: true,
+            stage: Some("validating".to_string()),
+            percent: None,
+            done: false,
+            success: false,
+            version: None,
+            error: None,
+        };
+        let state = Arc::clone(self);
+        std::thread::spawn(move || {
+            let mut progress = |report: crate::webota::FlashProgress| {
+                let mut slot = lock(&state.firmware_update);
+                slot.stage = Some(match report.stage {
+                    crate::webota::FlashStage::Validating => "validating".to_string(),
+                    crate::webota::FlashStage::Uploading => "uploading".to_string(),
+                    crate::webota::FlashStage::WaitingForRestart => "waitingForRestart".to_string(),
+                    crate::webota::FlashStage::Confirming => "confirming".to_string(),
+                });
+                slot.percent = report.percent;
+            };
+            let expected = bundled.clone();
+            let mut confirm =
+                || wait_for_board_version(&target, &expected, Duration::from_secs(30));
+            let result =
+                flash_firmware(&image_path, &target, installed, &mut progress, &mut confirm);
+            *lock(&state.firmware_update) = FirmwareUpdateStatus {
+                running: false,
+                stage: None,
+                percent: None,
+                done: true,
+                success: result.success,
+                version: result.version,
+                error: result.error,
+            };
+        });
+        Ok(self.firmware_update_status())
+    }
+
     /// Creates a profile with default tuning under `name` and persists.
     ///
     /// # Errors
@@ -3819,12 +4955,12 @@ impl AppStateCore {
     }
 
     /// Syncs the auto-switch watcher with the stored settings
-    /// (C-SET-1 / H3): when `auto_switch_profiles` is on, the
-    /// manual-override lock is cleared and the watcher thread starts
-    /// (when it is not running); when off, the thread stops. Called
-    /// after every settings write.
+    /// (C-SET-1 / H3): when `auto_switch_profiles` is on AND auto-pause
+    /// is off, the manual-override lock is cleared and the watcher
+    /// thread starts (when it is not running); when off — or paused
+    /// (M6) — the thread stops. Called after every settings write.
     fn sync_auto_switch_from_settings(self: &Arc<Self>, settings: &AppSettings) {
-        if settings.auto_switch_profiles {
+        if settings.auto_switch_profiles && !settings.auto_switch_paused {
             let cleared = {
                 let mut store = lock(&self.store);
                 if store.auto_switch_locked() {
@@ -4130,6 +5266,9 @@ impl AppStateCore {
                     .led_pattern
                     .as_deref()
                     .and_then(LedPattern::parse_name),
+                // M2/H8: stored colour (hex) + handbrake mode round-trip.
+                led_color: stored.led_color.as_deref().and_then(parse_hex_color),
+                handbrake_button_mode: stored.handbrake_button_mode,
             };
         }
         TuningSettings {
@@ -4144,6 +5283,8 @@ impl AppStateCore {
             horn_button: None,
             led_brightness: None,
             led_pattern: None,
+            led_color: None,
+            handbrake_button_mode: None,
         }
     }
 
@@ -4196,7 +5337,7 @@ impl AppStateCore {
             && let Some(pattern) = tuning.led_pattern
         {
             let brightness = tuning.led_brightness.unwrap_or(100);
-            let _ = self.led_test(pattern, Some(brightness), None);
+            let _ = self.led_test_with_color(pattern, Some(brightness), None, tuning.led_color);
         }
         Ok(tuning)
     }
@@ -4225,6 +5366,8 @@ impl AppStateCore {
                 horn_button: None,
                 led_brightness: None,
                 led_pattern: None,
+                led_color: None,
+                handbrake_button_mode: None,
             });
         entry.deadzone = tuning.deadzone / 100.0;
         entry.curve_strength = (tuning.curve - 1.0).clamp(-1.0, 1.0);
@@ -4235,6 +5378,9 @@ impl AppStateCore {
         entry.horn_button = tuning.horn_button;
         entry.led_brightness = tuning.led_brightness;
         entry.led_pattern = tuning.led_pattern.map(|pattern| pattern.name().to_string());
+        // M2/H8: colour persists as "#RRGGBB", handbrake mode as-is.
+        entry.led_color = tuning.led_color.map(|color| format!("#{color:06X}"));
+        entry.handbrake_button_mode = tuning.handbrake_button_mode;
         if let Some(gate) = tuning.shifter_gate {
             entry.gate_mode = match gate {
                 ShifterGate::Sequential => "Sequential".to_string(),
@@ -4675,6 +5821,32 @@ struct EngineEncoderAccum {
     n_enc: usize,
 }
 
+/// Latest raw axis readings in mV, as reported by the frame feeder
+/// (see [`AppStateCore::note_raw_axes`]). v2.0.2 capture plumbing:
+/// the engine consumes the frame's `axes_mv` inside the pipeline and
+/// the state used to only ever see the processed output — so a
+/// centre / pedal endpoint could never be captured from live data.
+/// The feeder now also reports the raw axes per frame (same pattern
+/// as [`EngineEncoderAccum`]), and the capture methods sample this
+/// slot. A sample older than [`RAW_MV_FRESH_FOR`] is refused by
+/// capture — a stale reading must never be saved as a calibration.
+#[derive(Clone, Copy, Debug, Default)]
+struct RawAxesSample {
+    /// Raw axis values in mV by slot 0–7 (`None` = slot not present).
+    axes: [Option<u16>; MAX_AXES],
+    /// When the sample arrived (`None` = no frame ever seen).
+    at: Option<Instant>,
+}
+
+/// A raw-mV sample counts as live for this long after the frame that
+/// carried it arrived. Frames flow at 200 Hz while the wheel is
+/// connected, so 2 s is generous against jitter and still refuses a
+/// reading from a wheel that dropped away.
+const RAW_MV_FRESH_FOR: Duration = Duration::from_secs(2);
+
+/// Raw axis slot for the steering centre capture (protocol §1.3).
+const SLOT_STEERING: usize = 0;
+
 /// The engine's [`PacketSource`](rsh_engine::engine::PacketSource):
 /// a tokio `mpsc` channel the transports feed. Awaiting the channel
 /// is cancellation-safe, so the engine's zero-timeout polls never lose
@@ -4705,14 +5877,15 @@ struct EngineSink {
 
 impl OutputSink for EngineSink {
     /// Send one processed tick: snapshot feed first (never fails the
-    /// send — a snapshot is bookkeeping), then the backend send.
+    /// send — a snapshot is bookkeeping), then the backend send of
+    /// the binding-remapped tick.
     fn send(&mut self, state: &PipelineOutputState) -> Result<(), SinkError> {
         // The plain-`send` path (the engine's final neutral in
         // `finish()`) has no live metrics of its own — it reuses the
         // last measured ones instead of resetting them to "unmeasured".
         let metrics = self.state.live_metrics();
-        self.state.ingest_engine_output(state, &metrics);
-        self.state.send_engine_output(state)
+        let remapped = self.state.ingest_engine_output(state, &metrics);
+        self.state.send_engine_output(&remapped)
     }
 
     /// Send one processed tick with the engine's live per-tick
@@ -4723,8 +5896,8 @@ impl OutputSink for EngineSink {
         state: &PipelineOutputState,
         metrics: &EngineMetrics,
     ) -> Result<(), SinkError> {
-        self.state.ingest_engine_output(state, metrics);
-        self.state.send_engine_output(state)
+        let remapped = self.state.ingest_engine_output(state, metrics);
+        self.state.send_engine_output(&remapped)
     }
 }
 
@@ -5576,6 +6749,18 @@ where
     Ok(())
 }
 
+/// Parse a stored LED colour (`"#RRGGBB"` or `"RRGGBB"`) into
+/// `0xRRGGBB` (M2, v2.0.2). Anything else (wrong length, non-hex)
+/// is `None` — never a guessed colour.
+#[must_use]
+pub fn parse_hex_color(text: &str) -> Option<u32> {
+    let hex = text.strip_prefix('#').unwrap_or(text);
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
 /// Builds the `LED_TEST` payload for a pattern + brightness
 /// (C-LED-1): the brightness (0–100 %) scales the base RGB before
 /// encoding, so a 50 % brightness halves every channel. The base
@@ -5599,6 +6784,29 @@ pub fn build_led_test_pattern(
     brightness: u8,
     period_ms: Option<u16>,
 ) -> Result<LedTestPattern, String> {
+    build_led_test_pattern_with_color(pattern, brightness, period_ms, None)
+}
+
+/// [`build_led_test_pattern`] with an explicit colour (M2, v2.0.2):
+/// `Some(0xRRGGBB)` tints the test flash; `None` is the historic
+/// white flash. Every channel scales with the brightness, so 0%
+/// brightness is dark whatever the colour.
+///
+/// # Errors
+///
+/// Returns an error when the period is outside 100..=5000 ms.
+///
+/// # Panics
+///
+/// Never panics in practice: both `expect` calls guard arithmetic
+/// bounded by construction (`255 * brightness <= 25500`, `/ 100 <=
+/// 255`; `base * channel / 255 <= 255`).
+pub fn build_led_test_pattern_with_color(
+    pattern: LedPattern,
+    brightness: u8,
+    period_ms: Option<u16>,
+    color: Option<u32>,
+) -> Result<LedTestPattern, String> {
     let period_ms = period_ms.unwrap_or(1000);
     if !(100..=5000).contains(&period_ms) {
         return Err(format!(
@@ -5608,13 +6816,26 @@ pub fn build_led_test_pattern(
     let brightness = brightness.min(100);
     // Integer scaling (rounds to nearest): 255 * brightness / 100,
     // exact — no float cast, so no truncation/sign-loss lint.
-    let channel = u8::try_from((255u32 * u32::from(brightness) + 50) / 100)
+    let base = u8::try_from((255u32 * u32::from(brightness) + 50) / 100)
         .expect("255 * brightness <= 25500, / 100 <= 255");
+    let (r, g, b) = match color {
+        Some(rgb) => {
+            let scale = |channel: u32| -> u8 {
+                u8::try_from(u32::from(base) * channel / 255).expect("base * channel / 255 <= 255")
+            };
+            (
+                scale((rgb >> 16) & 0xFF),
+                scale((rgb >> 8) & 0xFF),
+                scale(rgb & 0xFF),
+            )
+        }
+        None => (base, base, base),
+    };
     Ok(LedTestPattern {
         pattern_id: pattern.pattern_id(),
-        r: channel,
-        g: channel,
-        b: channel,
+        r,
+        g,
+        b,
         period_ms,
         repeats: 0,
     })
@@ -6353,6 +7574,10 @@ async fn forward_with_retry_with_policy<T, F>(
             // truth (see `note_frame_encoders`); report them before
             // handing the frame to the engine.
             state.note_frame_encoders(frame.encoders, frame.n_enc);
+            // v2.0.2 capture plumbing: the frame's raw mV is the
+            // capture source (see `note_raw_axes`) — reported for
+            // authenticated frames only, next to the encoders.
+            state.note_raw_axes(frame.axes_mv);
             if frame_tx.try_send(frame).is_err() {
                 // Channel full (engine behind) or closed (engine
                 // stopping): drop the newest frame, never block.
@@ -6414,6 +7639,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
+    use rsh_engine::encoder::EncoderButtons;
     use rsh_protocol::PinTableEntry;
     use rsh_security::keystore::KeystoreError;
 
@@ -7316,6 +8542,205 @@ mod tests {
         assert_eq!(state.take_learned_button(), None);
     }
 
+    // -- Button→action bindings (v2.0.2, Round 2B) --------------------
+
+    /// Drive one engine tick through the sink path (ingest +
+    /// backend send) the way [`EngineSink`] does, and return the
+    /// state the recording backend received.
+    fn drive_tick(
+        state: &AppStateCore,
+        sent: &Arc<Mutex<Vec<PipelineOutputState>>>,
+        output: &PipelineOutputState,
+    ) -> PipelineOutputState {
+        let remapped = state.ingest_engine_output(output, &EngineMetrics::new());
+        state
+            .send_engine_output(&remapped)
+            .expect("backend send succeeds");
+        sent.lock()
+            .expect("sent lock")
+            .last()
+            .copied()
+            .expect("backend received a tick")
+    }
+
+    /// Game-action bindings remap the tick before the backend sees
+    /// it: the source bit is cleared, the target is set — and with
+    /// no binding the tick passes through unchanged.
+    #[test]
+    fn bindings_remap_game_actions_before_backend_send() {
+        let (state, sent, _fail) = test_state_with_recording();
+        assert!(state.set_output_enabled(true).connected);
+        // No bindings yet: button 5 (bit 4) passes through.
+        let mut output = PipelineOutputState::neutral();
+        output.buttons = 1 << 4;
+        let received = drive_tick(&state, &sent, &output);
+        assert_eq!(received.buttons, 1 << 4);
+        assert!(!received.horn);
+        // Bind button 5 → horn, 6 → gear_2, 7 → handbrake.
+        state.set_binding(5, "horn").expect("bind 5");
+        state.set_binding(6, "gear_2").expect("bind 6");
+        state.set_binding(7, "handbrake").expect("bind 7");
+        let mut output = PipelineOutputState::neutral();
+        output.buttons = (1 << 4) | (1 << 5) | (1 << 6);
+        let received = drive_tick(&state, &sent, &output);
+        assert_eq!(
+            received.buttons,
+            1 << 2,
+            "only the horn bit (button 3) survives — source bits 4/5/6 are cleared"
+        );
+        assert!(received.horn, "horn flag follows the bound horn bit");
+        assert_eq!(received.gear, 2, "gear_2 sets the decoded gear field");
+        assert_eq!(received.handbrake, 1.0, "handbrake is full while held");
+        // Release: the next tick is clean again (per-tick override).
+        let received = drive_tick(&state, &sent, &PipelineOutputState::neutral());
+        assert_eq!(received.buttons, 0);
+        assert_eq!(received.gear, 0);
+        assert_eq!(received.handbrake, 0.0);
+    }
+
+    /// An encoder virtual button (65–72) bound to a game action
+    /// fires momentarily: the pulse is cleared and the target is
+    /// set for exactly that tick.
+    #[test]
+    fn bindings_remap_encoder_virtual_button() {
+        let (state, sent, _fail) = test_state_with_recording();
+        assert!(state.set_output_enabled(true).connected);
+        state.set_binding(65, "shifter_up").expect("bind 65");
+        let mut output = PipelineOutputState::neutral();
+        output.encoder_buttons = EncoderButtons(0b01); // button 65
+        let received = drive_tick(&state, &sent, &output);
+        assert_eq!(received.buttons, 1 << 0, "shifter_up = bit 0");
+        assert_eq!(
+            received.encoder_buttons.0, 0,
+            "the source pulse is consumed, not forwarded"
+        );
+    }
+
+    /// App-action bindings queue exactly one action per press edge:
+    /// holding the button does not repeat, and a fresh press after
+    /// release queues again. The raw button edge still reaches the
+    /// UI highlight (learn mode / `drain_button_presses` see the
+    /// physical button).
+    #[test]
+    fn bindings_app_action_queues_once_per_press_edge() {
+        let (state, _dir) = test_state();
+        state.set_binding(8, "profile_next").expect("bind 8");
+        state.set_binding(65, "profile_previous").expect("bind 65");
+        let mut output = PipelineOutputState::neutral();
+        output.buttons = 1 << 7; // button 8 pressed
+        output.encoder_buttons = EncoderButtons(0b01); // button 65 pulse
+        state.ingest_engine_output(&output, &EngineMetrics::new());
+        assert_eq!(
+            state.drain_binding_actions(),
+            vec![
+                BindingAppAction::ProfileNext,
+                BindingAppAction::ProfilePrevious
+            ]
+        );
+        // Held physical button: no repeat. (The encoder pulse is
+        // absent this tick — a pulse present on a tick IS an edge by
+        // construction, so it would fire again.)
+        let mut held = PipelineOutputState::neutral();
+        held.buttons = 1 << 7; // button 8 still held, no pulse
+        state.ingest_engine_output(&held, &EngineMetrics::new());
+        assert_eq!(state.drain_binding_actions().len(), 0);
+        // Release, then press again: one more action.
+        state.ingest_engine_output(&PipelineOutputState::neutral(), &EngineMetrics::new());
+        assert_eq!(state.drain_binding_actions().len(), 0);
+        state.ingest_engine_output(&output, &EngineMetrics::new());
+        assert_eq!(
+            state.drain_binding_actions(),
+            vec![
+                BindingAppAction::ProfileNext,
+                BindingAppAction::ProfilePrevious
+            ]
+        );
+        // The raw edge still reached the button-press feed.
+        let events = state.drain_button_presses();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.button == 8 && event.pressed),
+            "raw edge survives for the UI highlight: {events:?}"
+        );
+    }
+
+    /// `cycle_profile` wraps around in both directions and activates
+    /// (saves + pushes the plan) exactly like a manual switch.
+    #[test]
+    fn cycle_profile_wraps_around() {
+        let (state, _dir) = test_state();
+        let first = activate_first_profile(&state);
+        state.create_profile("Second").expect("create second");
+        let second = state
+            .list_profiles()
+            .into_iter()
+            .find(|summary| summary.name == "Second")
+            .expect("second profile listed")
+            .id;
+        assert_eq!(state.cycle_profile(true).expect("cycle next").id, second);
+        assert_eq!(
+            state.cycle_profile(true).expect("cycle next wraps").id,
+            first
+        );
+        assert_eq!(
+            state.cycle_profile(false).expect("cycle prev wraps").id,
+            second
+        );
+        assert_eq!(
+            state.active_profile().expect("active").id,
+            second,
+            "the cycled-to profile is the active one"
+        );
+    }
+
+    /// Bindings persist across a state reopen (same data dir), and
+    /// a corrupt bindings file surfaces as a load warning instead
+    /// of failing the open.
+    #[test]
+    fn bindings_persist_across_reopen_and_corrupt_file_warns() {
+        let (state, dir) = test_state();
+        state.set_binding(5, "horn").expect("bind 5");
+        drop(state);
+        let reopened = AppStateCore::open_with_null_sink(&dir).expect("reopen state with bindings");
+        assert_eq!(reopened.list_bindings().len(), 1);
+        assert_eq!(reopened.list_bindings()[0].button, 5);
+        assert_eq!(reopened.list_bindings()[0].action, "horn");
+        assert_eq!(reopened.binding_load_warnings().len(), 0);
+        assert!(reopened.clear_binding(5).expect("clear 5"));
+        drop(reopened);
+        // Corrupt the file, then reopen: the state still opens, the
+        // bindings are empty, and the warning names the problem.
+        std::fs::write(dir.join("bindings.json"), "{corrupt").expect("write corrupt file");
+        let repaired = AppStateCore::open_with_null_sink(&dir).expect("reopen with corrupt file");
+        assert_eq!(repaired.list_bindings().len(), 0);
+        assert_eq!(repaired.binding_load_warnings().len(), 1);
+        assert!(
+            repaired.binding_load_warnings()[0].contains("not valid JSON"),
+            "warning: {:?}",
+            repaired.binding_load_warnings()
+        );
+    }
+
+    /// Binding validation errors carry stable codes through the
+    /// state methods.
+    #[test]
+    fn binding_errors_carry_stable_codes() {
+        let (state, _dir) = test_state();
+        assert_eq!(
+            state.set_binding(0, "horn").expect_err("button 0").code,
+            "InvalidButton"
+        );
+        assert_eq!(
+            state
+                .set_binding(5, "warp_drive")
+                .expect_err("unknown action")
+                .code,
+            "UnknownAction"
+        );
+        assert!(!state.clear_binding(5).expect("clear absent"));
+    }
+
     // -- Deep-scan Phase 2 regressions -----------------------------------
 
     /// C2 / C-SET-1: a partial settings patch never wipes the fields
@@ -7683,6 +9108,236 @@ mod tests {
         let mut bad = read_back.clone();
         bad.pedal_min_mv.insert("accel".to_string(), 4000.0);
         assert!(state.save_calibration(bad).is_err());
+    }
+
+    /// v2.0.2 capture plumbing: the latest frame's raw axes reach
+    /// the state through `note_raw_axes`, and `raw_mv` reports them
+    /// with an age — never a fake 0 before any frame arrives.
+    #[test]
+    fn raw_mv_reports_latest_frame_axes_and_age() {
+        let (state, _dir) = test_state();
+        let empty = state.raw_mv();
+        assert_eq!(empty.steering_mv, None);
+        assert_eq!(empty.accel_mv, None);
+        assert_eq!(empty.age_ms, None);
+        state.note_raw_axes([
+            Some(1812),
+            Some(320),
+            Some(300),
+            None,
+            Some(250),
+            None,
+            None,
+            None,
+        ]);
+        let reading = state.raw_mv();
+        assert_eq!(reading.steering_mv, Some(1812));
+        assert_eq!(reading.accel_mv, Some(320));
+        assert_eq!(reading.brake_mv, Some(300));
+        assert_eq!(reading.clutch_mv, None);
+        assert_eq!(reading.handbrake_mv, Some(250));
+        assert!(reading.age_ms.is_some(), "a noted sample has an age");
+        // A newer frame replaces the sample (capture samples "now").
+        state.note_raw_axes([
+            Some(1790),
+            Some(400),
+            Some(310),
+            Some(900),
+            None,
+            None,
+            None,
+            None,
+        ]);
+        let newer = state.raw_mv();
+        assert_eq!(newer.steering_mv, Some(1790));
+        assert_eq!(newer.clutch_mv, Some(900));
+        assert_eq!(newer.handbrake_mv, None);
+    }
+
+    /// v2.0.2: a sample older than the freshness window is refused
+    /// (proven through the clock-taking half, so the test never
+    /// sleeps), while a fresh sample is accepted.
+    #[test]
+    fn fresh_raw_axes_refuses_a_stale_sample() {
+        let (state, _dir) = test_state();
+        assert!(
+            state.fresh_raw_axes_at(Instant::now()).is_err(),
+            "no frame ever seen must fail, not invent a reading"
+        );
+        state.note_raw_axes([Some(1800), None, None, None, None, None, None, None]);
+        assert!(state.fresh_raw_axes_at(Instant::now()).is_ok());
+        let aged = state.fresh_raw_axes_at(Instant::now() + Duration::from_secs(3));
+        assert!(aged.is_err(), "a 3 s old sample must be refused");
+    }
+
+    /// v2.0.2: centre capture needs live data, then saves the live
+    /// steering reading as the centre — and the live pipeline plan
+    /// picks it up.
+    #[test]
+    fn capture_centre_needs_live_data_and_drives_the_plan() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        assert!(
+            state.capture_centre().is_err(),
+            "no live frame yet: capture must fail, not save a default"
+        );
+        state.note_raw_axes([
+            Some(1812),
+            Some(300),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(state.capture_centre().expect("capture centre"), 1812);
+        let read_back = state.get_calibration().expect("read calibration");
+        assert_eq!(read_back.steering_center_mv, 1812.0);
+        assert!(read_back.calibrated_at.is_some(), "capture stamps the time");
+        assert_eq!(state.build_pipeline_plan().steering.center_mv, 1812);
+    }
+
+    /// v2.0.2: pedal min/max capture round-trips through the
+    /// calibration record AND the module tuning, and the live plan
+    /// uses the captured range.
+    #[test]
+    fn capture_pedal_min_max_round_trips_and_drives_the_plan() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        state.note_raw_axes([
+            Some(1800),
+            Some(320),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            state.capture_pedal_min("accel").expect("capture accel min"),
+            320
+        );
+        state.note_raw_axes([
+            Some(1800),
+            Some(3200),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            state.capture_pedal_max("accel").expect("capture accel max"),
+            3200
+        );
+        let tuning = state.get_tuning("accelerator");
+        assert_eq!(tuning.min_mv, 320.0);
+        assert_eq!(tuning.max_mv, 3200.0);
+        let plan = state.build_pipeline_plan();
+        assert_eq!(plan.accelerator.min_mv, 320);
+        assert_eq!(plan.accelerator.max_mv, 3200);
+        // The centre is untouched by a pedal capture: no steering
+        // calibration exists yet, so the calibration read still
+        // errors instead of inventing a centre.
+        assert!(state.get_calibration().is_err());
+    }
+
+    /// v2.0.2: a half-pressed capture is refused (span < 660 mV),
+    /// an inverted range is refused, and an unknown pedal name is
+    /// refused — never saved as a useless range.
+    #[test]
+    fn capture_pedal_rejects_narrow_span_inverted_range_and_unknown_pedal() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        assert!(state.capture_pedal_min("gear").is_err());
+        // Pedal barely moved: min 3000 against the 3300 default max
+        // spans 300 mV < 660 mV.
+        state.note_raw_axes([
+            Some(1800),
+            Some(3000),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert!(state.capture_pedal_min("accel").is_err());
+        // A real min, then a max below it: inverted.
+        state.note_raw_axes([
+            Some(1800),
+            Some(320),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(state.capture_pedal_min("accel").expect("capture min"), 320);
+        state.note_raw_axes([
+            Some(1800),
+            Some(200),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert!(
+            state.capture_pedal_max("accel").is_err(),
+            "max below min must fail"
+        );
+    }
+
+    /// v2.0.2: the handbrake has no calibration record, but its
+    /// endpoints still capture into the module tuning + live plan.
+    #[test]
+    fn capture_handbrake_endpoints_land_in_tuning_and_plan() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        state.note_raw_axes([
+            Some(1800),
+            Some(300),
+            Some(300),
+            None,
+            Some(250),
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            state
+                .capture_pedal_min("handbrake")
+                .expect("capture handbrake min"),
+            250
+        );
+        state.note_raw_axes([
+            Some(1800),
+            Some(300),
+            Some(300),
+            None,
+            Some(3100),
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            state
+                .capture_pedal_max("handbrake")
+                .expect("capture handbrake max"),
+            3100
+        );
+        let tuning = state.get_tuning("handbrake");
+        assert_eq!(tuning.min_mv, 250.0);
+        assert_eq!(tuning.max_mv, 3100.0);
+        let plan = state.build_pipeline_plan();
+        assert_eq!(plan.handbrake.min_mv, 250);
+        assert_eq!(plan.handbrake.max_mv, 3100);
     }
 
     /* ------------------------------------------------------------------ */

@@ -20,8 +20,9 @@ pub mod pairing;
 pub mod tuning;
 
 pub use api::{
-    ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionInfo, DiagStats, GameSummary,
-    PairingInfo, ProfileSummary, SnapshotInfo, VjoyStatus, app_version,
+    ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionInfo, DiagStats,
+    FirmwareCheck, FirmwareUpdateStatus, GameSummary, PairingInfo, ProfileSummary, RawMv,
+    SnapshotInfo, VjoyStatus, app_version,
 };
 pub use connection::{
     BACKOFF_BASE, BACKOFF_MAX, BAD_TAG_RETRY_DELAY, ConnEvent, ConnectionManager, ConnectionState,

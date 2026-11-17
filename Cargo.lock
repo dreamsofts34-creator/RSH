@@ -1706,7 +1706,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.7.4",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -3023,6 +3023,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "i-slint-backend-qt"
+version = "1.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a32cd6edc5422d1525fbe4ed29635b642fdbb26ae7036abc20eee063faa45d4a"
+dependencies = [
+ "const-field-offset",
+ "i-slint-common",
+ "i-slint-core",
+ "i-slint-core-macros",
+ "vtable",
+]
+
+[[package]]
 name = "i-slint-backend-selector"
 version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3031,6 +3044,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "i-slint-backend-linuxkms",
+ "i-slint-backend-qt",
  "i-slint-backend-testing",
  "i-slint-backend-winit",
  "i-slint-common",
@@ -6088,6 +6102,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsh-gate-ui"
+version = "2.0.1"
+dependencies = [
+ "i-slint-backend-testing",
+ "i-slint-core",
+ "slint-interpreter",
+ "spin_on",
+]
+
+[[package]]
 name = "rsh-ipc"
 version = "2.0.1"
 dependencies = [
@@ -6152,6 +6176,8 @@ dependencies = [
  "rsh-app-core",
  "rsh-benchmarks",
  "rsh-engine",
+ "rsh-ipc",
+ "rsh-output",
  "rsh-profiles",
  "rsh-protocol",
  "rsh-security",
@@ -6196,10 +6222,12 @@ dependencies = [
  "dirs 7.0.0",
  "rsh-api",
  "rsh-ipc",
+ "serde",
  "serde_json",
  "slint",
  "slint-build",
  "tokio",
+ "windows",
 ]
 
 [[package]]
@@ -6892,6 +6920,29 @@ dependencies = [
  "i-slint-compiler",
  "spin_on",
  "toml_edit 0.25.19+spec-1.1.0",
+]
+
+[[package]]
+name = "slint-interpreter"
+version = "1.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "645cf39fcf871b5b49f7319973e8dee7af03ee51c5a2c8e1e7466d72acc8b217"
+dependencies = [
+ "derive_more",
+ "i-slint-backend-linuxkms",
+ "i-slint-backend-selector",
+ "i-slint-backend-winit",
+ "i-slint-common",
+ "i-slint-compiler",
+ "i-slint-core",
+ "i-slint-core-macros",
+ "itertools 0.15.0",
+ "lyon_path",
+ "smol_str 0.3.7",
+ "typed-index-collections",
+ "unicode-segmentation",
+ "vtable",
+ "web-sys",
 ]
 
 [[package]]

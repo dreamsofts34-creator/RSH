@@ -2,7 +2,8 @@
 //! v2.0.1 hotfix: UI core (daemon self-heal, first-run wizard,
 //! wired Settings / Pedals / Buttons, diagnostics drawer, theme
 //! persist) + UI-FINISH deep-scan fixes (see the fix notes on each
-//! function: A1–A25, B1–B7, C1–C8, D, E).
+//! function: A1–A25, B1–B7, C1–C8, D, E) + v2.0.2 Round 2A
+//! (daemon-down honesty + hang/startup fixes: B1–B4, H1, H5, H10).
 //!
 //! Binary driver for the Slint main window. Data flows through the
 //! real `rsh_api::AppApi` trait behind `Arc<dyn AppApi>`: the live
@@ -23,6 +24,13 @@
 //! User-facing text never says "daemon" / "Simulated data" — the
 //! background service is called by its plain name.
 //!
+//! Startup (B4): the window shows first with a "Connecting…"
+//! state; a background health-monitor thread probes (spawning the
+//! daemon when needed) and swaps live data in when it answers.
+//! The same thread pings the daemon every second (B2): on a death
+//! it clears stale values, shows Disconnected + Reconnect, and
+//! re-probes in the background until the daemon is back.
+//!
 //! CLI: --page overview|steering|pedals|buttons|extras|settings|about|setup
 //!      --static            render once, no simulation timer
 //!      --quit-after SECONDS
@@ -40,20 +48,23 @@ mod ipc_api;
 mod live_probe;
 mod notifications;
 mod sim_api;
+mod ui_lifecycle;
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rsh_api::connection::ConnectionState;
 use rsh_api::pairing::countdown_ring_commands;
 use rsh_api::{
-    ApiTransport, AppApi, AppEvent, CalibrationInfo, GameSummary, LedPattern, ProfileSummary,
-    ShifterGate, TuningSettings,
+    ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionInfo, FirmwareCheck,
+    FirmwareUpdateStatus, GameSummary, LedPattern, PairingInfo, ProfileSummary, ShifterGate,
+    SnapshotInfo, TuningSettings, UserError,
 };
 use slint::{Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
@@ -96,12 +107,12 @@ const DEFAULT_BUTTON_ACTIONS: [&str; 12] = [
 /// field of the pedal's stored tuning record).
 const FEEL_EXPONENTS: [f32; 3] = [1.0, 0.7, 1.5];
 
-/// Rewrite user-facing "daemon" wording (C1): the background service
-/// is called by its plain name, never "daemon" / "Simulated data".
+/// Rewrite user-facing "daemon" wording (C1/L3): the background
+/// service is called "RSH", never "daemon" / "Simulated data".
 #[must_use]
 pub fn user_text(s: &str) -> String {
-    s.replace("Daemon", "Background service")
-        .replace("daemon", "background service")
+    s.replace("Daemon", "RSH")
+        .replace("daemon", "RSH")
         .replace("Simulated data", "Live data unavailable")
 }
 
@@ -114,6 +125,17 @@ pub fn mv_text(mv: f64) -> String {
         "—".to_string()
     } else {
         format!("{mv:.0} mV")
+    }
+}
+
+/// Pedal index (0 throttle, 1 brake, 2 clutch — see
+/// `ui/screens/pedals.slint`) → capture pedal key + display name.
+fn pedal_key(index: i32) -> Option<(&'static str, &'static str)> {
+    match index {
+        0 => Some(("accel", "Accelerator")),
+        1 => Some(("brake", "Brake")),
+        2 => Some(("clutch", "Clutch")),
+        _ => None,
     }
 }
 
@@ -141,20 +163,84 @@ pub fn pedal_marker(pct: f32, deadzone_pct: f32, exponent: f32) -> (f32, f32) {
     (6.0 + pct / 100.0 * 98.0, 104.0 - out / 100.0 * 98.0)
 }
 
-/// Tile code letters from a game name: first letters of the first
-/// two words ("Assetto Corsa" → "AC", "iRacing" → "IR").
+/// Tile code letters from a game name (H6): first letters of up to
+/// three letter-starting words, uppercased — "Assetto Corsa" → "AC",
+/// "Assetto Corsa Competizione" → "ACC" (no more AC/ACC collision),
+/// "Dirt Rally 2.0" → "DR" ("2.0" starts with a digit, skipped);
+/// a single word gives its first two letters, case preserved
+/// ("iRacing" → "iR"). An all-caps abbreviation as the first word
+/// (2–3 letters) is taken whole, plus the next word's initial
+/// ("AC Competizione" → "ACC").
 #[must_use]
 pub fn game_code(name: &str) -> String {
     let words: Vec<&str> = name.split_whitespace().collect();
     if words.len() >= 2 {
+        let first = words[0];
+        if first.len() >= 2 && first.len() <= 3 && first.chars().all(|c| c.is_ascii_uppercase()) {
+            let second = words[1..]
+                .iter()
+                .find(|w| w.chars().next().is_some_and(char::is_alphabetic));
+            return match second {
+                Some(w) => {
+                    format!("{}{}", first, w.chars().next().unwrap_or_default()).to_uppercase()
+                }
+                None => first.to_string(),
+            };
+        }
         words
             .iter()
-            .take(2)
+            .filter(|w| w.chars().next().is_some_and(char::is_alphabetic))
+            .take(3)
             .filter_map(|w| w.chars().next())
             .collect::<String>()
             .to_uppercase()
     } else {
-        name.chars().take(2).collect::<String>().to_uppercase()
+        name.chars().take(2).collect::<String>()
+    }
+}
+
+/// Display name ↔ backend action id for button/knob bindings (H-3 /
+/// B1 wiring): the Buttons screen shows display names ("Shift up",
+/// "Gear 3"), the daemon stores ids (`shifter_up`, `gear_3`).
+/// "Not set" (and anything unknown) maps to no id — saving it clears
+/// the binding.
+#[must_use]
+pub fn action_id(display: &str) -> Option<&'static str> {
+    match display {
+        "Shift up" => Some("shifter_up"),
+        "Shift down" => Some("shifter_down"),
+        "Horn" => Some("horn"),
+        "Gear 1" => Some("gear_1"),
+        "Gear 2" => Some("gear_2"),
+        "Gear 3" => Some("gear_3"),
+        "Gear 4" => Some("gear_4"),
+        "Gear 5" => Some("gear_5"),
+        "Gear 6" => Some("gear_6"),
+        "Handbrake" => Some("handbrake"),
+        _ => None,
+    }
+}
+
+/// Backend action id → display name (H-3): the inverse of
+/// [`action_id`]. App actions have display names too ("Next
+/// profile") even though the Buttons screen offers no chip for
+/// them — a stored app-action binding still reads correctly.
+#[must_use]
+pub fn action_display(id: &str) -> &'static str {
+    match id {
+        "shifter_up" => "Shift up",
+        "shifter_down" => "Shift down",
+        "horn" => "Horn",
+        "gear_1" => "Gear 1",
+        "gear_2" => "Gear 2",
+        "gear_3" => "Gear 3",
+        "gear_4" => "Gear 4",
+        "gear_5" => "Gear 5",
+        "gear_6" => "Gear 6",
+        "handbrake" => "Handbrake",
+        "profile_next" => "Next profile",
+        "profile_previous" => "Previous profile",
+        _ => "Not set",
     }
 }
 
@@ -199,18 +285,28 @@ pub fn chart_commands(samples: &VecDeque<f32>, min_v: f32, max_v: f32) -> String
     out
 }
 
-/// Static LED strip preview (8 circles) from pattern + brightness:
-/// Off is dark; any lit pattern shows the accent at the set
-/// brightness (a still preview, not a live strip — the strip itself
-/// is not readable through the API).
+/// LED swatch palette (M2, `extras.slint` order): the six colours
+/// the user can pick, as 0xRRGGBB. Index 3 is the historic accent
+/// blue — the default when no colour is stored yet.
+pub const LED_PALETTE: [u32; 6] = [
+    0xFF_6B_6B, 0xF5_B8_4A, 0x3D_D6_8C, 0x2F_6B_FF, 0xB4_6C_FF, 0xFF_FF_FF,
+];
+
+/// Static LED strip preview (8 circles) from pattern + brightness +
+/// colour (M2): Off is dark; any lit pattern shows the STORED colour
+/// at the set brightness (a still preview, not a live strip — the
+/// strip itself is not readable through the API). `None` keeps the
+/// historic accent blue (no colour stored yet).
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn led_preview(pattern: LedPattern, brightness: u8) -> Vec<Color> {
+pub fn led_preview(pattern: LedPattern, brightness: u8, color: Option<u32>) -> Vec<Color> {
     if pattern == LedPattern::Off {
         return vec![Color::from_rgb_u8(0x1D, 0x25, 0x33); 8];
     }
     let b = f32::from(brightness) / 100.0;
-    let (r, g, bl) = (47.0, 107.0, 255.0);
+    let rgb = color.unwrap_or(0x2F_6B_FF);
+    let [_, r, g, bl] = rgb.to_be_bytes();
+    let (r, g, bl) = (f32::from(r), f32::from(g), f32::from(bl));
     let (br, bg, bb) = (13.0, 17.0, 24.0);
     let mix = |c: f32, base: f32| (base + (c - base) * b).round().clamp(0.0, 255.0) as u8;
     vec![Color::from_rgb_u8(mix(r, br), mix(g, bg), mix(bl, bb)); 8]
@@ -403,22 +499,23 @@ fn parse_args() -> Args {
     a
 }
 
-/// Read the persisted UI theme (0 Dark, 1 Auto) from
-/// `<data_dir>/ui-theme` ("Dark"/"Auto", default Dark). Auto
-/// renders as Dark — no light tokens exist.
+/// Read the persisted UI theme choice (0 Dark, 1 Light, 2 Auto)
+/// from `<data_dir>/ui-theme` ("Dark"/"Light"/"Auto", default
+/// Dark). The returned index is the STORED choice — callers resolve
+/// Auto via [`resolve_theme_mode`] before setting the window theme.
 fn read_theme(data_dir: Option<&PathBuf>) -> i32 {
     let Some(dir) = data_dir else {
         return 0;
     };
     match std::fs::read_to_string(dir.join("ui-theme")) {
-        Ok(text) if text.trim() == "Auto" => 1,
+        Ok(text) if text.trim() == "Light" => 1,
+        Ok(text) if text.trim() == "Auto" => 2,
         _ => 0,
     }
 }
 
 /// Persist the UI theme choice (`settings_idx` is the Settings
-/// screen index: 0 Dark, 1 Light, 2 Auto — Light has no tokens, so
-/// it persists as Dark).
+/// screen index: 0 Dark, 1 Light, 2 Auto).
 fn write_theme(data_dir: Option<&PathBuf>, settings_idx: i32) {
     let Some(dir) = data_dir else {
         return;
@@ -426,22 +523,185 @@ fn write_theme(data_dir: Option<&PathBuf>, settings_idx: i32) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let text = if settings_idx == 2 { "Auto" } else { "Dark" };
+    let text = match settings_idx {
+        1 => "Light",
+        2 => "Auto",
+        _ => "Dark",
+    };
     match std::fs::write(dir.join("ui-theme"), format!("{text}\n")) {
         Ok(()) => eprintln!("RSH-UI theme persisted: {text}"),
         Err(e) => eprintln!("RSH-UI theme persist failed: {e}"),
     }
 }
 
+/// Resolve a stored theme choice to the window theme (0 Dark,
+/// 1 Light). Dark/Light are used as stored; Auto follows the OS
+/// preference (`system_light`). Pure — unit-tested below.
+fn resolve_theme_mode(choice: i32, system_light: bool) -> i32 {
+    match choice {
+        1 => 1,
+        2 => i32::from(system_light),
+        _ => 0,
+    }
+}
+
+/// Whether the OS currently prefers a light theme (A8/Auto,
+/// Windows): `AppsUseLightTheme` under the Personalize key.
+/// Best-effort — any failure (no `reg`, no key) means Dark.
+#[cfg(windows)]
+fn system_light() -> bool {
+    let Ok(out) = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "/v",
+            "AppsUseLightTheme",
+        ])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout).contains("0x1")
+}
+
+/// Whether the OS currently prefers a light theme (A8/Auto):
+/// non-Windows has no system light preference wired yet — Dark.
+#[cfg(not(windows))]
+fn system_light() -> bool {
+    false
+}
+
 /// Swappable data source (v2.0.1 hotfix): the active [`AppApi`]
-/// plus both backends. Reconnect re-probes (spawning the daemon when
-/// needed) and swaps `api` to live without restarting; the
-/// sim stays stored — frozen, not advanced — as the fallback.
+/// plus the live link. Reconnect re-probes (spawning the daemon when
+/// needed) and swaps `api` to live without restarting; the sim is
+/// the startup fallback and is dropped once live takes over.
 struct LiveState {
     api: Arc<dyn AppApi>,
     live_api: Option<Arc<IpcApi>>,
-    sim_api: Option<Arc<SimApi>>,
     live: bool,
+    /// True while the first probe is still running (B4): the window
+    /// shows "Connecting…" until the health monitor resolves it.
+    connecting: bool,
+    /// Transport of the last live session (H1): Reconnect re-uses
+    /// it (USB stays USB) instead of forcing Wi-Fi.
+    last_transport: ApiTransport,
+}
+
+/// One tuning field waiting for its debounced daemon push (M-7).
+/// (The steering curve is not here: the whole steering record goes
+/// through `push_steering`'s debounced push instead.)
+#[derive(Clone, Copy, PartialEq)]
+enum FieldKind {
+    /// Deadzone percent (0..10).
+    Deadzone,
+    /// Clutch bite point (0..1).
+    Bite,
+    /// LED brightness percent (0..100).
+    Brightness,
+}
+
+/// A slider drag's latest value, waiting out its debounce (M-7):
+/// the slider already moved on screen (the component owns the drag
+/// state); only the daemon push waits 150 ms after the last move.
+/// The value text / mini-curve lag the drag by at most that long.
+#[derive(Clone, Copy)]
+struct PendingField {
+    module: &'static str,
+    kind: FieldKind,
+    value: f64,
+}
+
+/// Health-monitor verdicts (B2): the background thread in
+/// [`spawn_health_monitor`] pings the live daemon every second and
+/// re-probes after a death; the frame timer drains these on the UI
+/// thread and applies them — the monitor never touches UI state.
+enum HealthEvent {
+    /// The live daemon stopped answering (or the first probe found
+    /// none): show Disconnected, clear stale values.
+    DaemonDown,
+    /// A (new) live daemon answered: swap it in.
+    DaemonBack(Arc<IpcApi>),
+}
+
+/// Background-job kinds (A9/B5): one entry per long operation, so the
+/// frame timer can time each out (never infinite loading) and the UI
+/// can ignore a second click while one is in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum JobKind {
+    /// Reconnect probe (spawn + ~3 s of retries).
+    Reconnect,
+    /// Transport switch (`connect`).
+    Transport,
+    /// Output-backend switch (`set_output_backend`, up to 75 s while
+    /// the user answers UAC + the sidecar spawns).
+    Backend,
+    /// Firmware check (board vs bundled version).
+    FirmwareCheck,
+    /// Firmware update start (the flash itself then runs on the
+    /// daemon and is polled separately).
+    FirmwareUpdate,
+    /// Raw-mV availability probe for the wizard Calibrate step.
+    RawAvailable,
+    /// Pairing reset.
+    ResetPairing,
+}
+
+impl JobKind {
+    /// How long the job may stay busy before the frame timer times
+    /// it out with a visible error (B5: loading never infinite).
+    /// Backend is long on purpose — the user may take a minute to
+    /// answer the UAC prompt while the sidecar spawn waits.
+    fn timeout(self) -> Duration {
+        match self {
+            JobKind::Reconnect => Duration::from_secs(15),
+            JobKind::Backend => Duration::from_secs(80),
+            JobKind::FirmwareUpdate => Duration::from_secs(10),
+            JobKind::Transport
+            | JobKind::FirmwareCheck
+            | JobKind::RawAvailable
+            | JobKind::ResetPairing => Duration::from_secs(5),
+        }
+    }
+}
+
+/// Background-job completions (A9/B5): a job thread sends exactly one
+/// of these on `job_tx`; the frame timer drains them on the UI thread
+/// and applies the result (notify / revert / re-sync). The payloads
+/// are the API's own types, so no result is re-interpreted here.
+enum JobDone {
+    /// Reconnect probe finished: the live API, or the plain reason
+    /// it never answered.
+    Reconnect(Result<Arc<IpcApi>, String>),
+    /// Transport switch finished: `index` is the Settings segment
+    /// the user picked (0 Wi-Fi, 1 USB) when the switch came from
+    /// Settings (`None` for the wizard's Connect step, which has no
+    /// switch to revert) — a failure reverts the switch.
+    Transport {
+        index: Option<i32>,
+        result: Result<ConnectionInfo, UserError>,
+    },
+    /// Backend switch finished: `index` is the Settings segment the
+    /// user picked (0 `HIDMaestro`, 1 vJoy), so a failure reverts the
+    /// switch to the other segment.
+    Backend {
+        index: i32,
+        result: Result<String, UserError>,
+    },
+    /// Firmware check finished (board vs bundled version).
+    FirmwareCheck(Result<FirmwareCheck, UserError>),
+    /// Firmware update start finished (the flash then runs on the
+    /// daemon; progress comes from `firmware_update_status` polls).
+    FirmwareUpdate(Result<FirmwareUpdateStatus, UserError>),
+    /// Raw-mV availability probe finished (any axis reported).
+    RawAvailable(bool),
+    /// Pairing reset finished: `was_armed` is whether the board had
+    /// BOOT held (`KEY_RESET` armed) when the reset started — armed
+    /// means the board rotated its key, unarmed means only the
+    /// PC-side state was cleared and the user still has to hold BOOT.
+    ResetPairing {
+        was_armed: bool,
+        result: Result<PairingInfo, UserError>,
+    },
 }
 
 /// Shared frame context for callbacks: the swappable API state,
@@ -488,6 +748,79 @@ struct Ctx {
     unsaved: Rc<Cell<bool>>,
     notifications: Rc<RefCell<NotificationCenter>>,
     data_dir: Option<PathBuf>,
+    /// Shared live link for the health monitor (B2): the monitor
+    /// thread pings whatever is here and re-probes when it is
+    /// empty. Kept in sync with `state.live_api` by
+    /// [`Ctx::swap_to_live`] / [`Ctx::mark_dead`].
+    live_link: Arc<Mutex<Option<Arc<IpcApi>>>>,
+    /// True while the window is hidden to tray (H-1/A11): the health
+    /// monitor must not spawn a daemon while hidden (a tray Quit
+    /// must not resurrect it). Shared with the monitor thread.
+    hidden: Arc<AtomicBool>,
+    /// Set by the close handler when "Keep running in the tray" is
+    /// off: the frame timer quits the event loop on the next tick
+    /// (quitting from inside the close callback would be re-entrant).
+    quit_requested: Rc<Cell<bool>>,
+    /// Page requests forwarded by a second UI instance (M-5/A1):
+    /// the Windows pipe listener pushes here; the frame timer drains
+    /// them. Linux requests arrive via the request file instead.
+    page_requests: Arc<Mutex<VecDeque<String>>>,
+    /// When the wizard started waiting for a pairing window
+    /// (B-1): `begin_pairing` returns immediately now, so the
+    /// window may open seconds later. The 1 Hz tick must not expire
+    /// a `seconds_left == 0` wait as a closed window — it gives the
+    /// board 10 s from this instant, then gives up honestly.
+    pairing_wait_since: Rc<RefCell<Option<Instant>>>,
+    /// Background-job completions (A9/B5): job threads send on
+    /// `job_tx`; the frame timer drains `job_rx` on the UI thread.
+    /// `Rc<RefCell<Receiver>>` — the UI is single-threaded, so no
+    /// `Mutex` is needed for the drain side.
+    job_tx: std::sync::mpsc::Sender<JobDone>,
+    job_rx: Rc<RefCell<std::sync::mpsc::Receiver<JobDone>>>,
+    /// Jobs currently running, by kind: (busy label, started at).
+    /// The frame timer times a stale entry out with a visible error
+    /// — loading is never infinite (B5).
+    busy_jobs: Rc<RefCell<HashMap<JobKind, (String, Instant)>>>,
+    /// When the current `connecting` state started (A9): the frame
+    /// timer clears a `connecting` older than 15 s with a message
+    /// instead of leaving "Connecting…" forever.
+    connecting_since: Rc<Cell<Option<Instant>>>,
+    /// True while a Reconnect job is in flight (A9): a second click
+    /// is ignored instead of queueing another ~3 s probe.
+    reconnect_in_flight: Rc<Cell<bool>>,
+    /// Last firmware check (M-8): refreshed by the `FirmwareCheck`
+    /// job and on reconnect; `sync_overview` reads the cache, never
+    /// the bundled file on the hot path.
+    firmware_check_cache: Rc<RefCell<Option<FirmwareCheck>>>,
+    /// True when the wheel recently reported raw mV (H9): refreshed
+    /// by a background job when the wizard enters Calibrate; the
+    /// wizard's Next gates on this, not just on the daemon being live.
+    raw_available: Rc<Cell<bool>>,
+    /// How many preset rows the popover shows (M1): the popover's
+    /// footer buttons pass a COMBINED index (presets first, then my
+    /// profiles) — this count converts it to a my-profiles index.
+    presets_count: Rc<Cell<usize>>,
+    /// Last known module on/off (H7): the Extras toggles flip their
+    /// .slint state first and call Rust with no payload, so Rust
+    /// tracks the state and flips it per toggle. Seeded from the API
+    /// on (re)connect. Order: handbrake, shifter, horn, led.
+    module_states: Rc<RefCell<[bool; 4]>>,
+    /// True while a firmware flash started from Settings is running
+    /// (H-4): the 1 Hz tick polls `firmware_update_status()` and
+    /// drives `firmware-text` with the progress.
+    firmware_update_running: Rc<Cell<bool>>,
+    /// Last "address applies" notification (H4): the address field
+    /// fires `edited` per keystroke, so the notify is throttled to
+    /// one per 3 s instead of spamming the drawer.
+    last_address_notify: Rc<Cell<Option<Instant>>>,
+    /// Steering push due at (M-7): slider drags set this instead of
+    /// pushing per move — the frame timer flushes it (150 ms
+    /// debounce), so a drag is one IPC call, not one per pixel.
+    steer_push_due: Rc<Cell<Option<Instant>>>,
+    /// Pedal / Extras slider drags waiting out their debounce (M-7):
+    /// the latest (module, field, value) + when it may be pushed.
+    /// The frame timer flushes it (150 ms after the last move).
+    pending_field: Rc<RefCell<Option<(PendingField, Instant)>>>,
 }
 
 impl Ctx {
@@ -501,17 +834,84 @@ impl Ctx {
         self.state.borrow().live
     }
 
-    /// SEAM (BACKEND-2, verified 2026-11-16): `calibration`,
-    /// `vjoy_status`, `install_vjoy` and `diag_stats` DO exist on
-    /// `AppApi` and are wired below. `set_centre` / `calibrate_pedal`
-    /// / `set_button_action` deliberately do NOT exist — BACKEND-2:
-    /// raw mV never reaches the state (capture needs a v2.0.2 engine
-    /// change) and button→action rebinding is not a board feature.
-    /// So every capture control stays disabled with that reason.
-    /// This is the capture gate: always false until a capture
-    /// method lands.
-    fn capture_available() -> bool {
-        false
+    /// SEAM (v2.0.2): capture exists now — `capture_centre` /
+    /// `capture_pedal_min` / `capture_pedal_max` on the daemon, via
+    /// the capture link below (raw mV is plumbed through, see
+    /// `AppStateCore::note_raw_axes`). `set_button_action`
+    /// deliberately does NOT exist — button→action rebinding is not
+    /// a board feature.
+    /// Capture is available while the live daemon is the data
+    /// source. The sim never captures — its readings are not the
+    /// wheel's. A live daemon with no wheel frames yet still enables
+    /// the buttons; the capture call itself then fails visibly
+    /// ("No live wheel data") instead of the buttons lying disabled.
+    fn capture_available(&self) -> bool {
+        self.is_live()
+    }
+
+    /// Reason shown under a disabled capture control.
+    fn capture_unavailable_reason() -> &'static str {
+        "RSH isn't running — reconnect to capture."
+    }
+
+    /// Push the capture availability into the window (centre /
+    /// pedal Set / wizard Calibrate + their reasons). Called every
+    /// frame from [`Self::refresh`], so a daemon that dies
+    /// mid-session disables the buttons again instead of leaving
+    /// them enabled against a dead link.
+    fn sync_capture_availability(&self, win: &MainWindow) {
+        let available = self.capture_available();
+        win.set_centre_available(available);
+        win.set_pedal_set_disabled(!available);
+        win.set_extras_calibration_disabled(!available);
+        // H9: the wizard's Calibrate step gates on REAL raw mV, not
+        // just on the daemon being live — `raw_available` is probed
+        // by a background job when the step is entered (and on the
+        // 5 s refresh while it is open).
+        win.set_setup_calibration_available(self.raw_available.get());
+        let reason = if available {
+            String::new()
+        } else {
+            Self::capture_unavailable_reason().to_string()
+        };
+        win.set_centre_reason(reason.clone().into());
+        let setup_reason = if self.raw_available.get() {
+            String::new()
+        } else if !available {
+            Self::capture_unavailable_reason().to_string()
+        } else if self.busy_jobs.borrow().contains_key(&JobKind::RawAvailable) {
+            "Waiting for wheel data…".to_string()
+        } else {
+            "No wheel data yet — check the wheel is connected.".to_string()
+        };
+        win.set_setup_calibration_reason(setup_reason.into());
+    }
+
+    /// Capture the steering centre over the live daemon (v2.0.2 —
+    /// the calls live on [`IpcApi`] now, not a second connection).
+    /// Returns the captured mV, or the human reason — never a
+    /// silent failure. Only while live: the sim never captures.
+    fn capture_centre_ipc(&self) -> Result<u16, String> {
+        if !self.is_live() {
+            return Err(Self::capture_unavailable_reason().to_string());
+        }
+        self.api().capture_centre().map_err(|e| e.title.clone())
+    }
+
+    /// Capture one pedal endpoint over the live daemon (`endpoint`
+    /// is `"min"` for the released point, `"max"` for fully
+    /// pressed). Returns the captured mV, or the human reason.
+    fn capture_pedal_ipc(&self, pedal: &str, endpoint: &str) -> Result<u16, String> {
+        if !self.is_live() {
+            return Err(Self::capture_unavailable_reason().to_string());
+        }
+        let api = self.api();
+        let result = if endpoint == "min" {
+            api.capture_pedal_min(pedal)
+        } else {
+            api.capture_pedal_max(pedal)
+        };
+        result.map_err(|e| e.title.clone())
     }
 
     /// Refresh the cached calibration read (`calibration()`):
@@ -536,14 +936,28 @@ impl Ctx {
     /// always -1 — the snapshot carries no button state (A5); the
     /// handbrake is 0 and the gear "—" — neither exists in the
     /// snapshot (A7).
+    ///
+    /// B1 (v2.0.2): the sim's sine-wave snapshot is NEVER displayed
+    /// — without a live daemon the wheel/pedals read "—"/0 and the
+    /// charts stay empty, even though the sim is the active API.
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn push_frame(&self, win: &MainWindow, tick: u64) {
-        let (api, live) = {
+        let (api, live, connecting) = {
             let state = self.state.borrow();
-            (state.api.clone(), state.live)
+            (state.api.clone(), state.live, state.connecting)
         };
         let conn = api.connection();
-        let snap = api.snapshot();
+        // H1: remember the live session's transport every frame, so
+        // Reconnect re-uses it (USB stays USB).
+        if live {
+            self.state.borrow_mut().last_transport = conn.transport;
+        }
+        // B1: no live daemon → zeroed snapshot, never the sim sine.
+        let snap = if live {
+            api.snapshot()
+        } else {
+            SnapshotInfo::default()
+        };
         let connected = live && conn.label == "Connected";
         let active = live && matches!(conn.state, ConnectionState::Active);
         let deadzone;
@@ -560,7 +974,10 @@ impl Ctx {
         let my = VY1 - output_pct / 100.0 * (VY1 - crate::curve::VY0);
 
         win.set_connected(connected);
-        win.set_conn_label(if live {
+        win.set_conn_label(if connecting {
+            // B4: the first probe is still running.
+            "Connecting…".into()
+        } else if live {
             conn.label.clone().into()
         } else {
             "Disconnected".into()
@@ -584,7 +1001,9 @@ impl Ctx {
             rsh_api::ApiTransport::Wifi => "Wi-Fi",
             rsh_api::ApiTransport::Usb => "USB",
         };
-        let sub = if live {
+        let sub = if connecting {
+            "Starting RSH…".to_string()
+        } else if live {
             if conn.address.is_empty() {
                 transport_label.to_string()
             } else {
@@ -596,13 +1015,23 @@ impl Ctx {
         win.set_conn_sub(sub.into());
         win.set_send_to_game(api.output_enabled());
         win.set_steer_angle(steer_deg);
-        win.set_steer_text(format!("{steer_deg:+.0}°").into());
+        // B1: no live daemon → "—", never a sine angle.
+        win.set_steer_text(if live {
+            format!("{steer_deg:+.0}°").into()
+        } else {
+            "—".into()
+        });
         win.set_throttle((snap.throttle * 100.0) as f32);
         win.set_brake((snap.brake * 100.0) as f32);
         win.set_clutch((snap.clutch.unwrap_or(0.0) * 100.0) as f32);
-        // A7: no handbrake / gear source in SnapshotInfo — 0 / "—".
-        win.set_handbrake(0.0);
-        win.set_gear("—".into());
+        // H10/M-3: handbrake + gear come from the live snapshot now
+        // (0 / "—" only without live data — the snapshot defaults).
+        win.set_handbrake((snap.handbrake * 100.0) as f32);
+        win.set_gear(if snap.gear == 0 {
+            "—".into()
+        } else {
+            snap.gear.to_string().into()
+        });
         win.set_input_pct(input_pct);
         win.set_output_pct(output_pct);
         win.set_marker_vx(mx);
@@ -618,9 +1047,18 @@ impl Ctx {
         win.set_curve_text(format!("{exponent:.2}").into());
         win.set_preset(self.tuning.borrow().preset);
         win.set_unsaved(self.unsaved.get());
-        // A5: pressed-index comes ONLY from live button state — the
-        // snapshot has none, so it is always -1 (no fake cycle).
-        win.set_pressed_index(-1);
+        // H10: pressed-index comes ONLY from live button state — the
+        // first pressed wheel button (1–12) highlights its tile
+        // (including while learning — the physical button being held
+        // lights up); -1 when nothing is pressed.
+        let pressed_index = if live {
+            (0..12)
+                .find(|i| snap.button_mask & (1_u64 << i) != 0)
+                .unwrap_or(-1)
+        } else {
+            -1
+        };
+        win.set_pressed_index(pressed_index);
         // Pedal mini-curve markers (A1): live pct + cached feel.
         {
             let pedals = self.pedals.borrow();
@@ -648,7 +1086,10 @@ impl Ctx {
             .is_some_and(|until| Instant::now() < until);
         win.set_horn_pressed(horn_pressed);
         // Live chart histories (A20) + chart props every 10th tick.
-        {
+        // B1: histories only grow while live — without a daemon the
+        // charts stay empty ("—") instead of drawing the sim sine
+        // or a flat zero line as if it were data.
+        if live {
             let mut steer_hist = self.steer_hist.borrow_mut();
             steer_hist.push_back(steer_deg);
             while steer_hist.len() > CHART_SAMPLES {
@@ -672,20 +1113,45 @@ impl Ctx {
                     .into(),
                 );
             }
+        } else if tick.is_multiple_of(10) {
+            win.set_diag_steer_chart("".into());
+            win.set_diag_pedals_chart("".into());
+            win.set_diag_steer_readout("—".into());
+            win.set_diag_pedals_readout("—".into());
         }
     }
 
     fn refresh(&self, win: &MainWindow, tick: u64) {
         self.push_frame(win, tick);
+        // v2.0.2: capture availability follows the live daemon every
+        // frame (see `sync_capture_availability`).
+        self.sync_capture_availability(win);
     }
 
-    /// Push the current steering tuning to the daemon (L4): builds a
+    /// Queue a steering push (M-7): slider drags call this per move,
+    /// but the daemon push is debounced — the frame timer flushes it
+    /// 150 ms after the last move, so a drag is one IPC call, not one
+    /// per pixel. The local slider state already moved (the UI feels
+    /// instant); only the daemon push waits.
+    fn push_steering(&self) {
+        self.steer_push_due
+            .set(Some(Instant::now() + Duration::from_millis(150)));
+    }
+
+    /// Flush a due steering push (frame timer, M-7): builds a
     /// `TuningSettings` from the local slider state over the cached
     /// stored record and calls `set_tuning`. On success the cached
     /// record updates and the profile is marked unsaved; on failure
-    /// the error is logged and the local state stays (the slider
-    /// still moves visually — the push is retried on the next edit).
-    fn push_steering(&self) {
+    /// the error is shown (never silent) and the local state stays —
+    /// the push is retried on the next edit.
+    fn flush_steering_push(&self, win: &MainWindow) {
+        let Some(due) = self.steer_push_due.get() else {
+            return;
+        };
+        if Instant::now() < due {
+            return;
+        }
+        self.steer_push_due.set(None);
         let settings = {
             let tuning = self.tuning.borrow();
             let base = self.steering.borrow();
@@ -696,27 +1162,747 @@ impl Ctx {
                 *self.steering.borrow_mut() = stored;
                 self.unsaved.set(true);
             }
-            Err(e) => eprintln!("RSH-UI set_tuning failed: {} ({})", e.code, e.title),
+            Err(e) => {
+                self.notify_error(win, "Steering", &e);
+                eprintln!("RSH-UI set_tuning failed: {} ({})", e.code, e.title);
+            }
         }
+    }
+
+    /// Queue a pedal / Extras slider drag's latest value (M-7): the
+    /// drag keeps flowing (the component owns the thumb); the daemon
+    /// push runs 150 ms after the last move. A newer move replaces
+    /// the pending one — a drag is one IPC call, not one per pixel.
+    fn queue_field_push(&self, module: &'static str, kind: FieldKind, value: f64) {
+        *self.pending_field.borrow_mut() = Some((
+            PendingField {
+                module,
+                kind,
+                value,
+            },
+            Instant::now() + Duration::from_millis(150),
+        ));
+    }
+
+    /// Flush a due field push (frame timer, M-7): read the module's
+    /// stored record, apply the queued field, push it. On success the
+    /// page re-syncs from the daemon; on failure the error is shown
+    /// and the page re-syncs anyway (the slider snaps back to the
+    /// stored value instead of lying).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn flush_field_push(&self, win: &MainWindow) {
+        let Some((pending, due)) = *self.pending_field.borrow() else {
+            return;
+        };
+        if Instant::now() < due {
+            return;
+        }
+        *self.pending_field.borrow_mut() = None;
+        let api = self.api();
+        let mut record = api.get_tuning(pending.module);
+        match pending.kind {
+            FieldKind::Deadzone => record.deadzone = pending.value,
+            FieldKind::Bite => record.bite_point = Some(pending.value),
+            FieldKind::Brightness => record.led_brightness = Some(pending.value.round() as u8),
+        }
+        match api.set_tuning(&record) {
+            Ok(_) => {
+                self.unsaved.set(true);
+            }
+            Err(e) => {
+                self.notify_error(win, "Tuning", &e);
+                eprintln!(
+                    "RSH-UI field push {} failed: {} ({})",
+                    pending.module, e.code, e.title
+                );
+            }
+        }
+        match pending.module {
+            "throttle" | "brake" | "clutch" => self.sync_pedals(win),
+            _ => self.sync_extras(win),
+        }
+        self.refresh(win, 0);
     }
 
     /// Push a VISIBLE notification and sync the drawer model. Every
     /// user-facing handler uses this — never silent, never
     /// eprintln-only (stderr is invisible under
     /// `windows_subsystem = "windows"`). "daemon" wording is
-    /// rewritten to "background service" (C1).
+    /// rewritten to "RSH" (L3).
     fn notify(&self, win: &MainWindow, kind: &str, title: &str, body: &str) {
         let title = user_text(title);
         let body = user_text(body);
         self.notifications.borrow_mut().push(kind, &title, &body);
+        // M10: the drawer persists — a notification survives a
+        // restart (best-effort save; a failed write never blocks
+        // the notification itself).
+        self.persist_notifications();
         sync_to_window(&self.notifications.borrow(), win);
     }
 
+    /// Show a typed error gracefully (B6): the title is the plain
+    /// headline, the body is what happened + the next step — never a
+    /// raw code or stack trace. The daemon maps untyped state errors
+    /// to `Unknown` with the real message in `detail`, so a generic
+    /// "Something went wrong." is replaced by that detail, and an
+    /// "Unknown" title by a plain one.
+    fn notify_error(&self, win: &MainWindow, kind: &str, err: &UserError) {
+        let title = if err.title == "Unknown" {
+            "Couldn't complete that"
+        } else {
+            err.title.as_str()
+        };
+        let happened = match (&err.detail, err.what_happened.as_str()) {
+            (Some(detail), "Something went wrong.") => detail.clone(),
+            _ => err.what_happened.clone(),
+        };
+        let body = if err.what_to_do.is_empty() {
+            happened
+        } else {
+            format!("{happened} {}", err.what_to_do)
+        };
+        self.notify(win, kind, title, &body);
+    }
+
+    /// Start a background job (A9/B5): the work runs on its own
+    /// thread — the UI thread never blocks on IPC, a spawn, or a
+    /// flash. The busy label is recorded immediately (feedback in
+    /// <100 ms: the caller notifies + the Reconnect job sets the
+    /// `connecting` state), and the result arrives on `job_tx` for
+    /// the frame timer to drain. A second job of the same kind while
+    /// one is in flight is ignored (no double-click queue) and the
+    /// call returns `false`. Loading never goes infinite: the frame
+    /// timer times a stale busy entry out (see
+    /// [`Ctx::check_job_timeouts`]).
+    fn run_job(
+        &self,
+        kind: JobKind,
+        label: &str,
+        work: impl FnOnce() -> JobDone + Send + 'static,
+    ) -> bool {
+        if self.busy_jobs.borrow().contains_key(&kind) {
+            eprintln!("RSH-UI job {kind:?} already running — ignoring duplicate start");
+            return false;
+        }
+        self.busy_jobs
+            .borrow_mut()
+            .insert(kind, (label.to_string(), Instant::now()));
+        let tx = self.job_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name(format!("rsh-job-{kind:?}"))
+            .spawn(move || {
+                let done = work();
+                if tx.send(done).is_err() {
+                    eprintln!("RSH-UI job {kind:?} finished after the UI went away");
+                }
+            });
+        true
+    }
+
+    /// Drain finished jobs on the UI thread (frame timer): each
+    /// result is applied (notify / revert / re-sync) exactly once.
+    fn drain_jobs(&self, win: &MainWindow) {
+        let rx = self.job_rx.borrow();
+        while let Ok(done) = rx.try_recv() {
+            self.apply_job_done(win, done);
+        }
+    }
+
+    /// Apply one finished job (A9/B5). A result whose kind is no
+    /// longer busy was already timed out — ignore it (the timeout
+    /// already notified). Every branch notifies visibly on failure
+    /// and re-syncs the affected page on success.
+    #[allow(clippy::too_many_lines)]
+    fn apply_job_done(&self, win: &MainWindow, done: JobDone) {
+        match done {
+            JobDone::Reconnect(result) => {
+                self.reconnect_in_flight.set(false);
+                self.busy_jobs.borrow_mut().remove(&JobKind::Reconnect);
+                match result {
+                    Ok(api) => self.reconnect_to_live(win, api),
+                    Err(reason) => {
+                        {
+                            let mut state = self.state.borrow_mut();
+                            state.connecting = false;
+                        }
+                        self.connecting_since.set(None);
+                        // M-2: the daemon's fatal file names the
+                        // reason (IpcBindFailed / DaemonHung) — show
+                        // it instead of the generic "not running".
+                        if let Some((_code, detail)) =
+                            live_probe::read_daemon_status(self.data_dir.as_deref())
+                        {
+                            self.notify(win, "Connection", "RSH stopped unexpectedly", &detail);
+                        } else {
+                            self.notify(win, "Connection", "Couldn't reconnect", &reason);
+                        }
+                        self.refresh(win, 0);
+                    }
+                }
+            }
+            JobDone::Transport { index, result } => {
+                if self
+                    .busy_jobs
+                    .borrow_mut()
+                    .remove(&JobKind::Transport)
+                    .is_none()
+                {
+                    return;
+                }
+                match result {
+                    Ok(info) => {
+                        eprintln!("RSH-UI transport switch ok: {}", info.label);
+                        self.refresh(win, 0);
+                    }
+                    Err(e) => {
+                        if let Some(i) = index {
+                            win.set_transport(1 - i);
+                        }
+                        self.notify_error(win, "Connection", &e);
+                    }
+                }
+            }
+            JobDone::Backend { index, result } => {
+                if self
+                    .busy_jobs
+                    .borrow_mut()
+                    .remove(&JobKind::Backend)
+                    .is_none()
+                {
+                    return;
+                }
+                match result {
+                    Ok(active) => {
+                        self.sync_overview(win);
+                        // The wizard's Drivers step mirrors the same
+                        // backend choice (fallback flag + controller
+                        // segment + any install error cleared).
+                        win.set_controller(index);
+                        if index == 0 {
+                            win.set_setup_vjoy_fallback(true);
+                            win.set_setup_vjoy_error("".into());
+                        }
+                        self.notify(
+                            win,
+                            "Game controller",
+                            "Controller switched",
+                            &format!("Game controller is now {active}."),
+                        );
+                    }
+                    Err(e) => {
+                        // A10: revert the switch the binding already
+                        // flipped, and show the typed reason (a UAC
+                        // decline says admin is needed, not "Unknown").
+                        win.set_controller(1 - index);
+                        self.notify_error(win, "Game controller", &e);
+                    }
+                }
+            }
+            JobDone::FirmwareCheck(result) => {
+                if self
+                    .busy_jobs
+                    .borrow_mut()
+                    .remove(&JobKind::FirmwareCheck)
+                    .is_none()
+                {
+                    return;
+                }
+                match result {
+                    Ok(check) => {
+                        *self.firmware_check_cache.borrow_mut() = Some(check.clone());
+                        self.sync_overview(win);
+                        if check.board_version == "Unknown" {
+                            self.notify(
+                                win,
+                                "Firmware",
+                                "Wheel firmware",
+                                "Firmware version unavailable — reconnect to see it.",
+                            );
+                        } else if check.update_available {
+                            let bundled = check.bundled_version.as_deref().unwrap_or("?");
+                            self.notify(
+                                win,
+                                "Firmware",
+                                "Firmware update available",
+                                &format!(
+                                    "Firmware {bundled} is available — the wheel runs {}.",
+                                    check.board_version
+                                ),
+                            );
+                        } else if let Some(bundled) = &check.bundled_version {
+                            self.notify(
+                                win,
+                                "Firmware",
+                                "Firmware up to date",
+                                &format!(
+                                    "Wheel firmware {} — up to date (bundled {bundled}).",
+                                    check.board_version
+                                ),
+                            );
+                        } else {
+                            self.notify(
+                                win,
+                                "Firmware",
+                                "Wheel firmware",
+                                &format!("Wheel firmware {}", check.board_version),
+                            );
+                        }
+                    }
+                    Err(e) => self.notify_error(win, "Firmware", &e),
+                }
+            }
+            JobDone::FirmwareUpdate(result) => {
+                if self
+                    .busy_jobs
+                    .borrow_mut()
+                    .remove(&JobKind::FirmwareUpdate)
+                    .is_none()
+                {
+                    return;
+                }
+                match result {
+                    Ok(status) => {
+                        if status.running {
+                            self.firmware_update_running.set(true);
+                            self.notify(
+                                win,
+                                "Firmware",
+                                "Firmware update started",
+                                "Updating the wheel firmware — the wheel will restart during the update.",
+                            );
+                        } else {
+                            self.notify(
+                                win,
+                                "Firmware",
+                                "Firmware update",
+                                "The update didn't start — try again.",
+                            );
+                        }
+                    }
+                    Err(e) => self.notify_error(win, "Firmware", &e),
+                }
+            }
+            JobDone::RawAvailable(available) => {
+                self.busy_jobs.borrow_mut().remove(&JobKind::RawAvailable);
+                // H9: the wizard's Calibrate Next gates on this.
+                self.raw_available.set(available);
+                self.sync_capture_availability(win);
+            }
+            JobDone::ResetPairing { was_armed, result } => {
+                if self
+                    .busy_jobs
+                    .borrow_mut()
+                    .remove(&JobKind::ResetPairing)
+                    .is_none()
+                {
+                    return;
+                }
+                match result {
+                    Ok(_) => {
+                        if was_armed {
+                            self.notify(
+                                win,
+                                "Pairing",
+                                "Pairing reset",
+                                "Pairing reset — the wheel has a new key. Pair again now.",
+                            );
+                        } else {
+                            self.notify(
+                                win,
+                                "Pairing",
+                                "Pairing reset",
+                                "This wheel is already paired — hold BOOT for 10 seconds to reset it, then pair again.",
+                            );
+                        }
+                        // The reset cleared the session: the wizard's
+                        // Pair step reflects the unpaired state.
+                        win.set_setup_paired(false);
+                        win.set_setup_reset_required(false);
+                    }
+                    Err(e) => self.notify_error(win, "Pairing", &e),
+                }
+            }
+        }
+    }
+
+    /// Time out stale busy jobs (B5, 1 Hz): a job older than its
+    /// kind's timeout is removed and reported — loading never hangs
+    /// forever. A late result for a timed-out job is ignored by
+    /// [`Ctx::apply_job_done`] (its kind is no longer busy). The
+    /// Reconnect timeout also clears the `connecting` state.
+    fn check_job_timeouts(&self, win: &MainWindow) {
+        let now = Instant::now();
+        let mut timed_out: Vec<(JobKind, String)> = Vec::new();
+        for (kind, (label, started)) in self.busy_jobs.borrow().iter() {
+            if now.duration_since(*started) > kind.timeout() {
+                timed_out.push((*kind, label.clone()));
+            }
+        }
+        for (kind, label) in timed_out {
+            self.busy_jobs.borrow_mut().remove(&kind);
+            if kind == JobKind::Reconnect {
+                self.reconnect_in_flight.set(false);
+                {
+                    let mut state = self.state.borrow_mut();
+                    state.connecting = false;
+                }
+                self.connecting_since.set(None);
+            }
+            if kind == JobKind::Backend {
+                // The switch already flipped; the late result is
+                // ignored, so restore the live backend's segment now.
+                let backend = self.api().output_backend();
+                win.set_controller(i32::from(backend != "HIDMaestro"));
+            }
+            eprintln!("RSH-UI job {kind:?} timed out ({label})");
+            self.notify(
+                win,
+                "Loading timed out",
+                &format!("{label} timed out"),
+                "The operation took too long — try again.",
+            );
+            self.refresh(win, 0);
+        }
+    }
+
+    /// Clear a `connecting` state older than 15 s (A9): the first
+    /// probe or a Reconnect that never resolves must not leave
+    /// "Connecting…" on screen forever.
+    fn check_connecting_timeout(&self, win: &MainWindow) {
+        if let Some(since) = self.connecting_since.get() {
+            if since.elapsed() > Duration::from_secs(15) {
+                self.connecting_since.set(None);
+                {
+                    let mut state = self.state.borrow_mut();
+                    state.connecting = false;
+                }
+                self.notify(
+                    win,
+                    "Connection",
+                    "Couldn't reach RSH",
+                    "RSH didn't answer — try Reconnect.",
+                );
+                self.refresh(win, 0);
+            }
+        }
+    }
+
+    /// Poll a running firmware update (H-4): the daemon flashes on
+    /// its own thread; the UI asks once a second and reports the
+    /// finish. While it runs, the Settings firmware line shows live
+    /// progress instead of going silent.
+    fn poll_firmware_update(&self, win: &MainWindow) {
+        if !self.firmware_update_running.get() {
+            return;
+        }
+        let st = self.api().firmware_update_status();
+        if st.done {
+            self.firmware_update_running.set(false);
+            if st.success {
+                if let Some(version) = st.version.clone() {
+                    self.notify(
+                        win,
+                        "Firmware",
+                        "Firmware updated",
+                        &format!(
+                            "Wheel firmware {version} installed — the wheel restarted with it."
+                        ),
+                    );
+                } else {
+                    self.notify(
+                        win,
+                        "Firmware",
+                        "Firmware updated",
+                        "The wheel restarted with the new firmware.",
+                    );
+                }
+                *self.firmware_check_cache.borrow_mut() = self.api().firmware_check().ok();
+                self.sync_overview(win);
+            } else {
+                let err = UserError {
+                    code: "firmware_update_failed".to_string(),
+                    title: "Firmware update failed".to_string(),
+                    what_happened: st
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "The wheel did not take the new firmware.".to_string()),
+                    what_to_do: "Try again.".to_string(),
+                    detail: None,
+                };
+                self.notify_error(win, "Firmware", &err);
+            }
+            return;
+        }
+        let stage = st.stage.as_deref().unwrap_or("updating");
+        let percent = st
+            .percent
+            .map_or_else(|| "…".to_string(), |p| format!("{p}%"));
+        win.set_firmware_text(format!("Updating firmware… {stage} {percent}").into());
+    }
+
+    /// Start the Reconnect job (A9): probe + spawn on a background
+    /// thread (6 retries ≈ 3 s), never on the UI thread. The
+    /// `connecting` state is set immediately — the Overview shows
+    /// "Connecting…" while the probe runs. A second click while one
+    /// is in flight is ignored.
+    fn start_reconnect_job(&self, win: &MainWindow) {
+        if self.reconnect_in_flight.get() {
+            return;
+        }
+        self.reconnect_in_flight.set(true);
+        {
+            let mut state = self.state.borrow_mut();
+            state.connecting = true;
+        }
+        self.connecting_since.set(Some(Instant::now()));
+        self.refresh(win, 0);
+        let data_dir = self.data_dir.clone();
+        self.run_job(JobKind::Reconnect, "Reconnecting…", move || {
+            match live_probe::try_live_api_with_spawn_n(data_dir.as_deref(), 6) {
+                Some(api) => JobDone::Reconnect(Ok(api)),
+                None => {
+                    JobDone::Reconnect(Err("RSH didn't answer — it isn't running.".to_string()))
+                }
+            }
+        });
+    }
+
+    /// Start a transport switch job (A9): `connect` runs on a
+    /// background thread. `index` is the Settings segment (0 Wi-Fi,
+    /// 1 USB) when the switch came from Settings, `None` for the
+    /// wizard's Connect step (no switch to revert).
+    fn start_transport_job(&self, win: &MainWindow, transport: ApiTransport, index: Option<i32>) {
+        if self.api().connection().transport == transport && self.is_live() {
+            // Already on this transport — the switch already shows
+            // it; nothing to do.
+            return;
+        }
+        self.notify(
+            win,
+            "Connection",
+            "Switching connection…",
+            "The wheel connection is switching — this takes a moment.",
+        );
+        let api = self.api();
+        self.run_job(JobKind::Transport, "Switching connection…", move || {
+            JobDone::Transport {
+                index,
+                result: api.connect(transport),
+            }
+        });
+    }
+
+    /// Start an output-backend switch job (A9/B-2): `set_output_backend`
+    /// runs on a background thread with its 75 s bound (UAC dwell +
+    /// 60 s sidecar spawn). Switching to `HIDMaestro` warns first —
+    /// Windows will ask once for admin permission. A second switch
+    /// while one is in flight is ignored (no re-spawn loop, A10).
+    fn start_backend_job(&self, win: &MainWindow, index: i32) {
+        let name = if index == 1 { "vJoy" } else { "HIDMaestro" };
+        if self.api().output_backend() == name {
+            return;
+        }
+        if self.busy_jobs.borrow().contains_key(&JobKind::Backend) {
+            return;
+        }
+        if name == "HIDMaestro" {
+            self.notify(
+                win,
+                "Game controller",
+                "Admin permission needed",
+                "HIDMaestro needs admin permission — Windows will ask once.",
+            );
+        } else {
+            self.notify(
+                win,
+                "Game controller",
+                "Switching controller…",
+                "Switching to vJoy — no permission needed.",
+            );
+        }
+        let api = self.api();
+        self.run_job(JobKind::Backend, "Switching controller…", move || {
+            JobDone::Backend {
+                index,
+                result: api.set_output_backend(name),
+            }
+        });
+    }
+
+    /// Start a firmware-check job (M-8): board live version vs the
+    /// bundled OTA image version — never the hardcoded "4.0.2".
+    fn start_firmware_check_job(&self, win: &MainWindow) {
+        self.notify(
+            win,
+            "Firmware",
+            "Checking firmware…",
+            "Reading the wheel and bundled firmware versions…",
+        );
+        let api = self.api();
+        self.run_job(JobKind::FirmwareCheck, "Checking firmware…", move || {
+            JobDone::FirmwareCheck(api.firmware_check())
+        });
+    }
+
+    /// Start a firmware update (H-4): the daemon validates the
+    /// bundled image + spawns the flash thread at once, so the start
+    /// call itself is fast — the minutes-long flash is polled via
+    /// `firmware_update_status()` on the 1 Hz tick.
+    fn start_firmware_update_job(&self, win: &MainWindow) {
+        self.notify(
+            win,
+            "Firmware",
+            "Starting firmware update…",
+            "Validating the firmware image before the upload…",
+        );
+        let api = self.api();
+        self.run_job(
+            JobKind::FirmwareUpdate,
+            "Starting firmware update…",
+            move || JobDone::FirmwareUpdate(api.update_firmware()),
+        );
+    }
+
+    /// Start a raw-mV availability probe (H9): any axis reporting
+    /// means the wizard's Calibrate step can proceed. Silent — no
+    /// notification; the wizard's Next button is the feedback.
+    fn start_raw_available_job(&self, _win: &MainWindow) {
+        let api = self.api();
+        self.run_job(JobKind::RawAvailable, "Checking wheel data…", move || {
+            let available = api.raw_mv().is_ok_and(|mv| {
+                mv.steering_mv.is_some()
+                    || mv.accel_mv.is_some()
+                    || mv.brake_mv.is_some()
+                    || mv.clutch_mv.is_some()
+                    || mv.handbrake_mv.is_some()
+            });
+            JobDone::RawAvailable(available)
+        });
+    }
+
+    /// Start a pairing reset job (B5): the daemon resets the pairing
+    /// (key rotation when BOOT was held, PC-side clear otherwise) —
+    /// never just a notification, and never an automatic re-pair.
+    fn start_reset_pairing_job(&self, win: &MainWindow) {
+        self.notify(
+            win,
+            "Pairing",
+            "Resetting pairing…",
+            "Clearing the pairing state…",
+        );
+        let api = self.api();
+        self.run_job(JobKind::ResetPairing, "Resetting pairing…", move || {
+            let was_armed = api.pairing_status().key_reset_armed;
+            JobDone::ResetPairing {
+                was_armed,
+                result: api.reset_pairing(),
+            }
+        });
+    }
+
+    /// Seed the Buttons page from the daemon's stored bindings (H-3 /
+    /// B1 wiring): button 1–12 ← stored action, unbound ← the
+    /// display default. Runs on (re)connect — at startup the sim has
+    /// no bindings, so the defaults stand until the daemon answers.
+    fn load_bindings(&self, win: &MainWindow) {
+        let mut actions: Vec<String> = DEFAULT_BUTTON_ACTIONS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        for binding in self.api().list_bindings() {
+            let idx = usize::from(binding.button.saturating_sub(1));
+            if idx < actions.len() {
+                actions[idx] = action_display(&binding.action).to_string();
+            }
+        }
+        (*self.button_actions.borrow_mut()).clone_from(&actions);
+        win.set_button_actions(ModelRc::new(Rc::new(VecModel::from(
+            actions
+                .iter()
+                .map(SharedString::from)
+                .collect::<Vec<SharedString>>(),
+        ))));
+        let idx = usize::try_from(self.selected_button.get()).unwrap_or(0);
+        if let Some(action) = actions.get(idx) {
+            win.set_selected_action(action.clone().into());
+        }
+    }
+
+    /// Seed the knob actions from the daemon's stored knobs (M9):
+    /// action ids → display names, "" → "Not set". Runs on
+    /// (re)connect alongside [`Ctx::load_bindings`].
+    fn load_knobs(&self, win: &MainWindow) {
+        let stored = self.api().knob_actions();
+        let mut knobs: [[String; 3]; 2] = [
+            [
+                "Not set".to_string(),
+                "Not set".to_string(),
+                "Not set".to_string(),
+            ],
+            [
+                "Not set".to_string(),
+                "Not set".to_string(),
+                "Not set".to_string(),
+            ],
+        ];
+        for (k, rows) in stored.iter().enumerate() {
+            for (r, action) in rows.iter().enumerate() {
+                knobs[k][r] = action_display(action).to_string();
+            }
+        }
+        let knob = usize::try_from(self.edit_knob.get()).unwrap_or(0);
+        let row = usize::try_from(self.knob_row.get()).unwrap_or(0);
+        let row_action = knobs[knob][row].clone();
+        *self.knob_actions.borrow_mut() = knobs;
+        win.set_knob_row_action(row_action.into());
+    }
+
+    /// Seed everything the daemon owns on (re)connect (B1 wiring):
+    /// bindings + knobs + auto-pause + module on/off + the firmware
+    /// check cache. The Settings switches the .slint does not forward
+    /// (keep-in-tray) are read from the API by the close handler
+    /// instead — there is no window prop to seed.
+    fn seed_live_state(&self, win: &MainWindow) {
+        self.load_bindings(win);
+        self.load_knobs(win);
+        win.set_auto_paused(self.api().auto_pause());
+        *self.module_states.borrow_mut() = [
+            self.api().module_enabled("handbrake"),
+            self.api().module_enabled("shifter"),
+            self.api().module_enabled("horn"),
+            self.api().module_enabled("led"),
+        ];
+        *self.firmware_check_cache.borrow_mut() = self.api().firmware_check().ok();
+        self.raw_available.set(false);
+    }
+
+    /// Open the setup wizard at the Pair step and start the real
+    /// pairing flow (H2): the Overview "Pair now" banner and the
+    /// Settings Pair button both land here — never a dead-end on
+    /// Settings. The wizard's own Begin button calls
+    /// `begin_pairing_flow` directly (it is already in the wizard).
+    fn open_pair_wizard(&self, win: &MainWindow) {
+        self.clear_setup_marker();
+        self.learn_target.set(0);
+        win.set_setup_step(2);
+        win.set_setup_centre_done(false);
+        win.set_setup_pedals_done(false);
+        win.set_setup_paired(win.get_paired());
+        win.set_setup_reset_required(self.api().pairing_status().replacement_required);
+        win.set_setup_mode(true);
+        self.sync_vjoy(win);
+        begin_pairing_flow(win, self);
+    }
+
+    /// Persist the notification center after a mutation (M10).
+    fn persist_notifications(&self) {
+        self.notifications.borrow().save(self.data_dir.as_deref());
+    }
+
     /// Swap the shared API state to a live daemon connection (the
-    /// Reconnect path): the daemon becomes the API, the sim stays
-    /// stored (frozen) as fallback, and the steering sliders
-    /// re-seed from the daemon's stored record. Caller re-syncs the
-    /// pedal / extras / overview props afterwards.
+    /// Reconnect path): the daemon becomes the API and the steering
+    /// sliders re-seed from the daemon's stored record. Caller
+    /// re-syncs the pedal / extras / overview props afterwards.
     fn swap_to_live(&self, live_api: Arc<IpcApi>) {
         let api = live_api.clone() as Arc<dyn AppApi>;
         let stored = api.get_tuning("steering");
@@ -726,8 +1912,137 @@ impl Ctx {
             .set(api.draft_status().is_some_and(|s| s.dirty));
         let mut state = self.state.borrow_mut();
         state.api = api;
-        state.live_api = Some(live_api);
+        state.live_api = Some(live_api.clone());
         state.live = true;
+        state.connecting = false;
+        if let Ok(mut link) = self.live_link.lock() {
+            *link = Some(live_api);
+        }
+        drop(state);
+        // A9: the probe resolved — the `connecting` clock stops.
+        self.connecting_since.set(None);
+    }
+
+    /// Transport of the last live session (H1): Reconnect re-uses
+    /// it instead of forcing Wi-Fi. Updated every frame from the
+    /// live connection (see [`Ctx::push_frame`]).
+    fn last_transport(&self) -> ApiTransport {
+        self.state.borrow().last_transport
+    }
+
+    /// Mark the daemon dead (B2): clear the stale caches, drop the
+    /// live link, show Disconnected + Reconnect. No-op when already
+    /// down (the monitor only notifies on a transition, and the
+    /// Reconnect button cannot kill a live link).
+    fn mark_dead(&self, win: &MainWindow) {
+        let old_api = {
+            let mut state = self.state.borrow_mut();
+            if !state.live && !state.connecting {
+                return;
+            }
+            state.live = false;
+            state.connecting = false;
+            let old = state.live_api.take();
+            if let Ok(mut link) = self.live_link.lock() {
+                *link = None;
+            }
+            old
+        };
+        if let Some(api) = old_api {
+            api.clear_cached_state();
+        }
+        self.steer_hist.borrow_mut().clear();
+        self.pedal_hist.borrow_mut().clear();
+        win.set_daemon_live(false);
+        self.connecting_since.set(None);
+        // M-2: the daemon's fatal file names the reason
+        // (IpcBindFailed / DaemonHung) — show it instead of the
+        // generic "not running". The detail is the daemon's own plain
+        // words; the code goes to the log only.
+        match live_probe::read_daemon_status(self.data_dir.as_deref()) {
+            Some((code, detail)) => {
+                eprintln!("RSH-UI daemon fatal: {code}: {detail}");
+                self.notify(win, "Connection", "RSH stopped unexpectedly", &detail);
+            }
+            None => {
+                self.notify(
+                    win,
+                    "Connection",
+                    "RSH not running",
+                    "Live data unavailable — RSH isn't running.",
+                );
+            }
+        }
+        self.refresh(win, 0);
+    }
+
+    /// Swap a (re)connected daemon in (B2/H1): the shared path for
+    /// the Reconnect button and the health monitor's re-probe —
+    /// seed the sliders from the daemon, reconnect the session on
+    /// the transport it was on, and re-sync every page. A duplicate
+    /// delivery of the link that is already live is a no-op.
+    fn reconnect_to_live(&self, win: &MainWindow, live_api: Arc<IpcApi>) {
+        {
+            let state = self.state.borrow();
+            if state.live {
+                if let Some(current) = &state.live_api {
+                    if Arc::ptr_eq(current, &live_api) {
+                        return;
+                    }
+                }
+            }
+        }
+        let transport = self.last_transport();
+        self.swap_to_live(live_api);
+        win.set_daemon_live(true);
+        // Seed the controller + autostart switches from the daemon
+        // (the startup seeding cannot run — the daemon was not
+        // there when the window opened).
+        if self.api().output_backend() == "HIDMaestro" {
+            win.set_controller(0);
+        } else {
+            win.set_controller(1);
+        }
+        win.set_autostart_enabled(self.api().autostart());
+        // B1 wiring: bindings + knobs + auto-pause + module on/off +
+        // the firmware check cache all seed from the daemon now that
+        // it is live (at startup the sim has none of these).
+        self.seed_live_state(win);
+        self.notify(win, "Connection", "RSH connected", "Live data is back.");
+        if let Err(e) = self.api().connect(transport) {
+            self.notify(win, "Connection", "Reconnect failed", &e.title);
+            eprintln!("RSH-UI reconnect failed: {} ({})", e.code, e.title);
+        }
+        // An already-open pairing window / Active session at
+        // (re)connect seeds the wizard the same way startup used to
+        // (TR §3c: Active session = already paired).
+        {
+            let ps = self.api().pairing_status();
+            // H-5: the wizard's reset branch (board already paired
+            // with another key) only shows when the daemon reports a
+            // replacement is required.
+            win.set_setup_reset_required(ps.replacement_required);
+            if ps.seconds_left > 0 {
+                win.set_setup_pairing_active(true);
+                win.set_setup_pair_seconds_left(i32::try_from(ps.seconds_left).unwrap_or(120));
+                win.set_setup_pair_total(i32::try_from(ps.seconds_left).unwrap_or(120));
+                win.set_setup_pair_status(
+                    "Pairing window open — hold the pair button on the wheel.".into(),
+                );
+                Ctx::sync_pair_ring(win);
+            }
+            if matches!(self.api().connection().state, ConnectionState::Active) {
+                win.set_setup_paired(true);
+            }
+        }
+        self.refresh_calibration();
+        self.sync_pedals(win);
+        self.sync_extras(win);
+        self.sync_overview(win);
+        self.refresh_profiles(win);
+        self.refresh_games(win);
+        self.sync_diag(win);
+        self.refresh(win, 0);
     }
 
     /// Apply one pedal-tuning edit (deadzone / bite / feel curve) to
@@ -856,9 +2171,9 @@ impl Ctx {
             pedal_curve_commands(c.deadzone as f32, FEEL_EXPONENTS[feels[2] as usize]).into(),
         );
         win.set_clutch_dashed("".into());
-        // Set up/down need the capture backend (A2 seam — no backend:
-        // raw mV never reaches the state).
-        win.set_pedal_set_disabled(!Self::capture_available());
+        // Set up/down capture the live endpoints (v2.0.2): enabled
+        // while the daemon is live, disabled with a reason otherwise.
+        win.set_pedal_set_disabled(!self.capture_available());
     }
 
     /// Refresh the Extras page from the stored records (A6):
@@ -888,8 +2203,19 @@ impl Ctx {
         win.set_handbrake_dashed("M 6 104 L 104 6".into());
         win.set_handbrake_marker_x(6.0);
         win.set_handbrake_marker_y(104.0);
-        win.set_handbrake_mode(0);
-        win.set_extras_calibration_disabled(!Self::capture_available());
+        // H8: the stored handbrake mode (Axis 0 / Button 1) — never
+        // a hardcoded 0.
+        win.set_handbrake_mode(i32::from(hb.handbrake_button_mode.unwrap_or(false)));
+        // H7: keep the toggle tracking in sync with the daemon (the
+        // .slint toggles flip first and call Rust with no payload, so
+        // Rust tracks the last known state per module).
+        *self.module_states.borrow_mut() = [
+            self.api().module_enabled("handbrake"),
+            self.api().module_enabled("shifter"),
+            self.api().module_enabled("horn"),
+            self.api().module_enabled("led"),
+        ];
+        win.set_extras_calibration_disabled(!self.capture_available());
         win.set_shifter_mode(match shifter.shifter_gate {
             Some(ShifterGate::HPattern) => 1,
             _ => 0,
@@ -910,8 +2236,18 @@ impl Ctx {
         let brightness = led.led_brightness.unwrap_or(80);
         win.set_led_brightness(f32::from(brightness) / 100.0);
         win.set_led_brightness_text(pct_text(f64::from(brightness)).into());
+        // M2: the stored colour drives the swatch + the preview —
+        // never always-blue. Unknown colours fall back to the accent
+        // swatch (index 3).
+        let color_index = led
+            .led_color
+            .and_then(|c| LED_PALETTE.iter().position(|p| *p == c))
+            .unwrap_or(3);
+        win.set_led_color(i32::try_from(color_index).unwrap_or(3));
         win.set_led_preview(ModelRc::new(Rc::new(VecModel::from(led_preview(
-            pattern, brightness,
+            pattern,
+            brightness,
+            led.led_color,
         )))));
     }
 
@@ -924,11 +2260,17 @@ impl Ctx {
         let api = self.api();
         let conn = api.connection();
         let firmware = api.firmware_version();
+        // H4: the address falls back to the persisted board address
+        // (never the hardcoded "rsh.local") — the transport already
+        // uses the same persisted value.
         let address = if conn.address.is_empty() {
-            "rsh.local".to_string()
+            api.board_address()
         } else {
             conn.address.clone()
         };
+        // L-2: the wizard's address field shows the live address
+        // (never its hardcoded "rsh.local" default).
+        win.set_setup_address(address.clone().into());
         // A11: measured stats, or "—" — never a hardcoded 4 ms / 0%.
         let stats = api.diag_stats().ok();
         let delay = stats
@@ -971,13 +2313,30 @@ impl Ctx {
             backend.clone().into()
         });
         win.set_backend_ready(backend != "Unknown");
-        // C3: Settings texts from the API, not literals.
-        win.set_firmware_text(if firmware == "Unknown" {
-            "—".into()
-        } else if firmware == "4.0.2" {
-            "Version 4.0.2 · up to date".into()
-        } else {
-            format!("Version {firmware}").into()
+        // C3/M-8: Settings firmware text from the cached firmware
+        // check (board live version vs bundled OTA image version) —
+        // never the hardcoded "4.0.2". No cache yet (startup, before
+        // the first check) falls back to the live version alone.
+        win.set_firmware_text(match self.firmware_check_cache.borrow().as_ref() {
+            Some(check) if check.board_version != "Unknown" => {
+                if check.update_available {
+                    format!(
+                        "Version {} · update {} available",
+                        check.board_version,
+                        check.bundled_version.as_deref().unwrap_or("?")
+                    )
+                    .into()
+                } else {
+                    format!("Version {} · up to date", check.board_version).into()
+                }
+            }
+            _ => {
+                if firmware == "Unknown" {
+                    "—".into()
+                } else {
+                    format!("Version {firmware}").into()
+                }
+            }
         });
         win.set_app_update_text("Auto-update is off — new versions are on GitHub Releases".into());
     }
@@ -1021,9 +2380,30 @@ impl Ctx {
                 active: p.active,
             })
             .collect();
-        win.set_popover_presets(ModelRc::new(Rc::new(VecModel::from(
-            Vec::<ProfileItem>::new(),
-        ))));
+        // M1: presets are one row per catalogue game (real data —
+        // the games list), read-only templates: "Use" creates a
+        // profile from the game. No invented preset store. The games
+        // cache may be empty on the very first call (refresh_games
+        // runs after this) — then read the list live once.
+        let preset_games = {
+            let cached = self.games_cache.borrow();
+            if cached.is_empty() {
+                drop(cached);
+                self.api().list_games()
+            } else {
+                cached.clone()
+            }
+        };
+        self.presets_count.set(preset_games.len());
+        let presets: Vec<ProfileItem> = preset_games
+            .iter()
+            .map(|g| ProfileItem {
+                name: g.name.clone().into(),
+                game: g.name.clone().into(),
+                active: false,
+            })
+            .collect();
+        win.set_popover_presets(ModelRc::new(Rc::new(VecModel::from(presets))));
         win.set_popover_profiles(ModelRc::new(Rc::new(VecModel::from(rows))));
         let settings_rows: Vec<ProfileRow> = profiles
             .iter()
@@ -1120,7 +2500,13 @@ impl Ctx {
         let api = self.api();
         let conn = api.connection();
         let version = api.version();
+        // H5: "Unknown" renders as "—" (never a hardcoded version).
         let firmware = api.firmware_version();
+        let firmware = if firmware == "Unknown" {
+            "—".to_string()
+        } else {
+            firmware
+        };
         win.set_diag_conn_label(conn.label.clone().into());
         win.set_diag_daemon_live(self.is_live());
         win.set_diag_app_version(version.clone().into());
@@ -1159,11 +2545,20 @@ impl Ctx {
             win.set_diag_tx_failures_text("—".into());
             win.set_diag_seq_gaps_text("—".into());
         }
-        win.set_diag_buttons_pressed(ModelRc::new(Rc::new(VecModel::from(vec![false; 12]))));
+        // H10: the live button grid shows the real pressed buttons
+        // (bits 1–12 of the snapshot mask) — empty when not live, so
+        // the section hides instead of rendering 12 dead tiles.
+        let pressed: Vec<bool> = if self.is_live() {
+            let mask = self.api().snapshot().button_mask;
+            (0..12).map(|i| mask & (1_u64 << i) != 0).collect()
+        } else {
+            Vec::new()
+        };
+        win.set_diag_buttons_pressed(ModelRc::new(Rc::new(VecModel::from(pressed))));
         let mut lines: Vec<SharedString> = vec![
             format!("App {version}").into(),
             format!(
-                "Background service: {}",
+                "RSH: {}",
                 if self.is_live() {
                     "running"
                 } else {
@@ -1426,6 +2821,183 @@ impl Ctx {
         }
     }
 
+    /// Convert a popover footer index to a my-profiles index (M1):
+    /// the popover's footer buttons pass a COMBINED index (preset
+    /// rows first, then my profiles). `None` means the row is a
+    /// preset (read-only) or out of range.
+    fn popover_my_index(&self, combined: i32) -> Option<i32> {
+        let presets = i32::try_from(self.presets_count.get()).unwrap_or(0);
+        let my = combined.checked_sub(presets).filter(|m| *m >= 0)?;
+        let idx = usize::try_from(my).ok()?;
+        if idx >= self.profiles_cache.borrow().len() {
+            None
+        } else {
+            Some(my)
+        }
+    }
+
+    /// Use a preset (M1): presets are one row per catalogue game
+    /// (read-only templates) — "Use" creates a profile from the
+    /// game (name = game name, "Name 2" when taken) and activates
+    /// it, so the template becomes a real, editable profile.
+    fn use_preset(&self, win: &MainWindow, preset_index: i32) {
+        let games = {
+            let cached = self.games_cache.borrow();
+            if cached.is_empty() {
+                drop(cached);
+                self.api().list_games()
+            } else {
+                cached.clone()
+            }
+        };
+        let Some(game) = games.get(usize::try_from(preset_index).unwrap_or(usize::MAX)) else {
+            return;
+        };
+        let existing: Vec<String> = self
+            .profiles_cache
+            .borrow()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        let mut name = game.name.clone();
+        let mut n = 2;
+        while existing.iter().any(|e| e == &name) {
+            name = format!("{} {n}", game.name);
+            n += 1;
+        }
+        match self.api().create_profile(&name) {
+            Ok(created) => {
+                self.refresh_profiles(win);
+                if let Some(p) = self
+                    .profiles_cache
+                    .borrow()
+                    .iter()
+                    .find(|p| p.name == created)
+                    .cloned()
+                {
+                    self.do_activate(win, &p);
+                }
+                self.notify(
+                    win,
+                    "Profile",
+                    "Profile created",
+                    &format!("{created} created from the {} preset.", game.name),
+                );
+            }
+            Err(e) => self.notify_error(win, "Profile", &e),
+        }
+    }
+
+    /// Rename the profile at a popover COMBINED index (M1): the new
+    /// name is the profile's linked game — the one name the popover
+    /// can supply without a text input (a free-text rename needs a
+    /// `rename-text` input in the popover; see the report). A preset
+    /// row or an unlinked profile explains itself instead of
+    /// pretending to rename.
+    fn rename_profile_index(&self, win: &MainWindow, combined: i32) {
+        let Some(index) = self.popover_my_index(combined) else {
+            self.notify(
+                win,
+                "Profile",
+                "Presets are read-only",
+                "Presets are read-only — duplicate one to edit it.",
+            );
+            return;
+        };
+        let Some(p) = self.profile_at(index) else {
+            return;
+        };
+        let Some(slug) = p.game.clone() else {
+            self.notify(
+                win,
+                "Profile",
+                "Rename",
+                "Link this profile to a game first — Rename names it after its game.",
+            );
+            return;
+        };
+        let game_name = self
+            .games_cache
+            .borrow()
+            .iter()
+            .find(|g| g.id == slug)
+            .map_or_else(|| pretty_game_slug(&slug), |g| g.name.clone());
+        if p.name == game_name {
+            self.notify(
+                win,
+                "Profile",
+                "Rename",
+                &format!("{game_name} is already named after its game."),
+            );
+            return;
+        }
+        match self.api().rename_profile(&p.id, &game_name) {
+            Ok(name) => {
+                self.refresh_profiles(win);
+                self.notify(
+                    win,
+                    "Profile",
+                    "Profile renamed",
+                    &format!("Renamed to {name}."),
+                );
+            }
+            Err(e) => self.notify_error(win, "Profile", &e),
+        }
+    }
+
+    /// Link the profile at a popover COMBINED index to its next game
+    /// (M1): each click cycles to the next catalogue game (the
+    /// popover has no game picker — cycling is the link action).
+    /// A preset row explains itself instead of linking.
+    fn link_profile_index(&self, win: &MainWindow, combined: i32) {
+        let Some(index) = self.popover_my_index(combined) else {
+            self.notify(
+                win,
+                "Profile",
+                "Presets are read-only",
+                "Presets are read-only — duplicate one to edit it.",
+            );
+            return;
+        };
+        let Some(p) = self.profile_at(index) else {
+            return;
+        };
+        let games = {
+            let cached = self.games_cache.borrow();
+            if cached.is_empty() {
+                drop(cached);
+                self.api().list_games()
+            } else {
+                cached.clone()
+            }
+        };
+        if games.is_empty() {
+            self.notify(
+                win,
+                "Profile",
+                "Link to game",
+                "No games found — install a racing game first.",
+            );
+            return;
+        }
+        let current = p.game.as_deref();
+        let pos = current.and_then(|slug| games.iter().position(|g| g.id == slug));
+        let next = games[pos.map_or(0, |i| i + 1) % games.len()].clone();
+        match self.api().link_profile(&p.id, &next.id) {
+            Ok(name) => {
+                self.refresh_profiles(win);
+                self.refresh_games(win);
+                self.notify(
+                    win,
+                    "Profile",
+                    "Profile linked",
+                    &format!("{name} is now linked to {}.", next.name),
+                );
+            }
+            Err(e) => self.notify_error(win, "Profile", &e),
+        }
+    }
+
     /// Poll a running learn (Buttons / horn): a picked button
     /// arrives via `take_learned_button()`; learning ending with no
     /// pick clears the listening state.
@@ -1557,6 +3129,11 @@ fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
                     &format!("Pairing window open — {}s left", info.seconds_left),
                 );
             } else {
+                // B-1: no window yet — the board may still open one
+                // (begin_pairing returns immediately now). Start the
+                // 10 s wait clock; the 1 Hz tick expires it, not the
+                // first tick.
+                *ctx.pairing_wait_since.borrow_mut() = Some(Instant::now());
                 w.set_setup_pairing_active(true);
                 w.set_setup_pair_status("Waiting for the wheel…".into());
                 Ctx::sync_pair_ring(w);
@@ -1583,21 +3160,12 @@ fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
 /// Connect the wizard to one transport and drive its props
 /// (`setup-transport`; `setup-connect-done` follows from
 /// `connection()` Active on the next frame via `push_frame`).
+/// A9: the connect runs on a background job — the click returns
+/// immediately; the wizard's Connect step is done when the session
+/// goes Active (or the job drain notifies the failure).
 fn setup_connect_to(w: &MainWindow, ctx: &Ctx, transport: ApiTransport) {
-    match ctx.api().connect(transport) {
-        Ok(info) => {
-            w.set_setup_transport(i32::from(transport == ApiTransport::Usb));
-            if matches!(info.state, ConnectionState::Active) {
-                w.set_setup_connect_done(true);
-            }
-            eprintln!("RSH-UI setup connect ok: {}", info.label);
-            ctx.refresh(w, 0);
-        }
-        Err(e) => {
-            ctx.notify(w, "Connection", "Connect failed", &e.title);
-            eprintln!("RSH-UI setup connect failed: {} ({})", e.code, e.title);
-        }
-    }
+    w.set_setup_transport(i32::from(transport == ApiTransport::Usb));
+    ctx.start_transport_job(w, transport, None);
 }
 
 /// Wire the setup-wizard callbacks (v2.0.1 hotfix).
@@ -1621,6 +3189,10 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
                 if next == 1 {
                     ctx.sync_vjoy(&w);
                 }
+                if next == 3 {
+                    // H9: re-entering Calibrate re-probes raw mV.
+                    ctx.start_raw_available_job(&w);
+                }
             }
         });
     }
@@ -1638,6 +3210,12 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
                     w.set_setup_step(next);
                     if next == 1 {
                         ctx.sync_vjoy(&w);
+                    }
+                    if next == 3 {
+                        // H9: entering Calibrate probes raw mV in the
+                        // background — Next gates on real data, not
+                        // just on the daemon being live.
+                        ctx.start_raw_available_job(&w);
                     }
                     if next == 4 {
                         ctx.refresh_games(&w);
@@ -1667,6 +3245,7 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
         });
     }
     wire_setup_pairing(win, ctx);
+    wire_setup_calibrate(win, ctx);
     wire_setup_vjoy(win, ctx);
 }
 
@@ -1708,23 +3287,10 @@ fn wire_setup_vjoy(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_setup_use_hidmaestro(move || {
             if let Some(w) = win.upgrade() {
-                match ctx.api().set_output_backend("HIDMaestro") {
-                    Ok(_) => {
-                        w.set_setup_vjoy_fallback(true);
-                        w.set_controller(0);
-                        w.set_setup_vjoy_error("".into());
-                        ctx.sync_overview(&w);
-                        ctx.notify(
-                            &w,
-                            "Drivers",
-                            "HIDMaestro selected",
-                            "HIDMaestro selected — RSH will ask for admin permission on start.",
-                        );
-                    }
-                    Err(e) => {
-                        ctx.notify(&w, "Drivers", "Couldn't switch controller", &e.title);
-                    }
-                }
+                // A9/B-2/A10: the shared backend-switch job (warn +
+                // 75 s bound); the wizard's fallback flag is set in
+                // the job drain on success.
+                ctx.start_backend_job(&w, 0);
             }
         });
     }
@@ -1756,13 +3322,10 @@ fn wire_setup_pairing(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_setup_reset_pairing(move || {
             if let Some(w) = win.upgrade() {
-                ctx.notify(
-                    &w,
-                    "Pairing",
-                    "Reset pairing",
-                    "This wheel is already paired — hold BOOT for 10 seconds to reset it, then pair again.",
-                );
-                begin_pairing_flow(&w, &ctx);
+                // B5: the reset REALLY resets (daemon pairing reset +
+                // board re-pair state cleared) — never just a
+                // notification, and never an automatic re-pair.
+                ctx.start_reset_pairing_job(&w);
             }
         });
     }
@@ -1782,31 +3345,6 @@ fn wire_setup_pairing(win: &MainWindow, ctx: &Rc<Ctx>) {
                 }
             };
             setup_connect_to(&w, &ctx, transport);
-        });
-    }
-    {
-        // A17: Calibrate calls the real calibration backend — centre
-        // via set_centre(), pedals via calibrate_pedal(). Both are
-        // BACKEND-2 seam methods; until they land the buttons are
-        // disabled in the wizard and this handler only explains why
-        // (never a fake done).
-        let win = win.as_weak();
-        let ctx = ctx.clone();
-        win.unwrap().on_setup_calibrate(move |a| {
-            let Some(w) = win.upgrade() else {
-                return;
-            };
-            match a.as_str() {
-                "centre" | "pedals" => {
-                    ctx.notify(
-                        &w,
-                        "Calibration",
-                        "Calibration unavailable",
-                        "Calibration capture needs a later wheel update.",
-                    );
-                }
-                other => eprintln!("RSH-UI setup calibrate: unknown action {other}"),
-            }
         });
     }
     {
@@ -1836,6 +3374,77 @@ fn wire_setup_pairing(win: &MainWindow, ctx: &Rc<Ctx>) {
     }
 }
 
+/// Wire the wizard's Calibrate step (v2.0.2): "centre" captures the
+/// live steering centre; "pedals" captures the fully-pressed
+/// endpoint of accelerator + brake (the wizard says "press each
+/// pedal fully, then set" — the clutch is optional and is set on
+/// the Pedals page instead).
+fn wire_setup_calibrate(win: &MainWindow, ctx: &Rc<Ctx>) {
+    {
+        // A17 (v2.0.2): Calibrate calls the real capture backend.
+        // "centre" captures the live steering centre; "pedals"
+        // captures the fully-pressed endpoint of accelerator +
+        // brake (the wizard says "press each pedal fully, then
+        // set" — the clutch is optional and is set on the Pedals
+        // page instead).
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_setup_calibrate(move |a| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            match a.as_str() {
+                "centre" => match ctx.capture_centre_ipc() {
+                    Ok(mv) => {
+                        w.set_setup_centre_done(true);
+                        ctx.refresh_calibration();
+                        ctx.notify(
+                            &w,
+                            "Calibration",
+                            "Centre set",
+                            &format!("Centre set at {mv} mV."),
+                        );
+                    }
+                    Err(reason) => {
+                        ctx.notify(&w, "Calibration", "Couldn't set centre", &reason);
+                        eprintln!("RSH-UI setup calibrate centre failed: {reason}");
+                    }
+                },
+                "pedals" => {
+                    let mut captured: Vec<String> = Vec::new();
+                    let mut failed: Option<String> = None;
+                    for (key, name) in [("accel", "Accelerator"), ("brake", "Brake")] {
+                        match ctx.capture_pedal_ipc(key, "max") {
+                            Ok(mv) => captured.push(format!("{name} {mv} mV")),
+                            Err(reason) => {
+                                failed = Some(reason);
+                                break;
+                            }
+                        }
+                    }
+                    match failed {
+                        None => {
+                            w.set_setup_pedals_done(true);
+                            ctx.refresh_calibration();
+                            ctx.notify(
+                                &w,
+                                "Calibration",
+                                "Pedals set",
+                                &format!("Pedals set: {}.", captured.join(", ")),
+                            );
+                        }
+                        Some(reason) => {
+                            ctx.notify(&w, "Calibration", "Couldn't set pedals", &reason);
+                            eprintln!("RSH-UI setup calibrate pedals failed: {reason}");
+                        }
+                    }
+                }
+                other => eprintln!("RSH-UI setup calibrate: unknown action {other}"),
+            }
+        });
+    }
+}
+
 /// Wire the Pedals page callbacks (v2.0.1 hotfix + UI-FINISH A1/A2).
 ///
 /// Pedal index order (verified in `ui/screens/pedals.slint`):
@@ -1844,17 +3453,18 @@ fn wire_setup_pairing(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// `v * 100` read 20% as "2%"). Typed deadzone values are percents
 /// ("2%"); the bite slider is 0..1 and typed bite values are
 /// percents ("40%" → 0.40). Feel chips push the curve (Linear 1.0 /
-/// Soft 0.7 / Sharp 1.5) through `set_tuning`. Set up/down need
-/// `calibrate_pedal` (BACKEND-2 seam) and stay disabled until then.
+/// Soft 0.7 / Sharp 1.5) through `set_tuning`. Set up/down capture
+/// the live endpoints (v2.0.2): up = released minimum, down = fully
+/// pressed maximum.
 fn wire_pedals(win: &MainWindow, ctx: &Rc<Ctx>) {
     const MODULES: [&str; 3] = ["throttle", "brake", "clutch"];
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_pedal_deadzone_changed(move |p, v| {
-            let Some(w) = win.upgrade() else {
+            if win.upgrade().is_none() {
                 return;
-            };
+            }
             let Ok(idx) = usize::try_from(p) else {
                 return;
             };
@@ -1862,8 +3472,9 @@ fn wire_pedals(win: &MainWindow, ctx: &Rc<Ctx>) {
                 return;
             };
             // A1: v is 0..1 of 10% → deadzone percent is v * 10.
+            // M-7: a drag queues one debounced push, not one per move.
             let deadzone = (f64::from(v) * 10.0).clamp(0.0, 10.0);
-            ctx.set_pedal_tuning(&w, module, |t| t.deadzone = deadzone);
+            ctx.queue_field_push(module, FieldKind::Deadzone, deadzone);
         });
     }
     {
@@ -1887,21 +3498,23 @@ fn wire_pedals(win: &MainWindow, ctx: &Rc<Ctx>) {
         });
     }
     wire_pedals_rest(win, ctx);
+    wire_pedals_set(win, ctx);
 }
 
-/// Wire the clutch bite-point, feel-preset and Set up/down
-/// callbacks (split from [`wire_pedals`]).
+/// Wire the clutch bite-point and feel-preset callbacks (split
+/// from [`wire_pedals`]; Set up/down live in [`wire_pedals_set`]).
 fn wire_pedals_rest(win: &MainWindow, ctx: &Rc<Ctx>) {
     const MODULES: [&str; 3] = ["throttle", "brake", "clutch"];
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_pedal_bite_changed(move |v| {
-            let Some(w) = win.upgrade() else {
+            if win.upgrade().is_none() {
                 return;
-            };
+            }
             let bite = f64::from(v).clamp(0.0, 1.0);
-            ctx.set_pedal_tuning(&w, "clutch", |t| t.bite_point = Some(bite));
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("clutch", FieldKind::Bite, bite);
         });
     }
     {
@@ -1935,33 +3548,66 @@ fn wire_pedals_rest(win: &MainWindow, ctx: &Rc<Ctx>) {
             ctx.set_pedal_tuning(&w, module, |t| t.curve = curve);
         });
     }
+}
+
+/// Wire the Pedals page Set up/down buttons (v2.0.2): up captures
+/// the released endpoint from the live raw reading, down the fully
+/// pressed one. Failure shows the reason, never silently.
+fn wire_pedals_set(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
-        // A2: SEAM — calibrate_pedal(module, "up"/"down") once
-        // BACKEND-2 lands it. The buttons are disabled until then.
+        // A2 (v2.0.2): "Set up" captures the pedal's released
+        // endpoint from the live raw reading; "Set down" the fully
+        // pressed one. Failure shows the reason, never silently.
         let win = win.as_weak();
         let ctx = ctx.clone();
-        win.unwrap().on_pedal_set_up(move |_| {
+        win.unwrap().on_pedal_set_up(move |p| {
             if let Some(w) = win.upgrade() {
-                ctx.notify(
-                    &w,
-                    "Pedals",
-                    "Pedal calibration",
-                    "Calibration capture needs a later wheel update.",
-                );
+                let Some((key, name)) = pedal_key(p) else {
+                    return;
+                };
+                match ctx.capture_pedal_ipc(key, "min") {
+                    Ok(mv) => {
+                        ctx.refresh_calibration();
+                        ctx.sync_pedals(&w);
+                        ctx.notify(
+                            &w,
+                            "Pedals",
+                            &format!("{name} released point set"),
+                            &format!("{name} up (released) captured at {mv} mV."),
+                        );
+                    }
+                    Err(reason) => {
+                        ctx.notify(&w, "Pedals", &format!("Couldn't set {name} up"), &reason);
+                        eprintln!("RSH-UI pedal set up {key} failed: {reason}");
+                    }
+                }
             }
         });
     }
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
-        win.unwrap().on_pedal_set_down(move |_| {
+        win.unwrap().on_pedal_set_down(move |p| {
             if let Some(w) = win.upgrade() {
-                ctx.notify(
-                    &w,
-                    "Pedals",
-                    "Pedal calibration",
-                    "Calibration capture needs a later wheel update.",
-                );
+                let Some((key, name)) = pedal_key(p) else {
+                    return;
+                };
+                match ctx.capture_pedal_ipc(key, "max") {
+                    Ok(mv) => {
+                        ctx.refresh_calibration();
+                        ctx.sync_pedals(&w);
+                        ctx.notify(
+                            &w,
+                            "Pedals",
+                            &format!("{name} pressed point set"),
+                            &format!("{name} down (pressed) captured at {mv} mV."),
+                        );
+                    }
+                    Err(reason) => {
+                        ctx.notify(&w, "Pedals", &format!("Couldn't set {name} down"), &reason);
+                        eprintln!("RSH-UI pedal set down {key} failed: {reason}");
+                    }
+                }
             }
         });
     }
@@ -2065,28 +3711,70 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
             let Some(w) = win.upgrade() else {
                 return;
             };
-            // A3: SEAM — set_button_action(button, action) once
-            // BACKEND-2 lands it. Until then a pending mapping
-            // cannot be saved to the wheel: say so, keep it pending.
+            // Knob edit (edit_kind == 1): persist the knob row's
+            // action (M9) — the chip tap already staged it in
+            // `knob_actions`; Save writes it to the daemon store.
             if ctx.edit_kind.get() == 1 {
-                ctx.notify(
-                    &w,
-                    "Buttons",
-                    "Knob mapping isn't supported yet",
-                    "Knob mapping isn't a wheel feature.",
+                let knob = ctx.edit_knob.get();
+                let row = ctx.knob_row.get();
+                let display = ctx.knob_actions.borrow()[usize::try_from(knob).unwrap_or(0)]
+                    [usize::try_from(row).unwrap_or(0)]
+                .clone();
+                let action = action_id(&display).unwrap_or("");
+                let saved = ctx.api().set_knob_action(
+                    u8::try_from(knob).unwrap_or(0),
+                    u8::try_from(row).unwrap_or(0),
+                    action,
                 );
+                match saved {
+                    Ok(()) => {
+                        ctx.unsaved
+                            .set(ctx.api().draft_status().is_some_and(|s| s.dirty));
+                        ctx.load_knobs(&w);
+                        ctx.notify(
+                            &w,
+                            "Buttons",
+                            "Knob mapping saved",
+                            &format!("Knob {} → {display}.", knob + 1),
+                        );
+                    }
+                    Err(e) => {
+                        ctx.notify_error(&w, "Buttons", &e);
+                        // Revert the staged choice to the stored one.
+                        ctx.load_knobs(&w);
+                    }
+                }
                 return;
             }
+            // Button edit: persist the pending chip choice (H-3) —
+            // "Not set" clears the binding, any other chip sets it.
+            // The tile refreshes from the daemon immediately after.
             if let Some(action) = ctx.pending_action.borrow().clone() {
                 let button = ctx.selected_button.get() + 1;
-                ctx.notify(
-                    &w,
-                    "Buttons",
-                    "Couldn't save button mapping",
-                    &format!(
-                        "Button {button} → {action} isn't a wheel feature — your choice stays on this screen."
-                    ),
-                );
+                let button_u8 = u8::try_from(button).unwrap_or(0);
+                let saved = match action_id(&action) {
+                    Some(id) => ctx.api().set_binding(button_u8, id).map(|_| ()),
+                    None => ctx.api().clear_binding(button_u8).map(|_| ()),
+                };
+                match saved {
+                    Ok(()) => {
+                        *ctx.pending_action.borrow_mut() = None;
+                        ctx.unsaved
+                            .set(ctx.api().draft_status().is_some_and(|s| s.dirty));
+                        ctx.load_bindings(&w);
+                        ctx.notify(
+                            &w,
+                            "Buttons",
+                            "Button mapping saved",
+                            &format!("Button {button} → {action}."),
+                        );
+                    }
+                    Err(e) => {
+                        ctx.notify_error(&w, "Buttons", &e);
+                        // Revert the tile to the stored action.
+                        ctx.load_bindings(&w);
+                    }
+                }
                 return;
             }
             match ctx.api().save_draft() {
@@ -2099,7 +3787,7 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                     ctx.notify(&w, "Buttons", "Nothing to save", "No changes to save.");
                 }
                 Err(e) => {
-                    ctx.notify(&w, "Buttons", "Couldn't save changes", &e.title);
+                    ctx.notify_error(&w, "Buttons", &e);
                     eprintln!("RSH-UI buttons edit-save failed: {} ({})", e.code, e.title);
                 }
             }
@@ -2140,9 +3828,10 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// Wire the Extras page callbacks (A6): LED pattern/brightness and
 /// handbrake feel/deadzone push through `set_tuning`; horn Learn
 /// arms `start_learn`; Test flashes the indicator; the shifter link
-/// opens the Buttons page. Controls with no backend (handbrake mode,
-/// sensitivity, LED colour, Set up/down) explain themselves instead
-/// of pretending to work.
+/// opens the Buttons page. Handbrake Set up/down capture the live
+/// endpoints (v2.0.2). Controls with no backend (handbrake mode,
+/// sensitivity, LED colour) explain themselves instead of
+/// pretending to work.
 #[allow(clippy::too_many_lines)]
 fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
@@ -2154,18 +3843,61 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
             };
             match a.as_str() {
                 "handbrake-toggle" | "shifter-toggle" | "horn-toggle" | "leds-toggle" => {
-                    // Module on/off has no backend field — the card
-                    // greying out IS the visible effect.
-                    eprintln!("RSH-UI extras toggle {a}");
+                    // H7: the toggle REALLY enables/disables the
+                    // module (draft entry + pipeline plan) — the card
+                    // greying out is only the visual echo. The .slint
+                    // flips its `-on` prop first and carries no
+                    // payload, so Rust tracks the intended state in
+                    // `module_states` and reverts it on failure (the
+                    // visual revert needs the `-on` props forwarded
+                    // as MainWindow in-out props — see the report).
+                    let (module, index) = match a.as_str() {
+                        "handbrake-toggle" => ("handbrake", 0),
+                        "shifter-toggle" => ("shifter", 1),
+                        "horn-toggle" => ("horn", 2),
+                        _ => ("led", 3),
+                    };
+                    let new_state = !ctx.module_states.borrow()[index];
+                    match ctx.api().set_module_enabled(module, new_state) {
+                        Ok(enabled) => {
+                            ctx.module_states.borrow_mut()[index] = enabled;
+                            ctx.refresh(&w, 0);
+                        }
+                        Err(e) => ctx.notify_error(&w, "Extras", &e),
+                    }
                 }
                 "handbrake-up" | "handbrake-down" => {
-                    // SEAM: calibrate_pedal("handbrake", …).
-                    ctx.notify(
-                        &w,
-                        "Extras",
-                        "Handbrake calibration",
-                        "Calibration capture needs a later wheel update.",
-                    );
+                    // v2.0.2: capture the handbrake endpoint from
+                    // the live raw reading (up = released, down =
+                    // fully pressed).
+                    let endpoint = if a.as_str() == "handbrake-up" {
+                        "min"
+                    } else {
+                        "max"
+                    };
+                    match ctx.capture_pedal_ipc("handbrake", endpoint) {
+                        Ok(mv) => {
+                            ctx.refresh_calibration();
+                            ctx.sync_extras(&w);
+                            ctx.notify(
+                                &w,
+                                "Extras",
+                                "Handbrake set",
+                                &format!(
+                                    "Handbrake {} captured at {mv} mV.",
+                                    if endpoint == "min" {
+                                        "up (released)"
+                                    } else {
+                                        "down (pressed)"
+                                    }
+                                ),
+                            );
+                        }
+                        Err(reason) => {
+                            ctx.notify(&w, "Extras", "Couldn't set handbrake", &reason);
+                            eprintln!("RSH-UI extras handbrake capture failed: {reason}");
+                        }
+                    }
                 }
                 "horn-learn" => ctx.toggle_learn(&w, 2),
                 "horn-test" => {
@@ -2189,17 +3921,14 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
-        win.unwrap().on_extras_handbrake_mode(move |_| {
+        win.unwrap().on_extras_handbrake_mode(move |i| {
             if let Some(w) = win.upgrade() {
-                // No backend for the handbrake mode (firmware F-15):
-                // stay on Axis and explain.
-                w.set_handbrake_mode(0);
-                ctx.notify(
-                    &w,
-                    "Extras",
-                    "Handbrake mode",
-                    "Handbrake button mode needs a wheel setting — staying on Axis.",
-                );
+                // H8: "Button" mode is selectable — persisted in the
+                // profile (the board-side pinmap push lives in
+                // `commands.rs`; see the report).
+                ctx.set_module_tuning(&w, "handbrake", |t| {
+                    t.handbrake_button_mode = Some(i == 1);
+                });
             }
         });
     }
@@ -2217,10 +3946,12 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_extras_handbrake_deadzone(move |v| {
-            if let Some(w) = win.upgrade() {
-                let deadzone = (f64::from(v) * 10.0).clamp(0.0, 10.0);
-                ctx.set_module_tuning(&w, "handbrake", |t| t.deadzone = deadzone);
+            if win.upgrade().is_none() {
+                return;
             }
+            let deadzone = (f64::from(v) * 10.0).clamp(0.0, 10.0);
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("handbrake", FieldKind::Deadzone, deadzone);
         });
     }
     {
@@ -2255,11 +3986,12 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_extras_led_brightness(move |v| {
-            if let Some(w) = win.upgrade() {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let brightness = (v.clamp(0.0, 1.0) * 100.0).round() as u8;
-                ctx.set_module_tuning(&w, "led", |t| t.led_brightness = Some(brightness));
+            if win.upgrade().is_none() {
+                return;
             }
+            let brightness = (v.clamp(0.0, 1.0) * 100.0).round();
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("led", FieldKind::Brightness, f64::from(brightness));
         });
     }
     {
@@ -2278,29 +4010,33 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
-        win.unwrap().on_extras_led_color(move |_| {
+        win.unwrap().on_extras_led_color(move |i| {
             if let Some(w) = win.upgrade() {
-                ctx.notify(
-                    &w,
-                    "Extras",
-                    "LED colour",
-                    "LED colour isn't stored on the wheel yet.",
-                );
+                // M2: the swatch persists in the profile and the
+                // preview re-renders in that colour (see
+                // `led_preview` / `sync_extras`).
+                let color = LED_PALETTE
+                    .get(usize::try_from(i).unwrap_or(3))
+                    .copied()
+                    .unwrap_or(0x2F_6B_FF);
+                ctx.set_module_tuning(&w, "led", |t| t.led_color = Some(color));
             }
         });
     }
 }
 
-/// Wire the theme-persist callback (v2.0.1 hotfix): the Settings
-/// screen reports its theme index (0 Dark, 1 Light, 2 Auto) and
-/// Rust writes `<data_dir>/ui-theme`.
+/// Wire the theme-persist callback (v2.0.1 hotfix, A8 v2.0.2): the
+/// Settings screen reports its theme index (0 Dark, 1 Light,
+/// 2 Auto) and Rust persists it AND resolves it to the window theme
+/// (0 Dark / 1 Light — Auto follows the OS preference, so the
+/// Settings segment then shows the resolved value, not "Auto").
 fn wire_theme(win: &MainWindow, ctx: &Rc<Ctx>) {
     let win = win.as_weak();
     let ctx = ctx.clone();
     win.unwrap().on_theme_persist(move |i| {
         write_theme(ctx.data_dir.as_ref(), i);
         if let Some(w) = win.upgrade() {
-            w.set_theme(i32::from(i == 2));
+            w.set_theme(resolve_theme_mode(i, system_light()));
         }
     });
 }
@@ -2331,6 +4067,7 @@ fn wire_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_notif_mark_all_read(move || {
             ctx.notifications.borrow_mut().mark_all_read();
+            ctx.persist_notifications();
             if let Some(w) = win.upgrade() {
                 sync_to_window(&ctx.notifications.borrow(), &w);
             }
@@ -2341,6 +4078,7 @@ fn wire_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_notif_clear(move || {
             ctx.notifications.borrow_mut().clear();
+            ctx.persist_notifications();
             if let Some(w) = win.upgrade() {
                 sync_to_window(&ctx.notifications.borrow(), &w);
             }
@@ -2489,10 +4227,11 @@ fn wire_keyboard(win: &MainWindow) {
     win.invoke_focus_keyboard();
 }
 
-/// Wire Reconnect (v2.0.1 hotfix): re-probes via
-/// `try_live_api_with_spawn` (spawning the daemon when it is not
-/// running) and swaps to live data on success, with a visible
-/// notification either way.
+/// Wire Reconnect (A9): the probe + spawn runs on a background job
+/// thread (see [`Ctx::start_reconnect_job`]) — the click returns
+/// immediately with the "Connecting…" state, and the verdict arrives
+/// via the job channel. A second click while one is in flight is
+/// ignored instead of queueing another probe.
 fn wire_reconnect(win: &MainWindow, ctx: &Rc<Ctx>) {
     let win = win.as_weak();
     let ctx = ctx.clone();
@@ -2500,58 +4239,37 @@ fn wire_reconnect(win: &MainWindow, ctx: &Rc<Ctx>) {
         let Some(w) = win.upgrade() else {
             return;
         };
-        match live_probe::try_live_api_with_spawn(ctx.data_dir.as_deref()) {
-            Some(live_api) => {
-                ctx.swap_to_live(live_api);
-                w.set_daemon_live(true);
-                ctx.notify(
-                    &w,
-                    "Connection",
-                    "Background service connected",
-                    "Live data is back.",
-                );
-                if let Err(e) = ctx.api().connect(ApiTransport::Wifi) {
-                    ctx.notify(&w, "Connection", "Reconnect failed", &e.title);
-                    eprintln!("RSH-UI reconnect failed: {} ({})", e.code, e.title);
-                }
-                ctx.refresh_calibration();
-                ctx.sync_pedals(&w);
-                ctx.sync_extras(&w);
-                ctx.sync_overview(&w);
-                ctx.refresh_profiles(&w);
-                ctx.refresh_games(&w);
-                ctx.sync_diag(&w);
-                ctx.refresh(&w, 0);
-            }
-            None => {
-                ctx.notify(
-                    &w,
-                    "Connection",
-                    "Background service not running",
-                    "Live data unavailable — the background service isn't running.",
-                );
-            }
-        }
+        ctx.start_reconnect_job(&w);
     });
 }
 
-/// Wire Set centre + Launch game (A14/A22): Set centre needs the
-/// calibration backend (`set_centre` seam) — the button is disabled
-/// until then. Launch game works off the real games list: running
-/// → Stop, installed → Launch, not installed → honest refusal.
+/// Wire Set centre + Launch game (A14/A22): Set centre captures
+/// the live centre (v2.0.2). Launch game works off the real games
+/// list: running → Stop, installed → Launch, not installed → honest
+/// refusal.
 fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_set_centre(move || {
             if let Some(w) = win.upgrade() {
-                // SEAM: api.set_centre() once BACKEND-2 lands it.
-                ctx.notify(
-                    &w,
-                    "Steering",
-                    "Set centre",
-                    "Calibration capture needs a later wheel update.",
-                );
+                // v2.0.2: capture the live centre over IPC.
+                match ctx.capture_centre_ipc() {
+                    Ok(mv) => {
+                        ctx.refresh_calibration();
+                        ctx.refresh(&w, 0);
+                        ctx.notify(
+                            &w,
+                            "Steering",
+                            "Centre set",
+                            &format!("Centre set at {mv} mV."),
+                        );
+                    }
+                    Err(reason) => {
+                        ctx.notify(&w, "Steering", "Couldn't set centre", &reason);
+                        eprintln!("RSH-UI set centre failed: {reason}");
+                    }
+                }
             }
         });
     }
@@ -2642,14 +4360,12 @@ fn wire_popover(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
-        win.unwrap().on_popover_use_preset(move |_| {
+        win.unwrap().on_popover_use_preset(move |i| {
             if let Some(w) = win.upgrade() {
-                ctx.notify(
-                    &w,
-                    "Profile",
-                    "Presets",
-                    "There are no presets — create a profile with New.",
-                );
+                // M1: presets are one row per catalogue game
+                // (read-only templates) — "Use" creates a profile
+                // from that game and activates it.
+                ctx.use_preset(&w, i);
             }
         });
     }
@@ -2676,16 +4392,27 @@ fn wire_popover(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_popover_duplicate(move |i| {
             if let Some(w) = win.upgrade() {
-                ctx.duplicate_profile_index(&w, i);
+                // M1: the footer passes a COMBINED index (presets
+                // first) — a preset row duplicates by creating a
+                // profile from its game; a my-profile row duplicates
+                // the profile itself.
+                if let Some(my) = ctx.popover_my_index(i) {
+                    ctx.duplicate_profile_index(&w, my);
+                } else {
+                    ctx.use_preset(&w, i);
+                }
             }
         });
     }
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
-        win.unwrap().on_popover_rename(move |_| {
+        win.unwrap().on_popover_rename(move |i| {
             if let Some(w) = win.upgrade() {
-                ctx.notify(&w, "Profile", "Rename", "Renaming isn't supported yet.");
+                // M1: renames the profile to its linked game's name
+                // (the popover has no text input — a free-text rename
+                // needs a `rename-text` prop; see the report).
+                ctx.rename_profile_index(&w, i);
             }
         });
     }
@@ -2694,21 +4421,28 @@ fn wire_popover(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_popover_delete(move |i| {
             if let Some(w) = win.upgrade() {
-                ctx.delete_profile_index(&w, i);
+                // M1: the footer passes a COMBINED index — presets
+                // are read-only and cannot be deleted.
+                if let Some(my) = ctx.popover_my_index(i) {
+                    ctx.delete_profile_index(&w, my);
+                } else {
+                    ctx.notify(
+                        &w,
+                        "Profile",
+                        "Presets are read-only",
+                        "Presets are read-only — duplicate one to edit it.",
+                    );
+                }
             }
         });
     }
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
-        win.unwrap().on_popover_link(move |_| {
+        win.unwrap().on_popover_link(move |i| {
             if let Some(w) = win.upgrade() {
-                ctx.notify(
-                    &w,
-                    "Profile",
-                    "Link to game",
-                    "Linking a profile to a game isn't supported yet.",
-                );
+                // M1: each click links the profile to its next game.
+                ctx.link_profile_index(&w, i);
             }
         });
     }
@@ -2769,18 +4503,10 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
             } else {
                 ApiTransport::Wifi
             };
-            match ctx.api().connect(transport) {
-                Ok(info) => {
-                    eprintln!("RSH-UI transport switch ok: {}", info.label);
-                    ctx.refresh(&w, 0);
-                }
-                Err(e) => {
-                    // Revert: the binding already flipped the switch.
-                    w.set_transport(1 - i);
-                    ctx.notify(&w, "Connection", "Couldn't switch connection", &e.title);
-                    eprintln!("RSH-UI transport switch failed: {} ({})", e.code, e.title);
-                }
-            }
+            // A9: the switch runs on a background job — the click
+            // returns immediately; a failure reverts the switch in
+            // the job drain (never a silent local-only change).
+            ctx.start_transport_job(&w, transport, Some(i));
         });
     }
     {
@@ -2790,31 +4516,11 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
             let Some(w) = win.upgrade() else {
                 return;
             };
-            let name = if i == 1 { "vJoy" } else { "HIDMaestro" };
-            match ctx.api().set_output_backend(name) {
-                Ok(active) => {
-                    ctx.sync_overview(&w);
-                    ctx.notify(
-                        &w,
-                        "Game controller",
-                        "Controller switched",
-                        &format!("Game controller is now {active}."),
-                    );
-                }
-                Err(e) => {
-                    w.set_controller(1 - i);
-                    ctx.notify(
-                        &w,
-                        "Game controller",
-                        "Couldn't switch controller",
-                        &e.title,
-                    );
-                    eprintln!(
-                        "RSH-UI output-backend switch failed: {} ({})",
-                        e.code, e.title
-                    );
-                }
-            }
+            // A9/B-2/A10: the switch runs on a background job with
+            // its 75 s bound (UAC dwell + 60 s sidecar spawn) — the
+            // click returns immediately; a failure (including a UAC
+            // decline) reverts the switch in the job drain.
+            ctx.start_backend_job(&w, i);
         });
     }
     {
@@ -2859,6 +4565,8 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
                 w.set_setup_centre_done(false);
                 w.set_setup_pedals_done(false);
                 w.set_setup_paired(w.get_paired());
+                // H-5: sync the reset branch on wizard (re)open too.
+                w.set_setup_reset_required(ctx.api().pairing_status().replacement_required);
                 w.set_setup_mode(true);
                 ctx.sync_vjoy(&w);
                 eprintln!("RSH-UI run setup again (wizard reopened)");
@@ -2885,48 +4593,20 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
     }
 }
 
-/// Run one pairing attempt from Settings and notify the result.
+/// Run one pairing attempt from Settings (H2): open the wizard at
+/// the Pair step and start the real pairing flow — never a dead-end
+/// notification on Settings.
 fn settings_pair(w: &MainWindow, ctx: &Ctx) {
-    match ctx.api().begin_pairing() {
-        Ok(info) => {
-            if info.seconds_left > 0 {
-                ctx.notify(
-                    w,
-                    "Pairing",
-                    "Pairing window open",
-                    &format!("Pairing window open — {}s left", info.seconds_left),
-                );
-            } else {
-                ctx.notify(
-                    w,
-                    "Pairing",
-                    "Pairing started",
-                    "Waiting for the wheel — hold the pair button for 3 seconds.",
-                );
-            }
-        }
-        Err(e) => ctx.notify(w, "Pairing", "Pairing failed", &e.title),
-    }
+    ctx.open_pair_wizard(w);
 }
 
-/// Report the wheel firmware version from Settings.
+/// Report the wheel firmware version from Settings (M-8): a
+/// background job compares the board's live version against the
+/// bundled OTA image version — never the hardcoded "4.0.2". The
+/// verdict (up to date / update available / unavailable) arrives via
+/// the job drain.
 fn settings_check_firmware(w: &MainWindow, ctx: &Ctx) {
-    let v = ctx.api().firmware_version();
-    if v == "4.0.2" {
-        ctx.notify(
-            w,
-            "Firmware",
-            "Firmware up to date",
-            &format!("Wheel firmware {v} — up to date"),
-        );
-    } else {
-        ctx.notify(
-            w,
-            "Firmware",
-            "Wheel firmware",
-            &format!("Wheel firmware {v}"),
-        );
-    }
+    ctx.start_firmware_check_job(w);
 }
 
 /// Wire the Settings screen actions (v2.0.1 hotfix). Every
@@ -2943,20 +4623,51 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
             let api = ctx.api();
             match a.as_str() {
                 "pair" => settings_pair(&w, &ctx),
-                "address" => ctx.notify(
-                    &w,
-                    "Settings",
-                    "Address",
-                    "Address applies when you reconnect",
-                ),
-                "tray" => ctx.notify(
-                    &w,
-                    "Settings",
-                    "Keep in tray",
-                    "RSH keeps running in the tray.",
-                ),
+                "address" => {
+                    // H4: the .slint drops the edited address (the
+                    // action carries no payload), so Rust cannot save
+                    // it yet — the Settings field needs a
+                    // `settings-action-with-text`-style callback (see
+                    // the report). Until then, say so once per 3 s
+                    // instead of spamming the drawer per keystroke.
+                    let now = Instant::now();
+                    let due = ctx
+                        .last_address_notify
+                        .get()
+                        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(3));
+                    if due {
+                        ctx.last_address_notify.set(Some(now));
+                        ctx.notify(
+                            &w,
+                            "Settings",
+                            "Address",
+                            "Address applies when you reconnect",
+                        );
+                    }
+                }
+                "tray" => {
+                    // M7: the .slint drops the toggled bool (the
+                    // action carries no payload), so Rust cannot read
+                    // the new state yet — the switch needs a
+                    // `keep-tray-selected(bool)` callback (see the
+                    // report). The close handler already reads the
+                    // live value from the API, so the behaviour is
+                    // correct; only the explicit save is pending.
+                    ctx.notify(
+                        &w,
+                        "Settings",
+                        "Keep in tray",
+                        "RSH keeps running in the tray.",
+                    );
+                }
                 "new-profile" => ctx.create_new_profile(&w),
                 "check-firmware" => settings_check_firmware(&w, &ctx),
+                // H-4: start the firmware flash (the daemon validates
+                // the bundled image + runs the minutes-long flash on
+                // its own thread; progress is polled on the 1 Hz tick).
+                // The Settings button itself is a .slint addition (see
+                // the report) — this arm is wired and waiting for it.
+                "update-firmware" => ctx.start_firmware_update_job(&w),
                 "update-check" => ctx.notify(
                     &w,
                     "Update",
@@ -2974,9 +4685,16 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
                             &format!("Backup saved to {path}"),
                         );
                     }
-                    Err(e) => ctx.notify(&w, "Backup", "Backup failed", &e.title),
+                    Err(e) => ctx.notify_error(&w, "Backup", &e),
                 },
-                "restore" => ctx.notify(&w, "Backup", "Restore", "Restore isn't supported yet."),
+                "restore" => match api.restore_backup() {
+                    Ok(message) => {
+                        ctx.notify(&w, "Backup", "Backup restored", &message);
+                        ctx.refresh_profiles(&w);
+                        ctx.refresh(&w, 0);
+                    }
+                    Err(e) => ctx.notify_error(&w, "Backup", &e),
+                },
                 other => eprintln!("RSH-UI unknown settings-action: {other}"),
             }
         });
@@ -3025,7 +4743,7 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
                     ctx.notify(&w, "Profile", "Nothing to save", "No changes to save.");
                 }
                 Err(e) => {
-                    ctx.notify(&w, "Profile", "Couldn't save changes", &e.title);
+                    ctx.notify_error(&w, "Profile", &e);
                     eprintln!("RSH-UI save-profile failed: {} ({})", e.code, e.title);
                 }
             }
@@ -3036,6 +4754,12 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_toggled_send(move || {
+            // M6: send-to-game persists + applies in the daemon
+            // (the trait's `set_output_enabled` is infallible `()`
+            // — there is no failure to revert on at this level; the
+            // daemon stores it in settings and applies it to the
+            // output path). The old code already called it; the bug
+            // was only the auto-pause toggle next to it.
             let next = !ctx.api().output_enabled();
             ctx.api().set_output_enabled(next);
             eprintln!("RSH-UI send-to-game={next}");
@@ -3046,11 +4770,33 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
     }
     {
         let win = win.as_weak();
+        let ctx = ctx.clone();
         win.unwrap().on_auto_pause_toggled(move || {
             if let Some(w) = win.upgrade() {
+                // M6: auto-pause persists in settings and applies
+                // (the daemon stops auto-switching while paused) —
+                // never a local-only prop flip.
                 let next = !w.get_auto_paused();
-                w.set_auto_paused(next);
-                eprintln!("RSH-UI auto-profile paused={next}");
+                match ctx.api().set_auto_pause(next) {
+                    Ok(stored) => {
+                        w.set_auto_paused(stored);
+                        ctx.notify(
+                            &w,
+                            "Profile",
+                            "Auto-switch",
+                            if stored {
+                                "Auto-switch paused — the active profile stays put."
+                            } else {
+                                "Auto-switch resumed."
+                            },
+                        );
+                        eprintln!("RSH-UI auto-profile paused={stored}");
+                    }
+                    Err(e) => {
+                        w.set_auto_paused(!next);
+                        ctx.notify_error(&w, "Profile", &e);
+                    }
+                }
             }
         });
     }
@@ -3132,6 +4878,11 @@ fn handle_live_event(win: &slint::Weak<MainWindow>, ctx: &Ctx, ev: &AppEvent) {
             open, seconds_left, ..
         } => {
             if let Some(w) = win.upgrade() {
+                // B-1: the window opened — the wait is over (the
+                // countdown now ticks from seconds_left).
+                if *open {
+                    *ctx.pairing_wait_since.borrow_mut() = None;
+                }
                 w.set_setup_pairing_active(*open);
                 w.set_setup_pair_seconds_left(i32::try_from(*seconds_left).unwrap_or(120));
                 if *open {
@@ -3146,20 +4897,189 @@ fn handle_live_event(win: &slint::Weak<MainWindow>, ctx: &Ctx, ev: &AppEvent) {
     }
     let pushed = ctx.notifications.borrow_mut().push_event(ev);
     if pushed {
+        // M10: daemon events persist like any other notification.
+        ctx.persist_notifications();
         if let Some(w) = win.upgrade() {
             sync_to_window(&ctx.notifications.borrow(), &w);
         }
     }
 }
 
-/// Start the 20 Hz frame timer: advance the sim only while it is
-/// the active source, drain live events only while a live API is
-/// attached, refresh the frame, and honour `--quit-after`. The data
-/// source comes from the shared state, so a Reconnect swap takes
-/// effect on the next tick. 1 Hz tasks (pairing countdown tick-down,
-/// learn poll) run every 20th tick; 5 s tasks (profiles/games
-/// refresh, diagnostics re-sync while open) every 100th tick.
-fn start_frame_timer(win: &MainWindow, ctx: &Rc<Ctx>, quit_after: Option<u64>, t0: Instant) {
+/// Drain the health monitor's verdicts on the UI thread (B2): a
+/// death clears stale values, a re-probe swaps live data in.
+fn drain_health(
+    rx: &std::sync::mpsc::Receiver<HealthEvent>,
+    win: &slint::Weak<MainWindow>,
+    ctx: &Ctx,
+) {
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            HealthEvent::DaemonDown => {
+                if let Some(w) = win.upgrade() {
+                    ctx.mark_dead(&w);
+                }
+            }
+            HealthEvent::DaemonBack(api) => {
+                if let Some(w) = win.upgrade() {
+                    ctx.reconnect_to_live(&w, api);
+                }
+            }
+        }
+    }
+}
+
+/// Spawn the health-monitor thread (B2/B4): ping the live daemon
+/// every second; on a death clear the shared link and report it,
+/// then re-probe (spawning the daemon when needed) until it answers
+/// again. The thread only talks to the UI through `tx` — the frame
+/// timer applies the verdicts on the UI thread — and it owns no
+/// `Rc` state, only the shared link. It exits when the UI drops
+/// the receiver (app quit).
+fn spawn_health_monitor(
+    data_dir: Option<PathBuf>,
+    live_link: Arc<Mutex<Option<Arc<IpcApi>>>>,
+    tx: std::sync::mpsc::Sender<HealthEvent>,
+    hidden: Arc<AtomicBool>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("rsh-health".to_string())
+        .spawn(move || {
+            let mut down_notified = false;
+            loop {
+                let current = live_link
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(api) = current {
+                    if !api.ping() {
+                        // Only clear the link when it still
+                        // holds the api that died — the user may
+                        // have reconnected while the ping was in
+                        // flight.
+                        if let Ok(mut slot) = live_link.lock() {
+                            if let Some(cur) = slot.as_ref() {
+                                if Arc::ptr_eq(cur, &api) {
+                                    *slot = None;
+                                }
+                            }
+                        }
+                        if !down_notified {
+                            if tx.send(HealthEvent::DaemonDown).is_err() {
+                                return;
+                            }
+                            down_notified = true;
+                        }
+                    }
+                } else {
+                    // H-1/A11: while the window is hidden to tray
+                    // the monitor only probes for an EXISTING daemon
+                    // — it must never spawn one, or a tray Quit
+                    // (daemon gone on purpose) would resurrect it.
+                    let found = if hidden.load(Ordering::Relaxed) {
+                        live_probe::try_live_api(data_dir.as_deref())
+                    } else {
+                        live_probe::try_live_api_with_spawn(data_dir.as_deref())
+                    };
+                    if let Some(api) = found {
+                        // Only publish when the slot is still
+                        // empty — Reconnect may have beaten us.
+                        let mut published = false;
+                        if let Ok(mut slot) = live_link.lock() {
+                            if slot.is_none() {
+                                *slot = Some(api.clone());
+                                published = true;
+                            }
+                        }
+                        down_notified = false;
+                        if published && tx.send(HealthEvent::DaemonBack(api)).is_err() {
+                            return;
+                        }
+                    } else if !down_notified {
+                        if tx.send(HealthEvent::DaemonDown).is_err() {
+                            return;
+                        }
+                        down_notified = true;
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+}
+
+/// Apply a page request forwarded by a second UI instance (M-5/A1):
+/// restore/show the window (instant — no fresh load, the daemon link
+/// is untouched) and navigate. `setup` re-opens the wizard on the
+/// same path as Settings "Run setup again"; any other page exits
+/// setup mode and selects that page.
+fn apply_page_request(win: &MainWindow, ctx: &Ctx, page: &str) {
+    let _ = win.show();
+    #[cfg(windows)]
+    ui_lifecycle::restore_and_foreground();
+    ctx.hidden.store(false, Ordering::SeqCst);
+    if page == "setup" {
+        ctx.clear_setup_marker();
+        ctx.learn_target.set(0);
+        win.set_setup_step(0);
+        win.set_setup_centre_done(false);
+        win.set_setup_pedals_done(false);
+        win.set_setup_paired(win.get_paired());
+        win.set_setup_reset_required(ctx.api().pairing_status().replacement_required);
+        win.set_setup_mode(true);
+        ctx.sync_vjoy(win);
+        eprintln!("RSH-UI page request: wizard reopened");
+    } else {
+        win.set_setup_mode(false);
+        win.set_page(ui_lifecycle::page_index(page));
+        eprintln!("RSH-UI page request: {page}");
+    }
+}
+
+/// Drain single-instance + lifecycle requests on each frame tick
+/// (M-5/A1, H-1): queued page forwards (Windows pipe), the Linux
+/// request file, the daemon's tray-Quit file, and the
+/// close-with-tray-off flag. Runs on the UI thread, so `show()` /
+/// `quit_event_loop()` are safe here.
+fn drain_ui_lifecycle(win: &MainWindow, ctx: &Ctx) {
+    let mut pages: Vec<String> = Vec::new();
+    if let Ok(mut pending) = ctx.page_requests.lock() {
+        while let Some(page) = pending.pop_front() {
+            pages.push(page);
+        }
+    }
+    if let Some(page) = ui_lifecycle::poll_page_request_file(ctx.data_dir.as_ref()) {
+        pages.push(page);
+    }
+    // Last request wins (a burst of tray clicks navigates once).
+    if let Some(page) = pages.pop() {
+        apply_page_request(win, ctx, &page);
+    }
+    if ui_lifecycle::take_quit_request(ctx.data_dir.as_ref()) {
+        eprintln!("RSH-UI tray quit requested");
+        slint::quit_event_loop().ok();
+    } else if ctx.quit_requested.get() {
+        ctx.quit_requested.set(false);
+        slint::quit_event_loop().ok();
+    }
+}
+
+/// Start the 20 Hz frame timer: drain health verdicts, drain live
+/// events only while a live API is attached, refresh the frame, and
+/// honour `--quit-after`. The data source comes from the shared
+/// state, so a Reconnect swap takes effect on the next tick. 1 Hz
+/// tasks (pairing countdown tick-down, learn poll) run every 20th
+/// tick; 5 s tasks (profiles/games refresh, diagnostics re-sync
+/// while open) every 100th tick.
+///
+/// The sim is NOT advanced here any more (B1): its sine snapshot is
+/// never displayed, so advancing the clock would only burn cycles.
+#[allow(clippy::too_many_lines)]
+fn start_frame_timer(
+    win: &MainWindow,
+    ctx: &Rc<Ctx>,
+    quit_after: Option<u64>,
+    t0: Instant,
+    health_rx: std::sync::mpsc::Receiver<HealthEvent>,
+) {
     let win = win.as_weak();
     let ctx = ctx.clone();
     let tick = Rc::new(Cell::new(0_u64));
@@ -3167,19 +5087,16 @@ fn start_frame_timer(win: &MainWindow, ctx: &Rc<Ctx>, quit_after: Option<u64>, t
     timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
         let t = tick.get();
         tick.set(t + 1);
+        // Health verdicts first: a death clears stale values, a
+        // re-probe swaps live data in — both on the UI thread.
+        drain_health(&health_rx, &win, &ctx);
         // Data source comes from the shared state so a Reconnect
-        // swap takes effect on the next tick: advance the sim
-        // only while it is the active source, drain live events
+        // swap takes effect on the next tick: drain live events
         // only while a live API is attached.
-        let (live_api, sim_api) = {
+        let live_api = {
             let state = ctx.state.borrow();
-            (state.live_api.clone(), state.sim_api.clone())
+            state.live_api.clone()
         };
-        if let Some(sim) = &sim_api {
-            if !ctx.is_live() {
-                sim.advance(0.05);
-            }
-        }
         if let Some(live) = &live_api {
             for ev in live.poll_events() {
                 log_event(&ev);
@@ -3187,18 +5104,61 @@ fn start_frame_timer(win: &MainWindow, ctx: &Rc<Ctx>, quit_after: Option<u64>, t
             }
         }
         if let Some(w) = win.upgrade() {
+            // M-5/A1 + H-1: forwarded page requests (second
+            // instance) + tray Quit + close-with-tray-off.
+            drain_ui_lifecycle(&w, &ctx);
+            // B5/B6: background-job verdicts arrive here — the UI
+            // thread never blocks on a job.
+            ctx.drain_jobs(&w);
+            // M-7: queued slider pushes (150 ms debounce) flush here.
+            ctx.flush_steering_push(&w);
+            ctx.flush_field_push(&w);
             ctx.refresh(&w, t);
             if t.is_multiple_of(20) {
-                // 1 Hz: local pairing countdown tick-down (A16 —
-                // the ring follows seconds-left/total) + learn poll.
+                // 1 Hz: job timeouts + the `connecting` guard (A9 —
+                // never infinite) + firmware-update poll (H-4) +
+                // local pairing countdown tick-down (A16 — the ring
+                // follows seconds-left/total) + learn poll.
+                ctx.check_job_timeouts(&w);
+                ctx.check_connecting_timeout(&w);
+                ctx.poll_firmware_update(&w);
                 if w.get_setup_pairing_active() && !w.get_setup_paired() {
                     let left = w.get_setup_pair_seconds_left();
-                    if left > 1 {
-                        w.set_setup_pair_seconds_left(left - 1);
-                    } else {
-                        w.set_setup_pair_seconds_left(0);
-                        w.set_setup_pairing_active(false);
-                        w.set_setup_pair_status("Pairing window closed — try again.".into());
+                    match left {
+                        2.. => {
+                            w.set_setup_pair_seconds_left(left - 1);
+                        }
+                        1 => {
+                            // The window had 1 s left — now closed.
+                            w.set_setup_pair_seconds_left(0);
+                            w.set_setup_pairing_active(false);
+                            w.set_setup_pair_status("Pairing window closed — try again.".into());
+                        }
+                        _ => {
+                            // B-1: left == 0 means no window yet (still
+                            // waiting), NOT a closed window. Give the
+                            // board 10 s from the wait start, then give
+                            // up honestly instead of expiring on the
+                            // first tick.
+                            let waited = ctx
+                                .pairing_wait_since
+                                .borrow()
+                                .is_some_and(|since| since.elapsed() >= Duration::from_secs(10));
+                            if waited {
+                                *ctx.pairing_wait_since.borrow_mut() = None;
+                                w.set_setup_pairing_active(false);
+                                w.set_setup_pair_status(
+                                    "No pairing window — check the wheel is on and try again."
+                                        .into(),
+                                );
+                                ctx.notify(
+                                    &w,
+                                    "Pairing",
+                                    "No pairing window",
+                                    "The wheel did not open a pairing window — check it is on and try again.",
+                                );
+                            }
+                        }
                     }
                     Ctx::sync_pair_ring(&w);
                 }
@@ -3231,6 +5191,11 @@ fn start_frame_timer(win: &MainWindow, ctx: &Rc<Ctx>, quit_after: Option<u64>, t
                 ctx.refresh_calibration();
                 ctx.refresh_profiles(&w);
                 ctx.refresh_games(&w);
+                // H9: while the wizard sits on Calibrate, re-probe
+                // raw mV so Next enables when wheel data arrives.
+                if w.get_setup_mode() && w.get_setup_step() == 3 {
+                    ctx.start_raw_available_job(&w);
+                }
                 if w.get_diag_open() {
                     ctx.sync_diag(&w);
                 }
@@ -3252,41 +5217,42 @@ fn main() -> Result<(), slint::PlatformError> {
     let args = parse_args();
     let data_dir = live_probe::resolve_data_dir(args.data_dir.as_deref());
 
-    // Data source: live daemon API when it answers (spawning the
-    // sibling daemon first when it is not running), simulated
-    // otherwise. The sim fallback posts one visible notification so
-    // the user knows the data is not live.
-    let live_api = live_probe::try_live_api_with_spawn(data_dir.as_deref());
-    let live = live_api.is_some();
-    let sim_api: Option<Arc<SimApi>> = if live {
-        None
-    } else {
-        Some(Arc::new(SimApi::new()))
+    // M-5/A1 (Tray-team hook): single instance, decided BEFORE the
+    // window is created. A second instance (daemon tray action
+    // `rsh-ui --page <page>` while the UI runs) forwards the page
+    // to the first instance and exits 0 — never a duplicate window.
+    let page_name = ui_lifecycle::page_name(args.page, args.setup);
+    let _ui_instance = match ui_lifecycle::ensure_single_instance(data_dir.as_ref(), page_name) {
+        ui_lifecycle::InstanceRole::First(guard) => guard,
+        ui_lifecycle::InstanceRole::Second => return Ok(()),
     };
-    let api: Arc<dyn AppApi> = match (&live_api, &sim_api) {
-        (Some(live), _) => live.clone() as Arc<dyn AppApi>,
-        (_, Some(sim)) => sim.clone() as Arc<dyn AppApi>,
-        _ => unreachable!("one data source always exists"),
-    };
-    eprintln!(
-        "RSH-UI daemon-live={live} ({})",
-        if live {
-            "live daemon data via rsh-ipc"
-        } else {
-            "simulated data until the daemon answers"
-        }
-    );
+    // A stale quit file (crashed session) must not quit this launch.
+    let _ = ui_lifecycle::take_quit_request(data_dir.as_ref());
+
+    // Data source at startup (B4): the sim fallback, frozen — the
+    // window shows first with a "Connecting…" state, and the health
+    // monitor probes (spawning the sibling daemon when it is not
+    // running) on a background thread, swapping live data in when
+    // the daemon answers. No ~10 s block before the first paint.
+    let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+    let live_link: Arc<Mutex<Option<Arc<IpcApi>>>> = Arc::new(Mutex::new(None));
+    let (health_tx, health_rx) = std::sync::mpsc::channel::<HealthEvent>();
+    eprintln!("RSH-UI starting with sim fallback; health monitor probing for the daemon");
 
     // L4 startup: seed the slider state from the stored steering
     // record (live daemon or sim) and the unsaved dot from the draft.
     let stored_steering = api.get_tuning("steering");
     let initial_unsaved = api.draft_status().is_some_and(|s| s.dirty);
+    // A9/B5: the background-job channel — job threads send JobDone
+    // here; the frame timer drains it on the UI thread.
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<JobDone>();
     let ctx = Rc::new(Ctx {
         state: Rc::new(RefCell::new(LiveState {
             api: api.clone(),
-            live_api: live_api.clone(),
-            sim_api: sim_api.clone(),
-            live,
+            live_api: None,
+            live: false,
+            connecting: true,
+            last_transport: ApiTransport::Wifi,
         })),
         tuning: Rc::new(RefCell::new(Tuning::from_settings(&stored_steering))),
         steering: Rc::new(RefCell::new(stored_steering)),
@@ -3324,11 +5290,59 @@ fn main() -> Result<(), slint::PlatformError> {
         steer_hist: Rc::new(RefCell::new(VecDeque::new())),
         pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
         unsaved: Rc::new(Cell::new(initial_unsaved)),
-        notifications: Rc::new(RefCell::new(NotificationCenter::new())),
+        // M10: notifications persist across restarts — the drawer is
+        // reloaded from `<data_dir>/notifications.json` here (a
+        // missing/corrupt file is an empty drawer, never a crash).
+        notifications: Rc::new(RefCell::new(NotificationCenter::load(data_dir.as_deref()))),
         data_dir: data_dir.clone(),
+        live_link: live_link.clone(),
+        hidden: Arc::new(AtomicBool::new(false)),
+        quit_requested: Rc::new(Cell::new(false)),
+        page_requests: Arc::new(Mutex::new(VecDeque::new())),
+        pairing_wait_since: Rc::new(RefCell::new(None)),
+        job_tx,
+        job_rx: Rc::new(RefCell::new(job_rx)),
+        busy_jobs: Rc::new(RefCell::new(HashMap::new())),
+        // A9: the window starts in "Connecting…" — the clock starts
+        // now, so a daemon that never answers is reported after 15 s
+        // instead of leaving the Overview on "Connecting…" forever.
+        connecting_since: Rc::new(Cell::new(Some(t0))),
+        reconnect_in_flight: Rc::new(Cell::new(false)),
+        firmware_check_cache: Rc::new(RefCell::new(None)),
+        raw_available: Rc::new(Cell::new(false)),
+        presets_count: Rc::new(Cell::new(0)),
+        module_states: Rc::new(RefCell::new([true; 4])),
+        firmware_update_running: Rc::new(Cell::new(false)),
+        last_address_notify: Rc::new(Cell::new(None)),
+        steer_push_due: Rc::new(Cell::new(None)),
+        pending_field: Rc::new(RefCell::new(None)),
     });
 
+    // The health monitor owns the first probe (B4): it starts now,
+    // on its own thread, while the window below opens.
+    spawn_health_monitor(data_dir.clone(), live_link, health_tx, ctx.hidden.clone());
+
     let win = MainWindow::new()?;
+    // H-1/A11: X hides to tray — the UI process stays alive (the
+    // daemon keeps running, tray "Open RSH" restores it instantly).
+    // Real quit is only via tray "Quit RSH" (quit file) or with
+    // "Keep running in the tray" off (then the frame timer quits on
+    // the next tick — quitting from inside this callback would be
+    // re-entrant).
+    {
+        let ctx_close = ctx.clone();
+        win.window().on_close_requested(move || {
+            let to_tray = ctx_close.api().close_to_tray();
+            ctx_close.hidden.store(true, Ordering::SeqCst);
+            if !to_tray {
+                ctx_close.quit_requested.set(true);
+            }
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+    // M-5/A1: listen for page forwards from second instances
+    // (Windows named pipe; Linux uses the request file).
+    ui_lifecycle::listen_for_page_requests(ctx.page_requests.clone());
     // First-run wizard: --page setup, or no setup-done marker yet.
     // A19: upgrade users see the wizard once (the marker is new) —
     // kept on purpose now that the Drivers step is in it.
@@ -3336,9 +5350,14 @@ fn main() -> Result<(), slint::PlatformError> {
     win.set_page(args.page);
     win.set_setup_mode(setup);
     win.set_setup_step(0);
-    win.set_theme(read_theme(data_dir.as_ref()));
+    win.set_theme(resolve_theme_mode(
+        read_theme(data_dir.as_ref()),
+        system_light(),
+    ));
     win.set_app_version(api.version().into());
-    win.set_daemon_live(live);
+    // B4: not live yet — the monitor is still probing. The first
+    // frame paints "Connecting…" (see `push_frame`).
+    win.set_daemon_live(false);
     win.set_gear("—".into());
     win.set_notif_open(false);
     win.set_diag_open(false);
@@ -3352,24 +5371,13 @@ fn main() -> Result<(), slint::PlatformError> {
     ))));
     // A10: Start with Windows seeds from the API at startup.
     win.set_autostart_enabled(api.autostart());
-    // Default game controller is vJoy (user order 2026-11-16); when
-    // live, seed from the stored backend instead.
-    if live {
-        if api.output_backend() == "HIDMaestro" {
-            win.set_controller(0);
-        } else {
-            // vJoy (the default) and anything unknown: vJoy.
-            win.set_controller(1);
-        }
-    }
-    // Capture gate (no capture backend — BACKEND-2): centre /
-    // pedal Set / wizard Calibrate stay disabled with a reason.
-    win.set_centre_available(Ctx::capture_available());
-    win.set_pedal_set_disabled(!Ctx::capture_available());
-    win.set_extras_calibration_disabled(!Ctx::capture_available());
-    win.set_setup_calibration_available(Ctx::capture_available());
-    win.set_centre_reason("Calibration capture needs a later wheel update.".into());
-    win.set_setup_calibration_reason("Calibration capture needs a later wheel update.".into());
+    // Default game controller is vJoy (user order 2026-11-16); the
+    // live backend re-seeds it on (re)connect (see
+    // `reconnect_to_live`) — at startup there is no daemon yet.
+    // Capture gate (v2.0.2): centre / pedal Set / wizard Calibrate
+    // are enabled while the daemon is live, disabled with a reason
+    // otherwise. Kept fresh every frame by `refresh`.
+    ctx.sync_capture_availability(&win);
     ctx.refresh_calibration();
     sync_to_window(&ctx.notifications.borrow(), &win);
     ctx.sync_pedals(&win);
@@ -3380,45 +5388,47 @@ fn main() -> Result<(), slint::PlatformError> {
     ctx.sync_vjoy(&win);
     ctx.sync_diag(&win);
     ctx.refresh(&win, 0);
-    // One-time pairing status: an already-open window shows its countdown.
-    {
-        let ps = api.pairing_status();
-        if ps.seconds_left > 0 {
-            win.set_setup_pairing_active(true);
-            win.set_setup_pair_seconds_left(i32::try_from(ps.seconds_left).unwrap_or(120));
-            win.set_setup_pair_total(i32::try_from(ps.seconds_left).unwrap_or(120));
-            win.set_setup_pair_status(
-                "Pairing window open — hold the pair button on the wheel.".into(),
-            );
-            Ctx::sync_pair_ring(&win);
-        }
-        // TR §3c: Active session at startup = already paired.
-        if matches!(api.connection().state, ConnectionState::Active) {
-            win.set_setup_paired(true);
-        }
-    }
-    // Sim fallback is visible, once: the bell carries the reason.
-    if !live {
-        ctx.notify(
-            &win,
-            "Connection",
-            "Background service not running",
-            "Live data unavailable — the background service isn't running.",
-        );
-    }
+    // No startup pairing seeding here any more (B4): the live API
+    // does not exist yet — `reconnect_to_live` seeds the wizard's
+    // pairing state when the daemon answers. The "not running"
+    // notification comes from the monitor's first verdict instead.
     eprintln!("RSH-UI window shown in {} ms", t0.elapsed().as_millis());
 
     wire_callbacks(&win, &ctx);
 
     // ---- frame timer (20 Hz) + --quit-after
-    if !args.static_mode {
-        start_frame_timer(&win, &ctx, args.quit_after, t0);
-    } else if let Some(secs) = args.quit_after {
-        let timer = Timer::default();
-        timer.start(TimerMode::SingleShot, Duration::from_secs(secs), || {
-            slint::quit_event_loop().ok();
+    if args.static_mode {
+        // Static mode has no frame timer: drain health verdicts on
+        // a 1 Hz timer so a late daemon still swaps in.
+        let win_weak = win.as_weak();
+        let ctx_static = ctx.clone();
+        let health_timer = Timer::default();
+        health_timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
+            drain_health(&health_rx, &win_weak, &ctx_static);
+            if let Some(w) = win_weak.upgrade() {
+                drain_ui_lifecycle(&w, &ctx_static);
+                // B5/B6/A9: the same job drain + timeout guards as
+                // the frame timer — static mode has no frame timer,
+                // but jobs still complete and loading must never
+                // hang forever.
+                ctx_static.drain_jobs(&w);
+                ctx_static.check_job_timeouts(&w);
+                ctx_static.check_connecting_timeout(&w);
+                ctx_static.poll_firmware_update(&w);
+                ctx_static.flush_steering_push(&w);
+                ctx_static.flush_field_push(&w);
+            }
         });
-        std::mem::forget(timer);
+        std::mem::forget(health_timer);
+        if let Some(secs) = args.quit_after {
+            let timer = Timer::default();
+            timer.start(TimerMode::SingleShot, Duration::from_secs(secs), || {
+                slint::quit_event_loop().ok();
+            });
+            std::mem::forget(timer);
+        }
+    } else {
+        start_frame_timer(&win, &ctx, args.quit_after, t0, health_rx);
     }
 
     win.run()
@@ -3485,11 +5495,54 @@ mod tests {
     }
 
     #[test]
+    fn resolve_theme_mode_maps_choice_to_window_theme() {
+        // Dark/Light as stored; Auto follows the OS preference.
+        assert_eq!(resolve_theme_mode(0, false), 0);
+        assert_eq!(resolve_theme_mode(0, true), 0);
+        assert_eq!(resolve_theme_mode(1, false), 1);
+        assert_eq!(resolve_theme_mode(1, true), 1);
+        assert_eq!(resolve_theme_mode(2, false), 0);
+        assert_eq!(resolve_theme_mode(2, true), 1);
+        // Out-of-range choices fall back to Dark.
+        assert_eq!(resolve_theme_mode(99, true), 0);
+    }
+
+    #[test]
     fn game_code_from_names() {
         assert_eq!(game_code("Assetto Corsa"), "AC");
-        assert_eq!(game_code("AC Competizione"), "AC");
-        assert_eq!(game_code("iRacing"), "IR");
+        // H6: AC Competizione gets its own code — no more collision.
+        assert_eq!(game_code("AC Competizione"), "ACC");
+        assert_eq!(game_code("Assetto Corsa Competizione"), "ACC");
+        assert_eq!(game_code("iRacing"), "iR");
         assert_eq!(game_code("Dirt Rally 2.0"), "DR");
+    }
+
+    #[test]
+    fn action_names_round_trip_through_ids() {
+        // H-3: the Buttons screen's display names map to backend ids
+        // and back — "Not set" clears, unknown ids read as "Not set".
+        assert_eq!(action_id("Shift up"), Some("shifter_up"));
+        assert_eq!(action_id("Gear 3"), Some("gear_3"));
+        assert_eq!(action_id("Not set"), None);
+        assert_eq!(action_display("shifter_up"), "Shift up");
+        assert_eq!(action_display("gear_3"), "Gear 3");
+        assert_eq!(action_display("profile_next"), "Next profile");
+        assert_eq!(action_display("bogus"), "Not set");
+        for display in [
+            "Shift up",
+            "Shift down",
+            "Horn",
+            "Gear 1",
+            "Gear 2",
+            "Gear 3",
+            "Gear 4",
+            "Gear 5",
+            "Gear 6",
+            "Handbrake",
+        ] {
+            let id = action_id(display).expect("a chip maps to an id");
+            assert_eq!(action_display(id), display);
+        }
     }
 
     #[test]
@@ -3500,13 +5553,14 @@ mod tests {
 
     #[test]
     fn user_text_never_says_daemon() {
+        // L3: the background service is called "RSH" now.
         assert_eq!(
             user_text("Daemon not running — showing Simulated data"),
-            "Background service not running — showing Live data unavailable"
+            "RSH not running — showing Live data unavailable"
         );
         assert_eq!(
             user_text("the daemon keeps running"),
-            "the background service keeps running"
+            "the RSH keeps running"
         );
         assert!(!user_text("Daemon x daemon y").contains("aemon"));
     }
@@ -3550,18 +5604,40 @@ mod tests {
 
     #[test]
     fn led_preview_off_is_dark_and_solid_is_accent() {
-        let off = led_preview(LedPattern::Off, 100);
+        let off = led_preview(LedPattern::Off, 100, None);
         assert_eq!(off.len(), 8);
         assert!(off
             .iter()
             .all(|c| *c == Color::from_rgb_u8(0x1D, 0x25, 0x33)));
-        let solid = led_preview(LedPattern::Solid, 100);
+        let solid = led_preview(LedPattern::Solid, 100, None);
         assert!(solid
             .iter()
             .all(|c| *c == Color::from_rgb_u8(0x2F, 0x6B, 0xFF)));
-        let dim = led_preview(LedPattern::Solid, 0);
+        let dim = led_preview(LedPattern::Solid, 0, None);
         assert!(dim
             .iter()
             .all(|c| *c == Color::from_rgb_u8(0x0D, 0x11, 0x18)));
+    }
+
+    #[test]
+    fn led_preview_uses_the_stored_colour() {
+        // M2: a stored red shows red, not the historic accent blue.
+        let red = led_preview(LedPattern::Solid, 100, Some(0xFF_6B_6B));
+        assert!(red
+            .iter()
+            .all(|c| *c == Color::from_rgb_u8(0xFF, 0x6B, 0x6B)));
+        let white = led_preview(LedPattern::Solid, 100, Some(0xFF_FF_FF));
+        assert!(white
+            .iter()
+            .all(|c| *c == Color::from_rgb_u8(0xFF, 0xFF, 0xFF)));
+    }
+
+    #[test]
+    fn pedal_key_maps_indices() {
+        assert_eq!(pedal_key(0), Some(("accel", "Accelerator")));
+        assert_eq!(pedal_key(1), Some(("brake", "Brake")));
+        assert_eq!(pedal_key(2), Some(("clutch", "Clutch")));
+        assert_eq!(pedal_key(3), None);
+        assert_eq!(pedal_key(-1), None);
     }
 }

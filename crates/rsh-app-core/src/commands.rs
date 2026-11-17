@@ -69,6 +69,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
+use rsh_api::UserError;
 use rsh_engine::metrics::EngineMetrics;
 pub use rsh_profiles::store::BackupInfo;
 use rsh_profiles::store::list_backups_in;
@@ -835,6 +836,51 @@ pub fn validate_firmware_image_against(path: &Path, current: (u8, u8, u8)) -> Fi
     validate_firmware_image_bytes(&bytes, current)
 }
 
+/// Map a failed firmware validation to the typed [`UserError`] the UI
+/// shows (B6): plain words + the next step, never the raw verifier
+/// string. Returns [`None`] when the image is valid (nothing to
+/// report). The flash flow ([`crate::webota::flash_firmware`],
+/// called from [`crate::state::AppStateCore::start_firmware_update`])
+/// validates again before any upload — this is the user-facing
+/// wording for the same rejection, shared so the two paths never
+/// drift apart.
+#[must_use]
+pub fn firmware_validation_user_error(validation: &FirmwareValidation) -> Option<UserError> {
+    if validation.valid {
+        return None;
+    }
+    let detail = validation.errors.first().cloned();
+    if validation.signature_valid {
+        // Signature verified, so the image is authentic — the only
+        // remaining rejection is a downgrade (see
+        // `firmware_validation_from_result`).
+        Some(UserError {
+            code: "firmware_rejected".to_string(),
+            title: "Firmware update refused".to_string(),
+            what_happened: format!(
+                "The firmware file is older than the wheel's version{} — the wheel keeps its current firmware.",
+                validation
+                    .version
+                    .as_ref()
+                    .map_or_else(String::new, |v| format!(" ({v})"))
+            ),
+            what_to_do: "Check for a newer firmware version on GitHub Releases.".to_string(),
+            detail,
+        })
+    } else {
+        Some(UserError {
+            code: "firmware_invalid".to_string(),
+            title: "Firmware image isn't valid".to_string(),
+            what_happened:
+                "The firmware file failed its signature check, so it can't be installed."
+                    .to_string(),
+            what_to_do: "Download the firmware again from GitHub Releases and try again."
+                .to_string(),
+            detail,
+        })
+    }
+}
+
 /// Shared body of [`validate_firmware_image`] and
 /// [`validate_firmware_image_against`]: verify `bytes` against
 /// `current` and map the outcome to [`FirmwareValidation`].
@@ -1506,6 +1552,40 @@ mod tests {
     }
 
     #[test]
+    fn firmware_validation_user_error_is_none_when_valid() {
+        let valid = firmware_validation_from_result(Ok(FirmwareImageInfo {
+            version: (4, 0, 2),
+            image_size: 70_000,
+            total_size: 70_068,
+            image_sha256: [0u8; 32],
+        }));
+        assert!(firmware_validation_user_error(&valid).is_none());
+    }
+
+    #[test]
+    fn firmware_validation_user_error_names_downgrade_plainly() {
+        // B6: a downgrade is a typed error with plain words + the next
+        // step — never the raw verifier string.
+        let rejected = firmware_validation_from_result(Err(FirmwareVerifyError::Downgrade {
+            image: (4, 0, 0),
+            current: (4, 0, 1),
+        }));
+        let err = firmware_validation_user_error(&rejected).expect("a UserError");
+        assert_eq!(err.code, "firmware_rejected");
+        assert!(err.what_happened.contains("4.0.0"));
+        assert!(err.what_to_do.contains("GitHub Releases"));
+    }
+
+    #[test]
+    fn firmware_validation_user_error_names_bad_signature_plainly() {
+        let invalid = validate_firmware_image(Path::new("/definitely/not/here/firmware.bin"));
+        let err = firmware_validation_user_error(&invalid).expect("a UserError");
+        assert_eq!(err.code, "firmware_invalid");
+        assert!(err.what_happened.contains("signature"));
+        assert!(err.what_to_do.contains("Download"));
+    }
+
+    #[test]
     fn shifter_with_six_pins_is_valid() {
         let mut pins = factory_assignments();
         pins.push(multi_assignment("shifter", &[5, 18, 19, 23, 4, 15]));
@@ -1643,6 +1723,8 @@ mod tests {
             }],
             seq_gap: 0,
             tx_fail: 0,
+            handbrake: 0.0,
+            gear: 0,
         });
         assert_eq!(snapshot.encoder_buttons, vec![65]);
         assert_eq!(snapshot.encoders.len(), 1);

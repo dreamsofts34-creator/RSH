@@ -50,6 +50,11 @@ impl SimApi {
     }
 
     /// Advance the simulation clock by `dt` seconds.
+    ///
+    /// Currently unused (B1, v2.0.2): the sim's sine snapshot is
+    /// never displayed, so the frame timer no longer advances it.
+    /// Kept for dev/test use — a frozen sim reads its t=0 values.
+    #[allow(dead_code)]
     pub fn advance(&self, dt: f64) {
         if let Ok(mut t) = self.t.lock() {
             *t += dt;
@@ -127,6 +132,7 @@ impl AppApi for SimApi {
             error_detail: None,
             board_mac: None,
             replacement_required: false,
+            key_reset_armed: false,
         }
     }
 
@@ -141,6 +147,11 @@ impl AppApi for SimApi {
             throttle: 0.5 + 0.5 * (t * 0.7).sin(),
             brake: (0.5 + 0.5 * (t * 0.9 + 1.3).sin()).clamp(0.0, 1.0),
             clutch: Some(0.15 + 0.1 * (t * 0.5).sin()),
+            // H10: the sim has no wheel — no button is ever pressed.
+            button_mask: 0,
+            // M-3: the sim has no handbrake or shifter either.
+            handbrake: 0.0,
+            gear: 0,
         }
     }
 
@@ -229,8 +240,12 @@ impl AppApi for SimApi {
         Ok(enabled)
     }
 
+    /// H5 (v2.0.2): the sim has no wheel behind it, so it reports
+    /// no firmware version — never the hardcoded "4.0.2". The UI
+    /// shows "—" for "Unknown" everywhere (same as the live path
+    /// when the daemon cannot be reached).
     fn firmware_version(&self) -> String {
-        "4.0.2".to_string()
+        "Unknown".to_string()
     }
 
     fn output_backend(&self) -> String {
@@ -365,7 +380,8 @@ mod tests {
         assert!(!api.autostart());
         assert!(api.set_autostart(true).expect("enable autostart"));
         assert!(api.autostart());
-        assert_eq!(api.firmware_version(), "4.0.2");
+        // H5: the sim reports no firmware version (never "4.0.2").
+        assert_eq!(api.firmware_version(), "Unknown");
         assert_eq!(api.output_backend(), "vJoy");
         assert_eq!(api.set_output_backend("vJoy").expect("vJoy"), "vJoy");
         assert_eq!(api.output_backend(), "vJoy");

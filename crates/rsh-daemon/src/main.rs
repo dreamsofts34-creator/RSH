@@ -491,26 +491,47 @@ fn spawn_ui(page: Option<&str>) {
 /// Returns `true` when an already-running UI was restored (or was
 /// already starting — no second copy spawned), `false` when a fresh
 /// UI was spawned (or the spawn was attempted). A `page` request
-/// (`--page settings`) only applies to a fresh spawn: a restored
-/// window stays on the page it was on — switching the page of a
-/// running UI needs a UI-side hook (single-instance arg forwarding
-/// or an IPC `show-page` method), which the daemon cannot do on
-/// its own (the IPC direction is UI → daemon, not daemon → UI).
+/// (`--page settings`) is forwarded to a running UI via a second
+/// `rsh-ui` instance: the UI's single-instance hook (pid file +
+/// `show-ui.request`, polled by the frame timer) makes the second
+/// instance forward the page to the first and exit, so the running
+/// UI switches page instead of staying put (M-5, v2.0.2).
 fn open_ui(page: Option<&str>, verbose: bool) -> bool {
-    // 1. A UI window exists → restore/show it (instant, live).
+    // 1. A UI window exists → restore/show it (instant, live). A page
+    // request is forwarded as well (see above) — restore alone would
+    // leave the window on its old page.
     if tray_geometry::restore_ui_window() {
+        if let Some(page) = page {
+            log_line(
+                verbose,
+                &format!("tray: forwarding page '{page}' to running UI"),
+            );
+            spawn_ui(Some(page));
+        }
         return true;
     }
     // 2. A UI process exists but has no window yet (still starting
     // up) — spawning a second UI would duplicate it, so leave it
     // alone; it appears on its own. On Linux there is no window
     // raise, so a running UI is likewise left alone here (its
-    // taskbar/dock entry brings it forward).
+    // taskbar/dock entry brings it forward). Exception: a page
+    // request is forwarded via a second instance (single-instance
+    // hook), which exits after forwarding — no duplicate window.
     if let Some(pid) = tray_geometry::ui_process_id() {
-        log_line(
-            verbose,
-            &format!("tray: UI already running (pid {pid}) — not spawning a second copy"),
-        );
+        if let Some(page) = page {
+            log_line(
+                verbose,
+                &format!(
+                    "tray: UI already running (pid {pid}) — forwarding page '{page}' via second instance"
+                ),
+            );
+            spawn_ui(Some(page));
+        } else {
+            log_line(
+                verbose,
+                &format!("tray: UI already running (pid {pid}) — not spawning a second copy"),
+            );
+        }
         return true;
     }
     // 3. No UI at all → launch it exactly like a double-click.

@@ -61,6 +61,7 @@ impl AppApi for StubApi {
             error_detail: None,
             board_mac: None,
             replacement_required: false,
+            key_reset_armed: false,
         }
     }
     fn begin_pairing(&self) -> Result<PairingInfo, UserError> {

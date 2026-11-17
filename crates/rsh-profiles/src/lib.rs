@@ -13,6 +13,10 @@ pub mod csharp_import;
 /// backup, per-game/per-car resolution, import/export).
 pub mod store;
 
+/// Persisted button→action bindings (v2.0.2): which wheel button
+/// triggers which game input or app action.
+pub mod bindings;
+
 /// Per-car / per-game profile resolution (Phase F2, SW-R7.2).
 pub mod resolver;
 

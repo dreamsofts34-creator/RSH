@@ -359,6 +359,7 @@ mod tests {
                 error_detail: None,
                 board_mac: None,
                 replacement_required: false,
+                key_reset_armed: false,
             }
         }
 
@@ -487,6 +488,8 @@ mod tests {
                 brake: 0.0,
                 clutch: Some(-0.2),
                 button_mask: 0,
+                handbrake: 0.0,
+                gear: 0,
             },
             send: true,
         };

@@ -129,6 +129,14 @@ pub struct TuningSettings {
     /// LED strip pattern (LED module only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub led_pattern: Option<LedPattern>,
+    /// LED strip colour as `0xRRGGBB` (M2, v2.0.2 — LED module only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub led_color: Option<u32>,
+    /// Handbrake "Button" mode (H8, v2.0.2 — handbrake module only):
+    /// `Some(true)` = the handbrake input acts as a button,
+    /// `Some(false)` = axis; `None` = module default (axis).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handbrake_button_mode: Option<bool>,
 }
 
 impl TuningSettings {
@@ -151,6 +159,8 @@ impl TuningSettings {
             horn_button: None,
             led_brightness: None,
             led_pattern: None,
+            led_color: None,
+            handbrake_button_mode: None,
         }
     }
 }

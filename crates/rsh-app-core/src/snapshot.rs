@@ -171,6 +171,14 @@ pub struct EngineSnapshot {
     pub seq_gap: u64,
     /// `txFail` counter passed through from the latest status packet.
     pub tx_fail: u64,
+    /// Handbrake position 0..1 (M-3, v2.0.2): the pipeline's handbrake
+    /// axis this tick. `0.0` = released; never faked — the pipeline
+    /// reports the real axis, and no frame yet means `0.0`.
+    pub handbrake: f64,
+    /// Decoded H-pattern gear (M-3, v2.0.2): `0` = neutral, `1..=6`
+    /// = gear. `0` in sequential mode or when the shifter module is
+    /// disabled — the pipeline's decoded gear, never a guess.
+    pub gear: u8,
 }
 
 /// Measures the engine tick rate over a sliding 1 s window.
@@ -361,6 +369,10 @@ pub struct SnapshotInput {
     pub seq_gap: u64,
     /// `txFail` counter from the latest status packet.
     pub tx_fail: u64,
+    /// Handbrake position 0..1 (pipeline output this tick).
+    pub handbrake: f64,
+    /// Decoded H-pattern gear: `0` = neutral, `1..=6` = gear.
+    pub gear: u8,
 }
 
 /// Build one [`EngineSnapshot`] from its inputs. The pressed virtual
@@ -380,6 +392,8 @@ pub fn build_snapshot(input: SnapshotInput) -> EngineSnapshot {
         encoder_buttons,
         seq_gap: input.seq_gap,
         tx_fail: input.tx_fail,
+        handbrake: input.handbrake,
+        gear: input.gear,
     }
 }
 
@@ -596,6 +610,8 @@ mod tests {
             encoders,
             seq_gap: 7,
             tx_fail: 3,
+            handbrake: 0.0,
+            gear: 0,
         });
         assert_eq!(snapshot.encoder_buttons, vec![65]);
         assert_eq!(snapshot.seq, 42);

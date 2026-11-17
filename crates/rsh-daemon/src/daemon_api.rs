@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use rsh_api::connection::ConnectionState as MgrState;
 use rsh_api::errors::{ConnectionError, UserError};
 use rsh_api::{
-    ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionInfo, DiagStats, DraftStatus,
-    GameSummary, PairingInfo, ProfileSummary, SnapshotInfo, TuningSettings, VjoyStatus,
-    app_version,
+    ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionInfo, DiagStats,
+    DraftStatus, FirmwareCheck, FirmwareUpdateStatus, GameSummary, PairingInfo, ProfileSummary,
+    RawMv, SnapshotInfo, TuningSettings, VjoyStatus, app_version,
 };
 use rsh_api::{ConnEvent, ConnectionManager};
 use rsh_app_core::snapshot::ConnectionState as CoreState;
@@ -170,11 +170,23 @@ impl AppApi for DaemonApi {
             error_detail: status.error,
             board_mac: status.board_mac,
             replacement_required: status.replacement_required,
+            key_reset_armed: status.key_reset_armed,
         }
     }
 
     fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
         self.state.begin_pairing().map_err(|detail| {
+            let typed = self
+                .state
+                .pairing_error_typed()
+                .unwrap_or(ConnectionError::Unknown);
+            UserError::from_connection(typed, detail)
+        })?;
+        Ok(self.pairing_status())
+    }
+
+    fn reset_pairing(&self) -> Result<PairingInfo, UserError> {
+        self.state.reset_pairing().map_err(|detail| {
             let typed = self
                 .state
                 .pairing_error_typed()
@@ -191,6 +203,11 @@ impl AppApi for DaemonApi {
             throttle: snap.pedals.accel,
             brake: snap.pedals.brake,
             clutch: snap.pedals.clutch,
+            // H10: live button bitmask from the last edge frame.
+            button_mask: self.state.pressed_button_mask(),
+            // M-3: live handbrake + gear from the pipeline output.
+            handbrake: snap.handbrake,
+            gear: snap.gear,
         }
     }
 
@@ -256,14 +273,83 @@ impl AppApi for DaemonApi {
             .unwrap_or_else(|_| "Unknown".to_string())
     }
 
+    fn firmware_check(&self) -> Result<FirmwareCheck, UserError> {
+        Ok(self.state.firmware_check())
+    }
+
+    fn update_firmware(&self) -> Result<FirmwareUpdateStatus, UserError> {
+        self.state
+            .start_firmware_update()
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn firmware_update_status(&self) -> FirmwareUpdateStatus {
+        self.state.firmware_update_status()
+    }
+
+    fn board_address(&self) -> String {
+        self.state.board_address()
+    }
+
+    fn set_board_address(&self, address: &str) -> Result<String, UserError> {
+        self.state
+            .set_board_address(address)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn module_enabled(&self, module: &str) -> bool {
+        self.state.module_enabled(module)
+    }
+
+    fn set_module_enabled(&self, module: &str, enabled: bool) -> Result<bool, UserError> {
+        self.state
+            .set_module_enabled(module, enabled)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn auto_pause(&self) -> bool {
+        self.state.auto_pause()
+    }
+
+    fn set_auto_pause(&self, paused: bool) -> Result<bool, UserError> {
+        self.state
+            .set_auto_pause(paused)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn close_to_tray(&self) -> bool {
+        self.state.close_to_tray()
+    }
+
+    fn set_close_to_tray(&self, enabled: bool) -> Result<bool, UserError> {
+        self.state
+            .set_close_to_tray(enabled)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
     fn output_backend(&self) -> String {
         self.state.backend_name()
     }
 
     fn set_output_backend(&self, name: &str) -> Result<String, UserError> {
-        self.state
-            .set_output_backend(name)
-            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
+        self.state.set_output_backend(name).map_err(|detail| {
+            // B6/A10: the admin-decline case gets a typed error with
+            // plain words — not `Unknown` / "Something went wrong."
+            // (the UI shows the title + what happened + what to do).
+            if detail == AppStateCore::HID_NOT_ADMIN {
+                UserError {
+                    code: "not_admin".to_string(),
+                    title: "Admin permission needed".to_string(),
+                    what_happened: detail.clone(),
+                    what_to_do:
+                        "Approve the Windows prompt when switching to HIDMaestro, or keep using vJoy (no permission needed)."
+                            .to_string(),
+                    detail: None,
+                }
+            } else {
+                UserError::from_connection(ConnectionError::Unknown, detail)
+            }
+        })?;
         Ok(self.state.backend_name())
     }
 
@@ -363,10 +449,12 @@ impl AppApi for DaemonApi {
     }
 
     // v2.0.1 hotfix BACKEND-2: calibration read, vJoy status/install,
-    // diagnostics. (No `set_centre` / `calibrate_pedal` /
-    // `set_button_action` — no backend: raw mV never reaches the
-    // state, and button→action rebinding is not a board feature. See
-    // `AppApi::calibration`.)
+    // diagnostics. v2.0.2 adds the capture backend on top
+    // (`raw_mv`, `capture_centre`, `capture_pedal_min/max`): raw mV
+    // now reaches the state (see `AppStateCore::note_raw_axes`), so
+    // capture samples the live reading instead of inverting the
+    // processed values. Button→action rebinding is still not a board
+    // feature (see `AppApi::calibration`).
     fn calibration(&self) -> Result<CalibrationInfo, UserError> {
         self.state
             .get_calibration()
@@ -376,6 +464,92 @@ impl AppApi for DaemonApi {
                 pedal_max_mv: calibration.pedal_max_mv,
                 calibrated_at: calibration.calibrated_at,
             })
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    /// Latest raw ADC readings in mV (v2.0.2): the live sample the
+    /// capture methods use. Never an error while the daemon runs —
+    /// an empty reading (no frame yet) is data, not a failure.
+    fn raw_mv(&self) -> Result<RawMv, UserError> {
+        Ok(self.state.raw_mv())
+    }
+
+    /// Capture the steering centre from the live raw reading
+    /// (v2.0.2). The core's message is classified into a stable code
+    /// so the UI can explain the failure instead of showing a bare
+    /// "Unknown" (see [`capture_user_error`]).
+    fn capture_centre(&self) -> Result<u16, UserError> {
+        self.state.capture_centre().map_err(capture_user_error)
+    }
+
+    /// Capture one pedal's released endpoint from the live raw
+    /// reading (v2.0.2).
+    fn capture_pedal_min(&self, pedal: &str) -> Result<u16, UserError> {
+        self.state
+            .capture_pedal_min(pedal)
+            .map_err(capture_user_error)
+    }
+
+    /// Capture one pedal's fully-pressed endpoint from the live raw
+    /// reading (v2.0.2).
+    fn capture_pedal_max(&self, pedal: &str) -> Result<u16, UserError> {
+        self.state
+            .capture_pedal_max(pedal)
+            .map_err(capture_user_error)
+    }
+
+    /// All persisted button→action bindings (v2.0.2), in button
+    /// order.
+    fn list_bindings(&self) -> Vec<ButtonBinding> {
+        self.state.list_bindings()
+    }
+
+    /// Bind a wheel button to an action and persist it (v2.0.2).
+    /// The error code is the store's stable code
+    /// (`InvalidButton` / `UnknownAction` / `BindingSaveFailed`),
+    /// so the UI can explain the failure instead of showing a bare
+    /// "Unknown" (see [`binding_user_error`]).
+    fn set_binding(&self, button: u8, action: &str) -> Result<ButtonBinding, UserError> {
+        self.state
+            .set_binding(button, action)
+            .map_err(|error| binding_user_error(error.code, error.message))
+    }
+
+    /// Remove a button's binding (v2.0.2). Returns `true` when a
+    /// binding was actually removed.
+    fn clear_binding(&self, button: u8) -> Result<bool, UserError> {
+        self.state
+            .clear_binding(button)
+            .map_err(|error| binding_user_error(error.code, error.message))
+    }
+
+    fn rename_profile(&self, id: &str, name: &str) -> Result<String, UserError> {
+        self.state
+            .rename_profile(id, name)
+            .map(|summary| summary.name)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn link_profile(&self, id: &str, game_slug: &str) -> Result<String, UserError> {
+        self.state
+            .link_profile(id, game_slug)
+            .map(|summary| summary.name)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn restore_backup(&self) -> Result<String, UserError> {
+        self.state
+            .restore_latest_backup()
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn knob_actions(&self) -> [[String; 3]; 2] {
+        self.state.knob_actions()
+    }
+
+    fn set_knob_action(&self, knob: u8, row: u8, action: &str) -> Result<(), UserError> {
+        self.state
+            .set_knob_action(knob, row, action)
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
     }
 
@@ -391,6 +565,101 @@ impl AppApi for DaemonApi {
 
     fn diag_stats(&self) -> Result<DiagStats, UserError> {
         Ok(self.state.diag_stats())
+    }
+}
+
+/// Classify a core capture failure into a typed [`UserError`]
+/// (v2.0.2). The core reports plain strings; the IPC layer only
+/// carries the code + detail (see `rsh_ipc::dispatch`), so the code
+/// is the stable handle the UI matches on and the detail is the
+/// human reason. Prefixes are the core's own message starts — the
+/// match is on the failure class, never on a substring of a value.
+#[must_use]
+pub fn capture_user_error(detail: String) -> UserError {
+    let (code, title, what_to_do) = if detail.starts_with("no live wheel data")
+        || detail.starts_with("live wheel data is stale")
+        || detail.starts_with("no steering reading")
+        || detail.starts_with("no live reading")
+    {
+        (
+            "NoLiveData",
+            "No live wheel data",
+            "Connect the wheel and wait for live data, then try again.",
+        )
+    } else if detail.starts_with("unknown pedal") {
+        (
+            "UnknownPedal",
+            "Unknown pedal",
+            "Pick the accelerator, brake, clutch, or handbrake.",
+        )
+    } else if detail.contains("is not below its maximum") || detail.contains("spans only") {
+        (
+            "BadRange",
+            "Pedal range too small",
+            "Move the pedal through its full travel — release it fully, then press it fully — and capture each end.",
+        )
+    } else if detail.starts_with("no active profile") {
+        (
+            "NoActiveProfile",
+            "No active profile",
+            "Activate a profile first, then capture again.",
+        )
+    } else if detail.contains("is outside 0..=3300") {
+        (
+            "ReadingOutOfRange",
+            "Reading out of range",
+            "Check the wheel wiring, then try again.",
+        )
+    } else {
+        (
+            "Unknown",
+            "Something went wrong",
+            "Retry, then check the diagnostics log.",
+        )
+    };
+    UserError {
+        code: code.to_string(),
+        title: title.to_string(),
+        what_happened: detail.clone(),
+        what_to_do: what_to_do.to_string(),
+        detail: Some(detail),
+    }
+}
+
+/// Map a binding failure to a typed [`UserError`] (v2.0.2). The
+/// store's code is already stable (`InvalidButton` /
+/// `UnknownAction` / `BindingSaveFailed`) — it is carried verbatim,
+/// with a title and a "what to do" per code, so the UI matches on
+/// the code and the IPC layer only has to carry `code|detail` (see
+/// `rsh_ipc::dispatch`). Takes the code + message instead of the
+/// store error type so this crate needs no `rsh-profiles`
+/// dependency.
+#[must_use]
+pub fn binding_user_error(code: &str, message: String) -> UserError {
+    let (title, what_to_do) = match code {
+        "InvalidButton" => (
+            "Button cannot be bound",
+            "Bind a physical button (1-32) or an encoder button (65-72).",
+        ),
+        "UnknownAction" => (
+            "Unknown action",
+            "Pick a game input (horn, shifter_up, shifter_down, gear_1-6, handbrake) or an app action (profile_next, profile_previous).",
+        ),
+        "BindingSaveFailed" => (
+            "Could not save the binding",
+            "Check the RSH data folder is writable, then try again.",
+        ),
+        _ => (
+            "Something went wrong",
+            "Retry, then check the diagnostics log.",
+        ),
+    };
+    UserError {
+        code: code.to_string(),
+        title: title.to_string(),
+        what_happened: message.clone(),
+        what_to_do: what_to_do.to_string(),
+        detail: Some(message),
     }
 }
 
@@ -428,5 +697,183 @@ pub fn connection_changed_event(api: &DaemonApi) -> AppEvent {
         state: info.state,
         label: info.label,
         reason,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rsh-daemon-capture-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn live_api() -> (Arc<DaemonApi>, std::path::PathBuf) {
+        live_api_named("api")
+    }
+
+    fn live_api_named(name: &str) -> (Arc<DaemonApi>, std::path::PathBuf) {
+        let dir = temp_dir(name);
+        let state =
+            Arc::new(AppStateCore::open_with_null_sink(&dir).expect("open state with null sink"));
+        let first = state
+            .list_profiles()
+            .into_iter()
+            .next()
+            .expect("default profile exists");
+        state
+            .activate_profile(&first.id)
+            .expect("activate default profile");
+        (DaemonApi::new(state), dir)
+    }
+
+    #[test]
+    fn capture_user_error_classifies_core_failures() {
+        let no_data = capture_user_error("no live wheel data yet — connect the wheel".into());
+        assert_eq!(no_data.code, "NoLiveData");
+        assert_eq!(no_data.title, "No live wheel data");
+        assert!(no_data.detail.is_some(), "the reason is kept in detail");
+        let stale = capture_user_error(
+            "live wheel data is stale (3000 ms since the last frame) — reconnect the wheel".into(),
+        );
+        assert_eq!(stale.code, "NoLiveData");
+        let bad_range = capture_user_error(
+            "pedal 'accel' range 3000..=3300 mV spans only 300 mV (need at least 660 mV) — move the pedal through its full travel and capture again".into(),
+        );
+        assert_eq!(bad_range.code, "BadRange");
+        let unknown = capture_user_error(
+            "unknown pedal 'gear' (want accel, brake, clutch, or handbrake)".into(),
+        );
+        assert_eq!(unknown.code, "UnknownPedal");
+        let other = capture_user_error("no active profile".into());
+        assert_eq!(other.code, "NoActiveProfile");
+    }
+
+    #[test]
+    fn daemon_api_capture_round_trips_the_live_reading() {
+        let (api, _dir) = live_api();
+        // No frame yet: an honest typed failure, not a fake capture.
+        let error = api
+            .capture_centre()
+            .expect_err("capture without data must fail");
+        assert_eq!(error.code, "NoLiveData");
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("no live wheel data")),
+            "detail keeps the reason: {error:?}"
+        );
+        api.state.note_raw_axes([
+            Some(1812),
+            Some(320),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        let reading = api.raw_mv().expect("raw reading");
+        assert_eq!(reading.steering_mv, Some(1812));
+        assert_eq!(reading.accel_mv, Some(320));
+        assert_eq!(api.capture_centre().expect("capture centre"), 1812);
+        let calibration = api.calibration().expect("calibration after capture");
+        assert_eq!(calibration.steering_center_mv, 1812.0);
+        assert_eq!(
+            api.capture_pedal_min("accel").expect("capture accel min"),
+            320
+        );
+        api.state.note_raw_axes([
+            Some(1812),
+            Some(3200),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            api.capture_pedal_max("accel").expect("capture accel max"),
+            3200
+        );
+        let calibration = api.calibration().expect("calibration after pedal capture");
+        assert_eq!(
+            calibration.pedal_min_mv.get("accel"),
+            Some(&320.0),
+            "pedal min round-trips through the API"
+        );
+        assert_eq!(calibration.pedal_max_mv.get("accel"), Some(&3200.0));
+    }
+
+    #[test]
+    fn daemon_api_bindings_round_trip_and_error_codes() {
+        let (api, _dir) = live_api_named("bindings");
+        assert_eq!(api.list_bindings().len(), 0);
+        let bound = api.set_binding(5, "horn").expect("bind button 5");
+        assert_eq!(bound.button, 5);
+        assert_eq!(bound.action, "horn");
+        let bound = api
+            .set_binding(65, "profile_next")
+            .expect("bind encoder button");
+        assert_eq!(bound.button, 65);
+        let listed = api.list_bindings();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].button, 5, "button order, not insertion order");
+        assert_eq!(listed[1].button, 65);
+        // Rebind the same button: the new action wins.
+        assert_eq!(
+            api.set_binding(5, "shifter_up").expect("rebind").action,
+            "shifter_up"
+        );
+        assert_eq!(api.list_bindings().len(), 2);
+        // Clear: true when bound, false when absent.
+        assert!(api.clear_binding(5).expect("clear bound"));
+        assert!(!api.clear_binding(5).expect("clear absent"));
+        assert_eq!(api.list_bindings().len(), 1);
+        // Error codes are stable, not a bare "Unknown".
+        assert_eq!(
+            api.set_binding(0, "horn").expect_err("button 0").code,
+            "InvalidButton"
+        );
+        assert_eq!(
+            api.set_binding(33, "horn").expect_err("button 33").code,
+            "InvalidButton"
+        );
+        let error = api
+            .set_binding(5, "warp_drive")
+            .expect_err("unknown action");
+        assert_eq!(error.code, "UnknownAction");
+        assert_eq!(error.title, "Unknown action");
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("warp_drive")),
+            "detail keeps the reason: {error:?}"
+        );
+    }
+
+    #[test]
+    fn binding_user_error_maps_each_stable_code() {
+        let invalid = binding_user_error("InvalidButton", "button 0 cannot be bound".to_string());
+        assert_eq!(invalid.code, "InvalidButton");
+        assert_eq!(invalid.title, "Button cannot be bound");
+        let unknown = binding_user_error("UnknownAction", "unknown action 'nope'".to_string());
+        assert_eq!(unknown.code, "UnknownAction");
+        assert!(
+            unknown
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("nope"))
+        );
+        let saved = binding_user_error("BindingSaveFailed", "disk full".to_string());
+        assert_eq!(saved.code, "BindingSaveFailed");
+        assert_eq!(saved.detail.as_deref(), Some("disk full"));
     }
 }
