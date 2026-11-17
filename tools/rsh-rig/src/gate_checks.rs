@@ -1270,7 +1270,7 @@ pub fn gate_notifications_source() -> (bool, String) {
 /// pairing that actually started.
 ///
 /// Runtime: a fake daemon that models the FIXED daemon — the
-/// begin_pairing board wait still takes 3 s server-side (the
+/// `begin_pairing` board wait still takes 3 s server-side (the
 /// slow-board case), but dispatch is non-blocking (each request
 /// answered from its own task), so the `begin_pairing` IPC call
 /// acks within 500 ms (fire-and-forget start + status polling)
