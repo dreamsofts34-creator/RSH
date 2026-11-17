@@ -351,6 +351,7 @@ impl SingleInstance {
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::os::unix::process::CommandExt;
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir =
@@ -479,12 +480,14 @@ mod tests {
     #[test]
     fn pid_of_a_process_named_rsh_daemon_is_already_running() {
         let dir = temp_dir("live");
-        // `exec -a` renames argv[0], so the child's cmdline names
-        // rsh-daemon without running the real daemon.
-        let mut child = std::process::Command::new("bash")
-            .args(["-c", "exec -a rsh-daemon sleep 30"])
+        // argv[0] set directly — no shell: `sh` here is dash,
+        // which has no `exec -a`, so a `sh -c "exec -a ..."` fake
+        // dies instantly and the pid is reclaimed as First.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .arg0("rsh-daemon")
             .spawn()
-            .expect("spawn bash");
+            .expect("spawn fake rsh-daemon");
         let pid = child.id();
         // Give the exec a moment to happen before we read cmdline.
         std::thread::sleep(std::time::Duration::from_millis(200));

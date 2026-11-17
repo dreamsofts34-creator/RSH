@@ -468,13 +468,16 @@ pub fn restore_ui_window() -> bool {
 #[cfg(not(windows))]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
 
     #[test]
     fn linux_ui_process_scan_finds_rsh_ui_and_ignores_other_programs() {
-        // `exec -a` renames argv[0], so the child's cmdline names
-        // rsh-ui without running the real UI.
-        let mut ui = std::process::Command::new("bash")
-            .args(["-c", "exec -a rsh-ui sleep 30"])
+        // argv[0] set directly — no shell: `sh` here is dash,
+        // which has no `exec -a`, so a `sh -c "exec -a ..."` fake
+        // dies instantly and the scan finds nothing.
+        let mut ui = std::process::Command::new("sleep")
+            .arg("30")
+            .arg0("rsh-ui")
             .spawn()
             .expect("spawn fake ui");
         std::thread::sleep(std::time::Duration::from_millis(200));

@@ -461,6 +461,7 @@ pub fn take_quit_request(data_dir: Option<&PathBuf>) -> bool {
 #[cfg(not(windows))]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmp_dir() -> PathBuf {
@@ -491,11 +492,13 @@ mod tests {
     #[test]
     fn second_instance_forwards_and_first_claims() {
         let dir = tmp_dir();
-        // A live process whose cmdline names rsh-ui (daemon test
-        // pattern: `exec -a` renames argv[0] without running the
-        // real UI).
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "exec -a rsh-ui sleep 30"])
+        // A live process whose cmdline names rsh-ui (argv[0] set
+        // directly — no shell: `sh` here is dash, which has no
+        // `exec -a`, so the old `sh -c "exec -a ..."` form died
+        // instantly and the pid was reclaimed as First).
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .arg0("rsh-ui")
             .spawn()
             .expect("spawn fake rsh-ui");
         let pid = child.id();

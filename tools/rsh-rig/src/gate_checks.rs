@@ -901,14 +901,15 @@ pub fn gate_slider_source() -> (bool, String) {
 /// Gate: tray popup persistence, source audit (A4, plan §C).
 ///
 /// Source audit: the popup's only hide paths are click-outside
-/// (via `tray_popup::should_dismiss_popup` — a pure function that
+/// (via `tray_popup::PopupDismissPoll` — the F9 state machine:
 /// never dismisses within the 500 ms grace, never dismisses while
 /// the popup is foreground, and only dismisses on a real
-/// foreground move-away), Escape, and the popup's own buttons —
-/// there is no unconditional auto-hide timer, and `tray.slint`
-/// itself contains no `Timer`. The runtime proof (popup open 5 s,
-/// click-away closes it) is Windows-only and stays a user-PC
-/// verification.
+/// foreground move-away — sustained foreground lost, or the
+/// foreground away from the re-sampled baseline for 3 consecutive
+/// polls), Escape, and the popup's own buttons — there is no
+/// unconditional auto-hide timer, and `tray.slint` itself contains
+/// no `Timer`. The runtime proof (popup open 5 s, click-away
+/// closes it) is Windows-only and stays a user-PC verification.
 #[must_use]
 pub fn gate_tray_persistence_source() -> (bool, String) {
     let mut report = Report::new();
@@ -928,16 +929,17 @@ pub fn gate_tray_persistence_source() -> (bool, String) {
     );
     report.check(
         "tray-dismiss-fn-grace",
-        popup.contains("pub fn should_dismiss_popup")
+        popup.contains("pub struct PopupDismissPoll")
             && popup.contains("POPUP_FOREGROUND_GRACE: Duration = Duration::from_millis(500)")
             && popup.contains("if elapsed <= POPUP_FOREGROUND_GRACE {"),
-        "should_dismiss_popup never dismisses within the 500 ms grace",
+        "PopupDismissPoll never dismisses within the 500 ms grace",
     );
     report.check(
         "tray-dismiss-fn-foreground",
         popup.contains("if popup_foreground {")
-            && popup.contains("if was_foreground {"),
-        "should_dismiss_popup never dismisses while foreground; dismisses only on a real foreground move-away",
+            && popup.contains("saw_sustained_foreground && foreground_now.is_some()")
+            && popup.contains("changed_streak >= POPUP_DISMISS_CHANGED_POLLS"),
+        "PopupDismissPoll never dismisses while foreground; dismisses only on a real foreground move-away (sustained foreground lost, or 3 consecutive polls away from baseline)",
     );
     let Some(timer_start) = daemon.find("Refresh timer (10 Hz while visible)") else {
         report.check("tray-timer-block", false, "refresh-timer block not found");
@@ -948,17 +950,17 @@ pub fn gate_tray_persistence_source() -> (bool, String) {
         return report.finish();
     };
     let block = &daemon[timer_start..timer_start + timer_end];
-    let hide_count = block.matches("handle.hide()").count();
+    let hide_count = block.matches("handle.hide(").count();
     report.check(
         "tray-timer-hide-only-via-dismiss",
-        block.contains("should_dismiss_popup(") && hide_count == 1,
-        "the timer's only hide() is inside the should_dismiss_popup gate (no timed hide)",
+        block.contains("handle.tick(shown, foreground_now, hwnd)") && hide_count == 1,
+        "the timer's only hide() is behind the PopupDismissPoll tick gate (no timed hide)",
     );
     report.check(
         "tray-hide-paths",
-        daemon.contains("on_close_popup(move || handle.hide())")
+        daemon.contains("handle.hide(\"close-button\")")
             && tray.contains("Key.Escape"),
-        "hide paths are: popup close button, Escape, click-away via should_dismiss_popup — no timed hide",
+        "hide paths are: popup close button, Escape, click-away via PopupDismissPoll — no timed hide",
     );
     report.finish()
 }
