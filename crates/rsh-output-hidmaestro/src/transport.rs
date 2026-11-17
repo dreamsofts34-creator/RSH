@@ -581,16 +581,17 @@ fn drain_to_ring<R: Read + Send + 'static>(reader: R, ring: Arc<Mutex<VecDeque<S
 /// not a time/pid xorshift (H1). The listener is still loopback-only
 /// and short-lived; the token is one layer, not the whole boundary.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics when the OS RNG is unavailable: without OS entropy there
-/// is no safe token to issue, and silently falling back to weak
-/// randomness would be worse than failing loudly at connect time.
-#[must_use]
-pub fn generate_token() -> String {
+/// Returns the OS RNG error instead of panicking when entropy is
+/// unavailable — the caller (Windows elevated spawn) surfaces it as
+/// a connect failure via `HidMaestroError::Io` instead of crashing
+/// the engine thread (DS-42).
+pub fn generate_token() -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("OS RNG unavailable for sidecar token");
-    bytes_to_hex(&bytes)
+    getrandom::fill(&mut bytes)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok(bytes_to_hex(&bytes))
 }
 
 #[cfg(test)]
@@ -629,8 +630,8 @@ mod tests {
 
     #[test]
     fn token_is_32_hex_and_unique() {
-        let a = generate_token();
-        let b = generate_token();
+        let a = generate_token().expect("OS RNG available in tests");
+        let b = generate_token().expect("OS RNG available in tests");
         assert_eq!(a.len(), 32);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);

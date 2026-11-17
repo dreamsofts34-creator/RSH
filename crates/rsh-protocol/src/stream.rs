@@ -141,7 +141,13 @@ impl StreamFrame {
     /// Callers that take untrusted input must check bounds first; the
     /// parser never calls this with out-of-range data. Prefer
     /// [`StreamFrame::try_new`] — this constructor is kept only for
-    /// existing callers outside the engine/transport crates.
+    /// tests: a 2026-11-17 workspace audit (DS-43) found NO production
+    /// caller — every call site is in a test module or an integration
+    /// test (`engine`, `pipeline`, `serial`, `udp`, `state`,
+    /// `golden_vectors`, `property`) — so the panic cannot fire on
+    /// a live frame path. `try_new` rejects the same out-of-range
+    /// input with an error (see
+    /// `try_new_accepts_valid_and_rejects_out_of_range`).
     #[must_use]
     pub fn new(
         seq: u16,

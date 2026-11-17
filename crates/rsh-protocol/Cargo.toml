@@ -6,6 +6,7 @@ license.workspace = true
 description = "RSH protocol v2.1 — pure parse/encode (stream, status, HELLO, control/HMAC, ping, config blob, PIN-RULES). No I/O, no tokio, no std-net."
 
 [dependencies]
+digest = "=0.11.3" # DS-44: infallible HMAC construction needs hybrid-array's Array from hmac 0.13's digest (0.11.x); hmac does not re-export it
 hmac = "=0.13.0"
 sha2 = "=0.11.1"
 serde_json.workspace = true
