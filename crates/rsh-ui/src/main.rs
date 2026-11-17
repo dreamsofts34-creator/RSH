@@ -662,6 +662,124 @@ impl JobKind {
             | JobKind::ResetPairing => Duration::from_secs(5),
         }
     }
+
+    /// Stable order for the busy strip's tie-break: when two jobs
+    /// started in the same instant, the earlier-declared kind wins
+    /// so the shown label is deterministic.
+    fn order(self) -> u8 {
+        match self {
+            JobKind::Reconnect => 0,
+            JobKind::Transport => 1,
+            JobKind::Backend => 2,
+            JobKind::FirmwareCheck => 3,
+            JobKind::FirmwareUpdate => 4,
+            JobKind::RawAvailable => 5,
+            JobKind::ResetPairing => 6,
+        }
+    }
+}
+
+/// Busy-strip state (B5, FC2) for a `busy_jobs` map: `(false, "")`
+/// when nothing runs, otherwise `(true, label)` of the OLDEST
+/// running job (the strip shows one job at a time — the one that
+/// started first; ties break by [`JobKind::order`]).
+fn busy_state_for(jobs: &HashMap<JobKind, (String, Instant)>) -> (bool, String) {
+    let mut best: Option<(Instant, u8, &str)> = None;
+    for (kind, (label, started)) in jobs {
+        let candidate = (*started, kind.order(), label.as_str());
+        let take = best.is_none_or(|(old_started, old_order, _)| {
+            candidate.0 < old_started || (candidate.0 == old_started && candidate.1 < old_order)
+        });
+        if take {
+            best = Some(candidate);
+        }
+    }
+    best.map_or_else(
+        || (false, String::new()),
+        |(_, _, label)| (true, label.to_string()),
+    )
+}
+
+/// Board-address validation (H4, FC2): the same rule the daemon
+/// enforces — a private/loopback IPv4 literal only. A hostname
+/// such as `rsh.local` or a public IP is not a board address.
+fn valid_board_address(address: &str) -> bool {
+    address
+        .trim()
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| ip.is_private() || ip.is_loopback())
+}
+
+/// A typed profile name, trimmed — `None` when nothing was typed.
+/// Length / character rules live in the backend (`rename_profile`
+/// validates them); the UI only rejects an empty name.
+fn clean_profile_name(name: &str) -> Option<String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Daemon-error banner text (M-2, FC2): empty while the daemon is
+/// live or no fatal file exists; otherwise the fatal file's plain
+/// detail (L3: "daemon" wording rewritten to "RSH"). A fatal file
+/// with no detail still shows a plain line instead of an empty
+/// banner.
+fn daemon_error_for(live: bool, status: Option<(String, String)>) -> String {
+    if live {
+        return String::new();
+    }
+    let Some((_code, detail)) = status else {
+        return String::new();
+    };
+    if detail.trim().is_empty() {
+        "RSH stopped unexpectedly — try Reconnect.".to_string()
+    } else {
+        user_text(&detail)
+    }
+}
+
+/// Write one Extras module `-on` prop by module index (H7, FC2):
+/// 0 handbrake, 1 shifter, 2 horn, 3 led. The props are `MainWindow`
+/// in-out props, so Rust can revert a toggle the backend rejected.
+fn set_extras_on_prop(win: &MainWindow, index: usize, value: bool) {
+    match index {
+        0 => win.set_extras_handbrake_on(value),
+        1 => win.set_extras_shifter_on(value),
+        2 => win.set_extras_horn_on(value),
+        _ => win.set_extras_leds_on(value),
+    }
+}
+
+/// Write the B5 busy props, only when they change (so the 1 Hz
+/// safety call in the frame timer is free). A transition logs to
+/// stderr — the Xvfb smoke run reads the busy on/off off the log.
+fn set_busy_props(win: &MainWindow, busy: bool, label: &str) {
+    if win.get_busy() == busy && win.get_busy_label().as_str() == label {
+        return;
+    }
+    win.set_busy(busy);
+    win.set_busy_label(label.into());
+    if busy {
+        eprintln!("RSH-UI busy: {label}");
+    } else {
+        eprintln!("RSH-UI busy: idle");
+    }
+}
+
+/// Write the M-2 daemon-error prop, only when it changes.
+fn set_daemon_error_prop(win: &MainWindow, text: &str) {
+    if win.get_daemon_error().as_str() == text {
+        return;
+    }
+    win.set_daemon_error(text.into());
+    if text.is_empty() {
+        eprintln!("RSH-UI daemon-error banner cleared");
+    } else {
+        eprintln!("RSH-UI daemon-error banner: {text}");
+    }
 }
 
 /// Background-job completions (A9/B5): a job thread sends exactly one
@@ -1264,6 +1382,45 @@ impl Ctx {
         self.notify(win, kind, title, &body);
     }
 
+    /// Current busy state (B5): whether any job runs + the oldest
+    /// running job's label (the strip shows one job at a time).
+    fn busy_state(&self) -> (bool, String) {
+        busy_state_for(&self.busy_jobs.borrow())
+    }
+
+    /// Drive the B5 busy strip from `busy_jobs` (FC2): a running
+    /// job shows the strip with its label, no job hides it. Fed on
+    /// every job start/finish/timeout (see [`Ctx::run_job`],
+    /// [`Ctx::drain_jobs`], [`Ctx::check_job_timeouts`]) plus a 1 Hz
+    /// safety call from the frame timer — the write itself is
+    /// change-detected, so the safety call costs nothing.
+    fn sync_busy(&self, win: &MainWindow) {
+        let (busy, label) = self.busy_state();
+        set_busy_props(win, busy, &label);
+    }
+
+    /// Drive the M-2 daemon-error banner (FC2): the fatal reason
+    /// from `daemon-status.json` while the daemon is down, empty
+    /// (banner hidden) while it is live or no fatal file exists.
+    /// Called on every daemon death / return (`mark_dead`,
+    /// `reconnect_to_live`, Reconnect failure) plus a 1 Hz safety
+    /// call, so a fatal file that lands without a health event
+    /// still reaches the banner.
+    fn sync_daemon_error(&self, win: &MainWindow) {
+        let text = daemon_error_for(
+            self.is_live(),
+            live_probe::read_daemon_status(self.data_dir.as_deref()),
+        );
+        set_daemon_error_prop(win, &text);
+    }
+
+    /// Seed the keep-in-tray switch from the API (FC2): the close
+    /// handler reads the same value, so the switch never disagrees
+    /// with what X will do.
+    fn sync_keep_in_tray(&self, win: &MainWindow) {
+        win.set_keep_in_tray(self.api().close_to_tray());
+    }
+
     /// Start a background job (A9/B5): the work runs on its own
     /// thread — the UI thread never blocks on IPC, a spawn, or a
     /// flash. The busy label is recorded immediately (feedback in
@@ -1276,6 +1433,7 @@ impl Ctx {
     /// [`Ctx::check_job_timeouts`]).
     fn run_job(
         &self,
+        win: &MainWindow,
         kind: JobKind,
         label: &str,
         work: impl FnOnce() -> JobDone + Send + 'static,
@@ -1287,6 +1445,10 @@ impl Ctx {
         self.busy_jobs
             .borrow_mut()
             .insert(kind, (label.to_string(), Instant::now()));
+        // B5/FC2: the strip shows the job immediately (<100 ms
+        // feedback — the frame timer is 50 ms, but the label is
+        // already in `busy_jobs`, so drive the props now).
+        self.sync_busy(win);
         let tx = self.job_tx.clone();
         let _ = std::thread::Builder::new()
             .name(format!("rsh-job-{kind:?}"))
@@ -1306,6 +1468,9 @@ impl Ctx {
         while let Ok(done) = rx.try_recv() {
             self.apply_job_done(win, done);
         }
+        // B5/FC2: a finished job clears its busy entry — hide the
+        // strip (or fall back to the next running job's label).
+        self.sync_busy(win);
     }
 
     /// Apply one finished job (A9/B5). A result whose kind is no
@@ -1336,6 +1501,10 @@ impl Ctx {
                         } else {
                             self.notify(win, "Connection", "Couldn't reconnect", &reason);
                         }
+                        // FC2: a fatal file names the reason — show
+                        // it in the Overview banner too, not just in
+                        // the notification drawer.
+                        self.sync_daemon_error(win);
                         self.refresh(win, 0);
                     }
                 }
@@ -1563,6 +1732,9 @@ impl Ctx {
             );
             self.refresh(win, 0);
         }
+        // B5/FC2: a timed-out job leaves the busy map — hide the
+        // strip (or fall back to the next running job's label).
+        self.sync_busy(win);
     }
 
     /// Clear a `connecting` state older than 15 s (A9): the first
@@ -1657,7 +1829,7 @@ impl Ctx {
         self.connecting_since.set(Some(Instant::now()));
         self.refresh(win, 0);
         let data_dir = self.data_dir.clone();
-        self.run_job(JobKind::Reconnect, "Reconnecting…", move || {
+        self.run_job(win, JobKind::Reconnect, "Reconnecting…", move || {
             match live_probe::try_live_api_with_spawn_n(data_dir.as_deref(), 6) {
                 Some(api) => JobDone::Reconnect(Ok(api)),
                 None => {
@@ -1684,12 +1856,15 @@ impl Ctx {
             "The wheel connection is switching — this takes a moment.",
         );
         let api = self.api();
-        self.run_job(JobKind::Transport, "Switching connection…", move || {
-            JobDone::Transport {
+        self.run_job(
+            win,
+            JobKind::Transport,
+            "Switching connection…",
+            move || JobDone::Transport {
                 index,
                 result: api.connect(transport),
-            }
-        });
+            },
+        );
     }
 
     /// Start an output-backend switch job (A9/B-2): `set_output_backend`
@@ -1721,12 +1896,15 @@ impl Ctx {
             );
         }
         let api = self.api();
-        self.run_job(JobKind::Backend, "Switching controller…", move || {
-            JobDone::Backend {
+        self.run_job(
+            win,
+            JobKind::Backend,
+            "Switching controller…",
+            move || JobDone::Backend {
                 index,
                 result: api.set_output_backend(name),
-            }
-        });
+            },
+        );
     }
 
     /// Start a firmware-check job (M-8): board live version vs the
@@ -1739,9 +1917,12 @@ impl Ctx {
             "Reading the wheel and bundled firmware versions…",
         );
         let api = self.api();
-        self.run_job(JobKind::FirmwareCheck, "Checking firmware…", move || {
-            JobDone::FirmwareCheck(api.firmware_check())
-        });
+        self.run_job(
+            win,
+            JobKind::FirmwareCheck,
+            "Checking firmware…",
+            move || JobDone::FirmwareCheck(api.firmware_check()),
+        );
     }
 
     /// Start a firmware update (H-4): the daemon validates the
@@ -1757,6 +1938,7 @@ impl Ctx {
         );
         let api = self.api();
         self.run_job(
+            win,
             JobKind::FirmwareUpdate,
             "Starting firmware update…",
             move || JobDone::FirmwareUpdate(api.update_firmware()),
@@ -1766,18 +1948,23 @@ impl Ctx {
     /// Start a raw-mV availability probe (H9): any axis reporting
     /// means the wizard's Calibrate step can proceed. Silent — no
     /// notification; the wizard's Next button is the feedback.
-    fn start_raw_available_job(&self, _win: &MainWindow) {
+    fn start_raw_available_job(&self, win: &MainWindow) {
         let api = self.api();
-        self.run_job(JobKind::RawAvailable, "Checking wheel data…", move || {
-            let available = api.raw_mv().is_ok_and(|mv| {
-                mv.steering_mv.is_some()
-                    || mv.accel_mv.is_some()
-                    || mv.brake_mv.is_some()
-                    || mv.clutch_mv.is_some()
-                    || mv.handbrake_mv.is_some()
-            });
-            JobDone::RawAvailable(available)
-        });
+        self.run_job(
+            win,
+            JobKind::RawAvailable,
+            "Checking wheel data…",
+            move || {
+                let available = api.raw_mv().is_ok_and(|mv| {
+                    mv.steering_mv.is_some()
+                        || mv.accel_mv.is_some()
+                        || mv.brake_mv.is_some()
+                        || mv.clutch_mv.is_some()
+                        || mv.handbrake_mv.is_some()
+                });
+                JobDone::RawAvailable(available)
+            },
+        );
     }
 
     /// Start a pairing reset job (B5): the daemon resets the pairing
@@ -1791,13 +1978,18 @@ impl Ctx {
             "Clearing the pairing state…",
         );
         let api = self.api();
-        self.run_job(JobKind::ResetPairing, "Resetting pairing…", move || {
-            let was_armed = api.pairing_status().key_reset_armed;
-            JobDone::ResetPairing {
-                was_armed,
-                result: api.reset_pairing(),
-            }
-        });
+        self.run_job(
+            win,
+            JobKind::ResetPairing,
+            "Resetting pairing…",
+            move || {
+                let was_armed = api.pairing_status().key_reset_armed;
+                JobDone::ResetPairing {
+                    was_armed,
+                    result: api.reset_pairing(),
+                }
+            },
+        );
     }
 
     /// Seed the Buttons page from the daemon's stored bindings (H-3 /
@@ -1859,13 +2051,14 @@ impl Ctx {
 
     /// Seed everything the daemon owns on (re)connect (B1 wiring):
     /// bindings + knobs + auto-pause + module on/off + the firmware
-    /// check cache. The Settings switches the .slint does not forward
-    /// (keep-in-tray) are read from the API by the close handler
-    /// instead — there is no window prop to seed.
+    /// check cache + the keep-in-tray switch (FC2: the switch is a
+    /// `MainWindow` in-out prop now, seeded from the API like the
+    /// others — the close handler reads the same value).
     fn seed_live_state(&self, win: &MainWindow) {
         self.load_bindings(win);
         self.load_knobs(win);
         win.set_auto_paused(self.api().auto_pause());
+        self.sync_keep_in_tray(win);
         *self.module_states.borrow_mut() = [
             self.api().module_enabled("handbrake"),
             self.api().module_enabled("shifter"),
@@ -1874,6 +2067,74 @@ impl Ctx {
         ];
         *self.firmware_check_cache.borrow_mut() = self.api().firmware_check().ok();
         self.raw_available.set(false);
+    }
+
+    /// Apply a board address from Settings (H4, FC2): the
+    /// `address-accepted` callback carries the typed value. A
+    /// private/loopback IPv4 literal is validated locally first
+    /// (the daemon's rule — `rsh.local` is not an address), then
+    /// persisted via the API (the transport uses it on the next
+    /// reconnect). Any failure notifies plainly and the field
+    /// reverts to the live address via [`Ctx::sync_overview`] —
+    /// never a silent no-op, never a stale typed value left on
+    /// screen.
+    fn apply_board_address(&self, win: &MainWindow, address: &str) {
+        let address = address.trim();
+        if !valid_board_address(address) {
+            self.notify(
+                win,
+                "Settings",
+                "Address not saved",
+                &format!(
+                    "\"{address}\" is not a board address — enter the wheel's Wi-Fi IP (for example 192.168.4.1)."
+                ),
+            );
+            self.sync_overview(win);
+            return;
+        }
+        match self.api().set_board_address(address) {
+            Ok(stored) => {
+                self.notify(
+                    win,
+                    "Settings",
+                    "Address saved",
+                    &format!("Wheel address is now {stored} — it applies on the next reconnect."),
+                );
+                self.sync_overview(win);
+            }
+            Err(e) => {
+                self.notify_error(win, "Settings", &e);
+                self.sync_overview(win);
+            }
+        }
+    }
+
+    /// Apply the keep-in-tray switch (M-7, FC2): the
+    /// `keep-tray-selected` callback carries the NEW state (the
+    /// .slint already flipped the prop). Success confirms the
+    /// authoritative value; failure reverts the prop to the old
+    /// state and explains — the switch never lies about the real
+    /// setting.
+    fn apply_keep_tray(&self, win: &MainWindow, enabled: bool) {
+        match self.api().set_close_to_tray(enabled) {
+            Ok(new_state) => {
+                win.set_keep_in_tray(new_state);
+                self.notify(
+                    win,
+                    "Settings",
+                    "Keep in tray",
+                    if new_state {
+                        "RSH keeps running in the tray after close."
+                    } else {
+                        "RSH quits when the window closes."
+                    },
+                );
+            }
+            Err(e) => {
+                win.set_keep_in_tray(!enabled);
+                self.notify_error(win, "Settings", &e);
+            }
+        }
     }
 
     /// Open the setup wizard at the Pair step and start the real
@@ -1954,6 +2215,9 @@ impl Ctx {
         self.steer_hist.borrow_mut().clear();
         self.pedal_hist.borrow_mut().clear();
         win.set_daemon_live(false);
+        // FC2: the fatal reason (if any) reaches the Overview
+        // banner now, not just the notification drawer.
+        self.sync_daemon_error(win);
         self.connecting_since.set(None);
         // M-2: the daemon's fatal file names the reason
         // (IpcBindFailed / DaemonHung) — show it instead of the
@@ -1995,6 +2259,8 @@ impl Ctx {
         let transport = self.last_transport();
         self.swap_to_live(live_api);
         win.set_daemon_live(true);
+        // FC2: live again — the daemon-error banner clears.
+        self.sync_daemon_error(win);
         // Seed the controller + autostart switches from the daemon
         // (the startup seeding cannot run — the daemon was not
         // there when the window opened).
@@ -2215,6 +2481,17 @@ impl Ctx {
             self.api().module_enabled("horn"),
             self.api().module_enabled("led"),
         ];
+        // FC2: the Extras `-on` props are Rust-written too — every
+        // re-sync re-seeds them from the daemon, so the switches
+        // never disagree with the real module state (a failed toggle
+        // reverts the prop in `wire_extras`; this is the seed).
+        {
+            let states = *self.module_states.borrow();
+            set_extras_on_prop(win, 0, states[0]);
+            set_extras_on_prop(win, 1, states[1]);
+            set_extras_on_prop(win, 2, states[2]);
+            set_extras_on_prop(win, 3, states[3]);
+        }
         win.set_extras_calibration_disabled(!self.capture_available());
         win.set_shifter_mode(match shifter.shifter_gate {
             Some(ShifterGate::HPattern) => 1,
@@ -2889,9 +3166,10 @@ impl Ctx {
     }
 
     /// Rename the profile at a popover COMBINED index (M1): the new
-    /// name is the profile's linked game — the one name the popover
-    /// can supply without a text input (a free-text rename needs a
-    /// `rename-text` input in the popover; see the report). A preset
+    /// name is the profile's linked game — the old no-text-input
+    /// path, kept for `popover-rename(int)`. Free-text rename lives
+    /// in [`Ctx::rename_profile_free_text`] (the popover's
+    /// `rename-text` input + `popover-rename-confirmed`). A preset
     /// row or an unlinked profile explains itself instead of
     /// pretending to rename.
     fn rename_profile_index(&self, win: &MainWindow, combined: i32) {
@@ -2939,6 +3217,55 @@ impl Ctx {
                     "Profile",
                     "Profile renamed",
                     &format!("Renamed to {name}."),
+                );
+            }
+            Err(e) => self.notify_error(win, "Profile", &e),
+        }
+    }
+
+    /// Rename the profile at a popover COMBINED index to a typed
+    /// name (M1, FC2): the `popover-rename-confirmed` callback
+    /// carries the row + the typed name. Unlike the old
+    /// `popover-rename(int)` path (rename to the linked game's
+    /// name, kept as-is), this needs no game link — any profile
+    /// renames to any typed name. A preset row explains itself; an
+    /// empty name asks for one; the backend validates the rest
+    /// (length / characters) and a failure notifies instead of
+    /// failing silently.
+    fn rename_profile_free_text(&self, win: &MainWindow, combined: i32, name: &str) {
+        let Some(index) = self.popover_my_index(combined) else {
+            self.notify(
+                win,
+                "Profile",
+                "Presets are read-only",
+                "Presets are read-only — duplicate one to edit it.",
+            );
+            return;
+        };
+        let Some(p) = self.profile_at(index) else {
+            return;
+        };
+        let Some(name) = clean_profile_name(name) else {
+            self.notify(win, "Profile", "Rename", "Enter a name first.");
+            return;
+        };
+        if p.name == name {
+            self.notify(
+                win,
+                "Profile",
+                "Rename",
+                &format!("{name} is already the profile name."),
+            );
+            return;
+        }
+        match self.api().rename_profile(&p.id, &name) {
+            Ok(renamed) => {
+                self.refresh_profiles(win);
+                self.notify(
+                    win,
+                    "Profile",
+                    "Profile renamed",
+                    &format!("Renamed to {renamed}."),
                 );
             }
             Err(e) => self.notify_error(win, "Profile", &e),
@@ -3105,6 +3432,57 @@ fn wire_callbacks(win: &MainWindow, ctx: &Rc<Ctx>) {
     wire_theme(win, ctx);
     wire_popover(win, ctx);
     wire_transport(win, ctx);
+    wire_fc2_callbacks(win, ctx);
+}
+
+/// Wire the FC2 callbacks (v2.0.2 Slint follow-up): the .slint side
+/// already fires these — Rust had no handlers, so the clicks did
+/// nothing. Each one lands on a real handler now:
+/// - `pair-now-requested` → the Pair wizard (Overview banner).
+/// - `address-accepted(string)` → validate + persist the board
+///   address (Settings field, Enter).
+/// - `keep-tray-selected(bool)` → persist keep-in-tray, reverting
+///   the switch on failure.
+/// - `popover-rename-confirmed(int, string)` → free-text rename.
+///   The old `popover-rename(int)` (rename to the linked game's
+///   name) stays wired in `wire_popover`.
+fn wire_fc2_callbacks(win: &MainWindow, ctx: &Rc<Ctx>) {
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pair_now_requested(move || {
+            if let Some(w) = win.upgrade() {
+                ctx.open_pair_wizard(&w);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_address_accepted(move |a| {
+            if let Some(w) = win.upgrade() {
+                ctx.apply_board_address(&w, &a);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_keep_tray_selected(move |enabled| {
+            if let Some(w) = win.upgrade() {
+                ctx.apply_keep_tray(&w, enabled);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_popover_rename_confirmed(move |i, name| {
+            if let Some(w) = win.upgrade() {
+                ctx.rename_profile_free_text(&w, i, &name);
+            }
+        });
+    }
 }
 
 /// Run one pairing attempt from the wizard (Begin / Retry /
@@ -3848,22 +4226,33 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                     // greying out is only the visual echo. The .slint
                     // flips its `-on` prop first and carries no
                     // payload, so Rust tracks the intended state in
-                    // `module_states` and reverts it on failure (the
-                    // visual revert needs the `-on` props forwarded
-                    // as MainWindow in-out props — see the report).
+                    // `module_states`; a failure reverts the prop
+                    // (FC2: the `-on` props are MainWindow in-out
+                    // props, so Rust can write them back).
                     let (module, index) = match a.as_str() {
                         "handbrake-toggle" => ("handbrake", 0),
                         "shifter-toggle" => ("shifter", 1),
                         "horn-toggle" => ("horn", 2),
                         _ => ("led", 3),
                     };
-                    let new_state = !ctx.module_states.borrow()[index];
+                    let old_state = ctx.module_states.borrow()[index];
+                    let new_state = !old_state;
                     match ctx.api().set_module_enabled(module, new_state) {
                         Ok(enabled) => {
                             ctx.module_states.borrow_mut()[index] = enabled;
+                            // FC2: confirm the prop with the
+                            // authoritative value (`sync_extras` in
+                            // refresh re-seeds it too).
+                            set_extras_on_prop(&w, index, enabled);
                             ctx.refresh(&w, 0);
                         }
-                        Err(e) => ctx.notify_error(&w, "Extras", &e),
+                        Err(e) => {
+                            // FC2: the .slint already flipped the
+                            // prop — flip it back so the switch
+                            // never lies about the real module state.
+                            set_extras_on_prop(&w, index, old_state);
+                            ctx.notify_error(&w, "Extras", &e);
+                        }
                     }
                 }
                 "handbrake-up" | "handbrake-down" => {
@@ -4410,8 +4799,9 @@ fn wire_popover(win: &MainWindow, ctx: &Rc<Ctx>) {
         win.unwrap().on_popover_rename(move |i| {
             if let Some(w) = win.upgrade() {
                 // M1: renames the profile to its linked game's name
-                // (the popover has no text input — a free-text rename
-                // needs a `rename-text` prop; see the report).
+                // (the old no-text-input path — kept on purpose).
+                // Free-text rename is `on_popover_rename_confirmed`
+                // (see `wire_fc2_callbacks`).
                 ctx.rename_profile_index(&w, i);
             }
         });
@@ -4624,12 +5014,12 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
             match a.as_str() {
                 "pair" => settings_pair(&w, &ctx),
                 "address" => {
-                    // H4: the .slint drops the edited address (the
-                    // action carries no payload), so Rust cannot save
-                    // it yet — the Settings field needs a
-                    // `settings-action-with-text`-style callback (see
-                    // the report). Until then, say so once per 3 s
-                    // instead of spamming the drawer per keystroke.
+                    // H4/FC2: fallback only — nothing in the .slint
+                    // fires this any more (the address field fires
+                    // `address-accepted(string)`, wired in
+                    // `wire_fc2_callbacks`). Kept so a stray call
+                    // still answers instead of hitting the unknown
+                    // arm; throttled to one note per 3 s.
                     let now = Instant::now();
                     let due = ctx
                         .last_address_notify
@@ -4646,13 +5036,10 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
                     }
                 }
                 "tray" => {
-                    // M7: the .slint drops the toggled bool (the
-                    // action carries no payload), so Rust cannot read
-                    // the new state yet — the switch needs a
-                    // `keep-tray-selected(bool)` callback (see the
-                    // report). The close handler already reads the
-                    // live value from the API, so the behaviour is
-                    // correct; only the explicit save is pending.
+                    // M7/FC2: fallback only — the switch fires
+                    // `keep-tray-selected(bool)` now (wired in
+                    // `wire_fc2_callbacks`), which persists the
+                    // value. This arm only answers a stray call.
                     ctx.notify(
                         &w,
                         "Settings",
@@ -5119,6 +5506,13 @@ fn start_frame_timer(
                 // never infinite) + firmware-update poll (H-4) +
                 // local pairing countdown tick-down (A16 — the ring
                 // follows seconds-left/total) + learn poll.
+                // FC2 safety net: the busy strip + daemon-error
+                // banner re-derive here too (both writes are
+                // change-detected, so this is free when nothing
+                // changed) — a job or fatal file that lands outside
+                // the drain/timeout paths still reaches the UI.
+                ctx.sync_busy(&w);
+                ctx.sync_daemon_error(&w);
                 ctx.check_job_timeouts(&w);
                 ctx.check_connecting_timeout(&w);
                 ctx.poll_firmware_update(&w);
@@ -5358,6 +5752,11 @@ fn main() -> Result<(), slint::PlatformError> {
     // B4: not live yet — the monitor is still probing. The first
     // frame paints "Connecting…" (see `push_frame`).
     win.set_daemon_live(false);
+    // FC2: a fatal file left by a previous crash shows its reason
+    // in the Overview banner from the first paint; the busy strip
+    // starts hidden (no job runs yet).
+    ctx.sync_daemon_error(&win);
+    ctx.sync_busy(&win);
     win.set_gear("—".into());
     win.set_notif_open(false);
     win.set_diag_open(false);
@@ -5371,6 +5770,9 @@ fn main() -> Result<(), slint::PlatformError> {
     ))));
     // A10: Start with Windows seeds from the API at startup.
     win.set_autostart_enabled(api.autostart());
+    // FC2: keep-in-tray seeds from the API too (the close handler
+    // reads the same value).
+    ctx.sync_keep_in_tray(&win);
     // Default game controller is vJoy (user order 2026-11-16); the
     // live backend re-seeds it on (re)connect (see
     // `reconnect_to_live`) — at startup there is no daemon yet.
@@ -5414,6 +5816,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 ctx_static.drain_jobs(&w);
                 ctx_static.check_job_timeouts(&w);
                 ctx_static.check_connecting_timeout(&w);
+                // FC2: same 1 Hz safety net as the frame timer —
+                // the daemon-error banner re-derives (change-
+                // detected, so free when nothing changed).
+                ctx_static.sync_daemon_error(&w);
                 ctx_static.poll_firmware_update(&w);
                 ctx_static.flush_steering_push(&w);
                 ctx_static.flush_field_push(&w);
@@ -5639,5 +6045,328 @@ mod tests {
         assert_eq!(pedal_key(2), Some(("clutch", "Clutch")));
         assert_eq!(pedal_key(3), None);
         assert_eq!(pedal_key(-1), None);
+    }
+
+    #[test]
+    fn fc2_busy_state_oldest_job_wins() {
+        // B5/FC2: the strip shows one label — the oldest job's.
+        let mut jobs: HashMap<JobKind, (String, Instant)> = HashMap::new();
+        assert_eq!(busy_state_for(&jobs), (false, String::new()));
+        let old = Instant::now();
+        let new = old + Duration::from_millis(1);
+        jobs.insert(
+            JobKind::Transport,
+            ("Switching connection…".to_string(), new),
+        );
+        jobs.insert(JobKind::Reconnect, ("Reconnecting…".to_string(), old));
+        assert_eq!(busy_state_for(&jobs), (true, "Reconnecting…".to_string()));
+        jobs.remove(&JobKind::Reconnect);
+        assert_eq!(
+            busy_state_for(&jobs),
+            (true, "Switching connection…".to_string())
+        );
+        jobs.clear();
+        assert_eq!(busy_state_for(&jobs), (false, String::new()));
+    }
+
+    #[test]
+    fn fc2_board_address_validation() {
+        // H4/FC2: same rule as the daemon — private/loopback IPv4
+        // literal only (whitespace trimmed).
+        for ok in [
+            "192.168.4.1",
+            "10.0.0.5",
+            "172.16.0.9",
+            "127.0.0.1",
+            " 192.168.4.1 ",
+        ] {
+            assert!(valid_board_address(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "",
+            "   ",
+            "rsh.local",
+            "8.8.8.8",
+            "256.1.1.1",
+            "192.168.4",
+            "fe80::1",
+        ] {
+            assert!(!valid_board_address(bad), "{bad} should be invalid");
+        }
+    }
+
+    #[test]
+    fn fc2_daemon_error_text() {
+        // M-2/FC2: live clears, no fatal file clears, a fatal detail
+        // shows (L3: "daemon" rewritten to "RSH"), an empty detail
+        // still shows a plain line.
+        assert_eq!(daemon_error_for(true, None), "");
+        assert_eq!(
+            daemon_error_for(
+                true,
+                Some((
+                    "IpcBindFailed".to_string(),
+                    "daemon IPC bind failed".to_string()
+                ))
+            ),
+            ""
+        );
+        assert_eq!(daemon_error_for(false, None), "");
+        assert_eq!(
+            daemon_error_for(
+                false,
+                Some((
+                    "IpcBindFailed".to_string(),
+                    "daemon IPC bind failed after 5 attempts".to_string()
+                ))
+            ),
+            "RSH IPC bind failed after 5 attempts"
+        );
+        assert_eq!(
+            daemon_error_for(false, Some(("DaemonHung".to_string(), String::new()))),
+            "RSH stopped unexpectedly — try Reconnect."
+        );
+        assert_eq!(
+            daemon_error_for(false, Some(("DaemonHung".to_string(), "   ".to_string()))),
+            "RSH stopped unexpectedly — try Reconnect."
+        );
+    }
+
+    #[test]
+    fn fc2_clean_profile_name() {
+        assert_eq!(
+            clean_profile_name("  GT3 Sprint "),
+            Some("GT3 Sprint".to_string())
+        );
+        assert_eq!(clean_profile_name(""), None);
+        assert_eq!(clean_profile_name("   "), None);
+    }
+
+    /// Minimal [`Ctx`] for the FC2 window test: the sim API, an
+    /// isolated temp data dir (notifications + `daemon-status.json`
+    /// never touch the real data dir), no health monitor, no frame
+    /// timer — the test drives the handlers directly.
+    fn fc2_test_ctx() -> (Rc<Ctx>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rsh-fc2-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fc2 temp dir");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let stored_steering = api.get_tuning("steering");
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<JobDone>();
+        let ctx = Rc::new(Ctx {
+            state: Rc::new(RefCell::new(LiveState {
+                api: api.clone(),
+                live_api: None,
+                live: false,
+                connecting: true,
+                last_transport: ApiTransport::Wifi,
+            })),
+            tuning: Rc::new(RefCell::new(Tuning::from_settings(&stored_steering))),
+            steering: Rc::new(RefCell::new(stored_steering)),
+            pedals: Rc::new(RefCell::new(PedalCache::new())),
+            calibration: Rc::new(RefCell::new(None)),
+            vjoy_polling: Rc::new(Cell::new(false)),
+            button_actions: Rc::new(RefCell::new(
+                DEFAULT_BUTTON_ACTIONS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            )),
+            pending_action: Rc::new(RefCell::new(None)),
+            selected_button: Rc::new(Cell::new(5)),
+            edit_kind: Rc::new(Cell::new(0)),
+            edit_knob: Rc::new(Cell::new(0)),
+            knob_row: Rc::new(Cell::new(0)),
+            knob_actions: Rc::new(RefCell::new([
+                [
+                    "Gear 1".to_string(),
+                    "Gear 2".to_string(),
+                    "Not set".to_string(),
+                ],
+                [
+                    "Not set".to_string(),
+                    "Not set".to_string(),
+                    "Not set".to_string(),
+                ],
+            ])),
+            profiles_cache: Rc::new(RefCell::new(Vec::new())),
+            games_cache: Rc::new(RefCell::new(Vec::new())),
+            pending_profile_id: Rc::new(RefCell::new(None)),
+            learn_target: Rc::new(Cell::new(0)),
+            horn_test_until: Rc::new(Cell::new(None)),
+            steer_hist: Rc::new(RefCell::new(VecDeque::new())),
+            pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
+            unsaved: Rc::new(Cell::new(false)),
+            notifications: Rc::new(RefCell::new(NotificationCenter::load(Some(&dir)))),
+            data_dir: Some(dir.clone()),
+            live_link: Arc::new(Mutex::new(None)),
+            hidden: Arc::new(AtomicBool::new(false)),
+            quit_requested: Rc::new(Cell::new(false)),
+            page_requests: Arc::new(Mutex::new(VecDeque::new())),
+            pairing_wait_since: Rc::new(RefCell::new(None)),
+            job_tx,
+            job_rx: Rc::new(RefCell::new(job_rx)),
+            busy_jobs: Rc::new(RefCell::new(HashMap::new())),
+            connecting_since: Rc::new(Cell::new(Some(Instant::now()))),
+            reconnect_in_flight: Rc::new(Cell::new(false)),
+            firmware_check_cache: Rc::new(RefCell::new(None)),
+            raw_available: Rc::new(Cell::new(false)),
+            presets_count: Rc::new(Cell::new(0)),
+            module_states: Rc::new(RefCell::new([true; 4])),
+            firmware_update_running: Rc::new(Cell::new(false)),
+            last_address_notify: Rc::new(Cell::new(None)),
+            steer_push_due: Rc::new(Cell::new(None)),
+            pending_field: Rc::new(RefCell::new(None)),
+        });
+        (ctx, dir)
+    }
+
+    /// FC2 end-to-end on a real `MainWindow` (needs a display — run
+    /// under Xvfb; skips gracefully headless so the plain suite
+    /// stays green). Drives the four new callbacks through the
+    /// generated `invoke_*` methods and the busy/daemon-error props
+    /// through the real setters, asserting the window props:
+    /// - busy on at job start, off after the job drains;
+    /// - daemon-error set from a planted fatal file, cleared live;
+    /// - pair-now opens the wizard at the Pair step;
+    /// - a bad address reverts the field + notifies;
+    /// - keep-tray reverts on a failed persist (sim has no daemon);
+    /// - free-text rename notifies (sim cannot persist it);
+    /// - a failed Extras toggle reverts the `-on` prop.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fc2_window_wiring_end_to_end() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("FC2 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+
+        // Props start clean.
+        assert!(!win.get_busy());
+        assert_eq!(win.get_busy_label().as_str(), "");
+        assert_eq!(win.get_daemon_error().as_str(), "");
+
+        // 1. Busy on/off around a real background job.
+        let started = ctx.run_job(&win, JobKind::FirmwareCheck, "Checking firmware…", || {
+            JobDone::FirmwareCheck(Err(UserError {
+                code: "fc2_test".to_string(),
+                title: "Test failure".to_string(),
+                what_happened: "The test job failed on purpose.".to_string(),
+                what_to_do: "Ignore this.".to_string(),
+                detail: None,
+            }))
+        });
+        assert!(started, "job should start");
+        assert!(win.get_busy(), "strip shows while the job runs");
+        assert_eq!(win.get_busy_label().as_str(), "Checking firmware…");
+        let mut drained = false;
+        for _ in 0..100 {
+            ctx.drain_jobs(&win);
+            if ctx.busy_jobs.borrow().is_empty() {
+                drained = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(drained, "job should finish and drain");
+        assert!(!win.get_busy(), "strip hides when the job ends");
+        assert_eq!(win.get_busy_label().as_str(), "");
+
+        // 2. Daemon-error set from a fatal file, cleared when live.
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            r#"{"status":"fatal","code":"IpcBindFailed","detail":"daemon IPC bind failed after 5 attempts","pid":123,"at_unix":1}"#,
+        )
+        .expect("fatal status file");
+        ctx.mark_dead(&win);
+        assert_eq!(
+            win.get_daemon_error().as_str(),
+            "RSH IPC bind failed after 5 attempts"
+        );
+        {
+            let mut state = ctx.state.borrow_mut();
+            state.live = true;
+        }
+        ctx.sync_daemon_error(&win);
+        assert_eq!(win.get_daemon_error().as_str(), "");
+        {
+            let mut state = ctx.state.borrow_mut();
+            state.live = false;
+        }
+
+        // 3. Pair-now opens the wizard at the Pair step.
+        win.invoke_pair_now_requested();
+        assert!(win.get_setup_mode(), "pair-now opens the wizard");
+        assert_eq!(win.get_setup_step(), 2, "wizard opens at Pair");
+
+        // 4. A bad address reverts the field + notifies once. The
+        // live address is whatever `sync_overview` derives (the sim
+        // reports "rsh.local" as its connection address — the live
+        // daemon reports the real board IP); capture it first.
+        ctx.sync_overview(&win);
+        let live_addr = win.get_setup_address().as_str().to_string();
+        win.set_setup_address("8.8.8.8".into());
+        let before = unread();
+        win.invoke_address_accepted("8.8.8.8".into());
+        assert_eq!(
+            win.get_setup_address().as_str(),
+            live_addr,
+            "bad address reverts to the live address"
+        );
+        assert_eq!(unread(), before + 1, "bad address notifies");
+        // A valid address the sim cannot persist also notifies
+        // instead of failing silently.
+        let before = unread();
+        win.invoke_address_accepted("192.168.4.1".into());
+        assert_eq!(unread(), before + 1, "unpersistable address notifies");
+        assert_eq!(win.get_setup_address().as_str(), live_addr);
+
+        // 5. Keep-tray reverts on a failed persist (sim: no daemon).
+        win.set_keep_in_tray(true);
+        let before = unread();
+        win.invoke_keep_tray_selected(false);
+        assert!(
+            win.get_keep_in_tray(),
+            "failed persist reverts the switch to on"
+        );
+        assert_eq!(unread(), before + 1, "failed persist notifies");
+
+        // 6. Free-text rename: seeded profile, sim cannot persist —
+        // the handler still runs and notifies (empty / same-name
+        // branches notify too).
+        ctx.profiles_cache.borrow_mut().push(ProfileSummary {
+            id: "p1".to_string(),
+            name: "GT3 Sprint".to_string(),
+            game: Some("assetto_corsa".to_string()),
+            active: true,
+        });
+        let before = unread();
+        win.invoke_popover_rename_confirmed(0, "FC2 Rename".into());
+        assert_eq!(unread(), before + 1, "rename failure notifies");
+        let before = unread();
+        win.invoke_popover_rename_confirmed(0, "   ".into());
+        assert_eq!(unread(), before + 1, "empty rename notifies");
+        let before = unread();
+        win.invoke_popover_rename_confirmed(0, "GT3 Sprint".into());
+        assert_eq!(unread(), before + 1, "same-name rename notifies");
+
+        // 7. Failed Extras toggle reverts the `-on` prop (sim:
+        // set_module_enabled errors without a daemon).
+        win.set_extras_handbrake_on(false); // the .slint flip
+        win.invoke_extras_action("handbrake-toggle".into());
+        assert!(
+            win.get_extras_handbrake_on(),
+            "failed toggle reverts the handbrake switch to on"
+        );
+        // The other `-on` props are Rust-writable too.
+        set_extras_on_prop(&win, 3, false);
+        assert!(!win.get_extras_leds_on());
+        set_extras_on_prop(&win, 3, true);
+        assert!(win.get_extras_leds_on());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

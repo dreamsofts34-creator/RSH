@@ -82,7 +82,7 @@ export component MainWindow inherits Window {
     // M-2 (v2.0.2): the specific fatal reason from
     // read_daemon_status() (daemon-status.json) — empty while there
     // is none; the Overview shows it as an error banner instead of
-    // the generic "not running" line. Rust setter pending (FC).
+    // the generic "not running" line. Set from Rust (mark_dead / sync).
     in property <string> daemon-error: "";
     // B5 spinner step (0..11, driven by the strip's Timer).
     property <int> spin-step: 0;
@@ -333,7 +333,7 @@ export component MainWindow inherits Window {
     // M1 (v2.0.2): free-text rename — the popover's rename input
     // fires this with the selected row + the typed name. The old
     // popover-rename(int) renames to the linked game's name (no text
-    // input existed). Rust wiring pending (FC).
+    // input existed). Wired in Rust (rename_profile_free_text).
     callback popover-rename-confirmed(int, string);
     callback popover-delete(int);
     callback popover-link(int);
