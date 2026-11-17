@@ -732,9 +732,29 @@ jobs:
       # which needs the system libudev headers (pkg-config). The
       # test (Linux) job installs the same package; rig-gate had no
       # install step and failed on a fresh runner (run 44047905469).
-      - name: Install libudev-dev (serialport dependency)
+      # CI follow-up (run 44105260838): the F17 lifecycle checks
+      # also need the X stack the rig stages under — Xvfb + xdotool
+      # (the only external commands lifecycle_checks.rs invokes,
+      # via `which` in XvfbSession::start) plus libxkbcommon-x11-0
+      # + libxcb-xkb1 (winit panics at startup without the xkbcommon
+      # library); libxdo3/libxtst6 are xdotool's runtime deps. The
+      # same set is documented in the module header of
+      # tools/rsh-rig/src/lifecycle_checks.rs. Without it, 9 F17
+      # checks failed with "xdotool missing" / "Xvfb did not start"
+      # / "staging failed" — environment gaps, not product bugs.
+      - name: Install system deps (libudev + X stack)
         if: steps.check.outputs.run == 'true'
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev xvfb xdotool libxkbcommon-x11-0 libxcb-xkb1 libxdo3 libxtst6
+      # F17 lifecycle checks stage the real debug binaries
+      # (target/debug/rsh-ui, rsh-daemon, rsh-fake-daemon) — the
+      # local gate (tools/gate-checks/run-gate.sh) builds them first,
+      # but CI never did, so on run 44105260838 the checks failed
+      # with "target/debug/rsh-daemon not built — run cargo build
+      # -p rsh-daemon" / "staging failed". Same build as the local
+      # gate, before the rig runs.
+      - name: Build lifecycle binaries (rsh-ui, rsh-daemon, rsh-fake-daemon)
+        if: steps.check.outputs.run == 'true'
+        run: cargo build -p rsh-ui -p rsh-daemon -p rsh-fake-daemon
       # Quick rig gate (60 s soak + scenarios), per TESTING-INPUT §9.1.
       # Full (10-min) and long (4-h, release blocker D-R14) soaks run
       # outside CI, in the rig itself. (The 4-h soak is SKIPPED by user
