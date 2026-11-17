@@ -30,6 +30,9 @@ members = [
     # v2.0.2 UI gate checks (Slint interpreter + testing backend).
     # Not in default-members: it is only built by tools/gate-checks/run-gate.sh.
     "tools/gate-checks/rsh-gate-ui",
+    # v2.0.3 F17 test fixture (controllable fake daemon). Not in
+    # default-members: only the rig gate builds it.
+    "tools/rsh-fake-daemon",
 ]
 default-members = [
     "crates/rsh-api",

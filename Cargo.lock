@@ -6102,6 +6102,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsh-fake-daemon"
+version = "2.0.2"
+dependencies = [
+ "dirs 7.0.0",
+ "rsh-api",
+ "rsh-ipc",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rsh-gate-ui"
 version = "2.0.2"
 dependencies = [
