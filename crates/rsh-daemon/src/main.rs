@@ -58,7 +58,7 @@ use rejoin::{RSH_SSID, rejoin_wifi};
 use single_instance::{AcquireOutcome, acquire};
 use tray_popup::{
     POPUP_ACTIVATION_TIMEOUT, PopupDismissPoll, PopupGame, TrayPopupData, TrayToggleGuard,
-    anchor_popup, next_profile,
+    anchor_popup, next_profile, popup_is_light,
 };
 
 slint::include_modules!();
@@ -1487,6 +1487,15 @@ impl PopupHandle {
         self.popup.set_conn_label(data.conn_label.into());
         self.popup.set_conn_sub(data.conn_sub.into());
         self.popup.set_connected(data.connected);
+        // DS-22: the popup follows the persisted UI theme (the same
+        // `<data_dir>/ui-theme` file the main window reads and
+        // writes). Re-read every refresh so a theme change in
+        // Settings repaints the popup on its next show — the file
+        // read is cheap, and the Auto OS sample is cached 60 s
+        // inside `popup_is_light`, so the 10 Hz refresh never
+        // spawns `reg` more than once a minute.
+        self.popup
+            .set_light_theme(popup_is_light(rsh_app_core::data_dir().as_deref()));
         self.popup.set_send_to_game(data.send_to_game);
         self.popup.set_steer_angle(data.steering_deg as f32);
         self.popup

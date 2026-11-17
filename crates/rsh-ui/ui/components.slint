@@ -970,7 +970,12 @@ export component EmptyBanner inherits Rectangle {
     in property <string> action-label: "";
     in property <bool> is-error;
     callback action-clicked();
-    height: 36px;
+    // DS-21 (U-03): was a fixed 36 px with no wrapping, so long
+    // strings (the ~100-char Overview banners, unbounded
+    // daemon-error text) were cut off mid-sentence with no way to
+    // read them. The text wraps now and the banner grows with it;
+    // 36 px stays the minimum for a single line.
+    min-height: 36px;
     border-radius: 8px;
     border-width: 1px;
     border-color: is-error ? Theme.bad : Theme.line;
@@ -978,10 +983,13 @@ export component EmptyBanner inherits Rectangle {
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 12px;
+        padding-top: 8px;
+        padding-bottom: 8px;
         spacing: 10px;
         Text {
             horizontal-stretch: 1;
             vertical-alignment: center;
+            wrap: word-wrap;
             text: text;
             font-size: 12px;
             color: is-error ? Theme.bad : Theme.mute;

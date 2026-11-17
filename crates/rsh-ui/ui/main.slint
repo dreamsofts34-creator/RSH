@@ -89,6 +89,14 @@ export component MainWindow inherits Window {
     // is none; the Overview shows it as an error banner instead of
     // the generic "not running" line. Set from Rust (mark_dead / sync).
     in property <string> daemon-error: "";
+    // DS-24 (U-06): transient in-place failure toast — every
+    // `notify_error` also surfaces here for ~5 s, so a failure is
+    // visible on the current screen without opening the bell drawer
+    // (the full text stays in the drawer). `in-out` so the toast's
+    // own click-to-dismiss can clear it; Rust clears it on expiry
+    // (1 Hz tick). Empty = hidden.
+    in-out property <string> toast-title: "";
+    in-out property <string> toast-text: "";
     // B5 spinner step (0..11, driven by the strip's Timer).
     property <int> spin-step: 0;
     in property <bool> connected: true;
@@ -790,6 +798,41 @@ export component MainWindow inherits Window {
         discard-and-switch => { popover-discard-switch(); }
         cancel-switch => { popover-cancel-switch(); }
         closed => { popover-closed(); }
+    }
+    // DS-24 (U-06): transient failure toast, above the page and
+    // below the top bar (same y as the drawers). It floats over the
+    // page title area for ~5 s — long enough to read, short enough
+    // to never need a close button (click it to dismiss early).
+    // Painted before the drawers, so an open drawer covers its
+    // right end; the text is left-aligned and stays readable.
+    if toast-text != "" : Rectangle {
+        x: Theme.sidebar-width;
+        y: 64px;
+        width: parent.width - Theme.sidebar-width - 20px;
+        min-height: 52px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.bad;
+        background: Theme.err-bg;
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            spacing: 10px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 2px;
+                Text { text: toast-title; font-size: 12.5px; font-weight: 600; color: Theme.bad; wrap: word-wrap; }
+                Text { text: toast-text; font-size: 12px; color: Theme.text; wrap: word-wrap; }
+            }
+            Text { text: "✕"; font-size: 12px; color: Theme.faint; vertical-alignment: center; }
+        }
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { toast-text = ""; toast-title = ""; }
+        }
     }
     // Notification drawer overlay (right edge, above the page).
     // Esc is owned by the keyboard worker (clears `notif-open`).

@@ -58,6 +58,84 @@ pub const POPUP_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(1);
 /// ignored, so a double-click is one show, not show-then-hide.
 pub const TRAY_TOGGLE_DEBOUNCE: Duration = Duration::from_millis(400);
 
+/// How long an OS theme sample is trusted (DS-22): the popup
+/// refreshes at 10 Hz while visible, so an uncached `reg` spawn
+/// per refresh would be 10 child processes a second. One sample
+/// a minute is plenty — the main window follows live OS changes
+/// (DS-50); the popup re-samples on the next minute tick.
+const SYSTEM_LIGHT_TTL: Duration = Duration::from_secs(60);
+
+/// Cached OS light-preference sample (`(sampled_at, is_light)`).
+static SYSTEM_LIGHT_CACHE: std::sync::Mutex<Option<(std::time::Instant, bool)>> =
+    std::sync::Mutex::new(None);
+
+/// Whether the OS currently prefers a light theme — Windows
+/// `AppsUseLightTheme` (mirrors `rsh-ui`'s `system_light`, which
+/// lives in the UI binary and cannot be shared here).
+/// Best-effort: any failure (no `reg`, no key) means Dark.
+#[cfg(windows)]
+fn system_light_uncached() -> bool {
+    let Ok(out) = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            "/v",
+            "AppsUseLightTheme",
+        ])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout).contains("0x1")
+}
+
+/// Whether the OS currently prefers a light theme (DS-22):
+/// non-Windows has no system light preference wired — Dark.
+#[cfg(not(windows))]
+fn system_light_uncached() -> bool {
+    false
+}
+
+/// Cached OS light preference (DS-22): the 10 Hz popup refresh
+/// calls [`popup_is_light`] every tick, and only the Auto case
+/// needs the OS — so the sample is cached for
+/// [`SYSTEM_LIGHT_TTL`] instead of spawning `reg` per refresh.
+/// A poisoned/unavailable lock degrades to a fresh sample.
+fn system_light() -> bool {
+    let now = std::time::Instant::now();
+    if let Ok(cache) = SYSTEM_LIGHT_CACHE.lock() {
+        if let Some((at, value)) = *cache {
+            if now.duration_since(at) < SYSTEM_LIGHT_TTL {
+                return value;
+            }
+        }
+    }
+    let value = system_light_uncached();
+    if let Ok(mut cache) = SYSTEM_LIGHT_CACHE.lock() {
+        *cache = Some((now, value));
+    }
+    value
+}
+
+/// Whether the tray popup should render Light (DS-22, U-04):
+/// reads the persisted UI theme choice from `<data_dir>/ui-theme`
+/// — the same file the main window reads and writes (`rsh-ui`
+/// `read_theme`/`write_theme`: `"Dark"`/`"Light"`/`"Auto"`).
+/// "Light" → light, "Dark" → dark, "Auto" (or a missing /
+/// unreadable file) → the OS preference. Pure over the given
+/// dir, so it is unit-testable with a temp dir.
+#[must_use]
+pub fn popup_is_light(data_dir: Option<&std::path::Path>) -> bool {
+    let Some(dir) = data_dir else {
+        return system_light();
+    };
+    match std::fs::read_to_string(dir.join("ui-theme")) {
+        Ok(text) if text.trim() == "Light" => true,
+        Ok(text) if text.trim() == "Dark" => false,
+        _ => system_light(),
+    }
+}
+
 /// Whether the visible tray popup should auto-dismiss, decided by
 /// the daemon's 100 ms click-outside poll in `main.rs` — kept here
 /// as pure state so it is unit-testable on Linux.
@@ -1008,5 +1086,37 @@ mod tests {
         assert!(guard.accept(ms(400))); // debounce expired: hide
         assert!(!guard.accept(ms(600))); // double-click again
         assert!(guard.accept(ms(1000))); // next real toggle
+    }
+
+    /// Temp dir for `popup_is_light` tests (no `tempfile` dev-dep
+    /// in this crate): unique per test name + pid, removed after.
+    fn theme_test_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rsh-popup-theme-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("theme test dir");
+        dir
+    }
+
+    #[test]
+    fn popup_is_light_follows_persisted_theme_file() {
+        // DS-22: the daemon reads the same `<data_dir>/ui-theme`
+        // file the main window writes ("Dark"/"Light"/"Auto").
+        let dir = theme_test_dir("file");
+        std::fs::write(dir.join("ui-theme"), "Light\n").expect("write theme");
+        assert!(popup_is_light(Some(&dir)), "Light must render light");
+        std::fs::write(dir.join("ui-theme"), "Dark\n").expect("write theme");
+        assert!(!popup_is_light(Some(&dir)), "Dark must render dark");
+        // "Auto", a missing file, and garbage all fall back to the
+        // OS preference — the same value as no data dir at all.
+        // (The OS value itself is runner-dependent, so the test
+        // asserts the fallback path, not a specific theme.)
+        std::fs::write(dir.join("ui-theme"), "Auto\n").expect("write theme");
+        assert_eq!(popup_is_light(Some(&dir)), popup_is_light(None));
+        let _ = std::fs::remove_file(dir.join("ui-theme"));
+        assert_eq!(popup_is_light(Some(&dir)), popup_is_light(None));
+        std::fs::write(dir.join("ui-theme"), "garbage\n").expect("write theme");
+        assert_eq!(popup_is_light(Some(&dir)), popup_is_light(None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

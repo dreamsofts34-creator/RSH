@@ -416,10 +416,15 @@ export component SetupWizard inherits Rectangle {
                 }
                 Rectangle { height: 14px; }
                 // Live status bar.
+                // DS-25: the trail line can be long (attempt +
+                // address + daemon report), so the text wraps and
+                // the bar grows with it (DS-21 pattern: min-height
+                // + wrapped text) instead of clipping mid-sentence.
+                // A short status stays 40 px.
                 Rectangle {
                     horizontal-stretch: 1;
                     width: 584px;
-                    height: 40px;
+                    min-height: 40px;
                     border-radius: 10px;
                     border-width: 1px;
                     border-color: Theme.line;
@@ -427,6 +432,8 @@ export component SetupWizard inherits Rectangle {
                     HorizontalLayout {
                         padding-left: 14px;
                         padding-right: 14px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
                         spacing: 10px;
                         Rectangle {
                             width: 9px;
@@ -434,8 +441,7 @@ export component SetupWizard inherits Rectangle {
                             border-radius: 5px;
                             background: paired ? Theme.ok : Theme.warn;
                         }
-                        Text { vertical-alignment: center; text: paired ? "Paired — wheel connected." : !daemon-live ? "Disconnected — RSH isn't running." : pair-status; font-size: 12.5px; color: Theme.mute; }
-                        Rectangle { horizontal-stretch: 1; }
+                        Text { horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; text: paired ? "Paired — wheel connected." : !daemon-live ? "Disconnected — RSH isn't running." : pair-status; font-size: 12.5px; color: Theme.mute; }
                         Text { vertical-alignment: center; text: paired ? "" : pairing-active ? pair-seconds-left + " seconds left" : "Not pairing"; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
                     }
                 }

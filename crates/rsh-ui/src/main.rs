@@ -645,6 +645,9 @@ enum JobKind {
     Backend,
     /// Firmware check (board vs bundled version).
     FirmwareCheck,
+    /// App update check (DS-20): GitHub Releases latest tag vs
+    /// the running version.
+    AppUpdateCheck,
     /// Firmware update start (the flash itself then runs on the
     /// daemon and is polled separately).
     FirmwareUpdate,
@@ -694,8 +697,12 @@ impl JobKind {
             // FirmwareUpdate is 10 s on purpose (A9); settings ops
             // share it — they can cross a UAC prompt (HIDMaestro
             // enable), the same bound the old callers tolerated,
-            // but now with a visible timeout.
-            JobKind::FirmwareUpdate | JobKind::SettingsOp => Duration::from_secs(10),
+            // but now with a visible timeout. The app update check
+            // (DS-20) shares it too: it is one bounded network
+            // round-trip (`curl --max-time 8`).
+            JobKind::FirmwareUpdate | JobKind::SettingsOp | JobKind::AppUpdateCheck => {
+                Duration::from_secs(10)
+            }
             // Everything else is a couple of round-trips at most
             // (F6: a tuning push is one `set_tuning`).
             JobKind::Transport
@@ -890,6 +897,9 @@ enum JobDone {
     },
     /// Firmware check finished (board vs bundled version).
     FirmwareCheck(Result<FirmwareCheck, UserError>),
+    /// App update check finished (DS-20): the GitHub Releases
+    /// latest tag vs the running version.
+    AppUpdateCheck(Result<AppUpdateVerdict, UserError>),
     /// Firmware update start finished (the flash then runs on the
     /// daemon; progress comes from `firmware_update_status` polls).
     FirmwareUpdate(Result<FirmwareUpdateStatus, UserError>),
@@ -913,6 +923,148 @@ enum JobDone {
     /// `PendingApply` the starter registered; `result` is the job
     /// thread's answer, applied on the UI thread.
     Generic { id: u64, result: JobResult },
+}
+
+/// The app-update check's verdict (DS-20, U-02): what the GitHub
+/// Releases latest tag says about the running version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AppUpdateVerdict {
+    /// The running version is the latest release.
+    UpToDate,
+    /// A newer release exists upstream (its version, no `v`).
+    Available(String),
+    /// The running build is newer than the latest release (a dev
+    /// build) — never offered as an update.
+    CurrentIsNewer(String),
+}
+
+/// GitHub Releases API endpoint for the latest RSH release (DS-20).
+const GITHUB_LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/dreamsofts34-creator/RSH/releases/latest";
+
+/// `curl` binary: Windows 10+ ships `curl.exe` (the same inbox
+/// binary the vJoy download uses); elsewhere plain `curl`.
+#[cfg(windows)]
+const CURL_BIN: &str = "curl.exe";
+#[cfg(not(windows))]
+const CURL_BIN: &str = "curl";
+
+/// Parse the `tag_name` out of a GitHub Releases `latest` payload
+/// (DS-20). Pure — unit-tested below. Returns the tag without the
+/// leading `v` (`"2.0.4"`), or `None` when the payload has no
+/// usable tag (error bodies, HTML, garbage).
+fn parse_latest_release_tag(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let tag = value.get("tag_name")?.as_str()?;
+    let tag = tag.strip_prefix('v').unwrap_or(tag);
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag.to_string())
+    }
+}
+
+/// Parse an `a.b.c` version into numeric parts (DS-20). A leading
+/// `v` and any `-`/`+` suffix are stripped; a missing part reads
+/// as 0; a non-numeric part fails the parse.
+fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let version = version.split(['-', '+']).next().unwrap_or(version);
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = match parts.next() {
+        Some(part) => part.parse().ok()?,
+        None => 0,
+    };
+    let patch = match parts.next() {
+        Some(part) => part.parse().ok()?,
+        None => 0,
+    };
+    Some((major, minor, patch))
+}
+
+/// Compare two `a.b.c` versions numerically (DS-20 — `2.0.10` is
+/// newer than `2.0.9`, which a string compare gets wrong).
+/// `None` when either side does not parse; the caller reports
+/// "unreadable" instead of guessing an update.
+fn compare_app_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    Some(parse_semver(a)?.cmp(&parse_semver(b)?))
+}
+
+/// Decide the update verdict from the current + latest versions
+/// (DS-20). Pure — unit-tested below.
+fn app_update_verdict(current: &str, latest: &str) -> Option<AppUpdateVerdict> {
+    match compare_app_versions(latest, current)? {
+        std::cmp::Ordering::Greater => Some(AppUpdateVerdict::Available(latest.to_string())),
+        std::cmp::Ordering::Equal => Some(AppUpdateVerdict::UpToDate),
+        std::cmp::Ordering::Less => Some(AppUpdateVerdict::CurrentIsNewer(latest.to_string())),
+    }
+}
+
+/// Fetch the latest release tag from GitHub Releases and decide
+/// the update verdict (DS-20): the Settings "Check" button really
+/// checks now. Runs on a job thread, never the UI thread; bounded
+/// by `--max-time 8` (inside the job's 10 s timeout) so a dead
+/// network can never hang the check. Public repo, no auth — the
+/// 60 req/h/IP unauthenticated limit is plenty for a manual
+/// button. Any failure is a plain-language [`UserError`], never a
+/// raw curl/JSON string.
+fn fetch_app_update() -> Result<AppUpdateVerdict, UserError> {
+    let err = |what_happened: &str| UserError {
+        code: "UpdateCheck".to_string(),
+        title: "Update check".to_string(),
+        what_happened: what_happened.to_string(),
+        what_to_do: "Check your connection and try again.".to_string(),
+        detail: None,
+    };
+    let output = std::process::Command::new(CURL_BIN)
+        .args([
+            "-sS",
+            "--fail",
+            "--max-time",
+            "8",
+            "--connect-timeout",
+            "5",
+            "-H",
+            "Accept: application/vnd.github+json",
+            // GitHub requires a User-Agent; the default `curl/x.y`
+            // one is refused by some egress filters, so send an
+            // explicit one (verified against the live API).
+            "-H",
+            "User-Agent: RSH-update-check",
+            // The `-w` trailer puts the HTTP status on the last
+            // line, so the verdict can tell "rate-limited" apart
+            // from "no network".
+            "-w",
+            "\n%{http_code}",
+            GITHUB_LATEST_RELEASE_URL,
+        ])
+        .output()
+        .map_err(|_| err("Couldn't reach GitHub to check for updates."))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (body, status) = match text.rsplit_once('\n') {
+        Some((body, status)) => (body, status.trim()),
+        None => ("", ""),
+    };
+    if !output.status.success() {
+        if status == "403" {
+            // Unauthenticated API limit is 60 req/h/IP — a manual
+            // button cannot hit it alone, but a shared IP can.
+            return Err(UserError {
+                code: "UpdateCheck".to_string(),
+                title: "Update check".to_string(),
+                what_happened: "GitHub is rate-limiting update checks right now.".to_string(),
+                what_to_do: "Try again in a little while — no download was started.".to_string(),
+                detail: None,
+            });
+        }
+        return Err(err("GitHub didn't answer the update check."));
+    }
+    let Some(latest) = parse_latest_release_tag(body) else {
+        return Err(err("GitHub answered, but the release info was unreadable."));
+    };
+    app_update_verdict(app_version(), &latest)
+        .ok_or_else(|| err("The latest release version was unreadable."))
 }
 
 /// One background-job answer (F6): the job thread's work returns
@@ -986,6 +1138,10 @@ struct Ctx {
     learn_target: Rc<Cell<i32>>,
     /// Horn test flash end (Extras Test lights the indicator).
     horn_test_until: Rc<Cell<Option<Instant>>>,
+    /// Failure-toast expiry (DS-24): `notify_error` shows the
+    /// toast until this instant; the 1 Hz tick clears it after.
+    /// `None` = no toast showing.
+    toast_until: Rc<Cell<Option<Instant>>>,
     /// Live chart histories (A20): steering deg + throttle 0..1.
     steer_hist: Rc<RefCell<VecDeque<f32>>>,
     pedal_hist: Rc<RefCell<VecDeque<f32>>>,
@@ -1015,6 +1171,18 @@ struct Ctx {
     /// a `seconds_left == 0` wait as a closed window — it gives the
     /// board 10 s from this instant, then gives up honestly.
     pairing_wait_since: Rc<RefCell<Option<Instant>>>,
+    /// Pairing-attempt trail (DS-25): how many `begin_pairing`
+    /// attempts this session, and the latest attempt's one-line
+    /// trail ("Attempt 2: no pairing window in 10 s at
+    /// 192.168.4.1 — board never answered"). Shown in the wizard
+    /// Pair status bar and in the diagnostics drawer event log, so
+    /// a failed pairing is diagnosable from the UI instead of only
+    /// "No pairing window". The HELO-level detail (tries, replies)
+    /// needs the daemon-side pairing logging (WS-B) — until it
+    /// lands, the trail says what the UI itself knows: attempts,
+    /// address, wait, and the daemon's `pairing_status()`.
+    pairing_attempts: Rc<Cell<u32>>,
+    pairing_trail: Rc<RefCell<String>>,
     /// Background-job completions (A9/B5): job threads send on
     /// `job_tx`; the frame timer drains `job_rx` on the UI thread.
     /// `Rc<RefCell<Receiver>>` — the UI is single-threaded, so no
@@ -1601,6 +1769,68 @@ impl Ctx {
             format!("{happened} {}", err.what_to_do)
         };
         self.notify(win, kind, title, &body);
+        // DS-24: the failure also surfaces in place, as a
+        // transient toast on the current screen — a user who never
+        // opens the bell drawer still sees that an action failed.
+        self.set_toast(win, title, &body);
+    }
+
+    /// Like [`Self::notify_error`], plus the notification drawer
+    /// opens (DS-24): reserved for P0-class failures the user must
+    /// not miss — firmware flash failed, pairing failed. The full
+    /// text is in the drawer; the toast still shows in place.
+    fn notify_error_urgent(&self, win: &MainWindow, kind: &str, err: &UserError) {
+        self.notify_error(win, kind, err);
+        // F27: same hidden-window guard as `notify` — never write
+        // a model/property on a hidden window.
+        if !self.hidden.load(Ordering::SeqCst) {
+            win.set_notif_open(true);
+        }
+    }
+
+    /// Show the transient failure toast (DS-24): title + body on
+    /// the current screen for ~5 s, then the 1 Hz tick clears it.
+    /// Skipped while the window is hidden (F27: no property writes
+    /// on a hidden window) — the notification itself is still
+    /// stored and synced on reopen.
+    fn set_toast(&self, win: &MainWindow, title: &str, body: &str) {
+        if self.hidden.load(Ordering::SeqCst) {
+            return;
+        }
+        win.set_toast_title(title.into());
+        win.set_toast_text(body.into());
+        self.toast_until
+            .set(Some(Instant::now() + Duration::from_secs(5)));
+    }
+
+    /// Clear an expired failure toast (DS-24, 1 Hz): the toast
+    /// lives ~5 s from the last failure, then vanishes — a newer
+    /// failure re-arms the deadline via [`Self::set_toast`].
+    fn check_toast_expiry(&self, win: &MainWindow) {
+        let Some(until) = self.toast_until.get() else {
+            return;
+        };
+        if Instant::now() >= until {
+            self.toast_until.set(None);
+            win.set_toast_title("".into());
+            win.set_toast_text("".into());
+        }
+    }
+
+    /// Record one pairing-attempt trail line (DS-25) and show it
+    /// in the wizard Pair status bar. The diagnostics drawer reads
+    /// the stored line on its next sync, so the attempt is visible
+    /// there too.
+    fn set_pairing_trail(&self, win: &MainWindow, trail: &str) {
+        *self.pairing_trail.borrow_mut() = trail.to_string();
+        win.set_setup_pair_status(trail.into());
+    }
+
+    /// The board address the current attempt went to (DS-25):
+    /// the live connection address, or empty when not connected.
+    /// A cache read — safe on the UI thread / 1 Hz tick.
+    fn pairing_board_address(&self) -> String {
+        self.api().connection().address
     }
 
     /// Current busy state (B5): whether any job runs + the oldest
@@ -1968,6 +2198,74 @@ impl Ctx {
                     Err(e) => self.notify_error(win, "Firmware", &e),
                 }
             }
+            JobDone::AppUpdateCheck(result) => {
+                if self
+                    .busy_jobs
+                    .borrow_mut()
+                    .remove(&JobKind::AppUpdateCheck)
+                    .is_none()
+                {
+                    return;
+                }
+                // DS-20: the verdict lands in the Settings line
+                // itself (so the answer survives the notification)
+                // and as a notification (so the user sees it now).
+                // Auto-update stays off — an available update is
+                // always a manual installer download from GitHub
+                // Releases, never a silent install.
+                match result {
+                    Ok(AppUpdateVerdict::UpToDate) => {
+                        win.set_app_update_text(
+                            format!(
+                                "You're on the latest version (RSH {}) — auto-update is off",
+                                app_version()
+                            )
+                            .into(),
+                        );
+                        self.notify(
+                            win,
+                            "Update",
+                            "RSH is up to date",
+                            &format!("You're on the latest version (RSH {}).", app_version()),
+                        );
+                    }
+                    Ok(AppUpdateVerdict::Available(latest)) => {
+                        win.set_app_update_text(
+                            format!(
+                                "RSH {latest} is available on GitHub Releases — auto-update is off, download the installer there"
+                            )
+                            .into(),
+                        );
+                        self.notify(
+                            win,
+                            "Update",
+                            "Update available",
+                            &format!(
+                                "RSH {latest} is available — download the installer from GitHub Releases."
+                            ),
+                        );
+                    }
+                    Ok(AppUpdateVerdict::CurrentIsNewer(latest)) => {
+                        win.set_app_update_text(
+                            format!(
+                                "You're on RSH {} (newer than the latest release {latest}) — auto-update is off",
+                                app_version()
+                            )
+                            .into(),
+                        );
+                        self.notify(
+                            win,
+                            "Update",
+                            "RSH is up to date",
+                            &format!(
+                                "You're on RSH {} — newer than the latest release.",
+                                app_version()
+                            ),
+                        );
+                    }
+                    Err(e) => self.notify_error(win, "Update", &e),
+                }
+            }
             JobDone::FirmwareUpdate(result) => {
                 if self
                     .busy_jobs
@@ -1996,7 +2294,9 @@ impl Ctx {
                             );
                         }
                     }
-                    Err(e) => self.notify_error(win, "Firmware", &e),
+                    // DS-24: the flash start failed — P0-class: toast
+                    // in place AND open the drawer.
+                    Err(e) => self.notify_error_urgent(win, "Firmware", &e),
                 }
             }
             JobDone::RawAvailable(available) => {
@@ -2036,7 +2336,9 @@ impl Ctx {
                         win.set_setup_paired(false);
                         win.set_setup_reset_required(false);
                     }
-                    Err(e) => self.notify_error(win, "Pairing", &e),
+                    // DS-24: pairing reset failed — P0-class: toast
+                    // in place AND open the drawer.
+                    Err(e) => self.notify_error_urgent(win, "Pairing", &e),
                 }
             }
         }
@@ -2095,6 +2397,13 @@ impl Ctx {
             self.notify(
                 win,
                 "Loading timed out",
+                &format!("{label} timed out"),
+                "The operation took too long — try again.",
+            );
+            // DS-24: a timeout is a failure — it toasts in place
+            // like any other error, not just behind the bell.
+            self.set_toast(
+                win,
                 &format!("{label} timed out"),
                 "The operation took too long — try again.",
             );
@@ -2169,7 +2478,7 @@ impl Ctx {
                     what_to_do: "Try again.".to_string(),
                     detail: None,
                 };
-                self.notify_error(win, "Firmware", &err);
+                self.notify_error_urgent(win, "Firmware", &err);
                 // The failure must not leave the stale "Updating
                 // firmware… uploading 42%" line in Settings — re-sync
                 // so the firmware line shows the real state again.
@@ -2195,7 +2504,7 @@ impl Ctx {
                 what_to_do: "Check the wheel is on and try the update again.".to_string(),
                 detail: None,
             };
-            self.notify_error(win, "Firmware", &err);
+            self.notify_error_urgent(win, "Firmware", &err);
             self.sync_overview(win);
             return;
         }
@@ -2322,6 +2631,26 @@ impl Ctx {
             JobKind::FirmwareCheck,
             "Checking firmware…",
             move || JobDone::FirmwareCheck(api.firmware_check()),
+        );
+    }
+
+    /// Start an app-update check (DS-20, U-02): the Settings
+    /// "Check" button used to answer without checking anything.
+    /// Now it really queries GitHub Releases for the latest tag
+    /// and reports up-to-date / available / unreachable — with
+    /// the busy strip + timeout + result like the firmware check.
+    fn start_app_update_check_job(&self, win: &MainWindow) {
+        self.notify(
+            win,
+            "Update",
+            "Checking for updates…",
+            "Asking GitHub Releases for the latest RSH version…",
+        );
+        self.run_job(
+            win,
+            JobKind::AppUpdateCheck,
+            "Checking for updates…",
+            move || JobDone::AppUpdateCheck(fetch_app_update()),
         );
     }
 
@@ -3470,6 +3799,12 @@ impl Ctx {
             format!("Connection: {}", conn.label).into(),
             format!("Firmware: {firmware}").into(),
         ];
+        // DS-25: the latest pairing-attempt trail, so a failed
+        // pairing is diagnosable from the drawer too (the wizard
+        // status bar shows the same line).
+        if !self.pairing_trail.borrow().is_empty() {
+            lines.push(format!("Pairing: {}", self.pairing_trail.borrow()).into());
+        }
         for n in self.notifications.borrow().to_model_items().iter().take(6) {
             lines.push(format!("{} {}", n.time, n.title).into());
         }
@@ -4394,12 +4729,41 @@ fn wire_fc2_callbacks(win: &MainWindow, ctx: &Rc<Ctx>) {
     }
 }
 
+/// Build the "no pairing window" trail line (DS-25): the daemon's
+/// `pairing_status()` at the moment the wait expires, plus the
+/// attempt count and the board address the attempt went to. The
+/// cases the UI can tell apart read differently — a daemon-reported
+/// error, a board that was seen (MAC) but never opened a window,
+/// and a board that never answered at all. Pure — unit-tested below.
+fn pairing_no_window_trail(attempts: u32, address: &str, status: &PairingInfo) -> String {
+    let at = if address.is_empty() {
+        String::new()
+    } else {
+        format!(" at {address}")
+    };
+    let base = format!("Attempt {attempts}: no pairing window in 10 s{at}");
+    if let Some(detail) = status.error_detail.as_deref().filter(|d| !d.is_empty()) {
+        return format!("{base} — daemon reports: {detail}");
+    }
+    if let Some(error) = &status.error {
+        return format!("{base} — daemon reports: {}", error.code());
+    }
+    if let Some(mac) = status.board_mac.as_deref().filter(|m| !m.is_empty()) {
+        return format!("{base} — board seen ({mac}) but no window: hold BOOT 3 s to open one.");
+    }
+    format!("{base} — board never answered: check the wheel is on and joined to the RSH Wi-Fi.")
+}
+
 /// Run one pairing attempt from the wizard (Begin / Retry /
 /// Reset): `begin_pairing` runs on a [`JobKind::PairingOp`] job
 /// thread — the click never blocks on the daemon. The apply drives
 /// the wizard's countdown + status props, and notifies visibly on
 /// success and failure.
 fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
+    // DS-25: count the attempt — the trail names it, so a retry
+    // reads differently from the first try.
+    let attempt = ctx.pairing_attempts.get() + 1;
+    ctx.pairing_attempts.set(attempt);
     ctx.run_generic_job(
         w,
         JobKind::PairingOp,
@@ -4408,6 +4772,15 @@ fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
         move |ctx, w, result| {
             let JobResult::Pairing(result) = result else {
                 return;
+            };
+            // DS-25: the board address this attempt went to, for
+            // the trail ("at 192.168.4.1" — empty when not
+            // connected, so the trail reads "the wheel" instead).
+            let address = ctx.pairing_board_address();
+            let at = if address.is_empty() {
+                String::new()
+            } else {
+                format!(" at {address}")
             };
             match result {
                 Ok(info) => {
@@ -4418,8 +4791,12 @@ fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
                             i32::try_from(info.seconds_left).unwrap_or(120),
                         );
                         w.set_setup_pair_total(i32::try_from(info.seconds_left).unwrap_or(120));
-                        w.set_setup_pair_status(
-                            "Pairing window open — hold the pair button on the wheel.".into(),
+                        ctx.set_pairing_trail(
+                            w,
+                            &format!(
+                                "Pairing window open — {} s left{at}; hold the pair button on the wheel.",
+                                info.seconds_left
+                            ),
                         );
                         Ctx::sync_pair_ring(w);
                         ctx.notify(
@@ -4435,7 +4812,10 @@ fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
                         // first tick.
                         *ctx.pairing_wait_since.borrow_mut() = Some(Instant::now());
                         w.set_setup_pairing_active(true);
-                        w.set_setup_pair_status("Waiting for the wheel…".into());
+                        ctx.set_pairing_trail(
+                            w,
+                            &format!("Attempt {attempt}: waiting for the wheel{at}…"),
+                        );
                         Ctx::sync_pair_ring(w);
                         ctx.notify(
                             w,
@@ -4448,7 +4828,16 @@ fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
                 }
                 Err(e) => {
                     w.set_setup_pair_error(e.title.clone().into());
-                    ctx.notify(w, "Pairing", "Pairing failed", &e.title);
+                    ctx.set_pairing_trail(
+                        w,
+                        &format!(
+                            "Attempt {attempt} failed: {} — {}",
+                            e.title, e.what_happened
+                        ),
+                    );
+                    // DS-24: pairing failed — P0-class: toast in
+                    // place AND open the drawer.
+                    ctx.notify_error_urgent(w, "Pairing", &e);
                     eprintln!(
                         "RSH-UI setup begin-pairing failed: {} ({})",
                         e.code, e.title
@@ -6236,12 +6625,10 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
                 // The Settings button itself is a .slint addition (see
                 // the report) — this arm is wired and waiting for it.
                 "update-firmware" => ctx.start_firmware_update_job(&w),
-                "update-check" => ctx.notify(
-                    &w,
-                    "Update",
-                    "Auto-update is off",
-                    "Auto-update is off — new versions are on GitHub Releases",
-                ),
+                // DS-20: a real check now — GitHub Releases latest
+                // tag vs the running version (was a bare notify
+                // that answered without checking anything).
+                "update-check" => ctx.start_app_update_check_job(&w),
                 // F6: backup / restore run on a SettingsOp job
                 // thread — the click never blocks on the daemon.
                 "backup" => {
@@ -6975,6 +7362,7 @@ fn start_frame_timer(
                 ctx.sync_busy(&w);
                 ctx.sync_daemon_error(&w);
                 ctx.check_job_timeouts(&w);
+                ctx.check_toast_expiry(&w);
                 ctx.check_connecting_timeout(&w);
                 ctx.poll_firmware_update(&w);
                 // F5: daemon-side slow changes (profiles, tunings,
@@ -7006,16 +7394,26 @@ fn start_frame_timer(
                             if waited {
                                 *ctx.pairing_wait_since.borrow_mut() = None;
                                 w.set_setup_pairing_active(false);
-                                w.set_setup_pair_status(
-                                    "No pairing window — check the wheel is on and try again."
-                                        .into(),
+                                // DS-25: the trail names the attempt,
+                                // the address, and what the daemon
+                                // reports — "board never answered"
+                                // reads differently from "board seen,
+                                // no window". The same line is the
+                                // notification + toast body.
+                                let trail = pairing_no_window_trail(
+                                    ctx.pairing_attempts.get(),
+                                    &ctx.pairing_board_address(),
+                                    &ctx.api().pairing_status(),
                                 );
-                                ctx.notify(
-                                    &w,
-                                    "Pairing",
-                                    "No pairing window",
-                                    "The wheel did not open a pairing window — check it is on and try again.",
-                                );
+                                ctx.set_pairing_trail(&w, &trail);
+                                ctx.notify(&w, "Pairing", "No pairing window", &trail);
+                                // DS-24: pairing failed — a P0-class
+                                // failure: toast in place AND open the
+                                // drawer, so the user cannot miss it.
+                                ctx.set_toast(&w, "No pairing window", &trail);
+                                if !ctx.hidden.load(Ordering::SeqCst) {
+                                    w.set_notif_open(true);
+                                }
                             }
                         }
                     }
@@ -7141,6 +7539,7 @@ fn main() -> Result<(), slint::PlatformError> {
         pending_profile_id: Rc::new(RefCell::new(None)),
         learn_target: Rc::new(Cell::new(0)),
         horn_test_until: Rc::new(Cell::new(None)),
+        toast_until: Rc::new(Cell::new(None)),
         steer_hist: Rc::new(RefCell::new(VecDeque::new())),
         pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
         unsaved: Rc::new(Cell::new(initial_unsaved)),
@@ -7154,6 +7553,8 @@ fn main() -> Result<(), slint::PlatformError> {
         quit_requested: Rc::new(Cell::new(false)),
         page_requests: Arc::new(Mutex::new(VecDeque::new())),
         pairing_wait_since: Rc::new(RefCell::new(None)),
+        pairing_attempts: Rc::new(Cell::new(0)),
+        pairing_trail: Rc::new(RefCell::new(String::new())),
         job_tx,
         job_rx: Rc::new(RefCell::new(job_rx)),
         busy_jobs: Rc::new(RefCell::new(HashMap::new())),
@@ -7696,6 +8097,7 @@ mod tests {
             pending_profile_id: Rc::new(RefCell::new(None)),
             learn_target: Rc::new(Cell::new(0)),
             horn_test_until: Rc::new(Cell::new(None)),
+        toast_until: Rc::new(Cell::new(None)),
             steer_hist: Rc::new(RefCell::new(VecDeque::new())),
             pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
             unsaved: Rc::new(Cell::new(false)),
@@ -7706,6 +8108,10 @@ mod tests {
             quit_requested: Rc::new(Cell::new(false)),
             page_requests: Arc::new(Mutex::new(VecDeque::new())),
             pairing_wait_since: Rc::new(RefCell::new(None)),
+            pairing_attempts: Rc::new(Cell::new(0)),
+            pairing_trail: Rc::new(RefCell::new(String::new())),
+        pairing_attempts: Rc::new(Cell::new(0)),
+        pairing_trail: Rc::new(RefCell::new(String::new())),
             job_tx,
             job_rx: Rc::new(RefCell::new(job_rx)),
             busy_jobs: Rc::new(RefCell::new(HashMap::new())),
@@ -8657,6 +9063,202 @@ mod tests {
         assert!(win.get_setup_mode(), "reopen must open the wizard");
         assert_eq!(win.get_setup_step(), 0, "reopen starts at step 0");
         assert!(!marker.is_file(), "reopen must delete the marker");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // DS-20: the Settings "Check" button now really checks — the
+    // tag parse + version verdict are pure, so they are tested
+    // here; the network call itself (`fetch_app_update`) is not
+    // exercised in tests (no live GitHub in the suite).
+    #[test]
+    fn ds20_parse_latest_release_tag() {
+        // Real-shaped `releases/latest` payload.
+        assert_eq!(
+            parse_latest_release_tag(
+                r#"{"tag_name":"v2.0.4","name":"RSH v2.0.4","draft":false,"prerelease":false}"#
+            ),
+            Some("2.0.4".to_string())
+        );
+        // A tag without the `v` prefix passes through as-is.
+        assert_eq!(
+            parse_latest_release_tag(r#"{"tag_name":"2.0.4"}"#),
+            Some("2.0.4".to_string())
+        );
+        // Error bodies, missing tags, empty tags, garbage: no
+        // usable tag — the caller reports "unreadable", never a
+        // guessed version.
+        assert_eq!(
+            parse_latest_release_tag(r#"{"message":"Not Found"}"#),
+            None
+        );
+        assert_eq!(parse_latest_release_tag(r#"{"name":"RSH"}"#), None);
+        assert_eq!(parse_latest_release_tag(r#"{"tag_name":""}"#), None);
+        assert_eq!(parse_latest_release_tag(r#"{"tag_name":"v"}"#), None);
+        assert_eq!(parse_latest_release_tag("not json"), None);
+        assert_eq!(parse_latest_release_tag(""), None);
+    }
+
+    #[test]
+    fn ds20_compare_app_versions_is_numeric() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            compare_app_versions("2.0.4", "2.0.3"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_app_versions("2.0.3", "2.0.3"),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            compare_app_versions("2.0.2", "2.0.3"),
+            Some(Ordering::Less)
+        );
+        // Numeric, not lexicographic: 2.0.10 is newer than 2.0.9.
+        assert_eq!(
+            compare_app_versions("2.0.10", "2.0.9"),
+            Some(Ordering::Greater)
+        );
+        // A leading `v` and a missing patch are tolerated.
+        assert_eq!(
+            compare_app_versions("v2.1", "2.0.9"),
+            Some(Ordering::Greater)
+        );
+        // Garbage never compares — the caller reports unreadable.
+        assert_eq!(compare_app_versions("garbage", "2.0.3"), None);
+        assert_eq!(compare_app_versions("2.0.3", "garbage"), None);
+    }
+
+    #[test]
+    fn ds20_app_update_verdict_matrix() {
+        assert_eq!(app_update_verdict("2.0.3", "2.0.3"), Some(AppUpdateVerdict::UpToDate));
+        assert_eq!(
+            app_update_verdict("2.0.3", "2.0.4"),
+            Some(AppUpdateVerdict::Available("2.0.4".to_string()))
+        );
+        assert_eq!(
+            app_update_verdict("2.0.3", "2.0.2"),
+            Some(AppUpdateVerdict::CurrentIsNewer("2.0.2".to_string()))
+        );
+        assert_eq!(app_update_verdict("2.0.3", "garbage"), None);
+    }
+
+    // DS-24: a failure toasts in place (and, for P0-class
+    // failures, opens the drawer) instead of hiding behind the
+    // bell. The toast lives ~5 s, then the 1 Hz expiry clears it.
+    #[test]
+    fn ds24_failure_toast_and_urgent_drawer() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("DS-24 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        assert_eq!(win.get_toast_text().as_str(), "");
+
+        // A plain failure toasts in place but leaves the drawer shut.
+        let err = UserError {
+            code: "ds24_test".to_string(),
+            title: "Test failure".to_string(),
+            what_happened: "The test action failed on purpose.".to_string(),
+            what_to_do: "Ignore this.".to_string(),
+            detail: None,
+        };
+        ctx.notify_error(&win, "Test", &err);
+        assert_eq!(win.get_toast_title().as_str(), "Test failure");
+        assert!(
+            win.get_toast_text().as_str().contains("failed on purpose"),
+            "toast shows the failure, got: {}",
+            win.get_toast_text()
+        );
+        assert!(!win.get_notif_open(), "plain failure must not open the drawer");
+
+        // Not expired yet: the 1 Hz check leaves it alone.
+        ctx.check_toast_expiry(&win);
+        assert_ne!(win.get_toast_text().as_str(), "");
+
+        // Past the 5 s deadline: the expiry clears it.
+        ctx.toast_until
+            .set(Some(Instant::now() - Duration::from_secs(1)));
+        ctx.check_toast_expiry(&win);
+        assert_eq!(win.get_toast_text().as_str(), "");
+        assert_eq!(win.get_toast_title().as_str(), "");
+
+        // A P0-class failure toasts AND opens the drawer.
+        ctx.notify_error_urgent(&win, "Test", &err);
+        assert_ne!(win.get_toast_text().as_str(), "");
+        assert!(win.get_notif_open(), "urgent failure must open the drawer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // DS-25: the "no pairing window" trail distinguishes the cases
+    // the UI can tell apart — daemon error, board seen, board silent.
+    #[test]
+    fn ds25_pairing_no_window_trail_matrix() {
+        fn info() -> PairingInfo {
+            PairingInfo {
+                seconds_left: 0,
+                password: None,
+                error: None,
+                error_detail: None,
+                board_mac: None,
+                replacement_required: false,
+                key_reset_armed: false,
+            }
+        }
+        // Board never answered: attempt + address + "never answered".
+        let trail = pairing_no_window_trail(2, "192.168.4.1", &info());
+        assert!(
+            trail.starts_with("Attempt 2: no pairing window in 10 s at 192.168.4.1"),
+            "got: {trail}"
+        );
+        assert!(trail.contains("board never answered"), "got: {trail}");
+        // Board seen (MAC) but no window: hold BOOT guidance.
+        let mut seen = info();
+        seen.board_mac = Some("AA:BB:CC:DD:EE:FF".to_string());
+        let trail = pairing_no_window_trail(1, "192.168.4.1", &seen);
+        assert!(trail.contains("board seen (AA:BB:CC:DD:EE:FF)"), "got: {trail}");
+        assert!(trail.contains("hold BOOT 3 s"), "got: {trail}");
+        // Daemon-reported error detail wins over the MAC.
+        let mut failed = seen;
+        failed.error_detail = Some("HELLO timeout after 2250ms".to_string());
+        let trail = pairing_no_window_trail(3, "192.168.4.1", &failed);
+        assert!(
+            trail.contains("daemon reports: HELLO timeout after 2250ms"),
+            "got: {trail}"
+        );
+        // A typed error without detail still names its code.
+        let mut typed = info();
+        typed.error = Some(ConnectionError::Unreachable);
+        let trail = pairing_no_window_trail(1, "192.168.4.1", &typed);
+        assert!(trail.contains("daemon reports: Unreachable"), "got: {trail}");
+        // No address: no "at" fragment, still readable.
+        let trail = pairing_no_window_trail(1, "", &info());
+        assert!(!trail.contains(" at "), "got: {trail}");
+    }
+
+    #[test]
+    fn ds25_set_pairing_trail_shows_in_wizard_status() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("DS-25 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        ctx.set_pairing_trail(
+            &win,
+            "Attempt 1: no pairing window in 10 s at 192.168.4.1 — board never answered.",
+        );
+        assert!(
+            win.get_setup_pair_status()
+                .as_str()
+                .contains("Attempt 1: no pairing window"),
+            "wizard status shows the trail, got: {}",
+            win.get_setup_pair_status()
+        );
+        assert!(
+            ctx.pairing_trail.borrow().contains("board never answered"),
+            "trail is stored for the diagnostics drawer"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
