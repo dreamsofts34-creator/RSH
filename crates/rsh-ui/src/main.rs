@@ -1800,7 +1800,7 @@ impl Ctx {
         // A24: slider range is 1.0..2.0 now, so the normalised value
         // is exponent - 1.0 (was / 2.0 for the old 1.0..3.0 range).
         set_if_changed(win.get_curve_val(), exponent - 1.0, |v| {
-            win.set_curve_val(v)
+            win.set_curve_val(v);
         });
         set_if_changed(win.get_curve_text(), format!("{exponent:.2}").into(), |v| {
             win.set_curve_text(v);
@@ -1809,7 +1809,7 @@ impl Ctx {
             win.set_preset(v);
         });
         set_if_changed(win.get_unsaved(), self.unsaved.get(), |v| {
-            win.set_unsaved(v)
+            win.set_unsaved(v);
         });
         // H10: pressed-index comes ONLY from live button state — the
         // first pressed wheel button (1–12) highlights its tile
