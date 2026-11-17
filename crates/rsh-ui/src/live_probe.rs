@@ -21,6 +21,20 @@ use std::time::Duration;
 
 use crate::ipc_api::IpcApi;
 
+/// Serialises the tests that touch the daemon IPC endpoint.
+///
+/// On Windows the endpoint is ONE global named pipe
+/// (`rsh_ipc::IPC_PIPE_NAME`) — the data dir does not isolate it,
+/// so parallel tests in this binary race on it: the probe test can
+/// connect to the round-trip test's server (and steal its single
+/// pipe instance, failing both tests with "all pipe instances are
+/// busy"). On Linux the Unix socket is per-dir, so this is only
+/// belt-and-braces there. The round-trip test joins its server
+/// thread before returning, so once the guard is released the pipe
+/// is gone.
+#[cfg(test)]
+pub(crate) static TEST_IPC_PIPE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Resolve the RSH data dir: the explicit override wins, otherwise
 /// the platform data dir + `RSH` (`dirs::data_dir().join("RSH")`).
 /// `None` when neither is available.
@@ -139,6 +153,11 @@ mod tests {
 
     #[test]
     fn try_live_api_returns_none_when_no_daemon() {
+        // Serialised with the round-trip test: on Windows both share
+        // the one global named pipe (see TEST_IPC_PIPE_GUARD).
+        let _guard = TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!("rsh-no-daemon-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");

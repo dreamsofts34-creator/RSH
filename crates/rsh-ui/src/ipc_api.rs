@@ -674,6 +674,13 @@ mod tests {
     /// with its own current-thread runtime instead.
     #[test]
     fn tuning_round_trip_over_real_socket() {
+        // Serialised with the probe test: on Windows both share the
+        // one global named pipe (see live_probe::TEST_IPC_PIPE_GUARD).
+        // The guard is held until the server thread is joined below,
+        // so the pipe is destroyed before the probe test can run.
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!("rsh-ipc-api-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");

@@ -76,3 +76,12 @@ every button works.**
 - Note: `cargo test --workspace` fails on this Linux sandbox only —
   the legacy Tauri member needs webkit2gtk (see Cargo.toml comment);
   the documented gate is the default-members run above.
+- Release attempt 1 (run 44000913501, tag on 4278280) FAILED on the
+  Windows runner only: `cargo test` — `live_probe` "no daemon" probe
+  and `ipc_api` round-trip raced on the ONE global named pipe
+  (`\\.\pipe\rsh-daemon`); the probe stole the round-trip server's
+  single pipe instance (os error 231). Fix (follow-up commit):
+  both tests share `TEST_IPC_PIPE_GUARD` (`live_probe.rs`) so they
+  run serially; the round-trip test joins its server thread, so the
+  pipe is gone before the probe runs. Local re-gate after the fix:
+  full suite 1014/0, clippy 0, fmt clean.
