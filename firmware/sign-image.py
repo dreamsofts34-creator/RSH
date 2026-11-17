@@ -15,7 +15,7 @@ hai (koi nayi dependency nahi).
 Usage:
   sign-image.py --gen-keypair <dir>
       Nayi Ed25519 keypair banao: <dir>/signing-key.pem (0600, OFFLINE
-      rakho) + <dir>/signing_pubkey.h (firmware/rsh/ mein copy karo).
+      rakho) + <dir>/signing_pubkey.h (firmware/signing_pubkey.h mein copy karo).
   sign-image.py --sign <key.pem> <firmware.bin> [--out <signed.bin>]
       Image sign karo. Default out: <firmware>-signed.bin.
       Pehle se signed image dobara sign nahi hoti (error).
@@ -174,7 +174,7 @@ def gen_keypair(outdir: str) -> None:
     header = os.path.join(outdir, "signing_pubkey.h")
     with open(header, "w") as f:
         f.write(pubkey_header(key))
-    print(f"keypair ban gaya:\n  private (OFFLINE rakho): {key}\n  header (firmware/rsh/ mein copy karo): {header}")
+    print(f"keypair ban gaya:\n  private (OFFLINE rakho): {key}\n  header (firmware/signing_pubkey.h mein copy karo): {header}")
     print("Private key ko kabhi repo/git/image mein mat dalo.")
 
 

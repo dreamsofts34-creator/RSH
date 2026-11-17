@@ -19,9 +19,10 @@ use rsh_api::{
     ProfileSummary, RawMv, SnapshotInfo, TuningSettings, VjoyStatus, app_version,
 };
 use rsh_api::{ConnEvent, ConnectionManager};
-use rsh_app_core::snapshot::{ConnectionState as CoreState, EngineSnapshot};
+use rsh_app_core::snapshot::EngineSnapshot;
 use rsh_app_core::state::{
-    AppStateCore, GameInfo, ProfileSummary as CoreProfileSummary, TransportKind, TransportState,
+    AppSettingsPatch, AppStateCore, GameInfo, ProfileSummary as CoreProfileSummary, TransportKind,
+    TransportState,
 };
 
 /// Feed window for the F20 watchdog frame feed (see
@@ -148,17 +149,16 @@ impl DaemonApi {
                 Some(hint.clone()),
             ),
             other => {
-                // Not Active: report the manager's label, but never
-                // "Connected" — and if the core says Connected while
-                // the gate is closed, downgrade (C-02 defence).
-                let label = if transport_state.session_active
-                    && matches!(transport_state.state, CoreState::Connected)
-                {
-                    "Connected".to_string()
-                } else {
-                    other.label().to_string()
-                };
-                (other.clone(), label, None, None)
+                // DS-18: the label is derived from the manager state
+                // ALONE when it is not Active. The old code upgraded
+                // the label to "Connected" whenever the core still
+                // reported Connected (e.g. the watchdog fired →
+                // Backoff before `disconnect_transport()` ran), so
+                // the published event carried `state: Backoff,
+                // label: "Connected"` — the comment above claimed
+                // the opposite. Only Active is "Connected" (see
+                // `ConnectionState::label`).
+                (other.clone(), other.label().to_string(), None, None)
             }
         };
         ConnectionInfo {
@@ -232,6 +232,13 @@ impl AppApi for DaemonApi {
             board_mac: status.board_mac,
             replacement_required: status.replacement_required,
             key_reset_armed: status.key_reset_armed,
+            // DS-25: the pairing attempt trail (HELO sends, HELLO
+            // replies, timeouts — see `AppStateCore::pairing_log_lines`)
+            // rides on the status the wizard already polls, so the UI
+            // can show e.g. "Sent HELO to 192.168.4.1 — no reply
+            // (3 tries)" instead of only "No pairing window". The
+            // log lines are redacted at the source (never a password).
+            attempt_log: self.state.pairing_log_lines(),
         }
     }
 
@@ -273,15 +280,19 @@ impl AppApi for DaemonApi {
     /// short lock), so there is no new lock-ordering vs the
     /// manager loop or the engine tick.
     fn poll(&self) -> PollState {
-        let core_snap = self.state.snapshot();
-        let transport = self.state.transport_state();
+        // DS-30: one `Arc` clone per source, not one struct clone
+        // per read — the settings are read once and shared between
+        // the transport state and the output flag.
+        let settings = self.state.settings_arc();
+        let core_snap = self.state.snapshot_arc();
+        let transport = self.state.transport_state_with_settings(&settings);
         let mgr = self.manager_state();
         let connection = Self::connection_from(&mgr, &transport);
         let snapshot = Self::snapshot_from(&core_snap, self.state.pressed_button_mask());
         PollState {
             snapshot,
             connection,
-            output_enabled: self.state.settings().output_enabled,
+            output_enabled: settings.output_enabled,
         }
     }
 
@@ -290,7 +301,31 @@ impl AppApi for DaemonApi {
     }
 
     fn set_output_enabled(&self, enabled: bool) {
-        let _ = self.state.set_output_enabled(enabled);
+        // DS-41: the old code discarded the returned state AND never
+        // persisted the flag — a backend activation/connect failure
+        // was invisible, and the toggle did not survive a restart
+        // (`settings().output_enabled` is the persisted source the
+        // UI polls on the next `poll`). Now: a failure in the
+        // applied state is noted in the engine detail (which the
+        // diagnostics surface), the flag is persisted, and a persist
+        // failure is logged + noted and reverts the in-memory toggle
+        // so the engine and the polled flag agree.
+        let applied = self.state.set_output_enabled(enabled);
+        if applied.detail.contains("failed") {
+            self.state
+                .note_engine_detail(format!("output enable failed: {}", applied.detail));
+        }
+        let patch = AppSettingsPatch {
+            output_enabled: Some(enabled),
+            ..Default::default()
+        };
+        if let Err(error) = self.state.set_settings_patch(patch) {
+            eprintln!("[rsh-daemon] set_output_enabled persist failed: {error}");
+            self.state.note_engine_detail(format!(
+                "output setting could not be saved ({error}) — the toggle was reverted"
+            ));
+            let _ = self.state.set_output_enabled(!enabled);
+        }
     }
 
     fn get_tuning(&self, module: &str) -> TuningSettings {
@@ -638,7 +673,14 @@ impl AppApi for DaemonApi {
     }
 
     fn diag_stats(&self) -> Result<DiagStats, UserError> {
-        Ok(self.state.diag_stats())
+        let mut stats = self.state.diag_stats();
+        // DS-82: the IPC dispatch latency aggregate, measured by
+        // the server on every dispatch.
+        if let Some((p50, p99)) = rsh_ipc::ipc_latency_global_p50_p99_ms() {
+            stats.ipc_p50_ms = Some(p50);
+            stats.ipc_p99_ms = Some(p99);
+        }
+        Ok(stats)
     }
 }
 
@@ -979,6 +1021,127 @@ mod tests {
         assert_eq!(polled.snapshot.steering_deg, 0.0);
         // A second poll is identical while nothing moves.
         assert_eq!(api.poll(), polled);
+    }
+
+    #[test]
+    fn connection_label_is_never_connected_outside_active() {
+        // DS-18: for every non-Active manager state, the label must
+        // not be "Connected" even when the core transport still
+        // reports Connected with an open session gate (the watchdog
+        // window: manager in Backoff, core not yet disconnected).
+        // The old code upgraded the label from the transport state
+        // and published `state: Backoff, label: "Connected"`.
+        let transport = TransportState {
+            transport: "wifi".to_string(),
+            state: rsh_app_core::snapshot::ConnectionState::Connected,
+            address: "192.168.4.1".to_string(),
+            error: None,
+            session_active: true,
+            frames_held_by_gate: 0,
+        };
+        for mgr in [
+            MgrState::Idle,
+            MgrState::LinkUp,
+            MgrState::Hello,
+            MgrState::Authenticating,
+            MgrState::Backoff {
+                wait_ms: 2000,
+                attempt: 1,
+            },
+            MgrState::Error {
+                reason: ConnectionError::Unreachable,
+                hint: "board not responding".to_string(),
+                retry_in_ms: None,
+            },
+        ] {
+            let info = DaemonApi::connection_from(&mgr, &transport);
+            assert_ne!(
+                info.label, "Connected",
+                "manager state {mgr:?} must not label Connected"
+            );
+            assert_eq!(info.state, mgr);
+        }
+        // And Active still reports Connected.
+        let info = DaemonApi::connection_from(&MgrState::Active, &transport);
+        assert_eq!(info.label, "Connected");
+        assert_eq!(info.state, MgrState::Active);
+    }
+
+    #[test]
+    fn set_output_enabled_persists_the_flag() {
+        // DS-41: the toggle used to live only in memory — the UI
+        // polls `settings().output_enabled`, so a restart reverted
+        // it and a persist failure was invisible. Now the flag is
+        // persisted, and the polled value agrees with the toggle.
+        let (api, _dir) = live_api_named("output-persist");
+        api.set_output_enabled(true);
+        assert!(
+            api.state.settings().output_enabled,
+            "the toggle must persist"
+        );
+        assert!(api.output_enabled());
+        api.set_output_enabled(false);
+        assert!(
+            !api.state.settings().output_enabled,
+            "toggling off must persist too"
+        );
+    }
+
+    #[test]
+    fn pairing_status_carries_the_attempt_trail() {
+        // DS-25: the wizard polls `pairing_status`; the attempt
+        // trail (attempt line, HELO sends, HELLO timeout) must ride
+        // on it so the UI can show what actually happened instead
+        // of only "No pairing window".
+        let (api, _dir) = live_api_named("pairing-trail");
+        assert!(
+            api.pairing_status().attempt_log.is_empty(),
+            "no attempt yet: the trail is empty, never fake"
+        );
+        // The forwarder needs UDP 4211 free; another test process
+        // may hold it briefly, so probe first and retry the
+        // attempt (up to 3 rounds) instead of failing on a
+        // transient foreign bind.
+        let udp_4211_free = || std::net::UdpSocket::bind("127.0.0.1:4211").is_ok();
+        let mut trail: Vec<String> = Vec::new();
+        for _attempt in 0..3 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !udp_4211_free() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            api.begin_pairing()
+                .expect("begin_pairing triggers an attempt");
+            trail = api.pairing_status().attempt_log;
+            assert!(
+                trail.iter().any(|line| line.contains("begin_pairing")),
+                "trail must start with the attempt line: {trail:?}"
+            );
+            let wait_deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !trail.iter().any(|line| line.contains("HELLO timeout"))
+                && std::time::Instant::now() < wait_deadline
+            {
+                std::thread::sleep(Duration::from_millis(100));
+                trail = api.pairing_status().attempt_log;
+            }
+            if trail.iter().any(|line| line.contains("HELLO timeout")) {
+                break;
+            }
+            let _ = api.state.stop_engine();
+        }
+        assert!(
+            trail.iter().any(|line| line.contains("HELLO timeout")),
+            "trail must record the timeout: {trail:?}"
+        );
+        assert!(
+            trail
+                .iter()
+                .any(|line| line.contains("HELO sent") || line.contains("HELO send failed")),
+            "trail must record the HELO attempts: {trail:?}"
+        );
+        // (In a sandbox with no route to 192.168.4.1 the send fails
+        // with EPERM and the failure is logged instead — either way
+        // the attempt is on the trail.)
+        let _ = api.state.stop_engine();
     }
 
     #[test]

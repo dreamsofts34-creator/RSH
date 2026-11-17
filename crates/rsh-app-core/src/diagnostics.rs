@@ -23,7 +23,8 @@
 //! gone (the v1.0.0 launch failure left `%AppData%\RSH\logs` empty
 //! because startup only ever used `eprintln`).
 
-use std::fs::{self, OpenOptions};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -415,25 +416,174 @@ pub fn append_startup_log(log_dir: &Path, message: &str) -> Option<PathBuf> {
 /// [`append_startup_log`] with an injectable clock (the test seam:
 /// tests pin the time to prove the date rollover).
 fn append_startup_log_at(log_dir: &Path, message: &str, now: SystemTime) -> Option<PathBuf> {
-    let _ = fs::create_dir_all(log_dir);
-    let path = startup_log_path_for(log_dir, now);
+    let line = format_startup_log_line(message, now);
+    write_log_line(log_dir, &line, now)
+}
+
+/// Format one startup-log line (DS-77): flatten + redact + UTC
+/// timestamp, exactly once. The formatted line is written to every
+/// location by `write_log_line`, so redaction no longer runs once
+/// per location.
+fn format_startup_log_line(message: &str, now: SystemTime) -> String {
     let (year, month, day, hour, minute, second) = utc_civil_parts(now);
     let single_line: String = message
         .chars()
         .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
         .collect();
-    let line = format!(
+    format!(
         "[{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}] {}\n",
         redact_secrets(&single_line)
-    );
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .ok()?;
-    file.write_all(line.as_bytes()).ok()?;
-    let _ = file.flush();
+    )
+}
+
+/// Identity of an open log file, for staleness checks (DS-77).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity(u64, u64);
+
+#[cfg(unix)]
+fn identity_of(meta: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    FileIdentity(meta.dev(), meta.ino())
+}
+
+#[cfg(windows)]
+fn identity_of(meta: &fs::Metadata) -> FileIdentity {
+    // `MetadataExt::file_index` is unstable (`windows_by_handle`)
+    // on this toolchain, so the identity is (length, mtime-nanos):
+    // a deleted-and-recreated log gets a new mtime and a truncated
+    // log a new length, so both are detected like Unix dev+ino.
+    use std::time::UNIX_EPOCH;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    FileIdentity(meta.len(), mtime)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn identity_of(_meta: &fs::Metadata) -> FileIdentity {
+    FileIdentity(0, 0)
+}
+
+/// One held-open log file (DS-77): the file is opened once and
+/// reused across appends, so a log line costs one `write_all`
+/// instead of `create_dir_all` + open + write + flush + close.
+/// `identity` is the file's identity at open time (Unix dev+ino,
+/// Windows length+mtime); it is checked against the live path on
+/// every write, so a deleted-and-recreated log (or a test that
+/// wipes its temp dir) is detected and the handle reopened.
+struct OpenLog {
+    file: File,
+    identity: FileIdentity,
+}
+
+/// Held-open log handles, keyed by full log path (DS-77).
+static LOG_HANDLES: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, OpenLog>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Log directories already created this process (DS-77): the
+/// `create_dir_all` syscall is cached per directory.
+static LOG_DIRS_CREATED: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Create `log_dir` once (DS-77): the `create_dir_all` syscall is
+/// cached per directory for the process lifetime, so a log line no
+/// longer stats/creates the directory every time. A later open
+/// failure recreates it on the spot (see `open_log_file`).
+fn ensure_log_dir(log_dir: &Path) {
+    let mut created = LOG_DIRS_CREATED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if created.contains(log_dir) {
+        return;
+    }
+    if fs::create_dir_all(log_dir).is_ok() {
+        created.insert(log_dir.to_path_buf());
+    }
+}
+
+/// Open (or create) a log file for append (DS-77). On failure the
+/// directory may have vanished after the cached create (a wipe
+/// raced us): recreate it and retry once. The cache entry is left
+/// alone — the directory exists again after the retry, so it is
+/// true again.
+fn open_log_file(path: &Path, log_dir: &Path) -> Option<File> {
+    if let Ok(file) = OpenOptions::new().create(true).append(true).open(path) {
+        Some(file)
+    } else {
+        let _ = fs::create_dir_all(log_dir);
+        OpenOptions::new().create(true).append(true).open(path).ok()
+    }
+}
+
+/// Write one pre-formatted line to the daily log in `log_dir`
+/// (DS-77): the directory is created once (cached), the file is
+/// opened once and held open, and the line is a single `write_all`
+/// — no open/close per line, and no flush-loss risk (the handle is
+/// unbuffered, so the bytes are in the kernel as soon as the call
+/// returns — a `process::exit` after this cannot lose them, the way
+/// a `BufWriter` without a flush could).
+///
+/// Staleness: the handle is checked against the live path on every
+/// write (identity mismatch, or the path gone) and — on Unix — the
+/// open file's link count (a deleted file has `nlink == 0`, which
+/// also catches a delete-and-recreate that reused the same inode).
+/// A stale handle is dropped and reopened. At most 8 handles are
+/// held at once (a long-running daemon rolls the file daily, and
+/// tests churn temp dirs); past that the map is cleared and the
+/// live paths reopen on demand.
+///
+/// Returns the path written, or [`None`] when nothing could be
+/// written.
+fn write_log_line(log_dir: &Path, line: &str, now: SystemTime) -> Option<PathBuf> {
+    let path = startup_log_path_for(log_dir, now);
+    ensure_log_dir(log_dir);
+    let mut handles = LOG_HANDLES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stale = match handles.get(&path) {
+        Some(open) => {
+            let identity_mismatch = match fs::metadata(&path) {
+                Ok(meta) => identity_of(&meta) != open.identity,
+                Err(_) => true,
+            };
+            identity_mismatch || file_is_unlinked(&open.file)
+        }
+        None => true,
+    };
+    if stale {
+        handles.remove(&path);
+        if handles.len() >= 8 {
+            handles.clear();
+        }
+        let file = open_log_file(&path, log_dir)?;
+        let identity = file
+            .metadata()
+            .ok()
+            .map_or(FileIdentity(0, 0), |meta| identity_of(&meta));
+        handles.insert(path.clone(), OpenLog { file, identity });
+    }
+    let open = handles.get_mut(&path)?;
+    open.file.write_all(line.as_bytes()).ok()?;
     Some(path)
+}
+
+/// Whether the open file has been unlinked from its directory
+/// (DS-77): a deleted file has link count 0, while a live file has
+/// at least 1. Unix-only — on Windows the identity check in
+/// `write_log_line` covers the common cases (delete without
+/// recreate, replace with a different file index).
+#[cfg(unix)]
+fn file_is_unlinked(file: &File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().is_ok_and(|meta| meta.nlink() == 0)
+}
+
+#[cfg(not(unix))]
+fn file_is_unlinked(_file: &File) -> bool {
+    false
 }
 
 /// The fallback log directory: `%TEMP%\RSH\logs` on Windows
@@ -459,15 +609,20 @@ pub fn temp_log_dir() -> PathBuf {
 #[must_use]
 pub fn append_startup_log_both(message: &str) -> Vec<PathBuf> {
     let mut written = Vec::new();
+    // DS-77: the line is formatted (flatten + redact + timestamp)
+    // once and written to both locations — redaction no longer runs
+    // once per location, and both files carry the same timestamp.
+    let now = SystemTime::now();
+    let line = format_startup_log_line(message, now);
     let primary = crate::data_dir().map(|dir| dir.join("logs"));
     if let Some(dir) = &primary
-        && let Some(path) = append_startup_log(dir, message)
+        && let Some(path) = write_log_line(dir, &line, now)
     {
         written.push(path);
     }
     let fallback = temp_log_dir();
     if primary.as_deref() != Some(fallback.as_path())
-        && let Some(path) = append_startup_log(&fallback, message)
+        && let Some(path) = write_log_line(&fallback, &line, now)
     {
         written.push(path);
     }
@@ -501,13 +656,16 @@ pub fn log_fatal_to(
     let line = format!("FATAL: {message}");
     eprintln!("[RSH] {line}");
     let mut written = Vec::new();
+    // DS-77: format once, write to both locations.
+    let now = SystemTime::now();
+    let formatted = format_startup_log_line(&line, now);
     if let Some(dir) = primary_log_dir
-        && let Some(path) = append_startup_log(dir, &line)
+        && let Some(path) = write_log_line(dir, &formatted, now)
     {
         written.push(path);
     }
     if primary_log_dir != Some(fallback_log_dir)
-        && let Some(path) = append_startup_log(fallback_log_dir, &line)
+        && let Some(path) = write_log_line(fallback_log_dir, &formatted, now)
     {
         written.push(path);
     }
@@ -833,6 +991,31 @@ mod tests {
         let written = log_fatal_to("dedup check", Some(&dir), &dir);
         assert_eq!(written.len(), 1, "{written:?}");
         let contents = fs::read_to_string(&written[0]).expect("read fatal log");
+        assert_eq!(contents.lines().count(), 1, "{contents}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// DS-77: a held-open handle is detected as stale when its file
+    /// is deleted and recreated — the next write reopens the new
+    /// file instead of writing into the unlinked inode (the
+    /// delete-and-recreate a test teardown does, or an external log
+    /// rotation).
+    #[test]
+    fn ds77_stale_handle_reopens_after_delete_and_recreate() {
+        let dir = temp_dir("ws-e-stale");
+        let log_dir = dir.join("logs");
+        let path = append_startup_log_at(&log_dir, "first line", fixed_time(1_794_700_800))
+            .expect("first write");
+        assert_eq!(fs::read_to_string(&path).expect("read").lines().count(), 1);
+        // Wipe the file (and its directory, as a test teardown
+        // would): the held handle now points at an unlinked inode.
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&log_dir).expect("recreate log dir");
+        let path2 = append_startup_log_at(&log_dir, "second line", fixed_time(1_794_700_805))
+            .expect("second write");
+        assert_eq!(path, path2);
+        let contents = fs::read_to_string(&path2).expect("read after recreate");
+        assert!(contents.contains("second line"), "{contents}");
         assert_eq!(contents.lines().count(), 1, "{contents}");
         let _ = fs::remove_dir_all(&dir);
     }

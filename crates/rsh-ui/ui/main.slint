@@ -72,13 +72,17 @@ export component MainWindow inherits Window {
     in property <bool> buttons-listening: false;
     in property <string> profile-name: "GT3 Sprint";
     in property <string> auto-profile-text: "No profile yet";
-    in property <string> app-version: "2.0.2";
+    in property <string> app-version: "2.0.3";
     in property <bool> daemon-live: false;
     // B5 (v2.0.2): the global busy strip reads these — Rust drives
     // them from busy_jobs (each start_*_job records its label, the
     // 1 Hz frame timer clears them); an empty label renders "Working…".
     in property <bool> busy: false;
     in property <string> busy-label: "";
+    // DS-54: which job kind the strip shows, as a JobKind::order
+    // value (-1 = idle) — screens disable + dim the button that
+    // started it while its job runs.
+    in property <int> busy-kind: -1;
     // F27 (v2.0.3): true while the window is hidden to tray —
     // the busy spinner's Timer stops (see below), so no redraw
     // is scheduled on the hidden window. Set from Rust in the
@@ -89,6 +93,14 @@ export component MainWindow inherits Window {
     // is none; the Overview shows it as an error banner instead of
     // the generic "not running" line. Set from Rust (mark_dead / sync).
     in property <string> daemon-error: "";
+    // DS-24 (U-06): transient in-place failure toast — every
+    // `notify_error` also surfaces here for ~5 s, so a failure is
+    // visible on the current screen without opening the bell drawer
+    // (the full text stays in the drawer). `in-out` so the toast's
+    // own click-to-dismiss can clear it; Rust clears it on expiry
+    // (1 Hz tick). Empty = hidden.
+    in-out property <string> toast-title: "";
+    in-out property <string> toast-text: "";
     // B5 spinner step (0..11, driven by the strip's Timer).
     property <int> spin-step: 0;
     in property <bool> connected: true;
@@ -231,6 +243,10 @@ export component MainWindow inherits Window {
     in-out property <string> setup-pair-status: "Waiting for the wheel…";
     in-out property <string> setup-pair-error: "";
     in-out property <bool> setup-pairing-active: false;
+    // DS-67: true while the board rejoins Wi-Fi with the new
+    // password after a successful pairing — the wizard says
+    // "rejoining" instead of claiming the wheel is connected.
+    in-out property <bool> setup-rejoining: false;
     // H-5 (v2.0.2): true when the board is already paired to another
     // key and re-pairing needs the BOOT reset — Rust sets this from
     // pairing_status().replacement_required (main.rs, reconnect flow).
@@ -269,6 +285,10 @@ export component MainWindow inherits Window {
     in-out property <string> diag-loop-rate-text: "—";
     in-out property <string> diag-tx-failures-text: "—";
     in-out property <string> diag-seq-gaps-text: "—";
+    in-out property <string> diag-frame-p50-text: "—";
+    in-out property <string> diag-frame-p99-text: "—";
+    in-out property <string> diag-ipc-p50-text: "—";
+    in-out property <string> diag-ipc-p99-text: "—";
     in-out property <[bool]> diag-buttons-pressed;
 
     callback toggled-send();
@@ -404,7 +424,10 @@ export component MainWindow inherits Window {
         }
         if !setup-mode : HorizontalLayout {
             width: 100%;
-            height: 100%;
+            // DS-53: the busy strip reserves its 38px in the layout
+            // while visible — it used to overlay (cover) the bottom
+            // 38px of the page. The wizard gets the same reserve below.
+            height: parent.height - (busy ? 38px : 0px);
         Sidebar {
             page: page;
             connected: connected;
@@ -515,6 +538,7 @@ export component MainWindow inherits Window {
                 clutch: clutch;
                 daemon-live: daemon-live;
                 daemon-error: daemon-error;
+                busy-kind: busy-kind;
                 connected: connected;
                 paired: paired;
                 firmware-line: firmware-line;
@@ -532,6 +556,9 @@ export component MainWindow inherits Window {
                 open-diagnostics => { open-diagnostics(); }
                 reconnect => { reconnect(); }
                 open-profile-popover => { profile-clicked(); }
+                // DS-56: the empty-games action re-uses the wizard's
+                // find-games path (which now guards daemon-live, DS-55).
+                find-games => { setup-find-games(); }
                 // H2: open the Pair wizard, don't just show Settings.
                 pair-now => { pair-now-requested(); }
             }
@@ -671,6 +698,7 @@ export component MainWindow inherits Window {
             }
             if page == 5 : SettingsScreen {
                 connected: connected;
+                busy-kind: busy-kind;
                 // Two-way bindings: the screen edits these, Rust
                 // reverts them on a failed backend call (A9/A10).
                 connection-type <=> transport;
@@ -726,8 +754,13 @@ export component MainWindow inherits Window {
     // (setup-step) so Rust drives Back/Next; the wizard itself only
     // reads it. The notifications drawer below still overlays it.
     if setup-mode : SetupWizard {
+        // DS-53: same 38px reserve as the shell layout above, so the
+        // busy strip never covers the wizard's footer.
+        height: parent.height - (busy ? 38px : 0px);
         step: setup-step;
         daemon-live: daemon-live;
+        busy-kind: busy-kind;
+        rejoining: setup-rejoining;
         connect-done: setup-connect-done;
         paired: setup-paired;
         centre-done: setup-centre-done;
@@ -791,6 +824,41 @@ export component MainWindow inherits Window {
         cancel-switch => { popover-cancel-switch(); }
         closed => { popover-closed(); }
     }
+    // DS-24 (U-06): transient failure toast, above the page and
+    // below the top bar (same y as the drawers). It floats over the
+    // page title area for ~5 s — long enough to read, short enough
+    // to never need a close button (click it to dismiss early).
+    // Painted before the drawers, so an open drawer covers its
+    // right end; the text is left-aligned and stays readable.
+    if toast-text != "" : Rectangle {
+        x: Theme.sidebar-width;
+        y: 64px;
+        width: parent.width - Theme.sidebar-width - 20px;
+        min-height: 52px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.bad;
+        background: Theme.err-bg;
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            spacing: 10px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 2px;
+                Text { text: toast-title; font-size: 12.5px; font-weight: 600; color: Theme.bad; wrap: word-wrap; }
+                Text { text: toast-text; font-size: 12px; color: Theme.text; wrap: word-wrap; }
+            }
+            Text { text: "✕"; font-size: 12px; color: Theme.faint; vertical-alignment: center; }
+        }
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { toast-text = ""; toast-title = ""; }
+        }
+    }
     // Notification drawer overlay (right edge, above the page).
     // Esc is owned by the keyboard worker (clears `notif-open`).
     if notif-open : NotificationsDrawer {
@@ -821,6 +889,10 @@ export component MainWindow inherits Window {
         loop-rate-text: diag-loop-rate-text;
         tx-failures-text: diag-tx-failures-text;
         seq-gaps-text: diag-seq-gaps-text;
+        frame-p50-text: diag-frame-p50-text;
+        frame-p99-text: diag-frame-p99-text;
+        ipc-p50-text: diag-ipc-p50-text;
+        ipc-p99-text: diag-ipc-p99-text;
         conn-label: diag-conn-label;
         daemon-live: diag-daemon-live;
         app-version: diag-app-version;

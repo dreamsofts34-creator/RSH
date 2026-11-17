@@ -4933,6 +4933,42 @@ int main() {
     CHECK(rsh_led_driver_has_persistent(&drv) == 0);
   }
 
+  // ============ §35: deep-scan DS-11/DS-64/DS-65/DS-75 diag codes ============
+  {
+    // Naye codes distinct hon, nonzero hon, aur GET_DIAG body mein
+    // round-trip hon (code byte + value LE) — host/CI assertion ke
+    // DS-64 ki "shipped build ki WDT config wahi hai jo code assume
+    // karta hai" wali shart ka host-side hissa.
+    CHECK(RSH_DIAG_AP_RESTART_FAIL == 13);
+    CHECK(RSH_DIAG_KEY_RESET_EXPIRED == 14);
+    CHECK(RSH_DIAG_WDT_STATE == 15);
+    CHECK(RSH_DIAG_KEYSTORE_NVS_FAIL == 16);
+    CHECK(RSH_DIAG_AP_RESTART_FAIL != RSH_DIAG_AP_LOCKED);
+    CHECK(RSH_DIAG_KEY_RESET_EXPIRED != RSH_DIAG_KEY_RESET_ARMED);
+    CHECK(RSH_DIAG_WDT_STATE != RSH_DIAG_BOOT);
+    CHECK(RSH_DIAG_KEYSTORE_NVS_FAIL != RSH_DIAG_PAIRED);
+    RshDiagLog dl3;
+    rsh_diag_init(&dl3);
+    // value semantics: AP fail 0 = lock, 1 = password restart, 2 = rescan;
+    // WDT 0 = subscribed now, 1 = already subscribed, 2 = failed.
+    rsh_diag_record(&dl3, RSH_DIAG_AP_RESTART_FAIL, 0, 100);
+    rsh_diag_record(&dl3, RSH_DIAG_AP_RESTART_FAIL, 1, 200);
+    rsh_diag_record(&dl3, RSH_DIAG_AP_RESTART_FAIL, 2, 300);
+    rsh_diag_record(&dl3, RSH_DIAG_KEY_RESET_EXPIRED, 0, 400);
+    rsh_diag_record(&dl3, RSH_DIAG_WDT_STATE, 1, 500);
+    rsh_diag_record(&dl3, RSH_DIAG_KEYSTORE_NVS_FAIL, 0, 600);
+    CHECK(dl3.count == 6 && dl3.total == 6);
+    uint8_t db3[230];
+    size_t dlen3 = rsh_diag_build_body(&dl3, 0, db3, sizeof(db3));
+    CHECK(dlen3 == 6 + 6 * 7);
+    CHECK(db3[6 + 0 * 7 + 4] == RSH_DIAG_AP_RESTART_FAIL && db3[6 + 0 * 7 + 5] == 0);
+    CHECK(db3[6 + 1 * 7 + 4] == RSH_DIAG_AP_RESTART_FAIL && db3[6 + 1 * 7 + 5] == 1);
+    CHECK(db3[6 + 2 * 7 + 4] == RSH_DIAG_AP_RESTART_FAIL && db3[6 + 2 * 7 + 5] == 2);
+    CHECK(db3[6 + 3 * 7 + 4] == RSH_DIAG_KEY_RESET_EXPIRED);
+    CHECK(db3[6 + 4 * 7 + 4] == RSH_DIAG_WDT_STATE && db3[6 + 4 * 7 + 5] == 1);
+    CHECK(db3[6 + 5 * 7 + 4] == RSH_DIAG_KEYSTORE_NVS_FAIL);
+  }
+
   printf("%s — %d checks, %d failures\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", checks, failures);
   return failures ? 1 : 0;
 }

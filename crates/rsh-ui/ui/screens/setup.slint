@@ -110,6 +110,13 @@ export component SetupWizard inherits Rectangle {
     in property <bool> usb-available: false;
     in property <bool> paired: false;
     in property <bool> reset-required: false;
+    // DS-67: true while the board rejoins Wi-Fi with the new
+    // password after a successful pairing.
+    in property <bool> rejoining: false;
+    // DS-54: which job kind the busy strip shows, as a
+    // JobKind::order value (-1 = idle) — the invoking button
+    // disables + dims while its job runs.
+    in property <int> busy-kind: -1;
     // A3 (v2.0.2): daemon state drives the display — while the
     // background service is down the wizard shows "Disconnected" /
     // "—", never a plausible-looking countdown, address or status.
@@ -256,7 +263,7 @@ export component SetupWizard inherits Rectangle {
                         Rectangle { horizontal-stretch: 1; }
                         // A3: "Connected" only once the connection is
                         // really up — transport == 0 alone is not proof.
-                        Btn { label: transport == 0 && (connect-done || wifi-joined) ? "Connected" : "Use Wi-Fi"; primary: transport == 0 && (connect-done || wifi-joined); clicked => { connect-action("wifi"); } }
+                        Btn { label: transport == 0 && (connect-done || wifi-joined) ? "Connected" : "Use Wi-Fi"; primary: transport == 0 && (connect-done || wifi-joined); disabled: busy-kind == 1; clicked => { connect-action("wifi"); } }
                     }
                 }
                 Rectangle {
@@ -276,7 +283,7 @@ export component SetupWizard inherits Rectangle {
                         Rectangle { horizontal-stretch: 1; }
                         // A3: same rule as Wi-Fi — "Connected" needs a
                         // real connection, not just the USB choice.
-                        Btn { label: transport == 1 && connect-done ? "Connected" : "Use USB"; primary: transport == 1 && connect-done; clicked => { connect-action("usb"); } }
+                        Btn { label: transport == 1 && connect-done ? "Connected" : "Use USB"; primary: transport == 1 && connect-done; disabled: busy-kind == 1; clicked => { connect-action("usb"); } }
                     }
                 }
                 // A3: no address is known until the wheel is really
@@ -307,7 +314,7 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: !daemon-live ? "Disconnected — status unknown" : vjoy-installed ? "Installed" + (vjoy-version == "" ? "" : " · " + vjoy-version) : vjoy-installing ? "Installing…" : "Not installed — games need a controller driver"; font-size: 12.5px; color: vjoy-installed ? Theme.ok : Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
                         if vjoy-installed : Text { vertical-alignment: center; text: "✓"; font-size: 16px; font-weight: 700; color: Theme.ok; }
-                        if !vjoy-installed && !vjoy-installing : Btn { label: "Install vJoy"; primary: true; clicked => { install-vjoy(); } }
+                        if !vjoy-installed && !vjoy-installing : Btn { label: "Install vJoy"; primary: true; disabled: busy-kind == 14; clicked => { install-vjoy(); } }
                     }
                 }
                 if vjoy-error != "" : Text { text: vjoy-error; font-size: 12.5px; color: Theme.bad; wrap: word-wrap; }
@@ -326,7 +333,7 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "HIDMaestro"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: "Needs admin permission when first used."; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: vjoy-fallback ? "Selected ✓" : "Use HIDMaestro instead"; primary: !vjoy-fallback; clicked => { use-hidmaestro(); } }
+                        Btn { label: vjoy-fallback ? "Selected ✓" : "Use HIDMaestro instead"; primary: !vjoy-fallback; disabled: busy-kind == 14; clicked => { use-hidmaestro(); } }
                     }
                 }
                 if vjoy-fallback : Text { text: "HIDMaestro selected — RSH will ask for admin permission on start."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
@@ -403,23 +410,28 @@ export component SetupWizard inherits Rectangle {
                             if !reset-required : PairStepLine { num: 1; text: "Turn on the wheel and wait for the light to blink."; }
                             if !reset-required : PairStepLine { num: 2; text: "Hold the pair button on the wheel for 3 seconds."; }
                             if !reset-required : PairStepLine { num: 3; text: "Keep this window open. It finishes by itself."; }
-                            if !pairing-active && !paired && !reset-required : Btn { label: "Begin pairing"; primary: true; clicked => { begin-pairing(); } }
-                            if !pairing-active && !paired && reset-required : Btn { label: "Reset pairing"; primary: true; clicked => { reset-pairing(); } }
+                            if !pairing-active && !paired && !reset-required : Btn { label: "Begin pairing"; primary: true; disabled: busy-kind == 12; clicked => { begin-pairing(); } }
+                            if !pairing-active && !paired && reset-required : Btn { label: "Reset pairing"; primary: true; disabled: busy-kind == 6; clicked => { reset-pairing(); } }
                             // M4 (v2.0.2): Retry belongs AFTER a
                             // failure (pair-error set), never while
                             // pairing is in progress with no error —
                             // the old condition showed it exactly
                             // then and hid it when it was needed.
-                            if pair-error != "" && !paired : Btn { label: "Retry"; clicked => { retry-pairing(); } }
+                            if pair-error != "" && !paired : Btn { label: "Retry"; disabled: busy-kind == 12; clicked => { retry-pairing(); } }
                         }
                     }
                 }
                 Rectangle { height: 14px; }
                 // Live status bar.
+                // DS-25: the trail line can be long (attempt +
+                // address + daemon report), so the text wraps and
+                // the bar grows with it (DS-21 pattern: min-height
+                // + wrapped text) instead of clipping mid-sentence.
+                // A short status stays 40 px.
                 Rectangle {
                     horizontal-stretch: 1;
                     width: 584px;
-                    height: 40px;
+                    min-height: 40px;
                     border-radius: 10px;
                     border-width: 1px;
                     border-color: Theme.line;
@@ -427,6 +439,8 @@ export component SetupWizard inherits Rectangle {
                     HorizontalLayout {
                         padding-left: 14px;
                         padding-right: 14px;
+                        padding-top: 8px;
+                        padding-bottom: 8px;
                         spacing: 10px;
                         Rectangle {
                             width: 9px;
@@ -434,8 +448,7 @@ export component SetupWizard inherits Rectangle {
                             border-radius: 5px;
                             background: paired ? Theme.ok : Theme.warn;
                         }
-                        Text { vertical-alignment: center; text: paired ? "Paired — wheel connected." : !daemon-live ? "Disconnected — RSH isn't running." : pair-status; font-size: 12.5px; color: Theme.mute; }
-                        Rectangle { horizontal-stretch: 1; }
+                        Text { horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; text: paired ? (rejoining ? "Paired — rejoining with the new password…" : "Paired — wheel connected.") : !daemon-live ? "Disconnected — RSH isn't running." : pair-status; font-size: 12.5px; color: Theme.mute; }
                         Text { vertical-alignment: center; text: paired ? "" : pairing-active ? pair-seconds-left + " seconds left" : "Not pairing"; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
                     }
                 }
@@ -451,6 +464,10 @@ export component SetupWizard inherits Rectangle {
                         wrap: word-wrap;
                     }
                 }
+                // DS-57: Next is disabled until the wheel is paired —
+                // say so under the card (the Calibrate step does the
+                // same with its availability reason).
+                if !paired : Text { text: "Pair the wheel to continue."; font-size: 12.5px; color: Theme.faint; wrap: word-wrap; }
             }
 
             // ---- Step 3: Calibrate ----
@@ -473,7 +490,7 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "Centre"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: centre-done ? "Centre set" : "Hold the wheel straight, then set the centre"; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: centre-done ? "Set ✓" : "Set centre"; primary: !centre-done; disabled: !calibration-available; clicked => { calibrate-action("centre"); } }
+                        Btn { label: centre-done ? "Set ✓" : "Set centre"; primary: !centre-done; disabled: !calibration-available || busy-kind == 10; clicked => { calibrate-action("centre"); } }
                     }
                 }
                 Rectangle {
@@ -491,7 +508,7 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "Pedals"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: pedals-done ? "Pedals set" : "Press each pedal fully, then set"; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: pedals-done ? "Set ✓" : "Set pedals"; primary: !pedals-done; disabled: !calibration-available; clicked => { calibrate-action("pedals"); } }
+                        Btn { label: pedals-done ? "Set ✓" : "Set pedals"; primary: !pedals-done; disabled: !calibration-available || busy-kind == 10; clicked => { calibrate-action("pedals"); } }
                     }
                 }
                 if !calibration-available : Text { text: calibration-reason; font-size: 12.5px; color: Theme.faint; wrap: word-wrap; }
@@ -516,7 +533,7 @@ export component SetupWizard inherits Rectangle {
                         spacing: 12px;
                         Text { vertical-alignment: center; text: games-text; font-size: 13.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: "Find games"; primary: true; clicked => { find-games(); } }
+                        Btn { label: "Find games"; primary: true; disabled: busy-kind == 13; clicked => { find-games(); } }
                     }
                 }
                 Text { text: "RSH switches profile automatically when a game starts."; font-size: 12.5px; color: Theme.mute; }

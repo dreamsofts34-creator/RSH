@@ -76,7 +76,33 @@ export component TrayPopup inherits Window {
     no-frame: true;
     width: 340px;
     height: 440px;
-    background: #11161f;
+    background: c-bg;
+
+    // DS-22 (deep scan, U-04): the popup ignored the Light theme —
+    // every colour was a hardcoded dark literal. The daemon sets
+    // `light-theme` from the persisted UI theme (the same
+    // `<data_dir>/ui-theme` file the main window reads; see
+    // `tray_popup::popup_is_light`). Dark values are the original
+    // literals; Light values mirror `crates/rsh-ui/ui/tokens.slint`.
+    in property <bool> light-theme: false;
+    out property <color> c-bg: light-theme ? #ffffff : #11161f;
+    out property <color> c-panel: light-theme ? #ffffff : #161c27;
+    out property <color> c-panel2: light-theme ? #efedf8 : #1d2533;
+    out property <color> c-line: light-theme ? #d9d4ec : #262f40;
+    out property <color> c-text: light-theme ? #171b26 : #e9edf4;
+    out property <color> c-mute: light-theme ? #565c6e : #9aa5b8;
+    out property <color> c-faint: light-theme ? #6e7490 : #7c879b;
+    out property <color> c-accent-text: light-theme ? #2456d6 : #8eb0ff;
+    out property <color> c-ok: light-theme ? #157a4c : #3dd68c;
+    out property <color> c-bad: light-theme ? #c92a2a : #ff6b6b;
+    out property <color> c-track: light-theme ? #dcd8ec : #232c3c;
+    out property <color> c-switch-off: light-theme ? #c6c1dc : #232c3c;
+    out property <color> c-ring: light-theme ? #c9c4de : #2a3446;
+    // DS-23 (U-05) hover fills, mirroring the main UI (A5):
+    // one step off the resting surface (`Theme.hover-bg`), and the
+    // accent darkens in Light / lightens in Dark (`accent-hover`).
+    out property <color> c-hover: light-theme ? #e3e8f6 : #28324a;
+    out property <color> c-accent-hover: light-theme ? #2456d6 : #4a7dff;
 
     in property <string> conn-label: "Disconnected";
     in property <string> conn-sub: "Wi-Fi";
@@ -150,7 +176,7 @@ export component TrayPopup inherits Window {
                     spacing: 0px;
                     Text {
                         text: "RSH Wheel";
-                        color: #e9edf4;
+                        color: c-text;
                         font-size: 13px;
                         font-weight: 600;
                     }
@@ -160,21 +186,24 @@ export component TrayPopup inherits Window {
                             width: 7px;
                             height: 7px;
                             border-radius: 4px;
-                            background: connected ? #3dd68c : #ff6b6b;
+                            background: connected ? c-ok : c-bad;
                         }
                         Text {
                             text: conn-label + " · " + conn-sub;
-                            color: #9aa5b8;
+                            color: c-mute;
                             font-size: 12px;
                         }
                     }
                 }
                 Rectangle {
                     // Send-to-game switch (right-aligned).
+                    // DS-23 (U-05): hover feedback, mirroring the
+                    // main UI Switch (A5) — accent lightens/darkens
+                    // when on, the off track steps to the hover fill.
                     width: 40px;
                     height: 22px;
                     border-radius: 11px;
-                    background: send-to-game ? #2f6bff : #232c3c;
+                    background: send-to-game ? (sw-ta.has-hover ? c-accent-hover : #2f6bff) : (sw-ta.has-hover ? c-hover : c-switch-off);
                     Rectangle {
                         x: send-to-game ? 21px : 3px;
                         y: 3px;
@@ -183,7 +212,7 @@ export component TrayPopup inherits Window {
                         border-radius: 8px;
                         background: #ffffff;
                     }
-                    TouchArea {
+                    sw-ta := TouchArea {
                         width: parent.width;
                         height: parent.height;
                         clicked => { root.toggled-send(); }
@@ -193,9 +222,9 @@ export component TrayPopup inherits Window {
 
             // Live wheel + 3 bars.
             Rectangle {
-                background: #161c27;
+                background: c-panel;
                 border-width: 1px;
-                border-color: #262f40;
+                border-color: c-line;
                 border-radius: 12px;
                 height: 88px;
                 HorizontalLayout {
@@ -206,7 +235,7 @@ export component TrayPopup inherits Window {
                         height: 64px;
                         border-radius: 32px;
                         border-width: 6px;
-                        border-color: #2a3446;
+                        border-color: c-ring;
                         Image {
                             // Steering marker, rotated by the live angle.
                             // (Rectangle has no rotation in Slint 1.18 —
@@ -220,7 +249,7 @@ export component TrayPopup inherits Window {
                         }
                         Text {
                             text: steer-text;
-                            color: #e9edf4;
+                            color: c-text;
                             font-size: 11px;
                             font-weight: 600;
                             horizontal-alignment: center;
@@ -232,42 +261,42 @@ export component TrayPopup inherits Window {
                         alignment: center;
                         HorizontalLayout {
                             spacing: 8px;
-                            Text { text: "Throttle"; color: #9aa5b8; font-size: 11px; width: 46px; }
+                            Text { text: "Throttle"; color: c-mute; font-size: 11px; width: 46px; }
                             Rectangle {
                                 height: 6px;
-                                background: #232c3c;
+                                background: c-track;
                                 border-radius: 3px;
                                 Rectangle {
                                     width: parent.width * throttle / 100;
                                     height: 6px;
-                                    background: #3dd68c;
+                                    background: c-ok;
                                     border-radius: 3px;
                                 }
                             }
-                            Text { text: throttle-text; color: #e9edf4; font-size: 11px; width: 30px; horizontal-alignment: right; }
+                            Text { text: throttle-text; color: c-text; font-size: 11px; width: 30px; horizontal-alignment: right; }
                         }
                         HorizontalLayout {
                             spacing: 8px;
-                            Text { text: "Brake"; color: #9aa5b8; font-size: 11px; width: 46px; }
+                            Text { text: "Brake"; color: c-mute; font-size: 11px; width: 46px; }
                             Rectangle {
                                 height: 6px;
-                                background: #232c3c;
+                                background: c-track;
                                 border-radius: 3px;
                                 Rectangle {
                                     width: parent.width * brake / 100;
                                     height: 6px;
-                                    background: #ff6b6b;
+                                    background: c-bad;
                                     border-radius: 3px;
                                 }
                             }
-                            Text { text: brake-text; color: #e9edf4; font-size: 11px; width: 30px; horizontal-alignment: right; }
+                            Text { text: brake-text; color: c-text; font-size: 11px; width: 30px; horizontal-alignment: right; }
                         }
                         HorizontalLayout {
                             spacing: 8px;
-                            Text { text: "Clutch"; color: #9aa5b8; font-size: 11px; width: 46px; }
+                            Text { text: "Clutch"; color: c-mute; font-size: 11px; width: 46px; }
                             Rectangle {
                                 height: 6px;
-                                background: #232c3c;
+                                background: c-track;
                                 border-radius: 3px;
                                 Rectangle {
                                     width: parent.width * clutch / 100;
@@ -276,33 +305,35 @@ export component TrayPopup inherits Window {
                                     border-radius: 3px;
                                 }
                             }
-                            Text { text: clutch-text; color: #e9edf4; font-size: 11px; width: 30px; horizontal-alignment: right; }
+                            Text { text: clutch-text; color: c-text; font-size: 11px; width: 30px; horizontal-alignment: right; }
                         }
                     }
                 }
             }
 
             // Profile selector (click cycles to the next profile).
+            // DS-23: hover fill — this row is clickable, so it gets
+            // the same hover treatment as the main UI tiles (A5).
             Rectangle {
-                background: #161c27;
+                background: prof-ta.has-hover ? c-hover : c-panel;
                 border-width: 1px;
-                border-color: #262f40;
+                border-color: c-line;
                 border-radius: 9px;
                 height: 34px;
                 HorizontalLayout {
                     padding-left: 10px;
                     padding-right: 10px;
-                    Text { text: profile-name; color: #e9edf4; font-size: 12px; font-weight: 600; vertical-alignment: center; }
-                    Text { text: profile-sub; color: #9aa5b8; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
+                    Text { text: profile-name; color: c-text; font-size: 12px; font-weight: 600; vertical-alignment: center; }
+                    Text { text: profile-sub; color: c-mute; font-size: 12px; horizontal-alignment: right; vertical-alignment: center; }
                 }
-                TouchArea {
+                prof-ta := TouchArea {
                     width: parent.width;
                     height: parent.height;
                     clicked => { root.cycle-profile(); }
                 }
             }
 
-            Text { text: "GAMES"; color: #7c879b; font-size: 11px; font-weight: 600; letter-spacing: 1px; }
+            Text { text: "GAMES"; color: c-faint; font-size: 11px; font-weight: 600; letter-spacing: 1px; }
             HorizontalLayout {
                 spacing: 10px;
                 height: 38px;
@@ -310,23 +341,24 @@ export component TrayPopup inherits Window {
                     width: 24px;
                     height: 24px;
                     border-radius: 6px;
-                    background: #1d2533;
-                    Text { text: game0-initials; color: #8eb0ff; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    background: c-panel2;
+                    Text { text: game0-initials; color: c-accent-text; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                 }
-                Text { text: game0-name; color: #e9edf4; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+                Text { text: game0-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
                 if game0-can-launch: Rectangle {
                     width: 60px;
                     height: 24px;
                     border-radius: 6px;
-                    background: #2f6bff;
+                    // DS-23: hover darkens the accent, mirroring Btn (A5).
+                    background: launch0-ta.has-hover ? c-accent-hover : #2f6bff;
                     Text { text: "Launch"; color: #ffffff; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
-                    TouchArea {
+                    launch0-ta := TouchArea {
                         width: parent.width;
                         height: parent.height;
                         clicked => { root.launch-game(game0-id); }
                     }
                 }
-                if !game0-can-launch: Text { text: game0-state; color: #9aa5b8; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                if !game0-can-launch: Text { text: game0-state; color: c-mute; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
             }
             HorizontalLayout {
                 spacing: 10px;
@@ -335,23 +367,24 @@ export component TrayPopup inherits Window {
                     width: 24px;
                     height: 24px;
                     border-radius: 6px;
-                    background: #1d2533;
-                    Text { text: game1-initials; color: #8eb0ff; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    background: c-panel2;
+                    Text { text: game1-initials; color: c-accent-text; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                 }
-                Text { text: game1-name; color: #e9edf4; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+                Text { text: game1-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
                 if game1-can-launch: Rectangle {
                     width: 60px;
                     height: 24px;
                     border-radius: 6px;
-                    background: #2f6bff;
+                    // DS-23: hover darkens the accent, mirroring Btn (A5).
+                    background: launch1-ta.has-hover ? c-accent-hover : #2f6bff;
                     Text { text: "Launch"; color: #ffffff; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
-                    TouchArea {
+                    launch1-ta := TouchArea {
                         width: parent.width;
                         height: parent.height;
                         clicked => { root.launch-game(game1-id); }
                     }
                 }
-                if !game1-can-launch: Text { text: game1-state; color: #9aa5b8; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                if !game1-can-launch: Text { text: game1-state; color: c-mute; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
             }
             HorizontalLayout {
                 spacing: 10px;
@@ -360,40 +393,43 @@ export component TrayPopup inherits Window {
                     width: 24px;
                     height: 24px;
                     border-radius: 6px;
-                    background: #1d2533;
-                    Text { text: game2-initials; color: #8eb0ff; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    background: c-panel2;
+                    Text { text: game2-initials; color: c-accent-text; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                 }
-                Text { text: game2-name; color: #e9edf4; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+                Text { text: game2-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
                 if game2-can-launch: Rectangle {
                     width: 60px;
                     height: 24px;
                     border-radius: 6px;
-                    background: #2f6bff;
+                    // DS-23: hover darkens the accent, mirroring Btn (A5).
+                    background: launch2-ta.has-hover ? c-accent-hover : #2f6bff;
                     Text { text: "Launch"; color: #ffffff; font-size: 11px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; }
-                    TouchArea {
+                    launch2-ta := TouchArea {
                         width: parent.width;
                         height: parent.height;
                         clicked => { root.launch-game(game2-id); }
                     }
                 }
-                if !game2-can-launch: Text { text: game2-state; color: #9aa5b8; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
+                if !game2-can-launch: Text { text: game2-state; color: c-mute; font-size: 11px; horizontal-alignment: right; vertical-alignment: center; }
             }
 
             // Footer.
+            // DS-23: the text links change colour on hover, mirroring
+            // the main UI text links (A5).
             Rectangle {
                 height: 1px;
-                background: #262f40;
+                background: c-line;
             }
             HorizontalLayout {
                 Rectangle {
                     Text {
                         text: "Open RSH";
-                        color: #8eb0ff;
+                        color: open-ta.has-hover ? c-accent-hover : c-accent-text;
                         font-size: 12px;
                         font-weight: 600;
                         vertical-alignment: center;
                     }
-                    TouchArea {
+                    open-ta := TouchArea {
                         width: parent.width;
                         height: parent.height;
                         clicked => { root.open-main(); }
@@ -402,13 +438,13 @@ export component TrayPopup inherits Window {
                 Rectangle {
                     Text {
                         text: "Restart wheel";
-                        color: #9aa5b8;
+                        color: restart-ta.has-hover ? c-text : c-mute;
                         font-size: 12px;
                         font-weight: 500;
                         horizontal-alignment: right;
                         vertical-alignment: center;
                     }
-                    TouchArea {
+                    restart-ta := TouchArea {
                         width: parent.width;
                         height: parent.height;
                         clicked => { root.restart-wheel(); }

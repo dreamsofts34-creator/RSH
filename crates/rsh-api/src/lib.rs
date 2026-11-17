@@ -22,7 +22,7 @@ pub mod tuning;
 pub use api::{
     ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionInfo, DiagStats,
     FirmwareCheck, FirmwareUpdateStatus, GameSummary, PairingInfo, PollState, ProfileSummary,
-    RawMv, SnapshotInfo, VjoyStatus, app_version,
+    RawMv, SlowPollState, SnapshotInfo, VjoyStatus, app_version,
 };
 pub use connection::{
     BACKOFF_BASE, BACKOFF_MAX, BAD_TAG_RETRY_DELAY, ConnEvent, ConnectionManager, ConnectionState,

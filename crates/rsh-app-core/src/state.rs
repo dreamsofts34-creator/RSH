@@ -201,7 +201,7 @@ use rsh_security::keystore::{KeyStore, KeystoreError};
 use rsh_transport::ControlTransport;
 use rsh_transport::config::{ConfigState, ConfigTransaction, ConfigTxnSnapshot};
 use rsh_transport::discovery::{DEFAULT_BOARD_IP, Discovery};
-use rsh_transport::port_conflict::diagnose_udp_port_holder;
+use rsh_transport::port_conflict::{PortHolder, diagnose_udp_port_holder};
 use rsh_transport::serial::{SerialConfig, SerialTransport, detect_board_port};
 use rsh_transport::session::{BoardSession, KeyStoreLike, SessionError};
 use rsh_transport::udp::{UdpBindError, UdpConfig, UdpTransport};
@@ -740,7 +740,8 @@ pub struct AppStateCore {
     /// Human-readable note on the most recent backend send.
     last_send_note: Mutex<String>,
     /// Latest snapshot (built by `ingest_frame`, sampled by the emitter).
-    latest_snapshot: Mutex<EngineSnapshot>,
+    /// `Arc` (DS-30): readers clone the pointer, not the struct.
+    latest_snapshot: Mutex<Arc<EngineSnapshot>>,
     /// Monotonic snapshot sequence number.
     seq: Mutex<u64>,
     /// Transport connection state, as last reported.
@@ -751,10 +752,23 @@ pub struct AppStateCore {
     /// `transport_state()` can report the kind and address even while
     /// the engine is idle.
     transport_choice: Mutex<(TransportKind, String)>,
+    /// Cached USB board port (DS-27): `detect_board_port()` enumerates
+    /// ports and probes each one (up to 500 ms per port), so it must
+    /// never run on the 20 Hz poll path. The first `transport_state()`
+    /// call fills this cache; later calls reuse it for up to
+    /// `BOARD_PORT_CACHE_TTL`, then re-detect. A disconnect or a
+    /// transport change clears it so the next poll re-detects.
+    cached_serial_port: Mutex<Option<(Option<String>, Instant)>>,
     /// Queued button-press edges, drained by the emitter.
     button_events: Mutex<VecDeque<ButtonPressEvent>>,
     /// Profile + settings store.
     store: Mutex<ProfileStore>,
+    /// Cached app settings (DS-30): `AppSettings` carries several
+    /// `String`s + a `HashMap`, so cloning the struct on every poll
+    /// is measurable on the 20 Hz path. Readers clone this `Arc`
+    /// instead (see `settings_arc`); writers refresh it after every
+    /// write (see `refresh_settings_cache`) — copy-on-write.
+    settings_cache: Mutex<Arc<AppSettings>>,
     /// Game launcher (one game at a time, tracked pid only).
     launcher: Mutex<GameLauncher<SystemSpawner>>,
     /// Validated per-module tunings for this session (see
@@ -1029,6 +1043,9 @@ impl AppStateCore {
         let selected_backend =
             BackendKind::parse(&store.settings().output_backend).unwrap_or(BackendKind::DEFAULT);
         let esp_ip = store.settings().esp_ip.clone();
+        // DS-30: the settings cache starts from the post-migration
+        // store (the migration above may have rewritten the backend).
+        let settings_cache = Arc::new(store.settings().clone());
         // The binding store lives beside the profile store; a
         // corrupt bindings file loads as empty with warnings (never
         // fails the state open — see `rsh_profiles::bindings`).
@@ -1047,12 +1064,14 @@ impl AppStateCore {
             last_buttons: Mutex::new(0),
             last_send_ok: Mutex::new(None),
             last_send_note: Mutex::new("not attempted yet".to_string()),
-            latest_snapshot: Mutex::new(EngineSnapshot::default()),
+            latest_snapshot: Mutex::new(Arc::new(EngineSnapshot::default())),
             seq: Mutex::new(0),
             connection: Mutex::new(ConnectionState::Disconnected),
             transport_choice: Mutex::new((TransportKind::Udp, esp_ip)),
+            cached_serial_port: Mutex::new(None),
             button_events: Mutex::new(VecDeque::new()),
             store: Mutex::new(store),
+            settings_cache: Mutex::new(settings_cache),
             launcher: Mutex::new(GameLauncher::new(SystemSpawner)),
             tunings: Mutex::new(BTreeMap::new()),
             draft: Mutex::new(None),
@@ -1308,6 +1327,18 @@ impl AppStateCore {
     #[must_use]
     pub fn pairing_log_lines(&self) -> Vec<String> {
         lock(&self.pairing_log).iter().cloned().collect()
+    }
+
+    /// Drains the pairing/connection log lines (DS-32): returns all
+    /// lines queued since the last drain and clears the buffer — the
+    /// `take_*` pattern `take_manager_log_lines()` already uses in
+    /// `DaemonApi`. The manager loop drains with this instead of
+    /// re-cloning the whole buffer and slicing by index every
+    /// 250 ms. `pairing_log_lines()` stays for tests and one-shot
+    /// readers.
+    #[must_use]
+    pub fn take_pairing_log_lines(&self) -> Vec<String> {
+        lock(&self.pairing_log).drain(..).collect()
     }
 
     /// Push one redacted, timestamped pairing log line (Phase 0
@@ -2536,8 +2567,47 @@ impl AppStateCore {
     /// shape is always complete; `state` is `disconnected` there. A
     /// failed engine reports `error` with the failure reason verbatim
     /// instead of a silent `disconnected`.
+    /// USB board-port cache TTL (DS-27). A plugged/unplugged board is
+    /// picked up within this bound; the poll path never re-detects
+    /// more often than this.
+    const BOARD_PORT_CACHE_TTL: Duration = Duration::from_secs(5);
+
+    /// Cached USB board port (DS-27): the first call detects (port
+    /// enumeration + up to 500 ms HELO probe per port) and caches the
+    /// result; later calls return the cached value until the TTL
+    /// lapses. Detection runs without holding the cache lock.
+    #[must_use]
+    pub fn cached_board_port(&self) -> Option<String> {
+        if let Some((port, at)) = lock(&self.cached_serial_port).clone()
+            && at.elapsed() < Self::BOARD_PORT_CACHE_TTL
+        {
+            return port;
+        }
+        let port = detect_board_port();
+        *lock(&self.cached_serial_port) = Some((port.clone(), Instant::now()));
+        port
+    }
+
+    /// Clears the cached board port so the next poll re-detects
+    /// (DS-27): call after a disconnect or a transport change.
+    pub fn rescan_board_port(&self) {
+        *lock(&self.cached_serial_port) = None;
+    }
+
+    /// Current transport state (kind + address + connection), for
+    /// the API and the UI. See [`Self::transport_state_with_settings`]
+    /// when the settings are already in hand.
     #[must_use]
     pub fn transport_state(&self) -> TransportState {
+        self.transport_state_with_settings(&self.settings_arc())
+    }
+
+    /// `transport_state()` with the settings already in hand
+    /// (DS-30): the UDP arm needs only `esp_ip`, so a caller that
+    /// already holds the settings `Arc` (e.g. `poll()`) avoids a
+    /// second store lock + struct clone.
+    #[must_use]
+    pub fn transport_state_with_settings(&self, settings: &AppSettings) -> TransportState {
         let status = self.engine_status();
         let live = match status {
             EngineTaskStatus::Running { transport } => transport,
@@ -2545,8 +2615,8 @@ impl AppStateCore {
         };
         let kind = live.unwrap_or_else(|| self.transport_request().0);
         let address = match kind {
-            TransportKind::Udp => self.settings().esp_ip,
-            TransportKind::Serial => detect_board_port().unwrap_or_default(),
+            TransportKind::Udp => settings.esp_ip.clone(),
+            TransportKind::Serial => self.cached_board_port().unwrap_or_default(),
         };
         let mut state = *lock(&self.connection);
         // C-02 defence in depth: "Connected" is only ever reported
@@ -2590,6 +2660,13 @@ impl AppStateCore {
     /// the default all-zero snapshot until the first engine tick).
     #[must_use]
     pub fn snapshot(&self) -> EngineSnapshot {
+        lock(&self.latest_snapshot).as_ref().clone()
+    }
+
+    /// The latest snapshot as a shared pointer (DS-30): clones the
+    /// `Arc`, not the struct — the 20 Hz `poll()` path takes this.
+    #[must_use]
+    pub fn snapshot_arc(&self) -> Arc<EngineSnapshot> {
         lock(&self.latest_snapshot).clone()
     }
 
@@ -2635,7 +2712,7 @@ impl AppStateCore {
         // output is stored: `last_output` — and the backend send,
         // via `ingest_engine_output` — carry the bound actions.
         *lock(&self.last_output) = self.apply_bindings(&input.output);
-        *lock(&self.latest_snapshot) = snapshot.clone();
+        *lock(&self.latest_snapshot) = Arc::new(snapshot.clone());
         snapshot
     }
 
@@ -3009,6 +3086,9 @@ impl AppStateCore {
             store.set_settings(settings);
             store.save().map_err(|error| error.to_string())?;
         }
+        // DS-30: the write above changed the store — refresh the
+        // `Arc` cache so `settings_arc()` readers see it at once.
+        self.refresh_settings_cache();
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
         let factories = real_backend_factories(vjoy_device_id);
         self.apply_backend_switch(requested, &factories)
@@ -3395,11 +3475,22 @@ impl AppStateCore {
             install.error = None;
         }
         let state = Arc::clone(self);
-        std::thread::Builder::new()
+        // DS-40: a failed thread spawn used to leave `installing`
+        // latched `true` forever (the flag was set before the
+        // spawn, and only the thread itself cleared it) — every
+        // later attempt then answered "already in progress".
+        // Reset the flag on the spawn-failure path.
+        match std::thread::Builder::new()
             .name("rsh-vjoy-install".to_string())
             .spawn(move || run_vjoy_install(&state))
-            .map_err(|error| format!("could not start the vJoy install thread: {error}"))?;
-        Ok("vJoy install started".to_string())
+        {
+            Ok(_) => Ok("vJoy install started".to_string()),
+            Err(error) => {
+                let mut install = lock(&self.vjoy_install);
+                install.installing = false;
+                Err(format!("could not start the vJoy install thread: {error}"))
+            }
+        }
     }
 
     /// Live engine / link diagnostics (v2.0.1 hotfix BACKEND-2): the
@@ -3410,7 +3501,7 @@ impl AppStateCore {
     #[must_use]
     pub fn diag_stats(&self) -> rsh_api::DiagStats {
         let stats = self.engine_stats();
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot_arc();
         rsh_api::DiagStats {
             loop_hz: stats.loop_hz,
             loss_pct: stats.loss_pct,
@@ -3419,6 +3510,10 @@ impl AppStateCore {
             e2e_ms: stats.e2e_ms,
             seq_gap: snapshot.seq_gap,
             tx_fail: snapshot.tx_fail,
+            // DS-82: the core does not know the IPC latency — only
+            // the daemon's `DaemonApi::diag_stats` fills these in.
+            ipc_p50_ms: None,
+            ipc_p99_ms: None,
         }
     }
 
@@ -3814,6 +3909,40 @@ impl AppStateCore {
     /// Returns a message when the supervisor thread cannot be spawned
     /// or does not report ready within 5 s.
     pub fn start_engine(self: &Arc<Self>) -> Result<(), String> {
+        // DS-16: a stored handle is not proof the supervisor is
+        // alive — a thread that panicked or exited early (e.g. the
+        // 5 s ready-timeout path, which records `Failed` but keeps
+        // the handle) used to make every later `start_engine` a
+        // silent no-op while the engine was dead, and
+        // `connect_transport` then failed only with "engine command
+        // channel is gone". A finished handle is treated as absent:
+        // reap it, drop the stale channels, and spawn fresh below.
+        let dead_handle = {
+            let mut thread = lock(&self.engine_thread);
+            if thread
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                thread.take()
+            } else {
+                None
+            }
+        };
+        if let Some(handle) = dead_handle {
+            // Finished, so this joins immediately; a panicked
+            // supervisor reports its panic here instead of leaving
+            // the status as a stale `Running`.
+            if handle.join().is_err() {
+                self.set_engine_status(
+                    EngineTaskStatus::Failed {
+                        reason: "engine supervisor thread panicked".to_string(),
+                    },
+                    "engine supervisor thread panicked — restarting it".to_string(),
+                );
+            }
+            *lock(&self.engine_cmd_tx) = None;
+            *lock(&self.engine_report_rx) = None;
+        }
         if lock(&self.engine_thread).is_some() {
             return Ok(());
         }
@@ -3866,7 +3995,12 @@ impl AppStateCore {
     /// only the requested kind/address are (see `transport_state`,
     /// which merges this with the live session-gate state).
     pub fn set_transport_request(&self, kind: TransportKind, address: String) {
+        let changed = lock(&self.transport_choice).0 != kind;
         *lock(&self.transport_choice) = (kind, address);
+        if changed {
+            // DS-27: a transport change invalidates the cached port.
+            self.rescan_board_port();
+        }
     }
 
     /// What the UI last asked for (kind + typed address).
@@ -3936,6 +4070,8 @@ impl AppStateCore {
         tx.try_send(EngineCommand::Disconnect)
             .map_err(|error| format!("could not queue transport disconnect: {error}"))?;
         self.set_connection(ConnectionState::Disconnected);
+        // DS-27: a disconnect invalidates the cached board port.
+        self.rescan_board_port();
         Ok(())
     }
 
@@ -4033,8 +4169,11 @@ impl AppStateCore {
     }
 
     /// Records an engine note in the status detail without changing
-    /// the status itself (transport retries, disconnects).
-    fn note_engine_detail(&self, detail: String) {
+    /// the status itself (transport retries, disconnects). Public
+    /// so the daemon API layer can surface a failure it observes
+    /// (DS-41: a swallowed `set_output_enabled` failure) in the
+    /// same detail the diagnostics already show.
+    pub fn note_engine_detail(&self, detail: String) {
         *lock(&self.engine_status_detail) = detail;
     }
 
@@ -4900,6 +5039,21 @@ impl AppStateCore {
         lock(&self.store).settings().clone()
     }
 
+    /// Current app settings as a shared pointer (DS-30): clones the
+    /// `Arc`, not the struct — the 20 Hz `poll()` path takes this.
+    #[must_use]
+    pub fn settings_arc(&self) -> Arc<AppSettings> {
+        lock(&self.settings_cache).clone()
+    }
+
+    /// Re-reads the store's settings into the `Arc` cache (DS-30):
+    /// call at the end of every settings write so readers never see
+    /// a stale copy. One struct clone per write, never per read.
+    fn refresh_settings_cache(&self) {
+        let fresh = lock(&self.store).settings().clone();
+        *lock(&self.settings_cache) = Arc::new(fresh);
+    }
+
     /// Replaces the app settings and persists them. When the settings
     /// flip the output flag, the change is actuated through the same
     /// path as the Output toggle (disable → neutral send). The
@@ -4923,6 +5077,9 @@ impl AppStateCore {
             let _ = self.set_output_enabled(apply_output);
         }
         self.sync_auto_switch_from_settings(&sanitized);
+        // DS-30: the write above changed the store — refresh the
+        // `Arc` cache so `settings_arc()` readers see it at once.
+        self.refresh_settings_cache();
         Ok(sanitized)
     }
 
@@ -4952,6 +5109,8 @@ impl AppStateCore {
             let _ = self.set_output_enabled(merged.output_enabled);
         }
         self.sync_auto_switch_from_settings(&merged);
+        // DS-30: refresh the `Arc` cache (see `set_settings`).
+        self.refresh_settings_cache();
         Ok(merged)
     }
 
@@ -5958,10 +6117,54 @@ pub fn migrate_persisted_backend_default(store: &mut ProfileStore) -> Option<Str
 /// manifest triggers the one UAC prompt; the download itself runs
 /// without a console window (`CREATE_NO_WINDOW`).
 fn run_vjoy_install(state: &Arc<AppStateCore>) {
+    // DS-40: the `installing` flag must clear even if this thread
+    // panics — the old code only cleared it on the normal return
+    // path, so a panicked install latched "already in progress"
+    // forever. The guard resets on drop (normal return, error
+    // return, or unwind); the explicit reset below stays as the
+    // documented normal-path write.
+    struct ResetInstalling<'a>(&'a Arc<AppStateCore>);
+    impl Drop for ResetInstalling<'_> {
+        fn drop(&mut self) {
+            let mut install = lock(&self.0.vjoy_install);
+            install.installing = false;
+        }
+    }
+    let _guard = ResetInstalling(state);
     let result = run_vjoy_install_inner();
     let mut install = lock(&state.vjoy_install);
     install.installing = false;
     install.error = result.err();
+}
+
+/// Wait for a spawned child with a hard timeout (DS-40): poll
+/// `try_wait()` every 100 ms; on timeout kill the child and report.
+/// The vJoy installer used to be awaited with a blocking `.status()`
+/// that waited forever. Platform-free (std only) so the Linux suite
+/// can cover the timeout itself with `/bin/sleep`.
+fn wait_child_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+    what: &'static str,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{what} timed out after {} s — killed",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("could not wait for {what}: {error}")),
+        }
+    }
 }
 
 /// The fallible half of [`run_vjoy_install`]: `Ok(())` only when the
@@ -5975,10 +6178,17 @@ fn run_vjoy_install_inner() -> Result<(), String> {
     // Windows 10+ ships curl.exe — no new HTTP dependency. The
     // download runs windowless; `--fail` makes HTTP errors fail the
     // command instead of writing an error page to the file.
+    // DS-40: `--max-time 120 --connect-timeout 15` — the download
+    // used to have no timeout at all, so a stalled network left
+    // the install thread (and the `installing` flag) stuck forever.
     let mut download = Command::new("curl.exe");
     download.args([
         "-L",
         "--fail",
+        "--max-time",
+        "120",
+        "--connect-timeout",
+        "15",
         "-o",
         &installer.to_string_lossy(),
         VJOY_INSTALLER_URL,
@@ -6019,10 +6229,23 @@ fn run_vjoy_install_inner() -> Result<(), String> {
     }
     // Silent install. The exe's manifest elevates (one UAC prompt —
     // expected); `/NORESTART` never reboots unattended.
-    let status = Command::new(&installer)
+    // DS-40: the installer used to be awaited with a blocking
+    // `.status()` (forever, with inherited stdio) — now it is
+    // spawned detached with nulled stdio (the same bug class as the
+    // NSIS `Exec` hang and the daemon/UI spawns) and bounded to
+    // 120 s, killed on timeout.
+    let mut installer_cmd = Command::new(&installer);
+    installer_cmd
         .args(VJOY_INSTALLER_ARGS)
-        .status()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    installer_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let child = installer_cmd
+        .spawn()
         .map_err(|error| format!("could not run the vJoy installer: {error}"))?;
+    let status = wait_child_timeout(child, Duration::from_secs(120), "vJoy installer")?;
     if !status.success() {
         return Err(format!(
             "vJoy installer exited with code {}",
@@ -6679,7 +6902,22 @@ where
 /// runtime — Tauri sync commands satisfy this; a call from inside a
 /// runtime panics (a runtime cannot be built inside one), so tests
 /// must be plain `#[test]`, never `#[tokio::test]`.
+///
+/// DS-02 (P0 audit): the only in-runtime caller was the daemon
+/// manager loop's tray "Restart wheel" path (now `spawn_blocking`,
+/// see `rsh-daemon/src/main.rs`); every other caller reaches here
+/// via IPC dispatch on `spawn_blocking` (safe — no runtime context)
+/// or from a plain thread / test. As a backstop this function now
+/// FAILS with an error instead of panicking when it is called from
+/// inside a runtime: a future misuse degrades one command instead
+/// of killing its caller task.
 fn block_on_control<R>(future: impl Future<Output = Result<R, String>>) -> Result<R, String> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(
+            "control command called from inside a tokio runtime — run it on spawn_blocking instead (DS-02)"
+                .to_string(),
+        );
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -7126,6 +7364,43 @@ fn spawn_forwarder(
                                 UdpBindError::NoInterface => rsh_api::BindErrorKind::NoInterface,
                                 UdpBindError::Other(_) => rsh_api::BindErrorKind::Other,
                             };
+                            // DS-06: diagnose the holder BEFORE
+                            // recording anything. An `AddrInUse`
+                            // whose holder is our own process (or
+                            // no holder at all — the port reads free)
+                            // is our own rebind race, not another
+                            // app: the previous transport's reader
+                            // thread still holds the socket for
+                            // ~100 ms after the drop, so the retry's
+                            // `bind(4211)` collides with ourselves
+                            // (measured 3/3, no other process
+                            // holding the port). It must NOT be
+                            // recorded as a foreign
+                            // `BindFailed(AddrInUse)` — that latches
+                            // the F21 terminal stop with a wrong
+                            // "another app" diagnosis ~5 s after
+                            // launch on any board-less machine.
+                            // It returns `None` with NO typed
+                            // `BindFailed` recorded, so the forwarder
+                            // retries with the normal M-11 backoff,
+                            // by which time the socket is free. Only
+                            // a foreign pid takes the F21 path below.
+                            let holder = if is_addr_in_use {
+                                diagnose_udp_port_holder(config.local_port)
+                            } else {
+                                None
+                            };
+                            if is_addr_in_use && !udp_addr_in_use_is_foreign(holder.as_ref()) {
+                                state_for_bind.note_engine_transport_error(
+                                    TransportKind::Udp,
+                                    "UDP bind failed: AddrInUse held by our own just-closed socket (or no holder found) — retrying with backoff",
+                                );
+                                state_for_bind.note_engine_detail(
+                                    "transport udp port conflict (AddrInUse, UDP 4211) was our own rebind race — retrying, not a foreign holder"
+                                        .to_string(),
+                                );
+                                return None;
+                            }
                             // F21: name the holder. A port conflict
                             // is a fact about another process, not a
                             // transient error — the diagnosis goes
@@ -7133,27 +7408,23 @@ fn spawn_forwarder(
                             // the engine status say WHO holds UDP
                             // 4211 (usually the still-running legacy
                             // Tauri app, `RSH.exe`).
-                            let holder_detail = if is_addr_in_use {
-                                diagnose_udp_port_holder(config.local_port)
-                                    .map(|holder| {
-                                        if holder.is_legacy_rsh_app() {
-                                            format!(
-                                                " — port held by the old RSH app: {}",
-                                                holder.describe()
-                                            )
-                                        } else if holder.is_current_rsh() {
-                                            format!(
-                                                " — port held by another RSH process: {}",
-                                                holder.describe()
-                                            )
-                                        } else {
-                                            format!(" — port held by {}", holder.describe())
-                                        }
-                                    })
-                                    .unwrap_or_default()
-                            } else {
-                                String::new()
-                            };
+                            let holder_detail = holder
+                                .map(|holder| {
+                                    if holder.is_legacy_rsh_app() {
+                                        format!(
+                                            " — port held by the old RSH app: {}",
+                                            holder.describe()
+                                        )
+                                    } else if holder.is_current_rsh() {
+                                        format!(
+                                            " — port held by another RSH process: {}",
+                                            holder.describe()
+                                        )
+                                    } else {
+                                        format!(" — port held by {}", holder.describe())
+                                    }
+                                })
+                                .unwrap_or_default();
                             state_for_bind.note_engine_transport_error(
                                 TransportKind::Udp,
                                 &format!(
@@ -7191,6 +7462,21 @@ fn spawn_forwarder(
             }
         }
     })
+}
+
+/// DS-06: whether a diagnosed UDP 4211 holder makes `AddrInUse`
+/// a foreign conflict (terminal, F21) or our own rebind race
+/// (transient, retry with the normal M-11 backoff). A holder that
+/// is our own process (`pid == ours`) — or no holder at all (the
+/// port reads free, i.e. our just-dropped socket was the holder
+/// and its reader thread had not released the fd yet) — is our
+/// own race, not another app. Only a foreign pid is terminal.
+/// Pure: unit-tested without binding anything.
+fn udp_addr_in_use_is_foreign(holder: Option<&PortHolder>) -> bool {
+    match holder {
+        Some(holder) => holder.pid != std::process::id(),
+        None => false,
+    }
 }
 
 /// Builds the UDP config from settings: the board IP is the
@@ -7455,10 +7741,18 @@ async fn forward_with_retry_with_policy<T, F>(
                 )
             {
                 state.set_connection(ConnectionState::Disconnected);
-                state.set_engine_status(
-                    EngineTaskStatus::Running { transport: None },
-                    "wheel port (UDP 4211) is held by another app — close the other RSH, then reconnect (no automatic retry)".to_string(),
-                );
+                // DS-06 (d): the user-facing text carries the
+                // diagnosed holder — the recorded reason already
+                // names it ("UDP bind failed: AddrInUse — port
+                // held by RSH.exe (pid …)") — instead of only the
+                // generic "another app" line.
+                let recorded = state.session_last_error().unwrap_or_default();
+                let status = if recorded.is_empty() {
+                    "wheel port (UDP 4211) is held by another app — close the other RSH, then reconnect (no automatic retry)".to_string()
+                } else {
+                    format!("{recorded} — close the other app, then reconnect (no automatic retry)")
+                };
+                state.set_engine_status(EngineTaskStatus::Running { transport: None }, status);
                 state.note_engine_detail(
                     "transport udp port conflict (AddrInUse, UDP 4211) — forwarder stopped, no bind retry; user reconnect required after closing the holder".to_string(),
                 );
@@ -7655,6 +7949,15 @@ async fn forward_with_retry_with_policy<T, F>(
         state.close_session_gate();
         state.clear_session_records();
         if deadline_fired {
+            // DS-06 (a): teardown-before-rebind — the old
+            // transport (and its socket, still held by its reader
+            // thread for ~100 ms after the flag is set) is dropped
+            // HERE, before the loop-top factory binds again, so
+            // the rebind cannot collide with it. The drop was
+            // previously implicit at the end of the iteration; it
+            // is explicit now so the ordering is visible and cannot
+            // regress silently.
+            drop(transport);
             continue;
         }
         if !forwarder_retry_after_failure(
@@ -8144,6 +8447,34 @@ mod tests {
         assert!(error.contains("Windows-only"), "{error}");
         // The refusal leaves no install running.
         assert!(!state.vjoy_status().installing);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_child_timeout_kills_a_hung_child() {
+        // DS-40: the installer wait is platform-free (std only),
+        // so it is covered here with /bin/sleep instead of the
+        // real installer.
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let start = Instant::now();
+        let error = wait_child_timeout(child, Duration::from_millis(200), "vJoy installer")
+            .expect_err("a 30 s sleep must time out at 200 ms");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "timeout must bound the wait: {:?}",
+            start.elapsed()
+        );
+        assert!(error.contains("timed out"), "{error}");
+        // And a fast child still succeeds with its status.
+        let child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn true");
+        let status = wait_child_timeout(child, Duration::from_secs(5), "vJoy installer")
+            .expect("true must succeed");
+        assert!(status.success());
     }
 
     #[test]
@@ -9632,6 +9963,38 @@ mod tests {
     }
 
     #[test]
+    fn start_engine_respawns_after_a_dead_supervisor() {
+        // DS-16: a finished supervisor handle used to make every
+        // later `start_engine` a silent no-op (the stored handle
+        // was never liveness-checked), so a dead engine never
+        // recovered without a process restart. Plant a thread that
+        // already exited as the supervisor: the next start must
+        // reap it and spawn fresh, and the engine must report
+        // Running afterwards.
+        let (state, _dir) = test_state();
+        let dead = std::thread::Builder::new()
+            .name("rsh-test-dead-supervisor".to_string())
+            .spawn(|| {})
+            .expect("spawn dead thread");
+        while !dead.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *lock(&state.engine_thread) = Some(dead);
+        state
+            .start_engine()
+            .expect("start_engine must respawn a dead supervisor");
+        assert_eq!(
+            state.engine_status(),
+            EngineTaskStatus::Running { transport: None },
+            "the respawned engine runs idle with no transport"
+        );
+        // A second start is still a no-op while the fresh one lives.
+        state.start_engine().expect("second start is a no-op");
+        let outcome = state.stop_engine();
+        assert!(outcome.joined, "engine stops bounded");
+    }
+
+    #[test]
     fn engine_spawn_flows_frames_to_backend_watchdog_neutral_and_bounded_stop() {
         let (state, sent, _fail) = test_state_with_recording();
         // Connect the recording backend first: the sink only sends to
@@ -10046,6 +10409,82 @@ mod tests {
         let reported = state.transport_state();
         assert_eq!(reported.transport, "usb");
         assert_eq!(reported.state, ConnectionState::Disconnected);
+    }
+
+    /// DS-27: repeated serial `transport_state()` calls must reuse the
+    /// cached board port (no board is attached in the test sandbox, so
+    /// the address stays empty) and `rescan_board_port()` must clear
+    /// the cache without error. The live cost (port enumeration +
+    /// up to 500 ms HELO probe per port) is unmeasurable here — the
+    /// proof is that `transport_state` no longer calls
+    /// `detect_board_port` directly.
+    #[test]
+    fn ds27_serial_transport_state_uses_cached_port() {
+        let (state, _dir) = test_state();
+        state.set_transport_request(TransportKind::Serial, "COM3".to_string());
+        assert_eq!(state.cached_board_port(), None);
+        assert_eq!(state.cached_board_port(), None);
+        let reported = state.transport_state();
+        assert_eq!(reported.transport, "usb");
+        assert_eq!(reported.address, "");
+        state.rescan_board_port();
+        assert_eq!(state.cached_board_port(), None);
+        assert_eq!(state.transport_state().address, "");
+    }
+
+    /// DS-30: the `Arc` settings cache tracks every writer, and the
+    /// `Arc` snapshot agrees with the struct read. The cache starts
+    /// from the store; `set_settings`, `set_settings_patch`, and
+    /// `set_output_backend` (which persists before switching — the
+    /// switch itself fails on Linux without a vJoy driver, but the
+    /// persisted choice must still reach the cache) all refresh it.
+    #[test]
+    fn ds30_settings_arc_tracks_writes_and_snapshot_arc_agrees() {
+        let (state, _dir) = test_state();
+        assert_eq!(state.settings_arc().esp_ip, state.settings().esp_ip);
+        let mut settings = state.settings();
+        settings.esp_ip = "10.0.0.5".to_string();
+        let saved = state.set_settings(settings).expect("set settings");
+        assert_eq!(saved.esp_ip, "10.0.0.5");
+        assert_eq!(state.settings_arc().esp_ip, "10.0.0.5");
+        let patch = AppSettingsPatch {
+            esp_ip: Some("10.0.0.9".to_string()),
+            ..Default::default()
+        };
+        let merged = state.set_settings_patch(patch).expect("patch");
+        assert_eq!(merged.esp_ip, "10.0.0.9");
+        assert_eq!(state.settings_arc().esp_ip, "10.0.0.9");
+        let _ = state.set_output_backend("vJoy");
+        assert_eq!(state.settings_arc().output_backend, "VJoy");
+        assert_eq!(*state.snapshot_arc(), state.snapshot());
+        // The settings-aware transport state reads the same `esp_ip`
+        // the `Arc` carries — no second store clone.
+        assert_eq!(
+            state
+                .transport_state_with_settings(&state.settings_arc())
+                .address,
+            "10.0.0.9"
+        );
+    }
+
+    /// DS-32: `take_pairing_log_lines()` drains once — the first
+    /// drain returns the queued lines, the second returns nothing,
+    /// and the read-back buffer is empty (the manager loop can no
+    /// longer re-log a line or re-clone the buffer per tick).
+    #[test]
+    fn ds32_take_pairing_log_lines_drains_once() {
+        let (state, _dir) = test_state();
+        assert_eq!(state.take_pairing_log_lines(), Vec::<String>::new());
+        state.open_session_gate();
+        let drained = state.take_pairing_log_lines();
+        assert_eq!(drained.len(), 1);
+        assert!(
+            drained[0].contains("session gate: closed -> open"),
+            "{}",
+            drained[0]
+        );
+        assert_eq!(state.take_pairing_log_lines(), Vec::<String>::new());
+        assert_eq!(state.pairing_log_lines(), Vec::<String>::new());
     }
 
     #[test]
@@ -10820,6 +11259,91 @@ mod tests {
         );
     }
 
+    /// DS-06: the classifier behind the self-collision fix — no
+    /// holder (port reads free) and our own pid are transient, a
+    /// foreign pid is terminal.
+    #[test]
+    fn udp_addr_in_use_self_or_none_is_transient_foreign_is_terminal() {
+        assert!(
+            !udp_addr_in_use_is_foreign(None),
+            "no holder (port free) is our own rebind race, not a foreign app"
+        );
+        let own = rsh_transport::port_conflict::PortHolder {
+            pid: std::process::id(),
+            process_name: "rsh-daemon".to_string(),
+            exe_path: None,
+        };
+        assert!(
+            !udp_addr_in_use_is_foreign(Some(&own)),
+            "our own pid holding the port is a rebind race, not a conflict"
+        );
+        let foreign = rsh_transport::port_conflict::PortHolder {
+            pid: std::process::id().wrapping_add(1),
+            process_name: "RSH.exe".to_string(),
+            exe_path: None,
+        };
+        assert!(
+            udp_addr_in_use_is_foreign(Some(&foreign)),
+            "a foreign pid is a real port conflict (F21 terminal)"
+        );
+    }
+
+    /// DS-06: a self-collision `AddrInUse` (the factory's transient
+    /// path: `None` with NO typed `BindFailed` recorded, as the
+    /// rebind race leaves it) must NOT stop the forwarder at one
+    /// attempt — it retries with the M-11 backoff and trips the
+    /// breaker after the policy's attempts instead of latching a
+    /// false "another app" error.
+    #[tokio::test]
+    async fn forwarder_retries_self_addr_in_use_instead_of_stopping() {
+        let (state, _dir) = test_state();
+        let (frame_tx, _frame_rx) = tokio::sync::mpsc::channel(8);
+        let (status_tx, _status_rx) = tokio::sync::mpsc::channel(8);
+        let policy = ForwarderRetryPolicy {
+            base: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            max_consecutive_failures: 3,
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let state_for_factory = Arc::clone(&state);
+        let attempts_for_factory = Arc::clone(&attempts);
+        // The last activation failed Unreachable (HELLO timeout,
+        // the no-board case) — the typed error a self-collision
+        // leaves behind, since the factory records no BindFailed
+        // for its own rebind race.
+        state.note_session_error_typed(
+            ConnectionError::Unreachable,
+            "no HELLO reply from the board",
+        );
+        let run = forward_with_retry_with_policy(
+            Arc::clone(&state),
+            TransportKind::Udp,
+            frame_tx,
+            status_tx,
+            move || {
+                attempts_for_factory.fetch_add(1, Ordering::SeqCst);
+                // DS-06 factory behaviour for a self-held port:
+                // no typed BindFailed is recorded.
+                let _ = &state_for_factory;
+                Option::<FakeSessionTransport>::None
+            },
+            policy,
+        );
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("self-collision forwarder must retry, then trip the breaker");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "a self-held port retries to the breaker, it must not stop at one attempt like a foreign conflict"
+        );
+        assert!(
+            state.engine_status_detail().contains("circuit breaker"),
+            "breaker named in the status, not a false 'another app': {}",
+            state.engine_status_detail()
+        );
+    }
+
     /// F21: a UDP port conflict stops the forwarder immediately —
     /// no backoff retries. The holder can only be closed by the
     /// user, so the M-11 retry loop would just re-log the same
@@ -11043,6 +11567,30 @@ mod tests {
             .filter(|line| line.contains("window state: open"))
             .count();
         assert_eq!(open_lines, 1, "window-open must log exactly once");
+    }
+
+    /// DS-02: `block_on_control` from inside a tokio runtime must
+    /// fail with an error, never panic ("Cannot start a runtime
+    /// from within a runtime" used to kill the daemon's manager
+    /// loop when tray "Restart wheel" called it). A current-thread
+    /// runtime built here is the exact manager-loop shape.
+    #[test]
+    fn block_on_control_inside_a_runtime_errors_instead_of_panicking() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let result = rt.block_on(async { block_on_control(async { Ok::<(), String>(()) }) });
+        let error = result.expect_err("in-runtime call must fail, not panic");
+        assert!(
+            error.contains("spawn_blocking"),
+            "the error must point at the fix: {error}"
+        );
+        // And outside a runtime the same call still works.
+        assert!(
+            block_on_control(async { Ok::<(), String>(()) }).is_ok(),
+            "plain-thread call must still succeed"
+        );
     }
 
     /* H5-control: run-a-control-command-under-a-fresh-session. */

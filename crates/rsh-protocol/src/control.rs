@@ -14,6 +14,7 @@
 //! Parse errors (§3.1): `TooShort` only when the frame is shorter than the
 //! 13-byte header; every other length mismatch is `BadLength`.
 
+use digest::common::array::Array;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
@@ -296,6 +297,21 @@ impl ControlFrame {
     }
 }
 
+/// DS-44: infallible HMAC construction for a fixed 32-byte key.
+/// `new_from_slice(...).expect(...)` panicked on an impossible
+/// condition; building the key array by copy cannot fail (and
+/// `Array::from_slice` is deprecated, so it is not used either).
+fn hmac_with_key(key: &[u8; 32]) -> HmacSha256 {
+    // The key size is inferred from `HmacSha256::new`: HMAC keys
+    // are the hash BLOCK size (64 bytes for SHA-256), and a short
+    // key is padded with zeros to it — exactly what
+    // `new_from_slice` did for our 32-byte key. Copying into a
+    // zeroed array is identical and cannot fail.
+    let mut key_array = Array::default();
+    key_array.as_mut_slice()[..32].copy_from_slice(key);
+    HmacSha256::new(&key_array)
+}
+
 /// Verify a 16-byte wire tag in constant time.
 ///
 /// The wire tag is the LEFT-truncated HMAC (`[0:16]`), so this uses
@@ -303,10 +319,8 @@ impl ControlFrame {
 /// here: it requires the full 32-byte tag and always fails on the
 /// 16-byte wire tag (A3 spike finding).
 ///
-/// # Panics
-///
-/// Panics only if the HMAC key length is invalid — impossible for the
-/// fixed `[u8; 32]` key type used by every caller.
+/// The HMAC is built infallibly (DS-44): the key is a fixed
+/// `[u8; 32]`, so its length cannot fail.
 #[must_use]
 pub fn verify_tag(
     key: &[u8; 32],
@@ -316,7 +330,10 @@ pub fn verify_tag(
     payload: &[u8],
     tag: &[u8; TAG_LEN],
 ) -> bool {
-    let mut mac = HmacSha256::new_from_slice(key).expect("32-byte HMAC key is valid");
+    // DS-44: infallible construction — the key is a fixed `[u8; 32]`,
+    // so its length cannot fail; `new_from_slice(...).expect(...)`
+    // was a panic on an impossible condition.
+    let mut mac = hmac_with_key(key);
     mac.update(nonce);
     mac.update(&counter.to_le_bytes());
     mac.update(&[cmd]);
@@ -327,10 +344,9 @@ pub fn verify_tag(
 /// Compute the 16-byte tag: first 16 bytes of
 /// `HMAC-SHA256(key, nonce ‖ counter_LE ‖ cmd ‖ payload)`.
 ///
-/// # Panics
-///
-/// Panics only if the HMAC key length is invalid — impossible for the
-/// fixed `[u8; 32]` key type used by every caller.
+/// The HMAC is built infallibly (DS-44): the key is a fixed
+/// `[u8; 32]`, so its length cannot fail — there is no
+/// `new_from_slice(...).expect(...)` panic on this path.
 #[must_use]
 pub fn compute_tag(
     key: &[u8; 32],
@@ -339,7 +355,8 @@ pub fn compute_tag(
     counter: u32,
     payload: &[u8],
 ) -> [u8; TAG_LEN] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("32-byte HMAC key is valid");
+    // DS-44: see `verify_tag`.
+    let mut mac = hmac_with_key(key);
     mac.update(nonce);
     mac.update(&counter.to_le_bytes());
     mac.update(&[cmd]);

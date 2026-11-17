@@ -1,7 +1,7 @@
 //! `rsh-gate-ui` — v2.0.2 UI gate checks (plan §C) that need a
 //! rendered UI: slider fill geometry + click values, wizard step
 //! gating + Next click-through, theme repaint, tray disconnected
-//! state.
+//! state, tray Light theme (DS-22), banner wrap + grow (DS-21).
 //!
 //! The real `.slint` files are compiled with `slint-interpreter`
 //! on the testing backend with the software renderer — no X, no
@@ -293,6 +293,13 @@ fn click(instance: &ComponentInstance, x: f32, y: f32) {
     adapter
         .window()
         .dispatch_event(WindowEvent::PointerReleased { position, button });
+}
+
+fn get_num(instance: &ComponentInstance, name: &str) -> Option<f64> {
+    match instance.get_property(name) {
+        Ok(Value::Number(value)) => Some(value),
+        _ => None,
+    }
 }
 
 fn get_bool(instance: &ComponentInstance, name: &str) -> Option<bool> {
@@ -806,6 +813,99 @@ fn ui_tray_disconnected() -> Outcome {
     report.finish()
 }
 
+/// Gate: tray popup Light theme (DS-22, U-04) — the popup was
+/// hardcoded dark. `light-theme` repaints it: the background is
+/// #11161F in Dark and #FFFFFF in Light (token `tray-bg`).
+/// Pixel proof via the flat background colour (tol 4 on the dark
+/// side so Light-mode text #171B26, which is 6/5/7 away, is not
+/// mistaken for the dark background).
+fn ui_tray_light_theme() -> Outcome {
+    let mut report = Report::new();
+    let instance = match compile("crates/rsh-daemon/ui/tray.slint", "TrayPopup") {
+        Ok(instance) => instance,
+        Err(error) => return Outcome::fail(error),
+    };
+    for (light, want_light) in [(false, false), (true, true)] {
+        if let Err(error) = set_bool(&instance, "light-theme", light) {
+            return Outcome::fail(error);
+        }
+        let (rgba, width, height) = match snapshot(&instance) {
+            Ok(snap) => snap,
+            Err(error) => return Outcome::fail(error),
+        };
+        let total = (width * height) as usize;
+        let (dark_bg, _, _, _, _) = count_color(&rgba, width, (0x11, 0x16, 0x1f), 4);
+        let (light_bg, _, _, _, _) = count_color(&rgba, width, (0xff, 0xff, 0xff), 12);
+        let dark_pct = dark_bg * 100 / total.max(1);
+        let light_pct = light_bg * 100 / total.max(1);
+        let name = if light {
+            "tray-light-bg-white"
+        } else {
+            "tray-dark-bg"
+        };
+        report.check(
+            name,
+            if want_light {
+                light_pct > 40 && dark_pct == 0
+            } else {
+                // Dark keeps a little white (switch knob, "R" logo,
+                // "Launch" labels) — under 2% of the popup.
+                dark_pct > 40 && light_pct < 2
+            },
+            &format!("light-theme={light}: dark-bg {dark_pct}% / light-bg {light_pct}% of pixels"),
+        );
+    }
+    report.finish()
+}
+
+/// Gate: error banner wraps + grows (DS-21, U-03) — the banner was
+/// a fixed 36 px with no wrapping, so a 150-char daemon-error was
+/// cut off mid-sentence. A short string stays 36 px; the 150-char
+/// string (the plan's verification case) must grow the banner past
+/// 40 px, proving the text wraps instead of clipping.
+fn ui_banner_wrap() -> Outcome {
+    let mut report = Report::new();
+    let instance = match compile(
+        "tools/gate-checks/rsh-gate-ui/ui/banner_probe.slint",
+        "GateBannerWindow",
+    ) {
+        Ok(instance) => instance,
+        Err(error) => return Outcome::fail(error),
+    };
+    if let Err(error) = set_str(&instance, "banner-text", "Short text.") {
+        return Outcome::fail(error);
+    }
+    // The height is only laid out once the window is shown — read it
+    // off a snapshot, not off the unshown instance.
+    if let Err(error) = snapshot(&instance) {
+        return Outcome::fail(error);
+    }
+    let short = get_num(&instance, "banner-height");
+    let long_text = "Daemon failed to start: IPC bind failed after 5 attempts — pipe is held by another process or the previous daemon did not exit cleanly. Close the old RSH app and retry.";
+    assert!(
+        long_text.chars().count() > 150,
+        "probe text must exceed 150 chars"
+    );
+    if let Err(error) = set_str(&instance, "banner-text", long_text) {
+        return Outcome::fail(error);
+    }
+    if let Err(error) = snapshot(&instance) {
+        return Outcome::fail(error);
+    }
+    let long = get_num(&instance, "banner-height");
+    report.check(
+        "banner-short-36px",
+        short == Some(36.0),
+        &format!("short text banner height: {short:?} (want 36)"),
+    );
+    report.check(
+        "banner-long-grows",
+        long.is_some_and(|h| h > 40.0),
+        &format!("150-char text banner height: {long:?} (want > 40)"),
+    );
+    report.finish()
+}
+
 /// One UI gate check: (id, description, runner).
 type UiCheck = (&'static str, &'static str, fn() -> Outcome);
 
@@ -840,6 +940,16 @@ fn checks() -> Vec<UiCheck> {
             "ui-tray-disconnected",
             "A12: tray popup defaults Disconnected + red dot; live values flip it green",
             ui_tray_disconnected as fn() -> Outcome,
+        ),
+        (
+            "ui-tray-light-theme",
+            "DS-22: tray popup light-theme repaints the background white (Dark stays #11161F)",
+            ui_tray_light_theme as fn() -> Outcome,
+        ),
+        (
+            "ui-banner-wrap",
+            "DS-21: EmptyBanner wraps long text and grows past 36 px (short text stays 36 px)",
+            ui_banner_wrap as fn() -> Outcome,
         ),
     ]
 }

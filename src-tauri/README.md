@@ -1,5 +1,15 @@
 # `src-tauri` — RSH Tauri 2 shell (v1.0.0)
 
+> **DS-71 status (v2.0): KEPT-BUT-UNSHIPPED.** This shell is still a
+> Cargo workspace member (`rsh-app`) and CI's `tauri-build` job still
+> builds it, but the v2.0 release does NOT ship the Tauri bundle: the
+> installer ships the Slint `rsh-ui` + `rsh-daemon` binaries. Its
+> `tauri.conf.json` version (`1.0.2`) and updater config (`active:
+> false`, no `latest.json` published) are therefore stale-by-design —
+> do not "fix" them or re-enable the updater without a migration plan.
+> `src-tauri/binaries/` is still live: it stages the HIDMaestro
+> sidecar exe the v2.0 installer bundles beside the daemon.
+
 Minimal app shell (Phase A2 / P2.1 scope):
 
 - Single window (`main`), title `RSH — Real Sim Hub v1.0.0`, 1100×700.

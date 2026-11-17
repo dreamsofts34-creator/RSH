@@ -251,17 +251,66 @@ void net_led_apply_persistent(const uint8_t *blob, size_t len) {
 // SEC-R2-03 (Phase 2 M-2): khula AP (pairing window) abhi chal raha hai?
 static bool apIsOpen = false;
 
+// Forward: neeche defined (DS-11 retry helper is se pehle aata hai).
+static bool net_start_ap_and_sockets(uint8_t ch);
+
 // Khula AP WPA2 par lock karo (generated password, keystore se).
 // Sirf tab jab AP khula ho — dobara call no-op hai.
-static void net_lock_ap_wpa2_() {
-  if (!apIsOpen) return;
+// DS-11: return value check karo — softAP/begin fail ho to apIsOpen
+// JAISA HAI waisa rehta hai (lock dobara koshish karega — net_poll()
+// har dafa net_lock_ap_after_pairing_window() chalata hai), diag event
+// record hota hai, aur retry 5 s throttle se hota hai (har loop
+// iteration par softAP hammer nahi). Kamyabi par true.
+static bool net_lock_ap_wpa2_() {
+  if (!apIsOpen) return true;
+  // Retry throttle: pehli koshish foran, fail ke baad agle 5 s tak nahi.
+  static uint32_t lastLockAttemptMs = 0;
+  static bool haveLastLockAttempt = false;
+  uint32_t nowMs = millis();
+  if (haveLastLockAttempt && (uint32_t)(nowMs - lastLockAttemptMs) < 5000)
+    return false;
+  haveLastLockAttempt = true;
+  lastLockAttemptMs = nowMs;
   udpHello.stop();
   udpCtrl.stop();
   WiFi.softAPdisconnect(true);
-  WiFi.softAP(WIFI_SSID, keystore_password(), currentChannel, 0, 4);
-  udpHello.begin(PORT_HELLO);
-  udpCtrl.begin(PORT_CTRL);
+  if (!WiFi.softAP(WIFI_SSID, keystore_password(), currentChannel, 0, 4)) {
+    // AP band ho gaya, sockets band hain — apIsOpen true rehta hai taake
+    // agle net_poll() par lock dobara koshish kare (throttle ke baad).
+    rsh_diag_record_global(RSH_DIAG_AP_RESTART_FAIL, 0, nowMs);
+    return false;
+  }
+  if (!udpHello.begin(PORT_HELLO) || !udpCtrl.begin(PORT_CTRL)) {
+    rsh_diag_record_global(RSH_DIAG_AP_RESTART_FAIL, 0, nowMs);
+    return false;
+  }
   apIsOpen = false;
+  return true;
+}
+
+// DS-11: AP restart retry — net_start_ap_and_sockets() fail hone par
+// (password restart ya rescan restart) AP band rehta hai; ye pending
+// flag agle net_poll() calls par har 5 s mein dobara koshish karta hai.
+// Pehli failure par diag event record hota hai; retry failures khamosh
+// rehte hain (ring flood nahi), kamyabi par flag saaf ho jata hai.
+static bool apRestartPending_ = false;
+static uint32_t apRestartRetryAtMs_ = 0;
+static uint8_t apRestartRetryCh_ = 0;
+
+static void net_request_ap_restart_retry_(uint8_t ch) {
+  apRestartPending_ = true;
+  apRestartRetryCh_ = ch;
+  apRestartRetryAtMs_ = millis() + 5000;
+}
+
+static void net_retry_ap_restart_() {
+  if (!apRestartPending_) return;
+  if ((int32_t)(millis() - apRestartRetryAtMs_) < 0) return;
+  if (net_start_ap_and_sockets(apRestartRetryCh_)) {
+    apRestartPending_ = false;
+    return;
+  }
+  apRestartRetryAtMs_ = millis() + 5000;  // dobara 5 s baad, diag dobara nahi
 }
 
 // AP lock policy (F-01, v4.0.2): do triggers, dono DEFERRED (reply
@@ -277,13 +326,15 @@ static void net_lock_ap_wpa2_() {
 static void net_lock_ap_after_pairing_window() {
   if (!apIsOpen) return;
   if (!keystore_unpaired()) {
-    net_lock_ap_wpa2_();
-    rsh_diag_record_global(RSH_DIAG_AP_LOCKED, 1, millis());  // paired (F-01)
+    // DS-11: AP_LOCKED sirf kamyab lock par — fail ho to apIsOpen true
+    // rehta hai aur agle net_poll() par lock dobara koshish karega.
+    if (net_lock_ap_wpa2_())
+      rsh_diag_record_global(RSH_DIAG_AP_LOCKED, 1, millis());  // paired (F-01)
     return;
   }
   if (keystore_pairing_open(millis())) return;
-  net_lock_ap_wpa2_();
-  rsh_diag_record_global(RSH_DIAG_AP_LOCKED, 0, millis());  // window expiry
+  if (net_lock_ap_wpa2_())
+    rsh_diag_record_global(RSH_DIAG_AP_LOCKED, 0, millis());  // window expiry
 }
 
 // AP + sockets ek channel par shuru karo. Pehli pairing tak AP KHULA hai
@@ -504,10 +555,18 @@ void net_maybe_rescan(uint32_t nowMs) {
   udpHello.stop();
   udpCtrl.stop();
   WiFi.softAPdisconnect(true);
-  net_start_ap_and_sockets(target);  // fail ho to agle rescan/retry par dobara
+  // DS-11: return check karo — fail ho to AP band rehta hai; diag event
+  // + net_poll() retry (5 s throttle) warna board rescan ke baad
+  // unreachable rehta aur koi retry nahi hoti (rescan 60 s+ waqfe se hai).
+  if (!net_start_ap_and_sockets(target)) {
+    rsh_diag_record_global(RSH_DIAG_AP_RESTART_FAIL, 2, nowMs);
+    net_request_ap_restart_retry_(target);
+  }
 }
 
 void net_poll() {
+  // DS-11: pehle kisi failed AP restart (password/rescan) ki retry.
+  net_retry_ap_restart_();
   // M-2: pairing window guzar jaye to khula AP WPA2 par lock ho jaye.
   net_lock_ap_after_pairing_window();
   // Per call cap: datagram flood sampler ko starve na kare (audit fix).
@@ -794,17 +853,28 @@ static void handle_ping(const uint8_t *req, int len, const IPAddress &sender,
 // Pairing window dobara NAHI khulti (apUpMarked guard
 // net_start_ap_and_sockets mein hai — ye function use nahi karta).
 // Connected clients drop honge — dobara naye password se join karna hoga.
-static void net_restart_ap_with_new_password() {
+// DS-11: bool return — fail ho to caller (deferred action) retry
+// flag ke zariye net_poll() retry karwata hai; apIsOpen sirf kamyabi
+// par false hota hai (pehle unconditional tha).
+static bool net_restart_ap_with_new_password() {
   udpHello.stop();
   udpCtrl.stop();
   WiFi.softAPdisconnect(true);
-  WiFi.softAP(WIFI_SSID, keystore_password(), currentChannel, 0, 4);
+  if (!WiFi.softAP(WIFI_SSID, keystore_password(), currentChannel, 0, 4)) {
+    rsh_diag_record_global(RSH_DIAG_AP_RESTART_FAIL, 1, millis());
+    net_request_ap_restart_retry_(currentChannel);
+    return false;
+  }
+  if (!udpHello.begin(PORT_HELLO) || !udpCtrl.begin(PORT_CTRL)) {
+    rsh_diag_record_global(RSH_DIAG_AP_RESTART_FAIL, 1, millis());
+    net_request_ap_restart_retry_(currentChannel);
+    return false;
+  }
   apIsOpen = false;  // M-2: password set ke baad AP hamesha WPA2 hai
-  udpHello.begin(PORT_HELLO);
-  udpCtrl.begin(PORT_CTRL);
   // udpData send-only hai (begin nahi hota) — dobara begin ki zaroorat nahi.
   // WebOTA auth har request par keystore_password() se hoti hai, is liye
   // naya password WebOTA par foran laagu hai (A7 par real board par verify).
+  return true;
 }
 
 // Deferred actions — reply bhejne KE BAAD (SEC-D-01 pattern):

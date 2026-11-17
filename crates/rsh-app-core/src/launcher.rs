@@ -559,7 +559,20 @@ impl ProcessSpawner for SystemSpawner {
     fn spawn(&mut self, exe: &Path) -> Result<u32, String> {
         #[cfg(windows)]
         {
+            // DS-47: null stdio + detached, no-window creation —
+            // mirroring the daemon's `spawn_ui` (F8). A game that
+            // inherits the daemon's stdio pipes can block the parent
+            // forever (the NSIS `Exec` hang class fixed in v2.0.2),
+            // and a console window must never flash up for a GUI
+            // game. Flags are the raw Win32 values, as elsewhere in
+            // this crate (`state.rs`): DETACHED_PROCESS 0x8,
+            // CREATE_NO_WINDOW 0x0800_0000.
+            use std::os::windows::process::CommandExt;
             std::process::Command::new(exe)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(0x0000_0008 | 0x0800_0000)
                 .spawn()
                 .map(|child| child.id())
                 .map_err(|error| error.to_string())

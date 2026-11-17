@@ -20,6 +20,7 @@
 #include "fw34_state.h"    // FW-7/8 wiring: net.cpp/keystore.cpp se accessors
 #include <Preferences.h>   // FW-3/FW-4 NVS glue (boot counter + config slots)
 #include <esp_system.h>  // Round 2 W3 (FIX-4): esp_reset_reason() (status packet)
+#include <esp_task_wdt.h>  // DS-64: task watchdog subscribe/feed (loop + sample task)
 #include <esp_ota_ops.h> // Round 2C: firmware rollback — doosri OTA slot boot partition
 #include "net.h"
 #include "webota.h"
@@ -239,7 +240,13 @@ static void fw34_loop_tick(uint32_t nowMs) {
     led_set(LedState::KeyResetArmed);
     rsh_diag_record_global(RSH_DIAG_KEY_RESET_ARMED, 0, nowMs);
   }
-  if (rsh_safe_mode_tick(&safeMode, nowMs)) ESP.restart();  // armed window khatam
+  if (rsh_safe_mode_tick(&safeMode, nowMs)) {
+    // DS-75: key-reset-armed expiry reboot se PEHLE diag event — warna
+    // board 120 s baad "bina wajah" reboot hota aur ring mein koi nishan
+    // nahi rehta.
+    rsh_diag_record_global(RSH_DIAG_KEY_RESET_EXPIRED, 0, nowMs);
+    ESP.restart();  // armed window khatam
+  }
   rsh_boot_tick_t bt = rsh_boot_tick(&bootCounter, netOk ? 1 : 0, nowMs, bootStartMs);
   if (bt == RSH_BOOT_SUCCESS || bt == RSH_BOOT_FAILED) {
     Preferences bootPref;
@@ -465,6 +472,10 @@ static void sample_send_frame_(const RshSampleMailbox *frame) {
 // loop task status packet mein wahi numbers parhta hai.
 static void sample_task_fn(void *arg) {
   (void)arg;
+  // DS-64: sampling task ko bhi task watchdog mein subscribe karo
+  // (loop task ki tarah) — 5 ms cycle par feed hota hai, stall ho to
+  // WDT reset karega. Subscribe fail ho to feed no-op hai.
+  esp_task_wdt_add(NULL);
   TickType_t lastWake = xTaskGetTickCount();
   for (;;) {
     uint32_t cycleStartUs = micros();
@@ -488,6 +499,7 @@ static void sample_task_fn(void *arg) {
     if (ticks == 0) ticks = 1;  // tick rate 100 Hz ho to bhi kam az kam 1 tick
     TickType_t nowTicks = xTaskGetTickCount();
     if ((TickType_t)(nowTicks - lastWake) >= ticks) lastWake = nowTicks;
+    esp_task_wdt_reset();  // DS-64: sample task feed (har cycle)
     vTaskDelayUntil(&lastWake, ticks);
   }
 }
@@ -528,6 +540,20 @@ void setup() {
   rsh_diag_record(rsh_diag_log(), RSH_DIAG_BOOT, rsh_reset_reason_code(),
                   millis());
   rsh_diag_set_heap_min(rsh_diag_log(), (uint16_t)(ESP.getFreeHeap() / 1024));
+  // DS-64: task watchdog — loop task ko subscribe karo aur state record
+  // karo (GET_DIAG se app dekh sakti hai). Arduino core aksar loop task
+  // ko pehle se subscribe karta hai (ESP_ERR_INVALID_STATE = pehle se
+  // watched, theek hai); ESP_OK = abhi subscribe hua; baqi = fail.
+  // Feed loop() ke shuru mein hota hai (har iteration, har early-return
+  // path se pehle). Timeout Arduino-core default hai (shipped esp32dev
+  // build mein sdkconfig flags laagu nahi hote — DS-64 note).
+  {
+    esp_err_t wdtErr = esp_task_wdt_add(NULL);
+    uint16_t wdtVal = (wdtErr == ESP_OK)               ? 0
+                      : (wdtErr == ESP_ERR_INVALID_STATE) ? 1
+                                                        : 2;
+    rsh_diag_record(rsh_diag_log(), RSH_DIAG_WDT_STATE, wdtVal, millis());
+  }
   inputs_begin();
   // Phase G (C3): boot-from-NVS — NVS pin map (ya factory fallback)
   // inputs par lagao. inputs_begin sirf compiled defaults lagata hai;
@@ -566,6 +592,9 @@ void loop() {
   // liya jata hai (OTA/WebServer/net_poll/LED samet), sirf inputs+send nahi.
   uint32_t loopStartUs = micros();
   uint32_t nowMs = millis();
+
+  esp_task_wdt_reset();  // DS-64: loop task feed — sab se pehle,
+  // taake !netOk / OTA early-return paths par bhi har iteration feed ho.
 
   fw34_loop_tick(nowMs);   // FW-3/FW-4: BOOT-hold + boot/confirm deadlines
 

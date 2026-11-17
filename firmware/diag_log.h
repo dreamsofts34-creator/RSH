@@ -38,6 +38,10 @@
 #define RSH_DIAG_FW_ROLLBACK     12  // value = 0 (Round 2C: 6 lagatar boot fail -> doosri OTA slot)
 #define RSH_DIAG_RESCAN          10  // value = naya channel (F-07)
 #define RSH_DIAG_KEY_RESET_ARMED 11  // value = 0 (BOOT 10 s hold)
+#define RSH_DIAG_AP_RESTART_FAIL 13  // DS-11: value 0 = AP lock, 1 = new-password restart, 2 = rescan restart
+#define RSH_DIAG_KEY_RESET_EXPIRED 14  // DS-75: value = 0 (120 s armed window khatam -> reboot)
+#define RSH_DIAG_WDT_STATE       15  // DS-64: value 0 = loop task subscribed now, 1 = already subscribed, 2 = subscribe failed
+#define RSH_DIAG_KEYSTORE_NVS_FAIL 16  // DS-65: value 0 = mark_paired NVS write fail
 
 #define RSH_DIAG_MAX_EVENTS 32
 

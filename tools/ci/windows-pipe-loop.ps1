@@ -38,13 +38,22 @@ Remove-Item $errLog, $outLog -ErrorAction SilentlyContinue
 
 function Connect-PipeClient {
     # One named-pipe client to \\.\pipe\rsh-daemon (IPC_PIPE_NAME).
+    # DS-05 follow-up (deep-scan FC-03/CI-03): do NOT set ReadTimeout /
+    # WriteTimeout on this stream at all. The first DS-05 fix opened it
+    # with PipeOptions::Asynchronous, on the theory that .NET accepts
+    # timeouts on an async pipe — but CI run 44129826880 (head cfbd135,
+    # which HAS the async flag) still threw "Exception setting
+    # ReadTimeout: Timeouts are not supported on this stream" 0.2 s
+    # after "daemon listening", before the first ping. In pwsh on the
+    # runner the async flag does not make the timeouts settable, so the
+    # assignments are deleted instead of re-attempted. The connect is
+    # still bounded by Connect(5000); the reads are bounded by the job
+    # timeout, so a hung daemon fails the job instead of hanging it.
     $stream = New-Object System.IO.Pipes.NamedPipeClientStream(
         '.', 'rsh-daemon',
         [System.IO.Pipes.PipeDirection]::InOut,
-        [System.IO.Pipes.PipeOptions]::None)
+        [System.IO.Pipes.PipeOptions]::Asynchronous)
     $stream.Connect(5000)
-    $stream.ReadTimeout = 5000
-    $stream.WriteTimeout = 5000
     $writer = New-Object System.IO.StreamWriter(
         $stream, (New-Object System.Text.UTF8Encoding($false)))
     $writer.AutoFlush = $true
