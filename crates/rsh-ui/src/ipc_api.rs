@@ -105,6 +105,12 @@ struct LiveCache {
     /// Set by a successful write (or the UI) to pull the next slow
     /// cycle forward at once instead of waiting out the 1 s period.
     refresh_requested: AtomicBool,
+    /// Write epoch (DS-29): bumped by every `request_slow_refresh`
+    /// — a slow cycle that started before the epoch moved can carry
+    /// pre-write values, so it must not bump `generation` (see
+    /// `refresh_slow`). The poller re-runs at once while the flag
+    /// above is set, so the next bump carries post-write values.
+    refresh_epoch: AtomicU64,
     generation: AtomicU64,
 }
 
@@ -137,6 +143,7 @@ impl Default for LiveCache {
             draft: Mutex::new(None),
             slow_filled: AtomicBool::new(false),
             refresh_requested: AtomicBool::new(false),
+            refresh_epoch: AtomicU64::new(0),
             generation: AtomicU64::new(0),
         }
     }
@@ -466,6 +473,10 @@ impl IpcApi {
     /// when it starts the early cycle.
     pub fn request_slow_refresh(&self) {
         self.cache.refresh_requested.store(true, Ordering::Relaxed);
+        // DS-29: a write is in flight — a slow cycle that started
+        // before this must not bump the generation with pre-write
+        // values (see `refresh_slow`).
+        self.cache.refresh_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// One slow refresh, run synchronously on the calling (job)
@@ -573,6 +584,13 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     if cache.link_dead.load(Ordering::Relaxed) {
         return;
     }
+    // DS-29: the epoch this cycle started at — a write that lands
+    // while the cycle runs makes its data possibly stale (the cycle
+    // reads everything at once, up front), so the generation bump
+    // at the end is skipped when the epoch moved (see below). The
+    // poller re-runs at once while `refresh_requested` is set, so
+    // the next bump carries post-write values.
+    let epoch = cache.refresh_epoch.load(Ordering::Relaxed);
     // DS-29: one combined call first (30 -> 1 round-trips). On any
     // failure — old daemon without the method, an unparseable reply
     // — fall through to the sequential per-slot pass below, which
@@ -634,7 +652,7 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
             }
         }
         cache.slow_filled.store(true, Ordering::Relaxed);
-        cache.generation.fetch_add(1, Ordering::Relaxed);
+        bump_generation_if_fresh(cache, epoch);
         return;
     }
     // One call, parsed or ignored. `parse` turns the reply into
@@ -772,7 +790,19 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
         }
     }
     cache.slow_filled.store(true, Ordering::Relaxed);
-    cache.generation.fetch_add(1, Ordering::Relaxed);
+    bump_generation_if_fresh(cache, epoch);
+}
+
+/// Bump the slow generation when the cycle's data is fresh
+/// (DS-29): skip the bump when a write asked for a refresh while
+/// this cycle ran — the cycle may carry pre-write values, and its
+/// bump would tell the UI (and the `discard_draft` test) the cache
+/// is current when it is not. `slow_filled` is NOT gated: the slots
+/// still hold genuine daemon values, only possibly a cycle old.
+fn bump_generation_if_fresh(cache: &LiveCache, epoch: u64) {
+    if cache.refresh_epoch.load(Ordering::Relaxed) == epoch {
+        cache.generation.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl AppApi for IpcApi {
