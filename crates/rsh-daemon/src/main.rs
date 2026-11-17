@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rsh_api::{AppApi, AppEvent, ConnEvent, ConnectionError, ManagerAction};
-use rsh_app_core::diagnostics::{append_startup_log_both, log_fatal};
+use rsh_app_core::diagnostics::{append_startup_log_both, install_panic_hook, log_fatal};
 use rsh_app_core::state::{AppStateCore, BindingAppAction, TransportKind};
 #[cfg(unix)]
 use rsh_ipc::serve_listener;
@@ -455,7 +455,14 @@ fn publish(event_tx: &broadcast::Sender<AppEvent>, event: AppEvent) {
 /// daemon therefore survives an X-close of the UI; what it must
 /// NOT do is spawn a second UI while one is already running — that
 /// is [`open_ui`]'s job.
-fn spawn_ui(page: Option<&str>) {
+///
+/// Detached spawn (F8, v2.0.3): stdio is nulled and, on Windows,
+/// the child is detached (`DETACHED_PROCESS |
+/// CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`) — the same bug
+/// class as the NSIS `Exec` hang fixed in v2.0.2 (b8b9fd4), where a
+/// spawned child inheriting the parent's stdio pipes could block
+/// the parent forever.
+fn spawn_ui(page: Option<&str>, verbose: bool) {
     let Some(exe) = std::env::current_exe().ok().and_then(|exe| {
         exe.parent().map(|dir| {
             dir.join(if cfg!(windows) {
@@ -472,8 +479,24 @@ fn spawn_ui(page: Option<&str>) {
     if let Some(page) = page {
         command.arg("--page").arg(page);
     }
-    if let Err(error) = command.spawn() {
-        eprintln!("rsh-daemon: cannot start UI ({}): {error}", exe.display());
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows::Win32::System::Threading::{
+            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+        };
+        command
+            .creation_flags(DETACHED_PROCESS.0 | CREATE_NEW_PROCESS_GROUP.0 | CREATE_NO_WINDOW.0);
+    }
+    match command.spawn() {
+        Ok(child) => log_line(verbose, &format!("daemon: spawned UI (pid {})", child.id())),
+        Err(error) => {
+            eprintln!("rsh-daemon: cannot start UI ({}): {error}", exe.display());
+        }
     }
 }
 
@@ -509,7 +532,7 @@ fn open_ui(page: Option<&str>, verbose: bool) -> bool {
                 verbose,
                 &format!("tray: forwarding page '{page}' to running UI"),
             );
-            spawn_ui(Some(page));
+            spawn_ui(Some(page), verbose);
         }
         return true;
     }
@@ -528,7 +551,7 @@ fn open_ui(page: Option<&str>, verbose: bool) -> bool {
                     "tray: UI already running (pid {pid}) — forwarding page '{page}' via second instance"
                 ),
             );
-            spawn_ui(Some(page));
+            spawn_ui(Some(page), verbose);
         } else {
             log_line(
                 verbose,
@@ -538,7 +561,7 @@ fn open_ui(page: Option<&str>, verbose: bool) -> bool {
         return true;
     }
     // 3. No UI at all → launch it exactly like a double-click.
-    spawn_ui(page);
+    spawn_ui(page, verbose);
     false
 }
 
@@ -978,11 +1001,18 @@ fn main() {
         Some(dir) => (dir, false),
         None => (PathBuf::from("."), true),
     };
+    // F16: install the panic hook FIRST, before anything that can
+    // panic leaves no trace — a silent panic used to die with no
+    // log at all. The hook appends to
+    // `<data_dir>/logs/diagnostics-panic.log` (plus the `%TEMP%`
+    // fallback inside `install_panic_hook`).
+    install_panic_hook(data_dir.join("logs"));
     log_line(
         verbose,
         &format!(
-            "daemon: starting rsh-daemon v{} (data dir {})",
+            "daemon: starting rsh-daemon v{} (pid {}, data dir {})",
             rsh_api::app_version(),
+            std::process::id(),
             data_dir.display()
         ),
     );
@@ -1308,16 +1338,21 @@ fn main() {
     // back to the UI. Retry for ~10 s before giving up; a headless
     // Linux host fails every attempt (expected, spike §3) and the
     // daemon keeps running headless.
-    let tray_ok = if args.no_tray {
+    //
+    // F11: the tray handle is OWNED here for the process lifetime —
+    // dropping it after the event loop sends `NIM_DELETE` and the
+    // icon goes away on a clean quit (the old `mem::forget` leaked
+    // it, so ghosts piled up).
+    let tray: Option<RshTray> = if args.no_tray {
         log_line(verbose, "daemon: tray disabled (--no-tray)");
-        false
+        None
     } else {
-        let mut tray_ok = false;
+        let mut tray: Option<RshTray> = None;
         for attempt in 1..=6 {
             match create_tray(&api, &tray_actions, &shutdown, verbose, &data_dir) {
-                Ok(()) => {
+                Ok(handle) => {
                     log_line(verbose, "daemon: tray icon registered");
-                    tray_ok = true;
+                    tray = Some(handle);
                     break;
                 }
                 Err(error) => {
@@ -1331,14 +1366,15 @@ fn main() {
                 }
             }
         }
-        if !tray_ok {
+        if tray.is_none() {
             log_line(
                 verbose,
                 "daemon: tray unavailable after 6 attempts — running headless",
             );
         }
-        tray_ok
+        tray
     };
+    let tray_ok = tray.is_some();
 
     if tray_ok {
         // The event loop runs until Quit is picked (or the process
@@ -1347,14 +1383,25 @@ fn main() {
             log_line(verbose, &format!("daemon: event loop error: {error}"));
         }
     } else {
-        // No tray, no event loop: park the main thread until killed.
+        // No tray, no event loop: park the main thread until killed
+        // or until a background task signals shutdown (F2: a fatal
+        // IPC bind ends the process this way instead of
+        // `process::exit(1)` from the task).
         // (Ctrl-C / SIGTERM end the process; the pid file is
         // reclaimed by the next launch's /proc check.)
-        loop {
-            std::thread::sleep(Duration::from_secs(3600));
+        while !shutdown.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 
+    // F11/F10: dropping the tray FIRST removes the icon
+    // (`NIM_DELETE`) before the lock is released, then log the exit
+    // with the pid so a start/exit pair brackets every run in the log.
+    drop(tray);
+    log_line(
+        verbose,
+        &format!("daemon: exiting (pid {})", std::process::id()),
+    );
     shutdown.store(true, Ordering::Relaxed);
     let _ = state.stop_engine();
     lock.release();
@@ -1603,6 +1650,12 @@ impl PopupHandle {
 /// tray popup (§7.7) alongside it. The tray lives on the Slint
 /// event loop (main thread). A popup failure never takes the tray
 /// down: left-click then falls back to opening the UI.
+///
+/// Returns the tray handle: the caller owns it for the process
+/// lifetime (F11) — dropping it sends `NIM_DELETE` (Slint
+/// `PlatformTray::drop`, verified in slint 1.18.1
+/// `i-slint-core/items/system_tray/windows.rs`), which is what
+/// removes the icon on a clean quit.
 // One function: tray + popup creation is a single wiring pass
 // (icon → menu → popup → timer); splitting it would scatter the
 // shared handles across helpers.
@@ -1613,7 +1666,7 @@ fn create_tray(
     shutdown: &Arc<AtomicBool>,
     verbose: bool,
     data_dir: &std::path::Path,
-) -> Result<(), slint::PlatformError> {
+) -> Result<RshTray, slint::PlatformError> {
     let tray = RshTray::new()?;
     // A25: fill the native menu from the live store (real profiles
     // + installed games only — never hardcoded names). The menu is
@@ -1831,10 +1884,17 @@ fn create_tray(
         });
     }
     tray.show()?;
-    // Keep the tray alive for the process lifetime: leak it the way
-    // the Tauri shell leaked its TrayIcon (it must outlive this fn).
-    std::mem::forget(tray);
-    Ok(())
+    // F11: NO `mem::forget` here any more. The old code leaked the
+    // tray deliberately ("the Tauri shell leaked its TrayIcon"),
+    // which meant `Drop` never ran and no `NIM_DELETE` was ever
+    // sent — every dead daemon left a ghost icon until hover. Slint
+    // event-loop ownership does NOT require the leak: the caller
+    // (`main`) holds the returned handle across `run_event_loop()`
+    // and drops it after the loop returns, which is exactly when
+    // the icon must go away. The popup's refresh `Timer` is still
+    // forgotten (its closure owns the popup handle); that leak is
+    // separate from the tray icon and untouched here.
+    Ok(tray)
 }
 
 #[cfg(test)]
