@@ -201,7 +201,7 @@ use rsh_security::keystore::{KeyStore, KeystoreError};
 use rsh_transport::ControlTransport;
 use rsh_transport::config::{ConfigState, ConfigTransaction, ConfigTxnSnapshot};
 use rsh_transport::discovery::{DEFAULT_BOARD_IP, Discovery};
-use rsh_transport::port_conflict::diagnose_udp_port_holder;
+use rsh_transport::port_conflict::{PortHolder, diagnose_udp_port_holder};
 use rsh_transport::serial::{SerialConfig, SerialTransport, detect_board_port};
 use rsh_transport::session::{BoardSession, KeyStoreLike, SessionError};
 use rsh_transport::udp::{UdpBindError, UdpConfig, UdpTransport};
@@ -7141,6 +7141,43 @@ fn spawn_forwarder(
                                 UdpBindError::NoInterface => rsh_api::BindErrorKind::NoInterface,
                                 UdpBindError::Other(_) => rsh_api::BindErrorKind::Other,
                             };
+                            // DS-06: diagnose the holder BEFORE
+                            // recording anything. An `AddrInUse`
+                            // whose holder is our own process (or
+                            // no holder at all — the port reads free)
+                            // is our own rebind race, not another
+                            // app: the previous transport's reader
+                            // thread still holds the socket for
+                            // ~100 ms after the drop, so the retry's
+                            // `bind(4211)` collides with ourselves
+                            // (measured 3/3, no other process
+                            // holding the port). It must NOT be
+                            // recorded as a foreign
+                            // `BindFailed(AddrInUse)` — that latches
+                            // the F21 terminal stop with a wrong
+                            // "another app" diagnosis ~5 s after
+                            // launch on any board-less machine.
+                            // It returns `None` with NO typed
+                            // `BindFailed` recorded, so the forwarder
+                            // retries with the normal M-11 backoff,
+                            // by which time the socket is free. Only
+                            // a foreign pid takes the F21 path below.
+                            let holder = if is_addr_in_use {
+                                diagnose_udp_port_holder(config.local_port)
+                            } else {
+                                None
+                            };
+                            if is_addr_in_use && !udp_addr_in_use_is_foreign(&holder) {
+                                state_for_bind.note_engine_transport_error(
+                                    TransportKind::Udp,
+                                    "UDP bind failed: AddrInUse held by our own just-closed socket (or no holder found) — retrying with backoff",
+                                );
+                                state_for_bind.note_engine_detail(
+                                    "transport udp port conflict (AddrInUse, UDP 4211) was our own rebind race — retrying, not a foreign holder"
+                                        .to_string(),
+                                );
+                                return None;
+                            }
                             // F21: name the holder. A port conflict
                             // is a fact about another process, not a
                             // transient error — the diagnosis goes
@@ -7148,27 +7185,23 @@ fn spawn_forwarder(
                             // the engine status say WHO holds UDP
                             // 4211 (usually the still-running legacy
                             // Tauri app, `RSH.exe`).
-                            let holder_detail = if is_addr_in_use {
-                                diagnose_udp_port_holder(config.local_port)
-                                    .map(|holder| {
-                                        if holder.is_legacy_rsh_app() {
-                                            format!(
-                                                " — port held by the old RSH app: {}",
-                                                holder.describe()
-                                            )
-                                        } else if holder.is_current_rsh() {
-                                            format!(
-                                                " — port held by another RSH process: {}",
-                                                holder.describe()
-                                            )
-                                        } else {
-                                            format!(" — port held by {}", holder.describe())
-                                        }
-                                    })
-                                    .unwrap_or_default()
-                            } else {
-                                String::new()
-                            };
+                            let holder_detail = holder
+                                .map(|holder| {
+                                    if holder.is_legacy_rsh_app() {
+                                        format!(
+                                            " — port held by the old RSH app: {}",
+                                            holder.describe()
+                                        )
+                                    } else if holder.is_current_rsh() {
+                                        format!(
+                                            " — port held by another RSH process: {}",
+                                            holder.describe()
+                                        )
+                                    } else {
+                                        format!(" — port held by {}", holder.describe())
+                                    }
+                                })
+                                .unwrap_or_default();
                             state_for_bind.note_engine_transport_error(
                                 TransportKind::Udp,
                                 &format!(
@@ -7206,6 +7239,21 @@ fn spawn_forwarder(
             }
         }
     })
+}
+
+/// DS-06: whether a diagnosed UDP 4211 holder makes `AddrInUse`
+/// a foreign conflict (terminal, F21) or our own rebind race
+/// (transient, retry with the normal M-11 backoff). A holder that
+/// is our own process (`pid == ours`) — or no holder at all (the
+/// port reads free, i.e. our just-dropped socket was the holder
+/// and its reader thread had not released the fd yet) — is our
+/// own race, not another app. Only a foreign pid is terminal.
+/// Pure: unit-tested without binding anything.
+fn udp_addr_in_use_is_foreign(holder: &Option<PortHolder>) -> bool {
+    match holder {
+        Some(holder) => holder.pid != std::process::id(),
+        None => false,
+    }
 }
 
 /// Builds the UDP config from settings: the board IP is the
@@ -7470,9 +7518,20 @@ async fn forward_with_retry_with_policy<T, F>(
                 )
             {
                 state.set_connection(ConnectionState::Disconnected);
+                // DS-06 (d): the user-facing text carries the
+                // diagnosed holder — the recorded reason already
+                // names it ("UDP bind failed: AddrInUse — port
+                // held by RSH.exe (pid …)") — instead of only the
+                // generic "another app" line.
+                let recorded = state.session_last_error().unwrap_or_default();
+                let status = if recorded.is_empty() {
+                    "wheel port (UDP 4211) is held by another app — close the other RSH, then reconnect (no automatic retry)".to_string()
+                } else {
+                    format!("{recorded} — close the other app, then reconnect (no automatic retry)")
+                };
                 state.set_engine_status(
                     EngineTaskStatus::Running { transport: None },
-                    "wheel port (UDP 4211) is held by another app — close the other RSH, then reconnect (no automatic retry)".to_string(),
+                    status,
                 );
                 state.note_engine_detail(
                     "transport udp port conflict (AddrInUse, UDP 4211) — forwarder stopped, no bind retry; user reconnect required after closing the holder".to_string(),
@@ -7670,6 +7729,15 @@ async fn forward_with_retry_with_policy<T, F>(
         state.close_session_gate();
         state.clear_session_records();
         if deadline_fired {
+            // DS-06 (a): teardown-before-rebind — the old
+            // transport (and its socket, still held by its reader
+            // thread for ~100 ms after the flag is set) is dropped
+            // HERE, before the loop-top factory binds again, so
+            // the rebind cannot collide with it. The drop was
+            // previously implicit at the end of the iteration; it
+            // is explicit now so the ordering is visible and cannot
+            // regress silently.
+            drop(transport);
             continue;
         }
         if !forwarder_retry_after_failure(
@@ -10831,6 +10899,91 @@ mod tests {
         assert!(
             state.engine_status_detail().contains("circuit breaker"),
             "breaker named in the status: {}",
+            state.engine_status_detail()
+        );
+    }
+
+    /// DS-06: the classifier behind the self-collision fix — no
+    /// holder (port reads free) and our own pid are transient, a
+    /// foreign pid is terminal.
+    #[test]
+    fn udp_addr_in_use_self_or_none_is_transient_foreign_is_terminal() {
+        assert!(
+            !udp_addr_in_use_is_foreign(&None),
+            "no holder (port free) is our own rebind race, not a foreign app"
+        );
+        let own = rsh_transport::port_conflict::PortHolder {
+            pid: std::process::id(),
+            process_name: "rsh-daemon".to_string(),
+            exe_path: None,
+        };
+        assert!(
+            !udp_addr_in_use_is_foreign(&Some(own)),
+            "our own pid holding the port is a rebind race, not a conflict"
+        );
+        let foreign = rsh_transport::port_conflict::PortHolder {
+            pid: std::process::id().wrapping_add(1),
+            process_name: "RSH.exe".to_string(),
+            exe_path: None,
+        };
+        assert!(
+            udp_addr_in_use_is_foreign(&Some(foreign)),
+            "a foreign pid is a real port conflict (F21 terminal)"
+        );
+    }
+
+    /// DS-06: a self-collision `AddrInUse` (the factory's transient
+    /// path: `None` with NO typed `BindFailed` recorded, as the
+    /// rebind race leaves it) must NOT stop the forwarder at one
+    /// attempt — it retries with the M-11 backoff and trips the
+    /// breaker after the policy's attempts instead of latching a
+    /// false "another app" error.
+    #[tokio::test]
+    async fn forwarder_retries_self_addr_in_use_instead_of_stopping() {
+        let (state, _dir) = test_state();
+        let (frame_tx, _frame_rx) = tokio::sync::mpsc::channel(8);
+        let (status_tx, _status_rx) = tokio::sync::mpsc::channel(8);
+        let policy = ForwarderRetryPolicy {
+            base: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            max_consecutive_failures: 3,
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let state_for_factory = Arc::clone(&state);
+        let attempts_for_factory = Arc::clone(&attempts);
+        // The last activation failed Unreachable (HELLO timeout,
+        // the no-board case) — the typed error a self-collision
+        // leaves behind, since the factory records no BindFailed
+        // for its own rebind race.
+        state.note_session_error_typed(
+            ConnectionError::Unreachable,
+            "no HELLO reply from the board",
+        );
+        let run = forward_with_retry_with_policy(
+            Arc::clone(&state),
+            TransportKind::Udp,
+            frame_tx,
+            status_tx,
+            move || {
+                attempts_for_factory.fetch_add(1, Ordering::SeqCst);
+                // DS-06 factory behaviour for a self-held port:
+                // no typed BindFailed is recorded.
+                let _ = &state_for_factory;
+                Option::<FakeSessionTransport>::None
+            },
+            policy,
+        );
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("self-collision forwarder must retry, then trip the breaker");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "a self-held port retries to the breaker, it must not stop at one attempt like a foreign conflict"
+        );
+        assert!(
+            state.engine_status_detail().contains("circuit breaker"),
+            "breaker named in the status, not a false 'another app': {}",
             state.engine_status_detail()
         );
     }
