@@ -62,7 +62,7 @@ use std::time::{Duration, Instant};
 use rsh_api::connection::ConnectionState;
 use rsh_api::pairing::countdown_ring_commands;
 use rsh_api::{
-    ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionInfo, FirmwareCheck,
+    app_version, ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionInfo, FirmwareCheck,
     FirmwareUpdateStatus, GameSummary, LedPattern, PairingInfo, ProfileSummary, ShifterGate,
     SnapshotInfo, TuningSettings, UserError,
 };
@@ -3450,19 +3450,41 @@ impl Ctx {
         self.data_dir.as_ref().map(|d| d.join("setup-done"))
     }
 
-    /// True once setup finished or was skipped. No data dir means no
-    /// marker can be read — TR §3 edge: that must NOT count as done,
-    /// or the wizard could never show on a machine without a data dir.
-    fn is_setup_done(&self) -> bool {
+    /// Read the setup marker. No data dir means no marker can be
+    /// read — TR §3 edge: that must NOT count as done, or the wizard
+    /// could never show on a machine without a data dir.
+    fn read_setup_marker(&self) -> SetupMarker {
         let Some(path) = self.setup_marker_path() else {
-            return false;
+            return SetupMarker::Missing;
         };
-        path.is_file()
+        read_setup_marker_file(&path)
     }
 
-    /// Record that setup finished (or was skipped) so the wizard
-    /// never shows again on this machine.
+    /// True when the wizard should show on this launch (F23).
+    /// Replaces the old `is_setup_done` boolean: a bare "done" file
+    /// can no longer tell a Skip from a Finish, so the decision
+    /// needs the marker state + the current version (see
+    /// [`setup_marker_should_show`]).
+    fn setup_should_show(&self) -> bool {
+        setup_marker_should_show(&self.read_setup_marker(), app_version())
+    }
+
+    /// Record that setup finished, so the wizard never shows again
+    /// on this machine (any version — a finished setup stays done).
     fn mark_setup_done(&self) {
+        self.write_setup_marker("done");
+    }
+
+    /// Record that setup was SKIPPED (F23): unlike Finish, a skip
+    /// re-offers the wizard once on the next version, so a skipped
+    /// setup (e.g. the vJoy Drivers step never seen) is not lost
+    /// forever on an update install.
+    fn mark_setup_skipped(&self) {
+        self.write_setup_marker("skipped");
+    }
+
+    /// Write a versioned marker (`<state> <app version>`).
+    fn write_setup_marker(&self, state: &str) {
         let Some(path) = self.setup_marker_path() else {
             return;
         };
@@ -3471,7 +3493,7 @@ impl Ctx {
                 return;
             }
         }
-        match std::fs::write(&path, "done\n") {
+        match std::fs::write(&path, format!("{state} {}\n", app_version())) {
             Ok(()) => eprintln!("RSH-UI setup marker written: {}", path.display()),
             Err(e) => eprintln!("RSH-UI setup marker write failed: {e}"),
         }
@@ -3488,7 +3510,59 @@ impl Ctx {
             }
         }
     }
+}
 
+/// F23 — setup-marker states (file `<data_dir>/setup-done`).
+///
+/// v2.0.2 and earlier wrote the bare word `done` for BOTH Finish
+/// and Skip, so an update install could never tell them apart: a
+/// user who skipped in v2.0.1 never saw the wizard again in v2.0.2,
+/// and with it never got the vJoy Drivers step. v2.0.3+ markers are
+/// versioned (`done <version>` / `skipped <version>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetupMarker {
+    /// No marker file (fresh profile, or no data dir).
+    Missing,
+    /// Setup finished on the recorded version — never re-offer.
+    Done(String),
+    /// Setup skipped on the recorded version — re-offer once the
+    /// app version changes, then the new choice is recorded.
+    Skipped(String),
+    /// Pre-v2.0.3 bare `done` (or unreadable/corrupt content):
+    /// Skip vs Finish is unknowable, so the wizard is offered once
+    /// and the user's new choice writes a versioned marker.
+    Legacy,
+}
+
+/// Parse marker file content into a [`SetupMarker`].
+fn parse_setup_marker(content: &str) -> SetupMarker {
+    let mut parts = content.split_whitespace();
+    match (parts.next(), parts.next()) {
+        (Some("done"), Some(version)) => SetupMarker::Done(version.to_string()),
+        (Some("skipped"), Some(version)) => SetupMarker::Skipped(version.to_string()),
+        _ => SetupMarker::Legacy,
+    }
+}
+
+/// Read a marker file: missing/unreadable file is [`SetupMarker::Missing`].
+fn read_setup_marker_file(path: &std::path::Path) -> SetupMarker {
+    match std::fs::read_to_string(path) {
+        Ok(content) => parse_setup_marker(&content),
+        Err(_) => SetupMarker::Missing,
+    }
+}
+
+/// Should the wizard show on this launch for this marker state?
+/// `current_version` is [`app_version()`].
+fn setup_marker_should_show(marker: &SetupMarker, current_version: &str) -> bool {
+    match marker {
+        SetupMarker::Done(_) => false,
+        SetupMarker::Skipped(version) => version != current_version,
+        SetupMarker::Missing | SetupMarker::Legacy => true,
+    }
+}
+
+impl Ctx {
     /// Profile row by list index (popover + Settings share the same
     /// `list_profiles()` order; presets are always empty, so the
     /// popover's selected index maps directly).
@@ -4390,7 +4464,9 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
         win.unwrap().on_setup_skip(move || {
             if let Some(w) = win.upgrade() {
                 w.set_setup_mode(false);
-                ctx.mark_setup_done();
+                // F23: a skip is NOT a finish — record it as skipped
+                // so the wizard is re-offered on the next version.
+                ctx.mark_setup_skipped();
                 eprintln!("RSH-UI setup skipped (wizard closed)");
             }
         });
@@ -7024,10 +7100,12 @@ fn main() -> Result<(), slint::PlatformError> {
     // M-5/A1: listen for page forwards from second instances
     // (Windows named pipe; Linux uses the request file).
     ui_lifecycle::listen_for_page_requests(ctx.page_requests.clone());
-    // First-run wizard: --page setup, or no setup-done marker yet.
-    // A19: upgrade users see the wizard once (the marker is new) —
-    // kept on purpose now that the Drivers step is in it.
-    let setup = args.setup || !ctx.is_setup_done();
+    // First-run wizard: --page setup, or the marker says so (F23).
+    // Finished setups never re-show; skipped setups re-show once
+    // per new version; a pre-v2.0.3 bare "done" marker (Skip vs
+    // Finish unknowable) re-shows once so a skipped setup is not
+    // lost on an update install — the v2.0.2 report.
+    let setup = args.setup || ctx.setup_should_show();
     win.set_page(args.page);
     win.set_setup_mode(setup);
     win.set_setup_step(0);
@@ -8101,6 +8179,128 @@ mod tests {
             last_body()
         );
         assert_eq!(ctx.flap_count.get(), 0, "count resets after folding");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // F23: the v2.0.2 report — a user who skipped setup in v2.0.1
+    // never saw the wizard again after the update install, because
+    // Skip and Finish both wrote the bare word "done".
+    #[test]
+    fn f23_parse_setup_marker() {
+        assert_eq!(
+            parse_setup_marker("done 2.0.2\n"),
+            SetupMarker::Done("2.0.2".to_string())
+        );
+        assert_eq!(
+            parse_setup_marker("skipped 2.0.1"),
+            SetupMarker::Skipped("2.0.1".to_string())
+        );
+        // Pre-v2.0.3 bare marker: Skip vs Finish unknowable.
+        assert_eq!(parse_setup_marker("done\n"), SetupMarker::Legacy);
+        assert_eq!(parse_setup_marker("done"), SetupMarker::Legacy);
+        // Unreadable / corrupt content re-offers once, like legacy.
+        assert_eq!(parse_setup_marker(""), SetupMarker::Legacy);
+        assert_eq!(parse_setup_marker("garbage\n"), SetupMarker::Legacy);
+        assert_eq!(parse_setup_marker("done \n"), SetupMarker::Legacy);
+    }
+
+    #[test]
+    fn f23_should_show_decision_matrix() {
+        // Fresh profile → wizard shows.
+        assert!(setup_marker_should_show(&SetupMarker::Missing, "2.0.3"));
+        // Finished setup never re-shows, any version.
+        assert!(!setup_marker_should_show(
+            &SetupMarker::Done("2.0.2".to_string()),
+            "2.0.3"
+        ));
+        assert!(!setup_marker_should_show(
+            &SetupMarker::Done("2.0.3".to_string()),
+            "2.0.3"
+        ));
+        // Skipped setup re-shows once the version changes, and only
+        // then — same-version skip stays hidden.
+        assert!(setup_marker_should_show(
+            &SetupMarker::Skipped("2.0.2".to_string()),
+            "2.0.3"
+        ));
+        assert!(!setup_marker_should_show(
+            &SetupMarker::Skipped("2.0.3".to_string()),
+            "2.0.3"
+        ));
+        // Legacy bare "done" (the v2.0.2 report) re-shows once.
+        assert!(setup_marker_should_show(&SetupMarker::Legacy, "2.0.3"));
+    }
+
+    #[test]
+    fn f23_marker_round_trip_through_ctx() {
+        let (ctx, dir) = fc2_test_ctx();
+        let marker = dir.join("setup-done");
+        // Fresh profile → wizard shows.
+        assert!(ctx.setup_should_show(), "fresh profile must show wizard");
+        // Finish writes a versioned marker → never re-shows.
+        ctx.mark_setup_done();
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("marker written"),
+            format!("done {}\n", app_version())
+        );
+        assert!(!ctx.setup_should_show(), "finished setup must hide wizard");
+        // Reopen (A1) clears the marker → wizard shows again.
+        ctx.clear_setup_marker();
+        assert!(!marker.is_file(), "reopen must delete the marker");
+        assert!(ctx.setup_should_show(), "cleared marker must show wizard");
+        // Skip writes a versioned skipped marker → hidden on this
+        // version (the skip itself is not re-prompted immediately).
+        ctx.mark_setup_skipped();
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("marker written"),
+            format!("skipped {}\n", app_version())
+        );
+        assert!(
+            !ctx.setup_should_show(),
+            "same-version skip must hide wizard"
+        );
+        // The reported case: a v2.0.1 skip left a bare "done" file,
+        // and the v2.0.2 update install never showed the wizard.
+        // v2.0.3 treats that legacy marker as "show once".
+        std::fs::write(&marker, "done\n").expect("legacy marker");
+        assert_eq!(ctx.read_setup_marker(), SetupMarker::Legacy);
+        assert!(
+            ctx.setup_should_show(),
+            "legacy bare marker must show wizard once"
+        );
+        // And a skip recorded under an OLDER version re-offers on
+        // the current version (the update-install path).
+        std::fs::write(&marker, "skipped 2.0.1\n").expect("old skip marker");
+        assert!(
+            ctx.setup_should_show(),
+            "older-version skip must re-offer wizard on update"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f23_run_setup_again_reopens_wizard() {
+        // A1 reopen, end to end at the callback level: the Settings
+        // "Run setup" button fires `run-setup-again`, which must
+        // clear the marker and open the wizard at step 0 — even
+        // when the marker came from a v2.0.1 skip.
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F23 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let marker = dir.join("setup-done");
+        std::fs::write(&marker, "done\n").expect("legacy marker");
+        assert!(
+            ctx.setup_should_show(),
+            "legacy marker must show wizard on next launch"
+        );
+        win.set_setup_mode(false);
+        win.invoke_run_setup_again();
+        assert!(win.get_setup_mode(), "reopen must open the wizard");
+        assert_eq!(win.get_setup_step(), 0, "reopen starts at step 0");
+        assert!(!marker.is_file(), "reopen must delete the marker");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
