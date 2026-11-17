@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ipc_api::IpcApi;
 
@@ -54,6 +54,21 @@ pub const FATAL_FRESHNESS: Duration = Duration::from_secs(600);
 /// respawn latch trips — the UI stops auto-spawning and shows the
 /// fatal state with a manual Retry (the Reconnect button) instead.
 pub const MAX_FAILED_SPAWNS: u32 = 5;
+
+/// F25 (v2.0.3): a live link that dies within this long of going
+/// live counts as a failed spawn (see
+/// [`SpawnBudget::record_live_link_lost`]) instead of resetting the
+/// budget — a daemon that answers briefly then dies is flapping,
+/// not healthy. 30 s: a daemon that survives that long has bound
+/// IPC, answered polls and completed a slow refresh (the rig's flap
+/// fixture dies after ~5 s, far inside the window), so a later
+/// death is a new incident and the budget resets. The choice is a
+/// judgement call, not a measurement: a shorter window would let a
+/// slow-starting flap (live 10–20 s per cycle) respawn for longer;
+/// a longer one would punish a genuinely healthy daemon that dies
+/// of an unrelated cause an hour later — but only by counting that
+/// one death, since the next success after it still resets.
+pub const FLAP_WINDOW: Duration = Duration::from_secs(30);
 
 /// F3 (v2.0.3): exponential backoff between auto-spawn attempts:
 /// 1 s, 5 s, 30 s, then 60 s capped. `failed_spawns` is how many
@@ -115,6 +130,12 @@ struct SpawnBudgetInner {
     /// failure while auto-spawn was healthy costs the monitor
     /// nothing (its budget is simply fresh again).
     was_latched: bool,
+    /// When the current live link went live (F25): set by
+    /// [`SpawnBudget::record_success`], cleared by
+    /// [`SpawnBudget::record_live_link_lost`]. `None` while no link
+    /// is live (or the link was never recorded) — a death then is
+    /// not a flap, it is just a failed spawn counted elsewhere.
+    live_since: Option<Instant>,
 }
 
 impl SpawnBudget {
@@ -126,6 +147,7 @@ impl SpawnBudget {
                 latched: false,
                 manual_retry_pending: false,
                 was_latched: false,
+                live_since: None,
             }),
         }
     }
@@ -172,13 +194,53 @@ impl SpawnBudget {
         }
     }
 
-    /// A live daemon answered: the budget is fresh again.
+    /// A live daemon answered: the link's birth is recorded and
+    /// the latch / manual-retry state clears — but the failure
+    /// count is NOT reset here (F25). The reset is deferred to
+    /// [`SpawnBudget::record_live_link_lost`]: only a link that
+    /// stayed live past [`FLAP_WINDOW`] proves the daemon healthy
+    /// and earns a fresh budget. Resetting here (the old F3
+    /// behaviour) let a flap daemon — live ~5 s, dead, respawned
+    /// at ~7.5 s cadence — respawn forever, each brief life
+    /// wiping the count. While a link is live the monitor never
+    /// consults the budget (it pings instead), so a still-spent
+    /// count during a live link is invisible and harmless.
     pub fn record_success(&self) {
         let mut inner = self.lock();
-        inner.failed_spawns = 0;
+        inner.live_since = Some(Instant::now());
         inner.latched = false;
         inner.manual_retry_pending = false;
         inner.was_latched = false;
+    }
+
+    /// The live link died (F25): called once per death, by the
+    /// health monitor when it declares the daemon dead — the one
+    /// place that observes a death, so a death is never counted
+    /// twice. A link that died within [`FLAP_WINDOW`] of going
+    /// live counts as a failed spawn (latching at
+    /// [`MAX_FAILED_SPAWNS`], like a crash on start); a link that
+    /// lived longer was genuinely healthy, so the budget resets.
+    /// A death with no recorded live link (never went live, or
+    /// already accounted) is a no-op — crash-on-start deaths are
+    /// counted by [`SpawnBudget::record_spawn_failure`] instead.
+    pub fn record_live_link_lost(&self) {
+        self.record_live_link_lost_at(Instant::now());
+    }
+
+    fn record_live_link_lost_at(&self, now: Instant) {
+        let mut inner = self.lock();
+        let Some(since) = inner.live_since.take() else {
+            return;
+        };
+        if now.saturating_duration_since(since) < FLAP_WINDOW {
+            inner.failed_spawns = inner.failed_spawns.saturating_add(1);
+            if inner.failed_spawns >= MAX_FAILED_SPAWNS {
+                inner.latched = true;
+            }
+        } else {
+            inner.failed_spawns = 0;
+            inner.latched = false;
+        }
     }
 
     /// A Reconnect click resets the budget once: the manual retry
@@ -545,7 +607,12 @@ mod tests {
     }
 
     #[test]
-    fn spawn_budget_latches_after_five_failures_and_resets_on_success() {
+    fn spawn_budget_latches_after_five_failures_then_link_death_decides() {
+        // F25: `record_success` no longer resets the count by
+        // itself — the reset is deferred until the link proves
+        // healthy (see `record_live_link_lost`). A link that dies
+        // at once is a flap and re-latches; a link that lives past
+        // FLAP_WINDOW earns the fresh budget.
         let budget = SpawnBudget::new();
         assert!(budget.auto_spawn_allowed());
         assert_eq!(budget.next_delay(), Some(Duration::from_secs(1)));
@@ -559,9 +626,78 @@ mod tests {
         assert!(!budget.auto_spawn_allowed());
         assert_eq!(budget.next_delay(), None);
         budget.record_success();
+        assert!(!budget.is_latched(), "a live link clears the latch flag");
+        budget.record_live_link_lost();
+        assert!(
+            budget.is_latched(),
+            "a link that dies at once is a flap, not a recovery"
+        );
+        assert!(!budget.auto_spawn_allowed());
+
+        // The same five failures, then a link that lives past the
+        // window: the budget is fresh again.
+        let budget = SpawnBudget::new();
+        for _ in 0..MAX_FAILED_SPAWNS {
+            budget.record_spawn_failure();
+        }
+        assert!(budget.is_latched());
+        budget.record_success();
+        let now = Instant::now();
+        budget.record_live_link_lost_at(now + FLAP_WINDOW + Duration::from_secs(1));
         assert!(!budget.is_latched());
         assert!(budget.auto_spawn_allowed());
         assert_eq!(budget.next_delay(), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn spawn_budget_flap_deaths_consume_the_budget() {
+        // F25: the rig observed 12 spawns in 90 s (~7.5 s
+        // cadence) from a daemon that went live then died quickly
+        // — every brief life reset the budget. Now each flap death
+        // counts, so five flaps latch exactly like five
+        // crash-on-start failures.
+        let budget = SpawnBudget::new();
+        for _ in 0..MAX_FAILED_SPAWNS {
+            budget.record_success();
+            budget.record_live_link_lost();
+            assert!(
+                budget.next_delay().is_some() || budget.is_latched(),
+                "budget must stay spendable until the latch"
+            );
+        }
+        assert!(budget.is_latched());
+        assert!(!budget.auto_spawn_allowed());
+        assert_eq!(budget.next_delay(), None);
+    }
+
+    #[test]
+    fn spawn_budget_flap_after_failures_latches() {
+        // Four failed spawns, then a link that flaps: the flap
+        // spends the last of the budget instead of wiping the four
+        // failures away.
+        let budget = SpawnBudget::new();
+        for _ in 0..4 {
+            budget.record_spawn_failure();
+        }
+        assert!(budget.auto_spawn_allowed());
+        budget.record_success();
+        budget.record_live_link_lost();
+        assert!(budget.is_latched());
+        assert!(!budget.auto_spawn_allowed());
+    }
+
+    #[test]
+    fn spawn_budget_link_death_without_a_live_link_is_a_noop() {
+        // Crash-on-start deaths never record a live link, so they
+        // must not double-count here — they are counted by
+        // `record_spawn_failure` alone.
+        let budget = SpawnBudget::new();
+        budget.record_live_link_lost();
+        assert!(budget.auto_spawn_allowed());
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(1)));
+        budget.record_spawn_failure();
+        budget.record_live_link_lost();
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(5)));
     }
 
     #[test]

@@ -6613,10 +6613,19 @@ fn spawn_health_monitor(
                                     }
                                 }
                             }
-                            if still_current
-                                && !send_daemon_down_once(&tx, &mut down_notified)
-                            {
-                                return;
+                            if still_current {
+                                // F25: the link that just died is
+                                // charged against the budget when it
+                                // flapped (died within FLAP_WINDOW
+                                // of going live) — a flap daemon
+                                // must not respawn forever on
+                                // `record_success` resets. This is
+                                // the one place a death is counted,
+                                // so it can never double-count.
+                                budget.record_live_link_lost();
+                                if !send_daemon_down_once(&tx, &mut down_notified) {
+                                    return;
+                                }
                             }
                         }
                     }
