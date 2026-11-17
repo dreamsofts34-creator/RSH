@@ -549,7 +549,7 @@ pub fn gate_respawn_bound() -> (bool, String) {
         &ui,
         &data_dir,
         &display,
-        225,
+        310,
         &log_path,
         &[
             ("RSH_FAKE_DAEMON_MODE", "crash"),
@@ -564,29 +564,15 @@ pub fn gate_respawn_bound() -> (bool, String) {
             );
         }
     };
-    // Wait for the loop to stop: poll the spawn log until no spawn
-    // has happened for 30 s (the latch), or 210 s elapse (the loop
-    // is still running — the pre-fix behaviour). The UI quits on
-    // its own 225 s timer afterwards.
-    let started = Instant::now();
-    let mut quiet_ms: Option<u64> = None;
-    loop {
-        let times = spawn_log_times(&spawn_log);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
-        if let Some(last) = times.last() {
-            let q = now_ms.saturating_sub(*last);
-            if q >= 30_000 {
-                quiet_ms = Some(q);
-                break;
-            }
-        }
-        if started.elapsed() >= Duration::from_secs(210) {
-            break;
-        }
-        std::thread::sleep(Duration::from_secs(5));
-    }
+    // Observe the FULL 300 s (no early break): the backoff
+    // delays (1/5/30/60 s) are longer than any short quiet window,
+    // so breaking on "30 s of quiet" mistakes a 30 s backoff sleep
+    // for the latch. The latch itself (5th failed spawn) lands at
+    // ~260 s on the measured cadence (gaps ~16/41/45/75 s) — the
+    // UI log's "RespawnBudgetExhausted" notification
+    // ("RSH stopped — automatic restart off") is the precise latch
+    // proof, read from notifications.json below.
+    std::thread::sleep(Duration::from_secs(300));
     let ui_alive = child_alive(&mut child);
     let times = spawn_log_times(&spawn_log);
     let spawns = times.len();
@@ -595,30 +581,42 @@ pub fn gate_respawn_bound() -> (bool, String) {
         .map(|w| w[1].saturating_sub(w[0]))
         .collect();
     let non_decreasing = gaps.windows(2).all(|g| g[1] + 3000 >= g[0]);
+    let notes = read_json(&data_dir.join("notifications.json"));
+    let latched = notes
+        .as_ref()
+        .and_then(|v| v.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|it| {
+                it.get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|t| t == "RSH stopped — automatic restart off")
+            })
+        });
     // Let the UI quit on its own timer, then reap (the timer is
-    // 225 s from launch; the latch is usually observed ~170 s in,
-    // so wait the remainder + 10 s).
-    let remaining = Duration::from_secs(225)
+    // 310 s from launch; the observation ends at ~300 s, so wait
+    // the remainder + 10 s).
+    let remaining = Duration::from_secs(310)
         .saturating_sub(ui_started.elapsed())
         .saturating_add(Duration::from_secs(10));
     let exit = wait_child_timeout(&mut child, remaining);
     let _ = std::fs::remove_dir_all(&stage);
     report.check(
-        "ui alive when the loop stops",
+        "ui alive at the end of the 300 s observation",
         ui_alive,
         &format!(
             "UI process {}",
             if ui_alive {
                 "alive"
             } else {
-                "DEAD before the loop stopped"
+                "DEAD before 300 s"
             }
         ),
     );
     report.check(
-        "spawn count <= 6",
+        "spawn count <= 6 in 300 s",
         spawns <= 6,
-        &format!("{spawns} daemon spawns before the latch (pre-fix: 17 in 185 s)"),
+        &format!("{spawns} daemon spawns (pre-fix: 17 in 185 s); gaps (ms): {gaps:?}"),
     );
     report.check(
         "gaps non-decreasing (backoff grows)",
@@ -626,13 +624,9 @@ pub fn gate_respawn_bound() -> (bool, String) {
         &format!("gaps (ms): {gaps:?} (pre-fix: flat ~11000 ms)"),
     );
     report.check(
-        "no spawn in last 30 s",
-        quiet_ms.is_some_and(|q| q >= 30_000),
-        &format!(
-            "quiet for {} ms (latch observed after {:.0} s)",
-            quiet_ms.unwrap_or(0),
-            started.elapsed().as_secs_f64()
-        ),
+        "latch observed (RespawnBudgetExhausted notification)",
+        latched,
+        "notifications.json must hold 'RSH stopped — automatic restart off' once the budget is exhausted",
     );
     report.check(
         "UI exits on its --quit-after timer",
@@ -1552,6 +1546,21 @@ fn run_fb_condition(
 /// UI thread shows up as a missed sample / a late close-ack / a
 /// late exit). The in-process tick log is a follow-up for the UI
 /// worker (env-gated tick timings in the frame timer).
+///
+/// Discrimination limit (measured 2026-11-17): this check PASSES on
+/// the PRE-FIX binary too (slow ack 6 ms). The old `reconnect_to_live`
+/// finishes in <2 s against a 300 ms daemon (most of its reads are
+/// cache reads; only `connect`/`pairing_status` hit the wire), and
+/// the poller's `link_dead` fail-fast truncates a hung daemon's calls
+/// — so no fixture mode here produces a >1 s freeze. The check is a
+/// regression net for the POST-fix behaviour (it would catch a
+/// reintroduction of UI-thread blocking in the dead/silent/slow
+/// states), not proof against the original v2.0.2 freeze. That freeze
+/// is proven by the code analysis (the old `reconnect_to_live`'s
+/// blocking calls on the UI thread), the F5/F6 job migration + unit
+/// tests, and the user-PC hang reports. A `hang-after-live` fake
+/// daemon mode (live, then stops replying while holding the socket)
+/// would let this check prove the freeze — follow-up, not done here.
 #[must_use]
 pub fn gate_frame_budget() -> (bool, String) {
     let mut report = LcReport::new();
@@ -1911,7 +1920,16 @@ pub fn gate_lifecycle_soak() -> (bool, String) {
             .count();
         let ping = ipc_ping(&data_dir);
         let in_recovery = kill_at.is_some_and(|k| k.elapsed() < Duration::from_secs(15));
-        if daemon_n != 1 {
+        // During the recovery window the daemon is legitimately 0
+        // (killed, not yet respawned) — but never 2. Outside the
+        // window it must be exactly 1.
+        if in_recovery {
+            if daemon_n > 1 {
+                violations.push(format!(
+                    "t={secs}s: daemon count {daemon_n} during recovery (must be <= 1)"
+                ));
+            }
+        } else if daemon_n != 1 {
             violations.push(format!("t={secs}s: daemon count {daemon_n}"));
         }
         if ui_n != 1 {
@@ -1933,7 +1951,7 @@ pub fn gate_lifecycle_soak() -> (bool, String) {
     let _ = daemon.try_wait();
     let _ = std::fs::remove_dir_all(&stage);
     report.check(
-        "every 5 s sample: daemon == 1",
+        "every 5 s sample: daemon == 1 (0 allowed <15 s after the kill)",
         !violations.iter().any(|v| v.contains("daemon count")),
         &format!("{samples} samples, violations: {violations:?}"),
     );

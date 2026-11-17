@@ -16,12 +16,15 @@
 #       (deep-scan Round 2, H1): if the rig crate disappears, the job
 #       FAILS, it never goes back to skipping.
 #   tauri-build  — src-tauri/ landed (Phase A2/E).
+#   windows-pipe-loop — F18 (v2.0.3): the REAL daemon on Windows with a
+#       named-pipe client held > 10 s — the execution proof for the
+#       v2.0.2 pipe loop, which the Linux rig cannot reproduce.
 # The `Check ... present` steps are kept as tripwires: a skip in Phase H
 # means a landed artifact vanished from the tree, and the loud ::notice
 # is the signal to investigate — it is NOT a pass and NOT normal.
 # (bench-gate and audit keep their fail-closed missing-prerequisite
 # branches for the same reason: thresholds.json / Cargo.lock must exist.)
-# The `gate` job (last job) aggregates all 12 jobs and fails unless every
+# The `gate` job (last job) aggregates all 13 jobs and fails unless every
 # one of them reports success — it is the single required check.
 #
 # ---- What this workflow does NOT do (deliberately) ----
@@ -351,6 +354,59 @@ jobs:
       - name: cargo test --workspace
         if: steps.check.outputs.run == 'true'
         run: cargo test --workspace
+
+  windows-pipe-loop:
+    name: windows-pipe-loop
+    # F18 (v2.0.3): the Windows execution test for the v2.0.2 pipe
+    # loop. The Linux rig cannot reproduce a Windows named-pipe
+    # failure (the user's log is the only repro evidence there), so
+    # this job is the proof the bug class cannot recur: the REAL
+    # daemon runs on Windows, a named-pipe client connects and HOLDS
+    # the pipe for 12 s (the failing sequence — pre-fix the second
+    # pipe create failed ~1 s after the first client connected, and
+    # after 5 failures the daemon died and the UI respawned it), and
+    # the daemon must still be alive with a second client able to
+    # connect afterwards. Only F17/F18 touches this workflow's pipe
+    # test — no other stream edits .github/workflows/.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check daemon crate present (fail closed)
+        id: check
+        shell: bash
+        run: |
+          if [ -d crates/rsh-daemon ] && [ -f tools/ci/windows-pipe-loop.ps1 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=missing-pipe-test" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Fail closed — pipe test missing
+        if: steps.check.outputs.state == 'missing-pipe-test'
+        shell: bash
+        run: |
+          echo "::error::crates/rsh-daemon or tools/ci/windows-pipe-loop.ps1 is missing — the Windows pipe-loop test (F18) is a landed artifact. windows-pipe-loop is FAIL-CLOSED: a missing test fails the job, it never skips. Restore the files; do not re-add a skip."
+          exit 1
+      - name: Install Rust 1.100.0
+        if: steps.check.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - name: Cache Cargo dependencies
+        if: steps.check.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+      # The daemon alone (no Tauri app, no sidecar, no frontend): its
+      # build needs no .NET SDK or Node.js.
+      - name: cargo build -p rsh-daemon
+        if: steps.check.outputs.run == 'true'
+        run: cargo build -p rsh-daemon
+      - name: Windows pipe loop (real daemon + held client > 10 s)
+        if: steps.check.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/windows-pipe-loop.ps1 `
+            -DaemonExe target/debug/rsh-daemon.exe `
+            -DataDir "$env:TEMP\rsh-pipe-loop"
 
   fuzz-quick:
     name: fuzz-quick
@@ -794,6 +850,7 @@ jobs:
       - audit
       - rig-gate
       - tauri-build
+      - windows-pipe-loop
     if: always()
     steps:
       - name: All CI jobs must have succeeded

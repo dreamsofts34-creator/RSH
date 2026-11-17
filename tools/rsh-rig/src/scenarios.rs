@@ -1584,7 +1584,7 @@ pub fn registry() -> Vec<Scenario> {
         // ---- v2.0.3 lifecycle checks (F17): real daemon/UI processes under Xvfb ----
         Scenario {
             id: "gate-respawn-bound",
-            description: "Gate (F17.1), runtime: crash-on-start daemon + UI health monitor ~190 s — spawns <= 6, non-decreasing gaps (backoff 1/5/30/60 s), no spawn in the last 30 s, UI alive. Pre-fix: 17 spawns in 185 s, flat ~11 s cadence.",
+            description: "Gate (F17.1), runtime: crash-on-start daemon + UI health monitor 300 s — spawns <= 6, non-decreasing gaps (backoff 1/5/30/60 s), latch observed via the 'RSH stopped — automatic restart off' notification, UI alive. Pre-fix: 17 spawns in 185 s, flat ~11 s cadence.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
