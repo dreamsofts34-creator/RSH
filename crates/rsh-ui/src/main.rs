@@ -1568,7 +1568,15 @@ impl Ctx {
         // restart (best-effort save; a failed write never blocks
         // the notification itself).
         self.persist_notifications();
-        sync_to_window(&self.notifications.borrow(), win);
+        // F27: the entry is kept in the center + on disk, but the
+        // model write is skipped while the window is hidden — a
+        // model change on a hidden window can drive a draw on the
+        // torn-down drawable (the F17-FINDING-5 close-vs-seed
+        // SIGSEGV class). `resync_after_reopen` syncs the model
+        // when the window comes back, so nothing is lost.
+        if !self.hidden.load(Ordering::SeqCst) {
+            sync_to_window(&self.notifications.borrow(), win);
+        }
     }
 
     /// Show a typed error gracefully (B6): the title is the plain
@@ -1835,6 +1843,17 @@ impl Ctx {
                     return;
                 };
                 self.busy_jobs.borrow_mut().remove(&kind);
+                // F27: a job that finished after the window was
+                // hidden must not apply to it — the apply closures
+                // touch the window (props, models, notifies) and
+                // the close-vs-apply race SIGSEGVs under Xvfb
+                // (F17-FINDING-5). The result is dropped; the
+                // frame timer re-derives the display from
+                // state/cache when the window comes back.
+                if self.hidden.load(Ordering::SeqCst) {
+                    eprintln!("RSH-UI job {kind:?} finished while hidden — apply skipped (F27)");
+                    return;
+                }
                 apply(self, win, result);
                 self.refresh(win, 0);
             }
@@ -2760,12 +2779,35 @@ impl Ctx {
     /// Apply a finished reconnect seed (F5, UI thread): the old
     /// `reconnect_to_live` body, but every value comes from the
     /// seed or the slow cache — no IPC round-trip runs here.
+    ///
+    /// F27: when the window is hidden to tray (`hidden`), the
+    /// state swap still runs but NO window property is touched.
+    /// The seed fetch takes ~1.3 s against a slow daemon, so a
+    /// close that lands mid-fetch delivers the completion after
+    /// the close — and the apply's model writes (notification /
+    /// profile / game / binding lists) on a hidden window drove a
+    /// draw on the torn-down X11 drawable, `SIGSEGV`ing the UI
+    /// under Xvfb within ~3 s of the close (F17-FINDING-5).
+    /// Scalar property writes are safe while hidden (the frame
+    /// timer does them every tick), but model writes are not, so
+    /// the whole window half is skipped, not cherry-picked. The
+    /// live state is already swapped in, and
+    /// [`Ctx::resync_after_reopen`] re-syncs every prop from
+    /// state/cache when the window comes back — nothing the user
+    /// sees is lost, only deferred.
     fn apply_reconnect_seed(
         &self,
         win: &MainWindow,
         live_api: Arc<IpcApi>,
         seed: crate::ipc_api::LiveSeed,
     ) {
+        if self.hidden.load(Ordering::SeqCst) {
+            self.swap_to_live(live_api);
+            eprintln!(
+                "RSH-UI reconnect seed landed while hidden — state swapped, window apply skipped (F27)"
+            );
+            return;
+        }
         self.swap_to_live(live_api);
         win.set_daemon_live(true);
         // FC2: live again — the daemon-error banner clears.
@@ -2849,6 +2891,27 @@ impl Ctx {
         self.refresh_profiles(win);
         self.refresh_games(win);
         self.sync_diag(win);
+        self.refresh(win, 0);
+    }
+
+    /// Re-sync the window after it comes back from tray-hide
+    /// (F27): a seed that landed while hidden swapped the live
+    /// state but skipped every window write, so the props are
+    /// stale until something re-derives them. The live flag +
+    /// the cache-seeded switches (controller, autostart, bindings,
+    /// knobs, firmware cache) are re-applied here, the
+    /// notification model is re-synced (entries pushed while
+    /// hidden were kept in the center + on disk, never drawn),
+    /// then a full refresh re-derives the rest from state/cache.
+    /// Called from [`apply_page_request`] only when the window
+    /// actually was hidden — a page forward while visible needs
+    /// no re-sync (the frame timer already re-derives every tick).
+    fn resync_after_reopen(&self, win: &MainWindow) {
+        if self.is_live() {
+            win.set_daemon_live(true);
+            self.seed_live_state(win);
+        }
+        sync_to_window(&self.notifications.borrow(), win);
         self.refresh(win, 0);
     }
 
@@ -6468,8 +6531,14 @@ fn handle_live_event(win: &slint::Weak<MainWindow>, ctx: &Ctx, ev: &AppEvent) {
     if pushed {
         // M10: daemon events persist like any other notification.
         ctx.persist_notifications();
+        // F27: same hidden-window guard as `Ctx::notify` — the
+        // model write is skipped while hidden (the entry is kept
+        // in the center + on disk; `resync_after_reopen` syncs it
+        // when the window comes back).
         if let Some(w) = win.upgrade() {
-            sync_to_window(&ctx.notifications.borrow(), &w);
+            if !ctx.hidden.load(Ordering::SeqCst) {
+                sync_to_window(&ctx.notifications.borrow(), &w);
+            }
         }
     }
 }
@@ -6756,7 +6825,14 @@ fn apply_page_request(win: &MainWindow, ctx: &Ctx, page: &str) {
     let _ = win.show();
     #[cfg(windows)]
     ui_lifecycle::restore_and_foreground();
-    ctx.hidden.store(false, Ordering::SeqCst);
+    // F27: only a window that actually was hidden needs the
+    // reopen re-sync — a seed may have landed while it was hidden
+    // (state swapped, window writes skipped), and notifications
+    // pushed while hidden were never drawn.
+    let was_hidden = ctx.hidden.swap(false, Ordering::SeqCst);
+    if was_hidden {
+        ctx.resync_after_reopen(win);
+    }
     if page == "setup" {
         ctx.clear_setup_marker();
         ctx.learn_target.set(0);
@@ -8057,6 +8133,108 @@ mod tests {
             "a real transport failure must notify once"
         );
         assert_eq!(last_title(), "Reconnect failed");
+
+        // Teardown: `mark_dead` drops the live link (F7) so the
+        // server thread ends when the client goes away.
+        ctx.mark_dead(&win);
+        drop(live_api);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ctx_dir);
+    }
+
+    /// F27: a reconnect seed that lands after the window was
+    /// hidden to tray must swap the live state but touch no window
+    /// prop and push no notification — the close-vs-seed-apply
+    /// race `SIGSEGV`ed under Xvfb (F17-FINDING-5). A generic job
+    /// that finishes while hidden must likewise never run its
+    /// apply. Reopening re-syncs the window
+    /// (`resync_after_reopen`): the live flag comes back and no
+    /// deferred notify fires twice.
+    #[test]
+    #[cfg(unix)]
+    fn seed_and_generic_job_landing_while_hidden_skip_the_window() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F27 gate test skipped: no usable display/backend");
+            return;
+        };
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-f27-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let server = Arc::new(rsh_ipc::IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let live_api = IpcApi::connect(&sock).expect("connect");
+        let (ctx, ctx_dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+
+        // Go live while visible, then hide (the close).
+        ctx.swap_to_live(live_api.clone());
+        assert!(!win.get_daemon_live(), "window starts not-live");
+        ctx.hidden.store(true, Ordering::SeqCst);
+        let before = unread();
+        ctx.apply_reconnect_seed(
+            &win,
+            live_api.clone(),
+            crate::ipc_api::LiveSeed::fetch(&live_api, ApiTransport::Wifi),
+        );
+        assert!(ctx.is_live(), "the state still swaps while hidden");
+        assert!(
+            !win.get_daemon_live(),
+            "no window write while hidden — the close-vs-apply race"
+        );
+        assert_eq!(unread(), before, "no notify while hidden");
+
+        // A generic job finishing while hidden never runs its apply.
+        let applied = std::rc::Rc::new(std::cell::Cell::new(false));
+        let applied_in_job = applied.clone();
+        assert!(
+            ctx.run_generic_job(
+                &win,
+                JobKind::SettingsOp,
+                "Hidden test job…",
+                move |_api| JobResult::Unit(Ok(())),
+                move |_ctx, _win, _result| {
+                    applied_in_job.set(true);
+                },
+            ),
+            "job should start"
+        );
+        drain_all_jobs(&ctx, &win);
+        assert!(
+            !applied.get(),
+            "a job that finished while hidden must not apply"
+        );
+
+        // Reopen: the live flag comes back, with no duplicate notify.
+        ctx.hidden.store(false, Ordering::SeqCst);
+        ctx.resync_after_reopen(&win);
+        assert!(
+            win.get_daemon_live(),
+            "reopen re-syncs the live flag the hidden apply skipped"
+        );
+        assert_eq!(unread(), before, "reopen must not re-notify");
 
         // Teardown: `mark_dead` drops the live link (F7) so the
         // server thread ends when the client goes away.
