@@ -83,7 +83,20 @@ impl IpcClient {
                 if line.trim().is_empty() {
                     continue;
                 }
-                if line.contains("\"event\"") {
+                // DS-35 (B-09): classify by STRUCTURE, not
+                // substring — the old `line.contains("\"event\"")`
+                // misclassified any response whose JSON contained
+                // the literal substring `"event"` (e.g. a string
+                // value holding it, escaped as `\"event\"`),
+                // parsed it as an event frame, failed, and silently
+                // dropped the line — the caller then saw only the
+                // 500 ms call timeout. A top-level `"event"` key
+                // marks an event frame; anything else is a
+                // response (an unparseable line is dropped either
+                // way, as before).
+                let is_event = serde_json::from_str::<serde_json::Value>(&line)
+                    .map_or(false, |value| value.get("event").is_some());
+                if is_event {
                     if let Ok(frame) = serde_json::from_str::<crate::IpcEventFrame>(&line)
                         && frame.v == IPC_PROTOCOL_VERSION
                         && event_tx.send(frame.event).await.is_err()
@@ -363,6 +376,58 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::time::Instant;
+
+    /// DS-35: a response whose JSON contains the substring
+    /// `"event"` (here, inside a string value) must still be
+    /// delivered as a response — the old substring check parsed it
+    /// as an event frame, failed, and silently dropped it, so the
+    /// call timed out.
+    #[test]
+    #[cfg(unix)]
+    fn response_containing_event_substring_is_not_dropped() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let (client_side, server_side) = tokio::io::duplex(8192);
+            let client = IpcClient::from_stream(client_side);
+            // Fake server: read one request line, answer it with a
+            // result whose string value contains `"event"`.
+            tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(server_side);
+                let mut lines = BufReader::new(reader).lines();
+                if let Ok(Some(line)) = lines.next_line().await {
+                    let id = serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|value| value.get("id").and_then(serde_json::Value::as_u64))
+                        .unwrap_or(0);
+                    let response = serde_json::json!({
+                        "v": IPC_PROTOCOL_VERSION,
+                        "id": id,
+                        "ok": true,
+                        "result": { "version": "1.0.2 \"event\" inside a string" },
+                        "error": null,
+                    });
+                    let text = serde_json::to_string(&response).expect("encode");
+                    let _ = writer.write_all(text.as_bytes()).await;
+                    let _ = writer.write_all(b"\n").await;
+                    let _ = writer.flush().await;
+                }
+            });
+            let result = client
+                .call("version", serde_json::json!({}))
+                .await
+                .expect("the response must be delivered, not dropped as an event");
+            assert_eq!(
+                result.get("version"),
+                Some(&serde_json::Value::String(
+                    "1.0.2 \"event\" inside a string".to_string()
+                )),
+                "result: {result}"
+            );
+        });
+    }
 
     /// B3: a peer that accepts the socket but never answers must
     /// not hang the call — it times out within ~500 ms.

@@ -797,7 +797,17 @@ async fn serve_ipc(
                     verbose,
                     &format!("daemon: IPC listening on {}", path.display()),
                 );
-                serve_listener(server, listener).await;
+                // DS-36: a broken accept loop (`true`) is a VISIBLE
+                // fatal like the bind path — the old code returned
+                // silently here and the daemon ran on with no IPC.
+                if serve_listener(server, listener).await {
+                    signal_ipc_fatal_shutdown(
+                        data_dir,
+                        "daemon IPC accept loop failed 50 times in a row — the listener is broken, the daemon cannot serve the UI",
+                        &shutdown,
+                        &ipc_fatal,
+                    );
+                }
                 return;
             }
             Err(error) => match tracker.record_failure(false) {

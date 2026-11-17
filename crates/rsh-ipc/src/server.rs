@@ -124,7 +124,25 @@ impl IpcServer {
                     }
                 }
                 event = event_rx.recv(), if subscribed => {
-                    let Ok(event) = event else { break };
+                    // DS-17 (B-05): `Lagged` means this subscriber
+                    // fell behind the 256-capacity channel — skip to
+                    // the newest event instead of tearing the whole
+                    // connection down (the old code treated it like
+                    // `Closed`, so a burst of events during a UI
+                    // stall forced a reconnect + re-subscribe).
+                    // Only `Closed` ends the connection.
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let mut latest = None;
+                            while let Ok(event) = event_rx.try_recv() {
+                                latest = Some(event);
+                            }
+                            let Some(event) = latest else { continue };
+                            event
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
                     let frame = IpcEventFrame { v: IPC_PROTOCOL_VERSION, event };
                     match serde_json::to_string(&frame) {
                         Ok(text) => {
@@ -221,24 +239,53 @@ impl IpcServer {
 }
 
 /// Serve a Unix listener forever (Linux): accept connections and
-/// spawn one task per client. Returns only on listener error.
-/// Unix-only: `tokio::net::UnixListener` does not exist on Windows
-/// (the daemon serves a named pipe there instead).
+/// spawn one task per client. Returns `true` only when the accept
+/// loop itself broke (too many consecutive accept errors) — the
+/// caller (the daemon) must surface that as a fatal, like the bind
+/// path; otherwise it never returns.
+///
+/// DS-36 (B-11): the old loop slept 100 ms on every accept error
+/// with no log, no counter, and no exit — a permanently broken
+/// listener (fd exhaustion, deleted socket dir) spun at 10 Hz
+/// forever with no trace. Now each error is logged (first + every
+/// 10th), the sleep ramps 100 ms → 1 s, and after 50 consecutive
+/// failures the listener is declared broken.
 #[cfg(unix)]
-pub async fn serve_listener(server: Arc<IpcServer>, listener: tokio::net::UnixListener) {
+pub async fn serve_listener(server: Arc<IpcServer>, listener: tokio::net::UnixListener) -> bool {
+    let mut consecutive_failures = 0u32;
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                consecutive_failures = 0;
                 let server = Arc::clone(&server);
                 tokio::spawn(async move {
                     server.serve_stream(stream).await;
                 });
             }
-            Err(_) => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Err(error) => {
+                consecutive_failures += 1;
+                if consecutive_failures == 1 || consecutive_failures % 10 == 0 {
+                    eprintln!(
+                        "rsh-ipc: accept failed ({consecutive_failures} consecutive): {error}"
+                    );
+                }
+                if consecutive_failures >= 50 {
+                    eprintln!("rsh-ipc: accept failed 50 times in a row — listener broken");
+                    return true;
+                }
+                tokio::time::sleep(accept_error_delay(consecutive_failures)).await;
             }
         }
     }
+}
+
+/// Backoff between accept retries after consecutive failures
+/// (DS-36): 100 ms per failure, capped at 1 s. Pure: unit-tested.
+#[cfg(unix)]
+fn accept_error_delay(consecutive_failures: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        (100u64.saturating_mul(u64::from(consecutive_failures.min(10)))).min(1000),
+    )
 }
 
 /// Bind a Unix socket at `path` with mode `0600` (current user
@@ -529,6 +576,12 @@ mod tests {
     }
 
     fn stub_server() -> Arc<IpcServer> {
+        stub_server_with_events().0
+    }
+
+    /// The stub server plus its event sender, so tests can flood
+    /// the broadcast channel (DS-17: the Lagged path).
+    fn stub_server_with_events() -> (Arc<IpcServer>, broadcast::Sender<AppEvent>) {
         let api: Arc<dyn AppApi> = Arc::new(StubApi {
             version: "1.0.2".to_string(),
             output: Mutex::new(false),
@@ -537,12 +590,111 @@ mod tests {
             bindings: Mutex::new(BTreeMap::new()),
         });
         let (tx, _rx) = broadcast::channel(64);
-        Arc::new(IpcServer::new(api, tx))
+        (Arc::new(IpcServer::new(api, tx.clone())), tx)
+    }
+
+    /// DS-17: a subscriber that falls behind the broadcast channel
+    /// (`Lagged`) must NOT lose its connection — the server skips
+    /// to the newest event and keeps answering requests (pre-fix
+    /// the `Lagged` error broke the whole connection, forcing a
+    /// reconnect + re-subscribe exactly when the UI was stalled).
+    #[test]
+    fn lagged_broadcast_does_not_drop_the_connection() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let (server, events) = stub_server_with_events();
+            let (client_side, server_side) = tokio::io::duplex(65536);
+            let serve = tokio::spawn(async move {
+                server.serve_stream(server_side).await;
+            });
+            let (reader, mut writer) = tokio::io::split(client_side);
+            let mut lines = BufReader::new(reader).lines();
+            // Subscribe first, so the connection forwards events.
+            writer
+                .write_all(b"{\"v\":1,\"id\":1,\"method\":\"subscribe\",\"params\":{}}\n")
+                .await
+                .expect("write subscribe");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Flood 100 events into the 64-capacity channel: the
+            // subscriber lags — pre-fix the connection died here.
+            for _ in 0..100 {
+                let _ = events.send(AppEvent::ConnectionChanged {
+                    state: ConnectionState::Active,
+                    label: "Connected".to_string(),
+                    reason: None,
+                });
+            }
+            // The connection must still answer a ping afterwards.
+            writer
+                .write_all(b"{\"v\":1,\"id\":2,\"method\":\"ping\",\"params\":{}}\n")
+                .await
+                .expect("write ping");
+            let mut answered = false;
+            for _ in 0..200 {
+                let line = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    lines.next_line(),
+                )
+                .await
+                .expect("read timeout")
+                .expect("read line")
+                .expect("a line");
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: serde_json::Value =
+                    serde_json::from_str(&line).expect("server writes JSON lines");
+                if value.get("event").is_some() {
+                    continue; // a forwarded event, not the ping reply
+                }
+                if value.get("id") == Some(&serde_json::json!(2)) {
+                    assert_eq!(
+                        value.get("ok"),
+                        Some(&serde_json::Value::Bool(true)),
+                        "ping reply: {value}"
+                    );
+                    answered = true;
+                    break;
+                }
+            }
+            assert!(answered, "ping must be answered after a lag burst");
+            assert!(
+                !serve.is_finished(),
+                "the connection task must still be alive"
+            );
+            serve.abort();
+        });
+    }
+
+    /// DS-36: the accept-error backoff ramps 100 ms per failure
+    /// and caps at 1 s (a permanently broken listener used to spin
+    /// at a fixed 100 ms with no log and no exit).
+    #[test]
+    #[cfg(unix)]
+    fn accept_error_delay_ramps_then_caps() {
+        assert_eq!(
+            accept_error_delay(1),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(
+            accept_error_delay(5),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            accept_error_delay(10),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            accept_error_delay(100),
+            std::time::Duration::from_secs(1)
+        );
     }
 
     #[test]
-    fn ping_and_version_round_trip_through_dispatch() {
-        let server = stub_server();
+    fn ping_and_version_round_trip_through_dispatch() {        let server = stub_server();
         let resp = server
             .handle_line(r#"{"v":1,"id":3,"method":"ping","params":{}}"#)
             .expect("ping parses");
