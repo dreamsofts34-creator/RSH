@@ -4078,8 +4078,11 @@ impl AppStateCore {
     }
 
     /// Records an engine note in the status detail without changing
-    /// the status itself (transport retries, disconnects).
-    fn note_engine_detail(&self, detail: String) {
+    /// the status itself (transport retries, disconnects). Public
+    /// so the daemon API layer can surface a failure it observes
+    /// (DS-41: a swallowed `set_output_enabled` failure) in the
+    /// same detail the diagnostics already show.
+    pub fn note_engine_detail(&self, detail: String) {
         *lock(&self.engine_status_detail) = detail;
     }
 

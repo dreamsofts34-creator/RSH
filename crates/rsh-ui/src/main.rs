@@ -8135,6 +8135,7 @@ mod tests {
                 board_mac: None,
                 replacement_required: false,
                 key_reset_armed: false,
+                attempt_log: Vec::new(),
             },
             connection_active: false,
         };

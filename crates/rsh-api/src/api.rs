@@ -96,6 +96,13 @@ pub struct PairingInfo {
     /// only clearing the PC-side state (B5).
     #[serde(default)]
     pub key_reset_armed: bool,
+    /// DS-25: the pairing attempt trail — the daemon's redacted
+    /// pairing log lines (attempt start, HELO sends, HELLO replies,
+    /// timeouts), oldest first, capped at 200 by the core. The
+    /// wizard already polls `pairing_status`, so the trail rides
+    /// along with no new IPC method; empty when no attempt ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempt_log: Vec<String>,
 }
 
 /// A live snapshot value (steering / pedals), pushed at ~30 Hz only
@@ -1242,6 +1249,7 @@ mod tests {
                 board_mac: None,
                 replacement_required: false,
                 key_reset_armed: false,
+                attempt_log: Vec::new(),
             }
         }
 

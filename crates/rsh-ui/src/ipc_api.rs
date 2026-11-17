@@ -796,6 +796,7 @@ impl AppApi for IpcApi {
                 board_mac: None,
                 replacement_required: false,
                 key_reset_armed: false,
+                attempt_log: Vec::new(),
             })
     }
 
@@ -816,6 +817,7 @@ impl AppApi for IpcApi {
                 board_mac: None,
                 replacement_required: false,
                 key_reset_armed: false,
+                attempt_log: Vec::new(),
             }))
         });
         match got {
@@ -2249,6 +2251,7 @@ mod tests {
                 board_mac: None,
                 replacement_required: false,
                 key_reset_armed: false,
+                attempt_log: Vec::new(),
             }
         }
 
