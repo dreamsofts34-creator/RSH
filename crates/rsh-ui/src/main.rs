@@ -615,12 +615,20 @@ struct PendingField {
 /// [`spawn_health_monitor`] pings the live daemon every second and
 /// re-probes after a death; the frame timer drains these on the UI
 /// thread and applies them — the monitor never touches UI state.
+/// (The shared `Daemon` prefix is the point: every variant is a
+/// daemon-health verdict.)
+#[allow(clippy::enum_variant_names)]
 enum HealthEvent {
     /// The live daemon stopped answering (or the first probe found
     /// none): show Disconnected, clear stale values.
     DaemonDown,
     /// A (new) live daemon answered: swap it in.
     DaemonBack(Arc<IpcApi>),
+    /// The daemon must NOT be auto-respawned (F3): either a fresh
+    /// fatal `daemon-status.json` blocks spawning, or the respawn
+    /// budget is exhausted. The UI latches the visible fatal state
+    /// (reason + manual Retry) instead of spawning another daemon.
+    DaemonFatal { code: String, detail: String },
 }
 
 /// Background-job kinds (A9/B5): one entry per long operation, so the
@@ -720,6 +728,29 @@ fn clean_profile_name(name: &str) -> Option<String> {
     } else {
         Some(name)
     }
+}
+
+/// F12 (v2.0.3): a down-episode shorter than this is a flap — the
+/// daemon died and came back almost at once, so the "RSH connected"
+/// notify is noise (suppressed by `reconnect_to_live` via
+/// [`Ctx::suppress_connected_notify`]) and the episode counts toward
+/// the burst total instead of earning its own entry.
+const FLAP_DOWN_WINDOW: Duration = Duration::from_secs(10);
+
+/// F12 (v2.0.3): a death within this long after a reconnect belongs
+/// to the same flapping burst — its down-notify is collapsed into
+/// the burst's single entry instead of one entry per death.
+const FLAP_BURST_UPTIME: Duration = Duration::from_secs(30);
+
+/// F12 (v2.0.3): a burst count older than this is stale — a much
+/// later, unrelated death must not claim "flapped ×N".
+const FLAP_COUNT_STALE: Duration = Duration::from_secs(600);
+
+/// F12 (v2.0.3): whether a down-episode of `down` counts as a flap.
+/// `None` (never down since launch — the first connect) is not a
+/// flap: a fast first connect is normal, not a flicker.
+fn is_flap_down_episode(down: Option<Duration>) -> bool {
+    down.is_some_and(|d| d < FLAP_DOWN_WINDOW)
 }
 
 /// Daemon-error banner text (M-2, FC2): empty while the daemon is
@@ -906,6 +937,40 @@ struct Ctx {
     /// True while a Reconnect job is in flight (A9): a second click
     /// is ignored instead of queueing another ~3 s probe.
     reconnect_in_flight: Rc<Cell<bool>>,
+    /// F3 (v2.0.3): the auto-respawn budget, shared with the health
+    /// monitor thread (which spends it) — the monitor never spawns
+    /// while this is latched or a manual retry is pending.
+    spawn_budget: Arc<live_probe::SpawnBudget>,
+    /// F3 (v2.0.3): latched respawn-failure reason (budget exhausted
+    /// or fresh fatal file) shown in the daemon-error banner until a
+    /// live daemon clears it. `None` = no latch.
+    spawn_latch: Rc<RefCell<Option<String>>>,
+    /// F3 (v2.0.3): the detail `mark_dead` last showed, so
+    /// `mark_spawn_latched` does not notify the same fatal reason
+    /// twice. `None` = the generic "not running" was shown.
+    last_dead_detail: Rc<RefCell<Option<String>>>,
+    /// F12 (v2.0.3): when the current down-episode started (set by
+    /// `mark_dead`, cleared by `swap_to_live`). `None` = never down
+    /// since launch, or back live.
+    down_since: Rc<Cell<Option<Instant>>>,
+    /// F12 (v2.0.3): when the last reconnect happened (set by
+    /// `swap_to_live`); a death soon after it belongs to the same
+    /// flapping burst as the previous one.
+    last_back_at: Rc<Cell<Option<Instant>>>,
+    /// F12 (v2.0.3): when the last flap reconnect happened (set by
+    /// `swap_to_live`); bounds how long a burst count stays
+    /// meaningful before it goes stale.
+    last_flap_at: Rc<Cell<Option<Instant>>>,
+    /// F12 (v2.0.3): how many short down-episodes (flaps) ran in
+    /// the current burst; folded into the next non-burst down
+    /// notification as "flapped ×N".
+    flap_count: Rc<Cell<u32>>,
+    /// F12 (v2.0.3): the last reconnect ended a flap (down-episode
+    /// < [`FLAP_DOWN_WINDOW`]) — the signal for `reconnect_to_live`
+    /// to suppress its "RSH connected" notify (the notify itself
+    /// lives in `reconnect_to_live`, owned by the F5 worker — see
+    /// the note on [`Ctx::swap_to_live`]).
+    suppress_connected_notify: Rc<Cell<bool>>,
     /// Last firmware check (M-8): refreshed by the `FirmwareCheck`
     /// job and on reconnect; `sync_overview` reads the cache, never
     /// the bundled file on the hot path.
@@ -1407,11 +1472,61 @@ impl Ctx {
     /// call, so a fatal file that lands without a health event
     /// still reaches the banner.
     fn sync_daemon_error(&self, win: &MainWindow) {
-        let text = daemon_error_for(
-            self.is_live(),
-            live_probe::read_daemon_status(self.data_dir.as_deref()),
-        );
+        let status = live_probe::read_daemon_status(self.data_dir.as_deref());
+        let mut text = daemon_error_for(self.is_live(), status);
+        // F3: a respawn latch has no fatal file to read from — show
+        // its reason instead of an empty banner. A fatal file still
+        // wins when one exists: it is the daemon's own newer word.
+        if text.is_empty() && !self.is_live() {
+            if let Some(latch) = self.spawn_latch.borrow().as_ref() {
+                text.clone_from(latch);
+            }
+        }
         set_daemon_error_prop(win, &text);
+    }
+
+    /// Latch the respawn-failure state (F3): the monitor sent
+    /// `HealthEvent::DaemonFatal` because a fresh fatal file blocks
+    /// spawning or the respawn budget is exhausted. Drives the
+    /// disconnected UI (no-op when already down — the `DaemonDown`
+    /// that preceded this already did it), records the reason so the
+    /// Overview banner shows it until a live daemon clears it, and
+    /// notifies once. A fatal-file reason `mark_dead` already showed
+    /// is not notified twice; the budget-exhausted reason always
+    /// notifies (there is no fatal file behind it). The existing
+    /// Reconnect button is the manual Retry — it resets the budget
+    /// once (see [`Ctx::start_reconnect_job`]).
+    fn mark_spawn_latched(&self, win: &MainWindow, code: &str, detail: &str) {
+        // Only drive the disconnected state when it isn't already
+        // down — in the normal flow the `DaemonDown` that preceded
+        // this already ran `mark_dead` (and notified), so calling it
+        // again would double-notify. At startup (still
+        // `connecting`) there was no `DaemonDown`, so it runs here.
+        let needs_dead = self.is_live() || self.state.borrow().connecting;
+        if needs_dead {
+            self.mark_dead(win);
+        }
+        let text = if detail.trim().is_empty() {
+            format!("RSH stopped unexpectedly ({code}) — try Reconnect.")
+        } else {
+            detail.to_string()
+        };
+        let already_shown = self
+            .last_dead_detail
+            .borrow()
+            .as_deref()
+            .is_some_and(|shown| shown == detail);
+        *self.spawn_latch.borrow_mut() = Some(text.clone());
+        if code == "RespawnBudgetExhausted" || !already_shown {
+            let title = if code == "RespawnBudgetExhausted" {
+                "RSH stopped — automatic restart off"
+            } else {
+                "RSH stopped unexpectedly"
+            };
+            self.notify(win, "Connection", title, &text);
+        }
+        self.sync_daemon_error(win);
+        self.refresh(win, 0);
     }
 
     /// Seed the keep-in-tray switch from the API (FC2): the close
@@ -1491,6 +1606,11 @@ impl Ctx {
                             state.connecting = false;
                         }
                         self.connecting_since.set(None);
+                        // F3: the manual retry failed — re-latch the
+                        // respawn budget when it was latched before
+                        // (no-op otherwise; the monitor resumes its
+                        // bounded attempts with a fresh budget).
+                        self.spawn_budget.record_manual_failure();
                         // M-2: the daemon's fatal file names the
                         // reason (IpcBindFailed / DaemonHung) — show
                         // it instead of the generic "not running".
@@ -1711,6 +1831,11 @@ impl Ctx {
             self.busy_jobs.borrow_mut().remove(&kind);
             if kind == JobKind::Reconnect {
                 self.reconnect_in_flight.set(false);
+                // F3: a timed-out manual retry counts as a failed
+                // retry — re-latch when it was latched before (the
+                // late job result, if any, is ignored by
+                // `apply_job_done`, so this is the only accounting).
+                self.spawn_budget.record_manual_failure();
                 {
                     let mut state = self.state.borrow_mut();
                     state.connecting = false;
@@ -1843,11 +1968,17 @@ impl Ctx {
     /// `connecting` state is set immediately — the Overview shows
     /// "Connecting…" while the probe runs. A second click while one
     /// is in flight is ignored.
+    ///
+    /// F3 (v2.0.3): the click resets the respawn budget once — this
+    /// manual retry is the single attempt, and the health monitor
+    /// stays out until it resolves (success clears the budget,
+    /// failure re-latches it when it was latched before).
     fn start_reconnect_job(&self, win: &MainWindow) {
         if self.reconnect_in_flight.get() {
             return;
         }
         self.reconnect_in_flight.set(true);
+        self.spawn_budget.reset_for_manual_retry();
         {
             let mut state = self.state.borrow_mut();
             state.connecting = true;
@@ -2210,6 +2341,27 @@ impl Ctx {
         *self.steering.borrow_mut() = stored;
         self.unsaved
             .set(api.draft_status().is_some_and(|s| s.dirty));
+        // F12: measure the down-episode this reconnect ends. A short
+        // one is a flap — count it and arm the "RSH connected"
+        // suppression for `reconnect_to_live` (F5 worker: gate that
+        // notify on `self.suppress_connected_notify.get()` — the flag
+        // is set here and cleared on the next non-flap reconnect).
+        // A long down-episode ends the burst: the count stays for
+        // `mark_dead` to fold into the next down notification.
+        let down = self.down_since.get().map(|t| t.elapsed());
+        self.down_since.set(None);
+        self.last_back_at.set(Some(Instant::now()));
+        if is_flap_down_episode(down) {
+            self.flap_count.set(self.flap_count.get().saturating_add(1));
+            self.last_flap_at.set(Some(Instant::now()));
+            self.suppress_connected_notify.set(true);
+        } else {
+            self.suppress_connected_notify.set(false);
+        }
+        // F3: a live link clears the respawn latch and the budget —
+        // the daemon is back, whatever killed it is over.
+        self.spawn_latch.borrow_mut().take();
+        self.spawn_budget.record_success();
         let mut state = self.state.borrow_mut();
         state.api = api;
         state.live_api = Some(live_api.clone());
@@ -2234,6 +2386,11 @@ impl Ctx {
     /// live link, show Disconnected + Reconnect. No-op when already
     /// down (the monitor only notifies on a transition, and the
     /// Reconnect button cannot kill a live link).
+    ///
+    /// F7 (v2.0.3): the dead `IpcApi` is dropped — `state.api` swaps
+    /// back to a fresh `SimApi`, so the dead link's Tokio runtime +
+    /// ~20 Hz poller die with the last `Arc` instead of spinning
+    /// forever on a dead socket.
     fn mark_dead(&self, win: &MainWindow) {
         let old_api = {
             let mut state = self.state.borrow_mut();
@@ -2242,12 +2399,17 @@ impl Ctx {
             }
             state.live = false;
             state.connecting = false;
+            // F7: swap back to the sim — dropping the last `Arc` of
+            // the dead `IpcApi` shuts its runtime + poller down.
+            state.api = Arc::new(SimApi::new());
             let old = state.live_api.take();
             if let Ok(mut link) = self.live_link.lock() {
                 *link = None;
             }
             old
         };
+        // F12: the down-episode starts now.
+        self.down_since.set(Some(Instant::now()));
         if let Some(api) = old_api {
             api.clear_cached_state();
         }
@@ -2258,21 +2420,51 @@ impl Ctx {
         // banner now, not just the notification drawer.
         self.sync_daemon_error(win);
         self.connecting_since.set(None);
+        // F12: a death that follows a flapping burst — soon after a
+        // reconnect that itself ended a flap — is part of the same
+        // burst: stay silent instead of pushing one "not running"
+        // entry per death. The burst's count is folded into the next
+        // non-burst notification below.
+        let burst_death = self.flap_count.get() > 0
+            && self
+                .last_back_at
+                .get()
+                .is_some_and(|t| t.elapsed() < FLAP_BURST_UPTIME);
+        let mut flap_note = String::new();
+        if !burst_death {
+            let n = self.flap_count.get();
+            let recent = self
+                .last_flap_at
+                .get()
+                .is_some_and(|t| t.elapsed() < FLAP_COUNT_STALE);
+            if n > 0 && recent {
+                flap_note = format!(" Connection flapped ×{n} before this drop.");
+            }
+            self.flap_count.set(0);
+        }
         // M-2: the daemon's fatal file names the reason
         // (IpcBindFailed / DaemonHung) — show it instead of the
         // generic "not running". The detail is the daemon's own plain
         // words; the code goes to the log only.
-        match live_probe::read_daemon_status(self.data_dir.as_deref()) {
-            Some((code, detail)) => {
-                eprintln!("RSH-UI daemon fatal: {code}: {detail}");
-                self.notify(win, "Connection", "RSH stopped unexpectedly", &detail);
+        if let Some((code, detail)) = live_probe::read_daemon_status(self.data_dir.as_deref()) {
+            *self.last_dead_detail.borrow_mut() = Some(detail.clone());
+            eprintln!("RSH-UI daemon fatal: {code}: {detail}");
+            if !burst_death {
+                self.notify(
+                    win,
+                    "Connection",
+                    "RSH stopped unexpectedly",
+                    &format!("{detail}{flap_note}"),
+                );
             }
-            None => {
+        } else {
+            *self.last_dead_detail.borrow_mut() = None;
+            if !burst_death {
                 self.notify(
                     win,
                     "Connection",
                     "RSH not running",
-                    "Live data unavailable — RSH isn't running.",
+                    &format!("Live data unavailable — RSH isn't running.{flap_note}"),
                 );
             }
         }
@@ -5350,8 +5542,72 @@ fn drain_health(
                     ctx.reconnect_to_live(&w, api);
                 }
             }
+            HealthEvent::DaemonFatal { code, detail } => {
+                if let Some(w) = win.upgrade() {
+                    ctx.mark_spawn_latched(&w, &code, &detail);
+                }
+            }
         }
     }
+}
+
+/// Publish a found live API into the shared slot (if still empty)
+/// and report `DaemonBack`; returns false only when the UI went
+/// away (the monitor thread exits then). A slot Reconnect filled
+/// first is not an error — the monitor just stands down.
+fn publish_daemon_back(
+    live_link: &Arc<Mutex<Option<Arc<IpcApi>>>>,
+    tx: &std::sync::mpsc::Sender<HealthEvent>,
+    api: Arc<IpcApi>,
+) -> bool {
+    let mut published = false;
+    if let Ok(mut slot) = live_link.lock() {
+        if slot.is_none() {
+            *slot = Some(api.clone());
+            published = true;
+        }
+    }
+    if published {
+        tx.send(HealthEvent::DaemonBack(api)).is_ok()
+    } else {
+        true
+    }
+}
+
+/// Report `DaemonDown` once per down-episode; returns false only
+/// when the UI went away.
+fn send_daemon_down_once(
+    tx: &std::sync::mpsc::Sender<HealthEvent>,
+    down_notified: &mut bool,
+) -> bool {
+    if *down_notified {
+        return true;
+    }
+    if tx.send(HealthEvent::DaemonDown).is_err() {
+        return false;
+    }
+    *down_notified = true;
+    true
+}
+
+/// Report `DaemonFatal` once per distinct reason; returns false
+/// only when the UI went away. A latched daemon must not spam the
+/// drawer once per poll.
+fn send_daemon_fatal_once(
+    tx: &std::sync::mpsc::Sender<HealthEvent>,
+    fatal_sent: &mut Option<String>,
+    code: String,
+    detail: String,
+) -> bool {
+    let reason = format!("{code}:{detail}");
+    if fatal_sent.as_deref() == Some(&reason) {
+        return true;
+    }
+    if tx.send(HealthEvent::DaemonFatal { code, detail }).is_err() {
+        return false;
+    }
+    *fatal_sent = Some(reason);
+    true
 }
 
 /// Spawn the health-monitor thread (B2/B4): ping the live daemon
@@ -5361,70 +5617,169 @@ fn drain_health(
 /// timer applies the verdicts on the UI thread — and it owns no
 /// `Rc` state, only the shared link. It exits when the UI drops
 /// the receiver (app quit).
+///
+/// F3 (v2.0.3): the respawn is bounded, not a loop —
+/// * death needs [`live_probe::PING_DEBOUNCE`] consecutive failed
+///   pings (~3 s), not one;
+/// * a fresh fatal `daemon-status.json` blocks spawning entirely
+///   (the daemon died on purpose — show it, don't re-run it);
+/// * spawn attempts back off exponentially (1 s → 5 s → 30 s →
+///   60 s cap) and stop after [`live_probe::MAX_FAILED_SPAWNS`]
+///   consecutive failures, latching the visible fatal state
+///   (`DaemonFatal`) with a manual Retry;
+/// * while the latch holds, the monitor only cheap-probes (the
+///   daemon may come back via a manual start) and never spawns.
+#[allow(clippy::too_many_lines)]
 fn spawn_health_monitor(
     data_dir: Option<PathBuf>,
     live_link: Arc<Mutex<Option<Arc<IpcApi>>>>,
     tx: std::sync::mpsc::Sender<HealthEvent>,
     hidden: Arc<AtomicBool>,
+    budget: Arc<live_probe::SpawnBudget>,
 ) {
     let _ = std::thread::Builder::new()
         .name("rsh-health".to_string())
         .spawn(move || {
             let mut down_notified = false;
+            let mut failed_pings = 0_u32;
+            let mut fatal_sent: Option<String> = None;
             loop {
                 let current = live_link
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
                 if let Some(api) = current {
-                    if !api.ping() {
-                        // Only clear the link when it still
-                        // holds the api that died — the user may
-                        // have reconnected while the ping was in
-                        // flight.
-                        if let Ok(mut slot) = live_link.lock() {
-                            if let Some(cur) = slot.as_ref() {
-                                if Arc::ptr_eq(cur, &api) {
-                                    *slot = None;
+                    if api.ping() {
+                        failed_pings = 0;
+                    } else {
+                        failed_pings += 1;
+                        if failed_pings >= live_probe::PING_DEBOUNCE {
+                            failed_pings = 0;
+                            // Only declare death when this api is
+                            // still the live one — Reconnect may have
+                            // swapped in a fresh link while these
+                            // pings were in flight, and a stale
+                            // `DaemonDown` would kill the new link.
+                            let mut still_current = false;
+                            if let Ok(mut slot) = live_link.lock() {
+                                if let Some(cur) = slot.as_ref() {
+                                    if Arc::ptr_eq(cur, &api) {
+                                        *slot = None;
+                                        still_current = true;
+                                    }
                                 }
                             }
-                        }
-                        if !down_notified {
-                            if tx.send(HealthEvent::DaemonDown).is_err() {
+                            if still_current
+                                && !send_daemon_down_once(&tx, &mut down_notified)
+                            {
                                 return;
                             }
-                            down_notified = true;
                         }
                     }
-                } else {
+                } else if let Some(api) = live_probe::try_live_api(data_dir.as_deref()) {
+                    // Cheap probe first (no spawn): the daemon may
+                    // have come back on its own, or via Reconnect.
+                    down_notified = false;
+                    fatal_sent = None;
+                    budget.record_success();
+                    if !publish_daemon_back(&live_link, &tx, api) {
+                        return;
+                    }
+                } else if hidden.load(Ordering::Relaxed) {
                     // H-1/A11: while the window is hidden to tray
                     // the monitor only probes for an EXISTING daemon
                     // — it must never spawn one, or a tray Quit
                     // (daemon gone on purpose) would resurrect it.
-                    let found = if hidden.load(Ordering::Relaxed) {
-                        live_probe::try_live_api(data_dir.as_deref())
-                    } else {
-                        live_probe::try_live_api_with_spawn(data_dir.as_deref())
-                    };
-                    if let Some(api) = found {
-                        // Only publish when the slot is still
-                        // empty — Reconnect may have beaten us.
-                        let mut published = false;
-                        if let Ok(mut slot) = live_link.lock() {
-                            if slot.is_none() {
-                                *slot = Some(api.clone());
-                                published = true;
-                            }
-                        }
+                    if !send_daemon_down_once(&tx, &mut down_notified) {
+                        return;
+                    }
+                } else if let Some((code, detail)) = live_probe::read_daemon_status_fresh(
+                    data_dir.as_deref(),
+                    live_probe::FATAL_FRESHNESS,
+                ) {
+                    // F3: a fresh fatal file means the daemon died
+                    // on purpose — spawning another one just re-runs
+                    // the death loop. Latch it and show the reason.
+                    if !send_daemon_fatal_once(&tx, &mut fatal_sent, code, detail) {
+                        return;
+                    }
+                    if !send_daemon_down_once(&tx, &mut down_notified) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                } else if budget.is_latched() {
+                    // F3: budget exhausted — latch, don't spawn. The
+                    // monitor keeps cheap-probing above: a manually
+                    // started daemon still comes back.
+                    if !send_daemon_fatal_once(
+                        &tx,
+                        &mut fatal_sent,
+                        "RespawnBudgetExhausted".to_string(),
+                        format!(
+                            "RSH keeps failing to start — automatic restarts stopped after {} tries. Use Reconnect to try again.",
+                            live_probe::MAX_FAILED_SPAWNS
+                        ),
+                    ) {
+                        return;
+                    }
+                    if !send_daemon_down_once(&tx, &mut down_notified) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                } else if !budget.auto_spawn_allowed() {
+                    // A manual retry is in flight (Reconnect click):
+                    // stay out of its way — no spawn, no fatal
+                    // event — until it resolves. The cheap probe
+                    // above already ran this cycle.
+                    if !send_daemon_down_once(&tx, &mut down_notified) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                } else {
+                    // F3: exponential backoff before the next spawn
+                    // attempt (1 s → 5 s → 30 s → 60 s cap).
+                    let delay = budget
+                        .next_delay()
+                        .unwrap_or(Duration::from_secs(60));
+                    std::thread::sleep(delay);
+                    // Re-check: Reconnect may have filled the slot
+                    // while we slept, or the daemon may have
+                    // appeared on its own.
+                    let current = live_link
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    if current.is_some() {
+                        continue;
+                    }
+                    if let Some(api) = live_probe::try_live_api(data_dir.as_deref()) {
                         down_notified = false;
-                        if published && tx.send(HealthEvent::DaemonBack(api)).is_err() {
+                        fatal_sent = None;
+                        budget.record_success();
+                        if !publish_daemon_back(&live_link, &tx, api) {
                             return;
                         }
-                    } else if !down_notified {
-                        if tx.send(HealthEvent::DaemonDown).is_err() {
+                        continue;
+                    }
+                    // F4: the spawn itself is serialised inside
+                    // `try_live_api_with_spawn` (guard) — a Reconnect
+                    // attempt in flight means this probes only.
+                    if let Some(api) = live_probe::try_live_api_with_spawn(data_dir.as_deref())
+                    {
+                        down_notified = false;
+                        fatal_sent = None;
+                        budget.record_success();
+                        if !publish_daemon_back(&live_link, &tx, api) {
                             return;
                         }
-                        down_notified = true;
+                    } else {
+                        budget.record_spawn_failure();
+                        if !send_daemon_down_once(&tx, &mut down_notified) {
+                            return;
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_secs(1));
@@ -5741,6 +6096,16 @@ fn main() -> Result<(), slint::PlatformError> {
         // instead of leaving the Overview on "Connecting…" forever.
         connecting_since: Rc::new(Cell::new(Some(t0))),
         reconnect_in_flight: Rc::new(Cell::new(false)),
+        // F3/F12 (v2.0.3): respawn budget (shared with the health
+        // monitor), latch reason, flap tracking — all start empty.
+        spawn_budget: Arc::new(live_probe::SpawnBudget::new()),
+        spawn_latch: Rc::new(RefCell::new(None)),
+        last_dead_detail: Rc::new(RefCell::new(None)),
+        down_since: Rc::new(Cell::new(None)),
+        last_back_at: Rc::new(Cell::new(None)),
+        last_flap_at: Rc::new(Cell::new(None)),
+        flap_count: Rc::new(Cell::new(0)),
+        suppress_connected_notify: Rc::new(Cell::new(false)),
         firmware_check_cache: Rc::new(RefCell::new(None)),
         raw_available: Rc::new(Cell::new(false)),
         presets_count: Rc::new(Cell::new(0)),
@@ -5753,7 +6118,13 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // The health monitor owns the first probe (B4): it starts now,
     // on its own thread, while the window below opens.
-    spawn_health_monitor(data_dir.clone(), live_link, health_tx, ctx.hidden.clone());
+    spawn_health_monitor(
+        data_dir.clone(),
+        live_link,
+        health_tx,
+        ctx.hidden.clone(),
+        ctx.spawn_budget.clone(),
+    );
 
     let win = MainWindow::new()?;
     // H-1/A11: X hides to tray — the UI process stays alive (the
@@ -6248,6 +6619,14 @@ mod tests {
             busy_jobs: Rc::new(RefCell::new(HashMap::new())),
             connecting_since: Rc::new(Cell::new(Some(Instant::now()))),
             reconnect_in_flight: Rc::new(Cell::new(false)),
+            spawn_budget: Arc::new(live_probe::SpawnBudget::new()),
+            spawn_latch: Rc::new(RefCell::new(None)),
+            last_dead_detail: Rc::new(RefCell::new(None)),
+            down_since: Rc::new(Cell::new(None)),
+            last_back_at: Rc::new(Cell::new(None)),
+            last_flap_at: Rc::new(Cell::new(None)),
+            flap_count: Rc::new(Cell::new(0)),
+            suppress_connected_notify: Rc::new(Cell::new(false)),
             firmware_check_cache: Rc::new(RefCell::new(None)),
             raw_available: Rc::new(Cell::new(false)),
             presets_count: Rc::new(Cell::new(0)),
@@ -6477,6 +6856,183 @@ mod tests {
             unread() > before,
             "the ignored start must tell the user an update is already running"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_flap_down_episode_classifies_by_duration() {
+        assert!(is_flap_down_episode(Some(Duration::from_secs(5))));
+        assert!(is_flap_down_episode(Some(Duration::from_millis(1))));
+        assert!(!is_flap_down_episode(Some(Duration::from_secs(10))));
+        assert!(!is_flap_down_episode(Some(Duration::from_secs(60))));
+        assert!(!is_flap_down_episode(None), "first connect is not a flap");
+    }
+
+    /// F7: `mark_dead` swaps `state.api` back to a fresh `SimApi` —
+    /// the old handle is dropped, so a dead link's runtime + poller
+    /// die with it instead of spinning on a dead socket.
+    #[test]
+    fn mark_dead_swaps_api_back_to_sim() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F7 test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        ctx.state.borrow_mut().live = true;
+        let before = ctx.api();
+        ctx.mark_dead(&win);
+        assert!(!ctx.is_live(), "dead link must not stay live");
+        assert!(
+            ctx.state.borrow().live_api.is_none(),
+            "live link must be dropped"
+        );
+        assert!(
+            !Arc::ptr_eq(&ctx.api(), &before),
+            "the dead API handle must be replaced by a fresh SimApi"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3: the respawn latch shows its reason in the banner (there
+    /// is no fatal file behind a budget exhaustion) and notifies
+    /// once; the Reconnect button stays the manual Retry.
+    #[test]
+    fn mark_spawn_latched_shows_latch_reason_in_banner() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F3 latch test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+        // Already down (the normal flow: `DaemonDown` ran `mark_dead`
+        // first), so the latch itself notifies exactly once.
+        ctx.state.borrow_mut().live = false;
+        ctx.state.borrow_mut().connecting = false;
+        let reason = "RSH keeps failing to start — automatic restarts stopped after 5 tries. Use Reconnect to try again.";
+        let before = unread();
+        ctx.mark_spawn_latched(&win, "RespawnBudgetExhausted", reason);
+        assert_eq!(unread(), before + 1, "latch must notify exactly once");
+        assert_eq!(win.get_daemon_error().as_str(), reason);
+        assert!(
+            ctx.spawn_latch.borrow().is_some(),
+            "latch must be recorded until a live daemon clears it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3: a fatal-file reason `mark_dead` already showed is not
+    /// notified twice by the latch — the banner still carries it.
+    #[test]
+    fn mark_spawn_latched_does_not_repeat_fatal_reason() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F3 latch test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            r#"{"status":"fatal","code":"IpcBindFailed","detail":"daemon IPC bind failed after 5 attempts","pid":123,"at_unix":1}"#,
+        )
+        .expect("fatal status file");
+        let before = unread();
+        ctx.mark_spawn_latched(
+            &win,
+            "IpcBindFailed",
+            "daemon IPC bind failed after 5 attempts",
+        );
+        assert_eq!(
+            unread(),
+            before + 1,
+            "fatal detail must be notified once, by mark_dead, not again by the latch"
+        );
+        assert_eq!(
+            win.get_daemon_error().as_str(),
+            "RSH IPC bind failed after 5 attempts"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3: a `DaemonFatal` health event latches the banner through
+    /// the same drain the frame timer uses.
+    #[test]
+    fn drain_health_fatal_latches_banner() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F3 drain test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let (tx, rx) = std::sync::mpsc::channel::<HealthEvent>();
+        tx.send(HealthEvent::DaemonFatal {
+            code: "RespawnBudgetExhausted".to_string(),
+            detail: "RSH keeps failing to start — automatic restarts stopped.".to_string(),
+        })
+        .expect("send fatal");
+        drain_health(&rx, &win.as_weak(), &ctx);
+        assert_eq!(
+            win.get_daemon_error().as_str(),
+            "RSH keeps failing to start — automatic restarts stopped."
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F12: a burst of flap deaths collapses into the first entry —
+    /// the second death (seconds after a flap reconnect) stays
+    /// silent, and the next death after a stable stretch folds the
+    /// count ("flapped ×1") into its notification.
+    #[test]
+    fn flap_burst_collapses_repeated_deaths() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F12 test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+        let last_body = || {
+            ctx.notifications
+                .borrow()
+                .to_model_items()
+                .into_iter()
+                .next_back()
+                .map(|item| item.body.as_str().to_string())
+                .unwrap_or_default()
+        };
+
+        // Death 1: fresh entry.
+        ctx.state.borrow_mut().live = true;
+        let before = unread();
+        ctx.mark_dead(&win);
+        assert_eq!(unread(), before + 1, "first death notifies");
+
+        // Flap reconnect, then death 2 seconds later: silent.
+        ctx.state.borrow_mut().live = true;
+        ctx.flap_count.set(1);
+        ctx.last_back_at.set(Some(Instant::now()));
+        ctx.last_flap_at.set(Some(Instant::now()));
+        ctx.mark_dead(&win);
+        assert_eq!(unread(), before + 1, "burst death must stay silent");
+
+        // Stable stretch (60 s up), then death 3: notifies with the
+        // folded count, and the count resets.
+        ctx.state.borrow_mut().live = true;
+        ctx.last_back_at.set(Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("60 s ago exists"),
+        ));
+        ctx.mark_dead(&win);
+        assert_eq!(unread(), before + 2, "post-burst death notifies");
+        assert!(
+            last_body().contains("×1"),
+            "post-burst death must fold the flap count in, got: {}",
+            last_body()
+        );
+        assert_eq!(ctx.flap_count.get(), 0, "count resets after folding");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

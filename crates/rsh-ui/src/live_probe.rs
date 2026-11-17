@@ -142,8 +142,7 @@ impl SpawnBudget {
     #[must_use]
     pub fn next_delay(&self) -> Option<Duration> {
         let inner = self.lock();
-        if inner.latched || inner.manual_retry_pending || inner.failed_spawns >= MAX_FAILED_SPAWNS
-        {
+        if inner.latched || inner.manual_retry_pending || inner.failed_spawns >= MAX_FAILED_SPAWNS {
             None
         } else {
             Some(backoff_delay(inner.failed_spawns))
@@ -544,7 +543,10 @@ mod tests {
         assert!(budget.is_latched());
         budget.reset_for_manual_retry();
         assert!(!budget.is_latched());
-        assert!(!budget.auto_spawn_allowed(), "monitor stays out during retry");
+        assert!(
+            !budget.auto_spawn_allowed(),
+            "monitor stays out during retry"
+        );
         budget.record_manual_failure();
         assert!(budget.is_latched());
         assert!(!budget.auto_spawn_allowed());
@@ -552,7 +554,10 @@ mod tests {
         // Healthy + manual retry that fails: fresh budget, no latch.
         let budget = SpawnBudget::new();
         budget.reset_for_manual_retry();
-        assert!(!budget.auto_spawn_allowed(), "monitor stays out during retry");
+        assert!(
+            !budget.auto_spawn_allowed(),
+            "monitor stays out during retry"
+        );
         budget.record_manual_failure();
         assert!(!budget.is_latched());
         assert!(budget.auto_spawn_allowed());
