@@ -446,6 +446,9 @@ struct Args {
     setup: bool,
     /// Test-only override for the daemon data dir (IPC socket path).
     data_dir: Option<std::path::PathBuf>,
+    /// Verbose: log live events to stderr (DS-79). Off by default —
+    /// the UI thread never does an `eprintln!` per event.
+    verbose: bool,
 }
 
 fn parse_args() -> Args {
@@ -455,6 +458,7 @@ fn parse_args() -> Args {
         static_mode: false,
         setup: false,
         data_dir: None,
+        verbose: false,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -492,6 +496,7 @@ fn parse_args() -> Args {
                 }
             }
             "--static" => a.static_mode = true,
+            "--verbose" => a.verbose = true,
             other => eprintln!("RSH-UI unknown arg: {other}"),
         }
         i += 1;
@@ -941,6 +946,22 @@ fn set_daemon_error_prop(win: &MainWindow, text: &str) {
     }
 }
 
+/// Set a window prop only when the value moved (DS-78): an
+/// unchanged `set_*` still crosses into Slint and marks the
+/// property dirty, so a 20 Hz frame that re-sets ~50 props repaints
+/// even when nothing moved. Reads (`get_*`) are cheap — they never
+/// mark anything dirty.
+///
+/// `next` is passed by value on purpose: the setter closure
+/// consumes it (Slint setters take values, not references), so the
+/// `needless_pass_by_value` lint is a false positive here.
+#[allow(clippy::needless_pass_by_value)]
+fn set_if_changed<T: PartialEq>(current: T, next: T, set: impl FnOnce(T)) {
+    if current != next {
+        set(next);
+    }
+}
+
 /// Background-job completions (A9/B5): a job thread sends exactly one
 /// of these on `job_tx`; the frame timer drains them on the UI thread
 /// and applies the result (notify / revert / re-sync). The payloads
@@ -1172,6 +1193,56 @@ type PendingApply = Box<dyn FnOnce(&Ctx, &MainWindow, JobResult)>;
 /// Shared frame context for callbacks: the swappable API state,
 /// tuning state, the unsaved flag, the notification center, and the
 /// resolved data dir (setup marker + theme file).
+/// Cached per-frame command strings (DS-78): `curve_commands`
+/// rebuilds ~25 segments and `crosshair_commands` formats on every
+/// frame, but their inputs only move when the tuning or the marker
+/// moves. The cache keys on the inputs and reuses the last string;
+/// `dashed_line_commands` is constant, so it is built once.
+#[derive(Default)]
+struct FrameCmdCache {
+    dashed_line: Option<SharedString>,
+    curve: Option<(f32, f32, SharedString)>,
+    crosshair: Option<(f32, f32, SharedString)>,
+}
+
+impl FrameCmdCache {
+    fn dashed_line(&mut self) -> SharedString {
+        if let Some(cached) = &self.dashed_line {
+            return cached.clone();
+        }
+        let built: SharedString = dashed_line_commands().into();
+        self.dashed_line = Some(built.clone());
+        built
+    }
+
+    // Cache keys compare with exact equality on purpose: the key
+    // IS the input, bit for bit — an epsilon comparison could
+    // return a stale string for a genuinely different input.
+    #[allow(clippy::float_cmp)]
+    fn curve(&mut self, deadzone: f32, exponent: f32) -> SharedString {
+        if let Some((dz, ex, cached)) = &self.curve {
+            if *dz == deadzone && *ex == exponent {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = curve_commands(deadzone, exponent).into();
+        self.curve = Some((deadzone, exponent, built.clone()));
+        built
+    }
+
+    #[allow(clippy::float_cmp)]
+    fn crosshair(&mut self, mx: f32, my: f32) -> SharedString {
+        if let Some((x, y, cached)) = &self.crosshair {
+            if *x == mx && *y == my {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = crosshair_commands(mx, my).into();
+        self.crosshair = Some((mx, my, built.clone()));
+        built
+    }
+}
+
 struct Ctx {
     state: Rc<RefCell<LiveState>>,
     tuning: Rc<RefCell<Tuning>>,
@@ -1214,6 +1285,18 @@ struct Ctx {
     /// Live chart histories (A20): steering deg + throttle 0..1.
     steer_hist: Rc<RefCell<VecDeque<f32>>>,
     pedal_hist: Rc<RefCell<VecDeque<f32>>>,
+    /// Cached per-frame command strings (DS-78): the curve /
+    /// crosshair / dashed-line strings are rebuilt only when their
+    /// inputs move.
+    frame_cmds: Rc<RefCell<FrameCmdCache>>,
+    /// Frame times (DS-82): the last 600 `refresh` durations (30 s
+    /// at 20 Hz) for the Diagnostics p50/p99. This is the Rust
+    /// frame work (`push_frame` + capture sync) — the Slint paint
+    /// itself runs async and is not observable from here.
+    frame_times: Rc<RefCell<VecDeque<Duration>>>,
+    /// Verbose logging (DS-79): `--verbose` — live events go to
+    /// stderr only when this is set.
+    verbose: Rc<Cell<bool>>,
     unsaved: Rc<Cell<bool>>,
     notifications: Rc<RefCell<NotificationCenter>>,
     data_dir: Option<PathBuf>,
@@ -1404,22 +1487,38 @@ impl Ctx {
     /// frame from [`Self::refresh`], so a daemon that dies
     /// mid-session disables the buttons again instead of leaving
     /// them enabled against a dead link.
+    /// Re-sync the capture-availability props every frame (DS-78:
+    /// change-detected — the availability flags are constant for
+    /// long stretches, and the reason strings are only rebuilt when
+    /// the frame needs them).
     fn sync_capture_availability(&self, win: &MainWindow) {
         let available = self.capture_available();
-        win.set_centre_available(available);
-        win.set_pedal_set_disabled(!available);
-        win.set_extras_calibration_disabled(!available);
+        set_if_changed(win.get_centre_available(), available, |v| {
+            win.set_centre_available(v);
+        });
+        set_if_changed(win.get_pedal_set_disabled(), !available, |v| {
+            win.set_pedal_set_disabled(v);
+        });
+        set_if_changed(win.get_extras_calibration_disabled(), !available, |v| {
+            win.set_extras_calibration_disabled(v);
+        });
         // H9: the wizard's Calibrate step gates on REAL raw mV, not
         // just on the daemon being live — `raw_available` is probed
         // by a background job when the step is entered (and on the
         // 5 s refresh while it is open).
-        win.set_setup_calibration_available(self.raw_available.get());
+        set_if_changed(
+            win.get_setup_calibration_available(),
+            self.raw_available.get(),
+            |v| win.set_setup_calibration_available(v),
+        );
         let reason = if available {
             String::new()
         } else {
             Self::capture_unavailable_reason().to_string()
         };
-        win.set_centre_reason(reason.clone().into());
+        set_if_changed(win.get_centre_reason(), reason.into(), |v| {
+            win.set_centre_reason(v);
+        });
         let setup_reason = if self.raw_available.get() {
             String::new()
         } else if !available {
@@ -1429,7 +1528,9 @@ impl Ctx {
         } else {
             "No wheel data yet — check the wheel is connected.".to_string()
         };
-        win.set_setup_calibration_reason(setup_reason.into());
+        set_if_changed(win.get_setup_calibration_reason(), setup_reason.into(), |v| {
+            win.set_setup_calibration_reason(v);
+        });
     }
 
     /// Refresh the cached calibration read (`calibration()`):
@@ -1475,6 +1576,45 @@ impl Ctx {
             .map(|s| s.chars().take(10).collect())
     }
 
+    /// Cached dashed-line commands (DS-78): constant, built once.
+    fn dashed_line_cached(&self) -> SharedString {
+        self.frame_cmds.borrow_mut().dashed_line()
+    }
+
+    /// Cached curve commands for the current tuning (DS-78).
+    fn curve_commands_cached(&self, deadzone: f32, exponent: f32) -> SharedString {
+        self.frame_cmds.borrow_mut().curve(deadzone, exponent)
+    }
+
+    /// Cached crosshair commands for the current marker (DS-78).
+    fn crosshair_commands_cached(&self, mx: f32, my: f32) -> SharedString {
+        self.frame_cmds.borrow_mut().crosshair(mx, my)
+    }
+
+    /// Record one frame's `refresh` time (DS-82): ring of the last
+    /// 600 frames (30 s at 20 Hz).
+    fn record_frame_time(&self, elapsed: Duration) {
+        let mut times = self.frame_times.borrow_mut();
+        times.push_back(elapsed);
+        while times.len() > 600 {
+            times.pop_front();
+        }
+    }
+
+    /// Frame-time p50/p99 over the recorded window (DS-82), in ms.
+    /// `None` until a frame has been recorded.
+    fn frame_time_p50_p99(&self) -> Option<(f64, f64)> {
+        let times = self.frame_times.borrow();
+        if times.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<Duration> = times.iter().copied().collect();
+        sorted.sort();
+        let p50 = sorted[(sorted.len() - 1) / 2];
+        let p99 = sorted[(sorted.len() - 1) * 99 / 100];
+        Some((p50.as_secs_f64() * 1000.0, p99.as_secs_f64() * 1000.0))
+    }
+
     /// Push the current API + tuning state into the window (one
     /// frame). Live values only: no daemon means Disconnected +
     /// "—", never fake Online (acceptance); the pressed tile is
@@ -1518,7 +1658,11 @@ impl Ctx {
         let mx = VX0 + input_pct / 100.0 * (VX1 - VX0);
         let my = VY1 - output_pct / 100.0 * (VY1 - crate::curve::VY0);
 
-        win.set_connected(connected);
+        // DS-78: every prop below is set only when it moved — an
+        // unchanged `set_*` still marks the property dirty and
+        // repaints, so a 20 Hz frame that re-sets ~50 props costs a
+        // repaint even when nothing moved.
+        set_if_changed(win.get_connected(), connected, |v| win.set_connected(v));
         // DS-67: a rejoining board clears the flag once the session
         // is Active again — the rejoin is done, the link is back.
         if active && self.pairing_rejoining.get() {
@@ -1526,25 +1670,35 @@ impl Ctx {
             self.pairing_rejoin_since.set(None);
             win.set_setup_pair_status("Paired — wheel connected.".into());
         }
-        win.set_setup_rejoining(self.pairing_rejoining.get());
-        win.set_conn_label(
+        set_if_changed(win.get_setup_rejoining(), self.pairing_rejoining.get(), |v| {
+            win.set_setup_rejoining(v);
+        });
+        set_if_changed(
+            win.get_conn_label(),
             conn_label_for(connecting, live, &conn.label, self.pairing_rejoining.get()).into(),
+            |v| win.set_conn_label(v),
         );
         // The wizard's Connect step is done exactly when the session
         // is Active on the LIVE daemon (v2.0.1 hotfix): re-derived on
         // every frame, so a reconnect also advances the wizard. The
         // sim reports Active too — it must never advance the wizard.
-        win.set_setup_connect_done(active);
+        set_if_changed(win.get_setup_connect_done(), active, |v| {
+            win.set_setup_connect_done(v);
+        });
         if active {
             // TR §3c: an already-paired board + Active session means
             // the Pair step is already complete when the wizard opens.
-            win.set_setup_paired(true);
-            win.set_paired(true);
+            set_if_changed(win.get_setup_paired(), true, |v| win.set_setup_paired(v));
+            set_if_changed(win.get_paired(), true, |v| win.set_paired(v));
         } else {
-            win.set_paired(false);
+            set_if_changed(win.get_paired(), false, |v| win.set_paired(v));
         }
-        win.set_setup_wifi_joined(active && conn.transport == ApiTransport::Wifi);
-        win.set_setup_usb_available(active && conn.transport == ApiTransport::Usb);
+        set_if_changed(win.get_setup_wifi_joined(), active && conn.transport == ApiTransport::Wifi, |v| {
+            win.set_setup_wifi_joined(v);
+        });
+        set_if_changed(win.get_setup_usb_available(), active && conn.transport == ApiTransport::Usb, |v| {
+            win.set_setup_usb_available(v);
+        });
         let transport_label = match conn.transport {
             rsh_api::ApiTransport::Wifi => "Wi-Fi",
             rsh_api::ApiTransport::Usb => "USB",
@@ -1560,41 +1714,75 @@ impl Ctx {
         } else {
             "Not connected".to_string()
         };
-        win.set_conn_sub(sub.into());
-        win.set_send_to_game(api.output_enabled());
-        win.set_steer_angle(steer_deg);
-        // B1: no live daemon → "—", never a sine angle.
-        win.set_steer_text(if live {
-            format!("{steer_deg:+.0}°").into()
-        } else {
-            "—".into()
+        set_if_changed(win.get_conn_sub(), sub.into(), |v| win.set_conn_sub(v));
+        set_if_changed(win.get_send_to_game(), api.output_enabled(), |v| {
+            win.set_send_to_game(v);
         });
-        win.set_throttle((snap.throttle * 100.0) as f32);
-        win.set_brake((snap.brake * 100.0) as f32);
-        win.set_clutch((snap.clutch.unwrap_or(0.0) * 100.0) as f32);
+        set_if_changed(win.get_steer_angle(), steer_deg, |v| win.set_steer_angle(v));
+        // B1: no live daemon → "—", never a sine angle.
+        set_if_changed(
+            win.get_steer_text(),
+            if live {
+                format!("{steer_deg:+.0}°").into()
+            } else {
+                "—".into()
+            },
+            |v| win.set_steer_text(v),
+        );
+        set_if_changed(win.get_throttle(), (snap.throttle * 100.0) as f32, |v| {
+            win.set_throttle(v);
+        });
+        set_if_changed(win.get_brake(), (snap.brake * 100.0) as f32, |v| {
+            win.set_brake(v);
+        });
+        set_if_changed(
+            win.get_clutch(),
+            (snap.clutch.unwrap_or(0.0) * 100.0) as f32,
+            |v| win.set_clutch(v),
+        );
         // H10/M-3: handbrake + gear come from the live snapshot now
         // (0 / "—" only without live data — the snapshot defaults).
-        win.set_handbrake((snap.handbrake * 100.0) as f32);
-        win.set_gear(if snap.gear == 0 {
-            "—".into()
-        } else {
-            snap.gear.to_string().into()
+        set_if_changed(win.get_handbrake(), (snap.handbrake * 100.0) as f32, |v| {
+            win.set_handbrake(v);
         });
-        win.set_input_pct(input_pct);
-        win.set_output_pct(output_pct);
-        win.set_marker_vx(mx);
-        win.set_marker_vy(my);
-        win.set_dashed_line(dashed_line_commands().into());
-        win.set_crosshair(crosshair_commands(mx, my).into());
-        win.set_curve_commands(curve_commands(deadzone, exponent).into());
-        win.set_deadzone(deadzone / 10.0);
-        win.set_deadzone_text(format!("{deadzone:.0}%").into());
+        set_if_changed(
+            win.get_gear(),
+            if snap.gear == 0 {
+                "—".into()
+            } else {
+                snap.gear.to_string().into()
+            },
+            |v| win.set_gear(v),
+        );
+        set_if_changed(win.get_input_pct(), input_pct, |v| win.set_input_pct(v));
+        set_if_changed(win.get_output_pct(), output_pct, |v| win.set_output_pct(v));
+        set_if_changed(win.get_marker_vx(), mx, |v| win.set_marker_vx(v));
+        set_if_changed(win.get_marker_vy(), my, |v| win.set_marker_vy(v));
+        set_if_changed(win.get_dashed_line(), self.dashed_line_cached(), |v| {
+            win.set_dashed_line(v);
+        });
+        set_if_changed(win.get_crosshair(), self.crosshair_commands_cached(mx, my), |v| {
+            win.set_crosshair(v);
+        });
+        set_if_changed(
+            win.get_curve_commands(),
+            self.curve_commands_cached(deadzone, exponent),
+            |v| win.set_curve_commands(v),
+        );
+        set_if_changed(win.get_deadzone(), deadzone / 10.0, |v| win.set_deadzone(v));
+        set_if_changed(win.get_deadzone_text(), format!("{deadzone:.0}%").into(), |v| {
+            win.set_deadzone_text(v);
+        });
         // A24: slider range is 1.0..2.0 now, so the normalised value
         // is exponent - 1.0 (was / 2.0 for the old 1.0..3.0 range).
-        win.set_curve_val(exponent - 1.0);
-        win.set_curve_text(format!("{exponent:.2}").into());
-        win.set_preset(self.tuning.borrow().preset);
-        win.set_unsaved(self.unsaved.get());
+        set_if_changed(win.get_curve_val(), exponent - 1.0, |v| win.set_curve_val(v));
+        set_if_changed(win.get_curve_text(), format!("{exponent:.2}").into(), |v| {
+            win.set_curve_text(v);
+        });
+        set_if_changed(win.get_preset(), self.tuning.borrow().preset, |v| {
+            win.set_preset(v);
+        });
+        set_if_changed(win.get_unsaved(), self.unsaved.get(), |v| win.set_unsaved(v));
         // H10: pressed-index comes ONLY from live button state — the
         // first pressed wheel button (1–12) highlights its tile
         // (including while learning — the physical button being held
@@ -1606,7 +1794,9 @@ impl Ctx {
         } else {
             -1
         };
-        win.set_pressed_index(pressed_index);
+        set_if_changed(win.get_pressed_index(), pressed_index, |v| {
+            win.set_pressed_index(v);
+        });
         // Pedal mini-curve markers (A1): live pct + cached feel.
         {
             let pedals = self.pedals.borrow();
@@ -1620,19 +1810,33 @@ impl Ctx {
                 let dz = pedals.records[i].deadzone as f32;
                 markers[i] = pedal_marker(*pct, dz, pedals.feel_exp[i]);
             }
-            win.set_throttle_marker_x(markers[0].0);
-            win.set_throttle_marker_y(markers[0].1);
-            win.set_brake_marker_x(markers[1].0);
-            win.set_brake_marker_y(markers[1].1);
-            win.set_clutch_marker_x(markers[2].0);
-            win.set_clutch_marker_y(markers[2].1);
+            set_if_changed(win.get_throttle_marker_x(), markers[0].0, |v| {
+                win.set_throttle_marker_x(v);
+            });
+            set_if_changed(win.get_throttle_marker_y(), markers[0].1, |v| {
+                win.set_throttle_marker_y(v);
+            });
+            set_if_changed(win.get_brake_marker_x(), markers[1].0, |v| {
+                win.set_brake_marker_x(v);
+            });
+            set_if_changed(win.get_brake_marker_y(), markers[1].1, |v| {
+                win.set_brake_marker_y(v);
+            });
+            set_if_changed(win.get_clutch_marker_x(), markers[2].0, |v| {
+                win.set_clutch_marker_x(v);
+            });
+            set_if_changed(win.get_clutch_marker_y(), markers[2].1, |v| {
+                win.set_clutch_marker_y(v);
+            });
         }
         // Horn test flash (Extras): lights the indicator briefly.
         let horn_pressed = self
             .horn_test_until
             .get()
             .is_some_and(|until| Instant::now() < until);
-        win.set_horn_pressed(horn_pressed);
+        set_if_changed(win.get_horn_pressed(), horn_pressed, |v| {
+            win.set_horn_pressed(v);
+        });
         // Live chart histories (A20) + chart props every 10th tick.
         // B1: histories only grow while live — without a daemon the
         // charts stay empty ("—") instead of drawing the sim sine
@@ -1649,23 +1853,45 @@ impl Ctx {
                 pedal_hist.pop_front();
             }
             if tick.is_multiple_of(10) {
-                win.set_diag_steer_chart(chart_commands(&steer_hist, -180.0, 180.0).into());
-                win.set_diag_pedals_chart(chart_commands(&pedal_hist, 0.0, 1.0).into());
-                win.set_diag_steer_readout(format!("{steer_deg:+.0}°").into());
-                win.set_diag_pedals_readout(
+                set_if_changed(
+                    win.get_diag_steer_chart(),
+                    chart_commands(&steer_hist, -180.0, 180.0).into(),
+                    |v| win.set_diag_steer_chart(v),
+                );
+                set_if_changed(
+                    win.get_diag_pedals_chart(),
+                    chart_commands(&pedal_hist, 0.0, 1.0).into(),
+                    |v| win.set_diag_pedals_chart(v),
+                );
+                set_if_changed(
+                    win.get_diag_steer_readout(),
+                    format!("{steer_deg:+.0}°").into(),
+                    |v| win.set_diag_steer_readout(v),
+                );
+                set_if_changed(
+                    win.get_diag_pedals_readout(),
                     format!(
                         "Throttle {:.0}% · Brake {:.0}%",
                         snap.throttle * 100.0,
                         snap.brake * 100.0
                     )
                     .into(),
+                    |v| win.set_diag_pedals_readout(v),
                 );
             }
         } else if tick.is_multiple_of(10) {
-            win.set_diag_steer_chart("".into());
-            win.set_diag_pedals_chart("".into());
-            win.set_diag_steer_readout("—".into());
-            win.set_diag_pedals_readout("—".into());
+            set_if_changed(win.get_diag_steer_chart(), "".into(), |v| {
+                win.set_diag_steer_chart(v);
+            });
+            set_if_changed(win.get_diag_pedals_chart(), "".into(), |v| {
+                win.set_diag_pedals_chart(v);
+            });
+            set_if_changed(win.get_diag_steer_readout(), "—".into(), |v| {
+                win.set_diag_steer_readout(v);
+            });
+            set_if_changed(win.get_diag_pedals_readout(), "—".into(), |v| {
+                win.set_diag_pedals_readout(v);
+            });
         }
     }
 
@@ -3932,6 +4158,20 @@ impl Ctx {
                 );
                 win.set_diag_tx_failures_text(stats.tx_fail.to_string().into());
                 win.set_diag_seq_gaps_text(stats.seq_gap.to_string().into());
+                // DS-82: IPC dispatch latency (the daemon, all
+                // methods). "—" until measured — never a fake 0.
+                win.set_diag_ipc_p50_text(
+                    stats
+                        .ipc_p50_ms
+                        .map_or_else(|| "—".to_string(), |v| format!("{v:.2} ms"))
+                        .into(),
+                );
+                win.set_diag_ipc_p99_text(
+                    stats
+                        .ipc_p99_ms
+                        .map_or_else(|| "—".to_string(), |v| format!("{v:.2} ms"))
+                        .into(),
+                );
             }
         } else {
             win.set_diag_delay_text("—".into());
@@ -3940,7 +4180,23 @@ impl Ctx {
             win.set_diag_loop_rate_text("—".into());
             win.set_diag_tx_failures_text("—".into());
             win.set_diag_seq_gaps_text("—".into());
+            win.set_diag_ipc_p50_text("—".into());
+            win.set_diag_ipc_p99_text("—".into());
         }
+        // DS-82: frame-time histogram (this UI, last 30 s) — local,
+        // so it is set regardless of whether the daemon answered
+        // `diag_stats` above.
+        let (frame_p50, frame_p99) = self.frame_time_p50_p99().unzip();
+        win.set_diag_frame_p50_text(
+            frame_p50
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
+                .into(),
+        );
+        win.set_diag_frame_p99_text(
+            frame_p99
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
+                .into(),
+        );
         // H10: the live button grid shows the real pressed buttons
         // (bits 1–12 of the snapshot mask) — empty when not live, so
         // the section hides instead of rendering 12 dead tiles.
@@ -7020,7 +7276,16 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// Log one drained push event. Notification events are ALSO fed to
 /// the [`NotificationCenter`] by the timer drain (see `main`); this
 /// function only logs, it never stores.
-fn log_event(ev: &AppEvent) {
+/// Log one drained live event (DS-79): to stderr only with
+/// `--verbose`. Without it the UI thread does no `eprintln!` per
+/// event at all — not even the `format!` (the early return skips
+/// it). The daemon already records its side of every event in the
+/// diagnostics log; the UI does not depend on `rsh-app-core`, so
+/// its events have no file sink here.
+fn log_event(verbose: bool, ev: &AppEvent) {
+    if !verbose {
+        return;
+    }
     match ev {
         AppEvent::ConnectionChanged {
             state,
@@ -7539,7 +7804,7 @@ fn start_frame_timer(
         };
         if let Some(live) = &live_api {
             for ev in live.poll_events() {
-                log_event(&ev);
+                log_event(ctx.verbose.get(), &ev);
                 handle_live_event(&win, &ctx, &ev);
             }
         }
@@ -7553,7 +7818,11 @@ fn start_frame_timer(
             // M-7: queued slider pushes (150 ms debounce) flush here.
             ctx.flush_steering_push(&w);
             ctx.flush_field_push(&w);
+            // DS-82: time the frame's Rust work for the Diagnostics
+            // frame-time histogram.
+            let frame_started = Instant::now();
             ctx.refresh(&w, t);
+            ctx.record_frame_time(frame_started.elapsed());
             if t.is_multiple_of(20) {
                 // 1 Hz: job timeouts + the `connecting` guard (A9 —
                 // never infinite) + firmware-update poll (H-4) +
@@ -7768,6 +8037,9 @@ fn main() -> Result<(), slint::PlatformError> {
         toast_until: Rc::new(Cell::new(None)),
         steer_hist: Rc::new(RefCell::new(VecDeque::new())),
         pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
+        frame_cmds: Rc::new(RefCell::new(FrameCmdCache::default())),
+        frame_times: Rc::new(RefCell::new(VecDeque::new())),
+        verbose: Rc::new(Cell::new(args.verbose)),
         unsaved: Rc::new(Cell::new(initial_unsaved)),
         // M10: notifications persist across restarts — the drawer is
         // reloaded from `<data_dir>/notifications.json` here (a
@@ -8183,6 +8455,47 @@ mod tests {
         assert!(cmds.starts_with("M 0.0 45.0 L 380.0 25.0"), "{cmds}");
     }
 
+    /// DS-78: the frame command cache reuses the built string while
+    /// its inputs are unchanged, rebuilds when an input moves, and
+    /// the dashed line is built once.
+    #[test]
+    fn ds78_frame_cmd_cache_reuses_unchanged_inputs() {
+        let mut cache = FrameCmdCache::default();
+        let first_curve = cache.curve(10.0, 1.5);
+        assert_eq!(cache.curve(10.0, 1.5), first_curve);
+        assert_ne!(cache.curve(20.0, 1.5), first_curve);
+        assert_eq!(cache.curve(20.0, 1.5), cache.curve(20.0, 1.5));
+        let first_cross = cache.crosshair(100.0, 50.0);
+        assert_eq!(cache.crosshair(100.0, 50.0), first_cross);
+        assert_ne!(cache.crosshair(101.0, 50.0), first_cross);
+        let dashed = cache.dashed_line();
+        assert_eq!(cache.dashed_line(), dashed);
+        assert!(!dashed.is_empty());
+    }
+
+    /// DS-82: the frame-time histogram is empty until a frame is
+    /// recorded, then reports p50/p99 over the recorded window in
+    /// ms (1..=100 ms samples: p50 50 ms, p99 99 ms).
+    #[test]
+    fn ds82_frame_time_histogram_reports_p50_p99() {
+        let (ctx, _dir) = fc2_test_ctx();
+        assert_eq!(ctx.frame_time_p50_p99(), None);
+        for ms in 1..=100_u64 {
+            ctx.record_frame_time(Duration::from_millis(ms));
+        }
+        let (p50, p99) = ctx.frame_time_p50_p99().expect("measured");
+        assert!((p50 - 50.0).abs() < 0.001, "p50 {p50}");
+        assert!((p99 - 99.0).abs() < 0.001, "p99 {p99}");
+        // The ring caps at 600: 700 more samples push the first
+        // 200 out (window 201..=800 ms → p50 500 ms).
+        for ms in 101..=800_u64 {
+            ctx.record_frame_time(Duration::from_millis(ms));
+        }
+        assert_eq!(ctx.frame_times.borrow().len(), 600);
+        let (p50, _) = ctx.frame_time_p50_p99().expect("measured");
+        assert!((p50 - 500.0).abs() < 0.001, "p50 {p50}");
+    }
+
     #[test]
     fn countdown_ring_drives_from_seconds() {
         assert_eq!(countdown_ring_commands(0, 120), "");
@@ -8413,6 +8726,9 @@ mod tests {
             toast_until: Rc::new(Cell::new(None)),
             steer_hist: Rc::new(RefCell::new(VecDeque::new())),
             pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
+            frame_cmds: Rc::new(RefCell::new(FrameCmdCache::default())),
+            frame_times: Rc::new(RefCell::new(VecDeque::new())),
+            verbose: Rc::new(Cell::new(false)),
             unsaved: Rc::new(Cell::new(false)),
             notifications: Rc::new(RefCell::new(NotificationCenter::load(Some(&dir)))),
             data_dir: Some(dir.clone()),

@@ -175,24 +175,18 @@ async fn manager_loop(
     // finishes it as failed.
     let mut pairing_in_flight = false;
     let mut pending_rejoin_password: Option<String> = None;
-    let mut logged_lines = 0usize;
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     loop {
         ticker.tick().await;
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        // Drain the pairing log into the diagnostics file (one line
-        // per transition — the buffer is capped at 200, so a shrink
-        // means the cap dropped old lines: restart from the top).
-        let lines = api.state.pairing_log_lines();
-        if lines.len() < logged_lines {
-            logged_lines = 0;
+        // Drain the pairing log into the diagnostics file (DS-32:
+        // drain-once — each line is logged exactly once, no
+        // re-clone of the whole buffer and no index bookkeeping).
+        for line in api.state.take_pairing_log_lines() {
+            log_line(verbose, &line);
         }
-        for line in &lines[logged_lines..] {
-            log_line(verbose, line);
-        }
-        logged_lines = lines.len();
         // Drain the manager's own transition lines.
         for line in api.take_manager_log_lines() {
             log_line(verbose, &line);
@@ -1399,72 +1393,92 @@ fn main() {
         }
     }
 
-    // D-7 lazy-start (Phase 7): activate the startup output backend.
-    // vJoy activates now; HIDMaestro stays deferred until the user
-    // turns "Send to game" on, so autostart never pops a UAC prompt
-    // at login. This never fails the launch (see the outcome log).
-    let backend = state.activate_startup_backend();
-    log_line(
-        verbose,
-        &format!(
-            "daemon: startup backend requested={:?} active={:?} fell_back={} reason={:?}",
-            backend.requested, backend.active, backend.fell_back, backend.reason
-        ),
-    );
-
-    // Autostart sync (Phase 7): `settings.autostart` drives the
-    // Windows Run key / Linux .desktop file. A stale v1 entry
-    // (pointing at the old `RSH.exe`) is migrated to the daemon exe
-    // when autostart is on, and removed when it is off — the old exe
-    // no longer exists after the v2.0 install. Best-effort: a failed
-    // write is logged, never fatal.
-    //
-    // Heal a stale persisted `autostart = false` FIRST: the v1
-    // default was false, so a machine upgraded from v1.0.2 carries
-    // `settings.json` with autostart off — and the plain sync below
-    // would DELETE the Run key the installer just wrote, so the
-    // daemon would never autostart again (the v2.0.0
-    // no-tray-after-reboot report). A Run entry that already points
-    // at this exe cannot come from a v2 Settings toggle-off (that
-    // deletes the entry immediately), so its presence is newer
-    // evidence than the stale persisted flag: adopt it and persist
-    // the fix. Only when persisting the adoption fails is the sync
-    // skipped this launch, so a stale flag can never delete a live
-    // entry. (A fresh-store default flip alone cannot heal this —
-    // it only affects stores with no `settings.json` yet.)
-    let mut skip_autostart_sync = false;
-    if let Ok(exe) = std::env::current_exe() {
-        if !state.settings().autostart && tray_autostart::autostart_enabled(&exe) {
-            let mut settings = state.settings();
-            settings.autostart = true;
-            match state.set_settings(settings) {
-                Ok(_) => log_line(
-                    verbose,
-                    "daemon: autostart adopted from the existing Run entry (persisted autostart was stale off) — Run key kept",
-                ),
-                Err(error) => {
-                    log_line(
-                        verbose,
-                        &format!(
-                            "daemon: autostart adoption failed ({error}) — leaving the Run entry untouched this launch"
-                        ),
-                    );
-                    skip_autostart_sync = true;
-                }
-            }
-        }
-        if !skip_autostart_sync {
-            match tray_autostart::sync_autostart(state.settings().autostart, &exe) {
-                Ok(sync) => log_line(
+    // DS-81: backend activation + autostart sync run on a
+    // background thread, concurrently with tray creation below —
+    // neither may block startup (activation probes drivers,
+    // autostart sync touches the registry / .desktop file, and the
+    // tray loop already waits up to 12 s on a headless host). IPC
+    // is already serving (runtime spawned above), so this changes
+    // no IPC ordering. The thread is best-effort and detached:
+    // `--check` exits without waiting for it.
+    let exe = std::env::current_exe().ok();
+    {
+        let state = Arc::clone(&state);
+        let _ = std::thread::Builder::new()
+            .name("rsh-daemon-startup".to_string())
+            .spawn(move || {
+                // D-7 lazy-start (Phase 7): activate the startup
+                // output backend. vJoy activates now; HIDMaestro
+                // stays deferred until the user turns "Send to
+                // game" on, so autostart never pops a UAC prompt at
+                // login. This never fails the launch (see the
+                // outcome log).
+                let backend = state.activate_startup_backend();
+                log_line(
                     verbose,
                     &format!(
-                        "daemon: autostart sync: {sync:?} (enabled now: {})",
-                        tray_autostart::autostart_enabled(&exe)
+                        "daemon: startup backend requested={:?} active={:?} fell_back={} reason={:?}",
+                        backend.requested, backend.active, backend.fell_back, backend.reason
                     ),
-                ),
-                Err(error) => log_line(verbose, &format!("daemon: autostart sync failed: {error}")),
-            }
-        }
+                );
+
+                // Autostart sync (Phase 7): `settings.autostart`
+                // drives the Windows Run key / Linux .desktop file.
+                // Best-effort: a failed write is logged, never
+                // fatal.
+                let Some(exe) = exe else { return };
+                // DS-81: the settings are read ONCE (one `Arc`
+                // clone) — the old code read them three times.
+                let settings = state.settings_arc();
+                let mut autostart = settings.autostart;
+                let mut skip_autostart_sync = false;
+                // Heal a stale persisted `autostart = false` FIRST:
+                // the v1 default was false, so a machine upgraded
+                // from v1.0.2 carries `settings.json` with autostart
+                // off — and the plain sync below would DELETE the
+                // Run key the installer just wrote. A Run entry that
+                // already points at this exe cannot come from a v2
+                // Settings toggle-off (that deletes the entry
+                // immediately), so its presence is newer evidence
+                // than the stale persisted flag: adopt it and
+                // persist the fix. Only when persisting the adoption
+                // fails is the sync skipped this launch, so a stale
+                // flag can never delete a live entry.
+                if !autostart && tray_autostart::autostart_enabled(&exe) {
+                    let mut adopted = (*settings).clone();
+                    adopted.autostart = true;
+                    match state.set_settings(adopted) {
+                        Ok(_) => {
+                            autostart = true;
+                            log_line(
+                                verbose,
+                                "daemon: autostart adopted from the existing Run entry (persisted autostart was stale off) — Run key kept",
+                            );
+                        }
+                        Err(error) => {
+                            log_line(
+                                verbose,
+                                &format!(
+                                    "daemon: autostart adoption failed ({error}) — leaving the Run entry untouched this launch"
+                                ),
+                            );
+                            skip_autostart_sync = true;
+                        }
+                    }
+                }
+                if !skip_autostart_sync {
+                    match tray_autostart::sync_autostart(autostart, &exe) {
+                        Ok(sync) => log_line(
+                            verbose,
+                            &format!(
+                                "daemon: autostart sync: {sync:?} (enabled now: {})",
+                                tray_autostart::autostart_enabled(&exe)
+                            ),
+                        ),
+                        Err(error) => log_line(verbose, &format!("daemon: autostart sync failed: {error}")),
+                    }
+                }
+            });
     }
 
     // --check: verify IPC answers, then exit 0 (no tray needed).

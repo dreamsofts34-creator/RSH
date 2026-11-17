@@ -285,6 +285,10 @@ export component MainWindow inherits Window {
     in-out property <string> diag-loop-rate-text: "—";
     in-out property <string> diag-tx-failures-text: "—";
     in-out property <string> diag-seq-gaps-text: "—";
+    in-out property <string> diag-frame-p50-text: "—";
+    in-out property <string> diag-frame-p99-text: "—";
+    in-out property <string> diag-ipc-p50-text: "—";
+    in-out property <string> diag-ipc-p99-text: "—";
     in-out property <[bool]> diag-buttons-pressed;
 
     callback toggled-send();
@@ -885,6 +889,10 @@ export component MainWindow inherits Window {
         loop-rate-text: diag-loop-rate-text;
         tx-failures-text: diag-tx-failures-text;
         seq-gaps-text: diag-seq-gaps-text;
+        frame-p50-text: diag-frame-p50-text;
+        frame-p99-text: diag-frame-p99-text;
+        ipc-p50-text: diag-ipc-p50-text;
+        ipc-p99-text: diag-ipc-p99-text;
         conn-label: diag-conn-label;
         daemon-live: diag-daemon-live;
         app-version: diag-app-version;

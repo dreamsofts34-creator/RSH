@@ -44,7 +44,8 @@ use rsh_api::connection::ConnectionState;
 use rsh_api::{
     app_version, ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionError,
     ConnectionInfo, DiagStats, DraftStatus, FirmwareCheck, FirmwareUpdateStatus, GameSummary,
-    PairingInfo, PollState, ProfileSummary, SnapshotInfo, TuningSettings, UserError, VjoyStatus,
+    PairingInfo, PollState, ProfileSummary, SlowPollState, SnapshotInfo, TuningSettings, UserError,
+    VjoyStatus,
 };
 use rsh_ipc::{IpcClient, IpcError};
 
@@ -115,6 +116,12 @@ struct LiveCache {
     /// Set by a successful write (or the UI) to pull the next slow
     /// cycle forward at once instead of waiting out the 1 s period.
     refresh_requested: AtomicBool,
+    /// Write epoch (DS-29): bumped by every `request_slow_refresh`
+    /// — a slow cycle that started before the epoch moved can carry
+    /// pre-write values, so it must not bump `generation` (see
+    /// `refresh_slow`). The poller re-runs at once while the flag
+    /// above is set, so the next bump carries post-write values.
+    refresh_epoch: AtomicU64,
     generation: AtomicU64,
 }
 
@@ -149,6 +156,7 @@ impl Default for LiveCache {
             draft: Mutex::new(None),
             slow_filled: AtomicBool::new(false),
             refresh_requested: AtomicBool::new(false),
+            refresh_epoch: AtomicU64::new(0),
             generation: AtomicU64::new(0),
         }
     }
@@ -297,7 +305,39 @@ impl IpcApi {
             cache: cache.clone(),
         });
         {
-            let poll_client = client.clone();
+            // DS-80: the fast poller gets its OWN connection, so a
+            // slow call on the main client (a `slow_poll`, a job
+            // call) never delays the 20 Hz `poll` behind the
+            // single-flight lock. Verified with a real `ping`
+            // before use: a server that accepts only one
+            // connection (the ipc_api test server) leaves the
+            // second connect unanswered, so the poller falls back
+            // to the shared client instead of stalling. The probe
+            // is bounded to 200 ms — a healthy daemon answers in
+            // under a millisecond.
+            let poll_client = api.rt.block_on(async {
+                let candidate = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    IpcClient::connect(path),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok);
+                match candidate {
+                    Some(candidate) => {
+                        let pinged = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            candidate.ping(),
+                        )
+                        .await;
+                        match pinged {
+                            Ok(Ok(true)) => candidate,
+                            _ => client.clone(),
+                        }
+                    }
+                    None => client.clone(),
+                }
+            });
             let poll_cache = cache.clone();
             api.rt.spawn(async move {
                 loop {
@@ -538,6 +578,10 @@ impl IpcApi {
     /// when it starts the early cycle.
     pub fn request_slow_refresh(&self) {
         self.cache.refresh_requested.store(true, Ordering::Relaxed);
+        // DS-29: a write is in flight — a slow cycle that started
+        // before this must not bump the generation with pre-write
+        // values (see `refresh_slow`).
+        self.cache.refresh_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// One slow refresh, run synchronously on the calling (job)
@@ -581,8 +625,10 @@ impl IpcApi {
     /// Drain all pushed [`AppEvent`]s waiting on this connection.
     #[must_use]
     pub fn poll_events(&self) -> Vec<AppEvent> {
+        // DS-78: a plain sync `mpsc` drain — no `block_on` per event
+        // (and none per empty frame either).
         let mut out = Vec::new();
-        while let Some(ev) = self.rt.block_on(self.client.try_recv_event()) {
+        while let Some(ev) = self.client.try_recv_event() {
             out.push(ev);
         }
         out
@@ -641,6 +687,77 @@ impl IpcApi {
 #[allow(clippy::too_many_lines)]
 async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     if cache.link_dead.load(Ordering::Relaxed) {
+        return;
+    }
+    // DS-29: the epoch this cycle started at — a write that lands
+    // while the cycle runs makes its data possibly stale (the cycle
+    // reads everything at once, up front), so the generation bump
+    // at the end is skipped when the epoch moved (see below). The
+    // poller re-runs at once while `refresh_requested` is set, so
+    // the next bump carries post-write values.
+    let epoch = cache.refresh_epoch.load(Ordering::Relaxed);
+    // DS-29: one combined call first (30 -> 1 round-trips). On any
+    // failure — old daemon without the method, an unparseable reply
+    // — fall through to the sequential per-slot pass below, which
+    // keeps exactly its old behaviour (including `link_dead` checks).
+    let slow_state = match client.call("slow_poll", serde_json::json!({})).await {
+        Ok(value) => serde_json::from_value::<SlowPollState>(value).ok(),
+        Err(_) => None,
+    };
+    if let Some(state) = slow_state {
+        macro_rules! set_slot {
+            ($slot:ident, $value:expr) => {
+                if let Ok(mut slot) = cache.$slot.lock() {
+                    *slot = Some($value);
+                }
+            };
+        }
+        set_slot!(version, state.version);
+        set_slot!(firmware_version, state.firmware_version);
+        set_slot!(backend, state.backend);
+        set_slot!(autostart, state.autostart);
+        set_slot!(board_address, state.board_address);
+        if let Some(diag) = state.diag_stats {
+            set_slot!(diag_stats, diag);
+        }
+        set_slot!(pairing_status, state.pairing_status);
+        if let Some(calibration) = state.calibration {
+            set_slot!(calibration, calibration);
+        }
+        set_slot!(profiles, state.profiles);
+        set_slot!(games, state.games);
+        if let Some(check) = state.firmware_check {
+            set_slot!(firmware_check, check);
+        }
+        set_slot!(firmware_update_status, state.firmware_update_status);
+        if let Some(vjoy) = state.vjoy_status {
+            set_slot!(vjoy_status, vjoy);
+        }
+        set_slot!(auto_pause, state.auto_pause);
+        set_slot!(close_to_tray, state.close_to_tray);
+        set_slot!(bindings, state.bindings);
+        set_slot!(knobs, state.knobs);
+        // Draft is `None`-or-object: store whichever parsed, so a
+        // saved draft clears the cached one (as the old path did).
+        if let Ok(mut slot) = cache.draft.lock() {
+            *slot = state.draft;
+        }
+        if let Ok(mut tunings) = cache.tunings.lock() {
+            for (module, tuning) in state.tunings {
+                tunings.insert(module, tuning);
+            }
+        }
+        if let Ok(mut modules) = cache.modules.lock() {
+            for (module, index) in
+                [("handbrake", 0), ("shifter", 1), ("horn", 2), ("led", 3)]
+            {
+                if let Some(enabled) = state.modules.get(module) {
+                    modules[index] = Some(*enabled);
+                }
+            }
+        }
+        cache.slow_filled.store(true, Ordering::Relaxed);
+        bump_generation_if_fresh(cache, epoch);
         return;
     }
     // One call, parsed or ignored. `parse` turns the reply into
@@ -778,7 +895,19 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
         }
     }
     cache.slow_filled.store(true, Ordering::Relaxed);
-    cache.generation.fetch_add(1, Ordering::Relaxed);
+    bump_generation_if_fresh(cache, epoch);
+}
+
+/// Bump the slow generation when the cycle's data is fresh
+/// (DS-29): skip the bump when a write asked for a refresh while
+/// this cycle ran — the cycle may carry pre-write values, and its
+/// bump would tell the UI (and the `discard_draft` test) the cache
+/// is current when it is not. `slow_filled` is NOT gated: the slots
+/// still hold genuine daemon values, only possibly a cycle old.
+fn bump_generation_if_fresh(cache: &LiveCache, epoch: u64) {
+    if cache.refresh_epoch.load(Ordering::Relaxed) == epoch {
+        cache.generation.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl AppApi for IpcApi {
@@ -2552,6 +2681,9 @@ mod tests {
         snapshot_calls: AtomicUsize,
         connection_calls: AtomicUsize,
         output_calls: AtomicUsize,
+        /// Test-only: `list_profiles` sleeps this long (DS-80 — a
+        /// controllable blocking handler). Zero in normal tests.
+        list_profiles_delay: std::time::Duration,
     }
 
     #[cfg(unix)]
@@ -2563,7 +2695,14 @@ mod tests {
                 snapshot_calls: AtomicUsize::new(0),
                 connection_calls: AtomicUsize::new(0),
                 output_calls: AtomicUsize::new(0),
+                list_profiles_delay: std::time::Duration::ZERO,
             }
+        }
+
+        fn with_list_profiles_delay(delay: std::time::Duration) -> Self {
+            let mut api = Self::new();
+            api.list_profiles_delay = delay;
+            api
         }
     }
 
@@ -2636,6 +2775,14 @@ mod tests {
                 output_enabled: self.inner.output_enabled(),
             }
         }
+
+        // DS-80 test hook: a controllable blocking handler.
+        fn list_profiles(&self) -> Vec<ProfileSummary> {
+            if !self.list_profiles_delay.is_zero() {
+                std::thread::sleep(self.list_profiles_delay);
+            }
+            self.inner.list_profiles()
+        }
     }
 
     /// L-4 (v2.0.2): the poller does exactly ONE round-trip per
@@ -2705,6 +2852,91 @@ mod tests {
         assert_eq!(client.connection().label, "Connected");
         assert_eq!(client.snapshot().throttle, 0.5);
         assert!(client.output_enabled());
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DS-80: the fast poller runs on its own connection — while a
+    /// 2 s `slow_poll` occupies the main client (its single-flight
+    /// lock held by the server-side `list_profiles` sleep), the
+    /// poller keeps running `poll` cycles on the second connection.
+    /// Without the dedicated connection the poller would stall
+    /// behind the blocked main client and run 0 cycles here.
+    #[test]
+    #[cfg(unix)]
+    fn ds80_fast_poller_keeps_polling_while_main_client_blocked() {
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-ds80-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let counting = Arc::new(CountingApi::with_list_profiles_delay(
+            std::time::Duration::from_secs(2),
+        ));
+        let api: Arc<dyn AppApi> = counting.clone();
+        let (tx, _rx) = broadcast::channel(64);
+        let server = Arc::new(IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                // Two connections: the main client and the fast
+                // poller's own connection, served concurrently —
+                // each serve task starts on accept (the main
+                // client's `subscribe` must be answered before the
+                // poller connects, so serving cannot wait for the
+                // second accept).
+                let mut tasks = tokio::task::JoinSet::new();
+                for _ in 0..2 {
+                    if let Ok((stream, _)) = listener.accept().await {
+                        let server = Arc::clone(&server);
+                        tasks.spawn(async move {
+                            server.serve_stream(stream).await;
+                        });
+                    }
+                }
+                while tasks.join_next().await.is_some() {}
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let client = IpcApi::connect(&sock).expect("connect");
+        // Wait for the poller to run at least once.
+        let mut polls = 0;
+        for _ in 0..100 {
+            polls = counting.poll_calls.load(Ordering::Relaxed);
+            if polls >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(polls >= 1, "poller never ran a poll cycle");
+        // Block the main client for ~2 s from another thread: a
+        // slow refresh whose server-side `slow_poll` sleeps in
+        // `list_profiles`, holding the main client's
+        // single-flight lock the whole time.
+        let blocked = client.clone();
+        let join = std::thread::spawn(move || {
+            blocked.refresh_slow_blocking();
+        });
+        // While the main client is blocked, the poller (own
+        // connection) must keep running: ~20 cycles/s.
+        std::thread::sleep(Duration::from_millis(1000));
+        let polls_during = counting.poll_calls.load(Ordering::Relaxed) - polls;
+        assert!(
+            polls_during >= 5,
+            "poller stalled behind the blocked main client: only {polls_during} polls in 1 s"
+        );
+        join.join().expect("blocked refresh finishes");
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);

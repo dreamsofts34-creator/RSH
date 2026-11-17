@@ -280,15 +280,19 @@ impl AppApi for DaemonApi {
     /// short lock), so there is no new lock-ordering vs the
     /// manager loop or the engine tick.
     fn poll(&self) -> PollState {
-        let core_snap = self.state.snapshot();
-        let transport = self.state.transport_state();
+        // DS-30: one `Arc` clone per source, not one struct clone
+        // per read — the settings are read once and shared between
+        // the transport state and the output flag.
+        let settings = self.state.settings_arc();
+        let core_snap = self.state.snapshot_arc();
+        let transport = self.state.transport_state_with_settings(&settings);
         let mgr = self.manager_state();
         let connection = Self::connection_from(&mgr, &transport);
         let snapshot = Self::snapshot_from(&core_snap, self.state.pressed_button_mask());
         PollState {
             snapshot,
             connection,
-            output_enabled: self.state.settings().output_enabled,
+            output_enabled: settings.output_enabled,
         }
     }
 
@@ -669,7 +673,14 @@ impl AppApi for DaemonApi {
     }
 
     fn diag_stats(&self) -> Result<DiagStats, UserError> {
-        Ok(self.state.diag_stats())
+        let mut stats = self.state.diag_stats();
+        // DS-82: the IPC dispatch latency aggregate, measured by
+        // the server on every dispatch.
+        if let Some((p50, p99)) = rsh_ipc::ipc_latency_global_p50_p99_ms() {
+            stats.ipc_p50_ms = Some(p50);
+            stats.ipc_p99_ms = Some(p99);
+        }
+        Ok(stats)
     }
 }
 

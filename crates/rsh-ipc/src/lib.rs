@@ -156,10 +156,13 @@ pub struct IpcEventFrame {
 
 /// The client library the Slint UI (Phase 3) uses.
 pub mod client;
+/// Per-method IPC latency histogram (DS-82).
+pub mod latency;
 /// The methods the IPC server answers, with their params.
 pub mod server;
 
 pub use client::IpcClient;
+pub use latency::{ipc_latency_global_p50_p99_ms, ipc_latency_snapshot, record_ipc_latency};
 pub use server::IpcServer;
 #[cfg(unix)]
 pub use server::bind_unix_socket;
@@ -248,6 +251,12 @@ pub fn dispatch(
         "poll" => {
             Ok(serde_json::to_value(api.poll()).map_err(|e| IpcError::Protocol(e.to_string()))?)
         }
+        // DS-29 (v2.0.3): one combined slow-state read — everything
+        // the UI's ~1 Hz slow poller fetched in 30 sequential
+        // round-trips, in a single dispatch (see `SlowPollState`).
+        "slow_poll" => Ok(
+            serde_json::to_value(api.slow_poll()).map_err(|e| IpcError::Protocol(e.to_string()))?,
+        ),
         "output_enabled" => Ok(serde_json::json!({"enabled": api.output_enabled()})),
         "set_output_enabled" => {
             let enabled = params

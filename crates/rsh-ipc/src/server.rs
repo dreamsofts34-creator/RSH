@@ -63,6 +63,11 @@ impl IpcServer {
         // for a client that stopped reading. Responses can arrive
         // out of order; the client matches them by `id`.
         let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<String>(64);
+        // DS-28: bound in-flight blocking dispatches per connection
+        // — a client that floods the server gets a `Busy` error
+        // instead of unbounded queued work. Cheap reads bypass this
+        // entirely (they never take a permit).
+        let dispatch_permits = Arc::new(tokio::sync::Semaphore::new(8));
         loop {
             tokio::select! {
                 line = lines.next_line() => {
@@ -75,40 +80,44 @@ impl IpcServer {
                     // Cheap parse here (no I/O, never blocks): the
                     // subscribe flag is set on request, since the
                     // response now arrives asynchronously.
-                    if parse_request(&line)
+                    let parsed = parse_request(&line);
+                    if parsed
+                        .as_ref()
                         .is_ok_and(|request| request.method == "subscribe")
                     {
                         subscribed = true;
                     }
+                    // DS-28: cheap reads run inline on this
+                    // connection task — no `spawn_blocking` hop, no
+                    // thread-pool wakeup. The response still travels
+                    // on `resp_tx` so writes stay ordered with
+                    // events; awaiting the send is safe (the select
+                    // re-polls and the drain arm runs while we wait).
+                    if parsed
+                        .as_ref()
+                        .is_ok_and(|request| is_cheap_method(&request.method))
+                    {
+                        if let Some(text) = self.response_text(&line) {
+                            let _ = resp_tx.send(text).await;
+                        }
+                        continue;
+                    }
                     let server = Arc::clone(&self);
                     let tx = resp_tx.clone();
+                    let Ok(permit) = dispatch_permits.clone().try_acquire_owned() else {
+                        // DS-28: too many dispatches in flight on
+                        // this connection — answer `Busy` instead of
+                        // queueing unbounded work.
+                        if let Some(text) = busy_response_text(&line) {
+                            let _ = resp_tx.send(text).await;
+                        }
+                        continue;
+                    };
                     tokio::task::spawn_blocking(move || {
-                        let text = match server.handle_line(&line) {
-                            Ok(resp) => encode_response(&resp).ok(),
-                            Err(error) => {
-                                // Unparseable request: answer with a
-                                // Protocol error instead of dropping
-                                // the connection silently.
-                                let id = serde_json::from_str::<serde_json::Value>(&line)
-                                    .ok()
-                                    .and_then(|value| {
-                                        value.get("id").and_then(serde_json::Value::as_u64)
-                                    })
-                                    .unwrap_or(0);
-                                encode_response(&IpcResponse {
-                                    v: IPC_PROTOCOL_VERSION,
-                                    id,
-                                    ok: false,
-                                    result: None,
-                                    error: Some(IpcErrorBody {
-                                        code: "Protocol".to_string(),
-                                        message: error.to_string(),
-                                    }),
-                                })
-                                .ok()
-                            }
-                        };
-                        if let Some(text) = text {
+                        // The permit is held until this handler
+                        // finishes, then released.
+                        let _permit = permit;
+                        if let Some(text) = server.response_text(&line) {
                             let _ = tx.blocking_send(text);
                         }
                     });
@@ -157,6 +166,38 @@ impl IpcServer {
                 }
             }
         }
+    }
+
+    /// Encode one request line's response (DS-28): shared by the
+    /// inline cheap path and the `spawn_blocking` path. Returns
+    /// `None` when the response itself cannot be encoded.
+    fn response_text(&self, line: &str) -> Option<String> {
+        // DS-82: the single instrumentation point — every dispatch
+        // (inline or blocking) records its latency per method.
+        let started = std::time::Instant::now();
+        let method = parse_request(line)
+            .map_or_else(|_| "?".to_string(), |request| request.method);
+        let out = match self.handle_line(line) {
+            Ok(resp) => encode_response(&resp).ok(),
+            Err(error) => {
+                // Unparseable request: answer with a Protocol error
+                // instead of dropping the connection silently.
+                let id = request_id(line);
+                encode_response(&IpcResponse {
+                    v: IPC_PROTOCOL_VERSION,
+                    id,
+                    ok: false,
+                    result: None,
+                    error: Some(IpcErrorBody {
+                        code: "Protocol".to_string(),
+                        message: error.to_string(),
+                    }),
+                })
+                .ok()
+            }
+        };
+        crate::record_ipc_latency(&method, started.elapsed());
+        out
     }
 
     /// Handle one request line → response (version check, dispatch,
@@ -236,6 +277,45 @@ impl IpcServer {
             }),
         }
     }
+}
+
+/// Cheap read methods (DS-28) that run inline on the connection
+/// task instead of `spawn_blocking`: pure lock reads, no I/O, no
+/// waits. `slow_poll` is deliberately NOT here — it scans the
+/// filesystem (`list_games`). `poll` / `connection` read the cached
+/// board port (DS-27), so they only ever probe hardware on a 5 s
+/// cache miss.
+fn is_cheap_method(method: &str) -> bool {
+    matches!(
+        method,
+        "ping" | "version" | "poll" | "snapshot" | "connection"
+    )
+}
+
+/// The request id carried by a raw line, for error responses to
+/// unparseable requests (0 when the line has no readable id).
+fn request_id(line: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value.get("id").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0)
+}
+
+/// A `Busy` error response (DS-28): the per-connection dispatch
+/// bound is exhausted. The client surfaces this as
+/// `IpcError::Api("Busy: …")` and retries or backs off.
+fn busy_response_text(line: &str) -> Option<String> {
+    encode_response(&IpcResponse {
+        v: IPC_PROTOCOL_VERSION,
+        id: request_id(line),
+        ok: false,
+        result: None,
+        error: Some(IpcErrorBody {
+            code: "Busy".to_string(),
+            message: "server busy: too many requests in flight — retry".to_string(),
+        }),
+    })
+    .ok()
 }
 
 /// Serve a Unix listener forever (Linux): accept connections and
@@ -330,6 +410,9 @@ mod tests {
         tunings: Mutex<BTreeMap<String, TuningSettings>>,
         dirty: Mutex<BTreeSet<String>>,
         bindings: Mutex<BTreeMap<u8, String>>,
+        /// Test-only: `list_profiles` sleeps this long (DS-28 — a
+        /// controllable blocking handler). Zero in normal tests.
+        list_profiles_delay: std::time::Duration,
     }
 
     impl StubApi {
@@ -489,6 +572,8 @@ mod tests {
                 e2e_ms: None,
                 seq_gap: 7,
                 tx_fail: 3,
+                ipc_p50_ms: None,
+                ipc_p99_ms: None,
             })
         }
 
@@ -533,6 +618,17 @@ mod tests {
         // v2.0.2 bindings: an in-memory map with the same button
         // range the real store enforces, so the dispatch round-trip
         // tests prove the wire shape and the error path.
+        // DS-28 test hook: a controllable blocking handler.
+        // `list_profiles` sleeps `list_profiles_delay` (zero in
+        // normal tests) so the dispatch-bound test can hold all 8
+        // permits at once.
+        fn list_profiles(&self) -> Vec<rsh_api::ProfileSummary> {
+            if !self.list_profiles_delay.is_zero() {
+                std::thread::sleep(self.list_profiles_delay);
+            }
+            Vec::new()
+        }
+
         fn list_bindings(&self) -> Vec<ButtonBinding> {
             self.bindings
                 .lock()
@@ -589,6 +685,7 @@ mod tests {
             tunings: Mutex::new(BTreeMap::new()),
             dirty: Mutex::new(BTreeSet::new()),
             bindings: Mutex::new(BTreeMap::new()),
+            list_profiles_delay: std::time::Duration::ZERO,
         });
         let (tx, _rx) = broadcast::channel(64);
         (Arc::new(IpcServer::new(api, tx.clone())), tx)
@@ -699,6 +796,37 @@ mod tests {
             resp.result.expect("result").get("version"),
             Some(&serde_json::Value::String("1.0.2".to_string()))
         );
+    }
+
+    /// DS-82: `response_text` records every dispatch's latency —
+    /// the snapshot holds the methods it served, with sane
+    /// percentiles (the global aggregate is `Some` once anything
+    /// was recorded; counts are lower bounds — the snapshot is
+    /// process-global, so other tests in this binary add to it).
+    #[test]
+    fn ds82_response_text_records_dispatch_latency() {
+        let server = stub_server();
+        assert!(server
+            .response_text(r#"{"v":1,"id":60,"method":"ping","params":{}}"#)
+            .is_some());
+        assert!(server
+            .response_text(r#"{"v":1,"id":61,"method":"poll","params":{}}"#)
+            .is_some());
+        let snapshot = crate::ipc_latency_snapshot();
+        let ping = snapshot
+            .iter()
+            .find(|(method, _, _, _)| method == "ping")
+            .expect("ping recorded");
+        assert!(ping.1 >= 1, "ping count: {ping:?}");
+        assert!(ping.2 <= ping.3, "p50 <= p99: {ping:?}");
+        let poll = snapshot
+            .iter()
+            .find(|(method, _, _, _)| method == "poll")
+            .expect("poll recorded");
+        assert!(poll.1 >= 1, "poll count: {poll:?}");
+        let (p50, p99) = crate::ipc_latency_global_p50_p99_ms().expect("global aggregate");
+        assert!(p50 <= p99, "global p50 {p50} <= p99 {p99}");
+        assert!(p50 >= 0.0 && p99 < 500.0, "p50 {p50} p99 {p99} ms");
     }
 
     #[test]
@@ -1159,5 +1287,114 @@ mod tests {
                 .contains("InvalidButton"),
             "missing button must fail as InvalidButton"
         );
+    }
+
+    /// DS-28: 12 concurrent blocking dispatches on one connection —
+    /// the first 8 run, the rest answer `Busy`; and a cheap `poll`
+    /// sent while the pool is full still answers inline at once.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ds28_blocking_dispatch_bound_answers_busy_and_cheap_stays_inline() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixStream;
+
+        let dir = std::env::temp_dir().join(format!("rsh-ipc-ds28-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let socket = dir.join("rsh-daemon.sock");
+        // `list_profiles` blocks 1 s per call on this server, so 12
+        // concurrent calls hold all 8 permits at once.
+        let api: Arc<dyn AppApi> = Arc::new(StubApi {
+            version: "1.0.2".to_string(),
+            output: Mutex::new(false),
+            tunings: Mutex::new(BTreeMap::new()),
+            dirty: Mutex::new(BTreeSet::new()),
+            bindings: Mutex::new(BTreeMap::new()),
+            list_profiles_delay: std::time::Duration::from_secs(1),
+        });
+        let (tx, _rx) = broadcast::channel(64);
+        let server = Arc::new(IpcServer::new(api, tx));
+        let listener = bind_unix_socket(&socket).expect("bind test socket");
+        let serve = tokio::spawn(serve_listener(Arc::clone(&server), listener));
+
+        let stream = UnixStream::connect(&socket).await.expect("connect");
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        // Fire 12 blocking calls without waiting for any reply.
+        for id in 1..=12_u64 {
+            let req = serde_json::json!({
+                "v": IPC_PROTOCOL_VERSION,
+                "id": id,
+                "method": "list_profiles",
+                "params": {}
+            });
+            writer
+                .write_all(format!("{req}\n").as_bytes())
+                .await
+                .expect("write request");
+        }
+        // A cheap poll while the pool is full: inline, no permit.
+        let poll_req = serde_json::json!({
+            "v": IPC_PROTOCOL_VERSION,
+            "id": 13,
+            "method": "poll",
+            "params": {}
+        });
+        writer
+            .write_all(format!("{poll_req}\n").as_bytes())
+            .await
+            .expect("write poll");
+        let mut ok = 0;
+        let mut busy = 0;
+        let mut poll_ok = false;
+        let started = std::time::Instant::now();
+        for _ in 0..13 {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("response arrives in time")
+                .expect("line read")
+                .expect("a line");
+            let value: serde_json::Value = serde_json::from_str(&line).expect("response parses");
+            let id = value
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .expect("id");
+            if id == 13 {
+                assert!(
+                    value
+                        .get("ok")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    "poll answers while pool is full: {line}"
+                );
+                poll_ok = true;
+                // The inline poll must not have waited out the 1 s
+                // blocking calls.
+                assert!(
+                    started.elapsed() < std::time::Duration::from_millis(900),
+                    "poll waited for blocking handlers: {:?}",
+                    started.elapsed()
+                );
+            } else if value
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                ok += 1;
+            } else {
+                let code = value
+                    .get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                assert_eq!(code, "Busy", "non-ok reply must be Busy: {line}");
+                busy += 1;
+            }
+        }
+        assert_eq!(ok, 8, "first 8 blocking calls run");
+        assert_eq!(busy, 4, "the rest answer Busy");
+        assert!(poll_ok, "poll answered");
+        serve.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

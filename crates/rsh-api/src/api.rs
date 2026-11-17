@@ -183,6 +183,69 @@ pub struct PollState {
     pub output_enabled: bool,
 }
 
+/// One combined slow-state read (DS-29, v2.0.3): everything the
+/// UI's ~1 Hz slow poller used to fetch in 30 sequential IPC
+/// round-trips (18 named calls + 8 `get_tuning` + 4
+/// `module_enabled` + `draft_status`), in a single call — the
+/// L-4 pattern that `poll()` already uses for the fast path.
+/// The values are read back-to-back in this one call, so they
+/// cannot drift the way 30 separate calls can; tearing across
+/// the slow (1 Hz) values is acceptable and documented. Fallible
+/// sources (`diag_stats`, `calibration`, `firmware_check`,
+/// `vjoy_status`) surface as `None` when the daemon reports an
+/// error — exactly the "keep the old slot value" behaviour the
+/// UI had per call.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlowPollState {
+    /// Daemon app version.
+    pub version: String,
+    /// Board firmware version (or `"Unknown"` when no live session).
+    pub firmware_version: String,
+    /// Active output backend name.
+    pub backend: String,
+    /// Whether the app starts with Windows.
+    pub autostart: bool,
+    /// Board address (Wi-Fi IP, or `""` for USB).
+    pub board_address: String,
+    /// Engine diagnostics, when the daemon can report them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diag_stats: Option<DiagStats>,
+    /// Current pairing state.
+    pub pairing_status: PairingInfo,
+    /// Calibration, when a board session is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<CalibrationInfo>,
+    /// Stored profiles.
+    pub profiles: Vec<ProfileSummary>,
+    /// Catalogue games with install / running state.
+    pub games: Vec<GameSummary>,
+    /// Firmware update check, when the daemon can report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware_check: Option<FirmwareCheck>,
+    /// Background firmware-flash progress.
+    pub firmware_update_status: FirmwareUpdateStatus,
+    /// vJoy driver status, when the daemon can report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vjoy_status: Option<VjoyStatus>,
+    /// Whether auto-profile switching is paused.
+    pub auto_pause: bool,
+    /// Whether closing the window keeps RSH in the tray.
+    pub close_to_tray: bool,
+    /// Button bindings.
+    pub bindings: Vec<ButtonBinding>,
+    /// Knob actions: `[knob][row]` action names.
+    pub knobs: [[String; 3]; 2],
+    /// Draft status, when an unsaved draft exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<DraftStatus>,
+    /// Per-module tunings, keyed by module name.
+    pub tunings: std::collections::BTreeMap<String, TuningSettings>,
+    /// Module on/off for the four toggleable modules
+    /// (`handbrake`, `shifter`, `horn`, `led`).
+    pub modules: std::collections::BTreeMap<String, bool>,
+}
+
 /// Firmware update check (H3, v2.0.2): the board's live version
 /// against the bundled OTA image's version (parsed from the signed
 /// image's `Version` marker — no signature check here; the OTA flow
@@ -385,6 +448,14 @@ pub struct DiagStats {
     pub seq_gap: u64,
     /// `txFail` counter from the latest status packet.
     pub tx_fail: u64,
+    /// IPC dispatch latency p50 in milliseconds, across methods
+    /// (DS-82): the daemon-side cost of one round-trip. [`None`]
+    /// until the daemon has measured a dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_p50_ms: Option<f64>,
+    /// IPC dispatch latency p99 in milliseconds (DS-82).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_p99_ms: Option<f64>,
 }
 
 /// Push events from the daemon to the UI. The UI never polls for
@@ -532,6 +603,51 @@ pub trait AppApi: Send + Sync {
             snapshot: self.snapshot(),
             connection: self.connection(),
             output_enabled: self.output_enabled(),
+        }
+    }
+
+    /// One combined slow-state read (DS-29, v2.0.3): everything the
+    /// UI's ~1 Hz slow poller fetches, in a single call (see
+    /// [`SlowPollState`]) — the L-4 pattern, extended from `poll()`.
+    ///
+    /// Default: reads the getters back-to-back in this one call —
+    /// no IPC round-trip (and no await / sleep) between them. That
+    /// is enough for simple / immutable implementations (sim, stubs)
+    /// and for the daemon: one IPC round-trip instead of 30 is the
+    /// win, and the daemon's getters are already cheap reads off its
+    /// locks. No override is needed anywhere.
+    fn slow_poll(&self) -> SlowPollState {
+        let mut tunings = std::collections::BTreeMap::new();
+        for module in [
+            "steering", "throttle", "brake", "clutch", "handbrake", "led", "shifter", "horn",
+        ] {
+            tunings.insert(module.to_string(), self.get_tuning(module));
+        }
+        let mut modules = std::collections::BTreeMap::new();
+        for module in ["handbrake", "shifter", "horn", "led"] {
+            modules.insert(module.to_string(), self.module_enabled(module));
+        }
+        SlowPollState {
+            version: self.version(),
+            firmware_version: self.firmware_version(),
+            backend: self.output_backend(),
+            autostart: self.autostart(),
+            board_address: self.board_address(),
+            diag_stats: self.diag_stats().ok(),
+            pairing_status: self.pairing_status(),
+            calibration: self.calibration().ok(),
+            profiles: self.list_profiles(),
+            games: self.list_games(),
+            firmware_check: self.firmware_check().ok(),
+            firmware_update_status: self.firmware_update_status(),
+            vjoy_status: self.vjoy_status().ok(),
+            auto_pause: self.auto_pause(),
+            close_to_tray: self.close_to_tray(),
+            bindings: self.list_bindings(),
+            knobs: self.knob_actions(),
+            draft: self.draft_status(),
+            tunings,
+            modules,
         }
     }
 
@@ -1369,5 +1485,49 @@ mod tests {
         assert!(json.contains("\"outputEnabled\":true"), "{json}");
         let back: PollState = serde_json::from_str(&json).expect("poll round-trips");
         assert_eq!(back, polled);
+    }
+
+    /// DS-29: the default `slow_poll()` composes every slow getter
+    /// into one value (the 30-call slow poller, in a single call):
+    /// fallible sources become `None`, per-module tunings and module
+    /// flags are all present, and the wire shape round-trips.
+    #[test]
+    fn slow_poll_composes_all_slow_getters() {
+        let api = FlippingApi::new();
+        let slow = api.slow_poll();
+        assert_eq!(slow.version, "test");
+        assert_eq!(slow.firmware_version, "Unknown");
+        assert!(!slow.autostart);
+        assert!(slow.close_to_tray);
+        assert!(!slow.auto_pause);
+        assert_eq!(slow.pairing_status.seconds_left, 0);
+        // Fallible sources: the stub errors, so the slots are None
+        // (the UI keeps its old value — same as a failed per-call
+        // fetch before).
+        assert!(slow.diag_stats.is_none());
+        assert!(slow.calibration.is_none());
+        assert!(slow.firmware_check.is_some());
+        assert!(slow.vjoy_status.is_none());
+        assert_eq!(slow.profiles, Vec::new());
+        assert_eq!(slow.games, Vec::new());
+        assert_eq!(slow.bindings, Vec::new());
+        assert!(slow.draft.is_none());
+        // All 8 module tunings + all 4 module flags present.
+        assert_eq!(slow.tunings.len(), 8);
+        for module in [
+            "steering", "throttle", "brake", "clutch", "handbrake", "led", "shifter", "horn",
+        ] {
+            assert!(slow.tunings.contains_key(module), "{module}");
+        }
+        assert_eq!(slow.modules.len(), 4);
+        assert!(slow.modules.values().all(|enabled| *enabled));
+        // Knobs: default all-unset.
+        assert!(slow.knobs.iter().flatten().all(String::is_empty));
+        // And the wire shape round-trips (camelCase).
+        let json = serde_json::to_string(&slow).expect("slow_poll serializes");
+        assert!(json.contains("\"firmwareVersion\":\"Unknown\""), "{json}");
+        assert!(json.contains("\"closeToTray\":true"), "{json}");
+        let back: SlowPollState = serde_json::from_str(&json).expect("slow_poll round-trips");
+        assert_eq!(back, slow);
     }
 }

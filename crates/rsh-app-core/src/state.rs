@@ -740,7 +740,8 @@ pub struct AppStateCore {
     /// Human-readable note on the most recent backend send.
     last_send_note: Mutex<String>,
     /// Latest snapshot (built by `ingest_frame`, sampled by the emitter).
-    latest_snapshot: Mutex<EngineSnapshot>,
+    /// `Arc` (DS-30): readers clone the pointer, not the struct.
+    latest_snapshot: Mutex<Arc<EngineSnapshot>>,
     /// Monotonic snapshot sequence number.
     seq: Mutex<u64>,
     /// Transport connection state, as last reported.
@@ -751,10 +752,23 @@ pub struct AppStateCore {
     /// `transport_state()` can report the kind and address even while
     /// the engine is idle.
     transport_choice: Mutex<(TransportKind, String)>,
+    /// Cached USB board port (DS-27): `detect_board_port()` enumerates
+    /// ports and probes each one (up to 500 ms per port), so it must
+    /// never run on the 20 Hz poll path. The first `transport_state()`
+    /// call fills this cache; later calls reuse it for up to
+    /// `BOARD_PORT_CACHE_TTL`, then re-detect. A disconnect or a
+    /// transport change clears it so the next poll re-detects.
+    cached_serial_port: Mutex<Option<(Option<String>, Instant)>>,
     /// Queued button-press edges, drained by the emitter.
     button_events: Mutex<VecDeque<ButtonPressEvent>>,
     /// Profile + settings store.
     store: Mutex<ProfileStore>,
+    /// Cached app settings (DS-30): `AppSettings` carries several
+    /// `String`s + a `HashMap`, so cloning the struct on every poll
+    /// is measurable on the 20 Hz path. Readers clone this `Arc`
+    /// instead (see `settings_arc`); writers refresh it after every
+    /// write (see `refresh_settings_cache`) — copy-on-write.
+    settings_cache: Mutex<Arc<AppSettings>>,
     /// Game launcher (one game at a time, tracked pid only).
     launcher: Mutex<GameLauncher<SystemSpawner>>,
     /// Validated per-module tunings for this session (see
@@ -1029,6 +1043,9 @@ impl AppStateCore {
         let selected_backend =
             BackendKind::parse(&store.settings().output_backend).unwrap_or(BackendKind::DEFAULT);
         let esp_ip = store.settings().esp_ip.clone();
+        // DS-30: the settings cache starts from the post-migration
+        // store (the migration above may have rewritten the backend).
+        let settings_cache = Arc::new(store.settings().clone());
         // The binding store lives beside the profile store; a
         // corrupt bindings file loads as empty with warnings (never
         // fails the state open — see `rsh_profiles::bindings`).
@@ -1047,12 +1064,14 @@ impl AppStateCore {
             last_buttons: Mutex::new(0),
             last_send_ok: Mutex::new(None),
             last_send_note: Mutex::new("not attempted yet".to_string()),
-            latest_snapshot: Mutex::new(EngineSnapshot::default()),
+            latest_snapshot: Mutex::new(Arc::new(EngineSnapshot::default())),
             seq: Mutex::new(0),
             connection: Mutex::new(ConnectionState::Disconnected),
             transport_choice: Mutex::new((TransportKind::Udp, esp_ip)),
+            cached_serial_port: Mutex::new(None),
             button_events: Mutex::new(VecDeque::new()),
             store: Mutex::new(store),
+            settings_cache: Mutex::new(settings_cache),
             launcher: Mutex::new(GameLauncher::new(SystemSpawner)),
             tunings: Mutex::new(BTreeMap::new()),
             draft: Mutex::new(None),
@@ -1308,6 +1327,18 @@ impl AppStateCore {
     #[must_use]
     pub fn pairing_log_lines(&self) -> Vec<String> {
         lock(&self.pairing_log).iter().cloned().collect()
+    }
+
+    /// Drains the pairing/connection log lines (DS-32): returns all
+    /// lines queued since the last drain and clears the buffer — the
+    /// `take_*` pattern `take_manager_log_lines()` already uses in
+    /// `DaemonApi`. The manager loop drains with this instead of
+    /// re-cloning the whole buffer and slicing by index every
+    /// 250 ms. `pairing_log_lines()` stays for tests and one-shot
+    /// readers.
+    #[must_use]
+    pub fn take_pairing_log_lines(&self) -> Vec<String> {
+        lock(&self.pairing_log).drain(..).collect()
     }
 
     /// Push one redacted, timestamped pairing log line (Phase 0
@@ -2536,8 +2567,47 @@ impl AppStateCore {
     /// shape is always complete; `state` is `disconnected` there. A
     /// failed engine reports `error` with the failure reason verbatim
     /// instead of a silent `disconnected`.
+    /// USB board-port cache TTL (DS-27). A plugged/unplugged board is
+    /// picked up within this bound; the poll path never re-detects
+    /// more often than this.
+    const BOARD_PORT_CACHE_TTL: Duration = Duration::from_secs(5);
+
+    /// Cached USB board port (DS-27): the first call detects (port
+    /// enumeration + up to 500 ms HELO probe per port) and caches the
+    /// result; later calls return the cached value until the TTL
+    /// lapses. Detection runs without holding the cache lock.
+    #[must_use]
+    pub fn cached_board_port(&self) -> Option<String> {
+        if let Some((port, at)) = lock(&self.cached_serial_port).clone()
+            && at.elapsed() < Self::BOARD_PORT_CACHE_TTL
+        {
+            return port;
+        }
+        let port = detect_board_port();
+        *lock(&self.cached_serial_port) = Some((port.clone(), Instant::now()));
+        port
+    }
+
+    /// Clears the cached board port so the next poll re-detects
+    /// (DS-27): call after a disconnect or a transport change.
+    pub fn rescan_board_port(&self) {
+        *lock(&self.cached_serial_port) = None;
+    }
+
+    /// Current transport state (kind + address + connection), for
+    /// the API and the UI. See [`Self::transport_state_with_settings`]
+    /// when the settings are already in hand.
     #[must_use]
     pub fn transport_state(&self) -> TransportState {
+        self.transport_state_with_settings(&self.settings_arc())
+    }
+
+    /// `transport_state()` with the settings already in hand
+    /// (DS-30): the UDP arm needs only `esp_ip`, so a caller that
+    /// already holds the settings `Arc` (e.g. `poll()`) avoids a
+    /// second store lock + struct clone.
+    #[must_use]
+    pub fn transport_state_with_settings(&self, settings: &AppSettings) -> TransportState {
         let status = self.engine_status();
         let live = match status {
             EngineTaskStatus::Running { transport } => transport,
@@ -2545,8 +2615,8 @@ impl AppStateCore {
         };
         let kind = live.unwrap_or_else(|| self.transport_request().0);
         let address = match kind {
-            TransportKind::Udp => self.settings().esp_ip,
-            TransportKind::Serial => detect_board_port().unwrap_or_default(),
+            TransportKind::Udp => settings.esp_ip.clone(),
+            TransportKind::Serial => self.cached_board_port().unwrap_or_default(),
         };
         let mut state = *lock(&self.connection);
         // C-02 defence in depth: "Connected" is only ever reported
@@ -2590,6 +2660,13 @@ impl AppStateCore {
     /// the default all-zero snapshot until the first engine tick).
     #[must_use]
     pub fn snapshot(&self) -> EngineSnapshot {
+        lock(&self.latest_snapshot).as_ref().clone()
+    }
+
+    /// The latest snapshot as a shared pointer (DS-30): clones the
+    /// `Arc`, not the struct — the 20 Hz `poll()` path takes this.
+    #[must_use]
+    pub fn snapshot_arc(&self) -> Arc<EngineSnapshot> {
         lock(&self.latest_snapshot).clone()
     }
 
@@ -2635,7 +2712,7 @@ impl AppStateCore {
         // output is stored: `last_output` — and the backend send,
         // via `ingest_engine_output` — carry the bound actions.
         *lock(&self.last_output) = self.apply_bindings(&input.output);
-        *lock(&self.latest_snapshot) = snapshot.clone();
+        *lock(&self.latest_snapshot) = Arc::new(snapshot.clone());
         snapshot
     }
 
@@ -3009,6 +3086,9 @@ impl AppStateCore {
             store.set_settings(settings);
             store.save().map_err(|error| error.to_string())?;
         }
+        // DS-30: the write above changed the store — refresh the
+        // `Arc` cache so `settings_arc()` readers see it at once.
+        self.refresh_settings_cache();
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
         let factories = real_backend_factories(vjoy_device_id);
         self.apply_backend_switch(requested, &factories)
@@ -3421,7 +3501,7 @@ impl AppStateCore {
     #[must_use]
     pub fn diag_stats(&self) -> rsh_api::DiagStats {
         let stats = self.engine_stats();
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot_arc();
         rsh_api::DiagStats {
             loop_hz: stats.loop_hz,
             loss_pct: stats.loss_pct,
@@ -3430,6 +3510,10 @@ impl AppStateCore {
             e2e_ms: stats.e2e_ms,
             seq_gap: snapshot.seq_gap,
             tx_fail: snapshot.tx_fail,
+            // DS-82: the core does not know the IPC latency — only
+            // the daemon's `DaemonApi::diag_stats` fills these in.
+            ipc_p50_ms: None,
+            ipc_p99_ms: None,
         }
     }
 
@@ -3911,7 +3995,12 @@ impl AppStateCore {
     /// only the requested kind/address are (see `transport_state`,
     /// which merges this with the live session-gate state).
     pub fn set_transport_request(&self, kind: TransportKind, address: String) {
+        let changed = lock(&self.transport_choice).0 != kind;
         *lock(&self.transport_choice) = (kind, address);
+        if changed {
+            // DS-27: a transport change invalidates the cached port.
+            self.rescan_board_port();
+        }
     }
 
     /// What the UI last asked for (kind + typed address).
@@ -3981,6 +4070,8 @@ impl AppStateCore {
         tx.try_send(EngineCommand::Disconnect)
             .map_err(|error| format!("could not queue transport disconnect: {error}"))?;
         self.set_connection(ConnectionState::Disconnected);
+        // DS-27: a disconnect invalidates the cached board port.
+        self.rescan_board_port();
         Ok(())
     }
 
@@ -4948,6 +5039,21 @@ impl AppStateCore {
         lock(&self.store).settings().clone()
     }
 
+    /// Current app settings as a shared pointer (DS-30): clones the
+    /// `Arc`, not the struct — the 20 Hz `poll()` path takes this.
+    #[must_use]
+    pub fn settings_arc(&self) -> Arc<AppSettings> {
+        lock(&self.settings_cache).clone()
+    }
+
+    /// Re-reads the store's settings into the `Arc` cache (DS-30):
+    /// call at the end of every settings write so readers never see
+    /// a stale copy. One struct clone per write, never per read.
+    fn refresh_settings_cache(&self) {
+        let fresh = lock(&self.store).settings().clone();
+        *lock(&self.settings_cache) = Arc::new(fresh);
+    }
+
     /// Replaces the app settings and persists them. When the settings
     /// flip the output flag, the change is actuated through the same
     /// path as the Output toggle (disable → neutral send). The
@@ -4971,6 +5077,9 @@ impl AppStateCore {
             let _ = self.set_output_enabled(apply_output);
         }
         self.sync_auto_switch_from_settings(&sanitized);
+        // DS-30: the write above changed the store — refresh the
+        // `Arc` cache so `settings_arc()` readers see it at once.
+        self.refresh_settings_cache();
         Ok(sanitized)
     }
 
@@ -5000,6 +5109,8 @@ impl AppStateCore {
             let _ = self.set_output_enabled(merged.output_enabled);
         }
         self.sync_auto_switch_from_settings(&merged);
+        // DS-30: refresh the `Arc` cache (see `set_settings`).
+        self.refresh_settings_cache();
         Ok(merged)
     }
 
@@ -10298,6 +10409,81 @@ mod tests {
         let reported = state.transport_state();
         assert_eq!(reported.transport, "usb");
         assert_eq!(reported.state, ConnectionState::Disconnected);
+    }
+
+    /// DS-27: repeated serial `transport_state()` calls must reuse the
+    /// cached board port (no board is attached in the test sandbox, so
+    /// the address stays empty) and `rescan_board_port()` must clear
+    /// the cache without error. The live cost (port enumeration +
+    /// up to 500 ms HELO probe per port) is unmeasurable here — the
+    /// proof is that `transport_state` no longer calls
+    /// `detect_board_port` directly.
+    #[test]
+    fn ds27_serial_transport_state_uses_cached_port() {
+        let (state, _dir) = test_state();
+        state.set_transport_request(TransportKind::Serial, "COM3".to_string());
+        assert_eq!(state.cached_board_port(), None);
+        assert_eq!(state.cached_board_port(), None);
+        let reported = state.transport_state();
+        assert_eq!(reported.transport, "usb");
+        assert_eq!(reported.address, "");
+        state.rescan_board_port();
+        assert_eq!(state.cached_board_port(), None);
+        assert_eq!(state.transport_state().address, "");
+    }
+
+    /// DS-30: the `Arc` settings cache tracks every writer, and the
+    /// `Arc` snapshot agrees with the struct read. The cache starts
+    /// from the store; `set_settings`, `set_settings_patch`, and
+    /// `set_output_backend` (which persists before switching — the
+    /// switch itself fails on Linux without a vJoy driver, but the
+    /// persisted choice must still reach the cache) all refresh it.
+    #[test]
+    fn ds30_settings_arc_tracks_writes_and_snapshot_arc_agrees() {        let (state, _dir) = test_state();
+        assert_eq!(state.settings_arc().esp_ip, state.settings().esp_ip);
+        let mut settings = state.settings();
+        settings.esp_ip = "10.0.0.5".to_string();
+        let saved = state.set_settings(settings).expect("set settings");
+        assert_eq!(saved.esp_ip, "10.0.0.5");
+        assert_eq!(state.settings_arc().esp_ip, "10.0.0.5");
+        let patch = AppSettingsPatch {
+            esp_ip: Some("10.0.0.9".to_string()),
+            ..Default::default()
+        };
+        let merged = state.set_settings_patch(patch).expect("patch");
+        assert_eq!(merged.esp_ip, "10.0.0.9");
+        assert_eq!(state.settings_arc().esp_ip, "10.0.0.9");
+        let _ = state.set_output_backend("vJoy");
+        assert_eq!(state.settings_arc().output_backend, "VJoy");
+        assert_eq!(*state.snapshot_arc(), state.snapshot());
+        // The settings-aware transport state reads the same `esp_ip`
+        // the `Arc` carries — no second store clone.
+        assert_eq!(
+            state
+                .transport_state_with_settings(&state.settings_arc())
+                .address,
+            "10.0.0.9"
+        );
+    }
+
+    /// DS-32: `take_pairing_log_lines()` drains once — the first
+    /// drain returns the queued lines, the second returns nothing,
+    /// and the read-back buffer is empty (the manager loop can no
+    /// longer re-log a line or re-clone the buffer per tick).
+    #[test]
+    fn ds32_take_pairing_log_lines_drains_once() {
+        let (state, _dir) = test_state();
+        assert_eq!(state.take_pairing_log_lines(), Vec::<String>::new());
+        state.open_session_gate();
+        let drained = state.take_pairing_log_lines();
+        assert_eq!(drained.len(), 1);
+        assert!(
+            drained[0].contains("session gate: closed -> open"),
+            "{}",
+            drained[0]
+        );
+        assert_eq!(state.take_pairing_log_lines(), Vec::<String>::new());
+        assert_eq!(state.pairing_log_lines(), Vec::<String>::new());
     }
 
     #[test]
