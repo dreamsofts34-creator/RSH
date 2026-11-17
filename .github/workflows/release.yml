@@ -1,12 +1,18 @@
-# RSH v2.0 — Release (SINGLE-ASSET, daemon + Slint UI)
+# RSH v2.0 — Release (THREE-ASSET, daemon + Slint UI)
 #
-# SINGLE-ASSET RELEASE (user order 2026-11-15 14:00, STANDING RULE for
-# every release — see docs/DECISIONS.md §18): the release contains
-# EXACTLY ONE asset, the NSIS installer `RSH_<version>_x64-setup.exe`.
-# Nothing else is built, staged, or uploaded: no MSI, no firmware
-# bins (merged + signed), no `.sig` files, no `latest.json`, no
-# `SHA256SUMS`, no SBOMs. Auto-update is OFF: no `latest.json` is
-# published, users install by downloading the exe manually.
+# THREE-ASSET RELEASE (user orders 2026-11-16 ~20:20 + 2026-11-17
+# ~07:48 — supersedes the 2026-11-15 exe-only rule, see
+# docs/DECISIONS.md §18): the release contains EXACTLY THREE assets:
+#   1. NSIS installer `RSH_<version>_x64-setup.exe`
+#   2. Merged full-flash firmware `RSH-Firmware-DevKitV1-<version>.bin`
+#      (factory image, flash at 0x0)
+#   3. Signed OTA firmware `RSH-Firmware-DevKitV1-<version>-OTA.bin`
+#      (Ed25519-signed app image — `firmware-signed.bin` — the image
+#      the app's WebOTA flow flashes to the board)
+# Nothing else is staged or uploaded: no MSI, no `.sig` files, no
+# `latest.json`, no `SHA256SUMS`, no SBOMs. Auto-update is OFF: no
+# `latest.json` is published, users install by downloading the exe
+# manually.
 #
 # v2.0 architecture (REDESIGN-PLAN): there is NO Tauri shell anymore.
 # The installer bundles two binaries + the HIDMaestro sidecar, all in
@@ -18,9 +24,15 @@
 #                             beside rsh-daemon.exe: the daemon resolves
 #                             it as <own exe dir>/rsh-hm-sidecar.exe
 #                             (rsh-output-hidmaestro `resolve_sidecar_path`)
-# Firmware v4.0.2 is NOT shipped in this release: the app talks
-# protocol v2.1 to boards already on v4.0.2, and firmware is
-# flashed from the app (WebOTA), never from the installer.
+# Firmware v4.0.2 IS shipped in this release (user orders 2026-11-16
+# ~20:20 + 2026-11-17 ~07:48): BOTH firmware files, built + signed
+# HERE on the runner from the tagged source (step 6 below) — never
+# copied from a developer machine. The merged factory image is for
+# USB/full-flash; the signed OTA image is what the app's WebOTA flow
+# flashes (the board verifies the Ed25519 signature against the
+# pubkey baked into rsh/signing_pubkey.h before applying it).
+# NOTE (honest): the WebOTA flow itself (app → board) has NOT been
+# verified on the user's board yet — that stays a human gate.
 #
 # What it does, in order (every step fail-closed — a missing asset
 # or a version mismatch fails the run, never a silent partial release):
@@ -55,9 +67,17 @@
 #        * does NOT enable autostart: Settings owns that (the daemon
 #          syncs the Run key / .desktop file from
 #          `settings.autostart` on startup).
-#   6. Stage the single NSIS exe, verify exactly one file is staged,
-#      then `gh release create` with that one file (skipped on dry-run).
-#   7. Headless launch smoke test: silently install the staged NSIS
+#   6. Firmware (v4.0.2): build with PlatformIO (`esp32dev` env),
+#      sign the app image with the release Ed25519 key (GitHub secret
+#      RSH_SIGNING_KEY_PEM — the private key never enters the repo),
+#      verify the signature + version marker fail-closed, then stage
+#      BOTH firmware assets into release-staging/ (merged factory
+#      image + signed OTA image). The merged image is the full-flash
+#      file; the OTA image is what the app's WebOTA flow flashes.
+#   7. Stage + verify: exactly THREE files in release-staging/
+#      (exe + merged + OTA), then `gh release create` with all three
+#      (skipped on dry-run).
+#   8. Headless launch smoke test: silently install the staged NSIS
 #      exe, prove the firewall rule exists, run
 #      `rsh-daemon --check --no-tray --no-connect` (exit 0 = IPC
 #      answers), uninstall silently, prove the rule and the install
@@ -67,18 +87,19 @@
 #
 # PREREQUISITES (human gates — NOT checked by this workflow, see
 # docs/RELEASE-CHECKLIST.md):
-#   * Workspace version bumped to 2.0.0 (Cargo.toml
+#   * Workspace version bumped to the tag version (Cargo.toml
 #     `[workspace.package]`): the tag check below FAILS CLOSED until
-#     then — the version is still 1.0.2 at the time this workflow
-#     was written (Phase 9 / integration owns the bump).
+#     then — bump first, then tag.
 #   * App ships UNSIGNED (OV cert deferred, D-R11).
 #   * pid.codes PR for VID 0x1209 / PID 0x5253 merged (Phase G gate).
 #   * vJoy DLL SHA-256 measured on a Windows machine (G-G3) — this
 #     workflow only records whether the runner happens to have vJoy
 #     installed (it will not).
 #
-# Release assets (exact list — ONE asset, see docs/RELEASE-CHECKLIST.md §3):
-#   RSH_2.0.0_x64-setup.exe            (NSIS installer — the ONLY asset)
+# Release assets (exact list — THREE assets, see docs/RELEASE-CHECKLIST.md §3):
+#   RSH_2.0.2_x64-setup.exe            (NSIS installer — app version)
+#   RSH-Firmware-DevKitV1-v4.0.2.bin    (merged full-flash firmware image — firmware version)
+#   RSH-Firmware-DevKitV1-v4.0.2-OTA.bin (Ed25519-signed OTA image — firmware version)
 #
 # REMOVED in the v2.0 rewrite (2026-11-16) — these v1.x steps no longer
 # exist in this file:
@@ -91,7 +112,10 @@
 #     crates; the full debug suite runs in CI, not here — user order:
 #     no repeated full-suite loops)
 #   * Firmware build/sign/verify + SBOM regeneration/verification
-#     (nothing firmware/SBOM is published in a v2.0 release)
+#     (the v2.0 rewrite removed them — nothing firmware/SBOM was
+#     published in a v2.0/v2.0.1 release; firmware build + sign +
+#     verify is RE-ADDED in v2.0.2 for the OTA asset, step 6 above.
+#     SBOMs are still NOT published.)
 #   * The v1.x headless smoke test that launched `RSH.exe` and waited
 #     for "event loop ready" in `%APPDATA%\RSH\logs` (replaced by the
 #     daemon `--check` + firewall-rule smoke test below)
@@ -262,15 +286,93 @@ jobs:
             Write-Host "$b : subsystem 2 (GUI) OK"
           }
 
-      # ---- NSIS installer (the ONLY release asset) ----
+      # ---- Firmware v4.0.2: build + sign (TWO assets) ----
+      # Runs BEFORE the NSIS build: the installer bundles
+      # firmware-signed.bin, so makensis fails closed if the
+      # image is missing or unsigned.
+      # Both firmware files are built HERE on the runner from the
+      # tagged source — never copied from a developer machine — so
+      # the release is reproducible from the tag alone. The merged
+      # factory image and the Ed25519-signed OTA image come out of
+      # one `pio run` (platformio.ini post-scripts: merge_bin.py +
+      # sign_firmware.py). The signing key comes from the GitHub
+      # secret RSH_SIGNING_KEY_PEM (the production Ed25519 key; its
+      # pubkey is baked into the firmware as rsh/signing_pubkey.h).
+      # The private key is written to $RUNNER_TEMP only, used once,
+      # and deleted in this same step. The derived public key (public
+      # by nature) stays in $RUNNER_TEMP for the verify step below.
+      - name: Build + sign firmware v4.0.2 (merged + OTA)
+        shell: pwsh
+        env:
+          RSH_SIGNING_KEY_PEM: ${{ secrets.RSH_SIGNING_KEY_PEM }}
+        run: |
+          if (-not $env:RSH_SIGNING_KEY_PEM) { Write-Error "RSH_SIGNING_KEY_PEM secret is not set — firmware cannot be signed. Refusing an unsigned OTA image."; exit 1 }
+          python -m pip install --quiet "platformio==6.2.0"
+          pio --version
+          $keyFile = Join-Path $env:RUNNER_TEMP "rsh-signing-key.pem"
+          $pubFile = Join-Path $env:RUNNER_TEMP "rsh-signing-pub.pem"
+          [System.IO.File]::WriteAllText($keyFile, $env:RSH_SIGNING_KEY_PEM)
+          try {
+            $openssl = Get-Command openssl -ErrorAction SilentlyContinue
+            if (-not $openssl) { Write-Error "openssl not found on the runner — cannot derive the verify pubkey."; exit 1 }
+            openssl pkey -in $keyFile -pubout -out $pubFile
+            if ($LASTEXITCODE -ne 0) { Write-Error "openssl pkey failed — the RSH_SIGNING_KEY_PEM secret is not a valid PEM key."; exit 1 }
+            $env:RSH_SIGNING_KEY = $keyFile
+            Push-Location firmware
+            try { pio run -e esp32dev } finally { Pop-Location }
+          } finally { Remove-Item $keyFile -Force -ErrorAction SilentlyContinue }
+          Write-Host "Firmware build + sign done. Private key deleted; pubkey kept at $pubFile for verification."
+
+      # ---- Firmware verify (fail closed — before the installer) ----
+      # Proves, before the installer is built (it bundles the OTA image):
+      # the signed OTA image both exist; the OTA image is exactly
+      # firmware.bin + 68 B trailer (64 B signature + "RSHS"); the
+      # version marker matches the firmware version; and the
+      # signature verifies against the production pubkey. Any
+      # failure here fails the run — an unsigned or wrong-version
+      # OTA image must never reach a release (a board would reject
+      # it, or worse, an old image would ship as new).
+      - name: Verify firmware (fail closed)
+        shell: pwsh
+        run: |
+          $buildDir = "firmware/.pio/build/esp32dev"
+          $fw = Join-Path $buildDir "firmware.bin"
+          $signed = Join-Path $buildDir "firmware-signed.bin"
+          $merged = Get-ChildItem (Join-Path $buildDir "RSH-Firmware-DevKitV1-*.bin") -File | Where-Object { $_.Name -notmatch "-OTA\.bin$" }
+          if ($merged.Count -ne 1) { Write-Error "Expected exactly one merged firmware image in $buildDir, found $($merged.Count)."; exit 1 }
+          if (-not (Test-Path $fw)) { Write-Error "firmware.bin not found after pio run."; exit 1 }
+          if (-not (Test-Path $signed)) { Write-Error "Signed OTA image (firmware-signed.bin) not found after pio run — signing must have been skipped. Refusing an unsigned OTA image."; exit 1 }
+          if ($merged[0].Name -notmatch 'v(\d+\.\d+\.\d+)\.bin$') { Write-Error "Merged image name '$($merged[0].Name)' has no firmware version."; exit 1 }
+          $fwVersion = $Matches[1]
+          $fwLen = (Get-Item $fw).Length
+          $signedLen = (Get-Item $signed).Length
+          if ($signedLen -ne ($fwLen + 68)) { Write-Error "Signed OTA image is $signedLen B, expected firmware.bin ($fwLen B) + 68 B trailer."; exit 1 }
+          $bytes = [System.IO.File]::ReadAllBytes($signed)
+          if ([System.Text.Encoding]::ASCII.GetString($bytes[-4..-1]) -ne "RSHS") { Write-Error "Signed OTA image trailer is not RSHS."; exit 1 }
+          $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($ascii -notmatch "Version.*$([regex]::Escape($fwVersion))") { Write-Error "Signed OTA image has no Version $fwVersion marker."; exit 1 }
+          $pubFile = Join-Path $env:RUNNER_TEMP "rsh-signing-pub.pem"
+          python firmware/sign-image.py --verify $pubFile $signed
+          if ($LASTEXITCODE -ne 0) { Write-Error "sign-image.py --verify FAILED — the OTA image does not verify against the production pubkey. Refusing to ship it."; exit 1 }
+          Write-Host "Firmware verify OK: merged $($merged[0].Name) ($((Get-Item $merged[0].FullName).Length) B), OTA image $signedLen B, Version $fwVersion, signature verifies."
+
+      # ---- NSIS installer (exe + bundled firmware image) ----
       # The .nsi script is generated here (no committed installer
       # script — the installer IS this step). It installs the two
-      # binaries + the sidecar beside the daemon, creates the
+      # binaries + the sidecar beside the daemon + the signed OTA
+      # firmware image (WebOTA flow, no download needed), creates the
       # program-scoped inbound firewall rule for rsh-daemon.exe
       # (Private + Public), and removes the rule on uninstall.
-      # Autostart is deliberately NOT enabled by the installer:
-      # Settings owns it (daemon syncs the Run key from
-      # settings.autostart on startup).
+      # SMART installer (v2.0.2): .onInit detects an existing install
+      # (HKLM\Software\RSH "Version", fallback DisplayVersion, then
+      # InstallDir for pre-2.0.2 installs) and offers Update /
+      # Reinstall / Downgrade-warning; silent installs proceed as an
+      # update. An update stops the running daemon/UI first, keeps
+      # %APPDATA%\RSH + the Run key, and restarts the daemon after.
+      # The installer SEEDS the Run key (tray from the first boot);
+      # the daemon OWNS it after that and syncs it from
+      # settings.autostart on startup (deletes it when off, repairs
+      # it when on — see tray_autostart.rs).
       - name: Write NSIS script
         shell: pwsh
         run: |
@@ -278,9 +380,15 @@ jobs:
           @'
           ; RSH v2.0 NSIS installer — generated by .github/workflows/release.yml
           ; (no committed .nsi: the installer is defined by the release workflow).
-          ; Single-asset release: this installer is the ONLY release asset.
+          ; Three-asset release: this installer is one of three
+          ; release assets (exe + merged firmware + OTA firmware).
           !include "LogicLib.nsh"
+          !include "WordFunc.nsh"
           !define VERSION "${VERSION}"
+          ; Smart-installer state: set by .onInit (detection) and read
+          ; by the install section (daemon restart after an update).
+          Var UpdateMode
+          Var InstalledVersion
           Name "RSH"
           ; NOTE: makensis changes its working directory to the
           ; script's directory (installer/), so every path below is
@@ -296,20 +404,84 @@ jobs:
           ; rule below can be created. Nothing at login ever prompts (D-7:
           ; the daemon defers the elevated HIDMaestro sidecar until
           ; "Send to game" is turned on).
+          ; ---- Smart installer: detect an existing install ------------
+          ; Reads HKLM\Software\RSH "Version" (written by this installer
+          ; since v2.0.2) and falls back to the Uninstall key
+          ; DisplayVersion, then to InstallDir for a v2.0.0/v2.0.1
+          ; install (those wrote no version value).
+          ; NOTE on registry view: this is a 32-bit installer, so
+          ; HKLM\Software\... reads/writes land in the WOW6432Node
+          ; view on 64-bit Windows — the SAME view v2.0.0/v2.0.1 used,
+          ; so detection matches existing installs. Do NOT add
+          ; SetRegView 64: it would make v2.0.2 blind to v2.0.1.
+          ; Silent installs (/S, e.g. CI) skip the prompt and proceed
+          ; as an update/reinstall — the daemon restart below still runs.
+          Function .onInit
+            StrCpy $UpdateMode "0"
+            StrCpy $InstalledVersion ""
+            ReadRegStr $InstalledVersion HKLM "Software\RSH" "Version"
+            ${If} $InstalledVersion == ""
+              ReadRegStr $InstalledVersion HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "DisplayVersion"
+            ${EndIf}
+            ${If} $InstalledVersion == ""
+              ReadRegStr $0 HKLM "Software\RSH" "InstallDir"
+              ${If} $0 != ""
+                StrCpy $InstalledVersion "unknown"
+              ${EndIf}
+            ${EndIf}
+            ${If} $InstalledVersion == ""
+              Return
+            ${EndIf}
+            StrCpy $UpdateMode "1"
+            IfSilent done
+            ${If} $InstalledVersion == "unknown"
+              MessageBox MB_YESNO|MB_ICONQUESTION "RSH is already installed on this PC.$\n$\nUpdate it to ${VERSION}? Your settings and profiles are kept." IDYES done
+              Abort
+            ${EndIf}
+            ${VersionCompare} $InstalledVersion "${VERSION}" $0
+            ${If} $0 == 0
+              MessageBox MB_YESNO|MB_ICONQUESTION "RSH ${VERSION} is already installed (latest).$\n$\nReinstall it?" IDYES done
+              Abort
+            ${ElseIf} $0 == 1
+              MessageBox MB_YESNO|MB_ICONEXCLAMATION "A NEWER version of RSH ($InstalledVersion) is already installed.$\n$\nDowngrade to ${VERSION}? (Not recommended.)" IDYES done
+              Abort
+            ${Else}
+              MessageBox MB_YESNO|MB_ICONQUESTION "RSH $InstalledVersion is installed. Update to ${VERSION}?$\n$\nYour settings and profiles are kept." IDYES done
+              Abort
+            ${EndIf}
+            done:
+          FunctionEnd
           Section "RSH"
             SetOutPath "$INSTDIR"
+            ; Stop a running daemon/UI first: locked files cannot be
+            ; overwritten on an update, and the old daemon would keep
+            ; the IPC pipe. Best-effort (taskkill exits non-zero when
+            ; the process is not running; nsExec ignores that).
+            nsExec::Exec 'taskkill /F /IM rsh-daemon.exe'
+            nsExec::Exec 'taskkill /F /IM rsh-ui.exe'
             File "..\target\release\rsh-daemon.exe"
             File "..\target\release\rsh-ui.exe"
             ; Sidecar MUST sit beside rsh-daemon.exe: the daemon resolves it
             ; as <own exe dir>\rsh-hm-sidecar.exe (resolve_sidecar_path).
             File "/oname=rsh-hm-sidecar.exe" "..\src-tauri\binaries\rsh-hm-sidecar-x86_64-pc-windows-msvc.exe"
+            ; Signed OTA image, bundled so the app can flash the board
+            ; with no download and no manual step: the daemon resolves
+            ; it as <own exe dir>\firmware-signed.bin (same pattern as
+            ; the sidecar). Built + signed in the firmware step above,
+            ; so makensis fails closed here if it is missing.
+            File "..\firmware\.pio\build\esp32dev\firmware-signed.bin"
             WriteRegStr HKLM "Software\RSH" "InstallDir" "$INSTDIR"
+            ; Version values the smart installer reads back in .onInit
+            ; (detection + update/reinstall/downgrade decision).
+            WriteRegStr HKLM "Software\RSH" "Version" "${VERSION}"
             WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "DisplayName" "RSH ${VERSION}"
+            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "DisplayVersion" "${VERSION}"
             WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "UninstallString" "$INSTDIR\uninstall.exe"
             ; Autostart the daemon at login (HKCU Run): the daemon owns
             ; the tray + IPC and syncs this key from settings.autostart
-            ; on startup (default true in v2.0.1). The UI spawns the
-            ; daemon on first launch, so the installer never starts it.
+            ; on startup (default true in v2.0.1). An update install
+            ; never touches this key or %APPDATA%\RSH (profiles and
+            ; settings survive an update); only uninstall removes it.
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RSH" "$INSTDIR\rsh-daemon.exe"
             WriteUninstaller "$INSTDIR\uninstall.exe"
             CreateDirectory "$SMPROGRAMS\RSH"
@@ -321,10 +493,19 @@ jobs:
             ; Private + Public. No port scope: a port-scoped rule would
             ; also allow other programs on that port. Hidden via nsExec
             ; (no console flash during install).
+            ; Update-safe: remove any rule from a previous install first,
+            ; otherwise every update would leave a duplicate "RSH" rule.
+            nsExec::Exec 'netsh advfirewall firewall delete rule name="RSH"'
             nsExec::ExecToStack 'netsh advfirewall firewall add rule name="RSH" dir=in action=allow program="$INSTDIR\rsh-daemon.exe" profile=private,public'
             Pop $0
             ${If} $0 != 0
               MessageBox MB_ICONEXCLAMATION "RSH installed, but the Windows Firewall rule could not be created (netsh exit $0). The wheel may not connect over Wi-Fi until you allow RSH through the firewall manually."
+            ${EndIf}
+            ; After an update, restart the daemon (it was stopped
+            ; above so its files could be replaced). Fresh installs do
+            ; not start it — the UI self-spawns it on first launch.
+            ${If} $UpdateMode == "1"
+              Exec '"$INSTDIR\rsh-daemon.exe"'
             ${EndIf}
           SectionEnd
           Section "Uninstall"
@@ -335,6 +516,7 @@ jobs:
             Delete "$INSTDIR\rsh-daemon.exe"
             Delete "$INSTDIR\rsh-ui.exe"
             Delete "$INSTDIR\rsh-hm-sidecar.exe"
+            Delete "$INSTDIR\firmware-signed.bin"
             Delete "$INSTDIR\uninstall.exe"
             Delete "$SMPROGRAMS\RSH\RSH Wheel.lnk"
             Delete "$SMPROGRAMS\RSH\Uninstall RSH.lnk"
@@ -354,25 +536,54 @@ jobs:
           makensis installer\rsh.nsi
           Get-ChildItem release-staging -File | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) B)" }
 
-      # ---- Stage the single asset + verify (fail closed) ----
-      - name: Verify staged asset (fail closed — exactly one file)
+      # ---- Stage firmware assets (after the NSIS build) ----
+      # Copies the verified merged + OTA images into release-staging
+      # under their release names. Runs after the NSIS build so the
+      # staged exe and the firmware assets land together; the
+      # "Verify staged assets" step below expects exactly three files.
+      - name: Stage firmware assets
+        shell: pwsh
+        run: |
+          $buildDir = "firmware/.pio/build/esp32dev"
+          $merged = Get-ChildItem (Join-Path $buildDir "RSH-Firmware-DevKitV1-*.bin") -File | Where-Object { $_.Name -notmatch "-OTA\.bin$" }
+          if ($merged.Count -ne 1) { Write-Error "Expected exactly one merged firmware image in $buildDir, found $($merged.Count)."; exit 1 }
+          $signed = Join-Path $buildDir "firmware-signed.bin"
+          if (-not (Test-Path $signed)) { Write-Error "Signed OTA image (firmware-signed.bin) not found — the firmware build step did not run."; exit 1 }
+          $otaName = $merged[0].BaseName + "-OTA.bin"
+          Copy-Item $merged[0].FullName (Join-Path "release-staging" $merged[0].Name)
+          Copy-Item $signed (Join-Path "release-staging" $otaName)
+          Get-FileHash (Join-Path "release-staging" $merged[0].Name) -Algorithm SHA256 | ForEach-Object { Write-Host "  $($merged[0].Name) SHA-256: $($_.Hash)" }
+          Get-FileHash (Join-Path "release-staging" $otaName) -Algorithm SHA256 | ForEach-Object { Write-Host "  $otaName SHA-256: $($_.Hash)" }
+
+      # ---- Stage + verify (fail closed — exactly three files) ----
+      - name: Verify staged assets (fail closed — exactly three files)
         shell: pwsh
         run: |
           $staging = "release-staging"
+          $version = "${{ steps.tag.outputs.version }}"
           $files = Get-ChildItem $staging -File
-          if ($files.Count -ne 1) { Write-Error "Expected exactly ONE staged asset (the NSIS exe), found $($files.Count). Single-asset release — refusing to publish anything else."; exit 1 }
-          if ($files[0].Name -notmatch '^RSH_.*-setup\.exe$') { Write-Error "Staged file '$($files[0].Name)' is not the NSIS setup exe."; exit 1 }
-          Write-Host "Single asset verified: $($files[0].Name) ($($files[0].Length) B)."
+          if ($files.Count -ne 3) { Write-Error "Expected exactly THREE staged assets (NSIS exe + merged firmware + OTA firmware), found $($files.Count): $(($files | ForEach-Object { $_.Name }) -join ', ')."; exit 1 }
+          $names = $files | ForEach-Object { $_.Name }
+          if ($names -notcontains "RSH_${version}_x64-setup.exe") { Write-Error "Staged NSIS exe 'RSH_${version}_x64-setup.exe' not found (found: $($names -join ', '))."; exit 1 }
+          $merged = @($names | Where-Object { $_ -match '^RSH-Firmware-DevKitV1-v\d+\.\d+\.\d+\.bin$' })
+          $ota = @($names | Where-Object { $_ -match '^RSH-Firmware-DevKitV1-v\d+\.\d+\.\d+-OTA\.bin$' })
+          if ($merged.Count -ne 1) { Write-Error "Expected exactly one merged firmware image in staging (found: $($names -join ', '))."; exit 1 }
+          if ($ota.Count -ne 1) { Write-Error "Expected exactly one OTA firmware image in staging (found: $($names -join ', '))."; exit 1 }
+          Get-ChildItem $staging -File | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) B)" }
+          Write-Host "Three assets verified."
 
       # ---- Headless launch smoke test ----
       # Installs the staged NSIS exe silently, proves the firewall
       # rule exists, proves the daemon starts and its IPC answers
-      # (`--check` exits 0), then uninstalls silently and proves the
-      # rule and the install dir are gone. What it CANNOT prove
+      # (`--check` exits 0), then installs a SECOND time over the
+      # first (update path: user data in %APPDATA%\RSH must survive,
+      # the registry version must be the new one, and the installer
+      # must restart the daemon), then uninstalls silently and proves
+      # the rule and the install dir are gone. What it CANNOT prove
       # (headless runner): the window actually painting — process +
       # IPC + rule is the strongest launch evidence available in CI;
       # real paint is a human gate (docs/RELEASE-CHECKLIST.md).
-      - name: Headless launch smoke test (install + firewall + daemon check + uninstall)
+      - name: Headless launch smoke test (install + update + firewall + daemon check + uninstall)
         shell: pwsh
         run: |
           $installer = (Get-ChildItem release-staging/*-setup.exe).FullName
@@ -380,10 +591,10 @@ jobs:
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
           # NSIS silent install (/S); /D must be last, unquoted.
           Start-Process -FilePath $installer -ArgumentList "/S", "/D=$installDir" -Wait
-          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "rsh-hm-sidecar.exe")) {
+          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "rsh-hm-sidecar.exe", "firmware-signed.bin")) {
             if (-not (Test-Path (Join-Path $installDir $exe))) { Write-Error "Smoke test: installed $exe not found in $installDir after silent install."; exit 1 }
           }
-          Write-Host "Installed to $installDir — all three binaries present."
+          Write-Host "Installed to $installDir — all three binaries + bundled firmware image present."
           $rule = netsh advfirewall firewall show rule name="RSH" | Out-String
           if ($rule -notmatch "RSH") { Write-Error "Smoke test: firewall rule 'RSH' not found after install (netsh show rule)."; exit 1 }
           Write-Host "Firewall rule 'RSH' present after install."
@@ -392,6 +603,35 @@ jobs:
           $proc = Start-Process -FilePath $daemon -ArgumentList "--check", "--no-tray", "--no-connect", "--data-dir", $dataDir -PassThru -Wait
           if ($proc.ExitCode -ne 0) { Write-Error "Smoke test: rsh-daemon --check exited with code $($proc.ExitCode) (expected 0 — IPC must answer)."; exit 1 }
           Write-Host "Smoke test PASS: daemon --check exit 0 (IPC answers)."
+          # --- Update path: install a second time over the first --------
+          # Simulates the user running the new installer on a PC that
+          # already has RSH: user data must survive, the registry
+          # version must be the new one, and the installer must
+          # restart the daemon after the update (smart installer).
+          $version = "${{ steps.tag.outputs.version }}"
+          $realDataDir = Join-Path $env:APPDATA "RSH"
+          New-Item -ItemType Directory -Force -Path $realDataDir | Out-Null
+          Set-Content -Path (Join-Path $realDataDir "smoke-marker.txt") -Value "user data must survive an update" -Encoding ASCII
+          Start-Process -FilePath $installer -ArgumentList "/S", "/D=$installDir" -Wait
+          if (-not (Test-Path (Join-Path $realDataDir "smoke-marker.txt"))) { Write-Error "Smoke test: user data in %APPDATA%\RSH was lost by the update install."; exit 1 }
+          Write-Host "User data in %APPDATA%\RSH survived the update install."
+          $reg32 = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry32)
+          $rshKey = $reg32.OpenSubKey("Software\RSH")
+          $regVersion = if ($rshKey) { $rshKey.GetValue("Version") } else { $null }
+          if ($regVersion -ne $version) { Write-Error "Smoke test: HKLM\Software\RSH Version is '$regVersion', expected '$version' (32-bit registry view)."; exit 1 }
+          $unKey = $reg32.OpenSubKey("Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH")
+          $dispVersion = if ($unKey) { $unKey.GetValue("DisplayVersion") } else { $null }
+          if ($dispVersion -ne $version) { Write-Error "Smoke test: Uninstall key DisplayVersion is '$dispVersion', expected '$version'."; exit 1 }
+          Write-Host "Registry version is $version (RSH key + Uninstall key)."
+          Start-Sleep -Seconds 3
+          $daemonProc = Get-Process rsh-daemon -ErrorAction SilentlyContinue
+          if (-not $daemonProc) { Write-Error "Smoke test: daemon was NOT restarted by the update install (no rsh-daemon process)."; exit 1 }
+          Write-Host "Daemon restarted by the update install (pid $($daemonProc.Id))."
+          taskkill /F /IM rsh-daemon.exe | Out-Null
+          Start-Sleep -Seconds 2
+          $proc2 = Start-Process -FilePath $daemon -ArgumentList "--check", "--no-tray", "--no-connect", "--data-dir", $dataDir -PassThru -Wait
+          if ($proc2.ExitCode -ne 0) { Write-Error "Smoke test: rsh-daemon --check after the update install exited with code $($proc2.ExitCode)."; exit 1 }
+          Write-Host "Smoke test PASS: update path — data kept, version $version, daemon restarted, --check exit 0."
           $uninstaller = Join-Path $installDir "uninstall.exe"
           if (-not (Test-Path $uninstaller)) { Write-Error "Smoke test: uninstaller not found at $uninstaller."; exit 1 }
           Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait
@@ -405,6 +645,7 @@ jobs:
           # the startup logger writes to the default data dir, not
           # this --data-dir) — only remove it when it exists.
           if (Test-Path $dataDir) { Remove-Item $dataDir -Recurse -Force }
+          if (Test-Path (Join-Path $realDataDir "smoke-marker.txt")) { Remove-Item (Join-Path $realDataDir "smoke-marker.txt") -Force }
           # Native commands above (the uninstaller, and `netsh show
           # rule` when no rule matches — the EXPECTED outcome after
           # uninstall) can leave $LASTEXITCODE non-zero even though
@@ -430,12 +671,12 @@ jobs:
         run: |
           $tag = "${{ steps.tag.outputs.tag }}"
           $files = Get-ChildItem release-staging -File | ForEach-Object { $_.FullName }
-          if ($files.Count -ne 1) { Write-Error "Expected exactly one staged file (the NSIS exe) — refusing to create a multi-asset or empty release."; exit 1 }
-          Write-Host "Releasing 1 file:"
+          if ($files.Count -ne 3) { Write-Error "Expected exactly three staged files (NSIS exe + merged firmware + OTA firmware) — refusing to create a partial release."; exit 1 }
+          Write-Host "Releasing 3 files:"
           $files | ForEach-Object { Write-Host "  $_" }
-          gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes "RSH v${{ steps.tag.outputs.version }} — NSIS installer only (single-asset release). v2.0 redesign: Slint UI + always-on daemon (tray popup + menu, autostart, lazy-start — no UAC prompt at login). Auto-update is off for this release: no latest.json is published — download and install manually. Firmware v4.0.2 is not included — no reflash needed (protocol v2.1, boards already on v4.0.2). App ships unsigned (OV cert deferred, D-R11)." $files
+          gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes "RSH v${{ steps.tag.outputs.version }} — NSIS installer + firmware v4.0.2 (merged full-flash image + Ed25519-signed OTA image for the app's WebOTA flow). v2.0 redesign: Slint UI + always-on daemon (tray popup + menu, autostart, lazy-start — no UAC prompt at login). Auto-update is off for this release: no latest.json is published — download and install manually. App ships unsigned (OV cert deferred, D-R11)." $files
 
       - name: Dry run — release NOT created
         if: ${{ github.ref_type != 'tag' && inputs.dry_run != 'false' }}
         shell: pwsh
-        run: Write-Host "Dry run complete — single asset verified in release-staging/, no GitHub Release created."
+        run: Write-Host "Dry run complete — three assets verified in release-staging/, no GitHub Release created."

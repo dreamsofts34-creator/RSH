@@ -1993,6 +1993,52 @@ int main() {
     CHECK(ota_endpoint_allowed(false) == false);  // F1: baghair auth kuch nahi
   }
 
+  // 14b) Firmware rollback decision (Round 2C, safemode.h): config
+  // fallback khatam (current 3 fail + LKG 3 fail) hone par hi rollback
+  // due hota hai — is se pehle config fallback (LKG/factory) kaam karta
+  // hai, firmware rollback sirf aakhri hal hai. Kamyab boot dono
+  // counter zero kar deta hai, is liye us ke baad rollback due nahi.
+  {
+    rsh_boot_counter_t c;
+    rsh_boot_counter_init(&c);
+    CHECK(rsh_boot_firmware_rollback_due(&c) == 0);  // fresh board
+    CHECK(rsh_boot_firmware_rollback_due(NULL) == 0);
+    c.consecutive_failures = 3;
+    CHECK(rsh_boot_firmware_rollback_due(&c) == 0);  // sirf current fail — LKG baaqi
+    c.consecutive_failures = 0;
+    c.lkg_consecutive_failures = 3;
+    CHECK(rsh_boot_firmware_rollback_due(&c) == 0);  // sirf LKG fail
+    c.consecutive_failures = 2;
+    CHECK(rsh_boot_firmware_rollback_due(&c) == 0);  // 2 + 3 — ek kam hai
+    c.consecutive_failures = 3;
+    CHECK(rsh_boot_firmware_rollback_due(&c) == 1);  // 3 + 3 — rollback due
+    c.consecutive_failures = 4;
+    CHECK(rsh_boot_firmware_rollback_due(&c) == 1);  // factory par bhi fail — due rehta hai
+    // Poora safar: 3 current fail, phir 3 LKG fail — record_outcome se.
+    rsh_boot_counter_t d;
+    rsh_boot_counter_init(&d);
+    for (int i = 0; i < 3; i++) {
+      rsh_boot_begin(&d);
+      rsh_boot_record_outcome(&d, 0);
+      CHECK(rsh_boot_firmware_rollback_due(&d) == 0);
+    }
+    d.using_lkg = 1;
+    for (int i = 0; i < 2; i++) {
+      d.counted_this_boot = 0;
+      rsh_boot_record_outcome(&d, 0);
+      CHECK(rsh_boot_firmware_rollback_due(&d) == 0);
+    }
+    d.counted_this_boot = 0;
+    rsh_boot_record_outcome(&d, 0);
+    CHECK(rsh_boot_firmware_rollback_due(&d) == 1);
+    // Rollback ke baad purana firmware kamyab boot kare to counter
+    // zero — dobara rollback due nahi (ping-pong nahi).
+    d.counted_this_boot = 0;
+    rsh_boot_record_outcome(&d, 1);
+    CHECK(rsh_boot_firmware_rollback_due(&d) == 0);
+    CHECK(d.consecutive_failures == 0 && d.lkg_consecutive_failures == 0);
+  }
+
   // 15) Heap + restart policy (FW-10, heap_policy.h, D17).
   {
     HeapPolicy p;

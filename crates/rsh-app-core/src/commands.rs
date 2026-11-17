@@ -57,12 +57,13 @@
 //! [`crate::commands::validate_firmware_image`] verifies the signature and the image
 //! format only. It passes current version `(0, 0, 0)` to the verifier,
 //! so it never rejects a downgrade: the command does not know the
-//! installed board version. The CALLER (Setup wizard) must compare the
-//! returned `version` against the installed version from
-//! `get_firmware_version` and refuse the upload on a downgrade, and
-//! `upload_firmware` (Phase F) must re-validate with the same verifier
-//! before any upload. The frontend's check is a gate, not a trust
-//! decision.
+//! installed board version. The version-aware form is
+//! [`crate::commands::validate_firmware_image_against`]: pass the
+//! installed version from `get_firmware_version` and it rejects a
+//! downgrade (reporting the image version too, so the UI can show
+//! both). The frontend's check is a gate, not a trust decision —
+//! `upload_firmware` (Phase F) and the [`crate::webota::flash_firmware`]
+//! flow re-validate with the same verifier before any upload.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -73,7 +74,9 @@ pub use rsh_profiles::store::BackupInfo;
 use rsh_profiles::store::list_backups_in;
 use rsh_protocol::config::{ConfigBlob, ConfigRecord, record_type};
 use rsh_protocol::pin::validate_blob;
-use rsh_security::firmware_verify::{FirmwareVerifyError, verify_firmware_image};
+use rsh_security::firmware_verify::{
+    FirmwareImageInfo, FirmwareVerifyError, verify_firmware_image,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::{EngineSnapshot, EngineStats, SnapshotInput};
@@ -801,7 +804,52 @@ pub fn validate_firmware_image(path: &Path) -> FirmwareValidation {
             };
         }
     };
-    match verify_firmware_image(&bytes, (0, 0, 0)) {
+    validate_firmware_image_bytes(&bytes, (0, 0, 0))
+}
+
+/// Validate a firmware image file against the production key, with the
+/// anti-downgrade check vs the installed board version `current`
+/// (from `get_firmware_version`, the live session's `GET_CAPS`) — the
+/// version-aware form of [`validate_firmware_image`]. An older image
+/// is rejected; an equal version is a reinstall and is allowed,
+/// matching the board rule in `ota_validate.h`. The Setup wizard and
+/// the [`crate::webota::flash_firmware`] flow call this (via the
+/// verifier) before any upload; the plain command above cannot know
+/// the installed version and never rejects a downgrade.
+#[must_use]
+pub fn validate_firmware_image_against(path: &Path, current: (u8, u8, u8)) -> FirmwareValidation {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return FirmwareValidation {
+                valid: false,
+                version: None,
+                signature_valid: false,
+                errors: vec![format!(
+                    "cannot read firmware image '{}': {error}",
+                    path.display()
+                )],
+            };
+        }
+    };
+    validate_firmware_image_bytes(&bytes, current)
+}
+
+/// Shared body of [`validate_firmware_image`] and
+/// [`validate_firmware_image_against`]: verify `bytes` against
+/// `current` and map the outcome to [`FirmwareValidation`].
+fn validate_firmware_image_bytes(bytes: &[u8], current: (u8, u8, u8)) -> FirmwareValidation {
+    firmware_validation_from_result(verify_firmware_image(bytes, current))
+}
+
+/// Map a verifier outcome to [`FirmwareValidation`]. On a downgrade
+/// the image version is still reported (the signature verified, so
+/// the version is authentic) — the UI can show both versions instead
+/// of just "rejected".
+fn firmware_validation_from_result(
+    result: Result<FirmwareImageInfo, FirmwareVerifyError>,
+) -> FirmwareValidation {
+    match result {
         Ok(info) => FirmwareValidation {
             valid: true,
             version: Some(format!(
@@ -818,9 +866,12 @@ pub fn validate_firmware_image(path: &Path) -> FirmwareValidation {
                 error,
                 FirmwareVerifyError::VersionNotFound | FirmwareVerifyError::Downgrade { .. }
             );
+            let version = if let FirmwareVerifyError::Downgrade { image, .. } = error {
+                Some(format!("{}.{}.{}", image.0, image.1, image.2))
+            } else {
+                None
+            };
             let mut message = error.to_string();
-            // A downgrade cannot happen with current (0,0,0); keep the
-            // message but note the caller owns the real comparison.
             if let FirmwareVerifyError::Downgrade { image, current } = error {
                 let _ = write!(
                     message,
@@ -831,7 +882,7 @@ pub fn validate_firmware_image(path: &Path) -> FirmwareValidation {
             }
             FirmwareValidation {
                 valid: false,
-                version: None,
+                version,
                 signature_valid,
                 errors: vec![message],
             }
@@ -1382,6 +1433,76 @@ mod tests {
         assert!(!result.valid);
         assert!(!result.signature_valid);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn firmware_image_against_rejects_throwaway_key() {
+        // The version-aware form still verifies against the PRODUCTION
+        // key, so a throwaway-signed image fails the signature — the
+        // installed version never even matters here.
+        let (image, _pubkey) = signed_test_image("4.0.2", 70_000);
+        let dir = std::env::temp_dir().join("rsh-app-core-fw-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("against-throwaway.bin");
+        std::fs::write(&path, &image).expect("write test image");
+        let result = validate_firmware_image_against(&path, (4, 0, 1));
+        assert!(!result.valid);
+        assert!(!result.signature_valid);
+        assert!(
+            result.errors.iter().any(|e| e.contains("signature")),
+            "errors: {:?}",
+            result.errors
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn firmware_image_against_missing_file_is_an_error() {
+        let result = validate_firmware_image_against(
+            Path::new("/definitely/not/here/firmware.bin"),
+            (4, 0, 1),
+        );
+        assert!(!result.valid);
+        assert!(!result.signature_valid);
+        assert_eq!(result.version, None);
+    }
+
+    #[test]
+    fn firmware_validation_maps_downgrade_with_version() {
+        // The downgrade mapping is the one outcome no file-based test
+        // can reach (it needs a production-signed older image), so the
+        // mapper is tested directly: version reported, signature valid.
+        let result = firmware_validation_from_result(Err(FirmwareVerifyError::Downgrade {
+            image: (4, 0, 0),
+            current: (4, 0, 1),
+        }));
+        assert!(!result.valid);
+        assert!(result.signature_valid);
+        assert_eq!(result.version.as_deref(), Some("4.0.0"));
+        assert!(
+            result.errors.iter().any(|e| e.contains("downgrade")),
+            "errors: {:?}",
+            result.errors
+        );
+        assert!(
+            result.errors.iter().any(|e| e.contains("4.0.1")),
+            "errors name the installed version: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn firmware_validation_maps_a_valid_image() {
+        let result = firmware_validation_from_result(Ok(FirmwareImageInfo {
+            version: (4, 0, 2),
+            image_size: 70_000,
+            total_size: 70_068,
+            image_sha256: [0u8; 32],
+        }));
+        assert!(result.valid);
+        assert!(result.signature_valid);
+        assert_eq!(result.version.as_deref(), Some("4.0.2"));
+        assert_eq!(result.errors, Vec::<String>::new());
     }
 
     #[test]

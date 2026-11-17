@@ -6147,12 +6147,17 @@ dependencies = [
 name = "rsh-rig"
 version = "2.0.1"
 dependencies = [
+ "ed25519-dalek",
  "rsh-api",
+ "rsh-app-core",
  "rsh-benchmarks",
  "rsh-engine",
+ "rsh-profiles",
  "rsh-protocol",
+ "rsh-security",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
 ]
 

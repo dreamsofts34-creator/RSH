@@ -20,6 +20,7 @@
 #include "fw34_state.h"    // FW-7/8 wiring: net.cpp/keystore.cpp se accessors
 #include <Preferences.h>   // FW-3/FW-4 NVS glue (boot counter + config slots)
 #include <esp_system.h>  // Round 2 W3 (FIX-4): esp_reset_reason() (status packet)
+#include <esp_ota_ops.h> // Round 2C: firmware rollback — doosri OTA slot boot partition
 #include "net.h"
 #include "webota.h"
 #include "status_led.h"
@@ -141,6 +142,33 @@ static void fw34_boot_setup() {
   bootPref.putUInt("total", bootCounter.total_boots);
   bootPref.putUInt("fails", bootCounter.consecutive_failures);
   bootPref.putUInt("lkgFails", bootCounter.lkg_consecutive_failures);
+  // Round 2C — firmware rollback: config fallback khatam (current 3 fail
+  // + LKG 3 fail) hone ke bawajood boot kamyab na ho to is slot ki image
+  // kharab hai (crash/panic loop) — doosri OTA slot par wapas jao.
+  // "fwRb" flag ping-pong rokta hai: rollback sirf ek dafa hota hai jab
+  // tak kamyab boot use saaf na kare (fw34_loop_tick, RSH_BOOT_SUCCESS).
+  // Rollback mumkin na ho (doosri slot nahi / set_boot fail) to normal
+  // boot jari rakho — aaj jaisa behaviour; USB reflash hi recovery hai.
+  if (rsh_boot_firmware_rollback_due(&bootCounter) &&
+      bootPref.getUChar("fwRb", 0) == 0) {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *other =
+        running ? esp_ota_get_next_update_partition(running) : NULL;
+    if (other != NULL && esp_ota_set_boot_partition(other) == ESP_OK) {
+      bootPref.putUChar("fwRb", 1);
+      bootPref.end();
+      rsh_diag_record_global(RSH_DIAG_FW_ROLLBACK, 0, millis());
+#if RSH_DEBUG
+      Serial.println("RSH: firmware rollback — doosri OTA slot par reboot");
+#endif
+      ESP.restart();
+    }
+#if RSH_DEBUG
+    else {
+      Serial.println("RSH: firmware rollback mumkin nahi (doosri slot nahi)");
+    }
+#endif
+  }
   bootPref.end();
 
   Preferences cfgPref;
@@ -218,6 +246,9 @@ static void fw34_loop_tick(uint32_t nowMs) {
     if (bootPref.begin("rsh-boot", false)) {
       bootPref.putUInt("fails", bootCounter.consecutive_failures);
       bootPref.putUInt("lkgFails", bootCounter.lkg_consecutive_failures);
+      // Round 2C: kamyab boot — firmware-rollback flag saaf, taake
+      // mustaqbil mein kharab firmware par rollback dobara mumkin ho.
+      if (bt == RSH_BOOT_SUCCESS) bootPref.putUChar("fwRb", 0);
       bootPref.end();
     }
     if (bt == RSH_BOOT_SUCCESS) {

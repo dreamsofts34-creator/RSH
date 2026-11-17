@@ -35,6 +35,7 @@
 #define RSH_DIAG_HEAP_LOW        7   // value = free heap KB jab naya minimum bana
 #define RSH_DIAG_CFG_ROLLBACK    8   // value = 0 (confirm timeout / boot recover)
 #define RSH_DIAG_OTA_FAIL        9   // value = 0 (WebOTA upload fail/abort)
+#define RSH_DIAG_FW_ROLLBACK     12  // value = 0 (Round 2C: 6 lagatar boot fail -> doosri OTA slot)
 #define RSH_DIAG_RESCAN          10  // value = naya channel (F-07)
 #define RSH_DIAG_KEY_RESET_ARMED 11  // value = 0 (BOOT 10 s hold)
 

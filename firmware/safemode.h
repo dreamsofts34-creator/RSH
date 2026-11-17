@@ -16,8 +16,12 @@
 //                                board normal mode mein reboot hota hai)
 //   * Boot fail = power-on ke 15 s mein AP up na ho (FW-3).
 //     3 lagatar fail -> last-known-good config; LKG bhi 3 dafa fail ho
-//     to factory fallback. Kamyab boot (AP waqt par up) dono counter
-//     zero karta hai.
+//     to factory fallback. Factory source par bhi fail ho to masla
+//     firmware mein hai — firmware rollback (Round 2C):
+//     `rsh_boot_firmware_rollback_due` sach hota hai aur caller doosri
+//     OTA slot par wapas jata hai (ping-pong rokne ke liye NVS "fwRb"
+//     flag, kamyab boot par saaf). Kamyab boot (AP waqt par up) dono
+//     counter zero karta hai.
 //   * Safe mode mein config apply nahi hoti — config_transaction.h ka
 //     safe-mode flag stage + commit dono ko BUSY (7) se rokta hai.
 //
@@ -90,6 +94,27 @@ static inline void rsh_boot_record_outcome(rsh_boot_counter_t *c, uint8_t ap_up_
   } else {
     c->consecutive_failures++;
   }
+}
+
+// ---------- Firmware rollback (Round 2C, WebOTA) ----------
+// Config fallback khatam (current 3 fail + LKG 3 fail -> factory source)
+// hone ke bawajood boot kamyab na ho to masla config mein nahi, FIRMWARE
+// mein hai: is slot ki image AP up nahi kar sakti (crash / panic loop).
+// Caller (rsh.ino) is par doosri OTA slot ko boot partition bana kar
+// restart karta hai — purana firmware wapas. Ye sirf faisla hai (pure);
+// NVS/ESP glue caller ka kaam hai, aur ping-pong rokne ke liye caller
+// ek "rollback ho chuka" flag (NVS "rsh-boot" / "fwRb") rakhta hai jo
+// kamyab boot par saaf hota hai.
+// NOTE: bootloader-level rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE)
+// plain Arduino env mein nahi chal sakta (precompiled bootloader,
+// sdkconfig flags laagu nahi hote — platformio.ini), is liye ye
+// app-level mechanism hi dono envs mein crash-loop rollback deta hai.
+static inline uint8_t rsh_boot_firmware_rollback_due(const rsh_boot_counter_t *c) {
+  if (!c) return 0;
+  return (c->consecutive_failures >= RSH_BOOT_MAX_CONSEC_FAILURES &&
+          c->lkg_consecutive_failures >= RSH_BOOT_MAX_CONSEC_FAILURES)
+             ? 1
+             : 0;
 }
 
 // ---------- Boot tick: AP-up deadline (har loop mein call karo) ----------

@@ -21,6 +21,14 @@
 //! must come from the keystore. This module only moves bytes to a
 //! board that has already been authenticated to.
 //!
+//! The full flow lives here too ([`flash_firmware`]): validate the
+//! image against the installed version, upload it with progress, then
+//! confirm the board reports the new version (the confirm step is a
+//! caller-supplied closure — the daemon reconnects and reads the
+//! signed `GET_CAPS` version, or passes [`wait_for_board_version`],
+//! which polls the board's index-page version chip). HTTP 200 + `"OK"`
+//! alone is never a version confirm (SIGNED-OTA §3).
+//!
 //! The board is expected on its own AP, so the PC must be joined to
 //! the board's Wi-Fi network for the upload to reach it; a TCP
 //! connect failure says so plainly instead of pretending otherwise.
@@ -28,7 +36,15 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream};
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use rsh_security::firmware_verify::{
+    FIRMWARE_SIGNING_PUBKEY, FirmwareVersion, verify_firmware_image_with_pubkey,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::secrets::ZeroizingString;
 
 /// The `WebOTA` server port on the board (plain HTTP on its AP).
 const WEB_OTA_PORT: u16 = 80;
@@ -306,16 +322,15 @@ fn basic_auth_header(password: &str) -> String {
     )
 }
 
-/// Fetch the per-boot CSRF token from the board's index page
-/// (`GET /` with Basic Auth, token in
-/// `<meta name="csrf-token" content="<32 hex chars>">`).
+/// Fetch the board's index page (`GET /` with Basic Auth) and return
+/// its body text. Shared by the CSRF-token fetch and the version-chip
+/// read — one request shape, one set of error messages.
 ///
 /// # Errors
 ///
 /// Returns a message when the server cannot be reached, rejects the
-/// password (HTTP 401), answers with another non-200 status, or sends
-/// a page without a token.
-fn fetch_csrf_token(host: IpAddr, port: u16, password: &str) -> Result<String, String> {
+/// password (HTTP 401), or answers with another non-200 status.
+fn get_index_page(host: IpAddr, port: u16, password: &str) -> Result<String, String> {
     let stream = connect(host, port, GET_READ_TIMEOUT)?;
     let mut reader = HttpReader::new(stream);
     let request = format!(
@@ -339,8 +354,100 @@ fn fetch_csrf_token(host: IpAddr, port: u16, password: &str) -> Result<String, S
             response.status
         ));
     }
-    let page = String::from_utf8_lossy(&response.body);
+    Ok(String::from_utf8_lossy(&response.body).into_owned())
+}
+
+/// Fetch the per-boot CSRF token from the board's index page
+/// (`GET /` with Basic Auth, token in
+/// `<meta name="csrf-token" content="<32 hex chars>">`).
+///
+/// # Errors
+///
+/// Returns a message when the server cannot be reached, rejects the
+/// password (HTTP 401), answers with another non-200 status, or sends
+/// a page without a token.
+fn fetch_csrf_token(host: IpAddr, port: u16, password: &str) -> Result<String, String> {
+    let page = get_index_page(host, port, password)?;
     extract_csrf_token(&page)
+}
+
+/// Read the running firmware version from the board's index page
+/// (the `Version <b>a.b.c</b>` chip the page renders). This is the
+/// unauthenticated-session version read: the page is served after the
+/// same Basic Auth as the upload, and the value is only trusted as a
+/// *confirm* after an upload whose image was signature-verified —
+/// never as the sole proof of what is running (the signed `GET_CAPS`
+/// version is the strong confirm; the daemon passes that as the
+/// `confirm_version` closure to [`flash_firmware`] when it has a
+/// session).
+///
+/// # Errors
+///
+/// Returns a message when the server cannot be reached, rejects the
+/// password, answers non-200, or sends a page without a version chip.
+pub fn fetch_board_version(host: IpAddr, port: u16, password: &str) -> Result<String, String> {
+    let page = get_index_page(host, port, password)?;
+    parse_board_version_chip(&page)
+}
+
+/// Parse the `Version <b>a.b.c</b>` chip out of an index page: find
+/// the marker, take the digit/dot run after it, and parse it strictly
+/// as `a.b.c` (each part 1–3 digits, value ≤ 255 — the board rule in
+/// `ota_validate.h`).
+fn parse_board_version_chip(page: &str) -> Result<String, String> {
+    let marker = "Version <b>";
+    let at = page.find(marker).ok_or_else(|| {
+        "update server did not return a firmware version — the board may not be running firmware v4.0.1 or newer"
+            .to_string()
+    })?;
+    let rest = &page[at + marker.len()..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(rest.len());
+    let run = &rest[..end];
+    parse_version_triple(run)
+        .map(|(major, minor, patch)| format!("{major}.{minor}.{patch}"))
+        .ok_or_else(|| format!("update server returned an unreadable firmware version: {run}"))
+}
+
+/// Strict `a.b.c` parse (each part 1–3 digits, value ≤ 255, whole run
+/// consumed), mirroring `rsh_parse_version` (`ota_validate.h`).
+fn parse_version_triple(run: &str) -> Option<FirmwareVersion> {
+    let bytes = run.as_bytes();
+    if bytes.is_empty() || bytes.len() > 11 {
+        return None;
+    }
+    let mut parts = [0u16; 3];
+    let mut part = 0usize;
+    let mut digits = 0usize;
+    for &byte in bytes {
+        if byte.is_ascii_digit() {
+            digits += 1;
+            if digits > 3 {
+                return None;
+            }
+            parts[part] = parts[part] * 10 + u16::from(byte - b'0');
+            if parts[part] > 255 {
+                return None;
+            }
+        } else if byte == b'.' {
+            if digits == 0 || part >= 2 {
+                return None;
+            }
+            part += 1;
+            digits = 0;
+        } else {
+            return None;
+        }
+    }
+    if part != 2 || digits == 0 {
+        return None;
+    }
+    Some((
+        u8::try_from(parts[0]).ok()?,
+        u8::try_from(parts[1]).ok()?,
+        u8::try_from(parts[2]).ok()?,
+    ))
 }
 
 /// Extract the CSRF token from an index page: find `csrf-token`,
@@ -408,6 +515,27 @@ pub fn upload_firmware_image_on_port(
     password: &str,
     image: &[u8],
 ) -> Result<(), String> {
+    upload_firmware_image_on_port_with_progress(host, port, password, image, &mut |_| {})
+}
+
+/// Upload a firmware image to the board's `WebOTA` endpoint on an
+/// explicit port, reporting upload progress: `progress` is called
+/// after every 32 KB chunk with the percent of the image sent so far
+/// (0..100, 100 once the whole image is on the wire — the board still
+/// verifies the signature and writes flash before answering, so 100%
+/// sent is not yet success). See [`upload_firmware_image_on_port`]
+/// for the contract; production callers use [`upload_firmware_image`].
+///
+/// # Errors
+///
+/// Same as [`upload_firmware_image_on_port`].
+pub fn upload_firmware_image_on_port_with_progress(
+    host: IpAddr,
+    port: u16,
+    password: &str,
+    image: &[u8],
+    progress: &mut dyn FnMut(u8),
+) -> Result<(), String> {
     let token = fetch_csrf_token(host, port, password)?;
     let preamble = format!(
         "--{MULTIPART_BOUNDARY}\r\nContent-Disposition: form-data; name=\"firmware\"; \
@@ -431,16 +559,27 @@ pub fn upload_firmware_image_on_port(
         .stream
         .write_all(preamble.as_bytes())
         .map_err(|error| format!("failed sending the upload request: {error}"))?;
+    let mut sent = 0usize;
     for chunk in image.chunks(UPLOAD_CHUNK_SIZE) {
         reader
             .stream
             .write_all(chunk)
             .map_err(|error| format!("failed sending the firmware image: {error}"))?;
+        sent += chunk.len();
+        let percent = if image.is_empty() {
+            100
+        } else {
+            u8::try_from(sent.saturating_mul(100) / image.len()).unwrap_or(100)
+        };
+        progress(percent);
     }
     reader
         .stream
         .write_all(closing.as_bytes())
         .map_err(|error| format!("failed sending the upload request: {error}"))?;
+    if image.is_empty() {
+        progress(100);
+    }
     let response = read_response(&mut reader)?;
     let body = String::from_utf8_lossy(&response.body);
     if response.status != 200 {
@@ -457,9 +596,256 @@ pub fn upload_firmware_image_on_port(
     }
 }
 
+/// Where to flash: the board's `WebOTA` server address plus the
+/// per-device Wi-Fi password from the keystore. The password is a
+/// [`ZeroizingString`] (Security L-2) — it is zeroed on drop and never
+/// appears in a `Debug` print.
+#[derive(Clone, Debug)]
+pub struct WebOtaTarget {
+    /// Board AP address (`192.168.4.1` in production; the IP the live
+    /// session authenticated against).
+    pub host: IpAddr,
+    /// `WebOTA` server port (80 in production; an ephemeral port only
+    /// for tests against a fake board).
+    pub port: u16,
+    /// Per-device Wi-Fi password (keystore; never a default).
+    pub password: ZeroizingString,
+}
+
+impl WebOtaTarget {
+    /// Production target: the board's `WebOTA` server on its usual port.
+    #[must_use]
+    pub fn new(host: IpAddr, password: impl Into<String>) -> Self {
+        Self {
+            host,
+            port: WEB_OTA_PORT,
+            password: ZeroizingString::new(password),
+        }
+    }
+
+    /// Target on an explicit port (tests against a fake board only).
+    #[must_use]
+    pub fn on_port(host: IpAddr, port: u16, password: impl Into<String>) -> Self {
+        Self {
+            host,
+            port,
+            password: ZeroizingString::new(password),
+        }
+    }
+}
+
+/// One stage of a firmware flash, reported through the
+/// [`flash_firmware`] progress callback.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum FlashStage {
+    /// The image file is being read and signature-verified.
+    Validating,
+    /// Image bytes are going to the board (`percent` is set).
+    Uploading,
+    /// The board accepted the image and is restarting.
+    WaitingForRestart,
+    /// The new version is being confirmed on the rebooted board.
+    Confirming,
+}
+
+/// One progress report from [`flash_firmware`]: the stage, plus the
+/// upload percent (0..100) while [`FlashStage::Uploading`], `None` on
+/// every other stage.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FlashProgress {
+    /// The stage the flash is in.
+    pub stage: FlashStage,
+    /// Upload percent while uploading, `None` otherwise.
+    pub percent: Option<u8>,
+}
+
+/// The outcome of [`flash_firmware`]: success with the confirmed new
+/// version, or failure with the reason — never a silent or ambiguous
+/// result. The caller shows `error` verbatim to the user.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FlashResult {
+    /// True only when the board confirmed the new version after the
+    /// restart. False on every other outcome, including an upload the
+    /// board accepted but whose version could not be confirmed.
+    pub success: bool,
+    /// The confirmed new firmware version (`"4.0.2"`), when success.
+    pub version: Option<String>,
+    /// The failure reason, when not success (empty on success).
+    pub error: Option<String>,
+}
+
+impl FlashResult {
+    fn ok(version: String) -> Self {
+        Self {
+            success: true,
+            version: Some(version),
+            error: None,
+        }
+    }
+
+    fn fail(reason: String) -> Self {
+        Self {
+            success: false,
+            version: None,
+            error: Some(reason),
+        }
+    }
+}
+
+/// Poll the board's index-page version chip until it reports
+/// `expected`, or the timeout runs out. This is the ready-made
+/// `confirm_version` closure for [`flash_firmware`] when the caller
+/// has no live session to read the signed `GET_CAPS` version from:
+/// connection failures while the board reboots are expected and
+/// ignored until the deadline; a different version keeps polling
+/// (the board may still be coming up on the old image).
+///
+/// # Errors
+///
+/// Returns a message when the board never reports `expected` in time
+/// (naming the last version seen, when any was seen).
+pub fn wait_for_board_version(
+    target: &WebOtaTarget,
+    expected: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    let mut last_seen: Option<String> = None;
+    loop {
+        match fetch_board_version(target.host, target.port, target.password.as_str()) {
+            Ok(reported) if reported == expected => return Ok(reported),
+            Ok(reported) => last_seen = Some(reported),
+            Err(_) => { /* board rebooting — retry until the deadline */ }
+        }
+        if Instant::now() >= deadline {
+            return Err(match last_seen {
+                Some(seen) => format!(
+                    "board did not report firmware version {expected} within {} s (last seen: {seen})",
+                    timeout.as_secs()
+                ),
+                None => format!(
+                    "board did not answer within {} s after the upload — version {expected} not confirmed",
+                    timeout.as_secs()
+                ),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Flash a signed firmware image to the board end to end, against the
+/// production release key:
+///
+/// 1. **Validate** — the image is read and verified (Ed25519 signature + format + anti-downgrade vs `installed_version`; an older image is rejected, an equal version is a reinstall and is allowed, matching the board rule in `ota_validate.h`). Nothing is sent before this passes.
+/// 2. **Upload** — the image goes to the board's `WebOTA` endpoint with progress (stage [`FlashStage::Uploading`], percent 0..100).
+/// 3. **Confirm** — after the board accepts and restarts, `confirm_version` runs: it must wait for the rebooted board and return its live firmware version (the daemon passes a closure that reconnects and reads the signed `GET_CAPS` version, or [`wait_for_board_version`]). Success needs the reported version to equal the image version — HTTP 200 + `"OK"` alone is not a confirm. A failed upload leaves the old firmware running (the
+///    board only applies a fully verified image to the other OTA slot).
+///
+/// `image_path` is a parameter on purpose: the daemon passes
+/// `<exe dir>/firmware-signed.bin` (the installer bundles it beside
+/// the daemon, the sidecar pattern). `installed_version` comes from
+/// `get_firmware_version` (the live session's `GET_CAPS`) before the
+/// flash.
+///
+/// The result is a [`FlashResult`], never a panic and never a bare
+/// `Ok(())` on an unconfirmed flash.
+#[must_use]
+pub fn flash_firmware(
+    image_path: &Path,
+    target: &WebOtaTarget,
+    installed_version: FirmwareVersion,
+    progress: &mut dyn FnMut(FlashProgress),
+    confirm_version: &mut dyn FnMut() -> Result<String, String>,
+) -> FlashResult {
+    flash_firmware_with_pubkey(
+        image_path,
+        target,
+        installed_version,
+        &FIRMWARE_SIGNING_PUBKEY,
+        progress,
+        confirm_version,
+    )
+}
+
+/// Same as [`flash_firmware`], but the caller supplies the Ed25519
+/// public key. Production code always uses [`flash_firmware`] (the
+/// embedded release key); this entry point exists so tests can flash
+/// images built with a throwaway keypair without ever touching the
+/// production signing key, and so a future key-migration path can
+/// verify against a second key — the same pattern as
+/// `rsh_security::verify_firmware_image_with_pubkey`.
+#[must_use]
+pub fn flash_firmware_with_pubkey(
+    image_path: &Path,
+    target: &WebOtaTarget,
+    installed_version: FirmwareVersion,
+    pubkey: &[u8; 32],
+    progress: &mut dyn FnMut(FlashProgress),
+    confirm_version: &mut dyn FnMut() -> Result<String, String>,
+) -> FlashResult {
+    progress(FlashProgress {
+        stage: FlashStage::Validating,
+        percent: None,
+    });
+    let bytes = match std::fs::read(image_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return FlashResult::fail(format!(
+                "could not read the firmware image at {}: {error}",
+                image_path.display()
+            ));
+        }
+    };
+    let info = match verify_firmware_image_with_pubkey(&bytes, installed_version, pubkey) {
+        Ok(info) => info,
+        Err(error) => {
+            return FlashResult::fail(format!("firmware image failed verification: {error}"));
+        }
+    };
+    let expected = format!("{}.{}.{}", info.version.0, info.version.1, info.version.2);
+    let mut upload_progress = |percent: u8| {
+        progress(FlashProgress {
+            stage: FlashStage::Uploading,
+            percent: Some(percent),
+        });
+    };
+    if let Err(error) = upload_firmware_image_on_port_with_progress(
+        target.host,
+        target.port,
+        target.password.as_str(),
+        &bytes,
+        &mut upload_progress,
+    ) {
+        return FlashResult::fail(format!(
+            "firmware upload failed (old firmware still running): {error}"
+        ));
+    }
+    progress(FlashProgress {
+        stage: FlashStage::WaitingForRestart,
+        percent: None,
+    });
+    progress(FlashProgress {
+        stage: FlashStage::Confirming,
+        percent: None,
+    });
+    match confirm_version() {
+        Ok(reported) if reported == expected => FlashResult::ok(expected),
+        Ok(reported) => FlashResult::fail(format!(
+            "board reports firmware version {reported}, expected {expected} — the update may not have applied"
+        )),
+        Err(error) => FlashResult::fail(format!(
+            "could not confirm the new firmware version ({expected}): {error}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsh_security::firmware_verify::{FIRMWARE_ESP_IMAGE_MAGIC, FIRMWARE_IMAGE_MIN_LEN};
     use std::net::TcpListener;
     use std::sync::mpsc;
 
@@ -678,5 +1064,333 @@ mod tests {
         let error = result.expect_err("upload must fail with no server");
         assert!(error.contains("could not reach"), "{error}");
         assert!(error.contains("Wi-Fi network"), "{error}");
+    }
+
+    // ---- flash_firmware flow (Round 2C) ----
+
+    /// Fixed, non-secret seed for the throwaway test keypair (same
+    /// pattern as `rsh_security::firmware_verify` tests). This key
+    /// signs test images only; it is NOT the production signing key.
+    const FLASH_TEST_SEED: [u8; 32] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0,
+        0xf0, 0x0f,
+    ];
+
+    fn flash_test_pubkey() -> [u8; 32] {
+        use ed25519_dalek::SigningKey;
+        SigningKey::from_bytes(&FLASH_TEST_SEED)
+            .verifying_key()
+            .to_bytes()
+    }
+
+    /// Build a signed test image: `body_len` bytes starting with
+    /// `0xE9`, the version marker at offset 1024, signed over
+    /// `SHA-256(body)` with the throwaway test key.
+    fn build_flash_test_image(version: &str, body_len: usize) -> Vec<u8> {
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::{Digest, Sha256};
+        let mut body = vec![0u8; body_len];
+        body[0] = FIRMWARE_ESP_IMAGE_MAGIC;
+        let marker = format!("Version <b>{version}");
+        body[1024..1024 + marker.len()].copy_from_slice(marker.as_bytes());
+        let digest: [u8; 32] = Sha256::digest(&body).into();
+        let signature = SigningKey::from_bytes(&FLASH_TEST_SEED).sign(&digest);
+        let mut image = body;
+        image.extend_from_slice(&signature.to_bytes());
+        image.extend_from_slice(b"RSHS");
+        image
+    }
+
+    /// Write `image` to a per-test temp file and return its path.
+    fn write_temp_image(name: &str, image: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rsh-webota-test-{name}-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&path, image).expect("write temp image");
+        path
+    }
+
+    /// The index page with a version chip, as the board serves it.
+    fn index_page_with_version(version: &str) -> String {
+        format!(
+            "<html><head><meta name=\"csrf-token\" content=\"0123456789abcdef0123456789abcdef\"></head>\
+             <body><span class=\"chip\">Version <b>{version}</b></span></body></html>"
+        )
+    }
+
+    fn run_flash(
+        path: &std::path::Path,
+        port: u16,
+        installed: FirmwareVersion,
+        confirm: &mut dyn FnMut() -> Result<String, String>,
+    ) -> (FlashResult, Vec<FlashProgress>) {
+        let target = WebOtaTarget::on_port(IpAddr::from([127, 0, 0, 1]), port, "secret");
+        let mut seen = Vec::new();
+        let result = flash_firmware_with_pubkey(
+            path,
+            &target,
+            installed,
+            &flash_test_pubkey(),
+            &mut |progress| seen.push(progress),
+            confirm,
+        );
+        (result, seen)
+    }
+
+    #[test]
+    fn flash_succeeds_with_progress_and_version_confirm() {
+        let (captured_tx, _captured_rx) = mpsc::channel();
+        let port = spawn_fake_server(
+            vec![
+                response_200_chunked(&index_page()),
+                response_200("OK - update ho gaya, board restart ho raha hai"),
+            ],
+            captured_tx,
+        );
+        let image = build_flash_test_image("4.0.2", FIRMWARE_IMAGE_MIN_LEN);
+        let path = write_temp_image("ok", &image);
+        let (result, seen) = run_flash(&path, port, (4, 0, 1), &mut || Ok("4.0.2".to_string()));
+        let _ = std::fs::remove_file(&path);
+        assert!(result.success, "result: {result:?}");
+        assert_eq!(result.version.as_deref(), Some("4.0.2"));
+        assert_eq!(result.error, None);
+        // Stages in order: Validating, Uploading (percents rising to
+        // 100), WaitingForRestart, Confirming.
+        assert_eq!(seen.first().map(|p| p.stage), Some(FlashStage::Validating));
+        let uploading: Vec<u8> = seen
+            .iter()
+            .filter(|p| p.stage == FlashStage::Uploading)
+            .filter_map(|p| p.percent)
+            .collect();
+        assert_eq!(
+            uploading.last(),
+            Some(&100),
+            "uploading percents: {uploading:?}"
+        );
+        assert!(
+            uploading.windows(2).all(|w| w[0] <= w[1]),
+            "percents never go backwards: {uploading:?}"
+        );
+        let stages: Vec<FlashStage> = seen.iter().map(|p| p.stage).collect();
+        let waiting = stages
+            .iter()
+            .position(|s| *s == FlashStage::WaitingForRestart)
+            .expect("WaitingForRestart reported");
+        let confirming = stages
+            .iter()
+            .position(|s| *s == FlashStage::Confirming)
+            .expect("Confirming reported");
+        assert!(waiting < confirming, "stages: {stages:?}");
+    }
+
+    #[test]
+    fn flash_allows_reinstall_of_the_same_version() {
+        let (captured_tx, _captured_rx) = mpsc::channel();
+        let port = spawn_fake_server(
+            vec![
+                response_200_chunked(&index_page()),
+                response_200("OK - update ho gaya"),
+            ],
+            captured_tx,
+        );
+        let image = build_flash_test_image("4.0.1", FIRMWARE_IMAGE_MIN_LEN);
+        let path = write_temp_image("reinstall", &image);
+        let (result, _) = run_flash(&path, port, (4, 0, 1), &mut || Ok("4.0.1".to_string()));
+        let _ = std::fs::remove_file(&path);
+        assert!(result.success, "reinstall must succeed: {result:?}");
+        assert_eq!(result.version.as_deref(), Some("4.0.1"));
+    }
+
+    #[test]
+    fn flash_rejects_a_bad_signature_before_any_network() {
+        let (captured_tx, captured_rx) = mpsc::channel();
+        // No canned responses: any request would hang the fake server
+        // thread, so a request here fails the test by timeout instead —
+        // the flow must never reach the network with a bad image.
+        let port = spawn_fake_server(vec![], captured_tx);
+        let mut image = build_flash_test_image("4.0.2", FIRMWARE_IMAGE_MIN_LEN);
+        image[2000] ^= 0x01; // tampered body byte -> bad signature
+        let path = write_temp_image("badsig", &image);
+        let (result, seen) = run_flash(&path, port, (4, 0, 1), &mut || Ok("4.0.2".to_string()));
+        let _ = std::fs::remove_file(&path);
+        assert!(!result.success, "result: {result:?}");
+        let error = result.error.expect("failure names the reason");
+        assert!(error.contains("signature"), "{error}");
+        assert!(
+            captured_rx.try_recv().is_err(),
+            "no request may reach the board with a bad image"
+        );
+        assert_eq!(seen.len(), 1, "only Validating is reported: {seen:?}");
+        assert_eq!(seen[0].stage, FlashStage::Validating);
+    }
+
+    #[test]
+    fn flash_rejects_a_downgrade() {
+        let (captured_tx, _captured_rx) = mpsc::channel();
+        let port = spawn_fake_server(vec![], captured_tx);
+        let image = build_flash_test_image("4.0.0", FIRMWARE_IMAGE_MIN_LEN);
+        let path = write_temp_image("downgrade", &image);
+        let (result, _) = run_flash(&path, port, (4, 0, 1), &mut || Ok("4.0.0".to_string()));
+        let _ = std::fs::remove_file(&path);
+        assert!(!result.success, "result: {result:?}");
+        let error = result.error.expect("failure names the reason");
+        assert!(error.contains("downgrade"), "{error}");
+    }
+
+    #[test]
+    fn flash_reports_a_board_rejection() {
+        let (captured_tx, _captured_rx) = mpsc::channel();
+        let port = spawn_fake_server(
+            vec![
+                response_200_chunked(&index_page()),
+                response_200("FAIL - signature verify fail"),
+            ],
+            captured_tx,
+        );
+        let image = build_flash_test_image("4.0.2", FIRMWARE_IMAGE_MIN_LEN);
+        let path = write_temp_image("boardfail", &image);
+        let (result, _) = run_flash(&path, port, (4, 0, 1), &mut || Ok("4.0.2".to_string()));
+        let _ = std::fs::remove_file(&path);
+        assert!(!result.success, "result: {result:?}");
+        let error = result.error.expect("failure names the reason");
+        assert!(error.contains("old firmware still running"), "{error}");
+        assert!(error.contains("signature verify fail"), "{error}");
+    }
+
+    #[test]
+    fn flash_fails_when_confirm_reports_the_old_version() {
+        let (captured_tx, _captured_rx) = mpsc::channel();
+        let port = spawn_fake_server(
+            vec![
+                response_200_chunked(&index_page()),
+                response_200("OK - update ho gaya"),
+            ],
+            captured_tx,
+        );
+        let image = build_flash_test_image("4.0.2", FIRMWARE_IMAGE_MIN_LEN);
+        let path = write_temp_image("oldconfirm", &image);
+        // The board says OK but still reports 4.0.1 — not a confirm.
+        let (result, _) = run_flash(&path, port, (4, 0, 1), &mut || Ok("4.0.1".to_string()));
+        let _ = std::fs::remove_file(&path);
+        assert!(!result.success, "result: {result:?}");
+        let error = result.error.expect("failure names the reason");
+        assert!(error.contains("4.0.1"), "{error}");
+        assert!(error.contains("4.0.2"), "{error}");
+    }
+
+    #[test]
+    fn flash_fails_when_confirm_errors() {
+        let (captured_tx, _captured_rx) = mpsc::channel();
+        let port = spawn_fake_server(
+            vec![
+                response_200_chunked(&index_page()),
+                response_200("OK - update ho gaya"),
+            ],
+            captured_tx,
+        );
+        let image = build_flash_test_image("4.0.2", FIRMWARE_IMAGE_MIN_LEN);
+        let path = write_temp_image("confirmerr", &image);
+        let (result, _) = run_flash(&path, port, (4, 0, 1), &mut || {
+            Err("board did not answer after the upload".to_string())
+        });
+        let _ = std::fs::remove_file(&path);
+        assert!(!result.success, "result: {result:?}");
+        let error = result.error.expect("failure names the reason");
+        assert!(error.contains("could not confirm"), "{error}");
+    }
+
+    #[test]
+    fn flash_fails_on_a_missing_image_file() {
+        let (captured_tx, _captured_rx) = mpsc::channel();
+        let port = spawn_fake_server(vec![], captured_tx);
+        let missing = std::env::temp_dir().join("rsh-webota-test-definitely-missing.bin");
+        let (result, _) = run_flash(&missing, port, (4, 0, 1), &mut || Ok("4.0.2".to_string()));
+        assert!(!result.success, "result: {result:?}");
+        assert!(
+            result
+                .error
+                .as_ref()
+                .is_some_and(|e| e.contains("could not read")),
+            "result: {result:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_board_version_reads_the_chip() {
+        let (captured_tx, _captured_rx) = mpsc::channel();
+        let port = spawn_fake_server(
+            vec![response_200_chunked(&index_page_with_version("4.0.2"))],
+            captured_tx,
+        );
+        let version =
+            fetch_board_version(IpAddr::from([127, 0, 0, 1]), port, "secret").expect("version");
+        assert_eq!(version, "4.0.2");
+    }
+
+    #[test]
+    fn fetch_board_version_fails_without_a_chip() {
+        let (captured_tx, _captured_rx) = mpsc::channel();
+        let port = spawn_fake_server(vec![response_200_chunked(&index_page())], captured_tx);
+        let error = fetch_board_version(IpAddr::from([127, 0, 0, 1]), port, "secret")
+            .expect_err("no chip must fail");
+        assert!(error.contains("version"), "{error}");
+    }
+
+    #[test]
+    fn version_chip_parsing_is_strict() {
+        assert_eq!(
+            parse_board_version_chip("Version <b>4.0.2</b>").expect("4.0.2"),
+            "4.0.2"
+        );
+        assert_eq!(
+            parse_board_version_chip("xx Version <b>10.20.30</b> yy").expect("10.20.30"),
+            "10.20.30"
+        );
+        assert!(parse_board_version_chip("no chip here").is_err());
+        assert!(parse_board_version_chip("Version <b>4.0</b>").is_err());
+        assert!(parse_board_version_chip("Version <b>4.0.256</b>").is_err());
+        assert!(parse_board_version_chip("Version <b></b>").is_err());
+    }
+
+    #[test]
+    fn wait_for_board_version_polls_until_the_new_version() {
+        let (captured_tx, _captured_rx) = mpsc::channel();
+        let port = spawn_fake_server(
+            vec![
+                response_200_chunked(&index_page_with_version("4.0.1")),
+                response_200_chunked(&index_page_with_version("4.0.1")),
+                response_200_chunked(&index_page_with_version("4.0.2")),
+            ],
+            captured_tx,
+        );
+        let target = WebOtaTarget::on_port(IpAddr::from([127, 0, 0, 1]), port, "secret");
+        let reported = wait_for_board_version(&target, "4.0.2", Duration::from_secs(10))
+            .expect("new version must appear");
+        assert_eq!(reported, "4.0.2");
+    }
+
+    #[test]
+    fn wait_for_board_version_times_out_on_the_old_version() {
+        let (captured_tx, _captured_rx) = mpsc::channel();
+        let port = spawn_fake_server(
+            vec![
+                response_200_chunked(&index_page_with_version("4.0.1")),
+                response_200_chunked(&index_page_with_version("4.0.1")),
+                response_200_chunked(&index_page_with_version("4.0.1")),
+                response_200_chunked(&index_page_with_version("4.0.1")),
+            ],
+            captured_tx,
+        );
+        let target = WebOtaTarget::on_port(IpAddr::from([127, 0, 0, 1]), port, "secret");
+        let error = wait_for_board_version(&target, "4.0.2", Duration::from_millis(1100))
+            .expect_err("old version must time out");
+        assert!(error.contains("4.0.2"), "{error}");
+        assert!(error.contains("4.0.1"), "{error}");
     }
 }
