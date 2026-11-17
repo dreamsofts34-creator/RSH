@@ -55,4 +55,9 @@ ignore = [
     # No fixed upgrade exists.
     # Review: 2027-02-14.
     "RUSTSEC-2026-0192",
+    # RUSTSEC-2026-0543 — chrono 0.4.45, unmaintained.
+    # Transitive via Slint (i-slint-core 1.18.1 <- slint 1.18.1) and via
+    # Tauri (serde_with 3.24.0 <- tauri-utils 2.10.2). No fixed upgrade exists.
+    # Review: 2027-02-14.
+    "RUSTSEC-2026-0543",
 ]

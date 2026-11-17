@@ -56,12 +56,13 @@ unmaintained = "all"
 unsound = "workspace"
 # Ignores (TESTING-INPUT §9.1: ignore only with id + reason + expiry).
 # The first four are transitive dependencies of Tauri 2.12.5's Linux/GTK stack
-# (tao → gtk → zbus/zvariant/glib); the three below are transitive via
-# Slint 1.18.1 (v2.0 UI). None is a direct dependency of any rsh-* crate
+# (tao → gtk → zbus/zvariant/glib); the four below are transitive via
+# Slint 1.18.1 (v2.0 UI), except chrono which also enters via Tauri
+# (serde_with <- tauri-utils). None is a direct dependency of any rsh-* crate
 # and none is a vulnerability in RSH code. Plain `cargo audit`
 # already exits 0 on these (they are warnings, not errors); they are
 # ignored here only so the stricter deny checks stay green and honest.
-# Review date for all seven: 2027-02-14 (re-check whether a Tauri/Slint bump
+# Review date for all eight: 2027-02-14 (re-check whether a Tauri/Slint bump
 # removed them; if yes, drop the entry).
 ignore = [
     # RUSTSEC-2024-0370 — proc-macro-error 1.0.4, unmaintained. No fixed upgrade exists.
@@ -81,6 +82,10 @@ ignore = [
     # RUSTSEC-2026-0192 — ttf-parser 0.25.1, unmaintained. Transitive via
     # Slint (ab_glyph <- winit <- i-slint-backend-winit). No fixed upgrade exists.
     "RUSTSEC-2026-0192",
+    # RUSTSEC-2026-0543 — chrono 0.4.45, unmaintained. Transitive via
+    # Slint (i-slint-core 1.18.1 <- slint 1.18.1) and via Tauri
+    # (serde_with 3.24.0 <- tauri-utils 2.10.2). No fixed upgrade exists.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
