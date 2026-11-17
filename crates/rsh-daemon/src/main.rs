@@ -262,12 +262,31 @@ async fn manager_loop(
                     },
                     None => log_line(verbose, &format!("tray: unknown game '{key}' — ignored")),
                 },
-                TrayAction::RestartWheel => match api.state.restart_wheel() {
-                    Ok(()) => log_line(verbose, "tray: wheel restart requested"),
-                    Err(error) => {
-                        log_line(verbose, &format!("tray: wheel restart failed: {error}"));
+                TrayAction::RestartWheel => {
+                    // DS-02 (P0): `restart_wheel` is a sync H5 command
+                    // built on `block_on_control` (fresh runtime +
+                    // `block_on`) — calling it here, inside this tokio
+                    // task, panics ("Cannot start a runtime from
+                    // within a runtime") and kills the manager loop
+                    // silently (proven with a scratch tokio probe).
+                    // Run it on the blocking pool instead, where
+                    // there is no runtime context; the loop awaits
+                    // the outcome and logs it like every other
+                    // tray action.
+                    let state = Arc::clone(&api.state);
+                    match tokio::task::spawn_blocking(move || state.restart_wheel()).await {
+                        Ok(Ok(())) => log_line(verbose, "tray: wheel restart requested"),
+                        Ok(Err(error)) => {
+                            log_line(verbose, &format!("tray: wheel restart failed: {error}"));
+                        }
+                        Err(error) => {
+                            log_line(
+                                verbose,
+                                &format!("tray: wheel restart task failed: {error}"),
+                            );
+                        }
                     }
-                },
+                }
                 TrayAction::OpenSetup => {
                     if open_ui(Some("setup"), verbose) {
                         log_line(
@@ -1246,15 +1265,33 @@ fn main() {
             serve_ipc(server, &dir, verbose, shutdown, ipc_fatal).await;
         });
     }
-    {
+    // DS-02 defence-in-depth: keep the manager-loop handle. A
+    // panicking tokio task just dies — the old code discarded both
+    // handles, so a dead loop left the daemon looking alive (no
+    // watchdog, no retries, no tray drain). `main` watches this
+    // handle in the headless park loop and restarts the loop (and
+    // logs fatally after the event loop) when it ends without a
+    // shutdown request.
+    let spawn_manager_loop = {
         let api = Arc::clone(&api);
-        let event_tx = event_tx.clone();
         let tray_actions = Arc::clone(&tray_actions);
         let shutdown = Arc::clone(&shutdown);
-        runtime.spawn(async move {
-            manager_loop(api, event_tx, tray_actions, shutdown, verbose).await;
-        });
-    }
+        // A cloned `Handle` (not a borrow of `runtime`): the
+        // closure must stay callable after `main` uses `runtime`
+        // again (`--check`'s `block_on`), and `Handle::spawn`
+        // is the same spawn.
+        let handle = runtime.handle().clone();
+        move || {
+            let api = Arc::clone(&api);
+            let event_tx = event_tx.clone();
+            let tray_actions = Arc::clone(&tray_actions);
+            let shutdown = Arc::clone(&shutdown);
+            handle.spawn(async move {
+                manager_loop(api, event_tx, tray_actions, shutdown, verbose).await;
+            })
+        }
+    };
+    let mut manager_handle = spawn_manager_loop();
 
     // Engine + transport (unless --no-connect): the daemon owns the
     // engine from startup, like the Tauri shell did.
@@ -1425,7 +1462,19 @@ fn main() {
         // `process::exit(1)` from the task).
         // (Ctrl-C / SIGTERM end the process; the pid file is
         // reclaimed by the next launch's /proc check.)
+        //
+        // DS-02: watch the manager-loop handle while parked — a
+        // loop that ends without a shutdown request (panic) is
+        // restarted here instead of leaving the daemon half-alive.
         while !shutdown.load(Ordering::Relaxed) {
+            if manager_handle.is_finished() {
+                let _ = log_fatal("daemon: manager loop ended unexpectedly — restarting it");
+                log_line(
+                    verbose,
+                    "daemon: manager loop ended unexpectedly — restarting it",
+                );
+                manager_handle = spawn_manager_loop();
+            }
             std::thread::sleep(Duration::from_millis(250));
         }
     }
@@ -1434,6 +1483,17 @@ fn main() {
     // (`NIM_DELETE`) before the lock is released, then log the exit
     // with the pid so a start/exit pair brackets every run in the log.
     drop(tray);
+    // DS-02: if the manager loop already ended while the event loop
+    // was running — and no shutdown was requested (tray Quit sets
+    // shutdown first, so a loop ended by Quit is normal) — that is
+    // a fatal trace: the loop never ends on its own otherwise.
+    if !shutdown.load(Ordering::Relaxed) && manager_handle.is_finished() {
+        let _ = log_fatal("daemon: manager loop ended unexpectedly before shutdown");
+        log_line(
+            verbose,
+            "daemon: manager loop ended unexpectedly before shutdown",
+        );
+    }
     log_line(
         verbose,
         &format!("daemon: exiting (pid {})", std::process::id()),

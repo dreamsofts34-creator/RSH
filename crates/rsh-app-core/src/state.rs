@@ -6679,7 +6679,22 @@ where
 /// runtime — Tauri sync commands satisfy this; a call from inside a
 /// runtime panics (a runtime cannot be built inside one), so tests
 /// must be plain `#[test]`, never `#[tokio::test]`.
+///
+/// DS-02 (P0 audit): the only in-runtime caller was the daemon
+/// manager loop's tray "Restart wheel" path (now `spawn_blocking`,
+/// see `rsh-daemon/src/main.rs`); every other caller reaches here
+/// via IPC dispatch on `spawn_blocking` (safe — no runtime context)
+/// or from a plain thread / test. As a backstop this function now
+/// FAILS with an error instead of panicking when it is called from
+/// inside a runtime: a future misuse degrades one command instead
+/// of killing its caller task.
 fn block_on_control<R>(future: impl Future<Output = Result<R, String>>) -> Result<R, String> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(
+            "control command called from inside a tokio runtime — run it on spawn_blocking instead (DS-02)"
+                .to_string(),
+        );
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -11043,6 +11058,30 @@ mod tests {
             .filter(|line| line.contains("window state: open"))
             .count();
         assert_eq!(open_lines, 1, "window-open must log exactly once");
+    }
+
+    /// DS-02: `block_on_control` from inside a tokio runtime must
+    /// fail with an error, never panic ("Cannot start a runtime
+    /// from within a runtime" used to kill the daemon's manager
+    /// loop when tray "Restart wheel" called it). A current-thread
+    /// runtime built here is the exact manager-loop shape.
+    #[test]
+    fn block_on_control_inside_a_runtime_errors_instead_of_panicking() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let result = rt.block_on(async { block_on_control(async { Ok::<(), String>(()) }) });
+        let error = result.expect_err("in-runtime call must fail, not panic");
+        assert!(
+            error.contains("spawn_blocking"),
+            "the error must point at the fix: {error}"
+        );
+        // And outside a runtime the same call still works.
+        assert!(
+            block_on_control(async { Ok::<(), String>(()) }).is_ok(),
+            "plain-thread call must still succeed"
+        );
     }
 
     /* H5-control: run-a-control-command-under-a-fresh-session. */
