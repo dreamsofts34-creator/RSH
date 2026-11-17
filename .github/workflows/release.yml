@@ -459,6 +459,16 @@ jobs:
             ; the process is not running; nsExec ignores that).
             nsExec::Exec 'taskkill /F /IM rsh-daemon.exe'
             nsExec::Exec 'taskkill /F /IM rsh-ui.exe'
+            ; F21: also stop the legacy Tauri v1 app (installed exe
+            ; `RSH.exe`): it binds the wheel UDP port 4211 at launch
+            ; and, if left running, the new daemon can never bind
+            ; the port (`AddrInUse` forever — user log: 117x). This
+            ; installer does NOT uninstall the old app — it lives in
+            ; its own per-user install with its own uninstall entry
+            ; — it only stops the running process so the port is
+            ; free; the user removes the old app via its own
+            ; "Uninstall RSH" entry afterwards.
+            nsExec::Exec 'taskkill /F /IM RSH.exe'
             File "..\target\release\rsh-daemon.exe"
             File "..\target\release\rsh-ui.exe"
             ; Sidecar MUST sit beside rsh-daemon.exe: the daemon resolves it
