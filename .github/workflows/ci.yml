@@ -662,11 +662,13 @@ jobs:
         working-directory: frontend
         run: node scripts/merge-locales.mjs --check
       # Frontend supply-chain gate (SECURITY-INPUT §9 / TM-R03):
-      # fail on High/Critical npm advisories.
+      # fail on High/Critical npm advisories, except the documented
+      # no-fix-available allowlist in scripts/npm-audit-gate.mjs
+      # (GHSA-fc5q-39xc-vjpf: picomatch, no fixed release exists yet).
       - name: npm audit (High/Critical fail)
         if: steps.check.outputs.run == 'true'
         working-directory: frontend
-        run: npm audit --audit-level=high
+        run: node scripts/npm-audit-gate.mjs
 
   audit:
     name: audit
@@ -759,7 +761,10 @@ jobs:
   rig-gate:
     name: rig-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # CI runners run the rig ~2x slower than the dev box: the 300 s
+    # scenarios + full quick suite need ~35 min; 30 min cancelled
+    # run 44170745634 mid-flight (two scenarios still running).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       # H1 (deep-scan Round 2): the old job skipped while `run-rig.sh`
