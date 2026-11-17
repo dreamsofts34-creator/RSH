@@ -1144,6 +1144,23 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// DS-01 (deep scan, U-01): the release gate — `app_version()`
+    /// must equal the release tag. The workspace version was still
+    /// "2.0.2" in the v2.0.3 build, so the app displayed "RSH 2.0.2",
+    /// wrote `skipped 2.0.2` markers, and the F23 wizard re-offer
+    /// (`Skipped(v) => v != current_version`) could never fire for
+    /// v2.0.2 skippers. This literal is the tripwire: bump it in the
+    /// same commit that bumps `[workspace.package] version`, or the
+    /// suite fails before the tag is cut. The release workflow
+    /// (`release.yml`, "Tag matches Cargo workspace version") checks
+    /// tag == workspace version; the local gate
+    /// (`tools/gate-checks/run-gate.sh`, `version-check`) checks the
+    /// Slint default copy too.
+    #[test]
+    fn app_version_matches_release_tag() {
+        assert_eq!(app_version(), "2.0.3");
+    }
+
     /// L-4: a stub whose state flips between two reads — the
     /// transition that, over IPC, happens between the snapshot
     /// round-trip and the connection round-trip of the old

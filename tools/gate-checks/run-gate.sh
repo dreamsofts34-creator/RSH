@@ -2,6 +2,10 @@
 # RSH v2.0.2 gate runner — docs/V2.0.2-GATE.md.
 #
 # Runs the automated gate harness:
+#   0. version-check: [workspace.package] version == the main.slint
+#      app-version default, and (when HEAD is exactly tagged) the
+#      tag == v<version> (DS-01: the 2.0.2 version drift that made
+#      the F23 wizard re-offer inert). Cheap, runs first.
 #   1. cargo fmt --check (workspace)
 #   2. cargo clippy on the gate crates (rsh-rig + rsh-gate-ui, warnings denied)
 #   3. cargo test -p rsh-rig (rig unit tests)
@@ -79,6 +83,34 @@ run_step() {
     fi
 }
 
+# DS-01 (deep scan, U-01): the app version IS the release version.
+# The workspace version is the single source of truth; the Slint
+# default is a second copy that drifted (still "2.0.2" in the v2.0.3
+# build), and the release workflow checks tag == workspace version —
+# so the local gate checks both copies agree, and, when HEAD is
+# exactly tagged, that the tag matches too. `app_version()` itself
+# is pinned by the unit test in crates/rsh-api/src/api.rs.
+version_check() {
+    local ver
+    ver=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p}' Cargo.toml | head -n 1)
+    if [ -z "$ver" ]; then
+        echo "ERROR: could not read [workspace.package] version from Cargo.toml" >&2
+        return 1
+    fi
+    if ! grep -Fq "app-version: \"$ver\"" crates/rsh-ui/ui/main.slint; then
+        echo "ERROR: main.slint app-version default does not match workspace version $ver" >&2
+        return 1
+    fi
+    local tag
+    tag=$(git describe --tags --exact-match HEAD 2>/dev/null || true)
+    if [ -n "$tag" ] && [ "$tag" != "v$ver" ]; then
+        echo "ERROR: HEAD is tagged $tag but workspace version is $ver" >&2
+        return 1
+    fi
+    echo "version $ver (main.slint matches; tag ${tag:-none} OK)"
+}
+
+run_step version-check version_check
 run_step fmt cargo fmt --all -- --check
 run_step clippy-gate cargo clippy -p rsh-rig -p rsh-gate-ui --all-targets -- -D warnings
 run_step rig-tests cargo test -q -p rsh-rig

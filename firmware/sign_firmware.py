@@ -21,7 +21,9 @@ Key kahan se aati hai:
   - Key kabhi repo mein nahi aati. Dev keypair:
       python3 sign-image.py --gen-keypair /tmp/rsh-signing
       python3 sign-image.py --pubkey-header /tmp/rsh-signing/dev-key.pem
-    phir header ko firmware/rsh/signing_pubkey.h mein copy karo.
+    phir header ko firmware/signing_pubkey.h mein copy karo (DS-13:
+    duplicate firmware/rsh/signing_pubkey.h delete kar di gayi — ek hi
+    source hai, webota.cpp isi ko include karta hai).
     Production (Phase H): offline release keypair, private key secure
     storage mein, public key release build mein bake hoti hai.
     Detail: docs/SIGNED-OTA.md

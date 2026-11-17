@@ -1,5 +1,6 @@
 // RSH device key store — implementation (keystore.h dekho).
 #include "keystore.h"
+#include "diag_log.h"  // DS-65: NVS write fail diag event
 #include "fw34_state.h"  // FW-3 armed state (rsh.ino) — key_reset_armed ke liye
 #include "pairing_window.h"  // F-02/F-03: transport-independent window deadline
 #include "pw_obfuscate.h"  // SEC-E-01 (Phase F): NVS password obfuscation
@@ -166,9 +167,38 @@ bool keystore_begin() {
     havePw = pw_load_(prefs, pwBuf, sizeof(pwBuf), &pwLen);
   }
 
-  if (keyLen != sizeof(s_key) || !havePw) {
-    // Pehla boot (ya NVS erase / kharab password): nayi key + naya password.
+  // DS-66: "no credentials" (pehla boot / NVS erase) vs "credentials
+  // mojood lekin parhe nahi ja rahe" (transient NVS glitch / corrupt)
+  // alag karo. Key hi na ho to generate karo (pehla boot). Key mojood
+  // ho lekin lambai ghalat ho to corrupt hai — fail closed, overwrite
+  // NAHI (warna pairing hamesha ke liye khatam). Password entry mojood
+  // ho lekin load fail ho to ek dafa dobara parho (transient glitch);
+  // phir bhi fail ho to fail closed WITHOUT overwriting — keystore_begin()
+  // false deta hai aur rsh.ino 5 s retry karta hai, pairing mehfooz rehti
+  // hai. Password entry bilkul na ho (generate ke beech crash jaisi
+  // aadhi state) to regenerate hi ek rasta hai — purani key ka koi
+  // usable password hai hi nahi.
+  bool keyExists = prefs.isKey("devkey");
+  bool pwExists = prefs.isKey("wifipw2") || prefs.isKey("wifipw");
+  if (keyLen != sizeof(s_key)) {
+    if (keyExists) { prefs.end(); return false; }  // corrupt key: fail closed
     if (!keystore_generate_and_save_(prefs)) { prefs.end(); return false; }
+  } else if (!havePw) {
+    if (pwExists) {
+      // Transient read glitch ho sakta hai — ek dafa dobara parho.
+      havePw = pw_load_(prefs, pwBuf, sizeof(pwBuf), &pwLen);
+      if (!havePw) { prefs.end(); return false; }  // unreadable: fail closed
+    } else {
+      // Key hai, password entry hi nahi (aadhi generate state).
+      if (!keystore_generate_and_save_(prefs)) { prefs.end(); return false; }
+      // generate ne s_password bhar diya; neeche else-branch skip karo.
+      prefs.end();
+      s_haveKey = true;
+      return true;
+    }
+    memcpy(s_password, pwBuf, pwLen);
+    s_password[pwLen] = '\0';
+    s_unpaired = !paired;
   } else {
     memcpy(s_password, pwBuf, pwLen);
     s_password[pwLen] = '\0';
@@ -210,12 +240,32 @@ uint16_t keystore_window_remaining_s(uint32_t now_ms) {
 
 void keystore_mark_paired(void) {
   if (!s_unpaired) return;
-  s_unpaired = false;
+  // DS-65: RAM (s_unpaired) sirf tab flip karo jab NVS write kamyab ho.
+  // Pehle s_unpaired unconditional flip hota tha aur NVS write best-effort
+  // thi — write fail ho to board reboot tak paired dikhta, phir dobara
+  // unpaired (AP khula, key disclosable). Fail ho to ek dafa retry karo;
+  // phir bhi fail ho to unpaired hi raho + diag event (agla GET_CAPS OK
+  // dobara koshish karega).
   Preferences prefs;
-  if (prefs.begin("rsh", false)) {
-    prefs.putBool("paired", true);
+  if (!prefs.begin("rsh", false)) {
+    rsh_diag_record_global(RSH_DIAG_KEYSTORE_NVS_FAIL, 0, millis());
+    return;
+  }
+  bool ok = prefs.putBool("paired", true);
+  if (!ok) {
+    prefs.end();
+    if (prefs.begin("rsh", false)) {
+      ok = prefs.putBool("paired", true);
+      prefs.end();
+    }
+  } else {
     prefs.end();
   }
+  if (!ok) {
+    rsh_diag_record_global(RSH_DIAG_KEYSTORE_NVS_FAIL, 0, millis());
+    return;  // s_unpaired true rehta hai — board unpaired hi hai
+  }
+  s_unpaired = false;
 }
 
 bool keystore_key_reset_armed(void) {
