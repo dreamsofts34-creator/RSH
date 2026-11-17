@@ -878,6 +878,56 @@ mod tests {
     }
 
     #[test]
+    fn transient_baseline_switch_back_by_700ms_stays_open() {
+        // F17 matrix: the transient lasts longer — other app (300)
+        // from 300 ms until 600 ms, back to the taskbar (100) at
+        // 700 ms. The 300 ms value still never stabilises into a
+        // baseline (3 stable polls of 100 arm it at ~900 ms), so
+        // the popup stays open through 2 s.
+        let samples = steady(2000, 100, &[(300, 300), (400, 300), (500, 300), (600, 300)]);
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+    }
+
+    #[test]
+    fn transient_activation_200_to_250ms_stays_open() {
+        // F17 matrix: the popup is briefly foreground at 200 ms
+        // and still foreground at 250 ms (a transient activation,
+        // e.g. the tray click focusing it for a moment), then the
+        // taskbar is foreground again. 250 ms of foreground is far
+        // below the 500 ms sustained threshold, so the loss rule
+        // never arms and the popup stays open.
+        let samples: Vec<(u64, Option<isize>)> = (0..=2000)
+            .step_by(100)
+            .map(|t| (t, Some(if t == 200 { 200 } else { 100 })))
+            .collect();
+        let mut samples = samples;
+        samples.push((250, Some(200)));
+        samples.sort_by_key(|(t, _)| *t);
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+    }
+
+    #[test]
+    fn sustained_foreground_loss_at_1500ms_dismisses_immediately() {
+        // F17 matrix: the popup is foreground from 900 ms and
+        // holds it continuously — by 1400 ms it has held it for
+        // the 500 ms sustained threshold. The user clicks away at
+        // exactly 1500 ms (foreground 300): a real click-away, so
+        // the popup dismisses at once, at 1500 ms.
+        let mut samples = steady(2000, 100, &[]);
+        for sample in &mut samples {
+            if (900..=1400).contains(&sample.0) {
+                sample.1 = Some(200);
+            } else if sample.0 >= 1500 {
+                sample.1 = Some(300);
+            }
+        }
+        assert_eq!(
+            run_timeline(&samples, Some(200)),
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    #[test]
     fn transient_activation_blip_does_not_arm_foreground_loss() {
         // Popup briefly foreground at the 200 ms sample (a
         // transient activation), never again: the old sticky

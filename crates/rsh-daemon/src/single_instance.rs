@@ -154,21 +154,96 @@ pub enum AcquireOutcome {
 /// Returns an error message when the lock file / mutex cannot be
 /// created or read (not when another instance holds it — that is
 /// [`AcquireOutcome::AlreadyRunning`]).
+///
+/// # F17 (v2.0.3) — `O_EXCL` claim, no check-then-create
+///
+/// The old code read the pid file, decided it was stale, and then
+/// truncated it with [`write_pid_file`]: two daemons launched at
+/// once could both pass the check and both become "First" (the
+/// duplicate-daemon half of the restart loop). The claim is now
+/// atomic ([`claim_pid_file`]: `O_EXCL` create — exactly one
+/// caller in the system wins) and every loser re-reads the file:
+/// a live winner means [`AcquireOutcome::AlreadyRunning`], a stale
+/// file is removed and the claim retried (bounded, so a
+/// pathological directory fails loudly instead of spinning).
 #[cfg(unix)]
 pub fn acquire(data_dir: &std::path::Path) -> Result<AcquireOutcome, String> {
-    if let Some(pid) = recorded_pid(data_dir)
-        && pid_is_live_rsh_daemon(pid)
-    {
-        return Ok(AcquireOutcome::AlreadyRunning(Some(pid)));
+    let _ = std::fs::create_dir_all(data_dir);
+    for _ in 0..16 {
+        // Live holder (whoever won the claim) — never steal it.
+        if let Some(pid) = recorded_pid(data_dir)
+            && pid_is_live_rsh_daemon(pid)
+        {
+            return Ok(AcquireOutcome::AlreadyRunning(Some(pid)));
+        }
+        match claim_pid_file(data_dir) {
+            Ok(path) => {
+                return Ok(AcquireOutcome::First(SingleInstance::PidFile { path }));
+            }
+            Err(ClaimError::Held) => {
+                // Lost the claim race. The winner may still be
+                // writing its pid (create_new done, writeln
+                // pending): give it a moment, then re-check —
+                // removing a live winner's file would let two
+                // daemons both become First. Only when there is
+                // still no live pid is the file a stale leftover
+                // (or an empty file whose owner died mid-write):
+                // remove it and retry the claim. Bounded — a file
+                // that can never be claimed fails loudly below
+                // instead of spinning.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                if let Some(pid) = recorded_pid(data_dir)
+                    && pid_is_live_rsh_daemon(pid)
+                {
+                    return Ok(AcquireOutcome::AlreadyRunning(Some(pid)));
+                }
+                let _ = std::fs::remove_file(pid_file_path(data_dir));
+            }
+            Err(ClaimError::Io(error)) => {
+                return Err(format!(
+                    "cannot create daemon lock file {}: {error}",
+                    pid_file_path(data_dir).display()
+                ));
+            }
+        }
     }
-    // Otherwise the pid file is stale (or unreadable): the previous
-    // daemon died without cleaning up — reclaim it below.
-    match write_pid_file(data_dir) {
-        Ok(path) => Ok(AcquireOutcome::First(SingleInstance::PidFile { path })),
-        Err(error) => Err(format!(
-            "cannot create daemon lock file {}: {error}",
-            pid_file_path(data_dir).display()
-        )),
+    Err(format!(
+        "cannot acquire daemon lock file {}: claim race did not settle",
+        pid_file_path(data_dir).display()
+    ))
+}
+
+/// Why [`claim_pid_file`] did not claim the lock.
+#[cfg(unix)]
+enum ClaimError {
+    /// Another caller owns the path (lost the `O_EXCL` race).
+    Held,
+    /// A real I/O failure (not a lost race).
+    Io(std::io::Error),
+}
+
+/// Atomically claim the pid file for this process (F17):
+/// `O_EXCL` create, so exactly one caller in the whole system
+/// wins. Returns the path for the winner; [`ClaimError::Held`]
+/// when another caller already owns the path. Split out of
+/// [`acquire`] so the atomicity itself is unit-testable without a
+/// live daemon process.
+#[cfg(unix)]
+fn claim_pid_file(data_dir: &std::path::Path) -> Result<PathBuf, ClaimError> {
+    use std::io::Write as _;
+    let path = pid_file_path(data_dir);
+    let _ = std::fs::create_dir_all(data_dir);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            writeln!(file, "{}", std::process::id()).map_err(ClaimError::Io)?;
+            Ok(path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(ClaimError::Held),
+        Err(error) => Err(ClaimError::Io(error)),
     }
 }
 
@@ -332,6 +407,44 @@ mod tests {
         assert_eq!(recorded_pid(&dir), Some(std::process::id()));
         assert_eq!(path, dir.join("rsh-daemon.pid"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claim_pid_file_exactly_one_winner_under_race() {
+        // F17: the O_EXCL claim itself, 8 threads × 20 rounds.
+        // With the old check-then-create (`File::create` truncate)
+        // every thread "won"; with `create_new` exactly one wins
+        // per round, deterministically — no live daemon needed.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for round in 0..20 {
+            let dir = temp_dir(&format!("claim-race-{round}"));
+            let wins = Arc::new(AtomicUsize::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let dir = dir.clone();
+                let wins = Arc::clone(&wins);
+                handles.push(std::thread::spawn(move || {
+                    if matches!(claim_pid_file(&dir), Ok(_)) {
+                        wins.fetch_add(1, Ordering::SeqCst);
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("claim thread panicked");
+            }
+            assert_eq!(
+                wins.load(Ordering::SeqCst),
+                1,
+                "round {round}: exactly one O_EXCL claim winner"
+            );
+            assert_eq!(
+                recorded_pid(&dir),
+                Some(std::process::id()),
+                "round {round}: the winner's pid is recorded"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

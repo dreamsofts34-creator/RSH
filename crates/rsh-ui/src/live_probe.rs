@@ -514,6 +514,37 @@ mod tests {
     }
 
     #[test]
+    fn spawn_budget_delays_are_non_decreasing_across_failures() {
+        // F17: the respawn-bound regression net needs the intervals
+        // between consecutive auto-spawns to grow (1 s → 5 s → 30 s
+        // → 60 s cap), never shrink or stay flat — a flat 1 s
+        // cadence is the v2.0.2 loop (17 spawns in 185 s). Read
+        // through the budget, the way the health monitor spends it.
+        let budget = SpawnBudget::new();
+        let mut delays = Vec::new();
+        while budget.auto_spawn_allowed() {
+            delays.push(budget.next_delay().expect("allowed means a delay"));
+            budget.record_spawn_failure();
+        }
+        assert_eq!(delays.len(), MAX_FAILED_SPAWNS as usize);
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            ]
+        );
+        for pair in delays.windows(2) {
+            assert!(pair[0] <= pair[1], "backoff must never shrink");
+        }
+        assert!(!budget.auto_spawn_allowed());
+        assert!(budget.is_latched());
+    }
+
+    #[test]
     fn spawn_budget_latches_after_five_failures_and_resets_on_success() {
         let budget = SpawnBudget::new();
         assert!(budget.auto_spawn_allowed());

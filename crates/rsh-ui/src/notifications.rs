@@ -376,6 +376,31 @@ mod tests {
     }
 
     #[test]
+    fn dedupe_ten_identical_pushes_in_60s_fold_into_one_item() {
+        // F17: the flap regression — 10 identical ConnectionLost
+        // pushes spread over 60 s (one every ~6 s, the daemon
+        // down/up flap cadence) must store exactly ONE row with 9
+        // suppressed repeats, not 10 rows. Pre-F12 this stored 10.
+        let mut c = NotificationCenter::new();
+        for i in 0..10 {
+            c.push_with_time(
+                "ConnectionLost",
+                "Connection lost",
+                "Board unreachable",
+                &format!("10:00:{:02}", i * 6),
+            );
+        }
+        let rows = c.to_model_items();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            c.suppressed_count("ConnectionLost", "Connection lost", "Board unreachable"),
+            9
+        );
+        assert_eq!(rows[0].title, "Connection lost (×9)");
+        assert_eq!(c.unread_count(), 1);
+    }
+
+    #[test]
     fn dedupe_cooldown_expiry_allows_second_item() {
         // F12: PairingNeeded cooldown is 60 s. A repeat at +59 s is
         // still folded; a repeat 60 s after the last seen push is a
