@@ -446,6 +446,9 @@ struct Args {
     setup: bool,
     /// Test-only override for the daemon data dir (IPC socket path).
     data_dir: Option<std::path::PathBuf>,
+    /// Verbose: log live events to stderr (DS-79). Off by default —
+    /// the UI thread never does an `eprintln!` per event.
+    verbose: bool,
 }
 
 fn parse_args() -> Args {
@@ -455,6 +458,7 @@ fn parse_args() -> Args {
         static_mode: false,
         setup: false,
         data_dir: None,
+        verbose: false,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -492,6 +496,7 @@ fn parse_args() -> Args {
                 }
             }
             "--static" => a.static_mode = true,
+            "--verbose" => a.verbose = true,
             other => eprintln!("RSH-UI unknown arg: {other}"),
         }
         i += 1;
@@ -1059,6 +1064,9 @@ struct Ctx {
     /// crosshair / dashed-line strings are rebuilt only when their
     /// inputs move.
     frame_cmds: Rc<RefCell<FrameCmdCache>>,
+    /// Verbose logging (DS-79): `--verbose` — live events go to
+    /// stderr only when this is set.
+    verbose: Rc<Cell<bool>>,
     unsaved: Rc<Cell<bool>>,
     notifications: Rc<RefCell<NotificationCenter>>,
     data_dir: Option<PathBuf>,
@@ -6624,7 +6632,16 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// Log one drained push event. Notification events are ALSO fed to
 /// the [`NotificationCenter`] by the timer drain (see `main`); this
 /// function only logs, it never stores.
-fn log_event(ev: &AppEvent) {
+/// Log one drained live event (DS-79): to stderr only with
+/// `--verbose`. Without it the UI thread does no `eprintln!` per
+/// event at all — not even the `format!` (the early return skips
+/// it). The daemon already records its side of every event in the
+/// diagnostics log; the UI does not depend on `rsh-app-core`, so
+/// its events have no file sink here.
+fn log_event(verbose: bool, ev: &AppEvent) {
+    if !verbose {
+        return;
+    }
     match ev {
         AppEvent::ConnectionChanged {
             state,
@@ -7136,7 +7153,7 @@ fn start_frame_timer(
         };
         if let Some(live) = &live_api {
             for ev in live.poll_events() {
-                log_event(&ev);
+                log_event(ctx.verbose.get(), &ev);
                 handle_live_event(&win, &ctx, &ev);
             }
         }
@@ -7333,6 +7350,7 @@ fn main() -> Result<(), slint::PlatformError> {
         steer_hist: Rc::new(RefCell::new(VecDeque::new())),
         pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
         frame_cmds: Rc::new(RefCell::new(FrameCmdCache::default())),
+        verbose: Rc::new(Cell::new(args.verbose)),
         unsaved: Rc::new(Cell::new(initial_unsaved)),
         // M10: notifications persist across restarts — the drawer is
         // reloaded from `<data_dir>/notifications.json` here (a
@@ -7907,6 +7925,7 @@ mod tests {
             steer_hist: Rc::new(RefCell::new(VecDeque::new())),
             pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
             frame_cmds: Rc::new(RefCell::new(FrameCmdCache::default())),
+            verbose: Rc::new(Cell::new(false)),
             unsaved: Rc::new(Cell::new(false)),
             notifications: Rc::new(RefCell::new(NotificationCenter::load(Some(&dir)))),
             data_dir: Some(dir.clone()),
