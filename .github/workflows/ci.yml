@@ -672,6 +672,13 @@ jobs:
       - name: Cache Cargo dependencies
         if: steps.check.outputs.run == 'true'
         uses: Swatinem/rust-cache@v2
+      # rsh-rig pulls rsh-transport -> serialport -> libudev-sys,
+      # which needs the system libudev headers (pkg-config). The
+      # test (Linux) job installs the same package; rig-gate had no
+      # install step and failed on a fresh runner (run 44047905469).
+      - name: Install libudev-dev (serialport dependency)
+        if: steps.check.outputs.run == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
       # Quick rig gate (60 s soak + scenarios), per TESTING-INPUT §9.1.
       # Full (10-min) and long (4-h, release blocker D-R14) soaks run
       # outside CI, in the rig itself. (The 4-h soak is SKIPPED by user

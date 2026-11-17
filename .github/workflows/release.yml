@@ -504,8 +504,19 @@ jobs:
             ; After an update, restart the daemon (it was stopped
             ; above so its files could be replaced). Fresh installs do
             ; not start it — the UI self-spawns it on first launch.
+            ; ExecShell, NOT Exec: NSIS Exec calls CreateProcess with
+            ; bInheritHandles=TRUE, so the forever-running daemon
+            ; inherits the installer's stdio/nsExec pipes and holds
+            ; them open — the silent installer then never finishes
+            ; and the caller (Start-Process -Wait) hangs forever.
+            ; This hung release run 44047919933 for 13+ min at the
+            ; second (update) install until the run was cancelled
+            ; (orphan rsh-daemon pid 8920 was still alive). The same
+            ; inherited-pipe hang is documented in nteract/nteract
+            ; aa838d9. ShellExecuteEx gives the daemon a fresh handle
+            ; table, so the installer can exit.
             ${If} $UpdateMode == "1"
-              Exec '"$INSTDIR\rsh-daemon.exe"'
+              ExecShell "open" "$INSTDIR\rsh-daemon.exe"
             ${EndIf}
           SectionEnd
           Section "Uninstall"
@@ -583,14 +594,36 @@ jobs:
       # (headless runner): the window actually painting — process +
       # IPC + rule is the strongest launch evidence available in CI;
       # real paint is a human gate (docs/RELEASE-CHECKLIST.md).
+      # Every process wait here is timeout-bounded via
+      # Start-WaitOrFail: run 44047919933 hung SILENTLY for 13+ min
+      # in a bare `Start-Process -Wait` on the second install (the
+      # installer had Exec'd the forever-running daemon with
+      # inherited handles — fixed with ExecShell above), so a future
+      # hang fails fast with the stuck step named.
       - name: Headless launch smoke test (install + update + firewall + daemon check + uninstall)
         shell: pwsh
         run: |
+          # Bounded process runner (see the header comment): every
+          # wait in this step has a timeout and fails closed, naming
+          # the still-alive processes — a hang must be a fast,
+          # located failure, never a silent 13-minute stall again.
+          function Start-WaitOrFail($file, $arguments, $timeoutSec, $what) {
+            Write-Host "Smoke test: starting $what ..."
+            $p = Start-Process -FilePath $file -ArgumentList $arguments -PassThru
+            if (-not $p.WaitForExit($timeoutSec * 1000)) {
+              $names = @("rsh-daemon", "rsh-ui", "uninstall") + @([System.IO.Path]::GetFileNameWithoutExtension($file))
+              $alive = Get-Process -ErrorAction SilentlyContinue | Where-Object { $names -contains $_.ProcessName } | ForEach-Object { "$($_.ProcessName) (pid $($_.Id))" }
+              Write-Error "Smoke test TIMEOUT: $what did not exit within $timeoutSec s. Still-alive processes: $($alive -join ', ')"
+              exit 1
+            }
+            if ($p.ExitCode -ne 0) { Write-Error "Smoke test: $what exited with code $($p.ExitCode)."; exit 1 }
+            Write-Host "Smoke test: $what finished (exit 0)."
+          }
           $installer = (Get-ChildItem release-staging/*-setup.exe).FullName
           $installDir = "C:\rsh-smoke-test"
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
           # NSIS silent install (/S); /D must be last, unquoted.
-          Start-Process -FilePath $installer -ArgumentList "/S", "/D=$installDir" -Wait
+          Start-WaitOrFail $installer @("/S", "/D=$installDir") 180 "first silent install"
           foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "rsh-hm-sidecar.exe", "firmware-signed.bin")) {
             if (-not (Test-Path (Join-Path $installDir $exe))) { Write-Error "Smoke test: installed $exe not found in $installDir after silent install."; exit 1 }
           }
@@ -600,8 +633,7 @@ jobs:
           Write-Host "Firewall rule 'RSH' present after install."
           $dataDir = Join-Path $env:TEMP "rsh-smoke-data"
           $daemon = Join-Path $installDir "rsh-daemon.exe"
-          $proc = Start-Process -FilePath $daemon -ArgumentList "--check", "--no-tray", "--no-connect", "--data-dir", $dataDir -PassThru -Wait
-          if ($proc.ExitCode -ne 0) { Write-Error "Smoke test: rsh-daemon --check exited with code $($proc.ExitCode) (expected 0 — IPC must answer)."; exit 1 }
+          Start-WaitOrFail $daemon @("--check", "--no-tray", "--no-connect", "--data-dir", $dataDir) 60 "daemon --check (IPC must answer)"
           Write-Host "Smoke test PASS: daemon --check exit 0 (IPC answers)."
           # --- Update path: install a second time over the first --------
           # Simulates the user running the new installer on a PC that
@@ -612,7 +644,7 @@ jobs:
           $realDataDir = Join-Path $env:APPDATA "RSH"
           New-Item -ItemType Directory -Force -Path $realDataDir | Out-Null
           Set-Content -Path (Join-Path $realDataDir "smoke-marker.txt") -Value "user data must survive an update" -Encoding ASCII
-          Start-Process -FilePath $installer -ArgumentList "/S", "/D=$installDir" -Wait
+          Start-WaitOrFail $installer @("/S", "/D=$installDir") 180 "second silent install (update path)"
           if (-not (Test-Path (Join-Path $realDataDir "smoke-marker.txt"))) { Write-Error "Smoke test: user data in %APPDATA%\RSH was lost by the update install."; exit 1 }
           Write-Host "User data in %APPDATA%\RSH survived the update install."
           $reg32 = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry32)
@@ -629,12 +661,11 @@ jobs:
           Write-Host "Daemon restarted by the update install (pid $($daemonProc.Id))."
           taskkill /F /IM rsh-daemon.exe | Out-Null
           Start-Sleep -Seconds 2
-          $proc2 = Start-Process -FilePath $daemon -ArgumentList "--check", "--no-tray", "--no-connect", "--data-dir", $dataDir -PassThru -Wait
-          if ($proc2.ExitCode -ne 0) { Write-Error "Smoke test: rsh-daemon --check after the update install exited with code $($proc2.ExitCode)."; exit 1 }
+          Start-WaitOrFail $daemon @("--check", "--no-tray", "--no-connect", "--data-dir", $dataDir) 60 "daemon --check after the update install"
           Write-Host "Smoke test PASS: update path — data kept, version $version, daemon restarted, --check exit 0."
           $uninstaller = Join-Path $installDir "uninstall.exe"
           if (-not (Test-Path $uninstaller)) { Write-Error "Smoke test: uninstaller not found at $uninstaller."; exit 1 }
-          Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait
+          Start-WaitOrFail $uninstaller @("/S") 120 "silent uninstall"
           Start-Sleep -Seconds 5
           $ruleAfter = netsh advfirewall firewall show rule name="RSH" | Out-String
           if ($ruleAfter -match "Rule Name:\s*RSH") { Write-Error "Smoke test: firewall rule 'RSH' still present after uninstall."; exit 1 }
