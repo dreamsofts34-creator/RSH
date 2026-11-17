@@ -547,7 +547,6 @@ mod tests {
             remaining_s: remaining,
             board_mac: Some("AA:BB:CC:DD:EE:FF".to_string()),
             key_reset_armed: false,
-            attempt_log: Vec::new(),
         }
     }
 
@@ -591,7 +590,6 @@ mod tests {
             remaining_s: None,
             board_mac: None,
             key_reset_armed: false,
-            attempt_log: Vec::new(),
         });
         assert_eq!(mgr.begin_pairing(), PairingAction::ResetRequired);
     }
@@ -630,7 +628,6 @@ mod tests {
             remaining_s: None,
             board_mac: None,
             key_reset_armed: false,
-            attempt_log: Vec::new(),
         });
         assert_eq!(
             mgr.window_state(),
@@ -657,7 +654,6 @@ mod tests {
             remaining_s: None,
             board_mac: None,
             key_reset_armed: false,
-            attempt_log: Vec::new(),
         });
         assert_eq!(
             mgr.window_state(),
@@ -746,7 +742,6 @@ mod tests {
             remaining_s: None,
             board_mac: None,
             key_reset_armed: false,
-            attempt_log: Vec::new(),
         });
         assert_eq!(mgr.begin_reset_flow(), Some(RESET_INSTRUCTION));
         assert!(mgr.reset_flow_active());
