@@ -252,7 +252,39 @@ impl IpcApi {
             cache: cache.clone(),
         });
         {
-            let poll_client = client.clone();
+            // DS-80: the fast poller gets its OWN connection, so a
+            // slow call on the main client (a `slow_poll`, a job
+            // call) never delays the 20 Hz `poll` behind the
+            // single-flight lock. Verified with a real `ping`
+            // before use: a server that accepts only one
+            // connection (the ipc_api test server) leaves the
+            // second connect unanswered, so the poller falls back
+            // to the shared client instead of stalling. The probe
+            // is bounded to 200 ms — a healthy daemon answers in
+            // under a millisecond.
+            let poll_client = api.rt.block_on(async {
+                let candidate = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    IpcClient::connect(path),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok);
+                match candidate {
+                    Some(candidate) => {
+                        let pinged = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            candidate.ping(),
+                        )
+                        .await;
+                        match pinged {
+                            Ok(Ok(true)) => candidate,
+                            _ => client.clone(),
+                        }
+                    }
+                    None => client.clone(),
+                }
+            });
             let poll_cache = cache.clone();
             api.rt.spawn(async move {
                 loop {
@@ -2544,6 +2576,9 @@ mod tests {
         snapshot_calls: AtomicUsize,
         connection_calls: AtomicUsize,
         output_calls: AtomicUsize,
+        /// Test-only: `list_profiles` sleeps this long (DS-80 — a
+        /// controllable blocking handler). Zero in normal tests.
+        list_profiles_delay: std::time::Duration,
     }
 
     #[cfg(unix)]
@@ -2555,7 +2590,14 @@ mod tests {
                 snapshot_calls: AtomicUsize::new(0),
                 connection_calls: AtomicUsize::new(0),
                 output_calls: AtomicUsize::new(0),
+                list_profiles_delay: std::time::Duration::ZERO,
             }
+        }
+
+        fn with_list_profiles_delay(delay: std::time::Duration) -> Self {
+            let mut api = Self::new();
+            api.list_profiles_delay = delay;
+            api
         }
     }
 
@@ -2628,6 +2670,14 @@ mod tests {
                 output_enabled: self.inner.output_enabled(),
             }
         }
+
+        // DS-80 test hook: a controllable blocking handler.
+        fn list_profiles(&self) -> Vec<ProfileSummary> {
+            if !self.list_profiles_delay.is_zero() {
+                std::thread::sleep(self.list_profiles_delay);
+            }
+            self.inner.list_profiles()
+        }
     }
 
     /// L-4 (v2.0.2): the poller does exactly ONE round-trip per
@@ -2697,6 +2747,91 @@ mod tests {
         assert_eq!(client.connection().label, "Connected");
         assert_eq!(client.snapshot().throttle, 0.5);
         assert!(client.output_enabled());
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DS-80: the fast poller runs on its own connection — while a
+    /// 2 s `slow_poll` occupies the main client (its single-flight
+    /// lock held by the server-side `list_profiles` sleep), the
+    /// poller keeps running `poll` cycles on the second connection.
+    /// Without the dedicated connection the poller would stall
+    /// behind the blocked main client and run 0 cycles here.
+    #[test]
+    #[cfg(unix)]
+    fn ds80_fast_poller_keeps_polling_while_main_client_blocked() {
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-ds80-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let counting = Arc::new(CountingApi::with_list_profiles_delay(
+            std::time::Duration::from_secs(2),
+        ));
+        let api: Arc<dyn AppApi> = counting.clone();
+        let (tx, _rx) = broadcast::channel(64);
+        let server = Arc::new(IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                // Two connections: the main client and the fast
+                // poller's own connection, served concurrently —
+                // each serve task starts on accept (the main
+                // client's `subscribe` must be answered before the
+                // poller connects, so serving cannot wait for the
+                // second accept).
+                let mut tasks = tokio::task::JoinSet::new();
+                for _ in 0..2 {
+                    if let Ok((stream, _)) = listener.accept().await {
+                        let server = Arc::clone(&server);
+                        tasks.spawn(async move {
+                            server.serve_stream(stream).await;
+                        });
+                    }
+                }
+                while tasks.join_next().await.is_some() {}
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let client = IpcApi::connect(&sock).expect("connect");
+        // Wait for the poller to run at least once.
+        let mut polls = 0;
+        for _ in 0..100 {
+            polls = counting.poll_calls.load(Ordering::Relaxed);
+            if polls >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(polls >= 1, "poller never ran a poll cycle");
+        // Block the main client for ~2 s from another thread: a
+        // slow refresh whose server-side `slow_poll` sleeps in
+        // `list_profiles`, holding the main client's
+        // single-flight lock the whole time.
+        let blocked = client.clone();
+        let join = std::thread::spawn(move || {
+            blocked.refresh_slow_blocking();
+        });
+        // While the main client is blocked, the poller (own
+        // connection) must keep running: ~20 cycles/s.
+        std::thread::sleep(Duration::from_millis(1000));
+        let polls_during = counting.poll_calls.load(Ordering::Relaxed) - polls;
+        assert!(
+            polls_during >= 5,
+            "poller stalled behind the blocked main client: only {polls_during} polls in 1 s"
+        );
+        join.join().expect("blocked refresh finishes");
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);
