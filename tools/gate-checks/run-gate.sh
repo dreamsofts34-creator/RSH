@@ -5,7 +5,8 @@
 #   1. cargo fmt --check (workspace)
 #   2. cargo clippy on the gate crates (rsh-rig + rsh-gate-ui, warnings denied)
 #   3. cargo test -p rsh-rig (rig unit tests)
-#   4. rsh-rig --gate (22 rig gate checks: runtime + source audits)
+#   4. rsh-rig --gate (32 rig gate checks: runtime + source audits +
+#      10 v2.0.3 lifecycle checks, F17 — real daemon/UI under Xvfb)
 #   5. rsh-gate-ui (6 headless UI checks: slider/wizard/theme/tray pixels)
 #
 # Usage:
@@ -72,6 +73,9 @@ run_step() {
 run_step fmt cargo fmt --all -- --check
 run_step clippy-gate cargo clippy -p rsh-rig -p rsh-gate-ui --all-targets -- -D warnings
 run_step rig-tests cargo test -q -p rsh-rig
+# F17 lifecycle checks launch the real binaries — build them first
+# (the rig stages target/debug/rsh-ui, rsh-daemon, rsh-fake-daemon).
+run_step build-lifecycle cargo build -p rsh-ui -p rsh-daemon -p rsh-fake-daemon
 run_step rig-gate cargo run -q -p rsh-rig -- --gate --out "$OUT/rig"
 run_step ui-gate cargo run -q -p rsh-gate-ui
 
