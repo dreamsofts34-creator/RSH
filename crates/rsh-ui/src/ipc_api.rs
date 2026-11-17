@@ -19,13 +19,23 @@
 //! (no stale connection / snapshot survives) and the health monitor
 //! re-probes in the background.
 //!
+//! F5 (v2.0.3): the slow values — firmware, address, diagnostics,
+//! pairing, calibration, profiles, games, bindings, knobs, modules,
+//! tunings, draft — are refreshed ~1 Hz by a second runtime task
+//! ([`refresh_slow`]) into the same cache, so the UI's whole sync
+//! suite reads cache only and `reconnect_to_live` fetches its seed
+//! on a background job ([`LiveSeed`]). A successful write updates
+//! its slot at once (or pulls the next slow cycle forward), so the
+//! UI converges within ~100 ms instead of at the next 1 s tick.
+//!
 //! The connection subscribes to [`AppEvent`] pushes (`subscribe`)
 //! at connect time; [`IpcApi::poll_events`] drains them for the
 //! UI's frame loop.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -43,11 +53,58 @@ use rsh_ipc::{IpcClient, IpcError};
 /// only ever reads the cache. `link_dead` is set by the poller when
 /// a round fails and cleared on the next good round; fallible calls
 /// fail fast on it instead of waiting out the 500 ms timeout.
+///
+/// F5 (v2.0.3): the slow slots below hold everything else the UI
+/// re-reads — firmware / address / diagnostics / pairing /
+/// calibration / profiles / games / bindings / knobs / modules /
+/// tunings / draft — refreshed ~1 Hz by a second poller task on
+/// the runtime (never the UI thread). The UI's sync suite
+/// (`sync_pedals`, `sync_extras`, `sync_overview`,
+/// `refresh_profiles`, `refresh_games`, `sync_diag`,
+/// `reconnect_to_live`) therefore reads cache only: on a slow or
+/// dying daemon the UI thread never waits out a 500 ms round-trip.
+/// A slot is `None` until its first fetch — reads fall back exactly
+/// as they did on an IPC error before (empty lists, `"Unknown"`,
+/// neutral tuning), so a cold cache is indistinguishable from a
+/// failed call. `generation` bumps at the end of every completed
+/// slow cycle; the frame timer re-syncs the pages when it changes.
 struct LiveCache {
     connection: Mutex<Option<ConnectionInfo>>,
     snapshot: Mutex<Option<SnapshotInfo>>,
     output: Mutex<Option<bool>>,
     link_dead: AtomicBool,
+    version: Mutex<Option<String>>,
+    firmware_version: Mutex<Option<String>>,
+    board_address: Mutex<Option<String>>,
+    diag_stats: Mutex<Option<DiagStats>>,
+    pairing_status: Mutex<Option<PairingInfo>>,
+    calibration: Mutex<Option<CalibrationInfo>>,
+    profiles: Mutex<Option<Vec<ProfileSummary>>>,
+    games: Mutex<Option<Vec<GameSummary>>>,
+    bindings: Mutex<Option<Vec<ButtonBinding>>>,
+    knobs: Mutex<Option<[[String; 3]; 2]>>,
+    firmware_check: Mutex<Option<FirmwareCheck>>,
+    firmware_update_status: Mutex<Option<FirmwareUpdateStatus>>,
+    vjoy_status: Mutex<Option<VjoyStatus>>,
+    auto_pause: Mutex<Option<bool>>,
+    close_to_tray: Mutex<Option<bool>>,
+    /// Last autostart flag (also the `autostart()` read slot).
+    autostart: Mutex<Option<bool>>,
+    /// Last output backend name (also the `output_backend()` slot).
+    backend: Mutex<Option<String>>,
+    /// Module on/off by index: 0 handbrake, 1 shifter, 2 horn, 3 led
+    /// (the same order [`module_index`] and the UI's `module_states`
+    /// use).
+    modules: Mutex<[Option<bool>; 4]>,
+    tunings: Mutex<HashMap<String, TuningSettings>>,
+    draft: Mutex<Option<DraftStatus>>,
+    /// True once a slow cycle has completed (the slots hold daemon
+    /// values, not just their fallbacks).
+    slow_filled: AtomicBool,
+    /// Set by a successful write (or the UI) to pull the next slow
+    /// cycle forward at once instead of waiting out the 1 s period.
+    refresh_requested: AtomicBool,
+    generation: AtomicU64,
 }
 
 impl Default for LiveCache {
@@ -57,6 +114,151 @@ impl Default for LiveCache {
             snapshot: Mutex::new(None),
             output: Mutex::new(None),
             link_dead: AtomicBool::new(false),
+            version: Mutex::new(None),
+            firmware_version: Mutex::new(None),
+            board_address: Mutex::new(None),
+            diag_stats: Mutex::new(None),
+            pairing_status: Mutex::new(None),
+            calibration: Mutex::new(None),
+            profiles: Mutex::new(None),
+            games: Mutex::new(None),
+            bindings: Mutex::new(None),
+            knobs: Mutex::new(None),
+            firmware_check: Mutex::new(None),
+            firmware_update_status: Mutex::new(None),
+            vjoy_status: Mutex::new(None),
+            auto_pause: Mutex::new(None),
+            close_to_tray: Mutex::new(None),
+            autostart: Mutex::new(None),
+            backend: Mutex::new(None),
+            modules: Mutex::new([None; 4]),
+            tunings: Mutex::new(HashMap::new()),
+            draft: Mutex::new(None),
+            slow_filled: AtomicBool::new(false),
+            refresh_requested: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Module on/off slot index for [`LiveCache::modules`]:
+/// handbrake 0, shifter 1, horn 2, led 3. `None` for a tuning-only
+/// module (steering / throttle / brake / clutch have no toggle).
+fn module_index(module: &str) -> Option<usize> {
+    match module {
+        "handbrake" => Some(0),
+        "shifter" => Some(1),
+        "horn" => Some(2),
+        "led" => Some(3),
+        _ => None,
+    }
+}
+
+/// Everything `reconnect_to_live` needs (F5): the whole
+/// reconnect-time fetch, done on a background job thread and handed
+/// to the UI thread as plain owned data — `Send`, no `Rc`, no
+/// window handle. [`LiveSeed::fetch`] connects first, then runs one
+/// synchronous slow refresh (which fills the [`LiveCache`] as a
+/// side effect), then reads the seed out of the cache — so the
+/// UI-thread apply step is cache reads only.
+pub struct LiveSeed {
+    /// Stored steering record (re-seeds the sliders).
+    pub steering: TuningSettings,
+    /// Whether the draft is dirty (the unsaved dot).
+    pub draft_dirty: bool,
+    /// Active output backend name.
+    pub backend: String,
+    /// Start-with-Windows flag.
+    pub autostart: bool,
+    /// Stored wheel-button bindings.
+    pub bindings: Vec<ButtonBinding>,
+    /// Stored knob actions.
+    pub knobs: [[String; 3]; 2],
+    /// Auto-profile-switch pause flag.
+    pub auto_pause: bool,
+    /// Keep-running-in-tray flag.
+    pub close_to_tray: bool,
+    /// Module on/off: handbrake, shifter, horn, led.
+    pub modules: [bool; 4],
+    /// Board vs bundled firmware check, when the board answers.
+    pub firmware_check: Option<FirmwareCheck>,
+    /// The session `connect` verdict (the wizard's Connect step
+    /// follows it; a failure notifies instead of blocking).
+    pub connect: Result<ConnectionInfo, UserError>,
+    /// Pairing window state (wizard Pair step).
+    pub pairing: PairingInfo,
+    /// Whether the `connect` verdict is an Active session.
+    pub connection_active: bool,
+    /// Last calibration read, when one exists.
+    pub calibration: Option<CalibrationInfo>,
+    /// Pedal tuning records: throttle, brake, clutch.
+    pub pedals: [TuningSettings; 3],
+    /// Extras tuning records: handbrake, led, shifter, horn.
+    pub extras: [TuningSettings; 4],
+    /// Board firmware version (`"Unknown"` with no session).
+    pub firmware_version: String,
+    /// Board address (falls back to the persisted address).
+    pub board_address: String,
+    /// Measured diagnostics, when the daemon measures.
+    pub diag: Option<DiagStats>,
+    /// Profiles list.
+    pub profiles: Vec<ProfileSummary>,
+    /// Games list.
+    pub games: Vec<GameSummary>,
+    /// Daemon app version.
+    pub version: String,
+}
+
+impl LiveSeed {
+    /// Fetch the whole seed on the calling (job) thread: connect
+    /// on the transport the last session used, run one synchronous
+    /// slow refresh (filling the live cache), then read the seed
+    /// out of the cache. Every step is bounded by the 500 ms IPC
+    /// bound / the poller's fail-fast, so a dying daemon finishes
+    /// fast with defaults instead of hanging the fetch.
+    pub fn fetch(api: &IpcApi, transport: ApiTransport) -> Self {
+        let connect = api.connect(transport);
+        api.refresh_slow_blocking();
+        let connection_active = connect
+            .as_ref()
+            .is_ok_and(|info| matches!(info.state, ConnectionState::Active));
+        Self {
+            steering: api.get_tuning("steering"),
+            draft_dirty: api.draft_status().is_some_and(|s| s.dirty),
+            backend: api.output_backend(),
+            autostart: api.autostart(),
+            bindings: api.list_bindings(),
+            knobs: api.knob_actions(),
+            auto_pause: api.auto_pause(),
+            close_to_tray: api.close_to_tray(),
+            modules: [
+                api.module_enabled("handbrake"),
+                api.module_enabled("shifter"),
+                api.module_enabled("horn"),
+                api.module_enabled("led"),
+            ],
+            firmware_check: api.firmware_check().ok(),
+            connect,
+            pairing: api.pairing_status(),
+            connection_active,
+            calibration: api.calibration().ok(),
+            pedals: [
+                api.get_tuning("throttle"),
+                api.get_tuning("brake"),
+                api.get_tuning("clutch"),
+            ],
+            extras: [
+                api.get_tuning("handbrake"),
+                api.get_tuning("led"),
+                api.get_tuning("shifter"),
+                api.get_tuning("horn"),
+            ],
+            firmware_version: api.firmware_version(),
+            board_address: api.board_address(),
+            diag: api.diag_stats().ok(),
+            profiles: api.list_profiles(),
+            games: api.list_games(),
+            version: api.version(),
         }
     }
 }
@@ -66,8 +268,6 @@ pub struct IpcApi {
     client: Arc<IpcClient>,
     rt: tokio::runtime::Runtime,
     cache: Arc<LiveCache>,
-    last_autostart: Mutex<Option<bool>>,
-    last_backend: Mutex<Option<String>>,
 }
 
 impl IpcApi {
@@ -101,12 +301,10 @@ impl IpcApi {
             client: client.clone(),
             rt,
             cache: cache.clone(),
-            last_autostart: Mutex::new(None),
-            last_backend: Mutex::new(None),
         });
         {
-            let poll_client = client;
-            let poll_cache = cache;
+            let poll_client = client.clone();
+            let poll_cache = cache.clone();
             api.rt.spawn(async move {
                 loop {
                     // L-4 (v2.0.2): ONE combined `poll` round-trip
@@ -145,6 +343,34 @@ impl IpcApi {
                     // starving the UI thread's own calls.
                     let delay_ms = if ok { 50 } else { 500 };
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            });
+        }
+        {
+            // F5 (v2.0.3): the slow poller refreshes every other
+            // read-only value the UI shows (~1 Hz, one sequential
+            // pass over the read methods — each bounded to 500 ms
+            // and fail-fast once the fast poller proves the link
+            // dead, so a dying daemon costs one cheap skipped cycle
+            // instead of a ~15 s stall). A first pass runs at once,
+            // so the cache is warm ~50 ms after connect on a healthy
+            // daemon; later passes wait out the 1 s period in 50 ms
+            // steps and run early when a write asked for a refresh.
+            let slow_client = client;
+            let slow_cache = cache;
+            api.rt.spawn(async move {
+                refresh_slow(&slow_client, &slow_cache).await;
+                loop {
+                    for _ in 0..20 {
+                        if slow_cache
+                            .refresh_requested
+                            .swap(false, Ordering::Relaxed)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    refresh_slow(&slow_client, &slow_cache).await;
                 }
             });
         }
@@ -196,7 +422,9 @@ impl IpcApi {
     /// the UI calls this when the health monitor proves the daemon
     /// died, so no frame ever shows a stale connection / snapshot /
     /// output again. A discarded link's poller keeps running only
-    /// until its `IpcApi` is dropped with the runtime.
+    /// until its `IpcApi` is dropped with the runtime. F5: the slow
+    /// slots go too — a dead daemon's firmware / profiles / tunings
+    /// must not survive as if they were live.
     pub fn clear_cached_state(&self) {
         if let Ok(mut slot) = self.cache.connection.lock() {
             *slot = None;
@@ -207,13 +435,134 @@ impl IpcApi {
         if let Ok(mut slot) = self.cache.output.lock() {
             *slot = None;
         }
-        if let Ok(mut slot) = self.last_autostart.lock() {
+        if let Ok(mut slot) = self.cache.version.lock() {
             *slot = None;
         }
-        if let Ok(mut slot) = self.last_backend.lock() {
+        if let Ok(mut slot) = self.cache.firmware_version.lock() {
             *slot = None;
         }
+        if let Ok(mut slot) = self.cache.board_address.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.diag_stats.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.pairing_status.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.calibration.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.profiles.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.games.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.bindings.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.knobs.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.firmware_check.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.firmware_update_status.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.vjoy_status.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.auto_pause.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.close_to_tray.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.autostart.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.backend.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = self.cache.modules.lock() {
+            *slot = [None; 4];
+        }
+        if let Ok(mut slot) = self.cache.tunings.lock() {
+            slot.clear();
+        }
+        if let Ok(mut slot) = self.cache.draft.lock() {
+            *slot = None;
+        }
+        self.cache.slow_filled.store(false, Ordering::Relaxed);
         self.cache.link_dead.store(true, Ordering::Relaxed);
+    }
+
+    /// True once a slow cycle has completed (F5): the slow slots
+    /// hold daemon values, not just their cold-cache fallbacks.
+    /// Tests wait on this instead of sleeping a fixed delay.
+    #[must_use]
+    pub fn slow_filled(&self) -> bool {
+        self.cache.slow_filled.load(Ordering::Relaxed)
+    }
+
+    /// Current slow-cache generation (F5): bumps at the end of
+    /// every completed slow cycle. The frame timer re-syncs the
+    /// pages when it changes — that is how a daemon-side change
+    /// reaches the UI without any UI-thread IPC.
+    #[must_use]
+    pub fn slow_generation(&self) -> u64 {
+        self.cache.generation.load(Ordering::Relaxed)
+    }
+
+    /// Pull the next slow cycle forward at once (F5/F6): a
+    /// successful write calls this so the cache — and the UI reading
+    /// it — converges within ~100 ms instead of at the next 1 s
+    /// tick. Cheap (one atomic store); the poller clears the flag
+    /// when it starts the early cycle.
+    pub fn request_slow_refresh(&self) {
+        self.cache
+            .refresh_requested
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// One slow refresh, run synchronously on the calling (job)
+    /// thread (F5): the reconnect seed job calls this after
+    /// `connect`, so the seed is read out of a just-filled cache.
+    /// Blocking here is fine — the caller is already a background
+    /// thread, never the UI thread.
+    pub fn refresh_slow_blocking(&self) {
+        self.rt.block_on(refresh_slow(&self.client, &self.cache));
+    }
+
+    /// Mark the cached draft dirty for `module` (F6): the daemon
+    /// marks the draft dirty on `set_tuning` /
+    /// `set_module_enabled`, so a successful write dirties the
+    /// cached draft at once instead of waiting for the slow
+    /// poller's next cycle — the UI's unsaved dot (read from
+    /// `draft_status()`) never lags a slider push. A binding /
+    /// knob write does NOT mark it (the daemon doesn't either).
+    fn mark_draft_dirty(&self, module: &str) {
+        if let Ok(mut slot) = self.cache.draft.lock() {
+            match slot.as_mut() {
+                Some(status) => {
+                    status.dirty = true;
+                    if !status.dirty_modules.contains(&module.to_string()) {
+                        status.dirty_modules.push(module.to_string());
+                        status.dirty_modules.sort();
+                    }
+                }
+                None => {
+                    *slot = Some(DraftStatus {
+                        profile_id: String::new(),
+                        profile_name: String::new(),
+                        dirty: true,
+                        dirty_modules: vec![module.to_string()],
+                    });
+                }
+            }
+        }
     }
 
     /// Drain all pushed [`AppEvent`]s waiting on this connection.
@@ -247,17 +596,184 @@ impl IpcApi {
     }
 }
 
+/// One slow refresh pass (F5, v2.0.3): every read-only value the
+/// UI shows that the fast poller does not cover, fetched
+/// sequentially into the cache. Each step checks `link_dead` first
+/// and bails — a daemon that died mid-pass costs at most one more
+/// 500 ms call, never the whole pass. A failed step keeps its last
+/// good value (or the cold-cache fallback): a slow value going
+/// briefly stale beats a frozen frame. A completed pass marks the
+/// cache filled and bumps the generation, so the frame timer
+/// re-syncs the pages from the fresh values.
+async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
+    if cache.link_dead.load(Ordering::Relaxed) {
+        return;
+    }
+    // One call, parsed or ignored. `parse` turns the reply into
+    // the slot's value (`None` = unparseable, keep the old value).
+    macro_rules! fetch {
+        ($method:literal, $slot:ident, $parse:expr) => {{
+            if cache.link_dead.load(Ordering::Relaxed) {
+                return;
+            }
+            if let Ok(value) = client.call($method, serde_json::json!({})).await {
+                let parse: fn(&serde_json::Value) -> Option<_> = $parse;
+                if let Some(parsed) = parse(&value) {
+                    if let Ok(mut slot) = cache.$slot.lock() {
+                        *slot = Some(parsed);
+                    }
+                }
+            }
+        }};
+    }
+    fetch!("version", version, |v: &serde_json::Value| {
+        v.get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
+    fetch!("firmware_version", firmware_version, |v| {
+        v.get("firmware_version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
+    fetch!("output_backend", backend, |v| {
+        v.get("output_backend")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
+    fetch!("autostart", autostart, |v| {
+        v.get("autostart").and_then(serde_json::Value::as_bool)
+    });
+    fetch!("board_address", board_address, |v| {
+        v.get("address")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
+    fetch!("diag_stats", diag_stats, |v| {
+        serde_json::from_value(v.clone()).ok()
+    });
+    fetch!("pairing_status", pairing_status, |v| {
+        serde_json::from_value(v.clone()).ok()
+    });
+    fetch!("calibration", calibration, |v| {
+        serde_json::from_value(v.clone()).ok()
+    });
+    fetch!("list_profiles", profiles, |v| {
+        serde_json::from_value(v.clone()).ok()
+    });
+    fetch!("list_games", games, |v| {
+        serde_json::from_value(v.clone()).ok()
+    });
+    fetch!("firmware_check", firmware_check, |v| {
+        serde_json::from_value(v.clone()).ok()
+    });
+    fetch!("firmware_update_status", firmware_update_status, |v| {
+        serde_json::from_value(v.clone()).ok()
+    });
+    fetch!("vjoy_status", vjoy_status, |v| {
+        serde_json::from_value(v.clone()).ok()
+    });
+    fetch!("auto_pause", auto_pause, |v| {
+        v.get("paused").and_then(serde_json::Value::as_bool)
+    });
+    fetch!("close_to_tray", close_to_tray, |v| {
+        v.get("close_to_tray")
+            .and_then(serde_json::Value::as_bool)
+    });
+    // `list_bindings` / `knob_actions` nest their payloads under a
+    // key, like their trait methods already parse them.
+    fetch!("list_bindings", bindings, |v| {
+        v.get("bindings")
+            .cloned()
+            .and_then(|b| serde_json::from_value(b).ok())
+    });
+    fetch!("knob_actions", knobs, |v| {
+        v.get("knobs")
+            .cloned()
+            .and_then(|k| serde_json::from_value(k).ok())
+    });
+    // The draft reply is `null` (no draft) or an object: store
+    // whichever parsed, so a saved draft clears the cached one.
+    if !cache.link_dead.load(Ordering::Relaxed) {
+        if let Ok(value) = client.call("draft_status", serde_json::json!({})).await {
+            if let Ok(draft) = serde_json::from_value::<Option<DraftStatus>>(value) {
+                if let Ok(mut slot) = cache.draft.lock() {
+                    *slot = draft;
+                }
+            }
+        }
+    }
+    // Per-module reads: tunings for every module, on/off for the
+    // four toggleable ones.
+    for module in [
+        "steering",
+        "throttle",
+        "brake",
+        "clutch",
+        "handbrake",
+        "led",
+        "shifter",
+        "horn",
+    ] {
+        if cache.link_dead.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(value) = client
+            .call("get_tuning", serde_json::json!({"module": module}))
+            .await
+        {
+            if let Ok(tuning) = serde_json::from_value::<TuningSettings>(value) {
+                if let Ok(mut tunings) = cache.tunings.lock() {
+                    tunings.insert(module.to_string(), tuning);
+                }
+            }
+        }
+    }
+    for (module, index) in [
+        ("handbrake", 0),
+        ("shifter", 1),
+        ("horn", 2),
+        ("led", 3),
+    ] {
+        if cache.link_dead.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(value) = client
+            .call("module_enabled", serde_json::json!({"module": module}))
+            .await
+        {
+            if let Some(enabled) = value
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+            {
+                if let Ok(mut modules) = cache.modules.lock() {
+                    modules[index] = Some(enabled);
+                }
+            }
+        }
+    }
+    cache.slow_filled.store(true, Ordering::Relaxed);
+    cache.generation.fetch_add(1, Ordering::Relaxed);
+}
+
 impl AppApi for IpcApi {
+    /// Cached version (F5): the slow poller refreshes it ~1 Hz, so
+    /// this never touches the socket. No cache yet means the local
+    /// app version (the pre-poller fallback).
     fn version(&self) -> String {
-        let got: Result<String, IpcError> = self.rt.block_on(async {
-            let value = self.call_async("version", serde_json::json!({})).await?;
-            value
-                .get("version")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| IpcError::Protocol("version response has no version".to_string()))
-        });
-        got.unwrap_or_else(|_| app_version().to_string())
+        self.cache
+            .version
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| app_version().to_string())
+    }
+
+    /// Slow-cache generation (F5): the frame timer re-syncs the
+    /// pages when this changes. `0` for implementations without a
+    /// slow cache (the trait default) — they never trigger a resync.
+    fn cache_generation(&self) -> u64 {
+        self.slow_generation()
     }
 
     /// Cached connection (B3): the poller refreshes it ~20 Hz, so
@@ -283,7 +799,15 @@ impl AppApi for IpcApi {
                 .await?;
             serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
         });
-        got.map_err(|_| Self::ipc_failed())
+        match got {
+            // F5: a (dis)connect changes the session — pull the
+            // next slow cycle forward so pairing / firmware follow.
+            Ok(info) => {
+                self.request_slow_refresh();
+                Ok(info)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
     }
 
     fn disconnect(&self) -> Result<ConnectionInfo, UserError> {
@@ -291,25 +815,33 @@ impl AppApi for IpcApi {
             let value = self.call_async("disconnect", serde_json::json!({})).await?;
             serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
         });
-        got.map_err(|_| Self::ipc_failed())
+        match got {
+            Ok(info) => {
+                self.request_slow_refresh();
+                Ok(info)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
     }
 
+    /// Cached pairing status (F5): the slow poller refreshes it
+    /// ~1 Hz, so this never touches the socket. No cache yet means
+    /// no window (the pre-poller fallback).
     fn pairing_status(&self) -> PairingInfo {
-        let got: Result<PairingInfo, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("pairing_status", serde_json::json!({}))
-                .await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        got.unwrap_or(PairingInfo {
-            seconds_left: 0,
-            password: None,
-            error: None,
-            error_detail: None,
-            board_mac: None,
-            replacement_required: false,
-            key_reset_armed: false,
-        })
+        self.cache
+            .pairing_status
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or(PairingInfo {
+                seconds_left: 0,
+                password: None,
+                error: None,
+                error_detail: None,
+                board_mac: None,
+                replacement_required: false,
+                key_reset_armed: false,
+            })
     }
 
     fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
@@ -331,7 +863,15 @@ impl AppApi for IpcApi {
                 key_reset_armed: false,
             }))
         });
-        got.map_err(|_| Self::ipc_failed())
+        match got {
+            // F5: pairing started — pull the next slow cycle forward
+            // so the wizard's countdown follows the real window.
+            Ok(info) => {
+                self.request_slow_refresh();
+                Ok(info)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
     }
 
     /// Cached snapshot (B3): the poller refreshes it ~20 Hz, so
@@ -368,14 +908,16 @@ impl AppApi for IpcApi {
         }
     }
 
+    /// Cached tuning record (F5): the slow poller refreshes every
+    /// module ~1 Hz, so this never touches the socket. No cache yet
+    /// means the neutral record (the pre-poller fallback).
     fn get_tuning(&self, module: &str) -> TuningSettings {
-        let got: Result<TuningSettings, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("get_tuning", serde_json::json!({"module": module}))
-                .await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        got.unwrap_or_else(|_| TuningSettings::neutral(module))
+        self.cache
+            .tunings
+            .lock()
+            .ok()
+            .and_then(|tunings| tunings.get(module).cloned())
+            .unwrap_or_else(|| TuningSettings::neutral(module))
     }
 
     fn set_tuning(&self, tuning: &TuningSettings) -> Result<TuningSettings, UserError> {
@@ -388,17 +930,29 @@ impl AppApi for IpcApi {
                 .await?;
             serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
         });
-        got.map_err(|_| Self::ipc_failed())
+        match got {
+            Ok(stored) => {
+                // F5/F6: the stored record is the cache now, the
+                // draft is dirty at once (the daemon marks it), and
+                // the poller re-fetches the rest promptly — the next
+                // sync reads the new values, not the pre-push ones.
+                if let Ok(mut tunings) = self.cache.tunings.lock() {
+                    tunings.insert(stored.module.clone(), stored.clone());
+                }
+                self.mark_draft_dirty(&stored.module);
+                self.request_slow_refresh();
+                Ok(stored)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
     }
 
+    /// Cached draft status (F5): the slow poller refreshes it ~1 Hz
+    /// (and a successful `set_tuning` / `set_module_enabled` marks
+    /// it dirty at once), so this never touches the socket. No
+    /// cache yet means no draft (the pre-poller fallback).
     fn draft_status(&self) -> Option<DraftStatus> {
-        let got: Result<Option<DraftStatus>, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("draft_status", serde_json::json!({}))
-                .await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        got.unwrap_or(None)
+        self.cache.draft.lock().ok().and_then(|slot| slot.clone())
     }
 
     fn save_draft(&self) -> Result<bool, UserError> {
@@ -409,7 +963,17 @@ impl AppApi for IpcApi {
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(|| IpcError::Protocol("save_draft has no saved".to_string()))
         });
-        got.map_err(|_| Self::ipc_failed())
+        match got {
+            Ok(saved) => {
+                // F5: a saved draft is gone — clear the cached one
+                // at once instead of waiting for the poller.
+                if let Ok(mut slot) = self.cache.draft.lock() {
+                    *slot = None;
+                }
+                Ok(saved)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
     }
 
     fn discard_draft(&self) -> bool {
@@ -422,31 +986,29 @@ impl AppApi for IpcApi {
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(|| IpcError::Protocol("discard_draft has no discarded".to_string()))
         });
-        got.unwrap_or(false)
+        let discarded = got.unwrap_or(false);
+        if discarded {
+            // F5: a discarded draft is gone — clear the cached one.
+            if let Ok(mut slot) = self.cache.draft.lock() {
+                *slot = None;
+            }
+            // A discard also reverts the stored tunings — pull the
+            // next slow cycle forward so the cache follows.
+            self.request_slow_refresh();
+        }
+        discarded
     }
 
+    /// Cached autostart flag (F5): the slow poller refreshes it
+    /// ~1 Hz, so this never touches the socket. No cache yet means
+    /// off (the pre-poller fallback).
     fn autostart(&self) -> bool {
-        let got: Result<bool, IpcError> = self.rt.block_on(async {
-            let value = self.call_async("autostart", serde_json::json!({})).await?;
-            value
-                .get("autostart")
-                .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| IpcError::Protocol("autostart has no autostart".to_string()))
-        });
-        match got {
-            Ok(enabled) => {
-                if let Ok(mut slot) = self.last_autostart.lock() {
-                    *slot = Some(enabled);
-                }
-                enabled
-            }
-            Err(_) => self
-                .last_autostart
-                .lock()
-                .ok()
-                .and_then(|slot| *slot)
-                .unwrap_or(false),
-        }
+        self.cache
+            .autostart
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .unwrap_or(false)
     }
 
     fn set_autostart(&self, enabled: bool) -> Result<bool, UserError> {
@@ -461,7 +1023,7 @@ impl AppApi for IpcApi {
         });
         match got {
             Ok(new_state) => {
-                if let Ok(mut slot) = self.last_autostart.lock() {
+                if let Ok(mut slot) = self.cache.autostart.lock() {
                     *slot = Some(new_state);
                 }
                 Ok(new_state)
@@ -470,49 +1032,29 @@ impl AppApi for IpcApi {
         }
     }
 
+    /// Cached firmware version (F5): the slow poller refreshes it
+    /// ~1 Hz, so this never touches the socket. No cache yet means
+    /// `"Unknown"` (the pre-poller fallback).
     fn firmware_version(&self) -> String {
-        let got: Result<String, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("firmware_version", serde_json::json!({}))
-                .await?;
-            value
-                .get("firmware_version")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    IpcError::Protocol("firmware_version has no firmware_version".to_string())
-                })
-        });
-        got.unwrap_or_else(|_| "Unknown".to_string())
+        self.cache
+            .firmware_version
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| "Unknown".to_string())
     }
 
+    /// Cached output backend (F5): the slow poller refreshes it
+    /// ~1 Hz (and a successful switch stores it at once), so this
+    /// never touches the socket. No cache yet means `"Unknown"` (the
+    /// pre-poller fallback).
     fn output_backend(&self) -> String {
-        let got: Result<String, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("output_backend", serde_json::json!({}))
-                .await?;
-            value
-                .get("output_backend")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    IpcError::Protocol("output_backend has no output_backend".to_string())
-                })
-        });
-        match got {
-            Ok(backend) => {
-                if let Ok(mut slot) = self.last_backend.lock() {
-                    *slot = Some(backend.clone());
-                }
-                backend
-            }
-            Err(_) => self
-                .last_backend
-                .lock()
-                .ok()
-                .and_then(|slot| slot.clone())
-                .unwrap_or_else(|| "Unknown".to_string()),
-        }
+        self.cache
+            .backend
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| "Unknown".to_string())
     }
 
     fn set_output_backend(&self, name: &str) -> Result<String, UserError> {
@@ -540,7 +1082,7 @@ impl AppApi for IpcApi {
         });
         match got {
             Ok(backend) => {
-                if let Ok(mut slot) = self.last_backend.lock() {
+                if let Ok(mut slot) = self.cache.backend.lock() {
                     *slot = Some(backend.clone());
                 }
                 Ok(backend)
@@ -564,14 +1106,16 @@ impl AppApi for IpcApi {
     // v2.0.1 hotfix: profiles / games / learn over the same socket.
     // Lists are empty (never invented) when the daemon cannot be
     // reached; fallible calls surface the IPC failure.
+    /// Cached profiles list (F5): the slow poller refreshes it
+    /// ~1 Hz, so this never touches the socket. No cache yet means
+    /// an empty list — never invented profiles.
     fn list_profiles(&self) -> Vec<ProfileSummary> {
-        let got: Result<Vec<ProfileSummary>, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("list_profiles", serde_json::json!({}))
-                .await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        got.unwrap_or_default()
+        self.cache
+            .profiles
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default()
     }
 
     fn activate_profile(&self, id: &str) -> Result<String, UserError> {
@@ -596,15 +1140,32 @@ impl AppApi for IpcApi {
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(|| IpcError::Protocol("delete_profile has no deleted".to_string()))
         });
-        got.map_err(|_| Self::ipc_failed())
+        match got {
+            Ok(deleted) => {
+                if deleted {
+                    if let Ok(mut slot) = self.cache.profiles.lock() {
+                        if let Some(profiles) = slot.as_mut() {
+                            profiles.retain(|p| p.id != id);
+                        }
+                    }
+                }
+                self.request_slow_refresh();
+                Ok(deleted)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
     }
 
+    /// Cached games list (F5): the slow poller refreshes it ~1 Hz,
+    /// so this never touches the socket. No cache yet means an empty
+    /// list — never invented games.
     fn list_games(&self) -> Vec<GameSummary> {
-        let got: Result<Vec<GameSummary>, IpcError> = self.rt.block_on(async {
-            let value = self.call_async("list_games", serde_json::json!({})).await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        got.unwrap_or_default()
+        self.cache
+            .games
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default()
     }
 
     fn launch_game(&self, id: &str) -> Result<GameSummary, UserError> {
@@ -661,24 +1222,28 @@ impl AppApi for IpcApi {
 
     // v2.0.1 hotfix BACKEND-2: calibration read, vJoy status/install,
     // diagnostics over the same socket.
+    /// Cached calibration read (F5): the slow poller refreshes it
+    /// ~1 Hz, so this never touches the socket. No cache yet (or
+    /// never captured) is an error — the sim / no-daemon behaviour.
     fn calibration(&self) -> Result<CalibrationInfo, UserError> {
-        let got: Result<CalibrationInfo, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("calibration", serde_json::json!({}))
-                .await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        got.map_err(|_| Self::ipc_failed())
+        self.cache
+            .calibration
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or_else(Self::ipc_failed)
     }
 
+    /// Cached vJoy status (F5): the slow poller refreshes it ~1 Hz,
+    /// so this never touches the socket. No cache yet is an error —
+    /// the status is honestly unknown, never a fake "installed".
     fn vjoy_status(&self) -> Result<VjoyStatus, UserError> {
-        let got: Result<VjoyStatus, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("vjoy_status", serde_json::json!({}))
-                .await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        got.map_err(|_| Self::ipc_failed())
+        self.cache
+            .vjoy_status
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or_else(Self::ipc_failed)
     }
 
     fn install_vjoy(&self) -> Result<String, UserError> {
@@ -692,15 +1257,28 @@ impl AppApi for IpcApi {
                 .map(str::to_string)
                 .ok_or_else(|| IpcError::Protocol("install_vjoy has no message".to_string()))
         });
-        got.map_err(|_| Self::ipc_failed())
+        match got {
+            Ok(message) => {
+                // F5: the install changes the driver state — pull
+                // the next slow cycle forward so the Drivers step
+                // converges promptly.
+                self.request_slow_refresh();
+                Ok(message)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
     }
 
+    /// Cached diagnostics (F5): the slow poller refreshes them ~1 Hz,
+    /// so this never touches the socket. No cache yet is an error —
+    /// the drawer shows "—" / "No telemetry yet".
     fn diag_stats(&self) -> Result<DiagStats, UserError> {
-        let got: Result<DiagStats, IpcError> = self.rt.block_on(async {
-            let value = self.call_async("diag_stats", serde_json::json!({})).await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        got.map_err(|_| Self::ipc_failed())
+        self.cache
+            .diag_stats
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or_else(Self::ipc_failed)
     }
 
     // v2.0.2 capture: the daemon-side methods, on this connection
@@ -731,23 +1309,27 @@ impl AppApi for IpcApi {
                 .await?;
             serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
         });
-        got.map_err(|e| Self::api_error(&e))
+        match got {
+            Ok(info) => {
+                // F5: the reset changes the pairing state — pull
+                // the next slow cycle forward.
+                self.request_slow_refresh();
+                Ok(info)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
     }
 
+    /// Cached bindings list (F5): the slow poller refreshes it ~1 Hz,
+    /// so this never touches the socket. No cache yet means an empty
+    /// list (the display defaults stand).
     fn list_bindings(&self) -> Vec<ButtonBinding> {
-        let got: Result<Vec<ButtonBinding>, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("list_bindings", serde_json::json!({}))
-                .await?;
-            value
-                .get("bindings")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|e| IpcError::Protocol(e.to_string()))?
-                .ok_or_else(|| IpcError::Protocol("list_bindings has no bindings".to_string()))
-        });
-        got.unwrap_or_default()
+        self.cache
+            .bindings
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default()
     }
 
     fn set_binding(&self, button: u8, action: &str) -> Result<ButtonBinding, UserError> {
@@ -766,7 +1348,23 @@ impl AppApi for IpcApi {
                 .map_err(|e| IpcError::Protocol(e.to_string()))?
                 .ok_or_else(|| IpcError::Protocol("set_binding has no binding".to_string()))
         });
-        got.map_err(|e| Self::api_error(&e))
+        match got {
+            Ok(binding) => {
+                // F5: the stored binding is the cache now.
+                if let Ok(mut slot) = self.cache.bindings.lock() {
+                    if let Some(bindings) = slot.as_mut() {
+                        if let Some(old) = bindings.iter_mut().find(|b| b.button == button) {
+                            *old = binding.clone();
+                        } else {
+                            bindings.push(binding.clone());
+                        }
+                    }
+                }
+                self.request_slow_refresh();
+                Ok(binding)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
     }
 
     fn clear_binding(&self, button: u8) -> Result<bool, UserError> {
@@ -779,17 +1377,33 @@ impl AppApi for IpcApi {
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(|| IpcError::Protocol("clear_binding has no cleared".to_string()))
         });
-        got.map_err(|e| Self::api_error(&e))
+        match got {
+            Ok(cleared) => {
+                if cleared {
+                    if let Ok(mut slot) = self.cache.bindings.lock() {
+                        if let Some(bindings) = slot.as_mut() {
+                            bindings.retain(|b| b.button != button);
+                        }
+                    }
+                }
+                self.request_slow_refresh();
+                Ok(cleared)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
     }
 
+    /// Cached firmware check (F5): the slow poller refreshes it
+    /// ~1 Hz, so this never touches the socket. No cache yet is an
+    /// error — the Settings firmware line falls back to the live
+    /// version alone.
     fn firmware_check(&self) -> Result<FirmwareCheck, UserError> {
-        let got: Result<FirmwareCheck, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("firmware_check", serde_json::json!({}))
-                .await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        got.map_err(|e| Self::api_error(&e))
+        self.cache
+            .firmware_check
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or_else(Self::ipc_failed)
     }
 
     fn update_firmware(&self) -> Result<FirmwareUpdateStatus, UserError> {
@@ -802,31 +1416,39 @@ impl AppApi for IpcApi {
                 .await?;
             serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
         });
-        got.map_err(|e| Self::api_error(&e))
+        match got {
+            Ok(status) => {
+                // F5: the flash changes the update status — pull
+                // the next slow cycle forward.
+                self.request_slow_refresh();
+                Ok(status)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
     }
 
+    /// Cached firmware-update status (F5): the slow poller
+    /// refreshes it ~1 Hz, so the 1 Hz flash poll never touches
+    /// the socket. No cache yet means the idle default.
     fn firmware_update_status(&self) -> FirmwareUpdateStatus {
-        let got: Result<FirmwareUpdateStatus, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("firmware_update_status", serde_json::json!({}))
-                .await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        got.unwrap_or_default()
+        self.cache
+            .firmware_update_status
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default()
     }
 
+    /// Cached board address (F5): the slow poller refreshes it ~1 Hz,
+    /// so this never touches the socket. No cache yet means the
+    /// default board address (the pre-poller fallback).
     fn board_address(&self) -> String {
-        let got: Result<String, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("board_address", serde_json::json!({}))
-                .await?;
-            value
-                .get("address")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| IpcError::Protocol("board_address has no address".to_string()))
-        });
-        got.unwrap_or_else(|_| "192.168.4.1".to_string())
+        self.cache
+            .board_address
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| "192.168.4.1".to_string())
     }
 
     fn set_board_address(&self, address: &str) -> Result<String, UserError> {
@@ -840,20 +1462,30 @@ impl AppApi for IpcApi {
                 .map(str::to_string)
                 .ok_or_else(|| IpcError::Protocol("set_board_address has no address".to_string()))
         });
-        got.map_err(|e| Self::api_error(&e))
+        match got {
+            Ok(stored) => {
+                if let Ok(mut slot) = self.cache.board_address.lock() {
+                    *slot = Some(stored.clone());
+                }
+                Ok(stored)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
     }
 
+    /// Cached module flag (F5): the slow poller refreshes it ~1 Hz,
+    /// so this never touches the socket. No cache yet means enabled
+    /// (the pre-poller fallback); unknown modules are enabled too.
     fn module_enabled(&self, module: &str) -> bool {
-        let got: Result<bool, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("module_enabled", serde_json::json!({"module": module}))
-                .await?;
-            value
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| IpcError::Protocol("module_enabled has no enabled".to_string()))
-        });
-        got.unwrap_or(true)
+        module_index(module)
+            .and_then(|index| {
+                self.cache
+                    .modules
+                    .lock()
+                    .ok()
+                    .and_then(|modules| modules[index])
+            })
+            .unwrap_or(true)
     }
 
     fn set_module_enabled(&self, module: &str, enabled: bool) -> Result<bool, UserError> {
@@ -867,20 +1499,35 @@ impl AppApi for IpcApi {
             value
                 .get("enabled")
                 .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| IpcError::Protocol("set_module_enabled has no enabled".to_string()))
+                .ok_or_else(|| IpcError::Protocol("module_enabled has no enabled".to_string()))
         });
-        got.map_err(|e| Self::api_error(&e))
+        match got {
+            Ok(stored) => {
+                if let Some(index) = module_index(module) {
+                    if let Ok(mut modules) = self.cache.modules.lock() {
+                        modules[index] = Some(stored);
+                    }
+                }
+                // F5: the daemon marks the draft dirty on a module
+                // toggle — the cached draft follows at once.
+                self.mark_draft_dirty(module);
+                self.request_slow_refresh();
+                Ok(stored)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
     }
 
+    /// Cached auto-pause flag (F5): the slow poller refreshes it
+    /// ~1 Hz, so this never touches the socket. No cache yet means
+    /// not paused (the pre-poller fallback).
     fn auto_pause(&self) -> bool {
-        let got: Result<bool, IpcError> = self.rt.block_on(async {
-            let value = self.call_async("auto_pause", serde_json::json!({})).await?;
-            value
-                .get("paused")
-                .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| IpcError::Protocol("auto_pause has no paused".to_string()))
-        });
-        got.unwrap_or(false)
+        self.cache
+            .auto_pause
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .unwrap_or(false)
     }
 
     fn set_auto_pause(&self, paused: bool) -> Result<bool, UserError> {
@@ -893,20 +1540,27 @@ impl AppApi for IpcApi {
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(|| IpcError::Protocol("set_auto_pause has no paused".to_string()))
         });
-        got.map_err(|e| Self::api_error(&e))
+        match got {
+            Ok(stored) => {
+                if let Ok(mut slot) = self.cache.auto_pause.lock() {
+                    *slot = Some(stored);
+                }
+                Ok(stored)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
     }
 
+    /// Cached keep-in-tray flag (F5): the slow poller refreshes it
+    /// ~1 Hz, so the close handler never touches the socket. No
+    /// cache yet means keep in tray (the pre-poller fallback).
     fn close_to_tray(&self) -> bool {
-        let got: Result<bool, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("close_to_tray", serde_json::json!({}))
-                .await?;
-            value
-                .get("close_to_tray")
-                .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| IpcError::Protocol("close_to_tray has no close_to_tray".to_string()))
-        });
-        got.unwrap_or(true)
+        self.cache
+            .close_to_tray
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .unwrap_or(true)
     }
 
     fn set_close_to_tray(&self, enabled: bool) -> Result<bool, UserError> {
@@ -921,7 +1575,15 @@ impl AppApi for IpcApi {
                     IpcError::Protocol("set_close_to_tray has no close_to_tray".to_string())
                 })
         });
-        got.map_err(|e| Self::api_error(&e))
+        match got {
+            Ok(stored) => {
+                if let Ok(mut slot) = self.cache.close_to_tray.lock() {
+                    *slot = Some(stored);
+                }
+                Ok(stored)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
     }
 
     fn restore_backup(&self) -> Result<String, UserError> {
@@ -946,20 +1608,16 @@ impl AppApi for IpcApi {
         self.profile_two_param_call("link_profile", "id", id, "game_slug", game_slug)
     }
 
+    /// Cached knob actions (F5): the slow poller refreshes them
+    /// ~1 Hz, so this never touches the socket. No cache yet means
+    /// the all-empty default (the pre-poller fallback).
     fn knob_actions(&self) -> [[String; 3]; 2] {
-        let got: Result<[[String; 3]; 2], IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("knob_actions", serde_json::json!({}))
-                .await?;
-            value
-                .get("knobs")
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()
-                .map_err(|e| IpcError::Protocol(e.to_string()))?
-                .ok_or_else(|| IpcError::Protocol("knob_actions has no knobs".to_string()))
-        });
-        got.unwrap_or_default()
+        self.cache
+            .knobs
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default()
     }
 
     fn set_knob_action(&self, knob: u8, row: u8, action: &str) -> Result<(), UserError> {
@@ -971,7 +1629,24 @@ impl AppApi for IpcApi {
             .await?;
             Ok(())
         });
-        got.map_err(|e| Self::api_error(&e))
+        match got {
+            Ok(()) => {
+                // F5: the stored action is the cache now.
+                if let Ok(mut slot) = self.cache.knobs.lock() {
+                    if let Some(knobs) = slot.as_mut() {
+                        if let (Some(k), Some(r)) = (
+                            usize::try_from(knob).ok().filter(|k| *k < 2),
+                            usize::try_from(row).ok().filter(|r| *r < 3),
+                        ) {
+                            knobs[k][r] = action.to_string();
+                        }
+                    }
+                }
+                self.request_slow_refresh();
+                Ok(())
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
     }
 }
 
@@ -988,7 +1663,15 @@ impl IpcApi {
                 .and_then(|mv| u16::try_from(mv).ok())
                 .ok_or_else(|| IpcError::Protocol(format!("{method} has no mv")))
         });
-        got.map_err(|e| Self::capture_error(&e))
+        match got {
+            Ok(mv) => {
+                // F5: a capture changes the calibration — pull the
+                // next slow cycle forward so the mV labels converge.
+                self.request_slow_refresh();
+                Ok(mv)
+            }
+            Err(e) => Err(Self::capture_error(&e)),
+        }
     }
 
     /// Build the [`UserError`] for a failed capture: the daemon's
@@ -1059,7 +1742,15 @@ impl IpcApi {
                 .map(str::to_string)
                 .ok_or_else(|| IpcError::Protocol(format!("{method} has no name")))
         });
-        got.map_err(|e| Self::api_error(&e))
+        match got {
+            // F5: a rename / link changes the profiles list — pull
+            // the next slow cycle forward.
+            Ok(name) => {
+                self.request_slow_refresh();
+                Ok(name)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
     }
 
     /// Shared `{"name": …}` profile call (`activate` / `create` /
@@ -1085,7 +1776,15 @@ impl IpcApi {
                 .map(str::to_string)
                 .ok_or_else(|| IpcError::Protocol(format!("{method} has no name")))
         });
-        got.map_err(|_| Self::ipc_failed())
+        match got {
+            // F5: an activate / create / duplicate changes the
+            // profiles list — pull the next slow cycle forward.
+            Ok(name) => {
+                self.request_slow_refresh();
+                Ok(name)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
     }
 
     /// Shared `{"id": …}` game call: one game id in, its
@@ -1097,7 +1796,22 @@ impl IpcApi {
                 .await?;
             serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
         });
-        got.map_err(|_| Self::ipc_failed())
+        match got {
+            Ok(summary) => {
+                // F5: a launch / stop changes the games list — the
+                // returned summary is the cache now.
+                if let Ok(mut slot) = self.cache.games.lock() {
+                    if let Some(games) = slot.as_mut() {
+                        if let Some(old) = games.iter_mut().find(|g| g.id == summary.id) {
+                            *old = summary.clone();
+                        }
+                    }
+                }
+                self.request_slow_refresh();
+                Ok(summary)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
     }
 
     /// Shared no-param learn call: `{"learning": bool}` out.
@@ -1144,6 +1858,7 @@ mod tests {
     use super::*;
     use crate::sim_api::SimApi;
     use rsh_ipc::IpcServer;
+    use std::path::PathBuf;
     #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::broadcast;
@@ -1208,6 +1923,15 @@ mod tests {
         ready_rx.recv().expect("server bound");
         let client = IpcApi::connect(&sock).expect("connect");
         assert!(client.ping());
+        // F5: the slow values (autostart, backend, …) arrive on
+        // the slow poller's first cycle — wait for it instead of
+        // asserting cold-cache fallbacks.
+        let mut waited = 0;
+        while !client.slow_filled() && waited < 100 {
+            std::thread::sleep(Duration::from_millis(50));
+            waited += 1;
+        }
+        assert!(client.slow_filled(), "slow cache should fill");
         // Neutral default before any edit.
         let got = client.get_tuning("steering");
         assert_eq!(got.module, "steering");
@@ -1229,9 +1953,23 @@ mod tests {
         let mut bad = TuningSettings::neutral("steering");
         bad.curve = 9.0;
         assert!(client.set_tuning(&bad).is_err());
-        // Discard reverts to neutral.
+        // Discard reverts to neutral — the daemon clears its
+        // tunings, and the discard pulls a slow refresh forward,
+        // so wait for the cache to follow instead of asserting a
+        // stale pre-discard record.
         client.set_tuning(&upd).expect("edit again");
+        let generation = client.slow_generation();
         assert!(client.discard_draft());
+        let mut waited = 0;
+        while client.slow_generation() == generation && waited < 100 {
+            std::thread::sleep(Duration::from_millis(50));
+            waited += 1;
+        }
+        assert_ne!(
+            client.slow_generation(),
+            generation,
+            "slow cache should refresh after discard"
+        );
         assert_eq!(client.get_tuning("steering").deadzone, 0.0);
         // v2.0.1 settings methods over the same socket.
         assert!(client.autostart());
@@ -1268,6 +2006,178 @@ mod tests {
         assert!(client.cancel_learn().is_err());
         assert!(!client.is_learning());
         assert_eq!(client.take_learned_button(), None);
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spin up a real Unix-socket `IpcServer` over `SimApi` (the
+    /// daemon stand-in) and connect a real `IpcApi` to it (F5
+    /// tests). Returns the client, the temp dir, the server thread,
+    /// and the held pipe guard — drop the client, join the thread,
+    /// then remove the dir. Plain `#[test]`: same runtime rules as
+    /// `tuning_round_trip_over_real_socket`.
+    #[cfg(unix)]
+    fn live_client() -> (
+        Arc<IpcApi>,
+        PathBuf,
+        std::thread::JoinHandle<()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-f5-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let (tx, _rx) = broadcast::channel(64);
+        let server = Arc::new(IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let client = IpcApi::connect(&sock).expect("connect");
+        (client, dir, handle, guard)
+    }
+
+    /// Wait up to ~5 s for a condition on the live client (F5
+    /// tests): the pollers fill asynchronously, so tests wait
+    /// instead of sleeping a fixed delay.
+    #[cfg(unix)]
+    fn wait_for(client: &IpcApi, mut done: impl FnMut(&IpcApi) -> bool) -> bool {
+        for _ in 0..100 {
+            if done(client) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        done(client)
+    }
+
+    /// F5: the slow poller fills every slow slot with the daemon's
+    /// values (~1 Hz) — the same values the old per-call reads
+    /// returned, now without any UI-thread round-trip.
+    #[test]
+    #[cfg(unix)]
+    fn slow_cache_fills_with_daemon_values() {
+        let (client, dir, handle, _guard) = live_client();
+        assert!(
+            wait_for(&client, |c| c.slow_filled()),
+            "slow cache should fill"
+        );
+        assert!(
+            client.slow_generation() > 0,
+            "a completed cycle bumps the generation"
+        );
+        assert_eq!(client.version(), app_version());
+        assert_eq!(client.firmware_version(), "Unknown");
+        assert_eq!(client.output_backend(), "vJoy");
+        assert!(client.autostart());
+        assert_eq!(client.board_address(), "192.168.4.1");
+        assert!(client.close_to_tray());
+        assert!(!client.auto_pause());
+        for module in ["handbrake", "shifter", "horn", "led", "steering"] {
+            assert!(client.module_enabled(module), "{module} enabled");
+        }
+        let check = client.firmware_check().expect("sim firmware check");
+        assert_eq!(check.board_version, "Unknown");
+        assert!(!check.update_available);
+        assert!(client.calibration().is_err());
+        assert!(client.vjoy_status().is_err());
+        assert!(client.diag_stats().is_err());
+        assert_eq!(client.list_profiles().len(), 0);
+        assert_eq!(client.list_games().len(), 0);
+        assert_eq!(client.list_bindings().len(), 0);
+        assert_eq!(client.get_tuning("brake").module, "brake");
+        assert_eq!(client.pairing_status().seconds_left, 0);
+        assert!(!client.firmware_update_status().running);
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F5/F6: a successful write updates its cache slot at once —
+    /// no waiting for the next slow cycle. Proves the write-through
+    /// half of the cache (the read half is the test above).
+    #[test]
+    #[cfg(unix)]
+    fn set_tuning_updates_tuning_cache_at_once() {
+        let (client, dir, handle, _guard) = live_client();
+        // Deliberately no fill wait: the write must update the
+        // cache by itself.
+        let mut upd = TuningSettings::neutral("brake");
+        upd.deadzone = 7.0;
+        let stored = client.set_tuning(&upd).expect("set_tuning");
+        assert_eq!(stored.deadzone, 7.0);
+        assert_eq!(client.get_tuning("brake").deadzone, 7.0);
+        assert!(client.draft_status().is_some_and(|s| s.dirty));
+        assert!(client.save_draft().expect("save"));
+        assert!(client.draft_status().is_none());
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F5: `clear_cached_state` empties the slow slots too (no
+    /// stale firmware / profiles / tunings survive a death), and
+    /// the pollers refill them — the fast one clears `link_dead`
+    /// on its next good round, then the slow one refills.
+    #[test]
+    #[cfg(unix)]
+    fn clear_cached_state_clears_slow_cache() {
+        let (client, dir, handle, _guard) = live_client();
+        assert!(
+            wait_for(&client, |c| c.slow_filled()),
+            "slow cache should fill"
+        );
+        assert_eq!(client.output_backend(), "vJoy");
+        client.clear_cached_state();
+        assert!(!client.slow_filled(), "clear must reset the filled flag");
+        assert_eq!(client.output_backend(), "Unknown");
+        assert_eq!(client.firmware_version(), "Unknown");
+        assert!(!client.autostart());
+        assert_eq!(client.get_tuning("steering").curve, 1.0);
+        assert_eq!(client.list_profiles().len(), 0);
+        assert!(
+            wait_for(&client, |c| c.slow_filled()),
+            "slow cache should refill"
+        );
+        assert_eq!(client.output_backend(), "vJoy");
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F5: the reconnect seed fetch runs its own synchronous slow
+    /// refresh (no fill wait needed) and reports the session
+    /// `connect` verdict the wizard follows.
+    #[test]
+    #[cfg(unix)]
+    fn live_seed_fetch_fills_cache_and_reports_connect() {
+        let (client, dir, handle, _guard) = live_client();
+        let seed = LiveSeed::fetch(&client, ApiTransport::Wifi);
+        assert!(seed.connect.is_ok(), "sim connect succeeds");
+        assert!(seed.connection_active, "sim session is Active");
+        assert_eq!(seed.backend, "vJoy");
+        assert!(seed.autostart);
+        assert_eq!(seed.firmware_version, "Unknown");
+        assert_eq!(seed.steering.module, "steering");
+        assert_eq!(seed.version, app_version());
+        assert!(client.slow_filled(), "seed fetch fills the slow cache");
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);

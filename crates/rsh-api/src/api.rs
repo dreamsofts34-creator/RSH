@@ -528,6 +528,17 @@ pub trait AppApi: Send + Sync {
         }
     }
 
+    /// Slow-cache generation (F5, v2.0.3): bumps whenever the
+    /// implementation's background cache refreshes a slow value.
+    /// The UI re-syncs the pages when it changes — that is how a
+    /// daemon-side change reaches the UI without any UI-thread IPC.
+    ///
+    /// Default: `0` forever — implementations without a slow cache
+    /// (sim, stubs, the daemon itself) never trigger a resync.
+    fn cache_generation(&self) -> u64 {
+        0
+    }
+
     /// Whether auto-profile switching is paused (M6, v2.0.2).
     /// Default: not paused — only the daemon overrides it.
     fn auto_pause(&self) -> bool {

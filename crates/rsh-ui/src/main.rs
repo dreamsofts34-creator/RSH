@@ -652,6 +652,31 @@ enum JobKind {
     RawAvailable,
     /// Pairing reset.
     ResetPairing,
+    /// Slider drag flush (F6, v2.0.3): `set_tuning` runs on a job
+    /// thread, never on the UI thread.
+    TuningPush,
+    /// Profile operations (F6, v2.0.3): activate / create /
+    /// duplicate / delete / rename / link / save / discard.
+    ProfileOp,
+    /// Button / knob mapping (F6, v2.0.3): set / clear binding,
+    /// set knob action.
+    BindingOp,
+    /// Capture (F6, v2.0.3): centre / pedal min-max.
+    CaptureOp,
+    /// Learn (F6, v2.0.3): start / cancel / poll.
+    LearnOp,
+    /// Pairing (F6, v2.0.3): begin pairing, wizard connect.
+    PairingOp,
+    /// Games (F6, v2.0.3): launch / stop / refresh.
+    GameOp,
+    /// Settings (F6, v2.0.3): autostart / backup / restore /
+    /// output toggle / auto-pause / board address / keep-in-tray /
+    /// module enable.
+    SettingsOp,
+    /// Reconnect seed (F5, v2.0.3): the slow-cache seed fetch
+    /// (`LiveSeed::fetch`) runs on a job thread, then applies on
+    /// the UI thread.
+    ReconnectSeed,
 }
 
 impl JobKind {
@@ -668,6 +693,23 @@ impl JobKind {
             | JobKind::FirmwareCheck
             | JobKind::RawAvailable
             | JobKind::ResetPairing => Duration::from_secs(5),
+            // F6: a tuning push is one `set_tuning` round-trip.
+            JobKind::TuningPush => Duration::from_secs(5),
+            // F6: profile / binding / capture / learn / pairing /
+            // game ops are a couple of round-trips at most.
+            JobKind::ProfileOp
+            | JobKind::BindingOp
+            | JobKind::CaptureOp
+            | JobKind::LearnOp
+            | JobKind::PairingOp
+            | JobKind::GameOp => Duration::from_secs(5),
+            // F6: settings ops can cross a UAC prompt
+            // (HIDMaestro enable) — same bound the old callers
+            // tolerated, but now with a visible timeout.
+            JobKind::SettingsOp => Duration::from_secs(10),
+            // F5: the seed fetch is ~35 round-trips on a live
+            // daemon; a dead one fails fast per call.
+            JobKind::ReconnectSeed => Duration::from_secs(15),
         }
     }
 
@@ -683,6 +725,17 @@ impl JobKind {
             JobKind::FirmwareUpdate => 4,
             JobKind::RawAvailable => 5,
             JobKind::ResetPairing => 6,
+            // F5/F6: a settings or seed job never hides an
+            // in-flight reconnect / backend switch.
+            JobKind::TuningPush => 7,
+            JobKind::ProfileOp => 8,
+            JobKind::BindingOp => 9,
+            JobKind::CaptureOp => 10,
+            JobKind::LearnOp => 11,
+            JobKind::PairingOp => 12,
+            JobKind::GameOp => 13,
+            JobKind::SettingsOp => 14,
+            JobKind::ReconnectSeed => 15,
         }
     }
 }
@@ -851,7 +904,56 @@ enum JobDone {
         was_armed: bool,
         result: Result<PairingInfo, UserError>,
     },
+    /// Reconnect seed finished (F5): the live API plus its fetched
+    /// seed — applied on the UI thread by `apply_reconnect_seed`.
+    ReconnectSeed {
+        api: Arc<IpcApi>,
+        seed: crate::ipc_api::LiveSeed,
+    },
+    /// Generic job finished (F6): `id` routes the result to the
+    /// `PendingApply` the starter registered; `result` is the job
+    /// thread's answer, applied on the UI thread.
+    Generic { id: u64, result: JobResult },
 }
+
+/// One background-job answer (F6): the job thread's work returns
+/// one of these; the UI-thread `apply` closure turns it into
+/// notifications / re-syncs / property writes. The payloads are
+/// the API's own types, so no result is re-interpreted here.
+enum JobResult {
+    /// A `set_tuning` push: the stored record, or the error.
+    Tuning(Result<TuningSettings, UserError>),
+    /// A yes/no op (module enable, output toggle, auto-pause,
+    /// autostart, keep-in-tray, save / discard draft, …): the new
+    /// state, or the error.
+    Bool(Result<bool, UserError>),
+    /// A text op (board address, backend, profile id, …): the new
+    /// value, or the error.
+    Text(Result<String, UserError>),
+    /// A no-value op (backup, restore, …): success or the error.
+    Unit(Result<(), UserError>),
+    /// A pairing op: the pairing state, or the error.
+    Pairing(Result<PairingInfo, UserError>),
+    /// A game op: `true` = the game is now running, or the error.
+    Game(Result<bool, UserError>),
+    /// A capture op: the captured mV, or the error.
+    Capture(Result<u16, UserError>),
+    /// A capture op that needs two values (centre + pedal): the
+    /// captured centre mV plus the pedal's min/max, or the error.
+    CapturePair(Result<(u16, u16, u16), UserError>),
+    /// A learn poll: the learned button, or `None` when nothing was
+    /// learned (yet).
+    LearnPoll(Option<u8>),
+    /// A refresh op (profiles / games): the fresh lists, or the
+    /// error.
+    Refresh(Result<(Vec<ProfileSummary>, Vec<GameSummary>), UserError>),
+}
+
+/// A pending generic-job apply (F6): registered by
+/// `run_generic_job` when a job starts, run once on the UI thread
+/// when its `JobDone::Generic` arrives (or dropped when the job
+/// times out — the late result is then ignored).
+type PendingApply = Box<dyn FnOnce(&Ctx, &MainWindow, JobResult)>;
 
 /// Shared frame context for callbacks: the swappable API state,
 /// tuning state, the unsaved flag, the notification center, and the
@@ -930,6 +1032,14 @@ struct Ctx {
     /// The frame timer times a stale entry out with a visible error
     /// — loading is never infinite (B5).
     busy_jobs: Rc<RefCell<HashMap<JobKind, (String, Instant)>>>,
+    /// Next generic-job id (F6): handed out by `run_generic_job`,
+    /// routed back by `JobDone::Generic`.
+    next_job_id: Rc<Cell<u64>>,
+    /// Pending generic-job applies (F6): id → (kind, apply). The
+    /// apply runs once on the UI thread when the job's result
+    /// arrives; a timed-out job's entry is dropped, so its late
+    /// result is ignored.
+    pending_applies: Rc<RefCell<HashMap<u64, (JobKind, PendingApply)>>>,
     /// When the current `connecting` state started (A9): the frame
     /// timer clears a `connecting` older than 15 s with a message
     /// instead of leaving "Connecting…" forever.
@@ -1327,6 +1437,12 @@ impl Ctx {
     /// record updates and the profile is marked unsaved; on failure
     /// the error is shown (never silent) and the local state stays —
     /// the push is retried on the next edit.
+    /// Flush a due steering push (frame timer, L4/F6): the push
+    /// runs on a [`JobKind::TuningPush`] job thread — a slow daemon
+    /// can no longer freeze the UI for ~500 ms per drag flush.
+    /// The due flag clears only when the job actually starts (a
+    /// busy kind retries on the next tick); the slider snaps back
+    /// to the stored value on failure, never lies.
     fn flush_steering_push(&self, win: &MainWindow) {
         let Some(due) = self.steer_push_due.get() else {
             return;
@@ -1334,21 +1450,34 @@ impl Ctx {
         if Instant::now() < due {
             return;
         }
-        self.steer_push_due.set(None);
         let settings = {
             let tuning = self.tuning.borrow();
             let base = self.steering.borrow();
             tuning.to_settings(&base)
         };
-        match self.api().set_tuning(&settings) {
-            Ok(stored) => {
-                *self.steering.borrow_mut() = stored;
-                self.unsaved.set(true);
-            }
-            Err(e) => {
-                self.notify_error(win, "Steering", &e);
-                eprintln!("RSH-UI set_tuning failed: {} ({})", e.code, e.title);
-            }
+        let started = self.run_generic_job(
+            win,
+            JobKind::TuningPush,
+            "Saving steering…",
+            move |api| JobResult::Tuning(api.set_tuning(&settings)),
+            |ctx, win, result| {
+                let JobResult::Tuning(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(stored) => {
+                        *ctx.steering.borrow_mut() = stored;
+                        ctx.unsaved.set(true);
+                    }
+                    Err(e) => {
+                        ctx.notify_error(win, "Steering", &e);
+                        eprintln!("RSH-UI set_tuning failed: {} ({})", e.code, e.title);
+                    }
+                }
+            },
+        );
+        if started {
+            self.steer_push_due.set(None);
         }
     }
 
@@ -1367,11 +1496,15 @@ impl Ctx {
         ));
     }
 
-    /// Flush a due field push (frame timer, M-7): read the module's
-    /// stored record, apply the queued field, push it. On success the
-    /// page re-syncs from the daemon; on failure the error is shown
-    /// and the page re-syncs anyway (the slider snaps back to the
-    /// stored value instead of lying).
+    /// Flush a due field push (frame timer, M-7/F6): read the
+    /// module's stored record, apply the queued field, push it —
+    /// the whole push runs on a [`JobKind::TuningPush`] job thread,
+    /// so a drag flush can no longer freeze the UI for ~5 s on a
+    /// slow daemon. The pending flag clears only when the job
+    /// actually starts; on success the page re-syncs from the
+    /// daemon, on failure the error is shown and the page re-syncs
+    /// anyway (the slider snaps back to the stored value instead
+    /// of lying).
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn flush_field_push(&self, win: &MainWindow) {
         let Some((pending, due)) = *self.pending_field.borrow() else {
@@ -1380,31 +1513,49 @@ impl Ctx {
         if Instant::now() < due {
             return;
         }
-        *self.pending_field.borrow_mut() = None;
-        let api = self.api();
-        let mut record = api.get_tuning(pending.module);
-        match pending.kind {
-            FieldKind::Deadzone => record.deadzone = pending.value,
-            FieldKind::Bite => record.bite_point = Some(pending.value),
-            FieldKind::Brightness => record.led_brightness = Some(pending.value.round() as u8),
+        let module = pending.module;
+        let kind = pending.kind;
+        let value = pending.value;
+        let started = self.run_generic_job(
+            win,
+            JobKind::TuningPush,
+            "Saving tuning…",
+            move |api| {
+                // `get_tuning` is a cache read on the live API
+                // (F5) — cheap even on the job thread.
+                let mut record = api.get_tuning(module);
+                match kind {
+                    FieldKind::Deadzone => record.deadzone = value,
+                    FieldKind::Bite => record.bite_point = Some(value),
+                    FieldKind::Brightness => record.led_brightness = Some(value.round() as u8),
+                }
+                JobResult::Tuning(api.set_tuning(&record))
+            },
+            move |ctx, win, result| {
+                let JobResult::Tuning(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(_) => {
+                        ctx.unsaved.set(true);
+                    }
+                    Err(e) => {
+                        ctx.notify_error(win, "Tuning", &e);
+                        eprintln!(
+                            "RSH-UI field push {module} failed: {} ({})",
+                            e.code, e.title
+                        );
+                    }
+                }
+                match module {
+                    "throttle" | "brake" | "clutch" => ctx.sync_pedals(win),
+                    _ => ctx.sync_extras(win),
+                }
+            },
+        );
+        if started {
+            *self.pending_field.borrow_mut() = None;
         }
-        match api.set_tuning(&record) {
-            Ok(_) => {
-                self.unsaved.set(true);
-            }
-            Err(e) => {
-                self.notify_error(win, "Tuning", &e);
-                eprintln!(
-                    "RSH-UI field push {} failed: {} ({})",
-                    pending.module, e.code, e.title
-                );
-            }
-        }
-        match pending.module {
-            "throttle" | "brake" | "clutch" => self.sync_pedals(win),
-            _ => self.sync_extras(win),
-        }
-        self.refresh(win, 0);
     }
 
     /// Push a VISIBLE notification and sync the drawer model. Every
@@ -1576,6 +1727,47 @@ impl Ctx {
         true
     }
 
+    /// Start a generic background job (F6): `work` runs on a job
+    /// thread (it may call the API — never the UI thread), `apply`
+    /// runs once on the UI thread with the result. `apply` may hold
+    /// `Rc` state and window props — it never leaves the UI thread.
+    /// A second job of the same kind is ignored (same rule as
+    /// [`Ctx::run_job`]); the apply is dropped when the job times
+    /// out, so a late result never applies.
+    fn run_generic_job(
+        &self,
+        win: &MainWindow,
+        kind: JobKind,
+        label: &str,
+        work: impl FnOnce(Arc<dyn AppApi>) -> JobResult + Send + 'static,
+        apply: impl FnOnce(&Ctx, &MainWindow, JobResult) + 'static,
+    ) -> bool {
+        if self.busy_jobs.borrow().contains_key(&kind) {
+            eprintln!("RSH-UI job {kind:?} already running — ignoring duplicate start");
+            return false;
+        }
+        let id = self.next_job_id.get();
+        self.next_job_id.set(id + 1);
+        self.pending_applies
+            .borrow_mut()
+            .insert(id, (kind, Box::new(apply)));
+        self.busy_jobs
+            .borrow_mut()
+            .insert(kind, (label.to_string(), Instant::now()));
+        self.sync_busy(win);
+        let api = self.api();
+        let tx = self.job_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name(format!("rsh-job-{kind:?}"))
+            .spawn(move || {
+                let result = work(api);
+                if tx.send(JobDone::Generic { id, result }).is_err() {
+                    eprintln!("RSH-UI job {kind:?} finished after the UI went away");
+                }
+            });
+        true
+    }
+
     /// Drain finished jobs on the UI thread (frame timer): each
     /// result is applied (notify / revert / re-sync) exactly once.
     fn drain_jobs(&self, win: &MainWindow) {
@@ -1628,6 +1820,26 @@ impl Ctx {
                         self.refresh(win, 0);
                     }
                 }
+            }
+            JobDone::ReconnectSeed { api, seed } => {
+                // F5: the seed fetch finished on its job thread —
+                // apply it exactly like the old `reconnect_to_live`,
+                // but from cached values only.
+                self.reconnect_in_flight.set(false);
+                self.busy_jobs.borrow_mut().remove(&JobKind::ReconnectSeed);
+                self.apply_reconnect_seed(win, api, seed);
+            }
+            JobDone::Generic { id, result } => {
+                // F6: a generic job finished — run its registered
+                // apply once. A missing entry means the job timed
+                // out (the timeout already notified) — ignore the
+                // late result.
+                let Some((kind, apply)) = self.pending_applies.borrow_mut().remove(&id) else {
+                    return;
+                };
+                self.busy_jobs.borrow_mut().remove(&kind);
+                apply(self, win, result);
+                self.refresh(win, 0);
             }
             JobDone::Transport { index, result } => {
                 if self
@@ -1829,6 +2041,11 @@ impl Ctx {
         }
         for (kind, label) in timed_out {
             self.busy_jobs.borrow_mut().remove(&kind);
+            // F6: drop the timed-out kind's pending applies — the
+            // late result must never apply.
+            self.pending_applies
+                .borrow_mut()
+                .retain(|_, (k, _)| *k != kind);
             if kind == JobKind::Reconnect {
                 self.reconnect_in_flight.set(false);
                 // F3: a timed-out manual retry counts as a failed
@@ -1836,6 +2053,16 @@ impl Ctx {
                 // late job result, if any, is ignored by
                 // `apply_job_done`, so this is the only accounting).
                 self.spawn_budget.record_manual_failure();
+                {
+                    let mut state = self.state.borrow_mut();
+                    state.connecting = false;
+                }
+                self.connecting_since.set(None);
+            }
+            if kind == JobKind::ReconnectSeed {
+                // F5: the seed fetch never resolved — same cleanup
+                // as a timed-out Reconnect.
+                self.reconnect_in_flight.set(false);
                 {
                     let mut state = self.state.borrow_mut();
                     state.connecting = false;
@@ -2472,9 +2699,10 @@ impl Ctx {
     }
 
     /// Swap a (re)connected daemon in (B2/H1): the shared path for
-    /// the Reconnect button and the health monitor's re-probe —
-    /// seed the sliders from the daemon, reconnect the session on
-    /// the transport it was on, and re-sync every page. A duplicate
+    /// the Reconnect button and the health monitor's re-probe.
+    /// F5: the fetch runs on a background job — this entry only
+    /// dedupes and starts it; [`Ctx::apply_reconnect_seed`] does
+    /// the UI-thread apply once the seed arrives. A duplicate
     /// delivery of the link that is already live is a no-op.
     fn reconnect_to_live(&self, win: &MainWindow, live_api: Arc<IpcApi>) {
         {
@@ -2487,7 +2715,35 @@ impl Ctx {
                 }
             }
         }
+        // A second seed fetch while one is in flight is ignored —
+        // the in-flight one applies when it lands.
+        if self.busy_jobs.borrow().contains_key(&JobKind::ReconnectSeed) {
+            return;
+        }
         let transport = self.last_transport();
+        self.run_job(
+            win,
+            JobKind::ReconnectSeed,
+            "Reconnecting…",
+            move || {
+                let seed = crate::ipc_api::LiveSeed::fetch(&live_api, transport);
+                JobDone::ReconnectSeed {
+                    api: live_api,
+                    seed,
+                }
+            },
+        );
+    }
+
+    /// Apply a finished reconnect seed (F5, UI thread): the old
+    /// `reconnect_to_live` body, but every value comes from the
+    /// seed or the slow cache — no IPC round-trip runs here.
+    fn apply_reconnect_seed(
+        &self,
+        win: &MainWindow,
+        live_api: Arc<IpcApi>,
+        seed: crate::ipc_api::LiveSeed,
+    ) {
         self.swap_to_live(live_api);
         win.set_daemon_live(true);
         // FC2: live again — the daemon-error banner clears.
@@ -2495,18 +2751,43 @@ impl Ctx {
         // Seed the controller + autostart switches from the daemon
         // (the startup seeding cannot run — the daemon was not
         // there when the window opened).
-        if self.api().output_backend() == "HIDMaestro" {
+        if seed.backend == "HIDMaestro" {
             win.set_controller(0);
         } else {
             win.set_controller(1);
         }
-        win.set_autostart_enabled(self.api().autostart());
+        win.set_autostart_enabled(seed.autostart);
         // B1 wiring: bindings + knobs + auto-pause + module on/off +
         // the firmware check cache all seed from the daemon now that
-        // it is live (at startup the sim has none of these).
+        // it is live (at startup the sim has none of these). All
+        // cache reads now (F5).
         self.seed_live_state(win);
-        self.notify(win, "Connection", "RSH connected", "Live data is back.");
-        if let Err(e) = self.api().connect(transport) {
+        // F12 (v2.0.3): a flap reconnect stays silent — the
+        // "RSH connected" notify is noise when the daemon died
+        // and came back within seconds (`swap_to_live` armed
+        // `suppress_connected_notify`). A non-flap reconnect that
+        // ends a burst folds the count in ("flapped ×N before
+        // stabilising") and resets it — the burst is reported
+        // exactly once, here, not again by the next `mark_dead`.
+        // A stale count (last flap > `FLAP_COUNT_STALE` ago) is
+        // cleared without folding: it belongs to an old burst.
+        if !self.suppress_connected_notify.get() {
+            let n = self.flap_count.get();
+            let recent = self
+                .last_flap_at
+                .get()
+                .is_some_and(|t| t.elapsed() < FLAP_COUNT_STALE);
+            let body = if n > 0 && recent {
+                format!("Live data is back — the connection flapped ×{n} before stabilising.")
+            } else {
+                "Live data is back.".to_string()
+            };
+            self.notify(win, "Connection", "RSH connected", &body);
+            self.flap_count.set(0);
+        }
+        // The session `connect` already ran on the seed job's
+        // thread — report its verdict here.
+        if let Err(e) = seed.connect {
             self.notify(win, "Connection", "Reconnect failed", &e.title);
             eprintln!("RSH-UI reconnect failed: {} ({})", e.code, e.title);
         }
@@ -2514,7 +2795,7 @@ impl Ctx {
         // (re)connect seeds the wizard the same way startup used to
         // (TR §3c: Active session = already paired).
         {
-            let ps = self.api().pairing_status();
+            let ps = &seed.pairing;
             // H-5: the wizard's reset branch (board already paired
             // with another key) only shows when the daemon reports a
             // replacement is required.
@@ -2528,7 +2809,7 @@ impl Ctx {
                 );
                 Ctx::sync_pair_ring(win);
             }
-            if matches!(self.api().connection().state, ConnectionState::Active) {
+            if seed.connection_active {
                 win.set_setup_paired(true);
             }
         }
@@ -2544,31 +2825,44 @@ impl Ctx {
 
     /// Apply one pedal-tuning edit (deadzone / bite / feel curve) to
     /// the named module: read the stored record, patch it, push it.
-    /// Success marks the profile unsaved and re-syncs the pedal
-    /// page; failure shows an error notification (never silent).
+    /// F6: the push runs on a [`JobKind::TuningPush`] job thread —
+    /// the UI never blocks on `set_tuning`. The record is patched
+    /// here (the read is a cache read, cheap); only the owned
+    /// record crosses into the job. Success marks the profile
+    /// unsaved and re-syncs the pedal page; failure shows an error
+    /// notification (never silent).
     fn set_pedal_tuning(
         &self,
         win: &MainWindow,
-        module: &str,
+        module: &'static str,
         update: impl FnOnce(&mut TuningSettings),
     ) {
-        let api = self.api();
-        let mut record = api.get_tuning(module);
+        let mut record = self.api().get_tuning(module);
         update(&mut record);
-        match api.set_tuning(&record) {
-            Ok(_) => {
-                self.unsaved.set(true);
-                self.sync_pedals(win);
-                self.refresh(win, 0);
-            }
-            Err(e) => {
-                self.notify(win, "Pedals", "Couldn't save pedal tuning", &e.title);
-                eprintln!(
-                    "RSH-UI pedal set_tuning {module} failed: {} ({})",
-                    e.code, e.title
-                );
-            }
-        }
+        self.run_generic_job(
+            win,
+            JobKind::TuningPush,
+            "Saving pedal tuning…",
+            move |api| JobResult::Tuning(api.set_tuning(&record)),
+            move |ctx, win, result| {
+                let JobResult::Tuning(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(_) => {
+                        ctx.unsaved.set(true);
+                        ctx.sync_pedals(win);
+                    }
+                    Err(e) => {
+                        ctx.notify(win, "Pedals", "Couldn't save pedal tuning", &e.title);
+                        eprintln!(
+                            "RSH-UI pedal set_tuning {module} failed: {} ({})",
+                            e.code, e.title
+                        );
+                    }
+                }
+            },
+        );
     }
 
     /// Apply one tuning edit to a non-pedal module (handbrake / LED /
@@ -2577,26 +2871,35 @@ impl Ctx {
     fn set_module_tuning(
         &self,
         win: &MainWindow,
-        module: &str,
+        module: &'static str,
         update: impl FnOnce(&mut TuningSettings),
     ) {
-        let api = self.api();
-        let mut record = api.get_tuning(module);
+        let mut record = self.api().get_tuning(module);
         update(&mut record);
-        match api.set_tuning(&record) {
-            Ok(_) => {
-                self.unsaved.set(true);
-                self.sync_extras(win);
-                self.refresh(win, 0);
-            }
-            Err(e) => {
-                self.notify(win, "Extras", "Couldn't save setting", &e.title);
-                eprintln!(
-                    "RSH-UI extras set_tuning {module} failed: {} ({})",
-                    e.code, e.title
-                );
-            }
-        }
+        self.run_generic_job(
+            win,
+            JobKind::TuningPush,
+            "Saving setting…",
+            move |api| JobResult::Tuning(api.set_tuning(&record)),
+            move |ctx, win, result| {
+                let JobResult::Tuning(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(_) => {
+                        ctx.unsaved.set(true);
+                        ctx.sync_extras(win);
+                    }
+                    Err(e) => {
+                        ctx.notify(win, "Extras", "Couldn't save setting", &e.title);
+                        eprintln!(
+                            "RSH-UI extras set_tuning {module} failed: {} ({})",
+                            e.code, e.title
+                        );
+                    }
+                }
+            },
+        );
     }
 
     /// Refresh the Pedals page from the stored records (A1/A2):
@@ -6091,6 +6394,9 @@ fn main() -> Result<(), slint::PlatformError> {
         job_tx,
         job_rx: Rc::new(RefCell::new(job_rx)),
         busy_jobs: Rc::new(RefCell::new(HashMap::new())),
+        // F6: generic-job registry.
+        next_job_id: Rc::new(Cell::new(0)),
+        pending_applies: Rc::new(RefCell::new(HashMap::new())),
         // A9: the window starts in "Connecting…" — the clock starts
         // now, so a daemon that never answers is reported after 15 s
         // instead of leaving the Overview on "Connecting…" forever.
@@ -6617,6 +6923,9 @@ mod tests {
             job_tx,
             job_rx: Rc::new(RefCell::new(job_rx)),
             busy_jobs: Rc::new(RefCell::new(HashMap::new())),
+            // F6: generic-job registry.
+            next_job_id: Rc::new(Cell::new(0)),
+            pending_applies: Rc::new(RefCell::new(HashMap::new())),
             connecting_since: Rc::new(Cell::new(Some(Instant::now()))),
             reconnect_in_flight: Rc::new(Cell::new(false)),
             spawn_budget: Arc::new(live_probe::SpawnBudget::new()),
