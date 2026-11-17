@@ -6172,6 +6172,7 @@ dependencies = [
 name = "rsh-protocol"
 version = "2.0.3"
 dependencies = [
+ "digest 0.11.3",
  "hmac",
  "proptest",
  "serde_json",

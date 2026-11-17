@@ -26,6 +26,8 @@
 //! helpers and their tests apart.
 #![allow(dead_code)]
 
+use std::time::Duration;
+
 /// The board's `SoftAP` SSID the PC joins after pairing.
 pub const RSH_SSID: &str = "RSH";
 
@@ -110,10 +112,10 @@ pub fn build_profile_xml(ssid: &str, password: &str) -> String {
 #[must_use]
 pub fn windows_steps() -> Vec<&'static str> {
     vec![
-        "Write the WPA2-PSK profile XML to %TEMP%\\rsh-wifi-profile.xml",
-        "netsh wlan add profile filename=\"%TEMP%\\rsh-wifi-profile.xml\" user=current",
-        "netsh wlan connect name=RSH",
-        "Delete %TEMP%\\rsh-wifi-profile.xml",
+        "Write the WPA2-PSK profile XML to a unique %TEMP%\\rsh-wifi-profile-<pid>-<nanos>.xml (deleted on every exit path)",
+        "netsh wlan add profile filename=\"<unique-temp-path>\" user=current (30 s timeout)",
+        "netsh wlan connect name=RSH (30 s timeout)",
+        "Delete the unique temp profile XML (Drop guard)",
         "Confirm: the RSH Wi-Fi shows as Connected before starting the session",
     ]
 }
@@ -161,6 +163,98 @@ pub fn rejoin_wifi(ssid: &str, password: &str) -> Result<(), RejoinError> {
     }
 }
 
+/// Hard timeout for one `netsh` call (DS-15): a hung Wi-Fi stack
+/// used to block the manager loop indefinitely on an unbounded
+/// `.output()`. 30 s per call, killed on expiry.
+const NETSH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// DS-45: unique temp path for the password-bearing profile XML:
+/// `%TEMP%\rsh-wifi-profile-<pid>-<nanos>.xml`. The old fixed path
+/// (`%TEMP%\rsh-wifi-profile.xml`) collided between two daemons /
+/// users and left the password on disk if the process died between
+/// write and delete.
+#[must_use]
+pub fn profile_temp_path() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    std::env::temp_dir().join(format!(
+        "rsh-wifi-profile-{}-{nanos}.xml",
+        std::process::id()
+    ))
+}
+
+/// DS-45: deletes the profile file on drop, so the password-bearing
+/// XML is removed on EVERY exit path — including a panic between
+/// write and the explicit delete.
+struct ProfileFileGuard(std::path::PathBuf);
+
+impl Drop for ProfileFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Run one command with a hard timeout (DS-15): poll `try_wait()`
+/// every 50 ms; on timeout kill the child and report `StepFailed`.
+/// Stdout/stderr are piped and drained after exit — `netsh` writes
+/// at most a few hundred bytes, far under the pipe buffer, so the
+/// child cannot block on a full pipe while we poll. Platform-free
+/// (std only) so the Linux suite can cover the timeout itself with
+/// `/bin/sleep`.
+fn run_command_timeout(
+    cmd: &mut std::process::Command,
+    timeout: Duration,
+    step: &'static str,
+) -> Result<std::process::Output, RejoinError> {
+    use std::io::Read as _;
+    use std::time::Instant;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| RejoinError::StepFailed {
+            step,
+            detail: format!("could not run netsh: {error}"),
+        })?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RejoinError::StepFailed {
+                        step,
+                        detail: format!("netsh timed out after {} s", timeout.as_secs()),
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(RejoinError::StepFailed {
+                    step,
+                    detail: format!("could not wait for netsh: {error}"),
+                });
+            }
+        }
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_end(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_end(&mut stderr);
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Windows implementation of [`rejoin_wifi`]: profile import +
 /// connect via `netsh`. Never logs the password and never passes
 /// it on a command line (it travels only inside the temp XML).
@@ -168,7 +262,10 @@ pub fn rejoin_wifi(ssid: &str, password: &str) -> Result<(), RejoinError> {
 fn rejoin_wifi_windows(ssid: &str, password: &str) -> Result<(), RejoinError> {
     use std::io::Write as _;
 
-    let profile_path = std::env::temp_dir().join("rsh-wifi-profile.xml");
+    // DS-45: unique temp path + Drop guard — the old fixed path
+    // collided between processes and left the password on disk if
+    // the daemon died between write and delete.
+    let profile_path = profile_temp_path();
     let xml = build_profile_xml(ssid, password);
     {
         let mut file =
@@ -182,44 +279,36 @@ fn rejoin_wifi_windows(ssid: &str, password: &str) -> Result<(), RejoinError> {
                 detail: format!("could not write profile XML: {e}"),
             })?;
     }
-    // The temp file holds the password: remove it on every exit path.
-    let result = (|| {
-        let add = std::process::Command::new("netsh")
-            .args([
-                "wlan",
-                "add",
-                "profile",
-                &format!("filename=\"{}\"", profile_path.display()),
-                "user=current",
-            ])
-            .output()
-            .map_err(|e| RejoinError::StepFailed {
-                step: "add-profile",
-                detail: format!("could not run netsh: {e}"),
-            })?;
-        if !add.status.success() {
-            return Err(RejoinError::StepFailed {
-                step: "add-profile",
-                detail: String::from_utf8_lossy(&add.stderr).trim().to_string(),
-            });
-        }
-        let connect = std::process::Command::new("netsh")
-            .args(["wlan", "connect", &format!("name={ssid}")])
-            .output()
-            .map_err(|e| RejoinError::StepFailed {
-                step: "connect",
-                detail: format!("could not run netsh: {e}"),
-            })?;
-        if !connect.status.success() {
-            return Err(RejoinError::StepFailed {
-                step: "connect",
-                detail: String::from_utf8_lossy(&connect.stderr).trim().to_string(),
-            });
-        }
-        Ok(())
-    })();
-    let _ = std::fs::remove_file(&profile_path);
-    result
+    let _guard = ProfileFileGuard(profile_path.clone());
+    // DS-15: each netsh call has a hard 30 s timeout (killed on
+    // expiry) instead of the old unbounded `.output()` — and the
+    // whole rejoin runs off the manager loop (see main.rs), so a
+    // hung Wi-Fi stack stalls nothing.
+    let mut add_cmd = std::process::Command::new("netsh");
+    add_cmd.args([
+        "wlan",
+        "add",
+        "profile",
+        &format!("filename=\"{}\"", profile_path.display()),
+        "user=current",
+    ]);
+    let add = run_command_timeout(&mut add_cmd, NETSH_TIMEOUT, "add-profile")?;
+    if !add.status.success() {
+        return Err(RejoinError::StepFailed {
+            step: "add-profile",
+            detail: String::from_utf8_lossy(&add.stderr).trim().to_string(),
+        });
+    }
+    let mut connect_cmd = std::process::Command::new("netsh");
+    connect_cmd.args(["wlan", "connect", &format!("name={ssid}")]);
+    let connect = run_command_timeout(&mut connect_cmd, NETSH_TIMEOUT, "connect")?;
+    if !connect.status.success() {
+        return Err(RejoinError::StepFailed {
+            step: "connect",
+            detail: String::from_utf8_lossy(&connect.stderr).trim().to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -310,5 +399,74 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("connect"), "{text}");
         assert!(text.contains("network not found"), "{text}");
+    }
+
+    #[test]
+    fn profile_temp_path_is_unique_per_call() {
+        // DS-45: the fixed `%TEMP%\rsh-wifi-profile.xml` path
+        // collided between processes; each call must name a
+        // different file, and it must carry the pid.
+        let first = profile_temp_path();
+        let second = profile_temp_path();
+        assert_ne!(first, second, "two calls must not share a path");
+        assert!(
+            first
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("rsh-wifi-profile")),
+            "{first:?}"
+        );
+        assert!(
+            first.file_name().is_some_and(|name| name
+                .to_string_lossy()
+                .contains(&std::process::id().to_string())),
+            "the path must carry the pid: {first:?}"
+        );
+    }
+
+    #[test]
+    fn profile_file_guard_deletes_on_drop() {
+        // DS-45: the password-bearing XML must not survive any
+        // exit path, including a panic — the Drop guard is the
+        // mechanism.
+        let path = profile_temp_path();
+        std::fs::write(&path, "secret").expect("write temp profile");
+        assert!(path.exists());
+        {
+            let _guard = ProfileFileGuard(path.clone());
+        }
+        assert!(!path.exists(), "guard must delete the file on drop");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_timeout_kills_a_hung_command() {
+        // DS-15: the timeout itself is platform-free (std only),
+        // so it is covered here with /bin/sleep instead of netsh.
+        let mut sleep = std::process::Command::new("/bin/sleep");
+        sleep.arg("30");
+        let start = std::time::Instant::now();
+        let error = run_command_timeout(&mut sleep, Duration::from_millis(200), "connect")
+            .expect_err("a 30 s sleep must time out at 200 ms");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "timeout must bound the call: {:?}",
+            start.elapsed()
+        );
+        match error {
+            RejoinError::StepFailed { step, detail } => {
+                assert_eq!(step, "connect");
+                assert!(detail.contains("timed out"), "{detail}");
+            }
+            RejoinError::UnsupportedPlatform { instructions } => {
+                panic!("expected StepFailed timeout, got UnsupportedPlatform: {instructions}")
+            }
+        }
+        // And a fast command still succeeds with its output.
+        let mut echo = std::process::Command::new("/bin/echo");
+        echo.arg("ok");
+        let output = run_command_timeout(&mut echo, Duration::from_secs(5), "add-profile")
+            .expect("echo must succeed");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
     }
 }

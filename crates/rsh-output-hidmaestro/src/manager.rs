@@ -458,7 +458,7 @@ impl SidecarManager {
     #[cfg(windows)]
     fn spawn_windows_elevated(&mut self) -> Result<HelloInfo, HidMaestroError> {
         let (listener, port) = listen_loopback().map_err(HidMaestroError::from)?;
-        let token = generate_token();
+        let token = generate_token().map_err(HidMaestroError::from)?;
         // C-TOK-1: the token travels in the sidecar's ENVIRONMENT, not
         // on its command line (argv is world-readable via WMI /
         // Process Explorer). `ShellExecuteEx` has no env-block

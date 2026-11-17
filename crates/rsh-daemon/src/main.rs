@@ -174,7 +174,6 @@ async fn manager_loop(
     // finishes it successfully. A window closing without Active
     // finishes it as failed.
     let mut pairing_in_flight = false;
-    let mut first_active_seen = false;
     let mut pending_rejoin_password: Option<String> = None;
     let mut logged_lines = 0usize;
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
@@ -262,12 +261,31 @@ async fn manager_loop(
                     },
                     None => log_line(verbose, &format!("tray: unknown game '{key}' — ignored")),
                 },
-                TrayAction::RestartWheel => match api.state.restart_wheel() {
-                    Ok(()) => log_line(verbose, "tray: wheel restart requested"),
-                    Err(error) => {
-                        log_line(verbose, &format!("tray: wheel restart failed: {error}"));
+                TrayAction::RestartWheel => {
+                    // DS-02 (P0): `restart_wheel` is a sync H5 command
+                    // built on `block_on_control` (fresh runtime +
+                    // `block_on`) — calling it here, inside this tokio
+                    // task, panics ("Cannot start a runtime from
+                    // within a runtime") and kills the manager loop
+                    // silently (proven with a scratch tokio probe).
+                    // Run it on the blocking pool instead, where
+                    // there is no runtime context; the loop awaits
+                    // the outcome and logs it like every other
+                    // tray action.
+                    let state = Arc::clone(&api.state);
+                    match tokio::task::spawn_blocking(move || state.restart_wheel()).await {
+                        Ok(Ok(())) => log_line(verbose, "tray: wheel restart requested"),
+                        Ok(Err(error)) => {
+                            log_line(verbose, &format!("tray: wheel restart failed: {error}"));
+                        }
+                        Err(error) => {
+                            log_line(
+                                verbose,
+                                &format!("tray: wheel restart task failed: {error}"),
+                            );
+                        }
                     }
-                },
+                }
                 TrayAction::OpenSetup => {
                     if open_ui(Some("setup"), verbose) {
                         log_line(
@@ -383,7 +401,14 @@ async fn manager_loop(
         }
         let active_now = api.manager_state().is_active();
         if active_now && !last_active {
-            if pairing_in_flight || !first_active_seen {
+            // DS-34: publish the success ONLY when a pairing was
+            // actually in flight. The old `!first_active_seen`
+            // arm published `PairingFinished { ok: true }` on the
+            // first Active since daemon start even when no pairing
+            // ever happened (a restart with an already-paired
+            // board auto-resuming) — a wizard open at that moment
+            // could advance past Pair on a phantom success.
+            if pairing_in_flight {
                 publish(
                     &event_tx,
                     AppEvent::PairingFinished {
@@ -394,14 +419,32 @@ async fn manager_loop(
                 log_line(verbose, "pairing: finished — board paired (session Active)");
             }
             pairing_in_flight = false;
-            first_active_seen = true;
             if let Some(password) = pending_rejoin_password.take() {
-                match rejoin_wifi(RSH_SSID, &password) {
-                    Ok(()) => log_line(verbose, "pairing: rejoined RSH Wi-Fi after pairing"),
-                    Err(error) => {
-                        log_line(verbose, &format!("pairing: Wi-Fi rejoin failed: {error}"));
+                // DS-15 (F14): `rejoin_wifi` runs blocking `netsh`
+                // calls — never on the manager-loop task (a hung
+                // Wi-Fi stack would stall the 250 ms ticker:
+                // watchdog, retries, tray drain, pairing events).
+                // A detached task runs it on the blocking pool
+                // (bounded by a hard timeout inside `rejoin_wifi`)
+                // and logs the outcome; the loop never waits on it.
+                tokio::spawn(async move {
+                    match tokio::task::spawn_blocking(move || rejoin_wifi(RSH_SSID, &password))
+                        .await
+                    {
+                        Ok(Ok(())) => {
+                            log_line(verbose, "pairing: rejoined RSH Wi-Fi after pairing");
+                        }
+                        Ok(Err(error)) => {
+                            log_line(verbose, &format!("pairing: Wi-Fi rejoin failed: {error}"));
+                        }
+                        Err(error) => {
+                            log_line(
+                                verbose,
+                                &format!("pairing: Wi-Fi rejoin task failed: {error}"),
+                            );
+                        }
                     }
-                }
+                });
             }
         }
         if !window_open && !active_now {
@@ -644,13 +687,23 @@ fn pipe_create_is_in_use(error: &std::io::Error) -> bool {
 }
 
 /// Backoff between retries of an in-use pipe create (F1): 100 ms,
-/// doubling, capped at 1 s. The retry itself is unbounded — an
-/// in-use pipe is a live peer, not a broken bind.
+/// doubling, capped at 1 s. DS-14: the retry itself is now CAPPED —
+/// an in-use pipe is a live peer, not a broken bind, but a squatted
+/// pipe used to leave the daemon IPC-dead forever (one log line per
+/// second, never fatal). After [`IN_USE_FATAL_AFTER`] of continuous
+/// in-use failures the tracker reports fatal (see
+/// [`IpcBindTracker::record_failure`]).
 fn pipe_in_use_backoff(failures: u32) -> Duration {
     // 100 ms, 200 ms, 400 ms, 800 ms, then 1 s forever.
     let shift = failures.saturating_sub(1).min(4);
     Duration::from_millis((100u64 << shift).min(1000))
 }
+
+/// Total continuous in-use time after which the daemon gives up
+/// (DS-14): ~90 s — long enough for any transient peer hold, short
+/// enough that a squatted pipe becomes a VISIBLE fatal instead of
+/// a silent IPC-dead loop.
+const IN_USE_FATAL_AFTER: Duration = Duration::from_secs(90);
 
 /// Outcome of recording one IPC bind/create failure (F1/F2).
 enum IpcBindRetry {
@@ -669,6 +722,11 @@ enum IpcBindRetry {
 struct IpcBindTracker {
     failures: u32,
     in_use_failures: u32,
+    /// DS-14: when the current run of consecutive in-use failures
+    /// started — `None` outside such a run. After
+    /// [`IN_USE_FATAL_AFTER`] the run is fatal instead of looping
+    /// forever.
+    in_use_since: Option<Instant>,
 }
 
 impl IpcBindTracker {
@@ -676,17 +734,31 @@ impl IpcBindTracker {
         Self {
             failures: 0,
             in_use_failures: 0,
+            in_use_since: None,
         }
     }
 
     fn record_success(&mut self) {
         self.failures = 0;
         self.in_use_failures = 0;
+        self.in_use_since = None;
     }
 
     fn record_failure(&mut self, in_use: bool) -> IpcBindRetry {
         if in_use {
             self.in_use_failures += 1;
+            if self.in_use_since.is_none() {
+                self.in_use_since = Some(Instant::now());
+            }
+            // DS-14: a squatted pipe (in-use forever) becomes a
+            // visible fatal after ~90 s instead of looping 1/s
+            // forever with no IPC and no exit.
+            if self
+                .in_use_since
+                .is_some_and(|since| since.elapsed() >= IN_USE_FATAL_AFTER)
+            {
+                return IpcBindRetry::Fatal;
+            }
             return IpcBindRetry::RetryAfter(pipe_in_use_backoff(self.in_use_failures));
         }
         self.failures += 1;
@@ -722,7 +794,17 @@ async fn serve_ipc(
                     verbose,
                     &format!("daemon: IPC listening on {}", path.display()),
                 );
-                serve_listener(server, listener).await;
+                // DS-36: a broken accept loop (`true`) is a VISIBLE
+                // fatal like the bind path — the old code returned
+                // silently here and the daemon ran on with no IPC.
+                if serve_listener(server, listener).await {
+                    signal_ipc_fatal_shutdown(
+                        data_dir,
+                        "daemon IPC accept loop failed 50 times in a row — the listener is broken, the daemon cannot serve the UI",
+                        &shutdown,
+                        &ipc_fatal,
+                    );
+                }
                 return;
             }
             Err(error) => match tracker.record_failure(false) {
@@ -786,15 +868,23 @@ async fn create_pipe_listener(
                 match tracker.record_failure(in_use) {
                     IpcBindRetry::RetryAfter(delay) => {
                         if in_use {
-                            log_line(
-                                verbose,
-                                &format!(
-                                    "daemon: IPC pipe create failed (in use, retry {}): {error} (kind={:?}, os_error={:?})",
-                                    tracker.in_use_failures,
-                                    error.kind(),
-                                    error.raw_os_error()
-                                ),
-                            );
+                            // DS-14: quiet after the first few
+                            // lines — at the 1 s cap an in-use
+                            // squat would otherwise log once per
+                            // second for the full ~90 s cap window.
+                            // First 3 + every 30th (~30 s) is enough
+                            // to see it is still stuck.
+                            if tracker.in_use_failures <= 3 || tracker.in_use_failures % 30 == 0 {
+                                log_line(
+                                    verbose,
+                                    &format!(
+                                        "daemon: IPC pipe create failed (in use, retry {}): {error} (kind={:?}, os_error={:?})",
+                                        tracker.in_use_failures,
+                                        error.kind(),
+                                        error.raw_os_error()
+                                    ),
+                                );
+                            }
                         } else {
                             log_line(
                                 verbose,
@@ -809,12 +899,19 @@ async fn create_pipe_listener(
                         tokio::time::sleep(delay).await;
                     }
                     IpcBindRetry::Fatal => {
-                        signal_ipc_fatal_shutdown(
-                            data_dir,
-                            "daemon IPC bind failed after 5 attempts — the daemon cannot serve the UI",
-                            shutdown,
-                            ipc_fatal,
-                        );
+                        // DS-14: name which cap tripped — the 5
+                        // real-failure fatal, or the ~90 s in-use
+                        // squat fatal (no real failures at all).
+                        let detail = if in_use && tracker.failures == 0 {
+                            format!(
+                                "daemon IPC pipe held in use for {} s ({} retries) — the daemon cannot serve the UI",
+                                IN_USE_FATAL_AFTER.as_secs(),
+                                tracker.in_use_failures
+                            )
+                        } else {
+                            "daemon IPC bind failed after 5 attempts — the daemon cannot serve the UI".to_string()
+                        };
+                        signal_ipc_fatal_shutdown(data_dir, &detail, shutdown, ipc_fatal);
                         return None;
                     }
                 }
@@ -886,7 +983,16 @@ async fn serve_ipc(
         // current-user-only DACL is a Phase-7 hardening item — see
         // docs/V2-PHASE-2-GATE.md. The pipe is local-only and the
         // name is per-user via the single-instance mutex scope.
-        if pipe.connect().await.is_err() {
+        if let Err(error) = pipe.connect().await {
+            // DS-37 (B-12): a failed connect used to restart the
+            // loop silently with no log and no delay — a
+            // fast-failing connect hot-spun pipe creates. Log it
+            // and back off briefly before retrying.
+            log_line(
+                verbose,
+                &format!("daemon: IPC pipe connect failed: {error} — retrying"),
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
         // Pre-create the next listener BEFORE handing this pipe to
@@ -1246,15 +1352,33 @@ fn main() {
             serve_ipc(server, &dir, verbose, shutdown, ipc_fatal).await;
         });
     }
-    {
+    // DS-02 defence-in-depth: keep the manager-loop handle. A
+    // panicking tokio task just dies — the old code discarded both
+    // handles, so a dead loop left the daemon looking alive (no
+    // watchdog, no retries, no tray drain). `main` watches this
+    // handle in the headless park loop and restarts the loop (and
+    // logs fatally after the event loop) when it ends without a
+    // shutdown request.
+    let spawn_manager_loop = {
         let api = Arc::clone(&api);
-        let event_tx = event_tx.clone();
         let tray_actions = Arc::clone(&tray_actions);
         let shutdown = Arc::clone(&shutdown);
-        runtime.spawn(async move {
-            manager_loop(api, event_tx, tray_actions, shutdown, verbose).await;
-        });
-    }
+        // A cloned `Handle` (not a borrow of `runtime`): the
+        // closure must stay callable after `main` uses `runtime`
+        // again (`--check`'s `block_on`), and `Handle::spawn`
+        // is the same spawn.
+        let handle = runtime.handle().clone();
+        move || {
+            let api = Arc::clone(&api);
+            let event_tx = event_tx.clone();
+            let tray_actions = Arc::clone(&tray_actions);
+            let shutdown = Arc::clone(&shutdown);
+            handle.spawn(async move {
+                manager_loop(api, event_tx, tray_actions, shutdown, verbose).await;
+            })
+        }
+    };
+    let mut manager_handle = spawn_manager_loop();
 
     // Engine + transport (unless --no-connect): the daemon owns the
     // engine from startup, like the Tauri shell did.
@@ -1396,6 +1520,19 @@ fn main() {
                         verbose,
                         &format!("daemon: tray unavailable (attempt {attempt}/6: {error})"),
                     );
+                    // DS-48: fail fast on a headless host — with no
+                    // display server a tray can never appear, so
+                    // retrying 6×2 s on the main thread only delays
+                    // startup by ~10 s (and blocks shutdown/quit
+                    // handling the whole time). Windows keeps the
+                    // retries: Explorer may just not be ready yet.
+                    if attempt == 1 && tray_headless() {
+                        log_line(
+                            verbose,
+                            "daemon: no display server — skipping tray retries (headless)",
+                        );
+                        break;
+                    }
                     if attempt < 6 {
                         std::thread::sleep(Duration::from_secs(2));
                     }
@@ -1425,7 +1562,19 @@ fn main() {
         // `process::exit(1)` from the task).
         // (Ctrl-C / SIGTERM end the process; the pid file is
         // reclaimed by the next launch's /proc check.)
+        //
+        // DS-02: watch the manager-loop handle while parked — a
+        // loop that ends without a shutdown request (panic) is
+        // restarted here instead of leaving the daemon half-alive.
         while !shutdown.load(Ordering::Relaxed) {
+            if manager_handle.is_finished() {
+                let _ = log_fatal("daemon: manager loop ended unexpectedly — restarting it");
+                log_line(
+                    verbose,
+                    "daemon: manager loop ended unexpectedly — restarting it",
+                );
+                manager_handle = spawn_manager_loop();
+            }
             std::thread::sleep(Duration::from_millis(250));
         }
     }
@@ -1434,6 +1583,17 @@ fn main() {
     // (`NIM_DELETE`) before the lock is released, then log the exit
     // with the pid so a start/exit pair brackets every run in the log.
     drop(tray);
+    // DS-02: if the manager loop already ended while the event loop
+    // was running — and no shutdown was requested (tray Quit sets
+    // shutdown first, so a loop ended by Quit is normal) — that is
+    // a fatal trace: the loop never ends on its own otherwise.
+    if !shutdown.load(Ordering::Relaxed) && manager_handle.is_finished() {
+        let _ = log_fatal("daemon: manager loop ended unexpectedly before shutdown");
+        log_line(
+            verbose,
+            "daemon: manager loop ended unexpectedly before shutdown",
+        );
+    }
     log_line(
         verbose,
         &format!("daemon: exiting (pid {})", std::process::id()),
@@ -1709,6 +1869,23 @@ impl PopupHandle {
 /// `PlatformTray::drop`, verified in slint 1.18.1
 /// `i-slint-core/items/system_tray/windows.rs`), which is what
 /// removes the icon on a clean quit.
+/// DS-48: `true` when no tray can ever appear — a host with no
+/// display server (no X11 `DISPLAY`, no Wayland
+/// `WAYLAND_DISPLAY`). The tray retry loop fails fast after the
+/// first attempt there instead of sleeping ~10 s on the main
+/// thread. Windows has no display-server variable to check and
+/// Explorer may just be slow at login, so it always retries.
+#[cfg(unix)]
+fn tray_headless() -> bool {
+    std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none()
+}
+
+/// DS-48: Windows always retries the tray (see the Unix arm).
+#[cfg(windows)]
+fn tray_headless() -> bool {
+    false
+}
+
 // One function: tray + popup creation is a single wiring pass
 // (icon → menu → popup → timer); splitting it would scatter the
 // shared handles across helpers.
@@ -1997,6 +2174,57 @@ mod tests {
         assert_eq!(pipe_in_use_backoff(4), Duration::from_millis(800));
         assert_eq!(pipe_in_use_backoff(5), Duration::from_secs(1));
         assert_eq!(pipe_in_use_backoff(100), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn in_use_retry_is_capped_then_fatal() {
+        // DS-14: a squatted pipe used to retry 1/s forever, never
+        // fatal. The first in-use failure still retries; ~90 s of
+        // continuous in-use failures is fatal; a success in
+        // between resets the clock.
+        let mut tracker = IpcBindTracker::new();
+        assert!(
+            matches!(tracker.record_failure(true), IpcBindRetry::RetryAfter(_)),
+            "first in-use failure retries"
+        );
+        assert_eq!(tracker.in_use_failures, 1);
+        // 89 s of continuous in-use: still retrying.
+        tracker.in_use_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(89))
+                .expect("test clock is past boot + 89 s"),
+        );
+        assert!(
+            matches!(tracker.record_failure(true), IpcBindRetry::RetryAfter(_)),
+            "89 s in-use still retries"
+        );
+        // 91 s: fatal.
+        tracker.in_use_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(91))
+                .expect("test clock is past boot + 91 s"),
+        );
+        assert!(
+            matches!(tracker.record_failure(true), IpcBindRetry::Fatal),
+            "91 s of continuous in-use must be fatal"
+        );
+        // A success resets the in-use clock: the next squat gets
+        // a fresh ~90 s.
+        tracker.record_success();
+        assert!(tracker.in_use_since.is_none());
+        assert!(
+            matches!(tracker.record_failure(true), IpcBindRetry::RetryAfter(_)),
+            "after a success the next in-use failure retries again"
+        );
+        // Real (non-in-use) failures keep the old 5-strike rule.
+        let mut tracker = IpcBindTracker::new();
+        for _ in 0..4 {
+            assert!(matches!(
+                tracker.record_failure(false),
+                IpcBindRetry::RetryAfter(_)
+            ));
+        }
+        assert!(matches!(tracker.record_failure(false), IpcBindRetry::Fatal));
     }
 
     #[test]

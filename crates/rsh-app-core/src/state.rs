@@ -201,7 +201,7 @@ use rsh_security::keystore::{KeyStore, KeystoreError};
 use rsh_transport::ControlTransport;
 use rsh_transport::config::{ConfigState, ConfigTransaction, ConfigTxnSnapshot};
 use rsh_transport::discovery::{DEFAULT_BOARD_IP, Discovery};
-use rsh_transport::port_conflict::diagnose_udp_port_holder;
+use rsh_transport::port_conflict::{PortHolder, diagnose_udp_port_holder};
 use rsh_transport::serial::{SerialConfig, SerialTransport, detect_board_port};
 use rsh_transport::session::{BoardSession, KeyStoreLike, SessionError};
 use rsh_transport::udp::{UdpBindError, UdpConfig, UdpTransport};
@@ -3395,11 +3395,22 @@ impl AppStateCore {
             install.error = None;
         }
         let state = Arc::clone(self);
-        std::thread::Builder::new()
+        // DS-40: a failed thread spawn used to leave `installing`
+        // latched `true` forever (the flag was set before the
+        // spawn, and only the thread itself cleared it) — every
+        // later attempt then answered "already in progress".
+        // Reset the flag on the spawn-failure path.
+        match std::thread::Builder::new()
             .name("rsh-vjoy-install".to_string())
             .spawn(move || run_vjoy_install(&state))
-            .map_err(|error| format!("could not start the vJoy install thread: {error}"))?;
-        Ok("vJoy install started".to_string())
+        {
+            Ok(_) => Ok("vJoy install started".to_string()),
+            Err(error) => {
+                let mut install = lock(&self.vjoy_install);
+                install.installing = false;
+                Err(format!("could not start the vJoy install thread: {error}"))
+            }
+        }
     }
 
     /// Live engine / link diagnostics (v2.0.1 hotfix BACKEND-2): the
@@ -3814,6 +3825,40 @@ impl AppStateCore {
     /// Returns a message when the supervisor thread cannot be spawned
     /// or does not report ready within 5 s.
     pub fn start_engine(self: &Arc<Self>) -> Result<(), String> {
+        // DS-16: a stored handle is not proof the supervisor is
+        // alive — a thread that panicked or exited early (e.g. the
+        // 5 s ready-timeout path, which records `Failed` but keeps
+        // the handle) used to make every later `start_engine` a
+        // silent no-op while the engine was dead, and
+        // `connect_transport` then failed only with "engine command
+        // channel is gone". A finished handle is treated as absent:
+        // reap it, drop the stale channels, and spawn fresh below.
+        let dead_handle = {
+            let mut thread = lock(&self.engine_thread);
+            if thread
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                thread.take()
+            } else {
+                None
+            }
+        };
+        if let Some(handle) = dead_handle {
+            // Finished, so this joins immediately; a panicked
+            // supervisor reports its panic here instead of leaving
+            // the status as a stale `Running`.
+            if handle.join().is_err() {
+                self.set_engine_status(
+                    EngineTaskStatus::Failed {
+                        reason: "engine supervisor thread panicked".to_string(),
+                    },
+                    "engine supervisor thread panicked — restarting it".to_string(),
+                );
+            }
+            *lock(&self.engine_cmd_tx) = None;
+            *lock(&self.engine_report_rx) = None;
+        }
         if lock(&self.engine_thread).is_some() {
             return Ok(());
         }
@@ -4033,8 +4078,11 @@ impl AppStateCore {
     }
 
     /// Records an engine note in the status detail without changing
-    /// the status itself (transport retries, disconnects).
-    fn note_engine_detail(&self, detail: String) {
+    /// the status itself (transport retries, disconnects). Public
+    /// so the daemon API layer can surface a failure it observes
+    /// (DS-41: a swallowed `set_output_enabled` failure) in the
+    /// same detail the diagnostics already show.
+    pub fn note_engine_detail(&self, detail: String) {
         *lock(&self.engine_status_detail) = detail;
     }
 
@@ -5958,10 +6006,54 @@ pub fn migrate_persisted_backend_default(store: &mut ProfileStore) -> Option<Str
 /// manifest triggers the one UAC prompt; the download itself runs
 /// without a console window (`CREATE_NO_WINDOW`).
 fn run_vjoy_install(state: &Arc<AppStateCore>) {
+    // DS-40: the `installing` flag must clear even if this thread
+    // panics — the old code only cleared it on the normal return
+    // path, so a panicked install latched "already in progress"
+    // forever. The guard resets on drop (normal return, error
+    // return, or unwind); the explicit reset below stays as the
+    // documented normal-path write.
+    struct ResetInstalling<'a>(&'a Arc<AppStateCore>);
+    impl Drop for ResetInstalling<'_> {
+        fn drop(&mut self) {
+            let mut install = lock(&self.0.vjoy_install);
+            install.installing = false;
+        }
+    }
+    let _guard = ResetInstalling(state);
     let result = run_vjoy_install_inner();
     let mut install = lock(&state.vjoy_install);
     install.installing = false;
     install.error = result.err();
+}
+
+/// Wait for a spawned child with a hard timeout (DS-40): poll
+/// `try_wait()` every 100 ms; on timeout kill the child and report.
+/// The vJoy installer used to be awaited with a blocking `.status()`
+/// that waited forever. Platform-free (std only) so the Linux suite
+/// can cover the timeout itself with `/bin/sleep`.
+fn wait_child_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+    what: &'static str,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{what} timed out after {} s — killed",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("could not wait for {what}: {error}")),
+        }
+    }
 }
 
 /// The fallible half of [`run_vjoy_install`]: `Ok(())` only when the
@@ -5975,10 +6067,17 @@ fn run_vjoy_install_inner() -> Result<(), String> {
     // Windows 10+ ships curl.exe — no new HTTP dependency. The
     // download runs windowless; `--fail` makes HTTP errors fail the
     // command instead of writing an error page to the file.
+    // DS-40: `--max-time 120 --connect-timeout 15` — the download
+    // used to have no timeout at all, so a stalled network left
+    // the install thread (and the `installing` flag) stuck forever.
     let mut download = Command::new("curl.exe");
     download.args([
         "-L",
         "--fail",
+        "--max-time",
+        "120",
+        "--connect-timeout",
+        "15",
         "-o",
         &installer.to_string_lossy(),
         VJOY_INSTALLER_URL,
@@ -6019,10 +6118,23 @@ fn run_vjoy_install_inner() -> Result<(), String> {
     }
     // Silent install. The exe's manifest elevates (one UAC prompt —
     // expected); `/NORESTART` never reboots unattended.
-    let status = Command::new(&installer)
+    // DS-40: the installer used to be awaited with a blocking
+    // `.status()` (forever, with inherited stdio) — now it is
+    // spawned detached with nulled stdio (the same bug class as the
+    // NSIS `Exec` hang and the daemon/UI spawns) and bounded to
+    // 120 s, killed on timeout.
+    let mut installer_cmd = Command::new(&installer);
+    installer_cmd
         .args(VJOY_INSTALLER_ARGS)
-        .status()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    installer_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let child = installer_cmd
+        .spawn()
         .map_err(|error| format!("could not run the vJoy installer: {error}"))?;
+    let status = wait_child_timeout(child, Duration::from_secs(120), "vJoy installer")?;
     if !status.success() {
         return Err(format!(
             "vJoy installer exited with code {}",
@@ -6679,7 +6791,22 @@ where
 /// runtime — Tauri sync commands satisfy this; a call from inside a
 /// runtime panics (a runtime cannot be built inside one), so tests
 /// must be plain `#[test]`, never `#[tokio::test]`.
+///
+/// DS-02 (P0 audit): the only in-runtime caller was the daemon
+/// manager loop's tray "Restart wheel" path (now `spawn_blocking`,
+/// see `rsh-daemon/src/main.rs`); every other caller reaches here
+/// via IPC dispatch on `spawn_blocking` (safe — no runtime context)
+/// or from a plain thread / test. As a backstop this function now
+/// FAILS with an error instead of panicking when it is called from
+/// inside a runtime: a future misuse degrades one command instead
+/// of killing its caller task.
 fn block_on_control<R>(future: impl Future<Output = Result<R, String>>) -> Result<R, String> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(
+            "control command called from inside a tokio runtime — run it on spawn_blocking instead (DS-02)"
+                .to_string(),
+        );
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -7126,6 +7253,43 @@ fn spawn_forwarder(
                                 UdpBindError::NoInterface => rsh_api::BindErrorKind::NoInterface,
                                 UdpBindError::Other(_) => rsh_api::BindErrorKind::Other,
                             };
+                            // DS-06: diagnose the holder BEFORE
+                            // recording anything. An `AddrInUse`
+                            // whose holder is our own process (or
+                            // no holder at all — the port reads free)
+                            // is our own rebind race, not another
+                            // app: the previous transport's reader
+                            // thread still holds the socket for
+                            // ~100 ms after the drop, so the retry's
+                            // `bind(4211)` collides with ourselves
+                            // (measured 3/3, no other process
+                            // holding the port). It must NOT be
+                            // recorded as a foreign
+                            // `BindFailed(AddrInUse)` — that latches
+                            // the F21 terminal stop with a wrong
+                            // "another app" diagnosis ~5 s after
+                            // launch on any board-less machine.
+                            // It returns `None` with NO typed
+                            // `BindFailed` recorded, so the forwarder
+                            // retries with the normal M-11 backoff,
+                            // by which time the socket is free. Only
+                            // a foreign pid takes the F21 path below.
+                            let holder = if is_addr_in_use {
+                                diagnose_udp_port_holder(config.local_port)
+                            } else {
+                                None
+                            };
+                            if is_addr_in_use && !udp_addr_in_use_is_foreign(holder.as_ref()) {
+                                state_for_bind.note_engine_transport_error(
+                                    TransportKind::Udp,
+                                    "UDP bind failed: AddrInUse held by our own just-closed socket (or no holder found) — retrying with backoff",
+                                );
+                                state_for_bind.note_engine_detail(
+                                    "transport udp port conflict (AddrInUse, UDP 4211) was our own rebind race — retrying, not a foreign holder"
+                                        .to_string(),
+                                );
+                                return None;
+                            }
                             // F21: name the holder. A port conflict
                             // is a fact about another process, not a
                             // transient error — the diagnosis goes
@@ -7133,27 +7297,23 @@ fn spawn_forwarder(
                             // the engine status say WHO holds UDP
                             // 4211 (usually the still-running legacy
                             // Tauri app, `RSH.exe`).
-                            let holder_detail = if is_addr_in_use {
-                                diagnose_udp_port_holder(config.local_port)
-                                    .map(|holder| {
-                                        if holder.is_legacy_rsh_app() {
-                                            format!(
-                                                " — port held by the old RSH app: {}",
-                                                holder.describe()
-                                            )
-                                        } else if holder.is_current_rsh() {
-                                            format!(
-                                                " — port held by another RSH process: {}",
-                                                holder.describe()
-                                            )
-                                        } else {
-                                            format!(" — port held by {}", holder.describe())
-                                        }
-                                    })
-                                    .unwrap_or_default()
-                            } else {
-                                String::new()
-                            };
+                            let holder_detail = holder
+                                .map(|holder| {
+                                    if holder.is_legacy_rsh_app() {
+                                        format!(
+                                            " — port held by the old RSH app: {}",
+                                            holder.describe()
+                                        )
+                                    } else if holder.is_current_rsh() {
+                                        format!(
+                                            " — port held by another RSH process: {}",
+                                            holder.describe()
+                                        )
+                                    } else {
+                                        format!(" — port held by {}", holder.describe())
+                                    }
+                                })
+                                .unwrap_or_default();
                             state_for_bind.note_engine_transport_error(
                                 TransportKind::Udp,
                                 &format!(
@@ -7191,6 +7351,21 @@ fn spawn_forwarder(
             }
         }
     })
+}
+
+/// DS-06: whether a diagnosed UDP 4211 holder makes `AddrInUse`
+/// a foreign conflict (terminal, F21) or our own rebind race
+/// (transient, retry with the normal M-11 backoff). A holder that
+/// is our own process (`pid == ours`) — or no holder at all (the
+/// port reads free, i.e. our just-dropped socket was the holder
+/// and its reader thread had not released the fd yet) — is our
+/// own race, not another app. Only a foreign pid is terminal.
+/// Pure: unit-tested without binding anything.
+fn udp_addr_in_use_is_foreign(holder: Option<&PortHolder>) -> bool {
+    match holder {
+        Some(holder) => holder.pid != std::process::id(),
+        None => false,
+    }
 }
 
 /// Builds the UDP config from settings: the board IP is the
@@ -7455,10 +7630,18 @@ async fn forward_with_retry_with_policy<T, F>(
                 )
             {
                 state.set_connection(ConnectionState::Disconnected);
-                state.set_engine_status(
-                    EngineTaskStatus::Running { transport: None },
-                    "wheel port (UDP 4211) is held by another app — close the other RSH, then reconnect (no automatic retry)".to_string(),
-                );
+                // DS-06 (d): the user-facing text carries the
+                // diagnosed holder — the recorded reason already
+                // names it ("UDP bind failed: AddrInUse — port
+                // held by RSH.exe (pid …)") — instead of only the
+                // generic "another app" line.
+                let recorded = state.session_last_error().unwrap_or_default();
+                let status = if recorded.is_empty() {
+                    "wheel port (UDP 4211) is held by another app — close the other RSH, then reconnect (no automatic retry)".to_string()
+                } else {
+                    format!("{recorded} — close the other app, then reconnect (no automatic retry)")
+                };
+                state.set_engine_status(EngineTaskStatus::Running { transport: None }, status);
                 state.note_engine_detail(
                     "transport udp port conflict (AddrInUse, UDP 4211) — forwarder stopped, no bind retry; user reconnect required after closing the holder".to_string(),
                 );
@@ -7655,6 +7838,15 @@ async fn forward_with_retry_with_policy<T, F>(
         state.close_session_gate();
         state.clear_session_records();
         if deadline_fired {
+            // DS-06 (a): teardown-before-rebind — the old
+            // transport (and its socket, still held by its reader
+            // thread for ~100 ms after the flag is set) is dropped
+            // HERE, before the loop-top factory binds again, so
+            // the rebind cannot collide with it. The drop was
+            // previously implicit at the end of the iteration; it
+            // is explicit now so the ordering is visible and cannot
+            // regress silently.
+            drop(transport);
             continue;
         }
         if !forwarder_retry_after_failure(
@@ -8144,6 +8336,34 @@ mod tests {
         assert!(error.contains("Windows-only"), "{error}");
         // The refusal leaves no install running.
         assert!(!state.vjoy_status().installing);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_child_timeout_kills_a_hung_child() {
+        // DS-40: the installer wait is platform-free (std only),
+        // so it is covered here with /bin/sleep instead of the
+        // real installer.
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let start = Instant::now();
+        let error = wait_child_timeout(child, Duration::from_millis(200), "vJoy installer")
+            .expect_err("a 30 s sleep must time out at 200 ms");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "timeout must bound the wait: {:?}",
+            start.elapsed()
+        );
+        assert!(error.contains("timed out"), "{error}");
+        // And a fast child still succeeds with its status.
+        let child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn true");
+        let status = wait_child_timeout(child, Duration::from_secs(5), "vJoy installer")
+            .expect("true must succeed");
+        assert!(status.success());
     }
 
     #[test]
@@ -9632,6 +9852,38 @@ mod tests {
     }
 
     #[test]
+    fn start_engine_respawns_after_a_dead_supervisor() {
+        // DS-16: a finished supervisor handle used to make every
+        // later `start_engine` a silent no-op (the stored handle
+        // was never liveness-checked), so a dead engine never
+        // recovered without a process restart. Plant a thread that
+        // already exited as the supervisor: the next start must
+        // reap it and spawn fresh, and the engine must report
+        // Running afterwards.
+        let (state, _dir) = test_state();
+        let dead = std::thread::Builder::new()
+            .name("rsh-test-dead-supervisor".to_string())
+            .spawn(|| {})
+            .expect("spawn dead thread");
+        while !dead.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *lock(&state.engine_thread) = Some(dead);
+        state
+            .start_engine()
+            .expect("start_engine must respawn a dead supervisor");
+        assert_eq!(
+            state.engine_status(),
+            EngineTaskStatus::Running { transport: None },
+            "the respawned engine runs idle with no transport"
+        );
+        // A second start is still a no-op while the fresh one lives.
+        state.start_engine().expect("second start is a no-op");
+        let outcome = state.stop_engine();
+        assert!(outcome.joined, "engine stops bounded");
+    }
+
+    #[test]
     fn engine_spawn_flows_frames_to_backend_watchdog_neutral_and_bounded_stop() {
         let (state, sent, _fail) = test_state_with_recording();
         // Connect the recording backend first: the sink only sends to
@@ -10820,6 +11072,91 @@ mod tests {
         );
     }
 
+    /// DS-06: the classifier behind the self-collision fix — no
+    /// holder (port reads free) and our own pid are transient, a
+    /// foreign pid is terminal.
+    #[test]
+    fn udp_addr_in_use_self_or_none_is_transient_foreign_is_terminal() {
+        assert!(
+            !udp_addr_in_use_is_foreign(None),
+            "no holder (port free) is our own rebind race, not a foreign app"
+        );
+        let own = rsh_transport::port_conflict::PortHolder {
+            pid: std::process::id(),
+            process_name: "rsh-daemon".to_string(),
+            exe_path: None,
+        };
+        assert!(
+            !udp_addr_in_use_is_foreign(Some(&own)),
+            "our own pid holding the port is a rebind race, not a conflict"
+        );
+        let foreign = rsh_transport::port_conflict::PortHolder {
+            pid: std::process::id().wrapping_add(1),
+            process_name: "RSH.exe".to_string(),
+            exe_path: None,
+        };
+        assert!(
+            udp_addr_in_use_is_foreign(Some(&foreign)),
+            "a foreign pid is a real port conflict (F21 terminal)"
+        );
+    }
+
+    /// DS-06: a self-collision `AddrInUse` (the factory's transient
+    /// path: `None` with NO typed `BindFailed` recorded, as the
+    /// rebind race leaves it) must NOT stop the forwarder at one
+    /// attempt — it retries with the M-11 backoff and trips the
+    /// breaker after the policy's attempts instead of latching a
+    /// false "another app" error.
+    #[tokio::test]
+    async fn forwarder_retries_self_addr_in_use_instead_of_stopping() {
+        let (state, _dir) = test_state();
+        let (frame_tx, _frame_rx) = tokio::sync::mpsc::channel(8);
+        let (status_tx, _status_rx) = tokio::sync::mpsc::channel(8);
+        let policy = ForwarderRetryPolicy {
+            base: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            max_consecutive_failures: 3,
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let state_for_factory = Arc::clone(&state);
+        let attempts_for_factory = Arc::clone(&attempts);
+        // The last activation failed Unreachable (HELLO timeout,
+        // the no-board case) — the typed error a self-collision
+        // leaves behind, since the factory records no BindFailed
+        // for its own rebind race.
+        state.note_session_error_typed(
+            ConnectionError::Unreachable,
+            "no HELLO reply from the board",
+        );
+        let run = forward_with_retry_with_policy(
+            Arc::clone(&state),
+            TransportKind::Udp,
+            frame_tx,
+            status_tx,
+            move || {
+                attempts_for_factory.fetch_add(1, Ordering::SeqCst);
+                // DS-06 factory behaviour for a self-held port:
+                // no typed BindFailed is recorded.
+                let _ = &state_for_factory;
+                Option::<FakeSessionTransport>::None
+            },
+            policy,
+        );
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("self-collision forwarder must retry, then trip the breaker");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "a self-held port retries to the breaker, it must not stop at one attempt like a foreign conflict"
+        );
+        assert!(
+            state.engine_status_detail().contains("circuit breaker"),
+            "breaker named in the status, not a false 'another app': {}",
+            state.engine_status_detail()
+        );
+    }
+
     /// F21: a UDP port conflict stops the forwarder immediately —
     /// no backoff retries. The holder can only be closed by the
     /// user, so the M-11 retry loop would just re-log the same
@@ -11043,6 +11380,30 @@ mod tests {
             .filter(|line| line.contains("window state: open"))
             .count();
         assert_eq!(open_lines, 1, "window-open must log exactly once");
+    }
+
+    /// DS-02: `block_on_control` from inside a tokio runtime must
+    /// fail with an error, never panic ("Cannot start a runtime
+    /// from within a runtime" used to kill the daemon's manager
+    /// loop when tray "Restart wheel" called it). A current-thread
+    /// runtime built here is the exact manager-loop shape.
+    #[test]
+    fn block_on_control_inside_a_runtime_errors_instead_of_panicking() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let result = rt.block_on(async { block_on_control(async { Ok::<(), String>(()) }) });
+        let error = result.expect_err("in-runtime call must fail, not panic");
+        assert!(
+            error.contains("spawn_blocking"),
+            "the error must point at the fix: {error}"
+        );
+        // And outside a runtime the same call still works.
+        assert!(
+            block_on_control(async { Ok::<(), String>(()) }).is_ok(),
+            "plain-thread call must still succeed"
+        );
     }
 
     /* H5-control: run-a-control-command-under-a-fresh-session. */

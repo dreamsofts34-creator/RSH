@@ -252,6 +252,25 @@ pub fn listen_for_page_requests(queue: Arc<Mutex<VecDeque<String>>>) {
                     return;
                 };
                 rt.block_on(async move {
+                    // DS-33 (F20-C1): backoff ramp 1 s -> 30 s cap +
+                    // quiet-after-first-log — NOT a latch. The old
+                    // code logged every create failure and retried at
+                    // a fixed 1 s, and a failing `connect()` spun
+                    // with no sleep at all. The loop persists while
+                    // the UI lives; a permanently broken pipe settles
+                    // at one attempt per 30 s. A success resets both
+                    // the ramp and the log flag, so a later incident
+                    // logs once again.
+                    let backoff = |failures: u32| -> Duration {
+                        Duration::from_secs(
+                            1u64.saturating_mul(
+                                2u64.saturating_pow(failures.saturating_sub(1).min(5)),
+                            )
+                            .min(30),
+                        )
+                    };
+                    let mut failures = 0u32;
+                    let mut logged = false;
                     loop {
                         let mut server = match ServerOptions::new()
                             .first_pipe_instance(true)
@@ -259,14 +278,25 @@ pub fn listen_for_page_requests(queue: Arc<Mutex<VecDeque<String>>>) {
                         {
                             Ok(server) => server,
                             Err(error) => {
-                                eprintln!("RSH-UI single-instance pipe unavailable: {error}");
-                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                if !logged {
+                                    eprintln!("RSH-UI single-instance pipe unavailable: {error}");
+                                    logged = true;
+                                }
+                                failures = failures.saturating_add(1);
+                                tokio::time::sleep(backoff(failures)).await;
                                 continue;
                             }
                         };
                         if server.connect().await.is_err() {
+                            // Usually a racing second instance; back
+                            // off the same way instead of spinning
+                            // (the old code had no sleep here).
+                            failures = failures.saturating_add(1);
+                            tokio::time::sleep(backoff(failures)).await;
                             continue;
                         }
+                        failures = 0;
+                        logged = false;
                         let mut buf = Vec::new();
                         let read = tokio::time::timeout(
                             Duration::from_secs(5),
