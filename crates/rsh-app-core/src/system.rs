@@ -6,10 +6,14 @@
 //! `src-tauri/src/system.rs` and calls into here.
 //!
 //! Covered here:
-//! - update check (`check_update`, SW-R7.5) — semver comparison only;
-//!   the Tauri updater plugin (download/install/signature verify) is
-//!   wired in `src-tauri` and its signing keypair is a Phase H (H4)
-//!   item — no keys are generated here.
+//! - update check (`check_update`, SW-R7.5) — semver comparison only.
+//!   DS-71: this is a pure, tested comparator with NO callers in the
+//!   v2.0 app — the Settings update check is a static notice, auto-
+//!   update is OFF, and no `latest.json` is published. The Tauri
+//!   updater plugin config in `src-tauri/tauri.conf.json` is inactive
+//!   (`active: false`); nothing downloads or installs an update.
+//!   Kept (not deleted) as a tested utility for a future manual
+//!   "check GitHub Releases" implementation (DS-20).
 //! - single-instance version rule (SW-R7.4) — the C# rule, decided as
 //!   pure logic: an older version terminates, fail-closed.
 //! - autostart stale-entry repair (SW-R7.4) — pure logic over a
@@ -92,16 +96,16 @@ pub fn compare_versions(a: &str, b: &str) -> Result<Ordering, SystemError> {
 }
 
 /// What an update check found upstream: a newer release, or nothing
-/// newer. `download_url` is filled in by the Tauri side when the
-/// updater plugin reports one; the pure check leaves it [`None`].
+/// newer. `download_url` is filled in by the caller when it has one;
+/// the pure check leaves it [`None`].
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateInfo {
     /// Upstream version (`a.b.c`).
     pub version: String,
-    /// Release notes, when the updater manifest carries them.
+    /// Release notes, when the upstream manifest carries them.
     pub notes: Option<String>,
-    /// Direct download URL, when the updater plugin reports one.
+    /// Direct download URL, when the caller knows one.
     pub download_url: Option<String>,
 }
 
@@ -131,8 +135,8 @@ pub enum UpdateDecision {
 /// `latest == current` is up to date, `latest < current` means the
 /// running build is newer (dev build) and no update is offered. This
 /// function never touches the network and never installs anything —
-/// the Tauri updater plugin does the download, the Ed25519 manifest
-/// verification, and the install (Phase H owns its signing keypair).
+/// v2.0 has no auto-update (DS-71); the updater plugin in the
+/// kept-but-unshipped Tauri shell is inactive.
 ///
 /// # Errors
 ///
