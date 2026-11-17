@@ -388,15 +388,30 @@ impl UdpTransport {
             Arc::clone(&shutdown),
         )
         .map(|handle| reader_handle = Some(handle))?;
-        spawn_helo(
+        match spawn_helo(
             Arc::clone(&socket),
             Arc::clone(&expected_remote),
             config.session_flag,
             config.helo_interval,
             Arc::clone(&counters),
             Arc::clone(&shutdown),
-        )
-        .map(|handle| helo_handle = Some(handle))?;
+        ) {
+            Ok(handle) => helo_handle = Some(handle),
+            Err(error) => {
+                // DS-38: the reader thread is already running — a
+                // bare `?` here leaked it forever (the socket Arc
+                // it holds keeps the port bound and the thread
+                // alive, invisible to the caller that got the Err).
+                // Tear it down first: same flag + poke as
+                // `UdpTransport::shutdown` — the reader exits
+                // within ~100 ms and the socket is released.
+                shutdown.store(true, Ordering::Relaxed);
+                if let Ok(addr) = socket.local_addr() {
+                    let _ = socket.send_to(&[], addr);
+                }
+                return Err(UdpBindError::from(error));
+            }
+        }
         Ok(Self {
             socket,
             expected_remote,
@@ -639,9 +654,12 @@ fn reader_loop(
     let polling = socket.set_read_timeout(Some(READER_POLL_TIMEOUT)).is_err()
         && socket.set_nonblocking(true).is_ok();
     let mut buf = [0u8; MAX_DATAGRAM_LEN];
+    // DS-46: consecutive recv errors (see the error arm below).
+    let mut consecutive_errors = 0u32;
     while !shutdown.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
+                consecutive_errors = 0;
                 // L11: the shutdown poke (an empty datagram to our own
                 // address) wakes recv — exit before counting it.
                 if shutdown.load(Ordering::Relaxed) {
@@ -658,16 +676,31 @@ fn reader_loop(
                 handle_datagram(&buf[..len], senders, counters);
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                consecutive_errors = 0;
                 if polling {
                     thread::sleep(Duration::from_millis(1));
                 }
             }
             Err(_) => {
                 counters.receive_errors.fetch_add(1, Ordering::Relaxed);
-                thread::sleep(Duration::from_millis(10));
+                // DS-46: progressive backoff — a persistently failing
+                // socket used to spin at a fixed 10 ms (100 Hz)
+                // forever, burning CPU and spamming the counter.
+                thread::sleep(reader_error_delay(consecutive_errors));
+                consecutive_errors = consecutive_errors.saturating_add(1);
             }
         }
     }
+}
+
+/// DS-46: backoff between repeated `recv` errors — 10 ms doubling,
+/// capped at 1 s. Reset on any successful recv (or a WouldBlock
+/// poll), so a transient error costs one 10 ms sleep, while a
+/// permanently broken socket settles at 1 Hz instead of 100 Hz.
+fn reader_error_delay(consecutive: u32) -> Duration {
+    Duration::from_millis(10)
+        .saturating_mul(2u32.saturating_pow(consecutive.min(7)))
+        .min(Duration::from_secs(1))
 }
 
 /// Demux one accepted datagram by magic, parse it, and forward it — or
@@ -697,8 +730,14 @@ fn handle_datagram(data: &[u8], senders: &DemuxSenders, counters: &AtomicCounter
         }
     } else if data.starts_with(b"RSHR") {
         if let Ok(reply) = HelloReply::parse(data) {
-            counters.hello_received.fetch_add(1, Ordering::Relaxed);
-            if senders.hello.try_send(reply).is_err() {
+            // DS-39: mirror the frame arm (L10) — delivered means
+            // it actually reached the channel. The old code counted
+            // `hello_received` first and then dropped the reply
+            // silently on a full channel, so the counter lied about
+            // HELLOs the session layer never saw.
+            if senders.hello.try_send(reply).is_ok() {
+                counters.hello_received.fetch_add(1, Ordering::Relaxed);
+            } else {
                 count_overflow(counters);
             }
         } else {
@@ -801,6 +840,8 @@ mod tests {
     use std::net::UdpSocket as StdUdpSocket;
     use std::time::Instant;
 
+    use rsh_protocol::hello::{DEVICE_KEY_LEN, NONCE_LEN, WIFI_PASSWORD_LEN};
+    use rsh_protocol::HelloReply;
     use rsh_protocol::StreamFlags;
     use tokio::time::sleep;
 
@@ -879,6 +920,109 @@ mod tests {
     /// Give the reader thread time to process what was just sent.
     async fn settle() {
         sleep(Duration::from_millis(300)).await;
+    }
+
+    /// DS-46: 10 ms doubling, capped at 1 s.
+    #[test]
+    fn reader_error_delay_ramps_then_caps() {
+        assert_eq!(reader_error_delay(0), Duration::from_millis(10));
+        assert_eq!(reader_error_delay(1), Duration::from_millis(20));
+        assert_eq!(reader_error_delay(3), Duration::from_millis(80));
+        assert_eq!(reader_error_delay(6), Duration::from_millis(640));
+        assert_eq!(reader_error_delay(7), Duration::from_secs(1));
+        assert_eq!(reader_error_delay(100), Duration::from_secs(1));
+    }
+
+    /// A HELLO reply with zeroed credentials (valid wire form).
+    fn test_hello_reply() -> HelloReply {
+        HelloReply {
+            flags: 0,
+            session_echo: 0,
+            board_mac: [0xAA; 6],
+            firmware: (4, 0, 2),
+            nonce: [0; NONCE_LEN],
+            device_key: [0; DEVICE_KEY_LEN],
+            wifi_password: [0; WIFI_PASSWORD_LEN],
+        }
+    }
+
+    /// DS-39: a HELLO dropped on a full channel must not be counted
+    /// as received — pre-fix it was counted first, then dropped, so
+    /// the counter lied about HELLOs the session layer never saw.
+    #[test]
+    fn hello_not_counted_when_channel_full() {
+        let datagram = test_hello_reply().encode();
+        let counters = AtomicCounters::default();
+        // Full hello channel: pre-fill its single slot.
+        let (frame_tx, _frame_rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        let (control_tx, _control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
+        let (hello_tx, _hello_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::channel(STATUS_CHANNEL_CAPACITY);
+        hello_tx
+            .try_send(test_hello_reply())
+            .expect("pre-fill the hello channel");
+        let senders = DemuxSenders {
+            frame: frame_tx,
+            control: control_tx,
+            hello: hello_tx,
+            status: status_tx,
+        };
+        handle_datagram(&datagram, &senders, &counters);
+        let snap = counters.snapshot();
+        assert_eq!(snap.hello_received, 0, "a dropped HELLO is not received");
+        assert!(
+            snap.dropped_overflow >= 1,
+            "the drop is counted as overflow"
+        );
+        // With room in the channel, the same datagram counts.
+        let (frame_tx, _frame_rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        let (control_tx, _control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
+        let (hello_tx, mut hello_rx) = mpsc::channel(1);
+        let (status_tx, _status_rx) = mpsc::channel(STATUS_CHANNEL_CAPACITY);
+        let senders = DemuxSenders {
+            frame: frame_tx,
+            control: control_tx,
+            hello: hello_tx,
+            status: status_tx,
+        };
+        handle_datagram(&datagram, &senders, &counters);
+        assert_eq!(
+            counters.snapshot().hello_received,
+            1,
+            "a delivered HELLO counts"
+        );
+        assert!(
+            hello_rx.try_recv().is_ok(),
+            "the reply reached the channel"
+        );
+    }
+
+    /// DS-38: the flag + poke teardown `bind_typed` now runs when
+    /// the HELO spawn fails must actually stop a running reader —
+    /// a thread-spawn failure itself is OS resource exhaustion and
+    /// cannot be triggered in a test, so this proves the mechanism
+    /// the fix relies on (and that teardown releases the port).
+    #[test]
+    fn shutdown_stops_the_reader_thread_and_releases_the_port() {
+        let config = UdpConfig {
+            local_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ..UdpConfig::default()
+        };
+        let transport = UdpTransport::bind(config).expect("binds");
+        assert!(transport.reader_alive(), "reader runs after bind");
+        let port = transport.socket.local_addr().expect("addr").port();
+        transport.shutdown();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while transport.reader_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !transport.reader_alive(),
+            "reader must stop after shutdown"
+        );
+        drop(transport);
+        StdUdpSocket::bind(("127.0.0.1", port)).expect("port released after teardown");
     }
 
     #[test]
