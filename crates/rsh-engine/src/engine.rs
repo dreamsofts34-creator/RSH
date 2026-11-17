@@ -560,7 +560,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
                     tokio::select! {
                         _ = ticker.tick() => self.on_tick().await,
                         result = self.stop_rx.changed() => {
-                            if Self::stop_fired(result, &self.stop_rx) {
+                            if Self::stop_fired(&result, &self.stop_rx) {
                                 break;
                             }
                         }
@@ -573,7 +573,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
                     tokio::select! {
                         () = tokio::time::sleep(delay) => self.on_tick().await,
                         result = self.stop_rx.changed() => {
-                            if Self::stop_fired(result, &self.stop_rx) {
+                            if Self::stop_fired(&result, &self.stop_rx) {
                                 break;
                             }
                         }
@@ -612,7 +612,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
     /// sender was dropped. A change that leaves the flag clear does
     /// not stop the loop.
     fn stop_fired(
-        result: Result<(), tokio::sync::watch::error::RecvError>,
+        result: &Result<(), tokio::sync::watch::error::RecvError>,
         stop_rx: &watch::Receiver<bool>,
     ) -> bool {
         match result {
@@ -1685,7 +1685,10 @@ mod tests {
             "{delay:?}"
         );
         // Reconnect overdue: wake at once.
-        engine.next_reconnect_at = Some(now - Duration::from_secs(1));
+        engine.next_reconnect_at = Some(
+            now.checked_sub(Duration::from_secs(1))
+                .expect("test time"),
+        );
         assert_eq!(engine.parked_tick_delay(now), Duration::ZERO);
         // With no factory an overdue retry time must NOT collapse
         // the delay (there is no reconnect to wait for).

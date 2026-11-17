@@ -1475,9 +1475,9 @@ mod tests {
         assert!(slow.calibration.is_none());
         assert!(slow.firmware_check.is_some());
         assert!(slow.vjoy_status.is_none());
-        assert!(slow.profiles.is_empty());
-        assert!(slow.games.is_empty());
-        assert!(slow.bindings.is_empty());
+        assert_eq!(slow.profiles, Vec::new());
+        assert_eq!(slow.games, Vec::new());
+        assert_eq!(slow.bindings, Vec::new());
         assert!(slow.draft.is_none());
         // All 8 module tunings + all 4 module flags present.
         assert_eq!(slow.tunings.len(), 8);

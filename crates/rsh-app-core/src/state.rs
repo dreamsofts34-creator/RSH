@@ -2594,6 +2594,9 @@ impl AppStateCore {
         *lock(&self.cached_serial_port) = None;
     }
 
+    /// Current transport state (kind + address + connection), for
+    /// the API and the UI. See [`Self::transport_state_with_settings`]
+    /// when the settings are already in hand.
     #[must_use]
     pub fn transport_state(&self) -> TransportState {
         self.transport_state_with_settings(&self.settings_arc())
@@ -10214,7 +10217,7 @@ mod tests {
     #[test]
     fn ds32_take_pairing_log_lines_drains_once() {
         let (state, _dir) = test_state();
-        assert!(state.take_pairing_log_lines().is_empty());
+        assert_eq!(state.take_pairing_log_lines(), Vec::<String>::new());
         state.open_session_gate();
         let drained = state.take_pairing_log_lines();
         assert_eq!(drained.len(), 1);
@@ -10223,8 +10226,8 @@ mod tests {
             "{}",
             drained[0]
         );
-        assert!(state.take_pairing_log_lines().is_empty());
-        assert!(state.pairing_log_lines().is_empty());
+        assert_eq!(state.take_pairing_log_lines(), Vec::<String>::new());
+        assert_eq!(state.pairing_log_lines(), Vec::<String>::new());
     }
 
     #[test]
