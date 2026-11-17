@@ -751,6 +751,13 @@ pub struct AppStateCore {
     /// `transport_state()` can report the kind and address even while
     /// the engine is idle.
     transport_choice: Mutex<(TransportKind, String)>,
+    /// Cached USB board port (DS-27): `detect_board_port()` enumerates
+    /// ports and probes each one (up to 500 ms per port), so it must
+    /// never run on the 20 Hz poll path. The first `transport_state()`
+    /// call fills this cache; later calls reuse it for up to
+    /// `BOARD_PORT_CACHE_TTL`, then re-detect. A disconnect or a
+    /// transport change clears it so the next poll re-detects.
+    cached_serial_port: Mutex<Option<(Option<String>, Instant)>>,
     /// Queued button-press edges, drained by the emitter.
     button_events: Mutex<VecDeque<ButtonPressEvent>>,
     /// Profile + settings store.
@@ -1051,6 +1058,7 @@ impl AppStateCore {
             seq: Mutex::new(0),
             connection: Mutex::new(ConnectionState::Disconnected),
             transport_choice: Mutex::new((TransportKind::Udp, esp_ip)),
+            cached_serial_port: Mutex::new(None),
             button_events: Mutex::new(VecDeque::new()),
             store: Mutex::new(store),
             launcher: Mutex::new(GameLauncher::new(SystemSpawner)),
@@ -2536,6 +2544,33 @@ impl AppStateCore {
     /// shape is always complete; `state` is `disconnected` there. A
     /// failed engine reports `error` with the failure reason verbatim
     /// instead of a silent `disconnected`.
+    /// USB board-port cache TTL (DS-27). A plugged/unplugged board is
+    /// picked up within this bound; the poll path never re-detects
+    /// more often than this.
+    const BOARD_PORT_CACHE_TTL: Duration = Duration::from_secs(5);
+
+    /// Cached USB board port (DS-27): the first call detects (port
+    /// enumeration + up to 500 ms HELO probe per port) and caches the
+    /// result; later calls return the cached value until the TTL
+    /// lapses. Detection runs without holding the cache lock.
+    #[must_use]
+    pub fn cached_board_port(&self) -> Option<String> {
+        if let Some((port, at)) = lock(&self.cached_serial_port).clone()
+            && at.elapsed() < Self::BOARD_PORT_CACHE_TTL
+        {
+            return port;
+        }
+        let port = detect_board_port();
+        *lock(&self.cached_serial_port) = Some((port.clone(), Instant::now()));
+        port
+    }
+
+    /// Clears the cached board port so the next poll re-detects
+    /// (DS-27): call after a disconnect or a transport change.
+    pub fn rescan_board_port(&self) {
+        *lock(&self.cached_serial_port) = None;
+    }
+
     #[must_use]
     pub fn transport_state(&self) -> TransportState {
         let status = self.engine_status();
@@ -2546,7 +2581,7 @@ impl AppStateCore {
         let kind = live.unwrap_or_else(|| self.transport_request().0);
         let address = match kind {
             TransportKind::Udp => self.settings().esp_ip,
-            TransportKind::Serial => detect_board_port().unwrap_or_default(),
+            TransportKind::Serial => self.cached_board_port().unwrap_or_default(),
         };
         let mut state = *lock(&self.connection);
         // C-02 defence in depth: "Connected" is only ever reported
@@ -3866,7 +3901,12 @@ impl AppStateCore {
     /// only the requested kind/address are (see `transport_state`,
     /// which merges this with the live session-gate state).
     pub fn set_transport_request(&self, kind: TransportKind, address: String) {
+        let changed = lock(&self.transport_choice).0 != kind;
         *lock(&self.transport_choice) = (kind, address);
+        if changed {
+            // DS-27: a transport change invalidates the cached port.
+            self.rescan_board_port();
+        }
     }
 
     /// What the UI last asked for (kind + typed address).
@@ -3936,6 +3976,8 @@ impl AppStateCore {
         tx.try_send(EngineCommand::Disconnect)
             .map_err(|error| format!("could not queue transport disconnect: {error}"))?;
         self.set_connection(ConnectionState::Disconnected);
+        // DS-27: a disconnect invalidates the cached board port.
+        self.rescan_board_port();
         Ok(())
     }
 
@@ -10046,6 +10088,27 @@ mod tests {
         let reported = state.transport_state();
         assert_eq!(reported.transport, "usb");
         assert_eq!(reported.state, ConnectionState::Disconnected);
+    }
+
+    /// DS-27: repeated serial `transport_state()` calls must reuse the
+    /// cached board port (no board is attached in the test sandbox, so
+    /// the address stays empty) and `rescan_board_port()` must clear
+    /// the cache without error. The live cost (port enumeration +
+    /// up to 500 ms HELO probe per port) is unmeasurable here — the
+    /// proof is that `transport_state` no longer calls
+    /// `detect_board_port` directly.
+    #[test]
+    fn ds27_serial_transport_state_uses_cached_port() {
+        let (state, _dir) = test_state();
+        state.set_transport_request(TransportKind::Serial, "COM3".to_string());
+        assert_eq!(state.cached_board_port(), None);
+        assert_eq!(state.cached_board_port(), None);
+        let reported = state.transport_state();
+        assert_eq!(reported.transport, "usb");
+        assert_eq!(reported.address, "");
+        state.rescan_board_port();
+        assert_eq!(state.cached_board_port(), None);
+        assert_eq!(state.transport_state().address, "");
     }
 
     #[test]
