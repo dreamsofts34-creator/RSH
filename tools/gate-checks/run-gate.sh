@@ -8,9 +8,11 @@
 #   4. rsh-rig --gate (32 rig gate checks: runtime + source audits +
 #      10 v2.0.3 lifecycle checks, F17 — real daemon/UI under Xvfb)
 #   5. rsh-gate-ui (6 headless UI checks: slider/wizard/theme/tray pixels)
-#   6. windows-check: cargo check --workspace --target
-#      x86_64-pc-windows-msvc (check-only, no linking) — Windows-only
-#      #[cfg(windows)] code never compiles on this Linux box, so a
+#   6. windows-check: cargo check --workspace --exclude rsh-app
+#      --target x86_64-pc-windows-msvc (check-only, no linking) —
+#      Windows-only #[cfg(windows)] code never compiles on this
+#      Linux box, so a Windows-target check runs here (rsh-app
+#      excluded: ring needs MSVC lib.exe; covered by CI tauri-build).
 #      release-blocker class (CI run 44105260838: E0308 in
 #      port_conflict.rs, Unix-only bind in the fake daemon) slipped
 #      through a green local gate. Runs in the DEFAULT path, not
@@ -100,7 +102,14 @@ windows_check() {
             return 1
         }
     fi
-    cargo check --workspace --target x86_64-pc-windows-msvc
+    # rsh-app is excluded: it alone pulls `ring` (tauri-plugin-updater
+    # -> reqwest -> rustls -> ring), whose build script needs MSVC
+    # `lib.exe`, unavailable on Linux. Same exclusion the --full Linux
+    # clippy/test steps already use. rsh-app's own Windows compile is
+    # covered by CI's tauri-build job on a real Windows runner. Both
+    # CI failure classes (E0308 in rsh-transport, E0425 in
+    # rsh-fake-daemon) are inside the checked set.
+    cargo check --workspace --exclude rsh-app --target x86_64-pc-windows-msvc
 }
 run_step windows-check windows_check
 run_step rig-gate cargo run -q -p rsh-rig -- --gate --out "$OUT/rig"
