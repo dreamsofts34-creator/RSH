@@ -2782,15 +2782,13 @@ impl Ctx {
     ///
     /// F27: when the window is hidden to tray (`hidden`), the
     /// state swap still runs but NO window property is touched.
-    /// The seed fetch takes ~1.3 s against a slow daemon, so a
-    /// close that lands mid-fetch delivers the completion after
-    /// the close — and the apply's model writes (notification /
-    /// profile / game / binding lists) on a hidden window drove a
-    /// draw on the torn-down X11 drawable, `SIGSEGV`ing the UI
-    /// under Xvfb within ~3 s of the close (F17-FINDING-5).
-    /// Scalar property writes are safe while hidden (the frame
-    /// timer does them every tick), but model writes are not, so
-    /// the whole window half is skipped, not cherry-picked. The
+    /// Defence-in-depth for the close-vs-seed race: gdb showed the
+    /// actual `SIGSEGV` is the frame timer's per-tick refresh
+    /// racing the hide (the fault is in the `llvmpipe-3` render
+    /// thread ~0.2 s after the close, before the fetch completes
+    /// — the seed apply itself was never the crash site), and the
+    /// timer now writes nothing while hidden; this guard keeps the
+    /// apply safe on any path that drains a job while hidden. The
     /// live state is already swapped in, and
     /// [`Ctx::resync_after_reopen`] re-syncs every prop from
     /// state/cache when the window comes back — nothing the user
@@ -6823,6 +6821,9 @@ fn spawn_health_monitor(
 /// setup mode and selects that page.
 fn apply_page_request(win: &MainWindow, ctx: &Ctx, page: &str) {
     let _ = win.show();
+    // F27: the spinner restarts on the visible window (it was
+    // stopped by the close handler — see there).
+    win.set_window_hidden(false);
     #[cfg(windows)]
     ui_lifecycle::restore_and_foreground();
     // F27: only a window that actually was hidden needs the
@@ -6904,6 +6905,36 @@ fn start_frame_timer(
     timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
         let t = tick.get();
         tick.set(t + 1);
+        // F27: the `--quit-after` check runs every tick, hidden or
+        // not (the rig's dead/silent closes rely on the timer
+        // firing while hidden) — it is checked first so the hidden
+        // early-return below cannot skip it.
+        if let Some(secs) = quit_after {
+            if t0.elapsed() >= Duration::from_secs(secs) {
+                slint::quit_event_loop().ok();
+            }
+        }
+        // F27: while the window is hidden to tray, this tick writes
+        // NOTHING to the window except `drain_ui_lifecycle` (tray
+        // Quit + page requests — a page request SHOWS the window
+        // first, so its writes are safe). gdb proved the
+        // close-during-seed crash is a redraw racing the hide: the
+        // fault is in the `llvmpipe-3` render thread, not app code
+        // — while the seed fetch is in flight, live data changes a
+        // property on nearly every tick, scheduling a redraw on the
+        // just-hidden window, and the software renderer draws on
+        // the torn-down drawable (SIGSEGV ~0.2 s after the close,
+        // before the fetch completes — so the seed apply itself was
+        // never the crash site; the apply guards stay as
+        // defence-in-depth). Health verdicts, live events and job
+        // completions queue in their channels and drain on reopen,
+        // when the window is visible again.
+        if ctx.hidden.load(Ordering::SeqCst) {
+            if let Some(w) = win.upgrade() {
+                drain_ui_lifecycle(&w, &ctx);
+            }
+            return;
+        }
         // Health verdicts first: a death clears stale values, a
         // re-probe swaps live data in — both on the UI thread.
         drain_health(&health_rx, &win, &ctx);
@@ -7027,11 +7058,6 @@ fn start_frame_timer(
                 if w.get_diag_open() {
                     ctx.sync_diag(&w);
                 }
-            }
-        }
-        if let Some(secs) = quit_after {
-            if t0.elapsed() >= Duration::from_secs(secs) {
-                slint::quit_event_loop().ok();
             }
         }
     });
@@ -7180,9 +7206,18 @@ fn main() -> Result<(), slint::PlatformError> {
     // re-entrant).
     {
         let ctx_close = ctx.clone();
+        let win_close = win.as_weak();
         win.window().on_close_requested(move || {
             let to_tray = ctx_close.api().close_to_tray();
             ctx_close.hidden.store(true, Ordering::SeqCst);
+            // F27: stop the busy spinner BEFORE hiding — its
+            // 90 ms Timer would otherwise keep scheduling redraws
+            // on the hidden window, and the software renderer
+            // draws on the torn-down drawable (llvmpipe SIGSEGV
+            // under Xvfb). Cleared on show (`apply_page_request`).
+            if let Some(w) = win_close.upgrade() {
+                w.set_window_hidden(true);
+            }
             if !to_tray {
                 ctx_close.quit_requested.set(true);
             }
@@ -7263,6 +7298,16 @@ fn main() -> Result<(), slint::PlatformError> {
         let ctx_static = ctx.clone();
         let health_timer = Timer::default();
         health_timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
+            // F27: same hidden-window guard as the frame timer —
+            // while hidden, only the lifecycle drain runs (tray
+            // Quit / page requests); health verdicts and job
+            // completions queue and drain on reopen.
+            if ctx_static.hidden.load(Ordering::SeqCst) {
+                if let Some(w) = win_weak.upgrade() {
+                    drain_ui_lifecycle(&w, &ctx_static);
+                }
+                return;
+            }
             drain_health(&health_rx, &win_weak, &ctx_static);
             if let Some(w) = win_weak.upgrade() {
                 drain_ui_lifecycle(&w, &ctx_static);

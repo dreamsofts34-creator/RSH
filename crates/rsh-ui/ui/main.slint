@@ -79,6 +79,11 @@ export component MainWindow inherits Window {
     // 1 Hz frame timer clears them); an empty label renders "Working…".
     in property <bool> busy: false;
     in property <string> busy-label: "";
+    // F27 (v2.0.3): true while the window is hidden to tray —
+    // the busy spinner's Timer stops (see below), so no redraw
+    // is scheduled on the hidden window. Set from Rust in the
+    // close handler, cleared on show (`apply_page_request`).
+    in property <bool> window-hidden: false;
     // M-2 (v2.0.2): the specific fatal reason from
     // read_daemon_status() (daemon-status.json) — empty while there
     // is none; the Overview shows it as an error banner instead of
@@ -881,7 +886,14 @@ export component MainWindow inherits Window {
         }
         Timer {
             interval: 90ms;
-            running: true;
+            // F27: the spinner stops while the window is hidden —
+            // a running spinner schedules a redraw every 90 ms,
+            // and a redraw on the just-hidden window SIGSEGVs the
+            // software renderer under Xvfb (the fault is in the
+            // `llvmpipe` render thread, not app code). The strip
+            // stays mounted (invisible anyway); the Timer resumes
+            // when the window comes back.
+            running: !window-hidden;
             triggered => { spin-step = spin-step >= 11 ? 0 : spin-step + 1; }
         }
     }
