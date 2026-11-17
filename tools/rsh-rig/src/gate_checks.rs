@@ -1054,9 +1054,10 @@ pub fn gate_wizard_fake_data_source() -> (bool, String) {
 /// `gate-ipc-timeout` (every IPC call fails within 500 ms instead
 /// of hanging). This audit checks the wiring around it: the IPC
 /// connect itself has a 2 s timeout, the poll loop goes through
-/// the bounded `call`, and the UI carries loading-state markers
-/// (a spinner/timeout/retry path per async action). The visible
-/// spinner behaviour is user-PC verified.
+/// the bounded `call` (a single combined `poll` since L-4, v2.0.2),
+/// and the UI carries loading-state markers (a spinner/timeout/
+/// retry path per async action). The visible spinner behaviour is
+/// user-PC verified.
 #[must_use]
 pub fn gate_loading_source() -> (bool, String) {
     let mut report = Report::new();
@@ -1077,15 +1078,15 @@ pub fn gate_loading_source() -> (bool, String) {
     );
     report.check(
         "loading-poll-uses-bounded-call",
-        ipc_api.contains(".call(\"snapshot\"") && ipc_api.contains(".call(\"connection\""),
-        "poll loop uses the bounded call for snapshot/connection",
+        ipc_api.contains(".call(\"poll\""),
+        "poll loop uses the bounded call (single combined poll, L-4)",
     );
     let loading_markers =
         count(&ui_main, "loading") + count(&ui_main, "spinner") + count(&ui_main, "Loading");
     report.check(
         "loading-ui-markers",
         loading_markers >= 5,
-        &format!("{loading_markers} loading/spinner markers in rsh-ui main.rs (no loading states wired yet — B5 pending)"),
+        &format!("{loading_markers} loading/spinner markers in rsh-ui main.rs"),
     );
     report.finish()
 }
@@ -1268,20 +1269,23 @@ pub fn gate_notifications_source() -> (bool, String) {
 /// still starting — and the UI shows "Pairing failed" for a
 /// pairing that actually started.
 ///
-/// Runtime: a fake daemon that answers `begin_pairing` after 3 s
-/// (the slow-board case) and `pairing_status` immediately with a
-/// 120 s countdown. The gate requires the `begin_pairing` IPC call
-/// to ack within 500 ms (fire-and-forget start + status polling)
-/// and the countdown to arrive via `pairing_status`. Currently
-/// FAILS: the call times out at ~500 ms. Source audit records the
+/// Runtime: a fake daemon that models the FIXED daemon — the
+/// begin_pairing board wait still takes 3 s server-side (the
+/// slow-board case), but dispatch is non-blocking (each request
+/// answered from its own task), so the `begin_pairing` IPC call
+/// acks within 500 ms (fire-and-forget start + status polling)
+/// and the countdown arrives via `pairing_status` immediately.
+/// The OLD daemon blocked dispatch for the whole 3 s, which made
+/// the call time out at ~500 ms. Source audit records the
 /// mismatch (3 s server wait vs 500 ms client bound) and that the
 /// UI half (countdown display on success) is already wired.
 #[must_use]
 pub fn gate_pairing_long_call() -> (bool, String) {
     let mut report = Report::new();
 
-    // Fake daemon: begin_pairing answers after 3 s; pairing_status
-    // answers immediately with a 120 s countdown.
+    // Fake daemon: begin_pairing still takes 3 s server-side (the
+    // slow-board case) but dispatch is non-blocking, so
+    // pairing_status answers immediately with a 120 s countdown.
     let dir = temp_dir("pairing-long-call");
     let path = dir.join("rsh-daemon.sock");
     let (begin_ms, begin_ok, status_ms, status_countdown) = block_on_scoped(|| {
@@ -1294,8 +1298,11 @@ pub fn gate_pairing_long_call() -> (bool, String) {
                         break;
                     };
                     tokio::spawn(async move {
+                        use std::sync::Arc;
                         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-                        let (reader, mut writer) = stream.into_split();
+                        use tokio::sync::Mutex;
+                        let (reader, writer) = stream.into_split();
+                        let writer = Arc::new(Mutex::new(writer));
                         let mut lines = BufReader::new(reader).lines();
                         while let Ok(Some(line)) = lines.next_line().await {
                             let value: serde_json::Value =
@@ -1309,20 +1316,31 @@ pub fn gate_pairing_long_call() -> (bool, String) {
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("")
                                 .to_string();
-                            if method == "begin_pairing" {
-                                tokio::time::sleep(Duration::from_secs(3)).await;
-                            }
-                            let result = if method == "pairing_status" {
-                                "{\"seconds_left\":120}".to_string()
-                            } else {
-                                "{}".to_string()
-                            };
-                            let reply = format!(
-                                "{{\"v\":1,\"id\":{id},\"ok\":true,\"result\":{result}}}\n"
-                            );
-                            if writer.write_all(reply.as_bytes()).await.is_err() {
-                                break;
-                            }
+                            // Fixed-daemon model (B-1): the 3 s board
+                            // wait must NOT block dispatch — each
+                            // request is answered from its own task
+                            // (shared writer, replies serialized),
+                            // so a slow begin_pairing never delays
+                            // the pairing_status countdown. A
+                            // sequential loop here would model the
+                            // OLD broken daemon and fail the check
+                            // for the wrong reason.
+                            let writer = Arc::clone(&writer);
+                            tokio::spawn(async move {
+                                if method == "begin_pairing" {
+                                    tokio::time::sleep(Duration::from_secs(3)).await;
+                                }
+                                let result = if method == "pairing_status" {
+                                    "{\"seconds_left\":120}".to_string()
+                                } else {
+                                    "{}".to_string()
+                                };
+                                let reply = format!(
+                                    "{{\"v\":1,\"id\":{id},\"ok\":true,\"result\":{result}}}\n"
+                                );
+                                let mut writer = writer.lock().await;
+                                let _ = writer.write_all(reply.as_bytes()).await;
+                            });
                         }
                     });
                 }
@@ -1420,10 +1438,11 @@ pub fn gate_pairing_long_call() -> (bool, String) {
 /// answer the prompt trips `HelloTimeout` and the switch fails.
 /// The gate requires the spawn/hello wait to cover 10 s + thinking
 /// time (>= 60 s). On decline the switch must surface ONE clear
-/// message and never retry-loop: the UI handler calls
-/// `set_output_backend` exactly once and notifies once, and the
-/// app-core call returns a single typed error without installing
-/// any backend.
+/// message and never retry-loop: the UI handler starts exactly one
+/// backend job (which calls `set_output_backend` once, guarded by
+/// the Backend in-flight check) and the done-arm notifies once
+/// with the typed error, and the app-core call returns a single
+/// typed error without installing any backend.
 #[must_use]
 pub fn gate_hid_uac_dwell() -> (bool, String) {
     let mut report = Report::new();
@@ -1485,6 +1504,12 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
     let _ = std::fs::remove_dir_all(&dir);
 
     // UI handler: exactly one switch attempt, one notification.
+    // Since the A9 job-system refactor the handler only starts a
+    // background job — the `set_output_backend` call lives in
+    // `start_backend_job` (guarded by the Backend in-flight check),
+    // and the failure notification lives in the `JobDone::Backend`
+    // done-arm (typed `notify_error` + toggle revert). Audit that
+    // shape instead of the old direct-call handler.
     let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
     let Some(handler_start) = ui_main.find("on_output_backend_selected") else {
         report.check(
@@ -1498,15 +1523,34 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
         .find("on_autostart_selected")
         .map_or(ui_main.len(), |off| handler_start + off);
     let handler = &ui_main[handler_start..handler_end];
+    let job_fn = ui_main.find("fn start_backend_job").map_or("", |start| {
+        let rest = &ui_main[start..];
+        let end = rest
+            .find("\n    /// Start a firmware-check job")
+            .unwrap_or(rest.len());
+        &rest[..end]
+    });
     report.check(
         "hid-ui-single-attempt",
-        count(handler, "set_output_backend") == 1 && !handler.contains("loop"),
-        "UI backend-selected handler calls set_output_backend exactly once, no loop/retry",
+        count(handler, "start_backend_job") == 1
+            && !handler.contains("loop")
+            && count(job_fn, "set_output_backend") == 1
+            && job_fn.contains("contains_key(&JobKind::Backend)"),
+        "UI backend-selected handler starts exactly one backend job (no loop); the job calls set_output_backend once, guarded by the Backend in-flight check",
     );
+    let done_arm = ui_main
+        .find("JobDone::Backend { index, result } => {")
+        .map_or("", |start| {
+            let rest = &ui_main[start..];
+            let end = rest
+                .find("JobDone::FirmwareCheck(result) => {")
+                .unwrap_or(rest.len());
+            &rest[..end]
+        });
     report.check(
         "hid-ui-one-message",
-        handler.contains("Couldn't switch controller"),
-        "UI shows one 'Couldn't switch controller' message on failure",
+        count(done_arm, "notify_error") == 1 && done_arm.contains("set_controller(1 - index)"),
+        "UI shows exactly one typed failure notification on backend-switch failure and reverts the toggle",
     );
     report.finish()
 }
