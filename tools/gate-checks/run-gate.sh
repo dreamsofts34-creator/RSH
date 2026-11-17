@@ -110,6 +110,19 @@ windows_check() {
     # CI failure classes (E0308 in rsh-transport, E0425 in
     # rsh-fake-daemon) are inside the checked set.
     cargo check --workspace --exclude rsh-app --target x86_64-pc-windows-msvc
+    # DS-07 (deep-scan FC-06/CI-01): test targets need --all-targets.
+    # Plain `cargo check` compiles lib + bins only, so the test-only
+    # unused `PathBuf` import in crates/rsh-ui/src/ipc_api.rs passed
+    # this step locally and failed clippy-windows (--all-targets) in
+    # CI on run 44120480671. Workspace-wide --all-targets does NOT
+    # run on Linux: it pulls criterion (rsh-benchmarks dev-dep) ->
+    # alloca, whose build script needs MSVC `lib.exe` (proven:
+    # --all-targets exits 101 on `alloca v0.4.0`, while the plain
+    # check passes). So the test-target check is scoped to the four
+    # ship crates — the same set CI's clippy-windows -p run covers —
+    # and the full workspace --all-targets runs in the CI
+    # windows-check job on a real Windows runner, where MSVC exists.
+    cargo check -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc --all-targets --target x86_64-pc-windows-msvc
 }
 run_step windows-check windows_check
 run_step rig-gate cargo run -q -p rsh-rig -- --gate --out "$OUT/rig"

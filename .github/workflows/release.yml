@@ -183,6 +183,56 @@ jobs:
           # The single source of truth is the workspace version above.
           Write-Host "Version $version matches the Cargo workspace version."
 
+      # DS-04 (deep-scan FC-02/FC-25) + DS-76: the release is gated on
+      # CI green — a release pre-condition, fail closed. CI never runs
+      # on a tag push (ci.yml triggers on push/PR to main only), so
+      # this step checks the CI run for the TAG COMMIT itself: the same
+      # SHA was pushed to main first, and CI ran there. It fails
+      # (exit 1) when no CI run exists for the commit on main, when
+      # the run is still in progress, or when its conclusion is
+      # anything but success. Run-level success implies the `gate`
+      # aggregator passed (gate is if: always() and fails unless every
+      # needed job succeeded), so no per-job parsing is needed. If a
+      # run was cancelled by a later push (ci.yml concurrency:
+      # cancel-in-progress), re-run it with `gh run rerun` and then
+      # re-trigger the release — do NOT bypass this step. `gh` is
+      # pre-authenticated on the runner; GITHUB_TOKEN (contents: read)
+      # is enough to list runs.
+      - name: CI gate must be green for the tag commit (fail closed)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.tag.outputs.tag }}"
+          git fetch --no-tags --depth 1 origin "refs/tags/$tag" 2>$null | Out-Null
+          $sha = (git rev-parse "FETCH_HEAD^{commit}" 2>$null)
+          if (-not $sha) { $sha = (git rev-parse "refs/tags/$tag^{commit}" 2>$null) }
+          if (-not $sha) {
+            Write-Error "Could not resolve tag $tag to a commit — cannot verify CI status for the release. Failing closed (DS-04)."
+            exit 1
+          }
+          Write-Host "Tag $tag is commit $sha — checking the CI run for that commit on main."
+          $runsJson = gh run list --workflow ci.yml --branch main --limit 20 --json databaseId,headSha,conclusion,status,url
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "gh run list failed — cannot verify CI status. Failing closed (DS-04)."
+            exit 1
+          }
+          $runs = $runsJson | ConvertFrom-Json
+          $run = @($runs | Where-Object { $_.headSha -eq $sha }) | Select-Object -First 1
+          if (-not $run) {
+            Write-Error "No CI run found for commit $sha on main — the release commit was never CI-gated. Push the commit to main and wait for CI green, then tag. Failing closed (DS-04)."
+            exit 1
+          }
+          if ($run.status -ne "completed") {
+            Write-Error "CI run $($run.databaseId) ($($run.url)) for commit $sha is still $($run.status) — the release cannot start until CI is green. Failing closed (DS-04)."
+            exit 1
+          }
+          if ($run.conclusion -ne "success") {
+            Write-Error "CI run $($run.databaseId) ($($run.url)) for commit $sha concluded '$($run.conclusion)' — the release is BLOCKED until CI is green on this commit. Failing closed (DS-04)."
+            exit 1
+          }
+          Write-Host "CI gate GREEN for commit $sha (run $($run.databaseId)): $($run.url)"
+
       - name: Install Rust 1.100.0
         uses: dtolnay/rust-toolchain@stable
         with:
