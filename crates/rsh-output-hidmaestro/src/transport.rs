@@ -589,8 +589,7 @@ fn drain_to_ring<R: Read + Send + 'static>(reader: R, ring: Arc<Mutex<VecDeque<S
 /// the engine thread (DS-42).
 pub fn generate_token() -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    getrandom::fill(&mut bytes).map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(bytes_to_hex(&bytes))
 }
 

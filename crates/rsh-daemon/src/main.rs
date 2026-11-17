@@ -432,13 +432,10 @@ async fn manager_loop(
                         .await
                     {
                         Ok(Ok(())) => {
-                            log_line(verbose, "pairing: rejoined RSH Wi-Fi after pairing")
+                            log_line(verbose, "pairing: rejoined RSH Wi-Fi after pairing");
                         }
                         Ok(Err(error)) => {
-                            log_line(
-                                verbose,
-                                &format!("pairing: Wi-Fi rejoin failed: {error}"),
-                            );
+                            log_line(verbose, &format!("pairing: Wi-Fi rejoin failed: {error}"));
                         }
                         Err(error) => {
                             log_line(
@@ -877,8 +874,7 @@ async fn create_pipe_listener(
                             // second for the full ~90 s cap window.
                             // First 3 + every 30th (~30 s) is enough
                             // to see it is still stuck.
-                            if tracker.in_use_failures <= 3 || tracker.in_use_failures % 30 == 0
-                            {
+                            if tracker.in_use_failures <= 3 || tracker.in_use_failures % 30 == 0 {
                                 log_line(
                                     verbose,
                                     &format!(
@@ -915,12 +911,7 @@ async fn create_pipe_listener(
                         } else {
                             "daemon IPC bind failed after 5 attempts — the daemon cannot serve the UI".to_string()
                         };
-                        signal_ipc_fatal_shutdown(
-                            data_dir,
-                            &detail,
-                            shutdown,
-                            ipc_fatal,
-                        );
+                        signal_ipc_fatal_shutdown(data_dir, &detail, shutdown, ipc_fatal);
                         return None;
                     }
                 }
@@ -2184,24 +2175,26 @@ mod tests {
         // between resets the clock.
         let mut tracker = IpcBindTracker::new();
         assert!(
-            matches!(
-                tracker.record_failure(true),
-                IpcBindRetry::RetryAfter(_)
-            ),
+            matches!(tracker.record_failure(true), IpcBindRetry::RetryAfter(_)),
             "first in-use failure retries"
         );
         assert_eq!(tracker.in_use_failures, 1);
         // 89 s of continuous in-use: still retrying.
-        tracker.in_use_since = Some(Instant::now() - Duration::from_secs(89));
+        tracker.in_use_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(89))
+                .expect("test clock is past boot + 89 s"),
+        );
         assert!(
-            matches!(
-                tracker.record_failure(true),
-                IpcBindRetry::RetryAfter(_)
-            ),
+            matches!(tracker.record_failure(true), IpcBindRetry::RetryAfter(_)),
             "89 s in-use still retries"
         );
         // 91 s: fatal.
-        tracker.in_use_since = Some(Instant::now() - Duration::from_secs(91));
+        tracker.in_use_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(91))
+                .expect("test clock is past boot + 91 s"),
+        );
         assert!(
             matches!(tracker.record_failure(true), IpcBindRetry::Fatal),
             "91 s of continuous in-use must be fatal"
@@ -2211,10 +2204,7 @@ mod tests {
         tracker.record_success();
         assert!(tracker.in_use_since.is_none());
         assert!(
-            matches!(
-                tracker.record_failure(true),
-                IpcBindRetry::RetryAfter(_)
-            ),
+            matches!(tracker.record_failure(true), IpcBindRetry::RetryAfter(_)),
             "after a success the next in-use failure retries again"
         );
         // Real (non-in-use) failures keep the old 5-strike rule.
@@ -2225,10 +2215,7 @@ mod tests {
                 IpcBindRetry::RetryAfter(_)
             ));
         }
-        assert!(matches!(
-            tracker.record_failure(false),
-            IpcBindRetry::Fatal
-        ));
+        assert!(matches!(tracker.record_failure(false), IpcBindRetry::Fatal));
     }
 
     #[test]

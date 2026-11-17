@@ -21,8 +21,8 @@ use rsh_api::{
 use rsh_api::{ConnEvent, ConnectionManager};
 use rsh_app_core::snapshot::EngineSnapshot;
 use rsh_app_core::state::{
-    AppStateCore, AppSettingsPatch, GameInfo, ProfileSummary as CoreProfileSummary,
-    TransportKind, TransportState,
+    AppSettingsPatch, AppStateCore, GameInfo, ProfileSummary as CoreProfileSummary, TransportKind,
+    TransportState,
 };
 
 /// Feed window for the F20 watchdog frame feed (see
@@ -308,10 +308,8 @@ impl AppApi for DaemonApi {
         // so the engine and the polled flag agree.
         let applied = self.state.set_output_enabled(enabled);
         if applied.detail.contains("failed") {
-            self.state.note_engine_detail(format!(
-                "output enable failed: {}",
-                applied.detail
-            ));
+            self.state
+                .note_engine_detail(format!("output enable failed: {}", applied.detail));
         }
         let patch = AppSettingsPatch {
             output_enabled: Some(enabled),
@@ -1093,9 +1091,7 @@ mod tests {
         // may hold it briefly, so probe first and retry the
         // attempt (up to 3 rounds) instead of failing on a
         // transient foreign bind.
-        fn udp_4211_free() -> bool {
-            std::net::UdpSocket::bind("127.0.0.1:4211").is_ok()
-        }
+        let udp_4211_free = || std::net::UdpSocket::bind("127.0.0.1:4211").is_ok();
         let mut trail: Vec<String> = Vec::new();
         for _attempt in 0..3 {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);

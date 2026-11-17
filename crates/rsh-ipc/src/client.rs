@@ -95,7 +95,7 @@ impl IpcClient {
                 // response (an unparseable line is dropped either
                 // way, as before).
                 let is_event = serde_json::from_str::<serde_json::Value>(&line)
-                    .map_or(false, |value| value.get("event").is_some());
+                    .is_ok_and(|value| value.get("event").is_some());
                 if is_event {
                     if let Ok(frame) = serde_json::from_str::<crate::IpcEventFrame>(&line)
                         && frame.v == IPC_PROTOCOL_VERSION

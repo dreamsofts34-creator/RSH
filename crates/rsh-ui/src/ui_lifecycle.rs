@@ -279,9 +279,7 @@ pub fn listen_for_page_requests(queue: Arc<Mutex<VecDeque<String>>>) {
                             Ok(server) => server,
                             Err(error) => {
                                 if !logged {
-                                    eprintln!(
-                                        "RSH-UI single-instance pipe unavailable: {error}"
-                                    );
+                                    eprintln!("RSH-UI single-instance pipe unavailable: {error}");
                                     logged = true;
                                 }
                                 failures = failures.saturating_add(1);

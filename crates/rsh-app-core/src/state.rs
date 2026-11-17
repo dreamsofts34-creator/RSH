@@ -3837,7 +3837,7 @@ impl AppStateCore {
             let mut thread = lock(&self.engine_thread);
             if thread
                 .as_ref()
-                .is_some_and(|handle| handle.is_finished())
+                .is_some_and(std::thread::JoinHandle::is_finished)
             {
                 thread.take()
             } else {
@@ -7279,7 +7279,7 @@ fn spawn_forwarder(
                             } else {
                                 None
                             };
-                            if is_addr_in_use && !udp_addr_in_use_is_foreign(&holder) {
+                            if is_addr_in_use && !udp_addr_in_use_is_foreign(holder.as_ref()) {
                                 state_for_bind.note_engine_transport_error(
                                     TransportKind::Udp,
                                     "UDP bind failed: AddrInUse held by our own just-closed socket (or no holder found) — retrying with backoff",
@@ -7361,7 +7361,7 @@ fn spawn_forwarder(
 /// and its reader thread had not released the fd yet) — is our
 /// own race, not another app. Only a foreign pid is terminal.
 /// Pure: unit-tested without binding anything.
-fn udp_addr_in_use_is_foreign(holder: &Option<PortHolder>) -> bool {
+fn udp_addr_in_use_is_foreign(holder: Option<&PortHolder>) -> bool {
     match holder {
         Some(holder) => holder.pid != std::process::id(),
         None => false,
@@ -7641,10 +7641,7 @@ async fn forward_with_retry_with_policy<T, F>(
                 } else {
                     format!("{recorded} — close the other app, then reconnect (no automatic retry)")
                 };
-                state.set_engine_status(
-                    EngineTaskStatus::Running { transport: None },
-                    status,
-                );
+                state.set_engine_status(EngineTaskStatus::Running { transport: None }, status);
                 state.note_engine_detail(
                     "transport udp port conflict (AddrInUse, UDP 4211) — forwarder stopped, no bind retry; user reconnect required after closing the holder".to_string(),
                 );
@@ -11081,7 +11078,7 @@ mod tests {
     #[test]
     fn udp_addr_in_use_self_or_none_is_transient_foreign_is_terminal() {
         assert!(
-            !udp_addr_in_use_is_foreign(&None),
+            !udp_addr_in_use_is_foreign(None),
             "no holder (port free) is our own rebind race, not a foreign app"
         );
         let own = rsh_transport::port_conflict::PortHolder {
@@ -11090,7 +11087,7 @@ mod tests {
             exe_path: None,
         };
         assert!(
-            !udp_addr_in_use_is_foreign(&Some(own)),
+            !udp_addr_in_use_is_foreign(Some(&own)),
             "our own pid holding the port is a rebind race, not a conflict"
         );
         let foreign = rsh_transport::port_conflict::PortHolder {
@@ -11099,7 +11096,7 @@ mod tests {
             exe_path: None,
         };
         assert!(
-            udp_addr_in_use_is_foreign(&Some(foreign)),
+            udp_addr_in_use_is_foreign(Some(&foreign)),
             "a foreign pid is a real port conflict (F21 terminal)"
         );
     }

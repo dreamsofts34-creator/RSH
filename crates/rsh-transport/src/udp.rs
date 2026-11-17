@@ -379,7 +379,6 @@ impl UdpTransport {
             status: status_tx,
         };
         let mut reader_handle = None;
-        let mut helo_handle = None;
         spawn_reader(
             Arc::clone(&socket),
             Arc::clone(&expected_remote),
@@ -388,7 +387,7 @@ impl UdpTransport {
             Arc::clone(&shutdown),
         )
         .map(|handle| reader_handle = Some(handle))?;
-        match spawn_helo(
+        let helo_handle = match spawn_helo(
             Arc::clone(&socket),
             Arc::clone(&expected_remote),
             config.session_flag,
@@ -396,7 +395,7 @@ impl UdpTransport {
             Arc::clone(&counters),
             Arc::clone(&shutdown),
         ) {
-            Ok(handle) => helo_handle = Some(handle),
+            Ok(handle) => Some(handle),
             Err(error) => {
                 // DS-38: the reader thread is already running — a
                 // bare `?` here leaked it forever (the socket Arc
@@ -411,7 +410,7 @@ impl UdpTransport {
                 }
                 return Err(UdpBindError::from(error));
             }
-        }
+        };
         Ok(Self {
             socket,
             expected_remote,
@@ -694,7 +693,7 @@ fn reader_loop(
 }
 
 /// DS-46: backoff between repeated `recv` errors — 10 ms doubling,
-/// capped at 1 s. Reset on any successful recv (or a WouldBlock
+/// capped at 1 s. Reset on any successful recv (or a `WouldBlock`
 /// poll), so a transient error costs one 10 ms sleep, while a
 /// permanently broken socket settles at 1 Hz instead of 100 Hz.
 fn reader_error_delay(consecutive: u32) -> Duration {
@@ -840,9 +839,9 @@ mod tests {
     use std::net::UdpSocket as StdUdpSocket;
     use std::time::Instant;
 
-    use rsh_protocol::hello::{DEVICE_KEY_LEN, NONCE_LEN, WIFI_PASSWORD_LEN};
     use rsh_protocol::HelloReply;
     use rsh_protocol::StreamFlags;
+    use rsh_protocol::hello::{DEVICE_KEY_LEN, NONCE_LEN, WIFI_PASSWORD_LEN};
     use tokio::time::sleep;
 
     use super::*;
@@ -991,10 +990,7 @@ mod tests {
             1,
             "a delivered HELLO counts"
         );
-        assert!(
-            hello_rx.try_recv().is_ok(),
-            "the reply reached the channel"
-        );
+        assert!(hello_rx.try_recv().is_ok(), "the reply reached the channel");
     }
 
     /// DS-38: the flag + poke teardown `bind_typed` now runs when
@@ -1017,10 +1013,7 @@ mod tests {
         while transport.reader_alive() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(
-            !transport.reader_alive(),
-            "reader must stop after shutdown"
-        );
+        assert!(!transport.reader_alive(), "reader must stop after shutdown");
         drop(transport);
         StdUdpSocket::bind(("127.0.0.1", port)).expect("port released after teardown");
     }

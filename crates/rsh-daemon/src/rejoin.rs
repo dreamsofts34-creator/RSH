@@ -416,11 +416,9 @@ mod tests {
             "{first:?}"
         );
         assert!(
-            first
-                .file_name()
-                .is_some_and(|name| name
-                    .to_string_lossy()
-                    .contains(&std::process::id().to_string())),
+            first.file_name().is_some_and(|name| name
+                .to_string_lossy()
+                .contains(&std::process::id().to_string())),
             "the path must carry the pid: {first:?}"
         );
     }
@@ -459,7 +457,9 @@ mod tests {
                 assert_eq!(step, "connect");
                 assert!(detail.contains("timed out"), "{detail}");
             }
-            other => panic!("expected StepFailed timeout, got {other:?}"),
+            RejoinError::UnsupportedPlatform { instructions } => {
+                panic!("expected StepFailed timeout, got UnsupportedPlatform: {instructions}")
+            }
         }
         // And a fast command still succeeds with its output.
         let mut echo = std::process::Command::new("/bin/echo");

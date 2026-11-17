@@ -264,7 +264,7 @@ pub async fn serve_listener(server: Arc<IpcServer>, listener: tokio::net::UnixLi
             }
             Err(error) => {
                 consecutive_failures += 1;
-                if consecutive_failures == 1 || consecutive_failures % 10 == 0 {
+                if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10) {
                     eprintln!(
                         "rsh-ipc: accept failed ({consecutive_failures} consecutive): {error}"
                     );
@@ -635,14 +635,12 @@ mod tests {
                 .expect("write ping");
             let mut answered = false;
             for _ in 0..200 {
-                let line = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    lines.next_line(),
-                )
-                .await
-                .expect("read timeout")
-                .expect("read line")
-                .expect("a line");
+                let line =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+                        .await
+                        .expect("read timeout")
+                        .expect("read line")
+                        .expect("a line");
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -676,26 +674,15 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn accept_error_delay_ramps_then_caps() {
-        assert_eq!(
-            accept_error_delay(1),
-            std::time::Duration::from_millis(100)
-        );
-        assert_eq!(
-            accept_error_delay(5),
-            std::time::Duration::from_millis(500)
-        );
-        assert_eq!(
-            accept_error_delay(10),
-            std::time::Duration::from_secs(1)
-        );
-        assert_eq!(
-            accept_error_delay(100),
-            std::time::Duration::from_secs(1)
-        );
+        assert_eq!(accept_error_delay(1), std::time::Duration::from_millis(100));
+        assert_eq!(accept_error_delay(5), std::time::Duration::from_millis(500));
+        assert_eq!(accept_error_delay(10), std::time::Duration::from_secs(1));
+        assert_eq!(accept_error_delay(100), std::time::Duration::from_secs(1));
     }
 
     #[test]
-    fn ping_and_version_round_trip_through_dispatch() {        let server = stub_server();
+    fn ping_and_version_round_trip_through_dispatch() {
+        let server = stub_server();
         let resp = server
             .handle_line(r#"{"v":1,"id":3,"method":"ping","params":{}}"#)
             .expect("ping parses");
