@@ -1,7 +1,8 @@
 //! Controllable fake `rsh-daemon` (v2.0.3 F17 test fixture).
 //!
 //! Speaks the REAL IPC wire protocol (`rsh_ipc::dispatch` over a
-//! Unix socket at `<data_dir>/rsh-daemon.sock`) with canned
+//! Unix socket at `<data_dir>/rsh-daemon.sock` on Unix, or the
+//! Windows named pipe `\\.\pipe\rsh-daemon` on Windows) with canned
 //! disconnected/neutral data, so the real UI treats it as a live
 //! daemon. Behaviour is selected by environment:
 //!
@@ -269,6 +270,85 @@ async fn serve_conn<S>(
     }
 }
 
+/// Windows accept loop: named-pipe listener on
+/// [`rsh_ipc::IPC_PIPE_NAME`], mirroring the real daemon's
+/// `create_pipe_listener` / `serve_ipc` F1/F2 pattern
+/// (`crates/rsh-daemon/src/main.rs`):
+///
+/// * `first_pipe_instance(true)` ONLY on the first create in the
+///   process — after the UI connects, instance #1 stays alive, so
+///   a second `first_pipe_instance(true)` create fails
+///   `ERROR_ACCESS_DENIED` (the v2.0.2 loop killer: 1199
+///   pipe-create failures in the user log).
+/// * The NEXT listener is pre-created with
+///   `first_pipe_instance(false)` BEFORE the accepted pipe is
+///   handed to `serve_conn`, so a listener is always available.
+///   A pre-create failure is NOT fatal — the loop-top create
+///   retries it, and the accepted client is served regardless.
+/// * `NamedPipeServer` has `connect().await`, not `accept()`.
+#[cfg(windows)]
+async fn run_windows(
+    api: Arc<dyn AppApi>,
+    mode: String,
+    slow_ms: u64,
+    flap_pings: usize,
+    pings: Arc<AtomicU64>,
+) {
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+    let mut first_create = true;
+    // The listening instance carried between iterations (see the
+    // doc comment above): pre-created before serving each
+    // connection.
+    let mut listener: Option<NamedPipeServer> = None;
+    loop {
+        let pipe = match listener.take() {
+            Some(pipe) => pipe,
+            None => match ServerOptions::new()
+                .first_pipe_instance(first_create)
+                .create(rsh_ipc::IPC_PIPE_NAME)
+            {
+                Ok(pipe) => pipe,
+                Err(error) => {
+                    eprintln!(
+                        "fake-daemon: cannot bind {}: {error}",
+                        rsh_ipc::IPC_PIPE_NAME
+                    );
+                    std::process::exit(1);
+                }
+            },
+        };
+        if first_create {
+            first_create = false;
+            if mode == "exit-after-bind" {
+                std::process::exit(0);
+            }
+        }
+        if pipe.connect().await.is_err() {
+            continue;
+        }
+        // Pre-create the next listener BEFORE handing this pipe to
+        // `serve_conn`. One best-effort attempt: a failure here is
+        // NOT fatal — the loop-top create retries it, and the
+        // accepted client is served regardless.
+        listener = match ServerOptions::new()
+            .first_pipe_instance(false)
+            .create(rsh_ipc::IPC_PIPE_NAME)
+        {
+            Ok(next) => Some(next),
+            Err(error) => {
+                eprintln!("fake-daemon: IPC next-pipe create failed (will retry): {error}");
+                None
+            }
+        };
+        let api = Arc::clone(&api);
+        let pings = Arc::clone(&pings);
+        let mode = mode.clone();
+        tokio::spawn(async move {
+            serve_conn(pipe, api, &mode, slow_ms, flap_pings, pings).await;
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let mut data_dir: Option<PathBuf> = None;
@@ -288,28 +368,38 @@ async fn main() {
     if mode == "crash" {
         std::process::exit(1);
     }
-    let path = rsh_ipc::socket_path(&data_dir);
-    let listener = match rsh_ipc::bind_unix_socket(&path) {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("fake-daemon: cannot bind {}: {error}", path.display());
-            std::process::exit(1);
-        }
-    };
-    if mode == "exit-after-bind" {
-        std::process::exit(0);
-    }
     let api: Arc<dyn AppApi> = Arc::new(StubApi);
     let pings = Arc::new(AtomicU64::new(0));
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            break;
+    #[cfg(unix)]
+    {
+        let path = rsh_ipc::socket_path(&data_dir);
+        let listener = match rsh_ipc::bind_unix_socket(&path) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("fake-daemon: cannot bind {}: {error}", path.display());
+                std::process::exit(1);
+            }
         };
-        let api = Arc::clone(&api);
-        let pings = Arc::clone(&pings);
-        let mode = mode.clone();
-        tokio::spawn(async move {
-            serve_conn(stream, api, &mode, slow_ms, flap_pings, pings).await;
-        });
+        if mode == "exit-after-bind" {
+            std::process::exit(0);
+        }
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let api = Arc::clone(&api);
+            let pings = Arc::clone(&pings);
+            let mode = mode.clone();
+            tokio::spawn(async move {
+                serve_conn(stream, api, &mode, slow_ms, flap_pings, pings).await;
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows has no Unix socket: the pipe name is fixed
+        // (`rsh_ipc::IPC_PIPE_NAME`), so `--data-dir` is unused.
+        let _ = data_dir;
+        run_windows(api, mode, slow_ms, flap_pings, pings).await;
     }
 }
