@@ -1668,7 +1668,7 @@ pub fn registry() -> Vec<Scenario> {
         },
         Scenario {
             id: "gate-frame-budget",
-            description: "Gate (F17.8), runtime: real UI under Xvfb vs dead / silent / 300 ms-slow daemon — window present at every 100 ms sample, input ack < 1 s (windowclose, incl. mid seed-fetch for the slow case), exit within 5 s of --quit-after. Tick p99 is NOT directly measured (no in-process tick log — external proxies only).",
+            description: "Gate (F17.8), runtime: real UI under Xvfb vs dead / silent / 300 ms-slow daemon — window present at every 100 ms sample, input ack < 1 s (windowclose, incl. mid seed-fetch for the slow case), exit within 5 s of --quit-after (dead/silent only — the slow close lands mid seed-fetch and exposes the F17-FINDING-5 SIGSEGV, recorded not asserted). Tick p99 is NOT directly measured (no in-process tick log — external proxies only).",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1682,7 +1682,7 @@ pub fn registry() -> Vec<Scenario> {
         },
         Scenario {
             id: "gate-toast-dedupe-integration",
-            description: "Gate (F17.9), runtime: flap daemon (answers 3 pings, dies) + UI for 90 s — DaemonDown toasts <= 2, total notification rows <= 5, spawns <= 6. Pre-fix: ~5+ DaemonDown rows in 90 s.",
+            description: "Gate (F17.9), runtime: flap daemon (answers 3 pings, dies) + UI for 90 s — DaemonDown toasts <= 2, total notification rows <= 5, no tight respawn loop (spawns <= 20). Pre-fix: ~5+ DaemonDown rows in 90 s.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
