@@ -882,6 +882,27 @@ mod tests {
     }
 
     #[test]
+    fn second_bind_on_same_port_fails_addr_in_use() {
+        // F21: no `SO_REUSEADDR` by design — a second bind on a held
+        // port must fail loud with typed `AddrInUse`, never silently
+        // share the port with the first holder (on Windows reuse
+        // would let two RSH processes race for the board's stream).
+        let first = StdUdpSocket::bind("127.0.0.1:0").expect("first binds");
+        let port = first.local_addr().expect("addr").port();
+        let config = UdpConfig {
+            local_port: port,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ..UdpConfig::default()
+        };
+        let error = UdpTransport::bind_typed(config).expect_err("second bind must fail");
+        assert!(
+            matches!(error, UdpBindError::AddrInUse),
+            "typed AddrInUse, got {error:?}"
+        );
+        assert_eq!(error.code(), "AddrInUse");
+    }
+
+    #[test]
     fn transport_is_send() {
         /// Compile-time assertion: the transport must be spawnable.
         fn assert_send<T: Send>() {}

@@ -14,3 +14,15 @@ rsh-protocol = { path = "../rsh-protocol" }
 rsh-security = { path = "../rsh-security" }
 serialport.workspace = true
 tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# F21: port-conflict diagnosis (`GetExtendedUdpTable`,
+# `QueryFullProcessImageNameW`). The `windows` crate does not
+# compile on Linux, so this is strictly Windows-only (same pattern
+# as the other crates — see the workspace root `Cargo.toml`).
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+] }

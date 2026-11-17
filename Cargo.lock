@@ -6213,6 +6213,7 @@ dependencies = [
  "rsh-security",
  "serialport",
  "tokio",
+ "windows",
 ]
 
 [[package]]
