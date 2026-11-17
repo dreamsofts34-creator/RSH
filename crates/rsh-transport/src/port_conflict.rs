@@ -201,14 +201,10 @@ fn pid_holding_socket(inode: u64) -> Option<u32> {
 
 #[cfg(windows)]
 fn diagnose_windows(port: u16) -> Option<PortHolder> {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::NetworkManagement::IpHelper::{
         GetExtendedUdpTable, MIB_UDPROW_OWNER_PID, UDP_TABLE_OWNER_PID,
     };
     use windows::Win32::Networking::WinSock::AF_INET;
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-    };
 
     // Ports in the UDP table are network byte order in the low 16 bits
     // (same layout as the TCP table rows — see the HIDMaestro
@@ -264,8 +260,7 @@ fn diagnose_windows(port: u16) -> Option<PortHolder> {
         let exe_path = process_image_path(pid);
         let process_name = exe_path
             .as_deref()
-            .map_or_else(|| format!("pid {pid}"), file_name_of)
-            .to_string();
+            .map_or_else(|| format!("pid {pid}"), |p| file_name_of(p).to_string());
         return Some(PortHolder {
             pid,
             process_name,
@@ -279,7 +274,8 @@ fn diagnose_windows(port: u16) -> Option<PortHolder> {
 fn process_image_path(pid: u32) -> Option<String> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
     };
     use windows::core::PWSTR;
     // SAFETY: `OpenProcess` with a pid from the OS table; the handle
@@ -290,11 +286,18 @@ fn process_image_path(pid: u32) -> Option<String> {
         return None;
     }
     let mut buf = [0u16; 1024];
-    let mut len = buf.len() as u32;
+    let mut len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
     // SAFETY: `buf` is a live wide-char buffer of `len` entries;
     // `QueryFullProcessImageNameW` writes at most `len` of them.
-    let ok =
-        unsafe { QueryFullProcessImageNameW(handle, 0, PWSTR(buf.as_mut_ptr()), &mut len).is_ok() };
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &raw mut len,
+        )
+        .is_ok()
+    };
     // SAFETY: the handle came from `OpenProcess` above and is closed
     // exactly once here.
     let _ = unsafe { CloseHandle(handle) };
@@ -313,6 +316,7 @@ impl fmt::Display for PortHolder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::net::UdpSocket;
 
     #[test]
