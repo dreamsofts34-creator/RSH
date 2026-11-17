@@ -1,6 +1,10 @@
 // Probe window hosting the real EmptyBanner (same-to-same component
 // from crates/rsh-ui/ui/components.slint) so the gate can render it
 // headless and measure its height for short vs long text.
+// DS-21 note: the banner sits in a VerticalLayout with a stretchable
+// spacer below it — without the spacer the layout stretches the
+// banner to the window height and the measurement reads the window,
+// not the banner.
 import { EmptyBanner } from "../../../crates/rsh-ui/ui/components.slint";
 
 export component GateBannerWindow inherits Window {
@@ -14,5 +18,6 @@ export component GateBannerWindow inherits Window {
             text: root.banner-text;
             is-error: true;
         }
+        Rectangle { vertical-stretch: 1; }
     }
 }

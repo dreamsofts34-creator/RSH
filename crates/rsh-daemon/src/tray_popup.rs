@@ -103,12 +103,11 @@ fn system_light_uncached() -> bool {
 /// A poisoned/unavailable lock degrades to a fresh sample.
 fn system_light() -> bool {
     let now = std::time::Instant::now();
-    if let Ok(cache) = SYSTEM_LIGHT_CACHE.lock() {
-        if let Some((at, value)) = *cache {
-            if now.duration_since(at) < SYSTEM_LIGHT_TTL {
-                return value;
-            }
-        }
+    if let Ok(cache) = SYSTEM_LIGHT_CACHE.lock()
+        && let Some((at, value)) = *cache
+        && now.duration_since(at) < SYSTEM_LIGHT_TTL
+    {
+        return value;
     }
     let value = system_light_uncached();
     if let Ok(mut cache) = SYSTEM_LIGHT_CACHE.lock() {

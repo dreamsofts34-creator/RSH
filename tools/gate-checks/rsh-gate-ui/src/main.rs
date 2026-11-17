@@ -875,10 +875,21 @@ fn ui_banner_wrap() -> Outcome {
     if let Err(error) = set_str(&instance, "banner-text", "Short text.") {
         return Outcome::fail(error);
     }
+    // The height is only laid out once the window is shown — read it
+    // off a snapshot, not off the unshown instance.
+    if let Err(error) = snapshot(&instance) {
+        return Outcome::fail(error);
+    }
     let short = get_num(&instance, "banner-height");
     let long_text = "Daemon failed to start: IPC bind failed after 5 attempts — pipe is held by another process or the previous daemon did not exit cleanly. Close the old RSH app and retry.";
-    assert!(long_text.chars().count() > 150, "probe text must exceed 150 chars");
+    assert!(
+        long_text.chars().count() > 150,
+        "probe text must exceed 150 chars"
+    );
     if let Err(error) = set_str(&instance, "banner-text", long_text) {
+        return Outcome::fail(error);
+    }
+    if let Err(error) = snapshot(&instance) {
         return Outcome::fail(error);
     }
     let long = get_num(&instance, "banner-height");

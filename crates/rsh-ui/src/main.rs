@@ -515,13 +515,17 @@ fn read_theme(data_dir: Option<&PathBuf>) -> i32 {
 }
 
 /// Persist the UI theme choice (`settings_idx` is the Settings
-/// screen index: 0 Dark, 1 Light, 2 Auto).
-fn write_theme(data_dir: Option<&PathBuf>, settings_idx: i32) {
+/// screen index: 0 Dark, 1 Light, 2 Auto). Returns `true` on
+/// success — DS-51: a persist failure is no longer silent
+/// (`eprintln` only); the caller notifies and reverts.
+/// (DS-49/DS-50: the OS preference itself is cached in
+/// [`Ctx::os_light`] — this only writes the choice.)
+fn write_theme(data_dir: Option<&PathBuf>, settings_idx: i32) -> bool {
     let Some(dir) = data_dir else {
-        return;
+        return false;
     };
     if std::fs::create_dir_all(dir).is_err() {
-        return;
+        return false;
     }
     let text = match settings_idx {
         1 => "Light",
@@ -529,8 +533,14 @@ fn write_theme(data_dir: Option<&PathBuf>, settings_idx: i32) {
         _ => "Dark",
     };
     match std::fs::write(dir.join("ui-theme"), format!("{text}\n")) {
-        Ok(()) => eprintln!("RSH-UI theme persisted: {text}"),
-        Err(e) => eprintln!("RSH-UI theme persist failed: {e}"),
+        Ok(()) => {
+            eprintln!("RSH-UI theme persisted: {text}");
+            true
+        }
+        Err(e) => {
+            eprintln!("RSH-UI theme persist failed: {e}");
+            false
+        }
     }
 }
 
@@ -569,6 +579,43 @@ fn system_light() -> bool {
 #[cfg(not(windows))]
 fn system_light() -> bool {
     false
+}
+
+/// Sample the OS light preference on a background thread (DS-49):
+/// `reg` must never run on the UI thread, and a synchronous spawn
+/// on every theme read froze the UI while `reg` started up. The
+/// returned flag is what the UI reads (a cheap atomic load);
+/// the sampler re-reads every 30 s, so Theme Auto follows a live
+/// OS change within half a minute (DS-50). The thread is detached
+/// — it ends with the process.
+fn spawn_os_light_sampler() -> Arc<AtomicBool> {
+    let shared = Arc::new(AtomicBool::new(system_light()));
+    let writer = shared.clone();
+    let _ = std::thread::Builder::new()
+        .name("rsh-os-light".to_string())
+        .spawn(move || loop {
+            writer.store(system_light(), Ordering::Relaxed);
+            std::thread::sleep(Duration::from_secs(30));
+        });
+    shared
+}
+
+/// Connection label for the top bar / sidebar (DS-67, pure —
+/// unit-tested): while the board is rejoining Wi-Fi with the new
+/// password after a successful pairing, the link is down on
+/// purpose — say so instead of a generic "Disconnected", which
+/// reads as if pairing broke the connection.
+fn conn_label_for(connecting: bool, live: bool, conn_label: &str, rejoining: bool) -> String {
+    if rejoining {
+        "Rejoining with the new password…".to_string()
+    } else if connecting {
+        // B4: the first probe is still running.
+        "Connecting…".to_string()
+    } else if live {
+        conn_label.to_string()
+    } else {
+        "Disconnected".to_string()
+    }
 }
 
 /// Swappable data source (v2.0.1 hotfix): the active [`AppApi`]
@@ -742,29 +789,44 @@ impl JobKind {
             JobKind::GameOp => 13,
             JobKind::SettingsOp => 14,
             JobKind::ReconnectSeed => 15,
+            JobKind::AppUpdateCheck => 16,
         }
     }
 }
 
-/// Busy-strip state (B5, FC2) for a `busy_jobs` map: `(false, "")`
-/// when nothing runs, otherwise `(true, label)` of the OLDEST
-/// running job (the strip shows one job at a time — the one that
-/// started first; ties break by [`JobKind::order`]).
-fn busy_state_for(jobs: &HashMap<JobKind, (String, Instant)>) -> (bool, String) {
-    let mut best: Option<(Instant, u8, &str)> = None;
+/// The oldest running job (DS-54): the strip shows one job at a
+/// time — the one that started first; ties break by
+/// [`JobKind::order`]. Returns the kind + its label.
+fn oldest_busy_job(jobs: &HashMap<JobKind, (String, Instant)>) -> Option<(JobKind, &str)> {
+    let mut best: Option<(Instant, u8, JobKind, &str)> = None;
     for (kind, (label, started)) in jobs {
-        let candidate = (*started, kind.order(), label.as_str());
-        let take = best.is_none_or(|(old_started, old_order, _)| {
+        let candidate = (*started, kind.order(), *kind, label.as_str());
+        let take = best.is_none_or(|(old_started, old_order, _, _)| {
             candidate.0 < old_started || (candidate.0 == old_started && candidate.1 < old_order)
         });
         if take {
             best = Some(candidate);
         }
     }
-    best.map_or_else(
+    best.map(|(_, _, kind, label)| (kind, label))
+}
+
+/// Busy-strip state (B5, FC2) for a `busy_jobs` map: `(false, "")`
+/// when nothing runs, otherwise `(true, label)` of the OLDEST
+/// running job (see [`oldest_busy_job`]).
+fn busy_state_for(jobs: &HashMap<JobKind, (String, Instant)>) -> (bool, String) {
+    oldest_busy_job(jobs).map_or_else(
         || (false, String::new()),
-        |(_, _, label)| (true, label.to_string()),
+        |(_, label)| (true, label.to_string()),
     )
+}
+
+/// Which job kind the busy strip is showing (DS-54), as the
+/// [`JobKind::order`] value the Slint `busy-kind` prop reads
+/// (`-1` = idle): screens disable + dim the button that started it,
+/// so a second click while its job runs is impossible.
+fn busy_kind_for(jobs: &HashMap<JobKind, (String, Instant)>) -> i32 {
+    oldest_busy_job(jobs).map_or(-1, |(kind, _)| i32::from(kind.order()))
 }
 
 /// Board-address validation (H4, FC2): the same rule the daemon
@@ -846,12 +908,19 @@ fn set_extras_on_prop(win: &MainWindow, index: usize, value: bool) {
 /// Write the B5 busy props, only when they change (so the 1 Hz
 /// safety call in the frame timer is free). A transition logs to
 /// stderr — the Xvfb smoke run reads the busy on/off off the log.
-fn set_busy_props(win: &MainWindow, busy: bool, label: &str) {
-    if win.get_busy() == busy && win.get_busy_label().as_str() == label {
+/// `kind` is the [`JobKind::order`] value for the running job
+/// (DS-54: `-1` = idle) — screens disable + dim the button that
+/// started it while it runs.
+fn set_busy_props(win: &MainWindow, busy: bool, label: &str, kind: i32) {
+    if win.get_busy() == busy
+        && win.get_busy_label().as_str() == label
+        && win.get_busy_kind() == kind
+    {
         return;
     }
     win.set_busy(busy);
     win.set_busy_label(label.into());
+    win.set_busy_kind(kind);
     if busy {
         eprintln!("RSH-UI busy: {label}");
     } else {
@@ -1183,6 +1252,24 @@ struct Ctx {
     /// address, wait, and the daemon's `pairing_status()`.
     pairing_attempts: Rc<Cell<u32>>,
     pairing_trail: Rc<RefCell<String>>,
+    /// Cached OS light preference (DS-49/DS-50): sampled by a
+    /// background thread, never by spawning `reg` on the UI thread.
+    /// `true` = the OS currently prefers a light theme.
+    os_light: Arc<AtomicBool>,
+    /// Stored theme choice (0 Dark, 1 Light, 2 Auto), cached so the
+    /// 1 Hz Auto re-sample never reads the file (DS-50).
+    theme_choice: Rc<Cell<i32>>,
+    /// True while the board is rejoining Wi-Fi with the new password
+    /// after a successful pairing (DS-67): the link drops while the
+    /// AP restarts to WPA2, so the UI says "Rejoining with the new
+    /// password…" instead of a generic disconnect. Cleared when the
+    /// session goes Active again, or after 30 s.
+    pairing_rejoining: Rc<Cell<bool>>,
+    pairing_rejoin_since: Rc<Cell<Option<Instant>>>,
+    /// True while a Backend job is switching to `HIDMaestro` (DS-59):
+    /// the busy strip relabels to "Waiting for admin permission…"
+    /// once the UAC prompt is expected.
+    backend_target_is_hid: Rc<Cell<bool>>,
     /// Background-job completions (A9/B5): job threads send on
     /// `job_tx`; the frame timer drains `job_rx` on the UI thread.
     /// `Rc<RefCell<Receiver>>` — the UI is single-threaded, so no
@@ -1432,14 +1519,17 @@ impl Ctx {
         let my = VY1 - output_pct / 100.0 * (VY1 - crate::curve::VY0);
 
         win.set_connected(connected);
-        win.set_conn_label(if connecting {
-            // B4: the first probe is still running.
-            "Connecting…".into()
-        } else if live {
-            conn.label.clone().into()
-        } else {
-            "Disconnected".into()
-        });
+        // DS-67: a rejoining board clears the flag once the session
+        // is Active again — the rejoin is done, the link is back.
+        if active && self.pairing_rejoining.get() {
+            self.pairing_rejoining.set(false);
+            self.pairing_rejoin_since.set(None);
+            win.set_setup_pair_status("Paired — wheel connected.".into());
+        }
+        win.set_setup_rejoining(self.pairing_rejoining.get());
+        win.set_conn_label(
+            conn_label_for(connecting, live, &conn.label, self.pairing_rejoining.get()).into(),
+        );
         // The wizard's Connect step is done exactly when the session
         // is Active on the LIVE daemon (v2.0.1 hotfix): re-derived on
         // every frame, so a reconnect also advances the wizard. The
@@ -1821,6 +1911,24 @@ impl Ctx {
     /// in the wizard Pair status bar. The diagnostics drawer reads
     /// the stored line on its next sync, so the attempt is visible
     /// there too.
+    /// Daemon-reported pairing seconds left (DS-58): a cache read
+    /// on the UI thread — safe on the 1 Hz tick.
+    fn daemon_pair_seconds_left(&self) -> i32 {
+        i32::try_from(self.api().pairing_status().seconds_left).unwrap_or(120)
+    }
+
+    /// Close the pairing window (DS-58/DS-74): the countdown hit
+    /// zero — the window is gone, and the only recovery is the BOOT
+    /// hold (or USB HELO), so the status says so instead of a bare
+    /// "try again".
+    fn close_pairing_window(w: &MainWindow) {
+        w.set_setup_pair_seconds_left(0);
+        w.set_setup_pairing_active(false);
+        w.set_setup_pair_status(
+            "Pairing window closed — hold BOOT 3 s on the wheel to open a new one.".into(),
+        );
+    }
+
     fn set_pairing_trail(&self, win: &MainWindow, trail: &str) {
         *self.pairing_trail.borrow_mut() = trail.to_string();
         win.set_setup_pair_status(trail.into());
@@ -1834,9 +1942,13 @@ impl Ctx {
     }
 
     /// Current busy state (B5): whether any job runs + the oldest
-    /// running job's label (the strip shows one job at a time).
-    fn busy_state(&self) -> (bool, String) {
-        busy_state_for(&self.busy_jobs.borrow())
+    /// running job's label (the strip shows one job at a time) + its
+    /// [`JobKind::order`] value (DS-54: `-1` = idle — the screens
+    /// disable + dim the button that started it).
+    fn busy_state(&self) -> (bool, String, i32) {
+        let jobs = self.busy_jobs.borrow();
+        let (busy, label) = busy_state_for(&jobs);
+        (busy, label, busy_kind_for(&jobs))
     }
 
     /// Drive the B5 busy strip from `busy_jobs` (FC2): a running
@@ -1846,8 +1958,58 @@ impl Ctx {
     /// safety call from the frame timer — the write itself is
     /// change-detected, so the safety call costs nothing.
     fn sync_busy(&self, win: &MainWindow) {
-        let (busy, label) = self.busy_state();
-        set_busy_props(win, busy, &label);
+        let (busy, label, kind) = self.busy_state();
+        set_busy_props(win, busy, &label, kind);
+    }
+
+    /// Re-sample Theme Auto from the cached OS preference (DS-50):
+    /// the sampler thread refreshes `os_light` every 30 s; the tick
+    /// repaints when the resolved theme changed. A cheap atomic
+    /// load + one guarded prop write — no `reg` spawn, no file read.
+    fn sync_auto_theme(&self, win: &MainWindow) {
+        if self.theme_choice.get() != 2 {
+            return;
+        }
+        let resolved = resolve_theme_mode(2, self.os_light.load(Ordering::Relaxed));
+        if win.get_theme() != resolved {
+            win.set_theme(resolved);
+        }
+    }
+
+    /// Relabel a long-running backend switch (DS-59): once the
+    /// `HIDMaestro` switch has run 5 s, the UAC prompt is what the
+    /// user is waiting on — say so in the busy strip instead of a
+    /// bare "Switching controller…" for up to 80 s.
+    fn refresh_backend_busy_label(&self, win: &MainWindow) {
+        if !self.backend_target_is_hid.get() {
+            return;
+        }
+        let mut jobs = self.busy_jobs.borrow_mut();
+        let Some((label, started)) = jobs.get_mut(&JobKind::Backend) else {
+            return;
+        };
+        if started.elapsed() >= Duration::from_secs(5) && label == "Switching controller…" {
+            *label = "Waiting for admin permission…".to_string();
+            drop(jobs);
+            self.sync_busy(win);
+        }
+    }
+
+    /// Give up the "Rejoining…" state (DS-67): if the session never
+    /// comes back Active within 30 s of pairing, the rejoin failed
+    /// and the plain disconnect text is honest again.
+    fn check_rejoin_timeout(&self) {
+        if !self.pairing_rejoining.get() {
+            return;
+        }
+        if self
+            .pairing_rejoin_since
+            .get()
+            .is_some_and(|since| since.elapsed() >= Duration::from_secs(30))
+        {
+            self.pairing_rejoining.set(false);
+            self.pairing_rejoin_since.set(None);
+        }
     }
 
     /// Drive the M-2 daemon-error banner (FC2): the fatal reason
@@ -2605,6 +2767,10 @@ impl Ctx {
             );
         }
         let api = self.api();
+        // DS-59: remember the target — the 1 Hz tick relabels the
+        // busy strip once a HIDMaestro switch has run long enough
+        // for the UAC prompt to be what the user waits on.
+        self.backend_target_is_hid.set(index != 1);
         self.run_job(
             win,
             JobKind::Backend,
@@ -4751,7 +4917,7 @@ fn pairing_no_window_trail(attempts: u32, address: &str, status: &PairingInfo) -
     if let Some(mac) = status.board_mac.as_deref().filter(|m| !m.is_empty()) {
         return format!("{base} — board seen ({mac}) but no window: hold BOOT 3 s to open one.");
     }
-    format!("{base} — board never answered: check the wheel is on and joined to the RSH Wi-Fi.")
+    format!("{base} — board never answered: check the wheel is on and joined to the RSH Wi-Fi — or hold BOOT 3 s on the wheel to open a pairing window.")
 }
 
 /// Run one pairing attempt from the wizard (Begin / Retry /
@@ -5058,6 +5224,18 @@ fn wire_setup_pairing(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_setup_find_games(move || {
             if let Some(w) = win.upgrade() {
+                // DS-55: when RSH isn't running, the empty list is
+                // the daemon's fault, not the user's — say so instead
+                // of blaming them for not having games installed.
+                if !ctx.is_live() {
+                    ctx.notify(
+                        &w,
+                        "Games",
+                        "RSH isn't running",
+                        "RSH isn't running — reconnect, then search again.",
+                    );
+                    return;
+                }
                 ctx.refresh_games(&w);
                 let count = ctx.games_cache.borrow().len();
                 if count == 0 {
@@ -5944,9 +6122,29 @@ fn wire_theme(win: &MainWindow, ctx: &Rc<Ctx>) {
     let win = win.as_weak();
     let ctx = ctx.clone();
     win.unwrap().on_theme_persist(move |i| {
-        write_theme(ctx.data_dir.as_ref(), i);
+        // DS-51: a persist failure notifies and reverts the segment
+        // to the stored choice instead of failing silently.
+        if !write_theme(ctx.data_dir.as_ref(), i) {
+            let stored = ctx.theme_choice.get();
+            if let Some(w) = win.upgrade() {
+                w.set_theme(resolve_theme_mode(
+                    stored,
+                    ctx.os_light.load(Ordering::Relaxed),
+                ));
+                ctx.notify(
+                    &w,
+                    "Settings",
+                    "Couldn't save theme",
+                    "Your theme choice wasn't saved — it will reset next time you open RSH.",
+                );
+            }
+            return;
+        }
+        ctx.theme_choice.set(i);
         if let Some(w) = win.upgrade() {
-            w.set_theme(resolve_theme_mode(i, system_light()));
+            // DS-49: the OS preference comes from the cached sampler
+            // flag — no `reg` spawn on the UI thread.
+            w.set_theme(resolve_theme_mode(i, ctx.os_light.load(Ordering::Relaxed)));
         }
     });
 }
@@ -6873,13 +7071,20 @@ fn handle_live_event(win: &slint::Weak<MainWindow>, ctx: &Ctx, ev: &AppEvent) {
                 if *ok {
                     w.set_setup_paired(true);
                     w.set_setup_pairing_active(false);
-                    w.set_setup_pair_status("Paired — wheel connected.".into());
+                    // DS-67: pairing success drops the link — the AP
+                    // restarts to WPA2 and the daemon rejoins with
+                    // the new password. Say "rejoining" instead of
+                    // claiming the wheel is connected (or, when the
+                    // link drops, a generic disconnect).
+                    ctx.pairing_rejoining.set(true);
+                    ctx.pairing_rejoin_since.set(Some(Instant::now()));
+                    w.set_setup_pair_status("Paired — rejoining with the new password…".into());
                     Ctx::sync_pair_ring(&w);
                     ctx.notify(
                         &w,
                         "Pairing",
                         "Wheel paired",
-                        "Pairing complete — wheel connected.",
+                        "Pairing complete — rejoining the wheel with the new password…",
                     );
                 } else {
                     let detail = error.as_ref().map_or_else(
@@ -7363,6 +7568,9 @@ fn start_frame_timer(
                 ctx.sync_daemon_error(&w);
                 ctx.check_job_timeouts(&w);
                 ctx.check_toast_expiry(&w);
+                ctx.sync_auto_theme(&w);
+                ctx.refresh_backend_busy_label(&w);
+                ctx.check_rejoin_timeout();
                 ctx.check_connecting_timeout(&w);
                 ctx.poll_firmware_update(&w);
                 // F5: daemon-side slow changes (profiles, tunings,
@@ -7373,13 +7581,31 @@ fn start_frame_timer(
                     let left = w.get_setup_pair_seconds_left();
                     match left {
                         2.. => {
-                            w.set_setup_pair_seconds_left(left - 1);
+                            // DS-58: the countdown is the daemon's
+                            // `seconds_left`, not a local decrement —
+                            // the local count drifted from the board
+                            // (and a board-side refresh re-syncs up).
+                            let daemon_left = ctx.daemon_pair_seconds_left();
+                            if daemon_left > 0 {
+                                w.set_setup_pair_seconds_left(daemon_left);
+                            } else {
+                                // The board closed the window between
+                                // ticks — don't fall through to the
+                                // 10 s wait below.
+                                Ctx::close_pairing_window(&w);
+                            }
                         }
                         1 => {
-                            // The window had 1 s left — now closed.
-                            w.set_setup_pair_seconds_left(0);
-                            w.set_setup_pairing_active(false);
-                            w.set_setup_pair_status("Pairing window closed — try again.".into());
+                            // DS-58: re-sync before closing — the
+                            // board may have refreshed the window
+                            // since the last tick.
+                            let daemon_left = ctx.daemon_pair_seconds_left();
+                            if daemon_left > 1 {
+                                w.set_setup_pair_seconds_left(daemon_left);
+                            } else {
+                                // The window had 1 s left — now closed.
+                                Ctx::close_pairing_window(&w);
+                            }
                         }
                         _ => {
                             // B-1: left == 0 means no window yet (still
@@ -7555,6 +7781,11 @@ fn main() -> Result<(), slint::PlatformError> {
         pairing_wait_since: Rc::new(RefCell::new(None)),
         pairing_attempts: Rc::new(Cell::new(0)),
         pairing_trail: Rc::new(RefCell::new(String::new())),
+        os_light: spawn_os_light_sampler(),
+        theme_choice: Rc::new(Cell::new(read_theme(data_dir.as_ref()))),
+        pairing_rejoining: Rc::new(Cell::new(false)),
+        pairing_rejoin_since: Rc::new(Cell::new(None)),
+        backend_target_is_hid: Rc::new(Cell::new(false)),
         job_tx,
         job_rx: Rc::new(RefCell::new(job_rx)),
         busy_jobs: Rc::new(RefCell::new(HashMap::new())),
@@ -7638,8 +7869,8 @@ fn main() -> Result<(), slint::PlatformError> {
     win.set_setup_mode(setup);
     win.set_setup_step(0);
     win.set_theme(resolve_theme_mode(
-        read_theme(data_dir.as_ref()),
-        system_light(),
+        ctx.theme_choice.get(),
+        ctx.os_light.load(Ordering::Relaxed),
     ));
     win.set_app_version(api.version().into());
     // B4: not live yet — the monitor is still probing. The first
@@ -7817,6 +8048,56 @@ mod tests {
     }
 
     #[test]
+    fn ds51_write_theme_reports_failure() {
+        // DS-51: persist success returns true and round-trips; a
+        // missing data dir or an unwritable path returns false (the
+        // caller notifies and reverts instead of failing silently).
+        assert!(!write_theme(None, 1));
+        let dir = std::env::temp_dir().join(format!("rsh-ds51-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("ds51 temp dir");
+        assert!(write_theme(Some(&dir), 1));
+        assert_eq!(read_theme(Some(&dir)), 1);
+        assert!(write_theme(Some(&dir), 2));
+        assert_eq!(read_theme(Some(&dir)), 2);
+        // A file where the directory should be: create_dir_all fails.
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, "x").expect("ds51 temp file");
+        assert!(!write_theme(Some(&file), 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ds67_conn_label_for_rejoining() {
+        // DS-67: pairing success drops the link on purpose — the
+        // label says "rejoining", never a generic disconnect.
+        assert_eq!(
+            conn_label_for(false, false, "Disconnected", true),
+            "Rejoining with the new password…"
+        );
+        assert_eq!(
+            conn_label_for(false, true, "Connected", true),
+            "Rejoining with the new password…"
+        );
+        assert_eq!(conn_label_for(true, false, "", false), "Connecting…");
+        assert_eq!(conn_label_for(false, true, "Connected", false), "Connected");
+        assert_eq!(
+            conn_label_for(false, false, "Disconnected", false),
+            "Disconnected"
+        );
+    }
+
+    #[test]
+    fn ds58_daemon_pair_seconds_left_is_cache_read() {
+        // DS-58: the countdown derives from the daemon's
+        // `pairing_status()` (a cache read) — the sim reports 0, a
+        // live daemon reports its real seconds left.
+        let (ctx, dir) = fc2_test_ctx();
+        assert_eq!(ctx.daemon_pair_seconds_left(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn game_code_from_names() {
         assert_eq!(game_code("Assetto Corsa"), "AC");
         // H6: AC Competizione gets its own code — no more collision.
@@ -7973,6 +8254,38 @@ mod tests {
     }
 
     #[test]
+    fn ds54_busy_kind_for_oldest_job() {
+        // DS-54: the Slint `busy-kind` prop carries the OLDEST job's
+        // JobKind::order value (-1 = idle) so the invoking button can
+        // disable + dim while its job runs.
+        let mut jobs: HashMap<JobKind, (String, Instant)> = HashMap::new();
+        assert_eq!(busy_kind_for(&jobs), -1);
+        let old = Instant::now();
+        let new = old + Duration::from_millis(1);
+        jobs.insert(
+            JobKind::Transport,
+            ("Switching connection…".to_string(), new),
+        );
+        jobs.insert(JobKind::Reconnect, ("Reconnecting…".to_string(), old));
+        assert_eq!(busy_kind_for(&jobs), 0);
+        jobs.remove(&JobKind::Reconnect);
+        assert_eq!(busy_kind_for(&jobs), 1);
+        jobs.insert(
+            JobKind::AppUpdateCheck,
+            ("Checking for updates…".to_string(), new),
+        );
+        // Transport (order 1) is still oldest — AppUpdateCheck (16)
+        // does not hide it.
+        assert_eq!(busy_kind_for(&jobs), 1);
+        jobs.clear();
+        jobs.insert(
+            JobKind::AppUpdateCheck,
+            ("Checking for updates…".to_string(), old),
+        );
+        assert_eq!(busy_kind_for(&jobs), 16);
+    }
+
+    #[test]
     fn fc2_board_address_validation() {
         // H4/FC2: same rule as the daemon — private/loopback IPv4
         // literal only (whitespace trimmed).
@@ -8097,7 +8410,7 @@ mod tests {
             pending_profile_id: Rc::new(RefCell::new(None)),
             learn_target: Rc::new(Cell::new(0)),
             horn_test_until: Rc::new(Cell::new(None)),
-        toast_until: Rc::new(Cell::new(None)),
+            toast_until: Rc::new(Cell::new(None)),
             steer_hist: Rc::new(RefCell::new(VecDeque::new())),
             pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
             unsaved: Rc::new(Cell::new(false)),
@@ -8110,8 +8423,13 @@ mod tests {
             pairing_wait_since: Rc::new(RefCell::new(None)),
             pairing_attempts: Rc::new(Cell::new(0)),
             pairing_trail: Rc::new(RefCell::new(String::new())),
-        pairing_attempts: Rc::new(Cell::new(0)),
-        pairing_trail: Rc::new(RefCell::new(String::new())),
+            // DS-49/DS-50: no sampler thread in tests — the cached
+            // flag starts Dark and the tests drive it directly.
+            os_light: Arc::new(AtomicBool::new(false)),
+            theme_choice: Rc::new(Cell::new(0)),
+            pairing_rejoining: Rc::new(Cell::new(false)),
+            pairing_rejoin_since: Rc::new(Cell::new(None)),
+            backend_target_is_hid: Rc::new(Cell::new(false)),
             job_tx,
             job_rx: Rc::new(RefCell::new(job_rx)),
             busy_jobs: Rc::new(RefCell::new(HashMap::new())),
@@ -9087,10 +9405,7 @@ mod tests {
         // Error bodies, missing tags, empty tags, garbage: no
         // usable tag — the caller reports "unreadable", never a
         // guessed version.
-        assert_eq!(
-            parse_latest_release_tag(r#"{"message":"Not Found"}"#),
-            None
-        );
+        assert_eq!(parse_latest_release_tag(r#"{"message":"Not Found"}"#), None);
         assert_eq!(parse_latest_release_tag(r#"{"name":"RSH"}"#), None);
         assert_eq!(parse_latest_release_tag(r#"{"tag_name":""}"#), None);
         assert_eq!(parse_latest_release_tag(r#"{"tag_name":"v"}"#), None);
@@ -9109,10 +9424,7 @@ mod tests {
             compare_app_versions("2.0.3", "2.0.3"),
             Some(Ordering::Equal)
         );
-        assert_eq!(
-            compare_app_versions("2.0.2", "2.0.3"),
-            Some(Ordering::Less)
-        );
+        assert_eq!(compare_app_versions("2.0.2", "2.0.3"), Some(Ordering::Less));
         // Numeric, not lexicographic: 2.0.10 is newer than 2.0.9.
         assert_eq!(
             compare_app_versions("2.0.10", "2.0.9"),
@@ -9130,7 +9442,10 @@ mod tests {
 
     #[test]
     fn ds20_app_update_verdict_matrix() {
-        assert_eq!(app_update_verdict("2.0.3", "2.0.3"), Some(AppUpdateVerdict::UpToDate));
+        assert_eq!(
+            app_update_verdict("2.0.3", "2.0.3"),
+            Some(AppUpdateVerdict::UpToDate)
+        );
         assert_eq!(
             app_update_verdict("2.0.3", "2.0.4"),
             Some(AppUpdateVerdict::Available("2.0.4".to_string()))
@@ -9170,15 +9485,21 @@ mod tests {
             "toast shows the failure, got: {}",
             win.get_toast_text()
         );
-        assert!(!win.get_notif_open(), "plain failure must not open the drawer");
+        assert!(
+            !win.get_notif_open(),
+            "plain failure must not open the drawer"
+        );
 
         // Not expired yet: the 1 Hz check leaves it alone.
         ctx.check_toast_expiry(&win);
         assert_ne!(win.get_toast_text().as_str(), "");
 
         // Past the 5 s deadline: the expiry clears it.
-        ctx.toast_until
-            .set(Some(Instant::now() - Duration::from_secs(1)));
+        ctx.toast_until.set(Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("1 s ago exists"),
+        ));
         ctx.check_toast_expiry(&win);
         assert_eq!(win.get_toast_text().as_str(), "");
         assert_eq!(win.get_toast_title().as_str(), "");
@@ -9212,11 +9533,16 @@ mod tests {
             "got: {trail}"
         );
         assert!(trail.contains("board never answered"), "got: {trail}");
+        // DS-74: even the never-answered trail names the recovery.
+        assert!(trail.contains("hold BOOT 3 s"), "got: {trail}");
         // Board seen (MAC) but no window: hold BOOT guidance.
         let mut seen = info();
         seen.board_mac = Some("AA:BB:CC:DD:EE:FF".to_string());
         let trail = pairing_no_window_trail(1, "192.168.4.1", &seen);
-        assert!(trail.contains("board seen (AA:BB:CC:DD:EE:FF)"), "got: {trail}");
+        assert!(
+            trail.contains("board seen (AA:BB:CC:DD:EE:FF)"),
+            "got: {trail}"
+        );
         assert!(trail.contains("hold BOOT 3 s"), "got: {trail}");
         // Daemon-reported error detail wins over the MAC.
         let mut failed = seen;
@@ -9230,7 +9556,10 @@ mod tests {
         let mut typed = info();
         typed.error = Some(ConnectionError::Unreachable);
         let trail = pairing_no_window_trail(1, "192.168.4.1", &typed);
-        assert!(trail.contains("daemon reports: Unreachable"), "got: {trail}");
+        assert!(
+            trail.contains("daemon reports: Unreachable"),
+            "got: {trail}"
+        );
         // No address: no "at" fragment, still readable.
         let trail = pairing_no_window_trail(1, "", &info());
         assert!(!trail.contains(" at "), "got: {trail}");
@@ -9259,6 +9588,52 @@ mod tests {
             ctx.pairing_trail.borrow().contains("board never answered"),
             "trail is stored for the diagnostics drawer"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ds58_ds50_ds54_close_window_auto_theme_busy_kind() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("DS-58/50/54 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        // DS-58/DS-74: closing the window names the BOOT recovery.
+        win.set_setup_pairing_active(true);
+        win.set_setup_pair_seconds_left(5);
+        Ctx::close_pairing_window(&win);
+        assert!(!win.get_setup_pairing_active());
+        assert_eq!(win.get_setup_pair_seconds_left(), 0);
+        assert!(
+            win.get_setup_pair_status()
+                .as_str()
+                .contains("hold BOOT 3 s"),
+            "closed-window status guides the user, got: {}",
+            win.get_setup_pair_status()
+        );
+        // DS-50: Theme Auto follows the cached OS preference.
+        ctx.theme_choice.set(2);
+        ctx.os_light.store(true, Ordering::Relaxed);
+        win.set_theme(0);
+        ctx.sync_auto_theme(&win);
+        assert_eq!(win.get_theme(), 1);
+        ctx.os_light.store(false, Ordering::Relaxed);
+        ctx.sync_auto_theme(&win);
+        assert_eq!(win.get_theme(), 0);
+        // DS-54: the busy-kind prop carries the running job's kind.
+        ctx.busy_jobs.borrow_mut().insert(
+            JobKind::Backend,
+            ("Switching controller…".to_string(), Instant::now()),
+        );
+        ctx.sync_busy(&win);
+        assert!(win.get_busy());
+        assert_eq!(win.get_busy_kind(), 2);
+        assert_eq!(win.get_busy_label().as_str(), "Switching controller…");
+        ctx.busy_jobs.borrow_mut().clear();
+        ctx.sync_busy(&win);
+        assert!(!win.get_busy());
+        assert_eq!(win.get_busy_kind(), -1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
