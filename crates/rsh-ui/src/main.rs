@@ -1802,7 +1802,33 @@ impl Ctx {
                     detail: None,
                 };
                 self.notify_error(win, "Firmware", &err);
+                // The failure must not leave the stale "Updating
+                // firmware… uploading 42%" line in Settings — re-sync
+                // so the firmware line shows the real state again.
+                self.sync_overview(win);
             }
+            return;
+        }
+        if !st.running {
+            // H-4 fail-closed: the flash was running (the flag is
+            // set) but the daemon's status slot is idle — neither
+            // running nor finished. The daemon died or restarted
+            // mid-flash, so no finish will ever arrive; showing
+            // "Updating firmware…" forever would be an infinite
+            // loading state (B5). Report the interruption and reset
+            // the firmware line instead.
+            self.firmware_update_running.set(false);
+            let err = UserError {
+                code: "firmware_update_failed".to_string(),
+                title: "Firmware update interrupted".to_string(),
+                what_happened:
+                    "RSH restarted while the firmware was updating, so the update did not finish."
+                        .to_string(),
+                what_to_do: "Check the wheel is on and try the update again.".to_string(),
+                detail: None,
+            };
+            self.notify_error(win, "Firmware", &err);
+            self.sync_overview(win);
             return;
         }
         let stage = st.stage.as_deref().unwrap_or("updating");
@@ -1930,6 +1956,19 @@ impl Ctx {
     /// call itself is fast — the minutes-long flash is polled via
     /// `firmware_update_status()` on the 1 Hz tick.
     fn start_firmware_update_job(&self, win: &MainWindow) {
+        // H-4: a flash is already running — a second click must not
+        // start another one (the daemon would refuse it with a
+        // generic error; saying "already running" here is the honest
+        // answer). The start job itself is also guarded by `run_job`.
+        if self.firmware_update_running.get() {
+            self.notify(
+                win,
+                "Firmware",
+                "Firmware update already running",
+                "The wheel firmware is already updating — wait for it to finish.",
+            );
+            return;
+        }
         self.notify(
             win,
             "Firmware",
@@ -6367,6 +6406,77 @@ mod tests {
         set_extras_on_prop(&win, 3, true);
         assert!(win.get_extras_leds_on());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H-4 (FD): a flash whose daemon status goes idle mid-update
+    /// (daemon died/restarted — the slot is neither running nor
+    /// done) must fail closed: the running flag clears, the user is
+    /// told the update was interrupted, and the Settings firmware
+    /// line stops saying "Updating firmware…" (B5: never infinite
+    /// loading). The sim reports the idle status, which is exactly
+    /// what a dead daemon looks like to the poller.
+    #[test]
+    fn firmware_update_poll_fails_closed_when_status_goes_idle() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("firmware poll test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+        assert!(!ctx.firmware_update_running.get());
+
+        // Mid-flash state: the flag is set and the line shows progress.
+        ctx.firmware_update_running.set(true);
+        win.set_firmware_text("Updating firmware… uploading 42%".into());
+        let before = unread();
+        ctx.poll_firmware_update(&win);
+
+        assert!(
+            !ctx.firmware_update_running.get(),
+            "idle status must clear the running flag"
+        );
+        assert!(
+            unread() > before,
+            "the interrupted update must notify the user"
+        );
+        assert!(
+            !win.get_firmware_text().contains("Updating firmware"),
+            "firmware line must stop showing progress: {}",
+            win.get_firmware_text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H-4 (FD): while a flash runs, "Update firmware" again must
+    /// not start a second job — it notifies "already running" and
+    /// the busy map stays empty (the daemon's own already-running
+    /// refusal is the backstop, not the user-facing answer).
+    #[test]
+    fn firmware_update_start_is_ignored_while_one_runs() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("firmware start-guard test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+
+        ctx.firmware_update_running.set(true);
+        let before = unread();
+        ctx.start_firmware_update_job(&win);
+
+        assert!(
+            !ctx.busy_jobs
+                .borrow()
+                .contains_key(&JobKind::FirmwareUpdate),
+            "no second firmware-update job may start while one runs"
+        );
+        assert!(
+            unread() > before,
+            "the ignored start must tell the user an update is already running"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

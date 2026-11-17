@@ -109,6 +109,51 @@ pub fn self_check_ota_e2e_success() -> (bool, String) {
     )
 }
 
+/// `ota-e2e-same-version`: reinstalling the version the board already
+/// runs (4.0.2 over 4.0.2) is allowed — the board rule in
+/// `ota_validate.h` and the app-side verifier both reject only
+/// *older* images, never an equal one. The flash succeeds, the
+/// confirm reads 4.0.2, and the board stays on 4.0.2.
+#[must_use]
+pub fn self_check_ota_e2e_same_version_reinstall() -> (bool, String) {
+    let board = FakeBoard::start("secret", (4, 0, 2));
+    let (image, _) = build_test_image("4.0.2", FIRMWARE_IMAGE_MIN_LEN);
+    let path = write_image("same-version", &image);
+    let (result, percents) = run_flash(&path, &board, (4, 0, 2));
+    let _ = std::fs::remove_file(&path);
+    if !result.success {
+        return (
+            false,
+            format!("same-version reinstall failed: {:?}", result.error),
+        );
+    }
+    if result.version.as_deref() != Some("4.0.2") {
+        return (
+            false,
+            format!("confirmed version wrong: {:?}", result.version),
+        );
+    }
+    if board.version() != (4, 0, 2) {
+        return (
+            false,
+            format!(
+                "board moved to {:?} after a same-version reinstall",
+                board.version()
+            ),
+        );
+    }
+    if percents.last() != Some(&100) {
+        return (false, format!("upload never reached 100%: {percents:?}"));
+    }
+    (
+        true,
+        format!(
+            "reinstall OK: 4.0.2 over 4.0.2 confirmed, board stays on 4.0.2, upload reached 100% ({} reports)",
+            percents.len()
+        ),
+    )
+}
+
 /// `ota-e2e-bad-signature`: (a) a tampered image is rejected by the
 /// app before any byte reaches the board; (b) an image signed under
 /// a different key passes the app-side check (called with that key)

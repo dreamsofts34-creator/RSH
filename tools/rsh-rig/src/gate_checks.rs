@@ -699,15 +699,17 @@ pub fn gate_perf() -> (bool, String) {
 
 /// Gate: OTA end-to-end (B4, plan §C) — reuses the 2C rig
 /// scenarios (`tools/rsh-rig/src/ota_checks.rs`): signed image
-/// flashes to the fake board, tampered/wrong-key images are
-/// rejected, a mid-upload disconnect rolls back, and an upgrade
-/// preserves data. The board half is the fake board; the real-board
-/// flash stays a user-PC verification.
+/// flashes to the fake board, a same-version reinstall is allowed,
+/// tampered/wrong-key images are rejected, a mid-upload disconnect
+/// rolls back, and an upgrade preserves data. The board half is the
+/// fake board; the real-board flash stays a user-PC verification.
 #[must_use]
 pub fn gate_ota_e2e() -> (bool, String) {
     let mut report = Report::new();
     let (ok, detail) = crate::ota_checks::self_check_ota_e2e_success();
     report.check("ota-e2e-success", ok, &detail);
+    let (ok, detail) = crate::ota_checks::self_check_ota_e2e_same_version_reinstall();
+    report.check("ota-e2e-same-version", ok, &detail);
     let (ok, detail) = crate::ota_checks::self_check_ota_e2e_bad_signature();
     report.check("ota-e2e-bad-signature", ok, &detail);
     let (ok, detail) = crate::ota_checks::self_check_ota_e2e_disconnect_rollback();

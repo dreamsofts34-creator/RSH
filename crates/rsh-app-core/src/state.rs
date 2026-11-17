@@ -11451,4 +11451,22 @@ mod tests {
             .expect_err("no board must fail");
         assert!(error.contains("no HELLO"), "{error}");
     }
+
+    #[test]
+    fn start_firmware_update_without_session_fails_closed() {
+        // H-4 (FD): the new flash flow refuses to start with no live
+        // board session — before any image read, keystore lookup, or
+        // network attempt — and the status slot stays idle (no
+        // phantom "running" flash for the UI to poll).
+        let (state, _dir) = test_state();
+        assert!(state.session_activation().is_none());
+        let error = state
+            .start_firmware_update()
+            .expect_err("no session must fail");
+        assert!(error.contains("no live board session"), "{error}");
+        let status = state.firmware_update_status();
+        assert!(!status.running, "no flash may be running");
+        assert!(!status.done, "no flash may be finished");
+        assert_eq!(status.error, None);
+    }
 }

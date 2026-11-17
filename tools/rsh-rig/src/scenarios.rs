@@ -1199,6 +1199,20 @@ pub fn registry() -> Vec<Scenario> {
             }],
         },
         Scenario {
+            id: "ota-e2e-same-version",
+            description: "WebOTA e2e: reinstalling the version the board already runs (4.0.2 over 4.0.2) is allowed — the flash succeeds, the confirm reads 4.0.2, the board stays on 4.0.2.",
+            durations: (0, 0, 0),
+            wheel: WheelConfig::default(),
+            harness: HarnessConfig::default(),
+            assertions: vec![Assertion {
+                metric: "selfCheck",
+                op: "==",
+                value: MetricValue::Str("pass"),
+                note: "Self-check PASS: same-version reinstall succeeded, board stayed on 4.0.2, upload reached 100%.",
+                min_duration_s: 0.0,
+            }],
+        },
+        Scenario {
             id: "ota-e2e-bad-signature",
             description: "WebOTA e2e: tampered image rejected app-side (signature) and wrong-key image rejected board-side; board stays on 4.0.1 in both cases.",
             durations: (0, 0, 0),
@@ -1316,7 +1330,7 @@ pub fn registry() -> Vec<Scenario> {
         },
         Scenario {
             id: "gate-ota-e2e",
-            description: "Gate (B4): OTA end-to-end via the 2C rig scenarios — signed flash, bad-signature reject, disconnect rollback, upgrade preserve, installer preserves data.",
+            description: "Gate (B4): OTA end-to-end via the 2C rig scenarios — signed flash, same-version reinstall, bad-signature reject, disconnect rollback, upgrade preserve, installer preserves data.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1324,7 +1338,7 @@ pub fn registry() -> Vec<Scenario> {
                 metric: "selfCheck",
                 op: "==",
                 value: MetricValue::Str("pass"),
-                note: "Gate PASS: all five OTA self-checks pass on the fake board.",
+                note: "Gate PASS: all six OTA self-checks pass on the fake board.",
                 min_duration_s: 0.0,
             }],
         },

@@ -1197,6 +1197,7 @@ pub fn run_contract(scenario: &Scenario) -> Metrics {
         "pairing-window-expired" => self_check_pairing_window_expired(),
         "pairing-unreachable" => self_check_pairing_unreachable(),
         "ota-e2e-success" => crate::ota_checks::self_check_ota_e2e_success(),
+        "ota-e2e-same-version" => crate::ota_checks::self_check_ota_e2e_same_version_reinstall(),
         "ota-e2e-bad-signature" => crate::ota_checks::self_check_ota_e2e_bad_signature(),
         "ota-e2e-disconnect-rollback" => {
             crate::ota_checks::self_check_ota_e2e_disconnect_rollback()
