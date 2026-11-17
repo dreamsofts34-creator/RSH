@@ -35,8 +35,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -316,20 +316,16 @@ impl IpcApi {
             // is bounded to 200 ms — a healthy daemon answers in
             // under a millisecond.
             let poll_client = api.rt.block_on(async {
-                let candidate = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    IpcClient::connect(path),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok);
+                let candidate =
+                    tokio::time::timeout(Duration::from_secs(2), IpcClient::connect(path))
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
                 match candidate {
                     Some(candidate) => {
-                        let pinged = tokio::time::timeout(
-                            Duration::from_millis(200),
-                            candidate.ping(),
-                        )
-                        .await;
+                        let pinged =
+                            tokio::time::timeout(Duration::from_millis(200), candidate.ping())
+                                .await;
                         match pinged {
                             Ok(Ok(true)) => candidate,
                             _ => client.clone(),
@@ -748,9 +744,7 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
             }
         }
         if let Ok(mut modules) = cache.modules.lock() {
-            for (module, index) in
-                [("handbrake", 0), ("shifter", 1), ("horn", 2), ("led", 3)]
-            {
+            for (module, index) in [("handbrake", 0), ("shifter", 1), ("horn", 2), ("led", 3)] {
                 if let Some(enabled) = state.modules.get(module) {
                     modules[index] = Some(*enabled);
                 }

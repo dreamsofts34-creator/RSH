@@ -603,8 +603,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
         let Some(due) = self.next_reconnect_at.filter(|_| self.factory.is_some()) else {
             return PARKED_TICK_INTERVAL;
         };
-        due.saturating_duration_since(now)
-            .min(PARKED_TICK_INTERVAL)
+        due.saturating_duration_since(now).min(PARKED_TICK_INTERVAL)
     }
 
     /// Interprets a `stop_rx.changed()` outcome (DS-31): `true`
@@ -1685,10 +1684,8 @@ mod tests {
             "{delay:?}"
         );
         // Reconnect overdue: wake at once.
-        engine.next_reconnect_at = Some(
-            now.checked_sub(Duration::from_secs(1))
-                .expect("test time"),
-        );
+        engine.next_reconnect_at =
+            Some(now.checked_sub(Duration::from_secs(1)).expect("test time"));
         assert_eq!(engine.parked_tick_delay(now), Duration::ZERO);
         // With no factory an overdue retry time must NOT collapse
         // the delay (there is no reconnect to wait for).
@@ -1722,7 +1719,9 @@ mod tests {
             "parked engine must tick ~10 Hz, not 200 Hz: {sends} sends in 600 ms"
         );
         assert!(
-            recorded(&states).iter().any(|s| *s == OutputState::neutral()),
+            recorded(&states)
+                .iter()
+                .any(|s| *s == OutputState::neutral()),
             "parked engine still sends neutral"
         );
         stop.stop();

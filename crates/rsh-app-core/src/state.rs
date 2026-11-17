@@ -10439,7 +10439,8 @@ mod tests {
     /// switch itself fails on Linux without a vJoy driver, but the
     /// persisted choice must still reach the cache) all refresh it.
     #[test]
-    fn ds30_settings_arc_tracks_writes_and_snapshot_arc_agrees() {        let (state, _dir) = test_state();
+    fn ds30_settings_arc_tracks_writes_and_snapshot_arc_agrees() {
+        let (state, _dir) = test_state();
         assert_eq!(state.settings_arc().esp_ip, state.settings().esp_ip);
         let mut settings = state.settings();
         settings.esp_ip = "10.0.0.5".to_string();

@@ -175,8 +175,7 @@ impl IpcServer {
         // DS-82: the single instrumentation point — every dispatch
         // (inline or blocking) records its latency per method.
         let started = std::time::Instant::now();
-        let method = parse_request(line)
-            .map_or_else(|_| "?".to_string(), |request| request.method);
+        let method = parse_request(line).map_or_else(|_| "?".to_string(), |request| request.method);
         let out = match self.handle_line(line) {
             Ok(resp) => encode_response(&resp).ok(),
             Err(error) => {
@@ -806,12 +805,16 @@ mod tests {
     #[test]
     fn ds82_response_text_records_dispatch_latency() {
         let server = stub_server();
-        assert!(server
-            .response_text(r#"{"v":1,"id":60,"method":"ping","params":{}}"#)
-            .is_some());
-        assert!(server
-            .response_text(r#"{"v":1,"id":61,"method":"poll","params":{}}"#)
-            .is_some());
+        assert!(
+            server
+                .response_text(r#"{"v":1,"id":60,"method":"ping","params":{}}"#)
+                .is_some()
+        );
+        assert!(
+            server
+                .response_text(r#"{"v":1,"id":61,"method":"poll","params":{}}"#)
+                .is_some()
+        );
         let snapshot = crate::ipc_latency_snapshot();
         let ping = snapshot
             .iter()

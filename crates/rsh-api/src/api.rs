@@ -619,7 +619,14 @@ pub trait AppApi: Send + Sync {
     fn slow_poll(&self) -> SlowPollState {
         let mut tunings = std::collections::BTreeMap::new();
         for module in [
-            "steering", "throttle", "brake", "clutch", "handbrake", "led", "shifter", "horn",
+            "steering",
+            "throttle",
+            "brake",
+            "clutch",
+            "handbrake",
+            "led",
+            "shifter",
+            "horn",
         ] {
             tunings.insert(module.to_string(), self.get_tuning(module));
         }
@@ -1515,7 +1522,14 @@ mod tests {
         // All 8 module tunings + all 4 module flags present.
         assert_eq!(slow.tunings.len(), 8);
         for module in [
-            "steering", "throttle", "brake", "clutch", "handbrake", "led", "shifter", "horn",
+            "steering",
+            "throttle",
+            "brake",
+            "clutch",
+            "handbrake",
+            "led",
+            "shifter",
+            "horn",
         ] {
             assert!(slow.tunings.contains_key(module), "{module}");
         }

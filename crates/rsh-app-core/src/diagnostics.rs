@@ -448,8 +448,18 @@ fn identity_of(meta: &fs::Metadata) -> FileIdentity {
 
 #[cfg(windows)]
 fn identity_of(meta: &fs::Metadata) -> FileIdentity {
-    use std::os::windows::fs::MetadataExt;
-    FileIdentity(meta.file_index(), 0)
+    // `MetadataExt::file_index` is unstable (`windows_by_handle`)
+    // on this toolchain, so the identity is (length, mtime-nanos):
+    // a deleted-and-recreated log gets a new mtime and a truncated
+    // log a new length, so both are detected like Unix dev+ino.
+    use std::time::UNIX_EPOCH;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    FileIdentity(meta.len(), mtime)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -461,7 +471,7 @@ fn identity_of(_meta: &fs::Metadata) -> FileIdentity {
 /// reused across appends, so a log line costs one `write_all`
 /// instead of `create_dir_all` + open + write + flush + close.
 /// `identity` is the file's identity at open time (Unix dev+ino,
-/// Windows file index); it is checked against the live path on
+/// Windows length+mtime); it is checked against the live path on
 /// every write, so a deleted-and-recreated log (or a test that
 /// wipes its temp dir) is detected and the handle reopened.
 struct OpenLog {
@@ -549,9 +559,10 @@ fn write_log_line(log_dir: &Path, line: &str, now: SystemTime) -> Option<PathBuf
             handles.clear();
         }
         let file = open_log_file(&path, log_dir)?;
-        let identity = file.metadata().ok().map_or(FileIdentity(0, 0), |meta| {
-            identity_of(&meta)
-        });
+        let identity = file
+            .metadata()
+            .ok()
+            .map_or(FileIdentity(0, 0), |meta| identity_of(&meta));
         handles.insert(path.clone(), OpenLog { file, identity });
     }
     let open = handles.get_mut(&path)?;

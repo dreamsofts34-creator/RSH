@@ -1804,12 +1804,12 @@ pub fn gate_ota_flash_caller() -> (bool, String) {
 ///
 /// The release workflow's tag check is fail-closed: the tag
 /// version must match `[workspace.package] version` in
-/// `Cargo.toml`. The gate requires the bump to 2.0.2 to be
+/// `Cargo.toml`. The gate requires the bump to 2.0.3 to be
 /// present in all three places that carry the version before any
 /// release is cut: the workspace `Cargo.toml`, the `MainWindow`
 /// `app-version` (`ui/main.slint`), and the Settings screen
 /// `app-version` (`ui/screens/settings.slint`). Currently FAILS:
-/// all three still say 2.0.1 — the bump is the gate
+/// all three still say 2.0.2 — the bump is the gate
 /// coordinator's step, done just before the release.
 #[must_use]
 pub fn gate_version_bump() -> (bool, String) {
@@ -1822,20 +1822,20 @@ pub fn gate_version_bump() -> (bool, String) {
     let pkg_section = &cargo[pkg_start..];
     report.check(
         "version-cargo-toml",
-        pkg_section.contains("version = \"2.0.2\""),
-        "workspace Cargo.toml version is 2.0.2",
+        pkg_section.contains("version = \"2.0.3\""),
+        "workspace Cargo.toml version is 2.0.3",
     );
     let main_slint = read("crates/rsh-ui/ui/main.slint").unwrap_or_default();
     report.check(
         "version-main-slint",
-        main_slint.contains("app-version: \"2.0.2\""),
-        "MainWindow app-version is 2.0.2",
+        main_slint.contains("app-version: \"2.0.3\""),
+        "MainWindow app-version is 2.0.3",
     );
     let settings = read("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
     report.check(
         "version-settings-slint",
-        settings.contains("app-version: \"RSH 2.0.2\""),
-        "Settings app-version is RSH 2.0.2",
+        settings.contains("app-version: \"RSH 2.0.3\""),
+        "Settings app-version is RSH 2.0.3",
     );
     let workflow = read(".github/workflows/release.yml").unwrap_or_default();
     report.check(

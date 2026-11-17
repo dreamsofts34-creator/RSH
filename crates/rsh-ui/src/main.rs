@@ -1528,9 +1528,13 @@ impl Ctx {
         } else {
             "No wheel data yet — check the wheel is connected.".to_string()
         };
-        set_if_changed(win.get_setup_calibration_reason(), setup_reason.into(), |v| {
-            win.set_setup_calibration_reason(v);
-        });
+        set_if_changed(
+            win.get_setup_calibration_reason(),
+            setup_reason.into(),
+            |v| {
+                win.set_setup_calibration_reason(v);
+            },
+        );
     }
 
     /// Refresh the cached calibration read (`calibration()`):
@@ -1670,9 +1674,13 @@ impl Ctx {
             self.pairing_rejoin_since.set(None);
             win.set_setup_pair_status("Paired — wheel connected.".into());
         }
-        set_if_changed(win.get_setup_rejoining(), self.pairing_rejoining.get(), |v| {
-            win.set_setup_rejoining(v);
-        });
+        set_if_changed(
+            win.get_setup_rejoining(),
+            self.pairing_rejoining.get(),
+            |v| {
+                win.set_setup_rejoining(v);
+            },
+        );
         set_if_changed(
             win.get_conn_label(),
             conn_label_for(connecting, live, &conn.label, self.pairing_rejoining.get()).into(),
@@ -1693,12 +1701,20 @@ impl Ctx {
         } else {
             set_if_changed(win.get_paired(), false, |v| win.set_paired(v));
         }
-        set_if_changed(win.get_setup_wifi_joined(), active && conn.transport == ApiTransport::Wifi, |v| {
-            win.set_setup_wifi_joined(v);
-        });
-        set_if_changed(win.get_setup_usb_available(), active && conn.transport == ApiTransport::Usb, |v| {
-            win.set_setup_usb_available(v);
-        });
+        set_if_changed(
+            win.get_setup_wifi_joined(),
+            active && conn.transport == ApiTransport::Wifi,
+            |v| {
+                win.set_setup_wifi_joined(v);
+            },
+        );
+        set_if_changed(
+            win.get_setup_usb_available(),
+            active && conn.transport == ApiTransport::Usb,
+            |v| {
+                win.set_setup_usb_available(v);
+            },
+        );
         let transport_label = match conn.transport {
             rsh_api::ApiTransport::Wifi => "Wi-Fi",
             rsh_api::ApiTransport::Usb => "USB",
@@ -1761,28 +1777,40 @@ impl Ctx {
         set_if_changed(win.get_dashed_line(), self.dashed_line_cached(), |v| {
             win.set_dashed_line(v);
         });
-        set_if_changed(win.get_crosshair(), self.crosshair_commands_cached(mx, my), |v| {
-            win.set_crosshair(v);
-        });
+        set_if_changed(
+            win.get_crosshair(),
+            self.crosshair_commands_cached(mx, my),
+            |v| {
+                win.set_crosshair(v);
+            },
+        );
         set_if_changed(
             win.get_curve_commands(),
             self.curve_commands_cached(deadzone, exponent),
             |v| win.set_curve_commands(v),
         );
         set_if_changed(win.get_deadzone(), deadzone / 10.0, |v| win.set_deadzone(v));
-        set_if_changed(win.get_deadzone_text(), format!("{deadzone:.0}%").into(), |v| {
-            win.set_deadzone_text(v);
-        });
+        set_if_changed(
+            win.get_deadzone_text(),
+            format!("{deadzone:.0}%").into(),
+            |v| {
+                win.set_deadzone_text(v);
+            },
+        );
         // A24: slider range is 1.0..2.0 now, so the normalised value
         // is exponent - 1.0 (was / 2.0 for the old 1.0..3.0 range).
-        set_if_changed(win.get_curve_val(), exponent - 1.0, |v| win.set_curve_val(v));
+        set_if_changed(win.get_curve_val(), exponent - 1.0, |v| {
+            win.set_curve_val(v)
+        });
         set_if_changed(win.get_curve_text(), format!("{exponent:.2}").into(), |v| {
             win.set_curve_text(v);
         });
         set_if_changed(win.get_preset(), self.tuning.borrow().preset, |v| {
             win.set_preset(v);
         });
-        set_if_changed(win.get_unsaved(), self.unsaved.get(), |v| win.set_unsaved(v));
+        set_if_changed(win.get_unsaved(), self.unsaved.get(), |v| {
+            win.set_unsaved(v)
+        });
         // H10: pressed-index comes ONLY from live button state — the
         // first pressed wheel button (1–12) highlights its tile
         // (including while learning — the physical button being held
@@ -9841,6 +9869,7 @@ mod tests {
                 board_mac: None,
                 replacement_required: false,
                 key_reset_armed: false,
+                attempt_log: Vec::new(),
             }
         }
         // Board never answered: attempt + address + "never answered".
