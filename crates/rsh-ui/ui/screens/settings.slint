@@ -13,8 +13,10 @@
 // switch calls connect(), backend switch calls set_output_backend()
 // (default vJoy), Start with Windows seeds from autost() and calls
 // set_autostart(bool), profiles come from list_profiles(), firmware /
-// update / backup texts are Rust-owned. Restore has no backend call
-// yet, so its button is disabled with a reason. The About card is
+// update / backup texts are Rust-owned. Restore calls the real
+// backend now (DS-52: restore_backup is wired UI → IPC → daemon →
+// app-core); a missing backup reports a graceful error instead of
+// a dead button. The About card is
 // gone (B3: not in the preview) — attribution lives on the shell
 // About page. English only; no language selector (§9).
 
@@ -84,6 +86,10 @@ export component SettingsScreen inherits VerticalLayout {
     // ---- state owned by Rust (simulated defaults; AppApi covers
     // connection + pairing only — see header)
     in-out property <bool> connected: true;
+    // DS-54: which job kind the busy strip shows, as a
+    // JobKind::order value (-1 = idle) — the invoking button
+    // disables + dims while its job runs.
+    in property <int> busy-kind: -1;
     in-out property <int> connection-type: 0; // 0 Wi-Fi, 1 USB cable
     // L-2: "—" until Rust sets the live address — never a hardcoded
     // default (the window binds this to setup-address).
@@ -155,7 +161,7 @@ export component SettingsScreen inherits VerticalLayout {
                             Rectangle { height: 8px; }
                             Seg {
                                 options: ["Wi-Fi", "USB cable"];
-                                enabled: [true, true];
+                                enabled: [busy-kind != 1, busy-kind != 1];
                                 selected: connection-type;
                                 selected-changed(i) => { connection-type = i; connection-selected(i); }
                             }
@@ -189,7 +195,7 @@ export component SettingsScreen inherits VerticalLayout {
                                         accepted => { address-accepted(self.text); }
                                     }
                                 }
-                                Btn { label: "Reconnect"; clicked => { reconnect(); } }
+                                Btn { label: "Reconnect"; disabled: busy-kind == 0; clicked => { reconnect(); } }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
                             HorizontalLayout {
@@ -202,7 +208,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     Text { text: "Pair a new wheel"; font-size: 13px; color: Theme.text; }
                                     Text { text: "120 s pairing window"; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                                 }
-                                Btn { label: "Pair"; clicked => { pair-requested(); } }
+                                Btn { label: "Pair"; disabled: busy-kind == 12; clicked => { pair-requested(); } }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
                             // A1 (v2.0.2): the setup-reopen row is easy
@@ -239,12 +245,14 @@ export component SettingsScreen inherits VerticalLayout {
                                     title: "HIDMaestro";
                                     desc: "Needs admin permission when first used.";
                                     selected: backend == 0;
+                                    disabled: busy-kind == 2;
                                     clicked => { backend = 0; backend-selected(0); }
                                 }
                                 RadioOptionCard {
                                     title: "vJoy";
                                     desc: "No admin prompt. Needs vJoy.";
                                     selected: backend == 1;
+                                    disabled: busy-kind == 2;
                                     clicked => { backend = 1; backend-selected(1); }
                                 }
                             }
@@ -297,7 +305,7 @@ export component SettingsScreen inherits VerticalLayout {
                             HorizontalLayout {
                                 alignment: space-between;
                                 Text { text: "Profiles"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
-                                Btn { label: "New"; clicked => { new-profile(); } }
+                                Btn { label: "New"; disabled: busy-kind == 8; clicked => { new-profile(); } }
                             }
                             Rectangle { height: 8px; }
                             for p[i] in profiles : VerticalLayout {
@@ -317,8 +325,8 @@ export component SettingsScreen inherits VerticalLayout {
                                         }
                                         Text { text: p.games; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                                     }
-                                    if p.active : Btn { label: "Duplicate"; clicked => { duplicate-profile(i); } }
-                                    if !p.active : Btn { label: "Use"; clicked => { use-profile(i); } }
+                                    if p.active : Btn { label: "Duplicate"; disabled: busy-kind == 8; clicked => { duplicate-profile(i); } }
+                                    if !p.active : Btn { label: "Use"; disabled: busy-kind == 8; clicked => { use-profile(i); } }
                                 }
                             }
                         }
@@ -374,8 +382,8 @@ export component SettingsScreen inherits VerticalLayout {
                                 // global busy strip shows progress).
                                 HorizontalLayout {
                                     spacing: 6px;
-                                    Btn { label: "Check"; clicked => { check-firmware(); } }
-                                    Btn { label: "Update firmware"; clicked => { update-firmware(); } }
+                                    Btn { label: "Check"; disabled: busy-kind == 3; clicked => { check-firmware(); } }
+                                    Btn { label: "Update firmware"; disabled: busy-kind == 4; clicked => { update-firmware(); } }
                                 }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
@@ -389,7 +397,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     Text { text: "App updates"; font-size: 13px; color: Theme.text; }
                                     Text { text: app-update-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                                 }
-                                Btn { label: "Check"; clicked => { check-app-updates(); } }
+                                Btn { label: "Check"; disabled: busy-kind == 16; clicked => { check-app-updates(); } }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
                             HorizontalLayout {
@@ -401,12 +409,11 @@ export component SettingsScreen inherits VerticalLayout {
                                     spacing: 0px;
                                     Text { text: "Backups"; font-size: 13px; color: Theme.text; }
                                     Text { text: backup-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
-                                    Text { text: "Restore isn't supported yet."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
                                 }
                                 HorizontalLayout {
                                     spacing: 6px;
-                                    Btn { label: "Back up"; clicked => { backup(); } }
-                                    Btn { label: "Restore"; disabled: true; clicked => { restore(); } }
+                                    Btn { label: "Back up"; disabled: busy-kind == 14; clicked => { backup(); } }
+                                    Btn { label: "Restore"; disabled: busy-kind == 14; clicked => { restore(); } }
                                 }
                             }
                         }

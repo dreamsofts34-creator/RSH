@@ -423,6 +423,23 @@ export component SliderRow inherits VerticalLayout {
     in property <bool> disabled: false;
     callback changed(float);
     callback value-edited(string);
+    // DS-63: local edit buffer — the box shows the buffer, which only
+    // syncs from value-text when the box is not focused, so a Rust
+    // re-sync (slider drag, profile load, per-frame refresh) never
+    // clobbers text the user is typing. `text: edit-buffer` is a
+    // two-way binding, so typing updates the buffer; the first
+    // imperative write replaces the initial `value-text` binding.
+    // An empty box is provably invalid: red border + note. On blur
+    // the buffer re-syncs — valid input is reformatted canonically
+    // ("3" -> "3%"), invalid input reverts to the last good value.
+    property <string> edit-buffer: value-text;
+    property <bool> edit-invalid: false;
+    changed value-text => {
+        if (!num.has-focus) {
+            edit-buffer = value-text;
+            edit-invalid = false;
+        }
+    }
     spacing: 6px;
     opacity: disabled ? 0.45 : 1;
     HorizontalLayout {
@@ -436,7 +453,7 @@ export component SliderRow inherits VerticalLayout {
             height: 26px;
             border-radius: 6px;
             border-width: 1px;
-            border-color: Theme.line;
+            border-color: edit-invalid ? Theme.bad : Theme.line;
             background: Theme.bg;
             // Raw TextInput (not the std LineEdit widget): the Fluent
             // widget hardcodes its own palette and a 160px min-width.
@@ -446,12 +463,18 @@ export component SliderRow inherits VerticalLayout {
                 horizontal-alignment: right;
                 accessible-label: label;
                 enabled: !disabled;
-                text: value-text;
+                text: edit-buffer;
                 font-family: Theme.font-mono;
                 font-size: 12px;
                 font-weight: 500;
                 color: Theme.text;
-                edited => { value-edited(num.text); }
+                edited => { edit-invalid = num.text == ""; value-edited(num.text); }
+                changed has-focus => {
+                    if (!self.has-focus) {
+                        edit-buffer = value-text;
+                        edit-invalid = false;
+                    }
+                }
             }
         }
     }
@@ -518,6 +541,8 @@ export component SliderRow inherits VerticalLayout {
             moved => { if (self.pressed && !disabled) { changed(Math.max(0, Math.min(1, self.mouse-x / track.width))); } }
         }
     }
+    // DS-63: empty input is invalid — red border above, one-line note here.
+    if edit-invalid : Text { text: "Enter a number."; font-size: 11.5px; color: Theme.bad; }
 }
 
 // ---------------------------------------------------------------- preset chips (§6: Soft / Balanced / Sharp / Custom)
@@ -916,6 +941,10 @@ export component RadioOptionCard inherits Rectangle {
     in property <string> title;
     in property <string> desc;
     in property <bool> selected;
+    // DS-54: disabled cards never fire `clicked` and render dimmed
+    // (same contract as Btn) — the backend switch dims while its
+    // job runs.
+    in property <bool> disabled: false;
     callback clicked();
     accessible-label: title;
     accessible-role: radio-button;
@@ -924,11 +953,13 @@ export component RadioOptionCard inherits Rectangle {
     border-width: 1px;
     border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : (ta.has-hover ? Theme.faint : Theme.line));
     background: selected ? Theme.acc-bg : (ta.pressed ? Theme.pressed-bg : ta.has-hover ? Theme.hover-bg : Theme.panel2);
+    opacity: disabled ? 0.45 : 1;
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
         height: 100%;
         key-pressed(event) => {
+            if (disabled) { return reject; }
             if (event.text == Key.Return || event.text == Key.Space) {
                 clicked();
                 return accept;
@@ -961,7 +992,7 @@ export component RadioOptionCard inherits Rectangle {
             Text { text: desc; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
         }
     }
-    ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { if (!disabled) { clicked(); } } }
 }
 
 // ---------------------------------------------------------------- empty / error banner (§6: one line + one action button)
@@ -970,7 +1001,12 @@ export component EmptyBanner inherits Rectangle {
     in property <string> action-label: "";
     in property <bool> is-error;
     callback action-clicked();
-    height: 36px;
+    // DS-21 (U-03): was a fixed 36 px with no wrapping, so long
+    // strings (the ~100-char Overview banners, unbounded
+    // daemon-error text) were cut off mid-sentence with no way to
+    // read them. The text wraps now and the banner grows with it;
+    // 36 px stays the minimum for a single line.
+    min-height: 36px;
     border-radius: 8px;
     border-width: 1px;
     border-color: is-error ? Theme.bad : Theme.line;
@@ -978,10 +1014,13 @@ export component EmptyBanner inherits Rectangle {
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 12px;
+        padding-top: 8px;
+        padding-bottom: 8px;
         spacing: 10px;
         Text {
             horizontal-stretch: 1;
             vertical-alignment: center;
+            wrap: word-wrap;
             text: text;
             font-size: 12px;
             color: is-error ? Theme.bad : Theme.mute;
