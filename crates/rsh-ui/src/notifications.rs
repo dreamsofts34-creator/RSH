@@ -148,6 +148,7 @@ impl NotificationCenter {
     /// Parse an `HH:MM:SS` time label back to seconds since
     /// midnight (the fake clock for [`NotificationCenter::push_with_time`]
     /// tests; `0` when the label does not parse).
+    #[cfg(test)]
     fn time_string_to_secs(time: &str) -> u64 {
         let mut parts = time.split(':');
         let parse = |part: Option<&str>| part.and_then(|p| p.parse::<u64>().ok());
@@ -251,6 +252,9 @@ impl NotificationCenter {
     /// pushes with this exact `(kind, title, body)` were folded
     /// into the stored item instead of becoming new rows (`0` when
     /// no such item exists, or it was never repeated).
+    /// Tests only (the drawer reads the `suppressed` field off the
+    /// stored item instead).
+    #[cfg(test)]
     #[must_use]
     pub fn suppressed_count(&self, kind: &str, title: &str, body: &str) -> u32 {
         self.items

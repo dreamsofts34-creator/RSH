@@ -36,7 +36,9 @@
 //! Platform: the process/X11 checks are Linux-only. On other
 //! platforms each check returns a PASS with an explicit SKIP note
 //! (the Windows execution proof is F18, not this file).
-//! Environment: needs `Xvfb` + `xdotool` and the debug binaries
+//! Environment: needs `Xvfb` + `xdotool` + `libxkbcommon-x11-0` +
+//! `libxcb-xkb1` (winit panics at startup without the xkbcommon
+//! library) and the debug binaries
 //! (`cargo build -p rsh-ui -p rsh-daemon -p rsh-fake-daemon` —
 //! `tools/gate-checks/run-gate.sh` builds them first). Staging goes
 //! under `target/rsh-rig-stage-<name>-<pid>` (NOT `/tmp`: the UI
@@ -105,14 +107,27 @@ fn have(cmd: &str) -> bool {
 }
 
 /// Stage directory for one check on the home disk (NOT `/tmp` —
-/// see the module docs): `target/rsh-rig-stage-<name>-<pid>`.
-/// Removed afterwards (best effort).
+/// see the module docs): `target/rig-<name>-<pid>`. The name is
+/// capped at 12 chars: the daemon socket is
+/// `<stage>/data/rsh-daemon.sock` and Unix socket paths cap at 108
+/// chars (`sun_path`) — the old `rsh-rig-stage-<name>-<pid>` prefix
+/// made the socket ~112 chars, so the daemon could never bind and
+/// every race-round check saw 7 "live" daemons stuck in the F15
+/// grace wait. Removed afterwards (best effort).
 fn stage_dir(name: &str) -> PathBuf {
+    let short: String = name.chars().take(12).collect();
     let dir = crate::gate_checks::repo_root()
         .join("target")
-        .join(format!("rsh-rig-stage-{name}-{}", std::process::id()));
+        .join(format!("rig-{short}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
-    dir
+    // Canonicalize: `repo_root()` is `tools/rsh-rig/../..`, so the
+    // raw path carries `/../..` segments and the daemon socket
+    // (`<stage>/data/rsh-daemon.sock`) exceeds SUN_LEN even when the
+    // normalized path fits — the daemon then fails all 5 binds with
+    // "path must be shorter than SUN_LEN" and every loser waits out
+    // its 20-try grace and exits 1. Canonicalize once here so every
+    // child sees the short real path.
+    std::fs::canonicalize(&dir).unwrap_or(dir)
 }
 
 fn debug_bin(name: &str) -> Option<PathBuf> {
@@ -202,6 +217,15 @@ impl XvfbSession {
                     .stderr(Stdio::null())
                     .status()
                     .is_ok_and(|s| s.code() == Some(0) || s.code() == Some(1));
+                // Freshness is guaranteed by construction: our
+                // Xvfb child being alive means WE bound this
+                // display (a taken display makes the child exit at
+                // once, caught by `try_wait` above) — a stale server
+                // left by a killed run cannot share the display
+                // with our live child. (An earlier draft required
+                // zero windows via `search --name ''`, but the empty
+                // pattern also matches the root window, so a fresh
+                // server never passed it.)
                 if reachable {
                     up = true;
                     break;
@@ -244,13 +268,23 @@ fn xdotool(display: &str, args: &[&str]) -> (bool, String) {
     }
 }
 
-fn window_visible(display: &str) -> bool {
-    let (ok, out) = xdotool(display, &["search", "--onlyvisible", "--name", "RSH"]);
+/// Window queries are scoped by OWNER PID, never by name:
+/// `xdotool search --name` matches the legacy `WM_NAME`, which the
+/// main window ("RSH — Real Sim Hub", `crates/rsh-ui/ui/main.slint`)
+/// does not carry in a matchable form (an exact-title search finds
+/// 0 windows, a bare `--name RSH` finds only the daemon's tray
+/// popup "RSH Wheel — Tray"). `--pid` uses `_NET_WM_PID`, which
+/// winit sets reliably — and it excludes the daemon's popup window
+/// (a different pid) by construction.
+fn window_visible(display: &str, pid: u32) -> bool {
+    let pid_arg = pid.to_string();
+    let (ok, out) = xdotool(display, &["search", "--onlyvisible", "--pid", &pid_arg]);
     ok && !out.is_empty()
 }
 
-fn window_id(display: &str) -> Option<String> {
-    let (ok, out) = xdotool(display, &["search", "--name", "RSH"]);
+fn window_id(display: &str, pid: u32) -> Option<String> {
+    let pid_arg = pid.to_string();
+    let (ok, out) = xdotool(display, &["search", "--pid", &pid_arg]);
     if ok {
         out.lines().next().map(str::to_string)
     } else {
@@ -903,7 +937,20 @@ pub fn gate_already_running_race() -> (bool, String) {
                 }
             }
         }
-        std::thread::sleep(Duration::from_secs(5));
+        // Wait for settlement: the winner binds (ping true) and the
+        // 7 losers exit — up to 20 s (cold debug binary + the 10 s
+        // F15 grace wait). Sampling at a fixed 5 s caught losers
+        // still inside their grace window.
+        let settled = wait_until(Duration::from_secs(20), || {
+            let live_n = procs_with_arg(&needle)
+                .iter()
+                .filter(|(pid, _)| {
+                    let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                    String::from_utf8_lossy(&cmd).contains("rsh-daemon")
+                })
+                .count();
+            live_n == 1 && ipc_ping(&data_dir)
+        });
         let live: Vec<u32> = procs_with_arg(&needle)
             .into_iter()
             .filter(|(pid, _)| {
@@ -913,6 +960,7 @@ pub fn gate_already_running_race() -> (bool, String) {
             .map(|(pid, _)| pid)
             .collect();
         let ping_ok = ipc_ping(&data_dir);
+        let _ = settled;
         // The losers exit 0 quickly (live peer answers); collect
         // their codes, then stop the winner.
         let mut loser_codes: Vec<Option<i32>> = Vec::new();
@@ -976,11 +1024,40 @@ pub fn gate_already_running_race() -> (bool, String) {
             );
         }
     };
-    // The second instance forwards its page and exits 0 within 5 s.
-    let second_exit = wait_child_timeout(&mut ui2, Duration::from_secs(5));
-    std::thread::sleep(Duration::from_secs(5));
+    // Either launch may win the pid claim (scheduling decides
+    // which process starts first) — so do NOT assume ui1 is First
+    // and ui2 Second. Wait up to 10 s for exactly one of them to
+    // exit (the Second forwards its page and exits 0); the First
+    // stays alive with the one window.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (second_exit, both_exited) = loop {
+        let e1 = ui1.try_wait().ok().flatten();
+        let e2 = ui2.try_wait().ok().flatten();
+        match (e1, e2) {
+            (Some(status), None) | (None, Some(status)) => {
+                break (status.code(), false);
+            }
+            (Some(_), Some(_)) => break (None, true),
+            (None, None) => {
+                if Instant::now() >= deadline {
+                    break (None, false);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    // Let the survivor's window appear before counting.
+    std::thread::sleep(Duration::from_secs(3));
+    // Count the survivor's windows by owner pid (name matching
+    // cannot see the main window — see `window_visible`).
+    let survivor_pid = if ui1.try_wait().ok().flatten().is_none() {
+        ui1.id()
+    } else {
+        ui2.id()
+    };
     let windows = {
-        let (ok, out) = xdotool(&display, &["search", "--name", "RSH"]);
+        let pid_arg = survivor_pid.to_string();
+        let (ok, out) = xdotool(&display, &["search", "--pid", &pid_arg]);
         if ok { out.lines().count() } else { 0 }
     };
     let ui_count = procs_with_arg(&ui_data.to_string_lossy())
@@ -991,11 +1068,12 @@ pub fn gate_already_running_race() -> (bool, String) {
         })
         .count();
     kill_child(&mut ui1);
+    kill_child(&mut ui2);
     let _ = std::fs::remove_dir_all(&stage);
     report.check(
         "second UI exits 0 (page forwarded, no duplicate window)",
-        second_exit == Some(0),
-        &format!("second UI exit: {second_exit:?}"),
+        second_exit == Some(0) && !both_exited,
+        &format!("second UI exit: {second_exit:?}, both exited: {both_exited}"),
     );
     report.check(
         "exactly 1 RSH window",
@@ -1074,7 +1152,9 @@ pub fn gate_xvfb_hidden_shown() -> (bool, String) {
         }
     };
     let ui_pid = ui_child.id();
-    let shown = wait_until(Duration::from_secs(20), || window_visible(&display));
+    let shown = wait_until(Duration::from_secs(20), || {
+        window_visible(&display, ui_child.id())
+    });
     if !shown {
         kill_child(&mut ui_child);
         kill_child(&mut daemon);
@@ -1088,13 +1168,13 @@ pub fn gate_xvfb_hidden_shown() -> (bool, String) {
     let mut worst_reopen_ms: u128 = 0;
     let mut cycles_ok = true;
     for cycle in 1..=10 {
-        let Some(wid) = window_id(&display) else {
+        let Some(wid) = window_id(&display, ui_pid) else {
             cycles_ok = false;
             report.note(&format!("cycle {cycle}: no window id found"));
             break;
         };
         xdotool(&display, &["windowunmap", &wid]);
-        let hidden = wait_until(Duration::from_secs(2), || !window_visible(&display));
+        let hidden = wait_until(Duration::from_secs(2), || !window_visible(&display, ui_pid));
         if !hidden {
             cycles_ok = false;
             report.note(&format!("cycle {cycle}: window did not hide after unmap"));
@@ -1102,7 +1182,7 @@ pub fn gate_xvfb_hidden_shown() -> (bool, String) {
         }
         let t0 = Instant::now();
         xdotool(&display, &["windowmap", &wid]);
-        let back = wait_until(Duration::from_secs(1), || window_visible(&display));
+        let back = wait_until(Duration::from_secs(1), || window_visible(&display, ui_pid));
         let reopen_ms = t0.elapsed().as_millis();
         worst_reopen_ms = worst_reopen_ms.max(reopen_ms);
         if !back {
@@ -1208,7 +1288,9 @@ pub fn gate_rapid_reconnect() -> (bool, String) {
             );
         }
     };
-    let shown = wait_until(Duration::from_secs(20), || window_visible(&display));
+    let shown = wait_until(Duration::from_secs(20), || {
+        window_visible(&display, ui_child.id())
+    });
     if !shown {
         kill_child(&mut ui_child);
         kill_child(&mut daemon);
@@ -1220,7 +1302,7 @@ pub fn gate_rapid_reconnect() -> (bool, String) {
     std::thread::sleep(Duration::from_secs(5));
     let spawns_before = count_lines_containing(&ui_log, "spawned daemon");
     for _ in 0..20 {
-        if let Some(wid) = window_id(&display) {
+        if let Some(wid) = window_id(&display, ui_child.id()) {
             xdotool(&display, &["windowunmap", &wid]);
             std::thread::sleep(Duration::from_millis(100));
             xdotool(&display, &["windowmap", &wid]);
@@ -1248,7 +1330,7 @@ pub fn gate_rapid_reconnect() -> (bool, String) {
         .collect();
     let zombies = procs.iter().filter(|(_, z)| *z).count();
     let ping_after = ipc_ping(&data_dir);
-    let visible_after = window_visible(&display);
+    let visible_after = window_visible(&display, ui_child.id());
     let spawns = count_lines_containing(&ui_log, "spawned daemon") - spawns_before;
     let daemon_pid_ok = std::fs::read_to_string(data_dir.join("rsh-daemon.pid"))
         .ok()
@@ -1353,7 +1435,9 @@ fn run_fb_condition(
     }
     let launched = Instant::now();
     let mut child = launch_ui(&ui, &data_dir, display, quit_after, &log_path, &env).ok()?;
-    let shown = wait_until(Duration::from_secs(20), || window_visible(display));
+    let shown = wait_until(Duration::from_secs(20), || {
+        window_visible(display, child.id())
+    });
     if !shown {
         kill_child(&mut child);
         let _ = std::fs::remove_dir_all(&stage);
@@ -1385,7 +1469,7 @@ fn run_fb_condition(
             }
             std::thread::sleep(Duration::from_millis(100));
             samples += 1;
-            if !window_visible(display) || !child_alive(&mut child) {
+            if !window_visible(display, child.id()) || !child_alive(&mut child) {
                 missed += 1;
             }
         }
@@ -1400,15 +1484,17 @@ fn run_fb_condition(
     while Instant::now() < close_at {
         std::thread::sleep(Duration::from_millis(100));
         samples += 1;
-        if !window_visible(display) || !child_alive(&mut child) {
+        if !window_visible(display, child.id()) || !child_alive(&mut child) {
             missed += 1;
         }
     }
     // Input-ack: windowclose → time until the window is gone.
-    let close_ack_ms = window_id(display).and_then(|wid| {
+    let close_ack_ms = window_id(display, child.id()).and_then(|wid| {
         let t0 = Instant::now();
         xdotool(display, &["windowclose", &wid]);
-        if wait_until(Duration::from_secs(5), || !window_visible(display)) {
+        if wait_until(Duration::from_secs(5), || {
+            !window_visible(display, child.id())
+        }) {
             Some(t0.elapsed().as_millis())
         } else {
             None
@@ -1619,7 +1705,9 @@ pub fn gate_toast_dedupe_integration() -> (bool, String) {
             );
         }
     };
-    let shown = wait_until(Duration::from_secs(20), || window_visible(&display));
+    let shown = wait_until(Duration::from_secs(20), || {
+        window_visible(&display, child.id())
+    });
     if !shown {
         kill_child(&mut child);
         return (
@@ -1726,7 +1814,9 @@ pub fn gate_lifecycle_soak() -> (bool, String) {
             );
         }
     };
-    let shown = wait_until(Duration::from_secs(20), || window_visible(&display));
+    let shown = wait_until(Duration::from_secs(20), || {
+        window_visible(&display, ui_child.id())
+    });
     if !shown {
         kill_child(&mut ui_child);
         kill_child(&mut daemon);
@@ -1750,7 +1840,7 @@ pub fn gate_lifecycle_soak() -> (bool, String) {
         // Events: X hide/show at 120 s and 240 s; SIGKILL at 180 s.
         if secs >= 120 && !reopened_at_120 {
             reopened_at_120 = true;
-            if let Some(wid) = window_id(&display) {
+            if let Some(wid) = window_id(&display, ui_child.id()) {
                 xdotool(&display, &["windowunmap", &wid]);
                 std::thread::sleep(Duration::from_millis(500));
                 xdotool(&display, &["windowmap", &wid]);
@@ -1758,7 +1848,7 @@ pub fn gate_lifecycle_soak() -> (bool, String) {
         }
         if secs >= 240 && !reopened_at_240 {
             reopened_at_240 = true;
-            if let Some(wid) = window_id(&display) {
+            if let Some(wid) = window_id(&display, ui_child.id()) {
                 xdotool(&display, &["windowunmap", &wid]);
                 std::thread::sleep(Duration::from_millis(500));
                 xdotool(&display, &["windowmap", &wid]);
