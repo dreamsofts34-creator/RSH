@@ -1329,6 +1329,18 @@ impl AppStateCore {
         lock(&self.pairing_log).iter().cloned().collect()
     }
 
+    /// Drains the pairing/connection log lines (DS-32): returns all
+    /// lines queued since the last drain and clears the buffer — the
+    /// `take_*` pattern `take_manager_log_lines()` already uses in
+    /// `DaemonApi`. The manager loop drains with this instead of
+    /// re-cloning the whole buffer and slicing by index every
+    /// 250 ms. `pairing_log_lines()` stays for tests and one-shot
+    /// readers.
+    #[must_use]
+    pub fn take_pairing_log_lines(&self) -> Vec<String> {
+        lock(&self.pairing_log).drain(..).collect()
+    }
+
     /// Push one redacted, timestamped pairing log line (Phase 0
     /// gate §6.2 format: `[<ISO> <LEVEL> pairing] <message>`).
     /// Every line goes through [`redact_secrets`] first — a secret
@@ -10168,8 +10180,7 @@ mod tests {
     /// switch itself fails on Linux without a vJoy driver, but the
     /// persisted choice must still reach the cache) all refresh it.
     #[test]
-    fn ds30_settings_arc_tracks_writes_and_snapshot_arc_agrees() {
-        let (state, _dir) = test_state();
+    fn ds30_settings_arc_tracks_writes_and_snapshot_arc_agrees() {        let (state, _dir) = test_state();
         assert_eq!(state.settings_arc().esp_ip, state.settings().esp_ip);
         let mut settings = state.settings();
         settings.esp_ip = "10.0.0.5".to_string();
@@ -10194,6 +10205,26 @@ mod tests {
                 .address,
             "10.0.0.9"
         );
+    }
+
+    /// DS-32: `take_pairing_log_lines()` drains once — the first
+    /// drain returns the queued lines, the second returns nothing,
+    /// and the read-back buffer is empty (the manager loop can no
+    /// longer re-log a line or re-clone the buffer per tick).
+    #[test]
+    fn ds32_take_pairing_log_lines_drains_once() {
+        let (state, _dir) = test_state();
+        assert!(state.take_pairing_log_lines().is_empty());
+        state.open_session_gate();
+        let drained = state.take_pairing_log_lines();
+        assert_eq!(drained.len(), 1);
+        assert!(
+            drained[0].contains("session gate: closed -> open"),
+            "{}",
+            drained[0]
+        );
+        assert!(state.take_pairing_log_lines().is_empty());
+        assert!(state.pairing_log_lines().is_empty());
     }
 
     #[test]

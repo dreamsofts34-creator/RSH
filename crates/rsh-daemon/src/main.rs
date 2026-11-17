@@ -176,24 +176,18 @@ async fn manager_loop(
     let mut pairing_in_flight = false;
     let mut first_active_seen = false;
     let mut pending_rejoin_password: Option<String> = None;
-    let mut logged_lines = 0usize;
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     loop {
         ticker.tick().await;
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        // Drain the pairing log into the diagnostics file (one line
-        // per transition — the buffer is capped at 200, so a shrink
-        // means the cap dropped old lines: restart from the top).
-        let lines = api.state.pairing_log_lines();
-        if lines.len() < logged_lines {
-            logged_lines = 0;
+        // Drain the pairing log into the diagnostics file (DS-32:
+        // drain-once — each line is logged exactly once, no
+        // re-clone of the whole buffer and no index bookkeeping).
+        for line in api.state.take_pairing_log_lines() {
+            log_line(verbose, &line);
         }
-        for line in &lines[logged_lines..] {
-            log_line(verbose, line);
-        }
-        logged_lines = lines.len();
         // Drain the manager's own transition lines.
         for line in api.take_manager_log_lines() {
             log_line(verbose, &line);
