@@ -868,7 +868,9 @@ async fn create_pipe_listener(
                             // second for the full ~90 s cap window.
                             // First 3 + every 30th (~30 s) is enough
                             // to see it is still stuck.
-                            if tracker.in_use_failures <= 3 || tracker.in_use_failures % 30 == 0 {
+                            if tracker.in_use_failures <= 3
+                                || tracker.in_use_failures.is_multiple_of(30)
+                            {
                                 log_line(
                                     verbose,
                                     &format!(
