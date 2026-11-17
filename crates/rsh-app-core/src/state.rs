@@ -740,7 +740,8 @@ pub struct AppStateCore {
     /// Human-readable note on the most recent backend send.
     last_send_note: Mutex<String>,
     /// Latest snapshot (built by `ingest_frame`, sampled by the emitter).
-    latest_snapshot: Mutex<EngineSnapshot>,
+    /// `Arc` (DS-30): readers clone the pointer, not the struct.
+    latest_snapshot: Mutex<Arc<EngineSnapshot>>,
     /// Monotonic snapshot sequence number.
     seq: Mutex<u64>,
     /// Transport connection state, as last reported.
@@ -762,6 +763,12 @@ pub struct AppStateCore {
     button_events: Mutex<VecDeque<ButtonPressEvent>>,
     /// Profile + settings store.
     store: Mutex<ProfileStore>,
+    /// Cached app settings (DS-30): `AppSettings` carries several
+    /// `String`s + a `HashMap`, so cloning the struct on every poll
+    /// is measurable on the 20 Hz path. Readers clone this `Arc`
+    /// instead (see `settings_arc`); writers refresh it after every
+    /// write (see `refresh_settings_cache`) — copy-on-write.
+    settings_cache: Mutex<Arc<AppSettings>>,
     /// Game launcher (one game at a time, tracked pid only).
     launcher: Mutex<GameLauncher<SystemSpawner>>,
     /// Validated per-module tunings for this session (see
@@ -1036,6 +1043,9 @@ impl AppStateCore {
         let selected_backend =
             BackendKind::parse(&store.settings().output_backend).unwrap_or(BackendKind::DEFAULT);
         let esp_ip = store.settings().esp_ip.clone();
+        // DS-30: the settings cache starts from the post-migration
+        // store (the migration above may have rewritten the backend).
+        let settings_cache = Arc::new(store.settings().clone());
         // The binding store lives beside the profile store; a
         // corrupt bindings file loads as empty with warnings (never
         // fails the state open — see `rsh_profiles::bindings`).
@@ -1054,13 +1064,14 @@ impl AppStateCore {
             last_buttons: Mutex::new(0),
             last_send_ok: Mutex::new(None),
             last_send_note: Mutex::new("not attempted yet".to_string()),
-            latest_snapshot: Mutex::new(EngineSnapshot::default()),
+            latest_snapshot: Mutex::new(Arc::new(EngineSnapshot::default())),
             seq: Mutex::new(0),
             connection: Mutex::new(ConnectionState::Disconnected),
             transport_choice: Mutex::new((TransportKind::Udp, esp_ip)),
             cached_serial_port: Mutex::new(None),
             button_events: Mutex::new(VecDeque::new()),
             store: Mutex::new(store),
+            settings_cache: Mutex::new(settings_cache),
             launcher: Mutex::new(GameLauncher::new(SystemSpawner)),
             tunings: Mutex::new(BTreeMap::new()),
             draft: Mutex::new(None),
@@ -2573,6 +2584,15 @@ impl AppStateCore {
 
     #[must_use]
     pub fn transport_state(&self) -> TransportState {
+        self.transport_state_with_settings(&self.settings_arc())
+    }
+
+    /// `transport_state()` with the settings already in hand
+    /// (DS-30): the UDP arm needs only `esp_ip`, so a caller that
+    /// already holds the settings `Arc` (e.g. `poll()`) avoids a
+    /// second store lock + struct clone.
+    #[must_use]
+    pub fn transport_state_with_settings(&self, settings: &AppSettings) -> TransportState {
         let status = self.engine_status();
         let live = match status {
             EngineTaskStatus::Running { transport } => transport,
@@ -2580,7 +2600,7 @@ impl AppStateCore {
         };
         let kind = live.unwrap_or_else(|| self.transport_request().0);
         let address = match kind {
-            TransportKind::Udp => self.settings().esp_ip,
+            TransportKind::Udp => settings.esp_ip.clone(),
             TransportKind::Serial => self.cached_board_port().unwrap_or_default(),
         };
         let mut state = *lock(&self.connection);
@@ -2625,6 +2645,13 @@ impl AppStateCore {
     /// the default all-zero snapshot until the first engine tick).
     #[must_use]
     pub fn snapshot(&self) -> EngineSnapshot {
+        lock(&self.latest_snapshot).as_ref().clone()
+    }
+
+    /// The latest snapshot as a shared pointer (DS-30): clones the
+    /// `Arc`, not the struct — the 20 Hz `poll()` path takes this.
+    #[must_use]
+    pub fn snapshot_arc(&self) -> Arc<EngineSnapshot> {
         lock(&self.latest_snapshot).clone()
     }
 
@@ -2670,7 +2697,7 @@ impl AppStateCore {
         // output is stored: `last_output` — and the backend send,
         // via `ingest_engine_output` — carry the bound actions.
         *lock(&self.last_output) = self.apply_bindings(&input.output);
-        *lock(&self.latest_snapshot) = snapshot.clone();
+        *lock(&self.latest_snapshot) = Arc::new(snapshot.clone());
         snapshot
     }
 
@@ -3044,6 +3071,9 @@ impl AppStateCore {
             store.set_settings(settings);
             store.save().map_err(|error| error.to_string())?;
         }
+        // DS-30: the write above changed the store — refresh the
+        // `Arc` cache so `settings_arc()` readers see it at once.
+        self.refresh_settings_cache();
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
         let factories = real_backend_factories(vjoy_device_id);
         self.apply_backend_switch(requested, &factories)
@@ -3445,7 +3475,7 @@ impl AppStateCore {
     #[must_use]
     pub fn diag_stats(&self) -> rsh_api::DiagStats {
         let stats = self.engine_stats();
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot_arc();
         rsh_api::DiagStats {
             loop_hz: stats.loop_hz,
             loss_pct: stats.loss_pct,
@@ -4942,6 +4972,21 @@ impl AppStateCore {
         lock(&self.store).settings().clone()
     }
 
+    /// Current app settings as a shared pointer (DS-30): clones the
+    /// `Arc`, not the struct — the 20 Hz `poll()` path takes this.
+    #[must_use]
+    pub fn settings_arc(&self) -> Arc<AppSettings> {
+        lock(&self.settings_cache).clone()
+    }
+
+    /// Re-reads the store's settings into the `Arc` cache (DS-30):
+    /// call at the end of every settings write so readers never see
+    /// a stale copy. One struct clone per write, never per read.
+    fn refresh_settings_cache(&self) {
+        let fresh = lock(&self.store).settings().clone();
+        *lock(&self.settings_cache) = Arc::new(fresh);
+    }
+
     /// Replaces the app settings and persists them. When the settings
     /// flip the output flag, the change is actuated through the same
     /// path as the Output toggle (disable → neutral send). The
@@ -4965,6 +5010,9 @@ impl AppStateCore {
             let _ = self.set_output_enabled(apply_output);
         }
         self.sync_auto_switch_from_settings(&sanitized);
+        // DS-30: the write above changed the store — refresh the
+        // `Arc` cache so `settings_arc()` readers see it at once.
+        self.refresh_settings_cache();
         Ok(sanitized)
     }
 
@@ -4994,6 +5042,8 @@ impl AppStateCore {
             let _ = self.set_output_enabled(merged.output_enabled);
         }
         self.sync_auto_switch_from_settings(&merged);
+        // DS-30: refresh the `Arc` cache (see `set_settings`).
+        self.refresh_settings_cache();
         Ok(merged)
     }
 
@@ -10109,6 +10159,41 @@ mod tests {
         state.rescan_board_port();
         assert_eq!(state.cached_board_port(), None);
         assert_eq!(state.transport_state().address, "");
+    }
+
+    /// DS-30: the `Arc` settings cache tracks every writer, and the
+    /// `Arc` snapshot agrees with the struct read. The cache starts
+    /// from the store; `set_settings`, `set_settings_patch`, and
+    /// `set_output_backend` (which persists before switching — the
+    /// switch itself fails on Linux without a vJoy driver, but the
+    /// persisted choice must still reach the cache) all refresh it.
+    #[test]
+    fn ds30_settings_arc_tracks_writes_and_snapshot_arc_agrees() {
+        let (state, _dir) = test_state();
+        assert_eq!(state.settings_arc().esp_ip, state.settings().esp_ip);
+        let mut settings = state.settings();
+        settings.esp_ip = "10.0.0.5".to_string();
+        let saved = state.set_settings(settings).expect("set settings");
+        assert_eq!(saved.esp_ip, "10.0.0.5");
+        assert_eq!(state.settings_arc().esp_ip, "10.0.0.5");
+        let patch = AppSettingsPatch {
+            esp_ip: Some("10.0.0.9".to_string()),
+            ..Default::default()
+        };
+        let merged = state.set_settings_patch(patch).expect("patch");
+        assert_eq!(merged.esp_ip, "10.0.0.9");
+        assert_eq!(state.settings_arc().esp_ip, "10.0.0.9");
+        let _ = state.set_output_backend("vJoy");
+        assert_eq!(state.settings_arc().output_backend, "VJoy");
+        assert_eq!(*state.snapshot_arc(), state.snapshot());
+        // The settings-aware transport state reads the same `esp_ip`
+        // the `Arc` carries — no second store clone.
+        assert_eq!(
+            state
+                .transport_state_with_settings(&state.settings_arc())
+                .address,
+            "10.0.0.9"
+        );
     }
 
     #[test]
