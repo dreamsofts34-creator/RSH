@@ -160,6 +160,14 @@ pub fn popup_hwnd(title: &str) -> Option<isize> {
     }
 }
 
+/// No popup window to find on Linux: the click-outside poll in
+/// `main.rs` always sees `None` here and never dismisses.
+#[cfg(not(windows))]
+#[must_use]
+pub fn popup_hwnd(_title: &str) -> Option<isize> {
+    None
+}
+
 /// Whether `hwnd` (a raw `HWND` value from [`popup_hwnd`]) is the
 /// current foreground window. `false` when Windows cannot tell
 /// (no foreground window).
@@ -170,4 +178,340 @@ pub fn is_foreground(hwnd_value: isize) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     let foreground = unsafe { GetForegroundWindow() };
     foreground == HWND(hwnd_value as *mut std::ffi::c_void)
+}
+
+/// No foreground window on Linux: the click-outside poll never
+/// treats the popup as foreground there.
+#[cfg(not(windows))]
+#[must_use]
+pub fn is_foreground(_hwnd_value: isize) -> bool {
+    false
+}
+
+/// Bring the tray popup to the foreground when it is shown (H-2,
+/// v2.0.2) — the second half of the A4 fix.
+///
+/// Root cause, restated: a window shown from a tray click usually
+/// NEVER becomes the foreground window, because the tray-click
+/// input went to Explorer/the taskbar, not to the daemon, so
+/// Windows' foreground lock refuses the popup activation and the
+/// old foreground poll dismissed it ~1 s later. The fixed poll
+/// (`tray_popup::should_dismiss_popup`) already keeps such a
+/// popup open, but a popup that never activates also never takes
+/// the `was_foreground` path, so a click-away is only caught via
+/// the foreground-change rule. Activating here makes the popup a
+/// real foreground window in the common case, so both dismiss
+/// rules work as designed.
+///
+/// `SetForegroundWindow` alone usually fails under the lock, so
+/// the window is also briefly raised `TOPMOST` (which forces it
+/// visible on top) and immediately dropped back to `NOTOPMOST`,
+/// so it ends up top of the Z-order but NOT always-on-top. All
+/// three calls are best-effort — a failure leaves the popup
+/// visible but inactive, and the fixed poll still keeps it open
+/// until a real click-away. Returns `true` when the popup window
+/// was found (activation attempted), `false` on Linux (no Win32)
+/// and while the popup window does not exist yet.
+#[cfg(windows)]
+#[must_use]
+pub fn activate_popup_window(title: &str) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
+        SetWindowPos,
+    };
+
+    let Some(hwnd_value) = popup_hwnd(title) else {
+        return false;
+    };
+    let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
+    let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags) };
+    let _ = unsafe { SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags) };
+    true
+}
+
+/// No popup activation on Linux (no Win32 to ask).
+#[cfg(not(windows))]
+#[must_use]
+pub fn activate_popup_window(_title: &str) -> bool {
+    false
+}
+
+/// The current foreground window, if Windows can report one.
+/// `None` when there is no foreground window. Used by the tray
+/// popup's click-outside poll (A4): the poll compares this against
+/// the foreground window recorded when the popup was shown — a
+/// *change* means the user clicked away, while "still the same"
+/// means they did nothing and the popup must stay open.
+#[cfg(windows)]
+#[must_use]
+pub fn foreground_hwnd() -> Option<isize> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_invalid() {
+        None
+    } else {
+        Some(foreground.0 as isize)
+    }
+}
+
+/// No foreground query on Linux: the popup never auto-dismisses
+/// there (Escape / its own buttons close it).
+#[cfg(not(windows))]
+#[must_use]
+pub fn foreground_hwnd() -> Option<isize> {
+    None
+}
+
+/// Title of the main UI window (`rsh-ui`, `ui/main.slint`).
+#[cfg(windows)]
+pub const UI_WINDOW_TITLE: &str = "RSH — Real Sim Hub";
+
+/// Title of the tray popup window (`TrayPopup` in `ui/tray.slint`).
+/// Used by the click-outside poll and the show-time activation so
+/// the title lives in exactly one place.
+pub const POPUP_WINDOW_TITLE: &str = "RSH Wheel — Tray";
+
+/// File name of the UI executable (Windows: `rsh-ui.exe`).
+#[cfg(windows)]
+const UI_EXE_NAME: &str = "rsh-ui.exe";
+
+/// The main UI window's native handle on Windows, found by its
+/// title and verified to belong to an `rsh-ui` process (a
+/// same-title window owned by another program must never be
+/// mistaken for ours). `None` on Linux and while the UI is not
+/// running (or its window is not created yet — the UI is still
+/// starting up).
+#[cfg(windows)]
+#[must_use]
+pub fn ui_window_hwnd() -> Option<isize> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
+    use windows::core::HSTRING;
+
+    let hwnd = unsafe { FindWindowW(None, &HSTRING::from(UI_WINDOW_TITLE)) }.unwrap_or_default();
+    if hwnd == HWND::default() {
+        return None;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+    if process_exe_name(pid).is_some_and(|name| name.eq_ignore_ascii_case(UI_EXE_NAME)) {
+        Some(hwnd.0 as isize)
+    } else {
+        None
+    }
+}
+
+/// No UI window lookup on Linux (no Win32 to ask). Only the
+/// Windows restore path and the tests use this; the Linux daemon
+/// never calls it — kept so the lookup API is the same on both
+/// platforms.
+#[cfg(not(windows))]
+#[allow(dead_code)]
+#[must_use]
+pub fn ui_window_hwnd() -> Option<isize> {
+    None
+}
+
+/// The pid of a running `rsh-ui` process, if one exists.
+///
+/// Windows: `ToolHelp` snapshot, matched on the exe file name
+/// (`rsh-ui.exe`) — the same pattern as
+/// `rsh-telemetry::windows::is_process_running`, so a UI launched
+/// by double-click / the installer (not by the daemon) is found
+/// too. Linux: `/proc` scan for a cmdline naming `rsh-ui`
+/// (zombies skipped — a dead UI must not block a fresh spawn).
+/// `None` when no UI process is running.
+#[cfg(windows)]
+#[must_use]
+pub fn ui_process_id() -> Option<u32> {
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?;
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>()).unwrap_or(u32::MAX),
+        ..Default::default()
+    };
+    let mut found = None;
+    let mut next = unsafe { Process32FirstW(snapshot, &raw mut entry) };
+    while next.is_ok() {
+        let end = entry
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+        if name.eq_ignore_ascii_case(UI_EXE_NAME) {
+            found = Some(entry.th32ProcessID);
+            break;
+        }
+        next = unsafe { Process32NextW(snapshot, &raw mut entry) };
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    found
+}
+
+/// Linux `rsh-ui` process scan (see the Windows docs above).
+#[cfg(not(windows))]
+#[must_use]
+pub fn ui_process_id() -> Option<u32> {
+    let own_pid = std::process::id();
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        // Zombie: dead, but /proc still lists it.
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && let Some(state) = stat
+                .rsplit(") ")
+                .next()
+                .and_then(|rest| rest.chars().next())
+            && state == 'Z'
+        {
+            continue;
+        }
+        if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline"))
+            && String::from_utf8_lossy(&cmdline)
+                .split('\0')
+                .any(|arg| arg.contains("rsh-ui"))
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// The exe file name of `pid` on Windows (`None` when the process
+/// is gone or its entry cannot be read).
+#[cfg(windows)]
+fn process_exe_name(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?;
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = PROCESSENTRY32W {
+        dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>()).unwrap_or(u32::MAX),
+        ..Default::default()
+    };
+    let mut found = None;
+    let mut next = unsafe { Process32FirstW(snapshot, &raw mut entry) };
+    while next.is_ok() {
+        if entry.th32ProcessID == pid {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(entry.szExeFile.len());
+            found = Some(String::from_utf16_lossy(&entry.szExeFile[..end]));
+            break;
+        }
+        next = unsafe { Process32NextW(snapshot, &raw mut entry) };
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    found
+}
+
+/// Restore / show the already-running UI window (A11, v2.0.2):
+/// a window hidden to the tray is shown again, a minimised one is
+/// restored, and the window is brought to the foreground. Returns
+/// `true` when a UI window was found and shown — the caller must
+/// NOT spawn a second UI then. `false` when no UI window exists
+/// (UI not running, or still starting up with no window yet).
+///
+/// Windows only: `SetForegroundWindow` can still fail under the
+/// foreground lock (the daemon is a background process), but the
+/// window is visible and restored regardless — the user can click
+/// it. On Linux there is no portable window raise, so this always
+/// returns `false` there; the caller falls back to the
+/// `ui_process_id` check (a running UI is left alone, a dead one
+/// is spawned fresh) instead of duplicating the UI.
+#[cfg(windows)]
+#[must_use]
+pub fn restore_ui_window() -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsWindowVisible, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
+    };
+
+    let Some(hwnd_value) = ui_window_hwnd() else {
+        return false;
+    };
+    let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
+    // Hidden (hide-to-tray) → show; minimised / visible → restore.
+    let command = if unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        SW_RESTORE
+    } else {
+        SW_SHOW
+    };
+    let _ = unsafe { ShowWindow(hwnd, command) };
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+    true
+}
+
+/// No window raise on Linux (see the Windows docs above).
+#[cfg(not(windows))]
+#[must_use]
+pub fn restore_ui_window() -> bool {
+    false
+}
+
+#[cfg(test)]
+#[cfg(not(windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_ui_process_scan_finds_rsh_ui_and_ignores_other_programs() {
+        // `exec -a` renames argv[0], so the child's cmdline names
+        // rsh-ui without running the real UI.
+        let mut ui = std::process::Command::new("bash")
+            .args(["-c", "exec -a rsh-ui sleep 30"])
+            .spawn()
+            .expect("spawn fake ui");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(ui_process_id(), Some(ui.id()));
+        let _ = ui.kill();
+        let _ = ui.wait();
+        // H-1 (v2.0.2): once the UI process is dead the scan must
+        // report nothing — that is what sends `open_ui` down the
+        // spawn-a-fresh-UI branch instead of restoring a dead
+        // window after an X-close.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(ui_process_id(), None);
+
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_ne!(ui_process_id(), Some(other.id()));
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    #[test]
+    fn linux_restore_ui_window_is_always_false() {
+        assert!(!restore_ui_window());
+        assert!(ui_window_hwnd().is_none());
+        assert!(foreground_hwnd().is_none());
+    }
 }

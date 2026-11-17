@@ -14,6 +14,8 @@
 //!   event-loop thread; the tray-icon rect comes from
 //!   [`crate::tray_geometry`] (Windows-only).
 
+use std::time::Duration;
+
 use rsh_api::AppApi;
 use rsh_app_core::state::{GameInfo, ProfileSummary};
 
@@ -23,6 +25,69 @@ pub const POPUP_WIDTH: i32 = 340;
 pub const POPUP_HEIGHT: i32 = 440;
 /// Gap between the tray icon and the popup, logical px.
 pub const POPUP_GAP: i32 = 8;
+/// Grace after the popup is shown during which the foreground poll
+/// never dismisses it (A4): showing the popup cannot instantly
+/// close it — the first poll after the tray click must not count
+/// as "clicked away".
+pub const POPUP_FOREGROUND_GRACE: Duration = Duration::from_millis(500);
+
+/// Whether the visible tray popup should auto-dismiss on this
+/// foreground poll (A4, v2.0.2) — the pure decision behind the
+/// daemon's 100 ms click-outside poll in `main.rs`, kept here so
+/// it is unit-testable on Linux.
+///
+/// Root cause of the v2.0.1 bug: the old poll dismissed the popup
+/// whenever it was not the foreground window after the 500 ms
+/// grace. But a window shown from a tray click is usually NEVER
+/// the foreground window — Windows' foreground lock stops a
+/// background process (the daemon, whose foreground owner at click
+/// time is Explorer/the taskbar) from stealing the foreground, so
+/// `SetForegroundWindow`-style activation of the popup fails and
+/// the first poll after the grace hid the popup the user had just
+/// opened (~0.5–1 s after the click — exactly the reported
+/// symptom). "Not foreground" on its own therefore says nothing
+/// about the user clicking away.
+///
+/// The fixed rule dismisses only on a *change* the user caused:
+/// * inside the grace — never (showing cannot instantly close);
+/// * the popup IS foreground — never (the user is in it; the
+///   caller records this in `was_foreground`);
+/// * the popup WAS foreground and lost it — yes (clicked away
+///   after interacting with it);
+/// * the popup was never foreground, but the foreground window
+///   moved away from what it was when the popup was shown
+///   (`foreground_now != foreground_at_show`, both known) — yes
+///   (clicked another window / the desktop while the popup sat
+///   inactive);
+/// * otherwise — no: the foreground is still whatever it was at
+///   show time (normally the taskbar), i.e. the user did nothing,
+///   so the popup stays until they dismiss it, click away, or
+///   press Escape.
+///
+/// Known limit: when the popup was shown while the main UI window
+/// was already foreground, clicking back into that same UI window
+/// leaves the foreground unchanged, so the popup stays open
+/// (Escape / tray-click / "Open RSH" still dismiss it). Detecting
+/// that click would need a mouse hook, which is out of scope.
+#[must_use]
+pub fn should_dismiss_popup(
+    elapsed: Duration,
+    popup_foreground: bool,
+    was_foreground: bool,
+    foreground_now: Option<isize>,
+    foreground_at_show: Option<isize>,
+) -> bool {
+    if elapsed <= POPUP_FOREGROUND_GRACE {
+        return false;
+    }
+    if popup_foreground {
+        return false;
+    }
+    if was_foreground {
+        return true;
+    }
+    matches!((foreground_now, foreground_at_show), (Some(now), Some(at_show)) if now != at_show)
+}
 
 /// Preview game order in the popup (AC, ACC, iRacing first).
 const PREFERRED_GAME_IDS: [&str; 3] = ["assetto_corsa", "assetto_corsa_competizione", "iracing"];
@@ -421,6 +486,7 @@ mod tests {
                 throttle: 1.4,
                 brake: 0.0,
                 clutch: Some(-0.2),
+                button_mask: 0,
             },
             send: true,
         };
@@ -480,5 +546,91 @@ mod tests {
         assert_eq!(next_profile(&profiles, Some("p3")).unwrap().id, "p1");
         assert_eq!(next_profile(&profiles, None).unwrap().id, "p1");
         assert!(next_profile(&profiles[..1], Some("p1")).is_none());
+    }
+
+    // A4 (v2.0.2): the ~1 s auto-dismiss. The foreground window at
+    // show time is the taskbar (Explorer, fake hwnd 100 here); the
+    // popup itself is hwnd 200 when it ever becomes foreground.
+    fn after_grace() -> Duration {
+        POPUP_FOREGROUND_GRACE + Duration::from_millis(100)
+    }
+
+    #[test]
+    fn dismiss_never_inside_the_grace() {
+        assert!(!should_dismiss_popup(
+            POPUP_FOREGROUND_GRACE,
+            false,
+            false,
+            Some(300),
+            Some(100)
+        ));
+    }
+
+    #[test]
+    fn dismiss_never_when_popup_never_foreground_and_user_did_nothing() {
+        // THE v2.0.1 BUG: the old poll hid the popup here (not
+        // foreground after the grace), even though the foreground
+        // never moved — the user just opened it from the tray.
+        assert!(!should_dismiss_popup(
+            after_grace(),
+            false,
+            false,
+            Some(100),
+            Some(100)
+        ));
+    }
+
+    #[test]
+    fn dismiss_when_foreground_moved_while_popup_never_foreground() {
+        // User clicked another window (300) while the popup sat
+        // inactive: that IS a click-away.
+        assert!(should_dismiss_popup(
+            after_grace(),
+            false,
+            false,
+            Some(300),
+            Some(100)
+        ));
+    }
+
+    #[test]
+    fn dismiss_when_popup_was_foreground_and_lost_it() {
+        assert!(should_dismiss_popup(
+            after_grace(),
+            false,
+            true,
+            Some(100),
+            Some(100)
+        ));
+    }
+
+    #[test]
+    fn dismiss_never_when_popup_is_foreground() {
+        assert!(!should_dismiss_popup(
+            after_grace(),
+            true,
+            false,
+            Some(200),
+            Some(100)
+        ));
+    }
+
+    #[test]
+    fn dismiss_never_when_foreground_is_unknown() {
+        // Cannot tell what the user did — stay open, never guess.
+        assert!(!should_dismiss_popup(
+            after_grace(),
+            false,
+            false,
+            None,
+            Some(100)
+        ));
+        assert!(!should_dismiss_popup(
+            after_grace(),
+            false,
+            false,
+            Some(300),
+            None
+        ));
     }
 }

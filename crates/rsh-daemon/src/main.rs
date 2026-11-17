@@ -42,11 +42,11 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rsh_api::{AppApi, AppEvent, ConnEvent, ConnectionError, ManagerAction};
 use rsh_app_core::diagnostics::{append_startup_log_both, log_fatal};
-use rsh_app_core::state::{AppStateCore, TransportKind};
+use rsh_app_core::state::{AppStateCore, BindingAppAction, TransportKind};
 #[cfg(unix)]
 use rsh_ipc::serve_listener;
 use rsh_ipc::{IpcServer, socket_path};
@@ -56,7 +56,7 @@ use tokio::sync::broadcast;
 use daemon_api::{DaemonApi, connection_changed_event};
 use rejoin::{RSH_SSID, rejoin_wifi};
 use single_instance::{AcquireOutcome, acquire};
-use tray_popup::{PopupGame, TrayPopupData, anchor_popup, next_profile};
+use tray_popup::{PopupGame, TrayPopupData, anchor_popup, next_profile, should_dismiss_popup};
 
 slint::include_modules!();
 
@@ -76,6 +76,9 @@ enum TrayAction {
     LaunchGame(String),
     /// "Restart wheel" from the tray menu / popup footer.
     RestartWheel,
+    /// "Run setup" from the tray menu: spawn the UI on the Setup
+    /// wizard (M-5, v2.0.2).
+    OpenSetup,
     /// "Settings" from the tray menu: spawn the UI on Settings.
     OpenSettings,
 }
@@ -202,8 +205,11 @@ async fn manager_loop(
         for action in actions {
             match action {
                 TrayAction::OpenMain => {
-                    spawn_ui(None);
-                    log_line(verbose, "tray: Open RSH — spawned rsh-ui");
+                    if open_ui(None, verbose) {
+                        log_line(verbose, "tray: Open RSH — restored the running UI window");
+                    } else {
+                        log_line(verbose, "tray: Open RSH — spawned rsh-ui");
+                    }
                 }
                 TrayAction::ToggleSend => {
                     let enabled = !api.output_enabled();
@@ -259,10 +265,42 @@ async fn manager_loop(
                         log_line(verbose, &format!("tray: wheel restart failed: {error}"));
                     }
                 },
-                TrayAction::OpenSettings => {
-                    spawn_ui(Some("settings"));
-                    log_line(verbose, "tray: Settings — spawned rsh-ui on Settings");
+                TrayAction::OpenSetup => {
+                    if open_ui(Some("setup"), verbose) {
+                        log_line(
+                            verbose,
+                            "tray: Run setup — restored the running UI window (setup page needs the UI's own single-instance hook)",
+                        );
+                    } else {
+                        log_line(verbose, "tray: Run setup — spawned rsh-ui on Setup");
+                    }
                 }
+                TrayAction::OpenSettings => {
+                    if open_ui(Some("settings"), verbose) {
+                        log_line(
+                            verbose,
+                            "tray: Settings — restored the running UI window (page switch needs the UI's own single-instance hook)",
+                        );
+                    } else {
+                        log_line(verbose, "tray: Settings — spawned rsh-ui on Settings");
+                    }
+                }
+            }
+        }
+        // Bound-button app actions (v2.0.2, Round 2B): a wheel
+        // button bound to profile_next / profile_previous queues
+        // here; the loop runs the cycle (activation saves + pushes
+        // the new profile's plan — that work never happens on the
+        // 200 Hz engine tick). Game-input bindings are already
+        // applied inline, in the tick itself.
+        for action in api.state.drain_binding_actions() {
+            let forward = matches!(action, BindingAppAction::ProfileNext);
+            match api.state.cycle_profile(forward) {
+                Ok(summary) => log_line(
+                    verbose,
+                    &format!("binding: profile cycled to: {}", summary.name),
+                ),
+                Err(error) => log_line(verbose, &format!("binding: profile cycle failed: {error}")),
             }
         }
         // Observations → manager events.
@@ -405,6 +443,15 @@ fn publish(event_tx: &broadcast::Sender<AppEvent>, event: AppEvent) {
 /// on a page (`--page settings`). Fire-and-forget: the UI is its own
 /// process (Phase 3 owns its lifecycle); a missing binary is logged,
 /// never fatal to the daemon.
+///
+/// Lifetime (A11/A12, v2.0.2): the spawned UI is deliberately NOT
+/// tied to the daemon — the `Child` handle is dropped without
+/// waiting and no job object / kill-on-drop exists, so the daemon
+/// keeps running after the UI exits (and vice versa: the UI spawns
+/// the daemon the same way, see `rsh-ui/src/live_probe.rs`). The
+/// daemon therefore survives an X-close of the UI; what it must
+/// NOT do is spawn a second UI while one is already running — that
+/// is [`open_ui`]'s job.
 fn spawn_ui(page: Option<&str>) {
     let Some(exe) = std::env::current_exe().ok().and_then(|exe| {
         exe.parent().map(|dir| {
@@ -425,6 +472,50 @@ fn spawn_ui(page: Option<&str>) {
     if let Err(error) = command.spawn() {
         eprintln!("rsh-daemon: cannot start UI ({}): {error}", exe.display());
     }
+}
+
+/// Open the main UI (A11/A12, v2.0.2): restore the already-running
+/// UI window when one exists, and only spawn a fresh UI when none
+/// is running.
+///
+/// Root cause of the v2.0.1 report: every tray "Open RSH" called
+/// [`spawn_ui`] unconditionally, so each open started a brand-new
+/// `rsh-ui` process — full startup, fresh IPC probe, fresh load —
+/// even when a UI was already running (hidden to the tray, or just
+/// minimised). That is the "fresh load" the user saw, and the
+/// fresh process's probe window is also where a fake-data flash
+/// can come from: a new UI starts on its `SimApi` fallback until
+/// its background probe answers, while the restored UI is already
+/// live-connected to this daemon and shows real state.
+///
+/// Returns `true` when an already-running UI was restored (or was
+/// already starting — no second copy spawned), `false` when a fresh
+/// UI was spawned (or the spawn was attempted). A `page` request
+/// (`--page settings`) only applies to a fresh spawn: a restored
+/// window stays on the page it was on — switching the page of a
+/// running UI needs a UI-side hook (single-instance arg forwarding
+/// or an IPC `show-page` method), which the daemon cannot do on
+/// its own (the IPC direction is UI → daemon, not daemon → UI).
+fn open_ui(page: Option<&str>, verbose: bool) -> bool {
+    // 1. A UI window exists → restore/show it (instant, live).
+    if tray_geometry::restore_ui_window() {
+        return true;
+    }
+    // 2. A UI process exists but has no window yet (still starting
+    // up) — spawning a second UI would duplicate it, so leave it
+    // alone; it appears on its own. On Linux there is no window
+    // raise, so a running UI is likewise left alone here (its
+    // taskbar/dock entry brings it forward).
+    if let Some(pid) = tray_geometry::ui_process_id() {
+        log_line(
+            verbose,
+            &format!("tray: UI already running (pid {pid}) — not spawning a second copy"),
+        );
+        return true;
+    }
+    // 3. No UI at all → launch it exactly like a double-click.
+    spawn_ui(page);
+    false
 }
 
 /// Resolve a tray-menu profile pick (display name) to a profile id.
@@ -477,25 +568,56 @@ async fn serve_ipc(server: Arc<IpcServer>, data_dir: &std::path::Path, verbose: 
             }
         }
     }
-    let _ = log_fatal(&format!(
-        "daemon: IPC bind failed after 5 attempts — running without IPC (the UI will use simulated data); socket was {}",
+    // M8 (v2.0.2): five failed binds are a VISIBLE fatal state,
+    // not a quiet headless run — the daemon exits(1) after leaving
+    // the machine-readable fatal status + the dual-location fatal
+    // log, so the UI can say the daemon is dead instead of silently
+    // running on simulated data.
+    let detail = format!(
+        "daemon IPC bind failed after 5 attempts (socket was {}) — the daemon cannot serve the UI",
         path.display()
-    ));
+    );
+    write_daemon_status(data_dir, "fatal", "IpcBindFailed", &detail);
+    let _ = log_fatal(&format!("daemon: {detail}"));
+    std::process::exit(1);
 }
 
 /// Serve the IPC named pipe forever (Windows).
 #[cfg(windows)]
-async fn serve_ipc(server: Arc<IpcServer>, _data_dir: &std::path::Path, verbose: bool) {
+async fn serve_ipc(server: Arc<IpcServer>, data_dir: &std::path::Path, verbose: bool) {
     use tokio::net::windows::named_pipe::ServerOptions;
     log_line(verbose, "daemon: IPC listening on \\\\.\\pipe\\rsh-daemon");
+    // A pipe create can fail transiently — retry, and count
+    // CONSECUTIVE failures: five in a row are a visible fatal
+    // (M8, v2.0.2), exactly like the Unix bind path, instead of
+    // the old infinite retry that left the daemon headless with no
+    // trace. A successful create resets the count; a failed client
+    // connect just loops for the next client.
+    let mut create_failures = 0u32;
     loop {
         let pipe = match ServerOptions::new()
             .first_pipe_instance(true)
             .create(rsh_ipc::IPC_PIPE_NAME)
         {
-            Ok(pipe) => pipe,
+            Ok(pipe) => {
+                create_failures = 0;
+                pipe
+            }
             Err(error) => {
-                log_line(verbose, &format!("daemon: IPC pipe create failed: {error}"));
+                create_failures += 1;
+                log_line(
+                    verbose,
+                    &format!(
+                        "daemon: IPC pipe create failed (attempt {create_failures}/5): {error}"
+                    ),
+                );
+                if create_failures >= 5 {
+                    let detail =
+                        "daemon IPC bind failed after 5 attempts — the daemon cannot serve the UI";
+                    write_daemon_status(data_dir, "fatal", "IpcBindFailed", detail);
+                    let _ = log_fatal(&format!("daemon: {detail}"));
+                    std::process::exit(1);
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -513,6 +635,47 @@ async fn serve_ipc(server: Arc<IpcServer>, _data_dir: &std::path::Path, verbose:
             server.serve_stream(pipe).await;
         });
     }
+}
+
+/// Name of the machine-readable daemon status file in the data dir
+/// (M8/L8, v2.0.2): the UI reads this when IPC is dead — it is the
+/// only channel left when the daemon cannot serve IPC at all, so a
+/// daemon that dies before (or without) IPC must leave a trace the
+/// UI can show instead of silently falling back to simulated data.
+const DAEMON_STATUS_FILE: &str = "daemon-status.json";
+
+/// Write `daemon-status.json` (M8/L8): `{"status": "fatal" |
+/// "running", "code": ..., "detail": ..., "pid": ..., "at_unix":
+/// ...}`. Atomic (temp file in the same directory, then rename).
+/// Best effort — a failure is swallowed, never fatal: the
+/// dual-location fatal log is the other channel, and a status
+/// write must never mask the fatal exit itself.
+fn write_daemon_status(data_dir: &std::path::Path, status: &str, code: &str, detail: &str) {
+    let at_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let json = serde_json::json!({
+        "status": status,
+        "code": code,
+        "detail": detail,
+        "pid": std::process::id(),
+        "at_unix": at_unix,
+    });
+    let path = data_dir.join(DAEMON_STATUS_FILE);
+    let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    if let Ok(text) = serde_json::to_string_pretty(&json)
+        && std::fs::write(&temp, text).is_ok()
+    {
+        let _ = std::fs::rename(&temp, &path);
+    }
+}
+
+/// Remove a stale `daemon-status.json` (a previous run's fatal
+/// state). Only the daemon that holds the single-instance lock
+/// clears it — a second daemon that finds a hung first daemon
+/// writes its own fatal state and exits instead.
+fn clear_daemon_status(data_dir: &std::path::Path) {
+    let _ = std::fs::remove_file(data_dir.join(DAEMON_STATUS_FILE));
 }
 
 /// Quarantine the unreadable store files (`profiles.json`,
@@ -637,10 +800,15 @@ fn main() {
             // not reclaim. Never exit 0 (success) for a broken
             // daemon, and never leave only an invisible stderr line:
             // a UI that spawned us falls back to simulated data, so
-            // this failure must be in the dual-location log.
-            let _ = log_fatal(&format!(
-                "daemon: already running (pid {pid:?}) but IPC did not answer after 3 tries — the running daemon is hung or its IPC is dead; not taking over, exiting"
-            ));
+            // this failure must be in the dual-location log AND in
+            // the machine-readable status file (L8, v2.0.2) — the UI
+            // reads the file and tells the user the running daemon
+            // is hung instead of silently simulating.
+            let detail = format!(
+                "already running (pid {pid:?}) but not responding to IPC after 3 tries — the running daemon is hung or its IPC is dead; not taking over"
+            );
+            write_daemon_status(&data_dir, "fatal", "DaemonHung", &detail);
+            let _ = log_fatal(&format!("daemon: {detail}"));
             std::process::exit(1);
         }
         Err(error) => {
@@ -650,6 +818,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // This process holds the single-instance lock: a previous run's
+    // fatal status is stale now (the daemon it describes is gone),
+    // so clear it before anything else can misread it.
+    clear_daemon_status(&data_dir);
 
     // Open the app state (repairs a corrupt store from backups).
     // Last resort when even the backups cannot repair it: quarantine
@@ -703,6 +876,12 @@ fn main() {
     // so a HIDMaestro→vJoy switch is visible in the startup log.
     if let Some(note) = state.backend_migration_note() {
         log_line(verbose, &format!("daemon: backend migration: {note}"));
+    }
+    // Binding store: log the load warnings (dropped entries,
+    // corrupt file) so a binding that did not survive is never
+    // silent.
+    for warning in state.binding_load_warnings() {
+        log_line(verbose, &format!("daemon: bindings: {warning}"));
     }
     let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(256);
     let tray_actions: Arc<Mutex<Vec<TrayAction>>> = Arc::new(Mutex::new(Vec::new()));
@@ -915,6 +1094,15 @@ struct PopupHandle {
     popup: TrayPopup,
     visible: Cell<bool>,
     shown_at: Cell<Option<Instant>>,
+    /// The popup was the foreground window at least once since it
+    /// was shown (A4): losing the foreground after that is a real
+    /// click-away. Never-foreground is NOT a click-away — see
+    /// [`tray_popup::should_dismiss_popup`].
+    was_foreground: Cell<bool>,
+    /// The foreground window when the popup was shown (A4): the
+    /// poll dismisses only when the foreground MOVED AWAY from
+    /// this window. `None` on Linux (no foreground query).
+    foreground_at_show: Cell<Option<isize>>,
 }
 
 impl PopupHandle {
@@ -988,6 +1176,12 @@ impl PopupHandle {
     /// Show the popup next to the tray icon (or docked bottom-right
     /// when the icon rect is unknown — Linux / hidden tray).
     fn show(&self, api: &DaemonApi) {
+        // A4/H-2: record the foreground window BEFORE showing —
+        // the click-outside poll dismisses only when the
+        // foreground moves away from THIS window.
+        self.was_foreground.set(false);
+        self.foreground_at_show
+            .set(tray_geometry::foreground_hwnd());
         let (x, y) = anchor_popup(tray_geometry::tray_icon_rect(), tray_geometry::work_area());
         self.popup
             .window()
@@ -996,6 +1190,15 @@ impl PopupHandle {
         if self.popup.show().is_ok() {
             self.visible.set(true);
             self.shown_at.set(Some(Instant::now()));
+            // H-2: activate the popup — a tray-shown window
+            // usually never becomes foreground on its own
+            // (foreground lock), which is what made the old poll
+            // dismiss it ~1 s after the click. Best-effort: a
+            // failed activation leaves the popup visible but
+            // inactive, and the fixed poll
+            // (`should_dismiss_popup`) still keeps it open until
+            // a real click-away.
+            let _ = tray_geometry::activate_popup_window(tray_geometry::POPUP_WINDOW_TITLE);
         }
     }
 
@@ -1004,6 +1207,8 @@ impl PopupHandle {
         let _ = self.popup.hide();
         self.visible.set(false);
         self.shown_at.set(None);
+        self.was_foreground.set(false);
+        self.foreground_at_show.set(None);
     }
 }
 
@@ -1061,6 +1266,8 @@ fn create_tray(
             popup,
             visible: Cell::new(false),
             shown_at: Cell::new(None),
+            was_foreground: Cell::new(false),
+            foreground_at_show: Cell::new(None),
         })),
         Err(error) => {
             log_line(
@@ -1118,11 +1325,15 @@ fn create_tray(
         // Refresh timer (10 Hz while visible) + click-outside poll.
         // The timer lives on the event-loop thread; the popup is
         // refreshed from the live `DaemonApi` (no IPC round-trip —
-        // the daemon IS the data source). On Windows the popup
-        // closes when another window takes the foreground (500 ms
-        // grace so showing the popup cannot instantly close it);
-        // on Linux there is no foreground query, so Escape and the
-        // popup's own buttons close it there.
+        // the daemon IS the data source). The poll dismisses only
+        // on a real click-away (see
+        // `tray_popup::should_dismiss_popup`: only when the
+        // foreground MOVES AWAY from the window it had at show
+        // time, or the popup loses a foreground it had — never
+        // merely for not being foreground, which a tray-shown
+        // window usually never is). On Linux `popup_hwnd` is
+        // always `None`, so the poll never dismisses there and
+        // Escape / the popup's own buttons close it instead.
         let timer = slint::Timer::default();
         {
             let handle = Rc::clone(handle);
@@ -1133,18 +1344,26 @@ fn create_tray(
                 move || {
                     if handle.visible.get() {
                         handle.refresh(&api);
-                        #[cfg(windows)]
+                        if let Some(shown) = handle.shown_at.get()
+                            && let Some(hwnd) =
+                                tray_geometry::popup_hwnd(tray_geometry::POPUP_WINDOW_TITLE)
                         {
-                            if handle
-                                .shown_at
-                                .get()
-                                .is_some_and(|shown| shown.elapsed() > Duration::from_millis(500))
-                                && let Some(hwnd) = tray_geometry::popup_hwnd("RSH Wheel — Tray")
-                                && !tray_geometry::is_foreground(hwnd)
-                            {
+                            let is_foreground = tray_geometry::is_foreground(hwnd);
+                            if is_foreground {
+                                handle.was_foreground.set(true);
+                            }
+                            if should_dismiss_popup(
+                                shown.elapsed(),
+                                is_foreground,
+                                handle.was_foreground.get(),
+                                tray_geometry::foreground_hwnd(),
+                                handle.foreground_at_show.get(),
+                            ) {
                                 handle.hide();
                             }
                         }
+                        // `popup_hwnd` None: the window cannot be
+                        // found (yet) — stay open, never guess.
                     }
                 },
             );
@@ -1189,6 +1408,10 @@ fn create_tray(
     {
         let actions = Arc::clone(tray_actions);
         tray.on_restart_wheel(move || push(&actions, TrayAction::RestartWheel));
+    }
+    {
+        let actions = Arc::clone(tray_actions);
+        tray.on_open_setup(move || push(&actions, TrayAction::OpenSetup));
     }
     {
         let actions = Arc::clone(tray_actions);
@@ -1248,6 +1471,52 @@ mod tests {
     fn quarantine_is_a_noop_without_store_files() {
         let dir = temp_dir("noop");
         assert_eq!(quarantine_corrupt_store_files(&dir).len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_status_write_and_clear_round_trip() {
+        let dir = temp_dir("status");
+        write_daemon_status(&dir, "fatal", "IpcBindFailed", "test detail");
+        let path = dir.join(DAEMON_STATUS_FILE);
+        assert!(path.is_file(), "the status file is written");
+        let text = std::fs::read_to_string(&path).expect("read status");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("status is valid JSON");
+        assert_eq!(value["status"], "fatal");
+        assert_eq!(value["code"], "IpcBindFailed");
+        assert_eq!(value["detail"], "test detail");
+        assert_eq!(
+            value["pid"],
+            serde_json::json!(std::process::id()),
+            "the status names the dying process"
+        );
+        assert!(
+            value["at_unix"].as_u64().is_some_and(|at| at > 0),
+            "the status carries a timestamp: {value}"
+        );
+        clear_daemon_status(&dir);
+        assert!(!path.exists(), "clear removes the file");
+        clear_daemon_status(&dir); // clearing an absent file is fine
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_status_write_is_atomic_and_overwrites() {
+        let dir = temp_dir("status-overwrite");
+        write_daemon_status(&dir, "fatal", "DaemonHung", "first");
+        write_daemon_status(&dir, "fatal", "IpcBindFailed", "second");
+        let text = std::fs::read_to_string(dir.join(DAEMON_STATUS_FILE)).expect("read status");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("status is valid JSON");
+        assert_eq!(value["code"], "IpcBindFailed");
+        assert_eq!(value["detail"], "second");
+        // No temp file is left behind.
+        assert!(
+            !std::fs::read_dir(&dir).expect("read dir").any(|entry| entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| name.contains(".tmp-"))),
+            "no temp file left behind"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

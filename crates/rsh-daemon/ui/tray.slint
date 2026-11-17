@@ -35,6 +35,7 @@ export component RshTray inherits SystemTrayIcon {
     callback profile-selected(string);
     callback launch-game(string);
     callback restart-wheel();
+    callback open-setup();
     callback open-settings();
     callback quit-app();
 
@@ -55,6 +56,7 @@ export component RshTray inherits SystemTrayIcon {
         MenuItem { title: "Restart wheel"; activated => { restart-wheel(); } }
         MenuSeparator {}
         MenuItem { title: "Settings"; activated => { open-settings(); } }
+        MenuItem { title: "Run setup"; activated => { open-setup(); } }
         MenuItem { title: "Quit RSH"; activated => { quit-app(); } }
     }
 }
