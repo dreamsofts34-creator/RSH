@@ -509,8 +509,10 @@ impl IpcApi {
     /// Drain all pushed [`AppEvent`]s waiting on this connection.
     #[must_use]
     pub fn poll_events(&self) -> Vec<AppEvent> {
+        // DS-78: a plain sync `mpsc` drain — no `block_on` per event
+        // (and none per empty frame either).
         let mut out = Vec::new();
-        while let Some(ev) = self.rt.block_on(self.client.try_recv_event()) {
+        while let Some(ev) = self.client.try_recv_event() {
             out.push(ev);
         }
         out

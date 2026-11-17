@@ -54,8 +54,13 @@ pub struct IpcClient {
     responses: Mutex<mpsc::Receiver<IpcResponse>>,
     /// Next request id.
     next_id: Mutex<u64>,
-    /// Pushed events, drained by the caller.
-    events: Mutex<mpsc::Receiver<AppEvent>>,
+    /// Pushed events, drained by the caller. A `std` mutex (DS-78):
+    /// `try_recv` needs no async runtime at all, so the drain is a
+    /// plain sync `mpsc` drain — the frame timer no longer enters
+    /// the runtime (`block_on`) once per event (and once per empty
+    /// frame). The lock is held only for the `try_recv` call itself;
+    /// the reader task never touches this side.
+    events: std::sync::Mutex<mpsc::Receiver<AppEvent>>,
     /// The reader task's handle (kept alive for the client's life).
     _reader: tokio::task::JoinHandle<()>,
 }
@@ -101,7 +106,7 @@ impl IpcClient {
             writer: Mutex::new(Box::new(writer)),
             responses: Mutex::new(resp_rx),
             next_id: Mutex::new(1),
-            events: Mutex::new(event_rx),
+            events: std::sync::Mutex::new(event_rx),
             _reader: reader_task,
         })
     }
@@ -170,9 +175,14 @@ impl IpcClient {
         Self::from_stream(stream)
     }
 
-    /// Receive the next pushed event, if one is waiting.
-    pub async fn try_recv_event(&self) -> Option<AppEvent> {
-        self.events.lock().await.try_recv().ok()
+    /// Receive the next pushed event, if one is waiting (DS-78:
+    /// synchronous — no runtime is needed to drain the channel).
+    pub fn try_recv_event(&self) -> Option<AppEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv()
+            .ok()
     }
 
     /// Call one method and await its response.

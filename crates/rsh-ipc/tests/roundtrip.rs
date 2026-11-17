@@ -265,7 +265,7 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
         .expect("event publishes");
     let mut got = None;
     for _ in 0..50 {
-        if let Some(event) = client.try_recv_event().await {
+        if let Some(event) = client.try_recv_event() {
             got = Some(event);
             break;
         }
