@@ -18,7 +18,10 @@
 //!   backoff (2 s → 30 s). User-action reasons (`NoStoredKey`,
 //!   `WindowClosed`, `WindowExpired`, `StoredKeyExists`) stop
 //!   auto-retry: `retry_in_ms` is `None` and the UI must surface
-//!   "Pairing needed" (C-01).
+//!   "Pairing needed" (C-01). F21: `BindFailed(AddrInUse)` also
+//!   stops auto-retry (`retry_in_ms: None` — the port holder can
+//!   only be closed by the user) but is NOT a pairing reason, so
+//!   it surfaces as a plain `Error`, never "Pairing needed".
 //! * Heartbeat watchdog (C-04): no stream/status frame for 2 s in
 //!   `Active` → transport rebuild + re-activate.
 //! * HELLO wait (C-03): 750 ms per attempt (above the firmware's
@@ -432,7 +435,15 @@ impl ConnectionManager {
 
     /// Record a failure: `BadTag` gets one 10 s retry (C-13);
     /// user-action reasons stop auto-retry with `retry_in_ms: None`
-    /// (C-01); everything else backs off 2 s → 30 s.
+    /// (C-01); everything else backs off 2 s → 30 s. F21: a UDP
+    /// `AddrInUse` is NOT retried at all — the port holder (usually
+    /// the still-running legacy RSH app) can only be closed by the
+    /// user, so retrying just re-logs the same failure forever
+    /// (user log: 117× `AddrInUse` over ~35 min). It lands in
+    /// `Error` with `retry_in_ms: None` like a user-action reason,
+    /// but returns `StateChanged` (not `NeedsPairing`): this is not
+    /// a pairing problem and must not surface a "Pairing needed"
+    /// notification.
     fn fail(&mut self, reason: ConnectionError, now: Instant) -> ManagerAction {
         // C-13: one BadTag retry after 10 s — the board rejects a new
         // session for 10 s after an authenticated one ("wheel busy").
@@ -463,6 +474,25 @@ impl ConnectionManager {
                 now,
             );
             return ManagerAction::NeedsPairing(reason);
+        }
+        // F21: `AddrInUse` never self-heals — stop here. No retry
+        // timer is armed (`backoff_until` stays `None`), so the
+        // driver's retry tick never re-fires `activate_session`
+        // into another doomed bind.
+        if matches!(
+            reason,
+            ConnectionError::BindFailed(crate::errors::BindErrorKind::AddrInUse)
+        ) {
+            self.backoff_until = None;
+            self.transition(
+                ConnectionState::Error {
+                    reason,
+                    hint: reason.hint().to_string(),
+                    retry_in_ms: None,
+                },
+                now,
+            );
+            return ManagerAction::StateChanged;
         }
         let delay = Self::backoff_delay(self.consecutive_failures);
         self.transition(
@@ -605,6 +635,39 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn bind_failed_addr_in_use_stops_auto_retry() {
+        // F21: the port holder (usually the still-running legacy
+        // RSH app) can only be closed by the user — retrying the
+        // bind just re-logs the same failure forever (user log:
+        // 117× `AddrInUse` over ~35 min). So no retry is scheduled
+        // and no "Pairing needed" is raised: plain `Error`.
+        let mut m = ConnectionManager::new();
+        let t = now();
+        m.on_event(ConnEvent::Connect, t);
+        let action = m.on_event(
+            ConnEvent::ActivationFailed(ConnectionError::BindFailed(
+                crate::errors::BindErrorKind::AddrInUse,
+            )),
+            t,
+        );
+        assert_eq!(action, ManagerAction::StateChanged);
+        assert!(matches!(
+            m.state(),
+            ConnectionState::Error {
+                reason: ConnectionError::BindFailed(crate::errors::BindErrorKind::AddrInUse),
+                retry_in_ms: None,
+                ..
+            }
+        ));
+        assert_eq!(m.retry_due_at(), None, "no retry timer is armed");
+        assert!(
+            matches!(m.state(), ConnectionState::Error { hint, .. } if hint.contains("4211") && hint.contains("RSH.exe")),
+            "hint names the port and the app to close: {:?}",
+            m.state()
+        );
     }
 
     #[test]

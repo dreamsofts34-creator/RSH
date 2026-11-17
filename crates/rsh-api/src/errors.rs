@@ -54,7 +54,11 @@ impl BindErrorKind {
     pub const fn hint(self) -> &'static str {
         match self {
             Self::AddrInUse => {
-                "Another app is using the wheel port — close the other RSH or wait, then retry."
+                // F21: name the port and the prime suspect (the legacy
+                // Tauri v1.0.2 app, installed exe `RSH.exe`, binds
+                // the same port at launch) — "close the other RSH"
+                // alone never told the user WHICH app to close.
+                "Another app is using the wheel port (UDP 4211) — close the old RSH app (RSH.exe) or any other RSH, then press Retry."
             }
             Self::PermissionDenied => {
                 "Binding the wheel port was denied — run RSH normally (no admin needed) and retry."
