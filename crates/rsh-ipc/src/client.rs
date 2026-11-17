@@ -358,7 +358,10 @@ impl IpcClient {
 
 #[cfg(test)]
 mod tests {
+    // Unix-only: the module's only test binds a real Unix socket.
+    #[cfg(unix)]
     use super::*;
+    #[cfg(unix)]
     use std::time::Instant;
 
     /// B3: a peer that accepts the socket but never answers must

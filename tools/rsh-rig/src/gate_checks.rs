@@ -3,12 +3,13 @@
 //! One function per gate item; each returns `(passed, detail)` and is
 //! wired as a duration-0 scenario (`gate-*`) in
 //! [`crate::harness::run_contract`], so the normal rig runner reports
-//! them like every other scenario. The checks run on Linux —
-//! everything a Windows-only behaviour needs (real UAC prompts, the
-//! NSIS installer UI, the tray icon) is covered by a *source audit*
-//! here plus an explicit open verification on the user PC, recorded in
-//! `docs/V2.0.2-GATE.md`. Nothing here pretends a Linux run proves a
-//! Windows behaviour.
+//! them like every other scenario. The runtime checks are
+//! cross-platform — the fake IPC peer is a Unix socket on Linux and
+//! a named pipe on Windows (see `FakeListener`). A Windows-only
+//! behaviour (real UAC prompts, the NSIS installer UI, the tray
+//! icon) is covered by a *source audit* here plus an explicit open
+//! verification on the user PC, recorded in `docs/V2.0.2-GATE.md`.
+//! Nothing here pretends a Linux run proves a Windows behaviour.
 //!
 //! Two kinds of check live in this module, and the detail string of
 //! each says which it is:
@@ -20,7 +21,7 @@
 //!   markers). The real visual proof for these stays the user-PC
 //!   retest; the audit only proves the code says what the fix claims.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -93,6 +94,72 @@ fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rsh-gate-{name}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// Cross-platform fake IPC listener for the runtime gate checks.
+///
+/// The checks model a daemon with a fake peer and drive the real
+/// `IpcClient` against it. On Unix the peer is a `UnixListener` at
+/// a temp socket path; on Windows it is a named-pipe server at the
+/// fixed `IPC_PIPE_NAME` — `IpcClient::connect` dials that fixed
+/// name there and ignores the path, so the fake peer must listen
+/// there (same pattern as the daemon's `serve_ipc` and the `rsh-ui`
+/// IPC tests). Added when the v2.0.2 release clippy run failed on
+/// Windows: `tokio::net::UnixListener` does not exist there.
+#[cfg(unix)]
+type FakeStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type FakeStream = tokio::net::windows::named_pipe::NamedPipeServer;
+
+struct FakeListener {
+    #[cfg(unix)]
+    inner: tokio::net::UnixListener,
+}
+
+impl FakeListener {
+    /// Bind the fake peer. Unix: bind the socket at `path`.
+    /// Windows: probe-create one pipe instance at the fixed
+    /// `IPC_PIPE_NAME` so a taken name (a real daemon running)
+    /// fails fast here instead of at the first accept; the probe
+    /// instance is dropped immediately.
+    fn bind(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                inner: tokio::net::UnixListener::bind(path)?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::ServerOptions;
+            let _ = path;
+            let _probe = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(rsh_ipc::IPC_PIPE_NAME)?;
+            Ok(Self {})
+        }
+    }
+
+    /// Accept one connection. Unix: accept on the socket.
+    /// Windows: create a fresh pipe instance (same pattern as the
+    /// daemon's `serve_ipc` loop) and wait for the client to
+    /// connect.
+    async fn accept(&self) -> std::io::Result<FakeStream> {
+        #[cfg(unix)]
+        {
+            let (stream, _) = self.inner.accept().await?;
+            Ok(stream)
+        }
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::ServerOptions;
+            let pipe = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(rsh_ipc::IPC_PIPE_NAME)?;
+            pipe.connect().await?;
+            Ok(pipe)
+        }
+    }
 }
 
 /// A mock output backend for the switch state machine: connects
@@ -531,13 +598,13 @@ pub fn gate_ipc_timeout() -> (bool, String) {
     let (elapsed_ms, timed_out) = block_on_scoped(|| {
         let rt = current_thread_runtime();
         rt.block_on(async {
-            let listener = match tokio::net::UnixListener::bind(&path_for_task) {
+            let listener = match FakeListener::bind(&path_for_task) {
                 Ok(listener) => listener,
                 Err(error) => return (0_u128, format!("bind failed: {error}")),
             };
             // Accept and hold the stream without ever answering.
             tokio::spawn(async move {
-                if let Ok((stream, _)) = listener.accept().await {
+                if let Ok(stream) = listener.accept().await {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     drop(stream);
                 }
@@ -641,16 +708,15 @@ pub fn gate_perf() -> (bool, String) {
         block_on_scoped(|| {
             let rt = current_thread_runtime();
             rt.block_on(async {
-        let listener = tokio::net::UnixListener::bind(&path)
-            .expect("gate echo server bind");
+        let listener = FakeListener::bind(&path).expect("gate echo server bind");
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
+                let Ok(stream) = listener.accept().await else {
                     break;
                 };
                 tokio::spawn(async move {
                     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-                    let (reader, mut writer) = stream.into_split();
+                    let (reader, mut writer) = tokio::io::split(stream);
                     let mut lines = BufReader::new(reader).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         let id = serde_json::from_str::<serde_json::Value>(&line)
@@ -1291,17 +1357,17 @@ pub fn gate_pairing_long_call() -> (bool, String) {
     let (begin_ms, begin_ok, status_ms, status_countdown) = block_on_scoped(|| {
         let rt = current_thread_runtime();
         rt.block_on(async {
-            let listener = tokio::net::UnixListener::bind(&path).expect("gate pairing bind");
+            let listener = FakeListener::bind(&path).expect("gate pairing bind");
             tokio::spawn(async move {
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else {
+                    let Ok(stream) = listener.accept().await else {
                         break;
                     };
                     tokio::spawn(async move {
                         use std::sync::Arc;
                         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
                         use tokio::sync::Mutex;
-                        let (reader, writer) = stream.into_split();
+                        let (reader, writer) = tokio::io::split(stream);
                         let writer = Arc::new(Mutex::new(writer));
                         let mut lines = BufReader::new(reader).lines();
                         while let Ok(Some(line)) = lines.next_line().await {

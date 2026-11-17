@@ -1144,6 +1144,7 @@ mod tests {
     use super::*;
     use crate::sim_api::SimApi;
     use rsh_ipc::IpcServer;
+    #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::broadcast;
 
@@ -1306,8 +1307,11 @@ mod tests {
     /// Minimal `AppApi` for the capture test: only the capture
     /// methods answer (canned values); everything else is an unused
     /// one-liner (the trait's defaults cover the rest).
+    /// Unix-only: the test that uses it binds a real Unix socket.
+    #[cfg(unix)]
     struct CaptureStubApi;
 
+    #[cfg(unix)]
     impl AppApi for CaptureStubApi {
         fn version(&self) -> String {
             "test".to_string()
@@ -1540,6 +1544,8 @@ mod tests {
     /// dispatch, no `snapshot` / `connection` / `output_enabled`
     /// dispatch inside it) — the same single-read pattern as the
     /// daemon's override.
+    /// Unix-only: the test that uses it binds a real Unix socket.
+    #[cfg(unix)]
     struct CountingApi {
         inner: SimApi,
         poll_calls: AtomicUsize,
@@ -1548,6 +1554,7 @@ mod tests {
         output_calls: AtomicUsize,
     }
 
+    #[cfg(unix)]
     impl CountingApi {
         fn new() -> Self {
             Self {
@@ -1560,6 +1567,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl AppApi for CountingApi {
         fn version(&self) -> String {
             self.inner.version()

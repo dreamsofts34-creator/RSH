@@ -147,6 +147,10 @@ impl Drop for InstanceGuard {
 /// the caller exits 0.
 #[must_use]
 pub fn ensure_single_instance(data_dir: Option<&PathBuf>, page: &str) -> InstanceRole {
+    // Windows ignores the data dir (named mutex + pipe instead of
+    // the pid file); keep the parameter for the shared signature.
+    #[cfg(windows)]
+    let _ = data_dir;
     #[cfg(windows)]
     {
         ensure_single_instance_windows(page)
@@ -195,7 +199,7 @@ const SINGLE_PIPE_NAME: &str = r"\\.\pipe\rsh-ui-single";
 #[cfg(windows)]
 fn forward_page_windows(page: &str) {
     use tokio::io::AsyncWriteExt;
-    use tokio::net::windows::named_pipe::NamedPipeClient;
+    use tokio::net::windows::named_pipe::ClientOptions;
 
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -207,7 +211,7 @@ fn forward_page_windows(page: &str) {
         for _ in 0..3 {
             match tokio::time::timeout(
                 Duration::from_secs(2),
-                NamedPipeClient::connect(SINGLE_PIPE_NAME),
+                std::future::ready(ClientOptions::new().open(SINGLE_PIPE_NAME)),
             )
             .await
             {
@@ -239,7 +243,7 @@ pub fn listen_for_page_requests(queue: Arc<Mutex<VecDeque<String>>>) {
             .name("rsh-ui-single".to_string())
             .spawn(move || {
                 use tokio::io::AsyncReadExt;
-                use tokio::net::windows::named_pipe::NamedPipeServer;
+                use tokio::net::windows::named_pipe::ServerOptions;
 
                 let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -249,7 +253,10 @@ pub fn listen_for_page_requests(queue: Arc<Mutex<VecDeque<String>>>) {
                 };
                 rt.block_on(async move {
                     loop {
-                        let mut server = match NamedPipeServer::create(SINGLE_PIPE_NAME) {
+                        let mut server = match ServerOptions::new()
+                            .first_pipe_instance(true)
+                            .create(SINGLE_PIPE_NAME)
+                        {
                             Ok(server) => server,
                             Err(error) => {
                                 eprintln!("RSH-UI single-instance pipe unavailable: {error}");
