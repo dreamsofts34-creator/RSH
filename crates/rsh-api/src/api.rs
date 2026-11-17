@@ -124,6 +124,14 @@ pub struct SnapshotInfo {
     /// = gear. `0` in sequential mode or with no live data.
     #[serde(default)]
     pub gear: u8,
+    /// Monotonic engine snapshot sequence (L-4, v2.0.2): the `seq`
+    /// of the engine tick this snapshot was built from (`0` = no
+    /// tick yet). A [`PollState`] carries this snapshot, so the UI
+    /// can tell whether the snapshot changed since the last poll —
+    /// and a snapshot read in the same `poll` as its connection
+    /// cannot be from a different instant than that connection.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// `skip_serializing_if` for `button_mask`: serde requires the
@@ -139,6 +147,33 @@ fn is_zero_u64(v: &u64) -> bool {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_f64(v: &f64) -> bool {
     *v == 0.0
+}
+
+/// One combined live-state read (L-4, v2.0.2): the snapshot, the
+/// connection, and the "Send to game" flag in a single call.
+///
+/// The UI poller used to make three sequential IPC round-trips per
+/// cycle (snapshot + connection + output) — on a slow daemon the
+/// cache could go ~1.5 s stale and the three values could come from
+/// three different instants (tearing: e.g. a snapshot from while
+/// connected paired with a connection that has since flipped to
+/// `Error`). One `poll` is one round-trip and one server-side
+/// dispatch, so the three values are from the same instant. This is
+/// the standard aggregated-state-endpoint pattern (REST / gRPC /
+/// telemetry loops): 1 RTT instead of 3, no concurrency / ordering
+/// / race between parallel clients, less overhead.
+///
+/// Wire shape is `camelCase`: `{"snapshot": {...}, "connection":
+/// {...}, "outputEnabled": true}`.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PollState {
+    /// Latest live snapshot (steering / pedals / buttons / gear).
+    pub snapshot: SnapshotInfo,
+    /// Current connection state.
+    pub connection: ConnectionInfo,
+    /// Whether "Send to game" output is enabled.
+    pub output_enabled: bool,
 }
 
 /// Firmware update check (H3, v2.0.2): the board's live version
@@ -468,6 +503,30 @@ pub trait AppApi: Send + Sync {
 
     /// Set "Send to game" on/off.
     fn set_output_enabled(&self, enabled: bool);
+
+    /// One combined live-state read (L-4, v2.0.2): the snapshot,
+    /// the connection, and the output flag in a single call (see
+    /// [`PollState`]). The UI poller calls this once per cycle
+    /// instead of three sequential IPC round-trips.
+    ///
+    /// Default: reads the three getters back-to-back in this one
+    /// call — no IPC round-trip (and no await / sleep) between
+    /// them, so the values cannot drift the way three separate
+    /// calls can. That is enough for simple / immutable
+    /// implementations (sim, stubs). A stateful implementation
+    /// whose state can change between two reads (the daemon: the
+    /// manager and the engine tick on different locks) MUST
+    /// override this and read each source exactly once — the
+    /// daemon's override reads one core snapshot, one transport
+    /// state, one manager state, and one settings copy, then
+    /// derives all three fields from those four reads.
+    fn poll(&self) -> PollState {
+        PollState {
+            snapshot: self.snapshot(),
+            connection: self.connection(),
+            output_enabled: self.output_enabled(),
+        }
+    }
 
     /// Whether auto-profile switching is paused (M6, v2.0.2).
     /// Default: not paused — only the daemon overrides it.
@@ -1066,5 +1125,213 @@ pub trait AppApi: Send + Sync {
             ConnectionError::Unknown,
             "diagnostics are not supported by this API",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// L-4: a stub whose state flips between two reads — the
+    /// transition that, over IPC, happens between the snapshot
+    /// round-trip and the connection round-trip of the old
+    /// three-call poller.
+    ///
+    /// Generation `0` = connected (`Active` / "Connected",
+    /// steering `0.0`); generation `1` = disconnected (`Idle` /
+    /// "Disconnected"). `snapshot()` reads its generation and then
+    /// advances to the next one, so a following `connection()` sees
+    /// the *new* generation: the two separate reads disagree
+    /// (tearing). `poll()` reads the generation exactly once under
+    /// one lock and derives all three fields from it, so it never
+    /// tears — the same single-read pattern the daemon's override
+    /// uses (one core snapshot, one transport state, one manager
+    /// state, one settings copy).
+    struct FlippingApi {
+        generation: Mutex<u64>,
+    }
+
+    impl FlippingApi {
+        fn new() -> Self {
+            Self {
+                generation: Mutex::new(0),
+            }
+        }
+
+        fn connection_for(generation: u64) -> ConnectionInfo {
+            if generation.is_multiple_of(2) {
+                ConnectionInfo {
+                    state: ConnectionState::Active,
+                    label: "Connected".to_string(),
+                    transport: ApiTransport::Wifi,
+                    address: "192.168.4.1".to_string(),
+                    session_active: true,
+                    error: None,
+                    hint: None,
+                }
+            } else {
+                ConnectionInfo {
+                    state: ConnectionState::Idle,
+                    label: "Disconnected".to_string(),
+                    transport: ApiTransport::Wifi,
+                    address: String::new(),
+                    session_active: false,
+                    error: None,
+                    hint: None,
+                }
+            }
+        }
+
+        // The `u64 → f64` cast cannot lose precision for real
+        // generations: the stub advances by one per read, far below
+        // 2^53.
+        #[allow(clippy::cast_precision_loss)]
+        fn snapshot_for(generation: u64) -> SnapshotInfo {
+            SnapshotInfo {
+                steering_deg: generation as f64,
+                throttle: 0.5,
+                brake: 0.0,
+                clutch: None,
+                button_mask: 0,
+                handbrake: 0.0,
+                gear: 0,
+                seq: generation,
+            }
+        }
+    }
+
+    impl AppApi for FlippingApi {
+        fn version(&self) -> String {
+            "test".to_string()
+        }
+
+        fn connection(&self) -> ConnectionInfo {
+            let generation = *self
+                .generation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self::connection_for(generation)
+        }
+
+        fn connect(&self, _transport: ApiTransport) -> Result<ConnectionInfo, UserError> {
+            Ok(self.connection())
+        }
+
+        fn disconnect(&self) -> Result<ConnectionInfo, UserError> {
+            Ok(self.connection())
+        }
+
+        fn pairing_status(&self) -> PairingInfo {
+            PairingInfo {
+                seconds_left: 0,
+                password: None,
+                error: None,
+                error_detail: None,
+                board_mac: None,
+                replacement_required: false,
+                key_reset_armed: false,
+            }
+        }
+
+        fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
+            Ok(self.pairing_status())
+        }
+
+        fn snapshot(&self) -> SnapshotInfo {
+            let mut generation = self
+                .generation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let snap = Self::snapshot_for(*generation);
+            // The transition: the state moves on after the snapshot
+            // read, before any later read in the same cycle.
+            *generation += 1;
+            snap
+        }
+
+        fn output_enabled(&self) -> bool {
+            true
+        }
+
+        fn set_output_enabled(&self, _enabled: bool) {}
+
+        fn get_tuning(&self, module: &str) -> TuningSettings {
+            TuningSettings::neutral(module)
+        }
+
+        fn set_tuning(&self, tuning: &TuningSettings) -> Result<TuningSettings, UserError> {
+            Ok(tuning.clone())
+        }
+
+        fn draft_status(&self) -> Option<DraftStatus> {
+            None
+        }
+
+        fn save_draft(&self) -> Result<bool, UserError> {
+            Ok(false)
+        }
+
+        fn discard_draft(&self) -> bool {
+            false
+        }
+
+        fn poll(&self) -> PollState {
+            // One read, one lock: every field comes from the same
+            // generation — no transition can interleave.
+            let generation = *self
+                .generation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            PollState {
+                snapshot: Self::snapshot_for(generation),
+                connection: Self::connection_for(generation),
+                output_enabled: true,
+            }
+        }
+    }
+
+    #[test]
+    fn separate_snapshot_and_connection_reads_tear() {
+        // The bug L-4 fixes, reproduced: the snapshot says
+        // generation 0 (connected) while the connection read that
+        // follows it says generation 1 (disconnected).
+        let api = FlippingApi::new();
+        let snap = api.snapshot();
+        assert_eq!(snap.seq, 0);
+        assert_eq!(snap.steering_deg, 0.0);
+        let conn = api.connection();
+        assert_eq!(conn.state, ConnectionState::Idle);
+        assert_eq!(conn.label, "Disconnected");
+        assert!(
+            !conn.session_active,
+            "snapshot seq 0 implies connected, but the later connection read says disconnected"
+        );
+    }
+
+    #[test]
+    fn poll_returns_all_three_from_one_generation() {
+        let api = FlippingApi::new();
+        let polled = api.poll();
+        // (a) one call carries snapshot + connection + output.
+        assert_eq!(polled.snapshot.seq, 0);
+        assert_eq!(polled.snapshot.steering_deg, 0.0);
+        assert_eq!(polled.snapshot.throttle, 0.5);
+        assert_eq!(polled.connection.state, ConnectionState::Active);
+        assert_eq!(polled.connection.label, "Connected");
+        assert!(polled.connection.session_active);
+        assert!(polled.output_enabled);
+        // (b) consistent: the snapshot's generation and the
+        // connection's generation are the same instant — the
+        // snapshot seq (0) is the connected generation, and the
+        // connection agrees. A second poll is identical: `poll`
+        // itself never advances the state.
+        let again = api.poll();
+        assert_eq!(again, polled);
+        // And the wire shape round-trips (camelCase).
+        let json = serde_json::to_string(&polled).expect("poll serializes");
+        assert!(json.contains("\"outputEnabled\":true"), "{json}");
+        let back: PollState = serde_json::from_str(&json).expect("poll round-trips");
+        assert_eq!(back, polled);
     }
 }

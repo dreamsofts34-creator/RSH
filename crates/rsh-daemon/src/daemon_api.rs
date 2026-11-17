@@ -14,13 +14,13 @@ use rsh_api::connection::ConnectionState as MgrState;
 use rsh_api::errors::{ConnectionError, UserError};
 use rsh_api::{
     ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionInfo, DiagStats,
-    DraftStatus, FirmwareCheck, FirmwareUpdateStatus, GameSummary, PairingInfo, ProfileSummary,
-    RawMv, SnapshotInfo, TuningSettings, VjoyStatus, app_version,
+    DraftStatus, FirmwareCheck, FirmwareUpdateStatus, GameSummary, PairingInfo, PollState,
+    ProfileSummary, RawMv, SnapshotInfo, TuningSettings, VjoyStatus, app_version,
 };
 use rsh_api::{ConnEvent, ConnectionManager};
-use rsh_app_core::snapshot::ConnectionState as CoreState;
+use rsh_app_core::snapshot::{ConnectionState as CoreState, EngineSnapshot};
 use rsh_app_core::state::{
-    AppStateCore, GameInfo, ProfileSummary as CoreProfileSummary, TransportKind,
+    AppStateCore, GameInfo, ProfileSummary as CoreProfileSummary, TransportKind, TransportState,
 };
 
 /// The daemon's API handle: shared by the IPC server, the tray
@@ -88,16 +88,13 @@ impl DaemonApi {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .check_watchdog(std::time::Instant::now())
     }
-}
 
-impl AppApi for DaemonApi {
-    fn version(&self) -> String {
-        app_version().to_string()
-    }
-
-    fn connection(&self) -> ConnectionInfo {
-        let transport_state = self.state.transport_state();
-        let mgr = self.manager_state();
+    /// Build the [`ConnectionInfo`] from one manager state + one
+    /// transport state (L-4, v2.0.2): [`AppApi::connection`] and
+    /// [`AppApi::poll`] share this, so both derive the same
+    /// label/state from the same reads — never two different
+    /// manager generations for one instant.
+    fn connection_from(mgr: &MgrState, transport_state: &TransportState) -> ConnectionInfo {
         let (transport, address) = (
             match transport_state.transport.as_str() {
                 "usb" => ApiTransport::Usb,
@@ -108,7 +105,7 @@ impl AppApi for DaemonApi {
         // The manager is the state of record; the core transport
         // state fills in the address + session gate. "Connected"
         // only when the gate is open.
-        let (state, label, error, hint) = match &mgr {
+        let (state, label, error, hint) = match mgr {
             MgrState::Active => (MgrState::Active, "Connected".to_string(), None, None),
             MgrState::Error { reason, hint, .. } => (
                 mgr.clone(),
@@ -139,6 +136,36 @@ impl AppApi for DaemonApi {
             error,
             hint,
         }
+    }
+
+    /// Build the [`SnapshotInfo`] from one core snapshot + the live
+    /// button mask (L-4, v2.0.2): [`AppApi::snapshot`] and
+    /// [`AppApi::poll`] share this, so both report the same `seq`
+    /// for the same engine tick.
+    fn snapshot_from(snap: &EngineSnapshot, button_mask: u64) -> SnapshotInfo {
+        SnapshotInfo {
+            steering_deg: snap.steering_deg,
+            throttle: snap.pedals.accel,
+            brake: snap.pedals.brake,
+            clutch: snap.pedals.clutch,
+            // H10: live button bitmask from the last edge frame.
+            button_mask,
+            // M-3: live handbrake + gear from the pipeline output.
+            handbrake: snap.handbrake,
+            gear: snap.gear,
+            // L-4: the engine tick this snapshot was built from.
+            seq: snap.seq,
+        }
+    }
+}
+
+impl AppApi for DaemonApi {
+    fn version(&self) -> String {
+        app_version().to_string()
+    }
+
+    fn connection(&self) -> ConnectionInfo {
+        Self::connection_from(&self.manager_state(), &self.state.transport_state())
     }
 
     fn connect(&self, transport: ApiTransport) -> Result<ConnectionInfo, UserError> {
@@ -197,17 +224,30 @@ impl AppApi for DaemonApi {
     }
 
     fn snapshot(&self) -> SnapshotInfo {
-        let snap = self.state.snapshot();
-        SnapshotInfo {
-            steering_deg: snap.steering_deg,
-            throttle: snap.pedals.accel,
-            brake: snap.pedals.brake,
-            clutch: snap.pedals.clutch,
-            // H10: live button bitmask from the last edge frame.
-            button_mask: self.state.pressed_button_mask(),
-            // M-3: live handbrake + gear from the pipeline output.
-            handbrake: snap.handbrake,
-            gear: snap.gear,
+        Self::snapshot_from(&self.state.snapshot(), self.state.pressed_button_mask())
+    }
+
+    /// L-4 (v2.0.2): one combined live-state read. Each source is
+    /// read exactly once, back-to-back in this one synchronous
+    /// dispatch (no IPC / await / sleep between the reads): one
+    /// core snapshot (carries the engine `seq`), one transport
+    /// state, one manager state, one settings copy — then the
+    /// connection is derived from the same manager + transport
+    /// reads as the snapshot's tick, so the three fields cannot
+    /// tear the way three separate IPC calls could. No lock is
+    /// held across the reads (each accessor clones under its own
+    /// short lock), so there is no new lock-ordering vs the
+    /// manager loop or the engine tick.
+    fn poll(&self) -> PollState {
+        let core_snap = self.state.snapshot();
+        let transport = self.state.transport_state();
+        let mgr = self.manager_state();
+        let connection = Self::connection_from(&mgr, &transport);
+        let snapshot = Self::snapshot_from(&core_snap, self.state.pressed_button_mask());
+        PollState {
+            snapshot,
+            connection,
+            output_enabled: self.state.settings().output_enabled,
         }
     }
 
@@ -875,5 +915,35 @@ mod tests {
         let saved = binding_user_error("BindingSaveFailed", "disk full".to_string());
         assert_eq!(saved.code, "BindingSaveFailed");
         assert_eq!(saved.detail.as_deref(), Some("disk full"));
+    }
+
+    #[test]
+    fn poll_agrees_with_the_separate_getters_at_the_same_instant() {
+        // L-4 (v2.0.2): one `poll` carries snapshot + connection +
+        // output, and — with no engine tick or manager transition
+        // in between — it agrees exactly with the three separate
+        // getters: same snapshot `seq`, same connection, same
+        // output flag. (The tearing mechanism itself — state
+        // changing between separate reads — is proven by the
+        // flipping-stub test in `rsh-api`.)
+        let (api, _dir) = live_api_named("poll");
+        let polled = api.poll();
+        assert_eq!(
+            polled.snapshot,
+            api.snapshot(),
+            "poll's snapshot is the live snapshot"
+        );
+        assert_eq!(
+            polled.connection,
+            api.connection(),
+            "poll's connection is the live connection"
+        );
+        assert_eq!(polled.output_enabled, api.output_enabled());
+        // No engine tick yet: seq 0, zeroed snapshot — never a
+        // fake reading.
+        assert_eq!(polled.snapshot.seq, 0);
+        assert_eq!(polled.snapshot.steering_deg, 0.0);
+        // A second poll is identical while nothing moves.
+        assert_eq!(api.poll(), polled);
     }
 }

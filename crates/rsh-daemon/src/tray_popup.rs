@@ -490,6 +490,7 @@ mod tests {
                 button_mask: 0,
                 handbrake: 0.0,
                 gear: 0,
+                seq: 0,
             },
             send: true,
         };

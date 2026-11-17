@@ -152,6 +152,8 @@ impl AppApi for SimApi {
             // M-3: the sim has no handbrake or shifter either.
             handbrake: 0.0,
             gear: 0,
+            // L-4: the sim has no engine tick — seq stays 0.
+            seq: 0,
         }
     }
 

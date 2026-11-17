@@ -11,9 +11,11 @@
 //! 500 ms ([`IpcClient::call`]) and fails fast once the background
 //! poller proves the link dead. The hot values (`connection`,
 //! `snapshot`, `output_enabled`) are refreshed ~20 Hz by a runtime
-//! task into [`LiveCache`] — the UI thread only ever reads the
-//! cache, so a hung daemon can never freeze a frame. When the
-//! daemon dies mid-session the UI calls [`IpcApi::clear_cached_state`]
+//! task into [`LiveCache`] — one combined `poll` call per cycle
+//! (L-4), so the three slots always hold values from the same
+//! instant. The UI thread only ever reads the cache, so a hung
+//! daemon can never freeze a frame. When the daemon dies
+//! mid-session the UI calls [`IpcApi::clear_cached_state`]
 //! (no stale connection / snapshot survives) and the health monitor
 //! re-probes in the background.
 //!
@@ -32,7 +34,7 @@ use rsh_api::connection::ConnectionState;
 use rsh_api::{
     app_version, ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionError,
     ConnectionInfo, DiagStats, DraftStatus, FirmwareCheck, FirmwareUpdateStatus, GameSummary,
-    PairingInfo, ProfileSummary, SnapshotInfo, TuningSettings, UserError, VjoyStatus,
+    PairingInfo, PollState, ProfileSummary, SnapshotInfo, TuningSettings, UserError, VjoyStatus,
 };
 use rsh_ipc::{IpcClient, IpcError};
 
@@ -71,12 +73,12 @@ pub struct IpcApi {
 impl IpcApi {
     /// Connect to the daemon at `path` and subscribe to push events.
     ///
-    /// Also starts the background poller task: snapshot /
-    /// connection / output are refreshed ~20 Hz into the shared
-    /// cache (B3), so the UI thread never blocks on the daemon for
-    /// them. The task holds only the client + cache (never the
-    /// `IpcApi`), so it ends when the runtime shuts down with the
-    /// last `Arc<IpcApi>`.
+    /// Also starts the background poller task: one combined `poll`
+    /// call per cycle refreshes snapshot / connection / output
+    /// ~20 Hz into the shared cache (B3 + L-4), so the UI thread
+    /// never blocks on the daemon for them. The task holds only the
+    /// client + cache (never the `IpcApi`), so it ends when the
+    /// runtime shuts down with the last `Arc<IpcApi>`.
     ///
     /// # Errors
     ///
@@ -107,45 +109,35 @@ impl IpcApi {
             let poll_cache = cache;
             api.rt.spawn(async move {
                 loop {
-                    let mut ok = true;
-                    match poll_client.call("snapshot", serde_json::json!({})).await {
-                        Ok(value) => match serde_json::from_value::<SnapshotInfo>(value) {
-                            Ok(snap) => {
+                    // L-4 (v2.0.2): ONE combined `poll` round-trip
+                    // per cycle — snapshot + connection + output
+                    // from one server-side dispatch, so the three
+                    // cache slots always hold values from the same
+                    // instant. The old three sequential calls could
+                    // tear (a snapshot from while connected paired
+                    // with a connection that had since flipped) and
+                    // went ~1.5 s stale on a slow daemon. A failed
+                    // call or a failed parse counts as a failed
+                    // round, same as before: the cache keeps its
+                    // last good values and `link_dead` trips below.
+                    let ok = match poll_client.call("poll", serde_json::json!({})).await {
+                        Ok(value) => match serde_json::from_value::<PollState>(value) {
+                            Ok(polled) => {
                                 if let Ok(mut slot) = poll_cache.snapshot.lock() {
-                                    *slot = Some(snap);
+                                    *slot = Some(polled.snapshot);
                                 }
-                            }
-                            Err(_) => ok = false,
-                        },
-                        Err(_) => ok = false,
-                    }
-                    match poll_client.call("connection", serde_json::json!({})).await {
-                        Ok(value) => match serde_json::from_value::<ConnectionInfo>(value) {
-                            Ok(info) => {
                                 if let Ok(mut slot) = poll_cache.connection.lock() {
-                                    *slot = Some(info);
+                                    *slot = Some(polled.connection);
                                 }
+                                if let Ok(mut slot) = poll_cache.output.lock() {
+                                    *slot = Some(polled.output_enabled);
+                                }
+                                true
                             }
-                            Err(_) => ok = false,
+                            Err(_) => false,
                         },
-                        Err(_) => ok = false,
-                    }
-                    match poll_client
-                        .call("output_enabled", serde_json::json!({}))
-                        .await
-                    {
-                        Ok(value) => {
-                            match value.get("enabled").and_then(serde_json::Value::as_bool) {
-                                Some(enabled) => {
-                                    if let Ok(mut slot) = poll_cache.output.lock() {
-                                        *slot = Some(enabled);
-                                    }
-                                }
-                                None => ok = false,
-                            }
-                        }
-                        Err(_) => ok = false,
-                    }
+                        Err(_) => false,
+                    };
                     poll_cache.link_dead.store(!ok, Ordering::Relaxed);
                     // A9/B7: a failed round backs off to 500 ms — a
                     // wedged daemon must not let the poller hog the
@@ -1152,6 +1144,7 @@ mod tests {
     use super::*;
     use crate::sim_api::SimApi;
     use rsh_ipc::IpcServer;
+    use std::sync::atomic::AtomicUsize;
     use tokio::sync::broadcast;
 
     /// L4 end-to-end: `IpcApi` → real Unix socket → `dispatch` →
@@ -1536,6 +1529,174 @@ mod tests {
         }
         assert_eq!(client.connection().label, "Connection lost");
         assert_eq!(client.snapshot(), SnapshotInfo::default());
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Counting `AppApi` for the L-4 poller test: delegates to a
+    /// `SimApi` and counts how many times the server dispatches
+    /// each hot method. `poll()` reads the inner sim directly (one
+    /// dispatch, no `snapshot` / `connection` / `output_enabled`
+    /// dispatch inside it) — the same single-read pattern as the
+    /// daemon's override.
+    struct CountingApi {
+        inner: SimApi,
+        poll_calls: AtomicUsize,
+        snapshot_calls: AtomicUsize,
+        connection_calls: AtomicUsize,
+        output_calls: AtomicUsize,
+    }
+
+    impl CountingApi {
+        fn new() -> Self {
+            Self {
+                inner: SimApi::new(),
+                poll_calls: AtomicUsize::new(0),
+                snapshot_calls: AtomicUsize::new(0),
+                connection_calls: AtomicUsize::new(0),
+                output_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl AppApi for CountingApi {
+        fn version(&self) -> String {
+            self.inner.version()
+        }
+
+        fn connection(&self) -> ConnectionInfo {
+            self.connection_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.connection()
+        }
+
+        fn connect(&self, transport: ApiTransport) -> Result<ConnectionInfo, UserError> {
+            self.inner.connect(transport)
+        }
+
+        fn disconnect(&self) -> Result<ConnectionInfo, UserError> {
+            self.inner.disconnect()
+        }
+
+        fn pairing_status(&self) -> PairingInfo {
+            self.inner.pairing_status()
+        }
+
+        fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
+            self.inner.begin_pairing()
+        }
+
+        fn snapshot(&self) -> SnapshotInfo {
+            self.snapshot_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.snapshot()
+        }
+
+        fn output_enabled(&self) -> bool {
+            self.output_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.output_enabled()
+        }
+
+        fn set_output_enabled(&self, enabled: bool) {
+            self.inner.set_output_enabled(enabled);
+        }
+
+        fn get_tuning(&self, module: &str) -> TuningSettings {
+            self.inner.get_tuning(module)
+        }
+
+        fn set_tuning(&self, tuning: &TuningSettings) -> Result<TuningSettings, UserError> {
+            self.inner.set_tuning(tuning)
+        }
+
+        fn draft_status(&self) -> Option<DraftStatus> {
+            self.inner.draft_status()
+        }
+
+        fn save_draft(&self) -> Result<bool, UserError> {
+            self.inner.save_draft()
+        }
+
+        fn discard_draft(&self) -> bool {
+            self.inner.discard_draft()
+        }
+
+        fn poll(&self) -> rsh_api::PollState {
+            self.poll_calls.fetch_add(1, Ordering::Relaxed);
+            rsh_api::PollState {
+                snapshot: self.inner.snapshot(),
+                connection: self.inner.connection(),
+                output_enabled: self.inner.output_enabled(),
+            }
+        }
+    }
+
+    /// L-4 (v2.0.2): the poller does exactly ONE round-trip per
+    /// cycle — the combined `poll` — never the three old separate
+    /// calls. Proved by counting server-side dispatches while the
+    /// real `IpcApi` poller runs against a real socket: after ≥ 2
+    /// poll cycles, `poll` was dispatched ≥ 2 times and
+    /// `snapshot` / `connection` / `output_enabled` were dispatched
+    /// 0 times, while the cache still holds live values.
+    #[test]
+    #[cfg(unix)]
+    fn poller_uses_one_combined_poll_per_cycle() {
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-poll-count-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let counting = Arc::new(CountingApi::new());
+        let api: Arc<dyn AppApi> = counting.clone();
+        let (tx, _rx) = broadcast::channel(64);
+        let server = Arc::new(IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let client = IpcApi::connect(&sock).expect("connect");
+        // The poller runs a cycle every ~50 ms; wait for ≥ 2.
+        let mut polls = 0;
+        for _ in 0..100 {
+            polls = counting.poll_calls.load(Ordering::Relaxed);
+            if polls >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(polls >= 2, "poller never ran a poll cycle");
+        assert_eq!(
+            counting.snapshot_calls.load(Ordering::Relaxed),
+            0,
+            "poller must not dispatch snapshot any more"
+        );
+        assert_eq!(
+            counting.connection_calls.load(Ordering::Relaxed),
+            0,
+            "poller must not dispatch connection any more"
+        );
+        assert_eq!(
+            counting.output_calls.load(Ordering::Relaxed),
+            0,
+            "poller must not dispatch output_enabled any more"
+        );
+        // The cache still got live values — from the one poll.
+        assert_eq!(client.connection().label, "Connected");
+        assert_eq!(client.snapshot().throttle, 0.5);
+        assert!(client.output_enabled());
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);

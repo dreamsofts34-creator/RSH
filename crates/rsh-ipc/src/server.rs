@@ -562,6 +562,46 @@ mod tests {
     }
 
     #[test]
+    fn poll_round_trip_through_dispatch() {
+        // L-4 (v2.0.2): one `poll` call carries snapshot +
+        // connection + output (the trait default, over the stub).
+        // Wire shape is camelCase: `outputEnabled`.
+        let server = stub_server();
+        let resp = server
+            .handle_line(r#"{"v":1,"id":5,"method":"poll","params":{}}"#)
+            .expect("poll parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        let got = resp.result.expect("result");
+        let snap = got.get("snapshot").expect("poll has a snapshot");
+        assert_eq!(snap.get("seq"), Some(&serde_json::json!(0)));
+        assert_eq!(snap.get("throttle"), Some(&serde_json::json!(0.0)));
+        let conn = got.get("connection").expect("poll has a connection");
+        assert_eq!(
+            conn.get("label"),
+            Some(&serde_json::Value::String("Connected".to_string()))
+        );
+        assert_eq!(
+            conn.get("session_active"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            got.get("outputEnabled"),
+            Some(&serde_json::Value::Bool(false)),
+            "the stub's output flag is off: {got}"
+        );
+        // The same values the three separate calls return — one
+        // call, not three round-trips.
+        let snap_resp = server
+            .handle_line(r#"{"v":1,"id":6,"method":"snapshot","params":{}}"#)
+            .expect("snapshot parses");
+        assert_eq!(snap_resp.result.expect("result"), *snap);
+        let conn_resp = server
+            .handle_line(r#"{"v":1,"id":7,"method":"connection","params":{}}"#)
+            .expect("connection parses");
+        assert_eq!(conn_resp.result.expect("result"), *conn);
+    }
+
+    #[test]
     fn wrong_version_is_rejected() {
         let server = stub_server();
         let resp = server

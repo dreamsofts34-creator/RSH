@@ -95,7 +95,7 @@ pub struct IpcRequest {
     pub id: u64,
     /// Method name (`ping`, `version`, `connection`, `connect`,
     /// `disconnect`, `pairing_status`, `begin_pairing`, `snapshot`,
-    /// `output_enabled`, `set_output_enabled`, `subscribe`,
+    /// `poll`, `output_enabled`, `set_output_enabled`, `subscribe`,
     /// `get_tuning`, `set_tuning`, `draft_status`, `save_draft`,
     /// `discard_draft`, `autostart`, `set_autostart`,
     /// `firmware_version`, `output_backend`, `set_output_backend`,
@@ -240,6 +240,13 @@ pub fn dispatch(
         "snapshot" => {
             Ok(serde_json::to_value(api.snapshot())
                 .map_err(|e| IpcError::Protocol(e.to_string()))?)
+        }
+        // L-4 (v2.0.2): one combined live-state read — snapshot +
+        // connection + output in a single round-trip, from one
+        // server-side dispatch, so the three values are from the
+        // same instant (no tearing between three sequential calls).
+        "poll" => {
+            Ok(serde_json::to_value(api.poll()).map_err(|e| IpcError::Protocol(e.to_string()))?)
         }
         "output_enabled" => Ok(serde_json::json!({"enabled": api.output_enabled()})),
         "set_output_enabled" => {

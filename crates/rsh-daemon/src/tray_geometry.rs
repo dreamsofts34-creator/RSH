@@ -383,10 +383,20 @@ pub fn ui_process_id() -> Option<u32> {
         {
             continue;
         }
+        // Match ONLY argv[0]'s file name (the exe name): a loose
+        // "any arg contains rsh-ui" match also fires on unrelated
+        // processes whose command line merely mentions rsh-ui —
+        // e.g. the very `cargo test -p rsh-ui` that runs this
+        // suite, or a terminal running an rsh-ui command — and
+        // then `open_ui` wrongly believes a UI is running and
+        // never spawns one. A real UI has argv[0] = its exe path
+        // (basename `rsh-ui`); the test fake sets argv[0] to
+        // `rsh-ui` via `exec -a`.
         if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline"))
-            && String::from_utf8_lossy(&cmdline)
-                .split('\0')
-                .any(|arg| arg.contains("rsh-ui"))
+            && let Some(argv0) = String::from_utf8_lossy(&cmdline).split('\0').next()
+            && std::path::Path::new(argv0)
+                .file_name()
+                .is_some_and(|name| name == "rsh-ui" || name == "rsh-ui.exe")
         {
             return Some(pid);
         }
