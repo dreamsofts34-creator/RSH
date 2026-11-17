@@ -590,12 +590,15 @@ fn signal_ipc_fatal_shutdown(data_dir: &std::path::Path, detail: &str, shutdown:
 /// killer). The raw OS codes are Win32 (`ERROR_ACCESS_DENIED` 5,
 /// `ERROR_PIPE_BUSY` 231); this helper is only called on the Windows
 /// path, so the raw-code arm never misfires on Linux.
+// Only called on the Windows IPC path; kept available in test
+// builds so the Linux suite can cover the classifier (F1).
+#[cfg(any(windows, test))]
 fn pipe_create_is_in_use(error: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     matches!(
         error.kind(),
         ErrorKind::PermissionDenied | ErrorKind::AlreadyExists | ErrorKind::AddrInUse
-    ) || matches!(error.raw_os_error(), Some(5) | Some(231))
+    ) || matches!(error.raw_os_error(), Some(5 | 231))
 }
 
 /// Backoff between retries of an in-use pipe create (F1): 100 ms,
@@ -1000,52 +1003,84 @@ fn main() {
         Ok(AcquireOutcome::First(lock)) => lock,
         Ok(AcquireOutcome::AlreadyRunning(pid)) => {
             let socket = socket_path(&data_dir);
-            // The lock holder may be a daemon that is still starting
-            // (IPC not bound yet) — give its ping a few tries before
-            // declaring it dead.
-            let alive = std::thread::spawn(move || {
+            // F15: the lock holder may be a daemon that is still
+            // starting (IPC not bound yet — store open + runtime
+            // happen before the pipe exists) — give its ping up to
+            // `PING_ATTEMPTS` × `PING_INTERVAL` (~10 s, not the old
+            // 3 × 500 ms), and track whether its IPC endpoint ever
+            // existed: no endpoint yet means "still starting", which
+            // must NOT be reported as hung.
+            let (alive, endpoint_seen) = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .ok()?;
                 Some(runtime.block_on(async move {
-                    for _ in 0..3 {
+                    let mut endpoint_seen = false;
+                    for _ in 0..single_instance::PING_ATTEMPTS {
+                        if single_instance::ipc_endpoint_exists(&socket) {
+                            endpoint_seen = true;
+                        }
                         if let Ok(client) = rsh_ipc::IpcClient::connect(&socket).await
                             && let Ok(true) = client.ping().await
                         {
-                            return true;
+                            return (true, endpoint_seen);
                         }
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        tokio::time::sleep(single_instance::PING_INTERVAL).await;
                     }
-                    false
+                    (false, endpoint_seen)
                 }))
             })
             .join()
             .ok()
             .flatten()
-            .unwrap_or(false);
-            if alive {
-                log_line(
-                    verbose,
-                    &format!("daemon: already running (pid {pid:?}, IPC answers) — exiting"),
-                );
-                std::process::exit(0);
+            .unwrap_or((false, false));
+            match single_instance::classify_already_running(alive, endpoint_seen) {
+                single_instance::AlreadyRunningVerdict::Alive => {
+                    log_line(
+                        verbose,
+                        &format!("daemon: already running (pid {pid:?}, IPC answers) — exiting"),
+                    );
+                    std::process::exit(0);
+                }
+                single_instance::AlreadyRunningVerdict::Hung => {
+                    // The lock is held, the endpoint exists, but the
+                    // daemon does not answer IPC: hung, or a stale
+                    // lock the single-instance check could not
+                    // reclaim. Never exit 0 (success) for a broken
+                    // daemon, and never leave only an invisible
+                    // stderr line: a UI that spawned us falls back to
+                    // simulated data, so this failure must be in the
+                    // dual-location log AND in the machine-readable
+                    // status file (L8, v2.0.2) — the UI reads the
+                    // file and tells the user the running daemon is
+                    // hung instead of silently simulating.
+                    let detail = format!(
+                        "already running (pid {pid:?}) but not responding to IPC after {} tries (endpoint exists) — the running daemon is hung or its IPC is dead; not taking over",
+                        single_instance::PING_ATTEMPTS
+                    );
+                    write_daemon_status(&data_dir, "fatal", "DaemonHung", &detail);
+                    let _ = log_fatal(&format!("daemon: {detail}"));
+                    std::process::exit(1);
+                }
+                single_instance::AlreadyRunningVerdict::Starting => {
+                    // No fatal status: the first daemon is still
+                    // starting (its IPC endpoint never appeared in
+                    // ~10 s). Exiting 1 without writing `DaemonHung`,
+                    // so the UI does not latch a false fatal for a
+                    // daemon that is still coming up — the first
+                    // daemon will either answer or leave its own
+                    // trace.
+                    log_line(
+                        verbose,
+                        &format!(
+                            "daemon: already running (pid {pid:?}) but its IPC endpoint never appeared after {} tries — the first daemon is still starting; not declaring it hung, not taking over",
+                            single_instance::PING_ATTEMPTS
+                        ),
+                    );
+                    std::process::exit(1);
+                }
             }
-            // The lock is held but the daemon does not answer IPC:
-            // hung, or a stale lock the single-instance check could
-            // not reclaim. Never exit 0 (success) for a broken
-            // daemon, and never leave only an invisible stderr line:
-            // a UI that spawned us falls back to simulated data, so
-            // this failure must be in the dual-location log AND in
-            // the machine-readable status file (L8, v2.0.2) — the UI
-            // reads the file and tells the user the running daemon
-            // is hung instead of silently simulating.
-            let detail = format!(
-                "already running (pid {pid:?}) but not responding to IPC after 3 tries — the running daemon is hung or its IPC is dead; not taking over"
-            );
-            write_daemon_status(&data_dir, "fatal", "DaemonHung", &detail);
-            let _ = log_fatal(&format!("daemon: {detail}"));
-            std::process::exit(1);
         }
         Err(error) => {
             let _ = log_fatal(&format!(
@@ -1511,8 +1546,7 @@ impl PopupHandle {
         popup_hwnd: Option<isize>,
     ) -> bool {
         let elapsed = shown.elapsed();
-        let popup_foreground =
-            popup_hwnd.is_some_and(|hwnd| foreground_now == Some(hwnd));
+        let popup_foreground = popup_hwnd.is_some_and(|hwnd| foreground_now == Some(hwnd));
         // (c) Activation retry: the show-time attempt runs before
         // Slint has created the native window, so retry on ticks
         // until the popup is foreground or the timeout expires.
@@ -1704,8 +1738,7 @@ fn create_tray(
                         handle.refresh(&api);
                         if let Some(shown) = handle.shown_at.get() {
                             let foreground_now = tray_geometry::foreground_hwnd();
-                            let hwnd =
-                                tray_geometry::popup_hwnd(tray_geometry::POPUP_WINDOW_TITLE);
+                            let hwnd = tray_geometry::popup_hwnd(tray_geometry::POPUP_WINDOW_TITLE);
                             if handle.tick(shown, foreground_now, hwnd) {
                                 handle.hide("click-away");
                             }

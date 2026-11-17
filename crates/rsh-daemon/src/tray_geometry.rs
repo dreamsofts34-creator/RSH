@@ -168,26 +168,6 @@ pub fn popup_hwnd(_title: &str) -> Option<isize> {
     None
 }
 
-/// Whether `hwnd` (a raw `HWND` value from [`popup_hwnd`]) is the
-/// current foreground window. `false` when Windows cannot tell
-/// (no foreground window).
-#[cfg(windows)]
-#[must_use]
-pub fn is_foreground(hwnd_value: isize) -> bool {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-    let foreground = unsafe { GetForegroundWindow() };
-    foreground == HWND(hwnd_value as *mut std::ffi::c_void)
-}
-
-/// No foreground window on Linux: the click-outside poll never
-/// treats the popup as foreground there.
-#[cfg(not(windows))]
-#[must_use]
-pub fn is_foreground(_hwnd_value: isize) -> bool {
-    false
-}
-
 /// Bring the tray popup to the foreground when it is shown (H-2,
 /// v2.0.2) — the second half of the A4 fix.
 ///
