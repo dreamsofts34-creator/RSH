@@ -161,27 +161,17 @@ fn module_index(module: &str) -> Option<usize> {
 /// synchronous slow refresh (which fills the [`LiveCache`] as a
 /// side effect), then reads the seed out of the cache — so the
 /// UI-thread apply step is cache reads only.
+///
+/// The seed carries only the verdicts the apply step cannot read
+/// from the cache itself: the session `connect` result (a live
+/// call, not a cached value) and the switches the wizard seeds
+/// from. Everything else (tunings, bindings, profiles, …) the
+/// apply reads straight from the filled cache.
 pub struct LiveSeed {
-    /// Stored steering record (re-seeds the sliders).
-    pub steering: TuningSettings,
-    /// Whether the draft is dirty (the unsaved dot).
-    pub draft_dirty: bool,
     /// Active output backend name.
     pub backend: String,
     /// Start-with-Windows flag.
     pub autostart: bool,
-    /// Stored wheel-button bindings.
-    pub bindings: Vec<ButtonBinding>,
-    /// Stored knob actions.
-    pub knobs: [[String; 3]; 2],
-    /// Auto-profile-switch pause flag.
-    pub auto_pause: bool,
-    /// Keep-running-in-tray flag.
-    pub close_to_tray: bool,
-    /// Module on/off: handbrake, shifter, horn, led.
-    pub modules: [bool; 4],
-    /// Board vs bundled firmware check, when the board answers.
-    pub firmware_check: Option<FirmwareCheck>,
     /// The session `connect` verdict (the wizard's Connect step
     /// follows it; a failure notifies instead of blocking).
     pub connect: Result<ConnectionInfo, UserError>,
@@ -189,24 +179,6 @@ pub struct LiveSeed {
     pub pairing: PairingInfo,
     /// Whether the `connect` verdict is an Active session.
     pub connection_active: bool,
-    /// Last calibration read, when one exists.
-    pub calibration: Option<CalibrationInfo>,
-    /// Pedal tuning records: throttle, brake, clutch.
-    pub pedals: [TuningSettings; 3],
-    /// Extras tuning records: handbrake, led, shifter, horn.
-    pub extras: [TuningSettings; 4],
-    /// Board firmware version (`"Unknown"` with no session).
-    pub firmware_version: String,
-    /// Board address (falls back to the persisted address).
-    pub board_address: String,
-    /// Measured diagnostics, when the daemon measures.
-    pub diag: Option<DiagStats>,
-    /// Profiles list.
-    pub profiles: Vec<ProfileSummary>,
-    /// Games list.
-    pub games: Vec<GameSummary>,
-    /// Daemon app version.
-    pub version: String,
 }
 
 impl LiveSeed {
@@ -223,42 +195,11 @@ impl LiveSeed {
             .as_ref()
             .is_ok_and(|info| matches!(info.state, ConnectionState::Active));
         Self {
-            steering: api.get_tuning("steering"),
-            draft_dirty: api.draft_status().is_some_and(|s| s.dirty),
             backend: api.output_backend(),
             autostart: api.autostart(),
-            bindings: api.list_bindings(),
-            knobs: api.knob_actions(),
-            auto_pause: api.auto_pause(),
-            close_to_tray: api.close_to_tray(),
-            modules: [
-                api.module_enabled("handbrake"),
-                api.module_enabled("shifter"),
-                api.module_enabled("horn"),
-                api.module_enabled("led"),
-            ],
-            firmware_check: api.firmware_check().ok(),
             connect,
             pairing: api.pairing_status(),
             connection_active,
-            calibration: api.calibration().ok(),
-            pedals: [
-                api.get_tuning("throttle"),
-                api.get_tuning("brake"),
-                api.get_tuning("clutch"),
-            ],
-            extras: [
-                api.get_tuning("handbrake"),
-                api.get_tuning("led"),
-                api.get_tuning("shifter"),
-                api.get_tuning("horn"),
-            ],
-            firmware_version: api.firmware_version(),
-            board_address: api.board_address(),
-            diag: api.diag_stats().ok(),
-            profiles: api.list_profiles(),
-            games: api.list_games(),
-            version: api.version(),
         }
     }
 }
@@ -362,10 +303,7 @@ impl IpcApi {
                 refresh_slow(&slow_client, &slow_cache).await;
                 loop {
                     for _ in 0..20 {
-                        if slow_cache
-                            .refresh_requested
-                            .swap(false, Ordering::Relaxed)
-                        {
+                        if slow_cache.refresh_requested.swap(false, Ordering::Relaxed) {
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -502,6 +440,10 @@ impl IpcApi {
     /// True once a slow cycle has completed (F5): the slow slots
     /// hold daemon values, not just their cold-cache fallbacks.
     /// Tests wait on this instead of sleeping a fixed delay.
+    /// (Diagnostic accessor — production code keys off
+    /// `slow_generation` instead, so this reads as dead outside
+    /// tests.)
+    #[allow(dead_code)]
     #[must_use]
     pub fn slow_filled(&self) -> bool {
         self.cache.slow_filled.load(Ordering::Relaxed)
@@ -522,9 +464,7 @@ impl IpcApi {
     /// tick. Cheap (one atomic store); the poller clears the flag
     /// when it starts the early cycle.
     pub fn request_slow_refresh(&self) {
-        self.cache
-            .refresh_requested
-            .store(true, Ordering::Relaxed);
+        self.cache.refresh_requested.store(true, Ordering::Relaxed);
     }
 
     /// One slow refresh, run synchronously on the calling (job)
@@ -605,6 +545,7 @@ impl IpcApi {
 /// briefly stale beats a frozen frame. A completed pass marks the
 /// cache filled and bumps the generation, so the frame timer
 /// re-syncs the pages from the fresh values.
+#[allow(clippy::too_many_lines)]
 async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     if cache.link_dead.load(Ordering::Relaxed) {
         return;
@@ -677,8 +618,7 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
         v.get("paused").and_then(serde_json::Value::as_bool)
     });
     fetch!("close_to_tray", close_to_tray, |v| {
-        v.get("close_to_tray")
-            .and_then(serde_json::Value::as_bool)
+        v.get("close_to_tray").and_then(serde_json::Value::as_bool)
     });
     // `list_bindings` / `knob_actions` nest their payloads under a
     // key, like their trait methods already parse them.
@@ -729,12 +669,7 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
             }
         }
     }
-    for (module, index) in [
-        ("handbrake", 0),
-        ("shifter", 1),
-        ("horn", 2),
-        ("led", 3),
-    ] {
+    for (module, index) in [("handbrake", 0), ("shifter", 1), ("horn", 2), ("led", 3)] {
         if cache.link_dead.load(Ordering::Relaxed) {
             return;
         }
@@ -742,10 +677,7 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
             .call("module_enabled", serde_json::json!({"module": module}))
             .await
         {
-            if let Some(enabled) = value
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-            {
+            if let Some(enabled) = value.get("enabled").and_then(serde_json::Value::as_bool) {
                 if let Ok(mut modules) = cache.modules.lock() {
                     modules[index] = Some(enabled);
                 }
@@ -1634,10 +1566,9 @@ impl AppApi for IpcApi {
                 // F5: the stored action is the cache now.
                 if let Ok(mut slot) = self.cache.knobs.lock() {
                     if let Some(knobs) = slot.as_mut() {
-                        if let (Some(k), Some(r)) = (
-                            usize::try_from(knob).ok().filter(|k| *k < 2),
-                            usize::try_from(row).ok().filter(|r| *r < 3),
-                        ) {
+                        let k = usize::from(knob);
+                        let r = usize::from(row);
+                        if k < 2 && r < 3 {
                             knobs[k][r] = action.to_string();
                         }
                     }
@@ -1872,6 +1803,7 @@ mod tests {
     /// async context — so the server runs on a background std thread
     /// with its own current-thread runtime instead.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn tuning_round_trip_over_real_socket() {
         // Serialised with the probe test: on Windows both share the
         // one global named pipe (see live_probe::TEST_IPC_PIPE_GUARD).
@@ -2076,7 +2008,7 @@ mod tests {
     fn slow_cache_fills_with_daemon_values() {
         let (client, dir, handle, _guard) = live_client();
         assert!(
-            wait_for(&client, |c| c.slow_filled()),
+            wait_for(&client, IpcApi::slow_filled),
             "slow cache should fill"
         );
         assert!(
@@ -2141,7 +2073,7 @@ mod tests {
     fn clear_cached_state_clears_slow_cache() {
         let (client, dir, handle, _guard) = live_client();
         assert!(
-            wait_for(&client, |c| c.slow_filled()),
+            wait_for(&client, IpcApi::slow_filled),
             "slow cache should fill"
         );
         assert_eq!(client.output_backend(), "vJoy");
@@ -2153,7 +2085,7 @@ mod tests {
         assert_eq!(client.get_tuning("steering").curve, 1.0);
         assert_eq!(client.list_profiles().len(), 0);
         assert!(
-            wait_for(&client, |c| c.slow_filled()),
+            wait_for(&client, IpcApi::slow_filled),
             "slow cache should refill"
         );
         assert_eq!(client.output_backend(), "vJoy");
@@ -2164,7 +2096,8 @@ mod tests {
 
     /// F5: the reconnect seed fetch runs its own synchronous slow
     /// refresh (no fill wait needed) and reports the session
-    /// `connect` verdict the wizard follows.
+    /// `connect` verdict the wizard follows; the rest of the seed
+    /// lands in the cache (read back through the client here).
     #[test]
     #[cfg(unix)]
     fn live_seed_fetch_fills_cache_and_reports_connect() {
@@ -2174,10 +2107,11 @@ mod tests {
         assert!(seed.connection_active, "sim session is Active");
         assert_eq!(seed.backend, "vJoy");
         assert!(seed.autostart);
-        assert_eq!(seed.firmware_version, "Unknown");
-        assert_eq!(seed.steering.module, "steering");
-        assert_eq!(seed.version, app_version());
+        assert_eq!(seed.pairing.seconds_left, 0);
         assert!(client.slow_filled(), "seed fetch fills the slow cache");
+        assert_eq!(client.version(), app_version());
+        assert_eq!(client.firmware_version(), "Unknown");
+        assert_eq!(client.get_tuning("steering").module, "steering");
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);
