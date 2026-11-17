@@ -521,18 +521,18 @@ impl IpcApi {
 
     /// Build the [`UserError`] for a failed session `connect`
     /// (F26): the daemon's `IpcError::Api` payload carries its
-    /// `UserError` code first (`"{code}: daemon API error: {code}"`
-    /// — see `IpcClient::call_once`), so a no-board `Unreachable`
-    /// comes back typed instead of collapsing into
-    /// `TransportClosed` (which used to notify "Reconnect failed"
-    /// on every no-board (re)connect). An unrecognised payload is
-    /// still the generic link failure — only the daemon's own typed
-    /// reason is preserved, nothing is invented.
+    /// `UserError` code first (`"{code}: {message}"` — see
+    /// `IpcClient::call_once`), so a no-board `Unreachable` comes
+    /// back typed instead of collapsing into `TransportClosed`
+    /// (which used to notify "Reconnect failed" on every no-board
+    /// (re)connect). The code is the text before the first `:` —
+    /// the real server sends `"{code}: daemon API error: {code}"`
+    /// and the fake daemon an empty message (`"{code}: "`), and
+    /// both must parse. An unrecognised payload is still the
+    /// generic link failure — only the daemon's own typed reason
+    /// is preserved, nothing is invented.
     fn daemon_connect_error(payload: &str) -> UserError {
-        let code = payload
-            .split(": daemon API error: ")
-            .next()
-            .unwrap_or(payload);
+        let code = payload.split(':').next().unwrap_or(payload).trim();
         match ConnectionError::from_code(code) {
             Some(error) => UserError::from_connection(error, payload.to_string()),
             None => Self::ipc_failed(),
@@ -2183,6 +2183,11 @@ mod tests {
         let error = IpcApi::daemon_connect_error("Unreachable: daemon API error: Unreachable");
         assert_eq!(error.code, "Unreachable");
         assert_eq!(error.title, "Unreachable");
+        // The fake daemon sends an empty message (`"Unreachable: "`)
+        // where the real server sends `"daemon API error:
+        // Unreachable"` — both must parse to the same kind.
+        let error = IpcApi::daemon_connect_error("Unreachable: ");
+        assert_eq!(error.code, "Unreachable");
         let error = IpcApi::daemon_connect_error("BadTag: daemon API error: BadTag");
         assert_eq!(error.code, "BadTag");
         let error = IpcApi::daemon_connect_error("AddrInUse: daemon API error: AddrInUse");

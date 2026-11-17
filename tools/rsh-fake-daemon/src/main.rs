@@ -228,8 +228,14 @@ async fn serve_conn<S>(
                 ok: false,
                 result: None,
                 error: Some(IpcErrorBody {
+                    // Match the real daemon server's message
+                    // (`"daemon API error: {code}"`) — the rig's
+                    // fake daemon must encode errors the way the
+                    // real one does (an empty message here used to
+                    // collapse `Unreachable` into `TransportClosed`
+                    // on the UI side).
+                    message: format!("daemon API error: {code}"),
                     code,
-                    message: String::new(),
                 }),
             },
             Err(error) => IpcResponse {
