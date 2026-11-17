@@ -3395,11 +3395,22 @@ impl AppStateCore {
             install.error = None;
         }
         let state = Arc::clone(self);
-        std::thread::Builder::new()
+        // DS-40: a failed thread spawn used to leave `installing`
+        // latched `true` forever (the flag was set before the
+        // spawn, and only the thread itself cleared it) — every
+        // later attempt then answered "already in progress".
+        // Reset the flag on the spawn-failure path.
+        match std::thread::Builder::new()
             .name("rsh-vjoy-install".to_string())
             .spawn(move || run_vjoy_install(&state))
-            .map_err(|error| format!("could not start the vJoy install thread: {error}"))?;
-        Ok("vJoy install started".to_string())
+        {
+            Ok(_) => Ok("vJoy install started".to_string()),
+            Err(error) => {
+                let mut install = lock(&self.vjoy_install);
+                install.installing = false;
+                Err(format!("could not start the vJoy install thread: {error}"))
+            }
+        }
     }
 
     /// Live engine / link diagnostics (v2.0.1 hotfix BACKEND-2): the
@@ -3814,6 +3825,40 @@ impl AppStateCore {
     /// Returns a message when the supervisor thread cannot be spawned
     /// or does not report ready within 5 s.
     pub fn start_engine(self: &Arc<Self>) -> Result<(), String> {
+        // DS-16: a stored handle is not proof the supervisor is
+        // alive — a thread that panicked or exited early (e.g. the
+        // 5 s ready-timeout path, which records `Failed` but keeps
+        // the handle) used to make every later `start_engine` a
+        // silent no-op while the engine was dead, and
+        // `connect_transport` then failed only with "engine command
+        // channel is gone". A finished handle is treated as absent:
+        // reap it, drop the stale channels, and spawn fresh below.
+        let dead_handle = {
+            let mut thread = lock(&self.engine_thread);
+            if thread
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+            {
+                thread.take()
+            } else {
+                None
+            }
+        };
+        if let Some(handle) = dead_handle {
+            // Finished, so this joins immediately; a panicked
+            // supervisor reports its panic here instead of leaving
+            // the status as a stale `Running`.
+            if handle.join().is_err() {
+                self.set_engine_status(
+                    EngineTaskStatus::Failed {
+                        reason: "engine supervisor thread panicked".to_string(),
+                    },
+                    "engine supervisor thread panicked — restarting it".to_string(),
+                );
+            }
+            *lock(&self.engine_cmd_tx) = None;
+            *lock(&self.engine_report_rx) = None;
+        }
         if lock(&self.engine_thread).is_some() {
             return Ok(());
         }
@@ -5958,10 +6003,54 @@ pub fn migrate_persisted_backend_default(store: &mut ProfileStore) -> Option<Str
 /// manifest triggers the one UAC prompt; the download itself runs
 /// without a console window (`CREATE_NO_WINDOW`).
 fn run_vjoy_install(state: &Arc<AppStateCore>) {
+    // DS-40: the `installing` flag must clear even if this thread
+    // panics — the old code only cleared it on the normal return
+    // path, so a panicked install latched "already in progress"
+    // forever. The guard resets on drop (normal return, error
+    // return, or unwind); the explicit reset below stays as the
+    // documented normal-path write.
+    struct ResetInstalling<'a>(&'a Arc<AppStateCore>);
+    impl Drop for ResetInstalling<'_> {
+        fn drop(&mut self) {
+            let mut install = lock(&self.0.vjoy_install);
+            install.installing = false;
+        }
+    }
+    let _guard = ResetInstalling(state);
     let result = run_vjoy_install_inner();
     let mut install = lock(&state.vjoy_install);
     install.installing = false;
     install.error = result.err();
+}
+
+/// Wait for a spawned child with a hard timeout (DS-40): poll
+/// `try_wait()` every 100 ms; on timeout kill the child and report.
+/// The vJoy installer used to be awaited with a blocking `.status()`
+/// that waited forever. Platform-free (std only) so the Linux suite
+/// can cover the timeout itself with `/bin/sleep`.
+fn wait_child_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+    what: &'static str,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{what} timed out after {} s — killed",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(format!("could not wait for {what}: {error}")),
+        }
+    }
 }
 
 /// The fallible half of [`run_vjoy_install`]: `Ok(())` only when the
@@ -5975,10 +6064,17 @@ fn run_vjoy_install_inner() -> Result<(), String> {
     // Windows 10+ ships curl.exe — no new HTTP dependency. The
     // download runs windowless; `--fail` makes HTTP errors fail the
     // command instead of writing an error page to the file.
+    // DS-40: `--max-time 120 --connect-timeout 15` — the download
+    // used to have no timeout at all, so a stalled network left
+    // the install thread (and the `installing` flag) stuck forever.
     let mut download = Command::new("curl.exe");
     download.args([
         "-L",
         "--fail",
+        "--max-time",
+        "120",
+        "--connect-timeout",
+        "15",
         "-o",
         &installer.to_string_lossy(),
         VJOY_INSTALLER_URL,
@@ -6019,10 +6115,23 @@ fn run_vjoy_install_inner() -> Result<(), String> {
     }
     // Silent install. The exe's manifest elevates (one UAC prompt —
     // expected); `/NORESTART` never reboots unattended.
-    let status = Command::new(&installer)
+    // DS-40: the installer used to be awaited with a blocking
+    // `.status()` (forever, with inherited stdio) — now it is
+    // spawned detached with nulled stdio (the same bug class as the
+    // NSIS `Exec` hang and the daemon/UI spawns) and bounded to
+    // 120 s, killed on timeout.
+    let mut installer_cmd = Command::new(&installer);
+    installer_cmd
         .args(VJOY_INSTALLER_ARGS)
-        .status()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    installer_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let child = installer_cmd
+        .spawn()
         .map_err(|error| format!("could not run the vJoy installer: {error}"))?;
+    let status = wait_child_timeout(child, Duration::from_secs(120), "vJoy installer")?;
     if !status.success() {
         return Err(format!(
             "vJoy installer exited with code {}",
@@ -8230,6 +8339,34 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn wait_child_timeout_kills_a_hung_child() {
+        // DS-40: the installer wait is platform-free (std only),
+        // so it is covered here with /bin/sleep instead of the
+        // real installer.
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let start = Instant::now();
+        let error = wait_child_timeout(child, Duration::from_millis(200), "vJoy installer")
+            .expect_err("a 30 s sleep must time out at 200 ms");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "timeout must bound the wait: {:?}",
+            start.elapsed()
+        );
+        assert!(error.contains("timed out"), "{error}");
+        // And a fast child still succeeds with its status.
+        let child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn true");
+        let status = wait_child_timeout(child, Duration::from_secs(5), "vJoy installer")
+            .expect("true must succeed");
+        assert!(status.success());
+    }
+
+    #[test]
     fn diag_stats_reports_measured_values_not_constants() {
         let (state, _dir) = test_state();
         // No ticks yet: rate unmeasured, loss a real 0 %, counters 0.
@@ -9712,6 +9849,38 @@ mod tests {
         let outcome = state.stop_engine();
         assert!(!outcome.joined);
         assert!(outcome.report.is_none());
+    }
+
+    #[test]
+    fn start_engine_respawns_after_a_dead_supervisor() {
+        // DS-16: a finished supervisor handle used to make every
+        // later `start_engine` a silent no-op (the stored handle
+        // was never liveness-checked), so a dead engine never
+        // recovered without a process restart. Plant a thread that
+        // already exited as the supervisor: the next start must
+        // reap it and spawn fresh, and the engine must report
+        // Running afterwards.
+        let (state, _dir) = test_state();
+        let dead = std::thread::Builder::new()
+            .name("rsh-test-dead-supervisor".to_string())
+            .spawn(|| {})
+            .expect("spawn dead thread");
+        while !dead.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *lock(&state.engine_thread) = Some(dead);
+        state
+            .start_engine()
+            .expect("start_engine must respawn a dead supervisor");
+        assert_eq!(
+            state.engine_status(),
+            EngineTaskStatus::Running { transport: None },
+            "the respawned engine runs idle with no transport"
+        );
+        // A second start is still a no-op while the fresh one lives.
+        state.start_engine().expect("second start is a no-op");
+        let outcome = state.stop_engine();
+        assert!(outcome.joined, "engine stops bounded");
     }
 
     #[test]
