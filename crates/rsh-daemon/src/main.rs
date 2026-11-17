@@ -699,6 +699,14 @@ fn clear_daemon_status(data_dir: &std::path::Path) {
     let _ = std::fs::remove_file(data_dir.join(DAEMON_STATUS_FILE));
 }
 
+/// Write the UI quit request (`<data_dir>/rsh-ui.quit`) that the UI
+/// polls in its frame timer (`rsh-ui` `ui_lifecycle::take_quit_request`,
+/// consumed once per file). Called from tray "Quit RSH" so a UI hidden
+/// to the tray quits together with the daemon.
+fn write_ui_quit_request(data_dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::write(data_dir.join("rsh-ui.quit"), b"quit")
+}
+
 /// Quarantine the unreadable store files (`profiles.json`,
 /// `settings.json`) aside so a fresh-default open can succeed: each
 /// existing file is renamed to `<name>.corrupt-<unix-seconds>-<pid>-<n>`
@@ -1063,7 +1071,7 @@ fn main() {
     } else {
         let mut tray_ok = false;
         for attempt in 1..=6 {
-            match create_tray(&api, &tray_actions, &shutdown, verbose) {
+            match create_tray(&api, &tray_actions, &shutdown, verbose, &data_dir) {
                 Ok(()) => {
                     log_line(verbose, "daemon: tray icon registered");
                     tray_ok = true;
@@ -1246,6 +1254,7 @@ fn create_tray(
     tray_actions: &Arc<Mutex<Vec<TrayAction>>>,
     shutdown: &Arc<AtomicBool>,
     verbose: bool,
+    data_dir: &std::path::Path,
 ) -> Result<(), slint::PlatformError> {
     let tray = RshTray::new()?;
     // A25: fill the native menu from the live store (real profiles
@@ -1440,7 +1449,15 @@ fn create_tray(
     }
     {
         let shutdown = Arc::clone(shutdown);
+        let data_dir = data_dir.to_path_buf();
         tray.on_quit_app(move || {
+            // Tell the UI to quit too: it polls `<data_dir>/rsh-ui.quit`
+            // in its frame timer (rsh-ui ui_lifecycle::take_quit_request)
+            // and quits on the next tick. Without this a UI hidden to
+            // the tray would keep running after "Quit RSH".
+            if let Err(error) = write_ui_quit_request(&data_dir) {
+                eprintln!("rsh-daemon: cannot write rsh-ui.quit: {error}");
+            }
             shutdown.store(true, Ordering::Relaxed);
             let _ = slint::quit_event_loop();
         });
@@ -1518,6 +1535,14 @@ mod tests {
         clear_daemon_status(&dir);
         assert!(!path.exists(), "clear removes the file");
         clear_daemon_status(&dir); // clearing an absent file is fine
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ui_quit_request_file_is_written() {
+        let dir = temp_dir("ui-quit");
+        write_ui_quit_request(&dir).expect("write rsh-ui.quit");
+        assert!(dir.join("rsh-ui.quit").exists(), "quit file exists");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
