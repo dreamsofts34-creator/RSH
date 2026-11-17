@@ -47,6 +47,12 @@ export component MainWindow inherits Window {
     min-width: 920px;
     min-height: 580px;
     background: Theme.bg;
+    // A8 (v2.0.2): the window theme drives the global tokens — the
+    // whole UI repaints when it changes (Dark 0 / Light 1 / Auto 2;
+    // Auto renders as Dark here until Rust resolves the OS choice).
+    // (A `Theme.mode: theme;` binding is not valid Slint — globals
+    // are written from code, so the change handler does it.)
+    changed theme => { Theme.mode = theme; }
     default-font-family: Theme.font-text;
     default-font-size: 13px;
 
@@ -57,7 +63,7 @@ export component MainWindow inherits Window {
     in-out property <bool> auto-paused: false;
     in-out property <int> transport: 0;   // 0 Wi-Fi, 1 USB
     in-out property <int> controller: 1;  // 0 HIDMaestro, 1 vJoy (vJoy is the default, user order 2026-11-16)
-    in-out property <int> theme: 0;       // 0 Dark, 1 Auto (Light removed, audit FIX-6)
+    in-out property <int> theme: 0;       // 0 Dark, 1 Light, 2 Auto (v2.0.2: Light added; Auto is resolved to Dark/Light by Rust)
     in-out property <int> pressed-index: -1;
     in-out property <int> selected-index: 5; // A4: index 5 = "Gear 3" (preview), not 0
     in property <[string]> button-actions: ["Shift up", "Shift down", "Horn", "Gear 1", "Gear 2", "Gear 3", "Gear 4", "Gear 5", "Gear 6", "Handbrake", "Not set", "Not set"];
@@ -95,7 +101,7 @@ export component MainWindow inherits Window {
     // while the calibration backend is unavailable.
     in property <bool> centre-set: false;
     in property <bool> centre-available: false;
-    in property <string> centre-reason: "Calibration capture needs a later wheel update.";
+    in property <string> centre-reason: "Background service not running — reconnect to capture.";
     // Pedals (A1/A2): mV / feel / deadzone / curve / marker from Rust
     // (get_tuning), refreshed on startup, on swap-to-live and after
     // every pedal edit — never literals.
@@ -198,9 +204,17 @@ export component MainWindow inherits Window {
     in-out property <string> setup-pair-status: "Waiting for the wheel…";
     in-out property <string> setup-pair-error: "";
     in-out property <bool> setup-pairing-active: false;
+    // H-5 (v2.0.2): true when the board is already paired to another
+    // key and re-pairing needs the BOOT reset — Rust sets this from
+    // pairing_status().replacement_required (main.rs, reconnect flow).
+    in-out property <bool> setup-reset-required: false;
     in-out property <int> setup-transport: 0; // 0 Wi-Fi, 1 USB
     in-out property <bool> setup-wifi-joined: false;
     in-out property <bool> setup-usb-available: false;
+    // L-2 (v2.0.2): live board address from connection().address —
+    // Rust sets this in sync_overview (where the address is already
+    // computed); empty/unknown renders as "—" in the wizard.
+    in-out property <string> setup-address: "";
     in-out property <string> setup-games-text: "No games found yet.";
     in-out property <bool> setup-games-done: false;
     in-out property <bool> setup-vjoy-installed: false;
@@ -209,7 +223,7 @@ export component MainWindow inherits Window {
     in-out property <string> setup-vjoy-error: "";
     in-out property <bool> setup-vjoy-fallback: false;
     in-out property <bool> setup-calibration-available: false;
-    in-out property <string> setup-calibration-reason: "Calibration capture needs a later wheel update.";
+    in-out property <string> setup-calibration-reason: "Background service not running — reconnect to capture.";
     // Diagnostics drawer (v2.0.1 hotfix): right-edge overlay like the
     // notifications drawer; Rust syncs these values when it opens.
     in-out property <bool> diag-open: false;
@@ -297,8 +311,8 @@ export component MainWindow inherits Window {
     callback notif-close();
     callback notif-mark-all-read();
     callback notif-clear();
-    // Theme persist (v2.0.1 hotfix): Rust writes the choice to the
-    // <data_dir>/ui-theme file ("Dark"/"Auto").
+    // Theme persist (v2.0.1 hotfix, A8 in v2.0.2): Rust writes the choice to the
+    // <data_dir>/ui-theme file ("Dark"/"Light"/"Auto").
     callback theme-persist(int);
     // Setup wizard (compare-fix): Rust owns step advance/finish;
     // begin-pairing etc. are stubs until the Pairing Manager lands.
@@ -609,9 +623,10 @@ export component MainWindow inherits Window {
                 address: "rsh.local";
                 backend <=> controller;
                 start-with-windows <=> autostart-enabled;
-                // Main theme is 0 Dark / 1 Auto; the screen is
-                // 0 Dark / 1 Light / 2 Auto (Light/Auto disabled).
-                theme: theme == 1 ? 2 : 0;
+                // Theme is 0 Dark / 1 Light / 2 Auto on both sides now
+                // (v2.0.2, A8) — the screen passes the index straight
+                // through and Rust persists it ("Dark"/"Light"/"Auto").
+                theme: theme;
                 profiles: settings-profiles;
                 app-version: "RSH " + app-version;
                 firmware-text: firmware-text;
@@ -624,7 +639,7 @@ export component MainWindow inherits Window {
                 backend-selected(i) => { output-backend-selected(i); }
                 toggled-start-windows(b) => { autostart-selected(b); }
                 toggled-keep-tray(b) => { settings-action("tray"); }
-                theme-selected(i) => { theme = i == 2 ? 1 : 0; theme-persist(i); }
+                theme-selected(i) => { theme = i; theme-persist(i); }
                 new-profile => { settings-action("new-profile"); }
                 use-profile(i) => { settings-use-profile(i); }
                 duplicate-profile(i) => { settings-duplicate-profile(i); }
@@ -647,6 +662,7 @@ export component MainWindow inherits Window {
     // reads it. The notifications drawer below still overlays it.
     if setup-mode : SetupWizard {
         step: setup-step;
+        daemon-live: daemon-live;
         connect-done: setup-connect-done;
         paired: setup-paired;
         centre-done: setup-centre-done;
@@ -657,9 +673,13 @@ export component MainWindow inherits Window {
         pair-status: setup-pair-status;
         pair-error: setup-pair-error;
         pairing-active: setup-pairing-active;
+        reset-required: setup-reset-required;
         transport: setup-transport;
         wifi-joined: setup-wifi-joined;
         usb-available: setup-usb-available;
+        // L-2: live address ("" until Rust sets it) — the wizard
+        // shows "—" while unconnected, never a hardcoded default.
+        address: setup-address == "" ? "—" : setup-address;
         games-text: setup-games-text;
         games-done: setup-games-done;
         vjoy-installed: setup-vjoy-installed;

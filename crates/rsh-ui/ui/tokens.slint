@@ -1,22 +1,35 @@
 // RSH v2.0 — design tokens (REDESIGN-PLAN §5). Single source of truth for
 // all Slint screens. The Phase 3 worker adopts this file into
 // crates/rsh-ui/ui/ as tokens.slint; staging screens import it from here.
-// Colors are the approved dark theme. Light theme is NOT designed yet —
-// do not invent light tokens.
+//
+// THEME (v2.0.2, A8): `mode` is driven by the MainWindow `theme`
+// property (0 Dark, 1 Light, 2 Auto). Auto renders as Dark here —
+// the Rust side resolves the OS preference and sets the window theme
+// to 0/1 (see main.rs wire_theme/read_theme). Every colour below is
+// a `mode` binding, so switching theme repaints the whole UI; no
+// screen reads a literal colour for a themed surface any more.
+// Light palette: bg #F5F3FF (approved light bg), panel pure white.
+// Contrast (WCAG, vs white panel): text 17.2, mute 6.7, faint 4.6,
+// accent-text 6.2, ok 5.4, warn 5.5, bad 5.5 — all >= 4.5:1. White on
+// accent is 4.50:1 in both themes.
 export global Theme {
-    in-out property <color> bg: #0D1118;
-    in-out property <color> side: #10151D;
-    in-out property <color> panel: #161C27;
-    in-out property <color> panel2: #1D2533;
-    in-out property <color> line: #262F40;
-    in-out property <color> text: #E9EDF4;
-    in-out property <color> mute: #9AA5B8;
-    in-out property <color> faint: #7C879B;
+    // 0 Dark, 1 Light, 2 Auto (Auto = Dark until Rust resolves it).
+    in-out property <int> mode: 0;
+    in-out property <bool> is-light: mode == 1;
+
+    in-out property <color> bg: is-light ? #F5F3FF : #0D1118;
+    in-out property <color> side: is-light ? #EAE7F8 : #10151D;
+    in-out property <color> panel: is-light ? #FFFFFF : #161C27;
+    in-out property <color> panel2: is-light ? #EFEDF8 : #1D2533;
+    in-out property <color> line: is-light ? #D9D4EC : #262F40;
+    in-out property <color> text: is-light ? #171B26 : #E9EDF4;
+    in-out property <color> mute: is-light ? #565C6E : #9AA5B8;
+    in-out property <color> faint: is-light ? #6E7490 : #7C879B;
     in-out property <color> accent: #2F6BFF;
-    in-out property <color> accent-text: #8EB0FF;
-    in-out property <color> ok: #3DD68C;
-    in-out property <color> warn: #F5B84A;
-    in-out property <color> bad: #FF6B6B;
+    in-out property <color> accent-text: is-light ? #2456D6 : #8EB0FF;
+    in-out property <color> ok: is-light ? #157A4C : #3DD68C;
+    in-out property <color> warn: is-light ? #8A6100 : #F5B84A;
+    in-out property <color> bad: is-light ? #C92A2A : #FF6B6B;
     in-out property <length> window-width: 920px;
     in-out property <length> window-height: 580px;
     in-out property <length> sidebar-width: 184px;
@@ -28,17 +41,37 @@ export global Theme {
     // Derived fills (Phase 1 spike): pre-blended translucent fills, since
     // Slint has no rgba() helper. Each is the §5 token blended over the
     // background it sits on — no new hues, no design change.
-    in-out property <color> track: #232C3C;
-    in-out property <color> switch-off: #2B3547;
-    in-out property <color> grid-line: #4A566C;
-    in-out property <color> acc-bg: #152341;   // rgba(47,107,255,.16) over #10151D
-    in-out property <color> ok-bg: #1B3635;    // rgba(61,214,140,.14) over #161C27
-    in-out property <color> warn-bg: #35322C;  // rgba(245,184,74,.14) over #161C27
-    in-out property <color> check-bg: #1C3A37; // rgba(61,214,140,.16) over #161C27
+    in-out property <color> track: is-light ? #DCD8EC : #232C3C;
+    in-out property <color> switch-off: is-light ? #C6C1DC : #2B3547;
+    in-out property <color> grid-line: is-light ? #8F96AD : #4A566C;
+    in-out property <color> acc-bg: is-light ? #DCE6FF : #152341;   // rgba(47,107,255,.16) over #10151D
+    in-out property <color> ok-bg: is-light ? #D2EFE0 : #1B3635;    // rgba(61,214,140,.14) over #161C27
+    in-out property <color> warn-bg: is-light ? #FCEFD2 : #35322C;  // rgba(245,184,74,.14) over #161C27
+    in-out property <color> check-bg: is-light ? #D2EFE0 : #1C3A37; // rgba(61,214,140,.16) over #161C27
     // Status-dot halos: rgba(ok,.18) / rgba(bad,.18) over #161C27, pre-blended
     // so the dot itself stays solid. Never nest the dot in an opacity rect.
-    in-out property <color> halo-ok: #1D3E39;
-    in-out property <color> halo-bad: #402A33;
-    in-out property <color> tray-bg: #11161F;  // Tray.html popup background
-    in-out property <color> tray-line: #2A3345;
+    in-out property <color> halo-ok: is-light ? #C6EAD8 : #1D3E39;
+    in-out property <color> halo-bad: is-light ? #F9D7D7 : #402A33;
+    in-out property <color> tray-bg: is-light ? #FFFFFF : #11161F;  // Tray.html popup background
+    in-out property <color> tray-line: is-light ? #D9D4EC : #2A3345;
+    // Hover / pressed fills (v2.0.2, A5): one step lighter than the
+    // resting surface in Dark, one step darker in Light, so hover is
+    // visible in both themes. Accent hover lightens in Dark and
+    // darkens in Light (white label stays 4.5:1 on both).
+    in-out property <color> hover-bg: is-light ? #E3E8F6 : #28324A;
+    in-out property <color> pressed-bg: is-light ? #D2D9EC : #1A2233;
+    in-out property <color> accent-hover: is-light ? #2456D6 : #4A7DFF;
+    in-out property <color> accent-pressed: is-light ? #1D49B8 : #2456D6;
+    // Text on a selected / accent-tinted surface (acc-bg, panel2):
+    // white in Dark, near-black in Light (white on #DCE6FF is unreadable).
+    in-out property <color> sel-text: is-light ? #171B26 : #FFFFFF;
+    // Former dark-only literals, now theme-aware (v2.0.2, A8):
+    // selected tile/knob tint, live-pressed tile tint, error banner bg,
+    // unselected step ring, learn-box dashed border, knob ring.
+    in-out property <color> sel-bg: is-light ? #DCE6FF : #203054;
+    in-out property <color> pressed-tile-bg: is-light ? #D2EFE0 : #213A3E;
+    in-out property <color> err-bg: is-light ? #FBEAEA : #2E1F26;
+    in-out property <color> ring-line: is-light ? #C9C4DE : #34405A;
+    in-out property <color> dash-line: is-light ? #B9B4D0 : #3A4660;
+    in-out property <color> knob-ring: is-light ? #C9C4DE : #2F3A50;
 }

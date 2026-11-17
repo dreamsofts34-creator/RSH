@@ -35,7 +35,7 @@ component StepRow inherits HorizontalLayout {
         height: 26px;
         border-radius: 13px;
         border-width: 2px;
-        border-color: done ? transparent : now ? Theme.accent : #34405A;
+        border-color: done ? transparent : now ? Theme.accent : Theme.ring-line;
         background: done ? Theme.check-bg : now ? Theme.accent : transparent;
         Text {
             width: 100%;
@@ -50,7 +50,7 @@ component StepRow inherits HorizontalLayout {
     }
     VerticalLayout {
         spacing: 0px;
-        Text { text: label; font-size: 13px; font-weight: 500; color: now ? #ffffff : Theme.mute; }
+        Text { text: label; font-size: 13px; font-weight: 500; color: now ? Theme.text : Theme.mute; }
         Text { text: sub; font-size: 11.5px; color: Theme.faint; }
     }
 }
@@ -110,6 +110,10 @@ export component SetupWizard inherits Rectangle {
     in property <bool> usb-available: false;
     in property <bool> paired: false;
     in property <bool> reset-required: false;
+    // A3 (v2.0.2): daemon state drives the display — while the
+    // background service is down the wizard shows "Disconnected" /
+    // "—", never a plausible-looking countdown, address or status.
+    in property <bool> daemon-live: false;
     // Step 1 — Drivers (v2.0.1 hotfix): Rust polls vjoy_status().
     in property <bool> vjoy-installed: false;
     in property <bool> vjoy-installing: false;
@@ -120,7 +124,7 @@ export component SetupWizard inherits Rectangle {
     // calibration backend is unavailable; the buttons stay disabled
     // and Next does not gate on calibration then.
     in property <bool> calibration-available: false;
-    in property <string> calibration-reason: "Calibration capture needs a later wheel update.";
+    in property <string> calibration-reason: "Background service not running — reconnect to capture.";
     // Step 2 — Calibrate.
     in property <bool> centre-done: false;
     in property <bool> pedals-done: false;
@@ -188,11 +192,12 @@ export component SetupWizard inherits Rectangle {
                 StepRow { num: 4; label: "Calibrate"; sub: "Centre and pedals"; done: step > 3; now: step == 3; }
                 StepRow { num: 5; label: "Games"; sub: "Find your racing games"; done: games-done; now: step == 4; }
                 Rectangle { vertical-stretch: 1; }
-                TouchArea {
+                skip-ta := TouchArea {
                     width: 100%;
                     height: 20px;
                     accessible-label: "Skip for now";
                     accessible-role: button;
+                    mouse-cursor: pointer;
                     clicked => { skip(); }
                     // (was `fs` — duplicated id in this component, see below)
                     skip-fs := FocusScope {
@@ -206,7 +211,7 @@ export component SetupWizard inherits Rectangle {
                             return reject;
                         }
                     }
-                    Text { text: "Skip for now"; font-size: 12.5px; font-weight: 600; color: Theme.accent-text; }
+                    Text { text: "Skip for now"; font-size: 12.5px; font-weight: 600; color: skip-ta.has-hover ? Theme.text : Theme.accent-text; }
                 }
             }
             Rectangle { x: 263px; width: 1px; height: 100%; background: Theme.line; }
@@ -247,7 +252,9 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "Wi-Fi"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: wifi-joined ? "Joined the RSH network" : "Join the RSH Wi-Fi network on this PC"; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: transport == 0 ? "Connected" : "Use Wi-Fi"; primary: transport == 0; clicked => { connect-action("wifi"); } }
+                        // A3: "Connected" only once the connection is
+                        // really up — transport == 0 alone is not proof.
+                        Btn { label: transport == 0 && (connect-done || wifi-joined) ? "Connected" : "Use Wi-Fi"; primary: transport == 0 && (connect-done || wifi-joined); clicked => { connect-action("wifi"); } }
                     }
                 }
                 Rectangle {
@@ -265,10 +272,14 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "USB"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: usb-available ? "USB cable connected" : "Plug in a USB cable for the fastest setup"; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: transport == 1 ? "Connected" : "Use USB"; primary: transport == 1; clicked => { connect-action("usb"); } }
+                        // A3: same rule as Wi-Fi — "Connected" needs a
+                        // real connection, not just the USB choice.
+                        Btn { label: transport == 1 && connect-done ? "Connected" : "Use USB"; primary: transport == 1 && connect-done; clicked => { connect-action("usb"); } }
                     }
                 }
-                Text { text: "Wheel address: " + address; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
+                // A3: no address is known until the wheel is really
+                // connected — "—" instead of the default address.
+                Text { text: "Wheel address: " + (connect-done ? address : "—"); font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
             }
 
             // ---- Step 1: Drivers (v2.0.1 hotfix) ----
@@ -289,7 +300,9 @@ export component SetupWizard inherits Rectangle {
                         padding-right: 16px;
                         spacing: 12px;
                         Text { vertical-alignment: center; text: "vJoy"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
-                        Text { vertical-alignment: center; text: vjoy-installed ? "Installed" + (vjoy-version == "" ? "" : " · " + vjoy-version) : vjoy-installing ? "Installing…" : "Not installed — games need a controller driver"; font-size: 12.5px; color: vjoy-installed ? Theme.ok : Theme.mute; }
+                        // A3: while the service is down the driver
+                        // status is unknown — never claim "Not installed".
+                        Text { vertical-alignment: center; text: !daemon-live ? "Disconnected — status unknown" : vjoy-installed ? "Installed" + (vjoy-version == "" ? "" : " · " + vjoy-version) : vjoy-installing ? "Installing…" : "Not installed — games need a controller driver"; font-size: 12.5px; color: vjoy-installed ? Theme.ok : Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
                         if vjoy-installed : Text { vertical-alignment: center; text: "✓"; font-size: 16px; font-weight: 700; color: Theme.ok; }
                         if !vjoy-installed && !vjoy-installing : Btn { label: "Install vJoy"; primary: true; clicked => { install-vjoy(); } }
@@ -309,7 +322,7 @@ export component SetupWizard inherits Rectangle {
                         padding-right: 16px;
                         spacing: 12px;
                         Text { vertical-alignment: center; text: "HIDMaestro"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
-                        Text { vertical-alignment: center; text: "Needs admin each start."; font-size: 12.5px; color: Theme.mute; }
+                        Text { vertical-alignment: center; text: "Needs admin permission when first used."; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
                         Btn { label: vjoy-fallback ? "Selected ✓" : "Use HIDMaestro instead"; primary: !vjoy-fallback; clicked => { use-hidmaestro(); } }
                     }
@@ -364,7 +377,9 @@ export component SetupWizard inherits Rectangle {
                                 height: 100%;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
-                                text: "" + pair-seconds-left;
+                                // A3: no countdown runs until pairing
+                                // actually starts — "—", not a fake 120.
+                                text: pairing-active || paired ? "" + pair-seconds-left : "—";
                                 font-family: Theme.font-mono;
                                 font-size: 30px;
                                 font-weight: 600;
@@ -412,9 +427,9 @@ export component SetupWizard inherits Rectangle {
                             border-radius: 5px;
                             background: paired ? Theme.ok : Theme.warn;
                         }
-                        Text { vertical-alignment: center; text: paired ? "Paired — wheel connected." : pair-status; font-size: 12.5px; color: Theme.mute; }
+                        Text { vertical-alignment: center; text: paired ? "Paired — wheel connected." : !daemon-live ? "Disconnected — background service isn't running." : pair-status; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Text { vertical-alignment: center; text: paired ? "" : pair-seconds-left + " seconds left"; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
+                        Text { vertical-alignment: center; text: paired ? "" : pairing-active ? pair-seconds-left + " seconds left" : "Not pairing"; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
                     }
                 }
                 if pair-error != "" : Rectangle {
@@ -508,10 +523,11 @@ export component SetupWizard inherits Rectangle {
                 horizontal-stretch: 1;
                 width: 584px;
                 spacing: 8px;
-                if step == 2 : TouchArea {
+                if step == 2 : usb-ta := TouchArea {
                     height: 36px;
                     accessible-label: "Wheel not found? Use a USB cable";
                     accessible-role: button;
+                    mouse-cursor: pointer;
                     clicked => { use-usb(); }
                     // (was `fs` — ids are component-scoped, so the Skip
                     // link's FocusScope above must not share the name)
@@ -526,7 +542,7 @@ export component SetupWizard inherits Rectangle {
                             return reject;
                         }
                     }
-                    Text { vertical-alignment: center; text: "Wheel not found? Use a USB cable"; font-size: 12.5px; font-weight: 600; color: Theme.accent-text; }
+                    Text { vertical-alignment: center; text: "Wheel not found? Use a USB cable"; font-size: 12.5px; font-weight: 600; color: usb-fs.has-focus || usb-ta.has-hover ? Theme.text : Theme.accent-text; }
                 }
                 Rectangle { horizontal-stretch: 1; }
                 if step > 0 : Btn { label: "Back"; clicked => { back(); } }

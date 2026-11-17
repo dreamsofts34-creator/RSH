@@ -27,10 +27,10 @@ export component Switch inherits Rectangle {
     width: sw-w;
     height: sw-h;
     border-radius: sw-h / 2;
-    background: on ? Theme.accent : Theme.switch-off;
+    background: on ? Theme.accent : (ta.has-hover ? Theme.hover-bg : Theme.switch-off);
     // FIX-4: accent border while keyboard-focused.
-    border-width: fs.has-focus ? 1px : 0px;
-    border-color: Theme.accent-text;
+    border-width: fs.has-focus || ta.has-hover ? 1px : 0px;
+    border-color: fs.has-focus ? Theme.accent-text : Theme.faint;
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -64,7 +64,7 @@ export component Switch inherits Rectangle {
         background: white;
         animate x { duration: 120ms; easing: ease-out; }
     }
-    TouchArea { clicked => { toggled(); } }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { toggled(); } }
 }
 
 // ---------------------------------------------------------------- pill (§6: Ok / warn / neutral / accent)
@@ -105,8 +105,10 @@ export component Btn inherits Rectangle {
     height: 30px;
     border-radius: 8px;
     border-width: 1px;
-    border-color: fs.has-focus ? Theme.accent-text : (primary ? Theme.accent : Theme.line);
-    background: primary ? Theme.accent : Theme.panel2;
+    // A5: hover + pressed feedback — primary lightens/darkens the
+    // accent, secondary lightens the panel; hover also lifts the border.
+    border-color: fs.has-focus ? Theme.accent-text : (primary ? Theme.accent : (ta.has-hover ? Theme.faint : Theme.line));
+    background: primary ? (ta.pressed ? Theme.accent-pressed : ta.has-hover ? Theme.accent-hover : Theme.accent) : (ta.pressed ? Theme.pressed-bg : ta.has-hover ? Theme.hover-bg : Theme.panel2);
     opacity: disabled ? 0.45 : 1;
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
@@ -131,7 +133,7 @@ export component Btn inherits Rectangle {
         // White on accent (4.50:1); Theme.text on accent is 3.83:1 (audit FIX-2).
         color: primary ? #FFFFFF : Theme.text;
     }
-    TouchArea { clicked => { if (!disabled) { clicked(); } } }
+    ta := TouchArea { mouse-cursor: disabled ? MouseCursor.default : MouseCursor.pointer; clicked => { if (!disabled) { clicked(); } } }
 }
 
 // ---------------------------------------------------------------- nav item (§6: 36px, icon 17px + label; active = accent tint)
@@ -145,7 +147,7 @@ export component NavItem inherits Rectangle {
     callback clicked();
     height: 36px;
     border-radius: 8px;
-    background: fs.has-focus || active ? Theme.acc-bg : transparent;
+    background: fs.has-focus || active ? Theme.acc-bg : (ta.has-hover ? Theme.hover-bg : transparent);
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -173,7 +175,7 @@ export component NavItem inherits Rectangle {
             text: label;
             font-size: 13px;
             font-weight: 500;
-            color: active ? white : Theme.mute;
+            color: active ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
         }
         Rectangle { horizontal-stretch: 1; }
         if show-dot : Rectangle {
@@ -183,7 +185,7 @@ export component NavItem inherits Rectangle {
             background: Theme.ok;
         }
     }
-    TouchArea { clicked => { clicked(); } }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
 }
 
 // ---------------------------------------------------------------- nav sub-item (§6: 30px, left padding 38px)
@@ -195,7 +197,7 @@ export component SubItem inherits Rectangle {
     callback clicked();
     height: 30px;
     border-radius: 8px;
-    background: fs.has-focus || active ? Theme.acc-bg : transparent;
+    background: fs.has-focus || active ? Theme.acc-bg : (ta.has-hover ? Theme.hover-bg : transparent);
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -215,9 +217,9 @@ export component SubItem inherits Rectangle {
         text: label;
         font-size: 12.5px;
         font-weight: 500;
-        color: active ? white : Theme.mute;
+        color: active ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
     }
-    TouchArea { clicked => { clicked(); } }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
 }
 
 // ---------------------------------------------------------------- status card (§6: sidebar bottom, on every screen)
@@ -287,7 +289,7 @@ export component SegmentedControl inherits Rectangle {
             border-radius: 6px;
             accessible-label: option-0;
             accessible-role: button;
-            background: fs0.has-focus ? Theme.line : (selected == 0 ? Theme.panel2 : transparent);
+            background: fs0.has-focus ? Theme.line : (selected == 0 ? Theme.panel2 : (ta0.has-hover ? Theme.hover-bg : transparent));
             fs0 := FocusScope {
                 width: 100%;
                 height: 100%;
@@ -299,8 +301,8 @@ export component SegmentedControl inherits Rectangle {
                     return reject;
                 }
             }
-            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-0; font-size: 12px; font-weight: 600; color: selected == 0 ? white : Theme.mute; }
-            TouchArea { clicked => { selected-changed(0); } }
+            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-0; font-size: 12px; font-weight: 600; color: selected == 0 ? Theme.sel-text : (ta0.has-hover ? Theme.text : Theme.mute); }
+            ta0 := TouchArea { mouse-cursor: pointer; clicked => { selected-changed(0); } }
         }
         Rectangle {
             width: 78px;
@@ -308,7 +310,7 @@ export component SegmentedControl inherits Rectangle {
             border-radius: 6px;
             accessible-label: option-1;
             accessible-role: button;
-            background: fs1.has-focus ? Theme.line : (selected == 1 ? Theme.panel2 : transparent);
+            background: fs1.has-focus ? Theme.line : (selected == 1 ? Theme.panel2 : (ta1.has-hover ? Theme.hover-bg : transparent));
             fs1 := FocusScope {
                 width: 100%;
                 height: 100%;
@@ -320,8 +322,8 @@ export component SegmentedControl inherits Rectangle {
                     return reject;
                 }
             }
-            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-1; font-size: 12px; font-weight: 600; color: selected == 1 ? white : Theme.mute; }
-            TouchArea { clicked => { selected-changed(1); } }
+            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-1; font-size: 12px; font-weight: 600; color: selected == 1 ? Theme.sel-text : (ta1.has-hover ? Theme.text : Theme.mute); }
+            ta1 := TouchArea { mouse-cursor: pointer; clicked => { selected-changed(1); } }
         }
         if option-2 != "" : Rectangle {
             width: 62px;
@@ -329,7 +331,7 @@ export component SegmentedControl inherits Rectangle {
             border-radius: 6px;
             accessible-label: option-2;
             accessible-role: button;
-            background: fs2.has-focus ? Theme.line : (selected == 2 ? Theme.panel2 : transparent);
+            background: fs2.has-focus ? Theme.line : (selected == 2 ? Theme.panel2 : (ta2.has-hover ? Theme.hover-bg : transparent));
             fs2 := FocusScope {
                 width: 100%;
                 height: 100%;
@@ -341,8 +343,8 @@ export component SegmentedControl inherits Rectangle {
                     return reject;
                 }
             }
-            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-2; font-size: 12px; font-weight: 600; color: selected == 2 ? white : Theme.mute; }
-            TouchArea { clicked => { selected-changed(2); } }
+            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-2; font-size: 12px; font-weight: 600; color: selected == 2 ? Theme.sel-text : (ta2.has-hover ? Theme.text : Theme.mute); }
+            ta2 := TouchArea { mouse-cursor: pointer; clicked => { selected-changed(2); } }
         }
     }
 }
@@ -357,8 +359,8 @@ export component ProfileButton inherits Rectangle {
     height: 30px;
     border-radius: 8px;
     border-width: 1px;
-    border-color: fs.has-focus ? Theme.accent-text : Theme.line;
-    background: Theme.panel;
+    border-color: fs.has-focus ? Theme.accent-text : (ta.has-hover ? Theme.faint : Theme.line);
+    background: ta.pressed ? Theme.pressed-bg : (ta.has-hover ? Theme.hover-bg : Theme.panel);
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -379,7 +381,7 @@ export component ProfileButton inherits Rectangle {
         Text { text: name; font-size: 12px; font-weight: 600; color: Theme.text; }
         Image { width: 12px; height: 12px; source: @image-url("../assets/icons/chevron.svg"); }
     }
-    TouchArea { clicked => { clicked(); } }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
 }
 
 // ---------------------------------------------------------------- auto-profile chip (§6: "Auto profile  Game → Profile" + pause switch)
@@ -409,6 +411,12 @@ export component SliderRow inherits VerticalLayout {
     in property <string> hint;
     in property <string> value-text;
     in property <float> value;      // 0..1 normalised
+    // A6 (v2.0.2): `frac` is the clamped 0..1 fraction — the fill and
+    // the thumb both read it, never the raw value, so an out-of-range
+    // value can never flip the fill or push the thumb off the track.
+    // Fill is ALWAYS min -> thumb (left edge -> thumb centre): at
+    // 1.24 on a 1.0..2.0 range the value is 0.24, so the fill is 24%.
+    property <float> frac: Math.max(0, Math.min(1, value));
     // Disabled sliders never fire `changed` and render dimmed; the
     // caller shows the short reason (v2.0.1 hotfix: no backend
     // setting for this slider yet).
@@ -476,24 +484,36 @@ export component SliderRow inherits VerticalLayout {
             border-radius: 2px;
             background: Theme.switch-off;
         }
+        // A6: fill starts at the track's left edge (min) and ends at
+        // the thumb centre — never on the thumb's right side.
+        // NOTE: `x: 0px` is REQUIRED, not cosmetic — Slint centres a
+        // child Rectangle with no explicit x, so without it the fill
+        // sat centred in the track (at 1.24 / frac 0.24 it lay
+        // entirely RIGHT of the thumb — exactly the reported bug).
         Rectangle {
+            x: 0px;
             y: 8px;
-            width: parent.width * value;
+            width: parent.width * frac;
             height: 4px;
             border-radius: 2px;
-            background: Theme.accent;
+            background: ta.has-hover ? Theme.accent-hover : Theme.accent;
         }
         Rectangle {
-            x: parent.width * value - 7px;
+            // A6: thumb centre sits on frac, clamped so the whole
+            // 14px thumb stays inside the track at min AND max
+            // (was: x = width*value - 7px, sticking out 7px at both ends).
+            property <length> thumb-x: parent.width * frac - 7px;
+            x: thumb-x < 0px ? 0px : thumb-x > parent.width - 14px ? parent.width - 14px : thumb-x;
             y: 3px;
             width: 14px;
             height: 14px;
             border-radius: 7px;
-            border-width: fs.has-focus ? 2px : 1px;
-            border-color: Theme.accent;
+            border-width: fs.has-focus || ta.has-hover ? 2px : 1px;
+            border-color: ta.has-hover ? Theme.accent-text : Theme.accent;
             background: white;
         }
-        TouchArea {
+        ta := TouchArea {
+            mouse-cursor: disabled ? MouseCursor.default : MouseCursor.pointer;
             clicked => { if (!disabled) { changed(Math.max(0, Math.min(1, self.mouse-x / track.width))); } }
             moved => { if (self.pressed && !disabled) { changed(Math.max(0, Math.min(1, self.mouse-x / track.width))); } }
         }
@@ -510,8 +530,8 @@ export component PresetChip inherits Rectangle {
     height: 30px;
     border-radius: 8px;
     border-width: 1px;
-    border-color: fs.has-focus ? Theme.accent-text : (active ? Theme.accent : Theme.line);
-    background: active ? Theme.acc-bg : Theme.panel2;
+    border-color: fs.has-focus ? Theme.accent-text : (active ? Theme.accent : (ta.has-hover ? Theme.faint : Theme.line));
+    background: active ? Theme.acc-bg : (ta.pressed ? Theme.pressed-bg : ta.has-hover ? Theme.hover-bg : Theme.panel2);
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -532,9 +552,9 @@ export component PresetChip inherits Rectangle {
         text: label;
         font-size: 12px;
         font-weight: 600;
-        color: active ? white : Theme.mute;
+        color: active ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
     }
-    TouchArea { clicked => { clicked(); } }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
 }
 
 // ---------------------------------------------------------------- curve graph (§6: grid + dashed straight line + accent curve + live marker)
@@ -702,6 +722,10 @@ export component HBar inherits HorizontalLayout {
         background: Theme.track;
         clip: true;
         Rectangle {
+            // A6-family: explicit x: 0px — a child Rectangle with no
+            // x is centred by Slint, so without this the bar filled
+            // from the middle outwards instead of from the left.
+            x: 0px;
             width: parent.width * pct / 100;
             height: 6px;
             border-radius: 3px;
@@ -764,8 +788,8 @@ export component ButtonTile inherits Rectangle {
     height: 52px;
     border-radius: 10px;
     border-width: 1px;
-    border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : Theme.line);
-    background: pressed ? Theme.ok-bg : (selected ? Theme.acc-bg : Theme.panel2);
+    border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : (ta.has-hover ? Theme.faint : Theme.line));
+    background: pressed ? Theme.ok-bg : (selected ? Theme.acc-bg : (ta.pressed ? Theme.pressed-bg : ta.has-hover ? Theme.hover-bg : Theme.panel2));
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -785,7 +809,7 @@ export component ButtonTile inherits Rectangle {
         Text { text: label; font-size: 10.5px; font-weight: 600; color: Theme.mute; }
         Text { text: action; font-size: 12.5px; font-weight: 600; color: not-set ? Theme.mute : Theme.text; }
     }
-    TouchArea { clicked => { clicked(); } }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
 }
 
 // ---------------------------------------------------------------- game tile (§6: icon square + name + profile + status pill + Launch/Stop/Locate)
@@ -799,8 +823,12 @@ export component GameTile inherits Rectangle {
     callback action-clicked();
     border-radius: 10px;
     border-width: 1px;
-    border-color: Theme.line;
-    background: Theme.panel2;
+    border-color: ta.has-hover ? Theme.faint : Theme.line;
+    background: ta.has-hover ? Theme.hover-bg : Theme.panel2;
+    // A5: the tile itself is not clickable (only its action button
+    // is), so this TouchArea only reports hover — it sits behind the
+    // content, so the inner Btn still gets its own clicks.
+    ta := TouchArea { }
     HorizontalLayout {
         padding: 10px;
         spacing: 10px;
@@ -828,11 +856,13 @@ export component GameTile inherits Rectangle {
                 font-size: 12.5px;
                 font-weight: 600;
                 color: Theme.text;
+                wrap: word-wrap;
             }
             Text {
                 text: sub;
                 font-size: 11px;
                 color: sub-warn ? Theme.warn : Theme.mute;
+                wrap: word-wrap;
             }
         }
         // No action for "Not installed" games (A14): an empty action
@@ -892,8 +922,8 @@ export component RadioOptionCard inherits Rectangle {
     height: 64px;
     border-radius: 10px;
     border-width: 1px;
-    border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : Theme.line);
-    background: selected ? Theme.acc-bg : Theme.panel2;
+    border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : (ta.has-hover ? Theme.faint : Theme.line));
+    background: selected ? Theme.acc-bg : (ta.pressed ? Theme.pressed-bg : ta.has-hover ? Theme.hover-bg : Theme.panel2);
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -928,10 +958,10 @@ export component RadioOptionCard inherits Rectangle {
         VerticalLayout {
             spacing: 1px;
             Text { text: title; font-size: 13px; font-weight: 600; color: Theme.text; }
-            Text { text: desc; font-size: 11.5px; color: Theme.mute; }
+            Text { text: desc; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
         }
     }
-    TouchArea { clicked => { clicked(); } }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
 }
 
 // ---------------------------------------------------------------- empty / error banner (§6: one line + one action button)
@@ -944,7 +974,7 @@ export component EmptyBanner inherits Rectangle {
     border-radius: 8px;
     border-width: 1px;
     border-color: is-error ? Theme.bad : Theme.line;
-    background: is-error ? #2E1F26 : Theme.panel2;
+    background: is-error ? Theme.err-bg : Theme.panel2;
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 12px;

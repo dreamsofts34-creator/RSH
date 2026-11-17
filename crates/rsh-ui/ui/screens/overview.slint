@@ -83,7 +83,7 @@ export component OverviewPage inherits VerticalLayout {
                 HorizontalLayout {
                     spacing: 6px;
                     Text { text: "RSH Wheel"; font-size: 14px; font-weight: 600; color: Theme.text; }
-                    Pill { label: connected ? "Online" : "Offline"; bg: connected ? Theme.ok-bg : #2E1F26; fg: connected ? Theme.ok : Theme.bad; }
+                    Pill { label: connected ? "Online" : "Offline"; bg: connected ? Theme.ok-bg : Theme.err-bg; fg: connected ? Theme.ok : Theme.bad; }
                 }
                 Text { text: firmware-line; font-size: 12px; color: Theme.mute; }
                 Rectangle { vertical-stretch: 1; }
@@ -94,8 +94,8 @@ export component OverviewPage inherits VerticalLayout {
                         height: 30px;
                         border-radius: 8px;
                         border-width: 1px;
-                        border-color: Theme.line;
-                        background: Theme.panel2;
+                        border-color: prof-ta.has-hover ? Theme.faint : Theme.line;
+                        background: prof-ta.has-hover ? Theme.hover-bg : Theme.panel2;
                         accessible-label: "Current profile: " + profile-name;
                         accessible-role: button;
                         prof-fs := FocusScope {
@@ -116,7 +116,7 @@ export component OverviewPage inherits VerticalLayout {
                             Rectangle { horizontal-stretch: 1; }
                             Image { width: 12px; height: 12px; source: @image-url("../../assets/icons/chevron.svg"); }
                         }
-                        TouchArea { clicked => { open-profile-popover(); } }
+                        prof-ta := TouchArea { mouse-cursor: pointer; clicked => { open-profile-popover(); } }
                     }
                     Btn { label: "Configure"; primary: true; clicked => { configure(); } }
                 }
@@ -175,7 +175,7 @@ export component OverviewPage inherits VerticalLayout {
                 Text {
                     text: "Open diagnostics";
                     font-size: 12px;
-                    color: fs.has-focus ? white : Theme.accent-text;
+                    color: fs.has-focus || diag-ta.has-hover ? Theme.text : Theme.accent-text;
                     accessible-label: "Open diagnostics";
                     accessible-role: button;
                     // FIX-4: keyboard activation for this text link.
@@ -190,7 +190,7 @@ export component OverviewPage inherits VerticalLayout {
                             return reject;
                         }
                     }
-                    TouchArea { clicked => { open-diagnostics(); } }
+                    diag-ta := TouchArea { mouse-cursor: pointer; clicked => { open-diagnostics(); } }
                 }
             }
         }

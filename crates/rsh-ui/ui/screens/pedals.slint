@@ -24,8 +24,8 @@ component FeelChip inherits Rectangle {
     height: 26px;
     border-radius: 7px;
     border-width: 1px;
-    border-color: fs.has-focus ? Theme.accent-text : (active ? Theme.accent : Theme.line);
-    background: active ? Theme.acc-bg : Theme.panel2;
+    border-color: fs.has-focus ? Theme.accent-text : (active ? Theme.accent : (ta.has-hover ? Theme.faint : Theme.line));
+    background: active ? Theme.acc-bg : (ta.pressed ? Theme.pressed-bg : ta.has-hover ? Theme.hover-bg : Theme.panel2);
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -46,9 +46,9 @@ component FeelChip inherits Rectangle {
         text: label;
         font-size: 11.5px;
         font-weight: 600;
-        color: active ? white : Theme.mute;
+        color: active ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
     }
-    TouchArea { clicked => { clicked(); } }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
 }
 
 // ---------------------------------------------------------------- mini curve (preview: 110x110 viewBox, axis + dashed

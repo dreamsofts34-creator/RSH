@@ -72,7 +72,7 @@ export component Sidebar inherits Rectangle {
             horizontal-alignment: center;
             text: "About";
             font-size: 11.5px;
-            color: fs.has-focus ? Theme.text : Theme.faint;
+            color: fs.has-focus || about-ta.has-hover ? Theme.text : Theme.faint;
             accessible-label: "About";
             accessible-role: button;
             // FIX-4: keyboard activation for this text link.
@@ -98,7 +98,7 @@ export component Sidebar inherits Rectangle {
                 border-width: 2px;
                 border-color: Theme.accent-text;
             }
-            TouchArea { clicked => { open-about(); } }
+            about-ta := TouchArea { mouse-cursor: pointer; clicked => { open-about(); } }
         }
     }
     Rectangle { x: 183px; width: 1px; height: 100%; background: Theme.line; }

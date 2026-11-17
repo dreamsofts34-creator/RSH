@@ -33,8 +33,8 @@ export component BellButton inherits Rectangle {
     height: 30px;
     border-radius: 8px;
     border-width: 1px;
-    border-color: fs.has-focus ? Theme.accent-text : Theme.line;
-    background: Theme.panel;
+    border-color: fs.has-focus ? Theme.accent-text : (ta.has-hover ? Theme.faint : Theme.line);
+    background: ta.pressed ? Theme.pressed-bg : (ta.has-hover ? Theme.hover-bg : Theme.panel);
     // Keyboard (compare-fix): FocusScope so Tab reaches the bell;
     // Enter/Space opens the drawer like a click. Visible 2px focus
     // ring while focused. Esc-close is owned by the root keyboard
@@ -89,7 +89,7 @@ export component BellButton inherits Rectangle {
             color: white;
         }
     }
-    TouchArea { clicked => { clicked(); } }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
 }
 
 // ---------------------------------------------------------------- one notification row
@@ -170,14 +170,15 @@ export component NotificationsDrawer inherits Rectangle {
             padding-left: 16px;
             padding-right: 16px;
             spacing: 10px;
-            Text { text: "Notifications"; font-size: 15px; font-weight: 600; color: Theme.text; }
+            // A7: the title shrinks (elides) instead of pushing the
+            // buttons out of the 344px drawer.
+            Text { horizontal-stretch: 1; text: "Notifications"; font-size: 15px; font-weight: 600; color: Theme.text; wrap: no-wrap; overflow: elide; }
             if unread > 0 : Text {
                 vertical-alignment: center;
                 text: unread + " unread";
                 font-size: 11.5px;
                 color: Theme.accent-text;
             }
-            Rectangle { horizontal-stretch: 1; }
             Btn { label: "Mark all read"; clicked => { mark-all-read(); } }
             Btn { label: "✕"; clicked => { close-requested(); } }
         }

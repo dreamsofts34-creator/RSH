@@ -6,8 +6,7 @@
 // library (../components.slint); Derived fills replaced with Theme
 // tokens (Phase 3 folded them in); font/icon imports dropped (the shell
 // embeds the fonts once). One local component remains: Seg, because the
-// shared SegmentedControl has no disabled options and the Light/Auto
-// theme options are disabled until the light theme is designed (§5).
+// shared SegmentedControl has no disabled options.
 //
 // Data: connection/backend/startup/theme/profiles come from Rust via the
 // props below. v2.0.1 hotfix wires them to the real AppApi: transport
@@ -30,8 +29,9 @@ export struct ProfileRow {
 }
 
 // ---------------------------------------------------------------- segmented control with disabled options
-// (shared SegmentedControl has no disabled state; only the Theme row
-// needs it — Light/Auto are not designed yet, shown faint, clicks ignored).
+// (shared SegmentedControl has no disabled state; the Theme row uses
+// it for Dark/Light/Auto — all three enabled since v2.0.2, when the
+// light theme landed in tokens.slint).
 // Pure view: never sets `selected` itself; the parent owns the state.
 component Seg inherits Rectangle {
     in property <[string]> options;
@@ -51,7 +51,7 @@ component Seg inherits Rectangle {
             border-radius: 6px;
             accessible-label: o;
             accessible-role: button;
-            background: fs.has-focus ? Theme.line : (selected == i ? Theme.panel2 : transparent);
+            background: fs.has-focus ? Theme.line : (selected == i ? Theme.panel2 : (ta.has-hover ? Theme.hover-bg : transparent));
             opacity: enabled[i] ? 1 : 0.45;
             fs := FocusScope {
                 width: 100%;
@@ -72,9 +72,9 @@ component Seg inherits Rectangle {
                 text: o;
                 font-size: 12px;
                 font-weight: 600;
-                color: selected == i ? white : Theme.mute;
+                color: selected == i ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
             }
-            TouchArea { clicked => { if (enabled[i]) { selected-changed(i); } } }
+            ta := TouchArea { mouse-cursor: enabled[i] ? MouseCursor.pointer : MouseCursor.default; clicked => { if (enabled[i]) { selected-changed(i); } } }
         }
     }
 }
@@ -89,7 +89,7 @@ export component SettingsScreen inherits VerticalLayout {
     in-out property <int> backend: 0; // 0 HIDMaestro, 1 vJoy
     in-out property <bool> start-with-windows: true;
     in-out property <bool> keep-in-tray: true;
-    in-out property <int> theme: 0; // 0 Dark only (Light/Auto not designed yet)
+    in-out property <int> theme: 0; // 0 Dark, 1 Light, 2 Auto (v2.0.2: all enabled)
     in-out property <[ProfileRow]> profiles;
     in-out property <string> app-version: "RSH 2.0.1";
     in-out property <string> firmware-text: "—";
@@ -188,11 +188,14 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Pair a new wheel"; font-size: 13px; color: Theme.text; }
-                                    Text { text: "120 s pairing window"; font-size: 11.5px; color: Theme.mute; }
+                                    Text { text: "120 s pairing window"; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 Btn { label: "Pair"; clicked => { pair-requested(); } }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
+                            // A1 (v2.0.2): the setup-reopen row is easy
+                            // to miss at the bottom of this card, so its
+                            // button is primary — it stands out at a glance.
                             HorizontalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
@@ -201,9 +204,9 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Run setup again"; font-size: 13px; color: Theme.text; }
-                                    Text { text: "Connect, drivers, pair, calibrate, games."; font-size: 11.5px; color: Theme.mute; }
+                                    Text { text: "Connect, drivers, pair, calibrate, games."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                                 }
-                                Btn { label: "Run setup"; clicked => { run-setup(); } }
+                                Btn { label: "Run setup"; primary: true; clicked => { run-setup(); } }
                             }
                         }
                     }
@@ -222,7 +225,7 @@ export component SettingsScreen inherits VerticalLayout {
                                 spacing: 6px;
                                 RadioOptionCard {
                                     title: "HIDMaestro";
-                                    desc: "Needs admin each start.";
+                                    desc: "Needs admin permission when first used.";
                                     selected: backend == 0;
                                     clicked => { backend = 0; backend-selected(0); }
                                 }
@@ -233,7 +236,11 @@ export component SettingsScreen inherits VerticalLayout {
                                     clicked => { backend = 1; backend-selected(1); }
                                 }
                             }
-                            Text { text: "Recommended: vJoy"; font-size: 11.5px; color: Theme.faint; }
+                            // M-6 (v2.0.2): the sub-text wraps — at
+                            // 920px the "Run setup" button is primary
+                            // (wider), so the 39-char sub needs two
+                            // lines instead of pushing past the card.
+                            Text { text: "Recommended: vJoy"; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
                         }
                     }
                     // Startup
@@ -259,7 +266,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Keep running in the tray"; font-size: 13px; color: Theme.text; }
-                                    Text { text: "Keeps running after close."; font-size: 11.5px; color: Theme.mute; }
+                                    Text { text: "Keeps running after close."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 Switch { accessible-name: "Keep running in tray"; on: keep-in-tray; toggled => { keep-in-tray = !keep-in-tray; toggled-keep-tray(keep-in-tray); } }
                             }
@@ -293,10 +300,10 @@ export component SettingsScreen inherits VerticalLayout {
                                         HorizontalLayout {
                                             spacing: 4px;
                                             alignment: start;
-                                            Text { text: p.name; font-size: 13px; font-weight: 600; color: Theme.text; }
+                                            Text { text: p.name; font-size: 13px; font-weight: 600; color: Theme.text; wrap: word-wrap; }
                                             if p.active : Pill { label: "Active"; bg: Theme.ok-bg; fg: Theme.ok; }
                                         }
-                                        Text { text: p.games; font-size: 11.5px; color: Theme.mute; }
+                                        Text { text: p.games; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                                     }
                                     if p.active : Btn { label: "Duplicate"; clicked => { duplicate-profile(i); } }
                                     if !p.active : Btn { label: "Use"; clicked => { use-profile(i); } }
@@ -304,9 +311,9 @@ export component SettingsScreen inherits VerticalLayout {
                             }
                         }
                     }
-                    // Appearance (Dark only: Light/Auto exist in the
-                    // preview but the light theme is NOT designed yet —
-                    // shown faint, clicks ignored)
+                    // Appearance (v2.0.2, A8): Dark / Light / Auto all
+                    // work now — Light tokens live in tokens.slint, Auto
+                    // is resolved to Dark/Light by the Rust side.
                     Card {
                         VerticalLayout {
                             padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
@@ -322,14 +329,17 @@ export component SettingsScreen inherits VerticalLayout {
                                 Seg {
                                     width: 190px;
                                     options: ["Dark", "Light", "Auto"];
-                                    enabled: [true, false, false];
+                                    enabled: [true, true, true];
                                     selected: theme;
                                     selected-changed(i) => { theme = i; theme-selected(i); }
                                 }
                             }
                         }
                     }
-                    // Backup and updates
+                    // Backup and updates (A7, v2.0.2): every sub-text
+                    // wraps, so a long line can never push its button
+                    // out of the card — the "App updates" Check button
+                    // overflowed before this fix.
                     Card {
                         VerticalLayout {
                             padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
@@ -344,7 +354,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Wheel firmware"; font-size: 13px; color: Theme.text; }
-                                    Text { text: firmware-text; font-size: 11.5px; color: Theme.mute; }
+                                    Text { text: firmware-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 Btn { label: "Check"; clicked => { check-firmware(); } }
                             }
@@ -357,7 +367,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "App updates"; font-size: 13px; color: Theme.text; }
-                                    Text { text: app-update-text; font-size: 11.5px; color: Theme.mute; }
+                                    Text { text: app-update-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 Btn { label: "Check"; clicked => { check-app-updates(); } }
                             }
@@ -370,8 +380,8 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Backups"; font-size: 13px; color: Theme.text; }
-                                    Text { text: backup-text; font-size: 11.5px; color: Theme.mute; }
-                                    Text { text: "Restore isn't supported yet."; font-size: 11.5px; color: Theme.faint; }
+                                    Text { text: backup-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: "Restore isn't supported yet."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
                                 }
                                 HorizontalLayout {
                                     spacing: 6px;
@@ -396,7 +406,7 @@ export component SettingsScreen inherits VerticalLayout {
             text: "Open diagnostics";
             font-size: 12px;
             font-weight: 600;
-            color: fs.has-focus ? white : Theme.accent-text;
+            color: fs.has-focus || diag-ta.has-hover ? Theme.text : Theme.accent-text;
             accessible-label: "Open diagnostics";
             accessible-role: button;
             // FIX-4: keyboard activation for this text link.
@@ -411,7 +421,7 @@ export component SettingsScreen inherits VerticalLayout {
                     return reject;
                 }
             }
-            TouchArea { clicked => { open-diagnostics(); } }
+            diag-ta := TouchArea { mouse-cursor: pointer; clicked => { open-diagnostics(); } }
         }
         Rectangle { horizontal-stretch: 1; }
     }

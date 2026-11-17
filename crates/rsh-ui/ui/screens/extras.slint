@@ -205,7 +205,7 @@ export component ExtrasScreen inherits VerticalLayout {
                             }
                         }
                         RangeBlock { up-value: handbrake-up-mv; down-value: handbrake-down-mv; up-disabled: calibration-disabled; down-disabled: calibration-disabled; set-up => { action("handbrake-up"); } set-down => { action("handbrake-down"); } }
-                        if calibration-disabled : Text { text: "Calibration capture needs a later wheel update."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                        if calibration-disabled : Text { text: "Background service not running — reconnect to capture."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
                         HorizontalLayout {
                             spacing: 4px;
                             PresetChip { horizontal-stretch: 1; label: "Linear"; active: handbrake-feel == 0; clicked => { handbrake-feel-selected(0); } }
@@ -240,7 +240,7 @@ export component ExtrasScreen inherits VerticalLayout {
                         text: "Change gear mapping in Buttons";
                         font-size: 12px;
                         font-weight: 600;
-                        color: gear-fs.has-focus ? white : Theme.accent-text;
+                        color: gear-fs.has-focus || gear-ta.has-hover ? Theme.text : Theme.accent-text;
                         accessible-label: "Change gear mapping in Buttons";
                         accessible-role: button;
                         // FIX-4: keyboard activation for this text link.
@@ -255,7 +255,7 @@ export component ExtrasScreen inherits VerticalLayout {
                                 return reject;
                             }
                         }
-                        TouchArea { clicked => { action("shifter-change-in-buttons"); } }
+                        gear-ta := TouchArea { mouse-cursor: pointer; clicked => { action("shifter-change-in-buttons"); } }
                     }
                 }
             }
@@ -324,7 +324,7 @@ export component ExtrasScreen inherits VerticalLayout {
                                 height: 22px;
                                 border-radius: 11px;
                                 border-width: led-color == i ? 2px : 1px;
-                                border-color: led-color == i ? white : Theme.line;
+                                border-color: led-color == i ? Theme.text : (sw-ta.has-hover ? Theme.faint : Theme.line);
                                 background: s;
                                 accessible-label: "LED colour " + (i + 1);
                                 accessible-role: button;
@@ -339,7 +339,7 @@ export component ExtrasScreen inherits VerticalLayout {
                                         return reject;
                                     }
                                 }
-                                TouchArea { clicked => { led-color-selected(i); } }
+                                sw-ta := TouchArea { mouse-cursor: pointer; clicked => { led-color-selected(i); } }
                             }
                         }
                     }
