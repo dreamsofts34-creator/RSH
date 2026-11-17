@@ -1,0 +1,25 @@
+[package]
+name = "rsh-gate-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RSH v2.0.2 UI gate checks (Slint interpreter + testing backend, software renderer): slider visual + click, wizard gating + click-through, theme switch, tray disconnected state. Headless, no X needed."
+publish = false
+
+[[bin]]
+name = "rsh-gate-ui"
+path = "src/main.rs"
+
+[dependencies]
+slint-interpreter = "=1.18.1"
+# renderer-software: headless rasterizer so take_snapshot works.
+# (The `internal` feature is NOT enabled: its test-font helper
+# cannot compile from the published crate — the NotoSans files it
+# includes live only in the Slint repo's tests/ dir. Mouse clicks
+# are dispatched below with public i-slint-core APIs instead.)
+i-slint-backend-testing = { version = "=1.18.1", features = ["renderer-software"] }
+i-slint-core = "=1.18.1"
+spin_on = "=0.1.1"
+
+[lints]
+workspace = true

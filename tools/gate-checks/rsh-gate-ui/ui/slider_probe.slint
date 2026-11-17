@@ -1,0 +1,21 @@
+// Probe window hosting the real SliderRow (same-to-same component
+// from crates/rsh-ui/ui/components.slint) so the gate can render it
+// headless and measure the fill + click it.
+import { SliderRow } from "../../../crates/rsh-ui/ui/components.slint";
+
+export component GateSliderWindow inherits Window {
+    width: 320px;
+    height: 80px;
+    title: "gate-slider-probe";
+    in-out property <float> value: 0.5;
+    callback changed(float);
+    SliderRow {
+        width: 100%;
+        height: 100%;
+        label: "Probe";
+        hint: "gate probe";
+        value-text: "0.50";
+        value: root.value;
+        changed(v) => { root.changed(v); }
+    }
+}

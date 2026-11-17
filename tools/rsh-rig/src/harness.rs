@@ -1196,6 +1196,37 @@ pub fn run_contract(scenario: &Scenario) -> Metrics {
         "pairing-window-open" => self_check_pairing_window_open(),
         "pairing-window-expired" => self_check_pairing_window_expired(),
         "pairing-unreachable" => self_check_pairing_unreachable(),
+        "ota-e2e-success" => crate::ota_checks::self_check_ota_e2e_success(),
+        "ota-e2e-bad-signature" => crate::ota_checks::self_check_ota_e2e_bad_signature(),
+        "ota-e2e-disconnect-rollback" => {
+            crate::ota_checks::self_check_ota_e2e_disconnect_rollback()
+        }
+        "upgrade-preserve" => crate::ota_checks::self_check_upgrade_preserve(),
+        "installer-preserves-data" => crate::ota_checks::self_check_installer_preserves_data(),
+        // v2.0.2 gate checks (docs/V2.0.2-FIX-PLAN.md §C).
+        "gate-backend-switch" => crate::gate_checks::gate_backend_switch(),
+        "gate-user-errors" => crate::gate_checks::gate_user_errors(),
+        "gate-ipc-timeout" => crate::gate_checks::gate_ipc_timeout(),
+        "gate-perf" => crate::gate_checks::gate_perf(),
+        "gate-ota-e2e" => crate::gate_checks::gate_ota_e2e(),
+        "gate-installer-audit" => crate::gate_checks::gate_installer_audit(),
+        "gate-slider-source" => crate::gate_checks::gate_slider_source(),
+        "gate-tray-persistence-source" => crate::gate_checks::gate_tray_persistence_source(),
+        "gate-tray-data-source" => crate::gate_checks::gate_tray_data_source(),
+        "gate-x-close-source" => crate::gate_checks::gate_x_close_source(),
+        "gate-wizard-reopen-source" => crate::gate_checks::gate_wizard_reopen_source(),
+        "gate-wizard-fake-data-source" => crate::gate_checks::gate_wizard_fake_data_source(),
+        "gate-loading-source" => crate::gate_checks::gate_loading_source(),
+        "gate-hover-source" => crate::gate_checks::gate_hover_source(),
+        "gate-theme-source" => crate::gate_checks::gate_theme_source(),
+        "gate-overflow-source" => crate::gate_checks::gate_overflow_source(),
+        "gate-notifications-source" => crate::gate_checks::gate_notifications_source(),
+        // v2.0.2 gate checks, re-scan findings (B-1, B-2, H-3, H-4, M-9).
+        "gate-pairing-long-call" => crate::gate_checks::gate_pairing_long_call(),
+        "gate-hid-uac-dwell" => crate::gate_checks::gate_hid_uac_dwell(),
+        "gate-bindings-ui" => crate::gate_checks::gate_bindings_ui(),
+        "gate-ota-flash-caller" => crate::gate_checks::gate_ota_flash_caller(),
+        "gate-version-bump" => crate::gate_checks::gate_version_bump(),
         _ => (
             false,
             format!("no self-check defined for {id}", id = scenario.id),

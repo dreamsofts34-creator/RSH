@@ -39,10 +39,13 @@ use serde::Serialize;
 
 use crate::metrics::Metrics;
 
+mod gate_checks;
 mod harness;
 mod metrics;
+mod ota_checks;
 mod rng;
 mod scenarios;
+mod webota_board;
 mod wheel;
 
 #[global_allocator]
@@ -167,9 +170,12 @@ fn evaluate(scenario: &scenarios::Scenario, m: &Metrics) -> (bool, Vec<String>) 
 /// Print usage to stderr.
 fn usage() {
     eprintln!(
-        "Usage: rsh-rig [--mode quick|full|long] [--only <id>] [--seed N] [--seeds 42,7,1337] [--out DIR] [--list]\n\
+        "Usage: rsh-rig [--mode quick|full|long] [--only <id>] [--seed N] [--seeds 42,7,1337] [--out DIR] [--list] [--gate]\n\
          \n\
          Modes: quick (~8 min), full (~15 min, 10-min soak), long (4-hour soak with --only long-soak).\n\
+         --gate runs only the v2.0.2 gate checks (`gate-*` scenarios:\n\
+         backend switch, typed errors, IPC timeout, performance, OTA,\n\
+         installer audit, and the UI source audits). Fast, no engine run.\n\
          --seed N runs every selected scenario once with seed N (default 42).\n\
          --seeds 42,7,1337 runs every selected scenario once per seed (M-3 multi-seed gate support;\n\
          the gate phase runs the full rig on seeds 42, 7 and 1337) and overrides --seed.\n\
@@ -187,9 +193,13 @@ async fn main() {
     let mut seeds: Option<Vec<u64>> = None;
     let mut out: Option<PathBuf> = None;
     let mut list = false;
+    // v2.0.2 gate: run only the `gate-*` contract checks (fast,
+    // no engine run) instead of the full scenario set.
+    let mut gate_only = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--gate" => gate_only = true,
             "--mode" => {
                 i += 1;
                 mode = args.get(i).cloned().unwrap_or_default();
@@ -251,6 +261,7 @@ async fn main() {
     let selected: Vec<&scenarios::Scenario> = registry
         .iter()
         .filter(|s| only.as_deref().is_none_or(|id| s.id == id))
+        .filter(|s| !gate_only || s.id.starts_with("gate-"))
         .collect();
     if selected.is_empty() {
         let want = only.unwrap_or_default();
@@ -443,11 +454,17 @@ fn write_reports(out_dir: &Path, report: &RunReport, wall: Duration) {
          - LED output (M-10): the engine's `OutputState` carries no LED field, so\n\
          the rig cannot observe LED output at all — needs a firmware/app change to\n\
          expose LED state plus a Windows observation.\n\
-         - FFB, per-game telemetry, profiles UI, serial transport, OTA, output\n\
+         - FFB, per-game telemetry, profiles UI, serial transport, output\n\
          backends (`vJoy`/`HIDMaestro`), game detection / foreground detector\n\
          (incl. the `windows_foreground_detector_needs_windows_ci` test, which\n\
          needs a real foreground game window on Windows CI) — all Windows/human\n\
          gates (M-10, L-2).\n\
+         - Real-board OTA (flashing the ESP32 + reboot) is a human gate:\n\
+         the rig covers the WebOTA flow end to end against a fake board\n\
+         (`ota-e2e-*` scenarios: success, bad-signature reject,\n\
+         mid-upload disconnect + rollback) plus upgrade preservation\n\
+         (`upgrade-preserve`, `installer-preserves-data`), but the real\n\
+         board's flash + reboot is only proven on hardware.\n\
          - Multi-seed gate (M-3): this run's seeds are listed at the top; the gate\n\
          phase runs the full rig on seeds 42, 7 and 1337\n\
          (`cargo run -p rsh-rig -- --mode full --seeds 42,7,1337`).\n\n",
