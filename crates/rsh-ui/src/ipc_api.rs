@@ -35,8 +35,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -73,6 +73,17 @@ struct LiveCache {
     snapshot: Mutex<Option<SnapshotInfo>>,
     output: Mutex<Option<bool>>,
     link_dead: AtomicBool,
+    /// DS-19: consecutive failed fast-poll rounds. The link trips
+    /// only at [`LINK_DEAD_AFTER_FAILURES`] — one transient failure
+    /// used to wedge every UI call (`call_async` fails fast on
+    /// `link_dead`) until a poll round succeeded.
+    consecutive_poll_failures: AtomicU32,
+    /// DS-19: true while a long IPC call (e.g. `set_output_backend`,
+    /// 75 s) is in flight. The fast poller freezes its failure
+    /// counter while this is set: the long call holds the
+    /// single-flight IPC lock, so polls behind it time out and
+    /// would otherwise trip the link spuriously.
+    long_call_in_flight: AtomicBool,
     version: Mutex<Option<String>>,
     firmware_version: Mutex<Option<String>>,
     board_address: Mutex<Option<String>>,
@@ -114,6 +125,8 @@ impl Default for LiveCache {
             snapshot: Mutex::new(None),
             output: Mutex::new(None),
             link_dead: AtomicBool::new(false),
+            consecutive_poll_failures: AtomicU32::new(0),
+            long_call_in_flight: AtomicBool::new(false),
             version: Mutex::new(None),
             firmware_version: Mutex::new(None),
             board_address: Mutex::new(None),
@@ -151,6 +164,46 @@ fn module_index(module: &str) -> Option<usize> {
         "horn" => Some(2),
         "led" => Some(3),
         _ => None,
+    }
+}
+
+/// DS-19: consecutive failed fast-poll rounds after which the link
+/// counts as dead. One transient failure (a slow daemon, a hiccup)
+/// used to trip `link_dead` at once and wedge every UI call until
+/// a poll round succeeded.
+const LINK_DEAD_AFTER_FAILURES: u32 = 3;
+
+/// DS-19: how the fast poller updates `link_dead` after one round.
+/// `failures` is the consecutive-failure count BEFORE this round.
+/// Returns `(link_dead, failures_after)`: a success clears the
+/// streak and the link; a failure counts up and trips the link at
+/// [`LINK_DEAD_AFTER_FAILURES`]; while a long call is in flight the
+/// counter freezes — the polls behind it time out on the
+/// single-flight IPC lock, which is not evidence of a dead link.
+/// (Pure, so the thresholds are unit-testable without a runtime.)
+fn link_dead_after_round(ok: bool, failures: u32, long_call_in_flight: bool) -> (bool, u32) {
+    if ok {
+        (false, 0)
+    } else if long_call_in_flight {
+        (false, failures)
+    } else {
+        let failures = failures.saturating_add(1);
+        (failures >= LINK_DEAD_AFTER_FAILURES, failures)
+    }
+}
+
+/// DS-19: clears `LiveCache::long_call_in_flight` on drop, so a
+/// cancelled or panicking long call cannot freeze the poller's
+/// failure counter forever.
+struct LongCallGuard<'a> {
+    cache: &'a LiveCache,
+}
+
+impl Drop for LongCallGuard<'_> {
+    fn drop(&mut self) {
+        self.cache
+            .long_call_in_flight
+            .store(false, Ordering::Relaxed);
     }
 }
 
@@ -277,7 +330,19 @@ impl IpcApi {
                         },
                         Err(_) => false,
                     };
-                    poll_cache.link_dead.store(!ok, Ordering::Relaxed);
+                    // DS-19: the link trips only after N
+                    // consecutive failed rounds (and never while a
+                    // long call is in flight — see
+                    // `link_dead_after_round`).
+                    let (dead, failures) = link_dead_after_round(
+                        ok,
+                        poll_cache.consecutive_poll_failures.load(Ordering::Relaxed),
+                        poll_cache.long_call_in_flight.load(Ordering::Relaxed),
+                    );
+                    poll_cache.link_dead.store(dead, Ordering::Relaxed);
+                    poll_cache
+                        .consecutive_poll_failures
+                        .store(failures, Ordering::Relaxed);
                     // A9/B7: a failed round backs off to 500 ms — a
                     // wedged daemon must not let the poller hog the
                     // single-flight IPC lock (and the CPU) at 20 Hz,
@@ -345,6 +410,14 @@ impl IpcApi {
         if self.cache.link_dead.load(Ordering::Relaxed) {
             return Err(IpcError::Closed);
         }
+        // DS-19: exempt the poller's failure counter while the long
+        // call holds the single-flight IPC lock (its polls behind it
+        // time out, which is not a dead link). The guard clears the
+        // flag on every exit path, including cancellation/panic.
+        self.cache
+            .long_call_in_flight
+            .store(true, Ordering::Relaxed);
+        let _guard = LongCallGuard { cache: &self.cache };
         self.client.call_with_timeout(method, params, timeout).await
     }
 
@@ -1814,6 +1887,30 @@ mod tests {
     use super::*;
     use crate::sim_api::SimApi;
     use rsh_ipc::IpcServer;
+
+    /// DS-19: the link trips only after N=3 consecutive failed poll
+    /// rounds — a single transient failure must not wedge the UI —
+    /// and the counter freezes while a long call is in flight.
+    #[test]
+    fn link_dead_needs_three_consecutive_failures() {
+        // Success clears the streak and the link.
+        assert_eq!(link_dead_after_round(true, 0, false), (false, 0));
+        assert_eq!(link_dead_after_round(true, 2, false), (false, 0));
+        // One or two failures: counted, but the link stays up.
+        assert_eq!(link_dead_after_round(false, 0, false), (false, 1));
+        assert_eq!(link_dead_after_round(false, 1, false), (false, 2));
+        // The third consecutive failure trips it, and it stays tripped.
+        assert_eq!(link_dead_after_round(false, 2, false), (true, 3));
+        assert_eq!(link_dead_after_round(false, 3, false), (true, 4));
+        // A later success clears it again.
+        assert_eq!(link_dead_after_round(true, 4, false), (false, 0));
+        // While a long call is in flight the counter freezes:
+        // failures are not counted and the link never trips.
+        assert_eq!(link_dead_after_round(false, 0, true), (false, 0));
+        assert_eq!(link_dead_after_round(false, 2, true), (false, 2));
+        // ... and a success during a long call still clears.
+        assert_eq!(link_dead_after_round(true, 2, true), (false, 0));
+    }
     // DS-07 (deep-scan FC-06/CI-01): the only use of PathBuf in this
     // test module is inside the #[cfg(unix)] fn live_client below, so
     // the import is unused on Windows and fails clippy-windows with
