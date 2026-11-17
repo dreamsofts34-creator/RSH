@@ -38,10 +38,16 @@ Remove-Item $errLog, $outLog -ErrorAction SilentlyContinue
 
 function Connect-PipeClient {
     # One named-pipe client to \\.\pipe\rsh-daemon (IPC_PIPE_NAME).
+    # DS-05 (deep-scan FC-03/CI-03): the client MUST be opened with
+    # PipeOptions::Asynchronous — .NET PipeStream rejects ReadTimeout /
+    # WriteTimeout on a synchronous pipe ("Timeouts are not supported
+    # on this stream"), which threw before the first ping and meant the
+    # F18 proof never executed (run 44120480671). With Asynchronous
+    # the timeout assignments below are accepted.
     $stream = New-Object System.IO.Pipes.NamedPipeClientStream(
         '.', 'rsh-daemon',
         [System.IO.Pipes.PipeDirection]::InOut,
-        [System.IO.Pipes.PipeOptions]::None)
+        [System.IO.Pipes.PipeOptions]::Asynchronous)
     $stream.Connect(5000)
     $stream.ReadTimeout = 5000
     $stream.WriteTimeout = 5000
