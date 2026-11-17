@@ -1812,6 +1812,11 @@ mod tests {
     use super::*;
     use crate::sim_api::SimApi;
     use rsh_ipc::IpcServer;
+    // DS-07 (deep-scan FC-06/CI-01): the only use of PathBuf in this
+    // test module is inside the #[cfg(unix)] fn live_client below, so
+    // the import is unused on Windows and fails clippy-windows with
+    // -D warnings. Gate it to unix.
+    #[cfg(unix)]
     use std::path::PathBuf;
     #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
