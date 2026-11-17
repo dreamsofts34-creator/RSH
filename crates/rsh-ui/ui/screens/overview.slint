@@ -32,6 +32,10 @@ export component OverviewPage inherits VerticalLayout {
     in property <bool> daemon-live;
     in property <bool> connected;
     in property <bool> paired: true;
+    // M-2 (v2.0.2): the specific fatal reason from
+    // read_daemon_status() — "" while there is none. Shown as an
+    // error banner with Reconnect instead of the generic line below.
+    in property <string> daemon-error: "";
     // Live values from Rust (A11/A12): "—" when there is no telemetry.
     in property <string> firmware-line: "—";
     in property <string> delay-text: "—";
@@ -51,7 +55,8 @@ export component OverviewPage inherits VerticalLayout {
     callback pair-now();
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
     spacing: 12px;
-    if !daemon-live : EmptyBanner { text: "Live data unavailable — the background service isn't running. Live data appears once it starts."; is-error: false; }
+    if daemon-error != "" : EmptyBanner { text: daemon-error; action-label: "Reconnect"; is-error: true; action-clicked => { reconnect(); } }
+    if !daemon-live && daemon-error == "" : EmptyBanner { text: "Live data unavailable — RSH isn't running. Live data appears once it starts."; is-error: false; }
     // REDESIGN-PLAN §8.6 disconnected state: banner + Reconnect.
     if daemon-live && !connected : EmptyBanner { text: "Wheel not connected — check the RSH Wi-Fi is joined (or the USB cable is plugged in), then retry."; action-label: "Reconnect"; is-error: true; action-clicked => { reconnect(); } }
     // REDESIGN-PLAN §8.6 pairing-needed state (E): banner + Pair.

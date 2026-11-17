@@ -97,6 +97,14 @@ export component ProfilePopover inherits Card {
     in property <string> pending-name: "";
     // selected row: 0..presets.length-1 = preset, presets.length.. = my profile
     in-out property <int> selected: 0;
+    // M1 (v2.0.2): free-text rename — the input below binds here so
+    // Rust can read the typed name (the popover never owned a text
+    // input before; rename just reused the linked game's name).
+    in-out property <string> rename-text: "";
+    in-out property <bool> rename-open: false;
+    // Name of the selected row (preset or profile) — the rename
+    // input is prefilled with it. Out-of-range reads yield "".
+    property <string> selected-name: selected < presets.length ? presets[selected].name : ((selected - presets.length) < profiles.length ? profiles[selected - presets.length].name : "");
 
     callback use-preset(int);
     callback use-profile(int);
@@ -106,6 +114,10 @@ export component ProfilePopover inherits Card {
     // index rides in the callback (0..presets-1 = preset, rest = profile).
     callback duplicate-selected(int);
     callback rename-selected(int);
+    // M1: fired when the rename input is saved — selected row +
+    // the typed name. (rename-selected(int) stays for the old
+    // rename-to-game-name path; Rust wiring pending for this one.)
+    callback rename-confirmed(int, string);
     callback delete-selected(int);
     callback link-selected(int);
     callback save-and-switch();
@@ -167,8 +179,50 @@ export component ProfilePopover inherits Card {
             spacing: 6px;
             Btn { label: "New"; clicked => { new-profile(); } }
             Btn { label: "Duplicate"; clicked => { duplicate-selected(selected); } }
-            Btn { label: "Rename"; clicked => { rename-selected(selected); } }
+            // M1: opens the rename input below (prefilled with the
+            // selected row's name) instead of renaming at once.
+            Btn { label: "Rename"; clicked => { rename-text = selected-name; rename-open = true; } }
             Btn { label: "Delete"; clicked => { delete-selected(selected); } }
+        }
+        // M1: free-text rename input — Save sends the selected row +
+        // the typed name, Cancel closes without touching anything.
+        // Enter in the field saves too (accepted); empty saves are
+        // disabled (Rust validates the name as well).
+        if rename-open : Rectangle {
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.line;
+            background: Theme.panel2;
+            VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                Text { text: "Rename profile"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    border-radius: 7px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.bg;
+                    TextInput {
+                        x: 10px;
+                        width: parent.width - 20px;
+                        height: 100%;
+                        vertical-alignment: center;
+                        text <=> rename-text;
+                        font-size: 12px;
+                        font-weight: 500;
+                        color: Theme.text;
+                        selection-background-color: Theme.accent;
+                        accepted => { rename-open = false; rename-confirmed(selected, rename-text); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    Btn { label: "Save"; primary: true; disabled: rename-text == ""; clicked => { rename-open = false; rename-confirmed(selected, rename-text); } }
+                    Btn { label: "Cancel"; clicked => { rename-open = false; } }
+                }
+            }
         }
         Btn { label: "Link to game"; clicked => { link-selected(selected); } }
         Text { text: "Presets are read-only — duplicate one to edit it."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }

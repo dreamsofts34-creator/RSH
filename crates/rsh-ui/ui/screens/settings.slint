@@ -85,7 +85,9 @@ export component SettingsScreen inherits VerticalLayout {
     // connection + pairing only — see header)
     in-out property <bool> connected: true;
     in-out property <int> connection-type: 0; // 0 Wi-Fi, 1 USB cable
-    in-out property <string> address: "rsh.local";
+    // L-2: "—" until Rust sets the live address — never a hardcoded
+    // default (the window binds this to setup-address).
+    in-out property <string> address: "—";
     in-out property <int> backend: 0; // 0 HIDMaestro, 1 vJoy
     in-out property <bool> start-with-windows: true;
     in-out property <bool> keep-in-tray: true;
@@ -97,7 +99,11 @@ export component SettingsScreen inherits VerticalLayout {
     in-out property <string> backup-text: "No backups yet";
 
     callback connection-selected(int);
-    callback address-changed(string);
+    // H4 (v2.0.2): fired on Enter with the typed address — the old
+    // address-changed(string) fired per keystroke and its payload was
+    // dropped by the window, so Rust could never save the value.
+    // (Enter = accept the address, not Save — M5.)
+    callback address-accepted(string);
     callback reconnect();
     callback pair-requested();
     callback backend-selected(int);
@@ -108,6 +114,9 @@ export component SettingsScreen inherits VerticalLayout {
     callback use-profile(int);
     callback duplicate-profile(int);
     callback check-firmware();
+    // H-4 (v2.0.2): start the firmware flash (Rust arm
+    // settings-action("update-firmware") is already wired).
+    callback update-firmware();
     callback check-app-updates();
     callback backup();
     callback restore();
@@ -174,7 +183,10 @@ export component SettingsScreen inherits VerticalLayout {
                                         font-weight: 500;
                                         color: Theme.text;
                                         selection-background-color: Theme.accent;
-                                        edited => { address-changed(self.text); }
+                                        // H4: Enter accepts the typed
+                                        // address — nothing is sent
+                                        // per keystroke any more.
+                                        accepted => { address-accepted(self.text); }
                                     }
                                 }
                                 Btn { label: "Reconnect"; clicked => { reconnect(); } }
@@ -356,7 +368,15 @@ export component SettingsScreen inherits VerticalLayout {
                                     Text { text: "Wheel firmware"; font-size: 13px; color: Theme.text; }
                                     Text { text: firmware-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                                 }
-                                Btn { label: "Check"; clicked => { check-firmware(); } }
+                                // H-4: Check reports the verdict,
+                                // Update firmware starts the flash
+                                // (daemon validates + flashes, the
+                                // global busy strip shows progress).
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Btn { label: "Check"; clicked => { check-firmware(); } }
+                                    Btn { label: "Update firmware"; clicked => { update-firmware(); } }
+                                }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
                             HorizontalLayout {

@@ -24,7 +24,7 @@ export component SteeringPage inherits HorizontalLayout {
     // with a reason while the backend is unavailable.
     in property <bool> centre-set: false;
     in property <bool> centre-available: false;
-    in property <string> centre-reason: "Background service not running — reconnect to capture.";
+    in property <string> centre-reason: "RSH isn't running — reconnect to capture.";
     callback deadzone-changed(float);
     callback curve-changed(float);
     callback deadzone-edited(string);

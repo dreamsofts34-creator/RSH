@@ -99,7 +99,7 @@ export component SetupWizard inherits Rectangle {
     in property <bool> connect-done: false;
     in property <bool> wifi-joined: false;
     in property <int> transport: 0; // 0 Wi-Fi, 1 USB
-    in property <string> address: "rsh.local";
+    in property <string> address: "—";
     // Step 1 — Pair (driven by the Pairing Manager).
     in property <int> pair-seconds-left: 120;
     in property <int> pair-total: 120;
@@ -124,7 +124,7 @@ export component SetupWizard inherits Rectangle {
     // calibration backend is unavailable; the buttons stay disabled
     // and Next does not gate on calibration then.
     in property <bool> calibration-available: false;
-    in property <string> calibration-reason: "Background service not running — reconnect to capture.";
+    in property <string> calibration-reason: "RSH isn't running — reconnect to capture.";
     // Step 2 — Calibrate.
     in property <bool> centre-done: false;
     in property <bool> pedals-done: false;
@@ -186,7 +186,9 @@ export component SetupWizard inherits Rectangle {
                 Text { text: "Set up your wheel"; font-size: 20px; font-weight: 700; color: Theme.text; }
                 Text { text: "About 3 minutes. You only do this once."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
                 Rectangle { height: 16px; }
-                StepRow { num: 1; label: "Connect"; sub: "Wi-Fi · rsh.local"; done: step > 0 || connect-done; now: step == 0; }
+                // L-2: the live address, never a hardcoded default —
+                // "Wi-Fi · —" until the wheel is really connected.
+                StepRow { num: 1; label: "Connect"; sub: transport == 1 ? "USB cable" : "Wi-Fi · " + address; done: step > 0 || connect-done; now: step == 0; }
                 StepRow { num: 2; label: "Drivers"; sub: "vJoy controller"; done: step > 1 || vjoy-installed || vjoy-fallback; now: step == 1; }
                 StepRow { num: 3; label: "Pair"; sub: "Link this PC to your wheel"; done: paired; now: step == 2; }
                 StepRow { num: 4; label: "Calibrate"; sub: "Centre and pedals"; done: step > 3; now: step == 3; }
@@ -403,7 +405,12 @@ export component SetupWizard inherits Rectangle {
                             if !reset-required : PairStepLine { num: 3; text: "Keep this window open. It finishes by itself."; }
                             if !pairing-active && !paired && !reset-required : Btn { label: "Begin pairing"; primary: true; clicked => { begin-pairing(); } }
                             if !pairing-active && !paired && reset-required : Btn { label: "Reset pairing"; primary: true; clicked => { reset-pairing(); } }
-                            if pairing-active && !paired && pair-error == "" : Btn { label: "Retry"; clicked => { retry-pairing(); } }
+                            // M4 (v2.0.2): Retry belongs AFTER a
+                            // failure (pair-error set), never while
+                            // pairing is in progress with no error —
+                            // the old condition showed it exactly
+                            // then and hid it when it was needed.
+                            if pair-error != "" && !paired : Btn { label: "Retry"; clicked => { retry-pairing(); } }
                         }
                     }
                 }
@@ -427,7 +434,7 @@ export component SetupWizard inherits Rectangle {
                             border-radius: 5px;
                             background: paired ? Theme.ok : Theme.warn;
                         }
-                        Text { vertical-alignment: center; text: paired ? "Paired — wheel connected." : !daemon-live ? "Disconnected — background service isn't running." : pair-status; font-size: 12.5px; color: Theme.mute; }
+                        Text { vertical-alignment: center; text: paired ? "Paired — wheel connected." : !daemon-live ? "Disconnected — RSH isn't running." : pair-status; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
                         Text { vertical-alignment: center; text: paired ? "" : pairing-active ? pair-seconds-left + " seconds left" : "Not pairing"; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
                     }

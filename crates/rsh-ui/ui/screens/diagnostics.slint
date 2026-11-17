@@ -15,10 +15,6 @@ import { Theme } from "../tokens.slint";
 import { Btn, HBar } from "../components.slint";
 import { ScrollView } from "std-widgets.slint";
 
-import { Theme } from "../tokens.slint";
-import { Btn, HBar } from "../components.slint";
-import { ScrollView } from "std-widgets.slint";
-
 // Small live line chart: title + polyline + readout (viewBox 380x90).
 component LiveChart inherits VerticalLayout {
     in property <string> title;
@@ -144,7 +140,7 @@ export component DiagnosticsDrawer inherits FocusScope {
                     VerticalLayout {
                         spacing: 4px;
                         Text { text: "Status: " + conn-label; font-family: Theme.font-mono; font-size: 12px; color: Theme.mute; }
-                        Text { text: "Background service: " + (daemon-live ? "running" : "not running"); font-family: Theme.font-mono; font-size: 12px; color: Theme.mute; }
+                        Text { text: "RSH: " + (daemon-live ? "running" : "not running"); font-family: Theme.font-mono; font-size: 12px; color: Theme.mute; }
                         Text { text: "App: " + app-version + " · Firmware: " + firmware; font-family: Theme.font-mono; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
                     }
                     // live charts (§8.3)
@@ -188,9 +184,13 @@ export component DiagnosticsDrawer inherits FocusScope {
                             }
                         }
                     }
-                    // button grid live state (§8.3)
-                    Text { text: "Buttons — live"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
-                    VerticalLayout {
+                    // H10 (v2.0.2): the live button grid hides when
+                    // there is nothing to show — Rust sets
+                    // buttons-pressed to an empty list while not live,
+                    // so 12 dead tiles never render. (The encoders
+                    // line below stays: it reads "—" while not live.)
+                    if buttons-pressed.length > 0 : Text { text: "Buttons — live"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    if buttons-pressed.length > 0 : VerticalLayout {
                         spacing: 6px;
                         for row in 3 : HorizontalLayout {
                             spacing: 6px;

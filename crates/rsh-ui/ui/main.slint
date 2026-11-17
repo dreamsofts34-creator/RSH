@@ -74,6 +74,18 @@ export component MainWindow inherits Window {
     in property <string> auto-profile-text: "No profile yet";
     in property <string> app-version: "2.0.1";
     in property <bool> daemon-live: false;
+    // B5 (v2.0.2): the global busy strip reads these — Rust drives
+    // them from busy_jobs (each start_*_job records its label, the
+    // 1 Hz frame timer clears them); an empty label renders "Working…".
+    in property <bool> busy: false;
+    in property <string> busy-label: "";
+    // M-2 (v2.0.2): the specific fatal reason from
+    // read_daemon_status() (daemon-status.json) — empty while there
+    // is none; the Overview shows it as an error banner instead of
+    // the generic "not running" line. Rust setter pending (FC).
+    in property <string> daemon-error: "";
+    // B5 spinner step (0..11, driven by the strip's Timer).
+    property <int> spin-step: 0;
     in property <bool> connected: true;
     in property <bool> paired: true;
     in property <string> conn-label: "Disconnected";
@@ -101,7 +113,7 @@ export component MainWindow inherits Window {
     // while the calibration backend is unavailable.
     in property <bool> centre-set: false;
     in property <bool> centre-available: false;
-    in property <string> centre-reason: "Background service not running — reconnect to capture.";
+    in property <string> centre-reason: "RSH isn't running — reconnect to capture.";
     // Pedals (A1/A2): mV / feel / deadzone / curve / marker from Rust
     // (get_tuning), refreshed on startup, on swap-to-live and after
     // every pedal edit — never literals.
@@ -170,6 +182,16 @@ export component MainWindow inherits Window {
     in property <[GameItem]> games;
     // Settings live values (A9/A10/C3/C6): seeded from the API.
     in-out property <bool> autostart-enabled: false;
+    // M-7 (v2.0.2): two-way — Rust reads keep-in-tray for the close
+    // handler and writes it back when set_close_to_tray fails, so the
+    // switch never lies about the real state. Same for the Extras
+    // module switches: Rust tracks the intended state in
+    // module_states and reverts the prop on a failed toggle.
+    in-out property <bool> keep-in-tray: true;
+    in-out property <bool> extras-handbrake-on: true;
+    in-out property <bool> extras-shifter-on: true;
+    in-out property <bool> extras-horn-on: true;
+    in-out property <bool> extras-leds-on: true;
     in property <string> firmware-text: "—";
     in property <string> app-update-text: "Auto-update is off — new versions are on GitHub Releases";
     in property <string> backup-text: "No backups yet";
@@ -223,7 +245,7 @@ export component MainWindow inherits Window {
     in-out property <string> setup-vjoy-error: "";
     in-out property <bool> setup-vjoy-fallback: false;
     in-out property <bool> setup-calibration-available: false;
-    in-out property <string> setup-calibration-reason: "Background service not running — reconnect to capture.";
+    in-out property <string> setup-calibration-reason: "RSH isn't running — reconnect to capture.";
     // Diagnostics drawer (v2.0.1 hotfix): right-edge overlay like the
     // notifications drawer; Rust syncs these values when it opens.
     in-out property <bool> diag-open: false;
@@ -278,12 +300,26 @@ export component MainWindow inherits Window {
     callback extras-led-brightness-edited(string);
     callback extras-led-color(int);
     callback settings-action(string);
+    // H4 (v2.0.2): the Settings address field fires this on Enter
+    // with the typed value — the old address-changed(string) carried
+    // no payload and fired per keystroke, so Rust could never save
+    // it. Rust wiring pending (FC: on_address_accepted).
+    callback address-accepted(string);
+    // M-7 (v2.0.2): the "Keep running in tray" switch fires this
+    // with the NEW state — settings-action("tray") drops the payload.
+    // Rust wiring pending (FC: on_keep_tray_selected).
+    callback keep-tray-selected(bool);
     callback settings-use-profile(int);
     callback settings-duplicate-profile(int);
     callback transport-selected(int);
     callback output-backend-selected(int);
     callback autostart-selected(bool);
     callback run-setup-again();
+    // H2 (v2.0.2): the Overview "Pair now" banner fires this — Rust
+    // opens the wizard at the Pair step (open_pair_wizard). The old
+    // handler just switched to the Settings page (a dead end).
+    // Rust wiring pending (FC: on_pair_now_requested).
+    callback pair-now-requested();
     callback tile-selected(int);
     callback action-chip(string);
     callback open-diagnostics();
@@ -294,6 +330,11 @@ export component MainWindow inherits Window {
     callback popover-new-profile();
     callback popover-duplicate(int);
     callback popover-rename(int);
+    // M1 (v2.0.2): free-text rename — the popover's rename input
+    // fires this with the selected row + the typed name. The old
+    // popover-rename(int) renames to the linked game's name (no text
+    // input existed). Rust wiring pending (FC).
+    callback popover-rename-confirmed(int, string);
     callback popover-delete(int);
     callback popover-link(int);
     callback popover-save-switch();
@@ -468,6 +509,7 @@ export component MainWindow inherits Window {
                 brake: brake;
                 clutch: clutch;
                 daemon-live: daemon-live;
+                daemon-error: daemon-error;
                 connected: connected;
                 paired: paired;
                 firmware-line: firmware-line;
@@ -485,7 +527,8 @@ export component MainWindow inherits Window {
                 open-diagnostics => { open-diagnostics(); }
                 reconnect => { reconnect(); }
                 open-profile-popover => { profile-clicked(); }
-                pair-now => { page = 5; }
+                // H2: open the Pair wizard, don't just show Settings.
+                pair-now => { pair-now-requested(); }
             }
             if page == 1 : SteeringPage {
                 input-pct: input-pct;
@@ -604,6 +647,12 @@ export component MainWindow inherits Window {
                 led-brightness-text: led-brightness-text;
                 led-color: led-color;
                 led-preview: led-preview;
+                // H-7: module switches are two-way window props, so
+                // Rust can revert them when a toggle fails.
+                handbrake-on <=> extras-handbrake-on;
+                shifter-on <=> extras-shifter-on;
+                horn-on <=> extras-horn-on;
+                leds-on <=> extras-leds-on;
                 action(a) => { extras-action(a); }
                 handbrake-mode-selected(i) => { extras-handbrake-mode(i); }
                 handbrake-feel-selected(f) => { extras-handbrake-feel(f); }
@@ -620,9 +669,12 @@ export component MainWindow inherits Window {
                 // Two-way bindings: the screen edits these, Rust
                 // reverts them on a failed backend call (A9/A10).
                 connection-type <=> transport;
-                address: "rsh.local";
+                // L-2: the live board address, never a hardcoded
+                // default — "—" until Rust sets setup-address.
+                address: setup-address == "" ? "—" : setup-address;
                 backend <=> controller;
                 start-with-windows <=> autostart-enabled;
+                keep-in-tray <=> keep-in-tray;
                 // Theme is 0 Dark / 1 Light / 2 Auto on both sides now
                 // (v2.0.2, A8) — the screen passes the index straight
                 // through and Rust persists it ("Dark"/"Light"/"Auto").
@@ -633,17 +685,25 @@ export component MainWindow inherits Window {
                 app-update-text: app-update-text;
                 backup-text: backup-text;
                 connection-selected(i) => { transport-selected(i); }
-                address-changed(a) => { settings-action("address"); }
+                // H4: Enter in the address field sends the typed
+                // value (the old per-keystroke address-changed
+                // carried no payload, so Rust could never save it).
+                address-accepted(a) => { address-accepted(a); }
                 reconnect => { reconnect(); }
                 pair-requested => { settings-action("pair"); }
                 backend-selected(i) => { output-backend-selected(i); }
                 toggled-start-windows(b) => { autostart-selected(b); }
-                toggled-keep-tray(b) => { settings-action("tray"); }
+                // M-7: forward the new switch state, don't drop it.
+                toggled-keep-tray(b) => { keep-tray-selected(b); }
                 theme-selected(i) => { theme = i; theme-persist(i); }
                 new-profile => { settings-action("new-profile"); }
                 use-profile(i) => { settings-use-profile(i); }
                 duplicate-profile(i) => { settings-duplicate-profile(i); }
                 check-firmware => { settings-action("check-firmware"); }
+                // H-4: the firmware flash job (Rust arm already wired:
+                // settings-action("update-firmware") starts the job,
+                // progress is polled on the 1 Hz tick).
+                update-firmware => { settings-action("update-firmware"); }
                 check-app-updates => { settings-action("update-check"); }
                 backup => { settings-action("backup"); }
                 restore => { settings-action("restore"); }
@@ -718,6 +778,7 @@ export component MainWindow inherits Window {
         new-profile => { popover-new-profile(); }
         duplicate-selected(i) => { popover-duplicate(i); }
         rename-selected(i) => { popover-rename(i); }
+        rename-confirmed(i, t) => { popover-rename-confirmed(i, t); }
         delete-selected(i) => { popover-delete(i); }
         link-selected(i) => { popover-link(i); }
         save-and-switch => { popover-save-switch(); }
@@ -765,6 +826,64 @@ export component MainWindow inherits Window {
         buttons-pressed: diag-buttons-pressed;
         events: diag-events;
         closed => { diag-open = false; }
+    }
+    // B5 (v2.0.2): global busy strip — one bar, bottom-anchored, on
+    // every screen (it is a direct child of the root FocusScope, so
+    // it also shows over the setup wizard). Rust drives `busy` /
+    // `busy-label` from busy_jobs; while a job runs the strip is
+    // visible with a spinner + the job's label, and it vanishes the
+    // moment the job finishes or times out — no infinite loading.
+    if busy : Rectangle {
+        x: 0px;
+        y: parent.height - 38px;
+        width: parent.width;
+        height: 38px;
+        background: Theme.panel;
+        Rectangle { y: 0px; width: 100%; height: 1px; background: Theme.line; }
+        HorizontalLayout {
+            y: 11px;
+            height: 16px;
+            width: parent.width;
+            padding-left: 20px;
+            padding-right: 20px;
+            spacing: 10px;
+            // Spinner: a ring with one accent dot orbiting it. The
+            // dot's position is a plain x/y binding off spin-step
+            // (Timer-driven), so it animates in every renderer.
+            // (transform-rotation was tried first: it compiles, but
+            // the dot does not move under the testing backend's
+            // software renderer — probe-verified 2026-11-17 — so the
+            // spinner does not rely on it.)
+            Rectangle {
+                width: 16px;
+                height: 16px;
+                border-radius: 8px;
+                border-width: 1.5px;
+                border-color: Theme.line;
+                property <angle> dot-angle: spin-step * 30deg - 90deg;
+                Rectangle {
+                    x: 6px + 5.5px * Math.cos(dot-angle);
+                    y: 5.5px + 5.5px * Math.sin(dot-angle);
+                    width: 4px;
+                    height: 5px;
+                    border-radius: 2px;
+                    background: Theme.accent;
+                }
+            }
+            Text {
+                vertical-alignment: center;
+                text: busy-label == "" ? "Working…" : busy-label;
+                font-size: 12.5px;
+                font-weight: 600;
+                color: Theme.text;
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Timer {
+            interval: 90ms;
+            running: true;
+            triggered => { spin-step = spin-step >= 11 ? 0 : spin-step + 1; }
+        }
     }
     }
 }
