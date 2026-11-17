@@ -597,9 +597,22 @@ fn resolve_game_id(api: &DaemonApi, key: &str) -> Option<String> {
 /// loop returns; with no event loop running (headless park,
 /// `--check`) the quit call is a harmless no-op and the main thread
 /// exits on the shutdown flag instead.
-fn signal_ipc_fatal_shutdown(data_dir: &std::path::Path, detail: &str, shutdown: &Arc<AtomicBool>) {
+///
+/// F24: the signal also sets `ipc_fatal`, so `main` can exit(1)
+/// AFTER that teardown — the `DaemonHung` path exits 1, and a fatal
+/// bind must too (the rig's `gate-ipc-bind-failure` asserts it).
+/// A clean SIGTERM/quit never sets it, so a clean shutdown still
+/// exits 0. The exit-code decision lives in `main`, never in a
+/// background task (F2's rule stands).
+fn signal_ipc_fatal_shutdown(
+    data_dir: &std::path::Path,
+    detail: &str,
+    shutdown: &Arc<AtomicBool>,
+    ipc_fatal: &Arc<AtomicBool>,
+) {
     write_daemon_status(data_dir, "fatal", "IpcBindFailed", detail);
     let _ = log_fatal(&format!("daemon: {detail}"));
+    ipc_fatal.store(true, Ordering::Relaxed);
     shutdown.store(true, Ordering::Relaxed);
     let _ = slint::quit_event_loop();
 }
@@ -687,6 +700,7 @@ async fn serve_ipc(
     data_dir: &std::path::Path,
     verbose: bool,
     shutdown: Arc<AtomicBool>,
+    ipc_fatal: Arc<AtomicBool>,
 ) {
     let path = socket_path(data_dir);
     // A bind can fail transiently (the data dir is still being
@@ -727,7 +741,7 @@ async fn serve_ipc(
                         "daemon IPC bind failed after 5 attempts (socket was {}) — the daemon cannot serve the UI",
                         path.display()
                     );
-                    signal_ipc_fatal_shutdown(data_dir, &detail, &shutdown);
+                    signal_ipc_fatal_shutdown(data_dir, &detail, &shutdown, &ipc_fatal);
                     return;
                 }
             },
@@ -745,6 +759,7 @@ async fn create_pipe_listener(
     data_dir: &std::path::Path,
     verbose: bool,
     shutdown: &Arc<AtomicBool>,
+    ipc_fatal: &Arc<AtomicBool>,
     tracker: &mut IpcBindTracker,
 ) -> Option<tokio::net::windows::named_pipe::NamedPipeServer> {
     use tokio::net::windows::named_pipe::ServerOptions;
@@ -792,6 +807,7 @@ async fn create_pipe_listener(
                             data_dir,
                             "daemon IPC bind failed after 5 attempts — the daemon cannot serve the UI",
                             shutdown,
+                            ipc_fatal,
                         );
                         return None;
                     }
@@ -808,6 +824,7 @@ async fn serve_ipc(
     data_dir: &std::path::Path,
     verbose: bool,
     shutdown: Arc<AtomicBool>,
+    ipc_fatal: Arc<AtomicBool>,
 ) {
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     let mut tracker = IpcBindTracker::new();
@@ -835,8 +852,15 @@ async fn serve_ipc(
         let pipe = match listener.take() {
             Some(pipe) => pipe,
             None => {
-                match create_pipe_listener(first_create, data_dir, verbose, &shutdown, &mut tracker)
-                    .await
+                match create_pipe_listener(
+                    first_create,
+                    data_dir,
+                    verbose,
+                    &shutdown,
+                    &ipc_fatal,
+                    &mut tracker,
+                )
+                .await
                 {
                     Some(pipe) => pipe,
                     // Fatal signalled (or shutdown) inside.
@@ -1187,6 +1211,11 @@ fn main() {
     let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(256);
     let tray_actions: Arc<Mutex<Vec<TrayAction>>> = Arc::new(Mutex::new(Vec::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
+    // F24: set only by `signal_ipc_fatal_shutdown` (a fatal IPC
+    // bind) — `main` exits 1 for it after the teardown below, so a
+    // fatal bind reports like `DaemonHung` instead of exiting 0.
+    // A clean quit never sets it.
+    let ipc_fatal = Arc::new(AtomicBool::new(false));
 
     // Runtime thread: IPC server + manager loop.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1206,8 +1235,9 @@ fn main() {
         let server = Arc::clone(&ipc_server);
         let dir = data_dir.clone();
         let shutdown = Arc::clone(&shutdown);
+        let ipc_fatal = Arc::clone(&ipc_fatal);
         runtime.spawn(async move {
-            serve_ipc(server, &dir, verbose, shutdown).await;
+            serve_ipc(server, &dir, verbose, shutdown, ipc_fatal).await;
         });
     }
     {
@@ -1405,6 +1435,14 @@ fn main() {
     shutdown.store(true, Ordering::Relaxed);
     let _ = state.stop_engine();
     lock.release();
+    // F24: a fatal IPC bind exits 1 — but only AFTER the teardown
+    // above (tray removed, engine stopped, lock released), so F2's
+    // rule (no `process::exit(1)` from a background task) still
+    // holds and the exit code is decided here, in `main`. A clean
+    // SIGTERM/quit leaves `ipc_fatal` unset and exits 0.
+    if ipc_fatal.load(Ordering::Relaxed) {
+        std::process::exit(1);
+    }
 }
 
 /// The tray popup window + its visibility state. Lives on the Slint
@@ -1972,6 +2010,34 @@ mod tests {
             tracker.record_failure(false),
             IpcBindRetry::RetryAfter(_)
         ));
+    }
+
+    #[test]
+    fn ipc_fatal_shutdown_signals_both_flags_and_writes_fatal_status() {
+        // F24: the fatal-bind signal must set BOTH flags — the
+        // shutdown flag (main quits cleanly, F2) and the fatal flag
+        // (main exits 1 after teardown, like DaemonHung) — and
+        // write the machine-readable `IpcBindFailed` status. A
+        // test that only checked the shutdown flag would still pass
+        // with the old exit-0 behaviour.
+        let dir = temp_dir("ipc-fatal");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let ipc_fatal = Arc::new(AtomicBool::new(false));
+        signal_ipc_fatal_shutdown(&dir, "test detail", &shutdown, &ipc_fatal);
+        assert!(
+            shutdown.load(Ordering::Relaxed),
+            "main must be asked to quit"
+        );
+        assert!(
+            ipc_fatal.load(Ordering::Relaxed),
+            "F24: main must exit(1) for a fatal bind, not 0"
+        );
+        let text = std::fs::read_to_string(dir.join(DAEMON_STATUS_FILE)).expect("read status");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("status is valid JSON");
+        assert_eq!(value["status"], "fatal");
+        assert_eq!(value["code"], "IpcBindFailed");
+        assert_eq!(value["detail"], "test detail");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
