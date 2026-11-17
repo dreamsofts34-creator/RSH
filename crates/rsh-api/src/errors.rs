@@ -103,6 +103,12 @@ pub enum ConnectionError {
     AlreadyPaired,
     /// The board is unpaired, so there is no stored key to resume with.
     BoardUnpaired,
+    /// The board authenticated but then stopped streaming frames:
+    /// the heartbeat watchdog rebuilt the transport
+    /// [`MAX_WATCHDOG_REBUILDS`](crate::connection::MAX_WATCHDOG_REBUILDS)
+    /// times with no frame seen and latched (F20, v2.0.3). Not a
+    /// pairing problem — the fix is the user's Retry, not re-pairing.
+    WatchdogStall,
     /// Anything else (detail string carried separately, never a secret).
     Unknown,
 }
@@ -124,6 +130,7 @@ impl ConnectionError {
             Self::BindFailed(kind) => kind.code(),
             Self::AlreadyPaired => "AlreadyPaired",
             Self::BoardUnpaired => "BoardUnpaired",
+            Self::WatchdogStall => "WatchdogStall",
             Self::Unknown => "Unknown",
         }
     }
@@ -152,6 +159,7 @@ impl ConnectionError {
             "BindFailed" => Self::BindFailed(BindErrorKind::Other),
             "AlreadyPaired" => Self::AlreadyPaired,
             "BoardUnpaired" => Self::BoardUnpaired,
+            "WatchdogStall" => Self::WatchdogStall,
             "Unknown" => Self::Unknown,
             _ => return None,
         })
@@ -180,6 +188,9 @@ impl ConnectionError {
             Self::BindFailed(kind) => kind.hint(),
             Self::AlreadyPaired => "Wheel is already paired — no need to pair again.",
             Self::BoardUnpaired => "Wheel is not paired yet — pair it first.",
+            Self::WatchdogStall => {
+                "The wheel connected but stopped sending data — rebuilding did not help. Check the wheel, then press Retry."
+            }
             Self::Unknown => "Something went wrong — retry, then check the diagnostics log.",
         }
     }
@@ -252,6 +263,9 @@ impl UserError {
                 ConnectionError::BindFailed(_) => "The wheel port could not be opened.".to_string(),
                 ConnectionError::AlreadyPaired => "The wheel is already paired.".to_string(),
                 ConnectionError::BoardUnpaired => "The wheel is not paired yet.".to_string(),
+                ConnectionError::WatchdogStall => {
+                    "The wheel connected but stopped sending data.".to_string()
+                }
                 ConnectionError::Unknown => "Something went wrong.".to_string(),
             },
             what_to_do: error.hint().to_string(),
@@ -284,6 +298,7 @@ mod tests {
             ConnectionError::BindFailed(BindErrorKind::Other),
             ConnectionError::AlreadyPaired,
             ConnectionError::BoardUnpaired,
+            ConnectionError::WatchdogStall,
             ConnectionError::Unknown,
         ] {
             assert_eq!(

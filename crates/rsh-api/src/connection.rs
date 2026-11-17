@@ -23,7 +23,10 @@
 //!   only be closed by the user) but is NOT a pairing reason, so
 //!   it surfaces as a plain `Error`, never "Pairing needed".
 //! * Heartbeat watchdog (C-04): no stream/status frame for 2 s in
-//!   `Active` → transport rebuild + re-activate.
+//!   `Active` → transport rebuild + re-activate. F20: capped at
+//!   [`MAX_WATCHDOG_REBUILDS`] consecutive frameless rebuilds, then
+//!   the manager latches `Error(WatchdogStall)` with no retry timer
+//!   (user Retry required) — only a real frame resets the count.
 //! * HELLO wait (C-03): 750 ms per attempt (above the firmware's
 //!   500 ms reply limiter), 3 attempts.
 //! * Resume fail `BadTag` (C-13): one retry after 10 s with the
@@ -49,6 +52,15 @@ pub const HELLO_ATTEMPTS: u32 = 3;
 /// in `Active` means the board is gone (reboot / Wi-Fi drop) — the
 /// transport is rebuilt and the session re-activated.
 pub const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(2);
+/// Watchdog rebuild cap (F20, v2.0.3): at most this many
+/// consecutive watchdog rebuilds with no stream frame seen, then
+/// the manager latches `Error(WatchdogStall)` with no retry timer
+/// instead of rebuilding forever. Same count as F1's 5-attempt IPC
+/// fatal and F3's 5-spawn budget. Only a real frame
+/// ([`ConnEvent::FrameSeen`]) resets the count — `CapsOk` must NOT:
+/// it resets `consecutive_failures`, which is exactly why the
+/// pre-F20 rebuild loop never backed off and never stopped.
+pub const MAX_WATCHDOG_REBUILDS: u32 = 5;
 /// `BadTag` resume retry (C-13): one retry after this delay — the
 /// firmware rejects a new session for 10 s after an authenticated
 /// one (F-05).
@@ -200,6 +212,11 @@ pub struct ConnectionManager {
     bad_tag_retried: bool,
     /// Last stream/status frame seen (heartbeat, C-04).
     last_frame_at: Option<Instant>,
+    /// Consecutive watchdog rebuilds with no frame seen (F20):
+    /// reset only by [`ConnEvent::FrameSeen`], a fresh
+    /// [`ConnEvent::Connect`]/[`ConnEvent::UserRetry`], or
+    /// [`ConnEvent::Disconnect`].
+    watchdog_rebuilds: u32,
     /// Absolute deadline of the current backoff (`None` when not backing off).
     backoff_until: Option<Instant>,
     /// Transition log lines, drained by the driver (one per
@@ -219,6 +236,7 @@ impl ConnectionManager {
             hello_attempts: 0,
             bad_tag_retried: false,
             last_frame_at: None,
+            watchdog_rebuilds: 0,
             backoff_until: None,
             log_lines: Vec::new(),
             changed: false,
@@ -235,6 +253,14 @@ impl ConnectionManager {
     #[must_use]
     pub const fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
+    }
+
+    /// Consecutive watchdog rebuilds with no frame seen (F20, test
+    /// visibility): reaches [`MAX_WATCHDOG_REBUILDS`] exactly when
+    /// the manager latches `Error(WatchdogStall)`.
+    #[must_use]
+    pub const fn watchdog_rebuilds(&self) -> u32 {
+        self.watchdog_rebuilds
     }
 
     /// Absolute instant the current backoff ends (`None` when not
@@ -281,6 +307,11 @@ impl ConnectionManager {
         match event {
             ConnEvent::FrameSeen => {
                 self.last_frame_at = Some(now);
+                // F20: a real frame is the only proof the session is
+                // alive — it clears the frameless-rebuild count, so
+                // a session that streams (even with transient
+                // silences) never latches.
+                self.watchdog_rebuilds = 0;
                 ManagerAction::None
             }
             ConnEvent::Connect => {
@@ -290,6 +321,7 @@ impl ConnectionManager {
                 ) {
                     self.consecutive_failures = 0;
                     self.bad_tag_retried = false;
+                    self.watchdog_rebuilds = 0;
                     self.transition(ConnectionState::LinkUp, now);
                     return ManagerAction::RequestHello;
                 }
@@ -384,6 +416,7 @@ impl ConnectionManager {
                 if matches!(self.state, ConnectionState::Error { .. }) {
                     self.consecutive_failures = 0;
                     self.bad_tag_retried = false;
+                    self.watchdog_rebuilds = 0;
                     self.transition(ConnectionState::LinkUp, now);
                     return ManagerAction::RequestHello;
                 }
@@ -392,6 +425,7 @@ impl ConnectionManager {
             ConnEvent::Disconnect => {
                 self.consecutive_failures = 0;
                 self.bad_tag_retried = false;
+                self.watchdog_rebuilds = 0;
                 self.last_frame_at = None;
                 self.backoff_until = None;
                 self.transition(ConnectionState::Idle, now);
@@ -404,6 +438,17 @@ impl ConnectionManager {
     /// `Active` with no frame for `WATCHDOG_TIMEOUT`, the transport
     /// is rebuilt and the session re-activated. Returns the action
     /// (or `None` when healthy).
+    ///
+    /// F20: the rebuild is capped — after
+    /// [`MAX_WATCHDOG_REBUILDS`] consecutive rebuilds with no frame
+    /// seen, the manager latches `Error(WatchdogStall)` (no retry
+    /// timer, user Retry required) instead of rebuilding forever.
+    /// `CapsOk` resets `consecutive_failures` but deliberately NOT
+    /// `watchdog_rebuilds`: a board that authenticates yet never
+    /// streams would otherwise rebuild at a fixed 2 s cadence
+    /// forever, and — worse — so would a healthy session, because
+    /// nothing fed [`ConnEvent::FrameSeen`] before F20 (the daemon
+    /// now feeds it from the core's stream-frame clock).
     pub fn check_watchdog(&mut self, now: Instant) -> ManagerAction {
         if !self.state.is_active() {
             return ManagerAction::None;
@@ -414,9 +459,28 @@ impl ConnectionManager {
                 now.saturating_duration_since(at)
             });
         if silent_for >= WATCHDOG_TIMEOUT {
+            self.watchdog_rebuilds = self.watchdog_rebuilds.saturating_add(1);
+            if self.watchdog_rebuilds >= MAX_WATCHDOG_REBUILDS {
+                self.log_lines.push(format!(
+                    "[WARN connection] heartbeat watchdog: {} consecutive rebuilds with no stream frame — latching WatchdogStall, user retry required",
+                    self.watchdog_rebuilds
+                ));
+                self.backoff_until = None;
+                self.transition(
+                    ConnectionState::Error {
+                        reason: ConnectionError::WatchdogStall,
+                        hint: ConnectionError::WatchdogStall.hint().to_string(),
+                        retry_in_ms: None,
+                    },
+                    now,
+                );
+                return ManagerAction::StateChanged;
+            }
             self.log_lines.push(format!(
-                "[WARN connection] heartbeat watchdog: no stream/status for {} ms in Active — rebuilding transport + re-activating",
-                silent_for.as_millis()
+                "[WARN connection] heartbeat watchdog: no stream/status for {} ms in Active — rebuilding transport + re-activating (frameless rebuild {}/{})",
+                silent_for.as_millis(),
+                self.watchdog_rebuilds,
+                MAX_WATCHDOG_REBUILDS
             ));
             self.consecutive_failures = self.consecutive_failures.saturating_add(1);
             let wait = Self::backoff_delay(self.consecutive_failures.max(1));
@@ -720,6 +784,114 @@ mod tests {
             ManagerAction::RebuildTransport
         );
         assert!(matches!(m.state(), ConnectionState::Backoff { .. }));
+    }
+
+    /// Drive one watchdog rebuild + the daemon driver's
+    /// re-activation (`RetryTimer` → `LinkUp` → `HELLO` → `CapsOk` →
+    /// `Active`) at `t`. `t` must be ≥2 s after the last `CapsOk` /
+    /// frame or the watchdog will not have fired yet.
+    fn reactivate_after_watchdog(m: &mut ConnectionManager, t: Instant) {
+        assert_eq!(
+            m.on_event(ConnEvent::RetryTimer, t),
+            ManagerAction::RequestHello,
+            "backoff must end in a re-activation attempt"
+        );
+        m.on_event(
+            ConnEvent::HelloReceived {
+                unpaired: false,
+                window_open: false,
+            },
+            t,
+        );
+        m.on_event(ConnEvent::CapsOk, t);
+        assert!(m.state().is_active(), "re-activation must reach Active");
+    }
+
+    #[test]
+    fn watchdog_latches_after_five_frameless_rebuilds() {
+        // F20: pre-fix, this loop ran forever — every re-activation
+        // passes through CapsOk, which resets `consecutive_failures`,
+        // so the backoff never grew past 2 s and nothing ever
+        // stopped the rebuild cycle (transport rebind + HELLO +
+        // GET_CAPS every ~4 s, healthy session included, because
+        // nothing fed FrameSeen at all).
+        let mut m = active_manager();
+        let mut t = now();
+        for rebuild in 1..=MAX_WATCHDOG_REBUILDS {
+            t += Duration::from_secs(3);
+            let action = m.check_watchdog(t);
+            if rebuild < MAX_WATCHDOG_REBUILDS {
+                assert_eq!(
+                    action,
+                    ManagerAction::RebuildTransport,
+                    "rebuild {rebuild} must still rebuild"
+                );
+                assert_eq!(m.watchdog_rebuilds(), rebuild);
+                reactivate_after_watchdog(&mut m, t);
+            } else {
+                assert_eq!(
+                    action,
+                    ManagerAction::StateChanged,
+                    "the 5th frameless rebuild must latch, not rebuild"
+                );
+                assert_eq!(m.watchdog_rebuilds(), MAX_WATCHDOG_REBUILDS);
+                assert!(
+                    matches!(
+                        m.state(),
+                        ConnectionState::Error {
+                            reason: ConnectionError::WatchdogStall,
+                            retry_in_ms: None,
+                            ..
+                        }
+                    ),
+                    "latched state must be Error(WatchdogStall) with no auto-retry: {:?}",
+                    m.state()
+                );
+                assert_eq!(m.retry_due_at(), None, "latched: no retry timer is armed");
+            }
+        }
+        // Latched: further silence fires nothing, so the driver
+        // never rebuilds again on its own.
+        t += Duration::from_secs(30);
+        assert_eq!(m.check_watchdog(t), ManagerAction::None);
+        // A manual retry gets a fresh budget.
+        assert_eq!(
+            m.on_event(ConnEvent::UserRetry, t),
+            ManagerAction::RequestHello
+        );
+        assert_eq!(m.watchdog_rebuilds(), 0);
+    }
+
+    #[test]
+    fn frame_seen_resets_watchdog_rebuild_count() {
+        let mut m = active_manager();
+        let mut t = now();
+        // 4 frameless rebuilds — one short of the latch.
+        for _ in 0..(MAX_WATCHDOG_REBUILDS - 1) {
+            t += Duration::from_secs(3);
+            assert_eq!(m.check_watchdog(t), ManagerAction::RebuildTransport);
+            reactivate_after_watchdog(&mut m, t);
+        }
+        assert_eq!(m.watchdog_rebuilds(), MAX_WATCHDOG_REBUILDS - 1);
+        // One real frame clears the count: the next 4 rebuilds must
+        // NOT latch (without the reset, the very next one would).
+        m.on_event(ConnEvent::FrameSeen, t);
+        assert_eq!(m.watchdog_rebuilds(), 0);
+        for _ in 0..(MAX_WATCHDOG_REBUILDS - 1) {
+            t += Duration::from_secs(3);
+            assert_eq!(m.check_watchdog(t), ManagerAction::RebuildTransport);
+            reactivate_after_watchdog(&mut m, t);
+        }
+        // ... and the 5th rebuild after the reset latches.
+        t += Duration::from_secs(3);
+        assert_eq!(m.check_watchdog(t), ManagerAction::StateChanged);
+        assert!(matches!(
+            m.state(),
+            ConnectionState::Error {
+                reason: ConnectionError::WatchdogStall,
+                ..
+            }
+        ));
     }
 
     #[test]

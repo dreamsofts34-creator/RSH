@@ -409,7 +409,13 @@ async fn manager_loop(
         }
         last_active = active_now;
         // Heartbeat watchdog (C-04): 2 s silence in Active →
-        // rebuild + re-activate.
+        // rebuild + re-activate. F20: the rebuild is capped inside
+        // `check_watchdog` (5 frameless rebuilds latch
+        // `Error(WatchdogStall)`, which returns `StateChanged`,
+        // not `RebuildTransport`, so this branch simply does not
+        // run for a latched manager) and the tick is fed real frame
+        // freshness by `DaemonApi::watchdog_tick` — a healthy
+        // session never reaches this branch at all.
         if gate && api.watchdog_tick() == ManagerAction::RebuildTransport {
             log_line(
                 verbose,
