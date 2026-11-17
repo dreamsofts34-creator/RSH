@@ -92,9 +92,14 @@ fn pid_file_path(data_dir: &std::path::Path) -> PathBuf {
 /// Record our pid in the pid file (F22, Windows First path; also
 /// the Linux lock file — see [`acquire`]).
 ///
+/// Only used by the Windows `acquire` and by tests: on Linux the
+/// production path uses [`claim_pid_file`] instead, so without the
+/// cfg this is dead code there (`-D warnings` fails the gate).
+///
 /// # Errors
 ///
 /// Returns the write error when the pid file cannot be written.
+#[cfg(any(test, windows))]
 fn write_pid_file(data_dir: &std::path::Path) -> std::io::Result<PathBuf> {
     let path = pid_file_path(data_dir);
     let _ = std::fs::create_dir_all(data_dir);
@@ -425,7 +430,7 @@ mod tests {
                 let dir = dir.clone();
                 let wins = Arc::clone(&wins);
                 handles.push(std::thread::spawn(move || {
-                    if matches!(claim_pid_file(&dir), Ok(_)) {
+                    if claim_pid_file(&dir).is_ok() {
                         wins.fetch_add(1, Ordering::SeqCst);
                     }
                 }));
