@@ -519,6 +519,26 @@ impl IpcApi {
         UserError::from_connection(ConnectionError::TransportClosed, "daemon IPC link failed")
     }
 
+    /// Build the [`UserError`] for a failed session `connect`
+    /// (F26): the daemon's `IpcError::Api` payload carries its
+    /// `UserError` code first (`"{code}: daemon API error: {code}"`
+    /// — see `IpcClient::call_once`), so a no-board `Unreachable`
+    /// comes back typed instead of collapsing into
+    /// `TransportClosed` (which used to notify "Reconnect failed"
+    /// on every no-board (re)connect). An unrecognised payload is
+    /// still the generic link failure — only the daemon's own typed
+    /// reason is preserved, nothing is invented.
+    fn daemon_connect_error(payload: &str) -> UserError {
+        let code = payload
+            .split(": daemon API error: ")
+            .next()
+            .unwrap_or(payload);
+        match ConnectionError::from_code(code) {
+            Some(error) => UserError::from_connection(error, payload.to_string()),
+            None => Self::ipc_failed(),
+        }
+    }
+
     fn lost_connection() -> ConnectionInfo {
         ConnectionInfo {
             state: ConnectionState::Error {
@@ -738,6 +758,9 @@ impl AppApi for IpcApi {
                 self.request_slow_refresh();
                 Ok(info)
             }
+            // F26: keep the daemon's typed reason (a no-board
+            // `Unreachable` must not become `TransportClosed`).
+            Err(IpcError::Api(payload)) => Err(Self::daemon_connect_error(&payload)),
             Err(_) => Err(Self::ipc_failed()),
         }
     }
@@ -2145,6 +2168,29 @@ mod tests {
         assert_eq!(
             detail(&IpcError::Io("socket gone".to_string())),
             "RSH isn't running — reconnect to capture."
+        );
+    }
+
+    #[test]
+    fn daemon_connect_error_keeps_unreachable_instead_of_transport_closed() {
+        // F26: the daemon's no-board verdict arrives as
+        // `IpcError::Api("Unreachable: daemon API error:
+        // Unreachable")` — it must stay `Unreachable`, not
+        // collapse into `TransportClosed` (which is what every
+        // no-board (re)connect used to notify as "Reconnect
+        // failed"). A real typed reason survives too; an
+        // unrecognised daemon code stays the generic link failure.
+        let error = IpcApi::daemon_connect_error("Unreachable: daemon API error: Unreachable");
+        assert_eq!(error.code, "Unreachable");
+        assert_eq!(error.title, "Unreachable");
+        let error = IpcApi::daemon_connect_error("BadTag: daemon API error: BadTag");
+        assert_eq!(error.code, "BadTag");
+        let error = IpcApi::daemon_connect_error("AddrInUse: daemon API error: AddrInUse");
+        assert_eq!(error.code, "AddrInUse");
+        let error = IpcApi::daemon_connect_error("NoSuchCode: daemon API error: NoSuchCode");
+        assert_eq!(
+            error.code, "TransportClosed",
+            "an unrecognised daemon code stays the generic link failure"
         );
     }
 

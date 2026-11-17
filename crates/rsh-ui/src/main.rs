@@ -62,9 +62,9 @@ use std::time::{Duration, Instant};
 use rsh_api::connection::ConnectionState;
 use rsh_api::pairing::countdown_ring_commands;
 use rsh_api::{
-    app_version, ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionInfo, FirmwareCheck,
-    FirmwareUpdateStatus, GameSummary, LedPattern, PairingInfo, ProfileSummary, ShifterGate,
-    SnapshotInfo, TuningSettings, UserError,
+    app_version, ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionError, ConnectionInfo,
+    FirmwareCheck, FirmwareUpdateStatus, GameSummary, LedPattern, PairingInfo, ProfileSummary,
+    ShifterGate, SnapshotInfo, TuningSettings, UserError,
 };
 use slint::{Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
@@ -2810,7 +2810,14 @@ impl Ctx {
         // The session `connect` already ran on the seed job's
         // thread — report its verdict here.
         if let Err(e) = seed.connect {
-            self.notify(win, "Connection", "Reconnect failed", &e.title);
+            // F26: `Unreachable` (no board) is the expected
+            // disconnected state, not a failure to report — the
+            // Overview already shows it, and notifying on every
+            // no-board (re)connect is spam. Anything else (a real
+            // transport failure, `Unknown`, …) still notifies.
+            if e.code != ConnectionError::Unreachable.code() {
+                self.notify(win, "Connection", "Reconnect failed", &e.title);
+            }
             eprintln!("RSH-UI reconnect failed: {} ({})", e.code, e.title);
         }
         // An already-open pairing window / Active session at
@@ -7933,6 +7940,123 @@ mod tests {
             last_body()
         );
         assert_eq!(ctx.flap_count.get(), 0, "count resets after folding");
+
+        // Teardown: `mark_dead` drops the live link (F7) so the
+        // server thread ends when the client goes away.
+        ctx.mark_dead(&win);
+        drop(live_api);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ctx_dir);
+    }
+
+    /// F26: a seed whose session `connect` failed with
+    /// `Unreachable` (no board — the expected disconnected state)
+    /// must not notify "Reconnect failed"; a real transport
+    /// failure still must. The flap-suppressed setup keeps the
+    /// "RSH connected" notify out of the count, so the only
+    /// notify under test is the Reconnect-failed one.
+    #[test]
+    #[cfg(unix)]
+    fn reconnect_seed_unreachable_stays_silent_but_transport_closed_notifies() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("F26 gate test skipped: no usable display/backend");
+            return;
+        };
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-f26-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let server = Arc::new(rsh_ipc::IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let live_api = IpcApi::connect(&sock).expect("connect");
+        let (ctx, ctx_dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+        let last_title = || {
+            ctx.notifications
+                .borrow()
+                .to_model_items()
+                .into_iter()
+                .next_back()
+                .map(|item| item.title.as_str().to_string())
+                .unwrap_or_default()
+        };
+        let seed_with = |connect: Result<ConnectionInfo, UserError>| crate::ipc_api::LiveSeed {
+            backend: "vJoy".to_string(),
+            autostart: true,
+            connect,
+            pairing: PairingInfo {
+                seconds_left: 0,
+                password: None,
+                error: None,
+                error_detail: None,
+                board_mac: None,
+                replacement_required: false,
+                key_reset_armed: false,
+            },
+            connection_active: false,
+        };
+
+        // Flap setup: down 5 s ago — the "RSH connected" notify
+        // is suppressed, so only a Reconnect-failed notify could
+        // move the count.
+        ctx.state.borrow_mut().live = true;
+        ctx.down_since.set(Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .expect("5 s ago exists"),
+        ));
+        let before = unread();
+        ctx.swap_to_live(live_api.clone());
+        ctx.apply_reconnect_seed(
+            &win,
+            live_api.clone(),
+            seed_with(Err(UserError::from_connection(
+                ConnectionError::Unreachable,
+                "no board answered",
+            ))),
+        );
+        assert_eq!(
+            unread(),
+            before,
+            "a no-board reconnect must not notify 'Reconnect failed'"
+        );
+
+        ctx.apply_reconnect_seed(
+            &win,
+            live_api.clone(),
+            seed_with(Err(UserError::from_connection(
+                ConnectionError::TransportClosed,
+                "link dropped",
+            ))),
+        );
+        assert_eq!(
+            unread(),
+            before + 1,
+            "a real transport failure must notify once"
+        );
+        assert_eq!(last_title(), "Reconnect failed");
 
         // Teardown: `mark_dead` drops the live link (F7) so the
         // server thread ends when the client goes away.

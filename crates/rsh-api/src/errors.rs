@@ -128,6 +128,35 @@ impl ConnectionError {
         }
     }
 
+    /// Parse a [`ConnectionError::code`] back into the typed error
+    /// (F26): the daemon's IPC error carries only the code string,
+    /// so the UI recovers the kind from it instead of collapsing
+    /// every failure into `TransportClosed`. `None` for codes this
+    /// type never produces (feature codes, typos). `BindFailed`
+    /// codes are the [`BindErrorKind`] codes (`AddrInUse`,
+    /// `PermissionDenied`, `NoInterface`, `BindFailed`).
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "Unreachable" => Self::Unreachable,
+            "WindowClosed" => Self::WindowClosed,
+            "WindowExpired" => Self::WindowExpired,
+            "NoStoredKey" => Self::NoStoredKey,
+            "StoredKeyExists" => Self::StoredKeyExists,
+            "BadTag" => Self::BadTag,
+            "Timeout" => Self::Timeout,
+            "TransportClosed" => Self::TransportClosed,
+            "AddrInUse" => Self::BindFailed(BindErrorKind::AddrInUse),
+            "PermissionDenied" => Self::BindFailed(BindErrorKind::PermissionDenied),
+            "NoInterface" => Self::BindFailed(BindErrorKind::NoInterface),
+            "BindFailed" => Self::BindFailed(BindErrorKind::Other),
+            "AlreadyPaired" => Self::AlreadyPaired,
+            "BoardUnpaired" => Self::BoardUnpaired,
+            "Unknown" => Self::Unknown,
+            _ => return None,
+        })
+    }
+
     /// One-line "what to do" for the UI.
     #[must_use]
     pub const fn hint(self) -> &'static str {
@@ -228,5 +257,43 @@ impl UserError {
             what_to_do: error.hint().to_string(),
             detail: Some(detail.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_error_code_round_trips_through_from_code() {
+        // F26: every code `code()` produces must parse back to the
+        // same error — the UI recovers the kind from the daemon's
+        // bare code string over IPC.
+        for error in [
+            ConnectionError::Unreachable,
+            ConnectionError::WindowClosed,
+            ConnectionError::WindowExpired,
+            ConnectionError::NoStoredKey,
+            ConnectionError::StoredKeyExists,
+            ConnectionError::BadTag,
+            ConnectionError::Timeout,
+            ConnectionError::TransportClosed,
+            ConnectionError::BindFailed(BindErrorKind::AddrInUse),
+            ConnectionError::BindFailed(BindErrorKind::PermissionDenied),
+            ConnectionError::BindFailed(BindErrorKind::NoInterface),
+            ConnectionError::BindFailed(BindErrorKind::Other),
+            ConnectionError::AlreadyPaired,
+            ConnectionError::BoardUnpaired,
+            ConnectionError::Unknown,
+        ] {
+            assert_eq!(
+                ConnectionError::from_code(error.code()),
+                Some(error),
+                "code {} must round-trip",
+                error.code()
+            );
+        }
+        assert_eq!(ConnectionError::from_code("NoSuchCode"), None);
+        assert_eq!(ConnectionError::from_code(""), None);
     }
 }
