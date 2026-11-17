@@ -66,6 +66,12 @@ use crate::watchdog::Watchdog;
 
 /// Tick period: 5 ms = 200 Hz (SW-R3.1).
 pub const TICK_INTERVAL: Duration = Duration::from_millis(5);
+/// Parked tick period (DS-31): 100 ms = 10 Hz, while no source is
+/// live. The engine still drains plan/status/ping, sends the 1 s
+/// ping, and retries a reconnect on schedule — it just stops waking
+/// 200×/s to do nothing. Restored to 5 ms the moment a source is
+/// live again.
+pub const PARKED_TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// Reconnect cadence after the source drops: try again every 2 s.
 pub const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 /// Ping cadence: one NTP-style ping request per second.
@@ -539,7 +545,9 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
     /// Run the 200 Hz loop until stopped, then return the final
     /// [`EngineReport`]. Never panics on bad input and never dies on
     /// a source/sink error: errors are counted, output goes neutral,
-    /// and the loop keeps ticking.
+    /// and the loop keeps ticking. While no source is live the loop
+    /// parks at 10 Hz (DS-31) — the stop watch still wakes it at
+    /// once, so `stop()` is never delayed by the parked sleep.
     pub async fn run(mut self) -> EngineReport {
         // Windows timer resolution (see `TimerResolutionGuard`):
         // without it the 5 ms interval ticks at ~64 Hz there.
@@ -548,23 +556,69 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         if !*self.stop_rx.borrow() {
             loop {
-                tokio::select! {
-                    _ = ticker.tick() => self.on_tick().await,
-                    result = self.stop_rx.changed() => {
-                        match result {
-                            Ok(()) => {
-                                if *self.stop_rx.borrow() {
-                                    break;
-                                }
+                if self.source_live() {
+                    tokio::select! {
+                        _ = ticker.tick() => self.on_tick().await,
+                        result = self.stop_rx.changed() => {
+                            if Self::stop_fired(result, &self.stop_rx) {
+                                break;
                             }
-                            // Stop sender dropped: treat as a stop.
-                            Err(_) => break,
+                        }
+                    }
+                } else {
+                    // DS-31: parked — one sleep instead of a 200 Hz
+                    // interval. The delay never runs past a due
+                    // reconnect (see `parked_tick_delay`).
+                    let delay = self.parked_tick_delay(Instant::now());
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => self.on_tick().await,
+                        result = self.stop_rx.changed() => {
+                            if Self::stop_fired(result, &self.stop_rx) {
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
         self.finish()
+    }
+
+    /// Whether a live source is attached right now (DS-31): the
+    /// 200 Hz tick only pays off while frames can arrive.
+    fn source_live(&self) -> bool {
+        self.source.is_some()
+    }
+
+    /// How long the run loop may sleep before the next tick (DS-31):
+    /// 5 ms while a source is live; 100 ms while parked — but never
+    /// past a due reconnect, so a factory retry fires on schedule.
+    /// With no factory there is no reconnect to wait for, so the
+    /// full 100 ms applies even once the (factory-less) retry time
+    /// has passed.
+    fn parked_tick_delay(&self, now: Instant) -> Duration {
+        if self.source_live() {
+            return TICK_INTERVAL;
+        }
+        let Some(due) = self.next_reconnect_at.filter(|_| self.factory.is_some()) else {
+            return PARKED_TICK_INTERVAL;
+        };
+        due.saturating_duration_since(now)
+            .min(PARKED_TICK_INTERVAL)
+    }
+
+    /// Interprets a `stop_rx.changed()` outcome (DS-31): `true`
+    /// means the run loop must exit — the flag was set, or the
+    /// sender was dropped. A change that leaves the flag clear does
+    /// not stop the loop.
+    fn stop_fired(
+        result: Result<(), tokio::sync::watch::error::RecvError>,
+        stop_rx: &watch::Receiver<bool>,
+    ) -> bool {
+        match result {
+            Ok(()) => *stop_rx.borrow(),
+            Err(_) => true,
+        }
     }
 
     /// One 5 ms tick: status/ping drains, ping send, reconnect, drain
@@ -1598,6 +1652,81 @@ mod tests {
             .expect("run() returns after stop()")
             .expect("engine task joins cleanly");
         assert_eq!(report.counters.source_reconnects, 0);
+    }
+
+    /// DS-31: the parked delay is 5 ms live, 100 ms parked, wakes
+    /// early for a due reconnect, fires at once when one is
+    /// overdue — and never collapses to 5 ms when there is no
+    /// factory to reconnect with.
+    #[test]
+    fn ds31_parked_tick_delay_parks_without_source_and_wakes_for_reconnect() {
+        let (_tx, rx) = mpsc::channel(32);
+        let (sink, _states) = RecordingSink::new(false);
+        let mut engine = WheelEngine::new(
+            ProcessingPipeline::new(PipelinePlan::default()),
+            ChannelSource::new(rx),
+            Box::new(sink),
+        );
+        let now = Instant::now();
+        // Live source: full rate.
+        assert_eq!(engine.parked_tick_delay(now), TICK_INTERVAL);
+        // No source, no factory, no reconnect pending: parked.
+        engine.source = None;
+        assert_eq!(engine.parked_tick_delay(now), PARKED_TICK_INTERVAL);
+        // No source, factory, reconnect far away: still parked.
+        engine.factory = Some(Box::new(ChannelFactory::new()));
+        engine.next_reconnect_at = Some(now + Duration::from_secs(2));
+        assert_eq!(engine.parked_tick_delay(now), PARKED_TICK_INTERVAL);
+        // Reconnect due soon: wake early for it, never past it.
+        engine.next_reconnect_at = Some(now + Duration::from_millis(50));
+        let delay = engine.parked_tick_delay(now);
+        assert!(
+            !delay.is_zero() && delay <= PARKED_TICK_INTERVAL,
+            "{delay:?}"
+        );
+        // Reconnect overdue: wake at once.
+        engine.next_reconnect_at = Some(now - Duration::from_secs(1));
+        assert_eq!(engine.parked_tick_delay(now), Duration::ZERO);
+        // With no factory an overdue retry time must NOT collapse
+        // the delay (there is no reconnect to wait for).
+        engine.factory = None;
+        assert_eq!(engine.parked_tick_delay(now), PARKED_TICK_INTERVAL);
+    }
+
+    /// DS-31: behaviour — after the source drops, the parked engine
+    /// sends ~6 outputs in 600 ms (10 Hz), not ~120 (200 Hz).
+    #[tokio::test]
+    async fn ds31_parked_engine_ticks_at_10hz_not_200hz() {
+        let (tx, rx) = mpsc::channel(32);
+        let (sink, states) = RecordingSink::new(false);
+        let engine = WheelEngine::new(
+            ProcessingPipeline::new(PipelinePlan::default()),
+            ChannelSource::new(rx),
+            Box::new(sink),
+        );
+        let stop = engine.stop_handle();
+        let join = tokio::spawn(engine.run());
+        tx.send(frame(0, 0, 3300)).await.expect("channel open");
+        sleep(Duration::from_millis(60)).await;
+        drop(tx);
+        // 600 ms parked: ~6 ticks at 10 Hz (plus ~12 live ticks
+        // before the drop). At the old 200 Hz this would be ~120
+        // more sends — the bound below separates the two by 3×.
+        sleep(Duration::from_millis(600)).await;
+        let sends = recorded(&states).len();
+        assert!(
+            sends < 40,
+            "parked engine must tick ~10 Hz, not 200 Hz: {sends} sends in 600 ms"
+        );
+        assert!(
+            recorded(&states).iter().any(|s| *s == OutputState::neutral()),
+            "parked engine still sends neutral"
+        );
+        stop.stop();
+        let _report = timeout(Duration::from_secs(5), join)
+            .await
+            .expect("run() returns after stop()")
+            .expect("engine task joins cleanly");
     }
 
     #[tokio::test]
