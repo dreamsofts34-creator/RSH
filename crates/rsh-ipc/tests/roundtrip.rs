@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use rsh_api::{
-    ApiTransport, AppApi, AppEvent, ConnectionInfo, DraftStatus, PairingInfo, SnapshotInfo,
-    TuningSettings, UserError, connection::ConnectionState, validate_tuning,
+    ApiTransport, AppApi, AppEvent, ConnectionInfo, DraftStatus, PairingInfo, SlowPollState,
+    SnapshotInfo, TuningSettings, UserError, connection::ConnectionState, validate_tuning,
 };
 use rsh_ipc::{IpcClient, IpcServer, bind_unix_socket, serve_listener};
 use tokio::sync::broadcast;
@@ -233,6 +233,22 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
             .and_then(serde_json::Value::as_bool),
         Some(true)
     );
+
+    // DS-29: one combined slow read over the same socket — the
+    // whole slow poller payload in a single round-trip.
+    let slow_value = client
+        .call("slow_poll", serde_json::json!({}))
+        .await
+        .expect("slow_poll");
+    let slow: SlowPollState =
+        serde_json::from_value(slow_value).expect("slow_poll parses as SlowPollState");
+    assert_eq!(slow.version, "1.0.2");
+    assert_eq!(slow.firmware_version, "Unknown");
+    assert_eq!(slow.pairing_status.seconds_left, 0);
+    assert_eq!(slow.tunings.len(), 8);
+    assert_eq!(slow.modules.len(), 4);
+    assert!(slow.modules.values().all(|enabled| *enabled));
+    assert!(slow.draft.is_none());
 
     // Subscribe, then push an event from the server side: the
     // client must receive it on its event channel.

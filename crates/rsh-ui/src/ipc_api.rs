@@ -44,7 +44,8 @@ use rsh_api::connection::ConnectionState;
 use rsh_api::{
     app_version, ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionError,
     ConnectionInfo, DiagStats, DraftStatus, FirmwareCheck, FirmwareUpdateStatus, GameSummary,
-    PairingInfo, PollState, ProfileSummary, SnapshotInfo, TuningSettings, UserError, VjoyStatus,
+    PairingInfo, PollState, ProfileSummary, SlowPollState, SnapshotInfo, TuningSettings, UserError,
+    VjoyStatus,
 };
 use rsh_ipc::{IpcClient, IpcError};
 
@@ -568,6 +569,70 @@ impl IpcApi {
 #[allow(clippy::too_many_lines)]
 async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     if cache.link_dead.load(Ordering::Relaxed) {
+        return;
+    }
+    // DS-29: one combined call first (30 -> 1 round-trips). On any
+    // failure — old daemon without the method, an unparseable reply
+    // — fall through to the sequential per-slot pass below, which
+    // keeps exactly its old behaviour (including `link_dead` checks).
+    let slow_state = match client.call("slow_poll", serde_json::json!({})).await {
+        Ok(value) => serde_json::from_value::<SlowPollState>(value).ok(),
+        Err(_) => None,
+    };
+    if let Some(state) = slow_state {
+        macro_rules! set_slot {
+            ($slot:ident, $value:expr) => {
+                if let Ok(mut slot) = cache.$slot.lock() {
+                    *slot = Some($value);
+                }
+            };
+        }
+        set_slot!(version, state.version);
+        set_slot!(firmware_version, state.firmware_version);
+        set_slot!(backend, state.backend);
+        set_slot!(autostart, state.autostart);
+        set_slot!(board_address, state.board_address);
+        if let Some(diag) = state.diag_stats {
+            set_slot!(diag_stats, diag);
+        }
+        set_slot!(pairing_status, state.pairing_status);
+        if let Some(calibration) = state.calibration {
+            set_slot!(calibration, calibration);
+        }
+        set_slot!(profiles, state.profiles);
+        set_slot!(games, state.games);
+        if let Some(check) = state.firmware_check {
+            set_slot!(firmware_check, check);
+        }
+        set_slot!(firmware_update_status, state.firmware_update_status);
+        if let Some(vjoy) = state.vjoy_status {
+            set_slot!(vjoy_status, vjoy);
+        }
+        set_slot!(auto_pause, state.auto_pause);
+        set_slot!(close_to_tray, state.close_to_tray);
+        set_slot!(bindings, state.bindings);
+        set_slot!(knobs, state.knobs);
+        // Draft is `None`-or-object: store whichever parsed, so a
+        // saved draft clears the cached one (as the old path did).
+        if let Ok(mut slot) = cache.draft.lock() {
+            *slot = state.draft;
+        }
+        if let Ok(mut tunings) = cache.tunings.lock() {
+            for (module, tuning) in state.tunings {
+                tunings.insert(module, tuning);
+            }
+        }
+        if let Ok(mut modules) = cache.modules.lock() {
+            for (module, index) in
+                [("handbrake", 0), ("shifter", 1), ("horn", 2), ("led", 3)]
+            {
+                if let Some(enabled) = state.modules.get(module) {
+                    modules[index] = Some(*enabled);
+                }
+            }
+        }
+        cache.slow_filled.store(true, Ordering::Relaxed);
+        cache.generation.fetch_add(1, Ordering::Relaxed);
         return;
     }
     // One call, parsed or ignored. `parse` turns the reply into
