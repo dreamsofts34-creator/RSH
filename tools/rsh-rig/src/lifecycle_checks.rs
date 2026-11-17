@@ -210,31 +210,43 @@ impl XvfbSession {
                 .stderr(Stdio::null())
                 .spawn()
                 .ok()?;
-            // The server is up when xdotool can talk to it (exit 0
-            // even with no matching window). If the display is
+            // The server is up only when xdotool can actually talk
+            // to it: `getdisplaygeometry` exits 0 iff the server
+            // answers. The old probe (`search --name
+            // definitely-not-a-window`, accepting exit 0 OR 1)
+            // could not tell "up" from "down" — xdotool exits 1
+            // both when nothing matches AND when it cannot open
+            // the display at all — so on a slow/cold runner it
+            // declared the server up before Xvfb was listening,
+            // and the UI then died at startup with exit 1
+            // ("Failed to open connection to X server", 0 daemon
+            // spawns — the CI gate-respawn-bound signature on
+            // runs 44170745634 / 44187518070). If the display is
             // taken, Xvfb exits at once — detect that and try the
             // next display instead of waiting the full probe loop.
+            // 100 probes (~10 s + xdotool exec time): a cold first
+            // start on a slow runner takes seconds to listen, and
+            // giving up early just moves the failure into the UI
+            // (exit 1, "Failed to open connection to X server").
+            // The loop still aborts at once if the child exits.
             let mut up = false;
-            for _ in 0..20 {
+            for _ in 0..100 {
                 if child.try_wait().ok().flatten().is_some() {
                     break;
                 }
                 let reachable = Command::new("xdotool")
                     .env("DISPLAY", &name)
-                    .args(["search", "--name", "definitely-not-a-window"])
+                    .args(["getdisplaygeometry"])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
-                    .is_ok_and(|s| s.code() == Some(0) || s.code() == Some(1));
+                    .is_ok_and(|s| s.code() == Some(0));
                 // Freshness is guaranteed by construction: our
                 // Xvfb child being alive means WE bound this
                 // display (a taken display makes the child exit at
                 // once, caught by `try_wait` above) — a stale server
                 // left by a killed run cannot share the display
-                // with our live child. (An earlier draft required
-                // zero windows via `search --name ''`, but the empty
-                // pattern also matches the root window, so a fresh
-                // server never passed it.)
+                // with our live child.
                 if reachable {
                     up = true;
                     break;
