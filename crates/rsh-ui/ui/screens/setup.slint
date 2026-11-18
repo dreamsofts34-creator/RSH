@@ -318,6 +318,10 @@ export component SetupWizard inherits Rectangle {
                     }
                 }
                 if vjoy-error != "" : Text { text: vjoy-error; font-size: 12.5px; color: Theme.bad; wrap: word-wrap; }
+                // R2-40: an install failure strands the wizard on
+                // this step unless the fallback is picked — say so
+                // on the step itself, next to the error.
+                if vjoy-error != "" && !vjoy-fallback : Text { text: "Install failed — you can still continue with HIDMaestro below."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
                 if !vjoy-installed && !vjoy-installing : Rectangle {
                     horizontal-stretch: 1;
                     width: 584px;

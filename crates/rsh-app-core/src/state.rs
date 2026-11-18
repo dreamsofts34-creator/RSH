@@ -997,6 +997,14 @@ pub struct AppStateCore {
     /// diagnostics log file; tests read it directly. Capped at 200
     /// lines (oldest dropped).
     pairing_log: Mutex<VecDeque<String>>,
+    /// Retained tail of the pairing log (R2-23/R2-42): the last
+    /// [`PAIRING_LOG_TAIL_LINES`] lines, kept for `pairing_status()`
+    /// readers. The manager loop drains `pairing_log` every 250 ms
+    /// for the diagnostics file (DS-32) — without this second
+    /// buffer the UI's 1 Hz `pairing_status()` read almost always
+    /// saw an empty log. This buffer is NEVER drained, only capped,
+    /// so a drain can no longer starve the UI.
+    pairing_log_tail: Mutex<VecDeque<String>>,
     /// Whether the "window state: open" line was already emitted for
     /// the current window (one line per transition, §6.3).
     window_open_logged: Mutex<bool>,
@@ -1165,6 +1173,7 @@ impl AppStateCore {
             control_last_error: Mutex::new(None),
             activation_in_flight: AtomicBool::new(false),
             pairing_log: Mutex::new(VecDeque::new()),
+            pairing_log_tail: Mutex::new(VecDeque::new()),
             window_open_logged: Mutex::new(false),
             window_expiry_logged: Mutex::new(false),
             last_stream_frame_at: Mutex::new(None),
@@ -1378,6 +1387,16 @@ impl AppStateCore {
         lock(&self.pairing_log).iter().cloned().collect()
     }
 
+    /// The retained pairing-log tail (R2-23/R2-42): the last
+    /// [`PAIRING_LOG_TAIL_LINES`] lines, oldest first. This is what
+    /// `pairing_status()` returns — it is never drained, so the
+    /// manager loop's 250 ms file drain cannot starve the UI's
+    /// 1 Hz read, and the IPC shape stays small (≤20 lines).
+    #[must_use]
+    pub fn pairing_log_tail_lines(&self) -> Vec<String> {
+        lock(&self.pairing_log_tail).iter().cloned().collect()
+    }
+
     /// Drains the pairing/connection log lines (DS-32): returns all
     /// lines queued since the last drain and clears the buffer — the
     /// `take_*` pattern `take_manager_log_lines()` already uses in
@@ -1395,7 +1414,9 @@ impl AppStateCore {
     /// Every line goes through [`redact_secrets`] first — a secret
     /// must never reach the log, even if a caller passes one in.
     /// Capped at 200 lines (oldest dropped); one line per
-    /// transition, never per poll.
+    /// transition, never per poll. The same line is also kept in
+    /// the retained tail (R2-23/R2-42, capped at
+    /// [`PAIRING_LOG_TAIL_LINES`]) for `pairing_status()` readers.
     fn push_pairing_log(&self, level: &str, message: &str) {
         let line = format!("[{} {level} pairing] {message}", utc_now_iso());
         let line = redact_secrets(&line);
@@ -1403,7 +1424,12 @@ impl AppStateCore {
         if log.len() >= 200 {
             log.pop_front();
         }
-        log.push_back(line);
+        log.push_back(line.clone());
+        let mut tail = lock(&self.pairing_log_tail);
+        if tail.len() >= PAIRING_LOG_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(line);
     }
 
     /// Classify a [`SessionError`] into its typed
@@ -6238,6 +6264,12 @@ impl AppStateCore {
 /// Capacity of the engine supervisor's command channel (connect /
 /// disconnect commands are rare; a full channel is an error, never a
 /// block — see [`AppStateCore::connect_transport`]).
+/// Retained pairing-log tail for `pairing_status()` (R2-23/R2-42):
+/// the IPC shape carries at most this many recent lines, so a
+/// ~1 Hz slow poll never clones + serialises the full ≤200-line
+/// buffer.
+pub const PAIRING_LOG_TAIL_LINES: usize = 20;
+
 const ENGINE_COMMAND_CAPACITY: usize = 16;
 
 /// Bounded engine stop: [`AppStateCore::stop_engine`] waits at most
@@ -11014,6 +11046,32 @@ mod tests {
         );
         assert_eq!(state.take_pairing_log_lines(), Vec::<String>::new());
         assert_eq!(state.pairing_log_lines(), Vec::<String>::new());
+    }
+
+    /// R2-23/R2-42: the retained tail survives the manager-loop
+    /// drain (the UI's `pairing_status()` read must still see the
+    /// trail) and is capped at [`PAIRING_LOG_TAIL_LINES`] lines.
+    #[test]
+    fn r2_pairing_log_tail_survives_drain_and_caps_at_20() {
+        let (state, _dir) = test_state();
+        for _ in 0..25 {
+            state.open_session_gate();
+            state.close_session_gate();
+        }
+        // 50 lines pushed; the drain takes them all from the main
+        // buffer — but the tail keeps the last 20.
+        assert_eq!(state.take_pairing_log_lines().len(), 50);
+        assert_eq!(state.pairing_log_lines(), Vec::<String>::new());
+        let tail = state.pairing_log_tail_lines();
+        assert_eq!(tail.len(), PAIRING_LOG_TAIL_LINES);
+        assert!(
+            tail.last().is_some_and(|l| l.contains("open -> closed")),
+            "tail ends with the newest line: {tail:?}"
+        );
+        assert!(
+            tail.first().is_some_and(|l| l.contains("closed -> open")),
+            "tail starts with the oldest retained line: {tail:?}"
+        );
     }
 
     #[test]

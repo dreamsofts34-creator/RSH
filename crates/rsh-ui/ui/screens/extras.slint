@@ -15,9 +15,10 @@
 //   backend field — its slider is disabled with a reason (A6).
 // - Horn button IS a set_tuning field (horn_button): Learn arms
 //   start_learn and take_learned_button supplies the picked button.
-// - LEDs ARE set_tuning fields (led_brightness, led_pattern): the
-//   pattern chips + brightness slider push through set_tuning("led").
-//   Colour has NO backend field — swatches show a reason (A6).
+// - LEDs ARE set_tuning fields (led_brightness, led_pattern,
+//   led_color): the pattern chips + brightness slider + colour
+//   swatches push through set_tuning("led") (R2-34 — the old
+//   "Colour isn't stored" copy was stale).
 // - Handbrake deadzone/feel/mV come from get_tuning("handbrake");
 //   Set up/down need calibrate_pedal (BACKEND-2 seam) and stay
 //   disabled with a reason until it lands (A2).
@@ -316,7 +317,7 @@ export component ExtrasScreen inherits VerticalLayout {
                     if led-pattern == 1 : VerticalLayout {
                         spacing: 6px;
                         Text { text: "Colour"; font-size: 12.5px; font-weight: 500; color: Theme.text; }
-                        Text { text: "Colour isn't stored on the wheel yet."; font-size: 11.5px; color: Theme.faint; }
+                        Text { text: "Colour is saved with the profile and shown in the preview."; font-size: 11.5px; color: Theme.faint; }
                         HorizontalLayout {
                             spacing: 8px;
                             for s[i] in [#FF6B6B, #F5B84A, #3DD68C, #2F6BFF, #B46CFF, #FFFFFF] : Rectangle {

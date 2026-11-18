@@ -82,6 +82,10 @@ export component DiagnosticsDrawer inherits FocusScope {
     // (the daemon); "—" until measured.
     in property <string> frame-p50-text: "—";
     in property <string> frame-p99-text: "—";
+    // R2-46: paint-completion p50/p99 (refresh start to Slint
+    // AfterRendering); "—" until a paint is observed.
+    in property <string> paint-p50-text: "—";
+    in property <string> paint-p99-text: "—";
     in property <string> ipc-p50-text: "—";
     in property <string> ipc-p99-text: "—";
     in property <bool> stats-bad: false;
@@ -177,6 +181,8 @@ export component DiagnosticsDrawer inherits FocusScope {
                         spacing: 12px;
                         StatCell { horizontal-stretch: 1; label: "Frame (p50)"; value: frame-p50-text; }
                         StatCell { horizontal-stretch: 1; label: "Frame (p99)"; value: frame-p99-text; }
+                        StatCell { horizontal-stretch: 1; label: "Paint (p50)"; value: paint-p50-text; }
+                        StatCell { horizontal-stretch: 1; label: "Paint (p99)"; value: paint-p99-text; }
                         StatCell { horizontal-stretch: 1; label: "IPC (p50)"; value: ipc-p50-text; }
                         StatCell { horizontal-stretch: 1; label: "IPC (p99)"; value: ipc-p99-text; }
                     }
