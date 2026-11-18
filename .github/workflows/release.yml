@@ -14,7 +14,12 @@
 # `latest.json` is published, users install by downloading the exe
 # manually.
 #
-# v2.0 architecture (REDESIGN-PLAN): there is NO Tauri shell anymore.
+# v2.0 architecture (REDESIGN-PLAN): the SHIPPED app has no Tauri shell
+# anymore — the installer ships Slint rsh-ui + rsh-daemon only.
+# (DS-71: src-tauri/ + frontend/ still EXIST in the repo, kept-but-
+# unshipped — see the note under 'REMOVED' below. The Tauri shell is
+# still built by CI's tauri-build job, and its src-tauri/binaries/
+# dir is still the staging place for the HIDMaestro sidecar exe.)
 # The installer bundles two binaries + the HIDMaestro sidecar, all in
 # one install dir:
 #   rsh-daemon.exe            always-on daemon (engine + transport +
@@ -43,7 +48,9 @@
 #      `dotnet publish` NativeAOT win-x64 (shared script
 #      `tools/ci/stage-sidecar.ps1`; it stages to
 #      `src-tauri/binaries/…` — the v2.0 installer picks the exe up
-#      from there, the Tauri shell itself is not built).
+#      from there; the Tauri shell itself is not built BY THIS
+#      WORKFLOW (CI's tauri-build job still builds it — DS-71,
+#      kept-but-unshipped).
 #   2. Gates: `cargo fmt --check`, `cargo clippy --workspace
 #      --exclude rsh-app` (Windows — every non-Tauri member),
 #      `cargo test -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc
@@ -552,27 +559,47 @@ jobs:
             ; DS-68: kill the UI FIRST, then the daemon — the UI's
             ; monitor respawns a dead daemon (budgeted, from 1 s), so
             ; killing the daemon first lets a fresh old-version daemon
-            ; start mid-install and re-lock rsh-daemon.exe. Second
-            ; pass (after a short sleep) catches a respawn that raced
-            ; the first pass; the file copy below still fails closed
-            ; if a process somehow survives (makensis errors).
-            nsExec::Exec 'taskkill /F /IM rsh-ui.exe'
-            Sleep 1000
-            nsExec::Exec 'taskkill /F /IM rsh-daemon.exe'
-            ; F21: also stop the legacy Tauri v1 app (installed exe
-            ; `RSH.exe`): it binds the wheel UDP port 4211 at launch
-            ; and, if left running, the new daemon can never bind
-            ; the port (`AddrInUse` forever — user log: 117x). This
-            ; installer does NOT uninstall the old app — it lives in
-            ; its own per-user install with its own uninstall entry
-            ; — it only stops the running process so the port is
-            ; free; the user removes the old app via its own
-            ; "Uninstall RSH" entry afterwards.
-            nsExec::Exec 'taskkill /F /IM RSH.exe'
-            Sleep 1000
-            nsExec::Exec 'taskkill /F /IM rsh-ui.exe'
-            nsExec::Exec 'taskkill /F /IM rsh-daemon.exe'
-            nsExec::Exec 'taskkill /F /IM RSH.exe'
+            ; start mid-install and re-lock rsh-daemon.exe. LOOP the
+            ; kills (max 10 passes) until NEITHER process exists, so
+            ; a respawn that races one pass is caught by the next;
+            ; the file copy below still fails closed if a process
+            ; somehow survives (makensis errors). Existence is checked
+            ; with tasklist: /NH prints the image name only when a
+            ; matching process exists, otherwise the "No tasks are
+            ; running" INFO line (which contains neither exe name).
+            StrCpy $R0 0
+            DS68KillLoop:
+              nsExec::Exec 'taskkill /F /IM rsh-ui.exe'
+              Sleep 500
+              nsExec::Exec 'taskkill /F /IM rsh-daemon.exe'
+              ; F21: also stop the legacy Tauri v1 app (installed exe
+              ; `RSH.exe`): it binds the wheel UDP port 4211 at launch
+              ; and, if left running, the new daemon can never bind
+              ; the port (`AddrInUse` forever — user log: 117x). This
+              ; installer does NOT uninstall the old app — it lives in
+              ; its own per-user install with its own uninstall entry
+              ; — it only stops the running process so the port is
+              ; free; the user removes the old app via its own
+              ; "Uninstall RSH" entry afterwards.
+              nsExec::Exec 'taskkill /F /IM RSH.exe'
+              Sleep 500
+              IntOp $R0 $R0 + 1
+              nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq rsh-ui.exe" /NH'
+              Pop $R1  ; exit code (discard)
+              Pop $R2  ; stdout: image name present only if still running
+              ${StrStr} $R3 $R2 "rsh-ui.exe"
+              ${If} $R3 != ""
+              ${AndIf} $R0 < 10
+                Goto DS68KillLoop
+              ${EndIf}
+              nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq rsh-daemon.exe" /NH'
+              Pop $R1  ; exit code (discard)
+              Pop $R2  ; stdout: image name present only if still running
+              ${StrStr} $R3 $R2 "rsh-daemon.exe"
+              ${If} $R3 != ""
+              ${AndIf} $R0 < 10
+                Goto DS68KillLoop
+              ${EndIf}
             File "..\target\release\rsh-daemon.exe"
             File "..\target\release\rsh-ui.exe"
             ; Sidecar MUST sit beside rsh-daemon.exe: the daemon resolves it
@@ -676,6 +703,8 @@ jobs:
             ; file survive an uninstall, so a reinstall keeps the user's
             ; data (same as an update install, which also keeps it).
             ; Delete %APPDATA%\RSH manually for a fully clean start.
+            ; The same KEEP decision is stated in the release notes.
+            DetailPrint "DS-69: %APPDATA%\RSH (profiles, settings, logs) was kept — delete it manually for a fully clean start."
           SectionEnd
           '@ -replace '\$\{VERSION\}', "${{ steps.tag.outputs.version }}" | Set-Content -Path installer\rsh.nsi -Encoding ASCII
           Get-Content installer\rsh.nsi | Select-Object -First 5

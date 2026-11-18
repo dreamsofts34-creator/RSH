@@ -6,14 +6,17 @@
 //! `src-tauri/src/system.rs` and calls into here.
 //!
 //! Covered here:
-//! - update check (`check_update`, SW-R7.5) — semver comparison only.
-//!   DS-71: this is a pure, tested comparator with NO callers in the
-//!   v2.0 app — the Settings update check is a static notice, auto-
-//!   update is OFF, and no `latest.json` is published. The Tauri
-//!   updater plugin config in `src-tauri/tauri.conf.json` is inactive
+//! - update check (SW-R7.5) — DELETED in Round 2 (DS-71): the pure
+//!   semver comparator `check_update` + `UpdateDecision` had NO
+//!   callers in the v2.0 app (only its own tests) and is gone. The
+//!   Settings update check is a static notice, auto-update is OFF,
+//!   and no `latest.json` is published. The Tauri updater plugin
+//!   config in `src-tauri/tauri.conf.json` is inactive
 //!   (`active: false`); nothing downloads or installs an update.
-//!   Kept (not deleted) as a tested utility for a future manual
-//!   "check GitHub Releases" implementation (DS-20).
+//!   `UpdateInfo` is KEPT: the kept-but-unshipped Tauri shell
+//!   (`src-tauri/src/system.rs`) still constructs it — deleting the
+//!   type would break CI's tauri-build job. It has no users in the
+//!   shipped Slint app.
 //! - single-instance version rule (SW-R7.4) — the C# rule, decided as
 //!   pure logic: an older version terminates, fail-closed.
 //! - autostart stale-entry repair (SW-R7.4) — pure logic over a
@@ -72,7 +75,7 @@ impl fmt::Display for SystemError {
 impl std::error::Error for SystemError {}
 
 // ---------------------------------------------------------------------------
-// Versions + update check (SW-R7.5)
+// Versions (SW-R7.5)
 // ---------------------------------------------------------------------------
 
 /// Parse a version string as semver.
@@ -96,8 +99,13 @@ pub fn compare_versions(a: &str, b: &str) -> Result<Ordering, SystemError> {
 }
 
 /// What an update check found upstream: a newer release, or nothing
-/// newer. `download_url` is filled in by the caller when it has one;
-/// the pure check leaves it [`None`].
+/// newer. `download_url` is filled in by the caller when it has one.
+///
+/// DS-71 (Round 2): retained ONLY for the kept-but-unshipped Tauri
+/// shell (`src-tauri/src/system.rs` constructs it); the shipped v2.0
+/// app has no update check — `check_update`/`UpdateDecision` were
+/// deleted with zero callers. Do not reintroduce an update check here
+/// without a migration plan (auto-update is OFF, no `latest.json`).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateInfo {
@@ -107,52 +115,6 @@ pub struct UpdateInfo {
     pub notes: Option<String>,
     /// Direct download URL, when the caller knows one.
     pub download_url: Option<String>,
-}
-
-/// The result of [`check_update`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UpdateDecision {
-    /// The running version is the newest known version.
-    UpToDate {
-        /// The running version.
-        current: String,
-    },
-    /// A newer version exists upstream.
-    Available(UpdateInfo),
-    /// The running version is *newer* than the latest upstream
-    /// version (e.g. a dev build). Never offered as an update.
-    CurrentIsNewer {
-        /// The running version.
-        current: String,
-        /// The latest upstream version.
-        latest: String,
-    },
-}
-
-/// Decide whether `latest` is an update over `current`.
-///
-/// Pure semver comparison: `latest > current` is an update,
-/// `latest == current` is up to date, `latest < current` means the
-/// running build is newer (dev build) and no update is offered. This
-/// function never touches the network and never installs anything —
-/// v2.0 has no auto-update (DS-71); the updater plugin in the
-/// kept-but-unshipped Tauri shell is inactive.
-///
-/// # Errors
-///
-/// Returns [`SystemError::InvalidVersion`] when either version string
-/// does not parse.
-pub fn check_update(current: &str, latest: &UpdateInfo) -> Result<UpdateDecision, SystemError> {
-    match compare_versions(&latest.version, current)? {
-        Ordering::Greater => Ok(UpdateDecision::Available(latest.clone())),
-        Ordering::Equal => Ok(UpdateDecision::UpToDate {
-            current: current.to_string(),
-        }),
-        Ordering::Less => Ok(UpdateDecision::CurrentIsNewer {
-            current: current.to_string(),
-            latest: latest.version.clone(),
-        }),
-    }
 }
 
 /// Whether the `WebView2` runtime check (SW-R7.5) has anything to do.
@@ -581,48 +543,6 @@ mod tests {
             compare_versions("1.0", "1.0.0"),
             Err(SystemError::InvalidVersion("1.0".to_string()))
         );
-    }
-
-    fn update_info(version: &str) -> UpdateInfo {
-        UpdateInfo {
-            version: version.to_string(),
-            notes: None,
-            download_url: None,
-        }
-    }
-
-    #[test]
-    fn update_available_when_newer() {
-        let decision = check_update("1.0.0", &update_info("1.1.0")).unwrap();
-        assert_eq!(decision, UpdateDecision::Available(update_info("1.1.0")));
-    }
-
-    #[test]
-    fn update_up_to_date_when_equal() {
-        let decision = check_update("1.0.0", &update_info("1.0.0")).unwrap();
-        assert_eq!(
-            decision,
-            UpdateDecision::UpToDate {
-                current: "1.0.0".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn update_never_offered_when_running_is_newer() {
-        let decision = check_update("1.2.0", &update_info("1.1.0")).unwrap();
-        assert_eq!(
-            decision,
-            UpdateDecision::CurrentIsNewer {
-                current: "1.2.0".to_string(),
-                latest: "1.1.0".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn update_rejects_bad_version() {
-        assert!(check_update("1.0.0", &update_info("not-a-version")).is_err());
     }
 
     // -- single instance -----------------------------------------------------
