@@ -127,6 +127,10 @@ component PedalCard inherits Card {
     // Disabled while the calibration backend is unavailable (A2):
     // Rust sets this; the reason is shown by the caller.
     in property <bool> set-disabled: false;
+    // DS-54: which job kind the busy strip shows, as a
+    // JobKind::order value (-1 = idle) — Set up/down disable + dim
+    // while their CaptureOp job (10) runs.
+    in property <int> busy-kind: -1;
     callback set-up();
     callback set-down();
     callback feel-selected(int);
@@ -190,7 +194,7 @@ component PedalCard inherits Card {
                     spacing: 6px;
                     Text { text: "Pedal up"; font-size: 11px; color: Theme.mute; }
                     Text { text: up-mv; font-family: Theme.font-mono; font-size: 13px; font-weight: 600; color: Theme.text; }
-                    Btn { horizontal-stretch: 1; label: "Set up"; disabled: set-disabled; clicked => { set-up(); } }
+                    Btn { horizontal-stretch: 1; label: "Set up"; disabled: set-disabled || busy-kind == 10; clicked => { set-up(); } }
                 }
             }
             Rectangle {
@@ -204,7 +208,7 @@ component PedalCard inherits Card {
                     spacing: 6px;
                     Text { text: "Pedal down"; font-size: 11px; color: Theme.mute; }
                     Text { text: down-mv; font-family: Theme.font-mono; font-size: 13px; font-weight: 600; color: Theme.text; }
-                    Btn { horizontal-stretch: 1; label: "Set down"; disabled: set-disabled; clicked => { set-down(); } }
+                    Btn { horizontal-stretch: 1; label: "Set down"; disabled: set-disabled || busy-kind == 10; clicked => { set-down(); } }
                 }
             }
         }
@@ -262,6 +266,10 @@ export component PedalsPage inherits VerticalLayout {
     in property <float> clutch-marker-y;
 
     in property <bool> set-disabled: false;
+    // DS-54: which job kind the busy strip shows, as a
+    // JobKind::order value (-1 = idle) — the cards' Set up/down
+    // disable + dim while their CaptureOp job (10) runs.
+    in property <int> busy-kind: -1;
     callback set-up(int);          // pedal index 0 throttle, 1 brake, 2 clutch
     callback set-down(int);
     callback feel-selected(int, int); // (pedal, feel)
@@ -293,6 +301,7 @@ export component PedalsPage inherits VerticalLayout {
             deadzone-text: throttle-deadzone-text;
             show-bite: false;
             set-disabled: set-disabled;
+            busy-kind: busy-kind;
             bite: 0;
             bite-text: "";
             curve-commands: throttle-curve;
@@ -322,6 +331,7 @@ export component PedalsPage inherits VerticalLayout {
             deadzone-text: brake-deadzone-text;
             show-bite: false;
             set-disabled: set-disabled;
+            busy-kind: busy-kind;
             bite: 0;
             bite-text: "";
             curve-commands: brake-curve;
@@ -351,6 +361,7 @@ export component PedalsPage inherits VerticalLayout {
             deadzone-text: clutch-deadzone-text;
             show-bite: true;
             set-disabled: set-disabled;
+            busy-kind: busy-kind;
             bite: clutch-bite;
             bite-text: clutch-bite-text;
             curve-commands: clutch-curve;

@@ -107,6 +107,9 @@ component KnobCell inherits Rectangle {
     HorizontalLayout {
         padding: 10px;
         spacing: 12px;
+        // UI-UX polish (a): preview `.e` is align-items:center — the
+        // 34px knob centres against the two-line label.
+        cross-axis-alignment: center;
         Rectangle {
             width: 34px;
             height: 34px;
@@ -244,6 +247,11 @@ export component ButtonsPage inherits HorizontalLayout {
     in-out property <int> knob-row: 0;  // 0 turn left, 1 turn right, 2 press
     in property <string> knob-row-action: "Gear 1";
     in-out property <bool> listening: false;
+    // DS-54: which job kind the busy strip shows, as a
+    // JobKind::order value (-1 = idle) — Save disables + dims while
+    // its BindingOp job (9) or ProfileOp save (8) runs; Cancel while
+    // its ProfileOp discard (8) runs.
+    in property <int> busy-kind: -1;
 
     callback tile-selected(int);
     callback knob-selected(int);
@@ -382,6 +390,10 @@ export component ButtonsPage inherits HorizontalLayout {
                     padding-top: 10px; padding-bottom: 10px; padding-left: 12px; padding-right: 12px;
                     spacing: 10px;
                     alignment: start;
+                    // UI-UX polish (a): preview `.learn` is
+                    // align-items:center — the 16px icon centres
+                    // against the (possibly two-line) hint text.
+                    cross-axis-alignment: center;
                     Rectangle {
                         width: 16px;
                         height: 16px;
@@ -414,6 +426,10 @@ export component ButtonsPage inherits HorizontalLayout {
                 KnobRow { label: "Turn right"; action: edit-knob == 0 ? knob1-right : knob2-right; selected: knob-row == 1; clicked => { knob-row = 1; knob-row-selected(1); } }
                 KnobRow { label: "Press"; action: edit-knob == 0 ? knob1-press : knob2-press; selected: knob-row == 2; clicked => { knob-row = 2; knob-row-selected(2); } }
             }
+            // UI-UX polish (a): preview is margin 14px 0 6px above
+            // this heading — it sat flush under the learn box (or
+            // the knob rows) with no gap at all.
+            Rectangle { height: 14px; }
             Text {
                 text: edit-kind == 0 ? "What should it do?" : "What should this do?";
                 font-size: 12.5px;
@@ -452,8 +468,8 @@ export component ButtonsPage inherits HorizontalLayout {
             Rectangle { height: 16px; }
             HorizontalLayout {
                 spacing: 8px;
-                Btn { horizontal-stretch: 1; label: "Cancel"; clicked => { edit-cancel(); } }
-                Btn { horizontal-stretch: 1; label: "Save"; primary: true; clicked => { edit-save(); } }
+                Btn { horizontal-stretch: 1; label: "Cancel"; disabled: busy-kind == 8; clicked => { edit-cancel(); } }
+                Btn { horizontal-stretch: 1; label: "Save"; primary: true; disabled: busy-kind == 9 || busy-kind == 8; clicked => { edit-save(); } }
             }
             Rectangle { height: 10px; }
             // D-2: 30 s (firmware confirm timeout), not the preview's 10 s.

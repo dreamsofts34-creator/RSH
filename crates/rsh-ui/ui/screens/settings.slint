@@ -97,7 +97,11 @@ export component SettingsScreen inherits VerticalLayout {
     in-out property <int> backend: 0; // 0 HIDMaestro, 1 vJoy
     in-out property <bool> start-with-windows: true;
     in-out property <bool> keep-in-tray: true;
-    in-out property <int> theme: 0; // 0 Dark, 1 Light, 2 Auto (v2.0.2: all enabled)
+    // R2-31 (UI-UX polish, h): the STORED theme choice (0 Dark,
+    // 1 Light, 2 Auto) — what the Appearance segment shows. The
+    // window's `theme` prop stays the resolved 0/1 that drives
+    // Theme.mode; the window binds this two-way to `theme-choice`.
+    in-out property <int> theme-choice: 0;
     in-out property <[ProfileRow]> profiles;
     in-out property <string> app-version: "RSH 2.0.3";
     in-out property <string> firmware-text: "—";
@@ -155,6 +159,10 @@ export component SettingsScreen inherits VerticalLayout {
                             spacing: 0px;
                             HorizontalLayout {
                                 alignment: space-between;
+                                // UI-UX polish (a): preview `.card h2`
+                                // is align-items:center — the title
+                                // centres against the 20px pill.
+                                cross-axis-alignment: center;
                                 Text { text: "Connection"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                                 Pill { label: connected ? "Connected" : "Disconnected"; bg: connected ? Theme.ok-bg : Theme.panel2; fg: connected ? Theme.ok : Theme.bad; }
                             }
@@ -274,6 +282,10 @@ export component SettingsScreen inherits VerticalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
                                 alignment: space-between;
+                                // UI-UX polish (a): preview `.row` is
+                                // align-items:center — the label
+                                // centres against the 20px switch.
+                                cross-axis-alignment: center;
                                 Text { text: "Start with Windows"; font-size: 13px; color: Theme.text; }
                                 Switch { accessible-name: "Start with Windows"; on: start-with-windows; toggled => { start-with-windows = !start-with-windows; toggled-start-windows(start-with-windows); } }
                             }
@@ -282,6 +294,10 @@ export component SettingsScreen inherits VerticalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
                                 alignment: space-between;
+                                // UI-UX polish (a): preview `.row` is
+                                // align-items:center — the two-line
+                                // label centres against the switch.
+                                cross-axis-alignment: center;
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
@@ -304,6 +320,10 @@ export component SettingsScreen inherits VerticalLayout {
                             spacing: 0px;
                             HorizontalLayout {
                                 alignment: space-between;
+                                // UI-UX polish (a): preview `.card h2`
+                                // is align-items:center — the title
+                                // centres against the 30px New button.
+                                cross-axis-alignment: center;
                                 Text { text: "Profiles"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                                 Btn { label: "New"; disabled: busy-kind == 8; clicked => { new-profile(); } }
                             }
@@ -350,8 +370,8 @@ export component SettingsScreen inherits VerticalLayout {
                                     width: 190px;
                                     options: ["Dark", "Light", "Auto"];
                                     enabled: [true, true, true];
-                                    selected: theme;
-                                    selected-changed(i) => { theme = i; theme-selected(i); }
+                                    selected: theme-choice;
+                                    selected-changed(i) => { theme-choice = i; theme-selected(i); }
                                 }
                             }
                         }

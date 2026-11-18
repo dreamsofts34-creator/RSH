@@ -31,6 +31,8 @@ component ProfileRowItem inherits Rectangle {
     in property <bool> active;
     in property <bool> selected;
     in property <bool> is-preset;
+    // DS-54: Use runs an activate_profile ProfileOp job (8).
+    in property <bool> use-disabled: false;
     callback clicked();
     callback use-clicked();
     accessible-label: name + ", " + game;
@@ -54,6 +56,9 @@ component ProfileRowItem inherits Rectangle {
         padding-left: 10px;
         padding-right: 10px;
         spacing: 8px;
+        // UI-UX polish (a): the 18px tick centres in the 44px row
+        // instead of top-aligning against the text block + Use button.
+        cross-axis-alignment: center;
         // Active tick
         Rectangle {
             width: 18px;
@@ -84,7 +89,7 @@ component ProfileRowItem inherits Rectangle {
             }
             Text { text: game; font-size: 11.5px; color: Theme.mute; wrap: no-wrap; overflow: elide; }
         }
-        if !active : Btn { label: "Use"; clicked => { use-clicked(); } }
+        if !active : Btn { label: "Use"; disabled: use-disabled; clicked => { use-clicked(); } }
     }
     ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
 }
@@ -95,6 +100,10 @@ export component ProfilePopover inherits Card {
     in property <bool> unsaved: false;
     in property <bool> show-unsaved-prompt: false;
     in property <string> pending-name: "";
+    // DS-54: which job kind the busy strip shows, as a
+    // JobKind::order value (-1 = idle) — Use / New / Duplicate /
+    // Delete / Link / Save / Discard all run ProfileOp jobs (8).
+    in property <int> busy-kind: -1;
     // selected row: 0..presets.length-1 = preset, presets.length.. = my profile
     in-out property <int> selected: 0;
     // M1 (v2.0.2): free-text rename — the input below binds here so
@@ -156,6 +165,7 @@ export component ProfilePopover inherits Card {
                 active: p.active;
                 selected: selected == i;
                 is-preset: true;
+                use-disabled: busy-kind == 8;
                 clicked => { selected = i; }
                 use-clicked => { use-preset(i); }
             }
@@ -170,6 +180,7 @@ export component ProfilePopover inherits Card {
                 active: p.active;
                 selected: selected == presets.length + i;
                 is-preset: false;
+                use-disabled: busy-kind == 8;
                 clicked => { selected = presets.length + i; }
                 use-clicked => { use-profile(i); }
             }
@@ -177,12 +188,12 @@ export component ProfilePopover inherits Card {
         Rectangle { height: 1px; background: Theme.line; }
         HorizontalLayout {
             spacing: 6px;
-            Btn { label: "New"; clicked => { new-profile(); } }
-            Btn { label: "Duplicate"; clicked => { duplicate-selected(selected); } }
+            Btn { label: "New"; disabled: busy-kind == 8; clicked => { new-profile(); } }
+            Btn { label: "Duplicate"; disabled: busy-kind == 8; clicked => { duplicate-selected(selected); } }
             // M1: opens the rename input below (prefilled with the
             // selected row's name) instead of renaming at once.
             Btn { label: "Rename"; clicked => { rename-text = selected-name; rename-open = true; } }
-            Btn { label: "Delete"; clicked => { delete-selected(selected); } }
+            Btn { label: "Delete"; disabled: busy-kind == 8; clicked => { delete-selected(selected); } }
         }
         // M1: free-text rename input — Save sends the selected row +
         // the typed name, Cancel closes without touching anything.
@@ -219,12 +230,12 @@ export component ProfilePopover inherits Card {
                 }
                 HorizontalLayout {
                     spacing: 6px;
-                    Btn { label: "Save"; primary: true; disabled: rename-text == ""; clicked => { rename-open = false; rename-confirmed(selected, rename-text); } }
+                    Btn { label: "Save"; primary: true; disabled: rename-text == "" || busy-kind == 8; clicked => { rename-open = false; rename-confirmed(selected, rename-text); } }
                     Btn { label: "Cancel"; clicked => { rename-open = false; } }
                 }
             }
         }
-        Btn { label: "Link to game"; clicked => { link-selected(selected); } }
+        Btn { label: "Link to game"; disabled: busy-kind == 8; clicked => { link-selected(selected); } }
         Text { text: "Presets are read-only — duplicate one to edit it."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
         // Save / Discard prompt (§8.4): switching with unsaved changes
         if show-unsaved-prompt : Rectangle {
@@ -239,8 +250,8 @@ export component ProfilePopover inherits Card {
                 Text { text: "Save your changes before switching to “" + pending-name + "”?"; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
                 HorizontalLayout {
                     spacing: 6px;
-                    Btn { label: "Save"; primary: true; clicked => { save-and-switch(); } }
-                    Btn { label: "Discard"; clicked => { discard-and-switch(); } }
+                    Btn { label: "Save"; primary: true; disabled: busy-kind == 8; clicked => { save-and-switch(); } }
+                    Btn { label: "Discard"; disabled: busy-kind == 8; clicked => { discard-and-switch(); } }
                     Btn { label: "Cancel"; clicked => { cancel-switch(); } }
                 }
             }

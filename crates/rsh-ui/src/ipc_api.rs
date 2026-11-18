@@ -32,7 +32,9 @@
 //! at connect time; [`IpcApi::poll_events`] drains them for the
 //! UI's frame loop.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -67,8 +69,9 @@ use rsh_ipc::{IpcClient, IpcError};
 /// A slot is `None` until its first fetch — reads fall back exactly
 /// as they did on an IPC error before (empty lists, `"Unknown"`,
 /// neutral tuning), so a cold cache is indistinguishable from a
-/// failed call. `generation` bumps at the end of every completed
-/// slow cycle; the frame timer re-syncs the pages when it changes.
+/// failed call. `generation` bumps at the end of a completed slow
+/// cycle whose content actually changed (R2-11); the frame timer
+/// re-syncs the pages when it changes.
 struct LiveCache {
     connection: Mutex<Option<ConnectionInfo>>,
     snapshot: Mutex<Option<SnapshotInfo>>,
@@ -116,6 +119,15 @@ struct LiveCache {
     /// Set by a successful write (or the UI) to pull the next slow
     /// cycle forward at once instead of waiting out the 1 s period.
     refresh_requested: AtomicBool,
+    /// Set alongside `refresh_requested` (R2-11): a cycle pulled
+    /// forward by a write always bumps the generation, even when
+    /// its content hashes back to a previously seen value — the
+    /// write guarantees the UI must re-read (edit then discard
+    /// inside one cycle: the cycle never saw the dirty state, so a
+    /// pure content check would swallow the revert). Consumed by
+    /// the bump, not by the poller loop, so an epoch-skipped cycle
+    /// leaves it set for the next one.
+    refresh_forced: AtomicBool,
     /// Write epoch (DS-29): bumped by every `request_slow_refresh`
     /// — a slow cycle that started before the epoch moved can carry
     /// pre-write values, so it must not bump `generation` (see
@@ -123,6 +135,13 @@ struct LiveCache {
     /// above is set, so the next bump carries post-write values.
     refresh_epoch: AtomicU64,
     generation: AtomicU64,
+    /// Content hash of the slow values the generation last bumped
+    /// for (R2-11): the generation only bumps when a slow cycle's
+    /// content actually changed, so the frame timer stops re-syncing
+    /// every page ~1 Hz while nothing moved. `content_hash_set` is
+    /// false until the first cycle bumps (a cold cache always bumps).
+    content_hash: AtomicU64,
+    content_hash_set: AtomicBool,
 }
 
 impl Default for LiveCache {
@@ -156,8 +175,11 @@ impl Default for LiveCache {
             draft: Mutex::new(None),
             slow_filled: AtomicBool::new(false),
             refresh_requested: AtomicBool::new(false),
+            refresh_forced: AtomicBool::new(false),
             refresh_epoch: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            content_hash: AtomicU64::new(0),
+            content_hash_set: AtomicBool::new(false),
         }
     }
 }
@@ -558,10 +580,13 @@ impl IpcApi {
         self.cache.slow_filled.load(Ordering::Relaxed)
     }
 
-    /// Current slow-cache generation (F5): bumps at the end of
-    /// every completed slow cycle. The frame timer re-syncs the
-    /// pages when it changes — that is how a daemon-side change
-    /// reaches the UI without any UI-thread IPC.
+    /// Current slow-cache generation (F5): bumps at the end of a
+    /// completed slow cycle whose content actually changed (R2-11 —
+    /// a cycle that reads back identical values does not bump), or
+    /// of a cycle a write pulled forward (a discard can hash back
+    /// to a previously seen value and still must bump). The frame
+    /// timer re-syncs the pages when it changes — that is how a
+    /// daemon-side change reaches the UI without any UI-thread IPC.
     #[must_use]
     pub fn slow_generation(&self) -> u64 {
         self.cache.generation.load(Ordering::Relaxed)
@@ -574,9 +599,23 @@ impl IpcApi {
     /// when it starts the early cycle.
     pub fn request_slow_refresh(&self) {
         self.cache.refresh_requested.store(true, Ordering::Relaxed);
+        // R2-11: the pulled-forward cycle always bumps (see
+        // `refresh_forced`) — the write guarantees a re-read.
+        self.cache.refresh_forced.store(true, Ordering::Relaxed);
         // DS-29: a write is in flight — a slow cycle that started
         // before this must not bump the generation with pre-write
         // values (see `refresh_slow`).
+        self.cache.refresh_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump the write epoch WITHOUT pulling a slow cycle forward
+    /// (R2-13): `set_tuning` calls this instead of
+    /// [`Self::request_slow_refresh`] — the cache is already updated
+    /// in place by the write, so no forced slow re-sync is needed,
+    /// but a slow cycle that started before the write must still
+    /// not bump the generation with pre-write values (DS-29). The
+    /// normal ~1 Hz cycle picks up the rest.
+    fn note_write_epoch(&self) {
         self.cache.refresh_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -678,8 +717,9 @@ impl IpcApi {
 /// 500 ms call, never the whole pass. A failed step keeps its last
 /// good value (or the cold-cache fallback): a slow value going
 /// briefly stale beats a frozen frame. A completed pass marks the
-/// cache filled and bumps the generation, so the frame timer
-/// re-syncs the pages from the fresh values.
+/// cache filled and bumps the generation when its content actually
+/// changed (R2-11), so the frame timer re-syncs the pages from the
+/// fresh values — and stays quiet while nothing moved.
 #[allow(clippy::too_many_lines)]
 async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     if cache.link_dead.load(Ordering::Relaxed) {
@@ -701,6 +741,9 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
         Err(_) => None,
     };
     if let Some(state) = slow_state {
+        // R2-11: hash the whole state BEFORE the slots below move
+        // its fields out (the tunings loop moves `state.tunings`).
+        let state_hash = slow_state_hash(&state);
         macro_rules! set_slot {
             ($slot:ident, $value:expr) => {
                 if let Ok(mut slot) = cache.$slot.lock() {
@@ -751,17 +794,23 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
             }
         }
         cache.slow_filled.store(true, Ordering::Relaxed);
-        bump_generation_if_fresh(cache, epoch);
+        bump_generation_if_fresh_and_changed(cache, epoch, state_hash);
         return;
     }
+    // R2-11 (fallback path): the raw replies feed the content hash
+    // below — a cycle that reads back identical values must not
+    // bump the generation.
+    let mut hasher = DefaultHasher::new();
     // One call, parsed or ignored. `parse` turns the reply into
     // the slot's value (`None` = unparseable, keep the old value).
+    // A successful reply also feeds the content hash (R2-11).
     macro_rules! fetch {
         ($method:literal, $slot:ident, $parse:expr) => {{
             if cache.link_dead.load(Ordering::Relaxed) {
                 return;
             }
             if let Ok(value) = client.call($method, serde_json::json!({})).await {
+                value.hash(&mut hasher);
                 let parse: fn(&serde_json::Value) -> Option<_> = $parse;
                 if let Some(parsed) = parse(&value) {
                     if let Ok(mut slot) = cache.$slot.lock() {
@@ -840,6 +889,7 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     // whichever parsed, so a saved draft clears the cached one.
     if !cache.link_dead.load(Ordering::Relaxed) {
         if let Ok(value) = client.call("draft_status", serde_json::json!({})).await {
+            value.hash(&mut hasher);
             if let Ok(draft) = serde_json::from_value::<Option<DraftStatus>>(value) {
                 if let Ok(mut slot) = cache.draft.lock() {
                     *slot = draft;
@@ -866,6 +916,7 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
             .call("get_tuning", serde_json::json!({"module": module}))
             .await
         {
+            value.hash(&mut hasher);
             if let Ok(tuning) = serde_json::from_value::<TuningSettings>(value) {
                 if let Ok(mut tunings) = cache.tunings.lock() {
                     tunings.insert(module.to_string(), tuning);
@@ -881,6 +932,7 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
             .call("module_enabled", serde_json::json!({"module": module}))
             .await
         {
+            value.hash(&mut hasher);
             if let Some(enabled) = value.get("enabled").and_then(serde_json::Value::as_bool) {
                 if let Ok(mut modules) = cache.modules.lock() {
                     modules[index] = Some(enabled);
@@ -889,19 +941,55 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
         }
     }
     cache.slow_filled.store(true, Ordering::Relaxed);
-    bump_generation_if_fresh(cache, epoch);
+    bump_generation_if_fresh_and_changed(cache, epoch, hasher.finish());
 }
 
-/// Bump the slow generation when the cycle's data is fresh
-/// (DS-29): skip the bump when a write asked for a refresh while
-/// this cycle ran — the cycle may carry pre-write values, and its
-/// bump would tell the UI (and the `discard_draft` test) the cache
-/// is current when it is not. `slow_filled` is NOT gated: the slots
-/// still hold genuine daemon values, only possibly a cycle old.
-fn bump_generation_if_fresh(cache: &LiveCache, epoch: u64) {
-    if cache.refresh_epoch.load(Ordering::Relaxed) == epoch {
-        cache.generation.fetch_add(1, Ordering::Relaxed);
+/// Content hash of one combined slow-poll reply (R2-11): the
+/// generation only bumps when the slow values actually changed.
+/// `SlowPollState` serialises deterministically (struct field order
+/// and sorted `BTreeMap`s), so equal content hashes equal. The hash
+/// is only ever compared with itself in this process.
+fn slow_state_hash(state: &SlowPollState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    serde_json::to_string(state)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Bump the slow generation when the cycle's data is fresh AND
+/// (changed OR pulled forward by a write) (DS-29 + R2-11): skip
+/// the bump when a write asked for a refresh while this cycle ran
+/// — the cycle may carry pre-write values, and its bump would tell
+/// the UI (and the `discard_draft` test) the cache is current when
+/// it is not. Also skip it when the cycle's content hash equals
+/// the last bumped hash — an unchanged cycle must not re-sync the
+/// pages — unless the cycle was pulled forward by a write, which
+/// always bumps. `slow_filled` is NOT gated: the slots still hold
+/// genuine daemon values, only possibly a cycle old.
+fn bump_generation_if_fresh_and_changed(cache: &LiveCache, epoch: u64, hash: u64) {
+    if cache.refresh_epoch.load(Ordering::Relaxed) != epoch {
+        // DS-29: a write landed mid-cycle — this cycle may carry
+        // pre-write values, so it must not bump. `refresh_forced`
+        // stays set: the next cycle still owes the re-read.
+        return;
     }
+    // R2-11: a cycle pulled forward by a write always bumps — the
+    // write guarantees the UI must re-read, even when the content
+    // hashes back to a previously seen value (edit then discard
+    // inside one cycle: the cycle never saw the dirty state, so a
+    // pure content check would swallow the revert). Otherwise bump
+    // only when the content actually changed.
+    let forced = cache.refresh_forced.swap(false, Ordering::Relaxed);
+    if !forced
+        && cache.content_hash_set.load(Ordering::Relaxed)
+        && cache.content_hash.load(Ordering::Relaxed) == hash
+    {
+        return;
+    }
+    cache.content_hash.store(hash, Ordering::Relaxed);
+    cache.content_hash_set.store(true, Ordering::Relaxed);
+    cache.generation.fetch_add(1, Ordering::Relaxed);
 }
 
 impl AppApi for IpcApi {
@@ -1087,13 +1175,17 @@ impl AppApi for IpcApi {
             Ok(stored) => {
                 // F5/F6: the stored record is the cache now, the
                 // draft is dirty at once (the daemon marks it), and
-                // the poller re-fetches the rest promptly — the next
-                // sync reads the new values, not the pre-push ones.
+                // the normal ~1 Hz cycle picks up the rest — no
+                // forced slow refresh (R2-13: a slider drag must not
+                // trigger a full slow re-sync). Only the write epoch
+                // moves (DS-29), so a cycle that started before this
+                // write cannot bump the generation with pre-write
+                // values.
                 if let Ok(mut tunings) = self.cache.tunings.lock() {
                     tunings.insert(stored.module.clone(), stored.clone());
                 }
                 self.mark_draft_dirty(&stored.module);
-                self.request_slow_refresh();
+                self.note_write_epoch();
                 Ok(stored)
             }
             Err(_) => Err(Self::ipc_failed()),
@@ -2287,6 +2379,45 @@ mod tests {
         assert_eq!(client.get_tuning("brake").module, "brake");
         assert_eq!(client.pairing_status().seconds_left, 0);
         assert!(!client.firmware_update_status().running);
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-11: the slow generation bumps only when the slow values
+    /// actually change — identical cycles stay quiet, a real write
+    /// bumps again.
+    #[test]
+    #[cfg(unix)]
+    fn slow_generation_bumps_only_on_content_change() {
+        let (client, dir, handle, _guard) = live_client();
+        assert!(
+            wait_for(&client, IpcApi::slow_filled),
+            "slow cache should fill"
+        );
+        let generation = client.slow_generation();
+        assert!(generation > 0, "first cycle bumps");
+        // Two more ~1 s cycles over an unchanged sim: no bump.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(
+            client.slow_generation(),
+            generation,
+            "unchanged values must not bump"
+        );
+        // A real change bumps again.
+        let mut upd = TuningSettings::neutral("steering");
+        upd.deadzone = 5.0;
+        client.set_tuning(&upd).expect("set_tuning");
+        let mut waited = 0;
+        while client.slow_generation() == generation && waited < 100 {
+            std::thread::sleep(Duration::from_millis(50));
+            waited += 1;
+        }
+        assert_ne!(
+            client.slow_generation(),
+            generation,
+            "changed values must bump"
+        );
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);

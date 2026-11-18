@@ -227,12 +227,22 @@ fn footer_accent_count(rgba: &[u8], width: u32, height: u32) -> usize {
 
 /// Bounding box (`min_x`, `max_x`, `min_y`, `max_y`) of the accent pixels
 /// in the footer strip, or `None` when the Next button is disabled.
+///
+/// The scan is restricted to the main column (x >= 264, the sidebar
+/// width): the sidebar's "now" step circle is accent-filled too, and
+/// with the preview-faithful 10px step-row padding (UI-UX polish) the
+/// step-5 circle at step 4 sits inside the bottom 30% strip — a
+/// whole-window union bbox would then centre on dead space between
+/// the circle and the Finish button and the finish click would miss.
+/// The footer button always lives in the main column, so sidebar
+/// pixels can never be it.
 #[must_use]
 fn footer_accent_box(rgba: &[u8], width: u32, height: u32) -> Option<(usize, usize, usize, usize)> {
     let footer_first_row = height as usize * 70 / 100;
+    let main_column_first_col = 264_usize;
     let mut bbox: Option<(usize, usize, usize, usize)> = None;
     for y in footer_first_row..height as usize {
-        for x in 0..width as usize {
+        for x in main_column_first_col..width as usize {
             let idx = (y * width as usize + x) * 4;
             let (red, green, blue) = (
                 i32::from(rgba[idx]),
@@ -654,6 +664,12 @@ fn ui_wizard_gating() -> Outcome {
             &instance,
             (bx.0 + bx.1) as f32 / 2.0,
             (bx.2 + bx.3) as f32 / 2.0,
+        );
+    } else {
+        report.check(
+            "wizard-click-finish-nobox",
+            false,
+            "enabled Finish button not found in the footer (no accent fill)",
         );
     }
     report.check(
