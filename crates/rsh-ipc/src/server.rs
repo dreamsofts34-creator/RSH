@@ -91,14 +91,18 @@ impl IpcServer {
                     // connection task — no `spawn_blocking` hop, no
                     // thread-pool wakeup. The response still travels
                     // on `resp_tx` so writes stay ordered with
-                    // events; awaiting the send is safe (the select
-                    // re-polls and the drain arm runs while we wait).
+                    // events. R2-49: `try_send`, never `send().await`
+                    // here — awaiting the send inside the read arm
+                    // wedged the connection task when the 64-slot
+                    // response channel filled (the old path used
+                    // `blocking_send` on a pool thread). A dropped
+                    // cheap response is superseded by the next poll.
                     if parsed
                         .as_ref()
                         .is_ok_and(|request| is_cheap_method(&request.method))
                     {
                         if let Some(text) = self.response_text(&line) {
-                            let _ = resp_tx.send(text).await;
+                            let _ = resp_tx.try_send(text);
                         }
                         continue;
                     }
@@ -107,9 +111,11 @@ impl IpcServer {
                     let Ok(permit) = dispatch_permits.clone().try_acquire_owned() else {
                         // DS-28: too many dispatches in flight on
                         // this connection — answer `Busy` instead of
-                        // queueing unbounded work.
+                        // queueing unbounded work. R2-49: `try_send`
+                        // for the same reason as the cheap path —
+                        // never await a send inside the read arm.
                         if let Some(text) = busy_response_text(&line) {
-                            let _ = resp_tx.send(text).await;
+                            let _ = resp_tx.try_send(text);
                         }
                         continue;
                     };
@@ -133,39 +139,81 @@ impl IpcServer {
                     }
                 }
                 event = event_rx.recv(), if subscribed => {
-                    // DS-17 (B-05): `Lagged` means this subscriber
-                    // fell behind the 256-capacity channel — skip to
-                    // the newest event instead of tearing the whole
-                    // connection down (the old code treated it like
-                    // `Closed`, so a burst of events during a UI
-                    // stall forced a reconnect + re-subscribe).
-                    // Only `Closed` ends the connection.
-                    let event = match event {
-                        Ok(event) => event,
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            let mut latest = None;
-                            while let Ok(event) = event_rx.try_recv() {
-                                latest = Some(event);
-                            }
-                            let Some(event) = latest else { continue };
-                            event
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    };
-                    let frame = IpcEventFrame { v: IPC_PROTOCOL_VERSION, event };
-                    match serde_json::to_string(&frame) {
-                        Ok(text) => {
-                            if writer.write_all(text.as_bytes()).await.is_err()
-                                || writer.write_all(b"\n").await.is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                    if !Self::forward_event(&mut writer, event, &mut event_rx).await {
+                        break;
                     }
                 }
             }
         }
+    }
+
+    /// Forward one received broadcast outcome to the client.
+    /// Returns `false` when the connection must end (channel closed,
+    /// or a write failed).
+    ///
+    /// DS-17 (B-05): `Lagged` means this subscriber fell behind the
+    /// 256-capacity channel — skip to the newest event instead of
+    /// tearing the whole connection down (the old code treated it
+    /// like `Closed`, so a burst of events during a UI stall forced
+    /// a reconnect + re-subscribe). Only `Closed` ends the
+    /// connection.
+    ///
+    /// R2-30: on `Lagged`, drain everything queued and forward the
+    /// one-shot events the wizard waits on (`PairingFinished` /
+    /// `ConnectionChanged`) in order, plus the newest event — a
+    /// lagged burst must never silently drop a pairing completion
+    /// (the old code kept only the newest event).
+    async fn forward_event<W>(
+        writer: &mut W,
+        result: Result<AppEvent, broadcast::error::RecvError>,
+        event_rx: &mut broadcast::Receiver<AppEvent>,
+    ) -> bool
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let events: Vec<AppEvent> = match result {
+            Ok(event) => vec![event],
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                let mut drained = Vec::new();
+                while let Ok(event) = event_rx.try_recv() {
+                    drained.push(event);
+                }
+                let Some(latest) = drained.pop() else {
+                    return true;
+                };
+                let mut out: Vec<AppEvent> = drained
+                    .into_iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            AppEvent::PairingFinished { .. } | AppEvent::ConnectionChanged { .. }
+                        )
+                    })
+                    .collect();
+                if !out.contains(&latest) {
+                    out.push(latest);
+                }
+                out
+            }
+            Err(broadcast::error::RecvError::Closed) => return false,
+        };
+        for event in events {
+            let frame = IpcEventFrame {
+                v: IPC_PROTOCOL_VERSION,
+                event,
+            };
+            match serde_json::to_string(&frame) {
+                Ok(text) => {
+                    if writer.write_all(text.as_bytes()).await.is_err()
+                        || writer.write_all(b"\n").await.is_err()
+                    {
+                        return false;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+        true
     }
 
     /// Encode one request line's response (DS-28): shared by the
@@ -573,6 +621,7 @@ mod tests {
                 tx_fail: 3,
                 ipc_p50_ms: None,
                 ipc_p99_ms: None,
+                ipc_per_method_ms: Vec::new(),
             })
         }
 
@@ -688,6 +737,74 @@ mod tests {
         });
         let (tx, _rx) = broadcast::channel(64);
         (Arc::new(IpcServer::new(api, tx.clone())), tx)
+    }
+
+    /// R2-30: a lagged burst must still deliver the one-shot
+    /// `PairingFinished` — the old code kept only the newest event,
+    /// so a pairing completion buried in a lag burst was silently
+    /// dropped and the wizard waited forever.
+    #[test]
+    fn lagged_burst_still_delivers_pairing_finished() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let (server, events) = stub_server_with_events();
+            let (client_side, server_side) = tokio::io::duplex(65536);
+            let serve = tokio::spawn(async move {
+                server.serve_stream(server_side).await;
+            });
+            let (reader, mut writer) = tokio::io::split(client_side);
+            let mut lines = BufReader::new(reader).lines();
+            writer
+                .write_all(b"{\"v\":1,\"id\":1,\"method\":\"subscribe\",\"params\":{}}\n")
+                .await
+                .expect("write subscribe");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Flood the 64-capacity channel, then the pairing
+            // completion: even if the subscriber lags, the
+            // completion must be forwarded (not just the newest
+            // event).
+            for _ in 0..100 {
+                let _ = events.send(AppEvent::ConnectionChanged {
+                    state: ConnectionState::Active,
+                    label: "Connected".to_string(),
+                    reason: None,
+                });
+            }
+            let _ = events.send(AppEvent::PairingFinished {
+                ok: true,
+                error: None,
+            });
+            let mut delivered = false;
+            for _ in 0..300 {
+                let line =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+                        .await
+                        .expect("read timeout")
+                        .expect("read line")
+                        .expect("a line");
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: serde_json::Value =
+                    serde_json::from_str(&line).expect("server writes JSON lines");
+                if let Some(event) = value.get("event")
+                    && event.get("type") == Some(&serde_json::json!("PairingFinished"))
+                    && event.get("ok") == Some(&serde_json::json!(true))
+                {
+                    delivered = true;
+                    break;
+                }
+            }
+            assert!(delivered, "PairingFinished must survive a lagged burst");
+            assert!(
+                !serve.is_finished(),
+                "the connection task must still be alive"
+            );
+            serve.abort();
+        });
     }
 
     /// DS-17: a subscriber that falls behind the broadcast channel

@@ -565,6 +565,8 @@ fn resolve_theme_mode(choice: i32, system_light: bool) -> i32 {
 /// Best-effort — any failure (no `reg`, no key) means Dark.
 #[cfg(windows)]
 fn system_light() -> bool {
+    // R2-03 (S-02): no console window flashes for the `reg` probe.
+    use std::os::windows::process::CommandExt;
     let Ok(out) = std::process::Command::new("reg")
         .args([
             "query",
@@ -572,6 +574,7 @@ fn system_light() -> bool {
             "/v",
             "AppsUseLightTheme",
         ])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .output()
     else {
         return false;
@@ -1107,7 +1110,17 @@ fn fetch_app_update() -> Result<AppUpdateVerdict, UserError> {
         what_to_do: "Check your connection and try again.".to_string(),
         detail: None,
     };
-    let output = std::process::Command::new(CURL_BIN)
+    // R2-03 (S-08): no console window flashes for the `curl` update
+    // check. `CURL_BIN` is `curl.exe` on Windows and `curl`
+    // elsewhere, so the flag is applied in a `#[cfg(windows)]`
+    // block after building the command, not in the chain.
+    let mut curl = std::process::Command::new(CURL_BIN);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        curl.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let output = curl
         .args([
             "-sS",
             "--fail",

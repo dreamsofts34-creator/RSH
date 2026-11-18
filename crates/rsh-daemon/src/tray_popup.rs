@@ -75,6 +75,8 @@ static SYSTEM_LIGHT_CACHE: std::sync::Mutex<Option<(std::time::Instant, bool)>> 
 /// Best-effort: any failure (no `reg`, no key) means Dark.
 #[cfg(windows)]
 fn system_light_uncached() -> bool {
+    // R2-03 (S-03): no console window flashes for the `reg` probe.
+    use std::os::windows::process::CommandExt;
     let Ok(out) = std::process::Command::new("reg")
         .args([
             "query",
@@ -82,6 +84,7 @@ fn system_light_uncached() -> bool {
             "/v",
             "AppsUseLightTheme",
         ])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .output()
     else {
         return false;

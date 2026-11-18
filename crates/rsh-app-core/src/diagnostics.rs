@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -476,7 +476,20 @@ fn identity_of(_meta: &fs::Metadata) -> FileIdentity {
 struct OpenLog {
     file: File,
     identity: FileIdentity,
+    /// When the on-disk identity was last re-checked (R2-45):
+    /// the per-line `fs::metadata` staleness check costs a syscall
+    /// on every log line (× 2 locations for fatal lines), so the
+    /// identity is re-checked at most once per
+    /// [`LOG_IDENTITY_CHECK_INTERVAL`]; between checks the cached
+    /// handle is trusted.
+    last_checked: Instant,
 }
+
+/// Re-check a held-open log file's on-disk identity at most this
+/// often (R2-45): 60 s is far shorter than any log rotation, and
+/// long enough that the per-line metadata syscalls disappear from
+/// the steady-state log path.
+const LOG_IDENTITY_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Held-open log handles, keyed by full log path (DS-77).
 static LOG_HANDLES: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, OpenLog>>> =
@@ -544,11 +557,28 @@ fn write_log_line(log_dir: &Path, line: &str, now: SystemTime) -> Option<PathBuf
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let stale = match handles.get(&path) {
         Some(open) => {
-            let identity_mismatch = match fs::metadata(&path) {
-                Ok(meta) => identity_of(&meta) != open.identity,
-                Err(_) => true,
-            };
-            identity_mismatch || file_is_unlinked(&open.file)
+            // R2-45: the unlink check runs every line — it is a
+            // single `fstat` on the already-open fd (cheap, and it
+            // is what catches a delete+recreate / external rotation
+            // immediately; see the DS-77 test). Only the *path*
+            // `fs::metadata` identity comparison is throttled to
+            // once per `LOG_IDENTITY_CHECK_INTERVAL`: the path lookup
+            // on every line (× 2 locations) was the steady-state
+            // cost, and a replace-with-a-different-file is caught
+            // within 60 s. (On non-Unix the unlink check is a stub,
+            // so the throttled identity check is the only guard
+            // there — deleting an open file is impossible on Windows,
+            // so the window only delays replace detection.)
+            if file_is_unlinked(&open.file) {
+                true
+            } else if open.last_checked.elapsed() < LOG_IDENTITY_CHECK_INTERVAL {
+                false
+            } else {
+                match fs::metadata(&path) {
+                    Ok(meta) => identity_of(&meta) != open.identity,
+                    Err(_) => true,
+                }
+            }
         }
         None => true,
     };
@@ -562,9 +592,23 @@ fn write_log_line(log_dir: &Path, line: &str, now: SystemTime) -> Option<PathBuf
             .metadata()
             .ok()
             .map_or(FileIdentity(0, 0), |meta| identity_of(&meta));
-        handles.insert(path.clone(), OpenLog { file, identity });
+        handles.insert(
+            path.clone(),
+            OpenLog {
+                file,
+                identity,
+                last_checked: Instant::now(),
+            },
+        );
     }
     let open = handles.get_mut(&path)?;
+    // R2-45: record the check time on the re-check path — the
+    // `stale` branch above runs only when the interval elapsed, so
+    // updating here keeps the 60 s cadence without a second clock
+    // read on the hot path.
+    if open.last_checked.elapsed() >= LOG_IDENTITY_CHECK_INTERVAL {
+        open.last_checked = Instant::now();
+    }
     open.file.write_all(line.as_bytes()).ok()?;
     Some(path)
 }
