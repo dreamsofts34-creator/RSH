@@ -233,12 +233,17 @@ impl AppApi for DaemonApi {
             replacement_required: status.replacement_required,
             key_reset_armed: status.key_reset_armed,
             // DS-25: the pairing attempt trail (HELO sends, HELLO
-            // replies, timeouts — see `AppStateCore::pairing_log_lines`)
-            // rides on the status the wizard already polls, so the UI
-            // can show e.g. "Sent HELO to 192.168.4.1 — no reply
-            // (3 tries)" instead of only "No pairing window". The
-            // log lines are redacted at the source (never a password).
-            attempt_log: self.state.pairing_log_lines(),
+            // replies, timeouts — see
+            // `AppStateCore::pairing_log_tail_lines`) rides on the
+            // status the wizard already polls, so the UI can show
+            // e.g. "Sent HELO to 192.168.4.1 — no reply (3 tries)"
+            // instead of only "No pairing window". The log lines
+            // are redacted at the source (never a password).
+            // R2-42: the retained tail (≤20 lines), never the full
+            // ≤200-line buffer — the slow poller calls this ~1 Hz.
+            // R2-23: the tail is never drained, so the manager
+            // loop's 250 ms file drain cannot starve this reader.
+            attempt_log: self.state.pairing_log_tail_lines(),
         }
     }
 

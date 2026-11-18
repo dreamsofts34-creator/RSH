@@ -48,8 +48,11 @@ export component MainWindow inherits Window {
     min-height: 580px;
     background: Theme.bg;
     // A8 (v2.0.2): the window theme drives the global tokens — the
-    // whole UI repaints when it changes (Dark 0 / Light 1 / Auto 2;
-    // Auto renders as Dark here until Rust resolves the OS choice).
+    // whole UI repaints when it changes. `theme` is the RESOLVED
+    // value only (0 Dark / 1 Light) — it never holds 2, so Auto
+    // never flashes the UI dark (R2-31). The stored choice
+    // (0/1/2) lives in `theme-choice` below, which is what the
+    // Settings segment binds to.
     // (A `Theme.mode: theme;` binding is not valid Slint — globals
     // are written from code, so the change handler does it.)
     changed theme => { Theme.mode = theme; }
@@ -63,7 +66,8 @@ export component MainWindow inherits Window {
     in-out property <bool> auto-paused: false;
     in-out property <int> transport: 0;   // 0 Wi-Fi, 1 USB
     in-out property <int> controller: 1;  // 0 HIDMaestro, 1 vJoy (vJoy is the default, user order 2026-11-16)
-    in-out property <int> theme: 0;       // 0 Dark, 1 Light, 2 Auto (v2.0.2: Light added; Auto is resolved to Dark/Light by Rust)
+    in-out property <int> theme: 0;       // Resolved window theme: 0 Dark, 1 Light (never 2 — R2-31). Drives Theme.mode.
+    in-out property <int> theme-choice: 0; // Stored theme choice: 0 Dark, 1 Light, 2 Auto (R2-31). The Settings segment binds to this, so Auto stays visibly selected.
     in-out property <int> pressed-index: -1;
     in-out property <int> selected-index: 5; // A4: index 5 = "Gear 3" (preview), not 0
     in property <[string]> button-actions: ["Shift up", "Shift down", "Horn", "Gear 1", "Gear 2", "Gear 3", "Gear 4", "Gear 5", "Gear 6", "Handbrake", "Not set", "Not set"];
@@ -126,6 +130,14 @@ export component MainWindow inherits Window {
     in property <float> curve-val;
     in property <string> curve-text;
     in property <int> preset;
+    // Advanced mode (R2-16, REDESIGN-PLAN §7.2): steering centre
+    // mV (captured calibration) + live raw mV per axis (~1 Hz).
+    // "—" until measured — never a fake 0.
+    in property <string> steer-centre-mv-text: "—";
+    in property <string> steer-raw-mv-text: "—";
+    in property <string> throttle-raw-mv-text: "—";
+    in property <string> brake-raw-mv-text: "—";
+    in property <string> clutch-raw-mv-text: "—";
     // Steering centre (A22): pill only once set; button disabled
     // while the calibration backend is unavailable.
     in property <bool> centre-set: false;
@@ -287,6 +299,10 @@ export component MainWindow inherits Window {
     in-out property <string> diag-seq-gaps-text: "—";
     in-out property <string> diag-frame-p50-text: "—";
     in-out property <string> diag-frame-p99-text: "—";
+    // R2-46: paint-completion p50/p99 (refresh start to Slint
+    // AfterRendering) — "—" until a paint is observed.
+    in-out property <string> diag-paint-p50-text: "—";
+    in-out property <string> diag-paint-p99-text: "—";
     in-out property <string> diag-ipc-p50-text: "—";
     in-out property <string> diag-ipc-p99-text: "—";
     in-out property <[bool]> diag-buttons-pressed;
@@ -503,7 +519,12 @@ export component MainWindow inherits Window {
                     if page >= 1 && page <= 4 : HorizontalLayout {
                         horizontal-stretch: 0;
                         spacing: 8px;
-                        SegmentedControl {
+                        // R2-16: the preview shows the Basic/Advanced
+                        // segment only on Steering (Wheel.html) and
+                        // Pedals (Pedals.html) — it never did anything
+                        // on Buttons/Extras, so it is not shown there.
+                        // (Profile + Save stay on all four pages.)
+                        if page == 1 || page == 2 : SegmentedControl {
                             option-0: "Basic";
                             option-1: "Advanced";
                             selected: advanced ? 1 : 0;
@@ -563,6 +584,9 @@ export component MainWindow inherits Window {
                 pair-now => { pair-now-requested(); }
             }
             if page == 1 : SteeringPage {
+                advanced: advanced;
+                centre-mv-text: steer-centre-mv-text;
+                raw-mv-text: steer-raw-mv-text;
                 input-pct: input-pct;
                 output-pct: output-pct;
                 marker-vx: marker-vx;
@@ -583,6 +607,7 @@ export component MainWindow inherits Window {
                 curve-changed(v) => { curve-changed(v); }
                 deadzone-edited(t) => { deadzone-edited(t); }
                 curve-edited(t) => { curve-edited(t); }
+                curve-exponent-edited(t) => { curve-edited(t); }
                 preset-selected(i) => { preset-selected(i); }
                 reset-defaults => { reset-defaults(); }
                 set-centre => { set-centre(); }
@@ -591,6 +616,11 @@ export component MainWindow inherits Window {
                 // Live values come from the window (Rust drives them);
                 // mV / feel / deadzone / curves come from get_tuning
                 // via the window props below — never literals (A1/A2).
+                // R2-16: Advanced mode (live raw mV per pedal).
+                advanced: advanced;
+                throttle-raw-mv: throttle-raw-mv-text;
+                brake-raw-mv: brake-raw-mv-text;
+                clutch-raw-mv: clutch-raw-mv-text;
                 throttle-pct: throttle;
                 throttle-up-mv: throttle-up-mv;
                 throttle-down-mv: throttle-down-mv;
@@ -711,7 +741,10 @@ export component MainWindow inherits Window {
                 // Theme is 0 Dark / 1 Light / 2 Auto on both sides now
                 // (v2.0.2, A8) — the screen passes the index straight
                 // through and Rust persists it ("Dark"/"Light"/"Auto").
-                theme: theme;
+                // R2-31: the segment binds to the stored choice
+                // (`theme-choice`), never to the resolved `theme` —
+                // Auto stays selected instead of flipping to Dark/Light.
+                theme: theme-choice;
                 profiles: settings-profiles;
                 app-version: "RSH " + app-version;
                 firmware-text: firmware-text;
@@ -728,7 +761,7 @@ export component MainWindow inherits Window {
                 toggled-start-windows(b) => { autostart-selected(b); }
                 // M-7: forward the new switch state, don't drop it.
                 toggled-keep-tray(b) => { keep-tray-selected(b); }
-                theme-selected(i) => { theme = i; theme-persist(i); }
+                theme-selected(i) => { theme-choice = i; theme-persist(i); }
                 new-profile => { settings-action("new-profile"); }
                 use-profile(i) => { settings-use-profile(i); }
                 duplicate-profile(i) => { settings-duplicate-profile(i); }
@@ -891,6 +924,8 @@ export component MainWindow inherits Window {
         seq-gaps-text: diag-seq-gaps-text;
         frame-p50-text: diag-frame-p50-text;
         frame-p99-text: diag-frame-p99-text;
+        paint-p50-text: diag-paint-p50-text;
+        paint-p99-text: diag-paint-p99-text;
         ipc-p50-text: diag-ipc-p50-text;
         ipc-p99-text: diag-ipc-p99-text;
         conn-label: diag-conn-label;

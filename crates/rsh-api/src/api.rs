@@ -216,6 +216,12 @@ pub struct SlowPollState {
     /// Calibration, when a board session is live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration: Option<CalibrationInfo>,
+    /// Latest raw ADC readings in mV, when the daemon can report
+    /// them (R2-16: the Advanced-mode live readouts — steering /
+    /// pedal raw values at the ~1 Hz slow rate). `None` = no live
+    /// frame yet; the UI shows "—", never a fake 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_mv: Option<RawMv>,
     /// Stored profiles.
     pub profiles: Vec<ProfileSummary>,
     /// Catalogue games with install / running state.
@@ -643,6 +649,7 @@ pub trait AppApi: Send + Sync {
             diag_stats: self.diag_stats().ok(),
             pairing_status: self.pairing_status(),
             calibration: self.calibration().ok(),
+            raw_mv: self.raw_mv().ok(),
             profiles: self.list_profiles(),
             games: self.list_games(),
             firmware_check: self.firmware_check().ok(),
@@ -1513,6 +1520,7 @@ mod tests {
         // fetch before).
         assert!(slow.diag_stats.is_none());
         assert!(slow.calibration.is_none());
+        assert!(slow.raw_mv.is_none());
         assert!(slow.firmware_check.is_some());
         assert!(slow.vjoy_status.is_none());
         assert_eq!(slow.profiles, Vec::new());

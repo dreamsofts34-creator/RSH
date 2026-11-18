@@ -720,6 +720,11 @@ enum JobKind {
     CaptureOp,
     /// Learn (F6, v2.0.3): start / cancel / poll.
     LearnOp,
+    /// Learn toggle (R2-35): the user's Learn start/cancel click.
+    /// Separate from [`JobKind::LearnOp`] (the 1 Hz poll job), so
+    /// a click while a poll job is in flight is not swallowed by
+    /// the duplicate-start rule — it runs on its own kind.
+    LearnToggle,
     /// Pairing (F6, v2.0.3): begin pairing, wizard connect.
     PairingOp,
     /// Games (F6, v2.0.3): launch / stop / refresh.
@@ -766,6 +771,7 @@ impl JobKind {
             | JobKind::BindingOp
             | JobKind::CaptureOp
             | JobKind::LearnOp
+            | JobKind::LearnToggle
             | JobKind::PairingOp
             | JobKind::GameOp => Duration::from_secs(5),
         }
@@ -790,6 +796,7 @@ impl JobKind {
             JobKind::BindingOp => 9,
             JobKind::CaptureOp => 10,
             JobKind::LearnOp => 11,
+            JobKind::LearnToggle => 17,
             JobKind::PairingOp => 12,
             JobKind::GameOp => 13,
             JobKind::SettingsOp => 14,
@@ -862,6 +869,11 @@ fn clean_profile_name(name: &str) -> Option<String> {
 /// [`Ctx::suppress_connected_notify`]) and the episode counts toward
 /// the burst total instead of earning its own entry.
 const FLAP_DOWN_WINDOW: Duration = Duration::from_secs(10);
+
+/// Wizard step debounce (R2-36): Next/Back clicks closer than
+/// this to the last accepted step change are ignored, so a rapid
+/// double-click advances exactly one step.
+const SETUP_STEP_DEBOUNCE: Duration = Duration::from_millis(300);
 
 /// F12 (v2.0.3): a death within this long after a reconnect belongs
 /// to the same flapping burst — its down-notify is collapsed into
@@ -1278,6 +1290,10 @@ struct Ctx {
     learn_target: Rc<Cell<i32>>,
     /// Horn test flash end (Extras Test lights the indicator).
     horn_test_until: Rc<Cell<Option<Instant>>>,
+    /// Handbrake Button-mode test flash end (R2-17): mirrors
+    /// `horn_test_until` — the tile click lights the indicator
+    /// for 400 ms instead of doing nothing.
+    handbrake_test_until: Rc<Cell<Option<Instant>>>,
     /// Failure-toast expiry (DS-24): `notify_error` shows the
     /// toast until this instant; the 1 Hz tick clears it after.
     /// `None` = no toast showing.
@@ -1292,8 +1308,20 @@ struct Ctx {
     /// Frame times (DS-82): the last 600 `refresh` durations (30 s
     /// at 20 Hz) for the Diagnostics p50/p99. This is the Rust
     /// frame work (`push_frame` + capture sync) — the Slint paint
-    /// itself runs async and is not observable from here.
+    /// itself is timed separately (see `frame_paint_times`, R2-46).
     frame_times: Rc<RefCell<VecDeque<Duration>>>,
+    /// Paint-completion times (R2-46): the last 600 durations from
+    /// a frame's `refresh` start to the Slint `AfterRendering`
+    /// notifier firing — i.e. Rust work + layout + paint, the
+    /// closest number to what the user sees. Filled only when a
+    /// frame actually paints (a tick with no dirty props produces
+    /// no `AfterRendering` and leaves no sample); empty until the
+    /// first paint, e.g. on a backend without notifier support.
+    frame_paint_times: Rc<RefCell<VecDeque<Duration>>>,
+    /// Frame start awaiting its paint (R2-46): set by the frame
+    /// timer before `refresh`, taken by the `AfterRendering`
+    /// notifier. `None` = no frame in flight / no paint pending.
+    frame_paint_pending: Rc<Cell<Option<Instant>>>,
     /// Verbose logging (DS-79): `--verbose` — live events go to
     /// stderr only when this is set.
     verbose: Rc<Cell<bool>>,
@@ -1379,6 +1407,10 @@ struct Ctx {
     /// timer clears a `connecting` older than 15 s with a message
     /// instead of leaving "Connecting…" forever.
     connecting_since: Rc<Cell<Option<Instant>>>,
+    /// When the wizard last changed step (R2-36): Next/Back clicks
+    /// within [`SETUP_STEP_DEBOUNCE`] of it are ignored, so a rapid
+    /// double-click cannot skip a step. `None` = no step change yet.
+    last_setup_step_at: Rc<Cell<Option<Instant>>>,
     /// True while a Reconnect job is in flight (A9): a second click
     /// is ignored instead of queueing another ~3 s probe.
     reconnect_in_flight: Rc<Cell<bool>>,
@@ -1449,6 +1481,26 @@ struct Ctx {
     /// the latest (module, field, value) + when it may be pushed.
     /// The frame timer flushes it (150 ms after the last move).
     pending_field: Rc<RefCell<Option<(PendingField, Instant)>>>,
+}
+
+/// Whether a 400 ms test flash (Horn Test, handbrake Button-mode
+/// test — R2-17) is still lit: `Some(until)` in the future means
+/// pressed, anything else means released. Pure — unit-tested.
+fn test_flash_active(until: Option<Instant>) -> bool {
+    until.is_some_and(|until| Instant::now() < until)
+}
+
+/// p50/p99 of a duration ring, in ms (DS-82 frame histogram,
+/// R2-46 paint histogram). `None` until a sample exists.
+fn percentile_p50_p99(times: &VecDeque<Duration>) -> Option<(f64, f64)> {
+    if times.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<Duration> = times.iter().copied().collect();
+    sorted.sort();
+    let p50 = sorted[(sorted.len() - 1) / 2];
+    let p99 = sorted[(sorted.len() - 1) * 99 / 100];
+    Some((p50.as_secs_f64() * 1000.0, p99.as_secs_f64() * 1000.0))
 }
 
 impl Ctx {
@@ -1540,8 +1592,52 @@ impl Ctx {
     /// Refresh the cached calibration read (`calibration()`):
     /// `Ok` stores it, `Err` (sim / never captured) clears it.
     /// Called at startup, on reconnect and on the 5 s refresh.
+    /// Callers that own a window also call [`Self::sync_advanced`]
+    /// next (R2-16), which reads the same cache points.
     fn refresh_calibration(&self) {
         *self.calibration.borrow_mut() = self.api().calibration().ok();
+    }
+
+    /// Push the Advanced-mode readouts (R2-16, REDESIGN-PLAN
+    /// §7.2): steering centre mV from the captured calibration,
+    /// plus the live raw mV per axis from the slow-cache
+    /// `raw_mv()` (~1 Hz). "—" until measured — never a fake 0.
+    /// Called from the 1 Hz re-sync, the 5 s tick, and startup —
+    /// the same points the calibration refreshes at.
+    fn sync_advanced(&self, win: &MainWindow) {
+        let centre_mv = self
+            .calibration
+            .borrow()
+            .as_ref()
+            .map(|c| c.steering_center_mv);
+        set_if_changed(
+            win.get_steer_centre_mv_text(),
+            centre_mv.map_or_else(|| "—".to_string(), mv_text).into(),
+            |v| win.set_steer_centre_mv_text(v),
+        );
+        let raw = self.api().raw_mv().ok();
+        let raw_text =
+            |slot: Option<u16>| slot.map_or_else(|| "—".to_string(), |mv| mv_text(f64::from(mv)));
+        set_if_changed(
+            win.get_steer_raw_mv_text(),
+            raw_text(raw.and_then(|r| r.steering_mv)).into(),
+            |v| win.set_steer_raw_mv_text(v),
+        );
+        set_if_changed(
+            win.get_throttle_raw_mv_text(),
+            raw_text(raw.and_then(|r| r.accel_mv)).into(),
+            |v| win.set_throttle_raw_mv_text(v),
+        );
+        set_if_changed(
+            win.get_brake_raw_mv_text(),
+            raw_text(raw.and_then(|r| r.brake_mv)).into(),
+            |v| win.set_brake_raw_mv_text(v),
+        );
+        set_if_changed(
+            win.get_clutch_raw_mv_text(),
+            raw_text(raw.and_then(|r| r.clutch_mv)).into(),
+            |v| win.set_clutch_raw_mv_text(v),
+        );
     }
 
     /// Re-sync the pages from the slow cache when the daemon's
@@ -1561,6 +1657,7 @@ impl Ctx {
         }
         self.last_cache_generation.set(generation);
         self.refresh_calibration();
+        self.sync_advanced(win);
         self.sync_pedals(win);
         self.sync_extras(win);
         self.sync_overview(win);
@@ -1608,15 +1705,15 @@ impl Ctx {
     /// Frame-time p50/p99 over the recorded window (DS-82), in ms.
     /// `None` until a frame has been recorded.
     fn frame_time_p50_p99(&self) -> Option<(f64, f64)> {
-        let times = self.frame_times.borrow();
-        if times.is_empty() {
-            return None;
-        }
-        let mut sorted: Vec<Duration> = times.iter().copied().collect();
-        sorted.sort();
-        let p50 = sorted[(sorted.len() - 1) / 2];
-        let p99 = sorted[(sorted.len() - 1) * 99 / 100];
-        Some((p50.as_secs_f64() * 1000.0, p99.as_secs_f64() * 1000.0))
+        percentile_p50_p99(&self.frame_times.borrow())
+    }
+
+    /// Paint-completion p50/p99 (R2-46): same window, but the
+    /// durations run to the Slint `AfterRendering` notifier — Rust
+    /// work + layout + paint. `None` until a paint is observed
+    /// (e.g. a backend without notifier support never fills it).
+    fn frame_paint_p50_p99(&self) -> Option<(f64, f64)> {
+        percentile_p50_p99(&self.frame_paint_times.borrow())
     }
 
     /// Push the current API + tuning state into the window (one
@@ -1699,6 +1796,12 @@ impl Ctx {
             set_if_changed(win.get_setup_paired(), true, |v| win.set_setup_paired(v));
             set_if_changed(win.get_paired(), true, |v| win.set_paired(v));
         } else {
+            // R2-33: mirror the `paired` else-arm for `setup_paired`
+            // — once the session drops, the Pair step's Next must
+            // stop looking complete.
+            set_if_changed(win.get_setup_paired(), false, |v| {
+                win.set_setup_paired(v);
+            });
             set_if_changed(win.get_paired(), false, |v| win.set_paired(v));
         }
         set_if_changed(
@@ -1858,12 +1961,15 @@ impl Ctx {
             });
         }
         // Horn test flash (Extras): lights the indicator briefly.
-        let horn_pressed = self
-            .horn_test_until
-            .get()
-            .is_some_and(|until| Instant::now() < until);
+        let horn_pressed = test_flash_active(self.horn_test_until.get());
         set_if_changed(win.get_horn_pressed(), horn_pressed, |v| {
             win.set_horn_pressed(v);
+        });
+        // R2-17: handbrake Button-mode test flash — same 400 ms
+        // indicator as Horn Test, driven by `handbrake_test_until`.
+        let handbrake_pressed = test_flash_active(self.handbrake_test_until.get());
+        set_if_changed(win.get_handbrake_pressed(), handbrake_pressed, |v| {
+            win.set_handbrake_pressed(v)
         });
         // Live chart histories (A20) + chart props every 10th tick.
         // B1: histories only grow while live — without a daemon the
@@ -2169,6 +2275,60 @@ impl Ctx {
     /// on the UI thread — safe on the 1 Hz tick.
     fn daemon_pair_seconds_left(&self) -> i32 {
         i32::try_from(self.api().pairing_status().seconds_left).unwrap_or(120)
+    }
+
+    /// Last few pairing attempt lines (R2-23): the daemon's HELO
+    /// trail from the cached `pairing_status()`, prefix-stripped
+    /// and oldest-first. A cache read on the UI thread — safe on
+    /// the 1 Hz tick and in `sync_diag`.
+    fn pairing_attempt_tail(&self) -> Vec<String> {
+        let mut tail: Vec<String> = self
+            .api()
+            .pairing_status()
+            .attempt_log
+            .iter()
+            .rev()
+            .take(3)
+            .map(|line| pairing_log_message(line).to_string())
+            .collect();
+        tail.reverse();
+        tail
+    }
+
+    /// Wizard step-change guard (R2-36): a Next/Back click within
+    /// [`SETUP_STEP_DEBOUNCE`] of the last accepted step change is
+    /// a double-click, not a second step — ignore it. The first
+    /// click (no previous change) always passes.
+    fn setup_step_allowed(&self) -> bool {
+        let now = Instant::now();
+        if self
+            .last_setup_step_at
+            .get()
+            .is_some_and(|last| now.duration_since(last) < SETUP_STEP_DEBOUNCE)
+        {
+            return false;
+        }
+        self.last_setup_step_at.set(Some(now));
+        true
+    }
+
+    /// Reset the full pairing state block (R2-32): every wizard
+    /// (re)open starts from a clean pairing slate, so a stale
+    /// countdown / error / wait clock from a previous attempt can
+    /// never leak into the reopened wizard (the 1 Hz tick would
+    /// otherwise close the window or fire the "no window" trail
+    /// from the old attempt's state). The trail text is cleared
+    /// too — the drawer keeps the attempt history via
+    /// `pairing_status().attempt_log`, not this line.
+    fn reset_pairing_state(&self, win: &MainWindow) {
+        *self.pairing_wait_since.borrow_mut() = None;
+        *self.pairing_trail.borrow_mut() = String::new();
+        win.set_setup_pairing_active(false);
+        win.set_setup_pair_seconds_left(0);
+        win.set_setup_pair_total(0);
+        win.set_setup_pair_error("".into());
+        win.set_setup_pair_status("".into());
+        Self::sync_pair_ring(win);
     }
 
     /// Close the pairing window (DS-58/DS-74): the countdown hit
@@ -3333,6 +3493,9 @@ impl Ctx {
     fn open_pair_wizard(&self, win: &MainWindow) {
         self.clear_setup_marker();
         self.learn_target.set(0);
+        // R2-32: a reopened wizard starts from a clean pairing
+        // slate — no stale countdown / error / wait clock.
+        self.reset_pairing_state(win);
         win.set_setup_step(2);
         win.set_setup_centre_done(false);
         win.set_setup_pedals_done(false);
@@ -4146,6 +4309,60 @@ impl Ctx {
     /// from `diag_stats()` ("—" + "No telemetry yet" while the
     /// daemon does not measure, A20/A21), plus status lines (and
     /// recent notifications) as the drawer's event log.
+    /// Pairing lines for the diagnostics event log (DS-25 + R2-23):
+    /// the latest attempt trail (wizard Pair status shows the same
+    /// line) plus the daemon's HELO trail (last few attempt lines),
+    /// so the drawer can diagnose a pairing still in progress, not
+    /// only a finished one. Split out of [`Self::sync_diag`] to
+    /// keep it under the line limit.
+    fn push_pairing_diag_lines(&self, lines: &mut Vec<SharedString>) {
+        // DS-25: the latest pairing-attempt trail, so a failed
+        // pairing is diagnosable from the drawer too (the wizard
+        // status bar shows the same line).
+        if !self.pairing_trail.borrow().is_empty() {
+            lines.push(format!("Pairing: {}", self.pairing_trail.borrow()).into());
+        }
+        // R2-23: the daemon's HELO trail (last few attempt lines)
+        // in the drawer too — the same lines the wizard status
+        // shows.
+        for line in self.pairing_attempt_tail() {
+            lines.push(format!("Pairing: {line}").into());
+        }
+    }
+
+    /// Frame + paint p50/p99 cells for the diagnostics drawer
+    /// (DS-82 frame time, R2-46 paint completion). "—" until
+    /// measured — never a fake 0; the paint cells stay "—" on a
+    /// backend without render-notifier support. Split out of
+    /// [`Self::sync_diag`] to keep it under the line limit.
+    fn sync_diag_frame_times(&self, win: &MainWindow) {
+        // DS-82: frame-time histogram (this UI, last 30 s).
+        let (frame_p50, frame_p99) = self.frame_time_p50_p99().unzip();
+        win.set_diag_frame_p50_text(
+            frame_p50
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
+                .into(),
+        );
+        win.set_diag_frame_p99_text(
+            frame_p99
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
+                .into(),
+        );
+        // R2-46: paint-completion p50/p99 (refresh start to
+        // `AfterRendering`).
+        let (paint_p50, paint_p99) = self.frame_paint_p50_p99().unzip();
+        win.set_diag_paint_p50_text(
+            paint_p50
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
+                .into(),
+        );
+        win.set_diag_paint_p99_text(
+            paint_p99
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
+                .into(),
+        );
+    }
+
     fn sync_diag(&self, win: &MainWindow) {
         let api = self.api();
         let conn = api.connection();
@@ -4211,20 +4428,10 @@ impl Ctx {
             win.set_diag_ipc_p50_text("—".into());
             win.set_diag_ipc_p99_text("—".into());
         }
-        // DS-82: frame-time histogram (this UI, last 30 s) — local,
-        // so it is set regardless of whether the daemon answered
-        // `diag_stats` above.
-        let (frame_p50, frame_p99) = self.frame_time_p50_p99().unzip();
-        win.set_diag_frame_p50_text(
-            frame_p50
-                .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
-                .into(),
-        );
-        win.set_diag_frame_p99_text(
-            frame_p99
-                .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
-                .into(),
-        );
+        // DS-82 + R2-46: frame and paint histograms (this UI,
+        // last 30 s) — local, so they are set regardless of
+        // whether the daemon answered `diag_stats` above.
+        self.sync_diag_frame_times(win);
         // H10: the live button grid shows the real pressed buttons
         // (bits 1–12 of the snapshot mask) — empty when not live, so
         // the section hides instead of rendering 12 dead tiles.
@@ -4249,12 +4456,7 @@ impl Ctx {
             format!("Connection: {}", conn.label).into(),
             format!("Firmware: {firmware}").into(),
         ];
-        // DS-25: the latest pairing-attempt trail, so a failed
-        // pairing is diagnosable from the drawer too (the wizard
-        // status bar shows the same line).
-        if !self.pairing_trail.borrow().is_empty() {
-            lines.push(format!("Pairing: {}", self.pairing_trail.borrow()).into());
-        }
+        self.push_pairing_diag_lines(&mut lines);
         for n in self.notifications.borrow().to_model_items().iter().take(6) {
             lines.push(format!("{} {}", n.time, n.title).into());
         }
@@ -4273,7 +4475,18 @@ impl Ctx {
             win.set_setup_vjoy_installed(status.installed);
             win.set_setup_vjoy_installing(status.installing);
             win.set_setup_vjoy_version(status.version.unwrap_or_default().into());
-            win.set_setup_vjoy_error(status.install_error.unwrap_or_default().into());
+            // R2-40: never clobber a failure the install job already
+            // reported with the daemon's (possibly empty)
+            // `install_error` — the 1 Hz tick used to wipe the
+            // message within a second of the failure, leaving the
+            // Drivers step on "Not installed" with no reason and no
+            // prompt to pick the fallback. A daemon-reported error
+            // replaces it; a success / new install clears it.
+            if status.installed || status.installing {
+                win.set_setup_vjoy_error("".into());
+            } else if let Some(error) = status.install_error {
+                win.set_setup_vjoy_error(error.into());
+            }
         } else {
             win.set_setup_vjoy_installed(false);
             win.set_setup_vjoy_installing(false);
@@ -5040,9 +5253,18 @@ impl Ctx {
                     }
                 }
                 JobResult::LearnPoll(None) => {
+                    // R2-35: Learn ended without a press (backend
+                    // stopped learning) — say so instead of going
+                    // silent; the listening state was the only cue.
                     ctx.learn_target.set(0);
                     win.set_buttons_listening(false);
                     win.set_horn_learning(false);
+                    ctx.notify(
+                        win,
+                        "Learn",
+                        "Learning ended",
+                        "Learning stopped without a button press — try again if you still need to learn a button.",
+                    );
                 }
                 _ => {}
             },
@@ -5050,14 +5272,16 @@ impl Ctx {
     }
 
     /// Start (or cancel) learning for `target` (1 Buttons, 2 horn):
-    /// `start_learn` / `cancel_learn` run on a [`JobKind::LearnOp`]
-    /// job thread; the frame timer picks the press up via
+    /// `start_learn` / `cancel_learn` run on a [`JobKind::LearnToggle`]
+    /// job thread (R2-35: its own kind, so the click is never
+    /// swallowed by an in-flight [`JobKind::LearnOp`] poll job);
+    /// the frame timer picks the press up via
     /// [`Ctx::start_learn_poll_job`].
     fn toggle_learn(&self, win: &MainWindow, target: i32) {
         if self.learn_target.get() == target {
             self.run_generic_job(
                 win,
-                JobKind::LearnOp,
+                JobKind::LearnToggle,
                 "Cancelling…",
                 move |api| JobResult::Unit(api.cancel_learn().map(|_| ())),
                 move |ctx, win, result| {
@@ -5079,7 +5303,7 @@ impl Ctx {
         }
         self.run_generic_job(
             win,
-            JobKind::LearnOp,
+            JobKind::LearnToggle,
             "Listening…",
             move |api| JobResult::Bool(api.start_learn()),
             move |ctx, win, result| {
@@ -5185,6 +5409,15 @@ fn wire_fc2_callbacks(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// cases the UI can tell apart read differently — a daemon-reported
 /// error, a board that was seen (MAC) but never opened a window,
 /// and a board that never answered at all. Pure — unit-tested below.
+/// Strip the daemon log prefix (`[<ISO> <LEVEL> pairing] `) from
+/// one pairing log line, leaving the human-readable message
+/// ("Sent HELO to 192.168.4.1 (try 1/3)"). Lines without the
+/// prefix pass through unchanged. Pure — unit-tested via
+/// `pairing_no_window_trail`.
+fn pairing_log_message(line: &str) -> &str {
+    line.split_once("] ").map_or(line, |(_, rest)| rest)
+}
+
 fn pairing_no_window_trail(attempts: u32, address: &str, status: &PairingInfo) -> String {
     let at = if address.is_empty() {
         String::new()
@@ -5192,16 +5425,31 @@ fn pairing_no_window_trail(attempts: u32, address: &str, status: &PairingInfo) -
         format!(" at {address}")
     };
     let base = format!("Attempt {attempts}: no pairing window in 10 s{at}");
-    if let Some(detail) = status.error_detail.as_deref().filter(|d| !d.is_empty()) {
-        return format!("{base} — daemon reports: {detail}");
+    let mut trail = if let Some(detail) = status.error_detail.as_deref().filter(|d| !d.is_empty()) {
+        format!("{base} — daemon reports: {detail}")
+    } else if let Some(error) = &status.error {
+        format!("{base} — daemon reports: {}", error.code())
+    } else if let Some(mac) = status.board_mac.as_deref().filter(|m| !m.is_empty()) {
+        format!("{base} — board seen ({mac}) but no window: hold BOOT 3 s to open one.")
+    } else {
+        format!("{base} — board never answered: check the wheel is on and joined to the RSH Wi-Fi — or hold BOOT 3 s on the wheel to open a pairing window.")
+    };
+    // R2-23: the daemon's HELO trail rides on the same status —
+    // the last few attempt lines say what actually happened
+    // (HELO sends, HELLO timeouts), not just "no window".
+    if !status.attempt_log.is_empty() {
+        let mut last_lines: Vec<&str> = status
+            .attempt_log
+            .iter()
+            .rev()
+            .take(3)
+            .map(|line| pairing_log_message(line))
+            .collect();
+        last_lines.reverse();
+        trail.push('\n');
+        trail.push_str(&last_lines.join("\n"));
     }
-    if let Some(error) = &status.error {
-        return format!("{base} — daemon reports: {}", error.code());
-    }
-    if let Some(mac) = status.board_mac.as_deref().filter(|m| !m.is_empty()) {
-        return format!("{base} — board seen ({mac}) but no window: hold BOOT 3 s to open one.");
-    }
-    format!("{base} — board never answered: check the wheel is on and joined to the RSH Wi-Fi — or hold BOOT 3 s on the wheel to open a pairing window.")
+    trail
 }
 
 /// Run one pairing attempt from the wizard (Begin / Retry /
@@ -5325,6 +5573,11 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_setup_back(move || {
             if let Some(w) = win.upgrade() {
+                // R2-36: debounce — a rapid double-click goes back
+                // exactly one step, never two.
+                if !ctx.setup_step_allowed() {
+                    return;
+                }
                 let next = (w.get_setup_step() - 1).max(0);
                 w.set_setup_step(next);
                 if next == 1 {
@@ -5342,6 +5595,11 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_setup_next(move || {
             if let Some(w) = win.upgrade() {
+                // R2-36: debounce — a rapid double-click advances
+                // exactly one step, never two.
+                if !ctx.setup_step_allowed() {
+                    return;
+                }
                 if w.get_setup_step() >= 4 {
                     w.set_setup_mode(false);
                     ctx.mark_setup_done();
@@ -6146,13 +6404,12 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
     }
 }
 
-/// Wire the Extras page callbacks (A6): LED pattern/brightness and
-/// handbrake feel/deadzone push through `set_tuning`; horn Learn
+/// Wire the Extras page callbacks (A6): LED pattern/brightness/colour
+/// and handbrake feel/deadzone push through `set_tuning`; horn Learn
 /// arms `start_learn`; Test flashes the indicator; the shifter link
 /// opens the Buttons page. Handbrake Set up/down capture the live
 /// endpoints (v2.0.2). Controls with no backend (handbrake mode,
-/// sensitivity, LED colour) explain themselves instead of
-/// pretending to work.
+/// sensitivity) explain themselves instead of pretending to work.
 #[allow(clippy::too_many_lines)]
 fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
@@ -6272,6 +6529,15 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                     }
                 }
                 "horn-learn" => ctx.toggle_learn(&w, 2),
+                "handbrake-test" => {
+                    // R2-17: Button-mode tile mirrors Horn Test —
+                    // the click flashes the tile's pressed state
+                    // for 400 ms (push_frame derives it from this
+                    // instant, exactly like `horn_test_until`).
+                    ctx.handbrake_test_until
+                        .set(Some(Instant::now() + Duration::from_millis(400)));
+                    ctx.refresh(&w, 0);
+                }
                 "horn-test" => {
                     ctx.horn_test_until
                         .set(Some(Instant::now() + Duration::from_millis(400)));
@@ -6400,17 +6666,22 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// Wire the theme-persist callback (v2.0.1 hotfix, A8 v2.0.2): the
 /// Settings screen reports its theme index (0 Dark, 1 Light,
 /// 2 Auto) and Rust persists it AND resolves it to the window theme
-/// (0 Dark / 1 Light — Auto follows the OS preference, so the
-/// Settings segment then shows the resolved value, not "Auto").
+/// (0 Dark / 1 Light — Auto follows the OS preference). R2-31: the
+/// segment keeps showing the stored choice (`theme-choice`), so
+/// Auto stays visibly selected.
 fn wire_theme(win: &MainWindow, ctx: &Rc<Ctx>) {
     let win = win.as_weak();
     let ctx = ctx.clone();
     win.unwrap().on_theme_persist(move |i| {
         // DS-51: a persist failure notifies and reverts the segment
         // to the stored choice instead of failing silently.
+        // R2-31: the segment shows the STORED choice (`theme-choice`,
+        // 0/1/2); only the resolved value (0/1) goes to `theme`,
+        // so Auto stays visibly selected and never flashes Dark.
         if !write_theme(ctx.data_dir.as_ref(), i) {
             let stored = ctx.theme_choice.get();
             if let Some(w) = win.upgrade() {
+                w.set_theme_choice(stored);
                 w.set_theme(resolve_theme_mode(
                     stored,
                     ctx.os_light.load(Ordering::Relaxed),
@@ -6428,6 +6699,7 @@ fn wire_theme(win: &MainWindow, ctx: &Rc<Ctx>) {
         if let Some(w) = win.upgrade() {
             // DS-49: the OS preference comes from the cached sampler
             // flag — no `reg` spawn on the UI thread.
+            w.set_theme_choice(i);
             w.set_theme(resolve_theme_mode(i, ctx.os_light.load(Ordering::Relaxed)));
         }
     });
@@ -7004,6 +7276,10 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
                 // A18: delete the marker and open the wizard at step 0.
                 ctx.clear_setup_marker();
                 ctx.learn_target.set(0);
+                // R2-32: a reopened wizard starts from a clean
+                // pairing slate — no stale countdown / error / wait
+                // clock from the previous attempt.
+                ctx.reset_pairing_state(&w);
                 w.set_setup_step(0);
                 w.set_setup_centre_done(false);
                 w.set_setup_pedals_done(false);
@@ -7722,6 +7998,9 @@ fn apply_page_request(win: &MainWindow, ctx: &Ctx, page: &str) {
     if page == "setup" {
         ctx.clear_setup_marker();
         ctx.learn_target.set(0);
+        // R2-32: a reopened wizard starts from a clean pairing
+        // slate — no stale countdown / error / wait clock.
+        ctx.reset_pairing_state(win);
         win.set_setup_step(0);
         win.set_setup_centre_done(false);
         win.set_setup_pedals_done(false);
@@ -7849,6 +8128,13 @@ fn start_frame_timer(
             // DS-82: time the frame's Rust work for the Diagnostics
             // frame-time histogram.
             let frame_started = Instant::now();
+            // R2-46: arm the paint timer — the `AfterRendering`
+            // notifier (registered in `main`) takes this start and
+            // records refresh-to-paint. A tick that paints nothing
+            // leaves no sample; a paint delayed past the next tick
+            // is attributed to the newer start (a small underestimate
+            // on a stalled frame, never an invented sample).
+            ctx.frame_paint_pending.set(Some(frame_started));
             ctx.refresh(&w, t);
             ctx.record_frame_time(frame_started.elapsed());
             if t.is_multiple_of(20) {
@@ -7937,6 +8223,31 @@ fn start_frame_timer(
                                 if !ctx.hidden.load(Ordering::SeqCst) {
                                     w.set_notif_open(true);
                                 }
+                            } else {
+                                // R2-23: while waiting, the Pair
+                                // status shows the live HELO trail
+                                // (last attempt line), not just
+                                // "waiting…" — the user sees the
+                                // attempt progressing. Guarded by
+                                // change, so an idle second costs no
+                                // repaint.
+                                if let Some(last) = ctx.pairing_attempt_tail().last().cloned() {
+                                    let at = {
+                                        let address = ctx.pairing_board_address();
+                                        if address.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" at {address}")
+                                        }
+                                    };
+                                    let live = format!(
+                                        "Attempt {}: waiting for the wheel{at}… — {last}",
+                                        ctx.pairing_attempts.get()
+                                    );
+                                    if *ctx.pairing_trail.borrow() != live {
+                                        ctx.set_pairing_trail(&w, &live);
+                                    }
+                                }
                             }
                         }
                     }
@@ -7969,6 +8280,7 @@ fn start_frame_timer(
             }
             if t.is_multiple_of(100) {
                 ctx.refresh_calibration();
+                ctx.sync_advanced(&w);
                 ctx.refresh_profiles(&w);
                 ctx.refresh_games(&w);
                 // H9: while the wizard sits on Calibrate, re-probe
@@ -8062,11 +8374,14 @@ fn main() -> Result<(), slint::PlatformError> {
         pending_profile_id: Rc::new(RefCell::new(None)),
         learn_target: Rc::new(Cell::new(0)),
         horn_test_until: Rc::new(Cell::new(None)),
+        handbrake_test_until: Rc::new(Cell::new(None)),
         toast_until: Rc::new(Cell::new(None)),
         steer_hist: Rc::new(RefCell::new(VecDeque::new())),
         pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
         frame_cmds: Rc::new(RefCell::new(FrameCmdCache::default())),
         frame_times: Rc::new(RefCell::new(VecDeque::new())),
+        frame_paint_times: Rc::new(RefCell::new(VecDeque::new())),
+        frame_paint_pending: Rc::new(Cell::new(None)),
         verbose: Rc::new(Cell::new(args.verbose)),
         unsaved: Rc::new(Cell::new(initial_unsaved)),
         // M10: notifications persist across restarts — the drawer is
@@ -8098,6 +8413,7 @@ fn main() -> Result<(), slint::PlatformError> {
         // now, so a daemon that never answers is reported after 15 s
         // instead of leaving the Overview on "Connecting…" forever.
         connecting_since: Rc::new(Cell::new(Some(t0))),
+        last_setup_step_at: Rc::new(Cell::new(None)),
         reconnect_in_flight: Rc::new(Cell::new(false)),
         // F3/F12 (v2.0.3): respawn budget (shared with the health
         // monitor), latch reason, flap tracking — all start empty.
@@ -8130,6 +8446,31 @@ fn main() -> Result<(), slint::PlatformError> {
     );
 
     let win = MainWindow::new()?;
+    // R2-46: paint-completion timestamp for the frame histogram.
+    // The `AfterRendering` notifier fires once Slint finished
+    // painting the frame (before presentation) — the closest
+    // number to user-visible jank. The callback only records a
+    // timestamp; it draws nothing and changes no rendering. A
+    // backend without notifier support returns `Err` and the
+    // Rust-only histogram keeps working (the paint p50/p99 then
+    // stay "—").
+    {
+        let paint_times = ctx.frame_paint_times.clone();
+        let paint_pending = ctx.frame_paint_pending.clone();
+        if let Err(e) = win.window().set_rendering_notifier(move |state, _api| {
+            if matches!(state, slint::RenderingState::AfterRendering) {
+                if let Some(started) = paint_pending.take() {
+                    let mut times = paint_times.borrow_mut();
+                    times.push_back(started.elapsed());
+                    while times.len() > 600 {
+                        times.pop_front();
+                    }
+                }
+            }
+        }) {
+            eprintln!("RSH-UI paint timing unavailable: {e}");
+        }
+    }
     // H-1/A11: X hides to tray — the UI process stays alive (the
     // daemon keeps running, tray "Open RSH" restores it instantly).
     // Real quit is only via tray "Quit RSH" (quit file) or with
@@ -8172,6 +8513,9 @@ fn main() -> Result<(), slint::PlatformError> {
         ctx.theme_choice.get(),
         ctx.os_light.load(Ordering::Relaxed),
     ));
+    // R2-31: the segment shows the stored choice (Auto stays
+    // Auto); `theme` above carries only the resolved value.
+    win.set_theme_choice(ctx.theme_choice.get());
     win.set_app_version(api.version().into());
     // B4: not live yet — the monitor is still probing. The first
     // frame paints "Connecting…" (see `push_frame`).
@@ -8205,6 +8549,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // otherwise. Kept fresh every frame by `refresh`.
     ctx.sync_capture_availability(&win);
     ctx.refresh_calibration();
+    ctx.sync_advanced(&win);
     sync_to_window(&ctx.notifications.borrow(), &win);
     ctx.sync_pedals(&win);
     ctx.sync_extras(&win);
@@ -8627,6 +8972,63 @@ mod tests {
     }
 
     #[test]
+    fn r2_learn_toggle_has_own_job_kind() {
+        // R2-35: the Learn click runs on its own kind (order 17,
+        // 5 s timeout) so an in-flight LearnOp poll job can never
+        // swallow it via the duplicate-start rule.
+        assert_eq!(JobKind::LearnToggle.order(), 17);
+        assert_eq!(JobKind::LearnToggle.timeout(), Duration::from_secs(5));
+        assert_eq!(JobKind::LearnOp.order(), 11);
+    }
+
+    #[test]
+    fn r2_setup_step_debounce() {
+        // R2-36: first click passes; a second click within 300 ms
+        // is ignored; a click after the window passes again.
+        let (ctx, _dir) = fc2_test_ctx();
+        assert!(ctx.setup_step_allowed());
+        assert!(!ctx.setup_step_allowed());
+        ctx.last_setup_step_at.set(Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(400))
+                .expect("test instant"),
+        ));
+        assert!(ctx.setup_step_allowed());
+    }
+
+    #[test]
+    fn r2_test_flash_active() {
+        // R2-17: a future flash instant reads pressed; None and a
+        // past instant read released (Horn Test + handbrake test).
+        assert!(test_flash_active(Some(
+            Instant::now() + Duration::from_millis(400)
+        )));
+        assert!(!test_flash_active(None));
+        assert!(!test_flash_active(Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("test instant")
+        )));
+    }
+
+    #[test]
+    fn r2_percentile_p50_p99() {
+        // R2-46: the shared percentile math behind the frame and
+        // paint histograms; empty ring means "—" (None).
+        assert_eq!(percentile_p50_p99(&VecDeque::new()), None);
+        let times: VecDeque<Duration> = [1, 2, 3, 4, 5]
+            .iter()
+            .map(|ms| Duration::from_millis(*ms))
+            .collect();
+        let (p50, p99) = percentile_p50_p99(&times).expect("samples");
+        assert!((p50 - 3.0).abs() < 0.01, "p50 {p50}");
+        // p99 index is (len-1)*99/100 = 3 for 5 samples, i.e. 4 ms
+        // — the DS-82 nearest-rank formula, preserved verbatim
+        // from the original `frame_time_p50_p99`.
+        assert!((p99 - 4.0).abs() < 0.01, "p99 {p99}");
+    }
+
+    #[test]
     fn fc2_board_address_validation() {
         // H4/FC2: same rule as the daemon — private/loopback IPv4
         // literal only (whitespace trimmed).
@@ -8751,11 +9153,14 @@ mod tests {
             pending_profile_id: Rc::new(RefCell::new(None)),
             learn_target: Rc::new(Cell::new(0)),
             horn_test_until: Rc::new(Cell::new(None)),
+            handbrake_test_until: Rc::new(Cell::new(None)),
             toast_until: Rc::new(Cell::new(None)),
             steer_hist: Rc::new(RefCell::new(VecDeque::new())),
             pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
             frame_cmds: Rc::new(RefCell::new(FrameCmdCache::default())),
             frame_times: Rc::new(RefCell::new(VecDeque::new())),
+            frame_paint_times: Rc::new(RefCell::new(VecDeque::new())),
+            frame_paint_pending: Rc::new(Cell::new(None)),
             verbose: Rc::new(Cell::new(false)),
             unsaved: Rc::new(Cell::new(false)),
             notifications: Rc::new(RefCell::new(NotificationCenter::load(Some(&dir)))),
@@ -8783,6 +9188,7 @@ mod tests {
             // F5: slow-cache generation the pages last re-synced from.
             last_cache_generation: Rc::new(Cell::new(0)),
             connecting_since: Rc::new(Cell::new(Some(Instant::now()))),
+            last_setup_step_at: Rc::new(Cell::new(None)),
             reconnect_in_flight: Rc::new(Cell::new(false)),
             spawn_budget: Arc::new(live_probe::SpawnBudget::new()),
             spawn_latch: Rc::new(RefCell::new(None)),
@@ -9909,6 +10315,29 @@ mod tests {
         // No address: no "at" fragment, still readable.
         let trail = pairing_no_window_trail(1, "", &info());
         assert!(!trail.contains(" at "), "got: {trail}");
+        // R2-23: the daemon's HELO trail rides on the same status —
+        // the last few attempt lines are appended, prefix-stripped.
+        let mut logged = info();
+        logged.attempt_log = vec![
+            "[2026-11-18T10:00:00Z INFO pairing] begin_pairing attempt 1".to_string(),
+            "[2026-11-18T10:00:01Z INFO pairing] Sent HELO to 192.168.4.1 (try 1/3)".to_string(),
+            "[2026-11-18T10:00:03Z INFO pairing] HELLO timeout after 2250ms (attempt 1/3)"
+                .to_string(),
+        ];
+        let trail = pairing_no_window_trail(1, "192.168.4.1", &logged);
+        assert!(trail.contains("begin_pairing attempt 1"), "got: {trail}");
+        assert!(
+            trail.contains("Sent HELO to 192.168.4.1 (try 1/3)"),
+            "got: {trail}"
+        );
+        assert!(
+            trail.contains("HELLO timeout after 2250ms (attempt 1/3)"),
+            "got: {trail}"
+        );
+        assert!(
+            !trail.contains("[2026-11-18"),
+            "prefix stripped, got: {trail}"
+        );
     }
 
     #[test]
@@ -9958,15 +10387,36 @@ mod tests {
             "closed-window status guides the user, got: {}",
             win.get_setup_pair_status()
         );
+        // R2-32: reopening the wizard resets the full pairing
+        // state block — no stale countdown / error / wait clock
+        // leaks into the reopened wizard.
+        win.set_setup_pairing_active(true);
+        win.set_setup_pair_seconds_left(5);
+        win.set_setup_pair_total(5);
+        win.set_setup_pair_error("stale".into());
+        win.set_setup_pair_status("stale".into());
+        *ctx.pairing_wait_since.borrow_mut() = Some(Instant::now());
+        ctx.reset_pairing_state(&win);
+        assert!(!win.get_setup_pairing_active());
+        assert_eq!(win.get_setup_pair_seconds_left(), 0);
+        assert_eq!(win.get_setup_pair_total(), 0);
+        assert_eq!(win.get_setup_pair_error().as_str(), "");
+        assert_eq!(win.get_setup_pair_status().as_str(), "");
+        assert!(ctx.pairing_wait_since.borrow().is_none());
         // DS-50: Theme Auto follows the cached OS preference.
         ctx.theme_choice.set(2);
         ctx.os_light.store(true, Ordering::Relaxed);
         win.set_theme(0);
+        win.set_theme_choice(2);
         ctx.sync_auto_theme(&win);
         assert_eq!(win.get_theme(), 1);
+        // R2-31: the resolved value never overwrites the stored
+        // choice — Auto stays visibly selected in Settings.
+        assert_eq!(win.get_theme_choice(), 2);
         ctx.os_light.store(false, Ordering::Relaxed);
         ctx.sync_auto_theme(&win);
         assert_eq!(win.get_theme(), 0);
+        assert_eq!(win.get_theme_choice(), 2);
         // DS-54: the busy-kind prop carries the running job's kind.
         ctx.busy_jobs.borrow_mut().insert(
             JobKind::Backend,

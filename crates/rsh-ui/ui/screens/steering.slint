@@ -6,6 +6,12 @@ import { Theme } from "../tokens.slint";
 import { Card, PresetChip, SliderRow, Pill, Btn, CurveGraph } from "../components.slint";
 
 export component SteeringPage inherits HorizontalLayout {
+    // R2-16: Advanced mode (REDESIGN-PLAN §7.2) — centre mV,
+    // raw live value, curve exponent number box. The toggle in the
+    // top bar flips this; Basic hides the whole card.
+    in property <bool> advanced: false;
+    in property <string> centre-mv-text: "—";
+    in property <string> raw-mv-text: "—";
     in property <float> input-pct;
     in property <float> output-pct;
     in property <float> marker-vx;
@@ -29,9 +35,25 @@ export component SteeringPage inherits HorizontalLayout {
     callback curve-changed(float);
     callback deadzone-edited(string);
     callback curve-edited(string);
+    // R2-16: the Advanced card's exponent number box re-uses the
+    // curve-edited handler (same parse + push as the slider's box).
+    callback curve-exponent-edited(string);
     callback preset-selected(int);
     callback reset-defaults();
     callback set-centre();
+    // Local edit buffer for the exponent box (SliderRow pattern):
+    // the box shows the buffer, which only syncs from curve-text
+    // when the box is not focused, so a re-sync never clobbers text
+    // the user is typing. The box lives under `if advanced`, so its
+    // id is invisible here — its focus is mirrored in `exp-focused`
+    // by the TextInput itself (below).
+    property <string> exp-buffer: curve-text;
+    property <bool> exp-focused: false;
+    changed curve-text => {
+        if (!exp-focused) {
+            exp-buffer = curve-text;
+        }
+    }
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
     spacing: 12px;
     Card {
@@ -112,6 +134,67 @@ export component SteeringPage inherits HorizontalLayout {
                     Btn { label: centre-set ? "Set ✓" : "Set centre"; disabled: !centre-available; clicked => { set-centre(); } }
                 }
                 if !centre-available : Text { text: centre-reason; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+            }
+        }
+        // R2-16: Advanced mode (REDESIGN-PLAN §7.2) — centre mV,
+        // raw live value, curve exponent number box. Min/max mV
+        // are not captured for steering (the backend stores only
+        // the centre), so they are not shown — never faked.
+        if advanced : Card {
+            VerticalLayout {
+                padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
+                spacing: 10px;
+                Text { text: "Advanced"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "Centre"; font-size: 12px; color: Theme.mute; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: centre-mv-text; font-family: Theme.font-mono; font-size: 12px; font-weight: 600; color: Theme.text; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "Raw live"; font-size: 12px; color: Theme.mute; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: raw-mv-text; font-family: Theme.font-mono; font-size: 12px; font-weight: 600; color: Theme.text; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        Text { text: "Curve exponent"; font-size: 12px; color: Theme.mute; }
+                        Text { text: "1.00 linear — 2.00 sharp"; font-size: 11px; color: Theme.faint; }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Rectangle {
+                        width: 60px;
+                        height: 26px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.line;
+                        background: Theme.bg;
+                        exp-num := TextInput {
+                            width: 100%;
+                            height: 100%;
+                            horizontal-alignment: right;
+                            accessible-label: "Curve exponent";
+                            text: exp-buffer;
+                            font-family: Theme.font-mono;
+                            font-size: 12px;
+                            font-weight: 500;
+                            color: Theme.text;
+                            edited => { curve-exponent-edited(exp-num.text); }
+                            // Mirror focus up to the component (see
+                            // `exp-focused` above) — the component
+                            // level cannot see this id directly.
+                            changed has-focus => {
+                                exp-focused = self.has-focus;
+                                if (!self.has-focus) {
+                                    exp-buffer = curve-text;
+                                }
+                            }
+                        }
+                    }
+                }
+                Text { text: "Min/max mV aren't stored for steering — the centre is the captured value."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
             }
         }
     }

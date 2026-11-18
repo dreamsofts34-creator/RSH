@@ -1649,6 +1649,11 @@ struct PopupHandle {
     /// The "no popup window yet" retry note was already logged once
     /// (bounds the activation-retry logging to one line per show).
     activation_note_logged: Cell<bool>,
+    /// Last data pushed into the popup (R2-38): the popup's props
+    /// are `in` (no Rust getters), so change-detection keeps its
+    /// own copy and only writes props that moved — like
+    /// `push_frame` does for the main window.
+    last: RefCell<Option<(TrayPopupData, bool)>>,
 }
 
 impl PopupHandle {
@@ -1660,9 +1665,6 @@ impl PopupHandle {
         let profiles = api.state.list_profiles();
         let games = api.state.list_games();
         let data = TrayPopupData::collect(api as &dyn AppApi, &profiles, &games);
-        self.popup.set_conn_label(data.conn_label.into());
-        self.popup.set_conn_sub(data.conn_sub.into());
-        self.popup.set_connected(data.connected);
         // DS-22: the popup follows the persisted UI theme (the same
         // `<data_dir>/ui-theme` file the main window reads and
         // writes). Re-read every refresh so a theme change in
@@ -1670,23 +1672,71 @@ impl PopupHandle {
         // read is cheap, and the Auto OS sample is cached 60 s
         // inside `popup_is_light`, so the 10 Hz refresh never
         // spawns `reg` more than once a minute.
-        self.popup
-            .set_light_theme(popup_is_light(rsh_app_core::data_dir().as_deref()));
-        self.popup.set_send_to_game(data.send_to_game);
-        self.popup.set_steer_angle(data.steering_deg as f32);
-        self.popup
-            .set_steer_text(format!("{:+.0}°", data.steering_deg).into());
-        self.popup.set_throttle(data.throttle_pct as f32);
-        self.popup.set_brake(data.brake_pct as f32);
-        self.popup.set_clutch(data.clutch_pct as f32);
-        self.popup.set_throttle_text(data.throttle_text.into());
-        self.popup.set_brake_text(data.brake_text.into());
-        self.popup.set_clutch_text(data.clutch_text.into());
-        self.popup.set_profile_name(data.profile_name.into());
-        self.popup.set_profile_sub(data.profile_sub.into());
-        self.set_game_row(0, data.games.first());
-        self.set_game_row(1, data.games.get(1));
-        self.set_game_row(2, data.games.get(2));
+        let light = popup_is_light(rsh_app_core::data_dir().as_deref());
+        // R2-38: change-detect like `push_frame` — an unchanged
+        // `set_*` still marks the property dirty and repaints, so
+        // the old code repainted the popup at 10 Hz even with zero
+        // data change. The popup's props are `in` (no Rust
+        // getters), so the last pushed data is kept in `self.last`
+        // and compared field by field; an idle visible popup now
+        // writes nothing at all.
+        let mut last = self.last.borrow_mut();
+        let prev = last.clone();
+        let moved = |f: &dyn Fn(&TrayPopupData) -> bool| prev.as_ref().is_none_or(|(d, _)| f(d));
+        if prev.as_ref().is_none_or(|(_, l)| *l != light) {
+            self.popup.set_light_theme(light);
+        }
+        if moved(&|d: &TrayPopupData| d.conn_label != data.conn_label) {
+            self.popup.set_conn_label(data.conn_label.clone().into());
+        }
+        if moved(&|d: &TrayPopupData| d.conn_sub != data.conn_sub) {
+            self.popup.set_conn_sub(data.conn_sub.clone().into());
+        }
+        if moved(&|d: &TrayPopupData| d.connected != data.connected) {
+            self.popup.set_connected(data.connected);
+        }
+        if moved(&|d: &TrayPopupData| d.send_to_game != data.send_to_game) {
+            self.popup.set_send_to_game(data.send_to_game);
+        }
+        if moved(&|d: &TrayPopupData| d.steering_deg.to_bits() != data.steering_deg.to_bits()) {
+            self.popup.set_steer_angle(data.steering_deg as f32);
+            self.popup
+                .set_steer_text(format!("{:+.0}°", data.steering_deg).into());
+        }
+        if moved(&|d: &TrayPopupData| d.throttle_pct.to_bits() != data.throttle_pct.to_bits()) {
+            self.popup.set_throttle(data.throttle_pct as f32);
+        }
+        if moved(&|d: &TrayPopupData| d.brake_pct.to_bits() != data.brake_pct.to_bits()) {
+            self.popup.set_brake(data.brake_pct as f32);
+        }
+        if moved(&|d: &TrayPopupData| d.clutch_pct.to_bits() != data.clutch_pct.to_bits()) {
+            self.popup.set_clutch(data.clutch_pct as f32);
+        }
+        if moved(&|d: &TrayPopupData| d.throttle_text != data.throttle_text) {
+            self.popup
+                .set_throttle_text(data.throttle_text.clone().into());
+        }
+        if moved(&|d: &TrayPopupData| d.brake_text != data.brake_text) {
+            self.popup.set_brake_text(data.brake_text.clone().into());
+        }
+        if moved(&|d: &TrayPopupData| d.clutch_text != data.clutch_text) {
+            self.popup.set_clutch_text(data.clutch_text.clone().into());
+        }
+        if moved(&|d: &TrayPopupData| d.profile_name != data.profile_name) {
+            self.popup
+                .set_profile_name(data.profile_name.clone().into());
+        }
+        if moved(&|d: &TrayPopupData| d.profile_sub != data.profile_sub) {
+            self.popup.set_profile_sub(data.profile_sub.clone().into());
+        }
+        for index in 0..3 {
+            let game = data.games.get(index);
+            let prev_game = prev.as_ref().and_then(|(d, _)| d.games.get(index));
+            if prev_game != game {
+                self.set_game_row(index, game);
+            }
+        }
+        *last = Some((data, light));
     }
 
     /// One game row (empty strings when the daemon knows fewer than
@@ -1957,6 +2007,7 @@ fn create_tray(
             poll: RefCell::new(PopupDismissPoll::new(None)),
             activation_done: Cell::new(true),
             activation_note_logged: Cell::new(false),
+            last: RefCell::new(None),
         })),
         Err(error) => {
             log_line(
