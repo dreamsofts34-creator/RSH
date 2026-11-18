@@ -36,6 +36,11 @@ pub mod firmware_image;
 /// Game detection + launch (Phase F2 / SW-R7.3).
 pub mod launcher;
 
+/// Manually added games (game-scanner removal, v2.0.3+): the
+/// persisted `manual-games.json` store — name + exe/shortcut path
+/// per entry, no detection of any kind.
+pub mod manual_games;
+
 /// Board firmware upload over the board's WebOTA HTTP server
 /// (H5-control `upload_firmware`): std-only HTTP client, CSRF token
 /// fetch + multipart `POST /update`. The image is verified by the

@@ -48,12 +48,14 @@ export component OverviewPage inherits VerticalLayout {
     in property <string> profile-name: "GT3 Sprint";
     in property <[GameItem]> games;
     // DS-54: which job kind the busy strip shows, as a
-    // JobKind::order value (-1 = idle) — the Find games button
-    // disables + dims while its job runs.
+    // JobKind::order value (-1 = idle) — the Add game button
+    // disables + dims while its GameOp job runs.
     in property <int> busy-kind: -1;
     callback configure();
     callback launch-game(string);
-    callback find-games();
+    callback add-game();
+    callback edit-game(string);
+    callback remove-game(string);
     callback open-diagnostics();
     callback reconnect();
     callback open-profile-popover();
@@ -141,17 +143,18 @@ export component OverviewPage inherits VerticalLayout {
                 Text { text: "Games"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                 Rectangle { horizontal-stretch: 1; }
                 Text { text: "Auto-switches profile."; font-size: 12px; color: Theme.mute; }
+                Btn { label: "Add game"; disabled: busy-kind == 13; clicked => { add-game(); } }
             }
-            // DS-56: the empty state gets an action — Find games runs
-            // the same search as the wizard (daemon-live guarded, DS-55).
+            // Manual games (no auto-scan): the empty state offers
+            // Add game instead of a search.
             if games.length == 0 : HorizontalLayout {
                 spacing: 10px;
-                Text { horizontal-stretch: 1; vertical-alignment: center; text: "No games found yet — run setup again to search."; font-size: 12px; color: Theme.faint; wrap: word-wrap; }
-                Btn { label: "Find games"; disabled: busy-kind == 13; clicked => { find-games(); } }
+                Text { horizontal-stretch: 1; vertical-alignment: center; text: "No games added yet — add your first game."; font-size: 12px; color: Theme.faint; wrap: word-wrap; }
+                Btn { label: "Add game"; disabled: busy-kind == 13; clicked => { add-game(); } }
             }
             if games.length > 0 : HorizontalLayout {
                 spacing: 10px;
-                for g in games : GameTile { horizontal-stretch: 1; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-clicked => { launch-game(g.id); } }
+                for g in games : GameTile { horizontal-stretch: 1; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
             }
         }
     }

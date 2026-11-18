@@ -1333,6 +1333,57 @@ impl AppApi for IpcApi {
         self.game_call("game_state", id)
     }
 
+    /// Add a manually added game (name + exe/shortcut path,
+    /// optional bound profile id); returns the new entry. A
+    /// `None` / empty profile id means no profile bound.
+    fn add_game(
+        &self,
+        name: &str,
+        exe_path: &str,
+        profile_id: Option<String>,
+    ) -> Result<GameSummary, UserError> {
+        self.game_write_call("add_game", None, name, exe_path, profile_id)
+    }
+
+    /// Update a manually added game's name / exe path / bound
+    /// profile; returns the updated entry.
+    fn update_game(
+        &self,
+        id: &str,
+        name: &str,
+        exe_path: &str,
+        profile_id: Option<String>,
+    ) -> Result<GameSummary, UserError> {
+        self.game_write_call("update_game", Some(id), name, exe_path, profile_id)
+    }
+
+    /// Remove a manually added game; returns `true` when removed.
+    fn remove_game(&self, id: &str) -> Result<bool, UserError> {
+        let got: Result<bool, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async("remove_game", serde_json::json!({"id": id}))
+                .await?;
+            value
+                .get("removed")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| IpcError::Protocol("remove_game has no removed".to_string()))
+        });
+        match got {
+            Ok(removed) => {
+                if removed {
+                    if let Ok(mut slot) = self.cache.games.lock() {
+                        if let Some(games) = slot.as_mut() {
+                            games.retain(|g| g.id != id);
+                        }
+                    }
+                }
+                self.request_slow_refresh();
+                Ok(removed)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
+    }
+
     fn start_learn(&self) -> Result<bool, UserError> {
         self.learn_call("start_learn")
     }
@@ -1939,6 +1990,53 @@ impl IpcApi {
         }
     }
 
+    /// Shared manual-game write call (`add_game` / `update_game`):
+    /// name + exe path in, the stored [`GameSummary`] out. An
+    /// empty profile id is sent as `null` (no profile bound), the
+    /// same as an absent one. Success upserts the games cache at
+    /// once (add appends, update replaces by id) and pulls the
+    /// next slow cycle forward.
+    fn game_write_call(
+        &self,
+        method: &str,
+        id: Option<&str>,
+        name: &str,
+        exe_path: &str,
+        profile_id: Option<String>,
+    ) -> Result<GameSummary, UserError> {
+        let profile_id = profile_id.filter(|s| !s.is_empty());
+        let got: Result<GameSummary, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async(
+                    method,
+                    serde_json::json!({
+                        "id": id,
+                        "name": name,
+                        "exe_path": exe_path,
+                        "profile_id": profile_id,
+                    }),
+                )
+                .await?;
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
+        });
+        match got {
+            Ok(summary) => {
+                if let Ok(mut slot) = self.cache.games.lock() {
+                    if let Some(games) = slot.as_mut() {
+                        if let Some(old) = games.iter_mut().find(|g| g.id == summary.id) {
+                            *old = summary.clone();
+                        } else {
+                            games.push(summary.clone());
+                        }
+                    }
+                }
+                self.request_slow_refresh();
+                Ok(summary)
+            }
+            Err(_) => Err(Self::ipc_failed()),
+        }
+    }
+
     /// Shared `{"id": …}` game call: one game id in, its
     /// [`GameSummary`] out.
     fn game_call(&self, method: &str, id: &str) -> Result<GameSummary, UserError> {
@@ -2184,6 +2282,20 @@ mod tests {
         assert!(client.launch_game("assetto_corsa").is_err());
         assert!(client.stop_game("assetto_corsa").is_err());
         assert!(client.game_state("assetto_corsa").is_err());
+        // Manual-game writes over the same socket: the sim has no
+        // manual store, so every write honestly errors (no fake
+        // entry) and the list stays empty. This still proves the
+        // method names dispatch end to end — an unknown method
+        // would fail the same way, so the success path is covered
+        // only against the real daemon store, not here (open).
+        assert!(client
+            .add_game("Test Game", "C:\\Games\\test.exe", None)
+            .is_err());
+        assert!(client
+            .update_game("x", "Test Game", "C:\\Games\\test.exe", None)
+            .is_err());
+        assert!(client.remove_game("x").is_err());
+        assert_eq!(client.list_games().len(), 0);
         assert!(client.start_learn().is_err());
         assert!(client.cancel_learn().is_err());
         assert!(!client.is_learning());

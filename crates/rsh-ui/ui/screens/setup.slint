@@ -136,7 +136,7 @@ export component SetupWizard inherits Rectangle {
     in property <bool> centre-done: false;
     in property <bool> pedals-done: false;
     // Step 3 — Games.
-    in property <string> games-text: "No games found yet.";
+    in property <string> games-text: "No games added yet.";
     in property <bool> games-done: false;
 
     callback back();
@@ -150,11 +150,11 @@ export component SetupWizard inherits Rectangle {
     callback reset-pairing();
     callback connect-action(string);
     callback calibrate-action(string);
-    callback find-games();
+    callback add-game();
 
     property <bool> next-enabled: step == 0 ? connect-done : step == 1 ? (vjoy-installed || vjoy-fallback) : step == 2 ? paired : step == 3 ? (!calibration-available || (centre-done && pedals-done)) : true;
-    property <string> step-title: step == 0 ? "Connect your wheel" : step == 1 ? "Install the game controller" : step == 2 ? "Pair your wheel" : step == 3 ? "Calibrate your wheel" : "Find your games";
-    property <string> step-lead: step == 0 ? "Join the wheel's Wi-Fi, or plug in a USB cable." : step == 1 ? "Games need a controller driver — vJoy is the default." : step == 2 ? "Pairing keeps your wheel safe, so only this PC can control it." : step == 3 ? "Centre the wheel and set the pedals, so the game gets true inputs." : "RSH finds your racing games and switches profile automatically.";
+    property <string> step-title: step == 0 ? "Connect your wheel" : step == 1 ? "Install the game controller" : step == 2 ? "Pair your wheel" : step == 3 ? "Calibrate your wheel" : "Add your games";
+    property <string> step-lead: step == 0 ? "Join the wheel's Wi-Fi, or plug in a USB cable." : step == 1 ? "Games need a controller driver — vJoy is the default." : step == 2 ? "Pairing keeps your wheel safe, so only this PC can control it." : step == 3 ? "Centre the wheel and set the pedals, so the game gets true inputs." : "Add your racing games — pick the exe or shortcut for each game. RSH switches profile automatically when a game starts.";
 
     HorizontalLayout {
         // Explicit 920px (not 100%): the wizard is a fixed-size
@@ -199,7 +199,7 @@ export component SetupWizard inherits Rectangle {
                 StepRow { num: 2; label: "Drivers"; sub: "vJoy controller"; done: step > 1 || vjoy-installed || vjoy-fallback; now: step == 1; }
                 StepRow { num: 3; label: "Pair"; sub: "Link this PC to your wheel"; done: paired; now: step == 2; }
                 StepRow { num: 4; label: "Calibrate"; sub: "Centre and pedals"; done: step > 3; now: step == 3; }
-                StepRow { num: 5; label: "Games"; sub: "Find your racing games"; done: games-done; now: step == 4; }
+                StepRow { num: 5; label: "Games"; sub: "Add your racing games"; done: games-done; now: step == 4; }
                 Rectangle { vertical-stretch: 1; }
                 skip-ta := TouchArea {
                     width: 100%;
@@ -533,7 +533,7 @@ export component SetupWizard inherits Rectangle {
                         spacing: 12px;
                         Text { vertical-alignment: center; text: games-text; font-size: 13.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: "Find games"; primary: true; disabled: busy-kind == 13; clicked => { find-games(); } }
+                        Btn { label: "Add game"; primary: true; disabled: busy-kind == 13; clicked => { add-game(); } }
                     }
                 }
                 Text { text: "RSH switches profile automatically when a game starts."; font-size: 12.5px; color: Theme.mute; }

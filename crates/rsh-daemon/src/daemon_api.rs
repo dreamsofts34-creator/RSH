@@ -539,6 +539,37 @@ impl AppApi for DaemonApi {
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
     }
 
+    fn add_game(
+        &self,
+        name: &str,
+        exe_path: &str,
+        profile_id: Option<String>,
+    ) -> Result<GameSummary, UserError> {
+        self.state
+            .add_manual_game(name, exe_path, profile_id)
+            .map(|game| to_api_game(&game))
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn update_game(
+        &self,
+        id: &str,
+        name: &str,
+        exe_path: &str,
+        profile_id: Option<String>,
+    ) -> Result<GameSummary, UserError> {
+        self.state
+            .update_manual_game(id, name, exe_path, profile_id)
+            .map(|game| to_api_game(&game))
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn remove_game(&self, id: &str) -> Result<bool, UserError> {
+        self.state
+            .remove_manual_game(id)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
     fn start_learn(&self) -> Result<bool, UserError> {
         self.state.start_learn();
         Ok(self.state.is_learning())

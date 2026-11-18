@@ -314,6 +314,9 @@ pub fn dispatch(
         | "launch_game"
         | "stop_game"
         | "game_state"
+        | "add_game"
+        | "update_game"
+        | "remove_game"
         | "start_learn"
         | "cancel_learn"
         | "is_learning"
@@ -674,6 +677,42 @@ fn dispatch_settings(
 
 /// Dispatch the v2.0.1 profiles / games / learn methods. Split out
 /// of [`dispatch`] so neither function trips `too_many_lines`.
+/// Dispatch the manual-game write methods (`add_game`,
+/// `update_game`, `remove_game`). Split out of
+/// [`dispatch_profiles_games_learn`] so neither function trips
+/// `too_many_lines`.
+fn dispatch_game_write(
+    api: &Arc<dyn AppApi>,
+    request: &IpcRequest,
+) -> Result<serde_json::Value, IpcError> {
+    let params = &request.params;
+    let text = |key: &str| {
+        params
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let profile_id = params
+        .get("profile_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    match request.method.as_str() {
+        "add_game" => api
+            .add_game(text("name"), text("exe_path"), profile_id)
+            .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
+            .map_err(|e| IpcError::Api(e.code)),
+        "update_game" => api
+            .update_game(text("id"), text("name"), text("exe_path"), profile_id)
+            .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
+            .map_err(|e| IpcError::Api(e.code)),
+        "remove_game" => api
+            .remove_game(text("id"))
+            .map(|removed| serde_json::json!({"removed": removed}))
+            .map_err(|e| IpcError::Api(e.code)),
+        other => Err(IpcError::UnknownMethod(other.to_string())),
+    }
+}
+
 fn dispatch_profiles_games_learn(
     api: &Arc<dyn AppApi>,
     request: &IpcRequest,
@@ -747,6 +786,7 @@ fn dispatch_profiles_games_learn(
                 .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
                 .map_err(|e| IpcError::Api(e.code))
         }
+        "add_game" | "update_game" | "remove_game" => dispatch_game_write(api, request),
         "start_learn" => api
             .start_learn()
             .map(|learning| serde_json::json!({"learning": learning}))

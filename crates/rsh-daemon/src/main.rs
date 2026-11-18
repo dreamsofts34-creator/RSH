@@ -1316,6 +1316,10 @@ fn main() {
     for warning in state.binding_load_warnings() {
         log_line(verbose, &format!("daemon: bindings: {warning}"));
     }
+    // Manual games: same contract as the bindings store.
+    for warning in state.manual_game_load_warnings() {
+        log_line(verbose, &format!("daemon: manual games: {warning}"));
+    }
     let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(256);
     let tray_actions: Arc<Mutex<Vec<TrayAction>>> = Arc::new(Mutex::new(Vec::new()));
     let shutdown = Arc::new(AtomicBool::new(false));

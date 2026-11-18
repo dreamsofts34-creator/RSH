@@ -1,449 +1,40 @@
-//! Game detection + launch (Phase F3 / SW-R7.3, Dashboard integration).
+//! Manual-game launch (game-scanner removal, v2.0.3+).
 //!
-//! Catalogue: Assetto Corsa, Assetto Corsa Competizione, iRacing,
-//! DiRT Rally 2.0 (FEATURE-INVENTORY §6.1). The other matrix games
-//! (rFactor 2, Automobilista 2, F1, Forza) are **not** in the catalogue:
-//! their Steam/exe paths are unverified and are only added after a
-//! Windows-PC check (see `docs/GAME-MATRIX.md`).
+//! The automatic game scanner is gone (user decision 2026-11-18):
+//! no Steam/iRacing catalogue, no registry reads, no `tasklist`,
+//! no filesystem detection of any kind. The user adds games by hand
+//! (see [`crate::manual_games`]) and this module only **launches**
+//! them and tracks the running one.
 //!
-//! * Detection reads Steam library folders (`steamapps/libraryfolders.vdf`)
-//!   and checks for the game's exe under `steamapps/common/<dir>/`.
-//!   iRacing is not on Steam — it is detected at its default install path.
-//!   The library discovery is a pure function over a Steam root, so it is
-//!   testable on Linux with fixture folders; only the *default* roots are
-//!   Windows-only.
-//! * Launch spawns the game exe directly and tracks the child pid.
-//!   Exactly one game runs at a time. Stop kills **only** the tracked pid
-//!   (SEC-E-10: never kill another same-name process).
+//! * Launch spawns the stored exe — or a shortcut (`.lnk`, via
+//!   `ShellExecuteExW`) — directly and tracks the child pid.
+//!   Exactly one game runs at a time. Stop kills **only** the
+//!   tracked pid (SEC-E-10: never kill another same-name process).
+//! * Spawn uses null stdio + detached, no-window creation (DS-47):
+//!   a game that inherits the daemon's stdio pipes can block the
+//!   parent forever (the NSIS `Exec` hang class fixed in v2.0.2),
+//!   and a console window must never flash up for a GUI game.
 //!
 //! # Windows-only gaps (this Linux sandbox cannot verify them)
 //!
-//! * Default Steam roots and the iRacing default path are Windows paths
-//!   (`#[cfg(windows)]`); on Linux detection finds nothing by default.
 //! * The real launch on Windows spawns a Windows exe; the
-//!   [`SystemSpawner`] is only exercised here through the fake spawner in
-//!   tests. Real-launch verification is a Windows-PC item (gate).
-//! * Assetto Corsa's helper (`acs.exe`) spawns as a *child* of the game:
-//!   stopping the tracked pid does not enumerate children (that needs
-//!   `Toolhelp32Snapshot` on Windows). If the helper outlives the game,
-//!   the app re-attaches on Refresh and stops it separately — the C#
-//!   behaviour, not yet implemented here (open item for Windows CI).
+//!   [`SystemSpawner`] is only exercised here through the fake
+//!   spawner in tests. Real-launch verification is a Windows-PC
+//!   item (gate).
+//! * A shortcut's target helper (e.g. AC's `acs.exe`) spawns as a
+//!   *child* of the game: stopping the tracked pid does not
+//!   enumerate children (that needs `Toolhelp32Snapshot` on
+//!   Windows). If the helper outlives the game, the app re-attaches
+//!   on Refresh and stops it separately — the C# behaviour, not yet
+//!   implemented here (open item for Windows CI).
 
-use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-
-use rsh_profiles::resolver::{
-    GAME_ASSETTO_CORSA, GAME_ASSETTO_CORSA_COMPETIZIONE, GAME_DIRT_RALLY_2, GAME_IRACING,
-};
-use serde::{Deserialize, Serialize};
-
-/// One catalogue game.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Game {
-    /// Game id (matches the `GAME_*` constants in `rsh-profiles`).
-    pub id: &'static str,
-    /// Display name.
-    pub name: &'static str,
-    /// Steam app id, when the game is on Steam (`None` for iRacing).
-    pub steam_app_id: Option<u32>,
-    /// Exe file names, first one is the main exe.
-    pub exe_file_names: &'static [&'static str],
-    /// Install directory names under `steamapps/common/` (Steam games).
-    pub install_dir_names: &'static [&'static str],
-    /// Helper exe spawned by the game, if any (AC: `acs.exe`).
-    pub helper_exe: Option<&'static str>,
-}
-
-/// The launcher catalogue (FEATURE-INVENTORY §6.1): exactly four games.
-pub const KNOWN_GAMES: &[Game] = &[
-    Game {
-        id: GAME_ASSETTO_CORSA,
-        name: "Assetto Corsa",
-        steam_app_id: Some(244_210),
-        exe_file_names: &["assettocorsa.exe"],
-        install_dir_names: &["assettocorsa"],
-        helper_exe: Some("acs.exe"),
-    },
-    Game {
-        id: GAME_ASSETTO_CORSA_COMPETIZIONE,
-        name: "Assetto Corsa Competizione",
-        steam_app_id: Some(805_550),
-        exe_file_names: &["acc.exe"],
-        install_dir_names: &["Assetto Corsa Competizione"],
-        helper_exe: None,
-    },
-    Game {
-        id: GAME_IRACING,
-        name: "iRacing",
-        steam_app_id: None,
-        exe_file_names: &["iRacingSim64DX11.exe"],
-        install_dir_names: &[],
-        helper_exe: None,
-    },
-    Game {
-        id: GAME_DIRT_RALLY_2,
-        name: "DiRT Rally 2.0",
-        steam_app_id: Some(690_790),
-        exe_file_names: &["dirt2.exe"],
-        install_dir_names: &["DiRT Rally 2.0"],
-        helper_exe: None,
-    },
-];
-
-/// Finds a catalogue game by id.
-#[must_use]
-pub fn game_by_id(id: &str) -> Option<&'static Game> {
-    KNOWN_GAMES.iter().find(|game| game.id == id)
-}
-
-/// Default Steam install roots.
-///
-/// Windows: the two standard install locations. Other platforms: empty
-/// (Steam library detection is Windows-only; callers pass explicit roots
-/// in tests).
-#[must_use]
-pub fn default_steam_roots() -> Vec<PathBuf> {
-    #[cfg(windows)]
-    {
-        vec![
-            PathBuf::from(r"C:\Program Files (x86)\Steam"),
-            PathBuf::from(r"C:\Program Files\Steam"),
-        ]
-    }
-    #[cfg(not(windows))]
-    {
-        Vec::new()
-    }
-}
-
-/// Steam install roots for a configured path plus the system sources.
-///
-/// Order: the user's configured `steam_path` (settings, when non-empty
-/// and a directory), the Registry `SteamPath` (Windows), then the two
-/// standard install locations. M2: a non-default Steam install used to
-/// be invisible to detection.
-#[must_use]
-pub fn steam_roots_for(configured: Option<&str>) -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(path) = configured
-        && !path.trim().is_empty()
-    {
-        let path = PathBuf::from(path.trim());
-        if path.is_dir() {
-            roots.push(path);
-        }
-    }
-    if let Some(registry) = steam_root_from_registry() {
-        roots.push(registry);
-    }
-    roots.extend(default_steam_roots());
-    roots
-}
-
-/// iRacing install paths for a configured path plus the defaults.
-///
-/// The user's configured `iracing_path` (settings, when non-empty)
-/// wins over the default install locations (M2).
-#[must_use]
-pub fn iracing_paths_for(configured: Option<&str>) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = Vec::new();
-    if let Some(path) = configured
-        && !path.trim().is_empty()
-    {
-        paths.push(PathBuf::from(path.trim()));
-    }
-    paths.extend(default_iracing_paths());
-    paths
-}
-
-/// Parses the `SteamPath` value out of `reg query` output (M2).
-///
-/// `reg query HKCU\Software\Valve\Steam /v SteamPath` prints lines like
-/// `    SteamPath    REG_SZ    C:\Program Files (x86)\Steam`.
-/// Returns the first value whose key is exactly `SteamPath`.
-#[must_use]
-pub fn parse_steam_registry_path(output: &str) -> Option<PathBuf> {
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 && parts[0] == "SteamPath" && parts[1] == "REG_SZ" {
-            // The path itself may contain spaces: rejoin from the 3rd token.
-            let path = parts[2..].join(" ");
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
-        }
-    }
-    None
-}
-
-/// Reads the Steam install root from the Windows Registry (M2).
-///
-/// Runs `reg query HKCU\Software\Valve\Steam /v SteamPath` and parses
-/// it with [`parse_steam_registry_path`]. `None` on non-Windows, when
-/// `reg` is unavailable, or when the key is absent.
-#[must_use]
-pub fn steam_root_from_registry() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        let output = std::process::Command::new("reg")
-            .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        parse_steam_registry_path(&String::from_utf8_lossy(&output.stdout))
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
-}
-
-/// Parses `tasklist` output: true when a line names `exe` (M2).
-///
-/// `tasklist /FI "IMAGENAME eq Steam.exe"` prints the image name as
-/// the first token of each process line.
-#[must_use]
-pub fn parse_tasklist_running(output: &str, exe: &str) -> bool {
-    output
-        .lines()
-        .any(|line| line.split_whitespace().next() == Some(exe))
-}
-
-/// Whether the Steam client process is running (M2).
-///
-/// Windows only; `false` elsewhere (a running client is only used as
-/// a *hint* that Steam's install is live — detection never depends on
-/// it, so a false negative only loses the hint).
-#[must_use]
-pub fn is_steam_running() -> bool {
-    #[cfg(windows)]
-    {
-        let Ok(output) = std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq Steam.exe", "/NH"])
-            .output()
-        else {
-            return false;
-        };
-        parse_tasklist_running(&String::from_utf8_lossy(&output.stdout), "Steam.exe")
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-/// Default iRacing install locations (M2): the two standard
-/// `Program Files` paths, used when no custom path is configured.
-#[must_use]
-pub fn default_iracing_paths() -> Vec<PathBuf> {
-    #[cfg(windows)]
-    {
-        vec![
-            PathBuf::from(r"C:\Program Files (x86)\iRacing\iRacingSim64DX11.exe"),
-            PathBuf::from(r"C:\Program Files\iRacing\iRacingSim64DX11.exe"),
-        ]
-    }
-    #[cfg(not(windows))]
-    {
-        Vec::new()
-    }
-}
-
-/// Discovers Steam library folders for one Steam install root.
-///
-/// Reads `<root>/steamapps/libraryfolders.vdf` and returns the root
-/// itself plus every `"path"` listed in the file (deduped, existing dirs
-/// only). A missing or unreadable VDF is not an error — the root alone is
-/// still a library. The VDF parse is deliberately minimal: it only looks
-/// for `"path"` keys and their quoted value on the same line.
-///
-/// # Errors
-///
-/// Never errors: unreadable input yields fewer libraries, never a failure.
-#[must_use]
-pub fn discover_steam_libraries(steam_root: &Path) -> Vec<PathBuf> {
-    let mut libraries: Vec<PathBuf> = Vec::new();
-    // Dedupe key is the lowercased path: Windows paths are
-    // case-insensitive, and the same library can appear once from the
-    // VDF (`C:\Games`) and once as the root (`c:\games`) (L2).
-    let mut seen: HashSet<String> = HashSet::new();
-    let push = |path: PathBuf, libraries: &mut Vec<PathBuf>, seen: &mut HashSet<String>| {
-        if path.is_dir() && seen.insert(path.to_string_lossy().to_lowercase()) {
-            libraries.push(path);
-        }
-    };
-    push(steam_root.to_path_buf(), &mut libraries, &mut seen);
-
-    let vdf = steam_root.join("steamapps").join("libraryfolders.vdf");
-    // L2: read bytes, not `read_to_string` — a VDF with a non-UTF8
-    // byte used to drop the whole file (and its libraries) outright.
-    if let Ok(bytes) = std::fs::read(vdf) {
-        let text = String::from_utf8_lossy(&bytes);
-        for path in parse_libraryfolders_vdf(&text) {
-            push(path, &mut libraries, &mut seen);
-        }
-    }
-    libraries
-}
-
-/// Extracts the `"path"` values from a `libraryfolders.vdf` document.
-fn parse_libraryfolders_vdf(text: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for line in text.lines() {
-        // Split on quotes, dropping empty and whitespace-only parts:
-        // `"path"  "C:\Games"` yields ["path", "C:\Games"].
-        let mut quoted = line.split('"').filter(|part| !part.trim().is_empty());
-        let mut in_path_value = false;
-        for part in quoted.by_ref() {
-            if part.trim() == "path" {
-                in_path_value = true;
-                break;
-            }
-        }
-        if !in_path_value {
-            continue;
-        }
-        if let Some(value) = quoted.next() {
-            // VDF escapes backslashes: `C:\\Games\\Steam`.
-            let unescaped = value.replace("\\\\", "\\");
-            paths.push(PathBuf::from(unescaped));
-        }
-    }
-    paths
-}
-
-/// Finds a game's exe inside the given Steam libraries, if installed.
-///
-/// Checks `<library>/steamapps/common/<install dir>/<exe>` for every
-/// install dir / exe combination. iRacing has no Steam install dirs and
-/// is never found here — use [`detect_game`] for it.
-#[must_use]
-pub fn find_game_exe(libraries: &[PathBuf], game: &Game) -> Option<PathBuf> {
-    for library in libraries {
-        for dir in game.install_dir_names {
-            for exe in game.exe_file_names {
-                let candidate = library.join("steamapps").join("common").join(dir).join(exe);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Detection result for one catalogue game.
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct DetectedGame {
-    /// Game id (one of the `GAME_*` constants).
-    pub game_id: String,
-    /// Display name.
-    pub name: String,
-    /// Steam app id, when the game is on Steam.
-    pub steam_app_id: Option<u32>,
-    /// True when the exe was found on disk.
-    pub installed: bool,
-    /// Full path to the game exe, when installed.
-    pub exe_path: Option<String>,
-    /// Profile bound to this game, if the user bound one (`None` = the
-    /// game profile / default applies; set by the caller, not by detection).
-    pub bound_profile_id: Option<String>,
-}
-
-impl DetectedGame {
-    /// Builds a not-installed entry for a game.
-    #[must_use]
-    pub fn not_installed(game: &Game) -> Self {
-        Self {
-            game_id: game.id.to_owned(),
-            name: game.name.to_owned(),
-            steam_app_id: game.steam_app_id,
-            installed: false,
-            exe_path: None,
-            bound_profile_id: None,
-        }
-    }
-
-    /// Binds a profile to this game. Returns `self` for chaining.
-    #[must_use]
-    pub fn with_bound_profile(mut self, profile_id: impl Into<String>) -> Self {
-        self.bound_profile_id = Some(profile_id.into());
-        self
-    }
-}
-
-/// Detects one game: Steam exe search, plus the iRacing default path
-/// when the game is iRacing.
-#[must_use]
-pub fn detect_game(game: &Game, steam_roots: &[PathBuf]) -> DetectedGame {
-    detect_game_with(game, steam_roots, &default_iracing_paths())
-}
-
-/// Detects one game with explicit iRacing install paths (M2: the
-/// user's configured `iracing_path` feeds this list).
-#[must_use]
-pub fn detect_game_with(
-    game: &Game,
-    steam_roots: &[PathBuf],
-    iracing_paths: &[PathBuf],
-) -> DetectedGame {
-    let mut libraries: Vec<PathBuf> = Vec::new();
-    for root in steam_roots {
-        libraries.extend(discover_steam_libraries(root));
-    }
-    if let Some(exe) = find_game_exe(&libraries, game) {
-        return DetectedGame {
-            game_id: game.id.to_owned(),
-            name: game.name.to_owned(),
-            steam_app_id: game.steam_app_id,
-            installed: true,
-            exe_path: Some(exe.to_string_lossy().into_owned()),
-            bound_profile_id: None,
-        };
-    }
-    if game.id == GAME_IRACING {
-        for candidate in iracing_paths {
-            if candidate.is_file() {
-                return DetectedGame {
-                    game_id: game.id.to_owned(),
-                    name: game.name.to_owned(),
-                    steam_app_id: None,
-                    installed: true,
-                    exe_path: Some(candidate.to_string_lossy().into_owned()),
-                    bound_profile_id: None,
-                };
-            }
-        }
-    }
-    DetectedGame::not_installed(game)
-}
-
-/// Detects every catalogue game for the given Steam roots.
-#[must_use]
-pub fn detect_all_games(steam_roots: &[PathBuf]) -> Vec<DetectedGame> {
-    detect_all_games_with(steam_roots, &default_iracing_paths())
-}
-
-/// Detects every catalogue game for the given Steam roots and iRacing
-/// install paths (M2: configured paths feed this list).
-#[must_use]
-pub fn detect_all_games_with(
-    steam_roots: &[PathBuf],
-    iracing_paths: &[PathBuf],
-) -> Vec<DetectedGame> {
-    KNOWN_GAMES
-        .iter()
-        .map(|game| detect_game_with(game, steam_roots, iracing_paths))
-        .collect()
-}
 
 /// Why a launch failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LaunchError {
-    /// The game is not installed (no exe found).
+    /// The game has no exe path (empty path stored on the entry).
     NotInstalled(String),
     /// Another game is already running (one game at a time).
     AlreadyRunning(String),
@@ -469,14 +60,14 @@ impl fmt::Display for LaunchError {
 impl std::error::Error for LaunchError {}
 
 /// A running game tracked by the launcher.
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RunningGame {
-    /// Game id.
+    /// Game id (the manual entry's slug id).
     pub game_id: String,
     /// OS process id of the tracked game process.
     pub pid: u32,
-    /// Full path to the exe that was launched.
+    /// Full path to the exe (or shortcut) that was launched.
     pub exe_path: String,
     /// Unix seconds when the game was launched.
     pub started_unix_secs: u64,
@@ -485,7 +76,7 @@ pub struct RunningGame {
 /// Spawns and supervises game processes. The production implementation
 /// is [`SystemSpawner`]; tests inject a fake.
 pub trait ProcessSpawner {
-    /// Spawns an exe and returns its pid.
+    /// Spawns an exe (or shortcut) and returns its pid.
     ///
     /// # Errors
     ///
@@ -514,9 +105,10 @@ pub trait ProcessSpawner {
 
 #[cfg(windows)]
 mod win32 {
-    //! Minimal raw Win32 FFI for process liveness / termination.
-    //! (Same rationale as the watcher module: no `windows`-crate
-    //! dependency yet; the SW-R7.1 spike may replace this.)
+    //! Minimal raw Win32 FFI for process liveness / termination and
+    //! shortcut launching. (Same rationale as the watcher module: no
+    //! `windows`-crate dependency yet; the SW-R7.1 spike may replace
+    //! this.)
 
     /// `HANDLE` as an integer-sized value.
     pub type Handle = isize;
@@ -537,6 +129,12 @@ mod win32 {
         ) -> i32;
         /// Closes a handle; returns non-zero on success.
         pub fn CloseHandle(handle: Handle) -> i32;
+        /// Launches a file with its registered handler (used for
+        /// `.lnk` shortcuts, which `CreateProcess` cannot start);
+        /// returns non-zero on success.
+        pub fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
+        /// Returns the pid for a process handle, or 0 on failure.
+        pub fn GetProcessId(process: Handle) -> u32;
     }
 
     /// `PROCESS_QUERY_LIMITED_INFORMATION` (0x1000).
@@ -545,20 +143,134 @@ mod win32 {
     pub const PROCESS_TERMINATE: u32 = 0x0001;
     /// `STILL_ACTIVE` (259).
     pub const STILL_ACTIVE: u32 = 259;
+    /// `SEE_MASK_NOCLOSEPROCESS` (0x40): return the child process
+    /// handle in `h_process`, so the launcher can track its pid.
+    pub const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
+    /// `SW_SHOWNORMAL` (1): show the launched app normally.
+    pub const SW_SHOWNORMAL: i32 = 1;
+
+    /// `SHELLEXECUTEINFOW` (partial: fields up to `h_process` are
+    /// the ones this module reads; the struct is `repr(C)` and the
+    /// size is set from the full layout, so later fields are
+    /// zero-initialised padding).
+    #[repr(C)]
+    pub struct ShellExecuteInfoW {
+        /// Size of this struct, in bytes.
+        pub cb_size: u32,
+        /// Flags (`SEE_MASK_*`).
+        pub f_mask: u32,
+        /// Parent window handle (`0` = none).
+        pub hwnd: Handle,
+        /// Verb (`null` = the default "open" verb).
+        pub lp_verb: *const u16,
+        /// File to open (the shortcut path, UTF-16, NUL-terminated).
+        pub lp_file: *const u16,
+        /// Parameters (`null`).
+        pub lp_parameters: *const u16,
+        /// Working directory (`null` = the shortcut's own).
+        pub lp_directory: *const u16,
+        /// Show command (`SW_SHOWNORMAL`).
+        pub n_show: i32,
+        /// Receives the `HINSTANCE` result (unused here).
+        pub h_inst_app: Handle,
+        /// Item-id list (`null`).
+        pub lp_id_list: *mut core::ffi::c_void,
+        /// Class name (`null`).
+        pub lp_class: *const u16,
+        /// Class key (`0`).
+        pub hkey_class: Handle,
+        /// Hot key (`0`).
+        pub dw_hot_key: u32,
+        /// Icon (`0`).
+        pub h_icon: Handle,
+        /// Receives the child process handle (with
+        /// `SEE_MASK_NOCLOSEPROCESS`).
+        pub h_process: Handle,
+    }
+}
+
+/// True when `path` is a Windows shortcut (`.lnk`, any case).
+#[must_use]
+pub fn is_shortcut(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
 }
 
 /// Spawns real OS processes.
 ///
 /// * Spawn uses [`std::process::Command`] (works on Windows and Linux).
+///   Shortcuts (`.lnk`) go through `ShellExecuteExW` instead —
+///   `CreateProcess` cannot start a shortcut — with
+///   `SEE_MASK_NOCLOSEPROCESS`, so the child pid is tracked exactly
+///   like a direct exe launch.
 /// * Liveness/termination use raw Win32 FFI on Windows and `/proc` +
 ///   the `kill` command elsewhere.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemSpawner;
 
+impl SystemSpawner {
+    /// Launches a shortcut (`.lnk`) via `ShellExecuteExW` and
+    /// returns the child pid. Windows-only.
+    #[cfg(windows)]
+    fn spawn_shortcut(exe: &Path) -> Result<u32, String> {
+        use std::os::windows::ffi::OsStrExt;
+        // SAFETY: plain Win32 call with checked returns; the path
+        // buffer is valid for the call, the info struct is fully
+        // initialised, and the process handle is always closed.
+        unsafe {
+            let file_wide: Vec<u16> = exe
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut info = win32::ShellExecuteInfoW {
+                cb_size: u32::try_from(std::mem::size_of::<win32::ShellExecuteInfoW>())
+                    .unwrap_or(u32::MAX),
+                f_mask: win32::SEE_MASK_NOCLOSEPROCESS,
+                hwnd: 0,
+                lp_verb: std::ptr::null(),
+                lp_file: file_wide.as_ptr(),
+                lp_parameters: std::ptr::null(),
+                lp_directory: std::ptr::null(),
+                n_show: win32::SW_SHOWNORMAL,
+                h_inst_app: 0,
+                lp_id_list: std::ptr::null_mut(),
+                lp_class: std::ptr::null(),
+                hkey_class: 0,
+                dw_hot_key: 0,
+                h_icon: 0,
+                h_process: 0,
+            };
+            let ok = win32::ShellExecuteExW(&raw mut info);
+            if ok == 0 {
+                return Err(format!("failed to launch shortcut '{}'", exe.display()));
+            }
+            if info.h_process == 0 {
+                return Err(format!(
+                    "shortcut '{}' launched but returned no process",
+                    exe.display()
+                ));
+            }
+            let pid = win32::GetProcessId(info.h_process);
+            win32::CloseHandle(info.h_process);
+            if pid == 0 {
+                return Err(format!(
+                    "shortcut '{}' launched but its pid could not be read",
+                    exe.display()
+                ));
+            }
+            Ok(pid)
+        }
+    }
+}
+
 impl ProcessSpawner for SystemSpawner {
     fn spawn(&mut self, exe: &Path) -> Result<u32, String> {
         #[cfg(windows)]
         {
+            if is_shortcut(exe) {
+                return Self::spawn_shortcut(exe);
+            }
             // DS-47: null stdio + detached, no-window creation —
             // mirroring the daemon's `spawn_ui` (F8). A game that
             // inherits the daemon's stdio pipes can block the parent
@@ -612,8 +324,8 @@ impl ProcessSpawner for SystemSpawner {
     fn terminate(&mut self, pid: u32) -> Result<(), String> {
         #[cfg(windows)]
         {
-            // SAFETY: plain Win32 call with a checked return; the handle
-            // is always closed.
+            // SAFETY: plain Win32 call with a checked return; the
+            // handle is always closed.
             unsafe {
                 let handle = win32::OpenProcess(win32::PROCESS_TERMINATE, 0, pid);
                 if handle == 0 {
@@ -680,7 +392,7 @@ impl ProcessSpawner for SystemSpawner {
 ///
 /// The launcher owns no profile state — it only reports which game is
 /// running. The watcher / app layer binds the game's profile (see
-/// [`DetectedGame::bound_profile_id`]).
+/// [`crate::manual_games::ManualGame::bound_profile_id`]).
 pub struct GameLauncher<S: ProcessSpawner> {
     spawner: S,
     running: Option<RunningGame>,
@@ -702,22 +414,21 @@ impl<S: ProcessSpawner> GameLauncher<S> {
         self.running.as_ref()
     }
 
-    /// Launches a detected game.
+    /// Launches a manually added game.
     ///
     /// # Errors
     ///
-    /// [`LaunchError::NotInstalled`] when the game has no exe path,
+    /// [`LaunchError::NotInstalled`] when the exe path is empty,
     /// [`LaunchError::AlreadyRunning`] when another game is tracked as
     /// running, [`LaunchError::SpawnFailed`] when the OS refuses to start it.
-    pub fn launch(&mut self, game: &DetectedGame) -> Result<RunningGame, LaunchError> {
+    pub fn launch(&mut self, game_id: &str, exe_path: &str) -> Result<RunningGame, LaunchError> {
         let _ = self.refresh();
         if let Some(running) = &self.running {
             return Err(LaunchError::AlreadyRunning(running.game_id.clone()));
         }
-        let exe_path = game
-            .exe_path
-            .as_ref()
-            .ok_or_else(|| LaunchError::NotInstalled(game.game_id.clone()))?;
+        if exe_path.trim().is_empty() {
+            return Err(LaunchError::NotInstalled(game_id.to_string()));
+        }
         let pid = self
             .spawner
             .spawn(Path::new(exe_path))
@@ -726,9 +437,9 @@ impl<S: ProcessSpawner> GameLauncher<S> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         let running = RunningGame {
-            game_id: game.game_id.clone(),
+            game_id: game_id.to_string(),
             pid,
-            exe_path: exe_path.clone(),
+            exe_path: exe_path.to_string(),
             started_unix_secs,
         };
         self.running = Some(running.clone());
@@ -878,161 +589,67 @@ mod tests {
         dir
     }
 
-    /// Builds a fake Steam root with one extra library and an AC exe.
-    fn steam_fixture() -> (PathBuf, PathBuf) {
-        let root = test_dir("steam");
-        let lib2 = root.join("lib2");
-        for dir in [
-            root.join("steamapps").join("common").join("assettocorsa"),
-            lib2.join("steamapps").join("common").join("DiRT Rally 2.0"),
-        ] {
-            std::fs::create_dir_all(&dir).expect("create fixture dir");
-        }
-        std::fs::write(
-            root.join("steamapps")
-                .join("common")
-                .join("assettocorsa")
-                .join("assettocorsa.exe"),
-            b"fake exe",
-        )
-        .expect("write fixture exe");
-        std::fs::write(
-            lib2.join("steamapps")
-                .join("common")
-                .join("DiRT Rally 2.0")
-                .join("dirt2.exe"),
-            b"fake exe",
-        )
-        .expect("write fixture exe");
-        std::fs::write(
-            root.join("steamapps").join("libraryfolders.vdf"),
-            format!(
-                "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n",
-                lib2.to_string_lossy().replace('\\', "\\\\")
-            ),
-        )
-        .expect("write fixture vdf");
-        (root, lib2)
+    /// A fake exe path inside a fresh temp dir.
+    fn fake_exe(dir: &Path, name: &str) -> String {
+        let exe = dir.join(name);
+        std::fs::write(&exe, b"fake exe").expect("write fixture exe");
+        exe.to_string_lossy().into_owned()
     }
 
     #[test]
-    fn vdf_discovers_extra_library_and_exe_is_found() {
-        let (root, lib2) = steam_fixture();
-        let libraries = discover_steam_libraries(&root);
-        assert!(libraries.contains(&root), "root is itself a library");
-        assert!(libraries.contains(&lib2), "VDF path is discovered");
-
-        let ac = game_by_id(GAME_ASSETTO_CORSA).expect("AC in catalogue");
-        let found = find_game_exe(&libraries, ac).expect("AC exe found");
-        assert!(found.ends_with("assettocorsa.exe"));
-
-        let dirt = game_by_id(GAME_DIRT_RALLY_2).expect("DR2 in catalogue");
-        let found = find_game_exe(&libraries, dirt).expect("DR2 exe found in lib2");
-        assert!(found.ends_with("dirt2.exe"));
-
-        let acc = game_by_id(GAME_ASSETTO_CORSA_COMPETIZIONE).expect("ACC in catalogue");
-        assert_eq!(find_game_exe(&libraries, acc), None);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn detect_all_games_reports_installed_flags() {
-        let (root, _lib2) = steam_fixture();
-        let games = detect_all_games(std::slice::from_ref(&root));
-        assert_eq!(games.len(), 4);
-        let by_id = |id: &str| games.iter().find(|game| game.game_id == id).unwrap();
-        assert!(by_id(GAME_ASSETTO_CORSA).installed);
-        assert!(by_id(GAME_DIRT_RALLY_2).installed);
-        assert!(!by_id(GAME_ASSETTO_CORSA_COMPETIZIONE).installed);
-        assert!(!by_id(GAME_IRACING).installed, "iRacing: no Steam exe");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn missing_vdf_still_detects_root_library() {
-        let root = test_dir("no-vdf");
-        std::fs::create_dir_all(
-            root.join("steamapps")
-                .join("common")
-                .join("Assetto Corsa Competizione"),
-        )
-        .expect("create fixture dir");
-        std::fs::write(
-            root.join("steamapps")
-                .join("common")
-                .join("Assetto Corsa Competizione")
-                .join("acc.exe"),
-            b"fake exe",
-        )
-        .expect("write fixture exe");
-        let libraries = discover_steam_libraries(&root);
-        assert_eq!(libraries, vec![root.clone()]);
-        let acc = game_by_id(GAME_ASSETTO_CORSA_COMPETIZIONE).expect("ACC in catalogue");
-        assert!(find_game_exe(&libraries, acc).is_some());
-        let _ = std::fs::remove_dir_all(&root);
+    fn is_shortcut_matches_lnk_case_insensitively() {
+        assert!(is_shortcut(Path::new(r"C:\Games\race.lnk")));
+        assert!(is_shortcut(Path::new(r"C:\Games\race.LNK")));
+        assert!(!is_shortcut(Path::new(r"C:\Games\race.exe")));
+        assert!(!is_shortcut(Path::new(r"C:\Games\race")));
     }
 
     #[test]
     fn launch_tracks_running_and_rejects_second_game() {
-        let (root, _lib2) = steam_fixture();
-        let games = detect_all_games(std::slice::from_ref(&root));
-        let ac = games
-            .iter()
-            .find(|game| game.game_id == GAME_ASSETTO_CORSA)
-            .unwrap()
-            .clone();
-        let dirt = games
-            .iter()
-            .find(|game| game.game_id == GAME_DIRT_RALLY_2)
-            .unwrap()
-            .clone();
+        let dir = test_dir("launch");
+        let ac = fake_exe(&dir, "race.exe");
+        let dirt = fake_exe(&dir, "dirt2.exe");
 
         let mut launcher = GameLauncher::new(FakeSpawner::new());
-        let running = launcher.launch(&ac).expect("AC launches");
-        assert_eq!(running.game_id, GAME_ASSETTO_CORSA);
+        let running = launcher.launch("my-race", &ac).expect("launch");
+        assert_eq!(running.game_id, "my-race");
         assert_eq!(
             launcher.running().map(|game| game.game_id.as_str()),
-            Some(GAME_ASSETTO_CORSA)
+            Some("my-race")
         );
 
-        let second = launcher.launch(&dirt);
+        let second = launcher.launch("dirt", &dirt);
         assert_eq!(
             second,
-            Err(LaunchError::AlreadyRunning(GAME_ASSETTO_CORSA.to_owned()))
+            Err(LaunchError::AlreadyRunning("my-race".to_owned()))
         );
 
         let stopped = launcher.stop().expect("stop works");
-        assert_eq!(stopped.game_id, GAME_ASSETTO_CORSA);
+        assert_eq!(stopped.game_id, "my-race");
         assert!(launcher.running().is_none());
 
         // After stopping, another game can launch.
-        assert!(launcher.launch(&dirt).is_ok());
-        let _ = std::fs::remove_dir_all(&root);
+        assert!(launcher.launch("dirt", &dirt).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn launch_not_installed_is_an_error() {
-        let acc = DetectedGame::not_installed(
-            game_by_id(GAME_ASSETTO_CORSA_COMPETIZIONE).expect("ACC in catalogue"),
-        );
+    fn launch_empty_exe_path_is_not_installed() {
         let mut launcher = GameLauncher::new(FakeSpawner::new());
         assert_eq!(
-            launcher.launch(&acc),
-            Err(LaunchError::NotInstalled(
-                GAME_ASSETTO_CORSA_COMPETIZIONE.to_owned()
-            ))
+            launcher.launch("my-race", ""),
+            Err(LaunchError::NotInstalled("my-race".to_owned()))
+        );
+        assert_eq!(
+            launcher.launch("my-race", "   "),
+            Err(LaunchError::NotInstalled("my-race".to_owned()))
         );
     }
 
     #[test]
     fn stop_kills_only_the_tracked_pid() {
-        let (root, _lib2) = steam_fixture();
-        let games = detect_all_games(std::slice::from_ref(&root));
-        let ac = games
-            .iter()
-            .find(|game| game.game_id == GAME_ASSETTO_CORSA)
-            .unwrap()
-            .clone();
+        let dir = test_dir("stop-only-tracked");
+        let ac = fake_exe(&dir, "race.exe");
 
         let mut launcher = GameLauncher::new(FakeSpawner::new());
         // A second, unrelated process with pid 2000 is alive in the fake.
@@ -1040,33 +657,28 @@ mod tests {
             .spawner
             .alive
             .borrow_mut()
-            .insert(2000, PathBuf::from("other-assettocorsa.exe"));
-        let running = launcher.launch(&ac).expect("AC launches");
+            .insert(2000, PathBuf::from("other-race.exe"));
+        let running = launcher.launch("my-race", &ac).expect("launch");
         launcher.stop().expect("stop works");
         assert!(
             launcher.spawner.alive.borrow().contains_key(&2000),
             "SEC-E-10: an unrelated pid must survive the stop"
         );
         assert_eq!(launcher.spawner.killed.borrow().as_slice(), [running.pid]);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn refresh_clears_a_game_that_exited_on_its_own() {
-        let (root, _lib2) = steam_fixture();
-        let games = detect_all_games(std::slice::from_ref(&root));
-        let ac = games
-            .iter()
-            .find(|game| game.game_id == GAME_ASSETTO_CORSA)
-            .unwrap()
-            .clone();
+        let dir = test_dir("refresh-dead");
+        let ac = fake_exe(&dir, "race.exe");
 
         let mut launcher = GameLauncher::new(FakeSpawner::new());
-        let running = launcher.launch(&ac).expect("AC launches");
+        let running = launcher.launch("my-race", &ac).expect("launch");
         launcher.spawner.kill_from_outside(running.pid);
         assert!(launcher.refresh().is_none());
         assert!(launcher.running().is_none());
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1079,15 +691,11 @@ mod tests {
     /// record, so the stop can be retried.
     #[test]
     fn stop_failed_terminate_keeps_record() {
-        let (root, _lib2) = steam_fixture();
-        let games = detect_all_games(std::slice::from_ref(&root));
-        let ac = games
-            .iter()
-            .find(|game| game.game_id == GAME_ASSETTO_CORSA)
-            .unwrap()
-            .clone();
+        let dir = test_dir("stop-fail");
+        let ac = fake_exe(&dir, "race.exe");
+
         let mut launcher = GameLauncher::new(FakeSpawner::new());
-        launcher.launch(&ac).expect("AC launches");
+        launcher.launch("my-race", &ac).expect("launch");
         launcher.spawner.set_fail_terminate(true);
         assert!(launcher.stop().is_err());
         assert!(
@@ -1099,120 +707,38 @@ mod tests {
             launcher.stop().is_ok(),
             "retry succeeds once terminate works"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// M1: when the process already died, stop still succeeds and
     /// clears the record (the game is gone either way).
     #[test]
     fn stop_when_process_already_dead_clears_record() {
-        let (root, _lib2) = steam_fixture();
-        let games = detect_all_games(std::slice::from_ref(&root));
-        let ac = games
-            .iter()
-            .find(|game| game.game_id == GAME_ASSETTO_CORSA)
-            .unwrap()
-            .clone();
+        let dir = test_dir("stop-dead");
+        let ac = fake_exe(&dir, "race.exe");
+
         let mut launcher = GameLauncher::new(FakeSpawner::new());
-        let running = launcher.launch(&ac).expect("AC launches");
+        let running = launcher.launch("my-race", &ac).expect("launch");
         launcher.spawner.kill_from_outside(running.pid);
         assert!(launcher.stop().is_ok());
         assert!(launcher.running().is_none());
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// L10: a pid reused by a different exe is not mistaken for the game.
     #[test]
     fn refresh_clears_on_exe_path_mismatch() {
-        let (root, _lib2) = steam_fixture();
-        let games = detect_all_games(std::slice::from_ref(&root));
-        let ac = games
-            .iter()
-            .find(|game| game.game_id == GAME_ASSETTO_CORSA)
-            .unwrap()
-            .clone();
+        let dir = test_dir("refresh-mismatch");
+        let ac = fake_exe(&dir, "race.exe");
+
         let mut launcher = GameLauncher::new(FakeSpawner::new());
-        let running = launcher.launch(&ac).expect("AC launches");
+        let running = launcher.launch("my-race", &ac).expect("launch");
         launcher
             .spawner
             .alive
             .borrow_mut()
             .insert(running.pid, PathBuf::from("other-game.exe"));
         assert!(launcher.refresh().is_none(), "pid now runs another exe");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// M2: the `reg query` parser finds `SteamPath` even when the
-    /// path contains spaces, and returns `None` without the key.
-    #[test]
-    fn steam_registry_path_parses_reg_query_output() {
-        let output = "\r\nHKEY_CURRENT_USER\\Software\\Valve\\Steam\r\n    SteamPath    REG_SZ    C:\\Program Files (x86)\\Steam\r\n";
-        assert_eq!(
-            parse_steam_registry_path(output),
-            Some(PathBuf::from(r"C:\Program Files (x86)\Steam"))
-        );
-        assert_eq!(
-            parse_steam_registry_path("    Other    REG_SZ    X\r\n"),
-            None
-        );
-    }
-
-    /// M2: the tasklist parser matches the image name in the first column.
-    #[test]
-    fn tasklist_parser_detects_steam() {
-        let output = "Steam.exe                   1234 Console                    1     50,000 K\n";
-        assert!(parse_tasklist_running(output, "Steam.exe"));
-        assert!(!parse_tasklist_running(
-            "INFO: No tasks are running.\n",
-            "Steam.exe"
-        ));
-    }
-
-    /// L2: a VDF with a non-UTF8 byte still yields its libraries, and
-    /// the same library in a different case is not listed twice.
-    #[test]
-    fn vdf_non_utf8_and_case_insensitive_dedupe() {
-        let root = test_dir("vdf-nonascii");
-        let lib2 = root.join("lib2");
-        std::fs::create_dir_all(lib2.join("steamapps").join("common")).expect("fixture dir");
-        std::fs::create_dir_all(root.join("steamapps")).expect("fixture dir");
-        let mut vdf = format!(
-            "\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n",
-            lib2.to_string_lossy().replace('\\', "\\\\")
-        )
-        .into_bytes();
-        vdf.extend_from_slice(b"// comment with a non-UTF8 byte: \xff\n");
-        // Same library again, uppercased — must not duplicate.
-        vdf.extend_from_slice(
-            format!(
-                "\"1\"\n{{\n\t\"path\"\t\t\"{}\"\n}}\n",
-                lib2.to_string_lossy().to_uppercase().replace('\\', "\\\\")
-            )
-            .as_bytes(),
-        );
-        std::fs::write(root.join("steamapps").join("libraryfolders.vdf"), vdf)
-            .expect("write fixture vdf");
-        let libraries = discover_steam_libraries(&root);
-        assert_eq!(
-            libraries.len(),
-            2,
-            "root + lib2, no duplicate: {libraries:?}"
-        );
-        assert!(libraries.contains(&lib2));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// M2: a configured iRacing path is detected even when the
-    /// defaults do not exist on this machine.
-    #[test]
-    fn configured_iracing_path_is_detected() {
-        let dir = test_dir("iracing-custom");
-        let exe = dir.join("iRacingSim64DX11.exe");
-        std::fs::write(&exe, b"fake exe").expect("write fixture exe");
-        let game = game_by_id(GAME_IRACING).expect("iRacing in catalogue");
-        let found = detect_game_with(game, &[], std::slice::from_ref(&exe));
-        assert!(found.installed);
-        assert_eq!(found.exe_path.as_deref(), Some(exe.to_str().unwrap()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
