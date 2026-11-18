@@ -608,6 +608,17 @@ jobs:
           for f in "${merged[@]}"; do
             echo "merged bin: $f ($(stat -c%s "$f") bytes)"
           done
+      # R2-48 (DS-64): WDT config assertion — the shipped build's
+      # watchdog config must be what the code assumes (5 s timeout,
+      # panic-on-timeout, loop + sample tasks subscribed and fed).
+      # Runs AFTER `pio run` (it inspects the built .elf/.bin + the
+      # Arduino-core sdkconfig the precompiled IDF was built with).
+      # What it cannot prove is documented in the script header: WDT
+      # actually firing on a real board needs a board test, not CI.
+      - name: WDT config check (R2-48)
+        if: steps.check.outputs.run == 'true'
+        shell: bash
+        run: bash firmware/tools/check-wdt-config.sh
 
   # Phase E gate: runs the full frontend gate — lint, vitest (includes
   # the AppShell render test, the blank-window regression test: the root

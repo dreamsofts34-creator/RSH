@@ -7,6 +7,10 @@
 // GET_DIAG control command (0x0D) se snapshot lekar diagnostics bundle
 // mein daal sakti hai. Koi secret kabhi log nahi hota (sirf event codes
 // + chhoti numeric values).
+// R2-47 (DS-75) exception: RSH_DIAG_KEY_RESET_EXPIRED reboot se bach
+// jata hai — reboot se pehle NVS mein 1-byte pending-flag ("rsh-boot" /
+// "krExp") likha jata hai aur agle boot par setup() event dobara ring
+// mein record karta hai; baqi ring ab bhi RAM-only hai.
 //
 // GET_DIAG reply body (wire, v4.0.2 additive — maujooda frames nahi badle):
 //   [0]    boot_reason u8 (PROTOCOL §1.2: 1 power-on, 2 brown-out,
