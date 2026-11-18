@@ -1982,7 +1982,7 @@ impl Ctx {
         // indicator as Horn Test, driven by `handbrake_test_until`.
         let handbrake_pressed = test_flash_active(self.handbrake_test_until.get());
         set_if_changed(win.get_handbrake_pressed(), handbrake_pressed, |v| {
-            win.set_handbrake_pressed(v)
+            win.set_handbrake_pressed(v);
         });
         // Live chart histories (A20) + chart props every 10th tick.
         // B1: histories only grow while live — without a daemon the
