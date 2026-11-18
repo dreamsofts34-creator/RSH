@@ -28,14 +28,34 @@ pub const POPUP_GAP: i32 = 8;
 /// Grace after the popup is shown during which the foreground poll
 /// never dismisses it (A4): showing the popup cannot instantly
 /// close it — the first poll after the tray click must not count
-/// as "clicked away".
+/// as "clicked away". Retained as the first guard (and checked
+/// verbatim by the rig's `gate_tray_persistence_source`); the
+/// 5 s floor below now does the heavy lifting.
 pub const POPUP_FOREGROUND_GRACE: Duration = Duration::from_millis(500);
-/// Settle window after the grace during which the poll re-samples
-/// its foreground baseline (F9, v2.0.3): Windows settles back to
-/// the pre-click app after the tray click, and that settle can
-/// finish after the grace expires, so a baseline sampled at show
-/// time is stale. The baseline is armed inside
-/// `grace .. grace + settle` and never before.
+/// Minimum time the popup stays visible after being shown
+/// (v2.0.4): the poll never dismisses before this, however the
+/// foreground moves.
+///
+/// Root cause of the v2.0.3 ~2 s auto-hide: F9's settle window
+/// (grace 500 ms + settle 500 ms) only absorbed a Windows
+/// tray-click restore landing before ~1.1 s. On the user's PC the
+/// restore lands at ~1.7–2 s — after the machine had armed (the
+/// baseline at ~800 ms, or the sustained-foreground flag at
+/// ~800–1100 ms) — so the poll read the system-driven restore as
+/// a user click-away and dismissed at ~2 s (baseline path: armed
+/// 800 ms + 3×100 ms changed polls after a ~1.7 s restore;
+/// sustained-loss path: flag set ~800 ms + restore at ~2 s). A
+/// fixed settle window can never cover a restore whose timing is
+/// unbounded, so the floor is the mechanism: no dismiss inside
+/// 5 s, and the baseline is only re-sampled after the floor, from
+/// the settled foreground. A real click-away inside the floor is
+/// absorbed (documented limit — the popup errs towards staying
+/// open); the next click-away after arming dismisses.
+pub const POPUP_MIN_VISIBLE: Duration = Duration::from_secs(5);
+/// Settle window after the floor during which the poll re-samples
+/// its foreground baseline (F9, v2.0.3; shifted to the floor by
+/// v2.0.4): the baseline is armed inside
+/// `floor .. floor + settle` and never before.
 pub const POPUP_BASELINE_SETTLE: Duration = Duration::from_millis(500);
 /// Consecutive 100 ms polls showing the same foreground window
 /// needed to arm the baseline (~300 ms of stability).
@@ -73,8 +93,14 @@ static SYSTEM_LIGHT_CACHE: std::sync::Mutex<Option<(std::time::Instant, bool)>> 
 /// `AppsUseLightTheme` (mirrors `rsh-ui`'s `system_light`, which
 /// lives in the UI binary and cannot be shared here).
 /// Best-effort: any failure (no `reg`, no key) means Dark.
+/// R2-03 theme half: `CREATE_NO_WINDOW` (0x0800_0000) — the
+/// daemon is a windowed process, so a console-subsystem `reg`
+/// spawned without it flashes a transient console window; the
+/// pattern is the same as the curl/installer spawns
+/// (`rsh-app-core` `state.rs`, `0x0800_0000`).
 #[cfg(windows)]
 fn system_light_uncached() -> bool {
+    use std::os::windows::process::CommandExt;
     let Ok(out) = std::process::Command::new("reg")
         .args([
             "query",
@@ -82,6 +108,7 @@ fn system_light_uncached() -> bool {
             "/v",
             "AppsUseLightTheme",
         ])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .output()
     else {
         return false;
@@ -156,28 +183,43 @@ pub fn popup_is_light(data_dir: Option<&std::path::Path>) -> bool {
 /// the A4 fix still missed: `foreground_at_show` is sampled
 /// during the tray-click transition, and Windows settles back to
 /// the pre-click app after the grace expires, so rule (d) fired at
-/// ~0.6–1 s on a settle the user never caused. This state machine
-/// therefore:
+/// ~0.6–1 s on a settle the user never caused. v2.0.4 found the
+/// same hole one layer deeper: F9's settle window (grace 500 ms +
+/// settle 500 ms) only absorbs a restore landing before ~1.1 s,
+/// but on the user's PC the restore lands at ~1.7–2 s — after the
+/// baseline armed (~800 ms) or the sustained-foreground flag set
+/// (~800–1100 ms) — so the poll read the system-driven restore as
+/// a click-away and dismissed at ~2 s. A fixed settle window can
+/// never cover a restore whose timing is unbounded, so this state
+/// machine therefore:
 ///
-/// * never dismisses inside the grace;
+/// * never dismisses inside the 5 s persistence floor
+///   ([`POPUP_MIN_VISIBLE`]) — the tray-click settle, however
+///   slow on the PC, is absorbed here, not in a 1 s window;
 /// * never dismisses while the popup IS foreground;
-/// * re-samples the baseline at grace expiry and only arms it
-///   once the foreground has been the same window for
+/// * re-samples the baseline only after the floor, in
+///   `floor .. floor + settle`, and only arms it once the
+///   foreground has been the same window for
 ///   [`POPUP_BASELINE_STABLE_POLLS`] consecutive polls (or at the
 ///   end of the settle window, taking the latest value) — a
-///   transient settle (e.g. taskbar → other app → taskbar across
-///   300–700 ms) never becomes the baseline, and a change that
-///   lands during the settle window is absorbed as the settle,
-///   not treated as a click-away;
+///   transient settle never becomes the baseline, and a change
+///   that lands during the settle window is absorbed as the
+///   settle, not treated as a click-away;
 /// * after arming, dismisses only on
 ///   [`POPUP_DISMISS_CHANGED_POLLS`] consecutive polls showing a
 ///   different foreground window (a real, sustained click-away);
 /// * dismisses immediately when the popup loses a foreground it
 ///   held continuously for [`POPUP_FOREGROUND_SUSTAINED`] — but
-///   never on a brief foreground blip (a transient activation
-///   does not arm the loss rule, which was the `was_foreground`
-///   trap: the old sticky flag fired on any foreground sighting,
-///   however short);
+///   only when that foreground run STARTED at/after the floor: a
+///   run started earlier is the show-time activation (the daemon
+///   forced the popup foreground on tray click, the user never
+///   touched it), and its loss is Windows restoring the pre-click
+///   app — the sustained-loss half of the ~2 s bug. A run
+///   starting after the floor is the user clicking into the popup
+///   after it sat inactive, so its loss is a real click-away. A
+///   brief foreground blip never arms the loss rule, which was
+///   the `was_foreground` trap: the old sticky flag fired on any
+///   foreground sighting, however short;
 /// * never dismisses when the foreground is unknown (`None`).
 ///
 /// Known limit: when the popup was shown while the main UI window
@@ -187,11 +229,11 @@ pub fn popup_is_light(data_dir: Option<&std::path::Path>) -> bool {
 /// that click would need a mouse hook, which is out of scope.
 ///
 /// A second honest limit: a click-away that lands inside the
-/// settle window (roughly the first second after showing) is
-/// absorbed as settling and does NOT dismiss — the popup stays
-/// open until the next click-away / Escape / tray-click. The
-/// ~1 s false dismiss is the worse failure, so the poll errs
-/// towards staying open.
+/// persistence floor (roughly the first five seconds after
+/// showing) is absorbed as settling and does NOT dismiss — the
+/// popup stays open until the next click-away / Escape /
+/// tray-click. The ~2 s false dismiss is the worse failure, so
+/// the poll errs towards staying open.
 #[derive(Clone, Debug, Default)]
 pub struct PopupDismissPoll {
     /// Foreground window sampled at show time (diagnostics only —
@@ -261,10 +303,20 @@ impl PopupDismissPoll {
         // Track continuous foreground first — grace samples count:
         // a popup that becomes foreground during the grace and
         // stays there is being used.
+        //
+        // v2.0.4: the sustained run only arms the loss rule when
+        // it STARTED at/after the persistence floor. A run that
+        // started earlier is the show-time activation (the daemon
+        // forced the popup foreground on tray click, the user never
+        // touched it) — its loss is Windows restoring the pre-click
+        // app, not a click-away, and it fired the ~2 s dismiss. A
+        // run starting after the floor is the user clicking into
+        // the popup after it sat inactive — a genuine interaction.
         if popup_foreground {
             if self.foreground_since.is_none() {
                 self.foreground_since = Some(elapsed);
             } else if let Some(since) = self.foreground_since
+                && since >= POPUP_MIN_VISIBLE
                 && elapsed.saturating_sub(since) >= POPUP_FOREGROUND_SUSTAINED
             {
                 self.saw_sustained_foreground = true;
@@ -273,6 +325,13 @@ impl PopupDismissPoll {
             self.foreground_since = None;
         }
         if elapsed <= POPUP_FOREGROUND_GRACE {
+            return false;
+        }
+        // v2.0.4 persistence floor: no dismiss before 5 s, however
+        // the foreground moves — the tray-click settle (however
+        // slow on this PC) is absorbed here, not in the 1 s
+        // grace+settle window that missed it.
+        if elapsed < POPUP_MIN_VISIBLE {
             return false;
         }
         if popup_foreground {
@@ -285,8 +344,8 @@ impl PopupDismissPoll {
         if self.saw_sustained_foreground && foreground_now.is_some() {
             return true;
         }
-        // Baseline arming: re-sampled in the settle window, only
-        // once the foreground has been stable for
+        // Baseline arming: re-sampled in the settle window AFTER
+        // the floor, only once the foreground has been stable for
         // `POPUP_BASELINE_STABLE_POLLS` consecutive polls; at the
         // settle deadline the latest known value wins so the poll
         // can still work on a flapping foreground.
@@ -300,14 +359,14 @@ impl PopupDismissPoll {
                         self.candidate_streak = 1;
                     }
                     if self.candidate_streak >= POPUP_BASELINE_STABLE_POLLS
-                        || elapsed > POPUP_FOREGROUND_GRACE + POPUP_BASELINE_SETTLE
+                        || elapsed > POPUP_MIN_VISIBLE + POPUP_BASELINE_SETTLE
                     {
                         self.baseline = Some(now);
                         self.changed_streak = 0;
                     }
                 }
                 None => {
-                    if elapsed > POPUP_FOREGROUND_GRACE + POPUP_BASELINE_SETTLE {
+                    if elapsed > POPUP_MIN_VISIBLE + POPUP_BASELINE_SETTLE {
                         self.baseline = self.foreground_at_show;
                     }
                 }
@@ -560,6 +619,59 @@ impl TrayPopupData {
             profile_name,
             profile_sub,
             games: popup_games,
+        }
+    }
+}
+
+/// Change detector for the 10 Hz popup refresh (R2-38): the
+/// refresh used to push every property unconditionally on every
+/// 100 ms tick, so Slint repainted the popup 10×/s even with zero
+/// data change. The caller keeps one of these per popup, calls
+/// [`Self::changed`] with each freshly collected snapshot, and
+/// skips the property writes (and the repaint) when it returns
+/// `false`.
+///
+/// Wired in `main.rs` (consolidation): `PopupHandle` holds a
+/// `refresh_cache: RefCell<PopupRefreshCache>` field (init at
+/// construction in `create_tray`) and `refresh()` checks it right
+/// after `TrayPopupData::collect` + `popup_is_light`, before any
+/// `set_*` — returning early when `changed()` is `false`.
+/// The theme bool is part of the comparison because the theme can
+/// change independently of the data (the `ui-theme` file is
+/// re-read every refresh).
+/// `TrayPopupData: PartialEq` is exact (`f64` fields compare
+/// exactly) — live values (steering/pedals) change while the
+/// wheel moves, so a moving wheel still repaints every tick; an
+/// idle or disconnected wheel produces identical snapshots and
+/// skips. The first call always reports a change (empty cache),
+/// so the first `show()` always pushes; a hide/show with
+/// unchanged data skips safely because the properties already
+/// hold the values.
+#[derive(Default)]
+pub struct PopupRefreshCache {
+    last: Option<(TrayPopupData, bool)>,
+}
+
+impl PopupRefreshCache {
+    /// A fresh cache (no snapshot seen yet — the next call
+    /// reports a change).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` when `data` or `light_theme` differs from
+    /// the last call (or this is the first call) — the caller
+    /// should push properties + repaint. Returns `false` when
+    /// both are identical to the last push — skip the writes.
+    pub fn changed(&mut self, data: &TrayPopupData, light_theme: bool) -> bool {
+        let current = (data.clone(), light_theme);
+        match &self.last {
+            Some(last) if *last == current => false,
+            _ => {
+                self.last = Some(current);
+                true
+            }
         }
     }
 }
@@ -879,37 +991,85 @@ mod tests {
         assert!(after_grace() > POPUP_FOREGROUND_GRACE);
     }
 
+    // v2.0.4: the 5 s persistence floor. No dismiss before the
+    // floor, however the foreground moves — the tray-click settle
+    // is absorbed here, not in the 1 s grace+settle window.
+
+    #[test]
+    fn dismiss_never_inside_the_persistence_floor() {
+        // Foreground moves away at 600 ms and stays there (300),
+        // then moves again (400) — all inside the floor, so no
+        // dismiss through 5 s.
+        let mut samples = steady(5000, 100, &[]);
+        for sample in &mut samples {
+            if (600..=2000).contains(&sample.0) {
+                sample.1 = Some(300);
+            } else if sample.0 > 2000 {
+                sample.1 = Some(400);
+            }
+        }
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+        assert!(POPUP_MIN_VISIBLE > POPUP_FOREGROUND_GRACE + POPUP_BASELINE_SETTLE);
+    }
+
     #[test]
     fn dismiss_never_when_popup_never_foreground_and_user_did_nothing() {
         // THE v2.0.1 BUG: the old poll hid the popup here (not
         // foreground after the grace), even though the foreground
         // never moved — the user just opened it from the tray.
-        let samples = steady(2000, 100, &[]);
+        // Extended past the 5 s floor: still open at 7 s.
+        let samples = steady(7000, 100, &[]);
         assert_eq!(run_timeline(&samples, Some(200)), None);
     }
 
     #[test]
-    fn dismiss_when_foreground_moves_after_baseline_arms() {
-        // Baseline arms on the settled taskbar (100) at ~800 ms;
-        // the user then clicks another window (300) and stays
-        // there: 3 consecutive changed polls dismiss at 1200 ms.
-        let samples = steady(
-            2000,
-            100,
-            &[(1000, 300), (1100, 300), (1200, 300), (1300, 300)],
+    fn late_settle_restore_at_1800ms_stays_open_then_real_click_away_dismisses() {
+        // THE v2.0.3 ~2 s BUG (baseline path): the foreground sits
+        // on the taskbar (100) until 1700 ms, then Windows restores
+        // the pre-click app (300) at ~1800 ms — after the old
+        // machine had armed its baseline (~800 ms), so the old poll
+        // dismissed at 2000 ms. The floor absorbs the restore: the
+        // popup is still visible at 2 s (and at 5 s — the baseline
+        // only arms at ~5200 ms, to the settled 300). A real
+        // click-away after arming (400 at 6000/6100/6200 ms) still
+        // dismisses, at 6200 ms.
+        let full: Vec<(u64, Option<isize>)> = (0..=7000)
+            .step_by(100)
+            .map(|t| {
+                let fg = if t < 1800 {
+                    100
+                } else if t < 6000 {
+                    300
+                } else {
+                    400
+                };
+                (t, Some(fg))
+            })
+            .collect();
+        let prefix: Vec<(u64, Option<isize>)> =
+            full.iter().copied().filter(|(t, _)| *t <= 2000).collect();
+        assert_eq!(
+            run_timeline(&prefix, Some(200)),
+            None,
+            "still visible at 2 s"
         );
         assert_eq!(
-            run_timeline(&samples, Some(200)),
-            Some(Duration::from_millis(1200))
+            run_timeline(&full, Some(200)),
+            Some(Duration::from_millis(6200))
         );
     }
 
     #[test]
-    fn dismiss_when_popup_was_foreground_sustained_and_lost_it() {
-        // Popup foreground from 600 ms, user clicks away at 1600 ms
-        // (foreground 300): sustained foreground (600–1500 ms)
-        // makes the loss a real click-away — dismiss at once.
-        let mut samples = steady(2000, 100, &[]);
+    fn activation_foreground_loss_at_1600ms_stays_open() {
+        // THE v2.0.3 ~2 s BUG (sustained-loss path): the activation
+        // retry made the popup foreground from 600 ms, Windows
+        // restored the pre-click app (300) at 1600 ms — the old
+        // poll had set the sustained flag at ~1100 ms and dismissed
+        // at once. The run started before the floor, so it can
+        // never arm the loss rule: the popup stays open through
+        // 7 s (the baseline arms at ~5200 ms to the settled 300,
+        // which never moves again).
+        let mut samples = steady(7000, 100, &[]);
         for sample in &mut samples {
             if (600..=1500).contains(&sample.0) {
                 sample.1 = Some(200);
@@ -917,22 +1077,65 @@ mod tests {
                 sample.1 = Some(300);
             }
         }
+        assert_eq!(run_timeline(&samples, Some(200)), None);
+    }
+
+    #[test]
+    fn dismiss_when_foreground_moves_after_baseline_arms() {
+        // Baseline arms on the settled taskbar (100) at ~5200 ms
+        // (first polls at/after the floor: 5000/5100/5200 stable);
+        // the user then clicks another window (300) and stays
+        // there: 3 consecutive changed polls dismiss at 6200 ms.
+        let samples = steady(
+            7000,
+            100,
+            &[(6000, 300), (6100, 300), (6200, 300), (6300, 300)],
+        );
         assert_eq!(
             run_timeline(&samples, Some(200)),
-            Some(Duration::from_millis(1600))
+            Some(Duration::from_millis(6200))
+        );
+    }
+
+    #[test]
+    fn sustained_foreground_loss_after_floor_dismisses_immediately() {
+        // F17 matrix, re-timed for the floor (the old
+        // `sustained_foreground_loss_at_1500ms_dismisses_immediately`
+        // case is now the ~2 s bug — see
+        // `activation_foreground_loss_at_1600ms_stays_open`): the
+        // user clicks INTO the popup at 5500 ms, after it sat
+        // inactive — the run starts after the floor, holds it
+        // continuously, and by 6000 ms has held it for the 500 ms
+        // sustained threshold. The user clicks away at exactly
+        // 6500 ms (foreground 300): a real click-away, so the popup
+        // dismisses at once, at 6500 ms.
+        let mut samples = steady(7000, 100, &[]);
+        for sample in &mut samples {
+            if (5500..=6400).contains(&sample.0) {
+                sample.1 = Some(200);
+            } else if sample.0 >= 6500 {
+                sample.1 = Some(300);
+            }
+        }
+        assert_eq!(
+            run_timeline(&samples, Some(200)),
+            Some(Duration::from_millis(6500))
         );
     }
 
     #[test]
     fn dismiss_never_when_popup_is_foreground() {
-        let samples = steady(2000, 200, &[]);
+        let samples = steady(7000, 200, &[]);
         assert_eq!(run_timeline(&samples, Some(200)), None);
     }
 
     #[test]
     fn dismiss_never_when_foreground_is_unknown() {
         // Cannot tell what the user did — stay open, never guess.
-        let mut samples = steady(2000, 100, &[]);
+        // Extended past the floor: the deadline arm falls back to
+        // `foreground_at_show` (100), and `None` reads keep
+        // resetting the changed streak.
+        let mut samples = steady(7000, 100, &[]);
         for sample in &mut samples {
             if sample.0 >= 600 {
                 sample.1 = None;
@@ -949,9 +1152,9 @@ mod tests {
     fn transient_baseline_switch_stays_open() {
         // Foreground: taskbar (100) → other app (300) at 300 ms →
         // back to taskbar (100) by 700 ms. The 300 ms value never
-        // stabilises into a baseline (the 100 ms value does, at
-        // ~900 ms), so the popup stays open.
-        let samples = steady(2000, 100, &[(300, 300), (400, 300), (500, 300)]);
+        // stabilises into a baseline (the 100 ms value arms it at
+        // ~5200 ms, after the floor), so the popup stays open.
+        let samples = steady(7000, 100, &[(300, 300), (400, 300), (500, 300)]);
         assert_eq!(run_timeline(&samples, Some(200)), None);
     }
 
@@ -960,9 +1163,9 @@ mod tests {
         // F17 matrix: the transient lasts longer — other app (300)
         // from 300 ms until 600 ms, back to the taskbar (100) at
         // 700 ms. The 300 ms value still never stabilises into a
-        // baseline (3 stable polls of 100 arm it at ~900 ms), so
-        // the popup stays open through 2 s.
-        let samples = steady(2000, 100, &[(300, 300), (400, 300), (500, 300), (600, 300)]);
+        // baseline (3 stable polls of 100 arm it at ~5200 ms, after
+        // the floor), so the popup stays open through 7 s.
+        let samples = steady(7000, 100, &[(300, 300), (400, 300), (500, 300), (600, 300)]);
         assert_eq!(run_timeline(&samples, Some(200)), None);
     }
 
@@ -974,7 +1177,7 @@ mod tests {
         // taskbar is foreground again. 250 ms of foreground is far
         // below the 500 ms sustained threshold, so the loss rule
         // never arms and the popup stays open.
-        let samples: Vec<(u64, Option<isize>)> = (0..=2000)
+        let samples: Vec<(u64, Option<isize>)> = (0..=7000)
             .step_by(100)
             .map(|t| (t, Some(if t == 200 { 200 } else { 100 })))
             .collect();
@@ -985,33 +1188,12 @@ mod tests {
     }
 
     #[test]
-    fn sustained_foreground_loss_at_1500ms_dismisses_immediately() {
-        // F17 matrix: the popup is foreground from 900 ms and
-        // holds it continuously — by 1400 ms it has held it for
-        // the 500 ms sustained threshold. The user clicks away at
-        // exactly 1500 ms (foreground 300): a real click-away, so
-        // the popup dismisses at once, at 1500 ms.
-        let mut samples = steady(2000, 100, &[]);
-        for sample in &mut samples {
-            if (900..=1400).contains(&sample.0) {
-                sample.1 = Some(200);
-            } else if sample.0 >= 1500 {
-                sample.1 = Some(300);
-            }
-        }
-        assert_eq!(
-            run_timeline(&samples, Some(200)),
-            Some(Duration::from_millis(1500))
-        );
-    }
-
-    #[test]
     fn transient_activation_blip_does_not_arm_foreground_loss() {
         // Popup briefly foreground at the 200 ms sample (a
         // transient activation), never again: the old sticky
         // `was_foreground` flag would have armed the loss rule on
         // this blip — the sustained rule must not.
-        let samples = steady(2000, 100, &[(200, 200)]);
+        let samples = steady(7000, 100, &[(200, 200)]);
         assert_eq!(run_timeline(&samples, Some(200)), None);
     }
 
@@ -1019,7 +1201,7 @@ mod tests {
     fn single_changed_poll_never_dismisses() {
         // One fluky read (300) after arming, then back to the
         // baseline: the changed streak resets, popup stays open.
-        let samples = steady(2000, 100, &[(1000, 300)]);
+        let samples = steady(7000, 100, &[(6000, 300)]);
         assert_eq!(run_timeline(&samples, Some(200)), None);
     }
 
@@ -1027,23 +1209,24 @@ mod tests {
     fn two_changed_polls_never_dismiss_but_three_do() {
         // Two changed polls: still open. A third consecutive one
         // dismisses.
-        let two = steady(2000, 100, &[(1000, 300), (1100, 300)]);
+        let two = steady(7000, 100, &[(6000, 300), (6100, 300)]);
         assert_eq!(run_timeline(&two, Some(200)), None);
-        let three = steady(2000, 100, &[(1000, 300), (1100, 300), (1200, 300)]);
+        let three = steady(7000, 100, &[(6000, 300), (6100, 300), (6200, 300)]);
         assert_eq!(
             run_timeline(&three, Some(200)),
-            Some(Duration::from_millis(1200))
+            Some(Duration::from_millis(6200))
         );
     }
 
     #[test]
-    fn click_away_inside_settle_window_is_absorbed() {
+    fn click_away_inside_persistence_window_is_absorbed() {
         // Honest limit, documented on `PopupDismissPoll`: a real
         // click-away at 700 ms — before the baseline arms — is
         // absorbed as settling (the 300 ms value becomes the
-        // baseline) and the popup stays open. The next click-away
-        // after arming still dismisses.
-        let samples: Vec<(u64, Option<isize>)> = (0..=2000)
+        // baseline at ~5200 ms) and the popup stays open. The next
+        // click-away after arming still dismisses (see
+        // `late_settle_restore_at_1800ms_stays_open_then_real_click_away_dismisses`).
+        let samples: Vec<(u64, Option<isize>)> = (0..=7000)
             .step_by(100)
             .map(|t| (t, Some(if t >= 700 { 300 } else { 100 })))
             .collect();
@@ -1052,28 +1235,49 @@ mod tests {
 
     #[test]
     fn baseline_arms_on_latest_value_at_settle_deadline() {
-        // Foreground flaps every poll through the settle window,
-        // so no value stabilises: at the deadline the latest value
-        // (300 at 1100 ms) arms as the baseline, and a later
-        // sustained move away from it dismisses.
+        // Foreground flaps every poll through the settle window
+        // after the floor, so no value stabilises: at the deadline
+        // the latest value (300 at 5600 ms) arms as the baseline,
+        // and a later sustained move away from it dismisses.
         let mut samples = Vec::new();
-        for t in (0..=2000).step_by(100) {
-            let fg = if (600..=1000).contains(&t) {
+        for t in (0..=7000).step_by(100) {
+            let fg = if (5100..=5500).contains(&t) {
                 if (t / 100) % 2 == 0 { 300 } else { 100 }
-            } else if t >= 1500 {
+            } else if t >= 6500 {
                 400
-            } else if t >= 1100 {
+            } else if t >= 5600 {
                 300
             } else {
                 100
             };
             samples.push((t, Some(fg)));
         }
-        // 1500/1600/1700 ms all show 400 ≠ baseline 300.
+        // 6500/6600/6700 ms all show 400 ≠ baseline 300.
         assert_eq!(
             run_timeline(&samples, Some(200)),
-            Some(Duration::from_millis(1700))
+            Some(Duration::from_millis(6700))
         );
+    }
+
+    #[test]
+    fn no_dismiss_before_five_seconds_despite_foreground_churn() {
+        // Foreground flaps every poll, drops to unknown twice, and
+        // the popup blips foreground once — all inside the floor:
+        // nothing dismisses before 5 s, whatever Windows does.
+        let mut samples = Vec::new();
+        for t in (0..=5000).step_by(100) {
+            let fg = if t == 2000 || t == 3000 {
+                None
+            } else if t == 2500 {
+                Some(200)
+            } else if (t / 100) % 2 == 0 {
+                Some(300)
+            } else {
+                Some(100)
+            };
+            samples.push((t, fg));
+        }
+        assert_eq!(run_timeline(&samples, Some(200)), None);
     }
 
     #[test]
@@ -1118,5 +1322,80 @@ mod tests {
         std::fs::write(dir.join("ui-theme"), "garbage\n").expect("write theme");
         assert_eq!(popup_is_light(Some(&dir)), popup_is_light(None));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // R2-38: the 10 Hz refresh must only repaint when the content
+    // actually changed.
+
+    fn cache_api(steering_deg: f64) -> FakeApi {
+        FakeApi {
+            label: "Connected",
+            snap: SnapshotInfo {
+                steering_deg,
+                throttle: 0.5,
+                brake: 0.0,
+                clutch: Some(0.0),
+                button_mask: 0,
+                handbrake: 0.0,
+                gear: 0,
+                seq: 0,
+            },
+            send: true,
+        }
+    }
+
+    #[test]
+    fn refresh_cache_first_call_reports_change_then_identical_skips() {
+        let mut cache = PopupRefreshCache::new();
+        let data = TrayPopupData::collect(
+            &cache_api(0.0),
+            &[profile("p1", "GT3 Sprint", true)],
+            &[game("assetto_corsa", "Assetto Corsa", true, false)],
+        );
+        assert!(cache.changed(&data, false), "first call always pushes");
+        assert!(
+            !cache.changed(&data, false),
+            "identical snapshot must skip the repaint"
+        );
+        assert!(
+            !cache.changed(&data, false),
+            "still identical on the third tick"
+        );
+    }
+
+    #[test]
+    fn refresh_cache_reports_live_value_and_theme_changes() {
+        let mut cache = PopupRefreshCache::new();
+        let data = TrayPopupData::collect(
+            &cache_api(0.0),
+            &[profile("p1", "GT3 Sprint", true)],
+            &[game("assetto_corsa", "Assetto Corsa", true, false)],
+        );
+        assert!(cache.changed(&data, false));
+        assert!(!cache.changed(&data, false));
+        // Steering moved: a live change must repaint.
+        let moved = TrayPopupData::collect(
+            &cache_api(-18.0),
+            &[profile("p1", "GT3 Sprint", true)],
+            &[game("assetto_corsa", "Assetto Corsa", true, false)],
+        );
+        assert!(cache.changed(&moved, false), "moved wheel must repaint");
+        assert!(!cache.changed(&moved, false));
+        // Same data, theme flipped: must repaint (Light/Dark swap).
+        assert!(
+            cache.changed(&moved, true),
+            "theme change must repaint even with identical data"
+        );
+        assert!(!cache.changed(&moved, true));
+        // Game row changed (launched): must repaint.
+        let launched = TrayPopupData::collect(
+            &cache_api(-18.0),
+            &[profile("p1", "GT3 Sprint", true)],
+            &[game("assetto_corsa", "Assetto Corsa", true, true)],
+        );
+        assert!(
+            cache.changed(&launched, true),
+            "game state change must repaint"
+        );
     }
 }

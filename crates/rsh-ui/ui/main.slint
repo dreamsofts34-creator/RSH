@@ -424,10 +424,14 @@ export component MainWindow inherits Window {
         }
         if !setup-mode : HorizontalLayout {
             width: 100%;
-            // DS-53: the busy strip reserves its 38px in the layout
-            // while visible — it used to overlay (cover) the bottom
-            // 38px of the page. The wizard gets the same reserve below.
-            height: parent.height - (busy ? 38px : 0px);
+            // R2-12: the busy strip FLOATS over the bottom 38px
+            // (bottom-anchored direct child of the root, below)
+            // instead of reserving layout space — the old
+            // `busy ? 38px : 0px` reserve resized the whole
+            // window on every job start/finish. DS-53's reserve
+            // is gone on purpose: the strip covers only the
+            // page's bottom padding while a job runs.
+            height: parent.height;
         Sidebar {
             page: page;
             connected: connected;
@@ -754,9 +758,10 @@ export component MainWindow inherits Window {
     // (setup-step) so Rust drives Back/Next; the wizard itself only
     // reads it. The notifications drawer below still overlays it.
     if setup-mode : SetupWizard {
-        // DS-53: same 38px reserve as the shell layout above, so the
-        // busy strip never covers the wizard's footer.
-        height: parent.height - (busy ? 38px : 0px);
+        // R2-12: same float as the shell layout above — no 38px
+        // reserve, so the window never resizes when a job starts
+        // or finishes while the wizard is open.
+        height: parent.height;
         step: setup-step;
         daemon-live: daemon-live;
         busy-kind: busy-kind;

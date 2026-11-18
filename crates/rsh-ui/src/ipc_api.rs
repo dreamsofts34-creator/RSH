@@ -38,7 +38,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rsh_api::connection::ConnectionState;
 use rsh_api::{
@@ -67,8 +67,9 @@ use rsh_ipc::{IpcClient, IpcError};
 /// A slot is `None` until its first fetch — reads fall back exactly
 /// as they did on an IPC error before (empty lists, `"Unknown"`,
 /// neutral tuning), so a cold cache is indistinguishable from a
-/// failed call. `generation` bumps at the end of every completed
-/// slow cycle; the frame timer re-syncs the pages when it changes.
+/// failed call. `generation` bumps at the end of a completed
+/// slow cycle whose content actually changed (R2-11); the frame
+/// timer re-syncs the pages when it changes.
 struct LiveCache {
     connection: Mutex<Option<ConnectionInfo>>,
     snapshot: Mutex<Option<SnapshotInfo>>,
@@ -123,6 +124,11 @@ struct LiveCache {
     /// above is set, so the next bump carries post-write values.
     refresh_epoch: AtomicU64,
     generation: AtomicU64,
+    /// R2-11: hash of the last slow content the generation was
+    /// bumped for (see [`slow_content_hash`]) — the generation
+    /// bumps only when the content actually changed, never once
+    /// per cycle on identical values.
+    last_content_hash: AtomicU64,
 }
 
 impl Default for LiveCache {
@@ -158,6 +164,7 @@ impl Default for LiveCache {
             refresh_requested: AtomicBool::new(false),
             refresh_epoch: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            last_content_hash: AtomicU64::new(0),
         }
     }
 }
@@ -180,6 +187,29 @@ fn module_index(module: &str) -> Option<usize> {
 /// used to trip `link_dead` at once and wedge every UI call until
 /// a poll round succeeded.
 const LINK_DEAD_AFTER_FAILURES: u32 = 3;
+
+/// R2-11: no recorded content hash yet — the next completed
+/// cycle always bumps (its hash cannot equal this sentinel in
+/// practice). Stored by `note_write_landed` after an in-place
+/// cache update and by `clear_cached_state`, so the next cycle
+/// bumps even when it reverts the cache to its pre-write
+/// content (a discard): without it the revert would hash equal
+/// to the recorded hash and the UI would never re-sync.
+const CONTENT_HASH_DIRTY: u64 = u64::MAX;
+
+/// R2-21: wall-clock budget for the sequential `slow_poll`
+/// fallback pass in [`refresh_slow`]. The combined call is one
+/// 500 ms round-trip; the fallback is 30 sequential calls, each
+/// up to 500 ms — up to ~15 s of stall before the next cycle.
+/// A cycle that cannot finish inside the budget keeps its last
+/// good values and ends; the next ~1 s cycle retries.
+const SLOW_FALLBACK_BUDGET: Duration = Duration::from_secs(2);
+
+/// R2-21: consecutive failed fetches that abort the fallback
+/// pass early — a daemon that answers nothing fails each fetch
+/// in 500 ms, so 3 in a row is enough signal without waiting
+/// out the whole budget.
+const SLOW_FALLBACK_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 /// DS-19: how the fast poller updates `link_dead` after one round.
 /// `failures` is the consecutive-failure count BEFORE this round.
@@ -213,6 +243,39 @@ impl Drop for LongCallGuard<'_> {
             .long_call_in_flight
             .store(false, Ordering::Relaxed);
     }
+}
+
+/// Open a second IPC connection for one background lane (DS-80,
+/// R2-22): the fast poller, the slow poller and the long-call
+/// lane each get their own connection, so a slow call on one lane
+/// never delays another lane behind the single-flight lock.
+/// Verified with a real `ping` before use: a server that accepts
+/// only one connection (the `ipc_api` test server) leaves the
+/// second connect unanswered, so the lane falls back to the
+/// shared client instead of stalling. The probe is bounded to
+/// 200 ms — a healthy daemon answers in under a millisecond.
+fn probe_lane_client(
+    rt: &tokio::runtime::Runtime,
+    path: &Path,
+    main: &Arc<IpcClient>,
+) -> Arc<IpcClient> {
+    rt.block_on(async {
+        let candidate = tokio::time::timeout(Duration::from_secs(2), IpcClient::connect(path))
+            .await
+            .ok()
+            .and_then(Result::ok);
+        match candidate {
+            Some(candidate) => {
+                let pinged =
+                    tokio::time::timeout(Duration::from_millis(200), candidate.ping()).await;
+                match pinged {
+                    Ok(Ok(true)) => candidate,
+                    _ => main.clone(),
+                }
+            }
+            None => main.clone(),
+        }
+    })
 }
 
 /// Everything `reconnect_to_live` needs (F5): the whole
@@ -268,6 +331,13 @@ impl LiveSeed {
 /// Live daemon API over IPC.
 pub struct IpcApi {
     client: Arc<IpcClient>,
+    /// R2-22: the long-call lane — `call_async_long` (the 75 s
+    /// backend switch) runs here, so a UAC dwell can no longer
+    /// stall the slow poller or a `set_tuning` job behind the
+    /// main client's single-flight lock. Falls back to `client`
+    /// when the daemon accepts only one connection (see
+    /// [`probe_lane_client`]).
+    long_client: Arc<IpcClient>,
     rt: tokio::runtime::Runtime,
     cache: Arc<LiveCache>,
 }
@@ -298,42 +368,22 @@ impl IpcApi {
                 .map_err(|_| IpcError::Io("daemon IPC connect timed out after 2 s".to_string()))?
         })?;
         rt.block_on(client.call("subscribe", serde_json::json!({})))?;
+        // DS-80 / R2-22: one connection per lane — fast poller,
+        // slow poller, long calls — so no lane can stall another
+        // behind the single-flight lock. Each probe falls back to
+        // the shared client when the daemon accepts only one
+        // connection (see `probe_lane_client`).
+        let poll_client = probe_lane_client(&rt, path, &client);
+        let slow_client = probe_lane_client(&rt, path, &client);
+        let long_client = probe_lane_client(&rt, path, &client);
         let cache = Arc::new(LiveCache::default());
         let api = Arc::new(Self {
             client: client.clone(),
+            long_client,
             rt,
             cache: cache.clone(),
         });
         {
-            // DS-80: the fast poller gets its OWN connection, so a
-            // slow call on the main client (a `slow_poll`, a job
-            // call) never delays the 20 Hz `poll` behind the
-            // single-flight lock. Verified with a real `ping`
-            // before use: a server that accepts only one
-            // connection (the ipc_api test server) leaves the
-            // second connect unanswered, so the poller falls back
-            // to the shared client instead of stalling. The probe
-            // is bounded to 200 ms — a healthy daemon answers in
-            // under a millisecond.
-            let poll_client = api.rt.block_on(async {
-                let candidate =
-                    tokio::time::timeout(Duration::from_secs(2), IpcClient::connect(path))
-                        .await
-                        .ok()
-                        .and_then(Result::ok);
-                match candidate {
-                    Some(candidate) => {
-                        let pinged =
-                            tokio::time::timeout(Duration::from_millis(200), candidate.ping())
-                                .await;
-                        match pinged {
-                            Ok(Ok(true)) => candidate,
-                            _ => client.clone(),
-                        }
-                    }
-                    None => client.clone(),
-                }
-            });
             let poll_cache = cache.clone();
             api.rt.spawn(async move {
                 loop {
@@ -389,16 +439,19 @@ impl IpcApi {
             });
         }
         {
-            // F5 (v2.0.3): the slow poller refreshes every other
-            // read-only value the UI shows (~1 Hz, one sequential
-            // pass over the read methods — each bounded to 500 ms
-            // and fail-fast once the fast poller proves the link
-            // dead, so a dying daemon costs one cheap skipped cycle
-            // instead of a ~15 s stall). A first pass runs at once,
-            // so the cache is warm ~50 ms after connect on a healthy
-            // daemon; later passes wait out the 1 s period in 50 ms
-            // steps and run early when a write asked for a refresh.
-            let slow_client = client;
+            // F5 (v2.0.3) / R2-22: the slow poller refreshes every
+            // other read-only value the UI shows (~1 Hz, one
+            // sequential pass over the read methods — each bounded
+            // to 500 ms and fail-fast once the fast poller proves
+            // the link dead, so a dying daemon costs one cheap
+            // skipped cycle instead of a ~15 s stall). A first
+            // pass runs at once, so the cache is warm ~50 ms after
+            // connect on a healthy daemon; later passes wait out
+            // the 1 s period in 50 ms steps and run early when a
+            // write asked for a refresh. The poller runs on its
+            // OWN connection (R2-22): a 75 s backend switch on the
+            // job lane can no longer stall it, and a stalled slow
+            // cycle can no longer delay a `set_tuning` job.
             let slow_cache = cache;
             api.rt.spawn(async move {
                 refresh_slow(&slow_client, &slow_cache).await;
@@ -437,6 +490,9 @@ impl IpcApi {
     /// backend switch waits out a UAC prompt + a 60 s sidecar spawn
     /// (75 s), so the UI does not time out while the user is still
     /// answering the prompt. Same fail-fast on a proven-dead link.
+    /// Runs on the long-call lane (R2-22), not the shared job
+    /// client — the switch must not stall the slow poller or a
+    /// `set_tuning` job behind the single-flight lock.
     async fn call_async_long(
         &self,
         method: &str,
@@ -447,14 +503,18 @@ impl IpcApi {
             return Err(IpcError::Closed);
         }
         // DS-19: exempt the poller's failure counter while the long
-        // call holds the single-flight IPC lock (its polls behind it
-        // time out, which is not a dead link). The guard clears the
-        // flag on every exit path, including cancellation/panic.
+        // call is in flight. On a single-connection daemon the
+        // lane falls back to the shared client, so the polls
+        // behind it time out on the single-flight lock — which is
+        // not evidence of a dead link. The guard clears the flag
+        // on every exit path, including cancellation/panic.
         self.cache
             .long_call_in_flight
             .store(true, Ordering::Relaxed);
         let _guard = LongCallGuard { cache: &self.cache };
-        self.client.call_with_timeout(method, params, timeout).await
+        self.long_client
+            .call_with_timeout(method, params, timeout)
+            .await
     }
 
     /// One `ping` round-trip (liveness check after connect, and the
@@ -543,6 +603,9 @@ impl IpcApi {
             *slot = None;
         }
         self.cache.slow_filled.store(false, Ordering::Relaxed);
+        self.cache
+            .last_content_hash
+            .store(CONTENT_HASH_DIRTY, Ordering::Relaxed);
         self.cache.link_dead.store(true, Ordering::Relaxed);
     }
 
@@ -558,10 +621,11 @@ impl IpcApi {
         self.cache.slow_filled.load(Ordering::Relaxed)
     }
 
-    /// Current slow-cache generation (F5): bumps at the end of
-    /// every completed slow cycle. The frame timer re-syncs the
-    /// pages when it changes — that is how a daemon-side change
-    /// reaches the UI without any UI-thread IPC.
+    /// Current slow-cache generation (F5, R2-11): bumps only when
+    /// a completed slow cycle actually changed the slow content.
+    /// The frame timer re-syncs the pages when it changes — that
+    /// is how a daemon-side change reaches the UI without any
+    /// UI-thread IPC.
     #[must_use]
     pub fn slow_generation(&self) -> u64 {
         self.cache.generation.load(Ordering::Relaxed)
@@ -577,7 +641,26 @@ impl IpcApi {
         // DS-29: a write is in flight — a slow cycle that started
         // before this must not bump the generation with pre-write
         // values (see `refresh_slow`).
+        self.note_write_landed();
+    }
+
+    /// Note that a write landed (R2-13, DS-29): bump the write
+    /// epoch so an in-flight slow cycle cannot bump the generation
+    /// with pre-write values — WITHOUT pulling the next cycle
+    /// forward. `set_tuning` updates its slot in place, so no
+    /// forced re-fetch is needed; the next natural ~1 Hz cycle
+    /// re-reads the rest. R2-11: the write also invalidates the
+    /// recorded content hash (`CONTENT_HASH_DIRTY`) — the in-place
+    /// update never passed through a cycle, so without this a
+    /// later cycle that reverts the cache to its pre-write
+    /// content (a discard) would hash equal to the recorded hash
+    /// and never bump, leaving the UI waiting for a refresh that
+    /// already happened.
+    fn note_write_landed(&self) {
         self.cache.refresh_epoch.fetch_add(1, Ordering::Relaxed);
+        self.cache
+            .last_content_hash
+            .store(CONTENT_HASH_DIRTY, Ordering::Relaxed);
     }
 
     /// One slow refresh, run synchronously on the calling (job)
@@ -674,12 +757,14 @@ impl IpcApi {
 /// One slow refresh pass (F5, v2.0.3): every read-only value the
 /// UI shows that the fast poller does not cover, fetched
 /// sequentially into the cache. Each step checks `link_dead` first
-/// and bails — a daemon that died mid-pass costs at most one more
-/// 500 ms call, never the whole pass. A failed step keeps its last
-/// good value (or the cold-cache fallback): a slow value going
-/// briefly stale beats a frozen frame. A completed pass marks the
-/// cache filled and bumps the generation, so the frame timer
-/// re-syncs the pages from the fresh values.
+/// and bails, and the sequential fallback pass is budgeted
+/// (R2-21: 2 s wall clock / 3 consecutive failures) — a daemon
+/// that died mid-pass costs at most ~2.5 s, never the whole
+/// ~15 s pass. A failed step keeps its last good value (or the
+/// cold-cache fallback): a slow value going briefly stale beats
+/// a frozen frame. A completed pass marks the cache filled and
+/// bumps the generation when the content changed, so the frame
+/// timer re-syncs the pages from the fresh values.
 #[allow(clippy::too_many_lines)]
 async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     if cache.link_dead.load(Ordering::Relaxed) {
@@ -751,22 +836,45 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
             }
         }
         cache.slow_filled.store(true, Ordering::Relaxed);
-        bump_generation_if_fresh(cache, epoch);
+        bump_generation_if_changed(cache, epoch);
         return;
     }
+    // R2-21: the fallback pass is budgeted (see
+    // `SLOW_FALLBACK_BUDGET` / `SLOW_FALLBACK_MAX_CONSECUTIVE_FAILURES`):
+    // a cycle that runs long keeps its last good values and ends
+    // instead of stalling the poller for ~15 s; the next ~1 s
+    // cycle retries.
+    let fallback_started = Instant::now();
+    let mut consecutive_failures = 0u32;
+    // Finish the pass the same way the normal tail does, then
+    // leave: the next ~1 s cycle retries with fresh values.
+    let finish_fallback = || {
+        cache.slow_filled.store(true, Ordering::Relaxed);
+        bump_generation_if_changed(cache, epoch);
+    };
     // One call, parsed or ignored. `parse` turns the reply into
     // the slot's value (`None` = unparseable, keep the old value).
     macro_rules! fetch {
         ($method:literal, $slot:ident, $parse:expr) => {{
-            if cache.link_dead.load(Ordering::Relaxed) {
+            if cache.link_dead.load(Ordering::Relaxed)
+                || fallback_started.elapsed() >= SLOW_FALLBACK_BUDGET
+                || consecutive_failures >= SLOW_FALLBACK_MAX_CONSECUTIVE_FAILURES
+            {
+                finish_fallback();
                 return;
             }
-            if let Ok(value) = client.call($method, serde_json::json!({})).await {
-                let parse: fn(&serde_json::Value) -> Option<_> = $parse;
-                if let Some(parsed) = parse(&value) {
-                    if let Ok(mut slot) = cache.$slot.lock() {
-                        *slot = Some(parsed);
+            match client.call($method, serde_json::json!({})).await {
+                Ok(value) => {
+                    consecutive_failures = 0;
+                    let parse: fn(&serde_json::Value) -> Option<_> = $parse;
+                    if let Some(parsed) = parse(&value) {
+                        if let Ok(mut slot) = cache.$slot.lock() {
+                            *slot = Some(parsed);
+                        }
                     }
+                }
+                Err(_) => {
+                    consecutive_failures += 1;
                 }
             }
         }};
@@ -838,12 +946,22 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     });
     // The draft reply is `null` (no draft) or an object: store
     // whichever parsed, so a saved draft clears the cached one.
-    if !cache.link_dead.load(Ordering::Relaxed) {
-        if let Ok(value) = client.call("draft_status", serde_json::json!({})).await {
-            if let Ok(draft) = serde_json::from_value::<Option<DraftStatus>>(value) {
-                if let Ok(mut slot) = cache.draft.lock() {
-                    *slot = draft;
+    // R2-21: the budget / failure cap applies here too.
+    if !cache.link_dead.load(Ordering::Relaxed)
+        && fallback_started.elapsed() < SLOW_FALLBACK_BUDGET
+        && consecutive_failures < SLOW_FALLBACK_MAX_CONSECUTIVE_FAILURES
+    {
+        match client.call("draft_status", serde_json::json!({})).await {
+            Ok(value) => {
+                consecutive_failures = 0;
+                if let Ok(draft) = serde_json::from_value::<Option<DraftStatus>>(value) {
+                    if let Ok(mut slot) = cache.draft.lock() {
+                        *slot = draft;
+                    }
                 }
+            }
+            Err(_) => {
+                consecutive_failures += 1;
             }
         }
     }
@@ -859,47 +977,136 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
         "shifter",
         "horn",
     ] {
-        if cache.link_dead.load(Ordering::Relaxed) {
-            return;
+        if cache.link_dead.load(Ordering::Relaxed)
+            || fallback_started.elapsed() >= SLOW_FALLBACK_BUDGET
+            || consecutive_failures >= SLOW_FALLBACK_MAX_CONSECUTIVE_FAILURES
+        {
+            break;
         }
-        if let Ok(value) = client
+        match client
             .call("get_tuning", serde_json::json!({"module": module}))
             .await
         {
-            if let Ok(tuning) = serde_json::from_value::<TuningSettings>(value) {
-                if let Ok(mut tunings) = cache.tunings.lock() {
-                    tunings.insert(module.to_string(), tuning);
+            Ok(value) => {
+                consecutive_failures = 0;
+                if let Ok(tuning) = serde_json::from_value::<TuningSettings>(value) {
+                    if let Ok(mut tunings) = cache.tunings.lock() {
+                        tunings.insert(module.to_string(), tuning);
+                    }
                 }
+            }
+            Err(_) => {
+                consecutive_failures += 1;
             }
         }
     }
     for (module, index) in [("handbrake", 0), ("shifter", 1), ("horn", 2), ("led", 3)] {
-        if cache.link_dead.load(Ordering::Relaxed) {
-            return;
+        if cache.link_dead.load(Ordering::Relaxed)
+            || fallback_started.elapsed() >= SLOW_FALLBACK_BUDGET
+            || consecutive_failures >= SLOW_FALLBACK_MAX_CONSECUTIVE_FAILURES
+        {
+            break;
         }
-        if let Ok(value) = client
+        match client
             .call("module_enabled", serde_json::json!({"module": module}))
             .await
         {
-            if let Some(enabled) = value.get("enabled").and_then(serde_json::Value::as_bool) {
-                if let Ok(mut modules) = cache.modules.lock() {
-                    modules[index] = Some(enabled);
+            Ok(value) => {
+                consecutive_failures = 0;
+                if let Some(enabled) = value.get("enabled").and_then(serde_json::Value::as_bool) {
+                    if let Ok(mut modules) = cache.modules.lock() {
+                        modules[index] = Some(enabled);
+                    }
                 }
+            }
+            Err(_) => {
+                consecutive_failures += 1;
             }
         }
     }
-    cache.slow_filled.store(true, Ordering::Relaxed);
-    bump_generation_if_fresh(cache, epoch);
+    finish_fallback();
+}
+
+/// Hash one slow slot's JSON into the content hash (R2-11):
+/// JSON field order is fixed per struct, so equal values hash
+/// equal; an unserialisable value (never expected — every slot
+/// type is `Serialize`) contributes nothing instead of failing
+/// the cycle.
+fn hash_slot<T: serde::Serialize>(
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+    value: &T,
+) {
+    use std::hash::Hash;
+    if let Ok(text) = serde_json::to_string(value) {
+        text.hash(hasher);
+    }
+}
+
+/// Content hash of the slow cache (R2-11): every slow slot that
+/// feeds `resync_from_cache`, EXCEPT `diag_stats` — its p99s and
+/// counters move every cycle while live, so including it would
+/// bump the generation ~1 Hz forever and defeat the point. Diag
+/// text is re-synced on the 1 Hz tick itself (guarded writes),
+/// not through the generation. Tunings hash with sorted keys: a
+/// `HashMap` iterates in arbitrary order, and the hash must be
+/// stable for equal contents.
+fn slow_content_hash(cache: &LiveCache) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let mut hasher = DefaultHasher::new();
+    macro_rules! slot {
+        ($field:ident) => {
+            if let Ok(guard) = cache.$field.lock() {
+                hash_slot(&mut hasher, &*guard);
+            }
+        };
+    }
+    slot!(version);
+    slot!(firmware_version);
+    slot!(backend);
+    slot!(autostart);
+    slot!(board_address);
+    slot!(pairing_status);
+    slot!(calibration);
+    slot!(profiles);
+    slot!(games);
+    slot!(firmware_check);
+    slot!(firmware_update_status);
+    slot!(vjoy_status);
+    slot!(auto_pause);
+    slot!(close_to_tray);
+    slot!(bindings);
+    slot!(knobs);
+    slot!(modules);
+    slot!(draft);
+    if let Ok(tunings) = cache.tunings.lock() {
+        let mut keys: Vec<&String> = tunings.keys().collect();
+        keys.sort();
+        for key in keys {
+            if let Some(tuning) = tunings.get(key) {
+                hash_slot(&mut hasher, &key);
+                hash_slot(&mut hasher, &tuning);
+            }
+        }
+    }
+    hasher.finish()
 }
 
 /// Bump the slow generation when the cycle's data is fresh
-/// (DS-29): skip the bump when a write asked for a refresh while
-/// this cycle ran — the cycle may carry pre-write values, and its
-/// bump would tell the UI (and the `discard_draft` test) the cache
-/// is current when it is not. `slow_filled` is NOT gated: the slots
-/// still hold genuine daemon values, only possibly a cycle old.
-fn bump_generation_if_fresh(cache: &LiveCache, epoch: u64) {
-    if cache.refresh_epoch.load(Ordering::Relaxed) == epoch {
+/// (DS-29) AND its content actually changed (R2-11): skip the
+/// bump when a write asked for a refresh while this cycle ran —
+/// the cycle may carry pre-write values, and its bump would tell
+/// the UI (and the `discard_draft` test) the cache is current
+/// when it is not — and skip it when the cycle changed nothing,
+/// so the frame timer stops re-syncing every page ~1 Hz with
+/// zero changes. `slow_filled` is NOT gated: the slots still hold
+/// genuine daemon values, only possibly a cycle old.
+fn bump_generation_if_changed(cache: &LiveCache, epoch: u64) {
+    if cache.refresh_epoch.load(Ordering::Relaxed) != epoch {
+        return;
+    }
+    let hash = slow_content_hash(cache);
+    if cache.last_content_hash.swap(hash, Ordering::Relaxed) != hash {
         cache.generation.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -1085,15 +1292,23 @@ impl AppApi for IpcApi {
         });
         match got {
             Ok(stored) => {
-                // F5/F6: the stored record is the cache now, the
-                // draft is dirty at once (the daemon marks it), and
-                // the poller re-fetches the rest promptly — the next
-                // sync reads the new values, not the pre-push ones.
+                // F5/F6: the stored record is the cache now, and
+                // the draft is dirty at once (the daemon marks
+                // it) — the next sync reads the new values, not
+                // the pre-push ones. R2-13: NO forced slow
+                // refresh here — the cache is already updated in
+                // place, and a forced `slow_poll` after every
+                // drag end fired the full ~1 Hz re-sync (list
+                // rebuilds, `reg` spawn) ~150 ms after every
+                // slider move. The epoch bump stays (DS-29): an
+                // in-flight cycle must not bump the generation
+                // with pre-push values. The normal ~1 Hz poll
+                // picks up anything else.
                 if let Ok(mut tunings) = self.cache.tunings.lock() {
                     tunings.insert(stored.module.clone(), stored.clone());
                 }
                 self.mark_draft_dirty(&stored.module);
-                self.request_slow_refresh();
+                self.note_write_landed();
                 Ok(stored)
             }
             Err(_) => Err(Self::ipc_failed()),
@@ -2678,6 +2893,15 @@ mod tests {
         /// Test-only: `list_profiles` sleeps this long (DS-80 — a
         /// controllable blocking handler). Zero in normal tests.
         list_profiles_delay: std::time::Duration,
+        /// R2-22 test hook: each `list_profiles` dispatch returns a
+        /// profile whose name carries this counter, so every
+        /// `slow_poll` cycle sees different content (and the
+        /// generation bumps once per completed cycle).
+        profiles_epoch: AtomicUsize,
+        /// R2-22 test hook: `set_output_backend` sleeps this long
+        /// before delegating — a stand-in for the 75 s backend
+        /// switch (UAC prompt + sidecar spawn).
+        backend_switch_delay: std::time::Duration,
     }
 
     #[cfg(unix)]
@@ -2690,6 +2914,8 @@ mod tests {
                 connection_calls: AtomicUsize::new(0),
                 output_calls: AtomicUsize::new(0),
                 list_profiles_delay: std::time::Duration::ZERO,
+                profiles_epoch: AtomicUsize::new(0),
+                backend_switch_delay: std::time::Duration::ZERO,
             }
         }
 
@@ -2770,12 +2996,29 @@ mod tests {
             }
         }
 
-        // DS-80 test hook: a controllable blocking handler.
+        // DS-80 test hook: a controllable blocking handler. R2-22:
+        // every dispatch also returns a fresh profile name, so
+        // consecutive `slow_poll` cycles see different content.
         fn list_profiles(&self) -> Vec<ProfileSummary> {
             if !self.list_profiles_delay.is_zero() {
                 std::thread::sleep(self.list_profiles_delay);
             }
-            self.inner.list_profiles()
+            let epoch = self.profiles_epoch.fetch_add(1, Ordering::Relaxed);
+            vec![ProfileSummary {
+                id: "counting".to_string(),
+                name: format!("counting-{epoch}"),
+                game: None,
+                active: true,
+            }]
+        }
+
+        // R2-22 test hook: a controllable long call — the backend
+        // switch the slow poller must not stall behind.
+        fn set_output_backend(&self, name: &str) -> Result<String, UserError> {
+            if !self.backend_switch_delay.is_zero() {
+                std::thread::sleep(self.backend_switch_delay);
+            }
+            self.inner.set_output_backend(name)
         }
     }
 
@@ -2931,6 +3174,174 @@ mod tests {
             "poller stalled behind the blocked main client: only {polls_during} polls in 1 s"
         );
         join.join().expect("blocked refresh finishes");
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-11: the slow generation bumps only when the slow content
+    /// actually changed. Against the static `SimApi` the first
+    /// cycle bumps once, then two more identical cycles bump
+    /// nothing — before the fix the generation moved every cycle
+    /// and the frame timer re-synced every page ~1 Hz.
+    #[test]
+    #[cfg(unix)]
+    fn slow_generation_only_bumps_when_content_changes() {
+        let (client, dir, handle, _guard) = live_client();
+        assert!(
+            wait_for(&client, IpcApi::slow_filled),
+            "slow cache should fill"
+        );
+        let gen_first = client.slow_generation();
+        assert!(gen_first > 0, "a completed cycle bumps the generation");
+        // Two more full cycles on identical content.
+        std::thread::sleep(Duration::from_millis(2200));
+        assert_eq!(
+            client.slow_generation(),
+            gen_first,
+            "identical slow cycles must not bump the generation"
+        );
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-21: the sequential `slow_poll` fallback is budgeted. A
+    /// daemon that accepts the socket but never answers used to
+    /// cost 30 sequential × 500 ms calls (~15 s) per cycle; now
+    /// the pass aborts after 3 consecutive failures / 2 s and
+    /// keeps its last good values.
+    #[test]
+    #[cfg(unix)]
+    fn slow_fallback_aborts_within_budget_when_daemon_silent() {
+        let dir = std::env::temp_dir().join(format!("rsh-fallback-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+            // Accept and hold the stream without ever answering.
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(stream);
+                }
+            });
+            let client = IpcClient::connect(&sock).await.expect("connect");
+            let cache = Arc::new(LiveCache::default());
+            let start = Instant::now();
+            refresh_slow(&client, &cache).await;
+            let elapsed = start.elapsed();
+            // 500 ms (failed combined call) + 3 × 500 ms (failed
+            // fetches up to the consecutive-failure cap) ≈ 2 s.
+            assert!(
+                elapsed >= Duration::from_millis(1500),
+                "fallback ended suspiciously fast: {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "budgeted fallback must end in ~2.5 s, took {elapsed:?}"
+            );
+            assert!(
+                cache.slow_filled.load(Ordering::Relaxed),
+                "the aborted pass still marks the cache filled (last-good values)"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-22: the slow poller runs on its own connection — while
+    /// a 3 s backend switch (75 s bound, long-call lane) is in
+    /// flight, the slow poller still completes cycles on its own
+    /// lane and the generation advances. Without the dedicated
+    /// lanes the switch would hold the shared client's
+    /// single-flight lock for 3 s, the poller's `slow_poll`
+    /// calls would time out behind it, and the generation would
+    /// not move. (The counting server returns a fresh profile
+    /// name per `slow_poll`, so every completed cycle changes
+    /// the content and bumps. The 200 ms `list_profiles` delay
+    /// keeps each `slow_poll` inside the 500 ms call timeout —
+    /// a longer sleep would time the poller's own cycles out
+    /// and prove nothing.)
+    #[test]
+    #[cfg(unix)]
+    fn r2_22_slow_poller_keeps_refreshing_during_backend_switch() {
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-r2-22-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let mut counting =
+            CountingApi::with_list_profiles_delay(Duration::from_millis(200));
+        counting.backend_switch_delay = Duration::from_secs(3);
+        let counting = Arc::new(counting);
+        let api: Arc<dyn AppApi> = counting.clone();
+        let (tx, _rx) = broadcast::channel(64);
+        let server = Arc::new(IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                // Four connections: main + fast poller + slow
+                // poller + long-call lane, served concurrently.
+                let mut tasks = tokio::task::JoinSet::new();
+                for _ in 0..4 {
+                    if let Ok((stream, _)) = listener.accept().await {
+                        let server = Arc::clone(&server);
+                        tasks.spawn(async move {
+                            server.serve_stream(stream).await;
+                        });
+                    }
+                }
+                while tasks.join_next().await.is_some() {}
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let client = IpcApi::connect(&sock).expect("connect");
+        assert!(
+            wait_for(&client, IpcApi::slow_filled),
+            "slow cache should fill"
+        );
+        let gen_before = client.slow_generation();
+        assert!(gen_before > 0, "a completed cycle bumps the generation");
+        // Block the long-call lane for ~3 s from another thread:
+        // a backend switch whose server-side handler sleeps,
+        // holding the long lane's single-flight lock.
+        let blocked = client.clone();
+        let join = std::thread::spawn(move || {
+            blocked
+                .set_output_backend("vJoy")
+                .expect("backend switch completes");
+        });
+        // The slow poller's ~1.2 s period (200 ms work + 1 s
+        // wait) fits twice inside the 3 s switch — its
+        // generation must move.
+        let mut gen_after = gen_before;
+        for _ in 0..120 {
+            gen_after = client.slow_generation();
+            if gen_after > gen_before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            gen_after > gen_before,
+            "slow poller stalled behind the backend switch: generation stayed {gen_before}"
+        );
+        join.join().expect("backend switch finishes");
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);

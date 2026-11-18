@@ -30,6 +30,7 @@
 // on every launch and on every autostart login.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod background;
 mod daemon_api;
 mod rejoin;
 mod single_instance;
@@ -44,7 +45,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rsh_api::{AppApi, AppEvent, ConnEvent, ConnectionError, ManagerAction};
+use rsh_api::{
+    ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnEvent, ConnectionError,
+    ConnectionInfo, ConnectionState, DiagStats, DraftStatus, FirmwareCheck, FirmwareUpdateStatus,
+    GameSummary, ManagerAction, PairingInfo, PollState, ProfileSummary, RawMv, SnapshotInfo,
+    TuningSettings, UserError, VjoyStatus,
+};
 use rsh_app_core::diagnostics::{append_startup_log_both, install_panic_hook, log_fatal};
 use rsh_app_core::state::{AppStateCore, BindingAppAction, TransportKind};
 #[cfg(unix)]
@@ -57,8 +63,8 @@ use daemon_api::{DaemonApi, connection_changed_event};
 use rejoin::{RSH_SSID, rejoin_wifi};
 use single_instance::{AcquireOutcome, acquire};
 use tray_popup::{
-    POPUP_ACTIVATION_TIMEOUT, PopupDismissPoll, PopupGame, TrayPopupData, TrayToggleGuard,
-    anchor_popup, next_profile, popup_is_light,
+    POPUP_ACTIVATION_TIMEOUT, PopupDismissPoll, PopupGame, PopupRefreshCache, TrayPopupData,
+    TrayToggleGuard, anchor_popup, next_profile, popup_is_light,
 };
 
 slint::include_modules!();
@@ -159,6 +165,7 @@ async fn manager_loop(
     event_tx: broadcast::Sender<AppEvent>,
     tray_actions: Arc<Mutex<Vec<TrayAction>>>,
     shutdown: Arc<AtomicBool>,
+    background: Arc<Mutex<background::BackgroundGuard>>,
     verbose: bool,
 ) {
     let mut last_gate = false;
@@ -395,6 +402,27 @@ async fn manager_loop(
         }
         let active_now = api.manager_state().is_active();
         if active_now && !last_active {
+            // Scope C: wheel connected — raise the daemon's
+            // priority and re-apply the power-throttling opt-out.
+            // Idempotent: escalate() reports nothing when already
+            // escalated, so this only logs on a real transition.
+            // The lock is held only for the short sync call, never
+            // across an .await.
+            {
+                let report = background
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .escalate();
+                if !report.is_empty() {
+                    log_line(
+                        verbose,
+                        &format!(
+                            "background resilience (escalated):\n{}",
+                            background::summarize(&report)
+                        ),
+                    );
+                }
+            }
             // DS-34: publish the success ONLY when a pairing was
             // actually in flight. The old `!first_active_seen`
             // arm published `PairingFinished { ok: true }` on the
@@ -443,6 +471,25 @@ async fn manager_loop(
         }
         if !window_open && !active_now {
             pending_rejoin_password = None;
+        }
+        if !active_now && last_active {
+            // Scope C: wheel disconnected — drop back to the
+            // baseline priority (see the escalate block above).
+            {
+                let report = background
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .relax();
+                if !report.is_empty() {
+                    log_line(
+                        verbose,
+                        &format!(
+                            "background resilience (relaxed):\n{}",
+                            background::summarize(&report)
+                        ),
+                    );
+                }
+            }
         }
         last_active = active_now;
         // Heartbeat watchdog (C-04): 2 s silence in Active →
@@ -1110,6 +1157,208 @@ fn quarantine_corrupt_store_files(data_dir: &std::path::Path) -> Vec<PathBuf> {
     quarantined
 }
 
+/// DS-81: the IPC server's API handle while the profile store is
+/// still opening. `main` binds the IPC endpoint BEFORE the store
+/// open (a slow store — repair / quarantine retry — used to leave a
+/// second launch waiting the full 20 × 500 ms ping budget for an
+/// endpoint that did not exist yet), so the server needs an
+/// [`AppApi`] before the real [`DaemonApi`] exists.
+///
+/// Until [`DeferredApi::install`] runs, every call answers with an
+/// honest "still starting" value — never a fake reading: `ping` does
+/// not touch the API at all ([`rsh_ipc::dispatch`] answers it
+/// directly), `version` is the static build version, `connection`
+/// is `Idle` / "Starting…", reads return empty / neutral defaults,
+/// and mutations fail with a retryable "still starting" error. Once
+/// installed, every method forwards to the live [`DaemonApi`]
+/// unchanged — including [`AppApi::poll`], whose single-read
+/// implementation must not be replaced by the trait default's three
+/// separate reads. [`AppApi::slow_poll`] and `cache_generation`
+/// need no override: the trait defaults compose through these
+/// getters, so they already delegate once installed.
+///
+/// Drift risk: a future [`DaemonApi`] override that is not
+/// forwarded here would silently keep answering the trait default
+/// after install. The `deferred_api_*` tests pin the forwarding for
+/// the methods the UI calls on every cycle; a new override must add
+/// its forwarding line (and a test assertion) here.
+struct DeferredApi {
+    inner: Mutex<Option<Arc<DaemonApi>>>,
+}
+
+/// The "still starting" error for mutations issued before the store
+/// has opened: retryable, plain-worded, and never a silent no-op.
+fn starting_error() -> UserError {
+    UserError::from_connection(
+        ConnectionError::Unknown,
+        "RSH is still starting — try again in a moment",
+    )
+}
+
+/// The starting [`ConnectionInfo`]: `Idle`, no session, no address
+/// — the daemon genuinely has no connection yet.
+fn starting_connection() -> ConnectionInfo {
+    ConnectionInfo {
+        state: ConnectionState::Idle,
+        label: "Starting…".to_string(),
+        transport: ApiTransport::Wifi,
+        address: String::new(),
+        session_active: false,
+        error: None,
+        hint: None,
+    }
+}
+
+/// The starting [`PairingInfo`]: no window open, no password, no
+/// error — no pairing attempt has run yet.
+fn starting_pairing_status() -> PairingInfo {
+    PairingInfo {
+        seconds_left: 0,
+        password: None,
+        error: None,
+        error_detail: None,
+        board_mac: None,
+        replacement_required: false,
+        key_reset_armed: false,
+        attempt_log: Vec::new(),
+    }
+}
+
+impl DeferredApi {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    /// Install the live API once the store has opened. Later calls
+    /// forward to it; calls already in flight keep the starting
+    /// value they read (no torn state — the install is one pointer
+    /// swap under the lock).
+    fn install(&self, api: Arc<DaemonApi>) {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(api);
+    }
+
+    fn inner(&self) -> Option<Arc<DaemonApi>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Forward one [`AppApi`] method to the installed [`DaemonApi`]:
+/// `result` methods fail with [`starting_error`] until installed,
+/// `value` methods answer with the given starting value, `unit`
+/// methods are a no-op until installed.
+macro_rules! fwd {
+    (result $name:ident ($($arg:ident : $ty:ty),*) -> $ret:ty) => {
+        fn $name(&self $(, $arg: $ty)*) -> Result<$ret, UserError> {
+            match self.inner() {
+                Some(api) => api.$name($($arg),*),
+                None => Err(starting_error()),
+            }
+        }
+    };
+    (value $name:ident ($($arg:ident : $ty:ty),*) -> $ret:ty = $start:expr) => {
+        fn $name(&self $(, $arg: $ty)*) -> $ret {
+            match self.inner() {
+                Some(api) => api.$name($($arg),*),
+                None => $start,
+            }
+        }
+    };
+    (unit $name:ident ($($arg:ident : $ty:ty),*)) => {
+        fn $name(&self $(, $arg: $ty)*) {
+            if let Some(api) = self.inner() {
+                api.$name($($arg),*);
+            }
+        }
+    };
+}
+
+impl AppApi for DeferredApi {
+    fwd!(value version() -> String = rsh_api::app_version().to_string());
+    fwd!(value connection() -> ConnectionInfo = starting_connection());
+    fwd!(result connect(transport: ApiTransport) -> ConnectionInfo);
+    fwd!(result disconnect() -> ConnectionInfo);
+    fwd!(value pairing_status() -> PairingInfo = starting_pairing_status());
+    fwd!(result begin_pairing() -> PairingInfo);
+    fwd!(result reset_pairing() -> PairingInfo);
+    fwd!(value snapshot() -> SnapshotInfo = SnapshotInfo::default());
+    fwd!(value output_enabled() -> bool = false);
+    fwd!(unit set_output_enabled(enabled: bool));
+    fwd!(value get_tuning(module: &str) -> TuningSettings = TuningSettings::neutral(module));
+    fwd!(result set_tuning(tuning: &TuningSettings) -> TuningSettings);
+    fwd!(value draft_status() -> Option<DraftStatus> = None);
+    fwd!(result save_draft() -> bool);
+    fwd!(value discard_draft() -> bool = false);
+    fwd!(value autostart() -> bool = false);
+    fwd!(result set_autostart(enabled: bool) -> bool);
+    fwd!(value firmware_version() -> String = "Unknown".to_string());
+    fwd!(result firmware_check() -> FirmwareCheck);
+    fwd!(result update_firmware() -> FirmwareUpdateStatus);
+    fwd!(value firmware_update_status() -> FirmwareUpdateStatus = FirmwareUpdateStatus::default());
+    fwd!(value board_address() -> String = String::new());
+    fwd!(result set_board_address(address: &str) -> String);
+    fwd!(value module_enabled(module: &str) -> bool = false);
+    fwd!(result set_module_enabled(module: &str, enabled: bool) -> bool);
+    fwd!(value auto_pause() -> bool = false);
+    fwd!(result set_auto_pause(paused: bool) -> bool);
+    fwd!(value close_to_tray() -> bool = true);
+    fwd!(result set_close_to_tray(enabled: bool) -> bool);
+    fwd!(value output_backend() -> String = String::new());
+    fwd!(result set_output_backend(name: &str) -> String);
+    fwd!(result backup_now() -> String);
+    fwd!(value list_profiles() -> Vec<ProfileSummary> = Vec::new());
+    fwd!(result activate_profile(id: &str) -> String);
+    fwd!(result create_profile(name: &str) -> String);
+    fwd!(result duplicate_profile(id: &str) -> String);
+    fwd!(result delete_profile(id: &str) -> bool);
+    fwd!(value list_games() -> Vec<GameSummary> = Vec::new());
+    fwd!(result launch_game(id: &str) -> GameSummary);
+    fwd!(result stop_game(id: &str) -> GameSummary);
+    fwd!(result game_state(id: &str) -> GameSummary);
+    fwd!(result start_learn() -> bool);
+    fwd!(result cancel_learn() -> bool);
+    fwd!(value is_learning() -> bool = false);
+    fwd!(value take_learned_button() -> Option<u8> = None);
+    fwd!(result calibration() -> CalibrationInfo);
+    fwd!(result raw_mv() -> RawMv);
+    fwd!(result capture_centre() -> u16);
+    fwd!(result capture_pedal_min(pedal: &str) -> u16);
+    fwd!(result capture_pedal_max(pedal: &str) -> u16);
+    fwd!(value list_bindings() -> Vec<ButtonBinding> = Vec::new());
+    fwd!(result set_binding(button: u8, action: &str) -> ButtonBinding);
+    fwd!(result clear_binding(button: u8) -> bool);
+    fwd!(result rename_profile(id: &str, name: &str) -> String);
+    fwd!(result link_profile(id: &str, game_slug: &str) -> String);
+    fwd!(result restore_backup() -> String);
+    fwd!(value knob_actions() -> [[String; 3]; 2] = Default::default());
+    fwd!(result set_knob_action(knob: u8, row: u8, action: &str) -> ());
+    fwd!(result vjoy_status() -> VjoyStatus);
+    fwd!(result install_vjoy() -> String);
+    fwd!(result diag_stats() -> DiagStats);
+
+    /// DS-81: delegate — do NOT fall back to the trait default's
+    /// three separate reads, which would undo
+    /// [`DaemonApi::poll`]'s single-read guarantee. Before install,
+    /// the three reads below are the starting values.
+    fn poll(&self) -> PollState {
+        match self.inner() {
+            Some(api) => api.poll(),
+            None => PollState {
+                snapshot: self.snapshot(),
+                connection: self.connection(),
+                output_enabled: self.output_enabled(),
+            },
+        }
+    }
+}
+
 /// Single-instance check, runtime + IPC + manager loop, engine
 /// start, tray creation, Slint event loop (tray only until Phase 3
 /// adds the window), shutdown.
@@ -1146,6 +1395,20 @@ fn main() {
             rsh_api::app_version(),
             std::process::id(),
             data_dir.display()
+        ),
+    );
+    // Scope C (background resilience): acquire the mitigations
+    // for the daemon's whole lifetime. The guard is shared with
+    // the manager loop (escalate on wheel-Active, relax on
+    // disconnect) and held until main() returns, so the power
+    // request stays active.
+    let (background_guard, background_report) = background::BackgroundGuard::acquire();
+    let background_guard = Arc::new(Mutex::new(background_guard));
+    log_line(
+        verbose,
+        &format!(
+            "daemon: background resilience:\n{}",
+            background::summarize(&background_report)
         ),
     );
     if data_dir_fell_back {
@@ -1257,6 +1520,46 @@ fn main() {
     // so clear it before anything else can misread it.
     clear_daemon_status(&data_dir);
 
+    // DS-81: build the runtime and bind the IPC endpoint BEFORE the
+    // store opens. The store open (repair / quarantine retry on a
+    // corrupt store) used to run first, so a second launch's ping
+    // saw "no endpoint yet" and burned the whole 20 × 500 ms budget
+    // before the first daemon could answer. The server runs over a
+    // [`DeferredApi`] (honest starting values, no fake readings)
+    // until the store below installs the live [`DaemonApi`] into it
+    // — `ping` answers from the moment the listener binds.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("rsh-daemon-rt")
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            let _ = log_fatal(&format!("rsh-daemon: cannot build runtime: {error}"));
+            std::process::exit(1);
+        });
+    let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(256);
+    let tray_actions: Arc<Mutex<Vec<TrayAction>>> = Arc::new(Mutex::new(Vec::new()));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    // F24: set only by `signal_ipc_fatal_shutdown` (a fatal IPC
+    // bind) — `main` exits 1 for it after the teardown below, so a
+    // fatal bind reports like `DaemonHung` instead of exiting 0.
+    // A clean quit never sets it.
+    let ipc_fatal = Arc::new(AtomicBool::new(false));
+    let deferred_api = Arc::new(DeferredApi::new());
+    let ipc_server = Arc::new(IpcServer::new(
+        Arc::clone(&deferred_api) as Arc<dyn AppApi>,
+        event_tx.clone(),
+    ));
+    {
+        let server = Arc::clone(&ipc_server);
+        let dir = data_dir.clone();
+        let shutdown = Arc::clone(&shutdown);
+        let ipc_fatal = Arc::clone(&ipc_fatal);
+        runtime.spawn(async move {
+            serve_ipc(server, &dir, verbose, shutdown, ipc_fatal).await;
+        });
+    }
+
     // Open the app state (repairs a corrupt store from backups).
     // Last resort when even the backups cannot repair it: quarantine
     // the unreadable store files aside (bytes preserved for manual
@@ -1305,6 +1608,9 @@ fn main() {
         }
     };
     let api = DaemonApi::new(Arc::clone(&state));
+    // DS-81: the store is open — the IPC server now serves live
+    // state instead of starting values.
+    deferred_api.install(Arc::clone(&api));
     // BACKEND-2 migration: log the persisted-backend note (if any)
     // so a HIDMaestro→vJoy switch is visible in the startup log.
     if let Some(note) = state.backend_migration_note() {
@@ -1315,38 +1621,6 @@ fn main() {
     // silent.
     for warning in state.binding_load_warnings() {
         log_line(verbose, &format!("daemon: bindings: {warning}"));
-    }
-    let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(256);
-    let tray_actions: Arc<Mutex<Vec<TrayAction>>> = Arc::new(Mutex::new(Vec::new()));
-    let shutdown = Arc::new(AtomicBool::new(false));
-    // F24: set only by `signal_ipc_fatal_shutdown` (a fatal IPC
-    // bind) — `main` exits 1 for it after the teardown below, so a
-    // fatal bind reports like `DaemonHung` instead of exiting 0.
-    // A clean quit never sets it.
-    let ipc_fatal = Arc::new(AtomicBool::new(false));
-
-    // Runtime thread: IPC server + manager loop.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("rsh-daemon-rt")
-        .enable_all()
-        .build()
-        .unwrap_or_else(|error| {
-            let _ = log_fatal(&format!("rsh-daemon: cannot build runtime: {error}"));
-            std::process::exit(1);
-        });
-    let ipc_server = Arc::new(IpcServer::new(
-        Arc::clone(&api) as Arc<dyn AppApi>,
-        event_tx.clone(),
-    ));
-    {
-        let server = Arc::clone(&ipc_server);
-        let dir = data_dir.clone();
-        let shutdown = Arc::clone(&shutdown);
-        let ipc_fatal = Arc::clone(&ipc_fatal);
-        runtime.spawn(async move {
-            serve_ipc(server, &dir, verbose, shutdown, ipc_fatal).await;
-        });
     }
     // DS-02 defence-in-depth: keep the manager-loop handle. A
     // panicking tokio task just dies — the old code discarded both
@@ -1359,6 +1633,7 @@ fn main() {
         let api = Arc::clone(&api);
         let tray_actions = Arc::clone(&tray_actions);
         let shutdown = Arc::clone(&shutdown);
+        let background = Arc::clone(&background_guard);
         // A cloned `Handle` (not a borrow of `runtime`): the
         // closure must stay callable after `main` uses `runtime`
         // again (`--check`'s `block_on`), and `Handle::spawn`
@@ -1369,8 +1644,9 @@ fn main() {
             let event_tx = event_tx.clone();
             let tray_actions = Arc::clone(&tray_actions);
             let shutdown = Arc::clone(&shutdown);
+            let background = Arc::clone(&background);
             handle.spawn(async move {
-                manager_loop(api, event_tx, tray_actions, shutdown, verbose).await;
+                manager_loop(api, event_tx, tray_actions, shutdown, background, verbose).await;
             })
         }
     };
@@ -1523,38 +1799,15 @@ fn main() {
         log_line(verbose, "daemon: tray disabled (--no-tray)");
         None
     } else {
-        let mut tray: Option<RshTray> = None;
-        for attempt in 1..=6 {
-            match create_tray(&api, &tray_actions, &shutdown, verbose, &data_dir) {
-                Ok(handle) => {
-                    log_line(verbose, "daemon: tray icon registered");
-                    tray = Some(handle);
-                    break;
-                }
-                Err(error) => {
-                    log_line(
-                        verbose,
-                        &format!("daemon: tray unavailable (attempt {attempt}/6: {error})"),
-                    );
-                    // DS-48: fail fast on a headless host — with no
-                    // display server a tray can never appear, so
-                    // retrying 6×2 s on the main thread only delays
-                    // startup by ~10 s (and blocks shutdown/quit
-                    // handling the whole time). Windows keeps the
-                    // retries: Explorer may just not be ready yet.
-                    if attempt == 1 && tray_headless() {
-                        log_line(
-                            verbose,
-                            "daemon: no display server — skipping tray retries (headless)",
-                        );
-                        break;
-                    }
-                    if attempt < 6 {
-                        std::thread::sleep(Duration::from_secs(2));
-                    }
-                }
-            }
-        }
+        // DS-81: the retry loop lives in `create_tray_with_retries`
+        // (below) — it keeps the 6 attempts × 2 s cadence and the
+        // headless fail-fast, but never blocks the main thread in a
+        // 2 s sleep: between attempts it wakes every 250 ms so a
+        // shutdown request is noticed promptly. `create_tray` itself
+        // stays on the main thread: it builds Slint `Rc` components
+        // (`PopupHandle`), which are `!Send` and cannot be created
+        // on a background thread.
+        let tray = create_tray_with_retries(&api, &tray_actions, &shutdown, verbose, &data_dir);
         if tray.is_none() {
             log_line(
                 verbose,
@@ -1641,6 +1894,10 @@ struct PopupHandle {
     /// dismiss needs a sustained change — see
     /// [`tray_popup::PopupDismissPoll`].
     poll: RefCell<PopupDismissPoll>,
+    /// Change-detection cache (R2-38): `refresh()` only pushes
+    /// properties when the collected data or theme actually moved,
+    /// so the 10 Hz timer does not repaint an idle popup.
+    refresh_cache: RefCell<PopupRefreshCache>,
     /// Show-time activation finished — either the popup became
     /// foreground or the retry window
     /// ([`tray_popup::POPUP_ACTIVATION_TIMEOUT`]) expired. While
@@ -1660,6 +1917,13 @@ impl PopupHandle {
         let profiles = api.state.list_profiles();
         let games = api.state.list_games();
         let data = TrayPopupData::collect(api as &dyn AppApi, &profiles, &games);
+        // R2-38: skip the property writes (and the repaint) when
+        // nothing moved since the last push. The first call always
+        // reports a change, so the first show() always pushes.
+        let light = popup_is_light(rsh_app_core::data_dir().as_deref());
+        if !self.refresh_cache.borrow_mut().changed(&data, light) {
+            return;
+        }
         self.popup.set_conn_label(data.conn_label.into());
         self.popup.set_conn_sub(data.conn_sub.into());
         self.popup.set_connected(data.connected);
@@ -1670,8 +1934,7 @@ impl PopupHandle {
         // read is cheap, and the Auto OS sample is cached 60 s
         // inside `popup_is_light`, so the 10 Hz refresh never
         // spawns `reg` more than once a minute.
-        self.popup
-            .set_light_theme(popup_is_light(rsh_app_core::data_dir().as_deref()));
+        self.popup.set_light_theme(light);
         self.popup.set_send_to_game(data.send_to_game);
         self.popup.set_steer_angle(data.steering_deg as f32);
         self.popup
@@ -1902,6 +2165,81 @@ fn tray_headless() -> bool {
     false
 }
 
+/// DS-81: the tray-retry decision, extracted for tests: after failed
+/// attempt `attempt` (1-based), how long to wait before the next
+/// attempt — `None` means stop retrying. 6 attempts total; a
+/// headless host fails fast after attempt 1 (a tray can never appear
+/// there), Windows keeps retrying (Explorer may just not be ready
+/// yet at login).
+fn tray_retry_after(attempt: u32, headless: bool) -> Option<Duration> {
+    if attempt >= 6 || (attempt == 1 && headless) {
+        None
+    } else {
+        Some(Duration::from_secs(2))
+    }
+}
+
+/// DS-81: create the tray with the 6-attempt retry cadence, without
+/// blocking the main thread in a 2 s sleep. The old loop slept
+/// `2 s × 5` on the main thread, so a shutdown request (fatal IPC
+/// bind, quit) was not noticed until the sleeps ran out. Between
+/// attempts this waits in 250 ms slices and returns `None` as soon
+/// as `shutdown` is set, so the caller falls through to the headless
+/// park loop (which exits on the flag) instead of sleeping out the
+/// remaining retries.
+///
+/// Creation itself stays on the calling (main) thread:
+/// [`create_tray`] builds Slint `Rc` components, which are `!Send`
+/// and cannot move to a background thread — so the retry *timing* is
+/// what moved off the blocking sleep, not the creation.
+fn create_tray_with_retries(
+    api: &Arc<DaemonApi>,
+    tray_actions: &Arc<Mutex<Vec<TrayAction>>>,
+    shutdown: &Arc<AtomicBool>,
+    verbose: bool,
+    data_dir: &std::path::Path,
+) -> Option<RshTray> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match create_tray(api, tray_actions, shutdown, verbose, data_dir) {
+            Ok(handle) => {
+                log_line(verbose, "daemon: tray icon registered");
+                return Some(handle);
+            }
+            Err(error) => {
+                log_line(
+                    verbose,
+                    &format!("daemon: tray unavailable (attempt {attempt}/6: {error})"),
+                );
+            }
+        }
+        let Some(delay) = tray_retry_after(attempt, tray_headless()) else {
+            if attempt == 1 {
+                // DS-48: fail fast on a headless host — with no
+                // display server a tray can never appear, so
+                // retrying 6×2 s only delays startup by ~10 s.
+                log_line(
+                    verbose,
+                    "daemon: no display server — skipping tray retries (headless)",
+                );
+            }
+            return None;
+        };
+        let deadline = Instant::now() + delay;
+        while Instant::now() < deadline {
+            if shutdown.load(Ordering::Relaxed) {
+                log_line(
+                    verbose,
+                    "daemon: shutdown requested during tray retry — stopping retries",
+                );
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
 // One function: tray + popup creation is a single wiring pass
 // (icon → menu → popup → timer); splitting it would scatter the
 // shared handles across helpers.
@@ -1955,6 +2293,7 @@ fn create_tray(
             shown_at: Cell::new(None),
             verbose,
             poll: RefCell::new(PopupDismissPoll::new(None)),
+            refresh_cache: RefCell::new(PopupRefreshCache::new()),
             activation_done: Cell::new(true),
             activation_note_logged: Cell::new(false),
         })),
@@ -2363,7 +2702,161 @@ mod tests {
     }
 
     #[test]
+    fn tray_retry_after_keeps_six_attempts_with_headless_fail_fast() {
+        // DS-81: the retry behaviour is unchanged — 6 attempts, 2 s
+        // apart, headless fail-fast after attempt 1.
+        assert_eq!(
+            tray_retry_after(1, false),
+            Some(Duration::from_secs(2)),
+            "attempt 1 (not headless) retries"
+        );
+        assert_eq!(
+            tray_retry_after(1, true),
+            None,
+            "headless fails fast after attempt 1"
+        );
+        assert_eq!(
+            tray_retry_after(2, false),
+            Some(Duration::from_secs(2)),
+            "mid-sequence retries"
+        );
+        assert_eq!(
+            tray_retry_after(5, false),
+            Some(Duration::from_secs(2)),
+            "attempt 5 still retries once more"
+        );
+        assert_eq!(tray_retry_after(6, false), None, "no 7th attempt");
+        assert_eq!(tray_retry_after(6, true), None, "no 7th attempt");
+    }
+
+    #[test]
+    fn deferred_api_reports_starting_values_before_install() {
+        // DS-81: before the store opens, the IPC server answers
+        // with honest starting values — never a fake reading — and
+        // mutations fail with a retryable error instead of silently
+        // dropping the call.
+        let deferred = DeferredApi::new();
+        assert_eq!(deferred.version(), rsh_api::app_version());
+        let connection = deferred.connection();
+        assert_eq!(connection.state, ConnectionState::Idle);
+        assert_eq!(connection.label, "Starting…");
+        assert!(!connection.session_active);
+        assert_eq!(deferred.pairing_status().seconds_left, 0);
+        assert!(deferred.pairing_status().password.is_none());
+        assert_eq!(deferred.snapshot(), SnapshotInfo::default());
+        assert!(!deferred.output_enabled());
+        assert_eq!(deferred.firmware_version(), "Unknown");
+        assert!(deferred.draft_status().is_none());
+        assert!(deferred.list_profiles().is_empty());
+        assert!(deferred.list_games().is_empty());
+        assert!(deferred.list_bindings().is_empty());
+        assert!(
+            deferred
+                .set_tuning(&TuningSettings::neutral("steering"))
+                .is_err()
+        );
+        assert!(deferred.begin_pairing().is_err());
+        assert!(deferred.firmware_check().is_err());
+        assert!(deferred.vjoy_status().is_err());
+        // slow_poll composes through the starting getters: version
+        // answers, everything else is empty / unknown.
+        let slow = deferred.slow_poll();
+        assert_eq!(slow.version, rsh_api::app_version());
+        assert!(slow.games.is_empty());
+        assert!(slow.profiles.is_empty());
+        assert!(slow.firmware_check.is_none());
+        assert!(slow.vjoy_status.is_none());
+    }
+
+    #[test]
+    fn deferred_api_delegates_once_installed() {
+        // DS-81: after install, every forwarded method agrees with
+        // the live DaemonApi — the wrapper must not shadow the real
+        // implementation (in particular `poll`, whose single-read
+        // guarantee the trait default would undo).
+        let dir = temp_dir("deferred-api-delegate");
+        let state = AppStateCore::open_with_null_sink(&dir).expect("open state");
+        let api = DaemonApi::new(Arc::new(state));
+        let deferred = DeferredApi::new();
+        deferred.install(Arc::clone(&api));
+        assert_eq!(deferred.version(), api.version());
+        assert_eq!(deferred.connection(), api.connection());
+        assert_eq!(deferred.pairing_status(), api.pairing_status());
+        assert_eq!(deferred.snapshot(), api.snapshot());
+        assert_eq!(deferred.poll(), api.poll());
+        assert_eq!(deferred.slow_poll(), api.slow_poll());
+        assert_eq!(deferred.output_enabled(), api.output_enabled());
+        assert_eq!(deferred.firmware_version(), api.firmware_version());
+        assert_eq!(deferred.firmware_check(), api.firmware_check());
+        assert_eq!(deferred.vjoy_status(), api.vjoy_status());
+        assert_eq!(deferred.list_profiles(), api.list_profiles());
+        assert_eq!(deferred.list_games(), api.list_games());
+        assert_eq!(deferred.list_bindings(), api.list_bindings());
+        assert_eq!(deferred.get_tuning("steering"), api.get_tuning("steering"));
+        assert_eq!(deferred.autostart(), api.autostart());
+        assert_eq!(deferred.board_address(), api.board_address());
+        assert_eq!(deferred.output_backend(), api.output_backend());
+        assert_eq!(deferred.module_enabled("led"), api.module_enabled("led"));
+        assert_eq!(deferred.draft_status(), api.draft_status());
+        assert_eq!(deferred.knob_actions(), api.knob_actions());
+        assert_eq!(
+            deferred.firmware_update_status(),
+            api.firmware_update_status()
+        );
+        assert_eq!(deferred.close_to_tray(), api.close_to_tray());
+        assert_eq!(deferred.auto_pause(), api.auto_pause());
+        assert_eq!(deferred.is_learning(), api.is_learning());
+        assert_eq!(deferred.take_learned_button(), api.take_learned_button());
+        assert_eq!(deferred.diag_stats(), api.diag_stats());
+        assert_eq!(deferred.calibration(), api.calibration());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_api_answers_ping_before_the_store_opens() {
+        // DS-81: the IPC endpoint answers with NO store open at
+        // all — this is the second-instance ping path: before this
+        // fix the listener did not exist until after the store
+        // open, so the ping burned the 20 × 500 ms budget.
+        let dir = temp_dir("deferred-api-ping");
+        let deferred = Arc::new(DeferredApi::new());
+        let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(256);
+        let server = Arc::new(IpcServer::new(deferred, event_tx));
+        let socket = socket_path(&dir);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // `bind_unix_socket` needs a runtime context
+        // (`UnixListener::bind` looks up the current reactor), so
+        // the bind happens inside `block_on` — binding before the
+        // runtime exists panics with "there is no reactor running".
+        let listener =
+            runtime.block_on(async { rsh_ipc::bind_unix_socket(&socket).expect("bind socket") });
+        runtime.spawn(async move {
+            serve_listener(server, listener).await;
+        });
+        let (ping, version) = runtime.block_on(async {
+            let client = rsh_ipc::IpcClient::connect(&socket).await.expect("connect");
+            let ping = client.ping().await.expect("ping");
+            let version = client.version().await.expect("version");
+            (ping, version)
+        });
+        assert!(ping, "ping answers with no store open");
+        assert_eq!(
+            version,
+            rsh_api::app_version(),
+            "version is the static build version"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn daemon_status_write_is_atomic_and_overwrites() {
+        // Restored: the DS-81 test additions clobbered this test
+        // (it was replaced, not moved) — the atomic status write
+        // still needs its own coverage.
         let dir = temp_dir("status-overwrite");
         write_daemon_status(&dir, "fatal", "DaemonHung", "first");
         write_daemon_status(&dir, "fatal", "IpcBindFailed", "second");

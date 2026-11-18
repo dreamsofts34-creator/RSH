@@ -13,6 +13,8 @@
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// Version marker in the signed image body (`ota_validate.h`).
 const VERSION_MARKER: &[u8] = b"Version <b>";
@@ -130,15 +132,67 @@ pub fn bundled_firmware_path(data_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Cached bundled-image version (R2-20): [`bundled_firmware_version`]
+/// used to `fs::read` the ~960 KB image on every call, and
+/// `slow_poll` calls it ~1 Hz — a ~1 MB disk read per slow cycle
+/// for a value that only changes when the image file changes. The
+/// parsed version is cached keyed by the resolved path + the file's
+/// metadata (mtime + length); a cache hit costs one `stat` and no
+/// read. A replacement with identical mtime and length would read
+/// stale — the flows that write a new image call
+/// [`invalidate_bundled_firmware_version_cache`] after writing, so
+/// that path never relies on the stat. A missing / unreadable file
+/// is never cached: the next call retries the read.
+struct BundledVersionEntry {
+    path: PathBuf,
+    modified: SystemTime,
+    len: u64,
+    version: Option<String>,
+}
+
+static BUNDLED_VERSION_CACHE: Mutex<Option<BundledVersionEntry>> = Mutex::new(None);
+
+/// Drop the cached bundled version (R2-20): call after writing a
+/// new bundled image (OTA download / installer refresh), so the
+/// next read parses the fresh file even if its mtime and length
+/// happen to match the old one.
+pub fn invalidate_bundled_firmware_version_cache() {
+    *BUNDLED_VERSION_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 /// The bundled OTA image's version (`"a.b.c"`), or `None` when the
 /// image is absent, unreadable, or carries no version marker. No
 /// signature check happens here — see the module docs.
 #[must_use]
 pub fn bundled_firmware_version(data_dir: &Path) -> Option<String> {
     let path = bundled_firmware_path(data_dir)?;
-    let bytes = std::fs::read(path).ok()?;
-    let (major, minor, patch_num) = parse_firmware_version(&bytes)?;
-    Some(format!("{major}.{minor}.{patch_num}"))
+    let metadata = std::fs::metadata(&path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let len = metadata.len();
+    let mut cache = BUNDLED_VERSION_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = cache.as_ref()
+        && entry.path == path
+        && entry.modified == modified
+        && entry.len == len
+    {
+        return entry.version.clone();
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    // Cache the `None` too: a present-but-unparseable image must
+    // not be re-read on every slow cycle either.
+    let version = parse_firmware_version(&bytes)
+        .map(|(major, minor, patch_num)| format!("{major}.{minor}.{patch_num}"));
+    *cache = Some(BundledVersionEntry {
+        path,
+        modified,
+        len,
+        version: version.clone(),
+    });
+    version
 }
 
 /// Compare two `"a.b.c"` version strings numerically (semver
@@ -228,5 +282,63 @@ mod tests {
         assert_eq!(bundled_firmware_version(&dir).as_deref(), Some("4.0.2"));
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(bundled_firmware_version(&dir), None);
+    }
+
+    #[test]
+    fn bundled_version_is_cached_until_the_file_changes() {
+        // R2-20: a second call with unchanged metadata must not
+        // re-read the file — rewrite the bytes (same length, mtime
+        // restored) and the cached version still answers.
+        let dir = std::env::temp_dir().join(format!(
+            "rsh-firmware-image-cache-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(BUNDLED_FIRMWARE_FILE);
+        std::fs::write(&path, image_with("4.0.2")).unwrap();
+        assert_eq!(bundled_firmware_version(&dir).as_deref(), Some("4.0.2"));
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, image_with("4.0.3")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(
+            bundled_firmware_version(&dir).as_deref(),
+            Some("4.0.2"),
+            "same mtime + length answers the cached version without re-reading"
+        );
+        // A real change (new mtime) re-reads the fresh version.
+        std::fs::write(&path, image_with("4.0.3")).unwrap();
+        assert_eq!(bundled_firmware_version(&dir).as_deref(), Some("4.0.3"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bundled_version_invalidate_forces_a_fresh_read() {
+        // R2-20: the explicit invalidate covers a rewrite the stat
+        // cannot see (same mtime + length).
+        let dir = std::env::temp_dir().join(format!(
+            "rsh-firmware-image-invalidate-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(BUNDLED_FIRMWARE_FILE);
+        std::fs::write(&path, image_with("4.0.2")).unwrap();
+        assert_eq!(bundled_firmware_version(&dir).as_deref(), Some("4.0.2"));
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, image_with("4.0.3")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(bundled_firmware_version(&dir).as_deref(), Some("4.0.2"));
+        invalidate_bundled_firmware_version_cache();
+        assert_eq!(bundled_firmware_version(&dir).as_deref(), Some("4.0.3"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

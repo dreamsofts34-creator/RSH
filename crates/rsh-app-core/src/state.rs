@@ -143,7 +143,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -398,6 +398,30 @@ struct VjoyInstallState {
     /// The last install failure, when the last install failed.
     error: Option<String>,
 }
+
+/// Cached vJoy DLL probe (R2-20): [`AppStateCore::vjoy_status`]
+/// called `resolve_dll_path()` twice per call — a registry read
+/// plus two `ProgramFiles` file probes on Windows — and `slow_poll`
+/// calls it ~1 Hz. The DLL only appears / disappears when the
+/// driver is installed / uninstalled, so the probe result is cached
+/// and re-run only when it is invalidated (install completion,
+/// backend switch) or when [`VJOY_DLL_CACHE_TTL`] has passed (a
+/// driver installed by hand while the daemon runs still shows up
+/// within a minute, without a restart).
+#[derive(Default)]
+struct VjoyDllCache {
+    /// When the cached probe ran ([`None`] = never probed, or
+    /// invalidated — the next read re-probes immediately).
+    probed_at: Option<Instant>,
+    /// The probe result: the resolved DLL path, or [`None`] when
+    /// the driver was not found.
+    dll: Option<PathBuf>,
+}
+
+/// Time after which the cached vJoy DLL probe is re-run (R2-20):
+/// long enough that the ~1 Hz slow poll never probes, short enough
+/// that a hand-installed driver shows up without a restart.
+const VJOY_DLL_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// vJoy installer download (v2.0.1 hotfix BACKEND-2).
 ///
@@ -847,6 +871,12 @@ pub struct AppStateCore {
     backend_migration_note: Mutex<Option<String>>,
     /// Background vJoy install progress (see [`VjoyInstallState`]).
     vjoy_install: Mutex<VjoyInstallState>,
+    /// Cached vJoy DLL probe (R2-20, see [`VjoyDllCache`]): the
+    /// probe result `vjoy_status()` reports, so the ~1 Hz slow poll
+    /// does not re-run the registry / file probes every cycle.
+    /// `installing` / `install_error` are NOT cached — they are
+    /// cheap lock reads and must stay live.
+    vjoy_dll_cache: Mutex<VjoyDllCache>,
     /// HMAC session gate (SEC-E-14, H1 condition 13): `true` only
     /// once a `BoardSession` has completed its HMAC-verified
     /// `GET_CAPS` and the session owner opened the gate. Starts
@@ -1095,6 +1125,7 @@ impl AppStateCore {
             startup_backend: Mutex::new(None),
             backend_migration_note: Mutex::new(backend_migration_note),
             vjoy_install: Mutex::new(VjoyInstallState::default()),
+            vjoy_dll_cache: Mutex::new(VjoyDllCache::default()),
             session_gate_open: Mutex::new(false),
             session_gate_held_frames: Mutex::new(0),
             session_activation: Mutex::new(None),
@@ -3067,6 +3098,9 @@ impl AppStateCore {
         let requested = BackendKind::parse(name).ok_or_else(|| {
             format!("unknown output backend '{name}' (expected HIDMaestro, vJoy, or none)")
         })?;
+        // R2-20: a backend switch re-probes the vJoy DLL on the next
+        // status read instead of trusting the cached probe.
+        self.invalidate_vjoy_dll_cache();
         // C-FAIL-1: an explicit user re-select re-arms the
         // mid-session failover, so the next failure can fall over
         // once more.
@@ -3359,7 +3393,7 @@ impl AppStateCore {
         let selected = self.selected_backend();
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
         let live_detail = lock(&self.backend_detail).clone();
-        let vjoy_installed = resolve_dll_path().is_some();
+        let vjoy_installed = self.vjoy_dll_path().is_some();
         let hidmaestro_installed = resolve_sidecar_path().is_file();
         vec![
             BackendStatus {
@@ -3427,19 +3461,55 @@ impl AppStateCore {
         ]
     }
 
+    /// Cached `resolve_dll_path()` (R2-20): one probe per
+    /// [`VJOY_DLL_CACHE_TTL`] window instead of two per
+    /// `vjoy_status()` call. Callers that change driver presence —
+    /// install completion ([`run_vjoy_install`]), backend switch
+    /// ([`Self::set_output_backend`]) — call
+    /// [`Self::invalidate_vjoy_dll_cache`] instead of waiting out
+    /// the TTL.
+    fn vjoy_dll_path(&self) -> Option<PathBuf> {
+        {
+            let cache = lock(&self.vjoy_dll_cache);
+            if let Some(probed_at) = cache.probed_at
+                && probed_at.elapsed() < VJOY_DLL_CACHE_TTL
+            {
+                return cache.dll.clone();
+            }
+        }
+        let dll = resolve_dll_path();
+        let mut cache = lock(&self.vjoy_dll_cache);
+        cache.probed_at = Some(Instant::now());
+        cache.dll.clone_from(&dll);
+        dll
+    }
+
+    /// Drop the cached vJoy DLL probe (R2-20): the next
+    /// [`Self::vjoy_dll_path`] re-probes immediately.
+    fn invalidate_vjoy_dll_cache(&self) {
+        let mut cache = lock(&self.vjoy_dll_cache);
+        cache.probed_at = None;
+        cache.dll = None;
+    }
+
     /// vJoy driver status (v2.0.1 hotfix BACKEND-2): whether the DLL
-    /// was found (file probe), whether a background install is
+    /// was found (cached file probe — see
+    /// [`Self::vjoy_dll_path`]), whether a background install is
     /// running, the last install failure, and the resolved DLL path.
     /// `version` is [`None`]: there is no version read without
     /// loading the DLL, and an unmeasured version is never invented.
     #[must_use]
     pub fn vjoy_status(&self) -> rsh_api::VjoyStatus {
+        // Probe before taking the install lock: the probe takes the
+        // cache lock, and no other path takes both locks in the
+        // opposite order.
+        let dll = self.vjoy_dll_path();
         let install = lock(&self.vjoy_install);
         rsh_api::VjoyStatus {
-            installed: resolve_dll_path().is_some(),
+            installed: dll.is_some(),
             installing: install.installing,
             install_error: install.error.clone(),
-            dll_path: resolve_dll_path().map(|path| path.to_string_lossy().into_owned()),
+            dll_path: dll.map(|path| path.to_string_lossy().into_owned()),
             version: None,
         }
     }
@@ -4912,6 +4982,9 @@ impl AppStateCore {
         let image_path = firmware_image::bundled_firmware_path(&data_dir).ok_or_else(|| {
             "no bundled firmware image found — check for updates first".to_string()
         })?;
+        // R2-20: a flash starts from a freshly written image — never
+        // trust the cached version for the pre-flight check.
+        firmware_image::invalidate_bundled_firmware_version_cache();
         let bundled = firmware_image::bundled_firmware_version(&data_dir).ok_or_else(|| {
             "the bundled firmware image has no version — it may be corrupt".to_string()
         })?;
@@ -6132,6 +6205,9 @@ fn run_vjoy_install(state: &Arc<AppStateCore>) {
     }
     let _guard = ResetInstalling(state);
     let result = run_vjoy_install_inner();
+    // R2-20: the install may have placed (or failed to place) the
+    // DLL — the cached probe must not keep answering the old result.
+    state.invalidate_vjoy_dll_cache();
     let mut install = lock(&state.vjoy_install);
     install.installing = false;
     install.error = result.err();
@@ -8435,6 +8511,44 @@ mod tests {
         assert_eq!(status.install_error, None);
         assert_eq!(status.dll_path, None);
         assert_eq!(status.version, None, "version is never invented");
+    }
+
+    #[test]
+    fn vjoy_dll_probe_is_cached_and_invalidation_reprobes() {
+        // R2-20: the first status read probes and populates the
+        // cache; later reads reuse it; invalidation clears it so
+        // the next read probes again.
+        let (state, _dir) = test_state();
+        assert!(lock(&state.vjoy_dll_cache).probed_at.is_none());
+        let first = state.vjoy_status();
+        assert!(lock(&state.vjoy_dll_cache).probed_at.is_some());
+        let probed_at = lock(&state.vjoy_dll_cache).probed_at;
+        let second = state.vjoy_status();
+        assert_eq!(lock(&state.vjoy_dll_cache).probed_at, probed_at);
+        assert_eq!(first.installed, second.installed);
+        assert_eq!(first.dll_path, second.dll_path);
+        state.invalidate_vjoy_dll_cache();
+        assert!(lock(&state.vjoy_dll_cache).probed_at.is_none());
+        let third = state.vjoy_status();
+        assert!(lock(&state.vjoy_dll_cache).probed_at.is_some());
+        assert_eq!(first.installed, third.installed);
+        assert_eq!(first.dll_path, third.dll_path);
+    }
+
+    #[test]
+    fn backend_switch_invalidates_the_vjoy_dll_probe() {
+        // R2-20: a backend-switch job re-probes on the next status
+        // read instead of trusting the cached probe.
+        let (state, _dir) = test_state();
+        let _ = state.vjoy_status();
+        assert!(lock(&state.vjoy_dll_cache).probed_at.is_some());
+        state
+            .set_output_backend("none")
+            .expect("none is selectable");
+        assert!(
+            lock(&state.vjoy_dll_cache).probed_at.is_none(),
+            "backend switch must clear the cached probe"
+        );
     }
 
     #[test]
