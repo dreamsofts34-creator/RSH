@@ -1473,6 +1473,29 @@ impl AppApi for IpcApi {
         }
     }
 
+    // R2-51: confirm a key replacement (WS-A server side) — NOT
+    // fire-and-forget like `begin_pairing`: the daemon returns the
+    // `PairingInfo` promptly, and the outcome arrives via
+    // `pairing_status()` polling + `PairingFinished`. Same call
+    // pattern as `reset_pairing` above.
+    fn confirm_pairing_replacement(&self) -> Result<PairingInfo, UserError> {
+        let got: Result<PairingInfo, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async("confirm_pairing_replacement", serde_json::json!({}))
+                .await?;
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
+        });
+        match got {
+            Ok(info) => {
+                // F5: the confirm changes the pairing state — pull
+                // the next slow cycle forward.
+                self.request_slow_refresh();
+                Ok(info)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
+    }
+
     /// Cached bindings list (F5): the slow poller refreshes it ~1 Hz,
     /// so this never touches the socket. No cache yet means an empty
     /// list (the display defaults stand).

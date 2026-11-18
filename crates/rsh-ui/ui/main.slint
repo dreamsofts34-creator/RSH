@@ -229,11 +229,21 @@ export component MainWindow inherits Window {
     in-out property <bool> setup-mode: false;
     in-out property <int> setup-step: 0; // A15: setup starts at Connect
     // Wizard live state (v2.0.1 hotfix): Rust drives these from the
-    // AppApi — connect-done from connection() Active, paired from
+    // AppApi — connect-done from the live connection's reachability
+    // (R2-19: Hello / Authenticating / Active — LinkUp alone does
+    // not prove the board is there), paired from
     // PairingFinished events, centre/pedals-done from the calibration
     // backend, pair countdown from PairingWindow events, ring arc
     // from seconds-left/total, drivers from vjoy_status().
     in-out property <bool> setup-connect-done: false;
+    // R2-19: why step 0 cannot advance (connection-error hint, or
+    // "RSH isn't running" while the daemon is down) — shown on the
+    // Connect step, which used to show no error at all.
+    in-out property <string> setup-connect-hint: "";
+    // R2-51: the board already has a stored key — the Pair step
+    // offers to replace it, naming the board MAC.
+    in-out property <bool> setup-replace-required: false;
+    in-out property <string> setup-replace-board-mac: "";
     in-out property <bool> setup-paired: false;
     in-out property <bool> setup-centre-done: false;
     in-out property <bool> setup-pedals-done: false;
@@ -389,6 +399,8 @@ export component MainWindow inherits Window {
     callback setup-use-usb();
     callback setup-retry-pairing();
     callback setup-reset-pairing();
+    callback setup-confirm-replace();
+    callback setup-cancel-replace();
     callback setup-connect(string);
     callback setup-calibrate(string);
     callback setup-find-games();
@@ -762,6 +774,7 @@ export component MainWindow inherits Window {
         busy-kind: busy-kind;
         rejoining: setup-rejoining;
         connect-done: setup-connect-done;
+        connect-hint: setup-connect-hint;
         paired: setup-paired;
         centre-done: setup-centre-done;
         pedals-done: setup-pedals-done;
@@ -772,6 +785,8 @@ export component MainWindow inherits Window {
         pair-error: setup-pair-error;
         pairing-active: setup-pairing-active;
         reset-required: setup-reset-required;
+        replace-required: setup-replace-required;
+        replace-board-mac: setup-replace-board-mac;
         transport: setup-transport;
         wifi-joined: setup-wifi-joined;
         usb-available: setup-usb-available;
@@ -796,6 +811,8 @@ export component MainWindow inherits Window {
         use-usb => { setup-use-usb(); }
         retry-pairing => { setup-retry-pairing(); }
         reset-pairing => { setup-reset-pairing(); }
+        confirm-replace => { setup-confirm-replace(); }
+        cancel-replace => { setup-cancel-replace(); }
         connect-action(a) => { setup-connect(a); }
         calibrate-action(a) => { setup-calibrate(a); }
         find-games => { setup-find-games(); }

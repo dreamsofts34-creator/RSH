@@ -97,6 +97,8 @@ export component SetupWizard inherits Rectangle {
     in-out property <int> step: 0;
     // Step 0 — Connect.
     in property <bool> connect-done: false;
+    // R2-19: why step 0 cannot advance ("" = no error to show).
+    in property <string> connect-hint: "";
     in property <bool> wifi-joined: false;
     in property <int> transport: 0; // 0 Wi-Fi, 1 USB
     in property <string> address: "—";
@@ -110,6 +112,11 @@ export component SetupWizard inherits Rectangle {
     in property <bool> usb-available: false;
     in property <bool> paired: false;
     in property <bool> reset-required: false;
+    // R2-51: the board already has a stored key — offer to replace
+    // it, naming the board MAC. Hidden while pairing runs / paired,
+    // and after Cancel until the wizard reopens.
+    in property <bool> replace-required: false;
+    in property <string> replace-board-mac: "";
     // DS-67: true while the board rejoins Wi-Fi with the new
     // password after a successful pairing.
     in property <bool> rejoining: false;
@@ -148,6 +155,8 @@ export component SetupWizard inherits Rectangle {
     callback use-usb();
     callback retry-pairing();
     callback reset-pairing();
+    callback confirm-replace();
+    callback cancel-replace();
     callback connect-action(string);
     callback calibrate-action(string);
     callback find-games();
@@ -289,6 +298,11 @@ export component SetupWizard inherits Rectangle {
                 // A3: no address is known until the wheel is really
                 // connected — "—" instead of the default address.
                 Text { text: "Wheel address: " + (connect-done ? address : "—"); font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
+                // R2-19: step 0 used to show no error at all — the
+                // pair-status text lived on step 2. The hint names
+                // the connection error (or the down daemon) so a
+                // stuck Connect step explains itself.
+                if connect-hint != "" : Text { text: connect-hint; font-size: 12.5px; color: Theme.bad; wrap: word-wrap; }
             }
 
             // ---- Step 1: Drivers (v2.0.1 hotfix) ----
@@ -418,6 +432,32 @@ export component SetupWizard inherits Rectangle {
                             // the old condition showed it exactly
                             // then and hid it when it was needed.
                             if pair-error != "" && !paired : Btn { label: "Retry"; disabled: busy-kind == 12; clicked => { retry-pairing(); } }
+                        }
+                    }
+                }
+                // R2-51: the wheel is already paired with a different
+                // key — replacing it needs the user's explicit
+                // confirmation, naming the board. Hidden while a
+                // pairing attempt runs, once paired, and after Cancel.
+                if replace-required && !pairing-active && !paired : Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel;
+                    VerticalLayout {
+                        padding-top: 16px;
+                        padding-bottom: 16px;
+                        padding-left: 24px;
+                        padding-right: 24px;
+                        spacing: 10px;
+                        Text { text: "This wheel is already paired with a different key — replace the pairing?"; font-size: 13.5px; font-weight: 600; color: Theme.text; wrap: word-wrap; }
+                        if replace-board-mac != "" : Text { text: "Wheel: " + replace-board-mac; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Btn { label: "Replace pairing"; primary: true; disabled: busy-kind == 12; clicked => { confirm-replace(); } }
+                            Btn { label: "Cancel"; disabled: busy-kind == 12; clicked => { cancel-replace(); } }
                         }
                     }
                 }
