@@ -361,9 +361,25 @@ impl ConnectionManager {
                 ManagerAction::None
             }
             ConnEvent::CapsOk => {
+                // R2-01 (wizard-pairing): a paired board resumes
+                // without ever opening a pairing window, so the
+                // daemon never feeds `HelloReceived` for it — the
+                // manager sits in `LinkUp` (where startup `Connect`
+                // left it) or in `Error` (a failed attempt whose
+                // forwarder then re-activated) when the session
+                // gate opens. `CapsOk` is only ever fed on the
+                // gate-open rising edge, and the gate only opens
+                // after a signed `GET_CAPS` passed
+                // (`activate_session_on`, `Ok(caps)` arm) — so
+                // accepting it from `LinkUp` / `Error` is still
+                // "Active only after authentication" (C-01/C-02),
+                // never a shortcut around it.
                 if matches!(
                     self.state,
-                    ConnectionState::Authenticating | ConnectionState::Hello
+                    ConnectionState::Authenticating
+                        | ConnectionState::Hello
+                        | ConnectionState::LinkUp
+                        | ConnectionState::Error { .. }
                 ) {
                     self.consecutive_failures = 0;
                     self.bad_tag_retried = false;
@@ -407,6 +423,30 @@ impl ConnectionManager {
                 if let ConnectionState::Backoff { attempt, .. } = self.state {
                     self.backoff_until = None;
                     self.consecutive_failures = attempt;
+                    self.transition(ConnectionState::LinkUp, now);
+                    return ManagerAction::RequestHello;
+                }
+                // R2-04: a generic failure lands in `Error` with
+                // a promised retry (`retry_in_ms: Some`) and an
+                // armed `backoff_until` — when the timer fires,
+                // the retry is the same re-activation as from
+                // `Backoff`: back to `LinkUp` + `RequestHello`.
+                // Without this arm the loop would deliver a no-op
+                // `RetryTimer` every 250 ms forever and the
+                // promised retry would never happen. The
+                // `retry_in_ms: None` states (user action,
+                // `AddrInUse`, watchdog latch) never arm the timer,
+                // so they never reach this branch.
+                // `consecutive_failures` is deliberately NOT reset
+                // here (unlike `Connect` / `UserRetry`): `fail()`
+                // already counted this failure, so the next
+                // failure backs off further (2 s → 30 s).
+                if let ConnectionState::Error {
+                    retry_in_ms: Some(_),
+                    ..
+                } = self.state
+                {
+                    self.backoff_until = None;
                     self.transition(ConnectionState::LinkUp, now);
                     return ManagerAction::RequestHello;
                 }
@@ -529,6 +569,12 @@ impl ConnectionManager {
         }
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         if reason.needs_user_action() {
+            // R2-04: clear a stale backoff left over from an
+            // earlier `BadTag` retry — without this, the
+            // manager loop's retry tick keeps delivering a
+            // no-op `RetryTimer` every 250 ms against a manager
+            // that is now latched in `Error` with no retry.
+            self.backoff_until = None;
             self.transition(
                 ConnectionState::Error {
                     reason,
@@ -542,7 +588,10 @@ impl ConnectionManager {
         // F21: `AddrInUse` never self-heals — stop here. No retry
         // timer is armed (`backoff_until` stays `None`), so the
         // driver's retry tick never re-fires `activate_session`
-        // into another doomed bind.
+        // into another doomed bind. The explicit clear also drops
+        // a stale backoff from an earlier `BadTag` retry (R2-04):
+        // without it the loop would keep delivering a no-op
+        // `RetryTimer` every 250 ms against this latched `Error`.
         if matches!(
             reason,
             ConnectionError::BindFailed(crate::errors::BindErrorKind::AddrInUse)
@@ -559,6 +608,12 @@ impl ConnectionManager {
             return ManagerAction::StateChanged;
         }
         let delay = Self::backoff_delay(self.consecutive_failures);
+        // R2-04: the `Error` above promises a retry in `delay`,
+        // so arm the timer the manager loop polls
+        // (`manager_retry_due_at`) — without this the retry tick
+        // never fires and the manager latches in `Error` with a
+        // `retry_in_ms` nobody honours.
+        self.backoff_until = Some(now + delay);
         self.transition(
             ConnectionState::Error {
                 reason,
@@ -744,6 +799,136 @@ mod tests {
             ConnectionManager::backoff_delay(99),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn caps_ok_from_link_up_reaches_active() {
+        // R2-01: a paired board resumes without ever opening a
+        // pairing window, so no `HelloReceived` is ever fed — the
+        // manager sits in `LinkUp` (where startup `Connect` left
+        // it) when the session gate opens and the daemon feeds
+        // `CapsOk`. The gate only opens after a signed `GET_CAPS`
+        // passed, so reaching `Active` from here is still
+        // "Active only after authentication".
+        let mut m = ConnectionManager::new();
+        let t = now();
+        m.on_event(ConnEvent::Connect, t);
+        assert!(matches!(m.state(), ConnectionState::LinkUp));
+        assert_eq!(
+            m.on_event(ConnEvent::CapsOk, t),
+            ManagerAction::StateChanged
+        );
+        assert!(m.state().is_active());
+    }
+
+    #[test]
+    fn caps_ok_from_error_reaches_active() {
+        // R2-01: same resume path, but a failed attempt latched
+        // the manager in `Error` first and the forwarder then
+        // re-activated successfully — the gate opening must still
+        // bring the manager to `Active` instead of stranding it.
+        let mut m = ConnectionManager::new();
+        let t = now();
+        m.on_event(ConnEvent::Connect, t);
+        let _ = m.on_event(ConnEvent::ActivationFailed(ConnectionError::Unreachable), t);
+        assert!(matches!(m.state(), ConnectionState::Error { .. }));
+        assert_eq!(
+            m.on_event(ConnEvent::CapsOk, t),
+            ManagerAction::StateChanged
+        );
+        assert!(m.state().is_active());
+    }
+
+    #[test]
+    fn generic_failure_arms_retry_timer_and_retries() {
+        // R2-04: a generic (retryable) failure promises a retry
+        // in `retry_in_ms` — the timer must actually be armed,
+        // and firing it must re-activate instead of no-op-ing.
+        let mut m = ConnectionManager::new();
+        let t = now();
+        m.on_event(ConnEvent::Connect, t);
+        let action = m.on_event(ConnEvent::ActivationFailed(ConnectionError::Unreachable), t);
+        assert_eq!(action, ManagerAction::StateChanged);
+        assert!(matches!(
+            m.state(),
+            ConnectionState::Error {
+                retry_in_ms: Some(2000),
+                ..
+            }
+        ));
+        assert_eq!(m.retry_due_at(), Some(t + Duration::from_secs(2)));
+        // Firing early is harmless (the daemon loop only fires
+        // at/after the deadline) but must not re-activate yet:
+        // the loop gates on the deadline, the manager on state.
+        assert_eq!(
+            m.on_event(ConnEvent::RetryTimer, t + Duration::from_secs(2)),
+            ManagerAction::RequestHello
+        );
+        assert!(matches!(m.state(), ConnectionState::LinkUp));
+        assert_eq!(m.retry_due_at(), None, "fired timer is disarmed");
+        // A second failure backs off further (2 s -> 4 s).
+        let _ = m.on_event(ConnEvent::ActivationFailed(ConnectionError::Unreachable), t);
+        assert!(matches!(
+            m.state(),
+            ConnectionState::Error {
+                retry_in_ms: Some(4000),
+                ..
+            }
+        ));
+        assert_eq!(m.retry_due_at(), Some(t + Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn retry_timer_is_noop_for_user_action_error() {
+        // R2-04: `retry_in_ms: None` states never arm the timer,
+        // so a stray `RetryTimer` must not re-activate them.
+        let mut m = ConnectionManager::new();
+        let t = now();
+        m.on_event(ConnEvent::Connect, t);
+        let _ = m.on_event(
+            ConnEvent::ActivationFailed(ConnectionError::StoredKeyExists),
+            t,
+        );
+        assert_eq!(m.retry_due_at(), None);
+        assert_eq!(m.on_event(ConnEvent::RetryTimer, t), ManagerAction::None);
+        assert!(matches!(
+            m.state(),
+            ConnectionState::Error {
+                reason: ConnectionError::StoredKeyExists,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn user_action_and_addr_in_use_failures_clear_stale_backoff() {
+        // R2-04: a `BadTag` backoff arms `backoff_until`; if the
+        // next failure is a latch (user action / `AddrInUse`), the
+        // stale deadline must be cleared — otherwise the manager
+        // loop delivers a no-op `RetryTimer` every 250 ms against
+        // a latched `Error` forever.
+        for reason in [
+            ConnectionError::StoredKeyExists,
+            ConnectionError::BindFailed(crate::errors::BindErrorKind::AddrInUse),
+        ] {
+            let mut m = ConnectionManager::new();
+            let t = now();
+            m.on_event(ConnEvent::Connect, t);
+            // Spend the one BadTag retry: Backoff + armed timer.
+            assert_eq!(
+                m.on_event(ConnEvent::ActivationFailed(ConnectionError::BadTag), t),
+                ManagerAction::Reactivate
+            );
+            assert!(m.retry_due_at().is_some());
+            // The latch failure arrives while still backing off.
+            let _ = m.on_event(ConnEvent::ActivationFailed(reason), t);
+            assert!(matches!(m.state(), ConnectionState::Error { .. }));
+            assert_eq!(
+                m.retry_due_at(),
+                None,
+                "stale BadTag backoff must be cleared by {reason:?}"
+            );
+        }
     }
 
     #[test]

@@ -107,7 +107,7 @@ pub struct IpcRequest {
     /// `install_vjoy`, `diag_stats`, `raw_mv`, `capture_centre`,
     /// `capture_pedal_min`, `capture_pedal_max`, `list_bindings`,
     /// `set_binding`, `clear_binding`, `reset_pairing`,
-    /// `firmware_check`, `update_firmware`,
+    /// `confirm_pairing_replacement`, `firmware_check`, `update_firmware`,
     /// `firmware_update_status`, `board_address`,
     /// `set_board_address`, `module_enabled`, `set_module_enabled`,
     /// `auto_pause`, `set_auto_pause`, `close_to_tray`,
@@ -463,8 +463,9 @@ fn detailed_api_error(error: &rsh_api::UserError) -> IpcError {
 /// Dispatch the v2.0.2 Round 3 methods. Split out of [`dispatch`]
 /// so neither function trips `too_many_lines`.
 ///
-/// Wire shapes: `reset_pairing` → the pairing status;
-/// `firmware_check` → the [`FirmwareCheck`](rsh_api::FirmwareCheck);
+/// Wire shapes: `reset_pairing` / `confirm_pairing_replacement` →
+/// the pairing status; `firmware_check` → the
+/// [`FirmwareCheck`](rsh_api::FirmwareCheck);
 /// `update_firmware` starts the flash and returns the running
 /// status; `firmware_update_status` polls it; `board_address` →
 /// `{"address"}`; `set_board_address` takes `{"address"}`;
@@ -485,6 +486,12 @@ fn dispatch_round3(
     match request.method.as_str() {
         "reset_pairing" => api
             .reset_pairing()
+            .map(|info| serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
+            .map_err(|error| detailed_api_error(&error)),
+        // R2-51: confirm a key replacement (StoredKeyExists) — same
+        // shape as `reset_pairing`: no params, returns PairingInfo.
+        "confirm_pairing_replacement" => api
+            .confirm_pairing_replacement()
             .map(|info| serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
             .map_err(|error| detailed_api_error(&error)),
         "firmware_check" => api

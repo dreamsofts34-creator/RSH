@@ -573,6 +573,28 @@ pub trait AppApi: Send + Sync {
         ))
     }
 
+    /// Confirm a key replacement (R2-51, M-7): the board already
+    /// has a stored key (`PairingInfo::replacement_required`), so
+    /// the user confirmed — in the dialog naming the board MAC
+    /// from `pairing_status().board_mac` — that the new key may
+    /// replace it. Arms the one-time replacement flag and triggers
+    /// a fresh activation attempt; the attempt itself runs
+    /// asynchronously in the forwarder, so this returns promptly
+    /// and the UI polls `pairing_status()` for the outcome (same
+    /// shape as [`AppApi::begin_pairing`]). Default: error — only
+    /// the daemon confirms a replacement.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when no replacement is currently required or
+    /// the activation attempt cannot start.
+    fn confirm_pairing_replacement(&self) -> Result<PairingInfo, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "pairing replacement confirmation is not supported by this API",
+        ))
+    }
+
     /// Latest live snapshot (steering / pedals).
     fn snapshot(&self) -> SnapshotInfo;
 
