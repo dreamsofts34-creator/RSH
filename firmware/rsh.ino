@@ -215,6 +215,37 @@ static void fw34_boot_setup() {
   cfgPref.end();
 }
 
+// R2-47 (DS-75): key-reset-expiry diag event RAM ring mein record karne
+// ke baad ESP.restart() use mita deta tha — event kabhi diagnostics mein
+// nazar nahi aata tha. Is liye reboot se PEHLE ek pending-flag NVS
+// ("rsh-boot" namespace, key "krExp") mein likho; agle boot par setup()
+// flag dekh kar event dobara ring mein record karta hai aur flag saaf
+// karta hai. Sirf ye ek event persist hota hai — poora ring NVS mein
+// nahi (flash wear + boot-time cost); flag 1 byte hai.
+static void rsh_key_reset_expiry_persist_() {
+  Preferences pref;
+  if (pref.begin("rsh-boot", false)) {
+    pref.putUChar("krExp", 1);
+    pref.end();
+  }
+  // begin fail ho to bhi restart hota hai — event is boot par kho jata
+  // hai (purana behaviour), lekin board kabhi atak ta nahi.
+}
+
+// Pichle boot ki key-reset expiry (agar flag set ho) is boot ke ring mein
+// sab se pehle record karo (BOOT event se pehle — oldest-first order mein
+// expiry reboot se pehle dikhe), phir flag saaf karo.
+static void rsh_key_reset_expiry_replay_() {
+  Preferences pref;
+  if (!pref.begin("rsh-boot", false)) return;
+  uint8_t pending = pref.getUChar("krExp", 0);
+  if (pending) {
+    rsh_diag_record(rsh_diag_log(), RSH_DIAG_KEY_RESET_EXPIRED, 0, millis());
+    pref.putUChar("krExp", 0);
+  }
+  pref.end();
+}
+
 // Har loop mein: BOOT-hold sample karo, boot deadline + confirm deadline
 // tick karo. Net down ho tab bhi chalta hai (is liye !netOk branch se pehle).
 static void fw34_loop_tick(uint32_t nowMs) {
@@ -241,10 +272,13 @@ static void fw34_loop_tick(uint32_t nowMs) {
     rsh_diag_record_global(RSH_DIAG_KEY_RESET_ARMED, 0, nowMs);
   }
   if (rsh_safe_mode_tick(&safeMode, nowMs)) {
-    // DS-75: key-reset-armed expiry reboot se PEHLE diag event — warna
-    // board 120 s baad "bina wajah" reboot hota aur ring mein koi nishan
-    // nahi rehta.
+    // DS-75 / R2-47: key-reset-armed expiry reboot se PEHLE diag event —
+    // warna board 120 s baad "bina wajah" reboot hota aur ring mein koi
+    // nishan nahi rehta. RAM event ke saath NVS pending-flag bhi likho:
+    // reboot ring mita deta hai, flag nahi — agle boot par setup() event
+    // dobara record karta hai (rsh_key_reset_expiry_replay_).
     rsh_diag_record_global(RSH_DIAG_KEY_RESET_EXPIRED, 0, nowMs);
+    rsh_key_reset_expiry_persist_();
     ESP.restart();  // armed window khatam
   }
   rsh_boot_tick_t bt = rsh_boot_tick(&bootCounter, netOk ? 1 : 0, nowMs, bootStartMs);
@@ -518,6 +552,9 @@ static void sample_task_start_() {
 
 void setup() {
   rsh_diag_init(rsh_diag_log());  // F-10: ring log tayyar (heap_min 0xFFFF se)
+  // R2-47: pichle boot ki key-reset expiry (NVS flag "krExp") ring mein
+  // wapas — BOOT event se pehle, taake oldest-first order barqarar rahe.
+  rsh_key_reset_expiry_replay_();
 #if RSH_WIRED_SERIAL
   serial_link_begin();  // Serial = wired transport (921600) — debug prints band
 #elif RSH_DEBUG
@@ -545,8 +582,14 @@ void setup() {
   // ko pehle se subscribe karta hai (ESP_ERR_INVALID_STATE = pehle se
   // watched, theek hai); ESP_OK = abhi subscribe hua; baqi = fail.
   // Feed loop() ke shuru mein hota hai (har iteration, har early-return
-  // path se pehle). Timeout Arduino-core default hai (shipped esp32dev
-  // build mein sdkconfig flags laagu nahi hote — DS-64 note).
+  // path se pehle). Timeout Arduino-core default hai — shipped esp32dev
+  // build mein platformio.ini ke sdkconfig flags laagu nahi hote (pre-
+  // compiled IDF), lekin core ki shipped sdkconfig mein
+  // CONFIG_ESP_TASK_WDT_TIMEOUT_S=5, PANIC=y hai; R2-48 check
+  // (firmware/tools/check-wdt-config.sh, CI firmware job) is value ko
+  // har build par assert karta hai — platform bump par dobara verify
+  // karna hoga. Board par WDT ka asal fire hona is check se prove
+  // nahi hota (board test chahiye).
   {
     esp_err_t wdtErr = esp_task_wdt_add(NULL);
     uint16_t wdtVal = (wdtErr == ESP_OK)               ? 0
