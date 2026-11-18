@@ -439,6 +439,13 @@ impl SerialTransport {
         self.hello_rx.recv()
     }
 
+    /// Non-blocking drain of one queued HELLO reply (R2-07): the
+    /// forwarder's frame loop drains this after every stream frame
+    /// so a pairing window opened after activation is still observed.
+    pub fn try_next_hello(&mut self) -> Option<HelloReply> {
+        self.hello_rx.try_recv().ok()
+    }
+
     /// Await the next status packet. Returns [`None`] once the
     /// transport is shut down.
     pub fn next_status(&mut self) -> impl Future<Output = Option<StatusPacket>> + Send {

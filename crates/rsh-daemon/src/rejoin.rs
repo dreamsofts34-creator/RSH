@@ -261,6 +261,10 @@ fn run_command_timeout(
 #[cfg(target_os = "windows")]
 fn rejoin_wifi_windows(ssid: &str, password: &str) -> Result<(), RejoinError> {
     use std::io::Write as _;
+    // R2-03 (S-05): `CommandExt` for the CREATE_NO_WINDOW flags on
+    // the `netsh` helpers below.
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
 
     // DS-45: unique temp path + Drop guard — the old fixed path
     // collided between processes and left the password on disk if
@@ -285,6 +289,9 @@ fn rejoin_wifi_windows(ssid: &str, password: &str) -> Result<(), RejoinError> {
     // whole rejoin runs off the manager loop (see main.rs), so a
     // hung Wi-Fi stack stalls nothing.
     let mut add_cmd = std::process::Command::new("netsh");
+    // R2-03 (S-05): no console window for the `netsh` helper.
+    #[cfg(windows)]
+    add_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     add_cmd.args([
         "wlan",
         "add",
@@ -300,6 +307,9 @@ fn rejoin_wifi_windows(ssid: &str, password: &str) -> Result<(), RejoinError> {
         });
     }
     let mut connect_cmd = std::process::Command::new("netsh");
+    // R2-03 (S-05): no console window for the `netsh` helper.
+    #[cfg(windows)]
+    connect_cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     connect_cmd.args(["wlan", "connect", &format!("name={ssid}")]);
     let connect = run_command_timeout(&mut connect_cmd, NETSH_TIMEOUT, "connect")?;
     if !connect.status.success() {

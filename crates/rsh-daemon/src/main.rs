@@ -390,8 +390,12 @@ async fn manager_loop(
         // pairing window is open — it is cleared on activation — and
         // rejoin the board AP once when the session reaches Active.
         // The password never reaches a log line (see rejoin.rs).
-        if window_open && let Some(password) = api.state.pairing_status_peek().password {
-            pending_rejoin_password = Some(password);
+        // R2-27: the manager stash is the single consumer of the
+        // rejoin password — `take_rejoin_password` reads the
+        // dedicated stash, so the UI's `pairing_status()` poll
+        // can never starve the rejoin.
+        if window_open && pending_rejoin_password.is_none() {
+            pending_rejoin_password = api.state.take_rejoin_password();
         }
         let active_now = api.manager_state().is_active();
         if active_now && !last_active {
@@ -699,6 +703,13 @@ fn pipe_in_use_backoff(failures: u32) -> Duration {
 /// a silent IPC-dead loop.
 const IN_USE_FATAL_AFTER: Duration = Duration::from_secs(90);
 
+/// Restarts of the manager loop the watchdog (R2-24) performs
+/// before giving up: a loop that panics deterministically is
+/// restarted at most this many times (with backoff), then the
+/// watchdog logs a fatal and stops — a visible fatal, not a hot
+/// respawn loop.
+const MANAGER_LOOP_MAX_RESTARTS: u32 = 5;
+
 /// Outcome of recording one IPC bind/create failure (F1/F2).
 enum IpcBindRetry {
     /// Try again after this delay.
@@ -755,6 +766,13 @@ impl IpcBindTracker {
             }
             return IpcBindRetry::RetryAfter(pipe_in_use_backoff(self.in_use_failures));
         }
+        // R2-50 (DS-14 gap): a non-in-use failure breaks the
+        // in-use run, so it resets `in_use_since` (and the run's
+        // count) — otherwise an interleaved non-in-use failure
+        // left a stale start time and a mixed failure pattern could
+        // trip the 90 s fatal early.
+        self.in_use_failures = 0;
+        self.in_use_since = None;
         self.failures += 1;
         if self.failures >= 5 {
             IpcBindRetry::Fatal
@@ -1305,6 +1323,10 @@ fn main() {
         }
     };
     let api = DaemonApi::new(Arc::clone(&state));
+    // R2-25: the background board-port refresher fills the cached
+    // USB port every 5 s, so `transport_state()` on the poll path
+    // never probes inline.
+    state.start_board_port_refresher();
     // BACKEND-2 migration: log the persisted-backend note (if any)
     // so a HIDMaestro→vJoy switch is visible in the startup log.
     if let Some(note) = state.backend_migration_note() {
@@ -1355,7 +1377,7 @@ fn main() {
     // handle in the headless park loop and restarts the loop (and
     // logs fatally after the event loop) when it ends without a
     // shutdown request.
-    let spawn_manager_loop = {
+    let spawn_manager_loop = std::sync::Arc::new({
         let api = Arc::clone(&api);
         let tray_actions = Arc::clone(&tray_actions);
         let shutdown = Arc::clone(&shutdown);
@@ -1373,8 +1395,62 @@ fn main() {
                 manager_loop(api, event_tx, tray_actions, shutdown, verbose).await;
             })
         }
+    });
+    // The manager-loop handle lives in a shared slot so the
+    // watchdog thread below (R2-24) and `main` both see it.
+    let manager_slot: Arc<Mutex<tokio::task::JoinHandle<()>>> =
+        Arc::new(Mutex::new(spawn_manager_loop()));
+    // R2-24: watch the manager-loop handle on EVERY path, not just
+    // headless (DS-02 defence-in-depth). The tray path used to block
+    // in `slint::run_event_loop()` and never poll the handle again,
+    // so a panicking loop left the daemon half-alive with no
+    // watchdog, no retries, no pairing events. A small watchdog
+    // thread polls the shared slot every 250 ms and restarts the
+    // loop when it ends without a shutdown request, with backoff
+    // (1 s, doubling to 30 s) and a restart budget of
+    // `MANAGER_LOOP_MAX_RESTARTS`: a deterministically panicking
+    // loop becomes a visible fatal (dual-location log) instead of a
+    // hot respawn loop.
+    let _manager_watchdog = {
+        let slot = Arc::clone(&manager_slot);
+        let spawn_loop = Arc::clone(&spawn_manager_loop);
+        let shutdown = Arc::clone(&shutdown);
+        std::thread::Builder::new()
+            .name("rsh-manager-watchdog".to_string())
+            .spawn(move || {
+                let mut restarts = 0_u32;
+                let mut backoff = Duration::from_secs(1);
+                loop {
+                    std::thread::sleep(Duration::from_millis(250));
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let finished = slot.lock().is_ok_and(|handle| handle.is_finished());
+                    if !finished {
+                        continue;
+                    }
+                    if restarts >= MANAGER_LOOP_MAX_RESTARTS {
+                        let _ = log_fatal(
+                            "daemon: manager loop ended repeatedly — restart budget exhausted, leaving it stopped",
+                        );
+                        return;
+                    }
+                    restarts += 1;
+                    if restarts > 1 {
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                    }
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let _ = log_fatal("daemon: manager loop ended unexpectedly — restarting it");
+                    log_line(verbose, "daemon: manager loop ended unexpectedly — restarting it");
+                    if let Ok(mut slot) = slot.lock() {
+                        *slot = spawn_loop();
+                    }
+                }
+            })
     };
-    let mut manager_handle = spawn_manager_loop();
 
     // Engine + transport (unless --no-connect): the daemon owns the
     // engine from startup, like the Tauri shell did.
@@ -1579,18 +1655,9 @@ fn main() {
         // (Ctrl-C / SIGTERM end the process; the pid file is
         // reclaimed by the next launch's /proc check.)
         //
-        // DS-02: watch the manager-loop handle while parked — a
-        // loop that ends without a shutdown request (panic) is
-        // restarted here instead of leaving the daemon half-alive.
+        // R2-24: the manager-watchdog thread (above) owns loop
+        // restarts now — this branch only parks until shutdown.
         while !shutdown.load(Ordering::Relaxed) {
-            if manager_handle.is_finished() {
-                let _ = log_fatal("daemon: manager loop ended unexpectedly — restarting it");
-                log_line(
-                    verbose,
-                    "daemon: manager loop ended unexpectedly — restarting it",
-                );
-                manager_handle = spawn_manager_loop();
-            }
             std::thread::sleep(Duration::from_millis(250));
         }
     }
@@ -1603,7 +1670,8 @@ fn main() {
     // was running — and no shutdown was requested (tray Quit sets
     // shutdown first, so a loop ended by Quit is normal) — that is
     // a fatal trace: the loop never ends on its own otherwise.
-    if !shutdown.load(Ordering::Relaxed) && manager_handle.is_finished() {
+    let manager_finished = manager_slot.lock().is_ok_and(|handle| handle.is_finished());
+    if !shutdown.load(Ordering::Relaxed) && manager_finished {
         let _ = log_fatal("daemon: manager loop ended unexpectedly before shutdown");
         log_line(
             verbose,
@@ -2241,6 +2309,41 @@ mod tests {
             ));
         }
         assert!(matches!(tracker.record_failure(false), IpcBindRetry::Fatal));
+    }
+
+    #[test]
+    fn non_in_use_failure_resets_in_use_clock() {
+        // R2-50: an interleaved non-in-use failure breaks the
+        // in-use run — the stale start time must not make a later
+        // in-use run trip the 90 s fatal early.
+        let mut tracker = IpcBindTracker::new();
+        tracker.record_failure(true);
+        tracker.in_use_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(89))
+                .expect("test clock is past boot + 89 s"),
+        );
+        // A non-in-use failure in between resets the clock…
+        assert!(matches!(
+            tracker.record_failure(false),
+            IpcBindRetry::RetryAfter(_)
+        ));
+        assert!(tracker.in_use_since.is_none());
+        assert_eq!(tracker.in_use_failures, 0);
+        // …so a fresh in-use run gets its own full ~90 s.
+        assert!(matches!(
+            tracker.record_failure(true),
+            IpcBindRetry::RetryAfter(_)
+        ));
+        tracker.in_use_since = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(89))
+                .expect("test clock is past boot + 89 s"),
+        );
+        assert!(
+            matches!(tracker.record_failure(true), IpcBindRetry::RetryAfter(_)),
+            "89 s of the NEW in-use run still retries"
+        );
     }
 
     #[test]

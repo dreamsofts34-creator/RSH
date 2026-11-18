@@ -202,7 +202,9 @@ use rsh_transport::ControlTransport;
 use rsh_transport::config::{ConfigState, ConfigTransaction, ConfigTxnSnapshot};
 use rsh_transport::discovery::{DEFAULT_BOARD_IP, Discovery};
 use rsh_transport::port_conflict::{PortHolder, diagnose_udp_port_holder};
-use rsh_transport::serial::{SerialConfig, SerialTransport, detect_board_port};
+use rsh_transport::serial::{
+    SerialConfig, SerialTransport, detect_board_port, detect_board_port_metadata_only,
+};
 use rsh_transport::session::{BoardSession, KeyStoreLike, SessionError};
 use rsh_transport::udp::{UdpBindError, UdpConfig, UdpTransport};
 use serde::{Deserialize, Serialize};
@@ -758,7 +760,18 @@ pub struct AppStateCore {
     /// call fills this cache; later calls reuse it for up to
     /// `BOARD_PORT_CACHE_TTL`, then re-detect. A disconnect or a
     /// transport change clears it so the next poll re-detects.
+    ///
+    /// R2-25: the cache is now filled ONLY by the background
+    /// refresher thread ([`AppStateCore::start_board_port_refresher`])
+    /// — `cached_board_port()` is a pure last-known read and never
+    /// probes inline, so `transport_state()` on the poll path can
+    /// never stall on port enumeration.
     cached_serial_port: Mutex<Option<(Option<String>, Instant)>>,
+    /// Whether the background board-port refresher thread (R2-25)
+    /// is already running: `start_board_port_refresher` is
+    /// idempotent, so a second start (e.g. from `connect_transport`)
+    /// never spawns a duplicate thread.
+    board_port_refresher_started: AtomicBool,
     /// Queued button-press edges, drained by the emitter.
     button_events: Mutex<VecDeque<ButtonPressEvent>>,
     /// Profile + settings store.
@@ -802,6 +815,13 @@ pub struct AppStateCore {
     /// 32`), for app-action edge detection in
     /// [`AppStateCore::apply_bindings`].
     last_bound_pressed: Mutex<u64>,
+    /// Last encoder-button bits seen (`encoder_buttons.0`, bits
+    /// 0–7 = virtual buttons 65–72), for app-action edge detection
+    /// in [`AppStateCore::apply_bindings`] (R2-08): the engine
+    /// repeats `last_output` on ticks with no new frame, so a
+    /// momentary encoder pulse would otherwise re-fire its app
+    /// action on every tick until the next frame recomputes it.
+    last_bound_encoder: Mutex<u8>,
     /// Queued app actions from bound button presses, drained by the
     /// daemon manager loop ([`AppStateCore::drain_binding_actions`]).
     binding_actions: Mutex<VecDeque<BindingAppAction>>,
@@ -937,6 +957,15 @@ pub struct AppStateCore {
     /// sets this; later reads return `None` until a new `HELLO`
     /// discloses a fresh one.
     password_consumed: Mutex<bool>,
+    /// The one-time pairing password stashed for the post-pairing
+    /// Wi-Fi rejoin (R2-27): filled by `note_observed_hello` from
+    /// every HELLO that discloses a password, independently of
+    /// `password_consumed` — the UI's `pairing_status()` read must
+    /// never starve the daemon's rejoin. The manager loop is the
+    /// single owner: it takes this once
+    /// ([`AppStateCore::take_rejoin_password`]) and hands it to the
+    /// rejoin step; cleared on disconnect / session clear.
+    pending_rejoin_password: Mutex<Option<ZeroizingString>>,
     /// Board IP the live session authenticated against (M-1):
     /// `upload_firmware`'s HTTP leg is bound to this IP, never to a
     /// stale settings value.
@@ -947,6 +976,21 @@ pub struct AppStateCore {
     /// error read this — the UI matches on it instead of parsing a
     /// string (Phase 0 gate §4.3).
     session_last_error_typed: Mutex<Option<ConnectionError>>,
+    /// The last *control-session* failure (R2-05): a failed LED
+    /// test / config / firmware step under a transient control
+    /// session. Deliberately separate from
+    /// [`Self::session_last_error_typed`] — a control op failing
+    /// while the board streams must never knock the live session's
+    /// manager state into `Error`. Read via
+    /// [`AppStateCore::control_last_error`]; the IPC caller of the
+    /// failed op still gets the error directly as its reply.
+    control_last_error: Mutex<Option<String>>,
+    /// Whether a forwarder activation exchange (flag-1 HELO →
+    /// signed `GET_CAPS`) is currently in flight (R2-28): set by
+    /// `activate_session_on`, cleared on every exit path. While set,
+    /// [`AppStateCore::activate_session`] no-ops instead of aborting
+    /// the forwarder mid-activation via `connect_transport`.
+    activation_in_flight: AtomicBool,
     /// Pairing/connection log lines (Phase 0 gate §6): the redacted,
     /// timestamped trail of pairing attempts — one line per
     /// transition, never per poll. The daemon drains this into the
@@ -1069,6 +1113,7 @@ impl AppStateCore {
             connection: Mutex::new(ConnectionState::Disconnected),
             transport_choice: Mutex::new((TransportKind::Udp, esp_ip)),
             cached_serial_port: Mutex::new(None),
+            board_port_refresher_started: AtomicBool::new(false),
             button_events: Mutex::new(VecDeque::new()),
             store: Mutex::new(store),
             settings_cache: Mutex::new(settings_cache),
@@ -1081,6 +1126,7 @@ impl AppStateCore {
             bindings: Mutex::new(bindings),
             binding_load_warnings,
             last_bound_pressed: Mutex::new(0),
+            last_bound_encoder: Mutex::new(0),
             binding_actions: Mutex::new(VecDeque::new()),
             stop_handle: Mutex::new(None),
             engine_status: Mutex::new(EngineTaskStatus::Idle),
@@ -1113,8 +1159,11 @@ impl AppStateCore {
             pairing_replacement_allowed: Mutex::new(false),
             replacement_required: Mutex::new(None),
             password_consumed: Mutex::new(false),
+            pending_rejoin_password: Mutex::new(None),
             session_board_ip: Mutex::new(None),
             session_last_error_typed: Mutex::new(None),
+            control_last_error: Mutex::new(None),
+            activation_in_flight: AtomicBool::new(false),
             pairing_log: Mutex::new(VecDeque::new()),
             window_open_logged: Mutex::new(false),
             window_expiry_logged: Mutex::new(false),
@@ -1454,11 +1503,6 @@ impl AppStateCore {
     /// pairing status reports, plus the engine detail (frames stay
     /// held until a session authenticates). The gate is left exactly
     /// as it was — a failed `GET_CAPS` never opens it.
-    fn note_session_error(&self, reason: &str) {
-        let typed = Self::classify_error_message(reason);
-        self.note_session_error_typed(typed, reason);
-    }
-
     /// Record a failed activation with its typed reason (Phase 2):
     /// sets both the string and the typed records, the engine
     /// detail, and the Phase 0 gate §6.2 format-6 failure line
@@ -1477,6 +1521,27 @@ impl AppStateCore {
         self.note_engine_detail(format!(
             "{reason} — stream frames held until a session authenticates (SEC-E-14)"
         ));
+    }
+
+    /// Records a failed *control* operation (R2-05): a transient
+    /// control session's failure (LED test, config, firmware step,
+    /// restart) goes here — never into
+    /// [`Self::note_session_error`]. The manager loop feeds only
+    /// `session_last_error_typed` as `ActivationFailed`, so a
+    /// control failure can no longer knock a live, streaming session
+    /// into `Error`. The pairing log still carries the failure (with
+    /// its own prefix, so it cannot be mistaken for an activation
+    /// failure), and the IPC caller gets the error as its reply.
+    fn note_control_error(&self, reason: &str) {
+        *lock(&self.control_last_error) = Some(reason.to_string());
+        self.push_pairing_log("ERROR", &format!("control op failed: {reason}"));
+    }
+
+    /// The last control-session failure, if any (R2-05) — for
+    /// diagnostics; the pairing status never reads this.
+    #[must_use]
+    pub fn control_last_error(&self) -> Option<String> {
+        lock(&self.control_last_error).clone()
     }
 
     /// Records one `HELLO` as observed by the activator: the pairing
@@ -1508,6 +1573,15 @@ impl AppStateCore {
             password: hello.wifi_password_str().map(ZeroizingString::new),
             observed_at: Instant::now(),
         });
+        // R2-27: stash a copy of the disclosed password for the
+        // post-pairing Wi-Fi rejoin, owned by the manager loop —
+        // independent of `password_consumed`, so the UI's first
+        // `pairing_status()` read can never starve the rejoin.
+        // The manager takes it once via `take_rejoin_password`;
+        // `clear_session_records` drops it on disconnect.
+        if let Some(password) = hello.wifi_password_str() {
+            *lock(&self.pending_rejoin_password) = Some(ZeroizingString::new(password));
+        }
         // A fresh HELLO discloses a fresh password: re-arm single-use.
         *lock(&self.password_consumed) = false;
         // Phase 0 gate §6.2 format 3 (HELLO received — booleans only,
@@ -1559,6 +1633,7 @@ impl AppStateCore {
         *lock(&self.session_last_hello) = None;
         *lock(&self.session_last_error) = None;
         *lock(&self.session_last_error_typed) = None;
+        *lock(&self.pending_rejoin_password) = None;
         *lock(&self.replacement_required) = None;
         *lock(&self.session_board_ip) = None;
         *lock(&self.window_open_logged) = false;
@@ -1656,6 +1731,21 @@ impl AppStateCore {
         }
     }
 
+    /// Takes the stashed post-pairing Wi-Fi password for the rejoin
+    /// step (R2-27): the manager loop is the single owner/consumer
+    /// of this stash. Taking it here does NOT consume the UI's
+    /// one-time disclosure (`password_consumed` is untouched), and
+    /// the UI's `pairing_status()` read does NOT consume this stash
+    /// — the two consumers can no longer race each other. Returns
+    /// [`None`] when no password was stashed (no window, or the
+    /// stash was already taken / cleared on disconnect).
+    #[must_use]
+    pub fn take_rejoin_password(&self) -> Option<String> {
+        lock(&self.pending_rejoin_password)
+            .take()
+            .map(|password| password.as_str().to_string())
+    }
+
     /// Live button bitmask (H10, v2.0.2): the raw combined mask
     /// (`buttons | buttons_ex << 32`) from the last button edge
     /// frame — bit `n - 1` is wheel button `n` (1–64). `0` = none
@@ -1698,11 +1788,26 @@ impl AppStateCore {
     /// `session_active` turns true only once a signed `GET_CAPS`
     /// succeeds.
     ///
+    /// R2-28: this no-ops (returns the current state) when the
+    /// session gate is already open — a live session needs no
+    /// re-activation — and when a forwarder activation is already
+    /// in flight. Without the second guard, a manager `RetryTimer`
+    /// firing mid-activation tore the forwarder down through
+    /// `connect_transport` (supervisor abort + respawn) and
+    /// restarted the HELO → signed `GET_CAPS` exchange from
+    /// scratch, wasting attempts and risking a board-side `BadTag`
+    /// ("wheel busy"). The forwarder owns its own retry timing
+    /// while its activation runs; the manager's timer only matters
+    /// once that attempt has finished.
+    ///
     /// # Errors
     ///
     /// Returns a message when no transport can be (re)connected (for
     /// example no serial board port is detected).
     pub fn activate_session(self: &Arc<Self>) -> Result<TransportState, String> {
+        if self.session_gate_open() || self.activation_in_flight.load(Ordering::SeqCst) {
+            return Ok(self.transport_state());
+        }
         let (kind, _) = self.transport_request();
         self.connect_transport(kind)?;
         Ok(self.transport_state())
@@ -2572,24 +2677,54 @@ impl AppStateCore {
     /// more often than this.
     const BOARD_PORT_CACHE_TTL: Duration = Duration::from_secs(5);
 
-    /// Cached USB board port (DS-27): the first call detects (port
-    /// enumeration + up to 500 ms HELO probe per port) and caches the
-    /// result; later calls return the cached value until the TTL
-    /// lapses. Detection runs without holding the cache lock.
+    /// Cached USB board port (R2-25): a pure last-known read — it
+    /// NEVER probes. The background refresher thread (see
+    /// [`Self::start_board_port_refresher`]) fills this cache every
+    /// [`Self::BOARD_PORT_CACHE_TTL`]; `transport_state()` on the
+    /// 20 Hz poll path reads it without ever enumerating ports or
+    /// waiting out a 500 ms HELO probe per candidate. [`None`] until
+    /// the first refresh (or after [`Self::rescan_board_port`]).
     #[must_use]
     pub fn cached_board_port(&self) -> Option<String> {
-        if let Some((port, at)) = lock(&self.cached_serial_port).clone()
-            && at.elapsed() < Self::BOARD_PORT_CACHE_TTL
-        {
-            return port;
-        }
-        let port = detect_board_port();
-        *lock(&self.cached_serial_port) = Some((port.clone(), Instant::now()));
-        port
+        lock(&self.cached_serial_port)
+            .clone()
+            .and_then(|(port, _)| port)
     }
 
-    /// Clears the cached board port so the next poll re-detects
-    /// (DS-27): call after a disconnect or a transport change.
+    /// Starts the background board-port refresher thread (R2-25):
+    /// it probes (`detect_board_port`, full enumeration + HELO
+    /// probe) on a detached thread every
+    /// [`Self::BOARD_PORT_CACHE_TTL`] and stores the result in the
+    /// cache — the poll path never probes. Idempotent: a second
+    /// call is a no-op. The thread holds only a `Weak` reference
+    /// and exits when the state is dropped.
+    pub fn start_board_port_refresher(self: &Arc<Self>) {
+        if self
+            .board_port_refresher_started
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let _ = std::thread::Builder::new()
+            .name("rsh-board-port-refresh".to_string())
+            .spawn(move || {
+                loop {
+                    let Some(state) = weak.upgrade() else {
+                        return;
+                    };
+                    let port = detect_board_port();
+                    *lock(&state.cached_serial_port) = Some((port, Instant::now()));
+                    drop(state);
+                    std::thread::sleep(Self::BOARD_PORT_CACHE_TTL);
+                }
+            });
+    }
+
+    /// Clears the cached board port so the next background refresh
+    /// re-detects (R2-25): call after a disconnect or a transport
+    /// change. Clearing only drops the last-known value — it never
+    /// probes inline.
     pub fn rescan_board_port(&self) {
         *lock(&self.cached_serial_port) = None;
     }
@@ -2730,8 +2865,11 @@ impl AppStateCore {
     /// * App action: on a press *edge* only (a held button must not
     ///   repeat at 200 Hz), the action is queued for the daemon
     ///   manager loop ([`AppStateCore::drain_binding_actions`]); the
-    ///   output is untouched. Encoder pulses (65–72) are momentary
-    ///   by construction, so every pulse is an edge.
+    ///   output is untouched. Encoder pulses (65–72) are edge-detected
+    ///   against the previous tick's encoder bits (R2-08) — the
+    ///   engine repeats `last_output` on ticks with no new frame, so
+    ///   a momentary pulse repeated across ticks is one edge, not one
+    ///   action per tick.
     /// * No binding for a button: the tick passes through unchanged
     ///   (the pre-binding default behaviour).
     /// * A binding to `horn` bypasses the horn module gate on
@@ -2745,20 +2883,26 @@ impl AppStateCore {
         let pressed64 = u64::from(output.buttons) | (u64::from(output.buttons_ex) << 32);
         if bindings.is_empty() {
             *lock(&self.last_bound_pressed) = pressed64;
+            *lock(&self.last_bound_encoder) = output.encoder_buttons.0;
             return *output;
         }
         let mut out = *output;
         let mut queued: Vec<BindingAppAction> = Vec::new();
         {
             let mut last_pressed = lock(&self.last_bound_pressed);
+            let mut last_encoder = lock(&self.last_bound_encoder);
             for (&button, action) in &bindings {
                 if !Self::binding_button_pressed(button, output, pressed64) {
                     continue;
                 }
                 if is_app_action(action) {
-                    // Edge only — see the method docs.
+                    // Edge only — see the method docs. Encoder
+                    // buttons (65–72) are edge-detected against the
+                    // previous tick's encoder bits (R2-08), exactly
+                    // like the physical-button path below.
                     let edge = if button >= 65 {
-                        true
+                        let bit = 1_u8 << (button - 65);
+                        *last_encoder & bit == 0
                     } else {
                         let bit = 1_u64 << (u64::from(button) - 1);
                         *last_pressed & bit == 0
@@ -2797,6 +2941,7 @@ impl AppStateCore {
                 }
             }
             *last_pressed = pressed64;
+            *last_encoder = output.encoder_buttons.0;
         }
         if !queued.is_empty() {
             lock(&self.binding_actions).extend(queued);
@@ -3000,7 +3145,33 @@ impl AppStateCore {
                     return self.output_state();
                 }
             }
-            let mut backend = lock(&self.backend);
+            // R2-09: connect outside the backend lock (up to 60 s
+            // for HIDMaestro's sidecar spawn + UAC dwell). Take the
+            // backend out of the slot (a disconnected NullSink
+            // stands in, so engine ticks keep flowing instead of
+            // blocking on the mutex), connect + resend on the local
+            // box, then swap it back. Serialised against switches
+            // by `switch_in_flight` so two extractions can never
+            // clobber each other's restore; a switch already in
+            // flight fails fast here instead of blocking the caller.
+            let Ok(_switch_guard) = self.switch_in_flight.try_lock() else {
+                self.record_send(
+                    false,
+                    "output enabled: a backend switch is already in progress — try again"
+                        .to_string(),
+                );
+                return self.output_state();
+            };
+            let mut backend = if let Some(placeholder) = factories.build(BackendKind::None) {
+                let mut slot = lock(&self.backend);
+                std::mem::replace(&mut *slot, placeholder)
+            } else {
+                // No sink factory (test-only path — the real
+                // factories always provide one): connect under
+                // the lock, as before.
+                let mut backend = lock(&self.backend);
+                return self.connect_and_resend(&mut backend);
+            };
             match backend.try_connect() {
                 Ok(()) => {
                     let last = *lock(&self.last_output);
@@ -3020,11 +3191,32 @@ impl AppStateCore {
                     self.record_send(false, format!("output enabled: connect failed ({error})"));
                 }
             }
+            *lock(&self.backend) = backend;
         } else {
-            let mut backend = lock(&self.backend);
+            // R2-09: same extract pattern for the neutral +
+            // disconnect — a sidecar shutdown must not hold the
+            // backend lock either. If a switch is in flight the
+            // flag above is already false, so the engine sends
+            // nothing (see `send_engine_output`) and the switch
+            // result is left alone.
+            let Ok(_switch_guard) = self.switch_in_flight.try_lock() else {
+                self.record_send(
+                    false,
+                    "output disabled: a backend switch is in progress — output is off".to_string(),
+                );
+                return self.output_state();
+            };
+            let mut backend = if let Some(placeholder) = factories.build(BackendKind::None) {
+                let mut slot = lock(&self.backend);
+                std::mem::replace(&mut *slot, placeholder)
+            } else {
+                let mut backend = lock(&self.backend);
+                return self.disable_backend(&mut backend);
+            };
             let was_connected = backend.is_connected();
             let neutral = backend.send_neutral();
             backend.disconnect();
+            *lock(&self.backend) = backend;
             match (was_connected, neutral) {
                 (true, Ok(())) => {
                     self.record_send(true, "output disabled: neutral sent to backend".to_string());
@@ -3038,6 +3230,55 @@ impl AppStateCore {
                         "output disabled: backend not connected, nothing sent".to_string(),
                     );
                 }
+            }
+        }
+        self.output_state()
+    }
+
+    /// Connect the given backend and resend the last output (the
+    /// enable half of [`Self::set_output_enabled_with_factories`],
+    /// split out so the no-sink-factory fallback can run it under
+    /// the lock without duplicating the block).
+    fn connect_and_resend(&self, backend: &mut Box<dyn IJoystickOutput>) -> CommandOutputState {
+        match backend.try_connect() {
+            Ok(()) => {
+                let last = *lock(&self.last_output);
+                match backend.update(&last) {
+                    Ok(()) => {
+                        self.record_send(true, "output enabled: sent to backend".to_string());
+                    }
+                    Err(error) => {
+                        self.record_send(false, format!("output enabled: update failed ({error})"));
+                    }
+                }
+            }
+            Err(error) => {
+                self.record_send(false, format!("output enabled: connect failed ({error})"));
+            }
+        }
+        self.output_state()
+    }
+
+    /// Send neutral + disconnect the given backend (the disable half
+    /// of [`Self::set_output_enabled_with_factories`], split out so
+    /// the no-sink-factory fallback can run it under the lock
+    /// without duplicating the block).
+    fn disable_backend(&self, backend: &mut Box<dyn IJoystickOutput>) -> CommandOutputState {
+        let was_connected = backend.is_connected();
+        let neutral = backend.send_neutral();
+        backend.disconnect();
+        match (was_connected, neutral) {
+            (true, Ok(())) => {
+                self.record_send(true, "output disabled: neutral sent to backend".to_string());
+            }
+            (true, Err(error)) => {
+                self.record_send(false, format!("output disabled: neutral failed ({error})"));
+            }
+            (false, _) => {
+                self.record_send(
+                    false,
+                    "output disabled: backend not connected, nothing sent".to_string(),
+                );
             }
         }
         self.output_state()
@@ -3191,10 +3432,50 @@ impl AppStateCore {
         {
             *lock(&self.backend) = fresh;
         }
-        let outcome = {
-            let mut backend = lock(&self.backend);
-            switch_backend(&mut backend, requested, factories, None)
-        };
+        // R2-09: the selector's connect (up to 60 s of sidecar
+        // spawn + UAC dwell for HIDMaestro) must NOT run under the
+        // backend lock — while it did, every engine tick blocked on
+        // the mutex and output stopped entirely for as long as the
+        // user took to answer UAC. Take the installed backend OUT of
+        // the slot (leaving a disconnected NullSink behind, so
+        // engine ticks keep flowing instead of blocking), run the
+        // switch on the local box with no lock held, then swap the
+        // result back under a short lock. The slot is restored on
+        // every path: a failed switch leaves the previous backend
+        // installed, exactly as the selector guarantees.
+        let outcome: Result<SwitchOutcome, String> =
+            if let Some(placeholder) = factories.build(BackendKind::None) {
+                let mut current = {
+                    let mut slot = lock(&self.backend);
+                    std::mem::replace(&mut *slot, placeholder)
+                };
+                let outcome = switch_backend(&mut current, requested, factories, None)
+                    .map_err(|error| error.to_string());
+                *lock(&self.backend) = current;
+                outcome
+            } else {
+                // No sink factory (test-only path — the real
+                // factories always provide one): switch in place
+                // under the lock, as before.
+                let mut backend = lock(&self.backend);
+                switch_backend(&mut backend, requested, factories, None)
+                    .map_err(|error| error.to_string())
+            };
+        self.finish_backend_switch(outcome, requested, vjoy_device_id)
+    }
+
+    /// Interprets a completed backend switch (R2-09): the UAC-decline
+    /// handling + live-name/detail bookkeeping that used to sit
+    /// inline in [`Self::apply_backend_switch`], split out so the
+    /// switch itself can run outside the backend lock. The backend
+    /// slot already holds the switch result when this runs, so the
+    /// live name is read from the slot (never from a stale local).
+    fn finish_backend_switch(
+        &self,
+        outcome: Result<SwitchOutcome, String>,
+        requested: BackendKind,
+        vjoy_device_id: u32,
+    ) -> Result<SwitchOutcome, String> {
         // B-2/A10: a UAC decline surfaces as a NotAdmin failure
         // (or a fallback whose reason names it). Record the decline
         // and FAIL the switch with the plain message — never silently
@@ -3214,7 +3495,6 @@ impl AppStateCore {
                 outcome
             }
             Err(error) => {
-                let error = error.to_string();
                 if requested == BackendKind::HidMaestro && error.contains("administrator rights") {
                     self.elevation_declined.store(true, Ordering::SeqCst);
                     return Err(Self::HID_NOT_ADMIN.to_string());
@@ -3514,6 +3794,7 @@ impl AppStateCore {
             // the daemon's `DaemonApi::diag_stats` fills these in.
             ipc_p50_ms: None,
             ipc_p99_ms: None,
+            ipc_per_method_ms: Vec::new(),
         }
     }
 
@@ -4031,7 +4312,12 @@ impl AppStateCore {
     /// NOT an error here: the forwarder retries every 2 s and the
     /// reason is recorded in [`AppStateCore::engine_status_detail`].
     pub fn connect_transport(self: &Arc<Self>, kind: TransportKind) -> Result<(), String> {
-        if kind == TransportKind::Serial && detect_board_port().is_none() {
+        // R2-25: the pre-check uses the metadata-only probe (open
+        // only, no 500 ms HELO round-trip — the session layer
+        // confirms the board with its own HELO/HELLO exchange
+        // afterwards), and the background refresher keeps the cached
+        // port fresh; the poll path never probes at all.
+        if kind == TransportKind::Serial && detect_board_port_metadata_only().is_none() {
             let reason =
                 "no board serial port detected — connect a board over USB and retry".to_string();
             self.note_engine_detail(reason.clone());
@@ -4287,6 +4573,15 @@ impl AppStateCore {
     /// Returns [`SinkError`] when the connected backend refuses the
     /// state.
     fn send_engine_output(&self, output: &PipelineOutputState) -> Result<(), SinkError> {
+        // R2-09 safety net: output off means nothing is sent, even
+        // if the backend is still connected (e.g. output was
+        // disabled while a backend switch was in flight and the
+        // disconnect was skipped). In the normal flow output-off
+        // already implies disconnected, so this changes nothing
+        // there — it only closes the race window.
+        if !*lock(&self.output_enabled) {
+            return Ok(());
+        }
         let mut backend = lock(&self.backend);
         if !backend.is_connected() {
             return Ok(());
@@ -6522,6 +6817,15 @@ trait SessionTransport: PacketSource + ControlTransport {
     /// deliver a `HELLO`; a dead link surfaces as a `HELLO` timeout).
     fn request_hello(&mut self, session_flag: u8) -> Result<(), String>;
 
+    /// Non-blocking drain of one queued `HELLO` reply (R2-07): the
+    /// frame loop calls this after every stream frame so HELLOs
+    /// arriving after activation still refresh the observed window
+    /// state. Default: no HELLO available (transports without a
+    /// HELLO channel keep it).
+    fn try_next_hello(&mut self) -> Option<HelloReply> {
+        None
+    }
+
     /// Short transport label for pairing log lines (`"wifi"` /
     /// `"usb"` — Phase 0 gate §6.2 format 1/2).
     fn transport_label(&self) -> &'static str {
@@ -6532,6 +6836,10 @@ trait SessionTransport: PacketSource + ControlTransport {
 impl SessionTransport for UdpTransport {
     fn recv_hello(&mut self) -> impl Future<Output = Option<HelloReply>> + Send {
         self.next_hello()
+    }
+
+    fn try_next_hello(&mut self) -> Option<HelloReply> {
+        self.try_next_hello()
     }
 
     fn transport_label(&self) -> &'static str {
@@ -6549,6 +6857,10 @@ impl SessionTransport for UdpTransport {
 impl SessionTransport for SerialTransport {
     fn recv_hello(&mut self) -> impl Future<Output = Option<HelloReply>> + Send {
         self.next_hello()
+    }
+
+    fn try_next_hello(&mut self) -> Option<HelloReply> {
+        self.try_next_hello()
     }
 
     fn transport_label(&self) -> &'static str {
@@ -6720,6 +7032,28 @@ where
 /// [`Some`] — the transport is alive, the gate stays closed, and the
 /// forwarder falls through to the frame loop, where frames are held
 /// and counted until a later activation succeeds.
+/// Guard that marks a forwarder activation in flight (R2-28) and
+/// clears the flag on drop, so every exit path of
+/// `activate_session_on` — including the early `None` returns —
+/// clears it. While armed, `AppStateCore::activate_session` no-ops
+/// instead of aborting the forwarder mid-activation.
+struct ActivationInFlightGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> ActivationInFlightGuard<'a> {
+    fn arm(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self { flag }
+    }
+}
+
+impl Drop for ActivationInFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
 async fn activate_session_on<T, K>(
     state: &Arc<AppStateCore>,
     transport: T,
@@ -6729,6 +7063,7 @@ where
     T: SessionTransport,
     K: KeyStoreLike,
 {
+    let _activation_guard = ActivationInFlightGuard::arm(&state.activation_in_flight);
     let mut transport = transport;
     match await_new_session_hello(state, &mut transport).await {
         NewSessionHello::TransportClosed => {
@@ -6744,7 +7079,10 @@ where
             let address = if transport.transport_label() == "wifi" {
                 state.settings().esp_ip
             } else {
-                detect_board_port().unwrap_or_default()
+                // R2-29: the address here is log-only — read the
+                // cached port, never probe inline on the supervisor
+                // runtime (a probe is up to 500 ms per candidate).
+                state.cached_board_port().unwrap_or_default()
             };
             state.push_pairing_log(
                 "WARN",
@@ -6833,10 +7171,12 @@ where
 ///
 /// Fail-closed throughout: no `HELLO`, a transport that died, a bad
 /// tag, a closed pairing window, or any op failure returns an
-/// [`Err`] with the reason (also recorded via
-/// [`AppStateCore::note_session_error`] so the pairing status shows
-/// it) — never a partial success. A successful activation whose op
-/// then fails still closes the session cleanly before returning.
+/// [`Err`] with the reason (also recorded on the separate control
+/// channel via [`AppStateCore::note_control_error`] — never as an
+/// activation failure, so a failed control op cannot knock a live
+/// session into `Error` (R2-05)) — never a partial success. A
+/// successful activation whose op then fails still closes the session
+/// cleanly before returning.
 ///
 /// The `HELLO` answering the fresh HELO rotates the board's nonce
 /// (D30) — harmless to a live forwarder: the stream is
@@ -6863,7 +7203,7 @@ where
     match await_new_session_hello(state, &mut transport).await {
         NewSessionHello::TransportClosed => {
             let reason = "transport closed while awaiting the board HELLO";
-            state.note_session_error(reason);
+            state.note_control_error(reason);
             Err(reason.to_string())
         }
         NewSessionHello::None => {
@@ -6872,7 +7212,7 @@ where
                 "no HELLO reply from the board within {total_ms} ms — board not responding \
                  on this transport"
             );
-            state.note_session_error(&reason);
+            state.note_control_error(&reason);
             Err(reason)
         }
         NewSessionHello::Found(hello) => {
@@ -6885,7 +7225,11 @@ where
                 Err(error) => Err(format!("session activation failed: {error}")),
             };
             if let Err(error) = &result {
-                state.note_session_error(error);
+                // R2-05: a control-session failure is recorded on the
+                // separate control channel, never as an activation
+                // failure — it must not knock a live session into
+                // Error via the manager loop's ActivationFailed feed.
+                state.note_control_error(error);
             }
             session.close();
             let _ = session.take_transport();
@@ -7550,8 +7894,8 @@ async fn forward_with_retry<T, F>(
     status_tx: tokio::sync::mpsc::Sender<StatusPacket>,
     factory: F,
 ) where
-    T: SessionTransport,
-    F: FnMut() -> Option<T> + Send,
+    T: SessionTransport + Send + 'static,
+    F: FnMut() -> Option<T> + Send + 'static,
 {
     forward_with_retry_with_policy(
         state,
@@ -7579,6 +7923,15 @@ const FORWARDER_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// long enough to ride out a board reboot and Wi-Fi reassociation,
 /// short enough that a dead board does not retry forever.
 const FORWARDER_MAX_CONSECUTIVE_FAILURES: u32 = 10;
+
+/// Frame silence that means transport loss (R2-06): once the gate
+/// is open, no stream frame for this long — a board that stopped
+/// streaming (reboot, Wi-Fi drop) while its socket stays live —
+/// ends the frame loop so the transport is rebuilt and the session
+/// re-activates. Well above the 250 ms engine watchdog (which
+/// already drives output neutral) and the ~5 ms frame spacing, so
+/// a healthy stream never trips it.
+const FRAME_SILENCE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Exponential-backoff + circuit-breaker policy for one
 /// [`forward_with_retry`] run (M-11). Pure data: the delay math is
@@ -7710,18 +8063,42 @@ async fn forward_with_retry_with_policy<T, F>(
     kind: TransportKind,
     frame_tx: tokio::sync::mpsc::Sender<StreamFrame>,
     status_tx: tokio::sync::mpsc::Sender<StatusPacket>,
-    mut factory: F,
+    factory: F,
     policy: ForwarderRetryPolicy,
 ) where
-    T: SessionTransport,
-    F: FnMut() -> Option<T> + Send,
+    T: SessionTransport + Send + 'static,
+    F: FnMut() -> Option<T> + Send + 'static,
 {
     let mut backoff = ForwarderBackoff::new(policy);
     // C-13: whether the one BadTag retry was already spent in this
     // forwarder run (reset on every successful activation).
     let mut bad_tag_retried = false;
+    // R2-29: the factory runs behind a shared lock so each build
+    // can be offloaded to the blocking pool below (the factory is
+    // `FnMut`, and `spawn_blocking` takes `FnOnce` — one call per
+    // offloaded closure).
+    let factory = std::sync::Arc::new(std::sync::Mutex::new(factory));
     loop {
-        let Some(transport) = factory() else {
+        // R2-29: build the transport on the blocking pool, never on
+        // the supervisor's single-threaded runtime. The serial
+        // factory enumerates ports + HELO-probes each one (up to
+        // 500 ms per candidate) and the UDP factory binds +
+        // diagnoses the port holder — either one stalled
+        // connect/disconnect handling while it ran inline here. A
+        // failed/shut-down blocking pool is a failed build (the
+        // backoff/breaker below handles it like any other).
+        let transport = {
+            let factory = std::sync::Arc::clone(&factory);
+            tokio::task::spawn_blocking(move || {
+                let mut factory = factory
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                factory()
+            })
+            .await
+            .unwrap_or(None)
+        };
+        let Some(transport) = transport else {
             // F21: a UDP port conflict never self-heals — the holder
             // must be closed by the user. Do not burn the M-11
             // backoff (10 retries, ~3 min) on it: stop this
@@ -7903,11 +8280,38 @@ async fn forward_with_retry_with_policy<T, F>(
                         }
                     }
                 }
-                _ => match transport.next_frame().await {
-                    Some(frame) => frame,
-                    None => break, // transport dropped
-                },
+                _ => {
+                    // R2-06: bound the authenticated wait — a live
+                    // socket with a silent board used to pend here
+                    // forever (silence only ended the loop if the
+                    // source channel *closed*). 2 s of silence is
+                    // transport loss: break out so the loop rebuilds
+                    // + re-activates below, like any other loss.
+                    match tokio::time::timeout(FRAME_SILENCE_TIMEOUT, transport.next_frame()).await
+                    {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => break, // transport dropped
+                        Err(_) => {
+                            state.note_engine_detail(
+                                "stream silent for 2 s — treating as transport loss, rebuilding"
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                    }
+                }
             };
+            // R2-07: drain HELLO replies that arrived while
+            // streaming — the frame loop is the only reader left
+            // after activation, so without this the 8-cap channel
+            // overflow-drops and the observed window state goes
+            // stale (a new pairing window after a board reboot was
+            // never seen, and `seconds_left` was computed from a
+            // 60 s-old HELLO). Every reply refreshes the observed
+            // HELLO / window state via `note_observed_hello`.
+            while let Some(hello) = transport.try_next_hello() {
+                state.note_observed_hello(&hello);
+            }
             // C-04 heartbeat: every frame (stream or status, via the
             // status pump below) stamps the watchdog clock.
             state.note_stream_frame();
@@ -9030,9 +9434,8 @@ mod tests {
                 BindingAppAction::ProfilePrevious
             ]
         );
-        // Held physical button: no repeat. (The encoder pulse is
-        // absent this tick — a pulse present on a tick IS an edge by
-        // construction, so it would fire again.)
+        // Held physical button: no repeat. The encoder pulse is
+        // absent this tick, so it does not fire again either.
         let mut held = PipelineOutputState::neutral();
         held.buttons = 1 << 7; // button 8 still held, no pulse
         state.ingest_engine_output(&held, &EngineMetrics::new());
@@ -9056,6 +9459,127 @@ mod tests {
                 .any(|event| event.button == 8 && event.pressed),
             "raw edge survives for the UI highlight: {events:?}"
         );
+    }
+
+    /// R2-08: an encoder pulse held across two ticks fires the bound
+    /// app action exactly once — the encoder buttons are now
+    /// edge-detected against the previous tick's encoder bits, like
+    /// the physical-button path. (Before the fix the pulse fired on
+    /// every tick it was present, so one detent could cycle several
+    /// profiles.)
+    #[test]
+    fn bindings_encoder_app_action_fires_once_per_detent() {
+        let (state, _dir) = test_state();
+        state.set_binding(65, "profile_previous").expect("bind 65");
+        let mut output = PipelineOutputState::neutral();
+        output.encoder_buttons = EncoderButtons(0b01); // button 65 pulse
+        state.ingest_engine_output(&output, &EngineMetrics::new());
+        assert_eq!(
+            state.drain_binding_actions(),
+            vec![BindingAppAction::ProfilePrevious],
+            "first tick fires"
+        );
+        // Same pulse still present on the next tick: no repeat.
+        state.ingest_engine_output(&output, &EngineMetrics::new());
+        assert_eq!(
+            state.drain_binding_actions().len(),
+            0,
+            "held encoder pulse must not repeat"
+        );
+        // Release, then a fresh pulse: fires again.
+        state.ingest_engine_output(&PipelineOutputState::neutral(), &EngineMetrics::new());
+        state.ingest_engine_output(&output, &EngineMetrics::new());
+        assert_eq!(
+            state.drain_binding_actions(),
+            vec![BindingAppAction::ProfilePrevious],
+            "fresh detent after release fires again"
+        );
+    }
+
+    /// R2-05: a failed control op (LED test, config) records on its
+    /// own channel and never knocks the live session into Error —
+    /// `session_last_error_typed` (what the manager loop turns into
+    /// `ActivationFailed`) stays untouched, and so does the pairing
+    /// status error the wizard reads.
+    #[test]
+    fn control_error_does_not_touch_session_error() {
+        let (state, _dir) = test_state();
+        state.note_control_error("led test failed");
+        assert_eq!(
+            state.control_last_error().as_deref(),
+            Some("led test failed")
+        );
+        assert!(state.session_last_error_typed().is_none());
+        assert!(state.session_last_error().is_none());
+        assert!(state.pairing_status_peek().error.is_none());
+        // …and an activation failure still records on the session
+        // channel, leaving the control channel alone.
+        state.note_session_error_typed(ConnectionError::TransportClosed, "activation failed");
+        assert!(state.session_last_error_typed().is_some());
+        assert_eq!(
+            state.control_last_error().as_deref(),
+            Some("led test failed")
+        );
+    }
+
+    /// R2-27: the UI's `pairing_status()` read must not starve the
+    /// manager's Wi-Fi rejoin — the rejoin password lives in its own
+    /// stash, independent of the one-time UI disclosure.
+    #[test]
+    fn rejoin_password_survives_ui_pairing_status_read() {
+        use rsh_protocol::hello::HelloReply;
+
+        let (state, _dir) = test_state();
+        let mut wifi = [0_u8; 24];
+        wifi.copy_from_slice(b"TestPassword0123456789AB");
+        let hello = HelloReply {
+            flags: 0x09, // unpaired + window open
+            session_echo: 0,
+            board_mac: [0x20, 0x9B, 0xA9, 0x70, 0x9A, 0x55],
+            firmware: (4, 0, 2),
+            nonce: [0; 16],
+            device_key: [0; 32],
+            wifi_password: wifi,
+        };
+        state.note_observed_hello(&hello);
+        // UI reads the one-time disclosure first…
+        let status = state.pairing_status();
+        assert!(status.password.is_some(), "UI gets the password once");
+        assert!(
+            state.pairing_status().password.is_none(),
+            "second UI read is empty"
+        );
+        // …and the manager still gets its own copy, exactly once.
+        assert_eq!(
+            state.take_rejoin_password().as_deref(),
+            Some("TestPassword0123456789AB")
+        );
+        assert!(
+            state.take_rejoin_password().is_none(),
+            "stash is single-take"
+        );
+    }
+
+    /// R2-28: `activate_session` no-ops while an activation is
+    /// already in flight — a manager `RetryTimer` can no longer
+    /// abort a mid-activation forwarder by starting a second
+    /// `connect_transport`.
+    #[test]
+    fn activate_session_noops_while_activation_in_flight() {
+        let (state, _dir) = test_state();
+        // No board is present, so a real activation attempt would
+        // fail — the in-flight flag must short-circuit before any
+        // transport work happens.
+        state.activation_in_flight.store(true, Ordering::SeqCst);
+        assert!(state.activate_session().is_ok());
+        state.activation_in_flight.store(false, Ordering::SeqCst);
+        // …and the guard clears the flag on drop, so a later
+        // activation is not stuck behind a stale flag.
+        {
+            let _guard = ActivationInFlightGuard::arm(&state.activation_in_flight);
+            assert!(state.activation_in_flight.load(Ordering::SeqCst));
+        }
+        assert!(!state.activation_in_flight.load(Ordering::SeqCst));
     }
 
     /// `cycle_profile` wraps around in both directions and activates
@@ -10069,7 +10593,7 @@ mod tests {
         let _ = state.set_output_enabled(true);
         state.start_engine().expect("engine starts");
         // The loop rate counts ticks inside a 1 s window, so a full
-        // second of idle ticks must pass before the rate reads ~200.
+        // second of idle ticks must pass before the rate settles.
         std::thread::sleep(Duration::from_millis(1200));
         let recorded = recorded_states(&sent);
         assert!(
@@ -10079,10 +10603,15 @@ mod tests {
             "idle engine sends only neutral, never fake input: {recorded:?}"
         );
         // The loop rate is measured from the real ticks, even idle.
+        // R2-39: with no transport and no frames the engine parks
+        // at 10 Hz instead of ticking 200 Hz idle — the parked rate
+        // is the expected measurement here.
         let engine_stats = state.engine_stats();
         assert!(
-            engine_stats.loop_hz.is_some_and(|hz| hz > 150.0),
-            "idle loop rate measured (~200 Hz): {engine_stats:?}"
+            engine_stats
+                .loop_hz
+                .is_some_and(|hz| (5.0..=20.0).contains(&hz)),
+            "idle loop rate measured (~10 Hz parked): {engine_stats:?}"
         );
         assert_eq!(
             state.engine_status(),
@@ -11735,7 +12264,17 @@ mod tests {
             "only GET_CAPS sent"
         );
         assert!(!state.session_gate_open(), "gate stays closed");
-        assert!(state.session_last_error().is_some(), "failure is recorded");
+        // R2-05: the failure is recorded on the separate control
+        // channel — the session channel (which the manager loop
+        // turns into `ActivationFailed`) stays untouched.
+        assert!(
+            state.control_last_error().is_some(),
+            "failure is recorded on the control channel"
+        );
+        assert!(
+            state.session_last_error().is_none(),
+            "control failure must not touch the session error"
+        );
     }
 
     #[test]
@@ -11750,7 +12289,17 @@ mod tests {
         .expect_err("no HELLO must fail");
         assert!(error.contains("no HELLO"), "{error}");
         assert!(!state.session_gate_open(), "gate stays closed");
-        assert!(state.session_last_error().is_some(), "failure is recorded");
+        // R2-05: the failure is recorded on the separate control
+        // channel — the session channel (which the manager loop
+        // turns into `ActivationFailed`) stays untouched.
+        assert!(
+            state.control_last_error().is_some(),
+            "failure is recorded on the control channel"
+        );
+        assert!(
+            state.session_last_error().is_none(),
+            "control failure must not touch the session error"
+        );
     }
 
     #[test]

@@ -72,6 +72,13 @@ pub const TICK_INTERVAL: Duration = Duration::from_millis(5);
 /// 200×/s to do nothing. Restored to 5 ms the moment a source is
 /// live again.
 pub const PARKED_TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// How long the engine tolerates frame silence before it parks the
+/// 200 Hz tick (R2-39 / DS-31): 2 s without a frame is not a live
+/// stream, even when the source object still exists — a board that
+/// stopped streaming used to keep the engine ticking 200 Hz idle
+/// forever (a parked tick still drains the source, so a resumed
+/// stream is picked up within one parked tick).
+pub const FRAME_SILENCE_PARK_AFTER: Duration = Duration::from_secs(2);
 /// Reconnect cadence after the source drops: try again every 2 s.
 pub const RECONNECT_INTERVAL: Duration = Duration::from_secs(2);
 /// Ping cadence: one NTP-style ping request per second.
@@ -545,18 +552,32 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
     /// Run the 200 Hz loop until stopped, then return the final
     /// [`EngineReport`]. Never panics on bad input and never dies on
     /// a source/sink error: errors are counted, output goes neutral,
-    /// and the loop keeps ticking. While no source is live the loop
-    /// parks at 10 Hz (DS-31) — the stop watch still wakes it at
-    /// once, so `stop()` is never delayed by the parked sleep.
+    /// and the loop keeps ticking. While no source is live — or the
+    /// source has gone silent for 2 s (R2-39) — the loop parks at
+    /// 10 Hz (DS-31); the stop watch still wakes it at once, so
+    /// `stop()` is never delayed by the parked sleep.
     pub async fn run(mut self) -> EngineReport {
         // Windows timer resolution (see `TimerResolutionGuard`):
         // without it the 5 ms interval ticks at ~64 Hz there.
-        let _timer_resolution = TimerResolutionGuard::acquire();
+        // R2-39: the guard is scoped to live-source periods only —
+        // it is acquired when frames are fresh and released when the
+        // engine parks, so an idle engine stops raising the system
+        // timer resolution (a global power/CPU cost).
+        let mut timer_guard: Option<TimerResolutionGuard> = None;
         let mut ticker = interval(TICK_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         if !*self.stop_rx.borrow() {
             loop {
-                if self.source_live() {
+                // R2-39: park on frame silence, not source presence
+                // — a board that stopped streaming is parked just
+                // like a missing one (a parked tick still drains the
+                // source, so a resumed stream is picked up within
+                // one parked tick).
+                let live = self.source_effectively_live(Instant::now());
+                if live {
+                    if timer_guard.is_none() {
+                        timer_guard = Some(TimerResolutionGuard::acquire());
+                    }
                     tokio::select! {
                         _ = ticker.tick() => self.on_tick().await,
                         result = self.stop_rx.changed() => {
@@ -566,6 +587,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
                         }
                     }
                 } else {
+                    timer_guard = None;
                     // DS-31: parked — one sleep instead of a 200 Hz
                     // interval. The delay never runs past a due
                     // reconnect (see `parked_tick_delay`).
@@ -590,6 +612,25 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
         self.source.is_some()
     }
 
+    /// Whether frames arrived recently enough to justify the 200 Hz
+    /// tick (R2-39): the watchdog's last-frame clock, with a 2 s
+    /// silence bound. Before any frame ever arrives this is false,
+    /// so a board-less engine parks immediately instead of ticking
+    /// 200 Hz idle forever.
+    fn frames_fresh(&self, now: Instant) -> bool {
+        self.watchdog
+            .last_tick()
+            .is_some_and(|last| now.saturating_duration_since(last) < FRAME_SILENCE_PARK_AFTER)
+    }
+
+    /// Whether the engine has a live source with fresh frames
+    /// (R2-39): the run loop ticks 200 Hz only then; otherwise it
+    /// parks at 10 Hz. Parked ticks still drain the source, so a
+    /// resumed stream is picked up within one parked tick.
+    fn source_effectively_live(&self, now: Instant) -> bool {
+        self.source_live() && self.frames_fresh(now)
+    }
+
     /// How long the run loop may sleep before the next tick (DS-31):
     /// 5 ms while a source is live; 100 ms while parked — but never
     /// past a due reconnect, so a factory retry fires on schedule.
@@ -597,9 +638,11 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
     /// full 100 ms applies even once the (factory-less) retry time
     /// has passed.
     fn parked_tick_delay(&self, now: Instant) -> Duration {
-        if self.source_live() {
-            return TICK_INTERVAL;
-        }
+        // R2-39: parked means 100 ms — whether the source is gone
+        // or merely silent (a live source never parks; see
+        // `source_effectively_live`). The old `source_live()` early
+        // return would have handed a silent-but-present source the
+        // 5 ms interval and defeated the park.
         let Some(due) = self.next_reconnect_at.filter(|_| self.factory.is_some()) else {
             return PARKED_TICK_INTERVAL;
         };
@@ -1667,8 +1710,21 @@ mod tests {
             Box::new(sink),
         );
         let now = Instant::now();
-        // Live source: full rate.
-        assert_eq!(engine.parked_tick_delay(now), TICK_INTERVAL);
+        // R2-39: a source with no frames yet is PARKED, not full
+        // rate — silence parks the tick even when the source object
+        // still exists (the old code returned `TICK_INTERVAL` here
+        // for any present source, so a board that stopped streaming
+        // kept the engine ticking 200 Hz idle forever).
+        assert_eq!(engine.parked_tick_delay(now), PARKED_TICK_INTERVAL);
+        assert!(!engine.frames_fresh(now));
+        assert!(!engine.source_effectively_live(now));
+        // A frame just arrived: fresh again, full rate.
+        engine.watchdog.tick(now);
+        assert!(engine.frames_fresh(now));
+        assert!(engine.source_effectively_live(now));
+        // ...and silence for the full 2 s parks it again.
+        assert!(!engine.frames_fresh(now + FRAME_SILENCE_PARK_AFTER));
+        assert!(!engine.source_effectively_live(now + FRAME_SILENCE_PARK_AFTER));
         // No source, no factory, no reconnect pending: parked.
         engine.source = None;
         assert_eq!(engine.parked_tick_delay(now), PARKED_TICK_INTERVAL);
