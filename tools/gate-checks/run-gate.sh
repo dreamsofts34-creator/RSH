@@ -101,13 +101,24 @@ version_check() {
         echo "ERROR: main.slint app-version default does not match workspace version $ver" >&2
         return 1
     fi
+    if ! grep -Fq "app-version: \"RSH $ver\"" crates/rsh-ui/ui/screens/settings.slint; then
+        echo "ERROR: settings.slint app-version default does not match workspace version $ver" >&2
+        return 1
+    fi
+    # The api.rs unit test pins app_version() with a literal (DS-01
+    # tripwire): check it here so a missed bump fails the local gate,
+    # not a 30-min CI run.
+    if ! grep -Fq "assert_eq!(app_version(), \"$ver\")" crates/rsh-api/src/api.rs; then
+        echo "ERROR: api.rs app_version() test literal does not match workspace version $ver" >&2
+        return 1
+    fi
     local tag
     tag=$(git describe --tags --exact-match HEAD 2>/dev/null || true)
     if [ -n "$tag" ] && [ "$tag" != "v$ver" ]; then
         echo "ERROR: HEAD is tagged $tag but workspace version is $ver" >&2
         return 1
     fi
-    echo "version $ver (main.slint matches; tag ${tag:-none} OK)"
+    echo "version $ver (main.slint, settings.slint, api.rs match; tag ${tag:-none} OK)"
 }
 
 run_step version-check version_check

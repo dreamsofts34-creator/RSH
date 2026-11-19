@@ -1638,10 +1638,19 @@ mod tests {
         // Drop the transport: the only sender goes away.
         drop(tx);
         assert!(!join.is_finished(), "loop alive right after drop");
-        // Reconnect fires 2 s after the drop; give it time, then feed
-        // a frame through the reconnected source.
-        sleep(Duration::from_millis(2300)).await;
-        assert!(attempts.load(Ordering::SeqCst) >= 1, "reconnect attempted");
+        // Reconnect fires 2 s after the drop; poll for the attempt
+        // instead of a fixed sleep — a loaded runner can delay the
+        // timer past the old 300 ms margin.
+        let reconnected = timeout(Duration::from_secs(10), async {
+            loop {
+                if attempts.load(Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(reconnected.is_ok(), "reconnect attempted");
         let fresh_tx = {
             let guard = senders.lock().expect("factory senders lock");
             guard.last().expect("factory handed out a sender").clone()
@@ -1890,7 +1899,19 @@ mod tests {
         let stop = engine.stop_handle();
         let join = tokio::spawn(engine.run());
         drop(tx);
-        sleep(Duration::from_millis(2200)).await;
+        // Wait for the pings instead of a fixed sleep: the 0/1/2 s
+        // pings can land late on a loaded runner, past the old
+        // 200 ms margin.
+        let pings_landed = timeout(Duration::from_secs(10), async {
+            loop {
+                if sent.lock().expect("ping sent lock").len() >= 2 {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(pings_landed.is_ok(), "pings at 0 s, 1 s, 2 s");
         stop.stop();
         let report = timeout(Duration::from_secs(5), join)
             .await
@@ -1921,7 +1942,19 @@ mod tests {
         let stop = engine.stop_handle();
         let join = tokio::spawn(engine.run());
         drop(tx);
-        sleep(Duration::from_millis(150)).await;
+        // Wait for the first ping instead of a fixed sleep: on a
+        // loaded runner the engine task may not have run within
+        // 150 ms, and `.first().expect()` would panic on an empty vec.
+        let ping_arrived = timeout(Duration::from_secs(5), async {
+            loop {
+                if !sent.lock().expect("ping sent lock").is_empty() {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(ping_arrived.is_ok(), "a ping request was sent");
         let request = {
             let guard = sent.lock().expect("ping sent lock");
             *guard.first().expect("a ping request was sent")

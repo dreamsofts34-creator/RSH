@@ -2850,7 +2850,9 @@ mod tests {
         // NotInstalled warning state, and a retry must fail the same
         // way (no panic, no fake success). Takes the env guard so a
         // parallel M1 test cannot make a fake DLL resolvable here.
-        let _guard = ENV_GUARD.lock().expect("env guard");
+        let _guard = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut out = VJoyOutput::new(1);
         let err = out.try_connect().expect_err("no driver on Linux");
         assert!(
@@ -2937,7 +2939,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn dll_hash_is_verified_before_load() {
-        let _guard = ENV_GUARD.lock().expect("env guard");
+        let _guard = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = std::env::temp_dir().join(format!("rsh-vjoy-m1-{}", std::process::id()));
         let dll_dir = base.join("vJoy").join("x64");
         std::fs::create_dir_all(&dll_dir).expect("create fake install dir");

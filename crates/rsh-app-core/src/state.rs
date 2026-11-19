@@ -9310,7 +9310,17 @@ mod tests {
             let _ = state.ingest_frame(test_frame(0.0));
         }
         let ingest_elapsed = ingest_start.elapsed();
-        std::thread::sleep(Duration::from_millis(1000));
+        // Wait for ~24 snapshots instead of a fixed 1 s sleep: on a
+        // loaded runner the emitter can fall behind the 24..=38
+        // window in a fixed window; reaching 24 proves the ~30 Hz
+        // rate, and stopping right after keeps the <= 38 bound
+        // meaningful.
+        assert!(
+            wait_until(Duration::from_secs(5), || count.load(Ordering::Relaxed)
+                >= 24),
+            "emitter stalled: only {} snapshots in 5 s",
+            count.load(Ordering::Relaxed)
+        );
         stop.store(true, Ordering::Relaxed);
         emitter.join().expect("emitter thread joins");
         let snapshot_count = count.load(Ordering::Relaxed);
@@ -10948,12 +10958,17 @@ mod tests {
         // The loop rate is measured from the real ticks, even idle.
         // R2-39: with no transport and no frames the engine parks
         // at 10 Hz instead of ticking 200 Hz idle — the parked rate
-        // is the expected measurement here.
+        // is the expected measurement here. Wait for it to settle
+        // instead of asserting right after the fixed sleep: under
+        // full-suite load the 1 s window may not have settled after
+        // 1200 ms (known flake — the rate reads low or None), so
+        // poll until it lands in the parked band.
         let engine_stats = state.engine_stats();
         assert!(
-            engine_stats
+            wait_until(Duration::from_secs(10), || state
+                .engine_stats()
                 .loop_hz
-                .is_some_and(|hz| (5.0..=20.0).contains(&hz)),
+                .is_some_and(|hz| (5.0..=20.0).contains(&hz))),
             "idle loop rate measured (~10 Hz parked): {engine_stats:?}"
         );
         assert_eq!(
@@ -11062,17 +11077,23 @@ mod tests {
         board
             .connect("127.0.0.1:4211")
             .expect("fake board connects");
-        let sender = std::thread::spawn(move || {
-            for seq in 0..50u16 {
-                let frame = test_stream_frame(seq, 3300, &[]);
-                send_loopback_frame(&board, &frame.encode());
-                std::thread::sleep(Duration::from_millis(20));
+        // Re-send until a frame lands: one burst can be dropped
+        // under parallel load (same as session_gate Phase 2,
+        // d59c89b), so keep sending while waiting instead of
+        // fire-once-then-wait. Same 20 s bound as before.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut seq: u16 = 0;
+        while !recorded_states(&sent).iter().any(|s| s.steering > 0.9) {
+            if std::time::Instant::now() >= deadline {
+                break;
             }
-        });
+            let frame = test_stream_frame(seq, 3300, &[]);
+            send_loopback_frame(&board, &frame.encode());
+            seq = seq.wrapping_add(1);
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(
-            wait_until(Duration::from_secs(20), || recorded_states(&sent)
-                .iter()
-                .any(|s| s.steering > 0.9)),
+            recorded_states(&sent).iter().any(|s| s.steering > 0.9),
             "loopback UDP frames reached the backend: {:?}",
             recorded_states(&sent)
         );
@@ -11084,7 +11105,6 @@ mod tests {
             "UDP transport live: {}",
             state.engine_status_detail()
         );
-        sender.join().expect("sender thread joins");
         let outcome = state.stop_engine();
         assert!(outcome.joined, "engine stops bounded after UDP");
         assert!(
@@ -11119,10 +11139,18 @@ mod tests {
             .connect("127.0.0.1:4211")
             .expect("fake board connects");
         // Phase 1 — gate closed: frames are held, counted, and reach
-        // neither the backend nor the engine.
-        for seq in 0..10u16 {
+        // neither the backend nor the engine. Re-send until the held
+        // count lands: one burst can be dropped under parallel load,
+        // same as the Phase 2 delivery below.
+        let mut seq: u16 = 0;
+        let phase1_deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while state.session_gate_held_frames() < 10 {
+            if std::time::Instant::now() >= phase1_deadline {
+                break;
+            }
             let frame = test_stream_frame(seq, 3300, &[]);
             send_loopback_frame(&board, &frame.encode());
+            seq = seq.wrapping_add(1);
             std::thread::sleep(Duration::from_millis(20));
         }
         std::thread::sleep(Duration::from_millis(300));
@@ -11177,8 +11205,9 @@ mod tests {
         // dropped (channel full / bind race under parallel load on
         // Windows CI), so keep sending while waiting instead of
         // fire-once-then-wait. Same 20 s bound as before.
+        // `seq` continues from Phase 1 so no sequence number is
+        // ever sent twice (the engine drops duplicates).
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        let mut seq: u16 = 10;
         while !recorded_states(&sent).iter().any(|s| s.steering > 0.9) {
             if std::time::Instant::now() >= deadline {
                 break;

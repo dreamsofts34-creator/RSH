@@ -1804,13 +1804,15 @@ pub fn gate_ota_flash_caller() -> (bool, String) {
 ///
 /// The release workflow's tag check is fail-closed: the tag
 /// version must match `[workspace.package] version` in
-/// `Cargo.toml`. The gate requires the bump to 2.0.3 to be
-/// present in all three places that carry the version before any
-/// release is cut: the workspace `Cargo.toml`, the `MainWindow`
-/// `app-version` (`ui/main.slint`), and the Settings screen
-/// `app-version` (`ui/screens/settings.slint`). Currently FAILS:
-/// all three still say 2.0.2 — the bump is the gate
-/// coordinator's step, done just before the release.
+/// `Cargo.toml`. The gate requires the version to agree in all
+/// three places that carry it before any release is cut: the
+/// workspace `Cargo.toml`, the `MainWindow` `app-version`
+/// (`ui/main.slint`), and the Settings screen `app-version`
+/// (`ui/screens/settings.slint`). The expected version is read
+/// from Cargo.toml itself — never a literal: a hardcoded "2.0.x"
+/// here is the DS-01 tripwire that failed CI round 1 of the
+/// v2.0.4 release (the literal still said 2.0.3 after the
+/// workspace bump to 2.0.4).
 #[must_use]
 pub fn gate_version_bump() -> (bool, String) {
     let mut report = Report::new();
@@ -1820,22 +1822,38 @@ pub fn gate_version_bump() -> (bool, String) {
         return report.finish();
     };
     let pkg_section = &cargo[pkg_start..];
+    // Single source of truth: the version is parsed out of
+    // [workspace.package], so the next bump needs no edit here.
+    let Some(version) = pkg_section.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("version = \"")?
+            .split('"')
+            .next()
+            .map(str::to_string)
+    }) else {
+        report.check(
+            "version-cargo-toml",
+            false,
+            "no version = \"...\" in [workspace.package]",
+        );
+        return report.finish();
+    };
     report.check(
         "version-cargo-toml",
-        pkg_section.contains("version = \"2.0.4\""),
-        "workspace Cargo.toml version is 2.0.4",
+        true,
+        &format!("workspace Cargo.toml version is {version}"),
     );
     let main_slint = read("crates/rsh-ui/ui/main.slint").unwrap_or_default();
     report.check(
         "version-main-slint",
-        main_slint.contains("app-version: \"2.0.4\""),
-        "MainWindow app-version is 2.0.4",
+        main_slint.contains(&format!("app-version: \"{version}\"")),
+        &format!("MainWindow app-version is {version}"),
     );
     let settings = read("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
     report.check(
         "version-settings-slint",
-        settings.contains("app-version: \"RSH 2.0.4\""),
-        "Settings app-version is RSH 2.0.4",
+        settings.contains(&format!("app-version: \"RSH {version}\"")),
+        &format!("Settings app-version is RSH {version}"),
     );
     let workflow = read(".github/workflows/release.yml").unwrap_or_default();
     report.check(

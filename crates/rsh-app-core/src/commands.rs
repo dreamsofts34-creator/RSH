@@ -1438,7 +1438,7 @@ mod tests {
         // throwaway-signed image must fail with an invalid signature —
         // and the failure must name the signature, not the format.
         let (image, _pubkey) = signed_test_image("4.0.2", 70_000);
-        let dir = std::env::temp_dir().join("rsh-app-core-fw-test");
+        let dir = std::env::temp_dir().join(format!("rsh-app-core-fw-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("firmware-signed.bin");
         {
@@ -1471,7 +1471,7 @@ mod tests {
 
     #[test]
     fn firmware_image_truncated_reports_unsigned() {
-        let dir = std::env::temp_dir().join("rsh-app-core-fw-test");
+        let dir = std::env::temp_dir().join(format!("rsh-app-core-fw-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("truncated.bin");
         std::fs::write(&path, [0xE9u8; 100]).expect("write test image");
@@ -1487,7 +1487,7 @@ mod tests {
         // key, so a throwaway-signed image fails the signature — the
         // installed version never even matters here.
         let (image, _pubkey) = signed_test_image("4.0.2", 70_000);
-        let dir = std::env::temp_dir().join("rsh-app-core-fw-test");
+        let dir = std::env::temp_dir().join(format!("rsh-app-core-fw-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("against-throwaway.bin");
         std::fs::write(&path, &image).expect("write test image");

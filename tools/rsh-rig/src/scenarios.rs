@@ -1569,7 +1569,7 @@ pub fn registry() -> Vec<Scenario> {
         },
         Scenario {
             id: "gate-version-bump",
-            description: "Gate (M-9): version is 2.0.4 in the workspace Cargo.toml, MainWindow app-version, and Settings app-version (release workflow tag check is fail-closed on the Cargo.toml version).",
+            description: "Gate (M-9): the workspace Cargo.toml version, MainWindow app-version, and Settings app-version all agree (the gate reads the version from Cargo.toml, so no literal to bump; release workflow tag check is fail-closed on the Cargo.toml version).",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1577,7 +1577,7 @@ pub fn registry() -> Vec<Scenario> {
                 metric: "selfCheck",
                 op: "==",
                 value: MetricValue::Str("pass"),
-                note: "Gate PASS: version 2.0.4 everywhere it is displayed or checked.",
+                note: "Gate PASS: workspace version agrees everywhere it is displayed or checked.",
                 min_duration_s: 0.0,
             }],
         },
