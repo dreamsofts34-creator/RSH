@@ -18,9 +18,9 @@ only) · Protocol **v2.1 wire FROZEN**.
 `SIGNED-OTA.md` (C# app v2.0.4 / firmware v4.0.1).
 
 > **Reconstruction note (deep-scan Round 2, 2026-11-14):** this file was
-> missing from the repo while `THREAT-MODEL-RUST.md`, `KEY-LIFECYCLE-RUST.md`,
-> `SECURITY-RESCAN-H1.md` and `DECISIONS.md` all cited it — every one of
-> those references was dangling. It is reconstructed here from the
+> missing from the repo while `THREAT-MODEL-RUST.md` and
+> `KEY-LIFECYCLE-RUST.md` cited it — both references were dangling. It
+> is reconstructed here from the
 > citing documents, with the original section numbers preserved so the
 > existing references (§1, §2.2, §4.1, §5, §6.1, §7.1, §7.2, §8, §9)
 > resolve again. Nothing in it is new: each section names the document
@@ -35,9 +35,7 @@ only) · Protocol **v2.1 wire FROZEN**.
 The security inputs for the Rust series: the threat list, the key
 lifecycle, the signing rules, the open decisions, and the carried
 items — in one place, so the design documents can cite a section
-number instead of re-arguing the input. Companion inputs live in
-`DATA-INPUT.md` and `TESTING-INPUT.md` (cited in `DECISIONS.md` §11
-alongside this file's §0).
+number instead of re-arguing the input.
 
 ---
 
@@ -110,8 +108,8 @@ SHA-256 of the firmware signing public key:
 
 `387764a4529337c437b233a148b48f9b2ffe3f3b5015e14c95737cb3a67a6411`
 
-Matches `crates/rsh-security/src/firmware_verify.rs` and
-`docs/FIRMWARE-COMPAT.md`. (This is a fingerprint, not a key — it
+Matches `crates/rsh-security/src/firmware_verify.rs`. (This is a
+fingerprint, not a key — it
 identifies the keypair; the public key itself is baked into the
 firmware and the app's verifier.)
 

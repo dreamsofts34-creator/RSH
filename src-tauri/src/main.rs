@@ -286,7 +286,7 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
 /// the updater plugin ignores (its `Config` has no `active` field).
 /// What keeps updates off is check-only app code + no `latest.json`
 /// published yet; the bad-signature-rejects-update test is still an
-/// open gap (deep-scan Round 2, L2 — see docs/SYSTEM-INTEGRATION.md §5).
+/// open gap (deep-scan Round 2, L2).
 #[tauri::command]
 async fn check_for_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
     system::check_for_update(&app).await

@@ -273,7 +273,7 @@ fn multi_pin_records(function: &str, pins: &[u8], slot: u8) -> Result<Vec<Config
 /// [`validate_blob`] — the same validator the board runs at COMMIT, so
 /// the UI rejects exactly what the board would reject (and never rejects
 /// what the board would accept, except for the deliberately stricter
-/// BUG-5/BUG-6c cases documented in `docs/FIRMWARE-COMPAT.md` §6).
+/// BUG-5/BUG-6c cases).
 /// A bad map is never sent to the board: the frontend gates Apply on
 /// `valid`, and this command is the defence in depth behind it.
 ///

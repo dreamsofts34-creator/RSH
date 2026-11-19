@@ -76,7 +76,7 @@ tauri-plugin-updater = "=2.14.1"
 # lock-step for the official plugins).
 tauri-plugin-dialog = "=2.8.4"
 tauri-build = "=2.7.4"
-# Windows-only (DECISIONS.md §4 — the `windows` crate does NOT compile on
+# Windows-only (the `windows` crate does NOT compile on
 # Linux, so it is only ever a `[target.'cfg(windows)'.dependencies]`
 # entry; never a plain dependency). Features are named per use site.
 windows = { version = "=0.62.2", default-features = false }

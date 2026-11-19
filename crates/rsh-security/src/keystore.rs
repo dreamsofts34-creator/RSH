@@ -1,7 +1,7 @@
 //! Per-device secrets in the OS credential store (`keyring` 4.2.0).
 //!
 //! This module is the app-side half of `docs/KEY-LIFECYCLE-RUST.md` §4 and
-//! the `keyring` decision in `docs/DECISIONS.md` §S-6 (D-R9). It stores two
+//! the `keyring` decision there (D-R9). It stores two
 //! secrets per board, and nothing else:
 //!
 //! | Secret | Service | Account (username) |
@@ -20,7 +20,7 @@
 //! Windows Credential Manager (DPAPI-backed, current-user scoped). `keyring`
 //! 4.x is fail-closed: if the platform store cannot be created,
 //! [`keyring::Entry::new`] returns an error instead of silently falling back
-//! to an in-memory mock (the `keyring` 3.x trap — see `DECISIONS.md` §S-6).
+//! to an in-memory mock (the `keyring` 3.x trap).
 //! Every failure surfaces here as [`KeystoreError::PlatformUnavailable`];
 //! pairing must fail loudly, never proceed without a stored key.
 //!
@@ -59,10 +59,9 @@ pub const KEYSTORE_SERVICE: &str = "RSH";
 
 /// Maximum credential-blob size in bytes on the platform store.
 ///
-/// Windows `CRED_MAX_CREDENTIAL_BLOB_SIZE` is 2560 bytes (see
-/// `docs/DECISIONS.md` §S-6). A write whose encoded form would exceed this
-/// is rejected before it reaches the store, so a too-large value fails
-/// loudly instead of truncating.
+/// Windows `CRED_MAX_CREDENTIAL_BLOB_SIZE` is 2560 bytes. A write whose
+/// encoded form would exceed this is rejected before it reaches the
+/// store, so a too-large value fails loudly instead of truncating.
 const MAX_CREDENTIAL_BLOB_BYTES: usize = 2560;
 
 /// Length in bytes of a device key (locked: 32 bytes, 256-bit).
@@ -391,7 +390,7 @@ impl KeyStore {
     ///
     /// The account is `board:<boardMac>` with the board identifier
     /// normalised by `normalize_board_id` (trimmed, upper-cased). This
-    /// is exposed so the Windows trap test (`docs/DECISIONS.md` §S-6) and
+    /// is exposed so the Windows trap test and
     /// diagnostics can name the exact entry without duplicating the
     /// naming rule.
     ///
@@ -616,8 +615,7 @@ mod tests {
 
     /// In-memory [`SecretBackend`] for tests only.
     ///
-    /// Why not `keyring_core::mock` (the route `docs/DECISIONS.md` §S-6
-    /// suggests)? The `keyring` 4.2.0 `v1` API re-exports only
+    /// Why not `keyring_core::mock`? The `keyring` 4.2.0 `v1` API re-exports only
     /// `keyring::Entry` / `keyring::Error` — `keyring_core::mock` is not
     /// reachable without adding `keyring-core` as a direct dependency,
     /// which would mean editing `Cargo.toml` (out of scope for this
@@ -1056,7 +1054,7 @@ mod tests {
     /// Fail-closed on this Linux sandbox: there is no Secret Service /
     /// D-Bus session here, so `keyring` 4.2.0 must refuse to create an
     /// entry instead of silently accepting into a mock store (the
-    /// `keyring` 3.x trap, `docs/DECISIONS.md` §S-6). This test is Linux
+    /// `keyring` 3.x trap). This test is Linux
     /// only on purpose: on Windows (Credential Manager) and macOS
     /// (Keychain) the platform store exists, so the same calls succeed
     /// there — see the ignored `windows_platform_round_trip` test.
@@ -1101,8 +1099,8 @@ mod tests {
     /// windows_platform_round_trip`, then confirm the entry is visible in
     /// Credential Manager (`cmdkey /list:RSH`) and gone afterwards.
     ///
-    /// This is the in-process half of the trap test in `docs/DECISIONS.md`
-    /// §S-6. The cross-process half (write here, read back in a FRESH
+    /// This is the in-process half of the trap test. The cross-process
+    /// half (write here, read back in a FRESH
     /// process — a mock store is per-process memory and cannot survive
     /// it) is still open as a Windows-runtime verification on the owner
     /// PC / Windows CI; it is not implemented here because a unit test

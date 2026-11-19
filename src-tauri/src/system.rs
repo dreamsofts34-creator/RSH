@@ -15,7 +15,7 @@
 //!
 //! // Single instance stays as-is (A2); the version arg is forwarded
 //! // by the plugin to the first instance's callback — see
-//! // `parse_instance_version_arg` / `docs/SYSTEM-INTEGRATION.md` §1.
+//! // `parse_instance_version_arg`.
 //! .plugin(tauri_plugin_autostart::init(
 //!     tauri_plugin_autostart::MacosLauncher::LaunchAgent,
 //!     Some(vec!["--tray"]),
@@ -232,8 +232,8 @@ pub fn parse_reg_query_value(stdout: &str) -> Option<String> {
 /// Returns the upstream release when one is available
 /// (`Some`), or [`None`] when the app is up to date. This only
 /// *checks* — download/install is a Phase H action (the updater
-/// signing keypair is generated there; see `docs/SYSTEM-INTEGRATION.md`
-/// §5). The caller compares the result with the running version via
+/// signing keypair is generated there). The caller compares the result
+/// with the running version via
 /// `rsh_app_core::system::check_update` and shows the update UI; the
 /// check runs only when the user asks for it (Settings "Check for
 /// updates") — never at startup — and never blocks the UI. Since

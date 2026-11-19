@@ -21,8 +21,8 @@ tauri-plugin-updater.workspace = true
 tauri-plugin-dialog.workspace = true
 rsh-app-core = { path = "../crates/rsh-app-core" }
 
-# Windows-only: the `windows` crate does not compile on Linux
-# (DECISIONS.md §4), so it is gated to Windows targets only.
+# Windows-only: the `windows` crate does not compile on Linux,
+# so it is gated to Windows targets only.
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",

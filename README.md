@@ -4,7 +4,7 @@
 [![CI](https://github.com/dreamsofts34-creator/RSH/actions/workflows/ci.yml/badge.svg)](https://github.com/dreamsofts34-creator/RSH/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: Windows 10 / 11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue.svg)](https://github.com/dreamsofts34-creator/RSH/releases/latest)
-[![Firmware: v4.0.2](https://img.shields.io/badge/firmware-v4.0.2-green.svg)](docs/FIRMWARE-COMPAT.md)
+[![Firmware: v4.0.2](https://img.shields.io/badge/firmware-v4.0.2-green.svg)](docs/ARCHITECTURE.md)
 [![Protocol: v2.1](https://img.shields.io/badge/protocol-v2.1-green.svg)](docs/ARCHITECTURE.md)
 
 **RSH (Real Sim Hub)** connects an ESP32 sim-racing wheel to Windows
@@ -90,7 +90,7 @@ firmware is **C++ v4.0.2** and the wire protocol is **v2.1 (frozen)**.
 - **Wheels already on v4.0.2 need no reflash.** Boards on v4.0.1
   still work in degraded mode (no pair button, no `GET_DIAG` /
   `HORN_TEST`); update them from the app. See
-  [firmware compatibility](docs/FIRMWARE-COMPAT.md).
+  [docs/CHANGELOG.md](docs/CHANGELOG.md) for the firmware version history.
 - Firmware images are **signed only** — unsigned or downgrade
   images are rejected by the board.
 
@@ -139,7 +139,7 @@ ESP32 wheel (C++ firmware v4.0.2, protocol v2.1 frozen)
 ├── tools/                      rsh-rig (Virtual Test Rig),
 │                               gate-checks, rsh-benchmarks,
 │                               rsh-hm-sidecar (C# NativeAOT)
-├── docs/                       docs (see docs/README.md)
+├── docs/                       docs (changelog, architecture, security, UI design)
 ├── src-tauri/ + frontend/      v1.x Tauri shell — kept but
 │                               unshipped (CI still builds it)
 ├── .github/workflows/          ci.yml, release.yml
@@ -179,19 +179,12 @@ pio run -e esp32dev            # from firmware/
 
 | Doc | What it is |
 |---|---|
-| [docs/README.md](docs/README.md) | Index of every doc in `docs/` |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | Release history (app v2.0.4, firmware v4.0.2) |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Daemon + UI split, IPC, connection state machine, threads |
 | [docs/UI-DESIGN.md](docs/UI-DESIGN.md) | Approved UI design (layout, colors, screens, states) |
-| [docs/FIRMWARE-COMPAT.md](docs/FIRMWARE-COMPAT.md) | App × firmware × protocol compatibility + verification evidence |
-| [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) | Release process + pre-tag gates |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | Frozen decisions |
 | [docs/KEY-LIFECYCLE-RUST.md](docs/KEY-LIFECYCLE-RUST.md) | Key lifecycle design (per-device key, pairing window, keyring) |
 | [docs/THREAT-MODEL-RUST.md](docs/THREAT-MODEL-RUST.md) | STRIDE threat model |
 | [docs/SECURITY-INPUT.md](docs/SECURITY-INPUT.md) | Security inputs the threat model and key lifecycle trace to |
-| [docs/SYSTEM-INTEGRATION.md](docs/SYSTEM-INTEGRATION.md) | Single instance, autostart, tray, firewall, update check |
-| [docs/TELEMETRY-RUST.md](docs/TELEMETRY-RUST.md) | AC / ACC / iRacing shared-memory readers (read-only) |
-| [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) | Diagnostics export + crash-dump approach |
 | [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) | License inventory (no GPL/AGPL/LGPL anywhere) |
 
 ## Release status (v2.0.4, 2026-11-19)

@@ -21,9 +21,9 @@
 //! parsing itself is pure and platform-independent: every reader has a
 //! `read_from_*` entry point that takes a [`MapAccessor`] and is tested
 //! on Linux against recorded shared-memory fixtures in
-//! `tests/fixtures/`. See `docs/TELEMETRY-RUST.md` for the spike
-//! verdict, the layouts used, the fixture format and the Windows-only
-//! gaps.
+//! `tests/fixtures/`. See `tests/fixtures/generate_fixtures.py`
+//! for the layouts used and the fixture format; live-game end-to-end
+//! is still open.
 
 pub mod ac;
 pub mod access;

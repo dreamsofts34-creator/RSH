@@ -3,7 +3,7 @@
 
 Regenerate with:  python3 generate_fixtures.py   (run in this directory)
 
-Format (see docs/TELEMETRY-RUST.md §4 for the full layout reference):
+Format (full layout reference — offsets are listed below):
 - ac_static.bin (1024 B): Kunos static block; carModel "ferrari_488_gt3"
   (UTF-16LE @ 68), track "monza" (@ 134), smVersion "1.4", acVersion
   "1.16.4", numberOfSessions 1 (@ 60), numCars 20 (@ 64).

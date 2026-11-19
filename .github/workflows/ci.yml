@@ -38,9 +38,9 @@
 #     dev builds — sign_firmware.py skips signing and does not fail.)
 #   * No 4-hour soak in CI: the long soak is a release blocker (D-R14) and
 #     runs in the rig (--long), not in CI. The 4-hour soak itself is
-#     SKIPPED by user order 2026-11-14 14:54 (DECISIONS §13) — never
+#     SKIPPED by user order 2026-11-14 14:54 — never
 #     presented as passed.
-#   * No `cargo test --workspace --release`: per TESTING-INPUT §9.1 that run
+#   * No `cargo test --workspace --release`: that run
 #     is required at least once before the release gate, not on every push.
 #     The release workflow runs it (deep-scan Round 2, H4).
 #
@@ -844,10 +844,10 @@ jobs:
       - name: Build lifecycle binaries (rsh-ui, rsh-daemon, rsh-fake-daemon)
         if: steps.check.outputs.run == 'true'
         run: cargo build -p rsh-ui -p rsh-daemon -p rsh-fake-daemon
-      # Quick rig gate (60 s soak + scenarios), per TESTING-INPUT §9.1.
+      # Quick rig gate (60 s soak + scenarios).
       # Full (10-min) and long (4-h, release blocker D-R14) soaks run
       # outside CI, in the rig itself. (The 4-h soak is SKIPPED by user
-      # order 2026-11-14 14:54 — DECISIONS §13 — never claimed as passed.)
+      # order 2026-11-14 14:54 — never claimed as passed.)
       - name: cargo run -p rsh-rig -- --mode quick
         if: steps.check.outputs.run == 'true'
         run: cargo run -p rsh-rig -- --mode quick

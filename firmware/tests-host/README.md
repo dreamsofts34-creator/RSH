@@ -39,6 +39,6 @@ firmware headers live directly in `firmware/`, not `firmware/rsh/`.)
 
 - Python reference: 10 positive + 6 negative (`protocol_v2_vectors.py`).
 - Rust `crates/rsh-protocol/tests/golden_vectors.rs`: **18 tests — 11
-  positive + 7 negative** (see `docs/FIRMWARE-COMPAT.md` §4).
+  positive + 7 negative**.
 - These C++ host tests mirror the same vectors; the count lives in
   `test_main.cpp` section headers, not here.

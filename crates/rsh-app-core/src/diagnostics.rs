@@ -13,9 +13,9 @@
 //! Crash dumps: the Rust panic hook is installed here (portable,
 //! testable — it appends the panic message + location to a file).
 //! The Windows native crash dump (`MiniDumpWriteDump` on an
-//! unhandled exception) is a Windows-only design documented in
-//! `docs/DIAGNOSTICS.md` §2; it needs the `windows` crate `dbghelp`
-//! feature and is a Phase H / Windows-CI item, not compiled here.
+//! unhandled exception) is a Windows-only design; it needs the
+//! `windows` crate `dbghelp` feature and is a Phase H / Windows-CI
+//! item, not compiled here.
 //!
 //! Startup log: [`append_startup_log`] appends timestamped lines to
 //! the daily-rotated `rsh-YYYYMMDD.log` in the log directory, so a
@@ -305,7 +305,7 @@ pub const PANIC_LOG_NAME: &str = "diagnostics-panic.log";
 /// panics itself — a failed write is silently dropped — and it never
 /// writes secret values (panic payloads are code strings, but the
 /// line is redacted anyway). Native Windows crash dumps
-/// (`MiniDumpWriteDump`) are documented in `docs/DIAGNOSTICS.md` §2.
+/// (`MiniDumpWriteDump`) are a Windows-only Phase H item.
 ///
 /// v1.0.2: the report is written to BOTH log locations — the given
 /// `log_dir` and the `%TEMP%` fallback ([`temp_log_dir`]) — so a

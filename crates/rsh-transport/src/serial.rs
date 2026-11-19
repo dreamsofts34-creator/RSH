@@ -11,8 +11,8 @@
 //! The design mirrors [`crate::udp::UdpTransport`]:
 //! a `std` blocking port (the workspace tokio pin does not enable the
 //! `net` feature, and `serialport` is a blocking API by design —
-//! `tokio-serial` 5.5.0 stays the escape hatch per spike decision S-4,
-//! `docs/DECISIONS.md`), a blocking reader thread feeding the
+//! `tokio-serial` 5.5.0 stays the escape hatch per spike decision S-4),
+//! a blocking reader thread feeding the
 //! incremental [`SerialDecoder`] and forwarding decoded frames into
 //! bounded tokio `mpsc` channels. [`PacketSource::next_frame`] awaits
 //! the channel, which is cancellation-safe, so the engine's zero-timeout

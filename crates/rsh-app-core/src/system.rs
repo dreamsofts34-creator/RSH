@@ -25,8 +25,8 @@
 //!   hidden when a tray icon actually exists.
 //! - firewall rule *specification* (SW-R7.4) — the program-scoped rule
 //!   itself is applied by the Windows COM code in `src-tauri`
-//!   (verified spike path, see `docs/SYSTEM-INTEGRATION.md`); this
-//!   module only builds and describes the spec.
+//!   (verified spike path); this module only builds and describes
+//!   the spec.
 //! - shutdown-neutral path (F4) — signal the engine to stop, then a
 //!   best-effort neutral send so the wheel never stays deflected after
 //!   the app exits.
@@ -137,8 +137,8 @@ pub const RUNTIME_CHECK_NOT_APPLICABLE: &str =
 /// The decision is pure logic; the handover itself (the running
 /// instance exiting so the newer one can take over) needs a
 /// named-event handshake the `tauri-plugin-single-instance` plugin
-/// does not provide — see `docs/SYSTEM-INTEGRATION.md` §1. Until
-/// that handshake exists, the shell ships the plugin's behaviour
+/// does not provide. Until that handshake exists, the shell ships
+/// the plugin's behaviour
 /// (focus the existing window) and treats `TakeOver` as "log and
 /// focus", never as a silent kill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,8 +163,8 @@ pub enum InstanceDecision {
 /// - running is newer → [`InstanceDecision::YieldFailClosed`]
 ///   (this process is the older one);
 /// - running is older → [`InstanceDecision::TakeOver`] (the running
-///   instance is the older one and must exit — the handover protocol
-///   in `docs/SYSTEM-INTEGRATION.md` §1);
+///   instance is the older one and must exit — but no handshake
+///   exists to make it exit, so the shell only focuses it);
 /// - same version → [`InstanceDecision::FocusExisting`];
 /// - either version unparsable → [`InstanceDecision::YieldFailClosed`]
 ///   (fail-closed: never guess).
@@ -385,10 +385,10 @@ pub const FIREWALL_RULE_NAME: &str = "RSH";
 /// left alone (Windows allows outbound by default). The rule is
 /// applied by the Windows COM code in `src-tauri/src/system.rs`
 /// (`INetFwPolicy2` / `INetFwRule`, verified against the
-/// `windows` 0.62.2 crate source — see `docs/SYSTEM-INTEGRATION.md`
-/// §4). Applying it needs elevation; a non-elevated apply fails
-/// loudly and the app keeps working without the rule (the user is
-/// told to allow it in the firewall prompt instead).
+/// `windows` 0.62.2 crate source). Applying it needs elevation; a
+/// non-elevated apply fails loudly and the app keeps working without
+/// the rule (the user is told to allow it in the firewall prompt
+/// instead).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FirewallRuleSpec {
     /// Rule name ([`FIREWALL_RULE_NAME`]).

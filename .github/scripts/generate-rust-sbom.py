@@ -157,7 +157,7 @@ def main() -> None:
                     "THIRD-PARTY-LICENSES.md. Regenerate at release time with "
                     ".github/scripts/generate-rust-sbom.py (cargo cyclonedx "
                     "does NOT reproduce this file — per-crate BOMs, host-target "
-                    "only, dev-deps excluded; see docs/DECISIONS.md §16)."
+                    "only, dev-deps excluded)."
                 ),
             },
             "licenses": [{"license": {"id": "MIT"}}],

@@ -1234,8 +1234,7 @@ mod tests {
     use crate::config::{ConfigBlob, ConfigRecord, record_type};
 
     /// Build a blob from exact 16-byte record hex strings (the FW-A2
-    /// regression bytes, verbatim — spaces allowed, as listed in
-    /// `docs/FIRMWARE-COMPAT.md` §6).
+    /// regression bytes, verbatim — spaces allowed).
     fn blob_from_hex(records_hex: &[&str]) -> ConfigBlob {
         let records = records_hex
             .iter()
@@ -1470,7 +1469,7 @@ mod tests {
     }
 
     // --- FW-A2 §6 regressions (BUG-1–BUG-4, BUG-6a, BUG-6b) ---
-    // Each test uses the exact record bytes from FIRMWARE-COMPAT.md §6
+    // Each test uses the exact recorded regression bytes
     // and asserts the error Rust previously missed (board COMMIT
     // rejects these with PIN_CONFLICT / UNSUPPORTED).
 

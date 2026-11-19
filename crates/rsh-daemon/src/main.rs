@@ -2025,8 +2025,7 @@ impl PopupHandle {
     }
 
     /// One game row (empty strings when the daemon knows fewer than
-    /// `index + 1` games — the row renders blank; see the Phase 7
-    /// notes in docs/RELEASE-CHECKLIST.md).
+    /// `index + 1` games — the row renders blank).
     fn set_game_row(&self, index: usize, game: Option<&PopupGame>) {
         let (id, name, initials, state, can_launch) = match game {
             Some(game) => (

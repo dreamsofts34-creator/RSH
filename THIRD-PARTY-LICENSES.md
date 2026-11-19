@@ -128,8 +128,7 @@ allow-list verbatim):**
 
 The sidecar has **no NuGet packages** (only the DLL reference above), so its SBOM is
 hand-written; verify the pins at release time against the sidecar
-staging script (`tools/ci/stage-sidecar.ps1`) and
-`docs/RELEASE-CHECKLIST.md`.
+staging script (`tools/ci/stage-sidecar.ps1`).
 
 ## 4. Not bundled / not distributed by RSH (excluded from the SBOMs)
 

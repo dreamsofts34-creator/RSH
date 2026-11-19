@@ -1,8 +1,7 @@
 # RSH v2.0 — Release (THREE-ASSET, daemon + Slint UI)
 #
 # THREE-ASSET RELEASE (user orders 2026-11-16 ~20:20 + 2026-11-17
-# ~07:48 — supersedes the 2026-11-15 exe-only rule, see
-# docs/DECISIONS.md §18): the release contains EXACTLY THREE assets:
+# ~07:48 — supersedes the 2026-11-15 exe-only rule): the release contains EXACTLY THREE assets:
 #   1. NSIS installer `RSH_<version>_x64-setup.exe`
 #   2. Merged full-flash firmware `RSH-Firmware-DevKitV1-<version>.bin`
 #      (factory image, flash at 0x0)
@@ -95,8 +94,7 @@
 #      — process + IPC + rule is the strongest launch evidence in
 #      CI; real paint stays a human gate.
 #
-# PREREQUISITES (human gates — NOT checked by this workflow, see
-# docs/RELEASE-CHECKLIST.md):
+# PREREQUISITES (human gates — NOT checked by this workflow):
 #   * Workspace version bumped to the tag version (Cargo.toml
 #     `[workspace.package]`): the tag check below FAILS CLOSED until
 #     then — bump first, then tag.
@@ -106,7 +104,7 @@
 #     workflow only records whether the runner happens to have vJoy
 #     installed (it will not).
 #
-# Release assets (exact list — THREE assets, see docs/RELEASE-CHECKLIST.md §3):
+# Release assets (exact list — THREE assets, as listed in this workflow's header):
 #   RSH_2.0.2_x64-setup.exe            (NSIS installer — app version)
 #   RSH-Firmware-DevKitV1-v4.0.2.bin    (merged full-flash firmware image — firmware version)
 #   RSH-Firmware-DevKitV1-v4.0.2-OTA.bin (Ed25519-signed OTA image — firmware version)
@@ -764,7 +762,7 @@ jobs:
       # the rule and the install dir are gone. What it CANNOT prove
       # (headless runner): the window actually painting — process +
       # IPC + rule is the strongest launch evidence available in CI;
-      # real paint is a human gate (docs/RELEASE-CHECKLIST.md).
+      # real paint is a human gate (see the human gates in this workflow's header).
       # Every process wait here is timeout-bounded via
       # Start-WaitOrFail: run 44047919933 hung SILENTLY for 13+ min
       # in a bare `Start-Process -Wait` on the second install (the
