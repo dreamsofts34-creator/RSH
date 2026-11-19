@@ -483,6 +483,7 @@ jobs:
           ; release assets (exe + merged firmware + OTA firmware).
           !include "LogicLib.nsh"
           !include "WordFunc.nsh"
+          !include "StrFunc.nsh"
           !define VERSION "${VERSION}"
           ; Smart-installer state: set by .onInit (detection) and read
           ; by the install section (daemon restart after an update).
