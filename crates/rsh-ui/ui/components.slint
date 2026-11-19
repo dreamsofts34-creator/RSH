@@ -846,6 +846,11 @@ export component GameTile inherits Rectangle {
     in property <string> action;
     in property <bool> action-primary;
     callback action-clicked();
+    // Manual games (no auto-scan): small Edit / Remove affordances
+    // next to the Launch/Stop button — text links, like the
+    // Overview diagnostics link, so the tile stays one row tall.
+    callback edit-clicked();
+    callback remove-clicked();
     border-radius: 10px;
     border-width: 1px;
     border-color: ta.has-hover ? Theme.faint : Theme.line;
@@ -888,6 +893,51 @@ export component GameTile inherits Rectangle {
                 font-size: 11px;
                 color: sub-warn ? Theme.warn : Theme.mute;
                 wrap: word-wrap;
+            }
+        }
+        // Edit / Remove links (manual games): text links with the
+        // same keyboard activation as the diagnostics link.
+        VerticalLayout {
+            spacing: 4px;
+            Text {
+                text: "Edit";
+                font-size: 11.5px;
+                font-weight: 600;
+                color: edit-fs.has-focus || edit-ta.has-hover ? Theme.text : Theme.accent-text;
+                accessible-label: "Edit " + name;
+                accessible-role: button;
+                edit-fs := FocusScope {
+                    width: 100%;
+                    height: 100%;
+                    key-pressed(event) => {
+                        if (event.text == Key.Return || event.text == Key.Space) {
+                            edit-clicked();
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+                edit-ta := TouchArea { mouse-cursor: pointer; clicked => { edit-clicked(); } }
+            }
+            Text {
+                text: "Remove";
+                font-size: 11.5px;
+                font-weight: 600;
+                color: remove-fs.has-focus || remove-ta.has-hover ? Theme.text : Theme.mute;
+                accessible-label: "Remove " + name;
+                accessible-role: button;
+                remove-fs := FocusScope {
+                    width: 100%;
+                    height: 100%;
+                    key-pressed(event) => {
+                        if (event.text == Key.Return || event.text == Key.Space) {
+                            remove-clicked();
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+                remove-ta := TouchArea { mouse-cursor: pointer; clicked => { remove-clicked(); } }
             }
         }
         // No action for "Not installed" games (A14): an empty action

@@ -1272,6 +1272,11 @@ struct Ctx {
     /// Last profiles/games lists (A8/A14): index → id lookups.
     profiles_cache: Rc<RefCell<Vec<ProfileSummary>>>,
     games_cache: Rc<RefCell<Vec<GameSummary>>>,
+    /// Add/edit game dialog state (manual games): the id being
+    /// edited (`None` = adding a new game), and the bound profile
+    /// id chosen in the dialog (`None` = no profile bound).
+    game_dialog_edit_id: Rc<RefCell<Option<String>>>,
+    game_dialog_profile_id: Rc<RefCell<Option<String>>>,
     /// Profile id waiting on the unsaved-changes prompt (A8).
     pending_profile_id: Rc<RefCell<Option<String>>>,
     /// Learn target: 0 none, 1 Buttons page, 2 horn (Extras).
@@ -1565,7 +1570,6 @@ impl Ctx {
         self.sync_extras(win);
         self.sync_overview(win);
         self.refresh_profiles(win);
-        self.refresh_games(win);
         self.sync_diag(win);
         self.sync_keep_in_tray(win);
         self.sync_vjoy(win);
@@ -4074,7 +4078,8 @@ impl Ctx {
     /// Refresh the game tiles (A14) + the wizard Games step (A17)
     /// from `list_games()`. Tiles: running → Stop, installed →
     /// Launch, not installed → "Not installed" with NO action button
-    /// (no fake Locate). Empty lists show the empty state, never
+    /// (no fake Locate). Games are manual-only now (no auto-scan):
+    /// an empty list shows the add-game empty state, never
     /// invented games.
     fn refresh_games(&self, win: &MainWindow) {
         let games = self.api().list_games();
@@ -4122,13 +4127,13 @@ impl Ctx {
         drop(profiles);
         win.set_games(ModelRc::new(Rc::new(VecModel::from(items))));
         if games.is_empty() {
-            win.set_setup_games_text("No games found yet.".into());
+            win.set_setup_games_text("No games added yet.".into());
             win.set_setup_games_done(false);
         } else {
             let names: Vec<String> = games.iter().map(|g| g.name.clone()).collect();
             win.set_setup_games_text(
                 format!(
-                    "Found {} game{}: {}",
+                    "Added {} game{}: {}",
                     games.len(),
                     if games.len() == 1 { "" } else { "s" },
                     names.join(", ")
@@ -4138,6 +4143,239 @@ impl Ctx {
             win.set_setup_games_done(true);
         }
         *self.games_cache.borrow_mut() = games;
+    }
+
+    /// Open the add/edit game dialog for a new game (`None`) or
+    /// the game with this id. Games are manual-only: the exe path
+    /// is typed in (no file picker — see [`wire_game_dialog`]),
+    /// and [`GameSummary`] carries no exe path, so Edit pre-fills
+    /// the name + bound profile and the exe field starts empty —
+    /// the user types (or pastes) the exe path again. Refuses
+    /// while RSH isn't running: there is no store to save to, so
+    /// say so instead of opening a dialog whose Save can only fail.
+    fn open_game_dialog(&self, win: &MainWindow, edit_id: Option<String>) {
+        if !self.is_live() {
+            self.notify(
+                win,
+                "Games",
+                "RSH isn't running",
+                "RSH isn't running — reconnect, then add a game.",
+            );
+            return;
+        }
+        self.refresh_profiles(win);
+        let game = edit_id.as_deref().and_then(|id| {
+            self.games_cache
+                .borrow()
+                .iter()
+                .find(|g| g.id == id)
+                .cloned()
+        });
+        if edit_id.is_some() && game.is_none() {
+            self.notify(
+                win,
+                "Game",
+                "Game not found",
+                "That game isn't in the list any more.",
+            );
+            return;
+        }
+        let (title, name, profile_id) = match &game {
+            Some(g) => (
+                "Edit game".to_string(),
+                g.name.clone(),
+                g.bound_profile_id.clone(),
+            ),
+            None => ("Add game".to_string(), String::new(), None),
+        };
+        *self.game_dialog_edit_id.borrow_mut() = edit_id;
+        self.game_dialog_profile_id
+            .borrow_mut()
+            .clone_from(&profile_id);
+        win.set_game_dialog_title(title.into());
+        win.set_game_dialog_name(name.into());
+        win.set_game_dialog_exe("".into());
+        win.set_game_dialog_profile_name(
+            self.game_dialog_profile_label(profile_id.as_ref()).into(),
+        );
+        win.set_game_dialog_open(true);
+    }
+
+    /// Display name for the dialog's bound profile: "No profile"
+    /// when none is bound (a stale id falls back the same way).
+    fn game_dialog_profile_label(&self, profile_id: Option<&String>) -> String {
+        match profile_id {
+            Some(id) => self
+                .profiles_cache
+                .borrow()
+                .iter()
+                .find(|p| &p.id == id)
+                .map_or_else(|| "No profile".to_string(), |p| p.name.clone()),
+            None => "No profile".to_string(),
+        }
+    }
+
+    /// Cycle the dialog's bound profile: none → first profile →
+    /// … → last → none again (the profile-link control's cycling
+    /// pattern — the dialog has no dropdown component).
+    fn cycle_game_dialog_profile(&self, win: &MainWindow) {
+        let profiles = self.profiles_cache.borrow().clone();
+        if profiles.is_empty() {
+            self.notify(
+                win,
+                "Profile",
+                "No profiles yet",
+                "Create a profile first, then link it to a game.",
+            );
+            return;
+        }
+        let current = self.game_dialog_profile_id.borrow().clone();
+        let next = match current
+            .as_deref()
+            .and_then(|id| profiles.iter().position(|p| p.id == id))
+        {
+            None => Some(profiles[0].id.clone()),
+            Some(i) if i + 1 < profiles.len() => Some(profiles[i + 1].id.clone()),
+            Some(_) => None,
+        };
+        win.set_game_dialog_profile_name(self.game_dialog_profile_label(next.as_ref()).into());
+        *self.game_dialog_profile_id.borrow_mut() = next;
+    }
+
+    /// Save the dialog: validate name + exe (empty is refused
+    /// through `notify_error`, like every other failure), then run
+    /// the add / update on a [`JobKind::GameOp`] job thread — the
+    /// click never blocks on the daemon. Success refreshes the
+    /// game tiles + profiles (a new bound profile changes the
+    /// auto-profile line) and closes the dialog.
+    fn save_game_dialog(&self, win: &MainWindow, name: &str, exe: &str) {
+        let name = name.trim().to_string();
+        let exe = exe.trim().to_string();
+        if name.is_empty() || exe.is_empty() {
+            self.notify_error(
+                win,
+                "Game",
+                &UserError::from_connection(
+                    ConnectionError::Unknown,
+                    "Enter a name and the game's exe or shortcut path.",
+                ),
+            );
+            return;
+        }
+        let edit_id = self.game_dialog_edit_id.borrow().clone();
+        let profile_id = self.game_dialog_profile_id.borrow().clone();
+        let adding = edit_id.is_none();
+        let label = if adding {
+            "Adding game…"
+        } else {
+            "Saving game…"
+        };
+        self.run_generic_job(
+            win,
+            JobKind::GameOp,
+            label,
+            move |api| {
+                let result = if let Some(id) = &edit_id {
+                    api.update_game(id, &name, &exe, profile_id.clone())
+                } else {
+                    api.add_game(&name, &exe, profile_id)
+                };
+                JobResult::Text(result.map(|g| g.name))
+            },
+            move |ctx, w, result| {
+                let JobResult::Text(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(saved_name) => {
+                        w.set_game_dialog_open(false);
+                        ctx.refresh_games(w);
+                        ctx.refresh_profiles(w);
+                        let body = if adding {
+                            format!("{saved_name} added.")
+                        } else {
+                            format!("{saved_name} saved.")
+                        };
+                        ctx.notify(
+                            w,
+                            "Game",
+                            if adding { "Game added" } else { "Game saved" },
+                            &body,
+                        );
+                    }
+                    Err(e) => ctx.notify_error(w, "Game", &e),
+                }
+            },
+        );
+    }
+
+    /// Remove a manually added game on a [`JobKind::GameOp`] job
+    /// thread. Refuses while RSH isn't running, refuses an unknown
+    /// id, and refuses a running game (stop it first) — all with a
+    /// plain message, never a silent no-op. Success refreshes the
+    /// tiles.
+    fn remove_game(&self, win: &MainWindow, id: String) {
+        if !self.is_live() {
+            self.notify(
+                win,
+                "Games",
+                "RSH isn't running",
+                "RSH isn't running — reconnect, then remove the game.",
+            );
+            return;
+        }
+        let Some(game) = self
+            .games_cache
+            .borrow()
+            .iter()
+            .find(|g| g.id == id)
+            .cloned()
+        else {
+            self.notify(
+                win,
+                "Game",
+                "Game not found",
+                "That game isn't in the list any more.",
+            );
+            return;
+        };
+        if game.running {
+            self.notify(
+                win,
+                "Game",
+                "Game is running",
+                &format!("Stop {} first, then remove it.", game.name),
+            );
+            return;
+        }
+        let name = game.name.clone();
+        self.run_generic_job(
+            win,
+            JobKind::GameOp,
+            "Removing game…",
+            move |api| JobResult::Bool(api.remove_game(&id)),
+            move |ctx, w, result| {
+                let JobResult::Bool(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(true) => {
+                        ctx.refresh_games(w);
+                        ctx.notify(w, "Game", "Game removed", &format!("{name} removed."));
+                    }
+                    Ok(false) => {
+                        ctx.refresh_games(w);
+                        ctx.notify(
+                            w,
+                            "Game",
+                            "Game not found",
+                            "That game isn't in the list any more.",
+                        );
+                    }
+                    Err(e) => ctx.notify_error(w, "Game", &e),
+                }
+            },
+        );
     }
 
     /// Sync the diagnostics drawer props (v2.0.1 hotfix): connection
@@ -4921,7 +5159,7 @@ impl Ctx {
                 win,
                 "Profile",
                 "Link to game",
-                "No games found — install a racing game first.",
+                "No games added yet — add a game from the Overview page.",
             );
             return;
         }
@@ -5120,6 +5358,7 @@ fn wire_callbacks(win: &MainWindow, ctx: &Rc<Ctx>) {
     wire_keyboard(win);
     wire_notifications(win, ctx);
     wire_setup(win, ctx);
+    wire_game_dialog(win, ctx);
     wire_pedals(win, ctx);
     wire_buttons(win, ctx);
     wire_extras(win, ctx);
@@ -5503,40 +5742,71 @@ fn wire_setup_pairing(win: &MainWindow, ctx: &Rc<Ctx>) {
             setup_connect_to(&w, &ctx, transport);
         });
     }
+}
+
+/// Wire the manual add/edit/remove game dialog (no auto-scan):
+/// `add-game` / `edit-game` open the dialog, `remove-game`
+/// deletes, the dialog's save runs the add/update job and its
+/// profile button cycles the bound profile like the profile-link
+/// control (no picker component exists). The dialog is a
+/// `GameDialog` overlay in ui/main.slint, following the profile
+/// popover pattern (Rust-owned props, callbacks carry the typed
+/// values). No file picker: `rfd` cannot resolve offline on this
+/// Linux VM (`pollster` is not in the cargo cache, and the gtk3
+/// backend needs GTK dev packages that are not installed), so the
+/// exe path is a plain text field — a picker can be added later
+/// without changing this wiring.
+fn wire_game_dialog(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
         let ctx = ctx.clone();
-        win.unwrap().on_setup_find_games(move || {
+        win.unwrap().on_add_game(move || {
             if let Some(w) = win.upgrade() {
-                // DS-55: when RSH isn't running, the empty list is
-                // the daemon's fault, not the user's — say so instead
-                // of blaming them for not having games installed.
-                if !ctx.is_live() {
-                    ctx.notify(
-                        &w,
-                        "Games",
-                        "RSH isn't running",
-                        "RSH isn't running — reconnect, then search again.",
-                    );
-                    return;
-                }
-                ctx.refresh_games(&w);
-                let count = ctx.games_cache.borrow().len();
-                if count == 0 {
-                    ctx.notify(
-                        &w,
-                        "Games",
-                        "No games found",
-                        "No games found — install a racing game and try again.",
-                    );
-                } else {
-                    ctx.notify(
-                        &w,
-                        "Games",
-                        "Games found",
-                        &format!("Found {count} game{}.", if count == 1 { "" } else { "s" }),
-                    );
-                }
+                ctx.open_game_dialog(&w, None);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_edit_game(move |id| {
+            if let Some(w) = win.upgrade() {
+                ctx.open_game_dialog(&w, Some(id.to_string()));
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_remove_game(move |id| {
+            if let Some(w) = win.upgrade() {
+                ctx.remove_game(&w, id.to_string());
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_game_dialog_save(move |name, exe| {
+            if let Some(w) = win.upgrade() {
+                ctx.save_game_dialog(&w, &name, &exe);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        win.unwrap().on_game_dialog_cancel(move || {
+            if let Some(w) = win.upgrade() {
+                w.set_game_dialog_open(false);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_game_dialog_cycle_profile(move || {
+            if let Some(w) = win.upgrade() {
+                ctx.cycle_game_dialog_profile(&w);
             }
         });
     }
@@ -6568,7 +6838,8 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
 ///   elsewhere a no-op.
 /// - `keyboard-nav` (Up/Down): move through the navigator pages 0..=5
 ///   (About is 6, reached from the sidebar footer, not the navigator).
-/// - `keyboard-escape`: closes the profile popover first, then the
+/// - `keyboard-escape`: closes the game dialog first, then the
+///   profile popover, then the
 ///   notifications drawer, then the diagnostics drawer (v2.0.1 hotfix).
 /// - `focus-keyboard`: focuses the root keyboard scope once at startup so
 ///   keys work before the user Tabs anywhere.
@@ -6600,7 +6871,10 @@ fn wire_keyboard(win: &MainWindow) {
         let win = win.as_weak();
         win.unwrap().on_keyboard_escape(move || {
             if let Some(w) = win.upgrade() {
-                if w.get_popover_open() {
+                if w.get_game_dialog_open() {
+                    w.set_game_dialog_open(false);
+                    eprintln!("RSH-UI keyboard-escape closed game dialog");
+                } else if w.get_popover_open() {
                     w.set_popover_open(false);
                     eprintln!("RSH-UI keyboard-escape closed profile popover");
                 } else if w.get_notif_open() {
@@ -7970,7 +8244,10 @@ fn start_frame_timer(
             if t.is_multiple_of(100) {
                 ctx.refresh_calibration();
                 ctx.refresh_profiles(&w);
-                ctx.refresh_games(&w);
+                // Games are manual-only now (no auto-scan): the list
+                // changes only via add / edit / remove / launch /
+                // stop / profile ops, which refresh it themselves —
+                // the 5 s tick no longer re-reads it.
                 // H9: while the wizard sits on Calibrate, re-probe
                 // raw mV so Next enables when wheel data arrives.
                 if w.get_setup_mode() && w.get_setup_step() == 3 {
@@ -8059,6 +8336,8 @@ fn main() -> Result<(), slint::PlatformError> {
         ])),
         profiles_cache: Rc::new(RefCell::new(Vec::new())),
         games_cache: Rc::new(RefCell::new(Vec::new())),
+        game_dialog_edit_id: Rc::new(RefCell::new(None)),
+        game_dialog_profile_id: Rc::new(RefCell::new(None)),
         pending_profile_id: Rc::new(RefCell::new(None)),
         learn_target: Rc::new(Cell::new(0)),
         horn_test_until: Rc::new(Cell::new(None)),
@@ -8748,6 +9027,8 @@ mod tests {
             ])),
             profiles_cache: Rc::new(RefCell::new(Vec::new())),
             games_cache: Rc::new(RefCell::new(Vec::new())),
+            game_dialog_edit_id: Rc::new(RefCell::new(None)),
+            game_dialog_profile_id: Rc::new(RefCell::new(None)),
             pending_profile_id: Rc::new(RefCell::new(None)),
             learn_target: Rc::new(Cell::new(0)),
             horn_test_until: Rc::new(Cell::new(None)),

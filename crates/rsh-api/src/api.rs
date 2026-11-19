@@ -1027,6 +1027,57 @@ pub trait AppApi: Send + Sync {
         ))
     }
 
+    /// Add a manually added game (name + exe/shortcut path,
+    /// optional bound profile id); returns the new entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty name or exe path, an unknown
+    /// bound profile, or a save failure.
+    fn add_game(
+        &self,
+        _name: &str,
+        _exe_path: &str,
+        _profile_id: Option<String>,
+    ) -> Result<GameSummary, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "games are not supported by this API",
+        ))
+    }
+
+    /// Update a manually added game's name / exe path / bound
+    /// profile; returns the updated entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown id, an empty name or exe
+    /// path, an unknown bound profile, or a save failure.
+    fn update_game(
+        &self,
+        _id: &str,
+        _name: &str,
+        _exe_path: &str,
+        _profile_id: Option<String>,
+    ) -> Result<GameSummary, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "games are not supported by this API",
+        ))
+    }
+
+    /// Remove a manually added game; returns `true` when removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown id or a running game.
+    fn remove_game(&self, _id: &str) -> Result<bool, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "games are not supported by this API",
+        ))
+    }
+
     /// Arm learn mode: the next physical wheel-button press (1–32)
     /// is captured for the binding editor. Returns the learning
     /// state after the call (`true` when armed).

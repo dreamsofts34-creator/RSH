@@ -183,7 +183,7 @@ use rsh_profiles::resolver::{
 };
 use rsh_profiles::store::{
     BackupGeneration, BackupInfo, ProfileStore, format_system_time_rfc3339, game_id_from_slug,
-    game_slug, validate_profile_name,
+    validate_profile_name,
 };
 use rsh_profiles::watcher::{
     CarSource, ForegroundDetector, TelemetryWatcher, WindowsForegroundDetector,
@@ -217,10 +217,8 @@ use crate::commands::{
 use crate::diagnostics::{redact_secrets, utc_now_iso};
 use crate::draft::{DraftStatus, ProfileDraft};
 use crate::firmware_image;
-use crate::launcher::{
-    GameLauncher, SystemSpawner, detect_all_games_with, detect_game_with, game_by_id,
-    iracing_paths_for, steam_roots_for,
-};
+use crate::launcher::{GameLauncher, SystemSpawner};
+use crate::manual_games::ManualGameStore;
 use crate::secrets::ZeroizingString;
 use crate::snapshot::{
     ConnectionState, EncoderState, EngineSnapshot, EngineStats, LoopRateTracker, PedalSnapshot,
@@ -348,11 +346,11 @@ pub enum BindingAppAction {
     ProfilePrevious,
 }
 
-/// One catalogue game, as the frontend's `GameInfo` shape consumes it.
+/// One manually added game, as the frontend's `GameInfo` shape consumes it.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GameInfo {
-    /// Game id (one of the `GAME_*` constants, e.g. `"assetto_corsa"`).
+    /// Game id (the manual entry's slug id, e.g. `"my-racing-game"`).
     pub id: String,
     /// Display name.
     pub name: String,
@@ -798,6 +796,13 @@ pub struct AppStateCore {
     /// Load-time warnings from the bindings store (see
     /// [`AppStateCore::binding_load_warnings`]).
     binding_load_warnings: Vec<String>,
+    /// Manually added games (game-scanner removal, v2.0.3+):
+    /// the `manual-games.json` store — name + exe/shortcut path
+    /// per entry, no detection of any kind.
+    manual_games: Mutex<ManualGameStore>,
+    /// Load-time warnings from the manual-games store (see
+    /// [`AppStateCore::manual_game_load_warnings`]).
+    manual_game_load_warnings: Vec<String>,
     /// Last pressed set for buttons 1–64 (`buttons | buttons_ex <<
     /// 32`), for app-action edge detection in
     /// [`AppStateCore::apply_bindings`].
@@ -1051,6 +1056,10 @@ impl AppStateCore {
         // fails the state open — see `rsh_profiles::bindings`).
         let bindings = BindingStore::open(store.dir());
         let binding_load_warnings = bindings.load_warnings().to_vec();
+        // The manual-games store lives beside the profile store too
+        // (same load-never-fails contract — see `manual_games`).
+        let manual_games = ManualGameStore::open(store.dir());
+        let manual_game_load_warnings = manual_games.load_warnings().to_vec();
         Self {
             metrics: Mutex::new(EngineMetrics::new()),
             loop_rate: Mutex::new(LoopRateTracker::new()),
@@ -1080,6 +1089,8 @@ impl AppStateCore {
             learned_button: Mutex::new(None),
             bindings: Mutex::new(bindings),
             binding_load_warnings,
+            manual_games: Mutex::new(manual_games),
+            manual_game_load_warnings,
             last_bound_pressed: Mutex::new(0),
             binding_actions: Mutex::new(VecDeque::new()),
             stop_handle: Mutex::new(None),
@@ -4471,6 +4482,14 @@ impl AppStateCore {
         self.binding_load_warnings.clone()
     }
 
+    /// Load-time warnings from the manual-games store (dropped
+    /// entries, corrupt file). Empty on a clean load; the daemon
+    /// logs them at startup so a dropped game is never silent.
+    #[must_use]
+    pub fn manual_game_load_warnings(&self) -> Vec<String> {
+        self.manual_game_load_warnings.clone()
+    }
+
     /// Drain the app actions queued by bound button presses (oldest
     /// first). The daemon manager loop runs them — profile cycles
     /// happen there, not on the 200 Hz engine tick.
@@ -4793,6 +4812,18 @@ impl AppStateCore {
     /// Returns a message for an unknown game slug or id, or a store
     /// save failure.
     pub fn link_profile(&self, id: &str, game_slug: &str) -> Result<ProfileSummary, String> {
+        // Manual games (game-scanner removal): a profile links to a
+        // manual entry by storing the profile id on the entry itself
+        // — the profile store only knows the four catalogue `GameId`s,
+        // so a manual slug would map to `Unknown` below. The binding
+        // is what `list_games` reports as `bound_profile_id`.
+        if lock(&self.manual_games).get(game_slug).is_some() {
+            if !self.profile_exists(id) {
+                return Err(format!("no profile with id '{id}'"));
+            }
+            let _ = lock(&self.manual_games).set_profile(game_slug, Some(id.to_string()))?;
+            return Self::summary(&lock(&self.store), id);
+        }
         let game = game_id_from_slug(game_slug);
         if game == GameId::Unknown {
             return Err(format!("unknown game '{game_slug}'"));
@@ -5222,41 +5253,26 @@ impl AppStateCore {
     /* Games                                                               */
     /* ------------------------------------------------------------------ */
 
-    /// Every catalogue game with its install state, bound profile, and
-    /// running state (the tracked game only — refresh first, so a game
-    /// that exited on its own stops showing as running). Detection
-    /// uses the configured Steam / iRacing paths (M2) plus the
-    /// Registry and the defaults.
+    /// Every manually added game with its install state, bound
+    /// profile, and running state (the tracked game only — refresh
+    /// first, so a game that exited on its own stops showing as
+    /// running). There is no detection: the list is exactly what the
+    /// user added (game-scanner removal, v2.0.3+). `installed` is
+    /// true when the stored exe/shortcut path exists on disk.
     #[must_use]
     pub fn list_games(&self) -> Vec<GameInfo> {
-        let settings = self.settings();
-        let detected = detect_all_games_with(
-            &steam_roots_for(Some(settings.steam_path.as_str())),
-            &iracing_paths_for(Some(settings.iracing_path.as_str())),
-        );
-        let store = lock(&self.store);
+        let games = lock(&self.manual_games).list().to_vec();
         let mut launcher = lock(&self.launcher);
         let _ = launcher.refresh();
         let running_id = launcher.running().map(|running| running.game_id.clone());
-        detected
+        games
             .into_iter()
-            .map(|game| {
-                // Launcher ids are hyphenated (`assetto-corsa`) while
-                // profile game slugs are underscored (`assetto_corsa`):
-                // normalize before comparing, or no profile ever binds.
-                let slug = game.game_id.replace('-', "_");
-                let bound_profile_id = store
-                    .list()
-                    .iter()
-                    .find(|stored| game_slug(stored.profile.game).is_some_and(|s| s == slug))
-                    .map(|stored| stored.id.clone());
-                GameInfo {
-                    id: game.game_id.clone(),
-                    name: game.name.clone(),
-                    bound_profile_id,
-                    running: running_id.as_deref() == Some(game.game_id.as_str()),
-                    installed: game.installed,
-                }
+            .map(|game| GameInfo {
+                id: game.id.clone(),
+                name: game.name.clone(),
+                bound_profile_id: game.bound_profile_id.clone(),
+                running: running_id.as_deref() == Some(game.id.as_str()),
+                installed: Path::new(&game.exe_path).is_file(),
             })
             .collect()
     }
@@ -5281,29 +5297,34 @@ impl AppStateCore {
     /// another game is already running, or the OS refuses to start it.
     pub fn launch_game(&self, id: &str) -> Result<GameInfo, String> {
         use crate::launcher::LaunchError;
-        let game = game_by_id(id).ok_or_else(|| format!("unknown game '{id}'"))?;
-        let settings = self.settings();
-        let detected = detect_game_with(
-            game,
-            &steam_roots_for(Some(settings.steam_path.as_str())),
-            &iracing_paths_for(Some(settings.iracing_path.as_str())),
-        );
+        let game = lock(&self.manual_games)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("unknown game '{id}'"))?;
+        if !Path::new(&game.exe_path).is_file() {
+            return Err(format!(
+                "game '{}' is not installed (exe not found: {})",
+                game.id, game.exe_path
+            ));
+        }
         {
             let mut launcher = lock(&self.launcher);
-            launcher.launch(&detected).map_err(|error| match error {
-                LaunchError::NotInstalled(game_id) => {
-                    format!("game '{game_id}' is not installed")
-                }
-                LaunchError::AlreadyRunning(game_id) => {
-                    format!("game '{game_id}' is already running")
-                }
-                LaunchError::SpawnFailed(message) => {
-                    format!("failed to launch game: {message}")
-                }
-                LaunchError::UnsupportedPlatform(detail) => {
-                    format!("game launch is not supported on this platform: {detail}")
-                }
-            })?;
+            launcher
+                .launch(&game.id, &game.exe_path)
+                .map_err(|error| match error {
+                    LaunchError::NotInstalled(game_id) => {
+                        format!("game '{game_id}' is not installed")
+                    }
+                    LaunchError::AlreadyRunning(game_id) => {
+                        format!("game '{game_id}' is already running")
+                    }
+                    LaunchError::SpawnFailed(message) => {
+                        format!("failed to launch game: {message}")
+                    }
+                    LaunchError::UnsupportedPlatform(detail) => {
+                        format!("game launch is not supported on this platform: {detail}")
+                    }
+                })?;
         }
         // H4: capture the pre-game profile for the stop-time restore.
         let pre_game = lock(&self.store).active().map(|active| active.id.clone());
@@ -5378,6 +5399,104 @@ impl AppStateCore {
     /// Returns a message for an unknown game id.
     pub fn get_game_state(&self, id: &str) -> Result<GameInfo, String> {
         self.game_info(id)
+    }
+
+    /// True when a profile with `id` exists in the store.
+    fn profile_exists(&self, id: &str) -> bool {
+        lock(&self.store)
+            .list()
+            .iter()
+            .any(|stored| stored.id == id)
+    }
+
+    /// Validate an optional bound profile id: `None` (or blank)
+    /// means "no profile bound"; otherwise the profile must exist.
+    fn check_bound_profile(&self, profile_id: Option<String>) -> Result<Option<String>, String> {
+        let profile_id = profile_id.filter(|id| !id.trim().is_empty());
+        if let Some(id) = &profile_id
+            && !self.profile_exists(id)
+        {
+            return Err(format!("no profile with id '{id}'"));
+        }
+        Ok(profile_id)
+    }
+
+    /// Add a manual game (name + exe/shortcut path, optional bound
+    /// profile) and persist it. The id is derived from the name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an empty name or exe path, an unknown
+    /// bound profile, a full list, or a save failure.
+    pub fn add_manual_game(
+        &self,
+        name: &str,
+        exe_path: &str,
+        bound_profile_id: Option<String>,
+    ) -> Result<GameInfo, String> {
+        let bound_profile_id = self.check_bound_profile(bound_profile_id)?;
+        let game = lock(&self.manual_games).add(name, exe_path, bound_profile_id)?;
+        self.game_info(&game.id)
+    }
+
+    /// Update a manual game's name / exe path / bound profile. The
+    /// id is stable and never changes. Refuses an exe-path change
+    /// while the game is running (the tracked record holds the old
+    /// path); name / profile changes are fine mid-run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an unknown id, an empty name or exe
+    /// path, an unknown bound profile, a mid-run exe change, or a
+    /// save failure.
+    pub fn update_manual_game(
+        &self,
+        id: &str,
+        name: &str,
+        exe_path: &str,
+        bound_profile_id: Option<String>,
+    ) -> Result<GameInfo, String> {
+        let bound_profile_id = self.check_bound_profile(bound_profile_id)?;
+        {
+            let running_id = lock(&self.launcher)
+                .refresh()
+                .map(|running| running.game_id.clone());
+            if running_id.as_deref() == Some(id) {
+                let stored = lock(&self.manual_games)
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown game '{id}'"))?;
+                if stored.exe_path.trim() != exe_path.trim() {
+                    return Err(format!(
+                        "game '{id}' is running — stop it before changing its exe path"
+                    ));
+                }
+            }
+        }
+        let game = lock(&self.manual_games).update(id, name, exe_path, bound_profile_id)?;
+        self.game_info(&game.id)
+    }
+
+    /// Remove a manual game. Refuses while the game is running
+    /// (stop it first — the launcher tracks the running game by id).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for an unknown id, a running game, or a
+    /// save failure.
+    pub fn remove_manual_game(&self, id: &str) -> Result<bool, String> {
+        {
+            let running_id = lock(&self.launcher)
+                .refresh()
+                .map(|running| running.game_id.clone());
+            if running_id.as_deref() == Some(id) {
+                return Err(format!(
+                    "game '{id}' is running — stop it before removing it"
+                ));
+            }
+        }
+        lock(&self.manual_games).remove(id)?;
+        Ok(true)
     }
 
     /* ------------------------------------------------------------------ */
@@ -8759,22 +8878,82 @@ mod tests {
     }
 
     #[test]
-    fn games_list_and_unknown_game_errors() {
+    fn manual_games_list_add_update_remove() {
         let (state, _dir) = test_state();
-        let games = state.list_games();
-        assert_eq!(games.len(), 4); // the catalogue: AC, ACC, iRacing, DR2
-        assert!(games.iter().all(|game| !game.installed)); // Linux sandbox
-        assert!(games.iter().all(|game| !game.running));
-        assert!(games.iter().any(|game| game.id == "assetto-corsa"));
-        let game = state.get_game_state("assetto-corsa").expect("known game");
-        assert!(!game.installed);
+        // No detection: a fresh store lists nothing.
+        assert_eq!(state.list_games().len(), 0);
         assert!(state.get_game_state("no-such-game").is_err());
-        // Nothing installed here, so launch fails honestly.
+        // Add two games; ids come from the names.
+        let first = state
+            .add_manual_game("My Racing Game", r"C:\Games\race.exe", None)
+            .expect("add");
+        assert_eq!(first.id, "my-racing-game");
+        assert!(!first.installed); // Linux sandbox: no such exe
+        assert!(!first.running);
+        let second = state
+            .add_manual_game("My Racing Game", r"C:\Games\race2.exe", None)
+            .expect("add duplicate name");
+        assert_eq!(second.id, "my-racing-game-2");
+        assert_eq!(state.list_games().len(), 2);
+        // Unknown ids error honestly, and a not-installed game cannot launch.
         let error = state
-            .launch_game("assetto-corsa")
+            .launch_game("my-racing-game")
             .expect_err("launch of a not-installed game must fail");
         assert!(error.contains("not installed"), "{error}");
-        assert!(state.stop_game("assetto-corsa").is_err());
+        assert!(state.stop_game("my-racing-game").is_err());
+        // Update keeps the stable id; remove drops the entry.
+        let updated = state
+            .update_manual_game(
+                "my-racing-game",
+                "My Racing Game 2",
+                r"C:\Games\race.exe",
+                None,
+            )
+            .expect("update");
+        assert_eq!(updated.id, "my-racing-game");
+        assert_eq!(updated.name, "My Racing Game 2");
+        assert!(
+            state
+                .remove_manual_game("my-racing-game-2")
+                .expect("remove")
+        );
+        assert_eq!(state.list_games().len(), 1);
+        assert!(state.remove_manual_game("no-such-game").is_err());
+        // Empty names / paths are rejected, never stored.
+        assert!(state.add_manual_game("", r"C:\a.exe", None).is_err());
+        assert!(state.add_manual_game("Race", "", None).is_err());
+        assert_eq!(state.list_games().len(), 1);
+    }
+
+    #[test]
+    fn manual_game_profile_binding_validates() {
+        let (state, _dir) = test_state();
+        let profile = state
+            .create_profile("Race Profile")
+            .expect("create profile");
+        let game = state
+            .add_manual_game("Race", r"C:\race.exe", Some(profile.id.clone()))
+            .expect("add with profile");
+        assert_eq!(game.bound_profile_id.as_deref(), Some(profile.id.as_str()));
+        // An unknown profile id is rejected at add time.
+        assert!(
+            state
+                .add_manual_game(
+                    "Race 2",
+                    r"C:\race2.exe",
+                    Some("no-such-profile".to_string())
+                )
+                .is_err()
+        );
+        // link_profile also binds a manual entry by id.
+        let other = state.create_profile("Other").expect("create other");
+        let summary = state
+            .link_profile(&other.id, &game.id)
+            .expect("link manual game");
+        assert_eq!(summary.id, other.id);
+        let bound = state.get_game_state(&game.id).expect("game state");
+        assert_eq!(bound.bound_profile_id.as_deref(), Some(other.id.as_str()));
+        assert!(state.link_profile(&other.id, "no-such-game").is_err());
     }
 
     #[test]

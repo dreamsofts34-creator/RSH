@@ -404,15 +404,6 @@ pub struct AppSettings {
     /// pipeline. Unknown keys are preserved verbatim.
     #[serde(default = "default_modules")]
     pub modules: HashMap<String, bool>,
-    /// User-configured Steam install root (empty = auto-detect via the
-    /// registry + the standard install locations). Used by game
-    /// detection when set.
-    #[serde(default)]
-    pub steam_path: String,
-    /// User-configured iRacing exe path (empty = the standard install
-    /// locations). Used by game detection when set.
-    #[serde(default)]
-    pub iracing_path: String,
 }
 
 fn default_profile_name() -> String {
@@ -561,8 +552,6 @@ impl Default for AppSettings {
             auto_switch_profiles: true,
             auto_switch_paused: false,
             modules: default_modules(),
-            steam_path: String::new(),
-            iracing_path: String::new(),
         }
     }
 }
@@ -672,10 +661,6 @@ pub struct AppSettingsPatch {
     pub auto_switch_paused: Option<bool>,
     /// Per-module switches, merged per key.
     pub modules: Option<HashMap<String, bool>>,
-    /// User-configured Steam install root.
-    pub steam_path: Option<String>,
-    /// User-configured iRacing exe path.
-    pub iracing_path: Option<String>,
 }
 
 impl AppSettings {
@@ -733,12 +718,6 @@ impl AppSettings {
             for (module, enabled) in modules {
                 self.modules.insert(canonical_module_id(&module), enabled);
             }
-        }
-        if let Some(steam_path) = patch.steam_path {
-            self.steam_path = steam_path;
-        }
-        if let Some(iracing_path) = patch.iracing_path {
-            self.iracing_path = iracing_path;
         }
         sanitize_settings(self);
     }

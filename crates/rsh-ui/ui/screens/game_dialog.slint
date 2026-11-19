@@ -1,0 +1,99 @@
+// RSH v2.0 — Add/edit game dialog (manual games, no auto-scan).
+// Content only — the shell positions this card and hides it on
+// Cancel / Save / Esc; it does NOT own the Window. Reuses the
+// profile popover's patterns: Rust-owned props, TextInput boxes
+// with two-way bindings, Save disabled while a field is empty,
+// Enter in a field saves when both fields are filled.
+// No file picker: rfd cannot resolve offline (see wire_game_dialog
+// in src/main.rs), so the exe path is typed or pasted in. The
+// profile is a cycling button (the profile-link control's pattern)
+// because no dropdown component exists — each click moves to the
+// next profile, then back to "No profile".
+
+import { Theme } from "../tokens.slint";
+import { Card, Btn } from "../components.slint";
+
+export component GameDialog inherits Card {
+    in property <string> title: "Add game";
+    in-out property <string> name: "";
+    in-out property <string> exe: "";
+    in property <string> profile-name: "No profile";
+    callback save(string, string);
+    callback cancel();
+    callback cycle-profile();
+    width: 360px;
+    // Esc target (stock-widget pattern, like the profile popover):
+    // a zero-size FocusScope; the shell focuses the dialog on open
+    // so Esc reaches it (keyboard-escape in src/main.rs also
+    // closes it).
+    FocusScope {
+        width: 0px;
+        height: 0px;
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                cancel();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    VerticalLayout {
+        padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
+        spacing: 10px;
+        Text { text: title; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+        Text { text: "Name"; font-size: 11.5px; color: Theme.mute; }
+        Rectangle {
+            horizontal-stretch: 1;
+            height: 28px;
+            border-radius: 7px;
+            border-width: 1px;
+            border-color: Theme.line;
+            background: Theme.bg;
+            TextInput {
+                x: 10px;
+                width: parent.width - 20px;
+                height: 100%;
+                vertical-alignment: center;
+                text <=> name;
+                font-size: 12px;
+                font-weight: 500;
+                color: Theme.text;
+                selection-background-color: Theme.accent;
+                accepted => { if (name != "" && exe != "") { save(name, exe); } }
+            }
+        }
+        Text { text: "Game exe or shortcut (.exe or .lnk)"; font-size: 11.5px; color: Theme.mute; }
+        Rectangle {
+            horizontal-stretch: 1;
+            height: 28px;
+            border-radius: 7px;
+            border-width: 1px;
+            border-color: Theme.line;
+            background: Theme.bg;
+            TextInput {
+                x: 10px;
+                width: parent.width - 20px;
+                height: 100%;
+                vertical-alignment: center;
+                text <=> exe;
+                font-size: 12px;
+                font-weight: 500;
+                color: Theme.text;
+                selection-background-color: Theme.accent;
+                accepted => { if (name != "" && exe != "") { save(name, exe); } }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Text { vertical-alignment: center; text: "Profile: " + profile-name; font-size: 12px; color: Theme.text; }
+            Rectangle { horizontal-stretch: 1; }
+            Btn { label: "Change"; clicked => { cycle-profile(); } }
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            Btn { label: "Save"; primary: true; disabled: name == "" || exe == ""; clicked => { save(name, exe); } }
+            Btn { label: "Cancel"; clicked => { cancel(); } }
+        }
+        Text { text: "RSH switches profile automatically when this game starts."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+    }
+}

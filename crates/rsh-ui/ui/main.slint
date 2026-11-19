@@ -25,6 +25,7 @@ import { PedalsPage } from "screens/pedals.slint";
 import { ButtonsPage } from "screens/buttons.slint";
 import { ExtrasScreen } from "screens/extras.slint";
 import { ProfilePopover, ProfileItem } from "screens/profile_popover.slint";
+import { GameDialog } from "screens/game_dialog.slint";
 // Compare-fix: the full Settings screen (screens/settings.slint)
 // replaces the shell placeholder — Reconnect, pairing-window text,
 // Duplicate/Use, Restore and per-item Check buttons only exist there.
@@ -216,6 +217,13 @@ export component MainWindow inherits Window {
     // Profile popover (A8): Rust-owned model, opened from the top-bar
     // ProfileButton and the Overview profile box.
     in-out property <bool> popover-open: false;
+    // Add/edit game dialog (manual games, no auto-scan): Rust-owned
+    // model, opened from the Overview / wizard Add game buttons.
+    in-out property <bool> game-dialog-open: false;
+    in property <string> game-dialog-title: "Add game";
+    in-out property <string> game-dialog-name: "";
+    in-out property <string> game-dialog-exe: "";
+    in property <string> game-dialog-profile-name: "No profile";
     in property <[ProfileItem]> popover-presets;
     in property <[ProfileItem]> popover-profiles;
     in property <bool> popover-show-prompt: false;
@@ -258,7 +266,7 @@ export component MainWindow inherits Window {
     // Rust sets this in sync_overview (where the address is already
     // computed); empty/unknown renders as "—" in the wizard.
     in-out property <string> setup-address: "";
-    in-out property <string> setup-games-text: "No games found yet.";
+    in-out property <string> setup-games-text: "No games added yet.";
     in-out property <bool> setup-games-done: false;
     in-out property <bool> setup-vjoy-installed: false;
     in-out property <bool> setup-vjoy-installing: false;
@@ -391,9 +399,17 @@ export component MainWindow inherits Window {
     callback setup-reset-pairing();
     callback setup-connect(string);
     callback setup-calibrate(string);
-    callback setup-find-games();
     callback setup-install-vjoy();
     callback setup-use-hidmaestro();
+    // Manual games (no auto-scan): open the add/edit dialog,
+    // remove a game, and the dialog's own save / cancel / profile
+    // cycling. Wired in Rust (wire_game_dialog in src/main.rs).
+    callback add-game();
+    callback edit-game(string);
+    callback remove-game(string);
+    callback game-dialog-save(string, string);
+    callback game-dialog-cancel();
+    callback game-dialog-cycle-profile();
 
     // FIX-4: root keyboard scope - ancestor of every control, so keys a
     // focused control rejects (Up/Down/Return/Escape) bubble up here.
@@ -556,9 +572,11 @@ export component MainWindow inherits Window {
                 open-diagnostics => { open-diagnostics(); }
                 reconnect => { reconnect(); }
                 open-profile-popover => { profile-clicked(); }
-                // DS-56: the empty-games action re-uses the wizard's
-                // find-games path (which now guards daemon-live, DS-55).
-                find-games => { setup-find-games(); }
+                // Manual games (no auto-scan): Add opens the dialog,
+                // Edit / Remove act on the tile's game.
+                add-game => { add-game(); }
+                edit-game(g) => { edit-game(g); }
+                remove-game(g) => { remove-game(g); }
                 // H2: open the Pair wizard, don't just show Settings.
                 pair-now => { pair-now-requested(); }
             }
@@ -798,7 +816,7 @@ export component MainWindow inherits Window {
         reset-pairing => { setup-reset-pairing(); }
         connect-action(a) => { setup-connect(a); }
         calibrate-action(a) => { setup-calibrate(a); }
-        find-games => { setup-find-games(); }
+        add-game => { add-game(); }
     }
     // Profile popover overlay (A8): under the top-bar profile
     // button, above the page. Esc is owned by the keyboard worker
@@ -823,6 +841,21 @@ export component MainWindow inherits Window {
         discard-and-switch => { popover-discard-switch(); }
         cancel-switch => { popover-cancel-switch(); }
         closed => { popover-closed(); }
+    }
+    // Add/edit game dialog overlay (manual games): same right-edge
+    // overlay position as the profile popover. Esc is owned by the
+    // keyboard worker (clears `game-dialog-open`) and by the
+    // dialog's own FocusScope.
+    if game-dialog-open : GameDialog {
+        x: parent.width - 380px;
+        y: 64px;
+        title: game-dialog-title;
+        name <=> game-dialog-name;
+        exe <=> game-dialog-exe;
+        profile-name: game-dialog-profile-name;
+        save(n, e) => { game-dialog-save(n, e); }
+        cancel => { game-dialog-cancel(); }
+        cycle-profile => { game-dialog-cycle-profile(); }
     }
     // DS-24 (U-06): transient failure toast, above the page and
     // below the top bar (same y as the drawers). It floats over the
