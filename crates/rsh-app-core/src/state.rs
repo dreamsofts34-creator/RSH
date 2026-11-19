@@ -10981,6 +10981,18 @@ mod tests {
     /// including the bounded engine stop.
     static UDP_FORWARDER_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Lock the shared stream-port guard, recovering from poisoning:
+    /// a previous holder may have panicked (that test already
+    /// failed); the port itself is freed separately by
+    /// `wait_for_stream_port_free`, so reusing the lock cannot
+    /// double-bind — but `expect`ing here would cascade one failure
+    /// into all four port tests.
+    fn lock_forwarder_port() -> std::sync::MutexGuard<'static, ()> {
+        UDP_FORWARDER_PORT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Waits until the fixed UDP stream port (4211) is free: the
     /// previous forwarder test's socket lingers ~100–150 ms after its
     /// engine stops (the reader thread exits on the shutdown flag),
@@ -11019,7 +11031,7 @@ mod tests {
 
     #[test]
     fn udp_forwarder_delivers_loopback_frames_to_backend() {
-        let _port = UDP_FORWARDER_PORT.lock().expect("port lock");
+        let _port = lock_forwarder_port();
         assert!(
             wait_for_stream_port_free(),
             "stream port 4211 still held by a previous test's transport"
@@ -11088,7 +11100,7 @@ mod tests {
     #[test]
     fn session_gate_holds_frames_status_pump_and_disconnect() {
         use rsh_protocol::stream::StatusPacket;
-        let _port = UDP_FORWARDER_PORT.lock().expect("port lock");
+        let _port = lock_forwarder_port();
         assert!(
             wait_for_stream_port_free(),
             "stream port 4211 still held by a previous test's transport"
@@ -11161,15 +11173,23 @@ mod tests {
             btns_ex: None,
         };
         send_loopback_frame(&board, &status.encode());
-        for seq in 10..30u16 {
+        // Re-send until a frame lands: a single burst can be
+        // dropped (channel full / bind race under parallel load on
+        // Windows CI), so keep sending while waiting instead of
+        // fire-once-then-wait. Same 20 s bound as before.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut seq: u16 = 10;
+        while !recorded_states(&sent).iter().any(|s| s.steering > 0.9) {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
             let frame = test_stream_frame(seq, 3300, &[]);
             send_loopback_frame(&board, &frame.encode());
+            seq = seq.wrapping_add(1);
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            wait_until(Duration::from_secs(20), || recorded_states(&sent)
-                .iter()
-                .any(|s| s.steering > 0.9)),
+            recorded_states(&sent).iter().any(|s| s.steering > 0.9),
             "open gate must deliver frames: {:?}",
             recorded_states(&sent)
         );
@@ -12326,7 +12346,7 @@ mod tests {
         // Full startup path (engine start → UDP connect → activator
         // attempt) with no board answering: the gate stays closed and
         // the failure is recorded instead of silently opening.
-        let _port = UDP_FORWARDER_PORT.lock().expect("port lock");
+        let _port = lock_forwarder_port();
         assert!(
             wait_for_stream_port_free(),
             "stream port 4211 still held by a previous test's transport"
@@ -12365,7 +12385,7 @@ mod tests {
     /// `Connected` while the gate is closed (C-02).
     #[test]
     fn begin_pairing_without_board_leaves_redacted_log_and_typed_error() {
-        let _port = UDP_FORWARDER_PORT.lock().expect("port lock");
+        let _port = lock_forwarder_port();
         assert!(
             wait_for_stream_port_free(),
             "stream port 4211 still held by a previous test's transport"
