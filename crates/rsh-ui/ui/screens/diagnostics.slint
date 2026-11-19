@@ -103,9 +103,11 @@ export component DiagnosticsDrawer inherits FocusScope {
     in property <float> clutch-pct: 0;
 
     callback closed();
-    // Esc: FocusScope key handler (the stock-widget pattern:
-    // `event.text == Key.Escape`). The shell must call focus() on the
-    // drawer when opening it — keyboard focus is what makes this fire.
+    // Esc: this FocusScope's key handler fires when the drawer has
+    // focus; the root keyboard scope (`keyboard-escape` in
+    // src/main.rs) also closes it, so Esc works from any focus
+    // (Phase 2, F-3 — the old comment claimed the shell focuses
+    // the drawer on open, which it never did).
     // (`@keys(Escape)` on a callback is NOT valid Slint 1.18.1 syntax:
     // the compiler rejects it — verified 2026-11-16.)
 
@@ -180,11 +182,17 @@ export component DiagnosticsDrawer inherits FocusScope {
                     // DS-82: frame-time histogram (this UI, last
                     // 30 s) + IPC dispatch latency (the daemon).
                     Text { text: "Frame + IPC latency"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    // Phase 2 (F-7): two rows of 3 — six cells in
+                    // one 388 px row gave ~54 px each and the
+                    // values/labels overlapped their neighbours.
                     HorizontalLayout {
                         spacing: 12px;
                         StatCell { horizontal-stretch: 1; label: "Frame (p50)"; value: frame-p50-text; }
                         StatCell { horizontal-stretch: 1; label: "Frame (p99)"; value: frame-p99-text; }
                         StatCell { horizontal-stretch: 1; label: "Paint (p50)"; value: paint-p50-text; }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
                         StatCell { horizontal-stretch: 1; label: "Paint (p99)"; value: paint-p99-text; }
                         StatCell { horizontal-stretch: 1; label: "IPC (p50)"; value: ipc-p50-text; }
                         StatCell { horizontal-stretch: 1; label: "IPC (p99)"; value: ipc-p99-text; }

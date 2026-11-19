@@ -1,6 +1,7 @@
 // RSH v2.0 — Add/edit game dialog (manual games, no auto-scan).
-// Content only — the shell positions this card and hides it on
-// Cancel / Save / Esc; it does NOT own the Window. Reuses the
+// Content only — the shell positions this card; the shell's dim
+// backdrop closes it on outside click, and Cancel / Save / Esc
+// close it too (Phase 2, F-2); it does NOT own the Window. Reuses the
 // profile popover's patterns: Rust-owned props, TextInput boxes
 // with two-way bindings, Save disabled while a field is empty,
 // Enter in a field saves when both fields are filled.
@@ -22,21 +23,10 @@ export component GameDialog inherits Card {
     callback cancel();
     callback cycle-profile();
     width: 360px;
-    // Esc target (stock-widget pattern, like the profile popover):
-    // a zero-size FocusScope; the shell focuses the dialog on open
-    // so Esc reaches it (keyboard-escape in src/main.rs also
-    // closes it).
-    FocusScope {
-        width: 0px;
-        height: 0px;
-        key-pressed(event) => {
-            if (event.text == Key.Escape) {
-                cancel();
-                return accept;
-            }
-            return reject;
-        }
-    }
+    // Esc is owned by the root keyboard scope (`keyboard-escape`
+    // in src/main.rs) — Phase 2 (F-3) removed the zero-size
+    // FocusScope here: it was never focused by Rust, so it could
+    // never fire.
     VerticalLayout {
         padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
         spacing: 10px;

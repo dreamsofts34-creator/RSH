@@ -16,7 +16,7 @@ use rsh_api::errors::{ConnectionError, UserError};
 use rsh_api::{
     ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionInfo, DiagStats,
     DraftStatus, FirmwareCheck, FirmwareUpdateStatus, GameSummary, PairingInfo, PollState,
-    ProfileSummary, RawMv, SnapshotInfo, TuningSettings, VjoyStatus, app_version,
+    ProfileSummary, RawMv, SlowPollState, SnapshotInfo, TuningSettings, VjoyStatus, app_version,
 };
 use rsh_api::{ConnEvent, ConnectionManager};
 use rsh_app_core::snapshot::EngineSnapshot;
@@ -244,6 +244,75 @@ impl AppApi for DaemonApi {
             // R2-23: the tail is never drained, so the manager
             // loop's 250 ms file drain cannot starve this reader.
             attempt_log: self.state.pairing_log_tail_lines(),
+        }
+    }
+
+    /// Phase 2 (RC-6): the ~1 Hz slow poll reads pairing status via
+    /// `pairing_status_peek()` — never the consuming
+    /// `pairing_status()`. The old path consumed the one-time
+    /// password on every poll cycle and logged "one-time password
+    /// disclosed to UI" 20× in the user's log, although no UI
+    /// element ever renders the password. The peek's password is
+    /// stripped here too (the UI never displays it; the post-pairing
+    /// Wi-Fi rejoin uses the daemon's own stash, R2-27), so the
+    /// password is never shipped over IPC once a second. Direct
+    /// `pairing_status()` calls (begin / reset / confirm replies)
+    /// keep the consuming behaviour — an explicit read is a real
+    /// disclosure. This override otherwise mirrors the trait
+    /// default field-for-field; if the default gains a field,
+    /// update this too (the `SlowPollState` struct literal fails
+    /// to compile on a missing field, so drift is caught).
+    fn slow_poll(&self) -> SlowPollState {
+        let mut tunings = std::collections::BTreeMap::new();
+        for module in [
+            "steering",
+            "throttle",
+            "brake",
+            "clutch",
+            "handbrake",
+            "led",
+            "shifter",
+            "horn",
+        ] {
+            tunings.insert(module.to_string(), self.get_tuning(module));
+        }
+        let mut modules = std::collections::BTreeMap::new();
+        for module in ["handbrake", "shifter", "horn", "led"] {
+            modules.insert(module.to_string(), self.module_enabled(module));
+        }
+        let peeked = self.state.pairing_status_peek();
+        let pairing_status = PairingInfo {
+            seconds_left: peeked.seconds_left,
+            password: None,
+            error: self.state.pairing_error_typed(),
+            error_detail: peeked.error,
+            board_mac: peeked.board_mac,
+            replacement_required: peeked.replacement_required,
+            key_reset_armed: peeked.key_reset_armed,
+            attempt_log: self.state.pairing_log_tail_lines(),
+        };
+        SlowPollState {
+            version: self.version(),
+            firmware_version: self.firmware_version(),
+            backend: self.output_backend(),
+            autostart: self.autostart(),
+            board_address: self.board_address(),
+            diag_stats: self.diag_stats().ok(),
+            pairing_status,
+            calibration: self.calibration().ok(),
+            raw_mv: self.raw_mv().ok(),
+            profiles: self.list_profiles(),
+            games: self.list_games(),
+            firmware_check: self.firmware_check().ok(),
+            firmware_update_status: self.firmware_update_status(),
+            vjoy_status: self.vjoy_status().ok(),
+            auto_pause: self.auto_pause(),
+            close_to_tray: self.close_to_tray(),
+            bindings: self.list_bindings(),
+            knobs: self.knob_actions(),
+            draft: self.draft_status(),
+            tunings,
+            modules,
         }
     }
 
@@ -1182,6 +1251,40 @@ mod tests {
             !api.state.settings().output_enabled,
             "toggling off must persist too"
         );
+    }
+
+    /// Phase 2 (RC-6): the ~1 Hz `slow_poll` never ships the
+    /// one-time pairing password over IPC and never consumes it —
+    /// the password rides only on a direct `pairing_status()` read.
+    /// With no board present there is no password at all, so the
+    /// test asserts the structural contract that matters to the UI:
+    /// the attempt trail still rides on `slow_poll` (the UI can
+    /// show what happened) while `password` is always `None`.
+    /// Non-consumption itself is proven in rsh-app-core by
+    /// `pairing_password_is_single_use` (peek never consumes).
+    #[test]
+    fn phase2_slow_poll_never_ships_the_pairing_password() {
+        let (api, _dir) = live_api_named("slow-poll-no-password");
+        api.begin_pairing()
+            .expect("begin_pairing triggers an attempt");
+        let polled = api.slow_poll();
+        assert_eq!(
+            polled.pairing_status.password, None,
+            "RC-6: the 1 Hz poll must never ship the one-time password"
+        );
+        assert!(
+            polled
+                .pairing_status
+                .attempt_log
+                .iter()
+                .any(|line| line.contains("begin_pairing")),
+            "RC-6: the attempt trail must still ride on slow_poll: {:?}",
+            polled.pairing_status.attempt_log
+        );
+        // A second poll is identical in this respect — nothing was
+        // consumed by the first one.
+        assert_eq!(api.slow_poll().pairing_status.password, None);
+        assert_eq!(api.pairing_status().password, None);
     }
 
     #[test]

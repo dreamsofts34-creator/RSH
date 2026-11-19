@@ -888,6 +888,9 @@ export component GameTile inherits Rectangle {
     // Overview diagnostics link, so the tile stays one row tall.
     callback edit-clicked();
     callback remove-clicked();
+    // Phase 2 (F-8): clip so the Launch button can never paint
+    // outside the tile when the name squeezes the row.
+    clip: true;
     border-radius: 10px;
     border-width: 1px;
     border-color: ta.has-hover ? Theme.faint : Theme.line;

@@ -31,6 +31,11 @@ pub struct SimApi {
     dirty_modules: Mutex<BTreeSet<String>>,
     autostart: Mutex<bool>,
     backend: Mutex<String>,
+    /// Phase 2 test seam: board MAC the sim reports a stored key
+    /// for (`replacement_required` in `pairing_status()`). `None`
+    /// in production behaviour (no replacement); tests set it to
+    /// drive the `StoredKeyExists` UI path without a daemon.
+    replacement_board: Mutex<Option<String>>,
 }
 
 impl SimApi {
@@ -46,6 +51,16 @@ impl SimApi {
             // autostarts, and vJoy is the default backend.
             autostart: Mutex::new(true),
             backend: Mutex::new("vJoy".to_string()),
+            replacement_board: Mutex::new(None),
+        }
+    }
+
+    /// Test seam (Phase 2): make `pairing_status()` report a stored
+    /// key for `mac` (`None` clears it again).
+    #[cfg(test)]
+    pub fn set_pairing_replacement(&self, mac: Option<String>) {
+        if let Ok(mut slot) = self.replacement_board.lock() {
+            *slot = mac;
         }
     }
 
@@ -125,13 +140,14 @@ impl AppApi for SimApi {
     }
 
     fn pairing_status(&self) -> PairingInfo {
+        let replacement_board = self.replacement_board.lock().ok().and_then(|s| s.clone());
         PairingInfo {
             seconds_left: 0,
             password: None,
             error: None,
             error_detail: None,
-            board_mac: None,
-            replacement_required: false,
+            board_mac: replacement_board.clone(),
+            replacement_required: replacement_board.is_some(),
             key_reset_armed: false,
             attempt_log: Vec::new(),
         }
@@ -139,6 +155,24 @@ impl AppApi for SimApi {
 
     fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
         Ok(self.pairing_status())
+    }
+
+    /// Phase 2 test seam: when the sim reports a stored key,
+    /// confirming replaces it (clears the board) and succeeds —
+    /// the mock-daemon happy path. Without a pending replacement
+    /// it errors like the trait default (no daemon to confirm to).
+    fn confirm_pairing_replacement(&self) -> Result<PairingInfo, UserError> {
+        let had = self
+            .replacement_board
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .is_some();
+        if had {
+            Ok(self.pairing_status())
+        } else {
+            Err(Self::needs_daemon("confirm_pairing_replacement"))
+        }
     }
 
     fn snapshot(&self) -> SnapshotInfo {

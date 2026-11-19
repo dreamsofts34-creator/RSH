@@ -384,6 +384,14 @@ export component MainWindow inherits Window {
     // handler just switched to the Settings page (a dead end).
     // Rust wiring pending (FC: on_pair_now_requested).
     callback pair-now-requested();
+    // Phase 2 (RC-3): the Overview "Replace pairing" banner fires
+    // this — Rust runs confirm_replace_pairing_flow directly,
+    // without opening the wizard first.
+    callback replace-pairing-requested();
+    // Phase 2 (Wi-Fi gap): the Overview disconnected banner names
+    // the fix while the daemon's last activation error is
+    // Unreachable (set from sync_overview).
+    in property <bool> overview-unreachable: false;
     callback tile-selected(int);
     callback action-chip(string);
     callback open-diagnostics();
@@ -633,6 +641,12 @@ export component MainWindow inherits Window {
                 remove-game(g) => { remove-game(g); }
                 // H2: open the Pair wizard, don't just show Settings.
                 pair-now => { pair-now-requested(); }
+                // Phase 2 (RC-3): Replace pairing straight from the
+                // Overview banner — no wizard detour.
+                replace-required: setup-replace-required;
+                replace-board-mac: setup-replace-board-mac;
+                unreachable: overview-unreachable;
+                replace-pairing => { replace-pairing-requested(); }
             }
             if page == 1 : SteeringPage {
                 busy-kind: busy-kind;
@@ -893,6 +907,17 @@ export component MainWindow inherits Window {
         calibrate-action(a) => { setup-calibrate(a); }
         add-game => { add-game(); }
     }
+    // Phase 2 (F-2 / U-1): click-outside-to-dismiss — one dim
+    // backdrop + full-window TouchArea behind EACH overlay. The
+    // backdrop is painted before the overlay (so it sits behind
+    // it) and closes only that overlay; clicks on the overlay
+    // itself never reach the backdrop. No popup in this window
+    // closes only via its own toggle button any more.
+    if popover-open : Rectangle {
+        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        background: #000000; opacity: 0.35;
+        TouchArea { width: parent.width; height: parent.height; clicked => { popover-closed(); } }
+    }
     // Profile popover overlay (A8): under the top-bar profile
     // button, above the page. Esc is owned by the keyboard worker
     // (clears `popover-open`).
@@ -918,6 +943,12 @@ export component MainWindow inherits Window {
         cancel-switch => { popover-cancel-switch(); }
         closed => { popover-closed(); }
     }
+    // Phase 2 (F-2 / U-1): backdrop + click-away for the game dialog.
+    if game-dialog-open : Rectangle {
+        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        background: #000000; opacity: 0.35;
+        TouchArea { width: parent.width; height: parent.height; clicked => { game-dialog-cancel(); } }
+    }
     // Add/edit game dialog overlay (manual games): same right-edge
     // overlay position as the profile popover. Esc is owned by the
     // keyboard worker (clears `game-dialog-open`) and by the
@@ -933,16 +964,20 @@ export component MainWindow inherits Window {
         cancel => { game-dialog-cancel(); }
         cycle-profile => { game-dialog-cycle-profile(); }
     }
-    // DS-24 (U-06): transient failure toast, above the page and
-    // below the top bar (same y as the drawers). It floats over the
-    // page title area for ~5 s — long enough to read, short enough
-    // to never need a close button (click it to dismiss early).
+    // DS-24 (U-06): transient failure toast — Phase 2 (F-1 / U-2):
+    // a centred ~480 px top-middle card per UI-DESIGN §6, NOT a
+    // full-content-width banner: the old full-width toast covered
+    // the Overview banner's Reconnect / Pair buttons while visible
+    // and read as a full-screen error. Click it to dismiss early;
+    // it also expires after ~5 s (U-1: the toast is not a modal
+    // popup — it never blocks the page, so it needs no backdrop).
     // Painted before the drawers, so an open drawer covers its
     // right end; the text is left-aligned and stays readable.
     if toast-text != "" : Rectangle {
-        x: Theme.sidebar-width;
+        // Centre within the content column (sidebar .. right edge).
+        x: Theme.sidebar-width + (parent.width - Theme.sidebar-width - 480px) / 2;
         y: 64px;
-        width: parent.width - Theme.sidebar-width - 20px;
+        width: 480px;
         min-height: 52px;
         border-radius: 8px;
         border-width: 1px;
@@ -968,6 +1003,13 @@ export component MainWindow inherits Window {
             clicked => { toast-text = ""; toast-title = ""; }
         }
     }
+    // Phase 2 (F-2 / U-1): backdrop + click-away for the
+    // notifications drawer.
+    if notif-open : Rectangle {
+        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        background: #000000; opacity: 0.35;
+        TouchArea { width: parent.width; height: parent.height; clicked => { notif-close(); } }
+    }
     // Notification drawer overlay (right edge, above the page).
     // Esc is owned by the keyboard worker (clears `notif-open`).
     if notif-open : NotificationsDrawer {
@@ -978,6 +1020,13 @@ export component MainWindow inherits Window {
         close-requested => { notif-close(); }
         mark-all-read => { notif-mark-all-read(); }
         clear-all => { notif-clear(); }
+    }
+    // Phase 2 (F-2 / U-1): backdrop + click-away for the
+    // diagnostics drawer.
+    if diag-open : Rectangle {
+        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        background: #000000; opacity: 0.35;
+        TouchArea { width: parent.width; height: parent.height; clicked => { diag-open = false; } }
     }
     // Diagnostics drawer overlay (v2.0.1 hotfix): right edge, above
     // the page, like the notifications drawer. Live values come from

@@ -51,6 +51,7 @@ mod live_probe;
 mod notifications;
 mod sim_api;
 mod ui_lifecycle;
+mod ui_log;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -80,16 +81,29 @@ slint::include_modules!();
 /// Verbose UI logging (DS-79 / R2-41): the UI thread never does
 /// an unconditional `eprintln!` per event — stderr is invisible
 /// under `windows_subsystem = "windows"` and an unbuffered write
-/// per event is pure UI-thread cost. `ui_log!` writes only with
-/// `--verbose`; without it even the `format!` is skipped (the
-/// macro expands to an `if` around the `eprintln!`). Set once in
+/// per event is pure UI-thread cost. `ui_log!` writes to stderr
+/// only with `--verbose`; without it even the `format!` is skipped
+/// (the macro expands to an `if` around the `eprintln!`). Set once in
 /// `main` from the parsed args; tests leave it off.
+///
+/// Phase 2 (L-1): every `ui_log!` line ALSO goes to the UI log
+/// file (`<data_dir>/logs/rsh-ui-YYYYMMDD.log`, always-on — the
+/// file is the evidence on the user's PC, where there is no
+/// terminal and no `--verbose`). The file write is unconditional
+/// but cheap (one append per key event); tests never init the file
+/// log, so it no-ops there.
 static UI_VERBOSE: AtomicBool = AtomicBool::new(false);
 
 macro_rules! ui_log {
     ($($arg:tt)*) => {
-        if UI_VERBOSE.load(Ordering::Relaxed) {
-            eprintln!($($arg)*);
+        {
+            // The file log needs the formatted line even when
+            // stderr is off — format once, use twice.
+            let __msg = format!($($arg)*);
+            crate::ui_log::ui_file_log(&__msg);
+            if UI_VERBOSE.load(Ordering::Relaxed) {
+                eprintln!("{__msg}");
+            }
         }
     };
 }
@@ -1686,6 +1700,11 @@ struct Ctx {
     /// mismatch clears (`replacement_required` false) or the wizard
     /// reopens, so Cancel is not undone by the next poll.
     replace_dismissed: Rc<Cell<bool>>,
+    /// Phase 2 (Wi-Fi gap): the first-`Unreachable` notification
+    /// was already shown — set on first Unreachable, cleared when
+    /// the board becomes reachable / the error clears, so the user
+    /// is told once per outage, not once per second.
+    unreachable_notified: Rc<Cell<bool>>,
     /// True while a Backend job is switching to `HIDMaestro` (DS-59):
     /// the busy strip relabels to "Waiting for admin permission…"
     /// once the UAC prompt is expected.
@@ -2695,6 +2714,7 @@ impl Ctx {
         }
         win.set_toast_title(title.into());
         win.set_toast_text(body.into());
+        ui_log!("RSH-UI toast shown: {title} — {body}");
         self.toast_until
             .set(Some(Instant::now() + Duration::from_secs(5)));
     }
@@ -4033,6 +4053,12 @@ impl Ctx {
     /// Settings Pair button both land here — never a dead-end on
     /// Settings. The wizard's own Begin button calls
     /// `begin_pairing_flow` directly (it is already in the wizard).
+    ///
+    /// Phase 2 (RC-3): when a replacement is already required, do
+    /// NOT auto-run `begin_pairing_flow` — Begin re-hides the
+    /// replace block (RC-1) and fails `StoredKeyExists` again. The
+    /// wizard opens on the Pair step with the replace block
+    /// visible instead, and the user confirms Replace pairing.
     fn open_pair_wizard(&self, win: &MainWindow) {
         self.clear_setup_marker();
         self.learn_target.set(0);
@@ -4049,7 +4075,16 @@ impl Ctx {
         self.sync_replace_block(win);
         win.set_setup_mode(true);
         self.sync_vjoy(win);
-        begin_pairing_flow(win, self);
+        ui_log!("RSH-UI wizard opened at Pair step");
+        if self.api().pairing_status().replacement_required {
+            self.set_pairing_trail(
+                win,
+                "This wheel is already paired with a different key — press Replace pairing below.",
+            );
+            ui_log!("RSH-UI wizard Pair step: replacement required — Begin NOT auto-run (RC-3)");
+        } else {
+            begin_pairing_flow(win, self);
+        }
     }
 
     /// Persist the notification center after a mutation (M10).
@@ -5005,6 +5040,34 @@ impl Ctx {
         set_if_changed(win.get_firmware_line(), firmware_line.into(), |v| {
             win.set_firmware_line(v);
         });
+        // Phase 2 (Wi-Fi gap / RC-3): the Overview disconnected
+        // banner names the fix while the daemon's last activation
+        // error is Unreachable, and the first Unreachable of an
+        // outage also raises a notification — the user is told
+        // proactively ("join the RSH Wi-Fi / plug in USB"), not
+        // only after repeated silent retries. Once per outage:
+        // the flag clears when the error clears.
+        let unreachable = api
+            .pairing_status()
+            .error
+            .is_some_and(|e| e == ConnectionError::Unreachable);
+        set_if_changed(win.get_overview_unreachable(), unreachable, |v| {
+            win.set_overview_unreachable(v);
+        });
+        if unreachable && !self.unreachable_notified.get() {
+            self.unreachable_notified.set(true);
+            self.notify(
+                win,
+                "Connection",
+                "Wheel not found",
+                "Join the 'RSH' Wi-Fi network (or plug in USB), then press Reconnect.",
+            );
+            ui_log!(
+                "RSH-UI first Unreachable this outage — proactive Wi-Fi/USB notification shown"
+            );
+        } else if !unreachable {
+            self.unreachable_notified.set(false);
+        }
         set_if_changed(win.get_delay_text(), delay.into(), |v| {
             win.set_delay_text(v);
         });
@@ -5357,6 +5420,7 @@ impl Ctx {
             self.game_dialog_profile_label(profile_id.as_ref()).into(),
         );
         win.set_game_dialog_open(true);
+        ui_log!("RSH-UI game dialog opened");
     }
 
     /// Display name for the dialog's bound profile: "No profile"
@@ -6664,7 +6728,7 @@ impl Ctx {
 fn wire_callbacks(win: &MainWindow, ctx: &Rc<Ctx>) {
     wire_tuning(win, ctx);
     wire_actions(win, ctx);
-    wire_keyboard(win);
+    wire_keyboard(win, ctx);
     wire_notifications(win, ctx);
     wire_setup(win, ctx);
     wire_game_dialog(win, ctx);
@@ -6695,6 +6759,19 @@ fn wire_fc2_callbacks(win: &MainWindow, ctx: &Rc<Ctx>) {
         win.unwrap().on_pair_now_requested(move || {
             if let Some(w) = win.upgrade() {
                 ctx.open_pair_wizard(&w);
+            }
+        });
+    }
+    {
+        // Phase 2 (RC-3): the Overview "Replace pairing" banner
+        // runs the confirm flow directly — no wizard detour, and
+        // no fresh Begin that would re-hide the block.
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_replace_pairing_requested(move || {
+            if let Some(w) = win.upgrade() {
+                ui_log!("RSH-UI Overview banner: Replace pairing clicked");
+                confirm_replace_pairing_flow(&w, &ctx);
             }
         });
     }
@@ -6891,6 +6968,10 @@ fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
 /// status props follow it; on failure the typed error surfaces as a
 /// pair error, never silently.
 fn confirm_replace_pairing_flow(w: &MainWindow, ctx: &Ctx) {
+    // Phase 2 (L-2): the confirm-click path is logged explicitly
+    // (click → IPC call → daemon reply → resulting state) so the
+    // next pairing failure is traceable from the UI log alone.
+    ui_log!("RSH-UI confirm-replace clicked — IPC confirm_pairing_replacement starting");
     ctx.set_pairing_trail(w, "Replacing pairing…");
     ctx.run_generic_job(
         w,
@@ -6903,8 +6984,8 @@ fn confirm_replace_pairing_flow(w: &MainWindow, ctx: &Ctx) {
             };
             match result {
                 Ok(info) => {
-                    eprintln!(
-                        "RSH-UI setup confirm-replace ok: replacement_required={}",
+                    ui_log!(
+                        "RSH-UI confirm-replace IPC ok: replacement_required={} — re-running begin_pairing_flow",
                         info.replacement_required
                     );
                     // The replacement is armed — re-run the normal
@@ -6921,8 +7002,8 @@ fn confirm_replace_pairing_flow(w: &MainWindow, ctx: &Ctx) {
                     // DS-24: pairing failed — P0-class: toast in
                     // place AND open the drawer.
                     ctx.notify_error_urgent(w, "Pairing", &e);
-                    eprintln!(
-                        "RSH-UI setup confirm-replace failed: {} ({})",
+                    ui_log!(
+                        "RSH-UI confirm-replace IPC failed: {} ({}) — pair error shown",
                         e.code, e.title
                     );
                 }
@@ -6966,6 +7047,7 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
                 }
                 let next = (w.get_setup_step() - 1).max(0);
                 w.set_setup_step(next);
+                ui_log!("RSH-UI wizard step {} -> {next} (Back)", next + 1);
                 if next == 1 {
                     ctx.sync_vjoy(&w);
                 }
@@ -6993,6 +7075,7 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
                 } else {
                     let next = w.get_setup_step() + 1;
                     w.set_setup_step(next);
+                    ui_log!("RSH-UI wizard step {} -> {next} (Next)", next - 1);
                     if next == 1 {
                         ctx.sync_vjoy(&w);
                     }
@@ -7139,6 +7222,10 @@ fn wire_setup_pairing(win: &MainWindow, ctx: &Rc<Ctx>) {
                 // paired with a different key, and the new key may
                 // replace it. The daemon arms the replacement and
                 // re-activates; the pairing flow re-runs on success.
+                // Phase 2 (L-2): the click itself is logged — the
+                // IPC call + reply are logged in
+                // `confirm_replace_pairing_flow`.
+                ui_log!("RSH-UI confirm-replace clicked (wizard Pair step)");
                 confirm_replace_pairing_flow(&w, &ctx);
             }
         });
@@ -8192,7 +8279,12 @@ fn wire_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
         let win = win.as_weak();
         win.unwrap().on_bell_clicked(move || {
             if let Some(w) = win.upgrade() {
-                w.set_notif_open(!w.get_notif_open());
+                let open = !w.get_notif_open();
+                w.set_notif_open(open);
+                ui_log!(
+                    "RSH-UI notifications drawer {}",
+                    if open { "opened" } else { "closed" }
+                );
             }
         });
     }
@@ -8201,6 +8293,7 @@ fn wire_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
         win.unwrap().on_notif_close(move || {
             if let Some(w) = win.upgrade() {
                 w.set_notif_open(false);
+                ui_log!("RSH-UI notifications drawer closed");
             }
         });
     }
@@ -8322,7 +8415,7 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
 ///   notifications drawer, then the diagnostics drawer (v2.0.1 hotfix).
 /// - `focus-keyboard`: focuses the root keyboard scope once at startup so
 ///   keys work before the user Tabs anywhere.
-fn wire_keyboard(win: &MainWindow) {
+fn wire_keyboard(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
         win.unwrap().on_keyboard_save(move || {
@@ -8348,11 +8441,12 @@ fn wire_keyboard(win: &MainWindow) {
     }
     {
         let win = win.as_weak();
+        let ctx = ctx.clone();
         win.unwrap().on_keyboard_escape(move || {
             if let Some(w) = win.upgrade() {
                 if w.get_game_dialog_open() {
                     w.set_game_dialog_open(false);
-                    eprintln!("RSH-UI keyboard-escape closed game dialog");
+                    ui_log!("RSH-UI keyboard-escape closed game dialog");
                 } else if w.get_popover_open() {
                     w.set_popover_open(false);
                     ui_log!("RSH-UI keyboard-escape closed profile popover");
@@ -8362,6 +8456,14 @@ fn wire_keyboard(win: &MainWindow) {
                 } else if w.get_diag_open() {
                     w.set_diag_open(false);
                     ui_log!("RSH-UI keyboard-escape closed diagnostics drawer");
+                } else if w.get_setup_mode() {
+                    // Phase 2 (F-13): Esc closes the wizard (Skip
+                    // path — a skip is NOT a finish, so the wizard
+                    // is re-offered on the next version, F23).
+                    // Before this, Esc did nothing in setup-mode.
+                    w.set_setup_mode(false);
+                    ctx.mark_setup_skipped();
+                    ui_log!("RSH-UI keyboard-escape closed setup wizard (skip)");
                 } else {
                     ui_log!("RSH-UI keyboard-escape (no drawer or popover open)");
                 }
@@ -8533,9 +8635,11 @@ fn wire_popover(win: &MainWindow, ctx: &Rc<Ctx>) {
             if let Some(w) = win.upgrade() {
                 if w.get_popover_open() {
                     w.set_popover_open(false);
+                    ui_log!("RSH-UI profile popover closed");
                 } else {
                     ctx.refresh_profiles(&w);
                     w.set_popover_open(true);
+                    ui_log!("RSH-UI profile popover opened");
                 }
             }
         });
@@ -8936,6 +9040,7 @@ fn wire_diagnostics_opener(win: &MainWindow, ctx: &Rc<Ctx>) {
             if let Some(w) = win.upgrade() {
                 ctx.sync_diag(&w);
                 w.set_diag_open(true);
+                ui_log!("RSH-UI diagnostics drawer opened");
             }
         });
     }
@@ -9145,6 +9250,26 @@ fn handle_live_event(win: &slint::Weak<MainWindow>, ctx: &Ctx, ev: &AppEvent) {
                         |e| format!("{} ({})", e.hint(), e.code()),
                     );
                     w.set_setup_pair_error(detail.clone().into());
+                    // Phase 2 (RC-5): on a StoredKeyExists failure
+                    // the attempt is over — clear `pairing-active`
+                    // and re-offer the replace block (clear the
+                    // Cancel dismiss), so Replace pairing is visible
+                    // and clickable instead of a Retry loop that
+                    // fails identically. Other failures keep the
+                    // old behaviour (Retry re-runs Begin).
+                    if error
+                        .as_ref()
+                        .is_some_and(|e| *e == ConnectionError::StoredKeyExists)
+                    {
+                        w.set_setup_pairing_active(false);
+                        ctx.replace_dismissed.set(false);
+                        ctx.sync_replace_block(&w);
+                        ctx.set_pairing_trail(
+                            &w,
+                            "This wheel is already paired with a different key — press Replace pairing to try again.",
+                        );
+                        ui_log!("RSH-UI pairing failed StoredKeyExists — pairing-active cleared, replace block re-offered (RC-5)");
+                    }
                     ctx.notify(&w, "Pairing", "Pairing failed", &detail);
                     // DS-24: pairing failed — P0-class: toast in
                     // place AND open the drawer, so the user cannot
@@ -9817,6 +9942,10 @@ fn main() -> Result<(), slint::PlatformError> {
     // DS-79: `--verbose` gates every `ui_log!` line in the UI.
     UI_VERBOSE.store(args.verbose, Ordering::Relaxed);
     let data_dir = live_probe::resolve_data_dir(args.data_dir.as_deref());
+    // Phase 2 (L-1): the UI file log lives in
+    // `<data_dir>/logs/rsh-ui-YYYYMMDD.log` — init before the
+    // window is created so startup lines are recorded too.
+    crate::ui_log::init_ui_file_log(data_dir.as_deref());
 
     // M-5/A1 (Tray-team hook): single instance, decided BEFORE the
     // window is created. A second instance (daemon tray action
@@ -9923,6 +10052,7 @@ fn main() -> Result<(), slint::PlatformError> {
         pairing_rejoining: Rc::new(Cell::new(false)),
         pairing_rejoin_since: Rc::new(Cell::new(None)),
         replace_dismissed: Rc::new(Cell::new(false)),
+        unreachable_notified: Rc::new(Cell::new(false)),
         backend_target_is_hid: Rc::new(Cell::new(false)),
         job_tx,
         job_rx: Rc::new(RefCell::new(job_rx)),
@@ -10702,10 +10832,15 @@ mod tests {
     /// timer — the test drives the handlers directly.
     #[allow(clippy::too_many_lines)]
     fn fc2_test_ctx() -> (Rc<Ctx>, PathBuf) {
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        fc2_test_ctx_with_api(&api)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fc2_test_ctx_with_api(api: &Arc<dyn AppApi>) -> (Rc<Ctx>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("rsh-fc2-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("fc2 temp dir");
-        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
         let stored_steering = api.get_tuning("steering");
         let (job_tx, job_rx) = std::sync::mpsc::channel::<JobDone>();
         let ctx = Rc::new(Ctx {
@@ -10783,6 +10918,7 @@ mod tests {
             pairing_rejoining: Rc::new(Cell::new(false)),
             pairing_rejoin_since: Rc::new(Cell::new(None)),
             replace_dismissed: Rc::new(Cell::new(false)),
+            unreachable_notified: Rc::new(Cell::new(false)),
             backend_target_is_hid: Rc::new(Cell::new(false)),
             job_tx,
             job_rx: Rc::new(RefCell::new(job_rx)),
@@ -12290,6 +12426,123 @@ mod tests {
         assert!(
             !win.get_setup_pair_error().as_str().is_empty(),
             "a failed confirm must surface a pair error, not fail silently"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 2 (RC-1): Begin → `StoredKeyExists` → the replace block
+    /// is visible WHILE `pairing-active` is true. The old Slint
+    /// gate (`replace-required && !pairing-active`) hid the block
+    /// exactly while a confirm could still succeed — every attempt
+    /// sets `pairing-active` until the 60 s window expires. The
+    /// sim reports a stored key for the board; Begin starts the
+    /// attempt (active + 10 s wait arm) and the 1 Hz sync must
+    /// still surface the block.
+    #[test]
+    fn phase2_replace_block_visible_while_pairing_active() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("Phase-2 window test skipped: no usable display/backend");
+            return;
+        };
+        let sim = Arc::new(SimApi::new());
+        sim.set_pairing_replacement(Some("20:9B:A9:70:9A:55".to_string()));
+        let api: Arc<dyn AppApi> = sim;
+        let (ctx, dir) = fc2_test_ctx_with_api(&api);
+        wire_callbacks(&win, &ctx);
+        begin_pairing_flow(&win, &ctx);
+        drain_all_jobs(&ctx, &win);
+        assert!(
+            win.get_setup_pairing_active(),
+            "Begin must leave the attempt active (10 s wait arm)"
+        );
+        ctx.sync_replace_block(&win);
+        assert!(
+            win.get_setup_replace_required(),
+            "the replace block must be offered after StoredKeyExists"
+        );
+        assert_eq!(
+            win.get_setup_replace_board_mac().as_str(),
+            "20:9B:A9:70:9A:55",
+            "the block must name the board"
+        );
+        assert!(
+            win.get_setup_pairing_active(),
+            "RC-1: the block must be visible WHILE pairing-active is true"
+        );
+        assert!(
+            !win.get_setup_paired(),
+            "the wheel is not paired yet — Replace has not been pressed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 2 (RC-5 + confirm happy path, mock daemon): a
+    /// `PairingFinished{ok:false}` with `StoredKeyExists` clears
+    /// `pairing-active` and re-offers the replace block; pressing
+    /// Replace confirms (mock daemon clears the stored key) and
+    /// re-runs Begin; a later `PairingFinished{ok:true}` marks
+    /// the wheel paired.
+    #[test]
+    fn phase2_stored_key_failure_reoffers_replace_and_confirm_pairs() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("Phase-2 window test skipped: no usable display/backend");
+            return;
+        };
+        let sim = Arc::new(SimApi::new());
+        sim.set_pairing_replacement(Some("20:9B:A9:70:9A:55".to_string()));
+        let api: Arc<dyn AppApi> = sim.clone();
+        let (ctx, dir) = fc2_test_ctx_with_api(&api);
+        wire_callbacks(&win, &ctx);
+        begin_pairing_flow(&win, &ctx);
+        drain_all_jobs(&ctx, &win);
+        ctx.sync_replace_block(&win);
+        assert!(win.get_setup_pairing_active());
+        assert!(win.get_setup_replace_required());
+        // The daemon reports the StoredKeyExists failure.
+        handle_live_event(
+            &win.as_weak(),
+            &ctx,
+            &AppEvent::PairingFinished {
+                ok: false,
+                error: Some(ConnectionError::StoredKeyExists),
+            },
+        );
+        assert!(
+            !win.get_setup_pairing_active(),
+            "RC-5: a StoredKeyExists failure must clear pairing-active"
+        );
+        assert!(
+            win.get_setup_replace_required(),
+            "RC-5: the failure must re-offer the replace block"
+        );
+        // Replace pairing (mock daemon) → Begin re-runs.
+        win.invoke_setup_confirm_replace();
+        drain_all_jobs(&ctx, &win);
+        assert!(
+            win.get_setup_pairing_active(),
+            "confirm must re-run the pairing flow"
+        );
+        ctx.sync_replace_block(&win);
+        assert!(
+            !win.get_setup_replace_required(),
+            "the mock daemon cleared the stored key, so the block must go away"
+        );
+        // The board pairs.
+        handle_live_event(
+            &win.as_weak(),
+            &ctx,
+            &AppEvent::PairingFinished {
+                ok: true,
+                error: None,
+            },
+        );
+        assert!(
+            win.get_setup_paired(),
+            "PairingFinished ok must mark paired"
+        );
+        assert!(
+            !win.get_setup_pairing_active(),
+            "a finished pairing is no longer active"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

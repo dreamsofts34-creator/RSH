@@ -229,11 +229,24 @@ pub fn popup_is_light(data_dir: Option<&std::path::Path>) -> bool {
 ///   foreground sighting, however short;
 /// * never dismisses when the foreground is unknown (`None`).
 ///
-/// Known limit: when the popup was shown while the main UI window
-/// was already foreground, clicking back into that same UI window
-/// leaves the foreground unchanged, so the popup stays open
-/// (Escape / tray-click / "Open RSH" still dismiss it). Detecting
-/// that click would need a mouse hook, which is out of scope.
+///
+/// Known limit (foreground poll only): when the popup was shown
+/// while the main UI window was already foreground, clicking back
+/// into that same UI window leaves the foreground unchanged, so
+/// the foreground poll alone never dismisses it. Phase 2 (F-12 /
+/// U-1) closes that hole WITHOUT a mouse hook: the 100 ms tick
+/// also reads `GetAsyncKeyState` (left button pressed since the
+/// last read — a press is caught even if released between polls)
+/// and `GetCursorPos`, and [`PopupDismissPoll::click_outside`]
+/// dismisses on a fresh press outside the popup rect (after the
+/// 5 s floor). The tray click that showed the popup is consumed
+/// by the first tick's read, so it cannot dismiss its own popup.
+/// Residual: a click-away is missed if the cursor moves back
+/// inside the popup rect within the ≤100 ms between the press and
+/// the next tick read, and touch/pen taps that do not set the
+/// mouse-button state are not seen by this path (foreground-loss
+/// still dismisses those). Both are bounded — the next real
+/// click-away dismisses.
 ///
 /// A second honest limit: a click-away that lands inside the
 /// persistence floor (roughly the first five seconds after
@@ -392,6 +405,26 @@ impl PopupDismissPoll {
                 false
             }
         }
+    }
+
+    /// Phase 2 (F-12 / U-1): click-outside via the mouse-button
+    /// state, not the foreground — this is what closes the
+    /// same-foreground hole (clicking back into the already-
+    /// foreground main window). `button_pressed` is "left button
+    /// pressed since the last `GetAsyncKeyState` read" (a quick
+    /// press is caught even if released between 100 ms ticks);
+    /// `cursor_inside_popup` is the cursor against the popup rect
+    /// on this tick. Dismisses only after the 5 s persistence
+    /// floor — the tray click that showed the popup is inside the
+    /// floor, and the first tick's read consumes it anyway.
+    /// Pure, so the rule is unit-testable without Windows.
+    #[must_use]
+    pub fn click_outside(
+        elapsed: Duration,
+        button_pressed: bool,
+        cursor_inside_popup: bool,
+    ) -> bool {
+        elapsed >= POPUP_MIN_VISIBLE && button_pressed && !cursor_inside_popup
     }
 }
 
@@ -1223,6 +1256,53 @@ mod tests {
             run_timeline(&three, Some(200)),
             Some(Duration::from_millis(6200))
         );
+    }
+
+    // Phase 2 (F-12 / U-1): click-outside via the mouse-button
+    // state — the same-foreground hole the foreground poll cannot
+    // see. A fresh press outside the popup rect after the 5 s
+    // floor dismisses; a press inside the floor, a press with the
+    // cursor inside the popup, or no press at all never does.
+    #[test]
+    fn click_outside_dismisses_after_floor() {
+        assert!(PopupDismissPoll::click_outside(
+            Duration::from_secs(6),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn click_outside_never_inside_the_floor() {
+        assert!(!PopupDismissPoll::click_outside(
+            Duration::from_secs(4),
+            true,
+            false
+        ));
+        assert!(!PopupDismissPoll::click_outside(
+            Duration::from_millis(500),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn click_outside_needs_a_press_outside_the_popup() {
+        assert!(!PopupDismissPoll::click_outside(
+            Duration::from_secs(6),
+            false,
+            false
+        ));
+        assert!(!PopupDismissPoll::click_outside(
+            Duration::from_secs(6),
+            true,
+            true
+        ));
+        assert!(!PopupDismissPoll::click_outside(
+            Duration::from_secs(6),
+            false,
+            true
+        ));
     }
 
     #[test]

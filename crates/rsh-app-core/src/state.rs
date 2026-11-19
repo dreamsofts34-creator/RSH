@@ -206,7 +206,7 @@ use rsh_transport::serial::{
     SerialConfig, SerialTransport, detect_board_port, detect_board_port_metadata_only,
 };
 use rsh_transport::session::{BoardSession, KeyStoreLike, SessionError};
-use rsh_transport::udp::{UdpBindError, UdpConfig, UdpTransport};
+use rsh_transport::udp::{HELO_PORT, UdpBindError, UdpConfig, UdpTransport};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::{
@@ -983,7 +983,16 @@ pub struct AppStateCore {
     /// Whether the user confirmed a key replacement (M-7): consumed
     /// once by the next activation attempt, which then pairs with
     /// replacement instead of failing with `StoredKeyExists`.
+    /// Phase 2 (RC-4): the flag is board-bound — it is consumed
+    /// only by a real `pair_with_replacement` attempt for the board
+    /// in [`Self::pairing_replacement_board`]; an attempt for a
+    /// different board, or one that fails with `WindowClosed` /
+    /// `WindowExpired` / `BoardMismatch`, leaves it armed.
     pairing_replacement_allowed: Mutex<bool>,
+    /// Board id the confirmed replacement is armed for (M-7 /
+    /// RC-4): set by [`Self::confirm_pairing_replacement`] from
+    /// `replacement_required`, cleared when the flag is consumed.
+    pairing_replacement_board: Mutex<Option<String>>,
     /// Board MAC the last activation failed with `StoredKeyExists`
     /// for (M-7): the board the confirm dialog must name.
     replacement_required: Mutex<Option<String>>,
@@ -1207,6 +1216,7 @@ impl AppStateCore {
             switch_in_flight: Mutex::new(()),
             firmware_update: Mutex::new(FirmwareUpdateStatus::default()),
             pairing_replacement_allowed: Mutex::new(false),
+            pairing_replacement_board: Mutex::new(None),
             replacement_required: Mutex::new(None),
             password_consumed: Mutex::new(false),
             pending_rejoin_password: Mutex::new(None),
@@ -2342,14 +2352,18 @@ impl AppStateCore {
     /// Returns a message when no replacement is currently required
     /// or the activation attempt cannot start.
     pub fn confirm_pairing_replacement(self: &Arc<Self>) -> Result<TransportState, String> {
-        if lock(&self.replacement_required).is_none() {
+        let Some(board) = lock(&self.replacement_required).clone() else {
             return Err(
                 "no key replacement is pending — activation did not report StoredKeyExists \
                  for any board"
                     .to_string(),
             );
-        }
+        };
+        // Phase 2 (RC-4): arm the flag for THIS board only — the
+        // activation attempt consumes it only for the same board
+        // MAC (see `activate_session_on`).
         *lock(&self.pairing_replacement_allowed) = true;
+        *lock(&self.pairing_replacement_board) = Some(board);
         self.activate_session()
     }
 
@@ -4958,6 +4972,31 @@ impl AppStateCore {
     pub fn reset_pairing(self: &Arc<Self>) -> Result<PairingStatus, String> {
         if self.pairing_status_peek().key_reset_armed {
             self.key_reset()?;
+        } else if let Some(board_id) = lock(&self.replacement_required).clone() {
+            // Phase 2 (RC-2): Reset in the StoredKeyExists state
+            // ACTUALLY deletes the stored device key (+ Wi-Fi
+            // password) for this board — the old code only cleared
+            // the PC-side session records, so the stored key
+            // survived and the next pairing failed identically.
+            // A missing key is already-reset (NotFound is fine);
+            // any other keystore failure fails the reset honestly
+            // instead of pretending it worked.
+            let store = KeyStore::new();
+            match store.delete_device_key(&board_id) {
+                Ok(()) | Err(KeystoreError::NotFound) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "reset pairing failed: could not delete the stored key for {board_id}: {error}"
+                    ));
+                }
+            }
+            let _ = store.delete_wifi_password(&board_id);
+            self.push_pairing_log(
+                "INFO",
+                &format!("pairing reset: stored key deleted for board {board_id}"),
+            );
+            self.close_session_gate();
+            self.clear_session_records();
         } else {
             self.close_session_gate();
             self.clear_session_records();
@@ -7127,6 +7166,10 @@ enum NewSessionHello {
     Found(HelloReply),
     /// No `HELLO` arrived within the wait attempts.
     None,
+    /// Phase 2 (Wi-Fi gap): no OS route to the board address, so no
+    /// HELO was even attempted — the caller reports Unreachable
+    /// without the timeout log line (no timeout happened).
+    NoRoute,
     /// The transport died while waiting (its `HELLO` channel closed).
     TransportClosed,
 }
@@ -7146,10 +7189,73 @@ enum NewSessionHello {
 /// opening the gate). A stale echo-0 reply triggers one more explicit
 /// flag-1 HELO; a timeout re-requests a new session once, then waits
 /// again.
+/// Whether the OS has a route to the board address (Phase 2,
+/// Wi-Fi gap): a UDP `connect()` performs the route lookup without
+/// sending a packet. An unparseable address is treated as "no
+/// route" (fail-closed — the caller reports Unreachable instead of
+/// HELO-ing into the void); a `connect()` that fails for any other
+/// reason is also "no route", since no packet could leave the PC
+/// either way. Unit-testable without a board: loopback always has
+/// a route, an unroutable test-net address does not (on a host
+/// without a default route to it — the test pins the unparseable
+/// case instead, which is deterministic everywhere).
+fn wifi_route_exists(board_ip: &str) -> bool {
+    use std::io::ErrorKind;
+    use std::net::{IpAddr, SocketAddr, UdpSocket};
+    let Ok(ip) = board_ip.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+        // Cannot even open a socket: fail open — the HELO path
+        // reports the real failure instead of a wrong "no route".
+        return true;
+    };
+    match socket.connect(SocketAddr::new(ip, HELO_PORT)) {
+        // No route to the board (Windows: WSAENETUNREACH 10051 —
+        // the user's 34× `HELO send failed` case): skip HELO.
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable
+            ) =>
+        {
+            false
+        }
+        // Anything else — `Ok(())`, or an error such as EPERM /
+        // EACCES from a sandbox or firewall policy, where a route
+        // can exist behind the block — fails OPEN: the normal
+        // HELO/timeout path runs and reports the real failure
+        // ("HELO send failed" / "HELLO timeout") instead of a
+        // wrong "no route".
+        _ => true,
+    }
+}
+
 async fn await_new_session_hello<T: SessionTransport>(
     state: &Arc<AppStateCore>,
     transport: &mut T,
 ) -> NewSessionHello {
+    // Phase 2 (Wi-Fi gap): when the transport is Wi-Fi and there is
+    // no route to the board address (the PC is not on the RSH Wi-Fi
+    // — the log's 34× `HELO send failed … os error 10051` case),
+    // skip the HELO attempts entirely instead of sending into the
+    // void 3× and waiting out every timeout. A UDP `connect()` does
+    // a route lookup without sending a packet, so this is a pure
+    // local check; a route that exists (board off, AP up) still
+    // takes the normal HELO/timeout path. A policy block (EPERM)
+    // is NOT "no route" — `wifi_route_exists` fails open there.
+    // Serial is untouched, and the fake test transport (label
+    // "unknown") never takes this branch.
+    if transport.transport_label() == "wifi" && !wifi_route_exists(&state.settings().esp_ip) {
+        state.push_pairing_log(
+            "WARN",
+            &format!(
+                "no route to board {} — Wi-Fi not joined to the RSH network (or USB not plugged in); skipping HELO",
+                state.settings().esp_ip
+            ),
+        );
+        return NewSessionHello::NoRoute;
+    }
     // Phase 0 gate §6.2 format 2 (HELO sent — one line per send).
     let send_helo = |state: &Arc<AppStateCore>, transport: &mut T| {
         match transport.request_hello(1) {
@@ -7299,6 +7405,26 @@ impl Drop for ActivationInFlightGuard<'_> {
     }
 }
 
+/// Phase 2 (RC-4): consume the confirmed replacement flag, but
+/// only for the board the user confirmed. Returns
+/// `(allow_replacement, armed_board)`; `armed_board` is the board
+/// the flag was armed for, so a failed attempt can re-arm it. A
+/// HELLO from any other board leaves the flag untouched.
+fn consume_replacement_allowance(
+    state: &Arc<AppStateCore>,
+    hello_board_id: &str,
+) -> (bool, Option<String>) {
+    let flag = *lock(&state.pairing_replacement_allowed);
+    let board = lock(&state.pairing_replacement_board).clone();
+    if flag && board.as_deref() == Some(hello_board_id) {
+        *lock(&state.pairing_replacement_allowed) = false;
+        *lock(&state.pairing_replacement_board) = None;
+        (true, board)
+    } else {
+        (false, board)
+    }
+}
+
 async fn activate_session_on<T, K>(
     state: &Arc<AppStateCore>,
     transport: T,
@@ -7317,6 +7443,20 @@ where
                 "transport closed while awaiting the board HELLO",
             );
             None
+        }
+        NewSessionHello::NoRoute => {
+            // Phase 2 (Wi-Fi gap): no HELO was sent and no timeout
+            // elapsed — the WARN line in `await_new_session_hello`
+            // already names the fix; record Unreachable so the UI
+            // shows its proactive Wi-Fi/USB banner + notification.
+            state.note_session_error_typed(
+                ConnectionError::Unreachable,
+                &format!(
+                    "no HELLO: no route to the board at {} — Wi-Fi not joined to the RSH network (or USB not plugged in)",
+                    state.settings().esp_ip
+                ),
+            );
+            Some(transport)
         }
         NewSessionHello::None => {
             // Phase 0 gate §6.2 format 4 (HELLO timeout).
@@ -7346,20 +7486,42 @@ where
         }
         NewSessionHello::Found(hello) => {
             state.note_observed_hello(&hello);
-            // M-7: a user-confirmed replacement is consumed once by
-            // this activation attempt — later attempts go back to the
-            // safe `pair` path until the user confirms again.
+            // M-7 / Phase 2 (RC-4): a user-confirmed replacement is
+            // consumed once — and ONLY by a real
+            // `pair_with_replacement` attempt for the SAME board
+            // MAC. An attempt for a different board leaves the
+            // flag armed for the confirmed board; an attempt that
+            // fails before pairing (`WindowClosed` /
+            // `WindowExpired` / `BoardMismatch`) re-arms it below.
+            // (An `Unreachable` attempt never reaches this branch
+            // — no HELLO means the flag is untouched.)
             // M-12: this guard is scoped inside the block and dropped
             // before the `.await` below — no `std::sync::Mutex` guard
             // is ever held across an await in this module.
-            let allow_replacement = {
-                let mut flag = lock(&state.pairing_replacement_allowed);
-                let allowed = *flag;
-                *flag = false;
-                allowed
-            };
+            let hello_board_id = hello
+                .board_mac
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<String>>()
+                .join(":");
+            let (allow_replacement, armed_board) =
+                consume_replacement_allowance(state, &hello_board_id);
             let (mut session, outcome) =
                 open_session_for_hello(transport, keystore, &hello, allow_replacement).await;
+            // RC-4: the flag was spent on an attempt that could not
+            // pair — re-arm it for the confirmed board so the user
+            // does not have to confirm again.
+            if allow_replacement
+                && matches!(
+                    outcome,
+                    Err(SessionError::WindowClosed
+                        | SessionError::WindowExpired
+                        | SessionError::BoardMismatch)
+                )
+            {
+                *lock(&state.pairing_replacement_allowed) = true;
+                *lock(&state.pairing_replacement_board) = armed_board;
+            }
             match outcome {
                 Ok(caps) => {
                     state.record_session_activation(SessionActivation {
@@ -7450,6 +7612,14 @@ where
             let reason = "transport closed while awaiting the board HELLO";
             state.note_control_error(reason);
             Err(reason.to_string())
+        }
+        NewSessionHello::NoRoute => {
+            let reason = format!(
+                "no HELLO: no route to the board at {} — Wi-Fi not joined to the RSH network (or USB not plugged in)",
+                state.settings().esp_ip
+            );
+            state.note_control_error(&reason);
+            Err(reason)
         }
         NewSessionHello::None => {
             let total_ms = SESSION_HELLO_WAIT.as_millis() * SESSION_HELLO_ATTEMPTS as u128;
@@ -12014,6 +12184,150 @@ mod tests {
         );
         // The pairing window is consumed: no transient password lingers.
         assert_eq!(state.pairing_status().password, None);
+    }
+
+    /// Phase 2 (RC-4): the confirmed replacement flag is board-bound
+    /// — an activation attempt for a DIFFERENT board must not spend
+    /// it. The flag stays armed for the confirmed board.
+    #[tokio::test]
+    async fn phase2_replacement_flag_not_spent_by_other_board() {
+        let (state, _dir) = test_state();
+        let store = ActKeyStore::new();
+        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
+        *lock(&state.pairing_replacement_allowed) = true;
+        *lock(&state.pairing_replacement_board) = Some(ACT_BOARD_ID.to_string());
+        let mut foreign = act_pairing_hello(ACT_KEY_TWO, ACT_NONCE_ONE);
+        foreign.board_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let transport = FakeSessionTransport::new(ACT_KEY_TWO, ACT_NONCE_ONE, Some(foreign));
+        let _transport = activate_session_on(&state, transport, store)
+            .await
+            .expect("transport survives foreign-board activation");
+        assert!(
+            *lock(&state.pairing_replacement_allowed),
+            "RC-4: a foreign board must not spend the confirmed flag"
+        );
+        assert_eq!(
+            *lock(&state.pairing_replacement_board),
+            Some(ACT_BOARD_ID.to_string()),
+            "RC-4: the flag stays armed for the confirmed board"
+        );
+    }
+
+    /// Phase 2 (RC-4): the full `StoredKeyExists` → confirm → pair
+    /// path at the activator level. A first attempt with a different
+    /// stored key fails `StoredKeyExists` (replacement required);
+    /// arming the flag for that board and retrying pairs with
+    /// replacement — the gate opens, the stored key is replaced,
+    /// and the flag is consumed.
+    #[tokio::test]
+    async fn phase2_replacement_flag_consumed_only_by_same_board_pair() {
+        let (state, _dir) = test_state();
+        let store = ActKeyStore::new();
+        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
+        // Attempt 1: no confirm — StoredKeyExists, gate closed.
+        let transport = FakeSessionTransport::new(
+            ACT_KEY_TWO,
+            ACT_NONCE_ONE,
+            Some(act_pairing_hello(ACT_KEY_TWO, ACT_NONCE_ONE)),
+        );
+        let _transport = activate_session_on(&state, transport, store.clone())
+            .await
+            .expect("transport survives first attempt");
+        assert!(
+            !state.session_gate_open(),
+            "gate stays closed on StoredKeyExists"
+        );
+        assert!(
+            state.pairing_status_peek().replacement_required,
+            "StoredKeyExists must record the replacement requirement"
+        );
+        assert!(
+            !*lock(&state.pairing_replacement_allowed),
+            "nothing is armed before the user confirms"
+        );
+        // The user confirms (armed for this board, as
+        // `confirm_pairing_replacement` does).
+        *lock(&state.pairing_replacement_allowed) = true;
+        *lock(&state.pairing_replacement_board) = Some(ACT_BOARD_ID.to_string());
+        // Attempt 2: same board, same disclosed key — pairs with
+        // replacement, gate opens, key replaced, flag consumed.
+        let transport = FakeSessionTransport::new(
+            ACT_KEY_TWO,
+            ACT_NONCE_TWO,
+            Some(act_pairing_hello(ACT_KEY_TWO, ACT_NONCE_TWO)),
+        );
+        let _transport = activate_session_on(&state, transport, store.clone())
+            .await
+            .expect("transport survives replacement attempt");
+        assert!(
+            state.session_gate_open(),
+            "gate opens after pair_with_replacement: {:?}",
+            state.session_last_error()
+        );
+        assert_eq!(
+            store.get_device_key(ACT_BOARD_ID).expect("key stored"),
+            ACT_KEY_TWO,
+            "the stored key is replaced by the disclosed one"
+        );
+        assert!(
+            !*lock(&state.pairing_replacement_allowed),
+            "RC-4: the flag is consumed by the same-board pair"
+        );
+        assert_eq!(
+            *lock(&state.pairing_replacement_board),
+            None,
+            "RC-4: the board binding clears with the flag"
+        );
+    }
+
+    /// Phase 2 (RC-4): a confirmed flag spent on an attempt that
+    /// fails with `WindowClosed` (board answered, window shut) is
+    /// re-armed — the user must not have to confirm again.
+    #[tokio::test]
+    async fn phase2_replacement_flag_rearmed_on_window_closed() {
+        let (state, _dir) = test_state();
+        let store = ActKeyStore::new();
+        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
+        *lock(&state.pairing_replacement_allowed) = true;
+        *lock(&state.pairing_replacement_board) = Some(ACT_BOARD_ID.to_string());
+        // Unpaired board, window closed (flags 0x01: unpaired, no
+        // window bit) — the pair attempt fails WindowClosed.
+        let closed = act_hello(0x01, ACT_NONCE_ONE, ACT_KEY_TWO, *ACT_WIFI_PASSWORD);
+        let transport = FakeSessionTransport::new(ACT_KEY_TWO, ACT_NONCE_ONE, Some(closed));
+        let _transport = activate_session_on(&state, transport, store)
+            .await
+            .expect("transport survives closed-window attempt");
+        assert!(!state.session_gate_open(), "gate stays closed");
+        assert!(
+            *lock(&state.pairing_replacement_allowed),
+            "RC-4: WindowClosed must re-arm the flag"
+        );
+        assert_eq!(
+            *lock(&state.pairing_replacement_board),
+            Some(ACT_BOARD_ID.to_string()),
+            "RC-4: the board binding survives the re-arm"
+        );
+    }
+
+    /// Phase 2 (Wi-Fi gap): the route check is deterministic for an
+    /// unparseable address (fail-closed) and for loopback (a route
+    /// always exists). A real board address depends on the host's
+    /// routing table, so it is not asserted here — but a policy
+    /// block (EPERM) must fail OPEN: in this sandbox `connect()` to
+    /// 192.168.4.1 is EPERM although a route exists, and the
+    /// daemon trail test (`pairing_status_carries_the_attempt_trail`)
+    /// proves the HELO/timeout path still runs there instead of a
+    /// wrong "no route".
+    #[test]
+    fn phase2_wifi_route_check() {
+        assert!(
+            !wifi_route_exists("not-an-ip"),
+            "an unparseable board address has no route"
+        );
+        assert!(
+            wifi_route_exists("127.0.0.1"),
+            "loopback always has a route"
+        );
     }
 
     #[tokio::test]

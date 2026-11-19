@@ -344,7 +344,7 @@ export component TrayPopup inherits Window {
                     background: c-panel2;
                     Text { text: game0-initials; color: c-accent-text; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                 }
-                Text { text: game0-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+                Text { horizontal-stretch: 1; overflow: elide; text: game0-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
                 if game0-can-launch: Rectangle {
                     width: 60px;
                     height: 24px;
@@ -370,7 +370,7 @@ export component TrayPopup inherits Window {
                     background: c-panel2;
                     Text { text: game1-initials; color: c-accent-text; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                 }
-                Text { text: game1-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+                Text { horizontal-stretch: 1; overflow: elide; text: game1-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
                 if game1-can-launch: Rectangle {
                     width: 60px;
                     height: 24px;
@@ -396,7 +396,7 @@ export component TrayPopup inherits Window {
                     background: c-panel2;
                     Text { text: game2-initials; color: c-accent-text; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                 }
-                Text { text: game2-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+                Text { horizontal-stretch: 1; overflow: elide; text: game2-name; color: c-text; font-size: 13px; font-weight: 500; vertical-alignment: center; }
                 if game2-can-launch: Rectangle {
                     width: 60px;
                     height: 24px;

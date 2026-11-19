@@ -1,7 +1,8 @@
 // RSH v2.0 — Profile popover (REDESIGN-PLAN §8.4). Opens from the
 // profile button in the top bar. Content only — the shell positions
-// this card under the profile button and hides it on outside click /
-// Esc; it does NOT own the Window.
+// this card under the profile button; the shell's dim backdrop
+// closes it on outside click, and Esc closes it too (Phase 2, F-2);
+// it does NOT own the Window.
 //
 // Sections: Presets (read-only, duplicable) + My profiles. Each row:
 // name, linked game, Active tick. Footer: New / Duplicate / Rename /
@@ -135,19 +136,10 @@ export component ProfilePopover inherits Card {
     callback closed();
 
     width: 300px;
-    // Esc target (stock-widget pattern): a zero-size FocusScope; the
-    // shell focuses the popover on open so Esc reaches it.
-    FocusScope {
-        width: 0px;
-        height: 0px;
-        key-pressed(event) => {
-            if (event.text == Key.Escape) {
-                closed();
-                return accept;
-            }
-            return reject;
-        }
-    }
+    // Esc is owned by the root keyboard scope (`keyboard-escape`
+    // in src/main.rs) — Phase 2 (F-3) removed the zero-size
+    // FocusScope here: it was never focused by Rust, so it could
+    // never fire.
     VerticalLayout {
         padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
         spacing: 10px;

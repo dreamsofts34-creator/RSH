@@ -12,6 +12,7 @@
 // (§8.6) shows when the wheel is not paired yet.
 import { Theme } from "../tokens.slint";
 import { EmptyBanner, Card, WheelGraphic, PedalBar, Pill, Btn, GameTile, CheckRow } from "../components.slint";
+import { ScrollView } from "std-widgets.slint";
 
 export struct GameItem {
     id: string,
@@ -60,17 +61,41 @@ export component OverviewPage inherits VerticalLayout {
     callback reconnect();
     callback open-profile-popover();
     callback pair-now();
+    // Phase 2 (RC-3): the board already has a stored key — the
+    // Overview banner offers Replace pairing directly (the wizard
+    // Pair step is not the only surface any more).
+    callback replace-pairing();
+    in property <bool> replace-required: false;
+    in property <string> replace-board-mac: "";
+    // Phase 2 (Wi-Fi gap): true while the daemon's last activation
+    // error is Unreachable — the banner then names the fix
+    // (join the RSH Wi-Fi / plug in USB) instead of the generic
+    // "not connected" line.
+    in property <bool> unreachable: false;
+    // Phase 2 (F-4): the page scrolls (Settings pattern) — the
+    // bottom row was clipped ~9 px with no banner, ~50–70 px
+    // with one. Root padding lives on the inner layout now.
+    overview-scroll := ScrollView {
+        vertical-stretch: 1;
+        VerticalLayout {
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
     spacing: 12px;
     if daemon-error != "" : EmptyBanner { text: daemon-error; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
     if !daemon-live && daemon-error == "" : EmptyBanner { text: "Live data unavailable — RSH isn't running. Live data appears once it starts."; is-error: false; }
     // REDESIGN-PLAN §8.6 disconnected state: banner + Reconnect.
-    if daemon-live && !connected : EmptyBanner { text: "Wheel not connected — check the RSH Wi-Fi is joined (or the USB cable is plugged in), then retry."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
+    // Phase 2 (Wi-Fi gap): while Unreachable, name the fix
+    // proactively instead of the generic line.
+    if daemon-live && !connected && unreachable : EmptyBanner { text: "Wheel not found — join the 'RSH' Wi-Fi network (or plug in USB), then press Reconnect."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
+    if daemon-live && !connected && !unreachable : EmptyBanner { text: "Wheel not connected — check the RSH Wi-Fi is joined (or the USB cable is plugged in), then retry."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
+    // Phase 2 (RC-3): StoredKeyExists — Replace pairing straight
+    // from Overview, wired to confirm_replace_pairing_flow.
+    if daemon-live && replace-required && !paired : EmptyBanner { text: "This wheel is already paired with a different key" + (replace-board-mac == "" ? "" : " (" + replace-board-mac + ")") + " — replace the pairing to connect."; action-label: "Replace pairing"; is-error: true; action-disabled: busy-kind == 12; action-clicked => { replace-pairing(); } }
     // REDESIGN-PLAN §8.6 pairing-needed state (E): banner + Pair.
     if daemon-live && connected && !paired : EmptyBanner { text: "Wheel not paired — pair it so only this PC can control it."; action-label: "Pair now"; is-error: true; action-disabled: busy-kind == 12; action-clicked => { pair-now(); } }
     Card {
         HorizontalLayout {
-            padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
+            // Phase 2 (F-16): spec card padding 14/16 (was 16/20).
+            padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
             spacing: 28px;
             // UI-UX polish (a): preview `Main.html` §96 is
             // align-items:center — the 112px wheel group centres
@@ -163,9 +188,21 @@ export component OverviewPage inherits VerticalLayout {
                 Text { horizontal-stretch: 1; vertical-alignment: center; text: "No games added yet — add your first game."; font-size: 12px; color: Theme.faint; wrap: word-wrap; }
                 Btn { label: "Add game"; disabled: busy-kind == 13; clicked => { add-game(); } }
             }
-            if games.length > 0 : HorizontalLayout {
+            // Phase 2 (F-8): two tiles per row, min 300 px each —
+            // three tiles in one row left ~26 px for the game name
+            // (the Edit/Remove column broke the preview's 3-tile
+            // layout); rows beyond two scroll with the page (F-4).
+            // (`for … : if …` is not valid Slint, so each row
+            // repeats all tiles and hides the other row's via
+            // `visible` — hidden tiles take no layout space.)
+            if games.length > 0 : GridLayout {
                 spacing: 10px;
-                for g in games : GameTile { horizontal-stretch: 1; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-disabled: busy-kind == 13; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
+                Row {
+                    for g[idx] in games : GameTile { visible: idx < 2; horizontal-stretch: 1; min-width: 300px; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-disabled: busy-kind == 13; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
+                }
+                Row {
+                    for g[idx] in games : GameTile { visible: idx >= 2; horizontal-stretch: 1; min-width: 300px; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-disabled: busy-kind == 13; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
+                }
             }
         }
     }
@@ -236,4 +273,6 @@ export component OverviewPage inherits VerticalLayout {
             }
         }
     }
+}
+}
 }

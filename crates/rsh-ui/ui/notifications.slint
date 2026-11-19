@@ -185,7 +185,9 @@ export component NotificationsDrawer inherits Rectangle {
                 font-size: 11.5px;
                 color: Theme.accent-text;
             }
-            Btn { label: "Mark all read"; clicked => { mark-all-read(); } }
+            // Phase 2 (F-16): "Mark read" (was "Mark all read") —
+            // with unread > 0 the title elided to "Notificatio…".
+            Btn { label: "Mark read"; clicked => { mark-all-read(); } }
             Btn { label: "✕"; clicked => { close-requested(); } }
         }
         Rectangle { height: 1px; background: Theme.line; }

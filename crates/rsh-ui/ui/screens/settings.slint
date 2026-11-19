@@ -137,6 +137,9 @@ export component SettingsScreen inherits VerticalLayout {
         vertical-stretch: 1;
         VerticalLayout {
             padding-top: 14px;
+            // Phase 2 (F-14): bottom padding so the last card
+            // never sits 2 px from the ScrollView edge.
+            padding-bottom: 14px;
             padding-left: 20px;
             padding-right: 20px;
             spacing: 12px;

@@ -245,6 +245,51 @@ pub fn foreground_hwnd() -> Option<isize> {
     None
 }
 
+/// Cursor position in screen pixels (Phase 2, F-12 / U-1): the
+/// click-outside check for the tray popup — a fresh left-button
+/// press counts as a click-away only when the cursor is outside
+/// the popup rect.
+#[cfg(windows)]
+#[must_use]
+pub fn cursor_position() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&raw mut point) }.ok()?;
+    Some((point.x, point.y))
+}
+
+/// No cursor query on Linux: the click-outside path is inert there.
+#[cfg(not(windows))]
+#[must_use]
+pub fn cursor_position() -> Option<(i32, i32)> {
+    None
+}
+
+/// Whether the left mouse button was pressed since the last call
+/// (Phase 2, F-12 / U-1): `GetAsyncKeyState` bit 0 is the
+/// "pressed since last read" latch, so a quick press is caught
+/// even if it is released between 100 ms ticks. Each call clears
+/// the latch — the tick calls this once per cycle, so the tray
+/// click that showed the popup is consumed by the first tick and
+/// cannot dismiss its own popup. Bit 15 (currently down) is NOT
+/// used: a held button must not dismiss on every tick.
+#[cfg(windows)]
+#[must_use]
+pub fn left_button_pressed_since_last_poll() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+    // Parentheses are load-bearing: `&` binds looser than `!=`,
+    // so an unparenthesised `x & 1 != 0` reads as `x & (1 != 0)`.
+    (unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) } & 1) != 0
+}
+
+/// No button query on Linux: the click-outside path is inert there.
+#[cfg(not(windows))]
+#[must_use]
+pub fn left_button_pressed_since_last_poll() -> bool {
+    false
+}
+
 /// Title of the main UI window (`rsh-ui`, `ui/main.slint`).
 #[cfg(windows)]
 pub const UI_WINDOW_TITLE: &str = "RSH — Real Sim Hub";

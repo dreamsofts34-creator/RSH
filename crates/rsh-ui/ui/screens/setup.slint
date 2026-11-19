@@ -22,6 +22,7 @@
 
 import { Theme } from "../tokens.slint";
 import { Btn } from "../components.slint";
+import { ScrollView } from "std-widgets.slint";
 
 component StepRow inherits HorizontalLayout {
     in property <int> num;
@@ -118,8 +119,13 @@ export component SetupWizard inherits Rectangle {
     in property <bool> paired: false;
     in property <bool> reset-required: false;
     // R2-51: the board already has a stored key — offer to replace
-    // it, naming the board MAC. Hidden while pairing runs / paired,
-    // and after Cancel until the wizard reopens.
+    // it, naming the board MAC. Phase 2 (RC-1): shown whenever a
+    // replacement is required and the wheel is not paired — NOT
+    // gated on `!pairing-active`: StoredKeyExists is produced by a
+    // pairing attempt, which sets `pairing-active` until the 60 s
+    // window expires, so the old gate hid the block exactly while
+    // a confirm could still succeed. Hidden once paired, and
+    // after Cancel until the wizard reopens / mismatch clears.
     in property <bool> replace-required: false;
     in property <string> replace-board-mac: "";
     // DS-67: true while the board rejoins Wi-Fi with the new
@@ -379,7 +385,14 @@ export component SetupWizard inherits Rectangle {
             }
 
             // ---- Step 2: Pair ----
-            if step == 2 : VerticalLayout {
+            // Phase 2 (F-6): the right column is a ScrollView — with
+            // the replace offer + pair error + hint the step is
+            // ~543 px against a 486 px budget, so the footer was
+            // pushed below the window bottom.
+            if step == 2 : ScrollView {
+                vertical-stretch: 1;
+                horizontal-stretch: 1;
+                VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 0px;
                 Rectangle { height: 22px; }
@@ -444,13 +457,23 @@ export component SetupWizard inherits Rectangle {
                             spacing: 12px;
                             vertical-stretch: 1;
                             if reset-required : PairStepLine { num: 1; text: "This wheel is already paired."; }
-                            if reset-required : PairStepLine { num: 2; text: "Reset pairing: hold BOOT for 10 seconds."; }
-                            if reset-required : PairStepLine { num: 3; text: "Then pair again — the window opens by itself."; }
+                            if reset-required : PairStepLine { num: 2; text: "Replace the pairing below — or hold BOOT for 10 seconds to reset the wheel, then pair again."; }
+                            if reset-required : PairStepLine { num: 3; text: "Keep this window open. It finishes by itself."; }
                             if !reset-required : PairStepLine { num: 1; text: "Turn on the wheel and wait for the light to blink."; }
                             if !reset-required : PairStepLine { num: 2; text: "Hold the pair button on the wheel for 3 seconds."; }
                             if !reset-required : PairStepLine { num: 3; text: "Keep this window open. It finishes by itself."; }
                             if !pairing-active && !paired && !reset-required : Btn { label: "Begin pairing"; primary: true; disabled: busy-kind == 12; clicked => { begin-pairing(); } }
-                            if !pairing-active && !paired && reset-required : Btn { label: "Reset pairing"; primary: true; disabled: busy-kind == 6; clicked => { reset-pairing(); } }
+                            // Phase 2 (RC-2): in the StoredKeyExists
+                            // state the primary action is Replace
+                            // pairing (confirm) — the old "Reset
+                            // pairing" button only cleared the
+                            // replacement flag without deleting the
+                            // stored key, so the next attempt failed
+                            // identically. Reset is removed here; the
+                            // BOOT-hold reset still works via the
+                            // board (key_reset_armed) and Replace
+                            // overwrites the stored key directly.
+                            if !paired && reset-required : Btn { label: "Replace pairing"; primary: true; disabled: busy-kind == 12; clicked => { confirm-replace(); } }
                             // M4 (v2.0.2): Retry belongs AFTER a
                             // failure (pair-error set), never while
                             // pairing is in progress with no error —
@@ -462,9 +485,13 @@ export component SetupWizard inherits Rectangle {
                 }
                 // R2-51: the wheel is already paired with a different
                 // key — replacing it needs the user's explicit
-                // confirmation, naming the board. Hidden while a
-                // pairing attempt runs, once paired, and after Cancel.
-                if replace-required && !pairing-active && !paired : Rectangle {
+                // confirmation, naming the board. Phase 2 (RC-1):
+                // shown whenever replacement is required and the
+                // wheel is not paired, even while a pairing attempt
+                // is active — that is exactly when a confirm can
+                // still succeed. Hidden once paired, and after
+                // Cancel until the wizard reopens.
+                if replace-required && !paired : Rectangle {
                     horizontal-stretch: 1;
                     width: 584px;
                     border-radius: 14px;
@@ -520,7 +547,10 @@ export component SetupWizard inherits Rectangle {
                 if pair-error != "" : Rectangle {
                     horizontal-stretch: 1;
                     width: 584px;
-                    height: 34px;
+                    // Phase 2 (F-10): min-height, not fixed height —
+                    // a 2-line error is ~36 px and was clipped in
+                    // the fixed 34 px box (DS-21 pattern).
+                    min-height: 34px;
                     Text {
                         vertical-alignment: center;
                         text: pair-error;
@@ -533,6 +563,7 @@ export component SetupWizard inherits Rectangle {
                 // say so under the card (the Calibrate step does the
                 // same with its availability reason).
                 if !paired : Text { text: "Pair the wheel to continue."; font-size: 12.5px; color: Theme.faint; wrap: word-wrap; }
+                }
             }
 
             // ---- Step 3: Calibrate ----
@@ -636,16 +667,11 @@ export component SetupWizard inherits Rectangle {
                 Rectangle { horizontal-stretch: 1; }
                 if step > 0 : Btn { label: "Back"; clicked => { back(); } }
                 if next-enabled : Btn { label: step == 4 ? "Finish" : "Next"; primary: true; clicked => { next(); } }
-                if !next-enabled : Rectangle {
-                    width: 76px;
-                    height: 30px;
-                    border-radius: 8px;
-                    border-width: 1px;
-                    border-color: Theme.line;
-                    background: Theme.panel2;
-                    opacity: 0.45;
-                    Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: "Next"; font-size: 12px; font-weight: 600; color: Theme.text; }
-                }
+                // Phase 2 (F-9): a disabled Btn, not a hand-made
+                // 76 px rectangle — the placeholder was ~24 px
+                // wider than the real Next button, so the footer
+                // jumped sideways on every gating change.
+                if !next-enabled : Btn { label: step == 4 ? "Finish" : "Next"; primary: true; disabled: true; }
             }
         }
     }

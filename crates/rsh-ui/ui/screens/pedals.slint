@@ -13,6 +13,7 @@
 
 import { Theme } from "../tokens.slint";
 import { Card, Pill, Btn, SliderRow } from "../components.slint";
+import { ScrollView } from "std-widgets.slint";
 
 // ---------------------------------------------------------------- feel chip (§6: active = accent border + tint)
 component FeelChip inherits Rectangle {
@@ -293,6 +294,13 @@ export component PedalsPage inherits VerticalLayout {
     callback bite-changed(float);
     callback bite-edited(string);
 
+    // Phase 2 (F-5): the page scrolls (Settings pattern) — the
+    // clutch card clipped ~11 px Basic / ~30–38 px Advanced.
+    // Root padding lives on the inner layout now; the trailing
+    // stretch absorber goes away (the ScrollView owns the slack).
+    pedals-scroll := ScrollView {
+        vertical-stretch: 1;
+        VerticalLayout {
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
     spacing: 12px;
     // FIX (inner shortfall): the shell sizes the page to its preferred
@@ -401,8 +409,8 @@ export component PedalsPage inherits VerticalLayout {
     }
     // B4: the extra calibration-rule hint line below the cards is
     // removed — the Set up / Set down buttons carry the action.
-    // Slack absorber: the body is stretched to the full height below
-    // the top bar; without this the layout stretches the pedal cards
-    // to fill it (preview keeps them content-height).
-    Rectangle { vertical-stretch: 1; }
+    // (Phase 2: the old stretch absorber is gone — the ScrollView
+    // owns the slack now.)
+        }
+    }
 }

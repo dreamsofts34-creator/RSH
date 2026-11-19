@@ -63,8 +63,9 @@ use daemon_api::{DaemonApi, connection_changed_event};
 use rejoin::{RSH_SSID, rejoin_wifi};
 use single_instance::{AcquireOutcome, acquire};
 use tray_popup::{
-    POPUP_ACTIVATION_TIMEOUT, PopupDismissPoll, PopupGame, PopupRefreshCache, TrayPopupData,
-    TrayToggleGuard, anchor_popup, next_profile, popup_is_light,
+    POPUP_ACTIVATION_TIMEOUT, POPUP_HEIGHT, POPUP_WIDTH, PopupDismissPoll, PopupGame,
+    PopupRefreshCache, Rect, TrayPopupData, TrayToggleGuard, anchor_popup, next_profile,
+    popup_is_light,
 };
 
 slint::include_modules!();
@@ -1966,6 +1967,12 @@ struct PopupHandle {
     /// dismiss needs a sustained change — see
     /// [`tray_popup::PopupDismissPoll`].
     poll: RefCell<PopupDismissPoll>,
+    /// Screen rect the popup was shown at (Phase 2, F-12 / U-1):
+    /// the click-outside check (`GetAsyncKeyState` + `GetCursorPos`)
+    /// dismisses on a fresh press outside this rect — this is what
+    /// closes the same-foreground hole. Set in `show()`, cleared
+    /// in `hide()`.
+    popup_rect: Cell<Option<Rect>>,
     /// Change-detection cache (R2-38): `refresh()` only pushes
     /// properties when the collected data or theme actually moved,
     /// so the 10 Hz timer does not repaint an idle popup.
@@ -2073,6 +2080,14 @@ impl PopupHandle {
         let foreground_at_show = tray_geometry::foreground_hwnd();
         *self.poll.borrow_mut() = PopupDismissPoll::new(foreground_at_show);
         let (x, y) = anchor_popup(tray_geometry::tray_icon_rect(), tray_geometry::work_area());
+        // Phase 2 (F-12 / U-1): remember the shown rect for the
+        // click-outside check in `tick()`.
+        self.popup_rect.set(Some(Rect {
+            left: x,
+            top: y,
+            right: x + POPUP_WIDTH,
+            bottom: y + POPUP_HEIGHT,
+        }));
         self.popup
             .window()
             .set_position(slint::PhysicalPosition::new(x, y));
@@ -2141,6 +2156,7 @@ impl PopupHandle {
         let _ = self.popup.hide();
         self.visible.set(false);
         self.shown_at.set(None);
+        self.popup_rect.set(None);
         self.activation_done.set(true);
     }
 
@@ -2203,9 +2219,33 @@ impl PopupHandle {
         if popup_hwnd.is_none() {
             return false;
         }
-        self.poll
+        if self
+            .poll
             .borrow_mut()
             .poll(elapsed, foreground_now, popup_hwnd)
+        {
+            return true;
+        }
+        // Phase 2 (F-12 / U-1): click-outside via the mouse-button
+        // state — closes the same-foreground hole the foreground
+        // poll cannot see (click back into the already-foreground
+        // main window). The button latch is read once per tick, so
+        // the tray click that showed the popup is consumed by the
+        // first tick; the 5 s floor inside `click_outside` absorbs
+        // it in any case.
+        if let Some(rect) = self.popup_rect.get() {
+            let cursor_inside = tray_geometry::cursor_position().is_some_and(|(x, y)| {
+                x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+            });
+            if PopupDismissPoll::click_outside(
+                elapsed,
+                tray_geometry::left_button_pressed_since_last_poll(),
+                cursor_inside,
+            ) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -2364,6 +2404,7 @@ fn create_tray(
             shown_at: Cell::new(None),
             verbose,
             poll: RefCell::new(PopupDismissPoll::new(None)),
+            popup_rect: Cell::new(None),
             refresh_cache: RefCell::new(PopupRefreshCache::new()),
             activation_done: Cell::new(true),
             activation_note_logged: Cell::new(false),
@@ -2430,7 +2471,10 @@ fn create_tray(
         // and must move away for 3 consecutive polls, or the popup
         // must lose a foreground it held for 500 ms — never merely
         // for not being foreground, which a tray-shown window
-        // usually never is). One `GetForegroundWindow()` read per
+        // usually never is). Phase 2 (F-12 / U-1): the same tick
+        // also dismisses on a fresh left-button press outside the
+        // popup rect — the same-foreground hole the foreground
+        // poll cannot see. One `GetForegroundWindow()` read per
         // tick feeds both the foreground check and the poll (F9).
         // On Linux `popup_hwnd` is always `None`, so the poll
         // never dismisses there and Escape / the popup's own
