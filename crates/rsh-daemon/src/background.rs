@@ -238,9 +238,6 @@ const _: fn() = || {
 pub struct BackgroundGuard {
     /// Power-request handle from `PowerCreateRequest`, if held.
     power_request: Option<SharedHandle>,
-    /// Wide reason string passed to `PowerCreateRequest`; it must
-    /// outlive the request handle, so the guard owns it.
-    reason_wide: Vec<u16>,
     /// Whether [`BackgroundGuard::escalate`] is currently in effect.
     escalated: bool,
 }
@@ -302,12 +299,11 @@ impl BackgroundGuard {
             set_memory_priority_normal(),
             restore_priority_class_normal(),
         ];
-        let (power_request, reason_wide, power_mitigation) = acquire_power_request();
+        let (power_request, power_mitigation) = acquire_power_request();
         report.push(power_mitigation);
         (
             Self {
                 power_request,
-                reason_wide,
                 escalated: false,
             },
             report,
@@ -489,10 +485,14 @@ fn restore_priority_class_normal() -> Mitigation {
 
 /// Create the power request and set both request types. On any
 /// failure the handle is cleared and closed and the mitigation is
-/// reported failed. The wide reason string is returned alongside
-/// the handle because it must outlive the request.
+/// reported failed. The wide reason string is built fresh for the
+/// `PowerCreateRequest` call and dropped with this function: the
+/// system copies it into the power-request object at creation
+/// (Chromium's `power_save_blocker_win.cc` and the `insomnia`
+/// crate both drop the buffer right after the call and keep only
+/// the handle), so the guard does not own it.
 #[cfg(windows)]
-fn acquire_power_request() -> (Option<SharedHandle>, Vec<u16>, Mitigation) {
+fn acquire_power_request() -> (Option<SharedHandle>, Mitigation) {
     use windows::Win32::System::Power::{
         PowerCreateRequest, PowerRequestExecutionRequired, PowerRequestSystemRequired,
         PowerSetRequest,
@@ -507,23 +507,22 @@ fn acquire_power_request() -> (Option<SharedHandle>, Vec<u16>, Mitigation) {
         .chain(std::iter::once(0))
         .collect();
     // `REASON_CONTEXT.Version` is `POWER_REQUEST_CONTEXT_VERSION`
-    // (= 0); `Flags` selects the simple-string reason form. The
-    // union field init is unsafe, like all union field access.
-    let context = unsafe {
-        REASON_CONTEXT {
-            Version: 0,
-            Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
-            Reason: REASON_CONTEXT_0 {
-                SimpleReasonString: PWSTR(reason_wide.as_mut_ptr()),
-            },
-        }
+    // (= 0); `Flags` selects the simple-string reason form.
+    // Initialising a union field in a struct literal is safe —
+    // only *reading* a union field is unsafe — so no `unsafe`
+    // block is needed here (clippy `unused_unsafe`).
+    let context = REASON_CONTEXT {
+        Version: 0,
+        Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+        Reason: REASON_CONTEXT_0 {
+            SimpleReasonString: PWSTR(reason_wide.as_mut_ptr()),
+        },
     };
     let handle = match unsafe { PowerCreateRequest(std::ptr::addr_of!(context)) } {
         Ok(handle) => handle,
         Err(error) => {
             return (
                 None,
-                reason_wide,
                 Mitigation::failed(
                     "power request",
                     format!("PowerCreateRequest failed: {error}"),
@@ -539,7 +538,6 @@ fn acquire_power_request() -> (Option<SharedHandle>, Vec<u16>, Mitigation) {
     match set {
         Ok(()) => (
             Some(SharedHandle(handle)),
-            reason_wide,
             Mitigation::ok(
                 "power request",
                 "SystemRequired + ExecutionRequired — visible in powercfg /requests; prevents automatic idle sleep and Modern Standby suspension, not user-initiated sleep",
@@ -554,7 +552,6 @@ fn acquire_power_request() -> (Option<SharedHandle>, Vec<u16>, Mitigation) {
             }
             (
                 None,
-                reason_wide,
                 Mitigation::failed("power request", format!("PowerSetRequest failed: {error}")),
             )
         }
@@ -609,9 +606,9 @@ mod tests {
             assert!(step.applied, "mitigation failed: {step:?}");
         }
         assert!(guard.power_request_active());
-        assert!(!guard.escalate().is_empty());
+        assert_ne!(guard.escalate(), [] as [Mitigation; 0]);
         assert!(guard.escalate().is_empty(), "escalate is idempotent");
-        assert!(!guard.relax().is_empty());
+        assert_ne!(guard.relax(), [] as [Mitigation; 0]);
         assert!(guard.relax().is_empty(), "relax is idempotent");
     }
 }

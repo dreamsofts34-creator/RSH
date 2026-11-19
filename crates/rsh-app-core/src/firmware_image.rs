@@ -215,6 +215,19 @@ pub fn compare_versions(left: &str, right: &str) -> Option<Ordering> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialises the cache-touching tests below: `bundled_firmware_version`
+    /// shares one process-global entry and the harness runs tests in
+    /// parallel, so a sibling test's refill / invalidate would otherwise
+    /// evict the entry under test — green alone, flaky together.
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_cache_tests() -> std::sync::MutexGuard<'static, ()> {
+        CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn image_with(version_text: &str) -> Vec<u8> {
         let mut bytes = b"firmware body \x00\x01\x02".to_vec();
@@ -275,6 +288,7 @@ mod tests {
 
     #[test]
     fn bundled_version_reads_the_file() {
+        let _cache_guard = lock_cache_tests();
         let dir =
             std::env::temp_dir().join(format!("rsh-firmware-image-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -286,6 +300,7 @@ mod tests {
 
     #[test]
     fn bundled_version_is_cached_until_the_file_changes() {
+        let _cache_guard = lock_cache_tests();
         // R2-20: a second call with unchanged metadata must not
         // re-read the file — rewrite the bytes (same length, mtime
         // restored) and the cached version still answers.
@@ -318,6 +333,7 @@ mod tests {
 
     #[test]
     fn bundled_version_invalidate_forces_a_fresh_read() {
+        let _cache_guard = lock_cache_tests();
         // R2-20: the explicit invalidate covers a rewrite the stat
         // cannot see (same mtime + length).
         let dir = std::env::temp_dir().join(format!(

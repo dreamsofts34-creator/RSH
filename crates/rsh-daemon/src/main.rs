@@ -2919,6 +2919,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Unix-only: the second-instance ping path binds a Unix socket;
+    // on Windows the same path uses a named pipe (different API).
+    #[cfg(unix)]
     #[test]
     fn deferred_api_answers_ping_before_the_store_opens() {
         // DS-81: the IPC endpoint answers with NO store open at

@@ -93,7 +93,7 @@ static SYSTEM_LIGHT_CACHE: std::sync::Mutex<Option<(std::time::Instant, bool)>> 
 /// `AppsUseLightTheme` (mirrors `rsh-ui`'s `system_light`, which
 /// lives in the UI binary and cannot be shared here).
 /// Best-effort: any failure (no `reg`, no key) means Dark.
-/// R2-03 theme half: `CREATE_NO_WINDOW` (0x0800_0000) — the
+/// R2-03 theme half: `CREATE_NO_WINDOW` (`0x0800_0000`) — the
 /// daemon is a windowed process, so a console-subsystem `reg`
 /// spawned without it flashes a transient console window; the
 /// pattern is the same as the curl/installer spawns

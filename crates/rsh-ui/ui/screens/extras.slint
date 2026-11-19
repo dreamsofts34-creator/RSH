@@ -299,7 +299,7 @@ export component ExtrasScreen inherits VerticalLayout {
                             ButtonTile { label: "HORN BUTTON"; action: horn-button; pressed: horn-pressed; clicked => { action("horn-learn"); } }
                             HorizontalLayout {
                                 spacing: 8px;
-                                Btn { label: horn-learning ? "Listening…" : "Learn from wheel"; primary: true; disabled: busy-kind == 11; clicked => { action("horn-learn"); } }
+                                Btn { label: horn-learning ? "Listening…" : "Learn from wheel"; primary: true; disabled: busy-kind == 11 || busy-kind == 17; clicked => { action("horn-learn"); } }
                                 Btn { label: "Test"; clicked => { action("horn-test"); } }
                             }
                             if horn-learning : Text { text: "Press the horn button on the wheel…"; font-size: 11.5px; color: Theme.warn; }

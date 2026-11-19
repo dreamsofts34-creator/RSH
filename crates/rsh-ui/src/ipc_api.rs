@@ -3471,8 +3471,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let sock = dir.join("rsh-daemon.sock");
-        let mut counting =
-            CountingApi::with_list_profiles_delay(Duration::from_millis(200));
+        let mut counting = CountingApi::with_list_profiles_delay(Duration::from_millis(200));
         counting.backend_switch_delay = Duration::from_secs(3);
         let counting = Arc::new(counting);
         let api: Arc<dyn AppApi> = counting.clone();

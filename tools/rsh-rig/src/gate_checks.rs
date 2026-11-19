@@ -1102,11 +1102,11 @@ pub fn gate_wizard_fake_data_source() -> (bool, String) {
     let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
     report.check(
         "wizard-defaults-placeholder",
-        setup.contains("games-text: \"No games found yet.\"")
+        setup.contains("games-text: \"No games added yet.\"")
             && setup.contains("pair-status: \"Waiting for the wheel…\"")
             && setup.contains("connect-done: false")
             && setup.contains("paired: false"),
-        "wizard defaults: 'No games found yet.', 'Waiting for the wheel…', connect-done=false, paired=false",
+        "wizard defaults: 'No games added yet.', 'Waiting for the wheel…', connect-done=false, paired=false",
     );
     report.check(
         "wizard-sim-never-advances",
@@ -1239,7 +1239,7 @@ pub fn gate_theme_source() -> (bool, String) {
     );
     report.check(
         "theme-settings-wired",
-        settings.contains("theme-selected") && settings.contains("theme: 0;"),
+        settings.contains("theme-selected") && settings.contains("theme-choice: 0;"),
         "Settings theme row forwards the selection",
     );
     report.check(

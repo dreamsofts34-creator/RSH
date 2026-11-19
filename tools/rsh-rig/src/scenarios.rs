@@ -1428,7 +1428,7 @@ pub fn registry() -> Vec<Scenario> {
         },
         Scenario {
             id: "gate-wizard-fake-data-source",
-            description: "Gate (A3), source audit: wizard defaults are placeholders ('No games found yet.', 'Waiting for the wheel…', connect-done=false) and simulated data never advances the wizard.",
+            description: "Gate (A3), source audit: wizard defaults are placeholders ('No games added yet.', 'Waiting for the wheel…', connect-done=false) and simulated data never advances the wizard.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),

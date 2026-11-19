@@ -268,6 +268,7 @@ impl ProcessSpawner for SystemSpawner {
     fn spawn(&mut self, exe: &Path) -> Result<u32, String> {
         #[cfg(windows)]
         {
+            use std::os::windows::process::CommandExt;
             if is_shortcut(exe) {
                 return Self::spawn_shortcut(exe);
             }
@@ -279,7 +280,6 @@ impl ProcessSpawner for SystemSpawner {
             // game. Flags are the raw Win32 values, as elsewhere in
             // this crate (`state.rs`): DETACHED_PROCESS 0x8,
             // CREATE_NO_WINDOW 0x0800_0000.
-            use std::os::windows::process::CommandExt;
             std::process::Command::new(exe)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())

@@ -704,7 +704,7 @@ jobs:
             ; data (same as an update install, which also keeps it).
             ; Delete %APPDATA%\RSH manually for a fully clean start.
             ; The same KEEP decision is stated in the release notes.
-            DetailPrint "DS-69: %APPDATA%\RSH (profiles, settings, logs) was kept — delete it manually for a fully clean start."
+            DetailPrint "DS-69: your RSH data (profiles, settings, logs) was kept — delete it manually for a fully clean start."
           SectionEnd
           '@ -replace '\$\{VERSION\}', "${{ steps.tag.outputs.version }}" | Set-Content -Path installer\rsh.nsi -Encoding ASCII
           Get-Content installer\rsh.nsi | Select-Object -First 5

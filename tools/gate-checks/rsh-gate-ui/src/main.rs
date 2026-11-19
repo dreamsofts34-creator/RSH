@@ -713,8 +713,8 @@ fn ui_wizard_no_fake_data() -> Outcome {
     };
     report.check(
         "wizard-default-games",
-        get_str(&instance, "games-text").as_deref() == Some("No games found yet."),
-        "games-text defaults to 'No games found yet.'",
+        get_str(&instance, "games-text").as_deref() == Some("No games added yet."),
+        "games-text defaults to 'No games added yet.'",
     );
     report.check(
         "wizard-default-pair",

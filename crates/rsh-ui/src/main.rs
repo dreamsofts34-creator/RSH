@@ -64,15 +64,15 @@ use std::time::{Duration, Instant};
 use rsh_api::connection::ConnectionState;
 use rsh_api::pairing::countdown_ring_commands;
 use rsh_api::{
-    ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionError, ConnectionInfo,
+    app_version, ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionError, ConnectionInfo,
     FirmwareCheck, FirmwareUpdateStatus, GameSummary, LedPattern, PairingInfo, ProfileSummary,
-    ShifterGate, SnapshotInfo, TuningSettings, UserError, app_version,
+    ShifterGate, SnapshotInfo, TuningSettings, UserError,
 };
 use slint::{Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
 use crate::curve::{crosshair_commands, curve_commands, curve_output, dashed_line_commands};
 use crate::ipc_api::IpcApi;
-use crate::notifications::{NotificationCenter, sync_to_window};
+use crate::notifications::{sync_to_window, NotificationCenter};
 use crate::sim_api::SimApi;
 
 slint::include_modules!();
@@ -646,11 +646,9 @@ fn spawn_os_light_sampler() -> Arc<AtomicBool> {
     let writer = shared.clone();
     let _ = std::thread::Builder::new()
         .name("rsh-os-light".to_string())
-        .spawn(move || {
-            loop {
-                writer.store(system_light(), Ordering::Relaxed);
-                std::thread::sleep(Duration::from_secs(30));
-            }
+        .spawn(move || loop {
+            writer.store(system_light(), Ordering::Relaxed);
+            std::thread::sleep(Duration::from_secs(30));
         });
     shared
 }
@@ -886,12 +884,16 @@ impl JobKind {
             JobKind::ProfileOp => 8,
             JobKind::BindingOp => 9,
             JobKind::CaptureOp => 10,
-            // R2-35: the toggle shares LearnOp's strip slot on
-            // purpose — Slint disables the Learn controls while
-            // `busy-kind == 11`, so the toggle job (start/cancel)
-            // keeps the same disable as the poll job instead of
-            // leaving the button live during the toggle.
-            JobKind::LearnOp | JobKind::LearnToggle => 11,
+            JobKind::LearnOp => 11,
+            // R2-35: the toggle has its OWN strip slot (17), not
+            // LearnOp's — the duplicate-start rule keys on the
+            // `JobKind` variant, so the distinct order keeps the
+            // tie-break deterministic and the toggle visible as
+            // its own job. Slint disables the Learn controls on
+            // `busy-kind == 11 || busy-kind == 17`, so the toggle
+            // job (start/cancel) dims the button exactly like the
+            // poll job instead of leaving it live.
+            JobKind::LearnToggle => 17,
             JobKind::PairingOp => 12,
             JobKind::GameOp => 13,
             JobKind::SettingsOp => 14,
@@ -951,7 +953,11 @@ fn valid_board_address(address: &str) -> bool {
 /// validates them); the UI only rejects an empty name.
 fn clean_profile_name(name: &str) -> Option<String> {
     let name = name.trim().to_string();
-    if name.is_empty() { None } else { Some(name) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 /// F12 (v2.0.3): a down-episode shorter than this is a flap — the
@@ -10430,37 +10436,30 @@ mod tests {
     fn led_preview_off_is_dark_and_solid_is_accent() {
         let off = led_preview(LedPattern::Off, 100, None);
         assert_eq!(off.len(), 8);
-        assert!(
-            off.iter()
-                .all(|c| *c == Color::from_rgb_u8(0x1D, 0x25, 0x33))
-        );
+        assert!(off
+            .iter()
+            .all(|c| *c == Color::from_rgb_u8(0x1D, 0x25, 0x33)));
         let solid = led_preview(LedPattern::Solid, 100, None);
-        assert!(
-            solid
-                .iter()
-                .all(|c| *c == Color::from_rgb_u8(0x2F, 0x6B, 0xFF))
-        );
+        assert!(solid
+            .iter()
+            .all(|c| *c == Color::from_rgb_u8(0x2F, 0x6B, 0xFF)));
         let dim = led_preview(LedPattern::Solid, 0, None);
-        assert!(
-            dim.iter()
-                .all(|c| *c == Color::from_rgb_u8(0x0D, 0x11, 0x18))
-        );
+        assert!(dim
+            .iter()
+            .all(|c| *c == Color::from_rgb_u8(0x0D, 0x11, 0x18)));
     }
 
     #[test]
     fn led_preview_uses_the_stored_colour() {
         // M2: a stored red shows red, not the historic accent blue.
         let red = led_preview(LedPattern::Solid, 100, Some(0xFF_6B_6B));
-        assert!(
-            red.iter()
-                .all(|c| *c == Color::from_rgb_u8(0xFF, 0x6B, 0x6B))
-        );
+        assert!(red
+            .iter()
+            .all(|c| *c == Color::from_rgb_u8(0xFF, 0x6B, 0x6B)));
         let white = led_preview(LedPattern::Solid, 100, Some(0xFF_FF_FF));
-        assert!(
-            white
-                .iter()
-                .all(|c| *c == Color::from_rgb_u8(0xFF, 0xFF, 0xFF))
-        );
+        assert!(white
+            .iter()
+            .all(|c| *c == Color::from_rgb_u8(0xFF, 0xFF, 0xFF)));
     }
 
     #[test]
@@ -10544,9 +10543,10 @@ mod tests {
             (JobKind::BindingOp, 9),
             (JobKind::CaptureOp, 10),
             (JobKind::LearnOp, 11),
-            // R2-35: the toggle shares LearnOp's strip slot (see
-            // `JobKind::order`) — both map to 11.
-            (JobKind::LearnToggle, 11),
+            // R2-35: the toggle has its own strip slot (17, see
+            // `JobKind::order`) — Slint disables Learn controls on
+            // 11 or 17.
+            (JobKind::LearnToggle, 17),
             (JobKind::PairingOp, 12),
             (JobKind::GameOp, 13),
             (JobKind::SettingsOp, 14),
