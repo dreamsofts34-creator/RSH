@@ -484,6 +484,7 @@ jobs:
           !include "LogicLib.nsh"
           !include "WordFunc.nsh"
           !include "StrFunc.nsh"
+          ${Using:StrFunc} StrStr
           !define VERSION "${VERSION}"
           ; Smart-installer state: set by .onInit (detection) and read
           ; by the install section (daemon restart after an update).
