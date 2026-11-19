@@ -65,6 +65,12 @@ export component MainWindow inherits Window {
     in-out property <int> transport: 0;   // 0 Wi-Fi, 1 USB
     in-out property <int> controller: 1;  // 0 HIDMaestro, 1 vJoy (vJoy is the default, user order 2026-11-16)
     in-out property <int> theme: 0;       // 0 Dark, 1 Light, 2 Auto (v2.0.2: Light added; Auto is resolved to Dark/Light by Rust)
+    // R2-31 (UI-UX polish, h): the STORED theme choice (0 Dark,
+    // 1 Light, 2 Auto) — this is what the Settings segment shows and
+    // what theme-persist stores. `theme` above stays the RESOLVED
+    // 0/1 the Rust side writes after resolving Auto against the OS;
+    // it alone drives Theme.mode. Rust sets both in wire_theme.
+    in-out property <int> theme-choice: 0;
     in-out property <int> pressed-index: -1;
     in-out property <int> selected-index: 5; // A4: index 5 = "Gear 3" (preview), not 0
     in property <[string]> button-actions: ["Shift up", "Shift down", "Horn", "Gear 1", "Gear 2", "Gear 3", "Gear 4", "Gear 5", "Gear 6", "Handbrake", "Not set", "Not set"];
@@ -126,6 +132,13 @@ export component MainWindow inherits Window {
     in property <string> deadzone-text;
     in property <float> curve-val;
     in property <string> curve-text;
+    // R2-16 (UI-UX polish): Advanced-mode steering readouts —
+    // min/max mV + centre mV from the cached records, raw live
+    // value at 1 Hz while Advanced is on. "—" = no reading yet.
+    in property <string> adv-min-mv: "—";
+    in property <string> adv-max-mv: "—";
+    in property <string> adv-centre-mv: "—";
+    in property <string> adv-raw-mv: "—";
     in property <int> preset;
     // Steering centre (A22): pill only once set; button disabled
     // while the calibration backend is unavailable.
@@ -452,13 +465,16 @@ export component MainWindow inherits Window {
         }
         if !setup-mode : HorizontalLayout {
             width: 100%;
-            // R2-12: the busy strip FLOATS over the bottom 38px
-            // (bottom-anchored direct child of the root, below)
-            // instead of reserving layout space — the old
-            // `busy ? 38px : 0px` reserve resized the whole
-            // window on every job start/finish. DS-53's reserve
-            // is gone on purpose: the strip covers only the
-            // page's bottom padding while a job runs.
+            // R2-12 / DS-53 (UI-UX polish, c): NO height reservation
+            // any more — the busy strip floats over the bottom 38px
+            // instead of shrinking the layout (the old
+            // `parent.height - (busy ? 38px : 0px)` re-laid the whole
+            // window on every job start/finish, which read as a
+            // blink). The 38px under the content is permanent empty
+            // padding (see the column's padding-bottom below and the
+            // sidebar's 52px bottom padding), so the strip only ever
+            // covers empty space — never content, never the About
+            // link. The window height never changes.
             height: parent.height;
         Sidebar {
             page: page;
@@ -485,6 +501,13 @@ export component MainWindow inherits Window {
             // column can never ask for more than the window gives.
             min-width: 736px;
             horizontal-stretch: 1;
+            // R2-12 (c): permanent 38px empty reserve at the bottom
+            // of the content column — the floating busy strip sits
+            // over this padding, never over page content. Pages keep
+            // their own 16px bottom padding above it; the reserve
+            // only eats slack (Overview already had ~68px of it) or
+            // shrinks a stretch absorber / the Settings ScrollView.
+            padding-bottom: 38px;
             // top bar (56px). The inner row is 30px tall and offset by
             // 13px so its contents are vertically centred in the bar:
             // Slint layouts top-align fixed-height children, so an
@@ -546,7 +569,9 @@ export component MainWindow inherits Window {
                             unsaved: unsaved;
                             clicked => { profile-clicked(); }
                         }
-                        Btn { label: "Save"; primary: true; clicked => { save-profile(); } }
+                        // DS-54: Save runs a ProfileOp job (8) — it
+                        // disables + dims while the save is in flight.
+                        Btn { label: "Save"; primary: true; disabled: busy-kind == 8; clicked => { save-profile(); } }
                     }
                     BellButton {
                         unread: notif-unread;
@@ -597,6 +622,12 @@ export component MainWindow inherits Window {
                 pair-now => { pair-now-requested(); }
             }
             if page == 1 : SteeringPage {
+                busy-kind: busy-kind;
+                advanced: advanced;
+                adv-min-mv: adv-min-mv;
+                adv-max-mv: adv-max-mv;
+                adv-centre-mv: adv-centre-mv;
+                adv-raw-mv: adv-raw-mv;
                 input-pct: input-pct;
                 output-pct: output-pct;
                 marker-vx: marker-vx;
@@ -622,6 +653,7 @@ export component MainWindow inherits Window {
                 set-centre => { set-centre(); }
             }
             if page == 2 : PedalsPage {
+                busy-kind: busy-kind;
                 // Live values come from the window (Rust drives them);
                 // mV / feel / deadzone / curves come from get_tuning
                 // via the window props below — never literals (A1/A2).
@@ -667,6 +699,7 @@ export component MainWindow inherits Window {
                 bite-edited(t) => { pedal-bite-edited(t); }
             }
             if page == 3 : ButtonsPage {
+                busy-kind: busy-kind;
                 button-actions: button-actions;
                 pressed-index: pressed-index;
                 selected-index: selected-index;
@@ -690,6 +723,7 @@ export component MainWindow inherits Window {
                 edit-save => { edit-save(); }
             }
             if page == 4 : ExtrasScreen {
+                busy-kind: busy-kind;
                 handbrake-pct: handbrake;
                 handbrake-up-mv: handbrake-up-mv;
                 handbrake-down-mv: handbrake-down-mv;
@@ -742,10 +776,10 @@ export component MainWindow inherits Window {
                 backend <=> controller;
                 start-with-windows <=> autostart-enabled;
                 keep-in-tray <=> keep-in-tray;
-                // Theme is 0 Dark / 1 Light / 2 Auto on both sides now
-                // (v2.0.2, A8) — the screen passes the index straight
-                // through and Rust persists it ("Dark"/"Light"/"Auto").
-                theme: theme;
+                // R2-31 (h): the segment shows the STORED choice
+                // (theme-choice, 0/1/2) — never the resolved `theme`
+                // (0/1), so Auto stays visibly selected.
+                theme-choice <=> theme-choice;
                 profiles: settings-profiles;
                 app-version: "RSH " + app-version;
                 firmware-text: firmware-text;
@@ -762,7 +796,7 @@ export component MainWindow inherits Window {
                 toggled-start-windows(b) => { autostart-selected(b); }
                 // M-7: forward the new switch state, don't drop it.
                 toggled-keep-tray(b) => { keep-tray-selected(b); }
-                theme-selected(i) => { theme = i; theme-persist(i); }
+                theme-selected(i) => { theme-choice = i; theme-persist(i); }
                 new-profile => { settings-action("new-profile"); }
                 use-profile(i) => { settings-use-profile(i); }
                 duplicate-profile(i) => { settings-duplicate-profile(i); }
@@ -788,9 +822,11 @@ export component MainWindow inherits Window {
     // (setup-step) so Rust drives Back/Next; the wizard itself only
     // reads it. The notifications drawer below still overlays it.
     if setup-mode : SetupWizard {
-        // R2-12: same float as the shell layout above — no 38px
-        // reserve, so the window never resizes when a job starts
-        // or finishes while the wizard is open.
+        // R2-12 (c): no 38px height reservation any more (see the
+        // shell layout above) — the wizard is always full-height and
+        // the strip floats over the right column's 38px bottom
+        // reserve (setup.slint padding-bottom 66px). Full height is
+        // kept explicit (perf R2-12) so the wizard never shrinks.
         height: parent.height;
         step: setup-step;
         daemon-live: daemon-live;
@@ -846,6 +882,7 @@ export component MainWindow inherits Window {
     if popover-open : ProfilePopover {
         x: parent.width - 320px;
         y: 64px;
+        busy-kind: busy-kind;
         presets: popover-presets;
         profiles: popover-profiles;
         unsaved: unsaved;
@@ -933,7 +970,10 @@ export component MainWindow inherits Window {
     if diag-open : DiagnosticsDrawer {
         x: parent.width - 420px;
         y: 0px;
-        height: parent.height;
+        // R2-12 (c): the drawer stops 38px above the window bottom
+        // so the floating busy strip never covers its bottom edge
+        // (event log / encoders) while a job runs.
+        height: parent.height - 38px;
         steer-chart: diag-steer-chart;
         steer-readout: diag-steer-readout;
         pedals-chart: diag-pedals-chart;
@@ -961,16 +1001,31 @@ export component MainWindow inherits Window {
     }
     // B5 (v2.0.2): global busy strip — one bar, bottom-anchored, on
     // every screen (it is a direct child of the root FocusScope, so
-    // it also shows over the setup wizard). Rust drives `busy` /
-    // `busy-label` from busy_jobs; while a job runs the strip is
-    // visible with a spinner + the job's label, and it vanishes the
-    // moment the job finishes or times out — no infinite loading.
+    // it also shows over the setup wizard). R2-12 (UI-UX polish, c):
+    // it FLOATS now — it is positioned absolute over the window's
+    // bottom 38px and the content keeps a permanent 38px empty
+    // reserve there, so starting/finishing a job never re-lays the
+    // window. Rust drives `busy` / `busy-label` from busy_jobs;
+    // while a job runs the strip is visible with a spinner + the
+    // job's label, and it vanishes the moment the job finishes or
+    // times out — no infinite loading.
     if busy : Rectangle {
         x: 0px;
         y: parent.height - 38px;
         width: parent.width;
         height: 38px;
         background: Theme.panel;
+        // Floating shadow: an 8px fade above the strip so it reads
+        // as a bar floating over the page's bottom padding, not as a
+        // hard edge slicing the content. (A child at negative y
+        // paints outside the parent — Rectangle does not clip.)
+        Rectangle {
+            x: 0px;
+            y: -8px;
+            width: parent.width;
+            height: 8px;
+            background: @linear-gradient(180deg, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.20));
+        }
         Rectangle { y: 0px; width: 100%; height: 1px; background: Theme.line; }
         HorizontalLayout {
             y: 11px;

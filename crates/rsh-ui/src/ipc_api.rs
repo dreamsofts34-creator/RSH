@@ -31,7 +31,6 @@
 //! The connection subscribes to [`AppEvent`] pushes (`subscribe`)
 //! at connect time; [`IpcApi::poll_events`] drains them for the
 //! UI's frame loop.
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
@@ -621,11 +620,13 @@ impl IpcApi {
         self.cache.slow_filled.load(Ordering::Relaxed)
     }
 
-    /// Current slow-cache generation (F5, R2-11): bumps only when
-    /// a completed slow cycle actually changed the slow content.
-    /// The frame timer re-syncs the pages when it changes — that
-    /// is how a daemon-side change reaches the UI without any
-    /// UI-thread IPC.
+    /// Current slow-cache generation (F5): bumps at the end of a
+    /// completed slow cycle whose content actually changed (R2-11 —
+    /// a cycle that reads back identical values does not bump), or
+    /// of a cycle a write pulled forward (a discard can hash back
+    /// to a previously seen value and still must bump). The frame
+    /// timer re-syncs the pages when it changes — that is how a
+    /// daemon-side change reaches the UI without any UI-thread IPC.
     #[must_use]
     pub fn slow_generation(&self) -> u64 {
         self.cache.generation.load(Ordering::Relaxed)
@@ -2637,6 +2638,45 @@ mod tests {
         assert_eq!(client.get_tuning("brake").module, "brake");
         assert_eq!(client.pairing_status().seconds_left, 0);
         assert!(!client.firmware_update_status().running);
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-11: the slow generation bumps only when the slow values
+    /// actually change — identical cycles stay quiet, a real write
+    /// bumps again.
+    #[test]
+    #[cfg(unix)]
+    fn slow_generation_bumps_only_on_content_change() {
+        let (client, dir, handle, _guard) = live_client();
+        assert!(
+            wait_for(&client, IpcApi::slow_filled),
+            "slow cache should fill"
+        );
+        let generation = client.slow_generation();
+        assert!(generation > 0, "first cycle bumps");
+        // Two more ~1 s cycles over an unchanged sim: no bump.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(
+            client.slow_generation(),
+            generation,
+            "unchanged values must not bump"
+        );
+        // A real change bumps again.
+        let mut upd = TuningSettings::neutral("steering");
+        upd.deadzone = 5.0;
+        client.set_tuning(&upd).expect("set_tuning");
+        let mut waited = 0;
+        while client.slow_generation() == generation && waited < 100 {
+            std::thread::sleep(Duration::from_millis(50));
+            waited += 1;
+        }
+        assert_ne!(
+            client.slow_generation(),
+            generation,
+            "changed values must bump"
+        );
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);

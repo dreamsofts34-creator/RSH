@@ -111,6 +111,9 @@ component NotificationRow inherits Rectangle {
         spacing: 3px;
         HorizontalLayout {
             spacing: 8px;
+            // UI-UX polish (a): the 8px dot centres against the
+            // kind/time line instead of top-aligning in the row.
+            cross-axis-alignment: center;
             if unread : Rectangle {
                 width: 8px;
                 height: 8px;
@@ -170,6 +173,9 @@ export component NotificationsDrawer inherits Rectangle {
             padding-left: 16px;
             padding-right: 16px;
             spacing: 10px;
+            // UI-UX polish (a): the title centres against the 30px
+            // buttons instead of top-aligning in the header row.
+            cross-axis-alignment: center;
             // A7: the title shrinks (elides) instead of pushing the
             // buttons out of the 344px drawer.
             Text { horizontal-stretch: 1; text: "Notifications"; font-size: 15px; font-weight: 600; color: Theme.text; wrap: no-wrap; overflow: elide; }

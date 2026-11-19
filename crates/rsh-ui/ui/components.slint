@@ -107,8 +107,12 @@ export component Btn inherits Rectangle {
     border-width: 1px;
     // A5: hover + pressed feedback — primary lightens/darkens the
     // accent, secondary lightens the panel; hover also lifts the border.
-    border-color: fs.has-focus ? Theme.accent-text : (primary ? Theme.accent : (ta.has-hover ? Theme.faint : Theme.line));
-    background: primary ? (ta.pressed ? Theme.accent-pressed : ta.has-hover ? Theme.accent-hover : Theme.accent) : (ta.pressed ? Theme.pressed-bg : ta.has-hover ? Theme.hover-bg : Theme.panel2);
+    // UI-UX polish (R2-12 wave): a disabled button never shows hover
+    // or pressed fills — it stays dimmed (opacity 0.45 below) with its
+    // resting border/background, so a job running elsewhere never
+    // leaves a dead button looking live on hover.
+    border-color: fs.has-focus ? Theme.accent-text : (primary ? Theme.accent : (!disabled && ta.has-hover ? Theme.faint : Theme.line));
+    background: primary ? (!disabled && ta.pressed ? Theme.accent-pressed : !disabled && ta.has-hover ? Theme.accent-hover : Theme.accent) : (!disabled && ta.pressed ? Theme.pressed-bg : !disabled && ta.has-hover ? Theme.hover-bg : Theme.panel2);
     opacity: disabled ? 0.45 : 1;
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
@@ -164,6 +168,11 @@ export component NavItem inherits Rectangle {
         padding-left: 10px;
         padding-right: 10px;
         spacing: 10px;
+        // UI-UX polish (a): preview `a.nav` is align-items:center —
+        // the 17px icon + label + 8px dot are centred in the 36px row,
+        // not top-aligned (Slint's default cross-axis is stretch, so
+        // fixed-height children sit high without this).
+        cross-axis-alignment: center;
         Image {
             width: 17px;
             height: 17px;
@@ -238,6 +247,10 @@ export component StatusCard inherits Rectangle {
         spacing: 9px;
         HorizontalLayout {
             spacing: 8px;
+            // UI-UX polish (a): preview centres the dot against the
+            // two-line label (align-items:center) — without this the
+            // 14px halo sits at the top of the ~30px text block.
+            cross-axis-alignment: center;
             // Halo disc is a pre-blended solid (Theme.halo-ok / halo-bad);
             // the dot is a solid disc on top. Do NOT use opacity here — an
             // opacity rect dims its child dot too (spike bug, Phase 3 fix).
@@ -261,6 +274,10 @@ export component StatusCard inherits Rectangle {
             }
         }
         HorizontalLayout {
+            // UI-UX polish (a): preview `.status .r` is
+            // align-items:center — the label centres against the 20px
+            // switch instead of sitting at the top of the row.
+            cross-axis-alignment: center;
             Text { text: "Send to game"; font-size: 12px; color: Theme.text; }
             Rectangle { horizontal-stretch: 1; }
             Switch { accessible-name: "Send to game"; on: send-to-game; toggled => { toggled-send(); } }
@@ -377,6 +394,9 @@ export component ProfileButton inherits Rectangle {
         padding-left: 10px;
         padding-right: 10px;
         spacing: 8px;
+        // UI-UX polish (a): preview `.pf` is align-items:center — the
+        // 12px chevron centres against the label in the 30px button.
+        cross-axis-alignment: center;
         if unsaved : Rectangle { width: 8px; height: 8px; border-radius: 4px; background: Theme.warn; }
         Text { text: name; font-size: 12px; font-weight: 600; color: Theme.text; }
         Image { width: 12px; height: 12px; source: @image-url("../assets/icons/chevron.svg"); }
@@ -398,6 +418,9 @@ export component AutoProfileChip inherits Rectangle {
         padding-left: 10px;
         padding-right: 10px;
         spacing: 8px;
+        // UI-UX polish (a): preview `.chip` is align-items:center —
+        // the 7px dot + labels centre against the 20px switch.
+        cross-axis-alignment: center;
         Rectangle { width: 7px; height: 7px; border-radius: 4px; background: paused ? Theme.warn : Theme.accent-text; }
         Text { text: "Auto profile"; font-size: 12px; color: Theme.mute; }
         Text { text: game-profile; font-size: 12px; font-weight: 600; color: Theme.text; }
@@ -443,6 +466,10 @@ export component SliderRow inherits VerticalLayout {
     spacing: 6px;
     opacity: disabled ? 0.45 : 1;
     HorizontalLayout {
+        // UI-UX polish (a): preview `.sl .h` is align-items:center —
+        // the 26px number box centres against the two-line label
+        // instead of sitting at the top of the ~32px label block.
+        cross-axis-alignment: center;
         VerticalLayout {
             Text { text: label; font-size: 13px; font-weight: 500; color: Theme.text; }
             Text { text: hint; font-size: 11.5px; color: Theme.faint; }
@@ -677,6 +704,9 @@ export component CurveGraph inherits VerticalLayout {
         Rectangle { horizontal-stretch: 1; }
         HorizontalLayout {
             spacing: 6px;
+            // UI-UX polish (a): the 2px dashed swatch centres against
+            // the "Straight line" label instead of top-aligning.
+            cross-axis-alignment: center;
             Path {
                 width: 22px;
                 height: 2px;
@@ -734,6 +764,10 @@ export component HBar inherits HorizontalLayout {
     in property <float> pct;
     in property <color> bar-color;
     spacing: 8px;
+    // UI-UX polish (a): the 6px bar centres against the labels —
+    // without this it top-aligns in the ~16px row and reads as a
+    // line above the text instead of a bar beside it.
+    cross-axis-alignment: center;
     Text {
         width: 46px;
         text: label;
@@ -845,6 +879,9 @@ export component GameTile inherits Rectangle {
     in property <bool> sub-warn;
     in property <string> action;
     in property <bool> action-primary;
+    // DS-54: the action button disables + dims while its job runs
+    // (Overview binds this to busy-kind == 13, GameOp).
+    in property <bool> action-disabled: false;
     callback action-clicked();
     // Manual games (no auto-scan): small Edit / Remove affordances
     // next to the Launch/Stop button — text links, like the
@@ -862,6 +899,9 @@ export component GameTile inherits Rectangle {
     HorizontalLayout {
         padding: 10px;
         spacing: 10px;
+        // UI-UX polish (a): preview `.tile` is align-items:center —
+        // the 34px icon + text block centre against the 30px button.
+        cross-axis-alignment: center;
         Rectangle {
             width: 34px;
             height: 34px;
@@ -942,7 +982,7 @@ export component GameTile inherits Rectangle {
         }
         // No action for "Not installed" games (A14): an empty action
         // hides the button entirely instead of a fake Locate button.
-        if action != "" : Btn { label: action; primary: action-primary; clicked => { action-clicked(); } }
+        if action != "" : Btn { label: action; primary: action-primary; disabled: action-disabled; clicked => { action-clicked(); } }
     }
 }
 
@@ -954,6 +994,9 @@ export component CheckRow inherits Rectangle {
     height: 26px;
     HorizontalLayout {
         spacing: 9px;
+        // UI-UX polish (a): preview `.chk` is align-items:center —
+        // the 18px tick centres against the label in the 26px row.
+        cross-axis-alignment: center;
         Rectangle {
             width: 18px;
             height: 18px;
@@ -1001,8 +1044,8 @@ export component RadioOptionCard inherits Rectangle {
     height: 64px;
     border-radius: 10px;
     border-width: 1px;
-    border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : (ta.has-hover ? Theme.faint : Theme.line));
-    background: selected ? Theme.acc-bg : (ta.pressed ? Theme.pressed-bg : ta.has-hover ? Theme.hover-bg : Theme.panel2);
+    border-color: fs.has-focus ? Theme.accent-text : (selected ? Theme.accent : (!disabled && ta.has-hover ? Theme.faint : Theme.line));
+    background: selected ? Theme.acc-bg : (!disabled && ta.pressed ? Theme.pressed-bg : !disabled && ta.has-hover ? Theme.hover-bg : Theme.panel2);
     opacity: disabled ? 0.45 : 1;
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
@@ -1020,6 +1063,10 @@ export component RadioOptionCard inherits Rectangle {
     HorizontalLayout {
         padding: 12px;
         spacing: 10px;
+        // UI-UX polish (a): preview `.opt` is align-items:flex-start —
+        // the 18px radio stays at the top against the two-line text,
+        // matching the preview (deliberately NOT centred here).
+        cross-axis-alignment: start;
         Rectangle {
             width: 18px;
             height: 18px;
@@ -1050,6 +1097,10 @@ export component EmptyBanner inherits Rectangle {
     in property <string> text;
     in property <string> action-label: "";
     in property <bool> is-error;
+    // DS-54: the action button disables + dims while its job runs
+    // (Overview binds this to the banner's job kind: Reconnect 0,
+    // PairingOp 12).
+    in property <bool> action-disabled: false;
     callback action-clicked();
     // DS-21 (U-03): was a fixed 36 px with no wrapping, so long
     // strings (the ~100-char Overview banners, unbounded
@@ -1075,7 +1126,7 @@ export component EmptyBanner inherits Rectangle {
             font-size: 12px;
             color: is-error ? Theme.bad : Theme.mute;
         }
-        if action-label != "" : Btn { label: action-label; clicked => { action-clicked(); } }
+        if action-label != "" : Btn { label: action-label; disabled: action-disabled; clicked => { action-clicked(); } }
     }
 }
 

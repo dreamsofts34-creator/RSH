@@ -62,19 +62,26 @@ export component OverviewPage inherits VerticalLayout {
     callback pair-now();
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
     spacing: 12px;
-    if daemon-error != "" : EmptyBanner { text: daemon-error; action-label: "Reconnect"; is-error: true; action-clicked => { reconnect(); } }
+    if daemon-error != "" : EmptyBanner { text: daemon-error; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
     if !daemon-live && daemon-error == "" : EmptyBanner { text: "Live data unavailable — RSH isn't running. Live data appears once it starts."; is-error: false; }
     // REDESIGN-PLAN §8.6 disconnected state: banner + Reconnect.
-    if daemon-live && !connected : EmptyBanner { text: "Wheel not connected — check the RSH Wi-Fi is joined (or the USB cable is plugged in), then retry."; action-label: "Reconnect"; is-error: true; action-clicked => { reconnect(); } }
+    if daemon-live && !connected : EmptyBanner { text: "Wheel not connected — check the RSH Wi-Fi is joined (or the USB cable is plugged in), then retry."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
     // REDESIGN-PLAN §8.6 pairing-needed state (E): banner + Pair.
-    if daemon-live && connected && !paired : EmptyBanner { text: "Wheel not paired — pair it so only this PC can control it."; action-label: "Pair now"; is-error: true; action-clicked => { pair-now(); } }
+    if daemon-live && connected && !paired : EmptyBanner { text: "Wheel not paired — pair it so only this PC can control it."; action-label: "Pair now"; is-error: true; action-disabled: busy-kind == 12; action-clicked => { pair-now(); } }
     Card {
         HorizontalLayout {
             padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
             spacing: 28px;
+            // UI-UX polish (a): preview `Main.html` §96 is
+            // align-items:center — the 112px wheel group centres
+            // against the ~132px pedal bars instead of top-aligning.
+            // The divider keeps full height via self-alignment
+            // stretch (a centred container would collapse it to 0).
+            cross-axis-alignment: center;
             HorizontalLayout {
                 horizontal-stretch: 0;
                 spacing: 14px;
+                cross-axis-alignment: center;
                 WheelGraphic { steer-angle: steer-angle; }
                 VerticalLayout {
                     Text { text: steer-text; font-family: Theme.font-mono; font-size: 30px; font-weight: 600; color: Theme.text; }
@@ -88,9 +95,13 @@ export component OverviewPage inherits VerticalLayout {
                 PedalBar { pct: brake; bar-color: Theme.bad; label: "Brake"; }
                 PedalBar { pct: clutch; bar-color: Theme.accent; label: "Clutch"; }
             }
-            Rectangle { width: 1px; vertical-stretch: 1; horizontal-stretch: 0; background: Theme.line; }
+            Rectangle { width: 1px; vertical-stretch: 1; horizontal-stretch: 0; background: Theme.line; cross-axis-self-alignment: stretch; }
             VerticalLayout {
                 horizontal-stretch: 1;
+                // (same as the divider: this column must keep the
+                // full row height, or its internal stretch spacer
+                // can't push the profile row to the bottom.)
+                cross-axis-self-alignment: stretch;
                 spacing: 4px;
                 HorizontalLayout {
                     spacing: 6px;
@@ -154,7 +165,7 @@ export component OverviewPage inherits VerticalLayout {
             }
             if games.length > 0 : HorizontalLayout {
                 spacing: 10px;
-                for g in games : GameTile { horizontal-stretch: 1; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
+                for g in games : GameTile { horizontal-stretch: 1; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-disabled: busy-kind == 13; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
             }
         }
     }
@@ -164,8 +175,15 @@ export component OverviewPage inherits VerticalLayout {
             horizontal-stretch: 1;
             VerticalLayout {
                 padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
-                spacing: 4px;
+                // UI-UX polish (a): preview is h2 margin 10 + `.chk`
+                // padding 4px 0 — title to first row 14px, rows 8px
+                // apart. Was spacing 4 throughout (rows packed).
+                spacing: 8px;
                 HorizontalLayout {
+                    // UI-UX polish (a): preview is h2 margin 10 +
+                    // `.chk` padding 4px 0 — title to first row 14px
+                    // (8 spacing + this 6px row padding), rows 8px.
+                    padding-bottom: 6px;
                     Text { text: "Ready to race"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                     Rectangle { horizontal-stretch: 1; }
                     Pill { label: connected ? "All good" : "Check needed"; bg: connected ? Theme.ok-bg : Theme.warn-bg; fg: connected ? Theme.ok : Theme.warn; }
@@ -181,6 +199,10 @@ export component OverviewPage inherits VerticalLayout {
                 padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
                 spacing: 10px;
                 HorizontalLayout {
+                    // UI-UX polish (a): preview is h2 margin 10 +
+                    // stats grid margin-top 6 = 16px title-to-stats
+                    // (10 spacing + this 6px row padding).
+                    padding-bottom: 6px;
                     Text { text: "Connection quality"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                     Rectangle { horizontal-stretch: 1; }
                     Text { text: "Last 10 s"; font-size: 12px; color: Theme.mute; }

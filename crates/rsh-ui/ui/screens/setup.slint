@@ -30,6 +30,11 @@ component StepRow inherits HorizontalLayout {
     in property <bool> done;
     in property <bool> now;
     spacing: 12px;
+    // UI-UX polish (a): preview `.st` is padding 10px 0 — each step
+    // row has 10px above and below it (26px between circles with the
+    // 6px column gap). Was flush, 6px apart.
+    padding-top: 10px;
+    padding-bottom: 10px;
     Rectangle {
         width: 26px;
         height: 26px;
@@ -199,9 +204,16 @@ export component SetupWizard inherits Rectangle {
                         source: @image-url("../../assets/icons/wheel.svg");
                     }
                 }
+                // UI-UX polish (a): preview `.side h1` is margin
+                // 14px 0 2px — logo-to-title 14px (column gap 6 + this
+                // 2px spacer + gap 6). Title-to-sub stays 6px vs the
+                // preview's 2px — 4px, not worth restructuring the
+                // column for. Sub-to-steps is 6+10+6=22, the preview's
+                // margin-bottom 22px.
+                Rectangle { height: 2px; }
                 Text { text: "Set up your wheel"; font-size: 20px; font-weight: 700; color: Theme.text; }
                 Text { text: "About 3 minutes. You only do this once."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
-                Rectangle { height: 16px; }
+                Rectangle { height: 10px; }
                 // L-2: the live address, never a hardcoded default —
                 // "Wi-Fi · —" until the wheel is really connected.
                 StepRow { num: 1; label: "Connect"; sub: transport == 1 ? "USB cable" : "Wi-Fi · " + address; done: step > 0 || connect-done; now: step == 0; }
@@ -238,12 +250,21 @@ export component SetupWizard inherits Rectangle {
         VerticalLayout {
             horizontal-stretch: 1;
             padding-top: 28px;
-            padding-bottom: 28px;
+            // UI-UX polish (c): the floating busy strip sits over the
+            // bottom 38px of the window, so the right column keeps
+            // 38px of empty padding below the footer (28+38=66) —
+            // otherwise the strip would cover Back/Next while a job
+            // runs. The window never resizes; this is the reserve.
+            padding-bottom: 66px;
             padding-left: 36px;
             padding-right: 36px;
             spacing: 0px;
             Text { text: "Step " + (step + 1) + " of 5"; font-size: 11.5px; font-weight: 700; color: Theme.accent-text; }
+            // UI-UX polish (a): preview `h2` is margin 6px 0 4px —
+            // eyebrow-to-title 6px, title-to-lead 4px (was 0/0).
+            Rectangle { height: 6px; }
             Text { text: step-title; font-size: 22px; font-weight: 700; color: Theme.text; }
+            Rectangle { height: 4px; }
             Text { text: step-lead; font-size: 13.5px; color: Theme.mute; }
 
             // ---- Step 0: Connect ----

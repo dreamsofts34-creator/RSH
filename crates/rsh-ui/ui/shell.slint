@@ -25,13 +25,22 @@ export component Sidebar inherits Rectangle {
         padding-top: 14px;
         padding-left: 10px;
         padding-right: 10px;
-        padding-bottom: 14px;
+        // UI-UX polish (c): the busy strip floats over the bottom
+        // 38px of the window, so the sidebar keeps 38px of empty
+        // padding below the About link — otherwise the strip would
+        // cover the link (and the StatusCard's bottom edge) while a
+        // job runs. The window never resizes; this is the reserve.
+        padding-bottom: 52px;
         spacing: 2px;
         HorizontalLayout {
             padding-left: 8px;
             padding-right: 8px;
             padding-bottom: 14px;
             spacing: 10px;
+            // UI-UX polish (a): preview `.brand` is
+            // align-items:center — the 28px logo centres against the
+            // two-line wordmark.
+            cross-axis-alignment: center;
             Rectangle {
                 width: 28px;
                 height: 28px;
@@ -52,13 +61,29 @@ export component Sidebar inherits Rectangle {
             }
         }
         NavItem { label: "Overview"; icon: @image-url("../assets/icons/grid.svg"); active: page == 0; clicked => { nav(0); } }
-        Text { text: "DEVICE"; font-size: 10.5px; font-weight: 600; color: Theme.faint; }
+        // UI-UX polish (a): preview `.lbl` is padding 12px 10px 4px —
+        // the section label sits 12px below the nav item above it and
+        // 4px above the next one. The column gap is 2px, so the row
+        // padding makes up the rest (2+10=12 above, 2+2=4 below).
+        // (x=20: sidebar padding 10 + this 10 — preview `.lbl`
+        // padding-left 10px puts the label over the nav icons.)
+        HorizontalLayout {
+            padding-top: 10px;
+            padding-bottom: 2px;
+            padding-left: 10px;
+            Text { text: "DEVICE"; font-size: 10.5px; font-weight: 600; color: Theme.faint; }
+        }
         NavItem { label: "RSH Wheel"; icon: @image-url("../assets/icons/wheel.svg"); active: page >= 1 && page <= 4; show-dot: connected; clicked => { nav(1); } }
         SubItem { label: "Steering"; active: page == 1; clicked => { nav(1); } }
         SubItem { label: "Pedals"; active: page == 2; clicked => { nav(2); } }
         SubItem { label: "Buttons"; active: page == 3; clicked => { nav(3); } }
         SubItem { label: "Extras"; active: page == 4; clicked => { nav(4); } }
-        Text { text: "APP"; font-size: 10.5px; font-weight: 600; color: Theme.faint; }
+        HorizontalLayout {
+            padding-top: 10px;
+            padding-bottom: 2px;
+            padding-left: 10px;
+            Text { text: "APP"; font-size: 10.5px; font-weight: 600; color: Theme.faint; }
+        }
         NavItem { label: "Settings"; icon: @image-url("../assets/icons/gear.svg"); active: page == 5 || page == 6; clicked => { nav(5); } }
         Rectangle { vertical-stretch: 1; }
         StatusCard {

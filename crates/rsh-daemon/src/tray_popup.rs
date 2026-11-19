@@ -147,18 +147,23 @@ fn system_light() -> bool {
 /// reads the persisted UI theme choice from `<data_dir>/ui-theme`
 /// — the same file the main window reads and writes (`rsh-ui`
 /// `read_theme`/`write_theme`: `"Dark"`/`"Light"`/`"Auto"`).
-/// "Light" → light, "Dark" → dark, "Auto" (or a missing /
-/// unreadable file) → the OS preference. Pure over the given
-/// dir, so it is unit-testable with a temp dir.
+/// "Light" → light, "Dark" → dark, "Auto" → the OS preference.
+/// A missing / unreadable file (or no data dir) → Dark — the
+/// fresh-install default, the same default `read_theme` uses
+/// (R2-37): the preview only approves the dark theme
+/// (REDESIGN-PLAN: "Light theme: abhi design nahi hui"), so a
+/// fresh install must not render Light on a light OS while the
+/// main window opens Dark. Pure over the given dir, so it is
+/// unit-testable with a temp dir.
 #[must_use]
 pub fn popup_is_light(data_dir: Option<&std::path::Path>) -> bool {
     let Some(dir) = data_dir else {
-        return system_light();
+        return false;
     };
     match std::fs::read_to_string(dir.join("ui-theme")) {
         Ok(text) if text.trim() == "Light" => true,
-        Ok(text) if text.trim() == "Dark" => false,
-        _ => system_light(),
+        Ok(text) if text.trim() == "Auto" => system_light(),
+        _ => false,
     }
 }
 
@@ -1311,16 +1316,18 @@ mod tests {
         assert!(popup_is_light(Some(&dir)), "Light must render light");
         std::fs::write(dir.join("ui-theme"), "Dark\n").expect("write theme");
         assert!(!popup_is_light(Some(&dir)), "Dark must render dark");
-        // "Auto", a missing file, and garbage all fall back to the
-        // OS preference — the same value as no data dir at all.
-        // (The OS value itself is runner-dependent, so the test
-        // asserts the fallback path, not a specific theme.)
+        // R2-37: "Auto" still follows the OS preference, but a
+        // missing file, garbage, and no data dir at all are Dark —
+        // the fresh-install default, matching `read_theme`.
+        // (The OS value itself is runner-dependent, so the Auto
+        // assertion compares against the sampler, not a theme.)
         std::fs::write(dir.join("ui-theme"), "Auto\n").expect("write theme");
-        assert_eq!(popup_is_light(Some(&dir)), popup_is_light(None));
+        assert_eq!(popup_is_light(Some(&dir)), system_light());
         let _ = std::fs::remove_file(dir.join("ui-theme"));
-        assert_eq!(popup_is_light(Some(&dir)), popup_is_light(None));
+        assert!(!popup_is_light(Some(&dir)), "missing file must render dark");
         std::fs::write(dir.join("ui-theme"), "garbage\n").expect("write theme");
-        assert_eq!(popup_is_light(Some(&dir)), popup_is_light(None));
+        assert!(!popup_is_light(Some(&dir)), "garbage must render dark");
+        assert!(!popup_is_light(None), "no data dir must render dark");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

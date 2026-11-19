@@ -15,9 +15,11 @@
 //   backend field — its slider is disabled with a reason (A6).
 // - Horn button IS a set_tuning field (horn_button): Learn arms
 //   start_learn and take_learned_button supplies the picked button.
-// - LEDs ARE set_tuning fields (led_brightness, led_pattern): the
-//   pattern chips + brightness slider push through set_tuning("led").
-//   Colour has NO backend field — swatches show a reason (A6).
+// - LEDs ARE set_tuning fields (led_brightness, led_pattern,
+//   led_color): the pattern chips + brightness slider + colour
+//   swatches push through set_tuning("led") and sync_extras reads
+//   the colour back (R2-34: the old "Colour isn't stored on the
+//   wheel yet" copy was stale — the colour IS stored).
 // - Handbrake deadzone/feel/mV come from get_tuning("handbrake");
 //   Set up/down need calibrate_pedal (BACKEND-2 seam) and stay
 //   disabled with a reason until it lands (A2).
@@ -27,6 +29,7 @@
 
 import { Theme } from "../tokens.slint";
 import { Card, Switch, Btn, SliderRow, RangeBlock, PresetChip, ButtonTile, SegmentedControl } from "../components.slint";
+import { ScrollView } from "std-widgets.slint";
 
 // Mini curve (preview Pedals.html: 110x110 viewBox, axis + dashed
 // straight line + accent curve + live marker). Path commands come from
@@ -86,6 +89,9 @@ component ExtrasCardHeader inherits HorizontalLayout {
     in property <string> title;
     in property <bool> on;
     callback toggled();
+    // UI-UX polish (a): the title centres against the 20px switch
+    // instead of top-aligning in the row.
+    cross-axis-alignment: center;
     Text { text: title; font-size: 12.5px; font-weight: 600; color: Theme.text; }
     Rectangle { horizontal-stretch: 1; }
     Switch { accessible-name: title; on: on; toggled => { toggled(); } }
@@ -132,6 +138,11 @@ export component ExtrasScreen inherits VerticalLayout {
     in property <string> led-brightness-text: "—";
     in property <int> led-color: 3; // swatch index 0..5
     in property <[color]> led-preview;
+    // DS-54: which job kind the busy strip shows, as a
+    // JobKind::order value (-1 = idle) — Horn Learn disables + dims
+    // while its LearnOp job (11) runs; Handbrake Set up/down while
+    // their CaptureOp job (10) runs.
+    in property <int> busy-kind: -1;
 
     callback action(string);
     callback handbrake-mode-selected(int);
@@ -144,209 +155,222 @@ export component ExtrasScreen inherits VerticalLayout {
     callback led-brightness-edited(string);
     callback led-color-selected(int);
 
-    padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
-    spacing: 12px;
+    // UI-UX polish (a): the 2x2 grid is ~750px tall — taller than
+    // the 524px body — so the bottom row (Horn / LEDs colour) was
+    // clipped below the window edge. The cards scroll inside a
+    // ScrollView now (the Settings pattern); the cards themselves
+    // are unchanged, and short content still sits at the top.
+    extras-scroll := ScrollView {
+        vertical-stretch: 1;
+        VerticalLayout {
+            padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
+            spacing: 12px;
 
-    HorizontalLayout {
-        spacing: 12px;
-        // ---- Handbrake
-        Card {
-            horizontal-stretch: 1;
-            VerticalLayout {
-                padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
-                spacing: 10px;
-                ExtrasCardHeader { title: "Handbrake"; on: handbrake-on; toggled => { handbrake-on = !handbrake-on; action("handbrake-toggle"); } }
-                if !handbrake-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
-                if handbrake-on : VerticalLayout {
-                    spacing: 10px;
-                    SegmentedControl {
-                        option-0: "Axis";
-                        option-1: "Button";
-                        selected: handbrake-mode;
-                        selected-changed(i) => { handbrake-mode-selected(i); }
-                    }
-                    if handbrake-mode == 0 : VerticalLayout {
+            HorizontalLayout {
+                spacing: 12px;
+                // ---- Handbrake
+                Card {
+                    horizontal-stretch: 1;
+                    VerticalLayout {
+                        padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
                         spacing: 10px;
-                        Rectangle {
-                            border-radius: 10px;
-                            border-width: 1px;
-                            border-color: Theme.line;
-                            background: Theme.bg;
-                            HorizontalLayout {
-                                padding: 10px;
-                                spacing: 12px;
-                                alignment: start;
+                        ExtrasCardHeader { title: "Handbrake"; on: handbrake-on; toggled => { handbrake-on = !handbrake-on; action("handbrake-toggle"); } }
+                        if !handbrake-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        if handbrake-on : VerticalLayout {
+                            spacing: 10px;
+                            SegmentedControl {
+                                option-0: "Axis";
+                                option-1: "Button";
+                                selected: handbrake-mode;
+                                selected-changed(i) => { handbrake-mode-selected(i); }
+                            }
+                            if handbrake-mode == 0 : VerticalLayout {
+                                spacing: 10px;
                                 Rectangle {
-                                    width: 16px;
-                                    height: 110px;
-                                    border-radius: 8px;
-                                    background: Theme.track;
-                                    clip: true;
-                                    Rectangle {
-                                        width: 16px;
-                                        height: parent.height * handbrake-pct / 100;
-                                        y: parent.height - self.height;
-                                        border-radius: 8px;
-                                        background: Theme.bad;
+                                    border-radius: 10px;
+                                    border-width: 1px;
+                                    border-color: Theme.line;
+                                    background: Theme.bg;
+                                    HorizontalLayout {
+                                        padding: 10px;
+                                        spacing: 12px;
+                                        alignment: start;
+                                        // UI-UX polish (a): the live % block
+                                        // centres against the 110px bar/curve
+                                        // instead of top-aligning in the box.
+                                        cross-axis-alignment: center;
+                                        Rectangle {
+                                            width: 16px;
+                                            height: 110px;
+                                            border-radius: 8px;
+                                            background: Theme.track;
+                                            clip: true;
+                                            Rectangle {
+                                                width: 16px;
+                                                height: parent.height * handbrake-pct / 100;
+                                                y: parent.height - self.height;
+                                                border-radius: 8px;
+                                                background: Theme.bad;
+                                            }
+                                        }
+                                        MiniCurve {
+                                            curve-commands: handbrake-curve;
+                                            dashed-commands: handbrake-dashed;
+                                            show-dashed: true;
+                                            marker-vx: handbrake-marker-x;
+                                            marker-vy: handbrake-marker-y;
+                                        }
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            Text { text: Math.round(handbrake-pct) + "%"; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; }
+                                            Text { text: "Live"; font-size: 11.5px; color: Theme.mute; }
+                                        }
                                     }
                                 }
-                                MiniCurve {
-                                    curve-commands: handbrake-curve;
-                                    dashed-commands: handbrake-dashed;
-                                    show-dashed: true;
-                                    marker-vx: handbrake-marker-x;
-                                    marker-vy: handbrake-marker-y;
+                                RangeBlock { up-value: handbrake-up-mv; down-value: handbrake-down-mv; up-disabled: calibration-disabled || busy-kind == 10; down-disabled: calibration-disabled || busy-kind == 10; set-up => { action("handbrake-up"); } set-down => { action("handbrake-down"); } }
+                                if calibration-disabled : Text { text: "RSH isn't running — reconnect to capture."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                                HorizontalLayout {
+                                    spacing: 4px;
+                                    PresetChip { horizontal-stretch: 1; label: "Linear"; active: handbrake-feel == 0; clicked => { handbrake-feel-selected(0); } }
+                                    PresetChip { horizontal-stretch: 1; label: "Soft"; active: handbrake-feel == 1; clicked => { handbrake-feel-selected(1); } }
+                                    PresetChip { horizontal-stretch: 1; label: "Sharp"; active: handbrake-feel == 2; clicked => { handbrake-feel-selected(2); } }
                                 }
-                                VerticalLayout {
-                                    spacing: 2px;
-                                    Text { text: Math.round(handbrake-pct) + "%"; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; }
-                                    Text { text: "Live"; font-size: 11.5px; color: Theme.mute; }
-                                }
+                                SliderRow { label: "Deadzone"; hint: "Ignores small inputs"; value-text: handbrake-deadzone-text; value: handbrake-deadzone; changed(v) => { handbrake-deadzone-changed(v); } value-edited(t) => { handbrake-deadzone-edited(t); } }
+                            }
+                            if handbrake-mode == 1 : VerticalLayout {
+                                spacing: 10px;
+                                ButtonTile { label: "HANDBRAKE"; action: handbrake-pressed ? "Pressed" : "Released"; pressed: handbrake-pressed; clicked => { action("handbrake-test"); } }
+                                Text { text: "Button mode: the handbrake acts as a digital button (firmware F-15)."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
                             }
                         }
-                        RangeBlock { up-value: handbrake-up-mv; down-value: handbrake-down-mv; up-disabled: calibration-disabled; down-disabled: calibration-disabled; set-up => { action("handbrake-up"); } set-down => { action("handbrake-down"); } }
-                        if calibration-disabled : Text { text: "RSH isn't running — reconnect to capture."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
-                        HorizontalLayout {
-                            spacing: 4px;
-                            PresetChip { horizontal-stretch: 1; label: "Linear"; active: handbrake-feel == 0; clicked => { handbrake-feel-selected(0); } }
-                            PresetChip { horizontal-stretch: 1; label: "Soft"; active: handbrake-feel == 1; clicked => { handbrake-feel-selected(1); } }
-                            PresetChip { horizontal-stretch: 1; label: "Sharp"; active: handbrake-feel == 2; clicked => { handbrake-feel-selected(2); } }
-                        }
-                        SliderRow { label: "Deadzone"; hint: "Ignores small inputs"; value-text: handbrake-deadzone-text; value: handbrake-deadzone; changed(v) => { handbrake-deadzone-changed(v); } value-edited(t) => { handbrake-deadzone-edited(t); } }
                     }
-                    if handbrake-mode == 1 : VerticalLayout {
+                }
+                // ---- Shifter
+                Card {
+                    horizontal-stretch: 1;
+                    VerticalLayout {
+                        padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
                         spacing: 10px;
-                        ButtonTile { label: "HANDBRAKE"; action: handbrake-pressed ? "Pressed" : "Released"; pressed: handbrake-pressed; clicked => { action("handbrake-test"); } }
-                        Text { text: "Button mode: the handbrake acts as a digital button (firmware F-15)."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
-                    }
-                }
-            }
-        }
-        // ---- Shifter
-        Card {
-            horizontal-stretch: 1;
-            VerticalLayout {
-                padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
-                spacing: 10px;
-                ExtrasCardHeader { title: "Shifter"; on: shifter-on; toggled => { shifter-on = !shifter-on; action("shifter-toggle"); } }
-                if !shifter-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
-                if shifter-on : VerticalLayout {
-                    spacing: 10px;
-                    Text { text: gear; font-family: Theme.font-mono; font-size: 44px; font-weight: 600; color: Theme.text; horizontal-alignment: center; }
-                    Text { text: shifter-mode == 1 ? "H-pattern · current gear" : "Sequential · current gear"; font-size: 12px; color: Theme.mute; horizontal-alignment: center; }
-                    SliderRow { label: "Sensitivity"; hint: "Shift firmness"; value-text: shifter-sensitivity-text; value: shifter-sensitivity; disabled: sensitivity-disabled; changed(v) => { shifter-sensitivity-changed(v); } }
-                    if sensitivity-disabled : Text { text: "Sensitivity has no wheel setting yet."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
-                    Text {
-                        text: "Change gear mapping in Buttons";
-                        font-size: 12px;
-                        font-weight: 600;
-                        color: gear-fs.has-focus || gear-ta.has-hover ? Theme.text : Theme.accent-text;
-                        accessible-label: "Change gear mapping in Buttons";
-                        accessible-role: button;
-                        // FIX-4: keyboard activation for this text link.
-                        gear-fs := FocusScope {
-                            width: 100%;
-                            height: 100%;
-                            key-pressed(event) => {
-                                if (event.text == Key.Return || event.text == Key.Space) {
-                                    action("shifter-change-in-buttons");
-                                    return accept;
-                                }
-                                return reject;
-                            }
-                        }
-                        gear-ta := TouchArea { mouse-cursor: pointer; clicked => { action("shifter-change-in-buttons"); } }
-                    }
-                }
-            }
-        }
-    }
-    HorizontalLayout {
-        spacing: 12px;
-        // ---- Horn
-        Card {
-            horizontal-stretch: 1;
-            VerticalLayout {
-                padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
-                spacing: 10px;
-                ExtrasCardHeader { title: "Horn"; on: horn-on; toggled => { horn-on = !horn-on; action("horn-toggle"); } }
-                if !horn-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
-                if horn-on : VerticalLayout {
-                    spacing: 10px;
-                    ButtonTile { label: "HORN BUTTON"; action: horn-button; pressed: horn-pressed; clicked => { action("horn-learn"); } }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Btn { label: horn-learning ? "Listening…" : "Learn from wheel"; primary: true; clicked => { action("horn-learn"); } }
-                        Btn { label: "Test"; clicked => { action("horn-test"); } }
-                    }
-                    if horn-learning : Text { text: "Press the horn button on the wheel…"; font-size: 11.5px; color: Theme.warn; }
-                    if !horn-learning : Text { text: "Test only lights the indicator when Send to game is off."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
-                }
-            }
-        }
-        // ---- LEDs
-        Card {
-            horizontal-stretch: 1;
-            VerticalLayout {
-                padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
-                spacing: 10px;
-                ExtrasCardHeader { title: "LEDs"; on: leds-on; toggled => { leds-on = !leds-on; action("leds-toggle"); } }
-                if !leds-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
-                if leds-on : VerticalLayout {
-                    spacing: 10px;
-                    // Live LED strip preview (8 circles, colours from Rust)
-                    HorizontalLayout {
-                        spacing: 6px;
-                        for c in led-preview : Rectangle {
-                            width: 14px;
-                            height: 14px;
-                            border-radius: 7px;
-                            background: c;
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: 4px;
-                        PresetChip { horizontal-stretch: 1; label: "Off"; active: led-pattern == 0; clicked => { led-pattern-selected(0); } }
-                        PresetChip { horizontal-stretch: 1; label: "Solid"; active: led-pattern == 1; clicked => { led-pattern-selected(1); } }
-                        PresetChip { horizontal-stretch: 1; label: "Blink"; active: led-pattern == 2; clicked => { led-pattern-selected(2); } }
-                        PresetChip { horizontal-stretch: 1; label: "Chase"; active: led-pattern == 3; clicked => { led-pattern-selected(3); } }
-                        PresetChip { horizontal-stretch: 1; label: "Rainbow"; active: led-pattern == 4; clicked => { led-pattern-selected(4); } }
-                    }
-                    SliderRow { label: "Brightness"; hint: "Brightness"; value-text: led-brightness-text; value: led-brightness; changed(v) => { led-brightness-changed(v); } value-edited(t) => { led-brightness-edited(t); } }
-                    if led-pattern == 1 : VerticalLayout {
-                        spacing: 6px;
-                        Text { text: "Colour"; font-size: 12.5px; font-weight: 500; color: Theme.text; }
-                        Text { text: "Colour isn't stored on the wheel yet."; font-size: 11.5px; color: Theme.faint; }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            for s[i] in [#FF6B6B, #F5B84A, #3DD68C, #2F6BFF, #B46CFF, #FFFFFF] : Rectangle {
-                                width: 22px;
-                                height: 22px;
-                                border-radius: 11px;
-                                border-width: led-color == i ? 2px : 1px;
-                                border-color: led-color == i ? Theme.text : (sw-ta.has-hover ? Theme.faint : Theme.line);
-                                background: s;
-                                accessible-label: "LED colour " + (i + 1);
+                        ExtrasCardHeader { title: "Shifter"; on: shifter-on; toggled => { shifter-on = !shifter-on; action("shifter-toggle"); } }
+                        if !shifter-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        if shifter-on : VerticalLayout {
+                            spacing: 10px;
+                            Text { text: gear; font-family: Theme.font-mono; font-size: 44px; font-weight: 600; color: Theme.text; horizontal-alignment: center; }
+                            Text { text: shifter-mode == 1 ? "H-pattern · current gear" : "Sequential · current gear"; font-size: 12px; color: Theme.mute; horizontal-alignment: center; }
+                            SliderRow { label: "Sensitivity"; hint: "Shift firmness"; value-text: shifter-sensitivity-text; value: shifter-sensitivity; disabled: sensitivity-disabled; changed(v) => { shifter-sensitivity-changed(v); } }
+                            if sensitivity-disabled : Text { text: "Sensitivity has no wheel setting yet."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                            Text {
+                                text: "Change gear mapping in Buttons";
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: gear-fs.has-focus || gear-ta.has-hover ? Theme.text : Theme.accent-text;
+                                accessible-label: "Change gear mapping in Buttons";
                                 accessible-role: button;
-                                color-fs := FocusScope {
+                                // FIX-4: keyboard activation for this text link.
+                                gear-fs := FocusScope {
                                     width: 100%;
                                     height: 100%;
                                     key-pressed(event) => {
                                         if (event.text == Key.Return || event.text == Key.Space) {
-                                            led-color-selected(i);
+                                            action("shifter-change-in-buttons");
                                             return accept;
                                         }
                                         return reject;
                                     }
                                 }
-                                sw-ta := TouchArea { mouse-cursor: pointer; clicked => { led-color-selected(i); } }
+                                gear-ta := TouchArea { mouse-cursor: pointer; clicked => { action("shifter-change-in-buttons"); } }
                             }
                         }
                     }
                 }
             }
+            HorizontalLayout {
+                spacing: 12px;
+                // ---- Horn
+                Card {
+                    horizontal-stretch: 1;
+                    VerticalLayout {
+                        padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
+                        spacing: 10px;
+                        ExtrasCardHeader { title: "Horn"; on: horn-on; toggled => { horn-on = !horn-on; action("horn-toggle"); } }
+                        if !horn-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        if horn-on : VerticalLayout {
+                            spacing: 10px;
+                            ButtonTile { label: "HORN BUTTON"; action: horn-button; pressed: horn-pressed; clicked => { action("horn-learn"); } }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Btn { label: horn-learning ? "Listening…" : "Learn from wheel"; primary: true; disabled: busy-kind == 11; clicked => { action("horn-learn"); } }
+                                Btn { label: "Test"; clicked => { action("horn-test"); } }
+                            }
+                            if horn-learning : Text { text: "Press the horn button on the wheel…"; font-size: 11.5px; color: Theme.warn; }
+                            if !horn-learning : Text { text: "Test only lights the indicator when Send to game is off."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                        }
+                    }
+                }
+                // ---- LEDs
+                Card {
+                    horizontal-stretch: 1;
+                    VerticalLayout {
+                        padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
+                        spacing: 10px;
+                        ExtrasCardHeader { title: "LEDs"; on: leds-on; toggled => { leds-on = !leds-on; action("leds-toggle"); } }
+                        if !leds-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        if leds-on : VerticalLayout {
+                            spacing: 10px;
+                            // Live LED strip preview (8 circles, colours from Rust)
+                            HorizontalLayout {
+                                spacing: 6px;
+                                for c in led-preview : Rectangle {
+                                    width: 14px;
+                                    height: 14px;
+                                    border-radius: 7px;
+                                    background: c;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 4px;
+                                PresetChip { horizontal-stretch: 1; label: "Off"; active: led-pattern == 0; clicked => { led-pattern-selected(0); } }
+                                PresetChip { horizontal-stretch: 1; label: "Solid"; active: led-pattern == 1; clicked => { led-pattern-selected(1); } }
+                                PresetChip { horizontal-stretch: 1; label: "Blink"; active: led-pattern == 2; clicked => { led-pattern-selected(2); } }
+                                PresetChip { horizontal-stretch: 1; label: "Chase"; active: led-pattern == 3; clicked => { led-pattern-selected(3); } }
+                                PresetChip { horizontal-stretch: 1; label: "Rainbow"; active: led-pattern == 4; clicked => { led-pattern-selected(4); } }
+                            }
+                            SliderRow { label: "Brightness"; hint: "Brightness"; value-text: led-brightness-text; value: led-brightness; changed(v) => { led-brightness-changed(v); } value-edited(t) => { led-brightness-edited(t); } }
+                            if led-pattern == 1 : VerticalLayout {
+                                spacing: 6px;
+                                Text { text: "Colour"; font-size: 12.5px; font-weight: 500; color: Theme.text; }
+                                Text { text: "Colour is saved on the wheel."; font-size: 11.5px; color: Theme.faint; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    for s[i] in [#FF6B6B, #F5B84A, #3DD68C, #2F6BFF, #B46CFF, #FFFFFF] : Rectangle {
+                                        width: 22px;
+                                        height: 22px;
+                                        border-radius: 11px;
+                                        border-width: led-color == i ? 2px : 1px;
+                                        border-color: led-color == i ? Theme.text : (sw-ta.has-hover ? Theme.faint : Theme.line);
+                                        background: s;
+                                        accessible-label: "LED colour " + (i + 1);
+                                        accessible-role: button;
+                                        color-fs := FocusScope {
+                                            width: 100%;
+                                            height: 100%;
+                                            key-pressed(event) => {
+                                                if (event.text == Key.Return || event.text == Key.Space) {
+                                                    led-color-selected(i);
+                                                    return accept;
+                                                }
+                                                return reject;
+                                            }
+                                        }
+                                        sw-ta := TouchArea { mouse-cursor: pointer; clicked => { led-color-selected(i); } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Rectangle { height: 2px; }
         }
     }
-    // Absorbs spare vertical space so the rows keep preferred height.
-    Rectangle { vertical-stretch: 1; }
 }
