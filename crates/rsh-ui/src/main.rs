@@ -36,7 +36,9 @@
 //!      --quit-after SECONDS
 //!      --data-dir DIR      test-only: daemon data dir for the IPC socket
 //!
-//! Timing / event logs go to stderr as `RSH-UI ...` lines.
+//! Timing / event logs go to stderr as `RSH-UI ...` lines, but
+//! only with `--verbose` (DS-79): the UI thread never does an
+//! unconditional `eprintln!` per event.
 #![allow(
     missing_docs,
     reason = "slint::include_modules! generates undocumented getters/setters"
@@ -74,6 +76,23 @@ use crate::notifications::{sync_to_window, NotificationCenter};
 use crate::sim_api::SimApi;
 
 slint::include_modules!();
+
+/// Verbose UI logging (DS-79 / R2-41): the UI thread never does
+/// an unconditional `eprintln!` per event — stderr is invisible
+/// under `windows_subsystem = "windows"` and an unbuffered write
+/// per event is pure UI-thread cost. `ui_log!` writes only with
+/// `--verbose`; without it even the `format!` is skipped (the
+/// macro expands to an `if` around the `eprintln!`). Set once in
+/// `main` from the parsed args; tests leave it off.
+static UI_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+macro_rules! ui_log {
+    ($($arg:tt)*) => {
+        if UI_VERBOSE.load(Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 /// View-box geometry of the steering curve (see `curve.rs`).
 const VX0: f32 = 30.0;
@@ -539,11 +558,11 @@ fn write_theme(data_dir: Option<&PathBuf>, settings_idx: i32) -> bool {
     };
     match std::fs::write(dir.join("ui-theme"), format!("{text}\n")) {
         Ok(()) => {
-            eprintln!("RSH-UI theme persisted: {text}");
+            ui_log!("RSH-UI theme persisted: {text}");
             true
         }
         Err(e) => {
-            eprintln!("RSH-UI theme persist failed: {e}");
+            ui_log!("RSH-UI theme persist failed: {e}");
             false
         }
     }
@@ -563,9 +582,14 @@ fn resolve_theme_mode(choice: i32, system_light: bool) -> i32 {
 /// Whether the OS currently prefers a light theme (A8/Auto,
 /// Windows): `AppsUseLightTheme` under the Personalize key.
 /// Best-effort — any failure (no `reg`, no key) means Dark.
+/// R2-03 theme half: `CREATE_NO_WINDOW` — a console-subsystem
+/// child spawned without it flashes a console window on every
+/// sample (the sampler runs this every 30 s).
 #[cfg(windows)]
 fn system_light() -> bool {
+    use std::os::windows::process::CommandExt;
     let Ok(out) = std::process::Command::new("reg")
+        .creation_flags(0x0800_0000)
         .args([
             "query",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
@@ -901,13 +925,34 @@ fn daemon_error_for(live: bool, status: Option<(String, String)>) -> String {
 /// Write one Extras module `-on` prop by module index (H7, FC2):
 /// 0 handbrake, 1 shifter, 2 horn, 3 led. The props are `MainWindow`
 /// in-out props, so Rust can revert a toggle the backend rejected.
+/// R2-11: change-guarded like every other sync write.
 fn set_extras_on_prop(win: &MainWindow, index: usize, value: bool) {
     match index {
-        0 => win.set_extras_handbrake_on(value),
-        1 => win.set_extras_shifter_on(value),
-        2 => win.set_extras_horn_on(value),
-        _ => win.set_extras_leds_on(value),
+        0 => set_if_changed(win.get_extras_handbrake_on(), value, |v| {
+            win.set_extras_handbrake_on(v);
+        }),
+        1 => set_if_changed(win.get_extras_shifter_on(), value, |v| {
+            win.set_extras_shifter_on(v);
+        }),
+        2 => set_if_changed(win.get_extras_horn_on(), value, |v| {
+            win.set_extras_horn_on(v);
+        }),
+        _ => set_if_changed(win.get_extras_leds_on(), value, |v| {
+            win.set_extras_leds_on(v);
+        }),
     }
+}
+
+/// True when a `ModelRc` already holds exactly `values` (R2-11):
+/// rebuilding the model from scratch resets every `for` row
+/// (hover / selection state), so list syncs only replace the
+/// model when its contents actually changed.
+fn model_eq<T: PartialEq + Clone>(model: &ModelRc<T>, values: &[T]) -> bool {
+    use slint::Model;
+    if model.row_count() != values.len() {
+        return false;
+    }
+    (0..values.len()).all(|i| model.row_data(i).as_ref() == Some(&values[i]))
 }
 
 /// Write the B5 busy props, only when they change (so the 1 Hz
@@ -927,9 +972,9 @@ fn set_busy_props(win: &MainWindow, busy: bool, label: &str, kind: i32) {
     win.set_busy_label(label.into());
     win.set_busy_kind(kind);
     if busy {
-        eprintln!("RSH-UI busy: {label}");
+        ui_log!("RSH-UI busy: {label}");
     } else {
-        eprintln!("RSH-UI busy: idle");
+        ui_log!("RSH-UI busy: idle");
     }
 }
 
@@ -940,9 +985,9 @@ fn set_daemon_error_prop(win: &MainWindow, text: &str) {
     }
     win.set_daemon_error(text.into());
     if text.is_empty() {
-        eprintln!("RSH-UI daemon-error banner cleared");
+        ui_log!("RSH-UI daemon-error banner cleared");
     } else {
-        eprintln!("RSH-UI daemon-error banner: {text}");
+        ui_log!("RSH-UI daemon-error banner: {text}");
     }
 }
 
@@ -1203,6 +1248,17 @@ struct FrameCmdCache {
     dashed_line: Option<SharedString>,
     curve: Option<(f32, f32, SharedString)>,
     crosshair: Option<(f32, f32, SharedString)>,
+    /// R2-43: the per-tick formatted strings, cached by their
+    /// cheap inputs — `push_frame` used to `format!` ~4 strings
+    /// per 50 ms tick even when nothing moved.
+    dash: Option<SharedString>,
+    steer_text: Option<(f32, SharedString)>,
+    deadzone_text: Option<(f32, SharedString)>,
+    curve_text: Option<(f32, SharedString)>,
+    conn_label: Option<(bool, bool, bool, String, SharedString)>,
+    conn_sub: Option<(bool, bool, String, String, SharedString)>,
+    gear_text: Option<(u8, SharedString)>,
+    pedals_readout: Option<(f64, f64, SharedString)>,
 }
 
 impl FrameCmdCache {
@@ -1212,6 +1268,154 @@ impl FrameCmdCache {
         }
         let built: SharedString = dashed_line_commands().into();
         self.dashed_line = Some(built.clone());
+        built
+    }
+
+    /// The "—" placeholder, built once.
+    fn dash(&mut self) -> SharedString {
+        if let Some(cached) = &self.dash {
+            return cached.clone();
+        }
+        let built: SharedString = "—".into();
+        self.dash = Some(built.clone());
+        built
+    }
+
+    /// Steering angle text (`"+12°"`, "—" without live data —
+    /// B1: never a sine angle), rebuilt only when the angle moved.
+    #[allow(clippy::float_cmp)]
+    fn steer_text(&mut self, live: bool, steer_deg: f32) -> SharedString {
+        if !live {
+            return self.dash();
+        }
+        if let Some((deg, cached)) = &self.steer_text {
+            if *deg == steer_deg {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = format!("{steer_deg:+.0}°").into();
+        self.steer_text = Some((steer_deg, built.clone()));
+        built
+    }
+
+    /// Deadzone percent text, rebuilt only when it moved.
+    #[allow(clippy::float_cmp)]
+    fn deadzone_text(&mut self, deadzone: f32) -> SharedString {
+        if let Some((dz, cached)) = &self.deadzone_text {
+            if *dz == deadzone {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = format!("{deadzone:.0}%").into();
+        self.deadzone_text = Some((deadzone, built.clone()));
+        built
+    }
+
+    /// Curve exponent text, rebuilt only when it moved.
+    #[allow(clippy::float_cmp)]
+    fn curve_text(&mut self, exponent: f32) -> SharedString {
+        if let Some((ex, cached)) = &self.curve_text {
+            if *ex == exponent {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = format!("{exponent:.2}").into();
+        self.curve_text = Some((exponent, built.clone()));
+        built
+    }
+
+    /// Top-bar connection label, rebuilt only when one of its
+    /// inputs moved. The `conn_label_for` rule stays the single
+    /// source of truth (see the DS-67 test).
+    fn conn_label(
+        &mut self,
+        connecting: bool,
+        live: bool,
+        label: &str,
+        rejoining: bool,
+    ) -> SharedString {
+        if let Some((c, l, r, old_label, cached)) = &self.conn_label {
+            if *c == connecting && *l == live && *r == rejoining && old_label == label {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = conn_label_for(connecting, live, label, rejoining).into();
+        self.conn_label = Some((
+            connecting,
+            live,
+            rejoining,
+            label.to_string(),
+            built.clone(),
+        ));
+        built
+    }
+
+    /// Top-bar connection sub-line (`"Wi-Fi · 192.168.4.1"`),
+    /// rebuilt only when one of its inputs moved.
+    fn conn_sub(
+        &mut self,
+        connecting: bool,
+        live: bool,
+        transport: &str,
+        address: &str,
+    ) -> SharedString {
+        if let Some((c, l, t, a, cached)) = &self.conn_sub {
+            if *c == connecting && *l == live && t == transport && a == address {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = if connecting {
+            "Starting RSH…".into()
+        } else if live {
+            if address.is_empty() {
+                transport.to_string().into()
+            } else {
+                format!("{transport} · {address}").into()
+            }
+        } else {
+            "Not connected".into()
+        };
+        self.conn_sub = Some((
+            connecting,
+            live,
+            transport.to_string(),
+            address.to_string(),
+            built.clone(),
+        ));
+        built
+    }
+
+    /// Gear text (`"—"` in neutral), rebuilt only when the gear moved.
+    fn gear_text(&mut self, gear: u8) -> SharedString {
+        if let Some((g, cached)) = &self.gear_text {
+            if *g == gear {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = if gear == 0 {
+            self.dash()
+        } else {
+            gear.to_string().into()
+        };
+        self.gear_text = Some((gear, built.clone()));
+        built
+    }
+
+    /// Diagnostics pedals readout, rebuilt only when a value moved.
+    #[allow(clippy::float_cmp)]
+    fn pedals_readout(&mut self, throttle: f64, brake: f64) -> SharedString {
+        if let Some((t, b, cached)) = &self.pedals_readout {
+            if *t == throttle && *b == brake {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = format!(
+            "Throttle {:.0}% · Brake {:.0}%",
+            throttle * 100.0,
+            brake * 100.0
+        )
+        .into();
+        self.pedals_readout = Some((throttle, brake, built.clone()));
         built
     }
 
@@ -1277,6 +1481,14 @@ struct Ctx {
     /// id chosen in the dialog (`None` = no profile bound).
     game_dialog_edit_id: Rc<RefCell<Option<String>>>,
     game_dialog_profile_id: Rc<RefCell<Option<String>>>,
+    /// R2-11: the games list the profile presets were last built
+    /// from — the presets model is only rebuilt when it changed.
+    presets_games: Rc<RefCell<Vec<GameSummary>>>,
+    /// R2-11: the profiles list the game tiles were last built
+    /// from — a tile's sub-line names its bound profile, so the
+    /// tiles rebuild when the profiles change even if the games
+    /// themselves did not.
+    games_profiles: Rc<RefCell<Vec<ProfileSummary>>>,
     /// Profile id waiting on the unsaved-changes prompt (A8).
     pending_profile_id: Rc<RefCell<Option<String>>>,
     /// Learn target: 0 none, 1 Buttons page, 2 horn (Extras).
@@ -1521,30 +1733,28 @@ impl Ctx {
             self.raw_available.get(),
             |v| win.set_setup_calibration_available(v),
         );
-        let reason = if available {
-            String::new()
+        let reason: &str = if available {
+            ""
         } else {
-            Self::capture_unavailable_reason().to_string()
+            Self::capture_unavailable_reason()
         };
-        set_if_changed(win.get_centre_reason(), reason.into(), |v| {
-            win.set_centre_reason(v);
-        });
-        let setup_reason = if self.raw_available.get() {
-            String::new()
+        // R2-43: compare as `&str` first — the old code built a
+        // fresh `String` every frame just to compare it away.
+        if win.get_centre_reason().as_str() != reason {
+            win.set_centre_reason(reason.into());
+        }
+        let setup_reason: &str = if self.raw_available.get() {
+            ""
         } else if !available {
-            Self::capture_unavailable_reason().to_string()
+            Self::capture_unavailable_reason()
         } else if self.busy_jobs.borrow().contains_key(&JobKind::RawAvailable) {
-            "Waiting for wheel data…".to_string()
+            "Waiting for wheel data…"
         } else {
-            "No wheel data yet — check the wheel is connected.".to_string()
+            "No wheel data yet — check the wheel is connected."
         };
-        set_if_changed(
-            win.get_setup_calibration_reason(),
-            setup_reason.into(),
-            |v| {
-                win.set_setup_calibration_reason(v);
-            },
-        );
+        if win.get_setup_calibration_reason().as_str() != setup_reason {
+            win.set_setup_calibration_reason(setup_reason.into());
+        }
     }
 
     /// Refresh the cached calibration read (`calibration()`):
@@ -1705,7 +1915,12 @@ impl Ctx {
         );
         set_if_changed(
             win.get_conn_label(),
-            conn_label_for(connecting, live, &conn.label, self.pairing_rejoining.get()).into(),
+            self.frame_cmds.borrow_mut().conn_label(
+                connecting,
+                live,
+                &conn.label,
+                self.pairing_rejoining.get(),
+            ),
             |v| win.set_conn_label(v),
         );
         // R2-19: the wizard's Connect step is done exactly when the
@@ -1772,30 +1987,25 @@ impl Ctx {
             rsh_api::ApiTransport::Wifi => "Wi-Fi",
             rsh_api::ApiTransport::Usb => "USB",
         };
-        let sub = if connecting {
-            "Starting RSH…".to_string()
-        } else if live {
-            if conn.address.is_empty() {
-                transport_label.to_string()
-            } else {
-                format!("{transport_label} · {}", conn.address)
-            }
-        } else {
-            "Not connected".to_string()
-        };
-        set_if_changed(win.get_conn_sub(), sub.into(), |v| win.set_conn_sub(v));
+        set_if_changed(
+            win.get_conn_sub(),
+            self.frame_cmds.borrow_mut().conn_sub(
+                connecting,
+                live,
+                transport_label,
+                &conn.address,
+            ),
+            |v| win.set_conn_sub(v),
+        );
         set_if_changed(win.get_send_to_game(), api.output_enabled(), |v| {
             win.set_send_to_game(v);
         });
         set_if_changed(win.get_steer_angle(), steer_deg, |v| win.set_steer_angle(v));
-        // B1: no live daemon → "—", never a sine angle.
+        // B1: no live daemon → "—", never a sine angle (cached —
+        // see `FrameCmdCache::steer_text`).
         set_if_changed(
             win.get_steer_text(),
-            if live {
-                format!("{steer_deg:+.0}°").into()
-            } else {
-                "—".into()
-            },
+            self.frame_cmds.borrow_mut().steer_text(live, steer_deg),
             |v| win.set_steer_text(v),
         );
         set_if_changed(win.get_throttle(), (snap.throttle * 100.0) as f32, |v| {
@@ -1816,11 +2026,7 @@ impl Ctx {
         });
         set_if_changed(
             win.get_gear(),
-            if snap.gear == 0 {
-                "—".into()
-            } else {
-                snap.gear.to_string().into()
-            },
+            self.frame_cmds.borrow_mut().gear_text(snap.gear),
             |v| win.set_gear(v),
         );
         set_if_changed(win.get_input_pct(), input_pct, |v| win.set_input_pct(v));
@@ -1845,7 +2051,7 @@ impl Ctx {
         set_if_changed(win.get_deadzone(), deadzone / 10.0, |v| win.set_deadzone(v));
         set_if_changed(
             win.get_deadzone_text(),
-            format!("{deadzone:.0}%").into(),
+            self.frame_cmds.borrow_mut().deadzone_text(deadzone),
             |v| {
                 win.set_deadzone_text(v);
             },
@@ -1855,9 +2061,11 @@ impl Ctx {
         set_if_changed(win.get_curve_val(), exponent - 1.0, |v| {
             win.set_curve_val(v);
         });
-        set_if_changed(win.get_curve_text(), format!("{exponent:.2}").into(), |v| {
-            win.set_curve_text(v);
-        });
+        set_if_changed(
+            win.get_curve_text(),
+            self.frame_cmds.borrow_mut().curve_text(exponent),
+            |v| win.set_curve_text(v),
+        );
         set_if_changed(win.get_preset(), self.tuning.borrow().preset, |v| {
             win.set_preset(v);
         });
@@ -1946,17 +2154,14 @@ impl Ctx {
                 );
                 set_if_changed(
                     win.get_diag_steer_readout(),
-                    format!("{steer_deg:+.0}°").into(),
+                    self.frame_cmds.borrow_mut().steer_text(live, steer_deg),
                     |v| win.set_diag_steer_readout(v),
                 );
                 set_if_changed(
                     win.get_diag_pedals_readout(),
-                    format!(
-                        "Throttle {:.0}% · Brake {:.0}%",
-                        snap.throttle * 100.0,
-                        snap.brake * 100.0
-                    )
-                    .into(),
+                    self.frame_cmds
+                        .borrow_mut()
+                        .pedals_readout(snap.throttle, snap.brake),
                     |v| win.set_diag_pedals_readout(v),
                 );
             }
@@ -1967,12 +2172,16 @@ impl Ctx {
             set_if_changed(win.get_diag_pedals_chart(), "".into(), |v| {
                 win.set_diag_pedals_chart(v);
             });
-            set_if_changed(win.get_diag_steer_readout(), "—".into(), |v| {
-                win.set_diag_steer_readout(v);
-            });
-            set_if_changed(win.get_diag_pedals_readout(), "—".into(), |v| {
-                win.set_diag_pedals_readout(v);
-            });
+            set_if_changed(
+                win.get_diag_steer_readout(),
+                self.frame_cmds.borrow_mut().dash(),
+                |v| win.set_diag_steer_readout(v),
+            );
+            set_if_changed(
+                win.get_diag_pedals_readout(),
+                self.frame_cmds.borrow_mut().dash(),
+                |v| win.set_diag_pedals_readout(v),
+            );
         }
     }
 
@@ -2033,7 +2242,7 @@ impl Ctx {
                     }
                     Err(e) => {
                         ctx.notify_error(win, "Steering", &e);
-                        eprintln!("RSH-UI set_tuning failed: {} ({})", e.code, e.title);
+                        ui_log!("RSH-UI set_tuning failed: {} ({})", e.code, e.title);
                     }
                 }
             },
@@ -2056,6 +2265,24 @@ impl Ctx {
             },
             Instant::now() + Duration::from_millis(150),
         ));
+    }
+
+    /// Latest queued field push for `module`/`kind`, if a drag is
+    /// still waiting out its debounce (R2-10): the drag handlers
+    /// write the thumb locally, and `sync_pedals` / `sync_extras`
+    /// must not overwrite it with the stale cached value until
+    /// the push lands — otherwise the thumb snaps back mid-drag.
+    fn pending_field_value(&self, module: &str, kind: FieldKind) -> Option<f64> {
+        self.pending_field
+            .borrow()
+            .as_ref()
+            .and_then(|(pending, _)| {
+                if pending.module == module && pending.kind == kind {
+                    Some(pending.value)
+                } else {
+                    None
+                }
+            })
     }
 
     /// Flush a due field push (frame timer, M-7/F6): read the
@@ -2103,7 +2330,7 @@ impl Ctx {
                     }
                     Err(e) => {
                         ctx.notify_error(win, "Tuning", &e);
-                        eprintln!(
+                        ui_log!(
                             "RSH-UI field push {module} failed: {} ({})",
                             e.code, e.title
                         );
@@ -2413,9 +2640,11 @@ impl Ctx {
 
     /// Seed the keep-in-tray switch from the API (FC2): the close
     /// handler reads the same value, so the switch never disagrees
-    /// with what X will do.
+    /// with what X will do. R2-11: change-guarded.
     fn sync_keep_in_tray(&self, win: &MainWindow) {
-        win.set_keep_in_tray(self.api().close_to_tray());
+        set_if_changed(win.get_keep_in_tray(), self.api().close_to_tray(), |v| {
+            win.set_keep_in_tray(v);
+        });
     }
 
     /// Start a background job (A9/B5): the work runs on its own
@@ -2436,7 +2665,7 @@ impl Ctx {
         work: impl FnOnce() -> JobDone + Send + 'static,
     ) -> bool {
         if self.busy_jobs.borrow().contains_key(&kind) {
-            eprintln!("RSH-UI job {kind:?} already running — ignoring duplicate start");
+            ui_log!("RSH-UI job {kind:?} already running — ignoring duplicate start");
             return false;
         }
         self.busy_jobs
@@ -2452,7 +2681,7 @@ impl Ctx {
             .spawn(move || {
                 let done = work();
                 if tx.send(done).is_err() {
-                    eprintln!("RSH-UI job {kind:?} finished after the UI went away");
+                    ui_log!("RSH-UI job {kind:?} finished after the UI went away");
                 }
             });
         true
@@ -2474,7 +2703,7 @@ impl Ctx {
         apply: impl FnOnce(&Ctx, &MainWindow, JobResult) + 'static,
     ) -> bool {
         if self.busy_jobs.borrow().contains_key(&kind) {
-            eprintln!("RSH-UI job {kind:?} already running — ignoring duplicate start");
+            ui_log!("RSH-UI job {kind:?} already running — ignoring duplicate start");
             return false;
         }
         let id = self.next_job_id.get();
@@ -2493,7 +2722,7 @@ impl Ctx {
             .spawn(move || {
                 let result = work(api);
                 if tx.send(JobDone::Generic { id, result }).is_err() {
-                    eprintln!("RSH-UI job {kind:?} finished after the UI went away");
+                    ui_log!("RSH-UI job {kind:?} finished after the UI went away");
                 }
             });
         true
@@ -2577,7 +2806,7 @@ impl Ctx {
                 // frame timer re-derives the display from
                 // state/cache when the window comes back.
                 if self.hidden.load(Ordering::SeqCst) {
-                    eprintln!("RSH-UI job {kind:?} finished while hidden — apply skipped (F27)");
+                    ui_log!("RSH-UI job {kind:?} finished while hidden — apply skipped (F27)");
                     return;
                 }
                 apply(self, win, result);
@@ -2594,7 +2823,7 @@ impl Ctx {
                 }
                 match result {
                     Ok(info) => {
-                        eprintln!("RSH-UI transport switch ok: {}", info.label);
+                        ui_log!("RSH-UI transport switch ok: {}", info.label);
                         self.refresh(win, 0);
                     }
                     Err(e) => {
@@ -2889,7 +3118,7 @@ impl Ctx {
                 let backend = self.api().output_backend();
                 win.set_controller(i32::from(backend != "HIDMaestro"));
             }
-            eprintln!("RSH-UI job {kind:?} timed out ({label})");
+            ui_log!("RSH-UI job {kind:?} timed out ({label})");
             self.notify(
                 win,
                 "Loading timed out",
@@ -3574,7 +3803,7 @@ impl Ctx {
         // words; the code goes to the log only.
         if let Some((code, detail)) = live_probe::read_daemon_status(self.data_dir.as_deref()) {
             *self.last_dead_detail.borrow_mut() = Some(detail.clone());
-            eprintln!("RSH-UI daemon fatal: {code}: {detail}");
+            ui_log!("RSH-UI daemon fatal: {code}: {detail}");
             if !burst_death {
                 self.notify(
                     win,
@@ -3658,7 +3887,7 @@ impl Ctx {
     ) {
         if self.hidden.load(Ordering::SeqCst) {
             self.swap_to_live(live_api);
-            eprintln!(
+            ui_log!(
                 "RSH-UI reconnect seed landed while hidden — state swapped, window apply skipped (F27)"
             );
             return;
@@ -3715,7 +3944,7 @@ impl Ctx {
             if e.code != ConnectionError::Unreachable.code() {
                 self.notify(win, "Connection", "Reconnect failed", &e.title);
             }
-            eprintln!("RSH-UI reconnect failed: {} ({})", e.code, e.title);
+            ui_log!("RSH-UI reconnect failed: {} ({})", e.code, e.title);
         }
         // An already-open pairing window / Active session at
         // (re)connect seeds the wizard the same way startup used to
@@ -3803,7 +4032,7 @@ impl Ctx {
                     }
                     Err(e) => {
                         ctx.notify(win, "Pedals", "Couldn't save pedal tuning", &e.title);
-                        eprintln!(
+                        ui_log!(
                             "RSH-UI pedal set_tuning {module} failed: {} ({})",
                             e.code, e.title
                         );
@@ -3840,7 +4069,7 @@ impl Ctx {
                     }
                     Err(e) => {
                         ctx.notify(win, "Extras", "Couldn't save setting", &e.title);
-                        eprintln!(
+                        ui_log!(
                             "RSH-UI extras set_tuning {module} failed: {} ({})",
                             e.code, e.title
                         );
@@ -3855,7 +4084,17 @@ impl Ctx {
     /// stored curve, mini-curve paths from feel + deadzone, bite for
     /// the clutch. Called at startup, on swap-to-live and after
     /// every pedal edit — the page never shows literals.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    /// R2-11: every write is change-guarded like `push_frame` —
+    /// the ~1 Hz re-sync used to rewrite ~25 props with zero
+    /// changes. R2-10: a slider with a drag still waiting out its
+    /// debounce keeps its local value — the record is patched with
+    /// the pending value and the slider props are skipped, so the
+    /// stale cache cannot snap the thumb back mid-drag.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
     fn sync_pedals(&self, win: &MainWindow) {
         const MODULES: [&str; 3] = ["throttle", "brake", "clutch"];
         let api = self.api();
@@ -3872,8 +4111,20 @@ impl Ctx {
             })
         };
         let mut cache = self.pedals.borrow_mut();
+        let mut pending_dz = [false; 3];
+        let mut pending_bite = false;
         for (i, module) in MODULES.iter().enumerate() {
-            let record = api.get_tuning(module);
+            let mut record = api.get_tuning(module);
+            // R2-10: the drag's latest value wins over the stale
+            // cached record until the push lands.
+            if let Some(value) = self.pending_field_value(module, FieldKind::Deadzone) {
+                record.deadzone = value;
+                pending_dz[i] = true;
+            }
+            if let Some(value) = self.pending_field_value(module, FieldKind::Bite) {
+                record.bite_point = Some(value);
+                pending_bite = true;
+            }
             cache.feel_exp[i] = record.curve as f32;
             cache.records[i] = record;
         }
@@ -3889,39 +4140,117 @@ impl Ctx {
         ];
         drop(cache);
         // A1: slider value = pct/10 (0..10% range), handler does v*10.
-        win.set_throttle_up_mv(mv_text(cal_mv("accel", true).unwrap_or(t.min_mv)).into());
-        win.set_throttle_down_mv(mv_text(cal_mv("accel", false).unwrap_or(t.max_mv)).into());
-        win.set_throttle_feel(feels[0]);
-        win.set_throttle_deadzone((t.deadzone / 10.0) as f32);
-        win.set_throttle_deadzone_text(pct_text(t.deadzone).into());
-        win.set_throttle_curve(
+        set_if_changed(
+            win.get_throttle_up_mv(),
+            mv_text(cal_mv("accel", true).unwrap_or(t.min_mv)).into(),
+            |v| win.set_throttle_up_mv(v),
+        );
+        set_if_changed(
+            win.get_throttle_down_mv(),
+            mv_text(cal_mv("accel", false).unwrap_or(t.max_mv)).into(),
+            |v| win.set_throttle_down_mv(v),
+        );
+        set_if_changed(win.get_throttle_feel(), feels[0], |v| {
+            win.set_throttle_feel(v);
+        });
+        if !pending_dz[0] {
+            set_if_changed(win.get_throttle_deadzone(), (t.deadzone / 10.0) as f32, |v| {
+                win.set_throttle_deadzone(v);
+            });
+            set_if_changed(
+                win.get_throttle_deadzone_text(),
+                pct_text(t.deadzone).into(),
+                |v| win.set_throttle_deadzone_text(v),
+            );
+        }
+        set_if_changed(
+            win.get_throttle_curve(),
             pedal_curve_commands(t.deadzone as f32, FEEL_EXPONENTS[feels[0] as usize]).into(),
+            |v| win.set_throttle_curve(v),
         );
-        win.set_throttle_dashed("M 6 104 L 104 6".into());
-        win.set_brake_up_mv(mv_text(cal_mv("brake", true).unwrap_or(b.min_mv)).into());
-        win.set_brake_down_mv(mv_text(cal_mv("brake", false).unwrap_or(b.max_mv)).into());
-        win.set_brake_feel(feels[1]);
-        win.set_brake_deadzone((b.deadzone / 10.0) as f32);
-        win.set_brake_deadzone_text(pct_text(b.deadzone).into());
-        win.set_brake_curve(
+        set_if_changed(win.get_throttle_dashed(), "M 6 104 L 104 6".into(), |v| {
+            win.set_throttle_dashed(v);
+        });
+        set_if_changed(
+            win.get_brake_up_mv(),
+            mv_text(cal_mv("brake", true).unwrap_or(b.min_mv)).into(),
+            |v| win.set_brake_up_mv(v),
+        );
+        set_if_changed(
+            win.get_brake_down_mv(),
+            mv_text(cal_mv("brake", false).unwrap_or(b.max_mv)).into(),
+            |v| win.set_brake_down_mv(v),
+        );
+        set_if_changed(win.get_brake_feel(), feels[1], |v| {
+            win.set_brake_feel(v);
+        });
+        if !pending_dz[1] {
+            set_if_changed(win.get_brake_deadzone(), (b.deadzone / 10.0) as f32, |v| {
+                win.set_brake_deadzone(v);
+            });
+            set_if_changed(
+                win.get_brake_deadzone_text(),
+                pct_text(b.deadzone).into(),
+                |v| win.set_brake_deadzone_text(v),
+            );
+        }
+        set_if_changed(
+            win.get_brake_curve(),
             pedal_curve_commands(b.deadzone as f32, FEEL_EXPONENTS[feels[1] as usize]).into(),
+            |v| win.set_brake_curve(v),
         );
-        win.set_brake_dashed("M 6 104 L 104 6".into());
-        win.set_clutch_up_mv(mv_text(cal_mv("clutch", true).unwrap_or(c.min_mv)).into());
-        win.set_clutch_down_mv(mv_text(cal_mv("clutch", false).unwrap_or(c.max_mv)).into());
-        win.set_clutch_feel(feels[2]);
-        win.set_clutch_deadzone((c.deadzone / 10.0) as f32);
-        win.set_clutch_deadzone_text(pct_text(c.deadzone).into());
+        set_if_changed(win.get_brake_dashed(), "M 6 104 L 104 6".into(), |v| {
+            win.set_brake_dashed(v);
+        });
+        set_if_changed(
+            win.get_clutch_up_mv(),
+            mv_text(cal_mv("clutch", true).unwrap_or(c.min_mv)).into(),
+            |v| win.set_clutch_up_mv(v),
+        );
+        set_if_changed(
+            win.get_clutch_down_mv(),
+            mv_text(cal_mv("clutch", false).unwrap_or(c.max_mv)).into(),
+            |v| win.set_clutch_down_mv(v),
+        );
+        set_if_changed(win.get_clutch_feel(), feels[2], |v| {
+            win.set_clutch_feel(v);
+        });
+        if !pending_dz[2] {
+            set_if_changed(win.get_clutch_deadzone(), (c.deadzone / 10.0) as f32, |v| {
+                win.set_clutch_deadzone(v);
+            });
+            set_if_changed(
+                win.get_clutch_deadzone_text(),
+                pct_text(c.deadzone).into(),
+                |v| win.set_clutch_deadzone_text(v),
+            );
+        }
         let bite = c.bite_point.unwrap_or(0.0);
-        win.set_clutch_bite(bite as f32);
-        win.set_clutch_bite_text(pct_text(bite * 100.0).into());
-        win.set_clutch_curve(
+        if !pending_bite {
+            set_if_changed(win.get_clutch_bite(), bite as f32, |v| {
+                win.set_clutch_bite(v);
+            });
+            set_if_changed(
+                win.get_clutch_bite_text(),
+                pct_text(bite * 100.0).into(),
+                |v| win.set_clutch_bite_text(v),
+            );
+        }
+        set_if_changed(
+            win.get_clutch_curve(),
             pedal_curve_commands(c.deadzone as f32, FEEL_EXPONENTS[feels[2] as usize]).into(),
+            |v| win.set_clutch_curve(v),
         );
-        win.set_clutch_dashed("".into());
+        set_if_changed(win.get_clutch_dashed(), "".into(), |v| {
+            win.set_clutch_dashed(v);
+        });
         // Set up/down capture the live endpoints (v2.0.2): enabled
         // while the daemon is live, disabled with a reason otherwise.
-        win.set_pedal_set_disabled(!self.capture_available());
+        set_if_changed(
+            win.get_pedal_set_disabled(),
+            !self.capture_available(),
+            |v| win.set_pedal_set_disabled(v),
+        );
     }
 
     /// Refresh the Extras page from the stored records (A6):
@@ -3929,31 +4258,89 @@ impl Ctx {
     /// pattern + brightness — all `set_tuning` fields. Controls with
     /// no backend field (sensitivity, LED colour, handbrake mode)
     /// stay disabled / explain themselves in the Slint.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    /// R2-11: every write is change-guarded and the LED preview
+    /// model is only replaced when its colours changed. R2-10:
+    /// a slider with a drag pending keeps its local value (see
+    /// `sync_pedals`).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
     fn sync_extras(&self, win: &MainWindow) {
         let api = self.api();
-        let hb = api.get_tuning("handbrake");
-        let led = api.get_tuning("led");
+        let mut hb = api.get_tuning("handbrake");
+        let mut led = api.get_tuning("led");
         let shifter = api.get_tuning("shifter");
         let horn = api.get_tuning("horn");
-        win.set_handbrake_up_mv(mv_text(hb.min_mv).into());
-        win.set_handbrake_down_mv(mv_text(hb.max_mv).into());
-        win.set_handbrake_feel(PedalCache::feel_index(hb.curve as f32));
-        win.set_handbrake_deadzone((hb.deadzone / 10.0) as f32);
-        win.set_handbrake_deadzone_text(pct_text(hb.deadzone).into());
-        win.set_handbrake_curve(
+        // R2-10: the drag's latest value wins over the stale
+        // cached record until the push lands.
+        let pending_hb_dz = match self.pending_field_value("handbrake", FieldKind::Deadzone) {
+            Some(value) => {
+                hb.deadzone = value;
+                true
+            }
+            None => false,
+        };
+        let pending_brightness = match self.pending_field_value("led", FieldKind::Brightness) {
+            Some(value) => {
+                led.led_brightness = Some(value.round() as u8);
+                true
+            }
+            None => false,
+        };
+        set_if_changed(
+            win.get_handbrake_up_mv(),
+            mv_text(hb.min_mv).into(),
+            |v| win.set_handbrake_up_mv(v),
+        );
+        set_if_changed(
+            win.get_handbrake_down_mv(),
+            mv_text(hb.max_mv).into(),
+            |v| win.set_handbrake_down_mv(v),
+        );
+        set_if_changed(
+            win.get_handbrake_feel(),
+            PedalCache::feel_index(hb.curve as f32),
+            |v| win.set_handbrake_feel(v),
+        );
+        if !pending_hb_dz {
+            set_if_changed(
+                win.get_handbrake_deadzone(),
+                (hb.deadzone / 10.0) as f32,
+                |v| win.set_handbrake_deadzone(v),
+            );
+            set_if_changed(
+                win.get_handbrake_deadzone_text(),
+                pct_text(hb.deadzone).into(),
+                |v| win.set_handbrake_deadzone_text(v),
+            );
+        }
+        set_if_changed(
+            win.get_handbrake_curve(),
             pedal_curve_commands(
                 hb.deadzone as f32,
                 FEEL_EXPONENTS[PedalCache::feel_index(hb.curve as f32) as usize],
             )
             .into(),
+            |v| win.set_handbrake_curve(v),
         );
-        win.set_handbrake_dashed("M 6 104 L 104 6".into());
-        win.set_handbrake_marker_x(6.0);
-        win.set_handbrake_marker_y(104.0);
+        set_if_changed(win.get_handbrake_dashed(), "M 6 104 L 104 6".into(), |v| {
+            win.set_handbrake_dashed(v);
+        });
+        set_if_changed(win.get_handbrake_marker_x(), 6.0, |v| {
+            win.set_handbrake_marker_x(v);
+        });
+        set_if_changed(win.get_handbrake_marker_y(), 104.0, |v| {
+            win.set_handbrake_marker_y(v);
+        });
         // H8: the stored handbrake mode (Axis 0 / Button 1) — never
         // a hardcoded 0.
-        win.set_handbrake_mode(i32::from(hb.handbrake_button_mode.unwrap_or(false)));
+        set_if_changed(
+            win.get_handbrake_mode(),
+            i32::from(hb.handbrake_button_mode.unwrap_or(false)),
+            |v| win.set_handbrake_mode(v),
+        );
         // H7: keep the toggle tracking in sync with the daemon (the
         // .slint toggles flip first and call Rust with no payload, so
         // Rust tracks the last known state per module).
@@ -3974,27 +4361,55 @@ impl Ctx {
             set_extras_on_prop(win, 2, states[2]);
             set_extras_on_prop(win, 3, states[3]);
         }
-        win.set_extras_calibration_disabled(!self.capture_available());
-        win.set_shifter_mode(match shifter.shifter_gate {
-            Some(ShifterGate::HPattern) => 1,
-            _ => 0,
+        set_if_changed(
+            win.get_extras_calibration_disabled(),
+            !self.capture_available(),
+            |v| win.set_extras_calibration_disabled(v),
+        );
+        set_if_changed(
+            win.get_shifter_mode(),
+            match shifter.shifter_gate {
+                Some(ShifterGate::HPattern) => 1,
+                _ => 0,
+            },
+            |v| win.set_shifter_mode(v),
+        );
+        set_if_changed(
+            win.get_horn_button(),
+            match horn.horn_button {
+                Some(b) => format!("Button {b}").into(),
+                None => "Not set".into(),
+            },
+            |v| win.set_horn_button(v),
+        );
+        set_if_changed(win.get_horn_learning(), self.learn_target.get() == 2, |v| {
+            win.set_horn_learning(v);
         });
-        win.set_horn_button(match horn.horn_button {
-            Some(b) => format!("Button {b}").into(),
-            None => "Not set".into(),
-        });
-        win.set_horn_learning(self.learn_target.get() == 2);
         let pattern = led.led_pattern.unwrap_or(LedPattern::Solid);
-        win.set_led_pattern(match pattern {
-            LedPattern::Off => 0,
-            LedPattern::Solid => 1,
-            LedPattern::Blink => 2,
-            LedPattern::Chase => 3,
-            LedPattern::Rainbow => 4,
-        });
+        set_if_changed(
+            win.get_led_pattern(),
+            match pattern {
+                LedPattern::Off => 0,
+                LedPattern::Solid => 1,
+                LedPattern::Blink => 2,
+                LedPattern::Chase => 3,
+                LedPattern::Rainbow => 4,
+            },
+            |v| win.set_led_pattern(v),
+        );
         let brightness = led.led_brightness.unwrap_or(80);
-        win.set_led_brightness(f32::from(brightness) / 100.0);
-        win.set_led_brightness_text(pct_text(f64::from(brightness)).into());
+        if !pending_brightness {
+            set_if_changed(
+                win.get_led_brightness(),
+                f32::from(brightness) / 100.0,
+                |v| win.set_led_brightness(v),
+            );
+            set_if_changed(
+                win.get_led_brightness_text(),
+                pct_text(f64::from(brightness)).into(),
+                |v| win.set_led_brightness_text(v),
+            );
+        }
         // M2: the stored colour drives the swatch + the preview —
         // never always-blue. Unknown colours fall back to the accent
         // swatch (index 3).
@@ -4002,12 +4417,15 @@ impl Ctx {
             .led_color
             .and_then(|c| LED_PALETTE.iter().position(|p| *p == c))
             .unwrap_or(3);
-        win.set_led_color(i32::try_from(color_index).unwrap_or(3));
-        win.set_led_preview(ModelRc::new(Rc::new(VecModel::from(led_preview(
-            pattern,
-            brightness,
-            led.led_color,
-        )))));
+        set_if_changed(
+            win.get_led_color(),
+            i32::try_from(color_index).unwrap_or(3),
+            |v| win.set_led_color(v),
+        );
+        let preview = led_preview(pattern, brightness, led.led_color);
+        if !model_eq(&win.get_led_preview(), &preview) {
+            win.set_led_preview(ModelRc::new(Rc::new(VecModel::from(preview))));
+        }
     }
 
     /// Refresh the Overview live values (A11/A12/A14/E): firmware
@@ -4015,6 +4433,9 @@ impl Ctx {
     /// until the daemon measures), calibration label from
     /// `calibration().calibrated_at`, backend name + readiness from
     /// `output_backend()`.
+    /// R2-11: every write is change-guarded — the ~1 Hz re-sync
+    /// used to rewrite all of these with zero changes.
+    #[allow(clippy::too_many_lines)]
     fn sync_overview(&self, win: &MainWindow) {
         let api = self.api();
         let conn = api.connection();
@@ -4029,7 +4450,9 @@ impl Ctx {
         };
         // L-2: the wizard's address field shows the live address
         // (never its hardcoded "rsh.local" default).
-        win.set_setup_address(address.clone().into());
+        set_if_changed(win.get_setup_address(), address.clone().into(), |v| {
+            win.set_setup_address(v);
+        });
         // A11: measured stats, or "—" — never a hardcoded 4 ms / 0%.
         let stats = api.diag_stats().ok();
         let delay = stats
@@ -4047,70 +4470,107 @@ impl Ctx {
             .as_ref()
             .and_then(|s| s.loop_hz)
             .map_or_else(String::new, |hz| format!(" · {hz:.0} updates/s"));
-        win.set_firmware_line(if firmware == "Unknown" {
-            "Firmware —".into()
-        } else {
-            format!("Firmware {firmware} · {address}{loop_suffix}").into()
+        set_if_changed(
+            win.get_firmware_line(),
+            if firmware == "Unknown" {
+                "Firmware —".into()
+            } else {
+                format!("Firmware {firmware} · {address}{loop_suffix}").into()
+            },
+            |v| win.set_firmware_line(v),
+        );
+        set_if_changed(win.get_delay_text(), delay.into(), |v| {
+            win.set_delay_text(v);
         });
-        win.set_delay_text(delay.into());
-        win.set_jitter_text(jitter.into());
-        win.set_lost_text(lost.into());
+        set_if_changed(win.get_jitter_text(), jitter.into(), |v| {
+            win.set_jitter_text(v);
+        });
+        set_if_changed(win.get_lost_text(), lost.into(), |v| {
+            win.set_lost_text(v);
+        });
         // A12: the capture date, or "Not calibrated" (warn state).
-        if let Some(date) = self.calibration_date() {
-            win.set_calibrated_label(format!("Calibrated {date}").into());
-            win.set_calibrated_warn(false);
-        } else {
-            win.set_calibrated_label("Not calibrated".into());
-            win.set_calibrated_warn(true);
-        }
-        // A22: the "Set" pill only once a centre was captured.
-        win.set_centre_set(self.calibration_date().is_some());
-        let backend = api.output_backend();
-        win.set_backend_name(if backend == "Unknown" {
-            "Not ready".into()
-        } else {
-            backend.clone().into()
+        let (cal_label, cal_warn) = match self.calibration_date() {
+            Some(date) => (format!("Calibrated {date}"), false),
+            None => ("Not calibrated".to_string(), true),
+        };
+        set_if_changed(win.get_calibrated_label(), cal_label.into(), |v| {
+            win.set_calibrated_label(v);
         });
-        win.set_backend_ready(backend != "Unknown");
+        set_if_changed(win.get_calibrated_warn(), cal_warn, |v| {
+            win.set_calibrated_warn(v);
+        });
+        // A22: the "Set" pill only once a centre was captured.
+        set_if_changed(
+            win.get_centre_set(),
+            self.calibration_date().is_some(),
+            |v| win.set_centre_set(v),
+        );
+        let backend = api.output_backend();
+        set_if_changed(
+            win.get_backend_name(),
+            if backend == "Unknown" {
+                "Not ready".into()
+            } else {
+                backend.clone().into()
+            },
+            |v| win.set_backend_name(v),
+        );
+        set_if_changed(win.get_backend_ready(), backend != "Unknown", |v| {
+            win.set_backend_ready(v);
+        });
         // C3/M-8: Settings firmware text from the cached firmware
         // check (board live version vs bundled OTA image version) —
         // never the hardcoded "4.0.2". No cache yet (startup, before
         // the first check) falls back to the live version alone.
-        win.set_firmware_text(match self.firmware_check_cache.borrow().as_ref() {
-            Some(check) if check.board_version != "Unknown" => {
-                if check.update_available {
-                    format!(
-                        "Version {} · update {} available",
-                        check.board_version,
-                        check.bundled_version.as_deref().unwrap_or("?")
-                    )
-                    .into()
-                } else {
-                    format!("Version {} · up to date", check.board_version).into()
+        set_if_changed(
+            win.get_firmware_text(),
+            match self.firmware_check_cache.borrow().as_ref() {
+                Some(check) if check.board_version != "Unknown" => {
+                    if check.update_available {
+                        format!(
+                            "Version {} · update {} available",
+                            check.board_version,
+                            check.bundled_version.as_deref().unwrap_or("?")
+                        )
+                        .into()
+                    } else {
+                        format!("Version {} · up to date", check.board_version).into()
+                    }
                 }
-            }
-            _ => {
-                if firmware == "Unknown" {
-                    "—".into()
-                } else {
-                    format!("Version {firmware}").into()
+                _ => {
+                    if firmware == "Unknown" {
+                        "—".into()
+                    } else {
+                        format!("Version {firmware}").into()
+                    }
                 }
-            }
-        });
-        win.set_app_update_text("Auto-update is off — new versions are on GitHub Releases".into());
+            },
+            |v| win.set_firmware_text(v),
+        );
+        set_if_changed(
+            win.get_app_update_text(),
+            "Auto-update is off — new versions are on GitHub Releases".into(),
+            |v| win.set_app_update_text(v),
+        );
     }
 
     /// Refresh the profile lists (A8/C6): the popover model, the
     /// Settings list, the top-bar / Overview profile name and the
     /// auto-profile chip — all from `list_profiles()`, never
     /// hardcoded. Empty lists stay empty (no invented profiles).
+    /// R2-11: a list model is only rebuilt when its contents
+    /// changed — the ~1 Hz / 5 s re-sync used to build fresh
+    /// `ModelRc`s for all three lists every cycle, resetting
+    /// every `for` row.
     fn refresh_profiles(&self, win: &MainWindow) {
         let profiles = self.api().list_profiles();
         let active = profiles.iter().find(|p| p.active);
-        win.set_profile_name(
+        set_if_changed(
+            win.get_profile_name(),
             active
                 .map_or_else(|| "No profile".to_string(), |p| p.name.clone())
                 .into(),
+            |v| win.set_profile_name(v),
         );
         let games = self.games_cache.borrow();
         let auto = active.map(|p| {
@@ -4126,19 +4586,11 @@ impl Ctx {
             format!("{game} → {}", p.name)
         });
         drop(games);
-        win.set_auto_profile_text(auto.unwrap_or_else(|| "No profile yet".to_string()).into());
-        let rows: Vec<ProfileItem> = profiles
-            .iter()
-            .map(|p| ProfileItem {
-                name: p.name.clone().into(),
-                game: p
-                    .game
-                    .as_deref()
-                    .map_or_else(|| "No game".to_string(), pretty_game_slug)
-                    .into(),
-                active: p.active,
-            })
-            .collect();
+        set_if_changed(
+            win.get_auto_profile_text(),
+            auto.unwrap_or_else(|| "No profile yet".to_string()).into(),
+            |v| win.set_auto_profile_text(v),
+        );
         // M1: presets are one row per catalogue game (real data —
         // the games list), read-only templates: "Use" creates a
         // profile from the game. No invented preset store. The games
@@ -4154,30 +4606,47 @@ impl Ctx {
             }
         };
         self.presets_count.set(preset_games.len());
-        let presets: Vec<ProfileItem> = preset_games
-            .iter()
-            .map(|g| ProfileItem {
-                name: g.name.clone().into(),
-                game: g.name.clone().into(),
-                active: false,
-            })
-            .collect();
-        win.set_popover_presets(ModelRc::new(Rc::new(VecModel::from(presets))));
-        win.set_popover_profiles(ModelRc::new(Rc::new(VecModel::from(rows))));
-        let settings_rows: Vec<ProfileRow> = profiles
-            .iter()
-            .map(|p| ProfileRow {
-                name: p.name.clone().into(),
-                games: p
-                    .game
-                    .as_deref()
-                    .map_or_else(|| "No game".to_string(), pretty_game_slug)
-                    .into(),
-                active: p.active,
-            })
-            .collect();
-        win.set_settings_profiles(ModelRc::new(Rc::new(VecModel::from(settings_rows))));
-        *self.profiles_cache.borrow_mut() = profiles;
+        if profiles != *self.profiles_cache.borrow() {
+            let rows: Vec<ProfileItem> = profiles
+                .iter()
+                .map(|p| ProfileItem {
+                    name: p.name.clone().into(),
+                    game: p
+                        .game
+                        .as_deref()
+                        .map_or_else(|| "No game".to_string(), pretty_game_slug)
+                        .into(),
+                    active: p.active,
+                })
+                .collect();
+            win.set_popover_profiles(ModelRc::new(Rc::new(VecModel::from(rows))));
+            let settings_rows: Vec<ProfileRow> = profiles
+                .iter()
+                .map(|p| ProfileRow {
+                    name: p.name.clone().into(),
+                    games: p
+                        .game
+                        .as_deref()
+                        .map_or_else(|| "No game".to_string(), pretty_game_slug)
+                        .into(),
+                    active: p.active,
+                })
+                .collect();
+            win.set_settings_profiles(ModelRc::new(Rc::new(VecModel::from(settings_rows))));
+            *self.profiles_cache.borrow_mut() = profiles;
+        }
+        if preset_games != *self.presets_games.borrow() {
+            let presets: Vec<ProfileItem> = preset_games
+                .iter()
+                .map(|g| ProfileItem {
+                    name: g.name.clone().into(),
+                    game: g.name.clone().into(),
+                    active: false,
+                })
+                .collect();
+            win.set_popover_presets(ModelRc::new(Rc::new(VecModel::from(presets))));
+            *self.presets_games.borrow_mut() = preset_games;
+        }
     }
 
     /// Refresh the game tiles (A14) + the wizard Games step (A17)
@@ -4186,9 +4655,44 @@ impl Ctx {
     /// (no fake Locate). Games are manual-only now (no auto-scan):
     /// an empty list shows the add-game empty state, never
     /// invented games.
+    /// R2-11: the tiles model is only rebuilt when the games or
+    /// the profiles they name changed — the ~1 Hz / 5 s re-sync
+    /// used to rebuild it with zero changes. The wizard text is
+    /// change-guarded, so the first call still seeds it.
     fn refresh_games(&self, win: &MainWindow) {
         let games = self.api().list_games();
-        let profiles = self.profiles_cache.borrow();
+        let profiles = self.profiles_cache.borrow().clone();
+        if games.is_empty() {
+            set_if_changed(
+                win.get_setup_games_text(),
+                "No games added yet.".into(),
+                |v| win.set_setup_games_text(v),
+            );
+            set_if_changed(win.get_setup_games_done(), false, |v| {
+                win.set_setup_games_done(v);
+            });
+        } else {
+            let names: Vec<String> = games.iter().map(|g| g.name.clone()).collect();
+            set_if_changed(
+                win.get_setup_games_text(),
+                format!(
+                    "Added {} game{}: {}",
+                    games.len(),
+                    if games.len() == 1 { "" } else { "s" },
+                    names.join(", ")
+                )
+                .into(),
+                |v| win.set_setup_games_text(v),
+            );
+            set_if_changed(win.get_setup_games_done(), true, |v| {
+                win.set_setup_games_done(v);
+            });
+        }
+        if games == *self.games_cache.borrow()
+            && profiles == *self.games_profiles.borrow()
+        {
+            return;
+        }
         let items: Vec<GameItem> = games
             .iter()
             .map(|g| {
@@ -4229,25 +4733,9 @@ impl Ctx {
                 }
             })
             .collect();
-        drop(profiles);
         win.set_games(ModelRc::new(Rc::new(VecModel::from(items))));
-        if games.is_empty() {
-            win.set_setup_games_text("No games added yet.".into());
-            win.set_setup_games_done(false);
-        } else {
-            let names: Vec<String> = games.iter().map(|g| g.name.clone()).collect();
-            win.set_setup_games_text(
-                format!(
-                    "Added {} game{}: {}",
-                    games.len(),
-                    if games.len() == 1 { "" } else { "s" },
-                    names.join(", ")
-                )
-                .into(),
-            );
-            win.set_setup_games_done(true);
-        }
         *self.games_cache.borrow_mut() = games;
+        *self.games_profiles.borrow_mut() = profiles;
     }
 
     /// Open the add/edit game dialog for a new game (`None`) or
@@ -4489,6 +4977,9 @@ impl Ctx {
     /// from `diag_stats()` ("—" + "No telemetry yet" while the
     /// daemon does not measure, A20/A21), plus status lines (and
     /// recent notifications) as the drawer's event log.
+    /// R2-11: every write is change-guarded and the two models
+    /// are only replaced when their contents changed.
+    #[allow(clippy::too_many_lines)]
     fn sync_diag(&self, win: &MainWindow) {
         let api = self.api();
         let conn = api.connection();
@@ -4500,73 +4991,123 @@ impl Ctx {
         } else {
             firmware
         };
-        win.set_diag_conn_label(conn.label.clone().into());
-        win.set_diag_daemon_live(self.is_live());
-        win.set_diag_app_version(version.clone().into());
-        win.set_diag_firmware(firmware.clone().into());
+        set_if_changed(win.get_diag_conn_label(), conn.label.clone().into(), |v| {
+            win.set_diag_conn_label(v);
+        });
+        set_if_changed(win.get_diag_daemon_live(), self.is_live(), |v| {
+            win.set_diag_daemon_live(v);
+        });
+        set_if_changed(win.get_diag_app_version(), version.clone().into(), |v| {
+            win.set_diag_app_version(v);
+        });
+        set_if_changed(win.get_diag_firmware(), firmware.clone().into(), |v| {
+            win.set_diag_firmware(v);
+        });
         // A20: measured stats, or "—" (the drawer shows
         // "No telemetry yet" while these are "—").
         if let Ok(stats) = api.diag_stats() {
             {
-                win.set_diag_delay_text(
+                set_if_changed(
+                    win.get_diag_delay_text(),
                     stats
                         .e2e_ms
                         .map_or_else(|| "—".to_string(), |v| format!("{v:.0} ms"))
                         .into(),
+                    |v| win.set_diag_delay_text(v),
                 );
-                win.set_diag_jitter_text(
+                set_if_changed(
+                    win.get_diag_jitter_text(),
                     stats
                         .jitter_ms_p99
                         .map_or_else(|| "—".to_string(), |v| format!("{v:.0} ms"))
                         .into(),
+                    |v| win.set_diag_jitter_text(v),
                 );
-                win.set_diag_lost_text(format!("{:.1}%", stats.loss_pct).into());
-                win.set_diag_loop_rate_text(
+                set_if_changed(
+                    win.get_diag_lost_text(),
+                    format!("{:.1}%", stats.loss_pct).into(),
+                    |v| win.set_diag_lost_text(v),
+                );
+                set_if_changed(
+                    win.get_diag_loop_rate_text(),
                     stats
                         .loop_hz
                         .map_or_else(|| "—".to_string(), |hz| format!("{hz:.0} Hz"))
                         .into(),
+                    |v| win.set_diag_loop_rate_text(v),
                 );
-                win.set_diag_tx_failures_text(stats.tx_fail.to_string().into());
-                win.set_diag_seq_gaps_text(stats.seq_gap.to_string().into());
+                set_if_changed(
+                    win.get_diag_tx_failures_text(),
+                    stats.tx_fail.to_string().into(),
+                    |v| win.set_diag_tx_failures_text(v),
+                );
+                set_if_changed(
+                    win.get_diag_seq_gaps_text(),
+                    stats.seq_gap.to_string().into(),
+                    |v| win.set_diag_seq_gaps_text(v),
+                );
                 // DS-82: IPC dispatch latency (the daemon, all
                 // methods). "—" until measured — never a fake 0.
-                win.set_diag_ipc_p50_text(
+                set_if_changed(
+                    win.get_diag_ipc_p50_text(),
                     stats
                         .ipc_p50_ms
                         .map_or_else(|| "—".to_string(), |v| format!("{v:.2} ms"))
                         .into(),
+                    |v| win.set_diag_ipc_p50_text(v),
                 );
-                win.set_diag_ipc_p99_text(
+                set_if_changed(
+                    win.get_diag_ipc_p99_text(),
                     stats
                         .ipc_p99_ms
                         .map_or_else(|| "—".to_string(), |v| format!("{v:.2} ms"))
                         .into(),
+                    |v| win.set_diag_ipc_p99_text(v),
                 );
             }
         } else {
-            win.set_diag_delay_text("—".into());
-            win.set_diag_jitter_text("—".into());
-            win.set_diag_lost_text("—".into());
-            win.set_diag_loop_rate_text("—".into());
-            win.set_diag_tx_failures_text("—".into());
-            win.set_diag_seq_gaps_text("—".into());
-            win.set_diag_ipc_p50_text("—".into());
-            win.set_diag_ipc_p99_text("—".into());
+            set_if_changed(win.get_diag_delay_text(), "—".into(), |v| {
+                win.set_diag_delay_text(v);
+            });
+            set_if_changed(win.get_diag_jitter_text(), "—".into(), |v| {
+                win.set_diag_jitter_text(v);
+            });
+            set_if_changed(win.get_diag_lost_text(), "—".into(), |v| {
+                win.set_diag_lost_text(v);
+            });
+            set_if_changed(win.get_diag_loop_rate_text(), "—".into(), |v| {
+                win.set_diag_loop_rate_text(v);
+            });
+            set_if_changed(win.get_diag_tx_failures_text(), "—".into(), |v| {
+                win.set_diag_tx_failures_text(v);
+            });
+            set_if_changed(win.get_diag_seq_gaps_text(), "—".into(), |v| {
+                win.set_diag_seq_gaps_text(v);
+            });
+            set_if_changed(win.get_diag_ipc_p50_text(), "—".into(), |v| {
+                win.set_diag_ipc_p50_text(v);
+            });
+            set_if_changed(win.get_diag_ipc_p99_text(), "—".into(), |v| {
+                win.set_diag_ipc_p99_text(v);
+            });
         }
         // DS-82: frame-time histogram (this UI, last 30 s) — local,
         // so it is set regardless of whether the daemon answered
         // `diag_stats` above.
         let (frame_p50, frame_p99) = self.frame_time_p50_p99().unzip();
-        win.set_diag_frame_p50_text(
+        set_if_changed(
+            win.get_diag_frame_p50_text(),
             frame_p50
                 .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
                 .into(),
+            |v| win.set_diag_frame_p50_text(v),
         );
-        win.set_diag_frame_p99_text(
+        set_if_changed(
+            win.get_diag_frame_p99_text(),
             frame_p99
                 .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
                 .into(),
+            |v| win.set_diag_frame_p99_text(v),
         );
         // H10: the live button grid shows the real pressed buttons
         // (bits 1–12 of the snapshot mask) — empty when not live, so
@@ -4577,7 +5118,9 @@ impl Ctx {
         } else {
             Vec::new()
         };
-        win.set_diag_buttons_pressed(ModelRc::new(Rc::new(VecModel::from(pressed))));
+        if !model_eq(&win.get_diag_buttons_pressed(), &pressed) {
+            win.set_diag_buttons_pressed(ModelRc::new(Rc::new(VecModel::from(pressed))));
+        }
         let mut lines: Vec<SharedString> = vec![
             format!("App {version}").into(),
             format!(
@@ -4601,7 +5144,9 @@ impl Ctx {
         for n in self.notifications.borrow().to_model_items().iter().take(6) {
             lines.push(format!("{} {}", n.time, n.title).into());
         }
-        win.set_diag_events(ModelRc::new(Rc::new(VecModel::from(lines))));
+        if !model_eq(&win.get_diag_events(), &lines) {
+            win.set_diag_events(ModelRc::new(Rc::new(VecModel::from(lines))));
+        }
     }
 
     /// Sync the wizard Drivers step (vJoy) from `vjoy_status()`:
@@ -4610,20 +5155,45 @@ impl Ctx {
     /// honestly unknown — never a fake "installed" — and the
     /// `HIDMaestro` fallback stays the way forward. The user's
     /// fallback choice is preserved across calls.
+    /// R2-11: every write is change-guarded.
     fn sync_vjoy(&self, win: &MainWindow) {
-        let fallback = win.get_setup_vjoy_fallback();
         if let Ok(status) = self.api().vjoy_status() {
-            win.set_setup_vjoy_installed(status.installed);
-            win.set_setup_vjoy_installing(status.installing);
-            win.set_setup_vjoy_version(status.version.unwrap_or_default().into());
-            win.set_setup_vjoy_error(status.install_error.unwrap_or_default().into());
+            set_if_changed(
+                win.get_setup_vjoy_installed(),
+                status.installed,
+                |v| win.set_setup_vjoy_installed(v),
+            );
+            set_if_changed(
+                win.get_setup_vjoy_installing(),
+                status.installing,
+                |v| win.set_setup_vjoy_installing(v),
+            );
+            set_if_changed(
+                win.get_setup_vjoy_version(),
+                status.version.unwrap_or_default().into(),
+                |v| win.set_setup_vjoy_version(v),
+            );
+            set_if_changed(
+                win.get_setup_vjoy_error(),
+                status.install_error.unwrap_or_default().into(),
+                |v| win.set_setup_vjoy_error(v),
+            );
         } else {
-            win.set_setup_vjoy_installed(false);
-            win.set_setup_vjoy_installing(false);
-            win.set_setup_vjoy_version("".into());
-            win.set_setup_vjoy_error("Driver status unavailable — use HIDMaestro instead.".into());
+            set_if_changed(win.get_setup_vjoy_installed(), false, |v| {
+                win.set_setup_vjoy_installed(v);
+            });
+            set_if_changed(win.get_setup_vjoy_installing(), false, |v| {
+                win.set_setup_vjoy_installing(v);
+            });
+            set_if_changed(win.get_setup_vjoy_version(), "".into(), |v| {
+                win.set_setup_vjoy_version(v);
+            });
+            set_if_changed(
+                win.get_setup_vjoy_error(),
+                "Driver status unavailable — use HIDMaestro instead.".into(),
+                |v| win.set_setup_vjoy_error(v),
+            );
         }
-        win.set_setup_vjoy_fallback(fallback);
     }
 
     /// Drive the wizard countdown ring from seconds-left/total (A16):
@@ -4690,8 +5260,8 @@ impl Ctx {
             }
         }
         match std::fs::write(&path, format!("{state} {}\n", app_version())) {
-            Ok(()) => eprintln!("RSH-UI setup marker written: {}", path.display()),
-            Err(e) => eprintln!("RSH-UI setup marker write failed: {e}"),
+            Ok(()) => ui_log!("RSH-UI setup marker written: {}", path.display()),
+            Err(e) => ui_log!("RSH-UI setup marker write failed: {e}"),
         }
     }
 
@@ -4701,7 +5271,7 @@ impl Ctx {
         if let Some(path) = self.setup_marker_path() {
             if let Err(e) = std::fs::remove_file(&path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("RSH-UI setup marker delete failed: {e}");
+                    ui_log!("RSH-UI setup marker delete failed: {e}");
                 }
             }
         }
@@ -4823,7 +5393,7 @@ impl Ctx {
                     }
                     Err(e) => {
                         ctx.notify(win, "Profile", "Couldn't switch profile", &e.title);
-                        eprintln!("RSH-UI activate_profile failed: {} ({})", e.code, e.title);
+                        ui_log!("RSH-UI activate_profile failed: {} ({})", e.code, e.title);
                     }
                 }
             },
@@ -5627,7 +6197,7 @@ fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
                             "Waiting for the wheel — hold the pair button for 3 seconds.",
                         );
                     }
-                    eprintln!("RSH-UI setup begin-pairing ok: {}s left", info.seconds_left);
+                    ui_log!("RSH-UI setup begin-pairing ok: {}s left", info.seconds_left);
                 }
                 Err(e) => {
                     w.set_setup_pair_error(e.title.clone().into());
@@ -5641,7 +6211,7 @@ fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
                     // DS-24: pairing failed — P0-class: toast in
                     // place AND open the drawer.
                     ctx.notify_error_urgent(w, "Pairing", &e);
-                    eprintln!(
+                    ui_log!(
                         "RSH-UI setup begin-pairing failed: {} ({})",
                         e.code, e.title
                     );
@@ -5749,7 +6319,7 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
                 if w.get_setup_step() >= 4 {
                     w.set_setup_mode(false);
                     ctx.mark_setup_done();
-                    eprintln!("RSH-UI setup finished (wizard closed)");
+                    ui_log!("RSH-UI setup finished (wizard closed)");
                 } else {
                     let next = w.get_setup_step() + 1;
                     w.set_setup_step(next);
@@ -5778,7 +6348,7 @@ fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
                 // F23: a skip is NOT a finish — record it as skipped
                 // so the wizard is re-offered on the next version.
                 ctx.mark_setup_skipped();
-                eprintln!("RSH-UI setup skipped (wizard closed)");
+                ui_log!("RSH-UI setup skipped (wizard closed)");
             }
         });
     }
@@ -5834,7 +6404,7 @@ fn wire_setup_vjoy(win: &MainWindow, ctx: &Rc<Ctx>) {
                             Err(e) => {
                                 w.set_setup_vjoy_error(user_text(&e.title).into());
                                 ctx.notify(w, "Drivers", "vJoy install failed", &e.title);
-                                eprintln!("RSH-UI install_vjoy failed: {} ({})", e.code, e.title);
+                                ui_log!("RSH-UI install_vjoy failed: {} ({})", e.code, e.title);
                             }
                         }
                     },
@@ -5937,7 +6507,7 @@ fn wire_setup_pairing(win: &MainWindow, ctx: &Rc<Ctx>) {
                 "usb" => ApiTransport::Usb,
                 "wifi" => ApiTransport::Wifi,
                 other => {
-                    eprintln!("RSH-UI setup connect: unknown transport {other}");
+                    ui_log!("RSH-UI setup connect: unknown transport {other}");
                     return;
                 }
             };
@@ -6061,7 +6631,7 @@ fn wire_setup_calibrate(win: &MainWindow, ctx: &Rc<Ctx>) {
                                     }
                                     Err(e) => {
                                         ctx.notify(w, "Calibration", "Couldn't set centre", &e.title);
-                                        eprintln!("RSH-UI setup calibrate centre failed: {}", e.title);
+                                        ui_log!("RSH-UI setup calibrate centre failed: {}", e.title);
                                     }
                                 }
                             },
@@ -6069,7 +6639,7 @@ fn wire_setup_calibrate(win: &MainWindow, ctx: &Rc<Ctx>) {
                     } else {
                         let reason = Ctx::capture_unavailable_reason();
                         ctx.notify(&w, "Calibration", "Couldn't set centre", reason);
-                        eprintln!("RSH-UI setup calibrate centre failed: {reason}");
+                        ui_log!("RSH-UI setup calibrate centre failed: {reason}");
                     }
                 }
                 "pedals" => {
@@ -6119,7 +6689,7 @@ fn wire_setup_calibrate(win: &MainWindow, ctx: &Rc<Ctx>) {
                                                             "Couldn't set pedals",
                                                             &e.title,
                                                         );
-                                                        eprintln!(
+                                                        ui_log!(
                                                             "RSH-UI setup calibrate pedals failed: {}",
                                                             e.title
                                                         );
@@ -6130,7 +6700,7 @@ fn wire_setup_calibrate(win: &MainWindow, ctx: &Rc<Ctx>) {
                                     }
                                     Err(e) => {
                                         ctx.notify(w, "Calibration", "Couldn't set pedals", &e.title);
-                                        eprintln!(
+                                        ui_log!(
                                             "RSH-UI setup calibrate pedals failed: {}",
                                             e.title
                                         );
@@ -6141,10 +6711,10 @@ fn wire_setup_calibrate(win: &MainWindow, ctx: &Rc<Ctx>) {
                     } else {
                         let reason = Ctx::capture_unavailable_reason();
                         ctx.notify(&w, "Calibration", "Couldn't set pedals", reason);
-                        eprintln!("RSH-UI setup calibrate pedals failed: {reason}");
+                        ui_log!("RSH-UI setup calibrate pedals failed: {reason}");
                     }
                 }
-                other => eprintln!("RSH-UI setup calibrate: unknown action {other}"),
+                other => ui_log!("RSH-UI setup calibrate: unknown action {other}"),
             }
         });
     }
@@ -6167,9 +6737,9 @@ fn wire_pedals(win: &MainWindow, ctx: &Rc<Ctx>) {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_pedal_deadzone_changed(move |p, v| {
-            if win.upgrade().is_none() {
+            let Some(w) = win.upgrade() else {
                 return;
-            }
+            };
             let Ok(idx) = usize::try_from(p) else {
                 return;
             };
@@ -6179,6 +6749,30 @@ fn wire_pedals(win: &MainWindow, ctx: &Rc<Ctx>) {
             // A1: v is 0..1 of 10% → deadzone percent is v * 10.
             // M-7: a drag queues one debounced push, not one per move.
             let deadzone = (f64::from(v) * 10.0).clamp(0.0, 10.0);
+            // R2-10: the thumb follows the mouse NOW — the prop
+            // is written locally and the mini-curve marker reads
+            // the local record, so the drag never waits on the
+            // ~1 Hz cache sync (which used to leave the thumb
+            // frozen, then jump). `sync_pedals` skips this module
+            // while the push is pending, so the stale cache cannot
+            // snap it back mid-drag.
+            match idx {
+                0 => {
+                    w.set_throttle_deadzone(v);
+                    w.set_throttle_deadzone_text(pct_text(deadzone).into());
+                }
+                1 => {
+                    w.set_brake_deadzone(v);
+                    w.set_brake_deadzone_text(pct_text(deadzone).into());
+                }
+                _ => {
+                    w.set_clutch_deadzone(v);
+                    w.set_clutch_deadzone_text(pct_text(deadzone).into());
+                }
+            }
+            if let Some(record) = ctx.pedals.borrow_mut().records.get_mut(idx) {
+                record.deadzone = deadzone;
+            }
             ctx.queue_field_push(module, FieldKind::Deadzone, deadzone);
         });
     }
@@ -6214,10 +6808,15 @@ fn wire_pedals_rest(win: &MainWindow, ctx: &Rc<Ctx>) {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_pedal_bite_changed(move |v| {
-            if win.upgrade().is_none() {
+            let Some(w) = win.upgrade() else {
                 return;
-            }
+            };
             let bite = f64::from(v).clamp(0.0, 1.0);
+            // R2-10: local thumb state — see
+            // `on_pedal_deadzone_changed`.
+            w.set_clutch_bite(v);
+            w.set_clutch_bite_text(pct_text(bite * 100.0).into());
+            ctx.pedals.borrow_mut().records[2].bite_point = Some(bite);
             // M-7: a drag queues one debounced push, not one per move.
             ctx.queue_field_push("clutch", FieldKind::Bite, bite);
         });
@@ -6274,7 +6873,7 @@ fn wire_pedals_set(win: &MainWindow, ctx: &Rc<Ctx>) {
                 if !ctx.is_live() {
                     let reason = Ctx::capture_unavailable_reason();
                     ctx.notify(&w, "Pedals", &format!("Couldn't set {name} up"), reason);
-                    eprintln!("RSH-UI pedal set up {key} failed: {reason}");
+                    ui_log!("RSH-UI pedal set up {key} failed: {reason}");
                     return;
                 }
                 ctx.run_generic_job(
@@ -6304,7 +6903,7 @@ fn wire_pedals_set(win: &MainWindow, ctx: &Rc<Ctx>) {
                                     &format!("Couldn't set {name} up"),
                                     &e.title,
                                 );
-                                eprintln!("RSH-UI pedal set up {key} failed: {}", e.title);
+                                ui_log!("RSH-UI pedal set up {key} failed: {}", e.title);
                             }
                         }
                     },
@@ -6324,7 +6923,7 @@ fn wire_pedals_set(win: &MainWindow, ctx: &Rc<Ctx>) {
                 if !ctx.is_live() {
                     let reason = Ctx::capture_unavailable_reason();
                     ctx.notify(&w, "Pedals", &format!("Couldn't set {name} down"), reason);
-                    eprintln!("RSH-UI pedal set down {key} failed: {reason}");
+                    ui_log!("RSH-UI pedal set down {key} failed: {reason}");
                     return;
                 }
                 ctx.run_generic_job(
@@ -6354,7 +6953,7 @@ fn wire_pedals_set(win: &MainWindow, ctx: &Rc<Ctx>) {
                                     &format!("Couldn't set {name} down"),
                                     &e.title,
                                 );
-                                eprintln!("RSH-UI pedal set down {key} failed: {}", e.title);
+                                ui_log!("RSH-UI pedal set down {key} failed: {}", e.title);
                             }
                         }
                     },
@@ -6573,7 +7172,7 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                         }
                         Err(e) => {
                             ctx.notify_error(w, "Buttons", &e);
-                            eprintln!("RSH-UI buttons edit-save failed: {} ({})", e.code, e.title);
+                            ui_log!("RSH-UI buttons edit-save failed: {} ({})", e.code, e.title);
                         }
                     }
                 },
@@ -6729,7 +7328,7 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                                     }
                                     Err(e) => {
                                         ctx.notify(w, "Extras", "Couldn't set handbrake", &e.title);
-                                        eprintln!(
+                                        ui_log!(
                                             "RSH-UI extras handbrake capture failed: {}",
                                             e.title
                                         );
@@ -6740,7 +7339,7 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                     } else {
                         let reason = Ctx::capture_unavailable_reason();
                         ctx.notify(&w, "Extras", "Couldn't set handbrake", reason);
-                        eprintln!("RSH-UI extras handbrake capture failed: {reason}");
+                        ui_log!("RSH-UI extras handbrake capture failed: {reason}");
                     }
                 }
                 "horn-learn" => ctx.toggle_learn(&w, 2),
@@ -6758,7 +7357,7 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                         "Sensitivity has no wheel setting yet.",
                     );
                 }
-                other => eprintln!("RSH-UI unknown extras-action: {other}"),
+                other => ui_log!("RSH-UI unknown extras-action: {other}"),
             }
         });
     }
@@ -6790,10 +7389,14 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_extras_handbrake_deadzone(move |v| {
-            if win.upgrade().is_none() {
+            let Some(w) = win.upgrade() else {
                 return;
-            }
+            };
             let deadzone = (f64::from(v) * 10.0).clamp(0.0, 10.0);
+            // R2-10: local thumb state — see
+            // `on_pedal_deadzone_changed`.
+            w.set_handbrake_deadzone(v);
+            w.set_handbrake_deadzone_text(pct_text(deadzone).into());
             // M-7: a drag queues one debounced push, not one per move.
             ctx.queue_field_push("handbrake", FieldKind::Deadzone, deadzone);
         });
@@ -6830,10 +7433,14 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_extras_led_brightness(move |v| {
-            if win.upgrade().is_none() {
+            let Some(w) = win.upgrade() else {
                 return;
-            }
+            };
             let brightness = (v.clamp(0.0, 1.0) * 100.0).round();
+            // R2-10: local thumb state — see
+            // `on_pedal_deadzone_changed`.
+            w.set_led_brightness(v.clamp(0.0, 1.0));
+            w.set_led_brightness_text(pct_text(f64::from(brightness)).into());
             // M-7: a drag queues one debounced push, not one per move.
             ctx.queue_field_push("led", FieldKind::Brightness, f64::from(brightness));
         });
@@ -6953,6 +7560,11 @@ fn wire_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// Wire the tuning callbacks (deadzone / curve / preset / reset / save).
 /// Tuning changes mark the profile unsaved (REDESIGN-PLAN §3.6).
 /// A24: the curve slider is 1.0..2.0 (exponent = 1.0 + v * 1.0).
+/// R2-13: no synchronous `refresh()` per move — the 50 ms frame
+/// timer repaints the new local value within one frame, and a full
+/// refresh per mouse-move ran `push_frame` + capture sync tens of
+/// times per second on top of the timer. Only the debounced daemon
+/// push (`push_steering`) still runs.
 fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
@@ -6961,9 +7573,6 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
             ctx.tuning.borrow_mut().set_deadzone(v * 10.0);
             ctx.tuning.borrow_mut().set_preset(3);
             ctx.push_steering();
-            if let Some(w) = win.upgrade() {
-                ctx.refresh(&w, 0);
-            }
         });
     }
     {
@@ -6973,9 +7582,6 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
             ctx.tuning.borrow_mut().set_exponent(1.0 + v * 1.0);
             ctx.tuning.borrow_mut().set_preset(3);
             ctx.push_steering();
-            if let Some(w) = win.upgrade() {
-                ctx.refresh(&w, 0);
-            }
         });
     }
     {
@@ -6986,9 +7592,6 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
                 ctx.tuning.borrow_mut().set_deadzone(pct);
                 ctx.tuning.borrow_mut().set_preset(3);
                 ctx.push_steering();
-            }
-            if let Some(w) = win.upgrade() {
-                ctx.refresh(&w, 0);
             }
         });
     }
@@ -7001,9 +7604,6 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
                 ctx.tuning.borrow_mut().set_preset(3);
                 ctx.push_steering();
             }
-            if let Some(w) = win.upgrade() {
-                ctx.refresh(&w, 0);
-            }
         });
     }
     {
@@ -7012,9 +7612,6 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
         win.unwrap().on_preset_selected(move |p| {
             ctx.tuning.borrow_mut().set_preset(p);
             ctx.push_steering();
-            if let Some(w) = win.upgrade() {
-                ctx.refresh(&w, 0);
-            }
         });
     }
     {
@@ -7023,9 +7620,6 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
         win.unwrap().on_reset_defaults(move || {
             ctx.tuning.borrow_mut().reset_defaults();
             ctx.push_steering();
-            if let Some(w) = win.upgrade() {
-                ctx.refresh(&w, 0);
-            }
         });
     }
 }
@@ -7054,7 +7648,7 @@ fn wire_keyboard(win: &MainWindow) {
                 if (1..=4).contains(&page) {
                     w.invoke_save_profile();
                 } else {
-                    eprintln!("RSH-UI keyboard-save ignored on page {page} (no Save there)");
+                    ui_log!("RSH-UI keyboard-save ignored on page {page} (no Save there)");
                 }
             }
         });
@@ -7065,7 +7659,7 @@ fn wire_keyboard(win: &MainWindow) {
             if let Some(w) = win.upgrade() {
                 let next = (w.get_page() + delta).rem_euclid(6);
                 w.set_page(next);
-                eprintln!("RSH-UI keyboard-nav page={next}");
+                ui_log!("RSH-UI keyboard-nav page={next}");
             }
         });
     }
@@ -7078,15 +7672,15 @@ fn wire_keyboard(win: &MainWindow) {
                     eprintln!("RSH-UI keyboard-escape closed game dialog");
                 } else if w.get_popover_open() {
                     w.set_popover_open(false);
-                    eprintln!("RSH-UI keyboard-escape closed profile popover");
+                    ui_log!("RSH-UI keyboard-escape closed profile popover");
                 } else if w.get_notif_open() {
                     w.set_notif_open(false);
-                    eprintln!("RSH-UI keyboard-escape closed notifications drawer");
+                    ui_log!("RSH-UI keyboard-escape closed notifications drawer");
                 } else if w.get_diag_open() {
                     w.set_diag_open(false);
-                    eprintln!("RSH-UI keyboard-escape closed diagnostics drawer");
+                    ui_log!("RSH-UI keyboard-escape closed diagnostics drawer");
                 } else {
-                    eprintln!("RSH-UI keyboard-escape (no drawer or popover open)");
+                    ui_log!("RSH-UI keyboard-escape (no drawer or popover open)");
                 }
             }
         });
@@ -7146,7 +7740,7 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                                 }
                                 Err(e) => {
                                     ctx.notify(w, "Steering", "Couldn't set centre", &e.title);
-                                    eprintln!("RSH-UI set centre failed: {}", e.title);
+                                    ui_log!("RSH-UI set centre failed: {}", e.title);
                                 }
                             }
                         },
@@ -7154,7 +7748,7 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                 } else {
                     let reason = Ctx::capture_unavailable_reason();
                     ctx.notify(&w, "Steering", "Couldn't set centre", reason);
-                    eprintln!("RSH-UI set centre failed: {reason}");
+                    ui_log!("RSH-UI set centre failed: {reason}");
                 }
             }
         });
@@ -7236,7 +7830,7 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                         }
                         Err(e) => {
                             ctx.notify(w, "Game", "Couldn't launch game", &e.title);
-                            eprintln!("RSH-UI launch-game failed: {} ({})", e.code, e.title);
+                            ui_log!("RSH-UI launch-game failed: {} ({})", e.code, e.title);
                         }
                     }
                 },
@@ -7465,7 +8059,7 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
                         Err(e) => {
                             w.set_autostart_enabled(!enabled);
                             ctx.notify(w, "Startup", "Autostart failed", &e.title);
-                            eprintln!("RSH-UI set_autostart failed: {} ({})", e.code, e.title);
+                            ui_log!("RSH-UI set_autostart failed: {} ({})", e.code, e.title);
                         }
                     }
                 },
@@ -7491,7 +8085,7 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
                 ctx.sync_replace_block(&w);
                 w.set_setup_mode(true);
                 ctx.sync_vjoy(&w);
-                eprintln!("RSH-UI run setup again (wizard reopened)");
+                ui_log!("RSH-UI run setup again (wizard reopened)");
             }
         });
     }
@@ -7638,7 +8232,7 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
                         },
                     );
                 }
-                other => eprintln!("RSH-UI unknown settings-action: {other}"),
+                other => ui_log!("RSH-UI unknown settings-action: {other}"),
             }
         });
     }
@@ -7697,7 +8291,7 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
                         }
                         Err(e) => {
                             ctx.notify_error(w, "Profile", &e);
-                            eprintln!("RSH-UI save-profile failed: {} ({})", e.code, e.title);
+                            ui_log!("RSH-UI save-profile failed: {} ({})", e.code, e.title);
                         }
                     }
                 },
@@ -7728,7 +8322,7 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
                     JobResult::Unit(Ok(()))
                 },
                 move |_ctx, w, _result| {
-                    eprintln!("RSH-UI send-to-game={next}");
+                    ui_log!("RSH-UI send-to-game={next}");
                     w.set_send_to_game(next);
                 },
             );
@@ -7766,7 +8360,7 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
                                         "Auto-switch resumed."
                                     },
                                 );
-                                eprintln!("RSH-UI auto-profile paused={stored}");
+                                ui_log!("RSH-UI auto-profile paused={stored}");
                             }
                             Err(e) => {
                                 w.set_auto_paused(!next);
@@ -7784,7 +8378,7 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// the [`NotificationCenter`] by the timer drain (see `main`); this
 /// function only logs, it never stores.
 /// Log one drained live event (DS-79): to stderr only with
-/// `--verbose`. Without it the UI thread does no `eprintln!` per
+/// `--verbose`. Without it the UI thread does no `ui_log!` per
 /// event at all — not even the `format!` (the early return skips
 /// it). The daemon already records its side of every event in the
 /// diagnostics log; the UI does not depend on `rsh-app-core`, so
@@ -8211,11 +8805,11 @@ fn apply_page_request(win: &MainWindow, ctx: &Ctx, page: &str) {
         ctx.sync_replace_block(win);
         win.set_setup_mode(true);
         ctx.sync_vjoy(win);
-        eprintln!("RSH-UI page request: wizard reopened");
+        ui_log!("RSH-UI page request: wizard reopened");
     } else {
         win.set_setup_mode(false);
         win.set_page(ui_lifecycle::page_index(page));
-        eprintln!("RSH-UI page request: {page}");
+        ui_log!("RSH-UI page request: {page}");
     }
 }
 
@@ -8239,7 +8833,7 @@ fn drain_ui_lifecycle(win: &MainWindow, ctx: &Ctx) {
         apply_page_request(win, ctx, &page);
     }
     if ui_lifecycle::take_quit_request(ctx.data_dir.as_ref()) {
-        eprintln!("RSH-UI tray quit requested");
+        ui_log!("RSH-UI tray quit requested");
         slint::quit_event_loop().ok();
     } else if ctx.quit_requested.get() {
         ctx.quit_requested.set(false);
@@ -8361,6 +8955,12 @@ fn start_frame_timer(
                 // the cache only — the confirm block must not wait
                 // for a wizard reopen.
                 ctx.sync_replace_block(&w);
+                // R2-11: diag / overview text is excluded from the
+                // generation hash (diag p99s move every cycle), so
+                // it re-syncs on the 1 Hz tick itself — guarded
+                // writes make this free when nothing changed.
+                ctx.sync_overview(&w);
+                ctx.sync_diag(&w);
                 if w.get_setup_pairing_active() && !w.get_setup_paired() {
                     let left = w.get_setup_pair_seconds_left();
                     match left {
@@ -8480,6 +9080,8 @@ fn start_frame_timer(
 fn main() -> Result<(), slint::PlatformError> {
     let t0 = Instant::now();
     let args = parse_args();
+    // DS-79: `--verbose` gates every `ui_log!` line in the UI.
+    UI_VERBOSE.store(args.verbose, Ordering::Relaxed);
     let data_dir = live_probe::resolve_data_dir(args.data_dir.as_deref());
 
     // M-5/A1 (Tray-team hook): single instance, decided BEFORE the
@@ -8551,6 +9153,8 @@ fn main() -> Result<(), slint::PlatformError> {
         games_cache: Rc::new(RefCell::new(Vec::new())),
         game_dialog_edit_id: Rc::new(RefCell::new(None)),
         game_dialog_profile_id: Rc::new(RefCell::new(None)),
+        presets_games: Rc::new(RefCell::new(Vec::new())),
+        games_profiles: Rc::new(RefCell::new(Vec::new())),
         pending_profile_id: Rc::new(RefCell::new(None)),
         learn_target: Rc::new(Cell::new(0)),
         horn_test_until: Rc::new(Cell::new(None)),
@@ -9243,6 +9847,8 @@ mod tests {
             games_cache: Rc::new(RefCell::new(Vec::new())),
             game_dialog_edit_id: Rc::new(RefCell::new(None)),
             game_dialog_profile_id: Rc::new(RefCell::new(None)),
+            presets_games: Rc::new(RefCell::new(Vec::new())),
+            games_profiles: Rc::new(RefCell::new(Vec::new())),
             pending_profile_id: Rc::new(RefCell::new(None)),
             learn_target: Rc::new(Cell::new(0)),
             horn_test_until: Rc::new(Cell::new(None)),
