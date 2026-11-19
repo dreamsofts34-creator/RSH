@@ -264,6 +264,23 @@ impl AppApi for DaemonApi {
         Ok(self.pairing_status())
     }
 
+    fn confirm_pairing_replacement(&self) -> Result<PairingInfo, UserError> {
+        // R2-51: `state.confirm_pairing_replacement` arms the
+        // one-time flag and calls `activate_session()`, which only
+        // queues the transport connect and returns — the
+        // activation itself runs async in the forwarder, so this
+        // never blocks the IPC dispatch path. The UI polls
+        // `pairing_status()` for the outcome.
+        self.state.confirm_pairing_replacement().map_err(|detail| {
+            let typed = self
+                .state
+                .pairing_error_typed()
+                .unwrap_or(ConnectionError::Unknown);
+            UserError::from_connection(typed, detail)
+        })?;
+        Ok(self.pairing_status())
+    }
+
     fn snapshot(&self) -> SnapshotInfo {
         Self::snapshot_from(&self.state.snapshot(), self.state.pressed_button_mask())
     }

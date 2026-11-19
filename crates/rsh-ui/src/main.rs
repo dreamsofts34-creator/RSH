@@ -1354,6 +1354,11 @@ struct Ctx {
     /// session goes Active again, or after 30 s.
     pairing_rejoining: Rc<Cell<bool>>,
     pairing_rejoin_since: Rc<Cell<Option<Instant>>>,
+    /// R2-51: the user dismissed the "replace the pairing?" confirm
+    /// block (Cancel) — the 1 Hz sync keeps it hidden until the
+    /// mismatch clears (`replacement_required` false) or the wizard
+    /// reopens, so Cancel is not undone by the next poll.
+    replace_dismissed: Rc<Cell<bool>>,
     /// True while a Backend job is switching to `HIDMaestro` (DS-59):
     /// the busy strip relabels to "Waiting for admin permission…"
     /// once the UAC prompt is expected.
@@ -1653,6 +1658,19 @@ impl Ctx {
         };
         let connected = live && conn.label == "Connected";
         let active = live && matches!(conn.state, ConnectionState::Active);
+        // R2-19: the board is REACHABLE once it answers — `Hello`
+        // means a HELLO was received, `Authenticating` a pair/resume
+        // is in flight, `Active` the resumed session. `LinkUp` alone
+        // does NOT prove the board is there (transport bound, still
+        // waiting for a HELLO), so it must not unlock the wizard's
+        // Connect step. `Active` needs signed `GET_CAPS` = pairing,
+        // which lives at step 2 — gating step 0 on it was a dead end
+        // for unpaired boards.
+        let reachable = live
+            && matches!(
+                conn.state,
+                ConnectionState::Hello | ConnectionState::Authenticating | ConnectionState::Active
+            );
         let deadzone;
         let exponent;
         {
@@ -1690,11 +1708,11 @@ impl Ctx {
             conn_label_for(connecting, live, &conn.label, self.pairing_rejoining.get()).into(),
             |v| win.set_conn_label(v),
         );
-        // The wizard's Connect step is done exactly when the session
-        // is Active on the LIVE daemon (v2.0.1 hotfix): re-derived on
+        // R2-19: the wizard's Connect step is done exactly when the
+        // board is REACHABLE on the LIVE daemon — re-derived on
         // every frame, so a reconnect also advances the wizard. The
         // sim reports Active too — it must never advance the wizard.
-        set_if_changed(win.get_setup_connect_done(), active, |v| {
+        set_if_changed(win.get_setup_connect_done(), reachable, |v| {
             win.set_setup_connect_done(v);
         });
         if active {
@@ -1707,18 +1725,49 @@ impl Ctx {
         }
         set_if_changed(
             win.get_setup_wifi_joined(),
-            active && conn.transport == ApiTransport::Wifi,
+            reachable && conn.transport == ApiTransport::Wifi,
             |v| {
                 win.set_setup_wifi_joined(v);
             },
         );
         set_if_changed(
             win.get_setup_usb_available(),
-            active && conn.transport == ApiTransport::Usb,
+            reachable && conn.transport == ApiTransport::Usb,
             |v| {
                 win.set_setup_usb_available(v);
             },
         );
+        // R2-19: step 0 shows WHY it cannot advance — the pair-status
+        // text used to live on step 2 only, so a stuck Connect step
+        // showed no error at all. The hint is the connection error's
+        // own hint (daemon-provided when present, else the typed
+        // reason's); `WindowClosed` names the step-0 recovery
+        // (BOOT hold + retry the transport button).
+        let connect_hint = if !live {
+            "RSH isn't running — reconnect to try again.".to_string()
+        } else if let ConnectionState::Error { reason, hint, .. } = &conn.state {
+            if *reason == ConnectionError::WindowClosed {
+                let again = if conn.transport == ApiTransport::Usb {
+                    "Use USB"
+                } else {
+                    "Use Wi-Fi"
+                };
+                format!(
+                    "Pairing window closed — hold BOOT 3 s on the wheel, then press {again} again."
+                )
+            } else if !hint.is_empty() {
+                hint.clone()
+            } else {
+                conn.hint
+                    .clone()
+                    .unwrap_or_else(|| reason.hint().to_string())
+            }
+        } else {
+            String::new()
+        };
+        set_if_changed(win.get_setup_connect_hint(), connect_hint.into(), |v| {
+            win.set_setup_connect_hint(v);
+        });
         let transport_label = match conn.transport {
             rsh_api::ApiTransport::Wifi => "Wi-Fi",
             rsh_api::ApiTransport::Usb => "USB",
@@ -2173,6 +2222,33 @@ impl Ctx {
     /// on the UI thread — safe on the 1 Hz tick.
     fn daemon_pair_seconds_left(&self) -> i32 {
         i32::try_from(self.api().pairing_status().seconds_left).unwrap_or(120)
+    }
+
+    /// Sync the R2-51 "replace the pairing?" block from the polled
+    /// `pairing_status()` (1 Hz tick + wizard (re)open + reconnect
+    /// seed): `replacement_required` + the board MAC reach the
+    /// wizard promptly — the confirm block must not wait for a
+    /// wizard reopen. A Cancel dismisses it until the mismatch
+    /// clears (`replacement_required` false) or the wizard reopens.
+    /// The legacy reset branch follows the same flag (H-5).
+    fn sync_replace_block(&self, win: &MainWindow) {
+        let ps = self.api().pairing_status();
+        if !ps.replacement_required {
+            self.replace_dismissed.set(false);
+        }
+        let show = ps.replacement_required && !self.replace_dismissed.get();
+        set_if_changed(win.get_setup_replace_required(), show, |v| {
+            win.set_setup_replace_required(v);
+        });
+        let mac = ps.board_mac.clone().unwrap_or_default();
+        set_if_changed(win.get_setup_replace_board_mac(), mac.into(), |v| {
+            win.set_setup_replace_board_mac(v);
+        });
+        set_if_changed(
+            win.get_setup_reset_required(),
+            ps.replacement_required,
+            |v| win.set_setup_reset_required(v),
+        );
     }
 
     /// Close the pairing window (DS-58/DS-74): the countdown hit
@@ -2973,9 +3049,34 @@ impl Ctx {
     /// 1 USB) when the switch came from Settings, `None` for the
     /// wizard's Connect step (no switch to revert).
     fn start_transport_job(&self, win: &MainWindow, transport: ApiTransport, index: Option<i32>) {
-        if self.api().connection().transport == transport && self.is_live() {
-            // Already on this transport — the switch already shows
-            // it; nothing to do.
+        // R2-15: no live daemon → the sim would answer `Ok(Active)`
+        // and the wizard would sit with Next disabled and no error.
+        // Refuse visibly instead of running the job — never a silent
+        // Ok against the sim.
+        if !self.is_live() {
+            if let Some(i) = index {
+                win.set_transport(1 - i);
+            }
+            self.notify(
+                win,
+                "Connection",
+                "RSH isn't running",
+                "Reconnect to RSH, then try again.",
+            );
+            return;
+        }
+        // R2-02: the old early-return swallowed every same-transport
+        // retry — `connection().transport` reports Wi-Fi even while
+        // disconnected, so the wizard's "Use Wi-Fi" (and any retry)
+        // did nothing with no job and no notification. Return early
+        // only when the session is genuinely connected (`Active`);
+        // otherwise the daemon `connect` re-triggers a fresh
+        // forwarder activation for the transport (WS-A: `Connect`
+        // from `Error` → `LinkUp` + `RequestHello`).
+        let conn = self.api().connection();
+        if conn.transport == transport && matches!(conn.state, ConnectionState::Active) {
+            // Already on this transport and connected — the switch
+            // already shows it; nothing to do.
             return;
         }
         self.notify(
@@ -3341,7 +3442,10 @@ impl Ctx {
         win.set_setup_centre_done(false);
         win.set_setup_pedals_done(false);
         win.set_setup_paired(win.get_paired());
-        win.set_setup_reset_required(self.api().pairing_status().replacement_required);
+        // R2-51: a reopen re-offers the replace block (a Cancel
+        // from the last visit does not carry over).
+        self.replace_dismissed.set(false);
+        self.sync_replace_block(win);
         win.set_setup_mode(true);
         self.sync_vjoy(win);
         begin_pairing_flow(win, self);
@@ -3618,10 +3722,11 @@ impl Ctx {
         // (TR §3c: Active session = already paired).
         {
             let ps = &seed.pairing;
-            // H-5: the wizard's reset branch (board already paired
-            // with another key) only shows when the daemon reports a
-            // replacement is required.
-            win.set_setup_reset_required(ps.replacement_required);
+            // H-5 / R2-51: the wizard's reset + replace branches
+            // (board already paired with another key) follow the
+            // daemon's `replacement_required` — synced from the
+            // just-refreshed cache, not only the seed copy.
+            self.sync_replace_block(win);
             if ps.seconds_left > 0 {
                 win.set_setup_pairing_active(true);
                 win.set_setup_pair_seconds_left(i32::try_from(ps.seconds_left).unwrap_or(120));
@@ -5500,6 +5605,15 @@ fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
                         // 10 s wait clock; the 1 Hz tick expires it, not the
                         // first tick.
                         *ctx.pairing_wait_since.borrow_mut() = Some(Instant::now());
+                        // R2-14: the prop MUST be 0 here — it defaults to
+                        // 120, and the tick's `2..` arm would read the
+                        // daemon's 0 (no window yet) and close the
+                        // window on the next tick, bypassing the 10 s
+                        // wait. At 0 the tick takes the wait arm instead.
+                        // (The `2..` arm already re-reads the daemon
+                        // value before closing, so no change is needed
+                        // there.)
+                        w.set_setup_pair_seconds_left(0);
                         w.set_setup_pairing_active(true);
                         ctx.set_pairing_trail(
                             w,
@@ -5537,12 +5651,63 @@ fn begin_pairing_flow(w: &MainWindow, ctx: &Ctx) {
     );
 }
 
+/// Run the R2-51 confirmed key replacement from the wizard Pair
+/// step: `confirm_pairing_replacement` runs on a
+/// [`JobKind::PairingOp`] job thread — the click never blocks on the
+/// daemon. The daemon returns promptly (it arms the one-time
+/// replacement flag and queues a fresh activation); the outcome
+/// arrives via `pairing_status()` polling + `PairingFinished`. On
+/// success the normal pairing flow re-runs, so the countdown +
+/// status props follow it; on failure the typed error surfaces as a
+/// pair error, never silently.
+fn confirm_replace_pairing_flow(w: &MainWindow, ctx: &Ctx) {
+    ctx.set_pairing_trail(w, "Replacing pairing…");
+    ctx.run_generic_job(
+        w,
+        JobKind::PairingOp,
+        "Replacing pairing…",
+        move |api| JobResult::Pairing(api.confirm_pairing_replacement()),
+        move |ctx, w, result| {
+            let JobResult::Pairing(result) = result else {
+                return;
+            };
+            match result {
+                Ok(info) => {
+                    eprintln!(
+                        "RSH-UI setup confirm-replace ok: replacement_required={}",
+                        info.replacement_required
+                    );
+                    // The replacement is armed — re-run the normal
+                    // pairing flow; its polling / PairingFinished
+                    // path completes the pairing.
+                    begin_pairing_flow(w, ctx);
+                }
+                Err(e) => {
+                    w.set_setup_pair_error(e.title.clone().into());
+                    ctx.set_pairing_trail(
+                        w,
+                        &format!("Replace pairing failed: {} — {}", e.title, e.what_happened),
+                    );
+                    // DS-24: pairing failed — P0-class: toast in
+                    // place AND open the drawer.
+                    ctx.notify_error_urgent(w, "Pairing", &e);
+                    eprintln!(
+                        "RSH-UI setup confirm-replace failed: {} ({})",
+                        e.code, e.title
+                    );
+                }
+            }
+        },
+    );
+}
+
 /// Connect the wizard to one transport and drive its props
-/// (`setup-transport`; `setup-connect-done` follows from
-/// `connection()` Active on the next frame via `push_frame`).
+/// (`setup-transport`; `setup-connect-done` follows from the live
+/// connection's reachability on the next frame via `push_frame`).
 /// A9: the connect runs on a background job — the click returns
-/// immediately; the wizard's Connect step is done when the session
-/// goes Active (or the job drain notifies the failure).
+/// immediately; the wizard's Connect step is done when the board
+/// answers (reachable — see `push_frame`, R2-19), or the job drain
+/// notifies the failure.
 fn setup_connect_to(w: &MainWindow, ctx: &Ctx, transport: ApiTransport) {
     w.set_setup_transport(i32::from(transport == ApiTransport::Usb));
     ctx.start_transport_job(w, transport, None);
@@ -5554,10 +5719,10 @@ fn setup_connect_to(w: &MainWindow, ctx: &Ctx, transport: ApiTransport) {
 /// last step and Skip leave setup, write the `setup-done` marker,
 /// and show the main pages. Pairing / connect / calibrate / game
 /// search are wired to the real `AppApi` now: `connect-done` comes
-/// from `connection()` Active (set at startup + every frame),
-/// `paired` from `PairingFinished` events, calibrate needs the
-/// calibration backend (disabled + reason while it is missing —
-/// never a fake done), games come from `list_games()`.
+/// from the live connection's reachability (R2-19, set at startup +
+/// every frame), `paired` from `PairingFinished` events, calibrate
+/// needs the calibration backend (disabled + reason while it is
+/// missing — never a fake done), games come from `list_games()`.
 fn wire_setup(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
@@ -5693,6 +5858,7 @@ fn wire_setup_vjoy(win: &MainWindow, ctx: &Rc<Ctx>) {
 
 /// Wire the wizard's pairing / transport / calibrate / games
 /// callbacks (split from [`wire_setup`] for readability).
+#[allow(clippy::too_many_lines)]
 fn wire_setup_pairing(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
@@ -5721,6 +5887,42 @@ fn wire_setup_pairing(win: &MainWindow, ctx: &Rc<Ctx>) {
                 // board re-pair state cleared) — never just a
                 // notification, and never an automatic re-pair.
                 ctx.start_reset_pairing_job(&w);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_setup_confirm_replace(move || {
+            if let Some(w) = win.upgrade() {
+                // R2-51: the user confirmed — the wheel is already
+                // paired with a different key, and the new key may
+                // replace it. The daemon arms the replacement and
+                // re-activates; the pairing flow re-runs on success.
+                confirm_replace_pairing_flow(&w, &ctx);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_setup_cancel_replace(move || {
+            if let Some(w) = win.upgrade() {
+                // R2-51: Cancel hides the block and leaves the
+                // pairing state untouched — pairing cannot proceed
+                // without replacing, and the hint says so. The block
+                // re-offers on the next wizard reopen (or when the
+                // mismatch clears and returns). The prop is hidden
+                // directly — not via `sync_replace_block`, whose
+                // clear-on-no-mismatch would undo the dismiss in
+                // the same call; the 1 Hz sync keeps it hidden
+                // afterwards (`replacement_required && !dismissed`).
+                ctx.replace_dismissed.set(true);
+                w.set_setup_replace_required(false);
+                ctx.set_pairing_trail(
+                    &w,
+                    "Pairing can't continue without replacing the stored pairing — press Replace pairing to try again.",
+                );
             }
         });
     }
@@ -7282,8 +7484,11 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
                 w.set_setup_centre_done(false);
                 w.set_setup_pedals_done(false);
                 w.set_setup_paired(w.get_paired());
-                // H-5: sync the reset branch on wizard (re)open too.
-                w.set_setup_reset_required(ctx.api().pairing_status().replacement_required);
+                // H-5 / R2-51: sync the reset + replace branches on
+                // wizard (re)open too — a Cancel from the last visit
+                // does not carry over.
+                ctx.replace_dismissed.set(false);
+                ctx.sync_replace_block(&w);
                 w.set_setup_mode(true);
                 ctx.sync_vjoy(&w);
                 eprintln!("RSH-UI run setup again (wizard reopened)");
@@ -8000,7 +8205,10 @@ fn apply_page_request(win: &MainWindow, ctx: &Ctx, page: &str) {
         win.set_setup_centre_done(false);
         win.set_setup_pedals_done(false);
         win.set_setup_paired(win.get_paired());
-        win.set_setup_reset_required(ctx.api().pairing_status().replacement_required);
+        // R2-51: a reopen re-offers the replace block (a Cancel
+        // from the last visit does not carry over).
+        ctx.replace_dismissed.set(false);
+        ctx.sync_replace_block(win);
         win.set_setup_mode(true);
         ctx.sync_vjoy(win);
         eprintln!("RSH-UI page request: wizard reopened");
@@ -8148,6 +8356,11 @@ fn start_frame_timer(
                 // firmware, …) reach the pages within ~1 s, from
                 // the cache only — no UI-thread IPC.
                 ctx.resync_from_cache(&w);
+                // R2-51: `replacement_required` + the board MAC
+                // reach the wizard's Pair step within ~1 s, from
+                // the cache only — the confirm block must not wait
+                // for a wizard reopen.
+                ctx.sync_replace_block(&w);
                 if w.get_setup_pairing_active() && !w.get_setup_paired() {
                     let left = w.get_setup_pair_seconds_left();
                     match left {
@@ -8364,6 +8577,7 @@ fn main() -> Result<(), slint::PlatformError> {
         theme_choice: Rc::new(Cell::new(read_theme(data_dir.as_ref()))),
         pairing_rejoining: Rc::new(Cell::new(false)),
         pairing_rejoin_since: Rc::new(Cell::new(None)),
+        replace_dismissed: Rc::new(Cell::new(false)),
         backend_target_is_hid: Rc::new(Cell::new(false)),
         job_tx,
         job_rx: Rc::new(RefCell::new(job_rx)),
@@ -9054,6 +9268,7 @@ mod tests {
             theme_choice: Rc::new(Cell::new(0)),
             pairing_rejoining: Rc::new(Cell::new(false)),
             pairing_rejoin_since: Rc::new(Cell::new(None)),
+            replace_dismissed: Rc::new(Cell::new(false)),
             backend_target_is_hid: Rc::new(Cell::new(false)),
             job_tx,
             job_rx: Rc::new(RefCell::new(job_rx)),
@@ -10261,6 +10476,154 @@ mod tests {
         ctx.sync_busy(&win);
         assert!(!win.get_busy());
         assert_eq!(win.get_busy_kind(), -1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-14: `begin_pairing` returns `seconds_left == 0` when no
+    /// window is open yet (`SimApi` does exactly that) — the flow must
+    /// arm the 10 s wait with `setup_pair_seconds_left` at 0, so the
+    /// 1 Hz tick takes the wait arm instead of the `2..` countdown
+    /// arm (which would read the daemon's 0 and close the window on
+    /// the next tick, ~1 s after Begin).
+    #[test]
+    fn r2_14_begin_pairing_zero_seconds_starts_ten_second_wait() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("R2-14 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        // The Slint default is 120 — the bug left it there.
+        win.set_setup_pair_seconds_left(120);
+        begin_pairing_flow(&win, &ctx);
+        drain_all_jobs(&ctx, &win);
+        assert!(
+            win.get_setup_pairing_active(),
+            "pairing must be active while waiting for the window"
+        );
+        assert_eq!(
+            win.get_setup_pair_seconds_left(),
+            0,
+            "the 10 s wait arm needs the prop at 0, not the 120 default"
+        );
+        assert!(
+            ctx.pairing_wait_since.borrow().is_some(),
+            "the wait clock must be armed"
+        );
+        assert!(
+            win.get_setup_pair_status()
+                .as_str()
+                .contains("waiting for the wheel"),
+            "waiting status must show, got: {}",
+            win.get_setup_pair_status()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-19: step 0 gates on reachability, not `Active` — and shows
+    /// why it cannot advance. With no live daemon the sim's `Active`
+    /// must never unlock Next, and the hint must name the down
+    /// daemon; with a live `Active` session the step unlocks.
+    #[test]
+    fn r2_19_step_zero_gate_reachability_and_hint() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("R2-19 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        // SimApi reports Active — but it is not live, so the wizard
+        // must stay locked and say why.
+        ctx.push_frame(&win, 0);
+        assert!(
+            !win.get_setup_connect_done(),
+            "the sim's Active must never unlock step 0"
+        );
+        assert!(
+            win.get_setup_connect_hint()
+                .as_str()
+                .contains("RSH isn't running"),
+            "step 0 must name the down daemon, got: {}",
+            win.get_setup_connect_hint()
+        );
+        // A live Active session still unlocks (already-paired
+        // resume path) and clears the hint.
+        ctx.state.borrow_mut().live = true;
+        ctx.push_frame(&win, 0);
+        assert!(
+            win.get_setup_connect_done(),
+            "a live Active session must unlock step 0"
+        );
+        assert_eq!(
+            win.get_setup_connect_hint().as_str(),
+            "",
+            "no hint once the board answers"
+        );
+        assert!(
+            win.get_setup_wifi_joined(),
+            "the joined label follows the same reachability"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-51: the replace block syncs from `pairing_status()` (the
+    /// sim reports no replacement, so the block stays hidden), and
+    /// Cancel hides it, leaves the pairing state untouched, and
+    /// says pairing cannot proceed without replacing.
+    #[test]
+    fn r2_51_replace_block_sync_and_cancel() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("R2-51 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        ctx.sync_replace_block(&win);
+        assert!(!win.get_setup_replace_required());
+        assert!(!win.get_setup_reset_required());
+        assert_eq!(win.get_setup_replace_board_mac().as_str(), "");
+        // Simulate a shown block, then Cancel.
+        win.set_setup_replace_required(true);
+        win.invoke_setup_cancel_replace();
+        assert!(
+            !win.get_setup_replace_required(),
+            "Cancel must hide the block"
+        );
+        assert!(
+            ctx.replace_dismissed.get(),
+            "Cancel must dismiss until reopen / mismatch clears"
+        );
+        assert!(
+            win.get_setup_pair_status()
+                .as_str()
+                .contains("can't continue without replacing"),
+            "Cancel must say pairing cannot proceed, got: {}",
+            win.get_setup_pair_status()
+        );
+        assert!(
+            !win.get_setup_pairing_active(),
+            "Cancel must leave the pairing state untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-51: a failed confirm surfaces as a pair error, never
+    /// silently — the sim has no daemon, so its default impl errors
+    /// ("not supported") and the wizard must show it.
+    #[test]
+    fn r2_51_confirm_replace_surfaces_error() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("R2-51 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        win.invoke_setup_confirm_replace();
+        drain_all_jobs(&ctx, &win);
+        assert!(
+            !win.get_setup_pair_error().as_str().is_empty(),
+            "a failed confirm must surface a pair error, not fail silently"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

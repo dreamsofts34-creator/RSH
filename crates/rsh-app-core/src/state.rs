@@ -4060,6 +4060,24 @@ impl AppStateCore {
                 kind.as_str()
             )
         })?;
+        // R2-02: a (re)connect is a new session — the old
+        // session is dead, so the gate closes here (SEC-E-14,
+        // same as `disconnect_transport`). The fresh forwarder
+        // re-authenticates and re-opens it, which is the rising
+        // edge the daemon's manager loop needs to feed `CapsOk`.
+        // Without this, a reconnect while the gate was still
+        // open (e.g. after a watchdog latch left the manager in
+        // `Error`) silently re-activated and the manager never
+        // learned the session was live again. This closes the
+        // gate synchronously on the calling thread (after the
+        // command queued successfully), NOT in the supervisor's
+        // async `Connect` handler: a late-processed handler
+        // close would race a legitimate gate-open that happened
+        // after the queue (the tests stand in for the session
+        // owner that way). Idempotent at startup / after a
+        // failure (gate already closed); frames stay held until
+        // the fresh `GET_CAPS` passes.
+        self.close_session_gate();
         Ok(())
     }
 
