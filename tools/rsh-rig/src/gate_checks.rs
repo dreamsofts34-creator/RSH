@@ -1822,20 +1822,20 @@ pub fn gate_version_bump() -> (bool, String) {
     let pkg_section = &cargo[pkg_start..];
     report.check(
         "version-cargo-toml",
-        pkg_section.contains("version = \"2.0.3\""),
-        "workspace Cargo.toml version is 2.0.3",
+        pkg_section.contains("version = \"2.0.4\""),
+        "workspace Cargo.toml version is 2.0.4",
     );
     let main_slint = read("crates/rsh-ui/ui/main.slint").unwrap_or_default();
     report.check(
         "version-main-slint",
-        main_slint.contains("app-version: \"2.0.3\""),
-        "MainWindow app-version is 2.0.3",
+        main_slint.contains("app-version: \"2.0.4\""),
+        "MainWindow app-version is 2.0.4",
     );
     let settings = read("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
     report.check(
         "version-settings-slint",
-        settings.contains("app-version: \"RSH 2.0.3\""),
-        "Settings app-version is RSH 2.0.3",
+        settings.contains("app-version: \"RSH 2.0.4\""),
+        "Settings app-version is RSH 2.0.4",
     );
     let workflow = read(".github/workflows/release.yml").unwrap_or_default();
     report.check(
