@@ -565,12 +565,11 @@ fn write_log_line(log_dir: &Path, line: &str, now: SystemTime) -> Option<PathBuf
             // once per `LOG_IDENTITY_CHECK_INTERVAL`: the path lookup
             // on every line (× 2 locations) was the steady-state
             // cost, and a replace-with-a-different-file is caught
-            // within 60 s. (On Windows the unlink check reads the
-            // handle's delete-pending bit, so a delete+recreate is
-            // caught immediately there too; on other non-Unix
-            // platforms the check is a stub and the throttled
-            // identity check is the only guard.)
-            if file_is_unlinked(&open.file) {
+            // within 60 s. (On Windows the unlink check stats the
+            // path, so a delete+recreate is caught immediately there
+            // too; on other non-Unix platforms the check is a stub
+            // and the throttled identity check is the only guard.)
+            if file_is_unlinked(&open.file, &path) {
                 true
             } else if open.last_checked.elapsed() < LOG_IDENTITY_CHECK_INTERVAL {
                 false
@@ -620,32 +619,31 @@ fn write_log_line(log_dir: &Path, line: &str, now: SystemTime) -> Option<PathBuf
 /// Rust opens files with `FILE_SHARE_DELETE`, so an open log file
 /// CAN be deleted (the "impossible on Windows" claim in the old
 /// comment was wrong — the DS-77 test proves it: the wiped path
-/// reads back `NotFound` while the handle is still open), and the
-/// handle's attributes then carry `FILE_ATTRIBUTE_DELETE_PENDING`
-/// until the last handle closes.
+/// reads back `NotFound` while the handle is still open).
 #[cfg(unix)]
-fn file_is_unlinked(file: &File) -> bool {
+fn file_is_unlinked(file: &File, _path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     file.metadata().is_ok_and(|meta| meta.nlink() == 0)
 }
 
-/// Windows mirror of the Unix link-count check (DS-77): the
-/// delete-pending bit on the open handle's attributes. Without it
-/// the 60 s identity-check throttle trusts the stale handle and
-/// the next line is written to the deleted file instead of
-/// reopening the recreated path.
+/// Windows: the handle's own metadata does NOT surface a delete —
+/// the `FILE_ATTRIBUTE_DELETE_PENDING` bit read off the open handle
+/// stayed clear in the DS-77 test (the stale handle was trusted and
+/// the next line went to the deleted file), so stat the path
+/// instead: a gone path means the file was deleted out from under
+/// the handle. One path stat per log line, Windows only; log lines
+/// are startup/fatal (rare), so the R2-45 cost concern does not
+/// apply here. A replace-with-a-different-file is still caught by
+/// the throttled identity check within 60 s.
 #[cfg(windows)]
-fn file_is_unlinked(file: &File) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_DELETE_PENDING: u32 = 0x0000_0400;
-    file.metadata()
-        .is_ok_and(|meta| meta.file_attributes() & FILE_ATTRIBUTE_DELETE_PENDING != 0)
+fn file_is_unlinked(_file: &File, path: &Path) -> bool {
+    fs::metadata(path).is_err()
 }
 
 /// Any other platform: no unlink detection — the throttled
 /// identity check is the only guard.
 #[cfg(not(any(unix, windows)))]
-fn file_is_unlinked(_file: &File) -> bool {
+fn file_is_unlinked(_file: &File, _path: &Path) -> bool {
     false
 }
 
