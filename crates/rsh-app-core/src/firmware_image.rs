@@ -326,7 +326,21 @@ mod tests {
             "same mtime + length answers the cached version without re-reading"
         );
         // A real change (new mtime) re-reads the fresh version.
+        // Set the mtime explicitly: a fast rewrite can land in the
+        // same timestamp quantum as the restored mtime on Windows,
+        // so the wall clock alone does not guarantee a new mtime
+        // and the cache would (correctly, by its mtime+length key)
+        // keep answering the stale version.
         std::fs::write(&path, image_with("4.0.3")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(modified + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
         assert_eq!(bundled_firmware_version(&dir).as_deref(), Some("4.0.3"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
