@@ -196,6 +196,13 @@ export component OverviewPage inherits VerticalLayout {
             // repeats all tiles and hides the other row's via
             // `visible` — hidden tiles take no layout space.)
             if games.length > 0 : GridLayout {
+                // Fixed 10px: a computed spacing from `self.width`
+                // is a binding LOOP here — the grid sits inside a
+                // ScrollView, so its width comes back through
+                // flickable.content-width (compiler error, caught by
+                // ui-theme-switch). The tiles themselves still grow
+                // (min-width 300px + stretch 1); only the gap stays
+                // fixed. See CARDS-LAYOUT-RESEARCH §2 R-4.
                 spacing: 10px;
                 Row {
                     for g[idx] in games : GameTile { visible: idx < 2; horizontal-stretch: 1; min-width: 300px; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-disabled: busy-kind == 13; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
@@ -207,7 +214,7 @@ export component OverviewPage inherits VerticalLayout {
         }
     }
     HorizontalLayout {
-        spacing: 12px;
+        spacing: 0px;
         Card {
             horizontal-stretch: 1;
             VerticalLayout {
@@ -230,6 +237,8 @@ export component OverviewPage inherits VerticalLayout {
                 CheckRow { label: "Game controller ready"; hint: backend-name; warn: !backend-ready; }
             }
         }
+        // Responsive gap (R-4): min-width 12px, stretch 0.05.
+        Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
         Card {
             horizontal-stretch: 1;
             VerticalLayout {

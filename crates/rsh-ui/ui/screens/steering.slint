@@ -60,7 +60,7 @@ export component SteeringPage inherits HorizontalLayout {
         }
     }
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
-    spacing: 12px;
+    spacing: 0px;
     Card {
         horizontal-stretch: 1;
         VerticalLayout {
@@ -77,6 +77,9 @@ export component SteeringPage inherits HorizontalLayout {
             }
         }
     }
+    // Responsive gap (R-4): min-width 12px, stretch 0.05. The graph
+    // card grows; the right column stays 296px (tool panel, fixed).
+    Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
     // R2-16 (UI-UX polish): the right column scrolls so the
     // Advanced card (below) never clips the page when Advanced
     // mode is on; with Advanced off the content fits and no

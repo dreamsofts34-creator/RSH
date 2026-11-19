@@ -305,14 +305,18 @@ export component PedalsPage inherits VerticalLayout {
     spacing: 12px;
     // FIX (inner shortfall): the shell sizes the page to its preferred
     // width, and the row only shares what the cards prefer - the cards
-    // preferred 215px each (row 671px, ending x=874). Explicit 224px card
-    // widths (preview-exact: (696 - 2*12) / 3) make the row prefer 696px,
-    // so the page spans the full 736px column.
+    // preferred 215px each (row 671px, ending x=874). `min-width:
+    // 224px` card widths (preview-exact: (696 - 2*12) / 3) make the
+    // row prefer 696px, so the page spans the full 736px column.
+    // CARDS-LAYOUT-RESEARCH §2: min-width (not `width`) so the cards
+    // can GROW past 224px on wider windows (explicit `width` caps
+    // max == pref, can_grow == 0); the gaps are spacer Rectangles
+    // (min-width 12px, stretch 0.05) that scale with the window.
     HorizontalLayout {
-        spacing: 12px;
+        spacing: 0px;
         PedalCard {
             horizontal-stretch: 1;
-            width: 224px;
+            min-width: 224px;
             pedal-name: "Throttle";
             pct: throttle-pct;
             bar-color: Theme.ok;
@@ -342,9 +346,11 @@ export component PedalsPage inherits VerticalLayout {
             bite-changed(v) => { bite-changed(v); }
             bite-edited(t) => { bite-edited(t); }
         }
+        // Responsive gap (R-4): min-width 12px, stretch 0.05.
+        Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
         PedalCard {
             horizontal-stretch: 1;
-            width: 224px;
+            min-width: 224px;
             pedal-name: "Brake";
             pct: brake-pct;
             bar-color: Theme.bad;
@@ -374,9 +380,11 @@ export component PedalsPage inherits VerticalLayout {
             bite-changed(v) => { bite-changed(v); }
             bite-edited(t) => { bite-edited(t); }
         }
+        // Responsive gap (R-4): min-width 12px, stretch 0.05.
+        Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
         PedalCard {
             horizontal-stretch: 1;
-            width: 224px;
+            min-width: 224px;
             pedal-name: "Clutch";
             pct: clutch-pct;
             bar-color: Theme.accent;

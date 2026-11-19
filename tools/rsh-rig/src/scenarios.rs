@@ -1510,6 +1510,35 @@ pub fn registry() -> Vec<Scenario> {
                 min_duration_s: 0.0,
             }],
         },
+        // ---- Cards layout fix (2026-11-19): Extras ON/OFF size + responsive gaps ----
+        Scenario {
+            id: "gate-extras-card-size-source",
+            description: "Gate (cards fix, Bug 2), source audit: the 4 Extras module cards keep the OFF note and the ON body in the tree with `visible` (no `if` branches), so a card is the same size ON and OFF instead of collapsing when off.",
+            durations: (0, 0, 0),
+            wheel: WheelConfig::default(),
+            harness: HarnessConfig::default(),
+            assertions: vec![Assertion {
+                metric: "selfCheck",
+                op: "==",
+                value: MetricValue::Str("pass"),
+                note: "Gate PASS: Extras cards use `visible` (no `if` size swap).",
+                min_duration_s: 0.0,
+            }],
+        },
+        Scenario {
+            id: "gate-card-gap-source",
+            description: "Gate (cards fix, Bug 1), source audit: inter-card gaps are spacer Rectangles (min-width = design gap, stretch 0.05) and growing cards use `min-width` (not explicit `width`), so gaps and cards scale with the window.",
+            durations: (0, 0, 0),
+            wheel: WheelConfig::default(),
+            harness: HarnessConfig::default(),
+            assertions: vec![Assertion {
+                metric: "selfCheck",
+                op: "==",
+                value: MetricValue::Str("pass"),
+                note: "Gate PASS: responsive gap spacers + min-width cards present.",
+                min_duration_s: 0.0,
+            }],
+        },
         // ---- v2.0.2 gate checks, re-scan findings (B-1, B-2, H-3, H-4, M-9) ----
         Scenario {
             id: "gate-pairing-long-call",

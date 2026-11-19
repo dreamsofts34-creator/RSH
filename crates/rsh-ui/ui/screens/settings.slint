@@ -144,16 +144,22 @@ export component SettingsScreen inherits VerticalLayout {
             padding-right: 20px;
             spacing: 12px;
             HorizontalLayout {
-                spacing: 12px;
-                // Equal columns: explicit 342px each (preview-exact:
+                spacing: 0px;
+                // Equal columns: `min-width: 342px` each (preview-exact:
                 // (736 - 40 pad - 12 gap) / 2 = 342 at 920px). The
                 // staging formula sized them from the ScrollView's
                 // visible-width, but that feeds back into the page's
                 // own preferred width here and the columns came out
                 // ~357px, overflowing the right edge to x=915.
+                // CARDS-LAYOUT-RESEARCH §2: min-width (not `width`)
+                // + stretch 1 so the columns GROW with the window
+                // instead of sitting left-aligned at 342px; the gap
+                // is a spacer Rectangle (min-width 12px, stretch
+                // 0.05) that scales with the window.
                 // ---- left column
                 VerticalLayout {
-                    width: 342px;
+                    min-width: 342px;
+                    horizontal-stretch: 1;
                     spacing: 12px;
                     // Connection
                     Card {
@@ -312,9 +318,12 @@ export component SettingsScreen inherits VerticalLayout {
                         }
                     }
                 }
+                // Responsive gap (R-4): min-width 12px, stretch 0.05.
+                Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
                 // ---- right column
                 VerticalLayout {
-                    width: 342px;
+                    min-width: 342px;
+                    horizontal-stretch: 1;
                     spacing: 12px;
                     // Profiles
                     Card {

@@ -1,7 +1,9 @@
 //! `rsh-gate-ui` — v2.0.2 UI gate checks (plan §C) that need a
 //! rendered UI: slider fill geometry + click values, wizard step
 //! gating + Next click-through, theme repaint, tray disconnected
-//! state, tray Light theme (DS-22), banner wrap + grow (DS-21).
+//! state, tray Light theme (DS-22), banner wrap + grow (DS-21),
+//! Extras card size ON/OFF + OFF no-input + responsive card gaps
+//! (cards layout fix, CARDS-LAYOUT-RESEARCH).
 //!
 //! The real `.slint` files are compiled with `slint-interpreter`
 //! on the testing backend with the software renderer — no X, no
@@ -188,6 +190,114 @@ fn count_family(rgba: &[u8], width: u32, family: &[(i32, i32, i32)]) -> usize {
         .iter()
         .map(|color| count_color(rgba, width, *color, 6).0)
         .sum()
+}
+
+/// Merge sorted pixel coordinates into runs, bridging gaps of at
+/// most 4 px (rounded corners / anti-aliasing) and dropping runs
+/// shorter than 50 px. Returns (start, length) pairs.
+fn merge_runs(coords: &[usize]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut prev: usize = 0;
+    for &coord in coords {
+        match start {
+            None => {
+                start = Some(coord);
+                prev = coord;
+            }
+            Some(_) if coord - prev <= 5 => {
+                prev = coord;
+            }
+            Some(first) => {
+                if prev + 1 - first >= 50 {
+                    runs.push((first, prev + 1 - first));
+                }
+                start = Some(coord);
+                prev = coord;
+            }
+        }
+    }
+    if let Some(first) = start.filter(|&first| prev + 1 - first >= 50) {
+        runs.push((first, prev + 1 - first));
+    }
+    runs
+}
+
+/// Panel-coloured runs in one pixel column (`Theme.panel` #161C27,
+/// the Card background). Used by the Extras card-size check: the
+/// column x = 25 sits inside the left card's 14px padding, so it
+/// crosses no inner element — a run is exactly one card. Returns
+/// (top, height) pairs, top to bottom.
+#[must_use]
+fn panel_runs(rgba: &[u8], width: u32, height: u32, col: usize) -> Vec<(usize, usize)> {
+    let mut ys: Vec<usize> = Vec::new();
+    for y in 0..height as usize {
+        let idx = (y * width as usize + col) * 4;
+        let (red, green, blue) = (
+            i32::from(rgba[idx]),
+            i32::from(rgba[idx + 1]),
+            i32::from(rgba[idx + 2]),
+        );
+        if (red - 0x16).abs() <= 6 && (green - 0x1c).abs() <= 6 && (blue - 0x27).abs() <= 6 {
+            ys.push(y);
+        }
+    }
+    merge_runs(&ys)
+}
+
+/// Panel-coloured runs along one horizontal pixel row (same colour
+/// as `panel_runs`). Used to measure card WIDTHS: a scan through a
+/// card's top padding strip (no content there) gives one run per
+/// card, so the run lengths are the card widths.
+#[must_use]
+fn panel_row_runs(rgba: &[u8], width: u32, y: usize) -> Vec<(usize, usize)> {
+    let mut xs: Vec<usize> = Vec::new();
+    for col in 0..width as usize {
+        let idx = (y * width as usize + col) * 4;
+        let (red, green, blue) = (
+            i32::from(rgba[idx]),
+            i32::from(rgba[idx + 1]),
+            i32::from(rgba[idx + 2]),
+        );
+        if (red - 0x16).abs() <= 6 && (green - 0x1c).abs() <= 6 && (blue - 0x27).abs() <= 6 {
+            xs.push(col);
+        }
+    }
+    merge_runs(&xs)
+}
+
+/// Bounding box (`min_x`, `min_y`, `max_x`, `max_y`, `count`) of pure-white
+/// pixels in a region — the Switch knob (`background: white`, 14x14)
+/// is the only solid white block in a card header (title text is
+/// Theme.text #E9EDF4, never #FFFFFF; the OFF note is Theme.faint).
+fn white_bbox(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+) -> (usize, usize, usize, usize, usize) {
+    let (mut count, mut min_x, mut max_x, mut min_y, mut max_y) =
+        (0usize, usize::MAX, usize::MIN, usize::MAX, usize::MIN);
+    for y in y0..y1.min(height as usize) {
+        for x in x0..x1.min(width as usize) {
+            let i = (y * width as usize + x) * 4;
+            if rgba[i] == 255 && rgba[i + 1] == 255 && rgba[i + 2] == 255 {
+                count += 1;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if count == 0 {
+        (0, 0, 0, 0, 0)
+    } else {
+        (min_x, min_y, max_x, max_y, count)
+    }
 }
 
 /// Accent-pixel count per row (used to find the slider fill band).
@@ -879,6 +989,236 @@ fn ui_tray_light_theme() -> Outcome {
 /// cut off mid-sentence. A short string stays 36 px; the 150-char
 /// string (the plan's verification case) must grow the banner past
 /// 40 px, proving the text wraps instead of clipping.
+/// Render the real `ExtrasScreen` in one on/off state and return the
+/// left-column card runs (top, height) from the panel column x = 25,
+/// plus the raw snapshot (for the horizontal width scan).
+/// A fresh instance per state: a shown Window keeps its size, so
+/// reusing one instance would contaminate the readings.
+///
+/// One Extras render: the card runs plus the raw snapshot bytes and
+/// width (the height is only needed to take the snapshot).
+type ExtrasSnapshot = (Vec<(usize, usize)>, Vec<u8>, u32);
+
+fn extras_runs(flags: [bool; 4]) -> Result<ExtrasSnapshot, String> {
+    let [handbrake, shifter, horn, leds] = flags;
+    let instance = compile(
+        "tools/gate-checks/rsh-gate-ui/ui/cards_probe.slint",
+        "GateExtrasWindow",
+    )?;
+    set_bool(&instance, "handbrake-on", handbrake)?;
+    set_bool(&instance, "shifter-on", shifter)?;
+    set_bool(&instance, "horn-on", horn)?;
+    set_bool(&instance, "leds-on", leds)?;
+    let (rgba, width, height) = snapshot(&instance)?;
+    Ok((panel_runs(&rgba, width, height, 25), rgba, width))
+}
+
+/// Gate: Extras card size (Bug 2) — the 4 module cards must be the
+/// SAME size ON and OFF. Pixel proof on the real `ExtrasScreen`: the
+/// row-1 card height and the row-2 top must be identical in the
+/// all-ON, one-OFF and all-OFF states (tolerance ±3 px for font
+/// metrics). The old `if` branches collapsed a card to ~71 px when
+/// off (grid 1030 px → 190 px); the fix keeps the body in the tree
+/// with `visible`, so both rows stay at their ON height.
+#[allow(clippy::cast_precision_loss)]
+fn ui_extras_card_size() -> Outcome {
+    let mut report = Report::new();
+    let states = [
+        ("all-on", true, true, true, true),
+        ("handbrake-off", false, true, true, true),
+        ("all-off", false, false, false, false),
+    ];
+    let mut runs_by_state: Vec<(&str, ExtrasSnapshot)> = Vec::new();
+    for (name, handbrake, shifter, horn, leds) in states {
+        match extras_runs([handbrake, shifter, horn, leds]) {
+            Ok(snapshot) => runs_by_state.push((name, snapshot)),
+            Err(error) => return Outcome::fail(format!("{name}: {error}")),
+        }
+    }
+    let mut first: Option<(usize, usize)> = None;
+    let mut first_top: Option<usize> = None;
+    for (name, (runs, rgba, width)) in &runs_by_state {
+        if runs.len() != 2 {
+            return Outcome::fail(format!(
+                "{name}: expected 2 card runs, got {} ({runs:?})",
+                runs.len()
+            ));
+        }
+        let (row1_top, row1_h) = runs[0];
+        let (row2_top, _) = runs[1];
+        report.check(
+            &format!("{name}-row1-tall"),
+            row1_h > 300,
+            &format!("row-1 card height {row1_h} px (ON body present, not collapsed)"),
+        );
+        // Card widths (R-10): the two row-1 cards share the row
+        // equally — 342 px each at design width — because every
+        // Extras card has `min-width: 342px`. Scanned through the
+        // top padding strip (y = run start + 6, no content there),
+        // so each run is exactly one card.
+        let row_runs = panel_row_runs(rgba, *width, row1_top + 6);
+        let widths_ok = row_runs.len() == 2 && row_runs.iter().all(|(_, w)| w.abs_diff(342) <= 12);
+        report.check(
+            &format!("{name}-cards-equal-width"),
+            widths_ok,
+            &format!("row-1 card widths {row_runs:?} (expected two ~342 px runs)"),
+        );
+        match first {
+            None => {
+                first = Some((row1_top, row1_h));
+                first_top = Some(row2_top);
+            }
+            Some((top0, h0)) => {
+                report.check(
+                    &format!("{name}-row1-same-height"),
+                    row1_h.abs_diff(h0) <= 3 && row1_top.abs_diff(top0) <= 3,
+                    &format!("row-1 {row1_h} px at y={row1_top} vs all-on {h0} px at y={top0}"),
+                );
+                report.check(
+                    &format!("{name}-row2-same-top"),
+                    row2_top.abs_diff(first_top.unwrap_or(0)) <= 3,
+                    &format!(
+                        "row-2 top y={row2_top} vs all-on y={}",
+                        first_top.unwrap_or(0)
+                    ),
+                );
+            }
+        }
+    }
+    report.finish()
+}
+
+/// Gate: Extras OFF card takes no input, header switch stays live
+/// (Bug 2 safety). With Horn OFF: a click on the body area (where
+/// the "Learn from wheel" button sits when ON) must fire nothing —
+/// the invisible body takes no input — while a click on the header
+/// Switch must flip `horn-on` back on and fire `horn-toggle`.
+#[allow(clippy::cast_precision_loss)]
+fn ui_extras_off_no_input() -> Outcome {
+    let mut report = Report::new();
+    let instance = match compile(
+        "tools/gate-checks/rsh-gate-ui/ui/cards_probe.slint",
+        "GateExtrasWindow",
+    ) {
+        Ok(instance) => instance,
+        Err(error) => return Outcome::fail(error),
+    };
+    let last = Rc::new(RefCell::new(String::new()));
+    {
+        let last = Rc::clone(&last);
+        if let Err(error) = instance.set_callback("action", move |args| {
+            if let Some(Value::String(value)) = args.first() {
+                *last.borrow_mut() = value.to_string();
+            }
+            Value::Void
+        }) {
+            return Outcome::fail(format!("set action handler failed: {error}"));
+        }
+    }
+    if let Err(error) = set_bool(&instance, "horn-on", false) {
+        return Outcome::fail(error);
+    }
+    let (rgba, width, height) = match snapshot(&instance) {
+        Ok(snap) => snap,
+        Err(error) => return Outcome::fail(error),
+    };
+    let runs = panel_runs(&rgba, width, height, 25);
+    if runs.len() != 2 {
+        return Outcome::fail(format!(
+            "expected 2 card runs, got {} ({runs:?})",
+            runs.len()
+        ));
+    }
+    let row2_top = runs[1].0 as f32;
+    // Body area: 80 px below the Horn card top — past the header
+    // (~34 px) and the "Off, turn on to edit" note, inside the
+    // invisible body (the Learn/Test button row when ON).
+    click(&instance, 200.0, row2_top + 80.0);
+    report.check(
+        "extras-off-body-no-input",
+        last.borrow().is_empty(),
+        &format!(
+            "click on the OFF Horn body fired '{}' (expected nothing)",
+            last.borrow()
+        ),
+    );
+    // Header Switch, located from its knob (pure white, 14x14 — the
+    // only solid white block in the header strip): click the knob
+    // centre, which sits inside the switch's TouchArea. Hardcoding
+    // the switch position from the card geometry missed (the panel
+    // run starts a few px below the true card top — rounded corners
+    // — so a geometry-derived y lands outside the 20 px switch).
+    let (kx0, ky0, kx1, ky1, kcount) =
+        white_bbox(&rgba, width, height, 20, 362, runs[1].0, runs[1].0 + 40);
+    let knob_ok = kcount >= 100 && kx1 - kx0 <= 20 && ky1 - ky0 <= 20;
+    report.check(
+        "extras-off-switch-located",
+        knob_ok,
+        &format!(
+            "Horn switch knob at x={kx0}..{kx1} y={ky0}..{ky1} ({kcount} white px, expected a ~14x14 block)"
+        ),
+    );
+    if knob_ok {
+        let cx = (kx0 + kx1) as f32 / 2.0;
+        let cy = (ky0 + ky1) as f32 / 2.0;
+        click(&instance, cx, cy);
+    }
+    report.check(
+        "extras-off-switch-toggles",
+        get_bool(&instance, "horn-on-state") == Some(true),
+        "header Switch click flipped the screen's horn-on back to true (read via the probe mirror property)",
+    );
+    report.check(
+        "extras-off-switch-action",
+        last.borrow().as_str() == "horn-toggle",
+        &format!(
+            "header Switch click fired '{}' (expected 'horn-toggle')",
+            last.borrow()
+        ),
+    );
+    report.finish()
+}
+
+/// Gate: card gaps scale with the window (Bug 1) — pixel proof on
+/// the spacer pattern the screens use. At the 736 px design width
+/// the gap is exactly 12 px and each card 362 px; at 1016 px the
+/// gap grows to ~19 px and the cards to ~498 px (extra space split
+/// by stretch: cards 1, spacer 0.05).
+fn ui_card_gap_responsive() -> Outcome {
+    let mut report = Report::new();
+    for (component, exp_left, exp_gap) in [
+        ("GateGapWindow736", 362.0_f64, 12.0_f64),
+        ("GateGapWindow1016", 498.0_f64, 19.0_f64),
+    ] {
+        let instance = match compile(
+            "tools/gate-checks/rsh-gate-ui/ui/cards_probe.slint",
+            component,
+        ) {
+            Ok(instance) => instance,
+            Err(error) => return Outcome::fail(error),
+        };
+        // Snapshot forces layout; the measurements come off the
+        // probe's out properties.
+        if let Err(error) = snapshot(&instance) {
+            return Outcome::fail(error);
+        }
+        let left = get_num(&instance, "left-w").unwrap_or(-1.0);
+        let gap = get_num(&instance, "gap-w").unwrap_or(-1.0);
+        let right = get_num(&instance, "right-w").unwrap_or(-1.0);
+        report.check(
+            &format!("{component}-card-width"),
+            (left - exp_left).abs() <= 3.0 && (right - exp_left).abs() <= 3.0,
+            &format!("cards {left:.0}/{right:.0} px (expected {exp_left:.0} px)"),
+        );
+        report.check(
+            &format!("{component}-gap"),
+            (gap - exp_gap).abs() <= 3.0,
+            &format!("gap {gap:.1} px (expected {exp_gap:.0} px)"),
+        );
+    }
+    report.finish()
+}
+
 fn ui_banner_wrap() -> Outcome {
     let mut report = Report::new();
     let instance = match compile(
@@ -966,6 +1306,21 @@ fn checks() -> Vec<UiCheck> {
             "ui-banner-wrap",
             "DS-21: EmptyBanner wraps long text and grows past 36 px (short text stays 36 px)",
             ui_banner_wrap as fn() -> Outcome,
+        ),
+        (
+            "ui-extras-card-size",
+            "Cards fix Bug 2: Extras card heights identical ON/OFF (all-ON, one-OFF, all-OFF)",
+            ui_extras_card_size as fn() -> Outcome,
+        ),
+        (
+            "ui-extras-off-no-input",
+            "Cards fix Bug 2 safety: OFF body takes no input, header Switch still toggles",
+            ui_extras_off_no_input as fn() -> Outcome,
+        ),
+        (
+            "ui-card-gap-responsive",
+            "Cards fix Bug 1: gap 12 px at design width, grows on wider windows; cards grow",
+            ui_card_gap_responsive as fn() -> Outcome,
         ),
     ]
 }

@@ -9,9 +9,10 @@
 #   1. cargo fmt --check (workspace)
 #   2. cargo clippy on the gate crates (rsh-rig + rsh-gate-ui, warnings denied)
 #   3. cargo test -p rsh-rig (rig unit tests)
-#   4. rsh-rig --gate (32 rig gate checks: runtime + source audits +
+#   4. rsh-rig --gate (34 rig gate checks: runtime + source audits +
 #      10 v2.0.3 lifecycle checks, F17 — real daemon/UI under Xvfb)
-#   5. rsh-gate-ui (6 headless UI checks: slider/wizard/theme/tray pixels)
+#   5. rsh-gate-ui (11 headless UI checks: slider/wizard/theme/tray/banner
+#      pixels + Extras card size / OFF no-input / responsive gaps)
 #   6. windows-check: cargo check --workspace --exclude rsh-app
 #      --target x86_64-pc-windows-msvc (check-only, no linking) —
 #      Windows-only #[cfg(windows)] code never compiles on this

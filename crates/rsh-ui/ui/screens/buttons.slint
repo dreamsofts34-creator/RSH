@@ -265,7 +265,9 @@ export component ButtonsPage inherits HorizontalLayout {
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
     // FIX (inner shortfall): the 12px column gap was missing, so the page
     // stayed 12px short (panel ending x=886) even with 90px tiles.
-    spacing: 12px;
+    // CARDS-LAYOUT-RESEARCH §2: the gap is now a spacer Rectangle
+    // (min-width 12px, stretch 0.05) so it scales with the window.
+    spacing: 0px;
 
     VerticalLayout {
         horizontal-stretch: 1;
@@ -283,31 +285,49 @@ export component ButtonsPage inherits HorizontalLayout {
                 // 4-column grid: 3 rows of 4 tiles. Actions come from
                 // the button-actions model by index.
                 // FIX (inner shortfall): the tiles preferred 87px each (panel
-                // ending x=886), so the page stayed 13px short. Explicit 90px
-                // tiles (preview-exact: (384 - 3*8) / 4) make the grid prefer
+                // ending x=886), so the page stayed 13px short. `min-width:
+                // 90px` tiles (preview-exact: (384 - 3*8) / 4) make the grid prefer
                 // 384px, the left column 416px, and the page the full 736px.
                 VerticalLayout {
                     spacing: 8px;
                     HorizontalLayout {
-                        spacing: 8px;
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 0; action: button-actions[0]; pressed: 0 == pressed-index; selected: 0 == selected-index && edit-kind == 0; clicked => { tile-selected(0); } }
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 1; action: button-actions[1]; pressed: 1 == pressed-index; selected: 1 == selected-index && edit-kind == 0; clicked => { tile-selected(1); } }
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 2; action: button-actions[2]; pressed: 2 == pressed-index; selected: 2 == selected-index && edit-kind == 0; clicked => { tile-selected(2); } }
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 3; action: button-actions[3]; pressed: 3 == pressed-index; selected: 3 == selected-index && edit-kind == 0; clicked => { tile-selected(3); } }
+                        spacing: 0px;
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 0; action: button-actions[0]; pressed: 0 == pressed-index; selected: 0 == selected-index && edit-kind == 0; clicked => { tile-selected(0); } }
+                        // Responsive gap (R-4): min-width 8px, stretch 0.05.
+                        Rectangle { min-width: 8px; horizontal-stretch: 0.05; }
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 1; action: button-actions[1]; pressed: 1 == pressed-index; selected: 1 == selected-index && edit-kind == 0; clicked => { tile-selected(1); } }
+                        // Responsive gap (R-4): min-width 8px, stretch 0.05.
+                        Rectangle { min-width: 8px; horizontal-stretch: 0.05; }
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 2; action: button-actions[2]; pressed: 2 == pressed-index; selected: 2 == selected-index && edit-kind == 0; clicked => { tile-selected(2); } }
+                        // Responsive gap (R-4): min-width 8px, stretch 0.05.
+                        Rectangle { min-width: 8px; horizontal-stretch: 0.05; }
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 3; action: button-actions[3]; pressed: 3 == pressed-index; selected: 3 == selected-index && edit-kind == 0; clicked => { tile-selected(3); } }
                     }
                     HorizontalLayout {
-                        spacing: 8px;
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 4; action: button-actions[4]; pressed: 4 == pressed-index; selected: 4 == selected-index && edit-kind == 0; clicked => { tile-selected(4); } }
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 5; action: button-actions[5]; pressed: 5 == pressed-index; selected: 5 == selected-index && edit-kind == 0; clicked => { tile-selected(5); } }
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 6; action: button-actions[6]; pressed: 6 == pressed-index; selected: 6 == selected-index && edit-kind == 0; clicked => { tile-selected(6); } }
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 7; action: button-actions[7]; pressed: 7 == pressed-index; selected: 7 == selected-index && edit-kind == 0; clicked => { tile-selected(7); } }
+                        spacing: 0px;
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 4; action: button-actions[4]; pressed: 4 == pressed-index; selected: 4 == selected-index && edit-kind == 0; clicked => { tile-selected(4); } }
+                        // Responsive gap (R-4): min-width 8px, stretch 0.05.
+                        Rectangle { min-width: 8px; horizontal-stretch: 0.05; }
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 5; action: button-actions[5]; pressed: 5 == pressed-index; selected: 5 == selected-index && edit-kind == 0; clicked => { tile-selected(5); } }
+                        // Responsive gap (R-4): min-width 8px, stretch 0.05.
+                        Rectangle { min-width: 8px; horizontal-stretch: 0.05; }
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 6; action: button-actions[6]; pressed: 6 == pressed-index; selected: 6 == selected-index && edit-kind == 0; clicked => { tile-selected(6); } }
+                        // Responsive gap (R-4): min-width 8px, stretch 0.05.
+                        Rectangle { min-width: 8px; horizontal-stretch: 0.05; }
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 7; action: button-actions[7]; pressed: 7 == pressed-index; selected: 7 == selected-index && edit-kind == 0; clicked => { tile-selected(7); } }
                     }
                     HorizontalLayout {
-                        spacing: 8px;
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 8; action: button-actions[8]; pressed: 8 == pressed-index; selected: 8 == selected-index && edit-kind == 0; clicked => { tile-selected(8); } }
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 9; action: button-actions[9]; pressed: 9 == pressed-index; selected: 9 == selected-index && edit-kind == 0; clicked => { tile-selected(9); } }
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 10; action: button-actions[10]; pressed: 10 == pressed-index; selected: 10 == selected-index && edit-kind == 0; clicked => { tile-selected(10); } }
-                        ButtonTile { horizontal-stretch: 1; width: 90px; index: 11; action: button-actions[11]; pressed: 11 == pressed-index; selected: 11 == selected-index && edit-kind == 0; clicked => { tile-selected(11); } }
+                        spacing: 0px;
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 8; action: button-actions[8]; pressed: 8 == pressed-index; selected: 8 == selected-index && edit-kind == 0; clicked => { tile-selected(8); } }
+                        // Responsive gap (R-4): min-width 8px, stretch 0.05.
+                        Rectangle { min-width: 8px; horizontal-stretch: 0.05; }
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 9; action: button-actions[9]; pressed: 9 == pressed-index; selected: 9 == selected-index && edit-kind == 0; clicked => { tile-selected(9); } }
+                        // Responsive gap (R-4): min-width 8px, stretch 0.05.
+                        Rectangle { min-width: 8px; horizontal-stretch: 0.05; }
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 10; action: button-actions[10]; pressed: 10 == pressed-index; selected: 10 == selected-index && edit-kind == 0; clicked => { tile-selected(10); } }
+                        // Responsive gap (R-4): min-width 8px, stretch 0.05.
+                        Rectangle { min-width: 8px; horizontal-stretch: 0.05; }
+                        ButtonTile { horizontal-stretch: 1; min-width: 90px; index: 11; action: button-actions[11]; pressed: 11 == pressed-index; selected: 11 == selected-index && edit-kind == 0; clicked => { tile-selected(11); } }
                     }
                 }
             }
@@ -319,7 +339,7 @@ export component ButtonsPage inherits HorizontalLayout {
                 spacing: 10px;
                 Text { text: "Rotary knobs"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                 HorizontalLayout {
-                    spacing: 8px;
+                    spacing: 0px;
                     KnobCell {
                         horizontal-stretch: 1;
                         knob-name: "Knob 1";
@@ -330,6 +350,8 @@ export component ButtonsPage inherits HorizontalLayout {
                         flash-text: knob-flash-text;
                         clicked => { edit-kind = 1; edit-knob = 0; knob-selected(0); }
                     }
+                    // Responsive gap (R-4): min-width 8px, stretch 0.05.
+                    Rectangle { min-width: 8px; horizontal-stretch: 0.05; }
                     KnobCell {
                         horizontal-stretch: 1;
                         knob-name: "Knob 2";
@@ -349,6 +371,8 @@ export component ButtonsPage inherits HorizontalLayout {
         // content-height with empty space below.
         Rectangle { vertical-stretch: 1; }
     }
+    // Responsive gap (R-4): min-width 12px, stretch 0.05.
+    Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
     // edit panel (268px)
     Card {
         width: 268px;

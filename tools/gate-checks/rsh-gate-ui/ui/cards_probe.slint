@@ -1,0 +1,72 @@
+// Probe windows for the cards layout fix (CARDS-LAYOUT-RESEARCH):
+// GateExtrasWindow hosts the REAL ExtrasScreen so the gate can
+// measure card heights across on/off states headless, and
+// GateGapWindow* host the same spacer pattern the screens use
+// (min-width + stretch 0.05) at the 736px design width and at
+// 1016px, so the gate can measure the gap + card growth.
+import { ExtrasScreen } from "../../../crates/rsh-ui/ui/screens/extras.slint";
+
+export component GateExtrasWindow inherits Window {
+    width: 736px;
+    height: 700px;
+    title: "gate-cards-extras-probe";
+    in-out property <bool> handbrake-on: true;
+    in-out property <bool> shifter-on: true;
+    in-out property <bool> horn-on: true;
+    in-out property <bool> leds-on: true;
+    callback action(string);
+    // The screen's own `horn-on` is bound one-way (root → screen):
+    // a click on the header Switch flips the SCREEN's property but
+    // does not write back to root, so the gate reads the flip off
+    // this mirror property instead.
+    out property <bool> horn-on-state: screen.horn-on;
+    screen := ExtrasScreen {
+        width: 100%;
+        height: 100%;
+        handbrake-on: root.handbrake-on;
+        shifter-on: root.shifter-on;
+        horn-on: root.horn-on;
+        leds-on: root.leds-on;
+        action(s) => { root.action(s); }
+    }
+}
+
+// One responsive row: two min-width cards + a spacer gap — the exact
+// pattern the screens use (extras/pedals/buttons/steering/overview/
+// settings). Exposes the rendered widths so the gate can assert the
+// gap is 12px at design width and grows on wider windows.
+component GapRow inherits HorizontalLayout {
+    out property <length> left-w: left-card.width;
+    out property <length> gap-w: gap-rect.width;
+    out property <length> right-w: right-card.width;
+    spacing: 0px;
+    left-card := Rectangle { min-width: 362px; horizontal-stretch: 1; height: 100px; background: #161c27; }
+    gap-rect := Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
+    right-card := Rectangle { min-width: 362px; horizontal-stretch: 1; height: 100px; background: #161c27; }
+}
+
+export component GateGapWindow736 inherits Window {
+    width: 736px;
+    height: 240px;
+    title: "gate-cards-gap-736";
+    out property <length> left-w: row.left-w;
+    out property <length> gap-w: row.gap-w;
+    out property <length> right-w: row.right-w;
+    VerticalLayout {
+        spacing: 0px;
+        row := GapRow { width: 100%; height: 100px; }
+    }
+}
+
+export component GateGapWindow1016 inherits Window {
+    width: 1016px;
+    height: 240px;
+    title: "gate-cards-gap-1016";
+    out property <length> left-w: row.left-w;
+    out property <length> gap-w: row.gap-w;
+    out property <length> right-w: row.right-w;
+    VerticalLayout {
+        spacing: 0px;
+        row := GapRow { width: 100%; height: 100px; }
+    }
+}

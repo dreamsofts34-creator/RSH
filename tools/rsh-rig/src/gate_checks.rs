@@ -1329,6 +1329,146 @@ pub fn gate_notifications_source() -> (bool, String) {
     report.finish()
 }
 
+/// Gate: Extras card size, source audit (cards layout fix, Bug 2).
+///
+/// Source audit: the 4 Extras module cards must NOT swap their body
+/// with `if` branches — `if` removes the element from the tree, so
+/// the card collapsed to ~71 px when off and the whole grid reflowed
+/// on every toggle (measured: grid 1030 px all-ON → 190 px all-OFF).
+/// Both the OFF note and the ON body stay in the tree and only
+/// `visible` toggles (`visible: false` keeps the layout space in box
+/// layouts, verified headless). The pixel proof (row heights identical
+/// ON/OFF on the real `ExtrasScreen`) runs in `tools/gate-checks/
+/// rsh-gate-ui` (`ui-extras-card-size`); this audit is the fast
+/// regression net.
+#[must_use]
+pub fn gate_extras_card_size_source() -> (bool, String) {
+    let mut report = Report::new();
+    let Some(extras) = read("crates/rsh-ui/ui/screens/extras.slint") else {
+        report.check("extras-source-present", false, "extras.slint missing");
+        return report.finish();
+    };
+    for card in ["handbrake", "shifter", "horn", "leds"] {
+        report.check(
+            &format!("extras-{card}-no-if-off"),
+            !extras.contains(&format!("if !{card}-on")),
+            &format!("no `if !{card}-on` branch (OFF note is `visible`, not `if`)"),
+        );
+        report.check(
+            &format!("extras-{card}-no-if-on"),
+            !extras.contains(&format!("if {card}-on :")),
+            &format!("no `if {card}-on :` branch (ON body is `visible`, not `if`)"),
+        );
+        report.check(
+            &format!("extras-{card}-visible-off"),
+            extras.contains(&format!("visible: !{card}-on;")),
+            &format!("OFF note uses `visible: !{card}-on`"),
+        );
+        report.check(
+            &format!("extras-{card}-visible-on"),
+            extras.contains(&format!("visible: {card}-on;")),
+            &format!("ON body uses `visible: {card}-on`"),
+        );
+    }
+    // R-10: the 4 cards share the row equally — 342 px each at
+    // design width ((696 - 12) / 2) — via `min-width`, so they still
+    // grow on wider windows. Without it the row was lopsided
+    // (measured: Horn ~213 px, LEDs ~471 px — content-preferred
+    // widths, no floor).
+    report.check(
+        "extras-cards-min-width",
+        count(&extras, "min-width: 342px;") == 4,
+        "all 4 Extras cards have min-width: 342px (equal columns)",
+    );
+    report.finish()
+}
+
+/// Gate: responsive card gaps, source audit (cards layout fix, Bug 1).
+///
+/// Source audit: inter-card gaps are spacer Rectangles (`min-width`
+/// = the design gap, `horizontal-stretch: 0.05`) — NOT fixed
+/// `spacing` literals, which never scale with the window — and the
+/// cards that should grow use `min-width` (an explicit `width` caps
+/// max == pref, `can_grow == 0`, so the card never grows however much
+/// stretch it has). The pixel proof (gap 12 px at design width,
+/// ~19 px at 1016 px; cards 362 → 498 px) runs in
+/// `tools/gate-checks/rsh-gate-ui` (`ui-card-gap-responsive`); this
+/// audit is the fast regression net. The two deliberately fixed tool
+/// panels (Steering right column 296 px, Buttons edit panel 268 px)
+/// are NOT asserted here.
+#[must_use]
+pub fn gate_card_gap_source() -> (bool, String) {
+    let mut report = Report::new();
+    let extras = read("crates/rsh-ui/ui/screens/extras.slint").unwrap_or_default();
+    let pedals = read("crates/rsh-ui/ui/screens/pedals.slint").unwrap_or_default();
+    let buttons = read("crates/rsh-ui/ui/screens/buttons.slint").unwrap_or_default();
+    let steering = read("crates/rsh-ui/ui/screens/steering.slint").unwrap_or_default();
+    let overview = read("crates/rsh-ui/ui/screens/overview.slint").unwrap_or_default();
+    let settings = read("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
+    report.check(
+        "gap-spacers-extras",
+        count(&extras, "min-width: 12px; horizontal-stretch: 0.05;") == 2,
+        "Extras has 2 gap spacers (one per card row)",
+    );
+    report.check(
+        "gap-spacers-pedals",
+        count(&pedals, "min-width: 12px; horizontal-stretch: 0.05;") == 2,
+        "Pedals has 2 gap spacers (between the 3 cards)",
+    );
+    report.check(
+        "gap-spacers-buttons-tiles",
+        count(&buttons, "min-width: 8px; horizontal-stretch: 0.05;") == 10,
+        "Buttons has 10 gap spacers (9 between tiles + 1 knob row)",
+    );
+    report.check(
+        "gap-spacers-buttons-root",
+        count(&buttons, "min-width: 12px; horizontal-stretch: 0.05;") == 1,
+        "Buttons has 1 root gap spacer (left column ↔ edit panel)",
+    );
+    report.check(
+        "gap-spacer-steering",
+        count(&steering, "min-width: 12px; horizontal-stretch: 0.05;") == 1,
+        "Steering has 1 gap spacer (graph card ↔ right column)",
+    );
+    report.check(
+        "gap-spacer-overview",
+        count(&overview, "min-width: 12px; horizontal-stretch: 0.05;") == 1,
+        "Overview has 1 gap spacer (bottom-row cards)",
+    );
+    report.check(
+        "gap-spacer-settings",
+        count(&settings, "min-width: 12px; horizontal-stretch: 0.05;") == 1,
+        "Settings has 1 gap spacer (between the columns)",
+    );
+    report.check(
+        "gap-grid-overview-fixed",
+        overview.contains("spacing: 10px;"),
+        "Overview games grid keeps fixed 10px spacing (a computed spacing from self.width is a binding loop inside the ScrollView — see the comment at the grid; the tiles still grow)",
+    );
+    // NOTE: `count("width: 224px;")` also matches the `min-width:`
+    // occurrences (substring), so the explicit-width count is the
+    // total minus the min-width count.
+    report.check(
+        "gap-pedals-min-width",
+        count(&pedals, "min-width: 224px;") == 3
+            && count(&pedals, "width: 224px;") - count(&pedals, "min-width: 224px;") == 0,
+        "Pedals cards use min-width: 224px (no explicit width: 224px)",
+    );
+    report.check(
+        "gap-buttons-min-width",
+        count(&buttons, "min-width: 90px;") == 12
+            && count(&buttons, "width: 90px;") - count(&buttons, "min-width: 90px;") == 0,
+        "Buttons tiles use min-width: 90px (no explicit width: 90px)",
+    );
+    report.check(
+        "gap-settings-min-width",
+        count(&settings, "min-width: 342px;") == 2
+            && count(&settings, "width: 342px;") - count(&settings, "min-width: 342px;") == 0,
+        "Settings columns use min-width: 342px + stretch (no explicit width: 342px)",
+    );
+    report.finish()
+}
+
 /// Gate: pairing long-call (B-1, re-scan finding).
 ///
 /// `begin_pairing` is a long call: the daemon waits up to 3 s for

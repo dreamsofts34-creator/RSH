@@ -167,16 +167,28 @@ export component ExtrasScreen inherits VerticalLayout {
             spacing: 12px;
 
             HorizontalLayout {
-                spacing: 12px;
+                spacing: 0px;
                 // ---- Handbrake
                 Card {
                     horizontal-stretch: 1;
+                    min-width: 342px;
                     VerticalLayout {
                         padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
                         spacing: 10px;
                         ExtrasCardHeader { title: "Handbrake"; on: handbrake-on; toggled => { handbrake-on = !handbrake-on; action("handbrake-toggle"); } }
-                        if !handbrake-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
-                        if handbrake-on : VerticalLayout {
+                        // CARDS-LAYOUT-RESEARCH §1 (Bug 2): the OFF
+                        // note and the ON body are BOTH always in the
+                        // tree — only `visible` toggles. The old `if`
+                        // branches removed the body from the tree, so
+                        // the card collapsed to ~71 px when off and
+                        // the whole grid reflowed on every toggle
+                        // (measured: grid 1030 px all-ON → 190 px
+                        // all-OFF). `visible: false` keeps the layout
+                        // space (verified headless, Slint 1.18.1) and
+                        // takes no input; the header Switch stays
+                        // live so the card can be turned back on.
+                        Text { visible: !handbrake-on; text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        VerticalLayout { visible: handbrake-on;
                             spacing: 10px;
                             SegmentedControl {
                                 option-0: "Axis";
@@ -245,15 +257,22 @@ export component ExtrasScreen inherits VerticalLayout {
                         }
                     }
                 }
+                // Responsive gap (CARDS-LAYOUT-RESEARCH §2 R-4):
+                // min-width = the 12px design gap; stretch 0.05
+                // grows it gently with the window while the cards
+                // take the rest. An explicit `width` would cap
+                // max == pref (can_grow == 0) and never grow.
+                Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
                 // ---- Shifter
                 Card {
                     horizontal-stretch: 1;
+                    min-width: 342px;
                     VerticalLayout {
                         padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
                         spacing: 10px;
                         ExtrasCardHeader { title: "Shifter"; on: shifter-on; toggled => { shifter-on = !shifter-on; action("shifter-toggle"); } }
-                        if !shifter-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
-                        if shifter-on : VerticalLayout {
+                        Text { visible: !shifter-on; text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        VerticalLayout { visible: shifter-on;
                             spacing: 10px;
                             Text { text: gear; font-family: Theme.font-mono; font-size: 44px; font-weight: 600; color: Theme.text; horizontal-alignment: center; }
                             Text { text: shifter-mode == 1 ? "H-pattern · current gear" : "Sequential · current gear"; font-size: 12px; color: Theme.mute; horizontal-alignment: center; }
@@ -285,16 +304,17 @@ export component ExtrasScreen inherits VerticalLayout {
                 }
             }
             HorizontalLayout {
-                spacing: 12px;
+                spacing: 0px;
                 // ---- Horn
                 Card {
                     horizontal-stretch: 1;
+                    min-width: 342px;
                     VerticalLayout {
                         padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
                         spacing: 10px;
                         ExtrasCardHeader { title: "Horn"; on: horn-on; toggled => { horn-on = !horn-on; action("horn-toggle"); } }
-                        if !horn-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
-                        if horn-on : VerticalLayout {
+                        Text { visible: !horn-on; text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        VerticalLayout { visible: horn-on;
                             spacing: 10px;
                             ButtonTile { label: "HORN BUTTON"; action: horn-button; pressed: horn-pressed; clicked => { action("horn-learn"); } }
                             HorizontalLayout {
@@ -307,15 +327,22 @@ export component ExtrasScreen inherits VerticalLayout {
                         }
                     }
                 }
+                // Responsive gap (CARDS-LAYOUT-RESEARCH §2 R-4):
+                // min-width = the 12px design gap; stretch 0.05
+                // grows it gently with the window while the cards
+                // take the rest. An explicit `width` would cap
+                // max == pref (can_grow == 0) and never grow.
+                Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
                 // ---- LEDs
                 Card {
                     horizontal-stretch: 1;
+                    min-width: 342px;
                     VerticalLayout {
                         padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
                         spacing: 10px;
                         ExtrasCardHeader { title: "LEDs"; on: leds-on; toggled => { leds-on = !leds-on; action("leds-toggle"); } }
-                        if !leds-on : Text { text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
-                        if leds-on : VerticalLayout {
+                        Text { visible: !leds-on; text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        VerticalLayout { visible: leds-on;
                             spacing: 10px;
                             // Live LED strip preview (8 circles, colours from Rust)
                             HorizontalLayout {

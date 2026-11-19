@@ -1223,6 +1223,9 @@ pub fn run_contract(scenario: &Scenario) -> Metrics {
         "gate-theme-source" => crate::gate_checks::gate_theme_source(),
         "gate-overflow-source" => crate::gate_checks::gate_overflow_source(),
         "gate-notifications-source" => crate::gate_checks::gate_notifications_source(),
+        // Cards layout fix (2026-11-19): Extras ON/OFF size + responsive gaps.
+        "gate-extras-card-size-source" => crate::gate_checks::gate_extras_card_size_source(),
+        "gate-card-gap-source" => crate::gate_checks::gate_card_gap_source(),
         // v2.0.2 gate checks, re-scan findings (B-1, B-2, H-3, H-4, M-9).
         "gate-pairing-long-call" => crate::gate_checks::gate_pairing_long_call(),
         "gate-hid-uac-dwell" => crate::gate_checks::gate_hid_uac_dwell(),
