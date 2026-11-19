@@ -146,9 +146,9 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, Sender as StdSender};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -718,6 +718,15 @@ pub struct EngineStopOutcome {
     pub report: Option<EngineReport>,
 }
 
+/// A handle to the installed output backend (PERF F-15): a
+/// shared pointer to the backend instance's own mutex. The slot
+/// in [`AppStateCore`] holds one of these; cloning it is cheap,
+/// and a slow backend call (`update()`) holds only the instance's
+/// lock — never the slot lock — so a backend switch (which swaps
+/// the slot handle) and an engine tick (which cloned the old one)
+/// never block each other.
+type BackendHandle = Arc<Mutex<Box<dyn IJoystickOutput>>>;
+
 /// The testable app state (Phase G0).
 ///
 /// Owns the engine metrics + loop-rate tracker + encoder state, the
@@ -741,7 +750,20 @@ pub struct AppStateCore {
     /// the [`NullSink`]; the G4 selector swaps this slot at runtime
     /// (vJoy default, `HIDMaestro` explicit choice, none) — see
     /// [`AppStateCore::set_output_backend`].
-    backend: Mutex<Box<dyn IJoystickOutput>>,
+    ///
+    /// PERF F-15: the slot holds an `Arc` handle to a per-instance
+    /// mutex, not the backend directly. A caller clones the handle
+    /// under this slot lock (microseconds — see
+    /// [`AppStateCore::backend_handle`]) and runs slow backend calls
+    /// (`update()`, up to ~200 ms on `HIDMaestro`'s sidecar
+    /// round-trip) on the handle's own lock, so the 200 Hz engine
+    /// tick never stalls a backend switch and a switch never stalls
+    /// a tick: a switch swaps the slot `Arc`, the tick keeps sending
+    /// to the instance it cloned, and the next tick picks up the new
+    /// backend. The old shape — `Mutex<Box<...>>` with `update()`
+    /// under the slot lock — stalled every switch and every
+    /// `output_state()` read for the whole update.
+    backend: Mutex<BackendHandle>,
     /// Backend name, exactly as the backend reports it (`name()` at
     /// construction; `"NullSink"` until the selector installs a real
     /// backend). Behind a lock because the selector changes it.
@@ -794,6 +816,25 @@ pub struct AppStateCore {
     /// idempotent, so a second start (e.g. from `connect_transport`)
     /// never spawns a duplicate thread.
     board_port_refresher_started: AtomicBool,
+    /// Wake channel for the board-port refresher (PERF F-5): the
+    /// refresher waits on this condvar instead of waking every 5 s
+    /// to re-scan. `rescan_board_port()` sets the flag and notifies
+    /// (a transport change or disconnect wakes the thread at once,
+    /// even mid-backoff); the refresher takes the flag when it
+    /// wakes and probes. The flag is only ever set here — the
+    /// refresher never sets it itself.
+    board_port_wake: (Mutex<bool>, Condvar),
+    /// Generation of the slow-poll state (PERF F-6): bumped by
+    /// [`AppStateCore::note_slow_state_changed`] on every mutation
+    /// the ~1 Hz `slow_poll` reports (profile / game / tuning /
+    /// binding / knob / draft / calibration / firmware changes —
+    /// including ones made directly on the state, e.g. tray actions
+    /// in the daemon's manager loop, which bypass the IPC layer).
+    /// The daemon's `slow_poll` serves its cached static groups
+    /// until this generation moves or their TTL expires, so a
+    /// mutation is visible on the next poll instead of waiting out
+    /// a TTL.
+    slow_state_generation: AtomicU64,
     /// Queued button-press edges, drained by the emitter.
     button_events: Mutex<VecDeque<ButtonPressEvent>>,
     /// Profile + settings store.
@@ -1155,7 +1196,7 @@ impl AppStateCore {
             metrics: Mutex::new(EngineMetrics::new()),
             loop_rate: Mutex::new(LoopRateTracker::new()),
             encoders: Mutex::new(EncoderState::new()),
-            backend: Mutex::new(backend),
+            backend: Mutex::new(Arc::new(Mutex::new(backend))),
             backend_name: Mutex::new(backend_name),
             backend_detail: Mutex::new(backend_detail.into()),
             selected_backend: Mutex::new(selected_backend),
@@ -1170,6 +1211,8 @@ impl AppStateCore {
             transport_choice: Mutex::new((TransportKind::Udp, esp_ip)),
             cached_serial_port: Mutex::new(None),
             board_port_refresher_started: AtomicBool::new(false),
+            board_port_wake: (Mutex::new(false), Condvar::new()),
+            slow_state_generation: AtomicU64::new(0),
             button_events: Mutex::new(VecDeque::new()),
             store: Mutex::new(store),
             settings_cache: Mutex::new(settings_cache),
@@ -1308,6 +1351,18 @@ impl AppStateCore {
     #[must_use]
     pub fn backend_name(&self) -> String {
         lock(&self.backend_name).clone()
+    }
+
+    /// Clone the live backend handle (PERF F-15): the slot lock is
+    /// held only for the `Arc` clone. The caller then locks the
+    /// handle's own mutex for its backend call — a slow `update()`
+    /// (up to ~200 ms on `HIDMaestro`'s sidecar round-trip) never
+    /// holds the slot lock, so it cannot stall a backend switch,
+    /// and a switch (which swaps the slot handle) cannot stall a
+    /// tick: the tick keeps sending to the instance it cloned and
+    /// the next tick picks up the new backend.
+    fn backend_handle(&self) -> BackendHandle {
+        lock(&self.backend).clone()
     }
 
     /// The backend the user selected in settings (persisted choice;
@@ -2761,11 +2816,13 @@ impl AppStateCore {
 
     /// Cached USB board port (R2-25): a pure last-known read — it
     /// NEVER probes. The background refresher thread (see
-    /// [`Self::start_board_port_refresher`]) fills this cache every
-    /// [`Self::BOARD_PORT_CACHE_TTL`]; `transport_state()` on the
-    /// 20 Hz poll path reads it without ever enumerating ports or
-    /// waiting out a 500 ms HELO probe per candidate. [`None`] until
-    /// the first refresh (or after [`Self::rescan_board_port`]).
+    /// [`Self::start_board_port_refresher`]) fills this cache — on
+    /// Serial only, every [`Self::BOARD_PORT_CACHE_TTL`] while the
+    /// board is found, backing off to 30 s while it keeps missing
+    /// (PERF F-5); `transport_state()` on the 20 Hz poll path reads
+    /// it without ever enumerating ports or waiting out a 500 ms
+    /// HELO probe per candidate. [`None`] until the first refresh
+    /// (or after [`Self::rescan_board_port`]).
     #[must_use]
     pub fn cached_board_port(&self) -> Option<String> {
         lock(&self.cached_serial_port)
@@ -2773,13 +2830,74 @@ impl AppStateCore {
             .and_then(|(port, _)| port)
     }
 
-    /// Starts the background board-port refresher thread (R2-25):
-    /// it probes (`detect_board_port`, full enumeration + HELO
-    /// probe) on a detached thread every
-    /// [`Self::BOARD_PORT_CACHE_TTL`] and stores the result in the
-    /// cache — the poll path never probes. Idempotent: a second
+    /// Current slow-poll generation (PERF F-6): the daemon's
+    /// `slow_poll` cache key — see [`Self::note_slow_state_changed`].
+    #[must_use]
+    pub fn slow_state_generation(&self) -> u64 {
+        self.slow_state_generation.load(Ordering::SeqCst)
+    }
+
+    /// Bumps the slow-poll generation: call (only) after a
+    /// successful mutation of state the ~1 Hz `slow_poll` reports
+    /// — profiles, games, tunings, modules, bindings, knobs,
+    /// drafts, calibration, vJoy / firmware status — so the
+    /// daemon's cached static groups are re-read on the next poll
+    /// instead of waiting out their TTL. Cheap (one atomic add);
+    /// callers must only bump on success, never on a failed
+    /// attempt, or the cache refetches for nothing.
+    fn note_slow_state_changed(&self) {
+        self.slow_state_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Backoff cap for the board-port refresher (PERF F-5): when
+    /// the board is repeatedly not found on Serial, the refresher
+    /// backs off to this interval instead of re-scanning every 5 s;
+    /// off Serial it waits this long between (probeless) wakeups.
+    const BOARD_PORT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+    /// Wait between board-port refreshes (PERF F-5): pure, so the
+    /// cadence is unit-testable without hardware.
+    ///
+    /// - Not Serial (the default Wi-Fi transport): the refresher
+    ///   never probes at all — it waits out the backoff cap and
+    ///   only wakes early on a rescan request (transport change /
+    ///   disconnect). A USB board that is never used costs zero
+    ///   serial-stack wakeups.
+    /// - Serial with a board found (`misses == 0`): every
+    ///   `BOARD_PORT_CACHE_TTL` (5 s), as before — a plugged /
+    ///   unplugged board is picked up within that bound.
+    /// - Serial with `misses` consecutive misses: 5 s × 2^misses,
+    ///   capped at 30 s — a missing board is re-checked less and
+    ///   less often instead of churning the serial stack forever.
+    fn board_port_refresh_delay(serial: bool, misses: u32) -> Duration {
+        if !serial {
+            return Self::BOARD_PORT_BACKOFF_MAX;
+        }
+        if misses == 0 {
+            return Self::BOARD_PORT_CACHE_TTL;
+        }
+        let shift = misses.min(3);
+        let secs = Self::BOARD_PORT_CACHE_TTL.as_secs() << shift;
+        Duration::from_secs(secs.min(Self::BOARD_PORT_BACKOFF_MAX.as_secs()))
+    }
+
+    /// Starts the background board-port refresher thread (R2-25,
+    /// PERF F-5): it probes (`detect_board_port` — full enumeration
+    /// plus a HELO probe) on a detached thread and stores the result in
+    /// the cache — the poll path never probes. Idempotent: a second
     /// call is a no-op. The thread holds only a `Weak` reference
     /// and exits when the state is dropped.
+    ///
+    /// PERF F-5: the probe runs ONLY while the requested transport
+    /// is Serial (or a rescan was requested). On the default Wi-Fi
+    /// transport the thread sleeps on its condvar for 30 s at a
+    /// time and probes nothing — the old code enumerated + probed
+    /// every 5 s even when no USB board could ever be used. While
+    /// Serial and the board keeps missing, the wait backs off
+    /// 5 s → 10 s → 20 s → 30 s (see
+    /// [`Self::board_port_refresh_delay`]); a rescan request wakes
+    /// the thread at once, so switching to Serial still finds a
+    /// plugged board promptly.
     pub fn start_board_port_refresher(self: &Arc<Self>) {
         if self
             .board_port_refresher_started
@@ -2791,24 +2909,57 @@ impl AppStateCore {
         let _ = std::thread::Builder::new()
             .name("rsh-board-port-refresh".to_string())
             .spawn(move || {
+                let mut misses: u32 = 0;
                 loop {
                     let Some(state) = weak.upgrade() else {
                         return;
                     };
-                    let port = detect_board_port();
-                    *lock(&state.cached_serial_port) = Some((port, Instant::now()));
+                    let serial = state.transport_request().0 == TransportKind::Serial;
+                    // Take a pending rescan request (set by
+                    // `rescan_board_port`): it forces one probe even
+                    // when the transport is not Serial — e.g. the
+                    // user just picked USB and the cache was cleared.
+                    let rescan = {
+                        let (flag, _) = &state.board_port_wake;
+                        std::mem::replace(&mut *lock(flag), false)
+                    };
+                    if serial || rescan {
+                        let port = detect_board_port();
+                        misses = if port.is_some() {
+                            0
+                        } else {
+                            misses.saturating_add(1)
+                        };
+                        *lock(&state.cached_serial_port) = Some((port, Instant::now()));
+                    }
+                    let delay = Self::board_port_refresh_delay(serial, misses);
+                    // Wait out the delay, or until a rescan wakes
+                    // the thread early (transport change /
+                    // disconnect). A spurious wake just re-loops
+                    // and re-waits.
+                    {
+                        let (flag, condvar) = &state.board_port_wake;
+                        let guard = lock(flag);
+                        let _ = condvar
+                            .wait_timeout(guard, delay)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
                     drop(state);
-                    std::thread::sleep(Self::BOARD_PORT_CACHE_TTL);
                 }
             });
     }
 
-    /// Clears the cached board port so the next background refresh
-    /// re-detects (R2-25): call after a disconnect or a transport
-    /// change. Clearing only drops the last-known value — it never
-    /// probes inline.
+    /// Clears the cached board port and wakes the background
+    /// refresher so the next refresh re-detects at once (R2-25,
+    /// PERF F-5): call after a disconnect or a transport change.
+    /// Clearing only drops the last-known value — it never probes
+    /// inline; the probe happens on the refresher thread, which
+    /// this wakes even mid-backoff.
     pub fn rescan_board_port(&self) {
         *lock(&self.cached_serial_port) = None;
+        let (flag, condvar) = &self.board_port_wake;
+        *lock(flag) = true;
+        condvar.notify_one();
     }
 
     /// Current transport state (kind + address + connection), for
@@ -3167,7 +3318,8 @@ impl AppStateCore {
     /// also names the requested backend and the failure reason.
     #[must_use]
     pub fn output_state(&self) -> CommandOutputState {
-        let connected = lock(&self.backend).is_connected();
+        let backend = self.backend_handle();
+        let connected = lock(&backend).is_connected();
         let enabled = *lock(&self.output_enabled);
         let detail = format!(
             "{} | last send: {}",
@@ -3244,20 +3396,29 @@ impl AppStateCore {
                 );
                 return self.output_state();
             };
-            let mut backend = if let Some(placeholder) = factories.build(BackendKind::None) {
+            let backend = if let Some(placeholder) = factories.build(BackendKind::None) {
                 let mut slot = lock(&self.backend);
-                std::mem::replace(&mut *slot, placeholder)
+                std::mem::replace(&mut *slot, Arc::new(Mutex::new(placeholder)))
             } else {
                 // No sink factory (test-only path — the real
-                // factories always provide one): connect under
-                // the lock, as before.
-                let mut backend = lock(&self.backend);
+                // factories always provide one): connect on the
+                // live handle, as before.
+                let handle = self.backend_handle();
+                let mut backend = lock(&handle);
                 return self.connect_and_resend(&mut backend);
             };
-            match backend.try_connect() {
+            // The extracted handle is owned by this scope: the slow
+            // connect + resend run on its own lock, never on the
+            // slot lock, so engine ticks keep flowing on the
+            // placeholder installed above. The connect result is
+            // bound first — the scrutinee guard of a `match` would
+            // still be held inside the arm and deadlock the resend
+            // on the same handle.
+            let connected = lock(&backend).try_connect();
+            match connected {
                 Ok(()) => {
                     let last = *lock(&self.last_output);
-                    match backend.update(&last) {
+                    match lock(&backend).update(&last) {
                         Ok(()) => {
                             self.record_send(true, "output enabled: sent to backend".to_string());
                         }
@@ -3288,16 +3449,21 @@ impl AppStateCore {
                 );
                 return self.output_state();
             };
-            let mut backend = if let Some(placeholder) = factories.build(BackendKind::None) {
+            let backend = if let Some(placeholder) = factories.build(BackendKind::None) {
                 let mut slot = lock(&self.backend);
-                std::mem::replace(&mut *slot, placeholder)
+                std::mem::replace(&mut *slot, Arc::new(Mutex::new(placeholder)))
             } else {
-                let mut backend = lock(&self.backend);
+                let handle = self.backend_handle();
+                let mut backend = lock(&handle);
                 return self.disable_backend(&mut backend);
             };
-            let was_connected = backend.is_connected();
-            let neutral = backend.send_neutral();
-            backend.disconnect();
+            let (was_connected, neutral) = {
+                let mut backend = lock(&backend);
+                let was_connected = backend.is_connected();
+                let neutral = backend.send_neutral();
+                backend.disconnect();
+                (was_connected, neutral)
+            };
             *lock(&self.backend) = backend;
             match (was_connected, neutral) {
                 (true, Ok(())) => {
@@ -3510,12 +3676,13 @@ impl AppStateCore {
         // behaviour. `set_output_backend` calls `reset_fallback`
         // first, so by the time this runs the app-core flag is clear
         // too — both latches re-arm on one explicit re-select.
+        let live = self.backend_handle();
         if requested != BackendKind::None
             && BackendKind::from_backend_name(&self.backend_name()) == Some(requested)
-            && !lock(&self.backend).is_connected()
+            && !lock(&live).is_connected()
             && let Some(fresh) = factories.build(requested)
         {
-            *lock(&self.backend) = fresh;
+            *lock(&self.backend) = Arc::new(Mutex::new(fresh));
         }
         // R2-09: the selector's connect (up to 60 s of sidecar
         // spawn + UAC dwell for HIDMaestro) must NOT run under the
@@ -3530,19 +3697,25 @@ impl AppStateCore {
         // installed, exactly as the selector guarantees.
         let outcome: Result<SwitchOutcome, String> =
             if let Some(placeholder) = factories.build(BackendKind::None) {
-                let mut current = {
+                let handle = {
                     let mut slot = lock(&self.backend);
-                    std::mem::replace(&mut *slot, placeholder)
+                    std::mem::replace(&mut *slot, Arc::new(Mutex::new(placeholder)))
                 };
+                // The extracted handle is owned by this scope: the
+                // switch (up to 60 s of sidecar spawn + UAC dwell)
+                // runs on its own lock, never on the slot lock.
+                let mut current = lock(&handle);
                 let outcome = switch_backend(&mut current, requested, factories, None)
                     .map_err(|error| error.to_string());
-                *lock(&self.backend) = current;
+                drop(current);
+                *lock(&self.backend) = handle;
                 outcome
             } else {
                 // No sink factory (test-only path — the real
-                // factories always provide one): switch in place
-                // under the lock, as before.
-                let mut backend = lock(&self.backend);
+                // factories always provide one): switch on the live
+                // handle, as before.
+                let handle = self.backend_handle();
+                let mut backend = lock(&handle);
                 switch_backend(&mut backend, requested, factories, None)
                     .map_err(|error| error.to_string())
             };
@@ -3588,7 +3761,8 @@ impl AppStateCore {
             }
         };
         *lock(&self.selected_backend) = requested;
-        let live_name = lock(&self.backend).name().to_string();
+        let live = self.backend_handle();
+        let live_name = lock(&live).name().to_string();
         let mut detail = live_backend_detail(outcome.active, vjoy_device_id);
         if outcome.fell_back {
             detail.push(' ');
@@ -3720,7 +3894,8 @@ impl AppStateCore {
     pub fn list_output_backends(&self) -> Vec<BackendStatus> {
         let live_kind =
             BackendKind::from_backend_name(&self.backend_name()).unwrap_or(BackendKind::None);
-        let connected = lock(&self.backend).is_connected();
+        let live = self.backend_handle();
+        let connected = lock(&live).is_connected();
         let selected = self.selected_backend();
         let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
         let live_detail = lock(&self.backend_detail).clone();
@@ -3885,7 +4060,10 @@ impl AppStateCore {
             .name("rsh-vjoy-install".to_string())
             .spawn(move || run_vjoy_install(&state))
         {
-            Ok(_) => Ok("vJoy install started".to_string()),
+            Ok(_) => {
+                self.note_slow_state_changed();
+                Ok("vJoy install started".to_string())
+            }
             Err(error) => {
                 let mut install = lock(&self.vjoy_install);
                 install.installing = false;
@@ -3939,7 +4117,12 @@ impl AppStateCore {
             None => false,
         };
         let neutral_sent = {
-            let mut backend = lock(&self.backend);
+            // PERF F-15: the shutdown neutral + disconnect run on
+            // the cloned handle's own lock (one-off); the slot lock
+            // stays free, so a switch mid-shutdown swaps the slot
+            // instead of blocking on the disconnect.
+            let handle = self.backend_handle();
+            let mut backend = lock(&handle);
             let was_connected = backend.is_connected();
             let neutral = backend.send_neutral();
             backend.disconnect();
@@ -4129,6 +4312,7 @@ impl AppStateCore {
                 .clone_from(&profile.calibrated_at_utc);
         }
         self.push_pipeline_plan();
+        self.note_slow_state_changed();
         Ok(centre)
     }
 
@@ -4290,6 +4474,7 @@ impl AppStateCore {
         }
         lock(&self.tunings).insert(module_tuning.module.clone(), module_tuning);
         self.push_pipeline_plan();
+        self.note_slow_state_changed();
         Ok(mv)
     }
 
@@ -4721,7 +4906,15 @@ impl AppStateCore {
         if !*lock(&self.output_enabled) {
             return Ok(());
         }
-        let mut backend = lock(&self.backend);
+        // PERF F-15: clone the backend handle under the slot lock,
+        // then run the update on the handle's own lock — never on
+        // the slot lock. A switch swaps the slot handle without
+        // waiting out this update (up to ~200 ms on HIDMaestro's
+        // sidecar round-trip), and this tick is not stalled by a
+        // switch either: it keeps sending to the instance it cloned
+        // and the next tick picks up the new backend.
+        let handle = self.backend_handle();
+        let mut backend = lock(&handle);
         if !backend.is_connected() {
             return Ok(());
         }
@@ -4786,7 +4979,11 @@ impl AppStateCore {
                     live.display_name(),
                     outcome.active.display_name()
                 ));
-                let mut backend = lock(&self.backend);
+                // PERF F-15: same handle-clone as
+                // `send_engine_output` — the retry update runs on
+                // the fresh backend's own lock, never the slot lock.
+                let handle = self.backend_handle();
+                let mut backend = lock(&handle);
                 if !backend.is_connected() {
                     return Err(SinkError::new(REFUSED));
                 }
@@ -4851,6 +5048,7 @@ impl AppStateCore {
         // the old profile) and pushes the new profile's plan live.
         *lock(&self.draft) = None;
         self.push_pipeline_plan();
+        self.note_slow_state_changed();
         Ok(summary)
     }
 
@@ -4880,6 +5078,7 @@ impl AppStateCore {
     /// `UnknownAction`, or `BindingSaveFailed`.
     pub fn set_binding(&self, button: u8, action: &str) -> Result<ButtonBinding, BindingError> {
         lock(&self.bindings).set(button, action)?;
+        self.note_slow_state_changed();
         Ok(ButtonBinding {
             button,
             action: action.to_string(),
@@ -4894,7 +5093,11 @@ impl AppStateCore {
     /// Returns [`BindingError`] with code `BindingSaveFailed` when
     /// the removal cannot be persisted.
     pub fn clear_binding(&self, button: u8) -> Result<bool, BindingError> {
-        lock(&self.bindings).clear(button)
+        let removed = lock(&self.bindings).clear(button)?;
+        if removed {
+            self.note_slow_state_changed();
+        }
+        Ok(removed)
     }
 
     /// Load-time warnings from the bindings store (dropped entries,
@@ -5102,6 +5305,7 @@ impl AppStateCore {
             draft.mark_dirty(&module);
         }
         self.push_pipeline_plan();
+        self.note_slow_state_changed();
         Ok(enabled)
     }
 
@@ -5247,6 +5451,7 @@ impl AppStateCore {
         {
             draft.profile.name = name;
         }
+        self.note_slow_state_changed();
         Ok(summary)
     }
 
@@ -5270,6 +5475,7 @@ impl AppStateCore {
                 return Err(format!("no profile with id '{id}'"));
             }
             let _ = lock(&self.manual_games).set_profile(game_slug, Some(id.to_string()))?;
+            self.note_slow_state_changed();
             return Self::summary(&lock(&self.store), id);
         }
         let game = game_id_from_slug(game_slug);
@@ -5298,6 +5504,7 @@ impl AppStateCore {
         {
             draft.profile.game = game;
         }
+        self.note_slow_state_changed();
         Ok(summary)
     }
 
@@ -5318,7 +5525,9 @@ impl AppStateCore {
     pub fn set_knob_action(&self, knob: u8, row: u8, action: &str) -> Result<(), String> {
         lock(&self.bindings)
             .set_knob(knob, row, action)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.note_slow_state_changed();
+        Ok(())
     }
 
     /// Firmware check (H3/M-8): the board's live version (from the
@@ -5449,6 +5658,9 @@ impl AppStateCore {
                 version: result.version,
                 error: result.error,
             };
+            // The flash outcome changes what `firmware_check`
+            // reports — bump so the next slow poll re-reads it.
+            state.note_slow_state_changed();
         });
         Ok(self.firmware_update_status())
     }
@@ -5462,7 +5674,9 @@ impl AppStateCore {
         let mut store = lock(&self.store);
         let created = store.create(name).map_err(|error| error.to_string())?;
         store.save().map_err(|error| error.to_string())?;
-        Self::summary(&store, &created.id)
+        let summary = Self::summary(&store, &created.id)?;
+        self.note_slow_state_changed();
+        Ok(summary)
     }
 
     /// Duplicates a profile (new id, `"copy"` name) and persists.
@@ -5474,7 +5688,9 @@ impl AppStateCore {
         let mut store = lock(&self.store);
         let created = store.duplicate(id).map_err(|error| error.to_string())?;
         store.save().map_err(|error| error.to_string())?;
-        Self::summary(&store, &created.id)
+        let summary = Self::summary(&store, &created.id)?;
+        self.note_slow_state_changed();
+        Ok(summary)
     }
 
     /// Deletes a profile and persists.
@@ -5485,7 +5701,9 @@ impl AppStateCore {
     pub fn delete_profile(&self, id: &str) -> Result<(), String> {
         let mut store = lock(&self.store);
         store.delete(id).map_err(|error| error.to_string())?;
-        store.save().map_err(|error| error.to_string())
+        store.save().map_err(|error| error.to_string())?;
+        self.note_slow_state_changed();
+        Ok(())
     }
 
     /// Imports a profile file (size-capped, schema-checked by the
@@ -5501,7 +5719,9 @@ impl AppStateCore {
             .import_profile(Path::new(path))
             .map_err(|error| error.to_string())?;
         store.save().map_err(|error| error.to_string())?;
-        Self::summary(&store, &imported.id)
+        let summary = Self::summary(&store, &imported.id)?;
+        self.note_slow_state_changed();
+        Ok(summary)
     }
 
     /// Exports a profile to a file.
@@ -5784,7 +6004,9 @@ impl AppStateCore {
             GAME_STATE_EVENT,
             serde_json::json!({ "gameId": id, "state": "launched" }),
         );
-        self.game_info(id)
+        let info = self.game_info(id)?;
+        self.note_slow_state_changed();
+        Ok(info)
     }
 
     /// Stops the tracked running game (only the tracked pid). H4:
@@ -5840,7 +6062,9 @@ impl AppStateCore {
                 serde_json::json!({ "gameId": id, "state": "stopped" }),
             );
         }
-        self.game_info(id)
+        let info = self.game_info(id)?;
+        self.note_slow_state_changed();
+        Ok(info)
     }
 
     /// One game's current state (installed / running / bound profile).
@@ -5887,7 +6111,9 @@ impl AppStateCore {
     ) -> Result<GameInfo, String> {
         let bound_profile_id = self.check_bound_profile(bound_profile_id)?;
         let game = lock(&self.manual_games).add(name, exe_path, bound_profile_id)?;
-        self.game_info(&game.id)
+        let info = self.game_info(&game.id)?;
+        self.note_slow_state_changed();
+        Ok(info)
     }
 
     /// Update a manual game's name / exe path / bound profile. The
@@ -5925,7 +6151,9 @@ impl AppStateCore {
             }
         }
         let game = lock(&self.manual_games).update(id, name, exe_path, bound_profile_id)?;
-        self.game_info(&game.id)
+        let info = self.game_info(&game.id)?;
+        self.note_slow_state_changed();
+        Ok(info)
     }
 
     /// Remove a manual game. Refuses while the game is running
@@ -5947,6 +6175,7 @@ impl AppStateCore {
             }
         }
         lock(&self.manual_games).remove(id)?;
+        self.note_slow_state_changed();
         Ok(true)
     }
 
@@ -6069,6 +6298,7 @@ impl AppStateCore {
             let brightness = tuning.led_brightness.unwrap_or(100);
             let _ = self.led_test_with_color(pattern, Some(brightness), None, tuning.led_color);
         }
+        self.note_slow_state_changed();
         Ok(tuning)
     }
 
@@ -6167,6 +6397,7 @@ impl AppStateCore {
         if let Some(draft) = lock(&self.draft).as_mut() {
             draft.mark_clean();
         }
+        self.note_slow_state_changed();
         Ok(true)
     }
 
@@ -6180,6 +6411,7 @@ impl AppStateCore {
         if had_dirty {
             lock(&self.tunings).clear();
             self.push_pipeline_plan();
+            self.note_slow_state_changed();
         }
         had_dirty
     }
@@ -8929,6 +9161,93 @@ mod tests {
         }
     }
 
+    /// One side of the `BlockingBackend` handshake: a bool flag
+    /// plus its condvar (test-only; keeps `new()`'s return type
+    /// below clippy's complexity threshold).
+    type FlagPair = Arc<(Mutex<bool>, Condvar)>;
+
+    /// Test-only backend whose `update()` blocks until the test
+    /// releases it (PERF F-15): models a `HIDMaestro` sidecar
+    /// round-trip that takes ~200 ms, so the test can prove a
+    /// backend switch does not wait it out. `update()` signals
+    /// `entered` on entry and waits on `release` (bounded, so a
+    /// regression fails the test instead of hanging the suite).
+    /// Connected from construction — the test enables output
+    /// directly instead of going through the connect path.
+    struct BlockingBackend {
+        entered: FlagPair,
+        release: FlagPair,
+        connected: Arc<Mutex<bool>>,
+    }
+
+    impl BlockingBackend {
+        fn new() -> (Self, FlagPair, FlagPair) {
+            let entered = Arc::new((Mutex::new(false), Condvar::new()));
+            let release = Arc::new((Mutex::new(false), Condvar::new()));
+            (
+                Self {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                    connected: Arc::new(Mutex::new(true)),
+                },
+                entered,
+                release,
+            )
+        }
+
+        fn set_flag(flag: &Arc<(Mutex<bool>, Condvar)>) {
+            let (mutex, condvar) = &**flag;
+            *mutex.lock().expect("flag lock poisoned") = true;
+            condvar.notify_all();
+        }
+
+        fn wait_flag(flag: &Arc<(Mutex<bool>, Condvar)>, timeout: Duration) -> bool {
+            let (mutex, condvar) = &**flag;
+            let guard = mutex.lock().expect("flag lock poisoned");
+            if *guard {
+                return true;
+            }
+            let (guard, _timed_out) = condvar
+                .wait_timeout(guard, timeout)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard
+        }
+    }
+
+    impl IJoystickOutput for BlockingBackend {
+        fn name(&self) -> &'static str {
+            "BlockingBackend"
+        }
+
+        fn is_connected(&self) -> bool {
+            *self.connected.lock().expect("connected lock poisoned")
+        }
+
+        fn try_connect(&mut self) -> Result<(), VJoyError> {
+            *self.connected.lock().expect("connected lock poisoned") = true;
+            Ok(())
+        }
+
+        fn disconnect(&mut self) {
+            *self.connected.lock().expect("connected lock poisoned") = false;
+        }
+
+        fn update(&mut self, _state: &ProcessedState) -> Result<(), VJoyError> {
+            if !self.is_connected() {
+                return Err(VJoyError::NotConnected);
+            }
+            Self::set_flag(&self.entered);
+            if !Self::wait_flag(&self.release, Duration::from_secs(10)) {
+                return Err(VJoyError::UpdateFailed(1));
+            }
+            Ok(())
+        }
+
+        fn send_neutral(&mut self) -> Result<(), VJoyError> {
+            Ok(())
+        }
+    }
+
     fn test_dir(name: &str) -> PathBuf {
         // Unique per call: tests run in parallel and must never share a
         // store directory (a shared dir races `remove_dir_all` against
@@ -10382,6 +10701,54 @@ mod tests {
         assert_eq!(state.backend_name(), "vJoy", "rate limit held the retry");
     }
 
+    /// PERF F-15: a slow `update()` must not hold the backend slot
+    /// lock. The old `send_engine_output` held `Mutex<Box<...>>`
+    /// across `update()`, so a switch (and every slot read) stalled
+    /// for the whole `HIDMaestro` sidecar round-trip (~200 ms). Here
+    /// a tick is parked inside `update()` while the main thread
+    /// clones the backend handle — the slot lock must be free, so
+    /// the clone returns at once instead of waiting out the update.
+    /// (The switch itself still needs the old instance's lock to
+    /// disconnect it, so it waits for at most one update — it is
+    /// proven below to complete promptly once the update is
+    /// released, and to install the new backend.)
+    #[test]
+    fn slow_update_does_not_hold_the_backend_slot_lock() {
+        let dir = test_dir("blocking-slot");
+        let store = ProfileStore::open(&dir).expect("open test store");
+        let (backend, entered, release) = BlockingBackend::new();
+        let state = Arc::new(AppStateCore::new(
+            store,
+            Box::new(backend),
+            "test blocking backend",
+        ));
+        *lock(&state.output_enabled) = true;
+        let output = PipelineOutputState::neutral();
+        let tick_state = Arc::clone(&state);
+        let tick = std::thread::spawn(move || tick_state.send_engine_output(&output));
+        assert!(
+            BlockingBackend::wait_flag(&entered, Duration::from_secs(5)),
+            "the tick must enter update() before the slot lock is probed"
+        );
+        let start = Instant::now();
+        let _handle = state.backend_handle();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "cloning the backend handle must not wait out the parked update"
+        );
+        BlockingBackend::set_flag(&release);
+        let sent = tick.join().expect("tick thread joins");
+        assert!(
+            sent.is_ok(),
+            "the parked tick still sends on the old instance"
+        );
+        let factories = mock_factories(false, false);
+        state
+            .apply_backend_switch(BackendKind::VJoy, &factories)
+            .expect("switch to vJoy after the update");
+        assert_eq!(state.backend_name(), "RecordingBackend");
+    }
+
     /// Deep-scan Round 2 item 5 (H2 latch): re-selecting a
     /// disconnected `HIDMaestro` whose manager latch is set must
     /// succeed — the re-select rebuilds the installed instance with
@@ -11521,6 +11888,119 @@ mod tests {
         state.rescan_board_port();
         assert_eq!(state.cached_board_port(), None);
         assert_eq!(state.transport_state().address, "");
+    }
+
+    /// PERF F-5: the board-port refresher's cadence — Wi-Fi never
+    /// probes (30 s idle wait), Serial re-probes every 5 s while
+    /// the board is found, and backs off 10 s → 20 s → 30 s while
+    /// it keeps missing.
+    #[test]
+    fn board_port_refresh_delay_backs_off_on_serial_misses() {
+        assert_eq!(
+            AppStateCore::board_port_refresh_delay(false, 0),
+            Duration::from_secs(30),
+            "Wi-Fi never probes: the wait is the backoff cap"
+        );
+        assert_eq!(
+            AppStateCore::board_port_refresh_delay(false, 5),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            AppStateCore::board_port_refresh_delay(true, 0),
+            Duration::from_secs(5),
+            "Serial with a board found: 5 s, as before"
+        );
+        assert_eq!(
+            AppStateCore::board_port_refresh_delay(true, 1),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            AppStateCore::board_port_refresh_delay(true, 2),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            AppStateCore::board_port_refresh_delay(true, 3),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            AppStateCore::board_port_refresh_delay(true, 100),
+            Duration::from_secs(30),
+            "the backoff caps at 30 s, it never grows past it"
+        );
+    }
+
+    /// PERF F-5: on the default Wi-Fi transport the refresher
+    /// thread never touches the serial stack — the cache stays
+    /// untouched (still `None`, not even a probed-`None` entry)
+    /// while the thread is alive and waiting on its condvar.
+    #[test]
+    fn board_port_refresher_never_probes_on_wifi() {
+        let (state, _dir) = test_state();
+        state.start_board_port_refresher();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            lock(&state.cached_serial_port).is_none(),
+            "Wi-Fi: no probe ran, the cache is still untouched"
+        );
+        // A rescan request wakes the thread at once — it probes
+        // once (no board here, so the cache fills with a
+        // probed-`None`) and then goes back to waiting.
+        state.rescan_board_port();
+        assert!(
+            wait_until(Duration::from_secs(2), || lock(&state.cached_serial_port)
+                .is_some()),
+            "a rescan request must wake the refresher promptly"
+        );
+    }
+
+    /// PERF F-5: on Serial the refresher probes promptly (the
+    /// cache fills within 2 s even with no board attached — the
+    /// entry is a probed-`None`, not an untouched cache).
+    #[test]
+    fn board_port_refresher_probes_promptly_on_serial() {
+        let (state, _dir) = test_state();
+        state.set_transport_request(TransportKind::Serial, String::new());
+        state.start_board_port_refresher();
+        assert!(
+            wait_until(Duration::from_secs(2), || lock(&state.cached_serial_port)
+                .is_some()),
+            "Serial: the first probe must run at once, not after a 30 s wait"
+        );
+    }
+
+    /// PERF F-6: the slow-poll generation moves on every mutation
+    /// the slow poll reports, and only on success — a failed
+    /// attempt must not invalidate the daemon's cache for nothing.
+    #[test]
+    fn slow_state_generation_bumps_on_mutation_not_on_failure() {
+        let (state, _dir) = test_state();
+        let first = state
+            .list_profiles()
+            .into_iter()
+            .next()
+            .expect("default profile exists");
+        state
+            .activate_profile(&first.id)
+            .expect("activate default profile");
+        let gen0 = state.slow_state_generation();
+        state.create_profile("Second").expect("create second");
+        assert!(state.slow_state_generation() > gen0);
+        let gen1 = state.slow_state_generation();
+        assert!(
+            state.delete_profile("missing-id").is_err(),
+            "deleting an unknown profile must fail"
+        );
+        assert_eq!(
+            state.slow_state_generation(),
+            gen1,
+            "a failed delete must not bump the generation"
+        );
+        let tuning = TuningSettings::neutral("steering");
+        state.set_tuning(&tuning).expect("set tuning");
+        assert!(state.slow_state_generation() > gen1);
+        let gen2 = state.slow_state_generation();
+        state.set_binding(5, "horn").expect("bind 5");
+        assert!(state.slow_state_generation() > gen2);
     }
 
     /// DS-30: the `Arc` settings cache tracks every writer, and the

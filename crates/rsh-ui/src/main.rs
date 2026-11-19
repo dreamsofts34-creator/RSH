@@ -89,9 +89,10 @@ slint::include_modules!();
 /// Phase 2 (L-1): every `ui_log!` line ALSO goes to the UI log
 /// file (`<data_dir>/logs/rsh-ui-YYYYMMDD.log`, always-on — the
 /// file is the evidence on the user's PC, where there is no
-/// terminal and no `--verbose`). The file write is unconditional
-/// but cheap (one append per key event); tests never init the file
-/// log, so it no-ops there.
+/// terminal and no `--verbose`). Perf (F-7): the file write is
+/// buffered (one held-open handle, flushed every 64 lines / at
+/// exit — see `ui_log.rs`), not one open/write/flush/close per
+/// line; tests never init the file log, so it no-ops there.
 static UI_VERBOSE: AtomicBool = AtomicBool::new(false);
 
 macro_rules! ui_log {
@@ -370,6 +371,10 @@ pub fn led_preview(pattern: LedPattern, brightness: u8, color: Option<u32>) -> V
 /// Cached pedal tuning records (A1/A2): the stored record per pedal
 /// supplies min/max mV, deadzone and the feel exponent, so the page
 /// never shows literals.
+/// Perf (F-4): `Clone + PartialEq` so `push_frame` can snapshot
+/// the pedal state into [`FrameInputs`] and skip a frame whose
+/// inputs did not move.
+#[derive(Clone, PartialEq)]
 struct PedalCache {
     records: [TuningSettings; 3],
     feel_exp: [f32; 3],
@@ -763,9 +768,10 @@ fn content_hash(value: &impl std::hash::Hash) -> u64 {
 }
 
 /// Health-monitor verdicts (B2): the background thread in
-/// [`spawn_health_monitor`] pings the live daemon every second and
-/// re-probes after a death; the frame timer drains these on the UI
-/// thread and applies them — the monitor never touches UI state.
+/// [`spawn_health_monitor`] watches the fast poller's link-dead
+/// flag every second and re-probes after a death; the frame timer
+/// drains these on the UI thread and applies them — the monitor
+/// never touches UI state.
 /// (The shared `Daemon` prefix is the point: every variant is a
 /// daemon-health verdict.)
 #[allow(clippy::enum_variant_names)]
@@ -1640,9 +1646,6 @@ struct Ctx {
     /// timer before `refresh`, taken by the `AfterRendering`
     /// notifier. `None` = no frame in flight / no paint pending.
     frame_paint_pending: Rc<Cell<Option<Instant>>>,
-    /// Verbose logging (DS-79): `--verbose` — live events go to
-    /// stderr only when this is set.
-    verbose: Rc<Cell<bool>>,
     unsaved: Rc<Cell<bool>>,
     notifications: Rc<RefCell<NotificationCenter>>,
     data_dir: Option<PathBuf>,
@@ -1831,6 +1834,57 @@ struct Ctx {
     /// moved. `None` = never built yet.
     diag_buttons_hash: Rc<Cell<Option<u64>>>,
     diag_events_hash: Rc<Cell<Option<u64>>>,
+    /// Last frame's inputs (perf F-4): `push_frame` returns early
+    /// when the current inputs equal these — an idle / disconnected
+    /// frame then costs one cache read + compare instead of ~52
+    /// Slint crossings + 4 history pushes + chart formatting.
+    /// `None` = no frame has run yet (the first frame always runs).
+    last_frame: Rc<RefCell<Option<FrameInputs>>>,
+    /// Startup syncs deferred to the first frame tick (perf F-2):
+    /// `main` sets this; the frame timer runs `refresh_profiles` /
+    /// `refresh_games` / `sync_diag` once and clears it, so the
+    /// window paints before those list/diag syncs run.
+    startup_sync_pending: Rc<Cell<bool>>,
+    /// Notification persistence coalescing (perf F-7): `true` while
+    /// a save is due — the 1 Hz tick flushes at most one disk
+    /// write per second, and `main` flushes once more at exit.
+    notif_save_pending: Rc<Cell<bool>>,
+    /// When the notification file was last written (perf F-7): the
+    /// ≤1 write/s bound for the coalesced save.
+    notif_last_save: Rc<Cell<Option<Instant>>>,
+}
+
+/// Every value a frame is derived from (perf F-4): `push_frame`
+/// compares these with the previous frame's and returns early when
+/// they are identical. Every input `push_frame` — or the capture
+/// sync it gates — reads is in here, so a skipped frame can never
+/// hide a visible change: the polled connection + snapshot, the
+/// local tuning / pedal / handbrake state, the unsaved dot, the
+/// test-flash instants, the raw-mV gate (value + its background
+/// job, whose start/stop flips the Calibrate reason), the pairing
+/// rejoin flag, whether Diagnostics is open (it gates the chart
+/// strings), the output flag, and the live / connecting flags.
+///
+/// The bools are one flat comparison struct on purpose (a single
+/// `==` decides the frame rest) — not a state machine.
+#[derive(Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+struct FrameInputs {
+    conn: ConnectionInfo,
+    snap: SnapshotInfo,
+    tuning: (f32, f32, i32),
+    pedals: PedalCache,
+    handbrake: TuningSettings,
+    unsaved: bool,
+    horn_flash: bool,
+    handbrake_flash: bool,
+    raw_available: bool,
+    raw_job_running: bool,
+    rejoining: bool,
+    diag_open: bool,
+    output_enabled: bool,
+    live: bool,
+    connecting: bool,
 }
 
 /// Whether a 400 ms test flash (Horn Test, handbrake Button-mode
@@ -2074,7 +2128,7 @@ impl Ctx {
     /// — without a live daemon the wheel/pedals read "—"/0 and the
     /// charts stay empty, even though the sim is the active API.
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
-    fn push_frame(&self, win: &MainWindow, tick: u64) {
+    fn push_frame(&self, win: &MainWindow, tick: u64) -> bool {
         let (api, live, connecting) = {
             let state = self.state.borrow();
             (state.api.clone(), state.live, state.connecting)
@@ -2106,6 +2160,51 @@ impl Ctx {
                 conn.state,
                 ConnectionState::Hello | ConnectionState::Authenticating | ConnectionState::Active
             );
+        // DS-67: a rejoining board clears the flag once the session
+        // is Active again — the rejoin is done, the link is back.
+        // This runs BEFORE the frame-rest comparison below: the
+        // clear itself is a visible change (the flag is an input),
+        // so clearing it here can never be skipped away.
+        if active && self.pairing_rejoining.get() {
+            self.pairing_rejoining.set(false);
+            self.pairing_rejoin_since.set(None);
+            win.set_setup_pair_status("Paired — wheel connected.".into());
+        }
+        // Perf (F-4): rest the frame when nothing moved. An idle /
+        // disconnected frame used to re-run ~52 guarded Slint
+        // writes + 4 history pushes every 50 ms even though no
+        // value changed; now it costs one cache read + compare and
+        // returns. Returns `false` when skipped, `true` when the
+        // frame ran — `refresh` gates the capture sync on it (same
+        // inputs, same rest).
+        let diag_open = win.get_diag_open();
+        let inputs = FrameInputs {
+            conn: conn.clone(),
+            snap: snap.clone(),
+            tuning: {
+                let tuning = self.tuning.borrow();
+                (tuning.deadzone_pct, tuning.exponent, tuning.preset)
+            },
+            pedals: self.pedals.borrow().clone(),
+            handbrake: self.handbrake_record.borrow().clone(),
+            unsaved: self.unsaved.get(),
+            horn_flash: test_flash_active(self.horn_test_until.get()),
+            handbrake_flash: test_flash_active(self.handbrake_test_until.get()),
+            raw_available: self.raw_available.get(),
+            raw_job_running: self.busy_jobs.borrow().contains_key(&JobKind::RawAvailable),
+            rejoining: self.pairing_rejoining.get(),
+            diag_open,
+            output_enabled: api.output_enabled(),
+            live,
+            connecting,
+        };
+        {
+            let mut last = self.last_frame.borrow_mut();
+            if last.as_ref() == Some(&inputs) {
+                return false;
+            }
+            *last = Some(inputs);
+        }
         let deadzone;
         let exponent;
         {
@@ -2124,13 +2223,6 @@ impl Ctx {
         // repaints, so a 20 Hz frame that re-sets ~50 props costs a
         // repaint even when nothing moved.
         set_if_changed(win.get_connected(), connected, |v| win.set_connected(v));
-        // DS-67: a rejoining board clears the flag once the session
-        // is Active again — the rejoin is done, the link is back.
-        if active && self.pairing_rejoining.get() {
-            self.pairing_rejoining.set(false);
-            self.pairing_rejoin_since.set(None);
-            win.set_setup_pair_status("Paired — wheel connected.".into());
-        }
         set_if_changed(
             win.get_setup_rejoining(),
             self.pairing_rejoining.get(),
@@ -2404,31 +2496,58 @@ impl Ctx {
                 clutch_hist.pop_front();
             }
             if tick.is_multiple_of(10) {
-                set_if_changed(
-                    win.get_diag_steer_chart(),
-                    chart_commands(&steer_hist, -180.0, 180.0).into(),
-                    |v| win.set_diag_steer_chart(v),
-                );
-                set_if_changed(
-                    win.get_diag_pedals_chart(),
-                    multi_chart_commands(&[&pedal_hist, &brake_hist, &clutch_hist], 0.0, 1.0)
-                        .into(),
-                    |v| win.set_diag_pedals_chart(v),
-                );
-                set_if_changed(
-                    win.get_diag_steer_readout(),
-                    self.frame_cmds.borrow_mut().steer_text(live, steer_deg),
-                    |v| win.set_diag_steer_readout(v),
-                );
-                set_if_changed(
-                    win.get_diag_pedals_readout(),
-                    self.frame_cmds.borrow_mut().pedals_readout(
-                        snap.throttle,
-                        snap.brake,
-                        snap.clutch.unwrap_or(0.0),
-                    ),
-                    |v| win.set_diag_pedals_readout(v),
-                );
+                if diag_open {
+                    // Perf (F-8): the chart strings cost ~800 float
+                    // formats/s — build them only while Diagnostics
+                    // is open. Histories above still push every live
+                    // frame, so opening Diagnostics finds a full
+                    // 10 s trace waiting.
+                    set_if_changed(
+                        win.get_diag_steer_chart(),
+                        chart_commands(&steer_hist, -180.0, 180.0).into(),
+                        |v| win.set_diag_steer_chart(v),
+                    );
+                    set_if_changed(
+                        win.get_diag_pedals_chart(),
+                        multi_chart_commands(&[&pedal_hist, &brake_hist, &clutch_hist], 0.0, 1.0)
+                            .into(),
+                        |v| win.set_diag_pedals_chart(v),
+                    );
+                    set_if_changed(
+                        win.get_diag_steer_readout(),
+                        self.frame_cmds.borrow_mut().steer_text(live, steer_deg),
+                        |v| win.set_diag_steer_readout(v),
+                    );
+                    set_if_changed(
+                        win.get_diag_pedals_readout(),
+                        self.frame_cmds.borrow_mut().pedals_readout(
+                            snap.throttle,
+                            snap.brake,
+                            snap.clutch.unwrap_or(0.0),
+                        ),
+                        |v| win.set_diag_pedals_readout(v),
+                    );
+                } else {
+                    // Diagnostics closed: clear the stale chart once
+                    // (`set_if_changed` no-ops after that) instead
+                    // of formatting it for a hidden page.
+                    set_if_changed(win.get_diag_steer_chart(), "".into(), |v| {
+                        win.set_diag_steer_chart(v);
+                    });
+                    set_if_changed(win.get_diag_pedals_chart(), "".into(), |v| {
+                        win.set_diag_pedals_chart(v);
+                    });
+                    set_if_changed(
+                        win.get_diag_steer_readout(),
+                        self.frame_cmds.borrow_mut().dash(),
+                        |v| win.set_diag_steer_readout(v),
+                    );
+                    set_if_changed(
+                        win.get_diag_pedals_readout(),
+                        self.frame_cmds.borrow_mut().dash(),
+                        |v| win.set_diag_pedals_readout(v),
+                    );
+                }
             }
         } else if tick.is_multiple_of(10) {
             set_if_changed(win.get_diag_steer_chart(), "".into(), |v| {
@@ -2448,13 +2567,18 @@ impl Ctx {
                 |v| win.set_diag_pedals_readout(v),
             );
         }
+        true
     }
 
     fn refresh(&self, win: &MainWindow, tick: u64) {
-        self.push_frame(win, tick);
-        // v2.0.2: capture availability follows the live daemon every
-        // frame (see `sync_capture_availability`).
-        self.sync_capture_availability(win);
+        // Perf (F-4): the capture sync derives from the same inputs
+        // `push_frame` compared — a skipped frame has nothing new
+        // for it either, so rest it too.
+        if self.push_frame(win, tick) {
+            // v2.0.2: capture availability follows the live daemon every
+            // frame (see `sync_capture_availability`).
+            self.sync_capture_availability(win);
+        }
     }
 
     /// Queue a steering push (M-7): slider drags call this per move,
@@ -4087,9 +4211,35 @@ impl Ctx {
         }
     }
 
-    /// Persist the notification center after a mutation (M10).
+    /// Persist the notification center after a mutation (M10) —
+    /// coalesced (perf F-7): a notification storm used to rewrite
+    /// the whole `notifications.json` on the UI thread per
+    /// notification. Now this only marks a save due; the 1 Hz tick
+    /// flushes at most one write per second, and `main` flushes
+    /// once more at exit.
     fn persist_notifications(&self) {
+        self.notif_save_pending.set(true);
+    }
+
+    /// Flush a due coalesced notification save (perf F-7): called
+    /// on the 1 Hz tick and once at exit. No-op when nothing is
+    /// pending, or — unless `force` — when the last save was under
+    /// a second ago (the next tick retries, so bursts still cost at
+    /// most one disk write per second).
+    fn flush_pending_notification_save(&self, force: bool) {
+        if !self.notif_save_pending.get() {
+            return;
+        }
+        if !force {
+            if let Some(last) = self.notif_last_save.get() {
+                if last.elapsed() < Duration::from_secs(1) {
+                    return;
+                }
+            }
+        }
         self.notifications.borrow().save(self.data_dir.as_deref());
+        self.notif_last_save.set(Some(Instant::now()));
+        self.notif_save_pending.set(false);
     }
 
     /// Swap the shared API state to a live daemon connection (the
@@ -5633,30 +5783,41 @@ impl Ctx {
     /// backend without render-notifier support. Split out of
     /// [`Self::sync_diag`] to keep it under the line limit.
     fn sync_diag_frame_times(&self, win: &MainWindow) {
-        // DS-82: frame-time histogram (this UI, last 30 s).
+        // DS-82: frame-time histogram (this UI, last 30 s). Perf
+        // (F-4): change-guarded like the rest of `sync_diag` — the
+        // old unconditional sets marked the props dirty every
+        // second even when the p50/p99 had not moved.
         let (frame_p50, frame_p99) = self.frame_time_p50_p99().unzip();
-        win.set_diag_frame_p50_text(
+        set_if_changed(
+            win.get_diag_frame_p50_text(),
             frame_p50
                 .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
                 .into(),
+            |v| win.set_diag_frame_p50_text(v),
         );
-        win.set_diag_frame_p99_text(
+        set_if_changed(
+            win.get_diag_frame_p99_text(),
             frame_p99
                 .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
                 .into(),
+            |v| win.set_diag_frame_p99_text(v),
         );
         // R2-46: paint-completion p50/p99 (refresh start to
         // `AfterRendering`).
         let (paint_p50, paint_p99) = self.frame_paint_p50_p99().unzip();
-        win.set_diag_paint_p50_text(
+        set_if_changed(
+            win.get_diag_paint_p50_text(),
             paint_p50
                 .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
                 .into(),
+            |v| win.set_diag_paint_p50_text(v),
         );
-        win.set_diag_paint_p99_text(
+        set_if_changed(
+            win.get_diag_paint_p99_text(),
             paint_p99
                 .map_or_else(|| "—".to_string(), |v| format!("{v:.1} ms"))
                 .into(),
+            |v| win.set_diag_paint_p99_text(v),
         );
     }
 
@@ -9166,26 +9327,22 @@ fn wire_actions(win: &MainWindow, ctx: &Rc<Ctx>) {
     }
 }
 
-/// Log one drained push event. Notification events are ALSO fed to
-/// the [`NotificationCenter`] by the timer drain (see `main`); this
-/// function only logs, it never stores.
-/// Log one drained live event (DS-79): to stderr only with
-/// `--verbose`. Without it the UI thread does no `ui_log!` per
-/// event at all — not even the `format!` (the early return skips
-/// it). The daemon already records its side of every event in the
-/// diagnostics log; the UI does not depend on `rsh-app-core`, so
-/// its events have no file sink here.
-fn log_event(verbose: bool, ev: &AppEvent) {
-    if !verbose {
-        return;
-    }
+/// Log one drained push event (DS-79 / F-10): routed through the
+/// buffered `ui_log!` (file log, always-on) instead of an
+/// unbuffered `eprintln!` per event on the UI thread. The macro
+/// still gates the stderr copy on `--verbose`, and `Snapshot`
+/// stays unlogged — it fires at poll rate and is not an event.
+/// Notification events are ALSO fed to the [`NotificationCenter`]
+/// by the timer drain (see `main`); this function only logs, it
+/// never stores.
+fn log_event(ev: &AppEvent) {
     match ev {
         AppEvent::ConnectionChanged {
             state,
             label,
             reason,
         } => {
-            eprintln!(
+            ui_log!(
                 "RSH-UI event ConnectionChanged state={state:?} label={label} reason={reason:?}"
             );
         }
@@ -9194,16 +9351,16 @@ fn log_event(verbose: bool, ev: &AppEvent) {
             seconds_left,
             board_mac,
         } => {
-            eprintln!(
+            ui_log!(
                 "RSH-UI event PairingWindow open={open} seconds_left={seconds_left} board_mac={board_mac:?}"
             );
         }
         AppEvent::PairingFinished { ok, error } => {
-            eprintln!("RSH-UI event PairingFinished ok={ok} error={error:?}");
+            ui_log!("RSH-UI event PairingFinished ok={ok} error={error:?}");
         }
         AppEvent::Snapshot(_) => {}
         AppEvent::Notification { kind, title, body } => {
-            eprintln!("RSH-UI event Notification kind={kind} title={title} body={body}");
+            ui_log!("RSH-UI event Notification kind={kind} title={title} body={body}");
         }
         AppEvent::JobProgress {
             id,
@@ -9211,7 +9368,7 @@ fn log_event(verbose: bool, ev: &AppEvent) {
             progress,
             error,
         } => {
-            eprintln!(
+            ui_log!(
                 "RSH-UI event JobProgress id={id} state={state} progress={progress:?} error={error:?}"
             );
         }
@@ -9414,9 +9571,17 @@ fn send_daemon_fatal_once(
 /// `Rc` state, only the shared link. It exits when the UI drops
 /// the receiver (app quit).
 ///
+/// Perf (F-1) — the 1 Hz probe is folded into the fast poller:
+/// the monitor reads the poller's debounced `link_dead` flag
+/// (`IpcApi::link_dead()`, trips after 3 failed poll rounds)
+/// instead of issuing its own `ping()` IPC round-trip every
+/// second. The flag read costs no IPC; the `PING_DEBOUNCE`
+/// counting below is kept so death is still declared after
+/// ~3 s of a dead link, exactly as before.
+///
 /// F3 (v2.0.3): the respawn is bounded, not a loop —
-/// * death needs [`live_probe::PING_DEBOUNCE`] consecutive failed
-///   pings (~3 s), not one;
+/// * death needs [`live_probe::PING_DEBOUNCE`] consecutive
+///   monitor ticks with the link-dead flag set (~3 s), not one;
 /// * a fresh fatal `daemon-status.json` blocks spawning entirely
 ///   (the daemon died on purpose — show it, don't re-run it);
 /// * spawn attempts back off exponentially (1 s → 5 s → 30 s →
@@ -9445,9 +9610,10 @@ fn spawn_health_monitor(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
                 if let Some(api) = current {
-                    if api.ping() {
-                        failed_pings = 0;
-                    } else {
+                    // Perf (F-1): no separate 1 Hz `ping()` IPC
+                    // round-trip — the fast poller already proves
+                    // the link dead (see `IpcApi::link_dead()`).
+                    if api.link_dead() {
                         failed_pings += 1;
                         if failed_pings >= live_probe::PING_DEBOUNCE {
                             failed_pings = 0;
@@ -9480,6 +9646,8 @@ fn spawn_health_monitor(
                                 }
                             }
                         }
+                    } else {
+                        failed_pings = 0;
                     }
                 } else if let Some(api) = live_probe::try_live_api(data_dir.as_deref()) {
                     // Cheap probe first (no spawn): the daemon may
@@ -9731,7 +9899,7 @@ fn start_frame_timer(
         };
         if let Some(live) = &live_api {
             for ev in live.poll_events() {
-                log_event(ctx.verbose.get(), &ev);
+                log_event(&ev);
                 handle_live_event(&win, &ctx, &ev);
             }
         }
@@ -9745,18 +9913,35 @@ fn start_frame_timer(
             // M-7: queued slider pushes (150 ms debounce) flush here.
             ctx.flush_steering_push(&w);
             ctx.flush_field_push(&w);
+            // Perf (F-2): the startup list/diag syncs were deferred
+            // out of `main` — run them once, on the first visible
+            // frame tick, so the window paints before they run.
+            if ctx.startup_sync_pending.get() {
+                ctx.startup_sync_pending.set(false);
+                ctx.refresh_profiles(&w);
+                ctx.refresh_games(&w);
+                ctx.sync_diag(&w);
+            }
             // DS-82: time the frame's Rust work for the Diagnostics
             // frame-time histogram.
             let frame_started = Instant::now();
-            // R2-46: arm the paint timer — the `AfterRendering`
-            // notifier (registered in `main`) takes this start and
-            // records refresh-to-paint. A tick that paints nothing
-            // leaves no sample; a paint delayed past the next tick
-            // is attributed to the newer start (a small underestimate
-            // on a stalled frame, never an invented sample).
-            ctx.frame_paint_pending.set(Some(frame_started));
-            ctx.refresh(&w, t);
-            ctx.record_frame_time(frame_started.elapsed());
+            // Perf (F-4): not live = no new data can arrive, and the
+            // frame-rest comparison would skip the frame anyway —
+            // run `refresh` at 10 Hz (every 2nd tick) instead of
+            // paying the timer + compare every 50 ms. (Focus-based
+            // throttling is not possible here: Slint 1.18 exposes
+            // no window-focus query on `Window`.)
+            if ctx.is_live() || t.is_multiple_of(2) {
+                // R2-46: arm the paint timer — the `AfterRendering`
+                // notifier (registered in `main`) takes this start and
+                // records refresh-to-paint. A tick that paints nothing
+                // leaves no sample; a paint delayed past the next tick
+                // is attributed to the newer start (a small underestimate
+                // on a stalled frame, never an invented sample).
+                ctx.frame_paint_pending.set(Some(frame_started));
+                ctx.refresh(&w, t);
+                ctx.record_frame_time(frame_started.elapsed());
+            }
             if t.is_multiple_of(20) {
                 // 1 Hz: job timeouts + the `connecting` guard (A9 —
                 // never infinite) + firmware-update poll (H-4) +
@@ -9780,6 +9965,9 @@ fn start_frame_timer(
                 // firmware, …) reach the pages within ~1 s, from
                 // the cache only — no UI-thread IPC.
                 ctx.resync_from_cache(&w);
+                // Perf (F-7): flush a due coalesced notification
+                // save — at most one disk write per second.
+                ctx.flush_pending_notification_save(false);
                 // R2-51: `replacement_required` + the board MAC
                 // reach the wizard's Pair step within ~1 s, from
                 // the cache only — the confirm block must not wait
@@ -10033,7 +10221,6 @@ fn main() -> Result<(), slint::PlatformError> {
         frame_times: Rc::new(RefCell::new(VecDeque::new())),
         frame_paint_times: Rc::new(RefCell::new(VecDeque::new())),
         frame_paint_pending: Rc::new(Cell::new(None)),
-        verbose: Rc::new(Cell::new(args.verbose)),
         unsaved: Rc::new(Cell::new(initial_unsaved)),
         // M10: notifications persist across restarts — the drawer is
         // reloaded from `<data_dir>/notifications.json` here (a
@@ -10093,6 +10280,12 @@ fn main() -> Result<(), slint::PlatformError> {
         led_preview_key: Rc::new(Cell::new((-1, 255, u32::MAX))),
         diag_buttons_hash: Rc::new(Cell::new(None)),
         diag_events_hash: Rc::new(Cell::new(None)),
+        last_frame: Rc::new(RefCell::new(None)),
+        // Perf (F-2): the list/diag syncs run on the first frame
+        // tick, not in `main` before the first paint.
+        startup_sync_pending: Rc::new(Cell::new(true)),
+        notif_save_pending: Rc::new(Cell::new(false)),
+        notif_last_save: Rc::new(Cell::new(None)),
     });
 
     // The health monitor owns the first probe (B4): it starts now,
@@ -10106,6 +10299,11 @@ fn main() -> Result<(), slint::PlatformError> {
     );
 
     let win = MainWindow::new()?;
+    // Perf (F-2): show the window BEFORE the synchronous sync block
+    // below — the first paint no longer waits behind
+    // `refresh_profiles` / `refresh_games` / `sync_diag` (those now
+    // run on the first frame tick instead) or behind `wire_*`.
+    let _ = win.show();
     // R2-46: paint-completion timestamp for the frame histogram.
     // The `AfterRendering` notifier fires once Slint finished
     // painting the frame (before presentation) — the closest
@@ -10117,8 +10315,20 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let paint_times = ctx.frame_paint_times.clone();
         let paint_pending = ctx.frame_paint_pending.clone();
+        // Perf (F-2): the first `AfterRendering` fire is the true
+        // first paint — log it once. (The old "window shown in X
+        // ms" line below fires before `run()` and measures setup,
+        // not paint.)
+        let first_paint_logged = Rc::new(Cell::new(false));
+        let first_paint_t0 = t0;
         if let Err(e) = win.window().set_rendering_notifier(move |state, _api| {
             if matches!(state, slint::RenderingState::AfterRendering) {
+                if !first_paint_logged.get() {
+                    first_paint_logged.set(true);
+                    let ms = first_paint_t0.elapsed().as_millis();
+                    ui_log!("RSH-UI first paint in {ms} ms");
+                    eprintln!("RSH-UI first paint in {ms} ms");
+                }
                 if let Some(started) = paint_pending.take() {
                     let mut times = paint_times.borrow_mut();
                     times.push_back(started.elapsed());
@@ -10219,10 +10429,11 @@ fn main() -> Result<(), slint::PlatformError> {
     ctx.sync_pedals(&win);
     ctx.sync_extras(&win);
     ctx.sync_overview(&win);
-    ctx.refresh_profiles(&win);
-    ctx.refresh_games(&win);
+    // Perf (F-2): `refresh_profiles` / `refresh_games` / `sync_diag`
+    // are deferred to the first frame tick (see
+    // `startup_sync_pending` in the frame timer) — the window
+    // paints before those list/diag syncs run.
     ctx.sync_vjoy(&win);
-    ctx.sync_diag(&win);
     ctx.refresh(&win, 0);
     // No startup pairing seeding here any more (B4): the live API
     // does not exist yet — `reconnect_to_live` seeds the wizard's
@@ -10260,6 +10471,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 ctx_static.drain_jobs(&w);
                 ctx_static.check_job_timeouts(&w);
                 ctx_static.check_connecting_timeout(&w);
+                // Perf (F-7): flush a due coalesced notification save.
+                ctx_static.flush_pending_notification_save(false);
                 // FC2: same 1 Hz safety net as the frame timer —
                 // the daemon-error banner re-derives (change-
                 // detected, so free when nothing changed).
@@ -10281,7 +10494,13 @@ fn main() -> Result<(), slint::PlatformError> {
         start_frame_timer(&win, &ctx, args.quit_after, t0, health_rx);
     }
 
-    win.run()
+    let result = win.run();
+    // Perf (F-7): flush the buffered UI log and any coalesced
+    // notification save still due — the process exits here, so no
+    // 1 Hz tick will do it.
+    crate::ui_log::flush_ui_file_log();
+    ctx.flush_pending_notification_save(true);
+    result
 }
 
 #[cfg(test)]
@@ -10551,6 +10770,65 @@ mod tests {
         assert_eq!(ctx.frame_times.borrow().len(), 600);
         let (p50, _) = ctx.frame_time_p50_p99().expect("measured");
         assert!((p50 - 500.0).abs() < 0.001, "p50 {p50}");
+    }
+
+    /// Perf (F-4): an unchanged frame rests — the second
+    /// `push_frame` with identical inputs returns `false` and the
+    /// frame after that too; a local tuning change wakes it again,
+    /// then it rests once more. (`SimApi` is not live here, so the
+    /// snapshot is the constant default — the disconnected idle
+    /// case the frame rest exists for.)
+    #[test]
+    fn perf_frame_rest_skips_unchanged_frame_and_wakes_on_tuning_change() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("perf frame-rest test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        assert!(ctx.push_frame(&win, 0), "first frame always runs");
+        assert!(!ctx.push_frame(&win, 1), "identical inputs rest the frame");
+        assert!(!ctx.push_frame(&win, 2), "still identical on the next tick");
+        ctx.tuning.borrow_mut().set_deadzone(5.0);
+        assert!(
+            ctx.push_frame(&win, 3),
+            "a local tuning change wakes the frame"
+        );
+        assert!(!ctx.push_frame(&win, 4), "identical again after the change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Perf (F-7): `persist_notifications` coalesces — repeated
+    /// notifies mark one save due but write nothing until the 1 Hz
+    /// flush, and that flush writes at most once per second (a
+    /// second flush inside the window is a no-op); the exit flush
+    /// (`force`) still lands the latest state.
+    #[test]
+    fn perf_notification_save_is_coalesced_to_one_write_per_second() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("perf notif test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        let path = dir.join(crate::notifications::NOTIFICATIONS_FILE);
+        ctx.notify(&win, "Test", "First", "one");
+        ctx.notify(&win, "Test", "Second", "two");
+        assert!(!path.exists(), "coalesced: no disk write before the flush");
+        ctx.flush_pending_notification_save(false);
+        assert!(path.exists(), "the 1 Hz flush writes once");
+        let written = std::fs::read_to_string(&path).expect("read notifications");
+        assert!(written.contains("First"), "first item persisted");
+        assert!(written.contains("Second"), "second item persisted");
+        ctx.notify(&win, "Test", "Third", "three");
+        ctx.flush_pending_notification_save(false);
+        let still = std::fs::read_to_string(&path).expect("read notifications");
+        assert_eq!(
+            still, written,
+            "a flush inside the 1 s window writes nothing"
+        );
+        ctx.flush_pending_notification_save(true);
+        let forced = std::fs::read_to_string(&path).expect("read notifications");
+        assert!(forced.contains("Third"), "the forced exit flush lands it");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -10900,7 +11178,6 @@ mod tests {
             frame_times: Rc::new(RefCell::new(VecDeque::new())),
             frame_paint_times: Rc::new(RefCell::new(VecDeque::new())),
             frame_paint_pending: Rc::new(Cell::new(None)),
-            verbose: Rc::new(Cell::new(false)),
             unsaved: Rc::new(Cell::new(false)),
             notifications: Rc::new(RefCell::new(NotificationCenter::load(Some(&dir)))),
             data_dir: Some(dir.clone()),
@@ -10954,6 +11231,13 @@ mod tests {
             led_preview_key: Rc::new(Cell::new((-1, 255, u32::MAX))),
             diag_buttons_hash: Rc::new(Cell::new(None)),
             diag_events_hash: Rc::new(Cell::new(None)),
+            last_frame: Rc::new(RefCell::new(None)),
+            // Tests drive handlers directly (no frame timer), so
+            // there is no first tick to run the deferred startup
+            // syncs — they stay off here.
+            startup_sync_pending: Rc::new(Cell::new(false)),
+            notif_save_pending: Rc::new(Cell::new(false)),
+            notif_last_save: Rc::new(Cell::new(None)),
         });
         (ctx, dir)
     }

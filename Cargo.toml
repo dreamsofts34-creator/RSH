@@ -93,3 +93,17 @@ pedantic = "warn"
 
 [workspace.lints.rust]
 missing_docs = "warn"
+
+[profile.release]
+# PERF-RESEARCH F-3 (§6 item 1): no release tuning shipped — the
+# release binaries were unstripped (daemon 36,654,936 B + UI
+# 42,330,392 B, ~80 MB installed) with no LTO. strip + fat LTO +
+# a single codegen unit shrink both binaries and speed cold start
+# (less page-in); the cost is slower release/CI builds — the
+# release-build time is measured in the perf-infra report, and the
+# gate's perf step (tools/gate-checks/run-gate.sh) enforces the new
+# sizes. Applies workspace-wide, including the bench profile
+# (bench inherits release), so bench builds pay the LTO cost too.
+strip = true
+lto = "fat"
+codegen-units = 1

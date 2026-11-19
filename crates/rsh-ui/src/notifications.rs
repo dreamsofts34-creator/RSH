@@ -121,7 +121,11 @@ impl NotificationCenter {
     /// Persist the center to `<data_dir>/notifications.json` (M10):
     /// best-effort — a write failure is silently ignored (the drawer
     /// still works in memory; the next save retries). Callers save
-    /// after every mutation (push / mark-all-read / clear).
+    /// after every mutation (push / mark-all-read / clear) — via
+    /// `Ctx::persist_notifications` in `main.rs`, which coalesces
+    /// bursts to at most one disk write per second (perf F-7); this
+    /// method itself still writes immediately (tests + the flush
+    /// path use it directly).
     pub fn save(&self, data_dir: Option<&Path>) {
         let Some(dir) = data_dir else {
             return;

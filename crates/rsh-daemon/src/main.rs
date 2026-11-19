@@ -52,7 +52,9 @@ use rsh_api::{
     TuningSettings, UserError, VjoyStatus,
 };
 use rsh_app_core::diagnostics::{append_startup_log_both, install_panic_hook, log_fatal};
-use rsh_app_core::state::{AppStateCore, BindingAppAction, TransportKind};
+use rsh_app_core::state::{
+    AppStateCore, BindingAppAction, GameInfo, ProfileSummary as CoreProfileSummary, TransportKind,
+};
 #[cfg(unix)]
 use rsh_ipc::serve_listener;
 use rsh_ipc::{IpcServer, socket_path};
@@ -1953,6 +1955,41 @@ fn main() {
     }
 }
 
+/// How often the tray popup re-reads the profile/game lists
+/// while visible (PERF F-9): the 10 Hz tick reuses the cached
+/// lists between refreshes. `list_games()` runs a launcher pid
+/// check + a disk probe per game on every call, so 10×/s was pure
+/// churn for lists that change on user actions (profile switch,
+/// game launch), not on ticks. A change lands in the popup within
+/// 2 s; the live steering/pedal bars still refresh every tick.
+const TRAY_LISTS_REFRESH: Duration = Duration::from_secs(2);
+
+/// How often the tray popup re-reads the persisted UI theme
+/// (PERF F-9): `popup_is_light` reads the `ui-theme` file on
+/// every call, so the 10 Hz tick re-read it 10×/s. A theme change
+/// in Settings repaints the popup within 5 s.
+const TRAY_THEME_REFRESH: Duration = Duration::from_secs(5);
+
+/// Whether the cached tray lists are due for a re-read (PERF
+/// F-9): never fetched, or older than [`TRAY_LISTS_REFRESH`].
+/// Pure, so the cadence is unit-testable without a Slint popup.
+fn tray_lists_stale(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some(at) => now.duration_since(at) >= TRAY_LISTS_REFRESH,
+    }
+}
+
+/// Whether the cached tray theme is due for a re-read (PERF
+/// F-9): never fetched, or older than [`TRAY_THEME_REFRESH`].
+/// Pure, so the cadence is unit-testable without a Slint popup.
+fn tray_theme_stale(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some(at) => now.duration_since(at) >= TRAY_THEME_REFRESH,
+    }
+}
+
 /// The tray popup window + its visibility state. Lives on the Slint
 /// event-loop thread only (`Rc` / `Cell` — never sent anywhere).
 struct PopupHandle {
@@ -1977,6 +2014,27 @@ struct PopupHandle {
     /// properties when the collected data or theme actually moved,
     /// so the 10 Hz timer does not repaint an idle popup.
     refresh_cache: RefCell<PopupRefreshCache>,
+    /// Cached profile/game lists for the refresh gate (PERF F-9):
+    /// `refresh()` re-reads them at most every
+    /// [`TRAY_LISTS_REFRESH`] and reuses them on the other ticks,
+    /// so `list_games()` (pid check + disk probe per game) runs
+    /// 0.5×/s instead of 10×/s while the popup is visible.
+    cached_profiles: RefCell<Vec<CoreProfileSummary>>,
+    cached_games: RefCell<Vec<GameInfo>>,
+    /// When the cached lists were last re-read (`None` = never —
+    /// the first `refresh()` always fetches).
+    lists_fetched_at: Cell<Option<Instant>>,
+    /// Cached theme bool (PERF F-9): re-read at most every
+    /// [`TRAY_THEME_REFRESH`] instead of on every 100 ms tick.
+    theme_light: Cell<bool>,
+    /// When the cached theme was last re-read (`None` = never).
+    theme_fetched_at: Cell<Option<Instant>>,
+    /// Cached popup HWND (PERF F-9): resolved once via the
+    /// `FindWindowW` title lookup, then reused for the whole show
+    /// (validated per tick with `window_exists`, cleared on
+    /// `hide()`), so the 100 ms poll never pays for a global
+    /// window-name search.
+    popup_hwnd: Cell<Option<isize>>,
     /// Show-time activation finished — either the popup became
     /// foreground or the retry window
     /// ([`tray_popup::POPUP_ACTIVATION_TIMEOUT`]) expired. While
@@ -1993,13 +2051,37 @@ impl PopupHandle {
     // so no truncation can occur in practice.
     #[allow(clippy::cast_possible_truncation)]
     fn refresh(&self, api: &DaemonApi) {
-        let profiles = api.state.list_profiles();
-        let games = api.state.list_games();
-        let data = TrayPopupData::collect(api as &dyn AppApi, &profiles, &games);
+        // PERF F-9: the change gate runs BEFORE the expensive
+        // collection. The profile/game lists are re-read at most
+        // every `TRAY_LISTS_REFRESH` and the theme at most every
+        // `TRAY_THEME_REFRESH`; the 10 Hz tick only re-reads the
+        // live snapshot/connection (cheap locks) and reuses the
+        // cached lists. `TrayPopupData::collect` itself is cheap
+        // clones + formats over the cached lists, and the R2-38
+        // `changed()` gate below still skips the property writes
+        // when nothing moved.
+        let now = Instant::now();
+        if tray_lists_stale(self.lists_fetched_at.get(), now) {
+            *self.cached_profiles.borrow_mut() = api.state.list_profiles();
+            *self.cached_games.borrow_mut() = api.state.list_games();
+            self.lists_fetched_at.set(Some(now));
+        }
+        let light = if tray_theme_stale(self.theme_fetched_at.get(), now) {
+            let light = popup_is_light(rsh_app_core::data_dir().as_deref());
+            self.theme_light.set(light);
+            self.theme_fetched_at.set(Some(now));
+            light
+        } else {
+            self.theme_light.get()
+        };
+        let data = {
+            let profiles = self.cached_profiles.borrow();
+            let games = self.cached_games.borrow();
+            TrayPopupData::collect(api as &dyn AppApi, &profiles, &games)
+        };
         // R2-38: skip the property writes (and the repaint) when
         // nothing moved since the last push. The first call always
         // reports a change, so the first show() always pushes.
-        let light = popup_is_light(rsh_app_core::data_dir().as_deref());
         if !self.refresh_cache.borrow_mut().changed(&data, light) {
             return;
         }
@@ -2008,11 +2090,11 @@ impl PopupHandle {
         self.popup.set_connected(data.connected);
         // DS-22: the popup follows the persisted UI theme (the same
         // `<data_dir>/ui-theme` file the main window reads and
-        // writes). Re-read every refresh so a theme change in
-        // Settings repaints the popup on its next show — the file
-        // read is cheap, and the Auto OS sample is cached 60 s
-        // inside `popup_is_light`, so the 10 Hz refresh never
-        // spawns `reg` more than once a minute.
+        // writes). The file is re-read at most every
+        // `TRAY_THEME_REFRESH` (see above), so a theme change in
+        // Settings repaints the popup within 5 s — the Auto OS
+        // sample is cached 60 s inside `popup_is_light`, so the
+        // refresh never spawns `reg` more than once a minute.
         self.popup.set_light_theme(light);
         self.popup.set_send_to_game(data.send_to_game);
         self.popup.set_steer_angle(data.steering_deg as f32);
@@ -2157,7 +2239,29 @@ impl PopupHandle {
         self.visible.set(false);
         self.shown_at.set(None);
         self.popup_rect.set(None);
+        // PERF F-9: the native window is hidden with the popup —
+        // drop the cached HWND so the next show re-resolves it
+        // instead of reusing a possibly destroyed handle.
+        self.popup_hwnd.set(None);
         self.activation_done.set(true);
+    }
+
+    /// The popup's native handle, resolved once per show (PERF
+    /// F-9): the first tick runs the `FindWindowW` title lookup
+    /// and caches the result; later ticks reuse it after a cheap
+    /// `IsWindow` validity check, so the 100 ms poll never pays
+    /// for a global window-name search. `None` on Linux and while
+    /// the native window does not exist yet (Slint creates it
+    /// after `show()` — the tick re-resolves then).
+    fn popup_hwnd_cached(&self) -> Option<isize> {
+        if let Some(hwnd) = self.popup_hwnd.get()
+            && tray_geometry::window_exists(hwnd)
+        {
+            return Some(hwnd);
+        }
+        let hwnd = tray_geometry::popup_hwnd(tray_geometry::POPUP_WINDOW_TITLE);
+        self.popup_hwnd.set(hwnd);
+        hwnd
     }
 
     /// One 100 ms timer tick while the popup is visible (F9).
@@ -2190,8 +2294,11 @@ impl PopupHandle {
                     ),
                 );
             } else if elapsed <= POPUP_ACTIVATION_TIMEOUT {
-                let attempted =
-                    tray_geometry::activate_popup_window(tray_geometry::POPUP_WINDOW_TITLE);
+                // PERF F-9: re-activate through the cached HWND,
+                // not the per-tick title lookup. `None` while the
+                // native window does not exist yet (expected right
+                // after show — Slint creates it asynchronously).
+                let attempted = popup_hwnd.is_some_and(tray_geometry::activate_popup_window_hwnd);
                 if !attempted && !self.activation_note_logged.get() {
                     self.activation_note_logged.set(true);
                     log_line(
@@ -2406,6 +2513,12 @@ fn create_tray(
             poll: RefCell::new(PopupDismissPoll::new(None)),
             popup_rect: Cell::new(None),
             refresh_cache: RefCell::new(PopupRefreshCache::new()),
+            cached_profiles: RefCell::new(Vec::new()),
+            cached_games: RefCell::new(Vec::new()),
+            lists_fetched_at: Cell::new(None),
+            theme_light: Cell::new(false),
+            theme_fetched_at: Cell::new(None),
+            popup_hwnd: Cell::new(None),
             activation_done: Cell::new(true),
             activation_note_logged: Cell::new(false),
         })),
@@ -2491,7 +2604,9 @@ fn create_tray(
                         handle.refresh(&api);
                         if let Some(shown) = handle.shown_at.get() {
                             let foreground_now = tray_geometry::foreground_hwnd();
-                            let hwnd = tray_geometry::popup_hwnd(tray_geometry::POPUP_WINDOW_TITLE);
+                            // PERF F-9: the cached HWND — one
+                            // `FindWindowW` per show, not per tick.
+                            let hwnd = handle.popup_hwnd_cached();
                             if handle.tick(shown, foreground_now, hwnd) {
                                 handle.hide("click-away");
                             }
@@ -3026,5 +3141,41 @@ mod tests {
             "no temp file left behind"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tray_lists_refresh_every_two_seconds_not_every_tick() {
+        // PERF F-9: the popup re-reads the expensive lists at most
+        // every 2 s — never fetched is stale, a fresh fetch is not,
+        // and the boundary is the 2 s cadence, not the 100 ms tick.
+        let now = Instant::now();
+        // `checked_sub`: the test instant is long after boot, so
+        // these never underflow — clippy's unchecked-subtraction
+        // lint still wants the checked form.
+        let ago = |d: Duration| now.checked_sub(d).expect("test instant after boot");
+        assert!(tray_lists_stale(None, now));
+        assert!(!tray_lists_stale(Some(now), now));
+        assert!(!tray_lists_stale(
+            Some(ago(Duration::from_millis(1999))),
+            now
+        ));
+        assert!(tray_lists_stale(Some(ago(Duration::from_secs(2))), now));
+        assert!(tray_lists_stale(Some(ago(Duration::from_secs(30))), now));
+    }
+
+    #[test]
+    fn tray_theme_refresh_every_five_seconds_not_every_tick() {
+        // PERF F-9: the popup re-reads the ui-theme file at most
+        // every 5 s — a theme change still lands within 5 s, while
+        // the 10 Hz tick stops re-reading the file 10×/s.
+        let now = Instant::now();
+        let ago = |d: Duration| now.checked_sub(d).expect("test instant after boot");
+        assert!(tray_theme_stale(None, now));
+        assert!(!tray_theme_stale(Some(now), now));
+        assert!(!tray_theme_stale(
+            Some(ago(Duration::from_millis(4999))),
+            now
+        ));
+        assert!(tray_theme_stale(Some(ago(Duration::from_secs(5))), now));
     }
 }

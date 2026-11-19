@@ -192,18 +192,47 @@ pub fn popup_hwnd(_title: &str) -> Option<isize> {
 /// until a real click-away. Returns `true` when the popup window
 /// was found (activation attempted), `false` on Linux (no Win32)
 /// and while the popup window does not exist yet.
+///
+/// PERF F-9: the title lookup (`FindWindowW`, a global window-name
+/// search) runs only here, once per show / activation attempt.
+/// The 100 ms tick re-activates through
+/// [`activate_popup_window_hwnd`] with the HWND the popup handle
+/// cached at show time, never through this title lookup.
 #[cfg(windows)]
 #[must_use]
 pub fn activate_popup_window(title: &str) -> bool {
+    let Some(hwnd_value) = popup_hwnd(title) else {
+        return false;
+    };
+    activate_popup_window_hwnd(hwnd_value)
+}
+
+/// No popup activation on Linux (no Win32 to ask).
+#[cfg(not(windows))]
+#[must_use]
+pub fn activate_popup_window(_title: &str) -> bool {
+    false
+}
+
+/// Bring the tray popup to the foreground by its cached native
+/// handle (PERF F-9): the same activation as
+/// [`activate_popup_window`], but without the per-tick
+/// `FindWindowW` title lookup — the caller
+/// ([`crate::PopupHandle`]) resolves the HWND once and reuses it
+/// for the whole show. The handle is validated with
+/// [`window_exists`] before use, and the popup handle clears it
+/// on hide, so a destroyed window is re-resolved instead of
+/// reused. Returns `true` when activation was attempted, `false`
+/// on Linux (no Win32).
+#[cfg(windows)]
+#[must_use]
+pub fn activate_popup_window_hwnd(hwnd_value: isize) -> bool {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
         SetWindowPos,
     };
 
-    let Some(hwnd_value) = popup_hwnd(title) else {
-        return false;
-    };
     let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
     let _ = unsafe { SetForegroundWindow(hwnd) };
     let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
@@ -215,7 +244,33 @@ pub fn activate_popup_window(title: &str) -> bool {
 /// No popup activation on Linux (no Win32 to ask).
 #[cfg(not(windows))]
 #[must_use]
-pub fn activate_popup_window(_title: &str) -> bool {
+pub fn activate_popup_window_hwnd(_hwnd: isize) -> bool {
+    false
+}
+
+/// Whether `hwnd_value` still names a live window (PERF F-9).
+/// The popup handle caches its HWND across 100 ms ticks instead
+/// of re-running the `FindWindowW` title lookup; this cheap
+/// handle-table check (`IsWindow`, no global search) is what
+/// catches a destroyed window, so a stale handle is re-resolved
+/// instead of compared against a recycled HWND. `false` on Linux
+/// (no Win32 — the Linux popup path never holds a cached HWND).
+#[cfg(windows)]
+#[must_use]
+pub fn window_exists(hwnd_value: isize) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+    let hwnd = HWND(hwnd_value as *mut std::ffi::c_void);
+    // `IsWindow` takes `Option<HWND>` in this `windows` crate
+    // version (unlike `IsWindowVisible` / `SetForegroundWindow`,
+    // which take a bare `HWND`).
+    unsafe { IsWindow(Some(hwnd)) }.as_bool()
+}
+
+/// No window query on Linux.
+#[cfg(not(windows))]
+#[must_use]
+pub fn window_exists(_hwnd: isize) -> bool {
     false
 }
 

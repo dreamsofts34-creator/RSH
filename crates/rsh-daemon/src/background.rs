@@ -125,6 +125,26 @@
 //! What this module adds is making the kill/throttle *less likely*
 //! in the first place; it does not pretend to survive one.
 //!
+//! # Trade-off (PERF F-13 — disclosed, NOT fixed)
+//!
+//! The mitigations above buy "Windows won't throttle or sleep the
+//! daemon while a game runs" with the opposite side of the same
+//! coin: a process that holds a power request for its whole lifetime
+//! never lets the machine idle-sleep, opts out of power throttling,
+//! and — while a wheel session is Active — runs a step above normal
+//! priority, so by construction it feels heavier than a process
+//! that idles at zero (fan / battery on a laptop). That is the
+//! price of the resilience the user ordered on 2026-11-18 ~18:59
+//! ("OS software ko band na kare jab games chal rahi hon"), and
+//! the guard is REQUIRED on that order: do NOT relax or remove
+//! it, the power request, or the escalation to chase a lighter
+//! feel — a lighter daemon that Windows throttles mid-race is the
+//! failure the guard exists to prevent. The only softening ever
+//! considered — relaxing the power request after N minutes with no
+//! board seen — is deliberately NOT implemented here: it would
+//! need its own user order, because it trades away exactly the
+//! guarantee above.
+//!
 //! # Platform behaviour
 //!
 //! On non-Windows platforms every function is a no-op stub with the
@@ -316,6 +336,12 @@ impl BackgroundGuard {
     /// priority (in case efficiency mode was toggled mid-session).
     /// Idempotent: a second call while already escalated reports
     /// nothing to do. Returns a per-step report.
+    ///
+    /// PERF F-13 trade-off (see the module docs): the above-normal
+    /// class is what keeps the input pipeline scheduled ahead of
+    /// other background work while a game runs — and it is also
+    /// part of why the daemon feels heavy. It stays: the guard is
+    /// required by user order (2026-11-18 ~18:59), do not relax it.
     ///
     /// Wired to the wheel-Active transition in `manager_loop`
     /// (`main.rs`): escalate when the session becomes Active,

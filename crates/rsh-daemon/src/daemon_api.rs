@@ -9,7 +9,7 @@
 //! the session gate is open (C-02).
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rsh_api::connection::ConnectionState as MgrState;
 use rsh_api::errors::{ConnectionError, UserError};
@@ -35,6 +35,50 @@ use rsh_app_core::state::{
 /// latency is ~2.5 s instead of the nominal 2 s.
 const FRAME_FEED_WINDOW: Duration = Duration::from_millis(500);
 
+/// Cadences for the slow-poll static groups (PERF F-6): profiles +
+/// games change on user actions, so 5 s; tunings / modules /
+/// bindings / knobs / draft / calibration change on edits, so 10 s;
+/// the firmware check + vJoy status change on installs / flashes,
+/// so 30 s. A group is also re-read at once when the state's slow
+/// generation moves (see
+/// [`AppStateCore::slow_state_generation`]), so a mutation is
+/// visible on the next poll, never a TTL later.
+const SLOW_GROUP_A_TTL: Duration = Duration::from_secs(5);
+const SLOW_GROUP_B_TTL: Duration = Duration::from_secs(10);
+const SLOW_GROUP_C_TTL: Duration = Duration::from_secs(30);
+
+/// The slow-poll static values (PERF F-6): everything `slow_poll`
+/// reports that only changes on a user action or install — the
+/// expensive half of the 1 Hz poll. Served from the cache in
+/// [`SlowStaticCache`]; the dynamic half (pairing, diag, raw mV,
+/// firmware-update progress) is always read live.
+#[derive(Clone, Default)]
+struct SlowStaticSnapshot {
+    profiles: Vec<ProfileSummary>,
+    games: Vec<GameSummary>,
+    tunings: std::collections::BTreeMap<String, TuningSettings>,
+    modules: std::collections::BTreeMap<String, bool>,
+    bindings: Vec<ButtonBinding>,
+    knobs: [[String; 3]; 2],
+    draft: Option<DraftStatus>,
+    calibration: Option<CalibrationInfo>,
+    firmware_check: Option<FirmwareCheck>,
+    vjoy_status: Option<VjoyStatus>,
+}
+
+/// Cache for the slow-poll static groups (PERF F-6), with one
+/// refresh timestamp per group + the state generation the snapshot
+/// was built at. The lock is never held across a state read (see
+/// [`DaemonApi::slow_static`]).
+#[derive(Default)]
+struct SlowStaticCache {
+    generation: u64,
+    group_a_at: Option<Instant>,
+    group_b_at: Option<Instant>,
+    group_c_at: Option<Instant>,
+    snapshot: SlowStaticSnapshot,
+}
+
 /// The daemon's API handle: shared by the IPC server, the tray
 /// callbacks, and the manager loop.
 pub struct DaemonApi {
@@ -42,6 +86,10 @@ pub struct DaemonApi {
     pub state: Arc<AppStateCore>,
     /// The L1 Connection Manager (driven by the manager loop).
     pub manager: Mutex<ConnectionManager>,
+    /// Cached slow-poll static groups (PERF F-6) — see
+    /// [`DaemonApi::slow_static`]. The lock is never held across a
+    /// state read.
+    slow_cache: Mutex<SlowStaticCache>,
 }
 
 impl DaemonApi {
@@ -51,7 +99,109 @@ impl DaemonApi {
         Arc::new(Self {
             state,
             manager: Mutex::new(ConnectionManager::new()),
+            slow_cache: Mutex::new(SlowStaticCache::default()),
         })
+    }
+
+    /// Static slow-poll groups, served from the cache when fresh
+    /// (PERF F-6): profiles + games (5 s), tunings / modules /
+    /// bindings / knobs / draft / calibration (10 s), firmware
+    /// check + vJoy status (30 s). A group is re-read when its TTL
+    /// expired OR the state's slow generation moved (a mutation —
+    /// profile switch, tuning edit, game launch — is visible on the
+    /// next poll, never a TTL later). The cache lock is never held
+    /// across a state read: staleness is decided under the lock,
+    /// the fresh values are fetched without it, then stored back.
+    /// Concurrent polls may both refetch a stale group — the values
+    /// are idempotent, so the last write wins harmlessly.
+    fn slow_static(&self, generation: u64) -> SlowStaticSnapshot {
+        let now = Instant::now();
+        let (stale_a, stale_b, stale_c) = {
+            let cache = self
+                .slow_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let moved = cache.generation != generation;
+            (
+                moved
+                    || cache
+                        .group_a_at
+                        .is_none_or(|at| now.duration_since(at) >= SLOW_GROUP_A_TTL),
+                moved
+                    || cache
+                        .group_b_at
+                        .is_none_or(|at| now.duration_since(at) >= SLOW_GROUP_B_TTL),
+                moved
+                    || cache
+                        .group_c_at
+                        .is_none_or(|at| now.duration_since(at) >= SLOW_GROUP_C_TTL),
+            )
+        };
+        if !stale_a && !stale_b && !stale_c {
+            return self
+                .slow_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot
+                .clone();
+        }
+        let mut snapshot = self
+            .slow_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot
+            .clone();
+        if stale_a {
+            snapshot.profiles = self.list_profiles();
+            snapshot.games = self.list_games();
+        }
+        if stale_b {
+            let mut tunings = std::collections::BTreeMap::new();
+            for module in [
+                "steering",
+                "throttle",
+                "brake",
+                "clutch",
+                "handbrake",
+                "led",
+                "shifter",
+                "horn",
+            ] {
+                tunings.insert(module.to_string(), self.get_tuning(module));
+            }
+            snapshot.tunings = tunings;
+            let mut modules = std::collections::BTreeMap::new();
+            for module in ["handbrake", "shifter", "horn", "led"] {
+                modules.insert(module.to_string(), self.module_enabled(module));
+            }
+            snapshot.modules = modules;
+            snapshot.bindings = self.list_bindings();
+            snapshot.knobs = self.knob_actions();
+            snapshot.draft = self.draft_status();
+            snapshot.calibration = self.calibration().ok();
+        }
+        if stale_c {
+            snapshot.firmware_check = self.firmware_check().ok();
+            snapshot.vjoy_status = self.vjoy_status().ok();
+        }
+        {
+            let mut cache = self
+                .slow_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if stale_a {
+                cache.group_a_at = Some(now);
+            }
+            if stale_b {
+                cache.group_b_at = Some(now);
+            }
+            if stale_c {
+                cache.group_c_at = Some(now);
+            }
+            cache.generation = generation;
+            cache.snapshot = snapshot.clone();
+        }
+        snapshot
     }
 
     /// Feed one manager event (from the manager loop) and return the
@@ -262,24 +412,25 @@ impl AppApi for DaemonApi {
     /// default field-for-field; if the default gains a field,
     /// update this too (the `SlowPollState` struct literal fails
     /// to compile on a missing field, so drift is caught).
+    ///
+    /// PERF F-6: the poll is split into a cheap 1 Hz half and
+    /// cached static groups ([`DaemonApi::slow_static`]). The
+    /// static half (profiles/games, tunings/modules/bindings/
+    /// knobs/draft/calibration, firmware check/vJoy) is only
+    /// re-read on its TTL or when the state's slow generation
+    /// moves; the dynamic half (pairing, diag, raw mV,
+    /// firmware-update progress) is read live every poll, as
+    /// before. `firmware_version()` stays 1 Hz — one lock +
+    /// format, no I/O — so the version label refreshes right
+    /// after connect; the expensive firmware work (bundled-image
+    /// stat/parse in `firmware_check`) is the cached 30 s group.
+    /// Every field the trait default ships is still shipped; the
+    /// shape is unchanged.
     fn slow_poll(&self) -> SlowPollState {
-        let mut tunings = std::collections::BTreeMap::new();
-        for module in [
-            "steering",
-            "throttle",
-            "brake",
-            "clutch",
-            "handbrake",
-            "led",
-            "shifter",
-            "horn",
-        ] {
-            tunings.insert(module.to_string(), self.get_tuning(module));
-        }
-        let mut modules = std::collections::BTreeMap::new();
-        for module in ["handbrake", "shifter", "horn", "led"] {
-            modules.insert(module.to_string(), self.module_enabled(module));
-        }
+        // One `settings_arc()` clone serves all four settings
+        // fields (the old code cloned the full `AppSettings`
+        // once per getter).
+        let settings = self.state.settings_arc();
         let peeked = self.state.pairing_status_peek();
         let pairing_status = PairingInfo {
             seconds_left: peeked.seconds_left,
@@ -291,28 +442,30 @@ impl AppApi for DaemonApi {
             key_reset_armed: peeked.key_reset_armed,
             attempt_log: self.state.pairing_log_tail_lines(),
         };
+        let generation = self.state.slow_state_generation();
+        let statics = self.slow_static(generation);
         SlowPollState {
             version: self.version(),
             firmware_version: self.firmware_version(),
             backend: self.output_backend(),
-            autostart: self.autostart(),
-            board_address: self.board_address(),
+            autostart: settings.autostart,
+            board_address: settings.esp_ip.clone(),
             diag_stats: self.diag_stats().ok(),
             pairing_status,
-            calibration: self.calibration().ok(),
+            calibration: statics.calibration,
             raw_mv: self.raw_mv().ok(),
-            profiles: self.list_profiles(),
-            games: self.list_games(),
-            firmware_check: self.firmware_check().ok(),
+            profiles: statics.profiles,
+            games: statics.games,
+            firmware_check: statics.firmware_check,
             firmware_update_status: self.firmware_update_status(),
-            vjoy_status: self.vjoy_status().ok(),
-            auto_pause: self.auto_pause(),
-            close_to_tray: self.close_to_tray(),
-            bindings: self.list_bindings(),
-            knobs: self.knob_actions(),
-            draft: self.draft_status(),
-            tunings,
-            modules,
+            vjoy_status: statics.vjoy_status,
+            auto_pause: settings.auto_switch_paused,
+            close_to_tray: settings.close_to_tray,
+            bindings: statics.bindings,
+            knobs: statics.knobs,
+            draft: statics.draft,
+            tunings: statics.tunings,
+            modules: statics.modules,
         }
     }
 
@@ -1373,6 +1526,59 @@ mod tests {
             api.watchdog_tick(),
             rsh_api::ManagerAction::RebuildTransport,
             "a frame 2.1 s old must not feed the watchdog"
+        );
+    }
+
+    /// PERF F-6: two back-to-back polls serve the static groups
+    /// from the cache — every cached field is identical, so the
+    /// expensive getters (profiles/games, tunings/modules,
+    /// firmware check, vJoy) do not re-run every second.
+    #[test]
+    fn slow_poll_serves_static_groups_from_cache() {
+        let (api, _dir) = live_api_named("slow-poll-cache");
+        let first = api.slow_poll();
+        let second = api.slow_poll();
+        assert_eq!(first.profiles, second.profiles);
+        assert_eq!(first.games, second.games);
+        assert_eq!(first.tunings, second.tunings);
+        assert_eq!(first.modules, second.modules);
+        assert_eq!(first.bindings, second.bindings);
+        assert_eq!(first.knobs, second.knobs);
+        assert_eq!(first.draft, second.draft);
+        assert_eq!(first.calibration, second.calibration);
+        assert_eq!(first.firmware_check, second.firmware_check);
+        assert_eq!(first.vjoy_status, second.vjoy_status);
+    }
+
+    /// PERF F-6: a mutation made directly on the state — behind
+    /// the API's back, as the daemon's tray actions do — bumps the
+    /// slow generation, so the next poll re-reads the static
+    /// groups at once instead of waiting out their TTL.
+    #[test]
+    fn slow_poll_reflects_direct_state_mutation_on_next_poll() {
+        let (api, _dir) = live_api_named("slow-poll-generation");
+        let first = api.slow_poll();
+        assert!(
+            !first.profiles.iter().any(|p| p.name == "Cached"),
+            "the new profile must not be there yet"
+        );
+        api.state
+            .create_profile("Cached")
+            .expect("create profile behind the API");
+        let second = api.slow_poll();
+        assert!(
+            second.profiles.iter().any(|p| p.name == "Cached"),
+            "generation bump must refetch profiles despite the 5 s TTL"
+        );
+        let mut tuning = TuningSettings::neutral("steering");
+        tuning.deadzone = 17.5;
+        api.state
+            .set_tuning(&tuning)
+            .expect("set tuning behind the API");
+        let third = api.slow_poll();
+        assert_eq!(
+            third.tunings["steering"].deadzone, 17.5,
+            "generation bump must refetch tunings despite the 10 s TTL"
         );
     }
 }

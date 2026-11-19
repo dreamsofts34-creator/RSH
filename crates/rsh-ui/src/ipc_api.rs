@@ -214,6 +214,20 @@ const SLOW_FALLBACK_BUDGET: Duration = Duration::from_secs(2);
 /// out the whole budget.
 const SLOW_FALLBACK_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
+/// Item 3c (perf-infra, PERF-RESEARCH §6 item 3): consecutive
+/// slow cycles whose content hash is unchanged before the poller
+/// parks at the 5 s cadence (see [`slow_park_steps`]). 3 matches the
+/// "3 strikes" motif elsewhere (`LINK_DEAD_AFTER_FAILURES`,
+/// `SLOW_FALLBACK_MAX_CONSECUTIVE_FAILURES`) — ~3 s of stability
+/// proves the slow values are idle, and a change (or a write)
+/// returns to 1 Hz at once.
+const SLOW_PARK_AFTER_UNCHANGED_CYCLES: u32 = 3;
+
+/// Item 3c: wait steps (x 50 ms) between slow cycles — 20 = 1 s
+/// while the content changes, 100 = 5 s once parked.
+const SLOW_PERIOD_STEPS: u32 = 20;
+const SLOW_PARKED_PERIOD_STEPS: u32 = 100;
+
 /// DS-19: how the fast poller updates `link_dead` after one round.
 /// `failures` is the consecutive-failure count BEFORE this round.
 /// Returns `(link_dead, failures_after)`: a success clears the
@@ -233,6 +247,41 @@ fn link_dead_after_round(ok: bool, failures: u32, long_call_in_flight: bool) -> 
     }
 }
 
+/// Item 3c (perf-infra): how many 50 ms wait steps the slow
+/// poller takes before its next cycle — 1 s while the slow
+/// content is changing, 5 s once it has been unchanged for
+/// [`SLOW_PARK_AFTER_UNCHANGED_CYCLES`] cycles. (Pure, so the
+/// park decision is unit-testable without a runtime — same
+/// pattern as [`link_dead_after_round`].)
+fn slow_park_steps(unchanged_cycles: u32) -> u32 {
+    if unchanged_cycles >= SLOW_PARK_AFTER_UNCHANGED_CYCLES {
+        SLOW_PARKED_PERIOD_STEPS
+    } else {
+        SLOW_PERIOD_STEPS
+    }
+}
+
+/// Item 3c: the unchanged-cycle count after one slow cycle.
+/// Returns `(unchanged_after)`: a generation bump (content
+/// actually changed — R2-11) resets to 0, so the next wait is
+/// 1 Hz again at once; a cycle that ran while the link was dead
+/// also resets to 0 — `refresh_slow` bailed early, so the
+/// unchanged generation is no evidence of stable content, and
+/// parking would delay the post-recovery refill by up to 5 s;
+/// anything else counts one more stable cycle. (Pure — see
+/// [`slow_park_steps`].)
+fn slow_unchanged_after_cycle(
+    generation_changed: bool,
+    link_dead: bool,
+    unchanged_cycles: u32,
+) -> u32 {
+    if generation_changed || link_dead {
+        0
+    } else {
+        unchanged_cycles.saturating_add(1)
+    }
+}
+
 /// DS-19: clears `LiveCache::long_call_in_flight` on drop, so a
 /// cancelled or panicking long call cannot freeze the poller's
 /// failure counter forever.
@@ -247,6 +296,24 @@ impl Drop for LongCallGuard<'_> {
             .store(false, Ordering::Relaxed);
     }
 }
+
+/// F-11 (perf-infra, PERF-RESEARCH §6 item 7): job-lane A
+/// methods — the tuning/draft write class. `set_tuning` (slider
+/// pushes; the daemon persists the record), `save_draft`,
+/// `discard_draft` and `set_module_enabled` can each hold a
+/// connection's single-flight lock up to the 500 ms call bound,
+/// and they are order-sensitive with each other (a save must not
+/// overtake an in-flight tuning push, or the saved draft misses
+/// it). They share lane A (`client`); every other job call runs
+/// on lane B (`job2_client`), so a slow save can no longer stall
+/// an unrelated job behind it. The poller lanes (fast/slow) and
+/// the long-call lane are untouched.
+const JOB_LANE_A_METHODS: &[&str] = &[
+    "set_tuning",
+    "save_draft",
+    "discard_draft",
+    "set_module_enabled",
+];
 
 /// Open a second IPC connection for one background lane (DS-80,
 /// R2-22): the fast poller, the slow poller and the long-call
@@ -341,6 +408,14 @@ pub struct IpcApi {
     /// when the daemon accepts only one connection (see
     /// [`probe_lane_client`]).
     long_client: Arc<IpcClient>,
+    /// F-11 (perf-infra): the second job lane — every
+    /// [`call_async`](Self::call_async) call whose method is NOT
+    /// in [`JOB_LANE_A_METHODS`] runs here, so a slow
+    /// `set_tuning`/save on the main job client can no longer
+    /// stall an unrelated job behind the single-flight lock.
+    /// Falls back to `client` when the daemon accepts only one
+    /// connection (see [`probe_lane_client`]).
+    job2_client: Arc<IpcClient>,
     rt: tokio::runtime::Runtime,
     cache: Arc<LiveCache>,
 }
@@ -379,10 +454,14 @@ impl IpcApi {
         let poll_client = probe_lane_client(&rt, path, &client);
         let slow_client = probe_lane_client(&rt, path, &client);
         let long_client = probe_lane_client(&rt, path, &client);
+        // F-11 (perf-infra): the second job lane — same probe +
+        // fallback as the other lanes.
+        let job2_client = probe_lane_client(&rt, path, &client);
         let cache = Arc::new(LiveCache::default());
         let api = Arc::new(Self {
             client: client.clone(),
             long_client,
+            job2_client,
             rt,
             cache: cache.clone(),
         });
@@ -450,22 +529,43 @@ impl IpcApi {
             // skipped cycle instead of a ~15 s stall). A first
             // pass runs at once, so the cache is warm ~50 ms after
             // connect on a healthy daemon; later passes wait out
-            // the 1 s period in 50 ms steps and run early when a
-            // write asked for a refresh. The poller runs on its
-            // OWN connection (R2-22): a 75 s backend switch on the
-            // job lane can no longer stall it, and a stalled slow
-            // cycle can no longer delay a `set_tuning` job.
+            // the period (1 s, or 5 s once parked — item 3c) in
+            // 50 ms steps and run early when a write asked for a
+            // refresh. The poller runs on its OWN connection
+            // (R2-22): a 75 s backend switch on the job lane can
+            // no longer stall it, and a stalled slow cycle can no
+            // longer delay a `set_tuning` job.
             let slow_cache = cache;
             api.rt.spawn(async move {
                 refresh_slow(&slow_client, &slow_cache).await;
+                // Item 3c (perf-infra): park the cadence when
+                // the slow content is stable — 3 unchanged
+                // cycles (~3 s) move the wait from 1 s to 5 s,
+                // and any generation bump returns to 1 Hz at
+                // once. The wait still steps in 50 ms slices and
+                // checks `refresh_requested` every step, so a
+                // write pulling the next cycle forward lands just
+                // as fast while parked as at 1 Hz — parking only
+                // skips idle daemon round-trips, never a
+                // write-triggered refresh. The link-dead case
+                // never parks (see `slow_unchanged_after_cycle`).
+                let mut unchanged_cycles: u32 = 0;
                 loop {
-                    for _ in 0..20 {
+                    for _ in 0..slow_park_steps(unchanged_cycles) {
                         if slow_cache.refresh_requested.swap(false, Ordering::Relaxed) {
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
+                    let generation_before = slow_cache.generation.load(Ordering::Relaxed);
                     refresh_slow(&slow_client, &slow_cache).await;
+                    let generation_changed =
+                        slow_cache.generation.load(Ordering::Relaxed) != generation_before;
+                    unchanged_cycles = slow_unchanged_after_cycle(
+                        generation_changed,
+                        slow_cache.link_dead.load(Ordering::Relaxed),
+                        unchanged_cycles,
+                    );
                 }
             });
         }
@@ -478,6 +578,14 @@ impl IpcApi {
     /// (see [`IpcClient::call`]). Async so the existing `block_on`
     /// call sites only change the callee; [`IpcApi::ping`] bypasses
     /// it on purpose (the health monitor needs a real attempt).
+    ///
+    /// F-11 (perf-infra): two job lanes — methods in
+    /// [`JOB_LANE_A_METHODS`] (the tuning/draft writes) run on the
+    /// main job client, everything else on `job2_client`, so a
+    /// slow save no longer stalls an unrelated job behind the
+    /// single-flight lock. On a single-connection daemon both
+    /// lanes are the same client (probe fallback), so behaviour
+    /// is unchanged there.
     async fn call_async(
         &self,
         method: &str,
@@ -486,7 +594,12 @@ impl IpcApi {
         if self.cache.link_dead.load(Ordering::Relaxed) {
             return Err(IpcError::Closed);
         }
-        self.client.call(method, params).await
+        let lane = if JOB_LANE_A_METHODS.contains(&method) {
+            &self.client
+        } else {
+            &self.job2_client
+        };
+        lane.call(method, params).await
     }
 
     /// [`call_async`] with an explicit bound (B-2, v2.0.2): the
@@ -622,6 +735,20 @@ impl IpcApi {
     #[must_use]
     pub fn slow_filled(&self) -> bool {
         self.cache.slow_filled.load(Ordering::Relaxed)
+    }
+
+    /// Whether the fast poller has proven the link dead (DS-19):
+    /// true after [`LINK_DEAD_AFTER_FAILURES`] consecutive failed
+    /// `poll` rounds, cleared by the next good round. This is the
+    /// fast poller's failure signal, exposed for the UI's health
+    /// monitor (WS-UI merge) — `call_async` already fails fast on
+    /// it, but no `AppApi` method exposed it, so the UI could not
+    /// read the signal itself. Read-only: no behaviour change,
+    /// no poller code touched. Called by `spawn_health_monitor`
+    /// (perf F-1 merge) instead of a separate 1 Hz `ping()`.
+    #[must_use]
+    pub fn link_dead(&self) -> bool {
+        self.cache.link_dead.load(Ordering::Relaxed)
     }
 
     /// Current slow-cache generation (F5): bumps at the end of a
@@ -2390,6 +2517,35 @@ mod tests {
         // ... and a success during a long call still clears.
         assert_eq!(link_dead_after_round(true, 2, true), (false, 0));
     }
+
+    /// Item 3c (perf-infra): the park decision — 1 s steps while
+    /// the slow content changes, 5 s steps after 3 unchanged
+    /// cycles; a change or a dead link resets the count at once.
+    #[test]
+    fn slow_park_decision() {
+        // Changing content never parks, however long it runs.
+        assert_eq!(slow_park_steps(0), SLOW_PERIOD_STEPS);
+        assert_eq!(slow_unchanged_after_cycle(true, false, 2), 0);
+        assert_eq!(slow_unchanged_after_cycle(true, false, 10), 0);
+        // One or two stable cycles: still 1 s, counting up.
+        assert_eq!(slow_park_steps(1), SLOW_PERIOD_STEPS);
+        assert_eq!(slow_unchanged_after_cycle(false, false, 0), 1);
+        assert_eq!(slow_unchanged_after_cycle(false, false, 1), 2);
+        assert_eq!(slow_park_steps(2), SLOW_PERIOD_STEPS);
+        // The third stable cycle parks the next wait at 5 s.
+        assert_eq!(slow_unchanged_after_cycle(false, false, 2), 3);
+        assert_eq!(slow_park_steps(3), SLOW_PARKED_PERIOD_STEPS);
+        assert_eq!(slow_park_steps(4), SLOW_PARKED_PERIOD_STEPS);
+        // A change after parking returns to 1 Hz at once.
+        assert_eq!(slow_unchanged_after_cycle(true, false, 3), 0);
+        assert_eq!(slow_park_steps(0), SLOW_PERIOD_STEPS);
+        // A cycle that ran while the link was dead never counts
+        // toward parking — and never parks on a dead link.
+        assert_eq!(slow_unchanged_after_cycle(false, true, 2), 0);
+        assert_eq!(slow_unchanged_after_cycle(false, true, 10), 0);
+        // Saturating: the count cannot wrap.
+        assert_eq!(slow_unchanged_after_cycle(false, false, u32::MAX), u32::MAX);
+    }
     // DS-07 (deep-scan FC-06/CI-01): the only use of PathBuf in this
     // test module is inside the #[cfg(unix)] fn live_client below, so
     // the import is unused on Windows and fails clippy-windows with
@@ -2718,6 +2874,251 @@ mod tests {
         assert!(client.draft_status().is_some_and(|s| s.dirty));
         assert!(client.save_draft().expect("save"));
         assert!(client.draft_status().is_none());
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F-11 (perf-infra): a slow lane-A job (`set_tuning`, 400 ms
+    /// on the daemon) must not stall a job on lane B. The slow
+    /// `set_tuning` runs on a background thread; once the stub
+    /// signals it entered the call, a lane-B job (`backup_now`)
+    /// must return in well under the tuning's 400 ms — on one
+    /// shared client it would queue behind the tuning and take
+    /// ~400 ms. The server is multi-accept (`serve_listener`) on
+    /// a multi-thread runtime, so the stub's blocking sleep stalls
+    /// only its own worker, and the lane probes in
+    /// [`IpcApi::connect`] all succeed (no fallback to the shared
+    /// client — on a single-accept server the lanes would collapse
+    /// and this test would fail, by design).
+    #[cfg(unix)]
+    struct SlowTuningApi {
+        entered: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(unix)]
+    impl AppApi for SlowTuningApi {
+        fn version(&self) -> String {
+            "test".to_string()
+        }
+
+        fn connection(&self) -> rsh_api::ConnectionInfo {
+            rsh_api::ConnectionInfo {
+                state: ConnectionState::Idle,
+                label: "Disconnected".to_string(),
+                transport: ApiTransport::Wifi,
+                address: String::new(),
+                session_active: false,
+                error: None,
+                hint: None,
+            }
+        }
+
+        fn connect(
+            &self,
+            _transport: ApiTransport,
+        ) -> Result<rsh_api::ConnectionInfo, rsh_api::UserError> {
+            Ok(self.connection())
+        }
+
+        fn disconnect(&self) -> Result<rsh_api::ConnectionInfo, rsh_api::UserError> {
+            Ok(self.connection())
+        }
+
+        fn pairing_status(&self) -> rsh_api::PairingInfo {
+            rsh_api::PairingInfo {
+                seconds_left: 0,
+                password: None,
+                error: None,
+                error_detail: None,
+                board_mac: None,
+                replacement_required: false,
+                key_reset_armed: false,
+                attempt_log: Vec::new(),
+            }
+        }
+
+        fn begin_pairing(&self) -> Result<rsh_api::PairingInfo, rsh_api::UserError> {
+            Ok(self.pairing_status())
+        }
+
+        fn snapshot(&self) -> rsh_api::SnapshotInfo {
+            rsh_api::SnapshotInfo::default()
+        }
+
+        fn output_enabled(&self) -> bool {
+            false
+        }
+
+        fn set_output_enabled(&self, _enabled: bool) {}
+
+        fn get_tuning(&self, module: &str) -> TuningSettings {
+            TuningSettings::neutral(module)
+        }
+
+        fn set_tuning(
+            &self,
+            tuning: &TuningSettings,
+        ) -> Result<TuningSettings, rsh_api::UserError> {
+            // Signal entry first, then stall: the test's lane-B
+            // call must land while this call is still in flight.
+            // 400 ms stays under the 500 ms IPC call bound, so
+            // the tuning itself still succeeds.
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(400));
+            Ok(tuning.clone())
+        }
+
+        fn draft_status(&self) -> Option<rsh_api::DraftStatus> {
+            None
+        }
+
+        fn save_draft(&self) -> Result<bool, rsh_api::UserError> {
+            Ok(false)
+        }
+
+        fn discard_draft(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn slow_tuning_job_does_not_stall_other_job_lane() {
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-job-lane-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let socket = rsh_ipc::socket_path(&dir);
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let api: Arc<dyn AppApi> = Arc::new(SlowTuningApi {
+            entered: entered.clone(),
+        });
+        let (tx, _rx) = broadcast::channel(64);
+        let server = Arc::new(IpcServer::new(api, tx));
+        let socket_for_thread = socket.clone();
+        // Detached server thread (capture-test precedent): it
+        // serves until the test process exits. Multi-thread
+        // runtime, so the stub's blocking 400 ms sleep stalls
+        // only its own worker, not the other lanes.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&socket_for_thread).expect("bind socket");
+                rsh_ipc::serve_listener(server, listener).await;
+            });
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(socket.exists(), "server did not bind its socket");
+        let client = IpcApi::connect(&socket).expect("connect");
+        assert!(client.ping());
+        // Lane A and lane B must be distinct connections here —
+        // if every probe had fallen back to the shared client,
+        // the timing assertion below could not pass.
+        let mut upd = TuningSettings::neutral("brake");
+        upd.deadzone = 7.0;
+        let tuning_client = client.clone();
+        let started = std::time::Instant::now();
+        let tuning_handle = std::thread::spawn(move || tuning_client.set_tuning(&upd));
+        // Wait until the slow tuning is actually in flight on the
+        // daemon before issuing the lane-B call.
+        for _ in 0..100 {
+            if entered.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+            "slow set_tuning never started on the daemon"
+        );
+        // Lane-B job: `backup_now` is a default-Err on the stub,
+        // which is fine — the test measures that the call
+        // RETURNS promptly, not that it succeeds.
+        let lane_b_start = std::time::Instant::now();
+        let _ = client.backup_now();
+        let lane_b_elapsed = lane_b_start.elapsed();
+        assert!(
+            lane_b_elapsed < Duration::from_millis(250),
+            "lane-B job took {lane_b_elapsed:?} while a slow set_tuning was in flight — the lanes are not separate"
+        );
+        let stored = tuning_handle
+            .join()
+            .expect("tuning thread")
+            .expect("slow set_tuning still succeeds");
+        assert_eq!(stored.deadzone, 7.0);
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "the tuning was not actually slow — the test proved nothing"
+        );
+        drop(client);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Item 3c (perf-infra): once the slow content has been
+    /// stable long enough to park (~3 s), a write that pulls the
+    /// next cycle forward still lands at once — the parked 5 s
+    /// wait must not delay a write-triggered refresh. Waits for
+    /// the cache to fill, sleeps past the 3 unchanged cycles
+    /// (`SimApi`'s slow values never change on their own), then
+    /// dirties a tuning and discards the draft (which requests
+    /// a refresh) and requires the generation bump within 2 s —
+    /// without the early break it would take up to 5 s.
+    #[test]
+    #[cfg(unix)]
+    fn parked_slow_poller_still_refreshes_early_on_write() {
+        let (client, dir, handle, _guard) = live_client();
+        assert!(
+            wait_for(&client, IpcApi::slow_filled),
+            "slow cache should fill"
+        );
+        // Settle: the first bump can land just after `slow_filled`
+        // is observed (fill is stored before the bump), so record
+        // the generation only once it is quiet.
+        std::thread::sleep(Duration::from_millis(500));
+        let generation = client.slow_generation();
+        // 3 unchanged cycles (~3 s) park the poller; sleep past
+        // them with margin. The SimApi slow values are static, so
+        // no cycle bumps in the meantime.
+        std::thread::sleep(Duration::from_millis(4000));
+        assert_eq!(
+            client.slow_generation(),
+            generation,
+            "stable slow content must not bump while parked"
+        );
+        let mut upd = TuningSettings::neutral("steering");
+        upd.deadzone = 9.0;
+        client.set_tuning(&upd).expect("set_tuning");
+        assert!(client.discard_draft(), "discard must report a draft");
+        let started = std::time::Instant::now();
+        let mut waited = 0;
+        while client.slow_generation() == generation && waited < 40 {
+            std::thread::sleep(Duration::from_millis(50));
+            waited += 1;
+        }
+        assert_ne!(
+            client.slow_generation(),
+            generation,
+            "a write must pull the parked slow cycle forward (took {:?})",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "parked refresh took {:?} — the early break did not fire",
+            started.elapsed()
+        );
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);

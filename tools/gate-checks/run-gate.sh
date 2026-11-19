@@ -22,6 +22,16 @@
 #      port_conflict.rs, Unix-only bind in the fake daemon) slipped
 #      through a green local gate. Runs in the DEFAULT path, not
 #      only --full, for exactly that reason.
+#   7. perf-gate (PERF-RESEARCH §6 item 9): startup-time + RSS
+#      gate on the RELEASE binaries — binary sizes vs thresholds,
+#      `rsh-daemon --check` wall time vs threshold (enforcing),
+#      daemon peak RSS + headless UI launch probe (record-only:
+#      RSS needs python3 `resource` on Linux and is skipped
+#      elsewhere; UI startup timing headless is not robust enough
+#      to enforce). If the release binaries are absent — the gate
+#      builds debug binaries only — the whole step is record-only
+#      and passes with a note; the release workflow builds the
+#      release binaries first, so the step enforces there.
 #
 # Usage:
 #   tools/gate-checks/run-gate.sh [--full] [--out DIR]
@@ -179,6 +189,115 @@ windows_check() {
 run_step windows-check windows_check
 run_step rig-gate cargo run -q -p rsh-rig -- --gate --out "$OUT/rig"
 run_step ui-gate cargo run -q -p rsh-gate-ui
+
+# PERF-RESEARCH §6 item 9 (perf-infra): startup-time + RSS gate.
+# Enforcing (release binaries present): release binary sizes and
+# `rsh-daemon --check` wall time. Record-only (numbers printed,
+# never fail): daemon peak RSS and a headless UI launch probe.
+# Record-only when the release binaries are absent: the gate builds
+# debug binaries only (see `build-lifecycle`); the release workflow
+# builds release binaries first, so this step enforces there.
+# Robustness: every missing tool/binary degrades to record-only
+# with a note — the step never fails for a missing binary, a
+# missing python3, or a missing Xvfb. Thresholds are the measured
+# post-[profile.release] sizes x 1.25, rounded up to whole MB
+# (perf-infra report, 2026-11-19: daemon 22,041,536 B = 21.02 MB
+# -> 27 MB; UI 27,879,904 B = 26.59 MB -> 34 MB; daemon --check
+# 7 ms warm / 32 ms cold, peak RSS 17,748 KB); the --check bound
+# is a tripwire, not a tuned number (Round-1 warm --check was
+# 7.8 ms, first-ever 214 ms — 5000 ms leaves an order of
+# magnitude of headroom).
+perf_gate() {
+    local daemon_bin="$ROOT/target/release/rsh-daemon"
+    local ui_bin="$ROOT/target/release/rsh-ui"
+    local daemon_size_max_mb=27
+    local ui_size_max_mb=34
+    local daemon_check_max_ms=5000
+
+    if [ ! -x "$daemon_bin" ] || [ ! -x "$ui_bin" ]; then
+        echo "perf-gate: record-only — release binaries not present"
+        echo "  (run 'cargo build --release -p rsh-daemon -p rsh-ui' first;"
+        echo "   the gate itself builds debug binaries only)"
+        return 0
+    fi
+
+    # Binary sizes (enforcing).
+    local daemon_bytes ui_bytes daemon_mb ui_mb
+    daemon_bytes=$(wc -c <"$daemon_bin" | tr -d ' ')
+    ui_bytes=$(wc -c <"$ui_bin" | tr -d ' ')
+    daemon_mb=$(( (daemon_bytes + 1048575) / 1048576 ))
+    ui_mb=$(( (ui_bytes + 1048575) / 1048576 ))
+    echo "perf-gate: rsh-daemon $daemon_bytes B (${daemon_mb} MB, max ${daemon_size_max_mb} MB)"
+    echo "perf-gate: rsh-ui $ui_bytes B (${ui_mb} MB, max ${ui_size_max_mb} MB)"
+    if [ "$daemon_mb" -gt "$daemon_size_max_mb" ]; then
+        echo "ERROR: rsh-daemon ${daemon_mb} MB exceeds ${daemon_size_max_mb} MB" >&2
+        return 1
+    fi
+    if [ "$ui_mb" -gt "$ui_size_max_mb" ]; then
+        echo "ERROR: rsh-ui ${ui_mb} MB exceeds ${ui_size_max_mb} MB" >&2
+        return 1
+    fi
+
+    # Daemon startup: --check starts the runtime + IPC, verifies
+    # a ping round-trip, and exits 0 (enforcing: wall time).
+    local start_ms end_ms check_ms
+    start_ms=$(date +%s%N | cut -c1-13)
+    if ! "$daemon_bin" --check >"$OUT/perf-daemon-check.log" 2>&1; then
+        echo "ERROR: rsh-daemon --check failed (see $OUT/perf-daemon-check.log)" >&2
+        return 1
+    fi
+    end_ms=$(date +%s%N | cut -c1-13)
+    check_ms=$((end_ms - start_ms))
+    echo "perf-gate: rsh-daemon --check ${check_ms} ms (max ${daemon_check_max_ms} ms)"
+    if [ "$check_ms" -gt "$daemon_check_max_ms" ]; then
+        echo "ERROR: rsh-daemon --check ${check_ms} ms exceeds ${daemon_check_max_ms} ms" >&2
+        return 1
+    fi
+
+    # Daemon peak RSS (record-only): python3 `resource` reports
+    # the waited child's ru_maxrss exactly — /usr/bin/time is not
+    # installed on this sandbox, and polling /proc would miss a
+    # sub-second peak. Skipped (with a note) where python3 or the
+    # resource module is unavailable (e.g. Windows CI).
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$daemon_bin" <<'PYEOF' || echo "perf-gate: RSS probe unavailable (record-only, skipped)"
+import resource
+import subprocess
+import sys
+proc = subprocess.run([sys.argv[1], "--check"], capture_output=True)
+rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+unit = "KB (Linux)"
+print(f"perf-gate: rsh-daemon --check peak RSS {rss} {unit} (record-only)")
+PYEOF
+    else
+        echo "perf-gate: python3 not found — RSS probe skipped (record-only)"
+    fi
+
+    # Headless UI launch probe (record-only): under Xvfb the
+    # release UI must stay up until the timeout kills it (exit
+    # 124); an instant exit with an error is printed but never
+    # fails the gate — first-paint timing headless (llvmpipe) is
+    # not comparable to a Windows GPU run.
+    if command -v xvfb-run >/dev/null 2>&1; then
+        local ui_start ui_end ui_ms ui_rc
+        ui_start=$(date +%s%N | cut -c1-13)
+        # No `set -e` in this script: a non-zero timeout exit
+        # code cannot abort the gate; it is captured in ui_rc.
+        timeout 20 xvfb-run -a "$ui_bin" >"$OUT/perf-ui-launch.log" 2>&1
+        ui_rc=$?
+        ui_end=$(date +%s%N | cut -c1-13)
+        ui_ms=$((ui_end - ui_start))
+        if [ "$ui_rc" -eq 124 ]; then
+            echo "perf-gate: rsh-ui stayed up under Xvfb until the 20 s probe timeout (record-only)"
+        else
+            echo "perf-gate: rsh-ui exited rc=$ui_rc after ${ui_ms} ms (record-only; see $OUT/perf-ui-launch.log)"
+        fi
+    else
+        echo "perf-gate: xvfb-run not found — UI launch probe skipped (record-only)"
+    fi
+    return 0
+}
+run_step perf-gate perf_gate
 
 if [ "$FULL" -eq 1 ]; then
     run_step clippy-workspace cargo clippy --workspace --exclude rsh-app --all-targets -- -D warnings
