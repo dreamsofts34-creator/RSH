@@ -216,6 +216,12 @@ pub struct SlowPollState {
     /// Calibration, when a board session is live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration: Option<CalibrationInfo>,
+    /// Latest raw ADC readings in mV, when the daemon can report
+    /// them (R2-16: the Advanced-mode live readouts — steering /
+    /// pedal raw values at the ~1 Hz slow rate). `None` = no live
+    /// frame yet; the UI shows "—", never a fake 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_mv: Option<RawMv>,
     /// Stored profiles.
     pub profiles: Vec<ProfileSummary>,
     /// Catalogue games with install / running state.
@@ -456,6 +462,28 @@ pub struct DiagStats {
     /// IPC dispatch latency p99 in milliseconds (DS-82).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipc_p99_ms: Option<f64>,
+    /// Per-method IPC dispatch latency (R2-46 / DS-82): one entry
+    /// per method the daemon has served, with its call count and
+    /// p50/p99 in milliseconds — the global aggregate above cannot
+    /// say *which* method is slow. Empty until the daemon has
+    /// measured a dispatch; the core leaves it empty (only the
+    /// daemon's `DaemonApi::diag_stats` fills it in).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ipc_per_method_ms: Vec<IpcMethodLatency>,
+}
+
+/// One method's IPC dispatch latency (R2-46): the per-method detail
+/// behind [`DiagStats::ipc_per_method_ms`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IpcMethodLatency {
+    /// IPC method name (`"poll"`, `"slow_poll"`, …).
+    pub method: String,
+    /// Total dispatches ever recorded for this method.
+    pub calls: u64,
+    /// p50 dispatch latency in milliseconds.
+    pub p50_ms: f64,
+    /// p99 dispatch latency in milliseconds.
+    pub p99_ms: f64,
 }
 
 /// Push events from the daemon to the UI. The UI never polls for
@@ -665,6 +693,7 @@ pub trait AppApi: Send + Sync {
             diag_stats: self.diag_stats().ok(),
             pairing_status: self.pairing_status(),
             calibration: self.calibration().ok(),
+            raw_mv: self.raw_mv().ok(),
             profiles: self.list_profiles(),
             games: self.list_games(),
             firmware_check: self.firmware_check().ok(),
@@ -1586,6 +1615,7 @@ mod tests {
         // fetch before).
         assert!(slow.diag_stats.is_none());
         assert!(slow.calibration.is_none());
+        assert!(slow.raw_mv.is_none());
         assert!(slow.firmware_check.is_some());
         assert!(slow.vjoy_status.is_none());
         assert_eq!(slow.profiles, Vec::new());

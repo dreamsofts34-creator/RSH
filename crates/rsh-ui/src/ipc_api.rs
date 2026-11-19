@@ -43,8 +43,8 @@ use rsh_api::connection::ConnectionState;
 use rsh_api::{
     app_version, ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionError,
     ConnectionInfo, DiagStats, DraftStatus, FirmwareCheck, FirmwareUpdateStatus, GameSummary,
-    PairingInfo, PollState, ProfileSummary, SlowPollState, SnapshotInfo, TuningSettings, UserError,
-    VjoyStatus,
+    PairingInfo, PollState, ProfileSummary, RawMv, SlowPollState, SnapshotInfo, TuningSettings,
+    UserError, VjoyStatus,
 };
 use rsh_ipc::{IpcClient, IpcError};
 
@@ -91,6 +91,9 @@ struct LiveCache {
     diag_stats: Mutex<Option<DiagStats>>,
     pairing_status: Mutex<Option<PairingInfo>>,
     calibration: Mutex<Option<CalibrationInfo>>,
+    /// Latest raw ADC readings in mV (R2-16): refreshed by the
+    /// slow poller ~1 Hz; the Advanced readouts read this slot.
+    raw_mv: Mutex<Option<RawMv>>,
     profiles: Mutex<Option<Vec<ProfileSummary>>>,
     games: Mutex<Option<Vec<GameSummary>>>,
     bindings: Mutex<Option<Vec<ButtonBinding>>>,
@@ -145,6 +148,7 @@ impl Default for LiveCache {
             diag_stats: Mutex::new(None),
             pairing_status: Mutex::new(None),
             calibration: Mutex::new(None),
+            raw_mv: Mutex::new(None),
             profiles: Mutex::new(None),
             games: Mutex::new(None),
             bindings: Mutex::new(None),
@@ -805,6 +809,9 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
         set_slot!(pairing_status, state.pairing_status);
         if let Some(calibration) = state.calibration {
             set_slot!(calibration, calibration);
+        }
+        if let Some(raw_mv) = state.raw_mv {
+            set_slot!(raw_mv, raw_mv);
         }
         set_slot!(profiles, state.profiles);
         set_slot!(games, state.games);
@@ -1651,6 +1658,18 @@ impl AppApi for IpcApi {
             .lock()
             .ok()
             .and_then(|slot| slot.clone())
+            .ok_or_else(Self::ipc_failed)
+    }
+
+    /// Cached raw ADC readings (R2-16): the slow poller refreshes
+    /// them ~1 Hz, so this never touches the socket. No cache yet
+    /// is an error — the Advanced readouts show "—", never a fake 0.
+    fn raw_mv(&self) -> Result<RawMv, UserError> {
+        self.cache
+            .raw_mv
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
             .ok_or_else(Self::ipc_failed)
     }
 

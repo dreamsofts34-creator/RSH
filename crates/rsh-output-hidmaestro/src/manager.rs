@@ -78,6 +78,14 @@ pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_millis(200);
 /// Heartbeat cadence while connected.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+/// How long an `ensure_alive` failure stays cached (R2-26): while
+/// inside the cooldown the cached `SidecarDied` error is returned
+/// without a Ping round-trip — a dead sidecar used to cost a full
+/// synchronous round-trip (up to `reply_timeout`, 200 ms) on EVERY
+/// 200 Hz tick until `fail()` retired the backend. 1 s matches the
+/// heartbeat cadence: the next heartbeat attempt is one cooldown
+/// away, and a recovered sidecar is re-probed promptly.
+pub const ALIVE_FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
 /// Successful submits in one session that re-arm the retry budget
 /// (1 s of 200 Hz output — a session that survives this long is
 /// healthy; a later isolated failure gets a fresh retry).
@@ -221,6 +229,12 @@ pub struct SidecarManager {
     elevation_declined: bool,
     healthy_submits: u64,
     last_reply: Option<Instant>,
+    /// When the last `ensure_alive` heartbeat failed (R2-26): while
+    /// this is within [`ALIVE_FAILURE_COOLDOWN`] of now, the failure
+    /// is returned from cache instead of another synchronous Ping
+    /// round-trip on the 200 Hz tick. Cleared on the next successful
+    /// heartbeat.
+    last_alive_failure: Option<Instant>,
     last_submit_latency_us: Option<f64>,
     submit_count: u64,
     transport_index: Option<i32>,
@@ -245,6 +259,7 @@ impl SidecarManager {
             elevation_declined: false,
             healthy_submits: 0,
             last_reply: None,
+            last_alive_failure: None,
             last_submit_latency_us: None,
             submit_count: 0,
             transport_index: None,
@@ -602,9 +617,31 @@ impl SidecarManager {
         if !due {
             return Ok(());
         }
-        let reply = self.request(&Command::Ping)?;
-        reply_to_error(&reply)?;
-        Ok(())
+        // R2-26: a recent heartbeat failure is returned from cache
+        // for one cooldown — without this, a dead sidecar costs a
+        // full synchronous Ping round-trip (up to `reply_timeout`,
+        // 200 ms) on EVERY 200 Hz tick until `fail()` retires the
+        // backend.
+        if let Some(failed_at) = self.last_alive_failure
+            && failed_at.elapsed() < ALIVE_FAILURE_COOLDOWN
+        {
+            return Err(HidMaestroError::SidecarDied(
+                "sidecar heartbeat failed recently (cached)".to_string(),
+            ));
+        }
+        let outcome = self
+            .request(&Command::Ping)
+            .and_then(|reply| reply_to_error(&reply));
+        match outcome {
+            Ok(()) => {
+                self.last_alive_failure = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.last_alive_failure = Some(Instant::now());
+                Err(error)
+            }
+        }
     }
 
     /// `install-driver` with the `AlreadyCurrent` fast path (the

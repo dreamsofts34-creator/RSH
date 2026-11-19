@@ -100,6 +100,7 @@ static SYSTEM_LIGHT_CACHE: std::sync::Mutex<Option<(std::time::Instant, bool)>> 
 /// (`rsh-app-core` `state.rs`, `0x0800_0000`).
 #[cfg(windows)]
 fn system_light_uncached() -> bool {
+    // R2-03 (S-03): no console window flashes for the `reg` probe.
     use std::os::windows::process::CommandExt;
     let Ok(out) = std::process::Command::new("reg")
         .args([
@@ -148,13 +149,13 @@ fn system_light() -> bool {
 /// — the same file the main window reads and writes (`rsh-ui`
 /// `read_theme`/`write_theme`: `"Dark"`/`"Light"`/`"Auto"`).
 /// "Light" → light, "Dark" → dark, "Auto" → the OS preference.
-/// A missing / unreadable file (or no data dir) → Dark — the
-/// fresh-install default, the same default `read_theme` uses
-/// (R2-37): the preview only approves the dark theme
-/// (REDESIGN-PLAN: "Light theme: abhi design nahi hui"), so a
-/// fresh install must not render Light on a light OS while the
-/// main window opens Dark. Pure over the given dir, so it is
-/// unit-testable with a temp dir.
+/// A missing / unreadable file (or no data dir, or garbage) →
+/// Dark — the fresh-install default, the same default
+/// `read_theme` uses (R2-37): the preview only approves the
+/// dark theme (REDESIGN-PLAN: "Light theme: abhi design nahi
+/// hui"), so a fresh install must not render Light on a light
+/// OS while the main window opens Dark. Pure over the given
+/// dir, so it is unit-testable with a temp dir.
 #[must_use]
 pub fn popup_is_light(data_dir: Option<&std::path::Path>) -> bool {
     let Some(dir) = data_dir else {
@@ -162,6 +163,7 @@ pub fn popup_is_light(data_dir: Option<&std::path::Path>) -> bool {
     };
     match std::fs::read_to_string(dir.join("ui-theme")) {
         Ok(text) if text.trim() == "Light" => true,
+        Ok(text) if text.trim() == "Dark" => false,
         Ok(text) if text.trim() == "Auto" => system_light(),
         _ => false,
     }
@@ -1323,6 +1325,9 @@ mod tests {
         // assertion compares against the sampler, not a theme.)
         std::fs::write(dir.join("ui-theme"), "Auto\n").expect("write theme");
         assert_eq!(popup_is_light(Some(&dir)), system_light());
+        // R2-37: a missing file, garbage, and no data dir are all
+        // Dark — the main window's missing-file default — so a
+        // fresh install renders the same theme in both windows.
         let _ = std::fs::remove_file(dir.join("ui-theme"));
         assert!(!popup_is_light(Some(&dir)), "missing file must render dark");
         std::fs::write(dir.join("ui-theme"), "garbage\n").expect("write theme");

@@ -4967,6 +4967,21 @@ int main() {
     CHECK(db3[6 + 3 * 7 + 4] == RSH_DIAG_KEY_RESET_EXPIRED);
     CHECK(db3[6 + 4 * 7 + 4] == RSH_DIAG_WDT_STATE && db3[6 + 4 * 7 + 5] == 1);
     CHECK(db3[6 + 5 * 7 + 4] == RSH_DIAG_KEYSTORE_NVS_FAIL);
+
+    // R2-47: key-reset-expiry replay order — pichle boot ki expiry event
+    // BOOT event se PEHLE ring mein aati hai (oldest-first), taake
+    // diagnostics mein expiry reboot se pehle dikhe. (Persist/replay
+    // khud Arduino NVS par hai — host par sirf ye order convention
+    // assert hoti hai, jis par rsh.ino ka replay bharosa karta hai.)
+    RshDiagLog dl4;
+    rsh_diag_init(&dl4);
+    rsh_diag_record(&dl4, RSH_DIAG_KEY_RESET_EXPIRED, 0, 10);
+    rsh_diag_record(&dl4, RSH_DIAG_BOOT, 4, 20);
+    CHECK(dl4.count == 2);
+    uint8_t db4[230];
+    CHECK(rsh_diag_build_body(&dl4, 0, db4, sizeof(db4)) == 6 + 2 * 7);
+    CHECK(db4[6 + 0 * 7 + 4] == RSH_DIAG_KEY_RESET_EXPIRED);
+    CHECK(db4[6 + 1 * 7 + 4] == RSH_DIAG_BOOT);
   }
 
   printf("%s — %d checks, %d failures\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", checks, failures);

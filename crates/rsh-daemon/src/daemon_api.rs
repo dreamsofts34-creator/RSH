@@ -233,12 +233,17 @@ impl AppApi for DaemonApi {
             replacement_required: status.replacement_required,
             key_reset_armed: status.key_reset_armed,
             // DS-25: the pairing attempt trail (HELO sends, HELLO
-            // replies, timeouts — see `AppStateCore::pairing_log_lines`)
-            // rides on the status the wizard already polls, so the UI
-            // can show e.g. "Sent HELO to 192.168.4.1 — no reply
-            // (3 tries)" instead of only "No pairing window". The
-            // log lines are redacted at the source (never a password).
-            attempt_log: self.state.pairing_log_lines(),
+            // replies, timeouts — see
+            // `AppStateCore::pairing_log_tail_lines`) rides on the
+            // status the wizard already polls, so the UI can show
+            // e.g. "Sent HELO to 192.168.4.1 — no reply (3 tries)"
+            // instead of only "No pairing window". The log lines
+            // are redacted at the source (never a password).
+            // R2-42: the retained tail (≤20 lines), never the full
+            // ≤200-line buffer — the slow poller calls this ~1 Hz.
+            // R2-23: the tail is never drained, so the manager
+            // loop's 250 ms file drain cannot starve this reader.
+            attempt_log: self.state.pairing_log_tail_lines(),
         }
     }
 
@@ -728,6 +733,24 @@ impl AppApi for DaemonApi {
             stats.ipc_p50_ms = Some(p50);
             stats.ipc_p99_ms = Some(p99);
         }
+        // R2-46: the per-method detail — which method is slow.
+        // `ipc_latency_snapshot` is `(method, calls, p50 µs, p99 µs)`,
+        // sorted by method name; µs → ms here. The µs values are
+        // dispatch durations — far below 2^53 µs — so the `u64 as
+        // f64` cast cannot lose precision.
+        #[allow(clippy::cast_precision_loss)]
+        let per_method: Vec<rsh_api::IpcMethodLatency> = rsh_ipc::ipc_latency_snapshot()
+            .into_iter()
+            .map(
+                |(method, calls, p50_us, p99_us)| rsh_api::IpcMethodLatency {
+                    method,
+                    calls,
+                    p50_ms: p50_us as f64 / 1000.0,
+                    p99_ms: p99_us as f64 / 1000.0,
+                },
+            )
+            .collect();
+        stats.ipc_per_method_ms = per_method;
         Ok(stats)
     }
 }
@@ -893,6 +916,32 @@ mod tests {
             .activate_profile(&first.id)
             .expect("activate default profile");
         (DaemonApi::new(state), dir)
+    }
+
+    /// R2-46: `diag_stats` exports the per-method IPC latency —
+    /// the method that is slow must be visible, not just the global
+    /// aggregate. (The latency rings are process-global, so the
+    /// assertion is "the recorded method is present", not exact
+    /// counts — other tests in this process may record too.)
+    #[test]
+    fn diag_stats_exports_per_method_ipc_latency() {
+        use std::time::Duration;
+
+        let (api, _dir) = live_api_named("diag-stats");
+        rsh_ipc::record_ipc_latency("poll", Duration::from_micros(2_000));
+        let stats = api.diag_stats().expect("diag_stats");
+        let entry = stats
+            .ipc_per_method_ms
+            .iter()
+            .find(|entry| entry.method == "poll")
+            .expect("poll entry present");
+        assert!(entry.calls >= 1);
+        assert!(entry.p50_ms >= 0.0);
+        assert!(entry.p99_ms >= entry.p50_ms);
+        assert!(
+            stats.ipc_p50_ms.is_some() && stats.ipc_p99_ms.is_some(),
+            "global aggregate still filled: {stats:?}"
+        );
     }
 
     #[test]
