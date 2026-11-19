@@ -48,7 +48,7 @@
 #define RSH_AS5600_STATUS_MH 0x08
 
 // AGC @3.3 V: range 0..128, ideal ~64 (mid-range). Acceptable band 16..112 —
-// is se bahar ho to magnet gap ghalat hai (USER-GUIDE mein gap adjust karo).
+// is se bahar ho to magnet gap ghalat hai (magnet gap adjust karo).
 #define RSH_AS5600_AGC_MAX_3V3  128
 #define RSH_AS5600_AGC_OK_LO    16
 #define RSH_AS5600_AGC_OK_HI    112

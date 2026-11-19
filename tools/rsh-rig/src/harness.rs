@@ -1204,7 +1204,8 @@ pub fn run_contract(scenario: &Scenario) -> Metrics {
         }
         "upgrade-preserve" => crate::ota_checks::self_check_upgrade_preserve(),
         "installer-preserves-data" => crate::ota_checks::self_check_installer_preserves_data(),
-        // v2.0.2 gate checks (docs/V2.0.2-FIX-PLAN.md §C).
+        // v2.0.2 gate checks (fix plan §C — the plan was removed from
+        // docs/ in the 2026-11-19 repo cleanup, see git history).
         "gate-backend-switch" => crate::gate_checks::gate_backend_switch(),
         "gate-user-errors" => crate::gate_checks::gate_user_errors(),
         "gate-ipc-timeout" => crate::gate_checks::gate_ipc_timeout(),

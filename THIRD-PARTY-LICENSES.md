@@ -127,7 +127,9 @@ allow-list verbatim):**
 | HIDMaestro UMDF2 driver | 2.1.0 | MIT | Installed by the sidecar's `install-driver` step (admin) from the pinned release ZIP, SHA-256 `7fe349f163864b8dfc36117af260d51bac94a2263b6cdfa719cb364a808397b4` |
 
 The sidecar has **no NuGet packages** (only the DLL reference above), so its SBOM is
-hand-written; verify the pins at release time against `docs/HIDMAESTRO-SPIKE.md`.
+hand-written; verify the pins at release time against the sidecar
+staging script (`tools/ci/stage-sidecar.ps1`) and
+`docs/RELEASE-CHECKLIST.md`.
 
 ## 4. Not bundled / not distributed by RSH (excluded from the SBOMs)
 

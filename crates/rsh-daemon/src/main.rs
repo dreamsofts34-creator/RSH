@@ -1041,9 +1041,9 @@ async fn serve_ipc(
         }
         // NOTE (OPEN, Windows verification): the pipe currently uses
         // the default security descriptor. An explicit
-        // current-user-only DACL is a Phase-7 hardening item — see
-        // docs/V2-PHASE-2-GATE.md. The pipe is local-only and the
-        // name is per-user via the single-instance mutex scope.
+        // current-user-only DACL is a Phase-7 hardening item. The pipe
+        // is local-only and the name is per-user via the
+        // single-instance mutex scope.
         if let Err(error) = pipe.connect().await {
             // DS-37 (B-12): a failed connect used to restart the
             // loop silently with no log and no delay — a

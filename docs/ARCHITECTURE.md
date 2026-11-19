@@ -3,11 +3,9 @@
 **Status:** v2.0 (Tauri 2 + React is gone) · **App:** Rust + Slint ·
 **Firmware:** C++ v4.0.2 · **Protocol:** v2.1 (FROZEN)
 
-This document describes the v2.0 architecture. Sources:
-[REDESIGN-PLAN.md](../redesign-plan/RSH-UI-Redesign/REDESIGN-PLAN.md)
-§10 and
-[LOGIC-FIX-PLAN.md](../redesign-plan/RSH-UI-Redesign/LOGIC-FIX-PLAN.md)
-§2 (target architecture) and §4.1 (Connection Manager). Nothing in this
+This document describes the v2.0 architecture. Sources: the v2.0
+redesign plans (target architecture and Connection Manager) and
+[UI-DESIGN.md](UI-DESIGN.md) (the approved UI design). Nothing in this
 document invents a component that is not in those plans.
 
 ## 1. Overview
@@ -125,8 +123,9 @@ Idle ─connect→ LinkUp ─HELLO→ Hello ─pair/resume→ Authenticating ─
 Rules (LOGIC-FIX-PLAN §4.1):
 
 - **`Active` only after a signed `GET_CAPS` passes.** The label
-  "Connected" is shown only in the `Active` state. The setup wizard
-  lets the user continue only from `Active`.
+  "Connected" is shown only in the `Active` state. The setup wizard's
+  Step 1 (board connect) unlocks Next when the board is reachable
+  (state `Hello` or better); pairing itself is Step 3.
 - **Re-activation loop.** A failed activation is not a one-shot: the
   manager reports `Error(reason)` and retries with backoff (2 s →
   30 s). For reasons that need a user action (`NoStoredKey`,
@@ -183,7 +182,7 @@ own. There is no state that reads "Connected" while no data flows.
 - **Not a home-network device.** The board is a Wi-Fi access point
   only — it never joins a home network. The daemon talks to the
   board's own `RSH` network (Wi-Fi) or to USB-serial. See
-  [USER-GUIDE.md](USER-GUIDE.md#pairing).
+  [README](../README.md#pairing).
 - **Not a protocol change.** Protocol v2.1 is frozen. The daemon/UI
   split, the IPC channel, and the firmware v4.0.2 features are all
   above or beside the wire protocol — no wire message changed.

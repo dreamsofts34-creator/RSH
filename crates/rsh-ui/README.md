@@ -40,7 +40,7 @@ data dir (test-only: points the IPC socket probe at DIR instead of the real
   imported), so `slint::include_modules!()` sees exactly one file.
 - `Palette.color-scheme` is NOT used (does not parse in Slint 1.18.1);
   the AboutSlint logo variant on a light-theme Windows PC is an open
-  gate item (see `docs/V2-PHASE-3-GATE.md`).
+  gate item.
 - The status-dot halo is a pre-blended solid (`Theme.halo-ok`/`halo-bad`),
   never an `opacity` rect — opacity dims the dot itself (spike bug).
 - Layout rule (spike + Phase 3): a non-stretch `alignment` on a layout

@@ -1,12 +1,10 @@
 # Release Checklist — RSH v2.0 (daemon + Slint UI)
 
-**Version:** Slint app + daemon **v2.0.0** · C++ firmware **v4.0.2** · protocol **v2.1**
-**Date:** 2026-11-16 · **Status: PREP — release NOT executed.**
-The coordinator executes the release by pushing a `v2.*` tag after
-the Phase 9 gate is green. This file is the gate list the coordinator
-ticks before tagging. The v1.x checklist it supersedes is in git
-history (the v1.0.0–v1.0.2 Tauri releases, `RSH_1.0.x_x64-setup.exe`,
-single-asset rule DECISIONS §18 — still standing, see §3).
+**Current:** Slint app + daemon **v2.0.4** · C++ firmware **v4.0.2** ·
+protocol **v2.1 (frozen)** · **v2.0.4 is live** (2026-11-19).
+This file is the checklist the release coordinator ticks before
+tagging the *next* release. The coordinator executes the release
+by pushing a `v2.*` tag after the gates below are green.
 
 > Honesty rule: an item is ticked only if it was actually
 > done/verified. Anything needing Windows is marked
@@ -17,9 +15,9 @@ single-asset rule DECISIONS §18 — still standing, see §3).
 
 | Piece | Version | Source of truth |
 |---|---|---|
-| App + daemon | **v2.0.0** | `Cargo.toml` `[workspace.package] version` — the ONLY version source in v2.0 (no `tauri.conf.json`, no `frontend/package.json` anymore); checked by `release.yml` against the tag |
-| Firmware | C++ **v4.0.2** | `docs/V2-FIRMWARE-4.0.2-GATE.md` (F-01…F-16, 4,705 checks, 0 failures) |
-| Protocol | **v2.1** (frozen) | Wire contract; the app talks to the same board — **no reflash needed** for wheels already on v4.0.2; firmware is flashed from the app (WebOTA), never from the installer |
+| App + daemon | **v2.0.4** | `Cargo.toml` `[workspace.package] version` — the ONLY version source (no `tauri.conf.json`, no `frontend/package.json` anymore); checked by `release.yml` against the tag |
+| Firmware | C++ **v4.0.2** | `firmware/version.h` (single source); see [FIRMWARE-COMPAT.md](FIRMWARE-COMPAT.md) |
+| Protocol | **v2.1** (frozen) | Wire contract; the app talks to the same board — **no reflash needed** for wheels already on v4.0.2; firmware is updated from the app (WebOTA), never from the installer |
 
 ## 2. What v2.0 is (architecture)
 
@@ -37,167 +35,74 @@ single-asset rule DECISIONS §18 — still standing, see §3).
   (no committed `.nsi` — the installer IS the release workflow's
   `installer/rsh.nsi` step). `RequestExecutionLevel admin` ONCE at
   install time, so the firewall rule can be created. Nothing at
-  login ever prompts (D-7, see §4).
+  login ever prompts.
 
-## 3. Release asset list (exact — ONE asset)
+## 3. Release asset list (exact — THREE assets)
 
-**Single-asset release (user order 2026-11-15 14:00, standing rule —
-see docs/DECISIONS.md §18):** what `release.yml` stages and publishes
-is exactly one file:
+What `release.yml` stages and publishes is exactly three files
+(fail-closed: any other count fails the run):
 
 | # | Asset | Source |
 |---|---|---|
-| 1 | `RSH_2.0.0_x64-setup.exe` | NSIS installer built by `release.yml` (the ONLY installer, the ONLY asset) |
+| 1 | `RSH_<version>_x64-setup.exe` | NSIS installer built by `release.yml` |
+| 2 | `RSH-Firmware-DevKitV1-v4.0.2.bin` | Merged full-flash firmware image (flash at 0x0) |
+| 3 | `RSH-Firmware-DevKitV1-v4.0.2-OTA.bin` | Ed25519-signed OTA image (`firmware-signed.bin`) for the app's WebOTA flow |
 
 NOT published in this release: MSI, `.sig` files, `latest.json`
-(auto-update is OFF — no manifest is published, users download and
-install manually), firmware bins (merged + signed), `SHA256SUMS`, SBOMs.
-`release.yml` fails closed unless exactly one file is staged.
+(auto-update is OFF — no manifest is published, users download
+and install manually), `SHA256SUMS`, SBOMs.
 
-## 4. What Phase 7 landed (tray + autostart + installer)
+## 4. How to release (in order)
 
-- [x] **Tray popup** (`crates/rsh-daemon/src/tray_popup.rs` +
-      `ui/tray.slint` `TrayPopup`, 340×440, same-to-same with
-      `preview-html/Tray.html`): header (name, status, Send-to-game
-      switch), live wheel + 3 bars, profile selector (click cycles
-      to the next profile), 3 games (Launch / Running / Not found),
-      footer Open RSH / Restart wheel. Live data comes from the
-      daemon's `AppApi` (no IPC round-trip — the daemon IS the data
-      source), refreshed at 10 Hz while visible.
-- [x] **Tray geometry** (`tray_geometry.rs`): the popup anchors next
-      to the tray icon via `Shell_NotifyIconGetRect` — verified
-      against the Slint 1.18.1 source (`i-slint-core`
-      `items/system_tray/windows.rs`): Slint's Windows tray backend
-      uses a hidden message-only window of class
-      `SlintSystemTrayWindow` with `uID = 1`, no GUID. The code finds
-      that window for our own process id and queries the rect; on
-      failure (or on Linux) the popup docks bottom-right. Pure
-      anchor math unit-tested (12 daemon tests green on Linux).
-- [x] **Click-outside closes the popup [Windows-only]**: a 100 ms
-      timer hides the popup when another window takes the foreground
-      (500 ms grace after showing). Linux has no foreground query —
-      Escape and the popup's own buttons close it there (documented
-      degradation, not a silent gap).
-- [x] **Tray menu** (§7.8, native platform menu — all 8 items):
-      Open RSH, Send to game (tick), Profile ›, Launch game ›,
-      Restart wheel, Settings, Quit RSH. Menu actions are now REAL
-      in the daemon (were log-only placeholders in Phase 2):
-      profile activates, game launches (id or display name),
-      Restart wheel reboots the board, Open RSH / Settings spawn
-      `rsh-ui` (beside the daemon exe). Known limit: the native menu
-      cannot render the `TrayMenu.html` status header and its Profile
-      submenu is still the static "Default" entry — profile
-      switching beyond Default goes through the popup's cycle row
-      (or the Profiles screen). A model-driven menu is a Phase 8
-      item, not silently claimed here.
-- [x] **Autostart** (`tray_autostart.rs`): Windows Run key
-      `HKCU\…\CurrentVersion\Run`, value `RSH` → `"…\rsh-daemon.exe"`
-      (no arguments — the daemon always creates its tray icon),
-      via the Registry API directly (no `reg.exe`, so no console
-      flash — the v1.0.2 bug class). Linux: `~/.config/autostart/
-      rsh-daemon.desktop`. The daemon syncs the entry from
-      `settings.autostart` on startup; a stale v1 entry (old
-      `RSH.exe`) is migrated to the daemon exe when autostart is on,
-      removed when it is off.
-- [x] **No login-time UAC surprise (D-7, LOGIC-FIX-PLAN §4.6)**:
-      the daemon calls `activate_startup_backend` on startup —
-      HIDMaestro stays deferred until the user turns "Send to game"
-      on (the UAC prompt there is expected, user-initiated); a
-      non-elevated backend (vJoy, driver present) activates at
-      startup, so autostart defaults to vJoy until HIDMaestro is
-      ready. The optional elevated helper (scheduled task, option
-      (a)) is NOT implemented — the deferral already removes the
-      login-time prompt. The installer does NOT enable autostart;
-      Settings owns it.
-- [x] **Installer firewall rule (LOGIC-FIX-PLAN §4.3 / C-10)**:
-      the NSIS installer creates a program-scoped inbound rule
-      named `RSH` for `rsh-daemon.exe` (Private + Public, no port
-      scope — a port-scoped rule would also allow other programs on
-      that port) via hidden `nsExec` `netsh`, and removes it on
-      uninstall. Verified by the release workflow's smoke test
-      (rule present after install, gone after uninstall).
-- [x] **Release workflow rewritten for v2.0**
-      (`.github/workflows/release.yml`): tag `v2.*`, workspace
-      version check, sidecar staging, fmt + clippy (`--workspace
-      --exclude src-tauri`) + `--release` tests of the four ship
-      crates + `cargo deny`, `cargo build --release -p rsh-daemon
-      -p rsh-ui`, PE-subsystem GUI check on all three binaries,
-      NSIS build, single-asset verify (exactly 1 file), smoke test
-      (silent install → firewall rule → `rsh-daemon --check` exit 0
-      → silent uninstall → rule + dir gone). YAML-valid; every
-      referenced path/binary verified to exist in the repo.
-- [x] **CI updated** (`.github/workflows/ci.yml`): the four v2.0
-      crates (`rsh-daemon`, `rsh-ui`, `rsh-api`, `rsh-ipc`) build +
-      clippy + test on Windows and Linux, with fail-closed presence
-      checks; the existing exclusion of `src-tauri` on Linux is kept
-      (its build script needs the staged Windows sidecar).
+1. **Bump the workspace version** in `Cargo.toml`
+   (`[workspace.package] version`) to the tag version, and add a
+   [CHANGELOG.md](CHANGELOG.md) entry. Commit and push to `main`.
+2. **Wait for CI green on that commit.** `release.yml` enforces
+   this (DS-04): it fails closed if there is no successful CI run
+   for the tag commit on `main`. Never bypass it.
+3. **Tag** `vX.Y.Z` on the version-bump commit and push the tag.
+   The tag push triggers `release.yml`.
+4. **Watch the release run to SUCCESS.** It builds the sidecar,
+   runs the gates (fmt, clippy, ship-crate tests, `cargo deny`),
+   builds daemon + UI, checks the PE subsystem (GUI, no console),
+   builds + signs the firmware (Ed25519, secret
+   `RSH_SIGNING_KEY_PEM`; DS-13 baked-pubkey cross-check),
+   builds the NSIS installer, stages exactly three assets, runs
+   the headless smoke test (install + update + firewall rule +
+   daemon `--check` + uninstall), and creates the GitHub release.
+5. **Verify the release yourself** (never trust the green run
+   alone): download all three assets, check SHA-256, verify the
+   OTA signature and trailer (`RSHS`) and the `Version 4.0.2`
+   marker, and confirm the release page lists exactly three
+   assets.
 
-## 5. Open release gates (none silently passed)
+## 5. Human gates (Windows-only / user PC — unticked until proven)
 
-| # | Gate | Status | Owner / next step |
-|---|---|---|---|
-| G-1 | **Workspace version → 2.0.0** | **OPEN** | `Cargo.toml` `[workspace.package]` is still `1.0.2`. Phase 9 / integration bumps it to `2.0.0` before the first `v2.*` tag — `release.yml` FAILS CLOSED until then (by design). |
-| G-2 | **`rsh-ui` PE subsystem = GUI** | **OPEN — Phase 3** | `rsh-ui` has no `windows_subsystem = "windows"` yet (the daemon already has it). The release workflow's PE check will fail the run until Phase 3 adds it. Do NOT weaken the check. |
-| G-3 | **pid.codes PR** for VID `0x1209` / PID `0x5253` | **OPEN — release gate** | Must merge before v2.0.0; human gate, not in the workflow |
-| G-4 | **vJoy DLL SHA-256** (`PINNED_DLL_SHA256_HEX`) | **OPEN — not measured** | Measure on the Windows release machine; never invented. `release.yml` only records whether the runner happens to have vJoy (it will not) |
-| G-5 | **First `release.yml` dry-run** (`workflow_dispatch`, `dry_run: true`) | **OPEN — never run** | Must pass end-to-end before any tag is pushed. It is the first proof of: the generated `.nsi`, the installer filenames, the sidecar staging path, the firewall-rule smoke test, the daemon `--check` smoke test |
-| G-6 | **Tray popup on real Windows** | **OPEN — Windows-only** | Left-click → popup appears next to the tray icon (not bottom-right dock, not off-screen); click-outside closes it; Escape closes it; live bars move; profile row cycles; Launch starts the game. Procedure in §6. |
-| G-7 | **Tray menu on real Windows** | **OPEN — Windows-only** | Right-click → all 8 items present and working (profile activates, game launches, restart reboots, Settings opens the UI on Settings, Quit exits the daemon). |
-| G-8 | **Autostart on real Windows** | **OPEN — Windows-only** | Enable in Settings → `RSH` Run-key value points at `rsh-daemon.exe`; log out/in → daemon runs, tray appears, NO UAC prompt; disable → value gone. |
-| G-9 | **Firewall rule on real Windows** | **OPEN — Windows-only** | After install: `netsh advfirewall firewall show rule name="RSH"` shows the program-scoped inbound rule; wheel connects over Wi-Fi (200 Hz stream arrives); after uninstall the rule is gone. The CI smoke test proves the same steps on the runner — this gate is the real-PC confirmation. |
-| G-10 | **5-minute soak** | **NOT RUN — max 5 min** | **The 4-hour soak is CUT by user order 2026-11-16 14:39 PKT** (was §7/§8 of the plan; recorded as CUT, never as passed). A 5-minute soak runs at the Phase 9 gate instead (rig `--mode quick` + 5-min soak). |
-| G-11 | **Game matrix in-game verification** | **OPEN — 0 of 16 backend–game pairs verified** | Windows-only; procedure in [GAME-MATRIX.md](GAME-MATRIX.md). v2.0.0 ships with the matrix honestly at 0/16 — no game is claimed to work until verified |
-| G-12 | **Clean-PC install + rollback** | **OPEN — Windows-only** | On Win10 22H2 **and** Win11: NSIS install, tray + popup paint check (no blank window), firewall rule, HIDMaestro UAC path (only on Send-to-game), vJoy fallback journey, upgrade-over-install, downgrade rollback, profile restore, uninstall removes rule + files |
-| G-13 | **A7 real-board run** | **OPEN — carried** | Run once, at final production release, on the owner PC (user decision: real-board tests only at final release) |
-| G-14 | **OV code-signing certificate** | Deferred (user decision D-R11) | Buy later ($150–300/year est.); app ships unsigned, SmartScreen expected |
+These are NOT proven by CI or by the release smoke test. They
+stay open until the user proves them on their own PC:
 
-## 6. Windows verification steps (Phase 7 — run on a real PC)
+- [ ] Setup wizard (connect → drivers → pair → calibrate → games)
+- [ ] Tray popup visible 5 s, tray menu, tray icons
+- [ ] Pairing / WebOTA on the real board
+- [ ] vJoy backend, smart installer (update path)
+- [ ] Window actually paints on first launch
+- [ ] Game end-to-end (0 backend–game pairs verified in-game so
+      far — no game is claimed to work until verified)
 
-These are the exact steps the CI run cannot do (headless runner).
-Tick G-6…G-9 only after running them:
+## 6. Standing rules
 
-1. Install `RSH_2.0.0_x64-setup.exe` (double-click, accept the
-   one-time admin prompt at install — that is the ONLY UAC prompt
-   in the whole flow).
-2. `netsh advfirewall firewall show rule name="RSH"` → rule exists,
-   program `…\rsh-daemon.exe`, direction In, action Allow,
-   profiles Private,Public.
-3. The tray icon appears (no terminal window, no console flash).
-4. Left-click the tray icon → the 340×440 popup opens next to the
-   icon (above the taskbar, right-aligned to the icon); the wheel
-   angle and the 3 bars move live; click the profile row → the
-   profile cycles; click a game's Launch → the game starts.
-5. Click on the desktop (outside the popup) → the popup closes.
-   Press Escape with the popup open → it closes.
-6. Right-click the tray icon → the menu shows all 8 items;
-   Profile / Launch game submenus work; Restart wheel reboots the
-   board; Settings opens the UI on the Settings page; Quit RSH
-   exits the daemon (tray icon disappears).
-7. In Settings, turn autostart ON → check the Run key:
-   `reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v RSH`
-   → `"…\rsh-daemon.exe"`. Sign out and back in → the daemon is
-   running, the tray icon is there, and NO UAC prompt appeared.
-   Turn autostart OFF → the value is gone.
-8. Uninstall from Settings / Apps → the `RSH` firewall rule is
-   gone (`netsh … show rule name="RSH"` → "No rules match") and
-   the install dir is gone.
-
-## 7. Pre-tag human gates (coordinator checks before pushing `v2.*`)
-
-- [ ] Phase 9 gate green (all phases, 5-minute soak, rig).
-- [ ] G-1 version bumped to `2.0.0` in `Cargo.toml`.
-- [ ] G-2 `rsh-ui` PE subsystem GUI (Phase 3) — release workflow
-      PE check green.
-- [ ] G-3 pid.codes PR merged.
-- [ ] G-4 vJoy DLL SHA-256 measured on the Windows release machine.
-- [ ] G-5 `release.yml` dry-run (`workflow_dispatch`,
-      `dry_run: true`) green, including the NSIS build and the
-      smoke test (§4).
-- [ ] G-6…G-9 Windows verification (§6) executed on Win10 + Win11,
-      report filed.
-- [ ] G-12 clean-PC install + rollback plans executed, report filed.
-- [ ] Release notes written: unsigned-app SmartScreen note;
-      firmware anti-downgrade note; HIDMaestro UAC note (only on
-      Send-to-game, never at login); **re-pairing note if the key
-      store changed**; game matrix status (0/16);
-      **4-hour soak CUT by user order** (5-minute soak instead).
+- **Auto-update is OFF.** No `latest.json` is published; users
+  install by downloading the exe manually. Firmware updates come
+  from the app (WebOTA).
+- **App ships UNSIGNED** (OV code-signing certificate deferred,
+  D-R11). Expect a Windows SmartScreen warning.
+- **Firmware is signed only.** An unsigned or wrong-version OTA
+  image must never reach a release (the board rejects it).
+- **Uninstall keeps `%APPDATA%\RSH`** (profiles, settings, logs)
+  — delete it manually for a fully clean start.
+- **Signing keys live outside the repo** (never committed,
+  never printed). Release needs the `RSH_SIGNING_KEY_PEM`
+  GitHub secret.
+- **pid.codes PR** for VID `0x1209` / PID `0x5253` is still open
+  (not yet merged) — a release gate that stays open, not a
+  blocker for the build itself.

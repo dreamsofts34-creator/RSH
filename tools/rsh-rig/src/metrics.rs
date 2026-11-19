@@ -6,7 +6,7 @@
 //! `results.json` can be compared key for key. Where the Rust engine
 //! cannot observe a C# metric, the Rust registry uses the closest
 //! engine-measured equivalent and the difference is documented in
-//! `scenarios.rs` and `docs/PERF-H2.md` — never silently renamed.
+//! `scenarios.rs` — never silently renamed.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};

@@ -1,4 +1,4 @@
-//! v2.0.2 gate checks (`docs/V2.0.2-FIX-PLAN.md` §C).
+//! v2.0.2 gate checks (fix plan §C).
 //!
 //! One function per gate item; each returns `(passed, detail)` and is
 //! wired as a duration-0 scenario (`gate-*`) in
@@ -8,8 +8,9 @@
 //! a named pipe on Windows (see `FakeListener`). A Windows-only
 //! behaviour (real UAC prompts, the NSIS installer UI, the tray
 //! icon) is covered by a *source audit* here plus an explicit open
-//! verification on the user PC, recorded in `docs/V2.0.2-GATE.md`.
-//! Nothing here pretends a Linux run proves a Windows behaviour.
+//! verification on the user PC, recorded in the v2.0.2 gate report
+//! (removed from docs/ in the 2026-11-19 repo cleanup — see git
+//! history). Nothing here pretends a Linux run proves a Windows behaviour.
 //!
 //! Two kinds of check live in this module, and the detail string of
 //! each says which it is:
@@ -665,7 +666,8 @@ pub fn gate_ipc_timeout() -> (bool, String) {
 /// [`AppStateCore`] (the app-startup path), and the ping round-trip
 /// distribution against a local echo server speaking the real IPC
 /// wire format (p50/p99 over 100 pings). Thresholds are recorded in
-/// `docs/V2.0.2-GATE.md`; a breach fails the gate. Memory is
+/// the v2.0.2 gate report (removed from docs/ — see git history); a
+/// breach fails the gate. Memory is
 /// reported by the rig's allocator counters in the full run, not
 /// re-measured here.
 #[must_use]

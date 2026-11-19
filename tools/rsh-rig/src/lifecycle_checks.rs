@@ -8,8 +8,9 @@
 //! yet the restart loop + duplicate tray + hang shipped, because no
 //! gate check ever launched a real daemon/UI process. Each check
 //! here must FAIL on the pre-fix binaries and PASS on the fixed
-//! ones; the pre-fix numbers are recorded in the fix plan
-//! (`docs/V2.0.3-FIX-PLAN.md` §F17) and in the F17 repro notes.
+//! ones; the pre-fix numbers are recorded in the v2.0.3 fix plan
+//! (§F17 — removed from docs/ in the 2026-11-19 repo cleanup, see
+//! git history) and in the F17 repro notes.
 //!
 //! Honest limits of this file (Linux):
 //! * Tick p99 (<100 ms, zero ticks >500 ms) cannot be measured from

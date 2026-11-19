@@ -10,6 +10,12 @@
 > **OPEN (Windows)** wherever it applies, never claimed as measured.
 > **Pin rule:** exact `=x.y.z` pins go into `[workspace.dependencies]` + `Cargo.lock` when the
 > Phase C / SW-R1 worker adds them. This file does **not** change any `Cargo.toml` itself.
+>
+> **Repo cleanup 2026-11-19:** gate reports, fix plans, deep-scan
+> plans, phase gates and spike reports cited in this file were
+> removed from `docs/` (they remain in git history). Filenames and
+> `docs/` paths below that point at removed files are historical
+> mentions, not live links.
 
 ## 0. Frozen decisions — summary
 
@@ -447,7 +453,8 @@ doc, release note, or report.
 
 **What still runs (H2):** the 60 s quick soak and the 10 min full soak —
 both fast, both give real stability signal (rate, loss, jitter). Their
-results are reported in `docs/PERF-H2.md`.
+results are reported in the H2 perf doc (removed from docs/ in the
+2026-11-19 repo cleanup — see git history).
 
 **Consequence:** the Phase H gate doc and the v1.0.0 release criteria carry
 this as an open, user-accepted item, verbatim: "4-hour soak SKIPPED by user
@@ -713,7 +720,7 @@ paths); that number was already correct.
   on the owner PC; `cargo tauri build` producing NSIS + MSI on
   windows-latest (already listed as Windows-only in H4 §8).
 
-## 17. Deep-scan gate decisions (2026-11-14, gate worker — see `docs/DEEP-SCAN-GATE.md`)
+## 17. Deep-scan gate decisions (2026-11-14, gate worker)
 
 Gate verdict: **CONDITIONAL PASS** — zero failing tests and zero failing rig scenarios locally (Rust 901/0, frontend 241/241, rig full 27/27 seed 42 + multi-seed 54/54, firmware host tests 4444/0, fuzz 500,000 runs 0 crashes). The conditions are exactly the ones every phase carried: first green CI + release dry-run after push (post-push proof), and the Windows/human gates (§17.6). Nothing local is left unproven.
 
@@ -1008,10 +1015,10 @@ launch evidence available in CI; real paint stays a human gate
 
 **Scope:** RSH v2.0 redesign — Tauri 2 + React is superseded by Slint UI
 + `rsh-daemon`; firmware v4.0.2; protocol v2.1 **frozen** (no wire
-change). Sources: `REDESIGN-PLAN.md`, `LOGIC-FIX-PLAN.md`,
-`docs/V2-PHASE-0-GATE.md` (pairing root cause, [S] findings, Slint
-licence), `docs/V2-PHASE-1-SPIKE.md` (Slint 1.18.1 GO),
-`docs/V2-FIRMWARE-4.0.2-GATE.md` (F-01…F-16 gate PASS).
+change). Sources: `REDESIGN-PLAN.md`, `LOGIC-FIX-PLAN.md`
+(the v2.0 redesign plans). The gate reports cited here (pairing root
+cause, Slint 1.18.1 GO, F-01…F-16 gate PASS) were removed from docs/
+in the 2026-11-19 repo cleanup — see git history.
 
 ### 20.1 Decisions D-1 … D-13 (LOGIC-FIX-PLAN §9)
 
@@ -1026,7 +1033,7 @@ licence), `docs/V2-PHASE-1-SPIKE.md` (Slint 1.18.1 GO),
 | D-7 | HIDMaestro UAC + autostart (UAC prompt on every launch / at login) | **Lazy-start + optional elevated helper.** The sidecar starts only when "Send to game" is on (lazy-start); an elevated helper installed once (scheduled task, "run with highest privileges" on logon) is the option for autostart without a login-time UAC prompt. |
 | D-8 | Firmware "Check" meaning (Settings) | **Board version vs bundled signed image.** "Check" compares the board's firmware version against the signed image bundled in the app. No online check. |
 | D-9 | App auto-update in this release? | **No.** With the app still unsigned, no auto-update in v2.0 — "Check" + download link only. (Auto-update stays off; releases are manual download/install.) |
-| D-10 | Home Wi-Fi (STA) support | **No (AP-only).** The board is a Wi-Fi access point only — it never joins a home network. The "home Wi-Fi join" claim in the old docs was wrong and is corrected in `docs/USER-GUIDE.md`. |
+| D-10 | Home Wi-Fi (STA) support | **No (AP-only).** The board is a Wi-Fi access point only — it never joins a home network. The "home Wi-Fi join" claim in the old docs was wrong and is corrected in the README (the board is AP-only). |
 | D-11 | Release firmware: secure (encrypted NVS) vs normal image | **PENDING — not decided.** The secure build (`RSH_SECURE_NVS`, `esp32dev-secure` env) now compiles, but it is **not yet board-verified** and the eFuse steps are manual. A secure image flashed to a board without the matching eFuse/key provisioning breaks the update path. Decision procedure: verify on a sacrificial board first, then decide. **Recommendation (firmware gate): release v2.0 on the normal image (unchanged default, same posture as v4.0.1); revisit the secure image only after the sacrificial-board check passes and the key-provisioning runbook exists.** |
 | D-12 | Slint licence (Royalty-free 2.0, AboutSlint) | **Royalty-free 2.0, with AboutSlint attribution. GPLv3 is FORBIDDEN.** Verified 2026-11-16 from Slint's official FAQ + licence text (Phase 0 gate §5): an MIT-licensed desktop app may use Slint under Royalty-free 2.0 free of charge, provided it shows the `AboutSlint` widget in an About screen/dialog reachable from the top-level menu (or the "Made with Slint" badge on the public download page). GPLv3 would re-licence the distributed product as a whole under GPLv3, contradicting RSH's MIT licence — it must never be selected. |
 | D-13 | 3 s pair button only on unpaired board | **Yes (security).** The 3-second BOOT hold opens a 120 s pairing window only on an **unpaired** board. On a paired board the hold is ignored; re-pairing a paired board needs the guided "Reset pairing: hold BOOT for 10 s" (KEY_RESET) path. |
@@ -1035,7 +1042,7 @@ licence), `docs/V2-PHASE-1-SPIKE.md` (Slint 1.18.1 GO),
 
 **Decision: Slint (1.18.1) for the v2.0 UI; Tauri 2 + React is gone.**
 
-- Phase 1 spike verdict: **GO** (`docs/V2-PHASE-1-SPIKE.md`). Slint
+- Phase 1 spike verdict: **GO**. Slint
   1.18.1 (latest stable, 2026-09-21) reproduces the approved preview
   faithfully (Overview + Steering + tray popup), warm startup 59–100 ms,
   DPI scaling verified at 125%/150%, `SystemTrayIcon` built in since

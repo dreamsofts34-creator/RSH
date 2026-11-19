@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RSH v2.0.2 gate runner — docs/V2.0.2-GATE.md.
+# RSH gate runner.
 #
 # Runs the automated gate harness:
 #   0. version-check: [workspace.package] version == the main.slint
@@ -35,7 +35,7 @@
 #
 # Exit code is non-zero if any step fails. The rig + UI gate steps
 # are EXPECTED to fail while fix workers are still landing fixes —
-# see docs/V2.0.2-GATE.md for the per-check baseline and owners.
+# see tools/rsh-rig/src/gate_checks.rs for the per-check baseline and owners.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

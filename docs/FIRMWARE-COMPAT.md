@@ -1,25 +1,25 @@
 # RSH Rust — Firmware Compatibility (FW-A1 / FW-A2)
 
-**Tareekh:** 2026-11-14 · **Status:** FW-A1 + FW-A2 complete, FW-A4/A7 carried (neeche §8)
-**Frozen triple:** Rust app **v1.0.0** · C++ firmware **v4.0.1** · protocol **v2.1**
+**Tareekh:** 2026-11-14 · **Updated:** 2026-11-19 (current triple v2.0.4 × v4.0.2; the v4.0.1-era verification evidence in §1, §5 and §6 is kept as the recorded evidence) · **Status:** FW-A1 + FW-A2 complete, FW-A4/A7 carried (neeche §8)
+**Frozen triple:** Rust app **v2.0.4** · C++ firmware **v4.0.2** · protocol **v2.1**
 **Authority:** `reference/docs/PROTOCOL-V2.1.md` (wire contract) ·
 `reference/firmware-v4.0.1/` (C++ firmware source, unchanged) ·
 `reference/tests-host/` (C++ host tests + Python reference vectors).
 
 ## 0. Faisla (user decision, RESEARCH.md §8)
 
-C++ firmware v4.0.1 **stays** (Track A ships). Rust app v1.0.0 usi board se
+C++ firmware v4.0.2 **stays** (Track A ships). Rust app v2.0.4 usi board se
 baat karta hai, **koi reflash zaroori nahi** — protocol v2.1 frozen hai.
-Firmware mein koi change nahi hua; is doc ka kaam sirf ye prove karna hai ke
-Rust app C++ board ke saath byte-level compatible hai. esp-rs firmware
-(Track B spike) is doc ka hissa nahi — us ka alag worker hai.
+Is doc ka kaam ye prove karna hai ke Rust app C++ board ke saath
+byte-level compatible hai. esp-rs firmware (Track B spike) is doc ka
+hissa nahi — us ka alag worker hai.
 
 ## 1. Frozen contract — protocol v2.1 wire format
 
 | Cheez | Frozen value |
 |---|---|
-| App version | Rust v1.0.0 (nayi series; C# v2.0.4 se alag) |
-| Firmware version | C++ v4.0.1 (`FIRMWARE_VERSION "4.0.1"`, `config.h:134`) |
+| App version | Rust v2.0.4 (nayi series; C# v2.0.4 se alag) |
+| Firmware version | C++ v4.0.2 (`FIRMWARE_VERSION "4.0.2"`, `firmware/version.h`) — v4.0.1-era verification evidence (§5) kept as recorded; wire format unchanged, see §2.1 |
 | Protocol version | v2.1 (`0x21` har frame mein; HELLO proto `2.1`) |
 | Stream (board → PC, UDP 4211) | `"RSH2" \| ver 0x21 \| flags \| seq u16 \| ts u32 \| axisMask \| nEnc \| buttons u32 \| rsv u16=0 \| axes u16×N (mV) \| encoders i16×nEnc (cumulative) \| CRC16` |
 | Status (board → PC, UDP 4211, 1 Hz) | magic `0xA6`, 34 B base / 38 B extended (btnsEx u32), seqGap + txFail CRC16 se pehle |
@@ -101,7 +101,7 @@ nahi kiye gaye — parser dono ko theek parse karta hai.
 
 | Rust app / daemon | C++ firmware | Protocol | Status |
 |---|---|---|---|
-| v2.0 daemon/app | **v4.0.2** | v2.1 | **SUPPORTED — full** (pair button, GET_DIAG, HORN_TEST, LED persistent, handbrake button mode, shifter sensitivity) |
+| v2.0.4 daemon/app | **v4.0.2** | v2.1 | **SUPPORTED — full, shipped combination (v2.0.4 release)** (pair button, GET_DIAG, HORN_TEST, LED persistent, handbrake button mode, shifter sensitivity) |
 | v2.0 daemon/app | v4.0.1 | v2.1 | DEGRADED — pair-button screen "Use USB or reboot wheel" fallback; GET_DIAG/HORN_TEST UNSUPPORTED; LED persistent / handbrake button mode unavailable (app ko blob mein type 13 ya handbrake flag bit0 nahi bhejna chahiye) |
 | v1.0.x app | v4.0.2 | v2.1 | SUPPORTED — purana app naye firmware se kaam karta hai (naye opcodes kabhi nahi bhejta; HELLO/GET_CAPS fw bytes `(4, 0, 2)`) |
 
@@ -402,7 +402,7 @@ accepts, C++ rejects). All three are now fixed in `pin.rs` too:
   `g3_eight_pinless_axes_no_limit_error`,
   `g3_two_pinless_batteries_hit_limit`.
 
-## 7. Release process (FW-A3 ka hissa — detail `REFLASH-GUIDE.md` mein)
+## 7. Release process (FW-A3 ka hissa)
 
 - Signed bins: `pio run` ke baad `sign_firmware.py` (post-build script)
   `firmware-signed.bin` banata hai = `firmware.bin` + **68 B trailer**,
@@ -417,14 +417,17 @@ accepts, C++ rejects). All three are now fixed in `pin.rs` too:
   Key **kabhi** repo/chat/log mein nahi aati — is doc mein sirf path aur
   fingerprint hai.
 - Board + app unsigned image ko reject karte hain (SEC-C-06, verify-before-
-  apply + anti-downgrade). Release assets: merged bin
-  `RSH-Firmware-DevKitV1-v4.0.1.bin` (956,032 B, Windows release runner;
-  Linux `pio run`: 955,984 B — host-toolchain variance, same source) +
-  `firmware-signed.bin` (890,564 B) + `SHA256SUMS`. Release workflow mein fail-closed verify hai
+  apply + anti-downgrade). Release assets (v2.0.4): merged bin
+  `RSH-Firmware-DevKitV1-v4.0.2.bin` (961,648 B) +
+  signed OTA `RSH-Firmware-DevKitV1-v4.0.2-OTA.bin` (896,180 B).
+  Release workflow mein fail-closed verify hai
   (signature + signed-region hash vs `firmware.bin`).
-- **Rust app v1.0.0 ko koi reflash nahi chahiye** — wahi board, wahi
-  firmware v4.0.1, protocol frozen. Reflash sirf naye board ya brick
-  recovery ke liye hai (procedure: `docs/REFLASH-GUIDE.md`).
+- **Rust app v2.0.4 ko koi reflash nahi chahiye** agar board pehle se
+  v4.0.2 par hai — wahi board, wahi firmware, protocol frozen.
+  v4.0.1 boards degraded mode mein chalte hain (§2.1); unhein app se
+  WebOTA update karo. Full-flash (merged bin, offset 0x0) sirf naye
+  board ya brick recovery ke liye hai — see the README firmware
+  section.
 
 ## 8. Open items / carried conditions
 

@@ -7,7 +7,7 @@
 //! `TEST_NONCE = a0..af` are NOT real secrets.
 //!
 //! Pipeline tick / engine E2E benches are intentionally absent: the
-//! engine is Phase B. See `docs/BASELINE.md` (TBD list).
+//! engine is Phase B.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use rsh_protocol::{

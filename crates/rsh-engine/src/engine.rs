@@ -136,7 +136,7 @@ impl TimerResolutionGuard {
 /// it (the watchdog fires after 250 ms of silence), while a
 /// reordered jump sits just below 2³². Reading the raw wrapping
 /// delta as an unsigned gap recorded a near-2³² µs jitter
-/// sample in `chaos-net` (PERF-H2.md §4.1); the signed reading
+/// sample in `chaos-net`; the signed reading
 /// keeps it at the true ~15 000 µs.
 #[must_use]
 pub fn signed_timestamp_delta_us(new: u32, old: u32) -> i64 {
@@ -1350,7 +1350,7 @@ mod tests {
 
     #[tokio::test]
     async fn reordered_frame_does_not_overflow_jitter_p99() {
-        // Regression (chaos-net, PERF-H2.md §4.1): a reordered
+        // Regression (chaos-net): a reordered
         // arrival lands behind the previous board timestamp, and
         // the old unsigned reading of the wrapping delta recorded
         // a ~4_294_957_295 µs jitter sample. The signed reading

@@ -1,6 +1,6 @@
 // RSH tray icon + menu (REDESIGN-PLAN §7.7/§7.8, TrayMenu.html).
-// Reuses the Phase 1 spike's SystemTrayIcon approach (docs/
-// V2-PHASE-1-SPIKE.md §3): the built-in `clicked` is forwarded in
+// Reuses the Phase 1 spike's SystemTrayIcon approach: the built-in
+// `clicked` is forwarded in
 // .slint (`clicked => { tray-clicked(); }`) because it is not
 // exposed as `on_clicked` in the generated Rust API in 1.18.1.
 // The daemon owns this icon from startup (A-09) — it is created on

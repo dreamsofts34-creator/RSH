@@ -17,7 +17,7 @@
 //!   (`EngineMetrics::output_latency_p99`, handle-frame + send per
 //!   tick). Soak/user-chaos assert `outputLatencyP99Us <= 2000`
 //!   (the §8.4 `sloTargets.outputLatencyP99Us`); criterion benches
-//!   measure tick nanoseconds separately (`docs/PERF-H2.md`).
+//!   measure tick nanoseconds separately.
 //! * `clutch-range` gains a `clutchAxisMax <= 100` assertion: the C#
 //!   v1 harness could not observe clutch, the Rust harness can (§8.4
 //!   "naya rule": full assertions everywhere observable).
@@ -1268,7 +1268,7 @@ pub fn registry() -> Vec<Scenario> {
                 min_duration_s: 0.0,
             }],
         },
-        // ---- v2.0.2 gate checks (docs/V2.0.2-FIX-PLAN.md §C) ----
+        // ---- v2.0.2 gate checks (fix plan §C) ----
         // Contract-only (duration 0): the harness runs them via
         // run_contract, like the OTA checks above. `cargo run -p
         // rsh-rig -- --gate` runs only these.
