@@ -1,7 +1,7 @@
 //! Board → PC stream (§1.1) and status (§1.2) packets.
 //!
 //! Stream layout (`"RSH2"`, variable length):
-//! `magic[4] | ver 0x21 | flags | seq u16 | timestamp u32 | axisMask |
+//! `magic[4] | ver 0x22 | flags | seq u16 | timestamp u32 | axisMask |
 //! nEnc | buttons u32 | reserved u16=0 | axes u16 × popcount(mask) (mV) |
 //! encoders i16 × nEnc (cumulative) | CRC16`.
 //!
@@ -11,8 +11,8 @@
 use crate::crc::{crc16, verify_crc16_trailer};
 use crate::error::{RejectCounters, StatusError, StreamError};
 
-/// Wire version byte for protocol v2.1.
-pub const VERSION: u8 = 0x21;
+/// Wire version byte for protocol v2.2.
+pub const VERSION: u8 = 0x22;
 /// Maximum axes (D6).
 pub const MAX_AXES: usize = 8;
 /// Maximum encoders (D6).
@@ -65,7 +65,7 @@ impl StreamFlags {
     }
 }
 
-/// A decoded v2.1 stream packet (§1.1).
+/// A decoded v2.2 stream packet (§1.1).
 ///
 /// Axes are millivolts (D6 — no per-axis unit flag). Axis values are stored
 /// per slot index; a slot absent from the packet is `None`. Encoders are
@@ -293,7 +293,7 @@ impl StreamFrame {
 
 /// Detect a legacy v1 packet: first byte `0xA5` and second byte `0x01`
 /// (Appendix A). Such packets are recognised and routed to the legacy path —
-/// never parsed as v2.1.
+/// never parsed as v2.2.
 #[must_use]
 pub fn is_legacy(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == 0xA5 && data[1] == 0x01
@@ -327,7 +327,7 @@ pub fn classify_datagram(data: &[u8]) -> DatagramKind {
     }
 }
 
-/// A decoded v2.1 status packet (§1.2): 34 B base, 38 B extended.
+/// A decoded v2.2 status packet (§1.2): 34 B base, 38 B extended.
 ///
 /// Extended packets carry `btns_ex` (buttons 32–63) and are recognised by
 /// datagram length only. `seq_gap`/`tx_fail` sit immediately before the

@@ -58,7 +58,7 @@ fn run_flash(
     let target =
         WebOtaTarget::on_port(IpAddr::from([127, 0, 0, 1]), board.port(), board.password());
     let mut percents = Vec::new();
-    let mut confirm = || wait_for_board_version(&target, "4.0.2", Duration::from_secs(10));
+    let mut confirm = || wait_for_board_version(&target, "4.0.3", Duration::from_secs(10));
     let result = flash_firmware_with_pubkey(
         image_path,
         &target,
@@ -76,25 +76,25 @@ fn run_flash(
     (result, percents)
 }
 
-/// `ota-e2e-success`: a good signed 4.0.2 image flashes, the board
-/// restarts on the new version, and the flow confirms 4.0.2.
+/// `ota-e2e-success`: a good signed 4.0.3 image flashes, the board
+/// restarts on the new version, and the flow confirms 4.0.3.
 #[must_use]
 pub fn self_check_ota_e2e_success() -> (bool, String) {
     let board = FakeBoard::start("secret", (4, 0, 1));
-    let (image, _) = build_test_image("4.0.2", FIRMWARE_IMAGE_MIN_LEN);
+    let (image, _) = build_test_image("4.0.3", FIRMWARE_IMAGE_MIN_LEN);
     let path = write_image("success", &image);
     let (result, percents) = run_flash(&path, &board, (4, 0, 1));
     let _ = std::fs::remove_file(&path);
     if !result.success {
         return (false, format!("flash failed: {:?}", result.error));
     }
-    if result.version.as_deref() != Some("4.0.2") {
+    if result.version.as_deref() != Some("4.0.3") {
         return (
             false,
             format!("confirmed version wrong: {:?}", result.version),
         );
     }
-    if board.version() != (4, 0, 2) {
+    if board.version() != (4, 0, 3) {
         return (false, format!("board still on {:?}", board.version()));
     }
     if percents.last() != Some(&100) {
@@ -103,23 +103,23 @@ pub fn self_check_ota_e2e_success() -> (bool, String) {
     (
         true,
         format!(
-            "flash OK: 4.0.1 -> 4.0.2 confirmed, board on 4.0.2, upload reached 100% ({} reports)",
+            "flash OK: 4.0.1 -> 4.0.3 confirmed, board on 4.0.3, upload reached 100% ({} reports)",
             percents.len()
         ),
     )
 }
 
 /// `ota-e2e-same-version`: reinstalling the version the board already
-/// runs (4.0.2 over 4.0.2) is allowed — the board rule in
+/// runs (4.0.3 over 4.0.3) is allowed — the board rule in
 /// `ota_validate.h` and the app-side verifier both reject only
 /// *older* images, never an equal one. The flash succeeds, the
-/// confirm reads 4.0.2, and the board stays on 4.0.2.
+/// confirm reads 4.0.3, and the board stays on 4.0.3.
 #[must_use]
 pub fn self_check_ota_e2e_same_version_reinstall() -> (bool, String) {
-    let board = FakeBoard::start("secret", (4, 0, 2));
-    let (image, _) = build_test_image("4.0.2", FIRMWARE_IMAGE_MIN_LEN);
+    let board = FakeBoard::start("secret", (4, 0, 3));
+    let (image, _) = build_test_image("4.0.3", FIRMWARE_IMAGE_MIN_LEN);
     let path = write_image("same-version", &image);
-    let (result, percents) = run_flash(&path, &board, (4, 0, 2));
+    let (result, percents) = run_flash(&path, &board, (4, 0, 3));
     let _ = std::fs::remove_file(&path);
     if !result.success {
         return (
@@ -127,13 +127,13 @@ pub fn self_check_ota_e2e_same_version_reinstall() -> (bool, String) {
             format!("same-version reinstall failed: {:?}", result.error),
         );
     }
-    if result.version.as_deref() != Some("4.0.2") {
+    if result.version.as_deref() != Some("4.0.3") {
         return (
             false,
             format!("confirmed version wrong: {:?}", result.version),
         );
     }
-    if board.version() != (4, 0, 2) {
+    if board.version() != (4, 0, 3) {
         return (
             false,
             format!(
@@ -148,7 +148,7 @@ pub fn self_check_ota_e2e_same_version_reinstall() -> (bool, String) {
     (
         true,
         format!(
-            "reinstall OK: 4.0.2 over 4.0.2 confirmed, board stays on 4.0.2, upload reached 100% ({} reports)",
+            "reinstall OK: 4.0.3 over 4.0.3 confirmed, board stays on 4.0.3, upload reached 100% ({} reports)",
             percents.len()
         ),
     )
@@ -163,7 +163,7 @@ pub fn self_check_ota_e2e_bad_signature() -> (bool, String) {
     // (a) Tampered image — app-side reject, board never contacted
     // (the flow validates before uploading).
     let board = FakeBoard::start("secret", (4, 0, 1));
-    let (mut image, _) = build_test_image("4.0.2", FIRMWARE_IMAGE_MIN_LEN);
+    let (mut image, _) = build_test_image("4.0.3", FIRMWARE_IMAGE_MIN_LEN);
     image[2000] ^= 0x01;
     let path = write_image("tampered", &image);
     let (result, _) = run_flash(&path, &board, (4, 0, 1));
@@ -190,11 +190,11 @@ pub fn self_check_ota_e2e_bad_signature() -> (bool, String) {
     // (b) Wrong-key image — the app is told the image's key (so its
     // own check passes) but the board trusts only the test key.
     let (wrong_key_image, wrong_pubkey) =
-        build_test_image_with_seed("4.0.2", FIRMWARE_IMAGE_MIN_LEN, &OTHER_TEST_SEED);
+        build_test_image_with_seed("4.0.3", FIRMWARE_IMAGE_MIN_LEN, &OTHER_TEST_SEED);
     let path = write_image("wrongkey", &wrong_key_image);
     let target =
         WebOtaTarget::on_port(IpAddr::from([127, 0, 0, 1]), board.port(), board.password());
-    let mut confirm = || wait_for_board_version(&target, "4.0.2", Duration::from_secs(2));
+    let mut confirm = || wait_for_board_version(&target, "4.0.3", Duration::from_secs(2));
     let result = flash_firmware_with_pubkey(
         &path,
         &target,
@@ -234,14 +234,14 @@ pub fn self_check_ota_e2e_bad_signature() -> (bool, String) {
 
 /// `ota-e2e-disconnect-rollback`: the connection drops mid-upload —
 /// the flash fails and the board keeps running 4.0.1; a retry with
-/// the link back succeeds to 4.0.2 (the board survived the abort).
+/// the link back succeeds to 4.0.3 (the board survived the abort).
 #[must_use]
 pub fn self_check_ota_e2e_disconnect_rollback() -> (bool, String) {
     let board = FakeBoard::start("secret", (4, 0, 1));
     board.set_fail_mode(FailMode::DropMidUpload {
         after_bytes: 30_000,
     });
-    let (image, _) = build_test_image("4.0.2", FIRMWARE_IMAGE_MIN_LEN);
+    let (image, _) = build_test_image("4.0.3", FIRMWARE_IMAGE_MIN_LEN);
     let path = write_image("disconnect", &image);
     let (result, _) = run_flash(&path, &board, (4, 0, 1));
     if result.success {
@@ -268,7 +268,7 @@ pub fn self_check_ota_e2e_disconnect_rollback() -> (bool, String) {
             format!("retry after the abort failed: {:?}", retry.error),
         );
     }
-    if board.version() != (4, 0, 2) {
+    if board.version() != (4, 0, 3) {
         return (
             false,
             format!("board on {:?} after a successful retry", board.version()),
@@ -276,7 +276,45 @@ pub fn self_check_ota_e2e_disconnect_rollback() -> (bool, String) {
     }
     (
         true,
-        "mid-upload drop failed the flash, board stayed on 4.0.1 (rollback); retry succeeded to 4.0.2".into(),
+        "mid-upload drop failed the flash, board stayed on 4.0.1 (rollback); retry succeeded to 4.0.3".into(),
+    )
+}
+
+/// `connect-migration-402-403`: a board still on the last
+/// pairing-era firmware (4.0.2) flashes the signed 4.0.3 image
+/// via the same `WebOTA` flow and confirms 4.0.3 (plan D6: the app
+/// is updated first, the board is flashed with the old stored
+/// Wi-Fi password, and 4.0.3 first boot deletes the old NVS
+/// secrets and comes up on an open AP — the NVS deletion itself
+/// is firmware behaviour, covered by the firmware host tests).
+#[must_use]
+pub fn self_check_connect_migration_402_403() -> (bool, String) {
+    let board = FakeBoard::start("secret", (4, 0, 2));
+    let (image, _) = build_test_image("4.0.3", FIRMWARE_IMAGE_MIN_LEN);
+    let path = write_image("migration-402-403", &image);
+    let (result, percents) = run_flash(&path, &board, (4, 0, 2));
+    let _ = std::fs::remove_file(&path);
+    if !result.success {
+        return (false, format!("migration flash failed: {:?}", result.error));
+    }
+    if result.version.as_deref() != Some("4.0.3") {
+        return (
+            false,
+            format!("confirmed version wrong: {:?}", result.version),
+        );
+    }
+    if board.version() != (4, 0, 3) {
+        return (false, format!("board still on {:?}", board.version()));
+    }
+    if percents.last() != Some(&100) {
+        return (false, format!("upload never reached 100%: {percents:?}"));
+    }
+    (
+        true,
+        format!(
+            "migration OK: 4.0.2 -> 4.0.3 confirmed, board on 4.0.3, upload reached 100% ({} reports)",
+            percents.len()
+        ),
     )
 }
 

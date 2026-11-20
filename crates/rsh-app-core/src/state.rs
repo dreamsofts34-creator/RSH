@@ -76,14 +76,14 @@
 //! - **The HMAC session gate is enforced (SEC-E-14, H1 condition 13).**
 //!   Stream frames are HELD at the forwarder until the session gate
 //!   is open: the gate opens only when a `BoardSession` has completed
-//!   its HMAC-verified `GET_CAPS` (pairing or resume) and the session
+//!   its unsigned `GET_CAPS` and the session
 //!   owner calls [`AppStateCore::open_session_gate`]. The gate closes
 //!   again on transport loss or disconnect — a new transport is a new
-//!   session and must re-authenticate. The session owner is the
+//!   session and must reconnect. The session owner is the
 //!   **activator (H5)**: [`activate_session_on`] runs inside the
 //!   forwarder, on the forwarder's own transport, before the frame
-//!   loop — it sends a flag-1 HELO for a fresh nonce (D30), runs
-//!   `BoardSession::pair` / `resume` (signed `GET_CAPS` first), opens
+//!   loop — it sends a flag-1 HELO, runs `BoardSession::connect`
+//!   (unsigned `GET_CAPS` first), opens
 //!   the gate on success, and hands the transport back via
 //!   [`BoardSession::take_transport`](rsh_transport::session::BoardSession::take_transport)
 //!   so the same transport streams frames. A failed activation leaves
@@ -157,7 +157,7 @@ use std::os::windows::process::CommandExt;
 
 use rsh_api::ButtonBinding;
 use rsh_api::RawMv;
-use rsh_api::connection::{BAD_TAG_RETRY_DELAY, HELLO_ATTEMPTS, HELLO_WAIT};
+use rsh_api::connection::{HELLO_ATTEMPTS, HELLO_WAIT};
 use rsh_api::errors::ConnectionError;
 use rsh_api::{FirmwareCheck, FirmwareUpdateStatus};
 use rsh_engine::calibration::{CalibrationError, MIN_SPAN_MV, validate_pedal_range};
@@ -190,7 +190,6 @@ use rsh_profiles::watcher::{
 };
 use rsh_protocol::config::ConfigBlob;
 use rsh_protocol::control::LedTestPattern;
-use rsh_protocol::hello::PAIRING_WINDOW_SECS;
 use rsh_protocol::stream::MAX_AXES;
 use rsh_protocol::stream::MAX_ENCODERS;
 use rsh_protocol::stream::StatusPacket;
@@ -221,7 +220,6 @@ use crate::draft::{DraftStatus, ProfileDraft};
 use crate::firmware_image;
 use crate::launcher::{GameLauncher, SystemSpawner};
 use crate::manual_games::ManualGameStore;
-use crate::secrets::ZeroizingString;
 use crate::snapshot::{
     ConnectionState, EncoderState, EngineSnapshot, EngineStats, LoopRateTracker, PedalSnapshot,
     SnapshotInput, build_engine_stats,
@@ -312,9 +310,6 @@ pub const GAME_STATE_EVENT: &str = "rsh://game-state";
 
 /// Event name for config rollback completions (C-EVT-1).
 pub const CONFIG_ROLLBACK_EVENT: &str = "rsh://config-rollback";
-
-/// Event name for pairing-window open/close transitions (C-EVT-1).
-pub const PAIRING_WINDOW_EVENT: &str = "rsh://pairing-window";
 
 /// Snapshot emission interval: 30 Hz ≈ 33 ms between emissions.
 pub const SNAPSHOT_EMIT_INTERVAL: Duration = Duration::from_millis(SNAPSHOT_EMIT_INTERVAL_MS);
@@ -586,9 +581,14 @@ pub struct TransportState {
     pub address: String,
     /// Failure reason, when the state is `error`.
     pub error: Option<String>,
-    /// True only once a `BoardSession` completed its HMAC-verified
+    /// True only once a `BoardSession` completed its unsigned
     /// `GET_CAPS` and the session owner opened the gate (SEC-E-14).
     pub session_active: bool,
+    /// Sticky reachable latch (D15): set on every HELLO observed,
+    /// cleared on disconnect / transport switch / `NoRoute` /
+    /// HELLO-timeout. Surfaced in `ConnectionInfo` via
+    /// `DaemonApi::connection_from`.
+    pub board_reachable: bool,
     /// Stream frames held by the closed session gate since engine start.
     pub frames_held_by_gate: u64,
 }
@@ -606,11 +606,11 @@ impl TransportState {
 
 /// The outcome of one successful session activation (H5): the board
 /// the session belongs to plus the `GET_CAPS` reply that authenticated
-/// it. Recorded on the state by the activator so the pairing-status
+/// it. Recorded on the state by the activator so the Wi-Fi-status
 /// and firmware-version commands have a real backend to read — the
 /// record exists only while a session is live (disconnect, transport
 /// loss, and engine stop clear it; a later reconnect is a new
-/// session and must re-authenticate).
+/// session and must reconnect).
 #[derive(Clone, Debug)]
 pub struct SessionActivation {
     /// Board MAC as reported by `HELLO` (`"AA:BB:CC:DD:EE:FF"`).
@@ -623,64 +623,18 @@ pub struct SessionActivation {
     pub caps: GetCapsReply,
 }
 
-/// Pairing status, as the `begin_pairing` / `get_pairing_status`
-/// commands report it (H5): how long the 60 s pairing window has
-/// left, the one-time Wi-Fi password while the window is open, and
-/// the last activation failure, if any. The password is held only
-/// while the window is open — it is cleared when the window expires,
-/// when pairing completes, and on disconnect — and it never appears
-/// in a log line or an error message.
-///
-/// M-9: the password is single-use — the first `pairing_status()`
-/// read returns it and every later read returns `None` until a new
-/// `HELLO` discloses a fresh one, so a second poll (or a second
-/// client) cannot re-read the same password.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct PairingStatus {
-    /// Seconds left in the 60 s pairing window; 0 when no window is open.
-    pub seconds_left: u64,
-    /// The one-time device password, shown once, or [`None`] when no
-    /// pairing window is open.
-    pub password: Option<String>,
-    /// The last session-activation failure, if any (cleared on the
-    /// next successful activation).
-    pub error: Option<String>,
-    /// True when the board's key-reset is armed (M-6): the `key_reset`
-    /// / `factory_reset` commands are meaningful now.
-    #[serde(default)]
-    pub key_reset_armed: bool,
-    /// Board MAC (`"AA:BB:CC:DD:EE:FF"`) of the board that sent the
-    /// last `HELLO`, when one was observed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub board_mac: Option<String>,
-    /// True when the last activation failed with `StoredKeyExists`
-    /// (M-7): the board already has a stored key and re-pairing needs
-    /// the user's explicit confirmation (`confirm_pairing_replacement`).
-    #[serde(default)]
-    pub replacement_required: bool,
-}
-
-/// One `HELLO` reply as the activator last observed it (H5): enough
-/// to report the pairing window without re-asking the board. The
-/// password is the transient one-time Wi-Fi password from the
-/// `HELLO` — held only while the window is open (see
-/// [`PairingStatus`]).
+/// One `HELLO` reply as the activator last observed it (H5):
+/// the board MAC + when it was seen — enough to report the board
+/// identity and to derive the `RSH-XXXX` SSID without re-asking
+/// the board. No password, no window, no key ever lives here.
+/// Only the MAC is kept: the firmware rides on the session
+/// activation once connected (and on the connection-log line),
+/// and nothing reads a HELLO timestamp — storing either would
+/// be dead code.
 #[derive(Clone, Debug)]
 struct ObservedHello {
-    /// The board reported itself unpaired.
-    unpaired: bool,
-    /// The 60 s pairing window was open when observed.
-    window_open: bool,
-    /// The board's key-reset is armed (M-6).
-    key_reset_armed: bool,
     /// Board MAC (`"AA:BB:CC:DD:EE:FF"`) that sent this `HELLO`.
     board_mac: String,
-    /// The one-time Wi-Fi password, when credentials were disclosed
-    /// (L-2: zeroized on drop, never logged).
-    password: Option<ZeroizingString>,
-    /// When the `HELLO` was observed (the window runs 60 s from here).
-    observed_at: Instant,
 }
 
 /// The outcome of one [`AppStateCore::activate_startup_backend`] call:
@@ -958,12 +912,11 @@ pub struct AppStateCore {
     /// clear it, so a dead session is never presented as live.
     session_activation: Mutex<Option<SessionActivation>>,
     /// The last session-activation failure, if any (H5): the
-    /// fail-closed reason the pairing status reports. Cleared on the
+    /// fail-closed reason the connection status reports. Cleared on the
     /// next successful activation and on disconnect.
     session_last_error: Mutex<Option<String>>,
-    /// The last `HELLO` the activator observed (H5): the pairing
-    /// window + transient one-time password for the pairing status.
-    /// Cleared when the window is consumed or on disconnect.
+    /// The last `HELLO` the activator observed (H5): board MAC +
+    /// firmware. Cleared on disconnect.
     session_last_hello: Mutex<Option<ObservedHello>>,
     /// The config-transaction record (H5-control): the resumable
     /// snapshot of the stage → commit → confirm → rollback flow
@@ -977,7 +930,7 @@ pub struct AppStateCore {
     config_txn: Mutex<ConfigTxnSnapshot>,
     /// App-level events queued for the frontend (C-EVT-1):
     /// `rsh://profile-switched`, `rsh://game-state`,
-    /// `rsh://config-rollback`, `rsh://pairing-window`. Drained by
+    /// `rsh://config-rollback`. Drained by
     /// the emitter thread (`drain_app_events`), which emits each
     /// through the Tauri window.
     pending_events: Mutex<Vec<(String, serde_json::Value)>>,
@@ -1021,43 +974,13 @@ pub struct AppStateCore {
     /// runs. Idle (`running: false`, `done: false`) until the first
     /// flash starts.
     firmware_update: Mutex<FirmwareUpdateStatus>,
-    /// Whether the user confirmed a key replacement (M-7): consumed
-    /// once by the next activation attempt, which then pairs with
-    /// replacement instead of failing with `StoredKeyExists`.
-    /// Phase 2 (RC-4): the flag is board-bound — it is consumed
-    /// only by a real `pair_with_replacement` attempt for the board
-    /// in [`Self::pairing_replacement_board`]; an attempt for a
-    /// different board, or one that fails with `WindowClosed` /
-    /// `WindowExpired` / `BoardMismatch`, leaves it armed.
-    pairing_replacement_allowed: Mutex<bool>,
-    /// Board id the confirmed replacement is armed for (M-7 /
-    /// RC-4): set by [`Self::confirm_pairing_replacement`] from
-    /// `replacement_required`, cleared when the flag is consumed.
-    pairing_replacement_board: Mutex<Option<String>>,
-    /// Board MAC the last activation failed with `StoredKeyExists`
-    /// for (M-7): the board the confirm dialog must name.
-    replacement_required: Mutex<Option<String>>,
-    /// Whether the one-time pairing password was already read (M-9):
-    /// the first `pairing_status()` read returns the password and
-    /// sets this; later reads return `None` until a new `HELLO`
-    /// discloses a fresh one.
-    password_consumed: Mutex<bool>,
-    /// The one-time pairing password stashed for the post-pairing
-    /// Wi-Fi rejoin (R2-27): filled by `note_observed_hello` from
-    /// every HELLO that discloses a password, independently of
-    /// `password_consumed` — the UI's `pairing_status()` read must
-    /// never starve the daemon's rejoin. The manager loop is the
-    /// single owner: it takes this once
-    /// ([`AppStateCore::take_rejoin_password`]) and hands it to the
-    /// rejoin step; cleared on disconnect / session clear.
-    pending_rejoin_password: Mutex<Option<ZeroizingString>>,
-    /// Board IP the live session authenticated against (M-1):
+    /// Board IP the live session connected against (M-1):
     /// `upload_firmware`'s HTTP leg is bound to this IP, never to a
     /// stale settings value.
     session_board_ip: Mutex<Option<IpAddr>>,
     /// The last session-activation failure, typed (Phase 2, C-01):
     /// the [`ConnectionError`] behind [`Self::session_last_error`].
-    /// The daemon's Connection Manager and the API's typed pairing
+    /// The daemon's Connection Manager and the API's typed session
     /// error read this — the UI matches on it instead of parsing a
     /// string (Phase 0 gate §4.3).
     session_last_error_typed: Mutex<Option<ConnectionError>>,
@@ -1071,31 +994,32 @@ pub struct AppStateCore {
     /// failed op still gets the error directly as its reply.
     control_last_error: Mutex<Option<String>>,
     /// Whether a forwarder activation exchange (flag-1 HELO →
-    /// signed `GET_CAPS`) is currently in flight (R2-28): set by
+    /// unsigned `GET_CAPS`) is currently in flight (R2-28): set by
     /// `activate_session_on`, cleared on every exit path. While set,
-    /// [`AppStateCore::activate_session`] no-ops instead of aborting
+    /// [`AppStateCore::connect_session`] no-ops instead of aborting
     /// the forwarder mid-activation via `connect_transport`.
     activation_in_flight: AtomicBool,
-    /// Pairing/connection log lines (Phase 0 gate §6): the redacted,
-    /// timestamped trail of pairing attempts — one line per
+    /// Sticky "board reachable" latch (D15): set on every HELLO
+    /// observed ([`Self::note_observed_hello`]), cleared on
+    /// disconnect / transport switch / `NoRoute` / HELLO-timeout.
+    /// The daemon reports it as `ConnectionInfo.board_reachable`;
+    /// the wizard Step 1 Next unlocks on it (HELLO-or-better),
+    /// never on `Active` alone.
+    board_reachable: AtomicBool,
+    /// Connection log lines (Phase 0 gate §6): the redacted,
+    /// timestamped trail of connection attempts — one line per
     /// transition, never per poll. The daemon drains this into the
     /// diagnostics log file; tests read it directly. Capped at 200
     /// lines (oldest dropped).
-    pairing_log: Mutex<VecDeque<String>>,
-    /// Retained tail of the pairing log (R2-23/R2-42): the last
-    /// [`PAIRING_LOG_TAIL_LINES`] lines, kept for `pairing_status()`
-    /// readers. The manager loop drains `pairing_log` every 250 ms
-    /// for the diagnostics file (DS-32) — without this second
-    /// buffer the UI's 1 Hz `pairing_status()` read almost always
-    /// saw an empty log. This buffer is NEVER drained, only capped,
-    /// so a drain can no longer starve the UI.
-    pairing_log_tail: Mutex<VecDeque<String>>,
-    /// Whether the "window state: open" line was already emitted for
-    /// the current window (one line per transition, §6.3).
-    window_open_logged: Mutex<bool>,
-    /// Whether the "window expired" line was already emitted for the
-    /// current window.
-    window_expiry_logged: Mutex<bool>,
+    connection_log: Mutex<VecDeque<String>>,
+    /// Retained tail of the connection log (R2-23/R2-42): the last
+    /// [`CONNECTION_LOG_TAIL_LINES`] lines, kept for diagnostics
+    /// readers. The manager loop drains `connection_log` every
+    /// 250 ms for the diagnostics file (DS-32) — without this
+    /// second buffer the 1 Hz readers almost always saw an empty
+    /// log. This buffer is NEVER drained, only capped, so a drain
+    /// can no longer starve the reader.
+    connection_log_tail: Mutex<VecDeque<String>>,
     /// When the last stream frame arrived (C-04 heartbeat watchdog):
     /// the daemon's Connection Manager checks this — no frame for
     /// 2 s in `Active` means rebuild + re-activate.
@@ -1258,19 +1182,13 @@ impl AppStateCore {
             elevation_declined: AtomicBool::new(false),
             switch_in_flight: Mutex::new(()),
             firmware_update: Mutex::new(FirmwareUpdateStatus::default()),
-            pairing_replacement_allowed: Mutex::new(false),
-            pairing_replacement_board: Mutex::new(None),
-            replacement_required: Mutex::new(None),
-            password_consumed: Mutex::new(false),
-            pending_rejoin_password: Mutex::new(None),
+            board_reachable: AtomicBool::new(false),
             session_board_ip: Mutex::new(None),
             session_last_error_typed: Mutex::new(None),
             control_last_error: Mutex::new(None),
             activation_in_flight: AtomicBool::new(false),
-            pairing_log: Mutex::new(VecDeque::new()),
-            pairing_log_tail: Mutex::new(VecDeque::new()),
-            window_open_logged: Mutex::new(false),
-            window_expiry_logged: Mutex::new(false),
+            connection_log: Mutex::new(VecDeque::new()),
+            connection_log_tail: Mutex::new(VecDeque::new()),
             last_stream_frame_at: Mutex::new(None),
         }
     }
@@ -1415,14 +1333,14 @@ impl AppStateCore {
     }
 
     /// Opens the session gate: call only after a `BoardSession` has
-    /// completed its HMAC-verified `GET_CAPS` (pairing or resume) for
+    /// completed its unsigned `GET_CAPS` for
     /// the live transport. From here on the forwarder feeds stream
     /// frames to the engine. The gate closes again on transport loss
     /// or disconnect — a new transport is a new session and must
     /// re-authenticate.
     pub fn open_session_gate(&self) {
         if !*lock(&self.session_gate_open) {
-            self.push_pairing_log("INFO", "session gate: closed -> open");
+            self.push_connection_log("INFO", "session gate: closed -> open");
         }
         *lock(&self.session_gate_open) = true;
         self.note_engine_detail(
@@ -1435,7 +1353,7 @@ impl AppStateCore {
     /// loss and by disconnect handling; idempotent.
     pub fn close_session_gate(&self) {
         if *lock(&self.session_gate_open) {
-            self.push_pairing_log("INFO", "session gate: open -> closed");
+            self.push_connection_log("INFO", "session gate: open -> closed");
         }
         *lock(&self.session_gate_open) = false;
     }
@@ -1465,18 +1383,18 @@ impl AppStateCore {
 
     /// The last session-activation failure, typed (Phase 2): the
     /// [`ConnectionError`] behind [`Self::session_last_error`]. The
-    /// daemon's Connection Manager and the API's typed pairing error
-    /// read this — never parse the string.
+    /// daemon's Connection Manager and the API's typed connection
+    /// error read this — never parse the string.
     #[must_use]
     pub fn session_last_error_typed(&self) -> Option<ConnectionError> {
         *lock(&self.session_last_error_typed)
     }
 
-    /// The typed pairing error for the API (Phase 0 gate §4.3,
+    /// The typed connection error for the API (Phase 0 gate §4.3,
     /// backend part): the typed reason when one was recorded, else
     /// the stored reason string classified from its text.
     #[must_use]
-    pub fn pairing_error_typed(&self) -> Option<ConnectionError> {
+    pub fn session_error_typed(&self) -> Option<ConnectionError> {
         if let Some(typed) = self.session_last_error_typed() {
             return Some(typed);
         }
@@ -1485,55 +1403,55 @@ impl AppStateCore {
             .map(Self::classify_error_message)
     }
 
-    /// The pairing/connection log lines (Phase 0 gate §6), oldest
+    /// The connection log lines (Phase 0 gate §6), oldest
     /// first. The daemon drains these into the diagnostics log
-    /// file; a pairing attempt must leave lines here (regression
-    /// test: `begin_pairing` with no board).
+    /// file; a connection attempt must leave lines here
+    /// (regression test: connect with no board).
     #[must_use]
-    pub fn pairing_log_lines(&self) -> Vec<String> {
-        lock(&self.pairing_log).iter().cloned().collect()
+    pub fn connection_log_lines(&self) -> Vec<String> {
+        lock(&self.connection_log).iter().cloned().collect()
     }
 
-    /// The retained pairing-log tail (R2-23/R2-42): the last
-    /// [`PAIRING_LOG_TAIL_LINES`] lines, oldest first. This is what
-    /// `pairing_status()` returns — it is never drained, so the
-    /// manager loop's 250 ms file drain cannot starve the UI's
-    /// 1 Hz read, and the IPC shape stays small (≤20 lines).
+    /// The retained connection-log tail (R2-23/R2-42): the last
+    /// [`CONNECTION_LOG_TAIL_LINES`] lines, oldest first. It is
+    /// never drained, so the manager loop's 250 ms file drain
+    /// cannot starve a 1 Hz diagnostics read, and the IPC shape
+    /// stays small (≤20 lines).
     #[must_use]
-    pub fn pairing_log_tail_lines(&self) -> Vec<String> {
-        lock(&self.pairing_log_tail).iter().cloned().collect()
+    pub fn connection_log_tail_lines(&self) -> Vec<String> {
+        lock(&self.connection_log_tail).iter().cloned().collect()
     }
 
-    /// Drains the pairing/connection log lines (DS-32): returns all
+    /// Drains the connection log lines (DS-32): returns all
     /// lines queued since the last drain and clears the buffer — the
     /// `take_*` pattern `take_manager_log_lines()` already uses in
     /// `DaemonApi`. The manager loop drains with this instead of
     /// re-cloning the whole buffer and slicing by index every
-    /// 250 ms. `pairing_log_lines()` stays for tests and one-shot
+    /// 250 ms. `connection_log_lines()` stays for tests and one-shot
     /// readers.
     #[must_use]
-    pub fn take_pairing_log_lines(&self) -> Vec<String> {
-        lock(&self.pairing_log).drain(..).collect()
+    pub fn take_connection_log_lines(&self) -> Vec<String> {
+        lock(&self.connection_log).drain(..).collect()
     }
 
-    /// Push one redacted, timestamped pairing log line (Phase 0
-    /// gate §6.2 format: `[<ISO> <LEVEL> pairing] <message>`).
-    /// Every line goes through [`redact_secrets`] first — a secret
-    /// must never reach the log, even if a caller passes one in.
-    /// Capped at 200 lines (oldest dropped); one line per
-    /// transition, never per poll. The same line is also kept in
-    /// the retained tail (R2-23/R2-42, capped at
-    /// [`PAIRING_LOG_TAIL_LINES`]) for `pairing_status()` readers.
-    fn push_pairing_log(&self, level: &str, message: &str) {
-        let line = format!("[{} {level} pairing] {message}", utc_now_iso());
+    /// Push one redacted, timestamped connection log line
+    /// (Phase 0 gate §6.2 format: `[<ISO> <LEVEL> connection]
+    /// <message>`). Every line goes through [`redact_secrets`]
+    /// first — a secret must never reach the log, even if a caller
+    /// passes one in. Capped at 200 lines (oldest dropped); one
+    /// line per transition, never per poll. The same line is also
+    /// kept in the retained tail (R2-23/R2-42, capped at
+    /// [`CONNECTION_LOG_TAIL_LINES`]) for diagnostics readers.
+    fn push_connection_log(&self, level: &str, message: &str) {
+        let line = format!("[{} {level} connection] {message}", utc_now_iso());
         let line = redact_secrets(&line);
-        let mut log = lock(&self.pairing_log);
+        let mut log = lock(&self.connection_log);
         if log.len() >= 200 {
             log.pop_front();
         }
         log.push_back(line.clone());
-        let mut tail = lock(&self.pairing_log_tail);
-        if tail.len() >= PAIRING_LOG_TAIL_LINES {
+        let mut tail = lock(&self.connection_log_tail);
+        if tail.len() >= CONNECTION_LOG_TAIL_LINES {
             tail.pop_front();
         }
         tail.push_back(line);
@@ -1545,21 +1463,19 @@ impl AppStateCore {
     fn classify_session_error(error: &SessionError) -> ConnectionError {
         use rsh_transport::control_client::ControlError;
         match error {
-            SessionError::WindowClosed => ConnectionError::WindowClosed,
-            SessionError::WindowExpired => ConnectionError::WindowExpired,
-            SessionError::AlreadyPaired => ConnectionError::AlreadyPaired,
-            SessionError::BoardUnpaired => ConnectionError::BoardUnpaired,
-            SessionError::NoStoredKey => ConnectionError::NoStoredKey,
-            SessionError::StoredKeyExists => ConnectionError::StoredKeyExists,
-            SessionError::Control(ControlError::BadTag) => ConnectionError::BadTag,
+            // Pairing variants (`WindowClosed`, `StoredKeyExists`,
+            // …) no longer exist in v2.2 — the wildcard below maps
+            // anything unrecognised (including a stale variant a
+            // caller still produces) to `Unknown`, so this match
+            // stays exhaustive across the WS-2 SessionError rewrite.
+            SessionError::BoardMismatch => ConnectionError::BoardMismatch,
             SessionError::Control(ControlError::Timeout) => ConnectionError::Timeout,
-            SessionError::Control(_)
-            | SessionError::Keystore(_)
-            | SessionError::HelloParse(_)
-            | SessionError::InvalidHello(_)
-            | SessionError::NotActive
-            | SessionError::AlreadyActive
-            | SessionError::BoardMismatch => ConnectionError::Unknown,
+            // Every other `SessionError` (control failures,
+            // keystore failures, malformed HELLOs, …) maps to
+            // `Unknown` — the wildcard keeps this exhaustive
+            // across the WS-2 `SessionError` rewrite without
+            // naming variants that no longer exist.
+            _ => ConnectionError::Unknown,
         }
     }
 
@@ -1568,16 +1484,6 @@ impl AppStateCore {
     fn classify_error_message(message: &str) -> ConnectionError {
         if message.contains("no HELLO reply") || message.contains("board not responding") {
             ConnectionError::Unreachable
-        } else if message.contains("BadTag") || message.contains("bad tag") {
-            ConnectionError::BadTag
-        } else if message.contains("already stored") {
-            ConnectionError::StoredKeyExists
-        } else if message.contains("window expired") {
-            ConnectionError::WindowExpired
-        } else if message.contains("window is closed") || message.contains("pairing window") {
-            ConnectionError::WindowClosed
-        } else if message.contains("no device key") {
-            ConnectionError::NoStoredKey
         } else if message.contains("transport closed") {
             ConnectionError::TransportClosed
         } else {
@@ -1600,11 +1506,8 @@ impl AppStateCore {
         lock(&self.last_stream_frame_at).map(|at| at.elapsed().as_secs_f64())
     }
 
-    /// Records a successful activation: the board id + the `GET_CAPS`
-    /// reply that authenticated it. Clears the last activation error
-    /// and the transient pairing password (the window is consumed —
-    /// the one-time password must not linger in memory). Also clears
-    /// the replacement requirement: the board now has a live session.
+    /// Records a successful activation: the board id + the
+    /// `GET_CAPS` reply. Clears the last activation error.
     fn record_session_activation(&self, activation: SessionActivation) {
         let (firmware, protocol, board_mac) = (
             activation.firmware,
@@ -1614,16 +1517,8 @@ impl AppStateCore {
         *lock(&self.session_activation) = Some(activation);
         *lock(&self.session_last_error) = None;
         *lock(&self.session_last_error_typed) = None;
-        *lock(&self.replacement_required) = None;
-        *lock(&self.password_consumed) = true;
-        if let Some(observed) = lock(&self.session_last_hello).as_mut()
-            && observed.password.is_some()
-        {
-            observed.password = None;
-            self.push_pairing_log("INFO", "one-time password consumed/dropped (paired)");
-        }
         // Phase 0 gate §6.2 format 6 (success).
-        self.push_pairing_log(
+        self.push_connection_log(
             "INFO",
             &format!(
                 "activation ok: firmware={}.{}.{} protocol={}.{} board_mac={board_mac}",
@@ -1633,9 +1528,9 @@ impl AppStateCore {
     }
 
     /// Records a failed activation: the fail-closed reason the
-    /// pairing status reports, plus the engine detail (frames stay
-    /// held until a session authenticates). The gate is left exactly
-    /// as it was — a failed `GET_CAPS` never opens it.
+    /// connection status reports, plus the engine detail (frames
+    /// stay held until a session activates). The gate is left
+    /// exactly as it was — a failed `GET_CAPS` never opens it.
     /// Record a failed activation with its typed reason (Phase 2):
     /// sets both the string and the typed records, the engine
     /// detail, and the Phase 0 gate §6.2 format-6 failure line
@@ -1643,7 +1538,7 @@ impl AppStateCore {
     fn note_session_error_typed(&self, typed: ConnectionError, reason: &str) {
         *lock(&self.session_last_error) = Some(reason.to_string());
         *lock(&self.session_last_error_typed) = Some(typed);
-        self.push_pairing_log(
+        self.push_connection_log(
             "ERROR",
             &format!(
                 "activation failed: reason={} detail={}",
@@ -1652,7 +1547,7 @@ impl AppStateCore {
             ),
         );
         self.note_engine_detail(format!(
-            "{reason} — stream frames held until a session authenticates (SEC-E-14)"
+            "{reason} — stream frames held until a session activates (SEC-E-14)"
         ));
     }
 
@@ -1662,221 +1557,107 @@ impl AppStateCore {
     /// [`Self::note_session_error`]. The manager loop feeds only
     /// `session_last_error_typed` as `ActivationFailed`, so a
     /// control failure can no longer knock a live, streaming session
-    /// into `Error`. The pairing log still carries the failure (with
+    /// into `Error`. The connection log still carries the failure (with
     /// its own prefix, so it cannot be mistaken for an activation
     /// failure), and the IPC caller gets the error as its reply.
     fn note_control_error(&self, reason: &str) {
         *lock(&self.control_last_error) = Some(reason.to_string());
-        self.push_pairing_log("ERROR", &format!("control op failed: {reason}"));
+        self.push_connection_log("ERROR", &format!("control op failed: {reason}"));
     }
 
     /// The last control-session failure, if any (R2-05) — for
-    /// diagnostics; the pairing status never reads this.
+    /// diagnostics; the connection status never reads this.
     #[must_use]
     pub fn control_last_error(&self) -> Option<String> {
         lock(&self.control_last_error).clone()
     }
 
-    /// Records one `HELLO` as observed by the activator: the pairing
-    /// window + the transient one-time Wi-Fi password (only when the
-    /// `HELLO` actually discloses credentials — see
-    /// [`HelloReply::wifi_password_str`]). A fresh `HELLO` re-arms
-    /// the single-use password (M-9): a new window discloses a new
-    /// password, readable once. A window-open transition queues the
-    /// `rsh://pairing-window` event (C-EVT-1).
+    /// Records one `HELLO` as observed by the activator: the
+    /// board MAC + firmware, and sets the sticky
+    /// [`Self::board_reachable`] latch (D15) — the wizard Step 1
+    /// gate reads it. No password, no window, no key is ever
+    /// recorded here: a v2.2 `HELLO` discloses none of them.
     fn note_observed_hello(&self, hello: &HelloReply) {
-        let (was_open, was_unpaired) = match lock(&self.session_last_hello).as_ref() {
-            Some(observed) => (observed.window_open, observed.unpaired),
-            None => (false, false),
-        };
         let board_mac = hello
             .board_mac
             .iter()
             .map(|byte| format!("{byte:02X}"))
             .collect::<Vec<String>>()
             .join(":");
-        let window_open = hello.pairing_window_open();
-        let unpaired = hello.unpaired();
-        let password_disclosed = hello.wifi_password_str().is_some();
         *lock(&self.session_last_hello) = Some(ObservedHello {
-            unpaired,
-            window_open,
-            key_reset_armed: hello.key_reset_armed(),
             board_mac: board_mac.clone(),
-            password: hello.wifi_password_str().map(ZeroizingString::new),
-            observed_at: Instant::now(),
         });
-        // R2-27: stash a copy of the disclosed password for the
-        // post-pairing Wi-Fi rejoin, owned by the manager loop —
-        // independent of `password_consumed`, so the UI's first
-        // `pairing_status()` read can never starve the rejoin.
-        // The manager takes it once via `take_rejoin_password`;
-        // `clear_session_records` drops it on disconnect.
-        if let Some(password) = hello.wifi_password_str() {
-            *lock(&self.pending_rejoin_password) = Some(ZeroizingString::new(password));
-        }
-        // A fresh HELLO discloses a fresh password: re-arm single-use.
-        *lock(&self.password_consumed) = false;
-        // Phase 0 gate §6.2 format 3 (HELLO received — booleans only,
-        // never the password, never its length beyond the fixed
-        // 24-char field, never the key/nonce/tag).
-        self.push_pairing_log(
+        self.board_reachable.store(true, Ordering::SeqCst);
+        // Phase 0 gate §6.2 format 3 (HELLO received — MAC +
+        // firmware only, never a secret).
+        self.push_connection_log(
             "INFO",
             &format!(
-                "HELLO received: board_mac={board_mac} unpaired={unpaired} window_open={window_open} key_reset_armed={} password_disclosed={password_disclosed}",
-                hello.key_reset_armed()
+                "HELLO received: board_mac={board_mac} firmware={}.{}.{}",
+                hello.firmware.0, hello.firmware.1, hello.firmware.2
             ),
         );
-        // Phase 0 gate §6.2 format 5 (window transitions — one line
-        // per transition, never per poll).
-        if window_open && !was_open {
-            *lock(&self.window_open_logged) = true;
-            *lock(&self.window_expiry_logged) = false;
-            self.push_pairing_log(
-                "INFO",
-                &format!("window state: open (seconds_left={PAIRING_WINDOW_SECS})"),
-            );
-        }
-        if !unpaired && was_unpaired {
-            self.push_pairing_log("INFO", "window closed: board already paired");
-        }
-        if window_open && !was_open {
-            self.queue_app_event(
-                PAIRING_WINDOW_EVENT,
-                serde_json::json!({ "open": true, "boardMac": board_mac }),
-            );
+    }
+
+    /// Whether a board `HELLO` has been observed since the last
+    /// disconnect (D15 latch). The daemon reports it as
+    /// `ConnectionInfo.board_reachable`.
+    #[must_use]
+    pub fn board_reachable(&self) -> bool {
+        self.board_reachable.load(Ordering::SeqCst)
+    }
+
+    /// Clears the [`Self::board_reachable`] latch (D15): on
+    /// disconnect / transport switch / `NoRoute` / HELLO-timeout.
+    pub fn clear_board_reachable(&self) {
+        self.board_reachable.store(false, Ordering::SeqCst);
+    }
+
+    /// Board MAC of the last observed `HELLO`, when one was seen.
+    /// The daemon uses it for the `RSH-XXXX` SSID derivation and
+    /// the device-key migration (D6).
+    #[must_use]
+    pub fn last_observed_board_mac(&self) -> Option<String> {
+        lock(&self.session_last_hello)
+            .as_ref()
+            .map(|observed| observed.board_mac.clone())
+    }
+
+    /// Current Wi-Fi status (D20): the board hotspot SSID derived
+    /// from the last observed `HELLO` (`RSH-XXXX`, D4), whether
+    /// the board is connected (live session), and whether a Wi-Fi
+    /// password is stored for this board. Never carries a password.
+    #[must_use]
+    pub fn wifi_status(&self) -> rsh_api::WifiStatus {
+        use rsh_api::ssid_for_board_mac;
+        let board_mac = self.last_observed_board_mac();
+        let ssid = board_mac.as_deref().and_then(ssid_for_board_mac);
+        let password_set = board_mac
+            .as_deref()
+            .is_some_and(|mac| KeyStore::new().get_wifi_password(mac).is_ok());
+        rsh_api::WifiStatus {
+            ssid,
+            connected: self.session_gate_open(),
+            password_set,
+            board_mac,
         }
     }
 
     /// Clears the live session records: the activation (caps /
-    /// firmware), the last observed `HELLO` (including any transient
-    /// pairing password), and the last activation error. Called on
+    /// firmware), the last observed `HELLO`, and the last activation
+    /// error. Called on
     /// disconnect, transport loss, and engine stop — a later
-    /// reconnect is a new session and must re-authenticate (SEC-E-14);
+    /// reconnect is a new session and must reconnect (SEC-E-14);
     /// stale records must never present a dead session as live.
     /// Also clears the board-IP binding (M-1) and the replacement
     /// requirement (M-7).
     fn clear_session_records(&self) {
-        if let Some(observed) = lock(&self.session_last_hello).as_ref()
-            && observed.password.is_some()
-        {
-            self.push_pairing_log("INFO", "one-time password consumed/dropped (disconnect)");
-        }
         *lock(&self.session_activation) = None;
         *lock(&self.session_last_hello) = None;
         *lock(&self.session_last_error) = None;
         *lock(&self.session_last_error_typed) = None;
-        *lock(&self.pending_rejoin_password) = None;
-        *lock(&self.replacement_required) = None;
         *lock(&self.session_board_ip) = None;
-        *lock(&self.window_open_logged) = false;
-        *lock(&self.window_expiry_logged) = false;
-    }
-
-    /// The pairing status for the `begin_pairing` /
-    /// `get_pairing_status` commands: seconds left in the 60 s window
-    /// (0 when no window is open), the one-time password while the
-    /// window is open, and the last activation failure, if any. When
-    /// the window has expired the transient password is dropped from
-    /// the record here, so it never lingers in memory past the
-    /// window.
-    ///
-    /// M-9 single-use: the first read returns the password and marks
-    /// it consumed; every later read returns `None` until a new
-    /// `HELLO` discloses a fresh one. Internal callers that must not
-    /// consume (e.g. `begin_pairing`'s wait loop) use
-    /// [`pairing_status_peek`](Self::pairing_status_peek).
-    #[must_use]
-    pub fn pairing_status(&self) -> PairingStatus {
-        let status = self.pairing_status_peek();
-        if status.password.is_some() {
-            // First read consumed the password; the next read (via
-            // the peek's consumed check) returns `None`.
-            *lock(&self.password_consumed) = true;
-            // Phase 0 gate §6.2 format 8 (password lifecycle — the
-            // boolean fact only, never the password itself).
-            self.push_pairing_log(
-                "INFO",
-                "one-time password disclosed to UI (single-use; consumed on first read)",
-            );
-        }
-        status
-    }
-
-    /// The pairing status without consuming the one-time password
-    /// (M-9): for internal polling (`begin_pairing`'s wait loop).
-    /// The password is still hidden once consumed by a real
-    /// `pairing_status()` read.
-    #[must_use]
-    pub fn pairing_status_peek(&self) -> PairingStatus {
-        let mut hello = lock(&self.session_last_hello);
-        let (seconds_left, password) = match hello.as_ref() {
-            Some(observed) if observed.unpaired && observed.window_open => {
-                let elapsed = observed.observed_at.elapsed().as_secs();
-                if elapsed >= PAIRING_WINDOW_SECS {
-                    (0, None)
-                } else if *lock(&self.password_consumed) {
-                    (PAIRING_WINDOW_SECS - elapsed, None)
-                } else {
-                    (
-                        PAIRING_WINDOW_SECS - elapsed,
-                        observed
-                            .password
-                            .as_ref()
-                            .map(ZeroizingString::as_str)
-                            .map(str::to_string),
-                    )
-                }
-            }
-            _ => (0, None),
-        };
-        if seconds_left == 0
-            && let Some(observed) = hello.as_mut()
-        {
-            // Phase 0 gate §6.2 format 5 (expiry) + format 8 (drop):
-            // one line per transition, guarded so the 5 s UI poll
-            // never re-logs.
-            if observed.window_open && !*lock(&self.window_expiry_logged) {
-                *lock(&self.window_expiry_logged) = true;
-                *lock(&self.window_open_logged) = false;
-                self.push_pairing_log("INFO", "window expired (60 s from first HELLO)");
-            }
-            if observed.password.is_some() {
-                observed.password = None;
-                self.push_pairing_log(
-                    "INFO",
-                    "one-time password consumed/dropped (window expired)",
-                );
-            }
-        }
-        let (key_reset_armed, board_mac) = match hello.as_ref() {
-            Some(observed) => (observed.key_reset_armed, Some(observed.board_mac.clone())),
-            None => (false, None),
-        };
-        drop(hello);
-        PairingStatus {
-            seconds_left,
-            password,
-            error: self.session_last_error(),
-            key_reset_armed,
-            board_mac,
-            replacement_required: lock(&self.replacement_required).is_some(),
-        }
-    }
-
-    /// Takes the stashed post-pairing Wi-Fi password for the rejoin
-    /// step (R2-27): the manager loop is the single owner/consumer
-    /// of this stash. Taking it here does NOT consume the UI's
-    /// one-time disclosure (`password_consumed` is untouched), and
-    /// the UI's `pairing_status()` read does NOT consume this stash
-    /// — the two consumers can no longer race each other. Returns
-    /// [`None`] when no password was stashed (no window, or the
-    /// stash was already taken / cleared on disconnect).
-    #[must_use]
-    pub fn take_rejoin_password(&self) -> Option<String> {
-        lock(&self.pending_rejoin_password)
-            .take()
-            .map(|password| password.as_str().to_string())
+        self.board_reachable.store(false, Ordering::SeqCst);
     }
 
     /// Live button bitmask (H10, v2.0.2): the raw combined mask
@@ -1917,9 +1698,8 @@ impl AppStateCore {
     /// old forwarder and spawns a new one, which runs the activator
     /// again — and returns the current transport state. Activation
     /// itself is asynchronous (the forwarder runs it); the caller
-    /// polls `transport_state` / `pairing_status` for the outcome —
-    /// `session_active` turns true only once a signed `GET_CAPS`
-    /// succeeds.
+    /// polls `transport_state` for the outcome — `session_active`
+    /// turns true only once an unsigned `GET_CAPS` succeeds.
     ///
     /// R2-28: this no-ops (returns the current state) when the
     /// session gate is already open — a live session needs no
@@ -1927,62 +1707,22 @@ impl AppStateCore {
     /// in flight. Without the second guard, a manager `RetryTimer`
     /// firing mid-activation tore the forwarder down through
     /// `connect_transport` (supervisor abort + respawn) and
-    /// restarted the HELO → signed `GET_CAPS` exchange from
-    /// scratch, wasting attempts and risking a board-side `BadTag`
-    /// ("wheel busy"). The forwarder owns its own retry timing
-    /// while its activation runs; the manager's timer only matters
-    /// once that attempt has finished.
+    /// restarted the HELO → unsigned `GET_CAPS` exchange from
+    /// scratch, wasting attempts. The forwarder owns its own retry
+    /// timing while its activation runs; the manager's timer only
+    /// matters once that attempt has finished.
     ///
     /// # Errors
     ///
     /// Returns a message when no transport can be (re)connected (for
     /// example no serial board port is detected).
-    pub fn activate_session(self: &Arc<Self>) -> Result<TransportState, String> {
+    pub fn connect_session(self: &Arc<Self>) -> Result<TransportState, String> {
         if self.session_gate_open() || self.activation_in_flight.load(Ordering::SeqCst) {
             return Ok(self.transport_state());
         }
         let (kind, _) = self.transport_request();
         self.connect_transport(kind)?;
         Ok(self.transport_state())
-    }
-
-    /// Begins pairing: triggers a session-activation attempt (the
-    /// forwarder runs `BoardSession::pair` when the board reports
-    /// itself unpaired with the window open, `resume` otherwise) and
-    /// returns the pairing status. When a session is already active
-    /// this is a no-op returning the current status — it never tears
-    /// down a live session to re-pair. The returned status is the
-    /// last-known one; the frontend polls `get_pairing_status` while
-    /// the window is open, because the `HELLO` arrives
-    /// asynchronously in the forwarder.
-    ///
-    /// B-1 (v2.0.2): this returns IMMEDIATELY after triggering the
-    /// attempt — it must never wait for the window. The old ~3 s wait
-    /// loop blocked the daemon's IPC connection task (which handles
-    /// one request at a time inline), so the UI's 500 ms call timeout
-    /// fired mid-attempt ("Pairing failed"), the poller's calls queued
-    /// behind it and also timed out, and the UI showed
-    /// "Disconnected". Progress now arrives via `PairingWindow` /
-    /// `PairingFinished` events and the `pairing_status` poll.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when no transport can be (re)connected.
-    pub fn begin_pairing(self: &Arc<Self>) -> Result<PairingStatus, String> {
-        if self.session_gate_open() {
-            return Ok(self.pairing_status());
-        }
-        // Phase 0 gate §6.2 format 1 (attempt start).
-        let (kind, address) = self.transport_request();
-        self.push_pairing_log(
-            "INFO",
-            &format!(
-                "begin_pairing: transport={} address={address} attempt=1",
-                TransportState::kind_id(kind)
-            ),
-        );
-        self.activate_session()?;
-        Ok(self.pairing_status_peek())
     }
 
     /* ------------------------------------------------------------------ */
@@ -2144,9 +1884,9 @@ impl AppStateCore {
     /* H5-control: the 11 remaining commands (live-session control)      */
     /*                                                                     */
     /* Every command below runs under a fresh session via                */
-    /* [`run_control_session`] (flag-1 HELO → fresh nonce → signed      */
-    /* `GET_CAPS` first, fail-closed, session closed + key zeroized     */
-    /* afterwards). They are synchronous, like `begin_pairing`: each     */
+    /* [`run_control_session`] (flag-1 HELO → unsigned `GET_CAPS`      */
+    /* first, fail-closed, session closed afterwards). They are         */
+    /* synchronous: each                                                */
     /* builds a short-lived current-thread runtime and blocks on the    */
     /* helper — call only outside a tokio runtime (Tauri sync commands   */
     /* satisfy this). The transport comes from the requested kind        */
@@ -2215,9 +1955,10 @@ impl AppStateCore {
     /// password is stored as the Wi-Fi / OTA password too (one
     /// credential for both). On success the session gate closes and
     /// the session records clear — the board restarts its AP after
-    /// replying, so the session is dead. The OS Wi-Fi profile still
-    /// holds the OLD password: the user must rejoin the board's AP
-    /// with the new one.
+    /// replying, so the session is dead. The daemon updates the
+    /// Windows WLAN profile with the new password in the same
+    /// `set_wifi_password` call (D8) and rejoins, so the PC
+    /// reconnects with the new password.
     ///
     /// # Errors
     ///
@@ -2326,49 +2067,44 @@ impl AppStateCore {
         }
     }
 
-    /// Rotates the board's device key (`key_reset`, M-6): only
-    /// meaningful while the board's key-reset is armed
-    /// (`PairingStatus.key_reset_armed`). On success the gate closes
-    /// and the session records clear — the new key arrives via a
-    /// fresh `HELLO`, so the user must re-pair.
+    /// Forget the Wi-Fi password on the PC side (`key_reset`,
+    /// D7): deletes the stored `:wifi` password for the current
+    /// board, closes the session gate, and clears the session
+    /// records. There is NO wire opcode anymore — the board-side
+    /// password is cleared only by holding BOOT ≥ 10 s on the
+    /// board itself (firmware clears it and reboots to open AP),
+    /// so the caller must tell the user that if the board still
+    /// has a password. A missing stored password is already-reset
+    /// (`NotFound` is fine).
     ///
     /// # Errors
     ///
-    /// Returns a message when key-reset is not armed, no board
-    /// answers, or the session fails to activate.
+    /// Returns a message when the stored password cannot be deleted
+    /// for a reason other than "not stored".
     pub fn key_reset(self: &Arc<Self>) -> Result<(), String> {
-        if !self.pairing_status_peek().key_reset_armed {
-            return Err(
-                "key reset is not armed on the board — the board must report key_reset_armed \
-                 in its HELLO first (pairing window)"
-                    .to_string(),
-            );
+        if let Some(board_id) = self
+            .session_activation()
+            .map(|activation| activation.board_id)
+            .or_else(|| self.last_observed_board_mac())
+        {
+            match KeyStore::new().delete_wifi_password(&board_id) {
+                Ok(()) | Err(KeystoreError::NotFound) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "could not delete the stored Wi-Fi password for {board_id}: {error}"
+                    ));
+                }
+            }
         }
-        let result = match self.transport_request().0 {
-            TransportKind::Udp => block_on_control(run_control_session(
-                self,
-                self.build_udp_control_transport()?,
-                KeyStore::new(),
-                |session| Box::pin(op_key_reset(session)),
-            )),
-            TransportKind::Serial => block_on_control(run_control_session(
-                self,
-                self.build_serial_control_transport()?,
-                KeyStore::new(),
-                |session| Box::pin(op_key_reset(session)),
-            )),
-        };
-        if result.is_ok() {
-            self.close_session_gate();
-            self.clear_session_records();
-        }
-        result
+        self.close_session_gate();
+        self.clear_session_records();
+        Ok(())
     }
 
     /// Factory-resets the board (`factory_reset`, M-6): clears the
-    /// board's stored key, config, and Wi-Fi credentials. On success
-    /// the gate closes and the session records clear — the board is
-    /// unpaired afterwards and must be paired again.
+    /// board's config and Wi-Fi password. On success the gate
+    /// closes and the session records clear — the board reboots to
+    /// an open AP afterwards (set a fresh password in Settings).
     ///
     /// # Errors
     ///
@@ -2394,32 +2130,6 @@ impl AppStateCore {
             self.clear_session_records();
         }
         result
-    }
-
-    /// Confirms a key replacement (M-7): arms the one-time flag the
-    /// next activation attempt consumes to pair with replacement
-    /// instead of failing with `StoredKeyExists`, then triggers the
-    /// activation attempt. The dialog must name the board MAC from
-    /// `pairing_status().board_mac`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when no replacement is currently required
-    /// or the activation attempt cannot start.
-    pub fn confirm_pairing_replacement(self: &Arc<Self>) -> Result<TransportState, String> {
-        let Some(board) = lock(&self.replacement_required).clone() else {
-            return Err(
-                "no key replacement is pending — activation did not report StoredKeyExists \
-                 for any board"
-                    .to_string(),
-            );
-        };
-        // Phase 2 (RC-4): arm the flag for THIS board only — the
-        // activation attempt consumes it only for the same board
-        // MAC (see `activate_session_on`).
-        *lock(&self.pairing_replacement_allowed) = true;
-        *lock(&self.pairing_replacement_board) = Some(board);
-        self.activate_session()
     }
 
     /// Read the board's live config blob (`get_config`) as the JSON
@@ -2702,7 +2412,7 @@ impl AppStateCore {
     ///    anti-downgrade vs the live version (an older image is
     ///    rejected; an equal version is a reinstall).
     /// 3. The Wi-Fi password comes from the keystore (missing →
-    ///    "pair the board first").
+    ///    "set a Wi-Fi password in Settings first").
     /// 4. The image uploads over HTTP to the board's AP address
     ///    (settings `esp_ip`, default `192.168.4.1`) — the PC must be
     ///    joined to the board's Wi-Fi network for this leg; over
@@ -2749,8 +2459,8 @@ impl AppStateCore {
             Ok(password) => password,
             Err(KeystoreError::NotFound) => {
                 return Err(
-                    "no Wi-Fi password stored for this board — pair the board first, then \
-                     retry the upload"
+                    "no Wi-Fi password stored for this board — set a Wi-Fi password in \
+                     Settings first, then retry the upload"
                         .to_string(),
                 );
             }
@@ -2988,7 +2698,7 @@ impl AppStateCore {
         };
         let mut state = *lock(&self.connection);
         // C-02 defence in depth: "Connected" is only ever reported
-        // when the session gate is open (signed GET_CAPS passed).
+        // when the session gate is open (unsigned GET_CAPS passed).
         // A transport that is up but unauthenticated reports
         // Connecting, never Connected.
         if state == ConnectionState::Connected && !self.session_gate_open() {
@@ -3007,6 +2717,7 @@ impl AppStateCore {
             address,
             error,
             session_active: self.session_gate_open(),
+            board_reachable: self.board_reachable(),
             frames_held_by_gate: self.session_gate_held_frames(),
         }
     }
@@ -4643,8 +4354,10 @@ impl AppStateCore {
         })?;
         // R2-02: a (re)connect is a new session — the old
         // session is dead, so the gate closes here (SEC-E-14,
-        // same as `disconnect_transport`). The fresh forwarder
-        // re-authenticates and re-opens it, which is the rising
+        // same as `disconnect_transport`) and the reachable latch
+        // clears (D15: a transport switch clears it; the next
+        // HELLO re-sets it). The fresh forwarder
+        // reconnects and re-opens it, which is the rising
         // edge the daemon's manager loop needs to feed `CapsOk`.
         // Without this, a reconnect while the gate was still
         // open (e.g. after a watchdog latch left the manager in
@@ -4659,6 +4372,7 @@ impl AppStateCore {
         // failure (gate already closed); frames stay held until
         // the fresh `GET_CAPS` passes.
         self.close_session_gate();
+        self.clear_board_reachable();
         Ok(())
     }
 
@@ -4666,7 +4380,7 @@ impl AppStateCore {
     /// engine keeps ticking in its clean idle state (watchdog stale →
     /// neutral) — disconnecting never stops the engine. The session
     /// gate closes too, and the session records are cleared: a later
-    /// reconnect is a new session and must re-authenticate (SEC-E-14).
+    /// reconnect is a new session and must reconnect (SEC-E-14).
     ///
     /// # Errors
     ///
@@ -5152,59 +4866,49 @@ impl AppStateCore {
     }
 
     /* ------------------------------------------------------------------ */
-    /* v2.0.2 Round 3: pairing reset, board address, module toggles,    */
+    /* v2.0.2 Round 3: Wi-Fi password forget, board address, module toggles, */
     /* auto-pause, tray, backup, profile rename/link, knobs, firmware   */
     /* (B5, H2/H3/H4, H7, M1/M6/M7/M9, M-8) — backing impls for the     */
     /* AppApi trait methods; the daemon maps the String errors to       */
     /* typed UserError.                                                 */
     /* ------------------------------------------------------------------ */
 
-    /// Reset pairing (B5): forget the pairing so the board can be
-    /// paired again. When the board reported `key_reset_armed` (the
-    /// user held BOOT ≥ 10 s, so the board's HELLO arms the reset),
-    /// the board rotates its key ([`Self::key_reset`]: gate closes,
-    /// PC-side records clear). Otherwise only the PC-side session
-    /// records clear — the board still holds its key, so the next
-    /// pairing goes through the replacement path, and the UI must tell
-    /// the user to hold BOOT ≥ 10 s for a clean reset. Never
-    /// auto-starts a new pairing: the user presses Pair when ready.
+    /// Forget the Wi-Fi password ("Forget password / reset to open
+    /// AP", D19): deletes the stored `:wifi` password for the
+    /// current board, closes the session gate, and clears the
+    /// session records. The daemon also deletes the Windows WLAN
+    /// profile in the same `clear_wifi_password` call. The
+    /// board-side password is cleared only by holding BOOT ≥ 10 s
+    /// (D7) — the caller must tell the user that if the board
+    /// still has a password. A missing stored password is
+    /// already-forgotten (`NotFound` is fine).
     ///
     /// # Errors
     ///
-    /// Returns a message when the board-side key reset fails.
-    pub fn reset_pairing(self: &Arc<Self>) -> Result<PairingStatus, String> {
-        if self.pairing_status_peek().key_reset_armed {
-            self.key_reset()?;
-        } else if let Some(board_id) = lock(&self.replacement_required).clone() {
-            // Phase 2 (RC-2): Reset in the StoredKeyExists state
-            // ACTUALLY deletes the stored device key (+ Wi-Fi
-            // password) for this board — the old code only cleared
-            // the PC-side session records, so the stored key
-            // survived and the next pairing failed identically.
-            // A missing key is already-reset (NotFound is fine);
-            // any other keystore failure fails the reset honestly
-            // instead of pretending it worked.
-            let store = KeyStore::new();
-            match store.delete_device_key(&board_id) {
+    /// Returns a message when the stored password cannot be deleted
+    /// for a reason other than "not stored".
+    pub fn clear_wifi_password(self: &Arc<Self>) -> Result<(), String> {
+        if let Some(board_id) = self
+            .session_activation()
+            .map(|activation| activation.board_id)
+            .or_else(|| self.last_observed_board_mac())
+        {
+            match KeyStore::new().delete_wifi_password(&board_id) {
                 Ok(()) | Err(KeystoreError::NotFound) => {}
                 Err(error) => {
                     return Err(format!(
-                        "reset pairing failed: could not delete the stored key for {board_id}: {error}"
+                        "could not delete the stored Wi-Fi password for {board_id}: {error}"
                     ));
                 }
             }
-            let _ = store.delete_wifi_password(&board_id);
-            self.push_pairing_log(
+            self.push_connection_log(
                 "INFO",
-                &format!("pairing reset: stored key deleted for board {board_id}"),
+                &format!("wifi password forgotten for board {board_id}"),
             );
-            self.close_session_gate();
-            self.clear_session_records();
-        } else {
-            self.close_session_gate();
-            self.clear_session_records();
         }
-        Ok(self.pairing_status_peek())
+        self.close_session_gate();
+        self.clear_session_records();
+        Ok(())
     }
 
     /// The board address the transport uses (H4): the persisted
@@ -5615,7 +5319,8 @@ impl AppStateCore {
             return Err(format!("{} — {}", err.title, err.what_to_do));
         }
         let password = KeyStore::new().get_wifi_password(&board_id).map_err(|_| {
-            "no Wi-Fi password stored for this board — pair the wheel first".to_string()
+            "no Wi-Fi password stored for this board — set a Wi-Fi password in Settings first"
+                .to_string()
         })?;
         let host: std::net::IpAddr = self
             .settings()
@@ -6745,11 +6450,11 @@ impl AppStateCore {
 /// Capacity of the engine supervisor's command channel (connect /
 /// disconnect commands are rare; a full channel is an error, never a
 /// block — see [`AppStateCore::connect_transport`]).
-/// Retained pairing-log tail for `pairing_status()` (R2-23/R2-42):
+/// Retained connection-log tail (R2-23/R2-42):
 /// the IPC shape carries at most this many recent lines, so a
 /// ~1 Hz slow poll never clones + serialises the full ≤200-line
 /// buffer.
-pub const PAIRING_LOG_TAIL_LINES: usize = 20;
+pub const CONNECTION_LOG_TAIL_LINES: usize = 20;
 
 const ENGINE_COMMAND_CAPACITY: usize = 16;
 
@@ -7342,7 +7047,7 @@ trait SessionTransport: PacketSource + ControlTransport {
         None
     }
 
-    /// Short transport label for pairing log lines (`"wifi"` /
+    /// Short transport label for connection log lines (`"wifi"` /
     /// `"usb"` — Phase 0 gate §6.2 format 1/2).
     fn transport_label(&self) -> &'static str {
         "unknown"
@@ -7416,9 +7121,9 @@ enum NewSessionHello {
 /// a `HELLO` timeout), then waits up to
 /// [`SESSION_HELLO_ATTEMPTS`] × [`SESSION_HELLO_WAIT`], preferring a
 /// reply with `session_echo 1` and keeping the most recent echo-0
-/// reply as a fallback (pairing works under any fresh nonce, and a
-/// stale-nonce resume fails loudly with `BAD_TAG` instead of silently
-/// opening the gate). A stale echo-0 reply triggers one more explicit
+/// reply as a fallback (a stale echo-0 reply fails loudly instead
+/// of silently opening the gate). A stale echo-0 reply triggers one
+/// more explicit
 /// flag-1 HELO; a timeout re-requests a new session once, then waits
 /// again.
 /// Whether the OS has a route to the board address (Phase 2,
@@ -7479,7 +7184,7 @@ async fn await_new_session_hello<T: SessionTransport>(
     // Serial is untouched, and the fake test transport (label
     // "unknown") never takes this branch.
     if transport.transport_label() == "wifi" && !wifi_route_exists(&state.settings().esp_ip) {
-        state.push_pairing_log(
+        state.push_connection_log(
             "WARN",
             &format!(
                 "no route to board {} — Wi-Fi not joined to the RSH network (or USB not plugged in); skipping HELO",
@@ -7492,7 +7197,7 @@ async fn await_new_session_hello<T: SessionTransport>(
     let send_helo = |state: &Arc<AppStateCore>, transport: &mut T| {
         match transport.request_hello(1) {
             Ok(()) => {
-                state.push_pairing_log(
+                state.push_connection_log(
                     "INFO",
                     &format!(
                         "HELO sent: session_flag=1 transport={} (fresh nonce requested)",
@@ -7504,7 +7209,7 @@ async fn await_new_session_hello<T: SessionTransport>(
                 // The send itself failed (e.g. sandbox blocks UDP
                 // `sendto`): log the attempt, not a success — the
                 // timeout below will still fire and fail closed.
-                state.push_pairing_log(
+                state.push_connection_log(
                     "WARN",
                     &format!(
                         "HELO send failed: transport={} error={error}",
@@ -7556,11 +7261,15 @@ async fn await_new_session_hello<T: SessionTransport>(
 /// Returns the session (live or not) plus the `GET_CAPS` outcome, so
 /// the caller keeps the session on failure and can still close it
 /// cleanly instead of dropping a half-open one.
+/// Open a session for one observed `HELLO` (no-pairing
+/// redesign, protocol v2.2): a single unsigned `connect(hello)`
+/// — an unsigned `GET_CAPS` first, no key, no nonce, no window,
+/// no replacement branch. The `BoardSession::connect` shape is
+/// WS-2's contract (plan §4: `resume()` → `connect()`).
 async fn open_session_for_hello<T, K>(
     transport: T,
     keystore: K,
     hello: &HelloReply,
-    allow_replacement: bool,
 ) -> (BoardSession<K, T>, Result<GetCapsReply, SessionError>)
 where
     T: SessionTransport,
@@ -7573,52 +7282,40 @@ where
         .collect::<Vec<String>>()
         .join(":");
     let mut session = BoardSession::new(&board_id, keystore, transport);
-    let outcome = if hello.unpaired() {
-        if allow_replacement {
-            session.pair_with_replacement(hello).await
-        } else {
-            session.pair(hello).await
-        }
-    } else {
-        session.resume(hello).await
-    };
+    let outcome = session.connect(hello).await;
     (session, outcome)
 }
 
 /// One session-activation attempt on `transport` (H5, SEC-E-14).
 ///
-/// The SEC-E-14 flow: transport up → session established via the
-/// HMAC control channel → signed `GET_CAPS` first →
+/// The SEC-E-14 flow: transport up → unsigned `GET_CAPS` first →
 /// `open_session_gate()` → frames flow to the engine/output.
 ///
 /// 1. Awaits a new-session `HELLO` via [`await_new_session_hello`]
-///    (flag-1 HELO — D30: only a new session gets a fresh nonce).
-/// 2. Runs [`open_session_for_hello`] (`pair` / `resume` — either
-///    way a signed `GET_CAPS` goes first and only its success
-///    activates the session). The device key + Wi-Fi password are
-///    stored in the OS credential store by `pair`; the in-memory key
-///    is zeroized on every exit path.
+///    (flag-1 HELO — a new session).
+/// 2. Runs [`open_session_for_hello`] (single unsigned
+///    `connect(hello)` — a `GET_CAPS` goes first and only its
+///    success activates the session).
 /// 3. On success records the activation and opens the session gate;
 ///    on any failure records the reason and leaves the gate exactly
 ///    as it was (closed in production) — fail-closed, never silently
 ///    opened.
 /// 4. Hands the transport back via `BoardSession::take_transport`
-///    (the session itself does not survive: the in-memory key was
-///    zeroized, and a later control operation starts a fresh session
-///    with a fresh nonce, exactly as D30 requires), so the forwarder
-///    can stream frames on the same transport.
+///    (the session itself does not survive: a later control
+///    operation starts a fresh session), so the forwarder can
+///    stream frames on the same transport.
 ///
 /// Returns [`None`] only when the transport died mid-activation (its
 /// `HELLO` channel closed): the caller treats that as transport loss
-/// and rebuilds. A failed activation (no `HELLO`, bad tag, no stored
-/// key, closed window, unavailable credential store) returns
-/// [`Some`] — the transport is alive, the gate stays closed, and the
-/// forwarder falls through to the frame loop, where frames are held
-/// and counted until a later activation succeeds.
+/// and rebuilds. A failed activation (no `HELLO`, unavailable
+/// credential store) returns [`Some`] — the transport is alive,
+/// the gate stays closed, and the forwarder falls through to the
+/// frame loop, where frames are held and counted until a later
+/// activation succeeds.
 /// Guard that marks a forwarder activation in flight (R2-28) and
 /// clears the flag on drop, so every exit path of
 /// `activate_session_on` — including the early `None` returns —
-/// clears it. While armed, `AppStateCore::activate_session` no-ops
+/// clears it. While armed, `AppStateCore::connect_session` no-ops
 /// instead of aborting the forwarder mid-activation.
 struct ActivationInFlightGuard<'a> {
     flag: &'a AtomicBool,
@@ -7634,26 +7331,6 @@ impl<'a> ActivationInFlightGuard<'a> {
 impl Drop for ActivationInFlightGuard<'_> {
     fn drop(&mut self) {
         self.flag.store(false, Ordering::SeqCst);
-    }
-}
-
-/// Phase 2 (RC-4): consume the confirmed replacement flag, but
-/// only for the board the user confirmed. Returns
-/// `(allow_replacement, armed_board)`; `armed_board` is the board
-/// the flag was armed for, so a failed attempt can re-arm it. A
-/// HELLO from any other board leaves the flag untouched.
-fn consume_replacement_allowance(
-    state: &Arc<AppStateCore>,
-    hello_board_id: &str,
-) -> (bool, Option<String>) {
-    let flag = *lock(&state.pairing_replacement_allowed);
-    let board = lock(&state.pairing_replacement_board).clone();
-    if flag && board.as_deref() == Some(hello_board_id) {
-        *lock(&state.pairing_replacement_allowed) = false;
-        *lock(&state.pairing_replacement_board) = None;
-        (true, board)
-    } else {
-        (false, board)
     }
 }
 
@@ -7681,6 +7358,9 @@ where
             // elapsed — the WARN line in `await_new_session_hello`
             // already names the fix; record Unreachable so the UI
             // shows its proactive Wi-Fi/USB banner + notification.
+            // D15: no route means no HELLO could have been seen —
+            // the reachable latch clears.
+            state.clear_board_reachable();
             state.note_session_error_typed(
                 ConnectionError::Unreachable,
                 &format!(
@@ -7701,7 +7381,8 @@ where
                 // runtime (a probe is up to 500 ms per candidate).
                 state.cached_board_port().unwrap_or_default()
             };
-            state.push_pairing_log(
+            state.clear_board_reachable();
+            state.push_connection_log(
                 "WARN",
                 &format!(
                     "HELLO timeout after {total_ms}ms (attempt {SESSION_HELLO_ATTEMPTS}/{SESSION_HELLO_ATTEMPTS}): board unreachable at {address} — check Wi-Fi is joined to the RSH network"
@@ -7718,42 +7399,9 @@ where
         }
         NewSessionHello::Found(hello) => {
             state.note_observed_hello(&hello);
-            // M-7 / Phase 2 (RC-4): a user-confirmed replacement is
-            // consumed once — and ONLY by a real
-            // `pair_with_replacement` attempt for the SAME board
-            // MAC. An attempt for a different board leaves the
-            // flag armed for the confirmed board; an attempt that
-            // fails before pairing (`WindowClosed` /
-            // `WindowExpired` / `BoardMismatch`) re-arms it below.
-            // (An `Unreachable` attempt never reaches this branch
-            // — no HELLO means the flag is untouched.)
-            // M-12: this guard is scoped inside the block and dropped
-            // before the `.await` below — no `std::sync::Mutex` guard
-            // is ever held across an await in this module.
-            let hello_board_id = hello
-                .board_mac
-                .iter()
-                .map(|byte| format!("{byte:02X}"))
-                .collect::<Vec<String>>()
-                .join(":");
-            let (allow_replacement, armed_board) =
-                consume_replacement_allowance(state, &hello_board_id);
-            let (mut session, outcome) =
-                open_session_for_hello(transport, keystore, &hello, allow_replacement).await;
-            // RC-4: the flag was spent on an attempt that could not
-            // pair — re-arm it for the confirmed board so the user
-            // does not have to confirm again.
-            if allow_replacement
-                && matches!(
-                    outcome,
-                    Err(SessionError::WindowClosed
-                        | SessionError::WindowExpired
-                        | SessionError::BoardMismatch)
-                )
-            {
-                *lock(&state.pairing_replacement_allowed) = true;
-                *lock(&state.pairing_replacement_board) = armed_board;
-            }
+            // M-12: no `std::sync::Mutex` guard is ever held across
+            // an await in this module.
+            let (mut session, outcome) = open_session_for_hello(transport, keystore, &hello).await;
             match outcome {
                 Ok(caps) => {
                     state.record_session_activation(SessionActivation {
@@ -7763,18 +7411,6 @@ where
                         caps,
                     });
                     state.open_session_gate();
-                }
-                Err(SessionError::StoredKeyExists) => {
-                    // M-7: the board already has a stored key — record
-                    // which board needs the user's explicit
-                    // confirmation instead of failing silently.
-                    *lock(&state.replacement_required) = Some(session.board_id().to_string());
-                    state.note_session_error_typed(
-                        ConnectionError::StoredKeyExists,
-                        "session activation failed: a device key is already stored for this \
-                         board; re-pairing with a different key needs user confirmation \
-                         (confirm_pairing_replacement)",
-                    );
                 }
                 Err(error) => {
                     let typed = AppStateCore::classify_session_error(&error);
@@ -7797,30 +7433,25 @@ where
 ///
 /// The helper the 11 remaining commands are built on: it opens a
 /// session exactly the way the activator does — [`await_new_session_hello`]
-/// (flag-1 HELO, fresh nonce, D30) then [`open_session_for_hello`]
-/// (signed `GET_CAPS` first) — runs the single operation `op` under
-/// that session, then closes the session and zeroizes the key. The
-/// session never survives the call, and the gate is never touched:
-/// this is a transient control session, not an activation — a
-/// successful op does not open the gate, and a failed op does not
-/// close a gate that was already open (the forwarder owns the gate).
-/// The transport is dropped afterwards: UDP control uses an ephemeral
-/// local port, and a serial control session holds the port only for
-/// the duration of the op.
+/// (flag-1 HELO) then [`open_session_for_hello`] (unsigned
+/// `GET_CAPS` first) — runs the single operation `op` under that
+/// session, then closes the session. The session never survives
+/// the call, and the gate is never touched: this is a transient
+/// control session, not an activation — a successful op does not
+/// open the gate, and a failed op does not close a gate that was
+/// already open (the forwarder owns the gate). The transport is
+/// dropped afterwards: UDP control uses an ephemeral local port,
+/// and a serial control session holds the port only for the
+/// duration of the op.
 ///
-/// Fail-closed throughout: no `HELLO`, a transport that died, a bad
-/// tag, a closed pairing window, or any op failure returns an
-/// [`Err`] with the reason (also recorded on the separate control
-/// channel via [`AppStateCore::note_control_error`] — never as an
-/// activation failure, so a failed control op cannot knock a live
-/// session into `Error` (R2-05)) — never a partial success. A
-/// successful activation whose op then fails still closes the session
+/// Fail-closed throughout: no `HELLO`, a transport that died, or
+/// any op failure returns an [`Err`] with the reason (also
+/// recorded on the separate control channel via
+/// [`AppStateCore::note_control_error`] — never as an activation
+/// failure, so a failed control op cannot knock a live session
+/// into `Error` (R2-05)) — never a partial success. A successful
+/// activation whose op then fails still closes the session
 /// cleanly before returning.
-///
-/// The `HELLO` answering the fresh HELO rotates the board's nonce
-/// (D30) — harmless to a live forwarder: the stream is
-/// unauthenticated and goes to the fixed port 4211, and the forwarder
-/// holds no control session of its own.
 async fn run_control_session<T, K, F, R>(
     state: &Arc<AppStateCore>,
     transport: T,
@@ -7863,10 +7494,7 @@ where
             Err(reason)
         }
         NewSessionHello::Found(hello) => {
-            // Control sessions never replace a stored key (M-7):
-            // replacement is an activation-time, user-confirmed act.
-            let (mut session, outcome) =
-                open_session_for_hello(transport, keystore, &hello, false).await;
+            let (mut session, outcome) = open_session_for_hello(transport, keystore, &hello).await;
             let result = match outcome {
                 Ok(_) => op(&mut session).await,
                 Err(error) => Err(format!("session activation failed: {error}")),
@@ -7887,7 +7515,7 @@ where
 
 /// Block the calling thread on a control future (H5-control).
 ///
-/// The control commands are synchronous (like `begin_pairing`), so
+/// The control commands are synchronous, so
 /// each builds a short-lived current-thread tokio runtime and blocks
 /// on [`run_control_session`]. Contract: call only OUTSIDE a tokio
 /// runtime — Tauri sync commands satisfy this; a call from inside a
@@ -7947,8 +7575,11 @@ where
 /// board AP password, then store the same password as the Wi-Fi / OTA
 /// password (the AP password and the `WebOTA` password are one
 /// credential — a stale stored password would 401 later uploads).
-/// If the keystore update fails the error says so plainly: the board
-/// password DID change, only the local record failed.
+/// The stored Wi-Fi password (if any) is sent as the current
+/// password (D3) — without it, changing a password that is already
+/// set fails with `BadPassword`. If the keystore update fails the
+/// error says so plainly: the board password DID change, only the
+/// local record failed.
 async fn op_set_password<T, K>(
     session: &mut BoardSession<K, T>,
     password: String,
@@ -7957,23 +7588,33 @@ where
     T: SessionTransport,
     K: KeyStoreLike,
 {
+    // D3: the v2.2 payload must carry the current password when one is
+    // set — the board rejects the change otherwise (BadPassword). The
+    // stored Wi-Fi password IS the current one (one credential); no
+    // password stored yet means first setup (current = none).
+    let board_id = session.board_id().to_string();
+    let current = session.keystore().get_wifi_password(&board_id).ok();
     {
         let Some(client) = session.control_client_mut() else {
             return Err("session has no control client — the session did not activate".to_string());
         };
         client
-            .set_password(password.as_bytes())
+            .set_password(current.as_deref().map(str::as_bytes), password.as_bytes())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| match error {
+                rsh_transport::control_client::ControlError::BoardError(
+                    rsh_protocol::control::ErrorCode::BadPassword,
+                ) => "the board already has a Wi-Fi password and the stored one did not match — if you forgot it, hold BOOT for 10 s to clear it, then set a new password".to_string(),
+                other => other.to_string(),
+            })?;
     }
-    let board_id = session.board_id().to_string();
     session
         .keystore()
         .store_wifi_password(&board_id, &password)
         .map_err(|error| {
             format!(
                 "board password changed, but the new password could not be stored ({error}) — \
-                 re-pair the board before the next firmware upload"
+                 set a Wi-Fi password in Settings before the next firmware upload"
             )
         })?;
     Ok(())
@@ -8090,15 +7731,6 @@ where
 }
 
 /// `KEY_RESET` under a fresh session (M-6).
-async fn op_key_reset<T, K>(session: &mut BoardSession<K, T>) -> Result<(), String>
-where
-    T: SessionTransport,
-    K: KeyStoreLike,
-{
-    session.key_reset().await.map_err(|error| error.to_string())
-}
-
-/// `FACTORY_RESET` under a fresh session (M-6).
 async fn op_factory_reset<T, K>(session: &mut BoardSession<K, T>) -> Result<(), String>
 where
     T: SessionTransport,
@@ -8532,7 +8164,7 @@ fn udp_config_for(state: &AppStateCore) -> UdpConfig {
 /// `HELLO` → `pair`/`resume` with a signed `GET_CAPS` first → gate
 /// opens on success. A failed activation does not stop the loop —
 /// the transport is alive and frames are held + counted until a
-/// later activation (reconnect / `begin_pairing`) succeeds. The loop
+/// later activation (reconnect) succeeds. The loop
 /// ends only when the task is aborted or the circuit breaker trips.
 async fn forward_with_retry<T, F>(
     state: Arc<AppStateCore>,
@@ -8717,9 +8349,6 @@ async fn forward_with_retry_with_policy<T, F>(
     F: FnMut() -> Option<T> + Send + 'static,
 {
     let mut backoff = ForwarderBackoff::new(policy);
-    // C-13: whether the one BadTag retry was already spent in this
-    // forwarder run (reset on every successful activation).
-    let mut bad_tag_retried = false;
     // R2-29: the factory runs behind a shared lock so each build
     // can be offloaded to the blocking pool below (the factory is
     // `FnMut`, and `spawn_blocking` takes `FnOnce` — one call per
@@ -8796,8 +8425,8 @@ async fn forward_with_retry_with_policy<T, F>(
             continue;
         };
         // C-02: the state is Connecting — NOT Connected — until the
-        // session gate opens (signed GET_CAPS passed). The old code
-        // set Connected here, before auth, so the UI showed
+        // session gate opens (unsigned GET_CAPS passed). The old code
+        // set Connected here, before the session, so the UI showed
         // "Connected" while no session existed.
         state.set_connection(ConnectionState::Connecting);
         state.set_engine_status(
@@ -8805,11 +8434,11 @@ async fn forward_with_retry_with_policy<T, F>(
                 transport: Some(kind),
             },
             format!(
-                "transport {} connected — authenticating session (SEC-E-14); frames held until the session gate opens",
+                "transport {} connected — connecting session (SEC-E-14); frames held until the session gate opens",
                 kind.as_str()
             ),
         );
-        // Session activation (H5): signed GET_CAPS first, gate opens
+        // Session activation (H5): unsigned GET_CAPS first, gate opens
         // only on success, transport handed back for streaming. A
         // failed activation returns the transport (gate stays closed);
         // only a transport that died mid-activation returns None, and
@@ -8832,12 +8461,9 @@ async fn forward_with_retry_with_policy<T, F>(
         };
         // C-01: a failed activation no longer falls through to the
         // frame loop "Connected" with no data (the old behaviour:
-        // one attempt, then "Connected" forever). The typed reason
-        // decides: user-action reasons (NoStoredKey / WindowClosed /
-        // StoredKeyExists) stop auto-retry and surface "Pairing
-        // needed"; BadTag gets one 10 s retry (C-13, the board
-        // rejects a new session for 10 s after an authenticated
-        // one); everything else enters the frame loop with the gate
+        // one attempt, then "Connected" forever). Nothing latches
+        // on a pairing reason anymore (pairing does not exist): a
+        // failed activation enters the frame loop with the gate
         // closed — the transport stays up, frames are held and
         // counted (SEC-E-14), and re-activation is attempted when
         // the backoff deadline fires. Dropping the transport on a
@@ -8845,66 +8471,44 @@ async fn forward_with_retry_with_policy<T, F>(
         // "gate closed" proof the rig relies on.
         let mut retry_deadline: Option<tokio::time::Instant> = None;
         if state.session_gate_open() {
-            // A connected + authenticated transport breaks the
-            // failure streak (M-11): the next loss starts again at
-            // the 2 s base. Only now — gate open, GET_CAPS passed —
-            // is it Connected.
+            // A connected transport breaks the failure streak
+            // (M-11): the next loss starts again at the 2 s base.
+            // Only now — gate open, GET_CAPS passed — is it
+            // Connected.
             backoff.record_success();
-            bad_tag_retried = false;
             state.set_connection(ConnectionState::Connected);
         } else {
-            match state.session_last_error_typed() {
-                Some(reason) if reason.needs_user_action() => {
-                    state.set_connection(ConnectionState::Disconnected);
-                    state.set_engine_status(
-                        EngineTaskStatus::Running { transport: None },
-                        format!("pairing needed: {} — {}", reason.code(), reason.hint()),
-                    );
-                    return;
-                }
-                Some(ConnectionError::BadTag) if !bad_tag_retried => {
-                    bad_tag_retried = true;
-                    state.note_engine_detail(
-                        "activation failed: BadTag — wheel busy, one retry in 10 s (C-13)"
-                            .to_string(),
-                    );
-                    tokio::time::sleep(BAD_TAG_RETRY_DELAY).await;
-                    continue;
-                }
-                _ => {
-                    let detail = format!(
-                        "transport {} session activation failed ({})",
-                        kind.as_str(),
-                        state.session_last_error().unwrap_or_default()
-                    );
-                    if let Some(delay) = backoff.record_failure() {
-                        retry_deadline = Some(tokio::time::Instant::now() + delay);
-                        state.set_engine_status(
-                            EngineTaskStatus::Running {
-                                transport: Some(kind),
-                            },
-                            format!(
-                                "{detail} — holding frames, retrying activation in {delay:?} (consecutive failure {})",
-                                backoff.consecutive_failures()
-                            ),
-                        );
-                    } else {
-                        state.set_connection(ConnectionState::Disconnected);
-                        state.set_engine_status(
-                            EngineTaskStatus::Running { transport: None },
-                            format!(
-                                "{detail} — circuit breaker open after {} consecutive failures; reconnect required (connect again from the UI)",
-                                backoff.consecutive_failures()
-                            ),
-                        );
-                        state.note_engine_detail(format!(
-                            "transport {} circuit breaker open after {} consecutive failures — forwarder stopped, user reconnect required",
-                            kind.as_str(),
-                            backoff.consecutive_failures()
-                        ));
-                        return;
-                    }
-                }
+            let detail = format!(
+                "transport {} session activation failed ({})",
+                kind.as_str(),
+                state.session_last_error().unwrap_or_default()
+            );
+            if let Some(delay) = backoff.record_failure() {
+                retry_deadline = Some(tokio::time::Instant::now() + delay);
+                state.set_engine_status(
+                    EngineTaskStatus::Running {
+                        transport: Some(kind),
+                    },
+                    format!(
+                        "{detail} — holding frames, retrying activation in {delay:?} (consecutive failure {})",
+                        backoff.consecutive_failures()
+                    ),
+                );
+            } else {
+                state.set_connection(ConnectionState::Disconnected);
+                state.set_engine_status(
+                    EngineTaskStatus::Running { transport: None },
+                    format!(
+                        "{detail} — circuit breaker open after {} consecutive failures; reconnect required (connect again from the UI)",
+                        backoff.consecutive_failures()
+                    ),
+                );
+                state.note_engine_detail(format!(
+                    "transport {} circuit breaker open after {} consecutive failures — forwarder stopped, user reconnect required",
+                    kind.as_str(),
+                    backoff.consecutive_failures()
+                ));
+                return;
             }
         }
         // Event-driven drain: awaiting the source blocks until a
@@ -8951,11 +8555,10 @@ async fn forward_with_retry_with_policy<T, F>(
             // R2-07: drain HELLO replies that arrived while
             // streaming — the frame loop is the only reader left
             // after activation, so without this the 8-cap channel
-            // overflow-drops and the observed window state goes
-            // stale (a new pairing window after a board reboot was
-            // never seen, and `seconds_left` was computed from a
-            // 60 s-old HELLO). Every reply refreshes the observed
-            // HELLO / window state via `note_observed_hello`.
+            // overflow-drops and the observed HELLO goes stale (a
+            // new HELLO after a board reboot was never seen).
+            // Every reply refreshes the observed HELLO via
+            // `note_observed_hello`.
             while let Some(hello) = transport.try_next_hello() {
                 state.note_observed_hello(&hello);
             }
@@ -10341,8 +9944,7 @@ mod tests {
     /// R2-05: a failed control op (LED test, config) records on its
     /// own channel and never knocks the live session into Error —
     /// `session_last_error_typed` (what the manager loop turns into
-    /// `ActivationFailed`) stays untouched, and so does the pairing
-    /// status error the wizard reads.
+    /// `ActivationFailed`) stays untouched.
     #[test]
     fn control_error_does_not_touch_session_error() {
         let (state, _dir) = test_state();
@@ -10353,7 +9955,7 @@ mod tests {
         );
         assert!(state.session_last_error_typed().is_none());
         assert!(state.session_last_error().is_none());
-        assert!(state.pairing_status_peek().error.is_none());
+        assert!(state.session_error_typed().is_none());
         // …and an activation failure still records on the session
         // channel, leaving the control channel alone.
         state.note_session_error_typed(ConnectionError::TransportClosed, "activation failed");
@@ -10364,56 +9966,63 @@ mod tests {
         );
     }
 
-    /// R2-27: the UI's `pairing_status()` read must not starve the
-    /// manager's Wi-Fi rejoin — the rejoin password lives in its own
-    /// stash, independent of the one-time UI disclosure.
+    /// D15: every observed `HELLO` sets the sticky
+    /// `board_reachable` latch and records the board MAC +
+    /// firmware; `wifi_status()` derives the `RSH-XXXX` SSID from
+    /// it. `clear_session_records` (disconnect) clears the latch.
     #[test]
-    fn rejoin_password_survives_ui_pairing_status_read() {
+    fn hello_observation_sets_board_reachable_and_wifi_status() {
         use rsh_protocol::hello::HelloReply;
 
         let (state, _dir) = test_state();
-        let mut wifi = [0_u8; 24];
-        wifi.copy_from_slice(b"TestPassword0123456789AB");
+        assert!(!state.board_reachable());
+        assert!(state.last_observed_board_mac().is_none());
+        let status = state.wifi_status();
+        assert!(status.ssid.is_none());
+        assert!(!status.connected);
+        assert!(!status.password_set);
         let hello = HelloReply {
-            flags: 0x09, // unpaired + window open
+            protocol: (2, 2),
+            flags: 0,
             session_echo: 0,
             board_mac: [0x20, 0x9B, 0xA9, 0x70, 0x9A, 0x55],
-            firmware: (4, 0, 2),
+            firmware: (4, 0, 3),
             nonce: [0; 16],
             device_key: [0; 32],
-            wifi_password: wifi,
+            wifi_password: [0; 24],
         };
         state.note_observed_hello(&hello);
-        // UI reads the one-time disclosure first…
-        let status = state.pairing_status();
-        assert!(status.password.is_some(), "UI gets the password once");
-        assert!(
-            state.pairing_status().password.is_none(),
-            "second UI read is empty"
-        );
-        // …and the manager still gets its own copy, exactly once.
+        assert!(state.board_reachable(), "HELLO sets the latch");
         assert_eq!(
-            state.take_rejoin_password().as_deref(),
-            Some("TestPassword0123456789AB")
+            state.last_observed_board_mac().as_deref(),
+            Some("20:9B:A9:70:9A:55")
         );
-        assert!(
-            state.take_rejoin_password().is_none(),
-            "stash is single-take"
-        );
+        let status = state.wifi_status();
+        assert_eq!(status.ssid.as_deref(), Some("RSH-9A55"));
+        assert_eq!(status.board_mac.as_deref(), Some("20:9B:A9:70:9A:55"));
+        assert!(!status.connected, "no live session yet");
+        // A second HELLO keeps the latch set (sticky, not toggled).
+        state.note_observed_hello(&hello);
+        assert!(state.board_reachable());
+        // Disconnect clears the latch + the last HELLO.
+        state.clear_session_records();
+        assert!(!state.board_reachable());
+        assert!(state.last_observed_board_mac().is_none());
+        assert!(state.wifi_status().ssid.is_none());
     }
 
-    /// R2-28: `activate_session` no-ops while an activation is
+    /// R2-28: `connect_session` no-ops while an activation is
     /// already in flight — a manager `RetryTimer` can no longer
     /// abort a mid-activation forwarder by starting a second
     /// `connect_transport`.
     #[test]
-    fn activate_session_noops_while_activation_in_flight() {
+    fn connect_session_noops_while_activation_in_flight() {
         let (state, _dir) = test_state();
         // No board is present, so a real activation attempt would
         // fail — the in-flight flag must short-circuit before any
         // transport work happens.
         state.activation_in_flight.store(true, Ordering::SeqCst);
-        assert!(state.activate_session().is_ok());
+        assert!(state.connect_session().is_ok());
         state.activation_in_flight.store(false, Ordering::SeqCst);
         // …and the guard clears the flag on drop, so a later
         // activation is not stuck behind a stale flag.
@@ -10534,36 +10143,6 @@ mod tests {
         settings.esp_ip = "127.0.0.1".to_string();
         let saved = state.set_settings(settings).expect("set settings");
         assert_eq!(saved.esp_ip, "127.0.0.1");
-    }
-
-    /// M-9: the one-time pairing password is readable exactly once —
-    /// the first `pairing_status()` returns it, the second returns
-    /// `None`, and a fresh `HELLO` re-arms it.
-    #[test]
-    fn pairing_password_is_single_use() {
-        let (state, _dir) = test_state();
-        let hello = act_pairing_hello([7u8; 32], [9u8; 16]);
-        state.note_observed_hello(&hello);
-        let first = state.pairing_status();
-        assert!(first.seconds_left > 0);
-        assert!(first.password.is_some(), "first read shows the password");
-        assert!(
-            !first.key_reset_armed,
-            "pairing HELLO does not arm key-reset"
-        );
-        assert_eq!(first.board_mac.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
-        let second = state.pairing_status();
-        assert_eq!(second.password, None, "second read hides the password");
-        assert!(second.seconds_left > 0, "the window itself is still open");
-        // A fresh HELLO discloses a fresh password: readable once more.
-        state.note_observed_hello(&hello);
-        assert!(state.pairing_status().password.is_some());
-        assert_eq!(state.pairing_status().password, None);
-        // The internal peek never consumes.
-        state.note_observed_hello(&hello);
-        assert!(state.pairing_status_peek().password.is_some());
-        assert!(state.pairing_status_peek().password.is_some());
-        assert!(state.pairing_status().password.is_some());
     }
 
     /// C-LED-1: the LED payload scales RGB by brightness and the
@@ -11767,7 +11346,7 @@ mod tests {
             state.snapshot().tx_fail
         );
         // Phase 3 — disconnect closes the gate: a later reconnect is
-        // a new session and must re-authenticate.
+        // a new session and must reconnect.
         let _ = state.disconnect_transport();
         assert!(
             !state.session_gate_open(),
@@ -12038,31 +11617,31 @@ mod tests {
         );
     }
 
-    /// DS-32: `take_pairing_log_lines()` drains once — the first
+    /// DS-32: `take_connection_log_lines()` drains once — the first
     /// drain returns the queued lines, the second returns nothing,
     /// and the read-back buffer is empty (the manager loop can no
     /// longer re-log a line or re-clone the buffer per tick).
     #[test]
-    fn ds32_take_pairing_log_lines_drains_once() {
+    fn ds32_take_connection_log_lines_drains_once() {
         let (state, _dir) = test_state();
-        assert_eq!(state.take_pairing_log_lines(), Vec::<String>::new());
+        assert_eq!(state.take_connection_log_lines(), Vec::<String>::new());
         state.open_session_gate();
-        let drained = state.take_pairing_log_lines();
+        let drained = state.take_connection_log_lines();
         assert_eq!(drained.len(), 1);
         assert!(
             drained[0].contains("session gate: closed -> open"),
             "{}",
             drained[0]
         );
-        assert_eq!(state.take_pairing_log_lines(), Vec::<String>::new());
-        assert_eq!(state.pairing_log_lines(), Vec::<String>::new());
+        assert_eq!(state.take_connection_log_lines(), Vec::<String>::new());
+        assert_eq!(state.connection_log_lines(), Vec::<String>::new());
     }
 
     /// R2-23/R2-42: the retained tail survives the manager-loop
-    /// drain (the UI's `pairing_status()` read must still see the
-    /// trail) and is capped at [`PAIRING_LOG_TAIL_LINES`] lines.
+    /// drain (a diagnostics read must still see the trail) and is
+    /// capped at [`CONNECTION_LOG_TAIL_LINES`] lines.
     #[test]
-    fn r2_pairing_log_tail_survives_drain_and_caps_at_20() {
+    fn r2_connection_log_tail_survives_drain_and_caps_at_20() {
         let (state, _dir) = test_state();
         for _ in 0..25 {
             state.open_session_gate();
@@ -12070,10 +11649,10 @@ mod tests {
         }
         // 50 lines pushed; the drain takes them all from the main
         // buffer — but the tail keeps the last 20.
-        assert_eq!(state.take_pairing_log_lines().len(), 50);
-        assert_eq!(state.pairing_log_lines(), Vec::<String>::new());
-        let tail = state.pairing_log_tail_lines();
-        assert_eq!(tail.len(), PAIRING_LOG_TAIL_LINES);
+        assert_eq!(state.take_connection_log_lines().len(), 50);
+        assert_eq!(state.connection_log_lines(), Vec::<String>::new());
+        let tail = state.connection_log_tail_lines();
+        assert_eq!(tail.len(), CONNECTION_LOG_TAIL_LINES);
         assert!(
             tail.last().is_some_and(|l| l.contains("open -> closed")),
             "tail ends with the newest line: {tail:?}"
@@ -12146,17 +11725,8 @@ mod tests {
     const ACT_BOARD_ID: &str = "AA:BB:CC:DD:EE:FF";
     /// Board MAC bytes.
     const ACT_BOARD_MAC: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-    /// First-boot device key disclosed by the board.
-    const ACT_KEY_ONE: [u8; 32] = [0x11; 32];
-    /// A different key (wrong board / evil twin).
-    const ACT_KEY_TWO: [u8; 32] = [0x22; 32];
-    /// First session nonce.
-    const ACT_NONCE_ONE: [u8; 16] = [0xA1; 16];
-    /// Fresh nonce after a reboot / new session.
-    const ACT_NONCE_TWO: [u8; 16] = [0xA2; 16];
-    /// Wi-Fi password disclosed on first pairing (24 ASCII bytes).
-    const ACT_WIFI_PASSWORD: &[u8; 24] = b"Ab3dEf6hJk9mNp2rSt5vXy8z";
-
+    /// No device keys / nonces exist in v2.2: the activator tests
+    /// need no key material at all — `connect()` is unsigned.
     /// In-memory [`KeyStoreLike`] for the activator tests (never
     /// touches the OS store). Entries live behind an [`Arc`] so the
     /// test keeps a handle to the store the activator consumed.
@@ -12176,56 +11746,16 @@ mod tests {
             }
         }
 
-        fn seed_device_key(&self, board_id: &str, key: [u8; 32]) {
-            let account = format!("board:{}", board_id.trim().to_ascii_uppercase());
-            self.entries
-                .lock()
-                .expect("test store lock")
-                .insert(("RSH".to_owned(), account), key.to_vec());
-        }
-
         /// The stored Wi-Fi password for `board_id`, if one was stored
-        /// (test inspection — the [`KeyStoreLike`] trait has no getter).
+        /// (test inspection — delegates to the [`KeyStoreLike`] getter).
         fn wifi_password(&self, board_id: &str) -> Option<String> {
-            let account = format!("board:{}:wifi", board_id.trim().to_ascii_uppercase());
-            self.entries
-                .lock()
-                .expect("test store lock")
-                .get(&("RSH".to_owned(), account))
-                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            self.get_wifi_password(board_id).ok()
         }
     }
 
     impl KeyStoreLike for ActKeyStore {
-        fn store_device_key(&self, board_id: &str, key: &[u8; 32]) -> Result<(), KeystoreError> {
-            let account = format!("board:{}", board_id.trim().to_ascii_uppercase());
-            self.entries
-                .lock()
-                .expect("test store lock")
-                .insert(("RSH".to_owned(), account), key.to_vec());
-            Ok(())
-        }
-
-        fn get_device_key(&self, board_id: &str) -> Result<[u8; 32], KeystoreError> {
-            let account = format!("board:{}", board_id.trim().to_ascii_uppercase());
-            let entries = self.entries.lock().expect("test store lock");
-            let blob = entries
-                .get(&("RSH".to_owned(), account))
-                .ok_or(KeystoreError::NotFound)?;
-            let mut key = [0u8; 32];
-            key.copy_from_slice(blob);
-            Ok(key)
-        }
-
-        fn delete_device_key(&self, board_id: &str) -> Result<(), KeystoreError> {
-            let account = format!("board:{}", board_id.trim().to_ascii_uppercase());
-            self.entries
-                .lock()
-                .expect("test store lock")
-                .remove(&("RSH".to_owned(), account))
-                .map_or(Err(KeystoreError::NotFound), |_| Ok(()))
-        }
-
+        // No-pairing redesign: the trait is Wi-Fi-password-only
+        // (WS-2 contract) — no device-key methods exist anymore.
         fn store_wifi_password(&self, board_id: &str, password: &str) -> Result<(), KeystoreError> {
             let account = format!("board:{}:wifi", board_id.trim().to_ascii_uppercase());
             self.entries
@@ -12233,6 +11763,16 @@ mod tests {
                 .expect("test store lock")
                 .insert(("RSH".to_owned(), account), password.as_bytes().to_vec());
             Ok(())
+        }
+
+        fn get_wifi_password(&self, board_id: &str) -> Result<String, KeystoreError> {
+            let account = format!("board:{}:wifi", board_id.trim().to_ascii_uppercase());
+            self.entries
+                .lock()
+                .expect("test store lock")
+                .get(&("RSH".to_owned(), account))
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .ok_or(KeystoreError::NotFound)
         }
 
         fn delete_wifi_password(&self, board_id: &str) -> Result<(), KeystoreError> {
@@ -12246,7 +11786,7 @@ mod tests {
     }
 
     /// The fake board's config state, shared across the fresh sessions
-    /// of one test (one board, many sessions — D30): what `GET_CFG`
+    /// of one test (one board, many sessions): what `GET_CFG`
     /// returns, the last-good blob `REVERT` restores, and the staged
     /// buffer `SET_CFG` accumulates into. `COMMIT` live-applies the
     /// staged blob (so `GET_CFG` returns it while the confirm window
@@ -12279,11 +11819,11 @@ mod tests {
     }
 
     /// A fake board as a session transport: answers `HELLO`s from a
-    /// configured reply, verifies control tags with its own key/nonce
-    /// (like the `FakeBoard` in `rsh-transport/src/session.rs`), and
-    /// serves stream frames from a channel. The `HELLO` behaviour is
-    /// switchable per test: answer always, never answer (forces the
-    /// activator's timeout), or report the transport closed.
+    /// configured reply, verifies control frames by CRC (protocol
+    /// v2.2 — no key, no tag), and serves stream frames from a
+    /// channel. The `HELLO` behaviour is switchable per test:
+    /// answer always, never answer (forces the activator's
+    /// timeout), or report the transport closed.
     ///
     /// The sent control frames and the board config live behind
     /// [`Arc`]s so a test keeps them after the transport is consumed
@@ -12293,8 +11833,6 @@ mod tests {
     /// board handle can also be shared across several fresh sessions
     /// against the "same" board via [`FakeSessionTransport::new_with_board`].
     struct FakeSessionTransport {
-        key: [u8; 32],
-        nonce: [u8; 16],
         hello: Option<HelloReply>,
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
         board: Arc<Mutex<FakeBoardConfig>>,
@@ -12307,29 +11845,17 @@ mod tests {
     }
 
     impl FakeSessionTransport {
-        fn new(key: [u8; 32], nonce: [u8; 16], hello: Option<HelloReply>) -> Self {
-            Self::new_with_board(
-                key,
-                nonce,
-                hello,
-                Arc::new(Mutex::new(FakeBoardConfig::new())),
-            )
+        fn new(hello: Option<HelloReply>) -> Self {
+            Self::new_with_board(hello, Arc::new(Mutex::new(FakeBoardConfig::new())))
         }
 
         /// Build a fake transport against a shared board (several
         /// fresh sessions, one board — the H5-control tests use this
         /// to run stage → commit → confirm across sessions).
-        fn new_with_board(
-            key: [u8; 32],
-            nonce: [u8; 16],
-            hello: Option<HelloReply>,
-            board: Arc<Mutex<FakeBoardConfig>>,
-        ) -> Self {
+        fn new_with_board(hello: Option<HelloReply>, board: Arc<Mutex<FakeBoardConfig>>) -> Self {
             let (_frame_tx, frame_rx) = tokio::sync::mpsc::channel(16);
             let (_status_tx, status_rx) = tokio::sync::mpsc::channel(16);
             Self {
-                key,
-                nonce,
                 hello,
                 sent: Arc::new(Mutex::new(Vec::new())),
                 board,
@@ -12442,26 +11968,12 @@ mod tests {
             let owned = bytes.to_vec();
             async move {
                 self.sent.lock().expect("sent log lock").push(owned.clone());
-                let Ok(frame) = rsh_protocol::ControlFrame::parse_structure(&owned) else {
+                // v2.2: frames are verified by CRC only — a bad CRC
+                // is dropped silently (never executed, never
+                // answered), like the real board.
+                let Ok(frame) = rsh_protocol::ControlFrame::verify(&owned) else {
                     return Ok(());
                 };
-                // A tag that fails under the board's key/nonce is
-                // answered BAD_TAG (tagged with the board's key/nonce,
-                // so the client sees a tag failure too).
-                if rsh_protocol::ControlFrame::verify(&owned, &self.key, &self.nonce).is_err() {
-                    let reply = rsh_protocol::control::build_reply(
-                        &self.key,
-                        &self.nonce,
-                        frame.cmd,
-                        frame.req_id,
-                        frame.counter,
-                        rsh_protocol::control::ErrorCode::BadTag,
-                        &[],
-                    )
-                    .expect("fake-board BAD_TAG reply builds");
-                    self.pending.push_back(reply);
-                    return Ok(());
-                }
                 let body = match frame.cmd {
                     cmd if cmd == rsh_protocol::control::Opcode::GetCaps as u8 => act_caps_body(),
                     cmd if cmd == rsh_protocol::control::Opcode::GetCfg as u8 => {
@@ -12486,11 +11998,8 @@ mod tests {
                     _ => Vec::new(),
                 };
                 let reply = rsh_protocol::control::build_reply(
-                    &self.key,
-                    &self.nonce,
                     frame.cmd,
                     frame.req_id,
-                    frame.counter,
                     rsh_protocol::control::ErrorCode::Ok,
                     &body,
                 )
@@ -12534,7 +12043,7 @@ mod tests {
         }
     }
 
-    /// A `GET_CAPS` body *after* the status byte: fw 4.0.1, proto 2.1,
+    /// A `GET_CAPS` body *after* the status byte: fw 4.0.1, proto 2.2,
     /// 8 axes / 64 buttons / 4 encoders, Wi-Fi channel 6, one pin-table
     /// entry (pin 34). Mirrors the helper in
     /// `rsh-transport/src/session.rs` tests.
@@ -12543,7 +12052,7 @@ mod tests {
             status: rsh_protocol::control::ErrorCode::Ok,
             board_mac: ACT_BOARD_MAC,
             firmware: (4, 0, 1),
-            protocol: (2, 1),
+            protocol: (2, 2),
             n_axes_max: 8,
             n_btn_max: 64,
             n_enc_max: 4,
@@ -12561,231 +12070,77 @@ mod tests {
         body
     }
 
-    /// A `HELLO` reply. `flags` bit0 unpaired, bit3 window open.
-    /// `session_echo` is 1 (answers the activator's new-session HELO)
-    /// unless the test overrides it afterwards.
-    fn act_hello(flags: u8, nonce: [u8; 16], key: [u8; 32], wifi: [u8; 24]) -> HelloReply {
+    /// A v2.2 `HELLO` reply: flags 0 (no pairing bits exist
+    /// anymore), `session_echo` 1 (answers the activator's
+    /// new-session HELO), zeroed reserved fields.
+    fn act_hello() -> HelloReply {
         HelloReply {
-            flags,
+            protocol: (2, 2),
+            flags: 0,
             session_echo: 1,
             board_mac: ACT_BOARD_MAC,
             firmware: (4, 0, 1),
-            nonce,
-            device_key: key,
-            wifi_password: wifi,
-        }
-    }
-
-    /// Unpaired board, window open, disclosing `key`.
-    fn act_pairing_hello(key: [u8; 32], nonce: [u8; 16]) -> HelloReply {
-        act_hello(0x09, nonce, key, *ACT_WIFI_PASSWORD)
-    }
-
-    /// Paired board (no credentials disclosed).
-    fn act_paired_hello(nonce: [u8; 16]) -> HelloReply {
-        act_hello(0x00, nonce, [0u8; 32], [0u8; 24])
-    }
-
-    /// A `GET_CAPS` reply for direct `SessionActivation` construction.
-    fn act_caps() -> GetCapsReply {
-        GetCapsReply {
-            status: rsh_protocol::control::ErrorCode::Ok,
-            board_mac: ACT_BOARD_MAC,
-            firmware: (4, 0, 1),
-            protocol: (2, 1),
-            n_axes_max: 8,
-            n_btn_max: 64,
-            n_enc_max: 4,
-            wifi_channel: 6,
-            caps_flags: 0,
-            pin_table: Vec::new(),
+            nonce: [0; 16],
+            device_key: [0; 32],
+            wifi_password: [0; 24],
         }
     }
 
     #[tokio::test]
-    async fn activator_resume_opens_gate_after_signed_get_caps() {
+    async fn activator_connect_opens_gate_after_unsigned_get_caps() {
         let (state, _dir) = test_state();
         assert!(!state.session_gate_open(), "gate starts closed");
         let store = ActKeyStore::new();
-        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
-        let transport = FakeSessionTransport::new(
-            ACT_KEY_ONE,
-            ACT_NONCE_TWO,
-            Some(act_paired_hello(ACT_NONCE_TWO)),
-        );
+        let transport = FakeSessionTransport::new(Some(act_hello()));
         let transport = activate_session_on(&state, transport, store)
             .await
             .expect("transport survives successful activation");
         assert!(
             state.session_gate_open(),
-            "gate opens after signed GET_CAPS: {:?}",
+            "gate opens after unsigned GET_CAPS: {:?}",
             state.session_last_error()
         );
         let activation = state.session_activation().expect("activation recorded");
         assert_eq!(activation.board_id, ACT_BOARD_ID);
         assert_eq!(activation.firmware, (4, 0, 1));
-        assert_eq!(activation.protocol, (2, 1));
+        assert_eq!(activation.protocol, (2, 2));
         assert_eq!(state.firmware_version().expect("firmware version"), "4.0.1");
         assert_eq!(state.session_last_error(), None);
-        // Signed GET_CAPS was the first (and only) control command.
+        // Unsigned GET_CAPS was the first (and only) control command.
         let frames = transport.sent_frames();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].cmd, rsh_protocol::control::Opcode::GetCaps as u8);
-        assert_eq!(frames[0].counter, 0);
-        // The activator asked for a new session (flag-1 HELO) so the
-        // resume runs under a fresh nonce (D30).
+        assert_eq!(frames[0].req_id, 0);
+        // The activator asked for a new session (flag-1 HELO).
         assert!(
             transport.helo_requests.contains(&1),
             "new-session HELO requested: {:?}",
             transport.helo_requests
         );
+        // The HELLO set the reachable latch (D15).
+        assert!(state.board_reachable());
     }
 
     #[tokio::test]
-    async fn activator_pair_opens_gate_and_stores_key() {
+    async fn activator_connect_opens_gate_without_storing_secrets() {
+        // No-pairing redesign: a v2.2 HELLO discloses no key and no
+        // password, so activation stores nothing in the keystore —
+        // the gate opens on the unsigned GET_CAPS alone.
         let (state, _dir) = test_state();
         let store = ActKeyStore::new();
-        let transport = FakeSessionTransport::new(
-            ACT_KEY_ONE,
-            ACT_NONCE_ONE,
-            Some(act_pairing_hello(ACT_KEY_ONE, ACT_NONCE_ONE)),
-        );
+        let transport = FakeSessionTransport::new(Some(act_hello()));
         let _transport = activate_session_on(&state, transport, store.clone())
             .await
-            .expect("transport survives pairing");
+            .expect("transport survives activation");
         assert!(
             state.session_gate_open(),
-            "gate opens after pairing GET_CAPS: {:?}",
+            "gate opens after unsigned GET_CAPS: {:?}",
             state.session_last_error()
         );
         assert_eq!(
-            store.get_device_key(ACT_BOARD_ID).expect("key stored"),
-            ACT_KEY_ONE
-        );
-        // The pairing window is consumed: no transient password lingers.
-        assert_eq!(state.pairing_status().password, None);
-    }
-
-    /// Phase 2 (RC-4): the confirmed replacement flag is board-bound
-    /// — an activation attempt for a DIFFERENT board must not spend
-    /// it. The flag stays armed for the confirmed board.
-    #[tokio::test]
-    async fn phase2_replacement_flag_not_spent_by_other_board() {
-        let (state, _dir) = test_state();
-        let store = ActKeyStore::new();
-        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
-        *lock(&state.pairing_replacement_allowed) = true;
-        *lock(&state.pairing_replacement_board) = Some(ACT_BOARD_ID.to_string());
-        let mut foreign = act_pairing_hello(ACT_KEY_TWO, ACT_NONCE_ONE);
-        foreign.board_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
-        let transport = FakeSessionTransport::new(ACT_KEY_TWO, ACT_NONCE_ONE, Some(foreign));
-        let _transport = activate_session_on(&state, transport, store)
-            .await
-            .expect("transport survives foreign-board activation");
-        assert!(
-            *lock(&state.pairing_replacement_allowed),
-            "RC-4: a foreign board must not spend the confirmed flag"
-        );
-        assert_eq!(
-            *lock(&state.pairing_replacement_board),
-            Some(ACT_BOARD_ID.to_string()),
-            "RC-4: the flag stays armed for the confirmed board"
-        );
-    }
-
-    /// Phase 2 (RC-4): the full `StoredKeyExists` → confirm → pair
-    /// path at the activator level. A first attempt with a different
-    /// stored key fails `StoredKeyExists` (replacement required);
-    /// arming the flag for that board and retrying pairs with
-    /// replacement — the gate opens, the stored key is replaced,
-    /// and the flag is consumed.
-    #[tokio::test]
-    async fn phase2_replacement_flag_consumed_only_by_same_board_pair() {
-        let (state, _dir) = test_state();
-        let store = ActKeyStore::new();
-        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
-        // Attempt 1: no confirm — StoredKeyExists, gate closed.
-        let transport = FakeSessionTransport::new(
-            ACT_KEY_TWO,
-            ACT_NONCE_ONE,
-            Some(act_pairing_hello(ACT_KEY_TWO, ACT_NONCE_ONE)),
-        );
-        let _transport = activate_session_on(&state, transport, store.clone())
-            .await
-            .expect("transport survives first attempt");
-        assert!(
-            !state.session_gate_open(),
-            "gate stays closed on StoredKeyExists"
-        );
-        assert!(
-            state.pairing_status_peek().replacement_required,
-            "StoredKeyExists must record the replacement requirement"
-        );
-        assert!(
-            !*lock(&state.pairing_replacement_allowed),
-            "nothing is armed before the user confirms"
-        );
-        // The user confirms (armed for this board, as
-        // `confirm_pairing_replacement` does).
-        *lock(&state.pairing_replacement_allowed) = true;
-        *lock(&state.pairing_replacement_board) = Some(ACT_BOARD_ID.to_string());
-        // Attempt 2: same board, same disclosed key — pairs with
-        // replacement, gate opens, key replaced, flag consumed.
-        let transport = FakeSessionTransport::new(
-            ACT_KEY_TWO,
-            ACT_NONCE_TWO,
-            Some(act_pairing_hello(ACT_KEY_TWO, ACT_NONCE_TWO)),
-        );
-        let _transport = activate_session_on(&state, transport, store.clone())
-            .await
-            .expect("transport survives replacement attempt");
-        assert!(
-            state.session_gate_open(),
-            "gate opens after pair_with_replacement: {:?}",
-            state.session_last_error()
-        );
-        assert_eq!(
-            store.get_device_key(ACT_BOARD_ID).expect("key stored"),
-            ACT_KEY_TWO,
-            "the stored key is replaced by the disclosed one"
-        );
-        assert!(
-            !*lock(&state.pairing_replacement_allowed),
-            "RC-4: the flag is consumed by the same-board pair"
-        );
-        assert_eq!(
-            *lock(&state.pairing_replacement_board),
+            store.wifi_password(ACT_BOARD_ID),
             None,
-            "RC-4: the board binding clears with the flag"
-        );
-    }
-
-    /// Phase 2 (RC-4): a confirmed flag spent on an attempt that
-    /// fails with `WindowClosed` (board answered, window shut) is
-    /// re-armed — the user must not have to confirm again.
-    #[tokio::test]
-    async fn phase2_replacement_flag_rearmed_on_window_closed() {
-        let (state, _dir) = test_state();
-        let store = ActKeyStore::new();
-        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
-        *lock(&state.pairing_replacement_allowed) = true;
-        *lock(&state.pairing_replacement_board) = Some(ACT_BOARD_ID.to_string());
-        // Unpaired board, window closed (flags 0x01: unpaired, no
-        // window bit) — the pair attempt fails WindowClosed.
-        let closed = act_hello(0x01, ACT_NONCE_ONE, ACT_KEY_TWO, *ACT_WIFI_PASSWORD);
-        let transport = FakeSessionTransport::new(ACT_KEY_TWO, ACT_NONCE_ONE, Some(closed));
-        let _transport = activate_session_on(&state, transport, store)
-            .await
-            .expect("transport survives closed-window attempt");
-        assert!(!state.session_gate_open(), "gate stays closed");
-        assert!(
-            *lock(&state.pairing_replacement_allowed),
-            "RC-4: WindowClosed must re-arm the flag"
-        );
-        assert_eq!(
-            *lock(&state.pairing_replacement_board),
-            Some(ACT_BOARD_ID.to_string()),
-            "RC-4: the board binding survives the re-arm"
+            "activation stores no Wi-Fi password"
         );
     }
 
@@ -12795,7 +12150,7 @@ mod tests {
     /// routing table, so it is not asserted here — but a policy
     /// block (EPERM) must fail OPEN: in this sandbox `connect()` to
     /// 192.168.4.1 is EPERM although a route exists, and the
-    /// daemon trail test (`pairing_status_carries_the_attempt_trail`)
+    /// daemon trail test (`connection_log_carries_the_attempt_trail`)
     /// proves the HELO/timeout path still runs there instead of a
     /// wrong "no route".
     #[test]
@@ -12814,13 +12169,12 @@ mod tests {
     async fn activator_stale_echo_zero_hello_is_used_as_fallback() {
         // The board only ever answers routine flag-0 HELOs (echo 0):
         // the activator falls back to that HELLO instead of failing
-        // outright, and the resume still succeeds under its nonce.
+        // outright, and the connect still succeeds.
         let (state, _dir) = test_state();
         let store = ActKeyStore::new();
-        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
-        let mut hello = act_paired_hello(ACT_NONCE_TWO);
+        let mut hello = act_hello();
         hello.session_echo = 0;
-        let transport = FakeSessionTransport::new(ACT_KEY_ONE, ACT_NONCE_TWO, Some(hello));
+        let transport = FakeSessionTransport::new(Some(hello));
         let _transport = activate_session_on(&state, transport, store)
             .await
             .expect("transport survives fallback activation");
@@ -12832,36 +12186,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activator_bad_tag_keeps_gate_closed() {
-        let (state, _dir) = test_state();
-        let store = ActKeyStore::new();
-        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
-        // Board key differs from the stored key: GET_CAPS fails BAD_TAG.
-        let transport = FakeSessionTransport::new(
-            ACT_KEY_TWO,
-            ACT_NONCE_TWO,
-            Some(act_paired_hello(ACT_NONCE_TWO)),
-        );
-        let _transport = activate_session_on(&state, transport, store)
-            .await
-            .expect("transport survives failed activation");
-        assert!(!state.session_gate_open(), "gate stays closed on BAD_TAG");
-        assert!(state.session_activation().is_none());
-        let error = state.session_last_error().expect("failure recorded");
-        assert!(
-            error.contains("HMAC tag verification failed"),
-            "bad-tag reason recorded: {error}"
-        );
-        assert!(
-            state.firmware_version().is_err(),
-            "no firmware version without a session"
-        );
-    }
-
-    #[tokio::test]
     async fn activator_no_hello_keeps_gate_closed() {
         let (state, _dir) = test_state();
-        let mut transport = FakeSessionTransport::new(ACT_KEY_ONE, ACT_NONCE_ONE, None);
+        let mut transport = FakeSessionTransport::new(None);
         transport.never_answer_hello = true;
         let started = Instant::now();
         let _transport = activate_session_on(&state, transport, ActKeyStore::new())
@@ -12876,6 +12203,10 @@ mod tests {
             !state.session_gate_open(),
             "gate stays closed with no HELLO"
         );
+        assert!(
+            !state.board_reachable(),
+            "no HELLO means the reachable latch stays clear (D15)"
+        );
         let error = state.session_last_error().expect("failure recorded");
         assert!(
             error.contains("no HELLO"),
@@ -12886,7 +12217,7 @@ mod tests {
     #[tokio::test]
     async fn activator_transport_closed_returns_none() {
         let (state, _dir) = test_state();
-        let mut transport = FakeSessionTransport::new(ACT_KEY_ONE, ACT_NONCE_ONE, None);
+        let mut transport = FakeSessionTransport::new(None);
         transport.hello_closed = true;
         let result = activate_session_on(&state, transport, ActKeyStore::new()).await;
         assert!(result.is_none(), "dead transport returns None");
@@ -12905,22 +12236,22 @@ mod tests {
         let (state, _dir) = test_state();
         state.start_engine().expect("engine starts");
         let store = ActKeyStore::new();
-        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
-        let transport = FakeSessionTransport::new(
-            ACT_KEY_ONE,
-            ACT_NONCE_TWO,
-            Some(act_paired_hello(ACT_NONCE_TWO)),
-        );
+        let transport = FakeSessionTransport::new(Some(act_hello()));
         let _transport = activate_session_on(&state, transport, store)
             .await
             .expect("activation succeeds");
         assert!(state.session_gate_open());
         assert!(state.session_activation().is_some());
+        assert!(state.board_reachable());
         state.disconnect_transport().expect("disconnect queues");
         assert!(!state.session_gate_open(), "disconnect closes the gate");
         assert!(
             state.session_activation().is_none(),
             "disconnect clears the activation"
+        );
+        assert!(
+            !state.board_reachable(),
+            "disconnect clears the reachable latch (D15)"
         );
         assert!(
             state.firmware_version().is_err(),
@@ -13136,36 +12467,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_status_reports_window_and_password_then_clears_on_activation() {
-        let (state, _dir) = test_state();
-        let status = state.pairing_status();
-        assert_eq!(status.seconds_left, 0);
-        assert_eq!(status.password, None);
-        assert_eq!(status.error, None);
-        state.note_observed_hello(&act_pairing_hello(ACT_KEY_ONE, ACT_NONCE_ONE));
-        let status = state.pairing_status();
-        assert!(
-            (1..=60).contains(&status.seconds_left),
-            "window counts down from 60: {}",
-            status.seconds_left
-        );
-        assert_eq!(status.password.as_deref(), Some("Ab3dEf6hJk9mNp2rSt5vXy8z"));
-        // Activation consumes the window: the transient password is dropped.
-        state.record_session_activation(SessionActivation {
-            board_id: ACT_BOARD_ID.to_string(),
-            firmware: (4, 0, 1),
-            protocol: (2, 1),
-            caps: act_caps(),
-        });
-        assert_eq!(state.pairing_status().password, None);
-        assert_eq!(
-            state.firmware_version().expect("version after activation"),
-            "4.0.1"
-        );
-    }
-
-    #[test]
-    fn begin_pairing_without_board_fails_closed_and_reports() {
+    fn connect_session_without_board_fails_closed_and_reports() {
         // Full startup path (engine start → UDP connect → activator
         // attempt) with no board answering: the gate stays closed and
         // the failure is recorded instead of silently opening.
@@ -13179,10 +12481,13 @@ mod tests {
         settings.esp_ip = "127.0.0.1".to_string();
         state.set_settings(settings).expect("settings save");
         let status = state
-            .begin_pairing()
-            .expect("begin_pairing triggers an attempt");
-        assert_eq!(status.seconds_left, 0);
-        assert_eq!(status.password, None);
+            .connect_session()
+            .expect("connect_session triggers an attempt");
+        assert_ne!(
+            status.state,
+            ConnectionState::Connected,
+            "never Connected while the gate is closed (C-02)"
+        );
         assert!(
             wait_until(Duration::from_secs(10), || state
                 .session_last_error()
@@ -13193,21 +12498,21 @@ mod tests {
             !state.session_gate_open(),
             "gate stays closed with no board"
         );
+        assert!(!state.board_reachable(), "no HELLO, no latch (D15)");
         assert!(state.session_activation().is_none());
         let outcome = state.stop_engine();
         assert!(outcome.joined, "engine stops bounded");
     }
 
-    /// Phase 0 gate §6.3 regression test: a pairing attempt with no
-    /// board must leave a redacted trail — the `begin_pairing`
-    /// attempt line, a `HELO sent` line, the `HELLO timeout` line,
-    /// and the typed `activation failed: reason=Unreachable` line —
-    /// and the typed error must be `Unreachable` (not a bare
-    /// string), so the UI can tell "board unreachable" from "window
-    /// closed". Also: the transport state must never report
-    /// `Connected` while the gate is closed (C-02).
+    /// Phase 0 gate §6.3 regression test: a connect attempt with no
+    /// board must leave a redacted trail — a `HELO sent` line, the
+    /// `HELLO timeout` line, and the typed `activation failed:
+    /// reason=Unreachable` line — and the typed error must be
+    /// `Unreachable` (not a bare string), so the UI can tell "board
+    /// unreachable" from other failures. Also: the transport state
+    /// must never report `Connected` while the gate is closed (C-02).
     #[test]
-    fn begin_pairing_without_board_leaves_redacted_log_and_typed_error() {
+    fn connect_session_without_board_leaves_redacted_log_and_typed_error() {
         let _port = lock_forwarder_port();
         assert!(
             wait_for_stream_port_free(),
@@ -13218,20 +12523,16 @@ mod tests {
         settings.esp_ip = "127.0.0.1".to_string();
         state.set_settings(settings).expect("settings save");
         let _status = state
-            .begin_pairing()
-            .expect("begin_pairing triggers an attempt");
+            .connect_session()
+            .expect("connect_session triggers an attempt");
         assert!(
             wait_until(Duration::from_secs(10), || state
                 .session_last_error()
                 .is_some()),
             "activation failure must be recorded"
         );
-        let lines = state.pairing_log_lines();
+        let lines = state.connection_log_lines();
         let joined = lines.join("\n");
-        assert!(
-            joined.contains("begin_pairing: transport=wifi"),
-            "attempt-start line missing:\n{joined}"
-        );
         assert!(
             joined.contains("HELO sent: session_flag=1") || joined.contains("HELO send failed:"),
             "HELO attempt line missing (sent or failed):\n{joined}"
@@ -13249,7 +12550,7 @@ mod tests {
             Some(ConnectionError::Unreachable)
         );
         assert_eq!(
-            state.pairing_error_typed(),
+            state.session_error_typed(),
             Some(ConnectionError::Unreachable)
         );
         assert_ne!(
@@ -13264,15 +12565,15 @@ mod tests {
 
     /// Phase 0 gate §6.3 redaction test: a log line carrying a
     /// planted 24-char password / 32-byte key / HMAC hex must not
-    /// leak the secret into the pairing log (via `redact_secrets`).
+    /// leak the secret into the connection log (via `redact_secrets`).
     #[test]
-    fn pairing_log_redacts_planted_secrets() {
+    fn connection_log_redacts_planted_secrets() {
         let (state, _dir) = test_state();
-        state.push_pairing_log(
+        state.push_connection_log(
             "INFO",
             "probe password=AbCdEfGhIjKlMnOpQrStUvWx key=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff hmac=deadbeef",
         );
-        let joined = state.pairing_log_lines().join("\n");
+        let joined = state.connection_log_lines().join("\n");
         assert!(
             !joined.contains("AbCdEfGhIjKlMnOpQrStUvWx"),
             "password leaked:\n{joined}"
@@ -13286,28 +12587,6 @@ mod tests {
             joined.contains("[REDACTED]"),
             "redaction marker missing:\n{joined}"
         );
-    }
-
-    /// One log line per transition, not per poll (§6.3): repeated
-    /// `pairing_status_peek` reads after the window expired must not
-    /// re-log the expiry.
-    #[test]
-    fn pairing_window_expiry_logs_once_not_per_poll() {
-        let (state, _dir) = test_state();
-        state.note_observed_hello(&act_pairing_hello(ACT_KEY_ONE, ACT_NONCE_ONE));
-        // Force the window to read as expired: the observed HELLO is
-        // fresh, so expiry only logs once the 60 s elapse — instead
-        // assert the open-transition logged exactly once across
-        // repeated peeks.
-        let _ = state.pairing_status_peek();
-        let _ = state.pairing_status_peek();
-        let _ = state.pairing_status_peek();
-        let open_lines = state
-            .pairing_log_lines()
-            .into_iter()
-            .filter(|line| line.contains("window state: open"))
-            .count();
-        assert_eq!(open_lines, 1, "window-open must log exactly once");
     }
 
     /// DS-02: `block_on_control` from inside a tokio runtime must
@@ -13356,21 +12635,13 @@ mod tests {
         block_on_control(run_control_session(state, transport, keystore, op))
     }
 
-    /// A paired fake transport against `board` (key seeded in the
-    /// store), answering a fresh-nonce `HELLO`. Each call is a new
-    /// session — the caller picks the nonce, like D30 requires.
+    /// A fake transport against `board`, answering a v2.2
+    /// `HELLO`. Each call is a new session.
     fn paired_transport(
         board: &Arc<Mutex<FakeBoardConfig>>,
-        nonce: [u8; 16],
     ) -> (ActKeyStore, FakeSessionTransport) {
         let store = ActKeyStore::new();
-        store.seed_device_key(ACT_BOARD_ID, ACT_KEY_ONE);
-        let transport = FakeSessionTransport::new_with_board(
-            ACT_KEY_ONE,
-            nonce,
-            Some(act_paired_hello(nonce)),
-            Arc::clone(board),
-        );
+        let transport = FakeSessionTransport::new_with_board(Some(act_hello()), Arc::clone(board));
         (store, transport)
     }
 
@@ -13398,14 +12669,14 @@ mod tests {
         board: &Arc<Mutex<FakeBoardConfig>>,
         blob: Vec<u8>,
     ) -> ConfigTxnSnapshot {
-        let (store, transport) = paired_transport(board, ACT_NONCE_ONE);
+        let (store, transport) = paired_transport(board);
         let (result, snapshot) = drive_control(state, transport, store, |session| {
             Box::pin(op_stage_config(session, ConfigTxnSnapshot::default(), blob))
         })
         .expect("stage helper succeeds");
         result.expect("stage succeeds");
         assert_eq!(snapshot.state, ConfigState::Staged);
-        let (store, transport) = paired_transport(board, ACT_NONCE_TWO);
+        let (store, transport) = paired_transport(board);
         let (result, snapshot) = drive_control(state, transport, store, |session| {
             Box::pin(op_commit_config(session, snapshot))
         })
@@ -13421,13 +12692,13 @@ mod tests {
         let (state, _dir) = test_state();
         assert!(!state.session_gate_open(), "gate starts closed");
         let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
-        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let (store, transport) = paired_transport(&board);
         let sent_log = transport.sent_log();
         drive_control(&state, transport, store.clone(), |session| {
             Box::pin(op_set_password(session, "new-password-123".to_string()))
         })
         .expect("set_password succeeds");
-        // Signed GET_CAPS first (counter 0), then SET_PASSWORD (counter 1).
+        // Unsigned GET_CAPS first (reqId 0), then SET_PASSWORD (reqId 1).
         let sent = sent_log.lock().expect("sent log lock");
         let frames: Vec<rsh_protocol::ControlFrame> = sent
             .iter()
@@ -13437,16 +12708,17 @@ mod tests {
             .collect();
         assert_eq!(frames.len(), 2, "only GET_CAPS + SET_PASSWORD sent");
         assert_eq!(frames[0].cmd, rsh_protocol::control::Opcode::GetCaps as u8);
-        assert_eq!(frames[0].counter, 0);
+        assert_eq!(frames[0].req_id, 0);
         assert_eq!(
             frames[1].cmd,
             rsh_protocol::control::Opcode::SetPassword as u8
         );
-        assert_eq!(frames[1].counter, 1);
-        // The SET_PASSWORD payload is length-prefixed (1 length byte +
-        // the password bytes).
-        assert_eq!(frames[1].payload[0], 16);
-        assert_eq!(&frames[1].payload[1..], b"new-password-123");
+        assert_eq!(frames[1].req_id, 1);
+        // The SET_PASSWORD payload is the v2.2 layout (D3): [curLen 0]
+        // (no password stored yet) + [newLen 16] + the new password.
+        assert_eq!(frames[1].payload[0], 0);
+        assert_eq!(frames[1].payload[1], 16);
+        assert_eq!(&frames[1].payload[2..], b"new-password-123");
         // The new password is stored as the Wi-Fi password (one credential).
         assert_eq!(
             store.wifi_password(ACT_BOARD_ID).as_deref(),
@@ -13459,10 +12731,45 @@ mod tests {
     }
 
     #[test]
+    fn control_session_set_password_carries_the_stored_password_as_current() {
+        let (state, _dir) = test_state();
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let (store, transport) = paired_transport(&board);
+        // A password is already set: the stored one must travel as the
+        // current password (D3), or the board rejects the change.
+        store
+            .store_wifi_password(ACT_BOARD_ID, "old-password-1")
+            .expect("pre-store the current password");
+        let sent_log = transport.sent_log();
+        drive_control(&state, transport, store.clone(), |session| {
+            Box::pin(op_set_password(session, "new-password-123".to_string()))
+        })
+        .expect("set_password succeeds");
+        let sent = sent_log.lock().expect("sent log lock");
+        let frames: Vec<rsh_protocol::ControlFrame> = sent
+            .iter()
+            .map(|bytes| {
+                rsh_protocol::ControlFrame::parse_structure(bytes).expect("sent frame parses")
+            })
+            .collect();
+        assert_eq!(frames.len(), 2, "only GET_CAPS + SET_PASSWORD sent");
+        // [curLen 14][current "old-password-1"][newLen 16][new].
+        assert_eq!(frames[1].payload[0], 14);
+        assert_eq!(&frames[1].payload[1..15], b"old-password-1");
+        assert_eq!(frames[1].payload[15], 16);
+        assert_eq!(&frames[1].payload[16..], b"new-password-123");
+        // The new password replaces the stored one.
+        assert_eq!(
+            store.wifi_password(ACT_BOARD_ID).as_deref(),
+            Some("new-password-123")
+        );
+    }
+
+    #[test]
     fn control_session_set_password_rejects_a_short_password() {
         let (state, _dir) = test_state();
         let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
-        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let (store, transport) = paired_transport(&board);
         let sent_log = transport.sent_log();
         let error = drive_control(&state, transport, store, |session| {
             Box::pin(op_set_password(session, "short".to_string()))
@@ -13493,7 +12800,7 @@ mod tests {
     fn control_session_fails_closed_with_no_hello() {
         let (state, _dir) = test_state();
         let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
-        let (store, mut transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let (store, mut transport) = paired_transport(&board);
         transport.never_answer_hello = true;
         let error = drive_control(&state, transport, store, |session| {
             Box::pin(op_reboot(session))
@@ -13518,7 +12825,7 @@ mod tests {
     fn control_session_fails_closed_when_the_transport_dies() {
         let (state, _dir) = test_state();
         let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
-        let (store, mut transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let (store, mut transport) = paired_transport(&board);
         transport.hello_closed = true;
         let error = drive_control(&state, transport, store, |session| {
             Box::pin(op_reboot(session))
@@ -13532,7 +12839,7 @@ mod tests {
     fn control_session_runs_reboot_under_a_fresh_session() {
         let (state, _dir) = test_state();
         let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
-        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let (store, transport) = paired_transport(&board);
         let sent_log = transport.sent_log();
         drive_control(&state, transport, store, |session| {
             Box::pin(op_reboot(session))
@@ -13557,7 +12864,7 @@ mod tests {
         let factory = board_current(&board);
         let staged = horn_moved_blob();
         // Stage: the board still runs the factory blob until commit.
-        let (store, transport) = paired_transport(&board, ACT_NONCE_ONE);
+        let (store, transport) = paired_transport(&board);
         let (result, snapshot) = drive_control(&state, transport, store, |session| {
             Box::pin(op_stage_config(
                 session,
@@ -13572,7 +12879,7 @@ mod tests {
         assert_eq!(state.config_state(), "staged");
         assert_eq!(board_current(&board), factory, "stage does not go live");
         // Commit on a fresh session: the board live-applies the blob.
-        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let (store, transport) = paired_transport(&board);
         let (result, snapshot) = drive_control(&state, transport, store, |session| {
             Box::pin(op_commit_config(session, snapshot))
         })
@@ -13587,7 +12894,7 @@ mod tests {
         assert_eq!(state.config_state(), "pending_confirm");
         assert_eq!(board_current(&board), staged, "commit goes live");
         // Confirm on a third fresh session: the new config is permanent.
-        let (store, transport) = paired_transport(&board, ACT_NONCE_ONE);
+        let (store, transport) = paired_transport(&board);
         let (result, snapshot) = drive_control(&state, transport, store, |session| {
             Box::pin(op_confirm_config(session, snapshot))
         })
@@ -13608,7 +12915,7 @@ mod tests {
         let snapshot = stage_and_commit(&state, &board, staged.clone());
         assert_eq!(board_current(&board), staged, "commit went live");
         assert_eq!(state.config_state(), "pending_confirm");
-        let (store, transport) = paired_transport(&board, ACT_NONCE_ONE);
+        let (store, transport) = paired_transport(&board);
         let (result, snapshot) = drive_control(&state, transport, store, |session| {
             Box::pin(op_rollback_config(session, snapshot))
         })
@@ -13628,7 +12935,7 @@ mod tests {
     fn get_config_and_get_pin_map_read_the_live_blob() {
         let (state, _dir) = test_state();
         let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
-        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let (store, transport) = paired_transport(&board);
         let blob = drive_control(&state, transport, store, |session| {
             Box::pin(op_read_config_blob(session))
         })
@@ -13714,7 +13021,7 @@ mod tests {
                 pins: Vec::new(),
             },
         ];
-        let (store, transport) = paired_transport(&board, ACT_NONCE_ONE);
+        let (store, transport) = paired_transport(&board);
         let (result, snapshot) = drive_control(&state, transport, store, |session| {
             Box::pin(op_stage_and_commit_pin_map(
                 session,
@@ -13754,7 +13061,7 @@ mod tests {
             "battery kept"
         );
         // Confirm on a fresh session.
-        let (store, transport) = paired_transport(&board, ACT_NONCE_TWO);
+        let (store, transport) = paired_transport(&board);
         let (result, snapshot) = drive_control(&state, transport, store, |session| {
             Box::pin(op_confirm_config(session, snapshot))
         })
@@ -13779,7 +13086,7 @@ mod tests {
                 pins: Vec::new(),
             },
         ];
-        let (store, transport) = paired_transport(&board, ACT_NONCE_ONE);
+        let (store, transport) = paired_transport(&board);
         let (result, snapshot) = drive_control(&state, transport, store, |session| {
             Box::pin(op_stage_and_commit_pin_map(
                 session,

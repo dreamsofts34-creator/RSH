@@ -14,11 +14,14 @@
 //! unconditional — a repeat with the same `(kind, title, body)` key
 //! inside the cooldown window is suppressed: no new row is stored,
 //! the existing item's `suppressed` count grows, and the drawer
-//! shows it as `"Title (×N)"`. Cooldown is 60 s for connection /
-//! pairing kinds (`Connection`, `ConnectionLost`, `PairingNeeded` —
-//! the daemon death→return flap pairs) and 5 s for everything else
+//! shows it as `"Title (×N)"`. Cooldown is 60 s for connection
+//! kinds (`Connection`, `ConnectionLost` — the daemon
+//! death→return flap pairs) and 5 s for everything else
 //! (user-action errors). The suppressed count survives a save/load
 //! round-trip with the item.
+//!
+//! D17 (no-pairing redesign): the `PairingNeeded` kind is deleted —
+//! pairing is gone, so the daemon never sends it any more.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -42,7 +45,7 @@ pub const NOTIFICATIONS_FILE: &str = "notifications.json";
 /// One stored notification.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Notification {
-    /// Stable kind (`ConnectionLost`, `PairingNeeded`, …).
+    /// Stable kind (`ConnectionLost`, `Connection`, …).
     pub kind: String,
     /// Short title.
     pub title: String,
@@ -138,13 +141,13 @@ impl NotificationCenter {
         }
     }
 
-    /// Cooldown (seconds) for a kind (F12): connection / pairing
+    /// Cooldown (seconds) for a kind (F12): connection
     /// notifications repeat on every daemon death→return flap, so
     /// they get the long window; user-action errors are rarer and
     /// more specific, so they get the short one.
     fn cooldown_secs_for(kind: &str) -> u64 {
         match kind {
-            "PairingNeeded" | "Connection" | "ConnectionLost" => 60,
+            "Connection" | "ConnectionLost" => 60,
             _ => 5,
         }
     }
@@ -281,7 +284,7 @@ impl NotificationCenter {
 
     /// Slint model rows for the drawer (`notifications` property).
     /// A folded item renders its suppressed count in the title
-    /// (F12): `"Pairing needed (×3)"` instead of three rows.
+    /// (F12): `"Connection lost (×3)"` instead of three rows.
     #[must_use]
     pub fn to_model_items(&self) -> Vec<NotificationItem> {
         self.items
@@ -320,18 +323,18 @@ mod tests {
         let mut c = NotificationCenter::new();
         assert_eq!(c.unread_count(), 0);
         c.push_with_time(
-            "PairingNeeded",
-            "Pair your board",
-            "Press Begin pairing",
+            "Connection",
+            "RSH stopped unexpectedly",
+            "RSH isn't running — try Reconnect.",
             "10:00:01",
         );
         let rows = c.to_model_items();
         assert_eq!(rows.len(), 1);
         assert_eq!(c.unread_count(), 1);
         let n = &rows[0];
-        assert_eq!(n.kind, "PairingNeeded");
-        assert_eq!(n.title, "Pair your board");
-        assert_eq!(n.body, "Press Begin pairing");
+        assert_eq!(n.kind, "Connection");
+        assert_eq!(n.title, "RSH stopped unexpectedly");
+        assert_eq!(n.body, "RSH isn't running — try Reconnect.");
         assert_eq!(n.time, "10:00:01");
         assert!(n.unread);
     }
@@ -366,19 +369,23 @@ mod tests {
         let mut c = NotificationCenter::new();
         for _ in 0..5 {
             c.push_with_time(
-                "PairingNeeded",
-                "Pair your board",
-                "Press Begin pairing",
+                "Connection",
+                "RSH stopped unexpectedly",
+                "RSH isn't running — try Reconnect.",
                 "10:00:00",
             );
         }
         let rows = c.to_model_items();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            c.suppressed_count("PairingNeeded", "Pair your board", "Press Begin pairing"),
+            c.suppressed_count(
+                "Connection",
+                "RSH stopped unexpectedly",
+                "RSH isn't running — try Reconnect."
+            ),
             4
         );
-        assert_eq!(rows[0].title, "Pair your board (×4)");
+        assert_eq!(rows[0].title, "RSH stopped unexpectedly (×4)");
         // One row, one unread — the flap does not inflate the badge.
         assert_eq!(c.unread_count(), 1);
     }
@@ -410,31 +417,35 @@ mod tests {
 
     #[test]
     fn dedupe_cooldown_expiry_allows_second_item() {
-        // F12: PairingNeeded cooldown is 60 s. A repeat at +59 s is
+        // F12: Connection cooldown is 60 s. A repeat at +59 s is
         // still folded; a repeat 60 s after the last seen push is a
         // new row (a genuinely new flap, not the same one).
         let mut c = NotificationCenter::new();
         c.push_with_time(
-            "PairingNeeded",
-            "Pair your board",
-            "Press Begin pairing",
+            "Connection",
+            "RSH stopped unexpectedly",
+            "RSH isn't running — try Reconnect.",
             "10:00:00",
         );
         c.push_with_time(
-            "PairingNeeded",
-            "Pair your board",
-            "Press Begin pairing",
+            "Connection",
+            "RSH stopped unexpectedly",
+            "RSH isn't running — try Reconnect.",
             "10:00:59",
         );
         assert_eq!(c.to_model_items().len(), 1);
         assert_eq!(
-            c.suppressed_count("PairingNeeded", "Pair your board", "Press Begin pairing"),
+            c.suppressed_count(
+                "Connection",
+                "RSH stopped unexpectedly",
+                "RSH isn't running — try Reconnect."
+            ),
             1
         );
         c.push_with_time(
-            "PairingNeeded",
-            "Pair your board",
-            "Press Begin pairing",
+            "Connection",
+            "RSH stopped unexpectedly",
+            "RSH isn't running — try Reconnect.",
             "10:01:59",
         );
         assert_eq!(c.to_model_items().len(), 2);
@@ -446,20 +457,24 @@ mod tests {
         // a different notification, even inside the cooldown.
         let mut c = NotificationCenter::new();
         c.push_with_time(
-            "PairingNeeded",
-            "Pair your board",
-            "Press Begin pairing",
+            "Connection",
+            "RSH stopped unexpectedly",
+            "RSH isn't running — try Reconnect.",
             "10:00:00",
         );
         c.push_with_time(
-            "PairingNeeded",
-            "Pair your board",
+            "Connection",
+            "RSH stopped unexpectedly",
             "A different hint",
             "10:00:00",
         );
         assert_eq!(c.to_model_items().len(), 2);
         assert_eq!(
-            c.suppressed_count("PairingNeeded", "Pair your board", "Press Begin pairing"),
+            c.suppressed_count(
+                "Connection",
+                "RSH stopped unexpectedly",
+                "RSH isn't running — try Reconnect."
+            ),
             0
         );
     }
@@ -467,7 +482,7 @@ mod tests {
     #[test]
     fn dedupe_user_action_cooldown_is_5s() {
         // F12: user-action kinds (anything but Connection /
-        // ConnectionLost / PairingNeeded) use the 5 s window.
+        // ConnectionLost) use the 5 s window.
         let mut c = NotificationCenter::new();
         c.push_with_time(
             "Profile",

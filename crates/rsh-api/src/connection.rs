@@ -2,26 +2,24 @@
 //! connection state machine the daemon drives and the UI renders.
 //!
 //! ```text
-//! Idle ─connect→ LinkUp ─HELLO→ Hello ─pair/resume→ Authenticating ─GET_CAPS ok→ Active
-//!   ▲              │ (no HELLO)    │ (window closed / bad tag / no key)   │
-//!   │              └─────────► Error(reason, hint, retry_in_ms) ◄────────────┘
+//! Idle ─connect→ LinkUp ─HELLO→ Hello ─GET_CAPS ok→ Active
+//!   ▲              │ (no HELLO)    │ (no caps)   │
+//!   │              └─────────► Error(reason, hint, retry_in_ms) ◄──────┘
 //!   └──────────────  Backoff(2s→30s)  ◄── Active ─(no frames 2 s / transport lost)
 //! ```
 //!
 //! Rules enforced here (pure logic — no I/O, no clock of its own;
 //! the caller supplies `Instant`s so tests drive it deterministically):
 //!
-//! * `Active` only after a signed `GET_CAPS` passes — the caller
-//!   reports `CapsOk` only on that event (C-01/C-02). The "Connected"
-//!   label is only valid in `Active`.
+//! * `Active` only after an unsigned `GET_CAPS` passes (protocol
+//!   v2.2, no pairing) — the caller reports `CapsOk` only on that
+//!   event (C-01/C-02). The "Connected" label is only valid in
+//!   `Active`.
 //! * A failed activation records `Error(reason, hint, retry_in_ms)` +
-//!   backoff (2 s → 30 s). User-action reasons (`NoStoredKey`,
-//!   `WindowClosed`, `WindowExpired`, `StoredKeyExists`) stop
-//!   auto-retry: `retry_in_ms` is `None` and the UI must surface
-//!   "Pairing needed" (C-01). F21: `BindFailed(AddrInUse)` also
+//!   backoff (2 s → 30 s). Nothing latches on a pairing reason
+//!   anymore (pairing does not exist). F21: `BindFailed(AddrInUse)`
 //!   stops auto-retry (`retry_in_ms: None` — the port holder can
-//!   only be closed by the user) but is NOT a pairing reason, so
-//!   it surfaces as a plain `Error`, never "Pairing needed".
+//!   only be closed by the user) and surfaces as a plain `Error`.
 //! * Heartbeat watchdog (C-04): no stream/status frame for 2 s in
 //!   `Active` → transport rebuild + re-activate. F20: capped at
 //!   [`MAX_WATCHDOG_REBUILDS`] consecutive frameless rebuilds, then
@@ -29,8 +27,6 @@
 //!   (user Retry required) — only a real frame resets the count.
 //! * HELLO wait (C-03): 750 ms per attempt (above the firmware's
 //!   500 ms reply limiter), 3 attempts.
-//! * Resume fail `BadTag` (C-13): one retry after 10 s with the
-//!   "wheel busy" message; a second `BadTag` is a hard error.
 //! * Every transition is recorded as one log line
 //!   (`take_log_lines`) and as a `ConnectionChanged` event the
 //!   caller forwards as `AppEvent` — one line per transition, never
@@ -61,10 +57,6 @@ pub const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(2);
 /// it resets `consecutive_failures`, which is exactly why the
 /// pre-F20 rebuild loop never backed off and never stopped.
 pub const MAX_WATCHDOG_REBUILDS: u32 = 5;
-/// `BadTag` resume retry (C-13): one retry after this delay — the
-/// firmware rejects a new session for 10 s after an authenticated
-/// one (F-05).
-pub const BAD_TAG_RETRY_DELAY: Duration = Duration::from_secs(10);
 /// First backoff delay (M-11, shared with the forwarder policy).
 pub const BACKOFF_BASE: Duration = Duration::from_secs(2);
 /// Backoff cap (M-11).
@@ -78,14 +70,12 @@ pub enum ConnectionState {
     Idle,
     /// Link is up (transport bound), waiting for a HELLO.
     LinkUp,
-    /// A HELLO arrived; waiting for pair/resume to start.
+    /// A HELLO arrived; waiting for `GET_CAPS` to start.
     Hello,
-    /// Pair/resume + signed `GET_CAPS` in flight.
-    Authenticating,
-    /// Signed `GET_CAPS` passed — the only "Connected" state.
+    /// Unsigned `GET_CAPS` passed — the only "Connected" state.
     Active,
-    /// Failed with a typed reason. `retry_in_ms` is `None` when the
-    /// fix needs the user (pairing) — auto-retry is stopped.
+    /// Failed with a typed reason. `retry_in_ms` is `None` when
+    /// auto-retry is stopped (`AddrInUse`, watchdog latch).
     Error {
         /// Typed failure reason.
         reason: ConnectionError,
@@ -113,7 +103,7 @@ impl ConnectionState {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Idle => "Disconnected",
-            Self::LinkUp | Self::Hello | Self::Authenticating => "Connecting",
+            Self::LinkUp | Self::Hello => "Connecting",
             Self::Active => "Connected",
             Self::Error { .. } => "Error",
             Self::Backoff { .. } => "Reconnecting",
@@ -133,7 +123,6 @@ impl ConnectionState {
             Self::Idle => "Idle",
             Self::LinkUp => "LinkUp",
             Self::Hello => "Hello",
-            Self::Authenticating => "Authenticating",
             Self::Active => "Active",
             Self::Error { .. } => "Error",
             Self::Backoff { .. } => "Backoff",
@@ -149,16 +138,10 @@ pub enum ConnEvent {
     Connect,
     /// The transport bound and the link is up.
     LinkUp,
-    /// A HELLO arrived.
-    HelloReceived {
-        /// Board reports itself unpaired.
-        unpaired: bool,
-        /// Pairing window is open.
-        window_open: bool,
-    },
-    /// Pair/resume started (signed `GET_CAPS` in flight).
-    Authenticating,
-    /// Signed `GET_CAPS` passed — the session is live.
+    /// A HELLO arrived (the board is reachable; no pairing
+    /// state rides along anymore — v2.2 HELLO carries none).
+    HelloReceived,
+    /// Unsigned `GET_CAPS` passed — the session is live.
     CapsOk,
     /// Activation failed with a typed reason.
     ActivationFailed(ConnectionError),
@@ -185,14 +168,12 @@ pub enum ManagerAction {
     None,
     /// Send one flag-1 HELO (fresh nonce) and wait `HELLO_WAIT`.
     RequestHello,
-    /// Start pair/resume + signed `GET_CAPS`.
-    StartAuthentication,
+    /// Start the unsigned `GET_CAPS` (Hello → Active).
+    StartActivation,
     /// Rebuild the transport, then re-activate from `LinkUp`.
     RebuildTransport,
     /// Re-activate on the live transport (no rebuild needed).
     Reactivate,
-    /// Stop auto-retry; surface "Pairing needed" in the UI.
-    NeedsPairing(ConnectionError),
     /// The state changed — the driver must emit
     /// `AppEvent::ConnectionChanged` (the manager also records the
     /// log line; see `take_log_lines`).
@@ -200,7 +181,7 @@ pub enum ManagerAction {
 }
 
 /// The L1 Connection Manager: pure state machine + backoff +
-/// watchdog + HELLO attempts + one `BadTag` retry.
+/// watchdog + HELLO attempts.
 #[derive(Debug)]
 pub struct ConnectionManager {
     state: ConnectionState,
@@ -208,8 +189,6 @@ pub struct ConnectionManager {
     consecutive_failures: u32,
     /// HELLO attempts used in the current activation.
     hello_attempts: u32,
-    /// Whether the one C-13 `BadTag` retry was already spent.
-    bad_tag_retried: bool,
     /// Last stream/status frame seen (heartbeat, C-04).
     last_frame_at: Option<Instant>,
     /// Consecutive watchdog rebuilds with no frame seen (F20):
@@ -234,7 +213,6 @@ impl ConnectionManager {
             state: ConnectionState::Idle,
             consecutive_failures: 0,
             hello_attempts: 0,
-            bad_tag_retried: false,
             last_frame_at: None,
             watchdog_rebuilds: 0,
             backoff_until: None,
@@ -320,7 +298,6 @@ impl ConnectionManager {
                     ConnectionState::Idle | ConnectionState::Error { .. }
                 ) {
                     self.consecutive_failures = 0;
-                    self.bad_tag_retried = false;
                     self.watchdog_rebuilds = 0;
                     self.transition(ConnectionState::LinkUp, now);
                     return ManagerAction::RequestHello;
@@ -334,55 +311,35 @@ impl ConnectionManager {
                 }
                 ManagerAction::None
             }
-            ConnEvent::HelloReceived {
-                unpaired,
-                window_open,
-            } => {
+            ConnEvent::HelloReceived => {
                 if matches!(self.state, ConnectionState::LinkUp | ConnectionState::Hello) {
                     self.hello_attempts = 0;
                     self.transition(ConnectionState::Hello, now);
-                    // An unpaired board with a closed window cannot
-                    // pair: fail closed with the typed reason now,
-                    // instead of attempting a doomed GET_CAPS.
-                    if unpaired && !window_open {
-                        return self.fail(ConnectionError::WindowClosed, now);
-                    }
-                    return ManagerAction::StartAuthentication;
-                }
-                ManagerAction::None
-            }
-            ConnEvent::Authenticating => {
-                if matches!(
-                    self.state,
-                    ConnectionState::Hello | ConnectionState::Authenticating
-                ) {
-                    self.transition(ConnectionState::Authenticating, now);
+                    // Any HELLO means the board is reachable: one
+                    // unsigned GET_CAPS decides Active. There is no
+                    // unpaired/window fail-closed anymore.
+                    return ManagerAction::StartActivation;
                 }
                 ManagerAction::None
             }
             ConnEvent::CapsOk => {
-                // R2-01 (wizard-pairing): a paired board resumes
-                // without ever opening a pairing window, so the
-                // daemon never feeds `HelloReceived` for it — the
-                // manager sits in `LinkUp` (where startup `Connect`
-                // left it) or in `Error` (a failed attempt whose
-                // forwarder then re-activated) when the session
-                // gate opens. `CapsOk` is only ever fed on the
+                // R2-01: the forwarder may feed `CapsOk` without a
+                // preceding `HelloReceived` (the manager sits in
+                // `LinkUp` or in `Error` when the session gate
+                // opens). `CapsOk` is only ever fed on the
                 // gate-open rising edge, and the gate only opens
-                // after a signed `GET_CAPS` passed
+                // after an unsigned `GET_CAPS` passed
                 // (`activate_session_on`, `Ok(caps)` arm) — so
                 // accepting it from `LinkUp` / `Error` is still
-                // "Active only after authentication" (C-01/C-02),
-                // never a shortcut around it.
+                // "Active only after GET_CAPS" (C-01/C-02), never a
+                // shortcut around it.
                 if matches!(
                     self.state,
-                    ConnectionState::Authenticating
-                        | ConnectionState::Hello
+                    ConnectionState::Hello
                         | ConnectionState::LinkUp
                         | ConnectionState::Error { .. }
                 ) {
                     self.consecutive_failures = 0;
-                    self.bad_tag_retried = false;
                     self.last_frame_at = Some(now);
                     self.transition(ConnectionState::Active, now);
                     return ManagerAction::StateChanged;
@@ -455,7 +412,6 @@ impl ConnectionManager {
             ConnEvent::UserRetry => {
                 if matches!(self.state, ConnectionState::Error { .. }) {
                     self.consecutive_failures = 0;
-                    self.bad_tag_retried = false;
                     self.watchdog_rebuilds = 0;
                     self.transition(ConnectionState::LinkUp, now);
                     return ManagerAction::RequestHello;
@@ -464,7 +420,6 @@ impl ConnectionManager {
             }
             ConnEvent::Disconnect => {
                 self.consecutive_failures = 0;
-                self.bad_tag_retried = false;
                 self.watchdog_rebuilds = 0;
                 self.last_frame_at = None;
                 self.backoff_until = None;
@@ -537,61 +492,22 @@ impl ConnectionManager {
         ManagerAction::None
     }
 
-    /// Record a failure: `BadTag` gets one 10 s retry (C-13);
-    /// user-action reasons stop auto-retry with `retry_in_ms: None`
-    /// (C-01); everything else backs off 2 s → 30 s. F21: a UDP
-    /// `AddrInUse` is NOT retried at all — the port holder (usually
-    /// the still-running legacy RSH app) can only be closed by the
-    /// user, so retrying just re-logs the same failure forever
-    /// (user log: 117× `AddrInUse` over ~35 min). It lands in
-    /// `Error` with `retry_in_ms: None` like a user-action reason,
-    /// but returns `StateChanged` (not `NeedsPairing`): this is not
-    /// a pairing problem and must not surface a "Pairing needed"
-    /// notification.
+    /// Record a failure: everything backs off 2 s → 30 s, except
+    /// F21: a UDP `AddrInUse` is NOT retried at all — the port
+    /// holder (usually the still-running legacy RSH app) can only
+    /// be closed by the user, so retrying just re-logs the same
+    /// failure forever (user log: 117× `AddrInUse` over ~35 min).
+    /// It lands in `Error` with `retry_in_ms: None` and returns
+    /// `StateChanged`.
     fn fail(&mut self, reason: ConnectionError, now: Instant) -> ManagerAction {
-        // C-13: one BadTag retry after 10 s — the board rejects a new
-        // session for 10 s after an authenticated one ("wheel busy").
-        if reason == ConnectionError::BadTag && !self.bad_tag_retried {
-            self.bad_tag_retried = true;
-            self.log_lines.push(
-                "[INFO connection] activation failed: reason=BadTag — wheel busy, one retry in 10 s"
-                    .to_string(),
-            );
-            self.backoff_until = Some(now + BAD_TAG_RETRY_DELAY);
-            self.transition(
-                ConnectionState::Backoff {
-                    wait_ms: Self::ms_u64(BAD_TAG_RETRY_DELAY),
-                    attempt: 1,
-                },
-                now,
-            );
-            return ManagerAction::Reactivate;
-        }
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        if reason.needs_user_action() {
-            // R2-04: clear a stale backoff left over from an
-            // earlier `BadTag` retry — without this, the
-            // manager loop's retry tick keeps delivering a
-            // no-op `RetryTimer` every 250 ms against a manager
-            // that is now latched in `Error` with no retry.
-            self.backoff_until = None;
-            self.transition(
-                ConnectionState::Error {
-                    reason,
-                    hint: reason.hint().to_string(),
-                    retry_in_ms: None,
-                },
-                now,
-            );
-            return ManagerAction::NeedsPairing(reason);
-        }
         // F21: `AddrInUse` never self-heals — stop here. No retry
         // timer is armed (`backoff_until` stays `None`), so the
-        // driver's retry tick never re-fires `activate_session`
+        // driver's retry tick never re-fires `connect_session`
         // into another doomed bind. The explicit clear also drops
-        // a stale backoff from an earlier `BadTag` retry (R2-04):
-        // without it the loop would keep delivering a no-op
-        // `RetryTimer` every 250 ms against this latched `Error`.
+        // a stale backoff (R2-04): without it the loop would keep
+        // delivering a no-op `RetryTimer` every 250 ms against
+        // this latched `Error`.
         if matches!(
             reason,
             ConnectionError::BindFailed(crate::errors::BindErrorKind::AddrInUse)
@@ -672,14 +588,7 @@ mod tests {
         let mut m = ConnectionManager::new();
         let t = now();
         m.on_event(ConnEvent::Connect, t);
-        m.on_event(
-            ConnEvent::HelloReceived {
-                unpaired: false,
-                window_open: false,
-            },
-            t,
-        );
-        m.on_event(ConnEvent::Authenticating, t);
+        m.on_event(ConnEvent::HelloReceived, t);
         m.on_event(ConnEvent::CapsOk, t);
         assert!(m.state().is_active());
         m
@@ -692,22 +601,32 @@ mod tests {
         assert_eq!(m.state().label(), "Disconnected");
         m.on_event(ConnEvent::Connect, t);
         assert_eq!(m.state().label(), "Connecting");
-        // CapsOk before HELLO/auth must not activate (C-01/C-02).
+        // CapsOk before HELLO must not activate (C-01/C-02).
         let mut m2 = ConnectionManager::new();
         m2.on_event(ConnEvent::CapsOk, t);
         assert!(!m2.state().is_active());
-        m.on_event(
-            ConnEvent::HelloReceived {
-                unpaired: false,
-                window_open: false,
-            },
-            t,
+        assert_eq!(
+            m.on_event(ConnEvent::HelloReceived, t),
+            ManagerAction::StartActivation
         );
-        m.on_event(ConnEvent::Authenticating, t);
         assert!(!m.state().is_active());
         m.on_event(ConnEvent::CapsOk, t);
         assert!(m.state().is_active());
         assert_eq!(m.state().label(), "Connected");
+    }
+
+    #[test]
+    fn hello_received_starts_activation() {
+        // No-pairing redesign: any HELLO means the board is
+        // reachable — there is no unpaired/window fail-closed.
+        let mut m = ConnectionManager::new();
+        let t = now();
+        m.on_event(ConnEvent::Connect, t);
+        assert_eq!(
+            m.on_event(ConnEvent::HelloReceived, t),
+            ManagerAction::StartActivation
+        );
+        assert!(matches!(m.state(), ConnectionState::Hello));
     }
 
     #[test]
@@ -735,24 +654,30 @@ mod tests {
     }
 
     #[test]
-    fn user_action_reasons_stop_auto_retry() {
+    fn generic_failures_back_off_with_retry() {
+        // No-pairing redesign: no failure latches on a pairing
+        // reason — every activation failure backs off 2 s → 30 s
+        // with a retry timer armed.
         for reason in [
-            ConnectionError::NoStoredKey,
-            ConnectionError::WindowClosed,
-            ConnectionError::StoredKeyExists,
+            ConnectionError::Unreachable,
+            ConnectionError::Timeout,
+            ConnectionError::TransportClosed,
+            ConnectionError::BoardMismatch,
+            ConnectionError::Unknown,
         ] {
             let mut m = ConnectionManager::new();
             let t = now();
             m.on_event(ConnEvent::Connect, t);
             let action = m.on_event(ConnEvent::ActivationFailed(reason), t);
-            assert_eq!(action, ManagerAction::NeedsPairing(reason));
+            assert_eq!(action, ManagerAction::StateChanged, "{reason:?}");
             assert!(matches!(
                 m.state(),
                 ConnectionState::Error {
-                    retry_in_ms: None,
+                    retry_in_ms: Some(_),
                     ..
                 }
             ));
+            assert!(m.retry_due_at().is_some(), "{reason:?}");
         }
     }
 
@@ -762,7 +687,7 @@ mod tests {
         // RSH app) can only be closed by the user — retrying the
         // bind just re-logs the same failure forever (user log:
         // 117× `AddrInUse` over ~35 min). So no retry is scheduled
-        // and no "Pairing needed" is raised: plain `Error`.
+        // and the state is a plain `Error`.
         let mut m = ConnectionManager::new();
         let t = now();
         m.on_event(ConnEvent::Connect, t);
@@ -803,13 +728,12 @@ mod tests {
 
     #[test]
     fn caps_ok_from_link_up_reaches_active() {
-        // R2-01: a paired board resumes without ever opening a
-        // pairing window, so no `HelloReceived` is ever fed — the
-        // manager sits in `LinkUp` (where startup `Connect` left
-        // it) when the session gate opens and the daemon feeds
-        // `CapsOk`. The gate only opens after a signed `GET_CAPS`
-        // passed, so reaching `Active` from here is still
-        // "Active only after authentication".
+        // R2-01: the forwarder may feed `CapsOk` without a
+        // preceding `HelloReceived` — the manager sits in `LinkUp`
+        // (where startup `Connect` left it) when the session gate
+        // opens. The gate only opens after an unsigned `GET_CAPS`
+        // passed, so reaching `Active` from here is still "Active
+        // only after GET_CAPS".
         let mut m = ConnectionManager::new();
         let t = now();
         m.on_event(ConnEvent::Connect, t);
@@ -879,14 +803,16 @@ mod tests {
     }
 
     #[test]
-    fn retry_timer_is_noop_for_user_action_error() {
+    fn retry_timer_is_noop_for_latched_addr_in_use_error() {
         // R2-04: `retry_in_ms: None` states never arm the timer,
         // so a stray `RetryTimer` must not re-activate them.
         let mut m = ConnectionManager::new();
         let t = now();
         m.on_event(ConnEvent::Connect, t);
         let _ = m.on_event(
-            ConnEvent::ActivationFailed(ConnectionError::StoredKeyExists),
+            ConnEvent::ActivationFailed(ConnectionError::BindFailed(
+                crate::errors::BindErrorKind::AddrInUse,
+            )),
             t,
         );
         assert_eq!(m.retry_due_at(), None);
@@ -894,60 +820,7 @@ mod tests {
         assert!(matches!(
             m.state(),
             ConnectionState::Error {
-                reason: ConnectionError::StoredKeyExists,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn user_action_and_addr_in_use_failures_clear_stale_backoff() {
-        // R2-04: a `BadTag` backoff arms `backoff_until`; if the
-        // next failure is a latch (user action / `AddrInUse`), the
-        // stale deadline must be cleared — otherwise the manager
-        // loop delivers a no-op `RetryTimer` every 250 ms against
-        // a latched `Error` forever.
-        for reason in [
-            ConnectionError::StoredKeyExists,
-            ConnectionError::BindFailed(crate::errors::BindErrorKind::AddrInUse),
-        ] {
-            let mut m = ConnectionManager::new();
-            let t = now();
-            m.on_event(ConnEvent::Connect, t);
-            // Spend the one BadTag retry: Backoff + armed timer.
-            assert_eq!(
-                m.on_event(ConnEvent::ActivationFailed(ConnectionError::BadTag), t),
-                ManagerAction::Reactivate
-            );
-            assert!(m.retry_due_at().is_some());
-            // The latch failure arrives while still backing off.
-            let _ = m.on_event(ConnEvent::ActivationFailed(reason), t);
-            assert!(matches!(m.state(), ConnectionState::Error { .. }));
-            assert_eq!(
-                m.retry_due_at(),
-                None,
-                "stale BadTag backoff must be cleared by {reason:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn bad_tag_retries_once_after_10s_then_fails() {
-        let mut m = ConnectionManager::new();
-        let t = now();
-        m.on_event(ConnEvent::Connect, t);
-        assert_eq!(
-            m.on_event(ConnEvent::ActivationFailed(ConnectionError::BadTag), t),
-            ManagerAction::Reactivate
-        );
-        assert!(matches!(m.state(), ConnectionState::Backoff { .. }));
-        // Second BadTag: no more free retries — hard error with backoff.
-        let action = m.on_event(ConnEvent::ActivationFailed(ConnectionError::BadTag), t);
-        assert_eq!(action, ManagerAction::StateChanged);
-        assert!(matches!(
-            m.state(),
-            ConnectionState::Error {
-                reason: ConnectionError::BadTag,
+                reason: ConnectionError::BindFailed(crate::errors::BindErrorKind::AddrInUse),
                 ..
             }
         ));
@@ -981,13 +854,7 @@ mod tests {
             ManagerAction::RequestHello,
             "backoff must end in a re-activation attempt"
         );
-        m.on_event(
-            ConnEvent::HelloReceived {
-                unpaired: false,
-                window_open: false,
-            },
-            t,
-        );
+        m.on_event(ConnEvent::HelloReceived, t);
         m.on_event(ConnEvent::CapsOk, t);
         assert!(m.state().is_active(), "re-activation must reach Active");
     }
@@ -1077,25 +944,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn window_closed_hello_fails_closed_without_auth() {
-        let mut m = ConnectionManager::new();
-        let t = now();
-        m.on_event(ConnEvent::Connect, t);
-        let action = m.on_event(
-            ConnEvent::HelloReceived {
-                unpaired: true,
-                window_open: false,
-            },
-            t,
-        );
-        assert_eq!(
-            action,
-            ManagerAction::NeedsPairing(ConnectionError::WindowClosed)
-        );
-        assert!(!m.state().is_active());
     }
 
     #[test]

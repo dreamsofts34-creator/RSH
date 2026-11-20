@@ -16,6 +16,7 @@ rsh-app-core = { path = "../rsh-app-core" }
 rsh-ipc = { path = "../rsh-ipc" }
 rsh-transport = { path = "../rsh-transport" }
 dirs.workspace = true
+keyring.workspace = true
 serde_json.workspace = true
 slint = "=1.18.1"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }

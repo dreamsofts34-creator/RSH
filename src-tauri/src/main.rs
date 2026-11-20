@@ -31,17 +31,17 @@
 //! `export_profile`, `list_games`, `launch_game`, `stop_game`,
 //! `get_game_state`, `get_settings`, `set_settings` (PATCH),
 //! `enable_auto_switch`, `led_test`, `key_reset`, `factory_reset`,
-//! `confirm_pairing_replacement`, `import_csharp_profiles`,
+//! `import_csharp_profiles`,
 //! `import_csharp_settings`, `backup_now`,
 //! `restore_backup`, `get_tuning`, `set_tuning`, `get_calibration`,
 //! `save_calibration` (Phase G0) + `get_transport_state`,
 //! `connect_transport`, `disconnect_transport`, `switch_transport`,
 //! `open_config_folder`, `get_startup_notice` (Phase H3: thin
 //! wrappers over the `AppStateCore` transport state / store repair)
-//! + `begin_pairing`, `get_pairing_status`, `get_firmware_version`
-//!   (Phase H5: thin wrappers over the `AppStateCore` session
-//!   activator — the pairing status and the firmware version read the
-//!   activator's records, which exist only while a session is live)
+//! + `get_firmware_version`
+//!   (Phase H5: thin wrapper over the `AppStateCore` session
+//!   activator — the firmware version reads the activator's
+//!   records, which exist only while a session is live)
 //! + `set_password`, `get_config`, `stage_config`, `commit_config`,
 //!   `confirm_config`, `rollback_config`, `get_config_state`,
 //!   `get_pin_map`, `set_pin_map`, `upload_firmware`, `restart_wheel`
@@ -93,9 +93,7 @@ use rsh_app_core::commands::{
 use rsh_app_core::diagnostics::{append_startup_log_both, install_panic_hook, log_fatal};
 use rsh_app_core::snapshot::{EngineSnapshot, EngineStats};
 use rsh_app_core::state::{AppSettings, AppSettingsPatch, ProfileSummary, is_allowed_board_ip};
-use rsh_app_core::state::{
-    AppStateCore, Calibration, GameInfo, PairingStatus, TransportKind, TransportState,
-};
+use rsh_app_core::state::{AppStateCore, Calibration, GameInfo, TransportKind, TransportState};
 use rsh_app_core::system::{
     InstanceDecision, UpdateInfo, parse_instance_version_arg, resolve_instance,
 };
@@ -446,33 +444,9 @@ fn get_startup_notice(state: tauri::State<'_, AppState>) -> Option<String> {
 }
 
 /* ------------------------------------------------------------------ */
-/* Session + pairing (Phase H5 — thin wrappers over the activator).   */
 /* ------------------------------------------------------------------ */
-
-/// Begins pairing: triggers a session-activation attempt on the live
-/// transport (the forwarder runs `BoardSession::pair` when the board
-/// reports itself unpaired with the window open, `resume` otherwise)
-/// and returns the pairing status. A no-op returning the current
-/// status while a session is already active — it never tears down a
-/// live session to re-pair. Thin wrapper over
-/// `AppStateCore::begin_pairing`. The command waits up to ~3 s for
-/// the attempt to produce a window or a failure (the `HELLO` arrives
-/// asynchronously in the forwarder); the frontend polls
-/// `get_pairing_status` while the window is open.
-#[tauri::command]
-#[allow(clippy::needless_pass_by_value)]
-fn begin_pairing(state: tauri::State<'_, AppState>) -> Result<PairingStatus, String> {
-    state.core().begin_pairing()
-}
-
-/// The pairing status: seconds left in the 60 s window, the one-time
-/// password while the window is open, and the last activation
-/// failure, if any. Thin wrapper over `AppStateCore::pairing_status`.
-#[tauri::command]
-#[allow(clippy::needless_pass_by_value)]
-fn get_pairing_status(state: tauri::State<'_, AppState>) -> PairingStatus {
-    state.core().pairing_status()
-}
+/* Session (Phase H5 — thin wrappers over the activator).           */
+/* ------------------------------------------------------------------ */
 
 /// The board firmware version from the live session's `GET_CAPS`
 /// reply (`"4.0.1"`). Errors honestly with no authenticated session
@@ -803,10 +777,11 @@ fn led_test(
     state.core().led_test(pattern, brightness, period_ms)
 }
 
-/// Resets the board's stored pairing key (M-6). Only works while the
-/// board has armed a key reset (the HELLO flag); otherwise it refuses
-/// loudly. On success the session gate closes and the session
-/// records are cleared, so the board can be paired again.
+/// Forgets the Wi-Fi password on the PC side (M-6, D7): deletes
+/// the stored `:wifi` password for the current board, closes the
+/// session gate, and clears the session records. There is no wire
+/// opcode anymore — the board-side password is cleared only by
+/// holding BOOT ≥ 10 s on the board itself.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 fn key_reset(state: tauri::State<'_, AppState>) -> Result<(), String> {
@@ -819,19 +794,6 @@ fn key_reset(state: tauri::State<'_, AppState>) -> Result<(), String> {
 #[allow(clippy::needless_pass_by_value)]
 fn factory_reset(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.core().factory_reset()
-}
-
-/// Confirms a pairing replacement (M-7): the board already holds a
-/// key for a different PC, and the user has seen the warning
-/// (board MAC in `get_pairing_status`). Re-triggers activation with
-/// the replacement allowed exactly once, and returns the resulting
-/// transport state.
-#[tauri::command]
-#[allow(clippy::needless_pass_by_value)]
-fn confirm_pairing_replacement(
-    state: tauri::State<'_, AppState>,
-) -> Result<TransportState, String> {
-    state.core().confirm_pairing_replacement()
 }
 
 /// Imports profiles from a C# ApexLink/RSH export file (M-6).
@@ -1255,7 +1217,6 @@ fn main() {
             led_test,
             key_reset,
             factory_reset,
-            confirm_pairing_replacement,
             import_csharp_profiles,
             import_csharp_settings,
             backup_now,
@@ -1274,8 +1235,6 @@ fn main() {
             switch_transport,
             open_config_folder,
             get_startup_notice,
-            begin_pairing,
-            get_pairing_status,
             get_firmware_version,
             set_password,
             get_config,

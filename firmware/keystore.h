@@ -1,67 +1,46 @@
 #pragma once
-// RSH device key store (FW-8, KEY-LIFECYCLE.md §2/§3, PROTOCOL-V2.1.md §4).
+// RSH Wi-Fi password store (v2.2, no-pairing redesign — PROTOCOL-V2.2.md §5,
+// NO-PAIRING-PLAN.md §3 D3/D6/D7/D23).
 // Arduino-only (Preferences + esp_random) — host tests is ko cover nahi
-// karte; pure logic (HMAC/session) ctrl.h + protocol.h mein test hota hai.
+// karte; pure logic (control dispatch, password validation, obfuscation)
+// ctrl.h / password.h / pw_obfuscate.h mein test hota hai.
 //
-// - Pehle boot par board khud 32 B random key + 24-char password banata
-//   hai (hardware RNG, rejection sampling) aur NVS ("rsh" namespace) mein
-//   likhta hai. FACTORY_RESET key/password ko NAHI chheerta (KEY_RESET
-//   alag command hai — FW-3/§4.4 owns armed state; yahan sirf read API).
-// - Nonce (16 B) SIRF RAM mein hai — har boot par naya (reboot = naya
-//   session, §2.3). NVS mein kabhi nahi.
-// - Pairing window: transport-independent deadline (F-02/F-03, v4.0.2 —
-//   pairing_window.h): AP-up se 60 s (purana), pair button (BOOT 3 s
-//   hold) se 120 s, ya serial HELO (unpaired board) se 120 s. Window
-//   sirf unpaired board par khulti hai; paired board par open_* no-op.
-// - RNG/NVS fail → begin() false → board normal boot mein aage NAHI
-//   barhta (fail closed, §4.6 — kamzor/repeat key ke saath boot kabhi nahi).
-// - RNG/NVS fail → begin() false → board normal boot mein aage NAHI
-//   barhta (fail closed, §4.6 — kamzor/repeat key ke saath boot kabhi nahi).
-//
-// NOTE (OPEN-3, residual — SEC-E-01, Phase F W1): Preferences (NVS)
-// bina flash-encryption ke plaintext-ish store karta hai — flash dump se
-// key parhi ja sakti hai. Phase F mein password ke liye ek behtari aayi:
-// "wifipw" (plaintext string) ki jagah "wifipw2" (device key se obfuscated
-// bytes, pw_obfuscate.h) — purana plaintext pehli load par migrate ho kar
-// mit jata hai. Ye OBFUSCATION hai, encryption nahi (device key khud usi
-// NVS mein plaintext hai — poora dump + open-source scheme = recoverable).
-// Asal hal encrypted NVS / flash encryption hai (OPEN-3) — us ka exact
-// mechanism + procedure Phase H mein hai (docs/FLASH-ENCRYPTION-PROCEDURE.md
-// — Secure Boot v2 RSA-3072 + flash encryption release mode + encrypted
-// NVS; secure-build runtime check secure_nvs.h mein hai), is code se
-// nahi badalta, sirf note karta hai.
+// Model (v2.2 — device key / pairing khatam):
+// - Sirf EK credential hai: user-set Wi-Fi password (AP + WebOTA dono ke
+//   liye). Koi device key nahi, koi generated password nahi, koi `paired`
+//   flag nahi, koi pairing window nahi.
+// - Koi password stored nahi hai to AP KHULA hai (open hotspot, pehli
+//   setup). User Settings se password set karta hai (SET_PASSWORD 0x0C);
+//   us ke baad AP WPA2-PSK hai.
+// - Password NVS "wifipw2" mein obfuscated hai (pw_obfuscate.h) —
+//   keystream key ek fresh random NVS key ("obfkey", 32 B) hai jo pehli
+//   4.0.3 boot par generate hoti hai (D23). Ye OBFUSCATION hai,
+//   encryption nahi (OPEN-3: asal hal flash encryption hai).
+// - Migration (D6): pehli 4.0.3 boot (NVS marker "mig403") purane
+//   secrets — "devkey", "paired", "wifipw2", "wifipw" — mita deti hai.
+//   AP us ke baad khula aata hai; user naya password set karta hai.
+// - Password clear sirf physical hai (D7): BOOT >= 10 s hold ->
+//   keystore_clear_password() + reboot -> open AP. Koi wire opcode nahi.
+// - NVS fail -> begin()/set/clear false -> board fail closed (rsh.ino
+//   5 s retry karta hai; ghalat/na-maloom password ke saath AP kabhi
+//   up nahi hota).
 #include <stdint.h>
 #include <stddef.h>
 #include "password.h"   // SET_PASSWORD length/charset (8..63, §5.2)
 
-#define RSH_KEY_LEN 32
-#define RSH_PASSWORD_LEN 24  // generated per-device password (§5.1); wire/store format mein hyphen NAHI
-
-bool keystore_begin();  // false = key/password generate ya NVS fail
-const uint8_t *keystore_key(void);       // 32 B device key (HMAC)
-const char *keystore_password(void);     // 24 ASCII chars + NUL (AP + WebOTA)
-const uint8_t *keystore_nonce(void);     // 16 B session nonce (RAM only)
-void keystore_rotate_nonce(void);        // naya session (HELO sessionFlag=1)
-bool keystore_unpaired(void);            // true = abhi tak pair nahi hua
-bool keystore_pairing_open(uint32_t now_ms);  // unpaired + window deadline ke andar
-// Pairing window kholo (F-02/F-03): pair button ya serial HELO se —
-// 120 s, sirf unpaired board par (paired par no-op). Har call deadline
-// dobara set karta hai (serial HELO har dafa refresh karta hai).
-void keystore_open_pair_window(uint32_t now_ms);
-// Window baqi waqt, poore seconds mein (0 = band) — GET_DIAG (F-10) ke
-// liye; HELLO mein jagah nahi hai (F-16: reserved byte, protocol frozen).
-uint16_t keystore_window_remaining_s(uint32_t now_ms);
-void keystore_mark_paired(void);         // pehli HMAC GET_CAPS OK par (§3 step 7)
-void keystore_mark_ap_up(uint32_t now_ms);    // AP up hote hi — window yahin se
-bool keystore_key_reset_armed(void);     // FW-3 owns armed state (§4.4 — rsh.ino se)
-bool keystore_key_reset(void);           // KEY_RESET (§4.4): nayi key+password,
-// unpaired; config nahi badalti. Caller reply ke BAAD bulaye, phir reboot.
-// false = fail (caller restart NAHI karta — fail closed, purani key rehti hai).
-// SET_PASSWORD (§5.2, Phase E WS5): user ka naya Wi-Fi/OTA password set karo
-// (ek credential, AP + WebOTA dono ke liye). NVS "wifipw2" (obfuscated,
-// SEC-E-01 Phase F) update hoti hai; key UNPAIRED state nahi badalti.
-// Length/charset dobara validate hota hai (password.h) — ghalat input par
-// false, purana password rehta hai. Caller reply bhejne KE BAAD bulaye,
-// phir AP restart kare (reply OK restart se pehle jata hai). false = NVS
-// fail → caller AP restart NAHI karta.
+bool keystore_begin();  // false = migration/obfkey/NVS fail (fail closed)
+bool keystore_has_password(void);   // true = user-set password stored hai
+const char *keystore_password(void);  // stored password, ya "" (koi nahi)
+// Stored password se constant-time match (false jab koi password na ho).
+bool keystore_check_password(const char *pw, uint8_t len);
+// SET_PASSWORD (§5.2, D3): user ka naya Wi-Fi/OTA password set karo.
+// NVS "wifipw2" (obfuscated) update hoti hai. Length/charset dobara
+// validate hota hai (password.h) — ghalat input par false, purana
+// password rehta hai. Caller reply bhejne KE BAAD bulaye, phir AP restart
+// kare (reply OK restart se pehle jata hai). false = NVS fail → caller AP
+// restart NAHI karta.
 bool keystore_set_password(const char *pw, uint8_t len);
+// D7: password mitao (NVS + RAM) — BOOT >= 10 s hold se. Clear ke baad
+// AP khula aata hai. false = NVS remove fail (fail closed — RAM password
+// rehta hai, caller reboot NAHI karta).
+bool keystore_clear_password(void);

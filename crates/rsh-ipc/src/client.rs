@@ -31,16 +31,15 @@ use crate::{IPC_PROTOCOL_VERSION, IpcError, IpcRequest, IpcResponse};
 const CALL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Methods whose result arrives via events/polling, not the RPC
-/// reply (B-1, v2.0.2): `begin_pairing` only *starts* a pairing
-/// window — the outcome arrives as `PairingWindow` /
-/// `PairingFinished` events and via `pairing_status`. Waiting for
-/// the RPC reply would time out against a slow board (the daemon
-/// used to wait up to 3 s for the window) and the timeout would
-/// poison the poller's link state, so [`IpcClient::call`] returns
-/// as soon as the request is written for these methods. The late
-/// reply is discarded by the next call's id check (the response
-/// channel holds 64 frames, so it never blocks the reader).
-const FIRE_AND_FORGET_METHODS: &[&str] = &["begin_pairing"];
+/// reply (B-1, v2.0.2). No-pairing redesign: the only
+/// fire-and-forget method was `begin_pairing` (it only *started*
+/// a pairing window); it is deleted, so the list is empty — kept
+/// as an empty list so [`IpcClient::call`] keeps its shape for
+/// any future method that legitimately waits on a human.
+/// The late reply of such a method is discarded by the next
+/// call's id check (the response channel holds 64 frames, so it
+/// never blocks the reader).
+const FIRE_AND_FORGET_METHODS: &[&str] = &[];
 
 /// A connected IPC client.
 pub struct IpcClient {
@@ -274,8 +273,7 @@ impl IpcClient {
     /// `set_output_backend` (the UAC prompt + a 60 s sidecar spawn)
     /// — use a longer bound instead of the 500 ms default, so the
     /// UI does not time out while the user is still answering the
-    /// prompt. (`begin_pairing` does not use this path: it is
-    /// fire-and-forget — see [`FIRE_AND_FORGET_METHODS`].)
+    /// prompt.
     ///
     /// # Errors
     ///

@@ -24,18 +24,6 @@ use rsh_protocol::stream::{StatusPacket, StreamFlags, StreamFrame};
 
 use crate::rng::Rng;
 
-/// Test key/nonce for the rig's control channel (same test fixtures
-/// as `rsh-benchmarks`: `TEST_KEY = 00..1f`, `TEST_NONCE = a0..af`).
-/// These are NOT real secrets — test fixtures only.
-pub const TEST_KEY: [u8; 32] = [
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-];
-/// Test nonce (see [`TEST_KEY`]).
-pub const TEST_NONCE: [u8; 16] = [
-    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
-];
-
 /// What the wheel is driving on this run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WheelKind {
@@ -358,11 +346,12 @@ impl VirtualWheel {
         std::time::Duration::from_micros(delay_us.clamp(50.0, 50_000.0) as u64)
     }
 
-    /// Handle one inbound control frame (bytes). A valid HMAC-verified
-    /// `GET_CAPS` opens the auth gate; anything else is ignored.
+    /// Handle one inbound control frame (bytes). A valid CRC-verified
+    /// `GET_CAPS` opens the gate (v2.2: plain, no HMAC); anything else
+    /// is ignored.
     pub fn handle_control(&mut self, bytes: &[u8]) {
         use rsh_protocol::control::ControlFrame;
-        let Ok(frame) = ControlFrame::verify(bytes, &TEST_KEY, &TEST_NONCE) else {
+        let Ok(frame) = ControlFrame::verify(bytes) else {
             return;
         };
         if frame.cmd == 0x01 {
@@ -918,16 +907,8 @@ mod tests {
             let out = wheel.next_tick();
             assert_eq!(out.frames.len(), 0);
         }
-        // Open the gate with a real HMAC-verified GET_CAPS frame.
-        let frame = rsh_protocol::control::build_frame(
-            &super::TEST_KEY,
-            &super::TEST_NONCE,
-            0x01,
-            1,
-            0,
-            b"",
-        )
-        .expect("builds");
+        // Open the gate with a real GET_CAPS frame (v2.2: plain, CRC).
+        let frame = rsh_protocol::control::build_frame(0x01, 1, b"").expect("builds");
         wheel.handle_control(&frame);
         assert!(wheel.gate_open());
         let out = wheel.next_tick();

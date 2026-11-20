@@ -1,5 +1,8 @@
-//! Wi-Fi rejoin helper — after pairing, join the PC to the RSH
-//! Wi-Fi itself (LOGIC-FIX-PLAN §4.2, C-08; Phase 6).
+//! Wi-Fi rejoin helper — join the PC to the RSH Wi-Fi itself
+//! (LOGIC-FIX-PLAN §4.2, C-08; Phase 6). No-pairing redesign:
+//! the board SSID is `RSH-XXXX` (D4 — last 4 hex of the board
+//! Wi-Fi MAC, uppercase), derived from the observed HELLO; there
+//! is no fixed `RSH` SSID anymore.
 //!
 //! Windows is the target (the user's PC): a user-level Wi-Fi
 //! profile (`netsh wlan add profile … user=current`) + connect —
@@ -7,16 +10,19 @@
 //! drive `NetworkManager` here, so [`rejoin_wifi`] returns the exact
 //! manual steps instead of pretending to work.
 //!
-//! The one-time Wi-Fi password is passed through this module but
-//! never logged: log lines carry the SSID only (see
-//! [`log_safe_summary`]). The profile XML is written to a temp
-//! file, imported, then deleted immediately — the password never
-//! stays on disk in cleartext.
+//! The Wi-Fi password (set by the user in Settings) is passed
+//! through this module but never logged: log lines carry the SSID
+//! only (see [`log_safe_summary`]). The profile XML is written to
+//! a temp file, imported, then deleted immediately — the password
+//! never stays on disk in cleartext.
 //!
-//! Wiring (Phase 6 + integration): `main.rs` declares `mod rejoin;`
-//! and calls [`rejoin_wifi`] from the pairing-completion path in the
-//! manager loop (password stashed while the window is open, used
-//! once on the transition to Active).
+//! Wiring (no-pairing redesign): `main.rs` declares `mod rejoin;`.
+//! [`DaemonApi::set_wifi_password`](crate::daemon_api::DaemonApi)
+//! calls [`rejoin_wifi`] after the board password changes (D8 —
+//! the WLAN profile update is part of the same IPC call), and
+//! the first-connect flow calls [`rejoin_wifi_open`] to join the
+//! board's open AP before the app connects. [`scan_rsh_networks`]
+//! lists nearby `RSH-XXXX` hotspots for the wizard.
 //!
 //! Windows-only helpers (`escape_xml`, `build_profile_xml`,
 //! `windows_steps`, `StepFailed`) are dead on the Linux build host
@@ -28,9 +34,6 @@
 
 use std::time::Duration;
 
-/// The board's `SoftAP` SSID the PC joins after pairing.
-pub const RSH_SSID: &str = "RSH";
-
 /// What went wrong while rejoining the RSH Wi-Fi.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RejoinError {
@@ -41,7 +44,8 @@ pub enum RejoinError {
         instructions: String,
     },
     /// A step of the Windows flow failed: `step` names it
-    /// (`add-profile` / `connect` / `write-profile`), `detail`
+    /// (`add-profile` / `connect` / `write-profile` /
+    /// `delete-profile` / `show-networks`), `detail`
     /// is the OS / netsh output (never the password).
     StepFailed {
         /// Which step failed.
@@ -114,7 +118,7 @@ pub fn windows_steps() -> Vec<&'static str> {
     vec![
         "Write the WPA2-PSK profile XML to a unique %TEMP%\\rsh-wifi-profile-<pid>-<nanos>.xml (deleted on every exit path)",
         "netsh wlan add profile filename=\"<unique-temp-path>\" user=current (30 s timeout)",
-        "netsh wlan connect name=RSH (30 s timeout)",
+        "netsh wlan connect name=RSH-XXXX (30 s timeout, SSID from the observed board MAC)",
         "Delete the unique temp profile XML (Drop guard)",
         "Confirm: the RSH Wi-Fi shows as Connected before starting the session",
     ]
@@ -126,8 +130,18 @@ pub fn windows_steps() -> Vec<&'static str> {
 pub fn manual_instructions(ssid: &str) -> String {
     format!(
         "Join the '{ssid}' Wi-Fi manually, then retry. Linux (NetworkManager): \
-         nmcli device wifi connect '{ssid}' password '<one-time-password>'. \
-         The one-time password was shown once during pairing."
+         nmcli device wifi connect '{ssid}' password '<the password you set in Settings>'. \
+         While the board AP is still open (no password set yet), omit the password argument."
+    )
+}
+
+/// Manual instructions for forgetting a network on platforms
+/// without automation (Linux): the exact command the user runs.
+#[must_use]
+pub fn manual_forget_instructions(ssid: &str) -> String {
+    format!(
+        "Remove the '{ssid}' Wi-Fi network manually. Linux (NetworkManager): \
+         nmcli connection delete '{ssid}'."
     )
 }
 
@@ -139,7 +153,46 @@ pub fn log_safe_summary(ssid: &str) -> String {
     format!("rejoin: ssid={ssid}")
 }
 
-/// Join the PC to the board's Wi-Fi after pairing.
+/// Build the Windows WLAN profile XML for an open (unsecured)
+/// SSID: `authentication` open, `encryption` none, no
+/// `<sharedKey>` — the first-connect flow joins the board's open
+/// AP with this profile ([`rejoin_wifi_open`]).
+#[must_use]
+pub fn build_open_profile_xml(ssid: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\"?>\n<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">\n\t<name>{ssid}</name>\n\t<SSIDConfig>\n\t\t<SSID>\n\t\t\t<name>{ssid}</name>\n\t\t</SSID>\n\t</SSIDConfig>\n\t<connectionType>ESS</connectionType>\n\t<connectionMode>manual</connectionMode>\n\t<MSM>\n\t\t<security>\n\t\t\t<authEncryption>\n\t\t\t\t<authentication>open</authentication>\n\t\t\t\t<encryption>none</encryption>\n\t\t\t\t<useOneX>false</useOneX>\n\t\t\t</authEncryption>\n\t\t</security>\n\t</MSM>\n</WLANProfile>\n",
+        ssid = escape_xml(ssid),
+    )
+}
+
+/// Join the PC to the board's open Wi-Fi (first connect, D5):
+/// writes the open profile XML and connects. Same
+/// platform rules as [`rejoin_wifi`]: Windows via `netsh`,
+/// any other OS returns [`RejoinError::UnsupportedPlatform`]
+/// with the exact manual steps.
+///
+/// # Errors
+///
+/// [`RejoinError::StepFailed`] when a Windows step fails, or
+/// [`RejoinError::UnsupportedPlatform`] off Windows.
+pub fn rejoin_wifi_open(ssid: &str) -> Result<(), RejoinError> {
+    #[cfg(target_os = "windows")]
+    {
+        rejoin_wifi_open_windows(ssid)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ssid;
+        Err(RejoinError::unsupported(manual_instructions(ssid)))
+    }
+}
+
+/// Join the PC to the board's Wi-Fi (WPA2-PSK).
+///
+/// This is also the password-change path (D8): importing a
+/// profile whose `<name>` already exists overwrites it, so
+/// calling this with the new password rewrites the stored
+/// profile and reconnects — no separate delete step needed.
 ///
 /// * Windows: writes the profile XML to `%TEMP%`, imports it as
 ///   a user-level profile, connects, deletes the temp file.
@@ -160,6 +213,105 @@ pub fn rejoin_wifi(ssid: &str, password: &str) -> Result<(), RejoinError> {
     {
         let _ = (ssid, password);
         Err(RejoinError::unsupported(manual_instructions(ssid)))
+    }
+}
+
+/// Parse `netsh wlan show networks` output into the visible
+/// `RSH-XXXX` SSIDs (D4): lines look like `SSID 1 : RSH-9A55`.
+/// Pure + tested — the Windows scan below only runs the command
+/// and hands its stdout here.
+#[must_use]
+pub fn parse_rsh_ssids(output: &str) -> Vec<String> {
+    let mut ssids = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("SSID") else {
+            continue;
+        };
+        // `SSID 1 : RSH-9A55` — skip the number, take the name
+        // after the colon.
+        let Some((_, name)) = rest.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_string();
+        if name.starts_with("RSH-") && !ssids.contains(&name) {
+            ssids.push(name);
+        }
+    }
+    ssids
+}
+
+/// Scan for nearby board hotspots (D4): SSIDs starting with
+/// `RSH-`.
+///
+/// * Windows: `netsh wlan show networks`, parsed by
+///   [`parse_rsh_ssids`].
+/// * Any other OS: empty — there is no `netsh` here, and the
+///   signature has no error channel; the wizard shows no
+///   networks instead of failing.
+#[must_use]
+pub fn scan_rsh_networks() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("netsh");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        cmd.args(["wlan", "show", "networks"]);
+        let Ok(output) = run_command_timeout(&mut cmd, NETSH_TIMEOUT, "show-networks") else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        parse_rsh_ssids(&String::from_utf8_lossy(&output.stdout))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Forget a board Wi-Fi network (D19, PC side of
+/// `clear_wifi_password`): deletes the Windows WLAN profile for
+/// `ssid` so the PC no longer auto-joins with a stale password.
+/// Off Windows there is no daemon-managed profile, so this is a
+/// no-op success (the user removes a manually saved network with
+/// [`manual_forget_instructions`]).
+///
+/// # Errors
+///
+/// [`RejoinError::StepFailed`] when the Windows delete fails.
+// The Windows branch returns `Err` (netsh delete failure); the
+// `Result` is the cross-platform contract — on Linux this is
+// always `Ok(())`, which is what `clippy::unnecessary_wraps`
+// (correctly, for this target) complains about.
+#[allow(clippy::unnecessary_wraps)]
+pub fn forget_wifi_profile(ssid: &str) -> Result<(), RejoinError> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("netsh");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        cmd.args(["wlan", "delete", "profile", &format!("name={ssid}")]);
+        let output = run_command_timeout(&mut cmd, NETSH_TIMEOUT, "delete-profile")?;
+        if !output.status.success() {
+            return Err(RejoinError::StepFailed {
+                step: "delete-profile",
+                detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ssid;
+        Ok(())
     }
 }
 
@@ -260,6 +412,21 @@ fn run_command_timeout(
 /// it on a command line (it travels only inside the temp XML).
 #[cfg(target_os = "windows")]
 fn rejoin_wifi_windows(ssid: &str, password: &str) -> Result<(), RejoinError> {
+    rejoin_wifi_windows_with_xml(ssid, &build_profile_xml(ssid, password))
+}
+
+/// Windows implementation of [`rejoin_wifi_open`]: open-profile
+/// import + connect via `netsh` (no password anywhere).
+#[cfg(target_os = "windows")]
+fn rejoin_wifi_open_windows(ssid: &str) -> Result<(), RejoinError> {
+    rejoin_wifi_windows_with_xml(ssid, &build_open_profile_xml(ssid))
+}
+
+/// Shared Windows flow for both profile kinds: write the XML to a
+/// unique temp file, import it as a user-level profile, connect,
+/// delete the temp file (Drop guard — every exit path).
+#[cfg(target_os = "windows")]
+fn rejoin_wifi_windows_with_xml(ssid: &str, xml: &str) -> Result<(), RejoinError> {
     use std::io::Write as _;
     // R2-03 (S-05): `CommandExt` for the CREATE_NO_WINDOW flags on
     // the `netsh` helpers below.
@@ -270,7 +437,6 @@ fn rejoin_wifi_windows(ssid: &str, password: &str) -> Result<(), RejoinError> {
     // collided between processes and left the password on disk if
     // the daemon died between write and delete.
     let profile_path = profile_temp_path();
-    let xml = build_profile_xml(ssid, password);
     {
         let mut file =
             std::fs::File::create(&profile_path).map_err(|e| RejoinError::StepFailed {
@@ -327,13 +493,13 @@ mod tests {
 
     #[test]
     fn profile_xml_is_wpa2_psk_with_escaped_key() {
-        let xml = build_profile_xml("RSH", "p<ass&\"word'");
+        let xml = build_profile_xml("RSH-9A55", "p<ass&\"word'");
         assert!(
             xml.contains("<authentication>WPA2PSK</authentication>"),
             "{xml}"
         );
         assert!(xml.contains("<encryption>AES</encryption>"), "{xml}");
-        assert!(xml.contains("<name>RSH</name>"), "{xml}");
+        assert!(xml.contains("<name>RSH-9A55</name>"), "{xml}");
         // The password is present, fully escaped — never raw.
         assert!(
             xml.contains("<keyMaterial>p&lt;ass&amp;&quot;word&apos;</keyMaterial>"),
@@ -365,15 +531,15 @@ mod tests {
 
     #[test]
     fn log_summary_never_carries_the_password() {
-        let summary = log_safe_summary(RSH_SSID);
-        assert!(summary.contains("RSH"));
+        let summary = log_safe_summary("RSH-9A55");
+        assert!(summary.contains("RSH-9A55"));
         assert!(!summary.contains("secret"), "{summary}");
     }
 
     #[test]
     fn manual_instructions_name_the_network_and_tool() {
-        let text = manual_instructions(RSH_SSID);
-        assert!(text.contains("RSH"), "{text}");
+        let text = manual_instructions("RSH-9A55");
+        assert!(text.contains("RSH-9A55"), "{text}");
         assert!(text.contains("nmcli"), "{text}");
     }
 
@@ -383,7 +549,7 @@ mod tests {
         // helper must say so, with the exact manual command.
         #[cfg(not(target_os = "windows"))]
         {
-            let err = rejoin_wifi(RSH_SSID, "one-time-password").unwrap_err();
+            let err = rejoin_wifi("RSH-9A55", "TestPass123").unwrap_err();
             match err {
                 RejoinError::UnsupportedPlatform { instructions } => {
                     assert!(instructions.contains("nmcli"), "{instructions}");
@@ -398,6 +564,45 @@ mod tests {
         {
             // Windows-only path: not exercised on this host.
         }
+    }
+
+    #[test]
+    fn open_profile_xml_has_no_shared_key() {
+        let xml = build_open_profile_xml("RSH-9A55");
+        assert!(xml.contains("<name>RSH-9A55</name>"), "{xml}");
+        assert!(
+            xml.contains("<authentication>open</authentication>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<encryption>none</encryption>"), "{xml}");
+        assert!(!xml.contains("sharedKey"), "{xml}");
+        assert!(!xml.contains("keyMaterial"), "{xml}");
+    }
+
+    #[test]
+    fn parse_rsh_ssids_keeps_only_rsh_networks() {
+        let output = "Interface name : Wi-Fi\n\
+            There are 3 networks currently visible.\n\
+            SSID 1 : RSH-9A55\n\
+            \tNetwork type            : Infrastructure\n\
+            SSID 2 : HomeWifi\n\
+            \tNetwork type            : Infrastructure\n\
+            SSID 3 : RSH-EEFF\n";
+        assert_eq!(
+            parse_rsh_ssids(output),
+            vec!["RSH-9A55".to_string(), "RSH-EEFF".to_string()]
+        );
+        assert_eq!(parse_rsh_ssids("no networks here"), Vec::<String>::new());
+        // A bare `RSH` (no dash) is not a board hotspot.
+        assert_eq!(parse_rsh_ssids("SSID 1 : RSH\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn linux_scan_returns_empty_and_forget_is_noop() {
+        assert_eq!(scan_rsh_networks(), Vec::<String>::new());
+        assert!(forget_wifi_profile("RSH-9A55").is_ok());
+        assert!(rejoin_wifi_open("RSH-9A55").is_err());
     }
 
     #[test]

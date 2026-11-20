@@ -8,8 +8,8 @@
 // game tiles all arrive as Rust-owned props (A11/A12/A14). No daemon
 // means "Disconnected" + "—" placeholders, never fake Online (the
 // sim fallback is labelled as unavailable, not live). The GT3 Sprint
-// box opens the profile popover (A13); the pairing-needed banner
-// (§8.6) shows when the wheel is not paired yet.
+// box opens the profile popover (A13). D17: no pairing banners any
+// more — `connected` (Active) is the only wheel state shown.
 import { Theme } from "../tokens.slint";
 import { EmptyBanner, Card, WheelGraphic, PedalBar, Pill, Btn, GameTile, CheckRow } from "../components.slint";
 import { ScrollView } from "std-widgets.slint";
@@ -32,7 +32,6 @@ export component OverviewPage inherits VerticalLayout {
     in property <float> clutch;
     in property <bool> daemon-live;
     in property <bool> connected;
-    in property <bool> paired: true;
     // M-2 (v2.0.2): the specific fatal reason from
     // read_daemon_status() — "" while there is none. Shown as an
     // error banner with Reconnect instead of the generic line below.
@@ -60,13 +59,6 @@ export component OverviewPage inherits VerticalLayout {
     callback open-diagnostics();
     callback reconnect();
     callback open-profile-popover();
-    callback pair-now();
-    // Phase 2 (RC-3): the board already has a stored key — the
-    // Overview banner offers Replace pairing directly (the wizard
-    // Pair step is not the only surface any more).
-    callback replace-pairing();
-    in property <bool> replace-required: false;
-    in property <string> replace-board-mac: "";
     // Phase 2 (Wi-Fi gap): true while the daemon's last activation
     // error is Unreachable — the banner then names the fix
     // (join the RSH Wi-Fi / plug in USB) instead of the generic
@@ -85,13 +77,8 @@ export component OverviewPage inherits VerticalLayout {
     // REDESIGN-PLAN §8.6 disconnected state: banner + Reconnect.
     // Phase 2 (Wi-Fi gap): while Unreachable, name the fix
     // proactively instead of the generic line.
-    if daemon-live && !connected && unreachable : EmptyBanner { text: "Wheel not found — join the 'RSH' Wi-Fi network (or plug in USB), then press Reconnect."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
-    if daemon-live && !connected && !unreachable : EmptyBanner { text: "Wheel not connected — check the RSH Wi-Fi is joined (or the USB cable is plugged in), then retry."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
-    // Phase 2 (RC-3): StoredKeyExists — Replace pairing straight
-    // from Overview, wired to confirm_replace_pairing_flow.
-    if daemon-live && replace-required && !paired : EmptyBanner { text: "This wheel is already paired with a different key" + (replace-board-mac == "" ? "" : " (" + replace-board-mac + ")") + " — replace the pairing to connect."; action-label: "Replace pairing"; is-error: true; action-disabled: busy-kind == 12; action-clicked => { replace-pairing(); } }
-    // REDESIGN-PLAN §8.6 pairing-needed state (E): banner + Pair.
-    if daemon-live && connected && !paired : EmptyBanner { text: "Wheel not paired — pair it so only this PC can control it."; action-label: "Pair now"; is-error: true; action-disabled: busy-kind == 12; action-clicked => { pair-now(); } }
+    if daemon-live && !connected && unreachable : EmptyBanner { text: "Wheel not found — join the wheel's RSH-XXXX Wi-Fi network (or plug in USB), then press Reconnect."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
+    if daemon-live && !connected && !unreachable : EmptyBanner { text: "Wheel not connected — check the RSH-XXXX Wi-Fi is joined (or the USB cable is plugged in), then retry."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
     Card {
         HorizontalLayout {
             // Phase 2 (F-16): spec card padding 14/16 (was 16/20).

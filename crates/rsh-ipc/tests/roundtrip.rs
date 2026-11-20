@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use rsh_api::{
-    ApiTransport, AppApi, AppEvent, ConnectionInfo, DraftStatus, PairingInfo, SlowPollState,
-    SnapshotInfo, TuningSettings, UserError, connection::ConnectionState, validate_tuning,
+    ApiTransport, AppApi, AppEvent, ConnectionInfo, DraftStatus, SlowPollState, SnapshotInfo,
+    TuningSettings, UserError, WifiStatus, connection::ConnectionState, validate_tuning,
 };
 use rsh_ipc::{IpcClient, IpcServer, bind_unix_socket, serve_listener};
 use tokio::sync::broadcast;
@@ -43,6 +43,7 @@ impl AppApi for StubApi {
             transport: ApiTransport::Wifi,
             address: "192.168.4.1".to_string(),
             session_active: true,
+            board_reachable: true,
             error: None,
             hint: None,
         }
@@ -53,20 +54,24 @@ impl AppApi for StubApi {
     fn disconnect(&self) -> Result<ConnectionInfo, UserError> {
         Ok(self.connection())
     }
-    fn pairing_status(&self) -> PairingInfo {
-        PairingInfo {
-            seconds_left: 0,
-            password: None,
-            error: None,
-            error_detail: None,
-            board_mac: None,
-            replacement_required: false,
-            key_reset_armed: false,
-            attempt_log: Vec::new(),
+    fn wifi_status(&self) -> WifiStatus {
+        WifiStatus {
+            ssid: Some("RSH-9A55".to_string()),
+            connected: true,
+            password_set: false,
+            board_mac: Some("AA:BB:CC:DD:EE:FF".to_string()),
         }
     }
-    fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
-        Ok(self.pairing_status())
+    fn set_wifi_password(&self, _password: &str, _confirm: &str) -> Result<WifiStatus, UserError> {
+        Ok(WifiStatus {
+            ssid: Some("RSH-9A55".to_string()),
+            connected: true,
+            password_set: true,
+            board_mac: Some("AA:BB:CC:DD:EE:FF".to_string()),
+        })
+    }
+    fn clear_wifi_password(&self) -> Result<WifiStatus, UserError> {
+        Ok(self.wifi_status())
     }
     fn snapshot(&self) -> SnapshotInfo {
         SnapshotInfo::default()
@@ -245,7 +250,9 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
         serde_json::from_value(slow_value).expect("slow_poll parses as SlowPollState");
     assert_eq!(slow.version, "1.0.2");
     assert_eq!(slow.firmware_version, "Unknown");
-    assert_eq!(slow.pairing_status.seconds_left, 0);
+    assert_eq!(slow.wifi_status.ssid.as_deref(), Some("RSH-9A55"));
+    assert!(slow.wifi_status.connected);
+    assert!(!slow.wifi_status.password_set);
     assert_eq!(slow.tunings.len(), 8);
     assert_eq!(slow.modules.len(), 4);
     assert!(slow.modules.values().all(|enabled| *enabled));

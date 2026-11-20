@@ -3,6 +3,11 @@
 // its step gating + click its Next/Skip buttons headless. Only the
 // properties the gate needs are forwarded; the wizard itself is
 // untouched.
+//
+// v2.2 (no-pairing redesign, D16): 4 steps (Connect, Drivers,
+// Calibrate, Games). Step 2 is the Calibrate gate; the pairing
+// props (`paired`, `pair-status`) are gone, and `connect-hint`
+// is the Connect step's why-it-cannot-advance text.
 import { SetupWizard } from "../../../crates/rsh-ui/ui/screens/setup.slint";
 
 export component GateWizardWindow inherits Window {
@@ -12,14 +17,13 @@ export component GateWizardWindow inherits Window {
 
     in-out property <int> step: 0;
     in property <bool> connect-done: false;
+    in property <string> connect-hint: "";
     in property <bool> vjoy-installed: false;
     in property <bool> vjoy-fallback: false;
-    in property <bool> paired: false;
     in property <bool> calibration-available: false;
     in property <bool> centre-done: false;
     in property <bool> pedals-done: false;
     in property <string> games-text: "No games added yet.";
-    in property <string> pair-status: "Waiting for the wheel…";
 
     callback next();
     callback back();
@@ -30,14 +34,13 @@ export component GateWizardWindow inherits Window {
         height: 100%;
         step: root.step;
         connect-done: root.connect-done;
+        connect-hint: root.connect-hint;
         vjoy-installed: root.vjoy-installed;
         vjoy-fallback: root.vjoy-fallback;
-        paired: root.paired;
         calibration-available: root.calibration-available;
         centre-done: root.centre-done;
         pedals-done: root.pedals-done;
         games-text: root.games-text;
-        pair-status: root.pair-status;
         next => { root.next(); }
         back => { root.back(); }
         skip => { root.skip(); }

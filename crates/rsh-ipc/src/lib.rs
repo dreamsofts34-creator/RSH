@@ -34,7 +34,11 @@ use rsh_api::{AppApi, AppEvent};
 use serde::{Deserialize, Serialize};
 
 /// IPC protocol version. Bump only with a breaking wire change.
-pub const IPC_PROTOCOL_VERSION: u32 = 1;
+// v2 (v2.0.6, no-pairing redesign): the pairing methods
+// (`pairing_status`, `begin_pairing`, `reset_pairing`,
+// `confirm_pairing_replacement`) are gone; `wifi_status`,
+// `set_wifi_password`, `clear_wifi_password` replace them.
+pub const IPC_PROTOCOL_VERSION: u32 = 2;
 
 /// Default socket / pipe name (no path — see [`socket_path`]).
 pub const IPC_SOCKET_NAME: &str = "rsh-daemon.sock";
@@ -94,7 +98,8 @@ pub struct IpcRequest {
     /// Client-chosen id; echoed in the response.
     pub id: u64,
     /// Method name (`ping`, `version`, `connection`, `connect`,
-    /// `disconnect`, `pairing_status`, `begin_pairing`, `snapshot`,
+    /// `disconnect`, `wifi_status`, `set_wifi_password`,
+    /// `clear_wifi_password`, `snapshot`,
     /// `poll`, `output_enabled`, `set_output_enabled`, `subscribe`,
     /// `get_tuning`, `set_tuning`, `draft_status`, `save_draft`,
     /// `discard_draft`, `autostart`, `set_autostart`,
@@ -106,8 +111,7 @@ pub struct IpcRequest {
     /// `take_learned_button`, `calibration`, `vjoy_status`,
     /// `install_vjoy`, `diag_stats`, `raw_mv`, `capture_centre`,
     /// `capture_pedal_min`, `capture_pedal_max`, `list_bindings`,
-    /// `set_binding`, `clear_binding`, `reset_pairing`,
-    /// `confirm_pairing_replacement`, `firmware_check`, `update_firmware`,
+    /// `set_binding`, `clear_binding`, `firmware_check`, `update_firmware`,
     /// `firmware_update_status`, `board_address`,
     /// `set_board_address`, `module_enabled`, `set_module_enabled`,
     /// `auto_pause`, `set_auto_pause`, `close_to_tray`,
@@ -234,12 +238,8 @@ pub fn dispatch(
             .disconnect()
             .map(|info| serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
             .map_err(|e| IpcError::Api(e.code)),
-        "pairing_status" => Ok(serde_json::to_value(api.pairing_status())
+        "wifi_status" => Ok(serde_json::to_value(api.wifi_status())
             .map_err(|e| IpcError::Protocol(e.to_string()))?),
-        "begin_pairing" => api
-            .begin_pairing()
-            .map(|info| serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
-            .map_err(|e| IpcError::Api(e.code)),
         "snapshot" => {
             Ok(serde_json::to_value(api.snapshot())
                 .map_err(|e| IpcError::Protocol(e.to_string()))?)
@@ -332,10 +332,11 @@ pub fn dispatch(
         }
         // v2.0.2: button→action bindings (list / set / clear).
         "list_bindings" | "set_binding" | "clear_binding" => dispatch_bindings(api, request),
-        // v2.0.2 Round 3: pairing reset, firmware check/update,
-        // board address, module toggles, auto-pause, tray, backup,
-        // profile rename/link, knob actions.
-        "reset_pairing"
+        // v2.0.2 Round 3: Wi-Fi password set/clear (v2.0.6),
+        // firmware check/update, board address, module toggles,
+        // auto-pause, tray, backup, profile rename/link, knob actions.
+        "set_wifi_password"
+        | "clear_wifi_password"
         | "firmware_check"
         | "update_firmware"
         | "firmware_update_status"
@@ -466,8 +467,10 @@ fn detailed_api_error(error: &rsh_api::UserError) -> IpcError {
 /// Dispatch the v2.0.2 Round 3 methods. Split out of [`dispatch`]
 /// so neither function trips `too_many_lines`.
 ///
-/// Wire shapes: `reset_pairing` / `confirm_pairing_replacement` →
-/// the pairing status; `firmware_check` → the
+/// Wire shapes: `set_wifi_password` takes `{"password",
+/// "confirm"}` and returns the [`WifiStatus`](rsh_api::WifiStatus);
+/// `clear_wifi_password` takes no params and returns the
+/// [`WifiStatus`](rsh_api::WifiStatus); `firmware_check` → the
 /// [`FirmwareCheck`](rsh_api::FirmwareCheck);
 /// `update_firmware` starts the flash and returns the running
 /// status; `firmware_update_status` polls it; `board_address` →
@@ -487,15 +490,22 @@ fn dispatch_round3(
 ) -> Result<serde_json::Value, IpcError> {
     let params = &request.params;
     match request.method.as_str() {
-        "reset_pairing" => api
-            .reset_pairing()
-            .map(|info| serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
-            .map_err(|error| detailed_api_error(&error)),
-        // R2-51: confirm a key replacement (StoredKeyExists) — same
-        // shape as `reset_pairing`: no params, returns PairingInfo.
-        "confirm_pairing_replacement" => api
-            .confirm_pairing_replacement()
-            .map(|info| serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
+        "set_wifi_password" => {
+            let password = params
+                .get("password")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let confirm = params
+                .get("confirm")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.set_wifi_password(password, confirm)
+                .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
+                .map_err(|error| detailed_api_error(&error))
+        }
+        "clear_wifi_password" => api
+            .clear_wifi_password()
+            .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
             .map_err(|error| detailed_api_error(&error)),
         "firmware_check" => api
             .firmware_check()

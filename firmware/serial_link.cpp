@@ -72,8 +72,8 @@ static void serial_link_handle_frame(uint8_t kind, const uint8_t *payload,
       break;
     }
     case RSH_SERIAL_KIND_CONTROL: {
-      // HMAC control — reply ho to pehle bhejo, PHIR deferred actions
-      // (REBOOT/KEY_RESET/SET_PASSWORD — SEC-D-01 pattern).
+      // plain control (v2.2) — reply ho to pehle bhejo, PHIR deferred actions
+      // (REBOOT/SET_PASSWORD — SEC-D-01 pattern).
       static uint8_t reply[RSH_V2_CTRL_MAX_FRAME];
       size_t replyLen = 0;
       if (net_serial_dispatch_control(payload, len, reply, sizeof(reply), &replyLen))

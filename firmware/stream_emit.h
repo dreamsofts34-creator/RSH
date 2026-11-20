@@ -1,15 +1,14 @@
 #pragma once
-// RSH v2.1 stream emission (Phase E WS5, PROTOCOL-V2.1.md §1.1) — PURE
+// RSH v2.2 stream emission (Phase E WS5, PROTOCOL-V2.2.md §1.1) — PURE
 // (Arduino-free) taake host par unit test ho sake.
 //
-// 200 Hz loop (rsh.ino) ka faisla (SEC-E-14, Phase F):
-//   peer active + session authenticated ho -> v2 / v1 (HELO proto se)
-//   session authenticated na ho            -> kuch nahi (HELO akela kaafi nahi)
-//   koi PC active na ho                    -> kuch nahi
-// "Authenticated session" = is boot mein is peer se kam az kam ek
-// HMAC-verified control command ACCEPT hua ho (net.cpp flag; GET_CAPS
-// aam tor par pehla hota hai). Status packet (1 Hz) is se alag hai —
-// waisa hi rehta hai.
+// 200 Hz loop (rsh.ino) ka faisla (v2.2, D3 — plain GET_CAPS OK):
+//   peer active + GET_CAPS OK ho -> v2 / v1 (HELO proto se)
+//   GET_CAPS OK na ho            -> kuch nahi (HELO akela kaafi nahi)
+//   koi PC active na ho         -> kuch nahi
+// "GET_CAPS OK" = is session mein GET_CAPS control command OK hua ho
+// (net.cpp per-transport flag; naya session / naya peer use saaf karta
+// hai). Status packet (1 Hz) is se alag hai — waisa hi rehta hai.
 //
 // Wire rules (§1.1, D6): sab axes mV mein hain. Steering mV mode mein
 // analogReadMilliVolts se seedha mV aata hai; pedals/clutch/handbrake
@@ -42,18 +41,16 @@ typedef enum {
   RSH_EMIT_V2          // v2.1 peer — v2 stream packet (§1.1)
 } rsh_emit_kind_t;
 
-/// Emission faisla: sirf ACTIVE + AUTHENTICATED session ko bhejo;
-/// version HELO proto se. SEC-E-14: HELO (unauthenticated UDP
-/// bootstrap) se stream nahi khulta — pehle is session mein kam az kam
-/// ek HMAC-verified control command ACCEPT hona lazmi hai (aam tor par
-/// GET_CAPS; board net.cpp mein sessionAuthenticated flag rakhta hai).
-/// Unauthenticated peer ko v1 bhi nahi milta (v1 ke paas auth ka rasta
-/// hi nahi — v1-only peer ko stream band hai; v2.1 app GET_CAPS se
-/// authenticate hoti hai). Status packet (1 Hz) is se alag hai.
+/// Emission faisla: sirf ACTIVE + GET_CAPS-OK session ko bhejo;
+/// version HELO proto se. D3: HELO (unauthenticated UDP bootstrap) se
+/// stream nahi khulta — pehle is session mein GET_CAPS OK hona lazmi
+/// hai (board net.cpp mein per-transport capsOk flag rakhta hai).
+/// GET_CAPS ke baghair peer ko v1 bhi nahi milta. Status packet (1 Hz)
+/// is se alag hai.
 static inline rsh_emit_kind_t rsh_stream_emit_kind(uint8_t pc_active,
                                                    uint8_t pc_is_v2,
-                                                   uint8_t session_authenticated) {
-  if (!pc_active || !session_authenticated) return RSH_EMIT_NONE;
+                                                   uint8_t caps_ok) {
+  if (!pc_active || !caps_ok) return RSH_EMIT_NONE;
   return pc_is_v2 ? RSH_EMIT_V2 : RSH_EMIT_V1;
 }
 

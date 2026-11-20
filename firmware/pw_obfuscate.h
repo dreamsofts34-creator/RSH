@@ -1,17 +1,20 @@
 #pragma once
 // RSH Wi-Fi/OTA password at-rest obfuscation (SEC-E-01, Phase F W1,
-// PROTOCOL-V2.1.md §5.3 / KEY-LIFECYCLE.md §2).
+// PROTOCOL-V2.2.md §5.3; D23 re-key, no-pairing redesign).
 //
 // MASLA: password NVS ("wifipw", Preferences) mein PLAINTEXT tha — flash
 // dump / `strings` se seedha parha jata tha (OPEN-3 flash encryption khula
-// hai, Phase H). FIX: NVS mein likhne se pehle password ko device key se
-// derived keystream se XOR karo; parhte waqt wapas XOR (same operation).
-// Naya NVS key "wifipw2" hai (obfuscated bytes, putBytes); purana plaintext
-// "wifipw" pehli load par migrate ho kar mit jata hai (keystore.cpp).
+// hai, Phase H). FIX: NVS mein likhne se pehle password ko ek fresh random
+// NVS key ("obfkey", 32 B, pehli 4.0.3 boot par generate hoti hai — D23,
+// keystore.cpp) se derived keystream se XOR karo; parhte waqt wapas XOR
+// (same operation). Naya NVS key "wifipw2" hai (obfuscated bytes,
+// putBytes); purani entries (devkey/paired/wifipw2/wifipw) pehli 4.0.3
+// boot par migration mein mit jati hain (D6) — purane blobs migrate NAHI
+// hote (purani device key ke baghair unreadable hain).
 //
 // *** IMAANDARI SE NOTE (chhupana mana hai): ye OBFUSCATION hai,
-// encryption nahi. *** Device key khud usi NVS mein plaintext hai
-// ("devkey") — jo poora flash dump le sakta hai wo scheme (ye file open
+// encryption nahi. *** Obfuscation key khud usi NVS mein plaintext hai
+// ("obfkey") — jo poora flash dump le sakta hai wo scheme (ye file open
 // source hai) se password wapas bana sakta hai. Is fix se milta hai:
 // (1) flash par `strings` / NVS dump mein password nazar nahi aata;
 // (2) sirf "wifipw" entry parhne wala (misal NVS tooling) password nahi
@@ -23,8 +26,7 @@
 // Construction: keystream block j (32 B) = SHA256(key32 || "RSH-PW-V1" ||
 // u32le(j)); ciphertext[i] = plaintext[i] ^ keystream[i]. SHA-256 caller
 // deta hai (firmware: mbedTLS; host tests: independent SHA-256) — is
-// header mein koi crypto implement nahi, sirf XOR + framing (protocol.h
-// ke rsh_hmac16_fn pattern jaisa).
+// header mein koi crypto implement nahi, sirf XOR + framing.
 //
 // Bounds: password 0..63 bytes (password.h: 8..63 valid, 0 = "koi entry
 // nahi"). Key hamesha 32 B. out buffer kam az kam len ka ho. Invalid input

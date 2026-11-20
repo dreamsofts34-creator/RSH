@@ -15,8 +15,8 @@ use rsh_api::connection::ConnectionState as MgrState;
 use rsh_api::errors::{ConnectionError, UserError};
 use rsh_api::{
     ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionInfo, DiagStats,
-    DraftStatus, FirmwareCheck, FirmwareUpdateStatus, GameSummary, PairingInfo, PollState,
-    ProfileSummary, RawMv, SlowPollState, SnapshotInfo, TuningSettings, VjoyStatus, app_version,
+    DraftStatus, FirmwareCheck, FirmwareUpdateStatus, GameSummary, PollState, ProfileSummary,
+    RawMv, SlowPollState, SnapshotInfo, TuningSettings, VjoyStatus, WifiStatus, app_version,
 };
 use rsh_api::{ConnEvent, ConnectionManager};
 use rsh_app_core::snapshot::EngineSnapshot;
@@ -50,7 +50,7 @@ const SLOW_GROUP_C_TTL: Duration = Duration::from_secs(30);
 /// The slow-poll static values (PERF F-6): everything `slow_poll`
 /// reports that only changes on a user action or install — the
 /// expensive half of the 1 Hz poll. Served from the cache in
-/// [`SlowStaticCache`]; the dynamic half (pairing, diag, raw mV,
+/// [`SlowStaticCache`]; the dynamic half (Wi-Fi status, diag, raw mV,
 /// firmware-update progress) is always read live.
 #[derive(Clone, Default)]
 struct SlowStaticSnapshot {
@@ -82,7 +82,7 @@ struct SlowStaticCache {
 /// The daemon's API handle: shared by the IPC server, the tray
 /// callbacks, and the manager loop.
 pub struct DaemonApi {
-    /// The app state (engine, transport, profiles, pairing).
+    /// The app state (engine, transport, profiles, Wi-Fi).
     pub state: Arc<AppStateCore>,
     /// The L1 Connection Manager (driven by the manager loop).
     pub manager: Mutex<ConnectionManager>,
@@ -317,6 +317,10 @@ impl DaemonApi {
             transport,
             address,
             session_active: transport_state.session_active,
+            // D15: the sticky reachable latch — set on every HELLO
+            // observed, cleared on disconnect / transport switch /
+            // NoRoute / HELLO-timeout (see `AppStateCore`).
+            board_reachable: transport_state.board_reachable,
             error,
             hint,
         }
@@ -372,76 +376,121 @@ impl AppApi for DaemonApi {
         Ok(self.connection())
     }
 
-    fn pairing_status(&self) -> PairingInfo {
-        let status = self.state.pairing_status();
-        PairingInfo {
-            seconds_left: status.seconds_left,
-            password: status.password,
-            error: self.state.pairing_error_typed(),
-            error_detail: status.error,
-            board_mac: status.board_mac,
-            replacement_required: status.replacement_required,
-            key_reset_armed: status.key_reset_armed,
-            // DS-25: the pairing attempt trail (HELO sends, HELLO
-            // replies, timeouts — see
-            // `AppStateCore::pairing_log_tail_lines`) rides on the
-            // status the wizard already polls, so the UI can show
-            // e.g. "Sent HELO to 192.168.4.1 — no reply (3 tries)"
-            // instead of only "No pairing window". The log lines
-            // are redacted at the source (never a password).
-            // R2-42: the retained tail (≤20 lines), never the full
-            // ≤200-line buffer — the slow poller calls this ~1 Hz.
-            // R2-23: the tail is never drained, so the manager
-            // loop's 250 ms file drain cannot starve this reader.
-            attempt_log: self.state.pairing_log_tail_lines(),
-        }
+    fn wifi_status(&self) -> WifiStatus {
+        self.state.wifi_status()
     }
 
-    /// Phase 2 (RC-6): the ~1 Hz slow poll reads pairing status via
-    /// `pairing_status_peek()` — never the consuming
-    /// `pairing_status()`. The old path consumed the one-time
-    /// password on every poll cycle and logged "one-time password
-    /// disclosed to UI" 20× in the user's log, although no UI
-    /// element ever renders the password. The peek's password is
-    /// stripped here too (the UI never displays it; the post-pairing
-    /// Wi-Fi rejoin uses the daemon's own stash, R2-27), so the
-    /// password is never shipped over IPC once a second. Direct
-    /// `pairing_status()` calls (begin / reset / confirm replies)
-    /// keep the consuming behaviour — an explicit read is a real
-    /// disclosure. This override otherwise mirrors the trait
-    /// default field-for-field; if the default gains a field,
-    /// update this too (the `SlowPollState` struct literal fails
-    /// to compile on a missing field, so drift is caught).
+    fn scan_rsh_networks(&self) -> Vec<String> {
+        crate::rejoin::scan_rsh_networks()
+    }
+
+    /// Set (or change) the board Wi-Fi password (D19 + D8): validate
+    /// here (8–63 printable ASCII, no space — the protocol rule —
+    /// and the confirmation must match), then the core sets it on
+    /// the board and stores it in the `KeyStore` `:wifi` entry, and
+    /// the daemon updates the Windows WLAN profile in the same IPC
+    /// call (the app-core has no netsh layer, so the profile update
+    /// lives here — the closest faithful variant of D8's "same
+    /// transaction"). If the profile update fails after the board
+    /// password changed, the error says so plainly: the board
+    /// password changed but the PC profile is stale, so the user
+    /// must rejoin the network manually with the new password.
     ///
+    /// # Errors
+    ///
+    /// [`UserError`] when validation fails, no board answers, or
+    /// the password / profile could not be applied.
+    fn set_wifi_password(&self, password: &str, confirm: &str) -> Result<WifiStatus, UserError> {
+        if password != confirm {
+            return Err(UserError::from_connection(
+                ConnectionError::Unknown,
+                "the two passwords do not match — type the same password twice",
+            ));
+        }
+        if !(8..=63).contains(&password.len())
+            || !password.bytes().all(|b| (0x21..=0x7E).contains(&b))
+        {
+            return Err(UserError::from_connection(
+                ConnectionError::Unknown,
+                "the Wi-Fi password must be 8–63 printable characters (no spaces)",
+            ));
+        }
+        let ssid = self.state.wifi_status().ssid.ok_or_else(|| {
+            UserError::from_connection(
+                ConnectionError::Unreachable,
+                "no board observed yet — join an RSH-XXXX network first, then set the password",
+            )
+        })?;
+        self.state
+            .set_password(password)
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
+        // D8: the WLAN profile update is part of the same call.
+        // On Linux this returns manual instructions (the daemon
+        // cannot drive NetworkManager here) — the board password
+        // already changed, so surface that explicitly.
+        if let Err(error) = crate::rejoin::rejoin_wifi(&ssid, password) {
+            return Err(UserError::from_connection(
+                ConnectionError::Unknown,
+                format!(
+                    "the board Wi-Fi password changed, but the PC Wi-Fi profile could not be updated ({error}) — rejoin the '{ssid}' network manually with the new password"
+                ),
+            ));
+        }
+        Ok(self.state.wifi_status())
+    }
+
+    /// Forget the Wi-Fi password (D19): the core deletes the
+    /// `KeyStore` `:wifi` entry, closes the session gate, and clears
+    /// the session records; the daemon then deletes the Windows
+    /// WLAN profile for the board's SSID, so the PC no longer
+    /// auto-joins with a stale password. The board-side password
+    /// is cleared only by holding BOOT ≥ 10 s on the board (D7).
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the password could not be cleared.
+    fn clear_wifi_password(&self) -> Result<WifiStatus, UserError> {
+        let ssid = self.state.wifi_status().ssid;
+        self.state
+            .clear_wifi_password()
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
+        if let Some(ssid) = ssid
+            && let Err(error) = crate::rejoin::forget_wifi_profile(&ssid)
+        {
+            return Err(UserError::from_connection(
+                ConnectionError::Unknown,
+                format!(
+                    "the stored Wi-Fi password was cleared, but the PC Wi-Fi profile for '{ssid}' could not be deleted ({error}) — remove it manually in Wi-Fi settings"
+                ),
+            ));
+        }
+        Ok(self.state.wifi_status())
+    }
+
     /// PERF F-6: the poll is split into a cheap 1 Hz half and
     /// cached static groups ([`DaemonApi::slow_static`]). The
     /// static half (profiles/games, tunings/modules/bindings/
     /// knobs/draft/calibration, firmware check/vJoy) is only
     /// re-read on its TTL or when the state's slow generation
-    /// moves; the dynamic half (pairing, diag, raw mV,
+    /// moves; the dynamic half (Wi-Fi status, diag, raw mV,
     /// firmware-update progress) is read live every poll, as
     /// before. `firmware_version()` stays 1 Hz — one lock +
     /// format, no I/O — so the version label refreshes right
     /// after connect; the expensive firmware work (bundled-image
     /// stat/parse in `firmware_check`) is the cached 30 s group.
     /// Every field the trait default ships is still shipped; the
-    /// shape is unchanged.
+    /// shape is unchanged. (No-pairing redesign: the old override
+    /// read the pairing status via `pairing_status_peek()` and
+    /// shipped a `PairingInfo` — the slow poll now ships the
+    /// `WifiStatus` from [`AppStateCore::wifi_status`] instead,
+    /// which never carries a password.)
+    ///
     fn slow_poll(&self) -> SlowPollState {
         // One `settings_arc()` clone serves all four settings
         // fields (the old code cloned the full `AppSettings`
         // once per getter).
         let settings = self.state.settings_arc();
-        let peeked = self.state.pairing_status_peek();
-        let pairing_status = PairingInfo {
-            seconds_left: peeked.seconds_left,
-            password: None,
-            error: self.state.pairing_error_typed(),
-            error_detail: peeked.error,
-            board_mac: peeked.board_mac,
-            replacement_required: peeked.replacement_required,
-            key_reset_armed: peeked.key_reset_armed,
-            attempt_log: self.state.pairing_log_tail_lines(),
-        };
+        let wifi_status = self.state.wifi_status();
         let generation = self.state.slow_state_generation();
         let statics = self.slow_static(generation);
         SlowPollState {
@@ -451,7 +500,7 @@ impl AppApi for DaemonApi {
             autostart: settings.autostart,
             board_address: settings.esp_ip.clone(),
             diag_stats: self.diag_stats().ok(),
-            pairing_status,
+            wifi_status,
             calibration: statics.calibration,
             raw_mv: self.raw_mv().ok(),
             profiles: statics.profiles,
@@ -467,45 +516,6 @@ impl AppApi for DaemonApi {
             tunings: statics.tunings,
             modules: statics.modules,
         }
-    }
-
-    fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
-        self.state.begin_pairing().map_err(|detail| {
-            let typed = self
-                .state
-                .pairing_error_typed()
-                .unwrap_or(ConnectionError::Unknown);
-            UserError::from_connection(typed, detail)
-        })?;
-        Ok(self.pairing_status())
-    }
-
-    fn reset_pairing(&self) -> Result<PairingInfo, UserError> {
-        self.state.reset_pairing().map_err(|detail| {
-            let typed = self
-                .state
-                .pairing_error_typed()
-                .unwrap_or(ConnectionError::Unknown);
-            UserError::from_connection(typed, detail)
-        })?;
-        Ok(self.pairing_status())
-    }
-
-    fn confirm_pairing_replacement(&self) -> Result<PairingInfo, UserError> {
-        // R2-51: `state.confirm_pairing_replacement` arms the
-        // one-time flag and calls `activate_session()`, which only
-        // queues the transport connect and returns — the
-        // activation itself runs async in the forwarder, so this
-        // never blocks the IPC dispatch path. The UI polls
-        // `pairing_status()` for the outcome.
-        self.state.confirm_pairing_replacement().map_err(|detail| {
-            let typed = self
-                .state
-                .pairing_error_typed()
-                .unwrap_or(ConnectionError::Unknown);
-            UserError::from_connection(typed, detail)
-        })?;
-        Ok(self.pairing_status())
     }
 
     fn snapshot(&self) -> SnapshotInfo {
@@ -1356,13 +1366,13 @@ mod tests {
             address: "192.168.4.1".to_string(),
             error: None,
             session_active: true,
+            board_reachable: false,
             frames_held_by_gate: 0,
         };
         for mgr in [
             MgrState::Idle,
             MgrState::LinkUp,
             MgrState::Hello,
-            MgrState::Authenticating,
             MgrState::Backoff {
                 wait_ms: 2000,
                 attempt: 1,
@@ -1406,95 +1416,20 @@ mod tests {
         );
     }
 
-    /// Phase 2 (RC-6): the ~1 Hz `slow_poll` never ships the
-    /// one-time pairing password over IPC and never consumes it —
-    /// the password rides only on a direct `pairing_status()` read.
-    /// With no board present there is no password at all, so the
-    /// test asserts the structural contract that matters to the UI:
-    /// the attempt trail still rides on `slow_poll` (the UI can
-    /// show what happened) while `password` is always `None`.
-    /// Non-consumption itself is proven in rsh-app-core by
-    /// `pairing_password_is_single_use` (peek never consumes).
+    /// No-pairing redesign: the ~1 Hz `slow_poll` ships the
+    /// `WifiStatus`, never a password. With no board present
+    /// there is no SSID and no password set, and the direct
+    /// `wifi_status()` read agrees with the poll.
     #[test]
-    fn phase2_slow_poll_never_ships_the_pairing_password() {
-        let (api, _dir) = live_api_named("slow-poll-no-password");
-        api.begin_pairing()
-            .expect("begin_pairing triggers an attempt");
+    fn slow_poll_ships_wifi_status_without_password() {
+        let (api, _dir) = live_api_named("slow-poll-wifi-status");
         let polled = api.slow_poll();
-        assert_eq!(
-            polled.pairing_status.password, None,
-            "RC-6: the 1 Hz poll must never ship the one-time password"
-        );
-        assert!(
-            polled
-                .pairing_status
-                .attempt_log
-                .iter()
-                .any(|line| line.contains("begin_pairing")),
-            "RC-6: the attempt trail must still ride on slow_poll: {:?}",
-            polled.pairing_status.attempt_log
-        );
-        // A second poll is identical in this respect — nothing was
-        // consumed by the first one.
-        assert_eq!(api.slow_poll().pairing_status.password, None);
-        assert_eq!(api.pairing_status().password, None);
-    }
-
-    #[test]
-    fn pairing_status_carries_the_attempt_trail() {
-        // DS-25: the wizard polls `pairing_status`; the attempt
-        // trail (attempt line, HELO sends, HELLO timeout) must ride
-        // on it so the UI can show what actually happened instead
-        // of only "No pairing window".
-        let (api, _dir) = live_api_named("pairing-trail");
-        assert!(
-            api.pairing_status().attempt_log.is_empty(),
-            "no attempt yet: the trail is empty, never fake"
-        );
-        // The forwarder needs UDP 4211 free; another test process
-        // may hold it briefly, so probe first and retry the
-        // attempt (up to 3 rounds) instead of failing on a
-        // transient foreign bind.
-        let udp_4211_free = || std::net::UdpSocket::bind("127.0.0.1:4211").is_ok();
-        let mut trail: Vec<String> = Vec::new();
-        for _attempt in 0..3 {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !udp_4211_free() && std::time::Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            api.begin_pairing()
-                .expect("begin_pairing triggers an attempt");
-            trail = api.pairing_status().attempt_log;
-            assert!(
-                trail.iter().any(|line| line.contains("begin_pairing")),
-                "trail must start with the attempt line: {trail:?}"
-            );
-            let wait_deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while !trail.iter().any(|line| line.contains("HELLO timeout"))
-                && std::time::Instant::now() < wait_deadline
-            {
-                std::thread::sleep(Duration::from_millis(100));
-                trail = api.pairing_status().attempt_log;
-            }
-            if trail.iter().any(|line| line.contains("HELLO timeout")) {
-                break;
-            }
-            let _ = api.state.stop_engine();
-        }
-        assert!(
-            trail.iter().any(|line| line.contains("HELLO timeout")),
-            "trail must record the timeout: {trail:?}"
-        );
-        assert!(
-            trail
-                .iter()
-                .any(|line| line.contains("HELO sent") || line.contains("HELO send failed")),
-            "trail must record the HELO attempts: {trail:?}"
-        );
-        // (In a sandbox with no route to 192.168.4.1 the send fails
-        // with EPERM and the failure is logged instead — either way
-        // the attempt is on the trail.)
-        let _ = api.state.stop_engine();
+        assert_eq!(polled.wifi_status.ssid, None);
+        assert!(!polled.wifi_status.connected);
+        assert!(!polled.wifi_status.password_set);
+        assert_eq!(polled.wifi_status.board_mac, None);
+        assert_eq!(api.wifi_status().ssid, None);
+        assert!(!api.wifi_status().connected);
     }
 
     #[test]
@@ -1507,11 +1442,7 @@ mod tests {
         // expires instead of masking a dead board forever.
         let (api, _dir) = live_api_named("watchdog-feed");
         api.manager_event(ConnEvent::Connect);
-        api.manager_event(ConnEvent::HelloReceived {
-            unpaired: false,
-            window_open: false,
-        });
-        api.manager_event(ConnEvent::Authenticating);
+        api.manager_event(ConnEvent::HelloReceived);
         api.manager_event(ConnEvent::CapsOk);
         assert!(api.manager_state().is_active());
         api.state.note_stream_frame();

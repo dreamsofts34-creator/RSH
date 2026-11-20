@@ -13,7 +13,7 @@
 #include "stream_emit.h"     // Phase E WS5: v2.1 stream emission (v2 peer)
 #include "inputs.h"
 #include "heap_policy.h"   // FW-10 / D17 heap + restart policy
-#include "keystore.h"      // FW-8: per-device key/nonce (setup mein net se pehle)
+#include "keystore.h"      // v2.2: user-set Wi-Fi password store (setup mein net se pehle)
 #include "secure_nvs.h"     // Phase H (SEC-E-01/OPEN-3): secure-build posture check
 #include "safemode.h"      // FW-3 (Workstream 1): safe mode + boot counter
 #include "config_transaction.h"  // FW-4 (Workstream 1): config transaction
@@ -41,7 +41,7 @@ static uint16_t statusSeq = 0;   // status packet sequence (data seq se alag)
 static uint32_t lastStatusMs = 0;
 static volatile uint16_t seqGap = 0;      // D5: boot se skip hue stream ticks
 static uint16_t lastSentSeqGap = 0;  // v2 tick-skipped flag ke liye (Phase E WS5)
-static bool keyOk = false;       // FW-8: keystore (key/nonce) tayyar hai?
+static bool keyOk = false;       // v2.2: keystore (password/obfkey) tayyar hai?
 static uint32_t nextTickUs = 0;
 static volatile uint32_t overrunCount = 0;     // cycles jin ka kaam period se zyada lamba hua
 static volatile uint32_t maxCycleUs = 0;       // sab se lamba cycle kaam (board par timing test ke liye)
@@ -49,7 +49,6 @@ static bool netOk = false;            // latched: fail ho to loop sirf retry kar
 static uint32_t lastRetryMs = 0;
 static volatile bool prevCycleOverran = false;
 static bool otaActive = false;
-static bool pairWindowLed = false;  // F-02: pair-button window khuli hai (LED pattern)
 #if RSH_SAMPLE_TASK
 static RshSampleMailbox sampleMailbox;  // F-06: sampling task -> loop handoff
 static TaskHandle_t sampleTaskHandle = NULL;
@@ -215,33 +214,33 @@ static void fw34_boot_setup() {
   cfgPref.end();
 }
 
-// R2-47 (DS-75): key-reset-expiry diag event RAM ring mein record karne
-// ke baad ESP.restart() use mita deta tha — event kabhi diagnostics mein
-// nazar nahi aata tha. Is liye reboot se PEHLE ek pending-flag NVS
-// ("rsh-boot" namespace, key "krExp") mein likho; agle boot par setup()
-// flag dekh kar event dobara ring mein record karta hai aur flag saaf
-// karta hai. Sirf ye ek event persist hota hai — poora ring NVS mein
-// nahi (flash wear + boot-time cost); flag 1 byte hai.
-static void rsh_key_reset_expiry_persist_() {
+// D7 (R2-47 krExp pattern): password-cleared diag event RAM ring mein
+// record karne ke baad ESP.restart() use mita deta tha — event kabhi
+// diagnostics mein nazar nahi aata tha. Is liye reboot se PEHLE ek
+// pending-flag NVS ("rsh-boot" namespace, key "pwClr") mein likho; agle
+// boot par setup() flag dekh kar event dobara ring mein record karta hai
+// aur flag saaf karta hai. Sirf ye ek event persist hota hai — poora ring
+// NVS mein nahi (flash wear + boot-time cost); flag 1 byte hai.
+static void rsh_password_cleared_persist_() {
   Preferences pref;
   if (pref.begin("rsh-boot", false)) {
-    pref.putUChar("krExp", 1);
+    pref.putUChar("pwClr", 1);
     pref.end();
   }
   // begin fail ho to bhi restart hota hai — event is boot par kho jata
   // hai (purana behaviour), lekin board kabhi atak ta nahi.
 }
 
-// Pichle boot ki key-reset expiry (agar flag set ho) is boot ke ring mein
+// Pichle boot ka password-clear (agar flag set ho) is boot ke ring mein
 // sab se pehle record karo (BOOT event se pehle — oldest-first order mein
-// expiry reboot se pehle dikhe), phir flag saaf karo.
-static void rsh_key_reset_expiry_replay_() {
+// clear reboot se pehle dikhe), phir flag saaf karo.
+static void rsh_password_cleared_replay_() {
   Preferences pref;
   if (!pref.begin("rsh-boot", false)) return;
-  uint8_t pending = pref.getUChar("krExp", 0);
+  uint8_t pending = pref.getUChar("pwClr", 0);
   if (pending) {
-    rsh_diag_record(rsh_diag_log(), RSH_DIAG_KEY_RESET_EXPIRED, 0, millis());
-    pref.putUChar("krExp", 0);
+    rsh_diag_record(rsh_diag_log(), RSH_DIAG_PASSWORD_CLEARED, 0, millis());
+    pref.putUChar("pwClr", 0);
   }
   pref.end();
 }
@@ -250,36 +249,20 @@ static void rsh_key_reset_expiry_replay_() {
 // tick karo. Net down ho tab bhi chalta hai (is liye !netOk branch se pehle).
 static void fw34_loop_tick(uint32_t nowMs) {
   rsh_hold_event_t ev = rsh_boothold_update(&bootHold, digitalRead(0) == LOW, nowMs);
-  if (ev == RSH_HOLD_PAIR_WINDOW) {
-    // F-02: 3 s hold + 5 s se pehle release = pair window (120 s).
-    // Sirf UNPAIRED board par — paired board ignore karta hai (UI "10 s
-    // reset" guide karta hai). LED pattern loop mein lagta hai.
-    if (keystore_unpaired()) {
-      uint8_t wasOpen = keystore_pairing_open(nowMs) ? 1 : 0;
-      keystore_open_pair_window(nowMs);
-      if (!wasOpen)
-        rsh_diag_record_global(RSH_DIAG_WINDOW_OPEN, 1, nowMs);  // pair button
-      pairWindowLed = true;
-    }
-  } else if (ev == RSH_HOLD_SAFE_MODE) {
-    rsh_safe_mode_enter(&safeMode, 0, nowMs);
+  if (ev == RSH_HOLD_SAFE_MODE) {
+    rsh_safe_mode_enter(&safeMode, nowMs);
     rsh_cfg_set_safe_mode(&cfgTxn, 1);
     led_set(LedState::SafeMode);
-  } else if (ev == RSH_HOLD_KEY_RESET_ARMED) {
-    rsh_safe_mode_enter(&safeMode, 1, nowMs);
-    rsh_cfg_set_safe_mode(&cfgTxn, 1);
-    led_set(LedState::KeyResetArmed);
-    rsh_diag_record_global(RSH_DIAG_KEY_RESET_ARMED, 0, nowMs);
-  }
-  if (rsh_safe_mode_tick(&safeMode, nowMs)) {
-    // DS-75 / R2-47: key-reset-armed expiry reboot se PEHLE diag event —
-    // warna board 120 s baad "bina wajah" reboot hota aur ring mein koi
-    // nishan nahi rehta. RAM event ke saath NVS pending-flag bhi likho:
-    // reboot ring mita deta hai, flag nahi — agle boot par setup() event
-    // dobara record karta hai (rsh_key_reset_expiry_replay_).
-    rsh_diag_record_global(RSH_DIAG_KEY_RESET_EXPIRED, 0, nowMs);
-    rsh_key_reset_expiry_persist_();
-    ESP.restart();  // armed window khatam
+  } else if (ev == RSH_HOLD_KEY_RESET_CLEAR) {
+    // D7: BOOT >= 10 s hold — password seedha mitao + reboot -> open AP.
+    // Clear threshold par hota hai (koi armed window nahi). Clear fail ho
+    // to reboot NAHI (fail closed — purana password rehta hai; user hold
+    // dobara kare). Kamyabi par NVS flag likho taake diag event agle boot
+    // par replay ho (ring reboot se mit jata hai).
+    if (keystore_clear_password()) {
+      rsh_password_cleared_persist_();
+      ESP.restart();
+    }
   }
   rsh_boot_tick_t bt = rsh_boot_tick(&bootCounter, netOk ? 1 : 0, nowMs, bootStartMs);
   if (bt == RSH_BOOT_SUCCESS || bt == RSH_BOOT_FAILED) {
@@ -325,10 +308,6 @@ uint8_t rsh_fw34_safe_mode_active(void) {
   return rsh_safe_mode_blocks_config(&safeMode);
 }
 
-uint8_t rsh_fw34_key_reset_armed(void) {
-  return (safeMode.active && safeMode.key_reset_armed) ? 1 : 0;
-}
-
 rsh_cfg_txn_t *rsh_fw34_cfg_txn(void) {
   return &cfgTxn;
 }
@@ -352,7 +331,7 @@ void rsh_fw34_cfg_persist(uint8_t pending) {
 static void ota_begin() {
 #if RSH_OTA
   ArduinoOTA.setHostname(OTA_HOSTNAME);
-  ArduinoOTA.setPassword(keystore_password());  // runtime per-device password (koi default nahi)
+  ArduinoOTA.setPassword(keystore_password());  // runtime user-set password (koi default nahi)
   ArduinoOTA.onStart([]() {
     otaActive = true;
     led_set(LedState::Updating);
@@ -392,15 +371,10 @@ static uint8_t rsh_reset_reason_code() {
 // ---- F-06: sampling helpers (dedicated task + legacy loop dono yahi istemal karte hain) ----
 
 // Link state ke mutabiq status LED set karo. Safe mode ki LED ko overwrite
-// nahi karta (fw34_loop_tick ne set ki hai). Pair window khuli ho to
-// PairWindow pattern (F-02), warna PcConnected / ApUpWaitingPc.
+// nahi karta (fw34_loop_tick ne set ki hai). Warna PcConnected / ApUpWaitingPc.
 static void led_set_for_link_(uint8_t active, uint32_t nowMs) {
+  (void)nowMs;
   if (rsh_safe_mode_blocks_config(&safeMode)) return;
-  if (pairWindowLed && keystore_pairing_open(nowMs)) {
-    led_set(LedState::PairWindow);
-    return;
-  }
-  pairWindowLed = false;
   led_set(active ? LedState::PcConnected : LedState::ApUpWaitingPc);
 }
 
@@ -423,21 +397,21 @@ static uint8_t sample_once_(RshSampleMailbox *frame, uint32_t nowMs,
   // D-5: HORN_TEST active ho to horn bit set karo (synthetic press).
   if (net_horn_test_active(nowMs)) s.buttons |= RSH_BTN_HORN;
 
-  // SEC-E-14: stream emission sirf authenticated session ko — HELO
-  // (unauthenticated bootstrap) se stream nahi khulta; pehle ek
-  // HMAC-verified control command (aam tor par GET_CAPS) lazmi hai.
-  // Status packet (1 Hz) is se alag hai — neeche waisa hi rehta hai.
+  // D3: stream emission sirf GET_CAPS-OK session ko — HELO
+  // (unauthenticated bootstrap) se stream nahi khulta; pehle is session
+  // mein GET_CAPS OK lazmi hai. Status packet (1 Hz) is se alag hai —
+  // neeche waisa hi rehta hai.
   // Phase G: DUAL transport — Wi-Fi aur serial ke alag emit faisle hain
-  // (alag peer, alag auth). Packet ek dafa banta hai, dono transports ko
-  // jata hai (har transport ko sirf us ka version).
+  // (alag peer, alag GET_CAPS-OK flag). Packet ek dafa banta hai, dono
+  // transports ko jata hai (har transport ko sirf us ka version).
   rsh_emit_kind_t emitKind = rsh_stream_emit_kind(
       net_pc_active(nowMs) ? 1 : 0, net_pc_is_v2(nowMs) ? 1 : 0,
-      net_session_authenticated(nowMs) ? 1 : 0);
+      net_caps_ok(nowMs) ? 1 : 0);
   rsh_emit_kind_t serialEmitKind = RSH_EMIT_NONE;
 #if RSH_WIRED_SERIAL
   serialEmitKind = rsh_stream_emit_kind(
       net_serial_pc_active(nowMs) ? 1 : 0, net_serial_pc_is_v2(nowMs) ? 1 : 0,
-      net_serial_session_authenticated(nowMs) ? 1 : 0);
+      net_serial_caps_ok(nowMs) ? 1 : 0);
 #endif
   frame->emit_wifi = (uint8_t)emitKind;
   frame->emit_serial = (uint8_t)serialEmitKind;
@@ -552,9 +526,9 @@ static void sample_task_start_() {
 
 void setup() {
   rsh_diag_init(rsh_diag_log());  // F-10: ring log tayyar (heap_min 0xFFFF se)
-  // R2-47: pichle boot ki key-reset expiry (NVS flag "krExp") ring mein
+  // D7: pichle boot ka password-clear (NVS flag "pwClr") ring mein
   // wapas — BOOT event se pehle, taake oldest-first order barqarar rahe.
-  rsh_key_reset_expiry_replay_();
+  rsh_password_cleared_replay_();
 #if RSH_WIRED_SERIAL
   serial_link_begin();  // Serial = wired transport (921600) — debug prints band
 #elif RSH_DEBUG
@@ -603,7 +577,7 @@ void setup() {
   // boot config yahan apply hoti hai (loop detector bhi pehli tick par
   // yahi karta — dono ek hi apply hain, doosri dafa no-op hai).
   inputs_apply_config_blob(cfgTxn.current, cfgTxn.current_len);
-  keyOk = keystore_begin();  // FW-8: RNG/NVS fail → AP up nahi (fail closed, §4.6)
+  keyOk = keystore_begin();  // v2.2: migration/obfkey/NVS fail → AP up nahi (fail closed)
   netOk = keyOk && net_begin();
   lastRetryMs = millis();
   govWindowStartMs = lastRetryMs;
@@ -701,7 +675,7 @@ void loop() {
 #endif
 
   net_poll();
-  net_poll_ctrl();              // FW-8: port 4212 — HMAC control + ping
+  net_poll_ctrl();              // FW-8: port 4212 — plain control + ping
 #if RSH_WIRED_SERIAL
   serial_link_poll(nowMs);      // Phase G: USB-serial frames (HELO/control/ping)
 #endif
@@ -710,7 +684,7 @@ void loop() {
   net_led_tick(nowMs);  // Phase H WS2: LED strip driver tick (200 Hz loop)
 
   // SEC-D-01: unauthenticated RSTX restart KHATAM — restart sirf
-  // HMAC-signed REBOOT (0x09) se hota hai (net_poll_ctrl → dispatcher).
+  // REBOOT (0x09) se hota hai (net_poll_ctrl → dispatcher).
 
   // Adaptive sampling: har 2 s window ke overruns governor ko do
   if (nowMs - govWindowStartMs >= 2000) {
@@ -780,8 +754,7 @@ void loop() {
 #if RSH_WIRED_SERIAL
   if (net_serial_pc_active(nowMs)) active = true;
 #endif
-  // FW-3: safe mode / key-reset-armed ki LED ko normal state overwrite na kare.
-  // F-02: pair window khuli ho to PairWindow pattern (led_set_for_link_).
+  // FW-3: safe mode ki LED ko normal state overwrite na kare.
   led_set_for_link_(active, nowMs);
 #if RSH_SAMPLE_TASK
   }

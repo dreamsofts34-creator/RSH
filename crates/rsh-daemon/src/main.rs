@@ -39,6 +39,7 @@ mod tray_geometry;
 mod tray_popup;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,8 +49,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rsh_api::{
     ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnEvent, ConnectionError,
     ConnectionInfo, ConnectionState, DiagStats, DraftStatus, FirmwareCheck, FirmwareUpdateStatus,
-    GameSummary, ManagerAction, PairingInfo, PollState, ProfileSummary, RawMv, SnapshotInfo,
-    TuningSettings, UserError, VjoyStatus,
+    GameSummary, ManagerAction, PollState, ProfileSummary, RawMv, SnapshotInfo, TuningSettings,
+    UserError, VjoyStatus, WifiStatus,
 };
 use rsh_app_core::diagnostics::{append_startup_log_both, install_panic_hook, log_fatal};
 use rsh_app_core::state::{
@@ -62,7 +63,7 @@ use slint::ComponentHandle;
 use tokio::sync::broadcast;
 
 use daemon_api::{DaemonApi, connection_changed_event};
-use rejoin::{RSH_SSID, rejoin_wifi};
+
 use single_instance::{AcquireOutcome, acquire};
 use tray_popup::{
     POPUP_ACTIVATION_TIMEOUT, POPUP_HEIGHT, POPUP_WIDTH, PopupDismissPoll, PopupGame,
@@ -156,11 +157,11 @@ fn log_line(verbose: bool, message: &str) {
 }
 
 /// The manager loop (tokio task): drives the L1 Connection Manager
-/// from live `AppStateCore` observations, drains the pairing log
-/// into the diagnostics file, runs the heartbeat watchdog, fires
-/// backoff retries, and publishes `AppEvent`s.
+/// from live `AppStateCore` observations, drains the connection
+/// log into the diagnostics file, runs the heartbeat watchdog,
+/// fires backoff retries, and publishes `AppEvent`s.
 // One loop: observations → manager events → published AppEvents is
-// a single pipeline; splitting it would scatter the pairing-log
+// a single pipeline; splitting it would scatter the connection-log
 // drain, the watchdog, and the retry timer across tasks.
 #[allow(clippy::too_many_lines)]
 async fn manager_loop(
@@ -173,29 +174,41 @@ async fn manager_loop(
 ) {
     let mut last_gate = false;
     let mut last_error: Option<ConnectionError> = None;
-    let mut last_window_open = false;
+    let mut last_reachable = false;
     let mut last_active = false;
-    // Pairing completion tracking (v2.0.1 hotfix): the wizard's Pair
-    // step only completes on `PairingFinished`, and nothing in the
-    // daemon ever published it — so the wizard could never advance
-    // past Pair except via Skip. A pairing is in flight while its
-    // window is open; reaching Active with a window open — or the
-    // first Active since daemon start (a resumed paired session) —
-    // finishes it successfully. A window closing without Active
-    // finishes it as failed.
-    let mut pairing_in_flight = false;
-    let mut pending_rejoin_password: Option<String> = None;
+    // D6 migration (lazy, per board): board MACs whose legacy
+    // device-key entry was already deleted this run — the entry
+    // is deleted once, on the first HELLO observed from that
+    // board (see `migrate_legacy_device_key`).
+    let mut migrated_macs: HashSet<String> = HashSet::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     loop {
         ticker.tick().await;
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        // Drain the pairing log into the diagnostics file (DS-32:
-        // drain-once — each line is logged exactly once, no
-        // re-clone of the whole buffer and no index bookkeeping).
-        for line in api.state.take_pairing_log_lines() {
+        // Drain the connection log into the diagnostics file
+        // (DS-32: drain-once — each line is logged exactly once,
+        // no re-clone of the whole buffer and no index
+        // bookkeeping).
+        for line in api.state.take_connection_log_lines() {
             log_line(verbose, &line);
+        }
+        // D6 migration (lazy): the first HELLO observed from a
+        // board MAC in this run deletes that board's legacy
+        // `board:<MAC>` device-key entry from the OS credential
+        // store (service `RSH`). No board-MAC registry is
+        // persisted anywhere, and the `keyring` API cannot
+        // enumerate entries — so the deletion happens here, per
+        // board, on first sight, instead of a startup sweep.
+        // Entries for boards never seen again are inert: nothing
+        // reads device keys after the no-pairing redesign. The
+        // `:wifi` entries are NOT deleted here — only once the
+        // board reports firmware ≥ 4.0.3 (a later step).
+        if let Some(mac) = api.state.last_observed_board_mac()
+            && migrated_macs.insert(mac.clone())
+        {
+            migrate_legacy_device_key(&mac, verbose);
         }
         // Drain the manager's own transition lines.
         for line in api.take_manager_log_lines() {
@@ -345,68 +358,25 @@ async fn manager_loop(
                 if changed {
                     publish(&event_tx, connection_changed_event(&api));
                 }
-                if matches!(action, ManagerAction::NeedsPairing(_)) {
-                    publish(
-                        &event_tx,
-                        AppEvent::Notification {
-                            kind: "PairingNeeded".to_string(),
-                            title: "Pairing needed".to_string(),
-                            body: reason.hint().to_string(),
-                        },
-                    );
-                }
+                let _ = action;
             }
             last_error = error;
         }
-        let window_open = api.state.pairing_status_peek().seconds_left > 0;
-        if window_open && !last_window_open {
-            pairing_in_flight = true;
-            let (action, changed) = api.manager_event(ConnEvent::HelloReceived {
-                unpaired: true,
-                window_open: true,
-            });
+        // No-pairing redesign: there is no pairing window to
+        // track. A HELLO observed (the sticky `board_reachable`
+        // latch rising) feeds `HelloReceived` to the manager —
+        // LinkUp/Hello → Hello, and the manager answers
+        // `StartActivation` (the forwarder is already running
+        // the unsigned GET_CAPS; the loop only observes).
+        let reachable = api.state.board_reachable();
+        if reachable && !last_reachable {
+            let (action, changed) = api.manager_event(ConnEvent::HelloReceived);
             if changed {
                 publish(&event_tx, connection_changed_event(&api));
             }
-            if matches!(action, ManagerAction::StartAuthentication) {
-                api.manager_event(ConnEvent::Authenticating);
-            }
-            publish(
-                &event_tx,
-                AppEvent::PairingWindow {
-                    open: true,
-                    seconds_left: api.state.pairing_status_peek().seconds_left,
-                    board_mac: api.state.pairing_status_peek().board_mac,
-                },
-            );
+            let _ = action;
         }
-        if !window_open && last_window_open && pairing_in_flight && !api.manager_state().is_active()
-        {
-            publish(
-                &event_tx,
-                AppEvent::PairingFinished {
-                    ok: false,
-                    error: api.state.session_last_error_typed(),
-                },
-            );
-            log_line(
-                verbose,
-                "pairing: finished — failed (window closed without Active)",
-            );
-            pairing_in_flight = false;
-        }
-        last_window_open = window_open;
-        // Pairing rejoin (Phase 6): stash the Wi-Fi password while the
-        // pairing window is open — it is cleared on activation — and
-        // rejoin the board AP once when the session reaches Active.
-        // The password never reaches a log line (see rejoin.rs).
-        // R2-27: the manager stash is the single consumer of the
-        // rejoin password — `take_rejoin_password` reads the
-        // dedicated stash, so the UI's `pairing_status()` poll
-        // can never starve the rejoin.
-        if window_open && pending_rejoin_password.is_none() {
-            pending_rejoin_password = api.state.take_rejoin_password();
-        }
+        last_reachable = reachable;
         let active_now = api.manager_state().is_active();
         if active_now && !last_active {
             // Scope C: wheel connected — raise the daemon's
@@ -430,54 +400,6 @@ async fn manager_loop(
                     );
                 }
             }
-            // DS-34: publish the success ONLY when a pairing was
-            // actually in flight. The old `!first_active_seen`
-            // arm published `PairingFinished { ok: true }` on the
-            // first Active since daemon start even when no pairing
-            // ever happened (a restart with an already-paired
-            // board auto-resuming) — a wizard open at that moment
-            // could advance past Pair on a phantom success.
-            if pairing_in_flight {
-                publish(
-                    &event_tx,
-                    AppEvent::PairingFinished {
-                        ok: true,
-                        error: None,
-                    },
-                );
-                log_line(verbose, "pairing: finished — board paired (session Active)");
-            }
-            pairing_in_flight = false;
-            if let Some(password) = pending_rejoin_password.take() {
-                // DS-15 (F14): `rejoin_wifi` runs blocking `netsh`
-                // calls — never on the manager-loop task (a hung
-                // Wi-Fi stack would stall the 250 ms ticker:
-                // watchdog, retries, tray drain, pairing events).
-                // A detached task runs it on the blocking pool
-                // (bounded by a hard timeout inside `rejoin_wifi`)
-                // and logs the outcome; the loop never waits on it.
-                tokio::spawn(async move {
-                    match tokio::task::spawn_blocking(move || rejoin_wifi(RSH_SSID, &password))
-                        .await
-                    {
-                        Ok(Ok(())) => {
-                            log_line(verbose, "pairing: rejoined RSH Wi-Fi after pairing");
-                        }
-                        Ok(Err(error)) => {
-                            log_line(verbose, &format!("pairing: Wi-Fi rejoin failed: {error}"));
-                        }
-                        Err(error) => {
-                            log_line(
-                                verbose,
-                                &format!("pairing: Wi-Fi rejoin task failed: {error}"),
-                            );
-                        }
-                    }
-                });
-            }
-        }
-        if !window_open && !active_now {
-            pending_rejoin_password = None;
         }
         if !active_now && last_active {
             // Scope C: wheel disconnected — drop back to the
@@ -526,7 +448,7 @@ async fn manager_loop(
             }
             match action {
                 ManagerAction::RequestHello | ManagerAction::Reactivate => {
-                    let _ = api.state.activate_session();
+                    let _ = api.state.connect_session();
                 }
                 _ => {}
             }
@@ -1225,23 +1147,51 @@ fn starting_connection() -> ConnectionInfo {
         transport: ApiTransport::Wifi,
         address: String::new(),
         session_active: false,
+        board_reachable: false,
         error: None,
         hint: None,
     }
 }
 
-/// The starting [`PairingInfo`]: no window open, no password, no
-/// error — no pairing attempt has run yet.
-fn starting_pairing_status() -> PairingInfo {
-    PairingInfo {
-        seconds_left: 0,
-        password: None,
-        error: None,
-        error_detail: None,
+/// The starting [`WifiStatus`]: no SSID, not connected, no
+/// password set — no board has been observed yet.
+fn starting_wifi_status() -> WifiStatus {
+    WifiStatus {
+        ssid: None,
+        connected: false,
+        password_set: false,
         board_mac: None,
-        replacement_required: false,
-        key_reset_armed: false,
-        attempt_log: Vec::new(),
+    }
+}
+
+/// D6 migration (lazy, per board): delete the legacy
+/// `board:<MAC>` device-key entry for `board_mac` from the OS
+/// credential store (service `RSH`). Called once per board MAC
+/// per daemon run, on the first HELLO observed from that board
+/// (see the manager loop). A missing entry is already migrated
+/// (silent); any other failure is logged, never fatal — the
+/// entry is inert after the no-pairing redesign (nothing reads
+/// device keys anymore). The `:wifi` entry is NOT deleted here.
+fn migrate_legacy_device_key(board_mac: &str, verbose: bool) {
+    let account = format!("board:{}", board_mac.trim().to_ascii_uppercase());
+    match keyring::Entry::new("RSH", &account) {
+        Ok(entry) => match entry.delete_credential() {
+            Ok(()) => log_line(
+                verbose,
+                &format!("migration: deleted legacy device key for board {board_mac}"),
+            ),
+            Err(keyring::Error::NoEntry) => {}
+            Err(error) => log_line(
+                verbose,
+                &format!(
+                    "migration: could not delete legacy device key for board {board_mac}: {error}"
+                ),
+            ),
+        },
+        Err(error) => log_line(
+            verbose,
+            &format!("migration: could not open legacy device key for board {board_mac}: {error}"),
+        ),
     }
 }
 
@@ -1306,9 +1256,9 @@ impl AppApi for DeferredApi {
     fwd!(value connection() -> ConnectionInfo = starting_connection());
     fwd!(result connect(transport: ApiTransport) -> ConnectionInfo);
     fwd!(result disconnect() -> ConnectionInfo);
-    fwd!(value pairing_status() -> PairingInfo = starting_pairing_status());
-    fwd!(result begin_pairing() -> PairingInfo);
-    fwd!(result reset_pairing() -> PairingInfo);
+    fwd!(value wifi_status() -> WifiStatus = starting_wifi_status());
+    fwd!(result set_wifi_password(password: &str, confirm: &str) -> WifiStatus);
+    fwd!(result clear_wifi_password() -> WifiStatus);
     fwd!(value snapshot() -> SnapshotInfo = SnapshotInfo::default());
     fwd!(value output_enabled() -> bool = false);
     fwd!(unit set_output_enabled(enabled: bool));
@@ -3006,8 +2956,9 @@ mod tests {
         assert_eq!(connection.state, ConnectionState::Idle);
         assert_eq!(connection.label, "Starting…");
         assert!(!connection.session_active);
-        assert_eq!(deferred.pairing_status().seconds_left, 0);
-        assert!(deferred.pairing_status().password.is_none());
+        assert_eq!(deferred.wifi_status().ssid, None);
+        assert!(!deferred.wifi_status().connected);
+        assert!(!deferred.wifi_status().password_set);
         assert_eq!(deferred.snapshot(), SnapshotInfo::default());
         assert!(!deferred.output_enabled());
         assert_eq!(deferred.firmware_version(), "Unknown");
@@ -3020,7 +2971,12 @@ mod tests {
                 .set_tuning(&TuningSettings::neutral("steering"))
                 .is_err()
         );
-        assert!(deferred.begin_pairing().is_err());
+        assert!(
+            deferred
+                .set_wifi_password("password1", "password1")
+                .is_err()
+        );
+        assert!(deferred.clear_wifi_password().is_err());
         assert!(deferred.firmware_check().is_err());
         assert!(deferred.vjoy_status().is_err());
         // slow_poll composes through the starting getters: version
@@ -3046,7 +3002,7 @@ mod tests {
         deferred.install(Arc::clone(&api));
         assert_eq!(deferred.version(), api.version());
         assert_eq!(deferred.connection(), api.connection());
-        assert_eq!(deferred.pairing_status(), api.pairing_status());
+        assert_eq!(deferred.wifi_status(), api.wifi_status());
         assert_eq!(deferred.snapshot(), api.snapshot());
         assert_eq!(deferred.poll(), api.poll());
         assert_eq!(deferred.slow_poll(), api.slow_poll());

@@ -56,8 +56,14 @@ pub struct ConnectionInfo {
     pub transport: ApiTransport,
     /// Board address (IP or `rsh.local` resolution result).
     pub address: String,
-    /// True only once a signed `GET_CAPS` passed (SEC-E-14).
+    /// True only once an unsigned `GET_CAPS` passed (SEC-E-14).
     pub session_active: bool,
+    /// Sticky "board reachable" latch (D15): set on every HELLO
+    /// observed, cleared on disconnect / transport switch /
+    /// `NoRoute` / HELLO-timeout. The wizard Step 1 Next unlocks
+    /// on this (HELLO-or-better), never on `Active` alone.
+    #[serde(default)]
+    pub board_reachable: bool,
     /// Typed failure reason, when in `Error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ConnectionError>,
@@ -66,43 +72,26 @@ pub struct ConnectionInfo {
     pub hint: Option<String>,
 }
 
-/// Pairing status, as the API reports it. The typed `error` is the
-/// backend part of the Phase 0 §4.3 finding — the UI (Phase 3/6)
-/// matches on it for distinct copy instead of one generic
-/// "No pairing window is open."
+/// Wi-Fi status, as the API reports it (no-pairing redesign):
+/// which board hotspot the PC is on, whether the board is
+/// connected, and whether the user has set a Wi-Fi password.
+/// Never carries a password.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub struct PairingInfo {
-    /// Seconds left in the pairing window; 0 when no window is open.
-    pub seconds_left: u64,
-    /// The one-time Wi-Fi password, shown once, or `None`.
-    /// Never logged, never put in an event payload.
+pub struct WifiStatus {
+    /// Board hotspot SSID (`RSH-XXXX`, D4), when a board HELLO
+    /// has been observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
-    /// Typed failure reason of the last activation, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<ConnectionError>,
-    /// Human-readable form of `error` (from the stored reason
-    /// string, when the typed value is unavailable).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_detail: Option<String>,
-    /// Board MAC of the last HELLO, when one was observed.
+    pub ssid: Option<String>,
+    /// True when the PC is connected to the board's network
+    /// (Wi-Fi joined / USB plugged in) and the board answered.
+    pub connected: bool,
+    /// True when the user has set a Wi-Fi password for this
+    /// board (stored in the OS credential store + WLAN profile).
+    pub password_set: bool,
+    /// Board MAC (`"AA:BB:CC:DD:EE:FF"`) of the last HELLO, when
+    /// one was observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board_mac: Option<String>,
-    /// True when the board already has a stored key and re-pairing
-    /// needs explicit user confirmation.
-    pub replacement_required: bool,
-    /// True when the board was booted with BOOT held (`KEY_RESET`
-    /// armed): a pairing reset now rotates the board key instead of
-    /// only clearing the PC-side state (B5).
-    #[serde(default)]
-    pub key_reset_armed: bool,
-    /// DS-25: the pairing attempt trail — the daemon's redacted
-    /// pairing log lines (attempt start, HELO sends, HELLO replies,
-    /// timeouts), oldest first, capped at 200 by the core. The
-    /// wizard already polls `pairing_status`, so the trail rides
-    /// along with no new IPC method; empty when no attempt ran.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attempt_log: Vec<String>,
 }
 
 /// A live snapshot value (steering / pedals), pushed at ~30 Hz only
@@ -211,8 +200,8 @@ pub struct SlowPollState {
     /// Engine diagnostics, when the daemon can report them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diag_stats: Option<DiagStats>,
-    /// Current pairing state.
-    pub pairing_status: PairingInfo,
+    /// Current Wi-Fi state (SSID / connected / password set).
+    pub wifi_status: WifiStatus,
     /// Calibration, when a board session is live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration: Option<CalibrationInfo>,
@@ -501,29 +490,11 @@ pub enum AppEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<ConnectionError>,
     },
-    /// A pairing window opened or closed.
-    PairingWindow {
-        /// True when a window is open now.
-        open: bool,
-        /// Seconds left (0 when closed).
-        seconds_left: u64,
-        /// Board MAC, when known.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        board_mac: Option<String>,
-    },
-    /// A pairing attempt finished (success or typed failure).
-    PairingFinished {
-        /// True on success.
-        ok: bool,
-        /// Typed reason on failure.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<ConnectionError>,
-    },
     /// A live snapshot (only while a UI is attached).
     Snapshot(SnapshotInfo),
     /// A notification for the bell / toast list (Phase 3 renders it).
     Notification {
-        /// Stable kind (`ConnectionLost`, `PairingNeeded`, …).
+        /// Stable kind (`ConnectionLost`, …).
         kind: String,
         /// Short title.
         title: String,
@@ -548,7 +519,7 @@ pub enum AppEvent {
 }
 
 /// The typed daemon API. Every method is synchronous from the
-/// caller's view; long work (pairing, firmware upload) runs as an
+/// caller's view; long work (firmware upload) runs as an
 /// async job and reports through [`AppEvent::JobProgress`] — never
 /// by blocking the caller (LOGIC-FIX-PLAN §2 rule 2, A-01).
 ///
@@ -575,51 +546,75 @@ pub trait AppApi: Send + Sync {
     /// [`UserError`] when the engine is not running.
     fn disconnect(&self) -> Result<ConnectionInfo, UserError>;
 
-    /// Current pairing status (typed error included).
-    fn pairing_status(&self) -> PairingInfo;
+    /// Current Wi-Fi status (SSID / connected / password set).
+    fn wifi_status(&self) -> WifiStatus;
 
-    /// Begin pairing (triggers a session-activation attempt).
+    /// Set (or change) the board Wi-Fi password (D19): the new
+    /// password + its confirmation. Validation is 8–63 printable
+    /// ASCII; the two must match. On success the board restarts
+    /// its AP WPA2-PSK and the PC reconnects with the new
+    /// password. Default: error — only the daemon sets it.
     ///
     /// # Errors
     ///
-    /// [`UserError`] when no transport can be started.
-    fn begin_pairing(&self) -> Result<PairingInfo, UserError>;
-
-    /// Reset pairing state (B5, v2.0.2): forget the PC-side pairing
-    /// (close the session gate, clear stored HELLO / key records) so
-    /// the wheel can be paired again; when the board has signalled a
-    /// key reset (BOOT held ≥ 10 s) the board rotates its key too.
-    /// Default: error — only the daemon resets pairing.
-    ///
-    /// # Errors
-    ///
-    /// [`UserError`] when the reset cannot be performed.
-    fn reset_pairing(&self) -> Result<PairingInfo, UserError> {
+    /// [`UserError`] when validation fails, no board answers, or
+    /// the password could not be stored / applied.
+    fn set_wifi_password(&self, _password: &str, _confirm: &str) -> Result<WifiStatus, UserError> {
         Err(UserError::from_connection(
             ConnectionError::Unknown,
-            "pairing reset is not supported by this API",
+            "setting the Wi-Fi password is not supported by this API",
         ))
     }
 
-    /// Confirm a key replacement (R2-51, M-7): the board already
-    /// has a stored key (`PairingInfo::replacement_required`), so
-    /// the user confirmed — in the dialog naming the board MAC
-    /// from `pairing_status().board_mac` — that the new key may
-    /// replace it. Arms the one-time replacement flag and triggers
-    /// a fresh activation attempt; the attempt itself runs
-    /// asynchronously in the forwarder, so this returns promptly
-    /// and the UI polls `pairing_status()` for the outcome (same
-    /// shape as [`AppApi::begin_pairing`]). Default: error — only
-    /// the daemon confirms a replacement.
+    /// Forget the Wi-Fi password ("Forget password / reset to open
+    /// AP", D19): clears the PC-side stores (credential-store
+    /// `:wifi` entry + WLAN profile). The board-side password is
+    /// cleared only by holding BOOT ≥ 10 s (D7) — the reply says
+    /// so when the board still has a password. Default: error —
+    /// only the daemon clears it.
     ///
     /// # Errors
     ///
-    /// [`UserError`] when no replacement is currently required or
-    /// the activation attempt cannot start.
-    fn confirm_pairing_replacement(&self) -> Result<PairingInfo, UserError> {
+    /// [`UserError`] when the password could not be cleared.
+    fn clear_wifi_password(&self) -> Result<WifiStatus, UserError> {
         Err(UserError::from_connection(
             ConnectionError::Unknown,
-            "pairing replacement confirmation is not supported by this API",
+            "clearing the Wi-Fi password is not supported by this API",
+        ))
+    }
+
+    /// Scan for nearby board hotspots (D4): SSIDs starting with
+    /// `RSH-` (`RSH-XXXX`, last 4 hex of the board Wi-Fi MAC).
+    /// Default: empty — only the daemon scans.
+    fn scan_rsh_networks(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Join a board hotspot that has no password (open AP, D5):
+    /// writes the open WLAN profile and connects. Default: error —
+    /// only the daemon joins.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the network cannot be joined.
+    fn rejoin_wifi_open(&self, _ssid: &str) -> Result<WifiStatus, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "joining the open Wi-Fi network is not supported by this API",
+        ))
+    }
+
+    /// Join a board hotspot with its stored password (D5/D8):
+    /// writes the WLAN profile with the password and connects.
+    /// Default: error — only the daemon joins.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the network cannot be joined.
+    fn rejoin_wifi(&self, _ssid: &str, _password: &str) -> Result<WifiStatus, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "joining the Wi-Fi network is not supported by this API",
         ))
     }
 
@@ -691,7 +686,7 @@ pub trait AppApi: Send + Sync {
             autostart: self.autostart(),
             board_address: self.board_address(),
             diag_stats: self.diag_stats().ok(),
-            pairing_status: self.pairing_status(),
+            wifi_status: self.wifi_status(),
             calibration: self.calibration().ok(),
             raw_mv: self.raw_mv().ok(),
             profiles: self.list_profiles(),
@@ -1390,7 +1385,7 @@ mod tests {
     /// Slint default copy too.
     #[test]
     fn app_version_matches_release_tag() {
-        assert_eq!(app_version(), "2.0.5");
+        assert_eq!(app_version(), "2.0.6");
     }
 
     /// L-4: a stub whose state flips between two reads — the
@@ -1427,6 +1422,7 @@ mod tests {
                     transport: ApiTransport::Wifi,
                     address: "192.168.4.1".to_string(),
                     session_active: true,
+                    board_reachable: true,
                     error: None,
                     hint: None,
                 }
@@ -1437,6 +1433,7 @@ mod tests {
                     transport: ApiTransport::Wifi,
                     address: String::new(),
                     session_active: false,
+                    board_reachable: false,
                     error: None,
                     hint: None,
                 }
@@ -1482,21 +1479,13 @@ mod tests {
             Ok(self.connection())
         }
 
-        fn pairing_status(&self) -> PairingInfo {
-            PairingInfo {
-                seconds_left: 0,
-                password: None,
-                error: None,
-                error_detail: None,
+        fn wifi_status(&self) -> WifiStatus {
+            WifiStatus {
+                ssid: None,
+                connected: false,
+                password_set: false,
                 board_mac: None,
-                replacement_required: false,
-                key_reset_armed: false,
-                attempt_log: Vec::new(),
             }
-        }
-
-        fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
-            Ok(self.pairing_status())
         }
 
         fn snapshot(&self) -> SnapshotInfo {
@@ -1609,7 +1598,9 @@ mod tests {
         assert!(!slow.autostart);
         assert!(slow.close_to_tray);
         assert!(!slow.auto_pause);
-        assert_eq!(slow.pairing_status.seconds_left, 0);
+        assert!(!slow.wifi_status.connected);
+        assert!(!slow.wifi_status.password_set);
+        assert!(slow.wifi_status.ssid.is_none());
         // Fallible sources: the stub errors, so the slots are None
         // (the UI keeps its old value — same as a failed per-call
         // fetch before).

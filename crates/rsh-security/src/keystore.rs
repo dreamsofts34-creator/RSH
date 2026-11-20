@@ -1,18 +1,22 @@
-//! Per-device secrets in the OS credential store (`keyring` 4.2.0).
+//! The Wi-Fi / OTA password in the OS credential store (`keyring` 4.2.0).
 //!
-//! This module is the app-side half of `docs/KEY-LIFECYCLE-RUST.md` §4 and
-//! the `keyring` decision there (D-R9). It stores two
-//! secrets per board, and nothing else:
+//! Protocol v2.2 (no-pairing redesign, D8): the device key is gone —
+//! there is no pairing and no per-device secret. This module stores one
+//! secret per board, and nothing else:
 //!
 //! | Secret | Service | Account (username) |
 //! |---|---|---|
-//! | Device key (32 bytes) | `RSH` | `board:<boardMac>` |
 //! | Wi-Fi / OTA password | `RSH` | `board:<boardMac>:wifi` |
 //!
-//! The service and account names are locked by the key-lifecycle design
-//! document; do not rename them without amending that document first. One
-//! board never overwrites another board's entries: the board MAC is part of
-//! every account name.
+//! The password entry is the `WebOTA` auth source: the WLAN profile
+//! password cannot be read back at runtime (`netsh wlan show profile
+//! key=clear` needs admin), so the stored entry is what the app uses
+//! for `WebOTA`. It is written in the same `set_password` transaction
+//! as the WLAN profile update, and cleared together with it on
+//! password-clear. The service and account names are locked by the
+//! key-lifecycle design document; do not rename them without amending
+//! that document first. One board never overwrites another board's
+//! entries: the board MAC is part of every account name.
 //!
 //! # Backend
 //!
@@ -22,29 +26,26 @@
 //! [`keyring::Entry::new`] returns an error instead of silently falling back
 //! to an in-memory mock (the `keyring` 3.x trap).
 //! Every failure surfaces here as [`KeystoreError::PlatformUnavailable`];
-//! pairing must fail loudly, never proceed without a stored key.
+//! password-set / `WebOTA` must fail loudly, never proceed without the
+//! stored password. Connecting to a board needs no credential store
+//! at all — a missing store blocks password-set and `WebOTA`, not connect.
 //!
 //! # Encoding
 //!
-//! The Windows credential blob is UTF-16LE text, so the 32-byte binary
-//! device key is stored hex-encoded (64 ASCII characters, far under the
-//! 2560-byte platform blob limit). The Wi-Fi password is stored as UTF-8
-//! text. A stored device-key blob that is not exactly 64 hex characters is
-//! treated as corrupt and rejected — never interpreted leniently.
+//! The Wi-Fi password is stored as UTF-8 text.
 //!
 //! # Zeroization
 //!
-//! [`KeyStore`] never retains key material: it holds no secret between
-//! calls. Buffers that transiently hold a key (the hex encoding on store,
-//! the fetched blob on read, a partially decoded key on a corrupt blob) are
-//! overwritten with zeros on drop or on the error path. The returned
-//! `[u8; 32]` from [`KeyStore::get_device_key`] and the `String` from
-//! [`KeyStore::get_wifi_password`] are owned by the caller, so the caller
-//! must zeroize them when done; this module cannot do it for them.
+//! [`KeyStore`] never retains password material: it holds no secret between
+//! calls. Buffers that transiently hold a password (the fetched blob on
+//! read) are overwritten with zeros on drop or on the error path. The
+//! returned `String` from [`KeyStore::get_wifi_password`] is owned by the
+//! caller, so the caller must zeroize it when done; this module cannot
+//! do it for them.
 //!
 //! # What is never logged
 //!
-//! No key or password material ever appears in an error message, a log
+//! No password material ever appears in an error message, a log
 //! line, or a `Debug`/`Display` output. [`KeystoreError::Other`] carries
 //! only fixed, secret-free descriptions. [`KeyStore`]'s `Debug` impl shows
 //! only the service name.
@@ -63,12 +64,6 @@ pub const KEYSTORE_SERVICE: &str = "RSH";
 /// encoded form would exceed this is rejected before it reaches the
 /// store, so a too-large value fails loudly instead of truncating.
 const MAX_CREDENTIAL_BLOB_BYTES: usize = 2560;
-
-/// Length in bytes of a device key (locked: 32 bytes, 256-bit).
-const DEVICE_KEY_LEN: usize = 32;
-
-/// Length in bytes of a hex-encoded device key.
-const DEVICE_KEY_HEX_LEN: usize = DEVICE_KEY_LEN * 2;
 
 /// Maximum length of a board identifier, in characters.
 const MAX_BOARD_ID_LEN: usize = 64;
@@ -122,20 +117,15 @@ fn zeroize(buf: &mut [u8]) {
 
 /// A byte buffer that is zeroized when it goes out of scope.
 ///
-/// Used for every transient copy of key material in this module (the hex
-/// encoding on store, the fetched blob on read). The buffer is zeroed in
-/// [`Drop`], so early returns and error paths cannot leak it.
+/// Used for every transient copy of password material in this module
+/// (the fetched blob on read). The buffer is zeroed in [`Drop`], so
+/// early returns and error paths cannot leak it.
 struct ZeroizingVec(Vec<u8>);
 
 impl ZeroizingVec {
     /// Wrap `bytes` in a zeroizing buffer.
     fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
-    }
-
-    /// Borrow the buffer contents.
-    fn as_slice(&self) -> &[u8] {
-        &self.0
     }
 }
 
@@ -276,76 +266,17 @@ fn normalize_board_id(board_id: &str) -> Result<String, KeystoreError> {
     Ok(trimmed.to_ascii_uppercase())
 }
 
-/// Hex-encode a device key into a zeroizing buffer.
-///
-/// The result is 64 lowercase ASCII hex characters. The buffer is zeroed
-/// when dropped, so the encoded key never lingers in memory after the
-/// store call returns.
-fn encode_key_hex(key: &[u8; DEVICE_KEY_LEN]) -> ZeroizingVec {
-    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut buf = Vec::with_capacity(DEVICE_KEY_HEX_LEN);
-    for &byte in key {
-        buf.push(HEX_DIGITS[(byte >> 4) as usize]);
-        buf.push(HEX_DIGITS[(byte & 0x0f) as usize]);
-    }
-    ZeroizingVec::new(buf)
-}
-
-/// Decode one hex digit, or `None` if `byte` is not a hex digit.
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Decode a stored hex blob back into a 32-byte device key.
-///
-/// The blob must be exactly 64 hex characters. Anything else — wrong
-/// length, non-hex character — is a corrupt entry and is rejected; a
-/// partially decoded key is zeroized before the error is returned. The
-/// error message never includes the blob itself.
-///
-/// # Errors
-///
-/// Returns [`KeystoreError::Other`] if the blob is not exactly 64 hex
-/// characters.
-///
-/// # Panics
-///
-/// This function does not panic.
-fn decode_key_hex(blob: &[u8]) -> Result<[u8; DEVICE_KEY_LEN], KeystoreError> {
-    const CORRUPT: &str = "stored device key has an unexpected format";
-    if blob.len() != DEVICE_KEY_HEX_LEN {
-        return Err(KeystoreError::Other(CORRUPT.to_owned()));
-    }
-    let mut key = [0u8; DEVICE_KEY_LEN];
-    let (pairs, _) = blob.as_chunks::<2>();
-    for (index, pair) in pairs.iter().enumerate() {
-        if let (Some(high), Some(low)) = (hex_value(pair[0]), hex_value(pair[1])) {
-            key[index] = (high << 4) | low;
-        } else {
-            zeroize(&mut key);
-            return Err(KeystoreError::Other(CORRUPT.to_owned()));
-        }
-    }
-    Ok(key)
-}
-
-/// Per-device secrets in the OS credential store.
+/// The Wi-Fi / OTA password in the OS credential store.
 ///
 /// A `KeyStore` holds no secret itself: every method reads or writes one
 /// entry in the platform store and returns. It is cheap to clone and safe
 /// to share between threads.
 ///
-/// Callers must zeroize the `[u8; 32]` returned by [`KeyStore::get_device_key`]
-/// and the `String` returned by [`KeyStore::get_wifi_password`] when they
-/// are done with them — this module cannot zeroize a value it has handed
-/// out. Secrets must never be sent to the frontend over IPC, written to a
-/// file or log, or included in an export; only the paired/unpaired state
-/// derived from these calls crosses that boundary.
+/// Callers must zeroize the `String` returned by
+/// [`KeyStore::get_wifi_password`] when they are done with it — this
+/// module cannot zeroize a value it has handed out. Passwords must never
+/// be sent to the frontend over IPC, written to a file or log, or
+/// included in an export.
 #[derive(Clone)]
 pub struct KeyStore {
     backend: Arc<dyn SecretBackend>,
@@ -373,10 +304,12 @@ impl KeyStore {
     ///
     /// This initialises the `keyring` store if that has not happened yet
     /// and returns `false` when no store exists (no Secret Service on
-    /// Linux, Credential Manager unreachable on Windows). Pairing must
-    /// check this — or handle [`KeystoreError::PlatformUnavailable`] from
-    /// a store call — and fail loudly instead of proceeding without a
-    /// stored key.
+    /// Linux, Credential Manager unreachable on Windows). Password-set
+    /// and `WebOTA` must check this — or handle
+    /// [`KeystoreError::PlatformUnavailable`] from a store call — and
+    /// fail loudly instead of proceeding without the stored password.
+    /// A missing store blocks password-set and `WebOTA`, not connect:
+    /// connecting to a board needs no credential store at all.
     ///
     /// # Panics
     ///
@@ -384,26 +317,6 @@ impl KeyStore {
     #[must_use]
     pub fn store_available() -> bool {
         keyring::Entry::store_status().is_ok()
-    }
-
-    /// Account (username) of the device-key entry for `board_id`.
-    ///
-    /// The account is `board:<boardMac>` with the board identifier
-    /// normalised by `normalize_board_id` (trimmed, upper-cased). This
-    /// is exposed so the Windows trap test and
-    /// diagnostics can name the exact entry without duplicating the
-    /// naming rule.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KeystoreError::Other`] if `board_id` is invalid (see
-    /// `normalize_board_id`).
-    ///
-    /// # Panics
-    ///
-    /// This function does not panic.
-    pub fn device_key_account(board_id: &str) -> Result<String, KeystoreError> {
-        normalize_board_id(board_id).map(|normalised| format!("board:{normalised}"))
     }
 
     /// Account (username) of the Wi-Fi password entry for `board_id`.
@@ -423,84 +336,12 @@ impl KeyStore {
         normalize_board_id(board_id).map(|normalised| format!("board:{normalised}:wifi"))
     }
 
-    /// Store (or replace) the 32-byte device key for `board_id`.
-    ///
-    /// The key is hex-encoded and written to the `board:<boardMac>` entry
-    /// under service `RSH`. Storing a key for one board never touches
-    /// another board's entry. The in-memory hex encoding is zeroized when
-    /// the write returns, whether it succeeded or not.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KeystoreError::Other`] if `board_id` is invalid, or
-    /// [`KeystoreError::PlatformUnavailable`] if the platform credential
-    /// store cannot be reached.
-    ///
-    /// # Panics
-    ///
-    /// This function does not panic.
-    pub fn store_device_key(
-        &self,
-        board_id: &str,
-        key: &[u8; DEVICE_KEY_LEN],
-    ) -> Result<(), KeystoreError> {
-        let account = Self::device_key_account(board_id)?;
-        let encoded = encode_key_hex(key);
-        self.backend
-            .set_secret(KEYSTORE_SERVICE, &account, encoded.as_slice())
-    }
-
-    /// Fetch the 32-byte device key stored for `board_id`.
-    ///
-    /// The stored blob must decode as exactly 64 hex characters; a
-    /// corrupt entry is rejected with [`KeystoreError::Other`]. The
-    /// caller owns the returned key and must zeroize it when done.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KeystoreError::NotFound`] if no key is stored for this
-    /// board, [`KeystoreError::Other`] if `board_id` is invalid or the
-    /// stored entry is corrupt, or [`KeystoreError::PlatformUnavailable`]
-    /// if the platform credential store cannot be reached.
-    ///
-    /// # Panics
-    ///
-    /// This function does not panic.
-    pub fn get_device_key(&self, board_id: &str) -> Result<[u8; DEVICE_KEY_LEN], KeystoreError> {
-        let account = Self::device_key_account(board_id)?;
-        let blob = ZeroizingVec::new(self.backend.get_secret(KEYSTORE_SERVICE, &account)?);
-        decode_key_hex(blob.as_slice())
-    }
-
-    /// Delete the stored device key for `board_id`.
-    ///
-    /// After a successful delete the board's key is gone from this PC; the
-    /// board itself is unaffected, so re-pairing (`KEY_RESET`, then the
-    /// pairing flow) is the only way to talk to that board again. Deleting
-    /// the key never deletes the Wi-Fi password entry.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KeystoreError::NotFound`] if no key is stored for this
-    /// board, [`KeystoreError::Other`] if `board_id` is invalid, or
-    /// [`KeystoreError::PlatformUnavailable`] if the platform credential
-    /// store cannot be reached.
-    ///
-    /// # Panics
-    ///
-    /// This function does not panic.
-    pub fn delete_device_key(&self, board_id: &str) -> Result<(), KeystoreError> {
-        let account = Self::device_key_account(board_id)?;
-        self.backend.delete_secret(KEYSTORE_SERVICE, &account)
-    }
-
     /// Store (or replace) the Wi-Fi / OTA password for `board_id`.
     ///
     /// The password is written to the `board:<boardMac>:wifi` entry under
     /// service `RSH`. The password must be non-empty and its UTF-16
     /// encoding must fit the platform blob limit
-    /// (`MAX_CREDENTIAL_BLOB_BYTES` bytes); the board-generated password
-    /// is 24 characters, far under it.
+    /// (`MAX_CREDENTIAL_BLOB_BYTES` bytes).
     ///
     /// # Errors
     ///
@@ -557,8 +398,6 @@ impl KeyStore {
 
     /// Delete the stored Wi-Fi / OTA password for `board_id`.
     ///
-    /// Deleting the password never deletes the device-key entry.
-    ///
     /// # Errors
     ///
     /// Returns [`KeystoreError::NotFound`] if no password is stored for
@@ -602,14 +441,6 @@ mod tests {
     const TEST_BOARD: &str = "AA:BB:CC:DD:EE:FF";
     /// A second board MAC, for per-board isolation tests.
     const OTHER_BOARD: &str = "11:22:33:44:55:66";
-    /// A distinctive device key (its hex form is recognisable in tests).
-    const TEST_KEY: [u8; DEVICE_KEY_LEN] = [
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-        0xff, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
-        0x32, 0x10,
-    ];
-    /// Hex encoding of [`TEST_KEY`].
-    const TEST_KEY_HEX: &str = "00112233445566778899aabbccddeeff0123456789abcdeffedcba9876543210";
     /// A distinctive Wi-Fi password.
     const TEST_PASSWORD: &str = "Ab3dEf6hJk9mNp2rSt5vXy8";
 
@@ -620,7 +451,7 @@ mod tests {
     /// reachable without adding `keyring-core` as a direct dependency,
     /// which would mean editing `Cargo.toml` (out of scope for this
     /// worker). This backend exercises the same `KeyStore` logic (naming,
-    /// hex encode/decode, error mapping for corrupt blobs, zeroization)
+    /// error mapping for corrupt blobs, zeroization)
     /// without touching the OS store; the platform-backend call-through
     /// itself is covered by the fail-closed Linux tests below and by the
     /// ignored Windows round-trip test, which runs on the real store.
@@ -693,9 +524,9 @@ mod tests {
 
     #[test]
     fn zeroize_overwrites_every_byte() {
-        let mut buf = [0xAAu8; DEVICE_KEY_LEN];
+        let mut buf = [0xAAu8; 32];
         zeroize(&mut buf);
-        assert_eq!(buf, [0u8; DEVICE_KEY_LEN]);
+        assert_eq!(buf, [0u8; 32]);
 
         let mut empty: [u8; 0] = [];
         zeroize(&mut empty);
@@ -703,143 +534,16 @@ mod tests {
     }
 
     #[test]
-    fn hex_encode_decode_round_trip() {
-        let encoded = encode_key_hex(&TEST_KEY);
-        assert_eq!(encoded.as_slice(), TEST_KEY_HEX.as_bytes());
-        assert_eq!(
-            decode_key_hex(encoded.as_slice()).expect("valid hex"),
-            TEST_KEY
-        );
-
-        let zero_key = [0u8; DEVICE_KEY_LEN];
-        assert_eq!(
-            encode_key_hex(&zero_key).as_slice(),
-            "0000000000000000000000000000000000000000000000000000000000000000".as_bytes()
-        );
-        let ff_key = [0xFFu8; DEVICE_KEY_LEN];
-        assert_eq!(
-            encode_key_hex(&ff_key).as_slice(),
-            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".as_bytes()
-        );
-    }
-
-    #[test]
-    fn hex_decode_rejects_wrong_length_and_non_hex() {
-        assert!(matches!(
-            decode_key_hex(b"0011"),
-            Err(KeystoreError::Other(_))
-        ));
-        assert!(matches!(
-            decode_key_hex(&[b'a'; DEVICE_KEY_HEX_LEN + 2]),
-            Err(KeystoreError::Other(_))
-        ));
-        let mut bad = [b'a'; DEVICE_KEY_HEX_LEN];
-        bad[3] = b'z';
-        assert!(matches!(decode_key_hex(&bad), Err(KeystoreError::Other(_))));
-        // Uppercase hex is accepted (decoders must not reject it).
-        let upper = [b'A'; DEVICE_KEY_HEX_LEN];
-        assert_eq!(
-            decode_key_hex(&upper).expect("uppercase hex"),
-            [0xAAu8; DEVICE_KEY_LEN]
-        );
-    }
-
-    #[test]
     fn account_naming_matches_key_lifecycle_doc() {
         assert_eq!(
-            KeyStore::device_key_account("aa:bb:cc:dd:ee:ff").expect("valid board"),
-            "board:AA:BB:CC:DD:EE:FF"
+            KeyStore::wifi_password_account("aa:bb:cc:dd:ee:ff").expect("valid board"),
+            "board:AA:BB:CC:DD:EE:FF:wifi"
         );
         assert_eq!(
-            KeyStore::device_key_account("  AA:BB:CC:DD:EE:FF  ").expect("valid board"),
-            "board:AA:BB:CC:DD:EE:FF"
-        );
-        assert_eq!(
-            KeyStore::wifi_password_account(TEST_BOARD).expect("valid board"),
+            KeyStore::wifi_password_account("  AA:BB:CC:DD:EE:FF  ").expect("valid board"),
             "board:AA:BB:CC:DD:EE:FF:wifi"
         );
         assert_eq!(KEYSTORE_SERVICE, "RSH");
-    }
-
-    #[test]
-    fn device_key_round_trip() {
-        let store = test_store();
-        assert_eq!(
-            store.get_device_key(TEST_BOARD),
-            Err(KeystoreError::NotFound)
-        );
-        store
-            .store_device_key(TEST_BOARD, &TEST_KEY)
-            .expect("store key");
-        assert_eq!(
-            store.get_device_key(TEST_BOARD).expect("read key"),
-            TEST_KEY
-        );
-        // Overwrite replaces the stored key.
-        let replacement = [0x5Au8; DEVICE_KEY_LEN];
-        store
-            .store_device_key(TEST_BOARD, &replacement)
-            .expect("overwrite key");
-        assert_eq!(
-            store.get_device_key(TEST_BOARD).expect("read key"),
-            replacement
-        );
-        store.delete_device_key(TEST_BOARD).expect("delete key");
-        assert_eq!(
-            store.get_device_key(TEST_BOARD),
-            Err(KeystoreError::NotFound)
-        );
-    }
-
-    #[test]
-    fn device_keys_are_per_board() {
-        let store = test_store();
-        store
-            .store_device_key(TEST_BOARD, &TEST_KEY)
-            .expect("store key");
-        store
-            .store_device_key(OTHER_BOARD, &[0x5Au8; DEVICE_KEY_LEN])
-            .expect("store other key");
-        assert_eq!(
-            store.get_device_key(TEST_BOARD).expect("read key"),
-            TEST_KEY
-        );
-        assert_eq!(
-            store.get_device_key(OTHER_BOARD).expect("read other key"),
-            [0x5Au8; DEVICE_KEY_LEN]
-        );
-        store.delete_device_key(TEST_BOARD).expect("delete key");
-        assert_eq!(
-            store.get_device_key(TEST_BOARD),
-            Err(KeystoreError::NotFound)
-        );
-        assert_eq!(
-            store
-                .get_device_key(OTHER_BOARD)
-                .expect("other key untouched"),
-            [0x5Au8; DEVICE_KEY_LEN]
-        );
-    }
-
-    #[test]
-    fn board_id_lookup_is_case_insensitive() {
-        let store = test_store();
-        store
-            .store_device_key("aa:bb:cc:dd:ee:ff", &TEST_KEY)
-            .expect("store lowercase");
-        assert_eq!(
-            store
-                .get_device_key("AA:BB:CC:DD:EE:FF")
-                .expect("read uppercase"),
-            TEST_KEY
-        );
-        store
-            .delete_device_key("Aa:Bb:Cc:Dd:Ee:Ff")
-            .expect("delete mixed case");
-        assert_eq!(
-            store.get_device_key(TEST_BOARD),
-            Err(KeystoreError::NotFound)
-        );
     }
 
     #[test]
@@ -874,45 +578,63 @@ mod tests {
     }
 
     #[test]
-    fn key_and_password_entries_are_independent() {
+    fn wifi_passwords_are_per_board() {
         let store = test_store();
-        store
-            .store_device_key(TEST_BOARD, &TEST_KEY)
-            .expect("store key");
         store
             .store_wifi_password(TEST_BOARD, TEST_PASSWORD)
             .expect("store password");
-        // Deleting the password leaves the key alone, and vice versa.
+        store
+            .store_wifi_password(OTHER_BOARD, "OtherBoardPass1")
+            .expect("store other password");
+        assert_eq!(
+            store.get_wifi_password(TEST_BOARD).expect("read password"),
+            TEST_PASSWORD
+        );
+        assert_eq!(
+            store
+                .get_wifi_password(OTHER_BOARD)
+                .expect("read other password"),
+            "OtherBoardPass1"
+        );
         store
             .delete_wifi_password(TEST_BOARD)
             .expect("delete password");
         assert_eq!(
-            store.get_device_key(TEST_BOARD).expect("key untouched"),
-            TEST_KEY
-        );
-        assert_eq!(
             store.get_wifi_password(TEST_BOARD),
             Err(KeystoreError::NotFound)
         );
-        store
-            .store_wifi_password(TEST_BOARD, TEST_PASSWORD)
-            .expect("store password again");
-        store.delete_device_key(TEST_BOARD).expect("delete key");
         assert_eq!(
             store
-                .get_wifi_password(TEST_BOARD)
-                .expect("password untouched"),
+                .get_wifi_password(OTHER_BOARD)
+                .expect("other password untouched"),
+            "OtherBoardPass1"
+        );
+    }
+
+    #[test]
+    fn board_id_lookup_is_case_insensitive() {
+        let store = test_store();
+        store
+            .store_wifi_password("aa:bb:cc:dd:ee:ff", TEST_PASSWORD)
+            .expect("store lowercase");
+        assert_eq!(
+            store
+                .get_wifi_password("AA:BB:CC:DD:EE:FF")
+                .expect("read uppercase"),
             TEST_PASSWORD
+        );
+        store
+            .delete_wifi_password("Aa:Bb:Cc:Dd:Ee:Ff")
+            .expect("delete mixed case");
+        assert_eq!(
+            store.get_wifi_password(TEST_BOARD),
+            Err(KeystoreError::NotFound)
         );
     }
 
     #[test]
     fn delete_of_missing_entry_is_not_found() {
         let store = test_store();
-        assert_eq!(
-            store.delete_device_key(TEST_BOARD),
-            Err(KeystoreError::NotFound)
-        );
         assert_eq!(
             store.delete_wifi_password(TEST_BOARD),
             Err(KeystoreError::NotFound)
@@ -924,25 +646,21 @@ mod tests {
         let store = test_store();
         for bad in ["", "   ", "AA BB CC", "AA/BB/CC", "AA\x00BB"] {
             assert!(
-                store.store_device_key(bad, &TEST_KEY).is_err(),
-                "board id {bad:?} must be rejected"
-            );
-            assert!(
-                store.get_device_key(bad).is_err(),
-                "board id {bad:?} must be rejected"
-            );
-            assert!(
                 store.store_wifi_password(bad, TEST_PASSWORD).is_err(),
                 "board id {bad:?} must be rejected"
             );
             assert!(
-                KeyStore::device_key_account(bad).is_err(),
+                store.get_wifi_password(bad).is_err(),
+                "board id {bad:?} must be rejected"
+            );
+            assert!(
+                KeyStore::wifi_password_account(bad).is_err(),
                 "board id {bad:?} must be rejected"
             );
         }
         // 65 characters is over the 64-character limit.
         let too_long = "A".repeat(65);
-        assert!(store.store_device_key(&too_long, &TEST_KEY).is_err());
+        assert!(store.store_wifi_password(&too_long, TEST_PASSWORD).is_err());
     }
 
     #[test]
@@ -966,35 +684,11 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_stored_key_blob_is_rejected_without_leaking_it() {
+    fn corrupt_stored_password_blob_is_rejected_without_leaking_it() {
         let backend = Arc::new(InMemoryBackend::new());
         let store = KeyStore {
             backend: Arc::clone(&backend) as Arc<dyn SecretBackend>,
         };
-        // Inject blobs exactly as a corrupt platform entry would hold them.
-        backend
-            .set_secret(KEYSTORE_SERVICE, "board:AA:BB:CC:DD:EE:FF", b"tooshort")
-            .expect("inject short blob");
-        let error = store
-            .get_device_key(TEST_BOARD)
-            .expect_err("short blob must be rejected");
-        assert!(matches!(error, KeystoreError::Other(_)));
-        assert!(
-            !error.to_string().contains("tooshort"),
-            "error must not echo the stored blob: {error}"
-        );
-
-        let mut non_hex = [b'0'; DEVICE_KEY_HEX_LEN];
-        non_hex[0] = b'g';
-        backend
-            .set_secret(KEYSTORE_SERVICE, "board:AA:BB:CC:DD:EE:FF", &non_hex)
-            .expect("inject non-hex blob");
-        let error = store
-            .get_device_key(TEST_BOARD)
-            .expect_err("non-hex blob must be rejected");
-        assert!(matches!(error, KeystoreError::Other(_)));
-        assert!(!error.to_string().contains('g'));
-
         // A stored blob of invalid UTF-8 is rejected for the password path.
         backend
             .set_secret(
@@ -1013,23 +707,18 @@ mod tests {
     fn no_secret_material_in_debug_or_error_output() {
         let store = test_store();
         store
-            .store_device_key(TEST_BOARD, &TEST_KEY)
-            .expect("store key");
-        store
             .store_wifi_password(TEST_BOARD, TEST_PASSWORD)
             .expect("store password");
         let debug = format!("{store:?}");
-        assert!(
-            !debug.contains(TEST_KEY_HEX),
-            "Debug leaked the key: {debug}"
-        );
         assert!(
             !debug.contains(TEST_PASSWORD),
             "Debug leaked the password: {debug}"
         );
         assert!(!debug.contains(TEST_BOARD), "Debug leaked the board id");
 
-        let error = store.get_device_key(OTHER_BOARD).expect_err("missing key");
+        let error = store
+            .get_wifi_password(OTHER_BOARD)
+            .expect_err("missing password");
         assert_eq!(error.to_string(), "no credential stored for this board");
         let other = KeystoreError::Other("something failed".to_owned());
         assert_eq!(format!("{other:?}"), r#"Other("something failed")"#);
@@ -1066,18 +755,6 @@ mod tests {
             "no platform store is expected on this Linux sandbox"
         );
         let store = KeyStore::new();
-        assert_eq!(
-            store.store_device_key(TEST_BOARD, &TEST_KEY),
-            Err(KeystoreError::PlatformUnavailable)
-        );
-        assert_eq!(
-            store.get_device_key(TEST_BOARD),
-            Err(KeystoreError::PlatformUnavailable)
-        );
-        assert_eq!(
-            store.delete_device_key(TEST_BOARD),
-            Err(KeystoreError::PlatformUnavailable)
-        );
         assert_eq!(
             store.store_wifi_password(TEST_BOARD, TEST_PASSWORD),
             Err(KeystoreError::PlatformUnavailable)
@@ -1117,13 +794,6 @@ mod tests {
         // A MAC that cannot be a real board (locally-administered DE:AD).
         let board = "DE:AD:BE:EF:00:01";
         store
-            .store_device_key(board, &TEST_KEY)
-            .expect("store key on Windows");
-        assert_eq!(
-            store.get_device_key(board).expect("read key on Windows"),
-            TEST_KEY
-        );
-        store
             .store_wifi_password(board, TEST_PASSWORD)
             .expect("store password on Windows");
         assert_eq!(
@@ -1132,9 +802,7 @@ mod tests {
                 .expect("read password on Windows"),
             TEST_PASSWORD
         );
-        store.delete_device_key(board).expect("delete key");
         store.delete_wifi_password(board).expect("delete password");
-        assert_eq!(store.get_device_key(board), Err(KeystoreError::NotFound));
         assert_eq!(store.get_wifi_password(board), Err(KeystoreError::NotFound));
     }
 }

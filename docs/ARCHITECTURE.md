@@ -1,19 +1,20 @@
 # RSH v2.0 — Architecture
 
 **Status:** v2.0 (Tauri 2 + React is gone) · **App:** Rust + Slint ·
-**Firmware:** C++ v4.0.2 · **Protocol:** v2.1 (FROZEN)
+**Firmware:** C++ v4.0.3 · **Protocol:** v2.2 (FROZEN)
 
 This document describes the v2.0 architecture. Sources: the v2.0
 redesign plans (target architecture and Connection Manager) and
 [UI-DESIGN.md](UI-DESIGN.md) (the approved UI design). Nothing in this
-document invents a component that is not in those plans.
+document invents a component that is not in those plans. The wire
+rules it stands on are [PROTOCOL-V2.2.md](PROTOCOL-V2.2.md).
 
 ## 1. Overview
 
 ```
 rsh-daemon  (Rust, always running, no web engine)
   ├─ Connection Manager   (state machine, §4)
-  ├─ Pairing Manager      (USB-first, pair button, rejoin helper)
+  ├─ Wi-Fi connect + password (Settings password, rejoin helper)
   ├─ Engine + Output      (200 Hz, on its own dedicated thread)
   ├─ Profile / Settings / Notifications store
   ├─ Tray icon + tray popup trigger
@@ -46,7 +47,7 @@ The daemon owns:
 | Part | What it does |
 |---|---|
 | **Connection Manager** | The state machine to the board (§4). Only it decides whether the wheel is connected. |
-| **Pairing Manager** | USB-first pairing, the pair-button window, the Wi-Fi password (shown once), and the rejoin helper that joins the PC to the `RSH` network after pairing. |
+| **Wi-Fi connect + password** | Wi-Fi join (open AP first, WPA2 once a password is set), the Settings Wi-Fi password (set/clear, current-password rule), and the rejoin helper that joins the PC to the `RSH-XXXX` network. No pairing, no device key, no window. |
 | **Engine + Output** | The 200 Hz input pipeline and the game output (HIDMaestro / vJoy). The engine runs on **its own dedicated thread** (see §5) — never on the UI thread, never sharing a runtime with the network code. |
 | **Profile / Settings / Notifications store** | Profiles (with the draft/save model), settings, and the `NotificationCenter` (persistent notification store behind the bell badge and toasts). |
 | **Tray icon + tray popup trigger** | The tray icon exists on **every** launch (the v1.x bug was that it only existed on `--tray` autostart launches). Left-click opens the tray popup; right-click opens the tray menu. |
@@ -76,7 +77,7 @@ The UI and the daemon talk over a **local IPC channel**:
 Two message directions travel over the same channel:
 
 - **Commands (request/response):** the UI asks the daemon to do
-  something (pair, save a profile, set a tuning value, launch a game)
+  something (connect, save a profile, set a tuning value, launch a game)
   and gets a reply. Commands are typed, not strings.
 - **Events (push):** the daemon pushes state changes to the UI as they
   happen (connection state, live snapshot, job progress, notifications).
@@ -114,23 +115,26 @@ The UI status card, the banners, and the setup wizard gating all read
 from it — nothing else decides "connected".
 
 ```
-Idle ─connect→ LinkUp ─HELLO→ Hello ─pair/resume→ Authenticating ─GET_CAPS ok→ Active
-  ▲              │ (no HELLO)    │ (window closed / bad tag / no key)   │
+Idle ─connect→ LinkUp ─HELLO→ Hello ─GET_CAPS ok→ Active
+  ▲              │ (no HELLO)    │ (error)              │
   │              └─────────► Error(reason, hint, retry_at) ◄────────────┘
   └──────────────  Backoff(2s→30s)  ◄── Active ─(no frames 2 s / transport lost)
 ```
 
-Rules (LOGIC-FIX-PLAN §4.1):
+Rules (PROTOCOL-V2.2.md §6):
 
-- **`Active` only after a signed `GET_CAPS` passes.** The label
+- **`Active` only after an unsigned `GET_CAPS` passes.** The label
   "Connected" is shown only in the `Active` state. The setup wizard's
   Step 1 (board connect) unlocks Next when the board is reachable
-  (state `Hello` or better); pairing itself is Step 3.
+  (state `Hello` or better — the `board_reachable` latch, set on every
+  HELLO observed); it never waits for `Active` or for any pairing
+  step. There is no `Authenticating` state and no pairing step at all.
 - **Re-activation loop.** A failed activation is not a one-shot: the
   manager reports `Error(reason)` and retries with backoff (2 s →
-  30 s). For reasons that need a user action (`NoStoredKey`,
-  `WindowClosed`), auto-retry stops and the UI shows a "Pairing
-  needed" banner instead of retrying forever.
+  30 s). Nothing latches on a pairing reason anymore — every remaining
+  failure retries with backoff (except `AddrInUse` and the watchdog
+  latch), and the UI shows a connect banner with a hint instead of
+  retrying forever in silence.
 - **Heartbeat watchdog.** In `Active`, if no stream/status frame
   arrives for **2 seconds**, the transport is rebuilt and the session
   re-activated (covers wheel reboot, AP restart, Wi-Fi drop). UDP has
@@ -138,10 +142,10 @@ Rules (LOGIC-FIX-PLAN §4.1):
 - **HELLO wait is longer than the firmware reply limiter** (700–800 ms,
   3 attempts), so a HELLO reply is not lost to the board's 250 ms
   rate limit.
-- **Resume after a restart:** if a resume fails with `BAD_TAG` (the
-  board rejects a new session for 10 s after an authenticated one),
-  the manager retries once after 10 s and tells the user the wheel
-  is busy — it does not fail silently.
+- **Resume after a restart:** a retried control frame keeps its
+  **reqId** — the board answers from its last-32 duplicate cache and
+  never executes twice (PROTOCOL-V2.2.md §2.3). There is no
+  `BAD_TAG` / 10 s authenticated-session rejection anymore.
 - **Typed bind errors.** A UDP bind failure is a typed reason
   (`AddrInUse`, `PermissionDenied`, `NoInterface`) with a UI hint,
   not a swallowed `.ok()`.
@@ -152,8 +156,8 @@ Rules (LOGIC-FIX-PLAN §4.1):
 
 **Acceptance:** wheel reboot, AP restart, Wi-Fi off/on, USB
 unplug/replug, app restart — in every case the UI shows the correct
-state within 5 seconds and (if paired) returns to `Active` on its
-own. There is no state that reads "Connected" while no data flows.
+state within 5 seconds and returns to `Active` on its own. There is
+no state that reads "Connected" while no data flows.
 
 ## 5. Threads — blocking work never touches the UI
 
@@ -161,7 +165,7 @@ own. There is no state that reads "Connected" while no data flows.
   thread/runtime. In v1.x the forwarder/activator and the engine
   shared one `current_thread` runtime; in v2.0 they do not.
   Network/IO runs on a separate runtime.
-- **Blocking work is an async job, never a UI block.** Pairing,
+- **Blocking work is an async job, never a UI block.** Wi-Fi join,
   firmware upload, config push, wheel restart — all run as jobs with
   progress events (`Job{id, state, progress, error}`). No
   long-running call ever blocks the UI thread (in v1.x, 63 of 64
@@ -181,25 +185,28 @@ own. There is no state that reads "Connected" while no data flows.
   the output.
 - **Not a home-network device.** The board is a Wi-Fi access point
   only — it never joins a home network. The daemon talks to the
-  board's own `RSH` network (Wi-Fi) or to USB-serial. See
-  [README](../README.md#pairing).
-- **Not a protocol change.** Protocol v2.1 is frozen. The daemon/UI
-  split, the IPC channel, and the firmware v4.0.2 features are all
-  above or beside the wire protocol — no wire message changed.
+  board's own `RSH-XXXX` network (Wi-Fi) or to USB-serial. See
+  [README](../README.md#connecting).
+- **Not a protocol change — in v2.0.** Protocol v2.2 is frozen. The
+  daemon/UI split, the IPC channel, and the firmware v4.0.3 features
+  are all above or beside the wire protocol — no wire message changed
+  *for the split*. The v2.0.6 redesign **did** change the wire
+  (pairing and HMAC removed, protocol v2.1 → v2.2) — see
+  [PROTOCOL-V2.2.md](PROTOCOL-V2.2.md) §0 for what changed and why.
 
 ## 7. Component map (plans only)
 
 | Plan component | Lives in | Notes |
 |---|---|---|
 | Connection Manager (L1) | `rsh-daemon` | §4 |
-| Pairing Manager (L2) | `rsh-daemon` | USB-first; 3 s pair button, 120 s window; rejoin helper; password shown once |
+| Wi-Fi connect + password (L2) | `rsh-daemon` | Settings password; rejoin helper; no pairing, no window |
 | Engine + Output | `rsh-daemon`, own thread | 200 Hz; HIDMaestro / vJoy; lazy UAC start |
 | Profile / Settings / Notifications store | `rsh-daemon` | Draft/save model; `NotificationCenter` |
 | Tray icon + popup trigger | `rsh-daemon` | Every launch; Slint `SystemTrayIcon` |
 | Local API server | `rsh-daemon` | Named pipe / local socket, JSON lines, versioned |
 | `AppApi` trait + `AppEvent` enum | Shared boundary | Typed commands + push events |
 | Slint UI (`rsh-ui`) | `rsh-ui` | Overview / Wheel / Settings / Setup / tray popup; only when opened |
-| Firmware v4.0.2 | ESP32 board | Pair button (F-02), AP lock (F-01), persistent LED (F-14), handbrake button mode (F-15), shifter sensitivity (D-4), horn test (D-5); protocol v2.1 frozen |
+| Firmware v4.0.3 | ESP32 board | Open AP until a password is set, BOOT-hold KEY_RESET (10 s), horn test; protocol v2.2 frozen |
 | `rsh-app-core` | Shared library | Stays UI-agnostic; `AppApi` sits above it |
 
 Reusable crates from v1.x (unchanged in role): `rsh-protocol`,

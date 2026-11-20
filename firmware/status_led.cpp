@@ -39,12 +39,6 @@ void led_update(uint32_t nowMs) {
     case LedState::SafeMode:                 // 1 Hz: 500 ms on / 500 ms off (§4.4)
       led_write((nowMs / 500) % 2 == 0);
       break;
-    case LedState::KeyResetArmed:            // 4 Hz: 125 ms on / 125 ms off (§4.4)
-      led_write((nowMs / 125) % 2 == 0);
-      break;
-    case LedState::PairWindow:               // F-02: 3 Hz blink (pairing window)
-      led_write((nowMs / 166) % 2 == 0);
-      break;
     case LedState::ErrorCode:                // F-10: N blinks + 1 s pause
       led_write(rsh_error_blink_on(errorBlinks, nowMs) != 0);
       break;

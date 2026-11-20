@@ -344,7 +344,7 @@ fn get_index_page(host: IpAddr, port: u16, password: &str) -> Result<String, Str
     let response = read_response(&mut reader)?;
     if response.status == 401 {
         return Err(
-            "update server rejected the Wi-Fi password (HTTP 401) — re-pair the board and retry"
+            "update server rejected the Wi-Fi password (HTTP 401) — set the Wi-Fi password in Settings and retry"
                 .to_string(),
         );
     }
@@ -1021,7 +1021,7 @@ mod tests {
         assert!(result.is_err());
         let error = result.expect_err("upload must fail on 401");
         assert!(error.contains("401"), "{error}");
-        assert!(error.contains("re-pair"), "{error}");
+        assert!(error.contains("set the Wi-Fi password"), "{error}");
     }
 
     #[test]

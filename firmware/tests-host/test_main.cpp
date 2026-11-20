@@ -8,7 +8,7 @@
 #include "inputs.h"
 #include "safemode.h"     // FW-3: boot counter + BOOT-hold + safe mode
 #include "net_logic.h"    // FW-7: channel score/pick, pc_active, TxStats
-#include "ctrl.h"        // FW-8: HMAC control dispatcher (dispatch tests §19)
+#include "ctrl.h"        // FW-8: plain control dispatcher (dispatch tests §19)
 #include "ota_validate.h" // FW-9: OTA magic/version/size + auth gate
 #include "heap_policy.h"  // FW-10: largest-block + 5-min drop restart policy
 #include "modules.h"      // FW-11: handbrake/shifter/horn, GET_CAPS, on/off
@@ -25,11 +25,10 @@
 #include "ctrl_handlers.h"   // FW-3/FW-4 dispatcher wiring (follow-up §21)
 #include "password.h"        // SET_PASSWORD 0x0C validation (§5.2, Phase E WS5)
 #include "pw_obfuscate.h"    // NVS password obfuscation (SEC-E-01, Phase F W1)
-#include "stream_emit.h"     // v2.1 stream emission (§1.1, Phase E WS5)
+#include "stream_emit.h"     // v2.2 stream emission (§1.1, Phase E WS5)
 #include "serial_transport.h" // wired USB-serial framing (§10, Phase G WS1)
 #include "as5600.h"          // Phase G WS4: AS5600 magnetic encoder (D34)
-#include "version.h"         // F-12 (v4.0.2): single version source
-#include "pairing_window.h"  // F-02/F-03: transport-independent pair window
+#include "version.h"         // F-12 (v4.0.3): single version source
 #include "diag_log.h"        // F-10: diagnostics ring log + GET_DIAG body
 #include "webota_auth.h"     // F-08: WebOTA per-IP auth lockout
 #include "horn_test.h"       // D-5: HORN_TEST synthetic pulse
@@ -54,9 +53,10 @@ static uint16_t crc_table_impl(const uint8_t *d, size_t n) {
   return crc;
 }
 
-// ---- Independent SHA-256 (test-only, FIPS 180-4) + HMAC-SHA256 -------------
-// protocol.h mein crypto NAHI hai: firmware mbedTLS deta hai, host test ye
-// independent implementation deta hai (rsh_hmac16_fn callback ke tor par).
+// ---- Independent SHA-256 (test-only, FIPS 180-4) ---------------------------
+// pw_obfuscate.h ka test callback (§24) is implementation ko istemal karta
+// hai. Control frames v2.2 mein HMAC NAHI hai (plain + CRC16), is liye
+// koi test HMAC helper nahi — rsh_hmac16_fn / test_hmac16 delete hue.
 #define ROTR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 static const uint32_t sha_k[64] = {
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -107,34 +107,6 @@ static void sha256_once(const uint8_t *d, size_t n, uint8_t out[32]) {
     out[4 * i + 2] = (uint8_t)(h[i] >> 8); out[4 * i + 3] = (uint8_t)h[i];
   }
 }
-// tag = HMAC-SHA256(key32, nonce16 || counter_LE || cmd || payload)[0:16] (§3.2)
-static void test_hmac16(const uint8_t *key32, const uint8_t *nonce16, uint32_t counter,
-                        uint8_t cmd, const uint8_t *payload, uint16_t payload_len,
-                        uint8_t tag_out[16]) {
-  size_t msg_len = 16 + 4 + 1 + payload_len;
-  uint8_t *msg = (uint8_t *)malloc(msg_len);
-  memcpy(msg, nonce16, 16);
-  msg[16] = (uint8_t)counter; msg[17] = (uint8_t)(counter >> 8);
-  msg[18] = (uint8_t)(counter >> 16); msg[19] = (uint8_t)(counter >> 24);
-  msg[20] = cmd;
-  if (payload_len) memcpy(msg + 21, payload, payload_len);
-  uint8_t kipad[64], kopad[64];
-  for (int i = 0; i < 64; i++) {
-    uint8_t k = i < 32 ? key32[i] : 0;
-    kipad[i] = (uint8_t)(k ^ 0x36); kopad[i] = (uint8_t)(k ^ 0x5c);
-  }
-  uint8_t *inner = (uint8_t *)malloc(64 + msg_len);
-  memcpy(inner, kipad, 64); memcpy(inner + 64, msg, msg_len);
-  uint8_t inner_hash[32];
-  sha256_once(inner, 64 + msg_len, inner_hash);
-  uint8_t *outer = (uint8_t *)malloc(64 + 32);
-  memcpy(outer, kopad, 64); memcpy(outer + 64, inner_hash, 32);
-  uint8_t full[32];
-  sha256_once(outer, 64 + 32, full);
-  memcpy(tag_out, full, 16);
-  free(msg); free(inner); free(outer);
-}
-
 // pw_obfuscate.h callback (SEC-E-01, §24): test SHA-256 ko int-returning
 // wrapper mein lapeto. Failing variant bhi hai (fail-closed check).
 static int test_sha256_cb(const uint8_t *d, size_t n, uint8_t out[32]) {
@@ -151,8 +123,9 @@ static uint32_t rng() { rng_state = rng_state * 1664525u + 1013904223u; return r
 
 // FW-8 dispatcher test handler (ctrl.h, §19): GET_CAPS -> golden minimal
 // body (17 B, pinCount 0 — protocol_v2_vectors.py ctrl_get_caps_reply
-// payload se); GET_CFG -> 200 B body (cache-overflow path); REBOOT ->
-// reboot flag; baqi -> UNSUPPORTED (execute nahi hota).
+// payload se, fw 4.0.3 / proto 2.2); GET_CFG -> 200 B body
+// (cache-overflow path); REBOOT -> reboot flag; baqi -> UNSUPPORTED
+// (execute nahi hota).
 struct test_ctrl_ctx_t {
   int exec_caps;
   int exec_big;
@@ -166,7 +139,7 @@ static uint8_t test_ctrl_handler(uint8_t cmd, const uint8_t *payload, uint16_t l
   if (cmd == 0x01) {  // GET_CAPS
     c->exec_caps++;
     static const uint8_t golden_body[17] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
-      0x04, 0x00, 0x00, 0x02, 0x01, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00};
+      0x04, 0x00, 0x03, 0x02, 0x02, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00};
     memcpy(reply_body, golden_body, 17);
     *reply_body_len = 17;
     return RSH_CTRL_OK;
@@ -200,15 +173,12 @@ static void rec_sink(void *ctx, const uint8_t *data, size_t len) {
   rec_len += len;
 }
 
-// §21 fakes (FW-3/FW-4 dispatcher wiring): armed flag, fake clock (millis),
-// NVS-persist spy (calls + aakhri pending value), KEY_RESET-request spy.
-static uint8_t fw34_test_armed = 0;
+// §21 fakes (FW-3/FW-4 dispatcher wiring): fake clock (millis),
+// NVS-persist spy (calls + aakhri pending value). KEY_RESET khatam
+// (v2.2, D7) — armed flag / key-reset-request spy delete hue.
 static uint32_t fw34_test_now = 1000;
 static int fw34_test_persist_calls = 0;
 static uint8_t fw34_test_persist_last_pending = 0;
-static int fw34_test_keyreset_calls = 0;
-static uint8_t fw34_test_armed_cb(void *u) { (void)u; return fw34_test_armed; }
-static void fw34_test_keyreset_cb(void *u) { (void)u; fw34_test_keyreset_calls++; }
 static void fw34_test_persist_cb(void *u, uint8_t pending) {
   (void)u;
   fw34_test_persist_calls++;
@@ -223,6 +193,15 @@ static void fw34_test_password_cb(void *u, const uint8_t *pw, uint16_t len) {
   fw34_test_password_calls++;
   fw34_test_password_len = len;
   if (pw && len <= 64) memcpy(fw34_test_password, pw, len);
+}
+// SET_PASSWORD verify fake (D3): NULL = koi password stored nahi -> proceed;
+// warna current password stored se milna chahiye.
+static const char *fw34_test_stored_pw = NULL;
+static uint8_t fw34_test_pw_verify_cb(void *u, const uint8_t *pw, uint16_t len) {
+  (void)u;
+  if (!fw34_test_stored_pw) return 1;
+  size_t sl = strlen(fw34_test_stored_pw);
+  return len == sl && memcmp(pw, fw34_test_stored_pw, sl) == 0;
 }
 // Phase F WS5: LED_TEST callback probe (ctrl_handlers.h led_test_request).
 static int fw34_test_led_calls = 0;
@@ -548,15 +527,11 @@ int main() {
       CHECK(rsh_crc16_ccitt(buf, n) == crc_table_impl(buf, n));
     }
 
-    uint8_t test_key[32], test_nonce[16], wrong_key[32];
-    for (int i = 0; i < 32; i++) { test_key[i] = (uint8_t)i; wrong_key[i] = 0xFF; }
-    for (int i = 0; i < 16; i++) test_nonce[i] = (uint8_t)(0xA0 + i);
-
-    // --- T1: stream v2.1 golden ---
-    const uint8_t data_v2[36] = {0x52, 0x53, 0x48, 0x32, 0x21, 0x01, 0x34, 0x12,
+    // --- T1: stream v2.2 golden (protocol_v2_vectors.py data_v2_2 se) ---
+    const uint8_t data_v2[36] = {0x52, 0x53, 0x48, 0x32, 0x22, 0x01, 0x34, 0x12,
       0x04, 0x03, 0x02, 0x01, 0x1f, 0x02, 0x05, 0x02, 0x00, 0x00, 0x00, 0x00,
       0xfc, 0x08, 0xe8, 0x03, 0xd0, 0x07, 0x00, 0x00, 0x00, 0x02, 0xe8, 0x03,
-      0x06, 0xff, 0x69, 0xd1};
+      0x06, 0xff, 0x48, 0xca};
     rsh_v2_stream_t st;
     CHECK(rsh_v2_parse_stream(data_v2, sizeof(data_v2), &st) == RSH_V2_OK);
     CHECK(st.seq == 0x1234 && st.timestamp_us == 0x01020304u);
@@ -576,14 +551,14 @@ int main() {
     }
 
     // --- T1: status golden base 34 B / extended 38 B ---
-    const uint8_t status_base[34] = {0xa6, 0x21, 0x07, 0x00, 0x40, 0xe2, 0x01, 0x00,
+    const uint8_t status_base[34] = {0xa6, 0x22, 0x07, 0x00, 0x40, 0xe2, 0x01, 0x00,
       0xcc, 0x56, 0xac, 0x0f, 0x78, 0xda, 0x02, 0x00, 0x03, 0x00, 0x5c, 0x08,
       0x00, 0x01, 0xef, 0xbe, 0xad, 0xde, 0x05, 0x00, 0x02, 0x00, 0x01, 0x00,
-      0x97, 0x00};
-    const uint8_t status_ext[38] = {0xa6, 0x21, 0x08, 0x00, 0x41, 0xe2, 0x01, 0x00,
+      0xcd, 0x82};
+    const uint8_t status_ext[38] = {0xa6, 0x22, 0x08, 0x00, 0x41, 0xe2, 0x01, 0x00,
       0xce, 0x56, 0xaa, 0x0f, 0x78, 0xda, 0x02, 0x00, 0x03, 0x00, 0x5c, 0x08,
       0x00, 0x01, 0xef, 0xbe, 0xad, 0xde, 0x05, 0x00, 0x20, 0x00, 0x00, 0x00,
-      0x02, 0x00, 0x01, 0x00, 0xe1, 0x1e};
+      0x02, 0x00, 0x01, 0x00, 0xbe, 0xb7};
     rsh_v2_status_t ss;
     CHECK(rsh_v2_parse_status(status_base, sizeof(status_base), &ss) == RSH_V2_OK);
     CHECK(ss.has_btns_ex == 0 && ss.seq == 7 && ss.uptime_ms == 123456u);
@@ -610,69 +585,105 @@ int main() {
       CHECK(rsh_v2_build_status(built, &s2) == 38 && memcmp(built, status_ext, 38) == 0);
     }
 
-    // --- T1: HELLO reply golden (92 B) ---
-    const uint8_t hello_unpaired[92] = {0x52, 0x53, 0x48, 0x52, 0x02, 0x01, 0x09, 0x01,
-      0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x00, 0x00, 0xa0, 0xa1,
-      0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad,
-      0xae, 0xaf, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
-      0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
-      0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x41, 0x62,
-      0x33, 0x64, 0x45, 0x66, 0x36, 0x68, 0x4a, 0x6b, 0x39, 0x6d, 0x4e, 0x70,
-      0x32, 0x72, 0x53, 0x74, 0x35, 0x76, 0x57, 0x78, 0x38, 0x59, 0x5a, 0x42};
+    // --- T1: HELLO reply golden v2.2 (92 B, protocol_v2_vectors.py se) ---
+    // Secret fields (nonce/device_key/wifi_password) HAMESHA zero hain;
+    // flags mein sirf bit2 safe_mode bachta hai.
+    const uint8_t hello_safe[92] = {0x52, 0x53, 0x48, 0x52, 0x02, 0x02, 0x04, 0x01,
+      0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa4, 0xaf};
+    const uint8_t hello_plain[92] = {0x52, 0x53, 0x48, 0x52, 0x02, 0x02, 0x00, 0x00,
+      0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x03, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xba, 0xf6};
     rsh_v2_hello_t hello;
-    CHECK(rsh_v2_parse_hello(hello_unpaired, sizeof(hello_unpaired), &hello) == RSH_V2_OK);
-    CHECK((hello.flags & RSH_V2_HELLO_UNPAIRED) != 0);
-    CHECK((hello.flags & RSH_V2_HELLO_WINDOW_OPEN) != 0);
-    CHECK(hello.session_echo == 1 && hello.fw_major == 4 && hello.fw_minor == 0);
+    CHECK(rsh_v2_parse_hello(hello_safe, sizeof(hello_safe), &hello) == RSH_V2_OK);
+    CHECK((hello.flags & RSH_V2_HELLO_SAFE_MODE) != 0);
+    CHECK(hello.flags == RSH_V2_HELLO_SAFE_MODE);
+    CHECK(hello.session_echo == 1 && hello.fw_major == 4 && hello.fw_minor == 0 &&
+          hello.fw_patch == 3);
     CHECK(memcmp(hello.board_mac, "\xaa\xbb\xcc\xdd\xee\xff", 6) == 0);
-    CHECK(memcmp(hello.nonce, test_nonce, 16) == 0);
-    CHECK(memcmp(hello.device_key, test_key, 32) == 0);
-    CHECK(memcmp(hello.wifi_password, "Ab3dEf6hJk9mNp2rSt5vWx8Y", 24) == 0);
-    // paired: key/password zero (header + nonce golden jaisa, baaqi zero, CRC 0x4524)
     {
-      uint8_t paired[92];
-      memcpy(paired, hello_unpaired, 92);
-      paired[6] = 0x00; paired[7] = 0x00;
-      memset(paired + 34, 0, 56);
-      paired[90] = 0x24; paired[91] = 0x45;
-      CHECK(rsh_v2_parse_hello(paired, 92, &hello) == RSH_V2_OK);
-      CHECK(hello.flags == 0);
-      uint8_t zeros[56] = {0};
+      uint8_t zeros[72] = {0};
+      CHECK(memcmp(hello.nonce, zeros, 16) == 0);
       CHECK(memcmp(hello.device_key, zeros, 32) == 0);
       CHECK(memcmp(hello.wifi_password, zeros, 24) == 0);
     }
+    CHECK(rsh_v2_parse_hello(hello_plain, sizeof(hello_plain), &hello) == RSH_V2_OK);
+    CHECK(hello.flags == 0 && hello.session_echo == 0);
+    // builder: secret params khatam — builder khud zero likhta hai
+    {
+      uint8_t mac[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+      uint8_t built[92];
+      size_t blen = rsh_v2_build_hello(built, 0x04, 1, mac, 4, 0, 3);
+      CHECK(blen == 92 && memcmp(built, hello_safe, 92) == 0);
+      blen = rsh_v2_build_hello(built, 0x00, 0, mac, 4, 0, 3);
+      CHECK(blen == 92 && memcmp(built, hello_plain, 92) == 0);
+      CHECK(rsh_v2_build_hello(NULL, 0, 0, mac, 4, 0, 3) == 0);
+      CHECK(rsh_v2_build_hello(built, 0, 0, NULL, 4, 0, 3) == 0);
+    }
+    // reserved rejection: flags bit0 set (CRC dobara lagao taake sirf flags fail ho)
+    {
+      uint8_t bad[92];
+      memcpy(bad, hello_plain, 92);
+      bad[6] = 0x01;
+      rsh_put_u16(bad + 90, rsh_crc16_ccitt(bad, 90));
+      CHECK(rsh_v2_parse_hello(bad, 92, &hello) == RSH_V2_RSV_NONZERO);
+      memcpy(bad, hello_plain, 92);
+      bad[20] = 0x01;  // nonce field mein nonzero byte
+      rsh_put_u16(bad + 90, rsh_crc16_ccitt(bad, 90));
+      CHECK(rsh_v2_parse_hello(bad, 92, &hello) == RSH_V2_RSV_NONZERO);
+      memcpy(bad, hello_plain, 92);
+      bad[40] = 0x01;  // device_key field mein nonzero byte
+      rsh_put_u16(bad + 90, rsh_crc16_ccitt(bad, 90));
+      CHECK(rsh_v2_parse_hello(bad, 92, &hello) == RSH_V2_RSV_NONZERO);
+    }
 
-    // --- T1: control golden ---
-    const uint8_t ctrl_caps[29] = {0x52, 0x53, 0x48, 0x43, 0x01, 0x01, 0x00, 0x00,
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0xee, 0x8d, 0x10, 0x07, 0x93, 0x58,
-      0xd9, 0x93, 0x6f, 0xe7, 0x43, 0x68, 0xf8, 0xb6, 0x61};
-    const uint8_t ctrl_setcfg[53] = {0x52, 0x53, 0x48, 0x43, 0x03, 0x02, 0x00, 0x01,
-      0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x40, 0x00, 0x10, 0x00, 0xeb,
-      0x52, 0x52, 0x53, 0x48, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x5e, 0x0c, 0x65, 0x66, 0xc9, 0xdd, 0x5e,
-      0x79, 0x1b, 0xe0, 0xae, 0x3e, 0x77, 0x66, 0x2d, 0x4c};
-    const uint8_t ctrl_reply[47] = {0x52, 0x53, 0x48, 0x43, 0x81, 0x01, 0x00, 0x00,
-      0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-      0x04, 0x00, 0x00, 0x02, 0x01, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0x04,
-      0xb2, 0x21, 0x24, 0x07, 0x63, 0x4f, 0xfd, 0x85, 0x52, 0xf4, 0x91, 0xba,
-      0x7d, 0xcb, 0xc0};
+    // --- T1: control golden v2.2 (9 B header + CRC16, protocol_v2_vectors.py se) ---
+    const uint8_t ctrl_caps[11] = {0x52, 0x53, 0x48, 0x43, 0x01, 0x01, 0x00, 0x00,
+      0x00, 0x77, 0xe7};
+    const uint8_t ctrl_setcfg[35] = {0x52, 0x53, 0x48, 0x43, 0x03, 0x02, 0x00, 0x18,
+      0x00, 0x00, 0x00, 0x40, 0x00, 0x10, 0x00, 0xeb, 0x52, 0x52, 0x53, 0x48,
+      0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x87, 0x9d};
+    const uint8_t ctrl_reply[29] = {0x52, 0x53, 0x48, 0x43, 0x81, 0x01, 0x00, 0x12,
+      0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x03, 0x02,
+      0x02, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0x6d, 0xc5};
     rsh_v2_ctrl_t cf;
-    CHECK(rsh_v2_ctrl_verify(ctrl_caps, sizeof(ctrl_caps), test_key, test_nonce, test_hmac16, &cf) == RSH_V2_OK);
-    CHECK(cf.cmd == 0x01 && cf.req_id == 1 && cf.counter == 0 && cf.len == 0);
-    CHECK(rsh_v2_ctrl_verify(ctrl_setcfg, sizeof(ctrl_setcfg), test_key, test_nonce, test_hmac16, &cf) == RSH_V2_OK);
-    CHECK(cf.cmd == 0x03 && cf.req_id == 2 && cf.counter == 1 && cf.len == 24);
+    CHECK(rsh_v2_ctrl_parse_structure(ctrl_caps, sizeof(ctrl_caps), &cf) == RSH_V2_OK);
+    CHECK(cf.cmd == 0x01 && cf.req_id == 1 && cf.len == 0);
+    CHECK(rsh_v2_ctrl_parse_structure(ctrl_setcfg, sizeof(ctrl_setcfg), &cf) == RSH_V2_OK);
+    CHECK(cf.cmd == 0x03 && cf.req_id == 2 && cf.len == 24);
     CHECK(rsh_get_u16(cf.payload + 0) == 0 && rsh_get_u16(cf.payload + 2) == 64);
     CHECK(rsh_get_u16(cf.payload + 4) == 16);
     CHECK(memcmp(cf.payload + 8, "RSHG", 4) == 0);
-    CHECK(rsh_v2_ctrl_verify(ctrl_reply, sizeof(ctrl_reply), test_key, test_nonce, test_hmac16, &cf) == RSH_V2_OK);
+    CHECK(rsh_v2_ctrl_parse_structure(ctrl_reply, sizeof(ctrl_reply), &cf) == RSH_V2_OK);
     CHECK(cf.cmd == 0x81 && cf.payload[0] == RSH_CTRL_OK && cf.len == 18);
     CHECK(cf.payload[13] == 64);  // nBtnMax (wire)
+    CHECK(cf.payload[9] == 3);    // fw patch 4.0.3
+    CHECK(cf.payload[10] == 2 && cf.payload[11] == 2);  // proto 2.2
     // build roundtrip golden se match kare
     {
       uint8_t built[64];
-      size_t blen = rsh_v2_ctrl_build(built, sizeof(built), 0x01, 1, 0, NULL, 0,
-                                     test_key, test_nonce, test_hmac16);
+      size_t blen = rsh_v2_ctrl_build(built, sizeof(built), 0x01, 1, NULL, 0);
       CHECK(blen == sizeof(ctrl_caps) && memcmp(built, ctrl_caps, blen) == 0);
+      uint8_t setcfg_pl[24];
+      memcpy(setcfg_pl, ctrl_setcfg + 9, 24);
+      blen = rsh_v2_ctrl_build(built, sizeof(built), 0x03, 2, setcfg_pl, 24);
+      CHECK(blen == sizeof(ctrl_setcfg) && memcmp(built, ctrl_setcfg, blen) == 0);
+      // build guards
+      CHECK(rsh_v2_ctrl_build(NULL, sizeof(built), 0x01, 1, NULL, 0) == 0);
+      CHECK(rsh_v2_ctrl_build(built, 10, 0x01, 1, NULL, 0) == 0);
+      uint8_t big[1025] = {0};
+      CHECK(rsh_v2_ctrl_build(built, sizeof(built), 0x01, 1, big, 1025) == 0);
     }
 
     // --- T2: stream negatives ---
@@ -710,49 +721,54 @@ int main() {
       CHECK(rsh_v2_parse_stream(v1gold, sizeof(v1gold), &st) == RSH_V2_LEGACY_V1);
     }
 
-    // --- T2: control negatives ---
+    // --- T2: control negatives (v2.2: bad CRC / length / magic; koi tag nahi) ---
     {
       uint8_t bad[64];
       memcpy(bad, ctrl_caps, sizeof(ctrl_caps));
-      bad[sizeof(ctrl_caps) - 1] ^= 0xFF;  // bad tag
-      CHECK(rsh_v2_ctrl_verify(bad, sizeof(ctrl_caps), test_key, test_nonce, test_hmac16, &cf) == RSH_V2_BAD_TAG);
-      CHECK(rsh_v2_ctrl_verify(ctrl_caps, sizeof(ctrl_caps), wrong_key, test_nonce, test_hmac16, &cf) == RSH_V2_BAD_TAG);
-      CHECK(rsh_v2_ctrl_verify(ctrl_caps, sizeof(ctrl_caps) - 8, test_key, test_nonce, test_hmac16, &cf) == RSH_V2_BAD_LENGTH);
+      bad[sizeof(ctrl_caps) - 1] ^= 0xFF;  // CRC byte flip
+      CHECK(rsh_v2_ctrl_parse_structure(bad, sizeof(ctrl_caps), &cf) == RSH_V2_BAD_CRC);
+      memcpy(bad, ctrl_caps, sizeof(ctrl_caps));
+      bad[sizeof(ctrl_caps) - 2] ^= 0xFF;  // CRC low byte flip
+      CHECK(rsh_v2_ctrl_parse_structure(bad, sizeof(ctrl_caps), &cf) == RSH_V2_BAD_CRC);
+      CHECK(rsh_v2_ctrl_parse_structure(ctrl_caps, sizeof(ctrl_caps) - 1, &cf) == RSH_V2_BAD_LENGTH);
+      CHECK(rsh_v2_ctrl_parse_structure(ctrl_caps, 8, &cf) == RSH_V2_TOO_SHORT);
       memcpy(bad, ctrl_caps, sizeof(ctrl_caps));
       bad[0] = 'X'; bad[1] = 'X'; bad[2] = 'X'; bad[3] = 'X';
-      CHECK(rsh_v2_ctrl_verify(bad, sizeof(ctrl_caps), test_key, test_nonce, test_hmac16, &cf) == RSH_V2_BAD_MAGIC);
-      // len field 5 kar do (asal 0) → length mismatch
+      CHECK(rsh_v2_ctrl_parse_structure(bad, sizeof(ctrl_caps), &cf) == RSH_V2_BAD_MAGIC);
+      // len field 5 kar do (asal 0), CRC dobara lagao -> length mismatch
       memcpy(bad, ctrl_caps, sizeof(ctrl_caps));
-      bad[11] = 5;
-      CHECK(rsh_v2_ctrl_verify(bad, sizeof(ctrl_caps), test_key, test_nonce, test_hmac16, &cf) == RSH_V2_BAD_LENGTH);
+      bad[7] = 5;
+      rsh_put_u16(bad + sizeof(ctrl_caps) - 2, rsh_crc16_ccitt(bad, sizeof(ctrl_caps) - 2));
+      CHECK(rsh_v2_ctrl_parse_structure(bad, sizeof(ctrl_caps), &cf) == RSH_V2_BAD_LENGTH);
       // oversize payload build mana hai
       uint8_t big[1100] = {0};
       uint8_t out[1200];
-      CHECK(rsh_v2_ctrl_build(out, sizeof(out), 0x01, 1, 0, big, 1025,
-                              test_key, test_nonce, test_hmac16) == 0);
-      // structure parse tag ke baghair bhi reqId/counter deta hai (§3.2 BAD_TAG reply rule)
-      memcpy(bad, ctrl_caps, sizeof(ctrl_caps));
-      bad[sizeof(ctrl_caps) - 1] ^= 0xFF;
-      CHECK(rsh_v2_ctrl_parse_structure(bad, sizeof(ctrl_caps), &cf) == RSH_V2_OK);
-      CHECK(cf.req_id == 1 && cf.counter == 0);
+      CHECK(rsh_v2_ctrl_build(out, sizeof(out), 0x01, 1, big, 1025) == 0);
+      // structure parse sahi frame se reqId deta hai
+      CHECK(rsh_v2_ctrl_parse_structure(ctrl_caps, sizeof(ctrl_caps), &cf) == RSH_V2_OK);
+      CHECK(cf.req_id == 1 && cf.cmd == 0x01);
+      // NULL guards
+      CHECK(rsh_v2_ctrl_parse_structure(NULL, sizeof(ctrl_caps), &cf) == RSH_V2_TOO_SHORT);
+      CHECK(rsh_v2_ctrl_parse_structure(ctrl_caps, sizeof(ctrl_caps), NULL) == RSH_V2_TOO_SHORT);
     }
 
-    // --- T2: replay / duplicate (tag valid, state rule reject karta hai) ---
+    // --- T2: duplicate suppression, reqId-only (D2) — koi REPLAY state nahi ---
     {
-      const uint8_t replay[29] = {0x52, 0x53, 0x48, 0x43, 0x01, 0x63, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0xee, 0x8d, 0x10, 0x07, 0x93, 0x58,
-        0xd9, 0x93, 0x6f, 0xe7, 0x43, 0x68, 0xf8, 0xb6, 0x61};
-      // replay frame cryptographically verify hota hai (reqId HMAC mein nahi)
-      CHECK(rsh_v2_ctrl_verify(replay, sizeof(replay), test_key, test_nonce, test_hmac16, &cf) == RSH_V2_OK);
+      // byte-identical retransmit CRC se guzarta hai (state rule reject karta hai)
+      CHECK(rsh_v2_ctrl_parse_structure(ctrl_caps, sizeof(ctrl_caps), &cf) == RSH_V2_OK);
       rsh_ctrl_session_t sess;
       rsh_ctrl_session_init(&sess);
-      CHECK(rsh_ctrl_session_classify(&sess, 1, 0) == RSH_DEC_ACCEPT);
-      CHECK(rsh_ctrl_session_classify(&sess, 1, 0) == RSH_DEC_DUPLICATE);
-      CHECK(rsh_ctrl_session_classify(&sess, 99, 0) == RSH_DEC_REPLAY);
-      CHECK(rsh_ctrl_session_classify(&sess, 2, 1) == RSH_DEC_ACCEPT);
-      CHECK(rsh_ctrl_session_classify(&sess, 3, 5) == RSH_DEC_ACCEPT);  // gap ok
-      CHECK(rsh_ctrl_session_classify(&sess, 4, 3) == RSH_DEC_REPLAY);
-      CHECK(rsh_ctrl_session_classify(&sess, 3, 5) == RSH_DEC_DUPLICATE);
+      CHECK(rsh_ctrl_session_classify(&sess, 1) == RSH_DEC_ACCEPT);
+      CHECK(rsh_ctrl_session_classify(&sess, 1) == RSH_DEC_DUPLICATE);
+      CHECK(rsh_ctrl_session_classify(&sess, 99) == RSH_DEC_ACCEPT);
+      CHECK(rsh_ctrl_session_classify(&sess, 2) == RSH_DEC_ACCEPT);
+      CHECK(rsh_ctrl_session_classify(&sess, 3) == RSH_DEC_ACCEPT);  // gap ok
+      CHECK(rsh_ctrl_session_classify(&sess, 3) == RSH_DEC_DUPLICATE);
+      CHECK(rsh_ctrl_session_classify(&sess, 4) == RSH_DEC_ACCEPT);
+      // reqId wrap: 65535 ke baad 0 dobara accept (monotonic per session)
+      CHECK(rsh_ctrl_session_classify(&sess, 65535) == RSH_DEC_ACCEPT);
+      CHECK(rsh_ctrl_session_classify(&sess, 65535) == RSH_DEC_DUPLICATE);
+      CHECK(rsh_ctrl_session_classify(&sess, 0) == RSH_DEC_ACCEPT);
     }
 
     // --- T2: button count rule N1 ---
@@ -809,10 +825,10 @@ int main() {
 
     // --- T3: PIN_PROBE frame (§3.8) ---
     {
-      // mode 1, 3 samples mV: RSHP | 21 | seq 3 | pin 21 | mode 1 | count 3 | samples | CRC
+      // mode 1, 3 samples mV: RSHP | 22 | seq 3 | pin 21 | mode 1 | count 3 | samples | CRC
       uint8_t probe[11 + 6 + 2];
       probe[0] = 'R'; probe[1] = 'S'; probe[2] = 'H'; probe[3] = 'P';
-      probe[4] = 0x21;
+      probe[4] = 0x22;
       rsh_put_u16(probe + 5, 3);
       probe[7] = 21; probe[8] = 1;
       rsh_put_u16(probe + 9, 3);
@@ -882,8 +898,8 @@ int main() {
     // RSH_CAPS_FW_* hi net.cpp HELLO reply ka bhi source hai (single source
     // of truth) — 4.0.0 hard-code dobara na aaye, is liye constants + string
     // dono yahan bandhe hain.
-    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 2);
-    CHECK(strcmp(FIRMWARE_VERSION, "4.0.2") == 0);
+    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 3);
+    CHECK(strcmp(FIRMWARE_VERSION, "4.0.3") == 0);
 
     // --- FW-11: default pin table mein naye modules ki rows ---
     RshCapsEntry table[20];
@@ -924,8 +940,8 @@ int main() {
       CHECK(blen == 18 + 8u * ntab);
       CHECK(body[0] == RSH_CTRL_OK);
       CHECK(memcmp(body + 1, mac, 6) == 0);
-      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 2);   // fw 4.0.2 (Round 2 W3 FIX-1)
-      CHECK(body[10] == 2 && body[11] == 1);                 // proto 2.1
+      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 3);   // fw 4.0.3 (Round 2 W3 FIX-1)
+      CHECK(body[10] == 2 && body[11] == 2);                 // proto 2.2
       CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
       CHECK(body[15] == 6 && body[16] == 0 && body[17] == ntab);
       // Handbrake row bytes (pin/kind/module/caps/reserved).
@@ -1230,7 +1246,7 @@ int main() {
     CHECK(rsh_boot_tick(&c, 0, wrap_start + 14999, wrap_start) == RSH_BOOT_WAITING);
     CHECK(rsh_boot_tick(&c, 0, wrap_start + 15000, wrap_start) == RSH_BOOT_FAILED);
 
-    // --- BOOT-hold: < 5 s kuch nahi; 5 s safe mode; 10 s key-reset-armed ---
+    // --- BOOT-hold v2.2 (D7): < 5 s kuch nahi; 5 s safe mode; 10 s password-clear ---
     rsh_boothold_t h;
     rsh_boothold_init(&h);
     CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
@@ -1238,7 +1254,7 @@ int main() {
     CHECK(rsh_boothold_update(&h, 1, 5000) == RSH_HOLD_SAFE_MODE);  // exactly 5 s
     CHECK(rsh_boothold_update(&h, 1, 6000) == RSH_HOLD_NONE);       // ek dafa hi fire
     CHECK(rsh_boothold_update(&h, 1, 9999) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 1, 10000) == RSH_HOLD_KEY_RESET_ARMED);
+    CHECK(rsh_boothold_update(&h, 1, 10000) == RSH_HOLD_KEY_RESET_CLEAR);
     CHECK(rsh_boothold_update(&h, 1, 20000) == RSH_HOLD_NONE);
     CHECK(rsh_boothold_update(&h, 0, 20001) == RSH_HOLD_NONE);      // release = reset
     // Chhota press (bounce / < 5 s) kuch nahi karta; dobara hold naye sire se
@@ -1254,22 +1270,15 @@ int main() {
     CHECK(rsh_boothold_update(&h, 1, 0xFFFFFF00u) == RSH_HOLD_NONE);
     CHECK(rsh_boothold_update(&h, 1, 0xFFFFFF00u + 5000) == RSH_HOLD_SAFE_MODE);
 
-    // --- Safe-mode state: config block + armed window expiry ---
+    // --- Safe-mode state v2.2: config block; koi armed window/expiry nahi (D7) ---
     rsh_safe_mode_t sm;
     rsh_safe_mode_init(&sm);
     CHECK(rsh_safe_mode_blocks_config(&sm) == 0);
-    CHECK(rsh_safe_mode_tick(&sm, 1000) == 0);
-    rsh_safe_mode_enter(&sm, 0, 1000);   // safe mode (5 s hold)
+    rsh_safe_mode_enter(&sm, 1000);   // safe mode (5 s hold)
     CHECK(rsh_safe_mode_blocks_config(&sm) == 1);
-    CHECK(rsh_safe_mode_tick(&sm, 1000000) == 0);  // safe mode ki koi expiry nahi
-    rsh_safe_mode_init(&sm);
-    rsh_safe_mode_enter(&sm, 1, 5000);   // key-reset-armed (10 s hold)
-    CHECK(rsh_safe_mode_blocks_config(&sm) == 1);
-    CHECK(rsh_safe_mode_tick(&sm, 5000 + 119999) == 0);
-    CHECK(rsh_safe_mode_tick(&sm, 5000 + 120000) == 1);  // window khatam -> reboot
+    CHECK(rsh_safe_mode_blocks_config(&sm) == 1);  // safe mode ki koi expiry nahi
     // HELLO flags bit2 safeMode hai (§2.2) — constant composition check
     CHECK(RSH_V2_HELLO_SAFE_MODE == 0x04);
-    CHECK((RSH_V2_HELLO_SAFE_MODE | RSH_V2_HELLO_KEY_RESET) == 0x06);
   }
 
   // 13) FW-4 config transaction (Workstream 1).
@@ -1733,7 +1742,7 @@ int main() {
       CHECK(rsh_cfg_txn_load_current(&t, factory, flen) == RSH_CTRL_OK);
       rsh_safe_mode_t sm;
       rsh_safe_mode_init(&sm);
-      rsh_safe_mode_enter(&sm, 0, 1000);
+      rsh_safe_mode_enter(&sm, 1000);
       rsh_cfg_set_safe_mode(&t, rsh_safe_mode_blocks_config(&sm));
       uint16_t sb = 0, tot = 0;
       CHECK(rsh_cfg_stage_chunk(&t, 0, (uint16_t)flen, (uint16_t)flen,
@@ -1843,28 +1852,24 @@ int main() {
     rsh_boot_begin(&t);
     CHECK(rsh_boot_tick(&t, 0, 15000, 0) == RSH_BOOT_FAILED);
     CHECK(rsh_boot_tick(&t, 0, 20000, 0) == RSH_BOOT_WAITING);  // darj ho chuka
-    // BOOT-hold: <5 s kuch nahi; 5 s -> safe mode; 10 s -> key-reset-armed.
+    // BOOT-hold v2.2 (D7): <5 s kuch nahi; 5 s -> safe mode; 10 s -> password-clear.
     rsh_boothold_t d;
     rsh_boothold_init(&d);
     CHECK(rsh_boothold_update(&d, 1, 0) == RSH_HOLD_NONE);
     CHECK(rsh_boothold_update(&d, 1, 4999) == RSH_HOLD_NONE);
     CHECK(rsh_boothold_update(&d, 1, 5000) == RSH_HOLD_SAFE_MODE);
     CHECK(rsh_boothold_update(&d, 1, 5001) == RSH_HOLD_NONE);  // ek dafa fire
-    CHECK(rsh_boothold_update(&d, 1, 10000) == RSH_HOLD_KEY_RESET_ARMED);
+    CHECK(rsh_boothold_update(&d, 1, 10000) == RSH_HOLD_KEY_RESET_CLEAR);
     CHECK(rsh_boothold_update(&d, 0, 10001) == RSH_HOLD_NONE);  // release reset
     CHECK(rsh_boothold_update(&d, 1, 11000) == RSH_HOLD_NONE);  // naya hold
     CHECK(rsh_boothold_update(&d, 1, 16000) == RSH_HOLD_SAFE_MODE);
-    // Safe mode: config blocked; armed window 120 s ke baad reboot signal.
+    // Safe mode v2.2: config blocked; koi armed window/expiry nahi (D7).
     rsh_safe_mode_t s;
     rsh_safe_mode_init(&s);
     CHECK(rsh_safe_mode_blocks_config(&s) == 0);
-    rsh_safe_mode_enter(&s, 0, 1000);
+    rsh_safe_mode_enter(&s, 1000);
     CHECK(rsh_safe_mode_blocks_config(&s) == 1);
-    CHECK(rsh_safe_mode_tick(&s, 500000) == 0);  // safe mode ki expiry nahi
-    rsh_safe_mode_init(&s);
-    rsh_safe_mode_enter(&s, 1, 1000);
-    CHECK(rsh_safe_mode_tick(&s, 1000 + 119999) == 0);
-    CHECK(rsh_safe_mode_tick(&s, 1000 + 120000) == 1);
+    CHECK(rsh_safe_mode_blocks_config(&s) == 1);  // safe mode ki expiry nahi
   }
 
   // 12) Config transaction reconciliation (Phase E WS5): `config_txn.h`
@@ -2094,8 +2099,8 @@ int main() {
     CHECK(rsh_caps_build_body(body, 100, mac, 6, 0, table, 15) == 0);
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 41) == 0);
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 15) == 138);
-    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 2);  // fw 4.0.2 (Round 2 W3 FIX-1)
-    CHECK(body[10] == 2 && body[11] == 1);  // proto 2.1
+    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 3);  // fw 4.0.3 (Round 2 W3 FIX-1)
+    CHECK(body[10] == 2 && body[11] == 2);  // proto 2.2
     CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
     CHECK(body[15] == 6 && body[17] == 15);
     CHECK(body[18 + 3 * 8] == PIN_HANDBRAKE_ADC);
@@ -2237,49 +2242,53 @@ int main() {
     CHECK(r == 0 && g == 0 && b == 0);
   }
 
-  // 18) Control extra negatives (FW-8, T2): structure / build / session ring.
+  // 18) Control extra negatives v2.2 (FW-8, T2): structure / build / session ring.
   {
     rsh_v2_ctrl_t cf;
-    uint8_t test_key[32], test_nonce[16];
-    for (int i = 0; i < 32; i++) test_key[i] = (uint8_t)i;
-    for (int i = 0; i < 16; i++) test_nonce[i] = (uint8_t)(0xA0 + i);
     uint8_t frame[64] = {0};
-    // Header se chhota frame -> TOO_SHORT (sirf <13 B par).
+    // Header se chhota frame -> TOO_SHORT (sirf <9 B par).
     CHECK(rsh_v2_ctrl_parse_structure(frame, 0, &cf) == RSH_V2_TOO_SHORT);
-    CHECK(rsh_v2_ctrl_parse_structure(frame, 12, &cf) == RSH_V2_TOO_SHORT);
-    CHECK(rsh_v2_ctrl_parse_structure(NULL, 29, &cf) == RSH_V2_TOO_SHORT);
-    // Verify: null key/nonce/hmac -> BAD_TAG (koi crash nahi).
-    const uint8_t caps[29] = {0x52, 0x53, 0x48, 0x43, 0x01, 0x01, 0x00, 0x00,
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0xee, 0x8d, 0x10, 0x07, 0x93, 0x58,
-      0xd9, 0x93, 0x6f, 0xe7, 0x43, 0x68, 0xf8, 0xb6, 0x61};
-    CHECK(rsh_v2_ctrl_verify(caps, sizeof(caps), NULL, test_nonce, test_hmac16, &cf) == RSH_V2_BAD_TAG);
-    CHECK(rsh_v2_ctrl_verify(caps, sizeof(caps), test_key, NULL, test_hmac16, &cf) == RSH_V2_BAD_TAG);
-    CHECK(rsh_v2_ctrl_verify(caps, sizeof(caps), test_key, test_nonce, NULL, &cf) == RSH_V2_BAD_TAG);
-    // Build: null buf/hmac, chhota buf -> 0.
+    CHECK(rsh_v2_ctrl_parse_structure(frame, 8, &cf) == RSH_V2_TOO_SHORT);
+    CHECK(rsh_v2_ctrl_parse_structure(NULL, 11, &cf) == RSH_V2_TOO_SHORT);
+    CHECK(rsh_v2_ctrl_parse_structure(frame, 11, NULL) == RSH_V2_TOO_SHORT);
+    // Bad CRC / bad magic / bad length (v2.2: koi tag/verify nahi).
+    const uint8_t caps[11] = {0x52, 0x53, 0x48, 0x43, 0x01, 0x01, 0x00, 0x00,
+      0x00, 0x77, 0xe7};
+    CHECK(rsh_v2_ctrl_parse_structure(caps, sizeof(caps), &cf) == RSH_V2_OK);
+    uint8_t bad[64];
+    memcpy(bad, caps, sizeof(caps));
+    bad[10] ^= 0xFF;
+    CHECK(rsh_v2_ctrl_parse_structure(bad, sizeof(caps), &cf) == RSH_V2_BAD_CRC);
+    memcpy(bad, caps, sizeof(caps));
+    bad[0] = 'X';
+    CHECK(rsh_v2_ctrl_parse_structure(bad, sizeof(caps), &cf) == RSH_V2_BAD_MAGIC);
+    CHECK(rsh_v2_ctrl_parse_structure(caps, 10, &cf) == RSH_V2_BAD_LENGTH);
+    // Build: null buf, chhota buf, oversize payload -> 0.
     uint8_t out[64];
-    CHECK(rsh_v2_ctrl_build(NULL, sizeof(out), 0x01, 1, 0, NULL, 0,
-                            test_key, test_nonce, test_hmac16) == 0);
-    CHECK(rsh_v2_ctrl_build(out, sizeof(out), 0x01, 1, 0, NULL, 0,
-                            test_key, test_nonce, NULL) == 0);
-    CHECK(rsh_v2_ctrl_build(out, 10, 0x01, 1, 0, NULL, 0,
-                            test_key, test_nonce, test_hmac16) == 0);
-    // Session ring (32 entries): 33 distinct accept ke baad sab se purana
-    // pair evict hota hai — us ka dobara aana DUPLICATE nahi, REPLAY hai.
+    CHECK(rsh_v2_ctrl_build(NULL, sizeof(out), 0x01, 1, NULL, 0) == 0);
+    CHECK(rsh_v2_ctrl_build(out, 10, 0x01, 1, NULL, 0) == 0);
+    uint8_t big[1025] = {0};
+    CHECK(rsh_v2_ctrl_build(out, sizeof(out), 0x01, 1, big, 1025) == 0);
+    // Max payload 1024 build + parse OK; 1024+2+9 = 1035 total.
+    uint8_t maxout[1100];
+    CHECK(rsh_v2_ctrl_build(maxout, sizeof(maxout), 0x01, 1, big, 1024) == 1035);
+    CHECK(rsh_v2_ctrl_parse_structure(maxout, 1035, &cf) == RSH_V2_OK);
+    CHECK(cf.len == 1024);
+    // Session ring (32 entries, reqId-only): 33 distinct accept ke baad
+    // sab se purana reqId evict hota hai — us ka dobara aana ACCEPT hai
+    // (koi REPLAY state nahi, D2).
     rsh_ctrl_session_t sess;
     rsh_ctrl_session_init(&sess);
     for (int i = 0; i < 33; i++)
-      CHECK(rsh_ctrl_session_classify(&sess, (uint16_t)i, (uint32_t)i) == RSH_DEC_ACCEPT);
-    CHECK(rsh_ctrl_session_classify(&sess, 32, 32) == RSH_DEC_DUPLICATE);
-    CHECK(rsh_ctrl_session_classify(&sess, 0, 0) == RSH_DEC_REPLAY);
-    CHECK(rsh_ctrl_session_classify(&sess, 33, 33) == RSH_DEC_ACCEPT);
+      CHECK(rsh_ctrl_session_classify(&sess, (uint16_t)i) == RSH_DEC_ACCEPT);
+    CHECK(rsh_ctrl_session_classify(&sess, 32) == RSH_DEC_DUPLICATE);
+    CHECK(rsh_ctrl_session_classify(&sess, 0) == RSH_DEC_ACCEPT);  // evicted
+    CHECK(rsh_ctrl_session_classify(&sess, 33) == RSH_DEC_ACCEPT);
+    CHECK(rsh_ctrl_session_classify(&sess, 33) == RSH_DEC_DUPLICATE);
   }
 
-  // 19) FW-7 extensions + FW-8 dispatcher (Workstream 3, SEC-D-01/06/07/08/09).
+  // 19) FW-7 extensions + FW-8 dispatcher v2.2 (Workstream 3, SEC-D-01/06/08/09).
   {
-    uint8_t test_key[32], test_nonce[16], wrong_key[32];
-    for (int i = 0; i < 32; i++) { test_key[i] = (uint8_t)i; wrong_key[i] = 0xFF; }
-    for (int i = 0; i < 16; i++) test_nonce[i] = (uint8_t)(0xA0 + i);
-
     // --- FW-7: RSSI-weighted scan load (F8) ---
     {
       // ch1: 2 strong (-40, w4 = 8), ch6: 3 weak (-85, w1 = 3),
@@ -2336,7 +2345,7 @@ int main() {
       CHECK(rsh_helo_accept(1, 0, 0, 6000) == 1);     // idle + 6 s -> qabool
       CHECK(rsh_helo_accept(1, 0, 0, 4000) == 0);     // idle lekin 4 s -> flap
       CHECK(rsh_helo_accept(1, 0, 1, 0) == 1);        // wahi IP hamesha
-      // HELLO reply throttle: 250 ms (F-04, v4.0.2: 500 ms se 250 ms).
+      // HELLO reply throttle: 250 ms (F-04, v4.0.3: 500 ms se 250 ms).
       CHECK(rsh_hello_reply_allowed(0) == 0);
       CHECK(rsh_hello_reply_allowed(249) == 0);
       CHECK(rsh_hello_reply_allowed(250) == 1);
@@ -2363,35 +2372,32 @@ int main() {
       CHECK(rsh_ping_allow(&lim2, 0x0A000000u, 2000) == 1);  // evicted -> fresh bucket
     }
 
-    // --- FW-8: HELLO build golden (92 B, §2.2) — Python vector se match ---
+    // --- FW-8: HELLO build v2.2 (92 B, §2.2) — T1 goldens se match ---
     {
       uint8_t mac[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
-      const uint8_t hello_exp[92] = {0x52, 0x53, 0x48, 0x52, 0x02, 0x01, 0x09, 0x01,
-        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x00, 0x00, 0xa0, 0xa1,
-        0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad,
-        0xae, 0xaf, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
-        0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
-        0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x41, 0x62,
-        0x33, 0x64, 0x45, 0x66, 0x36, 0x68, 0x4a, 0x6b, 0x39, 0x6d, 0x4e, 0x70,
-        0x32, 0x72, 0x53, 0x74, 0x35, 0x76, 0x57, 0x78, 0x38, 0x59, 0x5a, 0x42};
       uint8_t out[92];
-      size_t n = rsh_v2_build_hello(out, 0x09, 1, mac, 4, 0, 0, test_nonce, test_key,
-                                    (const uint8_t *)"Ab3dEf6hJk9mNp2rSt5vWx8Y");
-      CHECK(n == 92 && memcmp(out, hello_exp, 92) == 0);
-      // Paired: key/password zero → parse OK, fields zero.
-      uint8_t zeros32[32] = {0}, zeros24[24] = {0};
-      n = rsh_v2_build_hello(out, 0x00, 0, mac, 4, 0, 0, test_nonce, zeros32, zeros24);
-      CHECK(n == 92);
+      // Byte-exact goldens T1 mein hain (hello_safe / hello_plain);
+      // yahan build deterministic + parse round-trip check karte hain.
+      uint8_t out2[92];
+      size_t n = rsh_v2_build_hello(out, 0x04, 1, mac, 4, 0, 3);
+      size_t n2 = rsh_v2_build_hello(out2, 0x04, 1, mac, 4, 0, 3);
+      CHECK(n == 92 && n2 == 92 && memcmp(out, out2, 92) == 0);
       rsh_v2_hello_t hp;
+      CHECK(rsh_v2_parse_hello(out, 92, &hp) == RSH_V2_OK);
+      CHECK(hp.flags == RSH_V2_HELLO_SAFE_MODE && hp.session_echo == 1);
+      CHECK(hp.fw_major == 4 && hp.fw_minor == 0 && hp.fw_patch == 3);
+      n = rsh_v2_build_hello(out, 0x00, 0, mac, 4, 0, 3);
+      CHECK(n == 92);
       CHECK(rsh_v2_parse_hello(out, 92, &hp) == RSH_V2_OK);
       CHECK(hp.flags == 0 && hp.session_echo == 0);
       uint8_t z56[56] = {0};
       CHECK(memcmp(hp.device_key, z56, 32) == 0);
       CHECK(memcmp(hp.wifi_password, z56, 24) == 0);
-      CHECK(rsh_v2_build_hello(NULL, 0, 0, mac, 4, 0, 0, test_nonce, test_key, zeros24) == 0);
+      CHECK(rsh_v2_build_hello(NULL, 0, 0, mac, 4, 0, 3) == 0);
+      CHECK(rsh_v2_build_hello(out, 0, 0, NULL, 4, 0, 3) == 0);
     }
 
-    // --- FW-8: dispatcher (ctrl.h) — ghalat frame kabhi execute nahi ---
+    // --- FW-8: dispatcher v2.2 (ctrl.h) — ghalat frame kabhi execute nahi ---
     {
       test_ctrl_ctx_t ctx = {0, 0, 0};
       rsh_ctrl_session_t sess;
@@ -2402,32 +2408,22 @@ int main() {
       size_t rlen = 0;
       auto disp = [&](const uint8_t *fr, size_t fl) {
         rlen = 0;
-        return rsh_ctrl_dispatch(fr, fl, test_key, test_nonce, test_hmac16,
-                                 &sess, &cache, test_ctrl_handler, &ctx,
-                                 reply, sizeof(reply), &rlen);
-      };
-      auto disp_key = [&](const uint8_t *fr, size_t fl, const uint8_t *k) {
-        rlen = 0;
-        return rsh_ctrl_dispatch(fr, fl, k, test_nonce, test_hmac16,
-                                 &sess, &cache, test_ctrl_handler, &ctx,
+        return rsh_ctrl_dispatch(fr, fl, &sess, &cache, test_ctrl_handler, &ctx,
                                  reply, sizeof(reply), &rlen);
       };
       rsh_v2_ctrl_t rf;
-      const uint8_t ctrl_reply_exp[47] = {0x52, 0x53, 0x48, 0x43, 0x81, 0x01, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-        0x04, 0x00, 0x00, 0x02, 0x01, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0x04,
-        0xb2, 0x21, 0x24, 0x07, 0x63, 0x4f, 0xfd, 0x85, 0x52, 0xf4, 0x91, 0xba,
-        0x7d, 0xcb, 0xc0};
+      const uint8_t ctrl_reply_exp[29] = {0x52, 0x53, 0x48, 0x43, 0x81, 0x01, 0x00, 0x12,
+        0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x03, 0x02,
+        0x02, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0x6d, 0xc5};
 
       // Sahi GET_CAPS frame -> OK reply, golden bytes se byte-identical.
       uint8_t frame[64];
-      size_t flen = rsh_v2_ctrl_build(frame, sizeof(frame), 0x01, 1, 0, NULL, 0,
-                                      test_key, test_nonce, test_hmac16);
-      CHECK(flen == 29);
+      size_t flen = rsh_v2_ctrl_build(frame, sizeof(frame), 0x01, 1, NULL, 0);
+      CHECK(flen == 11);
       CHECK(disp(frame, flen) == RSH_CTRL_DISP_REPLY);
-      CHECK(rlen == 47 && memcmp(reply, ctrl_reply_exp, 47) == 0);
+      CHECK(rlen == 29 && memcmp(reply, ctrl_reply_exp, 29) == 0);
       CHECK(ctx.exec_caps == 1);
-      CHECK(rsh_v2_ctrl_verify(reply, rlen, test_key, test_nonce, test_hmac16, &rf) == RSH_V2_OK);
+      CHECK(rsh_v2_ctrl_parse_structure(reply, rlen, &rf) == RSH_V2_OK);
       CHECK(rf.cmd == 0x81 && rf.payload[0] == RSH_CTRL_OK);
 
       // Duplicate exact retransmit -> wahi cached reply, dobara execute nahi.
@@ -2438,88 +2434,66 @@ int main() {
       CHECK(rlen == saved_len && memcmp(reply, saved, rlen) == 0);
       CHECK(ctx.exec_caps == 1);
 
-      // Replay: naya reqId, wahi counter 0 -> REPLAY reply, no execute.
+      // Naya reqId (99) -> ACCEPT, dobara execute (v2.2 mein koi REPLAY
+      // state nahi — dedup sirf reqId par hai, D2).
       uint8_t rep[64];
-      size_t rplen = rsh_v2_ctrl_build(rep, sizeof(rep), 0x01, 99, 0, NULL, 0,
-                                       test_key, test_nonce, test_hmac16);
+      size_t rplen = rsh_v2_ctrl_build(rep, sizeof(rep), 0x01, 99, NULL, 0);
       CHECK(disp(rep, rplen) == RSH_CTRL_DISP_REPLY);
-      CHECK(rlen == 30);
-      CHECK(rsh_v2_ctrl_verify(reply, rlen, test_key, test_nonce, test_hmac16, &rf) == RSH_V2_OK);
-      CHECK(rf.payload[0] == RSH_CTRL_REPLAY);
-      CHECK(ctx.exec_caps == 1);
+      CHECK(rlen == 29 && ctx.exec_caps == 2);
 
-      // Retry: wahi reqId, NAYA counter -> ACCEPT (nayi execution, idempotent).
-      uint8_t retry[64];
-      size_t rtlen = rsh_v2_ctrl_build(retry, sizeof(retry), 0x01, 1, 1, NULL, 0,
-                                       test_key, test_nonce, test_hmac16);
-      CHECK(disp(retry, rtlen) == RSH_CTRL_DISP_REPLY);
-      CHECK(ctx.exec_caps == 2);
-
-      // Bad tag -> BAD_TAG reply, no execute.
+      // Bad CRC -> SILENT DROP, no execute (reply banane ka koi tareeqa nahi).
       uint8_t bad[64];
       memcpy(bad, frame, flen);
       bad[flen - 1] ^= 0xFF;
-      CHECK(disp(bad, flen) == RSH_CTRL_DISP_REPLY);
-      CHECK(rlen == 30);
-      CHECK(rsh_v2_ctrl_verify(reply, rlen, test_key, test_nonce, test_hmac16, &rf) == RSH_V2_OK);
-      CHECK(rf.payload[0] == RSH_CTRL_BAD_TAG);
-      CHECK(ctx.exec_caps == 2);
-
-      // Wrong key -> BAD_TAG reply (reply tag ghalat key se verify hota hai).
-      CHECK(disp_key(frame, flen, wrong_key) == RSH_CTRL_DISP_REPLY);
-      CHECK(rsh_v2_ctrl_verify(reply, rlen, wrong_key, test_nonce, test_hmac16, &rf) == RSH_V2_OK);
-      CHECK(rf.payload[0] == RSH_CTRL_BAD_TAG);
+      CHECK(disp(bad, flen) == RSH_CTRL_DISP_DROP && rlen == 0);
       CHECK(ctx.exec_caps == 2);
 
       // Truncated / bad magic / len mismatch / too short -> silent DROP.
-      CHECK(disp(frame, flen - 8) == RSH_CTRL_DISP_DROP && rlen == 0);
+      CHECK(disp(frame, flen - 1) == RSH_CTRL_DISP_DROP && rlen == 0);
       memcpy(bad, frame, flen);
       bad[0] = 'X';
       CHECK(disp(bad, flen) == RSH_CTRL_DISP_DROP);
       memcpy(bad, frame, flen);
-      bad[11] = 5;
+      bad[7] = 5;
       CHECK(disp(bad, flen) == RSH_CTRL_DISP_DROP);
-      CHECK(disp(frame, 12) == RSH_CTRL_DISP_DROP);
+      CHECK(disp(frame, 8) == RSH_CTRL_DISP_DROP);
       CHECK(ctx.exec_caps == 2);
 
-      // Unknown cmd (0x7F, valid tag) -> UNSUPPORTED reply, execute nahi.
+      // Unknown cmd (0x7F, valid CRC) -> UNSUPPORTED reply (12 B), execute nahi.
       uint8_t unk[64];
-      size_t ulen = rsh_v2_ctrl_build(unk, sizeof(unk), 0x7F, 5, 2, NULL, 0,
-                                      test_key, test_nonce, test_hmac16);
+      size_t ulen = rsh_v2_ctrl_build(unk, sizeof(unk), 0x7F, 5, NULL, 0);
       CHECK(disp(unk, ulen) == RSH_CTRL_DISP_REPLY);
-      CHECK(rsh_v2_ctrl_verify(reply, rlen, test_key, test_nonce, test_hmac16, &rf) == RSH_V2_OK);
+      CHECK(rlen == 12);
+      CHECK(rsh_v2_ctrl_parse_structure(reply, rlen, &rf) == RSH_V2_OK);
       CHECK(rf.payload[0] == RSH_CTRL_UNSUPPORTED);
       CHECK(ctx.exec_caps == 2 && ctx.exec_big == 0);
 
-      // REBOOT (0x09, valid tag) -> OK + reboot flag (SEC-D-01 rasta).
+      // REBOOT (0x09) -> OK + reboot flag (SEC-D-01 rasta).
       uint8_t rb[64];
-      size_t rblen = rsh_v2_ctrl_build(rb, sizeof(rb), 0x09, 6, 3, NULL, 0,
-                                       test_key, test_nonce, test_hmac16);
+      size_t rblen = rsh_v2_ctrl_build(rb, sizeof(rb), 0x09, 6, NULL, 0);
       CHECK(disp(rb, rblen) == RSH_CTRL_DISP_REPLY);
-      CHECK(rsh_v2_ctrl_verify(reply, rlen, test_key, test_nonce, test_hmac16, &rf) == RSH_V2_OK);
+      CHECK(rsh_v2_ctrl_parse_structure(reply, rlen, &rf) == RSH_V2_OK);
       CHECK(rf.payload[0] == RSH_CTRL_OK && ctx.reboot == 1);
 
-      // SEC-D-07a: reqId-tamper — valid frame ka reqId badlo (tag valid
-      // rehta hai, reqId HMAC mein nahi) -> REPLAY, kabhi execute nahi.
+      // v2.2 note: reqId-tamper detect NAHI hota (koi HMAC nahi) — tampered
+      // reqId (70) naya reqId hai, is liye ACCEPT + execute. Idempotency
+      // handler ki zimmedari hai (§3.2).
       uint8_t tam[64];
-      size_t tlen = rsh_v2_ctrl_build(tam, sizeof(tam), 0x01, 7, 4, NULL, 0,
-                                      test_key, test_nonce, test_hmac16);
+      size_t tlen = rsh_v2_ctrl_build(tam, sizeof(tam), 0x01, 7, NULL, 0);
       CHECK(disp(tam, tlen) == RSH_CTRL_DISP_REPLY);
       CHECK(ctx.exec_caps == 3);
       uint8_t tam2[64];
       memcpy(tam2, tam, tlen);
-      tam2[5] = 99; tam2[6] = 0;  // reqId 7 -> 99 (counter wahi 4)
+      tam2[5] = 70; tam2[6] = 0;  // reqId 7 -> 70 (CRC dobara lagao)
+      rsh_put_u16(tam2 + tlen - 2, rsh_crc16_ccitt(tam2, tlen - 2));
       CHECK(disp(tam2, tlen) == RSH_CTRL_DISP_REPLY);
-      CHECK(rsh_v2_ctrl_verify(reply, rlen, test_key, test_nonce, test_hmac16, &rf) == RSH_V2_OK);
-      CHECK(rf.payload[0] == RSH_CTRL_REPLAY);
-      CHECK(ctx.exec_caps == 3);
+      CHECK(ctx.exec_caps == 4);  // naya reqId = nayi execution
 
       // Bara reply (> 128 B) cache nahi hota — duplicate dobara execute.
       uint8_t big[1200];
-      size_t blen = rsh_v2_ctrl_build(big, sizeof(big), 0x02, 8, 5, NULL, 0,
-                                      test_key, test_nonce, test_hmac16);
+      size_t blen = rsh_v2_ctrl_build(big, sizeof(big), 0x02, 8, NULL, 0);
       CHECK(disp(big, blen) == RSH_CTRL_DISP_REPLY);
-      CHECK(rlen == 13 + 201 + 16 && ctx.exec_big == 1);
+      CHECK(rlen == 9 + 201 + 2 && ctx.exec_big == 1);
       uint8_t saved_big[1200];
       size_t saved_big_len = rlen;
       memcpy(saved_big, reply, rlen);
@@ -2527,35 +2501,27 @@ int main() {
       CHECK(rlen == saved_big_len && memcmp(reply, saved_big, rlen) == 0);
       CHECK(ctx.exec_big == 2);  // uncached duplicate -> idempotent re-execute
 
-      // Counter wrap (SEC-D-07c, RFC 1982): fresh session.
+      // reqId wrap (u16): fresh session.
       rsh_ctrl_session_t w;
       rsh_ctrl_session_init(&w);
       rsh_ctrl_cache_t c2;
       rsh_ctrl_cache_init(&c2);
       auto disp2 = [&](const uint8_t *fr, size_t fl) {
         rlen = 0;
-        return rsh_ctrl_dispatch(fr, fl, test_key, test_nonce, test_hmac16,
-                                 &w, &c2, test_ctrl_handler, &ctx,
+        return rsh_ctrl_dispatch(fr, fl, &w, &c2, test_ctrl_handler, &ctx,
                                  reply, sizeof(reply), &rlen);
       };
       uint8_t wf[64];
-      size_t wflen = rsh_v2_ctrl_build(wf, sizeof(wf), 0x01, 10, 0xFFFFFFFEu, NULL, 0,
-                                       test_key, test_nonce, test_hmac16);
-      CHECK(disp2(wf, wflen) == RSH_CTRL_DISP_REPLY && ctx.exec_caps == 4);
-      wflen = rsh_v2_ctrl_build(wf, sizeof(wf), 0x01, 11, 0xFFFFFFFFu, NULL, 0,
-                                test_key, test_nonce, test_hmac16);
+      size_t wflen = rsh_v2_ctrl_build(wf, sizeof(wf), 0x01, 65534, NULL, 0);
       CHECK(disp2(wf, wflen) == RSH_CTRL_DISP_REPLY && ctx.exec_caps == 5);
-      wflen = rsh_v2_ctrl_build(wf, sizeof(wf), 0x01, 12, 0, NULL, 0,
-                                test_key, test_nonce, test_hmac16);
-      CHECK(disp2(wf, wflen) == RSH_CTRL_DISP_REPLY && ctx.exec_caps == 6);  // wrap accept
-      wflen = rsh_v2_ctrl_build(wf, sizeof(wf), 0x01, 13, 0xFFFFFFFFu, NULL, 0,
-                                test_key, test_nonce, test_hmac16);
+      wflen = rsh_v2_ctrl_build(wf, sizeof(wf), 0x01, 65535, NULL, 0);
       CHECK(disp2(wf, wflen) == RSH_CTRL_DISP_REPLY && ctx.exec_caps == 6);
-      CHECK(rsh_v2_ctrl_verify(reply, rlen, test_key, test_nonce, test_hmac16, &rf) == RSH_V2_OK);
-      CHECK(rf.payload[0] == RSH_CTRL_REPLAY);  // purana counter wrap ke baad bhi
-      wflen = rsh_v2_ctrl_build(wf, sizeof(wf), 0x01, 11, 0xFFFFFFFFu, NULL, 0,
-                                test_key, test_nonce, test_hmac16);
-      CHECK(disp2(wf, wflen) == RSH_CTRL_DISP_REPLY && ctx.exec_caps == 6);  // duplicate
+      wflen = rsh_v2_ctrl_build(wf, sizeof(wf), 0x01, 0, NULL, 0);
+      CHECK(disp2(wf, wflen) == RSH_CTRL_DISP_REPLY && ctx.exec_caps == 7);  // wrap accept
+      wflen = rsh_v2_ctrl_build(wf, sizeof(wf), 0x01, 0, NULL, 0);
+      CHECK(disp2(wf, wflen) == RSH_CTRL_DISP_REPLY && ctx.exec_caps == 7);  // duplicate
+      wflen = rsh_v2_ctrl_build(wf, sizeof(wf), 0x01, 65535, NULL, 0);
+      CHECK(disp2(wf, wflen) == RSH_CTRL_DISP_REPLY && ctx.exec_caps == 7);  // duplicate
     }
   }
 
@@ -2714,10 +2680,11 @@ int main() {
     CHECK(!rsh_verify_signature(csig, digest, NULL));
   }
 
-  // 21) FW-3/FW-4 dispatcher wiring (follow-up): SET_CFG/COMMIT/CONFIRM/
-  // REVERT/GET_CFG/KEY_RESET — asal rsh_ctrl_dispatch se (HMAC + session +
-  // cache), rsh_fw34_handler + fake ctx ke saath. net.cpp ka net_ctrl_handler
-  // yahi handler delegate karta hai (wahi callbacks, asal millis/NVS/armed).
+  // 21) FW-3/FW-4 dispatcher wiring v2.2 (follow-up): SET_CFG/COMMIT/CONFIRM/
+  // REVERT/GET_CFG — asal rsh_ctrl_dispatch se (plain + session + cache),
+  // rsh_fw34_handler + fake ctx ke saath. net.cpp ka net_ctrl_handler
+  // yahi handler delegate karta hai (wahi callbacks, asal millis/NVS).
+  // KEY_RESET opcode khatam (v2.2, D7) — 0x0B ab UNSUPPORTED deta hai.
   {
     rsh_cfg_txn_t txn;
     rsh_cfg_txn_init(&txn);
@@ -2727,43 +2694,32 @@ int main() {
 
     rsh_fw34_handler_ctx_t hctx;
     rsh_fw34_handler_ctx_init(&hctx, &txn);
-    hctx.key_reset_armed = fw34_test_armed_cb;
-    hctx.key_reset_request = fw34_test_keyreset_cb;
     hctx.cfg_persist = fw34_test_persist_cb;
     hctx.now_ms = fw34_test_now_cb;
     hctx.user = NULL;
-    fw34_test_armed = 0;
     fw34_test_now = 1000;
     fw34_test_persist_calls = 0;
     fw34_test_persist_last_pending = 0;
-    fw34_test_keyreset_calls = 0;
 
     rsh_ctrl_session_t sess;
     rsh_ctrl_session_init(&sess);
     rsh_ctrl_cache_t cache;
     rsh_ctrl_cache_init(&cache);
-    uint8_t test_key[32], test_nonce[16];  // §19 wale yahan scope mein nahi
-    for (int i = 0; i < 32; i++) test_key[i] = (uint8_t)i;
-    for (int i = 0; i < 16; i++) test_nonce[i] = (uint8_t)(0xA0 + i);
     uint8_t reply[1200];
     size_t rlen = 0;
-    uint32_t ctr = 0;
     uint16_t req = 100;
     rsh_v2_ctrl_t rf;
     auto disp = [&](const uint8_t *fr, size_t fl) {
       rlen = 0;
-      return rsh_ctrl_dispatch(fr, fl, test_key, test_nonce, test_hmac16,
-                               &sess, &cache, rsh_fw34_handler, &hctx,
+      return rsh_ctrl_dispatch(fr, fl, &sess, &cache, rsh_fw34_handler, &hctx,
                                reply, sizeof(reply), &rlen);
     };
     auto build = [&](uint8_t cmd, const uint8_t *pl, uint16_t pl_len, uint8_t *out) {
-      return rsh_v2_ctrl_build(out, 1200, cmd, req++, ctr++, pl, pl_len,
-                               test_key, test_nonce, test_hmac16);
+      return rsh_v2_ctrl_build(out, 1200, cmd, req++, pl, pl_len);
     };
-    // Reply verify karo; rf mein parsed reply (payload[0] = status).
+    // Reply parse karo (structure + CRC); rf mein parsed reply (payload[0] = status).
     auto verified = [&]() {
-      return rsh_v2_ctrl_verify(reply, rlen, test_key, test_nonce, test_hmac16, &rf)
-             == RSH_V2_OK;
+      return rsh_v2_ctrl_parse_structure(reply, rlen, &rf) == RSH_V2_OK;
     };
     // SET_CFG chunk payload banao: offset|total|chunkLen|chunkCrc|data.
     auto setcfg_pl = [&](uint16_t off, const uint8_t *blob, uint16_t total,
@@ -2922,36 +2878,25 @@ int main() {
     CHECK(rf.payload[0] == RSH_CTRL_BAD_CRC);
     CHECK(rsh_cfg_staged_bytes(&txn) == 0);
 
-    // --- KEY_RESET: unarmed -> UNSUPPORTED; armed -> OK + request ---
-    fl2 = build(RSH_CMD_KEY_RESET, NULL, 0, frame);
+    // --- KEY_RESET opcode khatam (v2.2, D7): 0x0B -> UNSUPPORTED ---
+    // (Password clear sirf physical BOOT-hold se hota hai — rsh.ino.)
+    fl2 = build(0x0B, NULL, 0, frame);
     CHECK(disp(frame, fl2) == RSH_CTRL_DISP_REPLY && verified());
     CHECK(rf.payload[0] == RSH_CTRL_UNSUPPORTED);
-    CHECK(fw34_test_keyreset_calls == 0);
-    fw34_test_armed = 1;
-    fl2 = build(RSH_CMD_KEY_RESET, NULL, 0, frame);
-    CHECK(disp(frame, fl2) == RSH_CTRL_DISP_REPLY && verified());
-    CHECK(rf.payload[0] == RSH_CTRL_OK && rf.len == 1);
-    CHECK(fw34_test_keyreset_calls == 1);
-    // Armed ho lekin payload khaali na ho -> UNSUPPORTED (request nahi).
     uint8_t onebyte[1] = {0};
-    fl2 = build(RSH_CMD_KEY_RESET, onebyte, 1, frame);
+    fl2 = build(0x0B, onebyte, 1, frame);
     CHECK(disp(frame, fl2) == RSH_CTRL_DISP_REPLY && verified());
     CHECK(rf.payload[0] == RSH_CTRL_UNSUPPORTED);
-    CHECK(fw34_test_keyreset_calls == 1);
-    fw34_test_armed = 0;
 
-    // --- Bad tag SET_CFG -> BAD_TAG, handler bilkul nahi chalta ---
+    // --- Bad CRC SET_CFG -> SILENT DROP, handler bilkul nahi chalta ---
     pln = setcfg_pl(0, newblob, (uint16_t)nlen, 63, pl);
     fl2 = build(RSH_CMD_SET_CFG, pl, pln, frame);
-    uint8_t badtag[1200];
-    memcpy(badtag, frame, fl2);
-    badtag[fl2 - 1] ^= 0xFF;
-    uint32_t calls_before_tag = hctx.calls;
-    CHECK(disp(badtag, fl2) == RSH_CTRL_DISP_REPLY);
-    CHECK(rsh_v2_ctrl_verify(reply, rlen, test_key, test_nonce, test_hmac16, &rf)
-          == RSH_V2_OK);
-    CHECK(rf.payload[0] == RSH_CTRL_BAD_TAG);
-    CHECK(hctx.calls == calls_before_tag);
+    uint8_t badcrc[1200];
+    memcpy(badcrc, frame, fl2);
+    badcrc[fl2 - 1] ^= 0xFF;
+    uint32_t calls_before_crc = hctx.calls;
+    CHECK(disp(badcrc, fl2) == RSH_CTRL_DISP_DROP && rlen == 0);
+    CHECK(hctx.calls == calls_before_crc);
 
     // --- Malformed payloads -> UNSUPPORTED (frame sahi, payload ghalat) ---
     // SET_CFG: chunkLen 16 likha, data sirf 8 bytes.
@@ -3039,8 +2984,8 @@ int main() {
     CHECK(hctx.last_cmd == RSH_CMD_GET_CFG);
   }
 
-  // 22) SET_PASSWORD (Phase E WS5, PROTOCOL-V2.1.md §5.2, cmd 0x0C):
-  // validator + handler, asal rsh_ctrl_dispatch se (HMAC + session).
+  // 22) SET_PASSWORD v2.2 (Phase E WS5, PROTOCOL-V2.2.md §5.2, cmd 0x0C):
+  // validator + handler, asal rsh_ctrl_dispatch se (plain + session).
   // Positive: valid password -> OK + deferred callback ko exact bytes.
   // Negative: length/charset/payload-shape fail -> UNSUPPORTED, callback
   // nahi chalta; bad tag -> BAD_TAG, handler bilkul nahi chalta.
@@ -3069,115 +3014,153 @@ int main() {
     CHECK(rsh_password_validate(pwNul, 8) == RSH_CTRL_UNSUPPORTED);
     CHECK(rsh_password_validate(NULL, 8) == RSH_CTRL_UNSUPPORTED);
     CHECK(rsh_password_validate(pw8, 0) == RSH_CTRL_UNSUPPORTED);
-    // Generated 24-char password (§5.1) bhi valid hai.
+    // 24-char password (8..63 ke andar) bhi valid hai.
     CHECK(rsh_password_validate((const uint8_t *)"Ab3dEf6hJk9mNp2rSt5vWx8Y", 24)
           == RSH_CTRL_OK);
 
-    // --- Dispatcher: SET_PASSWORD, fake ctx + password callback ---
+    // --- Dispatcher v2.2: SET_PASSWORD [curLen][curPw][newLen][newPw], fake ctx ---
     rsh_cfg_txn_t txn2;
     rsh_cfg_txn_init(&txn2);
     rsh_fw34_handler_ctx_t hctx2;
     rsh_fw34_handler_ctx_init(&hctx2, &txn2);
+    hctx2.password_verify_current = fw34_test_pw_verify_cb;
     hctx2.password_change_request = fw34_test_password_cb;
     hctx2.user = NULL;
     fw34_test_password_calls = 0;
     fw34_test_password_len = 0;
+    fw34_test_stored_pw = NULL;  // pehle koi password stored nahi
     rsh_ctrl_session_t sess2;
     rsh_ctrl_session_init(&sess2);
     rsh_ctrl_cache_t cache2;
     rsh_ctrl_cache_init(&cache2);
-    uint8_t test_key2[32], test_nonce2[16];
-    for (int i = 0; i < 32; i++) test_key2[i] = (uint8_t)i;
-    for (int i = 0; i < 16; i++) test_nonce2[i] = (uint8_t)(0xA0 + i);
     uint8_t reply2[1200];
     size_t rlen2 = 0;
-    uint32_t ctr2 = 0;
     uint16_t req2 = 500;
     rsh_v2_ctrl_t rf2;
     auto disp2 = [&](const uint8_t *fr, size_t fl) {
       rlen2 = 0;
-      return rsh_ctrl_dispatch(fr, fl, test_key2, test_nonce2, test_hmac16,
-                               &sess2, &cache2, rsh_fw34_handler, &hctx2,
+      return rsh_ctrl_dispatch(fr, fl, &sess2, &cache2, rsh_fw34_handler, &hctx2,
                                reply2, sizeof(reply2), &rlen2);
     };
     auto build2 = [&](uint8_t cmd, const uint8_t *pl, uint16_t pl_len, uint8_t *out) {
-      return rsh_v2_ctrl_build(out, 1200, cmd, req2++, ctr2++, pl, pl_len,
-                               test_key2, test_nonce2, test_hmac16);
+      return rsh_v2_ctrl_build(out, 1200, cmd, req2++, pl, pl_len);
     };
     auto verified2 = [&]() {
-      return rsh_v2_ctrl_verify(reply2, rlen2, test_key2, test_nonce2, test_hmac16,
-                                &rf2) == RSH_V2_OK;
+      return rsh_v2_ctrl_parse_structure(reply2, rlen2, &rf2) == RSH_V2_OK;
     };
-    // Payload banao: newLen u8 + password bytes.
-    auto pw_pl = [&](const uint8_t *pw, uint8_t n, uint8_t *out) {
-      out[0] = n;
-      memcpy(out + 1, pw, n);
-      return (uint16_t)(1 + n);
+    // Payload banao v2.2: [curLen u8][curPw][newLen u8][newPw].
+    auto pw_pl = [&](const uint8_t *cur, uint8_t cur_len,
+                     const uint8_t *pw, uint8_t n, uint8_t *out) {
+      out[0] = cur_len;
+      if (cur_len) memcpy(out + 1, cur, cur_len);
+      out[1 + cur_len] = n;
+      memcpy(out + 2 + cur_len, pw, n);
+      return (uint16_t)(2 + cur_len + n);
     };
     uint8_t frame2[1200];
-    uint8_t pl2[128];
+    uint8_t pl2[140];
     size_t fl22 = 0;
-    // Positive: 12-char password -> OK, khaali body, callback ko exact bytes.
+    // Positive: koi password stored nahi, curLen 0 -> OK, callback ko exact bytes.
     const uint8_t good_pw[] = {'N', 'e', 'w', 'P', 'a', 's', 's', 'w', '0', 'r', 'd', '!'};
-    uint16_t pln2 = pw_pl(good_pw, 12, pl2);
+    uint16_t pln2 = pw_pl(NULL, 0, good_pw, 12, pl2);
     fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
     CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
     CHECK(rf2.payload[0] == RSH_CTRL_OK && rf2.len == 1);
     CHECK(fw34_test_password_calls == 1 && fw34_test_password_len == 12);
     CHECK(memcmp(fw34_test_password, good_pw, 12) == 0);
     CHECK(hctx2.last_cmd == RSH_CMD_SET_PASSWORD);
-    // Retry (naya counter, wahi password) idempotent hai — dobara callback.
+    // Retry (naya reqId, wahi password) idempotent hai — dobara callback.
     fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
     CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
     CHECK(rf2.payload[0] == RSH_CTRL_OK);
     CHECK(fw34_test_password_calls == 2);
-    // Negative: 7 chars -> UNSUPPORTED, callback nahi barhta.
-    pln2 = pw_pl(pw7, 7, pl2);
+    // Password stored hai (fake): curLen 0 -> BAD_PASSWORD (1).
+    fw34_test_stored_pw = "OldPassw0rd!";
+    pln2 = pw_pl(NULL, 0, good_pw, 12, pl2);
+    fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
+    CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
+    CHECK(rf2.payload[0] == RSH_CTRL_BAD_PASSWORD);
+    CHECK(fw34_test_password_calls == 2);
+    // Ghalat current password -> BAD_PASSWORD (1).
+    const uint8_t wrong_pw[] = {'W', 'r', 'o', 'n', 'g', 'P', 'a', 's', 's', '1', '2', '3'};
+    pln2 = pw_pl(wrong_pw, 12, good_pw, 12, pl2);
+    fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
+    CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
+    CHECK(rf2.payload[0] == RSH_CTRL_BAD_PASSWORD);
+    CHECK(fw34_test_password_calls == 2);
+    // Sahi current password -> OK.
+    const uint8_t old_pw[] = {'O', 'l', 'd', 'P', 'a', 's', 's', 'w', '0', 'r', 'd', '!'};
+    pln2 = pw_pl(old_pw, 12, good_pw, 12, pl2);
+    fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
+    CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
+    CHECK(rf2.payload[0] == RSH_CTRL_OK);
+    CHECK(fw34_test_password_calls == 3);
+    fw34_test_stored_pw = NULL;  // dobara koi password nahi
+    // Negative: 7 chars naya password -> UNSUPPORTED, callback nahi barhta.
+    pln2 = pw_pl(NULL, 0, pw7, 7, pl2);
     fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
     CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
     CHECK(rf2.payload[0] == RSH_CTRL_UNSUPPORTED);
-    CHECK(fw34_test_password_calls == 2);
+    CHECK(fw34_test_password_calls == 3);
     // Negative: newLen 12 likha, payload mein sirf 11 bytes -> UNSUPPORTED.
-    pl2[0] = 12;
-    memcpy(pl2 + 1, good_pw, 11);
-    fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, 12, frame2);
+    pl2[0] = 0;
+    pl2[1] = 12;
+    memcpy(pl2 + 2, good_pw, 11);
+    fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, 13, frame2);
     CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
     CHECK(rf2.payload[0] == RSH_CTRL_UNSUPPORTED);
-    CHECK(fw34_test_password_calls == 2);
-    // Negative: space wala password -> UNSUPPORTED.
-    pln2 = pw_pl(pwSpace, 8, pl2);
+    CHECK(fw34_test_password_calls == 3);
+    // Negative: current password mein space -> UNSUPPORTED (shape).
+    pln2 = pw_pl(pwSpace, 8, good_pw, 12, pl2);
     fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
     CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
     CHECK(rf2.payload[0] == RSH_CTRL_UNSUPPORTED);
-    CHECK(fw34_test_password_calls == 2);
+    CHECK(fw34_test_password_calls == 3);
+    // Negative: naya password mein space -> UNSUPPORTED.
+    pln2 = pw_pl(NULL, 0, pwSpace, 8, pl2);
+    fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
+    CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
+    CHECK(rf2.payload[0] == RSH_CTRL_UNSUPPORTED);
+    CHECK(fw34_test_password_calls == 3);
     // Negative: khaali payload (len 0) -> UNSUPPORTED.
     fl22 = build2(RSH_CMD_SET_PASSWORD, NULL, 0, frame2);
     CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
     CHECK(rf2.payload[0] == RSH_CTRL_UNSUPPORTED);
-    CHECK(fw34_test_password_calls == 2);
-    // Negative: callback NULL ho (fail closed) -> UNSUPPORTED.
-    hctx2.password_change_request = NULL;
-    pln2 = pw_pl(good_pw, 12, pl2);
+    CHECK(fw34_test_password_calls == 3);
+    // Negative: sirf curLen byte (len 1) -> UNSUPPORTED.
+    uint8_t one_len[1] = {0};
+    fl22 = build2(RSH_CMD_SET_PASSWORD, one_len, 1, frame2);
+    CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
+    CHECK(rf2.payload[0] == RSH_CTRL_UNSUPPORTED);
+    CHECK(fw34_test_password_calls == 3);
+    // Negative: verify callback NULL ho (fail closed) -> UNSUPPORTED.
+    hctx2.password_verify_current = NULL;
+    pln2 = pw_pl(NULL, 0, good_pw, 12, pl2);
     fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
     CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
     CHECK(rf2.payload[0] == RSH_CTRL_UNSUPPORTED);
-    CHECK(fw34_test_password_calls == 2);
-    hctx2.password_change_request = fw34_test_password_cb;
-    // Negative: bad tag -> BAD_TAG, handler bilkul nahi chalta.
+    CHECK(fw34_test_password_calls == 3);
+    hctx2.password_verify_current = fw34_test_pw_verify_cb;
+    // Negative: change callback NULL ho (fail closed) -> UNSUPPORTED.
+    hctx2.password_change_request = NULL;
+    pln2 = pw_pl(NULL, 0, good_pw, 12, pl2);
     fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
-    uint8_t badtag2[1200];
-    memcpy(badtag2, frame2, fl22);
-    badtag2[fl22 - 1] ^= 0xFF;
+    CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
+    CHECK(rf2.payload[0] == RSH_CTRL_UNSUPPORTED);
+    CHECK(fw34_test_password_calls == 3);
+    hctx2.password_change_request = fw34_test_password_cb;
+    // Negative: bad CRC -> SILENT DROP, handler bilkul nahi chalta.
+    fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
+    uint8_t badcrc2[1200];
+    memcpy(badcrc2, frame2, fl22);
+    badcrc2[fl22 - 1] ^= 0xFF;
     uint32_t calls_before2 = hctx2.calls;
-    CHECK(disp2(badtag2, fl22) == RSH_CTRL_DISP_REPLY);
-    CHECK(rsh_v2_ctrl_verify(reply2, rlen2, test_key2, test_nonce2, test_hmac16, &rf2)
-          == RSH_V2_OK);
-    CHECK(rf2.payload[0] == RSH_CTRL_BAD_TAG);
+    CHECK(disp2(badcrc2, fl22) == RSH_CTRL_DISP_DROP && rlen2 == 0);
     CHECK(hctx2.calls == calls_before2);
-    CHECK(fw34_test_password_calls == 2);
+    CHECK(fw34_test_password_calls == 3);
   }
 
-  // 23) v2.1 stream emission (Phase E WS5, PROTOCOL-V2.1.md §1.1):
+  // 23) v2.2 stream emission (Phase E WS5, PROTOCOL-V2.2.md §1.1):
   // faisla (active/v2) + packet build (mV axes, cumulative encoders,
   // module gating). Packet ko wapas rsh_v2_parse_stream se parho —
   // build/parse round-trip hi contract hai.
@@ -3187,13 +3170,13 @@ int main() {
     CHECK(rsh_raw_to_mv(4095) == 3300);
     CHECK(rsh_raw_to_mv(2048) == 1650);
     CHECK(rsh_raw_to_mv(4096) == 3300);  // clamp (4096 kabhi aana nahi chahiye)
-    // --- faisla (SEC-E-14, Phase F: emission sirf authenticated session ko) ---
+    // --- faisla (D3, Phase F: emission sirf GET_CAPS-OK session ko) ---
     CHECK(rsh_stream_emit_kind(0, 0, 0) == RSH_EMIT_NONE);  // koi PC nahi
-    CHECK(rsh_stream_emit_kind(0, 1, 1) == RSH_EMIT_NONE);  // koi PC nahi (auth bhi ho to)
-    CHECK(rsh_stream_emit_kind(1, 0, 0) == RSH_EMIT_NONE);  // active lekin unauthenticated — v1 bhi band
-    CHECK(rsh_stream_emit_kind(1, 1, 0) == RSH_EMIT_NONE);  // active lekin unauthenticated — v2 bhi band
-    CHECK(rsh_stream_emit_kind(1, 0, 1) == RSH_EMIT_V1);    // authenticated legacy peer
-    CHECK(rsh_stream_emit_kind(1, 1, 1) == RSH_EMIT_V2);    // authenticated v2 peer
+    CHECK(rsh_stream_emit_kind(0, 1, 1) == RSH_EMIT_NONE);  // koi PC nahi (GET_CAPS OK bhi ho to)
+    CHECK(rsh_stream_emit_kind(1, 0, 0) == RSH_EMIT_NONE);  // active lekin GET_CAPS nahi — v1 bhi band
+    CHECK(rsh_stream_emit_kind(1, 1, 0) == RSH_EMIT_NONE);  // active lekin GET_CAPS nahi — v2 bhi band
+    CHECK(rsh_stream_emit_kind(1, 0, 1) == RSH_EMIT_V1);    // GET_CAPS-OK legacy peer
+    CHECK(rsh_stream_emit_kind(1, 1, 1) == RSH_EMIT_V2);    // GET_CAPS-OK v2 peer
 
     // Phase F WS5: 5 axes (clutch slot 3 + handbrake slot 4) — sab-on
     // mask 0x1F, packet 36 B (20 + 2*5 + 2*2 + 2). Clutch raw 1024 ->
@@ -3285,7 +3268,7 @@ int main() {
   {
     uint8_t keyA[32], keyB[32];
     for (int i = 0; i < 32; i++) { keyA[i] = (uint8_t)i; keyB[i] = (uint8_t)(0xFF - i); }
-    const uint8_t pw24[] = "Ab3dEf6hJk9mNp2rSt5vWx8Y";  // generated 24-char (§5.1)
+    const uint8_t pw24[] = "Ab3dEf6hJk9mNp2rSt5vWx8Y";  // 24-char test password
     const uint8_t pw8[] = {'A', 'b', '2', 'x', 'Y', '9', '!', '#'};
     uint8_t pw63[63];
     memset(pw63, 'a', sizeof(pw63));
@@ -4344,13 +4327,13 @@ int main() {
     CHECK(rsh_serial_parse_frame(frame, flen, &kind, out, &plen) == RSH_SERIAL_OK);
     CHECK(kind == RSH_SERIAL_KIND_PROBE && plen == 0);
 
-    // Max payload 1053 OK; 1054 reject; kind 0/8 reject; buf chhota reject.
+    // Max payload 1035 OK (v2.2 control max frame); 1036 reject; kind 0/8 reject; buf chhota reject.
     memset(payload, 0xAB, sizeof(payload));
-    flen = rsh_serial_build_frame(frame, sizeof(frame), RSH_SERIAL_KIND_CONTROL, payload, 1053);
+    flen = rsh_serial_build_frame(frame, sizeof(frame), RSH_SERIAL_KIND_CONTROL, payload, 1035);
     CHECK(flen == RSH_SERIAL_MAX_FRAME);
     CHECK(rsh_serial_parse_frame(frame, flen, &kind, out, &plen) == RSH_SERIAL_OK);
-    CHECK(plen == 1053 && memcmp(out, payload, 1053) == 0);
-    CHECK(rsh_serial_build_frame(frame, sizeof(frame), RSH_SERIAL_KIND_CONTROL, payload, 1054) == 0);
+    CHECK(plen == 1035 && memcmp(out, payload, 1035) == 0);
+    CHECK(rsh_serial_build_frame(frame, sizeof(frame), RSH_SERIAL_KIND_CONTROL, payload, 1036) == 0);
     CHECK(rsh_serial_build_frame(frame, sizeof(frame), 0, payload, 1) == 0);
     CHECK(rsh_serial_build_frame(frame, sizeof(frame), 8, payload, 1) == 0);
     CHECK(rsh_serial_build_frame(frame, 10, RSH_SERIAL_KIND_STREAM, payload, 8) == 0);
@@ -4367,9 +4350,9 @@ int main() {
     CHECK(rsh_serial_parse_frame(badcrc, 17, &kind, out, &plen) == RSH_SERIAL_BAD_CRC);
     // Truncated frame (header poora, payload adhoora) -> BAD_LENGTH (B1 rule).
     CHECK(rsh_serial_parse_frame(v1exp, 12, &kind, out, &plen) == RSH_SERIAL_BAD_LENGTH);
-    // Len field 1054 -> BAD_LENGTH; kind 9 -> BAD_LENGTH; extra byte -> BAD_LENGTH.
+    // Len field 1036 -> BAD_LENGTH; kind 9 -> BAD_LENGTH; extra byte -> BAD_LENGTH.
     uint8_t badlen[17];
-    memcpy(badlen, v1exp, 17); badlen[5] = 0x1E; badlen[6] = 0x04;  // len 1054
+    memcpy(badlen, v1exp, 17); badlen[5] = 0x0C; badlen[6] = 0x04;  // len 1036
     CHECK(rsh_serial_parse_frame(badlen, 17, &kind, out, &plen) == RSH_SERIAL_BAD_LENGTH);
     memcpy(badlen, v1exp, 17); badlen[4] = 9;
     CHECK(rsh_serial_parse_frame(badlen, 17, &kind, out, &plen) == RSH_SERIAL_BAD_LENGTH);
@@ -4413,119 +4396,66 @@ int main() {
     memcpy(two, frame, flen); memcpy(two + flen, frame, flen);
     CHECK(rsh_serial_decoder_feed_buf(&dec, two, 2 * flen) == 2);
     CHECK(dec.frames_ok == 2);
-    // Oversize len header (kind 4, len 1054) -> bad_length, resync.
+    // Oversize len header (kind 4, len 1036) -> bad_length, resync.
     rsh_serial_decoder_init(&dec);
-    uint8_t oshdr[7] = {'R', 'S', 'H', 'S', 4, 0x1E, 0x04};
+    uint8_t oshdr[7] = {'R', 'S', 'H', 'S', 4, 0x0C, 0x04};
     CHECK(rsh_serial_decoder_feed_buf(&dec, oshdr, 7) == 0);
     CHECK(dec.bad_length == 1);
     CHECK(rsh_serial_decoder_feed_buf(&dec, frame, flen) == 1);
     CHECK(dec.frames_ok == 1);
   }
 
-  // ============ §34: firmware v4.0.2 (F-01..F-16) ============
-  // Net.cpp / rsh.ino wiring (AP lock after GET_CAPS, serial HELO window,
-  // LED PairWindow state, horn OR) host par nahi chalti — wo pio build +
-  // real-board HIL se cover hoti hai (gate doc). Yahan pure logic hai.
+  // ============ §34: firmware v4.0.3 (F-01..F-16, v2.2) ============
+  // Net.cpp / rsh.ino wiring (AP open/password, serial HELO, horn OR)
+  // host par nahi chalti — wo pio build + real-board HIL se cover hoti
+  // hai (gate doc). Yahan pure logic hai. Pairing khatam (D1/D7):
+  // 3 s pair branch + pairing window + new-session gate delete hue.
   {
-    // --- F-02: pair-button thresholds (safemode.h, 3/5/10 s) ---
+    // --- F-02 v2.2: BOOT-hold thresholds (safemode.h, 5/10 s) ---
     rsh_boothold_t h;
     // 2 s hold + release -> kuch nahi.
     rsh_boothold_init(&h);
     CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
     CHECK(rsh_boothold_update(&h, 1, 2000) == RSH_HOLD_NONE);
     CHECK(rsh_boothold_update(&h, 0, 2001) == RSH_HOLD_NONE);
-    // 2.999 s hold + release -> abhi bhi kuch nahi (3 s poora nahi).
+    // 4.999 s hold + release -> abhi bhi kuch nahi (5 s poora nahi).
     rsh_boothold_init(&h);
     CHECK(rsh_boothold_update(&h, 1, 1000) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 1, 3999) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 0, 4000) == RSH_HOLD_NONE);
-    // 3 s hold + 3.5 s par release -> PAIR_WINDOW (ek dafa).
-    rsh_boothold_init(&h);
-    CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 1, 3000) == RSH_HOLD_NONE);  // arm, koi event nahi
-    CHECK(rsh_boothold_update(&h, 1, 3500) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 0, 3501) == RSH_HOLD_PAIR_WINDOW);
-    CHECK(rsh_boothold_update(&h, 0, 3600) == RSH_HOLD_NONE);  // dobara release: kuch nahi
-    // 4.999 s hold + release -> PAIR_WINDOW (5 s se pehle chhora).
-    rsh_boothold_init(&h);
-    CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
     CHECK(rsh_boothold_update(&h, 1, 4999) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 0, 4999) == RSH_HOLD_PAIR_WINDOW);
-    // 5 s hold -> SAFE_MODE, release par pair CANCEL (kuch nahi).
+    CHECK(rsh_boothold_update(&h, 0, 5000) == RSH_HOLD_NONE);
+    // 5 s hold -> SAFE_MODE (ek dafa), release par kuch nahi.
     rsh_boothold_init(&h);
     CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
     CHECK(rsh_boothold_update(&h, 1, 5000) == RSH_HOLD_SAFE_MODE);
     CHECK(rsh_boothold_update(&h, 1, 6000) == RSH_HOLD_NONE);  // ek dafa hi fire
     CHECK(rsh_boothold_update(&h, 0, 6001) == RSH_HOLD_NONE);
-    // 10 s hold -> KEY_RESET_ARMED, release par kuch nahi.
+    // 10 s hold -> KEY_RESET_CLEAR (password clear, D7), release par kuch nahi.
     rsh_boothold_init(&h);
     CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
     CHECK(rsh_boothold_update(&h, 1, 5000) == RSH_HOLD_SAFE_MODE);
-    CHECK(rsh_boothold_update(&h, 1, 10000) == RSH_HOLD_KEY_RESET_ARMED);
+    CHECK(rsh_boothold_update(&h, 1, 10000) == RSH_HOLD_KEY_RESET_CLEAR);
     CHECK(rsh_boothold_update(&h, 1, 11000) == RSH_HOLD_NONE);
     CHECK(rsh_boothold_update(&h, 0, 11001) == RSH_HOLD_NONE);
-    // Dobara press: pehla pair ke baad detector phir 0 se shuru.
+    // Dobara press: detector phir 0 se shuru.
     rsh_boothold_init(&h);
     CHECK(rsh_boothold_update(&h, 1, 0) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 1, 3500) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 0, 3501) == RSH_HOLD_PAIR_WINDOW);
+    CHECK(rsh_boothold_update(&h, 1, 4000) == RSH_HOLD_NONE);
+    CHECK(rsh_boothold_update(&h, 0, 4001) == RSH_HOLD_NONE);
     CHECK(rsh_boothold_update(&h, 1, 5000) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 1, 7000) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 0, 7001) == RSH_HOLD_NONE);  // sirf 2 s hold
-    // Wrap-around: 0xFFFFFF00 se shuru, 3 s hold + release -> PAIR_WINDOW.
+    CHECK(rsh_boothold_update(&h, 1, 9000) == RSH_HOLD_NONE);  // sirf 4 s hold
+    CHECK(rsh_boothold_update(&h, 1, 10000) == RSH_HOLD_SAFE_MODE);  // 5000+5000
+    CHECK(rsh_boothold_update(&h, 0, 10001) == RSH_HOLD_NONE);
+    // Wrap-around: 0xFFFFFF00 se shuru, 5 s hold -> SAFE_MODE.
     rsh_boothold_init(&h);
     CHECK(rsh_boothold_update(&h, 1, 0xFFFFFF00u) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 1, 0xFFFFFF00u + 3000) == RSH_HOLD_NONE);
-    CHECK(rsh_boothold_update(&h, 0, 0xFFFFFF00u + 3500) == RSH_HOLD_PAIR_WINDOW);
-
-    // --- F-02/F-03: pairing window (pairing_window.h) ---
-    RshPairWindow w;
-    rsh_pair_window_init(&w);
-    CHECK(rsh_pair_window_is_open(&w, 0, 1) == 0);
-    CHECK(rsh_pair_window_remaining_s(&w, 0, 1) == 0);
-    // Boot window 60 s: 59999 ms par khuli (59 s baqi), 60000 par band.
-    rsh_pair_window_open(&w, 1000, RSH_PAIR_WINDOW_BOOT_MS, 1);
-    CHECK(rsh_pair_window_is_open(&w, 1000 + 59999, 1) == 1);
-    CHECK(rsh_pair_window_remaining_s(&w, 1000 + 1000, 1) == 59);
-    CHECK(rsh_pair_window_is_open(&w, 1000 + 60000, 1) == 0);
-    CHECK(rsh_pair_window_remaining_s(&w, 1000 + 60000, 1) == 0);
-    // Button window 120 s: 119999 ms par khuli, 120000 par band.
-    rsh_pair_window_open(&w, 70000, RSH_PAIR_WINDOW_BUTTON_MS, 1);
-    CHECK(rsh_pair_window_is_open(&w, 70000 + 119999, 1) == 1);
-    CHECK(rsh_pair_window_remaining_s(&w, 70000 + 1000, 1) == 119);
-    CHECK(rsh_pair_window_is_open(&w, 70000 + 120000, 1) == 0);
-    // Refresh (serial HELO): dobara kholne se deadline aage barhti hai.
-    rsh_pair_window_open(&w, 200000, RSH_PAIR_WINDOW_BUTTON_MS, 1);
-    rsh_pair_window_open(&w, 250000, RSH_PAIR_WINDOW_BUTTON_MS, 1);
-    CHECK(rsh_pair_window_is_open(&w, 200000 + 120000, 1) == 1);  // purani deadline guzar gayi
-    CHECK(rsh_pair_window_is_open(&w, 250000 + 120000, 1) == 0);
-    // Paired board: open no-op, kabhi khuli nahi.
-    rsh_pair_window_init(&w);
-    rsh_pair_window_open(&w, 0, RSH_PAIR_WINDOW_BUTTON_MS, 0);
-    CHECK(rsh_pair_window_is_open(&w, 1000, 0) == 0);
-    CHECK(rsh_pair_window_remaining_s(&w, 1000, 0) == 0);
-    // Wrap-around: 0xFFFFFF00 + 120 s window, deadline ke paar bhi khuli.
-    rsh_pair_window_init(&w);
-    rsh_pair_window_open(&w, 0xFFFFFF00u, RSH_PAIR_WINDOW_BUTTON_MS, 1);
-    CHECK(rsh_pair_window_is_open(&w, 0xFFFFFF00u + 60000, 1) == 1);
-    CHECK(rsh_pair_window_is_open(&w, 0xFFFFFF00u + 120000, 1) == 0);
+    CHECK(rsh_boothold_update(&h, 1, 0xFFFFFF00u + 5000) == RSH_HOLD_SAFE_MODE);
+    CHECK(rsh_boothold_update(&h, 1, 0xFFFFFF00u + 10000) == RSH_HOLD_KEY_RESET_CLEAR);
 
     // --- F-04/F-05/F-07: rate limits + rescan gate (net_logic.h) ---
     CHECK(rsh_hello_reply_allowed(0) == 0);
     CHECK(rsh_hello_reply_allowed(249) == 0);
     CHECK(rsh_hello_reply_allowed(250) == 1);   // 500 ms -> 250 ms (F-04)
     CHECK(rsh_hello_reply_allowed(10000) == 1);
-    // New session: unauthenticated hamesha OK; authenticated + 10 s OK.
-    CHECK(rsh_new_session_allowed(0, 0, 0, 0) == 1);
-    CHECK(rsh_new_session_allowed(1, 10000, 0, 0) == 1);
-    CHECK(rsh_new_session_allowed(1, 10001, 0, 0) == 1);
-    // Same IP + stale (>2 s) -> OK; same IP + live -> reject.
-    CHECK(rsh_new_session_allowed(1, 5000, 1, 1) == 1);
-    CHECK(rsh_new_session_allowed(1, 5000, 1, 0) == 0);
-    // Different IP -> 10 s paband, stale bhi nahi bacha sakta.
-    CHECK(rsh_new_session_allowed(1, 5000, 0, 1) == 0);
-    CHECK(rsh_new_session_allowed(1, 5000, 0, 0) == 0);
-    CHECK(rsh_new_session_allowed(1, 9999, 1, 1) == 1);
     // Rescan: sirf auto-channel ON + koi PC active nahi.
     CHECK(rsh_rescan_allowed(0, 0) == 0);
     CHECK(rsh_rescan_allowed(0, 1) == 0);
@@ -4762,21 +4692,21 @@ int main() {
     CHECK(dl.heap_min_kb == 100);
     rsh_diag_record(&dl, RSH_DIAG_BOOT, 2, 0);
     rsh_diag_record(&dl, RSH_DIAG_AP_UP, 6, 1000);
-    rsh_diag_record(&dl, RSH_DIAG_WINDOW_OPEN, 0, 2000);
+    rsh_diag_record(&dl, RSH_DIAG_PASSWORD_CLEARED, 0, 2000);
     CHECK(dl.count == 3 && dl.total == 3);
     uint8_t db[230];
-    size_t dlen = rsh_diag_build_body(&dl, 45, db, sizeof(db));
+    size_t dlen = rsh_diag_build_body(&dl, 0, db, sizeof(db));
     CHECK(dlen == 6 + 3 * 7);
     CHECK(db[0] == 2);                    // boot reason
     CHECK(db[1] == 100 && db[2] == 0);    // heap_min_kb LE
-    CHECK(db[3] == 45 && db[4] == 0);     // window_remaining_s LE
+    CHECK(db[3] == 0 && db[4] == 0);      // reserved u16 (D10) — hamesha 0
     CHECK(db[5] == 3);                    // event count
     CHECK(db[6] == 0 && db[7] == 0 && db[8] == 0 && db[9] == 0);  // ts 0
     CHECK(db[10] == RSH_DIAG_BOOT && db[11] == 2 && db[12] == 0);  // code + value LE
     CHECK(db[13] == 0xE8 && db[14] == 0x03 && db[15] == 0 && db[16] == 0);  // ts 1000
     CHECK(db[17] == RSH_DIAG_AP_UP && db[18] == 6 && db[19] == 0);
     CHECK(db[20] == 0xD0 && db[21] == 0x07 && db[22] == 0 && db[23] == 0);  // ts 2000
-    CHECK(db[24] == RSH_DIAG_WINDOW_OPEN && db[25] == 0 && db[26] == 0);
+    CHECK(db[24] == RSH_DIAG_PASSWORD_CLEARED && db[25] == 0 && db[26] == 0);
     // Ring wrap: 35 events -> count 32, total 35, oldest-first #4 se shuru.
     RshDiagLog dl2;
     rsh_diag_init(&dl2);
@@ -4857,8 +4787,8 @@ int main() {
 
     // --- F-12: version single source (version.h + modules.h + config.h) ---
     CHECK(RSH_FW_VERSION_MAJOR == 4 && RSH_FW_VERSION_MINOR == 0 &&
-          RSH_FW_VERSION_PATCH == 2);
-    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.2") == 0);
+          RSH_FW_VERSION_PATCH == 3);
+    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.3") == 0);
     CHECK(strcmp(FIRMWARE_VERSION, RSH_FW_VERSION_STRING) == 0);
     CHECK(RSH_CAPS_FW_MAJOR == RSH_FW_VERSION_MAJOR &&
           RSH_CAPS_FW_MINOR == RSH_FW_VERSION_MINOR &&
@@ -4933,54 +4863,53 @@ int main() {
     CHECK(rsh_led_driver_has_persistent(&drv) == 0);
   }
 
-  // ============ §35: deep-scan DS-11/DS-64/DS-65/DS-75 diag codes ============
+  // ============ §35: deep-scan DS-11/DS-64/DS-65/DS-75 diag codes (v2.2) ============
   {
     // Naye codes distinct hon, nonzero hon, aur GET_DIAG body mein
     // round-trip hon (code byte + value LE) — host/CI assertion ke
     // DS-64 ki "shipped build ki WDT config wahi hai jo code assume
-    // karta hai" wali shart ka host-side hissa.
+    // karta hai" wali shart ka host-side hissa. KEY_RESET_EXPIRED /
+    // KEY_RESET_ARMED / AP_LOCKED / PAIRED codes v2.2 mein DELETE hain
+    // (D7/D10) — values kabhi dobara istemal nahi hoti.
     CHECK(RSH_DIAG_AP_RESTART_FAIL == 13);
-    CHECK(RSH_DIAG_KEY_RESET_EXPIRED == 14);
+    CHECK(RSH_DIAG_PASSWORD_CLEARED == 17);
     CHECK(RSH_DIAG_WDT_STATE == 15);
     CHECK(RSH_DIAG_KEYSTORE_NVS_FAIL == 16);
-    CHECK(RSH_DIAG_AP_RESTART_FAIL != RSH_DIAG_AP_LOCKED);
-    CHECK(RSH_DIAG_KEY_RESET_EXPIRED != RSH_DIAG_KEY_RESET_ARMED);
     CHECK(RSH_DIAG_WDT_STATE != RSH_DIAG_BOOT);
-    CHECK(RSH_DIAG_KEYSTORE_NVS_FAIL != RSH_DIAG_PAIRED);
+    CHECK(RSH_DIAG_PASSWORD_CLEARED != RSH_DIAG_KEYSTORE_NVS_FAIL);
     RshDiagLog dl3;
     rsh_diag_init(&dl3);
-    // value semantics: AP fail 0 = lock, 1 = password restart, 2 = rescan;
-    // WDT 0 = subscribed now, 1 = already subscribed, 2 = failed.
-    rsh_diag_record(&dl3, RSH_DIAG_AP_RESTART_FAIL, 0, 100);
-    rsh_diag_record(&dl3, RSH_DIAG_AP_RESTART_FAIL, 1, 200);
-    rsh_diag_record(&dl3, RSH_DIAG_AP_RESTART_FAIL, 2, 300);
-    rsh_diag_record(&dl3, RSH_DIAG_KEY_RESET_EXPIRED, 0, 400);
-    rsh_diag_record(&dl3, RSH_DIAG_WDT_STATE, 1, 500);
-    rsh_diag_record(&dl3, RSH_DIAG_KEYSTORE_NVS_FAIL, 0, 600);
-    CHECK(dl3.count == 6 && dl3.total == 6);
+    // value semantics: AP fail 1 = password restart, 2 = rescan
+    // (value 0 = lock, v2.2 mein retired); WDT 0 = subscribed now,
+    // 1 = already subscribed, 2 = failed; PASSWORD_CLEARED value 0.
+    rsh_diag_record(&dl3, RSH_DIAG_AP_RESTART_FAIL, 1, 100);
+    rsh_diag_record(&dl3, RSH_DIAG_AP_RESTART_FAIL, 2, 200);
+    rsh_diag_record(&dl3, RSH_DIAG_PASSWORD_CLEARED, 0, 300);
+    rsh_diag_record(&dl3, RSH_DIAG_WDT_STATE, 1, 400);
+    rsh_diag_record(&dl3, RSH_DIAG_KEYSTORE_NVS_FAIL, 0, 500);
+    CHECK(dl3.count == 5 && dl3.total == 5);
     uint8_t db3[230];
     size_t dlen3 = rsh_diag_build_body(&dl3, 0, db3, sizeof(db3));
-    CHECK(dlen3 == 6 + 6 * 7);
-    CHECK(db3[6 + 0 * 7 + 4] == RSH_DIAG_AP_RESTART_FAIL && db3[6 + 0 * 7 + 5] == 0);
-    CHECK(db3[6 + 1 * 7 + 4] == RSH_DIAG_AP_RESTART_FAIL && db3[6 + 1 * 7 + 5] == 1);
-    CHECK(db3[6 + 2 * 7 + 4] == RSH_DIAG_AP_RESTART_FAIL && db3[6 + 2 * 7 + 5] == 2);
-    CHECK(db3[6 + 3 * 7 + 4] == RSH_DIAG_KEY_RESET_EXPIRED);
-    CHECK(db3[6 + 4 * 7 + 4] == RSH_DIAG_WDT_STATE && db3[6 + 4 * 7 + 5] == 1);
-    CHECK(db3[6 + 5 * 7 + 4] == RSH_DIAG_KEYSTORE_NVS_FAIL);
+    CHECK(dlen3 == 6 + 5 * 7);
+    CHECK(db3[6 + 0 * 7 + 4] == RSH_DIAG_AP_RESTART_FAIL && db3[6 + 0 * 7 + 5] == 1);
+    CHECK(db3[6 + 1 * 7 + 4] == RSH_DIAG_AP_RESTART_FAIL && db3[6 + 1 * 7 + 5] == 2);
+    CHECK(db3[6 + 2 * 7 + 4] == RSH_DIAG_PASSWORD_CLEARED);
+    CHECK(db3[6 + 3 * 7 + 4] == RSH_DIAG_WDT_STATE && db3[6 + 3 * 7 + 5] == 1);
+    CHECK(db3[6 + 4 * 7 + 4] == RSH_DIAG_KEYSTORE_NVS_FAIL);
 
-    // R2-47: key-reset-expiry replay order — pichle boot ki expiry event
-    // BOOT event se PEHLE ring mein aati hai (oldest-first), taake
-    // diagnostics mein expiry reboot se pehle dikhe. (Persist/replay
+    // D7 (R2-47 krExp pattern): password-clear replay order — pichle boot
+    // ka clear event BOOT event se PEHLE ring mein aata hai (oldest-first),
+    // taake diagnostics mein clear reboot se pehle dikhe. (Persist/replay
     // khud Arduino NVS par hai — host par sirf ye order convention
     // assert hoti hai, jis par rsh.ino ka replay bharosa karta hai.)
     RshDiagLog dl4;
     rsh_diag_init(&dl4);
-    rsh_diag_record(&dl4, RSH_DIAG_KEY_RESET_EXPIRED, 0, 10);
+    rsh_diag_record(&dl4, RSH_DIAG_PASSWORD_CLEARED, 0, 10);
     rsh_diag_record(&dl4, RSH_DIAG_BOOT, 4, 20);
     CHECK(dl4.count == 2);
     uint8_t db4[230];
     CHECK(rsh_diag_build_body(&dl4, 0, db4, sizeof(db4)) == 6 + 2 * 7);
-    CHECK(db4[6 + 0 * 7 + 4] == RSH_DIAG_KEY_RESET_EXPIRED);
+    CHECK(db4[6 + 0 * 7 + 4] == RSH_DIAG_PASSWORD_CLEARED);
     CHECK(db4[6 + 1 * 7 + 4] == RSH_DIAG_BOOT);
   }
 

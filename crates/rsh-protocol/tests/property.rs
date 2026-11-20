@@ -28,13 +28,11 @@ proptest! {
         let _ = ConfigBlob::decode(&bytes);
     }
 
-    /// Control parser + tag verifier never panic on arbitrary bytes.
+    /// Control parser + CRC verifier never panic on arbitrary bytes.
     #[test]
     fn control_parser_never_panics(bytes in arb_bytes(1060)) {
-        let key = [0x11u8; 32];
-        let nonce = [0x22u8; 16];
         let _ = ControlFrame::parse_structure(&bytes);
-        let _ = ControlFrame::verify(&bytes, &key, &nonce);
+        let _ = ControlFrame::verify(&bytes);
     }
 
     /// Round-trip: decode(encode(p)) == p for stream frames.
@@ -92,47 +90,36 @@ proptest! {
         prop_assert_eq!(decoded, packet);
     }
 
-    /// Round-trip: control frames (tag included).
+    /// Round-trip: control frames (CRC included). Opcodes exclude the
+    /// deleted 0x0B KEY_RESET.
     #[test]
     fn control_round_trip(
-        cmd in 1u8..=12,
+        cmd in prop::sample::select(vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12]),
         req_id in any::<u16>(),
-        counter in any::<u32>(),
         payload in prop::collection::vec(any::<u8>(), 0..=64),
     ) {
-        let key = [0xabu8; 32];
-        let nonce = [0xcdu8; 16];
-        let frame = ControlFrame { cmd, req_id, counter, payload: payload.clone() };
-        let bytes = frame.encode(&key, &nonce).expect("payload <= 1024");
-        let decoded = ControlFrame::verify(&bytes, &key, &nonce).expect("round-trip verifies");
+        let frame = ControlFrame { cmd, req_id, payload: payload.clone() };
+        let bytes = frame.encode().expect("payload <= 1024");
+        let decoded = ControlFrame::verify(&bytes).expect("round-trip verifies");
         prop_assert_eq!(decoded, frame);
     }
 
-    /// Round-trip: HELLO replies (both paired and unpaired shapes).
+    /// Round-trip: HELLO replies (v2.2 — only the safe_mode flag bit
+    /// may be set; the reserved nonce/key/password fields stay zero).
     #[test]
     fn hello_round_trip(
-        flags in prop::collection::vec(any::<bool>(), 4),
+        safe_mode in any::<bool>(),
         session_echo in 0u8..=1,
         mac in prop::collection::vec(any::<u8>(), 6),
-        nonce in prop::collection::vec(any::<u8>(), 16),
     ) {
-        let flags_byte: u8 = flags.iter().enumerate()
-            .map(|(i, b)| u8::from(*b) << i).sum();
         let mut mac_arr = [0u8; 6];
         mac_arr.copy_from_slice(&mac);
-        let mut nonce_arr = [0u8; 16];
-        nonce_arr.copy_from_slice(&nonce);
-        let unpaired = flags_byte & 0x01 != 0;
-        let window = flags_byte & 0x08 != 0;
-        let (key, pw) = if unpaired && window {
-            ([0x55u8; 32], [b'A'; 24])
-        } else {
-            ([0u8; 32], [0u8; 24])
-        };
         let reply = HelloReply {
-            flags: flags_byte, session_echo, board_mac: mac_arr,
-            firmware: (4, 0, 1), nonce: nonce_arr,
-            device_key: key, wifi_password: pw,
+            protocol: (2, 2),
+            flags: u8::from(safe_mode) << 2,
+            session_echo, board_mac: mac_arr,
+            firmware: (4, 0, 3), nonce: [0u8; 16],
+            device_key: [0u8; 32], wifi_password: [0u8; 24],
         };
         let bytes = reply.encode();
         prop_assert_eq!(bytes.len(), 92);
@@ -198,26 +185,16 @@ proptest! {
         }
     }
 
-    /// Single-byte flip in a valid control frame -> reject (tag or structure).
-    /// Exception: bytes 5–6 are `reqId`, which is deliberately NOT in the
-    /// HMAC (v2.1-frozen, SEC-D-07a analysis). Flipping `reqId` still
-    /// verifies — the changed reqId can only yield DUPLICATE (cached
-    /// pair) or REPLAY (old counter), never a new execution — so those
-    /// two positions are asserted to verify with a changed reqId instead.
+    /// Single-byte flip in a valid control frame -> reject (CRC or
+    /// structure). In v2.2 every header byte is CRC-covered — including
+    /// `reqId`, which the v2.1 HMAC deliberately did not cover — so
+    /// there is no exception position anymore.
     #[test]
-    fn control_single_byte_flip_rejects(idx in 0usize..29) {
-        let key = [0x01u8; 32];
-        let nonce = [0x02u8; 16];
-        let frame = ControlFrame { cmd: 1, req_id: 1, counter: 0, payload: vec![] };
-        let mut bytes = frame.encode(&key, &nonce).expect("encode");
+    fn control_single_byte_flip_rejects(idx in 0usize..11) {
+        let frame = ControlFrame { cmd: 1, req_id: 1, payload: vec![] };
+        let mut bytes = frame.encode().expect("encode");
         bytes[idx] ^= 0xFF;
-        if idx == 5 || idx == 6 {
-            let decoded = ControlFrame::verify(&bytes, &key, &nonce)
-                .expect("reqId is not covered by the HMAC, so it still verifies");
-            prop_assert_ne!(decoded.req_id, 1);
-        } else {
-            prop_assert!(ControlFrame::verify(&bytes, &key, &nonce).is_err(),
-                "flipped byte {idx} must reject");
-        }
+        prop_assert!(ControlFrame::verify(&bytes).is_err(),
+            "flipped byte {idx} must reject");
     }
 }

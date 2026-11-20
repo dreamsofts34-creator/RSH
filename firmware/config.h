@@ -123,16 +123,26 @@
 #define RSH_AUTO_CHANNEL 0
 
 // ---------- WiFi / Network ----------
-#define WIFI_SSID    "RSH"
+// SSID: "RSH-XXXX" (D4, v2.2) — aakhri 4 hex board ke softAP Wi-Fi MAC ke
+// (uppercase, per board fixed; misal MAC ...9A:55 -> "RSH-9A55"). Ye
+// compile-time string NAHI hai — net.cpp softAP shuru karne se pehle
+// WiFi.softAPmacAddress() se banata hai (wahi MAC jo HELLO board_mac
+// mein jata hai, is liye SSID suffix aur HELLO MAC hamesha milte hain).
+// WIFI_SSID macro khatam — koi fixed SSID nahi raha.
+#define RSH_SSID_PREFIX  "RSH-"
 // mDNS hostname (Phase G, C2/D33): board `rsh.local` par announce hota
 // hai (net.cpp MDNS.begin). PC EspAddress.MdnsHostname ("rsh.local")
 // isi se banta hai — hostname badlo to dono jagah badlo (aur OTA_HOSTNAME
 // bhi yahi hai — teeno ek naam hon).
 #define RSH_MDNS_HOSTNAME "rsh"
-// WIFI_PASS: KOI DEFAULT NAHI (SEC-C-04). Har board pehle boot par apna
-// 24-char random password banata hai (keystore.h/.cpp, NVS mein) —
-// Wi-Fi join aur WebOTA login dono ke liye yahi ek password hai
-// (PROTOCOL-V2.1 §5.1). Compile-time password kabhi nahi hota.
+// WIFI_PASS: KOI DEFAULT NAHI (SEC-C-04) aur koi generated password bhi
+// NAHI (v2.2: pehle boot par board khud password NAHI banata — AP tab tak
+// KHULA rehta hai jab tak user Settings se password set na kare, D3/D6).
+// Password sirf user-set hota hai (SET_PASSWORD 0x0C, NVS "wifipw2" mein
+// obfuscated — keystore.h/.cpp); Wi-Fi join aur WebOTA login dono ke liye
+// yahi ek password hai (PROTOCOL-V2.2 §5.2). Compile-time password kabhi
+// nahi hota. BOOT >= 10 s hold password mita kar AP dobara khula kar deta
+// hai (D7).
 #define WIFI_CHANNEL 0                 // 0 = auto: boot par 1/6/11 scan karke
                                        // sab se khaali channel khud chunta hai.
                                        // 1-13 rakho to wahi channel fix rahega.
@@ -142,7 +152,7 @@
 #define TX_POWER          WIFI_POWER_19_5dBm
 #define PORT_HELLO       4210   // PC -> ESP "HELO"
 #define PORT_DATA        4211   // ESP -> PC data
-#define PORT_CTRL        4212   // PC <-> ESP control (HMAC, §3) + ping (§9) — demux magic se
+#define PORT_CTRL        4212   // PC <-> ESP control (§3) + ping (§9) — demux magic se
 #define HELLO_TIMEOUT_MS 2000   // itni der HELO na aye to bhejna band
 
 // ---------- Advanced features ----------
@@ -153,7 +163,7 @@
 // hai aur LED 5 Hz blink karti hai.
 // RSH_OTA 0 = ArduinoOTA BAND (SEC-D-02): ye doosra OTA rasta tha, us ka
 // apna auth tha aur koi rate limit nahi — WebOTA hi waahid OTA rasta hai.
-// Dobara kholo to rsh.ino ota_begin() runtime per-device password istemal
+// Dobara kholo to rsh.ino ota_begin() runtime user-set password istemal
 // karta hai (koi default nahi); baghair lockout ke kabhi enable mat karo.
 #define RSH_OTA 0
 #define OTA_HOSTNAME "rsh"
@@ -161,14 +171,14 @@
 // ArduinoOTA/WebOTA dono runtime password istemal karte hain.
 
 // Web OTA: browser se update — RSH WiFi se jur kar
-// http://192.168.4.1 kholo, login (user neeche, password = per-device
+// http://192.168.4.1 kholo, login (user neeche, password = user-set Wi-Fi
 // password) karke signed .bin upload karo. Dual partition ki wajah se
 // failed upload par purana firmware mehfooz rehta hai.
 #define RSH_WEB_OTA 1
 #define WEB_OTA_USER "admin"
 
 // SEC-D-01: unauthenticated remote restart ("RSTX") KHATAM — RSH_ALLOW_
-// REMOTE_RESTART hata diya gaya. Restart sirf HMAC-signed REBOOT (0x09,
+// REMOTE_RESTART hata diya gaya. Restart sirf REBOOT (0x09,
 // PROTOCOL §3.3) se hota hai (net_poll_ctrl → dispatcher). PC side:
 // HelloClient.SendRestartAsync (RSTX) ko ControlClient REBOOT par
 // migrate karna hai — PC-side team ko bata diya gaya hai.

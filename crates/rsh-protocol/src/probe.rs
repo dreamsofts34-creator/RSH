@@ -1,12 +1,13 @@
 //! `PIN_PROBE` stream frames (§3.8).
 //!
 //! During a probe the board sends one frame per 100 ms on port 4211:
-//! `"RSHP" | ver 0x21 | seq u16 | pin u8 | mode u8 | sampleCount u16 |
+//! `"RSHP" | ver 0x22 | seq u16 | pin u8 | mode u8 | sampleCount u16 |
 //! samples | CRC16`. Mode 0 samples are `u8` levels (0/1); mode 1
 //! samples are `u16` LE millivolts. `sampleCount` is 1–64.
 
 use crate::crc::{crc16, verify_crc16_trailer};
 use crate::error::ProbeError;
+use crate::stream::VERSION;
 
 /// Maximum samples per probe frame.
 pub const MAX_PROBE_SAMPLES: usize = 64;
@@ -56,7 +57,7 @@ impl ProbeFrame {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(13 + self.samples.len() * 2);
         out.extend_from_slice(b"RSHP");
-        out.push(0x21);
+        out.push(VERSION);
         out.extend_from_slice(&self.seq.to_le_bytes());
         out.push(self.pin);
         out.push(self.mode);
@@ -90,7 +91,7 @@ impl ProbeFrame {
         if &data[0..4] != b"RSHP" {
             return Err(ProbeError::BadMagic);
         }
-        if data[4] != 0x21 || data[8] > 1 {
+        if data[4] != VERSION || data[8] > 1 {
             return Err(ProbeError::BadVersion);
         }
         let sample_count = u16::from_le_bytes([data[9], data[10]]) as usize;

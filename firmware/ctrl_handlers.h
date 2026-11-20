@@ -1,13 +1,13 @@
 #pragma once
 // FW-3/FW-4 control handler (FW-7/8 wiring follow-up) — PURE (Arduino-free)
 // taake host par unit test ho sake. net.cpp ka net_ctrl_handler FW-3/FW-4
-// commands (SET_CFG / COMMIT / CONFIRM / REVERT / GET_CFG / KEY_RESET) ko
+// commands (SET_CFG / COMMIT / CONFIRM / REVERT / GET_CFG / SET_PASSWORD) ko
 // yahan delegate karta hai; GET_CAPS / REBOOT net.cpp mein rehte hain.
 //
 // Handler contract (ctrl.h): status return karo; reply_body mein status
 // KE BAGHAIR body bharo (dispatcher status khud prepend karta hai).
 //
-// Reply formats (PROTOCOL-V2.1.md §3.3/§3.5/§3.6):
+// Reply formats (PROTOCOL-V2.2.md §3.3/§3.5/§3.6):
 //   GET_CFG   -> status, totalLen u16, offset u16, data...
 //              wantLen > 1019 ho to 1019 par clamp hota hai (dispatcher ki
 //              body had 1023 B hai: 4 header + 1019 data; PC baaqi offset
@@ -19,19 +19,21 @@
 //              Dobara COMMIT (retry) wahi deadline deta hai (idempotent).
 //   CONFIRM   -> status (khaali body).
 //   REVERT    -> status (khaali body).
-//   KEY_RESET -> status (khaali body). Sirf armed state mein (BOOT-hold
-//              >= 10 s, 120 s window); warna UNSUPPORTED. Kamyabi par
-//              key_reset_request() bulaya jata hai — asal rotation +
-//              reboot caller karta hai (reply bhejne KE BAAD, warna reply
-//              ka HMAC tag nayi key se banta aur PC verify na kar pata —
-//              REBOOT wala deferred pattern, SEC-D-01 jaisa).
-//   SET_PASSWORD -> status (khaali body). Payload: newLen u8 (8..63) +
-//              password bytes (printable ASCII 0x21-0x7E, §5.2). Kamyabi
-//              par password_change_request() bulaya jata hai — asal NVS
-//              write + AP restart caller karta hai (reply bhejne KE BAAD,
-//              §5.2: reply OK restart se PEHLE). Retry wahi password se
-//              idempotent hai (dobara wahi value likhi jati hai); retry
-//              alag password se naya execution hai (naya counter, §3.2).
+//   KEY_RESET (0x0B) — v2.2 mein DELETE (wire opcode khatam; password
+//              clear sirf physical BOOT-hold se hota hai, D7). Handler ko
+//              0x0B mile to default UNSUPPORTED deta hai.
+//   SET_PASSWORD -> status (khaali body). Payload v2.2 (D3): curLen u8 +
+//              currentPw[curLen] + newLen u8 + newPw[newLen]. curLen = 0
+//              matlab "koi current password nahi" (pehli setup / koi
+//              password stored nahi). Koi password stored ho aur curLen
+//              0 ho ya current password ghalat ho -> BAD_PASSWORD (1).
+//              Naya password: 8..63 printable ASCII 0x21-0x7E (§5.2).
+//              Kamyabi par password_change_request() bulaya jata hai —
+//              asal NVS write + AP restart caller karta hai (reply bhejne
+//              KE BAAD, §5.2: reply OK restart se PEHLE). Retry wahi
+//              password se idempotent hai (dobara wahi value likhi jati
+//              hai); retry alag password se naya execution hai (naya
+//              reqId, §3.2).
 //   LED_TEST -> status (khaali body). Payload: 8 B pattern request (§3.7).
 //              Kamyabi par led_test_request() bulaya jata hai (deferred —
 //              reply ke baad driver start karta hai). Callback NULL ho to
@@ -42,7 +44,7 @@
 //   FACTORY_RESET -> status (khaali body). Payload: koi nahi (len != 0
 //              -> UNSUPPORTED). Config factory defaults par wapas
 //              (factory blob load + persist); key/password ko haath NAHI
-//              lagta (keystore alag hai — KEY_RESET alag command hai).
+//              lagta (keystore alag hai — password clear BOOT-hold se hota hai, D7).
 //              Staged/previous state saaf ho jata hai (load_current
 //              has_previous=0, state IDLE). Reboot ki zaroorat nahi —
 //              live blob badalte hi caller ka blob-change detector
@@ -50,8 +52,10 @@
 //   Unknown cmd -> UNSUPPORTED (execute nahi hota).
 //
 // Malformed payload (SET_CFG len != 8+chunkLen, GET_CFG len != 4,
-// COMMIT/CONFIRM/REVERT/KEY_RESET len != 0) -> UNSUPPORTED. Frame khud
-// (magic/len/tag) dispatcher pehle hi verify kar chuka hota hai (§3.2).
+// COMMIT/CONFIRM/REVERT len != 0, SET_PASSWORD shape ghalat) ->
+// UNSUPPORTED. Frame khud (magic/len/CRC) dispatcher pehle hi verify kar
+// chuka hota hai (§3.2). Ghalat current password -> BAD_PASSWORD (1),
+// payload-shape ghalat hone par nahi (wo UNSUPPORTED hai).
 //
 // Callbacks ctx mein hain taake host tests fake de sakein; production
 // mein net.cpp asal functions deta hai (millis, NVS persist, armed state).
@@ -71,11 +75,12 @@
 
 typedef struct {
   rsh_cfg_txn_t *txn;  // FW-4 transaction state (rsh.ino ka cfgTxn)
-  // FW-3 armed state: KEY_RESET ke waqt poocha jata hai (live value).
-  uint8_t (*key_reset_armed)(void *user);
-  // KEY_RESET kamyab: caller ko bataye ke rotation + reboot karni hai.
-  // (Deferred — reply bhejne ke baad; upar dekho.)
-  void (*key_reset_request)(void *user);
+  // SET_PASSWORD (D3): current password verify karo. Callback return 1 =
+  // proceed (koi password stored nahi, ya current password stored se
+  // milta hai); 0 = reject (BAD_PASSWORD). net.cpp mein keystore par
+  // mabni hai (has_password ? check_password : 1). Callback NULL ho to
+  // handler UNSUPPORTED deta hai (fail closed).
+  uint8_t (*password_verify_current)(void *user, const uint8_t *pw, uint16_t len);
   // SET_PASSWORD kamyab: caller ko naya password de (deferred — reply
   // bhejne ke baad NVS write + AP restart; upar dekho). Callback NULL ho
   // to handler UNSUPPORTED deta hai (fail closed — password accept karke
@@ -196,7 +201,7 @@ static inline uint8_t rsh_fw34_handler(uint8_t cmd, const uint8_t *payload, uint
     }
     case RSH_CMD_FACTORY_RESET: {
       // M-5: config factory defaults par wapas — key/password ko haath
-      // nahi lagta (keystore alag hai; KEY_RESET alag command hai).
+      // nahi lagta (keystore alag hai; password clear BOOT-hold se hota hai, D7).
       // Factory blob load hota hai (validate hota hai — ghalat blob
       // load nahi hota, caller factory fallback le); load_current
       // staged/previous saaf kar deta hai (state IDLE,
@@ -212,15 +217,8 @@ static inline uint8_t rsh_fw34_handler(uint8_t cmd, const uint8_t *payload, uint
       if (c->cfg_persist) c->cfg_persist(c->user, 0);
       return RSH_CTRL_OK;
     }
-    case RSH_CMD_KEY_RESET: {
-      if (len != 0) return RSH_CTRL_UNSUPPORTED;
-      if (!c || !c->key_reset_armed || !c->key_reset_armed(c->user))
-        return RSH_CTRL_UNSUPPORTED;  // armed nahi — §4.4
-      if (c->key_reset_request) c->key_reset_request(c->user);
-      return RSH_CTRL_OK;
-    }
     case RSH_CMD_LED_TEST: {
-      // Payload: 8 B pattern request (§3.7). Dispatcher HMAC pehle hi
+      // Payload: 8 B pattern request (§3.7). Dispatcher CRC pehle hi
       // verify kar chuka hai. Validate order: payload -> module configured
       // -> patternId/reserved/period -> R-L9 pin rule (PIN_CONFLICT).
       // Kamyabi par led_test_request() bulaya jata hai (deferred — reply
@@ -243,15 +241,33 @@ static inline uint8_t rsh_fw34_handler(uint8_t cmd, const uint8_t *payload, uint
       return RSH_CTRL_OK;
     }
     case RSH_CMD_SET_PASSWORD: {
-      // Payload: newLen u8 + password[newLen] (§5.2). Dispatcher HMAC
-      // pehle hi verify kar chuka hai — bina key ke password nahi badalta.
-      if (len < 1) return RSH_CTRL_UNSUPPORTED;
-      uint8_t new_len = payload[0];
-      if ((uint32_t)len != 1u + (uint32_t)new_len) return RSH_CTRL_UNSUPPORTED;
-      if (rsh_password_validate(payload + 1, new_len) != RSH_CTRL_OK)
+      // Payload v2.2 (D3): curLen u8 + currentPw[curLen] + newLen u8 +
+      // newPw[newLen]. curLen = 0 matlab koi current password nahi.
+      // Validation order: shape -> naya password (length/charset) ->
+      // current password verify (BAD_PASSWORD). Shape ghalat ho to
+      // UNSUPPORTED; current ghalat ho to BAD_PASSWORD (1) — dono alag
+      // hain (PC pehla "request ghalat" aur doosra "password ghalat"
+      // samajhta hai).
+      if (len < 2) return RSH_CTRL_UNSUPPORTED;
+      uint8_t cur_len = payload[0];
+      if ((uint32_t)len < 1u + (uint32_t)cur_len + 1u) return RSH_CTRL_UNSUPPORTED;
+      const uint8_t *cur_pw = payload + 1;
+      const uint8_t *rest = payload + 1 + cur_len;
+      uint8_t new_len = rest[0];
+      if ((uint32_t)len != 1u + (uint32_t)cur_len + 1u + (uint32_t)new_len)
+        return RSH_CTRL_UNSUPPORTED;
+      if (cur_len > RSH_PASSWORD_MAX_LEN) return RSH_CTRL_UNSUPPORTED;
+      if (cur_len > 0) {
+        for (uint8_t i = 0; i < cur_len; i++)
+          if (cur_pw[i] < 0x21 || cur_pw[i] > 0x7E) return RSH_CTRL_UNSUPPORTED;
+      }
+      if (rsh_password_validate(rest + 1, new_len) != RSH_CTRL_OK)
         return RSH_CTRL_UNSUPPORTED;  // length/charset fail (§5.2)
-      if (!c || !c->password_change_request) return RSH_CTRL_UNSUPPORTED;
-      c->password_change_request(c->user, payload + 1, new_len);
+      if (!c || !c->password_verify_current) return RSH_CTRL_UNSUPPORTED;
+      if (!c->password_verify_current(c->user, cur_pw, cur_len))
+        return RSH_CTRL_BAD_PASSWORD;  // D3: ghalat current password
+      if (!c->password_change_request) return RSH_CTRL_UNSUPPORTED;
+      c->password_change_request(c->user, rest + 1, new_len);
       return RSH_CTRL_OK;
     }
     default:

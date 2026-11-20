@@ -56,7 +56,7 @@ impl IpcServer {
         // B-1 (v2.0.2): responses from blocking handlers travel on
         // their own channel. Dispatch runs on `spawn_blocking`
         // (below), so one slow handler — a backend switch waiting
-        // out a UAC prompt, a pairing attempt — never stalls this
+        // out a UAC prompt, a Wi-Fi password set — never stalls this
         // connection's event forwarding or its next request. The
         // channel is bounded (64): `blocking_send` in the handler
         // task applies backpressure instead of piling up responses
@@ -159,10 +159,10 @@ impl IpcServer {
     /// connection.
     ///
     /// R2-30: on `Lagged`, drain everything queued and forward the
-    /// one-shot events the wizard waits on (`PairingFinished` /
-    /// `ConnectionChanged`) in order, plus the newest event — a
-    /// lagged burst must never silently drop a pairing completion
-    /// (the old code kept only the newest event).
+    /// one-shot events the UI waits on (`ConnectionChanged`) in
+    /// order, plus the newest event — a lagged burst must never
+    /// silently drop a connection change (the old code kept only
+    /// the newest event).
     async fn forward_event<W>(
         writer: &mut W,
         result: Result<AppEvent, broadcast::error::RecvError>,
@@ -183,12 +183,7 @@ impl IpcServer {
                 };
                 let mut out: Vec<AppEvent> = drained
                     .into_iter()
-                    .filter(|event| {
-                        matches!(
-                            event,
-                            AppEvent::PairingFinished { .. } | AppEvent::ConnectionChanged { .. }
-                        )
-                    })
+                    .filter(|event| matches!(event, AppEvent::ConnectionChanged { .. }))
                     .collect();
                 if !out.contains(&latest) {
                     out.push(latest);
@@ -444,8 +439,7 @@ mod tests {
     use rsh_api::connection::ConnectionState;
     use rsh_api::{
         ApiTransport, ButtonBinding, CalibrationInfo, ConnectionError, ConnectionInfo, DiagStats,
-        DraftStatus, PairingInfo, RawMv, SnapshotInfo, TuningSettings, UserError, VjoyStatus,
-        validate_tuning,
+        DraftStatus, RawMv, SnapshotInfo, TuningSettings, UserError, VjoyStatus, validate_tuning,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
@@ -481,6 +475,7 @@ mod tests {
                 transport: ApiTransport::Wifi,
                 address: "192.168.4.1".to_string(),
                 session_active: true,
+                board_reachable: false,
                 error: None,
                 hint: None,
             }
@@ -491,20 +486,13 @@ mod tests {
         fn disconnect(&self) -> Result<ConnectionInfo, UserError> {
             Ok(self.connection())
         }
-        fn pairing_status(&self) -> PairingInfo {
-            PairingInfo {
-                seconds_left: 0,
-                password: None,
-                error: None,
-                error_detail: None,
-                board_mac: None,
-                replacement_required: false,
-                key_reset_armed: false,
-                attempt_log: Vec::new(),
+        fn wifi_status(&self) -> rsh_api::WifiStatus {
+            rsh_api::WifiStatus {
+                ssid: Some("RSH-9A55".to_string()),
+                connected: true,
+                password_set: false,
+                board_mac: Some("AA:BB:CC:DD:EE:FF".to_string()),
             }
-        }
-        fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
-            Ok(self.pairing_status())
         }
         fn snapshot(&self) -> SnapshotInfo {
             SnapshotInfo::default()
@@ -740,11 +728,13 @@ mod tests {
     }
 
     /// R2-30: a lagged burst must still deliver the one-shot
-    /// `PairingFinished` — the old code kept only the newest event,
-    /// so a pairing completion buried in a lag burst was silently
-    /// dropped and the wizard waited forever.
+    /// `ConnectionChanged` — the old code kept only the newest
+    /// event, so a connection change buried in a lag burst was
+    /// silently dropped and the UI waited forever. (No-pairing
+    /// redesign: the test used to cover `PairingFinished`; the
+    /// one-shot that matters now is `ConnectionChanged`.)
     #[test]
-    fn lagged_burst_still_delivers_pairing_finished() {
+    fn lagged_burst_still_delivers_connection_changed() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -758,24 +748,24 @@ mod tests {
             let (reader, mut writer) = tokio::io::split(client_side);
             let mut lines = BufReader::new(reader).lines();
             writer
-                .write_all(b"{\"v\":1,\"id\":1,\"method\":\"subscribe\",\"params\":{}}\n")
+                .write_all(b"{\"v\":2,\"id\":1,\"method\":\"subscribe\",\"params\":{}} \n")
                 .await
                 .expect("write subscribe");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            // Flood the 64-capacity channel, then the pairing
-            // completion: even if the subscriber lags, the
-            // completion must be forwarded (not just the newest
-            // event).
+            // Flood the 64-capacity channel, then the connection
+            // change: even if the subscriber lags, the change must
+            // be forwarded (not just the newest event).
             for _ in 0..100 {
                 let _ = events.send(AppEvent::ConnectionChanged {
-                    state: ConnectionState::Active,
-                    label: "Connected".to_string(),
+                    state: ConnectionState::LinkUp,
+                    label: "Link up".to_string(),
                     reason: None,
                 });
             }
-            let _ = events.send(AppEvent::PairingFinished {
-                ok: true,
-                error: None,
+            let _ = events.send(AppEvent::ConnectionChanged {
+                state: ConnectionState::Active,
+                label: "Connected".to_string(),
+                reason: None,
             });
             let mut delivered = false;
             for _ in 0..300 {
@@ -791,14 +781,14 @@ mod tests {
                 let value: serde_json::Value =
                     serde_json::from_str(&line).expect("server writes JSON lines");
                 if let Some(event) = value.get("event")
-                    && event.get("type") == Some(&serde_json::json!("PairingFinished"))
-                    && event.get("ok") == Some(&serde_json::json!(true))
+                    && event.get("type") == Some(&serde_json::json!("ConnectionChanged"))
+                    && event.get("state") == Some(&serde_json::json!("Active"))
                 {
                     delivered = true;
                     break;
                 }
             }
-            assert!(delivered, "PairingFinished must survive a lagged burst");
+            assert!(delivered, "ConnectionChanged must survive a lagged burst");
             assert!(
                 !serve.is_finished(),
                 "the connection task must still be alive"
@@ -807,11 +797,6 @@ mod tests {
         });
     }
 
-    /// DS-17: a subscriber that falls behind the broadcast channel
-    /// (`Lagged`) must NOT lose its connection — the server skips
-    /// to the newest event and keeps answering requests (pre-fix
-    /// the `Lagged` error broke the whole connection, forcing a
-    /// reconnect + re-subscribe exactly when the UI was stalled).
     #[test]
     fn lagged_broadcast_does_not_drop_the_connection() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -828,7 +813,7 @@ mod tests {
             let mut lines = BufReader::new(reader).lines();
             // Subscribe first, so the connection forwards events.
             writer
-                .write_all(b"{\"v\":1,\"id\":1,\"method\":\"subscribe\",\"params\":{}}\n")
+                .write_all(b"{\"v\":2,\"id\":1,\"method\":\"subscribe\",\"params\":{}}\n")
                 .await
                 .expect("write subscribe");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -843,7 +828,7 @@ mod tests {
             }
             // The connection must still answer a ping afterwards.
             writer
-                .write_all(b"{\"v\":1,\"id\":2,\"method\":\"ping\",\"params\":{}}\n")
+                .write_all(b"{\"v\":2,\"id\":2,\"method\":\"ping\",\"params\":{}}\n")
                 .await
                 .expect("write ping");
             let mut answered = false;
@@ -897,7 +882,7 @@ mod tests {
     fn ping_and_version_round_trip_through_dispatch() {
         let server = stub_server();
         let resp = server
-            .handle_line(r#"{"v":1,"id":3,"method":"ping","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":3,"method":"ping","params":{}}"#)
             .expect("ping parses");
         assert!(resp.ok);
         assert_eq!(resp.id, 3);
@@ -906,7 +891,7 @@ mod tests {
             Some(&serde_json::Value::Bool(true))
         );
         let resp = server
-            .handle_line(r#"{"v":1,"id":4,"method":"version","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":4,"method":"version","params":{}}"#)
             .expect("version parses");
         assert_eq!(
             resp.result.expect("result").get("version"),
@@ -924,12 +909,12 @@ mod tests {
         let server = stub_server();
         assert!(
             server
-                .response_text(r#"{"v":1,"id":60,"method":"ping","params":{}}"#)
+                .response_text(r#"{"v":2,"id":60,"method":"ping","params":{}}"#)
                 .is_some()
         );
         assert!(
             server
-                .response_text(r#"{"v":1,"id":61,"method":"poll","params":{}}"#)
+                .response_text(r#"{"v":2,"id":61,"method":"poll","params":{}}"#)
                 .is_some()
         );
         let snapshot = crate::ipc_latency_snapshot();
@@ -956,7 +941,7 @@ mod tests {
         // Wire shape is camelCase: `outputEnabled`.
         let server = stub_server();
         let resp = server
-            .handle_line(r#"{"v":1,"id":5,"method":"poll","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":5,"method":"poll","params":{}}"#)
             .expect("poll parses");
         assert!(resp.ok, "resp: {resp:?}");
         let got = resp.result.expect("result");
@@ -980,11 +965,11 @@ mod tests {
         // The same values the three separate calls return — one
         // call, not three round-trips.
         let snap_resp = server
-            .handle_line(r#"{"v":1,"id":6,"method":"snapshot","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":6,"method":"snapshot","params":{}}"#)
             .expect("snapshot parses");
         assert_eq!(snap_resp.result.expect("result"), *snap);
         let conn_resp = server
-            .handle_line(r#"{"v":1,"id":7,"method":"connection","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":7,"method":"connection","params":{}}"#)
             .expect("connection parses");
         assert_eq!(conn_resp.result.expect("result"), *conn);
     }
@@ -1003,7 +988,7 @@ mod tests {
     fn unknown_method_is_an_error_response() {
         let server = stub_server();
         let resp = server
-            .handle_line(r#"{"v":1,"id":2,"method":"explode","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":2,"method":"explode","params":{}}"#)
             .expect("unknown method is a response");
         assert!(!resp.ok);
         assert_eq!(resp.error.expect("error").code, "UnknownMethod");
@@ -1014,7 +999,7 @@ mod tests {
         let server = stub_server();
         // get_tuning: neutral default before any edit.
         let resp = server
-            .handle_line(r#"{"v":1,"id":10,"method":"get_tuning","params":{"module":"steering"}}"#)
+            .handle_line(r#"{"v":2,"id":10,"method":"get_tuning","params":{"module":"steering"}}"#)
             .expect("get_tuning parses");
         assert!(resp.ok);
         let got = resp.result.expect("result");
@@ -1022,7 +1007,7 @@ mod tests {
         assert_eq!(got.get("curve"), Some(&serde_json::json!(1.0)));
         // set_tuning: valid record is stored + echoed.
         let resp = server
-            .handle_line(r#"{"v":1,"id":11,"method":"set_tuning","params":{"module":"steering","deadzone":5.0,"curve":1.6,"minMv":0.0,"maxMv":3300.0,"smoothing":10.0}}"#)
+            .handle_line(r#"{"v":2,"id":11,"method":"set_tuning","params":{"module":"steering","deadzone":5.0,"curve":1.6,"minMv":0.0,"maxMv":3300.0,"smoothing":10.0}}"#)
             .expect("set_tuning parses");
         assert!(resp.ok, "resp: {resp:?}");
         let got = resp.result.expect("result");
@@ -1030,7 +1015,7 @@ mod tests {
         assert_eq!(got.get("curve"), Some(&serde_json::json!(1.6)));
         // draft_status: dirty after the edit.
         let resp = server
-            .handle_line(r#"{"v":1,"id":12,"method":"draft_status","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":12,"method":"draft_status","params":{}}"#)
             .expect("draft_status parses");
         assert!(resp.ok);
         let got = resp.result.expect("result");
@@ -1041,13 +1026,13 @@ mod tests {
         );
         // set_tuning: invalid record is an API error, not a crash.
         let resp = server
-            .handle_line(r#"{"v":1,"id":13,"method":"set_tuning","params":{"module":"steering","deadzone":5.0,"curve":9.0,"minMv":0.0,"maxMv":3300.0,"smoothing":10.0}}"#)
+            .handle_line(r#"{"v":2,"id":13,"method":"set_tuning","params":{"module":"steering","deadzone":5.0,"curve":9.0,"minMv":0.0,"maxMv":3300.0,"smoothing":10.0}}"#)
             .expect("invalid set_tuning parses");
         assert!(!resp.ok);
         assert_eq!(resp.error.expect("error").code, "Unknown");
         // save_draft: saves, then the draft is clean (null status).
         let resp = server
-            .handle_line(r#"{"v":1,"id":14,"method":"save_draft","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":14,"method":"save_draft","params":{}}"#)
             .expect("save_draft parses");
         assert!(resp.ok);
         assert_eq!(
@@ -1055,13 +1040,13 @@ mod tests {
             Some(&serde_json::Value::Bool(true))
         );
         let resp = server
-            .handle_line(r#"{"v":1,"id":15,"method":"draft_status","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":15,"method":"draft_status","params":{}}"#)
             .expect("draft_status parses");
         assert!(resp.ok);
         assert!(resp.result.expect("result").is_null());
         // discard_draft: nothing to discard when clean.
         let resp = server
-            .handle_line(r#"{"v":1,"id":16,"method":"discard_draft","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":16,"method":"discard_draft","params":{}}"#)
             .expect("discard_draft parses");
         assert!(resp.ok);
         assert_eq!(
@@ -1070,17 +1055,17 @@ mod tests {
         );
         // Edit again, then discard reverts to neutral.
         let _ = server
-            .handle_line(r#"{"v":1,"id":17,"method":"set_tuning","params":{"module":"steering","deadzone":8.0,"curve":1.6,"minMv":0.0,"maxMv":3300.0,"smoothing":10.0}}"#)
+            .handle_line(r#"{"v":2,"id":17,"method":"set_tuning","params":{"module":"steering","deadzone":8.0,"curve":1.6,"minMv":0.0,"maxMv":3300.0,"smoothing":10.0}}"#)
             .expect("set_tuning parses");
         let resp = server
-            .handle_line(r#"{"v":1,"id":18,"method":"discard_draft","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":18,"method":"discard_draft","params":{}}"#)
             .expect("discard_draft parses");
         assert_eq!(
             resp.result.expect("result").get("discarded"),
             Some(&serde_json::Value::Bool(true))
         );
         let resp = server
-            .handle_line(r#"{"v":1,"id":19,"method":"get_tuning","params":{"module":"steering"}}"#)
+            .handle_line(r#"{"v":2,"id":19,"method":"get_tuning","params":{"module":"steering"}}"#)
             .expect("get_tuning parses");
         assert_eq!(
             resp.result.expect("result").get("deadzone"),
@@ -1094,7 +1079,7 @@ mod tests {
         // errors, learn never armed, no pick to take.
         let server = stub_server();
         let resp = server
-            .handle_line(r#"{"v":1,"id":30,"method":"list_profiles","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":30,"method":"list_profiles","params":{}}"#)
             .expect("list_profiles parses");
         assert!(resp.ok);
         assert_eq!(
@@ -1102,25 +1087,25 @@ mod tests {
             serde_json::Value::Array(vec![])
         );
         let resp = server
-            .handle_line(r#"{"v":1,"id":31,"method":"activate_profile","params":{"id":"x"}}"#)
+            .handle_line(r#"{"v":2,"id":31,"method":"activate_profile","params":{"id":"x"}}"#)
             .expect("activate_profile parses");
         assert!(!resp.ok);
         assert_eq!(resp.error.expect("error").code, "Unknown");
         let resp = server
-            .handle_line(r#"{"v":1,"id":32,"method":"create_profile","params":{"name":"New"}}"#)
+            .handle_line(r#"{"v":2,"id":32,"method":"create_profile","params":{"name":"New"}}"#)
             .expect("create_profile parses");
         assert!(!resp.ok);
         assert_eq!(resp.error.expect("error").code, "Unknown");
         let resp = server
-            .handle_line(r#"{"v":1,"id":33,"method":"duplicate_profile","params":{"id":"x"}}"#)
+            .handle_line(r#"{"v":2,"id":33,"method":"duplicate_profile","params":{"id":"x"}}"#)
             .expect("duplicate_profile parses");
         assert!(!resp.ok);
         let resp = server
-            .handle_line(r#"{"v":1,"id":34,"method":"delete_profile","params":{"id":"x"}}"#)
+            .handle_line(r#"{"v":2,"id":34,"method":"delete_profile","params":{"id":"x"}}"#)
             .expect("delete_profile parses");
         assert!(!resp.ok);
         let resp = server
-            .handle_line(r#"{"v":1,"id":35,"method":"list_games","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":35,"method":"list_games","params":{}}"#)
             .expect("list_games parses");
         assert!(resp.ok);
         assert_eq!(
@@ -1129,30 +1114,30 @@ mod tests {
         );
         let resp = server
             .handle_line(
-                r#"{"v":1,"id":36,"method":"launch_game","params":{"id":"assetto_corsa"}}"#,
+                r#"{"v":2,"id":36,"method":"launch_game","params":{"id":"assetto_corsa"}}"#,
             )
             .expect("launch_game parses");
         assert!(!resp.ok);
         assert_eq!(resp.error.expect("error").code, "Unknown");
         let resp = server
-            .handle_line(r#"{"v":1,"id":37,"method":"stop_game","params":{"id":"assetto_corsa"}}"#)
+            .handle_line(r#"{"v":2,"id":37,"method":"stop_game","params":{"id":"assetto_corsa"}}"#)
             .expect("stop_game parses");
         assert!(!resp.ok);
         let resp = server
-            .handle_line(r#"{"v":1,"id":38,"method":"game_state","params":{"id":"assetto_corsa"}}"#)
+            .handle_line(r#"{"v":2,"id":38,"method":"game_state","params":{"id":"assetto_corsa"}}"#)
             .expect("game_state parses");
         assert!(!resp.ok);
         let resp = server
-            .handle_line(r#"{"v":1,"id":39,"method":"start_learn","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":39,"method":"start_learn","params":{}}"#)
             .expect("start_learn parses");
         assert!(!resp.ok);
         assert_eq!(resp.error.expect("error").code, "Unknown");
         let resp = server
-            .handle_line(r#"{"v":1,"id":40,"method":"cancel_learn","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":40,"method":"cancel_learn","params":{}}"#)
             .expect("cancel_learn parses");
         assert!(!resp.ok);
         let resp = server
-            .handle_line(r#"{"v":1,"id":41,"method":"is_learning","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":41,"method":"is_learning","params":{}}"#)
             .expect("is_learning parses");
         assert!(resp.ok);
         assert_eq!(
@@ -1160,7 +1145,7 @@ mod tests {
             Some(&serde_json::Value::Bool(false))
         );
         let resp = server
-            .handle_line(r#"{"v":1,"id":42,"method":"take_learned_button","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":42,"method":"take_learned_button","params":{}}"#)
             .expect("take_learned_button parses");
         assert!(resp.ok);
         assert_eq!(
@@ -1175,7 +1160,7 @@ mod tests {
         // firmware/backend unknown, set/backup unsupported.
         let server = stub_server();
         let resp = server
-            .handle_line(r#"{"v":1,"id":20,"method":"autostart","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":20,"method":"autostart","params":{}}"#)
             .expect("autostart parses");
         assert!(resp.ok);
         assert_eq!(
@@ -1183,12 +1168,12 @@ mod tests {
             Some(&serde_json::Value::Bool(false))
         );
         let resp = server
-            .handle_line(r#"{"v":1,"id":21,"method":"set_autostart","params":{"enabled":true}}"#)
+            .handle_line(r#"{"v":2,"id":21,"method":"set_autostart","params":{"enabled":true}}"#)
             .expect("set_autostart parses");
         assert!(!resp.ok);
         assert_eq!(resp.error.expect("error").code, "Unknown");
         let resp = server
-            .handle_line(r#"{"v":1,"id":22,"method":"firmware_version","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":22,"method":"firmware_version","params":{}}"#)
             .expect("firmware_version parses");
         assert!(resp.ok);
         assert_eq!(
@@ -1196,7 +1181,7 @@ mod tests {
             Some(&serde_json::Value::String("Unknown".to_string()))
         );
         let resp = server
-            .handle_line(r#"{"v":1,"id":23,"method":"output_backend","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":23,"method":"output_backend","params":{}}"#)
             .expect("output_backend parses");
         assert!(resp.ok);
         assert_eq!(
@@ -1205,13 +1190,13 @@ mod tests {
         );
         let resp = server
             .handle_line(
-                r#"{"v":1,"id":24,"method":"set_output_backend","params":{"name":"vJoy"}}"#,
+                r#"{"v":2,"id":24,"method":"set_output_backend","params":{"name":"vJoy"}}"#,
             )
             .expect("set_output_backend parses");
         assert!(!resp.ok);
         assert_eq!(resp.error.expect("error").code, "Unknown");
         let resp = server
-            .handle_line(r#"{"v":1,"id":25,"method":"backup_now","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":25,"method":"backup_now","params":{}}"#)
             .expect("backup_now parses");
         assert!(!resp.ok);
         assert_eq!(resp.error.expect("error").code, "Unknown");
@@ -1222,7 +1207,7 @@ mod tests {
         let server = stub_server();
         // calibration: wire shape is camelCase, values round-trip.
         let resp = server
-            .handle_line(r#"{"v":1,"id":30,"method":"calibration","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":30,"method":"calibration","params":{}}"#)
             .expect("calibration parses");
         assert!(resp.ok, "resp: {resp:?}");
         let got = resp.result.expect("result");
@@ -1236,7 +1221,7 @@ mod tests {
         );
         // vjoy_status: installed + DLL path round-trip.
         let resp = server
-            .handle_line(r#"{"v":1,"id":31,"method":"vjoy_status","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":31,"method":"vjoy_status","params":{}}"#)
             .expect("vjoy_status parses");
         assert!(resp.ok, "resp: {resp:?}");
         let got = resp.result.expect("result");
@@ -1249,7 +1234,7 @@ mod tests {
         );
         // install_vjoy: starts, returns the message.
         let resp = server
-            .handle_line(r#"{"v":1,"id":32,"method":"install_vjoy","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":32,"method":"install_vjoy","params":{}}"#)
             .expect("install_vjoy parses");
         assert!(resp.ok, "resp: {resp:?}");
         assert_eq!(
@@ -1260,7 +1245,7 @@ mod tests {
         );
         // diag_stats: measured values round-trip.
         let resp = server
-            .handle_line(r#"{"v":1,"id":33,"method":"diag_stats","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":33,"method":"diag_stats","params":{}}"#)
             .expect("diag_stats parses");
         assert!(resp.ok, "resp: {resp:?}");
         let got = resp.result.expect("result");
@@ -1275,7 +1260,7 @@ mod tests {
         let server = stub_server();
         // raw_mv: camelCase wire shape, absent slots omitted.
         let resp = server
-            .handle_line(r#"{"v":1,"id":40,"method":"raw_mv","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":40,"method":"raw_mv","params":{}}"#)
             .expect("raw_mv parses");
         assert!(resp.ok, "resp: {resp:?}");
         let got = resp.result.expect("result");
@@ -1285,7 +1270,7 @@ mod tests {
         assert_eq!(got.get("ageMs"), Some(&serde_json::json!(5)));
         // capture_centre: the captured mV comes back.
         let resp = server
-            .handle_line(r#"{"v":1,"id":41,"method":"capture_centre","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":41,"method":"capture_centre","params":{}}"#)
             .expect("capture_centre parses");
         assert!(resp.ok, "resp: {resp:?}");
         assert_eq!(
@@ -1295,7 +1280,7 @@ mod tests {
         // capture_pedal_min/max: pedal param in, captured mV out.
         let resp = server
             .handle_line(
-                r#"{"v":1,"id":42,"method":"capture_pedal_min","params":{"pedal":"accel"}}"#,
+                r#"{"v":2,"id":42,"method":"capture_pedal_min","params":{"pedal":"accel"}}"#,
             )
             .expect("capture_pedal_min parses");
         assert!(resp.ok, "resp: {resp:?}");
@@ -1305,7 +1290,7 @@ mod tests {
         );
         let resp = server
             .handle_line(
-                r#"{"v":1,"id":43,"method":"capture_pedal_max","params":{"pedal":"accel"}}"#,
+                r#"{"v":2,"id":43,"method":"capture_pedal_max","params":{"pedal":"accel"}}"#,
             )
             .expect("capture_pedal_max parses");
         assert!(resp.ok, "resp: {resp:?}");
@@ -1317,7 +1302,7 @@ mod tests {
         // (`code|detail`), not a bare "Unknown".
         let resp = server
             .handle_line(
-                r#"{"v":1,"id":44,"method":"capture_pedal_min","params":{"pedal":"gear"}}"#,
+                r#"{"v":2,"id":44,"method":"capture_pedal_min","params":{"pedal":"gear"}}"#,
             )
             .expect("capture_pedal_min parses");
         assert!(!resp.ok, "resp: {resp:?}");
@@ -1335,7 +1320,7 @@ mod tests {
         let server = stub_server();
         // list_bindings starts empty.
         let resp = server
-            .handle_line(r#"{"v":1,"id":50,"method":"list_bindings","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":50,"method":"list_bindings","params":{}}"#)
             .expect("list_bindings parses");
         assert!(resp.ok, "resp: {resp:?}");
         assert_eq!(
@@ -1345,7 +1330,7 @@ mod tests {
         // set_binding: button + action in, the stored binding out.
         let resp = server
             .handle_line(
-                r#"{"v":1,"id":51,"method":"set_binding","params":{"button":5,"action":"horn"}}"#,
+                r#"{"v":2,"id":51,"method":"set_binding","params":{"button":5,"action":"horn"}}"#,
             )
             .expect("set_binding parses");
         assert!(resp.ok, "resp: {resp:?}");
@@ -1355,7 +1340,7 @@ mod tests {
         );
         // list_bindings now shows it (camelCase wire shape).
         let resp = server
-            .handle_line(r#"{"v":1,"id":52,"method":"list_bindings","params":{}}"#)
+            .handle_line(r#"{"v":2,"id":52,"method":"list_bindings","params":{}}"#)
             .expect("list_bindings parses");
         assert!(resp.ok, "resp: {resp:?}");
         assert_eq!(
@@ -1364,7 +1349,7 @@ mod tests {
         );
         // clear_binding: true when bound, false when absent.
         let resp = server
-            .handle_line(r#"{"v":1,"id":53,"method":"clear_binding","params":{"button":5}}"#)
+            .handle_line(r#"{"v":2,"id":53,"method":"clear_binding","params":{"button":5}}"#)
             .expect("clear_binding parses");
         assert!(resp.ok, "resp: {resp:?}");
         assert_eq!(
@@ -1372,7 +1357,7 @@ mod tests {
             Some(&serde_json::json!(true))
         );
         let resp = server
-            .handle_line(r#"{"v":1,"id":54,"method":"clear_binding","params":{"button":5}}"#)
+            .handle_line(r#"{"v":2,"id":54,"method":"clear_binding","params":{"button":5}}"#)
             .expect("clear_binding parses");
         assert!(resp.ok, "resp: {resp:?}");
         assert_eq!(
@@ -1383,7 +1368,7 @@ mod tests {
         // reason (`code|detail`), not a bare "Unknown".
         let resp = server
             .handle_line(
-                r#"{"v":1,"id":55,"method":"set_binding","params":{"button":33,"action":"horn"}}"#,
+                r#"{"v":2,"id":55,"method":"set_binding","params":{"button":33,"action":"horn"}}"#,
             )
             .expect("set_binding parses");
         assert!(!resp.ok, "resp: {resp:?}");
@@ -1397,7 +1382,7 @@ mod tests {
         // A missing button param fails the same way, never silently
         // binds button 0.
         let resp = server
-            .handle_line(r#"{"v":1,"id":56,"method":"set_binding","params":{"action":"horn"}}"#)
+            .handle_line(r#"{"v":2,"id":56,"method":"set_binding","params":{"action":"horn"}}"#)
             .expect("set_binding parses");
         assert!(!resp.ok, "resp: {resp:?}");
         assert!(

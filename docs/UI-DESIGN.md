@@ -157,7 +157,8 @@ APP
 
 ### 5.5 Settings
 
-- Left column: Connection (Wi-Fi/USB, address, Pair), Game
+- Left column: Connection (Wi-Fi/USB, address, Wi-Fi password
+  set/clear + strength hint, board-reachable status), Game
   controller (HIDMaestro / vJoy), Startup (Start with Windows,
   Keep running in tray).
 - Right column: Profiles (list, Active, Duplicate, Use, New),
@@ -165,21 +166,22 @@ APP
   backup/restore). No language selector (English only).
 - Small link at the bottom: **Open diagnostics**.
 
-### 5.6 First-time setup (5 steps)
+### 5.6 First-time setup (4 steps)
 
-Left: logo, "Set up your wheel", 5 steps (Connect, Drivers, Pair,
+Left: logo, "Set up your wheel", 4 steps (Connect, Drivers,
 Calibrate, Games). Right: step content.
 
-- **Connect:** Wi-Fi/USB + address. Next unlocks when the board
-  is reachable.
-- **Drivers:** vJoy controller check/install, HIDMaestro fallback.
-- **Pair:** 60 second countdown ring + 3 simple steps + live
-  status + "Wheel not found? Use a USB cable".
-- **Calibrate:** centre + pedals, "Set" buttons.
+- **Connect:** Wi-Fi/USB + address. The Wi-Fi card performs the
+  join itself (scan `RSH-XXXX`, join open AP or with the stored
+  password). Next unlocks when the board is reachable — never
+  gated on pairing (there is none).
+- **Drivers:** vJoy controller check/install (with progress +
+  pre-warn), HIDMaestro fallback.
+- **Calibrate:** centre + pedals, "Set" buttons. Explicit skip if
+  the game controller backend is unavailable.
 - **Games:** add games, choose game controller.
-- Hidden (auto/advanced): password/key, pin map, firmware. They
-  appear only when needed (firmware mismatch, pins edit in
-  Advanced).
+- Hidden (auto/advanced): pin map, firmware. They appear only
+  when needed (firmware mismatch, pins edit in Advanced).
 - "Skip for now" is always present.
 
 ### 5.7 Tray popup (left click)
@@ -218,7 +220,10 @@ Profile ›, Launch game ›, Restart wheel, Settings, Quit RSH.
 
 - **Disconnected:** status card red/grey, Overview banner "Wheel
   not connected" + Reconnect + "Run setup".
-- **Pairing needed:** banner + Pair button.
+- **Board unreachable:** banner + connect hint ("Join the
+  `RSH-XXXX` Wi-Fi network or plug in the USB cable") + Reconnect.
+- **No password set:** banner prompting to set a Wi-Fi password in
+  Settings (WebOTA is disabled until a password is set).
 - **Game controller missing:** warn pill in Settings, warn row in
   the Overview checklist + "Fix".
 - **Loading:** skeleton rows, never bare "Loading…" text alone.
@@ -231,9 +236,10 @@ Profile ›, Launch game ›, Restart wheel, Settings, Quit RSH.
   scanning (Steam/iRacing auto-detection). v2.0.4 removed the
   scanner entirely: the user adds games by name + exe/shortcut
   and launches them locally. No "Locate" button, no scanning.
-- **Setup wizard is 5 steps.** The plan had 4; the Drivers step
-  was added for vJoy. Step order is Connect → Drivers → Pair →
-  Calibrate → Games.
+- **Setup wizard is 4 steps (v2.0.6).** The plan had 4; the Drivers
+  step was added for vJoy and the Pair step was removed when pairing
+  was abolished. Step order is Connect → Drivers → Calibrate →
+  Games.
 - **Buttons confirm timeout is 30 s** (firmware
   `RSH_CFG_CONFIRM_TIMEOUT_MS 30000`), not the 10 s in the
   plan's text.

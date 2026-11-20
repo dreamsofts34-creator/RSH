@@ -10,7 +10,7 @@
 //! window manager, no daemon. The wizard's Rust handlers live in
 //! `rsh-ui` (a binary crate, not importable), so the click-through
 //! mirrors the real `on_setup_next` handler from
-//! `crates/rsh-ui/src/main.rs` (step + 1, finish at step 4) and the
+//! `crates/rsh-ui/src/main.rs` (step + 1, finish at step 3) and the
 //! gate doc says so: this proves the Slint wiring (button exists,
 //! enabled exactly when its gate passes, fires the callback, step
 //! advances), not the production Rust handler. The production
@@ -341,7 +341,7 @@ fn footer_accent_count(rgba: &[u8], width: u32, height: u32) -> usize {
 /// The scan is restricted to the main column (x >= 264, the sidebar
 /// width): the sidebar's "now" step circle is accent-filled too, and
 /// with the preview-faithful 10px step-row padding (UI-UX polish) the
-/// step-5 circle at step 4 sits inside the bottom 30% strip — a
+/// step-4 circle at step 3 sits inside the bottom 30% strip — a
 /// whole-window union bbox would then centre on dead space between
 /// the circle and the Finish button and the finish click would miss.
 /// The footer button always lives in the main column, so sidebar
@@ -597,7 +597,7 @@ type GateCase<'a> = (&'a str, &'a [(&'a str, bool)]);
 /// `next-enabled` per step, then a real mouse click-through of
 /// the Next button (located from the rendered accent fill) with
 /// the production `on_setup_next` logic mirrored (step + 1,
-/// finish at step 4). Skip/Back are proven via `invoke` (their
+/// finish at step 3). Skip/Back are proven via `invoke` (their
 /// buttons are text, not locatable by colour in the frame).
 #[allow(clippy::cast_precision_loss)]
 #[allow(clippy::too_many_lines)]
@@ -610,7 +610,11 @@ fn ui_wizard_gating() -> Outcome {
         Ok(instance) => instance,
         Err(error) => return Outcome::fail(error),
     };
-    // next-enabled truth table (setup.slint line 148).
+    // next-enabled truth table (setup.slint: `next-enabled` —
+    // v2.2, 4 steps: 0 Connect, 1 Drivers, 2 Calibrate, 3 Games.
+    // Step 2 is the Calibrate gate: Next is enabled when the
+    // calibration backend is unavailable (explicit skip, D16) or
+    // when centre + pedals are done).
     let cases: &[GateCase] = &[
         ("step0-blocked", &[("connect-done", false)]),
         ("step0-open", &[("connect-done", true)]),
@@ -620,11 +624,9 @@ fn ui_wizard_gating() -> Outcome {
         ),
         ("step1-vjoy", &[("vjoy-installed", true)]),
         ("step1-fallback", &[("vjoy-fallback", true)]),
-        ("step2-blocked", &[("paired", false)]),
-        ("step2-open", &[("paired", true)]),
-        ("step3-no-calib", &[("calibration-available", false)]),
+        ("step2-no-calib", &[("calibration-available", false)]),
         (
-            "step3-blocked",
+            "step2-blocked",
             &[
                 ("calibration-available", true),
                 ("centre-done", false),
@@ -632,7 +634,7 @@ fn ui_wizard_gating() -> Outcome {
             ],
         ),
         (
-            "step3-open",
+            "step2-open",
             &[
                 ("calibration-available", true),
                 ("centre-done", true),
@@ -641,10 +643,8 @@ fn ui_wizard_gating() -> Outcome {
         ),
     ];
     // (step, expected next-enabled) per case, in order.
-    let steps = [0, 0, 1, 1, 1, 2, 2, 3, 3, 3];
-    let expected = [
-        false, true, false, true, true, false, true, true, false, true,
-    ];
+    let steps = [0, 0, 1, 1, 1, 2, 2, 2];
+    let expected = [false, true, false, true, true, true, false, true];
     for (i, (name, flags)) in cases.iter().enumerate() {
         let step = steps[i];
         if let Err(error) = set_num(&instance, "step", f64::from(step)) {
@@ -654,7 +654,6 @@ fn ui_wizard_gating() -> Outcome {
             "connect-done",
             "vjoy-installed",
             "vjoy-fallback",
-            "paired",
             "calibration-available",
             "centre-done",
             "pedals-done",
@@ -687,7 +686,7 @@ fn ui_wizard_gating() -> Outcome {
         );
     }
 
-    // Click-through: mirrored on_setup_next (step + 1, finish at 4).
+    // Click-through: mirrored on_setup_next (step + 1, finish at 3).
     let step_state = Rc::new(Cell::new(0_i32));
     let finished = Rc::new(Cell::new(false));
     let clicks = Rc::new(Cell::new(0_usize));
@@ -699,7 +698,7 @@ fn ui_wizard_gating() -> Outcome {
         if let Err(error) = instance.set_callback("next", move |_| {
             clicks.set(clicks.get() + 1);
             let step = step_state.get();
-            if step >= 4 {
+            if step >= 3 {
                 finished.set(true);
             } else {
                 step_state.set(step + 1);
@@ -712,12 +711,11 @@ fn ui_wizard_gating() -> Outcome {
             return Outcome::fail(format!("set next handler failed: {error}"));
         }
     }
-    // Drive: step 0 (connect-done) → 1 (vjoy) → 2 (paired) → 3
-    // (calibration done) → 4 → finish.
+    // Drive: step 0 (connect-done) → 1 (vjoy) → 2 (calibration
+    // done) → 3 → finish.
     let drive: &[(&str, bool)] = &[
         ("connect-done", true),
         ("vjoy-installed", true),
-        ("paired", true),
         ("centre-done", true),
     ];
     if let Err(error) = set_num(&instance, "step", 0.0) {
@@ -764,7 +762,7 @@ fn ui_wizard_gating() -> Outcome {
             break;
         }
     }
-    // Finish: one more Next at step 4.
+    // Finish: one more Next at step 3.
     let (rgba, width, height) = match snapshot(&instance) {
         Ok(snap) => snap,
         Err(error) => return Outcome::fail(error),
@@ -785,7 +783,7 @@ fn ui_wizard_gating() -> Outcome {
     report.check(
         "wizard-click-finish",
         finished.get(),
-        "Next at step 4 finishes the wizard (Finish button)",
+        "Next at step 3 finishes the wizard (Finish button)",
     );
 
     // Skip / Back via invoke (text buttons, not colour-locatable).
@@ -827,15 +825,14 @@ fn ui_wizard_no_fake_data() -> Outcome {
         "games-text defaults to 'No games added yet.'",
     );
     report.check(
-        "wizard-default-pair",
-        get_str(&instance, "pair-status").as_deref() == Some("Waiting for the wheel…"),
-        "pair-status defaults to 'Waiting for the wheel…'",
+        "wizard-default-hint",
+        get_str(&instance, "connect-hint").as_deref() == Some(""),
+        "connect-hint defaults to '' (no error to show)",
     );
     report.check(
         "wizard-default-flags",
-        get_bool(&instance, "connect-done") == Some(false)
-            && get_bool(&instance, "paired") == Some(false),
-        "connect-done=false, paired=false by default",
+        get_bool(&instance, "connect-done") == Some(false),
+        "connect-done=false by default",
     );
     report.finish()
 }
@@ -1279,7 +1276,7 @@ fn checks() -> Vec<UiCheck> {
         ),
         (
             "ui-wizard-gating",
-            "A2: wizard next-enabled per step + Next click-through 0→4 + finish; Skip invokes",
+            "A2: wizard next-enabled per step + Next click-through 0→3 + finish; Skip invokes",
             ui_wizard_gating as fn() -> Outcome,
         ),
         (

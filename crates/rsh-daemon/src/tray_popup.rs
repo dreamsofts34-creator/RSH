@@ -743,7 +743,7 @@ mod tests {
     use super::*;
     use rsh_api::errors::UserError;
     use rsh_api::{
-        ApiTransport, AppApi, ConnectionInfo, ConnectionState, PairingInfo, SnapshotInfo,
+        ApiTransport, AppApi, ConnectionInfo, ConnectionState, SnapshotInfo, WifiStatus,
     };
 
     struct FakeApi {
@@ -764,6 +764,7 @@ mod tests {
                 transport: ApiTransport::Wifi,
                 address: "192.168.4.1".to_string(),
                 session_active: true,
+                board_reachable: true,
                 error: None,
                 hint: None,
             }
@@ -777,21 +778,13 @@ mod tests {
             Ok(self.connection())
         }
 
-        fn pairing_status(&self) -> PairingInfo {
-            PairingInfo {
-                seconds_left: 0,
-                password: None,
-                error: None,
-                error_detail: None,
-                board_mac: None,
-                replacement_required: false,
-                key_reset_armed: false,
-                attempt_log: Vec::new(),
+        fn wifi_status(&self) -> WifiStatus {
+            WifiStatus {
+                ssid: Some("RSH-9A55".to_string()),
+                connected: true,
+                password_set: false,
+                board_mac: Some("AA:BB:CC:DD:EE:FF".to_string()),
             }
-        }
-
-        fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
-            Ok(self.pairing_status())
         }
 
         fn snapshot(&self) -> SnapshotInfo {

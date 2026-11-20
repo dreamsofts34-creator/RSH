@@ -32,7 +32,7 @@ use rsh_app_core::state::{AppStateCore, StartupBackendOutcome};
 use rsh_app_core::webota::{
     FlashStage, WebOtaTarget, flash_firmware_with_pubkey, wait_for_board_version,
 };
-use rsh_ipc::IpcClient;
+use rsh_ipc::{IPC_PROTOCOL_VERSION, IpcClient};
 use rsh_output::selector::{BackendFactories, BackendKind, switch_backend};
 use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
 use rsh_profiles::store::ProfileStore;
@@ -495,24 +495,25 @@ fn jargon_free(text: &str) -> bool {
 /// and the detail passed in. The `title` is the stable code by
 /// design (the UI maps the code to copy); the jargon rule applies
 /// to the two sentences the user actually reads.
+///
+/// v2.2 note: the pairing variants (`WindowClosed`,
+/// `WindowExpired`, `NoStoredKey`, `StoredKeyExists`, `BadTag`,
+/// `AlreadyPaired`, `BoardUnpaired`) were deleted with pairing
+/// (plan D14). `BoardMismatch` is kept: the app binds to the
+/// board it joined (D11, `RSH-XXXX` SSID per board).
 #[must_use]
 pub fn gate_user_errors() -> (bool, String) {
     let mut report = Report::new();
     let variants: Vec<ConnectionError> = vec![
         ConnectionError::Unreachable,
-        ConnectionError::WindowClosed,
-        ConnectionError::WindowExpired,
-        ConnectionError::NoStoredKey,
-        ConnectionError::StoredKeyExists,
-        ConnectionError::BadTag,
         ConnectionError::Timeout,
         ConnectionError::TransportClosed,
         ConnectionError::BindFailed(BindErrorKind::AddrInUse),
         ConnectionError::BindFailed(BindErrorKind::PermissionDenied),
         ConnectionError::BindFailed(BindErrorKind::NoInterface),
         ConnectionError::BindFailed(BindErrorKind::Other),
-        ConnectionError::AlreadyPaired,
-        ConnectionError::BoardUnpaired,
+        ConnectionError::BoardMismatch,
+        ConnectionError::WatchdogStall,
         ConnectionError::Unknown,
     ];
     for error in variants {
@@ -535,17 +536,17 @@ pub fn gate_user_errors() -> (bool, String) {
         );
     }
     // Distinct causes must render distinctly (Phase 0 gate §4.3):
-    // "board unreachable" vs "window closed" vs "already paired"
-    // are different sentences, not one generic error.
+    // "board unreachable" vs "control timed out" vs "watchdog
+    // stalled" are different sentences, not one generic error.
     let a = UserError::from_connection(ConnectionError::Unreachable, "");
-    let b = UserError::from_connection(ConnectionError::WindowClosed, "");
-    let c = UserError::from_connection(ConnectionError::AlreadyPaired, "");
+    let b = UserError::from_connection(ConnectionError::Timeout, "");
+    let c = UserError::from_connection(ConnectionError::WatchdogStall, "");
     report.check(
         "user-error-distinct-copy",
         a.what_happened != b.what_happened
             && b.what_happened != c.what_happened
             && a.what_to_do != b.what_to_do,
-        "Unreachable / WindowClosed / AlreadyPaired render different copy",
+        "Unreachable / Timeout / WatchdogStall render different copy",
     );
     report.finish()
 }
@@ -703,13 +704,16 @@ pub fn gate_perf() -> (bool, String) {
     let _ = std::fs::remove_dir_all(&dir);
 
     // IPC round-trip: echo server speaking the real wire format
-    // (`{"v":1,"id":N,"ok":true,"result":{"pong":true}}`).
+    // (`{"v":<IPC_PROTOCOL_VERSION>,"id":N,"ok":true,"result":{"pong":true}}`).
+    // The version must track `IPC_PROTOCOL_VERSION` — WS-3 bumped it
+    // 1 → 2 with the no-pairing IPC changes, and the client rejects
+    // any reply whose `v` differs, so a hardcoded `"v":1` here made
+    // every ping fail and the p50/p99 came back as Duration::MAX.
     let dir = temp_dir("perf-ipc");
     let path = dir.join("rsh-daemon.sock");
-    let (p50_ms, p99_ms, count) =
-        block_on_scoped(|| {
-            let rt = current_thread_runtime();
-            rt.block_on(async {
+    let (p50_ms, p99_ms, count) = block_on_scoped(|| {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
         let listener = FakeListener::bind(&path).expect("gate echo server bind");
         tokio::spawn(async move {
             loop {
@@ -726,7 +730,7 @@ pub fn gate_perf() -> (bool, String) {
                             .and_then(|v| v.get("id")?.as_u64())
                             .unwrap_or(0);
                         let reply = format!(
-                            "{{\"v\":1,\"id\":{id},\"ok\":true,\"result\":{{\"pong\":true}}}}\n"
+                            "{{\"v\":{IPC_PROTOCOL_VERSION},\"id\":{id},\"ok\":true,\"result\":{{\"pong\":true}}}}\n"
                         );
                         if writer.write_all(reply.as_bytes()).await.is_err() {
                             break;
@@ -751,7 +755,7 @@ pub fn gate_perf() -> (bool, String) {
         let p99 = samples.get(count.saturating_sub(1)).copied().unwrap_or(Duration::MAX);
         (p50, p99, count)
         })
-        });
+    });
     report.check(
         "ipc-ping-round-trip",
         count == 100 && p50_ms < Duration::from_millis(5) && p99_ms < Duration::from_millis(50),
@@ -1075,9 +1079,19 @@ pub fn gate_wizard_reopen_source() -> (bool, String) {
         main_slint.contains("run-setup => { run-setup-again(); }"),
         "main.slint forwards run-setup to run-setup-again",
     );
+    // v2.2 note (no-pairing redesign, WS-4): the handler delegates
+    // to `Ctx::open_setup_wizard`, which clears the marker, resets
+    // the wizard state and opens it at step 0 — the old inline
+    // `w.set_setup_mode(true)` in the closure is gone, but the
+    // behaviour is the same; audit the helper, not the old shape.
     report.check(
         "wizard-reopen-rust",
-        ui_main.contains("on_run_setup_again") && ui_main.contains("w.set_setup_mode(true)"),
+        ui_main.contains("on_run_setup_again")
+            && ui_main.contains("open_setup_wizard(&w)")
+            && ui_main.contains("fn open_setup_wizard")
+            && ui_main.contains("clear_setup_marker()")
+            && ui_main.contains("set_setup_step(0)")
+            && ui_main.contains("set_setup_mode(true)"),
         "Rust on_run_setup_again clears the marker and opens the wizard at step 0",
     );
     let tray_has_setup = daemon.contains("TrayAction::OpenSetup")
@@ -1097,6 +1111,12 @@ pub fn gate_wizard_reopen_source() -> (bool, String) {
 /// The wizard's defaults are placeholders, never fake live values,
 /// and the simulated data source must never advance the wizard
 /// (a sim reporting "Active" is not a real connection).
+///
+/// v2.2 note (no-pairing redesign, D16): the wizard is 4 steps
+/// (Connect, Drivers, Calibrate, Games) and the pairing copy is
+/// gone — no `pair-status` / `paired` defaults anymore. The
+/// Connect step's why-it-cannot-advance text is `connect-hint`
+/// ("" = no error to show).
 #[must_use]
 pub fn gate_wizard_fake_data_source() -> (bool, String) {
     let mut report = Report::new();
@@ -1105,10 +1125,11 @@ pub fn gate_wizard_fake_data_source() -> (bool, String) {
     report.check(
         "wizard-defaults-placeholder",
         setup.contains("games-text: \"No games added yet.\"")
-            && setup.contains("pair-status: \"Waiting for the wheel…\"")
             && setup.contains("connect-done: false")
-            && setup.contains("paired: false"),
-        "wizard defaults: 'No games added yet.', 'Waiting for the wheel…', connect-done=false, paired=false",
+            && setup.contains("connect-hint: \"\"")
+            && !setup.contains("pair-status:")
+            && !setup.contains("paired:"),
+        "wizard defaults: 'No games added yet.', connect-done=false, connect-hint empty, no pair-status/paired defaults",
     );
     report.check(
         "wizard-sim-never-advances",
@@ -1469,176 +1490,6 @@ pub fn gate_card_gap_source() -> (bool, String) {
     report.finish()
 }
 
-/// Gate: pairing long-call (B-1, re-scan finding).
-///
-/// `begin_pairing` is a long call: the daemon waits up to 3 s for
-/// the pairing window to open (`AppStateCore::begin_pairing`, 3 s
-/// deadline), but the UI calls it through the 500 ms-bounded IPC
-/// `call` (`IpcApi::call_async` is just `client.call`). A slow
-/// board therefore makes the IPC call time out while pairing is
-/// still starting — and the UI shows "Pairing failed" for a
-/// pairing that actually started.
-///
-/// Runtime: a fake daemon that models the FIXED daemon — the
-/// `begin_pairing` board wait still takes 3 s server-side (the
-/// slow-board case), but dispatch is non-blocking (each request
-/// answered from its own task), so the `begin_pairing` IPC call
-/// acks within 500 ms (fire-and-forget start + status polling)
-/// and the countdown arrives via `pairing_status` immediately.
-/// The OLD daemon blocked dispatch for the whole 3 s, which made
-/// the call time out at ~500 ms. Source audit records the
-/// mismatch (3 s server wait vs 500 ms client bound) and that the
-/// UI half (countdown display on success) is already wired.
-#[must_use]
-pub fn gate_pairing_long_call() -> (bool, String) {
-    let mut report = Report::new();
-
-    // Fake daemon: begin_pairing still takes 3 s server-side (the
-    // slow-board case) but dispatch is non-blocking, so
-    // pairing_status answers immediately with a 120 s countdown.
-    let dir = temp_dir("pairing-long-call");
-    let path = dir.join("rsh-daemon.sock");
-    let (begin_ms, begin_ok, status_ms, status_countdown) = block_on_scoped(|| {
-        let rt = current_thread_runtime();
-        rt.block_on(async {
-            let listener = FakeListener::bind(&path).expect("gate pairing bind");
-            tokio::spawn(async move {
-                loop {
-                    let Ok(stream) = listener.accept().await else {
-                        break;
-                    };
-                    tokio::spawn(async move {
-                        use std::sync::Arc;
-                        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-                        use tokio::sync::Mutex;
-                        let (reader, writer) = tokio::io::split(stream);
-                        let writer = Arc::new(Mutex::new(writer));
-                        let mut lines = BufReader::new(reader).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            let value: serde_json::Value =
-                                serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
-                            let id = value
-                                .get("id")
-                                .and_then(serde_json::Value::as_u64)
-                                .unwrap_or(0);
-                            let method = value
-                                .get("method")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            // Fixed-daemon model (B-1): the 3 s board
-                            // wait must NOT block dispatch — each
-                            // request is answered from its own task
-                            // (shared writer, replies serialized),
-                            // so a slow begin_pairing never delays
-                            // the pairing_status countdown. A
-                            // sequential loop here would model the
-                            // OLD broken daemon and fail the check
-                            // for the wrong reason.
-                            let writer = Arc::clone(&writer);
-                            tokio::spawn(async move {
-                                if method == "begin_pairing" {
-                                    tokio::time::sleep(Duration::from_secs(3)).await;
-                                }
-                                let result = if method == "pairing_status" {
-                                    "{\"seconds_left\":120}".to_string()
-                                } else {
-                                    "{}".to_string()
-                                };
-                                let reply = format!(
-                                    "{{\"v\":1,\"id\":{id},\"ok\":true,\"result\":{result}}}\n"
-                                );
-                                let mut writer = writer.lock().await;
-                                let _ = writer.write_all(reply.as_bytes()).await;
-                            });
-                        }
-                    });
-                }
-            });
-            let client = IpcClient::connect(&path)
-                .await
-                .expect("gate pairing connect");
-            let start = Instant::now();
-            let begin = client.call("begin_pairing", serde_json::json!({})).await;
-            let begin_ms = start.elapsed().as_millis();
-            let begin_ok = begin.is_ok();
-            let start = Instant::now();
-            let status = client.call("pairing_status", serde_json::json!({})).await;
-            let status_ms = start.elapsed().as_millis();
-            let status_countdown = status
-                .ok()
-                .and_then(|v| v.get("seconds_left")?.as_u64())
-                .unwrap_or(0);
-            (begin_ms, begin_ok, status_ms, status_countdown)
-        })
-    });
-    report.check(
-        "pairing-ack-within-500ms",
-        begin_ok && begin_ms < 500,
-        &format!(
-            "begin_pairing IPC ack in {begin_ms} ms (must be < 500 ms, Ok) — currently times out at ~500 ms while the daemon waits up to 3 s"
-        ),
-    );
-    report.check(
-        "pairing-status-countdown",
-        status_countdown == 120 && status_ms < 500,
-        &format!("pairing_status returns 120 s countdown in {status_ms} ms"),
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-
-    // No-board path: begin_pairing must fail fast with a typed
-    // outcome, never sit out the 3 s deadline when there is no
-    // transport to wait on.
-    let dir = temp_dir("pairing-no-board");
-    let state = match ProfileStore::open(&dir) {
-        Ok(store) => Arc::new(AppStateCore::new(
-            store,
-            MockBackend::new("NullSink").0.boxed(),
-            "gate",
-        )),
-        Err(error) => {
-            report.check(
-                "pairing-no-board-fails-fast",
-                false,
-                &format!("open store: {error}"),
-            );
-            return report.finish();
-        }
-    };
-    let start = Instant::now();
-    let outcome = state.begin_pairing();
-    let no_board_ms = start.elapsed().as_millis();
-    report.check(
-        "pairing-no-board-fails-fast",
-        no_board_ms < 500,
-        &format!(
-            "begin_pairing with no board returned in {no_board_ms} ms ({}; must be < 500 ms)",
-            if outcome.is_ok() { "Ok" } else { "Err" }
-        ),
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-
-    // Source audit: the mismatch itself.
-    let ipc_api = read("crates/rsh-ui/src/ipc_api.rs").unwrap_or_default();
-    let state_rs = read("crates/rsh-app-core/src/state.rs").unwrap_or_default();
-    let client_bound = ipc_api.contains("call_async(\"begin_pairing\"");
-    let server_waits_3s =
-        state_rs.contains("let deadline = Instant::now() + Duration::from_secs(3);");
-    report.check(
-        "pairing-no-500ms-mismatch",
-        !(client_bound && server_waits_3s),
-        "UI begin_pairing must NOT go through the 500 ms-bounded call while the daemon waits up to 3 s (mismatch present — needs a long-call / fire-and-forget start)",
-    );
-    let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
-    report.check(
-        "pairing-ui-shows-countdown",
-        ui_main.contains("set_setup_pair_seconds_left")
-            && ui_main.contains("Pairing window open — hold the pair button"),
-        "UI shows the countdown + 'hold the pair button' on a successful begin_pairing",
-    );
-    report.finish()
-}
-
 /// Gate: HID switch UAC dwell (B-2, re-scan finding).
 ///
 /// The elevated sidecar is launched via UAC (`runas`); the user
@@ -1858,7 +1709,7 @@ pub fn gate_bindings_ui() -> (bool, String) {
 /// Runtime: drives the real caller entry point
 /// (`flash_firmware_with_pubkey`, throwaway key) against the rig
 /// fake board and asserts the full flow — progress stages,
-/// upload to 100%, confirmed version 4.0.2, board on 4.0.2.
+/// upload to 100%, confirmed version 4.0.3, board on 4.0.3.
 /// Source audit: the UI caller. Currently FAILS: Settings only
 /// *checks* the version (`settings_check_firmware` notifies);
 /// there is no update/firmware action wired to a flash call.
@@ -1868,7 +1719,7 @@ pub fn gate_ota_flash_caller() -> (bool, String) {
 
     // Runtime: the caller entry point, end-to-end on the fake board.
     let board = FakeBoard::start("secret", (4, 0, 1));
-    let (image, _) = build_test_image("4.0.2", FIRMWARE_IMAGE_MIN_LEN);
+    let (image, _) = build_test_image("4.0.3", FIRMWARE_IMAGE_MIN_LEN);
     let dir = temp_dir("ota-flash-caller");
     let path = dir.join("firmware-signed.bin");
     if let Err(error) = std::fs::write(&path, &image) {
@@ -1886,7 +1737,7 @@ pub fn gate_ota_flash_caller() -> (bool, String) {
     );
     let mut stages: Vec<FlashStage> = Vec::new();
     let mut percents: Vec<u8> = Vec::new();
-    let mut confirm = || wait_for_board_version(&target, "4.0.2", Duration::from_secs(10));
+    let mut confirm = || wait_for_board_version(&target, "4.0.3", Duration::from_secs(10));
     let result = flash_firmware_with_pubkey(
         &path,
         &target,
@@ -1906,8 +1757,8 @@ pub fn gate_ota_flash_caller() -> (bool, String) {
     report.check(
         "ota-caller-flash-e2e",
         result.success
-            && result.version.as_deref() == Some("4.0.2")
-            && board.version() == (4, 0, 2)
+            && result.version.as_deref() == Some("4.0.3")
+            && board.version() == (4, 0, 3)
             && percents.last() == Some(&100),
         &format!(
             "flash_firmware_with_pubkey vs fake board: success={} version={:?} board={:?} upload-max={:?}",

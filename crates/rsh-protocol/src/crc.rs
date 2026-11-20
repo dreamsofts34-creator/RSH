@@ -1,7 +1,7 @@
 //! CRC16-CCITT-FALSE and CRC-32/ISO-HDLC, table-driven.
 //!
 //! CRC16: poly `0x1021`, init `0xFFFF`, no reflection, xorout `0x0000`.
-//! Check value: `crc16(b"123456789") == 0x29B1` (PROTOCOL-V2.1.md §0).
+//! Check value: `crc16(b"123456789") == 0x29B1` (PROTOCOL-V2.2.md §0).
 //! CRC16 is always last in a frame and covers every byte before it.
 //!
 //! CRC32: poly `0xEDB88320` (reflected), init `0xFFFFFFFF`,

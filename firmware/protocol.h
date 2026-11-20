@@ -74,13 +74,27 @@ static inline size_t rsh_build_packet(uint8_t *buf, uint16_t seq, uint32_t times
 }
 
 // ============================================================================
-// Protocol v2.1 (WP3, Phase A) — docs/PROTOCOL-V2.1.md authority hai.
-// v1 code (upar) barqarar hai; legacy mode 0xA5 0x01 se pehchana jata hai.
+// Protocol v2.2 (no-pairing redesign, NO-PAIRING-PLAN.md §3 D1/D2/D13) —
+// docs/PROTOCOL-V2.2.md authority hai. v2.1 se farq:
+//   * HELLO 92 B barqarar, lekin nonce/device_key/wifi_password fields
+//     hamesha zero/reserved hain (koi secret kabhi disclose nahi hota);
+//     flags sirf bit2 safe_mode rakhta hai (bit0 unpaired, bit1
+//     key_reset_armed, bit3 window_open — sab reserved 0; D7: password
+//     clear seedha physical hai, koi armed state nahi).
+//   * Control frames mein HMAC khatam (coordinator decision — WS-2 commit
+//     b5f96c2 se byte-exact match): layout "RSHC" | cmd u8 | reqId u16 LE |
+//     len u16 LE | payload[len] | CRC16. Header 9 B, kul 11 + len, max
+//     frame 1035 B. Na tag field hai, na counter field. Duplicate cache
+//     sirf reqId par hai (D2); reqId per session monotonic u16 hai.
+//   * SET_PASSWORD (0x0C) payload v2.2: [curLen u8][curPw][newLen u8]
+//     [newPw]; ghalat current password -> error code 1 (BadPassword).
+//   * Version byte 0x21 -> 0x22 (HELLO proto bytes (2,1) -> (2,2)).
+//   * BAD_TAG error code + RSH_V2_BAD_TAG result delete hue.
 // Sab integers little-endian. CRC16 hamesha aakhir mein, CRC field se pehle
 // ke tamam bytes par. Product naam RSH hai.
 // ============================================================================
 
-#define RSH_V2_VERSION            0x21   // wire version byte (§0)
+#define RSH_V2_VERSION            0x22   // wire version byte (§0)
 #define RSH_V2_MAX_AXES           8
 #define RSH_V2_MAX_ENC            4
 #define RSH_V2_MAX_BUTTONS_WIRE   64     // wire: stream buttons + status btnsEx (§1.1 N1)
@@ -89,10 +103,9 @@ static inline size_t rsh_build_packet(uint8_t *buf, uint16_t seq, uint32_t times
 #define RSH_V2_STATUS_BASE_SIZE   34
 #define RSH_V2_STATUS_EXT_SIZE    38
 #define RSH_V2_HELLO_SIZE         92
-#define RSH_V2_CTRL_HEADER_SIZE   13
-#define RSH_V2_CTRL_TAG_SIZE      16
+#define RSH_V2_CTRL_HEADER_SIZE   9
 #define RSH_V2_CTRL_MAX_PAYLOAD   1024
-#define RSH_V2_CTRL_MAX_FRAME     (RSH_V2_CTRL_HEADER_SIZE + RSH_V2_CTRL_MAX_PAYLOAD + RSH_V2_CTRL_TAG_SIZE) // 1053
+#define RSH_V2_CTRL_MAX_FRAME     (RSH_V2_CTRL_HEADER_SIZE + RSH_V2_CTRL_MAX_PAYLOAD + 2) // 1035 (9 header + payload + CRC16)
 #define RSH_V2_PING_SIZE          34     // NTP-style ping frame, fixed (§9.1)
 
 // Stream flags (§1.3, D4)
@@ -100,16 +113,20 @@ static inline size_t rsh_build_packet(uint8_t *buf, uint16_t seq, uint32_t times
 #define RSH_V2_FLAG_LOW_SUPPLY     0x02
 #define RSH_V2_FLAG_TICK_SKIPPED   0x04
 #define RSH_V2_FLAG_AXIS_INVALID   0x08
-// HELLO flags (§2.2)
-#define RSH_V2_HELLO_UNPAIRED      0x01
-#define RSH_V2_HELLO_KEY_RESET     0x02
+// HELLO flags (§2.2, v2.2): sirf bit2 safe_mode bacha hai. bit0 (unpaired),
+// bit1 (key_reset_armed) aur bit3 (window_open) reserved 0 hain — parser
+// in mein se koi bhi bit set ho to RSV_NONZERO deta hai.
 #define RSH_V2_HELLO_SAFE_MODE     0x04
-#define RSH_V2_HELLO_WINDOW_OPEN   0x08
 
 // Control error codes (§3.9)
 #define RSH_CTRL_OK           0
-#define RSH_CTRL_BAD_TAG      1
-#define RSH_CTRL_REPLAY       2
+#define RSH_CTRL_BAD_PASSWORD 1   // v2.2: SET_PASSWORD current password ghalat
+                                  // (D3 — freed BadTag slot ki value, Rust
+                                  // ErrorCode::BadPassword = 1 se match).
+#define RSH_CTRL_REPLAY       2   // v2.2: reserved — kabhi emit nahi hota
+                                  // (reqId-only dedup mein replay ka koi alag
+                                  // natija nahi; dobara reqId = duplicate,
+                                  // cached reply milta hai).
 #define RSH_CTRL_BAD_CRC      3
 #define RSH_CTRL_TOO_BIG      4
 #define RSH_CTRL_PIN_CONFLICT 5
@@ -127,7 +144,8 @@ static inline size_t rsh_build_packet(uint8_t *buf, uint16_t seq, uint32_t times
 #define RSH_CMD_FACTORY_RESET 0x08
 #define RSH_CMD_REBOOT       0x09
 #define RSH_CMD_LED_TEST     0x0A
-#define RSH_CMD_KEY_RESET    0x0B
+// 0x0B = KEY_RESET — v2.2 mein DELETE (wire opcode khatam; password clear
+// sirf physical BOOT-hold se hota hai, D7; value dobara istemal nahi hoti).
 #define RSH_CMD_SET_PASSWORD 0x0C
 // v4.0.2 additive commands (F-10 / D-5): maujooda frames nahi badle —
 // purana app inhein kabhi nahi bhejta, naya app purane firmware (4.0.1)
@@ -146,7 +164,6 @@ typedef enum {
   RSH_V2_RSV_NONZERO,  // reserved bytes != 0 ya flags bits 4-7 nonzero
   RSH_V2_BAD_LENGTH,   // status/control length valid set mein nahi
   RSH_V2_LEGACY_V1,    // pehle 2 bytes 0xA5 0x01 — v1 parser istemal karo
-  RSH_V2_BAD_TAG,      // HMAC tag verify fail
   RSH_V2_UNSUPPORTED   // nBtn 65-128 (SET_CFG rule, §1.1 N1)
 } rsh_v2_result_t;
 
@@ -181,7 +198,7 @@ static inline rsh_v2_result_t rsh_v2_check_button_count(int n_btn) {
   return RSH_V2_OK;
 }
 
-// ---- Stream v2.1 (§1.1) ----
+// ---- Stream v2.2 (§1.1) ----
 typedef struct {
   uint16_t seq;
   uint32_t timestamp_us;
@@ -232,7 +249,7 @@ static inline rsh_v2_result_t rsh_v2_parse_stream(const uint8_t *data, size_t le
   return RSH_V2_OK;
 }
 
-/// Stream v2.1 packet banao (parser ka aaina). axes: mask-order values.
+/// Stream v2.2 packet banao (parser ka aaina). axes: mask-order values.
 /// n_enc > 4 ya flags reserved bits par 0 return (ghalat input).
 static inline size_t rsh_v2_build_stream(uint8_t *buf, uint16_t seq, uint32_t timestamp_us,
                                          uint8_t flags, uint8_t axis_mask,
@@ -259,7 +276,7 @@ static inline size_t rsh_v2_build_stream(uint8_t *buf, uint16_t seq, uint32_t ti
   return total;
 }
 
-// ---- Status v2.1 (§1.2) ----
+// ---- Status v2.2 (§1.2) ----
 typedef struct {
   uint16_t seq;
   uint32_t uptime_ms;
@@ -339,15 +356,21 @@ static inline size_t rsh_v2_build_status(uint8_t *buf, const rsh_v2_status_t *s)
   return total;
 }
 
-// ---- HELLO reply (§2.2, 92 B fixed) ----
+// ---- HELLO reply (§2.2, 92 B fixed, v2.2) ----
+// Layout: "RSHR" | proto (2,2) | flags | sessionEcho | boardMac 6B |
+// fw (major, minor, patch) | rsv | nonce[16] | device_key[32] |
+// wifi_password[24] | CRC16. nonce/device_key/wifi_password hamesha
+// zero/reserved hain (v2.2 mein board kabhi secret disclose nahi karta —
+// struct mein fields sirf layout ki wajah se maujood hain, values hamesha 0).
+// flags: sirf bit2 safe_mode; bit0/bit1/bit3 reserved 0.
 typedef struct {
   uint8_t flags;
   uint8_t session_echo;
   uint8_t board_mac[6];
   uint8_t fw_major, fw_minor, fw_patch;
-  uint8_t nonce[16];
-  uint8_t device_key[32];   // unpaired + window ke ilawa sab 0x00
-  uint8_t wifi_password[24];
+  uint8_t nonce[16];         // v2.2: hamesha zero (reserved)
+  uint8_t device_key[32];    // v2.2: hamesha zero (reserved)
+  uint8_t wifi_password[24]; // v2.2: hamesha zero (reserved)
 } rsh_v2_hello_t;
 
 static inline rsh_v2_result_t rsh_v2_parse_hello(const uint8_t *data, size_t len,
@@ -356,11 +379,13 @@ static inline rsh_v2_result_t rsh_v2_parse_hello(const uint8_t *data, size_t len
   if (len < 6) return RSH_V2_TOO_SHORT;
   if (data[0] != 'R' || data[1] != 'S' || data[2] != 'H' || data[3] != 'R')
     return RSH_V2_BAD_MAGIC;
-  if (data[4] != 2 || data[5] != 1) return RSH_V2_BAD_VERSION;
+  if (data[4] != 2 || data[5] != 2) return RSH_V2_BAD_VERSION;  // v2.2: (2,2)
   if (len < RSH_V2_HELLO_SIZE) return RSH_V2_TOO_SHORT;
   if (len != RSH_V2_HELLO_SIZE) return RSH_V2_BAD_LENGTH;
   if (data[17] != 0) return RSH_V2_RSV_NONZERO;
-  if (data[6] & 0xF0) return RSH_V2_RSV_NONZERO;
+  if (data[6] & ~0x04u) return RSH_V2_RSV_NONZERO;  // sirf bit2 safe_mode allowed
+  for (int i = 18; i < 90; i++)  // nonce + device_key + wifi_password = zero
+    if (data[i] != 0) return RSH_V2_RSV_NONZERO;
   if (rsh_crc16_ccitt(data, 90) != rsh_get_u16(data + 90)) return RSH_V2_BAD_CRC;
 
   memset(out, 0, sizeof(*out));
@@ -374,26 +399,21 @@ static inline rsh_v2_result_t rsh_v2_parse_hello(const uint8_t *data, size_t len
   return RSH_V2_OK;
 }
 
-/// HELLO reply banao (parser ka aaina, §2.2). device_key/wifi_password
-/// sirf unpaired + window-open hon to bharo, warna sab 0x00 (caller ki
-/// zimmedari — builder jo diya jaye wahi likhta hai, khud faisla nahi
-/// karta). Hamesha RSH_V2_HELLO_SIZE (92) return, 0 = bad input.
+/// HELLO reply banao (parser ka aaina, §2.2 v2.2). Secret fields
+/// (nonce/device_key/wifi_password) builder khud hamesha zero likhta hai —
+/// caller unhein de hi nahi sakta (leak ka rasta hi band hai).
+/// Hamesha RSH_V2_HELLO_SIZE (92) return, 0 = bad input.
 static inline size_t rsh_v2_build_hello(uint8_t *buf, uint8_t flags, uint8_t session_echo,
                                         const uint8_t *board_mac,
-                                        uint8_t fw_major, uint8_t fw_minor, uint8_t fw_patch,
-                                        const uint8_t *nonce16,
-                                        const uint8_t *device_key32,
-                                        const uint8_t *wifi_password24) {
-  if (!buf || !board_mac || !nonce16 || !device_key32 || !wifi_password24) return 0;
+                                        uint8_t fw_major, uint8_t fw_minor, uint8_t fw_patch) {
+  if (!buf || !board_mac) return 0;
   buf[0] = 'R'; buf[1] = 'S'; buf[2] = 'H'; buf[3] = 'R';
-  buf[4] = 2; buf[5] = 1;
+  buf[4] = 2; buf[5] = 2;  // v2.2
   buf[6] = flags; buf[7] = session_echo;
   memcpy(buf + 8, board_mac, 6);
   buf[14] = fw_major; buf[15] = fw_minor; buf[16] = fw_patch;
   buf[17] = 0;  // reserved
-  memcpy(buf + 18, nonce16, 16);
-  memcpy(buf + 34, device_key32, 32);
-  memcpy(buf + 66, wifi_password24, 24);
+  memset(buf + 18, 0, 72);  // nonce (16) + device_key (32) + wifi_password (24) = zero
   rsh_put_u16(buf + 90, rsh_crc16_ccitt(buf, 90));
   return RSH_V2_HELLO_SIZE;
 }
@@ -438,104 +458,75 @@ static inline rsh_v2_result_t rsh_v2_parse_probe(const uint8_t *data, size_t len
   return RSH_V2_OK;
 }
 
-// ---- Control frames (§3.1/§3.2) ----
+// ---- Control frames v2.2 (§3.1/§3.2) ----
 //
-// HMAC-SHA256 yahan implement NAHI hai: firmware par mbedTLS maujood hai aur
-// host tests apni independent SHA256 dete hain. Caller ek callback deta hai jo
-// tag = HMAC-SHA256(key32, nonce16 || counter_LE || cmd || payload)[0:16]
-// compute karta hai. Key kabhi yahan hard-code nahi hoti — hamesha parameter.
-typedef void (*rsh_hmac16_fn)(const uint8_t *key32, const uint8_t *nonce16,
-                              uint32_t counter, uint8_t cmd,
-                              const uint8_t *payload, uint16_t payload_len,
-                              uint8_t tag_out[16]);
-
+// Layout (coordinator decision — WS-2 `control.rs` commit b5f96c2 se
+// byte-exact match): "RSHC" | cmd u8 | reqId u16 LE | len u16 LE |
+// payload[len] | CRC16 (CRC field se pehle ke tamam bytes par, CCITT).
+// Header 9 B, kul 11 + len, max frame 1035 B. Na HMAC tag hai, na counter
+// field. reqId per session monotonic u16 hai (wrap allowed); duplicate
+// suppression sirf reqId par hai (D2). CRC fail / malformed frame ->
+// dispatcher silent DROP karta hai (koi reply nahi — reqId par bharosa
+// nahi kiya ja sakta).
 typedef struct {
   uint8_t cmd;
   uint16_t req_id;
-  uint32_t counter;
   uint16_t len;
   const uint8_t *payload;  // frame ke andar point karta hai — copy nahi
-  uint8_t tag[16];
 } rsh_v2_ctrl_t;
 
-/// Sirf structure parse karo (tag verify NAHI) — BAD_TAG reply ka reqId/counter
-/// parhne ke liye lazmi hai (§3.2: PC BAD_TAG reply ko sirf reqId/counter match
-/// par maanta hai).
+/// Control frame parse karo: structure + CRC16 verify (§3.1/§3.2).
 static inline rsh_v2_result_t rsh_v2_ctrl_parse_structure(const uint8_t *data, size_t len,
                                                           rsh_v2_ctrl_t *out) {
   if (!data || !out) return RSH_V2_TOO_SHORT;
-  // TOO_SHORT sirf tab jab 13 B ka header hi parha na ja sake (§3.1).
+  // TOO_SHORT sirf tab jab 9 B ka header hi parha na ja sake (§3.1).
   // Header parh liya gaya ho to har length mismatch (truncation samet)
-  // → BAD_LENGTH (RSH_V2_BAD_LENGTH ki doc comment dekho).
+  // → BAD_LENGTH.
   if (len < (size_t)RSH_V2_CTRL_HEADER_SIZE)
     return RSH_V2_TOO_SHORT;
   if (data[0] != 'R' || data[1] != 'S' || data[2] != 'H' || data[3] != 'C')
     return RSH_V2_BAD_MAGIC;
-  uint16_t payload_len = rsh_get_u16(data + 11);
+  uint16_t payload_len = rsh_get_u16(data + 7);
   if (payload_len > RSH_V2_CTRL_MAX_PAYLOAD) return RSH_V2_BAD_LENGTH;
-  if (len != (size_t)RSH_V2_CTRL_HEADER_SIZE + payload_len + RSH_V2_CTRL_TAG_SIZE)
+  if (len != (size_t)RSH_V2_CTRL_HEADER_SIZE + payload_len + 2u)
     return RSH_V2_BAD_LENGTH;
+  if (rsh_crc16_ccitt(data, len - 2) != rsh_get_u16(data + len - 2))
+    return RSH_V2_BAD_CRC;
   out->cmd = data[4];
   out->req_id = rsh_get_u16(data + 5);
-  out->counter = rsh_get_u32(data + 7);
   out->len = payload_len;
   out->payload = data + RSH_V2_CTRL_HEADER_SIZE;
-  memcpy(out->tag, data + RSH_V2_CTRL_HEADER_SIZE + payload_len, RSH_V2_CTRL_TAG_SIZE);
   return RSH_V2_OK;
 }
 
-/// Structure + HMAC tag verify (§3.2). Tag fail → RSH_V2_BAD_TAG (BAD_TAG = 1).
-static inline rsh_v2_result_t rsh_v2_ctrl_verify(const uint8_t *data, size_t len,
-                                                 const uint8_t *key32,
-                                                 const uint8_t *nonce16,
-                                                 rsh_hmac16_fn hmac,
-                                                 rsh_v2_ctrl_t *out) {
-  rsh_v2_ctrl_t tmp;
-  rsh_v2_result_t r = rsh_v2_ctrl_parse_structure(data, len, &tmp);
-  if (r != RSH_V2_OK) return r;
-  if (!key32 || !nonce16 || !hmac) return RSH_V2_BAD_TAG;
-  uint8_t expected[16];
-  hmac(key32, nonce16, tmp.counter, tmp.cmd, tmp.payload, tmp.len, expected);
-  uint8_t diff = 0;  // constant-time compare
-  for (int i = 0; i < 16; i++) diff |= (uint8_t)(expected[i] ^ tmp.tag[i]);
-  if (diff != 0) return RSH_V2_BAD_TAG;
-  if (out) *out = tmp;
-  return RSH_V2_OK;
-}
-
-/// Control frame banao (tag sameet). 0 return = payload > 1024, buf chhota, ya hmac NULL.
+/// Control frame banao (CRC16 sameet). 0 return = payload > 1024 ya buf chhota.
 static inline size_t rsh_v2_ctrl_build(uint8_t *buf, size_t buf_len, uint8_t cmd,
-                                       uint16_t req_id, uint32_t counter,
-                                       const uint8_t *payload, uint16_t payload_len,
-                                       const uint8_t *key32, const uint8_t *nonce16,
-                                       rsh_hmac16_fn hmac) {
-  if (!buf || !hmac || !key32 || !nonce16) return 0;
+                                       uint16_t req_id,
+                                       const uint8_t *payload, uint16_t payload_len) {
+  if (!buf) return 0;
   if (payload_len > RSH_V2_CTRL_MAX_PAYLOAD) return 0;
-  size_t total = (size_t)RSH_V2_CTRL_HEADER_SIZE + payload_len + RSH_V2_CTRL_TAG_SIZE;
+  size_t total = (size_t)RSH_V2_CTRL_HEADER_SIZE + payload_len + 2u;
   if (buf_len < total) return 0;
   buf[0] = 'R'; buf[1] = 'S'; buf[2] = 'H'; buf[3] = 'C';
   buf[4] = cmd;
   rsh_put_u16(buf + 5, req_id);
-  rsh_put_u32(buf + 7, counter);
-  rsh_put_u16(buf + 11, payload_len);
+  rsh_put_u16(buf + 7, payload_len);
   if (payload_len > 0) memcpy(buf + RSH_V2_CTRL_HEADER_SIZE, payload, payload_len);
-  hmac(key32, nonce16, counter, cmd, payload, payload_len,
-       buf + RSH_V2_CTRL_HEADER_SIZE + payload_len);
+  rsh_put_u16(buf + total - 2, rsh_crc16_ccitt(buf, total - 2));
   return total;
 }
 
-// ---- Control session: duplicate / replay (§2.3/§3.2) ----
+// ---- Control session: reqId-only duplicate cache (§2.3/§3.2, D2) ----
+// Sirf do natije hain: naya reqId -> ACCEPT (execute karo); pehle dekha
+// hua reqId -> DUPLICATE (cached reply, dobara execute nahi). Koi counter
+// nahi, is liye koi REPLAY natija nahi (RSH_CTRL_REPLAY code reserved hai).
 typedef enum {
-  RSH_DEC_ACCEPT = 0,   // naya pair, counter max-seen se naya (serial arithmetic) — execute karo
-  RSH_DEC_DUPLICATE,    // wahi (reqId, counter) dobara — cached reply, dobara execute nahi
-  RSH_DEC_REPLAY        // naya reqId lekin counter purana (serial arithmetic se <= max-seen) — status REPLAY (2)
+  RSH_DEC_ACCEPT = 0,   // naya reqId — execute karo
+  RSH_DEC_DUPLICATE     // wahi reqId dobara — cached reply, dobara execute nahi
 } rsh_ctrl_decision_t;
 
 typedef struct {
-  uint32_t max_seen;
-  uint8_t has_seen;
   uint16_t req_ids[32];
-  uint32_t counters[32];
   uint8_t count;
   uint8_t next;
 } rsh_ctrl_session_t;
@@ -545,22 +536,12 @@ static inline void rsh_ctrl_session_init(rsh_ctrl_session_t *s) {
 }
 
 static inline rsh_ctrl_decision_t rsh_ctrl_session_classify(rsh_ctrl_session_t *s,
-                                                            uint16_t req_id,
-                                                            uint32_t counter) {
+                                                            uint16_t req_id) {
   for (int i = 0; i < s->count; i++) {
-    if (s->req_ids[i] == req_id && s->counters[i] == counter)
+    if (s->req_ids[i] == req_id)
       return RSH_DEC_DUPLICATE;
   }
-  // Counter-wrap rule (Phase D, SEC-D-07c — PROTOCOL-V2.1.md §3.2 amendment):
-  // "naya" counter wahi hai jis ka (int32_t)(counter - max_seen) > 0 ho
-  // (RFC 1982 serial arithmetic). 0xFFFFFFFF ke baad 0 bhi naya hai; koi
-  // bhi purana counter (wrap ke baad bhi) REPLAY hai. Naya session (naya
-  // nonce) par session reset hota hai — purane counters dobara valid nahi.
-  if (s->has_seen && (int32_t)(counter - s->max_seen) <= 0) return RSH_DEC_REPLAY;
-  s->max_seen = counter;
-  s->has_seen = 1;
   s->req_ids[s->next] = req_id;
-  s->counters[s->next] = counter;
   s->next = (uint8_t)((s->next + 1) % 32);
   if (s->count < 32) s->count++;
   return RSH_DEC_ACCEPT;

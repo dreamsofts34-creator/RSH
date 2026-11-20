@@ -20,7 +20,7 @@
 //! re-probes in the background.
 //!
 //! F5 (v2.0.3): the slow values — firmware, address, diagnostics,
-//! pairing, calibration, profiles, games, bindings, knobs, modules,
+//! wifi, calibration, profiles, games, bindings, knobs, modules,
 //! tunings, draft — are refreshed ~1 Hz by a second runtime task
 //! ([`refresh_slow`]) into the same cache, so the UI's whole sync
 //! suite reads cache only and `reconnect_to_live` fetches its seed
@@ -43,8 +43,8 @@ use rsh_api::connection::ConnectionState;
 use rsh_api::{
     app_version, ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionError,
     ConnectionInfo, DiagStats, DraftStatus, FirmwareCheck, FirmwareUpdateStatus, GameSummary,
-    PairingInfo, PollState, ProfileSummary, RawMv, SlowPollState, SnapshotInfo, TuningSettings,
-    UserError, VjoyStatus,
+    PollState, ProfileSummary, RawMv, SlowPollState, SnapshotInfo, TuningSettings, UserError,
+    VjoyStatus, WifiStatus,
 };
 use rsh_ipc::{IpcClient, IpcError};
 
@@ -55,7 +55,7 @@ use rsh_ipc::{IpcClient, IpcError};
 /// fail fast on it instead of waiting out the 500 ms timeout.
 ///
 /// F5 (v2.0.3): the slow slots below hold everything else the UI
-/// re-reads — firmware / address / diagnostics / pairing /
+/// re-reads — firmware / address / diagnostics / wifi /
 /// calibration / profiles / games / bindings / knobs / modules /
 /// tunings / draft — refreshed ~1 Hz by a second poller task on
 /// the runtime (never the UI thread). The UI's sync suite
@@ -89,7 +89,7 @@ struct LiveCache {
     firmware_version: Mutex<Option<String>>,
     board_address: Mutex<Option<String>>,
     diag_stats: Mutex<Option<DiagStats>>,
-    pairing_status: Mutex<Option<PairingInfo>>,
+    wifi_status: Mutex<Option<WifiStatus>>,
     calibration: Mutex<Option<CalibrationInfo>>,
     /// Latest raw ADC readings in mV (R2-16): refreshed by the
     /// slow poller ~1 Hz; the Advanced readouts read this slot.
@@ -146,7 +146,7 @@ impl Default for LiveCache {
             firmware_version: Mutex::new(None),
             board_address: Mutex::new(None),
             diag_stats: Mutex::new(None),
-            pairing_status: Mutex::new(None),
+            wifi_status: Mutex::new(None),
             calibration: Mutex::new(None),
             raw_mv: Mutex::new(None),
             profiles: Mutex::new(None),
@@ -369,10 +369,8 @@ pub struct LiveSeed {
     /// The session `connect` verdict (the wizard's Connect step
     /// follows it; a failure notifies instead of blocking).
     pub connect: Result<ConnectionInfo, UserError>,
-    /// Pairing window state (wizard Pair step).
-    pub pairing: PairingInfo,
-    /// Whether the `connect` verdict is an Active session.
-    pub connection_active: bool,
+    /// Wi-Fi status (wizard Connect step: SSID / password set).
+    pub wifi: WifiStatus,
 }
 
 impl LiveSeed {
@@ -385,15 +383,11 @@ impl LiveSeed {
     pub fn fetch(api: &IpcApi, transport: ApiTransport) -> Self {
         let connect = api.connect(transport);
         api.refresh_slow_blocking();
-        let connection_active = connect
-            .as_ref()
-            .is_ok_and(|info| matches!(info.state, ConnectionState::Active));
         Self {
             backend: api.output_backend(),
             autostart: api.autostart(),
             connect,
-            pairing: api.pairing_status(),
-            connection_active,
+            wifi: api.wifi_status(),
         }
     }
 }
@@ -670,7 +664,7 @@ impl IpcApi {
         if let Ok(mut slot) = self.cache.diag_stats.lock() {
             *slot = None;
         }
-        if let Ok(mut slot) = self.cache.pairing_status.lock() {
+        if let Ok(mut slot) = self.cache.wifi_status.lock() {
             *slot = None;
         }
         if let Ok(mut slot) = self.cache.calibration.lock() {
@@ -880,6 +874,7 @@ impl IpcApi {
             transport: ApiTransport::Wifi,
             address: String::new(),
             session_active: false,
+            board_reachable: false,
             error: Some(ConnectionError::TransportClosed),
             hint: Some(ConnectionError::TransportClosed.hint().to_string()),
         }
@@ -933,7 +928,7 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
         if let Some(diag) = state.diag_stats {
             set_slot!(diag_stats, diag);
         }
-        set_slot!(pairing_status, state.pairing_status);
+        set_slot!(wifi_status, state.wifi_status);
         if let Some(calibration) = state.calibration {
             set_slot!(calibration, calibration);
         }
@@ -1040,7 +1035,7 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     fetch!("diag_stats", diag_stats, |v| {
         serde_json::from_value(v.clone()).ok()
     });
-    fetch!("pairing_status", pairing_status, |v| {
+    fetch!("wifi_status", wifi_status, |v| {
         serde_json::from_value(v.clone()).ok()
     });
     fetch!("calibration", calibration, |v| {
@@ -1201,7 +1196,7 @@ fn slow_content_hash(cache: &LiveCache) -> u64 {
     slot!(backend);
     slot!(autostart);
     slot!(board_address);
-    slot!(pairing_status);
+    slot!(wifi_status);
     slot!(calibration);
     slot!(profiles);
     slot!(games);
@@ -1291,7 +1286,7 @@ impl AppApi for IpcApi {
         });
         match got {
             // F5: a (dis)connect changes the session — pull the
-            // next slow cycle forward so pairing / firmware follow.
+            // next slow cycle forward so wifi / firmware follow.
             Ok(info) => {
                 self.request_slow_refresh();
                 Ok(info)
@@ -1317,55 +1312,107 @@ impl AppApi for IpcApi {
         }
     }
 
-    /// Cached pairing status (F5): the slow poller refreshes it
+    /// Cached Wi-Fi status (F5): the slow poller refreshes it
     /// ~1 Hz, so this never touches the socket. No cache yet means
-    /// no window (the pre-poller fallback).
-    fn pairing_status(&self) -> PairingInfo {
+    /// no password set and not connected (the pre-poller fallback).
+    fn wifi_status(&self) -> WifiStatus {
         self.cache
-            .pairing_status
+            .wifi_status
             .lock()
             .ok()
             .and_then(|slot| slot.clone())
-            .unwrap_or(PairingInfo {
-                seconds_left: 0,
-                password: None,
-                error: None,
-                error_detail: None,
+            .unwrap_or(WifiStatus {
+                ssid: None,
+                connected: false,
+                password_set: false,
                 board_mac: None,
-                replacement_required: false,
-                key_reset_armed: false,
-                attempt_log: Vec::new(),
             })
     }
 
-    fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
-        // B-1: fire-and-forget start — the client returns as soon as
-        // the request is written (a slow board must not time the
-        // call out), so the reply is `null`; the real status arrives
-        // via `PairingWindow` events + `pairing_status` polling.
-        let got: Result<PairingInfo, IpcError> = self.rt.block_on(async {
+    fn set_wifi_password(&self, password: &str, confirm: &str) -> Result<WifiStatus, UserError> {
+        let got: Result<WifiStatus, IpcError> = self.rt.block_on(async {
             let value = self
-                .call_async("begin_pairing", serde_json::json!({}))
+                .call_async(
+                    "set_wifi_password",
+                    serde_json::json!({"password": password, "confirm": confirm}),
+                )
                 .await?;
-            Ok(serde_json::from_value(value).unwrap_or(PairingInfo {
-                seconds_left: 0,
-                password: None,
-                error: None,
-                error_detail: None,
-                board_mac: None,
-                replacement_required: false,
-                key_reset_armed: false,
-                attempt_log: Vec::new(),
-            }))
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
         });
         match got {
-            // F5: pairing started — pull the next slow cycle forward
-            // so the wizard's countdown follows the real window.
-            Ok(info) => {
+            Ok(status) => {
+                // F5: the password changes the Wi-Fi state — pull
+                // the next slow cycle forward so the Settings
+                // indicator follows the real state.
                 self.request_slow_refresh();
-                Ok(info)
+                if let Ok(mut slot) = self.cache.wifi_status.lock() {
+                    *slot = Some(status.clone());
+                }
+                Ok(status)
             }
-            Err(_) => Err(Self::ipc_failed()),
+            Err(e) => Err(Self::api_error(&e)),
+        }
+    }
+
+    fn clear_wifi_password(&self) -> Result<WifiStatus, UserError> {
+        let got: Result<WifiStatus, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async("clear_wifi_password", serde_json::json!({}))
+                .await?;
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
+        });
+        match got {
+            Ok(status) => {
+                self.request_slow_refresh();
+                if let Ok(mut slot) = self.cache.wifi_status.lock() {
+                    *slot = Some(status.clone());
+                }
+                Ok(status)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
+    }
+
+    fn scan_rsh_networks(&self) -> Vec<String> {
+        self.rt
+            .block_on(self.call_async("scan_rsh_networks", serde_json::json!({})))
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+
+    fn rejoin_wifi_open(&self, ssid: &str) -> Result<WifiStatus, UserError> {
+        let got: Result<WifiStatus, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async("rejoin_wifi_open", serde_json::json!({"ssid": ssid}))
+                .await?;
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
+        });
+        match got {
+            Ok(status) => {
+                self.request_slow_refresh();
+                Ok(status)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
+    }
+
+    fn rejoin_wifi(&self, ssid: &str, password: &str) -> Result<WifiStatus, UserError> {
+        let got: Result<WifiStatus, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async(
+                    "rejoin_wifi",
+                    serde_json::json!({"ssid": ssid, "password": password}),
+                )
+                .await?;
+            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
+        });
+        match got {
+            Ok(status) => {
+                self.request_slow_refresh();
+                Ok(status)
+            }
+            Err(e) => Err(Self::api_error(&e)),
         }
     }
 
@@ -1863,52 +1910,11 @@ impl AppApi for IpcApi {
         self.capture_mv("capture_pedal_max", serde_json::json!({"pedal": pedal}))
     }
 
-    // v2.0.2 Round 3: pairing reset, firmware check/update, board
+    // v2.0.2 Round 3: firmware check/update, board
     // address, module toggles, auto-pause, tray, backup, profile
     // rename/link, knob actions, bindings. Failures surface the
     // daemon's typed reason ([`Self::api_error`]), never a bare
     // "Unknown" — the UI shows the reason + the next step.
-    fn reset_pairing(&self) -> Result<PairingInfo, UserError> {
-        let got: Result<PairingInfo, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("reset_pairing", serde_json::json!({}))
-                .await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        match got {
-            Ok(info) => {
-                // F5: the reset changes the pairing state — pull
-                // the next slow cycle forward.
-                self.request_slow_refresh();
-                Ok(info)
-            }
-            Err(e) => Err(Self::api_error(&e)),
-        }
-    }
-
-    // R2-51: confirm a key replacement (WS-A server side) — NOT
-    // fire-and-forget like `begin_pairing`: the daemon returns the
-    // `PairingInfo` promptly, and the outcome arrives via
-    // `pairing_status()` polling + `PairingFinished`. Same call
-    // pattern as `reset_pairing` above.
-    fn confirm_pairing_replacement(&self) -> Result<PairingInfo, UserError> {
-        let got: Result<PairingInfo, IpcError> = self.rt.block_on(async {
-            let value = self
-                .call_async("confirm_pairing_replacement", serde_json::json!({}))
-                .await?;
-            serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
-        });
-        match got {
-            Ok(info) => {
-                // F5: the confirm changes the pairing state — pull
-                // the next slow cycle forward.
-                self.request_slow_refresh();
-                Ok(info)
-            }
-            Err(e) => Err(Self::api_error(&e)),
-        }
-    }
-
     /// Cached bindings list (F5): the slow poller refreshes it ~1 Hz,
     /// so this never touches the socket. No cache yet means an empty
     /// list (the display defaults stand).
@@ -2811,7 +2817,10 @@ mod tests {
         assert_eq!(client.list_games().len(), 0);
         assert_eq!(client.list_bindings().len(), 0);
         assert_eq!(client.get_tuning("brake").module, "brake");
-        assert_eq!(client.pairing_status().seconds_left, 0);
+        assert!(
+            !client.wifi_status().password_set,
+            "sim has no Wi-Fi password set"
+        );
         assert!(!client.firmware_update_status().running);
         drop(client);
         handle.join().expect("server thread");
@@ -2909,6 +2918,7 @@ mod tests {
                 transport: ApiTransport::Wifi,
                 address: String::new(),
                 session_active: false,
+                board_reachable: false,
                 error: None,
                 hint: None,
             }
@@ -2925,21 +2935,13 @@ mod tests {
             Ok(self.connection())
         }
 
-        fn pairing_status(&self) -> rsh_api::PairingInfo {
-            rsh_api::PairingInfo {
-                seconds_left: 0,
-                password: None,
-                error: None,
-                error_detail: None,
+        fn wifi_status(&self) -> rsh_api::WifiStatus {
+            rsh_api::WifiStatus {
+                ssid: None,
+                connected: false,
+                password_set: false,
                 board_mac: None,
-                replacement_required: false,
-                key_reset_armed: false,
-                attempt_log: Vec::new(),
             }
-        }
-
-        fn begin_pairing(&self) -> Result<rsh_api::PairingInfo, rsh_api::UserError> {
-            Ok(self.pairing_status())
         }
 
         fn snapshot(&self) -> rsh_api::SnapshotInfo {
@@ -3164,10 +3166,18 @@ mod tests {
         let (client, dir, handle, _guard) = live_client();
         let seed = LiveSeed::fetch(&client, ApiTransport::Wifi);
         assert!(seed.connect.is_ok(), "sim connect succeeds");
-        assert!(seed.connection_active, "sim session is Active");
+        assert!(
+            seed.connect
+                .as_ref()
+                .is_ok_and(|info| matches!(info.state, ConnectionState::Active)),
+            "sim session is Active"
+        );
         assert_eq!(seed.backend, "vJoy");
         assert!(seed.autostart);
-        assert_eq!(seed.pairing.seconds_left, 0);
+        assert!(
+            !seed.wifi.password_set,
+            "sim seed has no Wi-Fi password set"
+        );
         assert!(client.slow_filled(), "seed fetch fills the slow cache");
         assert_eq!(client.version(), app_version());
         assert_eq!(client.firmware_version(), "Unknown");
@@ -3225,8 +3235,12 @@ mod tests {
         // Unreachable"` — both must parse to the same kind.
         let error = IpcApi::daemon_connect_error("Unreachable: ");
         assert_eq!(error.code, "Unreachable");
+        // No-pairing redesign (protocol v2.2): `BadTag` died with
+        // pairing — there is no device-key/tag step any more, so the
+        // code is unrecognised and stays the generic link failure,
+        // like any other unknown code.
         let error = IpcApi::daemon_connect_error("BadTag: daemon API error: BadTag");
-        assert_eq!(error.code, "BadTag");
+        assert_eq!(error.code, "TransportClosed");
         let error = IpcApi::daemon_connect_error("AddrInUse: daemon API error: AddrInUse");
         assert_eq!(error.code, "AddrInUse");
         let error = IpcApi::daemon_connect_error("NoSuchCode: daemon API error: NoSuchCode");
@@ -3256,6 +3270,7 @@ mod tests {
                 transport: ApiTransport::Wifi,
                 address: String::new(),
                 session_active: false,
+                board_reachable: false,
                 error: None,
                 hint: None,
             }
@@ -3272,21 +3287,13 @@ mod tests {
             Ok(self.connection())
         }
 
-        fn pairing_status(&self) -> rsh_api::PairingInfo {
-            rsh_api::PairingInfo {
-                seconds_left: 0,
-                password: None,
-                error: None,
-                error_detail: None,
+        fn wifi_status(&self) -> rsh_api::WifiStatus {
+            rsh_api::WifiStatus {
+                ssid: None,
+                connected: false,
+                password_set: false,
                 board_mac: None,
-                replacement_required: false,
-                key_reset_armed: false,
-                attempt_log: Vec::new(),
             }
-        }
-
-        fn begin_pairing(&self) -> Result<rsh_api::PairingInfo, rsh_api::UserError> {
-            Ok(self.pairing_status())
         }
 
         fn snapshot(&self) -> rsh_api::SnapshotInfo {
@@ -3540,12 +3547,8 @@ mod tests {
             self.inner.disconnect()
         }
 
-        fn pairing_status(&self) -> PairingInfo {
-            self.inner.pairing_status()
-        }
-
-        fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
-            self.inner.begin_pairing()
+        fn wifi_status(&self) -> WifiStatus {
+            self.inner.wifi_status()
         }
 
         fn snapshot(&self) -> SnapshotInfo {

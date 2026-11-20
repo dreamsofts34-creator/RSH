@@ -1,19 +1,19 @@
-//! `rsh-protocol`: RSH protocol v2.1 — pure parse/encode.
+//! `rsh-protocol`: RSH protocol v2.2 — pure parse/encode.
 //!
-//! Wire contract: `PROTOCOL-V2.1.md` (authority). Byte-identical with the
-//! C#/C++/Python implementations; golden vectors live in
-//! `tests/golden_vectors.rs` (values copied from
-//! `reference/tests-host/protocol_v2_vectors.py` — the Rust code must
-//! match *them*, never the other way round).
+//! Wire contract: `PROTOCOL-V2.2.md` (authority, WS-5). Byte-identical with the
+//! C++/Python implementations; golden vectors live in
+//! `tests/golden_vectors.rs` (values computed from the v2.2 layout in
+//! `NO-PAIRING-PLAN.md` §3 D1/D2 — HELLO 92 B with zeroed reserved fields,
+//! plain `RSHC` frames with a CRC16 trailer, version byte `0x22`).
 //!
 //! Modules:
 //!
 //! * [`crc`] — CRC16-CCITT-FALSE (check `0x29B1`) and CRC-32/ISO-HDLC.
 //! * [`stream`] — stream (`"RSH2"`) and status (`0xA6`) packets, legacy
 //!   detection.
-//! * [`control`] — `"RSHC"` frames, HMAC-SHA256 tags, opcodes, error
-//!   codes, replay/duplicate/retry rules.
-//! * [`hello`] — HELO/HELLO pairing and the session state machine (D30).
+//! * [`control`] — `"RSHC"` frames (CRC only, no HMAC), opcodes, error
+//!   codes, reqId-duplicate/retry rules.
+//! * [`hello`] — HELO/HELLO discovery and the plain link state.
 //! * [`ping`] — `"RSHN"` NTP-style ping and delay/offset formulas.
 //! * [`config`] — `"RSHG"` config blob and `SET_CFG` chunk staging.
 //! * [`caps`] — `GET_CAPS` reply body and pin table.
@@ -41,15 +41,14 @@ pub use caps::{GetCapsReply, PinTableEntry};
 pub use config::{ConfigBlob, ConfigRecord, ConfigStaging, SetCfgChunk, factory_default_blob};
 pub use control::{
     ControlFrame, ControlRetry, DuplicateCache, ErrorCode, GetCfgRequest, LedTestPattern, Opcode,
-    PinProbeRequest, ReplayTracker, build_frame, build_reply, compute_tag, verify_frame,
-    verify_tag,
+    PinProbeRequest, build_frame, build_reply,
 };
 pub use crc::{crc16, crc32, verify_crc16_trailer, with_crc16};
 pub use error::{
     ConfigError, ControlParseError, HelloError, PingError, ProbeError, RejectCounters, SerialError,
     StatusError, StreamError,
 };
-pub use hello::{HelloReply, HeloRequest, SessionState};
+pub use hello::{HelloReply, HeloRequest, LinkState};
 pub use pin::{PinModule, PinModuleKind, free_pins, validate, validate_blob};
 pub use ping::{PingFrame, PingMeasurement, PingType, measure};
 pub use probe::{ProbeFrame, ProbeSamples};

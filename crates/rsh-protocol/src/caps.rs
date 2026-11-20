@@ -96,8 +96,9 @@ pub struct GetCapsReply {
     pub n_enc_max: u8,
     /// Current `SoftAP` channel (1–13); 0 = unknown / no AP.
     pub wifi_channel: u8,
-    /// Caps flags: bit0 slowAxis, bit1 safeMode, bit2 unpaired,
-    /// bit3 keyResetArmed; bits 4–7 reserved (0).
+    /// Caps flags: bit0 slowAxis, bit1 safeMode; bits 2–7 reserved (0)
+    /// in v2.2 (bit2 `unpaired` and bit3 `key_reset_armed` are deleted
+    /// with pairing / the armed window, D7).
     pub caps_flags: u8,
     /// Pin table entries.
     pub pin_table: Vec<PinTableEntry>,
@@ -114,18 +115,6 @@ impl GetCapsReply {
     #[must_use]
     pub fn safe_mode(&self) -> bool {
         self.caps_flags & 0x02 != 0
-    }
-
-    /// Bit 2 — unpaired.
-    #[must_use]
-    pub fn unpaired(&self) -> bool {
-        self.caps_flags & 0x04 != 0
-    }
-
-    /// Bit 3 — `KEY_RESET` armed.
-    #[must_use]
-    pub fn key_reset_armed(&self) -> bool {
-        self.caps_flags & 0x08 != 0
     }
 
     /// Parse the reply payload of a verified `GET_CAPS` control frame
@@ -159,7 +148,12 @@ impl GetCapsReply {
             return Err(ControlParseError::BadLength);
         }
         let caps_flags = payload[16];
-        if caps_flags & 0xF0 != 0 {
+        // Reserved bits: a v2.2 caps reply must have bits 2–7 clear
+        // (only slowAxis/safeMode are defined); a v2.1 reply is checked
+        // only for bits 4–7, since its bits 2/3 carried pairing meaning.
+        let protocol = (payload[10], payload[11]);
+        let reserved_mask = if protocol == (2, 2) { 0xFC } else { 0xF0 };
+        if caps_flags & reserved_mask != 0 {
             return Err(ControlParseError::BadLength);
         }
         let mut board_mac = [0u8; 6];
@@ -218,7 +212,7 @@ mod tests {
             status: ErrorCode::Ok,
             board_mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
             firmware: (4, 0, 1),
-            protocol: (2, 1),
+            protocol: (2, 2),
             n_axes_max: 8,
             n_btn_max: 64,
             n_enc_max: 4,

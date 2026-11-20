@@ -2,7 +2,7 @@
 //!
 //! Every parser rejects with a distinct error variant and bumps a distinct
 //! counter in [`RejectCounters`], so a caller can tell *why* a datagram was
-//! dropped (PROTOCOL-V2.1.md §1.4: `badMagic`, `badVersion`, `badCrc`,
+//! dropped (PROTOCOL-V2.2.md §1.4: `badMagic`, `badVersion`, `badCrc`,
 //! `badFrame`, `rsvNonzero`).
 
 use core::fmt;
@@ -23,11 +23,9 @@ pub struct RejectCounters {
     pub bad_frame: u64,
     /// Nonzero reserved byte(s).
     pub rsv_nonzero: u64,
-    /// HMAC tag verification failed.
-    pub bad_tag: u64,
-    /// Counter/state replay (`REPLAY`, RFC 1982 serial arithmetic).
+    /// Counter/state replay (`REPLAY`, duplicate `reqId`).
     pub replay: u64,
-    /// Exact retransmit of a cached `(reqId, counter)` pair.
+    /// Exact retransmit of a cached `reqId`.
     pub duplicate: u64,
     /// Frame shorter than its header (`TOO_SHORT` / `TooShort`).
     pub too_short: u64,
@@ -52,7 +50,6 @@ impl RejectCounters {
             .saturating_add(self.bad_crc)
             .saturating_add(self.bad_frame)
             .saturating_add(self.rsv_nonzero)
-            .saturating_add(self.bad_tag)
             .saturating_add(self.replay)
             .saturating_add(self.duplicate)
             .saturating_add(self.too_short)
@@ -70,7 +67,7 @@ pub enum StreamError {
     BadMagic,
     /// Legacy v1 packet (`0xA5 0x01`): recognised, deliberately not parsed.
     Legacy,
-    /// Version byte is not `0x21`.
+    /// Version byte is not `0x22`.
     BadVersion,
     /// `nEnc > 4`, or the datagram length does not equal
     /// `20 + 2·popcount(axisMask) + 2·nEnc + 2`.
@@ -86,8 +83,8 @@ impl fmt::Display for StreamError {
         let s = match self {
             Self::TooShort => "stream frame too short to read header",
             Self::BadMagic => "stream frame bad magic (not RSH2)",
-            Self::Legacy => "legacy v1 packet (0xA5 0x01), not parsed as v2.1",
-            Self::BadVersion => "stream frame version is not 0x21",
+            Self::Legacy => "legacy v1 packet (0xA5 0x01), not parsed as v2.2",
+            Self::BadVersion => "stream frame version is not 0x22",
             Self::BadFrame => "stream frame length or encoder count out of bounds",
             Self::RsvNonzero => "stream frame reserved byte(s) nonzero",
             Self::BadCrc => "stream frame CRC16 mismatch",
@@ -105,7 +102,7 @@ pub enum StatusError {
     BadLength,
     /// First byte is not `0xA6`.
     BadMagic,
-    /// Version byte is not `0x21`.
+    /// Version byte is not `0x22`.
     BadVersion,
     /// Trailing CRC16 does not match.
     BadCrc,
@@ -116,7 +113,7 @@ impl fmt::Display for StatusError {
         let s = match self {
             Self::BadLength => "status packet length is not 34 or 38 bytes",
             Self::BadMagic => "status packet magic is not 0xA6",
-            Self::BadVersion => "status packet version is not 0x21",
+            Self::BadVersion => "status packet version is not 0x22",
             Self::BadCrc => "status packet CRC16 mismatch",
         };
         f.write_str(s)
@@ -127,30 +124,30 @@ impl core::error::Error for StatusError {}
 
 /// Structural parse error for a control frame (§3.1).
 ///
-/// `TooShort` is returned **only** when the frame is shorter than the 13-byte
+/// `TooShort` is returned **only** when the frame is shorter than the 9-byte
 /// header (the `len` field itself cannot be read). Once the header has been
 /// read, every length mismatch — `len > 1024`, truncation, extra bytes — is
 /// `BadLength`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlParseError {
-    /// Frame is shorter than 13 bytes.
+    /// Frame is shorter than 9 bytes.
     TooShort,
     /// Magic is not `"RSHC"`.
     BadMagic,
-    /// Header readable but length does not satisfy `13 + len + 16`,
+    /// Header readable but length does not satisfy `9 + len + 2`,
     /// or `len > 1024`.
     BadLength,
-    /// HMAC tag verification failed (constant-time compare).
-    BadTag,
+    /// Trailing CRC16 does not match.
+    BadCrc,
 }
 
 impl fmt::Display for ControlParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            Self::TooShort => "control frame shorter than 13-byte header (TOO_SHORT)",
+            Self::TooShort => "control frame shorter than 9-byte header (TOO_SHORT)",
             Self::BadMagic => "control frame bad magic (not RSHC)",
             Self::BadLength => "control frame length mismatch (BAD_LENGTH)",
-            Self::BadTag => "control frame HMAC tag verification failed (BAD_TAG)",
+            Self::BadCrc => "control frame CRC16 mismatch (BAD_CRC)",
         };
         f.write_str(s)
     }
@@ -165,7 +162,8 @@ pub enum HelloError {
     BadLength,
     /// Magic is not `"RSHR"`.
     BadMagic,
-    /// `protoMajor`/`protoMinor` are not 2/1.
+    /// `protoMajor`/`protoMinor` are not 2/2 (2/1 accepted for an old
+    /// board — see `HelloReply::is_old_protocol`).
     BadVersion,
     /// Reserved byte 17 is nonzero.
     RsvNonzero,
@@ -178,7 +176,7 @@ impl fmt::Display for HelloError {
         let s = match self {
             Self::BadLength => "HELLO reply length is not 92 bytes",
             Self::BadMagic => "HELLO reply magic is not RSHR",
-            Self::BadVersion => "HELLO reply protocol version is not 2.1",
+            Self::BadVersion => "HELLO reply protocol version is not 2.2 (or 2.1 for old firmware)",
             Self::RsvNonzero => "HELLO reply reserved byte nonzero",
             Self::BadCrc => "HELLO reply CRC16 mismatch",
         };
@@ -195,7 +193,7 @@ pub enum PingError {
     TooShort,
     /// Magic is not `"RSHN"`.
     BadMagic,
-    /// Version byte is not `0x21`, or `type` is not 0/1.
+    /// Version byte is not `0x22`, or `type` is not 0/1.
     BadVersion,
     /// Length is not exactly 34 bytes.
     BadLength,
@@ -308,7 +306,7 @@ pub enum ProbeError {
     TooShort,
     /// Magic is not `"RSHP"`.
     BadMagic,
-    /// Version byte is not `0x21`, or `mode` is not 0/1.
+    /// Version byte is not `0x22`, or `mode` is not 0/1.
     BadVersion,
     /// Declared `sampleCount` does not match the frame length.
     BadLength,

@@ -34,8 +34,9 @@ use serde::{Deserialize, Serialize};
 /// Log lines whose value after `=`/`:` is a secret. Matched
 /// case-insensitively against the *key* part of a line; the bare word
 /// `key` is deliberately NOT in this list (it appears in benign
-/// contexts such as "hotkey" / "key binding") — device and signing
-/// keys are covered by the `device_key` / `signing` entries instead.
+/// contexts such as "hotkey" / "key binding") — signing keys are
+/// covered by the `signing` entry instead. (No-pairing redesign:
+/// there is no device key anymore, so no `device_key` entry.)
 pub const SECRET_KEYS: &[&str] = &[
     "password",
     "passwd",
@@ -50,8 +51,6 @@ pub const SECRET_KEYS: &[&str] = &[
     "bearer",
     "auth",
     "wifi",
-    "device_key",
-    "device-key",
     "signing",
 ];
 

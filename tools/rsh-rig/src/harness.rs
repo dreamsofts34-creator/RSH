@@ -97,7 +97,7 @@ use rsh_engine::engine::{
 };
 use rsh_engine::pipeline::{OutputState, PipelinePlan, ProcessingPipeline, ShifterGateMode};
 use rsh_engine::sequence::SequenceTracker;
-use rsh_protocol::control::{ControlFrame, DuplicateCache, ReplayTracker, build_frame};
+use rsh_protocol::control::{ControlFrame, DuplicateCache, build_frame};
 use rsh_protocol::error::RejectCounters;
 use rsh_protocol::ping::{PingFrame, measure};
 use rsh_protocol::stream::{StatusPacket, StreamFrame};
@@ -105,7 +105,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::metrics::{JitterHistogram, Metrics, Sampler};
 use crate::scenarios::{HarnessConfig, Scenario};
-use crate::wheel::{TEST_KEY, TEST_NONCE, VirtualWheel, WheelSummary};
+use crate::wheel::{VirtualWheel, WheelSummary};
 
 /// Lock a mutex, recovering from poisoning (a rig must not die
 /// because a task panicked while holding a metrics lock).
@@ -755,11 +755,11 @@ pub async fn run_live(
     wheel_cfg.seed = seed;
     let plan = plan_for(&scenario.harness);
 
-    // Auth gate: send GET_CAPS before the wheel task starts, so the
+    // Control gate: send GET_CAPS before the wheel task starts, so the
     // gate opens on the first tick (the channel buffers it).
     let mut auth_get_caps_ok = 0.0;
     if !scenario.harness.no_auto_get_caps
-        && let Ok(bytes) = build_frame(&TEST_KEY, &TEST_NONCE, 0x01, 1, 0, b"")
+        && let Ok(bytes) = build_frame(0x01, 1, b"")
         && ctrl_tx.send(bytes).await.is_ok()
     {
         auth_get_caps_ok = 1.0;
@@ -1193,9 +1193,15 @@ pub fn run_contract(scenario: &Scenario) -> Metrics {
         "config-transaction" => self_check_config_transaction(),
         "control-channel" => self_check_control_channel(),
         "pin-map-push" => self_check_pin_map_push(),
-        "pairing-window-open" => self_check_pairing_window_open(),
-        "pairing-window-expired" => self_check_pairing_window_expired(),
-        "pairing-unreachable" => self_check_pairing_unreachable(),
+        // Connect-play (protocol v2.2, no-pairing redesign): the
+        // old pairing self-checks were deleted with pairing itself.
+        "connect-open-ap" => self_check_connect_open_ap(),
+        "connect-password-set" => self_check_connect_password_set(),
+        "connect-password-reconnect" => self_check_connect_password_reconnect(),
+        "connect-key-reset-open" => self_check_connect_key_reset_open(),
+        "connect-usb" => self_check_connect_usb(),
+        "connect-migration-402-403" => crate::ota_checks::self_check_connect_migration_402_403(),
+        "connect-unreachable" => self_check_connect_unreachable(),
         "ota-e2e-success" => crate::ota_checks::self_check_ota_e2e_success(),
         "ota-e2e-same-version" => crate::ota_checks::self_check_ota_e2e_same_version_reinstall(),
         "ota-e2e-bad-signature" => crate::ota_checks::self_check_ota_e2e_bad_signature(),
@@ -1226,8 +1232,8 @@ pub fn run_contract(scenario: &Scenario) -> Metrics {
         // Cards layout fix (2026-11-19): Extras ON/OFF size + responsive gaps.
         "gate-extras-card-size-source" => crate::gate_checks::gate_extras_card_size_source(),
         "gate-card-gap-source" => crate::gate_checks::gate_card_gap_source(),
-        // v2.0.2 gate checks, re-scan findings (B-1, B-2, H-3, H-4, M-9).
-        "gate-pairing-long-call" => crate::gate_checks::gate_pairing_long_call(),
+        // v2.0.2 gate checks, re-scan findings (B-2, H-3, H-4, M-9).
+        // (B-1, gate-pairing-long-call, was deleted with pairing.)
         "gate-hid-uac-dwell" => crate::gate_checks::gate_hid_uac_dwell(),
         "gate-bindings-ui" => crate::gate_checks::gate_bindings_ui(),
         "gate-ota-flash-caller" => crate::gate_checks::gate_ota_flash_caller(),
@@ -1349,68 +1355,48 @@ fn self_check_config_transaction() -> (bool, String) {
     (true, notes.join("; "))
 }
 
-/// Control channel: `GET_CAPS` verifies; tampered tag rejected; replay
-/// rejected; duplicate reqId rejected; reply round-trips.
+/// Control channel: `GET_CAPS` verifies (CRC16); tampered frame
+/// rejected (CRC); duplicate reqId rejected (reqId-only dedup, D2);
+/// reply round-trips.
 fn self_check_control_channel() -> (bool, String) {
     use rsh_protocol::control::{Opcode, build_reply};
     let mut notes: Vec<String> = Vec::new();
-    let Ok(frame_bytes) = build_frame(&TEST_KEY, &TEST_NONCE, Opcode::GetCaps as u8, 1, 0, b"")
-    else {
+    let Ok(frame_bytes) = build_frame(Opcode::GetCaps as u8, 1, b"") else {
         return (false, "GET_CAPS build failed".into());
     };
-    let Ok(frame) = ControlFrame::verify(&frame_bytes, &TEST_KEY, &TEST_NONCE) else {
+    let Ok(frame) = ControlFrame::verify(&frame_bytes) else {
         return (false, "valid GET_CAPS did not verify".into());
     };
     if frame.cmd != Opcode::GetCaps as u8 {
         return (false, "verified frame has the wrong opcode".into());
     }
     notes.push("GET_CAPS verifies".into());
-    // Tampered tag.
+    // Tampered frame (flipping the last byte corrupts the CRC trailer).
     let mut bad = frame_bytes.clone();
     if let Some(b) = bad.last_mut() {
         *b ^= 0xFF;
     }
-    if ControlFrame::verify(&bad, &TEST_KEY, &TEST_NONCE).is_ok() {
-        return (false, "tampered tag was ACCEPTED".into());
+    if ControlFrame::verify(&bad).is_ok() {
+        return (false, "tampered frame was ACCEPTED".into());
     }
-    notes.push("tampered tag rejected".into());
-    // Replay: same counter twice.
-    let mut replay = ReplayTracker::new();
-    if !replay.observe(5) || replay.observe(5) {
-        return (
-            false,
-            "replay tracker did not reject the second observe(5)".into(),
-        );
-    }
-    if !replay.is_replay(5) || replay.is_replay(6) {
-        return (false, "replay tracker is_replay wrong".into());
-    }
-    notes.push("replay rejected".into());
-    // Duplicate reqId.
+    notes.push("tampered frame rejected".into());
+    // Duplicate reqId (D2: reqId-only dedup — no HMAC counter anymore).
     let mut dup = DuplicateCache::new();
-    if !dup.insert(1, 0) || dup.insert(1, 0) {
+    if !dup.insert(1) || dup.insert(1) {
         return (
             false,
-            "duplicate cache did not reject the second insert(1, 0)".into(),
+            "duplicate cache did not reject the second insert(1)".into(),
         );
     }
-    if !dup.is_duplicate(1, 0) {
+    if !dup.is_duplicate(1) {
         return (false, "duplicate cache is_duplicate wrong".into());
     }
     notes.push("duplicate reqId rejected".into());
     // Reply round-trip.
-    let Ok(reply_bytes) = build_reply(
-        &TEST_KEY,
-        &TEST_NONCE,
-        0x01,
-        1,
-        0,
-        rsh_protocol::ErrorCode::Ok,
-        b"",
-    ) else {
+    let Ok(reply_bytes) = build_reply(0x01, 1, rsh_protocol::ErrorCode::Ok, b"") else {
         return (false, "reply build failed".into());
     };
-    if ControlFrame::verify(&reply_bytes, &TEST_KEY, &TEST_NONCE).is_err() {
+    if ControlFrame::verify(&reply_bytes).is_err() {
         return (false, "reply did not verify".into());
     }
     notes.push("reply round-trips".into());
@@ -1479,29 +1465,29 @@ fn self_check_pin_map_push() -> (bool, String) {
     (true, notes.join("; "))
 }
 
-/// Pairing self-checks (Phase 2, Phase 0 §4.4 gap): the L1
-/// Connection Manager driven through the three pairing outcomes.
-/// Pure logic — no wheel, no UDP — so these run as contract
-/// scenarios (duration 0) in every rig mode.
-fn self_check_pairing_window_open() -> (bool, String) {
+/// Connect-play self-checks (protocol v2.2, no-pairing redesign):
+/// the L1 Connection Manager driven through the new connect-play
+/// outcomes. Pure logic — no wheel, no UDP — so these run as
+/// contract scenarios (duration 0) in every rig mode.
+///
+/// The machine has no pairing state anymore (plan D14):
+/// `HelloReceived` carries no fields, `Authenticating` /
+/// `StartAuthentication` / `NeedsPairing` are deleted, and any
+/// HELLO starts the unsigned `GET_CAPS` (`StartActivation`).
+fn self_check_connect_open_ap() -> (bool, String) {
     use rsh_api::{ConnEvent, ConnectionManager, ManagerAction};
     let mut manager = ConnectionManager::new();
     let now = Instant::now();
     manager.on_event(ConnEvent::Connect, now);
-    let action = manager.on_event(
-        ConnEvent::HelloReceived {
-            unpaired: true,
-            window_open: true,
-        },
-        now,
-    );
-    if action != ManagerAction::StartAuthentication {
+    // Open AP, no password, no pairing: the HELLO starts the
+    // unsigned GET_CAPS — there is no pairing action to take.
+    let action = manager.on_event(ConnEvent::HelloReceived, now);
+    if action != ManagerAction::StartActivation {
         return (
             false,
-            format!("window-open HELLO must start auth, got {action:?}"),
+            format!("open-AP HELLO must start activation, got {action:?}"),
         );
     }
-    manager.on_event(ConnEvent::Authenticating, now);
     manager.on_event(ConnEvent::CapsOk, now);
     if !manager.state().is_active() {
         return (
@@ -1517,55 +1503,231 @@ fn self_check_pairing_window_open() -> (bool, String) {
     }
     (
         true,
-        "window-open pairing: Idle -> LinkUp -> Hello -> Authenticating -> Active (Connected)"
+        "open-AP connect: Idle -> LinkUp -> Hello -> Active (Connected), no pairing action".into(),
+    )
+}
+
+/// `connect-password-set`: the `SET_PASSWORD` payload rule
+/// (8–63 printable ASCII, opcode 0x0C) that the Settings
+/// password UI builds on (plan D19). The v2.2 layout (D3 §3.6)
+/// is `[curLen][current][newLen][new]` — `curLen` 0 when no
+/// password is set yet, the stored password as `current` when
+/// one is set.
+fn self_check_connect_password_set() -> (bool, String) {
+    use rsh_protocol::control::{Opcode, build_set_password_payload};
+    if Opcode::from_u8(0x0C) != Some(Opcode::SetPassword) {
+        return (false, "SET_PASSWORD opcode 0x0C missing".into());
+    }
+    for good in [
+        &b"12345678"[..],
+        &b"correct-horse-battery-staple"[..],
+        &[b'a'; 63][..],
+    ] {
+        let Some(payload) = build_set_password_payload(None, good) else {
+            return (
+                false,
+                format!("valid password of len {} was rejected", good.len()),
+            );
+        };
+        // First setup (no current password): [curLen 0][newLen][new].
+        if payload.len() != good.len() + 2 || payload[0] != 0 || payload[1] as usize != good.len() {
+            return (false, "SET_PASSWORD payload is not the v2.2 layout".into());
+        }
+        if payload[2..] != *good {
+            return (
+                false,
+                "SET_PASSWORD payload does not carry the password".into(),
+            );
+        }
+        // Password change: [curLen 8][current][newLen][new].
+        let Some(payload) = build_set_password_payload(Some(b"oldpass1"), good) else {
+            return (
+                false,
+                format!(
+                    "valid current + new password was rejected (new len {})",
+                    good.len()
+                ),
+            );
+        };
+        if payload.len() != 8 + 1 + good.len() + 1
+            || payload[0] != 8
+            || payload[1..9] != *b"oldpass1"
+            || payload[9] as usize != good.len()
+            || payload[10..] != *good
+        {
+            return (
+                false,
+                "SET_PASSWORD payload does not carry the current password".into(),
+            );
+        }
+    }
+    for bad in [
+        &b""[..],
+        &b"short7"[..],
+        &[b'a'; 64][..],
+        &b"has space"[..],
+        &b"tab\there"[..],
+        &[0xC3, 0xA9, 0xC3, 0xA9, 0xC3, 0xA9, 0xC3, 0xA9][..],
+    ] {
+        if build_set_password_payload(None, bad).is_some() {
+            return (
+                false,
+                format!("invalid password of len {} was accepted", bad.len()),
+            );
+        }
+    }
+    // Bad current passwords are refused too (space / too long).
+    if build_set_password_payload(Some(b"has space"), b"12345678").is_some()
+        || build_set_password_payload(Some(&[b'a'; 64]), b"12345678").is_some()
+    {
+        return (false, "invalid current password was accepted".into());
+    }
+    (
+        true,
+        "SET_PASSWORD: 8–63 printable ASCII accepted, short/long/empty/non-printable rejected, current password carried (D3), opcode 0x0C"
             .into(),
     )
 }
 
-fn self_check_pairing_window_expired() -> (bool, String) {
-    use rsh_api::{ConnEvent, ConnectionError, ConnectionManager, ManagerAction};
+/// `connect-password-reconnect`: after Active, a transport loss
+/// (board reboot / Wi-Fi drop) backs off and rebuilds, then the
+/// stored WLAN profile reconnects with no user action and no
+/// pairing action — the manager returns to Active on its own.
+fn self_check_connect_password_reconnect() -> (bool, String) {
+    use rsh_api::{ConnEvent, ConnectionManager, ManagerAction};
     let mut manager = ConnectionManager::new();
     let now = Instant::now();
     manager.on_event(ConnEvent::Connect, now);
-    let action = manager.on_event(
-        ConnEvent::HelloReceived {
-            unpaired: true,
-            window_open: false,
-        },
-        now,
-    );
-    if action != ManagerAction::NeedsPairing(ConnectionError::WindowClosed) {
+    manager.on_event(ConnEvent::HelloReceived, now);
+    manager.on_event(ConnEvent::CapsOk, now);
+    if !manager.state().is_active() {
         return (
             false,
-            format!("expired window must fail closed NeedsPairing(WindowClosed), got {action:?}"),
+            format!("must be Active before the drop, got {:?}", manager.state()),
         );
     }
-    if manager.state().is_active() {
-        return (false, "expired window must never reach Active".into());
+    let action = manager.on_event(ConnEvent::TransportLost, now);
+    if action != ManagerAction::RebuildTransport {
+        return (
+            false,
+            format!("transport loss must rebuild, got {action:?}"),
+        );
     }
-    if !matches!(
-        manager.state(),
-        rsh_api::ConnectionState::Error {
-            retry_in_ms: None,
-            ..
-        }
-    ) {
+    manager.on_event(ConnEvent::LinkUp, now);
+    let action = manager.on_event(ConnEvent::HelloReceived, now);
+    if action != ManagerAction::StartActivation {
+        return (
+            false,
+            format!("reconnect HELLO must start activation, got {action:?}"),
+        );
+    }
+    manager.on_event(ConnEvent::CapsOk, now);
+    if !manager.state().is_active() {
         return (
             false,
             format!(
-                "expired window must stop auto-retry (retry None), got {:?}",
+                "must be Active again after reconnect, got {:?}",
                 manager.state()
             ),
         );
     }
     (
         true,
-        "window-expired pairing: fails closed with typed reason WindowClosed, auto-retry stopped"
+        "password reconnect: Active -> Backoff -> LinkUp -> Hello -> Active, no pairing action"
             .into(),
     )
 }
 
-fn self_check_pairing_unreachable() -> (bool, String) {
+/// `connect-key-reset-open`: (a) firmware side — the BOOT hold
+/// that clears the password is 10 s (plan D7; the threshold
+/// survives the redesign, wherever WS-1 moves the constant, so
+/// this scans the firmware headers for a 10 s key-reset hold
+/// instead of pinning one file); the NVS password-clear itself is
+/// firmware behaviour, covered by the firmware host tests (WS-1
+/// boothold key-reset cases). (b) PC side — after the reset the
+/// board is back on an open AP, so the manager must reach Active
+/// from a plain HELLO with no password and no pairing action.
+fn self_check_connect_key_reset_open() -> (bool, String) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repo root above tools/rsh-rig");
+    let firmware_dir = root.join("firmware");
+    let entries = match std::fs::read_dir(&firmware_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return (
+                false,
+                format!("cannot read {}: {error}", firmware_dir.display()),
+            );
+        }
+    };
+    let mut ten_second_hold = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "h") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if text
+            .lines()
+            .any(|line| line.contains("KEYRESET") && line.contains("10000"))
+        {
+            ten_second_hold = true;
+            break;
+        }
+    }
+    if !ten_second_hold {
+        return (
+            false,
+            "no 10 s key-reset BOOT hold found in firmware/*.h".into(),
+        );
+    }
+    let (pass, detail) = self_check_connect_open_ap();
+    if !pass {
+        return (
+            false,
+            format!("open-AP reconnect after reset failed: {detail}"),
+        );
+    }
+    (
+        true,
+        "key-reset-open: 10 s BOOT hold in firmware; open-AP reconnect reaches Active, no pairing action"
+            .into(),
+    )
+}
+
+/// `connect-usb`: serial HELO/HELLO + control + stream, no
+/// pairing, no window. The manager is transport-agnostic: the
+/// `GET_CAPS`-ok edge from `LinkUp` takes it straight to Active.
+fn self_check_connect_usb() -> (bool, String) {
+    use rsh_api::{ConnEvent, ConnectionManager};
+    let mut manager = ConnectionManager::new();
+    let now = Instant::now();
+    manager.on_event(ConnEvent::Connect, now);
+    manager.on_event(ConnEvent::CapsOk, now);
+    if !manager.state().is_active() {
+        return (
+            false,
+            format!(
+                "must be Active after GET_CAPS ok, got {:?}",
+                manager.state()
+            ),
+        );
+    }
+    if manager.state().label() != "Connected" {
+        return (false, "Active must label Connected".into());
+    }
+    (
+        true,
+        "USB connect: Idle -> LinkUp -> Active (Connected) on GET_CAPS ok, no pairing action"
+            .into(),
+    )
+}
+
+fn self_check_connect_unreachable() -> (bool, String) {
     use rsh_api::{ConnEvent, ConnectionError, ConnectionManager};
     let mut manager = ConnectionManager::new();
     let now = Instant::now();
@@ -1586,7 +1748,10 @@ fn self_check_pairing_unreachable() -> (bool, String) {
     if manager.state().is_active() {
         return (false, "unreachable board must never reach Active".into());
     }
-    (true, "unreachable board: fails closed with typed reason Unreachable (distinct from WindowClosed)".into())
+    (
+        true,
+        "unreachable board: fails closed with typed reason Unreachable".into(),
+    )
 }
 
 #[cfg(test)]

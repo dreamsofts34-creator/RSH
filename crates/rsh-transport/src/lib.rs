@@ -3,9 +3,9 @@
 //! (`RSHS` framing, 921600 baud), plus `GET_CAPS`, the config-transaction
 //! client, and mDNS discovery with the `192.168.4.1` fallback.
 //!
-//! Both transports speak the same protocol v2.1 — the engine cannot tell
+//! Both transports speak the same protocol v2.2 — the engine cannot tell
 //! which one is active. They sit behind the [`ControlTransport`] trait (for
-//! the HMAC control channel) and the engine's `PacketSource` trait (for the
+//! the unsigned control channel) and the engine's `PacketSource` trait (for the
 //! 200 Hz stream).
 
 use std::time::Duration;
@@ -54,7 +54,7 @@ impl From<std::io::Error> for TransportError {
     }
 }
 
-/// Byte-level transport for the HMAC control channel (port 4212 over UDP,
+/// Byte-level transport for the unsigned control channel (port 4212 over UDP,
 /// `RSHS` frames over serial). Implemented by [`udp::UdpTransport`] (Wave 1)
 /// and the serial transport (Wave 2, Phase C).
 ///

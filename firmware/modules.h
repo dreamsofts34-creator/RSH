@@ -76,7 +76,7 @@
 #define RSH_CAPS_FW_MINOR RSH_FW_VERSION_MINOR
 #define RSH_CAPS_FW_PATCH RSH_FW_VERSION_PATCH
 #define RSH_CAPS_PROTO_MAJOR 2
-#define RSH_CAPS_PROTO_MINOR 1
+#define RSH_CAPS_PROTO_MINOR 2  // v2.2
 #define RSH_CAPS_N_AXES_MAX 8
 #define RSH_CAPS_N_BTN_MAX  64   // wire (§1.1 N1); config ceiling 128 hai
 #define RSH_CAPS_N_ENC_MAX  4

@@ -1,27 +1,31 @@
 // RSH v2.0 — Setup wizard (REDESIGN-PLAN §7.6, preview Setup.html;
-// LOGIC-FIX-PLAN §4.2 Pairing Manager). First-time setup: 5 steps
-// (Connect, Drivers, Pair, Calibrate, Games), 920x580, dark theme.
+// NO-PAIRING-PLAN D16: pairing is gone — 4 steps (Connect, Drivers,
+// Calibrate, Games), 920x580, dark theme.
 //
-// v2.0.1 hotfix: the Drivers step (vJoy install / HIDMaestro
-// fallback) is new — the default game controller is vJoy, and the
-// wizard makes sure a driver exists before pairing. The countdown
-// ring arc is driven from Rust (seconds-left/total); Calibrate calls
-// the real calibration backend and its buttons stay disabled with a
-// reason while that backend is unavailable.
+// Step 1 Connect merges the old Connect + Pair steps: the Wi-Fi
+// card performs the join itself (scan → join RSH-XXXX, open or with
+// the stored WLAN password) — no more "join manually in Windows".
+// Next unlocks on `board-reachable` (HELLO-or-better, D15), NEVER
+// on Active/pairing. USB probes and unlocks on HELLO too.
 //
-// Wiring note (Phase 6): this screen is standalone — the shell
-// (Phase 3, main.slint) shows it instead of the main pages while
-// setup is unfinished, and the Rust side drives it from the
-// Pairing Manager + AppApi. All live values arrive as properties;
-// the screen never polls. The countdown ring arc comes from the
-// Rust side as `ring-commands` (Pairing Manager
-// `countdown_ring_commands`, board-clamped — never longer than the
-// board reports). Password/key, pin map, and firmware are
-// deliberately NOT in this screen: advanced-only, shown only when
-// needed (§7.6). "Skip for now" is always present (left column).
+// Step 2 Drivers: vJoy install shows progress % (or indeterminate
+// + elapsed) and pre-warns about the external installer window.
+// Step 3 Calibrate: an unavailable backend is an EXPLICIT skip
+// ("Calibration unavailable — you can do this later in Settings"),
+// never a silent pass; pedal graphs are live here. Step 4 Games:
+// keep as-is. Wizard errors also fire a toast (Rust side, in
+// addition to the inline text). Esc dismisses only the topmost
+// overlay/toast; closing the wizard needs Skip/Finish. Finish →
+// success toast ("Setup complete — …").
+//
+// Wiring note: this screen is standalone — the shell (main.slint)
+// shows it instead of the main pages while setup is unfinished,
+// and the Rust side drives it from the AppApi. All live values
+// arrive as properties; the screen never polls. "Skip for now" is
+// always present (left column).
 
 import { Theme } from "../tokens.slint";
-import { Btn } from "../components.slint";
+import { Btn, PedalBar } from "../components.slint";
 import { ScrollView } from "std-widgets.slint";
 
 component StepRow inherits HorizontalLayout {
@@ -61,44 +65,12 @@ component StepRow inherits HorizontalLayout {
     }
 }
 
-component PairStepLine inherits HorizontalLayout {
-    in property <int> num;
-    in property <string> text;
-    spacing: 10px;
-    Rectangle {
-        width: 22px;
-        height: 22px;
-        border-radius: 11px;
-        background: Theme.panel2;
-        Text {
-            width: 100%;
-            height: 100%;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            text: "" + num;
-            font-size: 11.5px;
-            font-weight: 700;
-            color: Theme.accent-text;
-        }
-    }
-    Text {
-        horizontal-stretch: 1;
-        // Explicit 344px (steps column 376 - circle 22 - gap 10):
-        // same content-sizing note as the steps column above.
-        width: 344px;
-        text: text;
-        font-size: 13.5px;
-        color: Theme.text;
-        wrap: word-wrap;
-    }
-}
-
 export component SetupWizard inherits Rectangle {
     width: Theme.window-width;
     height: Theme.window-height;
     background: Theme.bg;
 
-    // 0 Connect, 1 Drivers, 2 Pair, 3 Calibrate, 4 Games (A15:
+    // 0 Connect, 1 Drivers, 2 Calibrate, 3 Games (D16: 4 steps;
     // setup starts at Connect, step 0).
     in-out property <int> step: 0;
     // Step 0 — Connect.
@@ -108,51 +80,48 @@ export component SetupWizard inherits Rectangle {
     in property <bool> wifi-joined: false;
     in property <int> transport: 0; // 0 Wi-Fi, 1 USB
     in property <string> address: "—";
-    // Step 1 — Pair (driven by the Pairing Manager).
-    in property <int> pair-seconds-left: 120;
-    in property <int> pair-total: 120;
-    in property <string> ring-commands: "";
-    in property <string> pair-status: "Waiting for the wheel…";
-    in property <string> pair-error: "";
-    in property <bool> pairing-active: false;
+    // D16: Wi-Fi scan/join state — the card performs the join via
+    // the daemon (scan → join RSH-XXXX). `wifi-ssid` is the network
+    // found by the scan ("" = none found yet); `wifi-joining` is
+    // true while the join runs; `wifi-error` is the inline failure
+    // (the Rust side toasts it too).
+    in property <string> wifi-ssid: "";
+    in property <bool> wifi-joining: false;
+    in property <string> wifi-error: "";
     in property <bool> usb-available: false;
-    in property <bool> paired: false;
-    in property <bool> reset-required: false;
-    // R2-51: the board already has a stored key — offer to replace
-    // it, naming the board MAC. Phase 2 (RC-1): shown whenever a
-    // replacement is required and the wheel is not paired — NOT
-    // gated on `!pairing-active`: StoredKeyExists is produced by a
-    // pairing attempt, which sets `pairing-active` until the 60 s
-    // window expires, so the old gate hid the block exactly while
-    // a confirm could still succeed. Hidden once paired, and
-    // after Cancel until the wizard reopens / mismatch clears.
-    in property <bool> replace-required: false;
-    in property <string> replace-board-mac: "";
-    // DS-67: true while the board rejoins Wi-Fi with the new
-    // password after a successful pairing.
-    in property <bool> rejoining: false;
     // DS-54: which job kind the busy strip shows, as a
     // JobKind::order value (-1 = idle) — the invoking button
     // disables + dims while its job runs.
     in property <int> busy-kind: -1;
     // A3 (v2.0.2): daemon state drives the display — while the
     // background service is down the wizard shows "Disconnected" /
-    // "—", never a plausible-looking countdown, address or status.
+    // "—", never a plausible-looking address or status.
     in property <bool> daemon-live: false;
     // Step 1 — Drivers (v2.0.1 hotfix): Rust polls vjoy_status().
     in property <bool> vjoy-installed: false;
     in property <bool> vjoy-installing: false;
+    // D16: install progress — percent when the daemon reports it,
+    // -1 = indeterminate (then `vjoy-elapsed` shows the elapsed
+    // time instead, e.g. "0:42").
+    in property <int> vjoy-progress: -1;
+    in property <string> vjoy-elapsed: "";
     in property <string> vjoy-version: "";
     in property <string> vjoy-error: "";
     in property <bool> vjoy-fallback: false;
-    // Step 3 — Calibrate availability (A17): false while the
+    // Step 2 — Calibrate availability (A17): false while the
     // calibration backend is unavailable; the buttons stay disabled
-    // and Next does not gate on calibration then.
+    // and Next does not gate on calibration then — the step says
+    // so explicitly (D16), never a silent pass.
     in property <bool> calibration-available: false;
     in property <string> calibration-reason: "RSH isn't running — reconnect to capture.";
     // Step 2 — Calibrate.
     in property <bool> centre-done: false;
     in property <bool> pedals-done: false;
+    // D16: live pedal levels (0..100) for the pedal graphs on the
+    // Calibrate step — same live values as the Overview pedal bars.
+    in property <float> live-throttle: 0;
+    in property <float> live-brake: 0;
+    in property <float> live-clutch: 0;
     // Step 3 — Games.
     in property <string> games-text: "No games added yet.";
     in property <bool> games-done: false;
@@ -162,19 +131,13 @@ export component SetupWizard inherits Rectangle {
     callback skip();
     callback install-vjoy();
     callback use-hidmaestro();
-    callback begin-pairing();
-    callback use-usb();
-    callback retry-pairing();
-    callback reset-pairing();
-    callback confirm-replace();
-    callback cancel-replace();
     callback connect-action(string);
     callback calibrate-action(string);
     callback add-game();
 
-    property <bool> next-enabled: step == 0 ? connect-done : step == 1 ? (vjoy-installed || vjoy-fallback) : step == 2 ? paired : step == 3 ? (!calibration-available || (centre-done && pedals-done)) : true;
-    property <string> step-title: step == 0 ? "Connect your wheel" : step == 1 ? "Install the game controller" : step == 2 ? "Pair your wheel" : step == 3 ? "Calibrate your wheel" : "Add your games";
-    property <string> step-lead: step == 0 ? "Join the wheel's Wi-Fi, or plug in a USB cable." : step == 1 ? "Games need a controller driver — vJoy is the default." : step == 2 ? "Pairing keeps your wheel safe, so only this PC can control it." : step == 3 ? "Centre the wheel and set the pedals, so the game gets true inputs." : "Add your racing games — pick the exe or shortcut for each game. RSH switches profile automatically when a game starts.";
+    property <bool> next-enabled: step == 0 ? connect-done : step == 1 ? (vjoy-installed || vjoy-fallback) : step == 2 ? (!calibration-available || (centre-done && pedals-done)) : true;
+    property <string> step-title: step == 0 ? "Connect your wheel" : step == 1 ? "Install the game controller" : step == 2 ? "Calibrate your wheel" : "Add your games";
+    property <string> step-lead: step == 0 ? "Join the wheel's Wi-Fi, or plug in a USB cable." : step == 1 ? "Games need a controller driver — vJoy is the default." : step == 2 ? "Centre the wheel and set the pedals, so the game gets true inputs." : "Add your racing games — pick the exe or shortcut for each game. RSH switches profile automatically when a game starts.";
 
     HorizontalLayout {
         // Explicit 920px (not 100%): the wizard is a fixed-size
@@ -224,9 +187,8 @@ export component SetupWizard inherits Rectangle {
                 // "Wi-Fi · —" until the wheel is really connected.
                 StepRow { num: 1; label: "Connect"; sub: transport == 1 ? "USB cable" : "Wi-Fi · " + address; done: step > 0 || connect-done; now: step == 0; }
                 StepRow { num: 2; label: "Drivers"; sub: "vJoy controller"; done: step > 1 || vjoy-installed || vjoy-fallback; now: step == 1; }
-                StepRow { num: 3; label: "Pair"; sub: "Link this PC to your wheel"; done: paired; now: step == 2; }
-                StepRow { num: 4; label: "Calibrate"; sub: "Centre and pedals"; done: step > 3; now: step == 3; }
-                StepRow { num: 5; label: "Games"; sub: "Add your racing games"; done: games-done; now: step == 4; }
+                StepRow { num: 3; label: "Calibrate"; sub: "Centre and pedals"; done: step > 2; now: step == 2; }
+                StepRow { num: 4; label: "Games"; sub: "Add your racing games"; done: games-done; now: step == 3; }
                 Rectangle { vertical-stretch: 1; }
                 skip-ta := TouchArea {
                     width: 100%;
@@ -265,7 +227,7 @@ export component SetupWizard inherits Rectangle {
             padding-left: 36px;
             padding-right: 36px;
             spacing: 0px;
-            Text { text: "Step " + (step + 1) + " of 5"; font-size: 11.5px; font-weight: 700; color: Theme.accent-text; }
+            Text { text: "Step " + (step + 1) + " of 4"; font-size: 11.5px; font-weight: 700; color: Theme.accent-text; }
             // UI-UX polish (a): preview `h2` is margin 6px 0 4px —
             // eyebrow-to-title 6px, title-to-lead 4px (was 0/0).
             Rectangle { height: 6px; }
@@ -295,11 +257,15 @@ export component SetupWizard inherits Rectangle {
                         padding-right: 16px;
                         spacing: 12px;
                         Text { vertical-alignment: center; text: "Wi-Fi"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
-                        Text { vertical-alignment: center; text: wifi-joined ? "Joined the RSH network" : "Join the RSH Wi-Fi network on this PC"; font-size: 12.5px; color: Theme.mute; }
+                        // D16: the card performs the join itself —
+                        // the app scans for the wheel's RSH-XXXX
+                        // network and joins it; the user never joins
+                        // it in Windows by hand.
+                        Text { vertical-alignment: center; text: wifi-joined ? "Joined the wheel's Wi-Fi" : wifi-ssid != "" ? "Found " + wifi-ssid : "Scan for the wheel's Wi-Fi network"; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
                         // A3: "Connected" only once the connection is
                         // really up — transport == 0 alone is not proof.
-                        Btn { label: transport == 0 && (connect-done || wifi-joined) ? "Connected" : "Use Wi-Fi"; primary: transport == 0 && (connect-done || wifi-joined); disabled: busy-kind == 1; clicked => { connect-action("wifi"); } }
+                        Btn { label: transport == 0 && (connect-done || wifi-joined) ? "Connected" : wifi-joining ? "Joining…" : wifi-ssid != "" ? "Join " + wifi-ssid : "Scan & join"; primary: transport == 0 && (connect-done || wifi-joined); disabled: busy-kind == 1 || wifi-joining; clicked => { connect-action("wifi"); } }
                     }
                 }
                 Rectangle {
@@ -325,6 +291,7 @@ export component SetupWizard inherits Rectangle {
                 // A3: no address is known until the wheel is really
                 // connected — "—" instead of the default address.
                 Text { text: "Wheel address: " + (connect-done ? address : "—"); font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
+                if wifi-error != "" : Text { text: wifi-error; font-size: 12.5px; color: Theme.bad; wrap: word-wrap; }
                 // R2-19: step 0 used to show no error at all — the
                 // pair-status text lived on step 2. The hint names
                 // the connection error (or the down daemon) so a
@@ -337,6 +304,10 @@ export component SetupWizard inherits Rectangle {
                 horizontal-stretch: 1;
                 spacing: 12px;
                 Rectangle { height: 10px; }
+                // D16: pre-warn about the external installer window
+                // BEFORE the user clicks Install — it opens in its
+                // own window, then they come back here.
+                if !vjoy-installed : Text { text: "The vJoy installer will open in its own window — follow it, then come back here."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
                 Rectangle {
                     horizontal-stretch: 1;
                     width: 584px;
@@ -352,7 +323,9 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "vJoy"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
                         // A3: while the service is down the driver
                         // status is unknown — never claim "Not installed".
-                        Text { vertical-alignment: center; text: !daemon-live ? "Disconnected — status unknown" : vjoy-installed ? "Installed" + (vjoy-version == "" ? "" : " · " + vjoy-version) : vjoy-installing ? "Installing…" : "Not installed — games need a controller driver"; font-size: 12.5px; color: vjoy-installed ? Theme.ok : Theme.mute; }
+                        // D16: while installing, show progress % when
+                        // known, else indeterminate + elapsed time.
+                        Text { vertical-alignment: center; text: !daemon-live ? "Disconnected — status unknown" : vjoy-installed ? "Installed" + (vjoy-version == "" ? "" : " · " + vjoy-version) : vjoy-installing ? (vjoy-progress >= 0 ? "Installing… " + vjoy-progress + "%" : "Installing…" + (vjoy-elapsed == "" ? "" : " " + vjoy-elapsed)) : "Not installed — games need a controller driver"; font-size: 12.5px; color: vjoy-installed ? Theme.ok : Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
                         if vjoy-installed : Text { vertical-alignment: center; text: "✓"; font-size: 16px; font-weight: 700; color: Theme.ok; }
                         if !vjoy-installed && !vjoy-installing : Btn { label: "Install vJoy"; primary: true; disabled: busy-kind == 14; clicked => { install-vjoy(); } }
@@ -363,7 +336,10 @@ export component SetupWizard inherits Rectangle {
                 // this step unless the fallback is picked — say so
                 // on the step itself, next to the error.
                 if vjoy-error != "" && !vjoy-fallback : Text { text: "Install failed — you can still continue with HIDMaestro below."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
-                if !vjoy-installed && !vjoy-installing : Rectangle {
+                // D16: the HIDMaestro fallback is offered UP FRONT
+                // (not only after a failure) — it is always visible
+                // while vJoy is not installed.
+                if !vjoy-installed : Rectangle {
                     horizontal-stretch: 1;
                     width: 584px;
                     height: 64px;
@@ -384,190 +360,8 @@ export component SetupWizard inherits Rectangle {
                 if vjoy-fallback : Text { text: "HIDMaestro selected — RSH will ask for admin permission on start."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
             }
 
-            // ---- Step 2: Pair ----
-            // Phase 2 (F-6): the right column is a ScrollView — with
-            // the replace offer + pair error + hint the step is
-            // ~543 px against a 486 px budget, so the footer was
-            // pushed below the window bottom.
-            if step == 2 : ScrollView {
-                vertical-stretch: 1;
-                horizontal-stretch: 1;
-                VerticalLayout {
-                horizontal-stretch: 1;
-                spacing: 0px;
-                Rectangle { height: 22px; }
-                Rectangle {
-                    horizontal-stretch: 1;
-                    width: 584px;
-                    border-radius: 14px;
-                    border-width: 1px;
-                    border-color: Theme.line;
-                    background: Theme.panel;
-                    HorizontalLayout {
-                        padding-top: 24px;
-                        padding-bottom: 24px;
-                        padding-left: 24px;
-                        padding-right: 24px;
-                        spacing: 28px;
-                        // Countdown ring (132px, preview geometry).
-                        Rectangle {
-                            width: 132px;
-                            height: 132px;
-                            Path {
-                                width: 100%;
-                                height: 100%;
-                                viewbox-width: 132;
-                                viewbox-height: 132;
-                                commands: "M 66 8 A 58 58 0 1 1 66 124 A 58 58 0 1 1 66 8";
-                                fill: transparent;
-                                stroke: Theme.track;
-                                stroke-width: 9px;
-                            }
-                            Path {
-                                width: 100%;
-                                height: 100%;
-                                viewbox-width: 132;
-                                viewbox-height: 132;
-                                commands: ring-commands;
-                                fill: transparent;
-                                stroke: Theme.accent;
-                                stroke-width: 9px;
-                            }
-                            Text {
-                                width: 100%;
-                                height: 100%;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                                // A3: no countdown runs until pairing
-                                // actually starts — "—", not a fake 120.
-                                text: pairing-active || paired ? "" + pair-seconds-left : "—";
-                                font-family: Theme.font-mono;
-                                font-size: 30px;
-                                font-weight: 600;
-                                color: Theme.text;
-                            }
-                        }
-                        VerticalLayout {
-                            // Explicit 376px (card 584 - padding 48 -
-                            // ring 132 - gap 28): layouts in this
-                            // subtree size to content, so the step
-                            // lines wrapped at ~60px without it.
-                            width: 376px;
-                            horizontal-stretch: 1;
-                            spacing: 12px;
-                            vertical-stretch: 1;
-                            if reset-required : PairStepLine { num: 1; text: "This wheel is already paired."; }
-                            if reset-required : PairStepLine { num: 2; text: "Replace the pairing below — or hold BOOT for 10 seconds to reset the wheel, then pair again."; }
-                            if reset-required : PairStepLine { num: 3; text: "Keep this window open. It finishes by itself."; }
-                            if !reset-required : PairStepLine { num: 1; text: "Turn on the wheel and wait for the light to blink."; }
-                            if !reset-required : PairStepLine { num: 2; text: "Hold the pair button on the wheel for 3 seconds."; }
-                            if !reset-required : PairStepLine { num: 3; text: "Keep this window open. It finishes by itself."; }
-                            if !pairing-active && !paired && !reset-required : Btn { label: "Begin pairing"; primary: true; disabled: busy-kind == 12; clicked => { begin-pairing(); } }
-                            // Phase 2 (RC-2): in the StoredKeyExists
-                            // state the primary action is Replace
-                            // pairing (confirm) — the old "Reset
-                            // pairing" button only cleared the
-                            // replacement flag without deleting the
-                            // stored key, so the next attempt failed
-                            // identically. Reset is removed here; the
-                            // BOOT-hold reset still works via the
-                            // board (key_reset_armed) and Replace
-                            // overwrites the stored key directly.
-                            if !paired && reset-required : Btn { label: "Replace pairing"; primary: true; disabled: busy-kind == 12; clicked => { confirm-replace(); } }
-                            // M4 (v2.0.2): Retry belongs AFTER a
-                            // failure (pair-error set), never while
-                            // pairing is in progress with no error —
-                            // the old condition showed it exactly
-                            // then and hid it when it was needed.
-                            if pair-error != "" && !paired : Btn { label: "Retry"; disabled: busy-kind == 12; clicked => { retry-pairing(); } }
-                        }
-                    }
-                }
-                // R2-51: the wheel is already paired with a different
-                // key — replacing it needs the user's explicit
-                // confirmation, naming the board. Phase 2 (RC-1):
-                // shown whenever replacement is required and the
-                // wheel is not paired, even while a pairing attempt
-                // is active — that is exactly when a confirm can
-                // still succeed. Hidden once paired, and after
-                // Cancel until the wizard reopens.
-                if replace-required && !paired : Rectangle {
-                    horizontal-stretch: 1;
-                    width: 584px;
-                    border-radius: 14px;
-                    border-width: 1px;
-                    border-color: Theme.line;
-                    background: Theme.panel;
-                    VerticalLayout {
-                        padding-top: 16px;
-                        padding-bottom: 16px;
-                        padding-left: 24px;
-                        padding-right: 24px;
-                        spacing: 10px;
-                        Text { text: "This wheel is already paired with a different key — replace the pairing?"; font-size: 13.5px; font-weight: 600; color: Theme.text; wrap: word-wrap; }
-                        if replace-board-mac != "" : Text { text: "Wheel: " + replace-board-mac; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
-                        HorizontalLayout {
-                            spacing: 10px;
-                            Btn { label: "Replace pairing"; primary: true; disabled: busy-kind == 12; clicked => { confirm-replace(); } }
-                            Btn { label: "Cancel"; disabled: busy-kind == 12; clicked => { cancel-replace(); } }
-                        }
-                    }
-                }
-                Rectangle { height: 14px; }
-                // Live status bar.
-                // DS-25: the trail line can be long (attempt +
-                // address + daemon report), so the text wraps and
-                // the bar grows with it (DS-21 pattern: min-height
-                // + wrapped text) instead of clipping mid-sentence.
-                // A short status stays 40 px.
-                Rectangle {
-                    horizontal-stretch: 1;
-                    width: 584px;
-                    min-height: 40px;
-                    border-radius: 10px;
-                    border-width: 1px;
-                    border-color: Theme.line;
-                    background: Theme.panel;
-                    HorizontalLayout {
-                        padding-left: 14px;
-                        padding-right: 14px;
-                        padding-top: 8px;
-                        padding-bottom: 8px;
-                        spacing: 10px;
-                        Rectangle {
-                            width: 9px;
-                            height: 9px;
-                            border-radius: 5px;
-                            background: paired ? Theme.ok : Theme.warn;
-                        }
-                        Text { horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; text: paired ? (rejoining ? "Paired — rejoining with the new password…" : "Paired — wheel connected.") : !daemon-live ? "Disconnected — RSH isn't running." : pair-status; font-size: 12.5px; color: Theme.mute; }
-                        Text { vertical-alignment: center; text: paired ? "" : pairing-active ? pair-seconds-left + " seconds left" : "Not pairing"; font-size: 12.5px; font-family: Theme.font-mono; color: Theme.mute; }
-                    }
-                }
-                if pair-error != "" : Rectangle {
-                    horizontal-stretch: 1;
-                    width: 584px;
-                    // Phase 2 (F-10): min-height, not fixed height —
-                    // a 2-line error is ~36 px and was clipped in
-                    // the fixed 34 px box (DS-21 pattern).
-                    min-height: 34px;
-                    Text {
-                        vertical-alignment: center;
-                        text: pair-error;
-                        font-size: 12.5px;
-                        color: Theme.bad;
-                        wrap: word-wrap;
-                    }
-                }
-                // DS-57: Next is disabled until the wheel is paired —
-                // say so under the card (the Calibrate step does the
-                // same with its availability reason).
-                if !paired : Text { text: "Pair the wheel to continue."; font-size: 12.5px; color: Theme.faint; wrap: word-wrap; }
-                }
-            }
-
-            // ---- Step 3: Calibrate ----
-            if step == 3 : VerticalLayout {
+            // ---- Step 2: Calibrate ----
+            if step == 2 : VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 12px;
                 Rectangle { height: 10px; }
@@ -607,11 +401,34 @@ export component SetupWizard inherits Rectangle {
                         Btn { label: pedals-done ? "Set ✓" : "Set pedals"; primary: !pedals-done; disabled: !calibration-available || busy-kind == 10; clicked => { calibrate-action("pedals"); } }
                     }
                 }
+                // D16: pedal graphs live on this step too — the same
+                // live values as the Overview pedal bars.
+                if calibration-available : Rectangle {
+                    horizontal-stretch: 1;
+                    width: 584px;
+                    border-radius: 14px;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    background: Theme.panel;
+                    HorizontalLayout {
+                        padding-top: 14px;
+                        padding-bottom: 14px;
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 18px;
+                        PedalBar { pct: live-throttle; bar-color: Theme.ok; label: "Throttle"; }
+                        PedalBar { pct: live-brake; bar-color: Theme.bad; label: "Brake"; }
+                        PedalBar { pct: live-clutch; bar-color: Theme.accent; label: "Clutch"; }
+                    }
+                }
+                // D16: an unavailable backend is an EXPLICIT skip,
+                // never a silent pass.
+                if !calibration-available : Text { text: "Calibration unavailable — you can do this later in Settings."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
                 if !calibration-available : Text { text: calibration-reason; font-size: 12.5px; color: Theme.faint; wrap: word-wrap; }
             }
 
-            // ---- Step 4: Games ----
-            if step == 4 : VerticalLayout {
+            // ---- Step 3: Games ----
+            if step == 3 : VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 12px;
                 Rectangle { height: 10px; }
@@ -636,42 +453,21 @@ export component SetupWizard inherits Rectangle {
             }
 
             Rectangle { vertical-stretch: 1; }
-            // Footer: USB hint + Back / Next. Next is gated: Pair
-            // only completes when the session is Active (never on
-            // "password saved" alone).
+            // Footer: Back / Next. Next is gated: Connect only
+            // completes when the board is reachable (HELLO or
+            // better — never on Active/pairing).
             HorizontalLayout {
                 horizontal-stretch: 1;
                 width: 584px;
                 spacing: 8px;
-                if step == 2 : usb-ta := TouchArea {
-                    height: 36px;
-                    accessible-label: "Wheel not found? Use a USB cable";
-                    accessible-role: button;
-                    mouse-cursor: pointer;
-                    clicked => { use-usb(); }
-                    // (was `fs` — ids are component-scoped, so the Skip
-                    // link's FocusScope above must not share the name)
-                    usb-fs := FocusScope {
-                        width: 100%;
-                        height: 100%;
-                        key-pressed(event) => {
-                            if (event.text == Key.Return || event.text == Key.Space) {
-                                use-usb();
-                                return accept;
-                            }
-                            return reject;
-                        }
-                    }
-                    Text { vertical-alignment: center; text: "Wheel not found? Use a USB cable"; font-size: 12.5px; font-weight: 600; color: usb-fs.has-focus || usb-ta.has-hover ? Theme.text : Theme.accent-text; }
-                }
                 Rectangle { horizontal-stretch: 1; }
                 if step > 0 : Btn { label: "Back"; clicked => { back(); } }
-                if next-enabled : Btn { label: step == 4 ? "Finish" : "Next"; primary: true; clicked => { next(); } }
+                if next-enabled : Btn { label: step == 3 ? "Finish" : "Next"; primary: true; clicked => { next(); } }
                 // Phase 2 (F-9): a disabled Btn, not a hand-made
                 // 76 px rectangle — the placeholder was ~24 px
                 // wider than the real Next button, so the footer
                 // jumped sideways on every gating change.
-                if !next-enabled : Btn { label: step == 4 ? "Finish" : "Next"; primary: true; disabled: true; }
+                if !next-enabled : Btn { label: step == 3 ? "Finish" : "Next"; primary: true; disabled: true; }
             }
         }
     }

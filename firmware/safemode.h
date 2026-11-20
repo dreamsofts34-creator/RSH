@@ -4,16 +4,15 @@
 //
 //   * BOOT-hold detection RUNTIME hoti hai (C1 fix) — power-up par nahi.
 //     Loop har iteration GPIO0 (BOOT button, active-LOW) parhta hai; hold
-//     ki muddat se faisla hota hai:
-//       hold < 3 s            -> normal boot (BOOT ignore)
-//       3 s hold, 5 s se pehle release -> PAIR_WINDOW_OPEN (F-02, v4.0.2:
-//                                sirf unpaired board, 120 s window, LED
-//                                pattern; paired board ignore karta hai)
+//     ki muddat se faisla hota hai (v2.2 — 3 s pair branch khatam, D7):
+//       hold < 5 s            -> normal boot (BOOT ignore)
 //       5 s <= hold < 10 s    -> safe mode (factory pin map + AP; config
 //                                apply nahi hoti; LED slow blink 1 Hz)
-//       hold >= 10 s          -> key-reset-armed (LED fast blink 4 Hz,
-//                                armed window 120 s; waqt guzar jaye to
-//                                board normal mode mein reboot hota hai)
+//       hold >= 10 s          -> password clear (NVS password seedha
+//                                mitao + reboot -> open AP; koi armed
+//                                state / window nahi — clear threshold
+//                                par hota hai; 5-10 s ke beech SafeMode
+//                                LED hi hold ki indication hai)
 //   * Boot fail = power-on ke 15 s mein AP up na ho (FW-3).
 //     3 lagatar fail -> last-known-good config; LKG bhi 3 dafa fail ho
 //     to factory fallback. Factory source par bhi fail ho to masla
@@ -35,11 +34,8 @@
 // ---------- Constants (plan + contract) ----------
 #define RSH_BOOT_AP_UP_DEADLINE_MS   15000u   // FW-3: AP up na ho to boot fail
 #define RSH_BOOT_MAX_CONSEC_FAILURES 3u       // itne lagatar fail -> fallback
-#define RSH_BOOTHOLD_PAIR_MS         3000u    // F-02 (v4.0.2): 3 s hold + 5 s se
-                                              // pehle release -> pair window (120 s)
 #define RSH_BOOTHOLD_SAFE_MS         5000u    // 5 s hold -> safe mode (§4.4)
-#define RSH_BOOTHOLD_KEYRESET_MS     10000u   // 10 s hold -> key-reset-armed
-#define RSH_KEYRESET_ARMED_WINDOW_MS 120000u  // armed window boot se 120 s
+#define RSH_BOOTHOLD_KEYRESET_MS     10000u   // 10 s hold -> password clear (D7)
 
 // ---------- Boot counter + config source ----------
 typedef enum {
@@ -145,17 +141,15 @@ static inline rsh_boot_tick_t rsh_boot_tick(rsh_boot_counter_t *c, uint8_t ap_up
 // ---------- Runtime BOOT-hold detector (C1 fix: runtime, power-up nahi) ----------
 typedef enum {
   RSH_HOLD_NONE = 0,
-  RSH_HOLD_PAIR_WINDOW = 3,  // F-02: 3 s hold + 5 s se pehle release
   RSH_HOLD_SAFE_MODE = 1,        // 5 s hold paar — safe mode mein jao
-  RSH_HOLD_KEY_RESET_ARMED = 2   // 10 s hold paar — key-reset-armed mein jao
+  RSH_HOLD_KEY_RESET_CLEAR = 2   // 10 s hold paar — password clear + reboot (D7)
 } rsh_hold_event_t;
 
 typedef struct {
   uint32_t hold_start_ms;  // musalsal press kab se hai
   uint8_t pressed;         // pichli sample mein BOOT daba hua tha
-  uint8_t pair_armed;      // 3 s paar — release par pair window khulegi
   uint8_t safe_fired;      // 5 s event is hold mein ja chuka hai
-  uint8_t armed_fired;     // 10 s event is hold mein ja chuka hai
+  uint8_t clear_fired;     // 10 s event is hold mein ja chuka hai
 } rsh_boothold_t;
 
 static inline void rsh_boothold_init(rsh_boothold_t *d) {
@@ -163,25 +157,18 @@ static inline void rsh_boothold_init(rsh_boothold_t *d) {
 }
 
 // Har loop mein call karo: pressed = BOOT daba hua hai (GPIO0 LOW).
-// Release hote hi detector reset — chhoti dabao (bounce / < 3 s) kuch nahi karti.
-// Har threshold apne hold mein sirf ek dafa fire hota hai. Pair window
-// RELEASE par fire hoti hai (3 s paar, lekin 5 s safe mode se pehle) —
-// is liye 3 s cross karne par koi event nahi aata, sirf pair_armed lagta
-// hai; 5 s paar hote hi safe mode fire ho jata hai aur pair cancel.
+// Release hote hi detector reset — chhoti dabao (bounce / < 5 s) kuch nahi karti.
+// Har threshold apne hold mein sirf ek dafa fire hota hai. 10 s event
+// (password clear) threshold par fire hota hai — release ka intezar nahi
+// (D7: clear threshold par, phir reboot).
 static inline rsh_hold_event_t rsh_boothold_update(rsh_boothold_t *d, uint8_t pressed,
                                                     uint32_t now_ms) {
   if (!d) return RSH_HOLD_NONE;
   if (!pressed) {
-    rsh_hold_event_t ev = RSH_HOLD_NONE;
-    if (d->pressed && d->pair_armed && !d->safe_fired && !d->armed_fired) {
-      // 3 s hold poora, 5 s se pehle chhora — pair window (F-02).
-      ev = RSH_HOLD_PAIR_WINDOW;
-    }
     d->pressed = 0;
-    d->pair_armed = 0;
     d->safe_fired = 0;
-    d->armed_fired = 0;
-    return ev;
+    d->clear_fired = 0;
+    return RSH_HOLD_NONE;
   }
   if (!d->pressed) {
     d->pressed = 1;
@@ -189,46 +176,34 @@ static inline rsh_hold_event_t rsh_boothold_update(rsh_boothold_t *d, uint8_t pr
     return RSH_HOLD_NONE;
   }
   uint32_t held_ms = (uint32_t)(now_ms - d->hold_start_ms);
-  if (held_ms >= RSH_BOOTHOLD_KEYRESET_MS && !d->armed_fired) {
-    d->armed_fired = 1;
-    return RSH_HOLD_KEY_RESET_ARMED;
+  if (held_ms >= RSH_BOOTHOLD_KEYRESET_MS && !d->clear_fired) {
+    d->clear_fired = 1;
+    return RSH_HOLD_KEY_RESET_CLEAR;
   }
   if (held_ms >= RSH_BOOTHOLD_SAFE_MS && !d->safe_fired) {
     d->safe_fired = 1;
     return RSH_HOLD_SAFE_MODE;
   }
-  if (held_ms >= RSH_BOOTHOLD_PAIR_MS) d->pair_armed = 1;
   return RSH_HOLD_NONE;
 }
 
 // ---------- Safe-mode state ----------
 typedef struct {
-  uint8_t active;            // safe mode (ya key-reset-armed) active hai
-  uint8_t key_reset_armed;   // 1 = key-reset-armed (10 s hold), 0 = safe mode (5 s)
+  uint8_t active;            // safe mode active hai
   uint32_t entered_ms;       // safe mode kab shuru hua
-  uint32_t armed_ms;         // key-reset-armed kab hua (window isi se gini jati hai)
 } rsh_safe_mode_t;
 
 static inline void rsh_safe_mode_init(rsh_safe_mode_t *s) {
   memset(s, 0, sizeof(*s));
 }
 
-// Safe mode (armed=0) ya key-reset-armed (armed=1) mein jao. Reboot ke
-// baghair safe mode se bahar nahi nikla jata — ye jaan-boojh kar hai.
-static inline void rsh_safe_mode_enter(rsh_safe_mode_t *s, uint8_t armed, uint32_t now_ms) {
+// Safe mode mein jao. Reboot ke baghair safe mode se bahar nahi nikla
+// jata — ye jaan-boojh kar hai. (v2.2: key-reset-armed state khatam —
+// 10 s hold seedha password clear + reboot hai, D7.)
+static inline void rsh_safe_mode_enter(rsh_safe_mode_t *s, uint32_t now_ms) {
   if (!s) return;
   s->active = 1;
-  s->key_reset_armed = armed ? 1 : 0;
   s->entered_ms = now_ms;
-  if (armed) s->armed_ms = now_ms;
-}
-
-// Har loop mein call karo. Return 1 = armed window (120 s) khatam —
-// caller board ko normal mode mein reboot kare (§4.4). Safe mode (armed
-// nahi) ki koi expiry nahi: 0 return hota hai jab tak reboot na ho.
-static inline uint8_t rsh_safe_mode_tick(rsh_safe_mode_t *s, uint32_t now_ms) {
-  if (!s || !s->active || !s->key_reset_armed) return 0;
-  return (uint32_t)(now_ms - s->armed_ms) >= RSH_KEYRESET_ARMED_WINDOW_MS ? 1 : 0;
 }
 
 // Safe mode mein config apply nahi hoti (FW-3 gate).

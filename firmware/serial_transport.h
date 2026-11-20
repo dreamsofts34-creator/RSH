@@ -11,14 +11,14 @@
 //   magic "RSHS" (4 B) | kind u8 | len u16 LE | payload (len B) | CRC16 (2 B)
 //   CRC16-CCITT (§0: poly 0x1021, init 0xFFFF) — magic + kind + len +
 //   payload par, yani CRC field se pehle ke tamam bytes par (D2).
-//   Max payload 1053 B (bara control frame, §3.1) → max frame 1062 B.
+//   Max payload 1035 B (bara control frame v2.2, §3.1) → max frame 1044 B.
 //
 // Kinds (payload wahi bytes hain jo UDP par jate — koi naya wire format
 // nahi, sirf serial envelope hai):
 //   1 STREAM  — v2.1 "RSH2" stream packet (§1.1) ya v1 18 B packet
 //   2 STATUS  — v2.1 status packet (§1.2, 34/38 B)
 //   3 HELLO   — HELLO reply (§2.2, 92 B)
-//   4 CONTROL — "RSHC" control frame (§3.1, max 1053 B)
+//   4 CONTROL — "RSHC" control frame (§3.1, max 1035 B)
 //   5 PING    — "RSHN" ping frame (§9, 34 B)
 //   6 HELO    — HELO request (§2.1, 5 B "HELO" + proto + sessionFlag)
 //   7 PROBE   — "RSHP" probe frame (§3.8)
@@ -43,8 +43,8 @@
 #define RSH_SERIAL_MAGIC_3 'S'
 #define RSH_SERIAL_HEADER_SIZE 7    // magic(4) + kind(1) + len(2)
 #define RSH_SERIAL_CRC_SIZE 2
-#define RSH_SERIAL_MAX_PAYLOAD RSH_V2_CTRL_MAX_FRAME  // 1053 — bara control frame
-#define RSH_SERIAL_MAX_FRAME (RSH_SERIAL_HEADER_SIZE + RSH_SERIAL_MAX_PAYLOAD + RSH_SERIAL_CRC_SIZE)  // 1062
+#define RSH_SERIAL_MAX_PAYLOAD RSH_V2_CTRL_MAX_FRAME  // 1035 — bara control frame (v2.2)
+#define RSH_SERIAL_MAX_FRAME (RSH_SERIAL_HEADER_SIZE + RSH_SERIAL_MAX_PAYLOAD + RSH_SERIAL_CRC_SIZE)  // 1044
 
 // Kind bytes (§10).
 #define RSH_SERIAL_KIND_STREAM  1
@@ -59,7 +59,7 @@ typedef enum {
   RSH_SERIAL_OK = 0,
   RSH_SERIAL_TOO_SHORT,    // frame header (7 B) bhi poora nahi
   RSH_SERIAL_BAD_MAGIC,    // pehle 4 bytes "RSHS" nahi
-  RSH_SERIAL_BAD_LENGTH,   // len > 1053, ya total length match nahi, ya kind unknown
+  RSH_SERIAL_BAD_LENGTH,   // len > 1035, ya total length match nahi, ya kind unknown
   RSH_SERIAL_BAD_CRC       // CRC16 mismatch
 } rsh_serial_result_t;
 
@@ -68,8 +68,8 @@ static inline uint8_t rsh_serial_kind_valid(uint8_t kind) {
   return kind >= RSH_SERIAL_KIND_STREAM && kind <= RSH_SERIAL_KIND_PROBE;
 }
 
-/// Ek frame banao. buf kam az kam RSH_SERIAL_MAX_FRAME (1062) bytes ka
-/// ho. Return total frame length, ya 0 (kind unknown / payload > 1053 /
+/// Ek frame banao. buf kam az kam RSH_SERIAL_MAX_FRAME (1044) bytes ka
+/// ho. Return total frame length, ya 0 (kind unknown / payload > 1035 /
 /// buf chhota). CRC header+payload par banta hai (§0/D2).
 static inline size_t rsh_serial_build_frame(uint8_t *buf, size_t buf_len,
                                             uint8_t kind,
@@ -137,7 +137,7 @@ typedef struct {
   uint32_t frames_ok;
   uint32_t bad_magic;   // magic scan mein gira hua byte / ghalat magic
   uint32_t bad_crc;     // CRC mismatch par gira frame
-  uint32_t bad_length;  // len > 1053 ya kind unknown
+  uint32_t bad_length;  // len > 1035 ya kind unknown
 } rsh_serial_decoder_t;
 
 static inline void rsh_serial_decoder_init(rsh_serial_decoder_t *d) {

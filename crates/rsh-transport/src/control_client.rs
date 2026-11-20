@@ -1,114 +1,60 @@
-//! HMAC control client (Phase C3).
+//! Unsigned control client (protocol v2.2).
 //!
-//! Sends the twelve control commands (`GET_CAPS` … `SET_PASSWORD`,
-//! opcodes `0x01`–`0x0C`) over any [`ControlTransport`] and verifies the
-//! board's replies. Every request frame is built with
-//! [`rsh_protocol::control::build_frame`] — tag `HMAC-SHA256(key, nonce ‖
-//! counter_LE ‖ cmd ‖ payload)[0:16]` — and every reply is verified with
+//! Sends the eleven control commands (`GET_CAPS` … `SET_PASSWORD`,
+//! opcodes `0x01`–`0x0C` except the deleted `0x0B`) over any
+//! [`ControlTransport`] and verifies the board's replies by CRC. Every
+//! request frame is built with
+//! [`rsh_protocol::control::build_frame`] — plain `"RSHC"` with a
+//! trailing CRC16 — and every reply is verified with
 //! [`ControlFrame::verify`] before its status byte is trusted.
 //!
-//! Retry rule (§3.2): up to 3 sends at 250 ms intervals; every retry keeps
-//! the same `reqId` and uses a **new** counter. Only a timeout retries — a
-//! bad tag, a replay, a board error, or a malformed frame fails at once,
-//! because resending the same request cannot fix those. The board answers
-//! a same-`reqId` retry from its duplicate cache, so idempotent commands
-//! are never executed twice.
+//! Retry rule (§3.2, D2): up to 3 sends at 250 ms intervals; every retry
+//! keeps the same `reqId` and re-sends the byte-identical frame (there
+//! is no counter in v2.2). Only a timeout retries — a bad CRC, a board
+//! error, or a malformed frame fails at once, because resending the same
+//! request cannot fix those. The board answers a same-`reqId` retry from
+//! its duplicate cache, so idempotent commands are never executed twice.
 //!
-//! Replay rule (§3.2, RFC 1982 serial arithmetic): a reply counter is a
-//! replay when it is `≤` the highest counter accepted so far in this
-//! session, so the wrap `0xFFFFFFFF → 0` is a *new* counter, not a replay.
-//! Gaps above the maximum are accepted — a lost packet must not wedge
-//! the session.
-//!
-//! The [`Session`] (device key, nonce, counter) is defined here and driven
-//! by the C4 pairing worker in Wave 2: pairing supplies the key and nonce,
-//! and a new session (new nonce) restarts the counter at 0.
+//! The [`Session`] holds the per-session `reqId` counter, monotonic and
+//! wrapping `0xFFFF → 0`.
 
 use std::time::Duration;
 
 use rsh_protocol::control::{
     ControlFrame, ErrorCode, GetCfgRequest, LedTestPattern, MAX_PAYLOAD_LEN, MAX_RETRIES, Opcode,
-    PinProbeRequest, RETRY_INTERVAL_MS, ReplayTracker, build_set_password_payload,
+    PinProbeRequest, RETRY_INTERVAL_MS, build_set_password_payload,
 };
 use rsh_protocol::{ConfigError, ControlParseError, GetCapsReply, SetCfgChunk};
 
 use crate::{ControlTransport, TransportError};
 
-/// Overwrite `buf` with zeros in a way the compiler must not optimise
-/// away (volatile writes plus `black_box`, same primitive as
-/// `session.rs`). Used only by the `Drop` impls below.
-fn zeroize(buf: &mut [u8]) {
-    for byte in buf.iter_mut() {
-        // SAFETY: `byte` is a valid `&mut u8` borrowed from a live slice,
-        // so the derived raw pointer is valid for a volatile write.
-        unsafe {
-            std::ptr::write_volatile(byte, 0);
-        }
-    }
-    std::hint::black_box(buf);
-}
-
-/// Per-session control-channel context: the 32-byte device key, the
-/// 16-byte nonce, and the next counter to use.
+/// Per-session control-channel context: the next `reqId` to use.
 ///
-/// The counter starts at 0 for a fresh session (D30) and advances by one
-/// for every send, wrapping `0xFFFFFFFF → 0`. A new session — new nonce,
-/// e.g. after a board reboot — restarts the counter at 0; see
-/// [`Session::reset`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `reqId` is monotonic per session (D2) and wraps `0xFFFF → 0`. A new
+/// session restarts it at 0; see [`Session::reset`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Session {
-    /// Per-device HMAC key (32 bytes, never logged or exported).
-    pub key: [u8; 32],
-    /// Session nonce (16 bytes, from the `HELLO` reply).
-    pub nonce: [u8; 16],
-    /// Counter for the next send.
-    pub counter: u32,
+    /// `reqId` for the next command.
+    pub next_req_id: u16,
 }
 
 impl Session {
-    /// Create a session with the counter at 0.
+    /// Create a session with the next `reqId` at 0.
     #[must_use]
-    pub const fn new(key: [u8; 32], nonce: [u8; 16]) -> Self {
-        Self {
-            key,
-            nonce,
-            counter: 0,
-        }
+    pub const fn new() -> Self {
+        Self { next_req_id: 0 }
     }
 
-    /// Take the counter for the next send and advance it (wrapping).
-    pub fn next_counter(&mut self) -> u32 {
-        let counter = self.counter;
-        self.counter = self.counter.wrapping_add(1);
-        counter
+    /// Take the `reqId` for the next command and advance it (wrapping).
+    pub fn next_req_id(&mut self) -> u16 {
+        let req_id = self.next_req_id;
+        self.next_req_id = self.next_req_id.wrapping_add(1);
+        req_id
     }
 
-    /// Start a new session with a fresh nonce: counter restarts at 0.
-    pub fn reset(&mut self, nonce: [u8; 16]) {
-        self.nonce = nonce;
-        self.counter = 0;
-    }
-}
-
-impl Drop for Session {
-    /// Zeroize the device key when the session is dropped, so a key
-    /// never lingers in memory after the session ends (M1). The nonce
-    /// is not key material and is left alone. Callers that take the
-    /// session out via [`ControlClient::into_inner`] move the key out
-    /// whole, so this drop does not run for the moved-out copy — the
-    /// new owner (e.g. [`BoardSession::close`]) zeroizes it instead.
-    fn drop(&mut self) {
-        zeroize(&mut self.key);
-    }
-}
-
-impl<T: ControlTransport> Drop for ControlClient<T> {
-    /// Zeroize the session key when the client is dropped (M1) — a
-    /// dropped client must never leave the device key in memory.
-    /// [`ControlClient::into_inner`] moves the session out whole, so
-    /// this drop does not run for a taken-out client.
-    fn drop(&mut self) {
-        zeroize(&mut self.session.key);
+    /// Start a new session: `reqId` restarts at 0.
+    pub fn reset(&mut self) {
+        self.next_req_id = 0;
     }
 }
 
@@ -117,10 +63,6 @@ impl<T: ControlTransport> Drop for ControlClient<T> {
 pub enum ControlError {
     /// No reply within the per-attempt timeout after all attempts.
     Timeout,
-    /// A reply failed HMAC tag verification (constant-time compare).
-    BadTag,
-    /// A reply counter is a replay (RFC 1982: `≤` max-seen, new `reqId`).
-    Replay,
     /// The board answered with a non-zero status byte.
     BoardError(ErrorCode),
     /// The request payload (or `SET_CFG` chunk) exceeds its size limit.
@@ -128,7 +70,8 @@ pub enum ControlError {
     /// The underlying transport failed.
     Transport(TransportError),
     /// A reply could not be parsed (`TooShort` / `BadMagic` /
-    /// `BadLength`, or an empty / unknown-status reply payload).
+    /// `BadLength` / `BadCrc`, or an empty / unknown-status reply
+    /// payload).
     Parse(ControlParseError),
     /// A reply arrived for a different command or `reqId` than the one
     /// in flight (only surfaced when no matching reply arrives at all —
@@ -144,8 +87,6 @@ impl std::fmt::Display for ControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Timeout => write!(f, "control request timed out after all retries"),
-            Self::BadTag => write!(f, "control reply HMAC tag verification failed"),
-            Self::Replay => write!(f, "control reply counter is a replay"),
             Self::BoardError(code) => write!(f, "board rejected the command: {code:?}"),
             Self::TooBig => write!(f, "control payload exceeds the size limit"),
             Self::Transport(e) => write!(f, "control transport error: {e}"),
@@ -180,17 +121,15 @@ impl From<ControlParseError> for ControlError {
     }
 }
 
-/// HMAC control client, generic over the transport.
+/// Unsigned control client, generic over the transport.
 ///
 /// The client is generic — never `&dyn` — because [`ControlTransport`]
 /// uses desugared `impl Future` methods, which are not dyn-compatible.
 /// One client owns one [`Session`]; the `reqId` increments per command
-/// (wrapping) and the session counter increments per send.
+/// (wrapping).
 pub struct ControlClient<T: ControlTransport> {
     transport: T,
     session: Session,
-    next_req_id: u16,
-    replay: ReplayTracker,
     timeout: Duration,
     max_attempts: u32,
 }
@@ -202,8 +141,6 @@ impl<T: ControlTransport> ControlClient<T> {
         Self {
             transport,
             session,
-            next_req_id: 0,
-            replay: ReplayTracker::new(),
             timeout: Duration::from_millis(RETRY_INTERVAL_MS),
             max_attempts: MAX_RETRIES,
         }
@@ -225,13 +162,13 @@ impl<T: ControlTransport> ControlClient<T> {
         self
     }
 
-    /// The session (key, nonce, next counter).
+    /// The session (next `reqId`).
     #[must_use]
     pub fn session(&self) -> &Session {
         &self.session
     }
 
-    /// Mutable access to the session (C4 pairing rotates key/nonce here).
+    /// Mutable access to the session.
     #[must_use]
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
@@ -262,35 +199,24 @@ impl<T: ControlTransport> ControlClient<T> {
     }
 
     /// Consume the client, returning the transport and the session.
-    /// The session (and its key) moves out whole, so the client's
-    /// `Drop` impl does not run for it — the new owner zeroizes it.
     #[must_use]
     pub fn into_inner(self) -> (T, Session) {
-        let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `this` is never dropped (it is `ManuallyDrop`), so
-        // reading the fields out by pointer copy is the only access
-        // and no value is used twice.
-        unsafe {
-            (
-                std::ptr::read(std::ptr::addr_of!(this.transport)),
-                std::ptr::read(std::ptr::addr_of!(this.session)),
-            )
-        }
+        (self.transport, self.session)
     }
 
     /// Send one command and return the reply body (status byte stripped).
     ///
-    /// Retries only on timeout: same `reqId`, new counter, up to
-    /// [`ControlClient::max_attempts`] sends. A bad tag, a replay, a
-    /// board error, or a malformed reply fails immediately.
+    /// Retries only on timeout: same `reqId`, byte-identical resend, up
+    /// to [`ControlClient::max_attempts`] sends. A bad CRC, a board
+    /// error, or a malformed reply fails immediately.
     ///
     /// # Errors
     ///
     /// Returns [`ControlError::TooBig`] when `payload.len() > 1024`,
     /// [`ControlError::InvalidArgument`] for an unknown opcode,
-    /// [`ControlError::Timeout`] after all attempts, [`ControlError::BadTag`]
-    /// / [`ControlError::Replay`] / [`ControlError::Parse`] for a bad
-    /// reply, [`ControlError::BoardError`] for a non-zero board status,
+    /// [`ControlError::Timeout`] after all attempts,
+    /// [`ControlError::Parse`] for a bad reply,
+    /// [`ControlError::BoardError`] for a non-zero board status,
     /// and [`ControlError::Transport`] when the transport fails.
     pub async fn execute(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, ControlError> {
         let frame = self.execute_frame(cmd, payload).await?;
@@ -304,7 +230,7 @@ impl<T: ControlTransport> ControlClient<T> {
     /// some replies carry data with the error status (notably `COMMIT`:
     /// `[errCount, errCode…]` with `PIN_CONFLICT` / `UNSUPPORTED`). Use
     /// this method when the error body matters; it retries exactly like
-    /// `execute` (timeout only, same `reqId`, new counter).
+    /// `execute` (timeout only, same `reqId`, byte-identical resend).
     ///
     /// # Errors
     ///
@@ -422,8 +348,7 @@ impl<T: ControlTransport> ControlClient<T> {
         Ok(())
     }
 
-    /// `FACTORY_RESET` — reset config to factory defaults. The device
-    /// key is *not* touched by this command.
+    /// `FACTORY_RESET` — reset config to factory defaults.
     ///
     /// # Errors
     ///
@@ -462,29 +387,30 @@ impl<T: ControlTransport> ControlClient<T> {
         Ok(())
     }
 
-    /// `KEY_RESET` — rotate the device key (only while key-reset is
-    /// armed on the board; the new key arrives via a fresh `HELLO`).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`ControlClient::execute`].
-    pub async fn key_reset(&mut self) -> Result<(), ControlError> {
-        self.execute(Opcode::KeyReset as u8, &[]).await?;
-        Ok(())
-    }
-
     /// `SET_PASSWORD` — change the board AP password (8–63 printable
     /// ASCII bytes, no space; the board restarts its AP after replying).
+    ///
+    /// `current` is the password already set on the board, if any
+    /// (`None` on first setup, when the AP is still open). The v2.2
+    /// payload carries it (`curLen` + current + `newLen` + new, §3.6);
+    /// when a password is set and `current` is missing or wrong the
+    /// board replies `BadPassword`.
     ///
     /// # Errors
     ///
     /// Same as [`ControlClient::execute`];
-    /// [`ControlError::InvalidArgument`] when the password violates the
-    /// length/charset rules.
-    pub async fn set_password(&mut self, password: &[u8]) -> Result<(), ControlError> {
-        let payload = build_set_password_payload(password).ok_or(ControlError::InvalidArgument(
-            "password must be 8..=63 printable ASCII bytes (0x21..=0x7E)",
-        ))?;
+    /// [`ControlError::InvalidArgument`] when either password violates
+    /// the length/charset rules; [`ControlError::BoardError`] with
+    /// [`ErrorCode::BadPassword`] when the current password is wrong.
+    pub async fn set_password(
+        &mut self,
+        current: Option<&[u8]>,
+        password: &[u8],
+    ) -> Result<(), ControlError> {
+        let payload =
+            build_set_password_payload(current, password).ok_or(ControlError::InvalidArgument(
+                "passwords must be printable ASCII bytes (new 8..=63, current 0..=63)",
+            ))?;
         self.execute(Opcode::SetPassword as u8, &payload).await?;
         Ok(())
     }
@@ -502,20 +428,17 @@ impl<T: ControlTransport> ControlClient<T> {
         if payload.len() > MAX_PAYLOAD_LEN {
             return Err(ControlError::TooBig);
         }
-        let req_id = self.next_req_id;
-        self.next_req_id = self.next_req_id.wrapping_add(1);
+        let req_id = self.session.next_req_id();
+        let bytes = ControlFrame {
+            cmd,
+            req_id,
+            payload: payload.to_vec(),
+        }
+        .encode()
+        .map_err(ControlError::Parse)?;
         let mut attempts = 0u32;
         while attempts < self.max_attempts {
             attempts += 1;
-            let counter = self.session.next_counter();
-            let bytes = ControlFrame {
-                cmd,
-                req_id,
-                counter,
-                payload: payload.to_vec(),
-            }
-            .encode(&self.session.key, &self.session.nonce)
-            .map_err(ControlError::Parse)?;
             self.transport
                 .send_control(&bytes)
                 .await
@@ -523,23 +446,23 @@ impl<T: ControlTransport> ControlClient<T> {
             if let Some(frame) = self.wait_for_reply(cmd, req_id).await? {
                 return Ok(frame);
             }
-            // Attempt timed out: retry with the same reqId, new counter.
+            // Attempt timed out: retry with the same reqId, same bytes.
         }
         Err(ControlError::Timeout)
     }
 
     /// Wait up to the per-attempt timeout for the reply to `req_id`.
     /// Returns `Ok(None)` on timeout (caller retries), `Ok(Some(frame))`
-    /// for a verified, matching, non-replay reply. Stray frames for other
+    /// for a CRC-verified, matching reply. Stray frames for other
     /// commands/`reqId`s are skipped while time remains.
     ///
     /// H1/M-8: match first, verify second. The frame is parsed
-    /// structurally and matched on `cmd`/`reqId` *before* any HMAC
+    /// structurally and matched on `cmd`/`reqId` *before* any CRC
     /// check; a stray frame (another command, another `reqId`, or a
     /// late reply to a previous command) is skipped without verifying
-    /// its tag — so a stray frame with a corrupted tag can never kill
-    /// the in-flight command with a spurious `BadTag`. Only the
-    /// matching frame's tag is verified, and a bad tag on *that*
+    /// its CRC — so a stray frame with a corrupted CRC can never kill
+    /// the in-flight command with a spurious `BadCrc`. Only the
+    /// matching frame's CRC is verified, and a bad CRC on *that*
     /// frame still fails at once.
     async fn wait_for_reply(
         &mut self,
@@ -562,7 +485,7 @@ impl<T: ControlTransport> ControlClient<T> {
             // Structure first: a frame too short / bad magic / bad
             // length has no trustworthy cmd/reqId to match on, so it
             // fails like before. A structurally sound frame is
-            // matched before its tag is touched.
+            // matched before its CRC is touched.
             let frame = match ControlFrame::parse_structure(&raw) {
                 Ok(frame) => frame,
                 Err(e) => return Err(ControlError::Parse(e)),
@@ -570,17 +493,10 @@ impl<T: ControlTransport> ControlClient<T> {
             if frame.cmd != (cmd | 0x80) || frame.req_id != req_id {
                 continue;
             }
-            if let Err(e) = frame.verify_tag(&self.session.key, &self.session.nonce, &raw) {
-                return Err(match e {
-                    ControlParseError::BadTag => ControlError::BadTag,
-                    other => ControlError::Parse(other),
-                });
+            match ControlFrame::verify(&raw) {
+                Ok(frame) => return Ok(Some(frame)),
+                Err(e) => return Err(ControlError::Parse(e)),
             }
-            if self.replay.is_replay(frame.counter) {
-                return Err(ControlError::Replay);
-            }
-            self.replay.observe(frame.counter);
-            return Ok(Some(frame));
         }
     }
 
@@ -615,32 +531,20 @@ mod tests {
     use super::{ControlClient, ControlError, Session};
     use crate::{ControlTransport, TransportError};
 
-    /// Test device key / nonce (shared by client and test doubles).
-    const KEY: [u8; 32] = [0x42; 32];
-    /// Test session nonce.
-    const NONCE: [u8; 16] = [0x24; 16];
-
     /// Build a client with a 10 ms per-attempt timeout so a full
     /// 3-attempt timeout stays fast in tests.
     fn client<T: ControlTransport>(transport: T) -> ControlClient<T> {
-        ControlClient::new(transport, Session::new(KEY, NONCE))
-            .with_timeout(Duration::from_millis(10))
+        ControlClient::new(transport, Session::new()).with_timeout(Duration::from_millis(10))
     }
 
-    /// Build a verified reply frame for `req_id` / `counter`.
-    fn reply(cmd: u8, req_id: u16, counter: u32, status: ErrorCode, body: &[u8]) -> Vec<u8> {
-        build_reply(&KEY, &NONCE, cmd, req_id, counter, status, body).expect("test reply builds")
+    /// Build a verified reply frame for `req_id`.
+    fn reply(cmd: u8, req_id: u16, status: ErrorCode, body: &[u8]) -> Vec<u8> {
+        build_reply(cmd, req_id, status, body).expect("test reply builds")
     }
 
-    /// A reply whose tag is corrupted (flip the last tag byte).
-    fn reply_bad_tag(
-        cmd: u8,
-        req_id: u16,
-        counter: u32,
-        status: ErrorCode,
-        body: &[u8],
-    ) -> Vec<u8> {
-        let mut bytes = reply(cmd, req_id, counter, status, body);
+    /// A reply whose CRC is corrupted (flip the last CRC byte).
+    fn reply_bad_crc(cmd: u8, req_id: u16, status: ErrorCode, body: &[u8]) -> Vec<u8> {
+        let mut bytes = reply(cmd, req_id, status, body);
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         bytes
@@ -706,7 +610,7 @@ mod tests {
         }
     }
 
-    /// A fake board: verifies tags, answers same-`reqId` retries from a
+    /// A fake board: verifies CRCs, answers same-`reqId` retries from a
     /// cache without re-executing, counts executions per `reqId`, and can
     /// drop the next reply (to force a client retry).
     struct FakeBoard {
@@ -717,7 +621,7 @@ mod tests {
         cached: HashMap<u16, Vec<u8>>,
         status: ErrorCode,
         body: Vec<u8>,
-        corrupt_tag: bool,
+        corrupt_crc: bool,
     }
 
     impl FakeBoard {
@@ -730,7 +634,7 @@ mod tests {
                 cached: HashMap::new(),
                 status,
                 body,
-                corrupt_tag: false,
+                corrupt_crc: false,
             }
         }
 
@@ -751,19 +655,10 @@ mod tests {
                     self.pending = None;
                     return Ok(());
                 };
-                // Tag check first: a bad tag is answered BAD_TAG, never executed.
-                if ControlFrame::verify(&owned, &KEY, &NONCE).is_err() {
-                    let reply = build_reply(
-                        &KEY,
-                        &NONCE,
-                        frame.cmd,
-                        frame.req_id,
-                        frame.counter,
-                        ErrorCode::BadTag,
-                        &[],
-                    )
-                    .expect("fake-board BAD_TAG reply builds");
-                    self.pending = Some(reply);
+                // CRC check: a bad-CRC frame is dropped silently, never
+                // executed and never answered.
+                if ControlFrame::verify(&owned).is_err() {
+                    self.pending = None;
                     return Ok(());
                 }
                 // Duplicate cache: same reqId re-answered, never re-executed.
@@ -772,17 +667,9 @@ mod tests {
                     return Ok(());
                 }
                 *self.executions.entry(frame.req_id).or_insert(0) += 1;
-                let mut reply = build_reply(
-                    &KEY,
-                    &NONCE,
-                    frame.cmd,
-                    frame.req_id,
-                    frame.counter,
-                    self.status,
-                    &self.body,
-                )
-                .expect("fake-board reply builds");
-                if self.corrupt_tag {
+                let mut reply = build_reply(frame.cmd, frame.req_id, self.status, &self.body)
+                    .expect("fake-board reply builds");
+                if self.corrupt_crc {
                     let last = reply.len() - 1;
                     reply[last] ^= 0xFF;
                 }
@@ -806,7 +693,7 @@ mod tests {
     }
 
     /// A `GET_CAPS` body *after* the status byte (what `build_reply`
-    /// appends): fw 4.0.1, proto 2.1, 8 axes / 64 buttons / 4 encoders,
+    /// appends): fw 4.0.1, proto 2.2, 8 axes / 64 buttons / 4 encoders,
     /// Wi-Fi channel 6, one pin-table entry (pin 34). `encode_body`
     /// includes the status byte first, so it is stripped here.
     fn caps_body() -> Vec<u8> {
@@ -814,7 +701,7 @@ mod tests {
             status: ErrorCode::Ok,
             board_mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
             firmware: (4, 0, 1),
-            protocol: (2, 1),
+            protocol: (2, 2),
             n_axes_max: 8,
             n_btn_max: 64,
             n_enc_max: 4,
@@ -838,7 +725,7 @@ mod tests {
         let mut c = client(board);
         let caps = c.get_caps().await.expect("GET_CAPS succeeds");
         assert_eq!(caps.firmware, (4, 0, 1));
-        assert_eq!(caps.protocol, (2, 1));
+        assert_eq!(caps.protocol, (2, 2));
         assert_eq!(caps.n_axes_max, 8);
         assert_eq!(caps.n_btn_max, 64);
         assert_eq!(caps.n_enc_max, 4);
@@ -857,7 +744,6 @@ mod tests {
         let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(reply(
             Opcode::GetCaps as u8,
             0,
-            0,
             ErrorCode::Ok,
             &caps_body(),
         ))]);
@@ -868,80 +754,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bad_tag_reply_is_bad_tag_error() {
-        let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(reply_bad_tag(
+    async fn bad_crc_reply_is_parse_error() {
+        let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(reply_bad_crc(
             Opcode::GetCaps as u8,
-            0,
             0,
             ErrorCode::Ok,
             &caps_body(),
         ))]);
         let mut c = client(transport);
-        let err = c.get_caps().await.expect_err("bad tag must fail");
-        assert!(matches!(err, ControlError::BadTag), "got {err:?}");
-        // No retry on a bad tag: exactly one send.
+        let err = c.get_caps().await.expect_err("bad CRC must fail");
+        assert!(
+            matches!(err, ControlError::Parse(ControlParseError::BadCrc)),
+            "got {err:?}"
+        );
+        // No retry on a bad CRC: exactly one send.
         assert_eq!(c.transport().sent.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn replayed_reply_counter_is_replay_error() {
-        // First command succeeds (counter 0 accepted, max_seen = 0).
-        let transport = ScriptedTransport::new(vec![
-            ScriptedRecv::Bytes(reply(
-                Opcode::GetCaps as u8,
-                0,
-                0,
-                ErrorCode::Ok,
-                &caps_body(),
-            )),
-            // Second command sends counter 1, but the reply echoes the
-            // old counter 0 with a valid tag: a replay.
-            ScriptedRecv::Bytes(reply(
-                Opcode::GetCaps as u8,
-                1,
-                0,
-                ErrorCode::Ok,
-                &caps_body(),
-            )),
-        ]);
-        let mut c = client(transport);
-        c.get_caps().await.expect("first GET_CAPS succeeds");
-        let err = c.get_caps().await.expect_err("replayed counter must fail");
-        assert!(matches!(err, ControlError::Replay), "got {err:?}");
-    }
-
-    #[tokio::test]
-    async fn counter_wrap_is_new_not_replay() {
-        let session = Session {
-            counter: 0xFFFF_FFFF,
-            ..Session::new(KEY, NONCE)
-        };
-        let transport = ScriptedTransport::new(vec![
-            ScriptedRecv::Bytes(reply(
-                Opcode::GetCaps as u8,
-                0,
-                0xFFFF_FFFF,
-                ErrorCode::Ok,
-                &caps_body(),
-            )),
-            // Counter wraps 0xFFFFFFFF -> 0: new, not a replay (RFC 1982).
-            ScriptedRecv::Bytes(reply(
-                Opcode::GetCaps as u8,
-                1,
-                0,
-                ErrorCode::Ok,
-                &caps_body(),
-            )),
-        ]);
-        let mut c = ControlClient::new(transport, session).with_timeout(Duration::from_millis(10));
-        c.get_caps().await.expect("counter 0xFFFFFFFF accepted");
-        c.get_caps().await.expect("wrapped counter 0 accepted");
     }
 
     #[tokio::test]
     async fn board_error_codes_mapped() {
         for (code, name) in [
-            (ErrorCode::BadTag, "BAD_TAG"),
             (ErrorCode::Replay, "REPLAY"),
             (ErrorCode::BadCrc, "BAD_CRC"),
             (ErrorCode::TooBig, "TOO_BIG"),
@@ -951,7 +783,6 @@ mod tests {
         ] {
             let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(reply(
                 Opcode::Commit as u8,
-                0,
                 0,
                 code,
                 &[],
@@ -966,6 +797,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_byte_1_is_bad_password() {
+        // Status 0x01 was BadTag in v2.1; in v2.2 it is BadPassword
+        // (SET_PASSWORD current password wrong, D3).
+        let bytes = build_frame(0x81, 0, &[0x01]).expect("reply builds");
+        let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(bytes)]);
+        let mut c = client(transport);
+        let err = c.get_caps().await.expect_err("status 1 must fail");
+        assert!(
+            matches!(err, ControlError::BoardError(ErrorCode::BadPassword)),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn get_caps_busy_is_board_error() {
         let board = FakeBoard::new(ErrorCode::Busy, Vec::new());
         let mut c = client(board);
@@ -977,7 +822,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_after_three_attempts_same_req_id_new_counter() {
+    async fn timeout_after_three_attempts_same_req_id_identical_resend() {
         let transport = ScriptedTransport::new(vec![]);
         let mut c = client(transport);
         let err = c
@@ -987,14 +832,11 @@ mod tests {
         assert!(matches!(err, ControlError::Timeout), "got {err:?}");
         let sent = &c.transport().sent;
         assert_eq!(sent.len(), 3);
-        let frames: Vec<ControlFrame> = sent
-            .iter()
-            .map(|bytes| ControlFrame::parse_structure(bytes).expect("sent frame parses"))
-            .collect();
-        assert!(frames.iter().all(|f| f.req_id == frames[0].req_id));
-        assert_eq!(frames[0].counter, 0);
-        assert_eq!(frames[1].counter, 1);
-        assert_eq!(frames[2].counter, 2);
+        // Retries are byte-identical resends: same reqId, no counter.
+        assert_eq!(sent[0], sent[1]);
+        assert_eq!(sent[1], sent[2]);
+        let frame = ControlFrame::parse_structure(&sent[0]).expect("sent frame parses");
+        assert_eq!(frame.req_id, 0);
     }
 
     #[tokio::test]
@@ -1016,20 +858,17 @@ mod tests {
         let mut c = client(board);
         let caps = c.get_caps().await.expect("retry succeeds");
         assert_eq!(caps.firmware, (4, 0, 1));
-        // Same reqId (0) on both sends, new counter on the retry.
+        // Same reqId (0) on both sends, byte-identical resend.
         let sent = &c.transport().sent;
         assert_eq!(sent.len(), 2);
-        let first = ControlFrame::parse_structure(&sent[0]).expect("first send parses");
-        let second = ControlFrame::parse_structure(&sent[1]).expect("second send parses");
-        assert_eq!(first.req_id, second.req_id);
-        assert_ne!(first.counter, second.counter);
+        assert_eq!(sent[0], sent[1]);
         // The board executed the command exactly once.
         assert_eq!(c.transport().executions_for(0), 1);
     }
 
     #[tokio::test]
     async fn truncated_reply_is_parse_error_not_panic() {
-        let full = reply(Opcode::GetCaps as u8, 0, 0, ErrorCode::Ok, &caps_body());
+        let full = reply(Opcode::GetCaps as u8, 0, ErrorCode::Ok, &caps_body());
         let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(full[..5].to_vec())]);
         let mut c = client(transport);
         let err = c.get_caps().await.expect_err("5-byte reply must fail");
@@ -1041,8 +880,8 @@ mod tests {
 
     #[tokio::test]
     async fn bad_length_reply_is_parse_error() {
-        let full = reply(Opcode::GetCaps as u8, 0, 0, ErrorCode::Ok, &caps_body());
-        // 20 bytes: header readable, but 13 + len + 16 != 20.
+        let full = reply(Opcode::GetCaps as u8, 0, ErrorCode::Ok, &caps_body());
+        // 20 bytes: header readable, but 9 + len + 2 != 20.
         let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(full[..20].to_vec())]);
         let mut c = client(transport);
         let err = c
@@ -1057,7 +896,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_magic_reply_is_parse_error() {
-        let mut bytes = reply(Opcode::GetCaps as u8, 0, 0, ErrorCode::Ok, &caps_body());
+        let mut bytes = reply(Opcode::GetCaps as u8, 0, ErrorCode::Ok, &caps_body());
         bytes[0] = b'X';
         let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(bytes)]);
         let mut c = client(transport);
@@ -1070,7 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_reply_payload_is_parse_error() {
-        let bytes = build_frame(&KEY, &NONCE, 0x81, 0, 0, &[]).expect("empty reply builds");
+        let bytes = build_frame(0x81, 0, &[]).expect("empty reply builds");
         let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(bytes)]);
         let mut c = client(transport);
         let err = c.get_caps().await.expect_err("empty reply must fail");
@@ -1082,8 +921,8 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_status_byte_is_parse_error() {
-        // Status 0x09 is not in the 0..=7 error table.
-        let bytes = build_frame(&KEY, &NONCE, 0x81, 0, 0, &[0x09]).expect("reply builds");
+        // Status 0x09 is not in the 0/2..=7 error table.
+        let bytes = build_frame(0x81, 0, &[0x09]).expect("reply builds");
         let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(bytes)]);
         let mut c = client(transport);
         let err = c.get_caps().await.expect_err("unknown status must fail");
@@ -1098,7 +937,6 @@ mod tests {
         let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(reply(
             Opcode::GetCaps as u8,
             999,
-            0,
             ErrorCode::Ok,
             &caps_body(),
         ))]);
@@ -1112,27 +950,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stray_corrupt_tag_frame_does_not_kill_in_flight_command() {
-        // H1/M-8 regression: a stray frame for another reqId whose tag
-        // is corrupted must be skipped WITHOUT verification — the old
-        // code verified first and failed the in-flight command with
-        // BadTag. Here the stray frame arrives first, then the valid
-        // reply for reqId 0, and GET_CAPS must still succeed.
+    async fn stray_corrupt_crc_frame_does_not_kill_in_flight_command() {
+        // H1/M-8 regression, CRC edition: a stray frame for another
+        // reqId whose CRC is corrupted must be skipped WITHOUT
+        // verification — the old code verified first and failed the
+        // in-flight command with a spurious tag failure. Here the stray frame arrives
+        // first, then the valid reply for reqId 0, and GET_CAPS must
+        // still succeed.
         let transport = ScriptedTransport::new(vec![
-            ScriptedRecv::Bytes(reply_bad_tag(
+            ScriptedRecv::Bytes(reply_bad_crc(
                 Opcode::GetCaps as u8,
                 999,
-                0,
                 ErrorCode::Ok,
                 &caps_body(),
             )),
-            ScriptedRecv::Bytes(reply(
-                Opcode::GetCaps as u8,
-                0,
-                0,
-                ErrorCode::Ok,
-                &caps_body(),
-            )),
+            ScriptedRecv::Bytes(reply(Opcode::GetCaps as u8, 0, ErrorCode::Ok, &caps_body())),
         ]);
         let mut c = client(transport);
         let caps = c.get_caps().await.expect("valid reply still wins");
@@ -1141,19 +973,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_reply_with_bad_tag_still_fails() {
-        // The H1 split only skips non-matching frames: a bad tag on
-        // the MATCHING reply is still a hard BadTag, no retry.
-        let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(reply_bad_tag(
+    async fn matching_reply_with_bad_crc_still_fails() {
+        // The H1 split only skips non-matching frames: a bad CRC on
+        // the MATCHING reply is still a hard failure, no retry.
+        let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(reply_bad_crc(
             Opcode::GetCaps as u8,
-            0,
             0,
             ErrorCode::Ok,
             &caps_body(),
         ))]);
         let mut c = client(transport);
-        let err = c.get_caps().await.expect_err("matching bad tag must fail");
-        assert!(matches!(err, ControlError::BadTag), "got {err:?}");
+        let err = c.get_caps().await.expect_err("matching bad CRC must fail");
+        assert!(
+            matches!(err, ControlError::Parse(ControlParseError::BadCrc)),
+            "got {err:?}"
+        );
         assert_eq!(c.transport().sent.len(), 1);
     }
 
@@ -1174,7 +1008,6 @@ mod tests {
         let transport = ScriptedTransport::new(vec![ScriptedRecv::Bytes(reply(
             Opcode::SetCfg as u8,
             0,
-            0,
             ErrorCode::Ok,
             &[],
         ))]);
@@ -1188,14 +1021,16 @@ mod tests {
     async fn unknown_opcode_is_invalid_argument() {
         let transport = ScriptedTransport::new(vec![]);
         let mut c = client(transport);
-        let err = c
-            .execute(0x0D, &[])
-            .await
-            .expect_err("unknown opcode must fail");
-        assert!(
-            matches!(err, ControlError::InvalidArgument(_)),
-            "got {err:?}"
-        );
+        for bad in [0x0Bu8, 0x0D] {
+            let err = c
+                .execute(bad, &[])
+                .await
+                .expect_err("unknown opcode must fail");
+            assert!(
+                matches!(err, ControlError::InvalidArgument(_)),
+                "opcode {bad:#04x}: got {err:?}"
+            );
+        }
         assert_eq!(c.transport().sent.len(), 0);
     }
 
@@ -1296,7 +1131,6 @@ mod tests {
         c.revert().await.expect("REVERT succeeds");
         c.factory_reset().await.expect("FACTORY_RESET succeeds");
         c.reboot().await.expect("REBOOT succeeds");
-        c.key_reset().await.expect("KEY_RESET succeeds");
     }
 
     #[tokio::test]
@@ -1371,11 +1205,14 @@ mod tests {
     async fn set_password_ok_and_validation() {
         let board = FakeBoard::new(ErrorCode::Ok, Vec::new());
         let mut c = client(board);
-        c.set_password(b"Abcdef12")
+        c.set_password(None, b"Abcdef12")
             .await
             .expect("SET_PASSWORD succeeds");
+        // No current password: payload is [curLen 0][newLen 8][new].
+        let sent = ControlFrame::parse_structure(&c.transport().sent[0]).expect("send parses");
+        assert_eq!(sent.payload, b"\x00\x08Abcdef12".to_vec());
         let err = c
-            .set_password(b"short")
+            .set_password(None, b"short")
             .await
             .expect_err("7-char password must fail");
         assert!(
@@ -1383,51 +1220,76 @@ mod tests {
             "got {err:?}"
         );
         let err = c
-            .set_password(b"Abc def1")
+            .set_password(None, b"Abc def1")
             .await
             .expect_err("password with a space must fail");
         assert!(
             matches!(err, ControlError::InvalidArgument(_)),
             "got {err:?}"
         );
+        let err = c
+            .set_password(Some(b"old pas1"), b"Abcdef12")
+            .await
+            .expect_err("current password with a space must fail");
+        assert!(
+            matches!(err, ControlError::InvalidArgument(_)),
+            "got {err:?}"
+        );
         // Nothing was sent for the invalid passwords: 1 send total.
         assert_eq!(c.transport().sent.len(), 1);
+
+        // With a current password: [curLen 8][current][newLen 8][new].
+        let board = FakeBoard::new(ErrorCode::Ok, Vec::new());
+        let mut c = client(board);
+        c.set_password(Some(b"oldpass1"), b"Abcdef12")
+            .await
+            .expect("SET_PASSWORD with current succeeds");
+        let sent = ControlFrame::parse_structure(&c.transport().sent[0]).expect("send parses");
+        assert_eq!(sent.payload, b"\x08oldpass1\x08Abcdef12".to_vec());
+
+        // Wrong current password: the board replies BadPassword (1).
+        let board = FakeBoard::new(ErrorCode::BadPassword, Vec::new());
+        let mut c = client(board);
+        let err = c
+            .set_password(Some(b"wrongpas"), b"Abcdef12")
+            .await
+            .expect_err("wrong current password must fail");
+        assert!(
+            matches!(err, ControlError::BoardError(ErrorCode::BadPassword)),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
-    async fn session_counter_advances_per_send() {
+    async fn req_id_advances_per_command() {
         let transport = ScriptedTransport::new(vec![
-            ScriptedRecv::Bytes(reply(
-                Opcode::GetCaps as u8,
-                0,
-                0,
-                ErrorCode::Ok,
-                &caps_body(),
-            )),
-            ScriptedRecv::Bytes(reply(
-                Opcode::GetCaps as u8,
-                1,
-                1,
-                ErrorCode::Ok,
-                &caps_body(),
-            )),
+            ScriptedRecv::Bytes(reply(Opcode::GetCaps as u8, 0, ErrorCode::Ok, &caps_body())),
+            ScriptedRecv::Bytes(reply(Opcode::GetCaps as u8, 1, ErrorCode::Ok, &caps_body())),
         ]);
         let mut c = client(transport);
-        assert_eq!(c.session().counter, 0);
+        assert_eq!(c.session().next_req_id, 0);
         c.get_caps().await.expect("first succeeds");
-        assert_eq!(c.session().counter, 1);
+        assert_eq!(c.session().next_req_id, 1);
         c.get_caps().await.expect("second succeeds");
-        assert_eq!(c.session().counter, 2);
+        assert_eq!(c.session().next_req_id, 2);
     }
 
     #[tokio::test]
-    async fn session_reset_restarts_counter() {
-        let mut session = Session::new(KEY, NONCE);
-        assert_eq!(session.next_counter(), 0);
-        assert_eq!(session.next_counter(), 1);
-        session.reset([0x11; 16]);
-        assert_eq!(session.nonce, [0x11; 16]);
-        assert_eq!(session.counter, 0);
-        assert_eq!(session.next_counter(), 0);
+    async fn session_reset_restarts_req_id() {
+        let mut session = Session::new();
+        assert_eq!(session.next_req_id(), 0);
+        assert_eq!(session.next_req_id(), 1);
+        session.reset();
+        assert_eq!(session.next_req_id, 0);
+        assert_eq!(session.next_req_id(), 0);
+    }
+
+    #[tokio::test]
+    async fn req_id_wraps_at_u16_max() {
+        let mut session = Session {
+            next_req_id: 0xFFFF,
+        };
+        assert_eq!(session.next_req_id(), 0xFFFF);
+        assert_eq!(session.next_req_id(), 0);
     }
 }

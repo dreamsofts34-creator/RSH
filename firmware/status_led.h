@@ -7,9 +7,9 @@ enum class LedState : uint8_t {
   Error,           // 8 Hz tez blink
   Updating,        // 5 Hz blink (OTA chal raha hai)
   SafeMode,        // 1 Hz slow blink (FW-3: BOOT-hold 5 s — §4.4)
-  KeyResetArmed,   // 4 Hz fast blink (FW-3: BOOT-hold 10 s — §4.4)
-  PairWindow,      // F-02 (v4.0.2): 3 Hz blink — pairing window khuli hai
   ErrorCode        // F-10 (v4.0.2): blink count se error code (diag_log.h)
+// v2.2 DELETE: KeyResetArmed (koi armed state nahi — 10 s hold seedha
+// password clear + reboot hai, D7) aur PairWindow (pairing khatam).
 };
 
 void led_begin();

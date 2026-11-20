@@ -1,8 +1,8 @@
 #include "net.h"
 #include "net_logic.h"   // FW-7: channel score / pick (pure, host-testable)
-#include "protocol.h"    // FW-8: v2.1 builders / parsers
-#include "ctrl.h"        // FW-8: HMAC control dispatcher (SEC-D-06)
-#include "ctrl_handlers.h"  // FW-3/FW-4: SET_CFG/COMMIT/.../KEY_RESET handler (pure)
+#include "protocol.h"    // FW-8: v2.2 builders / parsers
+#include "ctrl.h"        // FW-8: plain control dispatcher (v2.2, no HMAC)
+#include "ctrl_handlers.h"  // FW-3/FW-4: SET_CFG/COMMIT/.../SET_PASSWORD handler (pure)
 #include "diag_log.h"    // F-10: diagnostics ring log + GET_DIAG body
 #include "horn_test.h"   // D-5: HORN_TEST timer state (pure)
 #include "led_driver.h"    // Phase G WS5: LED driver abstraction.
@@ -10,7 +10,7 @@
                            // led_test_request adapter + net_led_tick().
 #include "led_sink_rmt.h"  // Phase H WS2: RMT WS2812 sink (GPIO21)
 #include "fw34_state.h"    // FW-3/FW-4: safe mode + config txn state (rsh.ino)
-#include "keystore.h"    // FW-8: per-device key/nonce/pairing window
+#include "keystore.h"    // v2.2: user-set Wi-Fi password store (no device key)
 #include "modules.h"     // FW-11: GET_CAPS default pin table
 #include "config.h"
 #include <Arduino.h>
@@ -18,11 +18,10 @@
 #include <WiFiUdp.h>
 #include <ESPmDNS.h>   // Phase G (C2/D33): mDNS responder — board `rsh.local`
 #include <esp_wifi.h>    // per-station RSSI (SEC-D-08 / status packet)
-#include <mbedtls/md.h>  // HMAC-SHA256 (mbedTLS, firmware ka crypto)
 
 static WiFiUDP udpHello;   // 4210 par HELO sunta hai
 static WiFiUDP udpData;    // 4211 par data bhejta hai (+ HELLO/control/ping replies)
-static WiFiUDP udpCtrl;    // 4212 par control (HMAC) + ping sunta hai
+static WiFiUDP udpCtrl;    // 4212 par control + ping sunta hai
 static IPAddress pcIp;
 static bool havePc = false;
 static uint32_t lastHelloMs = 0;
@@ -39,55 +38,59 @@ static uint32_t pingDropped = 0;
 static uint64_t usBase = 0;          // micros() u64 monotonic (ping t1/t2)
 static uint32_t lastMicros = 0;
 static TxStats txStats;    // F3: failed UDP transmissions (status packet)
-static rsh_ctrl_session_t ctrlSession;  // FW-8: (reqId, counter) state
-static rsh_ctrl_cache_t ctrlCache;      // FW-8: duplicate cached replies
+static rsh_ctrl_session_t ctrlSession;  // v2.2: reqId-only dedup state
+static rsh_ctrl_cache_t ctrlCache;      // v2.2: duplicate cached replies
 static rsh_ping_limiter_t pingLimiter;  // §9.4: per-source token bucket
 static bool ctrlInitDone = false;       // session sirf ek dafa init ho
-static bool sessionAuthenticated = false;  // SEC-E-14: is session mein HMAC-verified control ACCEPT hua? (net_ctrl_handler set karta hai; peer/session badle to clear)
+// D3 (v2.2 stream gate): is session mein GET_CAPS OK hua? Stream sirf
+// is ke baad khulta hai (plain GET_CAPS OK — HMAC khatam). Naya peer /
+// naya session flag saaf karta hai. Wi-Fi aur serial ke alag flags hain.
+static bool wifiCapsOk = false;
+static bool serialCapsOk = false;
 // Phase G (D26/OPEN-20): wired serial peer ka ALAG session — apna HELO
-// timer, apna control session/cache, apna SEC-E-14 auth flag. Nonce/key
-// keystore se shared hain (board-global).
+// timer, apna control session/cache, apna GET_CAPS-OK flag.
 static rsh_ctrl_session_t serialCtrlSession;
 static rsh_ctrl_cache_t serialCtrlCache;
-static bool serialSessionAuthenticated = false;
 static bool serialHavePc = false;
 static uint32_t serialLastHelloMs = 0;
 static uint32_t serialLastHelloReplyMs = 0;
 static uint8_t serialLastHelloProto = 0;
-static bool rebootPending = false;      // HMAC REBOOT (0x09) mila — reply ke baad restart
-static bool keyResetPending = false;    // HMAC KEY_RESET (0x0B) mila — reply ke baad rotate + restart
-static bool passwordChangePending = false;  // HMAC SET_PASSWORD (0x0C) mila — reply ke baad NVS + AP restart
+static bool rebootPending = false;      // REBOOT (0x09) mila — reply ke baad restart
+static bool passwordChangePending = false;  // SET_PASSWORD (0x0C) mila — reply ke baad NVS + AP restart
 static RshHornTest hornTestState;       // D-5 (v4.0.2): HORN_TEST timer state
 static uint8_t pendingPassword[RSH_PASSWORD_MAX_LEN];  // deferred SET_PASSWORD bytes (reply ke baad apply)
 static uint8_t pendingPasswordLen = 0;
 
-// Control handler ka context: aakhri command + status (pairing + tests ke liye).
-// auth_flag: is transport ka SEC-E-14 flag (Wi-Fi → &sessionAuthenticated,
-// serial → &serialSessionAuthenticated) — handler sirf ACCEPT par chalta hai,
-// is liye yahan pahunchna hi us transport ki authentication hai.
+// Control handler ka context: aakhri command + status (tests ke liye).
 typedef struct {
   uint8_t lastCmd;
   uint8_t lastStatus;
-  bool *auth_flag;
 } net_ctrl_ctx_t;
-static net_ctrl_ctx_t ctrlCtx = {0, 0, NULL};
-static net_ctrl_ctx_t serialCtrlCtx = {0, 0, NULL};
+static net_ctrl_ctx_t ctrlCtx = {0, 0};
+static net_ctrl_ctx_t serialCtrlCtx = {0, 0};
 
-// FW-3/FW-4 handler callbacks (ctrl_handlers.h): armed state keystore se
-// (wo FW-3 state parhta hai), persist + txn rsh.ino se, clock millis().
-// key_reset_request sirf pending flag lagata hai — asal rotation + reboot
-// reply bhejne KE BAAD hota hai (neeche net_poll_ctrl mein).
-static uint8_t fw34_armed_cb(void *user) {
-  (void)user;
-  return keystore_key_reset_armed() ? 1 : 0;
+// SSID "RSH-XXXX" (D4): softAP MAC ke aakhri 2 bytes, uppercase hex.
+// Wahi MAC jo HELLO board_mac mein jata hai — SSID suffix aur HELLO MAC
+// hamesha milte hain (dono isi call se aate hain).
+static char ssidBuf[16];
+static const char *net_ssid_() {
+  uint8_t mac[6];
+  WiFi.softAPmacAddress(mac);
+  snprintf(ssidBuf, sizeof(ssidBuf), RSH_SSID_PREFIX "%02X%02X", mac[4], mac[5]);
+  return ssidBuf;
 }
-static void fw34_key_reset_cb(void *user) {
+
+// FW-3/FW-4 handler callbacks (ctrl_handlers.h): persist + txn rsh.ino se,
+// clock millis(). SET_PASSWORD deferred: password yahan sirf RAM mein rakho
+// (reply ke baad keystore_set_password + AP restart hota hai — neeche
+// net_poll_ctrl). Handler ne length/charset pehle hi validate kar li hai (§5.2).
+// D3 current-password check: koi password stored nahi ho to proceed (1);
+// stored ho to sirf match par proceed (keystore_check_password, constant-time).
+static uint8_t fw34_password_verify_cb(void *user, const uint8_t *pw, uint16_t len) {
   (void)user;
-  keyResetPending = true;
+  if (!keystore_has_password()) return 1;  // pehli setup — current ignore
+  return keystore_check_password((const char *)pw, (uint8_t)len) ? 1 : 0;
 }
-// SET_PASSWORD deferred: password yahan sirf RAM mein rakho (reply ke
-// baad keystore_set_password + AP restart hota hai — neeche net_poll_ctrl).
-// Handler ne length/charset pehle hi validate kar li hai (§5.2).
 static void fw34_password_cb(void *user, const uint8_t *pw, uint16_t len) {
   (void)user;
   if (!pw || len < RSH_PASSWORD_MIN_LEN || len > RSH_PASSWORD_MAX_LEN) return;
@@ -144,25 +147,6 @@ static uint64_t net_micros64() {
   if (now < lastMicros) usBase += 0x100000000ULL;
   lastMicros = now;
   return usBase + (uint64_t)now;
-}
-
-// HMAC-SHA256(key, nonce || counter_LE || cmd || payload)[0:16] (§3.2).
-// Static buffer — koi heap allocation nahi (ping/control path §9.3 style).
-static uint8_t hmacMsg[16 + 4 + 1 + RSH_V2_CTRL_MAX_PAYLOAD];
-static void net_hmac16(const uint8_t *key32, const uint8_t *nonce16, uint32_t counter,
-                       uint8_t cmd, const uint8_t *payload, uint16_t payload_len,
-                       uint8_t tag_out[16]) {
-  memcpy(hmacMsg, nonce16, 16);
-  hmacMsg[16] = (uint8_t)(counter & 0xFF);
-  hmacMsg[17] = (uint8_t)((counter >> 8) & 0xFF);
-  hmacMsg[18] = (uint8_t)((counter >> 16) & 0xFF);
-  hmacMsg[19] = (uint8_t)((counter >> 24) & 0xFF);
-  hmacMsg[20] = cmd;
-  if (payload_len > 0) memcpy(hmacMsg + 21, payload, payload_len);
-  uint8_t full[32];
-  mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                  key32, RSH_KEY_LEN, hmacMsg, 21u + payload_len, full);
-  memcpy(tag_out, full, 16);
 }
 
 uint32_t net_tx_fail_count() { return txStats.tx_fail; }
@@ -248,46 +232,6 @@ void net_led_apply_persistent(const uint8_t *blob, size_t len) {
   rsh_led_driver_set_persistent(&ledDrv, &p, cfg.brightness, millis());
 }
 
-// SEC-R2-03 (Phase 2 M-2): khula AP (pairing window) abhi chal raha hai?
-static bool apIsOpen = false;
-
-// Forward: neeche defined (DS-11 retry helper is se pehle aata hai).
-static bool net_start_ap_and_sockets(uint8_t ch);
-
-// Khula AP WPA2 par lock karo (generated password, keystore se).
-// Sirf tab jab AP khula ho — dobara call no-op hai.
-// DS-11: return value check karo — softAP/begin fail ho to apIsOpen
-// JAISA HAI waisa rehta hai (lock dobara koshish karega — net_poll()
-// har dafa net_lock_ap_after_pairing_window() chalata hai), diag event
-// record hota hai, aur retry 5 s throttle se hota hai (har loop
-// iteration par softAP hammer nahi). Kamyabi par true.
-static bool net_lock_ap_wpa2_() {
-  if (!apIsOpen) return true;
-  // Retry throttle: pehli koshish foran, fail ke baad agle 5 s tak nahi.
-  static uint32_t lastLockAttemptMs = 0;
-  static bool haveLastLockAttempt = false;
-  uint32_t nowMs = millis();
-  if (haveLastLockAttempt && (uint32_t)(nowMs - lastLockAttemptMs) < 5000)
-    return false;
-  haveLastLockAttempt = true;
-  lastLockAttemptMs = nowMs;
-  udpHello.stop();
-  udpCtrl.stop();
-  WiFi.softAPdisconnect(true);
-  if (!WiFi.softAP(WIFI_SSID, keystore_password(), currentChannel, 0, 4)) {
-    // AP band ho gaya, sockets band hain — apIsOpen true rehta hai taake
-    // agle net_poll() par lock dobara koshish kare (throttle ke baad).
-    rsh_diag_record_global(RSH_DIAG_AP_RESTART_FAIL, 0, nowMs);
-    return false;
-  }
-  if (!udpHello.begin(PORT_HELLO) || !udpCtrl.begin(PORT_CTRL)) {
-    rsh_diag_record_global(RSH_DIAG_AP_RESTART_FAIL, 0, nowMs);
-    return false;
-  }
-  apIsOpen = false;
-  return true;
-}
-
 // DS-11: AP restart retry — net_start_ap_and_sockets() fail hone par
 // (password restart ya rescan restart) AP band rehta hai; ye pending
 // flag agle net_poll() calls par har 5 s mein dobara koshish karta hai.
@@ -313,42 +257,18 @@ static void net_retry_ap_restart_() {
   apRestartRetryAtMs_ = millis() + 5000;  // dobara 5 s baad, diag dobara nahi
 }
 
-// AP lock policy (F-01, v4.0.2): do triggers, dono DEFERRED (reply
-// bhejne ke baad, agle net_poll() par — is liye GET_CAPS reply pehle
-// nikal jata hai, phir AP lock hota hai):
-//   (a) pairing complete (GET_CAPS OK → keystore paired) — AP foran
-//       WPA2 ho jata hai, reboot tak khula NAHI rehta (purana bug:
-//       SEC-R2-03 sirf unpaired board par chalta tha, pair hone ke
-//       baad AP reboot tak khula rehta tha). App ka rejoin helper
-//       (Phase 6) naye password se dobara join karta hai.
-//   (b) pairing window guzar jaye aur board abhi tak pair na hua ho
-//       (purana behaviour, barqarar).
-static void net_lock_ap_after_pairing_window() {
-  if (!apIsOpen) return;
-  if (!keystore_unpaired()) {
-    // DS-11: AP_LOCKED sirf kamyab lock par — fail ho to apIsOpen true
-    // rehta hai aur agle net_poll() par lock dobara koshish karega.
-    if (net_lock_ap_wpa2_())
-      rsh_diag_record_global(RSH_DIAG_AP_LOCKED, 1, millis());  // paired (F-01)
-    return;
-  }
-  if (keystore_pairing_open(millis())) return;
-  if (net_lock_ap_wpa2_())
-    rsh_diag_record_global(RSH_DIAG_AP_LOCKED, 0, millis());  // window expiry
-}
-
-// AP + sockets ek channel par shuru karo. Pehli pairing tak AP KHULA hai
-// (§4.2 — pairing ke baad WPA2, password per-device keystore se).
+// AP + sockets ek channel par shuru karo. AP KHULA hai jab koi password
+// stored nahi (v2.2, D6 — pehli setup / password clear ke baad), warna
+// WPA2-PSK (user-set password, keystore se).
 // keystore_begin() setup mein pehle ho chuka hona chahiye.
 static bool net_start_ap_and_sockets(uint8_t ch) {
   WiFi.mode(WIFI_AP);
-  bool open = keystore_unpaired();
+  bool open = !keystore_has_password();
   bool apOk;
-  if (open) apOk = WiFi.softAP(WIFI_SSID, (const char *)NULL, ch, 0, 4);
-  else apOk = WiFi.softAP(WIFI_SSID, keystore_password(), ch, 0, 4);
+  if (open) apOk = WiFi.softAP(net_ssid_(), (const char *)NULL, ch, 0, 4);
+  else apOk = WiFi.softAP(net_ssid_(), keystore_password(), ch, 0, 4);
   // max 4 stations: PC (data) + phone/PC browser (Web OTA) ek saath jur saken
   if (!apOk) return false;
-  apIsOpen = open;  // M-2: WPA2 AP khula nahi kehlata
 #if RSH_SET_TX_POWER
   WiFi.setTxPower(TX_POWER);   // softAP ke BAAD (vendor doc ke mutabiq)
 #endif
@@ -370,91 +290,41 @@ static bool net_start_ap_and_sockets(uint8_t ch) {
     MDNS.addService("http", "tcp", 80);
     mdnsStarted = true;
   }
-  // Pairing window SIRF pehli AP-up se 60 s (§2.3) — rescan par AP
-  // restart ho to window dobara NAHI khulti (warna window barh jati).
+  // AP-up event sirf pehli dafa (rescan restart par dobara nahi).
   static bool apUpMarked = false;
   if (!apUpMarked) {
-    keystore_mark_ap_up(millis());
     apUpMarked = true;
     rsh_diag_record_global(RSH_DIAG_AP_UP, ch, millis());
-    rsh_diag_record_global(RSH_DIAG_WINDOW_OPEN, 0, millis());  // boot 60 s window
   }
   return true;
 }
 
-// Naya session (HELO sessionFlag=1, kisi bhi transport par): nonce
-// rotate + DONO transports ke control sessions reset (§2.3/§3.2).
-// Nonce board-global hai (keystore), is liye ek transport ka naya session
-// doosre transport ke purane counters ko bhi invalid kar deta hai —
-// doosre peer ko dobara HELLO (naya session) + GET_CAPS karna hoga.
-// Yehi wajah hai ke dual-transport mein aam tor par ek waqt mein ek hi
-// transport istemal hota hai (§10).
-//
-// SEC-R2-04 (Phase 2 M-3): rate limit — jab koi authenticated session
-// active ho to naya session sirf 10 s mein ek dafa ban sakta hai.
-// Baghair is ke ek peer har packet par sessionFlag=1 bhej kar nonce
-// rotate karwa sakta hai aur doosre peer (ya khud ke purane counters)
-// ko bar bar invalid kar sakta hai — DoS. Unauthenticated peer (pairing
-// ke waqt) par limit nahi lagti, taake pehli HELLO kabhi block na ho.
-// F-05 (v4.0.2): WAHI peer jis ka purana session 2 s se zyada stale ho
-// (HELLO timeout ke baad) dobara session bana sakta hai — app restart /
-// crash recovery isi mein phans jati thi. DOOSRA peer abhi bhi 10 s ka
-// paband hai (rsh_new_session_allowed, net_logic.h).
-static void net_new_session(uint32_t nowMs, uint8_t same_ip,
-                            uint8_t old_session_stale) {
-  static uint32_t lastNewSessionMs = 0;
-  static bool haveNewSession = false;
-  if (haveNewSession &&
-      !rsh_new_session_allowed(
-          (sessionAuthenticated || serialSessionAuthenticated) ? 1 : 0,
-          (uint32_t)(nowMs - lastNewSessionMs), same_ip, old_session_stale)) {
-    return;
-  }
-  lastNewSessionMs = nowMs;
-  haveNewSession = true;
-  keystore_rotate_nonce();
+// Naya session (HELO sessionFlag=1, kisi bhi transport par): DONO
+// transports ke control sessions reset (reqId dedup cache saaf) aur
+// GET_CAPS-OK flags saaf — naye session mein stream ke liye dobara
+// GET_CAPS lazmi hai (D3).
+static void net_new_session() {
   rsh_ctrl_session_init(&ctrlSession);
   rsh_ctrl_cache_init(&ctrlCache);
-  sessionAuthenticated = false;
   rsh_ctrl_session_init(&serialCtrlSession);
   rsh_ctrl_cache_init(&serialCtrlCache);
-  serialSessionAuthenticated = false;
+  wifiCapsOk = false;
+  serialCapsOk = false;
 }
 
-// HELLO reply banao (92 B, §2.2) — Wi-Fi aur serial dono yahi istemal
-// karte hain (net_poll + net_serial_helo). Key/password sirf unpaired +
-// window ke andar (keystore_pairing_open) — window ke baad zero (§2.2).
+// HELLO reply banao (92 B, §2.2 v2.2) — Wi-Fi aur serial dono yahi istemal
+// karte hain (net_poll + net_serial_helo). Secret fields hamesha zero
+// hain (builder khud zero likhta hai). Flags: sirf bit2 safe_mode.
 // out kam az kam RSH_V2_HELLO_SIZE (92) bytes ka ho.
 static size_t net_build_hello_reply(uint8_t sessionEcho, uint8_t *out) {
   uint8_t flags = 0;
-  uint8_t zeroKey[RSH_KEY_LEN] = {0};
-  uint8_t zeroPw[RSH_PASSWORD_LEN] = {0};
-  const uint8_t *dk = zeroKey;
-  const uint8_t *pw = zeroPw;
-  if (keystore_unpaired()) {
-    flags |= RSH_V2_HELLO_UNPAIRED;
-    if (keystore_pairing_open(millis()) && keystore_key()) {
-      flags |= RSH_V2_HELLO_WINDOW_OPEN;
-      dk = keystore_key();
-      // wifi_password field sirf 24 B hai (§2.2): user ne SET_PASSWORD
-      // se lamba/chhota password set kiya ho to field ZERO rehta hai —
-      // app ke paas password pehle se hai (us ne khud set kiya tha aur
-      // DPAPI mein rakha hai), is liye kuch khota nahi. Generated
-      // password hamesha 24 chars ka hota hai (§5.1).
-      if (strlen(keystore_password()) == RSH_PASSWORD_LEN)
-        pw = (const uint8_t *)keystore_password();
-    }
-  }
-  if (keystore_key_reset_armed()) flags |= RSH_V2_HELLO_KEY_RESET;
   if (rsh_fw34_safe_mode_active()) flags |= RSH_V2_HELLO_SAFE_MODE;  // FW-3 bit2
   uint8_t mac[6];
   WiFi.softAPmacAddress(mac);
-  // Round 2 W3: version modules.h ke RSH_CAPS_FW_* constants se aati hai
-  // (FIRMWARE_VERSION "4.0.2" se match, F-12 single source) — hard-coded
-  // 4,0,0 HELLO mein ghalat version batata tha (GET_CAPS wala bug bhi yahi tha).
+  // Version modules.h ke RSH_CAPS_FW_* constants se aati hai
+  // (FIRMWARE_VERSION se match, F-12 single source).
   return rsh_v2_build_hello(out, flags, sessionEcho, mac, RSH_CAPS_FW_MAJOR,
-                            RSH_CAPS_FW_MINOR, RSH_CAPS_FW_PATCH,
-                            keystore_nonce(), dk, pw);
+                            RSH_CAPS_FW_MINOR, RSH_CAPS_FW_PATCH);
 }
 
 bool net_begin() {
@@ -462,21 +332,18 @@ bool net_begin() {
   if (!net_start_ap_and_sockets(ch)) return false;
   if (!ctrlInitDone) {
     // Session/cache/limiter sirf ek dafa init hon — net retry (Wi-Fi
-    // fail) par session reset NAHI hota (warna purane counters dobara
+    // fail) par session reset NAHI hota (warna purane reqIds dobara
     // valid ho jate). Naya session sirf HELO sessionFlag=1 ya reboot par.
     rsh_ctrl_session_init(&ctrlSession);
     rsh_ctrl_cache_init(&ctrlCache);
     rsh_ping_limiter_init(&pingLimiter);
-    // Phase G: serial control session bhi yahin init (alag counters —
-    // Wi-Fi aur serial ke (reqId, counter) pair ek doosre se takra na jayen).
+    // Phase G: serial control session bhi yahin init (alag reqIds —
+    // Wi-Fi aur serial ke reqId ek doosre se takra na jayen).
     rsh_ctrl_session_init(&serialCtrlSession);
     rsh_ctrl_cache_init(&serialCtrlCache);
-    ctrlCtx.auth_flag = &sessionAuthenticated;
-    serialCtrlCtx.auth_flag = &serialSessionAuthenticated;
     // FW-3/FW-4 handler callbacks (txn pointer har delegate par fresh).
     rsh_fw34_handler_ctx_init(&fw34Ctx, NULL);
-    fw34Ctx.key_reset_armed = fw34_armed_cb;
-    fw34Ctx.key_reset_request = fw34_key_reset_cb;
+    fw34Ctx.password_verify_current = fw34_password_verify_cb;
     fw34Ctx.password_change_request = fw34_password_cb;
     fw34Ctx.cfg_persist = fw34_persist_cb;
     fw34Ctx.now_ms = fw34_now_cb;
@@ -567,8 +434,6 @@ void net_maybe_rescan(uint32_t nowMs) {
 void net_poll() {
   // DS-11: pehle kisi failed AP restart (password/rescan) ki retry.
   net_retry_ap_restart_();
-  // M-2: pairing window guzar jaye to khula AP WPA2 par lock ho jaye.
-  net_lock_ap_after_pairing_window();
   // Per call cap: datagram flood sampler ko starve na kare (audit fix).
   // Har datagram ke baad flush() lazmi hai — core mein jab tak pichla
   // rx_buffer mojood ho, parsePacket() hamesha 0 deta hai; sirf 128 byte
@@ -601,9 +466,6 @@ void net_poll() {
     // sakta (hijack); idle board par bhi 5 s mein ek se zyada change nahi.
     uint32_t nowMs = millis();
     uint8_t sameIp = (havePc && sender == pcIp) ? 1 : 0;
-    // F-05: naya session ka faisla purane session ki staleness par hai —
-    // lastHelloMs update karne se PEHLE napo (update ke baad hamesha 0 hota).
-    uint8_t oldSessionStale = net_pc_active(nowMs) ? 0 : 1;
     if (!rsh_helo_accept(havePc ? 1 : 0, net_pc_active(nowMs) ? 1 : 0, sameIp,
                          (uint32_t)(nowMs - lastPcChangeMs))) {
       rsh_diag_record_global(RSH_DIAG_HELO_REJECT,
@@ -613,17 +475,16 @@ void net_poll() {
     if (!sameIp) {
       pcIp = sender;
       lastPcChangeMs = nowMs;
-      sessionAuthenticated = false;  // SEC-E-14: naya peer = naya session — dobara authenticate lazmi
+      wifiCapsOk = false;  // D3: naya peer = naya session — dobara GET_CAPS lazmi
     }
     havePc = true;
     lastHelloMs = nowMs;
     lastHelloProto = proto;
     if (proto != 0x02) continue;  // legacy v1: koi HELLO reply nahi (§2.1)
 
-    // Naya session: nonce rotate + control session reset (§2.3/§3.2).
-    // Routine HELO (sessionFlag 0) purana nonce wapas deta hai.
-    // F-05: same-IP + stale purana session ho to 10 s limit nahi lagti.
-    if (sessionFlag == 1) net_new_session(nowMs, sameIp, oldSessionStale);
+    // Naya session: control sessions reset + GET_CAPS-OK flags saaf (§2.3/§3.2).
+    // Routine HELO (sessionFlag 0) purana session wapas deta hai.
+    if (sessionFlag == 1) net_new_session();
 
     // HELLO reply rate limit (SEC-D-08): 250 ms mein ek se zyada nahi (F-04).
     if (!rsh_hello_reply_allowed((uint32_t)(nowMs - lastHelloReplyMs))) continue;
@@ -646,11 +507,10 @@ bool net_pc_active(uint32_t nowMs) {
   return havePc && rsh_pc_active(lastHelloMs, nowMs, HELLO_TIMEOUT_MS);
 }
 
-// SEC-E-14: session authenticated hai? (is boot mein is peer se kam az
-// kam ek HMAC-verified control command ACCEPT hua ho) + PC active ho.
-// Timeout par PC inactive hote hi false — purani authentication zinda nahi rehti.
-bool net_session_authenticated(uint32_t nowMs) {
-  return sessionAuthenticated && net_pc_active(nowMs);
+// D3: is session mein GET_CAPS OK hua ho + PC active ho. Timeout par PC
+// inactive hote hi false — purana GET_CAPS-OK zinda nahi rehta.
+bool net_caps_ok(uint32_t nowMs) {
+  return wifiCapsOk && net_pc_active(nowMs);
 }
 
 bool net_send(const uint8_t *buf, size_t len) {
@@ -661,26 +521,21 @@ bool net_send(const uint8_t *buf, size_t len) {
 }
 
 // ---- Control handler (FW-8): sirf dispatcher bulata hai, aur sirf
-// ACCEPT par (BAD_TAG / REPLAY / DUPLICATE par kabhi nahi — ctrl.h).
+// ACCEPT par (malformed / duplicate-cache-miss ke ilawa — ctrl.h).
 // GET_CAPS: live config blob se pin table (Phase G, C3 — board ki
-// table hi jeet-ti hai; fallback compiled default) + capsFlags.
+// table hi jeet-ti hai; fallback compiled default) + capsFlags. Stream
+// gate (D3): GET_CAPS OK par wifiCapsOk lagta hai (net_poll_ctrl mein).
 // REBOOT (0x09): reply ke BAAD restart (SEC-D-01 — RSTX khatam).
-// SET_CFG / COMMIT / CONFIRM / REVERT / GET_CFG (FW-4), KEY_RESET
-// (FW-3, 0x0B), SET_PASSWORD (Phase E WS5, 0x0C), FACTORY_RESET
-// (Phase 2 M-5, 0x08 — config defaults, key ko haath nahi) aur LED_TEST
-// (Phase F WS5, 0x0A): ctrl_handlers.h ko delegate (rsh_fw34_handler) —
-// txn + armed state rsh.ino se, NVS persist + clock callbacks se.
+// SET_CFG / COMMIT / CONFIRM / REVERT / GET_CFG (FW-4), SET_PASSWORD
+// (Phase E WS5, 0x0C, D3 current-password check), FACTORY_RESET
+// (Phase 2 M-5, 0x08 — config defaults, password ko haath nahi) aur
+// LED_TEST (Phase F WS5, 0x0A): ctrl_handlers.h ko delegate
+// (rsh_fw34_handler) — txn rsh.ino se, NVS persist + clock callbacks se.
 static uint8_t net_ctrl_handler(uint8_t cmd, const uint8_t *payload, uint16_t len,
                                 uint8_t *reply_body, uint16_t *reply_body_len, void *ctx) {
   (void)payload;
   (void)len;
-  // SEC-E-14: handler sirf HMAC-verified ACCEPT par chalta hai (ctrl.h:
-  // BAD_TAG / REPLAY / malformed kabhi yahan nahi pahunchte) — is liye
-  // yahan pahunchna hi is transport ki authentication hai: is ke baad hi
-  // stream emission khulti hai (rsh.ino / stream_emit.h). Kaunsa flag
-  // set ho, ye ctx batata hai (Wi-Fi ya serial — alag sessions).
   net_ctrl_ctx_t *c = (net_ctrl_ctx_t *)ctx;
-  if (c && c->auth_flag) *c->auth_flag = true;
   if (c) c->lastCmd = cmd;
   uint8_t st = RSH_CTRL_UNSUPPORTED;
   *reply_body_len = 0;
@@ -690,8 +545,7 @@ static uint8_t net_ctrl_handler(uint8_t cmd, const uint8_t *payload, uint16_t le
     case RSH_CMD_COMMIT:
     case RSH_CMD_CONFIRM:
     case RSH_CMD_REVERT:
-    case RSH_CMD_FACTORY_RESET:  // Phase 2 M-5: config defaults, key untouched
-    case RSH_CMD_KEY_RESET:
+    case RSH_CMD_FACTORY_RESET:  // Phase 2 M-5: config defaults, password untouched
     case RSH_CMD_SET_PASSWORD:  // Phase E WS5: fw34_password_cb -> deferred NVS + AP restart
     case RSH_CMD_LED_TEST: {    // Phase F WS5: LED_TEST 0x0A — pattern validate;
       // Phase H WS2: driver hai (led_test_request = adapter, net_begin
@@ -713,14 +567,14 @@ static uint8_t net_ctrl_handler(uint8_t cmd, const uint8_t *payload, uint16_t le
     }
     case RSH_CMD_GET_DIAG: {
       // F-10 (v4.0.2): diagnostics snapshot — boot reason, heap min,
-      // pairing window baqi waqt, ring-log events (diag_log.h layout).
-      // Koi secret nahi (sirf codes + numeric values). Len != 0 → UNSUPPORTED.
+      // reserved field (hamesha 0, D10), ring-log events (diag_log.h
+      // layout). Koi secret nahi (sirf codes + numeric values).
+      // Len != 0 → UNSUPPORTED.
       if (len != 0) {
         st = RSH_CTRL_UNSUPPORTED;
         break;
       }
-      uint16_t win_s = keystore_window_remaining_s(millis());
-      size_t n = rsh_diag_build_body(rsh_diag_log(), win_s, reply_body,
+      size_t n = rsh_diag_build_body(rsh_diag_log(), 0, reply_body,
                                      RSH_V2_CTRL_MAX_PAYLOAD - 1);
       if (n == 0) {
         st = RSH_CTRL_UNSUPPORTED;
@@ -764,8 +618,6 @@ static uint8_t net_ctrl_handler(uint8_t cmd, const uint8_t *payload, uint16_t le
       uint8_t mac[6];
       WiFi.softAPmacAddress(mac);
       uint8_t flags = 0;
-      if (keystore_unpaired()) flags |= 0x04;  // capsFlags bit2 unpaired (§3.4)
-      if (keystore_key_reset_armed()) flags |= 0x08;  // bit3 keyResetArmed (FW-3)
       if (rsh_fw34_safe_mode_active()) flags |= 0x02;  // bit1 safeMode (FW-3)
       uint8_t caps[18 + 8 * 40];
       size_t total = rsh_caps_build_body(caps, sizeof(caps), mac, net_channel(),
@@ -805,7 +657,7 @@ static size_t net_ping_build_reply(const uint8_t *req, int len, uint32_t srcKey,
   // L1: magic check SHARED hai — UDP demux (neeche, "RSHN" check) aur
   // serial rasta (net_serial_ping — frame kind se aata hai, payload ka
   // magic nahi dekhta) dono yahin se guzarte hain. Baghair "RSHN" magic
-  // ke frame drop (PROTOCOL-V2.1 §9: magic bytes 0-3).
+  // ke frame drop (PROTOCOL-V2.2 §9: magic bytes 0-3).
   if (len != 34 || memcmp(req, "RSHN", 4) != 0 || req[4] != RSH_V2_VERSION || req[5] != 0) {
     pingDropped++;
     return 0;
@@ -847,20 +699,17 @@ static void handle_ping(const uint8_t *req, int len, const IPAddress &sender,
 
 // SET_PASSWORD ke baad AP restart (§5.2): naya password AP + WebOTA
 // dono par laagu hota hai. Full ESP.restart NAHI — sirf AP restart,
-// taake session (key/nonce/counters) aur stream state barqarar rahe.
+// taake session (reqId dedup) aur stream state barqarar rahe.
 // Password set karne ka matlab hai user ne AP lock kar diya: restart
-// hamesha WPA2 hota hai (khula AP sirf pairing se pehle hota hai, §4.2).
-// Pairing window dobara NAHI khulti (apUpMarked guard
-// net_start_ap_and_sockets mein hai — ye function use nahi karta).
-// Connected clients drop honge — dobara naye password se join karna hoga.
-// DS-11: bool return — fail ho to caller (deferred action) retry
-// flag ke zariye net_poll() retry karwata hai; apIsOpen sirf kamyabi
-// par false hota hai (pehle unconditional tha).
+// hamesha WPA2 hota hai (khula AP sirf password set hone se pehle hota
+// hai, §4.2). Connected clients drop honge — dobara naye password se
+// join karna hoga. DS-11: bool return — fail ho to caller (deferred
+// action) retry flag ke zariye net_poll() retry karwata hai.
 static bool net_restart_ap_with_new_password() {
   udpHello.stop();
   udpCtrl.stop();
   WiFi.softAPdisconnect(true);
-  if (!WiFi.softAP(WIFI_SSID, keystore_password(), currentChannel, 0, 4)) {
+  if (!WiFi.softAP(net_ssid_(), keystore_password(), currentChannel, 0, 4)) {
     rsh_diag_record_global(RSH_DIAG_AP_RESTART_FAIL, 1, millis());
     net_request_ap_restart_retry_(currentChannel);
     return false;
@@ -870,7 +719,6 @@ static bool net_restart_ap_with_new_password() {
     net_request_ap_restart_retry_(currentChannel);
     return false;
   }
-  apIsOpen = false;  // M-2: password set ke baad AP hamesha WPA2 hai
   // udpData send-only hai (begin nahi hota) — dobara begin ki zaroorat nahi.
   // WebOTA auth har request par keystore_password() se hoti hai, is liye
   // naya password WebOTA par foran laagu hai (A7 par real board par verify).
@@ -878,24 +726,12 @@ static bool net_restart_ap_with_new_password() {
 }
 
 // Deferred actions — reply bhejne KE BAAD (SEC-D-01 pattern):
-// HMAC KEY_RESET (rotate + restart), SET_PASSWORD (NVS + AP restart),
-// REBOOT (restart). UDP (net_poll_ctrl) aur serial (net_serial_after_reply)
-// dono yahin se chalate hain — flags clear hote hain, is liye dobara
-// call mehfooz hai (koi double action nahi).
+// SET_PASSWORD (NVS + AP restart), REBOOT (restart). UDP
+// (net_poll_ctrl) aur serial (net_serial_after_reply) dono yahin se
+// chalate hain — flags clear hote hain, is liye dobara call mehfooz hai
+// (koi double action nahi).
 static void net_run_deferred_actions() {
-  // HMAC KEY_RESET: reply bhejne KE BAAD credentials rotate karo (nayi
-  // key+password NVS mein, unpaired), phir restart — naye boot par open
-  // AP + nayi pairing window (§4.4). Rotate fail ho to restart NAHI
-  // (fail closed — purani key rehti hai; armed window expiry par
-  // normal reboot hota hai). REBOOT wala deferred pattern (SEC-D-01).
-  if (keyResetPending) {
-    keyResetPending = false;
-    if (keystore_key_reset()) {
-      delay(50);
-      ESP.restart();
-    }
-  }
-  // HMAC SET_PASSWORD: reply bhejne KE BAAD NVS write + AP restart
+  // SET_PASSWORD: reply bhejne KE BAAD NVS write + AP restart
   // (§5.2 — reply OK restart se PEHLE jata hai). NVS fail ho to AP
   // restart NAHI (fail closed — purana password rehta hai). Pending
   // buffer hamesha saaf karo (password RAM mein na rahe).
@@ -910,7 +746,7 @@ static void net_run_deferred_actions() {
       net_restart_ap_with_new_password();
     }
   }
-  // HMAC REBOOT: reply bhejne ke BAAD restart (SEC-D-01).
+  // REBOOT: reply bhejne ke BAAD restart (SEC-D-01).
   if (rebootPending) {
     rebootPending = false;
     delay(50);
@@ -918,12 +754,12 @@ static void net_run_deferred_actions() {
   }
 }
 
-// FW-8 control channel (SEC-D-06): port 4212 par asal dispatcher.
+// FW-8 control channel (v2.2): port 4212 par asal dispatcher.
 // Demux magic se: "RSHN" = ping (§9), "RSHC" = control (§3), baqi drop.
 // Control sirf HELO wale peer (pcIp) se — ya jab koi peer abhi na ho
-// (pairing se pehle GET_CAPS ke liye HELO lazmi hai, lekin pehla HELO
-// aane se pehle control ko poori tarah band karna pairing rok dega).
-// Ping is pabandi se bahar hai (§9.5: pairing/HELO se pehle bhi chale).
+// (pehla HELO aane se pehle control ko poori tarah band karna first
+// connect rok dega). Ping is pabandi se bahar hai (§9.5: HELO se pehle
+// bhi chale).
 void net_poll_ctrl() {
   for (int i = 0; i < 8; i++) {
     int n = udpCtrl.parsePacket();
@@ -940,29 +776,24 @@ void net_poll_ctrl() {
     }
     if (memcmp(rxBuf, "RSHC", 4) != 0) continue;  // unknown magic → drop
     if (havePc && !(sender == pcIp)) continue;    // sirf HELO wala peer
-    if (!keystore_key() || !keystore_nonce()) continue;  // keystore down → fail closed
 
     static uint8_t replyBuf[RSH_V2_CTRL_MAX_FRAME + 8];
     size_t replyLen = 0;
     rsh_ctrl_disp_t d = rsh_ctrl_dispatch(
-        rxBuf, (size_t)len, keystore_key(), keystore_nonce(), net_hmac16,
+        rxBuf, (size_t)len,
         &ctrlSession, &ctrlCache, net_ctrl_handler, &ctrlCtx,
         replyBuf, sizeof(replyBuf), &replyLen);
     if (d != RSH_CTRL_DISP_REPLY) continue;
-    // GET_CAPS OK par pairing complete (§3 step 7): ab HELLO mein key nahi.
-    if (ctrlCtx.lastCmd == RSH_CMD_GET_CAPS && ctrlCtx.lastStatus == RSH_CTRL_OK) {
-      uint8_t wasUnpaired = keystore_unpaired() ? 1 : 0;
-      keystore_mark_paired();
-      if (wasUnpaired)
-        rsh_diag_record_global(RSH_DIAG_PAIRED, 0, millis());
-    }
+    // D3 stream gate: GET_CAPS OK par is session mein stream khulta hai.
+    if (ctrlCtx.lastCmd == RSH_CMD_GET_CAPS && ctrlCtx.lastStatus == RSH_CTRL_OK)
+      wifiCapsOk = true;
     if (udpData.beginPacket(sender, senderPort)) {
       udpData.write(replyBuf, replyLen);
       txStats.record(udpData.endPacket() == 1);
     } else {
       txStats.record(false);
     }
-    // Reply bhejne ke baad deferred actions (KEY_RESET / SET_PASSWORD / REBOOT).
+    // Reply bhejne ke baad deferred actions (SET_PASSWORD / REBOOT).
     net_run_deferred_actions();
   }
 }
@@ -971,24 +802,21 @@ void net_poll_ctrl() {
 // Wired USB-serial transport (Phase G, D26 / OPEN-20 — net.h dekho).
 //
 // Serial peer Wi-Fi peer se ALAG session hai (apna HELO timer, apna
-// control session/cache, apna SEC-E-14 auth flag). Framing
+// control session/cache, apna GET_CAPS-OK flag). Framing
 // (serial_transport.h) serial_link.cpp ki taraf hai — yahan sirf wohi
-// logic hai jo Wi-Fi path se share hoti hai (HELLO build, HMAC dispatch,
-// ping reply, deferred actions). Nonce/key keystore se shared hain.
+// logic hai jo Wi-Fi path se share hoti hai (HELLO build, plain
+// dispatch, ping reply, deferred actions).
 // ============================================================================
 
 void net_serial_begin() {
-  // Idempotent: serial control session/cache + ctx auth flag. net_begin
-  // ke ctrlInitDone block mein bhi yehi init hota hai (dobara init
+  // Idempotent: serial control session/cache init. net_begin ke
+  // ctrlInitDone block mein bhi yehi init hota hai (dobara init
   // memset hai — mehfooz). Zero-init BSS bhi session ke liye kaafi hota
-  // (rsh_ctrl_session_init sirf memset hai), lekin auth_flag pointer
-  // lazmi set hona chahiye — warna handler kisi flag ko set nahi karta
-  // aur SEC-E-14 gate kabhi nahi khulta.
+  // (rsh_ctrl_session_init sirf memset hai).
   static bool serialInitDone = false;
   if (serialInitDone) return;
   rsh_ctrl_session_init(&serialCtrlSession);
   rsh_ctrl_cache_init(&serialCtrlCache);
-  serialCtrlCtx.auth_flag = &serialSessionAuthenticated;
   serialInitDone = true;
 }
 
@@ -1001,19 +829,15 @@ bool net_serial_pc_is_v2(uint32_t nowMs) {
   return serialHavePc && serialLastHelloProto == 0x02;
 }
 
-// SEC-E-14 (serial): is session mein HMAC-verified control ACCEPT hua ho
-// + serial peer active ho. Timeout par PC inactive hote hi false.
-bool net_serial_session_authenticated(uint32_t nowMs) {
-  return serialSessionAuthenticated && net_serial_pc_active(nowMs);
+// D3 (serial): is session mein GET_CAPS OK hua ho + serial peer active ho.
+// Timeout par PC inactive hote hi false.
+bool net_serial_caps_ok(uint32_t nowMs) {
+  return serialCapsOk && net_serial_pc_active(nowMs);
 }
 
 // Serial HELO (serial frame kind=HELO ki payload, §2.1) → HELLO reply
 // (92 B, §2.2) hello_out mein, ya 0 (legacy v1 HELO — koi reply nahi;
 // ghalat proto/sessionFlag — ignore; rate limit — khamoshi).
-// F-03 (v4.0.2): serial HELO unpaired board par pairing window ON-DEMAND
-// kholta hai (120 s, har HELO par refresh) — USB cable physical access
-// mangta hai, is liye wired pairing Wi-Fi pairing se kamzor nahi. AP-up
-// clock par munhasir NAHI (purana rule: window sirf boot ke 60 s).
 size_t net_serial_helo(const uint8_t *helo, size_t len, uint32_t nowMs,
                        uint8_t *hello_out) {
   if (!helo || !hello_out) return 0;
@@ -1032,20 +856,11 @@ size_t net_serial_helo(const uint8_t *helo, size_t len, uint32_t nowMs,
   }
   // Serial point-to-point hai — IP takeover ka sawal hi nahi (SEC-D-08
   // sirf Wi-Fi AP par laagu hai). Har HELO peer ko active karta hai.
-  // F-05: staleness lastHello update se PEHLE napo.
-  uint8_t oldSessionStale = net_serial_pc_active(nowMs) ? 0 : 1;
-  // F-03: unpaired board par har serial HELO window kholta/refresh karta hai.
-  if (keystore_unpaired()) {
-    uint8_t wasOpen = keystore_pairing_open(nowMs) ? 1 : 0;
-    keystore_open_pair_window(nowMs);
-    if (!wasOpen)
-      rsh_diag_record_global(RSH_DIAG_WINDOW_OPEN, 2, nowMs);  // serial
-  }
   serialHavePc = true;
   serialLastHelloMs = nowMs;
   serialLastHelloProto = proto;
   if (proto != 0x02) return 0;  // legacy v1: koi HELLO reply nahi (§2.1)
-  if (sessionFlag == 1) net_new_session(nowMs, 1, oldSessionStale);  // naya nonce + dono sessions reset
+  if (sessionFlag == 1) net_new_session();  // naya session — dono sessions reset
   // HELLO reply rate limit (SEC-D-08 jaisa): 250 ms mein ek se zyada nahi (F-04).
   if (!rsh_hello_reply_allowed((uint32_t)(nowMs - serialLastHelloReplyMs))) return 0;
   serialLastHelloReplyMs = nowMs;
@@ -1053,25 +868,20 @@ size_t net_serial_helo(const uint8_t *helo, size_t len, uint32_t nowMs,
 }
 
 // Serial control frame dispatch — Wi-Fi path (net_poll_ctrl) jaisa hi:
-// structure → HMAC verify → session classify → handler (sirf ACCEPT par).
+// structure + CRC parse → reqId classify → handler (sirf ACCEPT par).
 // Reply reply_out mein (RSH_V2_CTRL_MAX_FRAME bytes ka buffer chahiye).
-// GET_CAPS OK par pairing complete (§3 step 7): ab HELLO mein key nahi.
+// GET_CAPS OK par serial stream gate khulta hai (D3).
 bool net_serial_dispatch_control(const uint8_t *frame, size_t len,
                                  uint8_t *reply_out, size_t reply_out_len,
                                  size_t *reply_len_out) {
-  if (!keystore_key() || !keystore_nonce()) return false;  // keystore down → fail closed
   rsh_ctrl_disp_t d = rsh_ctrl_dispatch(
-      frame, len, keystore_key(), keystore_nonce(), net_hmac16,
+      frame, len,
       &serialCtrlSession, &serialCtrlCache, net_ctrl_handler, &serialCtrlCtx,
       reply_out, reply_out_len, reply_len_out);
   if (d != RSH_CTRL_DISP_REPLY) return false;
   if (serialCtrlCtx.lastCmd == RSH_CMD_GET_CAPS &&
-      serialCtrlCtx.lastStatus == RSH_CTRL_OK) {
-    uint8_t wasUnpaired = keystore_unpaired() ? 1 : 0;
-    keystore_mark_paired();
-    if (wasUnpaired)
-      rsh_diag_record_global(RSH_DIAG_PAIRED, 0, millis());
-  }
+      serialCtrlCtx.lastStatus == RSH_CTRL_OK)
+    serialCapsOk = true;
   return true;
 }
 
@@ -1082,8 +892,8 @@ size_t net_serial_ping(const uint8_t *req, int len, uint8_t *reply_out) {
   return net_ping_build_reply(req, len, RSH_SERIAL_PING_KEY, reply_out);
 }
 
-// Serial reply bhejne KE BAAD deferred actions (REBOOT/KEY_RESET/
-// SET_PASSWORD) — net_poll_ctrl wala hi rasta (flags clear hote hain).
+// Serial reply bhejne KE BAAD deferred actions (REBOOT/SET_PASSWORD) —
+// net_poll_ctrl wala hi rasta (flags clear hote hain).
 void net_serial_after_reply() {
   net_run_deferred_actions();
 }

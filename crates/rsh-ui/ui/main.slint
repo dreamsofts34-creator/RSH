@@ -27,7 +27,7 @@ import { ExtrasScreen } from "screens/extras.slint";
 import { ProfilePopover, ProfileItem } from "screens/profile_popover.slint";
 import { GameDialog } from "screens/game_dialog.slint";
 // Compare-fix: the full Settings screen (screens/settings.slint)
-// replaces the shell placeholder — Reconnect, pairing-window text,
+// replaces the shell placeholder — Reconnect, connect-hint text,
 // Duplicate/Use, Restore and per-item Check buttons only exist there.
 // SetupWizard likewise replaces the shell layout while setup runs.
 import { SettingsScreen, ProfileRow } from "screens/settings.slint";
@@ -82,7 +82,7 @@ export component MainWindow inherits Window {
     in property <bool> buttons-listening: false;
     in property <string> profile-name: "GT3 Sprint";
     in property <string> auto-profile-text: "No profile yet";
-    in property <string> app-version: "2.0.5";
+    in property <string> app-version: "2.0.6";
     in property <bool> daemon-live: false;
     // B5 (v2.0.2): the global busy strip reads these — Rust drives
     // them from busy_jobs (each start_*_job records its label, the
@@ -111,10 +111,13 @@ export component MainWindow inherits Window {
     // (1 Hz tick). Empty = hidden.
     in-out property <string> toast-title: "";
     in-out property <string> toast-text: "";
+    // D17: "error" (error-accent border) or "success" (ok-accent
+    // border) — same 480 px card, set by Rust's set_toast /
+    // set_toast_success. Empty toast-text hides the card.
+    in-out property <string> toast-kind: "error";
     // B5 spinner step (0..11, driven by the strip's Timer).
     property <int> spin-step: 0;
     in property <bool> connected: true;
-    in property <bool> paired: true;
     in property <string> conn-label: "Disconnected";
     in property <string> conn-sub: "Not connected";
     in property <angle> steer-angle;
@@ -231,6 +234,15 @@ export component MainWindow inherits Window {
     in property <string> app-update-text: "Auto-update is off — new versions are on GitHub Releases";
     in property <string> backup-text: "No backups yet";
     in property <[ProfileRow]> settings-profiles;
+    // D19: Wi-Fi password state (Settings "Connection" card).
+    in property <bool> wifi-password-set: false;
+    in property <string> wifi-password-error: "";
+    in property <string> wifi-password-message: "";
+    in property <bool> wifi-password-busy: false;
+    in-out property <string> wifi-password-new: "";
+    in-out property <string> wifi-password-confirm: "";
+    callback set-wifi-password();
+    callback forget-wifi-password();
     // Profile popover (A8): Rust-owned model, opened from the top-bar
     // ProfileButton and the Overview profile box.
     in-out property <bool> popover-open: false;
@@ -255,40 +267,31 @@ export component MainWindow inherits Window {
     in-out property <int> setup-step: 0; // A15: setup starts at Connect
     // Wizard live state (v2.0.1 hotfix): Rust drives these from the
     // AppApi — connect-done from the live connection's reachability
-    // (R2-19: Hello / Authenticating / Active — LinkUp alone does
-    // not prove the board is there), paired from
-    // PairingFinished events, centre/pedals-done from the calibration
-    // backend, pair countdown from PairingWindow events, ring arc
-    // from seconds-left/total, drivers from vjoy_status().
+    // (D15: board_reachable latch or Active — LinkUp alone does
+    // not prove the board is there), centre/pedals-done from the
+    // calibration backend, drivers from vjoy_status().
     in-out property <bool> setup-connect-done: false;
     // R2-19: why step 0 cannot advance (connection-error hint, or
     // "RSH isn't running" while the daemon is down) — shown on the
     // Connect step, which used to show no error at all.
     in-out property <string> setup-connect-hint: "";
-    // R2-51: the board already has a stored key — the Pair step
-    // offers to replace it, naming the board MAC.
-    in-out property <bool> setup-replace-required: false;
-    in-out property <string> setup-replace-board-mac: "";
-    in-out property <bool> setup-paired: false;
     in-out property <bool> setup-centre-done: false;
     in-out property <bool> setup-pedals-done: false;
-    in-out property <int> setup-pair-seconds-left: 120;
-    in-out property <int> setup-pair-total: 120;
-    in-out property <string> setup-ring-commands: "";
-    in-out property <string> setup-pair-status: "Waiting for the wheel…";
-    in-out property <string> setup-pair-error: "";
-    in-out property <bool> setup-pairing-active: false;
-    // DS-67: true while the board rejoins Wi-Fi with the new
-    // password after a successful pairing — the wizard says
-    // "rejoining" instead of claiming the wheel is connected.
-    in-out property <bool> setup-rejoining: false;
-    // H-5 (v2.0.2): true when the board is already paired to another
-    // key and re-pairing needs the BOOT reset — Rust sets this from
-    // pairing_status().replacement_required (main.rs, reconnect flow).
-    in-out property <bool> setup-reset-required: false;
     in-out property <int> setup-transport: 0; // 0 Wi-Fi, 1 USB
     in-out property <bool> setup-wifi-joined: false;
     in-out property <bool> setup-usb-available: false;
+    // D16: Wi-Fi scan/join state for Step 1 (the card performs the
+    // join via the daemon) + vJoy install progress for Step 2
+    // (-1 = indeterminate, `setup-vjoy-elapsed` carries "m:ss")
+    // + live pedal levels for the Calibrate step's pedal graphs.
+    in-out property <string> setup-wifi-ssid: "";
+    in-out property <bool> setup-wifi-joining: false;
+    in-out property <string> setup-wifi-error: "";
+    in-out property <int> setup-vjoy-progress: -1;
+    in-out property <string> setup-vjoy-elapsed: "";
+    in-out property <float> setup-live-throttle: 0;
+    in-out property <float> setup-live-brake: 0;
+    in-out property <float> setup-live-clutch: 0;
     // L-2 (v2.0.2): live board address from connection().address —
     // Rust sets this in sync_overview (where the address is already
     // computed); empty/unknown renders as "—" in the wizard.
@@ -379,15 +382,6 @@ export component MainWindow inherits Window {
     callback output-backend-selected(int);
     callback autostart-selected(bool);
     callback run-setup-again();
-    // H2 (v2.0.2): the Overview "Pair now" banner fires this — Rust
-    // opens the wizard at the Pair step (open_pair_wizard). The old
-    // handler just switched to the Settings page (a dead end).
-    // Rust wiring pending (FC: on_pair_now_requested).
-    callback pair-now-requested();
-    // Phase 2 (RC-3): the Overview "Replace pairing" banner fires
-    // this — Rust runs confirm_replace_pairing_flow directly,
-    // without opening the wizard first.
-    callback replace-pairing-requested();
     // Phase 2 (Wi-Fi gap): the Overview disconnected banner names
     // the fix while the daemon's last activation error is
     // Unreachable (set from sync_overview).
@@ -427,21 +421,23 @@ export component MainWindow inherits Window {
     // Theme persist (v2.0.1 hotfix, A8 in v2.0.2): Rust writes the choice to the
     // <data_dir>/ui-theme file ("Dark"/"Light"/"Auto").
     callback theme-persist(int);
-    // Setup wizard (compare-fix): Rust owns step advance/finish;
-    // begin-pairing etc. are stubs until the Pairing Manager lands.
+    // Setup wizard (compare-fix): Rust owns step advance/finish.
     callback setup-back();
     callback setup-next();
     callback setup-skip();
-    callback setup-begin-pairing();
-    callback setup-use-usb();
-    callback setup-retry-pairing();
-    callback setup-reset-pairing();
-    callback setup-confirm-replace();
-    callback setup-cancel-replace();
     callback setup-connect(string);
     callback setup-calibrate(string);
     callback setup-install-vjoy();
     callback setup-use-hidmaestro();
+    // D17: small confirm dialog for destructive actions (delete
+    // profile, remove game) — 360 px card, same pattern as the
+    // GameDialog. Rust owns the pending action; Yes runs it.
+    in-out property <bool> confirm-open: false;
+    in property <string> confirm-title: "";
+    in property <string> confirm-text: "";
+    in property <string> confirm-confirm-label: "Delete";
+    callback confirm-yes();
+    callback confirm-no();
     // Manual games (no auto-scan): open the add/edit dialog,
     // remove a game, and the dialog's own save / cancel / profile
     // cycling. Wired in Rust (wire_game_dialog in src/main.rs).
@@ -618,7 +614,6 @@ export component MainWindow inherits Window {
                 daemon-error: daemon-error;
                 busy-kind: busy-kind;
                 connected: connected;
-                paired: paired;
                 firmware-line: firmware-line;
                 delay-text: delay-text;
                 jitter-text: jitter-text;
@@ -639,14 +634,7 @@ export component MainWindow inherits Window {
                 add-game => { add-game(); }
                 edit-game(g) => { edit-game(g); }
                 remove-game(g) => { remove-game(g); }
-                // H2: open the Pair wizard, don't just show Settings.
-                pair-now => { pair-now-requested(); }
-                // Phase 2 (RC-3): Replace pairing straight from the
-                // Overview banner — no wizard detour.
-                replace-required: setup-replace-required;
-                replace-board-mac: setup-replace-board-mac;
                 unreachable: overview-unreachable;
-                replace-pairing => { replace-pairing-requested(); }
             }
             if page == 1 : SteeringPage {
                 busy-kind: busy-kind;
@@ -822,7 +810,14 @@ export component MainWindow inherits Window {
                 // carried no payload, so Rust could never save it).
                 address-accepted(a) => { address-accepted(a); }
                 reconnect => { reconnect(); }
-                pair-requested => { settings-action("pair"); }
+                wifi-password-set: wifi-password-set;
+                wifi-password-error: wifi-password-error;
+                wifi-password-message: wifi-password-message;
+                wifi-password-busy: wifi-password-busy;
+                wifi-password-new <=> wifi-password-new;
+                wifi-password-confirm <=> wifi-password-confirm;
+                set-wifi-password => { set-wifi-password(); }
+                forget-wifi-password => { forget-wifi-password(); }
                 backend-selected(i) => { output-backend-selected(i); }
                 toggled-start-windows(b) => { autostart-selected(b); }
                 // M-7: forward the new switch state, don't drop it.
@@ -862,24 +857,16 @@ export component MainWindow inherits Window {
         step: setup-step;
         daemon-live: daemon-live;
         busy-kind: busy-kind;
-        rejoining: setup-rejoining;
         connect-done: setup-connect-done;
         connect-hint: setup-connect-hint;
-        paired: setup-paired;
         centre-done: setup-centre-done;
         pedals-done: setup-pedals-done;
-        pair-seconds-left: setup-pair-seconds-left;
-        pair-total: setup-pair-total;
-        ring-commands: setup-ring-commands;
-        pair-status: setup-pair-status;
-        pair-error: setup-pair-error;
-        pairing-active: setup-pairing-active;
-        reset-required: setup-reset-required;
-        replace-required: setup-replace-required;
-        replace-board-mac: setup-replace-board-mac;
         transport: setup-transport;
         wifi-joined: setup-wifi-joined;
         usb-available: setup-usb-available;
+        wifi-ssid: setup-wifi-ssid;
+        wifi-joining: setup-wifi-joining;
+        wifi-error: setup-wifi-error;
         // L-2: live address ("" until Rust sets it) — the wizard
         // shows "—" while unconnected, never a hardcoded default.
         address: setup-address == "" ? "—" : setup-address;
@@ -887,22 +874,21 @@ export component MainWindow inherits Window {
         games-done: setup-games-done;
         vjoy-installed: setup-vjoy-installed;
         vjoy-installing: setup-vjoy-installing;
+        vjoy-progress: setup-vjoy-progress;
+        vjoy-elapsed: setup-vjoy-elapsed;
         vjoy-version: setup-vjoy-version;
         vjoy-error: setup-vjoy-error;
         vjoy-fallback: setup-vjoy-fallback;
         calibration-available: setup-calibration-available;
         calibration-reason: setup-calibration-reason;
+        live-throttle: setup-live-throttle;
+        live-brake: setup-live-brake;
+        live-clutch: setup-live-clutch;
         back => { setup-back(); }
         next => { setup-next(); }
         skip => { setup-skip(); }
         install-vjoy => { setup-install-vjoy(); }
         use-hidmaestro => { setup-use-hidmaestro(); }
-        begin-pairing => { setup-begin-pairing(); }
-        use-usb => { setup-use-usb(); }
-        retry-pairing => { setup-retry-pairing(); }
-        reset-pairing => { setup-reset-pairing(); }
-        confirm-replace => { setup-confirm-replace(); }
-        cancel-replace => { setup-cancel-replace(); }
         connect-action(a) => { setup-connect(a); }
         calibrate-action(a) => { setup-calibrate(a); }
         add-game => { add-game(); }
@@ -964,6 +950,36 @@ export component MainWindow inherits Window {
         cancel => { game-dialog-cancel(); }
         cycle-profile => { game-dialog-cycle-profile(); }
     }
+    // D17: small confirm dialog for destructive actions (delete
+    // profile, remove game) — 360 px card, GameDialog pattern:
+    // backdrop + click-away closes it, Esc closes it (keyboard
+    // worker), Yes runs the pending action, No cancels. No
+    // destructive action runs without this confirm any more.
+    if confirm-open : Rectangle {
+        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        background: #000000; opacity: 0.35;
+        TouchArea { width: parent.width; height: parent.height; clicked => { confirm-no(); } }
+    }
+    if confirm-open : Rectangle {
+        x: parent.width - 380px;
+        y: 64px;
+        width: 360px;
+        border-radius: 14px;
+        border-width: 1px;
+        border-color: Theme.line;
+        background: Theme.panel;
+        VerticalLayout {
+            padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
+            spacing: 10px;
+            Text { text: confirm-title; font-size: 12.5px; font-weight: 600; color: Theme.text; wrap: word-wrap; }
+            Text { text: confirm-text; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
+            HorizontalLayout {
+                spacing: 6px;
+                Btn { label: confirm-confirm-label; primary: true; clicked => { confirm-yes(); } }
+                Btn { label: "Cancel"; clicked => { confirm-no(); } }
+            }
+        }
+    }
     // DS-24 (U-06): transient failure toast — Phase 2 (F-1 / U-2):
     // a centred ~480 px top-middle card per UI-DESIGN §6, NOT a
     // full-content-width banner: the old full-width toast covered
@@ -981,8 +997,8 @@ export component MainWindow inherits Window {
         min-height: 52px;
         border-radius: 8px;
         border-width: 1px;
-        border-color: Theme.bad;
-        background: Theme.err-bg;
+        border-color: toast-kind == "success" ? Theme.ok : Theme.bad;
+        background: toast-kind == "success" ? Theme.ok-bg : Theme.err-bg;
         HorizontalLayout {
             padding-left: 12px;
             padding-right: 12px;
@@ -992,7 +1008,7 @@ export component MainWindow inherits Window {
             VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 2px;
-                Text { text: toast-title; font-size: 12.5px; font-weight: 600; color: Theme.bad; wrap: word-wrap; }
+                Text { text: toast-title; font-size: 12.5px; font-weight: 600; color: toast-kind == "success" ? Theme.ok : Theme.bad; wrap: word-wrap; }
                 Text { text: toast-text; font-size: 12px; color: Theme.text; wrap: word-wrap; }
             }
             Text { text: "✕"; font-size: 12px; color: Theme.faint; vertical-alignment: center; }
@@ -1000,7 +1016,7 @@ export component MainWindow inherits Window {
         TouchArea {
             width: parent.width;
             height: parent.height;
-            clicked => { toast-text = ""; toast-title = ""; }
+            clicked => { toast-text = ""; toast-title = ""; toast-kind = "error"; }
         }
     }
     // Phase 2 (F-2 / U-1): backdrop + click-away for the

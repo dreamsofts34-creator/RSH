@@ -11,10 +11,6 @@
 // Safe mode active hai? (HELLO flags bit2 + GET_CAPS capsFlags bit1.)
 uint8_t rsh_fw34_safe_mode_active(void);
 
-// Key-reset-armed hai? (BOOT-hold >= 10 s, 120 s window ke andar.)
-// HELLO/GET_CAPS flags + KEY_RESET gate — yahi ek source of truth hai.
-uint8_t rsh_fw34_key_reset_armed(void);
-
 // Live config transaction (rsh.ino ka cfgTxn). FW-8 handler is par
 // stage/commit/confirm/revert chalata hai.
 rsh_cfg_txn_t *rsh_fw34_cfg_txn(void);

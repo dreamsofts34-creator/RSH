@@ -1,9 +1,17 @@
 //! Scenario registry — the 26 C# rig scenarios plus `emit-200hz`
-//! (H-2, the 200 Hz coalescing probe) plus the 3 Phase-2 pairing
-//! scenarios (`pairing-window-open`, `pairing-window-expired`,
-//! `pairing-unreachable` — contract-only, duration 0), same IDs,
+//! (H-2, the 200 Hz coalescing probe) plus the 7 connect-play
+//! scenarios (`connect-open-ap`, `connect-password-set`,
+//! `connect-password-reconnect`, `connect-key-reset-open`,
+//! `connect-usb`, `connect-migration-402-403`,
+//! `connect-unreachable` — contract-only, duration 0), same IDs,
 //! same durations, same assertion shapes (`TESTING-INPUT.md` §8.4,
 //! `test-env/scenarios/scenarios.json` v1).
+//!
+//! v2.2 note: pairing is gone (no-pairing redesign, app v2.0.6 /
+//! firmware v4.0.3 / protocol v2.2). The old Phase-2 pairing
+//! scenarios (`pairing-window-open`, `pairing-window-expired`,
+//! `pairing-unreachable`) and `gate-pairing-long-call` were deleted;
+//! the connect-play scenarios above replace them.
 //!
 //! # Rust adaptations (all deliberate, all documented here)
 //!
@@ -29,9 +37,11 @@
 //!   `>= 32000`, `>= 30000`) apply unchanged.
 //! * `wheelCtrlAccepted` is the wheel-side auth-gate count: the rig's
 //!   virtual wheel opens its stream gate only after a real
-//!   HMAC-verified `GET_CAPS`. This is the rig's mirror of SEC-E-14;
-//!   the app-side session gate is still open (Phase G condition 13)
-//!   and is H1's to cover — the rig does not claim otherwise.
+//!   `GET_CAPS` (protocol v2.2: plain — the HMAC gate is gone, the
+//!   stream gate is "≥1 `GET_CAPS` OK"). This is the rig's mirror of
+//!   SEC-E-14; the app-side session gate is still open (Phase G
+//!   condition 13) and is H1's to cover — the rig does not claim
+//!   otherwise.
 
 use crate::metrics::{Assertion, MetricValue};
 use crate::wheel::{Fault, WheelConfig, WheelKind};
@@ -1132,15 +1142,19 @@ pub fn registry() -> Vec<Scenario> {
                 ),
             ],
         },
-        // Phase 2 (V2-PHASE-2-GATE): pairing/window scenarios (Phase 0
-        // §4.4 gap — the rig had no pairing scenario). Contract-only
-        // self-checks over the L1 Connection Manager: window-open
-        // pairing succeeds, window-expired pairing fails closed with
-        // the typed reason, board-unreachable fails closed with a
+        // Connect-play scenarios (protocol v2.2, no-pairing
+        // redesign): pairing is deleted, so the rig proves the new
+        // connect-play flows instead. Contract-only self-checks
+        // over the L1 Connection Manager / protocol primitives /
+        // the OTA flash flow: an open AP connects with no password
+        // and no pairing step, a password can be set and is then
+        // required for reconnect, a BOOT-hold reset re-opens the
+        // AP, USB needs no pairing either, a 4.0.2 board migrates
+        // to 4.0.3, and an unreachable board fails closed with a
         // distinct reason. No wheel, no UDP — the manager is pure.
         Scenario {
-            id: "pairing-window-open",
-            description: "Pairing with the window open: HELLO (unpaired, window open) -> Authenticating -> GET_CAPS ok -> Active.",
+            id: "connect-open-ap",
+            description: "Connect-play (v2.2): open AP RSH-XXXX, no password — HELLO -> GET_CAPS ok -> Active, no pairing step, no user action.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1148,13 +1162,13 @@ pub fn registry() -> Vec<Scenario> {
                 metric: "selfCheck",
                 op: "==",
                 value: MetricValue::Str("pass"),
-                note: "Self-check PASS: window-open pairing reaches Active (Connected) via the L1 Connection Manager.",
+                note: "Self-check PASS: open-AP HELLO reaches Active (Connected) via the L1 Connection Manager, no pairing action.",
                 min_duration_s: 0.0,
             }],
         },
         Scenario {
-            id: "pairing-window-expired",
-            description: "Pairing with the window expired: HELLO (unpaired, window closed) -> Error(WindowClosed), auto-retry stopped, never Active.",
+            id: "connect-password-set",
+            description: "Connect-play (v2.2): SET_PASSWORD validation — 8–63 printable ASCII accepted; short, long, empty, non-printable rejected; opcode 0x0C known.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1162,13 +1176,13 @@ pub fn registry() -> Vec<Scenario> {
                 metric: "selfCheck",
                 op: "==",
                 value: MetricValue::Str("pass"),
-                note: "Self-check PASS: window-expired pairing fails closed with typed reason WindowClosed and no auto-retry.",
+                note: "Self-check PASS: SET_PASSWORD payload rules hold (8–63 printable ASCII, opcode 0x0C).",
                 min_duration_s: 0.0,
             }],
         },
         Scenario {
-            id: "pairing-unreachable",
-            description: "Pairing with no board: 3 HELLO timeouts -> Error(Unreachable), a reason distinct from WindowClosed, never Active.",
+            id: "connect-password-reconnect",
+            description: "Connect-play (v2.2): password reconnect — Active -> transport lost -> backoff -> HELLO -> GET_CAPS ok -> Active again, no pairing action, no user action.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1176,7 +1190,63 @@ pub fn registry() -> Vec<Scenario> {
                 metric: "selfCheck",
                 op: "==",
                 value: MetricValue::Str("pass"),
-                note: "Self-check PASS: unreachable board fails closed with typed reason Unreachable (distinct from WindowClosed).",
+                note: "Self-check PASS: reconnect after transport loss returns to Active with no pairing action.",
+                min_duration_s: 0.0,
+            }],
+        },
+        Scenario {
+            id: "connect-key-reset-open",
+            description: "Connect-play (v2.2): KEY_RESET — BOOT held 10 s clears the password in firmware and the board reboots to an open AP; the PC reconnects with no password and no pairing step.",
+            durations: (0, 0, 0),
+            wheel: WheelConfig::default(),
+            harness: HarnessConfig::default(),
+            assertions: vec![Assertion {
+                metric: "selfCheck",
+                op: "==",
+                value: MetricValue::Str("pass"),
+                note: "Self-check PASS: 10 s BOOT-hold threshold present; open-AP reconnect after reset reaches Active with no pairing action.",
+                min_duration_s: 0.0,
+            }],
+        },
+        Scenario {
+            id: "connect-usb",
+            description: "Connect-play (v2.2): USB unchanged — serial HELO/HELLO + control + stream, no pairing, no window; the manager reaches Active from LinkUp on GET_CAPS ok.",
+            durations: (0, 0, 0),
+            wheel: WheelConfig::default(),
+            harness: HarnessConfig::default(),
+            assertions: vec![Assertion {
+                metric: "selfCheck",
+                op: "==",
+                value: MetricValue::Str("pass"),
+                note: "Self-check PASS: USB path reaches Active (Connected) via the L1 Connection Manager, no pairing action.",
+                min_duration_s: 0.0,
+            }],
+        },
+        Scenario {
+            id: "connect-migration-402-403",
+            description: "Connect-play (v2.2): migration — a board on firmware 4.0.2 flashes the signed 4.0.3 image via WebOTA and confirms 4.0.3; the old pairing-era firmware is gone.",
+            durations: (0, 0, 0),
+            wheel: WheelConfig::default(),
+            harness: HarnessConfig::default(),
+            assertions: vec![Assertion {
+                metric: "selfCheck",
+                op: "==",
+                value: MetricValue::Str("pass"),
+                note: "Self-check PASS: flash 4.0.2 -> 4.0.3 confirmed, board on 4.0.3, upload reached 100%.",
+                min_duration_s: 0.0,
+            }],
+        },
+        Scenario {
+            id: "connect-unreachable",
+            description: "Connect-play (v2.2): no board — 3 HELLO timeouts -> Error(Unreachable), never Active.",
+            durations: (0, 0, 0),
+            wheel: WheelConfig::default(),
+            harness: HarnessConfig::default(),
+            assertions: vec![Assertion {
+                metric: "selfCheck",
+                op: "==",
+                value: MetricValue::Str("pass"),
+                note: "Self-check PASS: unreachable board fails closed with typed reason Unreachable.",
                 min_duration_s: 0.0,
             }],
         },
@@ -1186,7 +1256,7 @@ pub fn registry() -> Vec<Scenario> {
         // flow over loopback TCP, no real ESP32 / Wi-Fi.
         Scenario {
             id: "ota-e2e-success",
-            description: "WebOTA e2e: signed 4.0.2 image flashes to the fake board (4.0.1), board restarts on 4.0.2, flow confirms the new version with upload progress.",
+            description: "WebOTA e2e: signed 4.0.3 image flashes to the fake board (4.0.1), board restarts on 4.0.3, flow confirms the new version with upload progress.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1194,13 +1264,13 @@ pub fn registry() -> Vec<Scenario> {
                 metric: "selfCheck",
                 op: "==",
                 value: MetricValue::Str("pass"),
-                note: "Self-check PASS: flash succeeded, board on 4.0.2, upload reached 100%.",
+                note: "Self-check PASS: flash succeeded, board on 4.0.3, upload reached 100%.",
                 min_duration_s: 0.0,
             }],
         },
         Scenario {
             id: "ota-e2e-same-version",
-            description: "WebOTA e2e: reinstalling the version the board already runs (4.0.2 over 4.0.2) is allowed — the flash succeeds, the confirm reads 4.0.2, the board stays on 4.0.2.",
+            description: "WebOTA e2e: reinstalling the version the board already runs (4.0.3 over 4.0.3) is allowed — the flash succeeds, the confirm reads 4.0.3, the board stays on 4.0.3.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1208,7 +1278,7 @@ pub fn registry() -> Vec<Scenario> {
                 metric: "selfCheck",
                 op: "==",
                 value: MetricValue::Str("pass"),
-                note: "Self-check PASS: same-version reinstall succeeded, board stayed on 4.0.2, upload reached 100%.",
+                note: "Self-check PASS: same-version reinstall succeeded, board stayed on 4.0.3, upload reached 100%.",
                 min_duration_s: 0.0,
             }],
         },
@@ -1228,7 +1298,7 @@ pub fn registry() -> Vec<Scenario> {
         },
         Scenario {
             id: "ota-e2e-disconnect-rollback",
-            description: "WebOTA e2e: connection drops mid-upload — flash fails, board keeps running 4.0.1 (rollback); retry with the link back succeeds to 4.0.2.",
+            description: "WebOTA e2e: connection drops mid-upload — flash fails, board keeps running 4.0.1 (rollback); retry with the link back succeeds to 4.0.3.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1236,7 +1306,7 @@ pub fn registry() -> Vec<Scenario> {
                 metric: "selfCheck",
                 op: "==",
                 value: MetricValue::Str("pass"),
-                note: "Self-check PASS: aborted upload rolled back to 4.0.1, retry succeeded to 4.0.2.",
+                note: "Self-check PASS: aborted upload rolled back to 4.0.1, retry succeeded to 4.0.3.",
                 min_duration_s: 0.0,
             }],
         },
@@ -1540,20 +1610,6 @@ pub fn registry() -> Vec<Scenario> {
             }],
         },
         // ---- v2.0.2 gate checks, re-scan findings (B-1, B-2, H-3, H-4, M-9) ----
-        Scenario {
-            id: "gate-pairing-long-call",
-            description: "Gate (B-1): begin_pairing is a long call (daemon waits up to 3 s) and must NOT time out on the 500 ms IPC bound — it must ack within 500 ms and the countdown must arrive via pairing_status; no-board begin_pairing fails fast.",
-            durations: (0, 0, 0),
-            wheel: WheelConfig::default(),
-            harness: HarnessConfig::default(),
-            assertions: vec![Assertion {
-                metric: "selfCheck",
-                op: "==",
-                value: MetricValue::Str("pass"),
-                note: "Gate PASS: pairing acks fast, countdown arrives, no 500 ms timeout failure.",
-                min_duration_s: 0.0,
-            }],
-        },
         Scenario {
             id: "gate-hid-uac-dwell",
             description: "Gate (B-2): HID switch UAC dwell — spawn/hello wait covers 10 s + user thinking time (>= 60 s); decline yields one clear message, no retry loop, nothing installed.",

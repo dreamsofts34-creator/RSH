@@ -127,8 +127,6 @@ pub enum ConnectionState {
     Connecting,
     /// Transport connected.
     Connected,
-    /// Pairing window open.
-    Pairing,
     /// Transport in an error state.
     Error,
 }
@@ -141,7 +139,6 @@ impl ConnectionState {
             Self::Disconnected => "disconnected",
             Self::Connecting => "connecting",
             Self::Connected => "connected",
-            Self::Pairing => "pairing",
             Self::Error => "error",
         }
     }
@@ -631,7 +628,6 @@ mod tests {
     fn connection_state_strings_match_frontend_union() {
         assert_eq!(ConnectionState::Connected.as_str(), "connected");
         assert_eq!(ConnectionState::Disconnected.as_str(), "disconnected");
-        assert_eq!(ConnectionState::Pairing.as_str(), "pairing");
         assert_eq!(ConnectionState::Error.as_str(), "error");
         assert_eq!(ConnectionState::Connecting.as_str(), "connecting");
     }

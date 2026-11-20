@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""RSH protocol v2.1 — independent Python cross-check (WP3, Phase A).
-Contract: docs/PROTOCOL-V2.1.md (authority). Golden vectors:
+"""RSH protocol v2.2 — independent Python cross-check (WP3, Phase A).
+Contract: docs/PROTOCOL-V2.2.md (authority). Golden vectors:
 tests-host/protocol_v2_vectors.py (VECTORS/NEGATIVE).
 
 Ye script C# (RSH.Core/Protocol) aur C++ (firmware/rsh/protocol.h) parsers
 ka teesra, aazaad implementation hai — T1 gate (3-language match) ka Python
 hissa. C# / C++ code se kuch share nahi karta, sirf doc + vectors se likha
 gaya hai.
+
+v2.2 changes: version byte 0x22; HELLO secret fields hamesha zero, flags
+sirf bit2 safe_mode; control frames plain hain (9 B header + CRC16, koi
+HMAC tag / counter nahi), duplicate suppression sirf reqId par.
 
 NOTE: ye script Virtual Test Rig (~/workspace/projects/rsh/test-env/) mein
 chalega — rig tayyar hone tak isay chalana mana hai (standing rule).
@@ -48,7 +52,7 @@ def _fix_crc(frame: bytearray) -> bytes:
     return bytes(frame)
 
 
-# ---- v2.1 stream data packet (§1.1) -----------------------------------------
+# ---- v2.2 stream data packet (§1.1) -----------------------------------------
 def parse_data_v2(frame: bytes) -> dict:
     """Reject reasons §1.4 ke mutabiq: badMagic / badVersion / badFrame /
     rsvNonzero / badCrc (ValueError ka message = counter ka naam)."""
@@ -60,7 +64,7 @@ def parse_data_v2(frame: bytes) -> dict:
         raise ValueError("badMagic")
     if len(frame) < 5:
         raise ValueError("tooShort")
-    if frame[4] != 0x21:
+    if frame[4] != 0x22:
         raise ValueError("badVersion")
     if len(frame) < 20:
         raise ValueError("tooShort")
@@ -89,13 +93,13 @@ def parse_data_v2(frame: bytes) -> dict:
             "axes": axes, "enc": enc}
 
 
-# ---- v2.1 status packet (§1.2) ----------------------------------------------
+# ---- v2.2 status packet (§1.2) ----------------------------------------------
 def parse_status_v2(frame: bytes) -> dict:
     if len(frame) < 2:
         raise ValueError("tooShort")
     if frame[0] != 0xA6:
         raise ValueError("badMagic")
-    if frame[1] != 0x21:
+    if frame[1] != 0x22:
         raise ValueError("badVersion")
     if len(frame) < 34:
         raise ValueError("tooShort")
@@ -123,20 +127,22 @@ def parse_status_v2(frame: bytes) -> dict:
     return base
 
 
-# ---- HELLO reply (§2.2, 92 B fixed) -----------------------------------------
+# ---- HELLO reply v2.2 (§2.2, 92 B fixed) ------------------------------------
 def parse_hello(frame: bytes) -> dict:
     if len(frame) < 6:
         raise ValueError("tooShort")
     if frame[:4] != b"RSHR":
         raise ValueError("badMagic")
-    if frame[4] != 2 or frame[5] != 1:
+    if frame[4] != 2 or frame[5] != 2:
         raise ValueError("badVersion")
     if len(frame) < 92:
         raise ValueError("tooShort")
     if len(frame) != 92:
         raise ValueError("badLength")
-    if frame[17] != 0 or (frame[6] & 0xF0):
-        raise ValueError("rsvNonzero")
+    if frame[17] != 0 or (frame[6] & ~0x04):
+        raise ValueError("rsvNonzero")  # sirf bit2 safe_mode allowed
+    if frame[18:90] != b"\x00" * 72:
+        raise ValueError("rsvNonzero")  # nonce/device_key/wifi_password = 0
     if not _crc_ok(frame):
         raise ValueError("badCrc")
     return {"flags": frame[6], "session_echo": frame[7],
@@ -147,7 +153,7 @@ def parse_hello(frame: bytes) -> dict:
 
 # ---- PIN_PROBE frame (§3.8) -------------------------------------------------
 def build_probe(seq, pin, mode, samples):
-    body = struct.pack("<4sBHB BH".replace(" ", ""), b"RSHP", 0x21, seq, pin, mode,
+    body = struct.pack("<4sBHB BH".replace(" ", ""), b"RSHP", 0x22, seq, pin, mode,
                        len(samples))
     if mode == 1:
         body += b"".join(struct.pack("<H", s) for s in samples)
@@ -161,7 +167,7 @@ def parse_probe(frame: bytes) -> dict:
         raise ValueError("tooShort")
     if frame[:4] != b"RSHP":
         raise ValueError("badMagic")
-    if frame[4] != 0x21:
+    if frame[4] != 0x22:
         raise ValueError("badVersion")
     if len(frame) < 11:
         raise ValueError("tooShort")
@@ -181,34 +187,34 @@ def parse_probe(frame: bytes) -> dict:
             "mode": mode, "samples": samples}
 
 
-# ---- control frame (§3.1/§3.2) ----------------------------------------------
+# ---- control frame v2.2 (§3.1/§3.2) -----------------------------------------
+# Layout: "RSHC" | cmd | reqId u16 | len u16 | payload | CRC16.
+# Header 9 B, total 11 + len, max 1035 B. Koi HMAC tag / counter nahi.
 def parse_ctrl_structure(frame: bytes) -> dict:
-    if len(frame) < 29:
+    if len(frame) < 9:
         raise ValueError("tooShort")
     if frame[:4] != b"RSHC":
         raise ValueError("badMagic")
-    ln = struct.unpack("<H", frame[11:13])[0]
-    if ln > 1024 or len(frame) != 13 + ln + 16:
+    ln = struct.unpack("<H", frame[7:9])[0]
+    if ln > 1024 or len(frame) != 9 + ln + 2:
         raise ValueError("badLength")
+    if not _crc_ok(frame):
+        raise ValueError("badCrc")
     return {"cmd": frame[4], "req_id": struct.unpack("<H", frame[5:7])[0],
-            "counter": struct.unpack("<I", frame[7:11])[0],
-            "payload": frame[13:13 + ln], "tag": frame[13 + ln:]}
+            "payload": frame[9:9 + ln]}
 
 
 class ControlSession:
-    """Duplicate/replay state (§3.2): pichle 32 (reqId, counter) pairs cache."""
+    """Duplicate state (§3.2, D2): pichle 32 reqIds cache — sirf reqId
+    par dedup hota hai, koi counter / REPLAY state nahi."""
 
     def __init__(self):
-        self.max_seen = None
-        self.recent = []  # list of (req_id, counter), max 32
+        self.recent = []  # list of req_id, max 32
 
-    def classify(self, req_id, counter):
-        if (req_id, counter) in self.recent:
+    def classify(self, req_id):
+        if req_id in self.recent:
             return "duplicate"
-        if self.max_seen is not None and counter <= self.max_seen:
-            return "replay"
-        self.max_seen = counter
-        self.recent.append((req_id, counter))
+        self.recent.append(req_id)
         self.recent = self.recent[-32:]
         return "accept"
 
@@ -221,79 +227,84 @@ assert V1[:2] == b"\xa5\x01", "legacy v1 pehchan"
 
 def main():
     print("== T1: golden vectors (protocol_v2_vectors.py) ==")
-    d = parse_data_v2(vec.VECTORS["data_v2_1"])
+    d = parse_data_v2(vec.VECTORS["data_v2_2"])
     check(d["seq"] == 0x1234 and d["ts"] == 0x01020304, "data: seq/ts")
     check(d["flags"] == 0x01 and d["axis_mask"] == 0x1F, "data: flags/axisMask")
     check(d["axes"] == {0: 2300, 1: 1000, 2: 2000, 3: 0, 4: 512}, "data: axes mV")
     check(d["buttons"] == 0x205 and d["enc"] == [1000, -250], "data: buttons u32 + enc cumulative")
 
-    s = parse_status_v2(vec.VECTORS["status_v2_1"])
-    check(len(vec.VECTORS["status_v2_1"]) == 34 and not s["has_btns_ex"], "status base: 34 B")
+    s = parse_status_v2(vec.VECTORS["status_v2_2"])
+    check(len(vec.VECTORS["status_v2_2"]) == 34 and not s["has_btns_ex"], "status base: 34 B")
     check(s["seq"] == 7 and s["uptime"] == 123456 and s["rssi"] == -52, "status base: seq/uptime/rssi")
     check(s["battery"] == 86 and s["supply"] == 4012 and s["heap"] == 187000, "status base: battery/supply/heap")
     check(s["overruns"] == 3 and s["max_cycle"] == 2140, "status base: overruns/maxCycle")
     check(s["cfg_crc"] == 0xDEADBEEF and s["cfg_ver"] == 5, "status base: cfgCrc/cfgVer")
     check(s["seq_gap"] == 2 and s["tx_fail"] == 1, "status base: seqGap@28-29 / txFail@30-31")
 
-    sx = parse_status_v2(vec.VECTORS["status_v2_1_ext"])
-    check(len(vec.VECTORS["status_v2_1_ext"]) == 38 and sx["has_btns_ex"], "status ext: 38 B")
+    sx = parse_status_v2(vec.VECTORS["status_v2_2_ext"])
+    check(len(vec.VECTORS["status_v2_2_ext"]) == 38 and sx["has_btns_ex"], "status ext: 38 B")
     check(sx["btns_ex"] == 0x20 and sx["seq_gap"] == 2 and sx["tx_fail"] == 1,
           "status ext: btnsEx@28-31 / seqGap@32-33 / txFail@34-35")
 
-    h = parse_hello(vec.VECTORS["hello_unpaired"])
-    check(h["flags"] == 0x09 and h["session_echo"] == 1, "hello unpaired: flags/sessionEcho")
-    check(h["board_mac"] == vec.TEST_MAC and h["fw"] == (4, 0, 0), "hello unpaired: mac/fw 4.0.0")
-    check(h["nonce"] == vec.TEST_NONCE and h["device_key"] == vec.TEST_KEY, "hello unpaired: nonce/key")
-    check(h["wifi_password"] == vec.TEST_PW, "hello unpaired: wifi password 24 chars")
-    hp = parse_hello(vec.VECTORS["hello_paired"])
-    check(hp["flags"] == 0 and hp["device_key"] == b"\x00" * 32
-          and hp["wifi_password"] == b"\x00" * 24, "hello paired: key/password zero")
+    h = parse_hello(vec.VECTORS["hello_safe_mode"])
+    check(h["flags"] == 0x04 and h["session_echo"] == 1, "hello safe-mode: flags/sessionEcho")
+    check(h["board_mac"] == vec.TEST_MAC and h["fw"] == (4, 0, 3), "hello safe-mode: mac/fw 4.0.3")
+    check(h["nonce"] == b"\x00" * 16 and h["device_key"] == b"\x00" * 32,
+          "hello safe-mode: nonce/device_key zero (reserved)")
+    check(h["wifi_password"] == b"\x00" * 24, "hello safe-mode: wifi password zero (reserved)")
+    hp = parse_hello(vec.VECTORS["hello_plain"])
+    check(hp["flags"] == 0 and hp["session_echo"] == 0
+          and hp["device_key"] == b"\x00" * 32 and hp["wifi_password"] == b"\x00" * 24,
+          "hello plain: flags 0, secrets zero")
 
     c = parse_ctrl_structure(vec.VECTORS["ctrl_get_caps"])
-    check(c["cmd"] == 0x01 and c["req_id"] == 1 and c["counter"] == 0 and c["payload"] == b"",
+    check(c["cmd"] == 0x01 and c["req_id"] == 1 and c["payload"] == b"",
           "ctrl GET_CAPS: fields")
-    check(vec.ctrl_verify(vec.TEST_KEY, vec.TEST_NONCE, vec.VECTORS["ctrl_get_caps"]),
-          "ctrl GET_CAPS: HMAC tag verifies")
+    check(vec.ctrl_crc_ok(vec.VECTORS["ctrl_get_caps"]), "ctrl GET_CAPS: CRC verifies")
     c2 = parse_ctrl_structure(vec.VECTORS["ctrl_set_cfg"])
-    check(c2["cmd"] == 0x03 and c2["req_id"] == 2 and c2["counter"] == 1, "ctrl SET_CFG: fields")
+    check(c2["cmd"] == 0x03 and c2["req_id"] == 2, "ctrl SET_CFG: fields")
     check(struct.unpack("<HHHH", c2["payload"][:8]) == (0, 64, 16, crc16_ccitt_false(b"RSHG" + bytes(12))),
           "ctrl SET_CFG: chunk offset/total/len/crc")
     check(c2["payload"][8:12] == b"RSHG", "ctrl SET_CFG: blob magic RSHG")
-    check(vec.ctrl_verify(vec.TEST_KEY, vec.TEST_NONCE, vec.VECTORS["ctrl_set_cfg"]),
-          "ctrl SET_CFG: HMAC tag verifies")
+    check(vec.ctrl_crc_ok(vec.VECTORS["ctrl_set_cfg"]), "ctrl SET_CFG: CRC verifies")
     r = parse_ctrl_structure(vec.VECTORS["ctrl_get_caps_reply"])
     check(r["cmd"] == 0x81 and r["payload"][0] == 0 and len(r["payload"]) == 18,
           "ctrl reply: cmd 0x81, status OK")
     check(r["payload"][1:7] == vec.TEST_MAC and r["payload"][13] == 64,
           "ctrl reply: GET_CAPS body (mac, nBtnMax 64)")
-    check(vec.ctrl_verify(vec.TEST_KEY, vec.TEST_NONCE, vec.VECTORS["ctrl_get_caps_reply"]),
-          "ctrl reply: HMAC tag verifies")
+    check(r["payload"][9] == 3 and r["payload"][10] == 2 and r["payload"][11] == 2,
+          "ctrl reply: fw 4.0.3 / proto 2.2")
+    check(vec.ctrl_crc_ok(vec.VECTORS["ctrl_get_caps_reply"]), "ctrl reply: CRC verifies")
+    sp = parse_ctrl_structure(vec.VECTORS["ctrl_set_password"])
+    check(sp["cmd"] == 0x0C and sp["req_id"] == 3, "ctrl SET_PASSWORD: fields")
+    check(sp["payload"][0] == 0 and sp["payload"][1] == 12
+          and sp["payload"][2:14] == b"NewPassw0rd!",
+          "ctrl SET_PASSWORD: [curLen 0][newLen 12][newPw]")
 
     print("== T2: negative vectors ==")
     neg = vec.NEGATIVE
-    check(not vec.ctrl_verify(vec.TEST_KEY, vec.TEST_NONCE, neg["neg_bad_tag"]), "neg: bad tag fails")
-    check(not vec.ctrl_verify(vec.WRONG_KEY, vec.TEST_NONCE, neg["neg_wrong_key_frame"]),
-          "neg: wrong key fails")
-    check(not vec.ctrl_verify(vec.TEST_KEY, vec.TEST_NONCE, neg["neg_truncated"]), "neg: truncated fails")
-    check(not vec.ctrl_verify(vec.TEST_KEY, vec.TEST_NONCE, neg["neg_bad_magic"]), "neg: bad magic fails")
+    check(not vec.ctrl_crc_ok(neg["neg_bad_crc"]), "neg: bad CRC fails")
+    check(not vec.ctrl_crc_ok(neg["neg_truncated"]), "neg: truncated fails")
+    check(not vec.ctrl_crc_ok(neg["neg_bad_len"]), "neg: bad len fails")
+    check(not vec.ctrl_crc_ok(neg["neg_bad_magic"]), "neg: bad magic fails")
     try:
-        parse_ctrl_structure(struct.pack("<4sBHIH", b"RSHC", 1, 1, 0, 1025) + bytes(1025) + bytes(16))
+        parse_ctrl_structure(struct.pack("<4sBHH", b"RSHC", 1, 1, 1025) + bytes(1025) + bytes(2))
         raise AssertionError("oversize len 1025 must be rejected")
     except ValueError as e:
         check(str(e) == "badLength", "neg: control len 1025 → badLength (TOO_BIG)")
-    # replay + duplicate: tag valid hai, reject sirf counter-state se hota hai (§3.2)
-    check(vec.ctrl_verify(vec.TEST_KEY, vec.TEST_NONCE, neg["neg_replay_same_counter_new_reqid"]),
-          "neg replay: tag valid (reqId HMAC mein nahi)")
-    check(vec.ctrl_verify(vec.TEST_KEY, vec.TEST_NONCE, neg["neg_duplicate_exact"]),
-          "neg duplicate: tag valid (exact retransmit)")
+    # duplicate: frame CRC se guzarta hai — reject sirf reqId-state se hota hai (§3.2)
+    check(vec.ctrl_crc_ok(neg["neg_duplicate_exact"]),
+          "neg duplicate: CRC valid (exact retransmit)")
     sess = ControlSession()
-    check(sess.classify(1, 0) == "accept", "session: pehla frame accept (counter 0)")
-    check(sess.classify(1, 0) == "duplicate", "session: exact retransmit → duplicate")
-    check(sess.classify(99, 0) == "replay", "session: naya reqId, counter<=max → replay")
-    check(sess.classify(2, 1) == "accept" and sess.classify(3, 5) == "accept",
-          "session: naya counter / gap accept")
+    check(sess.classify(1) == "accept", "session: pehla frame accept (reqId 1)")
+    check(sess.classify(1) == "duplicate", "session: exact retransmit → duplicate")
+    check(sess.classify(99) == "accept", "session: naya reqId → accept (koi replay nahi)")
+    check(sess.classify(2) == "accept" and sess.classify(3) == "accept",
+          "session: naye reqIds accept")
+    check(sess.classify(65535) == "accept" and sess.classify(0) == "accept",
+          "session: reqId wrap 65535 -> 0 accept")
     # stream negatives
-    good = vec.VECTORS["data_v2_1"]
+    good = vec.VECTORS["data_v2_2"]
     for label, mutate in [
         ("badMagic", lambda b: b.__setitem__(0, ord("X"))),
         ("badVersion", lambda b: b.__setitem__(4, 0x20)),
@@ -318,14 +329,14 @@ def main():
         raise AssertionError("nEnc 5 must be rejected")
     except ValueError as e:
         check(str(e) == "badFrame", "neg stream: nEnc 5 → badFrame")
-    b = bytearray(vec.data_v2_1(1, 100, {}, 0, [], 0))
+    b = bytearray(vec.data_v2_2(1, 100, {}, 0, [], 0))
     b[18] = 1
     try:
         parse_data_v2(_fix_crc(b))
         raise AssertionError("reserved nonzero must be rejected")
     except ValueError as e:
         check(str(e) == "rsvNonzero", "neg stream: reserved 18-19 → rsvNonzero")
-    b = bytearray(vec.data_v2_1(1, 100, {}, 0, [], 0))
+    b = bytearray(vec.data_v2_2(1, 100, {}, 0, [], 0))
     b[5] = 0x80
     try:
         parse_data_v2(_fix_crc(b))
@@ -340,11 +351,11 @@ def main():
 
     print("== T3: status field-level + probe ==")
     try:
-        parse_status_v2(vec.VECTORS["status_v2_1"] + b"\x00")
+        parse_status_v2(vec.VECTORS["status_v2_2"] + b"\x00")
         raise AssertionError("35 B status must be rejected")
     except ValueError as e:
         check(str(e) == "badLength", "status: 35 B → badLength")
-    b = bytearray(vec.VECTORS["status_v2_1"])
+    b = bytearray(vec.VECTORS["status_v2_2"])
     b[12] ^= 0xFF
     try:
         parse_status_v2(bytes(b))
@@ -352,8 +363,8 @@ def main():
     except ValueError as e:
         check(str(e) == "badCrc", "status: bad CRC → badCrc")
     # base vs extended: aik hi values, sirf offsets badalte hain
-    sb = vec.status_v2_1(9, 1000, -60, 50, 4000, 100, 1, 100, 0, 1, 42, 3, 7, 9)
-    se = vec.status_v2_1(9, 1000, -60, 50, 4000, 100, 1, 100, 0, 1, 42, 3, 7, 9, btns_ex=1)
+    sb = vec.status_v2_2(9, 1000, -60, 50, 4000, 100, 1, 100, 0, 1, 42, 3, 7, 9)
+    se = vec.status_v2_2(9, 1000, -60, 50, 4000, 100, 1, 100, 0, 1, 42, 3, 7, 9, btns_ex=1)
     pb, pe = parse_status_v2(sb), parse_status_v2(se)
     check(pb["seq_gap"] == pe["seq_gap"] == 7 and pb["tx_fail"] == pe["tx_fail"] == 9,
           "status: base/ext seqGap/txFail barabar")
@@ -367,7 +378,7 @@ def main():
     check(parse_probe(probe0)["samples"] == [1, 0, 1], "probe: digital levels")
 
     print(f"PYTHON CROSS-VERIFY PASSED — {CHECKS} checks, "
-          "v2.1 stream/status/hello/control/probe vectors + negatives match")
+          "v2.2 stream/status/hello/control/probe vectors + negatives match")
 
 
 if __name__ == "__main__":

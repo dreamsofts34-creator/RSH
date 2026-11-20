@@ -4,8 +4,8 @@ Vendored from `rust-recreation/reference/tests-host/` (the reference
 copies used to build the firmware — kept here so the repo is
 self-contained and CI can run them without the handover folder):
 
-- `protocol_v2_vectors.py` — protocol v2.1 golden vectors:
-  `VECTORS` (10) + `NEGATIVE` (6). Run: `python3 protocol_v2_vectors.py`
+- `protocol_v2_vectors.py` — protocol v2.2 golden vectors:
+  `VECTORS` (11) + `NEGATIVE` (5). Run: `python3 protocol_v2_vectors.py`
 - `verify_packet.py` — packet cross-verify (Python vs Rust vs C++
   must agree). Run: `python3 verify_packet.py`
 - `test_main.cpp` — C++ host tests for the firmware logic in
@@ -37,7 +37,7 @@ firmware headers live directly in `firmware/`, not `firmware/rsh/`.)
 
 ## Vector counts (corrected — M9)
 
-- Python reference: 10 positive + 6 negative (`protocol_v2_vectors.py`).
+- Python reference: 11 positive + 5 negative (`protocol_v2_vectors.py`).
 - Rust `crates/rsh-protocol/tests/golden_vectors.rs`: **18 tests — 11
   positive + 7 negative**.
 - These C++ host tests mirror the same vectors; the count lives in

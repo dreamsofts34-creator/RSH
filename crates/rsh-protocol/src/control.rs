@@ -1,45 +1,40 @@
-//! Control frames (§3): `"RSHC"` + HMAC-SHA256 tag, opcodes, error codes,
-//! replay / duplicate / retry rules (D3).
+//! Control frames (§3): plain `"RSHC"` frames, CRC only (protocol v2.2).
 //!
-//! Frame layout: `magic[4] | cmd u8 | reqId u16 | counter u32 | len u16 |
-//! payload | tag[16]`; total `13 + len + 16`, `len ≤ 1024`.
+//! Frame layout: `magic[4] | cmd u8 | reqId u16 | len u16 | payload |
+//! CRC16[2]`; total `11 + len`, `len ≤ 1024`.
 //!
-//! Tag (v2.1-frozen, §3.2 — header is **not** in the HMAC):
-//! `tag = HMAC-SHA256(key32, nonce ‖ counter_LE ‖ cmd ‖ payload)[0:16]`.
-//! Verification uses `Mac::verify_truncated_left` — a constant-time
-//! check for a left-truncated tag. (A3 spike finding: `verify_slice`
-//! requires the FULL 32-byte tag and always fails on the 16-byte wire
-//! tag, so it must never be used here.)
+//! There is no HMAC, no device key, no nonce, and no counter in v2.2
+//! (D2): the duplicate cache keys on `reqId` alone, and `reqId` is
+//! monotonic per session. Integrity is the trailing CRC16-CCITT-FALSE
+//! over every byte before the CRC field — the same CRC as the stream /
+//! HELLO / serial frames. A frame whose CRC fails is dropped as
+//! `BadCrc`, never executed.
 //!
 //! Parse errors (§3.1): `TooShort` only when the frame is shorter than the
-//! 13-byte header; every other length mismatch is `BadLength`.
+//! 9-byte header; every other length mismatch is `BadLength`.
 
-use digest::common::array::Array;
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
-
+use crate::crc::{crc16, verify_crc16_trailer};
 use crate::error::{ControlParseError, RejectCounters};
 
-/// HMAC-SHA256 type alias.
-type HmacSha256 = Hmac<Sha256>;
-
-/// Control frame header size in bytes.
-pub const CONTROL_HEADER_LEN: usize = 13;
-/// HMAC tag size in bytes (first 16 bytes of HMAC-SHA256).
-pub const TAG_LEN: usize = 16;
+/// Control frame header size in bytes (`magic[4] | cmd | reqId u16 |
+/// len u16`).
+pub const CONTROL_HEADER_LEN: usize = 9;
+/// Trailing CRC16 size in bytes.
+pub const CRC_LEN: usize = 2;
 /// Maximum control payload in bytes.
 pub const MAX_PAYLOAD_LEN: usize = 1024;
-/// Maximum control frame size in bytes (`13 + 1024 + 16`).
-pub const MAX_FRAME_LEN: usize = CONTROL_HEADER_LEN + MAX_PAYLOAD_LEN + TAG_LEN;
+/// Maximum control frame size in bytes (`9 + 1024 + 2`).
+pub const MAX_FRAME_LEN: usize = CONTROL_HEADER_LEN + MAX_PAYLOAD_LEN + CRC_LEN;
 /// Maximum retry attempts per request: 3 sends total (§3.2).
 pub const MAX_RETRIES: u32 = 3;
 /// Retry interval in milliseconds (§3.2).
 pub const RETRY_INTERVAL_MS: u64 = 250;
-/// Duplicate-cache size: the board caches the last 32 `(reqId, counter)`
-/// pairs per session (§3.2).
+/// Duplicate-cache size: the board caches the last 32 `reqId`s per
+/// session (§3.2, D2).
 pub const DUPLICATE_CACHE_SIZE: usize = 32;
 
-/// Control opcodes (§3.3).
+/// Control opcodes (§3.3). `0x0B` (`KEY_RESET`) is deleted in v2.2 (D3):
+/// password-clear is physical-only (BOOT hold), there is no wire opcode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Opcode {
@@ -63,14 +58,13 @@ pub enum Opcode {
     Reboot = 0x09,
     /// `0x0A` — `LED_TEST`.
     LedTest = 0x0A,
-    /// `0x0B` — `KEY_RESET`.
-    KeyReset = 0x0B,
     /// `0x0C` — `SET_PASSWORD`.
     SetPassword = 0x0C,
 }
 
 impl Opcode {
-    /// Decode an opcode byte; `None` for unknown commands.
+    /// Decode an opcode byte; `None` for unknown commands (including
+    /// the deleted `0x0B`).
     #[must_use]
     pub fn from_u8(b: u8) -> Option<Self> {
         Some(match b {
@@ -84,13 +78,13 @@ impl Opcode {
             0x08 => Self::FactoryReset,
             0x09 => Self::Reboot,
             0x0A => Self::LedTest,
-            0x0B => Self::KeyReset,
             0x0C => Self::SetPassword,
             _ => return None,
         })
     }
 
-    /// `true` when the byte is a known opcode (0x01–0x0C).
+    /// `true` when the byte is a known opcode (`0x01`–`0x0C` except
+    /// the deleted `0x0B`).
     #[must_use]
     pub fn is_known(b: u8) -> bool {
         Self::from_u8(b).is_some()
@@ -98,14 +92,20 @@ impl Opcode {
 }
 
 /// Reply status codes (§3.9) — the first byte of every reply payload.
+///
+/// Code `1` is `BadPassword` (v2.2, D3): it reuses the freed `BadTag`
+/// slot (firmware `RSH_CTRL_BAD_PASSWORD` = 1), so a status byte means
+/// the same thing on both sides of the redesign. The remaining codes
+/// keep their v2.1 numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ErrorCode {
     /// `0` — success.
     Ok = 0,
-    /// `1` — HMAC tag verification failed.
-    BadTag = 1,
-    /// `2` — counter ≤ session max-seen with a new reqId.
+    /// `1` — `SET_PASSWORD` current password wrong (v2.2, D3).
+    BadPassword = 1,
+    /// `2` — duplicate `reqId` (retransmit answered from the cache,
+    /// or a `reqId` seen out of order).
     Replay = 2,
     /// `3` — `SET_CFG` chunk or config blob CRC mismatch.
     BadCrc = 3,
@@ -125,7 +125,7 @@ impl ErrorCode {
     pub fn from_u8(b: u8) -> Option<Self> {
         Some(match b {
             0 => Self::Ok,
-            1 => Self::BadTag,
+            1 => Self::BadPassword,
             2 => Self::Replay,
             3 => Self::BadCrc,
             4 => Self::TooBig,
@@ -137,16 +137,14 @@ impl ErrorCode {
     }
 }
 
-/// A parsed control frame (structure + payload, tag already verified by
-/// [`ControlFrame::verify`] / [`verify_frame`]).
+/// A parsed control frame (structure + payload, CRC already verified by
+/// [`ControlFrame::verify`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlFrame {
-    /// Command byte (request: 0x01–0x0C; reply: `req_cmd | 0x80`).
+    /// Command byte (request: known opcodes; reply: `req_cmd | 0x80`).
     pub cmd: u8,
-    /// Request id chosen by the PC; identical across retries (D3).
+    /// Request id chosen by the PC; identical across retries (D2).
     pub req_id: u16,
-    /// Per-session monotonic counter (u32 LE in the HMAC input).
-    pub counter: u32,
     /// Payload bytes (`len` ≤ 1024).
     pub payload: Vec<u8>,
 }
@@ -175,31 +173,23 @@ impl ControlFrame {
         }
     }
 
-    /// Encode this frame with a fresh HMAC tag.
+    /// Encode this frame with a trailing CRC16.
     ///
     /// # Errors
     ///
     /// Returns [`ControlParseError::BadLength`] when the payload exceeds
-    /// 1024 bytes. (Key/nonce length misuse is a caller bug and panics —
-    /// see [`compute_tag`].)
-    pub fn encode(&self, key: &[u8; 32], nonce: &[u8; 16]) -> Result<Vec<u8>, ControlParseError> {
-        build_frame(
-            key,
-            nonce,
-            self.cmd,
-            self.req_id,
-            self.counter,
-            &self.payload,
-        )
+    /// 1024 bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, ControlParseError> {
+        build_frame(self.cmd, self.req_id, &self.payload)
     }
 
     /// Parse only the structure (magic + header + length), without
-    /// verifying the tag. Use [`ControlFrame::verify`] for a full check.
+    /// verifying the CRC. Use [`ControlFrame::verify`] for a full check.
     ///
     /// # Errors
     ///
     /// Returns [`ControlParseError`] for a short frame, bad magic, or any
-    /// length mismatch (`TooShort` only below 13 bytes).
+    /// length mismatch (`TooShort` only below 9 bytes).
     pub fn parse_structure(data: &[u8]) -> Result<Self, ControlParseError> {
         if data.len() < CONTROL_HEADER_LEN {
             return Err(ControlParseError::TooShort);
@@ -209,66 +199,29 @@ impl ControlFrame {
         }
         let cmd = data[4];
         let req_id = u16::from_le_bytes([data[5], data[6]]);
-        let counter = u32::from_le_bytes([data[7], data[8], data[9], data[10]]);
-        let len = u16::from_le_bytes([data[11], data[12]]) as usize;
-        if len > MAX_PAYLOAD_LEN || data.len() != CONTROL_HEADER_LEN + len + TAG_LEN {
+        let len = u16::from_le_bytes([data[7], data[8]]) as usize;
+        if len > MAX_PAYLOAD_LEN || data.len() != CONTROL_HEADER_LEN + len + CRC_LEN {
             return Err(ControlParseError::BadLength);
         }
         Ok(Self {
             cmd,
             req_id,
-            counter,
             payload: data[CONTROL_HEADER_LEN..CONTROL_HEADER_LEN + len].to_vec(),
         })
     }
 
-    /// Parse and verify the HMAC tag (constant-time compare).
+    /// Parse and verify the trailing CRC16.
     ///
     /// # Errors
     ///
-    /// Returns [`ControlParseError`] for structural problems or a tag
-    /// mismatch (`BadTag`).
-    pub fn verify(
-        data: &[u8],
-        key: &[u8; 32],
-        nonce: &[u8; 16],
-    ) -> Result<Self, ControlParseError> {
+    /// Returns [`ControlParseError`] for structural problems or a CRC
+    /// mismatch (`BadCrc`).
+    pub fn verify(data: &[u8]) -> Result<Self, ControlParseError> {
         let frame = Self::parse_structure(data)?;
-        frame.verify_tag(key, nonce, data)?;
+        if !verify_crc16_trailer(data) {
+            return Err(ControlParseError::BadCrc);
+        }
         Ok(frame)
-    }
-
-    /// Verify the HMAC tag of an already-parsed frame against the raw
-    /// wire bytes it was parsed from.
-    ///
-    /// This is the H1/M-8 split: callers first run
-    /// [`ControlFrame::parse_structure`] and match `cmd`/`req_id`
-    /// against the command in flight, and only then call this — so a
-    /// stray frame for another command is skipped *without* spending
-    /// (or failing) a tag verification on it. A stray frame with a
-    /// corrupted tag must never kill the in-flight command.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControlParseError::BadLength`] when the raw bytes do
-    /// not carry a full tag for this frame, and
-    /// [`ControlParseError::BadTag`] on a tag mismatch.
-    pub fn verify_tag(
-        &self,
-        key: &[u8; 32],
-        nonce: &[u8; 16],
-        data: &[u8],
-    ) -> Result<(), ControlParseError> {
-        let tag_off = CONTROL_HEADER_LEN + self.payload.len();
-        if data.len() < tag_off + TAG_LEN {
-            return Err(ControlParseError::BadLength);
-        }
-        let mut tag = [0u8; TAG_LEN];
-        tag.copy_from_slice(&data[tag_off..tag_off + TAG_LEN]);
-        if !verify_tag(key, nonce, self.cmd, self.counter, &self.payload, &tag) {
-            return Err(ControlParseError::BadTag);
-        }
-        Ok(())
     }
 
     /// Parse + verify, bumping the matching counter in `counters`.
@@ -278,18 +231,16 @@ impl ControlFrame {
     /// Same as [`ControlFrame::verify`].
     pub fn verify_counted(
         data: &[u8],
-        key: &[u8; 32],
-        nonce: &[u8; 16],
         counters: &mut RejectCounters,
     ) -> Result<Self, ControlParseError> {
-        match Self::verify(data, key, nonce) {
+        match Self::verify(data) {
             Ok(frame) => Ok(frame),
             Err(e) => {
                 match e {
                     ControlParseError::TooShort => counters.too_short += 1,
                     ControlParseError::BadMagic => counters.bad_magic += 1,
                     ControlParseError::BadLength => counters.bad_length += 1,
-                    ControlParseError::BadTag => counters.bad_tag += 1,
+                    ControlParseError::BadCrc => counters.bad_crc += 1,
                 }
                 Err(e)
             }
@@ -297,190 +248,51 @@ impl ControlFrame {
     }
 }
 
-/// DS-44: infallible HMAC construction for a fixed 32-byte key.
-/// `new_from_slice(...).expect(...)` panicked on an impossible
-/// condition; building the key array by copy cannot fail (and
-/// `Array::from_slice` is deprecated, so it is not used either).
-fn hmac_with_key(key: &[u8; 32]) -> HmacSha256 {
-    // The key size is inferred from `HmacSha256::new`: HMAC keys
-    // are the hash BLOCK size (64 bytes for SHA-256), and a short
-    // key is padded with zeros to it — exactly what
-    // `new_from_slice` did for our 32-byte key. Copying into a
-    // zeroed array is identical and cannot fail.
-    let mut key_array = Array::default();
-    key_array.as_mut_slice()[..32].copy_from_slice(key);
-    HmacSha256::new(&key_array)
-}
-
-/// Verify a 16-byte wire tag in constant time.
-///
-/// The wire tag is the LEFT-truncated HMAC (`[0:16]`), so this uses
-/// `Mac::verify_truncated_left`. `verify_slice` must never be used
-/// here: it requires the full 32-byte tag and always fails on the
-/// 16-byte wire tag (A3 spike finding).
-///
-/// The HMAC is built infallibly (DS-44): the key is a fixed
-/// `[u8; 32]`, so its length cannot fail.
-#[must_use]
-pub fn verify_tag(
-    key: &[u8; 32],
-    nonce: &[u8; 16],
-    cmd: u8,
-    counter: u32,
-    payload: &[u8],
-    tag: &[u8; TAG_LEN],
-) -> bool {
-    // DS-44: infallible construction — the key is a fixed `[u8; 32]`,
-    // so its length cannot fail; `new_from_slice(...).expect(...)`
-    // was a panic on an impossible condition.
-    let mut mac = hmac_with_key(key);
-    mac.update(nonce);
-    mac.update(&counter.to_le_bytes());
-    mac.update(&[cmd]);
-    mac.update(payload);
-    mac.verify_truncated_left(tag).is_ok()
-}
-
-/// Compute the 16-byte tag: first 16 bytes of
-/// `HMAC-SHA256(key, nonce ‖ counter_LE ‖ cmd ‖ payload)`.
-///
-/// The HMAC is built infallibly (DS-44): the key is a fixed
-/// `[u8; 32]`, so its length cannot fail — there is no
-/// `new_from_slice(...).expect(...)` panic on this path.
-#[must_use]
-pub fn compute_tag(
-    key: &[u8; 32],
-    nonce: &[u8; 16],
-    cmd: u8,
-    counter: u32,
-    payload: &[u8],
-) -> [u8; TAG_LEN] {
-    // DS-44: see `verify_tag`.
-    let mut mac = hmac_with_key(key);
-    mac.update(nonce);
-    mac.update(&counter.to_le_bytes());
-    mac.update(&[cmd]);
-    mac.update(payload);
-    let digest = mac.finalize().into_bytes();
-    let mut tag = [0u8; TAG_LEN];
-    tag.copy_from_slice(&digest[..TAG_LEN]);
-    tag
-}
-
-/// Build a complete control frame (header + payload + tag).
+/// Build a complete control frame (header + payload + CRC16).
 ///
 /// # Errors
 ///
 /// Returns [`ControlParseError::BadLength`] when `payload.len() > 1024`.
-pub fn build_frame(
-    key: &[u8; 32],
-    nonce: &[u8; 16],
-    cmd: u8,
-    req_id: u16,
-    counter: u32,
-    payload: &[u8],
-) -> Result<Vec<u8>, ControlParseError> {
+pub fn build_frame(cmd: u8, req_id: u16, payload: &[u8]) -> Result<Vec<u8>, ControlParseError> {
     if payload.len() > MAX_PAYLOAD_LEN {
         return Err(ControlParseError::BadLength);
     }
-    let tag = compute_tag(key, nonce, cmd, counter, payload);
-    let mut out = Vec::with_capacity(CONTROL_HEADER_LEN + payload.len() + TAG_LEN);
+    let mut out = Vec::with_capacity(CONTROL_HEADER_LEN + payload.len() + CRC_LEN);
     out.extend_from_slice(b"RSHC");
     out.push(cmd);
     out.extend_from_slice(&req_id.to_le_bytes());
-    out.extend_from_slice(&counter.to_le_bytes());
     out.extend_from_slice(&(u16::try_from(payload.len()).unwrap_or(u16::MAX)).to_le_bytes());
     out.extend_from_slice(payload);
-    out.extend_from_slice(&tag);
+    let crc = crc16(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
     Ok(out)
 }
 
 /// Build a reply frame: `cmd = req_cmd | 0x80`, payload is
-/// `status ‖ body`, counter echoes the request counter (§3.2).
+/// `status ‖ body`.
 ///
 /// # Errors
 ///
 /// Returns [`ControlParseError::BadLength`] when the reply payload
 /// (`1 + body.len()`) exceeds 1024 bytes.
 pub fn build_reply(
-    key: &[u8; 32],
-    nonce: &[u8; 16],
     req_cmd: u8,
     req_id: u16,
-    counter: u32,
     status: ErrorCode,
     body: &[u8],
 ) -> Result<Vec<u8>, ControlParseError> {
     let mut payload = Vec::with_capacity(1 + body.len());
     payload.push(status as u8);
     payload.extend_from_slice(body);
-    build_frame(key, nonce, req_cmd | 0x80, req_id, counter, &payload)
+    build_frame(req_cmd | 0x80, req_id, &payload)
 }
 
-/// Verify a received frame's tag without allocating the parsed frame.
-/// Returns `false` for any structural problem or tag mismatch.
-#[must_use]
-pub fn verify_frame(data: &[u8], key: &[u8; 32], nonce: &[u8; 16]) -> bool {
-    ControlFrame::verify(data, key, nonce).is_ok()
-}
-
-/// RFC 1982 serial-number arithmetic for the per-session counter (§3.2).
-///
-/// A counter is a replay when `(counter − max_seen)` interpreted as a
-/// signed 32-bit difference is `≤ 0`. This makes the wrap
-/// `0xFFFFFFFF → 0` a *new* counter, not a replay. Any gap above
-/// `max_seen` is accepted (a lost packet must not wedge the session).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReplayTracker {
-    /// Highest counter accepted so far in this session (`None` = no frame yet).
-    max_seen: Option<u32>,
-}
-
-impl ReplayTracker {
-    /// Create a fresh tracker for a new session (counter restarts at 0).
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Highest counter seen so far, if any.
-    #[must_use]
-    pub fn max_seen(&self) -> Option<u32> {
-        self.max_seen
-    }
-
-    /// `true` when `counter` is a replay against the current `max_seen`.
-    /// The very first counter of a session is never a replay.
-    #[must_use]
-    pub fn is_replay(&self, counter: u32) -> bool {
-        match self.max_seen {
-            None => false,
-            Some(max) => (counter.wrapping_sub(max).cast_signed()) <= 0,
-        }
-    }
-
-    /// Record a counter. Returns `false` (and does not move `max_seen`)
-    /// when the counter is a replay.
-    pub fn observe(&mut self, counter: u32) -> bool {
-        if self.is_replay(counter) {
-            return false;
-        }
-        self.max_seen = Some(counter);
-        true
-    }
-
-    /// Reset for a new session (new nonce ⇒ counter restarts at 0, D30).
-    pub fn reset(&mut self) {
-        self.max_seen = None;
-    }
-}
-
-/// Exact-retransmit cache: the last 32 `(reqId, counter)` pairs (§3.2).
+/// Exact-retransmit cache: the last 32 `reqId`s (§3.2, D2).
 /// A byte-identical retransmit is answered from the cached reply and never
 /// re-executed.
 #[derive(Clone, Debug, Default)]
 pub struct DuplicateCache {
-    entries: [Option<(u16, u32)>; DUPLICATE_CACHE_SIZE],
+    entries: [Option<u16>; DUPLICATE_CACHE_SIZE],
     next: usize,
 }
 
@@ -491,19 +303,19 @@ impl DuplicateCache {
         Self::default()
     }
 
-    /// `true` when this exact `(req_id, counter)` pair was already seen.
+    /// `true` when this exact `req_id` was already seen.
     #[must_use]
-    pub fn is_duplicate(&self, req_id: u16, counter: u32) -> bool {
-        self.entries.contains(&Some((req_id, counter)))
+    pub fn is_duplicate(&self, req_id: u16) -> bool {
+        self.entries.contains(&Some(req_id))
     }
 
-    /// Record a pair. Returns `false` when it was already present
+    /// Record a `req_id`. Returns `false` when it was already present
     /// (a duplicate retransmit).
-    pub fn insert(&mut self, req_id: u16, counter: u32) -> bool {
-        if self.is_duplicate(req_id, counter) {
+    pub fn insert(&mut self, req_id: u16) -> bool {
+        if self.is_duplicate(req_id) {
             return false;
         }
-        self.entries[self.next] = Some((req_id, counter));
+        self.entries[self.next] = Some(req_id);
         self.next = (self.next + 1) % DUPLICATE_CACHE_SIZE;
         true
     }
@@ -518,39 +330,35 @@ impl DuplicateCache {
 /// Client-side retry state for one control request (§3.2).
 ///
 /// Rule: up to 3 sends at 250 ms intervals; every retry keeps the same
-/// `req_id` and uses a **new** counter. After the third send the request
-/// fails and the UI is told.
+/// `req_id` and re-sends the byte-identical frame (there is no counter
+/// in v2.2 — a retry is an exact retransmit). After the third send the
+/// request fails and the UI is told.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControlRetry {
     /// Request id, identical across retries.
     pub req_id: u16,
-    /// Counter to use for the next send.
-    pub next_counter: u32,
     /// Sends already made (1 after the first send).
     pub attempts: u32,
 }
 
 impl ControlRetry {
-    /// Start a request: first send uses `first_counter`, `req_id` fixed.
+    /// Start a request.
     #[must_use]
-    pub fn new(req_id: u16, first_counter: u32) -> Self {
+    pub fn new(req_id: u16) -> Self {
         Self {
             req_id,
-            next_counter: first_counter,
             attempts: 0,
         }
     }
 
-    /// Counter for the next send, or `None` when all 3 attempts are used.
-    /// Each call consumes one attempt and advances the counter.
-    pub fn next_send(&mut self) -> Option<u32> {
+    /// `true` when another send is allowed; each call consumes one
+    /// attempt. The retry re-sends the same `req_id` (same bytes).
+    pub fn next_send(&mut self) -> bool {
         if self.attempts >= MAX_RETRIES {
-            return None;
+            return false;
         }
-        let counter = self.next_counter;
-        self.next_counter = self.next_counter.wrapping_add(1);
         self.attempts += 1;
-        Some(counter)
+        true
     }
 
     /// `true` when no attempts remain.
@@ -701,39 +509,63 @@ impl PinProbeRequest {
     }
 }
 
-/// Validate a `SET_PASSWORD` request payload (§5.2): `newLen u8 (8..63)` +
-/// printable-ASCII password bytes (`0x21–0x7E`, no space).
+/// Validate a `SET_PASSWORD` request payload (§5.2, v2.2 layout D3):
+/// `curLen u8` + current password (`curLen` bytes, `0` = none set
+/// yet) + `newLen u8 (8..63)` + new password bytes, printable ASCII
+/// (`0x21–0x7E`, no space) in both parts.
 ///
-/// Returns the password bytes on success, `None` on any violation
-/// (length or charset — the board replies `UNSUPPORTED`).
+/// Returns `(current, new)` on success — `current` is `None` when
+/// `curLen` is `0` — and `None` on any violation (length, charset,
+/// or trailing bytes; the board replies `UNSUPPORTED`).
 #[must_use]
-pub fn validate_set_password_payload(payload: &[u8]) -> Option<&[u8]> {
-    if payload.is_empty() {
+pub fn validate_set_password_payload(payload: &[u8]) -> Option<(Option<&[u8]>, &[u8])> {
+    if payload.len() < 2 {
         return None;
     }
-    let new_len = payload[0] as usize;
-    if !(8..=63).contains(&new_len) || payload.len() != 1 + new_len {
+    let cur_len = payload[0] as usize;
+    if cur_len > 63 || payload.len() < 1 + cur_len + 1 {
         return None;
     }
-    let password = &payload[1..];
-    if password.iter().any(|b| !(0x21..=0x7E).contains(b)) {
+    let current = &payload[1..=cur_len];
+    if current.iter().any(|b| !(0x21..=0x7E).contains(b)) {
         return None;
     }
-    Some(password)
+    let rest = &payload[1 + cur_len..];
+    let new_len = rest[0] as usize;
+    if !(8..=63).contains(&new_len) || rest.len() != 1 + new_len {
+        return None;
+    }
+    let new = &rest[1..];
+    if new.iter().any(|b| !(0x21..=0x7E).contains(b)) {
+        return None;
+    }
+    Some((if cur_len == 0 { None } else { Some(current) }, new))
 }
 
-/// Build a `SET_PASSWORD` request payload.
+/// Build a `SET_PASSWORD` request payload (v2.2 layout, D3 §3.6):
+/// `curLen u8` + current password + `newLen u8` + new password.
 ///
-/// Returns `None` when the password violates the §5.2 rules.
+/// `current` is `None` (or empty) when no password is set yet —
+/// first setup on an open AP. When one is set, the current password
+/// must be carried, or the board replies `BadPassword` (1).
+///
+/// Returns `None` when either password violates the §5.2 rules
+/// (new: 8–63 printable ASCII; current: 0–63 printable ASCII).
 #[must_use]
-pub fn build_set_password_payload(password: &[u8]) -> Option<Vec<u8>> {
+pub fn build_set_password_payload(current: Option<&[u8]>, password: &[u8]) -> Option<Vec<u8>> {
+    let current = current.unwrap_or(&[]);
+    if current.len() > 63 || current.iter().any(|b| !(0x21..=0x7E).contains(b)) {
+        return None;
+    }
     if !(8..=63).contains(&password.len()) {
         return None;
     }
     if password.iter().any(|b| !(0x21..=0x7E).contains(b)) {
         return None;
     }
-    let mut out = Vec::with_capacity(1 + password.len());
+    let mut out = Vec::with_capacity(1 + current.len() + 1 + password.len());
+    out.push(u8::try_from(current.len()).unwrap_or(u8::MAX));
+    out.extend_from_slice(current);
     out.push(u8::try_from(password.len()).unwrap_or(u8::MAX));
     out.extend_from_slice(password);
     Some(out)
@@ -741,88 +573,173 @@ pub fn build_set_password_payload(password: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlRetry, ErrorCode, Opcode, ReplayTracker, validate_set_password_payload};
+    use super::{
+        ControlFrame, ControlRetry, DuplicateCache, ErrorCode, Opcode,
+        validate_set_password_payload,
+    };
+    use crate::error::ControlParseError;
 
     #[test]
     fn opcode_round_trip() {
-        for b in 1u8..=12 {
+        // Known opcodes: 0x01–0x0C except the deleted 0x0B KEY_RESET.
+        for b in [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12] {
             assert!(Opcode::from_u8(b).is_some());
             assert!(Opcode::is_known(b));
         }
         assert_eq!(Opcode::from_u8(0), None);
+        assert_eq!(Opcode::from_u8(0x0B), None, "KEY_RESET is deleted in v2.2");
         assert_eq!(Opcode::from_u8(0x0D), None);
         assert_eq!(Opcode::from_u8(0x81), None);
     }
 
     #[test]
     fn error_code_round_trip() {
-        for b in 0u8..=7 {
+        // Code 1 is BadPassword (v2.2, D3 — reuses the freed BadTag
+        // slot); every code 0..=7 decodes, 8+ does not.
+        for b in [0u8, 1, 2, 3, 4, 5, 6, 7] {
             assert!(ErrorCode::from_u8(b).is_some());
         }
+        assert_eq!(ErrorCode::from_u8(1), Some(ErrorCode::BadPassword));
         assert_eq!(ErrorCode::from_u8(8), None);
     }
 
     #[test]
-    fn replay_wrap_is_new() {
-        let mut tracker = ReplayTracker::new();
-        assert!(tracker.observe(0xFFFF_FFFF));
-        // Counter wrap 0xFFFFFFFF -> 0 is NEW, not a replay (RFC 1982).
-        assert!(!tracker.is_replay(0));
-        assert!(tracker.observe(0));
-        assert!(tracker.is_replay(0));
-        assert!(tracker.is_replay(0xFFFF_FFFF));
+    fn duplicate_cache_keys_on_req_id_only() {
+        let mut cache = DuplicateCache::new();
+        assert!(cache.insert(1));
+        assert!(!cache.insert(1));
+        assert!(cache.is_duplicate(1));
+        assert!(!cache.is_duplicate(2));
+        assert!(cache.insert(2));
+        cache.clear();
+        assert!(!cache.is_duplicate(1));
+        assert!(cache.insert(1));
     }
 
     #[test]
-    fn replay_gap_accepted() {
-        let mut tracker = ReplayTracker::new();
-        assert!(tracker.observe(5));
-        assert!(!tracker.is_replay(100)); // gaps never wedge the session
-        assert!(tracker.observe(100));
-        assert!(tracker.is_replay(6));
-    }
-
-    #[test]
-    fn retry_keeps_req_id_new_counter_three_times() {
-        let mut retry = ControlRetry::new(42, 7);
-        assert_eq!(retry.next_send(), Some(7));
-        assert_eq!(retry.next_send(), Some(8));
-        assert_eq!(retry.next_send(), Some(9));
-        assert_eq!(retry.next_send(), None);
+    fn retry_keeps_req_id_three_times() {
+        let mut retry = ControlRetry::new(42);
+        assert_eq!(retry.req_id, 42);
+        assert!(retry.next_send());
+        assert!(retry.next_send());
+        assert!(retry.next_send());
+        assert!(!retry.next_send());
         assert!(retry.exhausted());
     }
 
     #[test]
-    fn verify_tag_truncated_left_semantics() {
-        // A3 spike: verify_slice needs the FULL 32-byte tag and always
-        // fails on the 16-byte wire tag. verify_tag (verify_truncated_left)
-        // accepts the 16-byte tag and rejects a flipped byte / wrong key.
-        use super::{compute_tag, verify_tag};
-        let key = [0x42u8; 32];
-        let nonce = [0x24u8; 16];
-        let tag = compute_tag(&key, &nonce, 0x01, 0, b"");
-        assert!(verify_tag(&key, &nonce, 0x01, 0, b"", &tag));
-        let mut bad = tag;
-        bad[0] ^= 0xFF;
-        assert!(!verify_tag(&key, &nonce, 0x01, 0, b"", &bad));
-        assert!(!verify_tag(&[0xFFu8; 32], &nonce, 0x01, 0, b"", &tag));
-        assert!(!verify_tag(&key, &nonce, 0x01, 1, b"", &tag));
+    fn crc_verify_rejects_flipped_bytes() {
+        // CRC16 trailer: a flipped payload byte, a flipped CRC byte,
+        // and a wrong command byte all fail verification.
+        let frame = ControlFrame {
+            cmd: 0x01,
+            req_id: 1,
+            payload: b"hello".to_vec(),
+        };
+        let bytes = frame.encode().expect("encode");
+        assert_eq!(ControlFrame::verify(&bytes).expect("verifies"), frame);
+        let mut bad = bytes.clone();
+        bad[10] ^= 0xFF; // payload byte
+        assert_eq!(
+            ControlFrame::verify(&bad).unwrap_err(),
+            ControlParseError::BadCrc
+        );
+        let mut bad_crc = bytes.clone();
+        let last = bad_crc.len() - 1;
+        bad_crc[last] ^= 0xFF;
+        assert_eq!(
+            ControlFrame::verify(&bad_crc).unwrap_err(),
+            ControlParseError::BadCrc
+        );
+        // Structure-only parse still succeeds on a CRC-bad frame
+        // (and shows the flipped payload — structure is not integrity).
+        let parsed = ControlFrame::parse_structure(&bad).expect("structure parses");
+        assert_ne!(parsed.payload, frame.payload);
+    }
+
+    #[test]
+    fn frame_too_short_vs_bad_length() {
+        // Under 9 B -> TooShort; header readable but length mismatch ->
+        // BadLength.
+        let bytes = super::build_frame(0x01, 1, b"").expect("encode");
+        assert_eq!(
+            ControlFrame::verify(&bytes[..8]).unwrap_err(),
+            ControlParseError::TooShort
+        );
+        assert_eq!(
+            ControlFrame::verify(&bytes[..10]).unwrap_err(),
+            ControlParseError::BadLength
+        );
     }
 
     #[test]
     fn set_password_validation() {
         assert!(validate_set_password_payload(&[]).is_none());
-        let mut good = vec![8u8];
+        // No current password yet: curLen 0.
+        let mut good = vec![0u8, 8u8];
         good.extend_from_slice(b"Abcdef12");
         assert_eq!(
             validate_set_password_payload(&good),
-            Some(b"Abcdef12".as_slice())
+            Some((None, b"Abcdef12".as_slice()))
         );
-        let mut short = vec![7u8];
+        // With a current password: curLen 8 + current + newLen + new.
+        let mut with_current = vec![8u8];
+        with_current.extend_from_slice(b"oldpass1");
+        with_current.push(8u8);
+        with_current.extend_from_slice(b"Abcdef12");
+        assert_eq!(
+            validate_set_password_payload(&with_current),
+            Some((Some(b"oldpass1".as_slice()), b"Abcdef12".as_slice()))
+        );
+        // New password too short.
+        let mut short = vec![0u8, 7u8];
         short.extend_from_slice(b"Abcdef1");
         assert!(validate_set_password_payload(&short).is_none());
-        let mut space = vec![8u8];
+        // Space in the new password.
+        let mut space = vec![0u8, 8u8];
         space.extend_from_slice(b"Abc def1");
         assert!(validate_set_password_payload(&space).is_none());
+        // Space in the current password.
+        let mut bad_current = vec![8u8];
+        bad_current.extend_from_slice(b"old pas1");
+        bad_current.push(8u8);
+        bad_current.extend_from_slice(b"Abcdef12");
+        assert!(validate_set_password_payload(&bad_current).is_none());
+        // Truncated (declared newLen longer than the payload).
+        let mut truncated = vec![0u8, 8u8];
+        truncated.extend_from_slice(b"Abcdef");
+        assert!(validate_set_password_payload(&truncated).is_none());
+    }
+
+    #[test]
+    fn set_password_payload_round_trip() {
+        // First setup (no current password): [0][newLen][new].
+        let built = super::build_set_password_payload(None, b"Abcdef12")
+            .expect("valid new password builds");
+        assert_eq!(
+            built,
+            [0u8, 8u8, b'A', b'b', b'c', b'd', b'e', b'f', b'1', b'2']
+        );
+        assert_eq!(
+            validate_set_password_payload(&built),
+            Some((None, b"Abcdef12".as_slice()))
+        );
+        // Password change: [curLen][current][newLen][new].
+        let built = super::build_set_password_payload(Some(b"oldpass1"), b"Abcdef12")
+            .expect("valid current + new builds");
+        assert_eq!(
+            built,
+            [
+                8u8, b'o', b'l', b'd', b'p', b'a', b's', b's', b'1', 8u8, b'A', b'b', b'c', b'd',
+                b'e', b'f', b'1', b'2'
+            ]
+        );
+        assert_eq!(
+            validate_set_password_payload(&built),
+            Some((Some(b"oldpass1".as_slice()), b"Abcdef12".as_slice()))
+        );
+        // Bad current (space / too long) is refused.
+        assert!(super::build_set_password_payload(Some(b"old pas1"), b"Abcdef12").is_none());
+        assert!(super::build_set_password_payload(Some(&[b'a'; 64]), b"Abcdef12").is_none());
     }
 }

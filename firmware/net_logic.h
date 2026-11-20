@@ -127,7 +127,8 @@ static inline uint8_t rsh_rescan_allowed(uint8_t auto_channel, uint8_t pc_active
 // se zyada nahi (flap throttle). Pehla peer (have_pc=0) hamesha qabool.
 // Residual: idle board (koi active PC nahi) par koi bhi HELO bhej kar
 // stream le sakta hai — unauthenticated UDP bootstrap ki fitri had hai
-// (OPEN-6); pairing window + WPA2-after-pairing is ki had bandhte hain.
+// (OPEN-6); WPA2 password (jab set ho) is ki had bandhta hai — khula AP
+// (password set hone se pehle) par koi bhi station HELO bhej sakta hai.
 static inline uint8_t rsh_helo_accept(uint8_t have_pc, uint8_t pc_active, uint8_t same_ip,
                                       uint32_t ms_since_pc_change) {
   if (same_ip) return 1;
@@ -143,24 +144,6 @@ static inline uint8_t rsh_helo_accept(uint8_t have_pc, uint8_t pc_active, uint8_
 // liye reply drop ka chance kam; amplification cap phir bhi barqarar).
 static inline uint8_t rsh_hello_reply_allowed(uint32_t ms_since_last_reply) {
   return ms_since_last_reply >= 250u ? 1 : 0;
-}
-
-// ---- New-session rate limit (SEC-R2-04, F-05 v4.0.2) ----------------------
-// Purana rule: authenticated session active ho to naya session (HELO
-// sessionFlag=1 → nonce rotate) 10 s mein ek dafa — app restart/crash
-// recovery isi mein phans jati thi. Naya rule: WAHI PC (same IP / serial
-// point-to-point) jis ka purana session 2 s se zyada stale ho (HELLO
-// timeout ke baad — board ne use pehle hi inactive mana) dobara session
-// bana sakta hai; DOOSRA IP abhi bhi 10 s ka paband hai (nonce-rotate DoS
-// se bachao barqarar).
-static inline uint8_t rsh_new_session_allowed(uint8_t session_authenticated,
-                                              uint32_t ms_since_last_new_session,
-                                              uint8_t same_ip,
-                                              uint8_t old_session_stale) {
-  if (!session_authenticated) return 1;
-  if (ms_since_last_new_session >= 10000u) return 1;
-  if (same_ip && old_session_stale) return 1;
-  return 0;
 }
 
 // ---- Ping rate limiter (PROTOCOL §9.4, SEC-C-21) --------------------------

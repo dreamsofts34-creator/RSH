@@ -1,12 +1,12 @@
-//! Wired USB-serial transport for protocol v2.1 (Phase C2 / SW-R5.2).
+//! Wired USB-serial transport for protocol v2.2 (Phase C2 / SW-R5.2).
 //!
 //! One [`serialport`] port at 921600 baud, 8N1, no flow control, carries
-//! the same v2.1 payloads as UDP inside the `"RSHS"` envelope
+//! the same v2.2 payloads as UDP inside the `"RSHS"` envelope
 //! ([`SerialFrame`]): stream frames for the engine's [`PacketSource`],
-//! HELLO replies (the wired-pairing key disclosure, OPEN-20 — the USB
-//! cable is the trust anchor), status packets, ping frames, and raw
-//! `"RSHC"` control frames for the [`ControlTransport`] trait (HMAC
-//! verification lives in the control client, not here).
+//! HELLO replies (the USB cable is the trust anchor — no pairing,
+//! D12), status packets, ping frames, and raw `"RSHC"` control frames
+//! for the [`ControlTransport`] trait (CRC verification lives in the
+//! control client, not here).
 //!
 //! The design mirrors [`crate::udp::UdpTransport`]:
 //! a `std` blocking port (the workspace tokio pin does not enable the
@@ -24,7 +24,7 @@
 //!
 //! The ESP32 `DevKit V1` wires DTR/RTS through its auto-reset circuit to
 //! the EN/BOOT lines: asserting either resets the board or drops it
-//! into the bootloader (protocol v2.1 §10.3). This transport therefore
+//! into the bootloader (protocol v2.2 §10.3). This transport therefore
 //! opens every port with `.dtr_on_open(false)` **and** explicitly
 //! clears both lines ([`SerialPort::write_data_terminal_ready`] /
 //! [`SerialPort::write_request_to_send`] with `false`) immediately
@@ -72,7 +72,7 @@ use tokio::time::timeout;
 
 use crate::{ControlTransport, TransportError};
 
-/// Wired baud rate (protocol v2.1 §10.3): 115200 is not enough headroom
+/// Wired baud rate (protocol v2.2 §10.3): 115200 is not enough headroom
 /// at 200 Hz; 921600 runs at ~10% utilisation.
 pub const SERIAL_BAUD_RATE: u32 = 921_600;
 /// Reader-thread `read` timeout: how promptly shutdown is noticed, and
@@ -97,7 +97,7 @@ const PING_CHANNEL_CAPACITY: usize = 8;
 const READ_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
 /// Silicon Labs CP2102 VID — the ESP32 `DevKit V1` USB-UART bridge
-/// (protocol v2.1 §10.3).
+/// (protocol v2.2 §10.3).
 pub const CP2102_VID: u16 = 0x10C4;
 /// Silicon Labs CP2102 PID.
 pub const CP2102_PID: u16 = 0xEA60;
@@ -401,7 +401,7 @@ impl SerialTransport {
     /// wrapped as an `RSHS` kind-6 frame. The session layer drives
     /// this — there is no automatic HELO thread here, unlike the UDP
     /// transport's 1 Hz HELO: over serial the session is opened on
-    /// demand (connect / pair / reconnect), and the board's serial
+    /// demand (connect / reconnect), and the board's serial
     /// session ends on HELO timeout.
     ///
     /// # Errors
@@ -441,7 +441,7 @@ impl SerialTransport {
 
     /// Non-blocking drain of one queued HELLO reply (R2-07): the
     /// forwarder's frame loop drains this after every stream frame
-    /// so a pairing window opened after activation is still observed.
+    /// so a HELLO arriving after activation is still observed.
     pub fn try_next_hello(&mut self) -> Option<HelloReply> {
         self.hello_rx.try_recv().ok()
     }
@@ -896,7 +896,7 @@ fn handle_serial_frame(frame: SerialFrame, senders: &DemuxSenders, counters: &At
             }
         },
         SerialKind::Control => {
-            // Control replies are raw bytes here; HMAC verification
+            // Control replies are raw bytes here; CRC verification
             // belongs to the control client, which matches them by
             // `reqId`.
             counters.control_received.fetch_add(1, Ordering::Relaxed);

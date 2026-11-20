@@ -1101,8 +1101,7 @@ export component EmptyBanner inherits Rectangle {
     in property <string> action-label: "";
     in property <bool> is-error;
     // DS-54: the action button disables + dims while its job runs
-    // (Overview binds this to the banner's job kind: Reconnect 0,
-    // PairingOp 12).
+    // (Overview binds this to the banner's job kind: Reconnect 0).
     in property <bool> action-disabled: false;
     callback action-clicked();
     // DS-21 (U-03): was a fixed 36 px with no wrapping, so long

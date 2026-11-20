@@ -364,7 +364,7 @@ fn parse_get_cfg_body(
 /// One board transaction spans several Tauri commands
 /// (`stage_config` → `commit_config` → `confirm_config` /
 /// `rollback_config`), and every command runs under its own fresh
-/// session with a fresh nonce (D30) — the transaction client itself
+/// session with a fresh `reqId` counter — the transaction client itself
 /// cannot survive between commands. The snapshot is the part that
 /// does survive: it is kept in the app state between commands and
 /// handed to [`ConfigTransaction::resume`] over the next command's
@@ -871,11 +871,6 @@ mod tests {
     use crate::control_client::{ControlClient, ControlError, Session};
     use crate::{ControlTransport, TransportError};
 
-    /// Test device key / nonce (shared by client and fake board).
-    const KEY: [u8; 32] = [0x42; 32];
-    /// Test session nonce.
-    const NONCE: [u8; 16] = [0x24; 16];
-
     /// How the fake board answers `CONFIRM`.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     enum ConfirmBehavior {
@@ -900,10 +895,10 @@ mod tests {
         Silent,
     }
 
-    /// A scripted fake board: verifies tags, answers same-`reqId`
+    /// A scripted fake board: verifies CRCs, answers same-`reqId`
     /// retries from a cache without re-executing, keeps a live config
     /// (`stored`), a staged buffer, and a pending-commit flag — the
-    /// wire-faithful shapes from PROTOCOL-V2.1 §3.3/§3.5/§3.6
+    /// wire-faithful shapes from PROTOCOL-V2.2 §3.3/§3.5/§3.6
     /// (`GET_CFG` → `totalLen|offset|data`, `COMMIT` OK → `[30]`,
     /// `COMMIT` fail → `[errCount, errCode…]`).
     struct FakeBoard {
@@ -947,16 +942,7 @@ mod tests {
         }
 
         fn reply(frame: &ControlFrame, status: ErrorCode, body: &[u8]) -> Vec<u8> {
-            build_reply(
-                &KEY,
-                &NONCE,
-                frame.cmd,
-                frame.req_id,
-                frame.counter,
-                status,
-                body,
-            )
-            .expect("fake-board reply builds")
+            build_reply(frame.cmd, frame.req_id, status, body).expect("fake-board reply builds")
         }
 
         fn staged_bytes(&self) -> u16 {
@@ -1119,10 +1105,10 @@ mod tests {
                     self.pending = None;
                     return Ok(());
                 };
-                // Tag check first: a bad tag is answered BAD_TAG, never executed.
-                if ControlFrame::verify(&owned, &KEY, &NONCE).is_err() {
-                    let reply = Self::reply(&frame, ErrorCode::BadTag, &[]);
-                    self.pending = Some(reply);
+                // CRC check first: a bad-CRC frame is dropped silently,
+                // never executed and never answered.
+                if ControlFrame::verify(&owned).is_err() {
+                    self.pending = None;
                     return Ok(());
                 }
                 // Duplicate cache: same reqId re-answered, never re-executed.
@@ -1231,8 +1217,8 @@ mod tests {
     /// factory blob; 10 ms per-attempt timeout so a full 3-attempt
     /// timeout stays fast in tests.
     fn txn(board: FakeBoard) -> ConfigTransaction<FakeBoard> {
-        let client = ControlClient::new(board, Session::new(KEY, NONCE))
-            .with_timeout(Duration::from_millis(10));
+        let client =
+            ControlClient::new(board, Session::new()).with_timeout(Duration::from_millis(10));
         ConfigTransaction::new(client)
     }
 
@@ -1505,8 +1491,8 @@ mod tests {
         // with the distinct NoLastGoodBlob error.
         use super::ConfigTxnSnapshot;
         let board = FakeBoard::new(good_blob());
-        let client = ControlClient::new(board, Session::new(KEY, NONCE))
-            .with_timeout(Duration::from_millis(10));
+        let client =
+            ControlClient::new(board, Session::new()).with_timeout(Duration::from_millis(10));
         let snapshot = ConfigTxnSnapshot {
             state: ConfigState::Committed,
             staged_blob: Some(good_blob_v2()),
@@ -1718,7 +1704,7 @@ mod tests {
 
     /// A transaction split across two fresh sessions (H5-control):
     /// stage under one client, snapshot, resume over a new client
-    /// (fresh counter, same board), commit, snapshot, resume again,
+    /// (fresh reqId, same board), commit, snapshot, resume again,
     /// confirm — the board ends up on the new config. This is the
     /// exact shape the Tauri commands use (one command per step).
     #[tokio::test]
@@ -1730,16 +1716,15 @@ mod tests {
         assert_eq!(snapshot.state, ConfigState::Staged);
         assert_eq!(snapshot.staged_blob, Some(good_blob_v2()));
         assert_eq!(snapshot.last_good_blob, Some(good_blob()));
-        // The first client is dropped (its session key zeroized by the
-        // caller in production); the second client starts a fresh
+        // The first client is dropped; the second client starts a fresh
         // session over the same board. A fresh session resets the
         // board-side reply cache (`net_new_session()` in firmware
         // `net.cpp`), so the cached replies are cleared here — the
         // staged buffer itself survives the session change.
         let mut board = first.into_inner().into_inner().0;
         board.cached.clear();
-        let client = ControlClient::new(board, Session::new(KEY, NONCE))
-            .with_timeout(Duration::from_millis(10));
+        let client =
+            ControlClient::new(board, Session::new()).with_timeout(Duration::from_millis(10));
         let mut second = ConfigTransaction::resume(client, snapshot);
         assert_eq!(second.state(), ConfigState::Staged);
         second.commit().await.expect("commit succeeds");
@@ -1748,8 +1733,8 @@ mod tests {
         assert!(snapshot.committed_at.is_some());
         let mut board = second.into_inner().into_inner().0;
         board.cached.clear();
-        let client = ControlClient::new(board, Session::new(KEY, NONCE))
-            .with_timeout(Duration::from_millis(10));
+        let client =
+            ControlClient::new(board, Session::new()).with_timeout(Duration::from_millis(10));
         let mut third = ConfigTransaction::resume(client, snapshot);
         third.confirm().await.expect("confirm succeeds");
         assert_eq!(third.state(), ConfigState::Confirmed);
@@ -1760,8 +1745,8 @@ mod tests {
     #[tokio::test]
     async fn default_snapshot_resumes_idle() {
         let board = FakeBoard::new(good_blob());
-        let client = ControlClient::new(board, Session::new(KEY, NONCE))
-            .with_timeout(Duration::from_millis(10));
+        let client =
+            ControlClient::new(board, Session::new()).with_timeout(Duration::from_millis(10));
         let txn = ConfigTransaction::resume(client, super::ConfigTxnSnapshot::default());
         assert_eq!(txn.state(), ConfigState::Idle);
         assert_eq!(txn.confirm_deadline(), Duration::from_secs(30));

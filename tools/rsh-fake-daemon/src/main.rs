@@ -32,8 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rsh_api::{
-    ApiTransport, AppApi, ConnectionInfo, ConnectionState, PairingInfo, SnapshotInfo,
-    TuningSettings, UserError,
+    ApiTransport, AppApi, ConnectionInfo, ConnectionState, SnapshotInfo, TuningSettings, UserError,
+    WifiStatus,
 };
 use rsh_ipc::{IPC_PROTOCOL_VERSION, IpcError, IpcErrorBody, IpcResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -55,6 +55,7 @@ impl AppApi for StubApi {
             transport: ApiTransport::Wifi,
             address: String::new(),
             session_active: false,
+            board_reachable: false,
             error: None,
             hint: None,
         }
@@ -71,20 +72,28 @@ impl AppApi for StubApi {
         Ok(self.connection())
     }
 
-    fn pairing_status(&self) -> PairingInfo {
-        PairingInfo {
-            seconds_left: 0,
-            password: None,
-            error: None,
-            error_detail: None,
+    // No board, no network, no password: the honest disconnected
+    // Wi-Fi status (v2.2 — the pairing methods are gone).
+    // set/clear below return Unreachable ("fake daemon: no board"),
+    // consistent with connect() in this stub; the rejoin methods
+    // keep their trait defaults ("not supported").
+    fn wifi_status(&self) -> WifiStatus {
+        WifiStatus {
+            ssid: None,
+            connected: false,
+            password_set: false,
             board_mac: None,
-            replacement_required: false,
-            key_reset_armed: false,
-            attempt_log: Vec::new(),
         }
     }
 
-    fn begin_pairing(&self) -> Result<PairingInfo, UserError> {
+    fn set_wifi_password(&self, _password: &str, _confirm: &str) -> Result<WifiStatus, UserError> {
+        Err(UserError::from_connection(
+            rsh_api::errors::ConnectionError::Unreachable,
+            "fake daemon: no board",
+        ))
+    }
+
+    fn clear_wifi_password(&self) -> Result<WifiStatus, UserError> {
         Err(UserError::from_connection(
             rsh_api::errors::ConnectionError::Unreachable,
             "fake daemon: no board",

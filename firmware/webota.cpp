@@ -1,8 +1,12 @@
 // RSH WebOTA — browser se firmware update (FW-9 / SEC-C-02 / SEC-C-05 /
 // SEC-C-06 / SEC-D-02 / SEC-D-04 / SEC-D-12).
 // Board ke AP par http://192.168.4.1 par chhota sa page milta hai:
-// login (user: WEB_OTA_USER, password: per-device password —
-// keystore.h (FW-8), kabhi default nahi) ke baad .bin file upload karo.
+// login (user: WEB_OTA_USER, password: user-set Wi-Fi password —
+// keystore.h (v2.2), kabhi default nahi) ke baad .bin file upload karo.
+// D9 (v2.2): jab tak koi password set nahi, WebOTA DISABLED hai —
+// khula AP kabhi firmware-write endpoint offer nahi karta. Server
+// tabhi start hota hai jab password mojood ho (webota_begin ya baad
+// mein SET_PASSWORD ke baad webota_handle se lazy start).
 //
 // Security (har rule ka test tests-host/test_main.cpp mein hai):
 // - F1/SEC-D-02: HAR endpoint par authenticate() — root, /update
@@ -46,7 +50,7 @@
 #include <esp_random.h>
 #include <sodium.h>
 #include "status_led.h"
-#include "keystore.h"  // FW-8: per-device password (WebOTA auth, SEC-C-04)
+#include "keystore.h"  // v2.2: user-set Wi-Fi password (WebOTA auth, SEC-C-04)
 #include "ota_validate.h"
 #include "signing_pubkey.h"
 #include "webota_auth.h"  // F-08: per-IP auth rate limit (pure)
@@ -64,7 +68,13 @@ static uint32_t restartAtMs = 0;
 // (SoftAP max stations).
 static RshWebotaAuth webotaAuth;
 
+// D9: baghair password ke WebOTA band hai (defense in depth — server
+// aam tor par start hi nahi hota, lekin agar ho bhi jaye to auth fail).
 static bool authed() {
+  if (!keystore_has_password()) {
+    server.requestAuthentication();
+    return false;
+  }
   uint32_t now = millis();
   uint32_t ip = (uint32_t)server.client().remoteIP();
   // Lockout ke doran password check hi nahi karte (koi oracle nahi).
@@ -339,6 +349,17 @@ static void handleUpload() {
   }
 }
 
+static bool webotaStarted = false;
+
+// D9: server sirf tab start karo jab password set ho. SET_PASSWORD ke
+// baad (AP restart, reboot nahi) webota_handle() se lazy start hota hai.
+static void webota_ensure_started_() {
+  if (webotaStarted) return;
+  if (!keystore_has_password()) return;
+  server.begin();
+  webotaStarted = true;
+}
+
 void webota_begin() {
   // CSRF token: per-boot random 16 bytes -> 32 hex chars (SEC-D-12).
   static const char kHex[] = "0123456789abcdef";
@@ -357,10 +378,12 @@ void webota_begin() {
     if (!authed()) return;  // F1: unknown path par bhi auth (koi info leak nahi)
     server.send(404, "text/plain", "Not found");
   });
-  server.begin();
+  webota_ensure_started_();  // D9: password na ho to server start hi nahi hota
 }
 
 void webota_handle() {
+  webota_ensure_started_();  // D9: password baad mein set hua ho to ab start karo
+  if (!webotaStarted) return;  // WebOTA disabled (koi password nahi) — kuch nahi
   server.handleClient();
   // FIX-3: ruka hua upload (30 s koi chunk nahi) abort karo — warna
   // `active` latka rehta aur rsh.ino loop sampling kabhi wapas nahi

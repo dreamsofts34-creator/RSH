@@ -84,7 +84,7 @@ component Seg inherits Rectangle {
 // ---------------------------------------------------------------- Settings page (content only — no Window/sidebar)
 export component SettingsScreen inherits VerticalLayout {
     // ---- state owned by Rust (simulated defaults; AppApi covers
-    // connection + pairing only — see header)
+    // connection only — see header)
     in-out property <bool> connected: true;
     // DS-54: which job kind the busy strip shows, as a
     // JobKind::order value (-1 = idle) — the invoking button
@@ -103,10 +103,20 @@ export component SettingsScreen inherits VerticalLayout {
     // Theme.mode; the window binds this two-way to `theme-choice`.
     in-out property <int> theme-choice: 0;
     in-out property <[ProfileRow]> profiles;
-    in-out property <string> app-version: "RSH 2.0.5";
+    in-out property <string> app-version: "RSH 2.0.6";
     in-out property <string> firmware-text: "—";
     in-out property <string> app-update-text: "Auto-update is off — new versions are on GitHub Releases";
     in-out property <string> backup-text: "No backups yet";
+    // D19: Wi-Fi password state (Settings "Connection" card) —
+    // whether the wheel's hotspot has a password, the new-password
+    // + confirm fields, inline error/success, and the busy state
+    // while a set/forget runs. Rust owns all of these.
+    in property <bool> wifi-password-set: false;
+    in property <string> wifi-password-error: "";
+    in property <string> wifi-password-message: "";
+    in property <bool> wifi-password-busy: false;
+    in-out property <string> wifi-password-new: "";
+    in-out property <string> wifi-password-confirm: "";
 
     callback connection-selected(int);
     // H4 (v2.0.2): fired on Enter with the typed address — the old
@@ -115,7 +125,8 @@ export component SettingsScreen inherits VerticalLayout {
     // (Enter = accept the address, not Save — M5.)
     callback address-accepted(string);
     callback reconnect();
-    callback pair-requested();
+    callback set-wifi-password();
+    callback forget-wifi-password();
     callback backend-selected(int);
     callback toggled-start-windows(bool);
     callback toggled-keep-tray(bool);
@@ -215,17 +226,73 @@ export component SettingsScreen inherits VerticalLayout {
                                 Btn { label: "Reconnect"; disabled: busy-kind == 0; clicked => { reconnect(); } }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
-                            HorizontalLayout {
+                            // D19: Wi-Fi password — set on the wheel's
+                            // hotspot so the next connection uses it.
+                            // 8–63 printable ASCII; Rust validates and
+                            // reports inline + toast on failure.
+                            VerticalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
-                                spacing: 10px;
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    spacing: 0px;
-                                    Text { text: "Pair a new wheel"; font-size: 13px; color: Theme.text; }
-                                    Text { text: "120 s pairing window"; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                spacing: 6px;
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        spacing: 0px;
+                                        Text { text: "Wi-Fi password"; font-size: 13px; color: Theme.text; }
+                                        Text { text: wifi-password-set ? "Password set — the wheel's hotspot needs it." : "No password — the wheel's hotspot is open."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    }
+                                    Pill { label: wifi-password-set ? "Set" : "Not set"; bg: wifi-password-set ? Theme.ok-bg : Theme.panel2; fg: wifi-password-set ? Theme.ok : Theme.mute; }
                                 }
-                                Btn { label: "Pair"; disabled: busy-kind == 12; clicked => { pair-requested(); } }
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: 28px;
+                                    border-radius: 7px;
+                                    border-width: 1px;
+                                    border-color: Theme.line;
+                                    background: Theme.bg;
+                                    TextInput {
+                                        x: 10px;
+                                        width: parent.width - 20px;
+                                        height: 100%;
+                                        vertical-alignment: center;
+                                        text <=> wifi-password-new;
+                                        input-type: InputType.password;
+                                        font-size: 12px;
+                                        font-weight: 500;
+                                        color: Theme.text;
+                                        selection-background-color: Theme.accent;
+                                    }
+                                }
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: 28px;
+                                    border-radius: 7px;
+                                    border-width: 1px;
+                                    border-color: Theme.line;
+                                    background: Theme.bg;
+                                    TextInput {
+                                        x: 10px;
+                                        width: parent.width - 20px;
+                                        height: 100%;
+                                        vertical-alignment: center;
+                                        text <=> wifi-password-confirm;
+                                        input-type: InputType.password;
+                                        font-size: 12px;
+                                        font-weight: 500;
+                                        color: Theme.text;
+                                        selection-background-color: Theme.accent;
+                                    }
+                                }
+                                Text { text: "New password (8–63 characters) — type it again to confirm."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Btn { label: wifi-password-busy ? "Setting…" : wifi-password-set ? "Change password" : "Set password"; primary: true; disabled: wifi-password-busy || busy-kind == 14; clicked => { set-wifi-password(); } }
+                                    if wifi-password-set : Btn { label: "Forget password"; disabled: wifi-password-busy || busy-kind == 14; clicked => { forget-wifi-password(); } }
+                                }
+                                if wifi-password-error != "" : Text { text: wifi-password-error; font-size: 12px; color: Theme.bad; wrap: word-wrap; }
+                                if wifi-password-message != "" : Text { text: wifi-password-message; font-size: 12px; color: Theme.ok; wrap: word-wrap; }
+                                Text { text: "Forgetting clears the password on this PC. If the wheel still has one, hold BOOT on the wheel for 10 seconds to clear it there too — the hotspot then comes back open."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
                             // A1 (v2.0.2): the setup-reopen row is easy
@@ -239,7 +306,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Run setup again"; font-size: 13px; color: Theme.text; }
-                                    Text { text: "Connect, drivers, pair, calibrate, games."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: "Connect, drivers, calibrate, games."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 Btn { label: "Run setup"; primary: true; clicked => { run-setup(); } }
                             }

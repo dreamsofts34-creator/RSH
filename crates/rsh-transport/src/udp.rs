@@ -1,4 +1,4 @@
-//! UDP transport for protocol v2.1 (Phase C1 / SW-R5.1).
+//! UDP transport for protocol v2.2 (Phase C1 / SW-R5.1).
 //!
 //! One [`std::net::UdpSocket`] bound to the local stream port (4211 by
 //! default) serves all three UDP channels:
@@ -8,7 +8,7 @@
 //!   [`PacketSource`], plus `"RSHR"` HELLO replies and `0xA6` status
 //!   packets, demuxed by magic;
 //! * control (PC ↔ board, port 4212) — raw `"RSHC"` frames for the
-//!   [`ControlTransport`] trait (HMAC verification lives in the control
+//!   [`ControlTransport`] trait (CRC verification lives in the control
 //!   client, not here).
 //!
 //! The socket is a `std` socket, not `tokio::net::UdpSocket`: the
@@ -53,13 +53,13 @@ use crate::{ControlTransport, TransportError};
 pub const HELO_PORT: u16 = 4210;
 /// Local stream port (board → PC, 200 Hz stream + HELLO replies).
 pub const STREAM_PORT: u16 = 4211;
-/// Board control port (PC ↔ board, HMAC control frames).
+/// Board control port (PC ↔ board, unsigned control frames, CRC only).
 pub const CONTROL_PORT: u16 = 4212;
 /// Default board IP on its `SoftAP` (`D33` fallback).
 pub const DEFAULT_BOARD_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 4, 1);
 /// HELO send interval: 1 Hz.
 pub const HELO_INTERVAL: Duration = Duration::from_secs(1);
-/// Largest datagram this transport reads (control frames cap at 1053 B).
+/// Largest datagram this transport reads (control frames cap at 1035 B).
 pub const MAX_DATAGRAM_LEN: usize = 2048;
 /// Stream-frame channel capacity (200 Hz; the engine drains each tick).
 const FRAME_CHANNEL_CAPACITY: usize = 256;
@@ -449,13 +449,13 @@ impl UdpTransport {
 
     /// Send one HELO request to the board's HELO port (protocol §2.1).
     ///
-    /// One-shot, for the session layer: a new session needs a fresh
-    /// nonce (D30 — routine flag-0 HELOs return the old nonce, and the
-    /// old nonce/counter are never reused after a session ends), and
-    /// only a HELO with `session_flag 1` gets one. The 1 Hz HELO thread
-    /// always sends flag 0 (resume), so the session activator calls
-    /// this at activation start (and once on retry); steady-state
-    /// HELOs are untouched. A send failure is reported, never retried
+    /// One-shot, for the session layer: a new session is just a new
+    /// unsigned `connect()` on the PC side (v2.2 carries no session
+    /// material — the `session_flag` is retained for wire
+    /// compatibility only). The 1 Hz HELO thread always sends flag 0,
+    /// so the session activator calls this at activation start (and
+    /// once on retry); steady-state HELOs are untouched. A send failure
+    /// is reported, never retried
     /// here — the caller treats it as "no HELLO will arrive" and times
     /// out instead of failing the transport (in sandboxes `sendto` is
     /// blocked while loopback receive still works).
@@ -541,7 +541,7 @@ impl UdpTransport {
 
     /// Non-blocking drain of one queued HELLO reply (R2-07): the
     /// forwarder's frame loop drains this after every stream frame
-    /// so a pairing window opened after activation is still observed.
+    /// so a HELLO arriving after activation is still observed.
     pub fn try_next_hello(&mut self) -> Option<HelloReply> {
         self.hello_rx.try_recv().ok()
     }
@@ -751,7 +751,7 @@ fn handle_datagram(data: &[u8], senders: &DemuxSenders, counters: &AtomicCounter
             counters.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
         }
     } else if data.starts_with(b"RSHC") {
-        // Control replies are raw bytes here; HMAC verification belongs
+        // Control replies are raw bytes here; CRC verification belongs
         // to the control client, which matches them by `reqId`.
         counters.control_received.fetch_add(1, Ordering::Relaxed);
         if senders.control.try_send(data.to_vec()).is_err() {
@@ -939,9 +939,10 @@ mod tests {
         assert_eq!(reader_error_delay(100), Duration::from_secs(1));
     }
 
-    /// A HELLO reply with zeroed credentials (valid wire form).
+    /// A HELLO reply with zeroed reserved fields (valid wire form).
     fn test_hello_reply() -> HelloReply {
         HelloReply {
+            protocol: (2, 2),
             flags: 0,
             session_echo: 0,
             board_mac: [0xAA; 6],

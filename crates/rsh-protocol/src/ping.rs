@@ -1,6 +1,6 @@
 //! NTP-style ping (§9): `"RSHN"` 34 B fixed, E2E latency measurement.
 //!
-//! Layout: `magic[4] | ver 0x21 | type u8 (0 request, 1 reply) | seq u16 |
+//! Layout: `magic[4] | ver 0x22 | type u8 (0 request, 1 reply) | seq u16 |
 //! t0 u64 | t1 u64 | t2 u64 | CRC16`. All timestamps are µs; `t0` is the
 //! PC monotonic send time, `t1`/`t2` are board monotonic receive/send
 //! times. `t3` (PC receive time) is never on the wire — the PC measures

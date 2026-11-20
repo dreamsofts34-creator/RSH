@@ -1,20 +1,18 @@
 #pragma once
-// RSH control-channel dispatcher (FW-8, SEC-D-06/SEC-D-07) — PURE
+// RSH control-channel dispatcher (FW-8, v2.2 — plain, no HMAC) — PURE
 // (Arduino-free) taake host par unit test ho sake.
 //
-// Wire flow (§3.2): frame → structure parse → HMAC verify → session
-// classify → handler (sirf ACCEPT par) → signed reply.
+// Wire flow (§3.2, v2.2): frame → structure + CRC16 parse → reqId
+// classify → handler (sirf ACCEPT par) → reply (CRC16).
 //
-// - Malformed (bad magic / too short / bad length / truncated) → SILENT
-//   DROP, koi reply nahi (reqId par bharosa nahi kiya ja sakta).
-// - Bad tag / wrong key → BAD_TAG (1) reply, handler KABHI nahi chalta.
-// - Replay (naya reqId, purana counter) → REPLAY (2) reply, no execute.
-// - Duplicate (wahi reqId+counter) → CACHED reply dobara, no execute.
+// - Malformed (bad magic / too short / bad length / truncated / bad CRC)
+//   → SILENT DROP, koi reply nahi (reqId par bharosa nahi kiya ja sakta).
+// - Duplicate (wahi reqId dobara) → CACHED reply dobara, no execute.
 //   Cache mein reply na ho (reply RSH_CTRL_CACHED_REPLY_MAX se bara tha)
 //   to idempotent dobara-execute hota hai — §3.2 kehta hai tamam commands
 //   idempotent honi chahiye, is liye ye fallback mehfooz hai.
 // - Unknown cmd → handler UNSUPPORTED (6) deta hai, execute nahi hota.
-// - Reply tag hamesha board key/nonce se banta hai (rsh_v2_ctrl_build).
+// - Reply hamesha isi frame layout mein banta hai (rsh_v2_ctrl_build).
 //
 // Handler contract: status return karo; reply_body mein status KE BAGHAIR
 // body bharo (dispatcher status khud prepend karta hai); *reply_body_len
@@ -33,10 +31,9 @@ typedef uint8_t (*rsh_ctrl_handler_fn)(uint8_t cmd, const uint8_t *payload, uint
 
 typedef struct {
   uint16_t req_id;
-  uint32_t counter;
   uint16_t len;  // cached reply frame ki length (bytes[])
   uint8_t bytes[RSH_CTRL_CACHED_REPLY_MAX];
-  uint8_t has_pair;   // slot mein (reqId, counter) maujood hai
+  uint8_t has_pair;   // slot mein reqId maujood hai
   uint8_t has_reply;  // bytes[] mein poora reply frame maujood hai
 } rsh_ctrl_cache_entry_t;
 
@@ -51,25 +48,22 @@ static inline void rsh_ctrl_cache_init(rsh_ctrl_cache_t *c) {
 }
 
 static inline const rsh_ctrl_cache_entry_t *rsh_ctrl_cache_find(rsh_ctrl_cache_t *c,
-                                                                uint16_t req_id,
-                                                                uint32_t counter) {
+                                                                uint16_t req_id) {
   if (!c) return NULL;
   for (int i = 0; i < RSH_CTRL_CACHE_SLOTS; i++) {
-    if (c->slots[i].has_pair && c->slots[i].req_id == req_id &&
-        c->slots[i].counter == counter)
+    if (c->slots[i].has_pair && c->slots[i].req_id == req_id)
       return &c->slots[i];
   }
   return NULL;
 }
 
-static inline void rsh_ctrl_cache_store(rsh_ctrl_cache_t *c, uint16_t req_id, uint32_t counter,
+static inline void rsh_ctrl_cache_store(rsh_ctrl_cache_t *c, uint16_t req_id,
                                         const uint8_t *reply, uint16_t reply_len) {
   if (!c || !reply) return;
-  // Pehle wahi pair dhoondo (update), warna round-robin slot lo.
+  // Pehle wahi reqId dhoondo (update), warna round-robin slot lo.
   rsh_ctrl_cache_entry_t *slot = NULL;
   for (int i = 0; i < RSH_CTRL_CACHE_SLOTS; i++) {
-    if (c->slots[i].has_pair && c->slots[i].req_id == req_id &&
-        c->slots[i].counter == counter) { slot = &c->slots[i]; break; }
+    if (c->slots[i].has_pair && c->slots[i].req_id == req_id) { slot = &c->slots[i]; break; }
   }
   if (!slot) {
     slot = &c->slots[c->next];
@@ -77,7 +71,6 @@ static inline void rsh_ctrl_cache_store(rsh_ctrl_cache_t *c, uint16_t req_id, ui
   }
   memset(slot, 0, sizeof(*slot));
   slot->req_id = req_id;
-  slot->counter = counter;
   slot->has_pair = 1;
   if (reply_len <= RSH_CTRL_CACHED_REPLY_MAX) {
     memcpy(slot->bytes, reply, reply_len);
@@ -94,41 +87,28 @@ typedef enum {
 } rsh_ctrl_disp_t;
 
 // Ek control frame dispatch karo. reply_out kam az kam
-// RSH_V2_CTRL_MAX_FRAME (1053) bytes ka ho. *reply_len_out = reply bytes
+// RSH_V2_CTRL_MAX_FRAME (1035) bytes ka ho. *reply_len_out = reply bytes
 // (sirf REPLY par). Return DROP = kuch mat bhejo.
 static inline rsh_ctrl_disp_t rsh_ctrl_dispatch(
     const uint8_t *frame, size_t frame_len,
-    const uint8_t *key32, const uint8_t *nonce16, rsh_hmac16_fn hmac,
     rsh_ctrl_session_t *session, rsh_ctrl_cache_t *cache,
     rsh_ctrl_handler_fn handler, void *ctx,
     uint8_t *reply_out, size_t reply_out_len, size_t *reply_len_out) {
   if (reply_len_out) *reply_len_out = 0;
-  if (!frame || !key32 || !nonce16 || !hmac || !session || !cache || !handler ||
-      !reply_out || reply_out_len < (size_t)RSH_V2_CTRL_HEADER_SIZE + RSH_V2_CTRL_TAG_SIZE)
+  if (!frame || !session || !cache || !handler ||
+      !reply_out || reply_out_len < (size_t)RSH_V2_CTRL_HEADER_SIZE + 2u)
     return RSH_CTRL_DISP_DROP;
 
   rsh_v2_ctrl_t f;
-  // Malformed → silent drop (§3.2).
+  // Malformed (structure ya CRC) → silent drop (§3.2).
   if (rsh_v2_ctrl_parse_structure(frame, frame_len, &f) != RSH_V2_OK)
     return RSH_CTRL_DISP_DROP;
 
   uint8_t reply_cmd = (uint8_t)(f.cmd | 0x80);
-  uint8_t status_payload[1];
 
-  // Tag fail → BAD_TAG reply (reqId/counter echo; tag board key se).
-  // Handler NAHI chalta — ghalat frame kabhi execute nahi hota.
-  if (rsh_v2_ctrl_verify(frame, frame_len, key32, nonce16, hmac, NULL) != RSH_V2_OK) {
-    status_payload[0] = RSH_CTRL_BAD_TAG;
-    size_t n = rsh_v2_ctrl_build(reply_out, reply_out_len, reply_cmd, f.req_id, f.counter,
-                                 status_payload, 1, key32, nonce16, hmac);
-    if (n == 0) return RSH_CTRL_DISP_DROP;
-    *reply_len_out = n;
-    return RSH_CTRL_DISP_REPLY;
-  }
-
-  rsh_ctrl_decision_t dec = rsh_ctrl_session_classify(session, f.req_id, f.counter);
+  rsh_ctrl_decision_t dec = rsh_ctrl_session_classify(session, f.req_id);
   if (dec == RSH_DEC_DUPLICATE) {
-    const rsh_ctrl_cache_entry_t *hit = rsh_ctrl_cache_find(cache, f.req_id, f.counter);
+    const rsh_ctrl_cache_entry_t *hit = rsh_ctrl_cache_find(cache, f.req_id);
     if (hit && hit->has_reply) {
       if ((size_t)hit->len > reply_out_len) return RSH_CTRL_DISP_DROP;
       memcpy(reply_out, hit->bytes, hit->len);
@@ -137,13 +117,6 @@ static inline rsh_ctrl_disp_t rsh_ctrl_dispatch(
     }
     // Cached reply nahi (reply bohat bara tha) → neeche dobara execute
     // (idempotent fallback).
-  } else if (dec == RSH_DEC_REPLAY) {
-    status_payload[0] = RSH_CTRL_REPLAY;
-    size_t n = rsh_v2_ctrl_build(reply_out, reply_out_len, reply_cmd, f.req_id, f.counter,
-                                 status_payload, 1, key32, nonce16, hmac);
-    if (n == 0) return RSH_CTRL_DISP_DROP;
-    *reply_len_out = n;
-    return RSH_CTRL_DISP_REPLY;
   }
 
   // ACCEPT (ya DUPLICATE-baghair-cache): handler chalao — yehi waahid
@@ -161,10 +134,10 @@ static inline rsh_ctrl_disp_t rsh_ctrl_dispatch(
   }
   payload_buf[0] = status;
   if (body_len > 0) memcpy(payload_buf + 1, body_buf, body_len);
-  size_t n = rsh_v2_ctrl_build(reply_out, reply_out_len, reply_cmd, f.req_id, f.counter,
-                               payload_buf, (uint16_t)(1 + body_len), key32, nonce16, hmac);
+  size_t n = rsh_v2_ctrl_build(reply_out, reply_out_len, reply_cmd, f.req_id,
+                               payload_buf, (uint16_t)(1 + body_len));
   if (n == 0) return RSH_CTRL_DISP_DROP;
-  rsh_ctrl_cache_store(cache, f.req_id, f.counter, reply_out, (uint16_t)n);
+  rsh_ctrl_cache_store(cache, f.req_id, reply_out, (uint16_t)n);
   *reply_len_out = n;
   return RSH_CTRL_DISP_REPLY;
 }
