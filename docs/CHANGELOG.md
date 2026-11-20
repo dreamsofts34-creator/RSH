@@ -1,10 +1,39 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.4 · firmware v4.0.2 · protocol v2.1 (frozen)**.
+**app v2.0.5 · firmware v4.0.2 · protocol v2.1 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.5] — 2026-11-20
+
+Pairing confirm fix + full UI polish + cards layout + performance
+(commit `b897188`, `a935db2`, `02bfced`):
+
+- **Pairing fixed (research-first).** Root cause: the confirm block
+  only showed while `pairing-active` was false, but every attempt
+  sets it true until the 60 s window expires — confirm could never
+  be clicked. Now the replace block shows whenever a replacement is
+  required and the board is unpaired; "Replace pairing" is the
+  primary action and reset actually deletes the stored key; the
+  Overview banner offers confirm directly; the one-shot flag is
+  board-bound; failure clears `pairing-active` and re-offers the
+  block. Wi-Fi join banner + first-Unreachable notification.
+- **UI polish.** Every popup closes on outside click; errors only as
+  a centred ~480 px toast, a small inline box, or a banner — never
+  full-window. UI logging added (`rsh-ui-YYYYMMDD.log` in
+  `%APPDATA%\RSH\logs`).
+- **Cards layout.** Gaps now auto-adjust to the window (spacers +
+  min-width); cards are the same size ON and OFF (body stays in the
+  tree, greyed when off).
+- **Performance.** Release profile (strip + LTO fat): binaries
+  −36.8% (daemon 36.65 → 22.05 MB, UI 42.33 → 27.90 MB). Frame rest
+  (unchanged frames skip ~52 set calls; 10 Hz when not live);
+  wakeup sources cut (USB-only port refresher; slow-poll 192.5 µs →
+  9.3 µs); buffered UI log; tray refresh gating; window shown
+  before the sync block, first paint logged; second job lane;
+  backend lock fix; new perf gate step.
 
 ## [2.0.4] — 2026-11-19
 
