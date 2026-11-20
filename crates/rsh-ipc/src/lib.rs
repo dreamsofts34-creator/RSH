@@ -4,12 +4,12 @@
 //! Wire format — one JSON object per line, UTF-8, `\\n` terminated:
 //!
 //! * Request (client → server):
-//!   `{"v":1,"id":7,"method":"ping","params":{}}`
+//!   `{"v":2,"id":7,"method":"ping","params":{}}`
 //! * Response (server → client):
-//!   `{"v":1,"id":7,"ok":true,"result":{...}}` or
-//!   `{"v":1,"id":7,"ok":false,"error":{"code":"…","message":"…"}}`
+//!   `{"v":2,"id":7,"ok":true,"result":{...}}` or
+//!   `{"v":2,"id":7,"ok":false,"error":{"code":"…","message":"…"}}`
 //! * Event push (server → client, no `id`):
-//!   `{"v":1,"event":{…AppEvent JSON…}}`
+//!   `{"v":2,"event":{…AppEvent JSON…}}`
 //!
 //! `v` is the protocol version; a client or server that sees a
 //! version it does not understand must fail the call with

@@ -65,7 +65,7 @@ function Connect-PipeClient {
 function Invoke-PipePing {
     param($Client, [int]$Id)
     $Client.Writer.WriteLine(
-        "{`"v`":1,`"id`":$Id,`"method`":`"ping`",`"params`":{}}")
+        "{`"v`":2,`"id`":$Id,`"method`":`"ping`",`"params`":{}}")
     $line = $Client.Reader.ReadLine()
     if ($null -eq $line) { return $false }
     return $line.Contains('"pong":true')

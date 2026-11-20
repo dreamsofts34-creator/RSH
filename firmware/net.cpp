@@ -232,6 +232,10 @@ void net_led_apply_persistent(const uint8_t *blob, size_t len) {
   rsh_led_driver_set_persistent(&ledDrv, &p, cfg.brightness, millis());
 }
 
+// Forward declaration: defined below — the DS-11 retry block calls it
+// first, and C++ requires the declaration before use.
+static bool net_start_ap_and_sockets(uint8_t ch);
+
 // DS-11: AP restart retry — net_start_ap_and_sockets() fail hone par
 // (password restart ya rescan restart) AP band rehta hai; ye pending
 // flag agle net_poll() calls par har 5 s mein dobara koshish karta hai.
