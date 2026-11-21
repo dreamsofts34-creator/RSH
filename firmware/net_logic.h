@@ -39,6 +39,26 @@ static inline bool rsh_pc_active(uint32_t last_hello_ms, uint32_t now_ms,
   return (uint32_t)(now_ms - last_hello_ms) < timeout_ms;
 }
 
+// ---- Session reset triggers (R3-FW-02 / R3-FW-11) ------------------------
+// Board ka reqId dedup cache sirf flag-1 HELO ya reboot par reset hota
+// tha — app restart ke baad (reqIds dobara 0 se) purane session ke
+// cached replies se pehle ~32 commands takra sakte thay. Naya session
+// ab in surat mein bhi mana jata hai (sirf us transport ka — FW-11):
+//   * naya peer IP (pichle peer ka cache is peer ke liye stale hai), ya
+//   * peer liveness timeout ke baad wapas aaya (is beech app restart ho
+//     sakti hai — us ke reqIds 0 se shuru hote hain jabke board ke
+//     cache mein purane session ke 0..31 abhi maujood hain).
+// Routine HELO (same IP, timeout ke andar) kabhi reset nahi karta —
+// reset sirf tab jab board peer ko pehle se "gaya hua" manta ho
+// (net_pc_active false) ya peer badla ho. have_pc=0 ho to koi purana
+// session hai hi nahi (fresh init), is liye 0.
+static inline uint8_t rsh_session_reset_needed(uint8_t have_pc,
+                                               uint8_t pc_active,
+                                               uint8_t same_ip) {
+  if (!have_pc) return 0;
+  return (!same_ip || !pc_active) ? 1 : 0;
+}
+
 struct TxStats {
   uint32_t sent = 0;
   uint32_t tx_fail = 0;  // F3: failed UDP transmissions (boot se)

@@ -196,8 +196,18 @@ static void fw34_boot_setup() {
       cfgTxn.previous_len = plen;
       cfgTxn.has_previous = 1;
     }
-    if (rsh_cfg_boot_recover(&cfgTxn, 1))
+    if (rsh_cfg_boot_recover(&cfgTxn, 1)) {
       fw34_slot_save(cfgPref, "cur", cfgTxn.current, cfgTxn.current_len);
+    } else {
+      // R3-FW-10: pend=1 lekin `prv` maujood/kharab nahi — invariant
+      // (config_transaction.h) ke mutabiq caller factory fallback le:
+      // unconfirmed current config live NAHI reh sakti ("reboot confirm
+      // nahi karta"). Diag event bhi record karo taake nazar aaye.
+      uint16_t flen = (uint16_t)rsh_cfg_factory_blob(fw34_scratch);
+      if (rsh_cfg_txn_load_current(&cfgTxn, fw34_scratch, flen) == RSH_CTRL_OK)
+        fw34_slot_save(cfgPref, "cur", cfgTxn.current, cfgTxn.current_len);
+      rsh_diag_record_global(RSH_DIAG_CFG_ROLLBACK, 0, millis());
+    }
     cfgPref.putUChar("pend", 0);
   }
   // Phase G (C3): purana factory blob (Phase D/E/F — BUTTON slots 0..3)
@@ -778,7 +788,9 @@ void loop() {
     st.battery_pct = 255;  // no battery module
     st.supply_mv = 0;      // not measured
     st.heap = ESP.getFreeHeap();
-    st.overruns = (uint16_t)overrunCount;
+    st.overruns = (uint16_t)overrunCount;  // R3-FW-09: u32 counter ka low
+    // 16 bits — wrap-aware counter hai (layout change nahi, protocol
+    // bump nahi); PC sirf deltas parhe (PROTOCOL-V2.2.md §1.4).
     st.max_cycle_us = maxCycleUs > 0xFFFF ? 0xFFFF : (uint16_t)maxCycleUs;
     st.governor = inputs_governor().level;
     st.reset_reason = rsh_reset_reason_code();  // FIX-4: asal wajah (pehle hamesha 1)

@@ -42,5 +42,8 @@ bool keystore_check_password(const char *pw, uint8_t len);
 bool keystore_set_password(const char *pw, uint8_t len);
 // D7: password mitao (NVS + RAM) — BOOT >= 10 s hold se. Clear ke baad
 // AP khula aata hai. false = NVS remove fail (fail closed — RAM password
-// rehta hai, caller reboot NAHI karta).
+// rehta hai, caller reboot NAHI karta). R3-FW-03: clear `s_ready` par
+// munhasir NAHI hai — corrupt obfkey + blob wali bricked state mein bhi
+// kaam karta hai (recovery path); obfkey bhi mit-ti hai taake agla
+// begin() nayi key generate kar sake.
 bool keystore_clear_password(void);

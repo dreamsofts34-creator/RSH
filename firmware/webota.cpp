@@ -48,6 +48,7 @@
 #include <WebServer.h>
 #include <Update.h>
 #include <esp_random.h>
+#include <esp_task_wdt.h>  // R3-FW-08: Update.end() ke aas-paas feed
 #include <sodium.h>
 #include "status_led.h"
 #include "keystore.h"  // v2.2: user-set Wi-Fi password (WebOTA auth, SEC-C-04)
@@ -338,7 +339,12 @@ static void handleUpload() {
       active = false;
       return;
     }
+    // R3-FW-08: Update.end(true) flash verify/write blocking hai — loop
+    // task WDT (5 s) mein subscribed hai, is liye end se pehle aur baad
+    // mein feed karo (webota_handle loop task se chalta hai).
+    esp_task_wdt_reset();
     updateOk = Update.end(true);  // ESP image SHA bhi yahin verify hoti hai
+    esp_task_wdt_reset();
     if (!updateOk) uploadError = "update end failed";
     active = false;
   } else if (up.status == UPLOAD_FILE_ABORTED) {

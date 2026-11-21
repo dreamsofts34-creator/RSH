@@ -28,6 +28,8 @@
 #include "stream_emit.h"     // v2.2 stream emission (§1.1, Phase E WS5)
 #include "serial_transport.h" // wired USB-serial framing (§10, Phase G WS1)
 #include "as5600.h"          // Phase G WS4: AS5600 magnetic encoder (D34)
+#include "ads1115.h"         // Round 3 WS-3 FW-01: ADS1115 I2C ADC
+#include "i2c_axes.h"        // Round 3 WS-3 FW-01: I2C axes sampler
 #include "version.h"         // F-12 (v4.0.3): single version source
 #include "diag_log.h"        // F-10: diagnostics ring log + GET_DIAG body
 #include "webota_auth.h"     // F-08: WebOTA per-IP auth lockout
@@ -117,6 +119,47 @@ static int test_sha256_fail_cb(const uint8_t *d, size_t n, uint8_t out[32]) {
   (void)d; (void)n; (void)out;
   return 0;
 }
+
+// ---- mbedTLS SHA-256 stub implementations (stubs/mbedtls/sha256.h) ----
+// keystore.cpp ka sha256_ inhein bulata hai; yahan wahi independent
+// SHA-256 istemal hota hai jo upar test_sha256_cb mein hai. Context
+// sirf input buffer karta hai, finish par one-shot hash hota hai.
+#include <mbedtls/sha256.h>
+void mbedtls_sha256_init(mbedtls_sha256_context *ctx) {
+  if (ctx) ctx->len = 0;
+}
+int mbedtls_sha256_starts_ret(mbedtls_sha256_context *ctx, int is224) {
+  if (!ctx || is224) return 1;
+  ctx->len = 0;
+  return 0;
+}
+int mbedtls_sha256_update_ret(mbedtls_sha256_context *ctx,
+                              const unsigned char *input, size_t ilen) {
+  if (!ctx || !input) return 1;
+  if (ctx->len + ilen > sizeof(ctx->buf)) return 1;
+  memcpy(ctx->buf + ctx->len, input, ilen);
+  ctx->len += ilen;
+  return 0;
+}
+int mbedtls_sha256_finish_ret(mbedtls_sha256_context *ctx,
+                              unsigned char output[32]) {
+  if (!ctx || !output) return 1;
+  sha256_once(ctx->buf, ctx->len, output);
+  ctx->len = 0;
+  return 0;
+}
+void mbedtls_sha256_free(mbedtls_sha256_context *ctx) {
+  if (ctx) ctx->len = 0;
+}
+
+// ---- keystore.cpp (R3-FW-03 host test) ----------------------------------
+// Arduino-only file — stubs/ ke naql (Arduino.h, Preferences.h,
+// esp_system.h, mbedtls/sha256.h) ke saath host par compile hota hai.
+// Is include ke liye build mein -Istubs chahiye (README.md dekho).
+// keystore.cpp ke static globals (s_ready, s_password) is TU mein
+// rehte hain — keystore section ke tests un ki state par bharosa karte
+// hain (section ke andar order ahm hai).
+#include "../keystore.cpp"
 
 static uint32_t rng_state = 0x12345678;
 static uint32_t rng() { rng_state = rng_state * 1664525u + 1013904223u; return rng_state >> 8; }
@@ -246,6 +289,45 @@ static int as5600_mock_read(uint8_t dev, uint8_t reg, uint8_t *buf,
   }
   if (reg == RSH_AS5600_REG_AGC && len == 1) {
     buf[0] = as5600_mock_agc;
+    return 0;
+  }
+  return -1;
+}
+
+// §26 mock I2C (ADS1115, Round 3 WS-3 FW-01): canned conversion values
+// per channel + config-write recording + fail mode. Combined read/write
+// dono chips (AS5600 0x36 + ADS1115 0x48) ko serve karte hain —
+// rsh_i2c_axes_poll ek hi callback pair se dono parhta hai.
+static uint16_t ads_mock_raw[4] = {0, 0, 0, 0};  // conversion result per AIN
+static uint16_t ads_mock_last_config = 0;
+static int ads_mock_writes = 0;
+static int ads_mock_fail = 0;
+static uint8_t ads_mock_converting = 0;  // channel jis ki conversion in-flight hai
+static int i2c_mock_read(uint8_t dev, uint8_t reg, uint8_t *buf, uint8_t len,
+                         void *user) {
+  if (dev == RSH_AS5600_I2C_ADDR)
+    return as5600_mock_read(dev, reg, buf, len, user);
+  if (dev == RSH_ADS1115_I2C_ADDR) {
+    if (ads_mock_fail) return -1;
+    if (reg == RSH_ADS1115_REG_CONV && len == 2) {
+      uint16_t raw = ads_mock_raw[ads_mock_converting & 0x03];
+      buf[0] = (uint8_t)(raw >> 8);
+      buf[1] = (uint8_t)(raw & 0xFF);
+      return 0;
+    }
+    return -1;
+  }
+  return -1;
+}
+static int i2c_mock_write(uint8_t dev, uint8_t reg, const uint8_t *buf,
+                          uint8_t len, void *user) {
+  (void)user;
+  if (dev == RSH_ADS1115_I2C_ADDR && reg == RSH_ADS1115_REG_CONFIG && len == 2) {
+    if (ads_mock_fail) return -1;
+    ads_mock_last_config = (uint16_t)(((uint16_t)buf[0] << 8) | buf[1]);
+    ads_mock_writes++;
+    // MUX bits [14:12] = 100+ch (single-ended AIN ch).
+    ads_mock_converting = (uint8_t)(((ads_mock_last_config >> 12) & 0x07) - 4);
     return 0;
   }
   return -1;
@@ -873,21 +955,37 @@ int main() {
       CHECK(heap_policy_update(&hp, 180000, 7000, (uint32_t)(100000 + i * 10000)) == 0);
     CHECK(heap_policy_update(&hp, 180000, 7000, 190000) == 1);  // dobara 10
     // --- FW-10: free heap 5 min mein 20% se zyada gire -> restart ---
+    // R3-FW-12: Rule 2 sirf SUSTAINED decline par restart karta hai (do
+    // windows) — pehli window ki girawat sirf note hoti hai (baseline
+    // nayi satah par dobara), doosri window mein dobara >20% girawat
+    // ho to restart.
     heap_policy_reset(&hp);
     CHECK(heap_policy_update(&hp, 200000, 100000, 0) == 0);       // baseline
     CHECK(heap_policy_update(&hp, 170000, 100000, 60000) == 0);   // -15% ok
-    CHECK(heap_policy_update(&hp, 150000, 100000, 120000) == 1);  // -25% restart
+    CHECK(heap_policy_update(&hp, 150000, 100000, 120000) == 0);  // -25% pehli dafa: note, restart nahi
+    CHECK(heap_policy_update(&hp, 110000, 100000, 180000) == 1);  // -26.7% dobara: sustained -> restart
     // Boundary: exactly 20% drop restart NAHI (drop > 20% chahiye).
     heap_policy_reset(&hp);
     CHECK(heap_policy_update(&hp, 200000, 100000, 0) == 0);
     CHECK(heap_policy_update(&hp, 160000, 100000, 60000) == 0);   // -20% ok
-    CHECK(heap_policy_update(&hp, 159999, 100000, 120000) == 1);  // -20.0005%
+    CHECK(heap_policy_update(&hp, 159999, 100000, 120000) == 0);  // -20.0005% pehli dafa: note
+    CHECK(heap_policy_update(&hp, 120000, 100000, 180000) == 1);  // -25% dobara: restart
     // --- FW-10: window khatam ho to re-baseline (slow legit girawat ok) ---
     heap_policy_reset(&hp);
     CHECK(heap_policy_update(&hp, 200000, 100000, 0) == 0);
     CHECK(heap_policy_update(&hp, 170000, 100000, 300000) == 0);  // window end
     CHECK(heap_policy_update(&hp, 140000, 100000, 360000) == 0);  // -17.6% of 170k
-    CHECK(heap_policy_update(&hp, 130000, 100000, 420000) == 1);  // -23.5% restart
+    CHECK(heap_policy_update(&hp, 130000, 100000, 420000) == 0);  // -23.5% pehli dafa: note
+    CHECK(heap_policy_update(&hp, 100000, 100000, 480000) == 1);  // -23% dobara: restart
+    // --- R3-FW-12: one-time drop (WebOTA lazy start / AP restart jaisa)
+    // phir stable heap -> kabhi restart nahi (yehi asal bug tha). ---
+    heap_policy_reset(&hp);
+    CHECK(heap_policy_update(&hp, 200000, 100000, 0) == 0);       // baseline
+    CHECK(heap_policy_update(&hp, 150000, 100000, 120000) == 0);  // -25% one-time: note
+    CHECK(heap_policy_update(&hp, 150000, 100000, 180000) == 0);  // stable
+    CHECK(heap_policy_update(&hp, 150000, 100000, 300000) == 0);  // stable
+    CHECK(heap_policy_update(&hp, 150000, 100000, 420000) == 0);  // window end: pending saaf
+    CHECK(heap_policy_update(&hp, 150000, 100000, 480000) == 0);  // aaj bhi stable: koi restart nahi
     // Baseline 0 guard: pehla sample 0 ho to bhi koi crash/restart nahi.
     heap_policy_reset(&hp);
     CHECK(heap_policy_update(&hp, 0, 0, 0) == 0);
@@ -1369,11 +1467,21 @@ int main() {
       CHECK(rsh_cfg_blob_validate(dup, dlen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
       CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
       // 9 axes (> 8) -> PIN_CONFLICT, err 2 (ADS1115 axes ko pin nahi
-      // chahiye, is liye duplicate-pin ka masla nahi — sirf axes count)
+      // chahiye, is liye duplicate-pin ka masla nahi — sirf axes count).
+      // FW-01: ADS1115 channels distinct hone chahiye (duplicate channel
+      // ab PIN_CONFLICT hai), is liye 6 ADC (distinct ADC1 pins) +
+      // 3 ADS1115 (ch 0/1/2) — koi per-record ghalti nahi, sirf count fail.
       uint8_t many[9 * 16];
-      for (int i = 0; i < 9; i++)
-        rsh_cfg_record(many + i * 16, RSH_CFG_TYPE_AXIS_ADS1115, (uint8_t)i, 0,
-                       0xFF, 0xFF, 0xFF, NULL);
+      const uint8_t adc_pins[6] = {32, 33, 34, 35, 36, 39};
+      for (int i = 0; i < 6; i++)
+        rsh_cfg_record(many + i * 16, RSH_CFG_TYPE_AXIS_ADC, (uint8_t)i, 0,
+                       adc_pins[i], 0xFF, 0xFF, NULL);
+      for (int i = 0; i < 3; i++) {
+        uint8_t p10[10] = {0};
+        p10[0] = (uint8_t)i;  // ADS1115 channel
+        rsh_cfg_record(many + (6 + i) * 16, RSH_CFG_TYPE_AXIS_ADS1115,
+                       (uint8_t)(6 + i), 0, 0xFF, 0xFF, 0xFF, p10);
+      }
       uint8_t manyb[256];
       size_t mlen = rsh_cfg_blob_build(manyb, many, 9, 1);
       CHECK(rsh_cfg_blob_validate(manyb, mlen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
@@ -1787,7 +1895,8 @@ int main() {
       CHECK(rsh_cfg_boot_recover(&t3, 0) == 0);
       CHECK(memcmp(t3.current, newblob, nlen) == 0);
       // Pending ho lekin previous copy na ho (invariant tooti) -> 0, factory ka
-      // faisla caller karta hai — yahan sirf ye ke crash/UB nahi hota
+      // faisla caller karta hai (R3-FW-10: rsh.ino fw34_boot_setup ab is
+      // surat mein factory fallback leta hai + CFG_ROLLBACK diag event)
       rsh_cfg_txn_t t4;
       rsh_cfg_txn_init(&t4);
       CHECK(rsh_cfg_txn_load_current(&t4, newblob, nlen) == RSH_CTRL_OK);
@@ -2064,12 +2173,15 @@ int main() {
     for (int i = 0; i < 9; i++)
       CHECK(heap_policy_update(&q, 100000, 4000, (uint32_t)(70000 + i * 10000)) == 0);
     CHECK(heap_policy_update(&q, 100000, 4000, 160000) == 1);
-    // 5-min window mein 20%+ girawat -> restart; 10% girawat -> nahi.
+    // 5-min window mein 20%+ girawat -> restart (R3-FW-12: sirf sustained
+    // decline par — pehli window note hoti hai, doosri window mein
+    // dobara >20% girawat ho to restart); 10% girawat -> nahi.
     HeapPolicy r;
     heap_policy_reset(&r);
     CHECK(heap_policy_update(&r, 100000, 50000, 0) == 0);
     CHECK(heap_policy_update(&r, 90000, 50000, 100000) == 0);   // -10%
-    CHECK(heap_policy_update(&r, 79000, 50000, 200000) == 1);   // -21%
+    CHECK(heap_policy_update(&r, 79000, 50000, 200000) == 0);   // -21% pehli dafa: note
+    CHECK(heap_policy_update(&r, 60000, 50000, 250000) == 1);   // -24% dobara: restart
     // Window rollover: nayi baseline, purani girawat bhool jao.
     HeapPolicy w;
     heap_policy_reset(&w);
@@ -2345,6 +2457,16 @@ int main() {
       CHECK(rsh_helo_accept(1, 0, 0, 6000) == 1);     // idle + 6 s -> qabool
       CHECK(rsh_helo_accept(1, 0, 0, 4000) == 0);     // idle lekin 4 s -> flap
       CHECK(rsh_helo_accept(1, 0, 1, 0) == 1);        // wahi IP hamesha
+      // R3-FW-02: session reset triggers (net_logic.h) — naya peer ya
+      // timeout ke baad wapas aaya peer = naya session (dedup cache
+      // reset, warna app restart ke baad reqIds 0 se purane cache se
+      // takrate hain). Routine HELO kabhi reset nahi karta.
+      CHECK(rsh_session_reset_needed(0, 0, 0) == 0);  // pehla peer: koi purana session nahi
+      CHECK(rsh_session_reset_needed(0, 1, 0) == 0);
+      CHECK(rsh_session_reset_needed(1, 1, 1) == 0);  // wahi IP, live: routine HELO
+      CHECK(rsh_session_reset_needed(1, 1, 0) == 1);  // naya peer IP
+      CHECK(rsh_session_reset_needed(1, 0, 1) == 1);  // wahi IP, timeout ke baad wapas
+      CHECK(rsh_session_reset_needed(1, 0, 0) == 1);  // naya peer + inactive
       // HELLO reply throttle: 250 ms (F-04, v4.0.3: 500 ms se 250 ms).
       CHECK(rsh_hello_reply_allowed(0) == 0);
       CHECK(rsh_hello_reply_allowed(249) == 0);
@@ -4784,6 +4906,47 @@ int main() {
     CHECK(out.v2len == 0 && out.v1len == 0);
     CHECK(rsh_sample_mailbox_consume(NULL, &out) == 0);
     CHECK(rsh_sample_mailbox_consume(&mb, NULL) == 0);
+    // --- R3-FW-05: generation guard — torn snapshot drop hoti hai ---
+    // gen even = stable frame; produce har dafa gen +2 karta hai.
+    RshSampleMailbox mb2;
+    rsh_sample_mailbox_init(&mb2);
+    CHECK(mb2.gen == 0);
+    rsh_sample_mailbox_produce(&mb2, v2, 36, v1, 18, 300, 2, 1);
+    CHECK(mb2.gen == 2 && mb2.ready == 1);
+    CHECK(rsh_sample_mailbox_consume(&mb2, &out) == 1);
+    CHECK(out.seq == 300 && out.gen == 2 && mb2.ready == 0);
+    // Torn snapshot simulate karo: producer beech mein likh raha ho
+    // (gen odd) aur v2len/v2pkt pehle hi badal chuke hon — consume
+    // snapshot phenk de (return 0), mailbox ko haath na lagaye.
+    rsh_sample_mailbox_produce(&mb2, v2, 36, v1, 18, 301, 2, 1);
+    CHECK(mb2.gen == 4);
+    mb2.gen++;  // producer mid-write (odd) — fields aadhe naye
+    mb2.v2pkt[0] = 0xFF;
+    mb2.v2len = 10;
+    CHECK(rsh_sample_mailbox_consume(&mb2, &out) == 0);  // torn — drop
+    CHECK(mb2.ready == 1);  // frame abhi bhi maujood hai
+    // Producer ki write mukammal karo (gen even, fields consistent):
+    // agla consume naya frame deta hai.
+    mb2.seq = 302;
+    mb2.v2len = 36;
+    mb2.v2pkt[0] = v2[0];
+    mb2.gen++;
+    CHECK(mb2.gen == 6);
+    CHECK(rsh_sample_mailbox_consume(&mb2, &out) == 1);
+    CHECK(out.seq == 302 && out.v2len == 36 && out.v2pkt[0] == v2[0]);
+    // Gen badla ho (produce copy ke doran mukammal hua) to bhi drop:
+    // snapshot purana frame + naya gen = inconsistent.
+    rsh_sample_mailbox_produce(&mb2, v2, 36, v1, 18, 303, 2, 1);
+    {
+      RshSampleMailbox stale = mb2;  // copy, phir produce dobara
+      rsh_sample_mailbox_produce(&mb2, v2, 20, v1, 18, 304, 1, 2);
+      // stale copy ka gen (8) ab mb2.gen (10) se nahi milta — aisa
+      // snapshot consume() ke andar banta to drop hota; yahan seedha
+      // ye ke naya frame jeet-ta hai aur skipped gin-ta hai.
+      CHECK(stale.gen != mb2.gen && mb2.skipped == 1);
+      CHECK(rsh_sample_mailbox_consume(&mb2, &out) == 1);
+      CHECK(out.seq == 304 && out.skipped == 1);
+    }
 
     // --- F-12: version single source (version.h + modules.h + config.h) ---
     CHECK(RSH_FW_VERSION_MAJOR == 4 && RSH_FW_VERSION_MINOR == 0 &&
@@ -4911,6 +5074,302 @@ int main() {
     CHECK(rsh_diag_build_body(&dl4, 0, db4, sizeof(db4)) == 6 + 2 * 7);
     CHECK(db4[6 + 0 * 7 + 4] == RSH_DIAG_PASSWORD_CLEARED);
     CHECK(db4[6 + 1 * 7 + 4] == RSH_DIAG_BOOT);
+  }
+
+  // R3-FW-03: keystore recovery (keystore.cpp, stubs/ NVS naql).
+  // Bricked state: corrupt obfkey (ghalat lambai) + password blob —
+  // begin() fail closed karta hai (AP kabhi up nahi), aur KEY_RESET
+  // (BOOT >= 10 s hold -> keystore_clear_password) bhi pehle dead tha
+  // (s_ready gate). Fix: clear s_ready se aazad hai + obfkey bhi
+  // mit-ti hai, taake agla begin() nayi key generate kar sake.
+  // Order ahm hai: corrupt test PEHLE (s_ready abhi false hai).
+  {
+    Preferences::test_reset();
+    // Corrupt state seed karo: obfkey 5 B (32 ki jagah) + wifipw2 blob,
+    // mig403=true (migration pehle ho chuki — dobara nahi chalegi).
+    const uint8_t badKey[5] = {0x11, 0x22, 0x33, 0x44, 0x55};
+    const uint8_t blob[8] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
+    Preferences::test_put("rsh", "obfkey", badKey, sizeof(badKey));
+    Preferences::test_put("rsh", "wifipw2", blob, sizeof(blob));
+    Preferences::test_put_bool("rsh", "mig403", true);
+    CHECK(keystore_begin() == false);  // brick reproduce: AP kabhi up nahi
+    CHECK(keystore_has_password() == false);
+    // KEY_RESET path — s_ready false hone ke bawajood kaam karna chahiye.
+    CHECK(keystore_clear_password() == true);
+    CHECK(Preferences::test_has("rsh", "wifipw2") == false);
+    CHECK(Preferences::test_has("rsh", "obfkey") == false);
+    // Agla boot: nayi obfkey generate, khula AP (koi password nahi).
+    CHECK(keystore_begin() == true);
+    CHECK(keystore_has_password() == false);
+    // Normal flow: password set -> check -> clear -> dobara begin.
+    CHECK(keystore_set_password("TestPass123", 11) == true);
+    CHECK(keystore_has_password() == true);
+    CHECK(keystore_check_password("TestPass123", 11) == true);
+    CHECK(keystore_check_password("TestPass124", 11) == false);
+    CHECK(keystore_check_password("TestPass12", 10) == false);
+    CHECK(keystore_clear_password() == true);
+    CHECK(keystore_has_password() == false);
+    CHECK(keystore_begin() == true);
+    CHECK(keystore_has_password() == false);
+    // Corrupt obfkey BINA blob ke -> regenerate (purana behaviour).
+    Preferences::test_reset();
+    Preferences::test_put("rsh", "obfkey", badKey, sizeof(badKey));
+    Preferences::test_put_bool("rsh", "mig403", true);
+    CHECK(keystore_begin() == true);
+    {
+      Preferences p;
+      CHECK(p.begin("rsh", false) == true);
+      uint8_t kbuf[32];
+      CHECK(p.getBytes("obfkey", kbuf, sizeof(kbuf)) == 32);
+      p.end();
+    }
+    // Fail-closed password read barqarar: valid obfkey + kharab blob
+    // -> begin() false (overwrite nahi, AP up nahi).
+    Preferences::test_reset();
+    {
+      Preferences p;
+      CHECK(p.begin("rsh", false) == true);
+      uint8_t goodKey[32];
+      for (int i = 0; i < 32; i++) goodKey[i] = (uint8_t)(0x30 + i);
+      CHECK(p.putBytes("obfkey", goodKey, sizeof(goodKey)) == 32);
+      p.end();
+    }
+    Preferences::test_put("rsh", "wifipw2", blob, sizeof(blob));
+    Preferences::test_put_bool("rsh", "mig403", true);
+    CHECK(keystore_begin() == false);
+    // Is haalat se bhi KEY_RESET nikalta hai (blob + key dono mit-te hain).
+    CHECK(keystore_clear_password() == true);
+    CHECK(keystore_begin() == true);
+    CHECK(keystore_has_password() == false);
+  }
+
+  // 26) Round 3 WS-3 FW-01 — I2C axes sampling (AS5600 + ADS1115).
+  // COMMIT ke baad axis LIVE: blob -> pinmap -> sampler -> values.
+  {
+    // --- 26a) ADS1115 driver (ads1115.h): config word + conversion ---
+    CHECK(rsh_ads1115_config_word(0) == 0xC183);
+    CHECK(rsh_ads1115_config_word(1) == 0xD183);
+    CHECK(rsh_ads1115_config_word(2) == 0xE183);
+    CHECK(rsh_ads1115_config_word(3) == 0xF183);
+    CHECK(rsh_ads1115_raw_to_mv(0) == 0);
+    CHECK(rsh_ads1115_raw_to_mv(32767) == 3300);  // full-scale clamp
+    CHECK(rsh_ads1115_raw_to_mv(16384) == 3072);
+    CHECK(rsh_ads1115_raw_to_mv(8192) == 1536);
+    CHECK(rsh_ads1115_raw_to_mv(4000) == 750);
+    CHECK(rsh_ads1115_raw_to_mv(-100) == 0);
+    // Poll state machine (pipelined: write ch, 20 ms baad read + next write).
+    ads_mock_raw[0] = 16384;  // -> 3072 mV
+    ads_mock_raw[1] = 8192;   // -> 1536 mV
+    ads_mock_fail = 0;
+    ads_mock_writes = 0;
+    RshAds1115 ads;
+    uint8_t ads_chs[2] = {0, 1};
+    rsh_ads1115_configure(&ads, ads_chs, 2);
+    CHECK(rsh_ads1115_poll(&ads, i2c_mock_read, i2c_mock_write, NULL, 0) == 0);
+    CHECK(ads_mock_writes == 0);  // too soon (20 ms cadence)
+    CHECK(rsh_ads1115_poll(&ads, i2c_mock_read, i2c_mock_write, NULL, 20) == 0);
+    CHECK(ads_mock_writes == 1 && ads.converting == 0);
+    CHECK(ads_mock_last_config == 0xC183);
+    CHECK(rsh_ads1115_poll(&ads, i2c_mock_read, i2c_mock_write, NULL, 30) == 0);
+    CHECK(ads_mock_writes == 1);  // too soon — kuch nahi hua
+    CHECK(rsh_ads1115_poll(&ads, i2c_mock_read, i2c_mock_write, NULL, 40) == 0);
+    CHECK(ads.has_value[0] == 1 && ads.value_mv[0] == 3072);
+    CHECK(ads.converting == 1 && ads_mock_last_config == 0xD183);
+    CHECK(rsh_ads1115_poll(&ads, i2c_mock_read, i2c_mock_write, NULL, 60) == 0);
+    CHECK(ads.has_value[1] == 1 && ads.value_mv[1] == 1536);
+    CHECK(ads.converting == 0);  // round-robin wapas ch0 par
+    // Fail: NACK -> -1, converting waisa hi, value nahi badalti.
+    ads_mock_fail = 1;
+    CHECK(rsh_ads1115_poll(&ads, i2c_mock_read, i2c_mock_write, NULL, 80) == -1);
+    CHECK(ads.converting == 0 && ads.value_mv[0] == 3072);
+    ads_mock_fail = 0;
+    CHECK(rsh_ads1115_poll(&ads, i2c_mock_read, i2c_mock_write, NULL, 100) == 0);
+    CHECK(ads.has_value[0] == 1 && ads.value_mv[0] == 3072);
+    // Probe: config-write ACK = chip maujood hai.
+    CHECK(rsh_ads1115_probe(i2c_mock_write, NULL) == 1);
+    ads_mock_fail = 1;
+    CHECK(rsh_ads1115_probe(i2c_mock_write, NULL) == 0);
+    ads_mock_fail = 0;
+
+    // --- 26b) Pinmap: I2C kinds assign hote hain (FW-01 bug: pehle nahi hote the) ---
+    uint8_t i2c_recs[7 * 16];
+    uint8_t p_as5600[10] = {0, 2, 0, 0, 0, 0, 0, 0, 0, 0};  // params[1]=2 -> 900°
+    uint8_t p_ch0[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    uint8_t p_ch2[10] = {2, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    rsh_cfg_record(i2c_recs + 0 * 16, RSH_CFG_TYPE_AXIS_AS5600, 0, 0,
+                   0xFF, 0xFF, 0xFF, p_as5600);
+    rsh_cfg_record(i2c_recs + 1 * 16, RSH_CFG_TYPE_AXIS_ADS1115, 1, 0,
+                   0xFF, 0xFF, 0xFF, p_ch0);
+    rsh_cfg_record(i2c_recs + 2 * 16, RSH_CFG_TYPE_AXIS_ADS1115, 2, 0,
+                   0xFF, 0xFF, 0xFF, p_ch2);
+    rsh_cfg_record(i2c_recs + 3 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 27, 0xFF, 0xFF, NULL);
+    rsh_cfg_record(i2c_recs + 4 * 16, RSH_CFG_TYPE_BUTTON, 1, 0, 33, 0xFF, 0xFF, NULL);
+    rsh_cfg_record(i2c_recs + 5 * 16, RSH_CFG_TYPE_BATTERY, 0, 0, 39, 0xFF, 0xFF, NULL);
+    rsh_cfg_record(i2c_recs + 6 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 19, 0xFF, NULL);
+    uint8_t i2c_blob[256];
+    size_t i2c_len = rsh_cfg_blob_build(i2c_blob, i2c_recs, 7, 1);
+    CHECK(rsh_cfg_blob_validate(i2c_blob, i2c_len, NULL, NULL) == RSH_CTRL_OK);
+    RshPinMap im;
+    CHECK(rsh_pinmap_from_blob(i2c_blob, i2c_len, &im) == 1);
+    CHECK(im.steer == RSH_PINMAP_ABSENT && im.accel == RSH_PINMAP_ABSENT);
+    CHECK(im.axisType[0] == RSH_CFG_TYPE_AXIS_AS5600);
+    CHECK(im.axisType[1] == RSH_CFG_TYPE_AXIS_ADS1115 && im.adsCh[1] == 0);
+    CHECK(im.axisType[2] == RSH_CFG_TYPE_AXIS_ADS1115 && im.adsCh[2] == 2);
+    CHECK(im.axisType[3] == RSH_PINMAP_ABSENT &&
+          im.axisType[4] == RSH_PINMAP_ABSENT);
+    CHECK(im.as5600Rotation == 2 && im.as5600Multiturn == 0);
+    CHECK(rsh_pinmap_has_i2c(&im) == 1 && rsh_pinmap_has_slow_axis(&im) == 1);
+    CHECK(rsh_pinmap_axis_present(&im, 0) == 1);
+    CHECK(rsh_pinmap_axis_present(&im, 3) == 0);
+    // Defaults mein I2C nahi (factory blob native hai).
+    RshPinMap dm2;
+    rsh_pinmap_defaults(&dm2);
+    CHECK(rsh_pinmap_has_i2c(&dm2) == 0 && rsh_pinmap_has_slow_axis(&dm2) == 0);
+    CHECK(dm2.axisType[0] == RSH_CFG_TYPE_AXIS_ADC &&
+          dm2.axisType[3] == RSH_PINMAP_ABSENT);
+    // GET_CAPS table: I2C rows (pin 0xFF, kind 12/2) maujood hain.
+    RshCapsEntry captab[40];
+    uint8_t ncap = rsh_caps_table_from_pinmap(&im, captab, 40);
+    CHECK(ncap > 0);
+    int found_as5600 = 0, found_ads0 = 0, found_ads2 = 0;
+    for (uint8_t i = 0; i < ncap; i++) {
+      if (captab[i].pin == 0xFF && captab[i].kind == RSH_KIND_AXIS_AS5600 &&
+          captab[i].module == RSH_MOD_STEERING)
+        found_as5600 = 1;
+      if (captab[i].pin == 0xFF && captab[i].kind == RSH_KIND_ADC_ADS1115 &&
+          captab[i].module == RSH_MOD_ACCELERATOR)
+        found_ads0 = 1;
+      if (captab[i].pin == 0xFF && captab[i].kind == RSH_KIND_ADC_ADS1115 &&
+          captab[i].module == RSH_MOD_BRAKE)
+        found_ads2 = 1;
+    }
+    CHECK(found_as5600 == 1 && found_ads0 == 1 && found_ads2 == 1);
+    // capsFlags bit0 body mein jata hai (net.cpp GET_CAPS: flags |= 0x01).
+    uint8_t mac6[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+    uint8_t capsbody[18 + 8 * 40];
+    size_t cblen =
+        rsh_caps_build_body(capsbody, sizeof(capsbody), mac6, 6, 0x01, captab, ncap);
+    CHECK(cblen == 18 + 8u * ncap && capsbody[16] == 0x01);
+    cblen =
+        rsh_caps_build_body(capsbody, sizeof(capsbody), mac6, 6, 0x00, captab, ncap);
+    CHECK(capsbody[16] == 0x00);
+    // Modules: I2C clutch/handbrake bhi on karte hain.
+    rsh_modules_apply_config_blob(i2c_blob, i2c_len);
+    CHECK(rsh_modules_clutch_enabled() == 0);  // is blob mein clutch nahi
+    CHECK(rsh_modules_handbrake_enabled() == 0);
+    uint8_t ch_recs[2 * 16];
+    uint8_t p_ch1[10] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    uint8_t p_ch3[10] = {3, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    rsh_cfg_record(ch_recs + 0, RSH_CFG_TYPE_AXIS_ADS1115, 3, 0,
+                   0xFF, 0xFF, 0xFF, p_ch1);
+    rsh_cfg_record(ch_recs + 16, RSH_CFG_TYPE_AXIS_ADS1115, 4, 0,
+                   0xFF, 0xFF, 0xFF, p_ch3);
+    uint8_t ch_blob[128];
+    size_t ch_len = rsh_cfg_blob_build(ch_blob, ch_recs, 2, 1);
+    CHECK(rsh_cfg_blob_validate(ch_blob, ch_len, NULL, NULL) == RSH_CTRL_OK);
+    rsh_modules_apply_config_blob(ch_blob, ch_len);
+    CHECK(rsh_modules_clutch_enabled() == 1);
+    CHECK(rsh_modules_handbrake_enabled() == 1);
+    // Validator: channel range + duplicate (FW-01 fail-closed).
+    uint8_t bad_recs[2 * 16];
+    uint8_t p_ch4[10] = {4, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    rsh_cfg_record(bad_recs + 0, RSH_CFG_TYPE_AXIS_ADS1115, 1, 0,
+                   0xFF, 0xFF, 0xFF, p_ch4);
+    uint8_t bad_blob[128];
+    size_t bad_len = rsh_cfg_blob_build(bad_blob, bad_recs, 1, 1);
+    CHECK(rsh_cfg_blob_validate(bad_blob, bad_len, NULL, NULL) ==
+          RSH_CTRL_PIN_CONFLICT);
+    rsh_cfg_record(bad_recs + 0, RSH_CFG_TYPE_AXIS_ADS1115, 1, 0,
+                   0xFF, 0xFF, 0xFF, p_ch0);
+    rsh_cfg_record(bad_recs + 16, RSH_CFG_TYPE_AXIS_ADS1115, 2, 0,
+                   0xFF, 0xFF, 0xFF, p_ch0);
+    bad_len = rsh_cfg_blob_build(bad_blob, bad_recs, 2, 1);
+    CHECK(rsh_cfg_blob_validate(bad_blob, bad_len, NULL, NULL) ==
+          RSH_CTRL_PIN_CONFLICT);
+    rsh_cfg_record(bad_recs + 0, RSH_CFG_TYPE_AXIS_ADS1115, 1, 0,
+                   0xFF, 0xFF, 0xFF, p_ch3);
+    bad_len = rsh_cfg_blob_build(bad_blob, bad_recs, 1, 1);
+    CHECK(rsh_cfg_blob_validate(bad_blob, bad_len, NULL, NULL) == RSH_CTRL_OK);
+
+    // --- 26c) End-to-end: COMMIT (blob) -> configure -> poll -> LIVE values ---
+    as5600_mock_status = 0x20;  // MD=1
+    as5600_mock_raw = 2048;     // -> 1650 mV
+    as5600_mock_agc = 64;
+    as5600_mock_fail = 0;
+    ads_mock_raw[0] = 16384;  // -> 3072 mV
+    ads_mock_raw[2] = 8192;   // -> 1536 mV
+    ads_mock_fail = 0;
+    ads_mock_writes = 0;
+    RshI2cAxes ax;
+    rsh_i2c_axes_init(&ax);
+    rsh_i2c_axes_configure(&ax, &im);
+    CHECK(rsh_i2c_axes_has_slow_axis(&ax) == 1);
+    CHECK(rsh_i2c_axes_needs_bus(&ax, &im) == 1);
+    CHECK(ax.as5600_slot == 0 && ax.as5600_rotation == 2);
+    CHECK(ax.ads.n_channels == 2);
+    // t=0: AS5600 live (1650); ADS abhi shuru nahi (20 ms cadence).
+    CHECK(rsh_i2c_axes_poll(&ax, i2c_mock_read, i2c_mock_write, NULL, 0) == 0);
+    CHECK(ax.value_mv[0] == 1650 && ax.valid[0] == 1);
+    CHECK(ax.has_value[1] == 0 && ax.valid[1] == 0);
+    // t=20: ADS ch0 conversion start.
+    CHECK(rsh_i2c_axes_poll(&ax, i2c_mock_read, i2c_mock_write, NULL, 20) == 0);
+    CHECK(ads_mock_writes == 1);
+    // t=40: ADS ch0 result (3072) + ch2 start.
+    CHECK(rsh_i2c_axes_poll(&ax, i2c_mock_read, i2c_mock_write, NULL, 40) == 0);
+    CHECK(ax.value_mv[1] == 3072 && ax.valid[1] == 1);
+    // t=60: ADS ch2 result (1536) + ch0 dobara.
+    CHECK(rsh_i2c_axes_poll(&ax, i2c_mock_read, i2c_mock_write, NULL, 60) == 0);
+    CHECK(ax.value_mv[2] == 1536 && ax.valid[2] == 1);
+    CHECK(ax.value_mv[0] == 1650 && ax.valid[0] == 1);
+    // ADS fail: values rehti hain, valid=0 (kabhi 0/garbage nahi).
+    ads_mock_fail = 1;
+    CHECK(rsh_i2c_axes_poll(&ax, i2c_mock_read, i2c_mock_write, NULL, 80) == -1);
+    CHECK(ax.valid[1] == 0 && ax.value_mv[1] == 3072);
+    CHECK(ax.valid[2] == 0 && ax.value_mv[2] == 1536);
+    CHECK(ax.valid[0] == 1);  // AS5600 alag transaction hai — chalta rehta hai
+    ads_mock_fail = 0;
+    CHECK(rsh_i2c_axes_poll(&ax, i2c_mock_read, i2c_mock_write, NULL, 100) == 0);
+    CHECK(ax.valid[1] == 1 && ax.value_mv[1] == 3072);
+    // AS5600 magnet ghayab (MD=0) -> valid=0, last value rehti hai.
+    as5600_mock_status = 0x00;
+    CHECK(rsh_i2c_axes_poll(&ax, i2c_mock_read, i2c_mock_write, NULL, 120) == -1);
+    CHECK(ax.valid[0] == 0 && ax.value_mv[0] == 1650);
+    as5600_mock_status = 0x20;
+    CHECK(rsh_i2c_axes_poll(&ax, i2c_mock_read, i2c_mock_write, NULL, 140) == 0);
+    CHECK(ax.valid[0] == 1);
+    // AS5600 I2C NACK -> valid=0, value rehti hai; wapas aate hi valid=1.
+    as5600_mock_fail = 1;
+    CHECK(rsh_i2c_axes_poll(&ax, i2c_mock_read, i2c_mock_write, NULL, 160) == -1);
+    CHECK(ax.valid[0] == 0 && ax.value_mv[0] == 1650);
+    as5600_mock_fail = 0;
+    CHECK(rsh_i2c_axes_poll(&ax, i2c_mock_read, i2c_mock_write, NULL, 180) == 0);
+    CHECK(ax.valid[0] == 1 && ax.value_mv[0] == 1650);
+
+    // --- 26d) AS5600 multi-turn (flags bit0, rotation 900°) ---
+    uint8_t mt_recs[16];
+    uint8_t p_mt[10] = {0, 2, 0, 0, 0, 0, 0, 0, 0, 0};  // params[1]=2 -> 900°
+    rsh_cfg_record(mt_recs, RSH_CFG_TYPE_AXIS_AS5600, 0, 1,
+                   0xFF, 0xFF, 0xFF, p_mt);
+    uint8_t mt_blob[64];
+    size_t mt_len = rsh_cfg_blob_build(mt_blob, mt_recs, 1, 1);
+    CHECK(rsh_cfg_blob_validate(mt_blob, mt_len, NULL, NULL) == RSH_CTRL_OK);
+    RshPinMap mm;
+    CHECK(rsh_pinmap_from_blob(mt_blob, mt_len, &mm) == 1);
+    CHECK(mm.as5600Multiturn == 1 && mm.as5600Rotation == 2);
+    RshI2cAxes mt;
+    rsh_i2c_axes_configure(&mt, &mm);
+    CHECK(mt.as5600_multiturn == 1 && mt.as5600_rotation == 2);
+    as5600_mock_fail = 0;
+    as5600_mock_status = 0x20;
+    as5600_mock_raw = 4000;
+    CHECK(rsh_i2c_axes_poll(&mt, i2c_mock_read, i2c_mock_write, NULL, 0) == 0);
+    CHECK(mt.value_mv[0] == 0 && mt.valid[0] == 1);  // pehla sample: sirf state
+    as5600_mock_raw = 5;
+    CHECK(rsh_i2c_axes_poll(&mt, i2c_mock_read, i2c_mock_write, NULL, 1) == 0);
+    CHECK(mt.value_mv[0] == 32);  // +101 steps -> 101*3300/10240 = 32
+    as5600_mock_raw = 4090;
+    CHECK(rsh_i2c_axes_poll(&mt, i2c_mock_read, i2c_mock_write, NULL, 2) == 0);
+    CHECK(mt.value_mv[0] == 29);  // -11 steps -> total 90 -> 90*3300/10240 = 29
   }
 
   printf("%s — %d checks, %d failures\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", checks, failures);

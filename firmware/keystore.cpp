@@ -199,16 +199,29 @@ bool keystore_set_password(const char *pw, uint8_t len) {
   return true;
 }
 
-// D7: password mitao (NVS + RAM) — BOOT >= 10 s hold se. NVS remove fail
-// ho to RAM password rehta hai (fail closed — caller reboot NAHI karta,
-// warna reboot ke baad purana password wapas aa jata).
+// D7: password mitao (NVS + RAM) — BOOT >= 10 s hold se. R3-FW-03:
+// recovery path `s_ready` par munhasir NAHI hai — bricked state
+// (corrupt obfkey + password blob) mein begin() kabhi kamyab nahi hota,
+// is liye s_ready hamesha false rehta hai; purana gate (`!s_ready` par
+// foran false) documented physical recovery ko bhi dead kar deta tha.
+// Clear ka matlab hi hai "state phenk do": password blob + legacy
+// plaintext key + obfuscation key teeno mit-ti hain, taake agle boot
+// par begin() nayi obfkey generate karke khula AP la sake. Password
+// READS fail-closed rehte hain (ye sirf delete karta hai — koi read,
+// koi overwrite nahi). NVS remove fail ho to RAM password rehta hai
+// (fail closed — caller reboot NAHI karta, warna reboot ke baad
+// purana password wapas aa jata).
 bool keystore_clear_password(void) {
-  if (!s_ready) return false;
   Preferences prefs;
   if (!prefs.begin("rsh", false)) return false;
   bool ok = true;
   if (prefs.isKey("wifipw2") && !prefs.remove("wifipw2")) ok = false;
   if (prefs.isKey("wifipw") && !prefs.remove("wifipw")) ok = false;
+  // Corrupt obfkey bhi mitao — warna agla begin() usi corrupt key +
+  // (ab mit chuke) blob ke baghair bhi regenerate karta (blob na ho to
+  // regenerate mehfooz hai), lekin key ko rakhne ka koi faida nahi:
+  // password ja chuka hai, is liye key ka waahid consumer khatam hai.
+  if (prefs.isKey("obfkey") && !prefs.remove("obfkey")) ok = false;
   prefs.end();
   if (!ok) {
     rsh_diag_record_global(RSH_DIAG_KEYSTORE_NVS_FAIL, 0, millis());

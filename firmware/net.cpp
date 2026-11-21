@@ -18,6 +18,7 @@
 #include <WiFiUdp.h>
 #include <ESPmDNS.h>   // Phase G (C2/D33): mDNS responder — board `rsh.local`
 #include <esp_wifi.h>    // per-station RSSI (SEC-D-08 / status packet)
+#include <esp_task_wdt.h>  // R3-FW-08: blocking scan / feed ke liye
 
 static WiFiUDP udpHello;   // 4210 par HELO sunta hai
 static WiFiUDP udpData;    // 4211 par data bhejta hai (+ HELLO/control/ping replies)
@@ -163,7 +164,10 @@ bool net_pc_is_v2(uint32_t nowMs) {
 // Per-station RSSI: SoftAP se jure stations mein sab se taqatwar link.
 // Station ka IP yahan nahi milta (list mein sirf MAC hai), is liye max
 // RSSI report hota hai — PC aam tor par qareeb tareen station hota hai.
-// Koi station nahi / API fail → -128 (unknown, RSH_RSSI_UNKNOWN).
+// R3-FW-09: ye PC ka RSSI NAHI hai, strongest station ka hai (jab
+// phone/browser WebOTA ke liye jura ho aur PC se zyada qareeb ho to
+// status packet mein us ka RSSI jata hai); doc §1.4 mein aisa hi likha
+// hai. Koi station nahi / API fail → -128 (unknown, RSH_RSSI_UNKNOWN).
 int8_t net_rssi_dbm() {
   wifi_sta_list_t list;
   if (esp_wifi_ap_get_sta_list(&list) != ESP_OK || list.num == 0)
@@ -187,7 +191,14 @@ static uint8_t pick_channel() {
   if (forcedChannel) return forcedChannel;
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+  // R3-FW-08: sync scan ~1-3 s (dense RF mein zyada) — loop task WDT
+  // (5 s) mein subscribed hai (setup mein net_begin se pehle), is liye
+  // scan se pehle aur baad mein feed karo; warna scan + baaki setup
+  // 5 s ke qareeb ja kar WDT reset + boot-counter fail ka silsila
+  // shuru kar sakta hai.
+  esp_task_wdt_reset();
   int n = WiFi.scanNetworks(false, false);  // show_hidden=false: hidden exclude
+  esp_task_wdt_reset();
   if (n < 0) {
     WiFi.scanDelete();
     return currentChannel ? currentChannel : 1;
@@ -303,16 +314,23 @@ static bool net_start_ap_and_sockets(uint8_t ch) {
   return true;
 }
 
-// Naya session (HELO sessionFlag=1, kisi bhi transport par): DONO
-// transports ke control sessions reset (reqId dedup cache saaf) aur
-// GET_CAPS-OK flags saaf — naye session mein stream ke liye dobara
-// GET_CAPS lazmi hai (D3).
-static void net_new_session() {
+// Naya session (HELO sessionFlag=1): SIRF us transport ka control
+// session reset (reqId dedup cache saaf) aur us ka GET_CAPS-OK flag
+// saaf — naye session mein stream ke liye dobara GET_CAPS lazmi hai
+// (D3). R3-FW-11: pehle ye dono transports reset karta tha — serial ka
+// naya session Wi-Fi ka cache bhi wipe kar deta tha (cross-transport).
+// Ab per-transport hai: Wi-Fi flag-1 sirf Wi-Fi session, serial flag-1
+// sirf serial session. Naya peer / timeout ke baad wapas aaya peer bhi
+// Wi-Fi session reset karta hai (rsh_session_reset_needed, R3-FW-02).
+static void net_new_session_wifi() {
   rsh_ctrl_session_init(&ctrlSession);
   rsh_ctrl_cache_init(&ctrlCache);
+  wifiCapsOk = false;
+}
+
+static void net_new_session_serial() {
   rsh_ctrl_session_init(&serialCtrlSession);
   rsh_ctrl_cache_init(&serialCtrlCache);
-  wifiCapsOk = false;
   serialCapsOk = false;
 }
 
@@ -392,7 +410,11 @@ void net_maybe_rescan(uint32_t nowMs) {
   if (!rsh_rescan_needed(net_rssi_dbm(), delta, (uint32_t)(nowMs - lastScanMs))) return;
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+  // R3-FW-08: rescan bhi sync scan hai (loop iteration ke andar) — feed
+  // karo taake scan + AP restart 5 s WDT window mein rahe.
+  esp_task_wdt_reset();
   int n = WiFi.scanNetworks(false, false);
+  esp_task_wdt_reset();
   uint8_t picked = currentChannel;
   int newScore = 0, curScore = 0;
   bool scanned = false;
@@ -476,19 +498,29 @@ void net_poll() {
                              net_pc_active(nowMs) ? 0 : 1, nowMs);
       continue;
     }
+    // R3-FW-02: naya peer, ya liveness timeout ke baad wapas aaya peer =
+    // naya session — Wi-Fi dedup cache reset karo (warna app restart ke
+    // baad reqIds 0 se shuru hote hain aur purane session ke cached
+    // replies se pehle ~32 commands takrate hain). wasActive is HELO
+    // se PEHLE ki state hai (lastHelloMs abhi purana hai). Routine
+    // HELO (same IP, timeout ke andar) kabhi reset nahi karta.
+    uint8_t wasActive = net_pc_active(nowMs) ? 1 : 0;
     if (!sameIp) {
       pcIp = sender;
       lastPcChangeMs = nowMs;
-      wifiCapsOk = false;  // D3: naya peer = naya session — dobara GET_CAPS lazmi
     }
+    if (rsh_session_reset_needed(havePc ? 1 : 0, wasActive, sameIp))
+      net_new_session_wifi();  // wifiCapsOk bhi saaf karta hai (D3)
     havePc = true;
     lastHelloMs = nowMs;
     lastHelloProto = proto;
     if (proto != 0x02) continue;  // legacy v1: koi HELLO reply nahi (§2.1)
 
-    // Naya session: control sessions reset + GET_CAPS-OK flags saaf (§2.3/§3.2).
-    // Routine HELO (sessionFlag 0) purana session wapas deta hai.
-    if (sessionFlag == 1) net_new_session();
+    // Naya session: Wi-Fi control session reset + GET_CAPS-OK flag saaf
+    // (§2.3/§3.2). Routine HELO (sessionFlag 0) purana session wapas
+    // deta hai — jab tak peer naya na ho ya timeout ke baad wapas na
+    // aaya ho (upar rsh_session_reset_needed, R3-FW-02).
+    if (sessionFlag == 1) net_new_session_wifi();
 
     // HELLO reply rate limit (SEC-D-08): 250 ms mein ek se zyada nahi (F-04).
     if (!rsh_hello_reply_allowed((uint32_t)(nowMs - lastHelloReplyMs))) continue;
@@ -610,18 +642,22 @@ static uint8_t net_ctrl_handler(uint8_t cmd, const uint8_t *payload, uint16_t le
       // default table (fail closed — khaali/ghalat table kabhi nahi).
       RshCapsEntry table[40];
       uint8_t n = 0;
+      uint8_t slowAxis = 0;  // FW-04: capsFlags bit0 (ADS1115 live ho to)
       {
         rsh_cfg_txn_t *txn = rsh_fw34_cfg_txn();
         if (txn) {
           RshPinMap map;
-          if (rsh_pinmap_from_blob(txn->current, txn->current_len, &map))
+          if (rsh_pinmap_from_blob(txn->current, txn->current_len, &map)) {
             n = rsh_caps_table_from_pinmap(&map, table, 40);
+            slowAxis = rsh_pinmap_has_slow_axis(&map);
+          }
         }
       }
       if (n == 0) n = rsh_caps_default_table(table, 40);
       uint8_t mac[6];
       WiFi.softAPmacAddress(mac);
       uint8_t flags = 0;
+      if (slowAxis) flags |= 0x01;  // bit0 slowAxis (FW-04): ADS1115 axis live
       if (rsh_fw34_safe_mode_active()) flags |= 0x02;  // bit1 safeMode (FW-3)
       uint8_t caps[18 + 8 * 40];
       size_t total = rsh_caps_build_body(caps, sizeof(caps), mac, net_channel(),
@@ -864,7 +900,7 @@ size_t net_serial_helo(const uint8_t *helo, size_t len, uint32_t nowMs,
   serialLastHelloMs = nowMs;
   serialLastHelloProto = proto;
   if (proto != 0x02) return 0;  // legacy v1: koi HELLO reply nahi (§2.1)
-  if (sessionFlag == 1) net_new_session();  // naya session — dono sessions reset
+  if (sessionFlag == 1) net_new_session_serial();  // naya session — sirf serial reset (R3-FW-11)
   // HELLO reply rate limit (SEC-D-08 jaisa): 250 ms mein ek se zyada nahi (F-04).
   if (!rsh_hello_reply_allowed((uint32_t)(nowMs - serialLastHelloReplyMs))) return 0;
   serialLastHelloReplyMs = nowMs;

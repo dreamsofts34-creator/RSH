@@ -61,6 +61,7 @@
 #define RSH_KIND_EXPANDER_PCF8574  9
 #define RSH_KIND_AXIS_GENERIC      10
 #define RSH_KIND_RESERVED_PIN      11
+#define RSH_KIND_AXIS_AS5600       12  // FW-01 (Round 3): AS5600 I2C axis (§3.4.1)
 
 // ---- Pin caps bits (PROTOCOL §3.4 pin table entry byte 3) ----
 #define RSH_CAP_INPUT  0x01
@@ -197,33 +198,40 @@ static inline uint8_t rsh_caps_table_from_pinmap(const RshPinMap *map,
       tmp[n++] = rsh_caps_entry((pin_), (kind_), (module_), (caps_)); \
     } \
   } while (0)
-  if (map->steer != RSH_PINMAP_ABSENT)
-    RSH_CAPS_ADD(map->steer, RSH_KIND_ADC_NATIVE, RSH_MOD_STEERING,
-                 rsh_caps_pin_caps_(map->steer, 1));
-  if (map->accel != RSH_PINMAP_ABSENT)
-    RSH_CAPS_ADD(map->accel, RSH_KIND_ADC_NATIVE, RSH_MOD_ACCELERATOR,
-                 rsh_caps_pin_caps_(map->accel, 1));
-  if (map->brake != RSH_PINMAP_ABSENT)
-    RSH_CAPS_ADD(map->brake, RSH_KIND_ADC_NATIVE, RSH_MOD_BRAKE,
-                 rsh_caps_pin_caps_(map->brake, 1));
+// FW-01: ek axis slot ki row — kind/pin/caps axisType se. I2C axis ka
+// pin 0xFF hai (koi GPIO nahi), kind 2 (ADS1115) / 12 (AS5600); native
+// axis ka pin GPIO hai, kind 1 (ADC) / 10 (GENERIC). axisType 0xFF ho
+// to koi row nahi (slot ka record nahi).
+#define RSH_CAPS_AXIS_ROW(pin_, type_, module_) do { \
+    if ((type_) == RSH_CFG_TYPE_AXIS_AS5600) { \
+      RSH_CAPS_ADD(RSH_PINMAP_ABSENT, RSH_KIND_AXIS_AS5600, (module_), \
+                   RSH_CAP_INPUT); \
+    } else if ((type_) == RSH_CFG_TYPE_AXIS_ADS1115) { \
+      RSH_CAPS_ADD(RSH_PINMAP_ABSENT, RSH_KIND_ADC_ADS1115, (module_), \
+                   RSH_CAP_INPUT | RSH_CAP_ADC); \
+    } else if ((pin_) != RSH_PINMAP_ABSENT) { \
+      RSH_CAPS_ADD((pin_), \
+                   (type_) == RSH_CFG_TYPE_AXIS_GENERIC \
+                       ? RSH_KIND_AXIS_GENERIC : RSH_KIND_ADC_NATIVE, \
+                   (module_), rsh_caps_pin_caps_((pin_), 1)); \
+    } \
+  } while (0)
+  RSH_CAPS_AXIS_ROW(map->steer, map->axisType[0], RSH_MOD_STEERING);
+  RSH_CAPS_AXIS_ROW(map->accel, map->axisType[1], RSH_MOD_ACCELERATOR);
+  RSH_CAPS_AXIS_ROW(map->brake, map->axisType[2], RSH_MOD_BRAKE);
   // Clutch row sirf tab jab clutch record ho (factory blob mein nahi —
   // is liye factory table default table ke barabar rehti hai). Default
   // table mein clutch row is liye nahi thi ke pin 33 gear-down row mein
   // tha — blob mein clutch aur gear-down ek pin par kabhi nahi hote
   // (validator PIN_CONFLICT), is liye yahan dono rows aa sakti hain.
-  if (map->clutch != RSH_PINMAP_ABSENT)
-    RSH_CAPS_ADD(map->clutch, RSH_KIND_ADC_NATIVE, RSH_MOD_CLUTCH,
-                 rsh_caps_pin_caps_(map->clutch, 1));
-  if (map->handbrake != RSH_PINMAP_ABSENT)
-    // F-15: button mode mein handbrake digital input hai (ADC nahi) —
-    // GET_CAPS mein wahi kind/caps aate hain.
-    RSH_CAPS_ADD(map->handbrake,
-                 map->handbrakeButtonMode ? RSH_KIND_DIGITAL_IN
-                                          : RSH_KIND_ADC_NATIVE,
-                 RSH_MOD_HANDBRAKE,
-                 map->handbrakeButtonMode
-                     ? rsh_caps_pin_caps_(map->handbrake, 0)
-                     : rsh_caps_pin_caps_(map->handbrake, 1));
+  RSH_CAPS_AXIS_ROW(map->clutch, map->axisType[3], RSH_MOD_CLUTCH);
+  // F-15: button mode mein handbrake digital input hai (ADC nahi) —
+  // GET_CAPS mein wahi kind/caps aate hain (sirf native pin par).
+  if (map->handbrakeButtonMode && map->handbrake != RSH_PINMAP_ABSENT)
+    RSH_CAPS_ADD(map->handbrake, RSH_KIND_DIGITAL_IN, RSH_MOD_HANDBRAKE,
+                 rsh_caps_pin_caps_(map->handbrake, 0));
+  else
+    RSH_CAPS_AXIS_ROW(map->handbrake, map->axisType[4], RSH_MOD_HANDBRAKE);
   if (map->battery != RSH_PINMAP_ABSENT)
     RSH_CAPS_ADD(map->battery, RSH_KIND_ADC_NATIVE, RSH_MOD_BATTERY,
                  rsh_caps_pin_caps_(map->battery, 1));
@@ -265,6 +273,7 @@ static inline uint8_t rsh_caps_table_from_pinmap(const RshPinMap *map,
   }
   if (map->ledStrip != RSH_PINMAP_ABSENT)
     RSH_CAPS_ADD(map->ledStrip, RSH_KIND_LED_STRIP, RSH_MOD_LED, RSH_CAP_OUTPUT);
+#undef RSH_CAPS_AXIS_ROW
 #undef RSH_CAPS_ADD
   if (maxEntries < n) return 0;
   memcpy(out, tmp, (size_t)n * sizeof(tmp[0]));
@@ -359,8 +368,13 @@ static inline void rsh_modules_apply_config_blob(const uint8_t *blob, size_t len
   // warna ek corrupt blob modules band ya gate mode reset kar deta (host
   // test §25 ne pakda: CRC-toda blob shifterMode 1 -> 0 kar raha tha).
   if (!rsh_pinmap_from_blob(blob, len, &map)) return;
-  rsh_modules_state_().clutch = (map.clutch != RSH_PINMAP_ABSENT) ? 1 : 0;
-  rsh_modules_state_().handbrake = (map.handbrake != RSH_PINMAP_ABSENT) ? 1 : 0;
+  // FW-01: clutch/handbrake I2C axis (ADS1115/AS5600) par bhi on hote
+  // hain — un ka pin 0xFF hota hai, is liye axis_present (pin ya I2C
+  // kind) se check karo, sirf pin se nahi.
+  rsh_modules_state_().clutch =
+      rsh_pinmap_axis_present(&map, RSH_AXIS_SLOT_CLUTCH) ? 1 : 0;
+  rsh_modules_state_().handbrake =
+      rsh_pinmap_axis_present(&map, RSH_AXIS_SLOT_HANDBRAKE) ? 1 : 0;
   rsh_modules_state_().encoders =
       (map.enc1A != RSH_PINMAP_ABSENT || map.enc2A != RSH_PINMAP_ABSENT) ? 1 : 0;
   rsh_modules_state_().led = (map.ledStrip != RSH_PINMAP_ABSENT) ? 1 : 0;

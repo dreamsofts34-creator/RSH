@@ -365,6 +365,7 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
     uint16_t n_axes = 0, n_enc = 0, n_btn = 0, n_as5600 = 0, n_bat = 0, n_led = 0;
     uint16_t n_ledcfg = 0;  // F-14: persistent LED config records (max 1)
     uint8_t has_hpattern = 0;
+    uint8_t ads_ch_used = 0;  // FW-01: ADS1115 AIN channels (bit n = ch n istemal)
     // Pre-scan: I2C kinds (ADS1115/expander/AS5600) hon to GPIO21/22 I2C
     // hain (R-L9) — direct pin istemal neeche reject hota hai.
     uint8_t has_i2c = 0;
@@ -484,6 +485,22 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
           if (r[p] != 0xFF) {
             RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
             if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
+          }
+        }
+        if (type == RSH_CFG_TYPE_AXIS_ADS1115) {
+          // FW-01: channel params[0] mein hai (0..3, addr 0x48 fixed) —
+          // PC builder (pin.rs) bhi yahi range enforce karta hai.
+          // Duplicate channel do axes ko ek hi AIN par mirror kar deta
+          // (dono values hamesha barabar) — COMMIT par reject.
+          uint8_t ch = r[6];
+          if (ch > 3) {
+            RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
+            if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
+          } else if (ads_ch_used & (uint8_t)(1u << ch)) {
+            RSH_CFG_ADD_ERR(RSH_CFG_ERR_PIN_CONFLICT);
+            if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
+          } else {
+            ads_ch_used |= (uint8_t)(1u << ch);
           }
         }
         continue;
