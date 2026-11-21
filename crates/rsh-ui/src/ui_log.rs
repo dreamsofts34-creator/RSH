@@ -16,7 +16,9 @@
 //! sites, all on the UI thread). Lines accumulate in an 8 KiB
 //! buffer and flush when it fills, every [`UI_LOG_FLUSH_LINES`]
 //! lines, on day rollover, or on [`flush_ui_file_log`] (called at
-//! exit from `main`). The handle is deliberately reopened at each
+//! exit from `main`, and from the panic hook installed by
+//! `install_ui_panic_hook` in `main.rs` — R3-UI-04 — so a crash
+//! flushes the last buffered lines instead of stranding them). The handle is deliberately reopened at each
 //! flush boundary, so a delete-and-recreate of the log file can
 //! strand at most 64 lines on a stale handle instead of the whole
 //! session — the property the old open-per-line design bought, kept

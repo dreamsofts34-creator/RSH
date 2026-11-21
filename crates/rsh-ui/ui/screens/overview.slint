@@ -183,14 +183,24 @@ export component OverviewPage inherits VerticalLayout {
             // repeats all tiles and hides the other row's via
             // `visible` — hidden tiles take no layout space.)
             if games.length > 0 : GridLayout {
-                // Fixed 10px: a computed spacing from `self.width`
-                // is a binding LOOP here — the grid sits inside a
-                // ScrollView, so its width comes back through
-                // flickable.content-width (compiler error, caught by
-                // ui-theme-switch). The tiles themselves still grow
-                // (min-width 300px + stretch 1); only the gap stays
-                // fixed. See CARDS-LAYOUT-RESEARCH §2 R-4.
-                spacing: 10px;
+                // R3-UI-06: the gap is responsive now — it reads
+                // `overview-scroll.width` (the ScrollView's own
+                // width, set by the page layout from the window),
+                // NOT `self.width`: a computed spacing from the
+                // grid's own width is a binding LOOP here — the
+                // grid sits inside a ScrollView, so its width
+                // comes back through flickable.content-width
+                // (compiler error, caught by ui-theme-switch).
+                // The ScrollView's width is parent-driven and never
+                // flows back from the content, so no cycle.
+                // 10 px at the 736 px design width, then +2.5% of
+                // the extra width — the R-4 spacer rate (a 0.05
+                // stretch against two stretch-1 cards gives the gap
+                // ~2.4% of extra width), so this gap grows exactly
+                // like every other responsive gap on the page. The
+                // tiles themselves still grow (min-width 300px +
+                // stretch 1).
+                spacing: 10px + Math.max(0px, (overview-scroll.width - 736px) * 0.025);
                 Row {
                     for g[idx] in games : GameTile { visible: idx < 2; horizontal-stretch: 1; min-width: 300px; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-disabled: busy-kind == 13; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
                 }
