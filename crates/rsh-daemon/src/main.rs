@@ -921,7 +921,7 @@ fn try_create_pipe_with_dacl(
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             PCWSTR(sddl.as_ptr()),
             1, // SDDL_REVISION_1
-            &mut descriptor,
+            &raw mut descriptor,
             None,
         )
     };
@@ -942,7 +942,7 @@ fn try_create_pipe_with_dacl(
             .first_pipe_instance(first_create)
             .create_with_security_attributes_raw(
                 rsh_ipc::IPC_PIPE_NAME,
-                &mut attrs as *mut SECURITY_ATTRIBUTES as *mut std::ffi::c_void,
+                (&raw mut attrs).cast::<std::ffi::c_void>(),
             )
     };
     let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
@@ -1587,7 +1587,7 @@ fn main() {
             // the Global\ mutex needs SeCreateGlobalPrivilege,
             // which a non-elevated daemon does not hold.
             #[cfg(windows)]
-            if lock.mutex_scope() == Some(single_instance::MutexScope::Local) {
+            if lock.mutex_scope() == single_instance::MutexScope::Local {
                 log_line(
                     verbose,
                     "daemon: single-instance mutex fell back to Local\\ scope (Global\\ needs SeCreateGlobalPrivilege)",

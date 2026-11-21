@@ -477,7 +477,7 @@ fn confirm_connected_to(ssid: &str) -> Result<(), RejoinError> {
         step: "confirm-connected",
         detail: format!(
             "Wi-Fi did not connect to '{ssid}' within {} s — the network may be out of range or the board AP may be down",
-            CONFIRM_ATTEMPTS * CONFIRM_INTERVAL.as_secs() as u32
+            u64::from(CONFIRM_ATTEMPTS) * CONFIRM_INTERVAL.as_secs()
         ),
     })
 }
@@ -485,7 +485,7 @@ fn confirm_connected_to(ssid: &str) -> Result<(), RejoinError> {
 /// Delete the Windows WLAN profile for `ssid`, ignoring every
 /// failure (R3-FW-13): a profile that does not exist fails the
 /// delete, and that is fine. Used before importing an OPEN
-/// profile — after a KEY_RESET the board AP is open, but the PC
+/// profile — after a `KEY_RESET` the board AP is open, but the PC
 /// may still hold a stale WPA2 profile for the same `RSH-XXXX`
 /// SSID, which would make Windows try the old password against
 /// an open AP instead of joining it.
@@ -522,7 +522,7 @@ fn rejoin_wifi_open_windows(ssid: &str) -> Result<(), RejoinError> {
 ///
 /// `delete_stale_first` (R3-FW-13, open AP only): delete any
 /// existing WLAN profile for the SSID before importing — after a
-/// KEY_RESET the board AP is open, but the PC may still hold a
+/// `KEY_RESET` the board AP is open, but the PC may still hold a
 /// stale WPA2 profile for the same SSID. The WPA2 path keeps the
 /// existing profile (importing overwrites it, and deleting first
 /// would lose it if the import then failed).

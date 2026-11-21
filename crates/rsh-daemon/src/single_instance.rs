@@ -415,13 +415,14 @@ fn pid_is_live_rsh_daemon(pid: u32) -> bool {
 }
 
 impl SingleInstance {
-    /// Which mutex namespace this lock lives in (R3-06): `Some`
-    /// on Windows, `None` on Linux (pid-file lock, no mutex).
+    /// Which mutex namespace this lock lives in (R3-06). Windows-only
+    /// by construction (the Mutex variant exists only on Windows),
+    /// so this always has a value — no `Option` wrapper.
     #[cfg(windows)]
     #[must_use]
-    pub fn mutex_scope(&self) -> Option<MutexScope> {
+    pub fn mutex_scope(&self) -> MutexScope {
         match self {
-            Self::Mutex { scope, .. } => Some(*scope),
+            Self::Mutex { scope, .. } => *scope,
         }
     }
 

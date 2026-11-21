@@ -254,7 +254,8 @@ fn register_application_restart_windows(
         // deliberately: the registration lives for the process
         // lifetime, and the callback must never dangle.
         let log_path = data_dir.join("logs").join(RECOVERY_LOG_FILE);
-        let param = Box::leak(Box::new(log_path)) as *mut PathBuf as *mut std::ffi::c_void;
+        let param =
+            std::ptr::from_mut::<PathBuf>(Box::leak(Box::new(log_path))).cast::<std::ffi::c_void>();
         RegisterApplicationRecoveryCallback(Some(recovery_callback), Some(param), 5000, 0)
             .map_err(|error| error.to_string())?;
     }
@@ -428,14 +429,14 @@ mod tests {
         let outcome = register_application_restart(&dir, false).expect("register");
         assert_eq!(outcome, RestartOutcome::Registered);
         let mut buf = vec![0u16; 4096];
-        let mut size = buf.len() as u32;
+        let mut size = u32::try_from(buf.len()).unwrap_or(u32::MAX);
         let mut flags = 0u32;
         unsafe {
             GetApplicationRestartSettings(
                 GetCurrentProcess(),
                 Some(PWSTR(buf.as_mut_ptr())),
-                &mut size,
-                Some(&mut flags),
+                &raw mut size,
+                Some(&raw mut flags),
             )
             .expect("get settings");
         }

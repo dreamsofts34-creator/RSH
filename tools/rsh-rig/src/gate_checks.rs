@@ -1154,7 +1154,11 @@ pub fn gate_tray_persistence_source() -> (bool, String) {
             && popup.contains("changed_streak >= POPUP_DISMISS_CHANGED_POLLS"),
         "PopupDismissPoll never dismisses while foreground; dismisses only on a real foreground move-away (sustained foreground lost, or 3 consecutive polls away from baseline)",
     );
-    let Some(timer_start) = daemon.find("Refresh timer (10 Hz while visible)") else {
+    // R3-16: anchors must be live code — the old start anchor was
+    // the `// Refresh timer (10 Hz while visible)` comment, which
+    // `strip_comments` removes. The timer creation is the live
+    // anchor; the end anchor (`std::mem::forget(timer)`) is code.
+    let Some(timer_start) = daemon.find("let timer = slint::Timer::default();") else {
         report.check("tray-timer-block", false, "refresh-timer block not found");
         return report.finish();
     };
@@ -1338,9 +1342,13 @@ pub fn gate_wizard_fake_data_source() -> (bool, String) {
             && !setup.contains("paired:"),
         "wizard defaults: 'No games added yet.', connect-done=false, connect-hint empty, no pair-status/paired defaults",
     );
+    // R3-16: the old pattern matched the `// …must never advance
+    // the wizard` comment, which `strip_comments` removes. The
+    // live guard is `reachable`, which requires `live` — a sim
+    // reporting Active can never set it (see `refresh`, R2-19).
     report.check(
         "wizard-sim-never-advances",
-        ui_main.contains("must never advance the wizard"),
+        ui_main.contains("let reachable = live && (conn.board_reachable || active);"),
         "sim data never advances the wizard Connect step (Rust guards on the real session)",
     );
     report.finish()
@@ -1379,12 +1387,18 @@ pub fn gate_loading_source() -> (bool, String) {
         ipc_api.contains(".call(\"poll\""),
         "poll loop uses the bounded call (single combined poll, L-4)",
     );
+    // R3-16: the old count matched the English words
+    // "loading"/"spinner"/"Loading", which in main.rs are almost
+    // all `//` comments that `strip_comments` removes (2 left).
+    // The live loading-state wiring is the B5 busy-job system
+    // (`busy_jobs`: every async action sets a job kind, the frame
+    // timer times it out) plus the user-visible timeout string.
     let loading_markers =
-        count(&ui_main, "loading") + count(&ui_main, "spinner") + count(&ui_main, "Loading");
+        count(&ui_main, "busy_jobs") + count(&ui_main, "Loading") + count(&ui_main, "spinner");
     report.check(
         "loading-ui-markers",
         loading_markers >= 5,
-        &format!("{loading_markers} loading/spinner markers in rsh-ui main.rs"),
+        &format!("{loading_markers} loading/spinner/busy-job markers in rsh-ui main.rs"),
     );
     report.finish()
 }
@@ -1472,9 +1486,16 @@ pub fn gate_theme_source() -> (bool, String) {
         settings.contains("theme-selected") && settings.contains("theme-choice: 0;"),
         "Settings theme row forwards the selection",
     );
+    // R3-16: the old patterns matched `//` comments — "Theme.mode:
+    // theme;" only appears in the comment explaining why that
+    // binding is NOT valid Slint, and "theme-persist" only in the
+    // R2-31 comment. The live wiring is the `changed theme`
+    // handler (globals are written from code) plus the Settings
+    // row calling `theme-persist(i)`.
     report.check(
         "theme-window-wired",
-        main_slint.contains("Theme.mode: theme;") && main_slint.contains("theme-persist"),
+        main_slint.contains("changed theme => { Theme.mode = theme; }")
+            && main_slint.contains("theme-persist(i)"),
         "MainWindow drives Theme.mode and persists the choice",
     );
     report.check(
@@ -1518,10 +1539,16 @@ pub fn gate_overflow_source() -> (bool, String) {
         card.contains("horizontal-stretch: 1;"),
         "text column takes the free width; the Check button keeps its own width",
     );
+    // R3-16: the old pattern matched the `(A7, v2.0.2)` fix-note
+    // comment, which `strip_comments` removes — a comment marker
+    // can never be audited as live code. The live proof is that
+    // the Check button sits inside the card's rows (with the
+    // wrap + stretch siblings above, a long line cannot push it
+    // out of the card).
     report.check(
         "overflow-fix-note",
-        settings.contains("A7, v2.0.2"),
-        "A7 fix is marked in the source",
+        card.contains("Btn { label: \"Check\""),
+        "A7 fix is live in the source: the Check button sits inside the Backup card rows",
     );
     report.finish()
 }

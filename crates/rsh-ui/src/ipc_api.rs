@@ -3229,7 +3229,9 @@ mod tests {
         // unrecognised daemon code stays the generic link failure.
         let error = IpcApi::daemon_connect_error("Unreachable: daemon API error: Unreachable");
         assert_eq!(error.code, "Unreachable");
-        assert_eq!(error.title, "Unreachable");
+        // R3-D-15 (WS-4): the title is a human-readable headline,
+        // never the raw code — the code lives only in `code`.
+        assert_eq!(error.title, "Wheel not found");
         // The fake daemon sends an empty message (`"Unreachable: "`)
         // where the real server sends `"daemon API error:
         // Unreachable"` — both must parse to the same kind.

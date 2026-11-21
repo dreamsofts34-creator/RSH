@@ -16,10 +16,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// R3-08: `.lines()` survives only in the tests below (fake peers)
-/// — the production reader uses `read_bounded_line` — so this
-/// import is test-only.
-#[cfg(test)]
+/// R3-08: `.lines()` survives only in the Unix tests below (fake
+/// peers) — the production reader uses `read_bounded_line` — so
+/// this import is test-only AND Unix-only.
+#[cfg(all(test, unix))]
 use tokio::io::AsyncBufReadExt;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};

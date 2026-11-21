@@ -497,6 +497,9 @@ impl Tuning {
     }
 }
 
+// CLI flags: four bools is the struct's whole job (same allow as
+// `commands.rs` / daemon `main.rs` flag structs).
+#[allow(clippy::struct_excessive_bools)]
 struct Args {
     page: i32,
     quit_after: Option<u64>,
@@ -9677,15 +9680,14 @@ fn start_frame_timer(
             // foreground, behaviour unchanged.)
             #[cfg(windows)]
             let foreground = {
-                let hwnd = match ui_hwnd.get() {
-                    Some(hwnd) => Some(hwnd),
-                    None => {
-                        let hwnd = ui_lifecycle::ui_window_hwnd();
-                        ui_hwnd.set(hwnd);
-                        hwnd
-                    }
+                let hwnd = if let Some(hwnd) = ui_hwnd.get() {
+                    Some(hwnd)
+                } else {
+                    let hwnd = ui_lifecycle::ui_window_hwnd();
+                    ui_hwnd.set(hwnd);
+                    hwnd
                 };
-                hwnd.map_or(true, ui_lifecycle::window_is_foreground)
+                hwnd.is_none_or(ui_lifecycle::window_is_foreground)
             };
             #[cfg(not(windows))]
             let foreground = true;

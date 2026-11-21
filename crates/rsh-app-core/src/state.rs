@@ -7550,6 +7550,12 @@ impl<'a> ForwarderRetryWaitGuard<'a> {
 }
 
 impl Drop for ForwarderRetryWaitGuard<'_> {
+    // `fetch_update` is deprecated in favour of `try_update`, but
+    // `try_update` is stable only since Rust 1.95 and the MSRV
+    // floor is 1.90 (clippy.toml) — the old name is a rename, not
+    // a removal, so keep it with the lint allowed until the MSRV
+    // moves past 1.95.
+    #[allow(deprecated)]
     fn drop(&mut self) {
         let _ = self
             .count
@@ -8730,7 +8736,7 @@ async fn forward_with_retry_with_policy<T, F>(
         // this iteration (transport loss falls through to
         // `forwarder_retry_after_failure`, which arms its own
         // wait for the backoff sleep).
-        let mut retry_wait_guard: Option<ForwarderRetryWaitGuard<'_>> = None;
+        let mut _retry_wait_guard: Option<ForwarderRetryWaitGuard<'_>> = None;
         if state.session_gate_open() {
             // A connected transport breaks the failure streak
             // (M-11): the next loss starts again at the 2 s base.
@@ -8749,7 +8755,7 @@ async fn forward_with_retry_with_policy<T, F>(
                 // R3-D-02: the deadline wait is a forwarder retry
                 // wait — arm it now, before the frame loop starts
                 // waiting on it.
-                retry_wait_guard = Some(ForwarderRetryWaitGuard::arm(&state.forwarder_retry_wait));
+                _retry_wait_guard = Some(ForwarderRetryWaitGuard::arm(&state.forwarder_retry_wait));
                 state.set_engine_status(
                     EngineTaskStatus::Running {
                         transport: Some(kind),
@@ -8845,7 +8851,7 @@ async fn forward_with_retry_with_policy<T, F>(
             retry_deadline = None;
             // R3-D-02: the gate opened — the wait is over, the
             // forwarder no longer owns a retry.
-            retry_wait_guard = None;
+            _retry_wait_guard = None;
             // Status pump (H1 condition 12): board loss counters and
             // `btnsEx` reach the engine. A full/closed engine status
             // channel drops the packet (the engine drains its own
@@ -8878,7 +8884,7 @@ async fn forward_with_retry_with_policy<T, F>(
         if deadline_fired {
             // R3-D-02: the deadline fired — the wait is over, the
             // rebuild below starts a fresh activation attempt.
-            retry_wait_guard = None;
+            _retry_wait_guard = None;
             // DS-06 (a): teardown-before-rebind — the old
             // transport (and its socket, still held by its reader
             // thread for ~100 ms after the flag is set) is dropped

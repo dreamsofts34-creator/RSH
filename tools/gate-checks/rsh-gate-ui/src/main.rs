@@ -1124,7 +1124,7 @@ fn extras_runs(flags: [bool; 4]) -> Result<ExtrasSnapshot, String> {
 /// now has the same floor + cross-state equality as row-1, so all
 /// four cards are covered: row-1 proves Handbrake/Shifter, row-2
 /// proves Horn/LEDs (right-column cards share their row height by
-/// HorizontalLayout cross-axis stretch).
+/// `HorizontalLayout` cross-axis stretch).
 #[allow(clippy::cast_precision_loss)]
 fn ui_extras_card_size() -> Outcome {
     let mut report = Report::new();
