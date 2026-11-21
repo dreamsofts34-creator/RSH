@@ -356,6 +356,20 @@ impl AppApi for DaemonApi {
         Self::connection_from(&self.manager_state(), &self.state.transport_state())
     }
 
+    /// R3-D-05: this is the UI Connect / retry entry point, and it
+    /// retries immediately — it does not wait for the manager's
+    /// backoff timer. When no forwarder activity is in flight
+    /// (`Backoff` with a stopped forwarder, `LinkUp`/`Hello` with a
+    /// dead activation, tripped breaker), `connect_transport`
+    /// spawns a fresh forwarder at once. When an activation or a
+    /// forwarder retry wait IS in flight, `connect_transport`
+    /// no-ops instead of tearing that forwarder down — and this
+    /// still returns `Ok`, but with the LIVE connection state
+    /// (`Backoff` → "Reconnecting", `LinkUp`/`Hello` →
+    /// "Connecting"): the returned state is the honest status, not
+    /// a claim that a fresh connection started. (A full
+    /// accepted-vs-already-connecting distinction would need an IPC
+    /// schema change; R3-D-14 owns the error mapping here.)
     fn connect(&self, transport: ApiTransport) -> Result<ConnectionInfo, UserError> {
         let kind = match transport {
             ApiTransport::Wifi => TransportKind::Udp,

@@ -438,8 +438,25 @@ async fn manager_loop(
             let _ = api.state.connect_transport(TransportKind::Udp);
             publish(&event_tx, connection_changed_event(&api));
         }
-        // Backoff retry timer.
-        if let Some(due) = api.manager_retry_due_at()
+        // Backoff retry timer. R3-D-02: ONE loop owns the retry —
+        // the forwarder's. While the forwarder is waiting out its
+        // own retry backoff (`forwarder_retry_waiting`) or its
+        // circuit breaker is open (`forwarder_breaker_open`), the
+        // manager's timer is NOT fed: feeding it would move the
+        // manager to `LinkUp` and run `connect_session`, whose old
+        // code aborted the running forwarder and spawned a fresh
+        // one with streak 0 — the 10-failure breaker could never
+        // trip while the manager retried. The manager stays in
+        // `Backoff`/`Error` until the forwarder either re-activates
+        // (gate opens → `CapsOk`, accepted from `Backoff` too,
+        // R3-D-01) or stops; a tripped breaker stays tripped until
+        // the user reconnects explicitly. The due timer is left
+        // armed — it is re-checked every tick and fires as soon as
+        // neither condition holds.
+        if api.state.forwarder_retry_waiting() || api.state.forwarder_breaker_open() {
+            // Forwarder owns the retry (or the breaker is open):
+            // do not feed the manager's timer this tick.
+        } else if let Some(due) = api.manager_retry_due_at()
             && Instant::now() >= due
         {
             let (action, changed) = api.manager_event(ConnEvent::RetryTimer);
