@@ -1006,6 +1006,11 @@ mod tests {
     /// a thread-spawn failure itself is OS resource exhaustion and
     /// cannot be triggered in a test, so this proves the mechanism
     /// the fix relies on (and that teardown releases the port).
+    /// Both background threads hold a socket `Arc` (reader AND
+    /// helo), so the rebind must wait for BOTH to stop — waiting
+    /// for the reader alone flakes under load, when the helo
+    /// thread (1 s interval) is still exiting and holding the
+    /// port (AddrInUse on the rebind).
     #[test]
     fn shutdown_stops_the_reader_thread_and_releases_the_port() {
         let config = UdpConfig {
@@ -1018,10 +1023,11 @@ mod tests {
         let port = transport.socket.local_addr().expect("addr").port();
         transport.shutdown();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while transport.reader_alive() && Instant::now() < deadline {
+        while (transport.reader_alive() || transport.helo_alive()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!transport.reader_alive(), "reader must stop after shutdown");
+        assert!(!transport.helo_alive(), "helo must stop after shutdown");
         drop(transport);
         StdUdpSocket::bind(("127.0.0.1", port)).expect("port released after teardown");
     }
