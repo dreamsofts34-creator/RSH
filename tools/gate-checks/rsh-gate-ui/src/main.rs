@@ -981,6 +981,105 @@ fn ui_tray_light_theme() -> Outcome {
     report.finish()
 }
 
+/// Panel2-coloured runs along one horizontal pixel row
+/// (`Theme.panel2` #1D2533, the `GameTile` background) — the tile
+/// runs on a tile row. Mirrors `panel_row_runs` for the tile
+/// colour.
+#[must_use]
+fn panel2_row_runs(rgba: &[u8], width: u32, y: usize) -> Vec<(usize, usize)> {
+    let mut xs: Vec<usize> = Vec::new();
+    for col in 0..width as usize {
+        let idx = (y * width as usize + col) * 4;
+        let (red, green, blue) = (
+            i32::from(rgba[idx]),
+            i32::from(rgba[idx + 1]),
+            i32::from(rgba[idx + 2]),
+        );
+        if (red - 0x1d).abs() <= 6 && (green - 0x25).abs() <= 6 && (blue - 0x33).abs() <= 6 {
+            xs.push(col);
+        }
+    }
+    merge_runs(&xs)
+}
+
+/// R3-UI-06: measure the games-grid tile gap from a snapshot.
+/// The row with the most panel2 pixels is a tile padding strip
+/// (two full tile widths — no other row on the page comes close:
+/// tile content rows lose the icon + button widths, the wheel
+/// card has no wide panel2 run), and the gap is the space between
+/// the two tile runs on that row. Returns (gap, y) — the gap
+/// includes the two 1 px tile borders, so it reads ~2 px over the
+/// `spacing` value.
+#[must_use]
+fn games_tile_gap(rgba: &[u8], width: u32, height: u32) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for y in 0..height as usize {
+        let count = panel2_row_runs(rgba, width, y)
+            .iter()
+            .map(|(_, len)| len)
+            .sum::<usize>();
+        if best.is_none_or(|(best_count, _)| count > best_count) {
+            best = Some((count, y));
+        }
+    }
+    let (_, y) = best?;
+    let runs = panel2_row_runs(rgba, width, y);
+    if runs.len() < 2 {
+        return None;
+    }
+    // Runs come back left to right; the two tiles are the first
+    // two (a padding strip has no other panel2 run).
+    let (start0, len0) = runs[0];
+    let (start1, _) = runs[1];
+    Some((start1.saturating_sub(start0 + len0), y))
+}
+
+/// Gate: games-grid tile gap is responsive (R3-UI-06) — 10 px
+/// spacing at the 736 px design width, growing with the window.
+/// Pixel proof on the real `OverviewPage`: the measured gap
+/// (spacing + the two 1 px tile borders, so ~12 px at design)
+/// must be ~12 px at 736 px and ~19 px at 1016 px
+/// (`10 + (1016-736) * 0.025 + 2`), i.e. the gap grows ~7 px
+/// over the same range the R-4 spacers grow ~7 px.
+fn ui_games_grid_gap() -> Outcome {
+    let mut report = Report::new();
+    let mut gaps: Vec<(u32, usize)> = Vec::new();
+    for (component, exp_gap) in [
+        ("GateOverviewWindow736", 12_usize),
+        ("GateOverviewWindow1016", 19_usize),
+    ] {
+        let instance = match compile(
+            "tools/gate-checks/rsh-gate-ui/ui/overview_probe.slint",
+            component,
+        ) {
+            Ok(instance) => instance,
+            Err(error) => return Outcome::fail(error),
+        };
+        let (rgba, width, height) = match snapshot(&instance) {
+            Ok(snap) => snap,
+            Err(error) => return Outcome::fail(error),
+        };
+        let Some((gap, y)) = games_tile_gap(&rgba, width, height) else {
+            return Outcome::fail(format!("{component}: no tile row found"));
+        };
+        gaps.push((width, gap));
+        report.check(
+            &format!("{component}-gap"),
+            gap.abs_diff(exp_gap) <= 3,
+            &format!("tile gap {gap} px on row y={y} (expected ~{exp_gap} px)"),
+        );
+    }
+    if gaps.len() == 2 {
+        let growth = gaps[1].1.saturating_sub(gaps[0].1);
+        report.check(
+            "games-gap-grows",
+            (5..=9).contains(&growth),
+            &format!("gap grows {growth} px from 736 to 1016 px (expected ~7 px)"),
+        );
+    }
+    report.finish()
+}
+
 /// Gate: error banner wraps + grows (DS-21, U-03) — the banner was
 /// a fixed 36 px with no wrapping, so a 150-char daemon-error was
 /// cut off mid-sentence. A short string stays 36 px; the 150-char
@@ -1318,6 +1417,11 @@ fn checks() -> Vec<UiCheck> {
             "ui-card-gap-responsive",
             "Cards fix Bug 1: gap 12 px at design width, grows on wider windows; cards grow",
             ui_card_gap_responsive as fn() -> Outcome,
+        ),
+        (
+            "ui-games-grid-gap",
+            "R3-UI-06: games-grid tile gap 10 px at design width, grows with the window",
+            ui_games_grid_gap as fn() -> Outcome,
         ),
     ]
 }

@@ -1960,6 +1960,14 @@ struct PopupHandle {
     /// closes the same-foreground hole. Set in `show()`, cleared
     /// in `hide()`.
     popup_rect: Cell<Option<Rect>>,
+    /// Screen rect of the tray icon at show time (R3-UI-07): a
+    /// press on the tray icon is a toggle action (owned by the
+    /// double-click guard), not a click-away — the click-outside
+    /// check treats it as "inside". Set in `show()` (reusing the
+    /// rect already read for anchoring), cleared in `hide()`.
+    /// `None` when the icon rect is unknown (Linux / hidden tray)
+    /// — then only the popup rect counts.
+    tray_rect: Cell<Option<Rect>>,
     /// Change-detection cache (R2-38): `refresh()` only pushes
     /// properties when the collected data or theme actually moved,
     /// so the 10 Hz timer does not repaint an idle popup.
@@ -2111,7 +2119,11 @@ impl PopupHandle {
         // the time Windows settles, so it is diagnostics only).
         let foreground_at_show = tray_geometry::foreground_hwnd();
         *self.poll.borrow_mut() = PopupDismissPoll::new(foreground_at_show);
-        let (x, y) = anchor_popup(tray_geometry::tray_icon_rect(), tray_geometry::work_area());
+        // R3-UI-07: keep the tray-icon rect — a press on the icon
+        // is a toggle, not a click-away (see `tick`).
+        let tray_rect = tray_geometry::tray_icon_rect();
+        self.tray_rect.set(tray_rect);
+        let (x, y) = anchor_popup(tray_rect, tray_geometry::work_area());
         // Phase 2 (F-12 / U-1): remember the shown rect for the
         // click-outside check in `tick()`.
         self.popup_rect.set(Some(Rect {
@@ -2189,6 +2201,7 @@ impl PopupHandle {
         self.visible.set(false);
         self.shown_at.set(None);
         self.popup_rect.set(None);
+        self.tray_rect.set(None);
         // PERF F-9: the native window is hidden with the popup —
         // drop the cached HWND so the next show re-resolves it
         // instead of reusing a possibly destroyed handle.
@@ -2288,13 +2301,28 @@ impl PopupHandle {
         // poll cannot see (click back into the already-foreground
         // main window). The button latch is read once per tick, so
         // the tray click that showed the popup is consumed by the
-        // first tick; the 5 s floor inside `click_outside` absorbs
-        // it in any case.
+        // first tick; R3-UI-07's first-sample guard in
+        // `click_outside` relies on exactly that (a press on the
+        // first sample is the show click, never a click-away).
+        // A press counts as "inside" when the cursor is on the
+        // popup OR on the tray icon — the icon press is a toggle
+        // action owned by the double-click guard, so without this
+        // a double-click's second press would record a deferred
+        // dismiss and the popup would auto-hide at 5 s. A
+        // click-away recorded inside the 5 s floor dismisses on
+        // the first tick at/after the floor (deferred dismiss —
+        // no second click needed); the foreground poll above is
+        // untouched, so the floor's protection against the
+        // restore-landing misread stays.
         if let Some(rect) = self.popup_rect.get() {
             let cursor_inside = tray_geometry::cursor_position().is_some_and(|(x, y)| {
-                x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+                let in_popup = x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+                let on_tray = self.tray_rect.get().is_some_and(|tray| {
+                    x >= tray.left && x < tray.right && y >= tray.top && y < tray.bottom
+                });
+                in_popup || on_tray
             });
-            if PopupDismissPoll::click_outside(
+            if self.poll.borrow_mut().click_outside(
                 elapsed,
                 tray_geometry::left_button_pressed_since_last_poll(),
                 cursor_inside,
@@ -2462,6 +2490,7 @@ fn create_tray(
             verbose,
             poll: RefCell::new(PopupDismissPoll::new(None)),
             popup_rect: Cell::new(None),
+            tray_rect: Cell::new(None),
             refresh_cache: RefCell::new(PopupRefreshCache::new()),
             cached_profiles: RefCell::new(Vec::new()),
             cached_games: RefCell::new(Vec::new()),

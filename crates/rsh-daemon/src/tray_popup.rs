@@ -48,9 +48,13 @@ pub const POPUP_FOREGROUND_GRACE: Duration = Duration::from_millis(500);
 /// fixed settle window can never cover a restore whose timing is
 /// unbounded, so the floor is the mechanism: no dismiss inside
 /// 5 s, and the baseline is only re-sampled after the floor, from
-/// the settled foreground. A real click-away inside the floor is
-/// absorbed (documented limit — the popup errs towards staying
-/// open); the next click-away after arming dismisses.
+/// the settled foreground. A real MOUSE click-away inside the
+/// floor is recorded, not absorbed — it dismisses on the first
+/// tick at/after the floor (R3-UI-07, deferred dismiss; see
+/// [`PopupDismissPoll::click_outside`]). A FOREGROUND move inside
+/// the floor is still absorbed (documented limit — the poll
+/// cannot tell it from the restore, so it errs towards staying
+/// open); the next foreground move after arming dismisses.
 pub const POPUP_MIN_VISIBLE: Duration = Duration::from_secs(5);
 /// Settle window after the floor during which the poll re-samples
 /// its foreground baseline (F9, v2.0.3; shifted to the floor by
@@ -248,12 +252,17 @@ pub fn popup_is_light(data_dir: Option<&std::path::Path>) -> bool {
 /// still dismisses those). Both are bounded — the next real
 /// click-away dismisses.
 ///
-/// A second honest limit: a click-away that lands inside the
-/// persistence floor (roughly the first five seconds after
-/// showing) is absorbed as settling and does NOT dismiss — the
-/// popup stays open until the next click-away / Escape /
-/// tray-click. The ~2 s false dismiss is the worse failure, so
-/// the poll errs towards staying open.
+/// A second honest limit, narrowed by R3-UI-07: a FOREGROUND
+/// move inside the persistence floor (roughly the first five
+/// seconds after showing) is still absorbed as settling — the
+/// poll cannot tell it apart from the Windows restore landing,
+/// so it stays absorbed. But a MOUSE click-away inside the floor
+/// is no longer absorbed: [`PopupDismissPoll::click_outside`]
+/// records it and dismisses on the first tick at/after the floor
+/// (a deferred dismiss), because a press outside the popup rect
+/// is unambiguous user action. The ~2 s false dismiss is still
+/// the worse failure, so the foreground poll errs towards staying
+/// open; the click path errs towards the user's recorded click.
 #[derive(Clone, Debug, Default)]
 pub struct PopupDismissPoll {
     /// Foreground window sampled at show time (diagnostics only —
@@ -276,6 +285,17 @@ pub struct PopupDismissPoll {
     /// [`POPUP_FOREGROUND_SUSTAINED`] at some point since it was
     /// shown (sticky until the next show).
     saw_sustained_foreground: bool,
+    /// R3-UI-07: a real click-away recorded inside the 5 s floor
+    /// (see [`Self::click_outside`]) — the popup dismisses on the
+    /// first tick at/after the floor instead of absorbing it.
+    /// Cleared by a later press inside the popup (the user
+    /// re-engaged) or when it fires.
+    deferred_click_away: bool,
+    /// R3-UI-07: the first click sample after a show was consumed
+    /// — it is the tray click that showed the popup (the
+    /// `GetAsyncKeyState` latch read consumes it), so it must never
+    /// record a deferred dismiss.
+    show_click_consumed: bool,
 }
 
 impl PopupDismissPoll {
@@ -414,17 +434,66 @@ impl PopupDismissPoll {
     /// pressed since the last `GetAsyncKeyState` read" (a quick
     /// press is caught even if released between 100 ms ticks);
     /// `cursor_inside_popup` is the cursor against the popup rect
-    /// on this tick. Dismisses only after the 5 s persistence
+    /// on this tick — the caller folds the tray-icon rect into it,
+    /// so a press on the tray icon is a toggle action, not a
+    /// click-away. Dismisses only after the 5 s persistence
     /// floor — the tray click that showed the popup is inside the
     /// floor, and the first tick's read consumes it anyway.
-    /// Pure, so the rule is unit-testable without Windows.
+    ///
+    /// R3-UI-07 (deferred dismiss): a press outside the popup
+    /// that arrives inside the floor is no longer absorbed — it is
+    /// recorded in [`Self::deferred_click_away`], and the popup
+    /// dismisses on the first tick at/after the floor, even with no
+    /// fresh press. The floor itself is untouched: the 5 s
+    /// protection against the restore-landing misread stays, and
+    /// the deferred dismiss only ever fires for a click-away
+    /// recorded AFTER the popup was fully shown — the first click
+    /// sample after a show is the tray click that showed the popup
+    /// (the latch read consumes it), so it never records. A press
+    /// inside the popup (or on the tray icon) after a recorded
+    /// click-away cancels the deferred dismiss: the user
+    /// re-engaged. The foreground `poll()` path is untouched — a
+    /// foreground move inside the floor stays absorbed, because
+    /// it cannot be told apart from the Windows settle restore;
+    /// only a real mouse press outside the popup is unambiguous
+    /// user action. Pure, so the rule is unit-testable without
+    /// Windows.
     #[must_use]
     pub fn click_outside(
+        &mut self,
         elapsed: Duration,
         button_pressed: bool,
         cursor_inside_popup: bool,
     ) -> bool {
-        elapsed >= POPUP_MIN_VISIBLE && button_pressed && !cursor_inside_popup
+        // The first sample after a show is the tray click that
+        // showed the popup — consumed, never a click-away (and
+        // never a cancellation either: there is nothing to cancel
+        // yet, and the cursor sits on the tray icon, not in the
+        // popup).
+        if !self.show_click_consumed {
+            self.show_click_consumed = true;
+            return false;
+        }
+        if elapsed >= POPUP_MIN_VISIBLE {
+            // Floor expired: a press inside the popup on this very
+            // tick cancels the deferred dismiss (the user
+            // re-engaged at the last moment); otherwise a recorded
+            // click-away dismisses now, with no fresh press needed.
+            if button_pressed && cursor_inside_popup {
+                self.deferred_click_away = false;
+                return false;
+            }
+            if self.deferred_click_away {
+                return true;
+            }
+            return button_pressed && !cursor_inside_popup;
+        }
+        // Inside the floor: a fresh press outside records a
+        // deferred dismiss; a press inside cancels one.
+        if button_pressed {
+            self.deferred_click_away = !cursor_inside_popup;
+        }
+        false
     }
 }
 
@@ -1254,48 +1323,105 @@ mod tests {
     // Phase 2 (F-12 / U-1): click-outside via the mouse-button
     // state — the same-foreground hole the foreground poll cannot
     // see. A fresh press outside the popup rect after the 5 s
-    // floor dismisses; a press inside the floor, a press with the
-    // cursor inside the popup, or no press at all never does.
+    // floor dismisses; a press with the cursor inside the popup,
+    // or no press at all never does. R3-UI-07: the first sample
+    // after a show is the tray click that showed the popup, so
+    // every sequence below starts by consuming it.
+    //
+    /// A fresh poll with the show click already consumed (the
+    /// first tick's latch read), so the calls under test are real
+    /// user presses.
+    fn click_poll_after_show() -> PopupDismissPoll {
+        let mut poll = PopupDismissPoll::new(None);
+        assert!(
+            !poll.click_outside(Duration::from_millis(100), true, false),
+            "the show click itself never dismisses"
+        );
+        poll
+    }
+
     #[test]
     fn click_outside_dismisses_after_floor() {
-        assert!(PopupDismissPoll::click_outside(
-            Duration::from_secs(6),
-            true,
-            false
-        ));
+        let mut poll = click_poll_after_show();
+        assert!(poll.click_outside(Duration::from_secs(6), true, false));
     }
 
     #[test]
     fn click_outside_never_inside_the_floor() {
-        assert!(!PopupDismissPoll::click_outside(
-            Duration::from_secs(4),
-            true,
-            false
-        ));
-        assert!(!PopupDismissPoll::click_outside(
-            Duration::from_millis(500),
-            true,
-            false
-        ));
+        let mut poll = click_poll_after_show();
+        // A press at 4 s records a deferred dismiss (R3-UI-07)
+        // but does NOT dismiss yet — the floor holds.
+        assert!(!poll.click_outside(Duration::from_secs(4), true, false));
+        let mut poll = click_poll_after_show();
+        assert!(!poll.click_outside(Duration::from_millis(500), true, false));
     }
 
     #[test]
     fn click_outside_needs_a_press_outside_the_popup() {
-        assert!(!PopupDismissPoll::click_outside(
-            Duration::from_secs(6),
-            false,
-            false
-        ));
-        assert!(!PopupDismissPoll::click_outside(
-            Duration::from_secs(6),
-            true,
-            true
-        ));
-        assert!(!PopupDismissPoll::click_outside(
-            Duration::from_secs(6),
-            false,
-            true
-        ));
+        let mut poll = click_poll_after_show();
+        assert!(!poll.click_outside(Duration::from_secs(6), false, false));
+        assert!(!poll.click_outside(Duration::from_secs(6), true, true));
+        assert!(!poll.click_outside(Duration::from_secs(6), false, true));
+    }
+
+    // R3-UI-07: deferred dismiss — a real click-away inside the
+    // floor dismisses on the first tick at/after the floor, with
+    // no second click needed.
+    #[test]
+    fn click_away_inside_floor_dismisses_at_floor() {
+        let mut poll = click_poll_after_show();
+        // Click away at 2 s: no dismiss yet — the floor holds.
+        assert!(!poll.click_outside(Duration::from_secs(2), true, false));
+        // Ticks with no press: still open before the floor.
+        assert!(!poll.click_outside(Duration::from_secs(4), false, false));
+        // First tick at the floor: the recorded click-away fires.
+        assert!(poll.click_outside(Duration::from_secs(5), false, false));
+    }
+
+    #[test]
+    fn show_click_never_records_a_deferred_dismiss() {
+        // The show click itself (first sample, pressed + outside)
+        // must not arm a deferred dismiss — otherwise every popup
+        // would auto-hide at 5 s.
+        let mut poll = PopupDismissPoll::new(None);
+        assert!(!poll.click_outside(Duration::from_millis(100), true, false));
+        for t in (200..=7000).step_by(100) {
+            assert!(
+                !poll.click_outside(Duration::from_millis(t), false, false),
+                "no dismiss at {t} ms without a real click-away"
+            );
+        }
+    }
+
+    #[test]
+    fn inside_press_after_deferred_click_away_cancels_it() {
+        let mut poll = click_poll_after_show();
+        assert!(!poll.click_outside(Duration::from_secs(2), true, false));
+        // The user clicks back INTO the popup: re-engaged, the
+        // deferred dismiss is cancelled.
+        assert!(!poll.click_outside(Duration::from_secs(3), true, true));
+        assert!(!poll.click_outside(Duration::from_secs(5), false, false));
+        assert!(!poll.click_outside(Duration::from_secs(7), false, false));
+    }
+
+    #[test]
+    fn inside_press_on_the_floor_tick_cancels_deferred_dismiss() {
+        let mut poll = click_poll_after_show();
+        assert!(!poll.click_outside(Duration::from_secs(2), true, false));
+        // Re-engagement lands on the very tick the floor expires:
+        // the cancel wins over the fire.
+        assert!(!poll.click_outside(Duration::from_secs(5), true, true));
+        assert!(!poll.click_outside(Duration::from_secs(6), false, false));
+    }
+
+    #[test]
+    fn second_click_away_after_cancel_records_again() {
+        let mut poll = click_poll_after_show();
+        assert!(!poll.click_outside(Duration::from_secs(2), true, false));
+        assert!(!poll.click_outside(Duration::from_secs(3), true, true));
+        // Another click-away: records again, fires at the floor.
+        assert!(!poll.click_outside(Duration::from_secs(4), true, false));
+        assert!(poll.click_outside(Duration::from_secs(5), false, false));
     }
 
     #[test]

@@ -345,6 +345,38 @@ pub fn restore_and_foreground() {
     let _ = unsafe { SetForegroundWindow(hwnd) };
 }
 
+/// R3-UI-05 (Windows): the UI window's native handle, found by
+/// title (same lookup as `restore_and_foreground`) — the frame
+/// timer compares the foreground window against it. `None` when
+/// the window does not exist yet (Slint creates it after
+/// `show()`); the caller retries and fails open.
+#[cfg(windows)]
+#[must_use]
+pub fn ui_window_hwnd() -> Option<isize> {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    let hwnd = unsafe { FindWindowW(None, &HSTRING::from(UI_WINDOW_TITLE)) }.unwrap_or_default();
+    if hwnd.0.is_null() {
+        None
+    } else {
+        Some(hwnd.0 as isize)
+    }
+}
+
+/// R3-UI-05 (Windows): whether the given native window is the
+/// current foreground window. A minimized window is never
+/// foreground, so this one check covers both unfocused and
+/// minimized.
+#[cfg(windows)]
+#[must_use]
+pub fn window_is_foreground(hwnd: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    let foreground = unsafe { GetForegroundWindow() };
+    !foreground.is_invalid() && foreground.0 as isize == hwnd
+}
+
 /// Whether `pid` is a live `rsh-ui` process (Linux pid-file check,
 /// mirroring the daemon's `pid_is_live_rsh_daemon`): `/proc/<pid>`
 /// merely existing is not enough (recycled pids, zombies), and an

@@ -1,0 +1,32 @@
+// Probe windows for the games-grid gap (R3-UI-06): host the REAL
+// OverviewPage at the 736px design width and at 1016px, with 4
+// static games (two rows of two tiles), so the gate can measure
+// the tile gap headless. The games are static here — the gap is a
+// layout property, not data — and the page is live + connected so
+// no banner shifts the layout.
+import { OverviewPage } from "../../../crates/rsh-ui/ui/screens/overview.slint";
+
+component GateOverviewPage inherits OverviewPage {
+    daemon-live: true;
+    connected: true;
+    games: [
+        { id: "ac", code: "AC", name: "Assetto Corsa", sub: "GT3 Sprint", sub_warn: false, action: "Launch", action_primary: true },
+        { id: "acc", code: "ACC", name: "AC Competizione", sub: "GT3 Sprint", sub_warn: false, action: "Launch", action_primary: true },
+        { id: "iracing", code: "iR", name: "iRacing", sub: "GT3 Sprint", sub_warn: false, action: "Launch", action_primary: true },
+        { id: "dirt", code: "DR", name: "Dirt Rally 2.0", sub: "GT3 Sprint", sub_warn: false, action: "Launch", action_primary: true },
+    ];
+}
+
+export component GateOverviewWindow736 inherits Window {
+    width: 736px;
+    height: 700px;
+    title: "gate-overview-736";
+    page := GateOverviewPage { width: 100%; height: 100%; }
+}
+
+export component GateOverviewWindow1016 inherits Window {
+    width: 1016px;
+    height: 700px;
+    title: "gate-overview-1016";
+    page := GateOverviewPage { width: 100%; height: 100%; }
+}

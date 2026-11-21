@@ -1674,6 +1674,20 @@ struct Ctx {
     /// after 30 s.
     wifi_rejoining: Rc<Cell<bool>>,
     wifi_rejoin_since: Rc<Cell<Option<Instant>>>,
+    /// Last `password_set` value `sync_wifi_password_state` saw
+    /// (R3-UI-02): the success message is cleared when the state
+    /// moves on — otherwise it persists across Settings visits
+    /// after the state it describes has changed. `None` = never
+    /// synced yet.
+    wifi_password_set_known: Rc<Cell<Option<bool>>>,
+    /// The `password_set` value the currently displayed
+    /// `wifi-password-message` describes (R3-UI-02): the message
+    /// is kept across a re-sync that lands on the state it already
+    /// describes (e.g. the daemon's status flips to `true` on the
+    /// 1 Hz tick just after a successful set), and cleared only
+    /// when the state moves somewhere the message does not
+    /// describe. `None` = no message shown.
+    wifi_password_message_for: Rc<Cell<Option<bool>>>,
     /// D17: the destructive action the confirm dialog is waiting
     /// on (delete profile / remove game) — `None` = no confirm
     /// open. Set by `open_confirm`, taken by the Yes handler.
@@ -3462,6 +3476,17 @@ impl Ctx {
                 let backend = self.api().output_backend();
                 win.set_controller(i32::from(backend != "HIDMaestro"));
             }
+            if kind == JobKind::SettingsOp {
+                // R3-UI-02: the timed-out job's apply is dropped
+                // (see the `retain` above), so its busy-clear never
+                // runs — clear the Wi-Fi password button here, or
+                // it would stay "Setting…" forever. Only one
+                // SettingsOp runs at a time, and the busy prop is
+                // true only while a Wi-Fi password job is in
+                // flight — so for any other SettingsOp timeout
+                // this is a no-op clear of an already-false prop.
+                win.set_wifi_password_busy(false);
+            }
             // R2-18: a timed-out tuning push reverts its slider to
             // the stored value — the UI must not keep showing a
             // value the daemon never received. A push superseded by
@@ -3841,6 +3866,14 @@ impl Ctx {
             return;
         }
         win.set_wifi_password_error("".into());
+        // R3-UI-02: the per-button "Setting…" state was never set
+        // — drive it here, and clear it in the apply closure (both
+        // arms) and on timeout (see `check_job_timeouts`, where the
+        // apply is dropped). The old success message is stale the
+        // moment a new attempt starts.
+        win.set_wifi_password_busy(true);
+        win.set_wifi_password_message("".into());
+        self.wifi_password_message_for.set(None);
         let password = new.clone();
         self.run_generic_job(
             win,
@@ -3853,6 +3886,9 @@ impl Ctx {
                 )
             },
             move |ctx, win, result| {
+                // R3-UI-02: the button un-busy on every outcome —
+                // including a non-Text result, which returns below.
+                win.set_wifi_password_busy(false);
                 let JobResult::Text(result) = result else {
                     return;
                 };
@@ -3864,6 +3900,11 @@ impl Ctx {
                         win.set_wifi_password_message(
                             "Wi-Fi password set — the wheel's hotspot now needs it.".into(),
                         );
+                        // R3-UI-02: this message describes the
+                        // post-set state (`password_set` = true),
+                        // so the 1 Hz re-sync keeps it until the
+                        // state moves on.
+                        ctx.wifi_password_message_for.set(Some(true));
                         // DS-67: the AP restarts to WPA2 — the link
                         // drops on purpose; say "Rejoining…" until
                         // the session is Active again (or 30 s).
@@ -3890,12 +3931,20 @@ impl Ctx {
     /// PC-side stores; the board side needs the BOOT 10 s hold,
     /// which the success toast says.
     fn start_forget_wifi_password_job(&self, win: &MainWindow) {
+        // R3-UI-02: same per-button busy state as the set job (see
+        // above) — the old success message is stale the moment a
+        // new attempt starts.
+        win.set_wifi_password_busy(true);
+        win.set_wifi_password_message("".into());
+        self.wifi_password_message_for.set(None);
         self.run_generic_job(
             win,
             JobKind::SettingsOp,
             "Forgetting Wi-Fi password…",
             move |api| JobResult::Text(api.clear_wifi_password().map(|_| String::new())),
             move |ctx, win, result| {
+                // R3-UI-02: the button un-busy on every outcome.
+                win.set_wifi_password_busy(false);
                 let JobResult::Text(result) = result else {
                     return;
                 };
@@ -3905,6 +3954,10 @@ impl Ctx {
                             "Wi-Fi password forgotten — the wheel's hotspot is open again. Hold BOOT 10 s on the wheel to clear its side too."
                                 .into(),
                         );
+                        // R3-UI-02: this message describes the
+                        // post-forget state (`password_set` =
+                        // false) — see the set job above.
+                        ctx.wifi_password_message_for.set(Some(false));
                         ctx.sync_wifi_password_state(win);
                         ctx.notify_success(
                             win,
@@ -3997,6 +4050,23 @@ impl Ctx {
     fn sync_wifi_password_state(&self, win: &MainWindow) {
         let status = self.api().wifi_status();
         win.set_wifi_password_set(status.password_set);
+        // R3-UI-02: the success message describes the state at the
+        // time it was set — when the state moves on, the message is
+        // stale, so clear it. The message is kept when it already
+        // describes the state the sync just landed on (e.g. the
+        // daemon's status flips to `true` on the 1 Hz tick just
+        // after a successful set — clearing there would erase the
+        // message within a second of the action that wrote it).
+        // `wifi_password_set_known` tracks the last synced state;
+        // `wifi_password_message_for` tracks which state the
+        // displayed message describes (`None` = no message).
+        if self.wifi_password_set_known.get() != Some(status.password_set) {
+            self.wifi_password_set_known.set(Some(status.password_set));
+            if self.wifi_password_message_for.get() != Some(status.password_set) {
+                win.set_wifi_password_message("".into());
+                self.wifi_password_message_for.set(None);
+            }
+        }
         if let Some(ssid) = status.ssid {
             win.set_setup_wifi_ssid(ssid.into());
         }
@@ -9473,6 +9543,15 @@ fn drain_ui_lifecycle(win: &MainWindow, ctx: &Ctx) {
     }
 }
 
+/// R3-UI-05: whether this frame-timer tick runs a full `refresh`
+/// — live + foreground runs every tick (20 Hz); live-but-
+/// unfocused/minimized and not-live run every 2nd tick (10 Hz).
+/// Pure so the truth table is unit-testable (the Win32 foreground
+/// query itself only exists on Windows).
+fn should_refresh(is_live: bool, foreground: bool, tick: u64) -> bool {
+    (is_live && foreground) || tick.is_multiple_of(2)
+}
+
 /// Start the 20 Hz frame timer: drain health verdicts, drain live
 /// events only while a live API is attached, refresh the frame, and
 /// honour `--quit-after`. The data source comes from the shared
@@ -9494,6 +9573,14 @@ fn start_frame_timer(
     let win = win.as_weak();
     let ctx = ctx.clone();
     let tick = Rc::new(Cell::new(0_u64));
+    // R3-UI-05: the UI window's native handle for the per-tick
+    // foreground query (Windows only) — resolved lazily inside
+    // the tick and cached once found, so a window that does not
+    // exist yet on the first tick is retried, not assumed. The
+    // query fails OPEN: an unknown window counts as foreground,
+    // so the live path never throttles on a lookup failure.
+    #[cfg(windows)]
+    let ui_hwnd: Rc<Cell<Option<isize>>> = Rc::new(Cell::new(None));
     let timer = Timer::default();
     timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
         let t = tick.get();
@@ -9569,10 +9656,30 @@ fn start_frame_timer(
             // Perf (F-4): not live = no new data can arrive, and the
             // frame-rest comparison would skip the frame anyway —
             // run `refresh` at 10 Hz (every 2nd tick) instead of
-            // paying the timer + compare every 50 ms. (Focus-based
-            // throttling is not possible here: Slint 1.18 exposes
-            // no window-focus query on `Window`.)
-            if ctx.is_live() || t.is_multiple_of(2) {
+            // paying the timer + compare every 50 ms.
+            // R3-UI-05: focus-based throttling via a Win32
+            // foreground query (Slint 1.18 exposes no window-focus
+            // query on `Window`): a live-but-unfocused/minimized
+            // window drops to the same 10 Hz as not-live. The
+            // query fails open — an unresolvable window counts as
+            // foreground, so the live path never throttles on a
+            // lookup failure. (Non-Windows has no query: always
+            // foreground, behaviour unchanged.)
+            #[cfg(windows)]
+            let foreground = {
+                let hwnd = match ui_hwnd.get() {
+                    Some(hwnd) => Some(hwnd),
+                    None => {
+                        let hwnd = ui_lifecycle::ui_window_hwnd();
+                        ui_hwnd.set(hwnd);
+                        hwnd
+                    }
+                };
+                hwnd.map_or(true, ui_lifecycle::window_is_foreground)
+            };
+            #[cfg(not(windows))]
+            let foreground = true;
+            if should_refresh(ctx.is_live(), foreground, t) {
                 // R2-46: arm the paint timer — the `AfterRendering`
                 // notifier (registered in `main`) takes this start and
                 // records refresh-to-paint. A tick that paints nothing
@@ -9676,6 +9783,21 @@ fn start_frame_timer(
     std::mem::forget(timer);
 }
 
+/// Install a panic hook that flushes the buffered UI log
+/// (R3-UI-04): without it a crash strands the last ≤64 buffered
+/// lines — exactly the lines a crash diagnosis needs. The
+/// default hook still runs first (panic message + location to
+/// stderr), then the flush runs best-effort (`flush_ui_file_log`
+/// never panics and no-ops when logging is off or the lock is
+/// poisoned, e.g. a panic inside the logger itself).
+fn install_ui_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        crate::ui_log::flush_ui_file_log();
+    }));
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<(), slint::PlatformError> {
     let t0 = Instant::now();
@@ -9687,6 +9809,10 @@ fn main() -> Result<(), slint::PlatformError> {
     // `<data_dir>/logs/rsh-ui-YYYYMMDD.log` — init before the
     // window is created so startup lines are recorded too.
     crate::ui_log::init_ui_file_log(data_dir.as_deref());
+    // R3-UI-04: a crash must flush the buffered log (see
+    // `install_ui_panic_hook`) — installed before anything else
+    // that could panic.
+    install_ui_panic_hook();
 
     // M-5/A1 (Tray-team hook): single instance, decided BEFORE the
     // window is created. A second instance (daemon tray action
@@ -9788,6 +9914,8 @@ fn main() -> Result<(), slint::PlatformError> {
         theme_choice: Rc::new(Cell::new(read_theme(data_dir.as_ref()))),
         wifi_rejoining: Rc::new(Cell::new(false)),
         wifi_rejoin_since: Rc::new(Cell::new(None)),
+        wifi_password_set_known: Rc::new(Cell::new(None)),
+        wifi_password_message_for: Rc::new(Cell::new(None)),
         confirm_pending: Rc::new(RefCell::new(None)),
         vjoy_install_started: Rc::new(Cell::new(None)),
         unreachable_notified: Rc::new(Cell::new(false)),
@@ -9889,6 +10017,12 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             }
         }) {
+            // R3-UI-03: the renderer gives no notifier — log the
+            // absence to the UI log file, not just stderr (stderr
+            // is invisible in the windowed release build, so
+            // without this the log carries neither startup-timing
+            // line and the missing first paint looks like a gap).
+            ui_log!("RSH-UI first paint timing unavailable: {e}");
             eprintln!("RSH-UI paint timing unavailable: {e}");
         }
     }
@@ -9990,6 +10124,10 @@ fn main() -> Result<(), slint::PlatformError> {
     // does not exist yet — `reconnect_to_live` seeds the wizard
     // when the daemon answers. The "not running"
     // notification comes from the monitor's first verdict instead.
+    // R3-UI-03: same class as the first-paint fallback above —
+    // the "window shown" line is startup evidence too, so it goes
+    // to the UI log file as well as stderr.
+    ui_log!("RSH-UI window shown in {} ms", t0.elapsed().as_millis());
     eprintln!("RSH-UI window shown in {} ms", t0.elapsed().as_millis());
 
     wire_callbacks(&win, &ctx);
@@ -10727,6 +10865,8 @@ mod tests {
             theme_choice: Rc::new(Cell::new(0)),
             wifi_rejoining: Rc::new(Cell::new(false)),
             wifi_rejoin_since: Rc::new(Cell::new(None)),
+            wifi_password_set_known: Rc::new(Cell::new(None)),
+            wifi_password_message_for: Rc::new(Cell::new(None)),
             confirm_pending: Rc::new(RefCell::new(None)),
             vjoy_install_started: Rc::new(Cell::new(None)),
             unreachable_notified: Rc::new(Cell::new(false)),
@@ -11966,6 +12106,171 @@ mod tests {
         assert!(
             Ctx::wifi_password_error("a".repeat(63).as_str(), "a".repeat(63).as_str()).is_none()
         );
+    }
+
+    // R3-UI-04: a panic must flush the buffered UI log — the
+    // crash context survives instead of stranding the last ≤64
+    // lines. The hook is installed here (process-global, chained
+    // onto the test harness's hook); the panic is caught, so the
+    // test process survives, and the file is read with NO explicit
+    // flush — the hook must have done it.
+    #[test]
+    fn r3_ui04_panic_hook_flushes_buffered_log_lines() {
+        install_ui_panic_hook();
+        let dir = std::env::temp_dir().join(format!("rsh-ui-panic-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::ui_log::init_ui_file_log(Some(&dir));
+        crate::ui_log::ui_file_log("line before the panic");
+        let _ = std::panic::catch_unwind(|| panic!("R3-UI-04 test panic"));
+        let logs = std::fs::read_dir(dir.join("logs")).expect("logs dir exists");
+        let names: Vec<String> = logs
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1, "one daily file: {names:?}");
+        let text = std::fs::read_to_string(dir.join("logs").join(&names[0])).expect("read log");
+        assert!(
+            text.contains("line before the panic"),
+            "buffered line must reach the file via the panic hook: {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // Point the log nowhere again so later tests do not write
+        // into this test's (removed) dir.
+        crate::ui_log::init_ui_file_log(None);
+    }
+
+    // R3-UI-02: the success message is cleared when the Wi-Fi
+    // state moves on, and kept while it still describes the
+    // current state. The sim reports `password_set = false`, so a
+    // message recorded for `true` (a previous set) is stale and
+    // must clear on re-sync, while one recorded for `false`
+    // survives the same sync.
+    #[test]
+    fn r3_ui02_wifi_password_message_cleared_when_state_moves_on() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("R3-UI-02 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        // A message from a previous set (`password_set` = true)
+        // is stale against the sim's `false` — the sync clears it.
+        win.set_wifi_password_message(
+            "Wi-Fi password set — the wheel's hotspot now needs it.".into(),
+        );
+        ctx.wifi_password_message_for.set(Some(true));
+        ctx.sync_wifi_password_state(&win);
+        assert_eq!(
+            win.get_wifi_password_message().as_str(),
+            "",
+            "stale success message must clear when the state moves on"
+        );
+        assert_eq!(ctx.wifi_password_message_for.get(), None);
+        // The same message recorded for the current state
+        // (`false`) survives the re-sync.
+        win.set_wifi_password_message(
+            "Wi-Fi password forgotten — the wheel's hotspot is open again.".into(),
+        );
+        ctx.wifi_password_message_for.set(Some(false));
+        ctx.sync_wifi_password_state(&win);
+        assert!(
+            win.get_wifi_password_message()
+                .starts_with("Wi-Fi password forgotten"),
+            "message describing the current state must survive re-sync"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // R3-UI-02: the Set button shows "Setting…" while the job
+    // runs and un-busies when the job resolves. The sim rejects
+    // the set ("needs daemon"), so the error arm is what clears
+    // it here — the success arm is the same single clear line.
+    #[test]
+    fn r3_ui02_wifi_password_busy_set_on_start_and_cleared_on_apply() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("R3-UI-02 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        win.set_wifi_password_new("abcdefgh".into());
+        win.set_wifi_password_confirm("abcdefgh".into());
+        assert!(!win.get_wifi_password_busy(), "busy starts false");
+        ctx.start_set_wifi_password_job(&win);
+        assert!(
+            win.get_wifi_password_busy(),
+            "busy must be true while the set job runs"
+        );
+        // The job thread fails fast against the sim — drain until
+        // the apply clears the flag (bounded wait, never infinite).
+        for _ in 0..100 {
+            ctx.drain_jobs(&win);
+            if !win.get_wifi_password_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !win.get_wifi_password_busy(),
+            "busy must clear when the job resolves"
+        );
+        assert!(
+            !win.get_wifi_password_error().is_empty(),
+            "sim set failure must surface as an inline error"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // R3-UI-05: live + foreground refreshes every tick (20 Hz);
+    // live-but-unfocused/minimized drops to every 2nd tick
+    // (10 Hz, the not-live rate); not-live stays every 2nd tick
+    // whatever the focus. The Win32 query itself is
+    // Windows-only and fails open (unknown window = foreground),
+    // so this table is the whole throttle contract.
+    #[test]
+    fn r3_ui05_should_refresh_throttles_live_unfocused_to_10hz() {
+        // Live + foreground: every tick.
+        assert!(should_refresh(true, true, 0));
+        assert!(should_refresh(true, true, 1));
+        // Live + unfocused/minimized: every 2nd tick.
+        assert!(should_refresh(true, false, 0));
+        assert!(!should_refresh(true, false, 1));
+        assert!(should_refresh(true, false, 2));
+        // Not live: every 2nd tick regardless of focus.
+        assert!(should_refresh(false, true, 0));
+        assert!(!should_refresh(false, true, 1));
+        assert!(should_refresh(false, false, 0));
+        assert!(!should_refresh(false, false, 1));
+    }
+
+    // R3-UI-02: a timed-out SettingsOp drops its apply, so the
+    // busy-clear in the apply never runs — `check_job_timeouts`
+    // must clear the button itself, or it would stay "Setting…"
+    // forever. A stale (11 s old) busy entry stands in for the
+    // timed-out job; the 10 s SettingsOp bound makes it due.
+    #[test]
+    fn r3_ui02_wifi_password_busy_cleared_on_timeout() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("R3-UI-02 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(11))
+            .expect("11 s ago exists");
+        ctx.busy_jobs.borrow_mut().insert(
+            JobKind::SettingsOp,
+            ("Saving Wi-Fi password…".to_string(), started),
+        );
+        win.set_wifi_password_busy(true);
+        ctx.check_job_timeouts(&win);
+        assert!(
+            !win.get_wifi_password_busy(),
+            "busy must clear when the SettingsOp job times out"
+        );
+        assert!(
+            !ctx.busy_jobs.borrow().contains_key(&JobKind::SettingsOp),
+            "timed-out entry must be gone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // D17: destructive actions confirm first — opening the confirm
