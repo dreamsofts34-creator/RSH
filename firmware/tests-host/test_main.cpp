@@ -30,7 +30,7 @@
 #include "as5600.h"          // Phase G WS4: AS5600 magnetic encoder (D34)
 #include "ads1115.h"         // Round 3 WS-3 FW-01: ADS1115 I2C ADC
 #include "i2c_axes.h"        // Round 3 WS-3 FW-01: I2C axes sampler
-#include "version.h"         // F-12 (v4.0.3): single version source
+#include "version.h"         // F-12 (v4.0.4): single version source
 #include "diag_log.h"        // F-10: diagnostics ring log + GET_DIAG body
 #include "webota_auth.h"     // F-08: WebOTA per-IP auth lockout
 #include "horn_test.h"       // D-5: HORN_TEST synthetic pulse
@@ -166,7 +166,7 @@ static uint32_t rng() { rng_state = rng_state * 1664525u + 1013904223u; return r
 
 // FW-8 dispatcher test handler (ctrl.h, §19): GET_CAPS -> golden minimal
 // body (17 B, pinCount 0 — protocol_v2_vectors.py ctrl_get_caps_reply
-// payload se, fw 4.0.3 / proto 2.2); GET_CFG -> 200 B body
+// payload se, fw 4.0.4 / proto 2.2); GET_CFG -> 200 B body
 // (cache-overflow path); REBOOT -> reboot flag; baqi -> UNSUPPORTED
 // (execute nahi hota).
 struct test_ctrl_ctx_t {
@@ -737,8 +737,8 @@ int main() {
       0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       0x00, 0x87, 0x9d};
     const uint8_t ctrl_reply[29] = {0x52, 0x53, 0x48, 0x43, 0x81, 0x01, 0x00, 0x12,
-      0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x03, 0x02,
-      0x02, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0x6d, 0xc5};
+      0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x04, 0x02,
+      0x02, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0xc6, 0x74};
     rsh_v2_ctrl_t cf;
     CHECK(rsh_v2_ctrl_parse_structure(ctrl_caps, sizeof(ctrl_caps), &cf) == RSH_V2_OK);
     CHECK(cf.cmd == 0x01 && cf.req_id == 1 && cf.len == 0);
@@ -750,7 +750,7 @@ int main() {
     CHECK(rsh_v2_ctrl_parse_structure(ctrl_reply, sizeof(ctrl_reply), &cf) == RSH_V2_OK);
     CHECK(cf.cmd == 0x81 && cf.payload[0] == RSH_CTRL_OK && cf.len == 18);
     CHECK(cf.payload[13] == 64);  // nBtnMax (wire)
-    CHECK(cf.payload[9] == 3);    // fw patch 4.0.3
+    CHECK(cf.payload[9] == 4);    // fw patch 4.0.4
     CHECK(cf.payload[10] == 2 && cf.payload[11] == 2);  // proto 2.2
     // build roundtrip golden se match kare
     {
@@ -996,8 +996,8 @@ int main() {
     // RSH_CAPS_FW_* hi net.cpp HELLO reply ka bhi source hai (single source
     // of truth) — 4.0.0 hard-code dobara na aaye, is liye constants + string
     // dono yahan bandhe hain.
-    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 3);
-    CHECK(strcmp(FIRMWARE_VERSION, "4.0.3") == 0);
+    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 4);
+    CHECK(strcmp(FIRMWARE_VERSION, "4.0.4") == 0);
 
     // --- FW-11: default pin table mein naye modules ki rows ---
     RshCapsEntry table[20];
@@ -1038,7 +1038,7 @@ int main() {
       CHECK(blen == 18 + 8u * ntab);
       CHECK(body[0] == RSH_CTRL_OK);
       CHECK(memcmp(body + 1, mac, 6) == 0);
-      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 3);   // fw 4.0.3 (Round 2 W3 FIX-1)
+      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 4);   // fw 4.0.4 (Round 2 W3 FIX-1)
       CHECK(body[10] == 2 && body[11] == 2);                 // proto 2.2
       CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
       CHECK(body[15] == 6 && body[16] == 0 && body[17] == ntab);
@@ -2231,7 +2231,7 @@ int main() {
     CHECK(rsh_caps_build_body(body, 100, mac, 6, 0, table, 15) == 0);
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 41) == 0);
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 15) == 138);
-    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 3);  // fw 4.0.3 (Round 2 W3 FIX-1)
+    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 4);  // fw 4.0.4 (Round 2 W3 FIX-1)
     CHECK(body[10] == 2 && body[11] == 2);  // proto 2.2
     CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
     CHECK(body[15] == 6 && body[17] == 15);
@@ -4551,7 +4551,7 @@ int main() {
     CHECK(dec.frames_ok == 1);
   }
 
-  // ============ §34: firmware v4.0.3 (F-01..F-16, v2.2) ============
+  // ============ §34: firmware v4.0.4 (F-01..F-16, v2.2) ============
   // Net.cpp / rsh.ino wiring (AP open/password, serial HELO, horn OR)
   // host par nahi chalti — wo pio build + real-board HIL se cover hoti
   // hai (gate doc). Yahan pure logic hai. Pairing khatam (D1/D7):
@@ -4974,8 +4974,8 @@ int main() {
 
     // --- F-12: version single source (version.h + modules.h + config.h) ---
     CHECK(RSH_FW_VERSION_MAJOR == 4 && RSH_FW_VERSION_MINOR == 0 &&
-          RSH_FW_VERSION_PATCH == 3);
-    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.3") == 0);
+          RSH_FW_VERSION_PATCH == 4);
+    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.4") == 0);
     CHECK(strcmp(FIRMWARE_VERSION, RSH_FW_VERSION_STRING) == 0);
     CHECK(RSH_CAPS_FW_MAJOR == RSH_FW_VERSION_MAJOR &&
           RSH_CAPS_FW_MINOR == RSH_FW_VERSION_MINOR &&

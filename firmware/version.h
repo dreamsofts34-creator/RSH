@@ -1,5 +1,5 @@
 #pragma once
-// RSH firmware version — SINGLE SOURCE OF TRUTH (F-12, v4.0.3).
+// RSH firmware version — SINGLE SOURCE OF TRUTH (F-12, v4.0.4).
 //
 // Pehle version do jagah tha (config.h: FIRMWARE_VERSION "4.0.1" aur
 // modules.h: RSH_CAPS_FW_* 4/0/1) aur dono ka milna sirf comment + host
@@ -12,7 +12,7 @@
 
 #define RSH_FW_VERSION_MAJOR 4
 #define RSH_FW_VERSION_MINOR 0
-#define RSH_FW_VERSION_PATCH 3
+#define RSH_FW_VERSION_PATCH 4
 
 // Stringize helpers (do-step, taake macro pehle expand ho).
 #define RSH_FW_STR_(x) #x

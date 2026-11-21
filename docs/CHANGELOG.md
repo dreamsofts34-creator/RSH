@@ -1,12 +1,22 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.6 · firmware v4.0.3 · protocol v2.2 (frozen)**.
+**app v2.0.7 · firmware v4.0.4 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
 
-## [Unreleased] — Round 3 deep scan (in progress, not released)
+## [2.0.7] — 2026-11-22
+
+**Expander guard (Round 3, post-consolidation).** MCP23017/PCF8574
+expander-button sampling is not implemented, and the validator used
+to accept expander records — a user configuring expander buttons got
+COMMIT OK and then silently dead buttons. Both sides now reject
+expander records at COMMIT with a clear error: the firmware
+validator (`UNSUPPORTED`, err 3) and the app (`validate_blob`, plain
+message) before anything reaches the board. Axes (ADS1115/AS5600
+sampling, FW-01) are unaffected. A board with a legacy expander blob
+boots on factory defaults, never bricks; factory reset clears it.
 
 **Anti-kill / anti-crash (WS-6, R3-AK-01–04).** Desktop Windows does
 not kill Win32 apps for resource pressure — the real gaps were
