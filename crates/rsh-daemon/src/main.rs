@@ -885,13 +885,79 @@ async fn serve_ipc(
     }
 }
 
-/// SDDL for a current-user-only IPC pipe (R3-D-07): the DACL
-/// grants generic-all to the creator owner and nothing to anyone
-/// else. `CO` is resolved to the creating user's SID when the
-/// descriptor is applied to the pipe, so the UI (same user)
-/// connects and no other local user can drive the daemon IPC.
+/// The current user's SID as an SDDL string (`S-1-5-21-...`),
+/// read from the process token (`TokenUser`), or `None` when it
+/// cannot be read. The caller falls back to the default pipe
+/// security descriptor on `None`, so a token that cannot be
+/// queried never bricks IPC.
 #[cfg(windows)]
-const IPC_PIPE_USER_ONLY_SDDL: &str = "D:(A;;GA;;;CO)";
+fn current_user_sid_string() -> Option<String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::PWSTR;
+    // SAFETY: process-token query; every handle and allocation is
+    // freed on every path below, and the SID string is copied out
+    // before its buffer is freed.
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token).is_err() {
+            return None;
+        }
+        let sid = (|| {
+            let mut len = 0u32;
+            // Size query: expected to fail with
+            // `ERROR_INSUFFICIENT_BUFFER` and fill `len`.
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &raw mut len);
+            if len == 0 {
+                return None;
+            }
+            // `u64` buffer, not `u8`: the `TOKEN_USER` read below
+            // needs 8-byte alignment, and a byte buffer would
+            // trip `clippy::cast_ptr_alignment`.
+            let mut buf = vec![0u64; len.div_ceil(8) as usize];
+            if GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buf.as_mut_ptr().cast::<std::ffi::c_void>()),
+                len,
+                &raw mut len,
+            )
+            .is_err()
+            {
+                return None;
+            }
+            let user = &*(buf.as_ptr().cast::<TOKEN_USER>());
+            let mut sid_string = PWSTR::null();
+            if ConvertSidToStringSidW(user.User.Sid, &raw mut sid_string).is_err() {
+                return None;
+            }
+            // SID strings are ASCII (`S-1-5-21-...`); copy out
+            // before freeing the buffer.
+            let text = sid_string.to_string().ok();
+            let _ = LocalFree(Some(HLOCAL(sid_string.0.cast::<std::ffi::c_void>())));
+            text
+        })();
+        let _ = CloseHandle(token);
+        sid
+    }
+}
+
+// SDDL for a current-user-only IPC pipe (R3-D-07): the DACL
+// grants generic-all to the current user's SID and nothing to
+// anyone else, and the owner is set to the same SID.
+//
+// `CO` (creator owner) does NOT work here: a pipe created with
+// an explicit descriptor via `CreateNamedPipe` keeps the literal
+// creator-owner SID in its DACL, and the pipe's owner is not
+// reliably the user — on some machines (notably the CI runner)
+// it is the Administrators group SID, so the same-user client is
+// denied (CI run 44947397802: the pipe-loop client's `Connect`
+// threw "Access to the path is denied" 0.25 s after "IPC
+// listening"). PuTTY hit the same quirk and fixed it by setting
+// the owner explicitly and granting the user SID explicitly,
+// which is what this does.
 
 /// Create one IPC pipe listener with the current-user-only DACL
 /// (R3-D-07).
@@ -910,10 +976,16 @@ fn try_create_pipe_with_dacl(
     use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows::core::PCWSTR;
-    let sddl: Vec<u16> = IPC_PIPE_USER_ONLY_SDDL
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    // The SDDL names the current user's SID explicitly, both as
+    // the owner and as the only DACL grantee (see the note above
+    // `current_user_sid_string` — `CO` denies the same-user
+    // client). No SID, no DACL pipe: the caller falls back to the
+    // default descriptor instead.
+    let Some(sid) = current_user_sid_string() else {
+        return Ok(None);
+    };
+    let sddl_text = format!("O:{sid}D:(A;;GA;;;{sid})");
+    let sddl: Vec<u16> = sddl_text.encode_utf16().chain(std::iter::once(0)).collect();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     // SAFETY: the SDDL buffer is valid for the call; the descriptor
     // pointer is written by the API and freed below with LocalFree.
@@ -1131,10 +1203,19 @@ async fn serve_ipc(
         // NOT fatal — the loop-top create retries it with the full
         // backoff/fatal policy, and the accepted client is served
         // regardless.
-        listener = match ServerOptions::new()
-            .first_pipe_instance(false)
-            .create(rsh_ipc::IPC_PIPE_NAME)
-        {
+        // R3-D-07: the pre-created next listener gets the same
+        // current-user DACL as the first — a plain create here
+        // would leave instance #2+ world-accessible. Best
+        // effort, like before: a failure is logged and the
+        // loop-top create retries it.
+        let next_pipe = match try_create_pipe_with_dacl(false) {
+            Ok(Some(next)) => Ok(next),
+            Ok(None) => ServerOptions::new()
+                .first_pipe_instance(false)
+                .create(rsh_ipc::IPC_PIPE_NAME),
+            Err(error) => Err(error),
+        };
+        listener = match next_pipe {
             Ok(next) => {
                 tracker.record_success();
                 Some(next)

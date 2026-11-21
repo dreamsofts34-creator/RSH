@@ -1010,7 +1010,7 @@ mod tests {
     /// helo), so the rebind must wait for BOTH to stop — waiting
     /// for the reader alone flakes under load, when the helo
     /// thread (1 s interval) is still exiting and holding the
-    /// port (AddrInUse on the rebind).
+    /// port (`AddrInUse` on the rebind).
     #[test]
     fn shutdown_stops_the_reader_thread_and_releases_the_port() {
         let config = UdpConfig {

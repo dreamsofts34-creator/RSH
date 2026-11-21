@@ -268,14 +268,27 @@ type FakeStream = tokio::net::windows::named_pipe::NamedPipeServer;
 struct FakeListener {
     #[cfg(unix)]
     inner: tokio::net::UnixListener,
+    /// Windows: the first pipe instance, created by `bind` and
+    /// taken by the first `accept` (see `bind`). The lock is held
+    /// only for the take, never across an `.await`.
+    #[cfg(windows)]
+    first: std::sync::Mutex<Option<tokio::net::windows::named_pipe::NamedPipeServer>>,
 }
 
 impl FakeListener {
     /// Bind the fake peer. Unix: bind the socket at `path`.
-    /// Windows: probe-create one pipe instance at the fixed
-    /// `IPC_PIPE_NAME` so a taken name (a real daemon running)
-    /// fails fast here instead of at the first accept; the probe
-    /// instance is dropped immediately.
+    /// Windows: create one pipe instance at the fixed
+    /// `IPC_PIPE_NAME` and HOLD it — the first `accept` waits
+    /// for the client on this instance. The earlier shape
+    /// probe-created the instance and dropped it immediately,
+    /// which raced with `IpcClient::connect` (a single
+    /// non-retrying open): between the drop and the spawned
+    /// accept task creating its instance no pipe existed, so the
+    /// client failed with os error 2 (CI run 44947397802).
+    /// Holding the instance mirrors the Unix branch, where
+    /// `bind` leaves a listening socket behind; a real daemon
+    /// holding the name still fails fast here via
+    /// `first_pipe_instance(true)`.
     fn bind(path: &Path) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
@@ -287,32 +300,43 @@ impl FakeListener {
         {
             use tokio::net::windows::named_pipe::ServerOptions;
             let _ = path;
-            let _probe = ServerOptions::new()
+            let pipe = ServerOptions::new()
                 .first_pipe_instance(true)
                 .create(rsh_ipc::IPC_PIPE_NAME)?;
-            Ok(Self {})
+            Ok(Self {
+                first: std::sync::Mutex::new(Some(pipe)),
+            })
         }
     }
 
     /// Accept one connection. Unix: accept on the socket.
-    /// Windows: create a fresh pipe instance (same pattern as the
-    /// daemon's `serve_ipc` loop) and wait for the client to
-    /// connect.
+    /// Windows: the first accept waits for the client on the
+    /// instance `bind` created; later accepts create a fresh
+    /// instance with `first_pipe_instance(false)` (the first is
+    /// already connected by then, so a `true` create would fail
+    /// — the same rule as the daemon's `serve_ipc` pre-create).
+    #[cfg(unix)]
     async fn accept(&self) -> std::io::Result<FakeStream> {
-        #[cfg(unix)]
+        let (stream, _) = self.inner.accept().await?;
+        Ok(stream)
+    }
+
+    #[cfg(windows)]
+    async fn accept(&self) -> std::io::Result<FakeStream> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let pipe = match self
+            .first
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
         {
-            let (stream, _) = self.inner.accept().await?;
-            Ok(stream)
-        }
-        #[cfg(windows)]
-        {
-            use tokio::net::windows::named_pipe::ServerOptions;
-            let pipe = ServerOptions::new()
-                .first_pipe_instance(true)
-                .create(rsh_ipc::IPC_PIPE_NAME)?;
-            pipe.connect().await?;
-            Ok(pipe)
-        }
+            Some(pipe) => pipe,
+            None => ServerOptions::new()
+                .first_pipe_instance(false)
+                .create(rsh_ipc::IPC_PIPE_NAME)?,
+        };
+        pipe.connect().await?;
+        Ok(pipe)
     }
 }
 

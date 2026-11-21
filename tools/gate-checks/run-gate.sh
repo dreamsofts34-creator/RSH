@@ -198,11 +198,15 @@ windows_check() {
     # run on Linux: it pulls criterion (rsh-benchmarks dev-dep) ->
     # alloca, whose build script needs MSVC `lib.exe` (proven:
     # --all-targets exits 101 on `alloca v0.4.0`, while the plain
-    # check passes). So the test-target check is scoped to the four
-    # ship crates — the same set CI's clippy-windows -p run covers —
-    # and the full workspace --all-targets runs in the CI
-    # windows-check job on a real Windows runner, where MSVC exists.
-    cargo check -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc --all-targets --target x86_64-pc-windows-msvc
+    # check passes). So the test-target check is scoped to the ship
+    # crates plus rsh-transport — the same set CI's clippy-windows
+    # -p run covers, plus rsh-transport (CI run 44947397802: a
+    # `doc_markdown` lint in its test target passed this step
+    # locally and failed both CI clippy jobs; it has no
+    # dev-dependencies, so nothing in its test targets needs MSVC
+    # `lib.exe`) — and the full workspace --all-targets runs in the
+    # CI windows-check job on a real Windows runner, where MSVC exists.
+    cargo check -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc -p rsh-transport --all-targets --target x86_64-pc-windows-msvc
     # DS-08 (CI 44170745634): `cargo check` runs no lints, so a
     # Windows-only clippy lint (cast_possible_truncation in
     # rsh-app-core diagnostics.rs) passed this step locally and
@@ -210,7 +214,7 @@ windows_check() {
     # target on the same ship crates (+ rsh-app-core) so the class
     # is caught here. rsh-app itself is excluded (ring needs MSVC
     # lib.exe); its Windows clippy runs in CI's clippy-windows job.
-    cargo clippy -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc -p rsh-app-core --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+    cargo clippy -p rsh-daemon -p rsh-ui -p rsh-api -p rsh-ipc -p rsh-app-core -p rsh-transport --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 }
 run_step windows-check windows_check
 run_step rig-gate cargo run -q -p rsh-rig -- --gate --out "$OUT/rig"
