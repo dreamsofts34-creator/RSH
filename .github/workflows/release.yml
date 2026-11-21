@@ -229,7 +229,7 @@ jobs:
             exit 1
           }
           Write-Host "Tag $tag is commit $sha — checking the CI run for that commit on main."
-          $runsJson = gh run list --workflow ci.yml --branch main --limit 20 --json databaseId,headSha,conclusion,status,url
+          $runsJson = gh run list --workflow ci.yml --branch main --limit 100 --json databaseId,headSha,conclusion,status,url
           if ($LASTEXITCODE -ne 0) {
             Write-Error "gh run list failed — cannot verify CI status. Failing closed (DS-04)."
             exit 1
@@ -237,7 +237,7 @@ jobs:
           $runs = $runsJson | ConvertFrom-Json
           $run = @($runs | Where-Object { $_.headSha -eq $sha }) | Select-Object -First 1
           if (-not $run) {
-            Write-Error "No CI run found for commit $sha on main — the release commit was never CI-gated. Push the commit to main and wait for CI green, then tag. Failing closed (DS-04)."
+            Write-Error "No CI run found for commit $sha on main in the last 100 CI runs — the release commit was never CI-gated, OR its run fell off the list. Recovery: push the commit to main and wait for CI green, then tag (do NOT bypass this step). If CI *was* green for this commit, re-run CI on main with 'gh run rerun' so a fresh run for the commit appears in the list, then re-trigger the release. Failing closed (DS-04, R3-20)."
             exit 1
           }
           if ($run.status -ne "completed") {
@@ -262,7 +262,9 @@ jobs:
       - name: Set up .NET 10 SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "10.0.x"
+          # Pinned (R3-12): SDK 10.0.404 is the version installed on
+          # the green v2.0.6 release run (44717524848) — "10.0.x" floats.
+          dotnet-version: "10.0.404"
 
       - name: Install NSIS (makensis)
         shell: pwsh
@@ -270,7 +272,10 @@ jobs:
           # windows-latest no longer ships NSIS on PATH (release run
           # 43870249083 failed the makensis check below) — install it
           # via Chocolatey and put it on PATH for the later steps.
-          choco install nsis -y --no-progress
+          # Pinned (R3-12): NSIS 3.13.0 is the version installed on
+          # the green v2.0.6 release run (44717524848, makensis v3.13)
+          # — an unpinned `choco install nsis` floats with the feed.
+          choco install nsis --version 3.13.0 -y --no-progress
           $nsis = "C:\Program Files (x86)\NSIS"
           if (Test-Path "$nsis\makensis.exe") { "$nsis" >> $env:GITHUB_PATH }
 
@@ -323,6 +328,37 @@ jobs:
       # ---- Build the ship binaries ----
       - name: cargo build --release (daemon + UI)
         run: cargo build --release -p rsh-daemon -p rsh-ui
+
+      # R3-03: the perf gate (binary sizes vs 27/34 MB, daemon
+      # --check <= 5000 ms) never ran in the release workflow — a
+      # size/startup regression would have shipped silently. Same
+      # tools/gate-checks/perf-gate.sh the local gate and CI's
+      # `perf-gate` job run, fail-closed (no --record-only flag).
+      - name: perf-gate (sizes + daemon --check, fail-closed)
+        shell: bash
+        run: bash tools/gate-checks/perf-gate.sh --out "$RUNNER_TEMP/perf-gate"
+
+      # R3-18: archive the PDBs for this tag so a field crash can be
+      # symbolicated later. NOT a release asset — the release still
+      # ships exactly 3 files (see "Verify staged assets"). Requires
+      # [profile.release] debug = true (Cargo.toml); if the PDBs are
+      # missing the step fails closed instead of archiving nothing.
+      - name: Archive PDBs (symbols for this tag, not a release asset)
+        shell: pwsh
+        run: |
+          $pdbs = @("target/release/rsh-daemon.pdb", "target/release/rsh-ui.pdb")
+          foreach ($pdb in $pdbs) {
+            if (-not (Test-Path $pdb)) { Write-Error "PDB missing: $pdb — [profile.release] debug = true must emit it. Refusing to release without symbols (R3-18)."; exit 1 }
+          }
+          Write-Host "PDBs present: $($pdbs -join ', ')"
+      - name: Upload PDBs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsh-symbols-${{ steps.tag.outputs.tag }}
+          path: |
+            target/release/rsh-daemon.pdb
+            target/release/rsh-ui.pdb
+          retention-days: 90
 
       # ---- No console window — PE subsystem must be GUI ----
       # The v1.0.0 launch failure (user PC): the app opened behind a
@@ -828,6 +864,32 @@ jobs:
           $daemonProc = Get-Process rsh-daemon -ErrorAction SilentlyContinue
           if (-not $daemonProc) { Write-Error "Smoke test: daemon was NOT restarted by the update install (no rsh-daemon process)."; exit 1 }
           Write-Host "Daemon restarted by the update install (pid $($daemonProc.Id))."
+          # R3-19: enforcing startup measurement — launch the
+          # installed UI and poll for its main window with a 60 s
+          # bound. The startup SLO (launch-to-window) was unmeasured
+          # everywhere: the daemon --check above only measures the
+          # daemon side, and the perf-gate UI probe is record-only.
+          # First run shows the setup wizard — any main window
+          # counts. The UI is killed right after the probe so the
+          # uninstall below is not blocked by a running UI. If this
+          # fails on the runner for an environment reason (no
+          # desktop session), it fails LOUDLY by design — convert
+          # to record-only only with coordinator approval after
+          # seeing the failure mode, never silently.
+          $ui = Join-Path $installDir "rsh-ui.exe"
+          $uiStart = Get-Date
+          $uiProc = Start-Process -FilePath $ui -PassThru
+          $windowMs = $null
+          for ($i = 0; $i -lt 120; $i++) {
+            Start-Sleep -Milliseconds 500
+            $uiProc.Refresh()
+            if ($uiProc.MainWindowHandle -ne 0) { $windowMs = [int]((Get-Date) - $uiStart).TotalMilliseconds; break }
+            if ($uiProc.HasExited) { Write-Error "Smoke test: rsh-ui.exe exited before showing a window (startup probe, R3-19)."; exit 1 }
+          }
+          if ($null -eq $windowMs) { Write-Error "Smoke test: rsh-ui.exe showed no main window within 60 s (startup probe, R3-19)."; taskkill /F /IM rsh-ui.exe | Out-Null; exit 1 }
+          Write-Host "Smoke test: rsh-ui main window appeared after $windowMs ms (bound 60000 ms, R3-19)."
+          taskkill /F /IM rsh-ui.exe | Out-Null
+          Start-Sleep -Seconds 2
           taskkill /F /IM rsh-daemon.exe | Out-Null
           Start-Sleep -Seconds 2
           Start-WaitOrFail $daemon @("--check", "--no-tray", "--no-connect", "--data-dir", $dataDir) 60 "daemon --check after the update install"

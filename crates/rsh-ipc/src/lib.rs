@@ -165,7 +165,7 @@ pub mod latency;
 /// The methods the IPC server answers, with their params.
 pub mod server;
 
-pub use client::IpcClient;
+pub use client::{IpcClient, WireFrameKind, classify_wire_line};
 pub use latency::{ipc_latency_global_p50_p99_ms, ipc_latency_snapshot, record_ipc_latency};
 pub use server::IpcServer;
 #[cfg(unix)]

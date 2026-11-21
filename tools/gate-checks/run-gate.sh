@@ -9,8 +9,15 @@
 #   1. cargo fmt --check (workspace)
 #   2. cargo clippy on the gate crates (rsh-rig + rsh-gate-ui, warnings denied)
 #   3. cargo test -p rsh-rig (rig unit tests)
-#   4. rsh-rig --gate (34 rig gate checks: runtime + source audits +
-#      10 v2.0.3 lifecycle checks, F17 — real daemon/UI under Xvfb)
+#   4. rsh-rig --gate (the `gate-*` contract checks: runtime +
+#      source audits + v2.0.3 lifecycle checks, F17 — real
+#      daemon/UI under Xvfb). The count is printed by the runner
+#      itself at startup (registry + gate-subset counts) — the
+#      header used to hardcode "34" while the registry held 33
+#      (R3-14). The default gate deliberately covers ONLY the
+#      gate-* contract checks; CI's `rig-gate` job runs the FULL
+#      quick suite (all registry scenarios) — see --rig-quick
+#      below. A green default gate does NOT reproduce CI.
 #   5. rsh-gate-ui (11 headless UI checks: slider/wizard/theme/tray/banner
 #      pixels + Extras card size / OFF no-input / responsive gaps)
 #   6. windows-check: cargo check --workspace --exclude rsh-app
@@ -32,15 +39,32 @@
 #      builds debug binaries only — the whole step is record-only
 #      and passes with a note; the release workflow builds the
 #      release binaries first, so the step enforces there.
+#      Implementation: tools/gate-checks/perf-gate.sh (R3-03);
+#      the same script runs fail-closed in CI's `perf-gate` job
+#      and in release.yml right after `cargo build --release`.
+#      Cost note (R3-13): the gate-* lifecycle checks carry fixed
+#      waits — the 300 s respawn observation in
+#      `gate-respawn-bound` is load-bearing (the backoff latch
+#      lands at ~260 s; breaking early would mistake a 30 s
+#      backoff sleep for the latch) and the 300 s lifecycle soak
+#      is inside the 5-min soak cap — so a full --gate run takes
+#      >= 10 min before any scenario work is counted.
 #
 # Usage:
-#   tools/gate-checks/run-gate.sh [--full] [--out DIR]
+#   tools/gate-checks/run-gate.sh [--full] [--rig-quick] [--out DIR]
 #
 #   --full  also runs the full workspace suite the gate coordinator
 #           owns (cargo test --workspace --exclude rsh-app + workspace
 #           clippy -D warnings). NOT run by default: the full suite is
 #           the gate coordinator's step, and per user order it runs
 #           only at phase gates, not on every small fix.
+#   --rig-quick
+#           also runs the FULL quick suite (`rsh-rig --rig-quick`,
+#           every registry scenario at quick durations — the same
+#           command CI's `rig-gate` job runs, ~30 min) as an
+#           explicit step after the gate-* checks. NOT run by
+#           default: same phase-gate-only rule as --full. Without
+#           it the local gate does NOT reproduce CI (R3-02).
 #   --out   directory for the run logs (default: a timestamped dir
 #           under /tmp).
 #
@@ -51,14 +75,16 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FULL=0
+RIG_QUICK=0
 OUT=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --full) FULL=1; shift ;;
+        --rig-quick) RIG_QUICK=1; shift ;;
         --out) OUT="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,20p' "$0"
+            sed -n '53,70p' "$0" | sed 's/^# //;s/^#$//'
             exit 0
             ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -188,6 +214,11 @@ windows_check() {
 }
 run_step windows-check windows_check
 run_step rig-gate cargo run -q -p rsh-rig -- --gate --out "$OUT/rig"
+# R3-02: the full quick suite (same command CI's rig-gate runs),
+# opt-in only — ~30 min, phase gates only, like --full.
+if [ "$RIG_QUICK" -eq 1 ]; then
+    run_step rig-quick cargo run -q -p rsh-rig -- --rig-quick --out "$OUT/rig-quick"
+fi
 run_step ui-gate cargo run -q -p rsh-gate-ui
 
 # PERF-RESEARCH §6 item 9 (perf-infra): startup-time + RSS gate.
@@ -208,94 +239,13 @@ run_step ui-gate cargo run -q -p rsh-gate-ui
 # 7.8 ms, first-ever 214 ms — 5000 ms leaves an order of
 # magnitude of headroom).
 perf_gate() {
-    local daemon_bin="$ROOT/target/release/rsh-daemon"
-    local ui_bin="$ROOT/target/release/rsh-ui"
-    local daemon_size_max_mb=27
-    local ui_size_max_mb=34
-    local daemon_check_max_ms=5000
-
-    if [ ! -x "$daemon_bin" ] || [ ! -x "$ui_bin" ]; then
-        echo "perf-gate: record-only — release binaries not present"
-        echo "  (run 'cargo build --release -p rsh-daemon -p rsh-ui' first;"
-        echo "   the gate itself builds debug binaries only)"
-        return 0
-    fi
-
-    # Binary sizes (enforcing).
-    local daemon_bytes ui_bytes daemon_mb ui_mb
-    daemon_bytes=$(wc -c <"$daemon_bin" | tr -d ' ')
-    ui_bytes=$(wc -c <"$ui_bin" | tr -d ' ')
-    daemon_mb=$(( (daemon_bytes + 1048575) / 1048576 ))
-    ui_mb=$(( (ui_bytes + 1048575) / 1048576 ))
-    echo "perf-gate: rsh-daemon $daemon_bytes B (${daemon_mb} MB, max ${daemon_size_max_mb} MB)"
-    echo "perf-gate: rsh-ui $ui_bytes B (${ui_mb} MB, max ${ui_size_max_mb} MB)"
-    if [ "$daemon_mb" -gt "$daemon_size_max_mb" ]; then
-        echo "ERROR: rsh-daemon ${daemon_mb} MB exceeds ${daemon_size_max_mb} MB" >&2
-        return 1
-    fi
-    if [ "$ui_mb" -gt "$ui_size_max_mb" ]; then
-        echo "ERROR: rsh-ui ${ui_mb} MB exceeds ${ui_size_max_mb} MB" >&2
-        return 1
-    fi
-
-    # Daemon startup: --check starts the runtime + IPC, verifies
-    # a ping round-trip, and exits 0 (enforcing: wall time).
-    local start_ms end_ms check_ms
-    start_ms=$(date +%s%N | cut -c1-13)
-    if ! "$daemon_bin" --check >"$OUT/perf-daemon-check.log" 2>&1; then
-        echo "ERROR: rsh-daemon --check failed (see $OUT/perf-daemon-check.log)" >&2
-        return 1
-    fi
-    end_ms=$(date +%s%N | cut -c1-13)
-    check_ms=$((end_ms - start_ms))
-    echo "perf-gate: rsh-daemon --check ${check_ms} ms (max ${daemon_check_max_ms} ms)"
-    if [ "$check_ms" -gt "$daemon_check_max_ms" ]; then
-        echo "ERROR: rsh-daemon --check ${check_ms} ms exceeds ${daemon_check_max_ms} ms" >&2
-        return 1
-    fi
-
-    # Daemon peak RSS (record-only): python3 `resource` reports
-    # the waited child's ru_maxrss exactly — /usr/bin/time is not
-    # installed on this sandbox, and polling /proc would miss a
-    # sub-second peak. Skipped (with a note) where python3 or the
-    # resource module is unavailable (e.g. Windows CI).
-    if command -v python3 >/dev/null 2>&1; then
-        python3 - "$daemon_bin" <<'PYEOF' || echo "perf-gate: RSS probe unavailable (record-only, skipped)"
-import resource
-import subprocess
-import sys
-proc = subprocess.run([sys.argv[1], "--check"], capture_output=True)
-rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-unit = "KB (Linux)"
-print(f"perf-gate: rsh-daemon --check peak RSS {rss} {unit} (record-only)")
-PYEOF
-    else
-        echo "perf-gate: python3 not found — RSS probe skipped (record-only)"
-    fi
-
-    # Headless UI launch probe (record-only): under Xvfb the
-    # release UI must stay up until the timeout kills it (exit
-    # 124); an instant exit with an error is printed but never
-    # fails the gate — first-paint timing headless (llvmpipe) is
-    # not comparable to a Windows GPU run.
-    if command -v xvfb-run >/dev/null 2>&1; then
-        local ui_start ui_end ui_ms ui_rc
-        ui_start=$(date +%s%N | cut -c1-13)
-        # No `set -e` in this script: a non-zero timeout exit
-        # code cannot abort the gate; it is captured in ui_rc.
-        timeout 20 xvfb-run -a "$ui_bin" >"$OUT/perf-ui-launch.log" 2>&1
-        ui_rc=$?
-        ui_end=$(date +%s%N | cut -c1-13)
-        ui_ms=$((ui_end - ui_start))
-        if [ "$ui_rc" -eq 124 ]; then
-            echo "perf-gate: rsh-ui stayed up under Xvfb until the 20 s probe timeout (record-only)"
-        else
-            echo "perf-gate: rsh-ui exited rc=$ui_rc after ${ui_ms} ms (record-only; see $OUT/perf-ui-launch.log)"
-        fi
-    else
-        echo "perf-gate: xvfb-run not found — UI launch probe skipped (record-only)"
-    fi
-    return 0
+    # Thin wrapper: the enforcing implementation lives in
+    # tools/gate-checks/perf-gate.sh (Round 3 WS-2, R3-03) so CI's
+    # `perf-gate` job and release.yml run the exact same checks.
+    # The local gate builds debug binaries only, so the step stays
+    # record-only here (--record-only-if-missing); CI/release build
+    # the release binaries first and run the script fail-closed.
+    bash "$ROOT/tools/gate-checks/perf-gate.sh" --out "$OUT" --record-only-if-missing
 }
 run_step perf-gate perf_gate
 

@@ -64,6 +64,38 @@ pub struct IpcClient {
     _reader: tokio::task::JoinHandle<()>,
 }
 
+/// Which kind of JSON-lines frame a wire line is (R3-17).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireFrameKind {
+    /// A pushed event frame (`{"v":…,"event":{…}}`).
+    Event,
+    /// A request/response frame (anything else, including an
+    /// unparseable line — the reader drops those either way).
+    Response,
+}
+
+/// Classify one wire line by STRUCTURE, not substring (DS-35,
+/// B-09) — the old `line.contains("\"event\"")` misclassified
+/// any response whose JSON contained the literal substring
+/// `"event"` (e.g. a string value holding it, escaped as
+/// `\"event\"`), parsed it as an event frame, failed, and
+/// silently dropped the line — the caller then saw only the
+/// 500 ms call timeout. A top-level `"event"` key marks an event
+/// frame; anything else is a response. Split out of the reader
+/// task so the fuzz target (`fuzz/fuzz_targets/ipc_wire.rs`,
+/// R3-17) can drive it directly: a well-formed response must
+/// never classify as an event, whatever its string values hold.
+#[must_use]
+pub fn classify_wire_line(line: &str) -> WireFrameKind {
+    let is_event = serde_json::from_str::<serde_json::Value>(line)
+        .is_ok_and(|value| value.get("event").is_some());
+    if is_event {
+        WireFrameKind::Event
+    } else {
+        WireFrameKind::Response
+    }
+}
+
 impl IpcClient {
     /// Build a client over any connected byte stream (Unix socket
     /// or named pipe). Shared by the per-platform `connect_*`
@@ -88,18 +120,8 @@ impl IpcClient {
                     continue;
                 }
                 // DS-35 (B-09): classify by STRUCTURE, not
-                // substring — the old `line.contains("\"event\"")`
-                // misclassified any response whose JSON contained
-                // the literal substring `"event"` (e.g. a string
-                // value holding it, escaped as `\"event\"`),
-                // parsed it as an event frame, failed, and silently
-                // dropped the line — the caller then saw only the
-                // 500 ms call timeout. A top-level `"event"` key
-                // marks an event frame; anything else is a
-                // response (an unparseable line is dropped either
-                // way, as before).
-                let is_event = serde_json::from_str::<serde_json::Value>(&line)
-                    .is_ok_and(|value| value.get("event").is_some());
+                // substring — see [`classify_wire_line`].
+                let is_event = classify_wire_line(&line) == WireFrameKind::Event;
                 if is_event {
                     if let Ok(frame) = serde_json::from_str::<crate::IpcEventFrame>(&line)
                         && frame.v == IPC_PROTOCOL_VERSION

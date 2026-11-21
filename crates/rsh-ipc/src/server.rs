@@ -247,7 +247,19 @@ impl IpcServer {
     /// is answered as an error *response* (with the request's id
     /// when it can be read), never as a dropped connection — the
     /// client must learn the versions disagree.
-    fn handle_line(&self, line: &str) -> Result<IpcResponse, IpcError> {
+    ///
+    /// Public so the fuzz target (`fuzz/fuzz_targets/ipc_wire.rs`,
+    /// R3-17) can drive the wire format directly; the server's
+    /// connection loop calls this same function.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(IpcError::Protocol)` when the line is not a
+    /// parseable request (bad JSON, or a line too long). A version
+    /// mismatch, an unknown method, and a daemon API failure are NOT
+    /// errors here — they are answered as error *responses*
+    /// (`ok: false`) so the client learns what happened.
+    pub fn handle_line(&self, line: &str) -> Result<IpcResponse, IpcError> {
         let request = match parse_request(line) {
             Ok(request) => request,
             Err(IpcError::UnsupportedVersion(v)) => {

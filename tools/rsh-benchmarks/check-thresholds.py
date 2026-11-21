@@ -28,8 +28,18 @@ Checks:
     `--max-estimate-age-hours` (default 24 h) fails — a stale
     measurement is never a pass. Re-run `cargo bench` instead of
     reusing last week's numbers.
-  * LOAD AVERAGE (M-2): the run's `/proc/loadavg` is printed with
-    the gate output, so a slow bench can be read against host load.
+  * LOAD AVERAGE (M-2, R3-04): the run's `/proc/loadavg` is
+    printed with the gate output, so a slow bench can be read
+    against host load — and it is now USED: when the 1-min
+    loadavg exceeds `--load-bound` (default 4.0) AND a threshold
+    fails, the script exits 2 (LOAD-SUSPECT) instead of 1, so the
+    CI bench-gate job retries the bench + check once instead of
+    failing a good product for a busy runner. A pass under high
+    load still exits 0 (passing while loaded is stronger, not
+    weaker). The bound is absolute, not per-CPU: the measurement
+    host is a 1.5-CPU shared sandbox and CI runners are the same
+    loaded class — a 1-min loadavg over 4 means the host was
+    heavily contended during the run.
 
 The soak threshold (`soak_growth_mb_per_10min_max`) is NOT checked
 here: it is enforced by `cargo test -p rsh-benchmarks --test soak`
@@ -37,6 +47,11 @@ here: it is enforced by `cargo test -p rsh-benchmarks --test soak`
 
 Fail-closed: a missing estimates file or a missing thresholds file
 exits non-zero — a missing measurement is never a pass.
+
+Exit codes: 0 = all checks pass; 1 = a threshold failed on a quiet
+host (real regression — re-measure and explain, do not silently
+raise); 2 = LOAD-SUSPECT, a threshold failed while the 1-min
+loadavg exceeded `--load-bound` (retry once on a quieter runner).
 
 Usage (from the repo root, after `cargo bench -p rsh-benchmarks`):
     python3 tools/rsh-benchmarks/check-thresholds.py
@@ -122,6 +137,15 @@ def load_average() -> str:
         return "unavailable (non-Linux host)"
 
 
+def load_1min() -> float | None:
+    """1-min loadavg as a float, or None when it cannot be read."""
+    try:
+        with Path("/proc/loadavg").open() as f:
+            return float(f.read().split()[0])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Enforce the Phase B5 benchmark thresholds.")
     parser.add_argument(
@@ -141,6 +165,13 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=HERE / "baseline" / "runs-summary.json",
         help="measured-baseline file (default: tools/rsh-benchmarks/baseline/runs-summary.json)",
+    )
+    parser.add_argument(
+        "--load-bound",
+        type=float,
+        default=4.0,
+        help="1-min loadavg above which a threshold failure exits 2 "
+        "(LOAD-SUSPECT, retry once) instead of 1 (default: 4.0)",
     )
     parser.add_argument(
         "--max-estimate-age-hours",
@@ -232,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"[INFO] {bench}: estimates {age:.2f} h old (fresh)")
 
+    load1 = load_1min()
     print(f"[INFO] load average at gate time: {load_average()}")
     print(
         f"[INFO] bytes_per_tick_max={thresholds.get('bytes_per_tick_max')} "
@@ -246,6 +278,16 @@ def main(argv: list[str] | None = None) -> int:
     if failures:
         for failure in failures:
             print(f"::error::threshold gate failed: {failure}")
+        # R3-04: a failure under high load is LOAD-SUSPECT, not a
+        # proven regression — exit 2 so the CI bench-gate retries
+        # once instead of failing the run for a busy host.
+        if load1 is not None and load1 > args.load_bound:
+            print(
+                f"::warning::threshold gate failed with 1-min loadavg "
+                f"{load1:.2f} > bound {args.load_bound} — LOAD-SUSPECT, "
+                "retry once on a quieter runner (exit 2)"
+            )
+            return 2
         return 1
     print("threshold gate: all checks PASS")
     return 0
