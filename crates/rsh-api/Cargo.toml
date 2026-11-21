@@ -9,6 +9,23 @@ publish = false
 [dependencies]
 serde.workspace = true
 
+# Round 3 WS-6 (R3-AK-04): `RegisterApplicationRestart` /
+# `RegisterApplicationRecoveryCallback` live in
+# `Win32_System_Recovery`; the callback *type* needs
+# `Win32_System_WindowsProgramming`. The round-trip test also reads
+# the settings back via `GetCurrentProcess`
+# (`Win32_System_Threading`). Windows-only (the `windows` crate
+# does NOT compile on Linux).
+[target.'cfg(windows)'.dependencies]
+windows = {
+    workspace = true,
+    features = [
+        "Win32_System_Recovery",
+        "Win32_System_Threading",
+        "Win32_System_WindowsProgramming",
+    ],
+}
+
 [dev-dependencies]
 serde_json.workspace = true
 

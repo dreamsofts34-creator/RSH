@@ -52,7 +52,9 @@ use rsh_api::{
     GameSummary, ManagerAction, PollState, ProfileSummary, RawMv, SnapshotInfo, TuningSettings,
     UserError, VjoyStatus, WifiStatus,
 };
-use rsh_app_core::diagnostics::{append_startup_log_both, install_panic_hook, log_fatal};
+use rsh_app_core::diagnostics::{
+    append_startup_log_both, fresh_fatal_daemon_status, install_panic_hook, log_fatal,
+};
 use rsh_app_core::state::{
     AppStateCore, BindingAppAction, GameInfo, ProfileSummary as CoreProfileSummary, TransportKind,
 };
@@ -111,6 +113,13 @@ struct Args {
     data_dir: Option<PathBuf>,
     /// Also log to stderr.
     verbose: bool,
+    /// Launched by the Task Scheduler supervisor (Round 3 WS-6,
+    /// R3-AK-01): a fresh fatal status blocks the start (exit 0)
+    /// instead of retrying a fatally-broken daemon in a loop.
+    scheduled_respawn: bool,
+    /// Relaunched by WER after a crash (Round 3 WS-6, R3-AK-04):
+    /// the restart registration's crash-loop guard reads this.
+    wer_restart: bool,
 }
 
 fn parse_args() -> Args {
@@ -120,6 +129,8 @@ fn parse_args() -> Args {
         check: false,
         data_dir: None,
         verbose: false,
+        scheduled_respawn: false,
+        wer_restart: false,
     };
     let mut rest = std::env::args().skip(1);
     while let Some(arg) = rest.next() {
@@ -128,10 +139,12 @@ fn parse_args() -> Args {
             "--no-connect" => args.no_connect = true,
             "--check" => args.check = true,
             "--verbose" => args.verbose = true,
+            "--scheduled-respawn" => args.scheduled_respawn = true,
+            "--wer-restart" => args.wer_restart = true,
             "--data-dir" => args.data_dir = rest.next().map(PathBuf::from),
             "--help" | "-h" => {
                 eprintln!(
-                    "Usage: rsh-daemon [--no-tray] [--no-connect] [--check] [--data-dir DIR] [--verbose]"
+                    "Usage: rsh-daemon [--no-tray] [--no-connect] [--check] [--data-dir DIR] [--verbose] [--scheduled-respawn] [--wer-restart]"
                 );
                 std::process::exit(0);
             }
@@ -1368,6 +1381,47 @@ fn main() {
             data_dir.display()
         ),
     );
+    // Round 3 WS-6 (R3-AK-01): a Task-Scheduler respawn
+    // (`--scheduled-respawn`, the "RSH Daemon" task the installer
+    // creates) must stay blocked on the fatal latches — a daemon
+    // that died `IpcBindFailed` / `DaemonHung` exits 1 on purpose,
+    // and the task's restart-on-failure would otherwise resurrect
+    // it in a loop. Exit 0 here: Task Scheduler only restarts on
+    // *failure*, so a clean exit does not retrigger. This check is
+    // scoped to task launches on purpose: the Run-key / manual /
+    // rig launches are unaffected (the UI spawn already has the
+    // same latch in `live_probe` F3), and a manual launch after a
+    // fatal failure still retries — only the automatic respawn is
+    // blocked, for `FATAL_STATUS_FRESHNESS_SECS` (600 s).
+    if args.scheduled_respawn
+        && let Some((code, detail)) = fresh_fatal_daemon_status(&data_dir)
+    {
+        log_line(
+            verbose,
+            &format!(
+                "daemon: scheduled respawn blocked by fresh fatal status {code} ({detail}) — exiting 0 so the Task Scheduler restart does not resurrect a fatally-broken daemon"
+            ),
+        );
+        std::process::exit(0);
+    }
+    // Round 3 WS-6 (R3-AK-04): register for Windows Application
+    // Restart (+ recovery callback) — the OS's own crash/hang
+    // recovery path. Best-effort: a failed registration is logged
+    // and never fails the launch (no-op off Windows). Honest limit:
+    // NOT a silent auto-restart — WER needs >= 60 s uptime and the
+    // user's consent on crash/hang.
+    match rsh_api::restart::register_application_restart(&data_dir, args.wer_restart) {
+        Ok(outcome) => log_line(
+            verbose,
+            &format!("daemon: application restart registration: {outcome:?}"),
+        ),
+        Err(error) => log_line(
+            verbose,
+            &format!(
+                "daemon: WARNING application restart registration failed ({error}) — continuing without WER restart"
+            ),
+        ),
+    }
     // Scope C (background resilience): acquire the mitigations
     // for the daemon's whole lifetime. The guard is shared with
     // the manager loop (escalate on wheel-Active, relax on
@@ -2316,6 +2370,17 @@ impl PopupHandle {
 /// `PlatformTray::drop`, verified in slint 1.18.1
 /// `i-slint-core/items/system_tray/windows.rs`), which is what
 /// removes the icon on a clean quit.
+///
+/// Round 3 WS-6 (R3-AK-03, VERIFIED — no code change): Explorer
+/// restarts broadcast `TaskbarCreated` and every tray icon must be
+/// re-added. Slint 1.18.1 already does this internally — the same
+/// `i-slint-core/items/system_tray/windows.rs` backend this tray
+/// uses: its `wnd_proc` handles
+/// `RegisterWindowMessageW("TaskbarCreated")` and re-adds the icon
+/// with `Shell_NotifyIconW(NIM_ADD, ...)` (verified against the
+/// vendored `i-slint-core-1.18.1` sources, Cargo.lock pins slint
+/// `=1.18.1`). Do NOT add a second `TaskbarCreated` listener here —
+/// it would double-add the icon.
 /// DS-48: `true` when no tray can ever appear — a host with no
 /// display server (no X11 `DISPLAY`, no Wayland
 /// `WAYLAND_DISPLAY`). The tray retry loop fails fast after the
