@@ -5,7 +5,11 @@
 //! `connect-usb`, `connect-migration-402-403`,
 //! `connect-unreachable` — contract-only, duration 0), same IDs,
 //! same durations, same assertion shapes (`TESTING-INPUT.md` §8.4,
-//! `test-env/scenarios/scenarios.json` v1).
+//! `test-env/scenarios/scenarios.json` v1 — historical reference
+//! only: `test-env/` was the RETIRED C#-era rig (`ApexLink`, deleted
+//! in the Rust recreation) and is NOT the test environment; the
+//! standard test environment is `tools/rsh-rig`, run by CI's
+//! `rig-gate` and the local gate, R3-15).
 //!
 //! v2.2 note: pairing is gone (no-pairing redesign, app v2.0.6 /
 //! firmware v4.0.3 / protocol v2.2). The old Phase-2 pairing

@@ -328,6 +328,77 @@ fn wait_until(timeout: Duration, f: impl Fn() -> bool) -> bool {
     }
 }
 
+/// Poll `f` every 100 ms until it is true or `timeout` elapses;
+/// every `sample_every` also record `sample()` into the returned
+/// timeline (R3-05: when settlement times out, the next failure
+/// must be diagnosable from the check detail — live-count + ping
+/// over time — instead of a bare "live daemons: 2").
+fn wait_until_sampled(
+    timeout: Duration,
+    sample_every: Duration,
+    sample: impl Fn() -> String,
+    f: impl Fn() -> bool,
+) -> (bool, Vec<String>) {
+    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let mut timeline = vec![format!("t=0s {}", sample())];
+    let mut next_sample = started + sample_every;
+    loop {
+        if f() {
+            return (true, timeline);
+        }
+        if Instant::now() >= deadline {
+            timeline.push(format!("t={}s {}", started.elapsed().as_secs(), sample()));
+            return (false, timeline);
+        }
+        if Instant::now() >= next_sample {
+            timeline.push(format!("t={}s {}", started.elapsed().as_secs(), sample()));
+            next_sample += sample_every;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Live `rsh-daemon` pids whose cmdline contains `needle` (the
+/// check's data dir). Zombies are NOT live: an exited loser the
+/// rig has not reaped yet still has a `/proc` entry, and counting
+/// it would fail a correct product for being slow to reap
+/// (R3-05 — the `procs_with_arg` zombie flag exists for exactly
+/// this; the race check used to ignore it).
+fn live_daemon_pids(needle: &str) -> Vec<u32> {
+    procs_with_arg(needle)
+        .into_iter()
+        .filter(|(pid, zombie)| {
+            if *zombie {
+                return false;
+            }
+            let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            String::from_utf8_lossy(&cmd).contains("rsh-daemon")
+        })
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// Whether the single-instance pid file for `data_dir` names no
+/// live daemon: missing, unparsable, or naming a dead / zombie
+/// pid. Used by the inter-round socket-clear wait (R3-05): polling
+/// the ping alone cannot see a stale pid file the next round
+/// would trip over.
+fn pid_file_clear(data_dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(data_dir.join("rsh-daemon.pid")) else {
+        return true;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return true;
+    };
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    stat.rsplit(')')
+        .next()
+        .is_some_and(|t| t.trim_start().starts_with('Z'))
+}
+
 /// Pids whose `/proc/<pid>/cmdline` contains `needle` (the check's
 /// data dir — unique per check, so other workers' processes never
 /// match), plus whether each is a zombie. Skips this process.
@@ -585,6 +656,9 @@ pub fn gate_respawn_bound() -> (bool, String) {
     // UI log's "RespawnBudgetExhausted" notification
     // ("RSH stopped — automatic restart off") is the precise latch
     // proof, read from notifications.json below.
+    // R3-13: this sleep is LOAD-BEARING and stays — it is the
+    // single largest fixed cost in --gate, and its cost is
+    // documented in tools/gate-checks/run-gate.sh usage text.
     std::thread::sleep(Duration::from_secs(300));
     let ui_alive = child_alive(&mut child);
     let times = spawn_log_times(&spawn_log);
@@ -746,7 +820,17 @@ pub fn gate_ipc_bind_failure() -> (bool, String) {
             );
         }
     };
-    std::thread::sleep(Duration::from_secs(30));
+    // R3-13: was a fixed 30 s sleep. Poll every 1 s for the
+    // violation instead (UI died, or a daemon spawn appeared) —
+    // fail fast when it happens; the full 30 s still elapses when
+    // the UI stays quiet, so the observation window is unchanged.
+    let bind_observed = Instant::now();
+    while bind_observed.elapsed() < Duration::from_secs(30) {
+        if !child_alive(&mut ui_child) || count_lines_containing(&ui_log, "spawned daemon") > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
     let ui_alive = child_alive(&mut ui_child);
     let ui_spawns = count_lines_containing(&ui_log, "spawned daemon");
     let status_after = read_json(&data_dir.join("daemon-status.json"));
@@ -883,7 +967,17 @@ pub fn gate_hung_daemon() -> (bool, String) {
             );
         }
     };
-    std::thread::sleep(Duration::from_secs(45));
+    // R3-13: was a fixed 45 s sleep. Poll every 1 s for the
+    // violation instead (UI died, or a daemon spawn appeared) —
+    // fail fast when it happens; the full 45 s still elapses when
+    // the UI stays quiet, so the observation window is unchanged.
+    let hung_observed = Instant::now();
+    while hung_observed.elapsed() < Duration::from_secs(45) {
+        if !child_alive(&mut ui_child) || count_lines_containing(&ui_log, "spawned daemon") > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
     let ui_spawns_while_hung = count_lines_containing(&ui_log, "spawned daemon");
     let ui_alive = child_alive(&mut ui_child);
     report.check(
@@ -939,6 +1033,7 @@ pub fn gate_already_running_race() -> (bool, String) {
     let _ = std::fs::create_dir_all(&data_dir);
     let needle = data_dir.to_string_lossy().to_string();
     for round in 1..=3 {
+        let round_started = Instant::now();
         let mut children: Vec<Child> = Vec::new();
         for i in 0..8 {
             let log = stage.join(format!("daemon-r{round}-{i}.log"));
@@ -966,34 +1061,82 @@ pub fn gate_already_running_race() -> (bool, String) {
         // runs; it only stops the test from failing a correct product
         // (exactly one winner, losers exit 0) for being slow. A
         // genuinely stuck loser still fails after the budget.
-        let settled = wait_until(Duration::from_secs(120), || {
-            let live_n = procs_with_arg(&needle)
-                .iter()
-                .filter(|(pid, _)| {
-                    let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-                    String::from_utf8_lossy(&cmd).contains("rsh-daemon")
-                })
-                .count();
-            live_n == 1 && ipc_ping(&data_dir)
-        });
-        let live: Vec<u32> = procs_with_arg(&needle)
-            .into_iter()
-            .filter(|(pid, _)| {
-                let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-                String::from_utf8_lossy(&cmd).contains("rsh-daemon")
-            })
-            .map(|(pid, _)| pid)
-            .collect();
+        //
+        // R3-05 (v2.0.6 CI run 44703654038, attempts 1-2): the same
+        // check failed again — both times one round showed
+        // "live daemons: 2, ping: true" with every reaped loser at
+        // exit 0, after burning the full 120 s (wall 124 s). The old
+        // code DISCARDED the settlement result (`let _ = settled`),
+        // so the failure could not distinguish "never settled" from
+        // "settled then miscounted" — and the detail recorded no
+        // pids and no timeline. The hardening below keeps the
+        // 120 s budget and adds: (b) fail fast with a distinct
+        // "never settled" diagnostic + a 5 s-sampled live-count /
+        // ping timeline in the detail; (c) losers reaped in
+        // parallel with per-loser exit latency recorded (the old
+        // sequential 10 s waits could add 70 s of reap time);
+        // zombies are excluded from the live count (an exited
+        // loser the rig has not reaped yet is not a live daemon).
+        let (settled, timeline) = wait_until_sampled(
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+            || {
+                format!(
+                    "live={} ping={}",
+                    live_daemon_pids(&needle).len(),
+                    ipc_ping(&data_dir)
+                )
+            },
+            || live_daemon_pids(&needle).len() == 1 && ipc_ping(&data_dir),
+        );
+        let live = live_daemon_pids(&needle);
         let ping_ok = ipc_ping(&data_dir);
-        let _ = settled;
-        // The losers exit 0 quickly (live peer answers); collect
-        // their codes, then stop the winner.
-        let mut loser_codes: Vec<Option<i32>> = Vec::new();
+        if !settled {
+            // Distinct diagnostic: the round never settled — do not
+            // run the loser-code check on killed children (their
+            // codes would be the kill, not the product). Kill
+            // everything, record the timeline, and move to the next
+            // round so the other rounds still produce signal.
+            for mut c in children {
+                kill_child(&mut c);
+            }
+            report.check(
+                &format!("round {round}: settlement within 120 s"),
+                false,
+                &format!(
+                    "NEVER SETTLED in 120 s — live daemons at timeout: {live:?}, ping: {ping_ok}; timeline (5 s samples): {}",
+                    timeline.join(" | ")
+                ),
+            );
+            // Inter-round clear (see below) still applies.
+            let _ = wait_until(Duration::from_secs(30), || {
+                !ipc_ping(&data_dir) && pid_file_clear(&data_dir)
+            });
+            continue;
+        }
+        // The losers exit 0 quickly (live peer answers); reap them
+        // IN PARALLEL (R3-05c) and record each loser's exit latency
+        // (ms since the round started), then stop the winner.
+        let mut loser_threads = Vec::new();
         for mut c in children {
             if live.contains(&c.id()) {
                 kill_child(&mut c);
             } else {
-                loser_codes.push(wait_child_timeout(&mut c, Duration::from_secs(10)));
+                loser_threads.push(std::thread::spawn(move || {
+                    let code = wait_child_timeout(&mut c, Duration::from_secs(10));
+                    (c.id(), code, round_started.elapsed().as_millis())
+                }));
+            }
+        }
+        let mut loser_codes: Vec<Option<i32>> = Vec::new();
+        let mut loser_latencies: Vec<(u32, Option<i32>, u128)> = Vec::new();
+        for handle in loser_threads {
+            match handle.join() {
+                Ok((id, code, ms)) => {
+                    loser_codes.push(code);
+                    loser_latencies.push((id, code, ms));
+                }
+                Err(_) => loser_codes.push(None),
             }
         }
         let losers_all_zero = loser_codes.iter().all(|c| *c == Some(0));
@@ -1002,17 +1145,24 @@ pub fn gate_already_running_race() -> (bool, String) {
             &format!("round {round}: exactly 1 live daemon, rest exit 0"),
             round_ok,
             &format!(
-                "live daemons: {}, ping: {}, loser exits: {:?}",
+                "live daemons: {}, ping: {}, loser exits: {:?}, loser exit latencies (pid, code, ms since round start): {:?}",
                 live.len(),
                 ping_ok,
-                loser_codes
+                loser_codes,
+                loser_latencies
             ),
         );
         // A fresh data dir per round would hide a stale pid file;
         // keep the same dir (the winner's pid file must be
         // re-claimable after the kill) — wait for the socket to
-        // clear before the next round.
-        let _ = wait_until(Duration::from_secs(5), || !ipc_ping(&data_dir));
+        // clear before the next round. R3-05d: 5 s -> 30 s, polling
+        // the pid file as well as the ping — a slow kill under load
+        // could leave the previous winner's socket answering into
+        // the next round, which then "settles" against the stale
+        // winner (a false pass, or a confusing live-count).
+        let _ = wait_until(Duration::from_secs(30), || {
+            !ipc_ping(&data_dir) && pid_file_clear(&data_dir)
+        });
     }
     // Two UIs at once → exactly 1 window, the second exits 0.
     let Ok((ui, ui_data)) = stage_ui_with_real_daemon(&stage) else {
@@ -1051,21 +1201,35 @@ pub fn gate_already_running_race() -> (bool, String) {
     };
     // Either launch may win the pid claim (scheduling decides
     // which process starts first) — so do NOT assume ui1 is First
-    // and ui2 Second. Wait up to 10 s for exactly one of them to
-    // exit (the Second forwards its page and exits 0); the First
-    // stays alive with the one window.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let (second_exit, both_exited) = loop {
+    // and ui2 Second. Wait for exactly one of them to exit (the
+    // Second forwards its page and exits 0); the First stays alive
+    // with the one window.
+    //
+    // R3-05a: the deadline was a fixed 10 s measured from LAUNCH.
+    // On a loaded runner a cold debug UI (Slint + fontconfig under
+    // llvmpipe/Xvfb) can take >10 s just to start up and discover
+    // it is Second, so a correct product (second exits 0 at ~12 s)
+    // failed the check — the daemon half was re-budgeted to 120 s
+    // and the UI half never was. The deadline is now 60 s from
+    // launch, and the second UI's exit latency is recorded in the
+    // check detail so the next failure shows how slow it was.
+    let ui_launched = Instant::now();
+    let deadline = ui_launched + Duration::from_secs(60);
+    let (second_exit, second_exit_ms, both_exited) = loop {
         let e1 = ui1.try_wait().ok().flatten();
         let e2 = ui2.try_wait().ok().flatten();
         match (e1, e2) {
             (Some(status), None) | (None, Some(status)) => {
-                break (status.code(), false);
+                break (
+                    status.code(),
+                    Some(ui_launched.elapsed().as_millis()),
+                    false,
+                );
             }
-            (Some(_), Some(_)) => break (None, true),
+            (Some(_), Some(_)) => break (None, Some(ui_launched.elapsed().as_millis()), true),
             (None, None) => {
                 if Instant::now() >= deadline {
-                    break (None, false);
+                    break (None, None, false);
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -1098,7 +1262,9 @@ pub fn gate_already_running_race() -> (bool, String) {
     report.check(
         "second UI exits 0 (page forwarded, no duplicate window)",
         second_exit == Some(0) && !both_exited,
-        &format!("second UI exit: {second_exit:?}, both exited: {both_exited}"),
+        &format!(
+            "second UI exit: {second_exit:?} after {second_exit_ms:?} ms (deadline 60 s from launch), both exited: {both_exited}"
+        ),
     );
     report.check(
         "exactly 1 RSH window",
@@ -1759,7 +1925,54 @@ pub fn gate_toast_dedupe_integration() -> (bool, String) {
             "gate-toast-dedupe-integration: FAIL — window never became visible".into(),
         );
     }
-    std::thread::sleep(Duration::from_secs(90));
+    // R3-13: was a fixed 90 s sleep. Poll the asserted condition
+    // instead: the notification set is settled once the DaemonDown
+    // row count and the total row count stop changing for 10 s
+    // (samples every 5 s, after a 30 s minimum observation — the
+    // flap fixture respawns at ~7.5 s cadence, so fewer than ~4
+    // flap cycles would not prove the dedupe). 90 s stays as the
+    // timeout; a settled set exits early, an unsettled one costs
+    // the same 90 s. Trade-off, stated: exiting early shortens
+    // the window the "spawns <= 20" bound is measured over — the
+    // observed window is recorded in the check detail.
+    let toast_started = Instant::now();
+    let mut last_sig: Option<(usize, usize)> = None;
+    let mut stable_since = Instant::now();
+    loop {
+        let notes_now = read_json(&data_dir.join("notifications.json"));
+        let items_now = notes_now
+            .as_ref()
+            .and_then(|v| v.get("items"))
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let down_now = items_now
+            .iter()
+            .filter(|it| {
+                let title = it
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                title == "RSH not running" || title == "RSH stopped unexpectedly"
+            })
+            .count();
+        let sig = (down_now, items_now.len());
+        if last_sig == Some(sig) {
+            if stable_since.elapsed() >= Duration::from_secs(10)
+                && toast_started.elapsed() >= Duration::from_secs(30)
+            {
+                break;
+            }
+        } else {
+            last_sig = Some(sig);
+            stable_since = Instant::now();
+        }
+        if toast_started.elapsed() >= Duration::from_secs(90) {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    let toast_observed_s = toast_started.elapsed().as_secs();
     kill_child(&mut child);
     let spawns = spawn_log_times(&spawn_log).len();
     let notes = read_json(&data_dir.join("notifications.json"));
@@ -1790,9 +2003,11 @@ pub fn gate_toast_dedupe_integration() -> (bool, String) {
         .collect();
     let _ = std::fs::remove_dir_all(&stage);
     report.check(
-        "DaemonDown toasts <= 2 after 90 s of flapping",
+        "DaemonDown toasts <= 2 after flapping",
         down_rows <= 2,
-        &format!("{down_rows} DaemonDown rows (pre-fix: ~5+)"),
+        &format!(
+            "{down_rows} DaemonDown rows in {toast_observed_s} s observed (90 s max; pre-fix: ~5+ in 90 s)"
+        ),
     );
     report.check(
         "total notification rows <= 5",
@@ -1810,9 +2025,11 @@ pub fn gate_toast_dedupe_integration() -> (bool, String) {
     // deaths should also consume the budget is a follow-up for the
     // coordinator, not a failure of this check.
     report.check(
-        "no tight respawn loop (spawns <= 20 in 90 s)",
+        "no tight respawn loop (spawns <= 20)",
         spawns <= 20,
-        &format!("{spawns} daemon spawns in 90 s (flap cadence ~7.5 s; a 1 s loop would be ~90)"),
+        &format!(
+            "{spawns} daemon spawns in {toast_observed_s} s observed (90 s max; flap cadence ~7.5 s; a 1 s loop would be ~{toast_observed_s})"
+        ),
     );
     report.finish()
 }

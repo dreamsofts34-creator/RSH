@@ -13,12 +13,20 @@
 //! splitting either would hurt readability without helping review.
 //!
 //! Seeded virtual wheel + real `WheelEngine` + recording output,
-//! 30 scenarios, three modes:
+//! the scenario registry (registry size and the `gate-*` subset
+//! count are printed by the runner at startup — the header used
+//! to hardcode "30 scenarios" while the registry held 73, R3-14),
+//! three modes:
 //!
 //! * `quick` — every scenario at its short duration (~8 min total).
 //! * `full` — longer durations incl. the 10-minute soak (~15 min).
 //! * `long` — the 4-hour soak (`--only long-soak`, the release
 //!   blocker) plus the other scenarios at their long durations.
+//!
+//! `--gate` runs only the `gate-*` contract checks; `--rig-quick`
+//! (R3-02) runs the full quick suite — the same command CI's
+//! `rig-gate` job runs. The local gate's default `--gate` run does
+//! NOT reproduce CI; only `--rig-quick` does.
 //!
 //! The numeric casts above are allowed crate-wide on purpose: every
 //! number in the rig ends up as an `f64` JSON metric or as a wire
@@ -171,12 +179,18 @@ fn evaluate(scenario: &scenarios::Scenario, m: &Metrics) -> (bool, Vec<String>) 
 /// Print usage to stderr.
 fn usage() {
     eprintln!(
-        "Usage: rsh-rig [--mode quick|full|long] [--only <id>] [--seed N] [--seeds 42,7,1337] [--out DIR] [--list] [--gate]\n\
+        "Usage: rsh-rig [--mode quick|full|long] [--only <id>] [--seed N] [--seeds 42,7,1337] [--out DIR] [--list] [--gate] [--rig-quick]\n\
          \n\
          Modes: quick (~8 min), full (~15 min, 10-min soak), long (4-hour soak with --only long-soak).\n\
          --gate runs only the v2.0.2 gate checks (`gate-*` scenarios:\n\
          backend switch, typed errors, IPC timeout, performance, OTA,\n\
          installer audit, and the UI source audits). Fast, no engine run.\n\
+         --rig-quick (R3-02) runs the FULL quick suite — every registry\n\
+         scenario at quick durations, the same command CI's `rig-gate`\n\
+         job runs. The default local gate (--gate) deliberately covers\n\
+         only the gate-* contract checks; a green --gate run does NOT\n\
+         reproduce CI. Use --rig-quick (phase gates only, ~30 min) for\n\
+         the CI-equivalent local run.\n\
          --seed N runs every selected scenario once with seed N (default 42).\n\
          --seeds 42,7,1337 runs every selected scenario once per seed (M-3 multi-seed gate support;\n\
          the gate phase runs the full rig on seeds 42, 7 and 1337) and overrides --seed.\n\
@@ -197,10 +211,15 @@ async fn main() {
     // v2.0.2 gate: run only the `gate-*` contract checks (fast,
     // no engine run) instead of the full scenario set.
     let mut gate_only = false;
+    // R3-02: `--rig-quick` runs the FULL quick suite (every registry
+    // scenario, no gate filter) — the CI-equivalent local run.
+    // It overrides `--gate` when both are given.
+    let mut rig_quick = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--gate" => gate_only = true,
+            "--rig-quick" => rig_quick = true,
             "--mode" => {
                 i += 1;
                 mode = args.get(i).cloned().unwrap_or_default();
@@ -249,14 +268,35 @@ async fn main() {
         usage();
         std::process::exit(2);
     }
+    // R3-02: --rig-quick is the full quick suite — it overrides
+    // --gate (a run cannot be both the gate subset and the full
+    // suite), and pins the mode to quick.
+    if rig_quick {
+        if gate_only {
+            eprintln!("--rig-quick overrides --gate: running the FULL quick suite");
+        }
+        gate_only = false;
+        mode = "quick".to_string();
+    }
     // M-3: --seeds overrides --seed; default is the single --seed value.
     let seeds: Vec<u64> = seeds.unwrap_or_else(|| vec![seed]);
 
     let registry = scenarios::registry();
+    // R3-14: counts are derived from the registry at runtime and
+    // printed — never hardcoded in a header again.
+    let gate_count = registry
+        .iter()
+        .filter(|s| s.id.starts_with("gate-"))
+        .count();
     if list {
         for s in &registry {
             println!("{} — {}", s.id, s.description);
         }
+        println!(
+            "registry: {} scenarios, {} gate-*",
+            registry.len(),
+            gate_count
+        );
         return;
     }
     let selected: Vec<&scenarios::Scenario> = registry
@@ -281,9 +321,11 @@ async fn main() {
         std::process::exit(2);
     }
     println!(
-        "rsh-rig mode={mode} seeds={seeds:?} out={out}",
+        "rsh-rig mode={mode} seeds={seeds:?} out={out} registry={total} gate={gate_count} selected={selected_n}",
         seeds = seeds,
-        out = out_dir.display()
+        out = out_dir.display(),
+        total = registry.len(),
+        selected_n = selected.len()
     );
 
     let started_utc = utc_now();

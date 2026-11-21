@@ -214,7 +214,7 @@ jobs:
         if: steps.check.outputs.run == 'true'
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "10.0.x"
+          dotnet-version: "10.0.404"
       - name: Stage HIDMaestro sidecar (shared script)
         if: steps.check.outputs.run == 'true'
         shell: pwsh
@@ -229,7 +229,7 @@ jobs:
         if: steps.check.outputs.run == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "24.22.2"
       - name: Build frontend (dist required to compile rsh-app)
         if: steps.check.outputs.run == 'true'
         working-directory: frontend
@@ -286,12 +286,23 @@ jobs:
         with:
           toolchain: "1.100.0"
           targets: x86_64-pc-windows-msvc
+          components: clippy
       - name: Cache Cargo dependencies
         if: steps.check.outputs.run == 'true'
         uses: Swatinem/rust-cache@v2
       - name: cargo check --workspace (excluding rsh-app) --all-targets --target x86_64-pc-windows-msvc
         if: steps.check.outputs.run == 'true'
         run: cargo check --workspace --exclude rsh-app --all-targets --target x86_64-pc-windows-msvc
+      # R3-11 (Round 3 WS-2): the check above catches Windows-only
+      # *compile* breakage workspace-wide, but Windows-only *lint*
+      # breakage in the non-ship crates was caught only by
+      # `clippy-windows` (5 crates) or at release time. This pass
+      # lints the full workspace for the Windows target, so a
+      # Windows-only clippy lint fails the push, not the release.
+      # The release-time run stays as a backstop.
+      - name: cargo clippy --workspace (excluding rsh-app) --all-targets --target x86_64-pc-windows-msvc (warnings denied)
+        if: steps.check.outputs.run == 'true'
+        run: cargo clippy --workspace --exclude rsh-app --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 
   test-linux:
     name: test (Linux)
@@ -384,7 +395,7 @@ jobs:
         if: steps.check.outputs.run == 'true'
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "10.0.x"
+          dotnet-version: "10.0.404"
       - name: Stage HIDMaestro sidecar (shared script)
         if: steps.check.outputs.run == 'true'
         shell: pwsh
@@ -399,7 +410,7 @@ jobs:
         if: steps.check.outputs.run == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "24.22.2"
       - name: Build frontend (dist required to compile rsh-app)
         if: steps.check.outputs.run == 'true'
         working-directory: frontend
@@ -555,7 +566,54 @@ jobs:
         run: |
           set -euo pipefail
           cargo bench -p rsh-benchmarks
+          # R3-04: check-thresholds.py exits 2 (LOAD-SUSPECT) when a
+          # threshold fails while the 1-min loadavg is over the bound
+          # — a busy runner, not a bad product. Retry the bench +
+          # check once; a second failure (any code) fails the job.
+          set +e
           python3 tools/rsh-benchmarks/check-thresholds.py
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "bench-gate: thresholds PASS"
+          elif [ "$rc" -eq 2 ]; then
+            echo "::warning::bench-gate: first attempt failed under high load — retrying once (R3-04)"
+            sleep 60
+            cargo bench -p rsh-benchmarks
+            python3 tools/rsh-benchmarks/check-thresholds.py
+          else
+            echo "::error::bench-gate: thresholds FAILED (exit $rc)"
+            exit 1
+          fi
+
+  # R3-03 (Round 3 WS-2): the perf gate (binary sizes vs 27/34 MB,
+  # `rsh-daemon --check` <= 5000 ms) had no automated runner at all —
+  # locally it is record-only (debug binaries), and no workflow ever
+  # ran it. This job builds the release binaries, then runs the same
+  # tools/gate-checks/perf-gate.sh the local gate and release.yml
+  # run, fail-closed. Thresholds live in that script; do not change
+  # them here.
+  perf-gate:
+    name: perf-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.100.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+      # rsh-ui links Slint (fontconfig/freetype) and rsh-rig's
+      # transport needs libudev — same system-dep set as rig-gate.
+      - name: Install system deps (libudev + fontconfig + X stack)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev xvfb xdotool libxkbcommon-x11-0 libxcb-xkb1 libfontconfig-dev libfreetype-dev pkg-config
+      - name: cargo build --release (daemon + UI)
+        run: cargo build --release -p rsh-daemon -p rsh-ui
+      - name: perf-gate (sizes + daemon --check, fail-closed)
+        shell: bash
+        run: bash tools/gate-checks/perf-gate.sh --out /tmp/perf-gate-ci
 
   firmware:
     name: firmware
@@ -647,7 +705,7 @@ jobs:
         if: steps.check.outputs.run == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "24.22.2"
       - name: npm ci
         if: steps.check.outputs.run == 'true'
         working-directory: frontend
@@ -852,6 +910,32 @@ jobs:
         if: steps.check.outputs.run == 'true'
         run: cargo run -p rsh-rig -- --mode quick
 
+  # R3-01 (Round 3 WS-2): `rsh-gate-ui` (11 headless UI checks:
+  # slider/wizard/theme/tray/banner pixels + Extras card size /
+  # OFF no-input / responsive gaps) never ran in CI — the only
+  # caller was the local gate. The checks compile the real .slint
+  # files with slint-interpreter on the testing backend (software
+  # renderer — no X, no window manager, no daemon), so this is a
+  # plain Linux job; the Xvfb + system-dep set is installed anyway
+  # (same set as rig-gate) so the job stays runnable if a check
+  # ever needs a display, and `xvfb-run -a` wraps the run.
+  ui-gate:
+    name: ui-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.100.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Install system deps (libudev + X stack)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev xvfb xdotool libxkbcommon-x11-0 libxcb-xkb1 libfontconfig-dev libfreetype-dev pkg-config
+      - name: cargo run -p rsh-gate-ui (11 headless UI checks)
+        run: xvfb-run -a cargo run -p rsh-gate-ui
+
   tauri-build:
     name: tauri-build
     runs-on: windows-latest
@@ -872,7 +956,7 @@ jobs:
         if: steps.check.outputs.run == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "24.22.2"
       - name: Install Rust 1.100.0
         if: steps.check.outputs.run == 'true'
         uses: dtolnay/rust-toolchain@stable
@@ -925,7 +1009,7 @@ jobs:
         if: steps.check.outputs.run == 'true'
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "10.0.x"
+          dotnet-version: "10.0.404"
       - name: Stage HIDMaestro sidecar (shared script)
         if: steps.check.outputs.run == 'true'
         shell: pwsh
@@ -958,6 +1042,8 @@ jobs:
       - frontend
       - audit
       - rig-gate
+      - ui-gate
+      - perf-gate
       - tauri-build
       - windows-pipe-loop
       - windows-check

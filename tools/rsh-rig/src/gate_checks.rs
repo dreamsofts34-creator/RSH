@@ -22,6 +22,7 @@
 //!   markers). The real visual proof for these stays the user-PC
 //!   retest; the audit only proves the code says what the fix claims.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,6 +56,158 @@ pub fn repo_root() -> PathBuf {
 /// (audits treat that as a failure, never as a pass).
 fn read(rel: &str) -> Option<String> {
     std::fs::read_to_string(repo_root().join(rel)).ok()
+}
+
+/// Strip `//` line comments and `/* … */` block comments from Rust
+/// / Slint source before substring-matching (R3-16).
+///
+/// The old audits matched on raw file text, so a commented-out line
+/// containing the fixed string passed, and a comment mentioning the
+/// old pattern failed a correct fix. This is a small state machine:
+/// `//` inside a string literal (`"https://…"`) or a char literal
+/// (`'/'`) is not a comment, `/*` inside a string is not a block
+/// comment, and raw strings (`r#"…"#`) are copied verbatim. Block
+/// comments nest in Rust, so nesting is tracked (harmless for
+/// Slint, which has none). Comment bytes become spaces (newlines
+/// kept), so a `//` comment never swallows the next line.
+fn strip_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut depth = 0usize;
+    let mut string: Option<char> = None;
+    while let Some(c) = chars.next() {
+        if depth > 0 {
+            if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                depth += 1;
+                out.push(' ');
+                out.push(' ');
+            } else if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                depth -= 1;
+                out.push(' ');
+                out.push(' ');
+            } else {
+                out.push(if c == '\n' { '\n' } else { ' ' });
+            }
+            continue;
+        }
+        if let Some(q) = string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+                continue;
+            }
+            if c == q {
+                string = None;
+            }
+            continue;
+        }
+        // Raw string (`r"…"`, `r#"…"#`, `br#"…"#`): copy verbatim,
+        // so a `//` inside one is never mistaken for a comment.
+        if c == 'r' || c == 'b' {
+            let mut probe = chars.clone();
+            if c == 'b' && probe.next() != Some('r') {
+                out.push(c);
+                continue;
+            }
+            let mut hashes = 0usize;
+            while probe.peek() == Some(&'#') {
+                probe.next();
+                hashes += 1;
+            }
+            if probe.next() == Some('"') {
+                out.push(c);
+                if c == 'b' {
+                    out.push(chars.next().expect("probe saw 'r'"));
+                }
+                for _ in 0..hashes {
+                    out.push(chars.next().expect("probe saw '#'"));
+                }
+                out.push(chars.next().expect("probe saw quote"));
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some(ch) => {
+                            out.push(ch);
+                            if ch == '"' {
+                                let mut closed = true;
+                                for _ in 0..hashes {
+                                    match chars.next() {
+                                        Some('#') => out.push('#'),
+                                        Some(other) => {
+                                            out.push(other);
+                                            closed = false;
+                                            break;
+                                        }
+                                        None => {
+                                            closed = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if closed {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'/') {
+            // Line comment: drop to end of line (newline kept).
+            for n in chars.by_ref() {
+                if n == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            depth = 1;
+            out.push(' ');
+            out.push(' ');
+            continue;
+        }
+        if c == '"' {
+            string = Some('"');
+            out.push(c);
+            continue;
+        }
+        if c == '\'' {
+            // A `'` starts a char literal only when the next char
+            // is an escape or a single char followed by a closing
+            // quote — otherwise it is a lifetime (`&'a str`,
+            // `<'a, T>`), which must not open a string.
+            let mut probe = chars.clone();
+            let n1 = probe.next();
+            let n2 = probe.next();
+            if n1 == Some('\\') || n2 == Some('\'') {
+                string = Some('\'');
+            }
+            out.push(c);
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Read a repo-relative Rust/Slint file as text with comments
+/// stripped (R3-16) — source audits must match live code, not
+/// commented-out code. `None` when it cannot be read (audits treat
+/// that as a failure, never as a pass). Non-code files (workflow
+/// YAML, Cargo.toml) keep using raw [`read`].
+fn read_code(rel: &str) -> Option<String> {
+    read(rel).map(|text| strip_comments(&text))
 }
 
 /// Accumulates one check's sub-assertions into the `(passed, detail)`
@@ -439,8 +592,8 @@ pub fn gate_backend_switch() -> (bool, String) {
     // Settings wording changed during v2.0.2 from "Needs admin each
     // start." to "Needs admin permission when first used." — the
     // check accepts the current wording and reports it.)
-    let backend_rs = read("crates/rsh-output-hidmaestro/src/backend.rs").unwrap_or_default();
-    let settings_slint = read("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
+    let backend_rs = read_code("crates/rsh-output-hidmaestro/src/backend.rs").unwrap_or_default();
+    let settings_slint = read_code("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
     let settings_warns_admin = settings_slint.contains("Needs admin");
     report.check(
         "uac-copy",
@@ -660,6 +813,74 @@ pub fn gate_ipc_timeout() -> (bool, String) {
     report.finish()
 }
 
+/// 1-min load average on Linux (`/proc/loadavg`); `None` anywhere
+/// else (no `/proc` — the file read fails and the gate runs without
+/// load accounting, as before). Used by the load-aware retry in
+/// [`gate_perf`] (R3-21) and recorded in its check detail.
+fn loadavg_1min() -> Option<f64> {
+    std::fs::read_to_string("/proc/loadavg").ok().and_then(|t| {
+        t.split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+    })
+}
+
+/// One 100-ping measurement against a fresh echo server in `dir`,
+/// speaking the real IPC wire format
+/// (`{"v":<IPC_PROTOCOL_VERSION>,"id":N,"ok":true,"result":{"pong":true}}`).
+/// Returns (p50, p99, answered-count). Split out of [`gate_perf`]
+/// so the load-aware retry (R3-21) can run a second measurement
+/// against a fresh socket — a second bind on the same path would
+/// fail (the first listener's socket file stays behind).
+fn measure_ipc_ping_p50_p99(dir: &Path) -> (Duration, Duration, usize) {
+    let path = dir.join("rsh-daemon.sock");
+    block_on_scoped(|| {
+        let rt = current_thread_runtime();
+        rt.block_on(async {
+        let listener = FakeListener::bind(&path).expect("gate echo server bind");
+        tokio::spawn(async move {
+            loop {
+                let Ok(stream) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                    let (reader, mut writer) = tokio::io::split(stream);
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let id = serde_json::from_str::<serde_json::Value>(&line)
+                            .ok()
+                            .and_then(|v| v.get("id")?.as_u64())
+                            .unwrap_or(0);
+                        let reply = format!(
+                            "{{\"v\":{IPC_PROTOCOL_VERSION},\"id\":{id},\"ok\":true,\"result\":{{\"pong\":true}}}}\n"
+                        );
+                        if writer.write_all(reply.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let client = IpcClient::connect(&path).await.expect("gate echo connect");
+        let mut samples: Vec<Duration> = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let start = Instant::now();
+            let ok = client.ping().await.unwrap_or(false);
+            if !ok {
+                break;
+            }
+            samples.push(start.elapsed());
+        }
+        samples.sort_unstable();
+        let count = samples.len();
+        let p50 = samples.get(count / 2).copied().unwrap_or(Duration::MAX);
+        let p99 = samples.get(count.saturating_sub(1)).copied().unwrap_or(Duration::MAX);
+        (p50, p99, count)
+        })
+    })
+}
+
 /// Gate: performance (B7, plan §C) — startup + the IPC path every
 /// UI click uses.
 ///
@@ -709,62 +930,48 @@ pub fn gate_perf() -> (bool, String) {
     // 1 → 2 with the no-pairing IPC changes, and the client rejects
     // any reply whose `v` differs, so a hardcoded `"v":1` here made
     // every ping fail and the p50/p99 came back as Duration::MAX.
+    //
+    // R3-21: the p50 < 5 ms / p99 < 50 ms thresholds are absolute
+    // wall-clock numbers on a shared host — the same load-artifact
+    // class that already failed the bench gate (loadavg 14.5) can
+    // fail this check for a healthy IPC path. The thresholds stay
+    // (loopback pings are normally sub-ms, so the headroom is
+    // generous); what changes is accounting: the measured p50/p99
+    // are recorded alongside the run's 1-min loadavg, and a failure
+    // under high load (> 4.0) gets ONE retry before the gate fails.
     let dir = temp_dir("perf-ipc");
-    let path = dir.join("rsh-daemon.sock");
-    let (p50_ms, p99_ms, count) = block_on_scoped(|| {
-        let rt = current_thread_runtime();
-        rt.block_on(async {
-        let listener = FakeListener::bind(&path).expect("gate echo server bind");
-        tokio::spawn(async move {
-            loop {
-                let Ok(stream) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-                    let (reader, mut writer) = tokio::io::split(stream);
-                    let mut lines = BufReader::new(reader).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        let id = serde_json::from_str::<serde_json::Value>(&line)
-                            .ok()
-                            .and_then(|v| v.get("id")?.as_u64())
-                            .unwrap_or(0);
-                        let reply = format!(
-                            "{{\"v\":{IPC_PROTOCOL_VERSION},\"id\":{id},\"ok\":true,\"result\":{{\"pong\":true}}}}\n"
-                        );
-                        if writer.write_all(reply.as_bytes()).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-        let client = IpcClient::connect(&path).await.expect("gate echo connect");
-        let mut samples: Vec<Duration> = Vec::with_capacity(100);
-        for _ in 0..100 {
-            let start = Instant::now();
-            let ok = client.ping().await.unwrap_or(false);
-            if !ok {
-                break;
-            }
-            samples.push(start.elapsed());
-        }
-        samples.sort_unstable();
-        let count = samples.len();
-        let p50 = samples.get(count / 2).copied().unwrap_or(Duration::MAX);
-        let p99 = samples.get(count.saturating_sub(1)).copied().unwrap_or(Duration::MAX);
-        (p50, p99, count)
-        })
-    });
-    report.check(
-        "ipc-ping-round-trip",
-        count == 100 && p50_ms < Duration::from_millis(5) && p99_ms < Duration::from_millis(50),
-        &format!(
-            "100 pings: p50 {} ms, p99 {} ms (thresholds p50 < 5 ms, p99 < 50 ms)",
-            p50_ms.as_secs_f64() * 1000.0,
-            p99_ms.as_secs_f64() * 1000.0
-        ),
+    let (p50_ms, p99_ms, count) = measure_ipc_ping_p50_p99(&dir);
+    let load = loadavg_1min();
+    let mut detail = format!(
+        "100 pings: p50 {} ms, p99 {} ms (thresholds p50 < 5 ms, p99 < 50 ms); loadavg 1-min: {}",
+        p50_ms.as_secs_f64() * 1000.0,
+        p99_ms.as_secs_f64() * 1000.0,
+        load.map_or("unavailable".to_string(), |v| format!("{v:.2}"))
     );
+    let mut passed =
+        count == 100 && p50_ms < Duration::from_millis(5) && p99_ms < Duration::from_millis(50);
+    if !passed
+        && let Some(load1) = load
+        && load1 > 4.0
+    {
+        let retry_dir = temp_dir("perf-ipc-retry");
+        let (p50_b, p99_b, count_b) = measure_ipc_ping_p50_p99(&retry_dir);
+        let _ = write!(
+            detail,
+            "; LOAD-RETRY (loadavg {load1:.2} > 4.0): p50 {} ms, p99 {} ms, {} answered",
+            p50_b.as_secs_f64() * 1000.0,
+            p99_b.as_secs_f64() * 1000.0,
+            count_b
+        );
+        if count_b == 100 && p50_b < Duration::from_millis(5) && p99_b < Duration::from_millis(50) {
+            passed = true;
+            detail.push_str(" — retry PASSED, first attempt was a load artifact");
+        } else {
+            detail.push_str(" — retry also failed, not a load artifact");
+        }
+        let _ = std::fs::remove_dir_all(&retry_dir);
+    }
+    report.check("ipc-ping-round-trip", passed, &detail);
     let _ = std::fs::remove_dir_all(&dir);
     report.finish()
 }
@@ -878,7 +1085,7 @@ fn count(haystack: &str, needle: &str) -> usize {
 #[must_use]
 pub fn gate_slider_source() -> (bool, String) {
     let mut report = Report::new();
-    let Some(components) = read("crates/rsh-ui/ui/components.slint") else {
+    let Some(components) = read_code("crates/rsh-ui/ui/components.slint") else {
         report.check("slider-source-present", false, "components.slint missing");
         return report.finish();
     };
@@ -919,15 +1126,15 @@ pub fn gate_slider_source() -> (bool, String) {
 #[must_use]
 pub fn gate_tray_persistence_source() -> (bool, String) {
     let mut report = Report::new();
-    let Some(daemon) = read("crates/rsh-daemon/src/main.rs") else {
+    let Some(daemon) = read_code("crates/rsh-daemon/src/main.rs") else {
         report.check("tray-source-present", false, "daemon main.rs missing");
         return report.finish();
     };
-    let Some(tray) = read("crates/rsh-daemon/ui/tray.slint") else {
+    let Some(tray) = read_code("crates/rsh-daemon/ui/tray.slint") else {
         report.check("tray-source-present", false, "tray.slint missing");
         return report.finish();
     };
-    let popup = read("crates/rsh-daemon/src/tray_popup.rs").unwrap_or_default();
+    let popup = read_code("crates/rsh-daemon/src/tray_popup.rs").unwrap_or_default();
     report.check(
         "tray-slint-no-timer",
         !tray.contains("Timer"),
@@ -984,11 +1191,11 @@ pub fn gate_tray_persistence_source() -> (bool, String) {
 #[must_use]
 pub fn gate_tray_data_source() -> (bool, String) {
     let mut report = Report::new();
-    let Some(popup) = read("crates/rsh-daemon/src/tray_popup.rs") else {
+    let Some(popup) = read_code("crates/rsh-daemon/src/tray_popup.rs") else {
         report.check("tray-data-source-present", false, "tray_popup.rs missing");
         return report.finish();
     };
-    let Some(tray) = read("crates/rsh-daemon/ui/tray.slint") else {
+    let Some(tray) = read_code("crates/rsh-daemon/ui/tray.slint") else {
         report.check("tray-data-source-present", false, "tray.slint missing");
         return report.finish();
     };
@@ -1023,9 +1230,9 @@ pub fn gate_tray_data_source() -> (bool, String) {
 #[must_use]
 pub fn gate_x_close_source() -> (bool, String) {
     let mut report = Report::new();
-    let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
-    let main_slint = read("crates/rsh-ui/ui/main.slint").unwrap_or_default();
-    let shell_slint = read("crates/rsh-ui/ui/shell.slint").unwrap_or_default();
+    let ui_main = read_code("crates/rsh-ui/src/main.rs").unwrap_or_default();
+    let main_slint = read_code("crates/rsh-ui/ui/main.slint").unwrap_or_default();
+    let shell_slint = read_code("crates/rsh-ui/ui/shell.slint").unwrap_or_default();
     let combined = format!("{ui_main}\n{main_slint}\n{shell_slint}");
     let wired = combined.contains("close_to_tray")
         || combined.contains("on_close_requested")
@@ -1046,7 +1253,7 @@ pub fn gate_x_close_source() -> (bool, String) {
     // The tray side must already restore the window: the daemon
     // handles OpenMain (checked here so a tray regression is
     // caught even while the UI side is pending).
-    let daemon = read("crates/rsh-daemon/src/main.rs").unwrap_or_default();
+    let daemon = read_code("crates/rsh-daemon/src/main.rs").unwrap_or_default();
     report.check(
         "tray-open-main-exists",
         daemon.contains("TrayAction::OpenMain"),
@@ -1065,10 +1272,10 @@ pub fn gate_x_close_source() -> (bool, String) {
 #[must_use]
 pub fn gate_wizard_reopen_source() -> (bool, String) {
     let mut report = Report::new();
-    let settings = read("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
-    let main_slint = read("crates/rsh-ui/ui/main.slint").unwrap_or_default();
-    let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
-    let daemon = read("crates/rsh-daemon/src/main.rs").unwrap_or_default();
+    let settings = read_code("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
+    let main_slint = read_code("crates/rsh-ui/ui/main.slint").unwrap_or_default();
+    let ui_main = read_code("crates/rsh-ui/src/main.rs").unwrap_or_default();
+    let daemon = read_code("crates/rsh-daemon/src/main.rs").unwrap_or_default();
     report.check(
         "wizard-reopen-settings-row",
         settings.contains("Run setup again") && settings.contains("run-setup();"),
@@ -1120,8 +1327,8 @@ pub fn gate_wizard_reopen_source() -> (bool, String) {
 #[must_use]
 pub fn gate_wizard_fake_data_source() -> (bool, String) {
     let mut report = Report::new();
-    let setup = read("crates/rsh-ui/ui/screens/setup.slint").unwrap_or_default();
-    let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
+    let setup = read_code("crates/rsh-ui/ui/screens/setup.slint").unwrap_or_default();
+    let ui_main = read_code("crates/rsh-ui/src/main.rs").unwrap_or_default();
     report.check(
         "wizard-defaults-placeholder",
         setup.contains("games-text: \"No games added yet.\"")
@@ -1152,9 +1359,9 @@ pub fn gate_wizard_fake_data_source() -> (bool, String) {
 #[must_use]
 pub fn gate_loading_source() -> (bool, String) {
     let mut report = Report::new();
-    let client = read("crates/rsh-ipc/src/client.rs").unwrap_or_default();
-    let ipc_api = read("crates/rsh-ui/src/ipc_api.rs").unwrap_or_default();
-    let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
+    let client = read_code("crates/rsh-ipc/src/client.rs").unwrap_or_default();
+    let ipc_api = read_code("crates/rsh-ui/src/ipc_api.rs").unwrap_or_default();
+    let ui_main = read_code("crates/rsh-ui/src/main.rs").unwrap_or_default();
     report.check(
         "loading-ipc-call-bounded",
         client.contains("CALL_TIMEOUT")
@@ -1192,7 +1399,7 @@ pub fn gate_loading_source() -> (bool, String) {
 #[must_use]
 pub fn gate_hover_source() -> (bool, String) {
     let mut report = Report::new();
-    let Some(components) = read("crates/rsh-ui/ui/components.slint") else {
+    let Some(components) = read_code("crates/rsh-ui/ui/components.slint") else {
         report.check("hover-source-present", false, "components.slint missing");
         return report.finish();
     };
@@ -1245,10 +1452,10 @@ pub fn gate_hover_source() -> (bool, String) {
 #[must_use]
 pub fn gate_theme_source() -> (bool, String) {
     let mut report = Report::new();
-    let tokens = read("crates/rsh-ui/ui/tokens.slint").unwrap_or_default();
-    let settings = read("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
-    let main_slint = read("crates/rsh-ui/ui/main.slint").unwrap_or_default();
-    let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
+    let tokens = read_code("crates/rsh-ui/ui/tokens.slint").unwrap_or_default();
+    let settings = read_code("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
+    let main_slint = read_code("crates/rsh-ui/ui/main.slint").unwrap_or_default();
+    let ui_main = read_code("crates/rsh-ui/src/main.rs").unwrap_or_default();
     report.check(
         "theme-mode-binding",
         tokens.contains("in-out property <int> mode: 0;")
@@ -1288,7 +1495,7 @@ pub fn gate_theme_source() -> (bool, String) {
 #[must_use]
 pub fn gate_overflow_source() -> (bool, String) {
     let mut report = Report::new();
-    let Some(settings) = read("crates/rsh-ui/ui/screens/settings.slint") else {
+    let Some(settings) = read_code("crates/rsh-ui/ui/screens/settings.slint") else {
         report.check("overflow-source-present", false, "settings.slint missing");
         return report.finish();
     };
@@ -1329,8 +1536,8 @@ pub fn gate_overflow_source() -> (bool, String) {
 #[must_use]
 pub fn gate_notifications_source() -> (bool, String) {
     let mut report = Report::new();
-    let notifications = read("crates/rsh-ui/src/notifications.rs");
-    let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
+    let notifications = read_code("crates/rsh-ui/src/notifications.rs");
+    let ui_main = read_code("crates/rsh-ui/src/main.rs").unwrap_or_default();
     report.check(
         "notifications-module",
         notifications.is_some(),
@@ -1341,7 +1548,7 @@ pub fn gate_notifications_source() -> (bool, String) {
         ui_main.contains("NotificationCenter") && ui_main.contains("notifications:"),
         "NotificationCenter is wired into the UI context",
     );
-    let commands = read("crates/rsh-app-core/src/commands.rs").unwrap_or_default();
+    let commands = read_code("crates/rsh-app-core/src/commands.rs").unwrap_or_default();
     report.check(
         "notifications-typed-errors",
         commands.contains("UserError"),
@@ -1365,7 +1572,7 @@ pub fn gate_notifications_source() -> (bool, String) {
 #[must_use]
 pub fn gate_extras_card_size_source() -> (bool, String) {
     let mut report = Report::new();
-    let Some(extras) = read("crates/rsh-ui/ui/screens/extras.slint") else {
+    let Some(extras) = read_code("crates/rsh-ui/ui/screens/extras.slint") else {
         report.check("extras-source-present", false, "extras.slint missing");
         return report.finish();
     };
@@ -1420,12 +1627,12 @@ pub fn gate_extras_card_size_source() -> (bool, String) {
 #[must_use]
 pub fn gate_card_gap_source() -> (bool, String) {
     let mut report = Report::new();
-    let extras = read("crates/rsh-ui/ui/screens/extras.slint").unwrap_or_default();
-    let pedals = read("crates/rsh-ui/ui/screens/pedals.slint").unwrap_or_default();
-    let buttons = read("crates/rsh-ui/ui/screens/buttons.slint").unwrap_or_default();
-    let steering = read("crates/rsh-ui/ui/screens/steering.slint").unwrap_or_default();
-    let overview = read("crates/rsh-ui/ui/screens/overview.slint").unwrap_or_default();
-    let settings = read("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
+    let extras = read_code("crates/rsh-ui/ui/screens/extras.slint").unwrap_or_default();
+    let pedals = read_code("crates/rsh-ui/ui/screens/pedals.slint").unwrap_or_default();
+    let buttons = read_code("crates/rsh-ui/ui/screens/buttons.slint").unwrap_or_default();
+    let steering = read_code("crates/rsh-ui/ui/screens/steering.slint").unwrap_or_default();
+    let overview = read_code("crates/rsh-ui/ui/screens/overview.slint").unwrap_or_default();
+    let settings = read_code("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
     report.check(
         "gap-spacers-extras",
         count(&extras, "min-width: 12px; horizontal-stretch: 0.05;") == 2,
@@ -1509,7 +1716,7 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
     let mut report = Report::new();
 
     // Dwell: parse DEFAULT_SPAWN_TIMEOUT from the manager.
-    let manager = read("crates/rsh-output-hidmaestro/src/manager.rs").unwrap_or_default();
+    let manager = read_code("crates/rsh-output-hidmaestro/src/manager.rs").unwrap_or_default();
     let spawn_marker = "pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(";
     let spawn_secs = manager
         .find(spawn_marker)
@@ -1571,7 +1778,7 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
     // and the failure notification lives in the `JobDone::Backend`
     // done-arm (typed `notify_error` + toggle revert). Audit that
     // shape instead of the old direct-call handler.
-    let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
+    let ui_main = read_code("crates/rsh-ui/src/main.rs").unwrap_or_default();
     let Some(handler_start) = ui_main.find("on_output_backend_selected") else {
         report.check(
             "hid-ui-single-attempt",
@@ -1660,7 +1867,7 @@ pub fn gate_bindings_ui() -> (bool, String) {
     let _ = std::fs::remove_dir_all(&dir);
 
     // IPC server dispatches the binding methods (daemon side ready).
-    let server = read("crates/rsh-ipc/src/lib.rs").unwrap_or_default();
+    let server = read_code("crates/rsh-ipc/src/lib.rs").unwrap_or_default();
     report.check(
         "bindings-ipc-server-ready",
         server.contains("\"list_bindings\" | \"set_binding\" | \"clear_binding\""),
@@ -1668,7 +1875,7 @@ pub fn gate_bindings_ui() -> (bool, String) {
     );
 
     // UI client forwards them (the gap).
-    let ipc_api = read("crates/rsh-ui/src/ipc_api.rs").unwrap_or_default();
+    let ipc_api = read_code("crates/rsh-ui/src/ipc_api.rs").unwrap_or_default();
     report.check(
         "bindings-ipc-client-forwards",
         ipc_api.contains("set_binding") && ipc_api.contains("list_bindings"),
@@ -1676,7 +1883,7 @@ pub fn gate_bindings_ui() -> (bool, String) {
     );
 
     // Buttons save handler calls set_binding (the gap).
-    let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
+    let ui_main = read_code("crates/rsh-ui/src/main.rs").unwrap_or_default();
     let Some(save_start) = ui_main.find("on_edit_save") else {
         report.check(
             "bindings-save-calls-set-binding",
@@ -1778,8 +1985,8 @@ pub fn gate_ota_flash_caller() -> (bool, String) {
     );
 
     // Source audit: the UI caller.
-    let settings = read("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
-    let ui_main = read("crates/rsh-ui/src/main.rs").unwrap_or_default();
+    let settings = read_code("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
+    let ui_main = read_code("crates/rsh-ui/src/main.rs").unwrap_or_default();
     report.check(
         "ota-caller-settings-action",
         settings.contains("Update firmware"),
@@ -1836,13 +2043,13 @@ pub fn gate_version_bump() -> (bool, String) {
         true,
         &format!("workspace Cargo.toml version is {version}"),
     );
-    let main_slint = read("crates/rsh-ui/ui/main.slint").unwrap_or_default();
+    let main_slint = read_code("crates/rsh-ui/ui/main.slint").unwrap_or_default();
     report.check(
         "version-main-slint",
         main_slint.contains(&format!("app-version: \"{version}\"")),
         &format!("MainWindow app-version is {version}"),
     );
-    let settings = read("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
+    let settings = read_code("crates/rsh-ui/ui/screens/settings.slint").unwrap_or_default();
     report.check(
         "version-settings-slint",
         settings.contains(&format!("app-version: \"RSH {version}\"")),
@@ -1855,4 +2062,102 @@ pub fn gate_version_bump() -> (bool, String) {
         "release workflow fails closed when the tag version mismatches Cargo.toml",
     );
     report.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // R3-16: commented-out code must not pass the source audits.
+    #[test]
+    fn strip_comments_removes_line_and_block_comments() {
+        let src =
+            "let a = 1; // width: parent.width * frac;\nlet b = 2; /* (1 - value) */ let c = 3;";
+        let stripped = strip_comments(src);
+        assert!(!stripped.contains("width: parent.width * frac;"));
+        assert!(!stripped.contains("(1 - value)"));
+        assert!(stripped.contains("let a = 1;"));
+        assert!(stripped.contains("let b = 2;"));
+        assert!(stripped.contains("let c = 3;"));
+    }
+
+    #[test]
+    fn strip_comments_keeps_slashes_inside_strings() {
+        let src = r#"let url = "https://example.com/a//b"; // trailing
+let path = 'x'; // (1 - value)"#;
+        let stripped = strip_comments(src);
+        assert!(stripped.contains("https://example.com/a//b"));
+        assert!(stripped.contains("let path = 'x';"));
+        assert!(!stripped.contains("trailing"));
+        assert!(!stripped.contains("(1 - value)"));
+    }
+
+    #[test]
+    fn strip_comments_keeps_raw_strings_and_lifetimes() {
+        let src = "fn f<'a>(x: &'a str) -> &'a str { r#\"a // not a comment\"# }";
+        let stripped = strip_comments(src);
+        assert!(stripped.contains("a // not a comment"));
+        assert!(stripped.contains("fn f<'a>(x: &'a str)"));
+    }
+
+    #[test]
+    fn strip_comments_tracks_nested_block_comments() {
+        let src = "let a = 1; /* outer /* inner */ still comment */ let b = 2;";
+        let stripped = strip_comments(src);
+        assert!(!stripped.contains("still comment"));
+        assert!(stripped.contains("let a = 1;"));
+        assert!(stripped.contains("let b = 2;"));
+    }
+
+    // R3-10: the `FakeListener` Windows branch (named-pipe
+    // probe-create in `bind`, fresh instance in `accept`) never
+    // executed anywhere in automation — it only compiled. This
+    // test drives bind + accept + one ping round-trip through the
+    // real `IpcClient`, so the Windows branch runs under
+    // `test-windows` (`cargo test --workspace`) and the Unix
+    // branch runs under `test-linux`. The gate checks
+    // (`gate_ipc_timeout`, `gate_perf`) use the same peer.
+    #[test]
+    fn fake_listener_answers_one_ping_round_trip() {
+        let dir = temp_dir("fake-listener-test");
+        let path = dir.join("rsh-daemon.sock");
+        let (ok, detail) = block_on_scoped(|| {
+            let rt = current_thread_runtime();
+            rt.block_on(async {
+                let listener = match FakeListener::bind(&path) {
+                    Ok(listener) => listener,
+                    Err(error) => return (false, format!("bind failed: {error}")),
+                };
+                tokio::spawn(async move {
+                    if let Ok(stream) = listener.accept().await {
+                        tokio::spawn(async move {
+                            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                            let (reader, mut writer) = tokio::io::split(stream);
+                            let mut lines = BufReader::new(reader).lines();
+                            if let Ok(Some(line)) = lines.next_line().await {
+                                let id = serde_json::from_str::<serde_json::Value>(&line)
+                                    .ok()
+                                    .and_then(|v| v.get("id")?.as_u64())
+                                    .unwrap_or(0);
+                                let reply = format!(
+                                    "{{\"v\":{IPC_PROTOCOL_VERSION},\"id\":{id},\"ok\":true,\"result\":{{\"pong\":true}}}}\n"
+                                );
+                                let _ = writer.write_all(reply.as_bytes()).await;
+                            }
+                        });
+                    }
+                });
+                let client = match IpcClient::connect(&path).await {
+                    Ok(client) => client,
+                    Err(error) => return (false, format!("connect failed: {error}")),
+                };
+                match client.ping().await {
+                    Ok(true) => (true, String::new()),
+                    other => (false, format!("ping answered {other:?}, expected Ok(true)")),
+                }
+            })
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok, "{detail}");
+    }
 }

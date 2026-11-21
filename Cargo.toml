@@ -105,5 +105,13 @@ missing_docs = "warn"
 # sizes. Applies workspace-wide, including the bench profile
 # (bench inherits release), so bench builds pay the LTO cost too.
 strip = true
+# R3-18 (Round 3 WS-2): `debug = true` so the release build emits
+# PDBs (MSVC) next to the binaries — release.yml archives them per
+# tag as a non-release artifact, so a field crash can be
+# symbolicated. `strip = true` still strips the shipped binaries;
+# the PDBs are separate files, not shipped to users. If this is
+# ever turned off, the release.yml PDB step fails closed — do not
+# silence it.
+debug = true
 lto = "fat"
 codegen-units = 1

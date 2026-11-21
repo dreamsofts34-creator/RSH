@@ -76,28 +76,6 @@
     "runC_p99_ns": 431.2,
     "runC_p95_ns": 361.9
   },
-  "hmac_compute_tag_empty_payload": {
-    "runA_mean_ns": 359.3,
-    "runB_mean_ns": 360.0,
-    "runC_mean_ns": 356.1851877265843,
-    "mean_of_means_ns": 358.49506257552804,
-    "runC_median_ns": 356.0491706946859,
-    "runC_stddev_ns": 4.5003220542215665,
-    "spread_pct": 1.0641184974791718,
-    "runC_p99_ns": 368.7,
-    "runC_p95_ns": 363.2
-  },
-  "hmac_verify_tag": {
-    "runA_mean_ns": 372.4,
-    "runB_mean_ns": 381.4,
-    "runC_mean_ns": 396.96100707180966,
-    "mean_of_means_ns": 383.5870023572699,
-    "runC_median_ns": 372.12345000538346,
-    "runC_stddev_ns": 59.90190869513339,
-    "spread_pct": 6.402982092947392,
-    "runC_p99_ns": 698.4,
-    "runC_p95_ns": 463.3
-  },
   "pin_validate_blob_factory": {
     "runA_mean_ns": 6322.3,
     "runB_mean_ns": 6187.6,
