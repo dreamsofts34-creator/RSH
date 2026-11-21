@@ -21,6 +21,8 @@
 //       err 1 pin conflict       -> PIN_CONFLICT (5)
 //       err 2 value out of range -> PIN_CONFLICT (5)
 //       err 3 unknown module/type/schema/magic -> UNSUPPORTED (6)
+//       err 3 expander record (type 8/9, sampling not implemented — v4.0.4)
+//           -> UNSUPPORTED (6) (fail closed, silently dead buttons nahi)
 //       err 4 chunk/blob CRC mismatch        -> BAD_CRC (3)
 //       err 5 total size mismatch            -> TOO_BIG (4)
 //   * Safe mode mein stage + commit dono BUSY (7) — config apply nahi hoti.
@@ -290,6 +292,8 @@ static inline uint8_t rsh_cfg_pin_check_(uint8_t pin, uint8_t rule,
 //   magic != "RSHG" ya schema != 2                 -> UNSUPPORTED, err 3
 //   CRC32 trailer mismatch                          -> BAD_CRC, err 4
 //   unknown type (1..13 ke bahar)                   -> UNSUPPORTED, err 3
+//   expander record (type 8/9, sampling not implemented — v4.0.4)
+//                                                    -> UNSUPPORTED, err 3
 //   pin 0xFF ke ilawa 0..39 ke bahar                -> PIN_CONFLICT, err 2
 //   pin barred (flash/UART/strapping/LED/nonexistent)
 //     ya kind-ghalat (ADC2 axis, input-only digital/LED)
@@ -397,6 +401,19 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
           RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
           if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
         }
+        continue;
+      }
+      if (type == RSH_CFG_TYPE_EXP_MCP23017 || type == RSH_CFG_TYPE_EXP_PCF8574) {
+        // Round 3 (v4.0.4): expander sampling is NOT implemented — a
+        // COMMIT that accepts these records would leave silently dead
+        // buttons (validator pehle accept karta tha, pinmap sirf
+        // presence track karta tha). Reject fail-closed: err 3 ->
+        // UNSUPPORTED. The app (`validate_blob`, rsh-protocol) rejects
+        // first with a plain message; this is the backstop for old
+        // apps / direct SET_CFG. Axes (ADS1115/AS5600) unaffected —
+        // sirf kinds 8/9 reject hote hain.
+        RSH_CFG_ADD_ERR(RSH_CFG_ERR_UNKNOWN_TYPE);
+        if (status == RSH_CTRL_OK) status = RSH_CTRL_UNSUPPORTED;
         continue;
       }
       if (type == RSH_CFG_TYPE_AXIS_ADC || type == RSH_CFG_TYPE_AXIS_ADS1115

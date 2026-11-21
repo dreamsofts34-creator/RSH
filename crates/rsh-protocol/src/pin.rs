@@ -1159,10 +1159,31 @@ pub fn validate_blob(blob: &ConfigBlob) -> Vec<String> {
     let mut extra_pins: Vec<(u8, usize, String)> = Vec::new();
     // Every module pin with its record index, for the same cross-check.
     let mut module_pins: Vec<(u8, usize)> = Vec::new();
+    // Round 3 (v4.0.4): expander sampling is not implemented — one
+    // error per blob, not per record (see the loop below).
+    let mut saw_expander = false;
 
     for (idx, record) in blob.records.iter().enumerate() {
         if record.rec_type == record_type::SHIFTER {
             errs.extend(shifter_errors(record, has_encoder, &mut used));
+            continue;
+        }
+        if matches!(
+            record.rec_type,
+            record_type::EXPANDER_MCP23017 | record_type::EXPANDER_PCF8574
+        ) {
+            // The board rejects these records at COMMIT, so reject
+            // here first with a plain message instead of a silently
+            // dead button. Skipped entirely — no module is built, so
+            // no range/uniqueness checks run on dead records. Axes
+            // (ADS1115/AS5600) are unaffected — only kinds 8/9.
+            if !saw_expander {
+                errs.push(
+                    "expander_button: MCP23017/PCF8574 expander buttons are not supported yet — expander sampling is not implemented, so these buttons would never work. Remove the expander buttons from the configuration and try again."
+                        .to_string(),
+                );
+                saw_expander = true;
+            }
             continue;
         }
         match blob_record_module(record, &mut expanders) {
@@ -1752,6 +1773,66 @@ mod tests {
     }
 
     #[test]
+    fn expander_records_rejected_at_validate_blob() {
+        // Round 3 (v4.0.4): expander sampling is not implemented — a
+        // config with expander records must fail with a plain message
+        // instead of COMMIT OK + silently dead buttons. Axes (ADS1115 /
+        // AS5600) are unaffected — only kinds 8/9 are rejected.
+        for rec_type in [
+            record_type::EXPANDER_MCP23017,
+            record_type::EXPANDER_PCF8574,
+        ] {
+            let rec = ConfigRecord::new(rec_type, 0, 0xFF, 0xFF, 0xFF);
+            let errs = validate_blob(&ConfigBlob::new(1, vec![rec]));
+            assert!(
+                errs.iter().any(|e| e.contains("not supported yet")),
+                "expander type {rec_type} must be rejected, got {errs:?}"
+            );
+        }
+        // Expander + valid axis: still rejected (guard fires regardless
+        // of the other records).
+        let records = vec![
+            ConfigRecord::new(record_type::AXIS_ADC, 0, 34, 0xFF, 0xFF),
+            ConfigRecord::new(record_type::EXPANDER_MCP23017, 0, 0xFF, 0xFF, 0xFF),
+        ];
+        let errs = validate_blob(&ConfigBlob::new(1, records));
+        assert!(
+            errs.iter().any(|e| e.contains("not supported yet")),
+            "expander + axis must be rejected, got {errs:?}"
+        );
+        // Many expander records: exactly one expander error, not one
+        // per record.
+        let many: Vec<ConfigRecord> = (0..16)
+            .map(|i| {
+                ConfigRecord::new(
+                    record_type::EXPANDER_MCP23017,
+                    u8::try_from(i).unwrap_or(0),
+                    0xFF,
+                    0xFF,
+                    0xFF,
+                )
+            })
+            .collect();
+        let errs = validate_blob(&ConfigBlob::new(1, many));
+        assert_eq!(
+            errs.iter()
+                .filter(|e| e.contains("not supported yet"))
+                .count(),
+            1,
+            "one expander error per blob, got {errs:?}"
+        );
+        // I2C axes only: no expander error (FW-01 sampling is live).
+        let mut ads = ConfigRecord::new(record_type::AXIS_ADS1115, 0, 0xFF, 0xFF, 0xFF);
+        ads.params[0] = 0;
+        let as5600 = ConfigRecord::new(record_type::AXIS_AS5600, 1, 0xFF, 0xFF, 0xFF);
+        let errs = validate_blob(&ConfigBlob::new(1, vec![ads, as5600]));
+        assert!(
+            !errs.iter().any(|e| e.contains("not supported yet")),
+            "I2C axes must not trip the expander guard, got {errs:?}"
+        );
+    }
+
+    #[test]
     fn factory_blob_still_valid() {
         // Guard: the fixes must not reject the shipped factory blob.
         assert_eq!(
@@ -1776,12 +1857,16 @@ mod tests {
 
     #[test]
     fn g1_expander_gpio_pin_rejected() {
+        // Round 3 (v4.0.4): the expander guard fires first — the record
+        // is rejected as unsupported, so the G1 pin error never runs.
+        // (The ADS1115/AS5600 G1 pin errors are unaffected; only kinds
+        // 8/9 are guarded.)
         let errs = validate_blob(&blob_from_hex(&[
             "08 00 00 15 ff ff 00 00 00 00 00 00 00 00 00 00",
         ]));
         assert!(
-            errs.iter().any(|e| e.contains("I2C")),
-            "expected I2C pin error, got {errs:?}"
+            errs.iter().any(|e| e.contains("not supported yet")),
+            "expected expander unsupported error, got {errs:?}"
         );
     }
 

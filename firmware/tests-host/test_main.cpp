@@ -1587,15 +1587,17 @@ int main() {
       rsh_cfg_record(one, RSH_CFG_TYPE_LED_STRIP, 0, 0, 39, 0xFF, 0xFF, NULL);
       CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
       CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
-      // I2C kinds hon to GPIO21/22 I2C hain: LED 21 + expander reject,
-      // LED 4 + expander OK; AS5600 (I2C) + LED 21 bhi reject.
+      // I2C kinds hon to GPIO21/22 I2C hain: LED 21 + expander reject;
+      // LED 4 + expander bhi reject — Round 3 (v4.0.4): expander record
+      // khud reject hota hai (UNSUPPORTED, err 3), LED 4 theek hai.
       uint8_t two[2 * 16];
       rsh_cfg_record(two + 0, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
       rsh_cfg_record(two + 16, RSH_CFG_TYPE_EXP_MCP23017, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
       CHECK(v(two, 2) == RSH_CTRL_PIN_CONFLICT);
       CHECK(errs[0] == RSH_CFG_ERR_PIN_CONFLICT);
       rsh_cfg_record(two + 0, RSH_CFG_TYPE_LED_STRIP, 0, 0, 4, 0xFF, 0xFF, NULL);
-      CHECK(v(two, 2) == RSH_CTRL_OK);
+      CHECK(v(two, 2) == RSH_CTRL_UNSUPPORTED);
+      CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
       rsh_cfg_record(two + 0, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
       rsh_cfg_record(two + 16, RSH_CFG_TYPE_AXIS_AS5600, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
       CHECK(v(two, 2) == RSH_CTRL_PIN_CONFLICT);
@@ -1605,6 +1607,24 @@ int main() {
       CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
       rsh_cfg_record(one, RSH_CFG_TYPE_AXIS_ADS1115, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
       CHECK(v(one, 1) == RSH_CTRL_OK);
+      // Round 3 (v4.0.4): expander guard — MCP23017/PCF8574 records
+      // COMMIT par reject (UNSUPPORTED, err 3); sampling implemented
+      // nahi hai, is liye silently dead buttons kabhi accept nahi.
+      rsh_cfg_record(one, RSH_CFG_TYPE_EXP_MCP23017, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_UNSUPPORTED);
+      CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
+      rsh_cfg_record(one, RSH_CFG_TYPE_EXP_PCF8574, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_UNSUPPORTED);
+      CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
+      // Expander + valid axis: phir bhi reject (guard har record par).
+      rsh_cfg_record(two + 0, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 34, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(two + 16, RSH_CFG_TYPE_EXP_PCF8574, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
+      CHECK(v(two, 2) == RSH_CTRL_UNSUPPORTED);
+      CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
+      // I2C axes only: guard nahi lagta (FW-01 sampling live hai).
+      rsh_cfg_record(two + 0, RSH_CFG_TYPE_AXIS_ADS1115, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(two + 16, RSH_CFG_TYPE_AXIS_AS5600, 1, 0, 0xFF, 0xFF, 0xFF, NULL);
+      CHECK(v(two, 2) == RSH_CTRL_OK);
       // 2 batteries / 2 LED strips (pin wale) reject.
       rsh_cfg_record(two + 0, RSH_CFG_TYPE_BATTERY, 0, 0, 39, 0xFF, 0xFF, NULL);
       rsh_cfg_record(two + 16, RSH_CFG_TYPE_BATTERY, 1, 0, 36, 0xFF, 0xFF, NULL);
@@ -3593,15 +3613,19 @@ int main() {
     // Ghalat length (7 B) -> UNSUPPORTED.
     CHECK(rsh_fw34_handler(RSH_CMD_LED_TEST, solid, 7, reply, &reply_len, &lctx)
           == RSH_CTRL_UNSUPPORTED);
-    // LED blob getters: LED_STRIP record + expander record.
+    // LED blob getters: LED_STRIP record (pin 4) on its own.
     rsh_cfg_record(recs, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
     size_t llen = rsh_cfg_blob_build(blob, recs, 1, 1);
     CHECK(rsh_cfg_led_pin(blob, llen, &pin) == 1 && pin == 21);
     rsh_cfg_record(recs, RSH_CFG_TYPE_LED_STRIP, 0, 0, 4, 0xFF, 0xFF, NULL);
+    llen = rsh_cfg_blob_build(blob, recs, 1, 1);
+    CHECK(rsh_cfg_led_pin(blob, llen, &pin) == 1 && pin == 4);
+    // Round 3 (v4.0.4): expander record wala blob invalid hai —
+    // getters 0 dete hain (validation pehle fail hoti hai).
     rsh_cfg_record(recs + 16, RSH_CFG_TYPE_EXP_MCP23017, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
     size_t xlen = rsh_cfg_blob_build(blob, recs, 2, 1);
-    CHECK(rsh_cfg_led_pin(blob, xlen, &pin) == 1 && pin == 4);
-    CHECK(rsh_cfg_has_expanders(blob, xlen) == 1);
+    CHECK(rsh_cfg_led_pin(blob, xlen, &pin) == 0);
+    CHECK(rsh_cfg_has_expanders(blob, xlen) == 0);
   }
 
   // 25b) Phase 2 M-5 — FACTORY_RESET handler (0x08): config factory

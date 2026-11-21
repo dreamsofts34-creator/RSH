@@ -364,9 +364,12 @@ address 0x36 fixed, `flags` bit0 = multi-turn (0 = ≤ 360° direct,
 2 = 900°), max 1 per board, sampled every cycle; I2C failure or
 magnet-not-detected keeps the last value and sets the axis-invalid
 flag (never sends 0). Both produce millivolt values (0..3300 mV).
-Expander records (`EXP_MCP23017` / `EXP_PCF8574`) are still
-accepted but **not sampled** — expander-button sampling is pending
-work, not part of this round.
+Expander records (`EXP_MCP23017` / `EXP_PCF8574`) are **rejected
+at COMMIT** (firmware 4.0.4+, `UNSUPPORTED`, err 3) — expander-button
+sampling is not implemented, so accepting them would leave silently
+dead buttons. The app rejects them first with a plain message
+(`validate_blob` in `rsh-protocol`); the board rejection is the
+backstop for old apps / direct `SET_CFG`.
 
 **`nAxesMax` / `nEncMax` are wire ceilings, not implemented
 counts (R3-FW-07):** `nAxesMax` 8 / `nEncMax` 4 are the protocol's

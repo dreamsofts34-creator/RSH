@@ -27,9 +27,10 @@
 //   SHIFTER (type 11): params[0] gate mode (0 sequential, 1 H-pattern);
 //     H-pattern gear pins 1..6 = pinA/pinB/pinC + params[1..3].
 //   BUTTON_MATRIX (4): koi firmware consumer nahi — ignore.
-//   EXPANDER (8/9): sampling pending (FW-01) — sirf presence
-//     (`hasExpander`) track hoti hai (I2C bus management ke liye);
-//     expander buttons abhi sample nahi hote.
+//   EXPANDER (8/9): REJECTED at COMMIT (v4.0.4) — sampling not
+//     implemented, is liye validator in records ko refuse karta hai;
+//     `hasExpander` kisi valid blob mein kabhi 1 nahi hota (field
+//     parser ke liye rehta hai).
 //   Accel/brake BUTTON pins (25/26) blob mein NAHI hain aur PC pin map
 //   mein bhi nahi — wo pedal button-mode ke fixed pins hain, inputs.cpp
 //   unhein hamesha PIN_ACCEL_BTN/PIN_BRAKE_BTN se parhta hai.
@@ -90,7 +91,8 @@ typedef struct {
   uint8_t adsCh[5];     // ADS1115 AIN channel (0..3) per slot; 0xFF = n/a
   uint8_t as5600Rotation;  // 0=360°, 1=540°, 2=900° (RSH_CFG_AS5600_ROT_PARAM)
   uint8_t as5600Multiturn;  // flags bit0 (RSH_CFG_AS5600_MULTITURN_FLAG)
-  uint8_t hasExpander;  // koi EXP_MCP23017/PCF8574 record hai (sampling pending)
+  uint8_t hasExpander;  // koi EXP_MCP23017/PCF8574 record hai (v4.0.4:
+                          // validator reject karta hai — valid blob mein hamesha 0)
 } RshPinMap;
 
 // Compiled defaults (config.h PIN_* + naye modules) — factory blob ke
@@ -259,9 +261,10 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
       }
       case RSH_CFG_TYPE_EXP_MCP23017:
       case RSH_CFG_TYPE_EXP_PCF8574:
-        // FW-01: expander sampling pending — sirf presence track hoti
-        // hai (I2C bus management: Wire sirf tab start ho jab I2C
-        // kind maujood ho; expander buttons abhi sample nahi hote).
+        // Round 3 (v4.0.4): expander records COMMIT par reject hote
+        // hain (validator, config_transaction.h) — ye case kabhi live
+        // blob par nahi chalta; hasExpander sirf parser completeness
+        // ke liye set hota hai (I2C axes axisType se pehchane jate hain).
         m.hasExpander = 1;
         break;
       case RSH_CFG_TYPE_BATTERY:
