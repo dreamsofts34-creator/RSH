@@ -20,6 +20,7 @@
 pub mod api;
 pub mod connection;
 pub mod errors;
+pub mod restart;
 pub mod tuning;
 pub mod wifi;
 

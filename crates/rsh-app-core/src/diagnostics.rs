@@ -12,10 +12,19 @@
 //!
 //! Crash dumps: the Rust panic hook is installed here (portable,
 //! testable — it appends the panic message + location to a file).
-//! The Windows native crash dump (`MiniDumpWriteDump` on an
-//! unhandled exception) is a Windows-only design; it needs the
-//! `windows` crate `dbghelp` feature and is a Phase H / Windows-CI
-//! item, not compiled here.
+//! Native Windows crash dumps come from WER LocalDumps, not from an
+//! in-process writer: the installer writes the `LocalDumps` registry
+//! keys for `rsh-daemon.exe` / `rsh-ui.exe` (Round 3 WS-6, R3-AK-02
+//! — see `.github/workflows/release.yml`, the installer IS that
+//! workflow step), so WER writes the dump out of process after any
+//! unhandled exception, including native SEH faults the panic hook
+//! can never see. An in-process `MiniDumpWriteDump` writer is
+//! deliberately NOT built (research R-10: the filter is not always
+//! called on Windows 10, and writing from inside the crashing
+//! process is itself fragile). The export bundle lists the dumps
+//! present (names only — see [`DiagnosticsBundle::crash_dumps`]);
+//! the `.dmp` files themselves stay on disk in
+//! `%ProgramData%\RSH\dumps`.
 //!
 //! Startup log: [`append_startup_log`] appends timestamped lines to
 //! the daily-rotated `rsh-YYYYMMDD.log` in the log directory, so a
@@ -202,6 +211,21 @@ pub struct DiagnosticsBundle {
     pub log_tail: Vec<String>,
     /// Free-form notes (e.g. "exported from Settings → Diagnostics").
     pub notes: Vec<String>,
+    /// `WER` `LocalDumps` folder on Windows (`%ProgramData%\RSH\dumps`,
+    /// written by the installer — Round 3 WS-6, R3-AK-02); `None`
+    /// elsewhere. Tells the reader where the `.dmp` files live.
+    /// `#[serde(default)]` so bundles written before this field
+    /// existed still parse.
+    #[serde(default)]
+    pub crash_dump_dir: Option<String>,
+    /// Names of `*.dmp` files present in [`Self::crash_dump_dir`] at
+    /// export time, oldest first. Names only — a dump can be 100s of
+    /// MB, so the bytes never enter the bundle; collect the file
+    /// itself from the folder above.
+    /// `#[serde(default)]` so bundles written before this field
+    /// existed still parse.
+    #[serde(default)]
+    pub crash_dumps: Vec<String>,
 }
 
 /// Collect the redacted tail of the app logs in `log_dir`.
@@ -256,6 +280,14 @@ pub fn build_bundle_with_notes(
     let generated_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
+    // Round 3 WS-6 (R3-AK-02): the WER LocalDumps folder is a
+    // well-known location, not under `log_dir` — list the dumps
+    // present there (names only) so an export says whether a native
+    // crash was captured. On non-Windows both fields stay empty.
+    let crash_dump_dir = windows_crash_dump_dir();
+    let crash_dumps = crash_dump_dir
+        .as_ref()
+        .map_or_else(Vec::new, |dir| list_crash_dumps(dir));
     DiagnosticsBundle {
         app_version: app_version.to_string(),
         os: std::env::consts::OS.to_string(),
@@ -263,6 +295,8 @@ pub fn build_bundle_with_notes(
         generated_unix_secs,
         log_tail: collect_log_tail(log_dir, DEFAULT_LOG_TAIL_LINES),
         notes: notes.iter().map(|note| redact_secrets(note)).collect(),
+        crash_dump_dir: crash_dump_dir.map(|dir| dir.to_string_lossy().into_owned()),
+        crash_dumps,
     }
 }
 
@@ -290,6 +324,102 @@ pub fn export_diagnostics(
         .map_err(|error| DiagnosticsError::Io(error.to_string()))?;
     fs::write(out_path, json).map_err(|error| DiagnosticsError::Io(error.to_string()))?;
     Ok(out_path.to_path_buf())
+}
+
+/// Freshness window (seconds) for a fatal `daemon-status.json`
+/// (Round 3 WS-6, R3-AK-01 — the F3 latch). The UI's
+/// `live_probe::FATAL_FRESHNESS` is a separate constant with the
+/// same value (the UI does not depend on `rsh-app-core`) — keep the
+/// two in sync; the daemon-side reader below and the UI-side
+/// `read_daemon_status_fresh` implement the same rule.
+pub const FATAL_STATUS_FRESHNESS_SECS: u64 = 600;
+
+/// Read `<data_dir>/daemon-status.json` and return `(code, detail)`
+/// only when `status == "fatal"` **and** the file is fresh — the
+/// daemon's `at_unix` (or the file mtime when it is missing) no
+/// older than [`FATAL_STATUS_FRESHNESS_SECS`].
+///
+/// This is the daemon-side half of the F3 latch
+/// (`rsh-ui/src/live_probe.rs::read_daemon_status_fresh`, same rule —
+/// keep the two in sync): a Task-Scheduler respawn
+/// (`--scheduled-respawn`) must not resurrect a fatally-broken
+/// daemon (`IpcBindFailed` / `DaemonHung`) in a loop, so a fresh
+/// fatal file makes the respawn exit 0 instead of retrying the bind.
+/// A stale fatal file means the daemon died long ago and the fatal
+/// condition may have cleared, so a launch is allowed. A file with
+/// no usable timestamp counts as fresh — fail-safe, never launch
+/// into a known-fatal loop on a guess. Any other shape (missing
+/// file, healthy status, unparseable bytes) is `None`.
+#[must_use]
+pub fn fresh_fatal_daemon_status(data_dir: &Path) -> Option<(String, String)> {
+    let path = data_dir.join("daemon-status.json");
+    let text = fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if value.get("status").and_then(serde_json::Value::as_str) != Some("fatal") {
+        return None;
+    }
+    let code = value
+        .get("code")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let detail = value
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let fresh = match value.get("at_unix").and_then(serde_json::Value::as_u64) {
+        Some(0) | None => fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map_or(true, |mtime| {
+                mtime.elapsed().map_or(true, |age| {
+                    age <= Duration::from_secs(FATAL_STATUS_FRESHNESS_SECS)
+                })
+            }),
+        Some(at_unix) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            now.saturating_sub(at_unix) <= FATAL_STATUS_FRESHNESS_SECS
+        }
+    };
+    if fresh { Some((code, detail)) } else { None }
+}
+
+/// `WER` `LocalDumps` folder (Round 3 WS-6, R3-AK-02): the installer
+/// writes `HKLM\...\LocalDumps\rsh-daemon.exe` /
+/// `rsh-ui.exe` with `DumpFolder = %ProgramData%\RSH\dumps`, so this
+/// is where native crash dumps land. `None` on non-Windows (no WER,
+/// no dumps).
+#[must_use]
+pub fn windows_crash_dump_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("ProgramData").map(|dir| PathBuf::from(dir).join("RSH").join("dumps"))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Names of `*.dmp` files in `dumps_dir`, sorted by file name
+/// (WER names dumps `<exe>.<pid>.dmp`, so name order is roughly
+/// time order within one exe). Names only: the bytes stay on disk
+/// and never enter the diagnostics bundle. A missing/unreadable
+/// directory yields an empty list, not an error.
+#[must_use]
+pub fn list_crash_dumps(dumps_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(dumps_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.to_lowercase().ends_with(".dmp") {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    names
 }
 
 /// File the panic hook appends Rust panic reports to.
@@ -865,6 +995,136 @@ mod tests {
             "1.0.0",
         );
         assert!(matches!(result, Err(DiagnosticsError::Io(_))));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Round 3 WS-6 (R3-AK-01): the daemon-side F3 latch — mirrors
+    // `live_probe::read_daemon_status_fresh`, same rule.
+    fn write_status(dir: &Path, json: &str) {
+        fs::write(dir.join("daemon-status.json"), json).expect("write status");
+    }
+
+    fn now_unix() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+
+    #[test]
+    fn fresh_fatal_status_returns_code_and_detail() {
+        let dir = temp_dir("fatal-fresh");
+        write_status(
+            &dir,
+            &format!(
+                r#"{{"status":"fatal","code":"IpcBindFailed","detail":"daemon IPC bind failed after 5 attempts","pid":123,"at_unix":{}}}"#,
+                now_unix()
+            ),
+        );
+        let found = fresh_fatal_daemon_status(&dir).expect("fresh fatal");
+        assert_eq!(found.0, "IpcBindFailed");
+        assert!(found.1.contains("bind failed"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_fatal_status_is_not_fresh() {
+        let dir = temp_dir("fatal-stale");
+        write_status(
+            &dir,
+            &format!(
+                r#"{{"status":"fatal","code":"DaemonHung","detail":"hung","pid":123,"at_unix":{}}}"#,
+                now_unix() - FATAL_STATUS_FRESHNESS_SECS - 60
+            ),
+        );
+        assert_eq!(fresh_fatal_daemon_status(&dir), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nonfatal_and_unparseable_status_are_none() {
+        let dir = temp_dir("fatal-shapes");
+        write_status(
+            &dir,
+            &format!(
+                r#"{{"status":"running","code":"ok","detail":"","pid":1,"at_unix":{}}}"#,
+                now_unix()
+            ),
+        );
+        assert_eq!(fresh_fatal_daemon_status(&dir), None);
+        write_status(&dir, "not json at all");
+        assert_eq!(fresh_fatal_daemon_status(&dir), None);
+        // Missing file is None too.
+        let _ = fs::remove_file(dir.join("daemon-status.json"));
+        assert_eq!(fresh_fatal_daemon_status(&dir), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fatal_status_without_timestamp_counts_as_fresh() {
+        // Fail-safe: no `at_unix` → fall back to the file mtime,
+        // which is now → fresh.
+        let dir = temp_dir("fatal-no-ts");
+        write_status(
+            &dir,
+            r#"{"status":"fatal","code":"DaemonHung","detail":"hung","pid":1}"#,
+        );
+        assert_eq!(
+            fresh_fatal_daemon_status(&dir).map(|(code, _)| code),
+            Some("DaemonHung".to_string())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Round 3 WS-6 (R3-AK-02): crash-dump listing for the export.
+    #[test]
+    fn list_crash_dumps_names_only_dmp_files() {
+        let dir = temp_dir("dumps");
+        for name in [
+            "rsh-daemon.1234.dmp",
+            "rsh-ui.5678.DMP",
+            "rsh-daemon.1234.log",
+            "notes.txt",
+        ] {
+            fs::write(dir.join(name), b"x").expect("write file");
+        }
+        assert_eq!(
+            list_crash_dumps(&dir),
+            vec![
+                "rsh-daemon.1234.dmp".to_string(),
+                "rsh-ui.5678.DMP".to_string(),
+            ]
+        );
+        assert_eq!(
+            list_crash_dumps(Path::new("/definitely/not/here")),
+            Vec::<String>::new()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bundle_crash_dump_fields_are_empty_off_windows() {
+        let dir = temp_dir("bundle-dumps");
+        let bundle = build_bundle(&dir, "2.0.6");
+        #[cfg(not(windows))]
+        {
+            assert_eq!(bundle.crash_dump_dir, None);
+            assert_eq!(bundle.crash_dumps, [] as [String; 0]);
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                bundle.crash_dump_dir.as_deref(),
+                windows_crash_dump_dir()
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .as_deref()
+            );
+        }
+        // Old bundles (without the fields) still parse.
+        let old = r#"{"appVersion":"1.0.0","os":"windows","arch":"x86_64","generatedUnixSecs":0,"logTail":[],"notes":[]}"#;
+        let parsed: DiagnosticsBundle = serde_json::from_str(old).expect("old bundle parses");
+        assert_eq!(parsed.crash_dump_dir, None);
+        assert_eq!(parsed.crash_dumps, [] as [String; 0]);
         let _ = fs::remove_dir_all(&dir);
     }
 

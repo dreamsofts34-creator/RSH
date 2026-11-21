@@ -6,6 +6,46 @@ Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
 
+## [Unreleased] — Round 3 deep scan (in progress, not released)
+
+**Anti-kill / anti-crash (WS-6, R3-AK-01–04).** Desktop Windows does
+not kill Win32 apps for resource pressure — the real gaps were
+respawn, crash forensics, tray survival, and OS restart
+registration (see `deep-scan/ANTI-KILL-RESEARCH.md`).
+
+- **Task Scheduler supervisor (R3-AK-01).** The installer creates a
+  "RSH Daemon" scheduled task (logon trigger + restart on failure:
+  every 1 min, up to 3 attempts) that relaunches the daemon when it
+  dies while the UI is closed. The UI respawn stays the primary path
+  while the UI is open. A `--scheduled-respawn` launch exits 0 while
+  a fresh fatal `daemon-status.json` exists (`IpcBindFailed` /
+  `DaemonHung`, 600 s latch), so a fatally-broken daemon is never
+  respawned in a loop. Removed on uninstall. The daemon never
+  creates its own task at runtime.
+- **WER LocalDumps (R3-AK-02).** The installer registers
+  `HKLM\...\Windows Error Reporting\LocalDumps\rsh-daemon.exe` and
+  `rsh-ui.exe` (mini dumps, DumpCount 5) to `%ProgramData%\RSH\dumps`,
+  so a native SEH crash leaves a dump the Rust panic hook could never
+  produce. Removed on uninstall (dumps kept). The diagnostics export
+  now lists the dumps present (names only).
+- **Tray survives Explorer restarts (R3-AK-03, verified, no code).**
+  Slint 1.18.1's own tray backend already handles `TaskbarCreated`
+  and re-adds the icon — verified against the vendored
+  `i-slint-core-1.18.1` sources, nothing to build.
+- **Application Restart (R3-AK-04).** Daemon and UI register
+  `RegisterApplicationRestart(..., RESTART_NO_PATCH |
+  RESTART_NO_REBOOT)` + a recovery callback. Honest limit: NOT a
+  silent auto-restart — WER needs ≥ 60 s uptime and the user's
+  consent on crash/hang; a rapid re-crash skips re-registration.
+
+Rejected (verified, not built): whole-process HIGH/REALTIME
+priority, min working set / `VirtualLock`, job objects, protected /
+critical process, DACL-deny-terminate, watcher-process exe, Windows
+Service, Game Mode registry hacks, in-process minidump, MMCSS,
+memory priority above NORMAL. `BackgroundGuard` untouched (user
+order). Windows install/runtime proof still pending (no Windows
+machine in this environment — CI smoke test + human gate).
+
 ## [2.0.6] — 2026-11-20 (in progress, not released)
 
 **Pairing abolished — connect-play instead (feature, not a bugfix).**

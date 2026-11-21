@@ -508,6 +508,9 @@ struct Args {
     /// Verbose: log live events to stderr (DS-79). Off by default —
     /// the UI thread never does an `eprintln!` per event.
     verbose: bool,
+    /// Relaunched by WER after a crash (Round 3 WS-6, R3-AK-04):
+    /// the restart registration's crash-loop guard reads this.
+    wer_restart: bool,
 }
 
 fn parse_args() -> Args {
@@ -518,6 +521,7 @@ fn parse_args() -> Args {
         setup: false,
         data_dir: None,
         verbose: false,
+        wer_restart: false,
     };
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -556,6 +560,7 @@ fn parse_args() -> Args {
             }
             "--static" => a.static_mode = true,
             "--verbose" => a.verbose = true,
+            "--wer-restart" => a.wer_restart = true,
             other => eprintln!("RSH-UI unknown arg: {other}"),
         }
         i += 1;
@@ -9830,6 +9835,25 @@ fn main() -> Result<(), slint::PlatformError> {
     };
     // A stale quit file (crashed session) must not quit this launch.
     let _ = ui_lifecycle::take_quit_request(data_dir.as_ref());
+
+    // Round 3 WS-6 (R3-AK-04): register for Windows Application
+    // Restart (+ recovery callback) — the OS's own crash/hang
+    // recovery path. This covers the case the daemon-side respawn
+    // cannot: the UI itself crashing while the daemon is alive.
+    // Best-effort: a failed registration is logged and never fails
+    // the launch (no-op off Windows). Honest limit: NOT a silent
+    // auto-restart — WER needs >= 60 s uptime and the user's consent
+    // on crash/hang. Registered only for the first instance: a
+    // second instance forwards its page and exits, so it must not
+    // overwrite the first instance's restart command line.
+    if let Some(dir) = data_dir.as_deref() {
+        match rsh_api::restart::register_application_restart(dir, args.wer_restart) {
+            Ok(outcome) => ui_log!("application restart registration: {outcome:?}"),
+            Err(error) => ui_log!(
+                "WARNING application restart registration failed ({error}) — continuing without WER restart"
+            ),
+        }
+    }
 
     // Data source at startup (B4): the sim fallback, frozen — the
     // window shows first with a "Connecting…" state, and the health
