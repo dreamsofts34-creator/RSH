@@ -48,6 +48,11 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// R3-D-12: `SIDECAR_PATH_ENV` is only read inside
+/// `#[cfg(debug_assertions)]` (`resolve_sidecar_path`) — the
+/// unconditional import warned as unused in release builds.
+#[cfg(debug_assertions)]
+use crate::SIDECAR_PATH_ENV;
 #[cfg(windows)]
 use crate::SIDECAR_TOKEN_ENV;
 use crate::error::HidMaestroError;
@@ -59,7 +64,7 @@ use crate::protocol::{
 use crate::transport::{LiveTransport, TransportEvent, spawn_stdio};
 #[cfg(windows)]
 use crate::transport::{accept_loopback, generate_token, listen_loopback};
-use crate::{PROFILE_ID, SIDECAR_EXE_NAME, SIDECAR_PATH_ENV};
+use crate::{PROFILE_ID, SIDECAR_EXE_NAME};
 
 /// How long to wait for the sidecar's `hello` line after spawn.
 ///

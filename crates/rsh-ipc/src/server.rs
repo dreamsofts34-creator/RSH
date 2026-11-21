@@ -14,7 +14,12 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::path::Path;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+/// R3-08: `.lines()` survives only in the tests below (fake peers)
+/// — the production reader uses `read_bounded_line` — so this
+/// import is test-only.
+#[cfg(test)]
+use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 
 use rsh_api::{AppApi, AppEvent};
@@ -50,7 +55,7 @@ impl IpcServer {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (reader, mut writer) = tokio::io::split(stream);
-        let mut lines = BufReader::new(reader).lines();
+        let mut lines = BufReader::new(reader);
         let mut subscribed = false;
         let mut event_rx = self.events.subscribe();
         // B-1 (v2.0.2): responses from blocking handlers travel on
@@ -70,9 +75,14 @@ impl IpcServer {
         let dispatch_permits = Arc::new(tokio::sync::Semaphore::new(8));
         loop {
             tokio::select! {
-                line = lines.next_line() => {
+                // R3-08: bounded line read — a newline-free peer
+                // used to grow the reader's buffer without bound.
+                // An over-long line (or read error / EOF) ends the
+                // connection; the drop is logged in
+                // `read_bounded_line`.
+                line = crate::read_bounded_line(&mut lines) => {
                     let Ok(Some(line)) = line else {
-                        break; // client closed / read error
+                        break; // client closed / read error / over-long line
                     };
                     if line.trim().is_empty() {
                         continue;
@@ -239,6 +249,15 @@ impl IpcServer {
             }
         };
         crate::record_ipc_latency(&method, started.elapsed());
+        // R3-D-13: action → visible-result latency — a mutating
+        // dispatch arms the pending-action timestamp; the first
+        // later `poll` / `slow_poll` consumes it into a sample
+        // (the poll that shows the action's result).
+        if is_action_method(&method) {
+            crate::record_action_completed();
+        } else if method == "poll" || method == "slow_poll" {
+            crate::record_poll_observed();
+        }
         out
     }
 
@@ -331,6 +350,36 @@ fn is_cheap_method(method: &str) -> bool {
     matches!(
         method,
         "ping" | "version" | "poll" | "snapshot" | "connection"
+    )
+}
+
+/// Mutating methods (R3-D-13): a dispatch of one of these changes
+/// visible state, so its completion arms the action → visible-result
+/// latency sample (consumed by the next `poll` / `slow_poll`). Reads
+/// and fire-and-forget progress queries are not actions.
+fn is_action_method(method: &str) -> bool {
+    matches!(
+        method,
+        "connect"
+            | "disconnect"
+            | "set_output_enabled"
+            | "set_output_backend"
+            | "set_tuning"
+            | "save_draft"
+            | "activate_profile"
+            | "launch_game"
+            | "stop_game"
+            | "add_game"
+            | "update_game"
+            | "remove_game"
+            | "set_wifi_password"
+            | "clear_wifi_password"
+            | "set_knob_action"
+            | "install_vjoy"
+            | "backup_now"
+            | "start_learn"
+            | "cancel_learn"
+            | "take_learned_button"
     )
 }
 
@@ -610,6 +659,8 @@ mod tests {
                 ipc_p50_ms: None,
                 ipc_p99_ms: None,
                 ipc_per_method_ms: Vec::new(),
+                action_p50_ms: None,
+                action_p99_ms: None,
             })
         }
 

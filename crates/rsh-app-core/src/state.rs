@@ -418,6 +418,60 @@ struct VjoyDllCache {
 /// that a hand-installed driver shows up without a restart.
 const VJOY_DLL_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// Cached Wi-Fi password-set flag (R3-D-08): [`AppStateCore::wifi_status`]
+/// did one Credential Manager read per call, and the daemon's slow
+/// poll calls it ~1 Hz forever. The flag only changes when the
+/// password is set or cleared, so it is cached like the vJoy probe
+/// above (same 60 s TTL) and invalidated on set/clear.
+#[derive(Default)]
+struct WifiPasswordCache {
+    /// When the cached probe ran ([`None`] = never probed, or
+    /// invalidated — the next read re-probes immediately).
+    probed_at: Option<Instant>,
+    /// The board MAC the cached flag belongs to (a different board
+    /// re-probes — one board's flag must never answer for another).
+    board_mac: Option<String>,
+    /// The cached probe result: a Wi-Fi password is stored for
+    /// this board.
+    password_set: bool,
+}
+
+impl WifiPasswordCache {
+    /// The cached flag for `mac`, or [`None`] when the cache is
+    /// stale for it (never probed, invalidated, a different board,
+    /// or the TTL passed). The caller re-probes on [`None`] and
+    /// stores the result with [`Self::store`].
+    fn get(&self, mac: &str, now: Instant) -> Option<bool> {
+        let probed_at = self.probed_at?;
+        if self.board_mac.as_deref() != Some(mac) {
+            return None;
+        }
+        if now.duration_since(probed_at) >= WIFI_PASSWORD_CACHE_TTL {
+            return None;
+        }
+        Some(self.password_set)
+    }
+
+    /// Store a fresh probe result for `mac`.
+    fn store(&mut self, mac: &str, password_set: bool, now: Instant) {
+        self.probed_at = Some(now);
+        self.board_mac = Some(mac.to_string());
+        self.password_set = password_set;
+    }
+
+    /// Drop the cached flag (password set / cleared — the next
+    /// read re-probes immediately).
+    fn invalidate(&mut self) {
+        self.probed_at = None;
+    }
+}
+
+/// Time after which the cached Wi-Fi password-set flag is re-read
+/// (R3-D-08): same 60 s as the vJoy probe — a password set by hand
+/// in the credential store while the daemon runs still shows up
+/// within a minute, without a restart.
+const WIFI_PASSWORD_CACHE_TTL: Duration = Duration::from_secs(60);
+
 /// vJoy installer download (v2.0.1 hotfix BACKEND-2).
 ///
 /// Verification status (checked 2026-11-16): the pinned driver is
@@ -897,6 +951,11 @@ pub struct AppStateCore {
     /// `installing` / `install_error` are NOT cached — they are
     /// cheap lock reads and must stay live.
     vjoy_dll_cache: Mutex<VjoyDllCache>,
+    /// Cached Wi-Fi password-set flag (R3-D-08, see
+    /// [`WifiPasswordCache`]): the Credential Manager read behind
+    /// `wifi_status()` is cached the same way, so the ~1 Hz slow
+    /// poll does not hit the store every cycle.
+    wifi_password_cache: Mutex<WifiPasswordCache>,
     /// HMAC session gate (SEC-E-14, H1 condition 13): `true` only
     /// once a `BoardSession` has completed its HMAC-verified
     /// `GET_CAPS` and the session owner opened the gate. Starts
@@ -1167,6 +1226,7 @@ impl AppStateCore {
             backend_migration_note: Mutex::new(backend_migration_note),
             vjoy_install: Mutex::new(VjoyInstallState::default()),
             vjoy_dll_cache: Mutex::new(VjoyDllCache::default()),
+            wifi_password_cache: Mutex::new(WifiPasswordCache::default()),
             session_gate_open: Mutex::new(false),
             session_gate_held_frames: Mutex::new(0),
             session_activation: Mutex::new(None),
@@ -1627,20 +1687,40 @@ impl AppStateCore {
     /// from the last observed `HELLO` (`RSH-XXXX`, D4), whether
     /// the board is connected (live session), and whether a Wi-Fi
     /// password is stored for this board. Never carries a password.
+    ///
+    /// R3-D-08: the `password_set` Credential Manager read is
+    /// cached (60 s TTL, per board — see [`WifiPasswordCache`]),
+    /// so the daemon's ~1 Hz slow poll does not hit the store
+    /// every cycle. Set / clear invalidates it (see
+    /// [`Self::invalidate_wifi_password_cache`]).
     #[must_use]
     pub fn wifi_status(&self) -> rsh_api::WifiStatus {
         use rsh_api::ssid_for_board_mac;
         let board_mac = self.last_observed_board_mac();
         let ssid = board_mac.as_deref().and_then(ssid_for_board_mac);
-        let password_set = board_mac
-            .as_deref()
-            .is_some_and(|mac| KeyStore::new().get_wifi_password(mac).is_ok());
+        let password_set = board_mac.as_deref().is_some_and(|mac| {
+            let now = Instant::now();
+            if let Some(cached) = lock(&self.wifi_password_cache).get(mac, now) {
+                return cached;
+            }
+            let probed = KeyStore::new().get_wifi_password(mac).is_ok();
+            lock(&self.wifi_password_cache).store(mac, probed, now);
+            probed
+        });
         rsh_api::WifiStatus {
             ssid,
             connected: self.session_gate_open(),
             password_set,
             board_mac,
         }
+    }
+
+    /// Drop the cached Wi-Fi password-set flag (R3-D-08): the
+    /// password was set or cleared, so the next `wifi_status()`
+    /// re-probes the credential store instead of serving the stale
+    /// flag for up to 60 s.
+    fn invalidate_wifi_password_cache(&self) {
+        lock(&self.wifi_password_cache).invalidate();
     }
 
     /// Clears the live session records: the activation (caps /
@@ -1987,6 +2067,9 @@ impl AppStateCore {
         if result.is_ok() {
             self.close_session_gate();
             self.clear_session_records();
+            // R3-D-08: the stored password changed — the cached
+            // `password_set` flag must not serve the old value.
+            self.invalidate_wifi_password_cache();
         }
         result
     }
@@ -3805,6 +3888,10 @@ impl AppStateCore {
             ipc_p50_ms: None,
             ipc_p99_ms: None,
             ipc_per_method_ms: Vec::new(),
+            // R3-D-13: same — the action→poll latency is measured
+            // by the IPC server, filled in by the daemon.
+            action_p50_ms: None,
+            action_p99_ms: None,
         }
     }
 
@@ -4906,6 +4993,9 @@ impl AppStateCore {
                 &format!("wifi password forgotten for board {board_id}"),
             );
         }
+        // R3-D-08: the stored password is gone — the cached
+        // `password_set` flag must not keep reporting it as set.
+        self.invalidate_wifi_password_cache();
         self.close_session_gate();
         self.clear_session_records();
         Ok(())
@@ -5659,6 +5749,19 @@ impl AppStateCore {
             .into_iter()
             .find(|game| game.id == id)
             .ok_or_else(|| format!("unknown game '{id}'"))
+    }
+
+    /// True when the launcher currently tracks a running game
+    /// (R3-D-11: the daemon's background-resilience guard escalates
+    /// while a game runs, not only while the wheel is Active).
+    /// Cheap lock read only — no `refresh()`, so a game that just
+    /// exited on its own still reads as running until the next
+    /// slow-poll refresh clears the record (~1 s late at most, and
+    /// escalating a little long is harmless; relaxing late is not
+    /// a correctness issue for the guard).
+    #[must_use]
+    pub fn is_game_running(&self) -> bool {
+        lock(&self.launcher).running().is_some()
     }
 
     /// Launches a game (exactly one at a time; the launcher tracks the
@@ -7592,8 +7695,23 @@ where
     // set — the board rejects the change otherwise (BadPassword). The
     // stored Wi-Fi password IS the current one (one credential); no
     // password stored yet means first setup (current = none).
+    //
+    // R3-D-10: only `NotFound` means "no password stored yet". Any
+    // other keystore error (a dead credential store) must fail HERE,
+    // before the board is called — the old `.ok()` turned it into
+    // `current = None`, the board answered `BadPassword`, and the
+    // user was told to hold BOOT for 10 s for a fault that was in
+    // the local store, not on the board.
     let board_id = session.board_id().to_string();
-    let current = session.keystore().get_wifi_password(&board_id).ok();
+    let current = match session.keystore().get_wifi_password(&board_id) {
+        Ok(password) => Some(password),
+        Err(KeystoreError::NotFound) => None,
+        Err(error) => {
+            return Err(format!(
+                "could not read the stored Wi-Fi password ({error}) — the board password was not changed; check the credential store and retry"
+            ));
+        }
+    };
     {
         let Some(client) = session.control_client_mut() else {
             return Err("session has no control client — the session did not activate".to_string());
@@ -11737,13 +11855,25 @@ mod tests {
     #[derive(Clone)]
     struct ActKeyStore {
         entries: Arc<Mutex<ActStoreEntries>>,
+        /// R3-D-10: when set, `get_wifi_password` fails with
+        /// `PlatformUnavailable` (a dead credential store) instead
+        /// of reading — the `NotFound` path stays untouched.
+        fail_get: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl ActKeyStore {
         fn new() -> Self {
             Self {
                 entries: Arc::new(Mutex::new(HashMap::new())),
+                fail_get: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
+        }
+
+        /// Make the next `get_wifi_password` fail as if the platform
+        /// credential store were unavailable (R3-D-10).
+        fn set_fail_get(&self, fail: bool) {
+            self.fail_get
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// The stored Wi-Fi password for `board_id`, if one was stored
@@ -11766,6 +11896,9 @@ mod tests {
         }
 
         fn get_wifi_password(&self, board_id: &str) -> Result<String, KeystoreError> {
+            if self.fail_get.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(KeystoreError::PlatformUnavailable);
+            }
             let account = format!("board:{}:wifi", board_id.trim().to_ascii_uppercase());
             self.entries
                 .lock()
@@ -12793,6 +12926,59 @@ mod tests {
         assert!(
             state.session_last_error().is_none(),
             "control failure must not touch the session error"
+        );
+    }
+
+    /// R3-D-10: a dead credential store must fail BEFORE the board
+    /// is called — never as a misleading `BadPassword` + "hold
+    /// BOOT 10 s". `NotFound` (first setup) still proceeds with
+    /// `current = None`; only other keystore errors fail here.
+    #[test]
+    fn control_session_set_password_fails_closed_on_keystore_error() {
+        let (state, _dir) = test_state();
+        let board = Arc::new(Mutex::new(FakeBoardConfig::new()));
+        let (store, transport) = paired_transport(&board);
+        store.set_fail_get(true);
+        let sent_log = transport.sent_log();
+        let error = drive_control(&state, transport, store, |session| {
+            Box::pin(op_set_password(session, "new-password-123".to_string()))
+        })
+        .expect_err("a dead keystore must fail");
+        assert!(
+            error.contains("could not read the stored Wi-Fi password"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("BOOT"),
+            "must not blame the board / suggest the BOOT hold: {error}"
+        );
+        // Only GET_CAPS went out — no SET_PASSWORD reached the board.
+        assert_eq!(
+            sent_log.lock().expect("sent log lock").len(),
+            1,
+            "only GET_CAPS sent"
+        );
+    }
+
+    /// R3-D-08: the password-set cache serves the stored flag
+    /// within its TTL, re-probes for another board or after
+    /// invalidation, and never answers one board's flag for another.
+    #[test]
+    fn wifi_password_cache_serves_within_ttl_and_reprobes() {
+        let mut cache = WifiPasswordCache::default();
+        let now = Instant::now();
+        assert_eq!(cache.get("AA:BB", now), None, "never probed");
+        cache.store("AA:BB", true, now);
+        assert_eq!(cache.get("AA:BB", now), Some(true));
+        assert_eq!(cache.get("CC:DD", now), None, "another board must re-probe");
+        cache.invalidate();
+        assert_eq!(cache.get("AA:BB", now), None, "invalidated");
+        cache.store("AA:BB", false, now);
+        assert_eq!(cache.get("AA:BB", now), Some(false));
+        assert_eq!(
+            cache.get("AA:BB", now + WIFI_PASSWORD_CACHE_TTL),
+            None,
+            "TTL expiry re-probes"
         );
     }
 

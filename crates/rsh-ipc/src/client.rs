@@ -16,7 +16,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+/// R3-08: `.lines()` survives only in the tests below (fake peers)
+/// — the production reader uses `read_bounded_line` — so this
+/// import is test-only.
+#[cfg(test)]
+use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
 
 use rsh_api::AppEvent;
@@ -74,14 +79,19 @@ impl IpcClient {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (reader, writer) = tokio::io::split(stream);
-        let (event_tx, event_rx) = mpsc::channel(64);
+        // R3-07: the event channel matches the daemon-side
+        // broadcast (256) — a burst of events between UI frame
+        // drains must not stall IPC responses.
+        let (event_tx, event_rx) = mpsc::channel(256);
         let (resp_tx, resp_rx) = mpsc::channel::<IpcResponse>(64);
         // Reader task: demuxes response frames from event pushes.
         // Responses carry `id`; event frames carry `event`.
         let reader_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(reader).lines();
+            let mut lines = BufReader::new(reader);
             loop {
-                let Ok(Some(line)) = lines.next_line().await else {
+                // R3-08: bounded line read — a newline-free peer
+                // used to grow the reader's buffer without bound.
+                let Ok(Some(line)) = crate::read_bounded_line(&mut lines).await else {
                     break;
                 };
                 if line.trim().is_empty() {
@@ -103,9 +113,20 @@ impl IpcClient {
                 if is_event {
                     if let Ok(frame) = serde_json::from_str::<crate::IpcEventFrame>(&line)
                         && frame.v == IPC_PROTOCOL_VERSION
-                        && event_tx.send(frame.event).await.is_err()
                     {
-                        break;
+                        // R3-07: `try_send`, never `send().await` —
+                        // awaiting here parked the reader (and with
+                        // it every in-flight response) whenever the
+                        // event channel filled between UI drains.
+                        // Events are loss-tolerant (the UI re-reads
+                        // state on its next poll), so a full channel
+                        // drops the NEWEST event; a closed channel
+                        // means the client is gone, so the task ends.
+                        if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
+                            event_tx.try_send(frame.event)
+                        {
+                            break;
+                        }
                     }
                 } else if let Ok(resp) = serde_json::from_str::<IpcResponse>(&line)
                     && resp_tx.send(resp).await.is_err()
@@ -432,6 +453,74 @@ mod tests {
                 Some(&serde_json::Value::String(
                     "1.0.2 \"event\" inside a string".to_string()
                 )),
+                "result: {result}"
+            );
+        });
+    }
+
+    /// R3-07: a burst of events far larger than the event channel
+    /// must not head-of-line-block IPC responses. The old reader
+    /// awaited the event send, so >64 queued events parked it and
+    /// every in-flight call timed out at 500 ms. The reader now
+    /// `try_send`s (dropping the newest event when full), so a call
+    /// issued after the burst still gets its response in time.
+    #[test]
+    #[cfg(unix)]
+    fn event_burst_does_not_block_responses() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let (client_side, server_side) = tokio::io::duplex(1 << 20);
+            let client = IpcClient::from_stream(client_side);
+            tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(server_side);
+                let mut lines = BufReader::new(reader).lines();
+                // Flood 600 events (2x the 256-slot channel) before
+                // ever reading the request — the client drains
+                // nothing during this window.
+                for _ in 0..600 {
+                    let frame = serde_json::json!({
+                        "v": IPC_PROTOCOL_VERSION,
+                        "event": {"Notification": {"kind": "Test", "title": "t", "body": "b"}},
+                    });
+                    let text = serde_json::to_string(&frame).expect("encode");
+                    let _ = writer.write_all(text.as_bytes()).await;
+                    let _ = writer.write_all(b"\n").await;
+                }
+                let _ = writer.flush().await;
+                if let Ok(Some(line)) = lines.next_line().await {
+                    let id = serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|value| value.get("id").and_then(serde_json::Value::as_u64))
+                        .unwrap_or(0);
+                    let response = serde_json::json!({
+                        "v": IPC_PROTOCOL_VERSION,
+                        "id": id,
+                        "ok": true,
+                        "result": { "pong": true },
+                        "error": null,
+                    });
+                    let text = serde_json::to_string(&response).expect("encode");
+                    let _ = writer.write_all(text.as_bytes()).await;
+                    let _ = writer.write_all(b"\n").await;
+                    let _ = writer.flush().await;
+                }
+            });
+            let start = Instant::now();
+            let result = client
+                .call("ping", serde_json::json!({}))
+                .await
+                .expect("the response must arrive despite the event burst");
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "response must not time out behind the burst, took {:?}",
+                start.elapsed()
+            );
+            assert_eq!(
+                result.get("pong"),
+                Some(&serde_json::Value::Bool(true)),
                 "result: {result}"
             );
         });

@@ -116,6 +116,7 @@ pub fn build_profile_xml(ssid: &str, password: &str) -> String {
 #[must_use]
 pub fn windows_steps() -> Vec<&'static str> {
     vec![
+        "Open AP only (R3-FW-13): delete any stale profile for the SSID before importing the open profile, so a leftover WPA2 profile cannot block the join",
         "Write the WPA2-PSK profile XML to a unique %TEMP%\\rsh-wifi-profile-<pid>-<nanos>.xml (deleted on every exit path)",
         "netsh wlan add profile filename=\"<unique-temp-path>\" user=current (30 s timeout)",
         "netsh wlan connect name=RSH-XXXX (30 s timeout, SSID from the observed board MAC)",
@@ -214,6 +215,34 @@ pub fn rejoin_wifi(ssid: &str, password: &str) -> Result<(), RejoinError> {
         let _ = (ssid, password);
         Err(RejoinError::unsupported(manual_instructions(ssid)))
     }
+}
+
+/// Parse `netsh wlan show interfaces` output into the connection
+/// state (R3-D-09): `(connected, ssid)`. Lines look like
+/// `State                  : connected` and
+/// `SSID                   : RSH-9A55`. Pure + tested — the
+/// Windows confirm step below only runs the command and hands its
+/// stdout here.
+#[must_use]
+pub fn parse_interface_state(output: &str) -> (bool, Option<String>) {
+    let mut connected = false;
+    let mut ssid: Option<String> = None;
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "State" => connected = value.trim().eq_ignore_ascii_case("connected"),
+            "SSID" => {
+                let name = value.trim().to_string();
+                if !name.is_empty() {
+                    ssid = Some(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    (connected, ssid)
 }
 
 /// Parse `netsh wlan show networks` output into the visible
@@ -407,26 +436,102 @@ fn run_command_timeout(
     })
 }
 
+/// Confirm the PC actually joined `ssid` (R3-D-09): `netsh wlan
+/// connect` only means the request was accepted — association
+/// takes seconds and can fail after exit 0. Polls `netsh wlan
+/// show interfaces` (5 s per call) for up to ~15 s until the
+/// interface reports connected to this SSID.
+///
+/// # Errors
+///
+/// [`RejoinError::StepFailed`] (`"confirm-connected"`) when the
+/// interface never reports connected to `ssid` in the window.
+#[cfg(target_os = "windows")]
+fn confirm_connected_to(ssid: &str) -> Result<(), RejoinError> {
+    // 15 × 1 s: association on a local AP normally lands in 1–3 s;
+    // 15 s bounds a slow stack without stalling the caller
+    // (the whole rejoin already runs off the manager loop).
+    const CONFIRM_ATTEMPTS: u32 = 15;
+    const CONFIRM_INTERVAL: Duration = Duration::from_secs(1);
+    for _ in 0..CONFIRM_ATTEMPTS {
+        let mut cmd = std::process::Command::new("netsh");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        cmd.args(["wlan", "show", "interfaces"]);
+        if let Ok(output) =
+            run_command_timeout(&mut cmd, Duration::from_secs(5), "confirm-connected")
+            && output.status.success()
+        {
+            let (connected, current) =
+                parse_interface_state(&String::from_utf8_lossy(&output.stdout));
+            if connected && current.as_deref() == Some(ssid) {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(CONFIRM_INTERVAL);
+    }
+    Err(RejoinError::StepFailed {
+        step: "confirm-connected",
+        detail: format!(
+            "Wi-Fi did not connect to '{ssid}' within {} s — the network may be out of range or the board AP may be down",
+            CONFIRM_ATTEMPTS * CONFIRM_INTERVAL.as_secs() as u32
+        ),
+    })
+}
+
+/// Delete the Windows WLAN profile for `ssid`, ignoring every
+/// failure (R3-FW-13): a profile that does not exist fails the
+/// delete, and that is fine. Used before importing an OPEN
+/// profile — after a KEY_RESET the board AP is open, but the PC
+/// may still hold a stale WPA2 profile for the same `RSH-XXXX`
+/// SSID, which would make Windows try the old password against
+/// an open AP instead of joining it.
+#[cfg(target_os = "windows")]
+fn delete_profile_best_effort(ssid: &str) {
+    let mut cmd = std::process::Command::new("netsh");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.args(["wlan", "delete", "profile", &format!("name={ssid}")]);
+    let _ = run_command_timeout(&mut cmd, NETSH_TIMEOUT, "delete-profile");
+}
+
 /// Windows implementation of [`rejoin_wifi`]: profile import +
 /// connect via `netsh`. Never logs the password and never passes
 /// it on a command line (it travels only inside the temp XML).
 #[cfg(target_os = "windows")]
 fn rejoin_wifi_windows(ssid: &str, password: &str) -> Result<(), RejoinError> {
-    rejoin_wifi_windows_with_xml(ssid, &build_profile_xml(ssid, password))
+    rejoin_wifi_windows_with_xml(ssid, &build_profile_xml(ssid, password), false)
 }
 
 /// Windows implementation of [`rejoin_wifi_open`]: open-profile
 /// import + connect via `netsh` (no password anywhere).
 #[cfg(target_os = "windows")]
 fn rejoin_wifi_open_windows(ssid: &str) -> Result<(), RejoinError> {
-    rejoin_wifi_windows_with_xml(ssid, &build_open_profile_xml(ssid))
+    rejoin_wifi_windows_with_xml(ssid, &build_open_profile_xml(ssid), true)
 }
 
 /// Shared Windows flow for both profile kinds: write the XML to a
 /// unique temp file, import it as a user-level profile, connect,
 /// delete the temp file (Drop guard — every exit path).
+///
+/// `delete_stale_first` (R3-FW-13, open AP only): delete any
+/// existing WLAN profile for the SSID before importing — after a
+/// KEY_RESET the board AP is open, but the PC may still hold a
+/// stale WPA2 profile for the same SSID. The WPA2 path keeps the
+/// existing profile (importing overwrites it, and deleting first
+/// would lose it if the import then failed).
 #[cfg(target_os = "windows")]
-fn rejoin_wifi_windows_with_xml(ssid: &str, xml: &str) -> Result<(), RejoinError> {
+fn rejoin_wifi_windows_with_xml(
+    ssid: &str,
+    xml: &str,
+    delete_stale_first: bool,
+) -> Result<(), RejoinError> {
     use std::io::Write as _;
     // R2-03 (S-05): `CommandExt` for the CREATE_NO_WINDOW flags on
     // the `netsh` helpers below.
@@ -450,6 +555,13 @@ fn rejoin_wifi_windows_with_xml(ssid: &str, xml: &str) -> Result<(), RejoinError
             })?;
     }
     let _guard = ProfileFileGuard(profile_path.clone());
+    // R3-FW-13: before importing an OPEN profile, drop any stale
+    // profile for this SSID (best effort — a missing profile is
+    // not an error). A stale WPA2 profile would otherwise make
+    // Windows offer the old password to an open AP.
+    if delete_stale_first {
+        delete_profile_best_effort(ssid);
+    }
     // DS-15: each netsh call has a hard 30 s timeout (killed on
     // expiry) instead of the old unbounded `.output()` — and the
     // whole rejoin runs off the manager loop (see main.rs), so a
@@ -484,6 +596,10 @@ fn rejoin_wifi_windows_with_xml(ssid: &str, xml: &str) -> Result<(), RejoinError
             detail: String::from_utf8_lossy(&connect.stderr).trim().to_string(),
         });
     }
+    // R3-D-09: `netsh wlan connect` exit 0 only means the request
+    // was accepted — confirm the interface is actually connected
+    // to this SSID before reporting success.
+    confirm_connected_to(ssid)?;
     Ok(())
 }
 
@@ -577,6 +693,29 @@ mod tests {
         assert!(xml.contains("<encryption>none</encryption>"), "{xml}");
         assert!(!xml.contains("sharedKey"), "{xml}");
         assert!(!xml.contains("keyMaterial"), "{xml}");
+    }
+
+    #[test]
+    fn parse_interface_state_reads_connected_ssid() {
+        // R3-D-09: the confirm step's parser — real `netsh wlan
+        // show interfaces` shape (leading spaces, `key : value`).
+        let connected = "There is 1 interface on the system:\n    Name                   : Wi-Fi\n    State                  : connected\n    SSID                   : RSH-9A55\n    BSSID                  : aa:bb:cc:dd:ee:ff\n";
+        assert_eq!(
+            parse_interface_state(connected),
+            (true, Some("RSH-9A55".to_string()))
+        );
+        // Connected to a different network: not our board.
+        let other =
+            "    State                  : connected\n    SSID                   : HomeWifi\n";
+        assert_eq!(
+            parse_interface_state(other),
+            (true, Some("HomeWifi".to_string()))
+        );
+        // Disconnected: no SSID to report.
+        let down = "    State                  : disconnected\n";
+        assert_eq!(parse_interface_state(down), (false, None));
+        // Empty output: not connected.
+        assert_eq!(parse_interface_state(""), (false, None));
     }
 
     #[test]

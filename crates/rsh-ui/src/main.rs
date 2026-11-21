@@ -2759,8 +2759,13 @@ impl Ctx {
     /// to `Unknown` with the real message in `detail`, so a generic
     /// "Something went wrong." is replaced by that detail, and an
     /// "Unknown" title by a plain one.
+    ///
+    /// R3-D-15: the title is now a human headline, so the
+    /// generic-error check keys on `code`, not `title` (the old
+    /// `title == "Unknown"` check could never fire once the title
+    /// stopped being the raw code).
     fn notify_error(&self, win: &MainWindow, kind: &str, err: &UserError) {
-        let title = if err.title == "Unknown" {
+        let title = if err.code == "Unknown" {
             "Couldn't complete that"
         } else {
             err.title.as_str()

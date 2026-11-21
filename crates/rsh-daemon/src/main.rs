@@ -175,7 +175,7 @@ async fn manager_loop(
     let mut last_gate = false;
     let mut last_error: Option<ConnectionError> = None;
     let mut last_reachable = false;
-    let mut last_active = false;
+    let mut last_want_escalated = false;
     // D6 migration (lazy, per board): board MACs whose legacy
     // device-key entry was already deleted this run — the entry
     // is deleted once, on the first HELLO observed from that
@@ -231,9 +231,32 @@ async fn manager_loop(
                     }
                 }
                 TrayAction::ToggleSend => {
+                    // R3-D-03: the backend switch behind this toggle
+                    // can take up to 60 s (HIDMaestro sidecar spawn
+                    // + UAC dwell) — running it here, on the
+                    // manager-loop task, stalled the 250 ms tick
+                    // (watchdog, retry timer, tray drain) and the
+                    // resume then fired a spurious watchdog rebuild.
+                    // Same `spawn_blocking` fix as `RestartWheel`
+                    // below; the loop awaits the outcome and logs it
+                    // like every other tray action.
                     let enabled = !api.output_enabled();
-                    api.set_output_enabled(enabled);
-                    log_line(verbose, &format!("tray: Send to game = {enabled}"));
+                    let api_clone = Arc::clone(&api);
+                    match tokio::task::spawn_blocking(move || {
+                        api_clone.set_output_enabled(enabled);
+                    })
+                    .await
+                    {
+                        Ok(()) => {
+                            log_line(verbose, &format!("tray: Send to game = {enabled}"));
+                        }
+                        Err(error) => {
+                            log_line(
+                                verbose,
+                                &format!("tray: Send to game toggle failed: {error}"),
+                            );
+                        }
+                    }
                 }
                 TrayAction::ProfileSelected(name) => match resolve_profile_id(&api, &name) {
                     Some(id) => match api.state.activate_profile(&id) {
@@ -378,13 +401,23 @@ async fn manager_loop(
         }
         last_reachable = reachable;
         let active_now = api.manager_state().is_active();
-        if active_now && !last_active {
-            // Scope C: wheel connected — raise the daemon's
-            // priority and re-apply the power-throttling opt-out.
-            // Idempotent: escalate() reports nothing when already
-            // escalated, so this only logs on a real transition.
-            // The lock is held only for the short sync call, never
-            // across an .await.
+        // R3-D-11: the guard escalates while a game is running OR
+        // the wheel is Active — the old code only watched the wheel,
+        // so a game running with the wheel disconnected never
+        // escalated. The game check is a cheap lock read (no
+        // refresh — see `AppStateCore::is_game_running`); it covers
+        // every launch path (UI, tray, IPC) because all of them go
+        // through `launch_game`. The guard itself is NOT relaxed or
+        // removed (user order) — this only adds the missing trigger.
+        let game_running_now = api.state.is_game_running();
+        let want_escalated = active_now || game_running_now;
+        if want_escalated && !last_want_escalated {
+            // Scope C: wheel connected or game running — raise the
+            // daemon's priority and re-apply the power-throttling
+            // opt-out. Idempotent: escalate() reports nothing when
+            // already escalated, so this only logs on a real
+            // transition. The lock is held only for the short sync
+            // call, never across an .await.
             {
                 let report = background
                     .lock()
@@ -401,9 +434,10 @@ async fn manager_loop(
                 }
             }
         }
-        if !active_now && last_active {
-            // Scope C: wheel disconnected — drop back to the
-            // baseline priority (see the escalate block above).
+        if !want_escalated && last_want_escalated {
+            // Scope C: wheel disconnected and no game running —
+            // drop back to the baseline priority (see the escalate
+            // block above).
             {
                 let report = background
                     .lock()
@@ -420,7 +454,7 @@ async fn manager_loop(
                 }
             }
         }
-        last_active = active_now;
+        last_want_escalated = want_escalated;
         // Heartbeat watchdog (C-04): 2 s silence in Active →
         // rebuild + re-activate. F20: the rebuild is capped inside
         // `check_watchdog` (5 frameless rebuilds latch
@@ -821,6 +855,70 @@ async fn serve_ipc(
     }
 }
 
+/// SDDL for a current-user-only IPC pipe (R3-D-07): the DACL
+/// grants generic-all to the creator owner and nothing to anyone
+/// else. `CO` is resolved to the creating user's SID when the
+/// descriptor is applied to the pipe, so the UI (same user)
+/// connects and no other local user can drive the daemon IPC.
+#[cfg(windows)]
+const IPC_PIPE_USER_ONLY_SDDL: &str = "D:(A;;GA;;;CO)";
+
+/// Create one IPC pipe listener with the current-user-only DACL
+/// (R3-D-07).
+///
+/// Returns `Ok(Some(pipe))` when the DACL pipe was created,
+/// `Ok(None)` when the DACL itself could not be built (the caller
+/// falls back to the default security descriptor and logs — the
+/// hardening must never brick IPC), and `Err` when the pipe
+/// create failed (the caller's retry logic handles it — e.g. the
+/// in-use squat, which fails identically with or without a DACL).
+#[cfg(windows)]
+fn try_create_pipe_with_dacl(
+    first_create: bool,
+) -> std::io::Result<Option<tokio::net::windows::named_pipe::NamedPipeServer>> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::core::PCWSTR;
+    let sddl: Vec<u16> = IPC_PIPE_USER_ONLY_SDDL
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the SDDL buffer is valid for the call; the descriptor
+    // pointer is written by the API and freed below with LocalFree.
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            1, // SDDL_REVISION_1
+            &mut descriptor,
+            None,
+        )
+    };
+    if converted.is_err() || descriptor.is_invalid() {
+        return Ok(None);
+    }
+    let mut attrs = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: windows::Win32::Foundation::FALSE,
+    };
+    // SAFETY: `attrs` is a valid SECURITY_ATTRIBUTES for the call
+    // (tokio's `create_with_security_attributes_raw` passes it
+    // straight to `CreateNamedPipeW`); the pipe keeps its own copy
+    // of the descriptor, so ours is freed right after.
+    let created = unsafe {
+        tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(first_create)
+            .create_with_security_attributes_raw(
+                rsh_ipc::IPC_PIPE_NAME,
+                &mut attrs as *mut SECURITY_ATTRIBUTES as *mut std::ffi::c_void,
+            )
+    };
+    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    created.map(Some)
+}
+
 /// Create ONE Windows named-pipe listening instance, retrying
 /// transient failures (F1). Returns `None` only when a fatal bind
 /// failure was signalled (the tracker hit 5) or shutdown was
@@ -839,10 +937,26 @@ async fn create_pipe_listener(
         if shutdown.load(Ordering::Relaxed) {
             return None;
         }
-        match ServerOptions::new()
-            .first_pipe_instance(first_create)
-            .create(rsh_ipc::IPC_PIPE_NAME)
-        {
+        // R3-D-07: the DACL pipe first; the default descriptor
+        // only when the DACL could not be built at all (logged
+        // once — a persistent build failure must not spam the log
+        // on every retry).
+        let created = match try_create_pipe_with_dacl(first_create) {
+            Ok(Some(pipe)) => Ok(pipe),
+            Ok(None) => {
+                if tracker.failures == 0 && tracker.in_use_failures == 0 {
+                    log_line(
+                        verbose,
+                        "daemon: IPC pipe current-user DACL unavailable — using the default security descriptor",
+                    );
+                }
+                ServerOptions::new()
+                    .first_pipe_instance(first_create)
+                    .create(rsh_ipc::IPC_PIPE_NAME)
+            }
+            Err(error) => Err(error),
+        };
+        match created {
             Ok(pipe) => {
                 tracker.record_success();
                 return Some(pipe);
@@ -964,11 +1078,12 @@ async fn serve_ipc(
                 listening_logged = true;
             }
         }
-        // NOTE (OPEN, Windows verification): the pipe currently uses
-        // the default security descriptor. An explicit
-        // current-user-only DACL is a Phase-7 hardening item. The pipe
-        // is local-only and the name is per-user via the
-        // single-instance mutex scope.
+        // R3-D-07: the pipe is created with an explicit
+        // current-user-only DACL (`create_pipe_listener` — creator
+        // owner full access, no other local user can connect). The
+        // pipe name is FIXED `\\.\pipe\rsh-daemon`; only the
+        // single-instance *mutex* is per-user (the old comment here
+        // claimed the name was per-user — wrong).
         if let Err(error) = pipe.connect().await {
             // DS-37 (B-12): a failed connect used to restart the
             // loop silently with no log and no delay — a
@@ -1396,7 +1511,19 @@ fn main() {
     // Single-instance: a second launch signals the running daemon
     // (IPC ping — the UI open hook lands in Phase 3) and exits.
     let lock = match acquire(&data_dir) {
-        Ok(AcquireOutcome::First(lock)) => lock,
+        Ok(AcquireOutcome::First(lock)) => {
+            // R3-06: the Local\ fallback is worth one log line —
+            // the Global\ mutex needs SeCreateGlobalPrivilege,
+            // which a non-elevated daemon does not hold.
+            #[cfg(windows)]
+            if lock.mutex_scope() == Some(single_instance::MutexScope::Local) {
+                log_line(
+                    verbose,
+                    "daemon: single-instance mutex fell back to Local\\ scope (Global\\ needs SeCreateGlobalPrivilege)",
+                );
+            }
+            lock
+        }
         Ok(AcquireOutcome::AlreadyRunning(pid)) => {
             let socket = socket_path(&data_dir);
             // F15: the lock holder may be a daemon that is still
