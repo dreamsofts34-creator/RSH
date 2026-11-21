@@ -1116,6 +1116,15 @@ fn extras_runs(flags: [bool; 4]) -> Result<ExtrasSnapshot, String> {
 /// metrics). The old `if` branches collapsed a card to ~71 px when
 /// off (grid 1030 px → 190 px); the fix keeps the body in the tree
 /// with `visible`, so both rows stay at their ON height.
+///
+/// R3-UI-01 / WS-5b: the row-2 height is asserted too, not just its
+/// top. Before this, `runs[1]` (Horn, left column row 2) was read
+/// only for its top — a Horn/LEDs-only collapse would have kept
+/// row-1 and row-2-top identical and passed silently. Row-2 height
+/// now has the same floor + cross-state equality as row-1, so all
+/// four cards are covered: row-1 proves Handbrake/Shifter, row-2
+/// proves Horn/LEDs (right-column cards share their row height by
+/// HorizontalLayout cross-axis stretch).
 #[allow(clippy::cast_precision_loss)]
 fn ui_extras_card_size() -> Outcome {
     let mut report = Report::new();
@@ -1133,6 +1142,7 @@ fn ui_extras_card_size() -> Outcome {
     }
     let mut first: Option<(usize, usize)> = None;
     let mut first_top: Option<usize> = None;
+    let mut first_row2_h: Option<usize> = None;
     for (name, (runs, rgba, width)) in &runs_by_state {
         if runs.len() != 2 {
             return Outcome::fail(format!(
@@ -1141,11 +1151,20 @@ fn ui_extras_card_size() -> Outcome {
             ));
         }
         let (row1_top, row1_h) = runs[0];
-        let (row2_top, _) = runs[1];
+        let (row2_top, row2_h) = runs[1];
         report.check(
             &format!("{name}-row1-tall"),
             row1_h > 300,
             &format!("row-1 card height {row1_h} px (ON body present, not collapsed)"),
+        );
+        // R3-UI-01 / WS-5b: row-2 floor. Row-2 measures 189 px
+        // all-ON (Horn/LEDs row), so 150 px separates "body
+        // present" from a collapsed ~73 px OFF card with margin
+        // on both sides.
+        report.check(
+            &format!("{name}-row2-tall"),
+            row2_h > 150,
+            &format!("row-2 card height {row2_h} px (ON body present, not collapsed)"),
         );
         // Card widths (R-10): the two row-1 cards share the row
         // equally — 342 px each at design width — because every
@@ -1163,6 +1182,7 @@ fn ui_extras_card_size() -> Outcome {
             None => {
                 first = Some((row1_top, row1_h));
                 first_top = Some(row2_top);
+                first_row2_h = Some(row2_h);
             }
             Some((top0, h0)) => {
                 report.check(
@@ -1176,6 +1196,16 @@ fn ui_extras_card_size() -> Outcome {
                     &format!(
                         "row-2 top y={row2_top} vs all-on y={}",
                         first_top.unwrap_or(0)
+                    ),
+                );
+                // R3-UI-01 / WS-5b: row-2 height identical across
+                // states — the Horn/LEDs half of the guarantee.
+                report.check(
+                    &format!("{name}-row2-same-height"),
+                    row2_h.abs_diff(first_row2_h.unwrap_or(0)) <= 3,
+                    &format!(
+                        "row-2 {row2_h} px vs all-on {} px",
+                        first_row2_h.unwrap_or(0)
                     ),
                 );
             }
