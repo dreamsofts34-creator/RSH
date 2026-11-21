@@ -23,8 +23,11 @@ bool net_send(const uint8_t *buf, size_t len);  // PC ko unicast; PC na ho to fa
 
 // ---- Wired USB-serial transport (Phase G, D26 / OPEN-20) ----
 // Serial peer Wi-Fi peer se ALAG session hai: apna HELO timer, apna
-// control session/cache, apna GET_CAPS-OK flag. Kisi bhi transport par
-// naya session (HELO sessionFlag=1) dono sessions reset kar deta hai.
+// control session/cache, apna GET_CAPS-OK flag. Har transport par naya
+// session (HELO sessionFlag=1) SIRF usi transport ka session reset
+// karta hai (R3-FW-11: pehle dono reset hote thay). Wi-Fi par naya peer
+// ya liveness timeout ke baad wapas aaya peer bhi Wi-Fi session reset
+// karta hai (R3-FW-02, net_logic.h rsh_session_reset_needed).
 // Ye functions sirf serial_link.cpp se bulaye jate hain; framing
 // (serial_transport.h) us ki taraf hai.
 void net_serial_begin();  // serial control session/cache init (net_begin se)
@@ -40,7 +43,7 @@ size_t net_serial_ping(const uint8_t *req, int len, uint8_t *reply_out);  // pin
 void net_serial_after_reply();  // reply bhejne KE BAAD deferred actions (REBOOT/SET_PASSWORD)
 uint32_t net_tx_fail_count();        // F3: boot se failed UDP transmissions
 uint32_t net_tx_sent_count();        // F3: boot se kamyab UDP transmissions
-int8_t net_rssi_dbm();               // PC link RSSI (dBm); -128 = unknown
+int8_t net_rssi_dbm();               // Strongest associated station ka RSSI (dBm, R3-FW-09 — PC ka nahi); -128 = unknown
 uint8_t net_channel();               // current SoftAP channel (0 = AP down)
 void net_set_stream_busy(bool busy); // ping drop-when-busy ke liye (stream loop peeche ho)
 uint32_t net_ping_dropped_count();   // §9.4: rate-limit/busy par drop hue pings

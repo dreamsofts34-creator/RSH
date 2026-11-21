@@ -1718,7 +1718,7 @@ mod tests {
         assert_eq!(snapshot.last_good_blob, Some(good_blob()));
         // The first client is dropped; the second client starts a fresh
         // session over the same board. A fresh session resets the
-        // board-side reply cache (`net_new_session()` in firmware
+        // board-side reply cache (`net_new_session_wifi()` in firmware
         // `net.cpp`), so the cached replies are cleared here — the
         // staged buffer itself survives the session change.
         let mut board = first.into_inner().into_inner().0;

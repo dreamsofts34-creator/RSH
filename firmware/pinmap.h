@@ -13,6 +13,10 @@
 // bolta hai):
 //   AXIS_ADC/ADS1115/GENERIC (type 1/2/10): slot 0 steering, 1 accel,
 //     2 brake, 3 clutch, 4 handbrake; slot > 4 ka koi consumer nahi.
+//     I2C kinds (ADS1115 type 2 / AS5600 type 12) ke pins 0xFF hote
+//     hain — axis `axisType[]` se pehchana jata hai, pin se nahi
+//     (FW-01: I2C sampling; pehle pin 0xFF = record bekaar samjha jata
+//     tha, is liye axis kabhi assign nahi hota tha).
 //   BATTERY (type 7): slot 0.
 //   BUTTON (type 3): slot 0 shifter-up, 1 shifter-down, 2 horn;
 //     slot > 2 ka koi consumer nahi. NOTE: purana factory blob BUTTON
@@ -22,8 +26,10 @@
 //   LED_STRIP (type 6): slot 0.
 //   SHIFTER (type 11): params[0] gate mode (0 sequential, 1 H-pattern);
 //     H-pattern gear pins 1..6 = pinA/pinB/pinC + params[1..3].
-//   BUTTON_MATRIX (4) / EXPANDER (8/9): koi firmware consumer nahi —
-//     ignore (validator inhein count karta hai, parser nahi).
+//   BUTTON_MATRIX (4): koi firmware consumer nahi — ignore.
+//   EXPANDER (8/9): sampling pending (FW-01) — sirf presence
+//     (`hasExpander`) track hoti hai (I2C bus management ke liye);
+//     expander buttons abhi sample nahi hote.
 //   Accel/brake BUTTON pins (25/26) blob mein NAHI hain aur PC pin map
 //   mein bhi nahi — wo pedal button-mode ke fixed pins hain, inputs.cpp
 //   unhein hamesha PIN_ACCEL_BTN/PIN_BRAKE_BTN se parhta hai.
@@ -77,6 +83,14 @@ typedef struct {
   uint8_t shifterMode;  // 0 sequential, 1 H-pattern
   uint8_t handbrakeButtonMode;  // F-15 (v4.0.2): 1 = handbrake pin digital
                                 // button hai (axis nahi) — inputs.cpp dekho
+  // FW-01 (Round 3): I2C axes — pin 0xFF = I2C, is liye axis ka source
+  // alag field mein hai (pin se nahi pehchana ja sakta).
+  uint8_t axisType[5];  // per axis slot: RSH_CFG_TYPE_* (1 ADC, 2 ADS1115,
+                        // 10 GENERIC, 12 AS5600); 0xFF = koi axis record nahi
+  uint8_t adsCh[5];     // ADS1115 AIN channel (0..3) per slot; 0xFF = n/a
+  uint8_t as5600Rotation;  // 0=360°, 1=540°, 2=900° (RSH_CFG_AS5600_ROT_PARAM)
+  uint8_t as5600Multiturn;  // flags bit0 (RSH_CFG_AS5600_MULTITURN_FLAG)
+  uint8_t hasExpander;  // koi EXP_MCP23017/PCF8574 record hai (sampling pending)
 } RshPinMap;
 
 // Compiled defaults (config.h PIN_* + naye modules) — factory blob ke
@@ -105,6 +119,15 @@ static inline void rsh_pinmap_defaults(RshPinMap *out) {
   out->shiftH[5] = PIN_SHIFT_H6;
   out->shifterMode = RSH_SHIFTER_MODE;
   out->handbrakeButtonMode = 0;  // F-15: default axis mode
+  // FW-01: defaults native ADC hain (factory blob ke barabar) — clutch
+  // slot 3 ka axisType 0xFF rehta hai (memset se), adsCh bhi 0xFF.
+  out->axisType[0] = RSH_CFG_TYPE_AXIS_ADC;  // steering
+  out->axisType[1] = RSH_CFG_TYPE_AXIS_ADC;  // accel
+  out->axisType[2] = RSH_CFG_TYPE_AXIS_ADC;  // brake
+  out->axisType[4] = RSH_CFG_TYPE_AXIS_ADC;  // handbrake
+  out->as5600Rotation = 0;  // memset 0xFF ke baad saaf karo
+  out->as5600Multiturn = 0;
+  out->hasExpander = 0;
 }
 
 // Kya ye GPIO live pin table mein kisi function ko diya gaya hai?
@@ -128,6 +151,33 @@ static inline uint8_t rsh_pinmap_uses_pin(const RshPinMap *map, uint8_t pin) {
   return 0;
 }
 
+// FW-01 helpers — I2C axes pin se nahi, axisType se pehchane jate hain
+// (I2C records ke pins hamesha 0xFF hote hain).
+// Axis slot mein koi axis record hai? (pin ho ya I2C kind — dono present.)
+static inline uint8_t rsh_pinmap_axis_present(const RshPinMap *map,
+                                              uint8_t slot) {
+  if (!map || slot > RSH_PINMAP_AXIS_HANDBRAKE) return 0;
+  return map->axisType[slot] != RSH_PINMAP_ABSENT;
+}
+// Koi I2C kind (ADS1115/AS5600/expander) configure hai? (Wire.begin
+// sirf tab — warna GPIO21 LED strip ka pin rehta hai, I2C nahi.)
+static inline uint8_t rsh_pinmap_has_i2c(const RshPinMap *map) {
+  if (!map) return 0;
+  if (map->hasExpander) return 1;
+  for (int i = 0; i < 5; i++)
+    if (map->axisType[i] == RSH_CFG_TYPE_AXIS_ADS1115 ||
+        map->axisType[i] == RSH_CFG_TYPE_AXIS_AS5600)
+      return 1;
+  return 0;
+}
+// Koi slow (ADS1115) axis live hai? (GET_CAPS capsFlags bit0, FW-04.)
+static inline uint8_t rsh_pinmap_has_slow_axis(const RshPinMap *map) {
+  if (!map) return 0;
+  for (int i = 0; i < 5; i++)
+    if (map->axisType[i] == RSH_CFG_TYPE_AXIS_ADS1115) return 1;
+  return 0;
+}
+
 // Blob se pin table banao (replace semantics — upar dekho).
 // Return 1 = theek (out bhari hui), 0 = blob invalid (out ko haath nahi
 // lagta — caller purani table rakhta hai, fail closed). NULL blob/len 0
@@ -141,6 +191,9 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
   memset(&m, RSH_PINMAP_ABSENT, sizeof(m));
   m.shifterMode = RSH_SHIFTER_MODE;  // SHIFTER record na ho to sequential
   m.handbrakeButtonMode = 0;  // F-15: default axis mode (memset 0xFF ke baad saaf karo)
+  m.as5600Rotation = 0;  // FW-01: memset 0xFF ke baad saaf karo (default 360°)
+  m.as5600Multiturn = 0;
+  m.hasExpander = 0;  // axisType/adsCh 0xFF hi rehte hain (memset se)
   // H-pattern gear pins bhi default rakho — sequential mode mein istemal
   // nahi hote, lekin GET_CAPS/debug mein kabhi kachra na dikhe.
   m.shiftH[0] = PIN_SHIFT_H1;
@@ -158,21 +211,59 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
       case RSH_CFG_TYPE_AXIS_ADC:
       case RSH_CFG_TYPE_AXIS_ADS1115:
       case RSH_CFG_TYPE_AXIS_GENERIC: {
-        if (pinA == RSH_PINMAP_ABSENT) break;  // pin nahi — record bekaar
         uint8_t *dst = NULL;
         if (slot == RSH_PINMAP_AXIS_STEERING) dst = &m.steer;
         else if (slot == RSH_PINMAP_AXIS_ACCEL) dst = &m.accel;
         else if (slot == RSH_PINMAP_AXIS_BRAKE) dst = &m.brake;
         else if (slot == RSH_PINMAP_AXIS_CLUTCH) dst = &m.clutch;
         else if (slot == RSH_PINMAP_AXIS_HANDBRAKE) dst = &m.handbrake;
+        if (!dst) break;  // slot > 4 ka koi consumer nahi
+        // Pehla record jeetta hai (pin ki tarah) — axisType sirf usi se.
+        if (m.axisType[slot] != RSH_PINMAP_ABSENT) break;
+        if (type == RSH_CFG_TYPE_AXIS_ADS1115) {
+          // FW-01: I2C axis — pins 0xFF lazmi (validator bhi check karta
+          // hai); channel params[0] mein hai (0..3, validator range
+          // check karta hai). Pehle yahan `pinA == ABSENT` par break
+          // hota tha — I2C records ke pins hamesha 0xFF hote hain, is
+          // liye axis kabhi assign nahi hota tha (FW-01 bug).
+          if (pinA != RSH_PINMAP_ABSENT) break;
+          m.axisType[slot] = type;
+          m.adsCh[slot] = r[6];  // params[0] = AIN channel
+          break;
+        }
+        if (pinA == RSH_PINMAP_ABSENT) break;  // pin nahi — record bekaar
+        m.axisType[slot] = type;
         // F-15: handbrake button mode — pehla slot-4 record jeet-ta hai
         // (pin ki tarah); mode sirf usi record se aata hai.
-        if (slot == RSH_PINMAP_AXIS_HANDBRAKE && dst && *dst == RSH_PINMAP_ABSENT)
+        if (slot == RSH_PINMAP_AXIS_HANDBRAKE)
           m.handbrakeButtonMode =
               (r[2] & RSH_CFG_HANDBRAKE_BUTTON_FLAG) ? 1 : 0;
-        if (dst && *dst == RSH_PINMAP_ABSENT) *dst = pinA;  // pehla jeetta hai
+        *dst = pinA;  // pehla jeetta hai
         break;
       }
+      case RSH_CFG_TYPE_AXIS_AS5600: {
+        // FW-01: AS5600 magnetic encoder — pins 0xFF lazmi (I2C bus,
+        // addr 0x36 fixed); flags bit0 = multi-turn, params[1] =
+        // rotation (0=360°, 1=540°, 2=900°). Validator max 1/board +
+        // rotation range pehle hi check kar chuka hai.
+        if (pinA != RSH_PINMAP_ABSENT || r[4] != RSH_PINMAP_ABSENT ||
+            r[5] != RSH_PINMAP_ABSENT)
+          break;
+        if (slot > RSH_PINMAP_AXIS_HANDBRAKE) break;
+        if (m.axisType[slot] != RSH_PINMAP_ABSENT) break;  // pehla jeetta hai
+        m.axisType[slot] = type;
+        m.as5600Multiturn =
+            (r[2] & RSH_CFG_AS5600_MULTITURN_FLAG) ? 1 : 0;
+        m.as5600Rotation = r[6 + RSH_CFG_AS5600_ROT_PARAM];
+        break;
+      }
+      case RSH_CFG_TYPE_EXP_MCP23017:
+      case RSH_CFG_TYPE_EXP_PCF8574:
+        // FW-01: expander sampling pending — sirf presence track hoti
+        // hai (I2C bus management: Wire sirf tab start ho jab I2C
+        // kind maujood ho; expander buttons abhi sample nahi hote).
+        m.hasExpander = 1;
+        break;
       case RSH_CFG_TYPE_BATTERY:
         if (slot == 0 && pinA != RSH_PINMAP_ABSENT && m.battery == RSH_PINMAP_ABSENT)
           m.battery = pinA;
@@ -216,7 +307,7 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
         break;
       }
       default:
-        break;  // BUTTON_MATRIX / EXPANDER: koi consumer nahi
+        break;  // BUTTON_MATRIX: koi consumer nahi (EXPANDER ka case upar hai)
     }
   }
   // Quadrature decoder ko dono channels chahiye — ek channel akela ho

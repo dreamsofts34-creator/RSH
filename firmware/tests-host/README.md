@@ -12,6 +12,11 @@ self-contained and CI can run them without the handover folder):
   `firmware/` (protocol + FW-3..FW-12 + Phase 2 `FACTORY_RESET`).
   No Arduino/board needed; headers are included by bare name and
   resolve from `firmware/` (so `-I..` from this directory).
+  `keystore.cpp` (R3-FW-03) is also compiled in — its Arduino
+  dependencies come from the `stubs/` directory (in-memory NVS,
+  `millis()`, `esp_random()`, mbedTLS SHA-256 over the test's own
+  implementation), so the build needs `-Istubs` too. The stubs
+  are test-only and never ship in firmware.
 
 ## Run
 
@@ -21,7 +26,7 @@ cd firmware/tests-host
 # 1. C++ host tests (needs libsodium for the Ed25519 §20 tests)
 SODIUM=$(ls /lib/x86_64-linux-gnu/libsodium.so* /usr/lib/x86_64-linux-gnu/libsodium.so* 2>/dev/null | head -1)
 g++ -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
-  -I.. -o run_tests test_main.cpp "$SODIUM"
+  -I.. -Istubs -o run_tests test_main.cpp "$SODIUM"
 ./run_tests
 
 # 2. Python golden vectors

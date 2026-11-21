@@ -55,6 +55,16 @@ and refuses anything else.
   update; it must **not** attempt control (a v2.1 control frame
   is rejected by a v2.2 board, and a v2.2 control frame is
   rejected by a v2.1 board).
+  > **Scope note (R3-FW-06a):** "a v2.2 HELLO parser accepts a
+  > `(2,1)` HELLO" is true of the **Rust (app-side)** parser
+  > (`crates/rsh-protocol/src/hello.rs` — accepts `(2,2)` and
+  > `(2,1)`), which is the parser that needs it (old-firmware
+  > detection). The **firmware** parser
+  > (`firmware/protocol.h` `rsh_v2_parse_hello`) accepts **only**
+  > `(2,2)` and returns `RSH_V2_BAD_VERSION` for `(2,1)` — the
+  > board never parses HELLOs (it only builds them), so this has
+  > no runtime effect on the board; the two parsers differ by
+  > design, not by accident.
 - **Old app (≤ 2.0.5) vs new firmware (4.0.3): broken by design.**
   Upgrade order is **app first (v2.0.6), then firmware (v4.0.3
   via WebOTA)** — the new app still holds the old stored Wi-Fi
@@ -101,11 +111,70 @@ CRC16
 20-byte header; total 20 + 2×axes + 2×n_enc + 2. Flags:
 `0x01` config-changed, `0x02` low-supply, `0x04` tick-skipped,
 `0x08` axis-invalid; bits 4–7 reserved 0. Max 8 axes, 4
-encoders, 64 wire buttons. `seq` is the stream's own u16
+encoders, 64 wire buttons — **wire ceilings, not implemented
+counts** (R3-FW-07): the firmware can ever emit at most **5 axes**
+(steering, accel, brake, clutch, handbrake — `stream_emit.h`)
+and **2 encoders** (`n_enc > 2` → stream builder returns 0).
+`seq` is the stream's own u16
 sequence (unchanged from v2.1); stream frames have no HMAC in
 any version — an altered packet fails CRC16 and is dropped, and
 status packets carry `seqGap` + `txFail` counters so loss is
 visible.
+
+### 1.4 Status packets (board → PC, 1 Hz) — `0xA6`
+
+Sent at 1 Hz to a v2 peer only (a legacy v1 app does not
+understand the 34 B form). Two lengths: **34 B** base, **38 B**
+extended (when `btns_ex` is present — buttons 32–63). The CRC
+is always last; `seq_gap`/`tx_fail` sit directly before it, so
+their offsets shift by 4 in the extended form
+(`firmware/protocol.h` `rsh_v2_parse_status` /
+`rsh_v2_build_status`; Rust `crates/rsh-protocol/src/stream.rs`).
+
+```
+offset  field (base 34 B)
+0       magic 0xA6
+1       ver 0x22
+2..3    seq u16 LE (status packet's own sequence, NOT the stream seq)
+4..7    uptime_ms u32 LE
+8       rssi_dbm i8
+9       battery_pct u8 (255 = no battery module)
+10..11  supply_mv u16 LE (0 = not measured)
+12..15  heap u32 LE (free heap, bytes)
+16..17  overruns u16 LE (see note)
+18..19  max_cycle_us u16 LE (longest loop/sample cycle, µs)
+20      governor u8 (adaptive sampling level 0–3)
+21      reset_reason u8 (1 power-on, 2 brown-out, 3 watchdog,
+        4 software, 0 reserved)
+22..25  cfg_crc u32 LE (CRC32 of the live config blob)
+26..27  cfg_ver u16 LE (live config version)
+28..29  seq_gap u16 LE (stream seq skipped since boot, D5)
+30..31  tx_fail u16 LE (failed UDP transmissions since boot)
+32..33  CRC16 (over bytes 0..31)
+
+extended 38 B form: btns_ex u32 LE (buttons 32–63, bit n−32)
+at 28..31; seq_gap at 32..33; tx_fail at 34..35; CRC16 at
+36..37 (over bytes 0..35).
+```
+
+- **`overruns` is a wrap-aware u16 counter (R3-FW-09):** the
+  board counts overruns in a u32 (`overrunCount`) and sends only
+  its low 16 bits — the field wraps at 65,535. Read **deltas**
+  between consecutive status packets (u16 wrap-safe), never the
+  absolute value as a boot total. The layout is frozen (no
+  32-bit field without a protocol bump).
+- **`tx_fail` is likewise u16** (wrap allowed, D5) — deltas only.
+- **`rssi_dbm` is the strongest associated station's RSSI
+  (R3-FW-09), not the PC's:** the board reports the max RSSI
+  over all SoftAP stations (it has MACs, not IPs, for them), so
+  when a phone/browser is joined for WebOTA and is closer than
+  the PC, the status packet carries the phone's (better) RSSI.
+  `-128` = unknown (no station / API fail). The rescan decision
+  uses the same value, but rescan is off by default
+  (`RSH_AUTO_CHANNEL` 0).
+- `battery_pct` is always 255 and `supply_mv` always 0 in
+  v4.0.3 (no battery module, supply not measured) — the fields
+  exist so a future module can fill them without a layout change.
 
 ## 2. Discovery — HELO / HELLO
 
@@ -179,6 +248,22 @@ reqId older than the 32-entry window that reappears is accepted
 reply, so this is the correct behaviour across a u16 wrap).
 Stream frames keep their own u16 seq (§1.3); they are
 unaffected by reqId dedup.
+
+**When the cache resets (R3-FW-02 / R3-FW-11):** the dedup cache
+(and the `GET_CAPS`-OK stream gate) reset **per transport**, on:
+HELO `sessionFlag == 1` on that transport; a **new peer IP** on
+Wi-Fi; a peer returning after the liveness timeout (no HELO for
+> 2 s — the board already treats it as gone, `net_pc_active`
+false, so the cache must not outlive the session it belonged
+to); or a board reboot. A routine HELO (same IP, inside the
+timeout) never resets. Why this matters: the app restarts its
+reqIds at 0, so without the new-peer / return-after-timeout
+triggers the first ~32 commands after an app restart could hit
+the old session's cached replies and fail (wrong execution never
+happens — the reply's cmd check stops that — but the command
+fails its retry budget on the same stale reply). Serial's cache
+is separate: a serial flag-1 resets only the serial session,
+never Wi-Fi's.
 
 There is **no replay window anymore**: a captured frame can be
 replayed within the reqId-dedup scope. Accepted as a LAN-only
@@ -256,6 +341,40 @@ Module codes: 0 NONE, 1 STEERING, 2 ACCELERATOR, 3 BRAKE,
 10 LED, 11 BATTERY. Max 40 pin entries. `caps` bits: bit0 input,
 bit1 output, bit2 adc, bit3 pwm, bit4 pullup; bits 5–7 reserved 0.
 
+**`capsFlags` bits (R3-FW-06c / R3-FW-04):** bit0 `slowAxis` —
+a slow (ADS1115) axis exists (≤ 50 Hz); bit1 `safeMode` — the
+board is in safe mode. Bits 2–7 reserved 0. **Bit0 is set in
+4.0.4+ whenever an ADS1115 axis is live** (Round 3 WS-3, FW-01
++ FW-04 — `net.cpp` GET_CAPS handler, `rsh_pinmap_has_slow_axis`);
+in 4.0.3 it was never set (I2C axes validated but never sampled).
+The app reads it (`caps.rs` `slow_axis()`) and must treat 0 as
+"no slow axis".
+
+**I2C axes (R3-FW-01, implemented in firmware 4.0.4):** `AXIS_AS5600`
+(type 12) and `AXIS_ADS1115` (type 2) records are sampled after
+COMMIT — the axis is live, not just validated. Pin-table rows for
+I2C axes carry `pin` 0xFF (no GPIO) with kind 2 (`ADC_ADS1115`) /
+12 (`AXIS_AS5600`) and the axis module code. ADS1115: I2C address
+0x48 fixed, channel = record `params[0]` (0–3, validator rejects
+> 3 and duplicate channels), single-shot, PGA ±6.144 V, 128 SPS,
+polled on a 20 ms cadence (≤ 50 Hz per axis, round-robin across
+channels — this is what `capsFlags` bit0 reports). AS5600: I2C
+address 0x36 fixed, `flags` bit0 = multi-turn (0 = ≤ 360° direct,
+1 = turn counter on), `params[1]` = rotation (0 = 360°, 1 = 540°,
+2 = 900°), max 1 per board, sampled every cycle; I2C failure or
+magnet-not-detected keeps the last value and sets the axis-invalid
+flag (never sends 0). Both produce millivolt values (0..3300 mV).
+Expander records (`EXP_MCP23017` / `EXP_PCF8574`) are still
+accepted but **not sampled** — expander-button sampling is pending
+work, not part of this round.
+
+**`nAxesMax` / `nEncMax` are wire ceilings, not implemented
+counts (R3-FW-07):** `nAxesMax` 8 / `nEncMax` 4 are the protocol's
+maxima, but the firmware can ever emit at most **5 axes** and
+**2 encoders** (§1.3/§1.4). Do not size UI slots from these
+fields — slots beyond 5 axes / 2 encoders would stay dead
+forever.
+
 ### 3.5 Config transaction (GET_CFG / SET_CFG / COMMIT / CONFIRM / REVERT)
 
 Unchanged from v2.1: chunked `SET_CFG` into staging, `COMMIT`
@@ -317,12 +436,30 @@ Diag event codes: `AP_LOCKED` (3), `WINDOW_OPEN` (4),
 (14) are **deleted** with the pairing window / armed state
 (D10). `KEYSTORE_NVS_FAIL` (16) is kept.
 
+**Live event codes (R3-FW-06d)** — the full set the board can
+emit (`firmware/diag_log.h`; wire values never change):
+
+| Code | Name | Value |
+|---|---|---|
+| 1 | `BOOT` | reset reason code (§1.2) |
+| 2 | `AP_UP` | channel |
+| 6 | `HELO_REJECT` | 0 = live-session takeover attempt, 1 = peer-change throttle |
+| 7 | `HEAP_LOW` | free heap KB at the new minimum |
+| 8 | `CFG_ROLLBACK` | 0 (confirm timeout / boot recover, incl. factory fallback) |
+| 9 | `OTA_FAIL` | 0 (WebOTA upload fail / abort / timeout) |
+| 10 | `RESCAN` | new channel (F-07) |
+| 12 | `FW_ROLLBACK` | 0 (6 consecutive boot fails → other OTA slot) |
+| 13 | `AP_RESTART_FAIL` | 0 = AP lock, 1 = new-password restart, 2 = rescan restart |
+| 15 | `WDT_STATE` | 0 = loop task subscribed now, 1 = already subscribed, 2 = subscribe failed |
+| 16 | `KEYSTORE_NVS_FAIL` | 0 (keystore NVS write fail) |
+| 17 | `PASSWORD_CLEARED` | 0 (BOOT ≥ 10 s hold cleared the password; replayed from NVS after the reboot) |
+
 ### 3.9 Reply status codes
 
 | Code | Meaning |
 |---|---|
 | 0 | `OK` |
-| 1 | `BAD_TAG` — **deleted** (no HMAC). Never sent. |
+| 1 | `BAD_PASSWORD` — SET_PASSWORD current password wrong (§3.6). (v2.1's `BAD_TAG` was deleted; code 1 was reused for this, §0.) |
 | 2 | `REPLAY` — wire value kept so numbering does not shift; the dispatcher never sends it (a duplicate is answered from the cache, §2.3). |
 | 3 | `BAD_CRC` |
 | 4 | `TOO_BIG` (`len > 1024`, chunk `offset + len > total`, total > 2048) |
@@ -399,11 +536,16 @@ Idle → LinkUp → Hello → Active
   Wi-Fi password in Settings first".
 - **Auth password = the user-set AP password** (one credential
   for Wi-Fi and WebOTA). HTTP Basic Auth on **every** handler
-  (root, `/update`, restart, not-found included); per-IP rate
-  limit (5 wrong attempts → 60 s lockout, for everyone —
-  lockout is itself an accepted lockout-DoS tradeoff);
-  constant-time password compare; per-boot random CSRF token
-  (`X-RSH-CSRF`) on state-changing requests.
+  (root, `/update`, restart, not-found included); **per-IP**
+  rate limit (5 wrong attempts from one IP → 60 s lockout **for
+  that IP only** — other IPs are unaffected; table holds 4 IPs =
+  max stations, `firmware/webota_auth.h`). The lockout is itself
+  an accepted tradeoff, but it is per-IP, not global — one
+  station cannot lock everyone else out (R3-FW-06d). The
+  password check itself is the Arduino WebServer's
+  `authenticate()` (no separate constant-time compare in
+  firmware code); per-boot random CSRF token (`X-RSH-CSRF`) on
+  state-changing requests.
 - **Image checks (unchanged):** Ed25519 signature verified
   **before apply** (app verifies before upload, board verifies
   again after upload), anti-downgrade (only equal or newer
