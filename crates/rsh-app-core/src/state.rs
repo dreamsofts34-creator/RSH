@@ -146,7 +146,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, Sender as StdSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -999,6 +999,26 @@ pub struct AppStateCore {
     /// [`AppStateCore::connect_session`] no-ops instead of aborting
     /// the forwarder mid-activation via `connect_transport`.
     activation_in_flight: AtomicBool,
+    /// How many forwarder retry waits are currently armed (R3-D-02):
+    /// a count, not a bool, because the wait is armed in two nested
+    /// places — the frame loop's retry deadline and
+    /// `forwarder_retry_after_failure`'s backoff sleep — and a bool
+    /// cleared by the inner guard would lie while the outer wait
+    /// still holds. While > 0 the forwarder owns the retry: a
+    /// manager `RetryTimer` or a UI Connect must NOT abort it and
+    /// spawn a fresh forwarder (the old behaviour reset the
+    /// forwarder's breaker streak to 0 on every manager retry, so
+    /// the 10-failure circuit breaker could never trip). Read via
+    /// [`AppStateCore::forwarder_retry_waiting`].
+    forwarder_retry_wait: AtomicU32,
+    /// Latched when a forwarder run ends with its circuit breaker
+    /// open (R3-D-02): the run is over and no automatic retry may
+    /// start a fresh one — the user must reconnect. Cleared by an
+    /// explicit [`AppStateCore::connect_transport`] (user Connect /
+    /// watchdog rebuild / startup) or
+    /// [`AppStateCore::disconnect_transport`]. Read via
+    /// [`AppStateCore::forwarder_breaker_open`].
+    forwarder_breaker_open: AtomicBool,
     /// Sticky "board reachable" latch (D15): set on every HELLO
     /// observed ([`Self::note_observed_hello`]), cleared on
     /// disconnect / transport switch / `NoRoute` / HELLO-timeout.
@@ -1187,6 +1207,8 @@ impl AppStateCore {
             session_last_error_typed: Mutex::new(None),
             control_last_error: Mutex::new(None),
             activation_in_flight: AtomicBool::new(false),
+            forwarder_retry_wait: AtomicU32::new(0),
+            forwarder_breaker_open: AtomicBool::new(false),
             connection_log: Mutex::new(VecDeque::new()),
             connection_log_tail: Mutex::new(VecDeque::new()),
             last_stream_frame_at: Mutex::new(None),
@@ -1692,6 +1714,28 @@ impl AppStateCore {
         }
     }
 
+    /// True while a forwarder run is waiting out its own retry
+    /// backoff (R3-D-02): either the frame loop's retry deadline
+    /// after a failed activation, or the backoff sleep in
+    /// `forwarder_retry_after_failure` after a transport loss. The
+    /// forwarder owns the retry in that window — the manager loop
+    /// skips its `RetryTimer` and `connect_session` /
+    /// `connect_transport` no-op instead of aborting the forwarder
+    /// and resetting its breaker streak.
+    #[must_use]
+    pub fn forwarder_retry_waiting(&self) -> bool {
+        self.forwarder_retry_wait.load(Ordering::SeqCst) > 0
+    }
+
+    /// True once a forwarder run has ended with its circuit breaker
+    /// open (R3-D-02): no automatic retry may start a fresh
+    /// forwarder — only an explicit user Connect (via
+    /// `connect_transport`, which clears the latch) may.
+    #[must_use]
+    pub fn forwarder_breaker_open(&self) -> bool {
+        self.forwarder_breaker_open.load(Ordering::SeqCst)
+    }
+
     /// Retries session activation on the live transport (the explicit
     /// user action: connect / retry). Re-issues the connect for the
     /// currently requested transport kind — the supervisor aborts the
@@ -1712,12 +1756,27 @@ impl AppStateCore {
     /// timing while its activation runs; the manager's timer only
     /// matters once that attempt has finished.
     ///
+    /// R3-D-02: this also no-ops while the forwarder is waiting out
+    /// its own retry backoff (`forwarder_retry_waiting`) or its
+    /// circuit breaker is open (`forwarder_breaker_open`). The old
+    /// code ran `connect_transport` in both windows: the supervisor
+    /// unconditionally aborted the running forwarder and spawned a
+    /// fresh one with streak 0, so the 10-failure breaker could
+    /// never trip while the manager retried. One loop owns the
+    /// retry now — the forwarder's — and a tripped breaker stays
+    /// tripped until the user reconnects explicitly (via
+    /// `connect_transport`, which clears the latch).
+    ///
     /// # Errors
     ///
     /// Returns a message when no transport can be (re)connected (for
     /// example no serial board port is detected).
     pub fn connect_session(self: &Arc<Self>) -> Result<TransportState, String> {
-        if self.session_gate_open() || self.activation_in_flight.load(Ordering::SeqCst) {
+        if self.session_gate_open()
+            || self.activation_in_flight.load(Ordering::SeqCst)
+            || self.forwarder_retry_waiting()
+            || self.forwarder_breaker_open()
+        {
             return Ok(self.transport_state());
         }
         let (kind, _) = self.transport_request();
@@ -4328,7 +4387,34 @@ impl AppStateCore {
     /// when the engine command channel is gone. A UDP bind failure is
     /// NOT an error here: the forwarder retries every 2 s and the
     /// reason is recorded in [`AppStateCore::engine_status_detail`].
+    ///
+    /// R3-D-05: this no-ops (`Ok`, session untouched — the gate is
+    /// NOT closed, the latch is NOT cleared) while a forwarder
+    /// activation is in flight or the forwarder is waiting out its
+    /// own retry backoff — the same guards `connect_session` has.
+    /// Without them a UI Connect during `Backoff` / mid-activation
+    /// queued a second `EngineCommand::Connect` and the supervisor
+    /// aborted the in-flight forwarder, restarting the HELO →
+    /// `GET_CAPS` exchange from scratch, while the manager treated
+    /// the `Connect` event itself as a no-op. A no-op here is an
+    /// explicit "a (re)connect is already running" — the caller
+    /// reports the live state (see `DaemonApi::connect`), it does
+    /// not start a second activation. An explicit (re)connect that
+    /// DOES proceed clears a latched breaker (`forwarder_breaker_open`):
+    /// a tripped breaker stays tripped against automatic retries,
+    /// not against the user pressing Connect.
     pub fn connect_transport(self: &Arc<Self>, kind: TransportKind) -> Result<(), String> {
+        // R3-D-05: never tear an in-flight activation / retry-wait
+        // down. The supervisor aborts the running forwarder on every
+        // `EngineCommand::Connect`, so queueing one here would
+        // restart the exchange the live forwarder is already
+        // running — and reset its breaker streak (R3-D-02).
+        if self.activation_in_flight.load(Ordering::SeqCst) || self.forwarder_retry_waiting() {
+            return Ok(());
+        }
+        // An explicit (re)connect that proceeds clears a latched
+        // breaker: the user asked for a fresh run (R3-D-02).
+        self.forwarder_breaker_open.store(false, Ordering::SeqCst);
         // R2-25: the pre-check uses the metadata-only probe (open
         // only, no 500 ms HELO round-trip — the session layer
         // confirms the board with its own HELO/HELLO exchange
@@ -4388,6 +4474,13 @@ impl AppStateCore {
     pub fn disconnect_transport(&self) -> Result<(), String> {
         self.close_session_gate();
         self.clear_session_records();
+        // R3-D-02: a deliberate teardown ends any forwarder retry
+        // wait / breaker latch with it — the next explicit connect
+        // starts a fresh run. (The aborted forwarder's guards drop
+        // too, but clearing here keeps the flags correct even if the
+        // supervisor has not processed the abort yet.)
+        self.forwarder_retry_wait.store(0, Ordering::SeqCst);
+        self.forwarder_breaker_open.store(false, Ordering::SeqCst);
         let tx = lock(&self.engine_cmd_tx)
             .clone()
             .ok_or_else(|| "engine is not running".to_string())?;
@@ -7334,6 +7427,33 @@ impl Drop for ActivationInFlightGuard<'_> {
     }
 }
 
+/// Guard that marks one forwarder retry wait as armed (R3-D-02) and
+/// unmarks it on drop, so every exit path — including a task abort
+/// — clears it. The wait is a count, not a bool: the frame loop's
+/// retry deadline and `forwarder_retry_after_failure`'s backoff
+/// sleep nest, and a bool cleared by the inner guard would lie
+/// while the outer wait still holds. The drop saturates at 0, so a
+/// `disconnect_transport` reset racing a dropping guard can never
+/// underflow the count.
+struct ForwarderRetryWaitGuard<'a> {
+    count: &'a AtomicU32,
+}
+
+impl<'a> ForwarderRetryWaitGuard<'a> {
+    fn arm(count: &'a AtomicU32) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self { count }
+    }
+}
+
+impl Drop for ForwarderRetryWaitGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1));
+    }
+}
+
 async fn activate_session_on<T, K>(
     state: &Arc<AppStateCore>,
     transport: T,
@@ -8309,9 +8429,18 @@ async fn forwarder_retry_after_failure(
                 backoff.consecutive_failures()
             ),
         );
+        // R3-D-02: the backoff sleep IS a forwarder retry wait —
+        // arm it for the whole sleep, so a manager `RetryTimer`
+        // or UI Connect cannot abort this run mid-sleep and reset
+        // the streak the breaker counts on.
+        let _retry_wait = ForwarderRetryWaitGuard::arm(&state.forwarder_retry_wait);
         tokio::time::sleep(delay).await;
         true
     } else {
+        // R3-D-02: the breaker tripped — latch it, so no automatic
+        // retry starts a fresh forwarder run (and a fresh streak)
+        // behind this one. Only an explicit user Connect clears it.
+        state.forwarder_breaker_open.store(true, Ordering::SeqCst);
         state.set_connection(ConnectionState::Disconnected);
         state.set_engine_status(
             EngineTaskStatus::Running { transport: None },
@@ -8409,6 +8538,12 @@ async fn forward_with_retry_with_policy<T, F>(
                 state.note_engine_detail(
                     "transport udp port conflict (AddrInUse, UDP 4211) — forwarder stopped, no bind retry; user reconnect required after closing the holder".to_string(),
                 );
+                // R3-D-02: the forwarder stopped — latch it like a
+                // tripped breaker, so a manager retry timer armed
+                // by an earlier failure cannot respawn a fresh
+                // forwarder (and a fresh bind attempt) behind it.
+                // Only an explicit user Connect clears it.
+                state.forwarder_breaker_open.store(true, Ordering::SeqCst);
                 return;
             }
             state.note_engine_transport_error(kind, "transport could not be opened");
@@ -8470,6 +8605,14 @@ async fn forward_with_retry_with_policy<T, F>(
         // retryable failure would lose the held frames and the
         // "gate closed" proof the rig relies on.
         let mut retry_deadline: Option<tokio::time::Instant> = None;
+        // R3-D-02: held while a retry deadline is armed (below) —
+        // the forwarder owns the retry in that window, so the
+        // manager / UI must not abort this run. Dropped when the
+        // gate opens, when the deadline fires, or at the end of
+        // this iteration (transport loss falls through to
+        // `forwarder_retry_after_failure`, which arms its own
+        // wait for the backoff sleep).
+        let mut retry_wait_guard: Option<ForwarderRetryWaitGuard<'_>> = None;
         if state.session_gate_open() {
             // A connected transport breaks the failure streak
             // (M-11): the next loss starts again at the 2 s base.
@@ -8485,6 +8628,10 @@ async fn forward_with_retry_with_policy<T, F>(
             );
             if let Some(delay) = backoff.record_failure() {
                 retry_deadline = Some(tokio::time::Instant::now() + delay);
+                // R3-D-02: the deadline wait is a forwarder retry
+                // wait — arm it now, before the frame loop starts
+                // waiting on it.
+                retry_wait_guard = Some(ForwarderRetryWaitGuard::arm(&state.forwarder_retry_wait));
                 state.set_engine_status(
                     EngineTaskStatus::Running {
                         transport: Some(kind),
@@ -8495,6 +8642,11 @@ async fn forward_with_retry_with_policy<T, F>(
                     ),
                 );
             } else {
+                // R3-D-02: the breaker tripped — latch it, so no
+                // automatic retry starts a fresh forwarder run (and
+                // a fresh streak) behind this one. Only an explicit
+                // user Connect clears it.
+                state.forwarder_breaker_open.store(true, Ordering::SeqCst);
                 state.set_connection(ConnectionState::Disconnected);
                 state.set_engine_status(
                     EngineTaskStatus::Running { transport: None },
@@ -8573,6 +8725,9 @@ async fn forward_with_retry_with_policy<T, F>(
                 continue;
             }
             retry_deadline = None;
+            // R3-D-02: the gate opened — the wait is over, the
+            // forwarder no longer owns a retry.
+            retry_wait_guard = None;
             // Status pump (H1 condition 12): board loss counters and
             // `btnsEx` reach the engine. A full/closed engine status
             // channel drops the packet (the engine drains its own
@@ -8603,6 +8758,9 @@ async fn forward_with_retry_with_policy<T, F>(
         state.close_session_gate();
         state.clear_session_records();
         if deadline_fired {
+            // R3-D-02: the deadline fired — the wait is over, the
+            // rebuild below starts a fresh activation attempt.
+            retry_wait_guard = None;
             // DS-06 (a): teardown-before-rebind — the old
             // transport (and its socket, still held by its reader
             // thread for ~100 ms after the flag is set) is dropped
@@ -10031,6 +10189,134 @@ mod tests {
             assert!(state.activation_in_flight.load(Ordering::SeqCst));
         }
         assert!(!state.activation_in_flight.load(Ordering::SeqCst));
+    }
+
+    /// R3-D-02: `connect_session` no-ops while the forwarder is
+    /// waiting out its own retry backoff or its circuit breaker is
+    /// open — a manager `RetryTimer` firing in those windows must
+    /// not abort the forwarder and reset its breaker streak, and a
+    /// tripped breaker must stay tripped until the user reconnects.
+    #[test]
+    fn connect_session_noops_while_forwarder_retry_waiting_or_breaker_open() {
+        let (state, _dir) = test_state();
+        state.forwarder_retry_wait.store(1, Ordering::SeqCst);
+        assert!(state.connect_session().is_ok());
+        assert!(
+            state.forwarder_retry_waiting(),
+            "connect_session must not clear the forwarder's retry wait"
+        );
+        state.forwarder_retry_wait.store(0, Ordering::SeqCst);
+        state.forwarder_breaker_open.store(true, Ordering::SeqCst);
+        assert!(state.connect_session().is_ok());
+        assert!(
+            state.forwarder_breaker_open(),
+            "connect_session must not clear a tripped breaker — only an explicit user Connect may"
+        );
+    }
+
+    /// R3-D-05: `connect_transport` has the same in-flight guards
+    /// as `connect_session` — a UI Connect during an activation or
+    /// a forwarder retry wait no-ops instead of queueing a second
+    /// `EngineCommand::Connect` that would abort the live
+    /// forwarder. A no-op leaves the session untouched: the gate
+    /// stays open and a latched breaker stays latched.
+    #[test]
+    fn connect_transport_noops_while_activation_in_flight_or_retry_waiting() {
+        let (state, _dir) = test_state();
+        state.open_session_gate();
+        state.activation_in_flight.store(true, Ordering::SeqCst);
+        assert!(state.connect_transport(TransportKind::Udp).is_ok());
+        assert!(
+            state.session_gate_open(),
+            "a no-op connect must not close the gate"
+        );
+        state.activation_in_flight.store(false, Ordering::SeqCst);
+        state.forwarder_retry_wait.store(1, Ordering::SeqCst);
+        state.forwarder_breaker_open.store(true, Ordering::SeqCst);
+        assert!(state.connect_transport(TransportKind::Udp).is_ok());
+        assert!(
+            state.session_gate_open(),
+            "a no-op connect must not close the gate"
+        );
+        assert!(
+            state.forwarder_breaker_open(),
+            "a no-op connect must not clear a latched breaker"
+        );
+    }
+
+    /// R3-D-02: an explicit (re)connect that proceeds clears a
+    /// latched breaker — the latch stops automatic retries, not the
+    /// user pressing Connect.
+    #[test]
+    fn connect_transport_clears_breaker_latch() {
+        let (state, _dir) = test_state();
+        state.forwarder_breaker_open.store(true, Ordering::SeqCst);
+        assert!(state.connect_transport(TransportKind::Udp).is_ok());
+        assert!(
+            !state.forwarder_breaker_open(),
+            "an explicit connect clears the breaker latch"
+        );
+        let _ = state.disconnect_transport();
+        let _ = state.stop_engine();
+    }
+
+    /// R3-D-02 (integration): while a forwarder run waits out its
+    /// backoff sleep, the retry-wait flag is armed and a manager
+    /// `connect_session` no-ops instead of aborting the run — and
+    /// when the run's breaker trips, the latch is set and
+    /// `connect_session` keeps no-op-ing (no automatic respawn).
+    #[tokio::test]
+    async fn forwarder_retry_wait_blocks_connect_session_until_breaker_trips() {
+        let (state, _dir) = test_state();
+        let (frame_tx, _frame_rx) = tokio::sync::mpsc::channel(8);
+        let (status_tx, _status_rx) = tokio::sync::mpsc::channel(8);
+        let policy = ForwarderRetryPolicy {
+            base: Duration::from_millis(200),
+            max_delay: Duration::from_millis(500),
+            max_consecutive_failures: 3,
+        };
+        let run = forward_with_retry_with_policy(
+            Arc::clone(&state),
+            TransportKind::Udp,
+            frame_tx,
+            status_tx,
+            || Option::<FakeSessionTransport>::None,
+            policy,
+        );
+        let run = tokio::spawn(run);
+        // The run fails its first open immediately, then sleeps
+        // 200 ms in its backoff — the wait must be visible.
+        let mut waited = 0;
+        while !state.forwarder_retry_waiting() && waited < 100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        assert!(
+            state.forwarder_retry_waiting(),
+            "forwarder must arm its retry wait during the backoff sleep"
+        );
+        assert!(state.connect_session().is_ok());
+        assert!(
+            state.forwarder_retry_waiting(),
+            "connect_session must not abort the waiting forwarder run"
+        );
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("breaker must trip promptly, not retry forever")
+            .expect("forwarder task joins");
+        assert!(
+            state.forwarder_breaker_open(),
+            "a tripped breaker must latch forwarder_breaker_open"
+        );
+        assert!(
+            !state.forwarder_retry_waiting(),
+            "no wait after the run ends"
+        );
+        assert!(state.connect_session().is_ok());
+        assert!(
+            state.forwarder_breaker_open(),
+            "connect_session must not clear a tripped breaker"
+        );
     }
 
     /// `cycle_profile` wraps around in both directions and activates
@@ -12325,6 +12611,10 @@ mod tests {
             .expect("breaker must trip promptly, not retry forever");
         assert_eq!(state.transport_state().state, ConnectionState::Disconnected);
         assert!(
+            state.forwarder_breaker_open(),
+            "a tripped breaker must latch forwarder_breaker_open (R3-D-02)"
+        );
+        assert!(
             state.engine_status_detail().contains("circuit breaker"),
             "breaker named in the status: {}",
             state.engine_status_detail()
@@ -12410,6 +12700,10 @@ mod tests {
             "a self-held port retries to the breaker, it must not stop at one attempt like a foreign conflict"
         );
         assert!(
+            state.forwarder_breaker_open(),
+            "a tripped breaker must latch forwarder_breaker_open (R3-D-02)"
+        );
+        assert!(
             state.engine_status_detail().contains("circuit breaker"),
             "breaker named in the status, not a false 'another app': {}",
             state.engine_status_detail()
@@ -12459,6 +12753,10 @@ mod tests {
             "exactly one bind attempt — no backoff retries on a port conflict"
         );
         assert_eq!(state.transport_state().state, ConnectionState::Disconnected);
+        assert!(
+            state.forwarder_breaker_open(),
+            "a stopped forwarder latches forwarder_breaker_open, so no manager retry respawns it (R3-D-02)"
+        );
         assert!(
             state.engine_status_detail().contains("4211"),
             "status names the port: {}",

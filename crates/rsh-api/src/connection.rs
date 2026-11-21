@@ -134,7 +134,11 @@ impl ConnectionState {
 /// it answers with [`ManagerAction`]s the driver executes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnEvent {
-    /// The user (or autostart) asked to connect.
+    /// The user (or autostart) asked to connect. This is also the
+    /// retry path (R3-D-06): the former `UserRetry` event had zero
+    /// production callers, so `Connect` from `Error` — which resets
+    /// the failure and watchdog budgets exactly like a retry — is
+    /// the one documented retry event.
     Connect,
     /// The transport bound and the link is up.
     LinkUp,
@@ -155,8 +159,6 @@ pub enum ConnEvent {
     BindFailed(crate::errors::BindErrorKind),
     /// The backoff/retry timer fired.
     RetryTimer,
-    /// The user explicitly retried (from an `Error` state).
-    UserRetry,
     /// The user disconnected.
     Disconnect,
 }
@@ -193,8 +195,7 @@ pub struct ConnectionManager {
     last_frame_at: Option<Instant>,
     /// Consecutive watchdog rebuilds with no frame seen (F20):
     /// reset only by [`ConnEvent::FrameSeen`], a fresh
-    /// [`ConnEvent::Connect`]/[`ConnEvent::UserRetry`], or
-    /// [`ConnEvent::Disconnect`].
+    /// [`ConnEvent::Connect`], or [`ConnEvent::Disconnect`].
     watchdog_rebuilds: u32,
     /// Absolute deadline of the current backoff (`None` when not backing off).
     backoff_until: Option<Instant>,
@@ -312,8 +313,24 @@ impl ConnectionManager {
                 ManagerAction::None
             }
             ConnEvent::HelloReceived => {
-                if matches!(self.state, ConnectionState::LinkUp | ConnectionState::Hello) {
+                // R3-D-01: accept from `Backoff` too. After a
+                // watchdog rebuild the manager sits in `Backoff`
+                // while the forwarder re-activates on its own —
+                // the HELLO that re-opens the session is real
+                // evidence the board is reachable, so the manager
+                // must follow it into `Hello` instead of waiting
+                // for its own `RetryTimer` (which the driver now
+                // skips while the forwarder owns the retry). The
+                // backoff is over once activation starts: disarm
+                // its timer.
+                if matches!(
+                    self.state,
+                    ConnectionState::LinkUp
+                        | ConnectionState::Hello
+                        | ConnectionState::Backoff { .. }
+                ) {
                     self.hello_attempts = 0;
+                    self.backoff_until = None;
                     self.transition(ConnectionState::Hello, now);
                     // Any HELLO means the board is reachable: one
                     // unsigned GET_CAPS decides Active. There is no
@@ -323,23 +340,30 @@ impl ConnectionManager {
                 ManagerAction::None
             }
             ConnEvent::CapsOk => {
-                // R2-01: the forwarder may feed `CapsOk` without a
-                // preceding `HelloReceived` (the manager sits in
-                // `LinkUp` or in `Error` when the session gate
-                // opens). `CapsOk` is only ever fed on the
-                // gate-open rising edge, and the gate only opens
-                // after an unsigned `GET_CAPS` passed
-                // (`activate_session_on`, `Ok(caps)` arm) — so
-                // accepting it from `LinkUp` / `Error` is still
-                // "Active only after GET_CAPS" (C-01/C-02), never a
-                // shortcut around it.
+                // R2-01 + R3-D-01: the forwarder may feed `CapsOk`
+                // without a preceding `HelloReceived` (the manager
+                // sits in `LinkUp` or in `Error` when the session
+                // gate opens) — and, after a watchdog rebuild, in
+                // `Backoff`: the gate re-opens while the manager
+                // still waits out its backoff, and dropping the
+                // event stranded it in "Connecting" on a live
+                // session (no further gate edge ever arrives).
+                // `CapsOk` is only ever fed on the gate-open rising
+                // edge, and the gate only opens after an unsigned
+                // `GET_CAPS` passed (`activate_session_on`,
+                // `Ok(caps)` arm) — so accepting it from `LinkUp` /
+                // `Error` / `Backoff` is still "Active only after
+                // GET_CAPS" (C-01/C-02), never a shortcut around
+                // it. Leaving `Backoff` disarms its timer.
                 if matches!(
                     self.state,
                     ConnectionState::Hello
                         | ConnectionState::LinkUp
                         | ConnectionState::Error { .. }
+                        | ConnectionState::Backoff { .. }
                 ) {
                     self.consecutive_failures = 0;
+                    self.backoff_until = None;
                     self.last_frame_at = Some(now);
                     self.transition(ConnectionState::Active, now);
                     return ManagerAction::StateChanged;
@@ -395,7 +419,7 @@ impl ConnectionManager {
                 // `AddrInUse`, watchdog latch) never arm the timer,
                 // so they never reach this branch.
                 // `consecutive_failures` is deliberately NOT reset
-                // here (unlike `Connect` / `UserRetry`): `fail()`
+                // here (unlike `Connect`): `fail()`
                 // already counted this failure, so the next
                 // failure backs off further (2 s → 30 s).
                 if let ConnectionState::Error {
@@ -404,15 +428,6 @@ impl ConnectionManager {
                 } = self.state
                 {
                     self.backoff_until = None;
-                    self.transition(ConnectionState::LinkUp, now);
-                    return ManagerAction::RequestHello;
-                }
-                ManagerAction::None
-            }
-            ConnEvent::UserRetry => {
-                if matches!(self.state, ConnectionState::Error { .. }) {
-                    self.consecutive_failures = 0;
-                    self.watchdog_rebuilds = 0;
                     self.transition(ConnectionState::LinkUp, now);
                     return ManagerAction::RequestHello;
                 }
@@ -906,9 +921,11 @@ mod tests {
         // never rebuilds again on its own.
         t += Duration::from_secs(30);
         assert_eq!(m.check_watchdog(t), ManagerAction::None);
-        // A manual retry gets a fresh budget.
+        // A manual retry gets a fresh budget. (R3-D-06: the
+        // former `UserRetry` event is deleted — `Connect` from
+        // `Error` is the retry path and resets the budgets.)
         assert_eq!(
-            m.on_event(ConnEvent::UserRetry, t),
+            m.on_event(ConnEvent::Connect, t),
             ManagerAction::RequestHello
         );
         assert_eq!(m.watchdog_rebuilds(), 0);
@@ -944,6 +961,63 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn caps_ok_from_backoff_reaches_active() {
+        // R3-D-01: after a watchdog rebuild the manager sits in
+        // `Backoff` while the forwarder re-activates on its own —
+        // the gate opening must still bring the manager to
+        // `Active` instead of stranding it in "Connecting" on a
+        // live session. The gate only opens after an unsigned
+        // `GET_CAPS` passed, so this is still "Active only after
+        // GET_CAPS".
+        let mut m = active_manager();
+        let t = now();
+        m.on_event(ConnEvent::FrameSeen, t);
+        assert_eq!(
+            m.check_watchdog(t + Duration::from_millis(2001)),
+            ManagerAction::RebuildTransport
+        );
+        assert!(matches!(m.state(), ConnectionState::Backoff { .. }));
+        assert!(m.retry_due_at().is_some(), "backoff arms a timer");
+        assert_eq!(
+            m.on_event(ConnEvent::CapsOk, t),
+            ManagerAction::StateChanged
+        );
+        assert!(m.state().is_active());
+        assert_eq!(
+            m.retry_due_at(),
+            None,
+            "leaving Backoff via CapsOk disarms its timer"
+        );
+    }
+
+    #[test]
+    fn hello_received_from_backoff_starts_activation() {
+        // R3-D-01: same watchdog-rebuild shape, but the HELLO
+        // arrives before the gate opens — the manager must follow
+        // it into `Hello` instead of dropping it in `Backoff`.
+        let mut m = active_manager();
+        let t = now();
+        m.on_event(ConnEvent::FrameSeen, t);
+        assert_eq!(
+            m.check_watchdog(t + Duration::from_millis(2001)),
+            ManagerAction::RebuildTransport
+        );
+        assert!(matches!(m.state(), ConnectionState::Backoff { .. }));
+        assert_eq!(
+            m.on_event(ConnEvent::HelloReceived, t),
+            ManagerAction::StartActivation
+        );
+        assert!(matches!(m.state(), ConnectionState::Hello));
+        assert_eq!(
+            m.retry_due_at(),
+            None,
+            "leaving Backoff via HelloReceived disarms its timer"
+        );
+        m.on_event(ConnEvent::CapsOk, t);
+        assert!(m.state().is_active());
     }
 
     #[test]
