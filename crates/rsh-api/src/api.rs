@@ -459,6 +459,20 @@ pub struct DiagStats {
     /// daemon's `DaemonApi::diag_stats` fills it in).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ipc_per_method_ms: Vec<IpcMethodLatency>,
+    /// Action → visible-result latency p50 in milliseconds
+    /// (R3-D-13, R2-46 remainder): from a mutating IPC dispatch
+    /// completing (connect, launch game, toggle output, …) to the
+    /// first `poll` / `slow_poll` dispatch after it — the poll
+    /// that shows the action's result. The daemon measures from
+    /// mutation completion, not from the UI click itself (the
+    /// click timestamp lives in the UI); the outbound IPC leg is
+    /// in `ipc_p50_ms` above. [`None`] until an action + a later
+    /// poll have both been observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_p50_ms: Option<f64>,
+    /// Action → visible-result latency p99 in milliseconds (R3-D-13).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_p99_ms: Option<f64>,
 }
 
 /// One method's IPC dispatch latency (R2-46): the per-method detail

@@ -69,6 +69,16 @@ pub struct RunningGame {
     pub pid: u32,
     /// Full path to the exe (or shortcut) that was launched.
     pub exe_path: String,
+    /// The exe image the tracked pid actually runs, resolved at
+    /// launch time (R3-D-04): for a `.lnk` launch this is the
+    /// shortcut's target exe (`QueryFullProcessImageNameW` on the
+    /// spawned pid), which never equals the stored `.lnk` path —
+    /// the pid-reuse guard must compare against this, not the
+    /// stored path. [`None`] when the image could not be read at
+    /// launch (the guard then falls back to `exe_path`, and to
+    /// liveness-only for unresolved shortcuts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_exe_path: Option<String>,
     /// Unix seconds when the game was launched.
     pub started_unix_secs: u64,
 }
@@ -436,10 +446,21 @@ impl<S: ProcessSpawner> GameLauncher<S> {
         let started_unix_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
+        // R3-D-04: resolve the exe the pid actually runs NOW — for
+        // a `.lnk` launch this is the shortcut's target exe, not
+        // the `.lnk` path. The pid-reuse guard compares against
+        // this; without it every shortcut game was marked "not
+        // running" within ~1 s of launch (the resolved image never
+        // equals the stored `.lnk` path).
+        let resolved_exe_path = self
+            .spawner
+            .exe_path(pid)
+            .map(|path| path.to_string_lossy().into_owned());
         let running = RunningGame {
             game_id: game_id.to_string(),
             pid,
             exe_path: exe_path.to_string(),
+            resolved_exe_path,
             started_unix_secs,
         };
         self.running = Some(running.clone());
@@ -449,16 +470,33 @@ impl<S: ProcessSpawner> GameLauncher<S> {
     /// Re-checks whether the tracked game is still alive; clears the
     /// record when it exited on its own, or when the pid now belongs to
     /// a different exe (L10 pid-reuse guard). Returns the current record.
+    ///
+    /// R3-D-04: the guard compares against the launch-time resolved
+    /// image (`resolved_exe_path`), not the stored launch path — a
+    /// `.lnk` launch's stored path never equals its target exe. When
+    /// the image could not be resolved at launch AND the launch was
+    /// a shortcut, the exe-path comparison is skipped (liveness
+    /// only): a stale comparison there is worse than no comparison.
     #[must_use]
     pub fn refresh(&mut self) -> Option<&RunningGame> {
         let dead = match &self.running {
             Some(running) => {
                 if !self.spawner.is_alive(running.pid) {
                     true
+                } else if is_shortcut(Path::new(&running.exe_path))
+                    && running.resolved_exe_path.is_none()
+                {
+                    // Unresolved shortcut launch: liveness only —
+                    // there is no trustworthy image to compare.
+                    false
                 } else if let Some(exe) = self.spawner.exe_path(running.pid) {
                     // The pid is alive but runs a different exe: the
                     // game exited and the OS reused its pid.
-                    exe != Path::new(&running.exe_path)
+                    let guard_path = running
+                        .resolved_exe_path
+                        .as_deref()
+                        .unwrap_or(running.exe_path.as_str());
+                    exe != Path::new(guard_path)
                 } else {
                     false
                 }
@@ -521,6 +559,13 @@ mod tests {
         spawned: RefCell<Vec<PathBuf>>,
         killed: RefCell<Vec<u32>>,
         fail_terminate: RefCell<bool>,
+        /// Shortcut → target resolution (R3-D-04): when a spawn
+        /// path is listed here, the pid's image is the target, not
+        /// the spawned path — what `QueryFullProcessImageNameW`
+        /// returns for a real `.lnk` launch on Windows.
+        resolve: RefCell<HashMap<PathBuf, PathBuf>>,
+        /// When set, `exe_path` returns [`None`] (image unreadable).
+        fail_exe_path: RefCell<bool>,
     }
 
     impl FakeSpawner {
@@ -531,6 +576,8 @@ mod tests {
                 spawned: RefCell::new(Vec::new()),
                 killed: RefCell::new(Vec::new()),
                 fail_terminate: RefCell::new(false),
+                resolve: RefCell::new(HashMap::new()),
+                fail_exe_path: RefCell::new(false),
             }
         }
 
@@ -541,13 +588,32 @@ mod tests {
         fn set_fail_terminate(&self, fail: bool) {
             *self.fail_terminate.borrow_mut() = fail;
         }
+
+        /// Register a shortcut → target resolution for later spawns.
+        fn map_shortcut(&self, shortcut: &Path, target: &Path) {
+            self.resolve
+                .borrow_mut()
+                .insert(shortcut.to_path_buf(), target.to_path_buf());
+        }
+
+        fn set_fail_exe_path(&self, fail: bool) {
+            *self.fail_exe_path.borrow_mut() = fail;
+        }
     }
 
     impl ProcessSpawner for FakeSpawner {
         fn spawn(&mut self, exe: &Path) -> Result<u32, String> {
             let pid = self.next_pid;
             self.next_pid += 1;
-            self.alive.borrow_mut().insert(pid, exe.to_path_buf());
+            // R3-D-04: a registered shortcut resolves to its target
+            // image at spawn, like the real Windows launch.
+            let image = self
+                .resolve
+                .borrow()
+                .get(exe)
+                .cloned()
+                .unwrap_or_else(|| exe.to_path_buf());
+            self.alive.borrow_mut().insert(pid, image);
             self.spawned.borrow_mut().push(exe.to_path_buf());
             Ok(pid)
         }
@@ -569,6 +635,9 @@ mod tests {
         }
 
         fn exe_path(&self, pid: u32) -> Option<PathBuf> {
+            if *self.fail_exe_path.borrow() {
+                return None;
+            }
             self.alive.borrow().get(&pid).cloned()
         }
     }
@@ -739,6 +808,76 @@ mod tests {
             .borrow_mut()
             .insert(running.pid, PathBuf::from("other-game.exe"));
         assert!(launcher.refresh().is_none(), "pid now runs another exe");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3-D-04: a `.lnk` launch resolves to its target exe at
+    /// launch time, and the pid-reuse guard compares against the
+    /// resolved image — the game must NOT be marked "not running"
+    /// just because the stored path is the shortcut.
+    #[test]
+    fn shortcut_launch_stays_running_against_resolved_target() {
+        let dir = test_dir("refresh-lnk");
+        let target = fake_exe(&dir, "race.exe");
+        let shortcut = dir.join("race.lnk");
+        std::fs::write(&shortcut, b"fake shortcut").expect("write fixture lnk");
+
+        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        launcher.spawner.map_shortcut(&shortcut, Path::new(&target));
+        let running = launcher
+            .launch("my-race", &shortcut.to_string_lossy())
+            .expect("launch shortcut");
+        assert_eq!(running.exe_path, shortcut.to_string_lossy());
+        assert_eq!(
+            running.resolved_exe_path.as_deref(),
+            Some(target.as_str()),
+            "launch must resolve the shortcut target"
+        );
+        // The guard runs on every ~1 Hz slow poll: it must keep
+        // the game running.
+        assert!(
+            launcher.refresh().is_some(),
+            "shortcut game must stay running"
+        );
+        assert_eq!(
+            launcher.running().map(|game| game.game_id.as_str()),
+            Some("my-race")
+        );
+        // ...but the guard still fires when the pid really is
+        // reused by another exe.
+        launcher
+            .spawner
+            .alive
+            .borrow_mut()
+            .insert(running.pid, PathBuf::from("other-game.exe"));
+        assert!(launcher.refresh().is_none(), "pid now runs another exe");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3-D-04: when the image cannot be read at launch, a
+    /// shortcut launch falls back to liveness-only — never to a
+    /// comparison against the `.lnk` path (which can never match).
+    #[test]
+    fn unresolved_shortcut_launch_is_liveness_only() {
+        let dir = test_dir("refresh-lnk-unresolved");
+        let shortcut = dir.join("race.lnk");
+        std::fs::write(&shortcut, b"fake shortcut").expect("write fixture lnk");
+
+        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        launcher.spawner.set_fail_exe_path(true);
+        let running = launcher
+            .launch("my-race", &shortcut.to_string_lossy())
+            .expect("launch shortcut");
+        assert_eq!(running.resolved_exe_path, None);
+        assert!(
+            launcher.refresh().is_some(),
+            "unresolved shortcut must stay running while alive"
+        );
+        launcher.spawner.kill_from_outside(running.pid);
+        assert!(
+            launcher.refresh().is_none(),
+            "a dead shortcut game still clears on liveness"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

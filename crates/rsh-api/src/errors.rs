@@ -201,11 +201,23 @@ pub struct UserError {
 
 impl UserError {
     /// Build from a typed connection error.
+    ///
+    /// R3-D-15: the title is a short human-readable headline (what
+    /// the UI renders directly) — never the raw error code; the
+    /// code lives only in the `code` field (and in logs).
     #[must_use]
     pub fn from_connection(error: ConnectionError, detail: impl Into<String>) -> Self {
         Self {
             code: error.code().to_string(),
-            title: error.code().to_string(),
+            title: match error {
+                ConnectionError::Unreachable => "Wheel not found".to_string(),
+                ConnectionError::Timeout => "Wheel did not answer".to_string(),
+                ConnectionError::TransportClosed => "Connection dropped".to_string(),
+                ConnectionError::BindFailed(_) => "Wheel port could not be opened".to_string(),
+                ConnectionError::BoardMismatch => "Different wheel answered".to_string(),
+                ConnectionError::WatchdogStall => "Wheel stopped sending data".to_string(),
+                ConnectionError::Unknown => "Something went wrong".to_string(),
+            },
             what_happened: match error {
                 ConnectionError::Unreachable => "The wheel did not answer.".to_string(),
                 ConnectionError::Timeout => "The wheel did not answer in time.".to_string(),
@@ -257,5 +269,44 @@ mod tests {
         }
         assert_eq!(ConnectionError::from_code("NoSuchCode"), None);
         assert_eq!(ConnectionError::from_code(""), None);
+    }
+
+    /// R3-D-15: the title is a human-readable headline, never the
+    /// raw code — the code lives only in `code`.
+    #[test]
+    fn user_error_title_is_human_readable_not_the_code() {
+        for error in [
+            ConnectionError::Unreachable,
+            ConnectionError::Timeout,
+            ConnectionError::TransportClosed,
+            ConnectionError::BindFailed(BindErrorKind::AddrInUse),
+            ConnectionError::BoardMismatch,
+            ConnectionError::WatchdogStall,
+            ConnectionError::Unknown,
+        ] {
+            let user_error = UserError::from_connection(error, "detail");
+            assert_eq!(user_error.code, error.code(), "code stays the code");
+            assert_ne!(
+                user_error.title,
+                user_error.code,
+                "title must not be the raw code for {}",
+                error.code()
+            );
+            assert!(
+                !user_error.title.contains("AddrInUse")
+                    && !user_error.title.contains("Unreachable")
+                    && !user_error.title.contains("WatchdogStall"),
+                "title must be plain words: {}",
+                user_error.title
+            );
+        }
+        assert_eq!(
+            UserError::from_connection(ConnectionError::Unreachable, "d").title,
+            "Wheel not found"
+        );
+        assert_eq!(
+            UserError::from_connection(ConnectionError::Unknown, "d").title,
+            "Something went wrong"
+        );
     }
 }

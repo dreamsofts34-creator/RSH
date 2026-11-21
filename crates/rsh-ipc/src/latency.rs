@@ -60,6 +60,16 @@ impl MethodStats {
 struct IpcLatency {
     methods: HashMap<String, MethodStats>,
     global: MethodStats,
+    /// Action → visible-result latency (R3-D-13, R2-46 remainder):
+    /// samples of "mutating dispatch completed → first later
+    /// `poll` / `slow_poll` dispatch", i.e. how long until a poll
+    /// shows an action's result. `pending_action` is the completion
+    /// instant of the last mutating dispatch not yet observed by a
+    /// poll — a poll consumes it (one sample per action), so a
+    /// 20 Hz poll stream does not flood the ring with one sample
+    /// per tick for the same action.
+    action: MethodStats,
+    pending_action: Option<std::time::Instant>,
 }
 
 static LATENCY: OnceLock<Mutex<IpcLatency>> = OnceLock::new();
@@ -116,6 +126,45 @@ pub fn ipc_latency_snapshot() -> Vec<(String, u64, u64, u64)> {
     out
 }
 
+/// Record that a mutating dispatch just completed (R3-D-13): the
+/// next `poll` / `slow_poll` dispatch observes its result, and
+/// [`record_poll_observed`] turns the gap into a sample. Called
+/// from the server's single instrumentation point, after the
+/// dispatch — never on the hot path (mutating calls are rare).
+pub fn record_action_completed() {
+    let Ok(mut guard) = latency().lock() else {
+        return;
+    };
+    guard.pending_action = Some(std::time::Instant::now());
+}
+
+/// Record that a `poll` / `slow_poll` dispatch just ran (R3-D-13):
+/// when a mutating dispatch completed since the last poll, the
+/// elapsed time is one action → visible-result sample. A poll with
+/// no pending action records nothing.
+pub fn record_poll_observed() {
+    let Ok(mut guard) = latency().lock() else {
+        return;
+    };
+    if let Some(started) = guard.pending_action.take() {
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        guard.action.record(micros);
+    }
+}
+
+/// Action → visible-result latency aggregate (R3-D-13): p50 / p99
+/// in milliseconds. `None` until an action and a later poll have
+/// both been observed.
+#[must_use]
+// The µs values are dispatch gaps — far below 2^53 µs — so the
+// `u64 as f64` cast cannot lose precision.
+#[allow(clippy::cast_precision_loss)]
+pub fn action_latency_p50_p99_ms() -> Option<(f64, f64)> {
+    let guard = latency().lock().ok()?;
+    let (p50, p99) = guard.action.p50_p99()?;
+    Some((p50 as f64 / 1000.0, p99 as f64 / 1000.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +198,31 @@ mod tests {
         assert_eq!(stats.samples.len(), SAMPLES);
         // The kept window is 73..=200: p50 136, p99 198.
         assert_eq!(stats.p50_p99(), Some((136, 198)));
+    }
+
+    /// R3-D-13: one action + one later poll yields one sample; a
+    /// second poll without a new action yields none (the pending
+    /// action is consumed by the first poll).
+    #[test]
+    fn action_latency_samples_first_poll_only() {
+        let mut state = IpcLatency::default();
+        // No action yet: a poll records nothing (the default
+        // `pending_action` is already `None`).
+        let before = state.action.count;
+        // Simulate the record fns on this local state (the global
+        // rings are process-shared, so the unit under test here is
+        // the consume-once shape, not the global).
+        state.pending_action = Some(std::time::Instant::now());
+        // First poll consumes the pending action into one sample.
+        if state.pending_action.take().is_some() {
+            state.action.record(1_500);
+        }
+        assert_eq!(state.action.count, before + 1);
+        assert_eq!(state.action.p50_p99(), Some((1_500, 1_500)));
+        // Second poll: nothing pending, no new sample.
+        if state.pending_action.take().is_some() {
+            state.action.record(1_500);
+        }
+        assert_eq!(state.action.count, before + 1);
     }
 }

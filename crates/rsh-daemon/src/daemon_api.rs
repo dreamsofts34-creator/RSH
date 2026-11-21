@@ -377,7 +377,7 @@ impl AppApi for DaemonApi {
         };
         self.state
             .connect_transport(kind)
-            .map_err(|detail| UserError::from_connection(ConnectionError::Unreachable, detail))?;
+            .map_err(classify_connect_error)?;
         self.manager_event(ConnEvent::Connect);
         Ok(self.connection())
     }
@@ -588,7 +588,9 @@ impl AppApi for DaemonApi {
             ..Default::default()
         };
         if let Err(error) = self.state.set_settings_patch(patch) {
-            eprintln!("[rsh-daemon] set_output_enabled persist failed: {error}");
+            // R3-D-16: into the diagnostics log, not stderr — the
+            // persisted setting is already noted there too, so the
+            // failure is visible in the log file either way.
             self.state.note_engine_detail(format!(
                 "output setting could not be saved ({error}) — the toggle was reverted"
             ));
@@ -979,6 +981,13 @@ impl AppApi for DaemonApi {
             stats.ipc_p50_ms = Some(p50);
             stats.ipc_p99_ms = Some(p99);
         }
+        // R3-D-13: the action → visible-result latency aggregate
+        // (mutating dispatch → first later poll), measured by the
+        // server alongside the dispatch latency above.
+        if let Some((p50, p99)) = rsh_ipc::action_latency_p50_p99_ms() {
+            stats.action_p50_ms = Some(p50);
+            stats.action_p99_ms = Some(p99);
+        }
         // R2-46: the per-method detail — which method is slow.
         // `ipc_latency_snapshot` is `(method, calls, p50 µs, p99 µs)`,
         // sorted by method name; µs → ms here. The µs values are
@@ -998,6 +1007,28 @@ impl AppApi for DaemonApi {
             .collect();
         stats.ipc_per_method_ms = per_method;
         Ok(stats)
+    }
+}
+
+/// Classify a `connect_transport` failure into a typed
+/// [`UserError`] (R3-D-14): the old code mapped EVERY failure to
+/// `Unreachable` — including daemon-internal faults ("engine
+/// command channel is gone", a queue failure), which the UI then
+/// showed as "wheel did not answer". `Unreachable` is reserved
+/// for the board genuinely not answering (no serial port, no
+/// HELLO); internal faults map to `Unknown` so the UI says
+/// something went wrong in RSH itself instead of blaming the
+/// wheel. The match is on the core's own fixed message starts —
+/// the same prefix discipline as [`capture_user_error`].
+#[must_use]
+pub fn classify_connect_error(detail: String) -> UserError {
+    if detail.starts_with("engine command channel is gone")
+        || detail.starts_with("could not queue transport connect")
+        || detail.starts_with("could not spawn engine supervisor thread")
+    {
+        UserError::from_connection(ConnectionError::Unknown, detail)
+    } else {
+        UserError::from_connection(ConnectionError::Unreachable, detail)
     }
 }
 
@@ -1188,6 +1219,56 @@ mod tests {
             stats.ipc_p50_ms.is_some() && stats.ipc_p99_ms.is_some(),
             "global aggregate still filled: {stats:?}"
         );
+    }
+
+    /// R3-D-14: daemon-internal faults must not surface as
+    /// `Unreachable` ("wheel did not answer") — only a board that
+    /// genuinely does not answer is `Unreachable`.
+    #[test]
+    fn classify_connect_error_reserves_unreachable_for_the_board() {
+        assert_eq!(
+            classify_connect_error("engine command channel is gone".to_string()).code,
+            "Unknown"
+        );
+        assert_eq!(
+            classify_connect_error(
+                "could not queue transport connect for UDP: channel closed".to_string()
+            )
+            .code,
+            "Unknown"
+        );
+        assert_eq!(
+            classify_connect_error("could not spawn engine supervisor thread: boom".to_string())
+                .code,
+            "Unknown"
+        );
+        assert_eq!(
+            classify_connect_error(
+                "no board serial port detected — connect a board over USB and retry".to_string()
+            )
+            .code,
+            "Unreachable"
+        );
+    }
+
+    /// R3-D-13: `diag_stats` exports the action → visible-result
+    /// latency once an action and a later poll have both been
+    /// recorded by the IPC server.
+    #[test]
+    fn diag_stats_exports_action_latency() {
+        use std::time::Duration;
+
+        let (api, _dir) = live_api_named("diag-stats-action");
+        rsh_ipc::record_action_completed();
+        std::thread::sleep(Duration::from_millis(2));
+        rsh_ipc::record_poll_observed();
+        let stats = api.diag_stats().expect("diag_stats");
+        let (p50, p99) = stats
+            .action_p50_ms
+            .zip(stats.action_p99_ms)
+            .expect("action latency present after action + poll");
+        assert!(p50 >= 0.0);
+        assert!(p99 >= p50);
     }
 
     #[test]

@@ -5,7 +5,11 @@
 //! * Windows: a named mutex (`Global\RSH-Daemon-<user>` — the real
 //!   mutex name is built from the current username when available).
 //!   A second instance finds the mutex held and exits after
-//!   signalling via IPC.
+//!   signalling via IPC. R3-06: `Global\` needs
+//!   `SeCreateGlobalPrivilege`, which a non-elevated daemon does
+//!   not hold — on access-denied the acquire falls back to a
+//!   per-session `Local\` mutex (after probing `Global\`, so an
+//!   elevated first daemon is still seen as already-running).
 //! * Linux: a lock file `<data_dir>/rsh-daemon.pid` holding the
 //!   daemon's pid. A second instance reads the pid and checks the
 //!   process is a live `rsh-daemon` (its `/proc/<pid>/cmdline` must
@@ -119,6 +123,20 @@ pub fn recorded_pid(data_dir: &std::path::Path) -> Option<u32> {
         .ok()
 }
 
+/// Which namespace the Windows single-instance mutex lives in
+/// (R3-06): `Global\` is cross-session but needs
+/// `SeCreateGlobalPrivilege` (administrators / services only — a
+/// non-elevated daemon does not hold it); `Local\` is per-session
+/// and needs no privilege.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutexScope {
+    /// Cross-session `Global\` mutex.
+    Global,
+    /// Per-session `Local\` fallback.
+    Local,
+}
+
 /// The running-daemon lock, held for the daemon's lifetime.
 pub enum SingleInstance {
     /// Linux pid-file lock (path + our pid).
@@ -141,6 +159,8 @@ pub enum SingleInstance {
         /// is authoritative; a stale pid file is overwritten by the
         /// next First and removed on clean release.
         pid_path: PathBuf,
+        /// Which namespace the mutex was created in (R3-06).
+        scope: MutexScope,
     },
 }
 
@@ -254,12 +274,24 @@ fn claim_pid_file(data_dir: &std::path::Path) -> Result<PathBuf, ClaimError> {
 
 /// Try to become the single daemon instance (Windows named mutex).
 ///
+/// R3-06: the `Global\` create needs `SeCreateGlobalPrivilege`,
+/// which a non-elevated daemon (the production autostart case)
+/// does not hold — the create fails access-denied. The old code
+/// treated that as fatal with no fallback, so a standard-user /
+/// non-elevated first daemon could never start. Now: on
+/// access-denied, fall back to a per-session `Local\` mutex (no
+/// privilege needed), after probing the `Global\` mutex — an
+/// elevated daemon may already hold it, and a second daemon must
+/// not become "First" in the Local scope while the Global holder
+/// is alive. The scope taken is recorded on [`SingleInstance`]
+/// (see [`SingleInstance::mutex_scope`]).
+///
 /// # Errors
 ///
 /// Returns an error message when the mutex cannot be created.
 #[cfg(windows)]
 pub fn acquire(data_dir: &std::path::Path) -> Result<AcquireOutcome, String> {
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::core::PCWSTR;
     // Per-user mutex name: the username keeps two users' daemons
@@ -268,22 +300,84 @@ pub fn acquire(data_dir: &std::path::Path) -> Result<AcquireOutcome, String> {
     let name: Vec<u16> = format!("Global\\RSH-Daemon-{user}\0")
         .encode_utf16()
         .collect();
+    // SAFETY: plain Win32 call with a valid NUL-terminated name.
+    match unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) } {
+        Ok(handle) => {
+            let already =
+                unsafe { GetLastError() } == windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+            if already {
+                let _ = unsafe { CloseHandle(handle) };
+                // F22: the mutex carries no pid — read the pid file the
+                // owner wrote, so the second instance can name it.
+                return Ok(AcquireOutcome::AlreadyRunning(recorded_pid(data_dir)));
+            }
+            let pid_path = write_pid_file(data_dir).unwrap_or_else(|_| pid_file_path(data_dir));
+            Ok(AcquireOutcome::First(SingleInstance::Mutex {
+                handle,
+                pid_path,
+                scope: MutexScope::Global,
+            }))
+        }
+        Err(error) => {
+            if unsafe { GetLastError() } == ERROR_ACCESS_DENIED {
+                return acquire_local_mutex(data_dir, &user);
+            }
+            Err(format!("cannot create daemon mutex: {error}"))
+        }
+    }
+}
+
+/// Per-session `Local\` fallback for [`acquire`] (R3-06): no
+/// privilege needed. Before creating it, probe the `Global\`
+/// mutex: an elevated daemon may already hold it (its first
+/// create succeeded where ours failed with access-denied), and a
+/// second daemon must not become "First" in the Local scope while
+/// the Global holder is alive. A probe failure means no Global
+/// holder we can open — either none exists (fresh non-elevated
+/// first daemon) or a foreign user's daemon holds it (in which
+/// case a per-user Local daemon is the correct outcome) — so any
+/// probe failure falls through to the Local create.
+#[cfg(windows)]
+fn acquire_local_mutex(data_dir: &std::path::Path, user: &str) -> Result<AcquireOutcome, String> {
+    use windows::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows::Win32::System::Threading::{
+        CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE,
+    };
+    use windows::core::PCWSTR;
+    let global_name: Vec<u16> = format!("Global\\RSH-Daemon-{user}\0")
+        .encode_utf16()
+        .collect();
+    // SAFETY: plain Win32 probe with a valid NUL-terminated name.
+    if let Ok(handle) = unsafe {
+        OpenMutexW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            PCWSTR(global_name.as_ptr()),
+        )
+    } {
+        // A daemon already holds the Global\ mutex (elevated first
+        // daemon) — we are second, whatever our own scope would be.
+        let _ = unsafe { CloseHandle(handle) };
+        return Ok(AcquireOutcome::AlreadyRunning(recorded_pid(data_dir)));
+    }
+    let name: Vec<u16> = format!("Local\\RSH-Daemon-{user}\0")
+        .encode_utf16()
+        .collect();
+    // SAFETY: plain Win32 call with a valid NUL-terminated name.
     let handle = unsafe {
         CreateMutexW(None, true, PCWSTR(name.as_ptr()))
-            .map_err(|e| format!("cannot create daemon mutex: {e}"))?
+            .map_err(|e| format!("cannot create daemon mutex (Local fallback): {e}"))?
     };
-    let already = unsafe { windows::Win32::Foundation::GetLastError() }
-        == windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
+    let already = unsafe { GetLastError() } == windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
     if already {
         let _ = unsafe { CloseHandle(handle) };
-        // F22: the mutex carries no pid — read the pid file the
-        // owner wrote, so the second instance can name it.
         return Ok(AcquireOutcome::AlreadyRunning(recorded_pid(data_dir)));
     }
     let pid_path = write_pid_file(data_dir).unwrap_or_else(|_| pid_file_path(data_dir));
     Ok(AcquireOutcome::First(SingleInstance::Mutex {
         handle,
         pid_path,
+        scope: MutexScope::Local,
     }))
 }
 
@@ -321,6 +415,16 @@ fn pid_is_live_rsh_daemon(pid: u32) -> bool {
 }
 
 impl SingleInstance {
+    /// Which mutex namespace this lock lives in (R3-06): `Some`
+    /// on Windows, `None` on Linux (pid-file lock, no mutex).
+    #[cfg(windows)]
+    #[must_use]
+    pub fn mutex_scope(&self) -> Option<MutexScope> {
+        match self {
+            Self::Mutex { scope, .. } => Some(*scope),
+        }
+    }
+
     /// Release the lock (pid file removed / mutex dropped). Called
     /// on clean shutdown; a crash leaves the pid file behind, and
     /// the next launch reclaims it via the `/proc` check.
@@ -339,7 +443,9 @@ impl SingleInstance {
             // removed too (F22) — a stale file is harmless (the next
             // First overwrites it), but a clean release leaves no
             // trace of a dead owner behind.
-            let SingleInstance::Mutex { handle, pid_path } = self;
+            let SingleInstance::Mutex {
+                handle, pid_path, ..
+            } = self;
             let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
             let _ = std::fs::remove_file(pid_path);
         }

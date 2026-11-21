@@ -20,9 +20,10 @@
 //!   the user's data dir (`~/.local/share/RSH/`), so only the current
 //!   user can connect.
 //! * Windows: the named pipe `\\.\pipe\rsh-daemon` is local to this
-//!   machine and this session; an explicit current-user-only DACL is
-//!   an OPEN Phase-7/Windows item (see the gate doc) — the pipe name
-//!   is namespaced per user where the OS supports it.
+//!   machine; the daemon creates it with an explicit
+//!   current-user-only DACL (R3-D-07 — creator-owner full access, no
+//!   other local user can connect). The pipe name is FIXED — only
+//!   the single-instance *mutex* is per-user.
 //!
 //! The server is generic over `Arc<dyn AppApi>`; the daemon passes
 //! its real implementation, tests pass a stub.
@@ -166,12 +167,69 @@ pub mod latency;
 pub mod server;
 
 pub use client::IpcClient;
-pub use latency::{ipc_latency_global_p50_p99_ms, ipc_latency_snapshot, record_ipc_latency};
+pub use latency::{
+    action_latency_p50_p99_ms, ipc_latency_global_p50_p99_ms, ipc_latency_snapshot,
+    record_action_completed, record_ipc_latency, record_poll_observed,
+};
 pub use server::IpcServer;
 #[cfg(unix)]
 pub use server::bind_unix_socket;
 #[cfg(unix)]
 pub use server::serve_listener;
+
+/// Maximum bytes in one IPC line, including its newline (R3-08):
+/// 1 MB is far above the largest real frame (`slow_poll` /
+/// `snapshot` payloads are kilobytes), and a peer that streams
+/// bytes without a newline used to grow the reader's buffer
+/// without bound (`BufReader::lines()` has no cap) — an OOM
+/// vector on both sides. A longer line drops the connection.
+pub const MAX_IPC_LINE_BYTES: usize = 1024 * 1024;
+
+/// Read one `\n`-terminated IPC line, bounded by
+/// [`MAX_IPC_LINE_BYTES`] (R3-08). Returns the line without its
+/// terminator, or [`None`] at EOF. An over-long line, or invalid
+/// UTF-8, is an error — the caller drops the connection (the
+/// over-long case is logged here, once, so a wedged peer leaves a
+/// trace on the side that drops it).
+///
+/// # Errors
+///
+/// [`std::io::Error`] on I/O failure, an over-long line, or
+/// invalid UTF-8.
+pub(crate) async fn read_bounded_line<R>(reader: &mut R) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+    use tokio::io::AsyncReadExt as _;
+    let mut buf: Vec<u8> = Vec::new();
+    // One byte of headroom: a line of exactly MAX bytes + `\n`
+    // reads MAX + 1 bytes and is still legal; anything longer
+    // without a newline is over the cap.
+    let mut limited = reader.take((MAX_IPC_LINE_BYTES + 1) as u64);
+    let n = limited.read_until(b'\n', &mut buf).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.len() > MAX_IPC_LINE_BYTES && !buf.ends_with(b"\n") {
+        eprintln!(
+            "[rsh-ipc] dropping connection: IPC line exceeded the {MAX_IPC_LINE_BYTES}-byte cap without a newline"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IPC line exceeded the 1 MB cap",
+        ));
+    }
+    if buf.ends_with(b"\n") {
+        buf.pop();
+        if buf.ends_with(b"\r") {
+            buf.pop();
+        }
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "IPC line is not UTF-8"))
+}
 
 /// Parse + version-check one request line. Shared by the server and
 /// the tests so both sides enforce the version the same way.
@@ -815,5 +873,63 @@ fn dispatch_profiles_games_learn(
         "is_learning" => Ok(serde_json::json!({"learning": api.is_learning()})),
         "take_learned_button" => Ok(serde_json::json!({"button": api.take_learned_button()})),
         other => Err(IpcError::UnknownMethod(other.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    /// R3-08: a normal line reads back without its terminator;
+    /// a newline-free peer over the cap errors (the connection is
+    /// dropped) instead of growing the buffer without bound; a
+    /// line of exactly the cap + newline is still legal.
+    ///
+    /// Plain `#[test]` (not `#[tokio::test]`): this crate's tokio
+    /// has no `macros` feature, so the test builds its own
+    /// current-thread runtime (same as the client tests).
+    #[test]
+    fn bounded_line_reads_normal_and_rejects_overlong() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            // Normal line.
+            let data = b"{\"v\":2,\"id\":1}\n{\"v\":2}\n";
+            let mut reader = BufReader::new(&data[..]);
+            assert_eq!(
+                read_bounded_line(&mut reader).await.expect("read"),
+                Some("{\"v\":2,\"id\":1}".to_string())
+            );
+            assert_eq!(
+                read_bounded_line(&mut reader).await.expect("read"),
+                Some("{\"v\":2}".to_string())
+            );
+            assert_eq!(
+                read_bounded_line(&mut reader).await.expect("read"),
+                None,
+                "EOF after the last line"
+            );
+
+            // Over-long newline-free input: errors, and the reader is
+            // positioned past the cap (the caller drops the connection).
+            let big = vec![b'x'; MAX_IPC_LINE_BYTES + 64];
+            let mut reader = BufReader::new(&big[..]);
+            let error = read_bounded_line(&mut reader)
+                .await
+                .expect_err("over-long line must error");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+            // Exactly the cap + newline: legal.
+            let mut exact = vec![b'y'; MAX_IPC_LINE_BYTES];
+            exact.push(b'\n');
+            let mut reader = BufReader::new(&exact[..]);
+            let line = read_bounded_line(&mut reader)
+                .await
+                .expect("cap-sized line must read");
+            assert_eq!(line.as_deref().map(str::len), Some(MAX_IPC_LINE_BYTES));
+        });
     }
 }
