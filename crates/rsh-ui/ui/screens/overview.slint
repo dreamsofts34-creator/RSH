@@ -181,7 +181,12 @@ export component OverviewPage inherits VerticalLayout {
             // layout); rows beyond two scroll with the page (F-4).
             // (`for … : if …` is not valid Slint, so each row
             // repeats all tiles and hides the other row's via
-            // `visible` — hidden tiles take no layout space.)
+            // `visible` — NOTE: in Slint 1.18.1 `visible: false`
+            // still KEEPS layout space (proved by the extras gate:
+            // row-1 is 471 px whether the cards are ON or OFF), so
+            // hidden tiles do NOT free their slot; the rows work
+            // because each row's tiles are laid out identically
+            // and only the visible row's content is painted.)
             if games.length > 0 : GridLayout {
                 // R3-UI-06: the gap is responsive now — it reads
                 // `overview-scroll.width` (the ScrollView's own
