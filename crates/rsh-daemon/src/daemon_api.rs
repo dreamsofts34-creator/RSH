@@ -912,6 +912,22 @@ impl AppApi for DaemonApi {
             .map_err(capture_user_error)
     }
 
+    /// Capture the steering full-left endpoint from the live raw
+    /// reading (S1, per-module tuning).
+    fn capture_steering_left(&self) -> Result<u16, UserError> {
+        self.state
+            .capture_steering_left()
+            .map_err(capture_user_error)
+    }
+
+    /// Capture the steering full-right endpoint from the live raw
+    /// reading (S1, per-module tuning).
+    fn capture_steering_right(&self) -> Result<u16, UserError> {
+        self.state
+            .capture_steering_right()
+            .map_err(capture_user_error)
+    }
+
     /// All persisted button→action bindings (v2.0.2), in button
     /// order.
     fn list_bindings(&self) -> Vec<ButtonBinding> {
@@ -1353,6 +1369,36 @@ mod tests {
             "pedal min round-trips through the API"
         );
         assert_eq!(calibration.pedal_max_mv.get("accel"), Some(&3200.0));
+        // S1: steering full-lock capture — centre is 1812 from the
+        // capture above, so 320 lands as the min, 3200 as the max.
+        api.state.note_raw_axes([
+            Some(320),
+            Some(320),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(api.capture_steering_left().expect("capture full left"), 320);
+        api.state.note_raw_axes([
+            Some(3200),
+            Some(3200),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            api.capture_steering_right().expect("capture full right"),
+            3200
+        );
+        let tuning = api.get_tuning("steering");
+        assert_eq!(tuning.min_mv, 320.0);
+        assert_eq!(tuning.max_mv, 3200.0);
     }
 
     #[test]

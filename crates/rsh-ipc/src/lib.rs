@@ -389,10 +389,14 @@ pub fn dispatch(
         "calibration" | "vjoy_status" | "install_vjoy" | "diag_stats" => {
             dispatch_calibration_vjoy_diag(api, request)
         }
-        // v2.0.2: raw-mV read + capture (centre / pedal min / max).
-        "raw_mv" | "capture_centre" | "capture_pedal_min" | "capture_pedal_max" => {
-            dispatch_capture(api, request)
-        }
+        // v2.0.2: raw-mV read + capture (centre / pedal min / max /
+        // steering full lock).
+        "raw_mv"
+        | "capture_centre"
+        | "capture_pedal_min"
+        | "capture_pedal_max"
+        | "capture_steering_left"
+        | "capture_steering_right" => dispatch_capture(api, request),
         // v2.0.2: button→action bindings (list / set / clear).
         "list_bindings" | "set_binding" | "clear_binding" => dispatch_bindings(api, request),
         // v2.0.2 Round 3: Wi-Fi password set/clear (v2.0.6),
@@ -445,6 +449,18 @@ fn dispatch_capture(
                 api.capture_pedal_min(pedal)
             } else {
                 api.capture_pedal_max(pedal)
+            };
+            captured
+                .map(|mv| serde_json::json!({"mv": mv}))
+                .map_err(|error| detailed_api_error(&error))
+        }
+        // S1: steering full-lock capture (no params — the direction
+        // is the method name).
+        "capture_steering_left" | "capture_steering_right" => {
+            let captured = if request.method == "capture_steering_left" {
+                api.capture_steering_left()
+            } else {
+                api.capture_steering_right()
             };
             captured
                 .map(|mv| serde_json::json!({"mv": mv}))

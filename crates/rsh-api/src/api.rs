@@ -1264,6 +1264,40 @@ pub trait AppApi: Send + Sync {
         ))
     }
 
+    /// Capture the steering full-left endpoint from the live raw
+    /// reading (S1, per-module tuning): the wheel must be turned
+    /// fully left. The reading lands on whichever endpoint side
+    /// of the centre it falls on (below → minimum, above →
+    /// maximum), so a reversed pot still captures. Default: error
+    /// — only the daemon captures.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when there is no live wheel data, the reading
+    /// sits at the centre, the captured range would be invalid,
+    /// there is no active profile, or the save fails.
+    fn capture_steering_left(&self) -> Result<u16, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "steering capture is not supported by this API",
+        ))
+    }
+
+    /// Capture the steering full-right endpoint from the live raw
+    /// reading (S1): the wheel must be turned fully right. Same
+    /// side-of-centre storage as [`AppApi::capture_steering_left`].
+    /// Default: error — only the daemon captures.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] — see [`AppApi::capture_steering_left`].
+    fn capture_steering_right(&self) -> Result<u16, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "steering capture is not supported by this API",
+        ))
+    }
+
     /// All persisted button→action bindings (v2.0.2), in button
     /// order. Default: empty — only the daemon owns the store.
     fn list_bindings(&self) -> Vec<ButtonBinding> {

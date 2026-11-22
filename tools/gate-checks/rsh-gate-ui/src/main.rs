@@ -1917,7 +1917,12 @@ fn steering_probe_callbacks(
         *last_bool.borrow(),
         "invoke invert-changed(true) must reach the handler",
     );
-    for (name, value) in [("lock-changed", 0.5_f64), ("smoothing-changed", 0.3_f64)] {
+    for (name, value) in [
+        ("lock-changed", 0.5_f64),
+        ("smoothing-changed", 0.3_f64),
+        ("balance-changed", 0.75_f64),
+        ("trim-changed", 0.2_f64),
+    ] {
         let last_num = Rc::clone(&last_num);
         let last_num_cb = Rc::clone(&last_num);
         instance
@@ -1937,6 +1942,25 @@ fn steering_probe_callbacks(
             &format!("invoke {name}({value}) must reach the handler"),
         );
     }
+    // S1: the full-lock capture buttons fire their callbacks.
+    for name in ["capture-full-left", "capture-full-right"] {
+        let fired = Rc::new(RefCell::new(false));
+        let fired_cb = Rc::clone(&fired);
+        instance
+            .set_callback(name, move |_| {
+                *fired_cb.borrow_mut() = true;
+                Value::Void
+            })
+            .map_err(|error| format!("set {name} handler failed: {error}"))?;
+        instance
+            .invoke(name, &[])
+            .map_err(|error| format!("invoke {name} failed: {error}"))?;
+        report.check(
+            &format!("steering-{name}-callback"),
+            *fired.borrow(),
+            &format!("invoke {name}() must reach the handler"),
+        );
+    }
     Ok(())
 }
 
@@ -1947,6 +1971,8 @@ fn steering_probe_callbacks(
 /// Advanced-on renders a whole extra card of content, the new
 /// labels are in the source and the old rows are gone, and the
 /// Advanced callbacks exist with the right signatures.
+/// (S1–S3, per-module tuning: the full-lock capture buttons and the
+/// balance / centre-trim sliders are covered the same way.)
 fn ui_steering_advanced() -> Outcome {
     let mut report = Report::new();
     // Source assertions: new controls present, old rows gone.
@@ -1955,7 +1981,15 @@ fn ui_steering_advanced() -> Outcome {
         Ok(src) => src,
         Err(error) => return Outcome::fail(format!("read steering.slint failed: {error}")),
     };
-    for label in ["Invert steering", "Steering lock", "Smoothing"] {
+    for label in [
+        "Invert steering",
+        "Steering lock",
+        "Smoothing",
+        "Left/right balance",
+        "Centre trim",
+        "Full left",
+        "Full right",
+    ] {
         report.check(
             &format!("steering-advanced-has-{label}"),
             src.contains(label),
@@ -2110,7 +2144,7 @@ fn checks() -> Vec<UiCheck> {
         ),
         (
             "ui-steering-advanced",
-            "Bug 7: Advanced card holds invert + lock + smoothing (not the old read-only rows)",
+            "Bug 7 + S1–S3: Advanced card holds invert + lock + smoothing + balance + trim, centre card holds the full-lock capture buttons (not the old read-only rows)",
             ui_steering_advanced as fn() -> Outcome,
         ),
     ]

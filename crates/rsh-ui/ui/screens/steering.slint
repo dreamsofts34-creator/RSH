@@ -11,12 +11,18 @@ export component SteeringPage inherits HorizontalLayout {
     // invert, steering lock, smoothing. The old read-only rows
     // (centre mV, raw live, curve exponent box, min/max note) are
     // gone: they showed info nobody could act on.
+    // S1–S3 (per-module tuning): capture full lock (two buttons
+    // in the centre card), left/right balance, centre trim.
     in property <bool> advanced: false;
     in property <bool> invert: false;
     in property <float> lock-frac: 1.0;
     in property <string> lock-text: "900°";
     in property <float> smoothing: 0.3;
     in property <string> smoothing-text: "30%";
+    in property <float> balance: 0.5;
+    in property <string> balance-text: "0%";
+    in property <float> trim: 0.5;
+    in property <string> trim-text: "0%";
     in property <float> input-pct;
     in property <float> output-pct;
     in property <float> marker-vx;
@@ -49,9 +55,15 @@ export component SteeringPage inherits HorizontalLayout {
     callback lock-edited(string);
     callback smoothing-changed(float);
     callback smoothing-edited(string);
+    callback balance-changed(float);
+    callback balance-edited(string);
+    callback trim-changed(float);
+    callback trim-edited(string);
     callback preset-selected(int);
     callback reset-defaults();
     callback set-centre();
+    callback capture-full-left();
+    callback capture-full-right();
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
     spacing: 0px;
     Card {
@@ -148,13 +160,23 @@ export component SteeringPage inherits HorizontalLayout {
                     Text { horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; text: "Point straight ahead, then press."; font-size: 12px; color: Theme.mute; }
                     Btn { label: centre-set ? "Set ✓" : "Set centre"; disabled: !centre-available || busy-kind == 10; clicked => { set-centre(); } }
                 }
+                // S1: Capture full lock — the two buttons sit next
+                // to Set centre: turn fully left / right, press.
+                // Same availability: live daemon only (CaptureOp).
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text { horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; text: "Turn fully left or right, then press."; font-size: 12px; color: Theme.mute; }
+                    Btn { label: "Full left"; disabled: !centre-available || busy-kind == 10; clicked => { capture-full-left(); } }
+                    Btn { label: "Full right"; disabled: !centre-available || busy-kind == 10; clicked => { capture-full-right(); } }
+                }
                 if !centre-available : Text { text: centre-reason; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
             }
         }
         // Bug 7: Advanced mode is real tuning — invert, steering
         // lock (270–900° in steps), smoothing. No second
         // "Sensitivity" slider: the Basic Response curve already is
-        // the sensitivity. "Capture full lock" is deferred.
+        // the sensitivity. S2+S3 add the left/right balance and
+        // centre trim sliders here.
         if advanced : Card {
             VerticalLayout {
                 padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
@@ -171,6 +193,8 @@ export component SteeringPage inherits HorizontalLayout {
                 }
                 SliderRow { label: "Steering lock"; hint: "Lock-to-lock rotation"; value-text: lock-text; value: lock-frac; changed(v) => { lock-changed(v); } value-edited(t) => { lock-edited(t); } }
                 SliderRow { label: "Smoothing"; hint: "Steadies the wheel input"; value-text: smoothing-text; value: smoothing; changed(v) => { smoothing-changed(v); } value-edited(t) => { smoothing-edited(t); } }
+                SliderRow { label: "Left/right balance"; hint: "Evens out uneven pot travel — + favours left"; value-text: balance-text; value: balance; changed(v) => { balance-changed(v); } value-edited(t) => { balance-edited(t); } }
+                SliderRow { label: "Centre trim"; hint: "Fine-nudges the centre, no re-capture"; value-text: trim-text; value: trim; changed(v) => { trim-changed(v); } value-edited(t) => { trim-edited(t); } }
             }
         }
         }

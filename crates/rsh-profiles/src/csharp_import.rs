@@ -281,6 +281,16 @@ pub struct WheelProfile {
     /// Steering scale, 0.2..1.0 (1.0 = 900°, 0.6 = 540°, 0.4 = 360°).
     #[serde(default = "default_scale")]
     pub steering_scale: f64,
+    // --- Steering per-module tuning ---
+    /// Steering left/right lock balance in percent, −20..=+20
+    /// (0 = even; positive favours the left side). Absent in old
+    /// profiles → 0 (even), never a guessed value.
+    #[serde(default)]
+    pub steering_balance_pct: f64,
+    /// Steering centre trim in percent, −5..=+5 (0 = no trim).
+    /// Absent in old profiles → 0.
+    #[serde(default)]
+    pub steering_center_trim_pct: f64,
     /// Game process name for auto-switch (`.exe` suffix stripped by the store).
     pub game_process_name: String,
     /// Car model for auto-switch (normalized lowercase by the store).
@@ -516,6 +526,9 @@ impl Default for WheelProfile {
             pedal_press_ms: default_pedal_press_ms(),
             pedal_release_ms: default_pedal_release_ms(),
             steering_scale: default_scale(),
+            // --- Steering per-module tuning ---
+            steering_balance_pct: 0.0,
+            steering_center_trim_pct: 0.0,
             game_process_name: String::new(),
             car_model: String::new(),
             game: GameId::default(),

@@ -725,6 +725,16 @@ mod tests {
             }
         }
 
+        // S1: steering full-lock capture — canned endpoints either
+        // side of the stub's 1812 mV centre reading.
+        fn capture_steering_left(&self) -> Result<u16, UserError> {
+            Ok(320)
+        }
+
+        fn capture_steering_right(&self) -> Result<u16, UserError> {
+            Ok(3200)
+        }
+
         // v2.0.2 bindings: an in-memory map with the same button
         // range the real store enforces, so the dispatch round-trip
         // tests prove the wire shape and the error path.
@@ -1378,6 +1388,24 @@ mod tests {
                 r#"{"v":2,"id":43,"method":"capture_pedal_max","params":{"pedal":"accel"}}"#,
             )
             .expect("capture_pedal_max parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(
+            resp.result.expect("result").get("mv"),
+            Some(&serde_json::json!(3200))
+        );
+        // S1: steering full-lock capture — no params, the
+        // direction is the method name.
+        let resp = server
+            .handle_line(r#"{"v":2,"id":45,"method":"capture_steering_left","params":{}}"#)
+            .expect("capture_steering_left parses");
+        assert!(resp.ok, "resp: {resp:?}");
+        assert_eq!(
+            resp.result.expect("result").get("mv"),
+            Some(&serde_json::json!(320))
+        );
+        let resp = server
+            .handle_line(r#"{"v":2,"id":46,"method":"capture_steering_right","params":{}}"#)
+            .expect("capture_steering_right parses");
         assert!(resp.ok, "resp: {resp:?}");
         assert_eq!(
             resp.result.expect("result").get("mv"),

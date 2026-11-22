@@ -12,8 +12,11 @@
 //! `deadzone` is percent (0–30), `curve` is the response exponent
 //! (0.5–2.0, 1.0 = linear), `min_mv`/`max_mv` are millivolts (span
 //! must stay ≥ 660 mV), `smoothing` is percent (0–100), `invert`
-//! flips the steering direction, and `steering_lock_deg` is the
-//! steering lock in degrees (one of [`STEERING_LOCK_STEPS_DEG`]).
+//! flips the steering direction, `steering_lock_deg` is the
+//! steering lock in degrees (one of [`STEERING_LOCK_STEPS_DEG`]),
+//! `steering_balance_pct` is the left/right lock balance in percent
+//! (−20..=+20, 0 = even), and `steering_center_trim_pct` is the
+//! centre trim in percent (−5..=+5, 0 = no trim).
 
 use serde::{Deserialize, Serialize};
 
@@ -160,6 +163,21 @@ pub struct TuningSettings {
     /// [`STEERING_LOCK_STEPS_DEG`]; `None` = not applicable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steering_lock_deg: Option<f64>,
+    // --- Steering per-module tuning ---
+    /// Left/right lock balance in percent, −20..=+20 (steering
+    /// module only; `None` = not applicable). `0` = even. Positive
+    /// favours the left: the left side's scale shrinks, so full
+    /// left lock arrives sooner — for a pot that travels less to
+    /// the left than to the right. The engine maps it onto
+    /// `scale_left` / `scale_right` (S2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering_balance_pct: Option<f64>,
+    /// Centre trim in percent, −5..=+5 (steering module only;
+    /// `None` = not applicable). Shifts the effective centre
+    /// (`center_mv`) by that percent of the range's half-span,
+    /// without a full centre re-capture. `0` = no trim (S3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering_center_trim_pct: Option<f64>,
     /// Pedal bite point, 0..1 (clutch / brake only; `None` elsewhere).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bite_point: Option<f64>,
@@ -202,6 +220,9 @@ impl TuningSettings {
             smoothing: 0.0,
             invert: None,
             steering_lock_deg: None,
+            // --- Steering per-module tuning ---
+            steering_balance_pct: None,
+            steering_center_trim_pct: None,
             bite_point: None,
             shifter_gate: None,
             horn_button: None,
@@ -256,6 +277,21 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
     {
         errors.push(format!(
             "steering_lock_deg {lock_deg} is not one of {STEERING_LOCK_STEPS_DEG:?}"
+        ));
+    }
+    // --- Steering per-module tuning ---
+    if let Some(balance) = tuning.steering_balance_pct
+        && !(-20.0..=20.0).contains(&balance)
+    {
+        errors.push(format!(
+            "steering_balance_pct {balance} is outside -20..=20 (%)"
+        ));
+    }
+    if let Some(trim) = tuning.steering_center_trim_pct
+        && !(-5.0..=5.0).contains(&trim)
+    {
+        errors.push(format!(
+            "steering_center_trim_pct {trim} is outside -5..=5 (%)"
         ));
     }
     if let Some(bite) = tuning.bite_point
@@ -336,6 +372,38 @@ mod tests {
         let errors = validate_tuning(&bad);
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
         assert!(errors[0].contains("steering_lock_deg"), "{}", errors[0]);
+    }
+
+    /// Steering per-module tuning (S2+S3): balance and centre trim
+    /// round-trip through JSON, validate in range, and are absent
+    /// for other modules (old profiles load them as `None`).
+    #[test]
+    fn steering_balance_and_trim_round_trip_and_validate() {
+        let mut settings = tuning("steering");
+        settings.steering_balance_pct = Some(-20.0);
+        settings.steering_center_trim_pct = Some(5.0);
+        assert_eq!(validate_tuning(&settings), Vec::<String>::new());
+        let json = serde_json::to_string(&settings).expect("serialize");
+        assert!(json.contains("\"steeringBalancePct\":-20.0"), "{json}");
+        assert!(json.contains("\"steeringCenterTrimPct\":5.0"), "{json}");
+        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, settings);
+        // Other modules never carry them: omitted from the JSON.
+        let json = serde_json::to_string(&tuning("brake")).expect("serialize");
+        assert!(!json.contains("steeringBalancePct"), "{json}");
+        assert!(!json.contains("steeringCenterTrimPct"), "{json}");
+        // Out-of-range values are rejected, never silently clamped.
+        let mut bad = tuning("steering");
+        bad.steering_balance_pct = Some(21.0);
+        bad.steering_center_trim_pct = Some(-6.0);
+        let errors = validate_tuning(&bad);
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(errors.iter().any(|e| e.contains("steering_balance_pct")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("steering_center_trim_pct"))
+        );
     }
 
     #[test]

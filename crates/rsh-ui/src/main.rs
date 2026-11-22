@@ -450,6 +450,12 @@ struct Tuning {
     /// Steering lock in degrees (Bug 7 Advanced slider: one of the
     /// 270/360/540/720/900° steps, default 900°).
     lock_deg: f32,
+    /// Left/right lock balance, percent (−20..+20 — S2 Advanced
+    /// slider, default 0 = even; positive favours the left).
+    balance_pct: f32,
+    /// Centre trim, percent (−5..+5 — S3 Advanced slider,
+    /// default 0 = no trim).
+    trim_pct: f32,
 }
 
 impl Tuning {
@@ -476,6 +482,15 @@ impl Tuning {
             smoothing_pct: settings.smoothing.clamp(0.0, 100.0) as f32,
             invert: settings.invert.unwrap_or(false),
             lock_deg: snap_steering_lock_deg(settings.steering_lock_deg.unwrap_or(900.0)) as f32,
+            // --- Steering per-module tuning ---
+            balance_pct: settings
+                .steering_balance_pct
+                .unwrap_or(0.0)
+                .clamp(-20.0, 20.0) as f32,
+            trim_pct: settings
+                .steering_center_trim_pct
+                .unwrap_or(0.0)
+                .clamp(-5.0, 5.0) as f32,
         }
     }
 
@@ -492,6 +507,9 @@ impl Tuning {
             smoothing: f64::from(self.smoothing_pct),
             invert: Some(self.invert),
             steering_lock_deg: Some(f64::from(self.lock_deg)),
+            // --- Steering per-module tuning ---
+            steering_balance_pct: Some(f64::from(self.balance_pct)),
+            steering_center_trim_pct: Some(f64::from(self.trim_pct)),
             ..base.clone()
         }
     }
@@ -522,6 +540,17 @@ impl Tuning {
         self.lock_deg = snap_steering_lock_deg(f64::from(deg)) as f32;
     }
 
+    /// Left/right lock balance in percent (−20..+20; positive
+    /// favours the left side).
+    fn set_balance(&mut self, pct: f32) {
+        self.balance_pct = pct.clamp(-20.0, 20.0);
+    }
+
+    /// Centre trim in percent (−5..+5).
+    fn set_trim(&mut self, pct: f32) {
+        self.trim_pct = pct.clamp(-5.0, 5.0);
+    }
+
     /// Apply a preset (0 soft, 1 balanced, 2 sharp; 3 custom keeps values).
     fn set_preset(&mut self, preset: i32) {
         self.preset = preset;
@@ -549,6 +578,9 @@ impl Tuning {
         self.smoothing_pct = 30.0;
         self.invert = false;
         self.lock_deg = 900.0;
+        // --- Steering per-module tuning ---
+        self.balance_pct = 0.0;
+        self.trim_pct = 0.0;
     }
 }
 
@@ -1417,6 +1449,9 @@ struct FrameCmdCache {
     curve_text: Option<(f32, SharedString)>,
     lock_text: Option<(f32, SharedString)>,
     smoothing_text: Option<(f32, SharedString)>,
+    // --- Steering per-module tuning ---
+    balance_text: Option<(f32, SharedString)>,
+    trim_text: Option<(f32, SharedString)>,
     conn_label: Option<(bool, bool, bool, String, SharedString)>,
     conn_sub: Option<(bool, bool, String, String, SharedString)>,
     gear_text: Option<(u8, SharedString)>,
@@ -1510,6 +1545,35 @@ impl FrameCmdCache {
         let built: SharedString = format!("{smoothing_pct:.0}%").into();
         self.smoothing_text = Some((smoothing_pct, built.clone()));
         built
+    }
+
+    // --- Steering per-module tuning ---
+    /// Signed percent text (`"+10%"`, `"-5%"`, `"0%"`), rebuilt
+    /// only when it moved. Shared by the balance and trim sliders.
+    #[allow(clippy::float_cmp)]
+    fn signed_pct_text(cache: &mut Option<(f32, SharedString)>, pct: f32) -> SharedString {
+        if let Some((cached_pct, cached)) = cache.as_ref() {
+            if *cached_pct == pct {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = if pct == 0.0 {
+            "0%".into()
+        } else {
+            format!("{pct:+.0}%").into()
+        };
+        *cache = Some((pct, built.clone()));
+        built
+    }
+
+    /// Left/right balance text (`"+10%"`, `"-5%"`, `"0%"`).
+    fn balance_text(&mut self, balance_pct: f32) -> SharedString {
+        Self::signed_pct_text(&mut self.balance_text, balance_pct)
+    }
+
+    /// Centre trim text (`"+2%"`, `"-5%"`, `"0%"`).
+    fn trim_text(&mut self, trim_pct: f32) -> SharedString {
+        Self::signed_pct_text(&mut self.trim_text, trim_pct)
     }
 
     /// Top-bar connection label, rebuilt only when one of its
@@ -2478,6 +2542,33 @@ impl Ctx {
                 .borrow_mut()
                 .smoothing_text(self.tuning.borrow().smoothing_pct),
             |v| win.set_steer_smoothing_text(v),
+        );
+        // --- Steering per-module tuning ---
+        // S2 balance: slider fraction over the −20..+20% range
+        // (0.5 = even); S3 trim: fraction over −5..+5% (0.5 = none).
+        set_if_changed(
+            win.get_steer_balance(),
+            (self.tuning.borrow().balance_pct + 20.0) / 40.0,
+            |v| win.set_steer_balance(v),
+        );
+        set_if_changed(
+            win.get_steer_balance_text(),
+            self.frame_cmds
+                .borrow_mut()
+                .balance_text(self.tuning.borrow().balance_pct),
+            |v| win.set_steer_balance_text(v),
+        );
+        set_if_changed(
+            win.get_steer_trim(),
+            (self.tuning.borrow().trim_pct + 5.0) / 10.0,
+            |v| win.set_steer_trim(v),
+        );
+        set_if_changed(
+            win.get_steer_trim_text(),
+            self.frame_cmds
+                .borrow_mut()
+                .trim_text(self.tuning.borrow().trim_pct),
+            |v| win.set_steer_trim_text(v),
         );
         set_if_changed(win.get_unsaved(), self.unsaved.get(), |v| {
             win.set_unsaved(v);
@@ -8524,6 +8615,9 @@ fn wire_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// refresh per mouse-move ran `push_frame` + capture sync tens of
 /// times per second on top of the timer. Only the debounced daemon
 /// push (`push_steering`) still runs.
+/// (S2+S3: the balance / trim callbacks pushed this over the
+/// 100-line lint — same allow as the other wire_* functions.)
+#[allow(clippy::too_many_lines)]
 fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
@@ -8623,6 +8717,53 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
         win.unwrap().on_smoothing_edited(move |t| {
             if let Ok(pct) = t.trim().trim_end_matches('%').parse::<f32>() {
                 ctx.tuning.borrow_mut().set_smoothing(pct);
+                ctx.push_steering();
+            }
+            // R2-13: no full `refresh` per edit — the 50 ms timer
+            // paints the new local value within one frame.
+        });
+    }
+    // --- Steering per-module tuning ---
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_balance_changed(move |v| {
+            // Slider fraction over the −20..+20% range.
+            ctx.tuning.borrow_mut().set_balance(v * 40.0 - 20.0);
+            ctx.push_steering();
+            // R2-13: no full `refresh` per move — the 50 ms timer
+            // paints the new local value within one frame.
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_balance_edited(move |t| {
+            if let Ok(pct) = t.trim().trim_end_matches('%').parse::<f32>() {
+                ctx.tuning.borrow_mut().set_balance(pct);
+                ctx.push_steering();
+            }
+            // R2-13: no full `refresh` per edit — the 50 ms timer
+            // paints the new local value within one frame.
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_trim_changed(move |v| {
+            // Slider fraction over the −5..+5% range.
+            ctx.tuning.borrow_mut().set_trim(v * 10.0 - 5.0);
+            ctx.push_steering();
+            // R2-13: no full `refresh` per move — the 50 ms timer
+            // paints the new local value within one frame.
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_trim_edited(move |t| {
+            if let Ok(pct) = t.trim().trim_end_matches('%').parse::<f32>() {
+                ctx.tuning.borrow_mut().set_trim(pct);
                 ctx.push_steering();
             }
             // R2-13: no full `refresh` per edit — the 50 ms timer
@@ -8790,6 +8931,100 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                     let reason = Ctx::capture_unavailable_reason();
                     ctx.notify(&w, "Steering", "Couldn't set centre", reason);
                     ui_log!("RSH-UI set centre failed: {reason}");
+                }
+            }
+        });
+    }
+    // --- Steering per-module tuning (S1) ---
+    // Capture full lock: turn fully left / right, press. Same
+    // CaptureOp job shape as Set centre — the capture runs on a
+    // job thread and the result is a toast, never silent.
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_capture_full_left(move || {
+            if let Some(w) = win.upgrade() {
+                if ctx.is_live() {
+                    ctx.run_generic_job(
+                        &w,
+                        JobKind::CaptureOp,
+                        "Capturing full left…",
+                        move |api| JobResult::Capture(api.capture_steering_left()),
+                        move |ctx, w, result| {
+                            let JobResult::Capture(result) = result else {
+                                return;
+                            };
+                            match result {
+                                Ok(mv) => {
+                                    ctx.refresh_calibration();
+                                    ctx.notify(
+                                        w,
+                                        "Steering",
+                                        "Full left captured",
+                                        &format!("Full left captured at {mv} mV."),
+                                    );
+                                }
+                                Err(e) => {
+                                    ctx.notify(
+                                        w,
+                                        "Steering",
+                                        "Couldn't capture full left",
+                                        &e.title,
+                                    );
+                                    ui_log!("RSH-UI capture full left failed: {}", e.title);
+                                }
+                            }
+                        },
+                    );
+                } else {
+                    let reason = Ctx::capture_unavailable_reason();
+                    ctx.notify(&w, "Steering", "Couldn't capture full left", reason);
+                    ui_log!("RSH-UI capture full left failed: {reason}");
+                }
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_capture_full_right(move || {
+            if let Some(w) = win.upgrade() {
+                if ctx.is_live() {
+                    ctx.run_generic_job(
+                        &w,
+                        JobKind::CaptureOp,
+                        "Capturing full right…",
+                        move |api| JobResult::Capture(api.capture_steering_right()),
+                        move |ctx, w, result| {
+                            let JobResult::Capture(result) = result else {
+                                return;
+                            };
+                            match result {
+                                Ok(mv) => {
+                                    ctx.refresh_calibration();
+                                    ctx.notify(
+                                        w,
+                                        "Steering",
+                                        "Full right captured",
+                                        &format!("Full right captured at {mv} mV."),
+                                    );
+                                }
+                                Err(e) => {
+                                    ctx.notify(
+                                        w,
+                                        "Steering",
+                                        "Couldn't capture full right",
+                                        &e.title,
+                                    );
+                                    ui_log!("RSH-UI capture full right failed: {}", e.title);
+                                }
+                            }
+                        },
+                    );
+                } else {
+                    let reason = Ctx::capture_unavailable_reason();
+                    ctx.notify(&w, "Steering", "Couldn't capture full right", reason);
+                    ui_log!("RSH-UI capture full right failed: {reason}");
                 }
             }
         });
@@ -10510,25 +10745,39 @@ mod tests {
     /// Bug 7: the Advanced fields round-trip through the daemon
     /// record — invert, lock (snapped), smoothing — and
     /// `reset_defaults` restores all of them, not just the feel.
+    /// (S2+S3: balance and centre trim round-trip the same way.)
     #[test]
     fn steering_advanced_fields_round_trip_through_settings() {
         let mut t = Tuning::from_settings(&TuningSettings::neutral("steering"));
         assert!(!t.invert);
         assert_eq!(t.lock_deg, 900.0);
+        assert_eq!(t.balance_pct, 0.0);
+        assert_eq!(t.trim_pct, 0.0);
         t.set_invert(true);
         t.set_lock_deg(500.0);
         t.set_smoothing(45.0);
         t.set_deadzone(25.0);
+        t.set_balance(10.0);
+        t.set_trim(-3.0);
         let settings = t.to_settings(&TuningSettings::neutral("steering"));
         assert_eq!(settings.invert, Some(true));
         assert_eq!(settings.steering_lock_deg, Some(540.0));
         assert_eq!(settings.smoothing, 45.0);
         assert_eq!(settings.deadzone, 25.0);
+        assert_eq!(settings.steering_balance_pct, Some(10.0));
+        assert_eq!(settings.steering_center_trim_pct, Some(-3.0));
         let back = Tuning::from_settings(&settings);
         assert!(back.invert);
         assert_eq!(back.lock_deg, 540.0);
         assert_eq!(back.smoothing_pct, 45.0);
         assert_eq!(back.deadzone_pct, 25.0);
+        assert_eq!(back.balance_pct, 10.0);
+        assert_eq!(back.trim_pct, -3.0);
+        // The sliders clamp at their ends, never beyond.
+        t.set_balance(99.0);
+        assert_eq!(t.balance_pct, 20.0);
+        t.set_trim(-99.0);
+        assert_eq!(t.trim_pct, -5.0);
         // Deadzone clamps at the new 30% cap, not the old 10%.
         t.set_deadzone(99.0);
         assert_eq!(t.deadzone_pct, 30.0);
@@ -10537,6 +10786,8 @@ mod tests {
         assert_eq!(t.smoothing_pct, 30.0);
         assert!(!t.invert);
         assert_eq!(t.lock_deg, 900.0);
+        assert_eq!(t.balance_pct, 0.0);
+        assert_eq!(t.trim_pct, 0.0);
     }
 
     #[test]
@@ -11495,6 +11746,8 @@ mod tests {
     /// invert toggle, lock slider (snapped to steps), smoothing
     /// slider — from callback to local tuning to window props, and
     /// the deadzone cap is 30% (full-scale drag = 30%).
+    /// (S2+S3: the balance and centre-trim sliders sync the same
+    /// way — fractions over −20..+20% and −5..+5%.)
     #[test]
     fn steering_advanced_controls_sync_to_window_and_tuning() {
         let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
@@ -11509,6 +11762,11 @@ mod tests {
         assert_eq!(win.get_steer_lock(), 1.0);
         assert_eq!(win.get_steer_lock_text().as_str(), "900°");
         assert_eq!(win.get_steer_smoothing(), 0.0);
+        // S2+S3 defaults: even balance (0.5), no trim (0.5).
+        assert_eq!(win.get_steer_balance(), 0.5);
+        assert_eq!(win.get_steer_balance_text().as_str(), "0%");
+        assert_eq!(win.get_steer_trim(), 0.5);
+        assert_eq!(win.get_steer_trim_text().as_str(), "0%");
         // Invert on, lock slider mid-range (585° → snaps to 540°),
         // smoothing to 30%.
         win.invoke_invert_changed(true);
@@ -11522,6 +11780,22 @@ mod tests {
         assert!((win.get_steer_lock() - (540.0 - 270.0) / 630.0).abs() < 0.001);
         assert_eq!(win.get_steer_lock_text().as_str(), "540°");
         assert_eq!(win.get_steer_smoothing_text().as_str(), "30%");
+        // Balance slider to 0.75 (+10%) and trim to 0.2 (−3%):
+        // local tuning moves, window props follow on refresh.
+        win.invoke_balance_changed(0.75);
+        win.invoke_trim_changed(0.2);
+        assert_eq!(ctx.tuning.borrow().balance_pct, 10.0);
+        assert_eq!(ctx.tuning.borrow().trim_pct, -3.0);
+        ctx.refresh(&win, 0);
+        assert_eq!(win.get_steer_balance(), 0.75);
+        assert_eq!(win.get_steer_balance_text().as_str(), "+10%");
+        assert!((win.get_steer_trim() - 0.2).abs() < 0.001);
+        assert_eq!(win.get_steer_trim_text().as_str(), "-3%");
+        // Text edits parse: "+5%" balance and "-5%" trim.
+        win.invoke_balance_edited("+5%".into());
+        assert_eq!(ctx.tuning.borrow().balance_pct, 5.0);
+        win.invoke_trim_edited("-5%".into());
+        assert_eq!(ctx.tuning.borrow().trim_pct, -5.0);
         // Text edits parse and snap: "720°" and "45%".
         win.invoke_lock_edited("720°".into());
         assert_eq!(ctx.tuning.borrow().lock_deg, 720.0);

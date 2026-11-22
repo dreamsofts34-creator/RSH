@@ -314,6 +314,19 @@ pub fn validate_profile(profile: &WheelProfile) -> Vec<String> {
             profile.steering_scale
         ));
     }
+    // --- Steering per-module tuning ---
+    if !(-20.0..=20.0).contains(&profile.steering_balance_pct) {
+        errors.push(format!(
+            "steering_balance_pct {} is outside -20..=20 (%)",
+            profile.steering_balance_pct
+        ));
+    }
+    if !(-5.0..=5.0).contains(&profile.steering_center_trim_pct) {
+        errors.push(format!(
+            "steering_center_trim_pct {} is outside -5..=5 (%)",
+            profile.steering_center_trim_pct
+        ));
+    }
     for (label, button) in [
         ("gear_up_vjoy_button", profile.gear_up_vjoy_button),
         ("gear_down_vjoy_button", profile.gear_down_vjoy_button),
@@ -1911,6 +1924,8 @@ mod tests {
     /// Bug 7 (PC-test fix): a profile saved before the steering
     /// invert/lock fields existed loads with the defaults — not
     /// inverted, full 900° lock — instead of failing to parse.
+    /// (S2+S3: the same holds for the balance / centre-trim
+    /// fields — an old profile loads even, untrimmed.)
     #[test]
     fn old_profile_without_steering_fields_loads_with_defaults() {
         let mut value =
@@ -1918,9 +1933,16 @@ mod tests {
         let object = value.as_object_mut().expect("profile is an object");
         object.remove("invert_steering");
         object.remove("steering_scale");
+        object.remove("steering_balance_pct");
+        object.remove("steering_center_trim_pct");
         let back: WheelProfile = serde_json::from_value(value).expect("deserialize old profile");
         assert!(!back.invert_steering, "old profile is not inverted");
         assert_eq!(back.steering_scale, 1.0, "old profile is full lock");
+        assert_eq!(back.steering_balance_pct, 0.0, "old profile is even");
+        assert_eq!(
+            back.steering_center_trim_pct, 0.0,
+            "old profile is untrimmed"
+        );
     }
 
     #[test]

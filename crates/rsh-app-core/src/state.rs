@@ -161,7 +161,10 @@ use rsh_api::connection::{HELLO_ATTEMPTS, HELLO_WAIT};
 use rsh_api::errors::ConnectionError;
 use rsh_api::tuning::{snap_steering_lock_deg, steering_lock_deg_to_scale};
 use rsh_api::{FirmwareCheck, FirmwareUpdateStatus};
-use rsh_engine::calibration::{CalibrationError, MIN_SPAN_MV, validate_pedal_range};
+use rsh_engine::calibration::{
+    CalibrationError, DEFAULT_CENTER_MV, MIN_HALF_SPAN_MV, MIN_SPAN_MV, validate_pedal_range,
+    validate_steering_range,
+};
 use rsh_engine::engine::{
     EngineReport, OutputSink, PacketSource, SinkError, StopHandle, WheelEngine,
 };
@@ -4242,6 +4245,155 @@ impl AppStateCore {
         Ok(centre)
     }
 
+    /// Capture the steering full-left endpoint from the live raw
+    /// reading (S1, per-module tuning): the wheel must be turned
+    /// fully left. See [`Self::capture_steering_right`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when there is no fresh live reading (or
+    /// no steering axis in it), the reading sits at the centre,
+    /// the resulting range is invalid, there is no active profile,
+    /// or the save fails.
+    pub fn capture_steering_left(&self) -> Result<u16, String> {
+        self.capture_steering_endpoint(true)
+    }
+
+    /// Capture the steering full-right endpoint from the live raw
+    /// reading (S1): the wheel must be turned fully right. The
+    /// reading itself decides which endpoint it lands on: below
+    /// the centre it is the minimum, above it the maximum. That
+    /// keeps a reversed pot working — full left reads high, so it
+    /// lands as the maximum instead of refusing both captures —
+    /// and the Invert toggle then fixes the direction. The
+    /// endpoint lands in the steering calibration record AND the
+    /// module tuning's min/max (the plan reads the range from the
+    /// tuning), the profile is persisted to disk, the draft (when
+    /// one exists) gets the same values without being marked dirty
+    /// (the capture is already saved), and the plan is pushed
+    /// live. Returns the captured mV.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when there is no fresh live reading (or
+    /// no steering axis in it), the reading sits at the centre,
+    /// the resulting range fails [`validate_steering_range`], there
+    /// is no active profile, or the save fails.
+    pub fn capture_steering_right(&self) -> Result<u16, String> {
+        self.capture_steering_endpoint(false)
+    }
+
+    /// Shared half of [`Self::capture_steering_left`] /
+    /// [`Self::capture_steering_right`]: `is_left` names the
+    /// direction the user turned (used in messages); the stored
+    /// endpoint follows the reading's side of the centre.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn capture_steering_endpoint(&self, is_left: bool) -> Result<u16, String> {
+        let direction = if is_left { "left" } else { "right" };
+        let axes = self.fresh_raw_axes_at(Instant::now())?;
+        let mv = axes[SLOT_STEERING]
+            .ok_or_else(|| "no steering reading in the latest frame".to_string())?;
+        if mv > 3300 {
+            return Err(format!("steering reading {mv} mV is outside 0..=3300 mV"));
+        }
+        let tuning = self.get_tuning("steering");
+        let mut store = lock(&self.store);
+        let active = store
+            .active()
+            .ok_or_else(|| "no active profile".to_string())?;
+        let mut profile = active.profile.clone();
+        let id = active.id.clone();
+        // The centre the reading is judged against: the captured
+        // centre when one exists, else the midpoint of the current
+        // range (the pipeline's own fallback centre).
+        let centre = match profile
+            .steering_calibration
+            .as_ref()
+            .filter(|calibration| calibration.is_set)
+        {
+            Some(calibration) => u16::try_from(calibration.raw_center).unwrap_or(DEFAULT_CENTER_MV),
+            None => f64::midpoint(
+                tuning.min_mv.clamp(0.0, 3300.0),
+                tuning.max_mv.clamp(0.0, 3300.0),
+            ) as u16,
+        };
+        if mv == centre {
+            return Err(format!(
+                "steering reading {mv} mV is at the centre — turn the wheel fully {direction} first, then capture again"
+            ));
+        }
+        // The other endpoint comes from the calibration when it
+        // carries a real range; a fresh centre-only calibration
+        // (min == max == centre, as `capture_centre` creates it)
+        // is degenerate, so the tuning's range supplies the other
+        // endpoint instead — otherwise a centre captured first
+        // would refuse both full-lock captures.
+        let (current_min, current_max) = match profile
+            .steering_calibration
+            .as_ref()
+            .filter(|calibration| calibration.is_set)
+            .filter(|calibration| calibration.raw_min < calibration.raw_max)
+        {
+            Some(calibration) => (
+                u16::try_from(calibration.raw_min).unwrap_or(0),
+                u16::try_from(calibration.raw_max).unwrap_or(3300),
+            ),
+            None => (
+                tuning.min_mv.clamp(0.0, 3300.0) as u16,
+                tuning.max_mv.clamp(0.0, 3300.0) as u16,
+            ),
+        };
+        let (min_mv, max_mv) = if mv < centre {
+            (mv, current_max)
+        } else {
+            (current_min, mv)
+        };
+        validate_steering_range(min_mv, centre, max_mv).map_err(|error| match error {
+            CalibrationError::BadOrder => format!(
+                "steering range {min_mv}..={max_mv} mV does not straddle the centre {centre} mV — capture the centre first, then capture full lock again"
+            ),
+            CalibrationError::HalfSpanTooNarrow { half_span_mv } => format!(
+                "steering full-{direction} {mv} mV is only {half_span_mv} mV from the centre {centre} mV (need at least {MIN_HALF_SPAN_MV} mV) — turn the wheel further to full lock and capture again"
+            ),
+            CalibrationError::SpanTooNarrow { span_mv } => format!(
+                "steering range {min_mv}..={max_mv} mV spans only {span_mv} mV (need at least {MIN_SPAN_MV} mV) — capture the centre, then both full-lock ends"
+            ),
+            _ => format!("steering range {min_mv}..={max_mv} mV is invalid"),
+        })?;
+        profile.calibrated_at_utc = format_system_time_rfc3339(SystemTime::now());
+        profile.steering_calibration = Some(SteeringCalibration {
+            raw_min: i32::from(min_mv),
+            raw_center: i32::from(centre),
+            raw_max: i32::from(max_mv),
+            is_set: true,
+            is_millivolts: true,
+        });
+        // The pipeline reads the steering range from the module
+        // tuning, so the captured endpoint lands there too (store +
+        // draft + session tuning below).
+        let mut module_tuning = tuning.clone();
+        module_tuning.min_mv = f64::from(min_mv);
+        module_tuning.max_mv = f64::from(max_mv);
+        Self::apply_tuning_to_profile(&mut profile, &module_tuning);
+        store
+            .update(&id, profile.clone())
+            .map_err(|error| error.to_string())?;
+        store.save().map_err(|error| error.to_string())?;
+        drop(store);
+        if let Some(draft) = lock(&self.draft).as_mut() {
+            draft.profile.steering_calibration = profile.steering_calibration;
+            Self::apply_tuning_to_profile(&mut draft.profile, &module_tuning);
+            draft
+                .profile
+                .calibrated_at_utc
+                .clone_from(&profile.calibrated_at_utc);
+        }
+        lock(&self.tunings).insert(module_tuning.module.clone(), module_tuning);
+        self.push_pipeline_plan();
+        self.note_slow_state_changed();
+        Ok(mv)
+    }
+
     /// Capture one pedal's released ("up") endpoint from the live raw
     /// reading. See [`Self::capture_pedal_max`].
     ///
@@ -6176,21 +6328,27 @@ impl AppStateCore {
         // per-module tuning — both branches below report them, so
         // the UI can init the Advanced controls from a stored
         // profile even before any steering edit created a module
-        // entry. Other modules never carry them (`None`).
-        let steering_opts = |profile: &WheelProfile| -> (Option<bool>, Option<f64>) {
-            if module == "steering" {
-                (
-                    Some(profile.invert_steering),
-                    Some(snap_steering_lock_deg(profile.steering_scale * 900.0)),
-                )
-            } else {
-                (None, None)
-            }
-        };
+        // entry. (S2+S3: the balance / centre trim live on the
+        // profile the same way.) Other modules never carry them
+        // (`None`).
+        let steering_opts =
+            |profile: &WheelProfile| -> (Option<bool>, Option<f64>, Option<f64>, Option<f64>) {
+                if module == "steering" {
+                    (
+                        Some(profile.invert_steering),
+                        Some(snap_steering_lock_deg(profile.steering_scale * 900.0)),
+                        Some(profile.steering_balance_pct),
+                        Some(profile.steering_center_trim_pct),
+                    )
+                } else {
+                    (None, None, None, None)
+                }
+            };
         if let Some(active) = lock(&self.store).active()
             && let Some(stored) = active.profile.module_tunings.get(&module)
         {
-            let (invert, steering_lock_deg) = steering_opts(&active.profile);
+            let (invert, steering_lock_deg, steering_balance_pct, steering_center_trim_pct) =
+                steering_opts(&active.profile);
             return TuningSettings {
                 module: module.clone(),
                 deadzone: stored.deadzone * 100.0,
@@ -6200,6 +6358,9 @@ impl AppStateCore {
                 smoothing: stored.smoothing * 100.0,
                 invert,
                 steering_lock_deg,
+                // --- Steering per-module tuning ---
+                steering_balance_pct,
+                steering_center_trim_pct,
                 bite_point: stored.bite_point,
                 shifter_gate: if module == "shifter" {
                     Some(if stored.gate_mode.eq_ignore_ascii_case("h-pattern") {
@@ -6221,9 +6382,12 @@ impl AppStateCore {
                 handbrake_button_mode: stored.handbrake_button_mode,
             };
         }
-        let (invert, steering_lock_deg) = lock(&self.store)
-            .active()
-            .map_or((None, None), |active| steering_opts(&active.profile));
+        let (invert, steering_lock_deg, steering_balance_pct, steering_center_trim_pct) =
+            lock(&self.store)
+                .active()
+                .map_or((None, None, None, None), |active| {
+                    steering_opts(&active.profile)
+                });
         TuningSettings {
             module,
             deadzone: 0.0,
@@ -6233,6 +6397,9 @@ impl AppStateCore {
             smoothing: 0.0,
             invert,
             steering_lock_deg,
+            // --- Steering per-module tuning ---
+            steering_balance_pct,
+            steering_center_trim_pct,
             bite_point: None,
             shifter_gate: None,
             horn_button: None,
@@ -6342,6 +6509,13 @@ impl AppStateCore {
                 let scale = steering_lock_deg_to_scale(lock_deg);
                 profile.steering_scale = scale;
                 entry.scale = scale;
+            }
+            // --- Steering per-module tuning ---
+            if let Some(balance) = tuning.steering_balance_pct {
+                profile.steering_balance_pct = balance;
+            }
+            if let Some(trim) = tuning.steering_center_trim_pct {
+                profile.steering_center_trim_pct = trim;
             }
         }
         entry.min_mv = Some(tuning.min_mv);
@@ -6542,6 +6716,42 @@ impl AppStateCore {
                 ModuleTuning::default().release_ms,
             ),
         };
+        // --- Steering per-module tuning ---
+        // S2: the lock scale splits per side by the balance —
+        // positive favours left (left scale smaller, full left lock
+        // sooner). S3: the trim shifts the centre by that percent
+        // of the range's half-span, clamped to stay strictly inside
+        // the range (the pipeline would reset an outside centre to
+        // the midpoint — this keeps the trim honest instead). Both
+        // read the profile (draft-aware via `current_profile`), so
+        // an unsaved slider move reaches the live plan at once.
+        // A range narrower than the 660 mV minimum skips the trim:
+        // there is no room for a centre strictly inside it.
+        let (scale_left, scale_right, center_mv) = if module == "steering" {
+            let balance = profile
+                .map_or(0.0, |p| p.steering_balance_pct)
+                .clamp(-20.0, 20.0) as f32;
+            let trim = profile
+                .map_or(0.0, |p| p.steering_center_trim_pct)
+                .clamp(-5.0, 5.0) as f32;
+            let min_mv = tuning.min_mv.clamp(0.0, 3300.0) as f32;
+            let max_mv = tuning.max_mv.clamp(0.0, 3300.0) as f32;
+            let trimmed = if max_mv - min_mv >= 660.0 {
+                let half_span = (max_mv - min_mv) / 2.0;
+                (f32::from(center_mv) + trim / 100.0 * half_span)
+                    .round()
+                    .clamp(min_mv + 1.0, max_mv - 1.0)
+            } else {
+                f32::from(center_mv)
+            };
+            (
+                (scale * (1.0 - balance / 100.0)).clamp(0.2, 1.0),
+                (scale * (1.0 + balance / 100.0)).clamp(0.2, 1.0),
+                trimmed as u16,
+            )
+        } else {
+            (scale, scale, center_mv)
+        };
         ModuleTuning {
             enabled: stored.map_or(module != "clutch", |s| s.enabled),
             deadzone: (tuning.deadzone / 100.0) as f32,
@@ -6552,6 +6762,9 @@ impl AppStateCore {
             center_mv,
             invert,
             scale,
+            // --- Steering per-module tuning ---
+            scale_left,
+            scale_right,
             press_ms,
             release_ms,
             bite_point: tuning.bite_point.unwrap_or(0.0) as f32,
@@ -10309,6 +10522,245 @@ mod tests {
         // Other modules never carry steering options.
         assert_eq!(state.get_tuning("brake").invert, None);
         assert_eq!(state.get_tuning("brake").steering_lock_deg, None);
+    }
+
+    /// Steering per-module tuning (S2+S3): balance + centre trim
+    /// round-trip — `get_tuning` reports the profile defaults
+    /// (even, untrimmed), a `set_tuning` with +20% balance and
+    /// −4% trim lands in the live plan (left scale 0.8, right
+    /// scale clamped to 1.0, centre shifted by −4% of the
+    /// half-span), and a Save persists both.
+    #[test]
+    fn steering_balance_and_trim_round_trip_through_plan_and_store() {
+        let (state, dir) = test_state();
+        let _ = activate_first_profile(&state);
+        let tuning = state.get_tuning("steering");
+        assert_eq!(tuning.steering_balance_pct, Some(0.0), "default is even");
+        assert_eq!(
+            tuning.steering_center_trim_pct,
+            Some(0.0),
+            "default is untrimmed"
+        );
+        let mut steering = tuning;
+        steering.steering_balance_pct = Some(20.0);
+        steering.steering_center_trim_pct = Some(-4.0);
+        state
+            .set_tuning(&steering)
+            .expect("set steering balance+trim");
+        let plan = state.build_pipeline_plan();
+        assert!(
+            (plan.steering.scale_left - 0.8).abs() < f32::EPSILON,
+            "balance +20% → left scale 0.8 (base 1.0)"
+        );
+        assert!(
+            (plan.steering.scale_right - 1.0).abs() < f32::EPSILON,
+            "balance +20% → right scale clamps to 1.0"
+        );
+        assert_eq!(
+            plan.steering.center_mv, 1734,
+            "trim −4% of the 1650 mV half-span shifts 1800 → 1734"
+        );
+        let back = state.get_tuning("steering");
+        assert_eq!(back.steering_balance_pct, Some(20.0));
+        assert_eq!(back.steering_center_trim_pct, Some(-4.0));
+        assert!(state.save_draft().expect("save draft"));
+        let reopened = ProfileStore::open(&dir).expect("reopen store");
+        let profile = &reopened.active().expect("active after reopen").profile;
+        assert!(
+            (profile.steering_balance_pct - 20.0).abs() < f64::EPSILON,
+            "balance persisted"
+        );
+        assert!(
+            (profile.steering_center_trim_pct - (-4.0)).abs() < f64::EPSILON,
+            "trim persisted"
+        );
+        // Other modules never carry steering options.
+        assert_eq!(state.get_tuning("brake").steering_balance_pct, None);
+        assert_eq!(state.get_tuning("brake").steering_center_trim_pct, None);
+    }
+
+    /// S1: full-lock capture round-trips through the calibration
+    /// record AND the module tuning, and the live plan uses the
+    /// captured range. A reading at the centre and a half-pressed
+    /// capture are refused, never saved.
+    #[test]
+    fn capture_steering_left_right_round_trips_and_drives_the_plan() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        assert!(
+            state.capture_steering_left().is_err(),
+            "no live frame yet: capture must fail, not save a default"
+        );
+        // No calibration yet: the centre is the range midpoint
+        // (0..3300 → 1650), so a reading AT it is refused.
+        state.note_raw_axes([
+            Some(1650),
+            Some(300),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert!(
+            state.capture_steering_left().is_err(),
+            "a reading at the centre is not full lock"
+        );
+        // Barely off centre: half-span 150 mV < 330 mV.
+        state.note_raw_axes([
+            Some(1500),
+            Some(300),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert!(
+            state.capture_steering_left().is_err(),
+            "a half-pressed capture must fail"
+        );
+        state.note_raw_axes([
+            Some(320),
+            Some(300),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            state.capture_steering_left().expect("capture full left"),
+            320
+        );
+        let tuning = state.get_tuning("steering");
+        assert_eq!(tuning.min_mv, 320.0);
+        assert_eq!(tuning.max_mv, 3300.0);
+        let plan = state.build_pipeline_plan();
+        assert_eq!(plan.steering.min_mv, 320);
+        assert_eq!(plan.steering.max_mv, 3300);
+        assert_eq!(plan.steering.center_mv, 1650);
+        state.note_raw_axes([
+            Some(3100),
+            Some(300),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            state.capture_steering_right().expect("capture full right"),
+            3100
+        );
+        let tuning = state.get_tuning("steering");
+        assert_eq!(tuning.min_mv, 320.0);
+        assert_eq!(tuning.max_mv, 3100.0);
+        let plan = state.build_pipeline_plan();
+        assert_eq!(plan.steering.min_mv, 320);
+        assert_eq!(plan.steering.max_mv, 3100);
+        assert_eq!(plan.steering.center_mv, 1650);
+    }
+
+    /// S1 regression: a centre captured first (which creates a
+    /// degenerate min == max == centre calibration) must not
+    /// refuse the full-lock captures that follow.
+    #[test]
+    fn capture_steering_after_centre_uses_tuning_range() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        state.note_raw_axes([
+            Some(1812),
+            Some(300),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(state.capture_centre().expect("capture centre"), 1812);
+        state.note_raw_axes([
+            Some(320),
+            Some(300),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            state.capture_steering_left().expect("capture full left"),
+            320
+        );
+        state.note_raw_axes([
+            Some(3100),
+            Some(300),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            state.capture_steering_right().expect("capture full right"),
+            3100
+        );
+        let tuning = state.get_tuning("steering");
+        assert_eq!(tuning.min_mv, 320.0);
+        assert_eq!(tuning.max_mv, 3100.0);
+        let plan = state.build_pipeline_plan();
+        assert_eq!(plan.steering.center_mv, 1812);
+    }
+
+    /// S1: a reversed pot still captures — the reading lands on
+    /// whichever endpoint side of the centre it falls on, so full
+    /// left (reading high) is stored as the maximum and full right
+    /// (reading low) as the minimum; Invert then fixes direction.
+    #[test]
+    fn capture_steering_left_stores_by_side_for_reversed_pot() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        state.note_raw_axes([
+            Some(3100),
+            Some(300),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            state.capture_steering_left().expect("capture full left"),
+            3100
+        );
+        let tuning = state.get_tuning("steering");
+        assert_eq!(tuning.min_mv, 0.0, "high left reading is not the min");
+        assert_eq!(tuning.max_mv, 3100.0, "high left reading is the max");
+        state.note_raw_axes([
+            Some(320),
+            Some(300),
+            Some(300),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]);
+        assert_eq!(
+            state.capture_steering_right().expect("capture full right"),
+            320
+        );
+        let tuning = state.get_tuning("steering");
+        assert_eq!(tuning.min_mv, 320.0);
+        assert_eq!(tuning.max_mv, 3100.0);
     }
 
     /// L4 learn mode: arming captures the next physical button press
