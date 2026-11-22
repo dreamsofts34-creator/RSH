@@ -2329,9 +2329,9 @@ fn ui_encoder_tuning() -> Outcome {
 /// tuning" card holds the debounce + long-press threshold sliders,
 /// the edit panel holds the long-press action picker, and the window
 /// + Rust wiring exist behind them. Static source checks only: the
-/// Buttons page has no probe harness (its render needs the full
-/// window + bindings), so — like `ui_encoder_tuning` — this proves
-/// the controls are in the source and wired, not that they paint.
+///   Buttons page has no probe harness (its render needs the full
+///   window + bindings), so — like `ui_encoder_tuning` — this proves
+///   the controls are in the source and wired, not that they paint.
 fn ui_button_tuning() -> Outcome {
     let mut report = Report::new();
     let buttons = match read_gate_source("crates/rsh-ui/ui/screens/buttons.slint") {

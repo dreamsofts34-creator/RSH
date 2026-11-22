@@ -6452,7 +6452,6 @@ impl AppStateCore {
     // it would scatter one record's shape.
     #[allow(clippy::too_many_lines)]
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn get_tuning(&self, module: &str) -> TuningSettings {
         let module = canonical_module_id(module);
         if let Some(tuning) = lock(&self.tunings).get(&module) {
@@ -6979,6 +6978,10 @@ impl AppStateCore {
     /// (deadzone 0..=0.5, curve -1..=1, mV 0..=3300, bite 0..=1), and
     /// the pipeline itself is `f32`, so the `f64` → `f32` step loses
     /// only precision the pipeline never had.
+    // One function by design: the record is built field-by-field
+    // from the stored tuning (one line per tuning field) — splitting
+    // it would scatter one record's shape.
+    #[allow(clippy::too_many_lines)]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn module_plan_tuning(
         profile: Option<&WheelProfile>,
