@@ -181,6 +181,14 @@ pub struct TuningSettings {
     /// Pedal bite point, 0..1 (clutch / brake only; `None` elsewhere).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bite_point: Option<f64>,
+    // --- Brake per-module tuning ---
+    /// Brake force (BRF), 0.5..=1.0 as a fraction: the travel that
+    /// gives 100% brake (brake module only; `None` = 100% / not
+    /// applicable — old profiles load as `None`, i.e. full force).
+    /// Calibration (`min_mv` / `max_mv`) stays untouched: this only
+    /// rescales the mapped travel in the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saturation: Option<f64>,
     /// Shifter gate type (shifter module only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shifter_gate: Option<ShifterGate>,
@@ -224,6 +232,8 @@ impl TuningSettings {
             steering_balance_pct: None,
             steering_center_trim_pct: None,
             bite_point: None,
+            // --- Brake per-module tuning ---
+            saturation: None,
             shifter_gate: None,
             horn_button: None,
             led_brightness: None,
@@ -298,6 +308,12 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
         && !(0.0..=1.0).contains(&bite)
     {
         errors.push(format!("bite_point {bite} is outside 0..=1"));
+    }
+    // --- Brake per-module tuning ---
+    if let Some(saturation) = tuning.saturation
+        && !(0.5..=1.0).contains(&saturation)
+    {
+        errors.push(format!("saturation {saturation} is outside 0.5..=1.0"));
     }
     if let Some(button) = tuning.horn_button
         && !(1..=32).contains(&button)
@@ -427,6 +443,35 @@ mod tests {
         assert_eq!(validate_tuning(&shifter), Vec::<String>::new());
         let json = serde_json::to_string(&shifter).expect("serialize");
         assert!(json.contains("\"shifterGate\":\"h-pattern\""), "{json}");
+    }
+
+    #[test]
+    fn brake_saturation_round_trips_and_validates() {
+        // B1: brake force 50–100% (0.5..=1.0 fraction); defaults to
+        // None (= 100%) so old profiles load without the field.
+        let mut settings = tuning("brake");
+        assert_eq!(settings.saturation, None);
+        assert_eq!(validate_tuning(&settings), Vec::<String>::new());
+        settings.saturation = Some(0.75);
+        assert_eq!(validate_tuning(&settings), Vec::<String>::new());
+        let json = serde_json::to_string(&settings).expect("serialize");
+        assert!(json.contains("\"saturation\":0.75"), "{json}");
+        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, settings);
+        // Other modules never carry it: omitted from the JSON.
+        let json = serde_json::to_string(&tuning("clutch")).expect("serialize");
+        assert!(!json.contains("saturation"), "{json}");
+        // Old JSON without the field loads as None (100%).
+        let old = r#"{"module":"brake","deadzone":0.0,"curve":1.0,"minMv":0.0,"maxMv":3300.0,"smoothing":0.0,"bitePoint":0.2}"#;
+        let back: TuningSettings = serde_json::from_str(old).expect("deserialize old");
+        assert_eq!(back.saturation, None);
+        assert_eq!(back.bite_point, Some(0.2));
+        // Out-of-range saturation is rejected, never silently clamped.
+        let mut bad = tuning("brake");
+        bad.saturation = Some(0.4);
+        let errors = validate_tuning(&bad);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].contains("saturation"), "{}", errors[0]);
     }
 
     #[test]

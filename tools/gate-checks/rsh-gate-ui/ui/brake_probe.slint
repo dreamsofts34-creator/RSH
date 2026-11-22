@@ -1,0 +1,33 @@
+// Probe window hosting the real PedalsPage (same-to-same from
+// crates/rsh-ui/ui/screens/pedals.slint) so the gate can render
+// it headless: the brake card's Brake force + Bite point sliders
+// must render, move their thumbs when the props change, and fire
+// their callbacks through.
+import { PedalsPage } from "../../../crates/rsh-ui/ui/screens/pedals.slint";
+
+export component GateBrakeWindow inherits Window {
+    width: 920px;
+    height: 1000px;
+    title: "gate-brake-probe";
+    background: #0d1118;
+    in-out property <float> brake-bite: 0;
+    in-out property <string> brake-bite-text: "0%";
+    in-out property <float> brake-force: 1.0;
+    in-out property <string> brake-force-text: "100%";
+    callback brake-bite-changed(float);
+    callback brake-bite-edited(string);
+    callback brake-force-changed(float);
+    callback brake-force-edited(string);
+    PedalsPage {
+        width: 100%;
+        height: 100%;
+        brake-bite: root.brake-bite;
+        brake-bite-text: root.brake-bite-text;
+        brake-force: root.brake-force;
+        brake-force-text: root.brake-force-text;
+        brake-bite-changed(v) => { root.brake-bite-changed(v); }
+        brake-bite-edited(t) => { root.brake-bite-edited(t); }
+        brake-force-changed(v) => { root.brake-force-changed(v); }
+        brake-force-edited(t) => { root.brake-force-edited(t); }
+    }
+}

@@ -181,6 +181,12 @@ export component MainWindow inherits Window {
     in property <string> brake-dashed: "M 6 104 L 104 6";
     in property <float> brake-marker-x: 6;
     in property <float> brake-marker-y: 104;
+    // --- Brake per-module tuning ---
+    // B2 brake bite (0..1 of 50%) + B1 brake force (0.5..1.0).
+    in property <float> brake-bite: 0;
+    in property <string> brake-bite-text: "—";
+    in property <float> brake-force: 1.0;
+    in property <string> brake-force-text: "100%";
     in property <string> clutch-up-mv: "—";
     in property <string> clutch-down-mv: "—";
     in property <int> clutch-feel: 0;
@@ -371,6 +377,11 @@ export component MainWindow inherits Window {
     callback pedal-deadzone-edited(int, string);
     callback pedal-bite-changed(float);
     callback pedal-bite-edited(string);
+    // --- Brake per-module tuning ---
+    callback pedal-brake-bite-changed(float); // 0..1 of 50%
+    callback pedal-brake-bite-edited(string); // typed percent, 0–50%
+    callback pedal-brake-force-changed(float); // 0.5..1.0 saturation
+    callback pedal-brake-force-edited(string); // typed percent, 50–100%
     callback knob-selected(int);
     callback knob-row-selected(int);
     callback learn-clicked();
@@ -733,6 +744,11 @@ export component MainWindow inherits Window {
                 brake-dashed: brake-dashed;
                 brake-marker-x: brake-marker-x;
                 brake-marker-y: brake-marker-y;
+                // --- Brake per-module tuning ---
+                brake-bite: brake-bite;
+                brake-bite-text: brake-bite-text;
+                brake-force: brake-force;
+                brake-force-text: brake-force-text;
                 clutch-pct: clutch;
                 clutch-up-mv: clutch-up-mv;
                 clutch-down-mv: clutch-down-mv;
@@ -753,6 +769,11 @@ export component MainWindow inherits Window {
                 deadzone-edited(p, t) => { pedal-deadzone-edited(p, t); }
                 bite-changed(v) => { pedal-bite-changed(v); }
                 bite-edited(t) => { pedal-bite-edited(t); }
+                // --- Brake per-module tuning ---
+                brake-bite-changed(v) => { pedal-brake-bite-changed(v); }
+                brake-bite-edited(t) => { pedal-brake-bite-edited(t); }
+                brake-force-changed(v) => { pedal-brake-force-changed(v); }
+                brake-force-edited(t) => { pedal-brake-force-edited(t); }
             }
             if page == 3 : ButtonsPage {
                 busy-kind: busy-kind;

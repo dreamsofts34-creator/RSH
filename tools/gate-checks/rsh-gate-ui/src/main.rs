@@ -2055,6 +2055,108 @@ fn ui_steering_advanced() -> Outcome {
     report.finish()
 }
 
+fn ui_brake_tuning() -> Outcome {
+    let mut report = Report::new();
+    // Source assertions: the brake card carries both new controls
+    // (B1 brake force + B2 bite point), wired to their own
+    // callbacks — never to the clutch bite handler.
+    let src_path = repo_root().join("crates/rsh-ui/ui/screens/pedals.slint");
+    let src = match std::fs::read_to_string(&src_path) {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(format!("read pedals.slint failed: {error}")),
+    };
+    for label in ["Brake force", "Travel for full brake"] {
+        report.check(
+            &format!("brake-tuning-has-{label}"),
+            src.contains(label),
+            &format!("pedals.slint must contain the {label} control"),
+        );
+    }
+    for wiring in [
+        "bite: brake-bite;",
+        "force: brake-force;",
+        "bite-changed(v) => { brake-bite-changed(v); }",
+        "force-changed(v) => { brake-force-changed(v); }",
+    ] {
+        report.check(
+            &format!("brake-tuning-wires-{wiring}"),
+            src.contains(wiring),
+            &format!("pedals.slint must wire the brake card: {wiring}"),
+        );
+    }
+    report.check(
+        "brake-tuning-force-only-on-brake",
+        src.matches("show-force: true").count() == 1,
+        "only the brake card shows the Brake force row (throttle/clutch must not)",
+    );
+    let instance = match compile(
+        "tools/gate-checks/rsh-gate-ui/ui/brake_probe.slint",
+        "GateBrakeWindow",
+    ) {
+        Ok(instance) => instance,
+        Err(error) => return Outcome::fail(error),
+    };
+    // Rendered content: moving the Brake force thumb (1.0 → 0.5)
+    // and the Bite thumb (0.0 → 1.0 of 50%) must repaint the
+    // slider tracks — the rows exist and the props drive them.
+    // (Per-byte diff, like the steering check: a slider row is
+    // small, so the bar is 500 changed bytes, not 5000.)
+    let diff_for =
+        |instance: &ComponentInstance, prop: &str, from: f64, to: f64| -> Result<usize, String> {
+            set_num(instance, prop, from)?;
+            let (before, _, _) = snapshot(instance)?;
+            set_num(instance, prop, to)?;
+            let (after, _, _) = snapshot(instance)?;
+            Ok(before
+                .iter()
+                .zip(after.iter())
+                .filter(|(a, b)| a != b)
+                .count())
+        };
+    match diff_for(&instance, "brake-force", 1.0, 0.5) {
+        Ok(diff) => report.check(
+            "brake-force-slider-moves",
+            diff > 500,
+            &format!("Brake force thumb 100%→50%: {diff} bytes changed (want > 500)"),
+        ),
+        Err(error) => return Outcome::fail(error),
+    }
+    match diff_for(&instance, "brake-bite", 0.0, 1.0) {
+        Ok(diff) => report.check(
+            "brake-bite-slider-moves",
+            diff > 500,
+            &format!("Brake bite thumb 0%→50%: {diff} bytes changed (want > 500)"),
+        ),
+        Err(error) => return Outcome::fail(error),
+    }
+    // Callbacks: the probe's brake callbacks exist with the right
+    // signatures and fire (same pattern as the steering check).
+    for (name, value) in [
+        ("brake-force-changed", 0.75_f64),
+        ("brake-bite-changed", 0.5_f64),
+    ] {
+        let last_num = Rc::new(RefCell::new(f64::NAN));
+        let last_num_cb = Rc::clone(&last_num);
+        if let Err(error) = instance.set_callback(name, move |args| {
+            if let Some(Value::Number(n)) = args.first() {
+                *last_num_cb.borrow_mut() = *n;
+            }
+            Value::Void
+        }) {
+            return Outcome::fail(format!("set {name} handler failed: {error}"));
+        }
+        if let Err(error) = instance.invoke(name, &[Value::Number(value)]) {
+            return Outcome::fail(format!("invoke {name} failed: {error}"));
+        }
+        report.check(
+            &format!("brake-{name}-callback"),
+            (*last_num.borrow() - value).abs() < f64::EPSILON,
+            &format!("invoke {name}({value}) must reach the handler"),
+        );
+    }
+    report.finish()
+}
+
 fn checks() -> Vec<UiCheck> {
     vec![
         (
@@ -2146,6 +2248,11 @@ fn checks() -> Vec<UiCheck> {
             "ui-steering-advanced",
             "Bug 7 + S1–S3: Advanced card holds invert + lock + smoothing + balance + trim, centre card holds the full-lock capture buttons (not the old read-only rows)",
             ui_steering_advanced as fn() -> Outcome,
+        ),
+        (
+            "ui-brake-tuning",
+            "Brake B1+B2: brake card holds Brake force + Bite point sliders (own callbacks, force only on brake)",
+            ui_brake_tuning as fn() -> Outcome,
         ),
     ]
 }

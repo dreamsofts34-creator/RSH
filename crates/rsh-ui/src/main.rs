@@ -809,6 +809,9 @@ enum FieldKind {
     Deadzone,
     /// Clutch bite point (0..1).
     Bite,
+    // --- Brake per-module tuning ---
+    /// Brake force / saturation (0.5..=1.0).
+    Force,
     /// LED brightness percent (0..100).
     Brightness,
 }
@@ -2894,6 +2897,8 @@ impl Ctx {
                 match kind {
                     FieldKind::Deadzone => record.deadzone = value,
                     FieldKind::Bite => record.bite_point = Some(value),
+                    // --- Brake per-module tuning ---
+                    FieldKind::Force => record.saturation = Some(value),
                     FieldKind::Brightness => record.led_brightness = Some(value.round() as u8),
                 }
                 JobResult::Tuning(api.set_tuning(&record))
@@ -5049,11 +5054,12 @@ impl Ctx {
     }
 
     /// Write one pedal card's tuning props from a record (R2-10):
-    /// feel, deadzone slider + text, mini-curve, clutch bite.
-    /// Shared by `sync_pedals` (slow re-sync), the drag handlers
-    /// (local echo while dragging) and flush completions (the
-    /// authoritative `set_tuning` return value). All writes are
-    /// change-guarded, like `push_frame`.
+    /// feel, deadzone slider + text, mini-curve, clutch bite, and
+    /// (brake) the bite + brake-force sliders. Shared by
+    /// `sync_pedals` (slow re-sync), the drag handlers (local echo
+    /// while dragging) and flush completions (the authoritative
+    /// `set_tuning` return value). All writes are change-guarded,
+    /// like `push_frame`.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn sync_pedal_module_props(
         win: &MainWindow,
@@ -5094,6 +5100,29 @@ impl Ctx {
                     win.get_brake_deadzone_text(),
                     pct_text(record.deadzone).into(),
                     |v| win.set_brake_deadzone_text(v),
+                );
+                // --- Brake per-module tuning ---
+                // B2 bite: the slider is 0..1 of 50%, so the stored
+                // 0..0.5 bite is shown doubled; the text is the real
+                // percent. B1 force: the slider value IS the
+                // saturation fraction (0.5..1.0 = 50–100%).
+                let brake_bite = record.bite_point.unwrap_or(0.0);
+                set_if_changed(win.get_brake_bite(), (brake_bite / 0.5) as f32, |v| {
+                    win.set_brake_bite(v);
+                });
+                set_if_changed(
+                    win.get_brake_bite_text(),
+                    pct_text(brake_bite * 100.0).into(),
+                    |v| win.set_brake_bite_text(v),
+                );
+                let brake_force = record.saturation.unwrap_or(1.0);
+                set_if_changed(win.get_brake_force(), brake_force as f32, |v| {
+                    win.set_brake_force(v);
+                });
+                set_if_changed(
+                    win.get_brake_force_text(),
+                    pct_text(brake_force * 100.0).into(),
+                    |v| win.set_brake_force_text(v),
                 );
                 set_if_changed(win.get_brake_curve(), curve.into(), |v| {
                     win.set_brake_curve(v);
@@ -5147,15 +5176,29 @@ impl Ctx {
         Self::sync_pedal_module_props(win, index, &record, feel_exp);
     }
 
-    /// Echo a clutch bite-point drag locally (R2-10): same pattern
-    /// as [`Self::apply_pedal_deadzone_local`].
-    fn apply_pedal_bite_local(&self, win: &MainWindow, bite: f64) {
+    /// Echo a clutch / brake bite-point drag locally (R2-10): same
+    /// pattern as [`Self::apply_pedal_deadzone_local`]. `index` is
+    /// the pedal index (1 brake, 2 clutch).
+    fn apply_pedal_bite_local(&self, win: &MainWindow, index: usize, bite: f64) {
         let (record, feel_exp) = {
             let mut pedals = self.pedals.borrow_mut();
-            pedals.records[2].bite_point = Some(bite);
-            (pedals.records[2].clone(), pedals.feel_exp[2])
+            pedals.records[index].bite_point = Some(bite);
+            (pedals.records[index].clone(), pedals.feel_exp[index])
         };
-        Self::sync_pedal_module_props(win, 2, &record, feel_exp);
+        Self::sync_pedal_module_props(win, index, &record, feel_exp);
+    }
+
+    /// Echo a brake-force drag locally (R2-10, B1): same pattern —
+    /// the slider + text move with the mouse, the local record
+    /// follows, and only the daemon push waits out the 150 ms
+    /// debounce.
+    fn apply_pedal_brake_force_local(&self, win: &MainWindow, saturation: f64) {
+        let (record, feel_exp) = {
+            let mut pedals = self.pedals.borrow_mut();
+            pedals.records[1].saturation = Some(saturation);
+            (pedals.records[1].clone(), pedals.feel_exp[1])
+        };
+        Self::sync_pedal_module_props(win, 1, &record, feel_exp);
     }
 
     /// Write the handbrake card's tuning props from a record
@@ -7837,7 +7880,7 @@ fn wire_pedals_rest(win: &MainWindow, ctx: &Rc<Ctx>) {
             let bite = f64::from(v).clamp(0.0, 1.0);
             // R2-10: local echo — the bite slider + text move with
             // the drag, not at the next ~1 Hz re-sync.
-            ctx.apply_pedal_bite_local(&w, bite);
+            ctx.apply_pedal_bite_local(&w, 2, bite);
             // M-7: a drag queues one debounced push, not one per move.
             ctx.queue_field_push("clutch", FieldKind::Bite, bite);
         });
@@ -7854,6 +7897,66 @@ fn wire_pedals_rest(win: &MainWindow, ctx: &Rc<Ctx>) {
             };
             let bite = (f64::from(pct) / 100.0).clamp(0.0, 1.0);
             ctx.set_pedal_tuning(&w, "clutch", |t| t.bite_point = Some(bite));
+        });
+    }
+    // --- Brake per-module tuning ---
+    // B2 brake bite: the slider is 0..1 of 50% (like deadzone is
+    // 0..1 of 10%), so a drag value is halved; typed percents are
+    // 0–50%. The engine already applies the bite to the brake
+    // (shared pedal chain) — this is UI-only.
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_brake_bite_changed(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let bite = (f64::from(v) * 0.5).clamp(0.0, 0.5);
+            ctx.apply_pedal_bite_local(&w, 1, bite);
+            ctx.queue_field_push("brake", FieldKind::Bite, bite);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_brake_bite_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let Ok(pct) = t.trim().trim_end_matches('%').parse::<f32>() else {
+                return;
+            };
+            let bite = (f64::from(pct) / 100.0).clamp(0.0, 0.5);
+            ctx.set_pedal_tuning(&w, "brake", |t| t.bite_point = Some(bite));
+        });
+    }
+    // B1 brake force: the slider value IS the saturation fraction
+    // (0.5..1.0 = 50–100% travel for full brake); typed percents
+    // are 50–100%.
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_brake_force_changed(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let saturation = f64::from(v).clamp(0.5, 1.0);
+            ctx.apply_pedal_brake_force_local(&w, saturation);
+            ctx.queue_field_push("brake", FieldKind::Force, saturation);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_brake_force_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let Ok(pct) = t.trim().trim_end_matches('%').parse::<f32>() else {
+                return;
+            };
+            let saturation = (f64::from(pct) / 100.0).clamp(0.5, 1.0);
+            ctx.set_pedal_tuning(&w, "brake", |t| t.saturation = Some(saturation));
         });
     }
     {

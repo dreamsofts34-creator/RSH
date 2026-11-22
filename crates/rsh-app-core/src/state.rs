@@ -6362,6 +6362,7 @@ impl AppStateCore {
                 steering_balance_pct,
                 steering_center_trim_pct,
                 bite_point: stored.bite_point,
+                saturation: stored.saturation,
                 shifter_gate: if module == "shifter" {
                     Some(if stored.gate_mode.eq_ignore_ascii_case("h-pattern") {
                         ShifterGate::HPattern
@@ -6401,6 +6402,7 @@ impl AppStateCore {
             steering_balance_pct,
             steering_center_trim_pct,
             bite_point: None,
+            saturation: None,
             shifter_gate: None,
             horn_button: None,
             led_brightness: None,
@@ -6486,6 +6488,8 @@ impl AppStateCore {
                 min_mv: None,
                 max_mv: None,
                 bite_point: None,
+                // --- Brake per-module tuning ---
+                saturation: None,
                 horn_button: None,
                 led_brightness: None,
                 led_pattern: None,
@@ -6521,6 +6525,8 @@ impl AppStateCore {
         entry.min_mv = Some(tuning.min_mv);
         entry.max_mv = Some(tuning.max_mv);
         entry.bite_point = tuning.bite_point;
+        // --- Brake per-module tuning ---
+        entry.saturation = tuning.saturation;
         entry.horn_button = tuning.horn_button;
         entry.led_brightness = tuning.led_brightness;
         entry.led_pattern = tuning.led_pattern.map(|pattern| pattern.name().to_string());
@@ -6768,6 +6774,8 @@ impl AppStateCore {
             press_ms,
             release_ms,
             bite_point: tuning.bite_point.unwrap_or(0.0) as f32,
+            // --- Brake per-module tuning ---
+            saturation: tuning.saturation.unwrap_or(1.0) as f32,
             gate_mode: match tuning.shifter_gate {
                 Some(ShifterGate::HPattern) => ShifterGateMode::HPattern,
                 _ => ShifterGateMode::Sequential,
@@ -10369,10 +10377,14 @@ mod tests {
         tuning.deadzone = 5.0;
         tuning.curve = 1.2;
         tuning.bite_point = Some(0.35);
+        // --- Brake per-module tuning ---
+        tuning.saturation = Some(0.75);
         let saved = state.set_tuning(&tuning).expect("valid tuning");
         assert_eq!(saved.bite_point, Some(0.35));
+        assert_eq!(saved.saturation, Some(0.75));
         assert_eq!(state.get_tuning("brake").deadzone, 5.0);
         assert_eq!(state.get_tuning("brake").bite_point, Some(0.35));
+        assert_eq!(state.get_tuning("brake").saturation, Some(0.75));
         assert!(state.draft_dirty());
         let stored_deadzone = lock(&state.store).active().and_then(|active| {
             active
@@ -10427,6 +10439,7 @@ mod tests {
         assert!(!state.draft_dirty());
         assert_eq!(state.get_tuning("brake").deadzone, 0.0);
         assert_eq!(state.get_tuning("brake").bite_point, None);
+        assert_eq!(state.get_tuning("brake").saturation, None);
         state
             .switch_profile(&second.id, false)
             .expect("switch after discard");
@@ -10446,6 +10459,22 @@ mod tests {
             .get("steering")
             .expect("steering tuning persisted");
         assert!((stored.deadzone - 0.07).abs() < f64::EPSILON);
+        // --- Brake per-module tuning ---
+        // Brake force persists to disk too, and an old stored entry
+        // without the field reads back as None (100%).
+        let mut brake = state.get_tuning("brake");
+        brake.saturation = Some(0.75);
+        state.set_tuning(&brake).expect("set brake");
+        assert!(state.save_draft().expect("save brake draft"));
+        let reopened = ProfileStore::open(&dir).expect("reopen store");
+        let stored = reopened
+            .active()
+            .expect("active after reopen")
+            .profile
+            .module_tunings
+            .get("brake")
+            .expect("brake tuning persisted");
+        assert_eq!(stored.saturation, Some(0.75));
     }
 
     /// L4 pipeline push: the built plan carries the draft tuning —
@@ -10459,6 +10488,18 @@ mod tests {
         let plan = state.build_pipeline_plan();
         assert!(!plan.clutch.enabled);
         assert_eq!(plan.steering.deadzone, 0.0);
+        // --- Brake per-module tuning ---
+        // Default plan: saturation 1.0 (full travel = full brake).
+        assert!((plan.brake.saturation - 1.0).abs() < f32::EPSILON);
+        // Draft a brake tuning with a bite point + brake force: the
+        // plan picks both up without any Save.
+        let mut brake = state.get_tuning("brake");
+        brake.bite_point = Some(0.2);
+        brake.saturation = Some(0.75);
+        state.set_tuning(&brake).expect("set brake");
+        let plan = state.build_pipeline_plan();
+        assert!((plan.brake.bite_point - 0.2).abs() < f32::EPSILON);
+        assert!((plan.brake.saturation - 0.75).abs() < f32::EPSILON);
         // Draft a clutch tuning with a bite point: the plan picks it
         // up (and enables the clutch) without any Save.
         let mut clutch = state.get_tuning("clutch");

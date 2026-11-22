@@ -209,6 +209,12 @@ pub struct PerModuleTuning {
     /// Pedal bite point, 0..1 (clutch / brake only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bite_point: Option<f64>,
+    // --- Brake per-module tuning ---
+    /// Brake force (BRF), 0.5..=1.0 as a fraction: the travel that
+    /// gives 100% brake (brake module only; `None` = 100% — old
+    /// profiles load as `None`, i.e. full force, calibration intact).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saturation: Option<f64>,
     /// Button number (1–32) the horn is bound to (horn module only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub horn_button: Option<u8>,
@@ -496,6 +502,8 @@ impl Default for PerModuleTuning {
             min_mv: None,
             max_mv: None,
             bite_point: None,
+            // --- Brake per-module tuning ---
+            saturation: None,
             horn_button: None,
             led_brightness: None,
             led_pattern: None,
