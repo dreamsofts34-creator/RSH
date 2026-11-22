@@ -715,7 +715,11 @@ impl AppApi for DaemonApi {
             // B6/A10: the admin-decline case gets a typed error with
             // plain words — not `Unknown` / "Something went wrong."
             // (the UI shows the title + what happened + what to do).
-            if detail == AppStateCore::HID_NOT_ADMIN {
+            // `contains`, not `==`: the state wraps the failure
+            // ("could not switch output backend to HIDMaestro: …"),
+            // so the equality check never fired and every UAC
+            // decline arrived at the UI as a generic error (Bug 4).
+            if detail.contains(AppStateCore::HID_NOT_ADMIN) {
                 UserError {
                     code: "not_admin".to_string(),
                     title: "Admin permission needed".to_string(),

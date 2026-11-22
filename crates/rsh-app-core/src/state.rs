@@ -3224,7 +3224,11 @@ impl AppStateCore {
                 && self.selected_backend() != BackendKind::None
             {
                 let requested = self.selected_backend();
-                if let Err(error) = self.apply_backend_switch(requested, factories) {
+                // Deferred startup activation (automatic path): the
+                // fallback stays allowed here — enabling output is
+                // not an explicit backend switch (Bug 4/8 bans the
+                // fallback only for `set_output_backend`).
+                if let Err(error) = self.apply_backend_switch(requested, factories, true) {
                     self.record_send(
                         false,
                         format!("output enabled: backend activation failed ({error})"),
@@ -3388,24 +3392,46 @@ impl AppStateCore {
     /// Selects the output backend by name (`"HIDMaestro"`, `"vJoy"`,
     /// `"none"` / `"null"` / `"NullSink"`; case-insensitive) and
     /// switches the live slot at runtime — no restart. Default is
-    /// `vJoy`; a failed `HIDMaestro` connect falls back to vJoy
-    /// with the reason recorded in the returned state's detail, and a
-    /// failed connect of any kind leaves the previous backend exactly
-    /// as it was (see [`switch_backend`]).
+    /// `vJoy`. This is an EXPLICIT user switch: a failed `HIDMaestro`
+    /// connect NEVER falls back to vJoy (Bug 4/8) — it errors with
+    /// the real reason, the live backend stays exactly as it was,
+    /// and the persisted choice reverts to the previous backend, so
+    /// the next launch does not retry a switch the user saw fail.
+    /// (Automatic paths — startup activation, the deferred enable,
+    /// mid-session failover — still allow the fallback; see
+    /// [`Self::apply_backend_switch`].) A failed connect of any kind
+    /// leaves the previous backend exactly as it was (see
+    /// [`switch_backend`]).
     ///
     /// The requested choice is persisted in settings first (a save
-    /// failure errors out before anything switches). The persisted
-    /// choice is the *requested* backend even after a fallback, so the
-    /// next launch retries the user's choice instead of silently
-    /// keeping the fallback; the Output page shows the live backend
-    /// separately (see [`AppStateCore::list_output_backends`]).
+    /// failure errors out before anything switches); on a failed
+    /// switch the persisted choice is written back to the previous
+    /// backend.
     ///
     /// # Errors
     ///
     /// Returns a message when the name is unknown, the settings save
-    /// fails, or the requested backend (and its fallback, if any)
-    /// could not connect.
+    /// fails, or the requested backend could not connect.
     pub fn set_output_backend(&self, name: &str) -> Result<CommandOutputState, String> {
+        let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
+        let factories = real_backend_factories(vjoy_device_id);
+        self.set_output_backend_with_factories(name, &factories)
+    }
+
+    /// [`AppStateCore::set_output_backend`] with injectable factories
+    /// (the test seam: tests drive the explicit switch with mock
+    /// backends here, the shell uses the real factories through
+    /// [`AppStateCore::set_output_backend`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the name is unknown, the settings save
+    /// fails, or the requested backend could not connect.
+    pub fn set_output_backend_with_factories(
+        &self,
+        name: &str,
+        factories: &BackendFactories,
+    ) -> Result<CommandOutputState, String> {
         let requested = BackendKind::parse(name).ok_or_else(|| {
             format!("unknown output backend '{name}' (expected HIDMaestro, vJoy, or none)")
         })?;
@@ -3422,8 +3448,12 @@ impl AppStateCore {
         // (`set_output_enabled`, startup) never clears it.
         self.elevation_declined.store(false, Ordering::SeqCst);
         // Persist the choice first: a save failure errors out before
-        // anything switches, and a failed switch still leaves the
-        // user's choice recorded for the next launch.
+        // anything switches. Remember the previous choice: on a
+        // failed explicit switch the persisted choice reverts to it
+        // (Bug 4/8 — a failed HIDMaestro switch must not leave
+        // HIDMaestro persisted, or the next launch defers/retries a
+        // switch the user already saw fail).
+        let previous_output_backend = lock(&self.store).settings().output_backend.clone();
         {
             let mut settings = lock(&self.store).settings().clone();
             settings.output_backend = requested.settings_value().to_string();
@@ -3434,16 +3464,33 @@ impl AppStateCore {
         // DS-30: the write above changed the store — refresh the
         // `Arc` cache so `settings_arc()` readers see it at once.
         self.refresh_settings_cache();
-        let vjoy_device_id = lock(&self.store).settings().vjoy_device_id;
-        let factories = real_backend_factories(vjoy_device_id);
-        self.apply_backend_switch(requested, &factories)
+        let result = self
+            .apply_backend_switch(requested, factories, false)
             .map_err(|error| {
                 format!(
                     "could not switch output backend to {}: {error}",
                     requested.display_name()
                 )
             })
-            .map(|_| self.output_state())
+            .map(|_| self.output_state());
+        if result.is_err() {
+            // Revert the persisted choice (best effort: the switch
+            // error above is the one reported even if this save
+            // fails — the in-memory store is reverted either way).
+            // The store guard lives only inside this block (like the
+            // persist above): `refresh_settings_cache` locks the
+            // store itself, so it must run after the guard drops —
+            // holding it across that call deadlocks the thread.
+            {
+                let mut settings = lock(&self.store).settings().clone();
+                settings.output_backend = previous_output_backend;
+                let mut store = lock(&self.store);
+                store.set_settings(settings);
+                let _ = store.save();
+            }
+            self.refresh_settings_cache();
+        }
+        result
     }
 
     /// Re-arms the mid-session failover (C-FAIL-1): after an explicit
@@ -3484,20 +3531,25 @@ impl AppStateCore {
     /// Applies a backend switch through the selector with the given
     /// factories, and updates the live name / detail / selected choice
     /// on success. Shared by [`AppStateCore::set_output_backend`]
-    /// (which persists first) and
-    /// [`AppStateCore::activate_startup_backend`] (which does not —
-    /// the choice is already persisted). On failure the slot is
-    /// untouched (see [`switch_backend`]) and the error is returned;
-    /// the caller records it.
+    /// (explicit — `allow_fallback: false`, so a failed requested
+    /// backend errors instead of silently landing on vJoy, Bug 4/8)
+    /// and the automatic paths ([`AppStateCore::activate_startup_backend`]
+    /// and the deferred enable in
+    /// [`AppStateCore::set_output_enabled_with_factories`], plus the
+    /// mid-session failover — `allow_fallback: true`). On failure
+    /// the slot is untouched (see [`switch_backend`]) and the error
+    /// is returned; the caller records it.
     ///
     /// # Errors
     ///
     /// Returns the selector's failure (no factory, or the requested
-    /// backend and its fallback both failed to connect).
+    /// backend and its fallback, when allowed, both failed to
+    /// connect).
     fn apply_backend_switch(
         &self,
         requested: BackendKind,
         factories: &BackendFactories,
+        allow_fallback: bool,
     ) -> Result<SwitchOutcome, String> {
         // B-2: serialise switches — a second overlapping switch
         // (user double-clicking, a poll-driven re-activation) would
@@ -3548,31 +3600,32 @@ impl AppStateCore {
         // result back under a short lock. The slot is restored on
         // every path: a failed switch leaves the previous backend
         // installed, exactly as the selector guarantees.
-        let outcome: Result<SwitchOutcome, String> =
-            if let Some(placeholder) = factories.build(BackendKind::None) {
-                let handle = {
-                    let mut slot = lock(&self.backend);
-                    std::mem::replace(&mut *slot, Arc::new(Mutex::new(placeholder)))
-                };
-                // The extracted handle is owned by this scope: the
-                // switch (up to 60 s of sidecar spawn + UAC dwell)
-                // runs on its own lock, never on the slot lock.
-                let mut current = lock(&handle);
-                let outcome = switch_backend(&mut current, requested, factories, None)
-                    .map_err(|error| error.to_string());
-                drop(current);
-                *lock(&self.backend) = handle;
-                outcome
-            } else {
-                // No sink factory (test-only path — the real
-                // factories always provide one): switch on the live
-                // handle, as before.
-                let handle = self.backend_handle();
-                let mut backend = lock(&handle);
-                switch_backend(&mut backend, requested, factories, None)
-                    .map_err(|error| error.to_string())
+        let outcome: Result<SwitchOutcome, String> = if let Some(placeholder) =
+            factories.build(BackendKind::None)
+        {
+            let handle = {
+                let mut slot = lock(&self.backend);
+                std::mem::replace(&mut *slot, Arc::new(Mutex::new(placeholder)))
             };
-        self.finish_backend_switch(outcome, requested, vjoy_device_id)
+            // The extracted handle is owned by this scope: the
+            // switch (up to 60 s of sidecar spawn + UAC dwell)
+            // runs on its own lock, never on the slot lock.
+            let mut current = lock(&handle);
+            let outcome = switch_backend(&mut current, requested, factories, None, allow_fallback)
+                .map_err(|error| error.to_string());
+            drop(current);
+            *lock(&self.backend) = handle;
+            outcome
+        } else {
+            // No sink factory (test-only path — the real
+            // factories always provide one): switch on the live
+            // handle, as before.
+            let handle = self.backend_handle();
+            let mut backend = lock(&handle);
+            switch_backend(&mut backend, requested, factories, None, allow_fallback)
+                .map_err(|error| error.to_string())
+        };
+        self.finish_backend_switch(outcome, requested, vjoy_device_id, allow_fallback)
     }
 
     /// Interprets a completed backend switch (R2-09): the UAC-decline
@@ -3586,6 +3639,7 @@ impl AppStateCore {
         outcome: Result<SwitchOutcome, String>,
         requested: BackendKind,
         vjoy_device_id: u32,
+        allow_fallback: bool,
     ) -> Result<SwitchOutcome, String> {
         // B-2/A10: a UAC decline surfaces as a NotAdmin failure
         // (or a fallback whose reason names it). Record the decline
@@ -3602,6 +3656,20 @@ impl AppStateCore {
                 {
                     self.elevation_declined.store(true, Ordering::SeqCst);
                     return Err(Self::HID_NOT_ADMIN.to_string());
+                }
+                // Bug 4/8 defence: an explicit switch must never
+                // report a fallback as success — the selector does
+                // not produce one when `allow_fallback` is false,
+                // but if one ever arrived it is a failure with the
+                // real reason, not a silent "now vJoy".
+                if outcome.fell_back && !allow_fallback {
+                    return Err(outcome.fallback_reason.clone().unwrap_or_else(|| {
+                        format!(
+                            "{} could not connect (fell back to {})",
+                            requested.display_name(),
+                            outcome.active.display_name()
+                        )
+                    }));
                 }
                 outcome
             }
@@ -3696,7 +3764,7 @@ impl AppStateCore {
             *lock(&self.startup_backend) = Some(result.clone());
             return result;
         }
-        match self.apply_backend_switch(requested, factories) {
+        match self.apply_backend_switch(requested, factories, true) {
             Ok(outcome) => {
                 let result = StartupBackendOutcome {
                     requested,
@@ -4865,7 +4933,9 @@ impl AppStateCore {
         };
         *lock(&self.fallback_last_attempt) = Some(now);
         self.fallback_used.store(true, Ordering::SeqCst);
-        match self.apply_backend_switch(fallback, factories) {
+        // Automatic path (mid-session failover): the fallback stays
+        // allowed — only an explicit user switch bans it (Bug 4/8).
+        match self.apply_backend_switch(fallback, factories, true) {
             Ok(outcome) => {
                 self.note_engine_detail(format!(
                     "mid-session failover: {} refused an update, switched to {} \
@@ -8954,6 +9024,10 @@ mod tests {
         connected: Arc<Mutex<bool>>,
         fail: Arc<Mutex<bool>>,
         fail_connect: Arc<Mutex<bool>>,
+        /// Message a failing `try_connect` reports (default "mock
+        /// connect failed"; tests set it to e.g. an "administrator
+        /// rights" wording to model a UAC decline).
+        fail_connect_message: Arc<Mutex<String>>,
         /// Reported by `name()`; the failover test needs a backend
         /// that reports `"HIDMaestro"` / `"vJoy"`.
         name: &'static str,
@@ -8982,6 +9056,7 @@ mod tests {
                     connected: Arc::clone(&connected),
                     fail: Arc::clone(&fail),
                     fail_connect: Arc::new(Mutex::new(false)),
+                    fail_connect_message: Arc::new(Mutex::new("mock connect failed".to_string())),
                     name,
                 },
                 sent,
@@ -8995,6 +9070,14 @@ mod tests {
                 .fail_connect
                 .lock()
                 .expect("fail_connect lock poisoned") = fail;
+        }
+
+        /// Message a failing `try_connect` reports.
+        fn set_fail_connect_message(&self, message: &str) {
+            *self
+                .fail_connect_message
+                .lock()
+                .expect("fail_connect_message lock poisoned") = message.to_string();
         }
     }
 
@@ -9013,7 +9096,12 @@ mod tests {
                 .lock()
                 .expect("fail_connect lock poisoned")
             {
-                return Err(VJoyError::DriverNotFound("mock connect failed".to_string()));
+                let message = self
+                    .fail_connect_message
+                    .lock()
+                    .expect("fail_connect_message lock poisoned")
+                    .clone();
+                return Err(VJoyError::DriverNotFound(message));
             }
             *self.connected.lock().expect("connected lock poisoned") = true;
             Ok(())
@@ -9337,9 +9425,10 @@ mod tests {
     #[test]
     fn set_output_backend_without_drivers_fails_honestly_and_keeps_the_old_backend() {
         let (state, _dir) = test_state();
-        // Linux sandbox: no HIDMaestro sidecar, no vJoy DLL — both the
-        // requested backend and the vJoy fallback fail, and the slot
-        // must be left exactly as it was.
+        // Linux sandbox: no HIDMaestro sidecar, no vJoy DLL. An
+        // explicit HIDMaestro switch must ERROR with the real
+        // reason — never silently fall back to vJoy (Bug 4/8) — and
+        // the persisted choice reverts to the previous backend.
         let error = state
             .set_output_backend("HIDMaestro")
             .expect_err("HIDMaestro must fail without a sidecar");
@@ -9347,10 +9436,15 @@ mod tests {
             error.contains("could not switch output backend to HIDMaestro"),
             "{error}"
         );
-        assert!(error.contains("vJoy fallback also failed"), "{error}");
-        // The choice is still persisted (the next launch retries it)…
-        assert_eq!(state.settings().output_backend, "HIDMaestro");
-        // …but the failed switch never moved the in-memory selection
+        assert!(
+            !error.contains("fallback"),
+            "an explicit switch never falls back: {error}"
+        );
+        // The failed switch reverts the persisted choice to the
+        // previous backend (vJoy here), instead of leaving
+        // HIDMaestro persisted for the next launch to retry.
+        assert_eq!(state.settings().output_backend, "VJoy");
+        // …and the failed switch never moved the in-memory selection
         // off the previous choice (the vJoy default here).
         assert_eq!(state.selected_backend(), BackendKind::VJoy);
         // …but the live backend is untouched: still the sink, still
@@ -9365,6 +9459,96 @@ mod tests {
             "{error}"
         );
         assert_eq!(state.backend_name(), "NullSink");
+        // A failed vJoy switch reverts the persisted choice too.
+        assert_eq!(state.settings().output_backend, "VJoy");
+    }
+
+    /// Bug 4/8: an explicit `HIDMaestro` switch whose connect fails
+    /// (non-UAC reason) errors with the real reason, leaves vJoy
+    /// live and connected, and reverts the persisted choice to vJoy
+    /// — no silent fallback, no "now vJoy" success.
+    #[test]
+    fn explicit_hidmaestro_switch_failure_reverts_choice_and_keeps_vjoy() {
+        let factories = named_mock_factories(Some("HIDMaestro sidecar failed to start."), None);
+        let (state, _dir) = test_state();
+        state
+            .apply_backend_switch(BackendKind::VJoy, &factories, true)
+            .expect("install vJoy mock");
+        assert_eq!(state.backend_name(), "vJoy");
+        assert!(state.output_state().connected);
+
+        let error = state
+            .set_output_backend_with_factories("HIDMaestro", &factories)
+            .expect_err("explicit HIDMaestro failure must error");
+        assert!(
+            error.contains("sidecar failed to start"),
+            "the real reason is reported: {error}"
+        );
+        assert!(!error.contains("fell back"), "no silent fallback: {error}");
+        assert_eq!(state.backend_name(), "vJoy", "vJoy stays live");
+        assert!(state.output_state().connected, "vJoy stays connected");
+        assert_eq!(state.selected_backend(), BackendKind::VJoy);
+        assert_eq!(
+            state.settings().output_backend,
+            "VJoy",
+            "persisted choice reverts to the previous backend"
+        );
+    }
+
+    /// Bug 4/8 (UAC decline, regression guard): a `HIDMaestro`
+    /// connect failure naming "administrator rights" fails with
+    /// [`AppStateCore::HID_NOT_ADMIN`], latches the decline, and
+    /// reverts the persisted choice — no silent fallback to vJoy.
+    #[test]
+    fn explicit_hidmaestro_switch_uac_decline_returns_hid_not_admin() {
+        let factories = named_mock_factories(
+            Some("administrator rights are required to install the driver"),
+            None,
+        );
+        let (state, _dir) = test_state();
+        state
+            .apply_backend_switch(BackendKind::VJoy, &factories, true)
+            .expect("install vJoy mock");
+
+        let error = state
+            .set_output_backend_with_factories("HIDMaestro", &factories)
+            .expect_err("a UAC decline must error");
+        assert!(
+            error.contains(AppStateCore::HID_NOT_ADMIN),
+            "the decline is typed, not generic: {error}"
+        );
+        assert!(
+            state.elevation_declined.load(Ordering::SeqCst),
+            "the decline latch is set"
+        );
+        assert_eq!(state.backend_name(), "vJoy", "vJoy stays live");
+        assert_eq!(state.selected_backend(), BackendKind::VJoy);
+        assert_eq!(
+            state.settings().output_backend,
+            "VJoy",
+            "persisted choice reverts to the previous backend"
+        );
+    }
+
+    /// The fallback survives ONLY on automatic paths: enabling
+    /// output with a persisted `HIDMaestro` choice whose sidecar fails
+    /// still falls back to vJoy (the deferred startup activation),
+    /// and the persisted choice stays `HIDMaestro` for the next launch.
+    #[test]
+    fn automatic_deferred_enable_still_falls_back_to_vjoy() {
+        let factories = named_mock_factories(Some("HIDMaestro sidecar failed to start."), None);
+        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
+        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
+
+        let switched = state.set_output_enabled_with_factories(true, &factories);
+        assert_eq!(switched.backend, "vJoy", "automatic path falls back");
+        assert!(switched.connected, "fallback vJoy is connected");
+        assert_eq!(state.backend_name(), "vJoy");
+        assert_eq!(
+            state.settings().output_backend,
+            "HIDMaestro",
+            "the automatic path does not rewrite the persisted choice"
+        );
     }
 
     #[test]
@@ -10661,7 +10845,7 @@ mod tests {
         };
         let (state, _dir) = test_state();
         state
-            .apply_backend_switch(BackendKind::HidMaestro, &factories)
+            .apply_backend_switch(BackendKind::HidMaestro, &factories, true)
             .expect("install HIDMaestro mock");
         assert_eq!(state.backend_name(), "HIDMaestro");
         let output = PipelineOutputState::neutral();
@@ -10733,7 +10917,7 @@ mod tests {
         );
         let factories = mock_factories(false, false);
         state
-            .apply_backend_switch(BackendKind::VJoy, &factories)
+            .apply_backend_switch(BackendKind::VJoy, &factories, true)
             .expect("switch to vJoy after the update");
         assert_eq!(state.backend_name(), "RecordingBackend");
     }
@@ -10772,7 +10956,7 @@ mod tests {
         // latched instance, fail, and fall back to vJoy.
         state.reset_fallback();
         let outcome = state
-            .apply_backend_switch(BackendKind::HidMaestro, &factories)
+            .apply_backend_switch(BackendKind::HidMaestro, &factories, false)
             .expect("re-select of a latched backend must succeed on the fresh instance");
         assert_eq!(outcome.active, BackendKind::HidMaestro);
         assert!(!outcome.fell_back);
@@ -11139,6 +11323,36 @@ mod tests {
     /* ------------------------------------------------------------------ */
     /* Phase G gate wiring: engine spawn + startup backend               */
     /* ------------------------------------------------------------------ */
+
+    /// Mock backend factories that report the real backend names
+    /// (`"HIDMaestro"` / `"vJoy"`), each failing to connect with the
+    /// given message when `Some` (connecting fine when `None`).
+    /// Clones share the recording state, so the live backend's name
+    /// and connection state stay observable after a switch.
+    fn named_mock_factories(
+        hm_fail_message: Option<&str>,
+        vjoy_fail_message: Option<&str>,
+    ) -> BackendFactories {
+        let (hm, _hm_sent, _hm_fail) = RecordingBackend::new_named("HIDMaestro");
+        if let Some(message) = hm_fail_message {
+            hm.set_fail_connect(true);
+            hm.set_fail_connect_message(message);
+        }
+        let (vj, _vj_sent, _vj_fail) = RecordingBackend::new_named("vJoy");
+        if let Some(message) = vjoy_fail_message {
+            vj.set_fail_connect(true);
+            vj.set_fail_connect_message(message);
+        }
+        BackendFactories {
+            hidmaestro: Some(Box::new(move || {
+                Box::new(hm.clone()) as Box<dyn IJoystickOutput>
+            })),
+            vjoy: Some(Box::new(move || {
+                Box::new(vj.clone()) as Box<dyn IJoystickOutput>
+            })),
+            none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
+        }
+    }
 
     /// Mock backend factories for the startup-activation tests: the
     /// `HIDMaestro` and vJoy factories build clones of two recording

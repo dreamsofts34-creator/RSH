@@ -30,13 +30,21 @@
 //! * **Fallback:** a failed `HIDMaestro` connect (including the
 //!   manager's `FallbackNeeded` after its one retry — which arrives
 //!   through the trait as a `DriverNotFound` carrying that wording)
-//!   falls back to vJoy, and the switch outcome records the reason
-//!   verbatim ([`SwitchOutcome::fallback_reason`]). The selector does
-//!   **not** branch on a `VJoyError` variant to identify a
-//!   `HIDMaestro` failure (see [`error`](crate::error) for why): any
-//!   `HIDMaestro` connect failure triggers the fallback attempt.
-//!   If vJoy also fails, the switch errors and the previous backend
-//!   stays installed — the app keeps running with output as it was.
+//!   falls back to vJoy — but ONLY when the caller allows it
+//!   ([`switch_backend`]'s `allow_fallback`): automatic paths
+//!   (startup activation, deferred enable, mid-session failover)
+//!   allow it, an explicit user switch does NOT. An explicit switch
+//!   whose requested backend fails to connect errors with the real
+//!   reason instead of silently landing on vJoy (Bug 4/8: the user
+//!   asked for `HIDMaestro`, the UI must never toast "now vJoy").
+//!   The switch outcome records the reason verbatim
+//!   ([`SwitchOutcome::fallback_reason`]) when a fallback does
+//!   happen. The selector does **not** branch on a `VJoyError`
+//!   variant to identify a `HIDMaestro` failure (see
+//!   [`error`](crate::error) for why): any `HIDMaestro` connect
+//!   failure triggers the fallback attempt. If vJoy also fails, the
+//!   switch errors and the previous backend stays installed — the
+//!   app keeps running with output as it was.
 //! * **One live backend at a time:** after a successful switch exactly
 //!   one backend is connected; the previous one is disconnected.
 //!   (Both factories may exist in parallel — the switch test builds
@@ -220,21 +228,24 @@ fn connect(
 ///
 /// Connect-first, then disconnect (see the module docs): a failed
 /// connect leaves the previous backend installed and in its previous
-/// state. A failed `HIDMaestro` connect falls back to vJoy; if vJoy
-/// also fails, the error names both attempts and the previous backend
-/// is untouched.
+/// state. When `allow_fallback` is true, a failed `HIDMaestro`
+/// connect falls back to vJoy; when it is false (an explicit user
+/// switch), the failure errors with the real reason and the slot is
+/// untouched — never a silent fallback. If vJoy also fails, the error
+/// names both attempts and the previous backend is untouched.
 ///
 /// # Errors
 ///
 /// Returns [`OutputError::BackendNotAvailable`] when the requested
 /// backend has no factory, or [`OutputError::SwitchFailed`] when the
-/// requested backend (and its fallback, if any) could not connect.
-/// On error the slot is unchanged.
+/// requested backend (and its fallback, if allowed) could not
+/// connect. On error the slot is unchanged.
 pub fn switch_backend(
     current: &mut Box<dyn IJoystickOutput>,
     requested: BackendKind,
     factories: &BackendFactories,
     plan: Option<&PipelinePlan>,
+    allow_fallback: bool,
 ) -> Result<SwitchOutcome, OutputError> {
     let current_kind = BackendKind::from_backend_name(current.name());
 
@@ -268,7 +279,7 @@ pub fn switch_backend(
                 ),
             });
         }
-        return reconnect_or_fallback(current, requested, factories, plan);
+        return reconnect_or_fallback(current, requested, factories, plan, allow_fallback);
     }
 
     // A fresh backend: build it, connect it, and only then release the
@@ -309,27 +320,40 @@ pub fn switch_backend(
         }
         Err(error) => {
             // The new backend failed to connect: it is dropped
-            // (disconnected, never installed) and the fallback runs.
+            // (disconnected, never installed). With fallback
+            // allowed the fallback runs; without it (an explicit
+            // user switch) the failure is the error — the slot
+            // stays exactly as it was, never silently on vJoy.
             next.disconnect();
             drop(next);
-            try_fallback(current, requested, factories, plan, &error)
+            if allow_fallback {
+                try_fallback(current, requested, factories, plan, &error)
+            } else {
+                Err(OutputError::SwitchFailed(format!(
+                    "{} could not connect: {error}",
+                    requested.display_name()
+                )))
+            }
         }
     }
 }
 
 /// Reconnect the installed backend (same-kind switch while
-/// disconnected), falling back when it is `HIDMaestro` and the
-/// reconnect fails.
+/// disconnected), falling back when it is `HIDMaestro`, the
+/// reconnect fails, and `allow_fallback` is true. With fallback
+/// disallowed the reconnect failure errors and the slot is
+/// unchanged.
 ///
 /// # Errors
 ///
 /// Returns [`OutputError::SwitchFailed`] when the reconnect and its
-/// fallback (if any) both fail; the slot is unchanged then.
+/// fallback (if allowed) both fail; the slot is unchanged then.
 fn reconnect_or_fallback(
     current: &mut Box<dyn IJoystickOutput>,
     requested: BackendKind,
     factories: &BackendFactories,
     plan: Option<&PipelinePlan>,
+    allow_fallback: bool,
 ) -> Result<SwitchOutcome, OutputError> {
     match connect(current.as_mut(), plan) {
         Ok(()) => Ok(SwitchOutcome {
@@ -340,7 +364,16 @@ fn reconnect_or_fallback(
             fallback_reason: None,
             detail: format!("{} reconnected.", requested.display_name()),
         }),
-        Err(error) => try_fallback(current, requested, factories, plan, &error),
+        Err(error) => {
+            if allow_fallback {
+                try_fallback(current, requested, factories, plan, &error)
+            } else {
+                Err(OutputError::SwitchFailed(format!(
+                    "{} could not connect: {error}",
+                    requested.display_name()
+                )))
+            }
+        }
     }
 }
 
@@ -631,15 +664,21 @@ mod tests {
         let factories = factories_with(&hm, &vjoy);
         let mut current = MockBackend::new("NullSink").0.boxed();
 
-        let outcome = switch_backend(&mut current, BackendKind::HidMaestro, &factories, None)
-            .expect("HIDMaestro switch succeeds");
+        let outcome = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            true,
+        )
+        .expect("HIDMaestro switch succeeds");
         assert_eq!(outcome.active, BackendKind::HidMaestro);
         assert!(outcome.switched);
         assert!(!outcome.fell_back);
         assert!(current.is_connected());
         assert_eq!(current.name(), "HIDMaestro");
 
-        let outcome = switch_backend(&mut current, BackendKind::None, &factories, None)
+        let outcome = switch_backend(&mut current, BackendKind::None, &factories, None, true)
             .expect("switch to none succeeds");
         assert_eq!(outcome.active, BackendKind::None);
         assert!(outcome.switched);
@@ -655,8 +694,14 @@ mod tests {
         let factories = factories_with(&hm, &vjoy);
         let mut current = MockBackend::new("NullSink").0.boxed();
 
-        let outcome = switch_backend(&mut current, BackendKind::HidMaestro, &factories, None)
-            .expect("HIDMaestro switch succeeds");
+        let outcome = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            true,
+        )
+        .expect("HIDMaestro switch succeeds");
         assert_eq!(outcome.active, BackendKind::HidMaestro);
 
         // HIDMaestro -> vJoy: the HIDMaestro instance is disconnected,
@@ -665,15 +710,21 @@ mod tests {
         // live backend is vJoy and connected, and a second switch back
         // proves the vJoy instance was released (its factory builds a
         // fresh one — builds count both directions).
-        let outcome = switch_backend(&mut current, BackendKind::VJoy, &factories, None)
+        let outcome = switch_backend(&mut current, BackendKind::VJoy, &factories, None, true)
             .expect("vJoy switch succeeds");
         assert_eq!(outcome.active, BackendKind::VJoy);
         assert!(outcome.switched);
         assert!(current.is_connected());
         assert_eq!(current.name(), "vJoy");
 
-        let outcome = switch_backend(&mut current, BackendKind::HidMaestro, &factories, None)
-            .expect("switch back to HIDMaestro succeeds");
+        let outcome = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            true,
+        )
+        .expect("switch back to HIDMaestro succeeds");
         assert_eq!(outcome.active, BackendKind::HidMaestro);
         assert!(current.is_connected());
         assert_eq!(hm.builds.load(Ordering::SeqCst), 2);
@@ -690,7 +741,7 @@ mod tests {
         current.try_connect().expect("old connects");
         assert!(state_of(&old_state).0);
 
-        let outcome = switch_backend(&mut current, BackendKind::VJoy, &factories, None)
+        let outcome = switch_backend(&mut current, BackendKind::VJoy, &factories, None, true)
             .expect("vJoy switch succeeds");
         assert_eq!(outcome.active, BackendKind::VJoy);
         let (connected, _, disconnects) = state_of(&old_state);
@@ -713,8 +764,14 @@ mod tests {
         let factories = factories_with(&hm, &vjoy);
         let mut current = MockBackend::new("NullSink").0.boxed();
 
-        let outcome = switch_backend(&mut current, BackendKind::HidMaestro, &factories, None)
-            .expect("fallback to vJoy succeeds");
+        let outcome = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            true,
+        )
+        .expect("fallback to vJoy succeeds");
         assert_eq!(outcome.requested, BackendKind::HidMaestro);
         assert_eq!(outcome.active, BackendKind::VJoy);
         assert!(outcome.fell_back);
@@ -740,7 +797,7 @@ mod tests {
         let mut current = old.boxed();
         current.try_connect().expect("old connects");
 
-        let error = switch_backend(&mut current, BackendKind::VJoy, &factories, None)
+        let error = switch_backend(&mut current, BackendKind::VJoy, &factories, None, true)
             .expect_err("failed vJoy switch must error");
         assert!(error.to_string().contains("BUSY"), "{error}");
         assert_eq!(current.name(), "HIDMaestro");
@@ -758,8 +815,14 @@ mod tests {
         let factories = factories_with(&hm, &vjoy);
         let mut current = MockBackend::new("NullSink").0.boxed();
 
-        let error = switch_backend(&mut current, BackendKind::HidMaestro, &factories, None)
-            .expect_err("both backends failing must error");
+        let error = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            true,
+        )
+        .expect_err("both backends failing must error");
         let message = error.to_string();
         assert!(message.contains("sidecar not found"), "{message}");
         assert!(message.contains("vJoy not found"), "{message}");
@@ -781,8 +844,14 @@ mod tests {
         let mut current = old.boxed();
         current.try_connect().expect("old vJoy connects");
 
-        let outcome = switch_backend(&mut current, BackendKind::HidMaestro, &factories, None)
-            .expect("fallback reconnects the live vJoy backend");
+        let outcome = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            true,
+        )
+        .expect("fallback reconnects the live vJoy backend");
         assert_eq!(outcome.active, BackendKind::VJoy);
         assert!(outcome.fell_back);
         assert!(!outcome.switched, "same backend instance stays installed");
@@ -804,8 +873,14 @@ mod tests {
         let (backend, backend_state) = MockBackend::new("HIDMaestro");
         let mut current = backend.boxed();
 
-        let outcome = switch_backend(&mut current, BackendKind::HidMaestro, &factories, None)
-            .expect("same-kind reconnect succeeds");
+        let outcome = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            true,
+        )
+        .expect("same-kind reconnect succeeds");
         assert_eq!(outcome.active, BackendKind::HidMaestro);
         assert!(!outcome.switched, "same backend instance stays installed");
         assert_eq!(
@@ -827,8 +902,14 @@ mod tests {
         let mut current = backend.boxed();
         current.try_connect().expect("backend connects");
 
-        let outcome = switch_backend(&mut current, BackendKind::HidMaestro, &factories, None)
-            .expect("no-op switch succeeds");
+        let outcome = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            true,
+        )
+        .expect("no-op switch succeeds");
         assert!(!outcome.switched);
         assert!(!outcome.fell_back);
         let (_, connect_calls, disconnect_calls) = state_of(&backend_state);
@@ -845,11 +926,109 @@ mod tests {
         let mut current = old.boxed();
         current.try_connect().expect("old connects");
 
-        let outcome = switch_backend(&mut current, BackendKind::None, &factories, None)
+        let outcome = switch_backend(&mut current, BackendKind::None, &factories, None, true)
             .expect("switch to none succeeds");
         assert_eq!(outcome.active, BackendKind::None);
         assert!(!current.is_connected());
         assert_eq!(state_of(&old_state).2, 1, "old backend disconnected once");
+    }
+
+    #[test]
+    fn explicit_hidmaestro_failure_errors_without_fallback() {
+        // Bug 4/8: an explicit user switch to HIDMaestro whose
+        // connect fails (non-UAC reason) must ERROR with the real
+        // reason — never silently land on vJoy with a success
+        // outcome. The slot stays exactly as it was.
+        let hm = MockFactory::new("HIDMaestro");
+        hm.fail_next(1, "HIDMaestro sidecar failed to start.");
+        let vjoy = MockFactory::new("vJoy");
+        let factories = factories_with(&hm, &vjoy);
+        let (old, old_state) = MockBackend::new("vJoy");
+        let mut current = old.boxed();
+        current.try_connect().expect("old vJoy connects");
+
+        let error = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            false,
+        )
+        .expect_err("explicit HIDMaestro failure must error, not fall back");
+        let message = error.to_string();
+        assert!(message.contains("sidecar failed to start"), "{message}");
+        assert!(!message.contains("fell back"), "{message}");
+        assert_eq!(current.name(), "vJoy");
+        let (connected, _, disconnects) = state_of(&old_state);
+        assert!(connected, "live vJoy stays connected");
+        assert_eq!(disconnects, 0, "live vJoy is never disconnected");
+        assert_eq!(
+            vjoy.builds.load(Ordering::SeqCst),
+            0,
+            "no second vJoy is built for a disallowed fallback"
+        );
+    }
+
+    #[test]
+    fn explicit_hidmaestro_failure_from_sink_errors_without_fallback() {
+        // Same rule from the no-device sink: the error names the
+        // HIDMaestro failure, the sink stays installed.
+        let hm = MockFactory::new("HIDMaestro");
+        hm.fail_next(1, "HIDMaestro driver install failed.");
+        let vjoy = MockFactory::new("vJoy");
+        let factories = factories_with(&hm, &vjoy);
+        let mut current = MockBackend::new("NullSink").0.boxed();
+
+        let error = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            false,
+        )
+        .expect_err("explicit HIDMaestro failure must error");
+        assert!(error.to_string().contains("driver install failed"));
+        assert_eq!(current.name(), "NullSink");
+        assert!(!current.is_connected());
+    }
+
+    #[test]
+    fn explicit_same_kind_reconnect_failure_errors_without_fallback() {
+        // The same-kind reconnect path honours the flag too: a
+        // disconnected HIDMaestro whose reconnect fails errors
+        // instead of falling back to vJoy.
+        let hm = MockFactory::new("HIDMaestro");
+        let vjoy = MockFactory::new("vJoy");
+        let factories = factories_with(&hm, &vjoy);
+        let (backend, backend_state) =
+            MockBackend::with_failures("HIDMaestro", 2, "HIDMaestro sidecar failed to start.");
+        let mut current = backend.boxed();
+
+        let error = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            false,
+        )
+        .expect_err("explicit reconnect failure must error");
+        assert!(error.to_string().contains("sidecar failed to start"));
+        assert_eq!(current.name(), "HIDMaestro");
+        let (connected, _, disconnects) = state_of(&backend_state);
+        assert!(!connected);
+        assert_eq!(disconnects, 0, "failed instance is not disconnected");
+        // …while the automatic path still falls back, for the same
+        // installed backend.
+        let outcome = switch_backend(
+            &mut current,
+            BackendKind::HidMaestro,
+            &factories,
+            None,
+            true,
+        )
+        .expect("automatic reconnect falls back to vJoy");
+        assert!(outcome.fell_back);
+        assert_eq!(outcome.active, BackendKind::VJoy);
     }
 
     #[test]
@@ -866,7 +1045,7 @@ mod tests {
         // Requesting the *other* backend (vJoy) with no factory for it
         // must error — the same-kind request would be a no-op that
         // needs no factory at all.
-        let error = switch_backend(&mut current, BackendKind::VJoy, &factories, None)
+        let error = switch_backend(&mut current, BackendKind::VJoy, &factories, None, true)
             .expect_err("missing vJoy factory must error");
         assert!(matches!(error, OutputError::BackendNotAvailable(_)));
         assert!(error.to_string().contains("not installed"), "{error}");
