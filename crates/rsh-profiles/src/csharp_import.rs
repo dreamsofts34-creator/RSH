@@ -232,6 +232,17 @@ pub struct PerModuleTuning {
     /// `Some(false)` = axis; `None` = module default (axis).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handbrake_button_mode: Option<bool>,
+    // --- Pedal ramps/curves per-module tuning ---
+    /// Pedal press ramp in ms (accelerator / brake / clutch only).
+    /// `None` = never set — the profile's global `pedal_press_ms`
+    /// applies (old profiles load with `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub press_ms: Option<f64>,
+    /// Pedal release ramp in ms (accelerator / brake / clutch only).
+    /// `None` = never set — the profile's global `pedal_release_ms`
+    /// applies (old profiles load with `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_ms: Option<f64>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -509,6 +520,9 @@ impl Default for PerModuleTuning {
             led_pattern: None,
             led_color: None,
             handbrake_button_mode: None,
+            // --- Pedal ramps/curves per-module tuning ---
+            press_ms: None,
+            release_ms: None,
         }
     }
 }
@@ -603,12 +617,16 @@ pub fn default_modules() -> HashMap<String, bool> {
 }
 
 /// Canonicalizes a module id: trims, lowercases, and maps the legacy
-/// `"accel"` spelling to the canonical `"accelerator"` (C-MOD-1).
+/// spellings to the canonical `"accelerator"` (C-MOD-1): `"accel"`
+/// and `"throttle"` (the Pedals page's spelling) both read the
+/// accelerator record — without this the UI's throttle edits landed
+/// under a `"throttle"` key the pipeline never reads (Workstream C
+/// probe: a `"throttle"` deadzone never reached `plan.accelerator`).
 /// Unknown ids pass through unchanged (lowercased + trimmed).
 #[must_use]
 pub fn canonical_module_id(id: &str) -> String {
     match id.trim().to_ascii_lowercase().as_str() {
-        "accel" => "accelerator".to_string(),
+        "accel" | "throttle" => "accelerator".to_string(),
         other => other.to_string(),
     }
 }

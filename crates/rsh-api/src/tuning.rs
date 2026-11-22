@@ -56,6 +56,34 @@ pub fn steering_lock_deg_to_scale(deg: f64) -> f64 {
     (snap_steering_lock_deg(deg) / DEFAULT_STEERING_LOCK_DEG).clamp(0.2, 1.0)
 }
 
+/// Default pedal press-ramp ms for a module (per-module tuning,
+/// Workstream C): the accelerator opens over 100 ms, the brake bites
+/// over 50 ms; other modules have no press ramp of their own and
+/// fall back to the profile's global `pedal_press_ms` (150 ms).
+/// Both spellings of the throttle id are accepted — the UI writes
+/// `"throttle"`, the pipeline reads `"accelerator"`.
+#[must_use]
+pub fn default_press_ms(module: &str) -> Option<f64> {
+    match module {
+        "accelerator" | "throttle" => Some(100.0),
+        "brake" => Some(50.0),
+        _ => None,
+    }
+}
+
+/// Default pedal release-ramp ms for a module (per-module tuning,
+/// Workstream C): the accelerator closes over 50 ms, the clutch
+/// releases over 300 ms; other modules fall back to the profile's
+/// global `pedal_release_ms` (100 ms).
+#[must_use]
+pub fn default_release_ms(module: &str) -> Option<f64> {
+    match module {
+        "accelerator" | "throttle" => Some(50.0),
+        "clutch" => Some(300.0),
+        _ => None,
+    }
+}
+
 /// Shifter gate type (tuning extension; the C# `ShifterGateMode`
 /// string kept as a typed enum here).
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -209,6 +237,25 @@ pub struct TuningSettings {
     /// `Some(false)` = axis; `None` = module default (axis).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handbrake_button_mode: Option<bool>,
+    // --- Pedal ramps/curves per-module tuning ---
+    /// Pedal press ramp in ms (accelerator / brake / clutch only;
+    /// `None` = no per-module ramp — the profile's global
+    /// `pedal_press_ms` applies). Defaults: accelerator 100 ms,
+    /// brake 50 ms (see [`default_press_ms`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub press_ms: Option<f64>,
+    /// Pedal release ramp in ms (accelerator / brake / clutch only;
+    /// `None` = no per-module ramp — the profile's global
+    /// `pedal_release_ms` applies). Defaults: accelerator 50 ms,
+    /// clutch 300 ms (see [`default_release_ms`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_ms: Option<f64>,
+    /// Combined pedals (accelerator + brake as one axis, for old
+    /// games): a profile-level switch, carried on the accelerator
+    /// record only (`None` = not applicable — other modules never
+    /// carry it). Default off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combine_pedals: Option<bool>,
 }
 
 impl TuningSettings {
@@ -222,7 +269,10 @@ impl TuningSettings {
         Self {
             module: module.to_string(),
             deadzone: 0.0,
-            curve: 1.0,
+            // --- Pedal ramps/curves per-module tuning ---
+            // Brake defaults to a progressive 1.3 curve (B3); the
+            // other pedals are linear 1.0.
+            curve: if module == "brake" { 1.3 } else { 1.0 },
             min_mv: 0.0,
             max_mv: 3300.0,
             smoothing: 0.0,
@@ -240,6 +290,14 @@ impl TuningSettings {
             led_pattern: None,
             led_color: None,
             handbrake_button_mode: None,
+            // --- Pedal ramps/curves per-module tuning ---
+            press_ms: default_press_ms(module),
+            release_ms: default_release_ms(module),
+            combine_pedals: if module == "accelerator" || module == "throttle" {
+                Some(false)
+            } else {
+                None
+            },
         }
     }
 }
@@ -326,6 +384,21 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
         errors.push(format!(
             "led_brightness {brightness} is outside 0..=100 (%)"
         ));
+    }
+    // --- Pedal ramps/curves per-module tuning ---
+    // The engine sanitizes ramps to 0 (off) or 10..=2000 ms; the
+    // API contract accepts that whole range and the UI enforces the
+    // per-module slider ranges (accel 0..500, brake press 0..300,
+    // clutch release 0..1000).
+    if let Some(press_ms) = tuning.press_ms
+        && !(0.0..=2000.0).contains(&press_ms)
+    {
+        errors.push(format!("press_ms {press_ms} is outside 0..=2000"));
+    }
+    if let Some(release_ms) = tuning.release_ms
+        && !(0.0..=2000.0).contains(&release_ms)
+    {
+        errors.push(format!("release_ms {release_ms} is outside 0..=2000"));
     }
     errors
 }
@@ -499,6 +572,53 @@ mod tests {
         assert!(json.contains("\"module\":\"steering\""), "{json}");
         let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, settings);
+    }
+
+    #[test]
+    fn pedal_ramp_defaults_and_round_trip() {
+        // --- Pedal ramps/curves per-module tuning ---
+        // Task defaults: accel press 100 / release 50, brake press
+        // 50, clutch release 300, combined pedals off.
+        assert_eq!(default_press_ms("accelerator"), Some(100.0));
+        assert_eq!(default_release_ms("accelerator"), Some(50.0));
+        assert_eq!(default_press_ms("throttle"), Some(100.0));
+        assert_eq!(default_press_ms("brake"), Some(50.0));
+        assert_eq!(default_release_ms("brake"), None);
+        assert_eq!(default_press_ms("clutch"), None);
+        assert_eq!(default_release_ms("clutch"), Some(300.0));
+        assert_eq!(default_press_ms("steering"), None);
+        assert_eq!(default_release_ms("steering"), None);
+        // B3: the brake curve defaults to progressive 1.3, the
+        // other pedals to linear 1.0.
+        assert_eq!(TuningSettings::neutral("brake").curve, 1.3);
+        assert_eq!(TuningSettings::neutral("clutch").curve, 1.0);
+        let accel = TuningSettings::neutral("accelerator");
+        assert_eq!(accel.press_ms, Some(100.0));
+        assert_eq!(accel.release_ms, Some(50.0));
+        assert_eq!(accel.combine_pedals, Some(false));
+        assert_eq!(validate_tuning(&accel), Vec::<String>::new());
+        let json = serde_json::to_string(&accel).expect("serialize");
+        assert!(json.contains("\"pressMs\":100.0"), "{json}");
+        assert!(json.contains("\"releaseMs\":50.0"), "{json}");
+        assert!(json.contains("\"combinePedals\":false"), "{json}");
+        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, accel);
+        // Old JSON without the fields loads with None (old profiles
+        // keep the global ramps until edited).
+        let old: TuningSettings =
+            serde_json::from_str(r#"{"module":"brake","deadzone":0.0,"curve":1.3,"minMv":0.0,"maxMv":3300.0,"smoothing":0.0}"#)
+                .expect("deserialize old");
+        assert_eq!(old.press_ms, None);
+        assert_eq!(old.release_ms, None);
+        assert_eq!(old.combine_pedals, None);
+        // Out-of-range ramps are rejected, never silently clamped.
+        let mut bad = TuningSettings::neutral("brake");
+        bad.press_ms = Some(2500.0);
+        bad.release_ms = Some(-5.0);
+        let errors = validate_tuning(&bad);
+        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert!(errors.iter().any(|e| e.contains("press_ms")));
+        assert!(errors.iter().any(|e| e.contains("release_ms")));
     }
 
     #[test]

@@ -159,7 +159,9 @@ use rsh_api::ButtonBinding;
 use rsh_api::RawMv;
 use rsh_api::connection::{HELLO_ATTEMPTS, HELLO_WAIT};
 use rsh_api::errors::ConnectionError;
-use rsh_api::tuning::{snap_steering_lock_deg, steering_lock_deg_to_scale};
+use rsh_api::tuning::{
+    default_press_ms, default_release_ms, snap_steering_lock_deg, steering_lock_deg_to_scale,
+};
 use rsh_api::{FirmwareCheck, FirmwareUpdateStatus};
 use rsh_engine::calibration::{
     CalibrationError, DEFAULT_CENTER_MV, MIN_HALF_SPAN_MV, MIN_SPAN_MV, validate_pedal_range,
@@ -6381,6 +6383,20 @@ impl AppStateCore {
                 // M2/H8: stored colour (hex) + handbrake mode round-trip.
                 led_color: stored.led_color.as_deref().and_then(parse_hex_color),
                 handbrake_button_mode: stored.handbrake_button_mode,
+                // --- Pedal ramps/curves per-module tuning ---
+                // A stored per-module ramp wins; otherwise the task
+                // default for the module — old profiles load with
+                // the defaults, never with a silent 0. Combined
+                // pedals is a profile-level switch, carried on the
+                // throttle record (both spellings: the UI writes
+                // "throttle", the pipeline reads "accelerator").
+                press_ms: stored.press_ms.or(default_press_ms(&module)),
+                release_ms: stored.release_ms.or(default_release_ms(&module)),
+                combine_pedals: if module == "accelerator" || module == "throttle" {
+                    Some(active.profile.combine_pedals)
+                } else {
+                    None
+                },
             };
         }
         let (invert, steering_lock_deg, steering_balance_pct, steering_center_trim_pct) =
@@ -6389,10 +6405,26 @@ impl AppStateCore {
                 .map_or((None, None, None, None), |active| {
                     steering_opts(&active.profile)
                 });
+        // --- Pedal ramps/curves per-module tuning ---
+        let press_ms = default_press_ms(&module);
+        let release_ms = default_release_ms(&module);
+        // Brake defaults to a progressive 1.3 curve (B3) on a fresh
+        // profile; profiles with a stored brake curve keep it (the
+        // stored branch above).
+        let curve = if module == "brake" { 1.3 } else { 1.0 };
+        let combine_pedals = if module == "accelerator" || module == "throttle" {
+            Some(
+                lock(&self.store)
+                    .active()
+                    .is_some_and(|active| active.profile.combine_pedals),
+            )
+        } else {
+            None
+        };
         TuningSettings {
             module,
             deadzone: 0.0,
-            curve: 1.0,
+            curve,
             min_mv: 0.0,
             max_mv: 3300.0,
             smoothing: 0.0,
@@ -6409,6 +6441,9 @@ impl AppStateCore {
             led_pattern: None,
             led_color: None,
             handbrake_button_mode: None,
+            press_ms,
+            release_ms,
+            combine_pedals,
         }
     }
 
@@ -6495,6 +6530,9 @@ impl AppStateCore {
                 led_pattern: None,
                 led_color: None,
                 handbrake_button_mode: None,
+                // --- Pedal ramps/curves per-module tuning ---
+                press_ms: None,
+                release_ms: None,
             });
         entry.deadzone = tuning.deadzone / 100.0;
         entry.curve_strength = (tuning.curve - 1.0).clamp(-1.0, 1.0);
@@ -6533,6 +6571,16 @@ impl AppStateCore {
         // M2/H8: colour persists as "#RRGGBB", handbrake mode as-is.
         entry.led_color = tuning.led_color.map(|color| format!("#{color:06X}"));
         entry.handbrake_button_mode = tuning.handbrake_button_mode;
+        // --- Pedal ramps/curves per-module tuning ---
+        // Per-module ramps persist on the entry (None = never set,
+        // the global ramp applies); combined pedals is a
+        // profile-level switch, written only when the throttle
+        // record carries it.
+        entry.press_ms = tuning.press_ms;
+        entry.release_ms = tuning.release_ms;
+        if let Some(combine) = tuning.combine_pedals {
+            profile.combine_pedals = combine;
+        }
         if let Some(gate) = tuning.shifter_gate {
             entry.gate_mode = match gate {
                 ShifterGate::Sequential => "Sequential".to_string(),
@@ -6758,6 +6806,16 @@ impl AppStateCore {
         } else {
             (scale, scale, center_mv)
         };
+        // --- Pedal ramps/curves per-module tuning ---
+        // A per-module ramp wins over the profile's global pedal
+        // ramp (the pre-tuning behaviour for modules with no ramp
+        // of their own). `module_plan_tuning` runs on the
+        // `get_tuning` record, which already carries the task
+        // defaults for the pedal modules.
+        let (press_ms, release_ms) = (
+            tuning.press_ms.map_or(press_ms, |ms| ms as f32),
+            tuning.release_ms.map_or(release_ms, |ms| ms as f32),
+        );
         ModuleTuning {
             enabled: stored.map_or(module != "clutch", |s| s.enabled),
             deadzone: (tuning.deadzone / 100.0) as f32,
@@ -10519,6 +10577,76 @@ mod tests {
         let plan = state.build_pipeline_plan();
         assert!((plan.steering.curve_strength - 0.5).abs() < f32::EPSILON);
         assert_eq!((plan.steering.min_mv, plan.steering.max_mv), (300, 3300));
+    }
+
+    /// Workstream C regression: the Pedals page writes the throttle
+    /// as `"throttle"` while the pipeline reads `"accelerator"` —
+    /// both spellings must land in the same record, or the throttle
+    /// tuning never reaches the engine.
+    #[test]
+    fn throttle_spelling_reaches_plan() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        assert_eq!(state.get_tuning("throttle").module, "accelerator");
+        let mut t = state.get_tuning("throttle");
+        t.deadzone = 5.0;
+        state.set_tuning(&t).expect("set throttle");
+        let plan = state.build_pipeline_plan();
+        assert!(
+            (plan.accelerator.deadzone - 0.05).abs() < f32::EPSILON,
+            "throttle deadzone did not reach plan.accelerator (got {})",
+            plan.accelerator.deadzone
+        );
+        // The capture spelling reads the same record.
+        assert_eq!(state.get_tuning("accelerator").deadzone, 5.0);
+    }
+
+    /// Workstream C: per-module pedal ramps + combined pedals —
+    /// task defaults, persistence through `set_tuning`/`get_tuning`,
+    /// and the live pipeline plan (a per-module ramp overrides the
+    /// profile's global pedal ramp; a module with none keeps the
+    /// global).
+    #[test]
+    fn pedal_ramps_and_combined_pedals_round_trip_to_plan() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        // Task defaults on a fresh profile: accel 100/50, brake
+        // press 50, clutch release 300, combined off.
+        let accel = state.get_tuning("accelerator");
+        assert_eq!(accel.press_ms, Some(100.0));
+        assert_eq!(accel.release_ms, Some(50.0));
+        assert_eq!(accel.combine_pedals, Some(false));
+        assert_eq!(state.get_tuning("brake").press_ms, Some(50.0));
+        assert_eq!(state.get_tuning("clutch").release_ms, Some(300.0));
+        let plan = state.build_pipeline_plan();
+        assert!((plan.accelerator.press_ms - 100.0).abs() < f32::EPSILON);
+        assert!((plan.accelerator.release_ms - 50.0).abs() < f32::EPSILON);
+        assert!((plan.brake.press_ms - 50.0).abs() < f32::EPSILON);
+        assert!((plan.clutch.release_ms - 300.0).abs() < f32::EPSILON);
+        assert!(!plan.combine_pedals);
+        // A side with no per-module ramp keeps the global (150/100).
+        assert!((plan.brake.release_ms - 100.0).abs() < f32::EPSILON);
+        assert!((plan.clutch.press_ms - 150.0).abs() < f32::EPSILON);
+        // Edit: brake press 200, clutch release 800, combined on —
+        // all land in the plan and read back.
+        let mut brake = state.get_tuning("brake");
+        brake.press_ms = Some(200.0);
+        state.set_tuning(&brake).expect("set brake");
+        let mut clutch = state.get_tuning("clutch");
+        clutch.release_ms = Some(800.0);
+        state.set_tuning(&clutch).expect("set clutch");
+        let mut accel = state.get_tuning("accelerator");
+        accel.combine_pedals = Some(true);
+        state.set_tuning(&accel).expect("set accel");
+        let plan = state.build_pipeline_plan();
+        assert!((plan.brake.press_ms - 200.0).abs() < f32::EPSILON);
+        assert!((plan.clutch.release_ms - 800.0).abs() < f32::EPSILON);
+        assert!(plan.combine_pedals);
+        assert_eq!(state.get_tuning("brake").press_ms, Some(200.0));
+        assert_eq!(state.get_tuning("clutch").release_ms, Some(800.0));
+        assert_eq!(state.get_tuning("accelerator").combine_pedals, Some(true));
+        // Other modules never carry the switch.
+        assert_eq!(state.get_tuning("brake").combine_pedals, None);
     }
 
     /// Bug 7 (PC-test fix): steering invert + lock round-trip —

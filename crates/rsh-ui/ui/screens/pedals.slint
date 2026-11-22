@@ -12,7 +12,7 @@
 // token, no other deviation).
 
 import { Theme } from "../tokens.slint";
-import { Card, Pill, Btn, SliderRow } from "../components.slint";
+import { Card, Pill, Btn, SliderRow, Switch } from "../components.slint";
 import { ScrollView } from "std-widgets.slint";
 
 // ---------------------------------------------------------------- feel chip (§6: active = accent border + tint)
@@ -152,6 +152,32 @@ component PedalCard inherits Card {
     // --- Brake per-module tuning ---
     callback force-changed(float);
     callback force-edited(string);
+    // --- Pedal ramps/curves per-module tuning ---
+    // Advanced-only sliders (Rust owns the values; the frac is
+    // 0..1 over the control's own range — see the page props).
+    in property <float> curve-value: 0.333;
+    in property <string> curve-text: "1.00";
+    in property <bool> show-press: false;
+    in property <string> press-label: "Tip-in";
+    in property <string> press-hint: "How fast it opens";
+    in property <float> press-ms-value: 0;
+    in property <string> press-ms-text: "";
+    in property <bool> show-release: false;
+    in property <string> release-label: "Lift-off";
+    in property <string> release-hint: "How fast it closes";
+    in property <float> release-ms-value: 0;
+    in property <string> release-ms-text: "";
+    in property <bool> show-saturation: false;
+    in property <float> saturation-value: 1;
+    in property <string> saturation-text: "100%";
+    callback curve-changed(float);
+    callback curve-edited(string);
+    callback press-ms-changed(float);
+    callback press-ms-edited(string);
+    callback release-ms-changed(float);
+    callback release-ms-edited(string);
+    callback saturation-changed(float);
+    callback saturation-edited(string);
 
     VerticalLayout {
         padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
@@ -238,6 +264,13 @@ component PedalCard inherits Card {
         if show-force : SliderRow { label: "Brake force"; hint: "Travel for full brake"; value-text: force-text; value: force; changed(v) => { force-changed(v); } value-edited(t) => { force-edited(t); } }
         if show-bite : SliderRow { label: "Bite point"; hint: "Where the grip starts"; value-text: bite-text; value: bite; changed(v) => { bite-changed(v); } value-edited(t) => { bite-edited(t); } }
         SliderRow { label: "Deadzone"; hint: "Ignores small inputs"; value-text: deadzone-text; value: deadzone; changed(v) => { deadzone-changed(v); } value-edited(t) => { deadzone-edited(t); } }
+        // --- Pedal ramps/curves per-module tuning ---
+        // Advanced only: each pedal's own curve + ramps, never
+        // copied into a module that does not need them.
+        if advanced : SliderRow { label: "Response curve"; hint: "Shape — 1.00 is linear"; value-text: curve-text; value: curve-value; changed(v) => { curve-changed(v); } value-edited(t) => { curve-edited(t); } }
+        if advanced && show-press : SliderRow { label: press-label; hint: press-hint; value-text: press-ms-text; value: press-ms-value; changed(v) => { press-ms-changed(v); } value-edited(t) => { press-ms-edited(t); } }
+        if advanced && show-release : SliderRow { label: release-label; hint: release-hint; value-text: release-ms-text; value: release-ms-value; changed(v) => { release-ms-changed(v); } value-edited(t) => { release-ms-edited(t); } }
+        if advanced && show-saturation : SliderRow { label: "Throttle saturation"; hint: "Travel % for full throttle"; value-text: saturation-text; value: saturation-value; changed(v) => { saturation-changed(v); } value-edited(t) => { saturation-edited(t); } }
         // R2-16: Advanced only — the live raw ADC reading (~1 Hz).
         if advanced : HorizontalLayout {
             spacing: 8px;
@@ -300,6 +333,29 @@ export component PedalsPage inherits VerticalLayout {
     in property <string> clutch-dashed;
     in property <float> clutch-marker-x;
     in property <float> clutch-marker-y;
+    // --- Pedal ramps/curves per-module tuning ---
+    // Slider fracs are 0..1 over each control's own range
+    // (curve 0.5..2.0; throttle press/release 0..500 ms; brake
+    // press 0..300 ms; clutch release 0..1000 ms; saturation
+    // 70..100%) — Rust owns the mapping, the page only displays.
+    in property <float> throttle-curve-value: 0.333;
+    in property <string> throttle-curve-text: "1.00";
+    in property <float> throttle-press-ms-value: 0.2;
+    in property <string> throttle-press-ms-text: "100 ms";
+    in property <float> throttle-release-ms-value: 0.1;
+    in property <string> throttle-release-ms-text: "50 ms";
+    in property <float> throttle-saturation-value: 1;
+    in property <string> throttle-saturation-text: "100%";
+    in property <float> brake-curve-value: 0.533;
+    in property <string> brake-curve-text: "1.30";
+    in property <float> brake-press-ms-value: 0.167;
+    in property <string> brake-press-ms-text: "50 ms";
+    in property <float> clutch-curve-value: 0.333;
+    in property <string> clutch-curve-text: "1.00";
+    in property <float> clutch-release-ms-value: 0.3;
+    in property <string> clutch-release-ms-text: "300 ms";
+    // Combined pedals (gas + brake as one axis, for old games).
+    in property <bool> combine-pedals: false;
 
     in property <bool> set-disabled: false;
     // DS-54: which job kind the busy strip shows, as a
@@ -318,6 +374,16 @@ export component PedalsPage inherits VerticalLayout {
     callback brake-bite-edited(string); // typed percent, 0–50%
     callback brake-force-changed(float); // 0.5..1.0 saturation
     callback brake-force-edited(string); // typed percent, 50–100%
+    // --- Pedal ramps/curves per-module tuning ---
+    callback pedal-curve-changed(int, float); // (pedal, 0..1 of 0.5..2.0)
+    callback pedal-curve-edited(int, string); // (pedal, typed exponent)
+    callback pedal-press-ms-changed(int, float); // (pedal, 0..1 of range)
+    callback pedal-press-ms-edited(int, string); // (pedal, typed "120 ms")
+    callback pedal-release-ms-changed(int, float); // (pedal, 0..1 of range)
+    callback pedal-release-ms-edited(int, string); // (pedal, typed "120 ms")
+    callback throttle-saturation-changed(float); // 0..1 of 70..100%
+    callback throttle-saturation-edited(string); // typed "85%"
+    callback combine-pedals-changed(bool);
 
     // Phase 2 (F-5): the page scrolls (Settings pattern) — the
     // clutch card clipped ~11 px Basic / ~30–38 px Advanced.
@@ -353,6 +419,21 @@ export component PedalsPage inherits VerticalLayout {
             deadzone-text: throttle-deadzone-text;
             show-bite: false;
             show-force: false;
+            curve-value: throttle-curve-value;
+            curve-text: throttle-curve-text;
+            show-press: true;
+            press-label: "Tip-in";
+            press-hint: "How fast the throttle opens";
+            press-ms-value: throttle-press-ms-value;
+            press-ms-text: throttle-press-ms-text;
+            show-release: true;
+            release-label: "Lift-off";
+            release-hint: "How fast the throttle closes";
+            release-ms-value: throttle-release-ms-value;
+            release-ms-text: throttle-release-ms-text;
+            show-saturation: true;
+            saturation-value: throttle-saturation-value;
+            saturation-text: throttle-saturation-text;
             advanced: advanced;
             raw-mv: throttle-raw-mv;
             set-disabled: set-disabled;
@@ -373,6 +454,14 @@ export component PedalsPage inherits VerticalLayout {
             deadzone-edited(t) => { deadzone-edited(0, t); }
             bite-changed(v) => { bite-changed(v); }
             bite-edited(t) => { bite-edited(t); }
+            curve-changed(v) => { pedal-curve-changed(0, v); }
+            curve-edited(t) => { pedal-curve-edited(0, t); }
+            press-ms-changed(v) => { pedal-press-ms-changed(0, v); }
+            press-ms-edited(t) => { pedal-press-ms-edited(0, t); }
+            release-ms-changed(v) => { pedal-release-ms-changed(0, v); }
+            release-ms-edited(t) => { pedal-release-ms-edited(0, t); }
+            saturation-changed(v) => { throttle-saturation-changed(v); }
+            saturation-edited(t) => { throttle-saturation-edited(t); }
         }
         // Responsive gap (R-4): min-width 12px, stretch 0.05.
         Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
@@ -392,6 +481,15 @@ export component PedalsPage inherits VerticalLayout {
             // B2 bite (0..1 of 50%) + B1 brake force (0.5..1.0).
             show-bite: true;
             show-force: true;
+            curve-value: brake-curve-value;
+            curve-text: brake-curve-text;
+            show-press: true;
+            press-label: "Initial bite";
+            press-hint: "How fast brake force builds";
+            press-ms-value: brake-press-ms-value;
+            press-ms-text: brake-press-ms-text;
+            show-release: false;
+            show-saturation: false;
             advanced: advanced;
             raw-mv: brake-raw-mv;
             set-disabled: set-disabled;
@@ -415,6 +513,10 @@ export component PedalsPage inherits VerticalLayout {
             bite-edited(t) => { brake-bite-edited(t); }
             force-changed(v) => { brake-force-changed(v); }
             force-edited(t) => { brake-force-edited(t); }
+            curve-changed(v) => { pedal-curve-changed(1, v); }
+            curve-edited(t) => { pedal-curve-edited(1, t); }
+            press-ms-changed(v) => { pedal-press-ms-changed(1, v); }
+            press-ms-edited(t) => { pedal-press-ms-edited(1, t); }
         }
         // Responsive gap (R-4): min-width 12px, stretch 0.05.
         Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
@@ -432,6 +534,15 @@ export component PedalsPage inherits VerticalLayout {
             deadzone-text: clutch-deadzone-text;
             show-bite: true;
             show-force: false;
+            curve-value: clutch-curve-value;
+            curve-text: clutch-curve-text;
+            show-press: false;
+            show-release: true;
+            release-label: "Release speed";
+            release-hint: "Slower release, smoother engagement";
+            release-ms-value: clutch-release-ms-value;
+            release-ms-text: clutch-release-ms-text;
+            show-saturation: false;
             advanced: advanced;
             raw-mv: clutch-raw-mv;
             set-disabled: set-disabled;
@@ -452,7 +563,23 @@ export component PedalsPage inherits VerticalLayout {
             deadzone-edited(t) => { deadzone-edited(2, t); }
             bite-changed(v) => { bite-changed(v); }
             bite-edited(t) => { bite-edited(t); }
+            curve-changed(v) => { pedal-curve-changed(2, v); }
+            curve-edited(t) => { pedal-curve-edited(2, t); }
+            release-ms-changed(v) => { pedal-release-ms-changed(2, v); }
+            release-ms-edited(t) => { pedal-release-ms-edited(2, t); }
         }
+    }
+    // --- Pedal ramps/curves per-module tuning ---
+    // A5: Combined pedals — gas + brake as one axis, for old games.
+    // Advanced only; Rust owns the switch state.
+    if advanced : HorizontalLayout {
+        spacing: 8px;
+        VerticalLayout {
+            Text { text: "Combined pedals"; font-size: 13px; font-weight: 500; color: Theme.text; }
+            Text { text: "Gas + brake as one axis, for old games"; font-size: 11.5px; color: Theme.faint; }
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Switch { accessible-name: "Combined pedals"; on: combine-pedals; toggled => { combine-pedals-changed(!combine-pedals); } }
     }
     // B4: the extra calibration-rule hint line below the cards is
     // removed — the Set up / Set down buttons carry the action.

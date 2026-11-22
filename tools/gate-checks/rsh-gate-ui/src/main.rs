@@ -2157,6 +2157,145 @@ fn ui_brake_tuning() -> Outcome {
     report.finish()
 }
 
+/// Gate: pedals Advanced (Workstream C) — the Advanced view holds
+/// the per-module tuning sliders (own curve per pedal, tip-in /
+/// lift-off ramps, brake initial bite, clutch release speed,
+/// throttle saturation, combined pedals), not just the Basic
+/// deadzone / feel chips. Proves: the real `PedalsPage` compiles,
+/// Advanced-on renders a whole extra set of sliders, the new labels
+/// are in the source, and the new callbacks exist with the right
+/// signatures.
+fn ui_pedals_advanced() -> Outcome {
+    let mut report = Report::new();
+    // Source assertions: new controls present.
+    let src_path = repo_root().join("crates/rsh-ui/ui/screens/pedals.slint");
+    let src = match std::fs::read_to_string(&src_path) {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(format!("read pedals.slint failed: {error}")),
+    };
+    for label in [
+        "Tip-in",
+        "Lift-off",
+        "Response curve",
+        "Throttle saturation",
+        "Initial bite",
+        "Release speed",
+        "Combined pedals",
+    ] {
+        report.check(
+            &format!("pedals-advanced-has-{label}"),
+            src.contains(label),
+            &format!("pedals.slint must contain the {label} control"),
+        );
+    }
+    let instance = match compile(
+        "tools/gate-checks/rsh-gate-ui/ui/pedals_probe.slint",
+        "GatePedalsWindow",
+    ) {
+        Ok(instance) => instance,
+        Err(error) => return Outcome::fail(error),
+    };
+    // Rendered content: Advanced-on must visibly change the render
+    // — the new sliders + combined-pedals row paint new pixels
+    // (same diff-counting approach as the steering probe).
+    if let Err(error) = set_bool(&instance, "advanced", false) {
+        return Outcome::fail(error);
+    }
+    let (basic_rgba, _, _) = match snapshot(&instance) {
+        Ok(snap) => snap,
+        Err(error) => return Outcome::fail(error),
+    };
+    if let Err(error) = set_bool(&instance, "advanced", true) {
+        return Outcome::fail(error);
+    }
+    let (advanced_rgba, _, _) = match snapshot(&instance) {
+        Ok(snap) => snap,
+        Err(error) => return Outcome::fail(error),
+    };
+    let diff = basic_rgba
+        .iter()
+        .zip(advanced_rgba.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    report.check(
+        "pedals-advanced-adds-content",
+        diff > 5000,
+        &format!("render diff Basic→Advanced: {diff} px changed (want > 5000 changed)"),
+    );
+    if let Err(error) = pedals_probe_callbacks(&instance, &mut report) {
+        return Outcome::fail(error);
+    }
+    report.finish()
+}
+
+/// The probe's new callbacks exist with the right signatures and
+/// fire: invoke each root callback and check the handler receives
+/// the value.
+fn pedals_probe_callbacks(instance: &ComponentInstance, report: &mut Report) -> Result<(), String> {
+    for (name, args, want) in [
+        (
+            "pedal-curve-changed",
+            vec![Value::Number(0.0), Value::Number(0.5)],
+            0.5_f64,
+        ),
+        (
+            "pedal-press-ms-changed",
+            vec![Value::Number(1.0), Value::Number(0.25)],
+            0.25_f64,
+        ),
+        (
+            "pedal-release-ms-changed",
+            vec![Value::Number(2.0), Value::Number(0.3)],
+            0.3_f64,
+        ),
+        (
+            "throttle-saturation-changed",
+            vec![Value::Number(0.5)],
+            0.5_f64,
+        ),
+    ] {
+        let last_num = Rc::new(RefCell::new(f64::NAN));
+        let last_num_cb = Rc::clone(&last_num);
+        instance
+            .set_callback(name, move |args| {
+                if let Some(Value::Number(n)) = args.last() {
+                    *last_num_cb.borrow_mut() = *n;
+                }
+                Value::Void
+            })
+            .map_err(|error| format!("set {name} handler failed: {error}"))?;
+        instance
+            .invoke(name, &args)
+            .map_err(|error| format!("invoke {name} failed: {error}"))?;
+        report.check(
+            &format!("pedals-{name}-callback"),
+            (*last_num.borrow() - want).abs() <= f64::EPSILON,
+            &format!("invoke {name} must reach the handler with {want}"),
+        );
+    }
+    let last_bool = Rc::new(RefCell::new(false));
+    {
+        let last_bool = Rc::clone(&last_bool);
+        instance
+            .set_callback("combine-pedals-changed", move |args| {
+                if let Some(Value::Bool(value)) = args.first() {
+                    *last_bool.borrow_mut() = *value;
+                }
+                Value::Void
+            })
+            .map_err(|error| format!("set combine-pedals-changed handler failed: {error}"))?;
+    }
+    instance
+        .invoke("combine-pedals-changed", &[Value::Bool(true)])
+        .map_err(|error| format!("invoke combine-pedals-changed failed: {error}"))?;
+    report.check(
+        "pedals-combine-pedals-callback",
+        *last_bool.borrow(),
+        "invoke combine-pedals-changed(true) must reach the handler",
+    );
+    Ok(())
+}
+
 fn checks() -> Vec<UiCheck> {
     vec![
         (
@@ -2253,6 +2392,11 @@ fn checks() -> Vec<UiCheck> {
             "ui-brake-tuning",
             "Brake B1+B2: brake card holds Brake force + Bite point sliders (own callbacks, force only on brake)",
             ui_brake_tuning as fn() -> Outcome,
+        ),
+        (
+            "ui-pedals-advanced",
+            "Workstream C: Pedals Advanced holds per-module curve / ramps / saturation / combined pedals",
+            ui_pedals_advanced as fn() -> Outcome,
         ),
     ]
 }
