@@ -172,6 +172,8 @@ export component MainWindow inherits Window {
     in property <string> btn-debounce-text: "10 ms";
     in property <float> btn-longpress-ms: 800.0;
     in property <string> btn-longpress-text: "800 ms";
+    in property <float> btn-doublepress-ms: 300.0;
+    in property <string> btn-doublepress-text: "300 ms";
     in property <string> throttle-raw-mv-text: "—";
     in property <string> brake-raw-mv-text: "—";
     in property <string> clutch-raw-mv-text: "—";
@@ -445,6 +447,8 @@ export component MainWindow inherits Window {
     callback btn-debounce-edited(string);
     callback btn-longpress-changed(float);
     callback btn-longpress-edited(string);
+    callback btn-doublepress-changed(float);
+    callback btn-doublepress-edited(string);
     callback learn-clicked();
     callback edit-cancel();
     callback edit-save();
@@ -893,6 +897,8 @@ export component MainWindow inherits Window {
                 btn-debounce-text: btn-debounce-text;
                 btn-longpress-ms: btn-longpress-ms;
                 btn-longpress-text: btn-longpress-text;
+                btn-doublepress-ms: btn-doublepress-ms;
+                btn-doublepress-text: btn-doublepress-text;
                 enc-pulse-changed(v) => { enc-pulse-changed(v); }
                 enc-pulse-edited(t) => { enc-pulse-edited(t); }
                 enc-counts-changed(i) => { enc-counts-changed(i); }
@@ -904,6 +910,8 @@ export component MainWindow inherits Window {
                 btn-debounce-edited(t) => { btn-debounce-edited(t); }
                 btn-longpress-changed(v) => { btn-longpress-changed(v); }
                 btn-longpress-edited(t) => { btn-longpress-edited(t); }
+                btn-doublepress-changed(v) => { btn-doublepress-changed(v); }
+                btn-doublepress-edited(t) => { btn-doublepress-edited(t); }
                 listening: buttons-listening;
                 tile-selected(i) => { tile-selected(i); }
                 knob-selected(i) => { knob-selected(i); }

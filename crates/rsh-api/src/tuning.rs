@@ -290,6 +290,13 @@ pub struct TuningSettings {
     /// (old profile) — the 800 ms default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub button_long_press_ms: Option<f64>,
+    /// Double-press window in ms (BU3, buttons module only): a
+    /// second press within this long of the previous release
+    /// counts as a double-press and fires the button's long-press
+    /// (2nd) action — 150–500 (default 300). `None` = never set
+    /// (old profile) — the 300 ms default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub button_double_press_ms: Option<f64>,
 }
 
 impl TuningSettings {
@@ -341,6 +348,7 @@ impl TuningSettings {
             // --- Buttons per-module tuning ---
             button_debounce_ms: None,
             button_long_press_ms: None,
+            button_double_press_ms: None,
         }
     }
 }
@@ -485,6 +493,13 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
     {
         errors.push(format!(
             "button_long_press_ms {long_press_ms} is outside 300..=1500 (ms)"
+        ));
+    }
+    if let Some(double_press_ms) = tuning.button_double_press_ms
+        && !(150.0..=500.0).contains(&double_press_ms)
+    {
+        errors.push(format!(
+            "button_double_press_ms {double_press_ms} is outside 150..=500 (ms)"
         ));
     }
     errors
@@ -700,25 +715,30 @@ mod tests {
 
     #[test]
     fn button_fields_round_trip_and_validate() {
-        // BU1+BU2: debounce 0–50 ms (default 10), long-press
-        // threshold 300–1500 ms (default 800). Old profiles load
-        // them as None and the daemon applies the defaults.
+        // BU1+BU2+BU3: debounce 0–50 ms (default 10), long-press
+        // threshold 300–1500 ms (default 800), double-press
+        // window 150–500 ms (default 300). Old profiles load them
+        // as None and the daemon applies the defaults.
         let mut settings = tuning("buttons");
         assert_eq!(settings.button_debounce_ms, None);
         assert_eq!(settings.button_long_press_ms, None);
+        assert_eq!(settings.button_double_press_ms, None);
         assert_eq!(validate_tuning(&settings), Vec::<String>::new());
         settings.button_debounce_ms = Some(25.0);
         settings.button_long_press_ms = Some(1200.0);
+        settings.button_double_press_ms = Some(250.0);
         assert_eq!(validate_tuning(&settings), Vec::<String>::new());
         let json = serde_json::to_string(&settings).expect("serialize");
         assert!(json.contains("\"buttonDebounceMs\":25.0"), "{json}");
         assert!(json.contains("\"buttonLongPressMs\":1200.0"), "{json}");
+        assert!(json.contains("\"buttonDoublePressMs\":250.0"), "{json}");
         let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, settings);
         // Other modules never carry them: omitted from the JSON.
         let json = serde_json::to_string(&tuning("brake")).expect("serialize");
         assert!(!json.contains("buttonDebounceMs"), "{json}");
         assert!(!json.contains("buttonLongPressMs"), "{json}");
+        assert!(!json.contains("buttonDoublePressMs"), "{json}");
         // Old JSON without the fields loads as None.
         let old: TuningSettings = serde_json::from_str(
             r#"{"module":"buttons","deadzone":0.0,"curve":1.0,"minMv":0.0,"maxMv":3300.0,"smoothing":0.0}"#,
@@ -726,15 +746,21 @@ mod tests {
         .expect("deserialize old");
         assert_eq!(old.button_debounce_ms, None);
         assert_eq!(old.button_long_press_ms, None);
+        assert_eq!(old.button_double_press_ms, None);
         // Out-of-range values are rejected, never silently clamped here.
         let mut bad = tuning("buttons");
         bad.button_debounce_ms = Some(60.0);
         bad.button_long_press_ms = Some(200.0);
+        bad.button_double_press_ms = Some(100.0);
         let errors = validate_tuning(&bad);
-        assert_eq!(errors.len(), 2, "errors: {errors:?}");
+        assert_eq!(errors.len(), 3, "errors: {errors:?}");
         assert!(errors.iter().any(|e| e.contains("button_debounce_ms")));
         assert!(
             errors.iter().any(|e| e.contains("button_long_press_ms")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("button_double_press_ms")),
             "{errors:?}"
         );
     }

@@ -154,6 +154,11 @@ pub struct ModuleTuning {
     /// how long a button must be held before its long-press action
     /// takes over, `300..=1500` (default `800`).
     pub long_press_ms: f32,
+    /// Double-press window in milliseconds (BU3, buttons only):
+    /// a second press that starts within this long of the previous
+    /// release counts as a double-press, `150..=500` (default
+    /// `300`).
+    pub double_press_ms: f32,
 }
 
 impl Default for ModuleTuning {
@@ -186,6 +191,7 @@ impl Default for ModuleTuning {
             // --- Buttons per-module tuning ---
             debounce_ms: 10.0,
             long_press_ms: 800.0,
+            double_press_ms: 300.0,
         }
     }
 }
@@ -231,6 +237,7 @@ impl ModuleTuning {
         // --- Buttons per-module tuning ---
         out.debounce_ms = clamp_finite(self.debounce_ms, 0.0, 50.0, 10.0);
         out.long_press_ms = clamp_finite(self.long_press_ms, 300.0, 1500.0, 800.0);
+        out.double_press_ms = clamp_finite(self.double_press_ms, 150.0, 500.0, 300.0);
         if validate_pedal_range(self.min_mv, self.max_mv).is_err() {
             out.min_mv = DEFAULT_MIN_MV;
             out.max_mv = DEFAULT_MAX_MV;
@@ -351,6 +358,15 @@ pub struct OutputState {
     /// daemon's binding layer reads this to switch a button to its
     /// long-press action; the output backends never see it directly.
     pub long_press_buttons: u32,
+    /// Wheel buttons currently held as a double-press (BU3): bit
+    /// *n* is set while button *n* is held on a press that started
+    /// within the buttons module's `double_press_ms` of the
+    /// previous release of that button. The bit clears the tick the
+    /// button is released. `0` when the buttons module is disabled.
+    /// The daemon's binding layer reads this to switch the button
+    /// to its long-press (2nd) action — the same action BU2 uses, so
+    /// a double-press and a long hold both mean "2nd action".
+    pub double_press_buttons: u32,
     /// Wheel buttons 32–63. Always `0` from the pipeline: the stream
     /// packet carries only buttons 0–31, and `btnsEx` arrives via the
     /// status packet, which the engine layer merges — not the pipeline.
@@ -388,6 +404,7 @@ impl OutputState {
             pedals_combined: 0.0,
             buttons: 0,
             long_press_buttons: 0,
+            double_press_buttons: 0,
             buttons_ex: 0,
             encoder_buttons: EncoderButtons::none(),
             encoder_deltas: [0; MAX_ENCODERS],
@@ -620,6 +637,21 @@ pub struct ProcessingPipeline {
     /// BU2 ticks each debounced button has been held continuously
     /// (bit index = stream button bit).
     button_hold_ticks: [u16; 32],
+    /// BU3 tick counter: incremented once per `process_buttons`
+    /// call (one 5 ms tick at 200 Hz). Used only to measure the
+    /// gap between a release and the next press.
+    button_tick: u32,
+    /// BU3 tick each button was last released (bit index = stream
+    /// button bit). `0` = never released since the pipeline started
+    /// (so the first press is never a double-press).
+    button_last_release_tick: [u32; 32],
+    /// BU3 debounced button word from the previous tick (for edge
+    /// detection).
+    button_prev_buttons: u32,
+    /// BU3 mask of buttons currently held as a double-press (a
+    /// press that started within `double_press_ms` of the previous
+    /// release). Clears per-bit on release.
+    button_double_hold: u32,
 }
 
 impl Default for ProcessingPipeline {
@@ -657,6 +689,10 @@ impl ProcessingPipeline {
             button_candidate: 0,
             button_candidate_ticks: [0; 32],
             button_hold_ticks: [0; 32],
+            button_tick: 0,
+            button_last_release_tick: [0; 32],
+            button_prev_buttons: 0,
+            button_double_hold: 0,
             plan,
         }
     }
@@ -711,6 +747,9 @@ impl ProcessingPipeline {
         self.button_candidate = 0;
         self.button_candidate_ticks = [0; 32];
         self.button_hold_ticks = [0; 32];
+        self.button_last_release_tick = [0; 32];
+        self.button_prev_buttons = 0;
+        self.button_double_hold = 0;
     }
 
     /// Process one stream frame into an [`OutputState`].
@@ -838,6 +877,18 @@ impl ProcessingPipeline {
             self.button_candidate = 0;
             self.button_candidate_ticks = [0; 32];
             self.button_hold_ticks = [0; 32];
+            self.button_last_release_tick = [0; 32];
+            self.button_prev_buttons = 0;
+            self.button_double_hold = 0;
+            0
+        };
+        // BU3: double-press tracking on the debounced word — the
+        // mask of buttons held on a press that started within
+        // `double_press_ms` of the previous release. Clears with the
+        // same disabled branch above (which zeroes the BU3 state).
+        out.double_press_buttons = if self.plan.buttons.enabled {
+            self.track_button_double_press(out.buttons)
+        } else {
             0
         };
         // D9: buttons > 32 are rejected, never clamped. The stream
@@ -992,6 +1043,40 @@ impl ProcessingPipeline {
         }
         long
     }
+
+    /// BU3: double-press detection on the debounced word. A press
+    /// that starts within `double_press_ms` of the previous release
+    /// of the same button sets that button's bit in
+    /// `button_double_hold` for the whole hold; the bit clears on
+    /// release. The gap is measured in pipeline ticks (5 ms at
+    /// 200 Hz); a `process_with_gap` loss makes the window
+    /// approximate by the lost frames, which is acceptable for a
+    /// human double-press. Returns the current double-press mask.
+    fn track_button_double_press(&mut self, buttons: u32) -> u32 {
+        let window = button_double_press_ticks(self.plan.buttons.double_press_ms);
+        self.button_tick = self.button_tick.wrapping_add(1);
+        let tick = self.button_tick;
+        for (bit, last_release) in self.button_last_release_tick.iter_mut().enumerate() {
+            let mask = 1u32 << bit;
+            let pressed = buttons & mask != 0;
+            let was_pressed = self.button_prev_buttons & mask != 0;
+            if pressed && !was_pressed {
+                // Rising edge: double-press if the previous release
+                // was recent enough (and this is not the first
+                // press ever — `last_release == 0` means "never").
+                if *last_release != 0 && tick.wrapping_sub(*last_release) <= u32::from(window) {
+                    self.button_double_hold |= mask;
+                }
+            } else if !pressed && was_pressed {
+                // Falling edge: remember the release tick, clear
+                // the double-press hold for this button.
+                *last_release = tick;
+                self.button_double_hold &= !mask;
+            }
+        }
+        self.button_prev_buttons = buttons;
+        self.button_double_hold
+    }
 }
 
 /// Encoder pulse hold in ticks for a `pulse_ms` setting (E1): one
@@ -1020,6 +1105,15 @@ pub fn button_debounce_ticks(debounce_ms: f32) -> u8 {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn button_long_press_ticks(long_press_ms: f32) -> u16 {
     ((long_press_ms / 5.0).round().clamp(60.0, 300.0)) as u16
+}
+
+/// BU3: double-press window in ticks for a `double_press_ms`
+/// setting (150–500 ms → 30–100 ticks at 5 ms/tick). The clamp to
+/// `30..=100` makes both casts safe.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn button_double_press_ticks(double_press_ms: f32) -> u16 {
+    ((double_press_ms / 5.0).round().clamp(30.0, 100.0)) as u16
 }
 
 /// Map a steering sample in mV to `-1..=1` using a
@@ -2085,7 +2179,7 @@ mod tests {
 
     #[test]
     fn button_debounce_ticks_convert() {
-        use super::{button_debounce_ticks, button_long_press_ticks};
+        use super::{button_debounce_ticks, button_double_press_ticks, button_long_press_ticks};
         assert_eq!(button_debounce_ticks(0.0), 0);
         assert_eq!(button_debounce_ticks(10.0), 2);
         assert_eq!(button_debounce_ticks(50.0), 10);
@@ -2094,6 +2188,11 @@ mod tests {
         assert_eq!(button_long_press_ticks(300.0), 60);
         assert_eq!(button_long_press_ticks(1500.0), 300);
         assert_eq!(button_long_press_ticks(100.0), 60);
+        assert_eq!(button_double_press_ticks(300.0), 60);
+        assert_eq!(button_double_press_ticks(150.0), 30);
+        assert_eq!(button_double_press_ticks(500.0), 100);
+        assert_eq!(button_double_press_ticks(100.0), 30);
+        assert_eq!(button_double_press_ticks(600.0), 100);
     }
 
     #[test]
@@ -2202,15 +2301,72 @@ mod tests {
         let mut plan = plain_plan();
         plan.buttons.debounce_ms = 60.0;
         plan.buttons.long_press_ms = 100.0;
+        plan.buttons.double_press_ms = 600.0;
         let pipe = ProcessingPipeline::new(plan);
         assert_eq!(pipe.plan().buttons.debounce_ms, 50.0);
         assert_eq!(pipe.plan().buttons.long_press_ms, 300.0);
+        assert_eq!(pipe.plan().buttons.double_press_ms, 500.0);
         let mut plan = plain_plan();
         plan.buttons.debounce_ms = f32::NAN;
         plan.buttons.long_press_ms = f32::NAN;
+        plan.buttons.double_press_ms = f32::NAN;
         let pipe = ProcessingPipeline::new(plan);
         assert_eq!(pipe.plan().buttons.debounce_ms, 10.0);
         assert_eq!(pipe.plan().buttons.long_press_ms, 800.0);
+        assert_eq!(pipe.plan().buttons.double_press_ms, 300.0);
+    }
+
+    #[test]
+    fn button_double_press_sets_within_window_and_clears_on_release() {
+        // BU3: default 300 ms = 60 ticks. The first press is never
+        // a double-press; a second press starting within the window
+        // of the previous release sets the bit for the whole hold;
+        // the release clears it.
+        let mut plan = plain_plan();
+        plan.buttons.debounce_ms = 0.0;
+        plan.buttons.double_press_ms = 300.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[], 0)); // baseline
+        // First press: single.
+        let out = pipe.process(&frame(&[], &[], 1 << 4));
+        assert_eq!(out.buttons, 1 << 4);
+        assert_eq!(out.double_press_buttons, 0);
+        // Release, then 20 ticks of rest (inside the 60-tick window).
+        let _ = pipe.process(&frame(&[], &[], 0));
+        for _ in 0..20 {
+            let _ = pipe.process(&frame(&[], &[], 0));
+        }
+        // Second press: double, and it stays set while held.
+        let out = pipe.process(&frame(&[], &[], 1 << 4));
+        assert_eq!(out.buttons, 1 << 4);
+        assert_eq!(out.double_press_buttons, 1 << 4);
+        let out = pipe.process(&frame(&[], &[], 1 << 4));
+        assert_eq!(out.double_press_buttons, 1 << 4);
+        // Release clears both.
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert_eq!(out.buttons, 0);
+        assert_eq!(out.double_press_buttons, 0);
+    }
+
+    #[test]
+    fn button_double_press_ignored_outside_window() {
+        // BU3: a second press starting after the window is a fresh
+        // single press.
+        let mut plan = plain_plan();
+        plan.buttons.debounce_ms = 0.0;
+        plan.buttons.double_press_ms = 300.0; // 60 ticks
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[], 0));
+        let _ = pipe.process(&frame(&[], &[], 1 << 4));
+        let _ = pipe.process(&frame(&[], &[], 0));
+        // 61 ticks of rest: the next press starts 62 ticks after
+        // the release, outside the 60-tick window.
+        for _ in 0..61 {
+            let _ = pipe.process(&frame(&[], &[], 0));
+        }
+        let out = pipe.process(&frame(&[], &[], 1 << 4));
+        assert_eq!(out.buttons, 1 << 4);
+        assert_eq!(out.double_press_buttons, 0);
     }
 
     #[test]

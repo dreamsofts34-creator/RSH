@@ -865,6 +865,8 @@ enum FieldKind {
     ButtonDebounceMs,
     /// Long-press threshold in ms, 300..1500 (BU2).
     ButtonLongPressMs,
+    /// Double-press window in ms, 150..500 (BU3).
+    ButtonDoublePressMs,
 }
 
 /// A slider drag's latest value, waiting out its debounce (M-7):
@@ -2973,6 +2975,9 @@ impl Ctx {
                     }
                     FieldKind::ButtonLongPressMs => {
                         record.button_long_press_ms = Some(value.clamp(300.0, 1500.0));
+                    }
+                    FieldKind::ButtonDoublePressMs => {
+                        record.button_double_press_ms = Some(value.clamp(150.0, 500.0));
                     }
                 }
                 JobResult::Tuning(api.set_tuning(&record))
@@ -5152,6 +5157,9 @@ impl Ctx {
                                 FieldKind::ButtonLongPressMs => {
                                     effective.button_long_press_ms = local.button_long_press_ms;
                                 }
+                                FieldKind::ButtonDoublePressMs => {
+                                    effective.button_double_press_ms = local.button_double_press_ms;
+                                }
                             }
                         }
                     }
@@ -5707,9 +5715,9 @@ impl Ctx {
     }
 
     /// Write the Buttons page's button tuning props from a record
-    /// (BU1/BU2, R2-10): debounce slider + text, long-press
-    /// threshold slider + text. All writes are change-guarded,
-    /// like `push_frame`.
+    /// (BU1/BU2/BU3, R2-10): debounce slider + text, long-press
+    /// threshold slider + text, double-press window slider + text.
+    /// All writes are change-guarded, like `push_frame`.
     #[allow(clippy::cast_possible_truncation)]
     fn sync_button_props(win: &MainWindow, buttons: &TuningSettings) {
         let debounce_ms = buttons.button_debounce_ms.unwrap_or(10.0);
@@ -5730,17 +5738,32 @@ impl Ctx {
             format!("{long_press_ms:.0} ms").into(),
             |v| win.set_btn_longpress_text(v),
         );
+        let double_press_ms = buttons.button_double_press_ms.unwrap_or(300.0);
+        set_if_changed(win.get_btn_doublepress_ms(), double_press_ms as f32, |v| {
+            win.set_btn_doublepress_ms(v);
+        });
+        set_if_changed(
+            win.get_btn_doublepress_text(),
+            format!("{double_press_ms:.0} ms").into(),
+            |v| win.set_btn_doublepress_text(v),
+        );
     }
 
     /// Echo a button tuning slider drag locally (R2-10): same
-    /// pattern as [`Self::apply_encoder_local`]. Both slider values
-    /// are passed in (the moving one fresh, the other from the
-    /// window), so a drag never clobbers the other slider's value.
-    fn apply_button_local(win: &MainWindow, debounce_ms: f64, long_press_ms: f64) {
+    /// pattern as [`Self::apply_encoder_local`]. All three slider
+    /// values are passed in (the moving one fresh, the others from
+    /// the window), so a drag never clobbers another slider's value.
+    fn apply_button_local(
+        win: &MainWindow,
+        debounce_ms: f64,
+        long_press_ms: f64,
+        double_press_ms: f64,
+    ) {
         let record = TuningSettings {
             module: "buttons".to_string(),
             button_debounce_ms: Some(debounce_ms),
             button_long_press_ms: Some(long_press_ms),
+            button_double_press_ms: Some(double_press_ms),
             ..TuningSettings::neutral("buttons")
         };
         Self::sync_button_props(win, &record);
@@ -9187,7 +9210,12 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                 return;
             };
             let debounce_ms = (f64::from(v) * 50.0).clamp(0.0, 50.0);
-            Ctx::apply_button_local(&w, debounce_ms, f64::from(w.get_btn_longpress_ms()));
+            Ctx::apply_button_local(
+                &w,
+                debounce_ms,
+                f64::from(w.get_btn_longpress_ms()),
+                f64::from(w.get_btn_doublepress_ms()),
+            );
             // M-7: a drag queues one debounced push, not one per move.
             ctx.queue_field_push("buttons", FieldKind::ButtonDebounceMs, debounce_ms);
         });
@@ -9201,7 +9229,12 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
             };
             if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
                 let debounce_ms = ms.clamp(0.0, 50.0);
-                Ctx::apply_button_local(&w, debounce_ms, f64::from(w.get_btn_longpress_ms()));
+                Ctx::apply_button_local(
+                    &w,
+                    debounce_ms,
+                    f64::from(w.get_btn_longpress_ms()),
+                    f64::from(w.get_btn_doublepress_ms()),
+                );
                 ctx.queue_field_push("buttons", FieldKind::ButtonDebounceMs, debounce_ms);
             }
         });
@@ -9214,7 +9247,12 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                 return;
             };
             let long_press_ms = (300.0 + f64::from(v) * 1200.0).clamp(300.0, 1500.0);
-            Ctx::apply_button_local(&w, f64::from(w.get_btn_debounce_ms()), long_press_ms);
+            Ctx::apply_button_local(
+                &w,
+                f64::from(w.get_btn_debounce_ms()),
+                long_press_ms,
+                f64::from(w.get_btn_doublepress_ms()),
+            );
             // M-7: a drag queues one debounced push, not one per move.
             ctx.queue_field_push("buttons", FieldKind::ButtonLongPressMs, long_press_ms);
         });
@@ -9228,8 +9266,50 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
             };
             if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
                 let long_press_ms = ms.clamp(300.0, 1500.0);
-                Ctx::apply_button_local(&w, f64::from(w.get_btn_debounce_ms()), long_press_ms);
+                Ctx::apply_button_local(
+                    &w,
+                    f64::from(w.get_btn_debounce_ms()),
+                    long_press_ms,
+                    f64::from(w.get_btn_doublepress_ms()),
+                );
                 ctx.queue_field_push("buttons", FieldKind::ButtonLongPressMs, long_press_ms);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_btn_doublepress_changed(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let double_press_ms = (150.0 + f64::from(v) * 350.0).clamp(150.0, 500.0);
+            Ctx::apply_button_local(
+                &w,
+                f64::from(w.get_btn_debounce_ms()),
+                f64::from(w.get_btn_longpress_ms()),
+                double_press_ms,
+            );
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("buttons", FieldKind::ButtonDoublePressMs, double_press_ms);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_btn_doublepress_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
+                let double_press_ms = ms.clamp(150.0, 500.0);
+                Ctx::apply_button_local(
+                    &w,
+                    f64::from(w.get_btn_debounce_ms()),
+                    f64::from(w.get_btn_longpress_ms()),
+                    double_press_ms,
+                );
+                ctx.queue_field_push("buttons", FieldKind::ButtonDoublePressMs, double_press_ms);
             }
         });
     }

@@ -263,10 +263,14 @@ export component ButtonsPage inherits HorizontalLayout {
     in property <string> btn-debounce-text: "10 ms";
     in property <float> btn-longpress-ms: 800.0;
     in property <string> btn-longpress-text: "800 ms";
+    in property <float> btn-doublepress-ms: 300.0;
+    in property <string> btn-doublepress-text: "300 ms";
     callback btn-debounce-changed(float);
     callback btn-debounce-edited(string);
     callback btn-longpress-changed(float);
     callback btn-longpress-edited(string);
+    callback btn-doublepress-changed(float);
+    callback btn-doublepress-edited(string);
     // BU2: the selected button's long-press action ("Not set" = none)
     in property <string> selected-long-action: "Not set";
     // edit panel state: 0 = button, 1 = knob
@@ -446,6 +450,7 @@ export component ButtonsPage inherits HorizontalLayout {
                 Text { text: "Button tuning"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                 SliderRow { label: "Debounce"; hint: "Presses must hold steady this long"; value-text: btn-debounce-text; value: btn-debounce-ms / 50.0; changed(v) => { btn-debounce-changed(v); } value-edited(t) => { btn-debounce-edited(t); } }
                 SliderRow { label: "Long-press threshold"; hint: "Hold this long to switch to the long-press action"; value-text: btn-longpress-text; value: (btn-longpress-ms - 300.0) / 1200.0; changed(v) => { btn-longpress-changed(v); } value-edited(t) => { btn-longpress-edited(t); } }
+                SliderRow { label: "Double-press window"; hint: "Press again within this long to switch to the long-press action"; value-text: btn-doublepress-text; value: (btn-doublepress-ms - 150.0) / 350.0; changed(v) => { btn-doublepress-changed(v); } value-edited(t) => { btn-doublepress-edited(t); } }
             }
         }
         // Slack absorber: the column is stretched to the full body
@@ -587,7 +592,7 @@ export component ButtonsPage inherits HorizontalLayout {
                 Rectangle { height: 2px; }
                 Text {
                     wrap: word-wrap;
-                    text: "Hold past the threshold to switch to this action instead.";
+                    text: "Hold past the threshold — or press twice quickly — to switch to this action instead.";
                     font-size: 11.5px;
                     color: Theme.faint;
                 }

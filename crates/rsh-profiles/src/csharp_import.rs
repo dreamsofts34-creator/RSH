@@ -274,6 +274,11 @@ pub struct PerModuleTuning {
     /// default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub button_long_press_ms: Option<f64>,
+    /// Double-press window in ms (BU3, buttons module only),
+    /// 150–500. `None` = never set (old profile) — the 300 ms
+    /// default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub button_double_press_ms: Option<f64>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -563,6 +568,7 @@ impl Default for PerModuleTuning {
             // --- Buttons per-module tuning ---
             button_debounce_ms: None,
             button_long_press_ms: None,
+            button_double_press_ms: None,
         }
     }
 }

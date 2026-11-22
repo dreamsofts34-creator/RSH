@@ -2342,6 +2342,7 @@ fn ui_button_tuning() -> Outcome {
         "Button tuning",
         "Debounce",
         "Long-press threshold",
+        "Double-press window",
         "Long-press action",
     ] {
         report.check(
@@ -2359,6 +2360,8 @@ fn ui_button_tuning() -> Outcome {
         "btn-debounce-text",
         "btn-longpress-ms",
         "btn-longpress-text",
+        "btn-doublepress-ms",
+        "btn-doublepress-text",
         "selected-long-action",
     ] {
         report.check(
@@ -2372,6 +2375,8 @@ fn ui_button_tuning() -> Outcome {
         "btn-debounce-edited",
         "btn-longpress-changed",
         "btn-longpress-edited",
+        "btn-doublepress-changed",
+        "btn-doublepress-edited",
         "long-action-chip",
     ] {
         report.check(
@@ -2389,9 +2394,12 @@ fn ui_button_tuning() -> Outcome {
         "on_btn_debounce_edited",
         "on_btn_longpress_changed",
         "on_btn_longpress_edited",
+        "on_btn_doublepress_changed",
+        "on_btn_doublepress_edited",
         "on_long_action_chip",
         "FieldKind::ButtonDebounceMs",
         "FieldKind::ButtonLongPressMs",
+        "FieldKind::ButtonDoublePressMs",
         "sync_button_props",
         "set_long_press_binding",
     ] {
@@ -2581,7 +2589,7 @@ fn checks() -> Vec<UiCheck> {
         ),
         (
             "ui-button-tuning",
-            "BU1-BU2: Buttons page holds debounce + long-press threshold sliders + long-press action picker, wired through main.rs",
+            "BU1-BU3: Buttons page holds debounce + long-press threshold + double-press window sliders + long-press action picker, wired through main.rs",
             ui_button_tuning as fn() -> Outcome,
         ),
     ]
