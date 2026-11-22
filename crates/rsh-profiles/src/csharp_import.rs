@@ -226,6 +226,15 @@ pub struct PerModuleTuning {
     /// `Some(false)` = axis; `None` = module default (axis).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handbrake_button_mode: Option<bool>,
+    // --- Encoder per-module tuning ---
+    /// Pulse length in ms (E1, encoders module only), 20–200.
+    /// `None` = never set (old profile) — the 50 ms default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_pulse_ms: Option<f64>,
+    /// Counts per click (E2, encoders module only): 1, 2 or 4.
+    /// `None` = never set (old profile) — the default 4 applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_counts_per_click: Option<u8>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -491,6 +500,9 @@ impl Default for PerModuleTuning {
             led_pattern: None,
             led_color: None,
             handbrake_button_mode: None,
+            // --- Encoder per-module tuning ---
+            encoder_pulse_ms: None,
+            encoder_counts_per_click: None,
         }
     }
 }

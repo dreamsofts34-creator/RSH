@@ -2021,6 +2021,76 @@ fn ui_steering_advanced() -> Outcome {
     report.finish()
 }
 
+/// Read one repo source file for a static gate check (fail-closed:
+/// a missing file is an error, never an empty string that would
+/// pass a "must not contain" check by accident).
+fn read_gate_source(path: &str) -> Result<String, String> {
+    std::fs::read_to_string(repo_root().join(path))
+        .map_err(|error| format!("read {path} failed: {error}"))
+}
+
+/// Gate: encoder tuning (E1/E2) — the Buttons page's "Rotary knob
+/// tuning" card holds the pulse-length slider and the steps-per-click
+/// segment, and the window + Rust wiring exist behind them. Static
+/// source checks only: the Buttons page has no probe harness (its
+/// render needs the full window + bindings), so — like the first half
+/// of `ui_steering_advanced` — this proves the controls are in the
+/// source and wired, not that they paint.
+fn ui_encoder_tuning() -> Outcome {
+    let mut report = Report::new();
+    let buttons = match read_gate_source("crates/rsh-ui/ui/screens/buttons.slint") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for label in ["Rotary knob tuning", "Pulse length", "Steps per click"] {
+        report.check(
+            &format!("encoder-tuning-has-{label}"),
+            buttons.contains(label),
+            &format!("buttons.slint must contain the {label} control"),
+        );
+    }
+    let main_slint = match read_gate_source("crates/rsh-ui/ui/main.slint") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for prop in ["enc-pulse-ms", "enc-pulse-text", "enc-counts"] {
+        report.check(
+            &format!("encoder-tuning-prop-{prop}"),
+            main_slint.contains(prop),
+            &format!("main.slint must carry the {prop} window property"),
+        );
+    }
+    for callback in [
+        "enc-pulse-changed",
+        "enc-pulse-edited",
+        "enc-counts-changed",
+    ] {
+        report.check(
+            &format!("encoder-tuning-callback-{callback}"),
+            main_slint.contains(&format!("callback {callback}")),
+            &format!("main.slint must declare the {callback} callback"),
+        );
+    }
+    let main_rs = match read_gate_source("crates/rsh-ui/src/main.rs") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for wired in [
+        "on_enc_pulse_changed",
+        "on_enc_pulse_edited",
+        "on_enc_counts_changed",
+        "FieldKind::EncoderPulseMs",
+        "sync_encoder_props",
+    ] {
+        report.check(
+            &format!("encoder-tuning-wired-{wired}"),
+            main_rs.contains(wired),
+            &format!("main.rs must wire {wired}"),
+        );
+    }
+    report.finish()
+}
+
 fn checks() -> Vec<UiCheck> {
     vec![
         (
@@ -2112,6 +2182,11 @@ fn checks() -> Vec<UiCheck> {
             "ui-steering-advanced",
             "Bug 7: Advanced card holds invert + lock + smoothing (not the old read-only rows)",
             ui_steering_advanced as fn() -> Outcome,
+        ),
+        (
+            "ui-encoder-tuning",
+            "E1/E2: Buttons page holds pulse length + steps per click, wired through main.rs",
+            ui_encoder_tuning as fn() -> Outcome,
         ),
     ]
 }

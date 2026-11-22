@@ -146,6 +146,12 @@ export component MainWindow inherits Window {
     in property <string> steer-lock-text: "900°";
     in property <float> steer-smoothing: 0.3;
     in property <string> steer-smoothing-text: "30%";
+    // Encoder tuning (E1/E2): pulse length + steps per click, on the
+    // Buttons page (rotary knobs live there, not in a module of
+    // their own) — from get_tuning("encoders"), never literals.
+    in property <float> enc-pulse-ms: 50.0;
+    in property <string> enc-pulse-text: "50 ms";
+    in property <int> enc-counts: 4;
     in property <string> throttle-raw-mv-text: "—";
     in property <string> brake-raw-mv-text: "—";
     in property <string> clutch-raw-mv-text: "—";
@@ -361,6 +367,9 @@ export component MainWindow inherits Window {
     callback pedal-bite-edited(string);
     callback knob-selected(int);
     callback knob-row-selected(int);
+    callback enc-pulse-changed(float);
+    callback enc-pulse-edited(string);
+    callback enc-counts-changed(int);
     callback learn-clicked();
     callback edit-cancel();
     callback edit-save();
@@ -747,6 +756,12 @@ export component MainWindow inherits Window {
                 knob-flash-index: -1;
                 knob-flash-text: "";
                 knob-row-action: knob-row-action;
+                enc-pulse-ms: enc-pulse-ms;
+                enc-pulse-text: enc-pulse-text;
+                enc-counts: enc-counts;
+                enc-pulse-changed(v) => { enc-pulse-changed(v); }
+                enc-pulse-edited(t) => { enc-pulse-edited(t); }
+                enc-counts-changed(i) => { enc-counts-changed(i); }
                 listening: buttons-listening;
                 tile-selected(i) => { tile-selected(i); }
                 knob-selected(i) => { knob-selected(i); }
