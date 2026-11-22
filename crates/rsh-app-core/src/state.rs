@@ -6447,6 +6447,10 @@ impl AppStateCore {
     /// same tuning. The extended fields (C-TUNE-1: min/max mV, bite
     /// point, horn button, LED brightness/pattern) are read back from
     /// the stored tuning instead of hardcoded `None`/0–3300.
+    // One function by design: the record is built field-by-field
+    // from the stored tuning (one line per tuning field) — splitting
+    // it would scatter one record's shape.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn get_tuning(&self, module: &str) -> TuningSettings {
@@ -6565,6 +6569,13 @@ impl AppStateCore {
                 } else {
                     None
                 },
+                // --- LED/horn per-module tuning ---
+                // Old profiles carry none of these fields: the
+                // defaults (1000 ms period, 400 ms minimum honk,
+                // Momentary mode) apply.
+                led_period_ms: Some(stored.led_period_ms.unwrap_or(1000.0)),
+                horn_min_ms: Some(stored.horn_min_ms.unwrap_or(400.0)),
+                horn_latch: Some(stored.horn_latch.unwrap_or(false)),
             };
         }
         let (invert, steering_lock_deg, steering_balance_pct, steering_center_trim_pct) =
@@ -6632,6 +6643,10 @@ impl AppStateCore {
             handbrake_latch: if is_handbrake { Some(false) } else { None },
             handbrake_auto_release: if is_handbrake { Some(false) } else { None },
             bite_width: if is_clutch { Some(0.15) } else { None },
+            // --- LED/horn per-module tuning ---
+            led_period_ms: Some(1000.0),
+            horn_min_ms: Some(400.0),
+            horn_latch: Some(false),
         }
     }
 
@@ -6679,12 +6694,20 @@ impl AppStateCore {
         }
         self.push_pipeline_plan();
         // C-LED-1: apply the LED pattern best-effort — a board that
-        // is not connected never fails the tuning save.
+        // is not connected never fails the tuning save. L1: the
+        // stored period rides along instead of the hardcoded 1000 ms
+        // (`build_led_test_pattern_with_color` still defaults to
+        // 1000 ms when no period is stored).
         if tuning.module == "led"
             && let Some(pattern) = tuning.led_pattern
         {
             let brightness = tuning.led_brightness.unwrap_or(100);
-            let _ = self.led_test_with_color(pattern, Some(brightness), None, tuning.led_color);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let period_ms = tuning
+                .led_period_ms
+                .map(|ms| ms.clamp(100.0, 5000.0) as u16);
+            let _ =
+                self.led_test_with_color(pattern, Some(brightness), period_ms, tuning.led_color);
         }
         self.note_slow_state_changed();
         Ok(tuning)
@@ -6737,6 +6760,10 @@ impl AppStateCore {
                 handbrake_latch: None,
                 handbrake_auto_release: None,
                 bite_width: None,
+                // --- LED/horn per-module tuning ---
+                led_period_ms: None,
+                horn_min_ms: None,
+                horn_latch: None,
             });
         entry.deadzone = tuning.deadzone / 100.0;
         entry.curve_strength = (tuning.curve - 1.0).clamp(-1.0, 1.0);
@@ -6801,6 +6828,10 @@ impl AppStateCore {
         entry.handbrake_latch = tuning.handbrake_latch;
         entry.handbrake_auto_release = tuning.handbrake_auto_release;
         entry.bite_width = tuning.bite_width;
+        // --- LED/horn per-module tuning ---
+        entry.led_period_ms = tuning.led_period_ms;
+        entry.horn_min_ms = tuning.horn_min_ms;
+        entry.horn_latch = tuning.horn_latch;
         if let Some(gate) = tuning.shifter_gate {
             entry.gate_mode = match gate {
                 ShifterGate::Sequential => "Sequential".to_string(),
@@ -7081,6 +7112,9 @@ impl AppStateCore {
                 .bite_width
                 .unwrap_or(if module == "clutch" { 0.15 } else { 0.0 })
                 as f32,
+            // --- LED/horn per-module tuning ---
+            horn_min_ms: tuning.horn_min_ms.unwrap_or(400.0) as f32,
+            horn_latch: tuning.horn_latch.unwrap_or(false),
         }
     }
 
@@ -12059,6 +12093,43 @@ mod tests {
         assert_eq!(read_back.led_pattern, Some(LedPattern::Blink));
         // The legacy spelling reads the same stored tuning.
         assert_eq!(state.get_tuning("accel").min_mv, 120.0);
+    }
+
+    /// LED/horn per-module tuning (L1/HO1/HO2): the period, the
+    /// minimum honk and the latch mode persist through
+    /// `set_tuning`/`get_tuning`, old profiles read back the
+    /// defaults, and the horn values reach the live pipeline plan.
+    #[test]
+    fn led_horn_tuning_persists_and_feeds_pipeline_plan() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        // Old profile: defaults before any edit.
+        let led = state.get_tuning("led");
+        assert_eq!(led.led_period_ms, Some(1000.0));
+        let horn = state.get_tuning("horn");
+        assert_eq!(horn.horn_min_ms, Some(400.0));
+        assert_eq!(horn.horn_latch, Some(false));
+        // Edit + read back.
+        let mut led = state.get_tuning("led");
+        led.led_pattern = Some(LedPattern::Blink);
+        led.led_period_ms = Some(2500.0);
+        state.set_tuning(&led).expect("set led tuning");
+        let read_back = state.get_tuning("led");
+        assert_eq!(read_back.led_period_ms, Some(2500.0));
+        assert_eq!(read_back.led_pattern, Some(LedPattern::Blink));
+        let mut horn = state.get_tuning("horn");
+        horn.horn_min_ms = Some(100.0);
+        horn.horn_latch = Some(true);
+        state.set_tuning(&horn).expect("set horn tuning");
+        let read_back = state.get_tuning("horn");
+        assert_eq!(read_back.horn_min_ms, Some(100.0));
+        assert_eq!(read_back.horn_latch, Some(true));
+        // The live plan carries the horn values (the LED period
+        // rides the `LED_TEST` payload in `set_tuning`, not the
+        // pipeline — the LED is not a pipeline module).
+        let plan = state.build_pipeline_plan();
+        assert_eq!(plan.horn.horn_min_ms, 100.0);
+        assert!(plan.horn.horn_latch);
     }
 
     /// L8: a present-but-released clutch (0.0) reports `Some(0.0)`

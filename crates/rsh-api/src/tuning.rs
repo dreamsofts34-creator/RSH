@@ -324,6 +324,22 @@ pub struct TuningSettings {
     /// never carry it (their bite stays a hard stretch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bite_width: Option<f64>,
+    // --- LED/horn per-module tuning ---
+    /// Blink / Chase / Rainbow cycle period in ms (L1, LED module
+    /// only), 100–5000 (default 1000): one full pattern cycle per
+    /// period on the board. Solid / Off ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub led_period_ms: Option<f64>,
+    /// Minimum honk duration in ms (HO1, horn module only),
+    /// 100–1000 (default 400): a quick tap holds the horn output
+    /// for at least this long, so the game registers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horn_min_ms: Option<f64>,
+    /// Honk mode (HO2, horn module only): `Some(true)` = Latch
+    /// (press once = on, again = off), `Some(false)` = Momentary
+    /// (default — the horn sounds only while the button is held).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horn_latch: Option<bool>,
 }
 
 impl TuningSettings {
@@ -393,6 +409,10 @@ impl TuningSettings {
                 None
             },
             bite_width: if module == "clutch" { Some(0.15) } else { None },
+            // --- LED/horn per-module tuning ---
+            led_period_ms: None,
+            horn_min_ms: None,
+            horn_latch: None,
         }
     }
 }
@@ -505,6 +525,16 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
         errors.push(format!("release_ms {release_ms} is outside 0..=2000"));
     }
     // --- Encoder per-module tuning ---
+    validate_encoder_tuning(tuning, &mut errors);
+    validate_led_horn_tuning(tuning, &mut errors);
+    errors
+}
+
+/// Validate the encoder extension fields (E1–E4): one message per
+/// failed rule, appended to `errors`. Split out of
+/// [`validate_tuning`] so that function stays under Clippy's
+/// 100-line limit.
+fn validate_encoder_tuning(tuning: &TuningSettings, errors: &mut Vec<String>) {
     if let Some(pulse_ms) = tuning.encoder_pulse_ms
         && !(20.0..=200.0).contains(&pulse_ms)
     {
@@ -561,7 +591,26 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
     {
         errors.push(format!("bite_width {width} is outside 0.05..=0.40"));
     }
-    errors
+}
+
+/// Validate the LED/horn extension fields (L1/HO1): one message
+/// per failed rule, appended to `errors`. Split out of
+/// [`validate_tuning`] so that function stays under Clippy's
+/// 100-line limit.
+fn validate_led_horn_tuning(tuning: &TuningSettings, errors: &mut Vec<String>) {
+    // --- LED/horn per-module tuning ---
+    if let Some(period_ms) = tuning.led_period_ms
+        && !(100.0..=5000.0).contains(&period_ms)
+    {
+        errors.push(format!(
+            "led_period_ms {period_ms} is outside 100..=5000 (ms)"
+        ));
+    }
+    if let Some(min_ms) = tuning.horn_min_ms
+        && !(100.0..=1000.0).contains(&min_ms)
+    {
+        errors.push(format!("horn_min_ms {min_ms} is outside 100..=1000 (ms)"));
+    }
 }
 
 /// Draft status, as the UI prompt (and the `AppApi` surface)
@@ -770,6 +819,55 @@ mod tests {
             errors.iter().any(|e| e.contains("encoder_invert_mask")),
             "{errors:?}"
         );
+    }
+
+    /// LED/horn per-module tuning (L1/HO1/HO2): period, minimum
+    /// honk duration and latch mode round-trip through JSON,
+    /// validate in range, and are absent for other modules (old
+    /// profiles load them as `None`).
+    #[test]
+    fn led_horn_fields_round_trip_and_validate() {
+        let mut led = tuning("led");
+        led.led_period_ms = Some(2500.0);
+        assert_eq!(validate_tuning(&led), Vec::<String>::new());
+        let json = serde_json::to_string(&led).expect("serialize");
+        assert!(json.contains("\"ledPeriodMs\":2500.0"), "{json}");
+        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, led);
+        let mut horn = tuning("horn");
+        horn.horn_min_ms = Some(100.0);
+        horn.horn_latch = Some(true);
+        assert_eq!(validate_tuning(&horn), Vec::<String>::new());
+        let json = serde_json::to_string(&horn).expect("serialize");
+        assert!(json.contains("\"hornMinMs\":100.0"), "{json}");
+        assert!(json.contains("\"hornLatch\":true"), "{json}");
+        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, horn);
+        // Other modules never carry them: omitted from the JSON.
+        let json = serde_json::to_string(&tuning("brake")).expect("serialize");
+        assert!(!json.contains("ledPeriodMs"), "{json}");
+        assert!(!json.contains("hornMinMs"), "{json}");
+        assert!(!json.contains("hornLatch"), "{json}");
+        // Old JSON without the fields loads as None (1000 ms period,
+        // 400 ms minimum honk, Momentary mode — the defaults apply
+        // in `get_tuning`, never a silent 0).
+        let old: TuningSettings =
+            serde_json::from_str(r#"{"module":"led","deadzone":0.0,"curve":1.0,"minMv":0.0,"maxMv":3300.0,"smoothing":0.0,"ledPattern":"blink"}"#)
+                .expect("deserialize old");
+        assert_eq!(old.led_period_ms, None);
+        assert_eq!(old.horn_min_ms, None);
+        assert_eq!(old.horn_latch, None);
+        // Out-of-range values are rejected, never silently clamped.
+        let mut bad = tuning("led");
+        bad.led_period_ms = Some(50.0);
+        let mut bad_horn = tuning("horn");
+        bad_horn.horn_min_ms = Some(1500.0);
+        let errors = validate_tuning(&bad);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].contains("led_period_ms"), "{}", errors[0]);
+        let errors = validate_tuning(&bad_horn);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].contains("horn_min_ms"), "{}", errors[0]);
     }
 
     #[test]
