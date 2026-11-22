@@ -136,11 +136,18 @@ export component ProfilePopover inherits Card {
     callback closed();
 
     width: 300px;
+    // B5 (PC-test Bug 5): an explicit content height — a height-less
+    // Card parented by the window stretches to the window height
+    // (gate-measured 580 px), so the popover used to render as a
+    // full-height panel. The layout's preferred height is content-driven
+    // (fixed 300 px width, grows with the profile list), so binding
+    // to it sizes the card to its content.
+    height: layout.preferred-height;
     // Esc is owned by the root keyboard scope (`keyboard-escape`
     // in src/main.rs) — Phase 2 (F-3) removed the zero-size
     // FocusScope here: it was never focused by Rust, so it could
     // never fire.
-    VerticalLayout {
+    layout := VerticalLayout {
         padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
         spacing: 10px;
         HorizontalLayout {

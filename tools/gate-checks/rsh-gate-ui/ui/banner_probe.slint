@@ -6,6 +6,7 @@
 // banner to the window height and the measurement reads the window,
 // not the banner.
 import { EmptyBanner } from "../../../crates/rsh-ui/ui/components.slint";
+import { ScrollView } from "std-widgets.slint";
 
 export component GateBannerWindow inherits Window {
     width: 736px;
@@ -19,5 +20,44 @@ export component GateBannerWindow inherits Window {
             is-error: true;
         }
         Rectangle { vertical-stretch: 1; }
+    }
+}
+
+// Bug 3 probe: the Overview case the DS-21 probe does NOT cover —
+// the banner WITH its "Reconnect" action button, inside a
+// ScrollView → VerticalLayout with 20 px padding (overview.slint),
+// at the 736 px content-column width, with the exact Overview
+// banner texts. The button eats ~100 px of the text width, so the
+// same ~100-char text wraps where the button-less probe does not.
+// A panel-colored Rectangle below the banner stands in for the
+// Overview Card: if the wrapped second line overflows the banner,
+// the card (painted after the banner) covers its lower half —
+// exactly the "second line half cut off" the user saw.
+import { Theme } from "../../../crates/rsh-ui/ui/tokens.slint";
+
+export component GateBannerActionWindow inherits Window {
+    width: 736px;
+    height: 300px;
+    title: "gate-banner-action-probe";
+    in-out property <string> banner-text: "Wheel not found — join the wheel's RSH-XXXX Wi-Fi network or plug in USB.";
+    out property <length> banner-height: banner.height;
+    ScrollView {
+        width: 100%;
+        height: 100%;
+        VerticalLayout {
+            padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
+            spacing: 12px;
+            banner := EmptyBanner {
+                text: root.banner-text;
+                action-label: "Reconnect";
+                is-error: true;
+            }
+            Rectangle {
+                height: 120px;
+                background: Theme.panel;
+                border-radius: 8px;
+            }
+            Rectangle { vertical-stretch: 1; }
+        }
     }
 }
