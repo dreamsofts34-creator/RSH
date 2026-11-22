@@ -46,6 +46,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod curve;
+mod file_picker;
 mod ipc_api;
 mod live_probe;
 mod notifications;
@@ -5586,10 +5587,11 @@ impl Ctx {
 
     /// Open the add/edit game dialog for a new game (`None`) or
     /// the game with this id. Games are manual-only: the exe path
-    /// is typed in (no file picker — see [`wire_game_dialog`]),
-    /// and [`GameSummary`] carries no exe path, so Edit pre-fills
-    /// the name + bound profile and the exe field starts empty —
-    /// the user types (or pastes) the exe path again. Refuses
+    /// comes from the native file picker (Browse — see
+    /// [`Ctx::pick_game_exe`]), and [`GameSummary`] carries no exe
+    /// path, so Edit pre-fills the name + bound profile and the exe
+    /// field starts empty — the user picks the file again with
+    /// Browse. Refuses
     /// while RSH isn't running: there is no store to save to, so
     /// say so instead of opening a dialog whose Save can only fail.
     fn open_game_dialog(&self, win: &MainWindow, edit_id: Option<String>) {
@@ -5639,6 +5641,42 @@ impl Ctx {
         );
         win.set_game_dialog_open(true);
         ui_log!("RSH-UI game dialog opened");
+    }
+
+    /// Browse for the game file (PC-test Bug 6, WS-C): open the
+    /// native Windows file picker ([`file_picker::pick_game_exe`])
+    /// and fill the dialog from the selection. Cancel leaves the
+    /// dialog exactly as it was — no error, no toast. A selection
+    /// fills the (read-only) exe path and auto-fills the name from
+    /// the file stem, but only when the name field is still empty
+    /// (an Edit keeps its existing name; a typed name is never
+    /// overwritten). A picker failure is a plain toast, never a
+    /// silent no-op and never raw COM wording.
+    fn pick_game_exe(&self, win: &MainWindow) {
+        match file_picker::pick_game_exe() {
+            Ok(Some(path)) => {
+                win.set_game_dialog_exe(path.to_string_lossy().into_owned().into());
+                if win.get_game_dialog_name().trim().is_empty() {
+                    let name = file_picker::game_name_from_path(&path);
+                    if !name.is_empty() {
+                        win.set_game_dialog_name(name.into());
+                    }
+                }
+                ui_log!("RSH-UI game picker selected {}", path.display());
+            }
+            Ok(None) => {
+                // Cancelled — the dialog stays as it was.
+            }
+            Err(detail) => {
+                ui_log!("RSH-UI game picker failed: {detail}");
+                self.notify_toast(
+                    win,
+                    "Game",
+                    "Couldn't open the file picker",
+                    "The file picker couldn't be opened — try again.",
+                );
+            }
+        }
     }
 
     /// Display name for the dialog's bound profile: "No profile"
@@ -5697,7 +5735,7 @@ impl Ctx {
                 "Game",
                 &UserError::from_connection(
                     ConnectionError::Unknown,
-                    "Enter a name and the game's exe or shortcut path.",
+                    "Choose the game's file with Browse, and enter a name.",
                 ),
             );
             return;
@@ -7264,11 +7302,10 @@ fn wire_setup_connect(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// control (no picker component exists). The dialog is a
 /// `GameDialog` overlay in ui/main.slint, following the profile
 /// popover pattern (Rust-owned props, callbacks carry the typed
-/// values). No file picker: `rfd` cannot resolve offline on this
-/// Linux VM (`pollster` is not in the cargo cache, and the gtk3
-/// backend needs GTK dev packages that are not installed), so the
-/// exe path is a plain text field — a picker can be added later
-/// without changing this wiring.
+/// values). The exe path comes from the native Windows file
+/// picker (`game-dialog-browse` → [`Ctx::pick_game_exe`], PC-test
+/// Bug 6) — the exe field is read-only, never typed; the same
+/// Browse button serves Add and Edit.
 fn wire_game_dialog(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
         let win = win.as_weak();
@@ -7308,6 +7345,15 @@ fn wire_game_dialog(win: &MainWindow, ctx: &Rc<Ctx>) {
                     "Remove",
                     ConfirmAction::RemoveGame(id.to_string()),
                 );
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_game_dialog_browse(move || {
+            if let Some(w) = win.upgrade() {
+                ctx.pick_game_exe(&w);
             }
         });
     }
