@@ -6397,6 +6397,15 @@ impl AppStateCore {
                 } else {
                     None
                 },
+                // --- Encoder per-module tuning ---
+                // Old profiles carry none of these fields: the
+                // defaults (50 ms pulse, 4 counts per click, accel
+                // off, sensitivity 1.0, no invert) apply.
+                encoder_pulse_ms: Some(stored.encoder_pulse_ms.unwrap_or(50.0)),
+                encoder_counts_per_click: Some(stored.encoder_counts_per_click.unwrap_or(4)),
+                encoder_accel: Some(stored.encoder_accel.unwrap_or(false)),
+                encoder_accel_sensitivity: Some(stored.encoder_accel_sensitivity.unwrap_or(1.0)),
+                encoder_invert_mask: Some(stored.encoder_invert_mask.unwrap_or(0)),
             };
         }
         let (invert, steering_lock_deg, steering_balance_pct, steering_center_trim_pct) =
@@ -6444,6 +6453,12 @@ impl AppStateCore {
             press_ms,
             release_ms,
             combine_pedals,
+            // --- Encoder per-module tuning ---
+            encoder_pulse_ms: Some(50.0),
+            encoder_counts_per_click: Some(4),
+            encoder_accel: Some(false),
+            encoder_accel_sensitivity: Some(1.0),
+            encoder_invert_mask: Some(0),
         }
     }
 
@@ -6533,6 +6548,12 @@ impl AppStateCore {
                 // --- Pedal ramps/curves per-module tuning ---
                 press_ms: None,
                 release_ms: None,
+                // --- Encoder per-module tuning ---
+                encoder_pulse_ms: None,
+                encoder_counts_per_click: None,
+                encoder_accel: None,
+                encoder_accel_sensitivity: None,
+                encoder_invert_mask: None,
             });
         entry.deadzone = tuning.deadzone / 100.0;
         entry.curve_strength = (tuning.curve - 1.0).clamp(-1.0, 1.0);
@@ -6581,6 +6602,12 @@ impl AppStateCore {
         if let Some(combine) = tuning.combine_pedals {
             profile.combine_pedals = combine;
         }
+        // --- Encoder per-module tuning ---
+        entry.encoder_pulse_ms = tuning.encoder_pulse_ms;
+        entry.encoder_counts_per_click = tuning.encoder_counts_per_click;
+        entry.encoder_accel = tuning.encoder_accel;
+        entry.encoder_accel_sensitivity = tuning.encoder_accel_sensitivity;
+        entry.encoder_invert_mask = tuning.encoder_invert_mask;
         if let Some(gate) = tuning.shifter_gate {
             entry.gate_mode = match gate {
                 ShifterGate::Sequential => "Sequential".to_string(),
@@ -6838,6 +6865,12 @@ impl AppStateCore {
                 Some(ShifterGate::HPattern) => ShifterGateMode::HPattern,
                 _ => ShifterGateMode::Sequential,
             },
+            // --- Encoder per-module tuning ---
+            pulse_ms: tuning.encoder_pulse_ms.unwrap_or(50.0) as f32,
+            counts_per_click: tuning.encoder_counts_per_click.unwrap_or(4),
+            accel_enabled: tuning.encoder_accel.unwrap_or(false),
+            accel_sensitivity: tuning.encoder_accel_sensitivity.unwrap_or(1.0) as f32,
+            encoder_invert_mask: tuning.encoder_invert_mask.unwrap_or(0),
         }
     }
 
@@ -10455,6 +10488,72 @@ mod tests {
             stored_deadzone, None,
             "draft only: disk is untouched before Save"
         );
+    }
+
+    #[test]
+    fn encoder_tuning_round_trips_and_old_profiles_get_defaults() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        // No stored encoder entry yet: the defaults apply (50 ms
+        // pulse, 4 counts per click, accel off, sensitivity 1.0,
+        // no invert) — an old profile without the fields loads the
+        // same way.
+        let neutral = state.get_tuning("encoders");
+        assert_eq!(neutral.encoder_pulse_ms, Some(50.0));
+        assert_eq!(neutral.encoder_counts_per_click, Some(4));
+        assert_eq!(neutral.encoder_accel, Some(false));
+        assert_eq!(neutral.encoder_accel_sensitivity, Some(1.0));
+        assert_eq!(neutral.encoder_invert_mask, Some(0));
+        // Invalid values are rejected, never stored.
+        let mut bad = neutral.clone();
+        bad.encoder_pulse_ms = Some(10.0);
+        assert!(state.set_tuning(&bad).is_err());
+        let mut bad = neutral.clone();
+        bad.encoder_counts_per_click = Some(3);
+        assert!(state.set_tuning(&bad).is_err());
+        let mut bad = neutral.clone();
+        bad.encoder_accel_sensitivity = Some(3.0);
+        assert!(state.set_tuning(&bad).is_err());
+        let mut bad = neutral.clone();
+        bad.encoder_invert_mask = Some(0x10);
+        assert!(state.set_tuning(&bad).is_err());
+        assert_eq!(state.get_tuning("encoders").encoder_pulse_ms, Some(50.0));
+        // Valid values store, survive a get, and reach the live
+        // pipeline plan.
+        let mut tuning = neutral.clone();
+        tuning.encoder_pulse_ms = Some(120.0);
+        tuning.encoder_counts_per_click = Some(2);
+        tuning.encoder_accel = Some(true);
+        tuning.encoder_accel_sensitivity = Some(1.5);
+        tuning.encoder_invert_mask = Some(0b0010);
+        let saved = state.set_tuning(&tuning).expect("valid encoder tuning");
+        assert_eq!(saved.encoder_pulse_ms, Some(120.0));
+        assert_eq!(saved.encoder_counts_per_click, Some(2));
+        assert_eq!(saved.encoder_accel, Some(true));
+        assert_eq!(saved.encoder_accel_sensitivity, Some(1.5));
+        assert_eq!(saved.encoder_invert_mask, Some(0b0010));
+        assert_eq!(state.get_tuning("encoders").encoder_pulse_ms, Some(120.0));
+        assert_eq!(
+            state.get_tuning("encoders").encoder_counts_per_click,
+            Some(2)
+        );
+        let plan = state.build_pipeline_plan();
+        assert_eq!(plan.encoders.pulse_ms, 120.0);
+        assert_eq!(plan.encoders.counts_per_click, 2);
+        assert!(plan.encoders.accel_enabled);
+        assert_eq!(plan.encoders.accel_sensitivity, 1.5);
+        assert_eq!(plan.encoders.encoder_invert_mask, 0b0010);
+        // Save persists them into the profile on disk.
+        assert!(state.save_draft().expect("save draft"));
+        let stored = lock(&state.store)
+            .active()
+            .and_then(|active| active.profile.module_tunings.get("encoders").cloned());
+        let stored = stored.expect("stored encoder entry");
+        assert_eq!(stored.encoder_pulse_ms, Some(120.0));
+        assert_eq!(stored.encoder_counts_per_click, Some(2));
+        assert_eq!(stored.encoder_accel, Some(true));
+        assert_eq!(stored.encoder_accel_sensitivity, Some(1.5));
+        assert_eq!(stored.encoder_invert_mask, Some(0b0010));
     }
 
     /// L4 draft/save: Save persists the draft (and only the draft),

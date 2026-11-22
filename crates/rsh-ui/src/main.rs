@@ -856,6 +856,10 @@ enum FieldKind {
     /// Throttle saturation as the effective max in mV (the queued
     /// value is already converted from percent by the handler).
     Saturation,
+    /// Encoder pulse length in ms, 20..200 (E1).
+    EncoderPulseMs,
+    /// Encoder acceleration sensitivity, 0..2 (E3).
+    EncoderAccelSens,
 }
 
 /// A slider drag's latest value, waiting out its debounce (M-7):
@@ -2947,6 +2951,12 @@ impl Ctx {
                     FieldKind::ReleaseMs => record.release_ms = Some(value),
                     FieldKind::Curve => record.curve = value,
                     FieldKind::Saturation => record.max_mv = value,
+                    FieldKind::EncoderPulseMs => {
+                        record.encoder_pulse_ms = Some(value.clamp(20.0, 200.0));
+                    }
+                    FieldKind::EncoderAccelSens => {
+                        record.encoder_accel_sensitivity = Some(value.clamp(0.0, 2.0));
+                    }
                 }
                 JobResult::Tuning(api.set_tuning(&record))
             },
@@ -5089,6 +5099,19 @@ impl Ctx {
                                 }
                                 FieldKind::Curve => effective.curve = local.curve,
                                 FieldKind::Saturation => effective.max_mv = local.max_mv,
+                                // --- Encoder per-module tuning ---
+                                // An encoder drag can never reach this
+                                // pedal arm (`same_module` is false when
+                                // the pending module is "encoders"), but
+                                // the match must cover the new variants —
+                                // same carry-over as the pedal fields.
+                                FieldKind::EncoderPulseMs => {
+                                    effective.encoder_pulse_ms = local.encoder_pulse_ms;
+                                }
+                                FieldKind::EncoderAccelSens => {
+                                    effective.encoder_accel_sensitivity =
+                                        local.encoder_accel_sensitivity;
+                                }
                             }
                         }
                     }
@@ -5121,6 +5144,9 @@ impl Ctx {
             "led" => {
                 *self.led_record.borrow_mut() = stored.clone();
                 self.sync_extras_led_props(win, stored);
+            }
+            "encoders" => {
+                Self::sync_encoder_props(win, stored);
             }
             // Shifter / horn have no per-module writer — the slow
             // re-sync owns their props (as before).
@@ -5569,6 +5595,73 @@ impl Ctx {
         }
     }
 
+    /// Write the Buttons page's encoder tuning props from a record
+    /// (E1/E2/E3/E4, R2-10): pulse slider + text, steps-per-click
+    /// segment, acceleration switch + strength slider + text, and
+    /// the per-knob invert switches. All writes are change-guarded,
+    /// like `push_frame`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn sync_encoder_props(win: &MainWindow, enc: &TuningSettings) {
+        let pulse_ms = enc.encoder_pulse_ms.unwrap_or(50.0);
+        set_if_changed(win.get_enc_pulse_ms(), pulse_ms as f32, |v| {
+            win.set_enc_pulse_ms(v);
+        });
+        set_if_changed(
+            win.get_enc_pulse_text(),
+            format!("{pulse_ms:.0} ms").into(),
+            |v| win.set_enc_pulse_text(v),
+        );
+        set_if_changed(
+            win.get_enc_counts(),
+            i32::from(enc.encoder_counts_per_click.unwrap_or(4)),
+            |v| win.set_enc_counts(v),
+        );
+        set_if_changed(
+            win.get_enc_accel(),
+            enc.encoder_accel.unwrap_or(false),
+            |v| {
+                win.set_enc_accel(v);
+            },
+        );
+        let sens = enc.encoder_accel_sensitivity.unwrap_or(1.0);
+        set_if_changed(win.get_enc_accel_sens(), sens as f32, |v| {
+            win.set_enc_accel_sens(v);
+        });
+        set_if_changed(
+            win.get_enc_accel_sens_text(),
+            format!("{:.0}%", sens * 100.0).into(),
+            |v| win.set_enc_accel_sens_text(v),
+        );
+        let mask = enc.encoder_invert_mask.unwrap_or(0);
+        set_if_changed(win.get_enc_invert1(), mask & 0b0001 != 0, |v| {
+            win.set_enc_invert1(v);
+        });
+        set_if_changed(win.get_enc_invert2(), mask & 0b0010 != 0, |v| {
+            win.set_enc_invert2(v);
+        });
+    }
+
+    /// Echo an encoder slider drag locally (R2-10): the slider + text
+    /// move with the drag, not at the next ~1 Hz re-sync. Only the
+    /// encoder fields are read, so the neutral record is enough —
+    /// no API round-trip per drag move. Both slider values are
+    /// passed in (the moving one fresh, the other from the window),
+    /// so a drag never clobbers the other slider's value.
+    fn apply_encoder_local(win: &MainWindow, pulse_ms: f64, sens: f64) {
+        let record = TuningSettings {
+            module: "encoders".to_string(),
+            encoder_pulse_ms: Some(pulse_ms),
+            encoder_counts_per_click: Some(u8::try_from(win.get_enc_counts()).unwrap_or(4)),
+            encoder_accel: Some(win.get_enc_accel()),
+            encoder_accel_sensitivity: Some(sens),
+            encoder_invert_mask: Some(
+                (u8::from(win.get_enc_invert1())) | (u8::from(win.get_enc_invert2()) << 1),
+            ),
+            ..TuningSettings::neutral("encoders")
+        };
+        Self::sync_encoder_props(win, &record);
+    }
+
     /// Echo a handbrake deadzone drag locally (R2-10): same pattern
     /// as [`Self::apply_pedal_deadzone_local`].
     fn apply_handbrake_deadzone_local(&self, win: &MainWindow, deadzone: f64) {
@@ -5766,6 +5859,14 @@ impl Ctx {
             win.set_horn_learning(v);
         });
         self.sync_extras_led_props(win, &led);
+        // E1/E2: the Buttons page's encoder tuning rides this slow
+        // re-sync (no separate sync_buttons exists). While a drag's
+        // push is pending, the local echo owns the slider — the
+        // slow cache must not snap it back mid-drag (R2-10).
+        if !self.field_push_pending_for("encoders") {
+            let enc = api.get_tuning("encoders");
+            Self::sync_encoder_props(win, &enc);
+        }
     }
 
     /// Refresh the Overview live values (A11/A12/A14/E): firmware
@@ -8800,6 +8901,114 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                     }
                 },
             );
+        });
+    }
+    // Encoder tuning (E1/E2): pulse slider (debounced push, local
+    // echo while dragging) + steps-per-click segment (immediate
+    // push, like the handbrake Axis/Button segment).
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_enc_pulse_changed(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let pulse_ms = (20.0 + f64::from(v) * 180.0).clamp(20.0, 200.0);
+            Ctx::apply_encoder_local(&w, pulse_ms, f64::from(w.get_enc_accel_sens()));
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("encoders", FieldKind::EncoderPulseMs, pulse_ms);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_enc_pulse_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
+                let pulse_ms = ms.clamp(20.0, 200.0);
+                Ctx::apply_encoder_local(&w, pulse_ms, f64::from(w.get_enc_accel_sens()));
+                ctx.queue_field_push("encoders", FieldKind::EncoderPulseMs, pulse_ms);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_enc_counts_changed(move |i| {
+            if let Some(w) = win.upgrade() {
+                let counts = match i {
+                    1 => 1u8,
+                    2 => 2u8,
+                    _ => 4u8,
+                };
+                ctx.set_module_tuning(&w, "encoders", move |t| {
+                    t.encoder_counts_per_click = Some(counts);
+                });
+            }
+        });
+    }
+    // Encoder tuning (E3/E4): acceleration switch (immediate push)
+    // + strength slider (debounced push, local echo) + per-knob
+    // invert switches (immediate push, mask bit per knob).
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_enc_accel_changed(move |b| {
+            if let Some(w) = win.upgrade() {
+                ctx.set_module_tuning(&w, "encoders", move |t| {
+                    t.encoder_accel = Some(b);
+                });
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_enc_accel_sens_changed(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let sens = (f64::from(v) * 2.0).clamp(0.0, 2.0);
+            Ctx::apply_encoder_local(&w, f64::from(w.get_enc_pulse_ms()), sens);
+            ctx.queue_field_push("encoders", FieldKind::EncoderAccelSens, sens);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_enc_accel_sens_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(pct) = t.trim().trim_end_matches(['%', ' ']).parse::<f64>() {
+                let sens = (pct / 100.0).clamp(0.0, 2.0);
+                Ctx::apply_encoder_local(&w, f64::from(w.get_enc_pulse_ms()), sens);
+                ctx.queue_field_push("encoders", FieldKind::EncoderAccelSens, sens);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_enc_invert_changed(move |i, b| {
+            if let Some(w) = win.upgrade() {
+                let bit: u8 = match i {
+                    0 => 0b0001,
+                    1 => 0b0010,
+                    _ => return,
+                };
+                ctx.set_module_tuning(&w, "encoders", move |t| {
+                    let mut mask = t.encoder_invert_mask.unwrap_or(0);
+                    if b {
+                        mask |= bit;
+                    } else {
+                        mask &= !bit;
+                    }
+                    t.encoder_invert_mask = Some(mask);
+                });
+            }
         });
     }
 }

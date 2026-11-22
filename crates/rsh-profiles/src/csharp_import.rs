@@ -243,6 +243,27 @@ pub struct PerModuleTuning {
     /// applies (old profiles load with `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_ms: Option<f64>,
+    // --- Encoder per-module tuning ---
+    /// Pulse length in ms (E1, encoders module only), 20–200.
+    /// `None` = never set (old profile) — the 50 ms default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_pulse_ms: Option<f64>,
+    /// Counts per click (E2, encoders module only): 1, 2 or 4.
+    /// `None` = never set (old profile) — the default 4 applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_counts_per_click: Option<u8>,
+    /// Acceleration on/off (E3, encoders module only).
+    /// `None` = never set — off applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_accel: Option<bool>,
+    /// Acceleration sensitivity (E3, encoders module only), 0–2.
+    /// `None` = never set — 1.0 applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_accel_sensitivity: Option<f64>,
+    /// Per-encoder direction invert mask (E4, encoders module
+    /// only), bits 0–3. `None` = never set — 0 (no invert) applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_invert_mask: Option<u8>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -523,6 +544,12 @@ impl Default for PerModuleTuning {
             // --- Pedal ramps/curves per-module tuning ---
             press_ms: None,
             release_ms: None,
+            // --- Encoder per-module tuning ---
+            encoder_pulse_ms: None,
+            encoder_counts_per_click: None,
+            encoder_accel: None,
+            encoder_accel_sensitivity: None,
+            encoder_invert_mask: None,
         }
     }
 }

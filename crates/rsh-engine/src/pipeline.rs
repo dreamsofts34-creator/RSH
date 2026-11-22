@@ -119,6 +119,27 @@ pub struct ModuleTuning {
     /// `value / saturation`, clamped to `0..=1`. Calibration
     /// (`min_mv` / `max_mv`) is untouched.
     pub saturation: f32,
+    // --- Encoder per-module tuning ---
+    /// Pulse length in milliseconds (E1, encoders only): each step
+    /// holds its virtual button (65–72) for this long, `20..=200`
+    /// (default `50`), instead of exactly one 5 ms tick — games
+    /// polling slower than 200 Hz no longer miss steps.
+    pub pulse_ms: f32,
+    /// Counts per click (E2, encoders only): quadrature counts per
+    /// emitted step — `1`, `2` or `4` (default `4`: one physical
+    /// detent = one step). Anything else sanitizes to `4`.
+    pub counts_per_click: u8,
+    /// Acceleration (E3, encoders only): fast spins emit extra steps.
+    /// Default `false` (off).
+    pub accel_enabled: bool,
+    /// Acceleration sensitivity (E3, encoders only): extra steps as
+    /// a multiple of the spun steps, `0..=2` (default `1.0` — a fast
+    /// spin doubles its steps). Only read when `accel_enabled`.
+    pub accel_sensitivity: f32,
+    /// Per-encoder direction invert (E4, encoders only): bit `i`
+    /// inverts encoder `i` (only bits `0..=3` are kept). OR-ed with
+    /// the module-level `invert`, which inverts all encoders.
+    pub encoder_invert_mask: u8,
 }
 
 impl Default for ModuleTuning {
@@ -142,6 +163,12 @@ impl Default for ModuleTuning {
             bite_point: 0.0,
             // --- Brake per-module tuning ---
             saturation: 1.0,
+            // --- Encoder per-module tuning ---
+            pulse_ms: 50.0,
+            counts_per_click: 4,
+            accel_enabled: false,
+            accel_sensitivity: 1.0,
+            encoder_invert_mask: 0,
         }
     }
 }
@@ -175,6 +202,15 @@ impl ModuleTuning {
         out.bite_point = clamp_finite(self.bite_point, 0.0, 1.0, 0.0);
         // --- Brake per-module tuning ---
         out.saturation = clamp_finite(self.saturation, 0.5, 1.0, 1.0);
+        // --- Encoder per-module tuning ---
+        out.pulse_ms = clamp_finite(self.pulse_ms, 20.0, 200.0, 50.0);
+        out.counts_per_click = match self.counts_per_click {
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        out.accel_sensitivity = clamp_finite(self.accel_sensitivity, 0.0, 2.0, 1.0);
+        out.encoder_invert_mask = self.encoder_invert_mask & 0x0F;
         if validate_pedal_range(self.min_mv, self.max_mv).is_err() {
             out.min_mv = DEFAULT_MIN_MV;
             out.max_mv = DEFAULT_MAX_MV;
@@ -292,10 +328,15 @@ pub struct OutputState {
     /// status packet, which the engine layer merges — not the pipeline.
     pub buttons_ex: u32,
     /// Momentary encoder-button pulses, buttons 65–72 (see
-    /// [`EncoderButtons`]). `0` when the encoders module is disabled.
+    /// [`EncoderButtons`]). Each step holds its bit for the
+    /// encoders module's `pulse_ms` (E1, default 50 ms) instead of
+    /// exactly one 5 ms tick. `0` when the encoders module is disabled.
     pub encoder_buttons: EncoderButtons,
-    /// Per-encoder wrap-aware deltas observed this tick (index `i` =
-    /// encoder `i`). `0` when the encoders module is disabled.
+    /// Per-encoder effective step deltas this tick (index `i` =
+    /// encoder `i`): the glitch-filtered counts after per-encoder
+    /// invert and `counts_per_click` division (E2), so they always
+    /// agree with [`Self::encoder_buttons`]. `0` when the encoders
+    /// module is disabled.
     pub encoder_deltas: [i16; MAX_ENCODERS],
     /// Decoded H-pattern gear: `0` = neutral, `1..=6` = gear. Always
     /// `0` in sequential mode or when the shifter module is disabled.
@@ -532,6 +573,12 @@ pub struct ProcessingPipeline {
     handbrake_ramp: RampLimiter,
     /// Cumulative encoder counts (wrap-aware deltas).
     encoders: EncoderTracker,
+    /// E1 pulse hold: ticks left (incl. the current tick) each
+    /// virtual-button bit 0..=7 stays held after its step.
+    encoder_pulse: [u8; MAX_ENCODERS * 2],
+    /// E2 sub-click remainder: counts banked per encoder toward the
+    /// next whole step (`counts_per_click` counts = one step).
+    encoder_remainder: [i32; MAX_ENCODERS],
 }
 
 impl Default for ProcessingPipeline {
@@ -562,6 +609,8 @@ impl ProcessingPipeline {
             clutch_ramp: RampLimiter::new(),
             handbrake_ramp: RampLimiter::new(),
             encoders: EncoderTracker::new(),
+            encoder_pulse: [0; MAX_ENCODERS * 2],
+            encoder_remainder: [0; MAX_ENCODERS],
             plan,
         }
     }
@@ -609,6 +658,8 @@ impl ProcessingPipeline {
         self.clutch_ramp.reset();
         self.handbrake_ramp.reset();
         self.encoders.reset();
+        self.encoder_pulse = [0; MAX_ENCODERS * 2];
+        self.encoder_remainder = [0; MAX_ENCODERS];
     }
 
     /// Process one stream frame into an [`OutputState`].
@@ -726,10 +777,81 @@ impl ProcessingPipeline {
             skipped,
         );
         if self.plan.encoders.enabled {
-            out.encoder_deltas = deltas;
-            out.encoder_buttons = deltas_to_buttons(&deltas);
+            out.encoder_deltas = self.apply_encoder_tuning(deltas);
+            out.encoder_buttons = self.apply_encoder_pulse(out.encoder_deltas);
+        } else {
+            // Disabled: a held pulse must not survive to re-enable.
+            self.encoder_pulse = [0; MAX_ENCODERS * 2];
         }
     }
+
+    /// E2 (+E3/E4): turn raw glitch-filtered deltas into emitted steps.
+    ///
+    /// Per encoder: the module-level `invert` or that encoder's bit
+    /// in `encoder_invert_mask` flips the direction (the encoder path
+    /// never read the module `invert` before — steering/pedals did —
+    /// so an encoders `invert` was silently dead until E2 wired it
+    /// in), then `counts_per_click` counts make one step; the sub-click
+    /// remainder is banked across ticks, so turning back unwinds it
+    /// instead of emitting a phantom step. Division truncates toward
+    /// zero, which keeps the remainder's sign correct for reversals.
+    /// E3: with acceleration on, a fast spin (`|step| >= 2` in one
+    /// 5 ms tick — 2+ detents per tick) emits extra steps,
+    /// `round(step * accel_sensitivity)` more, same direction.
+    /// The `i32` step is clamped to the `i16` range before the cast.
+    /// The `i32 → f32` cast in the accel extra cannot lose precision
+    /// in practice: a step is at most ~32768 (glitch filter), far
+    /// below the 2^24 integers `f32` represents exactly.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn apply_encoder_tuning(&mut self, raw: [i16; MAX_ENCODERS]) -> [i16; MAX_ENCODERS] {
+        let tuning = self.plan.encoders;
+        let divisor = i32::from(tuning.counts_per_click);
+        let mut steps = [0i16; MAX_ENCODERS];
+        for (i, &delta) in raw.iter().enumerate() {
+            let mut delta = i32::from(delta);
+            if tuning.invert || tuning.encoder_invert_mask & (1u8 << i) != 0 {
+                delta = -delta;
+            }
+            self.encoder_remainder[i] += delta;
+            let mut step = self.encoder_remainder[i] / divisor;
+            self.encoder_remainder[i] -= step * divisor;
+            if tuning.accel_enabled && step.unsigned_abs() >= 2 {
+                let extra = (step as f32 * tuning.accel_sensitivity).round() as i32;
+                step += extra;
+            }
+            steps[i] = step.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        }
+        steps
+    }
+
+    /// E1: hold each fresh step's virtual-button bit for
+    /// `pulse_ms` (4–40 ticks at 5 ms/tick) instead of one tick.
+    /// A fresh step re-arms its bit to the full hold; the hold
+    /// counts down once per tick, including the fresh tick.
+    fn apply_encoder_pulse(&mut self, steps: [i16; MAX_ENCODERS]) -> EncoderButtons {
+        let ticks = encoder_pulse_ticks(self.plan.encoders.pulse_ms);
+        let fresh = deltas_to_buttons(&steps);
+        let mut mask = fresh.0;
+        for (bit, remaining) in self.encoder_pulse.iter_mut().enumerate() {
+            if fresh.0 & (1u8 << bit) != 0 {
+                *remaining = ticks;
+            } else if *remaining > 0 {
+                mask |= 1u8 << bit;
+            }
+            *remaining = remaining.saturating_sub(1);
+        }
+        EncoderButtons(mask)
+    }
+}
+
+/// Encoder pulse hold in ticks for a `pulse_ms` setting (E1): one
+/// tick is 5 ms at 200 Hz, so the 20–200 ms range is 4–40 ticks
+/// (1 tick minimum — a pulse shorter than one tick is still one tick).
+/// The clamp to `1..=40` makes both casts safe.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn encoder_pulse_ticks(pulse_ms: f32) -> u8 {
+    ((pulse_ms / 5.0).round().clamp(1.0, 40.0)) as u8
 }
 
 /// Map a steering sample in mV to `-1..=1` using a
@@ -1236,14 +1358,258 @@ mod tests {
     #[test]
     fn golden_encoder_wrap() {
         let mut pipe = ProcessingPipeline::new(plain_plan());
-        let out = pipe.process(&frame(&[], &[32767], 0));
+        // Default counts-per-click is 4: one step is 4 counts, so
+        // the wrap is crossed in 4-count steps.
+        let out = pipe.process(&frame(&[], &[32764], 0));
         assert_eq!(out.encoder_deltas[0], 0); // first sample: baseline
         let out = pipe.process(&frame(&[], &[-32768], 0));
         assert_eq!(out.encoder_deltas[0], 1);
         assert!(out.encoder_buttons.clockwise(0));
-        let out = pipe.process(&frame(&[], &[32767], 0));
+        let out = pipe.process(&frame(&[], &[32764], 0));
         assert_eq!(out.encoder_deltas[0], -1);
         assert!(out.encoder_buttons.counter_clockwise(0));
+    }
+
+    #[test]
+    fn encoder_pulse_holds_button_for_pulse_ms() {
+        use super::encoder_pulse_ticks;
+        assert_eq!(encoder_pulse_ticks(50.0), 10);
+        assert_eq!(encoder_pulse_ticks(20.0), 4);
+        assert_eq!(encoder_pulse_ticks(200.0), 40);
+        assert_eq!(encoder_pulse_ticks(5.0), 1);
+        // E1: 50 ms = 10 ticks at 200 Hz (counts-per-click 1, so
+        // the pulse is isolated from the division).
+        let mut plan = plain_plan();
+        plan.encoders.counts_per_click = 1;
+        plan.encoders.pulse_ms = 50.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[0], 0)); // baseline
+        let out = pipe.process(&frame(&[], &[1], 0));
+        assert_eq!(out.encoder_deltas[0], 1);
+        assert!(out.encoder_buttons.clockwise(0));
+        // Held for 10 ticks total (fresh tick + 9 held), with no
+        // new counts and no new deltas.
+        for _ in 0..9 {
+            let out = pipe.process(&frame(&[], &[1], 0));
+            assert_eq!(out.encoder_deltas[0], 0);
+            assert!(out.encoder_buttons.clockwise(0));
+        }
+        // 11th tick: the hold expired.
+        let out = pipe.process(&frame(&[], &[1], 0));
+        assert!(!out.encoder_buttons.any());
+        // A fresh step while held re-arms the full hold.
+        let out = pipe.process(&frame(&[], &[2], 0));
+        assert!(out.encoder_buttons.clockwise(0));
+        for _ in 0..9 {
+            let out = pipe.process(&frame(&[], &[2], 0));
+            assert!(out.encoder_buttons.clockwise(0));
+        }
+        let out = pipe.process(&frame(&[], &[2], 0));
+        assert!(!out.encoder_buttons.any());
+        // E1 floor: 20 ms = 4 ticks.
+        let mut plan = plain_plan();
+        plan.encoders.counts_per_click = 1;
+        plan.encoders.pulse_ms = 20.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[0], 0));
+        let out = pipe.process(&frame(&[], &[1], 0));
+        assert!(out.encoder_buttons.clockwise(0));
+        for _ in 0..3 {
+            assert!(
+                pipe.process(&frame(&[], &[1], 0))
+                    .encoder_buttons
+                    .clockwise(0)
+            );
+        }
+        assert!(!pipe.process(&frame(&[], &[1], 0)).encoder_buttons.any());
+    }
+
+    #[test]
+    fn encoder_counts_per_click_divides_and_banks_remainder() {
+        // E2: 4 counts = 1 step; the sub-click remainder is banked
+        // across ticks, and turning back unwinds it.
+        let mut plan = plain_plan();
+        plan.encoders.counts_per_click = 4;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[0], 0)); // baseline
+        for count in [1, 2, 3] {
+            let out = pipe.process(&frame(&[], &[count], 0));
+            assert_eq!(out.encoder_deltas[0], 0);
+            assert!(!out.encoder_buttons.any());
+        }
+        let out = pipe.process(&frame(&[], &[4], 0));
+        assert_eq!(out.encoder_deltas[0], 1);
+        assert!(out.encoder_buttons.clockwise(0));
+        // One more count banks a remainder of 1; turning back one
+        // count unwinds it instead of emitting a phantom step.
+        let out = pipe.process(&frame(&[], &[5], 0));
+        assert_eq!(out.encoder_deltas[0], 0);
+        let out = pipe.process(&frame(&[], &[4], 0));
+        assert_eq!(out.encoder_deltas[0], 0);
+        // Four back is one CCW step.
+        let out = pipe.process(&frame(&[], &[0], 0));
+        assert_eq!(out.encoder_deltas[0], -1);
+        assert!(out.encoder_buttons.counter_clockwise(0));
+        // Two detents in one tick are two steps.
+        let out = pipe.process(&frame(&[], &[8], 0));
+        assert_eq!(out.encoder_deltas[0], 2);
+        assert!(out.encoder_buttons.clockwise(0));
+    }
+
+    #[test]
+    fn encoder_counts_per_click_one_is_identity() {
+        let mut plan = plain_plan();
+        plan.encoders.counts_per_click = 1;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[0], 0));
+        let out = pipe.process(&frame(&[], &[3], 0));
+        assert_eq!(out.encoder_deltas[0], 3);
+        assert!(out.encoder_buttons.clockwise(0));
+    }
+
+    #[test]
+    fn encoder_tuning_sanitizes() {
+        use super::ModuleTuning;
+        let base = ModuleTuning::default();
+        let sane = ModuleTuning {
+            pulse_ms: 5.0,
+            counts_per_click: 0,
+            ..base
+        }
+        .sanitized();
+        assert_eq!(sane.pulse_ms, 20.0);
+        assert_eq!(sane.counts_per_click, 4);
+        let sane = ModuleTuning {
+            pulse_ms: 500.0,
+            counts_per_click: 3,
+            ..base
+        }
+        .sanitized();
+        assert_eq!(sane.pulse_ms, 200.0);
+        assert_eq!(sane.counts_per_click, 4);
+        let sane = ModuleTuning {
+            pulse_ms: f32::NAN,
+            counts_per_click: 2,
+            ..base
+        }
+        .sanitized();
+        assert_eq!(sane.pulse_ms, 50.0);
+        assert_eq!(sane.counts_per_click, 2);
+        let sane = ModuleTuning {
+            counts_per_click: 1,
+            ..base
+        }
+        .sanitized();
+        assert_eq!(sane.counts_per_click, 1);
+    }
+
+    #[test]
+    fn encoder_module_invert_flips_direction() {
+        // The encoder path never read the module-level `invert`
+        // before (steering/pedals did) — it was silently dead for
+        // encoders. E2 wires it in: invert flips CW/CCW.
+        let mut plan = plain_plan();
+        plan.encoders.counts_per_click = 1;
+        plan.encoders.invert = true;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[0], 0));
+        let out = pipe.process(&frame(&[], &[4], 0));
+        assert_eq!(out.encoder_deltas[0], -4);
+        assert!(out.encoder_buttons.counter_clockwise(0));
+    }
+
+    #[test]
+    fn encoder_acceleration_adds_steps_only_on_fast_spins() {
+        // E3: |step| >= 2 in one tick is a fast spin — extra steps
+        // are round(step * sensitivity); slow spins are untouched.
+        let mut plan = plain_plan();
+        plan.encoders.counts_per_click = 1;
+        plan.encoders.accel_enabled = true;
+        plan.encoders.accel_sensitivity = 1.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[0], 0));
+        // Slow: 1 count in a tick — no extra.
+        let out = pipe.process(&frame(&[], &[1], 0));
+        assert_eq!(out.encoder_deltas[0], 1);
+        // Fast: 2 steps in a tick at sensitivity 1.0 doubles to 4.
+        let out = pipe.process(&frame(&[], &[3], 0));
+        assert_eq!(out.encoder_deltas[0], 4);
+        assert!(out.encoder_buttons.clockwise(0));
+        // Fast the other way: -2 steps -> -4 (same direction).
+        let out = pipe.process(&frame(&[], &[1], 0));
+        assert_eq!(out.encoder_deltas[0], -4);
+        assert!(out.encoder_buttons.counter_clockwise(0));
+        // Sensitivity 0 adds nothing even on a fast spin.
+        let mut plan = plain_plan();
+        plan.encoders.counts_per_click = 1;
+        plan.encoders.accel_enabled = true;
+        plan.encoders.accel_sensitivity = 0.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[0], 0));
+        let out = pipe.process(&frame(&[], &[3], 0));
+        assert_eq!(out.encoder_deltas[0], 3);
+        // Sensitivity 2.0 triples a fast spin (2 + 4).
+        let mut plan = plain_plan();
+        plan.encoders.counts_per_click = 1;
+        plan.encoders.accel_enabled = true;
+        plan.encoders.accel_sensitivity = 2.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[0], 0));
+        let out = pipe.process(&frame(&[], &[2], 0));
+        assert_eq!(out.encoder_deltas[0], 6);
+        // Off: a fast spin stays exactly what was spun.
+        let mut plan = plain_plan();
+        plan.encoders.counts_per_click = 1;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[0], 0));
+        let out = pipe.process(&frame(&[], &[2], 0));
+        assert_eq!(out.encoder_deltas[0], 2);
+    }
+
+    #[test]
+    fn encoder_per_encoder_invert_is_independent() {
+        // E4: the mask inverts one encoder only; the other keeps
+        // its direction. Bit 1 = encoder 1.
+        let mut plan = plain_plan();
+        plan.encoders.counts_per_click = 1;
+        plan.encoders.encoder_invert_mask = 0b0010;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[0, 0], 0));
+        let out = pipe.process(&frame(&[], &[4, 4], 0));
+        assert_eq!(out.encoder_deltas, [4, -4, 0, 0]);
+        assert!(out.encoder_buttons.clockwise(0));
+        assert!(out.encoder_buttons.counter_clockwise(1));
+        // Out-of-range bits sanitize away (only 0..=3 kept).
+        let mut plan = plain_plan();
+        plan.encoders.encoder_invert_mask = 0b1111_0000;
+        assert_eq!(plan.sanitized().encoders.encoder_invert_mask, 0);
+        // Sensitivity sanitizes to 0..=2, default 1.0.
+        let mut plan = plain_plan();
+        plan.encoders.accel_sensitivity = 5.0;
+        assert_eq!(plan.sanitized().encoders.accel_sensitivity, 2.0);
+        plan.encoders.accel_sensitivity = f32::NAN;
+        assert_eq!(plan.sanitized().encoders.accel_sensitivity, 1.0);
+    }
+
+    #[test]
+    fn encoder_disabled_clears_held_pulse() {
+        let mut plan = plain_plan();
+        plan.encoders.counts_per_click = 1;
+        plan.encoders.pulse_ms = 200.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[0], 0));
+        let out = pipe.process(&frame(&[], &[1], 0));
+        assert!(out.encoder_buttons.clockwise(0));
+        // Live-disable (no state reset): the held pulse clears.
+        plan.encoders.enabled = false;
+        pipe.set_plan_live(plan);
+        let out = pipe.process(&frame(&[], &[1], 0));
+        assert!(!out.encoder_buttons.any());
+        // Re-enable: no stale pulse comes back.
+        plan.encoders.enabled = true;
+        pipe.set_plan_live(plan);
+        let out = pipe.process(&frame(&[], &[1], 0));
+        assert!(!out.encoder_buttons.any());
     }
 
     #[test]

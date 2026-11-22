@@ -256,6 +256,27 @@ pub struct TuningSettings {
     /// carry it). Default off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub combine_pedals: Option<bool>,
+    // --- Encoder per-module tuning ---
+    /// Pulse length in ms (E1, encoders module only): how long each
+    /// step holds its virtual button, 20–200 (default 50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_pulse_ms: Option<f64>,
+    /// Counts per click (E2, encoders module only): quadrature
+    /// counts per emitted step — 1, 2 or 4 (default 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_counts_per_click: Option<u8>,
+    /// Acceleration on/off (E3, encoders module only): fast spins
+    /// emit extra steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_accel: Option<bool>,
+    /// Acceleration sensitivity (E3, encoders module only): extra
+    /// steps as a multiple of the spun steps, 0–2 (default 1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_accel_sensitivity: Option<f64>,
+    /// Per-encoder direction invert (E4, encoders module only):
+    /// bit `i` inverts encoder `i` (only bits 0–3 used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_invert_mask: Option<u8>,
 }
 
 impl TuningSettings {
@@ -298,6 +319,12 @@ impl TuningSettings {
             } else {
                 None
             },
+            // --- Encoder per-module tuning ---
+            encoder_pulse_ms: None,
+            encoder_counts_per_click: None,
+            encoder_accel: None,
+            encoder_accel_sensitivity: None,
+            encoder_invert_mask: None,
         }
     }
 }
@@ -399,6 +426,35 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
         && !(0.0..=2000.0).contains(&release_ms)
     {
         errors.push(format!("release_ms {release_ms} is outside 0..=2000"));
+    }
+    // --- Encoder per-module tuning ---
+    if let Some(pulse_ms) = tuning.encoder_pulse_ms
+        && !(20.0..=200.0).contains(&pulse_ms)
+    {
+        errors.push(format!(
+            "encoder_pulse_ms {pulse_ms} is outside 20..=200 (ms)"
+        ));
+    }
+    if let Some(counts) = tuning.encoder_counts_per_click
+        && !matches!(counts, 1 | 2 | 4)
+    {
+        errors.push(format!(
+            "encoder_counts_per_click {counts} is not one of 1, 2, 4"
+        ));
+    }
+    if let Some(sensitivity) = tuning.encoder_accel_sensitivity
+        && !(0.0..=2.0).contains(&sensitivity)
+    {
+        errors.push(format!(
+            "encoder_accel_sensitivity {sensitivity} is outside 0..=2"
+        ));
+    }
+    if let Some(mask) = tuning.encoder_invert_mask
+        && mask & !0x0F != 0
+    {
+        errors.push(format!(
+            "encoder_invert_mask {mask} uses bits outside 0..=3"
+        ));
     }
     errors
 }
@@ -559,6 +615,56 @@ mod tests {
         assert!(errors.iter().any(|e| e.contains("span")));
         assert!(errors.iter().any(|e| e.contains("bite_point")));
         assert!(errors.iter().any(|e| e.contains("horn_button")));
+    }
+
+    #[test]
+    fn encoder_fields_round_trip_and_validate() {
+        let mut settings = tuning("encoders");
+        settings.encoder_pulse_ms = Some(120.0);
+        settings.encoder_counts_per_click = Some(2);
+        settings.encoder_accel = Some(true);
+        settings.encoder_accel_sensitivity = Some(1.5);
+        settings.encoder_invert_mask = Some(0b0010);
+        assert_eq!(validate_tuning(&settings), Vec::<String>::new());
+        let json = serde_json::to_string(&settings).expect("serialize");
+        assert!(json.contains("\"encoderPulseMs\":120.0"), "{json}");
+        assert!(json.contains("\"encoderCountsPerClick\":2"), "{json}");
+        assert!(json.contains("\"encoderAccel\":true"), "{json}");
+        assert!(json.contains("\"encoderAccelSensitivity\":1.5"), "{json}");
+        assert!(json.contains("\"encoderInvertMask\":2"), "{json}");
+        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, settings);
+        // Other modules never carry them: omitted from the JSON.
+        let json = serde_json::to_string(&tuning("brake")).expect("serialize");
+        assert!(!json.contains("encoderPulseMs"), "{json}");
+        assert!(!json.contains("encoderCountsPerClick"), "{json}");
+        assert!(!json.contains("encoderAccel"), "{json}");
+        assert!(!json.contains("encoderInvertMask"), "{json}");
+        // Out-of-range values are rejected, never silently clamped here.
+        let mut bad = tuning("encoders");
+        bad.encoder_pulse_ms = Some(10.0);
+        bad.encoder_counts_per_click = Some(3);
+        bad.encoder_accel_sensitivity = Some(3.0);
+        bad.encoder_invert_mask = Some(0x10);
+        let errors = validate_tuning(&bad);
+        assert_eq!(errors.len(), 4, "errors: {errors:?}");
+        assert!(errors.iter().any(|e| e.contains("encoder_pulse_ms")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("encoder_counts_per_click")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("encoder_accel_sensitivity")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("encoder_invert_mask")),
+            "{errors:?}"
+        );
     }
 
     #[test]
