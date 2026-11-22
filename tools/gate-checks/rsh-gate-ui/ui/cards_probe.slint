@@ -8,7 +8,15 @@ import { ExtrasScreen } from "../../../crates/rsh-ui/ui/screens/extras.slint";
 
 export component GateExtrasWindow inherits Window {
     width: 736px;
-    height: 700px;
+    // 1050px: the grown Extras grid's intrinsic height is 1018px
+    // (16 top pad + 655 row-1 + 12 gap + 305 row-2 + 12 gap +
+    // 2 trailing rect + 16 bottom pad, measured all-ON at 1000px).
+    // 1000px passed only because the 18px shortfall landed in the
+    // bottom padding, leaving row-2 flush with the viewport edge
+    // (0px margin) — fragile. 1050px leaves a 32px margin. Above
+    // the intrinsic height the ScrollView stretches both rows
+    // equally, so keep the height close to intrinsic.
+    height: 1050px;
     title: "gate-cards-extras-probe";
     in-out property <bool> handbrake-on: true;
     in-out property <bool> shifter-on: true;
