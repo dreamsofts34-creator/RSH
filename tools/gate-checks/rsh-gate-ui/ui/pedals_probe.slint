@@ -2,7 +2,7 @@
 // crates/rsh-ui/ui/screens/pedals.slint) so the gate can render
 // it headless: Advanced off vs on must add the per-module tuning
 // sliders (curve / ramps / saturation / combined pedals), and the
-// new callbacks must fire through.
+// new callbacks must fire through (incl. the clutch slip zone).
 import { PedalsPage } from "../../../crates/rsh-ui/ui/screens/pedals.slint";
 
 export component GatePedalsWindow inherits Window {
@@ -16,6 +16,7 @@ export component GatePedalsWindow inherits Window {
     callback pedal-press-ms-changed(int, float);
     callback pedal-release-ms-changed(int, float);
     callback throttle-saturation-changed(float);
+    callback clutch-bite-width-changed(float);
     callback combine-pedals-changed(bool);
     PedalsPage {
         width: 100%;
@@ -26,6 +27,7 @@ export component GatePedalsWindow inherits Window {
         pedal-press-ms-changed(p, v) => { root.pedal-press-ms-changed(p, v); }
         pedal-release-ms-changed(p, v) => { root.pedal-release-ms-changed(p, v); }
         throttle-saturation-changed(v) => { root.throttle-saturation-changed(v); }
+        clutch-bite-width-changed(v) => { root.clutch-bite-width-changed(v); }
         combine-pedals-changed(b) => { root.combine-pedals-changed(b); }
     }
 }
