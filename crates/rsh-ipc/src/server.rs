@@ -318,14 +318,25 @@ impl IpcServer {
                     message: format!("unknown method: {method}"),
                 }),
             }),
-            Err(IpcError::Api(code)) => Ok(IpcResponse {
+            Err(IpcError::Api(payload)) => Ok(IpcResponse {
                 v: IPC_PROTOCOL_VERSION,
                 id,
                 ok: false,
                 result: None,
                 error: Some(IpcErrorBody {
-                    code: code.clone(),
-                    message: format!("daemon API error: {code}"),
+                    // Bug 4/8: the payload is code-first
+                    // (`"{code}: {reason}"` — `set_output_backend`
+                    // carries the failure's real reason after the
+                    // code). The body's `code` stays the bare code
+                    // (callers parse it), the full payload — reason
+                    // included — rides in the message. A bare-code
+                    // payload (every other method) has no `": "`,
+                    // so it passes through unchanged.
+                    code: payload
+                        .split_once(": ")
+                        .map_or(payload.as_str(), |(code, _)| code)
+                        .to_string(),
+                    message: format!("daemon API error: {payload}"),
                 }),
             }),
             Err(IpcError::UnsupportedVersion(v)) => Ok(IpcResponse {
@@ -1257,7 +1268,18 @@ mod tests {
             )
             .expect("set_output_backend parses");
         assert!(!resp.ok);
-        assert_eq!(resp.error.expect("error").code, "Unknown");
+        let error = resp.error.expect("error");
+        assert_eq!(error.code, "Unknown");
+        // Bug 4/8: the body's code stays the bare code, but the
+        // failure's real reason rides in the message — the UI shows
+        // it instead of a generic link failure.
+        assert!(
+            error
+                .message
+                .contains("output backend switching is not supported by this API"),
+            "reason must ride in the message: {}",
+            error.message
+        );
         let resp = server
             .handle_line(r#"{"v":2,"id":25,"method":"backup_now","params":{}}"#)
             .expect("backup_now parses");

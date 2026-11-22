@@ -863,6 +863,61 @@ impl IpcApi {
         }
     }
 
+    /// Build the [`UserError`] for a failed `set_output_backend`
+    /// (Bug 4/8): the daemon's `IpcError::Api` payload carries its
+    /// code first and the failure's real reason after it
+    /// (`"{code}: {reason}"` — see `dispatch_settings` in
+    /// `rsh-ipc`), wrapped by the client as
+    /// `"daemon API error: {code}: daemon API error: {code}:
+    /// {reason}"`. The reason is the text after the LAST marker,
+    /// split from its code at the first `": "` (the reason itself
+    /// may contain `": "`). A `not_admin` code rebuilds the typed
+    /// UAC-decline error (same words as the daemon's — see
+    /// `daemon_api.rs` / `AppStateCore::HID_NOT_ADMIN`, the source
+    /// of truth); any other code keeps the daemon's reason as the
+    /// detail, so the toast names the sidecar/driver failure instead
+    /// of a generic link failure. A payload without a reason (fake
+    /// daemon, empty message) or a non-`Api` error (dead link,
+    /// timeout) is still the generic link failure — only the
+    /// daemon's own typed reason is preserved, nothing is invented.
+    fn daemon_backend_error(error: &IpcError) -> UserError {
+        let payload = error.to_string();
+        let Some(tail) = payload
+            .rsplit("daemon API error: ")
+            .next()
+            .filter(|tail| *tail != payload.as_str())
+        else {
+            return Self::ipc_failed();
+        };
+        let (code, reason) = match tail.split_once(": ") {
+            Some((code, reason)) => (code.trim(), reason.trim()),
+            None => (tail.trim(), ""),
+        };
+        if code == "not_admin" {
+            // The daemon's typed decline: `HIDMaestro needs
+            // administrator rights — approve the UAC prompt to
+            // switch to it, or run RSH as administrator. vJoy needs
+            // no prompt.` (kept in sync with `HID_NOT_ADMIN`).
+            return UserError {
+                code: "not_admin".to_string(),
+                title: "Admin permission needed".to_string(),
+                what_happened: if reason.is_empty() {
+                    "HIDMaestro needs administrator rights to switch to it."
+                        .to_string()
+                } else {
+                    reason.to_string()
+                },
+                what_to_do: "Approve the Windows prompt when switching to HIDMaestro, or keep using vJoy (no permission needed)."
+                    .to_string(),
+                detail: None,
+            };
+        }
+        if reason.is_empty() {
+            return Self::ipc_failed();
+        }
+        UserError::from_connection(ConnectionError::Unknown, reason.to_string())
+    }
+
     fn lost_connection() -> ConnectionInfo {
         ConnectionInfo {
             state: ConnectionState::Error {
@@ -1637,7 +1692,12 @@ impl AppApi for IpcApi {
                 }
                 Ok(backend)
             }
-            Err(_) => Err(Self::ipc_failed()),
+            // Bug 4/8: a daemon-side switch failure must reach the
+            // UI with its real reason — the old blanket
+            // `ipc_failed()` turned every failed switch into
+            // "daemon IPC link failed", hiding whether the sidecar,
+            // the driver, or the UAC prompt was the problem.
+            Err(error) => Err(Self::daemon_backend_error(&error)),
         }
     }
 
@@ -3250,6 +3310,50 @@ mod tests {
             error.code, "TransportClosed",
             "an unrecognised daemon code stays the generic link failure"
         );
+    }
+
+    #[test]
+    fn daemon_backend_error_keeps_the_daemons_reason() {
+        // Bug 4/8: a failed switch arrives as
+        // `IpcError::Api("Unknown: daemon API error: Unknown:
+        // <reason>")` — the daemon's reason must survive as the
+        // detail (the toast shows it), not collapse into the
+        // generic "daemon IPC link failed". The reason itself may
+        // contain ": " — only the first split is the code.
+        let error = IpcApi::daemon_backend_error(&IpcError::Api(
+            "Unknown: daemon API error: Unknown: could not switch output backend to HIDMaestro: HIDMaestro could not connect: HIDMaestro sidecar failed to start.".to_string(),
+        ));
+        assert_eq!(error.code, "Unknown");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("could not switch output backend to HIDMaestro: HIDMaestro could not connect: HIDMaestro sidecar failed to start."),
+            "the full reason survives, colons included"
+        );
+        // A `not_admin` code rebuilds the typed UAC-decline error.
+        let error = IpcApi::daemon_backend_error(&IpcError::Api(
+            "not_admin: daemon API error: not_admin: HIDMaestro needs administrator rights — approve the UAC prompt to switch to it, or run RSH as administrator. vJoy needs no prompt.".to_string(),
+        ));
+        assert_eq!(error.code, "not_admin");
+        assert_eq!(error.title, "Admin permission needed");
+        assert!(
+            error.what_happened.contains("administrator rights"),
+            "{}",
+            error.what_happened
+        );
+        assert!(
+            error.what_to_do.contains("Approve the Windows prompt"),
+            "{}",
+            error.what_to_do
+        );
+        // A payload without a reason (fake daemon, empty message)
+        // and a non-`Api` error (dead link) stay the generic link
+        // failure — nothing is invented.
+        let error = IpcApi::daemon_backend_error(&IpcError::Api(
+            "Unknown: daemon API error: Unknown".to_string(),
+        ));
+        assert_eq!(error.code, "TransportClosed");
+        let error = IpcApi::daemon_backend_error(&IpcError::Io("connection refused".to_string()));
+        assert_eq!(error.code, "TransportClosed");
     }
 
     /// Minimal `AppApi` for the capture test: only the capture

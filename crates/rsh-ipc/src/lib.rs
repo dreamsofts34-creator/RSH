@@ -57,7 +57,12 @@ pub enum IpcError {
     UnsupportedVersion(u32),
     /// The method is unknown on this server.
     UnknownMethod(String),
-    /// The daemon API call itself failed (carries the `UserError` code).
+    /// The daemon API call itself failed (carries the `UserError`
+    /// code first — `"{code}: {message}"`, where `{message}` is the
+    /// displayable reason for `set_output_backend` and empty for the
+    /// methods that still map to the bare code; see
+    /// [`IpcClient::call_once`](crate::client::IpcClient::call_once)
+    /// and `daemon_connect_error` in the UI for the parse).
     Api(String),
     /// An I/O error (bind, connect, read, write).
     Io(String),
@@ -738,9 +743,23 @@ fn dispatch_settings(
                 .get("name")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
+            // Bug 4/8: the failure's real reason must reach the UI —
+            // the bare code (`Unknown`) says nothing about why the
+            // switch failed. The payload stays code-first
+            // (`"{code}: {reason}"`, the shape `IpcError::Api`
+            // documents), with the displayable reason after it: the
+            // daemon's `detail` (the full "could not switch …"
+            // message) when present, else `what_happened` (the
+            // `not_admin` case, which has no `detail`).
             api.set_output_backend(name)
                 .map(|backend| serde_json::json!({"output_backend": backend}))
-                .map_err(|e| IpcError::Api(e.code))
+                .map_err(|e| {
+                    IpcError::Api(format!(
+                        "{}: {}",
+                        e.code,
+                        e.detail.as_deref().unwrap_or(&e.what_happened)
+                    ))
+                })
         }
         "backup_now" => api
             .backup_now()

@@ -1709,10 +1709,6 @@ struct Ctx {
     /// the board becomes reachable / the error clears, so the user
     /// is told once per outage, not once per second.
     unreachable_notified: Rc<Cell<bool>>,
-    /// True while a Backend job is switching to `HIDMaestro` (DS-59):
-    /// the busy strip relabels to "Waiting for admin permission…"
-    /// once the UAC prompt is expected.
-    backend_target_is_hid: Rc<Cell<bool>>,
     /// Background-job completions (A9/B5): job threads send on
     /// `job_tx`; the frame timer drains `job_rx` on the UI thread.
     /// `Rc<RefCell<Receiver>>` — the UI is single-threaded, so no
@@ -2929,23 +2925,20 @@ impl Ctx {
         }
     }
 
-    /// Relabel a long-running backend switch (DS-59): once the
-    /// `HIDMaestro` switch has run 5 s, the UAC prompt is what the
-    /// user is waiting on — say so in the busy strip instead of a
-    /// bare "Switching controller…" for up to 80 s.
-    fn refresh_backend_busy_label(&self, win: &MainWindow) {
-        if !self.backend_target_is_hid.get() {
-            return;
-        }
-        let mut jobs = self.busy_jobs.borrow_mut();
-        let Some((label, started)) = jobs.get_mut(&JobKind::Backend) else {
-            return;
+    /// Point the Settings controller segment at the backend that is
+    /// actually live (Bug 4/8): after a failed or mismatched switch
+    /// the radio must show the real backend, not the one the user
+    /// just clicked. `output_backend()` is the ~1 Hz cache — it
+    /// never touches the socket from the UI thread. When the cache
+    /// has no known backend yet (`"Unknown"`), fall back to
+    /// `fallback_index` (the segment the click flipped away from).
+    fn resync_controller_from_live(&self, win: &MainWindow, fallback_index: i32) {
+        let index = match self.api().output_backend().as_str() {
+            "HIDMaestro" => 0,
+            "vJoy" => 1,
+            _ => fallback_index,
         };
-        if started.elapsed() >= Duration::from_secs(5) && label == "Switching controller…" {
-            *label = "Waiting for admin permission…".to_string();
-            drop(jobs);
-            self.sync_busy(win);
-        }
+        win.set_controller(index);
     }
 
     /// Give up the "Rejoining…" state (DS-67): if the session never
@@ -3247,8 +3240,17 @@ impl Ctx {
                 {
                     return;
                 }
+                // Bug 4/8: a success toast is only honest when the
+                // backend that is actually live is the one the user
+                // asked for. The daemon reports the LIVE name, so a
+                // silent fallback used to arrive here as
+                // `Ok("vJoy")` for a HIDMaestro request and toast
+                // "Game controller is now vJoy". A mismatch is a
+                // failure now: error toast, radio back on the live
+                // backend, no success toast.
+                let requested = if index == 1 { "vJoy" } else { "HIDMaestro" };
                 match result {
-                    Ok(active) => {
+                    Ok(active) if active == requested => {
                         self.sync_overview(win);
                         // The wizard's Drivers step mirrors the same
                         // backend choice (fallback flag + controller
@@ -3265,11 +3267,33 @@ impl Ctx {
                             &format!("Game controller is now {active}."),
                         );
                     }
+                    Ok(active) => {
+                        self.resync_controller_from_live(win, 1 - index);
+                        self.notify_error(
+                            win,
+                            "Game controller",
+                            &UserError {
+                                code: "Unknown".to_string(),
+                                title: "Controller switch did not take effect".to_string(),
+                                what_happened: format!(
+                                    "{requested} is not active — {active} is still the game controller."
+                                ),
+                                what_to_do: format!(
+                                    "Try the switch again, or keep using {active}."
+                                ),
+                                detail: None,
+                            },
+                        );
+                    }
                     Err(e) => {
                         // A10: revert the switch the binding already
                         // flipped, and show the typed reason (a UAC
                         // decline says admin is needed, not "Unknown").
-                        win.set_controller(1 - index);
+                        // The radio re-syncs from the live backend
+                        // (cached, never the socket) — the flipped
+                        // segment is only a guess when the live
+                        // backend moved mid-switch.
+                        self.resync_controller_from_live(win, 1 - index);
                         self.notify_error(win, "Game controller", &e);
                     }
                 }
@@ -3520,6 +3544,11 @@ impl Ctx {
             if !tuning_silent {
                 let body = if tuning_reverted {
                     "The change wasn't saved — the slider was put back to its previous value."
+                } else if kind == JobKind::Backend {
+                    // Bug 4: a switch that never answers must say so
+                    // plainly — the previous controller is still
+                    // active, nothing silently changed under the user.
+                    "The controller switch took too long — the previous controller is still active. Try again."
                 } else {
                     "The operation took too long — try again."
                 };
@@ -3750,12 +3779,16 @@ impl Ctx {
             );
         }
         // D17: the switch itself is not a notification — the busy
-        // strip is the surface while it runs.
+        // strip is the surface while it runs. The label stays
+        // "Switching controller…" for the whole switch (Bug 4/8):
+        // the UI has no switch-progress source — the switch runs
+        // synchronously inside the daemon's `set_output_backend`
+        // call and the sidecar spawn reports no phase — so a
+        // time-based relabel to "Waiting for admin permission…"
+        // would claim knowledge the UI does not have (it stayed
+        // stuck on that label after the prompt was answered). The
+        // 75 s timeout already ends the job with a clear error.
         let api = self.api();
-        // DS-59: remember the target — the 1 Hz tick relabels the
-        // busy strip once a HIDMaestro switch has run long enough
-        // for the UAC prompt to be what the user waits on.
-        self.backend_target_is_hid.set(index != 1);
         self.run_job(
             win,
             JobKind::Backend,
@@ -9716,7 +9749,6 @@ fn start_frame_timer(
                 ctx.check_job_timeouts(&w);
                 ctx.check_toast_expiry(&w);
                 ctx.sync_auto_theme(&w);
-                ctx.refresh_backend_busy_label(&w);
                 ctx.check_wifi_rejoin_timeout();
                 ctx.check_connecting_timeout(&w);
                 ctx.poll_firmware_update(&w);
@@ -9950,7 +9982,6 @@ fn main() -> Result<(), slint::PlatformError> {
         confirm_pending: Rc::new(RefCell::new(None)),
         vjoy_install_started: Rc::new(Cell::new(None)),
         unreachable_notified: Rc::new(Cell::new(false)),
-        backend_target_is_hid: Rc::new(Cell::new(false)),
         job_tx,
         job_rx: Rc::new(RefCell::new(job_rx)),
         busy_jobs: Rc::new(RefCell::new(HashMap::new())),
@@ -10901,7 +10932,6 @@ mod tests {
             confirm_pending: Rc::new(RefCell::new(None)),
             vjoy_install_started: Rc::new(Cell::new(None)),
             unreachable_notified: Rc::new(Cell::new(false)),
-            backend_target_is_hid: Rc::new(Cell::new(false)),
             job_tx,
             job_rx: Rc::new(RefCell::new(job_rx)),
             busy_jobs: Rc::new(RefCell::new(HashMap::new())),
@@ -12092,6 +12122,118 @@ mod tests {
         assert_eq!(win.get_toast_title().as_str(), "Test success");
         assert_eq!(win.get_toast_kind().as_str(), "success");
         assert!(!win.get_notif_open(), "success must not open the drawer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Bug 4/8: a failed backend-switch job reverts the Settings
+    // radio to the backend that is actually live and toasts an
+    // error — never a "Game controller is now …" success. A job
+    // that reports success for the WRONG backend (live vJoy after a
+    // HIDMaestro request — the old silent fallback) is the same
+    // failure, not a success toast. A genuine success (live backend
+    // == requested) still toasts success.
+    #[test]
+    fn backend_job_failure_reverts_radio_and_errors_without_success_toast() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("backend job test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        // SimApi reports vJoy live; the click flipped the segment
+        // to HIDMaestro.
+        assert_eq!(ctx.api().output_backend(), "vJoy");
+        win.set_controller(0);
+
+        // 1. The switch errors (sidecar/UAC failure): radio back
+        // on vJoy, error toast with the real reason, no success.
+        let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
+            JobDone::Backend {
+                index: 0,
+                result: Err(UserError {
+                    code: "Unknown".to_string(),
+                    title: "Something went wrong".to_string(),
+                    what_happened: "Something went wrong.".to_string(),
+                    what_to_do: "Try again.".to_string(),
+                    detail: Some(
+                        "could not switch output backend to HIDMaestro: HIDMaestro sidecar failed to start."
+                            .to_string(),
+                    ),
+                }),
+            }
+        });
+        assert!(started, "backend job should start");
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(
+            win.get_controller(),
+            1,
+            "radio reverts to the live backend (vJoy)"
+        );
+        assert_eq!(win.get_toast_kind().as_str(), "error");
+        assert!(
+            win.get_toast_text()
+                .as_str()
+                .contains("sidecar failed to start"),
+            "toast shows the real reason, got: {}",
+            win.get_toast_text()
+        );
+        assert!(
+            !win.get_toast_text().as_str().contains("is now"),
+            "no success wording on a failed switch, got: {}",
+            win.get_toast_text()
+        );
+
+        // 2. The job "succeeds" for the WRONG backend (live vJoy
+        // after a HIDMaestro request — the old silent fallback):
+        // the same failure, not a success toast.
+        win.set_controller(0);
+        let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
+            JobDone::Backend {
+                index: 0,
+                result: Ok("vJoy".to_string()),
+            }
+        });
+        assert!(started, "second backend job should start");
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(
+            win.get_controller(),
+            1,
+            "radio reverts to the live backend (vJoy) on a mismatch"
+        );
+        assert_eq!(win.get_toast_kind().as_str(), "error");
+        assert!(
+            win.get_toast_text().as_str().contains("is not active"),
+            "mismatch toasts as a failure, got: {}",
+            win.get_toast_text()
+        );
+        assert!(
+            !win.get_toast_text()
+                .as_str()
+                .contains("Game controller is now"),
+            "no success toast on a mismatched switch, got: {}",
+            win.get_toast_text()
+        );
+
+        // 3. A genuine success (live backend == requested) still
+        // toasts success and keeps the segment.
+        win.set_controller(0);
+        let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
+            JobDone::Backend {
+                index: 0,
+                result: Ok("HIDMaestro".to_string()),
+            }
+        });
+        assert!(started, "third backend job should start");
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(win.get_controller(), 0, "segment keeps HIDMaestro");
+        assert_eq!(win.get_toast_kind().as_str(), "success");
+        assert!(
+            win.get_toast_text()
+                .as_str()
+                .contains("Game controller is now HIDMaestro"),
+            "genuine success still toasts, got: {}",
+            win.get_toast_text()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
