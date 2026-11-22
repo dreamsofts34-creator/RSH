@@ -100,6 +100,13 @@ pub struct ModuleTuning {
     /// passes the bite point, then ramps `(value - bite) / (1 - bite)`
     /// — the clutch engages at the bite, it does not creep before it.
     pub bite_point: f32,
+    // --- Brake per-module tuning ---
+    /// Brake force (BRF), `0.5..=1.0`: the travel fraction that
+    /// gives 100% brake (brake only; `1.0` = off, full travel).
+    /// Applied right after mapping, before the bite point:
+    /// `value / saturation`, clamped to `0..=1`. Calibration
+    /// (`min_mv` / `max_mv`) is untouched.
+    pub saturation: f32,
 }
 
 impl Default for ModuleTuning {
@@ -118,6 +125,8 @@ impl Default for ModuleTuning {
             release_ms: 100.0,
             gate_mode: ShifterGateMode::Sequential,
             bite_point: 0.0,
+            // --- Brake per-module tuning ---
+            saturation: 1.0,
         }
     }
 }
@@ -146,6 +155,8 @@ impl ModuleTuning {
             clamp_finite(self.release_ms, 10.0, 2000.0, 100.0)
         };
         out.bite_point = clamp_finite(self.bite_point, 0.0, 1.0, 0.0);
+        // --- Brake per-module tuning ---
+        out.saturation = clamp_finite(self.saturation, 0.5, 1.0, 1.0);
         if validate_pedal_range(self.min_mv, self.max_mv).is_err() {
             out.min_mv = DEFAULT_MIN_MV;
             out.max_mv = DEFAULT_MAX_MV;
@@ -737,6 +748,19 @@ pub fn apply_bite_point(value: f32, bite: f32) -> f32 {
     ((value - bite) / (1.0 - bite)).clamp(0.0, 1.0)
 }
 
+/// Brake-force (BRF) rescale for a mapped pedal value in `0..=1`:
+/// `saturation` is the travel fraction that gives 100% brake, so
+/// the output is `value / saturation`, clamped to `0..=1`. A
+/// saturation of `1.0` is the identity. Values outside `0.5..=1.0`
+/// clamp (a sanitized plan never sends them, but the stage must not
+/// amplify an insane input — and `0.0` would divide by zero).
+#[must_use]
+pub fn apply_saturation(value: f32, saturation: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    let saturation = clamp_finite(saturation, 0.5, 1.0, 1.0);
+    (value / saturation).clamp(0.0, 1.0)
+}
+
 /// Map a pedal sample in mV to `0..=1` using a `min / max` range.
 /// Out-of-range samples clamp to the ends. Returns `0.0` for a
 /// degenerate range (`max <= min`).
@@ -847,9 +871,9 @@ fn process_steering_axis(
     apply_smoothing(filter, value, tuning.smoothing)
 }
 
-/// Pedal chain for one tick: map → deadzone → curve → smooth → ramp.
-/// Returns `0.0` (and resets filter and ramp) when the module is
-/// disabled or the axis is missing.
+/// Pedal chain for one tick: map → saturation → bite → deadzone →
+/// curve → smooth → ramp. Returns `0.0` (and resets filter and
+/// ramp) when the module is disabled or the axis is missing.
 fn process_pedal_axis(
     mv: Option<u16>,
     tuning: &ModuleTuning,
@@ -868,6 +892,11 @@ fn process_pedal_axis(
     };
     let (min_mv, max_mv) = pedal_range(tuning);
     let mut value = map_pedal_mv(mv, min_mv, max_mv);
+    // --- Brake per-module tuning ---
+    // B1 brake force: rescale travel so `saturation` travel is full
+    // brake (1.0 = off). Runs before the bite point, so the bite
+    // and deadzone stages work in rescaled-travel units.
+    value = apply_saturation(value, tuning.saturation);
     if tuning.invert {
         value = 1.0 - value;
     }
@@ -1363,6 +1392,56 @@ mod tests {
             "clutch at 90% with bite 0.4: {}",
             out.clutch
         );
+    }
+
+    #[test]
+    fn brake_saturation_rescales_travel_and_clamps_in_sanitize() {
+        use super::{ModuleTuning, apply_saturation};
+        // Saturation 1.0 is the identity; 0.5 doubles the travel.
+        assert!(approx(apply_saturation(0.3, 1.0), 0.3));
+        assert!(approx(apply_saturation(1.0, 1.0), 1.0));
+        assert!(approx(apply_saturation(0.25, 0.5), 0.5));
+        assert!(approx(apply_saturation(0.5, 0.5), 1.0));
+        assert!(approx(apply_saturation(0.75, 0.5), 1.0));
+        // Insane inputs clamp, never amplify or divide by zero.
+        assert!(approx(apply_saturation(0.3, 0.0), 0.6));
+        assert!(approx(apply_saturation(0.3, 2.0), 0.3));
+        assert!(approx(apply_saturation(2.0, 0.5), 1.0));
+        assert!(approx(apply_saturation(0.3, f32::NAN), 0.3));
+        // sanitize() clamps to 0.5..=1.0 (NaN → 1.0).
+        let tuning = ModuleTuning {
+            saturation: 0.2,
+            ..ModuleTuning::default()
+        };
+        assert!(approx(tuning.sanitized().saturation, 0.5));
+        let tuning = ModuleTuning {
+            saturation: f32::NAN,
+            ..ModuleTuning::default()
+        };
+        assert!(approx(tuning.sanitized().saturation, 1.0));
+        // Through the pipeline: brake at 25% travel (1050 mV in the
+        // 300..3300 default range) with saturation 0.5 reads 50%;
+        // at 50% travel it reads full brake. Calibration is
+        // untouched — only the mapped travel is rescaled.
+        let mut plan = plain_plan();
+        plan.brake.saturation = 0.5;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[(2, 1050)], &[], 0));
+        assert!(
+            approx(out.brake, 0.5),
+            "brake at 25% with BRF 50%: {}",
+            out.brake
+        );
+        let out = pipe.process(&frame(&[(2, 1800)], &[], 0));
+        assert!(
+            approx(out.brake, 1.0),
+            "brake at 50% with BRF 50%: {}",
+            out.brake
+        );
+        // Default plan: saturation 1.0 — no behaviour change.
+        let mut pipe = ProcessingPipeline::new(plain_plan());
+        let out = pipe.process(&frame(&[(2, 1050)], &[], 0));
+        assert!(approx(out.brake, 0.25));
     }
 
     #[test]

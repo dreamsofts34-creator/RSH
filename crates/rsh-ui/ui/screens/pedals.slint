@@ -120,6 +120,13 @@ component PedalCard inherits Card {
     in property <bool> show-bite;
     in property <float> bite; // 0..1
     in property <string> bite-text;
+    // --- Brake per-module tuning ---
+    // B1 brake force: shown on the brake card only. `force` is the
+    // saturation fraction itself (0.5..1.0 = 50–100% travel for full
+    // brake), so the thumb sits at 50–100% of the track.
+    in property <bool> show-force;
+    in property <float> force; // 0.5..1.0
+    in property <string> force-text;
     in property <string> curve-commands;
     in property <string> dashed-commands;
     in property <bool> show-dashed;
@@ -142,6 +149,9 @@ component PedalCard inherits Card {
     callback deadzone-edited(string);
     callback bite-changed(float);
     callback bite-edited(string);
+    // --- Brake per-module tuning ---
+    callback force-changed(float);
+    callback force-edited(string);
 
     VerticalLayout {
         padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
@@ -222,6 +232,10 @@ component PedalCard inherits Card {
             FeelChip { horizontal-stretch: 1; label: "Soft"; active: feel == 1; clicked => { feel-selected(1); } }
             FeelChip { horizontal-stretch: 1; label: "Sharp"; active: feel == 2; clicked => { feel-selected(2); } }
         }
+        // --- Brake per-module tuning ---
+        // B1 brake force first (the headline brake control), then
+        // the bite point (B2), then the shared deadzone.
+        if show-force : SliderRow { label: "Brake force"; hint: "Travel for full brake"; value-text: force-text; value: force; changed(v) => { force-changed(v); } value-edited(t) => { force-edited(t); } }
         if show-bite : SliderRow { label: "Bite point"; hint: "Where the grip starts"; value-text: bite-text; value: bite; changed(v) => { bite-changed(v); } value-edited(t) => { bite-edited(t); } }
         SliderRow { label: "Deadzone"; hint: "Ignores small inputs"; value-text: deadzone-text; value: deadzone; changed(v) => { deadzone-changed(v); } value-edited(t) => { deadzone-edited(t); } }
         // R2-16: Advanced only — the live raw ADC reading (~1 Hz).
@@ -267,6 +281,12 @@ export component PedalsPage inherits VerticalLayout {
     in property <string> brake-dashed;
     in property <float> brake-marker-x;
     in property <float> brake-marker-y;
+    // --- Brake per-module tuning ---
+    // B2 brake bite (0..1 of 50%) + B1 brake force (0.5..1.0).
+    in property <float> brake-bite;
+    in property <string> brake-bite-text;
+    in property <float> brake-force;
+    in property <string> brake-force-text;
     // clutch
     in property <float> clutch-pct;
     in property <string> clutch-up-mv;
@@ -293,6 +313,11 @@ export component PedalsPage inherits VerticalLayout {
     callback deadzone-edited(int, string); // (pedal, typed value)
     callback bite-changed(float);
     callback bite-edited(string);
+    // --- Brake per-module tuning ---
+    callback brake-bite-changed(float); // 0..1 of 50%
+    callback brake-bite-edited(string); // typed percent, 0–50%
+    callback brake-force-changed(float); // 0.5..1.0 saturation
+    callback brake-force-edited(string); // typed percent, 50–100%
 
     // Phase 2 (F-5): the page scrolls (Settings pattern) — the
     // clutch card clipped ~11 px Basic / ~30–38 px Advanced.
@@ -327,12 +352,15 @@ export component PedalsPage inherits VerticalLayout {
             deadzone: throttle-deadzone;
             deadzone-text: throttle-deadzone-text;
             show-bite: false;
+            show-force: false;
             advanced: advanced;
             raw-mv: throttle-raw-mv;
             set-disabled: set-disabled;
             busy-kind: busy-kind;
             bite: 0;
             bite-text: "";
+            force: 1;
+            force-text: "";
             curve-commands: throttle-curve;
             dashed-commands: throttle-dashed;
             show-dashed: true;
@@ -360,13 +388,18 @@ export component PedalsPage inherits VerticalLayout {
             show-chips: true;
             deadzone: brake-deadzone;
             deadzone-text: brake-deadzone-text;
-            show-bite: false;
+            // --- Brake per-module tuning ---
+            // B2 bite (0..1 of 50%) + B1 brake force (0.5..1.0).
+            show-bite: true;
+            show-force: true;
             advanced: advanced;
             raw-mv: brake-raw-mv;
             set-disabled: set-disabled;
             busy-kind: busy-kind;
-            bite: 0;
-            bite-text: "";
+            bite: brake-bite;
+            bite-text: brake-bite-text;
+            force: brake-force;
+            force-text: brake-force-text;
             curve-commands: brake-curve;
             dashed-commands: brake-dashed;
             show-dashed: true;
@@ -377,8 +410,11 @@ export component PedalsPage inherits VerticalLayout {
             feel-selected(f) => { feel-selected(1, f); }
             deadzone-changed(v) => { deadzone-changed(1, v); }
             deadzone-edited(t) => { deadzone-edited(1, t); }
-            bite-changed(v) => { bite-changed(v); }
-            bite-edited(t) => { bite-edited(t); }
+            // --- Brake per-module tuning ---
+            bite-changed(v) => { brake-bite-changed(v); }
+            bite-edited(t) => { brake-bite-edited(t); }
+            force-changed(v) => { brake-force-changed(v); }
+            force-edited(t) => { brake-force-edited(t); }
         }
         // Responsive gap (R-4): min-width 12px, stretch 0.05.
         Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
@@ -395,12 +431,15 @@ export component PedalsPage inherits VerticalLayout {
             deadzone: clutch-deadzone;
             deadzone-text: clutch-deadzone-text;
             show-bite: true;
+            show-force: false;
             advanced: advanced;
             raw-mv: clutch-raw-mv;
             set-disabled: set-disabled;
             busy-kind: busy-kind;
             bite: clutch-bite;
             bite-text: clutch-bite-text;
+            force: 1;
+            force-text: "";
             curve-commands: clutch-curve;
             dashed-commands: clutch-dashed;
             show-dashed: false;
