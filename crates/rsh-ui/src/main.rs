@@ -14,8 +14,8 @@
 //! it is not running) and swaps live data in without restarting.
 //! Steering slider moves push live to the daemon through
 //! [`AppApi::set_tuning`] (L4): the cached stored record supplies
-//! min/max mV + smoothing, the sliders supply deadzone/curve, and
-//! Save persists the draft via [`AppApi::save_draft`].
+//! min/max mV, the sliders supply deadzone/curve/smoothing/invert/
+//! lock, and Save persists the draft via [`AppApi::save_draft`].
 //!
 //! Honesty rule (UI-FINISH acceptance): shipped UI shows no
 //! simulated or hardcoded live-looking value. No daemon means
@@ -64,6 +64,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rsh_api::connection::ConnectionState;
+use rsh_api::tuning::snap_steering_lock_deg;
 use rsh_api::{
     app_version, ApiTransport, AppApi, AppEvent, CalibrationInfo, ConnectionError, ConnectionInfo,
     FirmwareCheck, FirmwareUpdateStatus, GameSummary, LedPattern, ProfileSummary, ShifterGate,
@@ -434,13 +435,21 @@ impl PedalCache {
 /// the sliders edit local state and mark the profile unsaved; pushing
 /// the values into the engine lands in Phase 4.
 struct Tuning {
-    /// Centre deadzone, percent (0..10).
+    /// Centre deadzone, percent (0..30 — Bug 7: the Basic cap was
+    /// 10%, the core contract allows 30%).
     deadzone_pct: f32,
     /// Response-curve exponent (1.0..2.0 — A24: the core contract
     /// caps the curve at 2.0, so the UI slider runs to 2.0 too).
     exponent: f32,
     /// 0 soft, 1 balanced, 2 sharp, 3 custom.
     preset: i32,
+    /// Smoothing, percent (0..100 — Bug 7 Advanced slider).
+    smoothing_pct: f32,
+    /// Invert steering (Bug 7 Advanced toggle, default off).
+    invert: bool,
+    /// Steering lock in degrees (Bug 7 Advanced slider: one of the
+    /// 270/360/540/720/900° steps, default 900°).
+    lock_deg: f32,
 }
 
 impl Tuning {
@@ -452,7 +461,7 @@ impl Tuning {
     /// first, so no truncation can occur in practice.
     #[allow(clippy::cast_possible_truncation)]
     fn from_settings(settings: &TuningSettings) -> Self {
-        let deadzone_pct = settings.deadzone.clamp(0.0, 10.0) as f32;
+        let deadzone_pct = settings.deadzone.clamp(0.0, 30.0) as f32;
         let exponent = settings.curve.clamp(1.0, 2.0) as f32;
         let preset = match (deadzone_pct, exponent) {
             (3.0, 1.0) => 0,
@@ -464,29 +473,53 @@ impl Tuning {
             deadzone_pct,
             exponent,
             preset,
+            smoothing_pct: settings.smoothing.clamp(0.0, 100.0) as f32,
+            invert: settings.invert.unwrap_or(false),
+            lock_deg: snap_steering_lock_deg(settings.steering_lock_deg.unwrap_or(900.0)) as f32,
         }
     }
 
     /// Build the daemon record to push (L4): the cached stored
-    /// record supplies min/max mV, smoothing and the extension
-    /// fields; the sliders supply deadzone/curve. The core contract
-    /// caps the curve at 2.0 (A24) — the slider range matches, so
-    /// the clamp here is only a guard.
+    /// record supplies min/max mV and the extension fields; the
+    /// sliders supply deadzone/curve/smoothing/invert/lock. The core
+    /// contract caps the curve at 2.0 (A24) — the slider range
+    /// matches, so the clamp here is only a guard.
     fn to_settings(&self, base: &TuningSettings) -> TuningSettings {
         TuningSettings {
             module: "steering".to_string(),
             deadzone: f64::from(self.deadzone_pct),
             curve: f64::from(self.exponent).clamp(0.5, 2.0),
+            smoothing: f64::from(self.smoothing_pct),
+            invert: Some(self.invert),
+            steering_lock_deg: Some(f64::from(self.lock_deg)),
             ..base.clone()
         }
     }
 
     fn set_deadzone(&mut self, pct: f32) {
-        self.deadzone_pct = pct.clamp(0.0, 10.0);
+        self.deadzone_pct = pct.clamp(0.0, 30.0);
     }
 
     fn set_exponent(&mut self, exp: f32) {
         self.exponent = exp.clamp(1.0, 2.0);
+    }
+
+    /// Smoothing in percent (0..100).
+    fn set_smoothing(&mut self, pct: f32) {
+        self.smoothing_pct = pct.clamp(0.0, 100.0);
+    }
+
+    /// Invert steering on/off.
+    fn set_invert(&mut self, invert: bool) {
+        self.invert = invert;
+    }
+
+    /// Steering lock in degrees, snapped to the nearest step
+    /// (270/360/540/720/900°). The snap lands on a whole step, so
+    /// the `f64` → `f32` cast loses nothing in practice.
+    #[allow(clippy::cast_possible_truncation)]
+    fn set_lock_deg(&mut self, deg: f32) {
+        self.lock_deg = snap_steering_lock_deg(f64::from(deg)) as f32;
     }
 
     /// Apply a preset (0 soft, 1 balanced, 2 sharp; 3 custom keeps values).
@@ -511,6 +544,11 @@ impl Tuning {
 
     fn reset_defaults(&mut self) {
         self.set_preset(1);
+        // Bug 7: Reset restores the whole steering tuning, not just
+        // the Basic feel — smoothing 30%, not inverted, full lock.
+        self.smoothing_pct = 30.0;
+        self.invert = false;
+        self.lock_deg = 900.0;
     }
 }
 
@@ -1377,6 +1415,8 @@ struct FrameCmdCache {
     steer_text: Option<(f32, SharedString)>,
     deadzone_text: Option<(f32, SharedString)>,
     curve_text: Option<(f32, SharedString)>,
+    lock_text: Option<(f32, SharedString)>,
+    smoothing_text: Option<(f32, SharedString)>,
     conn_label: Option<(bool, bool, bool, String, SharedString)>,
     conn_sub: Option<(bool, bool, String, String, SharedString)>,
     gear_text: Option<(u8, SharedString)>,
@@ -1443,6 +1483,32 @@ impl FrameCmdCache {
         }
         let built: SharedString = format!("{exponent:.2}").into();
         self.curve_text = Some((exponent, built.clone()));
+        built
+    }
+
+    /// Steering lock text (`"540°"`), rebuilt only when it moved.
+    #[allow(clippy::float_cmp)]
+    fn lock_text(&mut self, lock_deg: f32) -> SharedString {
+        if let Some((deg, cached)) = &self.lock_text {
+            if *deg == lock_deg {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = format!("{lock_deg:.0}°").into();
+        self.lock_text = Some((lock_deg, built.clone()));
+        built
+    }
+
+    /// Smoothing percent text, rebuilt only when it moved.
+    #[allow(clippy::float_cmp)]
+    fn smoothing_text(&mut self, smoothing_pct: f32) -> SharedString {
+        if let Some((pct, cached)) = &self.smoothing_text {
+            if *pct == smoothing_pct {
+                return cached.clone();
+            }
+        }
+        let built: SharedString = format!("{smoothing_pct:.0}%").into();
+        self.smoothing_text = Some((smoothing_pct, built.clone()));
         built
     }
 
@@ -1886,7 +1952,7 @@ struct Ctx {
 struct FrameInputs {
     conn: ConnectionInfo,
     snap: SnapshotInfo,
-    tuning: (f32, f32, i32),
+    tuning: (f32, f32, i32, f32, bool, f32),
     pedals: PedalCache,
     handbrake: TuningSettings,
     unsaved: bool,
@@ -2014,30 +2080,15 @@ impl Ctx {
     }
 
     /// Push the Advanced-mode readouts (R2-16, REDESIGN-PLAN
-    /// §7.2): steering centre mV from the captured calibration,
-    /// plus the live raw mV per axis from the slow-cache
+    /// §7.2): the live raw mV per pedal axis from the slow-cache
     /// `raw_mv()` (~1 Hz). "—" until measured — never a fake 0.
-    /// Called from the 1 Hz re-sync, the 5 s tick, and startup —
-    /// the same points the calibration refreshes at.
+    /// Steering has no raw readout any more (Bug 7: the Advanced
+    /// card is tuning, not readouts). Called from the 1 Hz re-sync,
+    /// the 5 s tick, and startup.
     fn sync_advanced(&self, win: &MainWindow) {
-        let centre_mv = self
-            .calibration
-            .borrow()
-            .as_ref()
-            .map(|c| c.steering_center_mv);
-        set_if_changed(
-            win.get_steer_centre_mv_text(),
-            centre_mv.map_or_else(|| "—".to_string(), mv_text).into(),
-            |v| win.set_steer_centre_mv_text(v),
-        );
         let raw = self.api().raw_mv().ok();
         let raw_text =
             |slot: Option<u16>| slot.map_or_else(|| "—".to_string(), |mv| mv_text(f64::from(mv)));
-        set_if_changed(
-            win.get_steer_raw_mv_text(),
-            raw_text(raw.and_then(|r| r.steering_mv)).into(),
-            |v| win.set_steer_raw_mv_text(v),
-        );
         set_if_changed(
             win.get_throttle_raw_mv_text(),
             raw_text(raw.and_then(|r| r.accel_mv)).into(),
@@ -2189,7 +2240,14 @@ impl Ctx {
             snap: snap.clone(),
             tuning: {
                 let tuning = self.tuning.borrow();
-                (tuning.deadzone_pct, tuning.exponent, tuning.preset)
+                (
+                    tuning.deadzone_pct,
+                    tuning.exponent,
+                    tuning.preset,
+                    tuning.smoothing_pct,
+                    tuning.invert,
+                    tuning.lock_deg,
+                )
             },
             pedals: self.pedals.borrow().clone(),
             handbrake: self.handbrake_record.borrow().clone(),
@@ -2370,7 +2428,7 @@ impl Ctx {
             self.curve_commands_cached(deadzone, exponent),
             |v| win.set_curve_commands(v),
         );
-        set_if_changed(win.get_deadzone(), deadzone / 10.0, |v| win.set_deadzone(v));
+        set_if_changed(win.get_deadzone(), deadzone / 30.0, |v| win.set_deadzone(v));
         set_if_changed(
             win.get_deadzone_text(),
             self.frame_cmds.borrow_mut().deadzone_text(deadzone),
@@ -2391,6 +2449,36 @@ impl Ctx {
         set_if_changed(win.get_preset(), self.tuning.borrow().preset, |v| {
             win.set_preset(v);
         });
+        // Bug 7: Advanced controls — invert, lock (fraction of the
+        // 270–900° range), smoothing — sync from the same local
+        // tuning state the Basic sliders use.
+        set_if_changed(win.get_steer_invert(), self.tuning.borrow().invert, |v| {
+            win.set_steer_invert(v);
+        });
+        set_if_changed(
+            win.get_steer_lock(),
+            (self.tuning.borrow().lock_deg - 270.0) / 630.0,
+            |v| win.set_steer_lock(v),
+        );
+        set_if_changed(
+            win.get_steer_lock_text(),
+            self.frame_cmds
+                .borrow_mut()
+                .lock_text(self.tuning.borrow().lock_deg),
+            |v| win.set_steer_lock_text(v),
+        );
+        set_if_changed(
+            win.get_steer_smoothing(),
+            self.tuning.borrow().smoothing_pct / 100.0,
+            |v| win.set_steer_smoothing(v),
+        );
+        set_if_changed(
+            win.get_steer_smoothing_text(),
+            self.frame_cmds
+                .borrow_mut()
+                .smoothing_text(self.tuning.borrow().smoothing_pct),
+            |v| win.set_steer_smoothing_text(v),
+        );
         set_if_changed(win.get_unsaved(), self.unsaved.get(), |v| {
             win.set_unsaved(v);
         });
@@ -8445,7 +8533,7 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
         let win = win.as_weak();
         let ctx = ctx.clone();
         win.unwrap().on_deadzone_changed(move |v| {
-            ctx.tuning.borrow_mut().set_deadzone(v * 10.0);
+            ctx.tuning.borrow_mut().set_deadzone(v * 30.0);
             ctx.tuning.borrow_mut().set_preset(3);
             ctx.push_steering();
             // R2-13: no full `refresh` per move — the 50 ms timer
@@ -8483,6 +8571,62 @@ fn wire_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
             if let Ok(exp) = t.trim().parse::<f32>() {
                 ctx.tuning.borrow_mut().set_exponent(exp);
                 ctx.tuning.borrow_mut().set_preset(3);
+                ctx.push_steering();
+            }
+            // R2-13: no full `refresh` per edit — the 50 ms timer
+            // paints the new local value within one frame.
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_invert_changed(move |b| {
+            ctx.tuning.borrow_mut().set_invert(b);
+            ctx.push_steering();
+            // R2-13: no full `refresh` per move — the 50 ms timer
+            // paints the new local value within one frame.
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_lock_changed(move |v| {
+            // Slider fraction over the 270–900° range, snapped to
+            // the nearest lock step by `set_lock_deg`.
+            ctx.tuning.borrow_mut().set_lock_deg(270.0 + v * 630.0);
+            ctx.push_steering();
+            // R2-13: no full `refresh` per move — the 50 ms timer
+            // paints the new local value within one frame.
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_lock_edited(move |t| {
+            if let Ok(deg) = t.trim().trim_end_matches(['°', ' ']).parse::<f32>() {
+                ctx.tuning.borrow_mut().set_lock_deg(deg);
+                ctx.push_steering();
+            }
+            // R2-13: no full `refresh` per edit — the 50 ms timer
+            // paints the new local value within one frame.
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_smoothing_changed(move |v| {
+            ctx.tuning.borrow_mut().set_smoothing(v * 100.0);
+            ctx.push_steering();
+            // R2-13: no full `refresh` per move — the 50 ms timer
+            // paints the new local value within one frame.
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_smoothing_edited(move |t| {
+            if let Ok(pct) = t.trim().trim_end_matches('%').parse::<f32>() {
+                ctx.tuning.borrow_mut().set_smoothing(pct);
                 ctx.push_steering();
             }
             // R2-13: no full `refresh` per edit — the 50 ms timer
@@ -10367,6 +10511,38 @@ mod tests {
         assert_eq!(back.preset, 2);
     }
 
+    /// Bug 7: the Advanced fields round-trip through the daemon
+    /// record — invert, lock (snapped), smoothing — and
+    /// `reset_defaults` restores all of them, not just the feel.
+    #[test]
+    fn steering_advanced_fields_round_trip_through_settings() {
+        let mut t = Tuning::from_settings(&TuningSettings::neutral("steering"));
+        assert!(!t.invert);
+        assert_eq!(t.lock_deg, 900.0);
+        t.set_invert(true);
+        t.set_lock_deg(500.0);
+        t.set_smoothing(45.0);
+        t.set_deadzone(25.0);
+        let settings = t.to_settings(&TuningSettings::neutral("steering"));
+        assert_eq!(settings.invert, Some(true));
+        assert_eq!(settings.steering_lock_deg, Some(540.0));
+        assert_eq!(settings.smoothing, 45.0);
+        assert_eq!(settings.deadzone, 25.0);
+        let back = Tuning::from_settings(&settings);
+        assert!(back.invert);
+        assert_eq!(back.lock_deg, 540.0);
+        assert_eq!(back.smoothing_pct, 45.0);
+        assert_eq!(back.deadzone_pct, 25.0);
+        // Deadzone clamps at the new 30% cap, not the old 10%.
+        t.set_deadzone(99.0);
+        assert_eq!(t.deadzone_pct, 30.0);
+        t.reset_defaults();
+        assert_eq!(t.preset, 1);
+        assert_eq!(t.smoothing_pct, 30.0);
+        assert!(!t.invert);
+        assert_eq!(t.lock_deg, 900.0);
+    }
+
     #[test]
     fn pedal_curve_linear_is_straight() {
         let cmds = pedal_curve_commands(0.0, 1.0);
@@ -11283,7 +11459,8 @@ mod tests {
         // Stored steering deadzone is 0 (sim neutral); drag it to 9.
         ctx.tuning.borrow_mut().set_deadzone(9.0);
         ctx.refresh(&win, 0);
-        assert_eq!(win.get_deadzone(), 0.9);
+        // Bug 7: the deadzone cap is 30% now, so 9% is 9/30.
+        assert_eq!(win.get_deadzone(), 0.3);
         // A push started 6 s ago (past the 5 s TuningPush timeout)
         // and still pending.
         let due = Instant::now()
@@ -11315,6 +11492,51 @@ mod tests {
         );
         assert_eq!(win.get_deadzone(), 0.0);
         assert_eq!(win.get_toast_title().as_str(), "Saving steering… timed out");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bug 7 (PC-test fix): the Steering Advanced controls sync —
+    /// invert toggle, lock slider (snapped to steps), smoothing
+    /// slider — from callback to local tuning to window props, and
+    /// the deadzone cap is 30% (full-scale drag = 30%).
+    #[test]
+    fn steering_advanced_controls_sync_to_window_and_tuning() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("Bug 7 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        ctx.refresh(&win, 0);
+        // Sim neutral: not inverted, full lock, no smoothing.
+        assert!(!win.get_steer_invert());
+        assert_eq!(win.get_steer_lock(), 1.0);
+        assert_eq!(win.get_steer_lock_text().as_str(), "900°");
+        assert_eq!(win.get_steer_smoothing(), 0.0);
+        // Invert on, lock slider mid-range (585° → snaps to 540°),
+        // smoothing to 30%.
+        win.invoke_invert_changed(true);
+        win.invoke_lock_changed(0.5);
+        win.invoke_smoothing_changed(0.3);
+        assert!(ctx.tuning.borrow().invert);
+        assert_eq!(ctx.tuning.borrow().lock_deg, 540.0);
+        assert_eq!(ctx.tuning.borrow().smoothing_pct, 30.0);
+        ctx.refresh(&win, 0);
+        assert!(win.get_steer_invert());
+        assert!((win.get_steer_lock() - (540.0 - 270.0) / 630.0).abs() < 0.001);
+        assert_eq!(win.get_steer_lock_text().as_str(), "540°");
+        assert_eq!(win.get_steer_smoothing_text().as_str(), "30%");
+        // Text edits parse and snap: "720°" and "45%".
+        win.invoke_lock_edited("720°".into());
+        assert_eq!(ctx.tuning.borrow().lock_deg, 720.0);
+        win.invoke_smoothing_edited("45%".into());
+        assert_eq!(ctx.tuning.borrow().smoothing_pct, 45.0);
+        // Deadzone cap is 30: a full-scale drag is 30%.
+        win.invoke_deadzone_changed(1.0);
+        assert_eq!(ctx.tuning.borrow().deadzone_pct, 30.0);
+        ctx.refresh(&win, 0);
+        assert_eq!(win.get_deadzone(), 1.0);
+        assert_eq!(win.get_deadzone_text().as_str(), "30%");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

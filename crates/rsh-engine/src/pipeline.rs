@@ -1048,6 +1048,53 @@ mod tests {
     }
 
     #[test]
+    fn steering_invert_flips_sign_and_lock_scales_output() {
+        // Bug 7: invert flips the mapped value; the lock scale
+        // (lock/900) divides it — 900° → 1.0, 450° → 0.5, 270° → 0.3.
+        let mut plan = plain_plan();
+        plan.steering.invert = true;
+        let mut pipe = ProcessingPipeline::new(plan);
+        // mv 2550 -> +0.5 -> inverted -0.5; mv 1050 -> -0.5 -> +0.5.
+        let out = pipe.process(&frame(&[(0, 2550)], &[], 0));
+        assert!(approx(out.steering, -0.5));
+        let out = pipe.process(&frame(&[(0, 1050)], &[], 0));
+        assert!(approx(out.steering, 0.5));
+
+        // Lock mapping through the pipeline: normalised 0.4
+        // (mv 2400) at full lock stays 0.4, at 450° doubles to 0.8,
+        // at 270° clamps at full lock.
+        for (scale, expected) in [(1.0, 0.4), (0.5, 0.8), (0.3, 1.0)] {
+            let mut plan = plain_plan();
+            plan.steering.scale = scale;
+            let mut pipe = ProcessingPipeline::new(plan);
+            let out = pipe.process(&frame(&[(0, 2400)], &[], 0));
+            assert!(approx(out.steering, expected), "scale {scale}");
+        }
+    }
+
+    #[test]
+    fn steering_smoothing_and_scale_are_clamped_by_sanitize() {
+        // Bug 7: smoothing is a 0..=1 range — out-of-range input
+        // never reaches the filter; same for the lock scale.
+        let tuning = super::ModuleTuning {
+            smoothing: 1.5,
+            scale: 0.1,
+            ..super::ModuleTuning::default()
+        };
+        let clean = tuning.sanitized();
+        assert_eq!(clean.smoothing, 1.0);
+        assert_eq!(clean.scale, 0.2);
+        let tuning = super::ModuleTuning {
+            smoothing: f32::NAN,
+            scale: f32::NAN,
+            ..super::ModuleTuning::default()
+        };
+        let clean = tuning.sanitized();
+        assert_eq!(clean.smoothing, 0.3);
+        assert_eq!(clean.scale, 1.0);
+    }
+
+    #[test]
     fn golden_pedal_midpoint_and_curve() {
         assert!(approx(map_pedal_mv(1800, 300, 3300), 0.5));
         assert!(approx(map_pedal_mv(300, 300, 3300), 0.0));

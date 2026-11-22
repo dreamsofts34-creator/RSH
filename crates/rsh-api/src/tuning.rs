@@ -11,9 +11,47 @@
 //! Units are the tuning screen's units, not the C# profile's:
 //! `deadzone` is percent (0–30), `curve` is the response exponent
 //! (0.5–2.0, 1.0 = linear), `min_mv`/`max_mv` are millivolts (span
-//! must stay ≥ 660 mV), `smoothing` is percent (0–100).
+//! must stay ≥ 660 mV), `smoothing` is percent (0–100), `invert`
+//! flips the steering direction, and `steering_lock_deg` is the
+//! steering lock in degrees (one of [`STEERING_LOCK_STEPS_DEG`]).
 
 use serde::{Deserialize, Serialize};
+
+/// Steering lock steps in degrees (Bug 7, PC-test fix plan):
+/// 270° is the tightest usable lock — below that the wheel gets
+/// twitchy — and 900° is full lock.
+pub const STEERING_LOCK_STEPS_DEG: [f64; 5] = [270.0, 360.0, 540.0, 720.0, 900.0];
+
+/// Default steering lock in degrees (full lock).
+pub const DEFAULT_STEERING_LOCK_DEG: f64 = 900.0;
+
+/// Snap a steering lock in degrees to the nearest
+/// [`STEERING_LOCK_STEPS_DEG`] step (non-finite → full lock).
+#[must_use]
+pub fn snap_steering_lock_deg(deg: f64) -> f64 {
+    if !deg.is_finite() {
+        return DEFAULT_STEERING_LOCK_DEG;
+    }
+    let mut best = DEFAULT_STEERING_LOCK_DEG;
+    let mut best_dist = f64::INFINITY;
+    for step in STEERING_LOCK_STEPS_DEG {
+        let dist = (deg - step).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best = step;
+        }
+    }
+    best
+}
+
+/// Map a steering lock in degrees to the engine `scale`
+/// (`lock / 900`, clamped `0.2..=1.0`): 900° → 1.0, 540° → 0.6,
+/// 270° → 0.3. The lock is snapped first, so any input lands on a
+/// real step.
+#[must_use]
+pub fn steering_lock_deg_to_scale(deg: f64) -> f64 {
+    (snap_steering_lock_deg(deg) / DEFAULT_STEERING_LOCK_DEG).clamp(0.2, 1.0)
+}
 
 /// Shifter gate type (tuning extension; the C# `ShifterGateMode`
 /// string kept as a typed enum here).
@@ -114,6 +152,14 @@ pub struct TuningSettings {
     pub max_mv: f64,
     /// Smoothing in percent, 0–100 (One Euro factor).
     pub smoothing: f64,
+    /// Invert the steering direction (steering module only;
+    /// `None` = not applicable — other modules never carry it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invert: Option<bool>,
+    /// Steering lock in degrees (steering module only; one of
+    /// [`STEERING_LOCK_STEPS_DEG`]; `None` = not applicable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steering_lock_deg: Option<f64>,
     /// Pedal bite point, 0..1 (clutch / brake only; `None` elsewhere).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bite_point: Option<f64>,
@@ -154,6 +200,8 @@ impl TuningSettings {
             min_mv: 0.0,
             max_mv: 3300.0,
             smoothing: 0.0,
+            invert: None,
+            steering_lock_deg: None,
             bite_point: None,
             shifter_gate: None,
             horn_button: None,
@@ -203,6 +251,13 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
             tuning.smoothing
         ));
     }
+    if let Some(lock_deg) = tuning.steering_lock_deg
+        && !STEERING_LOCK_STEPS_DEG.contains(&lock_deg)
+    {
+        errors.push(format!(
+            "steering_lock_deg {lock_deg} is not one of {STEERING_LOCK_STEPS_DEG:?}"
+        ));
+    }
     if let Some(bite) = tuning.bite_point
         && !(0.0..=1.0).contains(&bite)
     {
@@ -244,6 +299,43 @@ mod tests {
 
     fn tuning(module: &str) -> TuningSettings {
         TuningSettings::neutral(module)
+    }
+
+    #[test]
+    fn steering_lock_snaps_to_steps_and_maps_to_scale() {
+        // Bug 7: lock steps 270/360/540/720/900°; scale = lock/900.
+        assert_eq!(snap_steering_lock_deg(900.0), 900.0);
+        assert_eq!(snap_steering_lock_deg(500.0), 540.0);
+        assert_eq!(snap_steering_lock_deg(200.0), 270.0);
+        assert_eq!(snap_steering_lock_deg(1000.0), 900.0);
+        assert_eq!(snap_steering_lock_deg(f64::NAN), 900.0);
+        assert_eq!(steering_lock_deg_to_scale(900.0), 1.0);
+        assert_eq!(steering_lock_deg_to_scale(360.0), 0.4);
+        assert!((steering_lock_deg_to_scale(540.0) - 0.6).abs() < f64::EPSILON);
+        assert!((steering_lock_deg_to_scale(270.0) - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn steering_invert_and_lock_round_trip_and_validate() {
+        let mut settings = tuning("steering");
+        settings.invert = Some(true);
+        settings.steering_lock_deg = Some(540.0);
+        assert_eq!(validate_tuning(&settings), Vec::<String>::new());
+        let json = serde_json::to_string(&settings).expect("serialize");
+        assert!(json.contains("\"invert\":true"), "{json}");
+        assert!(json.contains("\"steeringLockDeg\":540.0"), "{json}");
+        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, settings);
+        // Other modules never carry them: omitted from the JSON.
+        let json = serde_json::to_string(&tuning("brake")).expect("serialize");
+        assert!(!json.contains("invert"), "{json}");
+        assert!(!json.contains("steeringLockDeg"), "{json}");
+        // An off-step lock is rejected, never silently snapped here.
+        let mut bad = tuning("steering");
+        bad.steering_lock_deg = Some(450.0);
+        let errors = validate_tuning(&bad);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].contains("steering_lock_deg"), "{}", errors[0]);
     }
 
     #[test]

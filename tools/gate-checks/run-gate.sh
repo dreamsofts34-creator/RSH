@@ -18,8 +18,9 @@
 #      gate-* contract checks; CI's `rig-gate` job runs the FULL
 #      quick suite (all registry scenarios) — see --rig-quick
 #      below. A green default gate does NOT reproduce CI.
-#   5. rsh-gate-ui (11 headless UI checks: slider/wizard/theme/tray/banner
-#      pixels + Extras card size / OFF no-input / responsive gaps)
+#   5. rsh-gate-ui (18 headless UI checks: slider/wizard/theme/tray/banner
+#      pixels + Extras card size / OFF no-input / responsive gaps
+#      + steering Advanced controls)
 #   6. windows-check: cargo check --workspace --exclude rsh-app
 #      --target x86_64-pc-windows-msvc (check-only, no linking) —
 #      Windows-only #[cfg(windows)] code never compiles on this
