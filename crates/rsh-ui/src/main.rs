@@ -860,6 +860,11 @@ enum FieldKind {
     EncoderPulseMs,
     /// Encoder acceleration sensitivity, 0..2 (E3).
     EncoderAccelSens,
+    // --- Buttons per-module tuning ---
+    /// Button debounce in ms, 0..50 (BU1).
+    ButtonDebounceMs,
+    /// Long-press threshold in ms, 300..1500 (BU2).
+    ButtonLongPressMs,
 }
 
 /// A slider drag's latest value, waiting out its debounce (M-7):
@@ -1772,6 +1777,11 @@ struct Ctx {
     /// choice not yet saved (None = the tile's stored action).
     button_actions: Rc<RefCell<Vec<String>>>,
     pending_action: Rc<RefCell<Option<String>>>,
+    /// 12 wheel-button long-press display actions (BU2) + the
+    /// pending chip choice not yet saved (None = the tile's stored
+    /// long-press action, "Not set" = none).
+    long_press_actions: Rc<RefCell<Vec<String>>>,
+    pending_long_action: Rc<RefCell<Option<String>>>,
     selected_button: Rc<Cell<i32>>,
     /// Edit-panel mirror of the Buttons page state (Rust tracks it
     /// from the tile/knob callbacks): 0 button, 1 knob.
@@ -2956,6 +2966,13 @@ impl Ctx {
                     }
                     FieldKind::EncoderAccelSens => {
                         record.encoder_accel_sensitivity = Some(value.clamp(0.0, 2.0));
+                    }
+                    // --- Buttons per-module tuning ---
+                    FieldKind::ButtonDebounceMs => {
+                        record.button_debounce_ms = Some(value.clamp(0.0, 50.0));
+                    }
+                    FieldKind::ButtonLongPressMs => {
+                        record.button_long_press_ms = Some(value.clamp(300.0, 1500.0));
                     }
                 }
                 JobResult::Tuning(api.set_tuning(&record))
@@ -4397,6 +4414,8 @@ impl Ctx {
     /// B1 wiring): button 1–12 ← stored action, unbound ← the
     /// display default. Runs on (re)connect — at startup the sim has
     /// no bindings, so the defaults stand until the daemon answers.
+    /// The long-press actions (BU2) seed the same way, from
+    /// `list_long_press_bindings` ("Not set" = none).
     fn load_bindings(&self, win: &MainWindow) {
         let mut actions: Vec<String> = DEFAULT_BUTTON_ACTIONS
             .iter()
@@ -4418,6 +4437,17 @@ impl Ctx {
         let idx = usize::try_from(self.selected_button.get()).unwrap_or(0);
         if let Some(action) = actions.get(idx) {
             win.set_selected_action(action.clone().into());
+        }
+        let mut long_actions: Vec<String> = vec!["Not set".to_string(); 12];
+        for binding in self.api().list_long_press_bindings() {
+            let idx = usize::from(binding.button.saturating_sub(1));
+            if idx < long_actions.len() {
+                long_actions[idx] = action_display(&binding.action).to_string();
+            }
+        }
+        (*self.long_press_actions.borrow_mut()).clone_from(&long_actions);
+        if let Some(action) = long_actions.get(idx) {
+            win.set_selected_long_action(action.clone().into());
         }
     }
 
@@ -5112,6 +5142,16 @@ impl Ctx {
                                     effective.encoder_accel_sensitivity =
                                         local.encoder_accel_sensitivity;
                                 }
+                                // --- Buttons per-module tuning ---
+                                // Same as the encoder fields above: a
+                                // buttons drag never reaches the pedal
+                                // arm, but the match must cover them.
+                                FieldKind::ButtonDebounceMs => {
+                                    effective.button_debounce_ms = local.button_debounce_ms;
+                                }
+                                FieldKind::ButtonLongPressMs => {
+                                    effective.button_long_press_ms = local.button_long_press_ms;
+                                }
                             }
                         }
                     }
@@ -5147,6 +5187,10 @@ impl Ctx {
             }
             "encoders" => {
                 Self::sync_encoder_props(win, stored);
+            }
+            // --- Buttons per-module tuning ---
+            "buttons" => {
+                Self::sync_button_props(win, stored);
             }
             // Shifter / horn have no per-module writer — the slow
             // re-sync owns their props (as before).
@@ -5662,6 +5706,46 @@ impl Ctx {
         Self::sync_encoder_props(win, &record);
     }
 
+    /// Write the Buttons page's button tuning props from a record
+    /// (BU1/BU2, R2-10): debounce slider + text, long-press
+    /// threshold slider + text. All writes are change-guarded,
+    /// like `push_frame`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn sync_button_props(win: &MainWindow, buttons: &TuningSettings) {
+        let debounce_ms = buttons.button_debounce_ms.unwrap_or(10.0);
+        set_if_changed(win.get_btn_debounce_ms(), debounce_ms as f32, |v| {
+            win.set_btn_debounce_ms(v);
+        });
+        set_if_changed(
+            win.get_btn_debounce_text(),
+            format!("{debounce_ms:.0} ms").into(),
+            |v| win.set_btn_debounce_text(v),
+        );
+        let long_press_ms = buttons.button_long_press_ms.unwrap_or(800.0);
+        set_if_changed(win.get_btn_longpress_ms(), long_press_ms as f32, |v| {
+            win.set_btn_longpress_ms(v);
+        });
+        set_if_changed(
+            win.get_btn_longpress_text(),
+            format!("{long_press_ms:.0} ms").into(),
+            |v| win.set_btn_longpress_text(v),
+        );
+    }
+
+    /// Echo a button tuning slider drag locally (R2-10): same
+    /// pattern as [`Self::apply_encoder_local`]. Both slider values
+    /// are passed in (the moving one fresh, the other from the
+    /// window), so a drag never clobbers the other slider's value.
+    fn apply_button_local(win: &MainWindow, debounce_ms: f64, long_press_ms: f64) {
+        let record = TuningSettings {
+            module: "buttons".to_string(),
+            button_debounce_ms: Some(debounce_ms),
+            button_long_press_ms: Some(long_press_ms),
+            ..TuningSettings::neutral("buttons")
+        };
+        Self::sync_button_props(win, &record);
+    }
+
     /// Echo a handbrake deadzone drag locally (R2-10): same pattern
     /// as [`Self::apply_pedal_deadzone_local`].
     fn apply_handbrake_deadzone_local(&self, win: &MainWindow, deadzone: f64) {
@@ -5866,6 +5950,12 @@ impl Ctx {
         if !self.field_push_pending_for("encoders") {
             let enc = api.get_tuning("encoders");
             Self::sync_encoder_props(win, &enc);
+        }
+        // BU1/BU2: the Buttons page's button tuning rides the same
+        // slow re-sync, with the same pending-drag guard.
+        if !self.field_push_pending_for("buttons") {
+            let buttons = api.get_tuning("buttons");
+            Self::sync_button_props(win, &buttons);
         }
     }
 
@@ -8672,6 +8762,7 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
             };
             ctx.selected_button.set(i);
             *ctx.pending_action.borrow_mut() = None;
+            *ctx.pending_long_action.borrow_mut() = None;
             let idx = usize::try_from(i).unwrap_or(0);
             let action = ctx
                 .button_actions
@@ -8679,8 +8770,15 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                 .get(idx)
                 .cloned()
                 .unwrap_or_else(|| "Not set".to_string());
+            let long_action = ctx
+                .long_press_actions
+                .borrow()
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| "Not set".to_string());
             w.set_selected_index(i);
             w.set_selected_action(action.into());
+            w.set_selected_long_action(long_action.into());
         });
     }
     {
@@ -8729,6 +8827,24 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                 *ctx.pending_action.borrow_mut() = Some(action.clone());
                 w.set_selected_action(action.into());
             }
+            ctx.unsaved.set(true);
+            ctx.refresh(&w, 0);
+        });
+    }
+    // BU2: a long-press chip updates the pending long-press mapping
+    // for the selected tile (visible at once, same pattern as the
+    // normal action chip above — button edits only, knobs have no
+    // long-press action).
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_long_action_chip(move |a| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let action = a.to_string();
+            *ctx.pending_long_action.borrow_mut() = Some(action.clone());
+            w.set_selected_long_action(action.into());
             ctx.unsaved.set(true);
             ctx.refresh(&w, 0);
         });
@@ -8794,24 +8910,60 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                 );
                 return;
             }
-            // Button edit: persist the pending chip choice (H-3) —
-            // "Not set" clears the binding, any other chip sets it.
-            // The tile refreshes from the daemon immediately after.
-            // F6: `set_binding` / `clear_binding` run on a
-            // BindingOp job thread.
-            if let Some(action) = ctx.pending_action.borrow().clone() {
+            // Button edit: persist the pending chip choices (H-3 +
+            // BU2) — "Not set" clears the binding, any other chip
+            // sets it; the long-press chip does the same for the
+            // long-press action. Both save in one BindingOp job so
+            // the tile never shows a half-saved pair. The tile
+            // refreshes from the daemon immediately after. F6:
+            // `set_binding` / `clear_binding` /
+            // `set_long_press_binding` / `clear_long_press_binding`
+            // run on a BindingOp job thread.
+            let pending = ctx.pending_action.borrow().clone();
+            let pending_long = ctx.pending_long_action.borrow().clone();
+            if pending.is_some() || pending_long.is_some() {
                 let button = ctx.selected_button.get() + 1;
                 let button_u8 = u8::try_from(button).unwrap_or(0);
-                let binding_id = action_id(&action);
+                let binding_id = pending.as_deref().and_then(action_id);
+                let long_binding_id = pending_long.as_deref().and_then(action_id);
+                let saved_action = pending.clone().unwrap_or_default();
+                let saved_long = pending_long.clone().unwrap_or_default();
                 ctx.run_generic_job(
                     &w,
                     JobKind::BindingOp,
                     "Saving button mapping…",
                     move |api| {
-                        JobResult::Unit(match binding_id {
-                            Some(id) => api.set_binding(button_u8, id).map(|_| ()),
-                            None => api.clear_binding(button_u8).map(|_| ()),
-                        })
+                        JobResult::Unit(
+                            (|| -> Result<(), UserError> {
+                                // Normal binding first, then the
+                                // long-press one — either failing
+                                // aborts the job, and the tile
+                                // reverts to the stored pair.
+                                if pending.is_some() {
+                                    match binding_id {
+                                        Some(id) => {
+                                            api.set_binding(button_u8, id).map(|_| ())?;
+                                        }
+                                        None => {
+                                            api.clear_binding(button_u8).map(|_| ())?;
+                                        }
+                                    }
+                                }
+                                if pending_long.is_some() {
+                                    match long_binding_id {
+                                        Some(id) => {
+                                            api.set_long_press_binding(button_u8, id)
+                                                .map(|_| ())?;
+                                        }
+                                        None => {
+                                            api.clear_long_press_binding(button_u8)
+                                                .map(|_| ())?;
+                                        }
+                                    }
+                                }
+                                Ok(())
+                            })(),
+                        )
                     },
                     move |ctx, w, result| {
                         let JobResult::Unit(result) = result else {
@@ -8820,19 +8972,24 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                         match result {
                             Ok(()) => {
                                 *ctx.pending_action.borrow_mut() = None;
+                                *ctx.pending_long_action.borrow_mut() = None;
                                 ctx.unsaved
                                     .set(ctx.api().draft_status().is_some_and(|s| s.dirty));
                                 ctx.load_bindings(w);
-                                ctx.notify(
-                                    w,
-                                    "Buttons",
-                                    "Button mapping saved",
-                                    &format!("Button {button} → {action}."),
-                                );
+                                let detail = if saved_long.is_empty() {
+                                    format!("Button {button} → {saved_action}.")
+                                } else if saved_action.is_empty() {
+                                    format!("Button {button} long-press → {saved_long}.")
+                                } else {
+                                    format!(
+                                        "Button {button} → {saved_action}; long-press → {saved_long}."
+                                    )
+                                };
+                                ctx.notify(w, "Buttons", "Button mapping saved", &detail);
                             }
                             Err(e) => {
                                 ctx.notify_error(w, "Buttons", &e);
-                                // Revert the tile to the stored action.
+                                // Revert the tile to the stored actions.
                                 ctx.load_bindings(w);
                             }
                         }
@@ -8875,6 +9032,7 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                 return;
             };
             *ctx.pending_action.borrow_mut() = None;
+            *ctx.pending_long_action.borrow_mut() = None;
             let idx = usize::try_from(ctx.selected_button.get()).unwrap_or(0);
             let action = ctx
                 .button_actions
@@ -8883,6 +9041,13 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                 .cloned()
                 .unwrap_or_else(|| "Not set".to_string());
             w.set_selected_action(action.into());
+            let long_action = ctx
+                .long_press_actions
+                .borrow()
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| "Not set".to_string());
+            w.set_selected_long_action(long_action.into());
             // F6: `discard_draft` runs on a ProfileOp job thread.
             ctx.run_generic_job(
                 &w,
@@ -9008,6 +9173,63 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
                     }
                     t.encoder_invert_mask = Some(mask);
                 });
+            }
+        });
+    }
+    // Button tuning (BU1/BU2): debounce + long-press threshold
+    // sliders (debounced push, local echo while dragging — same
+    // pattern as the encoder pulse slider above).
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_btn_debounce_changed(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let debounce_ms = (f64::from(v) * 50.0).clamp(0.0, 50.0);
+            Ctx::apply_button_local(&w, debounce_ms, f64::from(w.get_btn_longpress_ms()));
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("buttons", FieldKind::ButtonDebounceMs, debounce_ms);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_btn_debounce_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
+                let debounce_ms = ms.clamp(0.0, 50.0);
+                Ctx::apply_button_local(&w, debounce_ms, f64::from(w.get_btn_longpress_ms()));
+                ctx.queue_field_push("buttons", FieldKind::ButtonDebounceMs, debounce_ms);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_btn_longpress_changed(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let long_press_ms = (300.0 + f64::from(v) * 1200.0).clamp(300.0, 1500.0);
+            Ctx::apply_button_local(&w, f64::from(w.get_btn_debounce_ms()), long_press_ms);
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("buttons", FieldKind::ButtonLongPressMs, long_press_ms);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_btn_longpress_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
+                let long_press_ms = ms.clamp(300.0, 1500.0);
+                Ctx::apply_button_local(&w, f64::from(w.get_btn_debounce_ms()), long_press_ms);
+                ctx.queue_field_push("buttons", FieldKind::ButtonLongPressMs, long_press_ms);
             }
         });
     }
@@ -11158,6 +11380,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 .collect(),
         )),
         pending_action: Rc::new(RefCell::new(None)),
+        long_press_actions: Rc::new(RefCell::new(vec!["Not set".to_string(); 12])),
+        pending_long_action: Rc::new(RefCell::new(None)),
         selected_button: Rc::new(Cell::new(5)),
         edit_kind: Rc::new(Cell::new(0)),
         edit_knob: Rc::new(Cell::new(0)),
@@ -12178,6 +12402,8 @@ mod tests {
                     .collect(),
             )),
             pending_action: Rc::new(RefCell::new(None)),
+            long_press_actions: Rc::new(RefCell::new(vec!["Not set".to_string(); 12])),
+            pending_long_action: Rc::new(RefCell::new(None)),
             selected_button: Rc::new(Cell::new(5)),
             edit_kind: Rc::new(Cell::new(0)),
             edit_knob: Rc::new(Cell::new(0)),

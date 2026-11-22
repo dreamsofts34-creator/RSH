@@ -46,6 +46,11 @@ pub const GEAR_BITS_MASK: u32 = 0x7E0;
 pub const HORN_BIT: u32 = 1 << 2;
 /// Stream `buttons` bits for sequential shifter up/down (BUTTON slots 0/1).
 pub const SHIFTER_SEQ_BITS: u32 = 0b11;
+/// Stream `buttons` bits the BU1 debounce stage skips: 0/1
+/// (sequential shifter) and 2 (horn) — the firmware already
+/// debounces them (`inputs.cpp:9-10`, `125-127`, `516-530`), so a
+/// second stage would only add latency to shifts and the horn.
+pub const BUTTON_DEBOUNCE_EXCLUDE_MASK: u32 = SHIFTER_SEQ_BITS | HORN_BIT;
 
 /// Shifter gate mode (per-module tuning, only meaningful for the
 /// shifter module; other modules ignore it).
@@ -140,6 +145,15 @@ pub struct ModuleTuning {
     /// inverts encoder `i` (only bits `0..=3` are kept). OR-ed with
     /// the module-level `invert`, which inverts all encoders.
     pub encoder_invert_mask: u8,
+    // --- Buttons per-module tuning ---
+    /// Button debounce in milliseconds (BU1, buttons only): a
+    /// press / release must hold steady this long before the engine
+    /// reports it, `0..=50` (default `10`). `0` = pass-through.
+    pub debounce_ms: f32,
+    /// Long-press threshold in milliseconds (BU2, buttons only):
+    /// how long a button must be held before its long-press action
+    /// takes over, `300..=1500` (default `800`).
+    pub long_press_ms: f32,
 }
 
 impl Default for ModuleTuning {
@@ -169,6 +183,9 @@ impl Default for ModuleTuning {
             accel_enabled: false,
             accel_sensitivity: 1.0,
             encoder_invert_mask: 0,
+            // --- Buttons per-module tuning ---
+            debounce_ms: 10.0,
+            long_press_ms: 800.0,
         }
     }
 }
@@ -211,6 +228,9 @@ impl ModuleTuning {
         };
         out.accel_sensitivity = clamp_finite(self.accel_sensitivity, 0.0, 2.0, 1.0);
         out.encoder_invert_mask = self.encoder_invert_mask & 0x0F;
+        // --- Buttons per-module tuning ---
+        out.debounce_ms = clamp_finite(self.debounce_ms, 0.0, 50.0, 10.0);
+        out.long_press_ms = clamp_finite(self.long_press_ms, 300.0, 1500.0, 800.0);
         if validate_pedal_range(self.min_mv, self.max_mv).is_err() {
             out.min_mv = DEFAULT_MIN_MV;
             out.max_mv = DEFAULT_MAX_MV;
@@ -323,6 +343,14 @@ pub struct OutputState {
     /// cleared when the horn module is disabled; `0` when the buttons
     /// module is disabled.
     pub buttons: u32,
+    /// Wheel buttons currently held past the long-press threshold
+    /// (BU2): bit *n* is set while button *n* has been held (after
+    /// the BU1 debounce) for at least the buttons module's
+    /// `long_press_ms`. The bit clears the tick the button is
+    /// released. `0` when the buttons module is disabled. The
+    /// daemon's binding layer reads this to switch a button to its
+    /// long-press action; the output backends never see it directly.
+    pub long_press_buttons: u32,
     /// Wheel buttons 32–63. Always `0` from the pipeline: the stream
     /// packet carries only buttons 0–31, and `btnsEx` arrives via the
     /// status packet, which the engine layer merges — not the pipeline.
@@ -359,6 +387,7 @@ impl OutputState {
             handbrake: 0.0,
             pedals_combined: 0.0,
             buttons: 0,
+            long_press_buttons: 0,
             buttons_ex: 0,
             encoder_buttons: EncoderButtons::none(),
             encoder_deltas: [0; MAX_ENCODERS],
@@ -579,6 +608,18 @@ pub struct ProcessingPipeline {
     /// E2 sub-click remainder: counts banked per encoder toward the
     /// next whole step (`counts_per_click` counts = one step).
     encoder_remainder: [i32; MAX_ENCODERS],
+    /// BU1 debounced wheel-button word (bits 0/1/2 excluded — see
+    /// [`BUTTON_DEBOUNCE_EXCLUDE_MASK`]).
+    button_stable: u32,
+    /// BU1 candidate word: the latest raw value a bit disagreed
+    /// with `button_stable` toward.
+    button_candidate: u32,
+    /// BU1 ticks each bit's candidate has held steady (bit index =
+    /// stream button bit).
+    button_candidate_ticks: [u8; 32],
+    /// BU2 ticks each debounced button has been held continuously
+    /// (bit index = stream button bit).
+    button_hold_ticks: [u16; 32],
 }
 
 impl Default for ProcessingPipeline {
@@ -611,6 +652,11 @@ impl ProcessingPipeline {
             encoders: EncoderTracker::new(),
             encoder_pulse: [0; MAX_ENCODERS * 2],
             encoder_remainder: [0; MAX_ENCODERS],
+            // --- Buttons per-module tuning ---
+            button_stable: 0,
+            button_candidate: 0,
+            button_candidate_ticks: [0; 32],
+            button_hold_ticks: [0; 32],
             plan,
         }
     }
@@ -660,6 +706,11 @@ impl ProcessingPipeline {
         self.encoders.reset();
         self.encoder_pulse = [0; MAX_ENCODERS * 2];
         self.encoder_remainder = [0; MAX_ENCODERS];
+        // --- Buttons per-module tuning ---
+        self.button_stable = 0;
+        self.button_candidate = 0;
+        self.button_candidate_ticks = [0; 32];
+        self.button_hold_ticks = [0; 32];
     }
 
     /// Process one stream frame into an [`OutputState`].
@@ -751,6 +802,19 @@ impl ProcessingPipeline {
             }
         }
 
+        // BU1: wheel-button debounce — the firmware debounces only
+        // gear / horn / pedal / handbrake inputs, so a bouncy wheel
+        // button reaches the stream raw. The stability stage holds
+        // each wheel-button bit until it has been steady for
+        // `debounce_ms` (5 ms ticks at 200 Hz); bits 0/1/2 skip it
+        // (firmware-debounced already). Skipped while the buttons
+        // module is disabled — the disabled branch below clears the
+        // state instead, so a stale hold can never survive a
+        // re-enable.
+        if self.plan.buttons.enabled {
+            buttons = self.apply_button_debounce(buttons);
+        }
+
         // Horn (BUTTON slot 2, bit 2).
         out.horn = self.plan.horn.enabled && (buttons & HORN_BIT) != 0;
         if !self.plan.horn.enabled {
@@ -761,6 +825,19 @@ impl ProcessingPipeline {
         out.buttons = if self.plan.buttons.enabled {
             buttons
         } else {
+            0
+        };
+        // BU2: long-press tracking on the debounced word — the mask
+        // of buttons held for at least `long_press_ms`. A disabled
+        // module clears the debounce + hold state (same pattern as
+        // the encoder pulse clear below).
+        out.long_press_buttons = if self.plan.buttons.enabled {
+            self.track_button_holds(out.buttons)
+        } else {
+            self.button_stable = 0;
+            self.button_candidate = 0;
+            self.button_candidate_ticks = [0; 32];
+            self.button_hold_ticks = [0; 32];
             0
         };
         // D9: buttons > 32 are rejected, never clamped. The stream
@@ -842,6 +919,79 @@ impl ProcessingPipeline {
         }
         EncoderButtons(mask)
     }
+
+    /// BU1: per-bit stability stage for the wheel-button word. A
+    /// bit flips in `button_stable` only after its raw value has
+    /// held steady for `debounce_ms` (0 = pass-through). Bits in
+    /// [`BUTTON_DEBOUNCE_EXCLUDE_MASK`] pass through untouched.
+    /// A bounce shorter than the hold never reaches the output; a
+    /// genuine press is delayed by at most `debounce_ms`.
+    fn apply_button_debounce(&mut self, raw: u32) -> u32 {
+        let needed = button_debounce_ticks(self.plan.buttons.debounce_ms);
+        let wheel_raw = raw & !BUTTON_DEBOUNCE_EXCLUDE_MASK;
+        if needed == 0 {
+            self.button_stable = wheel_raw;
+            self.button_candidate = wheel_raw;
+            self.button_candidate_ticks = [0; 32];
+            return raw;
+        }
+        for bit in 0..32 {
+            let mask = 1u32 << bit;
+            if mask & BUTTON_DEBOUNCE_EXCLUDE_MASK != 0 {
+                continue;
+            }
+            let raw_bit = wheel_raw & mask != 0;
+            let stable_bit = self.button_stable & mask != 0;
+            if raw_bit == stable_bit {
+                // Settled: forget any candidate.
+                self.button_candidate &= !mask;
+                self.button_candidate_ticks[bit] = 0;
+            } else {
+                // Disagreeing with stable: (re)arm the candidate,
+                // then count this tick toward the switch.
+                if (self.button_candidate & mask != 0) != raw_bit {
+                    if raw_bit {
+                        self.button_candidate |= mask;
+                    } else {
+                        self.button_candidate &= !mask;
+                    }
+                    self.button_candidate_ticks[bit] = 0;
+                }
+                self.button_candidate_ticks[bit] =
+                    self.button_candidate_ticks[bit].saturating_add(1);
+                if self.button_candidate_ticks[bit] >= needed {
+                    if raw_bit {
+                        self.button_stable |= mask;
+                    } else {
+                        self.button_stable &= !mask;
+                    }
+                    self.button_candidate_ticks[bit] = 0;
+                }
+            }
+        }
+        (raw & BUTTON_DEBOUNCE_EXCLUDE_MASK) | (self.button_stable & !BUTTON_DEBOUNCE_EXCLUDE_MASK)
+    }
+
+    /// BU2: per-button hold tracking on the debounced word.
+    /// Returns the mask of buttons held for at least
+    /// `long_press_ms` this tick; a released button clears at
+    /// once, so the mask is only set while the button is down.
+    fn track_button_holds(&mut self, buttons: u32) -> u32 {
+        let needed = button_long_press_ticks(self.plan.buttons.long_press_ms);
+        let mut long = 0u32;
+        for (bit, held) in self.button_hold_ticks.iter_mut().enumerate() {
+            let mask = 1u32 << bit;
+            if buttons & mask != 0 {
+                *held = held.saturating_add(1);
+                if *held >= needed {
+                    long |= mask;
+                }
+            } else {
+                *held = 0;
+            }
+        }
+        long
+    }
 }
 
 /// Encoder pulse hold in ticks for a `pulse_ms` setting (E1): one
@@ -852,6 +1002,24 @@ impl ProcessingPipeline {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn encoder_pulse_ticks(pulse_ms: f32) -> u8 {
     ((pulse_ms / 5.0).round().clamp(1.0, 40.0)) as u8
+}
+
+/// BU1: debounce hold in ticks for a `debounce_ms` setting (0–50
+/// ms → 0–10 ticks at 5 ms/tick; 0 = pass-through, no hold).
+/// The clamp to `0..=10` makes both casts safe.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn button_debounce_ticks(debounce_ms: f32) -> u8 {
+    ((debounce_ms / 5.0).round().clamp(0.0, 10.0)) as u8
+}
+
+/// BU2: long-press hold in ticks for a `long_press_ms` setting
+/// (300–1500 ms → 60–300 ticks at 5 ms/tick). The clamp to
+/// `60..=300` makes both casts safe.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn button_long_press_ticks(long_press_ms: f32) -> u16 {
+    ((long_press_ms / 5.0).round().clamp(60.0, 300.0)) as u16
 }
 
 /// Map a steering sample in mV to `-1..=1` using a
@@ -1913,6 +2081,136 @@ mod tests {
         insane.accelerator.deadzone = 2.0;
         pipe.set_plan_live(insane);
         assert_eq!(pipe.plan().accelerator.deadzone, 0.5);
+    }
+
+    #[test]
+    fn button_debounce_ticks_convert() {
+        use super::{button_debounce_ticks, button_long_press_ticks};
+        assert_eq!(button_debounce_ticks(0.0), 0);
+        assert_eq!(button_debounce_ticks(10.0), 2);
+        assert_eq!(button_debounce_ticks(50.0), 10);
+        assert_eq!(button_debounce_ticks(60.0), 10);
+        assert_eq!(button_long_press_ticks(800.0), 160);
+        assert_eq!(button_long_press_ticks(300.0), 60);
+        assert_eq!(button_long_press_ticks(1500.0), 300);
+        assert_eq!(button_long_press_ticks(100.0), 60);
+    }
+
+    #[test]
+    fn button_debounce_filters_bounce_and_passes_steady_press() {
+        // BU1: 10 ms default = 2 ticks. Bit 3 is a wheel button
+        // (bits 0/1/2 are shifter/horn and skip the stage).
+        let mut pipe = ProcessingPipeline::new(plain_plan());
+        let _ = pipe.process(&frame(&[], &[], 0)); // baseline
+        // A 1-tick blip never reaches the output.
+        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        assert_eq!(out.buttons, 0);
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert_eq!(out.buttons, 0);
+        // Two steady ticks: the press lands on the second.
+        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        assert_eq!(out.buttons, 0);
+        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        assert_eq!(out.buttons, 1 << 3);
+        // A 1-tick drop while held is a bounce, not a release.
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert_eq!(out.buttons, 1 << 3);
+        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        assert_eq!(out.buttons, 1 << 3);
+        // Two steady ticks released: the release lands.
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert_eq!(out.buttons, 1 << 3);
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert_eq!(out.buttons, 0);
+    }
+
+    #[test]
+    fn button_debounce_zero_is_passthrough_and_excluded_bits_skip() {
+        // BU1: 0 ms passes wheel buttons through on the first tick.
+        let mut plan = plain_plan();
+        plan.buttons.debounce_ms = 0.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        assert_eq!(out.buttons, 1 << 3);
+        // Excluded bits (shifter 0/1, horn 2) pass through even at
+        // the 50 ms maximum — the firmware already debounces them.
+        let mut plan = plain_plan();
+        plan.buttons.debounce_ms = 50.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[], &[], 0b111));
+        assert_eq!(out.buttons, 0b111);
+        assert!(out.horn);
+    }
+
+    #[test]
+    fn button_long_press_sets_after_threshold_and_clears_on_release() {
+        // BU2: default 800 ms = 160 ticks. A short hold never sets
+        // the long-press bit; holding past the threshold does; the
+        // release clears it on the next tick.
+        use super::button_long_press_ticks;
+        let mut plan = plain_plan();
+        plan.buttons.debounce_ms = 0.0;
+        plan.buttons.long_press_ms = 300.0; // 60 ticks, fast test
+        assert_eq!(button_long_press_ticks(300.0), 60);
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[], 0));
+        for _ in 0..59 {
+            let out = pipe.process(&frame(&[], &[], 1 << 4));
+            assert_eq!(out.buttons, 1 << 4);
+            assert_eq!(out.long_press_buttons, 0);
+        }
+        let out = pipe.process(&frame(&[], &[], 1 << 4));
+        assert_eq!(out.long_press_buttons, 1 << 4);
+        // Still held: the bit stays set.
+        let out = pipe.process(&frame(&[], &[], 1 << 4));
+        assert_eq!(out.long_press_buttons, 1 << 4);
+        // Released: both bits clear at once.
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert_eq!(out.buttons, 0);
+        assert_eq!(out.long_press_buttons, 0);
+    }
+
+    #[test]
+    fn button_disabled_clears_long_press_and_debounce_state() {
+        // BU1+BU2: live-disable while held clears the held press
+        // and the long-press bit; re-enabling does not resurrect
+        // either (same pattern as the encoder pulse clear).
+        let mut plan = plain_plan();
+        plan.buttons.debounce_ms = 0.0;
+        plan.buttons.long_press_ms = 300.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[], &[], 0));
+        for _ in 0..60 {
+            let out = pipe.process(&frame(&[], &[], 1 << 4));
+            assert_eq!(out.buttons, 1 << 4);
+        }
+        let out = pipe.process(&frame(&[], &[], 1 << 4));
+        assert_eq!(out.long_press_buttons, 1 << 4);
+        plan.buttons.enabled = false;
+        pipe.set_plan_live(plan);
+        let out = pipe.process(&frame(&[], &[], 1 << 4));
+        assert_eq!(out.buttons, 0);
+        assert_eq!(out.long_press_buttons, 0);
+        plan.buttons.enabled = true;
+        pipe.set_plan_live(plan);
+        let out = pipe.process(&frame(&[], &[], 1 << 4));
+        assert_eq!(out.long_press_buttons, 0);
+    }
+
+    #[test]
+    fn button_tuning_sanitizes() {
+        let mut plan = plain_plan();
+        plan.buttons.debounce_ms = 60.0;
+        plan.buttons.long_press_ms = 100.0;
+        let pipe = ProcessingPipeline::new(plan);
+        assert_eq!(pipe.plan().buttons.debounce_ms, 50.0);
+        assert_eq!(pipe.plan().buttons.long_press_ms, 300.0);
+        let mut plan = plain_plan();
+        plan.buttons.debounce_ms = f32::NAN;
+        plan.buttons.long_press_ms = f32::NAN;
+        let pipe = ProcessingPipeline::new(plan);
+        assert_eq!(pipe.plan().buttons.debounce_ms, 10.0);
+        assert_eq!(pipe.plan().buttons.long_press_ms, 800.0);
     }
 
     #[test]

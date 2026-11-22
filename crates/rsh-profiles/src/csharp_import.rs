@@ -264,6 +264,16 @@ pub struct PerModuleTuning {
     /// only), bits 0–3. `None` = never set — 0 (no invert) applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_invert_mask: Option<u8>,
+    // --- Buttons per-module tuning ---
+    /// Button debounce in ms (BU1, buttons module only), 0–50.
+    /// `None` = never set (old profile) — the 10 ms default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub button_debounce_ms: Option<f64>,
+    /// Long-press threshold in ms (BU2, buttons module only),
+    /// 300–1500. `None` = never set (old profile) — the 800 ms
+    /// default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub button_long_press_ms: Option<f64>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -550,6 +560,9 @@ impl Default for PerModuleTuning {
             encoder_accel: None,
             encoder_accel_sensitivity: None,
             encoder_invert_mask: None,
+            // --- Buttons per-module tuning ---
+            button_debounce_ms: None,
+            button_long_press_ms: None,
         }
     }
 }
