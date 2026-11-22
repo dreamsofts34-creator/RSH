@@ -3,7 +3,8 @@
 //! gating + Next click-through, theme repaint, tray disconnected
 //! state, tray Light theme (DS-22), banner wrap + grow (DS-21),
 //! Extras card size ON/OFF + OFF no-input + responsive card gaps
-//! (cards layout fix, CARDS-LAYOUT-RESEARCH).
+//! (cards layout fix, CARDS-LAYOUT-RESEARCH), steering Advanced
+//! controls (Bug 7).
 //!
 //! The real `.slint` files are compiled with `slint-interpreter`
 //! on the testing backend with the software renderer — no X, no
@@ -1388,6 +1389,148 @@ fn ui_banner_wrap() -> Outcome {
     report.finish()
 }
 
+/// Content pixels of a rendered probe snapshot: pixels that are
+/// not the window background (`#0d1118`).
+fn steering_probe_content_pixels(rgba: &[u8]) -> usize {
+    let (chunks, _rest) = rgba.as_chunks::<4>();
+    chunks
+        .iter()
+        .filter(|chunk| chunk[0] != 0x0d || chunk[1] != 0x11 || chunk[2] != 0x18)
+        .count()
+}
+
+/// The probe's Advanced callbacks exist with the right signatures
+/// and fire: invoke each root callback and check the handler
+/// receives the value.
+fn steering_probe_callbacks(
+    instance: &ComponentInstance,
+    report: &mut Report,
+) -> Result<(), String> {
+    let last_bool = Rc::new(RefCell::new(false));
+    let last_num = Rc::new(RefCell::new(f64::NAN));
+    {
+        let last_bool = Rc::clone(&last_bool);
+        instance
+            .set_callback("invert-changed", move |args| {
+                if let Some(Value::Bool(value)) = args.first() {
+                    *last_bool.borrow_mut() = *value;
+                }
+                Value::Void
+            })
+            .map_err(|error| format!("set invert-changed handler failed: {error}"))?;
+    }
+    instance
+        .invoke("invert-changed", &[Value::Bool(true)])
+        .map_err(|error| format!("invoke invert-changed failed: {error}"))?;
+    report.check(
+        "steering-invert-callback",
+        *last_bool.borrow(),
+        "invoke invert-changed(true) must reach the handler",
+    );
+    for (name, value) in [("lock-changed", 0.5_f64), ("smoothing-changed", 0.3_f64)] {
+        let last_num = Rc::clone(&last_num);
+        let last_num_cb = Rc::clone(&last_num);
+        instance
+            .set_callback(name, move |args| {
+                if let Some(Value::Number(n)) = args.first() {
+                    *last_num_cb.borrow_mut() = *n;
+                }
+                Value::Void
+            })
+            .map_err(|error| format!("set {name} handler failed: {error}"))?;
+        instance
+            .invoke(name, &[Value::Number(value)])
+            .map_err(|error| format!("invoke {name} failed: {error}"))?;
+        report.check(
+            &format!("steering-{name}-callback"),
+            (*last_num.borrow() - value).abs() <= f64::EPSILON,
+            &format!("invoke {name}({value}) must reach the handler"),
+        );
+    }
+    Ok(())
+}
+
+/// Gate: steering Advanced (Bug 7) — the Advanced card holds real
+/// tuning controls (invert toggle, lock slider, smoothing slider),
+/// not the old read-only rows (centre mV, raw live, curve exponent
+/// box, min/max note). Proves: the real `SteeringPage` compiles,
+/// Advanced-on renders a whole extra card of content, the new
+/// labels are in the source and the old rows are gone, and the
+/// Advanced callbacks exist with the right signatures.
+fn ui_steering_advanced() -> Outcome {
+    let mut report = Report::new();
+    // Source assertions: new controls present, old rows gone.
+    let src_path = repo_root().join("crates/rsh-ui/ui/screens/steering.slint");
+    let src = match std::fs::read_to_string(&src_path) {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(format!("read steering.slint failed: {error}")),
+    };
+    for label in ["Invert steering", "Steering lock", "Smoothing"] {
+        report.check(
+            &format!("steering-advanced-has-{label}"),
+            src.contains(label),
+            &format!("steering.slint must contain the {label} control"),
+        );
+    }
+    for gone in [
+        "Raw live",
+        "Curve exponent",
+        "Min/max mV aren't stored",
+        "centre-mv-text",
+        "raw-mv-text",
+    ] {
+        report.check(
+            &format!("steering-advanced-no-{gone}"),
+            !src.contains(gone),
+            &format!("steering.slint must not contain the old {gone} row"),
+        );
+    }
+    let instance = match compile(
+        "tools/gate-checks/rsh-gate-ui/ui/steering_probe.slint",
+        "GateSteeringWindow",
+    ) {
+        Ok(instance) => instance,
+        Err(error) => return Outcome::fail(error),
+    };
+    // Rendered content: Advanced-on must visibly change the render
+    // — the Advanced card (labels + two sliders + switch) paints
+    // new pixels. A raw content-pixel total misleads here (the
+    // ScrollView's scrollbar appears once the card is added), so
+    // the check counts pixels that DIFFER between the two renders.
+    if let Err(error) = set_bool(&instance, "advanced", false) {
+        return Outcome::fail(error);
+    }
+    let (basic_rgba, _, _) = match snapshot(&instance) {
+        Ok(snap) => snap,
+        Err(error) => return Outcome::fail(error),
+    };
+    let basic = steering_probe_content_pixels(&basic_rgba);
+    if let Err(error) = set_bool(&instance, "advanced", true) {
+        return Outcome::fail(error);
+    }
+    let (advanced_rgba, _, _) = match snapshot(&instance) {
+        Ok(snap) => snap,
+        Err(error) => return Outcome::fail(error),
+    };
+    let advanced = steering_probe_content_pixels(&advanced_rgba);
+    let diff = basic_rgba
+        .iter()
+        .zip(advanced_rgba.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    report.check(
+        "steering-advanced-adds-content",
+        diff > 5000,
+        &format!(
+            "render diff Basic→Advanced: {diff} px changed (content {basic} → {advanced}, want > 5000 changed)"
+        ),
+    );
+    if let Err(error) = steering_probe_callbacks(&instance, &mut report) {
+        return Outcome::fail(error);
+    }
+    report.finish()
+}
+
 /// One UI gate check: (id, description, runner).
 type UiCheck = (&'static str, &'static str, fn() -> Outcome);
 
@@ -1452,6 +1595,11 @@ fn checks() -> Vec<UiCheck> {
             "ui-games-grid-gap",
             "R3-UI-06: games-grid tile gap 10 px at design width, grows with the window",
             ui_games_grid_gap as fn() -> Outcome,
+        ),
+        (
+            "ui-steering-advanced",
+            "Bug 7: Advanced card holds invert + lock + smoothing (not the old read-only rows)",
+            ui_steering_advanced as fn() -> Outcome,
         ),
     ]
 }

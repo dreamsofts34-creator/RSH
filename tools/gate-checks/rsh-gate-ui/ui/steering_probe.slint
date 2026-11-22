@@ -1,0 +1,34 @@
+// Probe window hosting the real SteeringPage (same-to-same from
+// crates/rsh-ui/ui/screens/steering.slint) so the gate can render
+// it headless: Advanced off vs on must add a whole card of
+// content, and the Advanced callbacks must fire through.
+import { SteeringPage } from "../../../crates/rsh-ui/ui/screens/steering.slint";
+
+export component GateSteeringWindow inherits Window {
+    width: 920px;
+    height: 1000px;
+    title: "gate-steering-probe";
+    background: #0d1118;
+    in-out property <bool> advanced: false;
+    in-out property <bool> invert: false;
+    in-out property <float> lock-frac: 1.0;
+    in-out property <string> lock-text: "900°";
+    in-out property <float> smoothing: 0.3;
+    in-out property <string> smoothing-text: "30%";
+    callback invert-changed(bool);
+    callback lock-changed(float);
+    callback smoothing-changed(float);
+    SteeringPage {
+        width: 100%;
+        height: 100%;
+        advanced: root.advanced;
+        invert: root.invert;
+        lock-frac: root.lock-frac;
+        lock-text: root.lock-text;
+        smoothing: root.smoothing;
+        smoothing-text: root.smoothing-text;
+        invert-changed(b) => { root.invert-changed(b); }
+        lock-changed(v) => { root.lock-changed(v); }
+        smoothing-changed(v) => { root.smoothing-changed(v); }
+    }
+}

@@ -139,11 +139,13 @@ export component MainWindow inherits Window {
     in property <float> curve-val;
     in property <string> curve-text;
     in property <int> preset;
-    // Advanced mode (R2-16, REDESIGN-PLAN §7.2): steering centre
-    // mV (captured calibration) + live raw mV per axis (~1 Hz).
-    // "—" until measured — never a fake 0.
-    in property <string> steer-centre-mv-text: "—";
-    in property <string> steer-raw-mv-text: "—";
+    // Steering Advanced (Bug 7): invert + lock + smoothing — the
+    // old centre/raw-mV readouts are gone (steering.slint).
+    in property <bool> steer-invert: false;
+    in property <float> steer-lock: 1.0;
+    in property <string> steer-lock-text: "900°";
+    in property <float> steer-smoothing: 0.3;
+    in property <string> steer-smoothing-text: "30%";
     in property <string> throttle-raw-mv-text: "—";
     in property <string> brake-raw-mv-text: "—";
     in property <string> clutch-raw-mv-text: "—";
@@ -339,6 +341,11 @@ export component MainWindow inherits Window {
     callback curve-changed(float);
     callback deadzone-edited(string);
     callback curve-edited(string);
+    callback invert-changed(bool);
+    callback lock-changed(float);
+    callback lock-edited(string);
+    callback smoothing-changed(float);
+    callback smoothing-edited(string);
     callback preset-selected(int);
     callback reset-defaults();
     callback set-centre();
@@ -639,8 +646,11 @@ export component MainWindow inherits Window {
             if page == 1 : SteeringPage {
                 busy-kind: busy-kind;
                 advanced: advanced;
-                centre-mv-text: steer-centre-mv-text;
-                raw-mv-text: steer-raw-mv-text;
+                invert: steer-invert;
+                lock-frac: steer-lock;
+                lock-text: steer-lock-text;
+                smoothing: steer-smoothing;
+                smoothing-text: steer-smoothing-text;
                 input-pct: input-pct;
                 output-pct: output-pct;
                 marker-vx: marker-vx;
@@ -661,7 +671,11 @@ export component MainWindow inherits Window {
                 curve-changed(v) => { curve-changed(v); }
                 deadzone-edited(t) => { deadzone-edited(t); }
                 curve-edited(t) => { curve-edited(t); }
-                curve-exponent-edited(t) => { curve-edited(t); }
+                invert-changed(b) => { invert-changed(b); }
+                lock-changed(v) => { lock-changed(v); }
+                lock-edited(t) => { lock-edited(t); }
+                smoothing-changed(v) => { smoothing-changed(v); }
+                smoothing-edited(t) => { smoothing-edited(t); }
                 preset-selected(i) => { preset-selected(i); }
                 reset-defaults => { reset-defaults(); }
                 set-centre => { set-centre(); }

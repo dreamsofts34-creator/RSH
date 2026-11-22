@@ -159,6 +159,7 @@ use rsh_api::ButtonBinding;
 use rsh_api::RawMv;
 use rsh_api::connection::{HELLO_ATTEMPTS, HELLO_WAIT};
 use rsh_api::errors::ConnectionError;
+use rsh_api::tuning::{snap_steering_lock_deg, steering_lock_deg_to_scale};
 use rsh_api::{FirmwareCheck, FirmwareUpdateStatus};
 use rsh_engine::calibration::{CalibrationError, MIN_SPAN_MV, validate_pedal_range};
 use rsh_engine::engine::{
@@ -6100,9 +6101,26 @@ impl AppStateCore {
         if let Some(tuning) = lock(&self.tunings).get(&module) {
             return tuning.clone();
         }
+        // Bug 7 (PC-test fix): steering invert + lock live on the
+        // profile (`invert_steering` / `steering_scale`), not in the
+        // per-module tuning — both branches below report them, so
+        // the UI can init the Advanced controls from a stored
+        // profile even before any steering edit created a module
+        // entry. Other modules never carry them (`None`).
+        let steering_opts = |profile: &WheelProfile| -> (Option<bool>, Option<f64>) {
+            if module == "steering" {
+                (
+                    Some(profile.invert_steering),
+                    Some(snap_steering_lock_deg(profile.steering_scale * 900.0)),
+                )
+            } else {
+                (None, None)
+            }
+        };
         if let Some(active) = lock(&self.store).active()
             && let Some(stored) = active.profile.module_tunings.get(&module)
         {
+            let (invert, steering_lock_deg) = steering_opts(&active.profile);
             return TuningSettings {
                 module: module.clone(),
                 deadzone: stored.deadzone * 100.0,
@@ -6110,6 +6128,8 @@ impl AppStateCore {
                 min_mv: stored.min_mv.unwrap_or(0.0),
                 max_mv: stored.max_mv.unwrap_or(3300.0),
                 smoothing: stored.smoothing * 100.0,
+                invert,
+                steering_lock_deg,
                 bite_point: stored.bite_point,
                 shifter_gate: if module == "shifter" {
                     Some(if stored.gate_mode.eq_ignore_ascii_case("h-pattern") {
@@ -6131,6 +6151,9 @@ impl AppStateCore {
                 handbrake_button_mode: stored.handbrake_button_mode,
             };
         }
+        let (invert, steering_lock_deg) = lock(&self.store)
+            .active()
+            .map_or((None, None), |active| steering_opts(&active.profile));
         TuningSettings {
             module,
             deadzone: 0.0,
@@ -6138,6 +6161,8 @@ impl AppStateCore {
             min_mv: 0.0,
             max_mv: 3300.0,
             smoothing: 0.0,
+            invert,
+            steering_lock_deg,
             bite_point: None,
             shifter_gate: None,
             horn_button: None,
@@ -6233,6 +6258,22 @@ impl AppStateCore {
         entry.deadzone = tuning.deadzone / 100.0;
         entry.curve_strength = (tuning.curve - 1.0).clamp(-1.0, 1.0);
         entry.smoothing = tuning.smoothing / 100.0;
+        // Bug 7 (PC-test fix): steering invert + lock are profile
+        // fields — the pipeline plan reads `invert_steering` /
+        // `steering_scale` from the profile, not the module entry —
+        // so a steering edit writes both, keeping the entry in sync
+        // for the C# export shape. Other modules never carry them.
+        if tuning.module == "steering" {
+            if let Some(invert) = tuning.invert {
+                profile.invert_steering = invert;
+                entry.invert = invert;
+            }
+            if let Some(lock_deg) = tuning.steering_lock_deg {
+                let scale = steering_lock_deg_to_scale(lock_deg);
+                profile.steering_scale = scale;
+                entry.scale = scale;
+            }
+        }
         entry.min_mv = Some(tuning.min_mv);
         entry.max_mv = Some(tuning.max_mv);
         entry.bite_point = tuning.bite_point;
@@ -10040,6 +10081,50 @@ mod tests {
         let plan = state.build_pipeline_plan();
         assert!((plan.steering.curve_strength - 0.5).abs() < f32::EPSILON);
         assert_eq!((plan.steering.min_mv, plan.steering.max_mv), (300, 3300));
+    }
+
+    /// Bug 7 (PC-test fix): steering invert + lock round-trip —
+    /// `get_tuning` reports the profile defaults (not inverted,
+    /// 900°), a `set_tuning` with invert + 540° lock lands in the
+    /// live plan (inverted, scale 0.6), and a Save persists both
+    /// fields so a reopened store reads them back.
+    #[test]
+    fn steering_invert_and_lock_round_trip_through_plan_and_store() {
+        let (state, dir) = test_state();
+        let _ = activate_first_profile(&state);
+        let tuning = state.get_tuning("steering");
+        assert_eq!(tuning.invert, Some(false), "default is not inverted");
+        assert_eq!(
+            tuning.steering_lock_deg,
+            Some(900.0),
+            "default is full lock"
+        );
+        let mut steering = tuning;
+        steering.invert = Some(true);
+        steering.steering_lock_deg = Some(540.0);
+        state
+            .set_tuning(&steering)
+            .expect("set steering invert+lock");
+        let plan = state.build_pipeline_plan();
+        assert!(plan.steering.invert, "plan inverts");
+        assert!(
+            (plan.steering.scale - 0.6).abs() < f32::EPSILON,
+            "540° → scale 0.6"
+        );
+        let back = state.get_tuning("steering");
+        assert_eq!(back.invert, Some(true));
+        assert_eq!(back.steering_lock_deg, Some(540.0));
+        assert!(state.save_draft().expect("save draft"));
+        let reopened = ProfileStore::open(&dir).expect("reopen store");
+        let profile = &reopened.active().expect("active after reopen").profile;
+        assert!(profile.invert_steering, "invert persisted");
+        assert!(
+            (profile.steering_scale - 0.6).abs() < f64::EPSILON,
+            "scale persisted"
+        );
+        // Other modules never carry steering options.
+        assert_eq!(state.get_tuning("brake").invert, None);
+        assert_eq!(state.get_tuning("brake").steering_lock_deg, None);
     }
 
     /// L4 learn mode: arming captures the next physical button press

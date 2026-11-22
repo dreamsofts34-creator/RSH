@@ -1908,6 +1908,21 @@ mod tests {
         assert_eq!(back.game, GameId::Acc);
     }
 
+    /// Bug 7 (PC-test fix): a profile saved before the steering
+    /// invert/lock fields existed loads with the defaults — not
+    /// inverted, full 900° lock — instead of failing to parse.
+    #[test]
+    fn old_profile_without_steering_fields_loads_with_defaults() {
+        let mut value =
+            serde_json::to_value(WheelProfile::default()).expect("serialize default profile");
+        let object = value.as_object_mut().expect("profile is an object");
+        object.remove("invert_steering");
+        object.remove("steering_scale");
+        let back: WheelProfile = serde_json::from_value(value).expect("deserialize old profile");
+        assert!(!back.invert_steering, "old profile is not inverted");
+        assert_eq!(back.steering_scale, 1.0, "old profile is full lock");
+    }
+
     #[test]
     fn corrupt_profiles_file_is_an_error_not_silent_defaults() {
         let dir = temp_dir();
