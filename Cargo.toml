@@ -108,9 +108,13 @@ strip = true
 # R3-18 (Round 3 WS-2): `debug = true` so the release build emits
 # PDBs (MSVC) next to the binaries — release.yml archives them per
 # tag as a non-release artifact, so a field crash can be
-# symbolicated. `strip = true` still strips the shipped binaries;
-# the PDBs are separate files, not shipped to users. If this is
-# ever turned off, the release.yml PDB step fails closed — do not
+# symbolicated. NOTE (v2.0.7 release run 44962668126): on Windows-MSVC
+# cargo's `strip` DELETES the .pdb files, so `strip = true` + `debug =
+# true` yields no PDBs and the release PDB step fails closed. The
+# release job therefore sets CARGO_PROFILE_RELEASE_STRIP=false (see
+# release.yml) — strip stays on for CI/local builds, where the Linux
+# binary sizes + perf-gate limits are measured with it. If `debug`
+# is ever turned off, the release.yml PDB step fails closed — do not
 # silence it.
 debug = true
 lto = "fat"

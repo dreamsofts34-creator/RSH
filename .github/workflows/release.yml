@@ -179,6 +179,21 @@ jobs:
     name: release
     runs-on: windows-latest
     timeout-minutes: 120
+    env:
+      # R3-18 fix (v2.0.7 release run 44962668126 failed at the PDB
+      # step): on Windows-MSVC cargo's `strip` DELETES the .pdb files
+      # — with [profile.release] strip = true, `debug = true` emits
+      # PDBs and cargo then removes them, so the PDB archive step fails
+      # closed on a missing rsh-daemon.pdb. The PDBs must come from the
+      # SAME compilation as the shipped exes (GUID/Age fingerprint), so
+      # strip is disabled for this job only via the documented
+      # CARGO_PROFILE_RELEASE_STRIP override (verified: cargo honors the
+      # env var). CI/local builds keep strip = true (Linux binary sizes
+      # + perf-gate limits are measured with it). On Windows the shipped
+      # exes barely grow — debuginfo lives in the PDB, not the exe — and
+      # the release perf-gate below still enforces the size limits on
+      # the actual shipped binaries.
+      CARGO_PROFILE_RELEASE_STRIP: "false"
     steps:
       - uses: actions/checkout@v4
 
