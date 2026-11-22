@@ -6406,6 +6406,25 @@ impl AppStateCore {
                 encoder_accel: Some(stored.encoder_accel.unwrap_or(false)),
                 encoder_accel_sensitivity: Some(stored.encoder_accel_sensitivity.unwrap_or(1.0)),
                 encoder_invert_mask: Some(stored.encoder_invert_mask.unwrap_or(0)),
+                // --- Handbrake/clutch per-module tuning ---
+                // Old profiles carry none of these fields either:
+                // latch off, auto-release off, slip zone 15% — and
+                // only the owning module carries them at all.
+                handbrake_latch: if module == "handbrake" {
+                    Some(stored.handbrake_latch.unwrap_or(false))
+                } else {
+                    None
+                },
+                handbrake_auto_release: if module == "handbrake" {
+                    Some(stored.handbrake_auto_release.unwrap_or(false))
+                } else {
+                    None
+                },
+                bite_width: if module == "clutch" {
+                    Some(stored.bite_width.unwrap_or(0.15))
+                } else {
+                    None
+                },
             };
         }
         let (invert, steering_lock_deg, steering_balance_pct, steering_center_trim_pct) =
@@ -6430,6 +6449,10 @@ impl AppStateCore {
         } else {
             None
         };
+        // --- Handbrake/clutch per-module tuning ---
+        // Read before the literal below moves `module`.
+        let is_handbrake = module == "handbrake";
+        let is_clutch = module == "clutch";
         TuningSettings {
             module,
             deadzone: 0.0,
@@ -6459,6 +6482,10 @@ impl AppStateCore {
             encoder_accel: Some(false),
             encoder_accel_sensitivity: Some(1.0),
             encoder_invert_mask: Some(0),
+            // --- Handbrake/clutch per-module tuning ---
+            handbrake_latch: if is_handbrake { Some(false) } else { None },
+            handbrake_auto_release: if is_handbrake { Some(false) } else { None },
+            bite_width: if is_clutch { Some(0.15) } else { None },
         }
     }
 
@@ -6554,6 +6581,10 @@ impl AppStateCore {
                 encoder_accel: None,
                 encoder_accel_sensitivity: None,
                 encoder_invert_mask: None,
+                // --- Handbrake/clutch per-module tuning ---
+                handbrake_latch: None,
+                handbrake_auto_release: None,
+                bite_width: None,
             });
         entry.deadzone = tuning.deadzone / 100.0;
         entry.curve_strength = (tuning.curve - 1.0).clamp(-1.0, 1.0);
@@ -6608,6 +6639,10 @@ impl AppStateCore {
         entry.encoder_accel = tuning.encoder_accel;
         entry.encoder_accel_sensitivity = tuning.encoder_accel_sensitivity;
         entry.encoder_invert_mask = tuning.encoder_invert_mask;
+        // --- Handbrake/clutch per-module tuning ---
+        entry.handbrake_latch = tuning.handbrake_latch;
+        entry.handbrake_auto_release = tuning.handbrake_auto_release;
+        entry.bite_width = tuning.bite_width;
         if let Some(gate) = tuning.shifter_gate {
             entry.gate_mode = match gate {
                 ShifterGate::Sequential => "Sequential".to_string(),
@@ -6871,6 +6906,17 @@ impl AppStateCore {
             accel_enabled: tuning.encoder_accel.unwrap_or(false),
             accel_sensitivity: tuning.encoder_accel_sensitivity.unwrap_or(1.0) as f32,
             encoder_invert_mask: tuning.encoder_invert_mask.unwrap_or(0),
+            // --- Handbrake/clutch per-module tuning ---
+            handbrake_latch: tuning.handbrake_latch.unwrap_or(false),
+            handbrake_auto_release: tuning.handbrake_auto_release.unwrap_or(false),
+            // The clutch record carries the 15% slip-zone default
+            // (see `get_tuning`); a record without it — e.g. a
+            // direct IPC `set_tuning` — still loads as 15% for the
+            // clutch, and as the hard stretch (0.0) elsewhere.
+            bite_width: tuning
+                .bite_width
+                .unwrap_or(if module == "clutch" { 0.15 } else { 0.0 })
+                as f32,
         }
     }
 
@@ -10554,6 +10600,65 @@ mod tests {
         assert_eq!(stored.encoder_accel, Some(true));
         assert_eq!(stored.encoder_accel_sensitivity, Some(1.5));
         assert_eq!(stored.encoder_invert_mask, Some(0b0010));
+    }
+
+    #[test]
+    fn handbrake_clutch_tuning_round_trips_and_old_profiles_get_defaults() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        // No stored handbrake/clutch entry yet: the defaults apply
+        // (latch off, auto-release off, grab 0 ms, slip zone 15%)
+        // — an old profile without the fields loads the same way.
+        let neutral = state.get_tuning("handbrake");
+        assert_eq!(neutral.handbrake_latch, Some(false));
+        assert_eq!(neutral.handbrake_auto_release, Some(false));
+        assert_eq!(neutral.press_ms, Some(0.0));
+        assert_eq!(neutral.bite_width, None);
+        let neutral = state.get_tuning("clutch");
+        assert_eq!(neutral.bite_width, Some(0.15));
+        assert_eq!(neutral.handbrake_latch, None);
+        // Invalid slip width is rejected, never stored.
+        let mut bad = neutral.clone();
+        bad.bite_width = Some(0.04);
+        assert!(state.set_tuning(&bad).is_err());
+        assert_eq!(state.get_tuning("clutch").bite_width, Some(0.15));
+        // Valid values store, survive a get, and reach the live
+        // pipeline plan.
+        let mut hb = state.get_tuning("handbrake");
+        hb.handbrake_latch = Some(true);
+        hb.handbrake_auto_release = Some(true);
+        hb.press_ms = Some(120.0);
+        let saved = state.set_tuning(&hb).expect("valid handbrake tuning");
+        assert_eq!(saved.handbrake_latch, Some(true));
+        assert_eq!(saved.handbrake_auto_release, Some(true));
+        assert_eq!(saved.press_ms, Some(120.0));
+        let mut clutch = state.get_tuning("clutch");
+        clutch.bite_width = Some(0.3);
+        let saved = state.set_tuning(&clutch).expect("valid clutch tuning");
+        assert_eq!(saved.bite_width, Some(0.3));
+        assert_eq!(state.get_tuning("clutch").bite_width, Some(0.3));
+        let plan = state.build_pipeline_plan();
+        assert!(plan.handbrake.handbrake_latch);
+        assert!(plan.handbrake.handbrake_auto_release);
+        assert_eq!(plan.handbrake.press_ms, 120.0);
+        assert_eq!(plan.clutch.bite_width, 0.3);
+        // The brake keeps the hard stretch: its plan bite width
+        // is 0.0 even though the clutch carries 0.3.
+        assert_eq!(plan.brake.bite_width, 0.0);
+        // Save persists them into the profile on disk.
+        assert!(state.save_draft().expect("save draft"));
+        let stored = lock(&state.store)
+            .active()
+            .and_then(|active| active.profile.module_tunings.get("handbrake").cloned());
+        let stored = stored.expect("stored handbrake entry");
+        assert_eq!(stored.handbrake_latch, Some(true));
+        assert_eq!(stored.handbrake_auto_release, Some(true));
+        assert_eq!(stored.press_ms, Some(120.0));
+        let stored = lock(&state.store)
+            .active()
+            .and_then(|active| active.profile.module_tunings.get("clutch").cloned());
+        let stored = stored.expect("stored clutch entry");
+        assert_eq!(stored.bite_width, Some(0.3));
     }
 
     /// L4 draft/save: Save persists the draft (and only the draft),

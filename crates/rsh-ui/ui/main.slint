@@ -206,6 +206,10 @@ export component MainWindow inherits Window {
     in property <string> clutch-deadzone-text: "—";
     in property <float> clutch-bite: 0;
     in property <string> clutch-bite-text: "—";
+    // --- Handbrake/clutch per-module tuning ---
+    // C2 clutch slip zone (0..1 of 5..40%; the 15% default is 10/35).
+    in property <float> clutch-bite-width: 0.2857;
+    in property <string> clutch-bite-width-text: "15%";
     in property <string> clutch-curve: "M 6 104 L 104 6";
     in property <string> clutch-dashed: "";
     in property <float> clutch-marker-x: 6;
@@ -242,6 +246,12 @@ export component MainWindow inherits Window {
     in property <float> handbrake-marker-y: 104;
     in property <int> handbrake-mode: 0;
     in property <bool> handbrake-pressed: false;
+    // --- Handbrake/clutch per-module tuning ---
+    // H1 latch, H2 grab speed (0..1 of 0..200 ms), H3 auto-release.
+    in property <bool> handbrake-latch: false;
+    in property <float> handbrake-grab-ms: 0;
+    in property <string> handbrake-grab-ms-text: "0 ms";
+    in property <bool> handbrake-auto-release: false;
     in property <bool> extras-calibration-disabled: true;
     in property <int> shifter-mode: 0;
     in property <string> horn-button: "Not set";
@@ -407,6 +417,9 @@ export component MainWindow inherits Window {
     callback pedal-deadzone-edited(int, string);
     callback pedal-bite-changed(float);
     callback pedal-bite-edited(string);
+    // --- Handbrake/clutch per-module tuning ---
+    callback pedal-clutch-bite-width-changed(float); // 0..1 of 5..40%
+    callback pedal-clutch-bite-width-edited(string); // typed percent, 5–40%
     // --- Brake per-module tuning ---
     callback pedal-brake-bite-changed(float); // 0..1 of 50%
     callback pedal-brake-bite-edited(string); // typed percent, 0–50%
@@ -439,6 +452,11 @@ export component MainWindow inherits Window {
     callback extras-handbrake-feel(int);
     callback extras-handbrake-deadzone(float);
     callback extras-handbrake-deadzone-edited(string);
+    // --- Handbrake/clutch per-module tuning ---
+    callback extras-handbrake-latch-changed(bool);
+    callback extras-handbrake-grab-ms-changed(float); // 0..1 of 0..200 ms
+    callback extras-handbrake-grab-ms-edited(string); // typed "120 ms"
+    callback extras-handbrake-auto-release-changed(bool);
     callback extras-led-pattern(int);
     callback extras-led-brightness(float);
     callback extras-led-brightness-edited(string);
@@ -804,6 +822,9 @@ export component MainWindow inherits Window {
                 clutch-deadzone-text: clutch-deadzone-text;
                 clutch-bite: clutch-bite;
                 clutch-bite-text: clutch-bite-text;
+                // --- Handbrake/clutch per-module tuning ---
+                clutch-bite-width: clutch-bite-width;
+                clutch-bite-width-text: clutch-bite-width-text;
                 clutch-curve: clutch-curve;
                 clutch-dashed: clutch-dashed;
                 clutch-marker-x: clutch-marker-x;
@@ -834,6 +855,9 @@ export component MainWindow inherits Window {
                 deadzone-edited(p, t) => { pedal-deadzone-edited(p, t); }
                 bite-changed(v) => { pedal-bite-changed(v); }
                 bite-edited(t) => { pedal-bite-edited(t); }
+                // --- Handbrake/clutch per-module tuning ---
+                clutch-bite-width-changed(v) => { pedal-clutch-bite-width-changed(v); }
+                clutch-bite-width-edited(t) => { pedal-clutch-bite-width-edited(t); }
                 // --- Brake per-module tuning ---
                 brake-bite-changed(v) => { pedal-brake-bite-changed(v); }
                 brake-bite-edited(t) => { pedal-brake-bite-edited(t); }
@@ -902,6 +926,11 @@ export component MainWindow inherits Window {
                 handbrake-marker-y: handbrake-marker-y;
                 handbrake-mode: handbrake-mode;
                 handbrake-pressed: handbrake-pressed;
+                // --- Handbrake/clutch per-module tuning ---
+                handbrake-latch: handbrake-latch;
+                handbrake-grab-ms: handbrake-grab-ms;
+                handbrake-grab-ms-text: handbrake-grab-ms-text;
+                handbrake-auto-release: handbrake-auto-release;
                 calibration-disabled: extras-calibration-disabled;
                 gear: gear;
                 shifter-mode: shifter-mode;
@@ -924,6 +953,11 @@ export component MainWindow inherits Window {
                 handbrake-feel-selected(f) => { extras-handbrake-feel(f); }
                 handbrake-deadzone-changed(v) => { extras-handbrake-deadzone(v); }
                 handbrake-deadzone-edited(t) => { extras-handbrake-deadzone-edited(t); }
+                // --- Handbrake/clutch per-module tuning ---
+                handbrake-latch-changed(b) => { extras-handbrake-latch-changed(b); }
+                handbrake-grab-ms-changed(v) => { extras-handbrake-grab-ms-changed(v); }
+                handbrake-grab-ms-edited(t) => { extras-handbrake-grab-ms-edited(t); }
+                handbrake-auto-release-changed(b) => { extras-handbrake-auto-release-changed(b); }
                 shifter-sensitivity-changed(v) => { extras-action("shifter-sensitivity"); }
                 led-pattern-selected(i) => { extras-led-pattern(i); }
                 led-brightness-changed(v) => { extras-led-brightness(v); }

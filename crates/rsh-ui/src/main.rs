@@ -860,6 +860,9 @@ enum FieldKind {
     EncoderPulseMs,
     /// Encoder acceleration sensitivity, 0..2 (E3).
     EncoderAccelSens,
+    // --- Handbrake/clutch per-module tuning ---
+    /// Clutch slip-zone width as a fraction, 0.05..=0.40 (C2).
+    BiteWidth,
 }
 
 /// A slider drag's latest value, waiting out its debounce (M-7):
@@ -2956,6 +2959,10 @@ impl Ctx {
                     }
                     FieldKind::EncoderAccelSens => {
                         record.encoder_accel_sensitivity = Some(value.clamp(0.0, 2.0));
+                    }
+                    // --- Handbrake/clutch per-module tuning ---
+                    FieldKind::BiteWidth => {
+                        record.bite_width = Some(value.clamp(0.05, 0.40));
                     }
                 }
                 JobResult::Tuning(api.set_tuning(&record))
@@ -5112,6 +5119,10 @@ impl Ctx {
                                     effective.encoder_accel_sensitivity =
                                         local.encoder_accel_sensitivity;
                                 }
+                                // --- Handbrake/clutch per-module tuning ---
+                                FieldKind::BiteWidth => {
+                                    effective.bite_width = local.bite_width;
+                                }
                             }
                         }
                     }
@@ -5283,6 +5294,21 @@ impl Ctx {
                     pct_text(bite * 100.0).into(),
                     |v| win.set_clutch_bite_text(v),
                 );
+                // --- Handbrake/clutch per-module tuning ---
+                // C2 slip zone: the slider is 0..1 of 5..40%, so
+                // the stored 0.05..0.40 fraction is shown as
+                // (width - 0.05) / 0.35; the text is the real percent.
+                let bite_width = record.bite_width.unwrap_or(0.15);
+                set_if_changed(
+                    win.get_clutch_bite_width(),
+                    ((bite_width - 0.05) / 0.35) as f32,
+                    |v| win.set_clutch_bite_width(v),
+                );
+                set_if_changed(
+                    win.get_clutch_bite_width_text(),
+                    pct_text(bite_width * 100.0).into(),
+                    |v| win.set_clutch_bite_width_text(v),
+                );
                 set_if_changed(win.get_clutch_curve(), curve.into(), |v| {
                     win.set_clutch_curve(v);
                 });
@@ -5384,6 +5410,19 @@ impl Ctx {
             (pedals.records[index].clone(), pedals.feel_exp[index])
         };
         Self::sync_pedal_module_props(win, index, &record, feel_exp);
+    }
+
+    /// Echo a clutch slip-zone drag locally (R2-10, C2): the same
+    /// pattern as the bite echo — the slider + text move with the
+    /// mouse, the local record follows, and only the daemon push
+    /// waits out the 150 ms debounce.
+    fn apply_pedal_bite_width_local(&self, win: &MainWindow, width: f64) {
+        let (record, feel_exp) = {
+            let mut pedals = self.pedals.borrow_mut();
+            pedals.records[2].bite_width = Some(width);
+            (pedals.records[2].clone(), pedals.feel_exp[2])
+        };
+        Self::sync_pedal_module_props(win, 2, &record, feel_exp);
     }
 
     /// Echo a brake-force drag locally (R2-10, B1): same pattern —
@@ -5540,6 +5579,27 @@ impl Ctx {
             i32::from(hb.handbrake_button_mode.unwrap_or(false)),
             |v| win.set_handbrake_mode(v),
         );
+        // --- Handbrake/clutch per-module tuning ---
+        // H1 latch + H3 auto-release (both off by default); H2 grab
+        // speed is the handbrake press ramp (0..200 ms, 0 =
+        // instant), shown as a 0..1 fraction + "120 ms" text.
+        set_if_changed(
+            win.get_handbrake_latch(),
+            hb.handbrake_latch.unwrap_or(false),
+            |v| win.set_handbrake_latch(v),
+        );
+        let (grab_frac, grab_text) = ramp_frac_text(hb.press_ms.unwrap_or(0.0), 200.0);
+        set_if_changed(win.get_handbrake_grab_ms(), grab_frac, |v| {
+            win.set_handbrake_grab_ms(v);
+        });
+        set_if_changed(win.get_handbrake_grab_ms_text(), grab_text.into(), |v| {
+            win.set_handbrake_grab_ms_text(v);
+        });
+        set_if_changed(
+            win.get_handbrake_auto_release(),
+            hb.handbrake_auto_release.unwrap_or(false),
+            |v| win.set_handbrake_auto_release(v),
+        );
     }
 
     /// Write the LED card's tuning props from a record (R2-10 /
@@ -5668,6 +5728,18 @@ impl Ctx {
         let record = {
             let mut stored = self.handbrake_record.borrow_mut();
             stored.deadzone = deadzone;
+            stored.clone()
+        };
+        Self::sync_extras_handbrake_props(win, &record);
+    }
+
+    /// Echo a handbrake grab-speed drag locally (R2-10, H2): the
+    /// slider + text move with the mouse, the local record follows,
+    /// and only the daemon push waits out the 150 ms debounce.
+    fn apply_handbrake_grab_local(&self, win: &MainWindow, grab_ms: f64) {
+        let record = {
+            let mut stored = self.handbrake_record.borrow_mut();
+            stored.press_ms = Some(grab_ms);
             stored.clone()
         };
         Self::sync_extras_handbrake_props(win, &record);
@@ -8242,6 +8314,7 @@ fn wire_pedals(win: &MainWindow, ctx: &Rc<Ctx>) {
         });
     }
     wire_pedals_rest(win, ctx);
+    wire_pedals_bite_width(win, ctx);
     wire_pedals_tuning(win, ctx);
     wire_pedals_set(win, ctx);
 }
@@ -8538,6 +8611,45 @@ fn wire_pedals_rest(win: &MainWindow, ctx: &Rc<Ctx>) {
             };
             let curve = f64::from(PedalCache::feel_exponent(f));
             ctx.set_pedal_tuning(&w, module, |t| t.curve = curve);
+        });
+    }
+}
+
+/// Wire the clutch slip-zone callbacks (split from
+/// [`wire_pedals_rest`]: C2 bite width, 5–40% around the bite
+/// point).
+// --- Handbrake/clutch per-module tuning ---
+fn wire_pedals_bite_width(win: &MainWindow, ctx: &Rc<Ctx>) {
+    // C2 slip zone: the slider is 0..1 of 5..40% (like deadzone is
+    // 0..1 of 10%), so a drag value maps to 0.05..0.40; typed
+    // percents are 5–40%.
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_clutch_bite_width_changed(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let width = (0.05 + f64::from(v) * 0.35).clamp(0.05, 0.40);
+            // R2-10: local echo — the slider + text move with the
+            // drag, not at the next ~1 Hz re-sync.
+            ctx.apply_pedal_bite_width_local(&w, width);
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("clutch", FieldKind::BiteWidth, width);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_clutch_bite_width_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let Ok(pct) = t.trim().trim_end_matches('%').parse::<f32>() else {
+                return;
+            };
+            let width = (f64::from(pct) / 100.0).clamp(0.05, 0.40);
+            ctx.set_pedal_tuning(&w, "clutch", |t| t.bite_width = Some(width));
         });
     }
 }
@@ -9214,6 +9326,62 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                 }
             }
         });
+    }
+    // --- Handbrake/clutch per-module tuning ---
+    // H1 latch + H3 auto-release: switches push immediately.
+    // H2 grab speed: the slider is 0..1 of 0..200 ms (the
+    // handbrake press ramp); drags echo locally + push debounced,
+    // typed values parse like the encoder pulse ("120 ms").
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_handbrake_latch_changed(move |b| {
+            if let Some(w) = win.upgrade() {
+                ctx.set_module_tuning(&w, "handbrake", |t| {
+                    t.handbrake_latch = Some(b);
+                });
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_handbrake_grab_ms_changed(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let grab_ms = (f64::from(v) * 200.0).clamp(0.0, 200.0);
+            // R2-10: local echo — the slider + text move with the
+            // drag, not at the next ~1 Hz re-sync.
+            ctx.apply_handbrake_grab_local(&w, grab_ms);
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("handbrake", FieldKind::PressMs, grab_ms);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_handbrake_grab_ms_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
+                let grab_ms = ms.clamp(0.0, 200.0);
+                ctx.set_module_tuning(&w, "handbrake", |t| t.press_ms = Some(grab_ms));
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap()
+            .on_extras_handbrake_auto_release_changed(move |b| {
+                if let Some(w) = win.upgrade() {
+                    ctx.set_module_tuning(&w, "handbrake", |t| {
+                        t.handbrake_auto_release = Some(b);
+                    });
+                }
+            });
     }
     {
         let win = win.as_weak();
@@ -12501,6 +12669,9 @@ mod tests {
         assert_eq!(win.get_clutch_curve_text().as_str(), "1.00");
         assert!((win.get_clutch_release_ms_value() - 0.3).abs() < 0.001);
         assert_eq!(win.get_clutch_release_ms_text().as_str(), "300 ms");
+        // C2: clutch slip zone defaults to 15% (frac (0.15-0.05)/0.35).
+        assert!((win.get_clutch_bite_width() - (0.15_f32 - 0.05) / 0.35).abs() < 0.001);
+        assert_eq!(win.get_clutch_bite_width_text().as_str(), "15%");
         // Drags echo locally (frac + text + local record).
         win.invoke_pedal_curve_changed(0, 0.5);
         assert_eq!(win.get_throttle_curve_value(), 0.5);
@@ -12514,6 +12685,11 @@ mod tests {
         assert_eq!(win.get_clutch_release_ms_value(), 0.5);
         assert_eq!(win.get_clutch_release_ms_text().as_str(), "500 ms");
         assert_eq!(ctx.pedals.borrow().records[2].release_ms, Some(500.0));
+        // C2: slip-zone drag to full (1.0 of 5..40%) echoes 40%.
+        win.invoke_pedal_clutch_bite_width_changed(1.0);
+        assert_eq!(win.get_clutch_bite_width(), 1.0);
+        assert_eq!(win.get_clutch_bite_width_text().as_str(), "40%");
+        assert_eq!(ctx.pedals.borrow().records[2].bite_width, Some(0.4));
         // Saturation 0.5 → 85% of the (uncalibrated) 3300 mV span.
         win.invoke_throttle_saturation_changed(0.5);
         assert_eq!(win.get_throttle_saturation_value(), 0.5);
@@ -12533,6 +12709,49 @@ mod tests {
         drain_all_jobs(&ctx, &win);
         assert!(win.get_combine_pedals());
         assert_eq!(ctx.api().get_tuning("throttle").combine_pedals, Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Workstream G (H1–H3): the handbrake tuning controls sync —
+    /// latch + auto-release default off, grab speed defaults to
+    /// 0 ms (instant); the grab drag echoes locally and the latch
+    /// toggle pushes through `set_tuning`.
+    #[test]
+    fn handbrake_tuning_controls_sync_to_window() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("Workstream G window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        ctx.sync_extras(&win);
+        // Sim neutral = task defaults: latch off, auto-release off,
+        // grab 0 ms.
+        assert!(!win.get_handbrake_latch());
+        assert_eq!(win.get_handbrake_grab_ms(), 0.0);
+        assert_eq!(win.get_handbrake_grab_ms_text().as_str(), "0 ms");
+        assert!(!win.get_handbrake_auto_release());
+        // Grab drag echoes locally (frac + text + local record).
+        win.invoke_extras_handbrake_grab_ms_changed(0.5);
+        assert_eq!(win.get_handbrake_grab_ms(), 0.5);
+        assert_eq!(win.get_handbrake_grab_ms_text().as_str(), "100 ms");
+        assert_eq!(ctx.handbrake_record.borrow().press_ms, Some(100.0));
+        // The latch + auto-release toggles push through `set_tuning`
+        // (drain the job, then the window re-syncs from the return).
+        win.invoke_extras_handbrake_latch_changed(true);
+        drain_all_jobs(&ctx, &win);
+        assert!(win.get_handbrake_latch());
+        assert_eq!(
+            ctx.api().get_tuning("handbrake").handbrake_latch,
+            Some(true)
+        );
+        win.invoke_extras_handbrake_auto_release_changed(true);
+        drain_all_jobs(&ctx, &win);
+        assert!(win.get_handbrake_auto_release());
+        assert_eq!(
+            ctx.api().get_tuning("handbrake").handbrake_auto_release,
+            Some(true)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

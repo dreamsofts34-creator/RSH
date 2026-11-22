@@ -65,6 +65,12 @@ pub enum ShifterGateMode {
 /// mis-ordered endpoints) is never applied as-is: the mapper falls
 /// back to the default range (`300..=3300` mV, centre `1800` mV).
 /// [`sanitized`](Self::sanitized) applies the same rules eagerly.
+///
+/// Five independent flags, one per module behaviour (`enabled`,
+/// `invert`, encoder accel, handbrake latch + auto-release) —
+/// grouping them would obscure the flat plan shape the pipeline
+/// reads per module.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModuleTuning {
     /// False = the module emits nothing (neutral output).
@@ -140,6 +146,21 @@ pub struct ModuleTuning {
     /// inverts encoder `i` (only bits `0..=3` are kept). OR-ed with
     /// the module-level `invert`, which inverts all encoders.
     pub encoder_invert_mask: u8,
+    // --- Handbrake/clutch per-module tuning ---
+    /// Latch mode (H1, handbrake only): a rising edge toggles a
+    /// held handbrake instead of following the input. Default
+    /// `false` (off — the output follows the input).
+    pub handbrake_latch: bool,
+    /// Auto-release on throttle (H3, handbrake only): with latch
+    /// on, accelerator past 20% clears the latch (rally launch).
+    /// Default `false` (off). Only read when `handbrake_latch`.
+    pub handbrake_auto_release: bool,
+    /// Engagement width / slip zone (C2, clutch only), `0.05..=0.40`
+    /// as a fraction of travel (default `0.15`). `0.0` = no slip
+    /// zone — the bite is the old hard stretch. Only the clutch
+    /// plan carries a nonzero value; every other module keeps
+    /// `0.0`, so their bite behaviour is unchanged.
+    pub bite_width: f32,
 }
 
 impl Default for ModuleTuning {
@@ -169,6 +190,10 @@ impl Default for ModuleTuning {
             accel_enabled: false,
             accel_sensitivity: 1.0,
             encoder_invert_mask: 0,
+            // --- Handbrake/clutch per-module tuning ---
+            handbrake_latch: false,
+            handbrake_auto_release: false,
+            bite_width: 0.0,
         }
     }
 }
@@ -211,6 +236,14 @@ impl ModuleTuning {
         };
         out.accel_sensitivity = clamp_finite(self.accel_sensitivity, 0.0, 2.0, 1.0);
         out.encoder_invert_mask = self.encoder_invert_mask & 0x0F;
+        // --- Handbrake/clutch per-module tuning ---
+        // A slip width of 0 (or less) is "off" — the hard stretch
+        // — so it is kept, not clamped up to 0.05.
+        out.bite_width = if self.bite_width <= 0.0 {
+            0.0
+        } else {
+            clamp_finite(self.bite_width, 0.05, 0.40, 0.0)
+        };
         if validate_pedal_range(self.min_mv, self.max_mv).is_err() {
             out.min_mv = DEFAULT_MIN_MV;
             out.max_mv = DEFAULT_MAX_MV;
@@ -579,6 +612,13 @@ pub struct ProcessingPipeline {
     /// E2 sub-click remainder: counts banked per encoder toward the
     /// next whole step (`counts_per_click` counts = one step).
     encoder_remainder: [i32; MAX_ENCODERS],
+    // --- Handbrake/clutch per-module tuning ---
+    /// H1 latch state: true while a latched handbrake press is
+    /// held on (output forced to 1.0) after the input was released.
+    handbrake_latched: bool,
+    /// Previous tick's pressed state (processed handbrake value
+    /// above 0.5): a rising edge toggles the latch (H1).
+    handbrake_prev_pressed: bool,
 }
 
 impl Default for ProcessingPipeline {
@@ -611,6 +651,9 @@ impl ProcessingPipeline {
             encoders: EncoderTracker::new(),
             encoder_pulse: [0; MAX_ENCODERS * 2],
             encoder_remainder: [0; MAX_ENCODERS],
+            // --- Handbrake/clutch per-module tuning ---
+            handbrake_latched: false,
+            handbrake_prev_pressed: false,
             plan,
         }
     }
@@ -660,6 +703,9 @@ impl ProcessingPipeline {
         self.encoders.reset();
         self.encoder_pulse = [0; MAX_ENCODERS * 2];
         self.encoder_remainder = [0; MAX_ENCODERS];
+        // --- Handbrake/clutch per-module tuning ---
+        self.handbrake_latched = false;
+        self.handbrake_prev_pressed = false;
     }
 
     /// Process one stream frame into an [`OutputState`].
@@ -714,11 +760,20 @@ impl ProcessingPipeline {
             &mut self.clutch_ramp,
         );
         let handbrake_tuning = self.plan.handbrake;
-        out.handbrake = process_pedal_axis(
+        let handbrake_value = process_pedal_axis(
             frame.axes_mv[HANDBRAKE_SLOT],
             &handbrake_tuning,
             &mut self.handbrake_filter,
             &mut self.handbrake_ramp,
+        );
+        // H1/H3: the latch holds the output at full after the input
+        // is released (and auto-release drops it on throttle).
+        // The accelerator is already processed above, so the
+        // 20% throttle test reads this tick's value.
+        out.handbrake = self.apply_handbrake_latch(
+            handbrake_value,
+            out.accelerator,
+            frame.axes_mv[HANDBRAKE_SLOT].is_some(),
         );
 
         if self.plan.combine_pedals {
@@ -842,6 +897,48 @@ impl ProcessingPipeline {
         }
         EncoderButtons(mask)
     }
+
+    // --- Handbrake/clutch per-module tuning ---
+    /// H1/H3: handbrake latch + auto-release on throttle.
+    ///
+    /// `value` is the processed handbrake output (post-ramp,
+    /// `0..=1`); `accel` is this tick's accelerator output;
+    /// `input_present` is false when the axis is missing (the
+    /// board does not sample it). "Pressed" is `value > 0.5`:
+    /// a full pull (axis) or a debounced press (button mode,
+    /// which the firmware sends as 4095/0 on the same axis).
+    /// A rising edge toggles the latch — press once = stays at
+    /// full, press again = release. While latched the output is
+    /// `1.0` whatever the input; on release the output follows
+    /// the input again (so unlatching while still holding gives
+    /// full until the lever is let go). With latch off, or the
+    /// module disabled / the axis missing, the latch clears and
+    /// the output follows the input. H3: with latch and
+    /// auto-release both on, accelerator past 20% clears the
+    /// latch (rally launch) — before the edge test, so a
+    /// throttle press never re-latches in the same tick.
+    fn apply_handbrake_latch(&mut self, value: f32, accel: f32, input_present: bool) -> f32 {
+        let tuning = self.plan.handbrake;
+        if !tuning.enabled || !input_present {
+            self.handbrake_latched = false;
+            self.handbrake_prev_pressed = false;
+            return 0.0;
+        }
+        if !tuning.handbrake_latch {
+            self.handbrake_latched = false;
+            self.handbrake_prev_pressed = value > 0.5;
+            return value;
+        }
+        if tuning.handbrake_auto_release && self.handbrake_latched && accel > 0.2 {
+            self.handbrake_latched = false;
+        }
+        let pressed = value > 0.5;
+        if pressed && !self.handbrake_prev_pressed {
+            self.handbrake_latched = !self.handbrake_latched;
+        }
+        self.handbrake_prev_pressed = pressed;
+        if self.handbrake_latched { 1.0 } else { value }
+    }
 }
 
 /// Encoder pulse hold in ticks for a `pulse_ms` setting (E1): one
@@ -886,6 +983,38 @@ pub fn apply_bite_point(value: f32, bite: f32) -> f32 {
         return 0.0;
     }
     ((value - bite) / (1.0 - bite)).clamp(0.0, 1.0)
+}
+
+/// Bite-point remap with a slip zone for a mapped pedal value in
+/// `0..=1`: the clutch engages over a travel width `width` around
+/// the bite instead of the hard stretch. Below `bite - width/2`
+/// the output is `0.0`; above `bite + width/2` it is the hard
+/// [`apply_bite_point`] stretch; between the two it ramps linearly
+/// from `0.0` to the hard value at the top of the zone, so the
+/// curve is continuous and the knee is soft instead of sharp. A
+/// width of `0.0` (or less), a bite of `0.0`, or a bite of `1.0`
+/// is exactly the hard remap — the clutch default is `0.15`, every
+/// other module carries `0.0`, so only the clutch ever softens.
+#[must_use]
+pub fn apply_bite_point_width(value: f32, bite: f32, width: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    let bite = bite.clamp(0.0, 1.0);
+    if width <= 0.0 || bite <= 0.0 || bite >= 1.0 {
+        return apply_bite_point(value, bite);
+    }
+    let lo = (bite - width / 2.0).max(0.0);
+    let hi = (bite + width / 2.0).min(1.0);
+    if hi <= lo {
+        return apply_bite_point(value, bite);
+    }
+    if value <= lo {
+        return 0.0;
+    }
+    let hard_at_hi = (hi - bite) / (1.0 - bite);
+    if value >= hi {
+        return apply_bite_point(value, bite);
+    }
+    ((value - lo) / (hi - lo) * hard_at_hi).clamp(0.0, 1.0)
 }
 
 /// Brake-force (BRF) rescale for a mapped pedal value in `0..=1`:
@@ -1053,7 +1182,10 @@ fn process_pedal_axis(
         value = 1.0 - value;
     }
     // L4 clutch bite point: engages at the bite, silent before it.
-    value = apply_bite_point(value, tuning.bite_point);
+    // C2: the clutch plan carries a slip width (0.15) that softens
+    // the stretch into a zone around the bite; every other module
+    // carries 0.0, so their bite is the hard stretch as before.
+    value = apply_bite_point_width(value, tuning.bite_point, tuning.bite_width);
     value = apply_deadzone_unipolar(value, tuning.deadzone);
     value = apply_curve(value, tuning.curve_strength);
     value = apply_smoothing(filter, value, tuning.smoothing);
@@ -1831,6 +1963,176 @@ mod tests {
             approx(out.clutch, 0.833_333_3),
             "clutch at 90% with bite 0.4: {}",
             out.clutch
+        );
+    }
+
+    #[test]
+    fn bite_width_softens_the_bite_into_a_slip_zone() {
+        use super::{ModuleTuning, apply_bite_point_width};
+        // Width 0 is exactly the hard remap.
+        assert!(approx(apply_bite_point_width(0.7, 0.4, 0.0), 0.5));
+        assert!(approx(apply_bite_point_width(0.2, 0.4, 0.0), 0.0));
+        // Bite 0.35, width 0.15: the zone is 0.275..0.425 and the
+        // hard value at the top of the zone is
+        // (0.425 - 0.35) / 0.65 = 0.1154.
+        assert!(approx(apply_bite_point_width(0.2, 0.35, 0.15), 0.0));
+        assert!(approx(apply_bite_point_width(0.275, 0.35, 0.15), 0.0));
+        assert!(approx(
+            apply_bite_point_width(0.35, 0.35, 0.15),
+            0.057_692_31
+        ));
+        assert!(approx(
+            apply_bite_point_width(0.425, 0.35, 0.15),
+            0.115_384_62
+        ));
+        // Above the zone it is the hard stretch again.
+        assert!(approx(
+            apply_bite_point_width(0.7, 0.35, 0.15),
+            0.538_461_55
+        ));
+        assert!(approx(apply_bite_point_width(1.0, 0.35, 0.15), 1.0));
+        // Sanitize: 0 stays off (hard), over-range clamps, NaN
+        // falls back to off — never to a fake width.
+        assert!(approx(
+            ModuleTuning {
+                bite_width: 0.5,
+                ..ModuleTuning::default()
+            }
+            .sanitized()
+            .bite_width,
+            0.40
+        ));
+        assert!(approx(
+            ModuleTuning {
+                bite_width: -0.1,
+                ..ModuleTuning::default()
+            }
+            .sanitized()
+            .bite_width,
+            0.0
+        ));
+        assert!(approx(
+            ModuleTuning {
+                bite_width: f32::NAN,
+                ..ModuleTuning::default()
+            }
+            .sanitized()
+            .bite_width,
+            0.0
+        ));
+        // Through the pipeline: clutch at 35% travel (1350 mV)
+        // with bite 0.35 + width 0.15 is mid-zone (0.0577), not
+        // the hard 0.0; at 70% travel it is the hard 0.5385.
+        let mut plan = plain_plan();
+        plan.clutch.bite_point = 0.35;
+        plan.clutch.bite_width = 0.15;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[(3, 900)], &[], 0));
+        assert!(approx(out.clutch, 0.0));
+        let out = pipe.process(&frame(&[(3, 1350)], &[], 0));
+        assert!(
+            approx(out.clutch, 0.057_692_31),
+            "clutch mid-zone: {}",
+            out.clutch
+        );
+        let out = pipe.process(&frame(&[(3, 2400)], &[], 0));
+        assert!(
+            approx(out.clutch, 0.538_461_55),
+            "clutch above zone: {}",
+            out.clutch
+        );
+        // The brake carries the same bite but width 0.0, so its
+        // bite stays the hard stretch: 35% travel is exactly 0.
+        let mut plan = plain_plan();
+        plan.brake.bite_point = 0.35;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[(2, 1350)], &[], 0));
+        assert!(approx(out.brake, 0.0));
+    }
+
+    #[test]
+    fn handbrake_latch_holds_and_releases_on_second_press() {
+        // H1: press once = stays on after release, press again =
+        // release. Latch off = the output follows the input.
+        let mut plan = plain_plan();
+        plan.handbrake.handbrake_latch = true;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[(4, 3300)], &[], 0));
+        assert!(approx(out.handbrake, 1.0));
+        let out = pipe.process(&frame(&[(4, 300)], &[], 0));
+        assert!(approx(out.handbrake, 1.0), "latched after release");
+        let out = pipe.process(&frame(&[(4, 300)], &[], 0));
+        assert!(approx(out.handbrake, 1.0), "still latched");
+        let out = pipe.process(&frame(&[(4, 3300)], &[], 0));
+        assert!(approx(out.handbrake, 1.0), "unlatching press still holds");
+        let out = pipe.process(&frame(&[(4, 300)], &[], 0));
+        assert!(approx(out.handbrake, 0.0), "released after unlatch");
+        // Latch off: the same sequence follows the input.
+        let mut pipe = ProcessingPipeline::new(plain_plan());
+        let out = pipe.process(&frame(&[(4, 3300)], &[], 0));
+        assert!(approx(out.handbrake, 1.0));
+        let out = pipe.process(&frame(&[(4, 300)], &[], 0));
+        assert!(approx(out.handbrake, 0.0));
+        // A missing axis clears a latch (no stale hold): latch,
+        // release, drop the axis, then press again latches fresh
+        // instead of toggling the old latch off.
+        let mut plan = plain_plan();
+        plan.handbrake.handbrake_latch = true;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[(4, 3300)], &[], 0));
+        let out = pipe.process(&frame(&[(4, 300)], &[], 0));
+        assert!(approx(out.handbrake, 1.0));
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert!(approx(out.handbrake, 0.0), "missing axis clears latch");
+        let out = pipe.process(&frame(&[(4, 3300)], &[], 0));
+        assert!(approx(out.handbrake, 1.0), "fresh latch after clear");
+    }
+
+    #[test]
+    fn handbrake_auto_release_clears_latch_on_throttle() {
+        // H3: with latch + auto-release on, throttle past 20%
+        // releases the handbrake (rally launch); 20% exactly does
+        // not. Without auto-release the latch survives full throttle.
+        let mut plan = plain_plan();
+        plan.handbrake.handbrake_latch = true;
+        plan.handbrake.handbrake_auto_release = true;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[(4, 3300)], &[], 0));
+        let out = pipe.process(&frame(&[(4, 300)], &[], 0));
+        assert!(approx(out.handbrake, 1.0));
+        // Throttle at exactly 20% (900 mV): still latched.
+        let out = pipe.process(&frame(&[(1, 900), (4, 300)], &[], 0));
+        assert!(approx(out.accelerator, 0.2));
+        assert!(approx(out.handbrake, 1.0), "20% throttle keeps latch");
+        // Throttle at 50% (1800 mV): latch clears.
+        let out = pipe.process(&frame(&[(1, 1800), (4, 300)], &[], 0));
+        assert!(approx(out.accelerator, 0.5));
+        assert!(approx(out.handbrake, 0.0), "throttle released the latch");
+        // Auto-release off: full throttle leaves the latch on.
+        let mut plan = plain_plan();
+        plan.handbrake.handbrake_latch = true;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let _ = pipe.process(&frame(&[(4, 3300)], &[], 0));
+        let out = pipe.process(&frame(&[(1, 3300), (4, 300)], &[], 0));
+        assert!(approx(out.handbrake, 1.0), "no auto-release, latch holds");
+    }
+
+    #[test]
+    fn handbrake_grab_speed_ramps_through_press_ms() {
+        // H2: grab speed IS the handbrake press ramp — 200 ms
+        // takes 40 ticks to full travel, so the second tick after
+        // a full pull is only 5/200 = 0.025 (the first tick is the
+        // ramp's passthrough at rest).
+        let mut plan = plain_plan();
+        plan.handbrake.press_ms = 200.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[(4, 300)], &[], 0));
+        assert!(approx(out.handbrake, 0.0));
+        let out = pipe.process(&frame(&[(4, 3300)], &[], 0));
+        assert!(
+            approx(out.handbrake, 0.025),
+            "grab 200 ms: {}",
+            out.handbrake
         );
     }
 

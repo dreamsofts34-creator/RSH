@@ -264,6 +264,19 @@ pub struct PerModuleTuning {
     /// only), bits 0–3. `None` = never set — 0 (no invert) applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_invert_mask: Option<u8>,
+    // --- Handbrake/clutch per-module tuning ---
+    /// Latch mode (H1, handbrake module only). `None` = never set
+    /// (old profile) — off applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handbrake_latch: Option<bool>,
+    /// Auto-release on throttle (H3, handbrake module only).
+    /// `None` = never set (old profile) — off applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handbrake_auto_release: Option<bool>,
+    /// Engagement width / slip zone (C2, clutch module only),
+    /// 0.05..=0.40. `None` = never set (old profile) — 0.15 applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bite_width: Option<f64>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -550,6 +563,10 @@ impl Default for PerModuleTuning {
             encoder_accel: None,
             encoder_accel_sensitivity: None,
             encoder_invert_mask: None,
+            // --- Handbrake/clutch per-module tuning ---
+            handbrake_latch: None,
+            handbrake_auto_release: None,
+            bite_width: None,
         }
     }
 }

@@ -58,8 +58,9 @@ pub fn steering_lock_deg_to_scale(deg: f64) -> f64 {
 
 /// Default pedal press-ramp ms for a module (per-module tuning,
 /// Workstream C): the accelerator opens over 100 ms, the brake bites
-/// over 50 ms; other modules have no press ramp of their own and
-/// fall back to the profile's global `pedal_press_ms` (150 ms).
+/// over 50 ms, the handbrake grabs instantly (0 ms, H2); other
+/// modules have no press ramp of their own and fall back to the
+/// profile's global `pedal_press_ms` (150 ms).
 /// Both spellings of the throttle id are accepted — the UI writes
 /// `"throttle"`, the pipeline reads `"accelerator"`.
 #[must_use]
@@ -67,6 +68,7 @@ pub fn default_press_ms(module: &str) -> Option<f64> {
     match module {
         "accelerator" | "throttle" => Some(100.0),
         "brake" => Some(50.0),
+        "handbrake" => Some(0.0),
         _ => None,
     }
 }
@@ -277,6 +279,24 @@ pub struct TuningSettings {
     /// bit `i` inverts encoder `i` (only bits 0–3 used).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_invert_mask: Option<u8>,
+    // --- Handbrake/clutch per-module tuning ---
+    /// Latch mode (H1, handbrake module only): press once = the
+    /// handbrake stays on, press again = release. `None` = not
+    /// applicable — other modules never carry it. Default off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handbrake_latch: Option<bool>,
+    /// Auto-release on throttle (H3, handbrake module only): only
+    /// with latch on, pressing the throttle past 20% releases the
+    /// handbrake (rally launch). `None` = not applicable. Default off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handbrake_auto_release: Option<bool>,
+    /// Engagement width / slip zone (C2, clutch module only): the
+    /// travel width, as a fraction 0.05..=0.40 (default 0.15), over
+    /// which the clutch engages around the bite point instead of
+    /// the hard stretch. `None` = not applicable — other modules
+    /// never carry it (their bite stays a hard stretch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bite_width: Option<f64>,
 }
 
 impl TuningSettings {
@@ -325,6 +345,21 @@ impl TuningSettings {
             encoder_accel: None,
             encoder_accel_sensitivity: None,
             encoder_invert_mask: None,
+            // --- Handbrake/clutch per-module tuning ---
+            // Latch + auto-release live on the handbrake record
+            // only (both off); the slip zone on the clutch record
+            // only (15%). Other modules never carry them.
+            handbrake_latch: if module == "handbrake" {
+                Some(false)
+            } else {
+                None
+            },
+            handbrake_auto_release: if module == "handbrake" {
+                Some(false)
+            } else {
+                None
+            },
+            bite_width: if module == "clutch" { Some(0.15) } else { None },
         }
     }
 }
@@ -455,6 +490,12 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
         errors.push(format!(
             "encoder_invert_mask {mask} uses bits outside 0..=3"
         ));
+    }
+    // --- Handbrake/clutch per-module tuning ---
+    if let Some(width) = tuning.bite_width
+        && !(0.05..=0.40).contains(&width)
+    {
+        errors.push(format!("bite_width {width} is outside 0.05..=0.40"));
     }
     errors
 }
@@ -665,6 +706,57 @@ mod tests {
             errors.iter().any(|e| e.contains("encoder_invert_mask")),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn handbrake_clutch_fields_round_trip_and_validate() {
+        // H1/H3 + C2: latch off, auto-release off, grab 0 ms
+        // (press_ms), slip zone 15% — old profiles load with
+        // exactly these defaults (None in the stored JSON).
+        assert_eq!(default_press_ms("handbrake"), Some(0.0));
+        let mut hb = tuning("handbrake");
+        assert_eq!(hb.handbrake_latch, Some(false));
+        assert_eq!(hb.handbrake_auto_release, Some(false));
+        assert_eq!(hb.press_ms, Some(0.0));
+        assert_eq!(hb.bite_width, None);
+        assert_eq!(validate_tuning(&hb), Vec::<String>::new());
+        hb.handbrake_latch = Some(true);
+        hb.handbrake_auto_release = Some(true);
+        hb.press_ms = Some(120.0);
+        assert_eq!(validate_tuning(&hb), Vec::<String>::new());
+        let json = serde_json::to_string(&hb).expect("serialize");
+        assert!(json.contains("\"handbrakeLatch\":true"), "{json}");
+        assert!(json.contains("\"handbrakeAutoRelease\":true"), "{json}");
+        assert!(json.contains("\"pressMs\":120.0"), "{json}");
+        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, hb);
+        // Other modules never carry them: omitted from the JSON.
+        let json = serde_json::to_string(&tuning("brake")).expect("serialize");
+        assert!(!json.contains("handbrakeLatch"), "{json}");
+        assert!(!json.contains("handbrakeAutoRelease"), "{json}");
+        assert!(!json.contains("biteWidth"), "{json}");
+
+        let mut clutch = tuning("clutch");
+        assert_eq!(clutch.bite_width, Some(0.15));
+        assert_eq!(validate_tuning(&clutch), Vec::<String>::new());
+        clutch.bite_width = Some(0.4);
+        assert_eq!(validate_tuning(&clutch), Vec::<String>::new());
+        let json = serde_json::to_string(&clutch).expect("serialize");
+        assert!(json.contains("\"biteWidth\":0.4"), "{json}");
+        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, clutch);
+        // Old JSON without the fields loads with the defaults
+        // (None here — `get_tuning` fills them in; see state.rs).
+        let old = r#"{"module":"clutch","deadzone":0.0,"curve":1.0,"minMv":0.0,"maxMv":3300.0,"smoothing":0.0,"bitePoint":0.35}"#;
+        let back: TuningSettings = serde_json::from_str(old).expect("deserialize old");
+        assert_eq!(back.bite_width, None);
+        assert_eq!(back.bite_point, Some(0.35));
+        // Out-of-range slip width is rejected, never silently clamped.
+        let mut bad = tuning("clutch");
+        bad.bite_width = Some(0.04);
+        let errors = validate_tuning(&bad);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].contains("bite_width"), "{}", errors[0]);
     }
 
     #[test]

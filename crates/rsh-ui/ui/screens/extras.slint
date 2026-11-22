@@ -120,6 +120,13 @@ export component ExtrasScreen inherits VerticalLayout {
     in property <bool> calibration-disabled: true;
     in property <int> handbrake-mode: 0; // 0 Axis, 1 Button (F-15)
     in property <bool> handbrake-pressed: false; // button-mode live state
+    // --- Handbrake/clutch per-module tuning ---
+    // H1 latch, H2 grab speed (0..1 of 0..200 ms), H3
+    // auto-release on throttle. Rust owns the values.
+    in property <bool> handbrake-latch: false;
+    in property <float> handbrake-grab-ms: 0;
+    in property <string> handbrake-grab-ms-text: "0 ms";
+    in property <bool> handbrake-auto-release: false;
     // ---- shifter (live)
     in property <string> gear: "—"; // "—" until the wheel reports a gear (A7)
     in property <int> shifter-mode: 0; // 0 Sequential, 1 H-pattern
@@ -149,6 +156,11 @@ export component ExtrasScreen inherits VerticalLayout {
     callback handbrake-feel-selected(int);
     callback handbrake-deadzone-changed(float);
     callback handbrake-deadzone-edited(string);
+    // --- Handbrake/clutch per-module tuning ---
+    callback handbrake-latch-changed(bool);
+    callback handbrake-grab-ms-changed(float); // 0..1 of 0..200 ms
+    callback handbrake-grab-ms-edited(string); // typed "120 ms"
+    callback handbrake-auto-release-changed(bool);
     callback shifter-sensitivity-changed(float);
     callback led-pattern-selected(int);
     callback led-brightness-changed(float);
@@ -254,6 +266,35 @@ export component ExtrasScreen inherits VerticalLayout {
                                 ButtonTile { label: "HANDBRAKE"; action: handbrake-pressed ? "Pressed" : "Released"; pressed: handbrake-pressed; clicked => { action("handbrake-test"); } }
                                 Text { text: "Button mode: the handbrake acts as a digital button (firmware F-15)."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
                             }
+                            // --- Handbrake/clutch per-module tuning ---
+                            // H1/H2/H3: latch + grab speed + throttle
+                            // auto-release. Outside the Axis / Button
+                            // branches — the latch and the grab ramp
+                            // work on the processed axis value in both
+                            // modes (button mode sends 4095/0 on the
+                            // same axis). Auto-release only fires
+                            // while latch is on (the engine enforces
+                            // it too); the note says so when it is off.
+                            HorizontalLayout {
+                                spacing: 8px;
+                                VerticalLayout {
+                                    Text { text: "Latch mode"; font-size: 13px; font-weight: 500; color: Theme.text; }
+                                    Text { text: "Press once to hold, again to release"; font-size: 11.5px; color: Theme.faint; }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                Switch { accessible-name: "Latch mode"; on: handbrake-latch; toggled => { handbrake-latch-changed(!handbrake-latch); } }
+                            }
+                            SliderRow { label: "Grab speed"; hint: "How fast the handbrake bites"; value-text: handbrake-grab-ms-text; value: handbrake-grab-ms; changed(v) => { handbrake-grab-ms-changed(v); } value-edited(t) => { handbrake-grab-ms-edited(t); } }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                VerticalLayout {
+                                    Text { text: "Auto-release on throttle"; font-size: 13px; font-weight: 500; color: Theme.text; }
+                                    Text { text: "Throttle releases a latched handbrake"; font-size: 11.5px; color: Theme.faint; }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                Switch { accessible-name: "Auto-release on throttle"; on: handbrake-auto-release; toggled => { handbrake-auto-release-changed(!handbrake-auto-release); } }
+                            }
+                            if !handbrake-latch : Text { text: "Auto-release only works with latch on."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
                         }
                     }
                 }

@@ -2325,6 +2325,104 @@ fn ui_encoder_tuning() -> Outcome {
     report.finish()
 }
 
+/// Gate: handbrake + clutch per-module tuning (H1–H3 + C2) — the
+/// Extras handbrake card holds the latch switch, the grab-speed
+/// slider and the auto-release switch; the Pedals clutch card holds
+/// the slip-zone slider (clutch only); the window + Rust wiring
+/// exist behind them. Static source checks only, like
+/// `ui_encoder_tuning`: the Extras page has no probe harness, and
+/// the clutch slider's callback fire is covered by the pedals probe
+/// (`pedals_probe_callbacks`).
+fn ui_handbrake_clutch_tuning() -> Outcome {
+    let mut report = Report::new();
+    let extras = match read_gate_source("crates/rsh-ui/ui/screens/extras.slint") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for label in ["Latch mode", "Grab speed", "Auto-release on throttle"] {
+        report.check(
+            &format!("handbrake-tuning-has-{label}"),
+            extras.contains(label),
+            &format!("extras.slint must contain the {label} control"),
+        );
+    }
+    let pedals = match read_gate_source("crates/rsh-ui/ui/screens/pedals.slint") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    report.check(
+        "clutch-tuning-has-slip-zone",
+        pedals.contains("Slip zone"),
+        "pedals.slint must contain the Slip zone control",
+    );
+    report.check(
+        "clutch-tuning-slip-zone-only-on-clutch",
+        pedals.matches("show-bite-width: true").count() == 1,
+        "only the clutch card shows the Slip zone row (throttle/brake must not)",
+    );
+    let main_slint = match read_gate_source("crates/rsh-ui/ui/main.slint") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for prop in [
+        "handbrake-latch",
+        "handbrake-grab-ms",
+        "handbrake-grab-ms-text",
+        "handbrake-auto-release",
+        "clutch-bite-width",
+        "clutch-bite-width-text",
+    ] {
+        report.check(
+            &format!("handbrake-clutch-tuning-prop-{prop}"),
+            main_slint.contains(prop),
+            &format!("main.slint must carry the {prop} window property"),
+        );
+    }
+    for callback in [
+        "extras-handbrake-latch-changed",
+        "extras-handbrake-grab-ms-changed",
+        "extras-handbrake-grab-ms-edited",
+        "extras-handbrake-auto-release-changed",
+        "pedal-clutch-bite-width-changed",
+        "pedal-clutch-bite-width-edited",
+    ] {
+        report.check(
+            &format!("handbrake-clutch-tuning-callback-{callback}"),
+            main_slint.contains(&format!("callback {callback}")),
+            &format!("main.slint must declare the {callback} callback"),
+        );
+    }
+    let main_rs = match read_gate_source("crates/rsh-ui/src/main.rs") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for wired in [
+        "on_extras_handbrake_latch_changed",
+        "on_extras_handbrake_grab_ms_changed",
+        "on_extras_handbrake_grab_ms_edited",
+        "on_extras_handbrake_auto_release_changed",
+        "on_pedal_clutch_bite_width_changed",
+        "on_pedal_clutch_bite_width_edited",
+        "FieldKind::BiteWidth",
+        "apply_handbrake_grab_local",
+        "apply_pedal_bite_width_local",
+    ] {
+        report.check(
+            &format!("handbrake-clutch-tuning-wired-{wired}"),
+            main_rs.contains(wired),
+            &format!("main.rs must wire {wired}"),
+        );
+    }
+    // H2 grab speed reuses the press-ramp push (the handbrake
+    // `press_ms`), never a new field kind.
+    report.check(
+        "handbrake-grab-reuses-press-ms-push",
+        main_rs.contains("queue_field_push(\"handbrake\", FieldKind::PressMs, grab_ms)"),
+        "main.rs must push grab speed as a handbrake PressMs field push",
+    );
+    report.finish()
+}
+
 /// The probe's new callbacks exist with the right signatures and
 /// fire: invoke each root callback and check the handler receives
 /// the value.
@@ -2347,6 +2445,11 @@ fn pedals_probe_callbacks(instance: &ComponentInstance, report: &mut Report) -> 
         ),
         (
             "throttle-saturation-changed",
+            vec![Value::Number(0.5)],
+            0.5_f64,
+        ),
+        (
+            "clutch-bite-width-changed",
             vec![Value::Number(0.5)],
             0.5_f64,
         ),
@@ -2499,6 +2602,11 @@ fn checks() -> Vec<UiCheck> {
             "ui-encoder-tuning",
             "E1-E4: Buttons page holds pulse length + steps per click + accel + per-knob invert, wired through main.rs",
             ui_encoder_tuning as fn() -> Outcome,
+        ),
+        (
+            "ui-handbrake-clutch-tuning",
+            "H1-H3 + C2: Extras handbrake card holds latch + grab speed + auto-release, Pedals clutch card holds the slip zone, wired through main.rs",
+            ui_handbrake_clutch_tuning as fn() -> Outcome,
         ),
     ]
 }
