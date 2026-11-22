@@ -1504,7 +1504,10 @@ enum ConfirmAction {
 /// the API's own types, so no result is re-interpreted here.
 enum JobResult {
     /// A `set_tuning` push: the stored record, or the error.
-    Tuning(Result<TuningSettings, UserError>),
+    /// Boxed: `TuningSettings` grew past clippy's 200-byte
+    /// `large_enum_variant` threshold, so only the `Ok` payload
+    /// is boxed — the `Err` payload stays inline.
+    Tuning(Result<Box<TuningSettings>, UserError>),
     /// A yes/no op (module enable, output toggle, auto-pause,
     /// autostart, keep-in-tray, save / discard draft, …): the new
     /// state, or the error.
@@ -2936,7 +2939,7 @@ impl Ctx {
             win,
             JobKind::TuningPush,
             "Saving steering…",
-            move |api| JobResult::Tuning(api.set_tuning(&settings)),
+            move |api| JobResult::Tuning(api.set_tuning(&settings).map(Box::new)),
             move |ctx, win, result| {
                 let JobResult::Tuning(result) = result else {
                     return;
@@ -2950,7 +2953,7 @@ impl Ctx {
                 ctx.tuning_push_in_flight.borrow_mut().take();
                 match result {
                     Ok(stored) => {
-                        *ctx.steering.borrow_mut() = stored;
+                        *ctx.steering.borrow_mut() = *stored;
                         ctx.unsaved.set(true);
                     }
                     Err(e) => {
@@ -3072,7 +3075,7 @@ impl Ctx {
                         record.led_color = Some(value as u32);
                     }
                 }
-                JobResult::Tuning(api.set_tuning(&record))
+                JobResult::Tuning(api.set_tuning(&record).map(Box::new))
             },
             move |ctx, win, result| {
                 let JobResult::Tuning(result) = result else {
@@ -5245,7 +5248,7 @@ impl Ctx {
             win,
             JobKind::TuningPush,
             "Saving pedal tuning…",
-            move |api| JobResult::Tuning(api.set_tuning(&record)),
+            move |api| JobResult::Tuning(api.set_tuning(&record).map(Box::new)),
             move |ctx, win, result| {
                 let JobResult::Tuning(result) = result else {
                     return;
@@ -5287,7 +5290,7 @@ impl Ctx {
             win,
             JobKind::TuningPush,
             "Saving setting…",
-            move |api| JobResult::Tuning(api.set_tuning(&record)),
+            move |api| JobResult::Tuning(api.set_tuning(&record).map(Box::new)),
             move |ctx, win, result| {
                 let JobResult::Tuning(result) = result else {
                     return;
@@ -8183,7 +8186,7 @@ impl Ctx {
                             move |api| {
                                 let mut record = api.get_tuning("horn");
                                 record.horn_button = Some(b);
-                                JobResult::Tuning(api.set_tuning(&record))
+                                JobResult::Tuning(api.set_tuning(&record).map(Box::new))
                             },
                             move |ctx, win, result| {
                                 let JobResult::Tuning(result) = result else {
