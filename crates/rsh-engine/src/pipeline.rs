@@ -65,6 +65,12 @@ pub enum ShifterGateMode {
 /// mis-ordered endpoints) is never applied as-is: the mapper falls
 /// back to the default range (`300..=3300` mV, centre `1800` mV).
 /// [`sanitized`](Self::sanitized) applies the same rules eagerly.
+//
+// The bool count is the module's independent switches (enabled /
+// invert / accel / latch); grouping them would break the plan shape
+// the state layer builds field-by-field, so the pedantic bool-count
+// lint is allowed here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModuleTuning {
     /// False = the module emits nothing (neutral output).
@@ -140,6 +146,17 @@ pub struct ModuleTuning {
     /// inverts encoder `i` (only bits `0..=3` are kept). OR-ed with
     /// the module-level `invert`, which inverts all encoders.
     pub encoder_invert_mask: u8,
+    // --- LED/horn per-module tuning ---
+    /// Minimum honk duration in milliseconds (HO1, horn only):
+    /// a press holds the horn output for at least this long,
+    /// `100..=1000` (default `400`), so a quick tap still
+    /// registers in the game.
+    pub horn_min_ms: f32,
+    /// Honk mode (HO2, horn only): `true` = Latch (each press
+    /// toggles the horn on/off), `false` = Momentary (default —
+    /// the horn sounds only while the button is held, plus the
+    /// [`Self::horn_min_ms`] hold).
+    pub horn_latch: bool,
 }
 
 impl Default for ModuleTuning {
@@ -169,6 +186,9 @@ impl Default for ModuleTuning {
             accel_enabled: false,
             accel_sensitivity: 1.0,
             encoder_invert_mask: 0,
+            // --- LED/horn per-module tuning ---
+            horn_min_ms: 400.0,
+            horn_latch: false,
         }
     }
 }
@@ -211,6 +231,8 @@ impl ModuleTuning {
         };
         out.accel_sensitivity = clamp_finite(self.accel_sensitivity, 0.0, 2.0, 1.0);
         out.encoder_invert_mask = self.encoder_invert_mask & 0x0F;
+        // --- LED/horn per-module tuning ---
+        out.horn_min_ms = clamp_finite(self.horn_min_ms, 100.0, 1000.0, 400.0);
         if validate_pedal_range(self.min_mv, self.max_mv).is_err() {
             out.min_mv = DEFAULT_MIN_MV;
             out.max_mv = DEFAULT_MAX_MV;
@@ -579,6 +601,16 @@ pub struct ProcessingPipeline {
     /// E2 sub-click remainder: counts banked per encoder toward the
     /// next whole step (`counts_per_click` counts = one step).
     encoder_remainder: [i32; MAX_ENCODERS],
+    /// HO1 hold: ticks left the horn output stays on after the
+    /// button is released (re-armed to the full minimum on every
+    /// pressed tick, so a tap honks for at least `horn_min_ms`).
+    horn_hold_remaining: u16,
+    /// HO2 latch: true while a latched honk is on (toggled on each
+    /// rising edge while `horn_latch` is set).
+    horn_latch_on: bool,
+    /// Previous tick's raw horn bit (rising-edge detection for the
+    /// HO1 hold and the HO2 latch toggle).
+    horn_prev_pressed: bool,
 }
 
 impl Default for ProcessingPipeline {
@@ -611,6 +643,10 @@ impl ProcessingPipeline {
             encoders: EncoderTracker::new(),
             encoder_pulse: [0; MAX_ENCODERS * 2],
             encoder_remainder: [0; MAX_ENCODERS],
+            // --- LED/horn per-module tuning ---
+            horn_hold_remaining: 0,
+            horn_latch_on: false,
+            horn_prev_pressed: false,
             plan,
         }
     }
@@ -660,6 +696,12 @@ impl ProcessingPipeline {
         self.encoders.reset();
         self.encoder_pulse = [0; MAX_ENCODERS * 2];
         self.encoder_remainder = [0; MAX_ENCODERS];
+        // --- LED/horn per-module tuning ---
+        // A held/latched honk must not survive a reset (or a
+        // re-enable) — the next press starts from silence.
+        self.horn_hold_remaining = 0;
+        self.horn_latch_on = false;
+        self.horn_prev_pressed = false;
     }
 
     /// Process one stream frame into an [`OutputState`].
@@ -751,10 +793,48 @@ impl ProcessingPipeline {
             }
         }
 
-        // Horn (BUTTON slot 2, bit 2).
-        out.horn = self.plan.horn.enabled && (buttons & HORN_BIT) != 0;
+        // Horn (BUTTON slot 2, bit 2) — HO1 minimum honk + HO2
+        // latch. Momentary: the output follows the button, and a
+        // press re-arms the hold to the full minimum on every
+        // pressed tick, so the honk lasts at least `horn_min_ms`
+        // after release. Latch: each rising edge toggles the horn
+        // on/off (the hold does not apply — a latched honk stays
+        // on until toggled off, it must not tail after switch-off).
+        // The held/latched horn keeps bit 2 set in the button word
+        // too, so the game sees button 3 held — the `horn` flag
+        // alone would not honk in-game. Disabled clears the hold,
+        // the latch and the bit, like the encoder pulse clear.
+        let raw_horn = (buttons & HORN_BIT) != 0;
+        let horn_rising = raw_horn && !self.horn_prev_pressed;
+        self.horn_prev_pressed = raw_horn;
         if !self.plan.horn.enabled {
+            out.horn = false;
             buttons &= !HORN_BIT;
+            self.horn_hold_remaining = 0;
+            self.horn_latch_on = false;
+        } else if self.plan.horn.horn_latch {
+            if horn_rising {
+                self.horn_latch_on = !self.horn_latch_on;
+            }
+            out.horn = self.horn_latch_on;
+            if self.horn_latch_on {
+                buttons |= HORN_BIT;
+            } else {
+                buttons &= !HORN_BIT;
+            }
+        } else {
+            if raw_horn {
+                self.horn_hold_remaining = horn_min_ticks(self.plan.horn.horn_min_ms);
+            } else {
+                self.horn_hold_remaining = self.horn_hold_remaining.saturating_sub(1);
+            }
+            let held = raw_horn || self.horn_hold_remaining > 0;
+            out.horn = held;
+            if held {
+                buttons |= HORN_BIT;
+            } else {
+                buttons &= !HORN_BIT;
+            }
         }
 
         // Wheel buttons: a disabled module emits nothing.
@@ -852,6 +932,15 @@ impl ProcessingPipeline {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn encoder_pulse_ticks(pulse_ms: f32) -> u8 {
     ((pulse_ms / 5.0).round().clamp(1.0, 40.0)) as u8
+}
+
+/// Horn minimum-honk hold in ticks for a `horn_min_ms` setting
+/// (HO1): one tick is 5 ms at 200 Hz, so the 100–1000 ms range is
+/// 20–200 ticks. The clamp to `20..=200` makes the cast safe.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn horn_min_ticks(min_ms: f32) -> u16 {
+    ((min_ms / 5.0).round().clamp(20.0, 200.0)) as u16
 }
 
 /// Map a steering sample in mV to `-1..=1` using a
@@ -1650,6 +1739,75 @@ mod tests {
         let out = pipe.process(&frame(&[], &[], 0b111));
         assert_eq!(out.buttons, 0);
         assert!(!out.horn);
+    }
+
+    #[test]
+    fn horn_min_hold_keeps_honk_after_a_quick_tap() {
+        // HO1: a one-tick tap (5 ms) with a 400 ms minimum holds
+        // the horn — flag + button bit — for 80 ticks after release,
+        // then goes quiet. The game polls button 3, so the bit must
+        // stay set for the whole hold, not just the `horn` flag.
+        let mut plan = plain_plan();
+        plan.horn.horn_min_ms = 400.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[], &[], 0b100));
+        assert!(out.horn);
+        assert_eq!(out.buttons & 0b100, 0b100);
+        // 79 released ticks: still honking (the release tick counts
+        // as the first of the 80-tick hold).
+        for _ in 0..79 {
+            let out = pipe.process(&frame(&[], &[], 0));
+            assert!(out.horn);
+            assert_eq!(out.buttons & 0b100, 0b100);
+        }
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert!(!out.horn);
+        assert_eq!(out.buttons & 0b100, 0);
+        // A 100 ms minimum is 20 ticks; out-of-range sanitizes to
+        // 100..=1000 (default 400).
+        assert_eq!(super::horn_min_ticks(100.0), 20);
+        assert_eq!(super::horn_min_ticks(1000.0), 200);
+        assert_eq!(super::horn_min_ticks(50.0), 20);
+        assert_eq!(super::horn_min_ticks(5000.0), 200);
+        let mut plan = plain_plan();
+        plan.horn.horn_min_ms = 50.0;
+        assert_eq!(plan.sanitized().horn.horn_min_ms, 100.0);
+        plan.horn.horn_min_ms = f32::NAN;
+        assert_eq!(plan.sanitized().horn.horn_min_ms, 400.0);
+    }
+
+    #[test]
+    fn horn_latch_toggles_on_each_press() {
+        // HO2: press once = on (stays on with no button held),
+        // press again = off. A held press does not re-toggle —
+        // only the rising edge counts.
+        let mut plan = plain_plan();
+        plan.horn.horn_latch = true;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[], &[], 0b100));
+        assert!(out.horn);
+        let out = pipe.process(&frame(&[], &[], 0b100));
+        assert!(out.horn, "holding the button must not toggle off");
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert!(out.horn, "latched honk stays on after release");
+        assert_eq!(out.buttons & 0b100, 0b100);
+        let out = pipe.process(&frame(&[], &[], 0b100));
+        assert!(!out.horn, "second press toggles off");
+        assert_eq!(out.buttons & 0b100, 0);
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert!(!out.horn, "no hold tail after a latch switch-off");
+        // Live-disable clears a latched honk; re-enable stays quiet.
+        let out = pipe.process(&frame(&[], &[], 0b100));
+        assert!(out.horn);
+        plan.horn.enabled = false;
+        pipe.set_plan_live(plan);
+        let out = pipe.process(&frame(&[], &[], 0b100));
+        assert!(!out.horn);
+        assert_eq!(out.buttons & 0b100, 0);
+        plan.horn.enabled = true;
+        pipe.set_plan_live(plan);
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert!(!out.horn, "no stale latch comes back on re-enable");
     }
 
     #[test]

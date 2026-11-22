@@ -15,11 +15,15 @@
 //   backend field — its slider is disabled with a reason (A6).
 // - Horn button IS a set_tuning field (horn_button): Learn arms
 //   start_learn and take_learned_button supplies the picked button.
+//   Minimum honk (horn_min_ms, HO1) + latch mode (horn_latch, HO2)
+//   are set_tuning fields too.
 // - LEDs ARE set_tuning fields (led_brightness, led_pattern,
-//   led_color): the pattern chips + brightness slider + colour
-//   swatches push through set_tuning("led") and sync_extras reads
-//   the colour back (R2-34: the old "Colour isn't stored on the
-//   wheel yet" copy was stale — the colour IS stored).
+//   led_color, led_period_ms): the pattern chips + brightness
+//   slider + colour swatches push through set_tuning("led") and
+//   sync_extras reads the colour back (R2-34: the old "Colour
+//   isn't stored on the wheel yet" copy was stale — the colour IS
+//   stored). The Blink / Chase speed slider (L1) and the custom
+//   RGB colour sliders (L2) push the same way.
 // - Handbrake deadzone/feel/mV come from get_tuning("handbrake");
 //   Set up/down need calibrate_pedal (BACKEND-2 seam) and stay
 //   disabled with a reason until it lands (A2).
@@ -132,12 +136,26 @@ export component ExtrasScreen inherits VerticalLayout {
     in property <string> horn-button: "Button 3";
     in property <bool> horn-learning: false;
     in property <bool> horn-pressed: false;
+    // HO1: minimum honk in ms (100–1000); HO2: 0 Momentary, 1 Latch.
+    in property <float> horn-min-ms: 400;
+    in property <string> horn-min-text: "400 ms";
+    in property <int> horn-mode: 0;
     // ---- LEDs
     in property <int> led-pattern: 1; // 0 Off, 1 Solid, 2 Blink, 3 Chase, 4 Rainbow
     in property <float> led-brightness: 0.8; // 0..1
     in property <string> led-brightness-text: "—";
-    in property <int> led-color: 3; // swatch index 0..5
+    in property <int> led-color: 3; // swatch index 0..5, -1 = custom colour
     in property <[color]> led-preview;
+    // L1: pattern-cycle period in ms (100–5000). L2: custom-colour
+    // RGB channels (0..1) + the composed hex text.
+    in property <float> led-period-ms: 1000;
+    in property <string> led-period-text: "1000 ms";
+    in property <float> led-red: 0.18;
+    in property <float> led-green: 0.42;
+    in property <float> led-blue: 1.0;
+    in property <string> led-color-hex-text: "#2F6BFF";
+    // Local toggle for the custom-colour sliders (no backend state).
+    property <bool> show-custom-color: false;
     // DS-54: which job kind the busy strip shows, as a
     // JobKind::order value (-1 = idle) — Horn Learn disables + dims
     // while its LearnOp job (11) runs; Handbrake Set up/down while
@@ -154,6 +172,17 @@ export component ExtrasScreen inherits VerticalLayout {
     callback led-brightness-changed(float);
     callback led-brightness-edited(string);
     callback led-color-selected(int);
+    callback led-period-changed(float);
+    callback led-period-edited(string);
+    callback led-red-changed(float);
+    callback led-red-edited(string);
+    callback led-green-changed(float);
+    callback led-green-edited(string);
+    callback led-blue-changed(float);
+    callback led-blue-edited(string);
+    callback horn-min-changed(float);
+    callback horn-min-edited(string);
+    callback horn-mode-selected(int);
 
     // UI-UX polish (a): the 2x2 grid is ~750px tall — taller than
     // the 524px body — so the bottom row (Horn / LEDs colour) was
@@ -324,6 +353,14 @@ export component ExtrasScreen inherits VerticalLayout {
                             }
                             if horn-learning : Text { text: "Press the horn button on the wheel…"; font-size: 11.5px; color: Theme.warn; }
                             if !horn-learning : Text { text: "Test only lights the indicator when Send to game is off."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                            SegmentedControl {
+                                option-0: "Momentary";
+                                option-1: "Latch";
+                                selected: horn-mode;
+                                selected-changed(i) => { horn-mode-selected(i); }
+                            }
+                            SliderRow { label: "Minimum honk"; hint: "Quick taps still honk this long"; value-text: horn-min-text; value: (horn-min-ms - 100) / 900; changed(v) => { horn-min-changed(v); } value-edited(t) => { horn-min-edited(t); } }
+                            if horn-mode == 1 : Text { text: "Latch: press once to honk, again to stop."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
                         }
                     }
                 }
@@ -363,6 +400,7 @@ export component ExtrasScreen inherits VerticalLayout {
                                 PresetChip { horizontal-stretch: 1; label: "Rainbow"; active: led-pattern == 4; clicked => { led-pattern-selected(4); } }
                             }
                             SliderRow { label: "Brightness"; hint: "Brightness"; value-text: led-brightness-text; value: led-brightness; changed(v) => { led-brightness-changed(v); } value-edited(t) => { led-brightness-edited(t); } }
+                            if led-pattern == 2 || led-pattern == 3 || led-pattern == 4 : SliderRow { label: "Blink / Chase speed"; hint: "Blink / Chase / Rainbow cycle time"; value-text: led-period-text; value: (led-period-ms - 100) / 4900; changed(v) => { led-period-changed(v); } value-edited(t) => { led-period-edited(t); } }
                             if led-pattern == 1 : VerticalLayout {
                                 spacing: 6px;
                                 Text { text: "Colour"; font-size: 12.5px; font-weight: 500; color: Theme.text; }
@@ -391,6 +429,27 @@ export component ExtrasScreen inherits VerticalLayout {
                                         }
                                         sw-ta := TouchArea { mouse-cursor: pointer; clicked => { led-color-selected(i); } }
                                     }
+                                }
+                            }
+                            // L2: any RGB colour, not just the six
+                            // swatches — the button opens three channel
+                            // sliders (Solid / Blink / Chase; Rainbow
+                            // ignores the colour board-side).
+                            if led-pattern == 1 || led-pattern == 2 || led-pattern == 3 : VerticalLayout {
+                                spacing: 6px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    cross-axis-alignment: center;
+                                    Text { text: "Custom colour"; font-size: 12.5px; font-weight: 500; color: Theme.text; }
+                                    Text { text: led-color-hex-text; font-family: Theme.font-mono; font-size: 12px; color: Theme.mute; }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Btn { label: show-custom-color ? "Hide" : "Custom…"; clicked => { show-custom-color = !show-custom-color; } }
+                                }
+                                if show-custom-color : VerticalLayout {
+                                    spacing: 6px;
+                                    SliderRow { label: "Red"; hint: "Custom colour channel (0–255)"; value-text: Math.round(led-red * 255) + ""; value: led-red; changed(v) => { led-red-changed(v); } value-edited(t) => { led-red-edited(t); } }
+                                    SliderRow { label: "Green"; hint: "Custom colour channel (0–255)"; value-text: Math.round(led-green * 255) + ""; value: led-green; changed(v) => { led-green-changed(v); } value-edited(t) => { led-green-edited(t); } }
+                                    SliderRow { label: "Blue"; hint: "Custom colour channel (0–255)"; value-text: Math.round(led-blue * 255) + ""; value: led-blue; changed(v) => { led-blue-changed(v); } value-edited(t) => { led-blue-edited(t); } }
                                 }
                             }
                         }

@@ -2325,6 +2325,96 @@ fn ui_encoder_tuning() -> Outcome {
     report.finish()
 }
 
+/// Gate: LED + horn tuning (L1/L2/HO1/HO2) — the Extras page's
+/// LEDs card holds the Blink / Chase speed slider and the custom
+/// colour button + RGB sliders, and the Horn card holds the minimum
+/// honk slider and the Momentary / Latch segment; the window +
+/// Rust wiring exist behind them. Static source checks only: the
+/// Extras page has no probe harness (its render needs the full
+/// window + bindings), so — like `ui_encoder_tuning` — this proves
+/// the controls are in the source and wired, not that they paint.
+fn ui_led_horn_tuning() -> Outcome {
+    let mut report = Report::new();
+    let extras = match read_gate_source("crates/rsh-ui/ui/screens/extras.slint") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for label in [
+        "Blink / Chase speed",
+        "Custom colour",
+        "Minimum honk",
+        "Momentary",
+        "Latch",
+    ] {
+        report.check(
+            &format!("led-horn-tuning-has-{label}"),
+            extras.contains(label),
+            &format!("extras.slint must contain the {label} control"),
+        );
+    }
+    let main_slint = match read_gate_source("crates/rsh-ui/ui/main.slint") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for prop in [
+        "led-period-ms",
+        "led-period-text",
+        "led-red",
+        "led-green",
+        "led-blue",
+        "led-color-hex-text",
+        "horn-min-ms",
+        "horn-min-text",
+        "horn-mode",
+    ] {
+        report.check(
+            &format!("led-horn-tuning-prop-{prop}"),
+            main_slint.contains(prop),
+            &format!("main.slint must carry the {prop} window property"),
+        );
+    }
+    for callback in [
+        "extras-led-period",
+        "extras-led-red",
+        "extras-led-green",
+        "extras-led-blue",
+        "extras-horn-min",
+        "extras-horn-mode",
+    ] {
+        report.check(
+            &format!("led-horn-tuning-callback-{callback}"),
+            main_slint.contains(&format!("callback {callback}")),
+            &format!("main.slint must declare the {callback} callback"),
+        );
+    }
+    let main_rs = match read_gate_source("crates/rsh-ui/src/main.rs") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for wired in [
+        "on_extras_led_period",
+        "on_extras_led_red",
+        "on_extras_led_green",
+        "on_extras_led_blue",
+        "on_extras_horn_min",
+        "on_extras_horn_mode",
+        "FieldKind::LedPeriodMs",
+        "FieldKind::HornMinMs",
+        "FieldKind::LedColor",
+        "sync_extras_horn_props",
+        "led_period_ms_from_slider",
+        "horn_min_ms_from_slider",
+        "led_color_from_channels",
+    ] {
+        report.check(
+            &format!("led-horn-tuning-wired-{wired}"),
+            main_rs.contains(wired),
+            &format!("main.rs must wire {wired}"),
+        );
+    }
+    report.finish()
+}
+
 /// The probe's new callbacks exist with the right signatures and
 /// fire: invoke each root callback and check the handler receives
 /// the value.
@@ -2393,6 +2483,9 @@ fn pedals_probe_callbacks(instance: &ComponentInstance, report: &mut Report) -> 
     Ok(())
 }
 
+/// The check registry: one tuple per check. It grows one tuple
+/// per check by design — a flat list, not logic to split.
+#[allow(clippy::too_many_lines)]
 fn checks() -> Vec<UiCheck> {
     vec![
         (
@@ -2499,6 +2592,11 @@ fn checks() -> Vec<UiCheck> {
             "ui-encoder-tuning",
             "E1-E4: Buttons page holds pulse length + steps per click + accel + per-knob invert, wired through main.rs",
             ui_encoder_tuning as fn() -> Outcome,
+        ),
+        (
+            "ui-led-horn-tuning",
+            "L1/L2/HO1/HO2: Extras page holds LED pattern speed + custom colour + horn minimum honk + Momentary/Latch, wired through main.rs",
+            ui_led_horn_tuning as fn() -> Outcome,
         ),
     ]
 }

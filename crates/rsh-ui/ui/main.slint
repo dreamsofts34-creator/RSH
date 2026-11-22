@@ -252,6 +252,18 @@ export component MainWindow inherits Window {
     in property <string> led-brightness-text: "—";
     in property <int> led-color: 3;
     in property <[color]> led-preview;
+    // LED/horn per-module tuning (L1/L2/HO1/HO2): pattern-cycle
+    // period in ms, custom-colour RGB channels (0..1) + hex text,
+    // minimum honk in ms, honk mode (0 Momentary, 1 Latch).
+    in property <float> led-period-ms: 1000;
+    in property <string> led-period-text: "1000 ms";
+    in property <float> led-red: 0.18;
+    in property <float> led-green: 0.42;
+    in property <float> led-blue: 1.0;
+    in property <string> led-color-hex-text: "#2F6BFF";
+    in property <float> horn-min-ms: 400;
+    in property <string> horn-min-text: "400 ms";
+    in property <int> horn-mode: 0;
     // Overview live values (A11/A12/A14): "—" until telemetry lands.
     in property <string> firmware-line: "—";
     in property <string> delay-text: "—";
@@ -443,6 +455,17 @@ export component MainWindow inherits Window {
     callback extras-led-brightness(float);
     callback extras-led-brightness-edited(string);
     callback extras-led-color(int);
+    callback extras-led-period(float);
+    callback extras-led-period-edited(string);
+    callback extras-led-red(float);
+    callback extras-led-red-edited(string);
+    callback extras-led-green(float);
+    callback extras-led-green-edited(string);
+    callback extras-led-blue(float);
+    callback extras-led-blue-edited(string);
+    callback extras-horn-min(float);
+    callback extras-horn-min-edited(string);
+    callback extras-horn-mode(int);
     callback settings-action(string);
     // H4 (v2.0.2): the Settings address field fires this on Enter
     // with the typed value — the old address-changed(string) carried
@@ -908,11 +931,20 @@ export component MainWindow inherits Window {
                 horn-button: horn-button;
                 horn-learning: horn-learning;
                 horn-pressed: horn-pressed;
+                horn-min-ms: horn-min-ms;
+                horn-min-text: horn-min-text;
+                horn-mode: horn-mode;
                 led-pattern: led-pattern;
                 led-brightness: led-brightness;
                 led-brightness-text: led-brightness-text;
                 led-color: led-color;
                 led-preview: led-preview;
+                led-period-ms: led-period-ms;
+                led-period-text: led-period-text;
+                led-red: led-red;
+                led-green: led-green;
+                led-blue: led-blue;
+                led-color-hex-text: led-color-hex-text;
                 // H-7: module switches are two-way window props, so
                 // Rust can revert them when a toggle fails.
                 handbrake-on <=> extras-handbrake-on;
@@ -929,6 +961,17 @@ export component MainWindow inherits Window {
                 led-brightness-changed(v) => { extras-led-brightness(v); }
                 led-brightness-edited(t) => { extras-led-brightness-edited(t); }
                 led-color-selected(i) => { extras-led-color(i); }
+                led-period-changed(v) => { extras-led-period(v); }
+                led-period-edited(t) => { extras-led-period-edited(t); }
+                led-red-changed(v) => { extras-led-red(v); }
+                led-red-edited(t) => { extras-led-red-edited(t); }
+                led-green-changed(v) => { extras-led-green(v); }
+                led-green-edited(t) => { extras-led-green-edited(t); }
+                led-blue-changed(v) => { extras-led-blue(v); }
+                led-blue-edited(t) => { extras-led-blue-edited(t); }
+                horn-min-changed(v) => { extras-horn-min(v); }
+                horn-min-edited(t) => { extras-horn-min-edited(t); }
+                horn-mode-selected(i) => { extras-horn-mode(i); }
             }
             if page == 5 : SettingsScreen {
                 connected: connected;

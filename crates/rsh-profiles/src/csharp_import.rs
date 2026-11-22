@@ -264,6 +264,20 @@ pub struct PerModuleTuning {
     /// only), bits 0–3. `None` = never set — 0 (no invert) applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_invert_mask: Option<u8>,
+    // --- LED/horn per-module tuning ---
+    /// Blink / Chase / Rainbow cycle period in ms (L1, LED module
+    /// only), 100–5000. `None` = never set (old profile) — the
+    /// 1000 ms default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub led_period_ms: Option<f64>,
+    /// Minimum honk duration in ms (HO1, horn module only),
+    /// 100–1000. `None` = never set — the 400 ms default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horn_min_ms: Option<f64>,
+    /// Honk latch mode (HO2, horn module only): `Some(true)` =
+    /// Latch, `Some(false)` / `None` = Momentary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horn_latch: Option<bool>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -550,6 +564,10 @@ impl Default for PerModuleTuning {
             encoder_accel: None,
             encoder_accel_sensitivity: None,
             encoder_invert_mask: None,
+            // --- LED/horn per-module tuning ---
+            led_period_ms: None,
+            horn_min_ms: None,
+            horn_latch: None,
         }
     }
 }

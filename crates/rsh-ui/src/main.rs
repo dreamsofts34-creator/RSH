@@ -397,6 +397,29 @@ pub const LED_PALETTE: [u32; 6] = [
     0xFF_6B_6B, 0xF5_B8_4A, 0x3D_D6_8C, 0x2F_6B_FF, 0xB4_6C_FF, 0xFF_FF_FF,
 ];
 
+/// LED period (L1) from a normalised slider value: 0..1 maps to
+/// 100..5000 ms (the firmware's blink/chase/rainbow cycle range).
+#[must_use]
+pub fn led_period_ms_from_slider(v: f64) -> f64 {
+    100.0 + v.clamp(0.0, 1.0) * 4900.0
+}
+
+/// Horn minimum honk (HO1) from a normalised slider value: 0..1
+/// maps to 100..1000 ms.
+#[must_use]
+pub fn horn_min_ms_from_slider(v: f64) -> f64 {
+    100.0 + v.clamp(0.0, 1.0) * 900.0
+}
+
+/// A custom LED colour (L2) from normalised RGB channel sliders
+/// (0..1 each) — the full-RGB value the protocol takes.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn led_color_from_channels(r: f32, g: f32, b: f32) -> u32 {
+    let channel = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (channel(r) << 16) | (channel(g) << 8) | channel(b)
+}
+
 /// Static LED strip preview (8 circles) from pattern + brightness +
 /// colour (M2): Off is dark; any lit pattern shows the STORED colour
 /// at the set brightness (a still preview, not a live strip — the
@@ -860,6 +883,13 @@ enum FieldKind {
     EncoderPulseMs,
     /// Encoder acceleration sensitivity, 0..2 (E3).
     EncoderAccelSens,
+    // --- LED/horn per-module tuning ---
+    /// LED pattern-cycle period in ms, 100..5000 (L1).
+    LedPeriodMs,
+    /// Horn minimum honk in ms, 100..1000 (HO1).
+    HornMinMs,
+    /// LED colour as 0xRRGGBB (L2, composed from the RGB sliders).
+    LedColor,
 }
 
 /// A slider drag's latest value, waiting out its debounce (M-7):
@@ -1763,6 +1793,9 @@ struct Ctx {
     /// to a stale cached value mid-drag.
     handbrake_record: Rc<RefCell<TuningSettings>>,
     led_record: Rc<RefCell<TuningSettings>>,
+    /// Cached horn record (R2-10, HO1/HO2): same local-copy pattern
+    /// as the handbrake / LED records, for the minimum-honk drag.
+    horn_record: Rc<RefCell<TuningSettings>>,
     /// Last good calibration read (A2/A12/A22): pedal mV, capture
     /// date, centre-set state. `None` = never read / never captured.
     calibration: Rc<RefCell<Option<CalibrationInfo>>>,
@@ -2956,6 +2989,16 @@ impl Ctx {
                     }
                     FieldKind::EncoderAccelSens => {
                         record.encoder_accel_sensitivity = Some(value.clamp(0.0, 2.0));
+                    }
+                    // --- LED/horn per-module tuning ---
+                    FieldKind::LedPeriodMs => {
+                        record.led_period_ms = Some(value.clamp(100.0, 5000.0));
+                    }
+                    FieldKind::HornMinMs => {
+                        record.horn_min_ms = Some(value.clamp(100.0, 1000.0));
+                    }
+                    FieldKind::LedColor => {
+                        record.led_color = Some(value as u32);
                     }
                 }
                 JobResult::Tuning(api.set_tuning(&record))
@@ -5045,6 +5088,7 @@ impl Ctx {
             "clutch" => self.pedals.borrow().records[2].clone(),
             "handbrake" => self.handbrake_record.borrow().clone(),
             "led" => self.led_record.borrow().clone(),
+            "horn" => self.horn_record.borrow().clone(),
             _ => self.api().get_tuning(module),
         }
     }
@@ -5112,6 +5156,19 @@ impl Ctx {
                                     effective.encoder_accel_sensitivity =
                                         local.encoder_accel_sensitivity;
                                 }
+                                // --- LED/horn per-module tuning ---
+                                // Same: an LED/horn drag never reaches
+                                // this pedal arm, but the match must
+                                // cover the new variants.
+                                FieldKind::LedPeriodMs => {
+                                    effective.led_period_ms = local.led_period_ms;
+                                }
+                                FieldKind::HornMinMs => {
+                                    effective.horn_min_ms = local.horn_min_ms;
+                                }
+                                FieldKind::LedColor => {
+                                    effective.led_color = local.led_color;
+                                }
                             }
                         }
                     }
@@ -5145,11 +5202,15 @@ impl Ctx {
                 *self.led_record.borrow_mut() = stored.clone();
                 self.sync_extras_led_props(win, stored);
             }
+            "horn" => {
+                *self.horn_record.borrow_mut() = stored.clone();
+                self.sync_extras_horn_props(win, stored);
+            }
             "encoders" => {
                 Self::sync_encoder_props(win, stored);
             }
-            // Shifter / horn have no per-module writer — the slow
-            // re-sync owns their props (as before).
+            // Shifter has no per-module writer — the slow re-sync
+            // owns its props (as before).
             _ => self.sync_extras(win),
         }
     }
@@ -5547,6 +5608,7 @@ impl Ctx {
     /// The preview model is only rebuilt when its (pattern,
     /// brightness, colour) key moved. All writes are
     /// change-guarded, like `push_frame`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn sync_extras_led_props(&self, win: &MainWindow, led: &TuningSettings) {
         let pattern = led.led_pattern.unwrap_or(LedPattern::Solid);
         let pattern_i = match pattern {
@@ -5571,18 +5633,43 @@ impl Ctx {
             |v| win.set_led_brightness_text(v),
         );
         // M2: the stored colour drives the swatch + the preview —
-        // never always-blue. Unknown colours fall back to the accent
-        // swatch (index 3).
+        // never always-blue. A custom (non-palette) colour selects
+        // no swatch (-1) instead of highlighting a wrong one.
         let color_index = led
             .led_color
             .and_then(|c| LED_PALETTE.iter().position(|p| *p == c))
-            .unwrap_or(3);
+            .map_or(-1, |i| i32::try_from(i).unwrap_or(-1));
+        set_if_changed(win.get_led_color(), color_index, |v| {
+            win.set_led_color(v);
+        });
+        // L1: the pattern-cycle period slider + text (100–5000 ms).
+        let period_ms = led.led_period_ms.unwrap_or(1000.0);
+        set_if_changed(win.get_led_period_ms(), period_ms as f32, |v| {
+            win.set_led_period_ms(v);
+        });
         set_if_changed(
-            win.get_led_color(),
-            i32::try_from(color_index).unwrap_or(3),
-            |v| {
-                win.set_led_color(v);
-            },
+            win.get_led_period_text(),
+            format!("{period_ms:.0} ms").into(),
+            |v| win.set_led_period_text(v),
+        );
+        // L2: the custom-colour sliders + hex text follow the stored
+        // colour (palette or custom — the preview already does); no
+        // colour stored yet = the accent blue.
+        let rgb = led.led_color.unwrap_or(0x2F_6B_FF);
+        let [_, r, g, bl] = rgb.to_be_bytes();
+        set_if_changed(win.get_led_red(), f32::from(r) / 255.0, |v| {
+            win.set_led_red(v);
+        });
+        set_if_changed(win.get_led_green(), f32::from(g) / 255.0, |v| {
+            win.set_led_green(v);
+        });
+        set_if_changed(win.get_led_blue(), f32::from(bl) / 255.0, |v| {
+            win.set_led_blue(v);
+        });
+        set_if_changed(
+            win.get_led_color_hex_text(),
+            format!("#{rgb:06X}").into(),
+            |v| win.set_led_color_hex_text(v),
         );
         let key = (pattern_i, brightness, led.led_color.unwrap_or(u32::MAX));
         if self.led_preview_key.get() != key {
@@ -5593,6 +5680,39 @@ impl Ctx {
                 led.led_color,
             )))));
         }
+    }
+
+    /// Write the Horn card's tuning props from a record (HO1/HO2):
+    /// button label, learning state, minimum-honk slider + text,
+    /// mode segment. All writes are change-guarded, like
+    /// `push_frame`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    fn sync_extras_horn_props(&self, win: &MainWindow, horn: &TuningSettings) {
+        set_if_changed(
+            win.get_horn_button(),
+            match horn.horn_button {
+                Some(b) => format!("Button {b}").into(),
+                None => "Not set".into(),
+            },
+            |v| win.set_horn_button(v),
+        );
+        set_if_changed(win.get_horn_learning(), self.learn_target.get() == 2, |v| {
+            win.set_horn_learning(v);
+        });
+        let min_ms = horn.horn_min_ms.unwrap_or(400.0);
+        set_if_changed(win.get_horn_min_ms(), min_ms as f32, |v| {
+            win.set_horn_min_ms(v);
+        });
+        set_if_changed(
+            win.get_horn_min_text(),
+            format!("{min_ms:.0} ms").into(),
+            |v| win.set_horn_min_text(v),
+        );
+        set_if_changed(
+            win.get_horn_mode(),
+            i32::from(horn.horn_latch.unwrap_or(false)),
+            |v| win.set_horn_mode(v),
+        );
     }
 
     /// Write the Buttons page's encoder tuning props from a record
@@ -5683,6 +5803,51 @@ impl Ctx {
             stored.clone()
         };
         self.sync_extras_led_props(win, &record);
+    }
+
+    /// Echo an LED period drag locally (R2-10, L1): same pattern as
+    /// [`Self::apply_led_brightness_local`]. The pattern is stamped
+    /// from the window prop so the `set_tuning` flash fires at the
+    /// new speed even on a fresh profile (stored pattern `None`).
+    fn apply_led_period_local(&self, win: &MainWindow, period_ms: f64) {
+        let record = {
+            let mut stored = self.led_record.borrow_mut();
+            stored.led_period_ms = Some(period_ms);
+            if stored.led_pattern.is_none() {
+                stored.led_pattern = Some(match win.get_led_pattern() {
+                    0 => LedPattern::Off,
+                    2 => LedPattern::Blink,
+                    3 => LedPattern::Chase,
+                    4 => LedPattern::Rainbow,
+                    _ => LedPattern::Solid,
+                });
+            }
+            stored.clone()
+        };
+        self.sync_extras_led_props(win, &record);
+    }
+
+    /// Echo a custom-colour drag locally (R2-10, L2): the composed
+    /// colour follows in the local record; the preview, the RGB
+    /// sliders and the hex text re-render from it.
+    fn apply_led_color_local(&self, win: &MainWindow, color: u32) {
+        let record = {
+            let mut stored = self.led_record.borrow_mut();
+            stored.led_color = Some(color);
+            stored.clone()
+        };
+        self.sync_extras_led_props(win, &record);
+    }
+
+    /// Echo a horn minimum-honk drag locally (R2-10, HO1): same
+    /// pattern as [`Self::apply_led_brightness_local`].
+    fn apply_horn_min_local(&self, win: &MainWindow, min_ms: f64) {
+        let record = {
+            let mut stored = self.horn_record.borrow_mut();
+            stored.horn_min_ms = Some(min_ms);
+            stored.clone()
+        };
+        self.sync_extras_horn_props(win, &record);
     }
 
     /// Refresh the Pedals page from the stored records (A1/A2):
@@ -5812,7 +5977,13 @@ impl Ctx {
             record
         };
         let shifter = api.get_tuning("shifter");
-        let horn = api.get_tuning("horn");
+        let horn = if self.field_push_pending_for("horn") {
+            self.horn_record.borrow().clone()
+        } else {
+            let record = api.get_tuning("horn");
+            *self.horn_record.borrow_mut() = record.clone();
+            record
+        };
         Self::sync_extras_handbrake_props(win, &hb);
         // H7: keep the toggle tracking in sync with the daemon (the
         // .slint toggles flip first and call Rust with no payload, so
@@ -5847,17 +6018,7 @@ impl Ctx {
             },
             |v| win.set_shifter_mode(v),
         );
-        set_if_changed(
-            win.get_horn_button(),
-            match horn.horn_button {
-                Some(b) => format!("Button {b}").into(),
-                None => "Not set".into(),
-            },
-            |v| win.set_horn_button(v),
-        );
-        set_if_changed(win.get_horn_learning(), self.learn_target.get() == 2, |v| {
-            win.set_horn_learning(v);
-        });
+        self.sync_extras_horn_props(win, &horn);
         self.sync_extras_led_props(win, &led);
         // E1/E2: the Buttons page's encoder tuning rides this slow
         // re-sync (no separate sync_buttons exists). While a drag's
@@ -9147,8 +9308,16 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                     ctx.refresh(&w, 0);
                 }
                 "horn-test" => {
+                    // HO1: the indicator flash follows the configured
+                    // minimum honk (default 400 ms), not a fixed value.
+                    let ms = ctx
+                        .horn_record
+                        .borrow()
+                        .horn_min_ms
+                        .unwrap_or(400.0)
+                        .clamp(100.0, 1000.0);
                     ctx.horn_test_until
-                        .set(Some(Instant::now() + Duration::from_millis(400)));
+                        .set(Some(Instant::now() + Duration::from_secs_f64(ms / 1000.0)));
                     ctx.refresh(&w, 0);
                 }
                 "shifter-change-in-buttons" => w.set_page(3),
@@ -9271,6 +9440,165 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                     .copied()
                     .unwrap_or(0x2F_6B_FF);
                 ctx.set_module_tuning(&w, "led", |t| t.led_color = Some(color));
+            }
+        });
+    }
+    // LED pattern-cycle period (L1): slider (debounced push, local
+    // echo while dragging) + typed value.
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_led_period(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let period_ms = led_period_ms_from_slider(f64::from(v));
+            // R2-10: local echo — the slider + text move with the drag.
+            ctx.apply_led_period_local(&w, period_ms);
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("led", FieldKind::LedPeriodMs, period_ms);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_led_period_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
+                let period_ms = ms.clamp(100.0, 5000.0);
+                ctx.apply_led_period_local(&w, period_ms);
+                ctx.queue_field_push("led", FieldKind::LedPeriodMs, period_ms);
+            }
+        });
+    }
+    // Custom LED colour (L2): each RGB slider re-composes the colour
+    // from the three channel props (the moved channel first) and
+    // queues one debounced push; typing a channel value (0–255)
+    // does the same. The composed colour rides the push as the
+    // field value (see `FieldKind::LedColor`).
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_led_red(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let color = led_color_from_channels(v, w.get_led_green(), w.get_led_blue());
+            ctx.apply_led_color_local(&w, color);
+            ctx.queue_field_push("led", FieldKind::LedColor, f64::from(color));
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_led_red_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(channel) = t.trim().parse::<f32>() {
+                let color =
+                    led_color_from_channels(channel / 255.0, w.get_led_green(), w.get_led_blue());
+                ctx.apply_led_color_local(&w, color);
+                ctx.queue_field_push("led", FieldKind::LedColor, f64::from(color));
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_led_green(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let color = led_color_from_channels(w.get_led_red(), v, w.get_led_blue());
+            ctx.apply_led_color_local(&w, color);
+            ctx.queue_field_push("led", FieldKind::LedColor, f64::from(color));
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_led_green_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(channel) = t.trim().parse::<f32>() {
+                let color =
+                    led_color_from_channels(w.get_led_red(), channel / 255.0, w.get_led_blue());
+                ctx.apply_led_color_local(&w, color);
+                ctx.queue_field_push("led", FieldKind::LedColor, f64::from(color));
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_led_blue(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let color = led_color_from_channels(w.get_led_red(), w.get_led_green(), v);
+            ctx.apply_led_color_local(&w, color);
+            ctx.queue_field_push("led", FieldKind::LedColor, f64::from(color));
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_led_blue_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(channel) = t.trim().parse::<f32>() {
+                let color =
+                    led_color_from_channels(w.get_led_red(), w.get_led_green(), channel / 255.0);
+                ctx.apply_led_color_local(&w, color);
+                ctx.queue_field_push("led", FieldKind::LedColor, f64::from(color));
+            }
+        });
+    }
+    // Horn minimum honk (HO1): slider (debounced push, local echo
+    // while dragging) + typed value.
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_horn_min(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let min_ms = horn_min_ms_from_slider(f64::from(v));
+            // R2-10: local echo — the slider + text move with the drag.
+            ctx.apply_horn_min_local(&w, min_ms);
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("horn", FieldKind::HornMinMs, min_ms);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_horn_min_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
+                let min_ms = ms.clamp(100.0, 1000.0);
+                ctx.apply_horn_min_local(&w, min_ms);
+                ctx.queue_field_push("horn", FieldKind::HornMinMs, min_ms);
+            }
+        });
+    }
+    // Honk mode (HO2): Momentary 0 / Latch 1 — immediate push, like
+    // the handbrake Axis/Button segment.
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_horn_mode(move |i| {
+            if let Some(w) = win.upgrade() {
+                ctx.set_module_tuning(&w, "horn", |t| {
+                    t.horn_latch = Some(i == 1);
+                });
             }
         });
     }
@@ -11149,6 +11477,7 @@ fn main() -> Result<(), slint::PlatformError> {
         pedals: Rc::new(RefCell::new(PedalCache::new())),
         handbrake_record: Rc::new(RefCell::new(TuningSettings::neutral("handbrake"))),
         led_record: Rc::new(RefCell::new(TuningSettings::neutral("led"))),
+        horn_record: Rc::new(RefCell::new(TuningSettings::neutral("horn"))),
         calibration: Rc::new(RefCell::new(None)),
         vjoy_polling: Rc::new(Cell::new(false)),
         button_actions: Rc::new(RefCell::new(
@@ -11908,6 +12237,32 @@ mod tests {
     }
 
     #[test]
+    fn led_horn_slider_mappings() {
+        // L1: the period slider spans 100..5000 ms (default 1000 at
+        // the 0.184 thumb); HO1: the minimum-honk slider spans
+        // 100..1000 ms (default 400 at the 1/3 thumb). Out-of-range
+        // thumbs clamp instead of producing an invalid tuning.
+        assert_eq!(led_period_ms_from_slider(0.0), 100.0);
+        assert_eq!(led_period_ms_from_slider(1.0), 5000.0);
+        assert!((led_period_ms_from_slider(900.0 / 4900.0) - 1000.0).abs() < 1e-9);
+        assert_eq!(led_period_ms_from_slider(-0.5), 100.0);
+        assert_eq!(led_period_ms_from_slider(2.0), 5000.0);
+        assert_eq!(horn_min_ms_from_slider(0.0), 100.0);
+        assert_eq!(horn_min_ms_from_slider(1.0), 1000.0);
+        assert!((horn_min_ms_from_slider(300.0 / 900.0) - 400.0).abs() < 1e-9);
+        assert_eq!(horn_min_ms_from_slider(-0.5), 100.0);
+        assert_eq!(horn_min_ms_from_slider(2.0), 1000.0);
+        // L2: the RGB channels compose the full-RGB protocol value;
+        // out-of-range channels clamp to 0..255.
+        assert_eq!(led_color_from_channels(1.0, 0.0, 0.0), 0xFF_00_00);
+        assert_eq!(led_color_from_channels(0.0, 1.0, 0.0), 0x00_FF_00);
+        assert_eq!(led_color_from_channels(0.0, 0.0, 1.0), 0x00_00_FF);
+        assert_eq!(led_color_from_channels(1.0, 1.0, 1.0), 0xFF_FF_FF);
+        assert_eq!(led_color_from_channels(0.0, 0.0, 0.0), 0x00_00_00);
+        assert_eq!(led_color_from_channels(2.0, -1.0, 0.5), 0xFF_00_80);
+    }
+
+    #[test]
     fn pedal_key_maps_indices() {
         assert_eq!(pedal_key(0), Some(("accel", "Accelerator")));
         assert_eq!(pedal_key(1), Some(("brake", "Brake")));
@@ -12169,6 +12524,7 @@ mod tests {
             pedals: Rc::new(RefCell::new(PedalCache::new())),
             handbrake_record: Rc::new(RefCell::new(TuningSettings::neutral("handbrake"))),
             led_record: Rc::new(RefCell::new(TuningSettings::neutral("led"))),
+            horn_record: Rc::new(RefCell::new(TuningSettings::neutral("horn"))),
             calibration: Rc::new(RefCell::new(None)),
             vjoy_polling: Rc::new(Cell::new(false)),
             button_actions: Rc::new(RefCell::new(
