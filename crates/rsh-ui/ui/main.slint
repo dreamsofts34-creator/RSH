@@ -78,6 +78,8 @@ export component MainWindow inherits Window {
     in-out property <int> selected-index: 5; // A4: index 5 = "Gear 3" (preview), not 0
     in property <[string]> button-actions: ["Shift up", "Shift down", "Horn", "Gear 1", "Gear 2", "Gear 3", "Gear 4", "Gear 5", "Gear 6", "Handbrake", "Not set", "Not set"];
     in property <string> selected-action: "Gear 3";
+    // BU2: the selected tile's long-press action ("Not set" = none).
+    in property <string> selected-long-action: "Not set";
     in property <string> knob-row-action: "Gear 1";
     in property <bool> buttons-listening: false;
     in property <string> profile-name: "GT3 Sprint";
@@ -164,6 +166,14 @@ export component MainWindow inherits Window {
     in property <string> enc-accel-sens-text: "100%";
     in property <bool> enc-invert1: false;
     in property <bool> enc-invert2: false;
+    // Button tuning (BU1/BU2): debounce + long-press threshold, on
+    // the Buttons page — from get_tuning("buttons"), never literals.
+    in property <float> btn-debounce-ms: 10.0;
+    in property <string> btn-debounce-text: "10 ms";
+    in property <float> btn-longpress-ms: 800.0;
+    in property <string> btn-longpress-text: "800 ms";
+    in property <float> btn-doublepress-ms: 300.0;
+    in property <string> btn-doublepress-text: "300 ms";
     in property <string> throttle-raw-mv-text: "—";
     in property <string> brake-raw-mv-text: "—";
     in property <string> clutch-raw-mv-text: "—";
@@ -431,6 +441,14 @@ export component MainWindow inherits Window {
     callback enc-accel-sens-changed(float);
     callback enc-accel-sens-edited(string);
     callback enc-invert-changed(int, bool);
+    // Button tuning (BU1/BU2): debounce + long-press threshold
+    // sliders on the Buttons page.
+    callback btn-debounce-changed(float);
+    callback btn-debounce-edited(string);
+    callback btn-longpress-changed(float);
+    callback btn-longpress-edited(string);
+    callback btn-doublepress-changed(float);
+    callback btn-doublepress-edited(string);
     callback learn-clicked();
     callback edit-cancel();
     callback edit-save();
@@ -465,6 +483,8 @@ export component MainWindow inherits Window {
     in property <bool> overview-unreachable: false;
     callback tile-selected(int);
     callback action-chip(string);
+    // BU2: a long-press action chip in the button edit panel.
+    callback long-action-chip(string);
     callback open-diagnostics();
     callback auto-pause-toggled();
     // Profile popover (A8).
@@ -855,6 +875,7 @@ export component MainWindow inherits Window {
                 pressed-index: pressed-index;
                 selected-index: selected-index;
                 selected-action: selected-action;
+                selected-long-action: selected-long-action;
                 knob1-left: "Gear 1";
                 knob1-right: "Gear 2";
                 knob1-press: "Not set";
@@ -872,6 +893,12 @@ export component MainWindow inherits Window {
                 enc-accel-sens-text: enc-accel-sens-text;
                 enc-invert1: enc-invert1;
                 enc-invert2: enc-invert2;
+                btn-debounce-ms: btn-debounce-ms;
+                btn-debounce-text: btn-debounce-text;
+                btn-longpress-ms: btn-longpress-ms;
+                btn-longpress-text: btn-longpress-text;
+                btn-doublepress-ms: btn-doublepress-ms;
+                btn-doublepress-text: btn-doublepress-text;
                 enc-pulse-changed(v) => { enc-pulse-changed(v); }
                 enc-pulse-edited(t) => { enc-pulse-edited(t); }
                 enc-counts-changed(i) => { enc-counts-changed(i); }
@@ -879,11 +906,18 @@ export component MainWindow inherits Window {
                 enc-accel-sens-changed(v) => { enc-accel-sens-changed(v); }
                 enc-accel-sens-edited(t) => { enc-accel-sens-edited(t); }
                 enc-invert-changed(i, b) => { enc-invert-changed(i, b); }
+                btn-debounce-changed(v) => { btn-debounce-changed(v); }
+                btn-debounce-edited(t) => { btn-debounce-edited(t); }
+                btn-longpress-changed(v) => { btn-longpress-changed(v); }
+                btn-longpress-edited(t) => { btn-longpress-edited(t); }
+                btn-doublepress-changed(v) => { btn-doublepress-changed(v); }
+                btn-doublepress-edited(t) => { btn-doublepress-edited(t); }
                 listening: buttons-listening;
                 tile-selected(i) => { tile-selected(i); }
                 knob-selected(i) => { knob-selected(i); }
                 knob-row-selected(i) => { knob-row-selected(i); }
                 action-selected(a) => { action-chip(a); }
+                long-action-selected(a) => { long-action-chip(a); }
                 learn-clicked => { learn-clicked(); }
                 edit-cancel => { edit-cancel(); }
                 edit-save => { edit-save(); }

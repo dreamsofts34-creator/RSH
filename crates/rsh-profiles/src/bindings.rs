@@ -172,15 +172,31 @@ fn empty_knobs() -> [[String; 3]; 2] {
     std::array::from_fn(|_| [String::new(), String::new(), String::new()])
 }
 
+/// What [`BindingStore::read_file`] returns: (bindings, knobs,
+/// long-press bindings, load warnings).
+type BindingsFileContents = (
+    BTreeMap<u8, String>,
+    [[String; 3]; 2],
+    BTreeMap<u8, String>,
+    Vec<String>,
+);
+
 /// On-disk shape of `bindings.json` (`schemaVersion` camelCase,
 /// like `profiles.json`). `knobs` are the two rotary knobs' actions
 /// [knob][row: left, right, press] — `""` = not set (M9, v2.0.2).
+/// `long_press_bindings` (BU2) is the per-button second action
+/// that fires when the button is held past the long-press
+/// threshold — physical buttons 1–32 only (the engine tracks
+/// holds for stream buttons, not encoder virtual buttons).
+/// Absent in old files (`#[serde(default)]`) = no long-press
+/// actions, so old `bindings.json` files load unchanged.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 struct BindingsFile {
     schema_version: u32,
     bindings: BTreeMap<u8, String>,
     knobs: [[String; 3]; 2],
+    long_press_bindings: BTreeMap<u8, String>,
 }
 
 /// The persisted button→action store.
@@ -191,6 +207,9 @@ pub struct BindingStore {
     bindings: BTreeMap<u8, String>,
     /// Knob actions [knob][row: left, right, press] (`""` = not set).
     knobs: [[String; 3]; 2],
+    /// Button → long-press action id (BU2), in button order.
+    /// Physical buttons 1–32 only.
+    long_press_bindings: BTreeMap<u8, String>,
     /// Load-time warnings (dropped entries, corrupt file). Empty
     /// on a clean load; surfaced by the daemon as a startup notice,
     /// never silently swallowed.
@@ -205,15 +224,16 @@ impl BindingStore {
     #[must_use]
     pub fn open(dir: &Path) -> Self {
         let path = dir.join(BINDINGS_FILE_NAME);
-        let (bindings, knobs, load_warnings) = if path.exists() {
+        let (bindings, knobs, long_press_bindings, load_warnings) = if path.exists() {
             Self::read_file(&path)
         } else {
-            (BTreeMap::new(), empty_knobs(), Vec::new())
+            (BTreeMap::new(), empty_knobs(), BTreeMap::new(), Vec::new())
         };
         Self {
             dir: dir.to_path_buf(),
             bindings,
             knobs,
+            long_press_bindings,
             load_warnings,
         }
     }
@@ -272,7 +292,11 @@ impl BindingStore {
         }
         let mut next = self.knobs.clone();
         next[knob as usize][row as usize] = action.to_string();
-        self.save_file(&self.bindings.clone(), &next)?;
+        self.save_file(
+            &self.bindings.clone(),
+            &next,
+            &self.long_press_bindings.clone(),
+        )?;
         self.knobs = next;
         Ok(())
     }
@@ -307,7 +331,11 @@ impl BindingStore {
         }
         let mut next = self.bindings.clone();
         next.insert(button, action.to_string());
-        self.save_file(&next, &self.knobs.clone())?;
+        self.save_file(
+            &next,
+            &self.knobs.clone(),
+            &self.long_press_bindings.clone(),
+        )?;
         self.bindings = next;
         Ok(())
     }
@@ -326,8 +354,78 @@ impl BindingStore {
         }
         let mut next = self.bindings.clone();
         next.remove(&button);
-        self.save_file(&next, &self.knobs.clone())?;
+        self.save_file(
+            &next,
+            &self.knobs.clone(),
+            &self.long_press_bindings.clone(),
+        )?;
         self.bindings = next;
+        Ok(true)
+    }
+
+    /// All long-press bindings (BU2), in button order.
+    #[must_use]
+    pub fn list_long_press(&self) -> &BTreeMap<u8, String> {
+        &self.long_press_bindings
+    }
+
+    /// The long-press action bound to `button`, if any.
+    #[must_use]
+    pub fn get_long_press(&self, button: u8) -> Option<&str> {
+        self.long_press_bindings.get(&button).map(String::as_str)
+    }
+
+    /// Bind `button`'s long-press action and persist. Validates
+    /// first; a failed save leaves the in-memory map untouched.
+    /// Only physical buttons 1–32: the engine tracks holds for
+    /// stream buttons, so an encoder virtual button (65–72) could
+    /// never fire its long-press action — it is rejected here
+    /// instead of stored dead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingError`] with code `InvalidButton` for a
+    /// button outside 1–32, `UnknownAction` for an action id that
+    /// is neither a game input nor an app action, and
+    /// `BindingSaveFailed` when the file cannot be written.
+    pub fn set_long_press(&mut self, button: u8, action: &str) -> Result<(), BindingError> {
+        if !(1..=32).contains(&button) {
+            return Err(BindingError {
+                code: "InvalidButton",
+                message: format!(
+                    "button {button} cannot have a long-press action (long-press actions are for physical wheel buttons 1-32)"
+                ),
+            });
+        }
+        if let Some(message) = validate_action(action) {
+            return Err(BindingError {
+                code: "UnknownAction",
+                message,
+            });
+        }
+        let mut next = self.long_press_bindings.clone();
+        next.insert(button, action.to_string());
+        self.save_file(&self.bindings.clone(), &self.knobs.clone(), &next)?;
+        self.long_press_bindings = next;
+        Ok(())
+    }
+
+    /// Remove the long-press binding for `button` and persist.
+    /// Returns `true` when one was actually removed (`false` =
+    /// nothing was bound, nothing written).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingError`] with code `BindingSaveFailed` when
+    /// the removal cannot be persisted.
+    pub fn clear_long_press(&mut self, button: u8) -> Result<bool, BindingError> {
+        if !self.long_press_bindings.contains_key(&button) {
+            return Ok(false);
+        }
+        let mut next = self.long_press_bindings.clone();
+        next.remove(&button);
+        self.save_file(&self.bindings.clone(), &self.knobs.clone(), &next)?;
+        self.long_press_bindings = next;
         Ok(true)
     }
 
@@ -337,7 +435,7 @@ impl BindingStore {
     /// with one warning — never an error, never invented data. Knob
     /// entries follow the same rule (`""` or an assignable action,
     /// else `""` with a warning).
-    fn read_file(path: &Path) -> (BTreeMap<u8, String>, [[String; 3]; 2], Vec<String>) {
+    fn read_file(path: &Path) -> BindingsFileContents {
         let mut warnings = Vec::new();
         let empty_knobs = empty_knobs();
         let metadata = match fs::metadata(path) {
@@ -347,7 +445,7 @@ impl BindingStore {
                     "bindings file '{}' could not be read ({error}) — starting with no bindings",
                     path.display()
                 ));
-                return (BTreeMap::new(), empty_knobs, warnings);
+                return (BTreeMap::new(), empty_knobs, BTreeMap::new(), warnings);
             }
         };
         if metadata.len() > MAX_BINDINGS_FILE_BYTES {
@@ -355,7 +453,7 @@ impl BindingStore {
                 "bindings file '{}' exceeds the {MAX_BINDINGS_FILE_BYTES} byte cap — starting with no bindings",
                 path.display()
             ));
-            return (BTreeMap::new(), empty_knobs, warnings);
+            return (BTreeMap::new(), empty_knobs, BTreeMap::new(), warnings);
         }
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
@@ -364,7 +462,7 @@ impl BindingStore {
                     "bindings file '{}' could not be read ({error}) — starting with no bindings",
                     path.display()
                 ));
-                return (BTreeMap::new(), empty_knobs, warnings);
+                return (BTreeMap::new(), empty_knobs, BTreeMap::new(), warnings);
             }
         };
         let file: BindingsFile = match serde_json::from_str(&text) {
@@ -374,7 +472,7 @@ impl BindingStore {
                     "bindings file '{}' is not valid JSON ({error}) — starting with no bindings",
                     path.display()
                 ));
-                return (BTreeMap::new(), empty_knobs, warnings);
+                return (BTreeMap::new(), empty_knobs, BTreeMap::new(), warnings);
             }
         };
         if file.schema_version > BINDINGS_SCHEMA_VERSION {
@@ -383,7 +481,7 @@ impl BindingStore {
                 path.display(),
                 file.schema_version
             ));
-            return (BTreeMap::new(), empty_knobs, warnings);
+            return (BTreeMap::new(), empty_knobs, BTreeMap::new(), warnings);
         }
         let mut bindings = BTreeMap::new();
         for (button, action) in file.bindings {
@@ -413,20 +511,43 @@ impl BindingStore {
                 }
             }
         }
-        (bindings, knobs, warnings)
+        // BU2: long-press entries follow the same rule, except the
+        // button must be physical (1–32) — an encoder virtual
+        // button could never fire, so it is dropped with a warning
+        // instead of stored dead.
+        let mut long_press_bindings = BTreeMap::new();
+        for (button, action) in file.long_press_bindings {
+            if !(1..=32).contains(&button) {
+                warnings.push(format!(
+                    "long-press binding for button {button} dropped on load: long-press actions are for physical wheel buttons 1-32"
+                ));
+                continue;
+            }
+            if let Some(message) = validate_action(&action) {
+                warnings.push(format!(
+                    "long-press binding for button {button} dropped on load: {message}"
+                ));
+                continue;
+            }
+            long_press_bindings.insert(button, action);
+        }
+        (bindings, knobs, long_press_bindings, warnings)
     }
 
-    /// Write `bindings` + `knobs` to `bindings.json` atomically
-    /// (temp file in the same directory, then rename).
+    /// Write `bindings` + `knobs` + `long_press_bindings` to
+    /// `bindings.json` atomically (temp file in the same directory,
+    /// then rename).
     fn save_file(
         &self,
         bindings: &BTreeMap<u8, String>,
         knobs: &[[String; 3]; 2],
+        long_press_bindings: &BTreeMap<u8, String>,
     ) -> Result<(), BindingError> {
         let file = BindingsFile {
             schema_version: BINDINGS_SCHEMA_VERSION,
             bindings: bindings.clone(),
             knobs: knobs.clone(),
+            long_press_bindings: long_press_bindings.clone(),
         };
         let json = serde_json::to_string_pretty(&file)
             .map_err(|error| BindingError::save_failed(error.to_string()))?;
@@ -526,6 +647,80 @@ mod tests {
         assert_eq!(store.get(5), None);
         // Reopen: the removal persisted.
         assert!(BindingStore::open(&dir).list().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn long_press_persists_and_reopens() {
+        // BU2: the second action survives a reopen, alongside the
+        // normal bindings and knobs.
+        let dir = temp_dir("long-press");
+        let mut store = BindingStore::open(&dir);
+        store.set(5, "gear_1").expect("bind button 5");
+        store
+            .set_long_press(5, "gear_2")
+            .expect("bind button 5 long-press");
+        assert_eq!(store.get_long_press(5), Some("gear_2"));
+        assert_eq!(store.get(5), Some("gear_1"));
+        let reopened = BindingStore::open(&dir);
+        assert_eq!(reopened.load_warnings().len(), 0);
+        assert_eq!(reopened.get_long_press(5), Some("gear_2"));
+        assert_eq!(reopened.get(5), Some("gear_1"));
+        // Clear only the long-press: the normal binding stands.
+        let mut reopened = reopened;
+        assert!(reopened.clear_long_press(5).expect("clear long-press"));
+        assert_eq!(reopened.get_long_press(5), None);
+        assert_eq!(reopened.get(5), Some("gear_1"));
+        assert!(!reopened.clear_long_press(5).expect("clear absent"));
+        assert_eq!(BindingStore::open(&dir).get(5), Some("gear_1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn long_press_rejects_encoder_buttons_and_unknown_actions() {
+        // BU2: the engine tracks holds for stream buttons only, so
+        // an encoder virtual button (65–72) is rejected, not stored
+        // dead; unknown actions are rejected like normal bindings.
+        let dir = temp_dir("long-press-reject");
+        let mut store = BindingStore::open(&dir);
+        let error = store
+            .set_long_press(65, "horn")
+            .expect_err("encoder button");
+        assert_eq!(error.code, "InvalidButton");
+        let error = store.set_long_press(0, "horn").expect_err("button 0");
+        assert_eq!(error.code, "InvalidButton");
+        let error = store
+            .set_long_press(5, "warp_drive")
+            .expect_err("unknown action");
+        assert_eq!(error.code, "UnknownAction");
+        assert!(store.list_long_press().is_empty());
+        assert!(!dir.join(BINDINGS_FILE_NAME).exists(), "no file written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_file_without_long_press_loads_empty() {
+        // BU2: a bindings.json written before long-press existed
+        // (no `longPressBindings` key) loads with no long-press
+        // actions and no warning; an invalid long-press entry is
+        // dropped with a warning and the valid ones kept.
+        let dir = temp_dir("long-press-old");
+        std::fs::write(
+            dir.join(BINDINGS_FILE_NAME),
+            r#"{"schemaVersion":1,"bindings":{"5":"horn"},"knobs":[["","",""],["","",""]],"longPressBindings":{"70":"horn","5":"gear_2","6":"warp_drive"}}"#,
+        )
+        .expect("write");
+        let store = BindingStore::open(&dir);
+        assert_eq!(store.get(5), Some("horn"));
+        assert_eq!(store.get_long_press(5), Some("gear_2"));
+        assert_eq!(store.get_long_press(70), None);
+        assert_eq!(store.get_long_press(6), None);
+        assert_eq!(
+            store.load_warnings().len(),
+            2,
+            "{:?}",
+            store.load_warnings()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

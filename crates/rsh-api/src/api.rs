@@ -1339,6 +1339,45 @@ pub trait AppApi: Send + Sync {
         ))
     }
 
+    /// All persisted long-press button→action bindings (BU2), in
+    /// button order. Default: empty — only the daemon owns the store.
+    fn list_long_press_bindings(&self) -> Vec<ButtonBinding> {
+        Vec::new()
+    }
+
+    /// Bind `button`'s long-press action (BU2, physical buttons
+    /// 1–32) — the second action that takes over once the button
+    /// has been held past the long-press threshold — and persist
+    /// it. Default: error — only the daemon binds.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] with code `InvalidButton`, `UnknownAction`, or
+    /// `BindingSaveFailed`.
+    fn set_long_press_binding(&self, button: u8, action: &str) -> Result<ButtonBinding, UserError> {
+        let _ = (button, action);
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "long-press bindings are not supported by this API",
+        ))
+    }
+
+    /// Remove the long-press binding for `button` (BU2). Returns
+    /// `true` when one was actually removed. Default: error — only
+    /// the daemon binds.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] with code `BindingSaveFailed` when the removal
+    /// cannot be persisted.
+    fn clear_long_press_binding(&self, button: u8) -> Result<bool, UserError> {
+        let _ = button;
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "long-press bindings are not supported by this API",
+        ))
+    }
+
     /// Persisted knob actions (M9, v2.0.2): two knobs × three rows
     /// of action ids (`""` = not set). Default: all unset — only the
     /// daemon overrides it.

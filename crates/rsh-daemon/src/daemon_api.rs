@@ -953,6 +953,31 @@ impl AppApi for DaemonApi {
             .map_err(|error| binding_user_error(error.code, error.message))
     }
 
+    /// All persisted long-press button→action bindings (BU2), in
+    /// button order.
+    fn list_long_press_bindings(&self) -> Vec<ButtonBinding> {
+        self.state.list_long_press_bindings()
+    }
+
+    /// Bind a wheel button's long-press action (BU2) and persist
+    /// it. The error code is the store's stable code
+    /// (`InvalidButton` / `UnknownAction` / `BindingSaveFailed`),
+    /// so the UI can explain the failure instead of showing a bare
+    /// "Unknown" (see [`binding_user_error`]).
+    fn set_long_press_binding(&self, button: u8, action: &str) -> Result<ButtonBinding, UserError> {
+        self.state
+            .set_long_press_binding(button, action)
+            .map_err(|error| binding_user_error(error.code, error.message))
+    }
+
+    /// Remove a button's long-press binding (BU2). Returns `true`
+    /// when one was actually removed.
+    fn clear_long_press_binding(&self, button: u8) -> Result<bool, UserError> {
+        self.state
+            .clear_long_press_binding(button)
+            .map_err(|error| binding_user_error(error.code, error.message))
+    }
+
     fn rename_profile(&self, id: &str, name: &str) -> Result<String, UserError> {
         self.state
             .rename_profile(id, name)

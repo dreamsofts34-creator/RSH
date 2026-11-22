@@ -258,6 +258,21 @@ export component ButtonsPage inherits HorizontalLayout {
     callback enc-accel-sens-changed(float);
     callback enc-accel-sens-edited(string);
     callback enc-invert-changed(int, bool);
+    // button tuning (BU1 debounce, BU2 long-press threshold)
+    in property <float> btn-debounce-ms: 10.0;
+    in property <string> btn-debounce-text: "10 ms";
+    in property <float> btn-longpress-ms: 800.0;
+    in property <string> btn-longpress-text: "800 ms";
+    in property <float> btn-doublepress-ms: 300.0;
+    in property <string> btn-doublepress-text: "300 ms";
+    callback btn-debounce-changed(float);
+    callback btn-debounce-edited(string);
+    callback btn-longpress-changed(float);
+    callback btn-longpress-edited(string);
+    callback btn-doublepress-changed(float);
+    callback btn-doublepress-edited(string);
+    // BU2: the selected button's long-press action ("Not set" = none)
+    in property <string> selected-long-action: "Not set";
     // edit panel state: 0 = button, 1 = knob
     in-out property <int> edit-kind: 0;
     in-out property <int> edit-knob: 0; // 0 knob 1, 1 knob 2
@@ -274,6 +289,7 @@ export component ButtonsPage inherits HorizontalLayout {
     callback knob-selected(int);
     callback knob-row-selected(int);
     callback action-selected(string);
+    callback long-action-selected(string);
     callback learn-clicked();
     callback edit-cancel();
     callback edit-save();
@@ -426,6 +442,17 @@ export component ButtonsPage inherits HorizontalLayout {
                 }
             }
         }
+        // button tuning card (BU1 debounce, BU2 long-press threshold)
+        Card {
+            VerticalLayout {
+                padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
+                spacing: 10px;
+                Text { text: "Button tuning"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                SliderRow { label: "Debounce"; hint: "Presses must hold steady this long"; value-text: btn-debounce-text; value: btn-debounce-ms / 50.0; changed(v) => { btn-debounce-changed(v); } value-edited(t) => { btn-debounce-edited(t); } }
+                SliderRow { label: "Long-press threshold"; hint: "Hold this long to switch to the long-press action"; value-text: btn-longpress-text; value: (btn-longpress-ms - 300.0) / 1200.0; changed(v) => { btn-longpress-changed(v); } value-edited(t) => { btn-longpress-edited(t); } }
+                SliderRow { label: "Double-press window"; hint: "Press again within this long to switch to the long-press action"; value-text: btn-doublepress-text; value: (btn-doublepress-ms - 150.0) / 350.0; changed(v) => { btn-doublepress-changed(v); } value-edited(t) => { btn-doublepress-edited(t); } }
+            }
+        }
         // Slack absorber: the column is stretched to the full body
         // height; without this the layout stretches the cards (and
         // their title rows) to fill it. Preview keeps cards
@@ -548,6 +575,54 @@ export component ButtonsPage inherits HorizontalLayout {
                     ActionChip { horizontal-stretch: 1; label: "Handbrake"; active: "Handbrake" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Handbrake"); } }
                     ActionChip { horizontal-stretch: 1; label: "Not set"; active: "Not set" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Not set"); } }
                     Rectangle { horizontal-stretch: 1; }
+                }
+            }
+            // BU2: long-press action (button edits only) — the second
+            // action this button switches to when held past the
+            // threshold. Same chips as above, own picker state.
+            if edit-kind == 0 : VerticalLayout {
+                spacing: 0px;
+                Rectangle { height: 14px; }
+                Text {
+                    text: "Long-press action";
+                    font-size: 12.5px;
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                Rectangle { height: 2px; }
+                Text {
+                    wrap: word-wrap;
+                    text: "Hold past the threshold — or press twice quickly — to switch to this action instead.";
+                    font-size: 11.5px;
+                    color: Theme.faint;
+                }
+                Rectangle { height: 6px; }
+                VerticalLayout {
+                    spacing: 5px;
+                    HorizontalLayout {
+                        spacing: 5px;
+                        ActionChip { horizontal-stretch: 1; label: "Gear 1"; active: "Gear 1" == selected-long-action; clicked => { long-action-selected("Gear 1"); } }
+                        ActionChip { horizontal-stretch: 1; label: "Gear 2"; active: "Gear 2" == selected-long-action; clicked => { long-action-selected("Gear 2"); } }
+                        ActionChip { horizontal-stretch: 1; label: "Gear 3"; active: "Gear 3" == selected-long-action; clicked => { long-action-selected("Gear 3"); } }
+                    }
+                    HorizontalLayout {
+                        spacing: 5px;
+                        ActionChip { horizontal-stretch: 1; label: "Gear 4"; active: "Gear 4" == selected-long-action; clicked => { long-action-selected("Gear 4"); } }
+                        ActionChip { horizontal-stretch: 1; label: "Gear 5"; active: "Gear 5" == selected-long-action; clicked => { long-action-selected("Gear 5"); } }
+                        ActionChip { horizontal-stretch: 1; label: "Gear 6"; active: "Gear 6" == selected-long-action; clicked => { long-action-selected("Gear 6"); } }
+                    }
+                    HorizontalLayout {
+                        spacing: 5px;
+                        ActionChip { horizontal-stretch: 1; label: "Shift up"; active: "Shift up" == selected-long-action; clicked => { long-action-selected("Shift up"); } }
+                        ActionChip { horizontal-stretch: 1; label: "Shift down"; active: "Shift down" == selected-long-action; clicked => { long-action-selected("Shift down"); } }
+                        ActionChip { horizontal-stretch: 1; label: "Horn"; active: "Horn" == selected-long-action; clicked => { long-action-selected("Horn"); } }
+                    }
+                    HorizontalLayout {
+                        spacing: 5px;
+                        ActionChip { horizontal-stretch: 1; label: "Handbrake"; active: "Handbrake" == selected-long-action; clicked => { long-action-selected("Handbrake"); } }
+                        ActionChip { horizontal-stretch: 1; label: "Not set"; active: "Not set" == selected-long-action; clicked => { long-action-selected("Not set"); } }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
                 }
             }
             Rectangle { height: 16px; }

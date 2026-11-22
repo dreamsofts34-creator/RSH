@@ -398,7 +398,12 @@ pub fn dispatch(
         | "capture_steering_left"
         | "capture_steering_right" => dispatch_capture(api, request),
         // v2.0.2: button→action bindings (list / set / clear).
-        "list_bindings" | "set_binding" | "clear_binding" => dispatch_bindings(api, request),
+        "list_bindings"
+        | "set_binding"
+        | "clear_binding"
+        | "list_long_press_bindings"
+        | "set_long_press_binding"
+        | "clear_long_press_binding" => dispatch_bindings(api, request),
         // v2.0.2 Round 3: Wi-Fi password set/clear (v2.0.6),
         // firmware check/update, board address, module toggles,
         // auto-pause, tray, backup, profile rename/link, knob actions.
@@ -477,9 +482,11 @@ fn dispatch_capture(
 /// "action": "horn"}]}`; `set_binding` takes `{"button": 5,
 /// "action": "horn"}` and returns `{"binding": {...}}`;
 /// `clear_binding` takes `{"button": 5}` and returns `{"cleared":
-/// true}`. A non-numeric / out-of-range `button` param is an
-/// `InvalidButton` error, never a silent default: the UI must not
-/// bind the wrong button because it sent a bad number.
+/// true}`. The `long_press` variants (BU2) are the same shapes
+/// against the long-press bindings. A non-numeric / out-of-range
+/// `button` param is an `InvalidButton` error, never a silent
+/// default: the UI must not bind the wrong button because it sent
+/// a bad number.
 fn dispatch_bindings(
     api: &Arc<dyn AppApi>,
     request: &IpcRequest,
@@ -503,6 +510,26 @@ fn dispatch_bindings(
         "clear_binding" => {
             let button = parse_binding_button(params)?;
             api.clear_binding(button)
+                .map(|cleared| serde_json::json!({"cleared": cleared}))
+                .map_err(|error| detailed_api_error(&error))
+        }
+        "list_long_press_bindings" => {
+            let bindings = api.list_long_press_bindings();
+            Ok(serde_json::json!({"bindings": bindings}))
+        }
+        "set_long_press_binding" => {
+            let button = parse_binding_button(params)?;
+            let action = params
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.set_long_press_binding(button, action)
+                .map(|binding| serde_json::json!({"binding": binding}))
+                .map_err(|error| detailed_api_error(&error))
+        }
+        "clear_long_press_binding" => {
+            let button = parse_binding_button(params)?;
+            api.clear_long_press_binding(button)
                 .map(|cleared| serde_json::json!({"cleared": cleared}))
                 .map_err(|error| detailed_api_error(&error))
         }

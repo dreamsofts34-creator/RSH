@@ -2325,6 +2325,93 @@ fn ui_encoder_tuning() -> Outcome {
     report.finish()
 }
 
+/// Gate: button tuning (BU1–BU2) — the Buttons page's "Button
+/// tuning" card holds the debounce + long-press threshold sliders,
+/// the edit panel holds the long-press action picker, and the window
+/// + Rust wiring exist behind them. Static source checks only: the
+/// Buttons page has no probe harness (its render needs the full
+/// window + bindings), so — like `ui_encoder_tuning` — this proves
+/// the controls are in the source and wired, not that they paint.
+fn ui_button_tuning() -> Outcome {
+    let mut report = Report::new();
+    let buttons = match read_gate_source("crates/rsh-ui/ui/screens/buttons.slint") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for label in [
+        "Button tuning",
+        "Debounce",
+        "Long-press threshold",
+        "Double-press window",
+        "Long-press action",
+    ] {
+        report.check(
+            &format!("button-tuning-has-{label}"),
+            buttons.contains(label),
+            &format!("buttons.slint must contain the {label} control"),
+        );
+    }
+    let main_slint = match read_gate_source("crates/rsh-ui/ui/main.slint") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for prop in [
+        "btn-debounce-ms",
+        "btn-debounce-text",
+        "btn-longpress-ms",
+        "btn-longpress-text",
+        "btn-doublepress-ms",
+        "btn-doublepress-text",
+        "selected-long-action",
+    ] {
+        report.check(
+            &format!("button-tuning-prop-{prop}"),
+            main_slint.contains(prop),
+            &format!("main.slint must carry the {prop} window property"),
+        );
+    }
+    for callback in [
+        "btn-debounce-changed",
+        "btn-debounce-edited",
+        "btn-longpress-changed",
+        "btn-longpress-edited",
+        "btn-doublepress-changed",
+        "btn-doublepress-edited",
+        "long-action-chip",
+    ] {
+        report.check(
+            &format!("button-tuning-callback-{callback}"),
+            main_slint.contains(&format!("callback {callback}")),
+            &format!("main.slint must declare the {callback} callback"),
+        );
+    }
+    let main_rs = match read_gate_source("crates/rsh-ui/src/main.rs") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for wired in [
+        "on_btn_debounce_changed",
+        "on_btn_debounce_edited",
+        "on_btn_longpress_changed",
+        "on_btn_longpress_edited",
+        "on_btn_doublepress_changed",
+        "on_btn_doublepress_edited",
+        "on_long_action_chip",
+        "FieldKind::ButtonDebounceMs",
+        "FieldKind::ButtonLongPressMs",
+        "FieldKind::ButtonDoublePressMs",
+        "sync_button_props",
+        "set_long_press_binding",
+    ] {
+        report.check(
+            &format!("button-tuning-wired-{wired}"),
+            main_rs.contains(wired),
+            &format!("main.rs must wire {wired}"),
+        );
+    }
+    report.finish()
+}
+
 /// The probe's new callbacks exist with the right signatures and
 /// fire: invoke each root callback and check the handler receives
 /// the value.
@@ -2499,6 +2586,11 @@ fn checks() -> Vec<UiCheck> {
             "ui-encoder-tuning",
             "E1-E4: Buttons page holds pulse length + steps per click + accel + per-knob invert, wired through main.rs",
             ui_encoder_tuning as fn() -> Outcome,
+        ),
+        (
+            "ui-button-tuning",
+            "BU1-BU3: Buttons page holds debounce + long-press threshold + double-press window sliders + long-press action picker, wired through main.rs",
+            ui_button_tuning as fn() -> Outcome,
         ),
     ]
 }

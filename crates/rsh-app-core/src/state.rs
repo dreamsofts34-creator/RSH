@@ -906,6 +906,18 @@ pub struct AppStateCore {
     /// momentary encoder pulse would otherwise re-fire its app
     /// action on every tick until the next frame recomputes it.
     last_bound_encoder: Mutex<u8>,
+    /// Last long-press set for buttons 1–32 (the engine's
+    /// `long_press_buttons` word), for app-action edge detection
+    /// in [`AppStateCore::apply_bindings`] (BU2): a held button's
+    /// long-press app action must fire once, when the threshold is
+    /// crossed — not once per 200 Hz tick while it stays held.
+    last_long_press_pressed: Mutex<u64>,
+    /// Last double-press set for buttons 1–32 (the engine's
+    /// `double_press_buttons` word), for app-action edge detection
+    /// in [`AppStateCore::apply_bindings`] (BU3): a double-pressed
+    /// button's 2nd app action must fire once, when the second
+    /// press starts — not once per 200 Hz tick while it stays held.
+    last_double_press_pressed: Mutex<u64>,
     /// Queued app actions from bound button presses, drained by the
     /// daemon manager loop ([`AppStateCore::drain_binding_actions`]).
     binding_actions: Mutex<VecDeque<BindingAppAction>>,
@@ -1237,6 +1249,8 @@ impl AppStateCore {
             manual_game_load_warnings,
             last_bound_pressed: Mutex::new(0),
             last_bound_encoder: Mutex::new(0),
+            last_long_press_pressed: Mutex::new(0),
+            last_double_press_pressed: Mutex::new(0),
             binding_actions: Mutex::new(VecDeque::new()),
             stop_handle: Mutex::new(None),
             engine_status: Mutex::new(EngineTaskStatus::Idle),
@@ -2970,12 +2984,32 @@ impl AppStateCore {
     ///   while its button is already held fires its app action
     ///   once on the next tick — the edge baseline only tracks
     ///   ticks that pass through here.)
+    /// * Long-press action (BU2): a button with a long-press
+    ///   binding fires its *normal* action while held, and the
+    ///   long-press action takes over once the engine's
+    ///   `long_press_buttons` bit for it is set (held past the
+    ///   threshold). A button with only a long-press binding passes
+    ///   its raw bit through until the threshold, then the
+    ///   long-press action takes over. The short-press action is
+    ///   therefore NOT delayed — a hold shows the normal action
+    ///   first, then the long-press one. A long-press app action
+    ///   fires once, on the threshold edge
+    ///   (`last_long_press_pressed` baseline), not once per tick.
+    /// * Double-press action (BU3): the same 2nd action — a
+    ///   button whose press starts within the double-press window
+    ///   of its previous release switches to its long-press action
+    ///   for the whole hold (the engine's `double_press_buttons`
+    ///   bit). A double-press app action fires once, on the second
+    ///   press edge (`last_double_press_pressed` baseline).
     fn apply_bindings(&self, output: &PipelineOutputState) -> PipelineOutputState {
         let bindings = lock(&self.bindings).list().clone();
+        let long_press = lock(&self.bindings).list_long_press().clone();
         let pressed64 = u64::from(output.buttons) | (u64::from(output.buttons_ex) << 32);
-        if bindings.is_empty() {
+        if bindings.is_empty() && long_press.is_empty() {
             *lock(&self.last_bound_pressed) = pressed64;
             *lock(&self.last_bound_encoder) = output.encoder_buttons.0;
+            *lock(&self.last_long_press_pressed) = u64::from(output.long_press_buttons);
+            *lock(&self.last_double_press_pressed) = u64::from(output.double_press_buttons);
             return *output;
         }
         let mut out = *output;
@@ -2983,16 +3017,58 @@ impl AppStateCore {
         {
             let mut last_pressed = lock(&self.last_bound_pressed);
             let mut last_encoder = lock(&self.last_bound_encoder);
-            for (&button, action) in &bindings {
+            let mut last_long_press = lock(&self.last_long_press_pressed);
+            let mut last_double_press = lock(&self.last_double_press_pressed);
+            // Every button with a normal binding, a long-press
+            // binding, or both — one pass, one edge baseline each.
+            let mut buttons: Vec<u8> = bindings.keys().copied().collect();
+            for button in long_press.keys() {
+                if !bindings.contains_key(button) {
+                    buttons.push(*button);
+                }
+            }
+            for button in buttons {
+                let normal = bindings.get(&button).map(String::as_str);
+                let long_action = long_press.get(&button).map(String::as_str);
                 if !Self::binding_button_pressed(button, output, pressed64) {
                     continue;
                 }
+                // BU2+BU3: past the threshold (long-press) or on a
+                // second press inside the window (double-press) the
+                // 2nd action takes over (falling back to the normal
+                // action when no 2nd action is set); before either,
+                // only the normal action applies — a 2nd-action-only
+                // button passes its raw bit through until then.
+                let long_pressed = (1..=32).contains(&button)
+                    && output.long_press_buttons & (1u32 << (u64::from(button) - 1)) != 0;
+                let double_pressed = (1..=32).contains(&button)
+                    && output.double_press_buttons & (1u32 << (u64::from(button) - 1)) != 0;
+                let second_action = long_pressed || double_pressed;
+                let from_second_action = second_action && long_action.is_some();
+                let Some(action) = (if second_action {
+                    long_action.or(normal)
+                } else {
+                    normal
+                }) else {
+                    continue;
+                };
                 if is_app_action(action) {
                     // Edge only — see the method docs. Encoder
                     // buttons (65–72) are edge-detected against the
                     // previous tick's encoder bits (R2-08), exactly
-                    // like the physical-button path below.
-                    let edge = if button >= 65 {
+                    // like the physical-button path below; a
+                    // long-press app action is edge-detected
+                    // against the previous tick's long-press bits,
+                    // a double-press one against the previous
+                    // tick's double-press bits.
+                    let edge = if from_second_action {
+                        let bit = 1_u64 << (u64::from(button) - 1);
+                        if double_pressed {
+                            *last_double_press & bit == 0
+                        } else {
+                            *last_long_press & bit == 0
+                        }
+                    } else if button >= 65 {
                         let bit = 1_u8 << (button - 65);
                         *last_encoder & bit == 0
                     } else {
@@ -3000,7 +3076,7 @@ impl AppStateCore {
                         *last_pressed & bit == 0
                     };
                     if edge {
-                        match action.as_str() {
+                        match action {
                             "profile_next" => queued.push(BindingAppAction::ProfileNext),
                             "profile_previous" => {
                                 queued.push(BindingAppAction::ProfilePrevious);
@@ -3012,7 +3088,7 @@ impl AppStateCore {
                 }
                 // Game action: clear the source bit, set the target.
                 Self::clear_bound_button(&mut out, button);
-                match action.as_str() {
+                match action {
                     "horn" => {
                         out.buttons |= 1 << 2;
                         out.horn = true;
@@ -3034,6 +3110,8 @@ impl AppStateCore {
             }
             *last_pressed = pressed64;
             *last_encoder = output.encoder_buttons.0;
+            *last_long_press = u64::from(output.long_press_buttons);
+            *last_double_press = u64::from(output.double_press_buttons);
         }
         if !queued.is_empty() {
             lock(&self.binding_actions).extend(queued);
@@ -5219,6 +5297,56 @@ impl AppStateCore {
         Ok(removed)
     }
 
+    /// All persisted long-press button→action bindings (BU2), in
+    /// button order.
+    #[must_use]
+    pub fn list_long_press_bindings(&self) -> Vec<ButtonBinding> {
+        lock(&self.bindings)
+            .list_long_press()
+            .iter()
+            .map(|(&button, action)| ButtonBinding {
+                button,
+                action: action.clone(),
+            })
+            .collect()
+    }
+
+    /// Bind `button`'s long-press action and persist it (BU2). The
+    /// long-press action takes over from the next engine tick once
+    /// the button has been held past the threshold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingError`] with code `InvalidButton` (outside
+    /// 1–32), `UnknownAction`, or `BindingSaveFailed`.
+    pub fn set_long_press_binding(
+        &self,
+        button: u8,
+        action: &str,
+    ) -> Result<ButtonBinding, BindingError> {
+        lock(&self.bindings).set_long_press(button, action)?;
+        self.note_slow_state_changed();
+        Ok(ButtonBinding {
+            button,
+            action: action.to_string(),
+        })
+    }
+
+    /// Remove the long-press binding for `button` and persist the
+    /// removal. Returns `true` when one was actually removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindingError`] with code `BindingSaveFailed` when
+    /// the removal cannot be persisted.
+    pub fn clear_long_press_binding(&self, button: u8) -> Result<bool, BindingError> {
+        let removed = lock(&self.bindings).clear_long_press(button)?;
+        if removed {
+            self.note_slow_state_changed();
+        }
+        Ok(removed)
+    }
+
     /// Load-time warnings from the bindings store (dropped entries,
     /// corrupt file). Empty on a clean load; the daemon logs them at
     /// startup so a dropped binding is never silent.
@@ -6406,6 +6534,13 @@ impl AppStateCore {
                 encoder_accel: Some(stored.encoder_accel.unwrap_or(false)),
                 encoder_accel_sensitivity: Some(stored.encoder_accel_sensitivity.unwrap_or(1.0)),
                 encoder_invert_mask: Some(stored.encoder_invert_mask.unwrap_or(0)),
+                // --- Buttons per-module tuning ---
+                // Old profiles carry none of these fields: the
+                // defaults (10 ms debounce, 800 ms long-press
+                // threshold, 300 ms double-press window) apply.
+                button_debounce_ms: Some(stored.button_debounce_ms.unwrap_or(10.0)),
+                button_long_press_ms: Some(stored.button_long_press_ms.unwrap_or(800.0)),
+                button_double_press_ms: Some(stored.button_double_press_ms.unwrap_or(300.0)),
             };
         }
         let (invert, steering_lock_deg, steering_balance_pct, steering_center_trim_pct) =
@@ -6459,6 +6594,10 @@ impl AppStateCore {
             encoder_accel: Some(false),
             encoder_accel_sensitivity: Some(1.0),
             encoder_invert_mask: Some(0),
+            // --- Buttons per-module tuning ---
+            button_debounce_ms: Some(10.0),
+            button_long_press_ms: Some(800.0),
+            button_double_press_ms: Some(300.0),
         }
     }
 
@@ -6554,6 +6693,10 @@ impl AppStateCore {
                 encoder_accel: None,
                 encoder_accel_sensitivity: None,
                 encoder_invert_mask: None,
+                // --- Buttons per-module tuning ---
+                button_debounce_ms: None,
+                button_long_press_ms: None,
+                button_double_press_ms: None,
             });
         entry.deadzone = tuning.deadzone / 100.0;
         entry.curve_strength = (tuning.curve - 1.0).clamp(-1.0, 1.0);
@@ -6608,6 +6751,10 @@ impl AppStateCore {
         entry.encoder_accel = tuning.encoder_accel;
         entry.encoder_accel_sensitivity = tuning.encoder_accel_sensitivity;
         entry.encoder_invert_mask = tuning.encoder_invert_mask;
+        // --- Buttons per-module tuning ---
+        entry.button_debounce_ms = tuning.button_debounce_ms;
+        entry.button_long_press_ms = tuning.button_long_press_ms;
+        entry.button_double_press_ms = tuning.button_double_press_ms;
         if let Some(gate) = tuning.shifter_gate {
             entry.gate_mode = match gate {
                 ShifterGate::Sequential => "Sequential".to_string(),
@@ -6871,6 +7018,10 @@ impl AppStateCore {
             accel_enabled: tuning.encoder_accel.unwrap_or(false),
             accel_sensitivity: tuning.encoder_accel_sensitivity.unwrap_or(1.0) as f32,
             encoder_invert_mask: tuning.encoder_invert_mask.unwrap_or(0),
+            // --- Buttons per-module tuning ---
+            debounce_ms: tuning.button_debounce_ms.unwrap_or(10.0) as f32,
+            long_press_ms: tuning.button_long_press_ms.unwrap_or(800.0) as f32,
+            double_press_ms: tuning.button_double_press_ms.unwrap_or(300.0) as f32,
         }
     }
 
@@ -11055,6 +11206,54 @@ mod tests {
         assert_eq!(state.take_learned_button(), None);
     }
 
+    #[test]
+    fn button_tuning_round_trips_and_old_profiles_get_defaults() {
+        // BU1+BU2+BU3: no stored buttons entry yet — the defaults
+        // apply (10 ms debounce, 800 ms long-press threshold, 300 ms
+        // double-press window), exactly like an old profile without
+        // the fields.
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        let neutral = state.get_tuning("buttons");
+        assert_eq!(neutral.button_debounce_ms, Some(10.0));
+        assert_eq!(neutral.button_long_press_ms, Some(800.0));
+        assert_eq!(neutral.button_double_press_ms, Some(300.0));
+        // Invalid values are rejected, never stored.
+        let mut bad = neutral.clone();
+        bad.button_debounce_ms = Some(60.0);
+        assert!(state.set_tuning(&bad).is_err());
+        let mut bad = neutral.clone();
+        bad.button_long_press_ms = Some(200.0);
+        assert!(state.set_tuning(&bad).is_err());
+        let mut bad = neutral.clone();
+        bad.button_double_press_ms = Some(100.0);
+        assert!(state.set_tuning(&bad).is_err());
+        assert_eq!(state.get_tuning("buttons").button_debounce_ms, Some(10.0));
+        // Valid values store, survive a get, and reach the live
+        // pipeline plan.
+        let mut tuning = neutral.clone();
+        tuning.button_debounce_ms = Some(25.0);
+        tuning.button_long_press_ms = Some(1200.0);
+        tuning.button_double_press_ms = Some(200.0);
+        let saved = state.set_tuning(&tuning).expect("valid button tuning");
+        assert_eq!(saved.button_debounce_ms, Some(25.0));
+        assert_eq!(saved.button_long_press_ms, Some(1200.0));
+        assert_eq!(saved.button_double_press_ms, Some(200.0));
+        assert_eq!(state.get_tuning("buttons").button_debounce_ms, Some(25.0));
+        assert_eq!(
+            state.get_tuning("buttons").button_long_press_ms,
+            Some(1200.0)
+        );
+        assert_eq!(
+            state.get_tuning("buttons").button_double_press_ms,
+            Some(200.0)
+        );
+        let plan = state.build_pipeline_plan();
+        assert_eq!(plan.buttons.debounce_ms, 25.0);
+        assert_eq!(plan.buttons.long_press_ms, 1200.0);
+        assert_eq!(plan.buttons.double_press_ms, 200.0);
+    }
+
     // -- Button→action bindings (v2.0.2, Round 2B) --------------------
 
     /// Drive one engine tick through the sink path (ingest +
@@ -11109,6 +11308,121 @@ mod tests {
         assert_eq!(received.buttons, 0);
         assert_eq!(received.gear, 0);
         assert_eq!(received.handbrake, 0.0);
+    }
+
+    /// Long-press bindings (BU2): a held button fires its normal
+    /// action first, and the long-press action takes over once the
+    /// engine's `long_press_buttons` bit is set. A button with only
+    /// a long-press binding passes its raw bit through until the
+    /// threshold. A long-press app action queues exactly once, on
+    /// the threshold edge — not once per tick while held.
+    #[test]
+    fn bindings_long_press_takes_over_after_threshold() {
+        let (state, sent, _fail) = test_state_with_recording();
+        assert!(state.set_output_enabled(true).connected);
+        state.set_binding(5, "gear_1").expect("bind 5");
+        state
+            .set_long_press_binding(5, "gear_2")
+            .expect("bind 5 long-press");
+        // Held, before the threshold: the normal action fires.
+        let mut output = PipelineOutputState::neutral();
+        output.buttons = 1 << 4;
+        let received = drive_tick(&state, &sent, &output);
+        assert_eq!(received.gear, 1);
+        assert_eq!(received.buttons, 0, "source bit cleared by the binding");
+        // Held, past the threshold (engine's long-press bit set):
+        // the long-press action takes over.
+        output.long_press_buttons = 1 << 4;
+        let received = drive_tick(&state, &sent, &output);
+        assert_eq!(received.gear, 2);
+        // Released: everything clears.
+        let received = drive_tick(&state, &sent, &PipelineOutputState::neutral());
+        assert_eq!(received.gear, 0);
+        // Long-press-only button: raw bit passes through until the
+        // threshold, then the long-press action takes over.
+        state
+            .set_long_press_binding(6, "horn")
+            .expect("bind 6 long-press");
+        let mut output = PipelineOutputState::neutral();
+        output.buttons = 1 << 5;
+        let received = drive_tick(&state, &sent, &output);
+        assert_eq!(received.buttons, 1 << 5, "raw bit passes through");
+        assert!(!received.horn);
+        output.long_press_buttons = 1 << 5;
+        let received = drive_tick(&state, &sent, &output);
+        assert_eq!(received.buttons, 1 << 2, "horn bit only");
+        assert!(received.horn);
+        // Long-press app action: queues once on the threshold edge,
+        // not once per tick while held.
+        let (state, _dir) = test_state();
+        state.set_binding(8, "gear_1").expect("bind 8");
+        state
+            .set_long_press_binding(8, "profile_next")
+            .expect("bind 8 long-press");
+        let mut output = PipelineOutputState::neutral();
+        output.buttons = 1 << 7;
+        state.ingest_engine_output(&output, &EngineMetrics::new());
+        assert_eq!(state.drain_binding_actions().len(), 0);
+        output.long_press_buttons = 1 << 7;
+        state.ingest_engine_output(&output, &EngineMetrics::new());
+        assert_eq!(state.drain_binding_actions().len(), 1);
+        state.ingest_engine_output(&output, &EngineMetrics::new());
+        assert_eq!(
+            state.drain_binding_actions().len(),
+            0,
+            "held past the threshold must not re-queue"
+        );
+        state.ingest_engine_output(&PipelineOutputState::neutral(), &EngineMetrics::new());
+        assert_eq!(state.drain_binding_actions().len(), 0);
+    }
+
+    /// Double-press bindings (BU3): a second press inside the
+    /// window switches the button to its 2nd (long-press) action
+    /// for the whole hold — the same action BU2 uses. A double-press
+    /// app action queues exactly once, on the second press edge.
+    #[test]
+    fn bindings_double_press_takes_over_while_held() {
+        let (state, sent, _fail) = test_state_with_recording();
+        assert!(state.set_output_enabled(true).connected);
+        state.set_binding(5, "gear_1").expect("bind 5");
+        state
+            .set_long_press_binding(5, "gear_2")
+            .expect("bind 5 long-press");
+        // First press: the normal action fires.
+        let mut output = PipelineOutputState::neutral();
+        output.buttons = 1 << 4;
+        let received = drive_tick(&state, &sent, &output);
+        assert_eq!(received.gear, 1);
+        // Second press inside the window (engine's double-press
+        // bit set): the 2nd action takes over while held.
+        output.double_press_buttons = 1 << 4;
+        let received = drive_tick(&state, &sent, &output);
+        assert_eq!(received.gear, 2);
+        // Released: everything clears.
+        let received = drive_tick(&state, &sent, &PipelineOutputState::neutral());
+        assert_eq!(received.gear, 0);
+        // Double-press app action: queues once on the second-press
+        // edge, not once per tick while held.
+        let (state, _dir) = test_state();
+        state.set_binding(8, "gear_1").expect("bind 8");
+        state
+            .set_long_press_binding(8, "profile_next")
+            .expect("bind 8 long-press");
+        let mut output = PipelineOutputState::neutral();
+        output.buttons = 1 << 7;
+        state.ingest_engine_output(&output, &EngineMetrics::new());
+        assert_eq!(state.drain_binding_actions().len(), 0);
+        output.double_press_buttons = 1 << 7;
+        state.ingest_engine_output(&output, &EngineMetrics::new());
+        assert_eq!(state.drain_binding_actions().len(), 1);
+        state.ingest_engine_output(&output, &EngineMetrics::new());
+        assert_eq!(
+            state.drain_binding_actions().len(),
+            0,
+            "held as a double-press must not re-queue"
+        );
+        state.ingest_engine_output(&PipelineOutputState::neutral(), &EngineMetrics::new());
+        assert_eq!(state.drain_binding_actions().len(), 0);
     }
 
     /// An encoder virtual button (65–72) bound to a game action

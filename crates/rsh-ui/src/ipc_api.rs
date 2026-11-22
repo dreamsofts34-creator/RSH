@@ -2056,6 +2056,82 @@ impl AppApi for IpcApi {
         }
     }
 
+    /// Long-press bindings (BU2): a direct call, not the slow-poll
+    /// cache — the UI reads them on (re)connect and after a save,
+    /// like the knob actions. A failed read means an empty list
+    /// (the display defaults stand), matching `list_bindings` with
+    /// no cache yet.
+    fn list_long_press_bindings(&self) -> Vec<ButtonBinding> {
+        let got: Result<Vec<ButtonBinding>, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async("list_long_press_bindings", serde_json::json!({}))
+                .await?;
+            value
+                .get("bindings")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| IpcError::Protocol(e.to_string()))?
+                .ok_or_else(|| {
+                    IpcError::Protocol("list_long_press_bindings has no bindings".to_string())
+                })
+        });
+        got.unwrap_or_default()
+    }
+
+    fn set_long_press_binding(&self, button: u8, action: &str) -> Result<ButtonBinding, UserError> {
+        let got: Result<ButtonBinding, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async(
+                    "set_long_press_binding",
+                    serde_json::json!({"button": button, "action": action}),
+                )
+                .await?;
+            value
+                .get("binding")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| IpcError::Protocol(e.to_string()))?
+                .ok_or_else(|| {
+                    IpcError::Protocol("set_long_press_binding has no binding".to_string())
+                })
+        });
+        match got {
+            Ok(binding) => {
+                self.request_slow_refresh();
+                Ok(binding)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
+    }
+
+    fn clear_long_press_binding(&self, button: u8) -> Result<bool, UserError> {
+        let got: Result<bool, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async(
+                    "clear_long_press_binding",
+                    serde_json::json!({"button": button}),
+                )
+                .await?;
+            value
+                .get("cleared")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    IpcError::Protocol("clear_long_press_binding has no cleared".to_string())
+                })
+        });
+        match got {
+            Ok(cleared) => {
+                if cleared {
+                    self.request_slow_refresh();
+                }
+                Ok(cleared)
+            }
+            Err(e) => Err(Self::api_error(&e)),
+        }
+    }
+
     /// Cached firmware check (F5): the slow poller refreshes it
     /// ~1 Hz, so this never touches the socket. No cache yet is an
     /// error — the Settings firmware line falls back to the live
