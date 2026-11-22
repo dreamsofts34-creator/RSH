@@ -469,7 +469,13 @@ pub fn gate_backend_switch() -> (bool, String) {
     let factories = mock_factories();
     let mut current = MockBackend::new("NullSink").0.boxed();
 
-    let outcome = switch_backend(&mut current, BackendKind::HidMaestro, &factories, None);
+    let outcome = switch_backend(
+        &mut current,
+        BackendKind::HidMaestro,
+        &factories,
+        None,
+        true,
+    );
     let ok = outcome
         .is_ok_and(|o| o.active == BackendKind::HidMaestro && o.switched && !o.fell_back)
         && current.name() == "HIDMaestro"
@@ -480,7 +486,7 @@ pub fn gate_backend_switch() -> (bool, String) {
         "HIDMaestro active + connected after switch from NullSink",
     );
 
-    let outcome = switch_backend(&mut current, BackendKind::VJoy, &factories, None);
+    let outcome = switch_backend(&mut current, BackendKind::VJoy, &factories, None, true);
     let ok = outcome.is_ok_and(|o| o.active == BackendKind::VJoy && o.switched)
         && current.name() == "vJoy"
         && current.is_connected();
@@ -490,13 +496,19 @@ pub fn gate_backend_switch() -> (bool, String) {
         "vJoy active + connected; HID instance released (slot holds vJoy only)",
     );
 
-    let outcome = switch_backend(&mut current, BackendKind::HidMaestro, &factories, None);
+    let outcome = switch_backend(
+        &mut current,
+        BackendKind::HidMaestro,
+        &factories,
+        None,
+        true,
+    );
     let ok = outcome.is_ok_and(|o| o.active == BackendKind::HidMaestro && o.switched)
         && current.name() == "HIDMaestro"
         && current.is_connected();
     report.check("vjoy->hid", ok, "back to HIDMaestro, connected");
 
-    let outcome = switch_backend(&mut current, BackendKind::None, &factories, None);
+    let outcome = switch_backend(&mut current, BackendKind::None, &factories, None, true);
     let ok = outcome.is_ok_and(|o| o.active == BackendKind::None && o.switched)
         && current.name() == "NullSink"
         && !current.is_connected();
@@ -522,6 +534,7 @@ pub fn gate_backend_switch() -> (bool, String) {
         BackendKind::HidMaestro,
         &fallback_factories,
         None,
+        true,
     );
     let ok = outcome
         .is_ok_and(|o| o.active == BackendKind::VJoy && o.fell_back && o.fallback_reason.is_some())
@@ -548,6 +561,7 @@ pub fn gate_backend_switch() -> (bool, String) {
         BackendKind::VJoy,
         &no_fallback_factories,
         None,
+        true,
     );
     let ok = outcome.is_err() && current.name() == "NullSink" && !current.is_connected();
     report.check(

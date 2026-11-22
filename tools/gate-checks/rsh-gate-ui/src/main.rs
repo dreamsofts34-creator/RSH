@@ -2021,9 +2021,6 @@ fn ui_steering_advanced() -> Outcome {
     report.finish()
 }
 
-/// One UI gate check: (id, description, runner).
-type UiCheck = (&'static str, &'static str, fn() -> Outcome);
-
 fn checks() -> Vec<UiCheck> {
     vec![
         (
