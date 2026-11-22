@@ -15,9 +15,17 @@ export component GateSteeringWindow inherits Window {
     in-out property <string> lock-text: "900°";
     in-out property <float> smoothing: 0.3;
     in-out property <string> smoothing-text: "30%";
+    in-out property <float> balance: 0.5;
+    in-out property <string> balance-text: "0%";
+    in-out property <float> trim: 0.5;
+    in-out property <string> trim-text: "0%";
     callback invert-changed(bool);
     callback lock-changed(float);
     callback smoothing-changed(float);
+    callback balance-changed(float);
+    callback trim-changed(float);
+    callback capture-full-left();
+    callback capture-full-right();
     SteeringPage {
         width: 100%;
         height: 100%;
@@ -27,8 +35,16 @@ export component GateSteeringWindow inherits Window {
         lock-text: root.lock-text;
         smoothing: root.smoothing;
         smoothing-text: root.smoothing-text;
+        balance: root.balance;
+        balance-text: root.balance-text;
+        trim: root.trim;
+        trim-text: root.trim-text;
         invert-changed(b) => { root.invert-changed(b); }
         lock-changed(v) => { root.lock-changed(v); }
         smoothing-changed(v) => { root.smoothing-changed(v); }
+        balance-changed(v) => { root.balance-changed(v); }
+        trim-changed(v) => { root.trim-changed(v); }
+        capture-full-left => { root.capture-full-left(); }
+        capture-full-right => { root.capture-full-right(); }
     }
 }

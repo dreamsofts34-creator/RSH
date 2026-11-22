@@ -1970,6 +1970,14 @@ impl AppApi for IpcApi {
         self.capture_mv("capture_pedal_max", serde_json::json!({"pedal": pedal}))
     }
 
+    fn capture_steering_left(&self) -> Result<u16, UserError> {
+        self.capture_mv("capture_steering_left", serde_json::json!({}))
+    }
+
+    fn capture_steering_right(&self) -> Result<u16, UserError> {
+        self.capture_mv("capture_steering_right", serde_json::json!({}))
+    }
+
     // v2.0.2 Round 3: firmware check/update, board
     // address, module toggles, auto-pause, tray, backup, profile
     // rename/link, knob actions, bindings. Failures surface the

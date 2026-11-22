@@ -86,7 +86,19 @@ pub struct ModuleTuning {
     /// Invert the normalised value after mapping.
     pub invert: bool,
     /// Steering scale, `0.2..=1.0` (D7 divide). Default `1.0`.
+    /// Kept so stored profiles keep their shape and the plan still
+    /// mirrors the lock scale here — but steering no longer READS
+    /// it: the steering chain divides by `scale_left` /
+    /// `scale_right` instead (S2, per-module tuning).
     pub scale: f32,
+    // --- Steering per-module tuning ---
+    /// Steering left scale, `0.2..=1.0` (D7 divide). Default `1.0`.
+    /// Only the steering module reads it (S2: the balance splits
+    /// `scale` per side); every other module keeps it `1.0`.
+    pub scale_left: f32,
+    /// Steering right scale, `0.2..=1.0` (D7 divide). Default `1.0`.
+    /// Only the steering module reads it (S2).
+    pub scale_right: f32,
     /// Pedal press ramp in milliseconds (0 = no ramp, instant).
     /// Default `150`.
     pub press_ms: f32,
@@ -114,6 +126,9 @@ impl Default for ModuleTuning {
             center_mv: DEFAULT_CENTER_MV,
             invert: false,
             scale: 1.0,
+            // --- Steering per-module tuning ---
+            scale_left: 1.0,
+            scale_right: 1.0,
             press_ms: 150.0,
             release_ms: 100.0,
             gate_mode: ShifterGateMode::Sequential,
@@ -135,6 +150,9 @@ impl ModuleTuning {
         out.curve_strength = clamp_finite(self.curve_strength, -1.0, 1.0, 0.0);
         out.smoothing = clamp_finite(self.smoothing, 0.0, 1.0, 0.3);
         out.scale = clamp_finite(self.scale, 0.2, 1.0, 1.0);
+        // --- Steering per-module tuning ---
+        out.scale_left = clamp_finite(self.scale_left, 0.2, 1.0, 1.0);
+        out.scale_right = clamp_finite(self.scale_right, 0.2, 1.0, 1.0);
         out.press_ms = if self.press_ms <= 0.0 {
             0.0
         } else {
@@ -843,7 +861,19 @@ fn process_steering_axis(
     }
     value = apply_deadzone_bipolar(value, tuning.deadzone);
     value = apply_curve(value, tuning.curve_strength);
-    value = apply_steering_scale(value, tuning.scale);
+    // --- Steering per-module tuning (S2) ---
+    // The balance lives in the side scales: negative output (left)
+    // divides by `scale_left`, positive (right) by `scale_right`.
+    // The sign is read AFTER the invert, so "left" always means
+    // left in-game, whatever the pot wiring. At balance 0 both
+    // sides equal `scale`, so the old single-scale behaviour is
+    // exactly preserved.
+    let side_scale = if value < 0.0 {
+        tuning.scale_left
+    } else {
+        tuning.scale_right
+    };
+    value = apply_steering_scale(value, side_scale);
     apply_smoothing(filter, value, tuning.smoothing)
 }
 
@@ -1040,7 +1070,10 @@ mod tests {
         assert!(approx(apply_steering_scale(0.9, 0.4), 1.0));
 
         let mut plan = plain_plan();
-        plan.steering.scale = 0.4;
+        // S2: the single `scale` is replaced for steering — the
+        // divide now reads the side scales (both 0.4 here).
+        plan.steering.scale_left = 0.4;
+        plan.steering.scale_right = 0.4;
         let mut pipe = ProcessingPipeline::new(plan);
         // mv 2400 -> normalised 0.4 -> / 0.4 = 1.0.
         let out = pipe.process(&frame(&[(0, 2400)], &[], 0));
@@ -1062,14 +1095,55 @@ mod tests {
 
         // Lock mapping through the pipeline: normalised 0.4
         // (mv 2400) at full lock stays 0.4, at 450° doubles to 0.8,
-        // at 270° clamps at full lock.
+        // at 270° clamps at full lock. (S2: the lock scale lands on
+        // both side scales now — the single `scale` is no longer
+        // read by the steering chain.)
         for (scale, expected) in [(1.0, 0.4), (0.5, 0.8), (0.3, 1.0)] {
             let mut plan = plain_plan();
-            plan.steering.scale = scale;
+            plan.steering.scale_left = scale;
+            plan.steering.scale_right = scale;
             let mut pipe = ProcessingPipeline::new(plan);
             let out = pipe.process(&frame(&[(0, 2400)], &[], 0));
             assert!(approx(out.steering, expected), "scale {scale}");
         }
+    }
+
+    #[test]
+    fn steering_balance_splits_scale_per_side() {
+        // S2: balance +20% favours left — left scale 0.8, right
+        // scale 1.0 at full lock (base 1.0). A left sample
+        // (mv 1050 -> -0.5) divides by 0.8 -> -0.625; the mirror
+        // right sample (mv 2550 -> +0.5) divides by 1.0 -> +0.5.
+        // At balance 0 both sides are the base scale again.
+        let mut plan = plain_plan();
+        plan.steering.scale_left = 0.8;
+        plan.steering.scale_right = 1.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[(0, 1050)], &[], 0));
+        assert!(approx(out.steering, -0.625));
+        let out = pipe.process(&frame(&[(0, 2550)], &[], 0));
+        assert!(approx(out.steering, 0.5));
+        // Invert keeps the meaning in-game: with invert on, the
+        // physical-left sample (mv 1050) flips to +0.5 and now
+        // divides by the RIGHT scale (1.0) — the balance follows
+        // the output direction, not the pot wiring.
+        let mut plan = plain_plan();
+        plan.steering.invert = true;
+        plan.steering.scale_left = 0.8;
+        plan.steering.scale_right = 1.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[(0, 1050)], &[], 0));
+        assert!(approx(out.steering, 0.5));
+        // Side scales sanitize like `scale`: out-of-range clamps,
+        // NaN falls back to 1.0.
+        let tuning = super::ModuleTuning {
+            scale_left: 0.1,
+            scale_right: f32::NAN,
+            ..super::ModuleTuning::default()
+        };
+        let clean = tuning.sanitized();
+        assert_eq!(clean.scale_left, 0.2);
+        assert_eq!(clean.scale_right, 1.0);
     }
 
     #[test]

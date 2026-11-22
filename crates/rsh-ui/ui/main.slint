@@ -146,6 +146,12 @@ export component MainWindow inherits Window {
     in property <string> steer-lock-text: "900°";
     in property <float> steer-smoothing: 0.3;
     in property <string> steer-smoothing-text: "30%";
+    // Steering per-module tuning (S2+S3): balance −20..+20%
+    // (0.5 = even) and centre trim −5..+5% (0.5 = none).
+    in property <float> steer-balance: 0.5;
+    in property <string> steer-balance-text: "0%";
+    in property <float> steer-trim: 0.5;
+    in property <string> steer-trim-text: "0%";
     in property <string> throttle-raw-mv-text: "—";
     in property <string> brake-raw-mv-text: "—";
     in property <string> clutch-raw-mv-text: "—";
@@ -346,9 +352,15 @@ export component MainWindow inherits Window {
     callback lock-edited(string);
     callback smoothing-changed(float);
     callback smoothing-edited(string);
+    callback balance-changed(float);
+    callback balance-edited(string);
+    callback trim-changed(float);
+    callback trim-edited(string);
     callback preset-selected(int);
     callback reset-defaults();
     callback set-centre();
+    callback capture-full-left();
+    callback capture-full-right();
     callback save-profile();
     callback profile-clicked();
     callback launch-game(string);
@@ -652,6 +664,10 @@ export component MainWindow inherits Window {
                 lock-text: steer-lock-text;
                 smoothing: steer-smoothing;
                 smoothing-text: steer-smoothing-text;
+                balance: steer-balance;
+                balance-text: steer-balance-text;
+                trim: steer-trim;
+                trim-text: steer-trim-text;
                 input-pct: input-pct;
                 output-pct: output-pct;
                 marker-vx: marker-vx;
@@ -677,9 +693,15 @@ export component MainWindow inherits Window {
                 lock-edited(t) => { lock-edited(t); }
                 smoothing-changed(v) => { smoothing-changed(v); }
                 smoothing-edited(t) => { smoothing-edited(t); }
+                balance-changed(v) => { balance-changed(v); }
+                balance-edited(t) => { balance-edited(t); }
+                trim-changed(v) => { trim-changed(v); }
+                trim-edited(t) => { trim-edited(t); }
                 preset-selected(i) => { preset-selected(i); }
                 reset-defaults => { reset-defaults(); }
                 set-centre => { set-centre(); }
+                capture-full-left => { capture-full-left(); }
+                capture-full-right => { capture-full-right(); }
             }
             if page == 2 : PedalsPage {
                 busy-kind: busy-kind;
