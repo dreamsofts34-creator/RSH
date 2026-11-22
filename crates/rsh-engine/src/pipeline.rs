@@ -660,6 +660,15 @@ impl RampLimiter {
 /// The per-module processing pipeline. Owns the plan plus the
 /// per-axis filter, ramp, and encoder state. Allocation-free in the
 /// hot path: [`process`](Self::process) uses fixed-size arrays only.
+//
+// The struct holds exactly 4 bools: two (state, prev-state)
+// edge-detection pairs (`handbrake_latched` / `handbrake_prev_pressed`
+// and `horn_latch_on` / `horn_prev_pressed`) — private internal runtime
+// state, not config. All are built in the single construction site
+// [`ProcessingPipeline::new`] (all false), so the lint's confusion
+// concern does not apply; grouping them would only churn the 200 Hz
+// hot path.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ProcessingPipeline {
     /// Active per-module plan.
     plan: PipelinePlan,
