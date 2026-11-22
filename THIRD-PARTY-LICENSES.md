@@ -130,6 +130,14 @@ The sidecar has **no NuGet packages** (only the DLL reference above), so its SBO
 hand-written; verify the pins at release time against the sidecar
 staging script (`tools/ci/stage-sidecar.ps1`).
 
+The HIDMaestro MIT notice ships in the installer as `HIDMaestro-LICENSE.txt`
+beside `rsh-hm-sidecar.exe` (GitHub issue #2): the file is the LICENSE from
+the pinned v2.1.0 release ZIP, committed verbatim at
+`tools/rsh-hm-sidecar/HIDMaestro-LICENSE.txt` (SHA-256
+`fba8db4fff568ac6a91e4c3100d1be32d83dae713d924eecb291182ffc11d885`).
+On a HIDMaestro version bump, re-fetch the LICENSE from the new pinned ZIP
+and replace the committed file together with the pins above.
+
 ## 4. Not bundled / not distributed by RSH (excluded from the SBOMs)
 
 | Item | Why excluded |

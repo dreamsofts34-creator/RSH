@@ -743,6 +743,14 @@ jobs:
             ; Sidecar MUST sit beside rsh-daemon.exe: the daemon resolves it
             ; as <own exe dir>\rsh-hm-sidecar.exe (resolve_sidecar_path).
             File "/oname=rsh-hm-sidecar.exe" "..\src-tauri\binaries\rsh-hm-sidecar-x86_64-pc-windows-msvc.exe"
+            ; HIDMaestro LICENSE (GitHub issue #2): the sidecar is a
+            ; NativeAOT build with HIDMaestro compiled in, and the MIT
+            ; license requires its notice to ship with the software.
+            ; This file is the LICENSE from the pinned HIDMaestro v2.1.0
+            ; release ZIP, committed verbatim (see
+            ; THIRD-PARTY-LICENSES.md §3); it installs beside the
+            ; sidecar so the notice is always with the binary.
+            File "..\tools\rsh-hm-sidecar\HIDMaestro-LICENSE.txt"
             ; Signed OTA image, bundled so the app can flash the board
             ; with no download and no manual step: the daemon resolves
             ; it as <own exe dir>\firmware-signed.bin (same pattern as
@@ -882,6 +890,7 @@ jobs:
             Delete "$INSTDIR\rsh-daemon.exe"
             Delete "$INSTDIR\rsh-ui.exe"
             Delete "$INSTDIR\rsh-hm-sidecar.exe"
+            Delete "$INSTDIR\HIDMaestro-LICENSE.txt"
             Delete "$INSTDIR\firmware-signed.bin"
             Delete "$INSTDIR\rsh-task.ps1"
             Delete "$INSTDIR\uninstall.exe"
@@ -993,10 +1002,10 @@ jobs:
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
           # NSIS silent install (/S); /D must be last, unquoted.
           Start-WaitOrFail $installer @("/S", "/D=$installDir") 180 "first silent install"
-          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "rsh-hm-sidecar.exe", "firmware-signed.bin")) {
+          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "rsh-hm-sidecar.exe", "firmware-signed.bin", "HIDMaestro-LICENSE.txt")) {
             if (-not (Test-Path (Join-Path $installDir $exe))) { Write-Error "Smoke test: installed $exe not found in $installDir after silent install."; exit 1 }
           }
-          Write-Host "Installed to $installDir — all three binaries + bundled firmware image present."
+          Write-Host "Installed to $installDir — all three binaries + bundled firmware image + HIDMaestro LICENSE present."
           $rule = netsh advfirewall firewall show rule name="RSH" | Out-String
           if ($rule -notmatch "RSH") { Write-Error "Smoke test: firewall rule 'RSH' not found after install (netsh show rule)."; exit 1 }
           Write-Host "Firewall rule 'RSH' present after install."
