@@ -113,9 +113,13 @@ strip = true
 # true` yields no PDBs and the release PDB step fails closed. The
 # release job therefore sets CARGO_PROFILE_RELEASE_STRIP=false (see
 # release.yml) — strip stays on for CI/local builds, where the Linux
-# binary sizes + perf-gate limits are measured with it. If `debug`
-# is ever turned off, the release.yml PDB step fails closed — do not
-# silence it.
+# binary sizes + perf-gate limits are measured with it. NOTE 2
+# (v2.0.7 release run 44967991529, strip already off, still failed):
+# rustc names the PDB after the CRATE name — `rsh_daemon.pdb`, NOT
+# `rsh-daemon.pdb` (proven by the CodeView record in the shipped
+# v2.0.6 exe); release.yml searches for the underscore names. If
+# `debug` is ever turned off, the release.yml PDB step fails closed —
+# do not silence it.
 debug = true
 lto = "fat"
 codegen-units = 1
