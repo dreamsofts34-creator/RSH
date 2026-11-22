@@ -23,9 +23,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sy
 slint-build = "=1.18.1"
 
 # Windows-only: single-instance named mutex + foreground/restore
-# (M-5/A1). The `windows` crate does not compile on Linux.
+# (M-5/A1) + the native game-file picker (PC-test Bug 6, WS-C:
+# `IFileOpenDialog` via `Win32_UI_Shell` / `Win32_System_Com`).
+# The `windows` crate does not compile on Linux.
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_System_Com"] }
 
 [lints]
 workspace = true

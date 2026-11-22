@@ -2,14 +2,17 @@
 // Content only — the shell positions this card; the shell's dim
 // backdrop closes it on outside click, and Cancel / Save / Esc
 // close it too (Phase 2, F-2); it does NOT own the Window. Reuses the
-// profile popover's patterns: Rust-owned props, TextInput boxes
-// with two-way bindings, Save disabled while a field is empty,
-// Enter in a field saves when both fields are filled.
-// No file picker: rfd cannot resolve offline (see wire_game_dialog
-// in src/main.rs), so the exe path is typed or pasted in. The
-// profile is a cycling button (the profile-link control's pattern)
-// because no dropdown component exists — each click moves to the
-// next profile, then back to "No profile".
+// profile popover's patterns: Rust-owned props, TextInput box
+// with two-way binding for the name, Save disabled while a field
+// is empty, Enter in the name field saves when both fields are
+// filled.
+// The exe path is NOT typed: Browse opens the native Windows file
+// picker (Rust `game-dialog-browse`, PC-test Bug 6) and the picked
+// path shows read-only here, elided when long; the name auto-fills
+// from the file stem when still empty. The profile is a cycling
+// button (the profile-link control's pattern) because no dropdown
+// component exists — each click moves to the next profile, then
+// back to "No profile".
 
 import { Theme } from "../tokens.slint";
 import { Card, Btn } from "../components.slint";
@@ -21,6 +24,7 @@ export component GameDialog inherits Card {
     in property <string> profile-name: "No profile";
     callback save(string, string);
     callback cancel();
+    callback browse();
     callback cycle-profile();
     width: 360px;
     // B5 (PC-test Bug 5): an explicit content height — a height-less
@@ -59,26 +63,29 @@ export component GameDialog inherits Card {
                 accepted => { if (name != "" && exe != "") { save(name, exe); } }
             }
         }
-        Text { text: "Game exe or shortcut (.exe or .lnk)"; font-size: 11.5px; color: Theme.mute; }
-        Rectangle {
-            horizontal-stretch: 1;
-            height: 28px;
-            border-radius: 7px;
-            border-width: 1px;
-            border-color: Theme.line;
-            background: Theme.bg;
-            TextInput {
-                x: 10px;
-                width: parent.width - 20px;
-                height: 100%;
-                vertical-alignment: center;
-                text <=> exe;
-                font-size: 12px;
-                font-weight: 500;
-                color: Theme.text;
-                selection-background-color: Theme.accent;
-                accepted => { if (name != "" && exe != "") { save(name, exe); } }
+        Text { text: "Game file (.exe or shortcut)"; font-size: 11.5px; color: Theme.mute; }
+        HorizontalLayout {
+            spacing: 8px;
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 28px;
+                border-radius: 7px;
+                border-width: 1px;
+                border-color: Theme.line;
+                background: Theme.bg;
+                Text {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    height: 100%;
+                    vertical-alignment: center;
+                    text: exe == "" ? "No file chosen" : exe;
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: exe == "" ? Theme.faint : Theme.text;
+                    overflow: elide;
+                }
             }
+            Btn { label: "Browse…"; clicked => { browse(); } }
         }
         HorizontalLayout {
             spacing: 8px;

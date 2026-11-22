@@ -446,6 +446,7 @@ export component MainWindow inherits Window {
     callback remove-game(string);
     callback game-dialog-save(string, string);
     callback game-dialog-cancel();
+    callback game-dialog-browse();
     callback game-dialog-cycle-profile();
 
     // FIX-4: root keyboard scope - ancestor of every control, so keys a
@@ -948,6 +949,7 @@ export component MainWindow inherits Window {
         profile-name: game-dialog-profile-name;
         save(n, e) => { game-dialog-save(n, e); }
         cancel => { game-dialog-cancel(); }
+        browse => { game-dialog-browse(); }
         cycle-profile => { game-dialog-cycle-profile(); }
     }
     // D17: small confirm dialog for destructive actions (delete
