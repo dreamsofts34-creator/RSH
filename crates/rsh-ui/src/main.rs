@@ -3356,8 +3356,11 @@ impl Ctx {
                 // "Game controller is now vJoy". A mismatch is a
                 // failure now: error toast, radio back on the live
                 // backend, no success toast.
+                // Both failure paths (mismatch and Err) funnel
+                // through the single failure notification below, so
+                // a failed switch shows exactly one message.
                 let requested = if index == 1 { "vJoy" } else { "HIDMaestro" };
-                match result {
+                let failure: Option<UserError> = match result {
                     Ok(active) if active == requested => {
                         self.sync_overview(win);
                         // The wizard's Drivers step mirrors the same
@@ -3374,36 +3377,29 @@ impl Ctx {
                             "Controller switched",
                             &format!("Game controller is now {active}."),
                         );
+                        None
                     }
-                    Ok(active) => {
-                        self.resync_controller_from_live(win, 1 - index);
-                        self.notify_error(
-                            win,
-                            "Game controller",
-                            &UserError {
-                                code: "Unknown".to_string(),
-                                title: "Controller switch did not take effect".to_string(),
-                                what_happened: format!(
-                                    "{requested} is not active — {active} is still the game controller."
-                                ),
-                                what_to_do: format!(
-                                    "Try the switch again, or keep using {active}."
-                                ),
-                                detail: None,
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        // A10: revert the switch the binding already
-                        // flipped, and show the typed reason (a UAC
-                        // decline says admin is needed, not "Unknown").
-                        // The radio re-syncs from the live backend
-                        // (cached, never the socket) — the flipped
-                        // segment is only a guess when the live
-                        // backend moved mid-switch.
-                        self.resync_controller_from_live(win, 1 - index);
-                        self.notify_error(win, "Game controller", &e);
-                    }
+                    Ok(active) => Some(UserError {
+                        code: "Unknown".to_string(),
+                        title: "Controller switch did not take effect".to_string(),
+                        what_happened: format!(
+                            "{requested} is not active — {active} is still the game controller."
+                        ),
+                        what_to_do: format!("Try the switch again, or keep using {active}."),
+                        detail: None,
+                    }),
+                    Err(e) => Some(e),
+                };
+                if let Some(error) = failure {
+                    // A10: revert the switch the binding already
+                    // flipped, and show the typed reason (a UAC
+                    // decline says admin is needed, not "Unknown").
+                    // The radio re-syncs from the live backend
+                    // (cached, never the socket) — the flipped
+                    // segment is only a guess when the live
+                    // backend moved mid-switch.
+                    self.resync_controller_from_live(win, 1 - index);
+                    self.notify_error(win, "Game controller", &error);
                 }
             }
             JobDone::FirmwareCheck(result) => {

@@ -1880,9 +1880,18 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
                 .unwrap_or(rest.len());
             &rest[..end]
         });
+    // WS-A (Bug 4/8) replaced the direct `win.set_controller(1 -
+    // index)` guess-revert with `resync_controller_from_live`,
+    // which reads the LIVE backend and sets the segment from it
+    // (that fn calls `win.set_controller` itself) — accept either
+    // spelling as the toggle revert. The single `notify_error`
+    // call site covers both failure paths (mismatch and Err), so a
+    // failed switch still shows exactly one message.
     report.check(
         "hid-ui-one-message",
-        count(done_arm, "notify_error") == 1 && done_arm.contains("set_controller(1 - index)"),
+        count(done_arm, "notify_error") == 1
+            && (done_arm.contains("set_controller(1 - index)")
+                || done_arm.contains("resync_controller_from_live(win, 1 - index)")),
         "UI shows exactly one typed failure notification on backend-switch failure and reverts the toggle",
     );
     report.finish()
