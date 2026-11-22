@@ -214,6 +214,38 @@ pub fn pedal_marker(pct: f32, deadzone_pct: f32, exponent: f32) -> (f32, f32) {
     (6.0 + pct / 100.0 * 98.0, 104.0 - out / 100.0 * 98.0)
 }
 
+// --- Pedal ramps/curves per-module tuning ---
+/// Press/release ramp slider range in ms for a pedal index
+/// (0 throttle, 1 brake, 2 clutch): throttle 0..500 both ways,
+/// brake press 0..300, clutch release 0..1000. A pedal with no
+/// slider on that side reports 0.
+#[must_use]
+pub fn pedal_ramp_range_ms(index: usize, press: bool) -> f64 {
+    match (index, press) {
+        (0, _) => 500.0,
+        (1, true) => 300.0,
+        (2, false) => 1000.0,
+        _ => 0.0,
+    }
+}
+
+/// A ramp value in ms as a slider fraction (0..1) + text ("120 ms").
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub fn ramp_frac_text(ms: f64, max_ms: f64) -> (f32, String) {
+    ((ms / max_ms).clamp(0.0, 1.0) as f32, format!("{ms:.0} ms"))
+}
+
+/// A curve exponent (0.5..2.0) as a slider fraction (0..1) + text.
+#[allow(clippy::cast_possible_truncation)]
+#[must_use]
+pub fn curve_frac_text(exponent: f64) -> (f32, String) {
+    (
+        ((exponent - 0.5) / 1.5).clamp(0.0, 1.0) as f32,
+        format!("{exponent:.2}"),
+    )
+}
+
 /// Tile code letters from a game name (H6): first letters of up to
 /// three letter-starting words, uppercased — "Assetto Corsa" → "AC",
 /// "Assetto Corsa Competizione" → "ACC" (no more AC/ACC collision),
@@ -779,6 +811,16 @@ enum FieldKind {
     Bite,
     /// LED brightness percent (0..100).
     Brightness,
+    // --- Pedal ramps/curves per-module tuning ---
+    /// Pedal press ramp in ms (throttle 0..500, brake 0..300).
+    PressMs,
+    /// Pedal release ramp in ms (throttle 0..500, clutch 0..1000).
+    ReleaseMs,
+    /// Response curve exponent (0.5..2.0).
+    Curve,
+    /// Throttle saturation as the effective max in mV (the queued
+    /// value is already converted from percent by the handler).
+    Saturation,
 }
 
 /// A slider drag's latest value, waiting out its debounce (M-7):
@@ -2804,6 +2846,11 @@ impl Ctx {
                     FieldKind::Deadzone => record.deadzone = value,
                     FieldKind::Bite => record.bite_point = Some(value),
                     FieldKind::Brightness => record.led_brightness = Some(value.round() as u8),
+                    // --- Pedal ramps/curves per-module tuning ---
+                    FieldKind::PressMs => record.press_ms = Some(value),
+                    FieldKind::ReleaseMs => record.release_ms = Some(value),
+                    FieldKind::Curve => record.curve = value,
+                    FieldKind::Saturation => record.max_mv = value,
                 }
                 JobResult::Tuning(api.set_tuning(&record))
             },
@@ -4883,7 +4930,11 @@ impl Ctx {
     /// copy (shifter / horn / steering) fall back to the slow cache.
     fn local_tuning_record(&self, module: &str) -> TuningSettings {
         match module {
-            "throttle" => self.pedals.borrow().records[0].clone(),
+            // --- Pedal ramps/curves per-module tuning ---
+            // Both throttle spellings read pedal index 0 (the
+            // daemon canonicalizes to "accelerator", the sim echoes
+            // "throttle").
+            "accelerator" | "throttle" => self.pedals.borrow().records[0].clone(),
             "brake" => self.pedals.borrow().records[1].clone(),
             "clutch" => self.pedals.borrow().records[2].clone(),
             "handbrake" => self.handbrake_record.borrow().clone(),
@@ -4899,19 +4950,71 @@ impl Ctx {
     #[allow(clippy::cast_possible_truncation)]
     fn apply_tuning_record(&self, win: &MainWindow, stored: &TuningSettings) {
         match stored.module.as_str() {
-            "throttle" | "brake" | "clutch" => {
+            // --- Pedal ramps/curves per-module tuning ---
+            // Both throttle spellings: the daemon canonicalizes to
+            // "accelerator", the sim echoes "throttle" — either way
+            // the record belongs to pedal index 0.
+            "accelerator" | "throttle" | "brake" | "clutch" => {
                 let index = match stored.module.as_str() {
-                    "throttle" => 0,
+                    "accelerator" | "throttle" => 0,
                     "brake" => 1,
                     _ => 2,
                 };
+                // R2-10: a drag whose push is still pending owns its
+                // field — a completion for another field must not
+                // snap it back to the pre-drag stored value. The
+                // local record holds the drag value, so the
+                // effective record carries it over the stored one
+                // for exactly that field (one pending field at a
+                // time). Without this, dragging saturation and then
+                // typing a ramp value would snap saturation back.
+                let effective = {
+                    let mut effective = stored.clone();
+                    if let Some((pending, _)) = *self.pending_field.borrow() {
+                        // Both throttle spellings are the same pedal
+                        // (the daemon canonicalizes to "accelerator",
+                        // the sim echoes "throttle").
+                        let same_module = pending.module == stored.module.as_str()
+                            || pending.module == "throttle" && stored.module == "accelerator";
+                        if same_module {
+                            let local = self.local_tuning_record(&stored.module);
+                            match pending.kind {
+                                FieldKind::Deadzone => effective.deadzone = local.deadzone,
+                                FieldKind::Bite => effective.bite_point = local.bite_point,
+                                FieldKind::Brightness => {
+                                    effective.led_brightness = local.led_brightness;
+                                }
+                                // --- Pedal ramps/curves per-module tuning ---
+                                FieldKind::PressMs => effective.press_ms = local.press_ms,
+                                FieldKind::ReleaseMs => {
+                                    effective.release_ms = local.release_ms;
+                                }
+                                FieldKind::Curve => effective.curve = local.curve,
+                                FieldKind::Saturation => effective.max_mv = local.max_mv,
+                            }
+                        }
+                    }
+                    effective
+                };
                 let feel_exp = {
                     let mut pedals = self.pedals.borrow_mut();
-                    pedals.records[index] = stored.clone();
-                    pedals.feel_exp[index] = stored.curve as f32;
+                    pedals.records[index] = effective.clone();
+                    pedals.feel_exp[index] = effective.curve as f32;
                     pedals.feel_exp[index]
                 };
-                Self::sync_pedal_module_props(win, index, stored, feel_exp);
+                Self::sync_pedal_module_props(win, index, &effective, feel_exp);
+                // --- Pedal ramps/curves per-module tuning ---
+                // Throttle only: the saturation slider and the
+                // combined-pedals switch follow the effective
+                // record (a pending saturation drag included).
+                if index == 0 {
+                    self.sync_throttle_saturation_props(win, &effective);
+                    set_if_changed(
+                        win.get_combine_pedals(),
+                        effective.combine_pedals.unwrap_or(false),
+                        |v| win.set_combine_pedals(v),
+                    );
+                }
             }
             "handbrake" => {
                 *self.handbrake_record.borrow_mut() = stored.clone();
@@ -5040,6 +5143,73 @@ impl Ctx {
                 });
             }
         }
+        // --- Pedal ramps/curves per-module tuning ---
+        Self::sync_pedal_ramp_curve_props(win, index, record);
+    }
+
+    /// Write one pedal card's Advanced ramp/curve slider props from
+    /// a record (Workstream C): the own curve slider (continuous —
+    /// not just the Feel chips), tip-in / lift-off ramps (throttle,
+    /// defaults 100/50 ms), initial bite (brake, default 50 ms),
+    /// clutch release (default 300 ms). Split out of
+    /// [`Self::sync_pedal_module_props`] so that function stays
+    /// under the 100-line clippy limit.
+    fn sync_pedal_ramp_curve_props(win: &MainWindow, index: usize, record: &TuningSettings) {
+        let (frac, text) = curve_frac_text(record.curve);
+        match index {
+            0 => {
+                set_if_changed(win.get_throttle_curve_value(), frac, |v| {
+                    win.set_throttle_curve_value(v);
+                });
+                set_if_changed(win.get_throttle_curve_text(), text.into(), |v| {
+                    win.set_throttle_curve_text(v);
+                });
+                let (frac, text) = ramp_frac_text(record.press_ms.unwrap_or(100.0), 500.0);
+                set_if_changed(win.get_throttle_press_ms_value(), frac, |v| {
+                    win.set_throttle_press_ms_value(v);
+                });
+                set_if_changed(win.get_throttle_press_ms_text(), text.into(), |v| {
+                    win.set_throttle_press_ms_text(v);
+                });
+                let (frac, text) = ramp_frac_text(record.release_ms.unwrap_or(50.0), 500.0);
+                set_if_changed(win.get_throttle_release_ms_value(), frac, |v| {
+                    win.set_throttle_release_ms_value(v);
+                });
+                set_if_changed(win.get_throttle_release_ms_text(), text.into(), |v| {
+                    win.set_throttle_release_ms_text(v);
+                });
+            }
+            1 => {
+                set_if_changed(win.get_brake_curve_value(), frac, |v| {
+                    win.set_brake_curve_value(v);
+                });
+                set_if_changed(win.get_brake_curve_text(), text.into(), |v| {
+                    win.set_brake_curve_text(v);
+                });
+                let (frac, text) = ramp_frac_text(record.press_ms.unwrap_or(50.0), 300.0);
+                set_if_changed(win.get_brake_press_ms_value(), frac, |v| {
+                    win.set_brake_press_ms_value(v);
+                });
+                set_if_changed(win.get_brake_press_ms_text(), text.into(), |v| {
+                    win.set_brake_press_ms_text(v);
+                });
+            }
+            _ => {
+                set_if_changed(win.get_clutch_curve_value(), frac, |v| {
+                    win.set_clutch_curve_value(v);
+                });
+                set_if_changed(win.get_clutch_curve_text(), text.into(), |v| {
+                    win.set_clutch_curve_text(v);
+                });
+                let (frac, text) = ramp_frac_text(record.release_ms.unwrap_or(300.0), 1000.0);
+                set_if_changed(win.get_clutch_release_ms_value(), frac, |v| {
+                    win.set_clutch_release_ms_value(v);
+                });
+                set_if_changed(win.get_clutch_release_ms_text(), text.into(), |v| {
+                    win.set_clutch_release_ms_text(v);
+                });
+            }
+        }
     }
 
     /// Echo a pedal deadzone drag locally (R2-10, Steering pattern):
@@ -5065,6 +5235,103 @@ impl Ctx {
             (pedals.records[2].clone(), pedals.feel_exp[2])
         };
         Self::sync_pedal_module_props(win, 2, &record, feel_exp);
+    }
+
+    // --- Pedal ramps/curves per-module tuning ---
+    /// Throttle saturation base: the calibrated fully-pressed mV
+    /// when a capture exists, else full scale (3300 mV). Saturation
+    /// is a percent of the pedal's own travel (cal max − min),
+    /// never of the raw ADC scale — so a pot that only reaches
+    /// 3100 mV still reads 100% at full press.
+    fn throttle_saturation_base_max(&self) -> f64 {
+        self.calibration
+            .borrow()
+            .as_ref()
+            .and_then(|c| c.pedal_max_mv.get("accel").copied())
+            .unwrap_or(3300.0)
+    }
+
+    /// Saturation percent (0..100) for a throttle record, from its
+    /// effective max against the calibrated base.
+    fn throttle_saturation_pct(&self, record: &TuningSettings) -> f64 {
+        let base = self.throttle_saturation_base_max();
+        let span = (base - record.min_mv).max(1.0);
+        ((record.max_mv - record.min_mv) / span * 100.0).clamp(0.0, 100.0)
+    }
+
+    /// Effective max in mV for a saturation percent, clamped so the
+    /// endpoint span stays ≥ 660 mV (the tuning contract) — a high
+    /// released endpoint can otherwise make 70% unrepresentable.
+    fn throttle_saturation_max_mv(&self, record: &TuningSettings, pct: f64) -> f64 {
+        let base = self.throttle_saturation_base_max();
+        let full_span = (base - record.min_mv).max(1.0);
+        let min_pct = 660.0 / full_span * 100.0;
+        let pct = pct.clamp(min_pct, 100.0);
+        record.min_mv + pct / 100.0 * full_span
+    }
+
+    /// Write the throttle saturation slider + text from a record
+    /// (frac is 0..1 over 70..100%).
+    #[allow(clippy::cast_possible_truncation)]
+    fn sync_throttle_saturation_props(&self, win: &MainWindow, record: &TuningSettings) {
+        let pct = self.throttle_saturation_pct(record);
+        set_if_changed(
+            win.get_throttle_saturation_value(),
+            ((pct - 70.0) / 30.0).clamp(0.0, 1.0) as f32,
+            |v| win.set_throttle_saturation_value(v),
+        );
+        set_if_changed(
+            win.get_throttle_saturation_text(),
+            pct_text(pct).into(),
+            |v| win.set_throttle_saturation_text(v),
+        );
+    }
+
+    /// Echo a pedal curve drag locally (R2-10): the slider + text +
+    /// mini-curve move with the mouse; the Feel chip follows the
+    /// curve (soft < 0.95, sharp > 1.05, else linear).
+    #[allow(clippy::cast_possible_truncation)]
+    fn apply_pedal_curve_local(&self, win: &MainWindow, index: usize, exponent: f64) {
+        let (record, feel_exp) = {
+            let mut pedals = self.pedals.borrow_mut();
+            pedals.records[index].curve = exponent;
+            pedals.feel_exp[index] = exponent as f32;
+            (pedals.records[index].clone(), pedals.feel_exp[index])
+        };
+        Self::sync_pedal_module_props(win, index, &record, feel_exp);
+    }
+
+    /// Echo a pedal press-ramp drag locally (R2-10): same pattern.
+    fn apply_pedal_press_ms_local(&self, win: &MainWindow, index: usize, ms: f64) {
+        let (record, feel_exp) = {
+            let mut pedals = self.pedals.borrow_mut();
+            pedals.records[index].press_ms = Some(ms);
+            (pedals.records[index].clone(), pedals.feel_exp[index])
+        };
+        Self::sync_pedal_module_props(win, index, &record, feel_exp);
+    }
+
+    /// Echo a pedal release-ramp drag locally (R2-10): same pattern.
+    fn apply_pedal_release_ms_local(&self, win: &MainWindow, index: usize, ms: f64) {
+        let (record, feel_exp) = {
+            let mut pedals = self.pedals.borrow_mut();
+            pedals.records[index].release_ms = Some(ms);
+            (pedals.records[index].clone(), pedals.feel_exp[index])
+        };
+        Self::sync_pedal_module_props(win, index, &record, feel_exp);
+    }
+
+    /// Echo a throttle saturation drag locally (R2-10): the slider +
+    /// text move with the mouse; the effective max follows in the
+    /// local record (the "Pedal down" mV re-syncs from calibration
+    /// on the next ~1 Hz cycle when a capture exists).
+    fn apply_throttle_saturation_local(&self, win: &MainWindow, max_mv: f64) {
+        let record = {
+            let mut pedals = self.pedals.borrow_mut();
+            pedals.records[0].max_mv = max_mv;
+            pedals.records[0].clone()
+        };
+        self.sync_throttle_saturation_props(win, &record);
     }
 
     /// Write the handbrake card's tuning props from a record
@@ -5267,6 +5534,15 @@ impl Ctx {
             |v| win.set_clutch_down_mv(v),
         );
         Self::sync_pedal_module_props(win, 2, &c, feel_exps[2]);
+        // --- Pedal ramps/curves per-module tuning ---
+        // Throttle saturation (percent of the calibrated travel)
+        // and the combined-pedals switch follow the throttle record.
+        self.sync_throttle_saturation_props(win, &t);
+        set_if_changed(
+            win.get_combine_pedals(),
+            t.combine_pedals.unwrap_or(false),
+            |v| win.set_combine_pedals(v),
+        );
         // Set up/down capture the live endpoints (v2.0.2): enabled
         // while the daemon is live, disabled with a reason otherwise.
         set_if_changed(
@@ -7729,7 +8005,192 @@ fn wire_pedals(win: &MainWindow, ctx: &Rc<Ctx>) {
         });
     }
     wire_pedals_rest(win, ctx);
+    wire_pedals_tuning(win, ctx);
     wire_pedals_set(win, ctx);
+}
+
+/// Wire the per-module tuning callbacks (Workstream C): the
+/// Advanced curve / ramp / saturation sliders and the combined
+/// pedals switch. Sliders echo locally + queue one debounced push
+/// (M-7, like deadzone/bite); typed values push at once; the
+/// toggle pushes at once (no drag to debounce). Ranges: curve
+/// 0.5..2.0, throttle ramps 0..500 ms, brake press 0..300 ms,
+/// clutch release 0..1000 ms, saturation 70..100%.
+// Nine near-identical callback blocks (one per control), like
+// `wire_buttons` above — splitting them would hide the pattern.
+#[allow(clippy::too_many_lines)]
+fn wire_pedals_tuning(win: &MainWindow, ctx: &Rc<Ctx>) {
+    const MODULES: [&str; 3] = ["throttle", "brake", "clutch"];
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_curve_changed(move |p, v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let Ok(idx) = usize::try_from(p) else {
+                return;
+            };
+            let Some(module) = MODULES.get(idx) else {
+                return;
+            };
+            let exponent = (0.5 + f64::from(v) * 1.5).clamp(0.5, 2.0);
+            ctx.apply_pedal_curve_local(&w, idx, exponent);
+            ctx.queue_field_push(module, FieldKind::Curve, exponent);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_curve_edited(move |p, t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let Ok(exponent) = t.trim().parse::<f32>() else {
+                return;
+            };
+            let Ok(idx) = usize::try_from(p) else {
+                return;
+            };
+            let Some(module) = MODULES.get(idx) else {
+                return;
+            };
+            let exponent = f64::from(exponent).clamp(0.5, 2.0);
+            ctx.set_pedal_tuning(&w, module, |t| t.curve = exponent);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_press_ms_changed(move |p, v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let Ok(idx) = usize::try_from(p) else {
+                return;
+            };
+            let Some(module) = MODULES.get(idx) else {
+                return;
+            };
+            let max_ms = pedal_ramp_range_ms(idx, true);
+            if max_ms <= 0.0 {
+                return;
+            }
+            let ms = (f64::from(v) * max_ms).clamp(0.0, max_ms);
+            ctx.apply_pedal_press_ms_local(&w, idx, ms);
+            ctx.queue_field_push(module, FieldKind::PressMs, ms);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_press_ms_edited(move |p, t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let Ok(ms) = t.trim().trim_end_matches("ms").trim().parse::<f32>() else {
+                return;
+            };
+            let Ok(idx) = usize::try_from(p) else {
+                return;
+            };
+            let Some(module) = MODULES.get(idx) else {
+                return;
+            };
+            let max_ms = pedal_ramp_range_ms(idx, true);
+            if max_ms <= 0.0 {
+                return;
+            }
+            let ms = f64::from(ms).clamp(0.0, max_ms);
+            ctx.set_pedal_tuning(&w, module, |t| t.press_ms = Some(ms));
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_release_ms_changed(move |p, v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let Ok(idx) = usize::try_from(p) else {
+                return;
+            };
+            let Some(module) = MODULES.get(idx) else {
+                return;
+            };
+            let max_ms = pedal_ramp_range_ms(idx, false);
+            if max_ms <= 0.0 {
+                return;
+            }
+            let ms = (f64::from(v) * max_ms).clamp(0.0, max_ms);
+            ctx.apply_pedal_release_ms_local(&w, idx, ms);
+            ctx.queue_field_push(module, FieldKind::ReleaseMs, ms);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_pedal_release_ms_edited(move |p, t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let Ok(ms) = t.trim().trim_end_matches("ms").trim().parse::<f32>() else {
+                return;
+            };
+            let Ok(idx) = usize::try_from(p) else {
+                return;
+            };
+            let Some(module) = MODULES.get(idx) else {
+                return;
+            };
+            let max_ms = pedal_ramp_range_ms(idx, false);
+            if max_ms <= 0.0 {
+                return;
+            }
+            let ms = f64::from(ms).clamp(0.0, max_ms);
+            ctx.set_pedal_tuning(&w, module, |t| t.release_ms = Some(ms));
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_throttle_saturation_changed(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let pct = 70.0 + f64::from(v) * 30.0;
+            let record = ctx.local_tuning_record("throttle");
+            let max_mv = ctx.throttle_saturation_max_mv(&record, pct);
+            ctx.apply_throttle_saturation_local(&w, max_mv);
+            ctx.queue_field_push("throttle", FieldKind::Saturation, max_mv);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_throttle_saturation_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let Ok(pct) = t.trim().trim_end_matches('%').parse::<f32>() else {
+                return;
+            };
+            let pct = f64::from(pct).clamp(70.0, 100.0);
+            let record = ctx.api().get_tuning("throttle");
+            let max_mv = ctx.throttle_saturation_max_mv(&record, pct);
+            ctx.set_pedal_tuning(&w, "throttle", |t| t.max_mv = max_mv);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_combine_pedals_changed(move |b| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            ctx.set_pedal_tuning(&w, "throttle", |t| t.combine_pedals = Some(b));
+        });
+    }
 }
 
 /// Wire the clutch bite-point and feel-preset callbacks (split
@@ -11438,6 +11899,75 @@ mod tests {
         assert_eq!(win.get_throttle_deadzone(), 0.5);
         assert_eq!(win.get_throttle_deadzone_text().as_str(), "5%");
         assert_eq!(ctx.pedals.borrow().records[0].deadzone, 5.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Workstream C: the new pedal tuning controls sync — curve /
+    /// ramp sliders echo locally with the right fraction + text,
+    /// saturation derives from the record, and the combined pedals
+    /// switch + typed values push through `set_tuning`.
+    #[test]
+    fn pedal_tuning_controls_sync_to_window() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("Workstream C window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        ctx.sync_pedals(&win);
+        // Sim neutral = task defaults: throttle curve 1.00, tip-in
+        // 100 ms, lift-off 50 ms, saturation 100%, combined off;
+        // brake curve 1.30, bite 50 ms; clutch curve 1.00, release
+        // 300 ms.
+        assert!((win.get_throttle_curve_value() - 1.0_f32 / 3.0).abs() < 0.001);
+        assert_eq!(win.get_throttle_curve_text().as_str(), "1.00");
+        assert!((win.get_throttle_press_ms_value() - 0.2).abs() < 0.001);
+        assert_eq!(win.get_throttle_press_ms_text().as_str(), "100 ms");
+        assert!((win.get_throttle_release_ms_value() - 0.1).abs() < 0.001);
+        assert_eq!(win.get_throttle_release_ms_text().as_str(), "50 ms");
+        assert_eq!(win.get_throttle_saturation_value(), 1.0);
+        assert_eq!(win.get_throttle_saturation_text().as_str(), "100%");
+        assert!(!win.get_combine_pedals());
+        assert!((win.get_brake_curve_value() - 0.8_f32 / 1.5).abs() < 0.001);
+        assert_eq!(win.get_brake_curve_text().as_str(), "1.30");
+        assert!((win.get_brake_press_ms_value() - 50.0 / 300.0).abs() < 0.001);
+        assert_eq!(win.get_brake_press_ms_text().as_str(), "50 ms");
+        assert!((win.get_clutch_curve_value() - 1.0_f32 / 3.0).abs() < 0.001);
+        assert_eq!(win.get_clutch_curve_text().as_str(), "1.00");
+        assert!((win.get_clutch_release_ms_value() - 0.3).abs() < 0.001);
+        assert_eq!(win.get_clutch_release_ms_text().as_str(), "300 ms");
+        // Drags echo locally (frac + text + local record).
+        win.invoke_pedal_curve_changed(0, 0.5);
+        assert_eq!(win.get_throttle_curve_value(), 0.5);
+        assert_eq!(win.get_throttle_curve_text().as_str(), "1.25");
+        assert_eq!(ctx.pedals.borrow().records[0].curve, 1.25);
+        win.invoke_pedal_press_ms_changed(1, 0.5);
+        assert_eq!(win.get_brake_press_ms_value(), 0.5);
+        assert_eq!(win.get_brake_press_ms_text().as_str(), "150 ms");
+        assert_eq!(ctx.pedals.borrow().records[1].press_ms, Some(150.0));
+        win.invoke_pedal_release_ms_changed(2, 0.5);
+        assert_eq!(win.get_clutch_release_ms_value(), 0.5);
+        assert_eq!(win.get_clutch_release_ms_text().as_str(), "500 ms");
+        assert_eq!(ctx.pedals.borrow().records[2].release_ms, Some(500.0));
+        // Saturation 0.5 → 85% of the (uncalibrated) 3300 mV span.
+        win.invoke_throttle_saturation_changed(0.5);
+        assert_eq!(win.get_throttle_saturation_value(), 0.5);
+        assert_eq!(win.get_throttle_saturation_text().as_str(), "85%");
+        assert_eq!(ctx.pedals.borrow().records[0].max_mv, 2805.0);
+        // Typed values + the toggle push through `set_tuning`
+        // (drain the job, then the window re-syncs from the return).
+        win.invoke_pedal_curve_edited(1, "1.80".into());
+        drain_all_jobs(&ctx, &win);
+        assert!((win.get_brake_curve_value() - 1.3_f32 / 1.5).abs() < 0.001);
+        assert_eq!(win.get_brake_curve_text().as_str(), "1.80");
+        win.invoke_pedal_press_ms_edited(0, "250 ms".into());
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(win.get_throttle_press_ms_value(), 0.5);
+        assert_eq!(win.get_throttle_press_ms_text().as_str(), "250 ms");
+        win.invoke_combine_pedals_changed(true);
+        drain_all_jobs(&ctx, &win);
+        assert!(win.get_combine_pedals());
+        assert_eq!(ctx.api().get_tuning("throttle").combine_pedals, Some(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

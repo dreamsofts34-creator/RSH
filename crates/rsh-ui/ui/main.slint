@@ -186,6 +186,24 @@ export component MainWindow inherits Window {
     in property <string> clutch-dashed: "";
     in property <float> clutch-marker-x: 6;
     in property <float> clutch-marker-y: 104;
+    // --- Pedal ramps/curves per-module tuning ---
+    in property <float> throttle-curve-value: 0.333;
+    in property <string> throttle-curve-text: "1.00";
+    in property <float> throttle-press-ms-value: 0.2;
+    in property <string> throttle-press-ms-text: "100 ms";
+    in property <float> throttle-release-ms-value: 0.1;
+    in property <string> throttle-release-ms-text: "50 ms";
+    in property <float> throttle-saturation-value: 1;
+    in property <string> throttle-saturation-text: "100%";
+    in property <float> brake-curve-value: 0.533;
+    in property <string> brake-curve-text: "1.30";
+    in property <float> brake-press-ms-value: 0.167;
+    in property <string> brake-press-ms-text: "50 ms";
+    in property <float> clutch-curve-value: 0.333;
+    in property <string> clutch-curve-text: "1.00";
+    in property <float> clutch-release-ms-value: 0.3;
+    in property <string> clutch-release-ms-text: "300 ms";
+    in property <bool> combine-pedals: false;
     in property <bool> pedal-set-disabled: true;
     // Extras (A6/A7): wired to set_tuning fields; "—" / 0 until the
     // wheel reports a value.
@@ -359,6 +377,16 @@ export component MainWindow inherits Window {
     callback pedal-deadzone-edited(int, string);
     callback pedal-bite-changed(float);
     callback pedal-bite-edited(string);
+    // --- Pedal ramps/curves per-module tuning ---
+    callback pedal-curve-changed(int, float);
+    callback pedal-curve-edited(int, string);
+    callback pedal-press-ms-changed(int, float);
+    callback pedal-press-ms-edited(int, string);
+    callback pedal-release-ms-changed(int, float);
+    callback pedal-release-ms-edited(int, string);
+    callback throttle-saturation-changed(float);
+    callback throttle-saturation-edited(string);
+    callback combine-pedals-changed(bool);
     callback knob-selected(int);
     callback knob-row-selected(int);
     callback learn-clicked();
@@ -723,6 +751,24 @@ export component MainWindow inherits Window {
                 clutch-dashed: clutch-dashed;
                 clutch-marker-x: clutch-marker-x;
                 clutch-marker-y: clutch-marker-y;
+                // --- Pedal ramps/curves per-module tuning ---
+                throttle-curve-value: throttle-curve-value;
+                throttle-curve-text: throttle-curve-text;
+                throttle-press-ms-value: throttle-press-ms-value;
+                throttle-press-ms-text: throttle-press-ms-text;
+                throttle-release-ms-value: throttle-release-ms-value;
+                throttle-release-ms-text: throttle-release-ms-text;
+                throttle-saturation-value: throttle-saturation-value;
+                throttle-saturation-text: throttle-saturation-text;
+                brake-curve-value: brake-curve-value;
+                brake-curve-text: brake-curve-text;
+                brake-press-ms-value: brake-press-ms-value;
+                brake-press-ms-text: brake-press-ms-text;
+                clutch-curve-value: clutch-curve-value;
+                clutch-curve-text: clutch-curve-text;
+                clutch-release-ms-value: clutch-release-ms-value;
+                clutch-release-ms-text: clutch-release-ms-text;
+                combine-pedals: combine-pedals;
                 set-disabled: pedal-set-disabled;
                 set-up(i) => { pedal-set-up(i); }
                 set-down(i) => { pedal-set-down(i); }
@@ -731,6 +777,15 @@ export component MainWindow inherits Window {
                 deadzone-edited(p, t) => { pedal-deadzone-edited(p, t); }
                 bite-changed(v) => { pedal-bite-changed(v); }
                 bite-edited(t) => { pedal-bite-edited(t); }
+                pedal-curve-changed(p, v) => { pedal-curve-changed(p, v); }
+                pedal-curve-edited(p, t) => { pedal-curve-edited(p, t); }
+                pedal-press-ms-changed(p, v) => { pedal-press-ms-changed(p, v); }
+                pedal-press-ms-edited(p, t) => { pedal-press-ms-edited(p, t); }
+                pedal-release-ms-changed(p, v) => { pedal-release-ms-changed(p, v); }
+                pedal-release-ms-edited(p, t) => { pedal-release-ms-edited(p, t); }
+                throttle-saturation-changed(v) => { throttle-saturation-changed(v); }
+                throttle-saturation-edited(t) => { throttle-saturation-edited(t); }
+                combine-pedals-changed(b) => { combine-pedals-changed(b); }
             }
             if page == 3 : ButtonsPage {
                 busy-kind: busy-kind;
