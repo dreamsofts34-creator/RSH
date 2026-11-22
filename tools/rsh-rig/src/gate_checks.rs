@@ -201,6 +201,16 @@ fn strip_comments(text: &str) -> String {
     out
 }
 
+/// Collapse every whitespace run to a single space, so source audits
+/// survive `cargo fmt` wrapping a long match arm across lines
+/// (tun-bindfix: tun-e 44df7de added the long-press alternatives to
+/// the bindings dispatch arm and rustfmt broke it over 6 lines, so
+/// the single-line literal in `gate_bindings_ui` could no longer
+/// match even though dispatch was intact).
+fn collapse_ws(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Read a repo-relative Rust/Slint file as text with comments
 /// stripped (R3-16) — source audits must match live code, not
 /// commented-out code. `None` when it cannot be read (audits treat
@@ -1941,10 +1951,15 @@ pub fn gate_bindings_ui() -> (bool, String) {
     let _ = std::fs::remove_dir_all(&dir);
 
     // IPC server dispatches the binding methods (daemon side ready).
+    // Whitespace-collapsed: rustfmt wraps the long multi-alternative
+    // match arm across lines (tun-e 44df7de added the long-press
+    // alternatives), so a single-line literal never matches the raw
+    // text even though dispatch is intact.
     let server = read_code("crates/rsh-ipc/src/lib.rs").unwrap_or_default();
+    let server_flat = collapse_ws(&server);
     report.check(
         "bindings-ipc-server-ready",
-        server.contains("\"list_bindings\" | \"set_binding\" | \"clear_binding\""),
+        server_flat.contains("\"list_bindings\" | \"set_binding\" | \"clear_binding\""),
         "IPC server dispatches list/set/clear_binding",
     );
 
@@ -2181,6 +2196,26 @@ let path = 'x'; // (1 - value)"#;
         assert!(!stripped.contains("still comment"));
         assert!(stripped.contains("let a = 1;"));
         assert!(stripped.contains("let b = 2;"));
+    }
+
+    // tun-bindfix: tun-e 44df7de added the long-press alternatives to
+    // the bindings dispatch arm and rustfmt wrapped it across lines,
+    // so the single-line literal in `gate_bindings_ui` stopped
+    // matching even though dispatch was intact — the rig gate failed
+    // 31/33 on the tuning merge. The check must be whitespace
+    // insensitive, and the gate must pass on the real tree.
+    #[test]
+    fn collapse_ws_joins_wrapped_match_arm() {
+        let src = "\"list_bindings\"\n        | \"set_binding\"\n        | \"clear_binding\" => dispatch_bindings(api, request),";
+        assert!(
+            collapse_ws(src).contains("\"list_bindings\" | \"set_binding\" | \"clear_binding\"")
+        );
+    }
+
+    #[test]
+    fn gate_bindings_ui_passes_with_wrapped_dispatch_arm() {
+        let (ok, detail) = gate_bindings_ui();
+        assert!(ok, "gate_bindings_ui failed: {detail}");
     }
 
     // R3-10: the `FakeListener` Windows branch (named-pipe
