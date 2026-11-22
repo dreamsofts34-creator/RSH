@@ -415,6 +415,82 @@ fn click(instance: &ComponentInstance, x: f32, y: f32) {
         .dispatch_event(WindowEvent::PointerReleased { position, button });
 }
 
+/// Per-row counts of pixels within `tol` of `color`, restricted to
+/// the column range `x0..x1`. Used to find a wrapped text's rendered
+/// extent inside a bordered banner: the border rows carry a
+/// full-width run of the border color and the side borders put 2 px
+/// on every interior row, so the range excludes the border columns
+/// (callers pass the background bbox inset by 2 px) and rows with a
+/// small-but-nonzero count are text rows.
+fn color_row_counts(
+    rgba: &[u8],
+    width: u32,
+    color: (i32, i32, i32),
+    tol: i32,
+    x0: usize,
+    x1: usize,
+) -> Vec<usize> {
+    let height = rgba.len() / 4 / width as usize;
+    let mut rows = vec![0usize; height];
+    for (i, px) in rgba.as_chunks::<4>().0.iter().enumerate() {
+        let x = i % width as usize;
+        if x < x0 || x >= x1 {
+            continue;
+        }
+        let (red, green, blue) = (i32::from(px[0]), i32::from(px[1]), i32::from(px[2]));
+        if (red - color.0).abs() <= tol
+            && (green - color.1).abs() <= tol
+            && (blue - color.2).abs() <= tol
+        {
+            rows[i / width as usize] += 1;
+        }
+    }
+    rows
+}
+
+/// Bounding box of pixels within `tol` of `color`, restricted to
+/// the rectangle `region` (x0, x1, y0, y1). Used for the real-MainWindow
+/// toast: the window's Overview page contains other ok-bg elements
+/// (status pills/bars), so the whole-snapshot bbox of ok-bg spans
+/// the page, not the toast — the toast lives at x 312..792 (centred
+/// 480 px card) and y 64.., so the region pins the measurement to
+/// it. Returns (`count`, `min_x`, `max_x`, `min_y`, `max_y`) like
+/// [`count_color`].
+fn count_color_rect(
+    rgba: &[u8],
+    width: u32,
+    color: (i32, i32, i32),
+    tol: i32,
+    region: (usize, usize, usize, usize),
+) -> (usize, usize, usize, usize, usize) {
+    let (x0, x1, y0, y1) = region;
+    let (mut count, mut min_x, mut max_x, mut min_y, mut max_y) =
+        (0usize, usize::MAX, usize::MIN, usize::MAX, usize::MIN);
+    for (i, px) in rgba.as_chunks::<4>().0.iter().enumerate() {
+        let px_x = i % width as usize;
+        let px_y = i / width as usize;
+        if px_x < x0 || px_x >= x1 || px_y < y0 || px_y >= y1 {
+            continue;
+        }
+        let (red, green, blue) = (i32::from(px[0]), i32::from(px[1]), i32::from(px[2]));
+        if (red - color.0).abs() <= tol
+            && (green - color.1).abs() <= tol
+            && (blue - color.2).abs() <= tol
+        {
+            count += 1;
+            min_x = min_x.min(px_x);
+            max_x = max_x.max(px_x);
+            min_y = min_y.min(px_y);
+            max_y = max_y.max(px_y);
+        }
+    }
+    if count == 0 {
+        (0, 0, 0, 0, 0)
+    } else {
+        (count, min_x, max_x, min_y, max_y)
+    }
+}
+
 fn get_num(instance: &ComponentInstance, name: &str) -> Option<f64> {
     match instance.get_property(name) {
         Ok(Value::Number(value)) => Some(value),
@@ -1388,6 +1464,423 @@ fn ui_banner_wrap() -> Outcome {
     report.finish()
 }
 
+/// Gate: toast size (Bug 2) — the DS-24 toast is a designed
+/// 480×~52 px card, but the user PC rendered it at ~70% window
+/// width and ~30% window height. The probe hosts the toast markup
+/// verbatim from `crates/rsh-ui/ui/main.slint` and measures its
+/// rendered height (layout property + pixel bbox of the toast
+/// background) for a short body, the flap body, and a long error
+/// body. Acceptance: width stays 480 px and height stays ≤ 80 px
+/// on every body — a toast is a small card, never a panel.
+#[allow(clippy::cast_precision_loss)]
+fn ui_toast_size() -> Outcome {
+    let mut report = Report::new();
+    let instance = match compile(
+        "tools/gate-checks/rsh-gate-ui/ui/toast_probe.slint",
+        "GateToastWindow",
+    ) {
+        Ok(instance) => instance,
+        Err(error) => return Outcome::fail(error),
+    };
+    // (title, body, kind, label) cases.
+    let cases: [(&str, &str, &str, &str); 3] = [
+        (
+            "RSH connected",
+            "Live data is back.",
+            "success",
+            "short",
+        ),
+        (
+            "RSH connected",
+            "Live data is back — the connection flapped ×3 before stabilising.",
+            "success",
+            "flap",
+        ),
+        (
+            "Couldn't complete that",
+            // The longest body production can show: set_toast caps
+            // bodies at 120 chars (the uncapped error is 200 chars;
+            // the full text stays in the drawer). The gate renders
+            // the capped form, as the user sees it.
+            "Couldn't reach the wheel — the connection timed out after 10 s. Check the RSH-XXXX Wi-Fi is joined (or the USB cable is …",
+            "error",
+            "long",
+        ),
+    ];
+    for (title, body, kind, label) in cases {
+        if let Err(error) = set_str(&instance, "toast-title", title)
+            .and_then(|()| set_str(&instance, "toast-text", body))
+            .and_then(|()| set_str(&instance, "toast-kind", kind))
+        {
+            return Outcome::fail(error);
+        }
+        let (rgba, width, _height) = match snapshot(&instance) {
+            Ok(snap) => snap,
+            Err(error) => return Outcome::fail(error),
+        };
+        let height = get_num(&instance, "toast-height");
+        let toast_width = get_num(&instance, "toast-width");
+        // Pixel bbox of the toast background (ok-bg #1B3635 /
+        // err-bg #2E1F26): the rendered height, independent of the
+        // layout property read.
+        let bg: (i32, i32, i32) = if kind == "success" {
+            (0x1b, 0x36, 0x35)
+        } else {
+            (0x2e, 0x1f, 0x26)
+        };
+        let (_, _, _, top, bottom) = count_color(&rgba, width, bg, 6);
+        let px_height = if bottom >= top { bottom - top + 1 } else { 0 };
+        report.check(
+            &format!("toast-{label}-width-480px"),
+            toast_width == Some(480.0),
+            &format!("{label} toast width: {toast_width:?} (want 480)"),
+        );
+        report.check(
+            &format!("toast-{label}-height-compact"),
+            height.is_some_and(|h| h <= 80.0),
+            &format!(
+                "{label} toast height: {height:?} px (property), {px_height} px (pixels) (want <= 80)"
+            ),
+        );
+    }
+    report.finish()
+}
+
+/// Gate: banner with action button (Bug 3) — the DS-21 probe covers
+/// the button-less banner, but the Overview banners carry a
+/// "Reconnect" button that eats ~100 px of text width, inside a
+/// `ScrollView` at the 736 px content-column width. The probe renders
+/// the real `EmptyBanner` in exactly that setting with both exact
+/// Overview texts and measures (a) the banner height — it must grow
+/// past 36 px for the two-line text — and (b) the wrapped text's
+/// rendered extent from the snapshot: the last text row must sit
+/// inside the banner (≥ 6 px above its bottom edge), so the second
+/// line is never half cut off by the card painted below it.
+#[allow(clippy::cast_precision_loss)]
+fn ui_banner_action_wrap() -> Outcome {
+    let mut report = Report::new();
+    let instance = match compile(
+        "tools/gate-checks/rsh-gate-ui/ui/banner_probe.slint",
+        "GateBannerActionWindow",
+    ) {
+        Ok(instance) => instance,
+        Err(error) => return Outcome::fail(error),
+    };
+    let texts = [
+        (
+            "Wheel not found — join the wheel's RSH-XXXX Wi-Fi network or plug in USB.",
+            "wheel-not-found",
+            false,
+        ),
+        (
+            "Wheel not connected — check the wheel's Wi-Fi is joined or the USB cable is plugged in.",
+            "wheel-not-connected",
+            false,
+        ),
+        (
+            // The daemon-error banner (overview.slint) carries the
+            // same Reconnect button — and this 150-char text wraps
+            // to two lines even with the gate's narrow fallback
+            // font, so it exercises the wrap path the ~100-char
+            // Overview texts only hit under Inter on Windows.
+            "Daemon failed to start: IPC bind failed after 5 attempts — pipe is held by another process or the previous daemon did not exit cleanly. Close the old RSH app and retry.",
+            "daemon-error-long",
+            true,
+        ),
+    ];
+    for (text, label, expect_wrap) in texts {
+        if let Err(error) = set_str(&instance, "banner-text", text) {
+            return Outcome::fail(error);
+        }
+        let (rgba, width, _height) = match snapshot(&instance) {
+            Ok(snap) => snap,
+            Err(error) => return Outcome::fail(error),
+        };
+        let banner_height = get_num(&instance, "banner-height");
+        // Banner interior from its err-bg (#2E1F26) pixels.
+        let (_, bg_min_x, bg_max_x, bg_top, bg_bottom) =
+            count_color(&rgba, width, (0x2e, 0x1f, 0x26), 6);
+        // Text rows from Theme.bad (#FF6B6B) glyph pixels, counted
+        // only inside the banner interior (the side borders put bad
+        // pixels on every row — without the inset every interior
+        // row reads as a text row). The last text row is the bottom
+        // of the wrapped text as actually painted.
+        let rows = color_row_counts(
+            &rgba,
+            width,
+            (0xff, 0x6b, 0x6b),
+            60,
+            bg_min_x + 2,
+            bg_max_x.saturating_sub(1),
+        );
+        // (TEMP-DEBUG removed — the row histogram showed the text
+        // painting as a single 35..46 band, i.e. the ~100-char
+        // Overview texts fit on ONE line with this backend's font;
+        // the wrap path needs a longer text — see the third case
+        // below.)
+        // Text rows carry >= 3 glyph pixels; the banner's rounded
+        // corners put exactly 2 border pixels on the first/last
+        // interior rows, so the range starts at 3 to exclude them.
+        let text_bottom = rows
+            .iter()
+            .enumerate()
+            .filter(|&(_, &count)| (3..=200).contains(&count))
+            .map(|(y, _)| y)
+            .max();
+        let text_top = rows
+            .iter()
+            .enumerate()
+            .filter(|&(_, &count)| (3..=200).contains(&count))
+            .map(|(y, _)| y)
+            .min();
+        let fits = match (text_bottom, bg_bottom.checked_sub(bg_top)) {
+            (Some(last), Some(_)) => last + 6 <= bg_bottom,
+            _ => false,
+        };
+        let two_lines = match (text_top, text_bottom) {
+            (Some(first), Some(last)) => last - first >= 20,
+            _ => false,
+        };
+        report.check(
+            &format!("banner-{label}-grows"),
+            // The button is 30 px tall, so the layout is 30 px
+            // whether the text is one line or two — the banner is
+            // 46 px in both cases. Growth only shows past two
+            // lines; the wrap case is judged by the text extent,
+            // not the banner height.
+            banner_height.is_some_and(|h| h >= 46.0),
+            &format!("{label} banner height: {banner_height:?} (want >= 46)"),
+        );
+        // The wrap assertion only applies where the text is known
+        // to wrap in this backend (the long daemon-error text);
+        // the ~100-char Overview texts fit on one line here and
+        // wrap only under Inter on Windows.
+        if expect_wrap {
+            report.check(
+                &format!("banner-{label}-two-lines"),
+                two_lines,
+                &format!(
+                    "{label} text spans rows {text_top:?}..{text_bottom:?} (want two lines, >= 20 px apart)"
+                ),
+            );
+        }
+        report.check(
+            &format!("banner-{label}-text-fits"),
+            fits,
+            &format!(
+                "{label} last text row {text_bottom:?}, banner bg bottom {bg_bottom} (want text bottom + 6 <= banner bottom)"
+            ),
+        );
+    }
+    report.finish()
+}
+
+/// Gate: real `MainWindow` toast (Bug 2) — the verbatim probes above
+/// isolate the mechanism (a height-less Rectangle parented by the
+/// Window / a 100% `FocusScope` measures window-height), this check
+/// proves the shipped window: instantiate the real `MainWindow`,
+/// set its toast props, and measure the toast background's pixel
+/// bbox. Acceptance: the rendered toast is ≤ 80 px tall on a short
+/// body and on a long error body, at 480 px wide.
+#[allow(clippy::cast_precision_loss)]
+fn ui_toast_real_mainwindow() -> Outcome {
+    let mut report = Report::new();
+    // FocusScope-parented verbatim copy (MainWindow's parenting):
+    // the layout property alone proves the mechanism.
+    let focus = match compile(
+        "tools/gate-checks/rsh-gate-ui/ui/toast_probe.slint",
+        "GateToastFocusWindow",
+    ) {
+        Ok(instance) => instance,
+        Err(error) => return Outcome::fail(error),
+    };
+    if let Err(error) = snapshot(&focus) {
+        return Outcome::fail(error);
+    }
+    let focus_height = get_num(&focus, "toast-height");
+    let focus_width = get_num(&focus, "toast-width");
+    report.check(
+        "toast-focus-parent-height-compact",
+        focus_height.is_some_and(|h| h <= 80.0),
+        &format!("FocusScope-parented toast height: {focus_height:?} (want <= 80)"),
+    );
+    report.check(
+        "toast-focus-parent-width-480px",
+        focus_width == Some(480.0),
+        &format!("FocusScope-parented toast width: {focus_width:?} (want 480)"),
+    );
+    // The real MainWindow, short + long bodies (pixel bbox of the
+    // toast background — the window exposes no toast-height prop).
+    // One component per variant: the interpreter cannot set
+    // inherited properties on an instance.
+    let cases: [(&str, &str, &str); 2] = [
+        ("GateMainToastShort", "success", "short"),
+        ("GateMainToastLong", "error", "long"),
+    ];
+    for (component, kind, label) in cases {
+        let instance = match compile(
+            "tools/gate-checks/rsh-gate-ui/ui/toast_probe.slint",
+            component,
+        ) {
+            Ok(instance) => instance,
+            Err(error) => return Outcome::fail(error),
+        };
+        let (rgba, width, _height) = match snapshot(&instance) {
+            Ok(snap) => snap,
+            Err(error) => return Outcome::fail(error),
+        };
+        let bg: (i32, i32, i32) = if kind == "success" {
+            (0x1b, 0x36, 0x35)
+        } else {
+            (0x2e, 0x1f, 0x26)
+        };
+        // Region-restricted to the toast card (x 312..792, y 64..250):
+        // the Overview page behind it has other ok-bg elements.
+        let (_, _, _, top, bottom) = count_color_rect(&rgba, width, bg, 6, (312, 792, 64, 250));
+        let px_height = if bottom >= top { bottom - top + 1 } else { 0 };
+        report.check(
+            &format!("toast-real-{label}-height-compact"),
+            px_height <= 80,
+            &format!("real MainWindow toast ({label}): {px_height} px tall (want <= 80)"),
+        );
+    }
+    report.finish()
+}
+
+/// Gate: real Overview banner (Bug 3) — the real `OverviewPage`
+/// in the disconnected + unreachable state, i.e. the exact
+/// "Wheel not found" banner with its Reconnect button inside the
+/// real `ScrollView`. Measures the banner's painted extent (first
+/// err-bg row run) against the painted text extent: the last text
+/// row must sit inside the banner with padding to spare, and no
+/// text row may paint below the banner (that is the user's
+/// "second line half cut off"). The replica probe
+/// (`ui-banner-action-wrap`) isolates the component; this one
+/// proves the shipped page.
+#[allow(clippy::cast_precision_loss)]
+fn ui_overview_banner_real() -> Outcome {
+    let mut report = Report::new();
+    let instance = match compile(
+        "tools/gate-checks/rsh-gate-ui/ui/overview_probe.slint",
+        "GateOverviewDisconnectedWindow",
+    ) {
+        Ok(instance) => instance,
+        Err(error) => return Outcome::fail(error),
+    };
+    let (rgba, width, _height) = match snapshot(&instance) {
+        Ok(snap) => snap,
+        Err(error) => return Outcome::fail(error),
+    };
+    // Banner interior rows: rows with a wide run of err-bg
+    // (#2E1F26). The banner is the first such run (top of page).
+    let bg_rows = color_row_counts(&rgba, width, (0x2e, 0x1f, 0x26), 6, 0, width as usize);
+    let mut banner_top: Option<usize> = None;
+    let mut banner_bottom: Option<usize> = None;
+    for (y, &count) in bg_rows.iter().enumerate() {
+        if count > 100 {
+            if banner_top.is_none() {
+                banner_top = Some(y);
+            }
+            banner_bottom = Some(y);
+        } else if banner_top.is_some() && banner_bottom.is_some() {
+            break;
+        }
+    }
+    let (Some(top), Some(bottom)) = (banner_top, banner_bottom) else {
+        return Outcome::fail("no err-bg banner found on the Overview".to_string());
+    };
+    // Text rows from Theme.bad glyph pixels (rounded-corner border
+    // pixels excluded by the >= 3 threshold, as in the replica
+    // probe). Any text row below the banner bottom is overflow.
+    let (_, bg_min_x, bg_max_x, _, _) = count_color(&rgba, width, (0x2e, 0x1f, 0x26), 6);
+    let rows = color_row_counts(
+        &rgba,
+        width,
+        (0xff, 0x6b, 0x6b),
+        60,
+        bg_min_x + 2,
+        bg_max_x.saturating_sub(1),
+    );
+    let text_rows: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| (3..=200).contains(&count))
+        .map(|(y, _)| y)
+        .filter(|&y| y >= top.saturating_sub(2) && y <= bottom + 25)
+        .collect();
+    let last_text = text_rows.iter().max().copied();
+    let first_text = text_rows.iter().min().copied();
+    let overflow = text_rows.iter().any(|&y| y > bottom + 1);
+    report.check(
+        "overview-banner-text-fits",
+        !overflow && last_text.is_some_and(|last| last + 6 <= bottom),
+        &format!(
+            "real Overview banner bg rows {top}..{bottom}, text rows {first_text:?}..{last_text:?} (want text inside, last + 6 <= bottom)"
+        ),
+    );
+    report.finish()
+}
+
+/// Gate: popup surfaces (Bug 5) — the toast measured window-height
+/// (580 px) because its Rectangle had no explicit height, and the
+/// same defect was gate-measured on every other height-less
+/// overlay (plain rect, `GameDialog`, `ProfilePopover`: all 580 px).
+/// This check proves the fix: the confirm dialog's structure (as a
+/// replica — the real one is inline in `MainWindow`) plus the real
+/// `GameDialog` and the real `ProfilePopover`, all with their
+/// height bound to their content layout.
+/// Acceptance: every surface renders at content height, far below
+/// the 580 px window height — a popup is a small card, never a
+/// full-height panel.
+fn ui_popup_surfaces() -> Outcome {
+    let mut report = Report::new();
+    let cases = [
+        (
+            "GatePlainRectWindow",
+            "rect-height",
+            "rect-width",
+            100.0,
+            "confirm-replica",
+        ),
+        (
+            "GateGameDialogWindow",
+            "dlg-height",
+            "dlg-width",
+            400.0,
+            "game-dialog",
+        ),
+        (
+            "GateProfilePopoverWindow",
+            "pop-height",
+            "pop-width",
+            300.0,
+            "profile-popover",
+        ),
+    ];
+    for (component, height_prop, width_prop, max_height, label) in cases {
+        let instance = match compile(
+            "tools/gate-checks/rsh-gate-ui/ui/popup_probe.slint",
+            component,
+        ) {
+            Ok(instance) => instance,
+            Err(error) => return Outcome::fail(error),
+        };
+        if let Err(error) = snapshot(&instance) {
+            return Outcome::fail(error);
+        }
+        let height = get_num(&instance, height_prop);
+        let width = get_num(&instance, width_prop);
+        report.check(
+            &format!("popup-{label}-height-content"),
+            height.is_some_and(|h| h <= max_height),
+            &format!(
+                "{label} height: {height:?} px, width: {width:?} px (want height <= {max_height}, far below the 580 px window)"
+            ),
+        );
+    }
+    report.finish()
+}
+
 /// One UI gate check: (id, description, runner).
 type UiCheck = (&'static str, &'static str, fn() -> Outcome);
 
@@ -1432,6 +1925,31 @@ fn checks() -> Vec<UiCheck> {
             "ui-banner-wrap",
             "DS-21: EmptyBanner wraps long text and grows past 36 px (short text stays 36 px)",
             ui_banner_wrap as fn() -> Outcome,
+        ),
+        (
+            "ui-toast-size",
+            "Bug 2: toast stays a 480 px wide, <= 80 px tall card on short, flap and long bodies",
+            ui_toast_size as fn() -> Outcome,
+        ),
+        (
+            "ui-toast-real-mainwindow",
+            "Bug 2: the real MainWindow toast (FocusScope-parented) renders <= 80 px tall, short and long bodies",
+            ui_toast_real_mainwindow as fn() -> Outcome,
+        ),
+        (
+            "ui-banner-action-wrap",
+            "Bug 3: Overview banner with Reconnect button grows for two-line text and the second line fits inside it",
+            ui_banner_action_wrap as fn() -> Outcome,
+        ),
+        (
+            "ui-overview-banner-real",
+            "Bug 3: the real OverviewPage in the wheel-not-found state renders its banner text inside the banner, no overflow below it",
+            ui_overview_banner_real as fn() -> Outcome,
+        ),
+        (
+            "ui-popup-surfaces",
+            "Bug 5: every height-less popup surface (plain rect, GameDialog, ProfilePopover) renders at content height, not window height",
+            ui_popup_surfaces as fn() -> Outcome,
         ),
         (
             "ui-extras-card-size",

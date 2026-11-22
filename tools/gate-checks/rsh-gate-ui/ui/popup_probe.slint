@@ -1,0 +1,74 @@
+// Popup-surface probes (Bug 5): the other height-less overlays
+// were window-tall like the toast (pre-fix gate measurement:
+// plain rect, GameDialog and ProfilePopover all 580 px — the
+// window height). The plain rect below is the confirm dialog's
+// exact structure WITH the B5 fix (height bound to its content
+// layout); GameDialog / ProfilePopover are the real components,
+// so they prove the shipped code.
+import { Theme } from "../../../crates/rsh-ui/ui/tokens.slint";
+import { GameDialog } from "../../../crates/rsh-ui/ui/screens/game_dialog.slint";
+import { ProfilePopover } from "../../../crates/rsh-ui/ui/screens/profile_popover.slint";
+
+export component GatePlainRectWindow inherits Window {
+    width: 920px;
+    height: 580px;
+    title: "gate-plain-rect-probe";
+    out property <length> rect-height: r.height;
+    out property <length> rect-width: r.width;
+    r := Rectangle {
+        x: 220px;
+        y: 64px;
+        width: 480px;
+        // B5 fix: explicit content height (was height-less,
+        // gate-measured 580 px). Mirrors the fixed confirm dialog.
+        height: r-layout.preferred-height;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.line;
+        background: Theme.panel;
+        r-layout := VerticalLayout {
+            padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
+            spacing: 10px;
+            Text { text: "Confirm title"; font-size: 12.5px; font-weight: 600; color: Theme.text; wrap: word-wrap; }
+            Text { text: "Some short confirm text."; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
+        }
+    }
+}
+
+// The REAL GameDialog (manual add-game dialog): 360 px wide, no
+// height in game_dialog.slint — hosted as a direct Window child
+// exactly as MainWindow parents it.
+export component GateGameDialogWindow inherits Window {
+    width: 920px;
+    height: 580px;
+    title: "gate-game-dialog-probe";
+    out property <length> dlg-height: dlg.height;
+    out property <length> dlg-width: dlg.width;
+    dlg := GameDialog {
+        x: parent.width - 380px;
+        y: 64px;
+        title: "Add game";
+        name: "";
+        exe: "";
+        profile-name: "No profile";
+    }
+}
+
+// The REAL ProfilePopover: 300 px wide, no height in
+// profile_popover.slint — hosted exactly as MainWindow parents it.
+export component GateProfilePopoverWindow inherits Window {
+    width: 920px;
+    height: 580px;
+    title: "gate-profile-popover-probe";
+    out property <length> pop-height: pop.height;
+    out property <length> pop-width: pop.width;
+    pop := ProfilePopover {
+        x: parent.width - 320px;
+        y: 64px;
+        presets: [];
+        profiles: [];
+        unsaved: false;
+        show-unsaved-prompt: false;
+        pending-name: "";
+    }
+}

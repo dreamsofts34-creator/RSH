@@ -964,11 +964,20 @@ export component MainWindow inherits Window {
         x: parent.width - 380px;
         y: 64px;
         width: 360px;
+        // B5 (PC-test Bug 5): an explicit content height — a
+        // height-less Rectangle parented by the window stretches
+        // to the window height (gate-measured 580 px), so the
+        // confirm used to render as a full-height panel. The
+        // layout's preferred height is content-driven (fixed
+        // 360 px width), so binding to it sizes the card to its
+        // content. (Binding to layout.height is a loop: a layout
+        // fills its parent, so layout.height IS the card height.)
+        height: confirm-layout.preferred-height;
         border-radius: 14px;
         border-width: 1px;
         border-color: Theme.line;
         background: Theme.panel;
-        VerticalLayout {
+        confirm-layout := VerticalLayout {
             padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
             spacing: 10px;
             Text { text: confirm-title; font-size: 12.5px; font-weight: 600; color: Theme.text; wrap: word-wrap; }
@@ -994,12 +1003,25 @@ export component MainWindow inherits Window {
         x: Theme.sidebar-width + (parent.width - Theme.sidebar-width - 480px) / 2;
         y: 64px;
         width: 480px;
-        min-height: 52px;
+        // B2 (PC-test Bug 2): an explicit content height — a
+        // height-less Rectangle parented by the window stretches
+        // to the window height (gate-measured 580 px for every
+        // body, short or long), so the toast used to render as a
+        // full-height panel instead of the designed 480×~52 px
+        // card. The layout's preferred height is content-driven
+        // (fixed 480 px width, wrapped text), so binding to it
+        // sizes the card to its text; Rust caps the text
+        // (set_toast) so the card stays ≤ ~80 px. The 52 px floor
+        // is the design height for one-line toasts (height +
+        // min-height cannot both be set). (Binding to
+        // layout.height is a loop: a layout fills its parent, so
+        // layout.height IS the card height.)
+        height: Math.max(toast-layout.preferred-height, 52px);
         border-radius: 8px;
         border-width: 1px;
         border-color: toast-kind == "success" ? Theme.ok : Theme.bad;
         background: toast-kind == "success" ? Theme.ok-bg : Theme.err-bg;
-        HorizontalLayout {
+        toast-layout := HorizontalLayout {
             padding-left: 12px;
             padding-right: 12px;
             padding-top: 8px;

@@ -30,3 +30,22 @@ export component GateOverviewWindow1016 inherits Window {
     title: "gate-overview-1016";
     page := GateOverviewPage { width: 100%; height: 100%; }
 }
+
+// Bug 3 probe: the REAL OverviewPage in the disconnected +
+// unreachable state (daemon live, board not found) — the exact
+// state the user's screenshot showed. The banner here is the real
+// "Wheel not found" EmptyBanner with its Reconnect button, inside
+// the real ScrollView → VerticalLayout, not a replica.
+component GateOverviewDisconnectedPage inherits OverviewPage {
+    daemon-live: true;
+    connected: false;
+    unreachable: true;
+    games: [];
+}
+
+export component GateOverviewDisconnectedWindow inherits Window {
+    width: 736px;
+    height: 700px;
+    title: "gate-overview-disconnected";
+    page := GateOverviewDisconnectedPage { width: 100%; height: 100%; }
+}

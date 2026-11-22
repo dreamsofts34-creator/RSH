@@ -77,8 +77,17 @@ export component OverviewPage inherits VerticalLayout {
     // REDESIGN-PLAN §8.6 disconnected state: banner + Reconnect.
     // Phase 2 (Wi-Fi gap): while Unreachable, name the fix
     // proactively instead of the generic line.
-    if daemon-live && !connected && unreachable : EmptyBanner { text: "Wheel not found — join the wheel's RSH-XXXX Wi-Fi network (or plug in USB), then press Reconnect."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
-    if daemon-live && !connected && !unreachable : EmptyBanner { text: "Wheel not connected — check the RSH-XXXX Wi-Fi is joined (or the USB cable is plugged in), then retry."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
+    // B3 (PC-test Bug 3): these two texts are kept to one line at
+    // the banner's ~568 px text width (74 / 86 chars) — the old
+    // ~100-char texts wrapped to two lines under Inter on the user
+    // PC and the second line rendered half cut off. The Reconnect
+    // button beside the text carries the action, so "then press
+    // Reconnect" / "then retry" is not repeated in the text. The
+    // banner still grows for longer texts (daemon-error above) —
+    // gate-measured — this only removes the wrap for the two texts
+    // the user actually saw clip.
+    if daemon-live && !connected && unreachable : EmptyBanner { text: "Wheel not found — join the wheel's RSH-XXXX Wi-Fi network or plug in USB."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
+    if daemon-live && !connected && !unreachable : EmptyBanner { text: "Wheel not connected — check the wheel's Wi-Fi is joined or the USB cable is plugged in."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
     Card {
         HorizontalLayout {
             // Phase 2 (F-16): spec card padding 14/16 (was 16/20).

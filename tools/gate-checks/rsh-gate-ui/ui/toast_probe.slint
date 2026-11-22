@@ -1,0 +1,129 @@
+// Probe window hosting the REAL toast markup from
+// crates/rsh-ui/ui/main.slint (DS-24 toast Rectangle, copied
+// verbatim — same x/y/width/min-height, same inner layout, same
+// Theme colors) so the gate can render it headless and measure its
+// height for short vs long bodies. The toast is an inline Rectangle
+// in MainWindow, not a named component, so it cannot be imported;
+// this probe is a verbatim copy and its header comment says so —
+// if the MainWindow toast changes, this probe must change with it.
+//
+// Bug 2: the user PC rendered the toast at ~70% window width and
+// ~30% window height instead of the designed 480×~52 px card.
+// Pre-fix measurement (this probe, height-less Rectangle): 580 px
+// tall — the window height — for every body, short or long. The
+// fix (B2) binds the Rectangle's height to its content layout;
+// this probe mirrors the fixed structure, and the real-MainWindow
+// check below proves the shipped window.
+import { Theme } from "../../../crates/rsh-ui/ui/tokens.slint";
+
+export component GateToastWindow inherits Window {
+    width: 920px;
+    height: 580px;
+    title: "gate-toast-probe";
+    in-out property <string> toast-title: "RSH connected";
+    in-out property <string> toast-text: "Live data is back.";
+    in-out property <string> toast-kind: "success";
+    out property <length> toast-height: toast.height;
+    out property <length> toast-width: toast.width;
+    toast := Rectangle {
+        // Centre within the content column (sidebar .. right edge).
+        x: Theme.sidebar-width + (parent.width - Theme.sidebar-width - 480px) / 2;
+        y: 64px;
+        width: 480px;
+        // B2 fix: explicit content height (was height-less, which
+        // gate-measured 580 px — the window height), floored at
+        // the 52 px design height. Mirrors the fixed MainWindow
+        // toast. (height + min-height cannot both be set.)
+        height: Math.max(toast-layout.preferred-height, 52px);
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: toast-kind == "success" ? Theme.ok : Theme.bad;
+        background: toast-kind == "success" ? Theme.ok-bg : Theme.err-bg;
+        toast-layout := HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            spacing: 10px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 2px;
+                Text { text: toast-title; font-size: 12.5px; font-weight: 600; color: toast-kind == "success" ? Theme.ok : Theme.bad; wrap: word-wrap; }
+                Text { text: toast-text; font-size: 12px; color: Theme.text; wrap: word-wrap; }
+            }
+            Text { text: "✕"; font-size: 12px; color: Theme.faint; vertical-alignment: center; }
+        }
+    }
+}
+
+// Same verbatim toast Rectangle, but parented by a 100% FocusScope
+// — exactly how MainWindow parents it (the root FocusScope `kb`,
+// width/height 100%). If this also measures window-height, the
+// production toast is giant for the same reason as the Window-child
+// probe above, and the fix (an explicit height) covers both.
+export component GateToastFocusWindow inherits Window {
+    width: 920px;
+    height: 580px;
+    title: "gate-toast-focus-probe";
+    in-out property <string> toast-title: "RSH connected";
+    in-out property <string> toast-text: "Live data is back.";
+    in-out property <string> toast-kind: "success";
+    out property <length> toast-height: toast2.height;
+    out property <length> toast-width: toast2.width;
+    FocusScope {
+        width: 100%;
+        height: 100%;
+        toast2 := Rectangle {
+            x: Theme.sidebar-width + (parent.width - Theme.sidebar-width - 480px) / 2;
+            y: 64px;
+            width: 480px;
+            // B2 fix: explicit content height (was height-less,
+            // gate-measured 580 px), floored at the 52 px design
+            // height. Mirrors the fixed MainWindow toast.
+            height: Math.max(toast2-layout.preferred-height, 52px);
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: toast-kind == "success" ? Theme.ok : Theme.bad;
+            background: toast-kind == "success" ? Theme.ok-bg : Theme.err-bg;
+            toast2-layout := HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 10px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text { text: toast-title; font-size: 12.5px; font-weight: 600; color: toast-kind == "success" ? Theme.ok : Theme.bad; wrap: word-wrap; }
+                    Text { text: toast-text; font-size: 12px; color: Theme.text; wrap: word-wrap; }
+                }
+                Text { text: "✕"; font-size: 12px; color: Theme.faint; vertical-alignment: center; }
+            }
+        }
+    }
+}
+
+import { MainWindow } from "../../../crates/rsh-ui/ui/main.slint";
+
+// The REAL MainWindow toast (not a copy): the gate renders each
+// variant and measures the ok-bg/err-bg pixel bbox — the rendered
+// height of the production toast. This is the regression guard for
+// Bug 2: the verbatim probes above isolate the mechanism, these
+// prove the shipped window. Two components because the interpreter
+// cannot set inherited properties on an instance — each variant
+// carries its toast props in Slint.
+// Short success body (the "RSH connected" case).
+export component GateMainToastShort inherits MainWindow {
+    toast-title: "RSH connected";
+    toast-text: "Live data is back.";
+    toast-kind: "success";
+}
+
+// Long error body (the worst realistic notify_error body, as
+// production shows it: set_toast caps bodies at 160 chars — the
+// full text stays in the drawer).
+export component GateMainToastLong inherits MainWindow {
+    toast-title: "Couldn't complete that";
+    toast-text: "Couldn't reach the wheel — the connection timed out after 10 s. Check the RSH-XXXX Wi-Fi is joined (or the USB cable is …";
+    toast-kind: "error";
+}

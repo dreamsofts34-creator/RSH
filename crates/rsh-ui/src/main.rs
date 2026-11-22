@@ -149,6 +149,22 @@ pub fn user_text(s: &str) -> String {
         .replace("Simulated data", "Live data unavailable")
 }
 
+/// Truncate a toast string to `max` chars (char-safe — the texts
+/// carry "—"/"×"), appending "…" when cut. The toast card is
+/// 480 px wide with ~2 lines of body at 12 px; longer text would
+/// grow the card past its ~80 px design height (B2). The full text
+/// is never lost: `notify` stores it in the notification drawer
+/// before the toast is shown.
+fn toast_capped(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut capped: String = s.chars().take(max).collect();
+        capped.push('…');
+        capped
+    }
+}
+
 /// One mV reading as shown in the range blocks ("410 mV", "—" for
 /// the neutral 0 mV that means "no reading yet" — the neutral record
 /// is 0..3300 mV, so a stored 0 minimum is not a real reading).
@@ -980,7 +996,7 @@ fn clean_profile_name(name: &str) -> Option<String> {
 }
 
 /// F12 (v2.0.3): a down-episode shorter than this is a flap — the
-/// daemon died and came back almost at once, so the "RSH connected"
+/// daemon died and came back almost at once, so the "Wheel connected"
 /// notify is noise (suppressed by `reconnect_to_live` via
 /// [`Ctx::suppress_connected_notify`]) and the episode counts toward
 /// the burst total instead of earning its own entry.
@@ -1772,7 +1788,7 @@ struct Ctx {
     flap_count: Rc<Cell<u32>>,
     /// F12 (v2.0.3): the last reconnect ended a flap (down-episode
     /// < [`FLAP_DOWN_WINDOW`]) — the signal for `reconnect_to_live`
-    /// to suppress its "RSH connected" notify (the notify itself
+    /// to suppress its "Wheel connected" notify (the notify itself
     /// lives in `reconnect_to_live`, owned by the F5 worker — see
     /// the note on [`Ctx::swap_to_live`]).
     suppress_connected_notify: Rc<Cell<bool>>,
@@ -2833,14 +2849,16 @@ impl Ctx {
     /// the current screen for ~5 s, then the 1 Hz tick clears it.
     /// Skipped while the window is hidden (F27: no property writes
     /// on a hidden window) — the notification itself is still
-    /// stored and synced on reopen.
+    /// stored and synced on reopen. B2: title/body are capped
+    /// (60 / 120 chars) so the card stays ≤ ~80 px tall; the full
+    /// text is in the drawer.
     fn set_toast(&self, win: &MainWindow, title: &str, body: &str) {
         if self.hidden.load(Ordering::SeqCst) {
             return;
         }
         win.set_toast_kind("error".into());
-        win.set_toast_title(title.into());
-        win.set_toast_text(body.into());
+        win.set_toast_title(toast_capped(title, 60).into());
+        win.set_toast_text(toast_capped(body, 120).into());
         ui_log!("RSH-UI toast shown: {title} — {body}");
         self.toast_until
             .set(Some(Instant::now() + Duration::from_secs(5)));
@@ -2848,14 +2866,15 @@ impl Ctx {
 
     /// Show the transient success toast (D17): same 480 px card
     /// as [`Self::set_toast`], ok-accent border (`toast-kind`
-    /// "success"). Same ~5 s lifetime + 1 Hz expiry.
+    /// "success"). Same ~5 s lifetime + 1 Hz expiry. B2: same
+    /// 60 / 120-char cap as [`Self::set_toast`].
     fn set_toast_success(&self, win: &MainWindow, title: &str, body: &str) {
         if self.hidden.load(Ordering::SeqCst) {
             return;
         }
         win.set_toast_kind("success".into());
-        win.set_toast_title(title.into());
-        win.set_toast_text(body.into());
+        win.set_toast_title(toast_capped(title, 60).into());
+        win.set_toast_text(toast_capped(body, 120).into());
         ui_log!("RSH-UI success toast shown: {title} — {body}");
         self.toast_until
             .set(Some(Instant::now() + Duration::from_secs(5)));
@@ -4368,7 +4387,7 @@ impl Ctx {
         self.unsaved
             .set(api.draft_status().is_some_and(|s| s.dirty));
         // F12: measure the down-episode this reconnect ends. A short
-        // one is a flap — count it and arm the "RSH connected"
+        // one is a flap — count it and arm the "Wheel connected"
         // suppression for `reconnect_to_live` (F5 worker: gate that
         // notify on `self.suppress_connected_notify.get()` — the flag
         // is set here and cleared on the next non-flap reconnect).
@@ -4591,7 +4610,7 @@ impl Ctx {
         // cache reads now (F5).
         self.seed_live_state(win);
         // F12 (v2.0.3): a flap reconnect stays silent — the
-        // "RSH connected" notify is noise when the daemon died
+        // "Wheel connected" notify is noise when the daemon died
         // and came back within seconds (`swap_to_live` armed
         // `suppress_connected_notify`). A non-flap reconnect that
         // ends a burst folds the count in ("flapped ×N before
@@ -4599,7 +4618,22 @@ impl Ctx {
         // exactly once, here, not again by the next `mark_dead`.
         // A stale count (last flap > `FLAP_COUNT_STALE` ago) is
         // cleared without folding: it belongs to an old burst.
-        if !self.suppress_connected_notify.get() {
+        // B1 (PC-test Bug 1): the notify is about the BOARD, not
+        // the daemon link — this function runs whenever the
+        // UI↔daemon feed resumes, so the old code toasted
+        // "RSH connected / Live data is back" while the board was
+        // offline (the Overview already showed "Wheel not found").
+        // Gate on the seed's session `connect` verdict: only an
+        // Ok seed means the wheel is really connected. An Err seed
+        // stays silent here — F26 already reports non-Unreachable
+        // errors below, and the Overview banner covers
+        // Unreachable. The flap count is left alone when gated
+        // off: it describes daemon-link flaps and is folded into
+        // the next notify that actually fires (if still recent).
+        // The title says "Wheel connected" (the board), never
+        // "RSH connected" (the daemon link) — the two must not
+        // read as the same thing.
+        if seed.connect.is_ok() && !self.suppress_connected_notify.get() {
             let n = self.flap_count.get();
             let recent = self
                 .last_flap_at
@@ -4610,7 +4644,7 @@ impl Ctx {
             } else {
                 "Live data is back.".to_string()
             };
-            self.notify_success(win, "Connection", "RSH connected", &body);
+            self.notify_success(win, "Connection", "Wheel connected", &body);
             self.flap_count.set(0);
         }
         // The session `connect` already ran on the seed job's
@@ -10431,6 +10465,27 @@ mod tests {
         assert!(!user_text("Daemon x daemon y").contains("aemon"));
     }
 
+    /// B2: the toast cap keeps short text untouched, truncates long
+    /// text to `max` chars + "…", and never splits a multi-byte
+    /// char ("—"/"×" sit inside the cap boundary here). The
+    /// production caps are title 60 / body 120 (`set_toast`).
+    #[test]
+    fn toast_capped_keeps_short_truncates_long_char_safe() {
+        assert_eq!(
+            toast_capped("Live data is back.", 120),
+            "Live data is back."
+        );
+        let long = "Couldn't reach the wheel — the connection timed out after 10 s. Check the RSH-XXXX Wi-Fi is joined (or the USB cable is plugged in), then press Reconnect. If it still fails, restart RSH and try again.";
+        assert_eq!(long.chars().count(), 200);
+        let capped = toast_capped(long, 120);
+        assert_eq!(capped.chars().count(), 121);
+        assert!(capped.ends_with('…'));
+        assert!(capped.starts_with("Couldn't reach the wheel —"));
+        // Exactly at the cap: untouched, no ellipsis.
+        let exact: String = "×".repeat(120);
+        assert_eq!(toast_capped(&exact, 120), exact);
+    }
+
     #[test]
     fn mv_text_dash_for_no_reading() {
         assert_eq!(mv_text(0.0), "—");
@@ -11299,7 +11354,7 @@ mod tests {
     }
 
     /// F12/F5: a flap reconnect (down-episode < 10 s) stays silent
-    /// — no "RSH connected" notify — and the count survives; the
+    /// — no "Wheel connected" notify — and the count survives; the
     /// next non-flap reconnect folds "flapped ×1" into its notify
     /// and resets the count.
     #[test]
@@ -11414,7 +11469,7 @@ mod tests {
     /// `Unreachable` (no board — the expected disconnected state)
     /// must not notify "Reconnect failed"; a real transport
     /// failure still must. The flap-suppressed setup keeps the
-    /// "RSH connected" notify out of the count, so the only
+    /// "Wheel connected" notify out of the count, so the only
     /// notify under test is the Reconnect-failed one.
     #[test]
     #[cfg(unix)]
@@ -11474,7 +11529,7 @@ mod tests {
             },
         };
 
-        // Flap setup: down 5 s ago — the "RSH connected" notify
+        // Flap setup: down 5 s ago — the "Wheel connected" notify
         // is suppressed, so only a Reconnect-failed notify could
         // move the count.
         ctx.state.borrow_mut().live = true;
@@ -11513,6 +11568,142 @@ mod tests {
             "a real transport failure must notify once"
         );
         assert_eq!(last_title(), "Reconnect failed");
+
+        // Teardown: `mark_dead` drops the live link (F7) so the
+        // server thread ends when the client goes away.
+        ctx.mark_dead(&win);
+        drop(live_api);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ctx_dir);
+    }
+
+    /// B1 (PC-test Bug 1): a reconnect seed whose session `connect`
+    /// failed with `Unreachable` (board offline — the expected
+    /// disconnected state) must NOT toast "Wheel connected / Live
+    /// data is back": the daemon link coming back is not the board
+    /// connecting, and the Overview already shows "Wheel not
+    /// found". A seed whose `connect` is Ok (board really
+    /// connected) must still notify once, titled "Wheel connected"
+    /// — the daemon link and the board connection are different
+    /// things and must not read as one. Non-flap setup (down 60 s
+    /// ago) so the flap suppression cannot hide the result.
+    #[test]
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    fn reconnect_seed_unreachable_never_toasts_connected_but_ok_seed_does() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("B1 gate test skipped: no usable display/backend");
+            return;
+        };
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-b1-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let server = Arc::new(rsh_ipc::IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let live_api = IpcApi::connect(&sock).expect("connect");
+        let (ctx, ctx_dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let unread = || ctx.notifications.borrow().unread_count();
+        let last_title = || {
+            ctx.notifications
+                .borrow()
+                .to_model_items()
+                .into_iter()
+                .next_back()
+                .map(|item| item.title.as_str().to_string())
+                .unwrap_or_default()
+        };
+        let seed_with = |connect: Result<ConnectionInfo, UserError>| crate::ipc_api::LiveSeed {
+            backend: "vJoy".to_string(),
+            autostart: true,
+            connect,
+            wifi: WifiStatus {
+                ssid: None,
+                connected: false,
+                password_set: false,
+                board_mac: None,
+            },
+        };
+        let connected_info = ConnectionInfo {
+            state: ConnectionState::Active,
+            label: "Connected".to_string(),
+            transport: ApiTransport::Wifi,
+            address: "192.168.4.1".to_string(),
+            session_active: true,
+            board_reachable: true,
+            error: None,
+            hint: None,
+        };
+
+        // Non-flap setup: down 60 s ago — the connected notify is
+        // NOT suppressed, so a wrong toast would show up here.
+        ctx.state.borrow_mut().live = true;
+        ctx.down_since.set(Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("60 s ago exists"),
+        ));
+        let before = unread();
+        ctx.swap_to_live(live_api.clone());
+        assert!(
+            !ctx.suppress_connected_notify.get(),
+            "long episode must not suppress"
+        );
+        ctx.apply_reconnect_seed(
+            &win,
+            live_api.clone(),
+            seed_with(Err(UserError::from_connection(
+                ConnectionError::Unreachable,
+                "no board answered",
+            ))),
+        );
+        assert_eq!(
+            unread(),
+            before,
+            "a no-board reconnect must not notify 'Wheel connected'"
+        );
+        assert_eq!(
+            win.get_toast_text().as_str(),
+            "",
+            "a no-board reconnect must not show any toast"
+        );
+
+        // Board really connected: one notify + toast, titled for
+        // the wheel, not the daemon link.
+        ctx.apply_reconnect_seed(&win, live_api.clone(), seed_with(Ok(connected_info)));
+        assert_eq!(
+            unread(),
+            before + 1,
+            "a board-connected reconnect must notify once"
+        );
+        assert_eq!(last_title(), "Wheel connected");
+        assert!(
+            win.get_toast_text().as_str().contains("Live data is back"),
+            "the connected toast must show, got: {}",
+            win.get_toast_text()
+        );
 
         // Teardown: `mark_dead` drops the live link (F7) so the
         // server thread ends when the client goes away.
