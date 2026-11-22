@@ -22,6 +22,9 @@ struct StubApi {
     output: Mutex<bool>,
     tunings: Mutex<BTreeMap<String, TuningSettings>>,
     dirty: Mutex<BTreeSet<String>>,
+    /// In-memory shifter sensitivity (`None` = no shifter
+    /// configured, like a factory board).
+    sensitivity: Mutex<Option<u8>>,
 }
 
 impl StubApi {
@@ -111,6 +114,32 @@ impl AppApi for StubApi {
         }
         Ok(tuning.clone())
     }
+    fn shifter_sensitivity(&self) -> Result<Option<u8>, UserError> {
+        Ok(*self
+            .sensitivity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    fn set_shifter_sensitivity(&self, sensitivity: u8) -> Result<u8, UserError> {
+        if sensitivity > 100 {
+            return Err(UserError::from_connection(
+                rsh_api::ConnectionError::Unknown,
+                format!("shifter sensitivity {sensitivity} is outside 0..=100"),
+            ));
+        }
+        let mut slot = self
+            .sensitivity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            return Err(UserError::from_connection(
+                rsh_api::ConnectionError::Unknown,
+                "no shifter is configured on the board — assign shifter pins in the pin map first",
+            ));
+        }
+        *slot = Some(sensitivity);
+        Ok(sensitivity)
+    }
     fn draft_status(&self) -> Option<DraftStatus> {
         let dirty_modules: Vec<String> = self
             .dirty
@@ -194,6 +223,52 @@ async fn assert_tuning_round_trip(client: &IpcClient) {
     assert!(status.is_null(), "draft clean after save, got {status}");
 }
 
+async fn assert_shifter_sensitivity_round_trip(client: &IpcClient) {
+    // SH1: the shifter sensitivity rides the IPC methods, not
+    // `set_tuning` — read → write → read, over the same socket.
+    let got = client
+        .call("shifter_sensitivity", serde_json::json!({}))
+        .await
+        .expect("shifter_sensitivity");
+    assert_eq!(
+        got.get("sensitivity").and_then(serde_json::Value::as_u64),
+        Some(50)
+    );
+    let applied = client
+        .call(
+            "set_shifter_sensitivity",
+            serde_json::json!({"sensitivity": 70}),
+        )
+        .await
+        .expect("set_shifter_sensitivity");
+    assert_eq!(
+        applied
+            .get("sensitivity")
+            .and_then(serde_json::Value::as_u64),
+        Some(70)
+    );
+    let got = client
+        .call("shifter_sensitivity", serde_json::json!({}))
+        .await
+        .expect("shifter_sensitivity after write");
+    assert_eq!(
+        got.get("sensitivity").and_then(serde_json::Value::as_u64),
+        Some(70)
+    );
+    // Out-of-range values are rejected, never clamped.
+    let err = client
+        .call(
+            "set_shifter_sensitivity",
+            serde_json::json!({"sensitivity": 101}),
+        )
+        .await
+        .expect_err("101 must be rejected");
+    assert!(
+        format!("{err:?}").contains("outside 0..=100"),
+        "unexpected error: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn ipc_round_trip_ping_version_connection_and_event() {
     let dir = std::env::temp_dir().join(format!("rsh-ipc-test-{}", std::process::id()));
@@ -204,6 +279,7 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
         output: Mutex::new(false),
         tunings: Mutex::new(BTreeMap::new()),
         dirty: Mutex::new(BTreeSet::new()),
+        sensitivity: Mutex::new(Some(50)),
     });
     let (event_tx, _rx) = broadcast::channel(64);
     let server = Arc::new(IpcServer::new(Arc::clone(&api), event_tx.clone()));
@@ -287,6 +363,9 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
     // L4 tuning round-trip over the same socket: set → get → draft
     // → save → clean.
     assert_tuning_round_trip(&client).await;
+
+    // SH1 shifter sensitivity round-trip over the same socket.
+    assert_shifter_sensitivity_round_trip(&client).await;
 
     serve.abort();
     let _ = std::fs::remove_dir_all(&dir);

@@ -780,6 +780,40 @@ pub trait AppApi: Send + Sync {
     /// active profile to draft against.
     fn set_tuning(&self, tuning: &TuningSettings) -> Result<TuningSettings, UserError>;
 
+    /// Shifter sensitivity (SH1, 0..100) from the board config blob
+    /// — the `SHIFTER` record's `params[4]` — or [`None`] when the
+    /// board has no shifter configured. This is a board-config
+    /// value, NOT a `set_tuning` field: the firmware reads it from
+    /// the config blob (`rsh_shifter_debounce_ms`: 0 → 20 ms,
+    /// 50 → 13 ms, 100 → 5 ms). Default: `Ok(None)` — only the
+    /// daemon reads it.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the board cannot be reached.
+    fn shifter_sensitivity(&self) -> Result<Option<u8>, UserError> {
+        Ok(None)
+    }
+
+    /// Write the shifter sensitivity (SH1, 0..100) into the board
+    /// config blob: read → set `params[4]` → stage → commit →
+    /// confirm (the config transaction path). The firmware applies
+    /// the new debounce on COMMIT, with no reboot. Returns the
+    /// applied sensitivity. Default: error — only the daemon writes
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the sensitivity is outside 0..=100, no
+    /// shifter is configured on the board, or the board cannot be
+    /// reached / rejects the transaction.
+    fn set_shifter_sensitivity(&self, _sensitivity: u8) -> Result<u8, UserError> {
+        Err(UserError::from_connection(
+            ConnectionError::Unknown,
+            "setting the shifter sensitivity is not supported by this API",
+        ))
+    }
+
     /// Draft status for the Save / Discard prompt; [`None`] when no
     /// draft exists (nothing edited since the last save or switch).
     fn draft_status(&self) -> Option<DraftStatus>;

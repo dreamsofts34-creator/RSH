@@ -244,6 +244,16 @@ export component MainWindow inherits Window {
     in property <bool> handbrake-pressed: false;
     in property <bool> extras-calibration-disabled: true;
     in property <int> shifter-mode: 0;
+    // Shifter tuning (SH1/SH2): sensitivity is a board-config
+    // value (0..1 = 0..100%), read once from the board — disabled
+    // with a reason until the read lands or no shifter is
+    // configured; lockout is a `set_tuning` field (0..1 = 0..200 ms).
+    in property <float> shifter-sensitivity: 0.5;
+    in property <string> shifter-sensitivity-text: "50%";
+    in property <bool> sensitivity-disabled: true;
+    in property <string> shifter-sensitivity-reason: "Reading the shifter setting…";
+    in property <float> shifter-lockout: 0.25;
+    in property <string> shifter-lockout-text: "50 ms";
     in property <string> horn-button: "Not set";
     in property <bool> horn-learning: false;
     in property <bool> horn-pressed: false;
@@ -439,6 +449,10 @@ export component MainWindow inherits Window {
     callback extras-handbrake-feel(int);
     callback extras-handbrake-deadzone(float);
     callback extras-handbrake-deadzone-edited(string);
+    callback extras-shifter-sensitivity(float);
+    callback extras-shifter-sensitivity-edited(string);
+    callback extras-shifter-lockout(float);
+    callback extras-shifter-lockout-edited(string);
     callback extras-led-pattern(int);
     callback extras-led-brightness(float);
     callback extras-led-brightness-edited(string);
@@ -905,6 +919,12 @@ export component MainWindow inherits Window {
                 calibration-disabled: extras-calibration-disabled;
                 gear: gear;
                 shifter-mode: shifter-mode;
+                shifter-sensitivity: shifter-sensitivity;
+                shifter-sensitivity-text: shifter-sensitivity-text;
+                sensitivity-disabled: sensitivity-disabled;
+                shifter-sensitivity-reason: shifter-sensitivity-reason;
+                shifter-lockout: shifter-lockout;
+                shifter-lockout-text: shifter-lockout-text;
                 horn-button: horn-button;
                 horn-learning: horn-learning;
                 horn-pressed: horn-pressed;
@@ -924,7 +944,10 @@ export component MainWindow inherits Window {
                 handbrake-feel-selected(f) => { extras-handbrake-feel(f); }
                 handbrake-deadzone-changed(v) => { extras-handbrake-deadzone(v); }
                 handbrake-deadzone-edited(t) => { extras-handbrake-deadzone-edited(t); }
-                shifter-sensitivity-changed(v) => { extras-action("shifter-sensitivity"); }
+                shifter-sensitivity-changed(v) => { extras-shifter-sensitivity(v); }
+                shifter-sensitivity-edited(t) => { extras-shifter-sensitivity-edited(t); }
+                shifter-lockout-changed(v) => { extras-shifter-lockout(v); }
+                shifter-lockout-edited(t) => { extras-shifter-lockout-edited(t); }
                 led-pattern-selected(i) => { extras-led-pattern(i); }
                 led-brightness-changed(v) => { extras-led-brightness(v); }
                 led-brightness-edited(t) => { extras-led-brightness-edited(t); }

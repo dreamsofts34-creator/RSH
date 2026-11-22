@@ -781,6 +781,83 @@ pub fn config_json_to_blob(value: &serde_json::Value) -> Result<ConfigBlob, Stri
     Ok(decoded)
 }
 
+/// Shifter sensitivity (`SHIFTER` record `params[4]`, 0..100) of a
+/// `get_config` JSON blob — [`None`] when the board has no SHIFTER
+/// record (no shifter configured; the firmware default 50 then
+/// applies on the board, but there is nothing to edit). Mirrors
+/// [`rsh_protocol::pin::shifter_sensitivity`] on the decoded blob;
+/// this is the JSON-side read for the daemon API, which only ever
+/// sees the `get_config` shape. A stored value above 100 (a blob
+/// that could never validate) reads as [`None`], never as a lie.
+#[must_use]
+pub fn shifter_sensitivity_from_config(config: &serde_json::Value) -> Option<u8> {
+    let records = config.get("records")?.as_array()?;
+    let record = records.iter().find(|record| {
+        record.get("type").and_then(serde_json::Value::as_u64)
+            == Some(u64::from(record_type::SHIFTER))
+    })?;
+    let params = record.get("params")?.as_array()?;
+    let sensitivity = params
+        .get(rsh_protocol::SHIFTER_SENSITIVITY_PARAM)?
+        .as_u64()?;
+    u8::try_from(sensitivity)
+        .ok()
+        .filter(|sensitivity| *sensitivity <= 100)
+}
+
+/// Set the shifter sensitivity (`SHIFTER` record `params[4]`) in a
+/// `get_config` JSON blob, returning a new value with everything
+/// else verbatim (records, buttons, `cfgVersion`) — the shape
+/// `stage_config` accepts. This is the SH1 write: the UI slider's
+/// 0–100 value lands in the board config blob, and the firmware
+/// applies the new debounce (`rsh_shifter_debounce_ms`) on COMMIT
+/// with no reboot (`inputs_apply_config_blob` re-reads it before
+/// its pinmap early-return).
+///
+/// # Errors
+///
+/// Returns a message when the sensitivity is outside 0..=100 or
+/// the blob has no SHIFTER record — a board with no shifter
+/// configured has nowhere to store it, so the slider stays
+/// disabled instead of inventing a record with unknown pins.
+pub fn set_shifter_sensitivity_in_config(
+    config: &serde_json::Value,
+    sensitivity: u8,
+) -> Result<serde_json::Value, String> {
+    if sensitivity > 100 {
+        return Err(format!(
+            "shifter sensitivity {sensitivity} is outside 0..=100"
+        ));
+    }
+    let mut updated = config.clone();
+    let Some(records) = updated
+        .get_mut("records")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Err("config has no 'records' list".to_string());
+    };
+    let Some(record) = records.iter_mut().find(|record| {
+        record.get("type").and_then(serde_json::Value::as_u64)
+            == Some(u64::from(record_type::SHIFTER))
+    }) else {
+        return Err(
+            "no shifter is configured on the board — assign shifter pins in the pin map first"
+                .to_string(),
+        );
+    };
+    let Some(params) = record
+        .get_mut("params")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Err("shifter record has no 'params' list".to_string());
+    };
+    let Some(slot) = params.get_mut(rsh_protocol::SHIFTER_SENSITIVITY_PARAM) else {
+        return Err("shifter record params are shorter than 5 entries".to_string());
+    };
+    *slot = serde_json::Value::from(sensitivity);
+    Ok(updated)
+}
+
 /// Validate a signed firmware image file (Setup wizard upload gate).
 ///
 /// Reads the file and runs [`verify_firmware_image`] with current
@@ -2011,6 +2088,55 @@ mod tests {
         );
         let back = config_json_to_blob(&json).expect("round-trip succeeds");
         assert_eq!(back, blob);
+    }
+
+    #[test]
+    fn shifter_sensitivity_config_helpers_round_trip() {
+        // The factory blob has no SHIFTER record: no sensitivity
+        // to read, and the write refuses instead of inventing one.
+        let factory = config_blob_to_json(&rsh_protocol::factory_default_blob());
+        assert_eq!(shifter_sensitivity_from_config(&factory), None);
+        let err = set_shifter_sensitivity_in_config(&factory, 70)
+            .expect_err("no SHIFTER record must refuse");
+        assert!(err.contains("no shifter is configured"), "{err}");
+        // With a sequential SHIFTER record (params[4] = 50), the
+        // read returns 50 and the write changes only params[4].
+        let mut blob = rsh_protocol::factory_default_blob();
+        let mut shifter = ConfigRecord::new(record_type::SHIFTER, 0, 25, 26, 14);
+        shifter.params[0] = 0; // sequential
+        shifter.params[4] = 50;
+        blob.records.push(shifter);
+        let json = config_blob_to_json(&blob);
+        assert_eq!(shifter_sensitivity_from_config(&json), Some(50));
+        let updated = set_shifter_sensitivity_in_config(&json, 70).expect("write 70");
+        assert_eq!(shifter_sensitivity_from_config(&updated), Some(70));
+        // Everything else is verbatim: same version, same records
+        // except the one params entry, same buttons view.
+        assert_eq!(updated["cfgVersion"], json["cfgVersion"]);
+        assert_eq!(updated["buttons"], json["buttons"]);
+        assert_eq!(
+            updated["records"].as_array().map(Vec::len),
+            json["records"].as_array().map(Vec::len)
+        );
+        for (before, after) in json["records"]
+            .as_array()
+            .expect("records")
+            .iter()
+            .zip(updated["records"].as_array().expect("records").iter())
+        {
+            if before["type"] == record_type::SHIFTER {
+                assert_eq!(after["params"][4], 70);
+                assert_eq!(after["params"][0], before["params"][0]);
+            } else {
+                assert_eq!(after, before);
+            }
+        }
+        // Out-of-range values are rejected, never clamped.
+        let err = set_shifter_sensitivity_in_config(&json, 101).expect_err("101 must be rejected");
+        assert!(err.contains("outside 0..=100"), "{err}");
+        // The mutated JSON still rebuilds to a valid blob.
+        let rebuilt = config_json_to_blob(&updated).expect("mutated config rebuilds");
+        assert_eq!(rsh_protocol::pin::shifter_sensitivity(&rebuilt), 70);
     }
 
     #[test]

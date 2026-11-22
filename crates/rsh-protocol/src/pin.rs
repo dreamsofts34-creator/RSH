@@ -631,7 +631,7 @@ const HANDBRAKE_SLOT: u8 = 4;
 
 /// Shifter sensitivity: `SHIFTER` record `params[4]` (v4.0.2 D-4),
 /// 0..100; default 50 when no SHIFTER record exists.
-const SHIFTER_SENSITIVITY_PARAM: usize = 4;
+pub const SHIFTER_SENSITIVITY_PARAM: usize = 4;
 /// Default shifter sensitivity (→ 13 ms debounce, see
 /// [`shifter_debounce_ms`]).
 const SHIFTER_SENSITIVITY_DEFAULT: u8 = 50;

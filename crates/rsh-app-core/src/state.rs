@@ -6320,6 +6320,7 @@ impl AppStateCore {
     /// point, horn button, LED brightness/pattern) are read back from
     /// the stored tuning instead of hardcoded `None`/0–3300.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn get_tuning(&self, module: &str) -> TuningSettings {
         let module = canonical_module_id(module);
         if let Some(tuning) = lock(&self.tunings).get(&module) {
@@ -6406,6 +6407,10 @@ impl AppStateCore {
                 encoder_accel: Some(stored.encoder_accel.unwrap_or(false)),
                 encoder_accel_sensitivity: Some(stored.encoder_accel_sensitivity.unwrap_or(1.0)),
                 encoder_invert_mask: Some(stored.encoder_invert_mask.unwrap_or(0)),
+                // --- Shifter per-module tuning ---
+                // Old profiles carry no lockout: the 50 ms default
+                // applies (`Some(0.0)` = off, once set).
+                shift_lockout_ms: Some(stored.shift_lockout_ms.unwrap_or(50.0)),
             };
         }
         let (invert, steering_lock_deg, steering_balance_pct, steering_center_trim_pct) =
@@ -6459,6 +6464,8 @@ impl AppStateCore {
             encoder_accel: Some(false),
             encoder_accel_sensitivity: Some(1.0),
             encoder_invert_mask: Some(0),
+            // --- Shifter per-module tuning ---
+            shift_lockout_ms: Some(50.0),
         }
     }
 
@@ -6554,6 +6561,8 @@ impl AppStateCore {
                 encoder_accel: None,
                 encoder_accel_sensitivity: None,
                 encoder_invert_mask: None,
+                // --- Shifter per-module tuning ---
+                shift_lockout_ms: None,
             });
         entry.deadzone = tuning.deadzone / 100.0;
         entry.curve_strength = (tuning.curve - 1.0).clamp(-1.0, 1.0);
@@ -6608,6 +6617,8 @@ impl AppStateCore {
         entry.encoder_accel = tuning.encoder_accel;
         entry.encoder_accel_sensitivity = tuning.encoder_accel_sensitivity;
         entry.encoder_invert_mask = tuning.encoder_invert_mask;
+        // --- Shifter per-module tuning ---
+        entry.shift_lockout_ms = tuning.shift_lockout_ms;
         if let Some(gate) = tuning.shifter_gate {
             entry.gate_mode = match gate {
                 ShifterGate::Sequential => "Sequential".to_string(),
@@ -6871,6 +6882,8 @@ impl AppStateCore {
             accel_enabled: tuning.encoder_accel.unwrap_or(false),
             accel_sensitivity: tuning.encoder_accel_sensitivity.unwrap_or(1.0) as f32,
             encoder_invert_mask: tuning.encoder_invert_mask.unwrap_or(0),
+            // --- Shifter per-module tuning ---
+            shift_lockout_ms: tuning.shift_lockout_ms.unwrap_or(50.0) as f32,
         }
     }
 
@@ -10554,6 +10567,41 @@ mod tests {
         assert_eq!(stored.encoder_accel, Some(true));
         assert_eq!(stored.encoder_accel_sensitivity, Some(1.5));
         assert_eq!(stored.encoder_invert_mask, Some(0b0010));
+    }
+
+    #[test]
+    fn shifter_lockout_round_trips_and_old_profiles_get_default() {
+        let (state, _dir) = test_state();
+        let _ = activate_first_profile(&state);
+        // No stored shifter entry yet: the 50 ms default applies —
+        // an old profile without the field loads the same way.
+        let neutral = state.get_tuning("shifter");
+        assert_eq!(neutral.shift_lockout_ms, Some(50.0));
+        // Invalid values are rejected, never stored.
+        let mut bad = neutral.clone();
+        bad.shift_lockout_ms = Some(201.0);
+        assert!(state.set_tuning(&bad).is_err());
+        assert_eq!(state.get_tuning("shifter").shift_lockout_ms, Some(50.0));
+        // Valid values store, survive a get, and reach the live
+        // pipeline plan.
+        let mut tuning = neutral.clone();
+        tuning.shift_lockout_ms = Some(120.0);
+        let saved = state.set_tuning(&tuning).expect("valid shifter tuning");
+        assert_eq!(saved.shift_lockout_ms, Some(120.0));
+        assert_eq!(state.get_tuning("shifter").shift_lockout_ms, Some(120.0));
+        let plan = state.build_pipeline_plan();
+        assert_eq!(plan.shifter.shift_lockout_ms, 120.0);
+        // Save persists it into the profile on disk; 0 (off) too.
+        assert!(state.save_draft().expect("save draft"));
+        let stored = lock(&state.store)
+            .active()
+            .and_then(|active| active.profile.module_tunings.get("shifter").cloned());
+        let stored = stored.expect("stored shifter entry");
+        assert_eq!(stored.shift_lockout_ms, Some(120.0));
+        let mut tuning = state.get_tuning("shifter");
+        tuning.shift_lockout_ms = Some(0.0);
+        state.set_tuning(&tuning).expect("lockout off");
+        assert_eq!(state.build_pipeline_plan().shifter.shift_lockout_ms, 0.0);
     }
 
     /// L4 draft/save: Save persists the draft (and only the draft),

@@ -220,6 +220,13 @@ pub struct TuningSettings {
     /// Shifter gate type (shifter module only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shifter_gate: Option<ShifterGate>,
+    // --- Shifter per-module tuning ---
+    /// Shift lockout in ms (SH2, shifter module only): new gear
+    /// inputs within this long of the last accepted shift are
+    /// ignored — 0–200 (default 50). `0` = off. Kills gate-bounce
+    /// double-shifts in H-pattern and double-taps in sequential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shift_lockout_ms: Option<f64>,
     /// Button number (1–32) the horn is bound to (horn module only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub horn_button: Option<u8>,
@@ -306,6 +313,8 @@ impl TuningSettings {
             // --- Brake per-module tuning ---
             saturation: None,
             shifter_gate: None,
+            // --- Shifter per-module tuning ---
+            shift_lockout_ms: None,
             horn_button: None,
             led_brightness: None,
             led_pattern: None,
@@ -335,6 +344,7 @@ impl TuningSettings {
 /// `clampEndpoints` enforces — the backend re-checks it, never trusting
 /// the UI alone.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
     let mut errors = Vec::new();
     if tuning.module.trim().is_empty() {
@@ -404,6 +414,14 @@ pub fn validate_tuning(tuning: &TuningSettings) -> Vec<String> {
         && !(1..=32).contains(&button)
     {
         errors.push(format!("horn_button {button} is outside 1..=32"));
+    }
+    // --- Shifter per-module tuning ---
+    if let Some(lockout_ms) = tuning.shift_lockout_ms
+        && !(0.0..=200.0).contains(&lockout_ms)
+    {
+        errors.push(format!(
+            "shift_lockout_ms {lockout_ms} is outside 0..=200 (ms)"
+        ));
     }
     if let Some(brightness) = tuning.led_brightness
         && brightness > 100
@@ -665,6 +683,33 @@ mod tests {
             errors.iter().any(|e| e.contains("encoder_invert_mask")),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn shifter_lockout_round_trips_and_validates() {
+        let mut settings = tuning("shifter");
+        settings.shift_lockout_ms = Some(120.0);
+        assert_eq!(validate_tuning(&settings), Vec::<String>::new());
+        let json = serde_json::to_string(&settings).expect("serialize");
+        assert!(json.contains("\"shiftLockoutMs\":120.0"), "{json}");
+        let back: TuningSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, settings);
+        // Other modules never carry it: omitted from the JSON.
+        let json = serde_json::to_string(&tuning("brake")).expect("serialize");
+        assert!(!json.contains("shiftLockoutMs"), "{json}");
+        // Out-of-range values are rejected, never silently clamped
+        // here; 0 (off) and 200 (max) are valid.
+        let mut bad = tuning("shifter");
+        bad.shift_lockout_ms = Some(201.0);
+        let errors = validate_tuning(&bad);
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].contains("shift_lockout_ms"), "{}", errors[0]);
+        let mut off = tuning("shifter");
+        off.shift_lockout_ms = Some(0.0);
+        assert_eq!(validate_tuning(&off), Vec::<String>::new());
+        let mut max = tuning("shifter");
+        max.shift_lockout_ms = Some(200.0);
+        assert_eq!(validate_tuning(&max), Vec::<String>::new());
     }
 
     #[test]

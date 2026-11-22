@@ -264,6 +264,12 @@ pub struct PerModuleTuning {
     /// only), bits 0–3. `None` = never set — 0 (no invert) applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_invert_mask: Option<u8>,
+    // --- Shifter per-module tuning ---
+    /// Shift lockout in ms (SH2, shifter module only), 0–200.
+    /// `None` = never set (old profile) — the 50 ms default applies.
+    /// `Some(0.0)` = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shift_lockout_ms: Option<f64>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -550,6 +556,8 @@ impl Default for PerModuleTuning {
             encoder_accel: None,
             encoder_accel_sensitivity: None,
             encoder_invert_mask: None,
+            // --- Shifter per-module tuning ---
+            shift_lockout_ms: None,
         }
     }
 }
