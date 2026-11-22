@@ -112,6 +112,12 @@ pub struct ModuleTuning {
     pub release_ms: f32,
     /// Shifter gate mode (only the shifter module reads this).
     pub gate_mode: ShifterGateMode,
+    // --- Shifter per-module tuning ---
+    /// Shift lockout in ms (SH2, shifter only): new gear inputs
+    /// within this long of the last accepted shift are ignored,
+    /// `0..=200` (default `50`; `0` = off). Kills gate-bounce
+    /// double-shifts in H-pattern and double-taps in sequential.
+    pub shift_lockout_ms: f32,
     /// Clutch bite point, `0..=1` (clutch / brake only; `0.0` =
     /// none). The pedal output stays `0.0` until the mapped travel
     /// passes the bite point, then ramps `(value - bite) / (1 - bite)`
@@ -179,6 +185,8 @@ impl Default for ModuleTuning {
             press_ms: 150.0,
             release_ms: 100.0,
             gate_mode: ShifterGateMode::Sequential,
+            // --- Shifter per-module tuning ---
+            shift_lockout_ms: 50.0,
             bite_point: 0.0,
             // --- Brake per-module tuning ---
             saturation: 1.0,
@@ -223,6 +231,8 @@ impl ModuleTuning {
             clamp_finite(self.release_ms, 10.0, 2000.0, 100.0)
         };
         out.bite_point = clamp_finite(self.bite_point, 0.0, 1.0, 0.0);
+        // --- Shifter per-module tuning ---
+        out.shift_lockout_ms = clamp_finite(self.shift_lockout_ms, 0.0, 200.0, 50.0);
         // --- Brake per-module tuning ---
         out.saturation = clamp_finite(self.saturation, 0.5, 1.0, 1.0);
         // --- Encoder per-module tuning ---
@@ -652,6 +662,23 @@ pub struct ProcessingPipeline {
     /// press that started within `double_press_ms` of the previous
     /// release). Clears per-bit on release.
     button_double_hold: u32,
+    /// SH2 last accepted H-pattern gear (0 = neutral): the lockout
+    /// holds the output at this gear while the window is open.
+    shift_last_gear: u8,
+    /// SH2 lockout ticks left (incl. the current tick's countdown):
+    /// a new gear / up-down edge is ignored while this is nonzero.
+    /// One tick is 5 ms at 200 Hz, like the encoder pulse (E1).
+    shift_lockout_left: u8,
+    /// SH2 previous sequential up/down bits (bits 0/1): a shift is
+    /// a rising edge against these, so a press held through the
+    /// window emits nothing more.
+    shift_prev_seq: u32,
+    /// SH2 rejected sequential presses (bits 0/1): a press whose
+    /// edge landed inside the window stays suppressed while held —
+    /// otherwise the held bit would leak through on the very next
+    /// tick (no new edge) and the double-tap would land anyway.
+    /// Releasing the press clears its suppression.
+    shift_suppressed_seq: u32,
 }
 
 impl Default for ProcessingPipeline {
@@ -693,6 +720,11 @@ impl ProcessingPipeline {
             button_last_release_tick: [0; 32],
             button_prev_buttons: 0,
             button_double_hold: 0,
+            // --- Shifter per-module tuning ---
+            shift_last_gear: 0,
+            shift_lockout_left: 0,
+            shift_prev_seq: 0,
+            shift_suppressed_seq: 0,
             plan,
         }
     }
@@ -750,6 +782,11 @@ impl ProcessingPipeline {
         self.button_last_release_tick = [0; 32];
         self.button_prev_buttons = 0;
         self.button_double_hold = 0;
+        // --- Shifter per-module tuning ---
+        self.shift_last_gear = 0;
+        self.shift_lockout_left = 0;
+        self.shift_prev_seq = 0;
+        self.shift_suppressed_seq = 0;
     }
 
     /// Process one stream frame into an [`OutputState`].
@@ -825,18 +862,34 @@ impl ProcessingPipeline {
 
         // Shifter: H-pattern gear decode (bits 5–10) or sequential
         // up/down (bits 0/1). Gear bits never reach the button word.
+        // SH2: the lockout ignores a new gear / up-down edge within
+        // `shift_lockout_ms` of the last accepted shift (gate-bounce
+        // double-shifts, sequential double-taps). The window counts
+        // in 5 ms ticks like the encoder pulse (E1) and ticks down
+        // once per processed frame — a gap (`skipped`) does not
+        // fast-forward it, same as the pulse. A gear still engaged
+        // after the window ends is accepted on the next tick, so
+        // only transient bounces are killed, never a real shift.
         match self.plan.shifter.gate_mode {
             ShifterGateMode::HPattern => {
-                out.gear = if self.plan.shifter.enabled {
-                    decode_gear(buttons)
+                if self.plan.shifter.enabled {
+                    let gear = decode_gear(buttons);
+                    out.gear = self.apply_shift_lockout_h(gear);
                 } else {
-                    0
-                };
+                    out.gear = 0;
+                    self.shift_last_gear = 0;
+                    self.shift_lockout_left = 0;
+                }
                 buttons &= !GEAR_BITS_MASK;
             }
             ShifterGateMode::Sequential => {
-                if !self.plan.shifter.enabled {
+                if self.plan.shifter.enabled {
+                    buttons = self.apply_shift_lockout_seq(buttons);
+                } else {
                     buttons &= !SHIFTER_SEQ_BITS;
+                    self.shift_prev_seq = 0;
+                    self.shift_suppressed_seq = 0;
+                    self.shift_lockout_left = 0;
                 }
             }
         }
@@ -911,6 +964,50 @@ impl ProcessingPipeline {
             // Disabled: a held pulse must not survive to re-enable.
             self.encoder_pulse = [0; MAX_ENCODERS * 2];
         }
+    }
+
+    /// SH2, H-pattern side: accept `gear` unless it differs from
+    /// the last accepted gear while the lockout window is still
+    /// open — then the output holds the last accepted gear. The
+    /// window ticks down once per processed frame; an accepted
+    /// change restarts it. A level (not an edge) is decoded, so a
+    /// gear still engaged after the window ends is accepted on the
+    /// next tick.
+    fn apply_shift_lockout_h(&mut self, gear: u8) -> u8 {
+        self.shift_lockout_left = self.shift_lockout_left.saturating_sub(1);
+        if gear != self.shift_last_gear {
+            if self.shift_lockout_left > 0 {
+                return self.shift_last_gear;
+            }
+            self.shift_last_gear = gear;
+            self.shift_lockout_left = shift_lockout_ticks(self.plan.shifter.shift_lockout_ms);
+        }
+        self.shift_last_gear
+    }
+
+    /// SH2, sequential side: a shift is a rising edge on bit 0/1.
+    /// An edge inside the lockout window is rejected — and the
+    /// rejected press stays suppressed while held (a held bit would
+    /// otherwise leak through on the very next tick, when there is
+    /// no new edge, and the double-tap would land anyway). Releasing
+    /// the press clears its suppression, so the next real tap can
+    /// fire. An accepted edge restarts the window.
+    fn apply_shift_lockout_seq(&mut self, buttons: u32) -> u32 {
+        self.shift_lockout_left = self.shift_lockout_left.saturating_sub(1);
+        let seq = buttons & SHIFTER_SEQ_BITS;
+        let edges = seq & !self.shift_prev_seq;
+        self.shift_prev_seq = seq;
+        // A rejected press stays suppressed while held; releasing it
+        // clears the suppression.
+        self.shift_suppressed_seq &= seq;
+        if edges != 0 {
+            if self.shift_lockout_left > 0 {
+                self.shift_suppressed_seq |= edges;
+            } else {
+                self.shift_lockout_left = shift_lockout_ticks(self.plan.shifter.shift_lockout_ms);
+            }
+        }
+        buttons & !self.shift_suppressed_seq
     }
 
     /// E2 (+E3/E4): turn raw glitch-filtered deltas into emitted steps.
@@ -1077,6 +1174,15 @@ impl ProcessingPipeline {
         self.button_prev_buttons = buttons;
         self.button_double_hold
     }
+}
+
+/// Shift-lockout window in ticks (SH2): one tick is 5 ms at
+/// 200 Hz, so the 0–200 ms range is 0–40 ticks (`0` = off). The
+/// clamp to `0..=40` makes both casts safe.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn shift_lockout_ticks(lockout_ms: f32) -> u8 {
+    ((lockout_ms / 5.0).round().clamp(0.0, 40.0)) as u8
 }
 
 /// Encoder pulse hold in ticks for a `pulse_ms` setting (E1): one
@@ -1385,7 +1491,7 @@ mod tests {
     use super::{
         DT_S, INPUT_FREQ_HZ, OneEuroFilter, OutputState, PipelinePlan, ProcessingPipeline,
         ShifterGateMode, apply_curve, apply_deadzone_bipolar, apply_deadzone_unipolar,
-        apply_steering_scale, decode_gear, map_pedal_mv, map_steering_mv,
+        apply_steering_scale, decode_gear, map_pedal_mv, map_steering_mv, shift_lockout_ticks,
     };
     use rsh_protocol::{StreamFlags, StreamFrame};
 
@@ -1884,6 +1990,9 @@ mod tests {
 
         let mut plan = plain_plan();
         plan.shifter.gate_mode = ShifterGateMode::HPattern;
+        // Pure decode here — the lockout (SH2) is off, so a gear
+        // change on the very next tick is not held.
+        plan.shifter.shift_lockout_ms = 0.0;
         let mut pipe = ProcessingPipeline::new(plan);
         // Gear bit 7 (gear 3) plus a wheel button (bit 0): gear
         // decodes, gear bits are stripped, bit 0 survives.
@@ -1894,6 +2003,78 @@ mod tests {
         let out = pipe.process(&frame(&[], &[], (1 << 5) | (1 << 6)));
         assert_eq!(out.gear, 0);
         assert_eq!(out.buttons, 0);
+    }
+
+    #[test]
+    fn shifter_lockout_kills_h_pattern_bounce() {
+        let mut plan = plain_plan();
+        plan.shifter.gate_mode = ShifterGateMode::HPattern;
+        plan.shifter.shift_lockout_ms = 50.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        // Gear 3 engages: accepted at once.
+        let out = pipe.process(&frame(&[], &[], 1 << 7));
+        assert_eq!(out.gear, 3);
+        // A bounce to gear 4 inside the 50 ms window is ignored…
+        for _ in 0..9 {
+            let out = pipe.process(&frame(&[], &[], 1 << 8));
+            assert_eq!(out.gear, 3);
+        }
+        // …but the same gear, still engaged after the window, is accepted.
+        let out = pipe.process(&frame(&[], &[], 1 << 8));
+        assert_eq!(out.gear, 4);
+        // And the window restarts on the accepted shift: a bounce
+        // back to gear 3 is ignored again until it expires.
+        let out = pipe.process(&frame(&[], &[], 1 << 7));
+        assert_eq!(out.gear, 4);
+    }
+
+    #[test]
+    fn shifter_lockout_kills_sequential_double_tap() {
+        let mut plan = plain_plan();
+        plan.shifter.shift_lockout_ms = 50.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        // Shift up: passes.
+        let out = pipe.process(&frame(&[], &[], 0b01));
+        assert_eq!(out.buttons, 0b01);
+        // Release, then a second tap inside the window: dropped.
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert_eq!(out.buttons, 0);
+        let out = pipe.process(&frame(&[], &[], 0b01));
+        assert_eq!(out.buttons, 0);
+        // Held through the window, the rejected press stays
+        // suppressed — it never leaks through as a late shift.
+        for _ in 0..9 {
+            let out = pipe.process(&frame(&[], &[], 0b01));
+            assert_eq!(out.buttons, 0);
+        }
+        // Release clears the suppression; a fresh tap past the
+        // window passes.
+        let out = pipe.process(&frame(&[], &[], 0));
+        assert_eq!(out.buttons, 0);
+        let out = pipe.process(&frame(&[], &[], 0b01));
+        assert_eq!(out.buttons, 0b01);
+    }
+
+    #[test]
+    fn shifter_lockout_zero_is_off_and_sanitizes() {
+        // 0 ms = off: rapid gear changes all pass through.
+        let mut plan = plain_plan();
+        plan.shifter.gate_mode = ShifterGateMode::HPattern;
+        plan.shifter.shift_lockout_ms = 0.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[], &[], 1 << 7));
+        assert_eq!(out.gear, 3);
+        let out = pipe.process(&frame(&[], &[], 1 << 8));
+        assert_eq!(out.gear, 4);
+        // Sanitizer: 500 clamps to 200, NaN falls back to 50.
+        let mut plan = plain_plan();
+        plan.shifter.shift_lockout_ms = 500.0;
+        assert_eq!(plan.sanitized().shifter.shift_lockout_ms, 200.0);
+        plan.shifter.shift_lockout_ms = f32::NAN;
+        assert_eq!(plan.sanitized().shifter.shift_lockout_ms, 50.0);
+        assert_eq!(shift_lockout_ticks(50.0), 10);
+        assert_eq!(shift_lockout_ticks(0.0), 0);
+        assert_eq!(shift_lockout_ticks(200.0), 40);
     }
 
     #[test]

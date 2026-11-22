@@ -11,8 +11,13 @@
 //   method to read/set it, so `handbrake-mode` stays Axis (0) unless
 //   the mode lands — the segmented click explains itself.
 // - Shifter gate IS a set_tuning field (shifter_gate): Rust seeds
-//   `shifter-mode` from get_tuning("shifter"). Sensitivity has NO
-//   backend field — its slider is disabled with a reason (A6).
+//   `shifter-mode` from get_tuning("shifter"). Sensitivity IS a
+//   board-config value (SH1): Rust reads it once from the board
+//   config blob (`SHIFTER` record params[4]) and writes it back
+//   through the config transaction (stage → commit → confirm) —
+//   the slider is disabled with a reason until the read lands or
+//   no shifter is configured. Shift lockout (SH2) is a set_tuning
+//   field (shift_lockout_ms, 0–200 ms).
 // - Horn button IS a set_tuning field (horn_button): Learn arms
 //   start_learn and take_learned_button supplies the picked button.
 // - LEDs ARE set_tuning fields (led_brightness, led_pattern,
@@ -123,11 +128,16 @@ export component ExtrasScreen inherits VerticalLayout {
     // ---- shifter (live)
     in property <string> gear: "—"; // "—" until the wheel reports a gear (A7)
     in property <int> shifter-mode: 0; // 0 Sequential, 1 H-pattern
-    in property <float> shifter-sensitivity: 0.6; // 0..1
-    // A6: no set_tuning field carries sensitivity, so the slider is
-    // disabled with a reason instead of pretending to work.
+    in property <float> shifter-sensitivity: 0.5; // 0..1 (= 0..100%)
+    // SH1: disabled until the board read lands (or no shifter is
+    // configured) — the reason text below says why, instead of
+    // pretending to work.
     in property <bool> sensitivity-disabled: true;
-    in property <string> shifter-sensitivity-text: "—";
+    in property <string> shifter-sensitivity-text: "50%";
+    in property <string> shifter-sensitivity-reason: "Reading the shifter setting…";
+    // SH2: shift lockout, 0..1 (= 0..200 ms), default 50 ms.
+    in property <float> shifter-lockout: 0.25;
+    in property <string> shifter-lockout-text: "50 ms";
     // ---- horn
     in property <string> horn-button: "Button 3";
     in property <bool> horn-learning: false;
@@ -150,6 +160,9 @@ export component ExtrasScreen inherits VerticalLayout {
     callback handbrake-deadzone-changed(float);
     callback handbrake-deadzone-edited(string);
     callback shifter-sensitivity-changed(float);
+    callback shifter-sensitivity-edited(string);
+    callback shifter-lockout-changed(float);
+    callback shifter-lockout-edited(string);
     callback led-pattern-selected(int);
     callback led-brightness-changed(float);
     callback led-brightness-edited(string);
@@ -276,8 +289,9 @@ export component ExtrasScreen inherits VerticalLayout {
                             spacing: 10px;
                             Text { text: gear; font-family: Theme.font-mono; font-size: 44px; font-weight: 600; color: Theme.text; horizontal-alignment: center; }
                             Text { text: shifter-mode == 1 ? "H-pattern · current gear" : "Sequential · current gear"; font-size: 12px; color: Theme.mute; horizontal-alignment: center; }
-                            SliderRow { label: "Sensitivity"; hint: "Shift firmness"; value-text: shifter-sensitivity-text; value: shifter-sensitivity; disabled: sensitivity-disabled; changed(v) => { shifter-sensitivity-changed(v); } }
-                            if sensitivity-disabled : Text { text: "Sensitivity has no wheel setting yet."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                            SliderRow { label: "Sensitivity"; hint: "Shift firmness"; value-text: shifter-sensitivity-text; value: shifter-sensitivity; disabled: sensitivity-disabled; changed(v) => { shifter-sensitivity-changed(v); } value-edited(t) => { shifter-sensitivity-edited(t); } }
+                            if sensitivity-disabled : Text { text: shifter-sensitivity-reason; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                            SliderRow { label: "Shift lockout"; hint: "Ignores shifts within this window"; value-text: shifter-lockout-text; value: shifter-lockout; changed(v) => { shifter-lockout-changed(v); } value-edited(t) => { shifter-lockout-edited(t); } }
                             Text {
                                 text: "Change gear mapping in Buttons";
                                 font-size: 12px;

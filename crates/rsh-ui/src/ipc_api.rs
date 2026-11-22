@@ -1552,6 +1552,57 @@ impl AppApi for IpcApi {
         }
     }
 
+    fn shifter_sensitivity(&self) -> Result<Option<u8>, UserError> {
+        let got: Result<Option<u8>, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async("shifter_sensitivity", serde_json::json!({}))
+                .await?;
+            value
+                .get("sensitivity")
+                .and_then(|sensitivity| {
+                    if sensitivity.is_null() {
+                        Some(None)
+                    } else {
+                        sensitivity
+                            .as_u64()
+                            .and_then(|n| u8::try_from(n).ok())
+                            .map(Some)
+                    }
+                })
+                .ok_or_else(|| {
+                    IpcError::Protocol(
+                        "shifter_sensitivity must return {\"sensitivity\": number|null}"
+                            .to_string(),
+                    )
+                })
+        });
+        // B6: the daemon's reason survives (`api_error` splits the
+        // `code|detail` payload) — a "no shifter is configured"
+        // must not collapse into a generic link failure.
+        got.map_err(|error| Self::api_error(&error))
+    }
+
+    fn set_shifter_sensitivity(&self, sensitivity: u8) -> Result<u8, UserError> {
+        let got: Result<u8, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async(
+                    "set_shifter_sensitivity",
+                    serde_json::json!({"sensitivity": sensitivity}),
+                )
+                .await?;
+            value
+                .get("sensitivity")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| {
+                    IpcError::Protocol(
+                        "set_shifter_sensitivity must return {\"sensitivity\": number}".to_string(),
+                    )
+                })
+        });
+        got.map_err(|error| Self::api_error(&error))
+    }
+
     /// Cached draft status (F5): the slow poller refreshes it ~1 Hz
     /// (and a successful `set_tuning` / `set_module_enabled` marks
     /// it dirty at once), so this never touches the socket. No
@@ -3027,6 +3078,36 @@ mod tests {
         assert!(client.draft_status().is_some_and(|s| s.dirty));
         assert!(client.save_draft().expect("save"));
         assert!(client.draft_status().is_none());
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SH1: the shifter sensitivity rides the IPC methods, not
+    /// `set_tuning`. The sim has no board, so the read is `None`
+    /// (no shifter configured) and the write is refused — and the
+    /// refusal's reason survives the IPC hop instead of collapsing
+    /// into a generic link failure.
+    #[test]
+    #[cfg(unix)]
+    fn shifter_sensitivity_over_live_client() {
+        let (client, dir, handle, _guard) = live_client();
+        assert_eq!(
+            client.shifter_sensitivity().expect("read"),
+            None,
+            "sim has no board, so no shifter is configured"
+        );
+        let err = client
+            .set_shifter_sensitivity(70)
+            .expect_err("sim cannot write board config");
+        assert_eq!(err.code, "Unknown");
+        assert!(
+            err.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("not supported")),
+            "reason must survive, got detail: {:?}",
+            err.detail
+        );
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);

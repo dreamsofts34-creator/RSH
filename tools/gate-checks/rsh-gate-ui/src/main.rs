@@ -2412,6 +2412,89 @@ fn ui_button_tuning() -> Outcome {
     report.finish()
 }
 
+/// Gate: shifter tuning (SH1–SH2) — the Extras page's Shifter card
+/// holds the sensitivity slider (board-config value, read once +
+/// written through the config transaction) and the shift-lockout
+/// slider (a `set_tuning` field), and the window + Rust wiring
+/// exist behind them. Static source checks only: the Extras page
+/// has no probe harness (its render needs the full window +
+/// bindings), so — like `ui_encoder_tuning` — this proves the
+/// controls are in the source and wired, not that they paint.
+fn ui_shifter_tuning() -> Outcome {
+    let mut report = Report::new();
+    let extras = match read_gate_source("crates/rsh-ui/ui/screens/extras.slint") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for label in ["Sensitivity", "Shift lockout"] {
+        report.check(
+            &format!("shifter-tuning-has-{label}"),
+            extras.contains(label),
+            &format!("extras.slint must contain the {label} control"),
+        );
+    }
+    let main_slint = match read_gate_source("crates/rsh-ui/ui/main.slint") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for prop in [
+        "shifter-sensitivity",
+        "shifter-sensitivity-text",
+        "sensitivity-disabled",
+        "shifter-sensitivity-reason",
+        "shifter-lockout",
+        "shifter-lockout-text",
+    ] {
+        report.check(
+            &format!("shifter-tuning-prop-{prop}"),
+            main_slint.contains(prop),
+            &format!("main.slint must carry the {prop} window property"),
+        );
+    }
+    for callback in [
+        "extras-shifter-sensitivity",
+        "extras-shifter-sensitivity-edited",
+        "extras-shifter-lockout",
+        "extras-shifter-lockout-edited",
+    ] {
+        report.check(
+            &format!("shifter-tuning-callback-{callback}"),
+            main_slint.contains(&format!("callback {callback}")),
+            &format!("main.slint must declare the {callback} callback"),
+        );
+    }
+    let main_rs = match read_gate_source("crates/rsh-ui/src/main.rs") {
+        Ok(src) => src,
+        Err(error) => return Outcome::fail(error),
+    };
+    for wired in [
+        "on_extras_shifter_sensitivity",
+        "on_extras_shifter_sensitivity_edited",
+        "on_extras_shifter_lockout",
+        "on_extras_shifter_lockout_edited",
+        "FieldKind::ShiftLockoutMs",
+        "JobKind::SensitivityPush",
+        "JobResult::Sensitivity",
+        "sync_shifter_props",
+        "queue_sensitivity_push",
+        "flush_sensitivity_push",
+    ] {
+        report.check(
+            &format!("shifter-tuning-wired-{wired}"),
+            main_rs.contains(wired),
+            &format!("main.rs must wire {wired}"),
+        );
+    }
+    // The stale "no wheel setting yet" dead-end must be gone: the
+    // slider has a real backend now.
+    report.check(
+        "shifter-tuning-no-stale-disabled-copy",
+        !extras.contains("no wheel setting yet") && !main_rs.contains("no wheel setting yet"),
+        "the stale \"no wheel setting yet\" copy must be gone from extras.slint and main.rs",
+    );
+    report.finish()
+}
+
 /// The probe's new callbacks exist with the right signatures and
 /// fire: invoke each root callback and check the handler receives
 /// the value.
@@ -2480,6 +2563,7 @@ fn pedals_probe_callbacks(instance: &ComponentInstance, report: &mut Report) -> 
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn checks() -> Vec<UiCheck> {
     vec![
         (
@@ -2591,6 +2675,11 @@ fn checks() -> Vec<UiCheck> {
             "ui-button-tuning",
             "BU1-BU3: Buttons page holds debounce + long-press threshold + double-press window sliders + long-press action picker, wired through main.rs",
             ui_button_tuning as fn() -> Outcome,
+        ),
+        (
+            "ui-shifter-tuning",
+            "SH1-SH2: Extras page holds shifter sensitivity (board config) + shift lockout (set_tuning), wired through main.rs",
+            ui_shifter_tuning as fn() -> Outcome,
         ),
     ]
 }

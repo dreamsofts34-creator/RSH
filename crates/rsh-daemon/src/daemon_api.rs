@@ -19,6 +19,7 @@ use rsh_api::{
     RawMv, SlowPollState, SnapshotInfo, TuningSettings, VjoyStatus, WifiStatus, app_version,
 };
 use rsh_api::{ConnEvent, ConnectionManager};
+use rsh_app_core::commands::{set_shifter_sensitivity_in_config, shifter_sensitivity_from_config};
 use rsh_app_core::snapshot::EngineSnapshot;
 use rsh_app_core::state::{
     AppSettingsPatch, AppStateCore, GameInfo, ProfileSummary as CoreProfileSummary, TransportKind,
@@ -606,6 +607,39 @@ impl AppApi for DaemonApi {
         self.state
             .set_tuning(tuning)
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
+    fn shifter_sensitivity(&self) -> Result<Option<u8>, UserError> {
+        let config = self
+            .state
+            .get_config()
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
+        Ok(shifter_sensitivity_from_config(&config))
+    }
+
+    fn set_shifter_sensitivity(&self, sensitivity: u8) -> Result<u8, UserError> {
+        // SH1: the board-config write — read the live blob, set
+        // `params[4]`, then run the config transaction (stage →
+        // commit → confirm). The firmware applies the new debounce
+        // on COMMIT, with no reboot. A failed confirm leaves the
+        // board to self-roll-back in 30 s; the explicit rollback
+        // below verifies it at once instead of leaving the
+        // transaction pending.
+        let err = |detail: String| UserError::from_connection(ConnectionError::Unknown, detail);
+        if sensitivity > 100 {
+            return Err(err(format!(
+                "shifter sensitivity {sensitivity} is outside 0..=100"
+            )));
+        }
+        let config = self.state.get_config().map_err(&err)?;
+        let updated = set_shifter_sensitivity_in_config(&config, sensitivity).map_err(&err)?;
+        self.state.stage_config(&updated).map_err(&err)?;
+        self.state.commit_config().map_err(&err)?;
+        if let Err(confirm_err) = self.state.confirm_config().map_err(&err) {
+            let _ = self.state.rollback_config();
+            return Err(confirm_err);
+        }
+        Ok(sensitivity)
     }
 
     fn draft_status(&self) -> Option<DraftStatus> {

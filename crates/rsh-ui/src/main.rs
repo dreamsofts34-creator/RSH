@@ -867,6 +867,9 @@ enum FieldKind {
     ButtonLongPressMs,
     /// Double-press window in ms, 150..500 (BU3).
     ButtonDoublePressMs,
+    // --- Shifter per-module tuning ---
+    /// Shift lockout in ms, 0..200 (SH2).
+    ShiftLockoutMs,
 }
 
 /// A slider drag's latest value, waiting out its debounce (M-7):
@@ -992,6 +995,12 @@ enum JobKind {
     /// (`LiveSeed::fetch`) runs on a job thread, then applies on
     /// the UI thread.
     ReconnectSeed,
+    /// Shifter sensitivity (SH1): the board-config read (one-shot,
+    /// on first Extras visit) and the debounced config-transaction
+    /// write (stage → commit → confirm). Its OWN kind, so a
+    /// sensitivity push is never swallowed by an in-flight
+    /// `TuningPush` — and vice versa — by the duplicate-start rule.
+    SensitivityPush,
 }
 
 impl JobKind {
@@ -1011,10 +1020,13 @@ impl JobKind {
             // enable), the same bound the old callers tolerated,
             // but now with a visible timeout. The app update check
             // (DS-20) shares it too: it is one bounded network
-            // round-trip (`curl --max-time 8`).
-            JobKind::FirmwareUpdate | JobKind::SettingsOp | JobKind::AppUpdateCheck => {
-                Duration::from_secs(10)
-            }
+            // round-trip (`curl --max-time 8`). The sensitivity push
+            // shares it as well: it is four board control sessions
+            // (read → stage → commit → confirm), not one round-trip.
+            JobKind::FirmwareUpdate
+            | JobKind::SettingsOp
+            | JobKind::AppUpdateCheck
+            | JobKind::SensitivityPush => Duration::from_secs(10),
             // Everything else is a couple of round-trips at most
             // (F6: a tuning push is one `set_tuning`).
             JobKind::Transport
@@ -1061,6 +1073,7 @@ impl JobKind {
             JobKind::SettingsOp => 14,
             JobKind::ReconnectSeed => 15,
             JobKind::AppUpdateCheck => 16,
+            JobKind::SensitivityPush => 18,
         }
     }
 }
@@ -1475,6 +1488,10 @@ enum JobResult {
     /// A learn poll: the learned button, or `None` when learning
     /// ended with no pick.
     LearnPoll(Option<u8>),
+    /// A shifter sensitivity read / write (SH1): `Ok(Some(v))` =
+    /// the board's sensitivity, `Ok(None)` = no shifter configured
+    /// on the board, or the error.
+    Sensitivity(Result<Option<u8>, UserError>),
 }
 
 /// A pending generic-job apply (F6): registered by
@@ -2017,6 +2034,27 @@ struct Ctx {
     /// the latest (module, field, value) + when it may be pushed.
     /// The frame timer flushes it (150 ms after the last move).
     pending_field: Rc<RefCell<Option<(PendingField, Instant)>>>,
+    /// Shifter sensitivity drag waiting out its debounce (SH1, M-7):
+    /// the latest percent (0..100) + when it may be pushed. Kept
+    /// apart from `pending_field`: a sensitivity push is a board
+    /// config transaction, not a `set_tuning` field push.
+    pending_sensitivity: Rc<RefCell<Option<(u8, Instant)>>>,
+    /// Last-known shifter sensitivity from the board (SH1): `None`
+    /// = unknown (never read), `Some(None)` = the board has no
+    /// shifter configured, `Some(Some(v))` = the value. Read once
+    /// (on first Extras visit) and after every successful push —
+    /// never on the ~1 Hz sync, which would open a board control
+    /// session every second. The nested `Option` is deliberate:
+    /// three states, no sentinel value.
+    #[allow(clippy::option_option)]
+    sensitivity_cached: Rc<Cell<Option<Option<u8>>>>,
+    /// When the last sensitivity read failed (SH1): the fetch
+    /// retries at most every 30 s, not on every ~1 Hz sync.
+    sensitivity_failed_at: Rc<Cell<Option<Instant>>>,
+    /// Last confirmed shifter sensitivity (SH1): the value a failed
+    /// or timed-out push snaps the slider back to. `None` = no
+    /// shifter configured (nothing to snap back to).
+    sensitivity_push_base: Rc<Cell<Option<u8>>>,
     /// What the running [`JobKind::TuningPush`] job is pushing
     /// (R2-18): the snapshot taken when the job started, so a
     /// timeout reverts exactly that slider. `None` = no tuning
@@ -2979,6 +3017,10 @@ impl Ctx {
                     FieldKind::ButtonDoublePressMs => {
                         record.button_double_press_ms = Some(value.clamp(150.0, 500.0));
                     }
+                    // --- Shifter per-module tuning ---
+                    FieldKind::ShiftLockoutMs => {
+                        record.shift_lockout_ms = Some(value.clamp(0.0, 200.0));
+                    }
                 }
                 JobResult::Tuning(api.set_tuning(&record))
             },
@@ -3025,6 +3067,155 @@ impl Ctx {
             *self.tuning_push_in_flight.borrow_mut() =
                 Some(TuningPushTarget::Field { pending, due, base });
         }
+    }
+
+    /// Fetch the board's shifter sensitivity once (SH1): a
+    /// [`JobKind::SensitivityPush`] job thread reads it, then the
+    /// UI thread caches + seeds the slider. A failed read records
+    /// the time (30 s retry backoff) and leaves the slider disabled
+    /// with the reason in place — no toast: a background read
+    /// failure is not a user action.
+    fn fetch_shifter_sensitivity(&self, win: &MainWindow) {
+        let started = self.run_generic_job(
+            win,
+            JobKind::SensitivityPush,
+            "Reading shifter sensitivity…",
+            move |api| JobResult::Sensitivity(api.shifter_sensitivity()),
+            move |ctx, win, result| {
+                let JobResult::Sensitivity(result) = result else {
+                    return;
+                };
+                match result {
+                    Ok(value) => {
+                        ctx.sensitivity_cached.set(Some(value));
+                        ctx.sensitivity_failed_at.set(None);
+                        ctx.sensitivity_push_base.set(value);
+                        ctx.sync_shifter_props(win, &ctx.api().get_tuning("shifter"));
+                    }
+                    Err(e) => {
+                        ctx.sensitivity_failed_at.set(Some(Instant::now()));
+                        ui_log!(
+                            "RSH-UI shifter sensitivity read failed: {} ({})",
+                            e.code,
+                            e.title
+                        );
+                        ctx.sync_shifter_props(win, &ctx.api().get_tuning("shifter"));
+                    }
+                }
+            },
+        );
+        let _ = started;
+    }
+
+    /// Queue a shifter sensitivity drag's latest value (SH1, M-7):
+    /// the drag keeps flowing; the board config push runs 150 ms
+    /// after the last move. A newer move replaces the pending one —
+    /// a drag is one config transaction, not one per pixel.
+    fn queue_sensitivity_push(&self, value: u8) {
+        *self.pending_sensitivity.borrow_mut() =
+            Some((value, Instant::now() + Duration::from_millis(150)));
+    }
+
+    /// Flush a due sensitivity push (frame timer, SH1/M-7/F6): the
+    /// debounced board-config write runs on a
+    /// [`JobKind::SensitivityPush`] job thread, so a drag flush can
+    /// no longer freeze the UI. R2-18: the pending flag clears only
+    /// when the job COMPLETES (and only when this push is still the
+    /// pending one — a newer drag supersedes it); on failure or
+    /// timeout the slider snaps back to the last confirmed value
+    /// instead of lying.
+    fn flush_sensitivity_push(&self, win: &MainWindow) {
+        let Some((pending, due)) = *self.pending_sensitivity.borrow() else {
+            return;
+        };
+        if Instant::now() < due {
+            return;
+        }
+        let base = self.sensitivity_push_base.get();
+        let started = self.run_generic_job(
+            win,
+            JobKind::SensitivityPush,
+            "Saving shifter sensitivity…",
+            move |api| JobResult::Sensitivity(api.set_shifter_sensitivity(pending).map(Some)),
+            move |ctx, win, result| {
+                let JobResult::Sensitivity(result) = result else {
+                    return;
+                };
+                // R2-18: clear the pending flag only on completion,
+                // and only when this push is still the pending one.
+                let current = *ctx.pending_sensitivity.borrow();
+                let still_pending = current.is_some_and(|(p, d)| p == pending && d == due);
+                if still_pending {
+                    *ctx.pending_sensitivity.borrow_mut() = None;
+                }
+                match result {
+                    Ok(value) => {
+                        // The board confirmed it: the cache is the
+                        // applied value now. No profile save — this
+                        // is board config, not tuning.
+                        ctx.sensitivity_cached.set(Some(value));
+                        ctx.sensitivity_push_base.set(value);
+                        ctx.sync_shifter_props(win, &ctx.api().get_tuning("shifter"));
+                    }
+                    Err(e) => {
+                        if still_pending {
+                            // The push never landed — snap the
+                            // slider back to the last confirmed value.
+                            ctx.sensitivity_cached.set(Some(base));
+                            ctx.sync_shifter_props(win, &ctx.api().get_tuning("shifter"));
+                        }
+                        ctx.notify_error(win, "Shifter", &e);
+                        ui_log!("RSH-UI sensitivity push failed: {} ({})", e.code, e.title);
+                    }
+                }
+            },
+        );
+        let _ = started;
+    }
+
+    /// Sensitivity percent (0..100) from a 0..1 slider fraction
+    /// (SH1): rounded + clamped, so the `f64 → u8` cast below is
+    /// exact.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn sensitivity_pct(value: f32) -> u8 {
+        (f64::from(value) * 100.0).round().clamp(0.0, 100.0) as u8
+    }
+
+    /// Echo a sensitivity drag locally (SH1, R2-10): the slider +
+    /// text move with the drag, not at the next ~1 Hz re-sync.
+    #[allow(clippy::cast_possible_truncation)]
+    fn apply_sensitivity_local(win: &MainWindow, value: u8) {
+        set_if_changed(
+            win.get_shifter_sensitivity(),
+            f32::from(value) / 100.0,
+            |v| {
+                win.set_shifter_sensitivity(v);
+            },
+        );
+        set_if_changed(
+            win.get_shifter_sensitivity_text(),
+            format!("{value}%").into(),
+            |v| win.set_shifter_sensitivity_text(v),
+        );
+    }
+
+    /// Echo a lockout drag locally (SH2, R2-10): the slider + text
+    /// move with the drag. Only the props move — the pending field
+    /// push owns the value until it lands.
+    #[allow(clippy::cast_possible_truncation)]
+    fn apply_shifter_lockout_local(win: &MainWindow, lockout_ms: f64) {
+        set_if_changed(
+            win.get_shifter_lockout(),
+            (lockout_ms / 200.0) as f32,
+            |v| {
+                win.set_shifter_lockout(v);
+            },
+        );
+        set_if_changed(
+            win.get_shifter_lockout_text(),
+            format!("{lockout_ms:.0} ms").into(),
+            |v| win.set_shifter_lockout_text(v),
+        );
     }
 
     /// Push a VISIBLE notification and sync the drawer model. Every
@@ -3819,9 +4010,29 @@ impl Ctx {
                     tuning_silent = !tuning_reverted;
                 }
             }
+            // SH1: a timed-out sensitivity push reverts its slider
+            // to the last confirmed value. A timed-out one-shot
+            // READ has no pending push — no slider to revert, and
+            // the 30 s backoff path shows the reason in place —
+            // so it stays silent instead of toasting a background
+            // read.
+            let mut sensitivity_reverted = false;
+            let mut sensitivity_silent = false;
+            if kind == JobKind::SensitivityPush {
+                if self.pending_sensitivity.borrow().is_some() {
+                    *self.pending_sensitivity.borrow_mut() = None;
+                    let base = self.sensitivity_push_base.get();
+                    self.sensitivity_cached.set(Some(base));
+                    self.sync_shifter_props(win, &self.api().get_tuning("shifter"));
+                    sensitivity_reverted = true;
+                } else {
+                    self.sensitivity_failed_at.set(Some(Instant::now()));
+                    sensitivity_silent = true;
+                }
+            }
             ui_log!("RSH-UI job {kind:?} timed out ({label})");
-            if !tuning_silent {
-                let body = if tuning_reverted {
+            if !tuning_silent && !sensitivity_silent {
+                let body = if tuning_reverted || sensitivity_reverted {
                     "The change wasn't saved — the slider was put back to its previous value."
                 } else if kind == JobKind::Backend {
                     // Bug 4: a switch that never answers must say so
@@ -5160,6 +5371,16 @@ impl Ctx {
                                 FieldKind::ButtonDoublePressMs => {
                                     effective.button_double_press_ms = local.button_double_press_ms;
                                 }
+                                // --- Shifter per-module tuning ---
+                                // A shifter drag can never reach this
+                                // pedal arm (`same_module` is false
+                                // when the pending module is
+                                // "shifter"), but the match must cover
+                                // the new variant — same carry-over
+                                // as the pedal fields.
+                                FieldKind::ShiftLockoutMs => {
+                                    effective.shift_lockout_ms = local.shift_lockout_ms;
+                                }
                             }
                         }
                     }
@@ -5693,6 +5914,85 @@ impl Ctx {
         });
     }
 
+    /// Write the Extras page's shifter props from a tuning record +
+    /// the cached board sensitivity (SH1/SH2, R2-10): the lockout
+    /// slider + text from the record, the sensitivity slider + text
+    /// from the board cache. While a lockout drag's push is pending,
+    /// the local echo owns that slider — the slow cache must not
+    /// snap it back mid-drag; the same guard covers a sensitivity
+    /// drag. All writes are change-guarded, like `push_frame`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn sync_shifter_props(&self, win: &MainWindow, shifter: &TuningSettings) {
+        if !self.field_push_pending_for("shifter") {
+            let lockout_ms = shifter.shift_lockout_ms.unwrap_or(50.0);
+            set_if_changed(
+                win.get_shifter_lockout(),
+                (lockout_ms / 200.0) as f32,
+                |v| {
+                    win.set_shifter_lockout(v);
+                },
+            );
+            set_if_changed(
+                win.get_shifter_lockout_text(),
+                format!("{lockout_ms:.0} ms").into(),
+                |v| win.set_shifter_lockout_text(v),
+            );
+        }
+        if self.pending_sensitivity.borrow().is_some() {
+            return;
+        }
+        match self.sensitivity_cached.get() {
+            Some(Some(value)) => {
+                set_if_changed(win.get_sensitivity_disabled(), false, |v| {
+                    win.set_sensitivity_disabled(v);
+                });
+                set_if_changed(
+                    win.get_shifter_sensitivity(),
+                    f32::from(value) / 100.0,
+                    |v| {
+                        win.set_shifter_sensitivity(v);
+                    },
+                );
+                set_if_changed(
+                    win.get_shifter_sensitivity_text(),
+                    format!("{value}%").into(),
+                    |v| win.set_shifter_sensitivity_text(v),
+                );
+            }
+            Some(None) => {
+                set_if_changed(win.get_sensitivity_disabled(), true, |v| {
+                    win.set_sensitivity_disabled(v);
+                });
+                set_if_changed(
+                    win.get_shifter_sensitivity_reason(),
+                    "No shifter is configured on the board.".into(),
+                    |v| win.set_shifter_sensitivity_reason(v),
+                );
+            }
+            None => {
+                // Unknown: "Reading…" while the fetch runs (or has
+                // not started yet); after a failed read the reason
+                // says so until the 30 s backoff lets it retry.
+                set_if_changed(win.get_sensitivity_disabled(), true, |v| {
+                    win.set_sensitivity_disabled(v);
+                });
+                let reason = if self
+                    .busy_jobs
+                    .borrow()
+                    .contains_key(&JobKind::SensitivityPush)
+                    || self.sensitivity_failed_at.get().is_none()
+                {
+                    "Reading the shifter setting…"
+                } else {
+                    "Couldn't read the shifter setting — check the board connection."
+                };
+                set_if_changed(win.get_shifter_sensitivity_reason(), reason.into(), |v| {
+                    win.set_shifter_sensitivity_reason(v);
+                });
+            }
+        }
+    }
+
     /// Echo an encoder slider drag locally (R2-10): the slider + text
     /// move with the drag, not at the next ~1 Hz re-sync. Only the
     /// encoder fields are read, so the neutral record is enough —
@@ -5889,10 +6189,12 @@ impl Ctx {
     }
 
     /// Refresh the Extras page from the stored records (A6):
-    /// handbrake mV/deadzone/feel, shifter gate, horn button, LED
-    /// pattern + brightness — all `set_tuning` fields. Controls with
-    /// no backend field (sensitivity, LED colour, handbrake mode)
-    /// stay disabled / explain themselves in the Slint.
+    /// handbrake mV/deadzone/feel, shifter gate + lockout, horn
+    /// button, LED pattern + brightness — all `set_tuning` fields —
+    /// plus the shifter sensitivity from the board config blob
+    /// (SH1, `sync_shifter_props`). Controls with no backend field
+    /// (LED colour, handbrake mode) stay disabled / explain
+    /// themselves in the Slint.
     /// R2-11: every write is change-guarded like `push_frame`, so
     /// the ~1 Hz re-sync stops rewriting props that did not move.
     /// R2-10: a module with a field push still pending keeps its
@@ -5979,6 +6281,28 @@ impl Ctx {
         if !self.field_push_pending_for("buttons") {
             let buttons = api.get_tuning("buttons");
             Self::sync_button_props(win, &buttons);
+        }
+        // SH1/SH2: the shifter props ride this slow re-sync — the
+        // lockout from the tuning record, the sensitivity from the
+        // board cache (see `sync_shifter_props`).
+        self.sync_shifter_props(win, &shifter);
+        // SH1: the board sensitivity is read once, on first Extras
+        // visit — a `get_config` board session on every ~1 Hz sync
+        // would be a control session per second. A failed read
+        // retries at most every 30 s; a SensitivityPush job already
+        // running (fetch or write) is never doubled.
+        if win.get_page() == 4
+            && self.sensitivity_cached.get().is_none()
+            && !self
+                .busy_jobs
+                .borrow()
+                .contains_key(&JobKind::SensitivityPush)
+            && self
+                .sensitivity_failed_at
+                .get()
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+        {
+            self.fetch_shifter_sensitivity(win);
         }
     }
 
@@ -9318,9 +9642,11 @@ fn wire_buttons(win: &MainWindow, ctx: &Rc<Ctx>) {
 /// Wire the Extras page callbacks (A6): LED pattern/brightness/colour
 /// and handbrake feel/deadzone push through `set_tuning`; horn Learn
 /// arms `start_learn`; Test flashes the indicator; the shifter link
-/// opens the Buttons page. Handbrake Set up/down capture the live
-/// endpoints (v2.0.2). Controls with no backend (handbrake mode,
-/// sensitivity) explain themselves instead of pretending to work.
+/// opens the Buttons page; the shifter sensitivity slider pushes
+/// through the board config transaction (SH1) and the lockout slider
+/// through `set_tuning` (SH2). Handbrake Set up/down capture the live
+/// endpoints (v2.0.2). Controls with no backend (handbrake mode)
+/// explain themselves instead of pretending to work.
 #[allow(clippy::too_many_lines)]
 fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
     {
@@ -9454,14 +9780,6 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                     ctx.refresh(&w, 0);
                 }
                 "shifter-change-in-buttons" => w.set_page(3),
-                "shifter-sensitivity" => {
-                    ctx.notify(
-                        &w,
-                        "Extras",
-                        "Shifter sensitivity",
-                        "Sensitivity has no wheel setting yet.",
-                    );
-                }
                 other => ui_log!("RSH-UI unknown extras-action: {other}"),
             }
         });
@@ -9573,6 +9891,65 @@ fn wire_extras(win: &MainWindow, ctx: &Rc<Ctx>) {
                     .copied()
                     .unwrap_or(0x2F_6B_FF);
                 ctx.set_module_tuning(&w, "led", |t| t.led_color = Some(color));
+            }
+        });
+    }
+    // Shifter tuning (SH1/SH2): sensitivity slider (debounced
+    // board-config push, local echo while dragging) + lockout
+    // slider (debounced `set_tuning` field push, like the encoder
+    // pulse slider). Both have typed-value handlers, like the
+    // handbrake deadzone / LED brightness sliders.
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_shifter_sensitivity(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let pct = Ctx::sensitivity_pct(v);
+            Ctx::apply_sensitivity_local(&w, pct);
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_sensitivity_push(pct);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_shifter_sensitivity_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(pct) = t.trim().trim_end_matches(['%', ' ']).parse::<f32>() {
+                let pct = Ctx::sensitivity_pct(pct / 100.0);
+                Ctx::apply_sensitivity_local(&w, pct);
+                ctx.queue_sensitivity_push(pct);
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_shifter_lockout(move |v| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            let ms = (f64::from(v) * 200.0).clamp(0.0, 200.0);
+            Ctx::apply_shifter_lockout_local(&w, ms);
+            // M-7: a drag queues one debounced push, not one per move.
+            ctx.queue_field_push("shifter", FieldKind::ShiftLockoutMs, ms);
+        });
+    }
+    {
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_extras_shifter_lockout_edited(move |t| {
+            let Some(w) = win.upgrade() else {
+                return;
+            };
+            if let Ok(ms) = t.trim().trim_end_matches(['m', 's', ' ']).parse::<f64>() {
+                let ms = ms.clamp(0.0, 200.0);
+                Ctx::apply_shifter_lockout_local(&w, ms);
+                ctx.queue_field_push("shifter", FieldKind::ShiftLockoutMs, ms);
             }
         });
     }
@@ -11219,6 +11596,7 @@ fn start_frame_timer(
             // M-7: queued slider pushes (150 ms debounce) flush here.
             ctx.flush_steering_push(&w);
             ctx.flush_field_push(&w);
+            ctx.flush_sensitivity_push(&w);
             // Perf (F-2): the startup list/diag syncs were deferred
             // out of `main` — run them once, on the first visible
             // frame tick, so the window paints before they run.
@@ -11548,6 +11926,10 @@ fn main() -> Result<(), slint::PlatformError> {
         last_address_notify: Rc::new(Cell::new(None)),
         steer_push_due: Rc::new(Cell::new(None)),
         pending_field: Rc::new(RefCell::new(None)),
+        pending_sensitivity: Rc::new(RefCell::new(None)),
+        sensitivity_cached: Rc::new(Cell::new(None)),
+        sensitivity_failed_at: Rc::new(Cell::new(None)),
+        sensitivity_push_base: Rc::new(Cell::new(None)),
         tuning_push_in_flight: Rc::new(RefCell::new(None)),
         profiles_model_hash: Rc::new(Cell::new(None)),
         games_model_hash: Rc::new(Cell::new(None)),
@@ -11765,6 +12147,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 ctx_static.poll_firmware_update(&w);
                 ctx_static.flush_steering_push(&w);
                 ctx_static.flush_field_push(&w);
+                ctx_static.flush_sensitivity_push(&w);
             }
         });
         std::mem::forget(health_timer);
@@ -12564,6 +12947,10 @@ mod tests {
             last_address_notify: Rc::new(Cell::new(None)),
             steer_push_due: Rc::new(Cell::new(None)),
             pending_field: Rc::new(RefCell::new(None)),
+            pending_sensitivity: Rc::new(RefCell::new(None)),
+            sensitivity_cached: Rc::new(Cell::new(None)),
+            sensitivity_failed_at: Rc::new(Cell::new(None)),
+            sensitivity_push_base: Rc::new(Cell::new(None)),
             tuning_push_in_flight: Rc::new(RefCell::new(None)),
             profiles_model_hash: Rc::new(Cell::new(None)),
             games_model_hash: Rc::new(Cell::new(None)),

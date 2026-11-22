@@ -279,6 +279,12 @@ pub struct PerModuleTuning {
     /// default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub button_double_press_ms: Option<f64>,
+    // --- Shifter per-module tuning ---
+    /// Shift lockout in ms (SH2, shifter module only), 0–200.
+    /// `None` = never set (old profile) — the 50 ms default applies.
+    /// `Some(0.0)` = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shift_lockout_ms: Option<f64>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -569,6 +575,8 @@ impl Default for PerModuleTuning {
             button_debounce_ms: None,
             button_long_press_ms: None,
             button_double_press_ms: None,
+            // --- Shifter per-module tuning ---
+            shift_lockout_ms: None,
         }
     }
 }

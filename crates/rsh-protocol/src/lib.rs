@@ -49,7 +49,9 @@ pub use error::{
     StatusError, StreamError,
 };
 pub use hello::{HelloReply, HeloRequest, LinkState};
-pub use pin::{PinModule, PinModuleKind, free_pins, validate, validate_blob};
+pub use pin::{
+    PinModule, PinModuleKind, SHIFTER_SENSITIVITY_PARAM, free_pins, validate, validate_blob,
+};
 pub use ping::{PingFrame, PingMeasurement, PingType, measure};
 pub use probe::{ProbeFrame, ProbeSamples};
 pub use serial::{SerialDecoder, SerialFrame, SerialKind};

@@ -351,6 +351,32 @@ pub fn dispatch(
                 .map(|stored| serde_json::to_value(stored).unwrap_or(serde_json::Value::Null))
                 .map_err(|e| IpcError::Api(e.code))
         }
+        // SH1: shifter sensitivity is a board-config value, not a
+        // `set_tuning` field — the read returns `{"sensitivity":
+        // 50}` (or `null` when no shifter is configured) and the
+        // write runs the daemon's config transaction (stage →
+        // commit → confirm) and returns the applied value. Both
+        // arms use `detailed_api_error`, so the reason ("no shifter
+        // is configured…", "the wheel did not answer…") reaches the
+        // UI instead of a bare "Unknown".
+        "shifter_sensitivity" => api
+            .shifter_sensitivity()
+            .map(|sensitivity| serde_json::json!({"sensitivity": sensitivity}))
+            .map_err(|e| detailed_api_error(&e)),
+        "set_shifter_sensitivity" => {
+            let sensitivity = params
+                .get("sensitivity")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u8::try_from(n).ok())
+                .ok_or_else(|| {
+                    IpcError::Protocol(
+                        "set_shifter_sensitivity needs a 'sensitivity' byte (0..100)".to_string(),
+                    )
+                })?;
+            api.set_shifter_sensitivity(sensitivity)
+                .map(|applied| serde_json::json!({"sensitivity": applied}))
+                .map_err(|e| detailed_api_error(&e))
+        }
         "draft_status" => Ok(serde_json::to_value(api.draft_status())
             .map_err(|e| IpcError::Protocol(e.to_string()))?),
         "save_draft" => api
@@ -561,8 +587,9 @@ fn parse_binding_button(params: &serde_json::Value) -> Result<u8, IpcError> {
 /// code, so a failed call would reach the UI as a bare "Unknown"
 /// with the real reason lost. The payload is `code|detail` (the
 /// detail never contains `|`); the UI splits it back out. The
-/// capture and binding methods use this — every other method keeps
-/// the existing code-only mapping.
+/// capture and binding methods use this, as do the shifter
+/// sensitivity methods — every other method keeps the existing
+/// code-only mapping.
 fn detailed_api_error(error: &rsh_api::UserError) -> IpcError {
     let mut body = error.code.clone();
     body.push('|');
