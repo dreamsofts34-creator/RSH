@@ -6220,10 +6220,14 @@ impl AppStateCore {
                 led_color: stored.led_color.as_deref().and_then(parse_hex_color),
                 handbrake_button_mode: stored.handbrake_button_mode,
                 // --- Encoder per-module tuning ---
-                // Old profiles carry neither field: the defaults
-                // (50 ms pulse, 4 counts per click) apply.
+                // Old profiles carry none of these fields: the
+                // defaults (50 ms pulse, 4 counts per click, accel
+                // off, sensitivity 1.0, no invert) apply.
                 encoder_pulse_ms: Some(stored.encoder_pulse_ms.unwrap_or(50.0)),
                 encoder_counts_per_click: Some(stored.encoder_counts_per_click.unwrap_or(4)),
+                encoder_accel: Some(stored.encoder_accel.unwrap_or(false)),
+                encoder_accel_sensitivity: Some(stored.encoder_accel_sensitivity.unwrap_or(1.0)),
+                encoder_invert_mask: Some(stored.encoder_invert_mask.unwrap_or(0)),
             };
         }
         let (invert, steering_lock_deg) = lock(&self.store)
@@ -6248,6 +6252,9 @@ impl AppStateCore {
             // --- Encoder per-module tuning ---
             encoder_pulse_ms: Some(50.0),
             encoder_counts_per_click: Some(4),
+            encoder_accel: Some(false),
+            encoder_accel_sensitivity: Some(1.0),
+            encoder_invert_mask: Some(0),
         }
     }
 
@@ -6335,6 +6342,9 @@ impl AppStateCore {
                 // --- Encoder per-module tuning ---
                 encoder_pulse_ms: None,
                 encoder_counts_per_click: None,
+                encoder_accel: None,
+                encoder_accel_sensitivity: None,
+                encoder_invert_mask: None,
             });
         entry.deadzone = tuning.deadzone / 100.0;
         entry.curve_strength = (tuning.curve - 1.0).clamp(-1.0, 1.0);
@@ -6367,6 +6377,9 @@ impl AppStateCore {
         // --- Encoder per-module tuning ---
         entry.encoder_pulse_ms = tuning.encoder_pulse_ms;
         entry.encoder_counts_per_click = tuning.encoder_counts_per_click;
+        entry.encoder_accel = tuning.encoder_accel;
+        entry.encoder_accel_sensitivity = tuning.encoder_accel_sensitivity;
+        entry.encoder_invert_mask = tuning.encoder_invert_mask;
         if let Some(gate) = tuning.shifter_gate {
             entry.gate_mode = match gate {
                 ShifterGate::Sequential => "Sequential".to_string(),
@@ -6576,6 +6589,9 @@ impl AppStateCore {
             // --- Encoder per-module tuning ---
             pulse_ms: tuning.encoder_pulse_ms.unwrap_or(50.0) as f32,
             counts_per_click: tuning.encoder_counts_per_click.unwrap_or(4),
+            accel_enabled: tuning.encoder_accel.unwrap_or(false),
+            accel_sensitivity: tuning.encoder_accel_sensitivity.unwrap_or(1.0) as f32,
+            encoder_invert_mask: tuning.encoder_invert_mask.unwrap_or(0),
         }
     }
 
@@ -10196,11 +10212,15 @@ mod tests {
         let (state, _dir) = test_state();
         let _ = activate_first_profile(&state);
         // No stored encoder entry yet: the defaults apply (50 ms
-        // pulse, 4 counts per click) — an old profile without the
-        // fields loads the same way.
+        // pulse, 4 counts per click, accel off, sensitivity 1.0,
+        // no invert) — an old profile without the fields loads the
+        // same way.
         let neutral = state.get_tuning("encoders");
         assert_eq!(neutral.encoder_pulse_ms, Some(50.0));
         assert_eq!(neutral.encoder_counts_per_click, Some(4));
+        assert_eq!(neutral.encoder_accel, Some(false));
+        assert_eq!(neutral.encoder_accel_sensitivity, Some(1.0));
+        assert_eq!(neutral.encoder_invert_mask, Some(0));
         // Invalid values are rejected, never stored.
         let mut bad = neutral.clone();
         bad.encoder_pulse_ms = Some(10.0);
@@ -10208,15 +10228,27 @@ mod tests {
         let mut bad = neutral.clone();
         bad.encoder_counts_per_click = Some(3);
         assert!(state.set_tuning(&bad).is_err());
+        let mut bad = neutral.clone();
+        bad.encoder_accel_sensitivity = Some(3.0);
+        assert!(state.set_tuning(&bad).is_err());
+        let mut bad = neutral.clone();
+        bad.encoder_invert_mask = Some(0x10);
+        assert!(state.set_tuning(&bad).is_err());
         assert_eq!(state.get_tuning("encoders").encoder_pulse_ms, Some(50.0));
         // Valid values store, survive a get, and reach the live
         // pipeline plan.
         let mut tuning = neutral.clone();
         tuning.encoder_pulse_ms = Some(120.0);
         tuning.encoder_counts_per_click = Some(2);
+        tuning.encoder_accel = Some(true);
+        tuning.encoder_accel_sensitivity = Some(1.5);
+        tuning.encoder_invert_mask = Some(0b0010);
         let saved = state.set_tuning(&tuning).expect("valid encoder tuning");
         assert_eq!(saved.encoder_pulse_ms, Some(120.0));
         assert_eq!(saved.encoder_counts_per_click, Some(2));
+        assert_eq!(saved.encoder_accel, Some(true));
+        assert_eq!(saved.encoder_accel_sensitivity, Some(1.5));
+        assert_eq!(saved.encoder_invert_mask, Some(0b0010));
         assert_eq!(state.get_tuning("encoders").encoder_pulse_ms, Some(120.0));
         assert_eq!(
             state.get_tuning("encoders").encoder_counts_per_click,
@@ -10225,6 +10257,9 @@ mod tests {
         let plan = state.build_pipeline_plan();
         assert_eq!(plan.encoders.pulse_ms, 120.0);
         assert_eq!(plan.encoders.counts_per_click, 2);
+        assert!(plan.encoders.accel_enabled);
+        assert_eq!(plan.encoders.accel_sensitivity, 1.5);
+        assert_eq!(plan.encoders.encoder_invert_mask, 0b0010);
         // Save persists them into the profile on disk.
         assert!(state.save_draft().expect("save draft"));
         let stored = lock(&state.store)
@@ -10233,6 +10268,9 @@ mod tests {
         let stored = stored.expect("stored encoder entry");
         assert_eq!(stored.encoder_pulse_ms, Some(120.0));
         assert_eq!(stored.encoder_counts_per_click, Some(2));
+        assert_eq!(stored.encoder_accel, Some(true));
+        assert_eq!(stored.encoder_accel_sensitivity, Some(1.5));
+        assert_eq!(stored.encoder_invert_mask, Some(0b0010));
     }
 
     /// L4 draft/save: Save persists the draft (and only the draft),

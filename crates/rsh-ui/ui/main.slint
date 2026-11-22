@@ -152,6 +152,12 @@ export component MainWindow inherits Window {
     in property <float> enc-pulse-ms: 50.0;
     in property <string> enc-pulse-text: "50 ms";
     in property <int> enc-counts: 4;
+    // Encoder tuning (E3/E4): acceleration + per-knob invert.
+    in property <bool> enc-accel: false;
+    in property <float> enc-accel-sens: 1.0;
+    in property <string> enc-accel-sens-text: "100%";
+    in property <bool> enc-invert1: false;
+    in property <bool> enc-invert2: false;
     in property <string> throttle-raw-mv-text: "—";
     in property <string> brake-raw-mv-text: "—";
     in property <string> clutch-raw-mv-text: "—";
@@ -370,6 +376,10 @@ export component MainWindow inherits Window {
     callback enc-pulse-changed(float);
     callback enc-pulse-edited(string);
     callback enc-counts-changed(int);
+    callback enc-accel-changed(bool);
+    callback enc-accel-sens-changed(float);
+    callback enc-accel-sens-edited(string);
+    callback enc-invert-changed(int, bool);
     callback learn-clicked();
     callback edit-cancel();
     callback edit-save();
@@ -759,9 +769,18 @@ export component MainWindow inherits Window {
                 enc-pulse-ms: enc-pulse-ms;
                 enc-pulse-text: enc-pulse-text;
                 enc-counts: enc-counts;
+                enc-accel: enc-accel;
+                enc-accel-sens: enc-accel-sens;
+                enc-accel-sens-text: enc-accel-sens-text;
+                enc-invert1: enc-invert1;
+                enc-invert2: enc-invert2;
                 enc-pulse-changed(v) => { enc-pulse-changed(v); }
                 enc-pulse-edited(t) => { enc-pulse-edited(t); }
                 enc-counts-changed(i) => { enc-counts-changed(i); }
+                enc-accel-changed(b) => { enc-accel-changed(b); }
+                enc-accel-sens-changed(v) => { enc-accel-sens-changed(v); }
+                enc-accel-sens-edited(t) => { enc-accel-sens-edited(t); }
+                enc-invert-changed(i, b) => { enc-invert-changed(i, b); }
                 listening: buttons-listening;
                 tile-selected(i) => { tile-selected(i); }
                 knob-selected(i) => { knob-selected(i); }

@@ -235,6 +235,18 @@ pub struct PerModuleTuning {
     /// `None` = never set (old profile) — the default 4 applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_counts_per_click: Option<u8>,
+    /// Acceleration on/off (E3, encoders module only).
+    /// `None` = never set — off applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_accel: Option<bool>,
+    /// Acceleration sensitivity (E3, encoders module only), 0–2.
+    /// `None` = never set — 1.0 applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_accel_sensitivity: Option<f64>,
+    /// Per-encoder direction invert mask (E4, encoders module
+    /// only), bits 0–3. `None` = never set — 0 (no invert) applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_invert_mask: Option<u8>,
 }
 
 /// One wheel profile from a C# `profiles.json` (Profile v2).
@@ -503,6 +515,9 @@ impl Default for PerModuleTuning {
             // --- Encoder per-module tuning ---
             encoder_pulse_ms: None,
             encoder_counts_per_click: None,
+            encoder_accel: None,
+            encoder_accel_sensitivity: None,
+            encoder_invert_mask: None,
         }
     }
 }

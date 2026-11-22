@@ -2029,9 +2029,11 @@ fn read_gate_source(path: &str) -> Result<String, String> {
         .map_err(|error| format!("read {path} failed: {error}"))
 }
 
-/// Gate: encoder tuning (E1/E2) — the Buttons page's "Rotary knob
-/// tuning" card holds the pulse-length slider and the steps-per-click
-/// segment, and the window + Rust wiring exist behind them. Static
+/// Gate: encoder tuning (E1–E4) — the Buttons page's "Rotary knob
+/// tuning" card holds the pulse-length slider, the steps-per-click
+/// segment, the acceleration switch + strength slider, and the
+/// per-knob invert switches, and the window + Rust wiring exist
+/// behind them. Static
 /// source checks only: the Buttons page has no probe harness (its
 /// render needs the full window + bindings), so — like the first half
 /// of `ui_steering_advanced` — this proves the controls are in the
@@ -2042,7 +2044,15 @@ fn ui_encoder_tuning() -> Outcome {
         Ok(src) => src,
         Err(error) => return Outcome::fail(error),
     };
-    for label in ["Rotary knob tuning", "Pulse length", "Steps per click"] {
+    for label in [
+        "Rotary knob tuning",
+        "Pulse length",
+        "Steps per click",
+        "Acceleration",
+        "Acceleration strength",
+        "Invert Knob 1",
+        "Invert Knob 2",
+    ] {
         report.check(
             &format!("encoder-tuning-has-{label}"),
             buttons.contains(label),
@@ -2053,7 +2063,16 @@ fn ui_encoder_tuning() -> Outcome {
         Ok(src) => src,
         Err(error) => return Outcome::fail(error),
     };
-    for prop in ["enc-pulse-ms", "enc-pulse-text", "enc-counts"] {
+    for prop in [
+        "enc-pulse-ms",
+        "enc-pulse-text",
+        "enc-counts",
+        "enc-accel",
+        "enc-accel-sens",
+        "enc-accel-sens-text",
+        "enc-invert1",
+        "enc-invert2",
+    ] {
         report.check(
             &format!("encoder-tuning-prop-{prop}"),
             main_slint.contains(prop),
@@ -2064,6 +2083,10 @@ fn ui_encoder_tuning() -> Outcome {
         "enc-pulse-changed",
         "enc-pulse-edited",
         "enc-counts-changed",
+        "enc-accel-changed",
+        "enc-accel-sens-changed",
+        "enc-accel-sens-edited",
+        "enc-invert-changed",
     ] {
         report.check(
             &format!("encoder-tuning-callback-{callback}"),
@@ -2079,7 +2102,12 @@ fn ui_encoder_tuning() -> Outcome {
         "on_enc_pulse_changed",
         "on_enc_pulse_edited",
         "on_enc_counts_changed",
+        "on_enc_accel_changed",
+        "on_enc_accel_sens_changed",
+        "on_enc_accel_sens_edited",
+        "on_enc_invert_changed",
         "FieldKind::EncoderPulseMs",
+        "FieldKind::EncoderAccelSens",
         "sync_encoder_props",
     ] {
         report.check(
@@ -2185,7 +2213,7 @@ fn checks() -> Vec<UiCheck> {
         ),
         (
             "ui-encoder-tuning",
-            "E1/E2: Buttons page holds pulse length + steps per click, wired through main.rs",
+            "E1-E4: Buttons page holds pulse length + steps per click + accel + per-knob invert, wired through main.rs",
             ui_encoder_tuning as fn() -> Outcome,
         ),
     ]
