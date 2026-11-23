@@ -439,15 +439,44 @@ fn ensure_single_instance_unix(data_dir: Option<&PathBuf>, page: &str) -> Instan
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Lost the claim race. The winner may still be
-                // writing its pid: give it a moment, then re-check
-                // before removing anything — removing a live
-                // winner's file would let two UIs both be First.
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                if pid_file_names_live_ui(&pid_path) {
-                    let _ = std::fs::write(dir.join("show-ui.request"), format!("{page}\n"));
-                    return InstanceRole::Second;
+                // writing its pid (create_new done, writeln
+                // pending) — the old code waited once (10 ms) and
+                // then REMOVED the file when the re-check saw no
+                // live pid, so a winner stalled >10 ms between
+                // create and write lost its claim and the loser
+                // became First too (tun-racefix: the rig's
+                // `gate-already-running-race` hit this 3/3 — both
+                // UIs became First and both quit on the
+                // `--quit-after` timer at ~25.3 s). Wait for the
+                // write instead, bounded (`PID_WRITE_GRACE_POLLS`):
+                // only remove when the file names a dead pid,
+                // vanishes, or is still empty after the full grace
+                // (an owner that died mid-write). Never remove a
+                // file that might belong to a live winner.
+                let mut waited: u32 = 0;
+                loop {
+                    match pid_file_state(&pid_path) {
+                        PidFileState::Live => {
+                            let _ =
+                                std::fs::write(dir.join("show-ui.request"), format!("{page}\n"));
+                            return InstanceRole::Second;
+                        }
+                        PidFileState::Dead | PidFileState::Missing => {
+                            let _ = std::fs::remove_file(&pid_path);
+                            break;
+                        }
+                        PidFileState::Empty => {
+                            waited += 1;
+                            if waited >= PID_WRITE_GRACE_POLLS {
+                                // Owner died mid-write (or the file is
+                                // garbage): reclaim it and retry the claim.
+                                let _ = std::fs::remove_file(&pid_path);
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
                 }
-                let _ = std::fs::remove_file(&pid_path);
             }
             Err(_) => {
                 // Cannot determine single-instance state: open the
@@ -461,18 +490,63 @@ fn ensure_single_instance_unix(data_dir: Option<&PathBuf>, page: &str) -> Instan
     InstanceRole::First(InstanceGuard::with_dir(Some(dir.clone())))
 }
 
+/// How long a claim loser waits for the winner's pid to appear in
+/// the pid file before concluding the file is stale (tun-racefix):
+/// 200 polls x 10 ms = 2 s. The winner writes its pid within
+/// microseconds of creating the file, so 2 s is already
+/// pathological; it only covers a winner stalled between
+/// `create_new` and `writeln!` by scheduler / filesystem stalls
+/// under load.
+#[cfg(not(windows))]
+const PID_WRITE_GRACE_POLLS: u32 = 200;
+
+/// What the pid file says right now (Linux single-instance claim).
+/// `Empty` covers a file the winner created but has not written
+/// yet (create_new done, writeln pending) as well as garbage
+/// content — both mean "no pid to check", never "no owner".
+#[cfg(not(windows))]
+enum PidFileState {
+    /// Names a live `rsh-ui` process other than this one.
+    Live,
+    /// Names a dead pid (stale — safe to remove).
+    Dead,
+    /// Exists but holds no parsable pid (winner mid-write).
+    Empty,
+    /// No file (removed by a rival, or never created).
+    Missing,
+}
+
+/// Classify the pid file's current content.
+#[cfg(not(windows))]
+fn pid_file_state(pid_path: &std::path::Path) -> PidFileState {
+    let text = match std::fs::read_to_string(pid_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return PidFileState::Missing;
+        }
+        Err(_) => return PidFileState::Empty,
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return PidFileState::Empty;
+    };
+    if pid == std::process::id() {
+        // Our own pid (a stale file naming a recycled pid): we
+        // have not claimed yet, so the file cannot be our claim
+        // — it is stale and safe to remove at once.
+        return PidFileState::Dead;
+    }
+    if pid_is_live_rsh_ui(pid) {
+        PidFileState::Live
+    } else {
+        PidFileState::Dead
+    }
+}
+
 /// Whether the pid file names a live `rsh-ui` process other than
-/// this one (edition 2021: no let-chains, so nested `if let`s).
+/// this one.
 #[cfg(not(windows))]
 fn pid_file_names_live_ui(pid_path: &std::path::Path) -> bool {
-    if let Ok(text) = std::fs::read_to_string(pid_path) {
-        if let Ok(pid) = text.trim().parse::<u32>() {
-            if pid != std::process::id() && pid_is_live_rsh_ui(pid) {
-                return true;
-            }
-        }
-    }
-    false
+    matches!(pid_file_state(pid_path), PidFileState::Live)
 }
 
 /// Consume a pending page request (Linux request file; Windows uses
@@ -564,6 +638,13 @@ mod tests {
             .spawn()
             .expect("spawn fake rsh-ui");
         let pid = child.id();
+        // Give the exec a moment to happen before we read cmdline:
+        // right after spawn the child's cmdline is still the
+        // parent's (no "rsh-ui" in it), so the liveness check would
+        // misread it as a stale pid. The old code's single 10 ms
+        // re-check accidentally masked this; the daemon's
+        // equivalent test waits the same 200 ms.
+        std::thread::sleep(std::time::Duration::from_millis(200));
         std::fs::write(dir.join("rsh-ui.pid"), pid.to_string()).unwrap();
         let role = ensure_single_instance(Some(&dir), "settings");
         assert!(matches!(role, InstanceRole::Second));
@@ -581,6 +662,59 @@ mod tests {
         assert_eq!(poll_page_request_file(Some(&dir)), None);
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_pid_file_with_late_writer_is_not_stolen() {
+        // tun-racefix: the winner's pid file is empty between
+        // `create_new` and `writeln!`; a loser that re-checks in
+        // that window must WAIT for the write, not remove the file
+        // and become a second First (the rig's UI race hit this
+        // 3/3). The writer lands 200 ms after the empty file
+        // appears — past the old code's single 10 ms re-check, so
+        // this test FAILS on the old code (First) and passes on the
+        // fix (Second).
+        let dir = tmp_dir();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .arg0("rsh-ui")
+            .spawn()
+            .expect("spawn fake rsh-ui");
+        let pid = child.id();
+        std::fs::write(dir.join("rsh-ui.pid"), "").unwrap();
+        let dir2 = dir.clone();
+        std::thread::spawn(move || {
+            // 200 ms: the fake process has exec'd by then (its
+            // cmdline names rsh-ui), and 200 ms is past the old
+            // 10 ms re-check but far inside the 2 s grace.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::fs::write(dir2.join("rsh-ui.pid"), pid.to_string()).unwrap();
+        });
+        let role = ensure_single_instance(Some(&dir), "settings");
+        assert!(matches!(role, InstanceRole::Second));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_pid_file_with_no_writer_is_reclaimed() {
+        // An owner that died between create and write leaves an empty
+        // file: the claim must still settle (bounded wait), not hang.
+        // Takes the ~2 s grace.
+        let dir = tmp_dir();
+        std::fs::write(dir.join("rsh-ui.pid"), "").unwrap();
+        let role = ensure_single_instance(Some(&dir), "overview");
+        assert!(matches!(role, InstanceRole::First(_)));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("rsh-ui.pid"))
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap(),
+            std::process::id()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
