@@ -502,7 +502,7 @@ const PID_WRITE_GRACE_POLLS: u32 = 200;
 
 /// What the pid file says right now (Linux single-instance claim).
 /// `Empty` covers a file the winner created but has not written
-/// yet (create_new done, writeln pending) as well as garbage
+/// yet (`create_new` done, `writeln!` pending) as well as garbage
 /// content — both mean "no pid to check", never "no owner".
 #[cfg(not(windows))]
 enum PidFileState {
