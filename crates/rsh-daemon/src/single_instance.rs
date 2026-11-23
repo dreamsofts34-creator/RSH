@@ -208,21 +208,43 @@ pub fn acquire(data_dir: &std::path::Path) -> Result<AcquireOutcome, String> {
             Err(ClaimError::Held) => {
                 // Lost the claim race. The winner may still be
                 // writing its pid (create_new done, writeln
-                // pending): give it a moment, then re-check —
-                // removing a live winner's file would let two
-                // daemons both become First. Only when there is
-                // still no live pid is the file a stale leftover
-                // (or an empty file whose owner died mid-write):
-                // remove it and retry the claim. Bounded — a file
-                // that can never be claimed fails loudly below
-                // instead of spinning.
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                if let Some(pid) = recorded_pid(data_dir)
-                    && pid_is_live_rsh_daemon(pid)
-                {
-                    return Ok(AcquireOutcome::AlreadyRunning(Some(pid)));
+                // pending) — the old code waited once (10 ms) and
+                // then REMOVED the file when the re-check saw no
+                // live pid, so a winner stalled >10 ms between
+                // create and write lost its claim and the loser
+                // became First too (tun-racefix: the rig's UI race
+                // hit this in the UI claim 3/3, and the daemon
+                // claim the same way once — two live daemons, both
+                // bound IPC, in the quiet control run). Wait for
+                // the write instead, bounded
+                // (`PID_WRITE_GRACE_POLLS`): only remove when the
+                // file names a dead pid, vanishes, or is still
+                // empty after the full grace (an owner that died
+                // mid-write). Never remove a file that might belong
+                // to a live winner. Bounded — a file that can never
+                // be claimed fails loudly below instead of spinning.
+                let mut waited: u32 = 0;
+                loop {
+                    match daemon_pid_file_state(data_dir) {
+                        DaemonPidFileState::Live(pid) => {
+                            return Ok(AcquireOutcome::AlreadyRunning(Some(pid)));
+                        }
+                        DaemonPidFileState::Dead | DaemonPidFileState::Missing => {
+                            let _ = std::fs::remove_file(pid_file_path(data_dir));
+                            break;
+                        }
+                        DaemonPidFileState::Empty => {
+                            waited += 1;
+                            if waited >= PID_WRITE_GRACE_POLLS {
+                                // Owner died mid-write (or the file is
+                                // garbage): reclaim it and retry the claim.
+                                let _ = std::fs::remove_file(pid_file_path(data_dir));
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
                 }
-                let _ = std::fs::remove_file(pid_file_path(data_dir));
             }
             Err(ClaimError::Io(error)) => {
                 return Err(format!(
@@ -236,6 +258,59 @@ pub fn acquire(data_dir: &std::path::Path) -> Result<AcquireOutcome, String> {
         "cannot acquire daemon lock file {}: claim race did not settle",
         pid_file_path(data_dir).display()
     ))
+}
+
+/// How long a claim loser waits for the winner's pid to appear in
+/// the pid file before concluding the file is stale (tun-racefix):
+/// 200 polls x 10 ms = 2 s. The winner writes its pid within
+/// microseconds of creating the file, so 2 s is already
+/// pathological; it only covers a winner stalled between
+/// `create_new` and `writeln!` by scheduler / filesystem stalls
+/// under load.
+#[cfg(unix)]
+const PID_WRITE_GRACE_POLLS: u32 = 200;
+
+/// What the daemon pid file says right now (see [`acquire`]).
+/// `Empty` covers a file the winner created but has not written
+/// yet (create_new done, writeln pending) as well as garbage
+/// content — both mean "no pid to check", never "no owner".
+#[cfg(unix)]
+enum DaemonPidFileState {
+    /// Names a live `rsh-daemon` other than this process.
+    Live(u32),
+    /// Names a dead pid (stale — safe to remove).
+    Dead,
+    /// Exists but holds no parsable pid (winner mid-write).
+    Empty,
+    /// No file (removed by a rival, or never created).
+    Missing,
+}
+
+/// Classify the pid file's current content.
+#[cfg(unix)]
+fn daemon_pid_file_state(data_dir: &std::path::Path) -> DaemonPidFileState {
+    let path = pid_file_path(data_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return DaemonPidFileState::Missing;
+        }
+        Err(_) => return DaemonPidFileState::Empty,
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return DaemonPidFileState::Empty;
+    };
+    if pid == std::process::id() {
+        // Our own pid (a stale file naming a recycled pid): we
+        // have not claimed yet, so the file cannot be our claim
+        // — it is stale and safe to remove at once.
+        return DaemonPidFileState::Dead;
+    }
+    if pid_is_live_rsh_daemon(pid) {
+        DaemonPidFileState::Live(pid)
+    } else {
+        DaemonPidFileState::Dead
+    }
 }
 
 /// Why [`claim_pid_file`] did not claim the lock.
@@ -581,6 +656,52 @@ mod tests {
         assert!(matches!(acquire(&dir), Ok(AcquireOutcome::First(_))));
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_pid_file_with_late_writer_is_not_stolen() {
+        // tun-racefix: same shape as the UI claim — the winner's pid
+        // file is empty between `create_new` and `writeln!`; a loser
+        // must wait for the write, not remove the file and become a
+        // second First. The writer lands 200 ms after the empty file
+        // appears — past the old single 10 ms re-check, inside the
+        // 2 s grace. FAILS on the old code (First), passes on the
+        // fix (AlreadyRunning).
+        let dir = temp_dir("late-writer");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .arg0("rsh-daemon")
+            .spawn()
+            .expect("spawn fake rsh-daemon");
+        let pid = child.id();
+        std::fs::write(dir.join("rsh-daemon.pid"), "").expect("empty pid file");
+        let dir2 = dir.clone();
+        std::thread::spawn(move || {
+            // 200 ms: the fake process has exec'd by then (its
+            // cmdline names rsh-daemon), and 200 ms is past the old
+            // 10 ms re-check but far inside the 2 s grace.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::fs::write(dir2.join("rsh-daemon.pid"), pid.to_string()).expect("write pid");
+        });
+        assert!(matches!(
+            acquire(&dir),
+            Ok(AcquireOutcome::AlreadyRunning(Some(p))) if p == pid
+        ));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_pid_file_with_no_writer_is_reclaimed() {
+        // An owner that died between create and write leaves an empty
+        // file: the claim must still settle (bounded wait), not hang.
+        // Takes the ~2 s grace.
+        let dir = temp_dir("empty-reclaim");
+        std::fs::write(dir.join("rsh-daemon.pid"), "").expect("empty pid file");
+        assert!(matches!(acquire(&dir), Ok(AcquireOutcome::First(_))));
+        assert_eq!(recorded_pid(&dir), Some(std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
