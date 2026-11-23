@@ -37,8 +37,7 @@
 // the API grows them (A7). Nothing here talks to the daemon directly.
 
 import { Theme } from "../tokens.slint";
-import { Card, Switch, Btn, SliderRow, RangeBlock, PresetChip, ButtonTile, SegmentedControl } from "../components.slint";
-import { ScrollView } from "std-widgets.slint";
+import { Card, CardBody, FormRow, Switch, Btn, SliderRow, RangeBlock, PresetChip, ButtonTile, SegmentedControl, PageScaffold } from "../components.slint";
 
 // Mini curve (preview Pedals.html: 110x110 viewBox, axis + dashed
 // straight line + accent curve + live marker). Path commands come from
@@ -101,12 +100,12 @@ component ExtrasCardHeader inherits HorizontalLayout {
     // UI-UX polish (a): the title centres against the 20px switch
     // instead of top-aligning in the row.
     cross-axis-alignment: center;
-    Text { text: title; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+    Text { text: title; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
     Rectangle { horizontal-stretch: 1; }
     Switch { accessible-name: title; on: on; toggled => { toggled(); } }
 }
 
-export component ExtrasScreen inherits VerticalLayout {
+export component ExtrasScreen inherits PageScaffold {
     // ---- module on/off (Rust-owned; off greys the card body)
     in-out property <bool> handbrake-on: true;
     in-out property <bool> shifter-on: true;
@@ -209,27 +208,17 @@ export component ExtrasScreen inherits VerticalLayout {
     callback horn-min-edited(string);
     callback horn-mode-selected(int);
 
-    // UI-UX polish (a): the 2x2 grid is ~750px tall — taller than
-    // the 524px body — so the bottom row (Horn / LEDs colour) was
-    // clipped below the window edge. The cards scroll inside a
-    // ScrollView now (the Settings pattern); the cards themselves
-    // are unchanged, and short content still sits at the top.
-    extras-scroll := ScrollView {
-        vertical-stretch: 1;
-        content-width: self.visible-width;
-        VerticalLayout {
-            padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
-            spacing: 12px;
-
-            HorizontalLayout {
+    // P1: the page is a PageScaffold (ScrollView + standard
+    // padding) — the 2x2 grid is ~750px tall, taller than the
+    // 524px body, so the bottom row used to clip below the window
+    // edge. Short content still sits at the top.
+    HorizontalLayout {
                 spacing: 0px;
                 // ---- Handbrake
                 Card {
                     horizontal-stretch: 1;
                     min-width: 342px;
-                    VerticalLayout {
-                        padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
-                        spacing: 10px;
+                    CardBody {
                         ExtrasCardHeader { title: "Handbrake"; on: handbrake-on; toggled => { handbrake-on = !handbrake-on; action("handbrake-toggle"); } }
                         // CARDS-LAYOUT-RESEARCH §1 (Bug 2): the OFF
                         // note and the ON body are BOTH always in the
@@ -242,7 +231,7 @@ export component ExtrasScreen inherits VerticalLayout {
                         // space (verified headless, Slint 1.18.1) and
                         // takes no input; the header Switch stays
                         // live so the card can be turned back on.
-                        Text { visible: !handbrake-on; text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        Text { visible: !handbrake-on; text: "Off, turn on to edit"; font-size: Theme.fs-hint; color: Theme.faint; }
                         VerticalLayout { visible: handbrake-on;
                             spacing: 10px;
                             SegmentedControl {
@@ -289,13 +278,13 @@ export component ExtrasScreen inherits VerticalLayout {
                                         }
                                         VerticalLayout {
                                             spacing: 2px;
-                                            Text { text: Math.round(handbrake-pct) + "%"; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; }
-                                            Text { text: "Live"; font-size: 11.5px; color: Theme.mute; }
+                                            Text { text: Math.round(handbrake-pct) + "%"; font-family: Theme.font-mono; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
+                                            Text { text: "Live"; font-size: Theme.fs-hint; color: Theme.mute; }
                                         }
                                     }
                                 }
                                 RangeBlock { up-value: handbrake-up-mv; down-value: handbrake-down-mv; up-disabled: calibration-disabled || busy-kind == 10; down-disabled: calibration-disabled || busy-kind == 10; set-up => { action("handbrake-up"); } set-down => { action("handbrake-down"); } }
-                                if calibration-disabled : Text { text: "RSH isn't running — reconnect to capture."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                                if calibration-disabled : Text { text: "RSH isn't running — reconnect to capture."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
                                 HorizontalLayout {
                                     spacing: 4px;
                                     PresetChip { horizontal-stretch: 1; label: "Linear"; active: handbrake-feel == 0; clicked => { handbrake-feel-selected(0); } }
@@ -307,7 +296,7 @@ export component ExtrasScreen inherits VerticalLayout {
                             if handbrake-mode == 1 : VerticalLayout {
                                 spacing: 10px;
                                 ButtonTile { label: "HANDBRAKE"; action: handbrake-pressed ? "Pressed" : "Released"; pressed: handbrake-pressed; clicked => { action("handbrake-test"); } }
-                                Text { text: "Button mode: the handbrake acts as a digital button (firmware F-15)."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                                Text { text: "Button mode: the handbrake acts as a digital button (firmware F-15)."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
                             }
                             // --- Handbrake/clutch per-module tuning ---
                             // H1/H2/H3: latch + grab speed + throttle
@@ -318,26 +307,10 @@ export component ExtrasScreen inherits VerticalLayout {
                             // same axis). Auto-release only fires
                             // while latch is on (the engine enforces
                             // it too); the note says so when it is off.
-                            HorizontalLayout {
-                                spacing: 8px;
-                                VerticalLayout {
-                                    Text { text: "Latch mode"; font-size: 13px; font-weight: 500; color: Theme.text; }
-                                    Text { text: "Press once to hold, again to release"; font-size: 11.5px; color: Theme.faint; }
-                                }
-                                Rectangle { horizontal-stretch: 1; }
-                                Switch { accessible-name: "Latch mode"; on: handbrake-latch; toggled => { handbrake-latch-changed(!handbrake-latch); } }
-                            }
+                            FormRow { label: "Latch mode"; hint: "Press once to hold, again to release"; Switch { accessible-name: "Latch mode"; on: handbrake-latch; toggled => { handbrake-latch-changed(!handbrake-latch); } } }
                             SliderRow { label: "Grab speed"; hint: "How fast the handbrake bites"; value-text: handbrake-grab-ms-text; value: handbrake-grab-ms; changed(v) => { handbrake-grab-ms-changed(v); } value-edited(t) => { handbrake-grab-ms-edited(t); } }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                VerticalLayout {
-                                    Text { text: "Auto-release on throttle"; font-size: 13px; font-weight: 500; color: Theme.text; }
-                                    Text { text: "Throttle releases a latched handbrake"; font-size: 11.5px; color: Theme.faint; }
-                                }
-                                Rectangle { horizontal-stretch: 1; }
-                                Switch { accessible-name: "Auto-release on throttle"; on: handbrake-auto-release; toggled => { handbrake-auto-release-changed(!handbrake-auto-release); } }
-                            }
-                            if !handbrake-latch : Text { text: "Auto-release only works with latch on."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                            FormRow { label: "Auto-release on throttle"; hint: "Throttle releases a latched handbrake"; Switch { accessible-name: "Auto-release on throttle"; on: handbrake-auto-release; toggled => { handbrake-auto-release-changed(!handbrake-auto-release); } } }
+                            if !handbrake-latch : Text { text: "Auto-release only works with latch on."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
                         }
                     }
                 }
@@ -351,21 +324,19 @@ export component ExtrasScreen inherits VerticalLayout {
                 Card {
                     horizontal-stretch: 1;
                     min-width: 342px;
-                    VerticalLayout {
-                        padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
-                        spacing: 10px;
+                    CardBody {
                         ExtrasCardHeader { title: "Shifter"; on: shifter-on; toggled => { shifter-on = !shifter-on; action("shifter-toggle"); } }
-                        Text { visible: !shifter-on; text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        Text { visible: !shifter-on; text: "Off, turn on to edit"; font-size: Theme.fs-hint; color: Theme.faint; }
                         VerticalLayout { visible: shifter-on;
                             spacing: 10px;
                             Text { text: gear; font-family: Theme.font-mono; font-size: 44px; font-weight: 600; color: Theme.text; horizontal-alignment: center; }
-                            Text { text: shifter-mode == 1 ? "H-pattern · current gear" : "Sequential · current gear"; font-size: 12px; color: Theme.mute; horizontal-alignment: center; }
+                            Text { text: shifter-mode == 1 ? "H-pattern · current gear" : "Sequential · current gear"; font-size: Theme.fs-hint; color: Theme.mute; horizontal-alignment: center; }
                             SliderRow { label: "Sensitivity"; hint: "Shift firmness"; value-text: shifter-sensitivity-text; value: shifter-sensitivity; disabled: sensitivity-disabled; changed(v) => { shifter-sensitivity-changed(v); } value-edited(t) => { shifter-sensitivity-edited(t); } }
-                            if sensitivity-disabled : Text { text: shifter-sensitivity-reason; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                            if sensitivity-disabled : Text { text: shifter-sensitivity-reason; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
                             SliderRow { label: "Shift lockout"; hint: "Ignores shifts within this window"; value-text: shifter-lockout-text; value: shifter-lockout; changed(v) => { shifter-lockout-changed(v); } value-edited(t) => { shifter-lockout-edited(t); } }
                             Text {
                                 text: "Change gear mapping in Buttons";
-                                font-size: 12px;
+                                font-size: Theme.fs-label;
                                 font-weight: 600;
                                 color: gear-fs.has-focus || gear-ta.has-hover ? Theme.text : Theme.accent-text;
                                 accessible-label: "Change gear mapping in Buttons";
@@ -394,11 +365,9 @@ export component ExtrasScreen inherits VerticalLayout {
                 Card {
                     horizontal-stretch: 1;
                     min-width: 342px;
-                    VerticalLayout {
-                        padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
-                        spacing: 10px;
+                    CardBody {
                         ExtrasCardHeader { title: "Horn"; on: horn-on; toggled => { horn-on = !horn-on; action("horn-toggle"); } }
-                        Text { visible: !horn-on; text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        Text { visible: !horn-on; text: "Off, turn on to edit"; font-size: Theme.fs-hint; color: Theme.faint; }
                         VerticalLayout { visible: horn-on;
                             spacing: 10px;
                             ButtonTile { label: "HORN BUTTON"; action: horn-button; pressed: horn-pressed; clicked => { action("horn-learn"); } }
@@ -407,8 +376,8 @@ export component ExtrasScreen inherits VerticalLayout {
                                 Btn { label: horn-learning ? "Listening…" : "Learn from wheel"; primary: true; disabled: busy-kind == 11 || busy-kind == 17; clicked => { action("horn-learn"); } }
                                 Btn { label: "Test"; clicked => { action("horn-test"); } }
                             }
-                            if horn-learning : Text { text: "Press the horn button on the wheel…"; font-size: 11.5px; color: Theme.warn; }
-                            if !horn-learning : Text { text: "Test only lights the indicator when Send to game is off."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                            if horn-learning : Text { text: "Press the horn button on the wheel…"; font-size: Theme.fs-hint; color: Theme.warn; }
+                            if !horn-learning : Text { text: "Test only lights the indicator when Send to game is off."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
                             SegmentedControl {
                                 option-0: "Momentary";
                                 option-1: "Latch";
@@ -416,7 +385,7 @@ export component ExtrasScreen inherits VerticalLayout {
                                 selected-changed(i) => { horn-mode-selected(i); }
                             }
                             SliderRow { label: "Minimum honk"; hint: "Quick taps still honk this long"; value-text: horn-min-text; value: (horn-min-ms - 100) / 900; changed(v) => { horn-min-changed(v); } value-edited(t) => { horn-min-edited(t); } }
-                            if horn-mode == 1 : Text { text: "Latch: press once to honk, again to stop."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                            if horn-mode == 1 : Text { text: "Latch: press once to honk, again to stop."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
                         }
                     }
                 }
@@ -430,11 +399,9 @@ export component ExtrasScreen inherits VerticalLayout {
                 Card {
                     horizontal-stretch: 1;
                     min-width: 342px;
-                    VerticalLayout {
-                        padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
-                        spacing: 10px;
+                    CardBody {
                         ExtrasCardHeader { title: "LEDs"; on: leds-on; toggled => { leds-on = !leds-on; action("leds-toggle"); } }
-                        Text { visible: !leds-on; text: "Off, turn on to edit"; font-size: 12px; color: Theme.faint; }
+                        Text { visible: !leds-on; text: "Off, turn on to edit"; font-size: Theme.fs-hint; color: Theme.faint; }
                         VerticalLayout { visible: leds-on;
                             spacing: 10px;
                             // Live LED strip preview (8 circles, colours from Rust)
@@ -455,12 +422,12 @@ export component ExtrasScreen inherits VerticalLayout {
                                 PresetChip { horizontal-stretch: 1; label: "Chase"; active: led-pattern == 3; clicked => { led-pattern-selected(3); } }
                                 PresetChip { horizontal-stretch: 1; label: "Rainbow"; active: led-pattern == 4; clicked => { led-pattern-selected(4); } }
                             }
-                            SliderRow { label: "Brightness"; hint: "Brightness"; value-text: led-brightness-text; value: led-brightness; changed(v) => { led-brightness-changed(v); } value-edited(t) => { led-brightness-edited(t); } }
+                            SliderRow { label: "Brightness"; hint: "Overall LED brightness"; value-text: led-brightness-text; value: led-brightness; changed(v) => { led-brightness-changed(v); } value-edited(t) => { led-brightness-edited(t); } }
                             if led-pattern == 2 || led-pattern == 3 || led-pattern == 4 : SliderRow { label: "Blink / Chase speed"; hint: "Blink / Chase / Rainbow cycle time"; value-text: led-period-text; value: (led-period-ms - 100) / 4900; changed(v) => { led-period-changed(v); } value-edited(t) => { led-period-edited(t); } }
                             if led-pattern == 1 : VerticalLayout {
                                 spacing: 6px;
-                                Text { text: "Colour"; font-size: 12.5px; font-weight: 500; color: Theme.text; }
-                                Text { text: "Colour is saved on the wheel."; font-size: 11.5px; color: Theme.faint; }
+                                Text { text: "Colour"; font-size: Theme.fs-label; font-weight: 500; color: Theme.text; }
+                                Text { text: "Colour is saved on the wheel."; font-size: Theme.fs-hint; color: Theme.faint; }
                                 HorizontalLayout {
                                     spacing: 8px;
                                     for s[i] in [#FF6B6B, #F5B84A, #3DD68C, #2F6BFF, #B46CFF, #FFFFFF] : Rectangle {
@@ -496,8 +463,8 @@ export component ExtrasScreen inherits VerticalLayout {
                                 HorizontalLayout {
                                     spacing: 8px;
                                     cross-axis-alignment: center;
-                                    Text { text: "Custom colour"; font-size: 12.5px; font-weight: 500; color: Theme.text; }
-                                    Text { text: led-color-hex-text; font-family: Theme.font-mono; font-size: 12px; color: Theme.mute; }
+                                    Text { text: "Custom colour"; font-size: Theme.fs-label; font-weight: 500; color: Theme.text; }
+                                    Text { text: led-color-hex-text; font-family: Theme.font-mono; font-size: Theme.fs-value; color: Theme.mute; }
                                     Rectangle { horizontal-stretch: 1; }
                                     Btn { label: show-custom-color ? "Hide" : "Custom…"; clicked => { show-custom-color = !show-custom-color; } }
                                 }
@@ -512,7 +479,4 @@ export component ExtrasScreen inherits VerticalLayout {
                     }
                 }
             }
-            Rectangle { height: 2px; }
-        }
-    }
 }

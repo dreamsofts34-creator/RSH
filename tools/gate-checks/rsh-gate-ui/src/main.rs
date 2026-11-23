@@ -1451,14 +1451,14 @@ fn ui_banner_wrap() -> Outcome {
     }
     let long = get_num(&instance, "banner-height");
     report.check(
-        "banner-short-36px",
-        short == Some(36.0),
-        &format!("short text banner height: {short:?} (want 36)"),
+        "banner-short-46px",
+        short == Some(46.0),
+        &format!("short text banner height: {short:?} (want 46)"),
     );
     report.check(
         "banner-long-grows",
-        long.is_some_and(|h| h > 40.0),
-        &format!("150-char text banner height: {long:?} (want > 40)"),
+        long.is_some_and(|h| h > 46.0),
+        &format!("150-char text banner height: {long:?} (want > 46)"),
     );
     report.finish()
 }
@@ -2871,7 +2871,7 @@ fn checks() -> Vec<UiCheck> {
         ),
         (
             "ui-banner-wrap",
-            "DS-21: EmptyBanner wraps long text and grows past 36 px (short text stays 36 px)",
+            "DS-21: EmptyBanner wraps long text and grows past 46 px (short text stays 46 px)",
             ui_banner_wrap as fn() -> Outcome,
         ),
         (

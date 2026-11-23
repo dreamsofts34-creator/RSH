@@ -41,8 +41,8 @@ export component GameDialog inherits Card {
     layout := VerticalLayout {
         padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
         spacing: 10px;
-        Text { text: title; font-size: 12.5px; font-weight: 600; color: Theme.text; }
-        Text { text: "Name"; font-size: 11.5px; color: Theme.mute; }
+        Text { text: title; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
+        Text { text: "Name"; font-size: Theme.fs-label; color: Theme.mute; }
         Rectangle {
             horizontal-stretch: 1;
             height: 28px;
@@ -56,14 +56,14 @@ export component GameDialog inherits Card {
                 height: 100%;
                 vertical-alignment: center;
                 text <=> name;
-                font-size: 12px;
+                font-size: Theme.fs-hint;
                 font-weight: 500;
                 color: Theme.text;
                 selection-background-color: Theme.accent;
                 accepted => { if (name != "" && exe != "") { save(name, exe); } }
             }
         }
-        Text { text: "Game file (.exe or shortcut)"; font-size: 11.5px; color: Theme.mute; }
+        Text { text: "Game file (.exe or shortcut)"; font-size: Theme.fs-label; color: Theme.mute; }
         HorizontalLayout {
             spacing: 8px;
             Rectangle {
@@ -79,25 +79,25 @@ export component GameDialog inherits Card {
                     height: 100%;
                     vertical-alignment: center;
                     text: exe == "" ? "No file chosen" : exe;
-                    font-size: 12px;
+                    font-size: Theme.fs-hint;
                     font-weight: 500;
                     color: exe == "" ? Theme.faint : Theme.text;
                     overflow: elide;
                 }
             }
-            Btn { label: "Browse…"; clicked => { browse(); } }
+            Btn { label: "Browse…"; icon: @image-url("../../assets/icons/folder.svg"); has-icon: true; clicked => { browse(); } }
         }
         HorizontalLayout {
             spacing: 8px;
-            Text { vertical-alignment: center; text: "Profile: " + profile-name; font-size: 12px; color: Theme.text; }
+            Text { vertical-alignment: center; text: "Profile: " + profile-name; font-size: Theme.fs-label; color: Theme.text; }
             Rectangle { horizontal-stretch: 1; }
             Btn { label: "Change"; clicked => { cycle-profile(); } }
         }
         HorizontalLayout {
             spacing: 6px;
-            Btn { label: "Save"; primary: true; disabled: name == "" || exe == ""; clicked => { save(name, exe); } }
+            Btn { label: "Save"; primary: true; icon: @image-url("../../assets/icons/save.svg"); has-icon: true; disabled: name == "" || exe == ""; clicked => { save(name, exe); } }
             Btn { label: "Cancel"; clicked => { cancel(); } }
         }
-        Text { text: "RSH switches profile automatically when this game starts."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+        Text { text: "RSH switches profile automatically when this game starts."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
     }
 }

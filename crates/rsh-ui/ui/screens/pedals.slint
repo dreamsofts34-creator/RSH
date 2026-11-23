@@ -12,8 +12,7 @@
 // token, no other deviation).
 
 import { Theme } from "../tokens.slint";
-import { Card, Pill, Btn, SliderRow, Switch } from "../components.slint";
-import { ScrollView } from "std-widgets.slint";
+import { Card, CardBody, FormRow, Pill, Btn, SliderRow, Switch, PageScaffold } from "../components.slint";
 
 // ---------------------------------------------------------------- feel chip (§6: active = accent border + tint)
 component FeelChip inherits Rectangle {
@@ -45,7 +44,7 @@ component FeelChip inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         text: label;
-        font-size: 11.5px;
+        font-size: Theme.fs-hint;
         font-weight: 600;
         color: active ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
     }
@@ -189,12 +188,13 @@ component PedalCard inherits Card {
     callback saturation-changed(float);
     callback saturation-edited(string);
 
-    VerticalLayout {
-        padding-top: 14px; padding-bottom: 14px; padding-left: 14px; padding-right: 14px;
-        spacing: 12px;
+    // P1: the card body is the shared CardBody (16px padding,
+    // 12px spacing, alignment: start) — cards of different
+    // heights in one row never grow an inner gap.
+    CardBody {
         HorizontalLayout {
             alignment: space-between;
-            Text { text: pedal-name; font-size: 13px; font-weight: 600; color: Theme.text; }
+            Text { text: pedal-name; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
             Pill { label: Math.round(pct) + "%"; bg: pct > 0 ? Theme.ok-bg : Theme.panel2; fg: pct > 0 ? Theme.ok : Theme.mute; }
         }
         // live viz: vertical bar (16x110) + mini curve
@@ -242,8 +242,8 @@ component PedalCard inherits Card {
                 VerticalLayout {
                     padding-top: 8px; padding-bottom: 8px; padding-left: 10px; padding-right: 10px;
                     spacing: 6px;
-                    Text { text: "Pedal up"; font-size: 11px; color: Theme.mute; }
-                    Text { text: up-mv; font-family: Theme.font-mono; font-size: 13px; font-weight: 600; color: Theme.text; }
+                    Text { text: "Pedal up"; font-size: Theme.fs-hint; color: Theme.mute; }
+                    Text { text: up-mv; font-family: Theme.font-mono; font-size: Theme.fs-value; font-weight: 600; color: Theme.text; }
                     Btn { horizontal-stretch: 1; label: "Set up"; disabled: set-disabled || busy-kind == 10; clicked => { set-up(); } }
                 }
             }
@@ -256,8 +256,8 @@ component PedalCard inherits Card {
                 VerticalLayout {
                     padding-top: 8px; padding-bottom: 8px; padding-left: 10px; padding-right: 10px;
                     spacing: 6px;
-                    Text { text: "Pedal down"; font-size: 11px; color: Theme.mute; }
-                    Text { text: down-mv; font-family: Theme.font-mono; font-size: 13px; font-weight: 600; color: Theme.text; }
+                    Text { text: "Pedal down"; font-size: Theme.fs-hint; color: Theme.mute; }
+                    Text { text: down-mv; font-family: Theme.font-mono; font-size: Theme.fs-value; font-weight: 600; color: Theme.text; }
                     Btn { horizontal-stretch: 1; label: "Set down"; disabled: set-disabled || busy-kind == 10; clicked => { set-down(); } }
                 }
             }
@@ -288,9 +288,9 @@ component PedalCard inherits Card {
         // R2-16: Advanced only — the live raw ADC reading (~1 Hz).
         if advanced : HorizontalLayout {
             spacing: 8px;
-            Text { text: "Raw live"; font-size: 12px; color: Theme.mute; }
+            Text { text: "Raw live"; font-size: Theme.fs-hint; color: Theme.mute; }
             Rectangle { horizontal-stretch: 1; }
-            Text { text: raw-mv; font-family: Theme.font-mono; font-size: 12px; font-weight: 600; color: Theme.text; }
+            Text { text: raw-mv; font-family: Theme.font-mono; font-size: Theme.fs-value; font-weight: 600; color: Theme.text; }
         }
     }
 }
@@ -300,7 +300,7 @@ component PedalCard inherits Card {
 // The calibration rule (§7.3): "Set down" needs the pedal fully pressed —
 // the backend enforces it with a UserError (see PEDALS-BUTTONS-PORTING.md
 // §3); this line states the rule, it is not the enforcement.
-export component PedalsPage inherits VerticalLayout {
+export component PedalsPage inherits PageScaffold {
     // R2-16: Advanced mode (live raw mV per pedal, ~1 Hz).
     in property <bool> advanced: false;
     in property <string> throttle-raw-mv: "—";
@@ -406,16 +406,10 @@ export component PedalsPage inherits VerticalLayout {
     callback throttle-saturation-edited(string); // typed "85%"
     callback combine-pedals-changed(bool);
 
-    // Phase 2 (F-5): the page scrolls (Settings pattern) — the
-    // clutch card clipped ~11 px Basic / ~30–38 px Advanced.
-    // Root padding lives on the inner layout now; the trailing
-    // stretch absorber goes away (the ScrollView owns the slack).
-    pedals-scroll := ScrollView {
-        vertical-stretch: 1;
-        content-width: self.visible-width;
-        VerticalLayout {
-    padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
-    spacing: 12px;
+    // P1: the page is a PageScaffold (ScrollView + standard
+    // padding) — the clutch card used to clip ~11 px Basic /
+    // ~30–38 px Advanced. The trailing stretch absorber is gone:
+    // the ScrollView owns the slack.
     // FIX (inner shortfall): the shell sizes the page to its preferred
     // width, and the row only shares what the cards prefer - the cards
     // preferred 215px each (row 671px, ending x=874). `min-width:
@@ -601,19 +595,9 @@ export component PedalsPage inherits VerticalLayout {
     // --- Pedal ramps/curves per-module tuning ---
     // A5: Combined pedals — gas + brake as one axis, for old games.
     // Advanced only; Rust owns the switch state.
-    if advanced : HorizontalLayout {
-        spacing: 8px;
-        VerticalLayout {
-            Text { text: "Combined pedals"; font-size: 13px; font-weight: 500; color: Theme.text; }
-            Text { text: "Gas + brake as one axis, for old games"; font-size: 11.5px; color: Theme.faint; }
-        }
-        Rectangle { horizontal-stretch: 1; }
-        Switch { accessible-name: "Combined pedals"; on: combine-pedals; toggled => { combine-pedals-changed(!combine-pedals); } }
-    }
+    if advanced : FormRow { label: "Combined pedals"; hint: "Gas + brake as one axis, for old games"; Switch { accessible-name: "Combined pedals"; on: combine-pedals; toggled => { combine-pedals-changed(!combine-pedals); } } }
     // B4: the extra calibration-rule hint line below the cards is
     // removed — the Set up / Set down buttons carry the action.
-    // (Phase 2: the old stretch absorber is gone — the ScrollView
-    // owns the slack now.)
-        }
-    }
+    // (The old stretch absorber is gone — the ScrollView inside
+    // the PageScaffold owns the slack now.)
 }

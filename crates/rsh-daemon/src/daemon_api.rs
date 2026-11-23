@@ -295,7 +295,11 @@ impl DaemonApi {
             MgrState::Active => (MgrState::Active, "Connected".to_string(), None, None),
             MgrState::Error { reason, hint, .. } => (
                 mgr.clone(),
-                "Error".to_string(),
+                // D10: the label comes from the manager state alone
+                // (ConnectionState::label) — "Wheel not found" /
+                // "Disconnected" for a missing wheel, "Error" only
+                // for a real fault. Never hardcoded here.
+                mgr.label().to_string(),
                 Some(*reason),
                 Some(hint.clone()),
             ),

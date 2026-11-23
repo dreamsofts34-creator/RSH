@@ -6,6 +6,7 @@
 // give fixed-size siblings an explicit `horizontal-stretch: 0` where they
 // would otherwise share freed space.
 import { Theme } from "tokens.slint";
+import { ScrollView } from "std-widgets.slint";
 
 // ---------------------------------------------------------------- card shell (§6: radius 12px, 1px border, 14px 16px padding via content)
 export component Card inherits Rectangle {
@@ -13,6 +14,117 @@ export component Card inherits Rectangle {
     border-width: 1px;
     border-color: Theme.line;
     background: Theme.panel;
+}
+
+// ---------------------------------------------------------------- shared card body (P1, B09/B12/B14):
+// EVERY card's content goes through this — 16px padding, 12px
+// spacing, `alignment: start`, so slack never lands in a Text
+// child and no card grows a gap when its row-mates are taller.
+// Project rule (see the file header): an `alignment: start`
+// layout must NOT contain a `vertical-stretch` absorber Rectangle
+// — the alignment already packs children at the top, the leftover
+// space simply stays empty.
+export component CardBody inherits VerticalLayout {
+    in property <string> title;
+    in property <image> title-icon;
+    in property <bool> has-title-icon: false;
+    padding: 16px;
+    spacing: 12px;
+    alignment: start;
+    if title != "" : HorizontalLayout {
+        spacing: 8px;
+        cross-axis-alignment: center;
+        if has-title-icon : Image { width: 16px; height: 16px; source: title-icon; colorize: Theme.mute; }
+        Text { text: title; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
+    }
+    @children
+}
+
+// ---------------------------------------------------------------- form row (P1): label+hint left (stretch,
+// wrap), control right, min-height 44, vertically centred. The
+// control is whatever the caller puts after the labels.
+export component FormRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> hint;
+    min-height: 44px;
+    spacing: 16px;
+    cross-axis-alignment: center;
+    VerticalLayout {
+        horizontal-stretch: 1;
+        min-width: 0px;
+        spacing: 2px;
+        Text { text: label; font-size: Theme.fs-label; font-weight: 500; color: Theme.text; overflow: elide; }
+        if hint != "" : Text { text: hint; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
+    }
+    @children
+}
+
+// ---------------------------------------------------------------- page scaffold (P1): EVERY page's outer
+// shell — a ScrollView with the standard page padding (20px
+// sides, 16px top/bottom) and 16px card gaps, content packed at
+// the top. `viewport-width: visible-width` pins the content to
+// the visible width, so a long hint can never push a card off
+// the right edge (B07-class). The 40px StatusBar reserve lives
+// on the main.slint content column, not here.
+// `scroll-width` exposes the ScrollView's width for spacing
+// formulas that must read a parent-driven width (never
+// `self.width` inside the content — binding loop).
+export component PageScaffold inherits VerticalLayout {
+    out property <length> scroll-width: page-scroll.width;
+    page-scroll := ScrollView {
+        vertical-stretch: 1;
+        content-width: self.visible-width;
+        VerticalLayout {
+            padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
+            spacing: 16px;
+            alignment: start;
+            @children
+        }
+    }
+}
+
+// ---------------------------------------------------------------- modal (P1, B19 wiring is P2): centred
+// 420px card over a 40% scrim, overlay shadow. The caller owns
+// the open state (places `if open : Modal { ... }` over the area
+// it covers) and closes on `closed()` — scrim click, or Escape
+// when the modal has focus (the root keyboard scope also
+// forwards Escape to the same callback). The scrim is a child
+// Rectangle so its opacity never dims the card.
+export component Modal inherits Rectangle {
+    in property <string> title;
+    callback closed();
+    background: transparent;
+    scrim := Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000;
+        opacity: 0.4;
+        TouchArea { clicked => { closed(); } }
+    }
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                closed();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    modal-card := Card {
+        width: 420px;
+        height: body.preferred-height;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        drop-shadow-blur: 24px;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-color: #00000040;
+        body := CardBody {
+            title: title;
+            @children
+        }
+    }
 }
 
 // ---------------------------------------------------------------- switch (§6: 34x20 cards/top bar, 40x22 tray)
@@ -82,16 +194,24 @@ export component Pill inherits Rectangle {
         height: 20px;
         vertical-alignment: center;
         text: label;
-        font-size: 11px;
+        font-size: Theme.fs-hint;
         font-weight: 600;
         color: fg;
     }
 }
 
-// ---------------------------------------------------------------- button (primary accent / secondary panel2)
+// ---------------------------------------------------------------- button (D3 hierarchy — one primary
+// (accent fill) per screen; secondary is an outline, tertiary is
+// a ghost (no border), destructive (Remove, Restore) is a red
+// outline. D2: `icon` + `has-icon` put a 16px line icon before
+// the label, colour-matched to the label.)
 export component Btn inherits Rectangle {
     in property <string> label;
     in property <bool> primary;
+    in property <image> icon;
+    in property <bool> has-icon: false;
+    in property <bool> ghost: false;
+    in property <bool> destructive: false;
     // Disabled buttons never fire `clicked` and render dimmed; the
     // caller shows the short reason next to them (v2.0.1 hotfix: no
     // fake-working buttons — a button either works or is disabled
@@ -101,18 +221,18 @@ export component Btn inherits Rectangle {
     accessible-role: button;
     in property <length> btn-w: 0px;
     callback clicked();
-    width: btn-w > 0px ? btn-w : lbl.width + 24px;
+    width: btn-w > 0px ? btn-w : content.preferred-width + 24px;
     height: 30px;
     border-radius: 8px;
-    border-width: 1px;
+    border-width: ghost ? 0px : 1px;
     // A5: hover + pressed feedback — primary lightens/darkens the
-    // accent, secondary lightens the panel; hover also lifts the border.
-    // UI-UX polish (R2-12 wave): a disabled button never shows hover
-    // or pressed fills — it stays dimmed (opacity 0.45 below) with its
-    // resting border/background, so a job running elsewhere never
-    // leaves a dead button looking live on hover.
-    border-color: fs.has-focus ? Theme.accent-text : (primary ? Theme.accent : (!disabled && ta.has-hover ? Theme.faint : Theme.line));
-    background: primary ? (!disabled && ta.pressed ? Theme.accent-pressed : !disabled && ta.has-hover ? Theme.accent-hover : Theme.accent) : (!disabled && ta.pressed ? Theme.pressed-bg : !disabled && ta.has-hover ? Theme.hover-bg : Theme.panel2);
+    // accent, secondary/destructive lift the border + fill on
+    // hover, ghost only fills on hover. A disabled button never
+    // shows hover or pressed fills — it stays dimmed (opacity 0.45
+    // below) with its resting border/background, so a job running
+    // elsewhere never leaves a dead button looking live on hover.
+    border-color: fs.has-focus ? Theme.accent-text : destructive ? Theme.bad : (primary ? Theme.accent : (!disabled && ta.has-hover ? Theme.faint : Theme.line));
+    background: primary ? (!disabled && ta.pressed ? Theme.accent-pressed : !disabled && ta.has-hover ? Theme.accent-hover : Theme.accent) : destructive ? (!disabled && ta.pressed ? Theme.err-bg : !disabled && ta.has-hover ? Theme.err-bg : transparent) : ghost ? (!disabled && ta.pressed ? Theme.pressed-bg : !disabled && ta.has-hover ? Theme.hover-bg : transparent) : (!disabled && ta.pressed ? Theme.pressed-bg : !disabled && ta.has-hover ? Theme.hover-bg : transparent);
     opacity: disabled ? 0.45 : 1;
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
@@ -127,15 +247,25 @@ export component Btn inherits Rectangle {
             return reject;
         }
     }
-    lbl := Text {
+    content := HorizontalLayout {
         x: (parent.width - self.width) / 2;
-        height: 100%;
-        vertical-alignment: center;
-        text: label;
-        font-size: 12px;
-        font-weight: 600;
-        // White on accent (4.50:1); Theme.text on accent is 3.83:1 (audit FIX-2).
-        color: primary ? #FFFFFF : Theme.text;
+        y: (parent.height - self.height) / 2;
+        spacing: 6px;
+        cross-axis-alignment: center;
+        if has-icon : Image {
+            width: 16px;
+            height: 16px;
+            source: icon;
+            colorize: primary ? #FFFFFF : destructive ? Theme.bad : Theme.text;
+        }
+        lbl := Text {
+            vertical-alignment: center;
+            text: label;
+            font-size: Theme.fs-label;
+            font-weight: 600;
+            // White on accent (4.50:1); Theme.text on accent is 3.83:1 (audit FIX-2).
+            color: primary ? #FFFFFF : destructive ? Theme.bad : Theme.text;
+        }
     }
     ta := TouchArea { mouse-cursor: disabled ? MouseCursor.default : MouseCursor.pointer; clicked => { if (!disabled) { clicked(); } } }
 }
@@ -174,15 +304,15 @@ export component NavItem inherits Rectangle {
         // fixed-height children sit high without this).
         cross-axis-alignment: center;
         Image {
-            width: 17px;
-            height: 17px;
+            width: 16px;
+            height: 16px;
             source: icon;
             colorize: active ? Theme.accent-text : Theme.mute;
         }
         Text {
             vertical-alignment: center;
             text: label;
-            font-size: 13px;
+            font-size: Theme.fs-label;
             font-weight: 500;
             color: active ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
         }
@@ -224,7 +354,7 @@ export component SubItem inherits Rectangle {
         height: 100%;
         vertical-alignment: center;
         text: label;
-        font-size: 12.5px;
+        font-size: Theme.fs-label;
         font-weight: 500;
         color: active ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
     }
@@ -232,8 +362,13 @@ export component SubItem inherits Rectangle {
 }
 
 // ---------------------------------------------------------------- status card (§6: sidebar bottom, on every screen)
+// D10: the dot is green only when Connected. `conn-warn` (wheel
+// simply not found / dropped / reconnecting) is amber; red is
+// reserved for a real fault (wrong wheel, watchdog latch, port
+// in use) — set from Rust via ConnectionState::is_fault().
 export component StatusCard inherits Rectangle {
     in property <bool> connected;
+    in property <bool> conn-warn: false;
     in property <string> label;
     in property <string> sub;
     in property <bool> send-to-game;
@@ -251,26 +386,27 @@ export component StatusCard inherits Rectangle {
             // two-line label (align-items:center) — without this the
             // 14px halo sits at the top of the ~30px text block.
             cross-axis-alignment: center;
-            // Halo disc is a pre-blended solid (Theme.halo-ok / halo-bad);
-            // the dot is a solid disc on top. Do NOT use opacity here — an
-            // opacity rect dims its child dot too (spike bug, Phase 3 fix).
+            // Halo disc is a pre-blended solid (Theme.halo-ok /
+            // halo-warn / halo-bad); the dot is a solid disc on top.
+            // Do NOT use opacity here — an opacity rect dims its
+            // child dot too (spike bug, Phase 3 fix).
             Rectangle {
                 width: 14px;
                 height: 14px;
                 border-radius: 7px;
-                background: connected ? Theme.halo-ok : Theme.halo-bad;
+                background: connected ? Theme.halo-ok : conn-warn ? Theme.halo-warn : Theme.halo-bad;
                 Rectangle {
                     x: 3px;
                     y: 3px;
                     width: 8px;
                     height: 8px;
                     border-radius: 4px;
-                    background: connected ? Theme.ok : Theme.bad;
+                    background: connected ? Theme.ok : conn-warn ? Theme.warn : Theme.bad;
                 }
             }
             VerticalLayout {
-                Text { text: label; font-size: 12px; font-weight: 600; color: Theme.text; }
-                Text { text: sub; font-size: 11px; color: Theme.mute; }
+                Text { text: label; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
+                Text { text: sub; font-size: Theme.fs-hint; color: Theme.mute; }
             }
         }
         HorizontalLayout {
@@ -278,14 +414,18 @@ export component StatusCard inherits Rectangle {
             // align-items:center — the label centres against the 20px
             // switch instead of sitting at the top of the row.
             cross-axis-alignment: center;
-            Text { text: "Send to game"; font-size: 12px; color: Theme.text; }
+            Text { text: "Send to game"; font-size: Theme.fs-label; color: Theme.text; }
             Rectangle { horizontal-stretch: 1; }
             Switch { accessible-name: "Send to game"; on: send-to-game; toggled => { toggled-send(); } }
         }
     }
 }
 
-// ---------------------------------------------------------------- segmented control (§6: Basic/Advanced, Dark/Light/Auto, Wi-Fi/USB)
+// ---------------------------------------------------------------- segmented control v2 (§6: Basic/Advanced, Dark/Light/Auto, Wi-Fi/USB)
+// B11: every option stretches equally — no fixed 62/78/62px
+// widths, so "Momentary" never clips and a wide control never
+// leaves its options small. `min-width: 160px` keeps three
+// options usable in a narrow container.
 export component SegmentedControl inherits Rectangle {
     in property <string> option-0;
     in property <string> option-1;
@@ -293,6 +433,7 @@ export component SegmentedControl inherits Rectangle {
     in property <int> selected: 0;
     callback selected-changed(int);
     height: 30px;
+    min-width: 160px;
     border-radius: 8px;
     border-width: 1px;
     border-color: Theme.line;
@@ -301,7 +442,8 @@ export component SegmentedControl inherits Rectangle {
         padding: 2px;
         spacing: 0px;
         Rectangle {
-            width: 62px;
+            horizontal-stretch: 1;
+            min-width: 0px;
             height: 24px;
             border-radius: 6px;
             accessible-label: option-0;
@@ -318,11 +460,12 @@ export component SegmentedControl inherits Rectangle {
                     return reject;
                 }
             }
-            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-0; font-size: 12px; font-weight: 600; color: selected == 0 ? Theme.sel-text : (ta0.has-hover ? Theme.text : Theme.mute); }
+            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-0; font-size: Theme.fs-hint; font-weight: 600; color: selected == 0 ? Theme.sel-text : (ta0.has-hover ? Theme.text : Theme.mute); overflow: elide; }
             ta0 := TouchArea { mouse-cursor: pointer; clicked => { selected-changed(0); } }
         }
         Rectangle {
-            width: 78px;
+            horizontal-stretch: 1;
+            min-width: 0px;
             height: 24px;
             border-radius: 6px;
             accessible-label: option-1;
@@ -339,11 +482,12 @@ export component SegmentedControl inherits Rectangle {
                     return reject;
                 }
             }
-            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-1; font-size: 12px; font-weight: 600; color: selected == 1 ? Theme.sel-text : (ta1.has-hover ? Theme.text : Theme.mute); }
+            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-1; font-size: Theme.fs-hint; font-weight: 600; color: selected == 1 ? Theme.sel-text : (ta1.has-hover ? Theme.text : Theme.mute); overflow: elide; }
             ta1 := TouchArea { mouse-cursor: pointer; clicked => { selected-changed(1); } }
         }
         if option-2 != "" : Rectangle {
-            width: 62px;
+            horizontal-stretch: 1;
+            min-width: 0px;
             height: 24px;
             border-radius: 6px;
             accessible-label: option-2;
@@ -360,7 +504,7 @@ export component SegmentedControl inherits Rectangle {
                     return reject;
                 }
             }
-            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-2; font-size: 12px; font-weight: 600; color: selected == 2 ? Theme.sel-text : (ta2.has-hover ? Theme.text : Theme.mute); }
+            Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: option-2; font-size: Theme.fs-hint; font-weight: 600; color: selected == 2 ? Theme.sel-text : (ta2.has-hover ? Theme.text : Theme.mute); overflow: elide; }
             ta2 := TouchArea { mouse-cursor: pointer; clicked => { selected-changed(2); } }
         }
     }
@@ -398,7 +542,7 @@ export component ProfileButton inherits Rectangle {
         // 12px chevron centres against the label in the 30px button.
         cross-axis-alignment: center;
         if unsaved : Rectangle { width: 8px; height: 8px; border-radius: 4px; background: Theme.warn; }
-        Text { text: name; font-size: 12px; font-weight: 600; color: Theme.text; }
+        Text { text: name; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
         Image { width: 12px; height: 12px; source: @image-url("../assets/icons/chevron.svg"); }
     }
     ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
@@ -422,13 +566,13 @@ export component AutoProfileChip inherits Rectangle {
         // the 7px dot + labels centre against the 20px switch.
         cross-axis-alignment: center;
         Rectangle { width: 7px; height: 7px; border-radius: 4px; background: paused ? Theme.warn : Theme.accent-text; }
-        Text { text: "Auto profile"; font-size: 12px; color: Theme.mute; }
-        Text { text: game-profile; font-size: 12px; font-weight: 600; color: Theme.text; }
+        Text { text: "Auto profile"; font-size: Theme.fs-label; color: Theme.mute; }
+        Text { text: game-profile; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
         Switch { accessible-name: "Pause auto profile"; on: !paused; toggled => { pause-toggled(); } }
     }
 }
 
-// ---------------------------------------------------------------- slider + number box (§6: accent slider + 54-60px mono box, typeable)
+// ---------------------------------------------------------------- slider + number box (§6: accent slider + 64x28 mono box, typeable)
 export component SliderRow inherits VerticalLayout {
     in property <string> label;
     in property <string> hint;
@@ -465,26 +609,18 @@ export component SliderRow inherits VerticalLayout {
     }
     spacing: 6px;
     opacity: disabled ? 0.45 : 1;
+    // SliderRow v2 (P1, B07): top row is label (elides) + value
+    // box; the track sits below; the hint wraps under the track.
+    // The old header put label+hint in one column beside the box
+    // with no wrap/elide/stretch, so a long hint forced the whole
+    // panel wider than its ScrollView and clipped it.
     HorizontalLayout {
-        // UI-UX polish (a): preview `.sl .h` is align-items:center —
-        // the 26px number box centres against the two-line label
-        // instead of sitting at the top of the ~32px label block.
+        spacing: 8px;
         cross-axis-alignment: center;
-        // B07 (v2.0.8 retest): the label column stretches and the
-        // hint wraps — an unwrapped long hint (e.g. "Evens out
-        // uneven pot travel — + favours left") set the row's
-        // minimum width past the panel and clipped its right side.
-        // The spacer after this column is gone: the column itself
-        // takes the slack now, so the value box stays flush right.
-        VerticalLayout {
-            horizontal-stretch: 1;
-            min-width: 0px;
-            Text { text: label; font-size: 13px; font-weight: 500; color: Theme.text; overflow: elide; }
-            Text { text: hint; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
-        }
+        Text { horizontal-stretch: 1; min-width: 0px; text: label; font-size: Theme.fs-label; font-weight: 500; color: Theme.text; overflow: elide; }
         Rectangle {
-            width: 60px;
-            height: 26px;
+            width: 64px;
+            height: 28px;
             border-radius: 6px;
             border-width: 1px;
             border-color: edit-invalid ? Theme.bad : Theme.line;
@@ -499,7 +635,7 @@ export component SliderRow inherits VerticalLayout {
                 enabled: !disabled;
                 text: edit-buffer;
                 font-family: Theme.font-mono;
-                font-size: 12px;
+                font-size: Theme.fs-value;
                 font-weight: 500;
                 color: Theme.text;
                 edited => { edit-invalid = num.text == ""; value-edited(num.text); }
@@ -575,8 +711,10 @@ export component SliderRow inherits VerticalLayout {
             moved => { if (self.pressed && !disabled) { changed(Math.max(0, Math.min(1, self.mouse-x / track.width))); } }
         }
     }
+    // Hint under the track, wrapping — never a min-width driver.
+    if hint != "" : Text { text: hint; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
     // DS-63: empty input is invalid — red border above, one-line note here.
-    if edit-invalid : Text { text: "Enter a number."; font-size: 11.5px; color: Theme.bad; }
+    if edit-invalid : Text { text: "Enter a number."; font-size: Theme.fs-hint; color: Theme.bad; }
 }
 
 // ---------------------------------------------------------------- preset chips (§6: Soft / Balanced / Sharp / Custom)
@@ -609,7 +747,7 @@ export component PresetChip inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         text: label;
-        font-size: 12px;
+        font-size: Theme.fs-hint;
         font-weight: 600;
         color: active ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
     }
@@ -630,9 +768,9 @@ export component CurveGraph inherits VerticalLayout {
     in property <string> curve-commands;
     spacing: 10px;
     HorizontalLayout {
-        Text { text: title; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+        Text { text: title; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
         Rectangle { horizontal-stretch: 1; }
-        Text { text: subtitle; font-size: 12px; color: Theme.mute; }
+        Text { text: subtitle; font-size: Theme.fs-hint; color: Theme.mute; }
     }
     curve-box := Rectangle {
         height: self.width * 232 / 330;
@@ -686,27 +824,27 @@ export component CurveGraph inherits VerticalLayout {
             border-color: Theme.accent-text;
             background: Theme.bg;
         }
-        Text { x: curve-box.width * 30 / 330 - 10px; y: curve-box.height * 196 / 232; width: 20px; horizontal-alignment: center; text: "0"; font-size: 10px; color: Theme.faint; }
-        Text { x: curve-box.width * 160 / 330 - 10px; y: curve-box.height * 196 / 232; width: 20px; horizontal-alignment: center; text: "50"; font-size: 10px; color: Theme.faint; }
+        Text { x: curve-box.width * 30 / 330 - 10px; y: curve-box.height * 196 / 232; width: 20px; horizontal-alignment: center; text: "0"; font-size: Theme.fs-hint; color: Theme.faint; }
+        Text { x: curve-box.width * 160 / 330 - 10px; y: curve-box.height * 196 / 232; width: 20px; horizontal-alignment: center; text: "50"; font-size: Theme.fs-hint; color: Theme.faint; }
         // "100%" is 4 glyphs (~24px at 10px font) — a 20px box clipped
         // it to "100:" (compare-fix). 30px centred on the 290 tick.
-        Text { x: curve-box.width * 290 / 330 - 15px; y: curve-box.height * 196 / 232; width: 30px; horizontal-alignment: center; text: "100%"; font-size: 10px; color: Theme.faint; }
-        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 183 / 232; width: 20px; horizontal-alignment: right; text: "0"; font-size: 10px; color: Theme.faint; }
-        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 99 / 232; width: 20px; horizontal-alignment: right; text: "50"; font-size: 10px; color: Theme.faint; }
-        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 14 / 232; width: 20px; horizontal-alignment: right; text: "100"; font-size: 10px; color: Theme.faint; }
-        Text { x: curve-box.width * 160 / 330 - 40px; y: curve-box.height * 214 / 232; width: 80px; horizontal-alignment: center; text: "Wheel input"; font-size: 10px; color: Theme.faint; }
+        Text { x: curve-box.width * 290 / 330 - 15px; y: curve-box.height * 196 / 232; width: 30px; horizontal-alignment: center; text: "100%"; font-size: Theme.fs-hint; color: Theme.faint; }
+        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 183 / 232; width: 20px; horizontal-alignment: right; text: "0"; font-size: Theme.fs-hint; color: Theme.faint; }
+        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 99 / 232; width: 20px; horizontal-alignment: right; text: "50"; font-size: Theme.fs-hint; color: Theme.faint; }
+        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 14 / 232; width: 20px; horizontal-alignment: right; text: "100"; font-size: Theme.fs-hint; color: Theme.faint; }
+        Text { x: curve-box.width * 160 / 330 - 40px; y: curve-box.height * 214 / 232; width: 80px; horizontal-alignment: center; text: "Wheel input"; font-size: Theme.fs-hint; color: Theme.faint; }
     }
     HorizontalLayout {
         spacing: 20px;
         HorizontalLayout {
             spacing: 4px;
-            Text { text: "Input"; font-size: 12px; color: Theme.mute; }
-            Text { text: Math.round(input-pct) + "%"; font-family: Theme.font-mono; font-size: 12px; font-weight: 600; color: Theme.text; }
+            Text { text: "Input"; font-size: Theme.fs-hint; color: Theme.mute; }
+            Text { text: Math.round(input-pct) + "%"; font-family: Theme.font-mono; font-size: Theme.fs-value; font-weight: 600; color: Theme.text; }
         }
         HorizontalLayout {
             spacing: 4px;
-            Text { text: "Output"; font-size: 12px; color: Theme.mute; }
-            Text { text: Math.round(output-pct) + "%"; font-family: Theme.font-mono; font-size: 12px; font-weight: 600; color: Theme.text; }
+            Text { text: "Output"; font-size: Theme.fs-hint; color: Theme.mute; }
+            Text { text: Math.round(output-pct) + "%"; font-family: Theme.font-mono; font-size: Theme.fs-value; font-weight: 600; color: Theme.text; }
         }
         Rectangle { horizontal-stretch: 1; }
         HorizontalLayout {
@@ -724,7 +862,7 @@ export component CurveGraph inherits VerticalLayout {
                 stroke: Theme.grid-line;
                 stroke-width: 2px;
             }
-            Text { text: "Straight line"; font-size: 12px; color: Theme.mute; }
+            Text { text: "Straight line"; font-size: Theme.fs-hint; color: Theme.mute; }
         }
     }
 }
@@ -753,14 +891,14 @@ export component PedalBar inherits VerticalLayout {
         horizontal-alignment: center;
         text: Math.round(pct) + "%";
         font-family: Theme.font-mono;
-        font-size: 12px;
+        font-size: Theme.fs-value;
         font-weight: 600;
         color: Theme.text;
     }
     Text {
         horizontal-alignment: center;
         text: label;
-        font-size: 11px;
+        font-size: Theme.fs-hint;
         color: Theme.mute;
     }
 }
@@ -778,7 +916,7 @@ export component HBar inherits HorizontalLayout {
     Text {
         width: 46px;
         text: label;
-        font-size: 11.5px;
+        font-size: Theme.fs-hint;
         color: Theme.mute;
     }
     Rectangle {
@@ -803,7 +941,7 @@ export component HBar inherits HorizontalLayout {
         horizontal-alignment: right;
         text: Math.round(pct) + "%";
         font-family: Theme.font-mono;
-        font-size: 11.5px;
+        font-size: Theme.fs-value;
         color: Theme.text;
     }
 }
@@ -825,8 +963,8 @@ export component RangeBlock inherits VerticalLayout {
         VerticalLayout {
             horizontal-stretch: 1;
             spacing: 1px;
-            Text { text: up-label; font-size: 11.5px; color: Theme.mute; }
-            Text { text: up-value; font-family: Theme.font-mono; font-size: 13px; font-weight: 600; color: Theme.text; }
+            Text { text: up-label; font-size: Theme.fs-hint; color: Theme.mute; }
+            Text { text: up-value; font-family: Theme.font-mono; font-size: Theme.fs-value; font-weight: 600; color: Theme.text; }
         }
         Btn { label: "Set up"; disabled: up-disabled; clicked => { set-up(); } }
     }
@@ -834,8 +972,8 @@ export component RangeBlock inherits VerticalLayout {
         VerticalLayout {
             horizontal-stretch: 1;
             spacing: 1px;
-            Text { text: down-label; font-size: 11.5px; color: Theme.mute; }
-            Text { text: down-value; font-family: Theme.font-mono; font-size: 13px; font-weight: 600; color: Theme.text; }
+            Text { text: down-label; font-size: Theme.fs-hint; color: Theme.mute; }
+            Text { text: down-value; font-family: Theme.font-mono; font-size: Theme.fs-value; font-weight: 600; color: Theme.text; }
         }
         Btn { label: "Set down"; disabled: down-disabled; clicked => { set-down(); } }
     }
@@ -872,8 +1010,8 @@ export component ButtonTile inherits Rectangle {
         padding-left: 10px;
         padding-top: 8px;
         spacing: 1px;
-        Text { text: label; font-size: 10.5px; font-weight: 600; color: Theme.mute; }
-        Text { text: action; font-size: 12.5px; font-weight: 600; color: not-set ? Theme.mute : Theme.text; }
+        Text { text: label; font-size: Theme.fs-hint; font-weight: 600; color: Theme.mute; }
+        Text { text: action; font-size: Theme.fs-value; font-weight: 600; color: not-set ? Theme.mute : Theme.text; }
     }
     ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
 }
@@ -923,7 +1061,7 @@ export component GameTile inherits Rectangle {
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 text: code;
-                font-size: 12px;
+                font-size: Theme.fs-value;
                 font-weight: 700;
                 color: Theme.accent-text;
             }
@@ -933,14 +1071,14 @@ export component GameTile inherits Rectangle {
             spacing: 1px;
             Text {
                 text: name;
-                font-size: 12.5px;
+                font-size: Theme.fs-label;
                 font-weight: 600;
                 color: Theme.text;
                 wrap: word-wrap;
             }
             Text {
                 text: sub;
-                font-size: 11px;
+                font-size: Theme.fs-hint;
                 color: sub-warn ? Theme.warn : Theme.mute;
                 wrap: word-wrap;
             }
@@ -951,7 +1089,7 @@ export component GameTile inherits Rectangle {
             spacing: 4px;
             Text {
                 text: "Edit";
-                font-size: 11.5px;
+                font-size: Theme.fs-hint;
                 font-weight: 600;
                 color: edit-fs.has-focus || edit-ta.has-hover ? Theme.text : Theme.accent-text;
                 accessible-label: "Edit " + name;
@@ -971,7 +1109,7 @@ export component GameTile inherits Rectangle {
             }
             Text {
                 text: "Remove";
-                font-size: 11.5px;
+                font-size: Theme.fs-hint;
                 font-weight: 600;
                 color: remove-fs.has-focus || remove-ta.has-hover ? Theme.text : Theme.mute;
                 accessible-label: "Remove " + name;
@@ -1018,7 +1156,7 @@ export component CheckRow inherits Rectangle {
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 text: warn ? "!" : "✓";
-                font-size: 10px;
+                font-size: Theme.fs-label;
                 font-weight: 700;
                 color: warn ? Theme.warn : Theme.ok;
             }
@@ -1026,14 +1164,14 @@ export component CheckRow inherits Rectangle {
         Text {
             vertical-alignment: center;
             text: label;
-            font-size: 12.5px;
+            font-size: Theme.fs-label;
             color: Theme.text;
         }
         Rectangle { horizontal-stretch: 1; }
         Text {
             vertical-alignment: center;
             text: hint;
-            font-size: 11.5px;
+            font-size: Theme.fs-hint;
             color: Theme.mute;
         }
     }
@@ -1095,8 +1233,8 @@ export component RadioOptionCard inherits Rectangle {
         }
         VerticalLayout {
             spacing: 1px;
-            Text { text: title; font-size: 13px; font-weight: 600; color: Theme.text; }
-            Text { text: desc; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+            Text { text: title; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
+            Text { text: desc; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
         }
     }
     ta := TouchArea { mouse-cursor: pointer; clicked => { if (!disabled) { clicked(); } } }
@@ -1110,13 +1248,18 @@ export component EmptyBanner inherits Rectangle {
     // DS-54: the action button disables + dims while its job runs
     // (Overview binds this to the banner's job kind: Reconnect 0).
     in property <bool> action-disabled: false;
+    // D2: optional 16px icon on the action button (Reconnect).
+    in property <image> action-icon;
+    in property <bool> action-has-icon: false;
     callback action-clicked();
     // DS-21 (U-03): was a fixed 36 px with no wrapping, so long
     // strings (the ~100-char Overview banners, unbounded
     // daemon-error text) were cut off mid-sentence with no way to
-    // read them. The text wraps now and the banner grows with it;
-    // 36 px stays the minimum for a single line.
-    min-height: 36px;
+    // read them. The text wraps now and the banner grows with it.
+    // B03: 46px minimum — a 30px button + 8px padding top/bottom —
+    // and the row is vertically centred, so the button never sits
+    // on the border.
+    min-height: 46px;
     border-radius: 8px;
     border-width: 1px;
     border-color: is-error ? Theme.bad : Theme.line;
@@ -1127,15 +1270,16 @@ export component EmptyBanner inherits Rectangle {
         padding-top: 8px;
         padding-bottom: 8px;
         spacing: 10px;
+        cross-axis-alignment: center;
         Text {
             horizontal-stretch: 1;
             vertical-alignment: center;
             wrap: word-wrap;
             text: text;
-            font-size: 12px;
+            font-size: Theme.fs-hint;
             color: is-error ? Theme.bad : Theme.mute;
         }
-        if action-label != "" : Btn { label: action-label; disabled: action-disabled; clicked => { action-clicked(); } }
+        if action-label != "" : Btn { label: action-label; icon: action-icon; has-icon: action-has-icon; disabled: action-disabled; clicked => { action-clicked(); } }
     }
 }
 

@@ -17,7 +17,7 @@
 // folded into Theme at integration. No other deviation.
 
 import { Theme } from "../tokens.slint";
-import { Card, Pill, Btn, Switch, SliderRow, SegmentedControl } from "../components.slint";
+import { Card, CardBody, FormRow, Pill, Btn, Switch, SliderRow, SegmentedControl } from "../components.slint";
 import { ScrollView } from "std-widgets.slint";
 
 // ---------------------------------------------------------------- button tile (§6: "BUTTON n" + action; normal /
@@ -58,7 +58,7 @@ component ButtonTile inherits Rectangle {
             Text {
                 width: 70px;
                 text: "BUTTON " + (index + 1) + (pressed ? " · PRESSED" : selected ? " · EDITING" : "");
-                font-size: 11px;
+                font-size: Theme.fs-hint;
                 font-weight: 600;
                 color: Theme.faint;
                 wrap: no-wrap;
@@ -67,7 +67,7 @@ component ButtonTile inherits Rectangle {
         }
         Text {
             text: action;
-            font-size: 12.5px;
+            font-size: Theme.fs-value;
             font-weight: action == "Not set" ? 500 : 600;
             color: action == "Not set" ? Theme.faint : Theme.text;
             wrap: no-wrap;
@@ -130,18 +130,18 @@ component KnobCell inherits Rectangle {
                 x: 22px;
                 y: -6px;
                 text: flash-text;
-                font-size: 11px;
+                font-size: Theme.fs-hint;
                 font-weight: 700;
                 color: Theme.ok;
             }
         }
         VerticalLayout {
             spacing: 0px;
-            Text { text: knob-name; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+            Text { text: knob-name; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
             Text {
                 wrap: word-wrap;
                 text: "Turn left: " + left-action + " · Turn right: " + right-action;
-                font-size: 11.5px;
+                font-size: Theme.fs-hint;
                 color: Theme.mute;
             }
         }
@@ -179,11 +179,45 @@ component ActionChip inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         text: label;
-        font-size: 11.5px;
+        font-size: Theme.fs-hint;
         font-weight: 600;
         color: active ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
     }
     ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
+}
+
+// ---------------------------------------------------------------- action chip grid (P1, B09): the 11-chip
+// action picker, written once and used twice — the "What should
+// it do?" picker and the "Long-press action" picker. `current`
+// is the selected action; `picked` fires the chosen action.
+component ActionChipGrid inherits VerticalLayout {
+    in property <string> current;
+    callback picked(string);
+    spacing: 5px;
+    HorizontalLayout {
+        spacing: 5px;
+        ActionChip { horizontal-stretch: 1; label: "Gear 1"; active: "Gear 1" == current; clicked => { picked("Gear 1"); } }
+        ActionChip { horizontal-stretch: 1; label: "Gear 2"; active: "Gear 2" == current; clicked => { picked("Gear 2"); } }
+        ActionChip { horizontal-stretch: 1; label: "Gear 3"; active: "Gear 3" == current; clicked => { picked("Gear 3"); } }
+    }
+    HorizontalLayout {
+        spacing: 5px;
+        ActionChip { horizontal-stretch: 1; label: "Gear 4"; active: "Gear 4" == current; clicked => { picked("Gear 4"); } }
+        ActionChip { horizontal-stretch: 1; label: "Gear 5"; active: "Gear 5" == current; clicked => { picked("Gear 5"); } }
+        ActionChip { horizontal-stretch: 1; label: "Gear 6"; active: "Gear 6" == current; clicked => { picked("Gear 6"); } }
+    }
+    HorizontalLayout {
+        spacing: 5px;
+        ActionChip { horizontal-stretch: 1; label: "Shift up"; active: "Shift up" == current; clicked => { picked("Shift up"); } }
+        ActionChip { horizontal-stretch: 1; label: "Shift down"; active: "Shift down" == current; clicked => { picked("Shift down"); } }
+        ActionChip { horizontal-stretch: 1; label: "Horn"; active: "Horn" == current; clicked => { picked("Horn"); } }
+    }
+    HorizontalLayout {
+        spacing: 5px;
+        ActionChip { horizontal-stretch: 1; label: "Handbrake"; active: "Handbrake" == current; clicked => { picked("Handbrake"); } }
+        ActionChip { horizontal-stretch: 1; label: "Not set"; active: "Not set" == current; clicked => { picked("Not set"); } }
+        Rectangle { horizontal-stretch: 1; }
+    }
 }
 
 // ---------------------------------------------------------------- knob action row (knob edit mode, §8.2:
@@ -216,8 +250,8 @@ component KnobRow inherits Rectangle {
         padding-left: 10px;
         padding-right: 10px;
         alignment: space-between;
-        Text { text: label; font-size: 12px; font-weight: 600; color: Theme.text; }
-        Text { text: action; font-size: 12px; color: selected ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute); }
+        Text { text: label; font-size: Theme.fs-hint; font-weight: 600; color: Theme.text; }
+        Text { text: action; font-size: Theme.fs-hint; color: selected ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute); }
     }
     ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
 }
@@ -314,14 +348,13 @@ export component ButtonsPage inherits HorizontalLayout {
             spacing: 12px;
             alignment: start;
             // wheel buttons card
+            // wheel buttons card
             Card {
-                VerticalLayout {
-                    padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
-                    spacing: 10px;
+                CardBody {
                     HorizontalLayout {
                         alignment: space-between;
-                        Text { text: "Wheel buttons"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
-                        Text { text: "Live presses light up here"; font-size: 12px; color: Theme.mute; }
+                        Text { text: "Wheel buttons"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
+                        Text { text: "Live presses light up here"; font-size: Theme.fs-hint; color: Theme.mute; }
                     }
                     // 4-column grid: 3 rows of 4 tiles. Actions come from
                     // the button-actions model by index.
@@ -375,10 +408,8 @@ export component ButtonsPage inherits HorizontalLayout {
             }
             // rotary knobs card (§8.2)
             Card {
-                VerticalLayout {
-                    padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
-                    spacing: 10px;
-                    Text { text: "Rotary knobs"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                CardBody {
+                    Text { text: "Rotary knobs"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                     HorizontalLayout {
                         spacing: 0px;
                         KnobCell {
@@ -408,54 +439,25 @@ export component ButtonsPage inherits HorizontalLayout {
             }
             // rotary knob tuning card (E1 pulse length, E2 steps per click)
             Card {
-                VerticalLayout {
-                    padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
-                    spacing: 10px;
-                    Text { text: "Rotary knob tuning"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                CardBody {
+                    Text { text: "Rotary knob tuning"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                     SliderRow { label: "Pulse length"; hint: "How long each step stays pressed"; value-text: enc-pulse-text; value: (enc-pulse-ms - 20.0) / 180.0; changed(v) => { enc-pulse-changed(v); } value-edited(t) => { enc-pulse-edited(t); } }
                     HorizontalLayout {
-                        alignment: start;
-                        Text { text: "Steps per click"; font-size: 13px; font-weight: 500; color: Theme.text; }
+                        Text { text: "Steps per click"; font-size: Theme.fs-label; font-weight: 500; color: Theme.text; }
                         Rectangle { horizontal-stretch: 1; }
-                        Text { text: "Counts per physical click"; font-size: 11.5px; color: Theme.faint; }
+                        Text { text: "Counts per physical click"; font-size: Theme.fs-hint; color: Theme.faint; }
                     }
                     SegmentedControl { option-0: "1"; option-1: "2"; option-2: "4"; selected: enc-counts == 1 ? 0 : enc-counts == 2 ? 1 : 2; selected-changed(i) => { enc-counts-changed(i == 0 ? 1 : i == 1 ? 2 : 4); } }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout {
-                            Text { text: "Acceleration"; font-size: 12px; color: Theme.text; }
-                            Text { text: "Fast spins emit extra steps"; font-size: 11px; color: Theme.faint; }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        Switch { accessible-name: "Encoder acceleration"; on: enc-accel; toggled => { enc-accel-changed(!enc-accel); } }
-                    }
+                    FormRow { label: "Acceleration"; hint: "Fast spins emit extra steps"; Switch { accessible-name: "Encoder acceleration"; on: enc-accel; toggled => { enc-accel-changed(!enc-accel); } } }
                     SliderRow { label: "Acceleration strength"; hint: "Extra steps on fast spins"; value-text: enc-accel-sens-text; value: enc-accel-sens / 2.0; disabled: !enc-accel; changed(v) => { enc-accel-sens-changed(v); } value-edited(t) => { enc-accel-sens-edited(t); } }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout {
-                            Text { text: "Invert Knob 1"; font-size: 12px; color: Theme.text; }
-                            Text { text: "Swap left and right on Knob 1"; font-size: 11px; color: Theme.faint; }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        Switch { accessible-name: "Invert Knob 1"; on: enc-invert1; toggled => { enc-invert-changed(0, !enc-invert1); } }
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout {
-                            Text { text: "Invert Knob 2"; font-size: 12px; color: Theme.text; }
-                            Text { text: "Swap left and right on Knob 2"; font-size: 11px; color: Theme.faint; }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        Switch { accessible-name: "Invert Knob 2"; on: enc-invert2; toggled => { enc-invert-changed(1, !enc-invert2); } }
-                    }
+                    FormRow { label: "Invert Knob 1"; hint: "Swap left and right on Knob 1"; Switch { accessible-name: "Invert Knob 1"; on: enc-invert1; toggled => { enc-invert-changed(0, !enc-invert1); } } }
+                    FormRow { label: "Invert Knob 2"; hint: "Swap left and right on Knob 2"; Switch { accessible-name: "Invert Knob 2"; on: enc-invert2; toggled => { enc-invert-changed(1, !enc-invert2); } } }
                 }
             }
             // button tuning card (BU1 debounce, BU2 long-press threshold)
             Card {
-                VerticalLayout {
-                    padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
-                    spacing: 10px;
-                    Text { text: "Button tuning"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                CardBody {
+                    Text { text: "Button tuning"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                     SliderRow { label: "Debounce"; hint: "Presses must hold steady this long"; value-text: btn-debounce-text; value: btn-debounce-ms / 50.0; changed(v) => { btn-debounce-changed(v); } value-edited(t) => { btn-debounce-edited(t); } }
                     SliderRow { label: "Long-press threshold"; hint: "Hold this long to switch to the long-press action"; value-text: btn-longpress-text; value: (btn-longpress-ms - 300.0) / 1200.0; changed(v) => { btn-longpress-changed(v); } value-edited(t) => { btn-longpress-edited(t); } }
                     SliderRow { label: "Double-press window"; hint: "Press again within this long to switch to the long-press action"; value-text: btn-doublepress-text; value: (btn-doublepress-ms - 150.0) / 350.0; changed(v) => { btn-doublepress-changed(v); } value-edited(t) => { btn-doublepress-edited(t); } }
@@ -485,12 +487,12 @@ export component ButtonsPage inherits HorizontalLayout {
                     spacing: 0px;
                     if edit-kind == 0 : HorizontalLayout {
                         alignment: space-between;
-                        Text { text: "Button " + (selected-index + 1); font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                        Text { text: "Button " + (selected-index + 1); font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                         Pill { label: selected-action; }
                     }
                     if edit-kind == 1 : HorizontalLayout {
                         alignment: space-between;
-                        Text { text: "Knob " + (edit-knob + 1); font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                        Text { text: "Knob " + (edit-knob + 1); font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                         Pill { label: knob-row-action; }
                     }
                     Rectangle { height: 10px; }
@@ -541,7 +543,7 @@ export component ButtonsPage inherits HorizontalLayout {
                                 vertical-alignment: center;
                                 wrap: word-wrap;
                                 text: listening ? "Listening… press a button on the wheel." : "Press any button on the wheel to pick it.";
-                                font-size: 12px;
+                                font-size: Theme.fs-hint;
                                 color: Theme.mute;
                             }
                         }
@@ -560,48 +562,24 @@ export component ButtonsPage inherits HorizontalLayout {
                     Rectangle { height: 14px; }
                     Text {
                         text: edit-kind == 0 ? "What should it do?" : "What should this do?";
-                        font-size: 12.5px;
+                        font-size: Theme.fs-card;
                         font-weight: 600;
                         color: Theme.text;
                     }
                     Rectangle { height: 6px; }
-                    // action chips (§7.4): 11 actions, 3 per row
-                    VerticalLayout {
-                        spacing: 5px;
-                        HorizontalLayout {
-                            spacing: 5px;
-                            ActionChip { horizontal-stretch: 1; label: "Gear 1"; active: "Gear 1" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 1"); } }
-                            ActionChip { horizontal-stretch: 1; label: "Gear 2"; active: "Gear 2" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 2"); } }
-                            ActionChip { horizontal-stretch: 1; label: "Gear 3"; active: "Gear 3" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 3"); } }
-                        }
-                        HorizontalLayout {
-                            spacing: 5px;
-                            ActionChip { horizontal-stretch: 1; label: "Gear 4"; active: "Gear 4" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 4"); } }
-                            ActionChip { horizontal-stretch: 1; label: "Gear 5"; active: "Gear 5" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 5"); } }
-                            ActionChip { horizontal-stretch: 1; label: "Gear 6"; active: "Gear 6" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Gear 6"); } }
-                        }
-                        HorizontalLayout {
-                            spacing: 5px;
-                            ActionChip { horizontal-stretch: 1; label: "Shift up"; active: "Shift up" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Shift up"); } }
-                            ActionChip { horizontal-stretch: 1; label: "Shift down"; active: "Shift down" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Shift down"); } }
-                            ActionChip { horizontal-stretch: 1; label: "Horn"; active: "Horn" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Horn"); } }
-                        }
-                        HorizontalLayout {
-                            spacing: 5px;
-                            ActionChip { horizontal-stretch: 1; label: "Handbrake"; active: "Handbrake" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Handbrake"); } }
-                            ActionChip { horizontal-stretch: 1; label: "Not set"; active: "Not set" == (edit-kind == 0 ? selected-action : knob-row-action); clicked => { action-selected("Not set"); } }
-                            Rectangle { horizontal-stretch: 1; }
-                        }
-                    }
+                    // action chips (§7.4): 11 actions, 3 per row — one
+                    // ActionChipGrid, shared with the long-press picker.
+                    ActionChipGrid { current: edit-kind == 0 ? selected-action : knob-row-action; picked(a) => { action-selected(a); } }
                     // BU2: long-press action (button edits only) — the second
                     // action this button switches to when held past the
                     // threshold. Same chips as above, own picker state.
                     if edit-kind == 0 : VerticalLayout {
                         spacing: 0px;
+                        alignment: start;
                         Rectangle { height: 14px; }
                         Text {
                             text: "Long-press action";
-                            font-size: 12.5px;
+                            font-size: Theme.fs-card;
                             font-weight: 600;
                             color: Theme.text;
                         }
@@ -609,50 +587,24 @@ export component ButtonsPage inherits HorizontalLayout {
                         Text {
                             wrap: word-wrap;
                             text: "Hold past the threshold — or press twice quickly — to switch to this action instead.";
-                            font-size: 11.5px;
+                            font-size: Theme.fs-hint;
                             color: Theme.faint;
                         }
                         Rectangle { height: 6px; }
-                        VerticalLayout {
-                            spacing: 5px;
-                            HorizontalLayout {
-                                spacing: 5px;
-                                ActionChip { horizontal-stretch: 1; label: "Gear 1"; active: "Gear 1" == selected-long-action; clicked => { long-action-selected("Gear 1"); } }
-                                ActionChip { horizontal-stretch: 1; label: "Gear 2"; active: "Gear 2" == selected-long-action; clicked => { long-action-selected("Gear 2"); } }
-                                ActionChip { horizontal-stretch: 1; label: "Gear 3"; active: "Gear 3" == selected-long-action; clicked => { long-action-selected("Gear 3"); } }
-                            }
-                            HorizontalLayout {
-                                spacing: 5px;
-                                ActionChip { horizontal-stretch: 1; label: "Gear 4"; active: "Gear 4" == selected-long-action; clicked => { long-action-selected("Gear 4"); } }
-                                ActionChip { horizontal-stretch: 1; label: "Gear 5"; active: "Gear 5" == selected-long-action; clicked => { long-action-selected("Gear 5"); } }
-                                ActionChip { horizontal-stretch: 1; label: "Gear 6"; active: "Gear 6" == selected-long-action; clicked => { long-action-selected("Gear 6"); } }
-                            }
-                            HorizontalLayout {
-                                spacing: 5px;
-                                ActionChip { horizontal-stretch: 1; label: "Shift up"; active: "Shift up" == selected-long-action; clicked => { long-action-selected("Shift up"); } }
-                                ActionChip { horizontal-stretch: 1; label: "Shift down"; active: "Shift down" == selected-long-action; clicked => { long-action-selected("Shift down"); } }
-                                ActionChip { horizontal-stretch: 1; label: "Horn"; active: "Horn" == selected-long-action; clicked => { long-action-selected("Horn"); } }
-                            }
-                            HorizontalLayout {
-                                spacing: 5px;
-                                ActionChip { horizontal-stretch: 1; label: "Handbrake"; active: "Handbrake" == selected-long-action; clicked => { long-action-selected("Handbrake"); } }
-                                ActionChip { horizontal-stretch: 1; label: "Not set"; active: "Not set" == selected-long-action; clicked => { long-action-selected("Not set"); } }
-                                Rectangle { horizontal-stretch: 1; }
-                            }
-                        }
+                        ActionChipGrid { current: selected-long-action; picked(a) => { long-action-selected(a); } }
                     }
                     Rectangle { height: 16px; }
                     HorizontalLayout {
                         spacing: 8px;
                         Btn { horizontal-stretch: 1; label: "Cancel"; disabled: busy-kind == 8; clicked => { edit-cancel(); } }
-                        Btn { horizontal-stretch: 1; label: "Save"; primary: true; disabled: busy-kind == 9 || busy-kind == 8; clicked => { edit-save(); } }
+                        Btn { horizontal-stretch: 1; label: "Save"; primary: true; icon: @image-url("../../assets/icons/save.svg"); has-icon: true; disabled: busy-kind == 9 || busy-kind == 8; clicked => { edit-save(); } }
                     }
                     Rectangle { height: 10px; }
                     // D-2: 30 s (firmware confirm timeout), not the preview's 10 s.
                     Text {
                         wrap: word-wrap;
                         text: "If the wheel stops responding, RSH goes back to your old buttons in 30 s.";
-                        font-size: 11.5px;
+                        font-size: Theme.fs-hint;
                         color: Theme.faint;
                     }
                 }

@@ -100,7 +100,7 @@ export component SteeringPage inherits HorizontalLayout {
             VerticalLayout {
                 padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
                 spacing: 0px;
-                Text { text: "Feel"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                Text { text: "Feel"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                 // UI-UX polish (a): preview `.card h2` is
                 // margin-bottom 10px — the chips sat flush under the
                 // title (spacing 0 + no spacer).
@@ -125,7 +125,7 @@ export component SteeringPage inherits HorizontalLayout {
                     spacing: 4px;
                     Text {
                         text: "Reset to defaults";
-                        font-size: 12px;
+                        font-size: Theme.fs-label;
                         font-weight: 600;
                         color: fs.has-focus || reset-ta.has-hover ? Theme.text : Theme.accent-text;
                         accessible-label: "Reset to defaults";
@@ -144,7 +144,7 @@ export component SteeringPage inherits HorizontalLayout {
                         }
                         reset-ta := TouchArea { mouse-cursor: pointer; clicked => { reset-defaults(); } }
                     }
-                    if unsaved : Text { text: "Unsaved changes"; font-size: 11.5px; color: Theme.warn; }
+                    if unsaved : Text { text: "Unsaved changes"; font-size: Theme.fs-hint; color: Theme.warn; }
                 }
             }
         }
@@ -153,7 +153,7 @@ export component SteeringPage inherits HorizontalLayout {
                 padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
                 spacing: 10px;
                 HorizontalLayout {
-                    Text { text: "Steering centre"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    Text { text: "Steering centre"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                     Rectangle { horizontal-stretch: 1; }
                     if centre-set : Pill { label: "Set"; bg: Theme.ok-bg; fg: Theme.ok; }
                 }
@@ -163,7 +163,7 @@ export component SteeringPage inherits HorizontalLayout {
                     // 30px Set centre button instead of top-aligning
                     // in the row (it stretched to 30px and rendered
                     // its text at the top).
-                    Text { horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; text: "Point straight ahead, then press."; font-size: 12px; color: Theme.mute; }
+                    Text { horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; text: "Point straight ahead, then press."; font-size: Theme.fs-hint; color: Theme.mute; }
                     Btn { label: centre-set ? "Set ✓" : "Set centre"; disabled: !centre-available || busy-kind == 10; clicked => { set-centre(); } }
                 }
                 // S1: Capture full lock — the two buttons sit next
@@ -171,11 +171,11 @@ export component SteeringPage inherits HorizontalLayout {
                 // Same availability: live daemon only (CaptureOp).
                 HorizontalLayout {
                     spacing: 10px;
-                    Text { horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; text: "Turn fully left or right, then press."; font-size: 12px; color: Theme.mute; }
+                    Text { horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; text: "Turn fully left or right, then press."; font-size: Theme.fs-hint; color: Theme.mute; }
                     Btn { label: "Full left"; disabled: !centre-available || busy-kind == 10; clicked => { capture-full-left(); } }
                     Btn { label: "Full right"; disabled: !centre-available || busy-kind == 10; clicked => { capture-full-right(); } }
                 }
-                if !centre-available : Text { text: centre-reason; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                if !centre-available : Text { text: centre-reason; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
             }
         }
         // Bug 7: Advanced mode is real tuning — invert, steering
@@ -187,12 +187,12 @@ export component SteeringPage inherits HorizontalLayout {
             VerticalLayout {
                 padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
                 spacing: 10px;
-                Text { text: "Advanced"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                Text { text: "Advanced"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                 HorizontalLayout {
                     spacing: 8px;
                     VerticalLayout {
-                        Text { text: "Invert steering"; font-size: 12px; color: Theme.text; }
-                        Text { text: "Reverses left and right"; font-size: 11px; color: Theme.faint; }
+                        Text { text: "Invert steering"; font-size: Theme.fs-label; color: Theme.text; }
+                        Text { text: "Reverses left and right"; font-size: Theme.fs-hint; color: Theme.faint; }
                     }
                     Rectangle { horizontal-stretch: 1; }
                     Switch { accessible-name: "Invert steering"; on: invert; toggled => { invert-changed(!invert); } }

@@ -11,8 +11,7 @@
 // box opens the profile popover (A13). D17: no pairing banners any
 // more — `connected` (Active) is the only wheel state shown.
 import { Theme } from "../tokens.slint";
-import { EmptyBanner, Card, WheelGraphic, PedalBar, Pill, Btn, GameTile, CheckRow } from "../components.slint";
-import { ScrollView } from "std-widgets.slint";
+import { EmptyBanner, Card, WheelGraphic, PedalBar, Pill, Btn, GameTile, CheckRow, PageScaffold } from "../components.slint";
 
 export struct GameItem {
     id: string,
@@ -24,7 +23,7 @@ export struct GameItem {
     action_primary: bool,
 }
 
-export component OverviewPage inherits VerticalLayout {
+export component OverviewPage inherits PageScaffold {
     in property <angle> steer-angle;
     in property <string> steer-text;
     in property <float> throttle;
@@ -64,16 +63,11 @@ export component OverviewPage inherits VerticalLayout {
     // (join the RSH Wi-Fi / plug in USB) instead of the generic
     // "not connected" line.
     in property <bool> unreachable: false;
-    // Phase 2 (F-4): the page scrolls (Settings pattern) — the
-    // bottom row was clipped ~9 px with no banner, ~50–70 px
-    // with one. Root padding lives on the inner layout now.
-    overview-scroll := ScrollView {
-        vertical-stretch: 1;
-        content-width: self.visible-width;
-        VerticalLayout {
-    padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
-    spacing: 12px;
-    if daemon-error != "" : EmptyBanner { text: daemon-error; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
+    // P1: the page is a PageScaffold (ScrollView + standard
+    // padding) — the games-grid gap below reads `scroll-width`
+    // (the scaffold's parent-driven ScrollView width), never the
+    // content's own width (binding loop — see the comment there).
+    if daemon-error != "" : EmptyBanner { text: daemon-error; action-label: "Reconnect"; action-icon: @image-url("../../assets/icons/refresh.svg"); action-has-icon: true; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
     if !daemon-live && daemon-error == "" : EmptyBanner { text: "Live data unavailable — RSH isn't running. Live data appears once it starts."; is-error: false; }
     // REDESIGN-PLAN §8.6 disconnected state: banner + Reconnect.
     // Phase 2 (Wi-Fi gap): while Unreachable, name the fix
@@ -87,8 +81,8 @@ export component OverviewPage inherits VerticalLayout {
     // banner still grows for longer texts (daemon-error above) —
     // gate-measured — this only removes the wrap for the two texts
     // the user actually saw clip.
-    if daemon-live && !connected && unreachable : EmptyBanner { text: "Wheel not found — join the wheel's RSH-XXXX Wi-Fi network or plug in USB."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
-    if daemon-live && !connected && !unreachable : EmptyBanner { text: "Wheel not connected — check the wheel's Wi-Fi is joined or the USB cable is plugged in."; action-label: "Reconnect"; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
+    if daemon-live && !connected && unreachable : EmptyBanner { text: "Wheel not found — join the wheel's RSH-XXXX Wi-Fi network or plug in USB."; action-label: "Reconnect"; action-icon: @image-url("../../assets/icons/refresh.svg"); action-has-icon: true; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
+    if daemon-live && !connected && !unreachable : EmptyBanner { text: "Wheel not connected — check the wheel's Wi-Fi is joined or the USB cable is plugged in."; action-label: "Reconnect"; action-icon: @image-url("../../assets/icons/refresh.svg"); action-has-icon: true; is-error: true; action-disabled: busy-kind == 0; action-clicked => { reconnect(); } }
     Card {
         HorizontalLayout {
             // Phase 2 (F-16): spec card padding 14/16 (was 16/20).
@@ -107,7 +101,7 @@ export component OverviewPage inherits VerticalLayout {
                 WheelGraphic { steer-angle: steer-angle; }
                 VerticalLayout {
                     Text { text: steer-text; font-family: Theme.font-mono; font-size: 30px; font-weight: 600; color: Theme.text; }
-                    Text { text: "Steering"; font-size: 12px; color: Theme.mute; }
+                    Text { text: "Steering"; font-size: Theme.fs-hint; color: Theme.mute; }
                 }
             }
             HorizontalLayout {
@@ -127,10 +121,10 @@ export component OverviewPage inherits VerticalLayout {
                 spacing: 4px;
                 HorizontalLayout {
                     spacing: 6px;
-                    Text { text: "RSH Wheel"; font-size: 14px; font-weight: 600; color: Theme.text; }
+                    Text { text: "RSH Wheel"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                     Pill { label: connected ? "Online" : "Offline"; bg: connected ? Theme.ok-bg : Theme.err-bg; fg: connected ? Theme.ok : Theme.bad; }
                 }
-                Text { text: firmware-line; font-size: 12px; color: Theme.mute; }
+                Text { text: firmware-line; font-size: Theme.fs-hint; color: Theme.mute; }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
                     spacing: 8px;
@@ -157,7 +151,8 @@ export component OverviewPage inherits VerticalLayout {
                         HorizontalLayout {
                             padding-left: 12px;
                             padding-right: 12px;
-                            Text { text: profile-name; font-size: 12px; font-weight: 600; color: Theme.text; }
+                            cross-axis-alignment: center;
+                            Text { text: profile-name; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; vertical-alignment: center; overflow: elide; }
                             Rectangle { horizontal-stretch: 1; }
                             Image { width: 12px; height: 12px; source: @image-url("../../assets/icons/chevron.svg"); }
                         }
@@ -173,20 +168,17 @@ export component OverviewPage inherits VerticalLayout {
             padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
             spacing: 10px;
             HorizontalLayout {
-                Text { text: "Games"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                Text { text: "Games"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                 Rectangle { horizontal-stretch: 1; }
-                Text { text: "Auto-switches profile."; font-size: 12px; color: Theme.mute; }
-                // B04 (v2.0.8 retest): the header button only shows
-                // once a game exists — with no games the empty state
-                // below is the one "Add game" CTA.
-                if games.length > 0 : Btn { label: "Add game"; disabled: busy-kind == 13; clicked => { add-game(); } }
+                Text { text: "Auto-switches profile."; font-size: Theme.fs-hint; color: Theme.mute; }
+                if games.length > 0 : Btn { label: "Add game"; icon: @image-url("../../assets/icons/plus.svg"); has-icon: true; disabled: busy-kind == 13; clicked => { add-game(); } }
             }
             // Manual games (no auto-scan): the empty state offers
             // Add game instead of a search.
             if games.length == 0 : HorizontalLayout {
                 spacing: 10px;
-                Text { horizontal-stretch: 1; vertical-alignment: center; text: "No games added yet — add your first game."; font-size: 12px; color: Theme.faint; wrap: word-wrap; }
-                Btn { label: "Add game"; disabled: busy-kind == 13; clicked => { add-game(); } }
+                Text { horizontal-stretch: 1; vertical-alignment: center; text: "No games added yet — add your first game."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
+                Btn { label: "Add game"; icon: @image-url("../../assets/icons/plus.svg"); has-icon: true; disabled: busy-kind == 13; clicked => { add-game(); } }
             }
             // Phase 2 (F-8): two tiles per row, min 300 px each —
             // three tiles in one row left ~26 px for the game name
@@ -202,11 +194,11 @@ export component OverviewPage inherits VerticalLayout {
             // and only the visible row's content is painted.)
             if games.length > 0 : GridLayout {
                 // R3-UI-06: the gap is responsive now — it reads
-                // `overview-scroll.width` (the ScrollView's own
-                // width, set by the page layout from the window),
-                // NOT `self.width`: a computed spacing from the
-                // grid's own width is a binding LOOP here — the
-                // grid sits inside a ScrollView, so its width
+                // `scroll-width` (the PageScaffold ScrollView's
+                // own width, set by the page layout from the
+                // window), NOT `self.width`: a computed spacing
+                // from the grid's own width is a binding LOOP here
+                // — the grid sits inside a ScrollView, so its width
                 // comes back through flickable.content-width
                 // (compiler error, caught by ui-theme-switch).
                 // The ScrollView's width is parent-driven and never
@@ -218,7 +210,7 @@ export component OverviewPage inherits VerticalLayout {
                 // like every other responsive gap on the page. The
                 // tiles themselves still grow (min-width 300px +
                 // stretch 1).
-                spacing: 10px + Math.max(0px, (overview-scroll.width - 736px) * 0.025);
+                spacing: 10px + Math.max(0px, (root.scroll-width - 736px) * 0.025);
                 Row {
                     for g[idx] in games : GameTile { visible: idx < 2; horizontal-stretch: 1; min-width: 300px; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-disabled: busy-kind == 13; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
                 }
@@ -243,7 +235,7 @@ export component OverviewPage inherits VerticalLayout {
                     // `.chk` padding 4px 0 — title to first row 14px
                     // (8 spacing + this 6px row padding), rows 8px.
                     padding-bottom: 6px;
-                    Text { text: "Ready to race"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    Text { text: "Ready to race"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                     Rectangle { horizontal-stretch: 1; }
                     Pill { label: connected ? "All good" : "Check needed"; bg: connected ? Theme.ok-bg : Theme.warn-bg; fg: connected ? Theme.ok : Theme.warn; }
                 }
@@ -264,19 +256,19 @@ export component OverviewPage inherits VerticalLayout {
                     // stats grid margin-top 6 = 16px title-to-stats
                     // (10 spacing + this 6px row padding).
                     padding-bottom: 6px;
-                    Text { text: "Connection quality"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                    Text { text: "Connection quality"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                     Rectangle { horizontal-stretch: 1; }
-                    Text { text: "Last 10 s"; font-size: 12px; color: Theme.mute; }
+                    Text { text: "Last 10 s"; font-size: Theme.fs-hint; color: Theme.mute; }
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    VerticalLayout { horizontal-stretch: 1; Text { text: delay-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Delay"; font-size: 11.5px; color: Theme.mute; } }
-                    VerticalLayout { horizontal-stretch: 1; Text { text: lost-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Lost data"; font-size: 11.5px; color: Theme.mute; } }
-                    VerticalLayout { horizontal-stretch: 1; Text { text: jitter-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Jitter"; font-size: 11.5px; color: Theme.mute; } }
+                    VerticalLayout { horizontal-stretch: 1; Text { text: delay-text; font-family: Theme.font-mono; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; } Text { text: "Delay"; font-size: Theme.fs-hint; color: Theme.mute; } }
+                    VerticalLayout { horizontal-stretch: 1; Text { text: lost-text; font-family: Theme.font-mono; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; } Text { text: "Lost data"; font-size: Theme.fs-hint; color: Theme.mute; } }
+                    VerticalLayout { horizontal-stretch: 1; Text { text: jitter-text; font-family: Theme.font-mono; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; } Text { text: "Jitter"; font-size: Theme.fs-hint; color: Theme.mute; } }
                 }
                 Text {
                     text: "Open diagnostics";
-                    font-size: 12px;
+                    font-size: Theme.fs-hint;
                     color: fs.has-focus || diag-ta.has-hover ? Theme.text : Theme.accent-text;
                     accessible-label: "Open diagnostics";
                     accessible-role: button;
@@ -297,6 +289,4 @@ export component OverviewPage inherits VerticalLayout {
             }
         }
     }
-}
-}
 }

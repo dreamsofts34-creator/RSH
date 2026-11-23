@@ -2482,6 +2482,14 @@ impl Ctx {
             ),
             |v| win.set_conn_label(v),
         );
+        // D10: amber sidebar dot while unconnected for a non-fault
+        // reason (wheel not found / dropped / reconnecting); red
+        // only for a real fault (ConnectionState::is_fault).
+        set_if_changed(
+            win.get_conn_warn(),
+            !connected && !conn.state.is_fault(),
+            |v| win.set_conn_warn(v),
+        );
         // R2-19: the wizard's Connect step is done exactly when the
         // board is REACHABLE on the LIVE daemon — re-derived on
         // every frame, so a reconnect also advances the wizard. The
