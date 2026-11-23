@@ -52,12 +52,15 @@ component ButtonTile inherits Rectangle {
         // B1: the label stays on ONE line — the 70px clipping slot
         // (see below) elides instead of wrapping, so the tile never
         // grows taller than the grid.
+        // B20: short label ("BTN 6") — the pressed/editing state is
+        // already shown by the tile colour, and the accessible-label
+        // above still names the button fully.
         Rectangle {
             width: 70px;
             clip: true;
             Text {
                 width: 70px;
-                text: "BUTTON " + (index + 1) + (pressed ? " · PRESSED" : selected ? " · EDITING" : "");
+                text: "BTN " + (index + 1);
                 font-size: Theme.fs-hint;
                 font-weight: 600;
                 color: Theme.faint;
@@ -449,7 +452,7 @@ export component ButtonsPage inherits HorizontalLayout {
                     }
                     SegmentedControl { option-0: "1"; option-1: "2"; option-2: "4"; selected: enc-counts == 1 ? 0 : enc-counts == 2 ? 1 : 2; selected-changed(i) => { enc-counts-changed(i == 0 ? 1 : i == 1 ? 2 : 4); } }
                     FormRow { label: "Acceleration"; hint: "Fast spins emit extra steps"; Switch { accessible-name: "Encoder acceleration"; on: enc-accel; toggled => { enc-accel-changed(!enc-accel); } } }
-                    SliderRow { label: "Acceleration strength"; hint: "Extra steps on fast spins"; value-text: enc-accel-sens-text; value: enc-accel-sens / 2.0; disabled: !enc-accel; changed(v) => { enc-accel-sens-changed(v); } value-edited(t) => { enc-accel-sens-edited(t); } }
+                    SliderRow { label: "Acceleration strength"; hint: "Extra steps on fast spins"; value-text: enc-accel-sens-text; value: enc-accel-sens / 2.0; disabled: !enc-accel; disabled-hint: "Turn on Acceleration to change this."; changed(v) => { enc-accel-sens-changed(v); } value-edited(t) => { enc-accel-sens-edited(t); } }
                     FormRow { label: "Invert Knob 1"; hint: "Swap left and right on Knob 1"; Switch { accessible-name: "Invert Knob 1"; on: enc-invert1; toggled => { enc-invert-changed(0, !enc-invert1); } } }
                     FormRow { label: "Invert Knob 2"; hint: "Swap left and right on Knob 2"; Switch { accessible-name: "Invert Knob 2"; on: enc-invert2; toggled => { enc-invert-changed(1, !enc-invert2); } } }
                 }

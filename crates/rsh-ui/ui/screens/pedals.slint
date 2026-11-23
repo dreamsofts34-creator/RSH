@@ -142,8 +142,9 @@ component PedalCard inherits Card {
     in property <bool> advanced: false;
     in property <string> raw-mv: "—";
     // Disabled while the calibration backend is unavailable (A2):
-    // Rust sets this; the reason is shown by the caller.
+    // Rust sets this; the reason shows under the Set buttons (D8).
     in property <bool> set-disabled: false;
+    in property <string> set-reason: "RSH isn't running — reconnect to capture.";
     // DS-54: which job kind the busy strip shows, as a
     // JobKind::order value (-1 = idle) — Set up/down disable + dim
     // while their CaptureOp job (10) runs.
@@ -231,6 +232,10 @@ component PedalCard inherits Card {
             }
         }
         // range block (§6): Pedal up / Pedal down + Set buttons
+        // D8: the disabled reason shows under the buttons — but not
+        // while a capture job is running (busy-kind 10): then the
+        // buttons are only briefly disabled, and the reason would lie.
+        if set-disabled && busy-kind != 10 : Text { text: set-reason; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
         HorizontalLayout {
             spacing: 8px;
             Rectangle {

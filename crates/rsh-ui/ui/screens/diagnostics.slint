@@ -119,10 +119,15 @@ export component DiagnosticsDrawer inherits FocusScope {
         }
         return reject;
     }
+    // D5: overlay depth — blur 24, y 8, 25% black. (The root is a
+    // FocusScope, which takes no shadow — it lives on the panel.)
     Rectangle {
         width: 100%;
         height: 100%;
         background: Theme.side;
+        drop-shadow-blur: Theme.shadow-blur;
+        drop-shadow-offset-y: Theme.shadow-offset-y;
+        drop-shadow-color: Theme.shadow-color;
         Rectangle { width: 1px; height: 100%; background: Theme.line; }
         VerticalLayout {
             spacing: 0px;

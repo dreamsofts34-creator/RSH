@@ -164,7 +164,8 @@ export component SteeringPage inherits HorizontalLayout {
                     // in the row (it stretched to 30px and rendered
                     // its text at the top).
                     Text { horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; text: "Point straight ahead, then press."; font-size: Theme.fs-hint; color: Theme.mute; }
-                    Btn { label: centre-set ? "Set ✓" : "Set centre"; disabled: !centre-available || busy-kind == 10; clicked => { set-centre(); } }
+                    // D12: no "✓" glyph in the label — the "Set" pill above already shows the state.
+                    Btn { label: centre-set ? "Set" : "Set centre"; disabled: !centre-available || busy-kind == 10; clicked => { set-centre(); } }
                 }
                 // S1: Capture full lock — the two buttons sit next
                 // to Set centre: turn fully left / right, press.

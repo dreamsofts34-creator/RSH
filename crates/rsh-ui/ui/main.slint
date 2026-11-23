@@ -17,7 +17,7 @@
 import "../assets/Inter.ttf";
 import "../assets/JetBrainsMono.ttf";
 import { Theme } from "tokens.slint";
-import { SegmentedControl, ProfileButton, AutoProfileChip, Btn, Pill } from "components.slint";
+import { SegmentedControl, ProfileButton, AutoProfileChip, Btn } from "components.slint";
 import { Sidebar, AboutPage } from "shell.slint";
 import { OverviewPage, GameItem } from "screens/overview.slint";
 import { SteeringPage } from "screens/steering.slint";
@@ -61,6 +61,11 @@ export component MainWindow inherits Window {
     default-font-size: Theme.fs-label;
 
     in-out property <int> page: 0; // 0 Overview, 1 Steering, 2 Pedals, 3 Buttons, 4 Extras, 5 Settings, 6 About
+    // D4: page-switch fade — dips to 0.3 on every `page` change and
+    // the timer below restores it to 1; the content column animates
+    // its opacity over 150ms both ways.
+    property <float> page-opacity: 1;
+    changed page => { page-opacity = 0.3; }
     in-out property <bool> send-to-game: true;
     in-out property <bool> advanced: false;
     in-out property <bool> unsaved: false;
@@ -639,6 +644,12 @@ export component MainWindow inherits Window {
             }
             return reject;
         }
+        // D4: restores `page-opacity` 170ms after a page switch.
+        page-fade-timer := Timer {
+            interval: 170ms;
+            running: page-opacity < 1;
+            triggered => { page-opacity = 1; }
+        }
         if !setup-mode : HorizontalLayout {
             width: 100%;
             // R2-12 / DS-53 (UI-UX polish, c): NO height reservation
@@ -685,6 +696,9 @@ export component MainWindow inherits Window {
             // eats slack or shrinks a stretch absorber / the
             // Settings ScrollView.
             padding-bottom: Theme.statusbar-height;
+            // D4: page-switch fade (see `page-opacity` above).
+            opacity: page-opacity;
+            animate opacity { duration: 150ms; easing: ease-in-out; }
             // top bar (56px). The inner row is 30px tall and offset by
             // 13px so its contents are vertically centred in the bar:
             // Slint layouts top-align fixed-height children, so an
@@ -692,8 +706,8 @@ export component MainWindow inherits Window {
             Rectangle {
                 height: Theme.topbar-height;
                 HorizontalLayout {
-                    y: 13px;
-                    height: 30px;
+                    y: 12px;
+                    height: Theme.control-height;
                     width: parent.width;
                     padding-left: 20px;
                     padding-right: 20px;
@@ -719,12 +733,9 @@ export component MainWindow inherits Window {
                         Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: "/ Extras"; font-size: Theme.fs-title; font-weight: 500; color: Theme.faint; }
                     }
-                    if page == 5 : HorizontalLayout {
-                        spacing: 8px;
-                        Text { vertical-alignment: center; text: "Settings"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
-                        // B2: version pill on the Settings top bar.
-                        Pill { label: "v" + app-version; bg: Theme.panel2; fg: Theme.mute; }
-                    }
+                    // B17: the version badge left the header — it lives
+                    // at the bottom of Settings + on the About page now.
+                    if page == 5 : Text { vertical-alignment: center; text: "Settings"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
                     if page == 6 : Text { vertical-alignment: center; text: "About"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
                     Rectangle { horizontal-stretch: 1; }
                     if page == 0 : AutoProfileChip {
@@ -1222,19 +1233,14 @@ export component MainWindow inherits Window {
         cancel-switch => { popover-cancel-switch(); }
         closed => { popover-closed(); }
     }
-    // Phase 2 (F-2 / U-1): backdrop + click-away for the game dialog.
-    if game-dialog-open : Rectangle {
-        x: 0px; y: 0px; width: parent.width; height: parent.height;
-        background: #000000; opacity: 0.35;
-        TouchArea { width: parent.width; height: parent.height; clicked => { game-dialog-cancel(); } }
-    }
-    // Add/edit game dialog overlay (manual games): same right-edge
-    // overlay position as the profile popover. Esc is owned by the
-    // keyboard worker (clears `game-dialog-open`) and by the
-    // dialog's own FocusScope.
+    // B19: Add/edit game dialog overlay (manual games) — the P1
+    // shared Modal (full-window host; the card is Modal's own
+    // centred 420px card, 40% scrim, shadow, scrim-click close).
+    // Esc is owned by the keyboard worker (clears
+    // `game-dialog-open`) and by Modal's own FocusScope.
     if game-dialog-open : GameDialog {
-        x: parent.width - 380px;
-        y: 64px;
+        width: parent.width;
+        height: parent.height;
         title: game-dialog-title;
         name <=> game-dialog-name;
         exe <=> game-dialog-exe;
@@ -1271,6 +1277,10 @@ export component MainWindow inherits Window {
         border-width: 1px;
         border-color: Theme.line;
         background: Theme.panel;
+        // D5: overlay depth — blur 24, y 8, 25% black.
+        drop-shadow-blur: Theme.shadow-blur;
+        drop-shadow-offset-y: Theme.shadow-offset-y;
+        drop-shadow-color: Theme.shadow-color;
         confirm-layout := VerticalLayout {
             padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
             spacing: 10px;
@@ -1412,7 +1422,7 @@ export component MainWindow inherits Window {
             if busy && status-kind != "" : Text {
                 vertical-alignment: center;
                 text: busy-label == "" ? "Working…" : busy-label;
-                font-size: 12px;
+                font-size: Theme.fs-hint;
                 color: Theme.mute;
             }
             if busy && status-kind == "" : Text {
@@ -1422,12 +1432,12 @@ export component MainWindow inherits Window {
                 font-weight: 600;
                 color: Theme.text;
             }
-            if status-kind == "error" : Text { vertical-alignment: center; text: "!"; font-size: 13px; font-weight: 700; color: Theme.bad; }
-            if status-kind == "success" : Text { vertical-alignment: center; text: "✓"; font-size: 13px; font-weight: 700; color: Theme.ok; }
+            if status-kind == "error" : Text { vertical-alignment: center; text: "!"; font-size: Theme.fs-label; font-weight: 700; color: Theme.bad; }
+            if status-kind == "success" : Text { vertical-alignment: center; text: "✓"; font-size: Theme.fs-label; font-weight: 700; color: Theme.ok; }
             if status-kind != "" : Text {
                 vertical-alignment: center;
                 text: status-title;
-                font-size: 13px;
+                font-size: Theme.fs-label;
                 font-weight: 600;
                 color: status-kind == "error" ? Theme.bad : Theme.ok;
                 overflow: elide;
@@ -1436,7 +1446,7 @@ export component MainWindow inherits Window {
                 horizontal-stretch: 1;
                 vertical-alignment: center;
                 text: status-text;
-                font-size: 12.5px;
+                font-size: Theme.fs-value;
                 color: Theme.text;
                 overflow: elide;
             }
@@ -1444,14 +1454,14 @@ export component MainWindow inherits Window {
             if status-more > 0 : Text {
                 vertical-alignment: center;
                 text: "+" + status-more;
-                font-size: 12px;
+                font-size: Theme.fs-hint;
                 color: Theme.mute;
             }
             if status-kind != "" : Btn { label: "Details"; clicked => { status-details(); } }
             if status-kind != "" : Rectangle {
                 width: 24px;
                 height: 24px;
-                Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: "✕"; font-size: 12px; color: Theme.faint; }
+                Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: "✕"; font-size: Theme.fs-hint; color: Theme.faint; }
                 dismiss-ta := TouchArea { width: 100%; height: 100%; mouse-cursor: pointer; clicked => { status-dismiss(); } }
             }
         }

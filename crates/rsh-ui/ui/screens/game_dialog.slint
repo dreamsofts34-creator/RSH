@@ -1,11 +1,8 @@
 // RSH v2.0 — Add/edit game dialog (manual games, no auto-scan).
-// Content only — the shell positions this card; the shell's dim
-// backdrop closes it on outside click, and Cancel / Save / Esc
-// close it too (Phase 2, F-2); it does NOT own the Window. Reuses the
-// profile popover's patterns: Rust-owned props, TextInput box
-// with two-way binding for the name, Save disabled while a field
-// is empty, Enter in the name field saves when both fields are
-// filled.
+// B19: the dialog IS the P1 shared Modal — centred 420px card, 40%
+// scrim, shadow, scrim-click + Esc close. The P2 hand-rolled centred
+// Card + separate backdrop is gone; Modal owns the shell now.
+// Content only below the title (CardBody shows `title`).
 // The exe path is NOT typed: Browse opens the native Windows file
 // picker (Rust `game-dialog-browse`, PC-test Bug 6) and the picked
 // path shows read-only here, elided when long; the name auto-fills
@@ -15,10 +12,10 @@
 // back to "No profile".
 
 import { Theme } from "../tokens.slint";
-import { Card, Btn } from "../components.slint";
+import { Btn, Modal } from "../components.slint";
 
-export component GameDialog inherits Card {
-    in property <string> title: "Add game";
+export component GameDialog inherits Modal {
+    title: "Add game";
     in-out property <string> name: "";
     in-out property <string> exe: "";
     in property <string> profile-name: "No profile";
@@ -26,78 +23,62 @@ export component GameDialog inherits Card {
     callback cancel();
     callback browse();
     callback cycle-profile();
-    width: 360px;
-    // B5 (PC-test Bug 5): an explicit content height — a height-less
-    // Card parented by the window stretches to the window height
-    // (gate-measured 580 px), so the dialog used to render as a
-    // full-height panel. The layout's preferred height is content-driven
-    // (fixed 360 px width), so binding to it sizes the card to its
-    // content.
-    height: layout.preferred-height;
-    // Esc is owned by the root keyboard scope (`keyboard-escape`
-    // in src/main.rs) — Phase 2 (F-3) removed the zero-size
-    // FocusScope here: it was never focused by Rust, so it could
-    // never fire.
-    layout := VerticalLayout {
-        padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
-        spacing: 10px;
-        Text { text: title; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
-        Text { text: "Name"; font-size: Theme.fs-label; color: Theme.mute; }
+    closed => { cancel(); }
+    Text { text: "Name"; font-size: Theme.fs-hint; color: Theme.mute; }
+    Rectangle {
+        horizontal-stretch: 1;
+        height: Theme.control-height;
+        border-radius: 7px;
+        border-width: 1px;
+        border-color: Theme.line;
+        background: Theme.bg;
+        TextInput {
+            x: 10px;
+            width: parent.width - 20px;
+            height: 100%;
+            vertical-alignment: center;
+            text <=> name;
+            font-size: Theme.fs-hint;
+            font-weight: 500;
+            color: Theme.text;
+            selection-background-color: Theme.accent;
+            accepted => { if (name != "" && exe != "") { save(name, exe); } }
+        }
+    }
+    Text { text: "Game file (.exe or shortcut)"; font-size: Theme.fs-hint; color: Theme.mute; }
+    HorizontalLayout {
+        spacing: 8px;
         Rectangle {
             horizontal-stretch: 1;
-            height: 28px;
+            height: Theme.control-height;
             border-radius: 7px;
             border-width: 1px;
             border-color: Theme.line;
             background: Theme.bg;
-            TextInput {
+            Text {
                 x: 10px;
                 width: parent.width - 20px;
                 height: 100%;
                 vertical-alignment: center;
-                text <=> name;
+                text: exe == "" ? "No file chosen" : exe;
                 font-size: Theme.fs-hint;
                 font-weight: 500;
-                color: Theme.text;
-                selection-background-color: Theme.accent;
-                accepted => { if (name != "" && exe != "") { save(name, exe); } }
+                color: exe == "" ? Theme.faint : Theme.text;
+                overflow: elide;
             }
         }
-        Text { text: "Game file (.exe or shortcut)"; font-size: Theme.fs-label; color: Theme.mute; }
-        HorizontalLayout {
-            spacing: 8px;
-            Rectangle {
-                horizontal-stretch: 1;
-                height: 28px;
-                border-radius: 7px;
-                border-width: 1px;
-                border-color: Theme.line;
-                background: Theme.bg;
-                Text {
-                    x: 10px;
-                    width: parent.width - 20px;
-                    height: 100%;
-                    vertical-alignment: center;
-                    text: exe == "" ? "No file chosen" : exe;
-                    font-size: Theme.fs-hint;
-                    font-weight: 500;
-                    color: exe == "" ? Theme.faint : Theme.text;
-                    overflow: elide;
-                }
-            }
-            Btn { label: "Browse…"; icon: @image-url("../../assets/icons/folder.svg"); has-icon: true; clicked => { browse(); } }
-        }
-        HorizontalLayout {
-            spacing: 8px;
-            Text { vertical-alignment: center; text: "Profile: " + profile-name; font-size: Theme.fs-label; color: Theme.text; }
-            Rectangle { horizontal-stretch: 1; }
-            Btn { label: "Change"; clicked => { cycle-profile(); } }
-        }
-        HorizontalLayout {
-            spacing: 6px;
-            Btn { label: "Save"; primary: true; icon: @image-url("../../assets/icons/save.svg"); has-icon: true; disabled: name == "" || exe == ""; clicked => { save(name, exe); } }
-            Btn { label: "Cancel"; clicked => { cancel(); } }
-        }
-        Text { text: "RSH switches profile automatically when this game starts."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
+        Btn { label: "Browse…"; clicked => { browse(); } }
     }
+    HorizontalLayout {
+        spacing: 8px;
+        Text { vertical-alignment: center; text: "Profile: " + profile-name; font-size: Theme.fs-hint; color: Theme.text; }
+        Rectangle { horizontal-stretch: 1; }
+        Btn { label: "Change"; clicked => { cycle-profile(); } }
+    }
+    HorizontalLayout {
+        spacing: 6px;
+        Btn { label: "Save"; primary: true; disabled: name == "" || exe == ""; clicked => { save(name, exe); } }
+        Btn { label: "Cancel"; clicked => { cancel(); } }
+    }
+    Text { text: "RSH switches profile automatically when this game starts."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
 }

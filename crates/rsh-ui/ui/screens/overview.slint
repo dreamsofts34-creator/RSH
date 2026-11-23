@@ -175,9 +175,14 @@ export component OverviewPage inherits PageScaffold {
             }
             // Manual games (no auto-scan): the empty state offers
             // Add game instead of a search.
-            if games.length == 0 : HorizontalLayout {
-                spacing: 10px;
-                Text { horizontal-stretch: 1; vertical-alignment: center; text: "No games added yet — add your first game."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
+            // D6: empty state — 32px icon + one line + one button.
+            // (P0 B04 hides the header "Add game" while empty, so
+            // this is the only Add game button then.)
+            if games.length == 0 : VerticalLayout {
+                spacing: 8px;
+                cross-axis-alignment: center;
+                Image { width: 32px; height: 32px; source: @image-url("../../assets/icons/grid.svg"); colorize: Theme.faint; }
+                Text { text: "No games added yet — add your first game."; font-size: Theme.fs-hint; color: Theme.faint; horizontal-alignment: center; wrap: word-wrap; }
                 Btn { label: "Add game"; icon: @image-url("../../assets/icons/plus.svg"); has-icon: true; disabled: busy-kind == 13; clicked => { add-game(); } }
             }
             // Phase 2 (F-8): two tiles per row, min 300 px each —

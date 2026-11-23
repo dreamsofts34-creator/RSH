@@ -331,8 +331,10 @@ export component ExtrasScreen inherits PageScaffold {
                             spacing: 10px;
                             Text { text: gear; font-family: Theme.font-mono; font-size: 44px; font-weight: 600; color: Theme.text; horizontal-alignment: center; }
                             Text { text: shifter-mode == 1 ? "H-pattern · current gear" : "Sequential · current gear"; font-size: Theme.fs-hint; color: Theme.mute; horizontal-alignment: center; }
-                            SliderRow { label: "Sensitivity"; hint: "Shift firmness"; value-text: shifter-sensitivity-text; value: shifter-sensitivity; disabled: sensitivity-disabled; changed(v) => { shifter-sensitivity-changed(v); } value-edited(t) => { shifter-sensitivity-edited(t); } }
-                            if sensitivity-disabled : Text { text: shifter-sensitivity-reason; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
+                            // D8: the disabled reason (Rust-owned
+                            // shifter-sensitivity-reason) shows under the
+                            // slider now, via SliderRow itself.
+                            SliderRow { label: "Sensitivity"; hint: "Shift firmness"; value-text: shifter-sensitivity-text; value: shifter-sensitivity; disabled: sensitivity-disabled; disabled-hint: shifter-sensitivity-reason; changed(v) => { shifter-sensitivity-changed(v); } value-edited(t) => { shifter-sensitivity-edited(t); } }
                             SliderRow { label: "Shift lockout"; hint: "Ignores shifts within this window"; value-text: shifter-lockout-text; value: shifter-lockout; changed(v) => { shifter-lockout-changed(v); } value-edited(t) => { shifter-lockout-edited(t); } }
                             Text {
                                 text: "Change gear mapping in Buttons";

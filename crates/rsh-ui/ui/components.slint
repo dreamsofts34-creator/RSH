@@ -112,6 +112,10 @@ export component Modal inherits Rectangle {
             return reject;
         }
     }
+    // Card size for the gate probe (Bug 5): the visible card's
+    // content height, not the full-window Modal size.
+    out property <length> card-width: modal-card.width;
+    out property <length> card-height: modal-card.height;
     modal-card := Card {
         width: 420px;
         height: body.preferred-height;
@@ -222,8 +226,8 @@ export component Btn inherits Rectangle {
     in property <length> btn-w: 0px;
     callback clicked();
     width: btn-w > 0px ? btn-w : content.preferred-width + 24px;
-    height: 30px;
-    border-radius: 8px;
+    height: 30px; // not control-height (32px): Btn lives in the 30px top-bar row.
+    border-radius: Theme.radius-control;
     border-width: ghost ? 0px : 1px;
     // A5: hover + pressed feedback — primary lightens/darkens the
     // accent, secondary/destructive lift the border + fill on
@@ -234,6 +238,8 @@ export component Btn inherits Rectangle {
     border-color: fs.has-focus ? Theme.accent-text : destructive ? Theme.bad : (primary ? Theme.accent : (!disabled && ta.has-hover ? Theme.faint : Theme.line));
     background: primary ? (!disabled && ta.pressed ? Theme.accent-pressed : !disabled && ta.has-hover ? Theme.accent-hover : Theme.accent) : destructive ? (!disabled && ta.pressed ? Theme.err-bg : !disabled && ta.has-hover ? Theme.err-bg : transparent) : ghost ? (!disabled && ta.pressed ? Theme.pressed-bg : !disabled && ta.has-hover ? Theme.hover-bg : transparent) : (!disabled && ta.pressed ? Theme.pressed-bg : !disabled && ta.has-hover ? Theme.hover-bg : transparent);
     opacity: disabled ? 0.45 : 1;
+    // D4: hover/pressed is a 120ms background transition, not an instant switch.
+    animate background { duration: 120ms; easing: ease-out; }
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -270,6 +276,49 @@ export component Btn inherits Rectangle {
     ta := TouchArea { mouse-cursor: disabled ? MouseCursor.default : MouseCursor.pointer; clicked => { if (!disabled) { clicked(); } } }
 }
 
+// ---------------------------------------------------------------- icon-only button (D9/D12: SVG icon, never a text
+// glyph; `accessible-name` is the tooltip/announcement — Slint 1.18
+// has no native tooltip element, so this is the mechanism that names
+// the button for the user).
+export component IconBtn inherits Rectangle {
+    in property <image> icon;
+    in property <string> accessible-name: "";
+    in property <bool> disabled: false;
+    accessible-label: accessible-name;
+    accessible-role: button;
+    callback clicked();
+    width: Theme.control-height;
+    height: Theme.control-height;
+    border-radius: Theme.radius-control;
+    border-width: 1px;
+    border-color: fs.has-focus ? Theme.accent-text : (ta.has-hover ? Theme.faint : Theme.line);
+    background: ta.pressed ? Theme.pressed-bg : (ta.has-hover ? Theme.hover-bg : Theme.panel2);
+    opacity: disabled ? 0.45 : 1;
+    // D4: 120ms background transition, like Btn.
+    animate background { duration: 120ms; easing: ease-out; }
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (disabled) { return reject; }
+            if (event.text == Key.Return || event.text == Key.Space) {
+                clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    Image {
+        x: 8px;
+        y: 8px;
+        width: 16px;
+        height: 16px;
+        source: icon;
+        colorize: Theme.mute;
+    }
+    ta := TouchArea { mouse-cursor: disabled ? MouseCursor.default : MouseCursor.pointer; clicked => { if (!disabled) { clicked(); } } }
+}
+
 // ---------------------------------------------------------------- nav item (§6: 36px, icon 17px + label; active = accent tint)
 export component NavItem inherits Rectangle {
     in property <string> label;
@@ -282,6 +331,8 @@ export component NavItem inherits Rectangle {
     height: 36px;
     border-radius: 8px;
     background: fs.has-focus || active ? Theme.acc-bg : (ta.has-hover ? Theme.hover-bg : transparent);
+    // D4: 120ms background transition on hover/active.
+    animate background { duration: 120ms; easing: ease-out; }
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -432,7 +483,7 @@ export component SegmentedControl inherits Rectangle {
     in property <string> option-2: "";
     in property <int> selected: 0;
     callback selected-changed(int);
-    height: 30px;
+    height: 30px; // not control-height (32px): this lives in the 30px top-bar row.
     min-width: 160px;
     border-radius: 8px;
     border-width: 1px;
@@ -449,6 +500,8 @@ export component SegmentedControl inherits Rectangle {
             accessible-label: option-0;
             accessible-role: button;
             background: fs0.has-focus ? Theme.line : (selected == 0 ? Theme.panel2 : (ta0.has-hover ? Theme.hover-bg : transparent));
+            // D4: 120ms background transition on hover/select.
+            animate background { duration: 120ms; easing: ease-out; }
             fs0 := FocusScope {
                 width: 100%;
                 height: 100%;
@@ -471,6 +524,8 @@ export component SegmentedControl inherits Rectangle {
             accessible-label: option-1;
             accessible-role: button;
             background: fs1.has-focus ? Theme.line : (selected == 1 ? Theme.panel2 : (ta1.has-hover ? Theme.hover-bg : transparent));
+            // D4: 120ms background transition on hover/select.
+            animate background { duration: 120ms; easing: ease-out; }
             fs1 := FocusScope {
                 width: 100%;
                 height: 100%;
@@ -493,6 +548,8 @@ export component SegmentedControl inherits Rectangle {
             accessible-label: option-2;
             accessible-role: button;
             background: fs2.has-focus ? Theme.line : (selected == 2 ? Theme.panel2 : (ta2.has-hover ? Theme.hover-bg : transparent));
+            // D4: 120ms background transition on hover/select.
+            animate background { duration: 120ms; easing: ease-out; }
             fs2 := FocusScope {
                 width: 100%;
                 height: 100%;
@@ -517,7 +574,7 @@ export component ProfileButton inherits Rectangle {
     callback clicked();
     accessible-label: name;
     accessible-role: button;
-    height: 30px;
+    height: 30px; // not control-height (32px): this lives in the 30px top-bar row.
     border-radius: 8px;
     border-width: 1px;
     border-color: fs.has-focus ? Theme.accent-text : (ta.has-hover ? Theme.faint : Theme.line);
@@ -553,7 +610,7 @@ export component AutoProfileChip inherits Rectangle {
     in property <string> game-profile;
     in property <bool> paused;
     callback pause-toggled();
-    height: 30px;
+    height: 30px; // not control-height (32px): this lives in the 30px top-bar row.
     border-radius: 8px;
     border-width: 1px;
     border-color: Theme.line;
@@ -588,6 +645,10 @@ export component SliderRow inherits VerticalLayout {
     // caller shows the short reason (v2.0.1 hotfix: no backend
     // setting for this slider yet).
     in property <bool> disabled: false;
+    // D8: why this slider is disabled, shown underneath it in 12px
+    // while disabled ("Turn on Acceleration to change this."). Empty
+    // means no reason is shown (e.g. transient job disables).
+    in property <string> disabled-hint: "";
     callback changed(float);
     callback value-edited(string);
     // DS-63: local edit buffer — the box shows the buffer, which only
@@ -619,9 +680,9 @@ export component SliderRow inherits VerticalLayout {
         cross-axis-alignment: center;
         Text { horizontal-stretch: 1; min-width: 0px; text: label; font-size: Theme.fs-label; font-weight: 500; color: Theme.text; overflow: elide; }
         Rectangle {
-            width: 64px;
-            height: 28px;
-            border-radius: 6px;
+            width: Theme.value-box-w;
+            height: Theme.value-box-h;
+            border-radius: Theme.radius-chip;
             border-width: 1px;
             border-color: edit-invalid ? Theme.bad : Theme.line;
             background: Theme.bg;
@@ -713,6 +774,8 @@ export component SliderRow inherits VerticalLayout {
     }
     // Hint under the track, wrapping — never a min-width driver.
     if hint != "" : Text { text: hint; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
+    // D8: the disabled reason sits under the track, same 12px size.
+    if disabled && disabled-hint != "" : Text { text: disabled-hint; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
     // DS-63: empty input is invalid — red border above, one-line note here.
     if edit-invalid : Text { text: "Enter a number."; font-size: Theme.fs-hint; color: Theme.bad; }
 }
@@ -724,11 +787,13 @@ export component PresetChip inherits Rectangle {
     callback clicked();
     accessible-label: label;
     accessible-role: button;
-    height: 30px;
-    border-radius: 8px;
+    height: Theme.control-height;
+    border-radius: Theme.radius-chip;
     border-width: 1px;
     border-color: fs.has-focus ? Theme.accent-text : (active ? Theme.accent : (ta.has-hover ? Theme.faint : Theme.line));
     background: active ? Theme.acc-bg : (ta.pressed ? Theme.pressed-bg : ta.has-hover ? Theme.hover-bg : Theme.panel2);
+    // D4: 120ms background transition on hover/active.
+    animate background { duration: 120ms; easing: ease-out; }
     // FIX-4: keyboard activation - Enter/Space acts, like a click.
     fs := FocusScope {
         width: 100%;
@@ -826,12 +891,12 @@ export component CurveGraph inherits VerticalLayout {
         }
         Text { x: curve-box.width * 30 / 330 - 10px; y: curve-box.height * 196 / 232; width: 20px; horizontal-alignment: center; text: "0"; font-size: Theme.fs-hint; color: Theme.faint; }
         Text { x: curve-box.width * 160 / 330 - 10px; y: curve-box.height * 196 / 232; width: 20px; horizontal-alignment: center; text: "50"; font-size: Theme.fs-hint; color: Theme.faint; }
-        // "100%" is 4 glyphs (~24px at 10px font) — a 20px box clipped
-        // it to "100:" (compare-fix). 30px centred on the 290 tick.
+        // "100%" is 4 glyphs (~29px at 12px font) — a 30px box fits it; a
+        // 20px box clipped it to "100:" (compare-fix). 30px centred on the 290 tick.
         Text { x: curve-box.width * 290 / 330 - 15px; y: curve-box.height * 196 / 232; width: 30px; horizontal-alignment: center; text: "100%"; font-size: Theme.fs-hint; color: Theme.faint; }
-        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 183 / 232; width: 20px; horizontal-alignment: right; text: "0"; font-size: Theme.fs-hint; color: Theme.faint; }
-        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 99 / 232; width: 20px; horizontal-alignment: right; text: "50"; font-size: Theme.fs-hint; color: Theme.faint; }
-        Text { x: curve-box.width * 24 / 330 - 20px; y: curve-box.height * 14 / 232; width: 20px; horizontal-alignment: right; text: "100"; font-size: Theme.fs-hint; color: Theme.faint; }
+        Text { x: curve-box.width * 24 / 330 - 26px; y: curve-box.height * 183 / 232; width: 26px; horizontal-alignment: right; text: "0"; font-size: Theme.fs-hint; color: Theme.faint; }
+        Text { x: curve-box.width * 24 / 330 - 26px; y: curve-box.height * 99 / 232; width: 26px; horizontal-alignment: right; text: "50"; font-size: Theme.fs-hint; color: Theme.faint; }
+        Text { x: curve-box.width * 24 / 330 - 26px; y: curve-box.height * 14 / 232; width: 26px; horizontal-alignment: right; text: "100"; font-size: Theme.fs-hint; color: Theme.faint; }
         Text { x: curve-box.width * 160 / 330 - 40px; y: curve-box.height * 214 / 232; width: 80px; horizontal-alignment: center; text: "Wheel input"; font-size: Theme.fs-hint; color: Theme.faint; }
     }
     HorizontalLayout {
@@ -914,7 +979,8 @@ export component HBar inherits HorizontalLayout {
     // line above the text instead of a bar beside it.
     cross-axis-alignment: center;
     Text {
-        width: 46px;
+        // B18: 46px clipped "Throttle" at the 12px minimum font.
+        width: 56px;
         text: label;
         font-size: Theme.fs-hint;
         color: Theme.mute;
@@ -1150,15 +1216,24 @@ export component CheckRow inherits Rectangle {
             height: 18px;
             border-radius: 9px;
             background: warn ? Theme.warn-bg : Theme.check-bg;
-            Text {
+            // D12: the tick is an SVG, not the "✓" text glyph.
+            if !warn : Image {
+                x: 3px;
+                y: 3px;
+                width: 12px;
+                height: 12px;
+                source: @image-url("../assets/icons/check.svg");
+                colorize: Theme.ok;
+            }
+            if warn : Text {
                 width: 100%;
                 height: 100%;
                 horizontal-alignment: center;
                 vertical-alignment: center;
-                text: warn ? "!" : "✓";
+                text: "!";
                 font-size: Theme.fs-label;
                 font-weight: 700;
-                color: warn ? Theme.warn : Theme.ok;
+                color: Theme.warn;
             }
         }
         Text {

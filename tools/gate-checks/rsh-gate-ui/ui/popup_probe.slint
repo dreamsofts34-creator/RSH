@@ -35,18 +35,19 @@ export component GatePlainRectWindow inherits Window {
     }
 }
 
-// The REAL GameDialog (manual add-game dialog): 360 px wide, no
-// height in game_dialog.slint — hosted as a direct Window child
-// exactly as MainWindow parents it.
+// The REAL GameDialog (manual add-game dialog): it IS the P1 Modal
+// now — a full-window host whose visible card is Modal's centred
+// 420px card. Hosted full-window exactly as MainWindow parents it,
+// and the probe reads the CARD size (dlg.card-*), not the Modal size.
 export component GateGameDialogWindow inherits Window {
     width: 920px;
     height: 580px;
     title: "gate-game-dialog-probe";
-    out property <length> dlg-height: dlg.height;
-    out property <length> dlg-width: dlg.width;
+    out property <length> dlg-height: dlg.card-height;
+    out property <length> dlg-width: dlg.card-width;
     dlg := GameDialog {
-        x: parent.width - 380px;
-        y: 64px;
+        width: parent.width;
+        height: parent.height;
         title: "Add game";
         name: "";
         exe: "";
