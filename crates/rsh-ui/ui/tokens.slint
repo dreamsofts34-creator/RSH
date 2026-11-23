@@ -34,6 +34,19 @@ export global Theme {
     in-out property <length> window-height: 580px;
     in-out property <length> sidebar-width: 184px;
     in-out property <length> topbar-height: 56px;
+    // StatusBar height (B06/P0): the bottom bar is 40px; the
+    // content column and the sidebar reserve against this.
+    in-out property <length> statusbar-height: 40px;
+    // Type scale (D1): the only five text sizes in the UI —
+    // fs-title 20 page title · fs-card 14 card title · fs-label 13
+    // label · fs-hint 12 hint (minimum) · fs-value 12.5 mono value.
+    // Display numerals (Overview steer 30px, Extras gear 44px) are
+    // the only literals left, deliberately outside the scale.
+    in-out property <length> fs-title: 20px;
+    in-out property <length> fs-card: 14px;
+    in-out property <length> fs-label: 13px;
+    in-out property <length> fs-hint: 12px;
+    in-out property <length> fs-value: 12.5px;
     in-out property <length> card-radius: 12px;
     in-out property <length> card-gap: 12px;
     in-out property <string> font-text: "Inter";
@@ -52,6 +65,9 @@ export global Theme {
     // so the dot itself stays solid. Never nest the dot in an opacity rect.
     in-out property <color> halo-ok: is-light ? #C6EAD8 : #1D3E39;
     in-out property <color> halo-bad: is-light ? #F9D7D7 : #402A33;
+    // D10: amber halo for "not found / disconnected" — the dot is
+    // amber, not red, when the wheel is simply not there.
+    in-out property <color> halo-warn: is-light ? #FBEBC2 : #3D3A2C;
     in-out property <color> tray-bg: is-light ? #FFFFFF : #11161F;  // Tray.html popup background
     in-out property <color> tray-line: is-light ? #D9D4EC : #2A3345;
     // Hover / pressed fills (v2.0.2, A5): one step lighter than the

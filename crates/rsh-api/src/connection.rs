@@ -105,9 +105,37 @@ impl ConnectionState {
             Self::Idle => "Disconnected",
             Self::LinkUp | Self::Hello => "Connecting",
             Self::Active => "Connected",
-            Self::Error { .. } => "Error",
+            // D10: "Error" scared users when the wheel was simply
+            // not there — the sidebar now says what is actually
+            // wrong. Red is reserved for real faults (see
+            // `is_fault`); the rest read as not-found / dropped.
+            Self::Error { reason, .. } => match reason {
+                ConnectionError::Unreachable => "Wheel not found",
+                ConnectionError::Timeout | ConnectionError::TransportClosed => "Disconnected",
+                _ => "Error",
+            },
             Self::Backoff { .. } => "Reconnecting",
         }
+    }
+
+    /// True when the state is a REAL fault — the sidebar dot is
+    /// red. Anything else unconnected (not found, dropped,
+    /// retrying) is amber: the wheel being off is not a fault in
+    /// the app. Faults: a foreign board answered, the watchdog
+    /// latched, the UDP port is held by another app, or an
+    /// unknown failure.
+    #[must_use]
+    pub fn is_fault(&self) -> bool {
+        matches!(
+            self,
+            Self::Error {
+                reason: ConnectionError::BoardMismatch
+                    | ConnectionError::WatchdogStall
+                    | ConnectionError::BindFailed(_)
+                    | ConnectionError::Unknown,
+                ..
+            }
+        )
     }
 
     /// True only in `Active`.
@@ -628,6 +656,41 @@ mod tests {
         m.on_event(ConnEvent::CapsOk, t);
         assert!(m.state().is_active());
         assert_eq!(m.state().label(), "Connected");
+    }
+
+    #[test]
+    fn error_label_names_not_found_instead_of_error() {
+        // D10: the sidebar must not scare the user with "Error"
+        // when the wheel is simply not there — and the dot is
+        // amber, not red, for a missing wheel.
+        let t = now();
+        let mut m = ConnectionManager::new();
+        m.on_event(ConnEvent::Connect, t);
+        let _ = m.on_event(ConnEvent::ActivationFailed(ConnectionError::Unreachable), t);
+        assert_eq!(m.state().label(), "Wheel not found");
+        assert!(!m.state().is_fault());
+        // A dropped transport reads as Disconnected, not Error.
+        let mut m = ConnectionManager::new();
+        m.on_event(ConnEvent::Connect, t);
+        let _ = m.on_event(
+            ConnEvent::ActivationFailed(ConnectionError::TransportClosed),
+            t,
+        );
+        assert_eq!(m.state().label(), "Disconnected");
+        assert!(!m.state().is_fault());
+        // A real fault keeps "Error" + the red dot.
+        for reason in [
+            ConnectionError::BoardMismatch,
+            ConnectionError::WatchdogStall,
+            ConnectionError::Unknown,
+            ConnectionError::BindFailed(crate::errors::BindErrorKind::AddrInUse),
+        ] {
+            let mut m = ConnectionManager::new();
+            m.on_event(ConnEvent::Connect, t);
+            let _ = m.on_event(ConnEvent::ActivationFailed(reason), t);
+            assert_eq!(m.state().label(), "Error", "{reason:?}");
+            assert!(m.state().is_fault(), "{reason:?}");
+        }
     }
 
     #[test]

@@ -58,7 +58,7 @@ export component MainWindow inherits Window {
     // are written from code, so the change handler does it.)
     changed theme => { Theme.mode = theme; }
     default-font-family: Theme.font-text;
-    default-font-size: 13px;
+    default-font-size: Theme.fs-label;
 
     in-out property <int> page: 0; // 0 Overview, 1 Steering, 2 Pedals, 3 Buttons, 4 Extras, 5 Settings, 6 About
     in-out property <bool> send-to-game: true;
@@ -121,6 +121,11 @@ export component MainWindow inherits Window {
     property <int> spin-step: 0;
     in property <bool> connected: true;
     in property <string> conn-label: "Disconnected";
+    // D10: true while the wheel is not connected for a NON-fault
+    // reason (not found / dropped / reconnecting) — the sidebar
+    // dot is amber. False + !connected means a real fault (red).
+    // Set from Rust via ConnectionState::is_fault().
+    in property <bool> conn-warn: false;
     in property <string> conn-sub: "Not connected";
     in property <angle> steer-angle;
     in property <string> steer-text;
@@ -631,19 +636,20 @@ export component MainWindow inherits Window {
         if !setup-mode : HorizontalLayout {
             width: 100%;
             // R2-12 / DS-53 (UI-UX polish, c): NO height reservation
-            // any more — the busy strip floats over the bottom 38px
+            // any more — the bottom bar floats over the bottom 40px
             // instead of shrinking the layout (the old
-            // `parent.height - (busy ? 38px : 0px)` re-laid the whole
+            // `parent.height - (busy ? 40px : 0px)` re-laid the whole
             // window on every job start/finish, which read as a
-            // blink). The 38px under the content is permanent empty
+            // blink). The 40px under the content is permanent empty
             // padding (see the column's padding-bottom below and the
-            // sidebar's 52px bottom padding), so the strip only ever
+            // sidebar's 52px bottom padding), so the bar only ever
             // covers empty space — never content, never the About
             // link. The window height never changes.
             height: parent.height;
         Sidebar {
             page: page;
             connected: connected;
+            conn-warn: conn-warn;
             conn-label: conn-label;
             conn-sub: conn-sub;
             send-to-game: send-to-game;
@@ -666,13 +672,13 @@ export component MainWindow inherits Window {
             // column can never ask for more than the window gives.
             min-width: 736px;
             horizontal-stretch: 1;
-            // R2-12 (c): permanent 38px empty reserve at the bottom
-            // of the content column — the floating busy strip sits
-            // over this padding, never over page content. Pages keep
-            // their own 16px bottom padding above it; the reserve
-            // only eats slack (Overview already had ~68px of it) or
-            // shrinks a stretch absorber / the Settings ScrollView.
-            padding-bottom: 38px;
+            // B06: permanent 40px empty reserve at the bottom of
+            // the content column — the StatusBar sits over this
+            // padding, never over page content. Pages keep their
+            // own 16px bottom padding above it; the reserve only
+            // eats slack or shrinks a stretch absorber / the
+            // Settings ScrollView.
+            padding-bottom: Theme.statusbar-height;
             // top bar (56px). The inner row is 30px tall and offset by
             // 13px so its contents are vertically centred in the bar:
             // Slint layouts top-align fixed-height children, so an
@@ -686,34 +692,34 @@ export component MainWindow inherits Window {
                     padding-left: 20px;
                     padding-right: 20px;
                     spacing: 12px;
-                    if page == 0 : Text { vertical-alignment: center; text: "Overview"; font-size: 17px; font-weight: 600; color: Theme.text; }
+                    if page == 0 : Text { vertical-alignment: center; text: "Overview"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
                     if page == 1 : HorizontalLayout {
                         spacing: 0px;
-                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: 17px; font-weight: 600; color: Theme.text; }
-                        Text { vertical-alignment: center; text: "/ Steering"; font-size: 17px; font-weight: 500; color: Theme.faint; }
+                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: "/ Steering"; font-size: Theme.fs-title; font-weight: 500; color: Theme.faint; }
                     }
                     if page == 2 : HorizontalLayout {
                         spacing: 0px;
-                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: 17px; font-weight: 600; color: Theme.text; }
-                        Text { vertical-alignment: center; text: "/ Pedals"; font-size: 17px; font-weight: 500; color: Theme.faint; }
+                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: "/ Pedals"; font-size: Theme.fs-title; font-weight: 500; color: Theme.faint; }
                     }
                     if page == 3 : HorizontalLayout {
                         spacing: 0px;
-                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: 17px; font-weight: 600; color: Theme.text; }
-                        Text { vertical-alignment: center; text: "/ Buttons"; font-size: 17px; font-weight: 500; color: Theme.faint; }
+                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: "/ Buttons"; font-size: Theme.fs-title; font-weight: 500; color: Theme.faint; }
                     }
                     if page == 4 : HorizontalLayout {
                         spacing: 0px;
-                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: 17px; font-weight: 600; color: Theme.text; }
-                        Text { vertical-alignment: center; text: "/ Extras"; font-size: 17px; font-weight: 500; color: Theme.faint; }
+                        Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: "/ Extras"; font-size: Theme.fs-title; font-weight: 500; color: Theme.faint; }
                     }
                     if page == 5 : HorizontalLayout {
                         spacing: 8px;
-                        Text { vertical-alignment: center; text: "Settings"; font-size: 17px; font-weight: 600; color: Theme.text; }
+                        Text { vertical-alignment: center; text: "Settings"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
                         // B2: version pill on the Settings top bar.
                         Pill { label: "v" + app-version; bg: Theme.panel2; fg: Theme.mute; }
                     }
-                    if page == 6 : Text { vertical-alignment: center; text: "About"; font-size: 17px; font-weight: 600; color: Theme.text; }
+                    if page == 6 : Text { vertical-alignment: center; text: "About"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
                     Rectangle { horizontal-stretch: 1; }
                     if page == 0 : AutoProfileChip {
                         game-profile: auto-profile-text;
@@ -741,7 +747,7 @@ export component MainWindow inherits Window {
                         }
                         // DS-54: Save runs a ProfileOp job (8) — it
                         // disables + dims while the save is in flight.
-                        Btn { label: "Save"; primary: true; disabled: busy-kind == 8; clicked => { save-profile(); } }
+                        Btn { label: "Save"; primary: true; icon: @image-url("../assets/icons/save.svg"); has-icon: true; disabled: busy-kind == 8; clicked => { save-profile(); } }
                     }
                     BellButton {
                         unread: notif-unread;
@@ -1262,11 +1268,11 @@ export component MainWindow inherits Window {
         confirm-layout := VerticalLayout {
             padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
             spacing: 10px;
-            Text { text: confirm-title; font-size: 12.5px; font-weight: 600; color: Theme.text; wrap: word-wrap; }
-            Text { text: confirm-text; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
+            Text { text: confirm-title; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; wrap: word-wrap; }
+            Text { text: confirm-text; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
             HorizontalLayout {
                 spacing: 6px;
-                Btn { label: confirm-confirm-label; primary: true; clicked => { confirm-yes(); } }
+                Btn { label: confirm-confirm-label; destructive: true; clicked => { confirm-yes(); } }
                 Btn { label: "Cancel"; clicked => { confirm-no(); } }
             }
         }
@@ -1312,10 +1318,10 @@ export component MainWindow inherits Window {
             VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 2px;
-                Text { text: toast-title; font-size: 12.5px; font-weight: 600; color: toast-kind == "success" ? Theme.ok : Theme.bad; wrap: word-wrap; }
-                Text { text: toast-text; font-size: 12px; color: Theme.text; wrap: word-wrap; }
+                Text { text: toast-title; font-size: Theme.fs-value; font-weight: 600; color: toast-kind == "success" ? Theme.ok : Theme.bad; wrap: word-wrap; }
+                Text { text: toast-text; font-size: Theme.fs-hint; color: Theme.text; wrap: word-wrap; }
             }
-            Text { text: "✕"; font-size: 12px; color: Theme.faint; vertical-alignment: center; }
+            Text { text: "✕"; font-size: Theme.fs-hint; color: Theme.faint; vertical-alignment: center; }
         }
         TouchArea {
             width: parent.width;
@@ -1448,7 +1454,7 @@ export component MainWindow inherits Window {
             Text {
                 vertical-alignment: center;
                 text: busy-label == "" ? "Working…" : busy-label;
-                font-size: 12.5px;
+                font-size: Theme.fs-label;
                 font-weight: 600;
                 color: Theme.text;
             }

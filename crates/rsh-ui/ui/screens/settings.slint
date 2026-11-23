@@ -21,8 +21,7 @@
 // About page. English only; no language selector (§9).
 
 import { Theme } from "../tokens.slint";
-import { Card, Btn, Pill, RadioOptionCard, Switch } from "../components.slint";
-import { ScrollView } from "std-widgets.slint";
+import { Card, CardBody, Btn, Pill, RadioOptionCard, Switch, PageScaffold } from "../components.slint";
 
 export struct ProfileRow {
     name: string,
@@ -72,7 +71,7 @@ component Seg inherits Rectangle {
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 text: o;
-                font-size: 12px;
+                font-size: Theme.fs-hint;
                 font-weight: 600;
                 color: selected == i ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
             }
@@ -144,16 +143,11 @@ export component SettingsScreen inherits VerticalLayout {
     callback run-setup();
     callback open-diagnostics();
 
-    settings-scroll := ScrollView {
+    // P1: the scroll area is a PageScaffold (ScrollView +
+    // standard padding). The diagnostics link below stays pinned
+    // outside the scroll, as before.
+    PageScaffold {
         vertical-stretch: 1;
-        VerticalLayout {
-            padding-top: 14px;
-            // Phase 2 (F-14): bottom padding so the last card
-            // never sits 2 px from the ScrollView edge.
-            padding-bottom: 14px;
-            padding-left: 20px;
-            padding-right: 20px;
-            spacing: 12px;
             HorizontalLayout {
                 spacing: 0px;
                 // Equal columns: `min-width: 342px` each (preview-exact:
@@ -174,31 +168,27 @@ export component SettingsScreen inherits VerticalLayout {
                     spacing: 12px;
                     // Connection
                     Card {
-                        VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
-                            spacing: 0px;
+                        CardBody {
                             HorizontalLayout {
                                 alignment: space-between;
                                 // UI-UX polish (a): preview `.card h2`
                                 // is align-items:center — the title
                                 // centres against the 20px pill.
                                 cross-axis-alignment: center;
-                                Text { text: "Connection"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                                Text { text: "Connection"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                                 Pill { label: connected ? "Connected" : "Disconnected"; bg: connected ? Theme.ok-bg : Theme.panel2; fg: connected ? Theme.ok : Theme.bad; }
                             }
-                            Rectangle { height: 8px; }
                             Seg {
                                 options: ["Wi-Fi", "USB cable"];
                                 enabled: [busy-kind != 1, busy-kind != 1];
                                 selected: connection-type;
                                 selected-changed(i) => { connection-type = i; connection-selected(i); }
                             }
-                            Rectangle { height: 6px; }
                             HorizontalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
                                 spacing: 10px;
-                                Text { width: 52px; text: "Address"; font-size: 13px; color: Theme.mute; vertical-alignment: center; }
+                                Text { width: 52px; text: "Address"; font-size: Theme.fs-label; color: Theme.mute; vertical-alignment: center; }
                                 Rectangle {
                                     horizontal-stretch: 1;
                                     height: 28px;
@@ -213,7 +203,7 @@ export component SettingsScreen inherits VerticalLayout {
                                         vertical-alignment: center;
                                         text <=> address;
                                         font-family: Theme.font-mono;
-                                        font-size: 12px;
+                                        font-size: Theme.fs-value;
                                         font-weight: 500;
                                         color: Theme.text;
                                         selection-background-color: Theme.accent;
@@ -223,7 +213,7 @@ export component SettingsScreen inherits VerticalLayout {
                                         accepted => { address-accepted(self.text); }
                                     }
                                 }
-                                Btn { label: "Reconnect"; disabled: busy-kind == 0; clicked => { reconnect(); } }
+                                Btn { label: "Reconnect"; icon: @image-url("../../assets/icons/refresh.svg"); has-icon: true; disabled: busy-kind == 0; clicked => { reconnect(); } }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
                             // D19: Wi-Fi password — set on the wheel's
@@ -239,8 +229,8 @@ export component SettingsScreen inherits VerticalLayout {
                                     VerticalLayout {
                                         horizontal-stretch: 1;
                                         spacing: 0px;
-                                        Text { text: "Wi-Fi password"; font-size: 13px; color: Theme.text; }
-                                        Text { text: wifi-password-set ? "Password set — the wheel's hotspot needs it." : "No password — the wheel's hotspot is open."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                        Text { text: "Wi-Fi password"; font-size: Theme.fs-label; color: Theme.text; }
+                                        Text { text: wifi-password-set ? "Password set — the wheel's hotspot needs it." : "No password — the wheel's hotspot is open."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                                     }
                                     Pill { label: wifi-password-set ? "Set" : "Not set"; bg: wifi-password-set ? Theme.ok-bg : Theme.panel2; fg: wifi-password-set ? Theme.ok : Theme.mute; }
                                 }
@@ -258,7 +248,7 @@ export component SettingsScreen inherits VerticalLayout {
                                         vertical-alignment: center;
                                         text <=> wifi-password-new;
                                         input-type: InputType.password;
-                                        font-size: 12px;
+                                        font-size: Theme.fs-hint;
                                         font-weight: 500;
                                         color: Theme.text;
                                         selection-background-color: Theme.accent;
@@ -278,26 +268,27 @@ export component SettingsScreen inherits VerticalLayout {
                                         vertical-alignment: center;
                                         text <=> wifi-password-confirm;
                                         input-type: InputType.password;
-                                        font-size: 12px;
+                                        font-size: Theme.fs-hint;
                                         font-weight: 500;
                                         color: Theme.text;
                                         selection-background-color: Theme.accent;
                                     }
                                 }
-                                Text { text: "New password (8–63 characters) — type it again to confirm."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                Text { text: "New password (8–63 characters) — type it again to confirm."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                                 HorizontalLayout {
                                     spacing: 8px;
                                     Btn { label: wifi-password-busy ? "Setting…" : wifi-password-set ? "Change password" : "Set password"; primary: true; disabled: wifi-password-busy || busy-kind == 14; clicked => { set-wifi-password(); } }
                                     if wifi-password-set : Btn { label: "Forget password"; disabled: wifi-password-busy || busy-kind == 14; clicked => { forget-wifi-password(); } }
                                 }
-                                if wifi-password-error != "" : Text { text: wifi-password-error; font-size: 12px; color: Theme.bad; wrap: word-wrap; }
-                                if wifi-password-message != "" : Text { text: wifi-password-message; font-size: 12px; color: Theme.ok; wrap: word-wrap; }
-                                Text { text: "Forgetting clears the password on this PC. If the wheel still has one, hold BOOT on the wheel for 10 seconds to clear it there too — the hotspot then comes back open."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                if wifi-password-error != "" : Text { text: wifi-password-error; font-size: Theme.fs-hint; color: Theme.bad; wrap: word-wrap; }
+                                if wifi-password-message != "" : Text { text: wifi-password-message; font-size: Theme.fs-hint; color: Theme.ok; wrap: word-wrap; }
+                                Text { text: "Forgetting clears the password on this PC. If the wheel still has one, hold BOOT on the wheel for 10 seconds to clear it there too — the hotspot then comes back open."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
-                            // A1 (v2.0.2): the setup-reopen row is easy
-                            // to miss at the bottom of this card, so its
-                            // button is primary — it stands out at a glance.
+                            // D3: one primary per screen — "Set
+                            // password" above is this screen's
+                            // primary, so "Run setup" is a secondary
+                            // outline button (was primary, A1).
                             HorizontalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
@@ -305,24 +296,21 @@ export component SettingsScreen inherits VerticalLayout {
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
-                                    Text { text: "Run setup again"; font-size: 13px; color: Theme.text; }
-                                    Text { text: "Connect, drivers, calibrate, games."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: "Run setup again"; font-size: Theme.fs-label; color: Theme.text; }
+                                    Text { text: "Connect, drivers, calibrate, games."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                                 }
-                                Btn { label: "Run setup"; primary: true; clicked => { run-setup(); } }
+                                Btn { label: "Run setup"; clicked => { run-setup(); } }
                             }
                         }
                     }
                     // Game controller
                     Card {
-                        VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
-                            spacing: 0px;
+                        CardBody {
                             HorizontalLayout {
                                 spacing: 8px;
                                 alignment: start;
-                                Text { text: "Game controller"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                                Text { text: "Game controller"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                             }
-                            Rectangle { height: 8px; }
                             VerticalLayout {
                                 spacing: 6px;
                                 RadioOptionCard {
@@ -344,16 +332,13 @@ export component SettingsScreen inherits VerticalLayout {
                             // 920px the "Run setup" button is primary
                             // (wider), so the 39-char sub needs two
                             // lines instead of pushing past the card.
-                            Text { text: "Recommended: vJoy"; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                            Text { text: "Recommended: vJoy"; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
                         }
                     }
                     // Startup
                     Card {
-                        VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
-                            spacing: 0px;
-                            Text { text: "Startup"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
-                            Rectangle { height: 8px; }
+                        CardBody {
+                            Text { text: "Startup"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                             HorizontalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
@@ -362,7 +347,7 @@ export component SettingsScreen inherits VerticalLayout {
                                 // align-items:center — the label
                                 // centres against the 20px switch.
                                 cross-axis-alignment: center;
-                                Text { text: "Start with Windows"; font-size: 13px; color: Theme.text; }
+                                Text { text: "Start with Windows"; font-size: Theme.fs-label; color: Theme.text; }
                                 Switch { accessible-name: "Start with Windows"; on: start-with-windows; toggled => { start-with-windows = !start-with-windows; toggled-start-windows(start-with-windows); } }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
@@ -377,8 +362,8 @@ export component SettingsScreen inherits VerticalLayout {
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
-                                    Text { text: "Keep running in the tray"; font-size: 13px; color: Theme.text; }
-                                    Text { text: "Keeps running after close."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: "Keep running in the tray"; font-size: Theme.fs-label; color: Theme.text; }
+                                    Text { text: "Keeps running after close."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 Switch { accessible-name: "Keep running in tray"; on: keep-in-tray; toggled => { keep-in-tray = !keep-in-tray; toggled-keep-tray(keep-in-tray); } }
                             }
@@ -394,19 +379,16 @@ export component SettingsScreen inherits VerticalLayout {
                     spacing: 12px;
                     // Profiles
                     Card {
-                        VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
-                            spacing: 0px;
+                        CardBody {
                             HorizontalLayout {
                                 alignment: space-between;
                                 // UI-UX polish (a): preview `.card h2`
                                 // is align-items:center — the title
                                 // centres against the 30px New button.
                                 cross-axis-alignment: center;
-                                Text { text: "Profiles"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
+                                Text { text: "Profiles"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                                 Btn { label: "New"; disabled: busy-kind == 8; clicked => { new-profile(); } }
                             }
-                            Rectangle { height: 8px; }
                             for p[i] in profiles : VerticalLayout {
                                 if i > 0 : Rectangle { height: 1px; background: Theme.line; }
                                 HorizontalLayout {
@@ -419,10 +401,10 @@ export component SettingsScreen inherits VerticalLayout {
                                         HorizontalLayout {
                                             spacing: 4px;
                                             alignment: start;
-                                            Text { text: p.name; font-size: 13px; font-weight: 600; color: Theme.text; wrap: word-wrap; }
+                                            Text { text: p.name; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; wrap: word-wrap; }
                                             if p.active : Pill { label: "Active"; bg: Theme.ok-bg; fg: Theme.ok; }
                                         }
-                                        Text { text: p.games; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                        Text { text: p.games; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                                     }
                                     if p.active : Btn { label: "Duplicate"; disabled: busy-kind == 8; clicked => { duplicate-profile(i); } }
                                     if !p.active : Btn { label: "Use"; disabled: busy-kind == 8; clicked => { use-profile(i); } }
@@ -434,16 +416,13 @@ export component SettingsScreen inherits VerticalLayout {
                     // work now — Light tokens live in tokens.slint, Auto
                     // is resolved to Dark/Light by the Rust side.
                     Card {
-                        VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
-                            spacing: 0px;
-                            Text { text: "Appearance"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
-                            Rectangle { height: 8px; }
+                        CardBody {
+                            Text { text: "Appearance"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                             HorizontalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
                                 spacing: 10px;
-                                Text { text: "Theme"; font-size: 13px; color: Theme.mute; vertical-alignment: center; }
+                                Text { text: "Theme"; font-size: Theme.fs-label; color: Theme.mute; vertical-alignment: center; }
                                 Rectangle { horizontal-stretch: 1; }
                                 Seg {
                                     width: 190px;
@@ -460,11 +439,8 @@ export component SettingsScreen inherits VerticalLayout {
                     // out of the card — the "App updates" Check button
                     // overflowed before this fix.
                     Card {
-                        VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
-                            spacing: 0px;
-                            Text { text: "Backup and updates"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
-                            Rectangle { height: 8px; }
+                        CardBody {
+                            Text { text: "Backup and updates"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                             HorizontalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
@@ -472,8 +448,8 @@ export component SettingsScreen inherits VerticalLayout {
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
-                                    Text { text: "Wheel firmware"; font-size: 13px; color: Theme.text; }
-                                    Text { text: firmware-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: "Wheel firmware"; font-size: Theme.fs-label; color: Theme.text; }
+                                    Text { text: firmware-text; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 // H-4: Check reports the verdict,
                                 // Update firmware starts the flash
@@ -481,7 +457,7 @@ export component SettingsScreen inherits VerticalLayout {
                                 // global busy strip shows progress).
                                 HorizontalLayout {
                                     spacing: 6px;
-                                    Btn { label: "Check"; disabled: busy-kind == 3; clicked => { check-firmware(); } }
+                                    Btn { label: "Check"; icon: @image-url("../../assets/icons/check.svg"); has-icon: true; disabled: busy-kind == 3; clicked => { check-firmware(); } }
                                     Btn { label: "Update firmware"; disabled: busy-kind == 4; clicked => { update-firmware(); } }
                                 }
                             }
@@ -493,10 +469,10 @@ export component SettingsScreen inherits VerticalLayout {
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
-                                    Text { text: "App updates"; font-size: 13px; color: Theme.text; }
-                                    Text { text: app-update-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: "App updates"; font-size: Theme.fs-label; color: Theme.text; }
+                                    Text { text: app-update-text; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                                 }
-                                Btn { label: "Check"; disabled: busy-kind == 16; clicked => { check-app-updates(); } }
+                                Btn { label: "Check"; icon: @image-url("../../assets/icons/check.svg"); has-icon: true; disabled: busy-kind == 16; clicked => { check-app-updates(); } }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
                             HorizontalLayout {
@@ -506,21 +482,19 @@ export component SettingsScreen inherits VerticalLayout {
                                 VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
-                                    Text { text: "Backups"; font-size: 13px; color: Theme.text; }
-                                    Text { text: backup-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: "Backups"; font-size: Theme.fs-label; color: Theme.text; }
+                                    Text { text: backup-text; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 HorizontalLayout {
                                     spacing: 6px;
                                     Btn { label: "Back up"; disabled: busy-kind == 14; clicked => { backup(); } }
-                                    Btn { label: "Restore"; disabled: busy-kind == 14; clicked => { restore(); } }
+                                    Btn { label: "Restore"; icon: @image-url("../../assets/icons/restore.svg"); has-icon: true; destructive: true; disabled: busy-kind == 14; clicked => { restore(); } }
                                 }
                             }
                         }
                     }
                 }
             }
-            Rectangle { height: 2px; }
-        }
     }
     // diagnostics link, pinned at the bottom (§7.5)
     HorizontalLayout {
@@ -530,7 +504,7 @@ export component SettingsScreen inherits VerticalLayout {
         padding-right: 20px;
         Text {
             text: "Open diagnostics";
-            font-size: 12px;
+            font-size: Theme.fs-hint;
             font-weight: 600;
             color: fs.has-focus || diag-ta.has-hover ? Theme.text : Theme.accent-text;
             accessible-label: "Open diagnostics";
