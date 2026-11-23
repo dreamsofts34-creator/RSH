@@ -218,11 +218,12 @@ export component SetupWizard inherits Rectangle {
         VerticalLayout {
             horizontal-stretch: 1;
             padding-top: 28px;
-            // UI-UX polish (c): the floating busy strip sits over the
-            // bottom 38px of the window, so the right column keeps
-            // 38px of empty padding below the footer (28+38=66) —
-            // otherwise the strip would cover Back/Next while a job
-            // runs. The window never resizes; this is the reserve.
+            // UI-UX polish (c): the status bar sits over the
+            // bottom 40px of the window, so the right column keeps
+            // empty padding below the footer (66px — more than the
+            // 40px bar) — otherwise the bar would cover Back/Next
+            // while a job runs. The window never resizes; this is
+            // the reserve.
             padding-bottom: 66px;
             padding-left: 36px;
             padding-right: 36px;

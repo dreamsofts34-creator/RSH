@@ -450,12 +450,11 @@ fn color_row_counts(
 
 /// Bounding box of pixels within `tol` of `color`, restricted to
 /// the rectangle `region` (x0, x1, y0, y1). Used for the real-MainWindow
-/// toast: the window's Overview page contains other ok-bg elements
+/// `StatusBar`: the window's Overview page contains other ok-bg elements
 /// (status pills/bars), so the whole-snapshot bbox of ok-bg spans
-/// the page, not the toast — the toast lives at x 312..792 (centred
-/// 480 px card) and y 64.., so the region pins the measurement to
-/// it. Returns (`count`, `min_x`, `max_x`, `min_y`, `max_y`) like
-/// [`count_color`].
+/// the page, not the bar — the bar lives in the bottom 40 px strip,
+/// so the region pins the measurement to it. Returns (`count`,
+/// `min_x`, `max_x`, `min_y`, `max_y`) like [`count_color`].
 fn count_color_rect(
     rgba: &[u8],
     width: u32,
@@ -1464,80 +1463,226 @@ fn ui_banner_wrap() -> Outcome {
     report.finish()
 }
 
-/// Gate: toast size (Bug 2) — the DS-24 toast is a designed
-/// 480×~52 px card, but the user PC rendered it at ~70% window
-/// width and ~30% window height. The probe hosts the toast markup
-/// verbatim from `crates/rsh-ui/ui/main.slint` and measures its
-/// rendered height (layout property + pixel bbox of the toast
-/// background) for a short body, the flap body, and a long error
-/// body. Acceptance: width stays 480 px and height stays ≤ 80 px
-/// on every body — a toast is a small card, never a panel.
+/// Render one `StatusBar` probe variant and return its snapshot
+/// (rgba bytes, width, height).
+fn statusbar_snapshot(component: &str) -> Result<(Vec<u8>, u32, u32), String> {
+    let instance = compile(
+        "tools/gate-checks/rsh-gate-ui/ui/statusbar_probe.slint",
+        component,
+    )?;
+    snapshot(&instance)
+}
+
+/// Gate: bottom `StatusBar` (B01) — the real `MainWindow` bar, four
+/// variants: a 200-char UNCAPPED error body, a short success body,
+/// busy-only, and idle. Acceptance: the error bar is exactly 40 px
+/// tall (39 px of bg + the 1 px top line) and spans the full window
+/// width in the bottom strip, whatever the text length (the text
+/// elides to one line); the success bar shows its ok "✓" + ok title
+/// well above the idle baseline; busy paints the spinner dot
+/// (accent) in the strip and no message bg; idle paints nothing in
+/// the strip at all (the reserve is empty space).
+/// Pixel proof on the real `MainWindow`: err-bg (#2E1F26) bbox
+/// restricted to the bottom 40 px strip, ok-foreground (#3DD68C)
+/// counts in the same strip for success vs idle, accent counts
+/// in the same strip for busy vs idle.
 #[allow(clippy::cast_precision_loss)]
-fn ui_toast_size() -> Outcome {
+fn ui_statusbar_real_mainwindow() -> Outcome {
     let mut report = Report::new();
-    let instance = match compile(
-        "tools/gate-checks/rsh-gate-ui/ui/toast_probe.slint",
-        "GateToastWindow",
-    ) {
-        Ok(instance) => instance,
-        Err(error) => return Outcome::fail(error),
-    };
-    // (title, body, kind, label) cases.
-    let cases: [(&str, &str, &str, &str); 3] = [
-        ("RSH connected", "Live data is back.", "success", "short"),
-        (
-            "RSH connected",
-            "Live data is back — the connection flapped ×3 before stabilising.",
-            "success",
-            "flap",
-        ),
-        (
-            "Couldn't complete that",
-            // The longest body production can show: set_toast caps
-            // bodies at 120 chars (the uncapped error is 200 chars;
-            // the full text stays in the drawer). The gate renders
-            // the capped form, as the user sees it.
-            "Couldn't reach the wheel — the connection timed out after 10 s. Check the RSH-XXXX Wi-Fi is joined (or the USB cable is …",
-            "error",
-            "long",
-        ),
+    // Idle baseline first: accent pixels already in the strip
+    // (page content cut at the fold) would make a busy-only
+    // accent assertion meaningless without a baseline. Same for
+    // the success bar's ok-coloured glyphs (see below).
+    let mut idle_accent = 0_usize;
+    let mut idle_ok_fg = 0_usize;
+    let cases: [(&str, &str); 4] = [
+        ("GateMainStatusIdle", "idle"),
+        ("GateMainStatusError", "error"),
+        ("GateMainStatusSuccess", "success"),
+        ("GateMainStatusBusy", "busy"),
     ];
-    for (title, body, kind, label) in cases {
-        if let Err(error) = set_str(&instance, "toast-title", title)
-            .and_then(|()| set_str(&instance, "toast-text", body))
-            .and_then(|()| set_str(&instance, "toast-kind", kind))
-        {
-            return Outcome::fail(error);
-        }
-        let (rgba, width, _height) = match snapshot(&instance) {
+    for (component, kind) in cases {
+        let (rgba, width, height) = match statusbar_snapshot(component) {
             Ok(snap) => snap,
             Err(error) => return Outcome::fail(error),
         };
-        let height = get_num(&instance, "toast-height");
-        let toast_width = get_num(&instance, "toast-width");
-        // Pixel bbox of the toast background (ok-bg #1B3635 /
-        // err-bg #2E1F26): the rendered height, independent of the
-        // layout property read.
-        let bg: (i32, i32, i32) = if kind == "success" {
-            (0x1b, 0x36, 0x35)
-        } else {
-            (0x2e, 0x1f, 0x26)
-        };
-        let (_, _, _, top, bottom) = count_color(&rgba, width, bg, 6);
-        let px_height = if bottom >= top { bottom - top + 1 } else { 0 };
-        report.check(
-            &format!("toast-{label}-width-480px"),
-            toast_width == Some(480.0),
-            &format!("{label} toast width: {toast_width:?} (want 480)"),
+        // Bottom strip: the 40 px reserve (last 40 rows).
+        let strip = (
+            0_usize,
+            width as usize,
+            (height as usize).saturating_sub(40),
+            height as usize,
         );
-        report.check(
-            &format!("toast-{label}-height-compact"),
-            height.is_some_and(|h| h <= 80.0),
-            &format!(
-                "{label} toast height: {height:?} px (property), {px_height} px (pixels) (want <= 80)"
-            ),
-        );
+        let strip_top = strip.2;
+        let strip_bottom = strip.3;
+        let (err_count, err_min_x, err_max_x, err_top, err_bottom) =
+            count_color_rect(&rgba, width, (0x2e, 0x1f, 0x26), 6, strip);
+        let (ok_count, _, _, _, _) = count_color_rect(&rgba, width, (0x1b, 0x36, 0x35), 6, strip);
+        let (accent_count, _, _, _, _) = count_color_rect(&rgba, width, ACCENT, 12, strip);
+        // Success-bar glyphs: the "✓" icon + title render in
+        // Theme.ok (#3DD68C). (The bar background is Theme.panel
+        // per the §3.1 sketch — ok-bg is the wrong signal: the
+        // only ok-bg pixels a success render shows are the
+        // anti-aliased fringes of those ok glyphs.)
+        let (ok_fg_count, _, _, _, _) =
+            count_color_rect(&rgba, width, (0x3d, 0xd6, 0x8c), 12, strip);
+        match kind {
+            "idle" => {
+                idle_accent = accent_count;
+                idle_ok_fg = ok_fg_count;
+                report.check(
+                    "statusbar-idle-no-bar",
+                    err_count == 0 && ok_count == 0,
+                    &format!(
+                        "idle: err-bg {err_count} px / ok-bg {ok_count} px in the bottom strip (want 0/0)"
+                    ),
+                );
+            }
+            "error" => {
+                let px_height = if err_bottom >= err_top {
+                    err_bottom - err_top + 1
+                } else {
+                    0
+                };
+                report.check(
+                    "statusbar-error-full-width",
+                    err_count > 0 && err_min_x == 0 && err_max_x == width as usize - 1,
+                    &format!(
+                        "error bar spans x={err_min_x}..{err_max_x} (want 0..{}), {err_count} px",
+                        width as usize - 1
+                    ),
+                );
+                report.check(
+                    "statusbar-error-height-40px",
+                    (38..=40).contains(&px_height)
+                        && err_top <= strip_top + 1
+                        && err_bottom >= strip_bottom.saturating_sub(2),
+                    &format!(
+                        "error bar y={err_top}..{err_bottom} ({px_height} px tall, want ~40 px)"
+                    ),
+                );
+            }
+            "success" => {
+                // The success bar is panel-backed with an ok "✓" +
+                // ok title: its ok-foreground pixels must exceed
+                // the idle baseline by a clear margin (the title
+                // alone is ~100 px of 13 px semibold text), and no
+                // error background may show.
+                report.check(
+                    "statusbar-success-ok-glyphs",
+                    ok_fg_count > idle_ok_fg + 50,
+                    &format!(
+                        "success: ok-fg {ok_fg_count} px in the strip vs idle {idle_ok_fg} px (want > idle + 50)"
+                    ),
+                );
+                report.check(
+                    "statusbar-success-no-error-bg",
+                    err_count == 0,
+                    &format!("success: err-bg {err_count} px in the strip (want 0)"),
+                );
+            }
+            _ => {
+                // Busy: spinner dot (accent) above the idle
+                // baseline, and no message background at all.
+                report.check(
+                    "statusbar-busy-spinner",
+                    accent_count > idle_accent,
+                    &format!(
+                        "busy: accent {accent_count} px in the strip vs idle {idle_accent} px (want more)"
+                    ),
+                );
+                report.check(
+                    "statusbar-busy-no-message-bg",
+                    err_count == 0 && ok_count == 0,
+                    &format!(
+                        "busy: err-bg {err_count} px / ok-bg {ok_count} px in the strip (want 0/0)"
+                    ),
+                );
+            }
+        }
     }
+    report.finish()
+}
+
+/// Gate: no-clip (B07/B08) — every `ScrollView` in the shipped UI
+/// clamps its content to the visible width
+/// (`content-width: self.visible-width`), so a wide child can
+/// never force a horizontal scroll / clip the panel's right side
+/// the way the Steering tuning panel clipped at 296 px. Static
+/// source check: the interpreter cannot read nested-element
+/// properties, so this scans the `.slint` sources and brace-matches
+/// each `ScrollView { ... }` block for the clamp. A `ScrollView`
+/// without the clamp fails the gate.
+fn ui_scrollview_no_clip() -> Outcome {
+    let mut report = Report::new();
+    let ui_root = repo_root().join("crates/rsh-ui/ui");
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for entry in [ui_root.clone(), ui_root.join("screens")] {
+        let Ok(dir) = std::fs::read_dir(&entry) else {
+            return Outcome::fail(format!("cannot read dir {}", entry.display()));
+        };
+        for item in dir.flatten() {
+            let path = item.path();
+            if path.extension().is_some_and(|ext| ext == "slint") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        return Outcome::fail("no .slint files found under crates/rsh-ui/ui".to_string());
+    }
+    let mut checked = 0_usize;
+    for path in &files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Outcome::fail(format!("cannot read {}", path.display()));
+        };
+        let name = path
+            .strip_prefix(repo_root())
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        // Brace-match each `ScrollView { ... }` block.
+        let mut rest = text.as_str();
+        let mut offset = 0_usize;
+        while let Some(at) = rest.find("ScrollView {") {
+            let block_start = offset + at + "ScrollView ".len();
+            let bytes = text.as_bytes();
+            let mut depth = 0_i32;
+            let mut end: Option<usize> = None;
+            for (i, &byte) in bytes.iter().enumerate().skip(block_start) {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(block_end) = end else {
+                return Outcome::fail(format!("{name}: unbalanced ScrollView block"));
+            };
+            let block = &text[block_start..=block_end];
+            let line_no = text[..block_start].matches('\n').count() + 1;
+            checked += 1;
+            report.check(
+                &format!("scrollview-no-clip-{name}:{line_no}"),
+                block.contains("content-width: self.visible-width"),
+                &format!("{name}:{line_no} ScrollView clamps content-width to visible-width"),
+            );
+            offset = block_end + 1;
+            rest = &text[offset..];
+        }
+    }
+    report.check(
+        "scrollview-no-clip-found-any",
+        checked > 0,
+        &format!("{checked} ScrollView blocks checked (want > 0)"),
+    );
     report.finish()
 }
 
@@ -1665,78 +1810,6 @@ fn ui_banner_action_wrap() -> Outcome {
             &format!(
                 "{label} last text row {text_bottom:?}, banner bg bottom {bg_bottom} (want text bottom + 6 <= banner bottom)"
             ),
-        );
-    }
-    report.finish()
-}
-
-/// Gate: real `MainWindow` toast (Bug 2) — the verbatim probes above
-/// isolate the mechanism (a height-less Rectangle parented by the
-/// Window / a 100% `FocusScope` measures window-height), this check
-/// proves the shipped window: instantiate the real `MainWindow`,
-/// set its toast props, and measure the toast background's pixel
-/// bbox. Acceptance: the rendered toast is ≤ 80 px tall on a short
-/// body and on a long error body, at 480 px wide.
-#[allow(clippy::cast_precision_loss)]
-fn ui_toast_real_mainwindow() -> Outcome {
-    let mut report = Report::new();
-    // FocusScope-parented verbatim copy (MainWindow's parenting):
-    // the layout property alone proves the mechanism.
-    let focus = match compile(
-        "tools/gate-checks/rsh-gate-ui/ui/toast_probe.slint",
-        "GateToastFocusWindow",
-    ) {
-        Ok(instance) => instance,
-        Err(error) => return Outcome::fail(error),
-    };
-    if let Err(error) = snapshot(&focus) {
-        return Outcome::fail(error);
-    }
-    let focus_height = get_num(&focus, "toast-height");
-    let focus_width = get_num(&focus, "toast-width");
-    report.check(
-        "toast-focus-parent-height-compact",
-        focus_height.is_some_and(|h| h <= 80.0),
-        &format!("FocusScope-parented toast height: {focus_height:?} (want <= 80)"),
-    );
-    report.check(
-        "toast-focus-parent-width-480px",
-        focus_width == Some(480.0),
-        &format!("FocusScope-parented toast width: {focus_width:?} (want 480)"),
-    );
-    // The real MainWindow, short + long bodies (pixel bbox of the
-    // toast background — the window exposes no toast-height prop).
-    // One component per variant: the interpreter cannot set
-    // inherited properties on an instance.
-    let cases: [(&str, &str, &str); 2] = [
-        ("GateMainToastShort", "success", "short"),
-        ("GateMainToastLong", "error", "long"),
-    ];
-    for (component, kind, label) in cases {
-        let instance = match compile(
-            "tools/gate-checks/rsh-gate-ui/ui/toast_probe.slint",
-            component,
-        ) {
-            Ok(instance) => instance,
-            Err(error) => return Outcome::fail(error),
-        };
-        let (rgba, width, _height) = match snapshot(&instance) {
-            Ok(snap) => snap,
-            Err(error) => return Outcome::fail(error),
-        };
-        let bg: (i32, i32, i32) = if kind == "success" {
-            (0x1b, 0x36, 0x35)
-        } else {
-            (0x2e, 0x1f, 0x26)
-        };
-        // Region-restricted to the toast card (x 312..792, y 64..250):
-        // the Overview page behind it has other ok-bg elements.
-        let (_, _, _, top, bottom) = count_color_rect(&rgba, width, bg, 6, (312, 792, 64, 250));
-        let px_height = if bottom >= top { bottom - top + 1 } else { 0 };
-        report.check(
-            &format!("toast-real-{label}-height-compact"),
-            px_height <= 80,
-            &format!("real MainWindow toast ({label}): {px_height} px tall (want <= 80)"),
         );
     }
     report.finish()
@@ -2802,14 +2875,14 @@ fn checks() -> Vec<UiCheck> {
             ui_banner_wrap as fn() -> Outcome,
         ),
         (
-            "ui-toast-size",
-            "Bug 2: toast stays a 480 px wide, <= 80 px tall card on short, flap and long bodies",
-            ui_toast_size as fn() -> Outcome,
+            "ui-statusbar-real-mainwindow",
+            "B01: the real MainWindow StatusBar is 40 px tall, full width, for error/success/busy; absent when idle",
+            ui_statusbar_real_mainwindow as fn() -> Outcome,
         ),
         (
-            "ui-toast-real-mainwindow",
-            "Bug 2: the real MainWindow toast (FocusScope-parented) renders <= 80 px tall, short and long bodies",
-            ui_toast_real_mainwindow as fn() -> Outcome,
+            "ui-scrollview-no-clip",
+            "B07/B08: every ScrollView in the shipped UI clamps content-width to visible-width (no horizontal clip)",
+            ui_scrollview_no_clip as fn() -> Outcome,
         ),
         (
             "ui-banner-action-wrap",

@@ -105,18 +105,24 @@ export component MainWindow inherits Window {
     // is none; the Overview shows it as an error banner instead of
     // the generic "not running" line. Set from Rust (mark_dead / sync).
     in property <string> daemon-error: "";
-    // DS-24 (U-06): transient in-place failure toast — every
-    // `notify_error` also surfaces here for ~5 s, so a failure is
-    // visible on the current screen without opening the bell drawer
-    // (the full text stays in the drawer). `in-out` so the toast's
-    // own click-to-dismiss can clear it; Rust clears it on expiry
-    // (1 Hz tick). Empty = hidden.
-    in-out property <string> toast-title: "";
-    in-out property <string> toast-text: "";
-    // D17: "error" (error-accent border) or "success" (ok-accent
-    // border) — same 480 px card, set by Rust's set_toast /
-    // set_toast_success. Empty toast-text hides the card.
-    in-out property <string> toast-kind: "error";
+    // B01 (v2.0.8 retest): the bottom StatusBar replaces the
+    // floating toast (DS-24, deleted) — every `notify_error` /
+    // `notify_success` / `notify_toast` surfaces here for 8 s
+    // (error) / 4 s (success), so a failure is visible on the
+    // current screen without opening the bell drawer. `in-out`
+    // so Rust drives it and the bar's own ✕ / Details callbacks
+    // clear it / open the drawer; Rust clears it on expiry
+    // (1 Hz tick). Empty `status-kind` = hidden (unless a job
+    // is busy). FULL text, never truncated: the bar elides the
+    // one line visually and the whole message lives in the drawer.
+    in-out property <string> status-kind: ""; // "", "error", "success"
+    in-out property <string> status-title: "";
+    in-out property <string> status-text: "";
+    // Superseded-message counter: a new message replaces the
+    // shown one; this counts how many were replaced (+N).
+    in-out property <int> status-more: 0;
+    callback status-dismiss();
+    callback status-details();
     // B5 spinner step (0..11, driven by the strip's Timer).
     property <int> spin-step: 0;
     in property <bool> connected: true;
@@ -631,13 +637,13 @@ export component MainWindow inherits Window {
         if !setup-mode : HorizontalLayout {
             width: 100%;
             // R2-12 / DS-53 (UI-UX polish, c): NO height reservation
-            // any more — the busy strip floats over the bottom 38px
+            // any more — the status bar sits over the bottom 40px
             // instead of shrinking the layout (the old
             // `parent.height - (busy ? 38px : 0px)` re-laid the whole
             // window on every job start/finish, which read as a
-            // blink). The 38px under the content is permanent empty
+            // blink). The 40px under the content is permanent empty
             // padding (see the column's padding-bottom below and the
-            // sidebar's 52px bottom padding), so the strip only ever
+            // sidebar's 52px bottom padding), so the bar only ever
             // covers empty space — never content, never the About
             // link. The window height never changes.
             height: parent.height;
@@ -666,13 +672,13 @@ export component MainWindow inherits Window {
             // column can never ask for more than the window gives.
             min-width: 736px;
             horizontal-stretch: 1;
-            // R2-12 (c): permanent 38px empty reserve at the bottom
-            // of the content column — the floating busy strip sits
+            // R2-12 (c): permanent 40px empty reserve at the bottom
+            // of the content column — the status bar sits
             // over this padding, never over page content. Pages keep
             // their own 16px bottom padding above it; the reserve
             // only eats slack (Overview already had ~68px of it) or
             // shrinks a stretch absorber / the Settings ScrollView.
-            padding-bottom: 38px;
+            padding-bottom: 40px;
             // top bar (56px). The inner row is 30px tall and offset by
             // 13px so its contents are vertically centred in the bar:
             // Slint layouts top-align fixed-height children, so an
@@ -1129,9 +1135,9 @@ export component MainWindow inherits Window {
     // (setup-step) so Rust drives Back/Next; the wizard itself only
     // reads it. The notifications drawer below still overlays it.
     if setup-mode : SetupWizard {
-        // R2-12 (c): no 38px height reservation any more (see the
+        // R2-12 (c): no 40px height reservation any more (see the
         // shell layout above) — the wizard is always full-height and
-        // the strip floats over the right column's 38px bottom
+        // the status bar sits over the right column's 40px bottom
         // reserve (setup.slint padding-bottom 66px). Full height is
         // kept explicit (perf R2-12) so the wizard never shrinks.
         height: parent.height;
@@ -1271,58 +1277,6 @@ export component MainWindow inherits Window {
             }
         }
     }
-    // DS-24 (U-06): transient failure toast — Phase 2 (F-1 / U-2):
-    // a centred ~480 px top-middle card per UI-DESIGN §6, NOT a
-    // full-content-width banner: the old full-width toast covered
-    // the Overview banner's Reconnect / Pair buttons while visible
-    // and read as a full-screen error. Click it to dismiss early;
-    // it also expires after ~5 s (U-1: the toast is not a modal
-    // popup — it never blocks the page, so it needs no backdrop).
-    // Painted before the drawers, so an open drawer covers its
-    // right end; the text is left-aligned and stays readable.
-    if toast-text != "" : Rectangle {
-        // Centre within the content column (sidebar .. right edge).
-        x: Theme.sidebar-width + (parent.width - Theme.sidebar-width - 480px) / 2;
-        y: 64px;
-        width: 480px;
-        // B2 (PC-test Bug 2): an explicit content height — a
-        // height-less Rectangle parented by the window stretches
-        // to the window height (gate-measured 580 px for every
-        // body, short or long), so the toast used to render as a
-        // full-height panel instead of the designed 480×~52 px
-        // card. The layout's preferred height is content-driven
-        // (fixed 480 px width, wrapped text), so binding to it
-        // sizes the card to its text; Rust caps the text
-        // (set_toast) so the card stays ≤ ~80 px. The 52 px floor
-        // is the design height for one-line toasts (height +
-        // min-height cannot both be set). (Binding to
-        // layout.height is a loop: a layout fills its parent, so
-        // layout.height IS the card height.)
-        height: Math.max(toast-layout.preferred-height, 52px);
-        border-radius: 8px;
-        border-width: 1px;
-        border-color: toast-kind == "success" ? Theme.ok : Theme.bad;
-        background: toast-kind == "success" ? Theme.ok-bg : Theme.err-bg;
-        toast-layout := HorizontalLayout {
-            padding-left: 12px;
-            padding-right: 12px;
-            padding-top: 8px;
-            padding-bottom: 8px;
-            spacing: 10px;
-            VerticalLayout {
-                horizontal-stretch: 1;
-                spacing: 2px;
-                Text { text: toast-title; font-size: 12.5px; font-weight: 600; color: toast-kind == "success" ? Theme.ok : Theme.bad; wrap: word-wrap; }
-                Text { text: toast-text; font-size: 12px; color: Theme.text; wrap: word-wrap; }
-            }
-            Text { text: "✕"; font-size: 12px; color: Theme.faint; vertical-alignment: center; }
-        }
-        TouchArea {
-            width: parent.width;
-            height: parent.height;
-            clicked => { toast-text = ""; toast-title = ""; toast-kind = "error"; }
-        }
-    }
     // Phase 2 (F-2 / U-1): backdrop + click-away for the
     // notifications drawer.
     if notif-open : Rectangle {
@@ -1356,10 +1310,10 @@ export component MainWindow inherits Window {
     if diag-open : DiagnosticsDrawer {
         x: parent.width - 420px;
         y: 0px;
-        // R2-12 (c): the drawer stops 38px above the window bottom
-        // so the floating busy strip never covers its bottom edge
+        // R2-12 (c): the drawer stops 40px above the window bottom
+        // so the status bar never covers its bottom edge
         // (event log / encoders) while a job runs.
-        height: parent.height - 38px;
+        height: parent.height - 40px;
         steer-chart: diag-steer-chart;
         steer-readout: diag-steer-readout;
         pedals-chart: diag-pedals-chart;
@@ -1387,26 +1341,31 @@ export component MainWindow inherits Window {
         events: diag-events;
         closed => { diag-open = false; }
     }
-    // B5 (v2.0.2): global busy strip — one bar, bottom-anchored, on
-    // every screen (it is a direct child of the root FocusScope, so
-    // it also shows over the setup wizard). R2-12 (UI-UX polish, c):
-    // it FLOATS now — it is positioned absolute over the window's
-    // bottom 38px and the content keeps a permanent 38px empty
-    // reserve there, so starting/finishing a job never re-lays the
-    // window. Rust drives `busy` / `busy-label` from busy_jobs;
-    // while a job runs the strip is visible with a spinner + the
-    // job's label, and it vanishes the moment the job finishes or
-    // times out — no infinite loading.
-    if busy : Rectangle {
+    // B01 (v2.0.8 retest): ONE bottom StatusBar replaces the
+    // floating toast (DS-24, deleted) and the separate busy strip
+    // (B5, merged in) — busy + error + success share this single
+    // 40 px bar, so a message never covers content, a dialog or a
+    // banner. Priority: Error > Busy > Success — an error paints
+    // the bar err-bg with its title + one elided line; a busy job
+    // still shows its spinner + a small label at the left. One
+    // message at a time: a new message replaces the old one and
+    // `status-more` counts the superseded ones (+N); the full text
+    // lives in the notifications drawer (Details opens it). Error
+    // 8 s / success 4 s (Rust `set_toast*`); the ✕ dismisses
+    // early. The content column keeps a permanent 40 px reserve
+    // below the page (padding-bottom above), so the bar only ever
+    // covers empty space. It is a direct child of the root
+    // FocusScope, so it also shows over the setup wizard.
+    if busy || status-kind != "" : Rectangle {
         x: 0px;
-        y: parent.height - 38px;
+        y: parent.height - 40px;
         width: parent.width;
-        height: 38px;
-        background: Theme.panel;
-        // Floating shadow: an 8px fade above the strip so it reads
-        // as a bar floating over the page's bottom padding, not as a
-        // hard edge slicing the content. (A child at negative y
-        // paints outside the parent — Rectangle does not clip.)
+        height: 40px;
+        background: status-kind == "error" ? Theme.err-bg : Theme.panel;
+        // Floating shadow: an 8px fade above the bar so it reads
+        // as a bar over the page's bottom padding, not as a hard
+        // edge slicing the content. (A child at negative y paints
+        // outside the parent — Rectangle does not clip.)
         Rectangle {
             x: 0px;
             y: -8px;
@@ -1414,22 +1373,21 @@ export component MainWindow inherits Window {
             height: 8px;
             background: @linear-gradient(180deg, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.20));
         }
-        Rectangle { y: 0px; width: 100%; height: 1px; background: Theme.line; }
+        Rectangle { y: 0px; width: 100%; height: 1px; background: status-kind == "error" ? Theme.bad : Theme.line; }
         HorizontalLayout {
-            y: 11px;
-            height: 16px;
+            y: 0px;
+            height: 40px;
             width: parent.width;
             padding-left: 20px;
-            padding-right: 20px;
+            padding-right: 12px;
             spacing: 10px;
-            // Spinner: a ring with one accent dot orbiting it. The
-            // dot's position is a plain x/y binding off spin-step
-            // (Timer-driven), so it animates in every renderer.
-            // (transform-rotation was tried first: it compiles, but
-            // the dot does not move under the testing backend's
-            // software renderer — probe-verified 2026-11-17 — so the
-            // spinner does not rely on it.)
-            Rectangle {
+            cross-axis-alignment: center;
+            // Spinner: the same ring + orbiting dot as the old busy
+            // strip (transform-rotation does not move under the
+            // testing backend's software renderer — probe-verified
+            // 2026-11-17 — so the dot is a plain x/y binding off
+            // spin-step).
+            if busy : Rectangle {
                 width: 16px;
                 height: 16px;
                 border-radius: 8px;
@@ -1445,14 +1403,51 @@ export component MainWindow inherits Window {
                     background: Theme.accent;
                 }
             }
-            Text {
+            if busy && status-kind != "" : Text {
+                vertical-alignment: center;
+                text: busy-label == "" ? "Working…" : busy-label;
+                font-size: 12px;
+                color: Theme.mute;
+            }
+            if busy && status-kind == "" : Text {
                 vertical-alignment: center;
                 text: busy-label == "" ? "Working…" : busy-label;
                 font-size: 12.5px;
                 font-weight: 600;
                 color: Theme.text;
             }
-            Rectangle { horizontal-stretch: 1; }
+            if status-kind == "error" : Text { vertical-alignment: center; text: "!"; font-size: 13px; font-weight: 700; color: Theme.bad; }
+            if status-kind == "success" : Text { vertical-alignment: center; text: "✓"; font-size: 13px; font-weight: 700; color: Theme.ok; }
+            if status-kind != "" : Text {
+                vertical-alignment: center;
+                text: status-title;
+                font-size: 13px;
+                font-weight: 600;
+                color: status-kind == "error" ? Theme.bad : Theme.ok;
+                overflow: elide;
+            }
+            if status-kind != "" : Text {
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                text: status-text;
+                font-size: 12.5px;
+                color: Theme.text;
+                overflow: elide;
+            }
+            if status-kind == "" : Rectangle { horizontal-stretch: 1; }
+            if status-more > 0 : Text {
+                vertical-alignment: center;
+                text: "+" + status-more;
+                font-size: 12px;
+                color: Theme.mute;
+            }
+            if status-kind != "" : Btn { label: "Details"; clicked => { status-details(); } }
+            if status-kind != "" : Rectangle {
+                width: 24px;
+                height: 24px;
+                Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: "✕"; font-size: 12px; color: Theme.faint; }
+                dismiss-ta := TouchArea { width: 100%; height: 100%; mouse-cursor: pointer; clicked => { status-dismiss(); } }
+            }
         }
         Timer {
             interval: 90ms;
@@ -1460,10 +1455,10 @@ export component MainWindow inherits Window {
             // a running spinner schedules a redraw every 90 ms,
             // and a redraw on the just-hidden window SIGSEGVs the
             // software renderer under Xvfb (the fault is in the
-            // `llvmpipe` render thread, not app code). The strip
+            // `llvmpipe` render thread, not app code). The bar
             // stays mounted (invisible anyway); the Timer resumes
             // when the window comes back.
-            running: !window-hidden;
+            running: busy && !window-hidden;
             triggered => { spin-step = spin-step >= 11 ? 0 : spin-step + 1; }
         }
     }

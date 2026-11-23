@@ -151,22 +151,6 @@ pub fn user_text(s: &str) -> String {
         .replace("Simulated data", "Live data unavailable")
 }
 
-/// Truncate a toast string to `max` chars (char-safe — the texts
-/// carry "—"/"×"), appending "…" when cut. The toast card is
-/// 480 px wide with ~2 lines of body at 12 px; longer text would
-/// grow the card past its ~80 px design height (B2). The full text
-/// is never lost: `notify` stores it in the notification drawer
-/// before the toast is shown.
-fn toast_capped(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut capped: String = s.chars().take(max).collect();
-        capped.push('…');
-        capped
-    }
-}
-
 /// One mV reading as shown in the range blocks ("410 mV", "—" for
 /// the neutral 0 mV that means "no reading yet" — the neutral record
 /// is 0..3300 mV, so a stored 0 minimum is not a real reading).
@@ -1876,10 +1860,10 @@ struct Ctx {
     /// `handbrake-test` action sets this, `push_frame` drives
     /// `handbrake-pressed` from it.
     handbrake_test_until: Rc<Cell<Option<Instant>>>,
-    /// Failure-toast expiry (DS-24): `notify_error` shows the
-    /// toast until this instant; the 1 Hz tick clears it after.
-    /// `None` = no toast showing.
-    toast_until: Rc<Cell<Option<Instant>>>,
+    /// Status-bar expiry (B01, was the DS-24 toast):
+    /// `notify_error` shows the message until this instant; the
+    /// 1 Hz tick clears it after. `None` = no status showing.
+    status_until: Rc<Cell<Option<Instant>>>,
     /// Live chart histories (A20): steering deg + throttle 0..1.
     steer_hist: Rc<RefCell<VecDeque<f32>>>,
     pedal_hist: Rc<RefCell<VecDeque<f32>>>,
@@ -3316,26 +3300,35 @@ impl Ctx {
             (Some(detail), "Something went wrong.") => detail.clone(),
             _ => err.what_happened.clone(),
         };
-        let body = if err.what_to_do.is_empty() {
+        // B02: never join `what_to_do` when it already says what
+        // happened (case-insensitive) — TransportClosed used to
+        // render "…dropped. Connection to the wheel dropped —
+        // reconnecting." with the sentence twice.
+        let body = if err.what_to_do.is_empty()
+            || happened
+                .to_lowercase()
+                .contains(&err.what_to_do.to_lowercase())
+        {
             happened
         } else {
             format!("{happened} {}", err.what_to_do)
         };
         self.notify(win, kind, title, &body);
-        // DS-24: the failure also surfaces in place, as a
-        // transient toast on the current screen — a user who never
-        // opens the bell drawer still sees that an action failed.
+        // B01 (was DS-24): the failure also surfaces in place, as
+        // a transient status-bar message on the current screen — a
+        // user who never opens the bell drawer still sees that an
+        // action failed.
         self.set_toast(win, title, &body);
     }
 
     // D17: `notify_error_urgent` is DELETED — no failure ever
     // auto-opens the drawer any more. The drawer opens only on
-    // bell click; every failure toasts in place via
+    // bell click; every failure shows in the status bar via
     // [`Self::notify_error`] (+ [`Self::set_toast`]) and lands in
     // the drawer + badge for later.
 
     /// Show a user-initiated success visibly (D17): drawer entry
-    /// + a success toast (same 480 px card, ok-accent border) —
+    /// + a success status-bar message —
     ///   reconnected, firmware updated, controller switched, profile
     ///   ops, game added/removed, wizard finish, backup restored.
     fn notify_success(&self, win: &MainWindow, kind: &str, title: &str, body: &str) {
@@ -3343,64 +3336,85 @@ impl Ctx {
         self.set_toast_success(win, title, body);
     }
 
-    /// Drawer entry + toast for a plain-string message (D17):
-    /// validation refusals and other non-`UserError` results —
-    /// "RSH isn't running", "Admin permission needed", "Game
-    /// refused", timeouts. Same toast-only rule as
+    /// Drawer entry + status-bar message for a plain-string
+    /// message (D17): validation refusals and other non-`UserError`
+    /// results — "RSH isn't running", "Admin permission needed",
+    /// "Game refused", timeouts. Same status-bar-only rule as
     /// [`Self::notify_error`]: the drawer never auto-opens.
     fn notify_toast(&self, win: &MainWindow, kind: &str, title: &str, body: &str) {
         self.notify(win, kind, title, body);
         self.set_toast(win, title, body);
     }
 
-    /// Show the transient failure toast (DS-24): title + body on
-    /// the current screen for ~5 s, then the 1 Hz tick clears it.
-    /// Skipped while the window is hidden (F27: no property writes
-    /// on a hidden window) — the notification itself is still
-    /// stored and synced on reopen. B2: title/body are capped
-    /// (60 / 120 chars) so the card stays ≤ ~80 px tall; the full
-    /// text is in the drawer.
+    /// Show a failure in the bottom `StatusBar` (B01, was the DS-24
+    /// toast): title + body on the current screen for 8 s, then
+    /// the 1 Hz tick clears it. Skipped while the window is hidden
+    /// (F27: no property writes on a hidden window) — the
+    /// notification itself is still stored and synced on reopen.
+    /// FULL text, never truncated: the bar elides the one line
+    /// visually (H4: the drawer carries the same full text). A
+    /// status already showing means this message supersedes it:
+    /// `status-more` counts the superseded ones (+N).
     fn set_toast(&self, win: &MainWindow, title: &str, body: &str) {
         if self.hidden.load(Ordering::SeqCst) {
             return;
         }
-        win.set_toast_kind("error".into());
-        win.set_toast_title(toast_capped(title, 60).into());
-        win.set_toast_text(toast_capped(body, 120).into());
-        ui_log!("RSH-UI toast shown: {title} — {body}");
-        self.toast_until
-            .set(Some(Instant::now() + Duration::from_secs(5)));
+        let more = if self.status_until.get().is_some() {
+            win.get_status_more() + 1
+        } else {
+            0
+        };
+        win.set_status_kind("error".into());
+        win.set_status_title(title.into());
+        win.set_status_text(body.into());
+        win.set_status_more(more);
+        ui_log!("RSH-UI status shown (error): {title} — {body}");
+        self.status_until
+            .set(Some(Instant::now() + Duration::from_secs(8)));
     }
 
-    /// Show the transient success toast (D17): same 480 px card
-    /// as [`Self::set_toast`], ok-accent border (`toast-kind`
-    /// "success"). Same ~5 s lifetime + 1 Hz expiry. B2: same
-    /// 60 / 120-char cap as [`Self::set_toast`].
+    /// Show a success in the bottom `StatusBar` (B01, was the D17
+    /// toast): same 8 s / 4 s rule as [`Self::set_toast`] — success
+    /// lives 4 s. Same full text, same +N counter.
     fn set_toast_success(&self, win: &MainWindow, title: &str, body: &str) {
         if self.hidden.load(Ordering::SeqCst) {
             return;
         }
-        win.set_toast_kind("success".into());
-        win.set_toast_title(toast_capped(title, 60).into());
-        win.set_toast_text(toast_capped(body, 120).into());
-        ui_log!("RSH-UI success toast shown: {title} — {body}");
-        self.toast_until
-            .set(Some(Instant::now() + Duration::from_secs(5)));
+        let more = if self.status_until.get().is_some() {
+            win.get_status_more() + 1
+        } else {
+            0
+        };
+        win.set_status_kind("success".into());
+        win.set_status_title(title.into());
+        win.set_status_text(body.into());
+        win.set_status_more(more);
+        ui_log!("RSH-UI status shown (success): {title} — {body}");
+        self.status_until
+            .set(Some(Instant::now() + Duration::from_secs(4)));
     }
 
-    /// Clear an expired failure toast (DS-24, 1 Hz): the toast
-    /// lives ~5 s from the last failure, then vanishes — a newer
-    /// failure re-arms the deadline via [`Self::set_toast`].
-    fn check_toast_expiry(&self, win: &MainWindow) {
-        let Some(until) = self.toast_until.get() else {
+    /// Clear an expired status-bar message (B01, was the DS-24
+    /// toast, 1 Hz): the error lives 8 s / success 4 s from the
+    /// last message, then vanishes — a newer message re-arms the
+    /// deadline via [`Self::set_toast`].
+    fn check_status_expiry(&self, win: &MainWindow) {
+        let Some(until) = self.status_until.get() else {
             return;
         };
         if Instant::now() >= until {
-            self.toast_until.set(None);
-            win.set_toast_title("".into());
-            win.set_toast_text("".into());
-            win.set_toast_kind("error".into());
+            self.clear_status(win);
         }
+    }
+
+    /// Clear the status bar now (expiry, ✕, Esc): title, text and
+    /// kind reset, the deadline and the +N counter with them.
+    fn clear_status(&self, win: &MainWindow) {
+        self.status_until.set(None);
+        win.set_status_title("".into());
+        win.set_status_text("".into());
+        win.set_status_kind("error".into());
+        win.set_status_more(0);
     }
 
     /// click (no previous change) always passes.
@@ -10563,6 +10577,27 @@ fn wire_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
             }
         });
     }
+    {
+        // B01: the status bar's ✕ dismisses the message; Details
+        // opens the notifications drawer (the full text lives there).
+        let win = win.as_weak();
+        let ctx = ctx.clone();
+        win.unwrap().on_status_dismiss(move || {
+            if let Some(w) = win.upgrade() {
+                ctx.clear_status(&w);
+                ui_log!("RSH-UI status bar dismissed");
+            }
+        });
+    }
+    {
+        let win = win.as_weak();
+        win.unwrap().on_status_details(move || {
+            if let Some(w) = win.upgrade() {
+                w.set_notif_open(true);
+                ui_log!("RSH-UI status bar Details opened notifications drawer");
+            }
+        });
+    }
 }
 
 /// Wire the tuning callbacks (deadzone / curve / preset / reset / save).
@@ -10794,19 +10829,17 @@ fn wire_keyboard(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_keyboard_escape(move || {
             if let Some(w) = win.upgrade() {
-                // D16: Esc dismisses only the TOPMOST overlay/toast
-                // — never the wizard itself (closing the wizard
-                // needs the explicit Skip/Finish path).
+                // D16: Esc dismisses only the TOPMOST overlay /
+                // status-bar message — never the wizard itself
+                // (closing the wizard needs the explicit
+                // Skip/Finish path).
                 if w.get_confirm_open() {
                     w.set_confirm_open(false);
                     *ctx.confirm_pending.borrow_mut() = None;
                     ui_log!("RSH-UI keyboard-escape closed confirm dialog");
-                } else if w.get_toast_title() != "" {
-                    w.set_toast_title("".into());
-                    w.set_toast_text("".into());
-                    w.set_toast_kind("error".into());
-                    ctx.toast_until.set(None);
-                    ui_log!("RSH-UI keyboard-escape dismissed toast");
+                } else if w.get_status_title() != "" {
+                    ctx.clear_status(&w);
+                    ui_log!("RSH-UI keyboard-escape dismissed status bar");
                 } else if w.get_game_dialog_open() {
                     w.set_game_dialog_open(false);
                     ui_log!("RSH-UI keyboard-escape closed game dialog");
@@ -12161,7 +12194,7 @@ fn start_frame_timer(
                 ctx.sync_busy(&w);
                 ctx.sync_daemon_error(&w);
                 ctx.check_job_timeouts(&w);
-                ctx.check_toast_expiry(&w);
+                ctx.check_status_expiry(&w);
                 ctx.sync_auto_theme(&w);
                 ctx.check_wifi_rejoin_timeout();
                 ctx.check_connecting_timeout(&w);
@@ -12371,7 +12404,7 @@ fn main() -> Result<(), slint::PlatformError> {
         learn_target: Rc::new(Cell::new(0)),
         horn_test_until: Rc::new(Cell::new(None)),
         handbrake_test_until: Rc::new(Cell::new(None)),
-        toast_until: Rc::new(Cell::new(None)),
+        status_until: Rc::new(Cell::new(None)),
         steer_hist: Rc::new(RefCell::new(VecDeque::new())),
         pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
         brake_hist: Rc::new(RefCell::new(VecDeque::new())),
@@ -12901,27 +12934,6 @@ mod tests {
         assert!(!user_text("Daemon x daemon y").contains("aemon"));
     }
 
-    /// B2: the toast cap keeps short text untouched, truncates long
-    /// text to `max` chars + "…", and never splits a multi-byte
-    /// char ("—"/"×" sit inside the cap boundary here). The
-    /// production caps are title 60 / body 120 (`set_toast`).
-    #[test]
-    fn toast_capped_keeps_short_truncates_long_char_safe() {
-        assert_eq!(
-            toast_capped("Live data is back.", 120),
-            "Live data is back."
-        );
-        let long = "Couldn't reach the wheel — the connection timed out after 10 s. Check the RSH-XXXX Wi-Fi is joined (or the USB cable is plugged in), then press Reconnect. If it still fails, restart RSH and try again.";
-        assert_eq!(long.chars().count(), 200);
-        let capped = toast_capped(long, 120);
-        assert_eq!(capped.chars().count(), 121);
-        assert!(capped.ends_with('…'));
-        assert!(capped.starts_with("Couldn't reach the wheel —"));
-        // Exactly at the cap: untouched, no ellipsis.
-        let exact: String = "×".repeat(120);
-        assert_eq!(toast_capped(&exact, 120), exact);
-    }
-
     #[test]
     fn mv_text_dash_for_no_reading() {
         assert_eq!(mv_text(0.0), "—");
@@ -13425,7 +13437,7 @@ mod tests {
             learn_target: Rc::new(Cell::new(0)),
             horn_test_until: Rc::new(Cell::new(None)),
             handbrake_test_until: Rc::new(Cell::new(None)),
-            toast_until: Rc::new(Cell::new(None)),
+            status_until: Rc::new(Cell::new(None)),
             steer_hist: Rc::new(RefCell::new(VecDeque::new())),
             pedal_hist: Rc::new(RefCell::new(VecDeque::new())),
             brake_hist: Rc::new(RefCell::new(VecDeque::new())),
@@ -13858,7 +13870,10 @@ mod tests {
             "slider snaps back to stored"
         );
         assert_eq!(win.get_deadzone(), 0.0);
-        assert_eq!(win.get_toast_title().as_str(), "Saving steering… timed out");
+        assert_eq!(
+            win.get_status_title().as_str(),
+            "Saving steering… timed out"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14343,7 +14358,7 @@ mod tests {
             "a no-board reconnect must not notify 'Wheel connected'"
         );
         assert_eq!(
-            win.get_toast_text().as_str(),
+            win.get_status_text().as_str(),
             "",
             "a no-board reconnect must not show any toast"
         );
@@ -14358,9 +14373,9 @@ mod tests {
         );
         assert_eq!(last_title(), "Wheel connected");
         assert!(
-            win.get_toast_text().as_str().contains("Live data is back"),
+            win.get_status_text().as_str().contains("Live data is back"),
             "the connected toast must show, got: {}",
-            win.get_toast_text()
+            win.get_status_text()
         );
 
         // Teardown: `mark_dead` drops the live link (F7) so the
@@ -14917,21 +14932,21 @@ mod tests {
         assert_eq!(app_update_verdict("2.0.3", "garbage"), None);
     }
 
-    // D17 (was DS-24): a failure toasts in place and NEVER opens
-    // the drawer — the drawer opens only on bell click. The toast
-    // lives ~5 s, then the 1 Hz expiry clears it. A success toasts
-    // the same way, with the ok-accent kind.
+    // D17 (was DS-24): a failure shows in the status bar and NEVER
+    // opens the drawer — the drawer opens only on bell click. The
+    // error lives 8 s, then the 1 Hz expiry clears it. A success
+    // shows the same way, with the ok-accent kind.
     #[test]
-    fn d17_failure_toast_never_opens_drawer() {
+    fn d17_failure_status_never_opens_drawer() {
         let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
             eprintln!("D17 window test skipped: no usable display/backend");
             return;
         };
         let (ctx, dir) = fc2_test_ctx();
         wire_callbacks(&win, &ctx);
-        assert_eq!(win.get_toast_text().as_str(), "");
+        assert_eq!(win.get_status_text().as_str(), "");
 
-        // A plain failure toasts in place but leaves the drawer shut.
+        // A plain failure shows in place but leaves the drawer shut.
         let err = UserError {
             code: "d17_test".to_string(),
             title: "Test failure".to_string(),
@@ -14940,37 +14955,96 @@ mod tests {
             detail: None,
         };
         ctx.notify_error(&win, "Test", &err);
-        assert_eq!(win.get_toast_title().as_str(), "Test failure");
+        assert_eq!(win.get_status_title().as_str(), "Test failure");
         assert!(
-            win.get_toast_text().as_str().contains("failed on purpose"),
-            "toast shows the failure, got: {}",
-            win.get_toast_text()
+            win.get_status_text().as_str().contains("failed on purpose"),
+            "status shows the failure, got: {}",
+            win.get_status_text()
         );
-        assert_eq!(win.get_toast_kind().as_str(), "error");
+        assert_eq!(win.get_status_kind().as_str(), "error");
         assert!(!win.get_notif_open(), "failure must not open the drawer");
 
         // Not expired yet: the 1 Hz check leaves it alone.
-        ctx.check_toast_expiry(&win);
-        assert_ne!(win.get_toast_text().as_str(), "");
+        ctx.check_status_expiry(&win);
+        assert_ne!(win.get_status_text().as_str(), "");
 
-        // Past the 5 s deadline: the expiry clears it (and the kind
+        // Past the 8 s deadline: the expiry clears it (and the kind
         // resets to error).
-        ctx.toast_until.set(Some(
+        ctx.status_until.set(Some(
             Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .expect("1 s ago exists"),
         ));
-        ctx.check_toast_expiry(&win);
-        assert_eq!(win.get_toast_text().as_str(), "");
-        assert_eq!(win.get_toast_title().as_str(), "");
-        assert_eq!(win.get_toast_kind().as_str(), "error");
+        ctx.check_status_expiry(&win);
+        assert_eq!(win.get_status_text().as_str(), "");
+        assert_eq!(win.get_status_title().as_str(), "");
+        assert_eq!(win.get_status_kind().as_str(), "error");
 
-        // A success toasts the same way — ok-accent kind, drawer
+        // A success shows the same way — ok-accent kind, drawer
         // still shut.
         ctx.notify_success(&win, "Test", "Test success", "The test action worked.");
-        assert_eq!(win.get_toast_title().as_str(), "Test success");
-        assert_eq!(win.get_toast_kind().as_str(), "success");
+        assert_eq!(win.get_status_title().as_str(), "Test success");
+        assert_eq!(win.get_status_kind().as_str(), "success");
         assert!(!win.get_notif_open(), "success must not open the drawer");
+
+        // B01: the status bar carries the FULL text — a 200-char
+        // body is not cut at 120 chars any more (the bar elides
+        // the one line visually; the drawer holds the same text).
+        let long_happened = "x".repeat(200);
+        let long_err = UserError {
+            code: "d17_test_long".to_string(),
+            title: "Long failure".to_string(),
+            what_happened: long_happened.clone(),
+            what_to_do: "Retry.".to_string(),
+            detail: None,
+        };
+        ctx.notify_error(&win, "Test", &long_err);
+        assert!(
+            win.get_status_text().as_str().contains(&long_happened),
+            "status carries the full 200-char body, got: {}",
+            win.get_status_text()
+        );
+
+        // B01: a second message supersedes the first and the +N
+        // counter counts it; clearing resets it.
+        ctx.notify_success(&win, "Test", "Second", "Second message.");
+        assert_eq!(win.get_status_more(), 1);
+        ctx.clear_status(&win);
+        assert_eq!(win.get_status_more(), 0);
+        assert_eq!(win.get_status_text().as_str(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B02: TransportClosed never renders its sentence twice — the
+    // hint is "RSH is reconnecting automatically." now, and
+    // `notify_error` refuses to join a `what_to_do` that already
+    // says what happened.
+    #[test]
+    fn b02_transport_closed_no_doubled_sentence() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("B02 window test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        let err = UserError::from_connection(ConnectionError::TransportClosed, "test detail");
+        assert_eq!(err.what_to_do, "RSH is reconnecting automatically.");
+        ctx.notify_error(&win, "Test", &err);
+        assert_eq!(
+            win.get_status_text().as_str(),
+            "The connection to the wheel dropped. RSH is reconnecting automatically."
+        );
+        // And the dedupe guard: a what_to_do that repeats the
+        // happened text is not joined at all.
+        let dup = UserError {
+            code: "dup".to_string(),
+            title: "Dup".to_string(),
+            what_happened: "The wheel stopped.".to_string(),
+            what_to_do: "the wheel stopped".to_string(),
+            detail: None,
+        };
+        ctx.notify_error(&win, "Test", &dup);
+        assert_eq!(win.get_status_text().as_str(), "The wheel stopped.");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15018,18 +15092,18 @@ mod tests {
             1,
             "radio reverts to the live backend (vJoy)"
         );
-        assert_eq!(win.get_toast_kind().as_str(), "error");
+        assert_eq!(win.get_status_kind().as_str(), "error");
         assert!(
-            win.get_toast_text()
+            win.get_status_text()
                 .as_str()
                 .contains("sidecar failed to start"),
             "toast shows the real reason, got: {}",
-            win.get_toast_text()
+            win.get_status_text()
         );
         assert!(
-            !win.get_toast_text().as_str().contains("is now"),
+            !win.get_status_text().as_str().contains("is now"),
             "no success wording on a failed switch, got: {}",
-            win.get_toast_text()
+            win.get_status_text()
         );
 
         // 2. The job "succeeds" for the WRONG backend (live vJoy
@@ -15049,18 +15123,18 @@ mod tests {
             1,
             "radio reverts to the live backend (vJoy) on a mismatch"
         );
-        assert_eq!(win.get_toast_kind().as_str(), "error");
+        assert_eq!(win.get_status_kind().as_str(), "error");
         assert!(
-            win.get_toast_text().as_str().contains("is not active"),
+            win.get_status_text().as_str().contains("is not active"),
             "mismatch toasts as a failure, got: {}",
-            win.get_toast_text()
+            win.get_status_text()
         );
         assert!(
-            !win.get_toast_text()
+            !win.get_status_text()
                 .as_str()
                 .contains("Game controller is now"),
             "no success toast on a mismatched switch, got: {}",
-            win.get_toast_text()
+            win.get_status_text()
         );
 
         // 3. A genuine success (live backend == requested) still
@@ -15075,13 +15149,13 @@ mod tests {
         assert!(started, "third backend job should start");
         drain_all_jobs(&ctx, &win);
         assert_eq!(win.get_controller(), 0, "segment keeps HIDMaestro");
-        assert_eq!(win.get_toast_kind().as_str(), "success");
+        assert_eq!(win.get_status_kind().as_str(), "success");
         assert!(
-            win.get_toast_text()
+            win.get_status_text()
                 .as_str()
                 .contains("Game controller is now HIDMaestro"),
             "genuine success still toasts, got: {}",
-            win.get_toast_text()
+            win.get_status_text()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15330,12 +15404,12 @@ mod tests {
         assert!(ctx.confirm_pending.borrow().is_none());
         assert!(win.get_setup_mode(), "Esc must NOT close the wizard");
 
-        // Esc with a toast showing dismisses the toast — the wizard
+        // Esc with a status showing dismisses it — the wizard
         // still stays open.
         ctx.set_toast(&win, "Test", "Test toast");
-        assert_ne!(win.get_toast_title().as_str(), "");
+        assert_ne!(win.get_status_title().as_str(), "");
         win.invoke_keyboard_escape();
-        assert_eq!(win.get_toast_title().as_str(), "");
+        assert_eq!(win.get_status_title().as_str(), "");
         assert!(win.get_setup_mode(), "Esc must NOT close the wizard");
 
         // Esc with nothing open does nothing to the wizard either.

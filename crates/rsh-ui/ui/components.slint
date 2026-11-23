@@ -470,11 +470,18 @@ export component SliderRow inherits VerticalLayout {
         // the 26px number box centres against the two-line label
         // instead of sitting at the top of the ~32px label block.
         cross-axis-alignment: center;
+        // B07 (v2.0.8 retest): the label column stretches and the
+        // hint wraps — an unwrapped long hint (e.g. "Evens out
+        // uneven pot travel — + favours left") set the row's
+        // minimum width past the panel and clipped its right side.
+        // The spacer after this column is gone: the column itself
+        // takes the slack now, so the value box stays flush right.
         VerticalLayout {
-            Text { text: label; font-size: 13px; font-weight: 500; color: Theme.text; }
-            Text { text: hint; font-size: 11.5px; color: Theme.faint; }
+            horizontal-stretch: 1;
+            min-width: 0px;
+            Text { text: label; font-size: 13px; font-weight: 500; color: Theme.text; overflow: elide; }
+            Text { text: hint; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
         }
-        Rectangle { horizontal-stretch: 1; }
         Rectangle {
             width: 60px;
             height: 26px;

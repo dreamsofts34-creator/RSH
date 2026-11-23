@@ -412,6 +412,7 @@ export component PedalsPage inherits VerticalLayout {
     // stretch absorber goes away (the ScrollView owns the slack).
     pedals-scroll := ScrollView {
         vertical-stretch: 1;
+        content-width: self.visible-width;
         VerticalLayout {
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
     spacing: 12px;

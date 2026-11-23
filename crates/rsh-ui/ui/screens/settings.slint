@@ -146,6 +146,7 @@ export component SettingsScreen inherits VerticalLayout {
 
     settings-scroll := ScrollView {
         vertical-stretch: 1;
+        content-width: self.visible-width;
         VerticalLayout {
             padding-top: 14px;
             // Phase 2 (F-14): bottom padding so the last card

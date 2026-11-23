@@ -69,6 +69,7 @@ export component OverviewPage inherits VerticalLayout {
     // with one. Root padding lives on the inner layout now.
     overview-scroll := ScrollView {
         vertical-stretch: 1;
+        content-width: self.visible-width;
         VerticalLayout {
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
     spacing: 12px;
@@ -175,7 +176,10 @@ export component OverviewPage inherits VerticalLayout {
                 Text { text: "Games"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                 Rectangle { horizontal-stretch: 1; }
                 Text { text: "Auto-switches profile."; font-size: 12px; color: Theme.mute; }
-                Btn { label: "Add game"; disabled: busy-kind == 13; clicked => { add-game(); } }
+                // B04 (v2.0.8 retest): the header button only shows
+                // once a game exists — with no games the empty state
+                // below is the one "Add game" CTA.
+                if games.length > 0 : Btn { label: "Add game"; disabled: busy-kind == 13; clicked => { add-game(); } }
             }
             // Manual games (no auto-scan): the empty state offers
             // Add game instead of a search.
