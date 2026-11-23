@@ -743,6 +743,16 @@ jobs:
             ; Sidecar MUST sit beside rsh-daemon.exe: the daemon resolves it
             ; as <own exe dir>\rsh-hm-sidecar.exe (resolve_sidecar_path).
             File "/oname=rsh-hm-sidecar.exe" "..\src-tauri\binaries\rsh-hm-sidecar-x86_64-pc-windows-msvc.exe"
+            ; HIDMaestro.Core.dll (v2.0.8 retest Bug 1, H1): the
+            ; sidecar reads + SHA-256-hashes this DLL beside itself
+            ; at startup (Program.cs CheckDllHash) and the Rust side
+            ; refuses the hello when the hash is missing — the
+            ; installer never shipped it, so the HIDMaestro switch
+            ; always failed. The DLL is the pinned v2.1.0 file the
+            ; stage step already hash-verified (stage-sidecar.ps1
+            ; stages it to src-tauri/binaries/ beside the exe);
+            ; makensis fails closed here if it is missing.
+            File "..\src-tauri\binaries\HIDMaestro.Core.dll"
             ; HIDMaestro LICENSE (GitHub issue #2): the sidecar is a
             ; NativeAOT build with HIDMaestro compiled in, and the MIT
             ; license requires its notice to ship with the software.
@@ -891,6 +901,7 @@ jobs:
             Delete "$INSTDIR\rsh-daemon.exe"
             Delete "$INSTDIR\rsh-ui.exe"
             Delete "$INSTDIR\rsh-hm-sidecar.exe"
+            Delete "$INSTDIR\HIDMaestro.Core.dll"
             Delete "$INSTDIR\HIDMaestro-LICENSE.txt"
             Delete "$INSTDIR\firmware-signed.bin"
             Delete "$INSTDIR\rsh-task.ps1"
@@ -914,6 +925,7 @@ jobs:
             Delete "$INSTDIR\rsh-daemon.exe"
             Delete "$INSTDIR\rsh-ui.exe"
             Delete "$INSTDIR\rsh-hm-sidecar.exe"
+            Delete "$INSTDIR\HIDMaestro.Core.dll"
             Delete "$INSTDIR\HIDMaestro-LICENSE.txt"
             Delete "$INSTDIR\firmware-signed.bin"
             Delete "$INSTDIR\rsh-task.ps1"
@@ -1023,10 +1035,14 @@ jobs:
           if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
           # NSIS silent install (/S); /D must be last, unquoted.
           Start-WaitOrFail $installer @("/S", "/D=$installDir") 180 "first silent install"
-          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "rsh-hm-sidecar.exe", "firmware-signed.bin", "HIDMaestro-LICENSE.txt")) {
+          # v2.0.8 retest Bug 1 (H1): the sidecar reads + hashes
+          # HIDMaestro.Core.dll beside itself at startup, so the DLL
+          # must be installed beside the sidecar — fail closed here
+          # when it is missing (same pattern as the LICENSE check).
+          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "rsh-hm-sidecar.exe", "HIDMaestro.Core.dll", "firmware-signed.bin", "HIDMaestro-LICENSE.txt")) {
             if (-not (Test-Path (Join-Path $installDir $exe))) { Write-Error "Smoke test: installed $exe not found in $installDir after silent install."; exit 1 }
           }
-          Write-Host "Installed to $installDir — all three binaries + bundled firmware image + HIDMaestro LICENSE present."
+          Write-Host "Installed to $installDir — all three binaries + HIDMaestro DLL + bundled firmware image + HIDMaestro LICENSE present."
           $rule = netsh advfirewall firewall show rule name="RSH" | Out-String
           if ($rule -notmatch "RSH") { Write-Error "Smoke test: firewall rule 'RSH' not found after install (netsh show rule)."; exit 1 }
           Write-Host "Firewall rule 'RSH' present after install."

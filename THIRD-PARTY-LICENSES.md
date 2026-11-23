@@ -123,7 +123,7 @@ allow-list verbatim):**
 | Component | Version | License | Notes |
 |---|---|---|---|
 | `rsh-hm-sidecar` (RSH) | 1.0.0 | MIT | C# NativeAOT exe, `tools/rsh-hm-sidecar/`; self-contained, no .NET runtime ships with it |
-| `HIDMaestro.Core.dll` | 2.1.0 | MIT | Pinned SDK DLL, SHA-256 `f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5`. Fetched at build time, **never committed**; the sidecar re-verifies the hash at startup |
+| `HIDMaestro.Core.dll` | 2.1.0 | MIT | Pinned SDK DLL, SHA-256 `f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5`. Fetched at build time, **never committed**; the sidecar re-verifies the hash at startup; ships in the installer beside `rsh-hm-sidecar.exe` (v2.0.8 retest Bug 1 — the switch failed without it) |
 | HIDMaestro UMDF2 driver | 2.1.0 | MIT | Installed by the sidecar's `install-driver` step (admin) from the pinned release ZIP, SHA-256 `7fe349f163864b8dfc36117af260d51bac94a2263b6cdfa719cb364a808397b4` |
 
 The sidecar has **no NuGet packages** (only the DLL reference above), so its SBOM is

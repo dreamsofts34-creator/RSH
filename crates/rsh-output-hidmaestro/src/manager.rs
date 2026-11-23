@@ -184,6 +184,13 @@ pub struct HelloInfo {
     pub driver_installed: bool,
     /// Transport in use (`"stdio"` / `"tcp-loopback"`).
     pub transport: Option<String>,
+    /// SHA-256 the sidecar measured for `HIDMaestro.Core.dll`
+    /// beside itself (`None` when the DLL was missing — the
+    /// v2.0.8 retest failure mode). Kept so the hello verdict is
+    /// preserved structurally, not only inside an error string.
+    pub dll_sha256: Option<String>,
+    /// Whether the measured DLL hash matched the pin.
+    pub dll_sha256_ok: Option<bool>,
 }
 
 /// What `create()` learned about the created controller.
@@ -540,6 +547,8 @@ impl SidecarManager {
                     admin: reply.admin.unwrap_or(false),
                     driver_installed: reply.driver_installed.unwrap_or(false),
                     transport: reply.transport.clone(),
+                    dll_sha256: reply.dll_sha256.clone(),
+                    dll_sha256_ok: reply.dll_sha256_ok,
                 })
             }
             Ok(TransportEvent::Eof) => Err(HidMaestroError::SidecarDied(
@@ -982,5 +991,46 @@ mod tests {
         assert!(!manager.elevation_declined());
         let error = manager.connect().expect_err("no sidecar binary on Linux");
         assert!(!matches!(error, HidMaestroError::NotAdmin));
+    }
+
+    /// H4 (v2.0.8 retest Bug 1): `read_hello` preserves the
+    /// DLL-hash verdict in `HelloInfo` — the daemon/UI log and
+    /// Diagnostics need the measurement, not just pass/fail.
+    #[test]
+    fn read_hello_preserves_dll_verdict() {
+        use crate::transport::TransportWriter;
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        struct StubWriter;
+        impl TransportWriter for StubWriter {
+            fn write_line(&mut self, _line: &str) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn kill(&mut self) {}
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let transport = LiveTransport {
+            writer: Box::new(StubWriter),
+            events: rx,
+            stderr_lines: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut manager = SidecarManager::new(SidecarConfig::with_path(std::path::PathBuf::from(
+            "/nonexistent/rsh-hidmaestro-sidecar",
+        )));
+        manager.transport = Some(transport);
+        tx.send(TransportEvent::Line(
+            r#"{"ok":true,"hello":"rsh-hm-sidecar","sidecar":"rsh-hm-sidecar","sdk":"2.1.0","protocol":1,"dll_sha256":"f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5","dll_sha256_ok":true,"admin":true}"#
+                .to_string(),
+        ))
+        .unwrap();
+        let info = manager.read_hello(None).expect("good hello must parse");
+        assert_eq!(info.sdk_version.as_deref(), Some("2.1.0"));
+        assert_eq!(
+            info.dll_sha256.as_deref(),
+            Some("f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5")
+        );
+        assert_eq!(info.dll_sha256_ok, Some(true));
     }
 }

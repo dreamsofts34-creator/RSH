@@ -7404,8 +7404,13 @@ impl Ctx {
             format!("Firmware: {firmware}").into(),
         ];
         self.push_connection_diag_lines(&mut lines);
+        // H4 (v2.0.8 retest Bug 1): the event log used to show only
+        // the notification title — a failed switch read "Couldn't
+        // complete that" with no cause. The body carries the full
+        // reason (e.g. the sidecar hello verdict), so include it;
+        // the lines wrap.
         for n in self.notifications.borrow().to_model_items().iter().take(6) {
-            lines.push(format!("{} {}", n.time, n.title).into());
+            lines.push(format!("{} {} — {}", n.time, n.title, n.body).into());
         }
         let events_hash = content_hash(
             &lines

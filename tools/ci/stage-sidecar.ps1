@@ -13,6 +13,13 @@
 #      (the exact file `tauri-build`'s `copy_binaries` looks for: the
 #      `bundle.externalBin` entry `binaries/rsh-hm-sidecar` plus the
 #      Windows target triple plus `.exe`).
+#   5. Copy the verified `HIDMaestro.Core.dll` beside the staged exe
+#      (v2.0.8 retest Bug 1, H1): the sidecar READS this DLL beside
+#      itself at startup and SHA-256-hashes it (Program.cs
+#      CheckDllHash); the installer ships it from here, and the
+#      release smoke test fails closed when it is missing after
+#      install. The DLL staged here is the SAME file hash-verified
+#      in step 2 against the pin — never a different copy.
 #
 # Why the sidecar must be staged BEFORE any cargo build of `rsh-app`:
 # the rsh-app build script (`tauri_build::build()`) copies the externalBin
@@ -58,6 +65,14 @@ $exe = "tools/rsh-hm-sidecar/bin/Release/net10.0-windows/win-x64/publish/rsh-hm-
 if (-not (Test-Path $exe)) { Write-Error "Sidecar AOT publish produced no exe at $exe."; exit 1 }
 New-Item -ItemType Directory -Force -Path "src-tauri/binaries" | Out-Null
 Copy-Item $exe "src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe"
+# v2.0.8 retest Bug 1 (H1): the sidecar READS HIDMaestro.Core.dll
+# beside itself at startup and hashes it (Program.cs CheckDllHash);
+# the installer never shipped the DLL, so the hello verdict was
+# always "no hash" and the HIDMaestro switch always failed. Stage
+# the SAME verified DLL (hash-checked above against the pin) beside
+# the staged exe so the NSIS installer can ship it.
+Copy-Item $dll.FullName "src-tauri/binaries/HIDMaestro.Core.dll"
+Write-Host "Staged sidecar + HIDMaestro.Core.dll (SHA-256 $dllHash) to src-tauri/binaries/"
 Write-Host "Sidecar staged for Tauri externalBin."
 
 if ($env:GITHUB_OUTPUT) {

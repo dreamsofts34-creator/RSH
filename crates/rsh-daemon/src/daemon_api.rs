@@ -745,7 +745,7 @@ impl AppApi for DaemonApi {
     }
 
     fn set_output_backend(&self, name: &str) -> Result<String, UserError> {
-        self.state.set_output_backend(name).map_err(|detail| {
+        let outcome = self.state.set_output_backend(name).map_err(|detail| {
             // B6/A10: the admin-decline case gets a typed error with
             // plain words — not `Unknown` / "Something went wrong."
             // (the UI shows the title + what happened + what to do).
@@ -766,7 +766,28 @@ impl AppApi for DaemonApi {
             } else {
                 UserError::from_connection(ConnectionError::Unknown, detail)
             }
-        })?;
+        });
+        // H4 (v2.0.8 retest Bug 1): preserve the switch outcome in
+        // the daemon log (rsh-YYYYMMDD.log) — a hello failure used
+        // to leave no trace there, so the next failure is
+        // diagnosable from the log alone. The failure reason IS the
+        // hello verdict ("sidecar did not report a DLL hash
+        // measurement", …); a success implies the hello passed.
+        match &outcome {
+            Ok(_) => {
+                let _ = rsh_app_core::diagnostics::append_startup_log_both(&format!(
+                    "set_output_backend({name}) succeeded — active: {}",
+                    self.state.backend_name()
+                ));
+            }
+            Err(err) => {
+                let reason = err.detail.as_deref().unwrap_or(err.what_happened.as_str());
+                let _ = rsh_app_core::diagnostics::append_startup_log_both(&format!(
+                    "set_output_backend({name}) failed: {reason}"
+                ));
+            }
+        }
+        outcome?;
         Ok(self.state.backend_name())
     }
 

@@ -400,6 +400,14 @@ jobs:
         if: steps.check.outputs.run == 'true'
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1
+      # v2.0.8 retest Bug 1 (H5): no CI test ever RAN the sidecar, so
+      # a sidecar that could not say hello shipped. Run the staged
+      # exe (DLL beside it) and assert the hello verdict is OK with
+      # the pinned SDK — fail closed on timeout or a bad verdict.
+      - name: Check staged sidecar hello (DLL hash verdict)
+        if: steps.check.outputs.run == 'true'
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/check-sidecar-hello.ps1
       # v1.0.2 Bug 6 follow-up: the stale committed frontend/dist is
       # gone, so dist must be built before any cargo build of rsh-app —
       # tauri::generate_context!() panics at compile time when
