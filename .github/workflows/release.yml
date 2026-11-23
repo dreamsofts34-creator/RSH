@@ -1094,10 +1094,22 @@ jobs:
           $uninstaller = Join-Path $installDir "uninstall.exe"
           if (-not (Test-Path $uninstaller)) { Write-Error "Smoke test: uninstaller not found at $uninstaller."; exit 1 }
           Start-WaitOrFail $uninstaller @("/S") 120 "silent uninstall"
-          Start-Sleep -Seconds 5
           $ruleAfter = netsh advfirewall firewall show rule name="RSH" | Out-String
           if ($ruleAfter -match "Rule Name:\s*RSH") { Write-Error "Smoke test: firewall rule 'RSH' still present after uninstall."; exit 1 }
-          if (Test-Path $installDir) { Get-ChildItem $installDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "Smoke test: leftover after uninstall: $($_.FullName)" }; Get-Process rsh-* -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "Smoke test: still-running RSH process: $($_.ProcessName) (pid $($_.Id))" }; Write-Error "Smoke test: install dir $installDir still present after uninstall."; exit 1 }
+          # NSIS uninstallers copy themselves to %TEMP% and the launcher
+          # exits in ~60 ms — the real work happens in the copy, so a
+          # fixed sleep after the launcher exits proves nothing (release
+          # runs 45110475449 + 45117939264 failed here: the copy was
+          # still working when the 5 s sleep expired, all files present;
+          # v2.0.7 passed the same check only because the copy finished
+          # inside 5 s that once). Poll until the dir is gone (bounded,
+          # fail closed) instead of sleeping a fixed time.
+          $gone = $false
+          for ($i = 0; $i -lt 120; $i++) {
+            Start-Sleep -Seconds 1
+            if (-not (Test-Path $installDir)) { $gone = $true; break }
+          }
+          if (-not $gone) { Get-ChildItem $installDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "Smoke test: leftover after uninstall: $($_.FullName)" }; Get-Process rsh-* -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "Smoke test: still-running RSH process: $($_.ProcessName) (pid $($_.Id))" }; Write-Error "Smoke test: install dir $installDir still present 120 s after uninstall."; exit 1 }
           Write-Host "Smoke test PASS: uninstall removed the firewall rule and the install dir."
           # The data dir may never exist on Windows (named-pipe IPC
           # leaves no socket file, single-instance is a mutex, and
