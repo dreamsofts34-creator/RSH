@@ -570,6 +570,24 @@ impl OneEuroFilter {
         }
     }
 
+    /// Configure this filter from a `0..=1` smoothing amount (the
+    /// per-module `smoothing` tuning value), the same mapping as
+    /// [`from_smoothing`](Self::from_smoothing). Called when the
+    /// plan is set ([`ProcessingPipeline::set_plan_live`]), so the
+    /// per-tick [`apply_smoothing`] does not have to re-derive the
+    /// cutoff on every tick for a value that only changes on a plan
+    /// set (bench regression: the per-tick reconfiguration on all
+    /// five axes was pure overhead). `0` (or less / non-finite)
+    /// disables the filter (pass-through, state reset).
+    pub fn configure(&mut self, smoothing: f32) {
+        if !(smoothing.is_finite() && smoothing > 0.0) {
+            self.set_enabled(false);
+            return;
+        }
+        self.set_enabled(true);
+        self.set_min_cutoff(0.5 + 9.5 * (1.0 - smoothing.clamp(0.0, 1.0)));
+    }
+
     /// Forget all state; the next sample passes through unfiltered.
     pub fn reset(&mut self) {
         self.x_prev = 0.0;
@@ -634,6 +652,13 @@ impl RampLimiter {
     /// Step toward `target`, limited by the press/release ramps.
     /// `dt` is seconds per tick; `press_ms` / `release_ms` are the
     /// full-travel times in milliseconds (0 = unlimited).
+    ///
+    /// NOTE: hoisting the `max_step` division out of this fn (cached
+    /// per-tick steps configured at plan time, like the filter cutoff
+    /// and the encoder pulse ticks) was tried and measured slightly
+    /// SLOWER (234–240 ns vs 229.5 ns `pipeline_tick`, two runs), so
+    /// the per-tick division stays — do not re-hoist without new
+    /// measurements.
     pub fn update(&mut self, target: f32, dt: f32, press_ms: f32, release_ms: f32) -> f32 {
         if !self.initialized {
             self.value = target;
@@ -695,6 +720,18 @@ pub struct ProcessingPipeline {
     /// E1 pulse hold: ticks left (incl. the current tick) each
     /// virtual-button bit 0..=7 stays held after its step.
     encoder_pulse: [u8; MAX_ENCODERS * 2],
+    /// E1 mask of virtual-button bits with a nonzero pulse hold
+    /// (`encoder_pulse` bit > 0): [`apply_encoder_pulse`] only
+    /// visits held or freshly-stepped bits instead of all 8 every
+    /// tick. Kept in sync with `encoder_pulse` wherever that
+    /// array is written (reset / disabled clear / the pulse
+    /// itself).
+    encoder_pulse_mask: u8,
+    /// E1 pulse hold in ticks, derived from the encoders module's
+    /// `pulse_ms` when the plan is set ([`encoder_pulse_ticks`]):
+    /// the float division runs once per plan change, not once per
+    /// tick in [`apply_encoder_pulse`](Self::apply_encoder_pulse).
+    encoder_pulse_ticks: u8,
     /// E2 sub-click remainder: counts banked per encoder toward the
     /// next whole step (`counts_per_click` counts = one step).
     encoder_remainder: [i32; MAX_ENCODERS],
@@ -710,6 +747,13 @@ pub struct ProcessingPipeline {
     /// BU2 ticks each debounced button has been held continuously
     /// (bit index = stream button bit).
     button_hold_ticks: [u16; 32],
+    /// BU2 mask of buttons with a nonzero hold count (bit index =
+    /// stream button bit): the set-bit iteration in
+    /// [`track_button_holds`](Self::track_button_holds) only visits
+    /// pressed or held buttons instead of all 32 every tick. Kept
+    /// in sync with `button_hold_ticks` wherever that array is
+    /// written (reset / disabled clear / the tracker itself).
+    button_held_mask: u32,
     /// BU3 tick counter: incremented once per `process_buttons`
     /// call (one 5 ms tick at 200 Hz). Used only to measure the
     /// gap between a release and the next press.
@@ -790,12 +834,15 @@ impl ProcessingPipeline {
             handbrake_ramp: RampLimiter::new(),
             encoders: EncoderTracker::new(),
             encoder_pulse: [0; MAX_ENCODERS * 2],
+            encoder_pulse_mask: 0,
+            encoder_pulse_ticks: encoder_pulse_ticks(plan.encoders.pulse_ms),
             encoder_remainder: [0; MAX_ENCODERS],
             // --- Buttons per-module tuning ---
             button_stable: 0,
             button_candidate: 0,
             button_candidate_ticks: [0; 32],
             button_hold_ticks: [0; 32],
+            button_held_mask: 0,
             button_tick: 0,
             button_last_release_tick: [0; 32],
             button_prev_buttons: 0,
@@ -840,11 +887,19 @@ impl ProcessingPipeline {
     /// must take effect on the next tick, not restart the smoothing
     /// and ramps (which would step the output). The plan is still
     /// sanitized on entry. Filter cutoffs track the new smoothing
-    /// per tick (`apply_smoothing`), so kept state stays valid.
+    /// here ([`OneEuroFilter::configure`]), so kept state stays
+    /// valid and the per-tick path does not re-derive them.
     /// Profile switches and engine start use [`Self::set_plan`]
     /// (full reset) instead.
     pub fn set_plan_live(&mut self, plan: PipelinePlan) {
         self.plan = plan.sanitized();
+        self.encoder_pulse_ticks = encoder_pulse_ticks(self.plan.encoders.pulse_ms);
+        self.steering_filter.configure(self.plan.steering.smoothing);
+        self.accel_filter.configure(self.plan.accelerator.smoothing);
+        self.brake_filter.configure(self.plan.brake.smoothing);
+        self.clutch_filter.configure(self.plan.clutch.smoothing);
+        self.handbrake_filter
+            .configure(self.plan.handbrake.smoothing);
     }
 
     /// Forget all filter, ramp, and encoder state (same plan).
@@ -860,12 +915,14 @@ impl ProcessingPipeline {
         self.handbrake_ramp.reset();
         self.encoders.reset();
         self.encoder_pulse = [0; MAX_ENCODERS * 2];
+        self.encoder_pulse_mask = 0;
         self.encoder_remainder = [0; MAX_ENCODERS];
         // --- Buttons per-module tuning ---
         self.button_stable = 0;
         self.button_candidate = 0;
         self.button_candidate_ticks = [0; 32];
         self.button_hold_ticks = [0; 32];
+        self.button_held_mask = 0;
         self.button_last_release_tick = [0; 32];
         self.button_prev_buttons = 0;
         self.button_double_hold = 0;
@@ -909,6 +966,11 @@ impl ProcessingPipeline {
     pub fn process_with_gap(&mut self, frame: &StreamFrame, skipped: u16) -> OutputState {
         let mut out = OutputState::neutral();
 
+        // NOTE (bench-gate fix attempt): reading the tunings by
+        // reference instead of copying them was measured SLOWER
+        // (+21 ns/tick on criterion) — the local copies scalarize
+        // into registers, while the reference re-loads tuning
+        // fields from memory on every access. Copies stay.
         let steering_tuning = self.plan.steering;
         out.steering = process_steering_axis(
             frame.axes_mv[STEERING_SLOT],
@@ -962,6 +1024,11 @@ impl ProcessingPipeline {
     }
 
     /// Buttons, gear decode, horn, and encoders.
+    ///
+    /// Never inlined into `process_with_gap`: the button/encoder
+    /// block is large, and inlining it balloons the axis hot path
+    /// (register pressure / icache) — measured on criterion.
+    #[inline(never)]
     fn process_buttons(&mut self, frame: &StreamFrame, skipped: u16, out: &mut OutputState) {
         let mut buttons = frame.buttons;
 
@@ -1075,6 +1142,7 @@ impl ProcessingPipeline {
             self.button_candidate = 0;
             self.button_candidate_ticks = [0; 32];
             self.button_hold_ticks = [0; 32];
+            self.button_held_mask = 0;
             self.button_last_release_tick = [0; 32];
             self.button_prev_buttons = 0;
             self.button_double_hold = 0;
@@ -1108,6 +1176,7 @@ impl ProcessingPipeline {
         } else {
             // Disabled: a held pulse must not survive to re-enable.
             self.encoder_pulse = [0; MAX_ENCODERS * 2];
+            self.encoder_pulse_mask = 0;
         }
     }
 
@@ -1183,7 +1252,15 @@ impl ProcessingPipeline {
                 delta = -delta;
             }
             self.encoder_remainder[i] += delta;
-            let mut step = self.encoder_remainder[i] / divisor;
+            // Idle encoder (no movement, nothing banked): the step
+            // is 0 whatever the invert / divisor / accel settings
+            // say, so the division and accel test are skipped. The
+            // common case — a wheel reports 2 encoders, slots 2–3
+            // never move — so half the loop is cut on every tick.
+            if delta == 0 && self.encoder_remainder[i] == 0 {
+                continue;
+            }
+            let mut step = div_counts(self.encoder_remainder[i], divisor);
             self.encoder_remainder[i] -= step * divisor;
             if tuning.accel_enabled && step.unsigned_abs() >= 2 {
                 let extra = (step as f32 * tuning.accel_sensitivity).round() as i32;
@@ -1198,18 +1275,36 @@ impl ProcessingPipeline {
     /// `pulse_ms` (4–40 ticks at 5 ms/tick) instead of one tick.
     /// A fresh step re-arms its bit to the full hold; the hold
     /// counts down once per tick, including the fresh tick.
+    ///
+    /// Only held or freshly-stepped bits are visited (set bits of
+    /// `fresh | encoder_pulse_mask`): a bit with a zero counter
+    /// contributes nothing, so skipping it is exactly the 8-bit
+    /// loop with the no-op iterations cut. `encoder_pulse_mask`
+    /// is the set of bits with a nonzero counter on entry, so a
+    /// bit is in this tick's mask exactly when the old loop would
+    /// have set it (fresh, or counter > 0), and the next mask is
+    /// the bits still nonzero after the countdown — the hold
+    /// length is unchanged.
     fn apply_encoder_pulse(&mut self, steps: [i16; MAX_ENCODERS]) -> EncoderButtons {
-        let ticks = encoder_pulse_ticks(self.plan.encoders.pulse_ms);
+        let ticks = self.encoder_pulse_ticks;
         let fresh = deltas_to_buttons(&steps);
-        let mut mask = fresh.0;
-        for (bit, remaining) in self.encoder_pulse.iter_mut().enumerate() {
-            if fresh.0 & (1u8 << bit) != 0 {
+        let mask = fresh.0 | self.encoder_pulse_mask;
+        let mut next_mask = 0u8;
+        let mut active = mask;
+        while active != 0 {
+            let bit = active.trailing_zeros();
+            active &= active - 1;
+            let bit_mask = 1u8 << bit;
+            let remaining = &mut self.encoder_pulse[bit as usize];
+            if fresh.0 & bit_mask != 0 {
                 *remaining = ticks;
-            } else if *remaining > 0 {
-                mask |= 1u8 << bit;
             }
             *remaining = remaining.saturating_sub(1);
+            if *remaining > 0 {
+                next_mask |= bit_mask;
+            }
         }
+        self.encoder_pulse_mask = next_mask;
         EncoderButtons(mask)
     }
 
@@ -1219,12 +1314,25 @@ impl ProcessingPipeline {
     /// [`BUTTON_DEBOUNCE_EXCLUDE_MASK`] pass through untouched.
     /// A bounce shorter than the hold never reaches the output; a
     /// genuine press is delayed by at most `debounce_ms`.
+    ///
+    /// Fast path: when every wheel bit already agrees with stable,
+    /// the per-bit loop would only clear pending candidates — the
+    /// same clearing in one shot, then the raw word unchanged.
+    /// (A bit that disagreed on an earlier tick has its candidate
+    /// and count cleared here exactly as the loop's settled branch
+    /// would; a bit that disagrees on a later tick re-arms from
+    /// zero either way, so the debounce timing is unchanged.)
     fn apply_button_debounce(&mut self, raw: u32) -> u32 {
         let needed = button_debounce_ticks(self.plan.buttons.debounce_ms);
         let wheel_raw = raw & !BUTTON_DEBOUNCE_EXCLUDE_MASK;
         if needed == 0 {
             self.button_stable = wheel_raw;
             self.button_candidate = wheel_raw;
+            self.button_candidate_ticks = [0; 32];
+            return raw;
+        }
+        if wheel_raw == self.button_stable {
+            self.button_candidate = 0;
             self.button_candidate_ticks = [0; 32];
             return raw;
         }
@@ -1269,18 +1377,29 @@ impl ProcessingPipeline {
     /// Returns the mask of buttons held for at least
     /// `long_press_ms` this tick; a released button clears at
     /// once, so the mask is only set while the button is down.
+    ///
+    /// Only pressed or currently-held buttons are visited (set
+    /// bits of `buttons | button_held_mask`): every other bit has
+    /// a zero hold count and contributes nothing, so skipping it
+    /// is exactly the 32-bit loop with the no-op iterations cut.
     fn track_button_holds(&mut self, buttons: u32) -> u32 {
         let needed = button_long_press_ticks(self.plan.buttons.long_press_ms);
         let mut long = 0u32;
-        for (bit, held) in self.button_hold_ticks.iter_mut().enumerate() {
+        let mut remaining = buttons | self.button_held_mask;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros();
+            remaining &= remaining - 1;
             let mask = 1u32 << bit;
+            let held = &mut self.button_hold_ticks[bit as usize];
             if buttons & mask != 0 {
                 *held = held.saturating_add(1);
+                self.button_held_mask |= mask;
                 if *held >= needed {
                     long |= mask;
                 }
             } else {
                 *held = 0;
+                self.button_held_mask &= !mask;
             }
         }
         long
@@ -1294,22 +1413,31 @@ impl ProcessingPipeline {
     /// 200 Hz); a `process_with_gap` loss makes the window
     /// approximate by the lost frames, which is acceptable for a
     /// human double-press. Returns the current double-press mask.
+    ///
+    /// Only bits whose pressed state changed this tick are visited:
+    /// an unchanged bit has no edge, so neither its release tick
+    /// nor the double-press hold can move. The tick counter still
+    /// advances on every call, so the release→press gap is measured
+    /// in real ticks even on ticks with no edge.
     fn track_button_double_press(&mut self, buttons: u32) -> u32 {
         let window = button_double_press_ticks(self.plan.buttons.double_press_ms);
         self.button_tick = self.button_tick.wrapping_add(1);
         let tick = self.button_tick;
-        for (bit, last_release) in self.button_last_release_tick.iter_mut().enumerate() {
+        let mut changed = buttons ^ self.button_prev_buttons;
+        while changed != 0 {
+            let bit = changed.trailing_zeros();
+            changed &= changed - 1;
             let mask = 1u32 << bit;
+            let last_release = &mut self.button_last_release_tick[bit as usize];
             let pressed = buttons & mask != 0;
-            let was_pressed = self.button_prev_buttons & mask != 0;
-            if pressed && !was_pressed {
+            if pressed {
                 // Rising edge: double-press if the previous release
                 // was recent enough (and this is not the first
                 // press ever — `last_release == 0` means "never").
                 if *last_release != 0 && tick.wrapping_sub(*last_release) <= u32::from(window) {
                     self.button_double_hold |= mask;
                 }
-            } else if !pressed && was_pressed {
+            } else {
                 // Falling edge: remember the release tick, clear
                 // the double-press hold for this button.
                 *last_release = tick;
@@ -1359,6 +1487,27 @@ impl ProcessingPipeline {
         }
         self.handbrake_prev_pressed = pressed;
         if self.handbrake_latched { 1.0 } else { value }
+    }
+}
+
+/// Truncating division of `value` by a `counts_per_click` divisor.
+/// The sanitized divisors (`1`, `2`, `4`) are powers of two, so they
+/// use the bias-and-shift idiom instead of a hardware `idiv` — the
+/// remainder banking runs this 4 times per tick on the 200 Hz hot
+/// path, and integer division is the slowest op in the tick (bench
+/// regression: the E2 division was ~40 ns/tick of the +42 ns
+/// encoder cost). The bias (`(value >> 31) & (d - 1)`) rounds toward
+/// zero exactly like `/` for negative values; it cannot overflow
+/// (a negative `value` gains at most 3, a positive one gains 0).
+/// Any other divisor — unreachable after sanitize, but the plan is
+/// also constructible directly — falls back to `/`.
+#[must_use]
+fn div_counts(value: i32, divisor: i32) -> i32 {
+    match divisor {
+        1 => value,
+        2 => (value + ((value >> 31) & 1)) >> 1,
+        4 => (value + ((value >> 31) & 3)) >> 2,
+        d => value / d,
     }
 }
 
@@ -1489,9 +1638,14 @@ pub fn apply_bite_point_width(value: f32, bite: f32, width: f32) -> f32 {
 /// saturation of `1.0` is the identity. Values outside `0.5..=1.0`
 /// clamp (a sanitized plan never sends them, but the stage must not
 /// amplify an insane input — and `0.0` would divide by zero).
+/// A saturation at/above `1.0` (the default) or non-finite (which
+/// sanitizes to `1.0`) skips the division: `value / 1.0` is `value`.
 #[must_use]
 pub fn apply_saturation(value: f32, saturation: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
+    if !(saturation.is_finite() && saturation < 1.0) {
+        return value;
+    }
     let saturation = clamp_finite(saturation, 0.5, 1.0, 1.0);
     (value / saturation).clamp(0.0, 1.0)
 }
@@ -1566,8 +1720,13 @@ pub fn decode_gear(buttons: u32) -> u8 {
 
 /// Apply One Euro smoothing for one tick. `smoothing <= 0` bypasses
 /// the filter (state reset, value passes through); otherwise the
-/// filter's base cutoff follows the documented smoothing mapping
-/// (see [`OneEuroFilter::from_smoothing`]).
+/// filter runs with the cutoff configured when the plan was set
+/// ([`OneEuroFilter::configure`] in [`ProcessingPipeline::new`] /
+/// [`set_plan_live`](ProcessingPipeline::set_plan_live)) — the
+/// cutoff is NOT re-derived here per tick (bench regression: the
+/// per-tick `set_min_cutoff` on all five axes recomputed the same
+/// cutoff every tick). The enable flag is still applied per tick so
+/// a filter used without a plan-set configuration behaves as before.
 #[must_use]
 pub fn apply_smoothing(filter: &mut OneEuroFilter, value: f32, smoothing: f32) -> f32 {
     if !(smoothing.is_finite() && smoothing > 0.0) {
@@ -1575,7 +1734,6 @@ pub fn apply_smoothing(filter: &mut OneEuroFilter, value: f32, smoothing: f32) -
         return value;
     }
     filter.set_enabled(true);
-    filter.set_min_cutoff(0.5 + 9.5 * (1.0 - smoothing.clamp(0.0, 1.0)));
     filter.filter(value)
 }
 
@@ -1651,7 +1809,12 @@ fn process_pedal_axis(
     // C2: the clutch plan carries a slip width (0.15) that softens
     // the stretch into a zone around the bite; every other module
     // carries 0.0, so their bite is the hard stretch as before.
-    value = apply_bite_point_width(value, tuning.bite_point, tuning.bite_width);
+    // A zero bite with a zero width is the identity (the mapped
+    // value is already `0..=1`), so the stage is skipped — the
+    // default for every pedal.
+    if tuning.bite_point != 0.0 || tuning.bite_width != 0.0 {
+        value = apply_bite_point_width(value, tuning.bite_point, tuning.bite_width);
+    }
     value = apply_deadzone_unipolar(value, tuning.deadzone);
     value = apply_curve(value, tuning.curve_strength);
     value = apply_smoothing(filter, value, tuning.smoothing);
@@ -2052,6 +2215,28 @@ mod tests {
         let out = pipe.process(&frame(&[], &[8], 0));
         assert_eq!(out.encoder_deltas[0], 2);
         assert!(out.encoder_buttons.clockwise(0));
+    }
+
+    #[test]
+    fn div_counts_matches_truncating_division() {
+        // The bias-and-shift idiom must agree with `/` exactly,
+        // including negatives (truncation toward zero, not floor)
+        // and the i32 extremes.
+        use super::div_counts;
+        for divisor in [1, 2, 4] {
+            for value in -200..=200 {
+                assert_eq!(div_counts(value, divisor), value / divisor);
+            }
+            for value in [i32::MIN, i32::MIN + 1, i32::MAX, -1, 0, 1] {
+                assert_eq!(div_counts(value, divisor), value / divisor);
+            }
+        }
+        // Non-power-of-two divisors fall back to `/`.
+        for divisor in [3, 5, 7] {
+            for value in -100..=100 {
+                assert_eq!(div_counts(value, divisor), value / divisor);
+            }
+        }
     }
 
     #[test]

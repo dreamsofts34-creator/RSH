@@ -183,6 +183,16 @@ impl EncoderTracker {
     /// that is still a glitch: dropped, counted in
     /// [`Self::glitch_dropped`], baseline still advances.
     pub fn update_with_gap(&mut self, index: usize, count: i16, skipped: u16) -> i16 {
+        self.update_with_limit(index, count, gap_limit(skipped))
+    }
+
+    /// One encoder update against a precomputed glitch limit (see
+    /// [`gap_limit`]): the per-encoder work of
+    /// [`Self::update_with_gap`]. [`Self::update_all_with_gap`]
+    /// computes the limit once per tick instead of once per
+    /// encoder — the limit depends only on the gap, not the
+    /// encoder.
+    fn update_with_limit(&mut self, index: usize, count: i16, limit: u32) -> i16 {
         if index >= MAX_ENCODERS {
             return 0;
         }
@@ -191,11 +201,6 @@ impl EncoderTracker {
             None => 0,
         };
         self.previous[index] = Some(count);
-        // 32 counts/tick × (skipped + 1) ticks of legitimate motion,
-        // saturating so a huge gap can never overflow the limit.
-        let limit = u32::from(MAX_ENCODER_DELTA_PER_TICK.unsigned_abs())
-            .saturating_mul(u32::from(skipped) + 1)
-            .min(u32::from(i16::MAX.unsigned_abs()) + 1);
         if u32::from(delta.unsigned_abs()) > limit {
             self.glitch_dropped += 1;
             0
@@ -226,8 +231,9 @@ impl EncoderTracker {
         skipped: u16,
     ) -> [i16; MAX_ENCODERS] {
         let mut deltas = [0i16; MAX_ENCODERS];
+        let limit = gap_limit(skipped);
         for (i, &count) in counts.iter().enumerate().take(n_enc.min(MAX_ENCODERS)) {
-            deltas[i] = self.update_with_gap(i, count, skipped);
+            deltas[i] = self.update_with_limit(i, count, limit);
         }
         deltas
     }
@@ -243,6 +249,17 @@ impl EncoderTracker {
     pub fn reset(&mut self) {
         *self = Self::new();
     }
+}
+
+/// Glitch limit in counts for a sequence gap of `skipped` frames
+/// (M4): 32 counts/tick × (`skipped` + 1) ticks of legitimate
+/// motion, saturating so a huge gap can never overflow the limit
+/// (capped at the `i16` range).
+#[must_use]
+fn gap_limit(skipped: u16) -> u32 {
+    u32::from(MAX_ENCODER_DELTA_PER_TICK.unsigned_abs())
+        .saturating_mul(u32::from(skipped) + 1)
+        .min(u32::from(i16::MAX.unsigned_abs()) + 1)
 }
 
 #[cfg(test)]

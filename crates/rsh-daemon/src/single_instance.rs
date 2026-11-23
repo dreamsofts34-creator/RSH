@@ -272,7 +272,7 @@ const PID_WRITE_GRACE_POLLS: u32 = 200;
 
 /// What the daemon pid file says right now (see [`acquire`]).
 /// `Empty` covers a file the winner created but has not written
-/// yet (create_new done, writeln pending) as well as garbage
+/// yet (`create_new` done, `writeln!` pending) as well as garbage
 /// content — both mean "no pid to check", never "no owner".
 #[cfg(unix)]
 enum DaemonPidFileState {
