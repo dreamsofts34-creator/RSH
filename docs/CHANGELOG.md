@@ -79,7 +79,9 @@ iRacing / ACC; nothing is copy-pasted between modules).
   the firmware config blob, debounce 20–5 ms) plus shift lockout
   0–200 ms.
 - **Buttons:** Debounce 0–50 ms, long-press action, double-press
-  action.
+  action. Hold-to-repeat was NOT built: a held vJoy button already
+  repeats in the game's eyes, so the semantics need a product
+  decision first.
 - **Encoders:** Pulse length 20–200 ms (games polling slowly no
   longer miss steps), steps per click 1/2/4 (default 4),
   acceleration, per-knob direction invert.
@@ -92,6 +94,30 @@ zones (they need a game-telemetry subsystem that does not exist
 yet). Also fixed along the way: the `gate-already-running-race`
 flake (pid-file write is now awaited before a claim is reclaimed)
 and a clippy `struct_excessive_bools` in the engine pipeline.
+
+**Real bugs found (and fixed) while building tuning.**
+
+- Throttle settings silently never reached the engine: a spelling
+  split meant throttle deadzone / Feel edits were dropped. If you
+  tuned the throttle before this release, check your throttle
+  settings again.
+- Encoder module-level invert was silently dead (per-knob invert
+  now works).
+- Capturing full lock after a centre capture failed (min == max ==
+  centre).
+- Pid-file claim hole: a losing claimant could delete the winner's
+  empty pid file and become First itself.
+- Throttle saturation (A4) reset to 100% on a Set-down range
+  capture — by design; re-set it after re-calibrating.
+
+**Not yet verified / follow-ups.** Windows-only behaviour (pedal
+feel, vJoy / HIDMaestro, Slint rendering, board round-trip,
+shifter config write) can only be proven on the user's PC.
+Handbrake button-mode debounce still follows shifter sensitivity
+(`inputs.cpp:127` — firmware-config fix, out of this scope).
+UI-spawned daemons silently die after ~11 s (pre-existing, cause
+unknown — follow-up). The `gate-already-running-race` hardening
+proposal is still due (the flake has now hit 5 times).
 
 ## [2.0.7] — 2026-11-22
 
