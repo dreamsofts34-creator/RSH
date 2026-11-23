@@ -862,6 +862,7 @@ jobs:
             Sleep 1000
             nsExec::Exec 'taskkill /F /IM rsh-daemon.exe'
             nsExec::Exec 'taskkill /F /IM RSH.exe'
+            nsExec::Exec 'taskkill /F /IM rsh-hm-sidecar.exe'
             Sleep 1000
             nsExec::Exec 'taskkill /F /IM rsh-ui.exe'
             nsExec::Exec 'taskkill /F /IM rsh-daemon.exe'
@@ -897,6 +898,26 @@ jobs:
             Delete "$SMPROGRAMS\RSH\RSH Wheel.lnk"
             Delete "$SMPROGRAMS\RSH\Uninstall RSH.lnk"
             RMDir "$SMPROGRAMS\RSH"
+            RMDir "$INSTDIR"
+            ; Retry once (release run 45110475449): the uninstall
+            ; exited 0 but $INSTDIR was still there — a Delete on a
+            ; locked exe fails silently and RMDir fails on the
+            ; non-empty dir. A process can respawn (or a handle can
+            ; still be closing) between the taskkills above and the
+            ; Deletes, so kill again, wait, and delete again.
+            Sleep 3000
+            nsExec::Exec 'taskkill /F /IM rsh-ui.exe'
+            nsExec::Exec 'taskkill /F /IM rsh-daemon.exe'
+            nsExec::Exec 'taskkill /F /IM rsh-hm-sidecar.exe'
+            nsExec::Exec 'taskkill /F /IM RSH.exe'
+            Sleep 1000
+            Delete "$INSTDIR\rsh-daemon.exe"
+            Delete "$INSTDIR\rsh-ui.exe"
+            Delete "$INSTDIR\rsh-hm-sidecar.exe"
+            Delete "$INSTDIR\HIDMaestro-LICENSE.txt"
+            Delete "$INSTDIR\firmware-signed.bin"
+            Delete "$INSTDIR\rsh-task.ps1"
+            Delete "$INSTDIR\uninstall.exe"
             RMDir "$INSTDIR"
             ; DS-10: fail visibly if the daemon exe survived (still
             ; running/locked) instead of reporting a partial uninstall
@@ -1067,13 +1088,16 @@ jobs:
           Start-Sleep -Seconds 2
           Start-WaitOrFail $daemon @("--check", "--no-tray", "--no-connect", "--data-dir", $dataDir) 60 "daemon --check after the update install"
           Write-Host "Smoke test PASS: update path — data kept, version $version, daemon restarted, --check exit 0."
+          # The sidecar is a separate process the uninstaller also
+          # kills — stop it here too so it cannot hold its exe open.
+          taskkill /F /IM rsh-hm-sidecar.exe | Out-Null
           $uninstaller = Join-Path $installDir "uninstall.exe"
           if (-not (Test-Path $uninstaller)) { Write-Error "Smoke test: uninstaller not found at $uninstaller."; exit 1 }
           Start-WaitOrFail $uninstaller @("/S") 120 "silent uninstall"
           Start-Sleep -Seconds 5
           $ruleAfter = netsh advfirewall firewall show rule name="RSH" | Out-String
           if ($ruleAfter -match "Rule Name:\s*RSH") { Write-Error "Smoke test: firewall rule 'RSH' still present after uninstall."; exit 1 }
-          if (Test-Path $installDir) { Write-Error "Smoke test: install dir $installDir still present after uninstall."; exit 1 }
+          if (Test-Path $installDir) { Get-ChildItem $installDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "Smoke test: leftover after uninstall: $($_.FullName)" }; Get-Process rsh-* -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "Smoke test: still-running RSH process: $($_.ProcessName) (pid $($_.Id))" }; Write-Error "Smoke test: install dir $installDir still present after uninstall."; exit 1 }
           Write-Host "Smoke test PASS: uninstall removed the firewall rule and the install dir."
           # The data dir may never exist on Windows (named-pipe IPC
           # leaves no socket file, single-instance is a mutex, and
