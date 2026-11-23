@@ -12,7 +12,7 @@
 // the Close button does. No FocusScope / key-pressed handler here.
 
 import { Theme } from "tokens.slint";
-import { Btn } from "components.slint";
+import { Btn, IconBtn } from "components.slint";
 import { ScrollView } from "std-widgets.slint";
 
 export struct NotificationItem {
@@ -29,8 +29,8 @@ export component BellButton inherits Rectangle {
     callback clicked();
     accessible-label: "Notifications";
     accessible-role: button;
-    width: 30px;
-    height: 30px;
+    width: Theme.control-height;
+    height: Theme.control-height;
     border-radius: 8px;
     border-width: 1px;
     border-color: fs.has-focus ? Theme.accent-text : (ta.has-hover ? Theme.faint : Theme.line);
@@ -84,7 +84,7 @@ export component BellButton inherits Rectangle {
             horizontal-alignment: center;
             vertical-alignment: center;
             text: unread > 9 ? "9+" : unread + "";
-            font-size: 9px;
+            font-size: 12px;
             font-weight: 700;
             color: white;
         }
@@ -123,14 +123,14 @@ component NotificationRow inherits Rectangle {
             Text {
                 horizontal-stretch: 1;
                 text: kind;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 700;
                 color: Theme.accent-text;
             }
             Text {
                 text: time;
                 font-family: Theme.font-mono;
-                font-size: 11px;
+                font-size: 12px;
                 color: Theme.faint;
             }
         }
@@ -164,6 +164,10 @@ export component NotificationsDrawer inherits Rectangle {
     border-width: 1px;
     border-color: Theme.line;
     background: Theme.side;
+    // D5: overlay depth — blur 24, y 8, 25% black.
+    drop-shadow-blur: Theme.shadow-blur;
+    drop-shadow-offset-y: Theme.shadow-offset-y;
+    drop-shadow-color: Theme.shadow-color;
     VerticalLayout {
         spacing: 0px;
         // header
@@ -182,13 +186,14 @@ export component NotificationsDrawer inherits Rectangle {
             if unread > 0 : Text {
                 vertical-alignment: center;
                 text: unread + " unread";
-                font-size: 11.5px;
+                font-size: 12px;
                 color: Theme.accent-text;
             }
             // Phase 2 (F-16): "Mark read" (was "Mark all read") —
             // with unread > 0 the title elided to "Notificatio…".
             Btn { label: "Mark read"; clicked => { mark-all-read(); } }
-            Btn { label: "✕"; clicked => { close-requested(); } }
+            // D12: close is an SVG IconBtn, not the "✕" text glyph.
+            IconBtn { icon: @image-url("../assets/icons/close.svg"); accessible-name: "Close notifications"; clicked => { close-requested(); } }
         }
         Rectangle { height: 1px; background: Theme.line; }
         // list
@@ -225,7 +230,7 @@ export component NotificationsDrawer inherits Rectangle {
             Text {
                 vertical-alignment: center;
                 text: items.length + (items.length == 1 ? " notification" : " notifications");
-                font-size: 11.5px;
+                font-size: 12px;
                 color: Theme.faint;
             }
             Rectangle { horizontal-stretch: 1; }

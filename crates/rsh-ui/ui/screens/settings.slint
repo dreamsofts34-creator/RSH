@@ -40,7 +40,7 @@ component Seg inherits Rectangle {
     in property <[bool]> enabled: [true, true, true];
     in property <int> selected;
     callback selected-changed(int);
-    height: 30px;
+    height: Theme.control-height;
     border-radius: 8px;
     border-width: 1px;
     border-color: Theme.line;
@@ -54,6 +54,8 @@ component Seg inherits Rectangle {
             accessible-label: o;
             accessible-role: button;
             background: fs.has-focus ? Theme.line : (selected == i ? Theme.panel2 : (ta.has-hover ? Theme.hover-bg : transparent));
+            // D4: 120ms background transition on hover/select.
+            animate background { duration: 120ms; easing: ease-out; }
             opacity: enabled[i] ? 1 : 0.45;
             fs := FocusScope {
                 width: 100%;
@@ -79,6 +81,16 @@ component Seg inherits Rectangle {
             ta := TouchArea { mouse-cursor: enabled[i] ? MouseCursor.pointer : MouseCursor.default; clicked => { if (enabled[i]) { selected-changed(i); } } }
         }
     }
+}
+
+// D7: section header — small caps label grouping the cards below
+// it (Connection · Game controller · Profiles · App · Backup & updates).
+// The cards keep their own titles; the header is the section label.
+component SectionHeader inherits Text {
+    font-size: Theme.fs-hint;
+    font-weight: 600;
+    color: Theme.faint;
+    letter-spacing: 0.8px;
 }
 
 // ---------------------------------------------------------------- Settings page (content only — no Window/sidebar)
@@ -147,17 +159,18 @@ export component SettingsScreen inherits VerticalLayout {
     settings-scroll := ScrollView {
         vertical-stretch: 1;
         VerticalLayout {
-            padding-top: 14px;
+            padding-top: Theme.pad-page-top;
             // Phase 2 (F-14): bottom padding so the last card
             // never sits 2 px from the ScrollView edge.
             padding-bottom: 14px;
-            padding-left: 20px;
-            padding-right: 20px;
+            padding-left: Theme.pad-page-x;
+            padding-right: Theme.pad-page-x;
             spacing: 12px;
             HorizontalLayout {
                 spacing: 0px;
-                // Equal columns: `min-width: 342px` each (preview-exact:
-                // (736 - 40 pad - 12 gap) / 2 = 342 at 920px). The
+                // Equal columns: `min-width: 338px` each
+                // ((736 - 48 pad - 12 gap) / 2 = 338 at 920px, with
+                // the 24px page padding token). The
                 // staging formula sized them from the ScrollView's
                 // visible-width, but that feeds back into the page's
                 // own preferred width here and the columns came out
@@ -169,13 +182,14 @@ export component SettingsScreen inherits VerticalLayout {
                 // 0.05) that scales with the window.
                 // ---- left column
                 VerticalLayout {
-                    min-width: 342px;
+                    min-width: 338px;
                     horizontal-stretch: 1;
                     spacing: 12px;
+                    SectionHeader { text: "CONNECTION"; }
                     // Connection
                     Card {
                         VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            padding: Theme.pad-card;
                             spacing: 0px;
                             HorizontalLayout {
                                 alignment: space-between;
@@ -201,7 +215,7 @@ export component SettingsScreen inherits VerticalLayout {
                                 Text { width: 52px; text: "Address"; font-size: 13px; color: Theme.mute; vertical-alignment: center; }
                                 Rectangle {
                                     horizontal-stretch: 1;
-                                    height: 28px;
+                                    height: Theme.control-height;
                                     border-radius: 7px;
                                     border-width: 1px;
                                     border-color: Theme.line;
@@ -240,51 +254,83 @@ export component SettingsScreen inherits VerticalLayout {
                                         horizontal-stretch: 1;
                                         spacing: 0px;
                                         Text { text: "Wi-Fi password"; font-size: 13px; color: Theme.text; }
-                                        Text { text: wifi-password-set ? "Password set — the wheel's hotspot needs it." : "No password — the wheel's hotspot is open."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                        Text { text: wifi-password-set ? "Password set — the wheel's hotspot needs it." : "No password — the wheel's hotspot is open."; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
                                     }
                                     Pill { label: wifi-password-set ? "Set" : "Not set"; bg: wifi-password-set ? Theme.ok-bg : Theme.panel2; fg: wifi-password-set ? Theme.ok : Theme.mute; }
                                 }
-                                Rectangle {
-                                    horizontal-stretch: 1;
-                                    height: 28px;
-                                    border-radius: 7px;
-                                    border-width: 1px;
-                                    border-color: Theme.line;
-                                    background: Theme.bg;
-                                    TextInput {
-                                        x: 10px;
-                                        width: parent.width - 20px;
-                                        height: 100%;
-                                        vertical-alignment: center;
-                                        text <=> wifi-password-new;
-                                        input-type: InputType.password;
-                                        font-size: 12px;
-                                        font-weight: 500;
-                                        color: Theme.text;
-                                        selection-background-color: Theme.accent;
+                                // B15: each password box has its label above it
+                                // (the S6 screenshot showed two bare boxes)
+                                // and a placeholder inside it — visible in
+                                // Light and Dark, since the label is real text.
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    Text { text: "New password"; font-size: 13px; color: Theme.text; }
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: Theme.control-height;
+                                        border-radius: 7px;
+                                        border-width: 1px;
+                                        border-color: Theme.line;
+                                        background: Theme.bg;
+                                        Text {
+                                            x: 10px;
+                                            width: parent.width - 20px;
+                                            height: 100%;
+                                            vertical-alignment: center;
+                                            text: "New password";
+                                            font-size: 12px;
+                                            color: Theme.faint;
+                                            visible: wifi-password-new == "";
+                                        }
+                                        TextInput {
+                                            x: 10px;
+                                            width: parent.width - 20px;
+                                            height: 100%;
+                                            vertical-alignment: center;
+                                            text <=> wifi-password-new;
+                                            input-type: InputType.password;
+                                            font-size: 12px;
+                                            font-weight: 500;
+                                            color: Theme.text;
+                                            selection-background-color: Theme.accent;
+                                        }
                                     }
                                 }
-                                Rectangle {
-                                    horizontal-stretch: 1;
-                                    height: 28px;
-                                    border-radius: 7px;
-                                    border-width: 1px;
-                                    border-color: Theme.line;
-                                    background: Theme.bg;
-                                    TextInput {
-                                        x: 10px;
-                                        width: parent.width - 20px;
-                                        height: 100%;
-                                        vertical-alignment: center;
-                                        text <=> wifi-password-confirm;
-                                        input-type: InputType.password;
-                                        font-size: 12px;
-                                        font-weight: 500;
-                                        color: Theme.text;
-                                        selection-background-color: Theme.accent;
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    Text { text: "Confirm password"; font-size: 13px; color: Theme.text; }
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                        height: Theme.control-height;
+                                        border-radius: 7px;
+                                        border-width: 1px;
+                                        border-color: Theme.line;
+                                        background: Theme.bg;
+                                        Text {
+                                            x: 10px;
+                                            width: parent.width - 20px;
+                                            height: 100%;
+                                            vertical-alignment: center;
+                                            text: "Confirm password";
+                                            font-size: 12px;
+                                            color: Theme.faint;
+                                            visible: wifi-password-confirm == "";
+                                        }
+                                        TextInput {
+                                            x: 10px;
+                                            width: parent.width - 20px;
+                                            height: 100%;
+                                            vertical-alignment: center;
+                                            text <=> wifi-password-confirm;
+                                            input-type: InputType.password;
+                                            font-size: 12px;
+                                            font-weight: 500;
+                                            color: Theme.text;
+                                            selection-background-color: Theme.accent;
+                                        }
                                     }
                                 }
-                                Text { text: "New password (8–63 characters) — type it again to confirm."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                Text { text: "New password (8–63 characters) — type it again to confirm."; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
                                 HorizontalLayout {
                                     spacing: 8px;
                                     Btn { label: wifi-password-busy ? "Setting…" : wifi-password-set ? "Change password" : "Set password"; primary: true; disabled: wifi-password-busy || busy-kind == 14; clicked => { set-wifi-password(); } }
@@ -292,7 +338,7 @@ export component SettingsScreen inherits VerticalLayout {
                                 }
                                 if wifi-password-error != "" : Text { text: wifi-password-error; font-size: 12px; color: Theme.bad; wrap: word-wrap; }
                                 if wifi-password-message != "" : Text { text: wifi-password-message; font-size: 12px; color: Theme.ok; wrap: word-wrap; }
-                                Text { text: "Forgetting clears the password on this PC. If the wheel still has one, hold BOOT on the wheel for 10 seconds to clear it there too — the hotspot then comes back open."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                Text { text: "Forgetting clears the password on this PC. If the wheel still has one, hold BOOT on the wheel for 10 seconds to clear it there too — the hotspot then comes back open."; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
                             // A1 (v2.0.2): the setup-reopen row is easy
@@ -306,16 +352,17 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Run setup again"; font-size: 13px; color: Theme.text; }
-                                    Text { text: "Connect, drivers, calibrate, games."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: "Connect, drivers, calibrate, games."; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 Btn { label: "Run setup"; primary: true; clicked => { run-setup(); } }
                             }
                         }
                     }
+                    SectionHeader { text: "GAME CONTROLLER"; }
                     // Game controller
                     Card {
                         VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            padding: Theme.pad-card;
                             spacing: 0px;
                             HorizontalLayout {
                                 spacing: 8px;
@@ -344,13 +391,14 @@ export component SettingsScreen inherits VerticalLayout {
                             // 920px the "Run setup" button is primary
                             // (wider), so the 39-char sub needs two
                             // lines instead of pushing past the card.
-                            Text { text: "Recommended: vJoy"; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+                            Text { text: "Recommended: vJoy"; font-size: 12px; color: Theme.faint; wrap: word-wrap; }
                         }
                     }
+                    SectionHeader { text: "APP"; }
                     // Startup
                     Card {
                         VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            padding: Theme.pad-card;
                             spacing: 0px;
                             Text { text: "Startup"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                             Rectangle { height: 8px; }
@@ -378,7 +426,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Keep running in the tray"; font-size: 13px; color: Theme.text; }
-                                    Text { text: "Keeps running after close."; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: "Keeps running after close."; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 Switch { accessible-name: "Keep running in tray"; on: keep-in-tray; toggled => { keep-in-tray = !keep-in-tray; toggled-keep-tray(keep-in-tray); } }
                             }
@@ -389,13 +437,14 @@ export component SettingsScreen inherits VerticalLayout {
                 Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
                 // ---- right column
                 VerticalLayout {
-                    min-width: 342px;
+                    min-width: 338px;
                     horizontal-stretch: 1;
                     spacing: 12px;
+                    SectionHeader { text: "PROFILES"; }
                     // Profiles
                     Card {
                         VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            padding: Theme.pad-card;
                             spacing: 0px;
                             HorizontalLayout {
                                 alignment: space-between;
@@ -422,7 +471,7 @@ export component SettingsScreen inherits VerticalLayout {
                                             Text { text: p.name; font-size: 13px; font-weight: 600; color: Theme.text; wrap: word-wrap; }
                                             if p.active : Pill { label: "Active"; bg: Theme.ok-bg; fg: Theme.ok; }
                                         }
-                                        Text { text: p.games; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                        Text { text: p.games; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
                                     }
                                     if p.active : Btn { label: "Duplicate"; disabled: busy-kind == 8; clicked => { duplicate-profile(i); } }
                                     if !p.active : Btn { label: "Use"; disabled: busy-kind == 8; clicked => { use-profile(i); } }
@@ -430,12 +479,13 @@ export component SettingsScreen inherits VerticalLayout {
                             }
                         }
                     }
+                    SectionHeader { text: "APP"; }
                     // Appearance (v2.0.2, A8): Dark / Light / Auto all
                     // work now — Light tokens live in tokens.slint, Auto
                     // is resolved to Dark/Light by the Rust side.
                     Card {
                         VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            padding: Theme.pad-card;
                             spacing: 0px;
                             Text { text: "Appearance"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                             Rectangle { height: 8px; }
@@ -455,17 +505,27 @@ export component SettingsScreen inherits VerticalLayout {
                             }
                         }
                     }
+                    SectionHeader { text: "BACKUP & UPDATES"; }
                     // Backup and updates (A7, v2.0.2): every sub-text
                     // wraps, so a long line can never push its button
                     // out of the card — the "App updates" Check button
                     // overflowed before this fix.
                     Card {
                         VerticalLayout {
-                            padding-top: 12px; padding-bottom: 12px; padding-left: 14px; padding-right: 14px;
+                            padding: Theme.pad-card;
                             spacing: 0px;
                             Text { text: "Backup and updates"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
                             Rectangle { height: 8px; }
-                            HorizontalLayout {
+                            // D6: empty state — 32px icon + one line + one
+                            // button — while no firmware info has landed.
+                            if firmware-text == "—" : VerticalLayout {
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+                                Image { width: 32px; height: 32px; source: @image-url("../../assets/icons/wheel.svg"); colorize: Theme.faint; }
+                                Text { text: "No firmware info yet — check for updates."; font-size: 12px; color: Theme.mute; horizontal-alignment: center; }
+                                Btn { label: "Check"; disabled: busy-kind == 3; clicked => { check-firmware(); } }
+                            }
+                            if firmware-text != "—" : HorizontalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
                                 spacing: 10px;
@@ -473,7 +533,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Wheel firmware"; font-size: 13px; color: Theme.text; }
-                                    Text { text: firmware-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: firmware-text; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 // H-4: Check reports the verdict,
                                 // Update firmware starts the flash
@@ -494,12 +554,22 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "App updates"; font-size: 13px; color: Theme.text; }
-                                    Text { text: app-update-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: app-update-text; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 Btn { label: "Check"; disabled: busy-kind == 16; clicked => { check-app-updates(); } }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
-                            HorizontalLayout {
+                            // D6: empty state — 32px icon + one line + one
+                            // button — while no backup exists yet.
+                            // (Restore only appears once a backup exists.)
+                            if backup-text == "No backups yet" : VerticalLayout {
+                                spacing: 8px;
+                                cross-axis-alignment: center;
+                                Image { width: 32px; height: 32px; source: @image-url("../../assets/icons/archive.svg"); colorize: Theme.faint; }
+                                Text { text: "No backups yet"; font-size: 12px; color: Theme.mute; horizontal-alignment: center; }
+                                Btn { label: "Back up"; disabled: busy-kind == 14; clicked => { backup(); } }
+                            }
+                            if backup-text != "No backups yet" : HorizontalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
                                 spacing: 10px;
@@ -507,7 +577,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     horizontal-stretch: 1;
                                     spacing: 0px;
                                     Text { text: "Backups"; font-size: 13px; color: Theme.text; }
-                                    Text { text: backup-text; font-size: 11.5px; color: Theme.mute; wrap: word-wrap; }
+                                    Text { text: backup-text; font-size: 12px; color: Theme.mute; wrap: word-wrap; }
                                 }
                                 HorizontalLayout {
                                     spacing: 6px;
@@ -522,12 +592,13 @@ export component SettingsScreen inherits VerticalLayout {
             Rectangle { height: 2px; }
         }
     }
-    // diagnostics link, pinned at the bottom (§7.5)
+    // diagnostics link, pinned at the bottom (§7.5) + version
+    // (B17: the header badge moved here — "RSH 2.0.8").
     HorizontalLayout {
         padding-top: 4px;
         padding-bottom: 12px;
-        padding-left: 20px;
-        padding-right: 20px;
+        padding-left: Theme.pad-page-x;
+        padding-right: Theme.pad-page-x;
         Text {
             text: "Open diagnostics";
             font-size: 12px;
@@ -550,5 +621,7 @@ export component SettingsScreen inherits VerticalLayout {
             diag-ta := TouchArea { mouse-cursor: pointer; clicked => { open-diagnostics(); } }
         }
         Rectangle { horizontal-stretch: 1; }
+        // B17: version lives here now (and on the About page).
+        Text { text: app-version; font-size: 12px; color: Theme.faint; vertical-alignment: center; }
     }
 }

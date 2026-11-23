@@ -51,13 +51,16 @@ component ButtonTile inherits Rectangle {
         // B1: the label stays on ONE line — the 70px clipping slot
         // (see below) elides instead of wrapping, so the tile never
         // grows taller than the grid.
+        // B20: short label ("BTN 6") — the pressed/editing state is
+        // already shown by the tile colour, and the accessible-label
+        // above still names the button fully.
         Rectangle {
             width: 70px;
             clip: true;
             Text {
                 width: 70px;
-                text: "BUTTON " + (index + 1) + (pressed ? " · PRESSED" : selected ? " · EDITING" : "");
-                font-size: 11px;
+                text: "BTN " + (index + 1);
+                font-size: 12px;
                 font-weight: 600;
                 color: Theme.faint;
                 wrap: no-wrap;
@@ -129,7 +132,7 @@ component KnobCell inherits Rectangle {
                 x: 22px;
                 y: -6px;
                 text: flash-text;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 700;
                 color: Theme.ok;
             }
@@ -140,7 +143,7 @@ component KnobCell inherits Rectangle {
             Text {
                 wrap: word-wrap;
                 text: "Turn left: " + left-action + " · Turn right: " + right-action;
-                font-size: 11.5px;
+                font-size: 12px;
                 color: Theme.mute;
             }
         }
@@ -178,7 +181,7 @@ component ActionChip inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         text: label;
-        font-size: 11.5px;
+        font-size: 12px;
         font-weight: 600;
         color: active ? Theme.sel-text : (ta.has-hover ? Theme.text : Theme.mute);
     }
@@ -409,24 +412,25 @@ export component ButtonsPage inherits HorizontalLayout {
                     alignment: start;
                     Text { text: "Steps per click"; font-size: 13px; font-weight: 500; color: Theme.text; }
                     Rectangle { horizontal-stretch: 1; }
-                    Text { text: "Counts per physical click"; font-size: 11.5px; color: Theme.faint; }
+                    Text { text: "Counts per physical click"; font-size: 12px; color: Theme.faint; }
                 }
                 SegmentedControl { option-0: "1"; option-1: "2"; option-2: "4"; selected: enc-counts == 1 ? 0 : enc-counts == 2 ? 1 : 2; selected-changed(i) => { enc-counts-changed(i == 0 ? 1 : i == 1 ? 2 : 4); } }
                 HorizontalLayout {
                     spacing: 8px;
                     VerticalLayout {
                         Text { text: "Acceleration"; font-size: 12px; color: Theme.text; }
-                        Text { text: "Fast spins emit extra steps"; font-size: 11px; color: Theme.faint; }
+                        Text { text: "Fast spins emit extra steps"; font-size: 12px; color: Theme.faint; }
                     }
                     Rectangle { horizontal-stretch: 1; }
                     Switch { accessible-name: "Encoder acceleration"; on: enc-accel; toggled => { enc-accel-changed(!enc-accel); } }
                 }
-                SliderRow { label: "Acceleration strength"; hint: "Extra steps on fast spins"; value-text: enc-accel-sens-text; value: enc-accel-sens / 2.0; disabled: !enc-accel; changed(v) => { enc-accel-sens-changed(v); } value-edited(t) => { enc-accel-sens-edited(t); } }
+                // D8: the disabled reason shows under the slider.
+                SliderRow { label: "Acceleration strength"; hint: "Extra steps on fast spins"; value-text: enc-accel-sens-text; value: enc-accel-sens / 2.0; disabled: !enc-accel; disabled-hint: "Turn on Acceleration to change this."; changed(v) => { enc-accel-sens-changed(v); } value-edited(t) => { enc-accel-sens-edited(t); } }
                 HorizontalLayout {
                     spacing: 8px;
                     VerticalLayout {
                         Text { text: "Invert Knob 1"; font-size: 12px; color: Theme.text; }
-                        Text { text: "Swap left and right on Knob 1"; font-size: 11px; color: Theme.faint; }
+                        Text { text: "Swap left and right on Knob 1"; font-size: 12px; color: Theme.faint; }
                     }
                     Rectangle { horizontal-stretch: 1; }
                     Switch { accessible-name: "Invert Knob 1"; on: enc-invert1; toggled => { enc-invert-changed(0, !enc-invert1); } }
@@ -435,7 +439,7 @@ export component ButtonsPage inherits HorizontalLayout {
                     spacing: 8px;
                     VerticalLayout {
                         Text { text: "Invert Knob 2"; font-size: 12px; color: Theme.text; }
-                        Text { text: "Swap left and right on Knob 2"; font-size: 11px; color: Theme.faint; }
+                        Text { text: "Swap left and right on Knob 2"; font-size: 12px; color: Theme.faint; }
                     }
                     Rectangle { horizontal-stretch: 1; }
                     Switch { accessible-name: "Invert Knob 2"; on: enc-invert2; toggled => { enc-invert-changed(1, !enc-invert2); } }
@@ -593,7 +597,7 @@ export component ButtonsPage inherits HorizontalLayout {
                 Text {
                     wrap: word-wrap;
                     text: "Hold past the threshold — or press twice quickly — to switch to this action instead.";
-                    font-size: 11.5px;
+                    font-size: 12px;
                     color: Theme.faint;
                 }
                 Rectangle { height: 6px; }
@@ -636,7 +640,7 @@ export component ButtonsPage inherits HorizontalLayout {
             Text {
                 wrap: word-wrap;
                 text: "If the wheel stops responding, RSH goes back to your old buttons in 30 s.";
-                font-size: 11.5px;
+                font-size: 12px;
                 color: Theme.faint;
             }
             // Slack absorber: the panel is stretched to the full body

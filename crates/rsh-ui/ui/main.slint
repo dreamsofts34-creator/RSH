@@ -17,7 +17,7 @@
 import "../assets/Inter.ttf";
 import "../assets/JetBrainsMono.ttf";
 import { Theme } from "tokens.slint";
-import { SegmentedControl, ProfileButton, AutoProfileChip, Btn, Pill } from "components.slint";
+import { SegmentedControl, ProfileButton, AutoProfileChip, Btn } from "components.slint";
 import { Sidebar, AboutPage } from "shell.slint";
 import { OverviewPage, GameItem } from "screens/overview.slint";
 import { SteeringPage } from "screens/steering.slint";
@@ -61,6 +61,11 @@ export component MainWindow inherits Window {
     default-font-size: 13px;
 
     in-out property <int> page: 0; // 0 Overview, 1 Steering, 2 Pedals, 3 Buttons, 4 Extras, 5 Settings, 6 About
+    // D4: page-switch fade — dips to 0.3 on every `page` change and
+    // the timer below restores it to 1; the content column animates
+    // its opacity over 150ms both ways.
+    property <float> page-opacity: 1;
+    changed page => { page-opacity = 0.3; }
     in-out property <bool> send-to-game: true;
     in-out property <bool> advanced: false;
     in-out property <bool> unsaved: false;
@@ -628,6 +633,12 @@ export component MainWindow inherits Window {
             }
             return reject;
         }
+        // D4: restores `page-opacity` 170ms after a page switch.
+        page-fade-timer := Timer {
+            interval: 170ms;
+            running: page-opacity < 1;
+            triggered => { page-opacity = 1; }
+        }
         if !setup-mode : HorizontalLayout {
             width: 100%;
             // R2-12 / DS-53 (UI-UX polish, c): NO height reservation
@@ -666,6 +677,9 @@ export component MainWindow inherits Window {
             // column can never ask for more than the window gives.
             min-width: 736px;
             horizontal-stretch: 1;
+            // D4: page-switch fade (see `page-opacity` above).
+            opacity: page-opacity;
+            animate opacity { duration: 150ms; easing: ease-in-out; }
             // R2-12 (c): permanent 38px empty reserve at the bottom
             // of the content column — the floating busy strip sits
             // over this padding, never over page content. Pages keep
@@ -673,15 +687,16 @@ export component MainWindow inherits Window {
             // only eats slack (Overview already had ~68px of it) or
             // shrinks a stretch absorber / the Settings ScrollView.
             padding-bottom: 38px;
-            // top bar (56px). The inner row is 30px tall and offset by
-            // 13px so its contents are vertically centred in the bar:
-            // Slint layouts top-align fixed-height children, so an
-            // un-offset row would sit at the top edge (as in the spike).
+            // top bar (56px). The inner row is 32px tall (control
+            // height token) and offset by 12px so its contents are
+            // vertically centred in the bar: Slint layouts top-align
+            // fixed-height children, so an un-offset row would sit at
+            // the top edge (as in the spike).
             Rectangle {
                 height: Theme.topbar-height;
                 HorizontalLayout {
-                    y: 13px;
-                    height: 30px;
+                    y: 12px;
+                    height: Theme.control-height;
                     width: parent.width;
                     padding-left: 20px;
                     padding-right: 20px;
@@ -707,12 +722,9 @@ export component MainWindow inherits Window {
                         Text { vertical-alignment: center; text: "RSH Wheel  "; font-size: 17px; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: "/ Extras"; font-size: 17px; font-weight: 500; color: Theme.faint; }
                     }
-                    if page == 5 : HorizontalLayout {
-                        spacing: 8px;
-                        Text { vertical-alignment: center; text: "Settings"; font-size: 17px; font-weight: 600; color: Theme.text; }
-                        // B2: version pill on the Settings top bar.
-                        Pill { label: "v" + app-version; bg: Theme.panel2; fg: Theme.mute; }
-                    }
+                    // B17: the version badge left the header — it lives
+                    // at the bottom of Settings + on the About page now.
+                    if page == 5 : Text { vertical-alignment: center; text: "Settings"; font-size: 17px; font-weight: 600; color: Theme.text; }
                     if page == 6 : Text { vertical-alignment: center; text: "About"; font-size: 17px; font-weight: 600; color: Theme.text; }
                     Rectangle { horizontal-stretch: 1; }
                     if page == 0 : AutoProfileChip {
@@ -1213,16 +1225,20 @@ export component MainWindow inherits Window {
     // Phase 2 (F-2 / U-1): backdrop + click-away for the game dialog.
     if game-dialog-open : Rectangle {
         x: 0px; y: 0px; width: parent.width; height: parent.height;
-        background: #000000; opacity: 0.35;
+        background: #000000; opacity: 0.40;
         TouchArea { width: parent.width; height: parent.height; clicked => { game-dialog-cancel(); } }
     }
-    // Add/edit game dialog overlay (manual games): same right-edge
-    // overlay position as the profile popover. Esc is owned by the
-    // keyboard worker (clears `game-dialog-open`) and by the
-    // dialog's own FocusScope.
+    // B19: Add/edit game dialog overlay (manual games) — centred
+    // Modal-pattern dialog (report §4.2): 420px wide, centred in the
+    // window, 40% scrim, shadow on the card itself (game_dialog).
+    // Esc is owned by the keyboard worker (clears
+    // `game-dialog-open`) and by the dialog's own FocusScope.
+    // (P1's shared Modal component does not exist yet — this builds
+    // on the report's Modal pattern with the same values, so P1 can
+    // swap the shell for Modal without changing the dialog.)
     if game-dialog-open : GameDialog {
-        x: parent.width - 380px;
-        y: 64px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
         title: game-dialog-title;
         name <=> game-dialog-name;
         exe <=> game-dialog-exe;
@@ -1259,6 +1275,10 @@ export component MainWindow inherits Window {
         border-width: 1px;
         border-color: Theme.line;
         background: Theme.panel;
+        // D5: overlay depth — blur 24, y 8, 25% black.
+        drop-shadow-blur: Theme.shadow-blur;
+        drop-shadow-offset-y: Theme.shadow-offset-y;
+        drop-shadow-color: Theme.shadow-color;
         confirm-layout := VerticalLayout {
             padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
             spacing: 10px;
@@ -1309,13 +1329,17 @@ export component MainWindow inherits Window {
             padding-top: 8px;
             padding-bottom: 8px;
             spacing: 10px;
+            // D12: centres the 12px close icon against the text block.
+            cross-axis-alignment: center;
             VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 2px;
                 Text { text: toast-title; font-size: 12.5px; font-weight: 600; color: toast-kind == "success" ? Theme.ok : Theme.bad; wrap: word-wrap; }
                 Text { text: toast-text; font-size: 12px; color: Theme.text; wrap: word-wrap; }
             }
-            Text { text: "✕"; font-size: 12px; color: Theme.faint; vertical-alignment: center; }
+            // D12: SVG close icon, not the "✕" text glyph (decorative —
+            // the whole toast dismisses on click, see below).
+            Image { width: 12px; height: 12px; source: @image-url("../assets/icons/close.svg"); colorize: Theme.faint; }
         }
         TouchArea {
             width: parent.width;

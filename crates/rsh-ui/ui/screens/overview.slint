@@ -179,9 +179,14 @@ export component OverviewPage inherits VerticalLayout {
             }
             // Manual games (no auto-scan): the empty state offers
             // Add game instead of a search.
-            if games.length == 0 : HorizontalLayout {
-                spacing: 10px;
-                Text { horizontal-stretch: 1; vertical-alignment: center; text: "No games added yet — add your first game."; font-size: 12px; color: Theme.faint; wrap: word-wrap; }
+            // D6: empty state — 32px icon + one line + one button.
+            // (P0 B04 hides the header "Add game" while empty, so
+            // this is the only Add game button then.)
+            if games.length == 0 : VerticalLayout {
+                spacing: 8px;
+                cross-axis-alignment: center;
+                Image { width: 32px; height: 32px; source: @image-url("../../assets/icons/grid.svg"); colorize: Theme.faint; }
+                Text { text: "No games added yet — add your first game."; font-size: 12px; color: Theme.faint; horizontal-alignment: center; wrap: word-wrap; }
                 Btn { label: "Add game"; disabled: busy-kind == 13; clicked => { add-game(); } }
             }
             // Phase 2 (F-8): two tiles per row, min 300 px each —
@@ -266,9 +271,9 @@ export component OverviewPage inherits VerticalLayout {
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    VerticalLayout { horizontal-stretch: 1; Text { text: delay-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Delay"; font-size: 11.5px; color: Theme.mute; } }
-                    VerticalLayout { horizontal-stretch: 1; Text { text: lost-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Lost data"; font-size: 11.5px; color: Theme.mute; } }
-                    VerticalLayout { horizontal-stretch: 1; Text { text: jitter-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Jitter"; font-size: 11.5px; color: Theme.mute; } }
+                    VerticalLayout { horizontal-stretch: 1; Text { text: delay-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Delay"; font-size: 12px; color: Theme.mute; } }
+                    VerticalLayout { horizontal-stretch: 1; Text { text: lost-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Lost data"; font-size: 12px; color: Theme.mute; } }
+                    VerticalLayout { horizontal-stretch: 1; Text { text: jitter-text; font-family: Theme.font-mono; font-size: 20px; font-weight: 600; color: Theme.text; } Text { text: "Jitter"; font-size: 12px; color: Theme.mute; } }
                 }
                 Text {
                     text: "Open diagnostics";

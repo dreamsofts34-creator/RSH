@@ -35,7 +35,35 @@ export global Theme {
     in-out property <length> sidebar-width: 184px;
     in-out property <length> topbar-height: 56px;
     in-out property <length> card-radius: 12px;
-    in-out property <length> card-gap: 12px;
+    // Token value per report §4.1 is 16px; no screen reads this
+    // token yet (screens use literal 12px spacing) — P1's
+    // CardBody/PageScaffold migrates the layouts onto it.
+    in-out property <length> card-gap: 16px;
+    // P2 tokens (UI-REPORT §4.1): spacing scale, card/page padding,
+    // control + value-box sizes, radii, overlay shadow, type scale.
+    in-out property <length> space-4: 4px;
+    in-out property <length> space-8: 8px;
+    in-out property <length> space-12: 12px;
+    in-out property <length> space-16: 16px;
+    in-out property <length> space-24: 24px;
+    in-out property <length> pad-card: 16px;
+    in-out property <length> pad-page-x: 24px;
+    in-out property <length> pad-page-top: 20px;
+    in-out property <length> control-height: 32px;
+    in-out property <length> value-box-w: 64px;
+    in-out property <length> value-box-h: 28px;
+    in-out property <length> radius-control: 8px;
+    in-out property <length> radius-chip: 6px;
+    in-out property <length> shadow-blur: 24px;
+    in-out property <length> shadow-offset-y: 8px;
+    in-out property <color> shadow-color: #00000040;
+    // Type scale (D1, P1 migrates usage): 20 title · 14 card ·
+    // 13 label · 12 hint (minimum, B18) · 12.5 mono value.
+    in-out property <length> fs-title: 20px;
+    in-out property <length> fs-card: 14px;
+    in-out property <length> fs-label: 13px;
+    in-out property <length> fs-hint: 12px;
+    in-out property <length> fs-value: 12.5px;
     in-out property <string> font-text: "Inter";
     in-out property <string> font-mono: "JetBrains Mono";
     // Derived fills (Phase 1 spike): pre-blended translucent fills, since

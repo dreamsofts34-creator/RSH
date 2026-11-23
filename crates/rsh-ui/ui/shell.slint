@@ -57,7 +57,7 @@ export component Sidebar inherits Rectangle {
             VerticalLayout {
                 spacing: 0px;
                 Text { text: "RSH"; font-size: 14px; font-weight: 700; color: Theme.text; }
-                Text { text: "Real Sim Hub"; font-size: 11px; color: Theme.faint; }
+                Text { text: "Real Sim Hub"; font-size: 12px; color: Theme.faint; }
             }
         }
         NavItem { label: "Overview"; icon: @image-url("../assets/icons/grid.svg"); active: page == 0; clicked => { nav(0); } }
@@ -71,7 +71,7 @@ export component Sidebar inherits Rectangle {
             padding-top: 10px;
             padding-bottom: 2px;
             padding-left: 10px;
-            Text { text: "DEVICE"; font-size: 10.5px; font-weight: 600; color: Theme.faint; }
+            Text { text: "DEVICE"; font-size: 12px; font-weight: 600; color: Theme.faint; }
         }
         NavItem { label: "RSH Wheel"; icon: @image-url("../assets/icons/wheel.svg"); active: page >= 1 && page <= 4; show-dot: connected; clicked => { nav(1); } }
         SubItem { label: "Steering"; active: page == 1; clicked => { nav(1); } }
@@ -82,7 +82,7 @@ export component Sidebar inherits Rectangle {
             padding-top: 10px;
             padding-bottom: 2px;
             padding-left: 10px;
-            Text { text: "APP"; font-size: 10.5px; font-weight: 600; color: Theme.faint; }
+            Text { text: "APP"; font-size: 12px; font-weight: 600; color: Theme.faint; }
         }
         NavItem { label: "Settings"; icon: @image-url("../assets/icons/gear.svg"); active: page == 5 || page == 6; clicked => { nav(5); } }
         Rectangle { vertical-stretch: 1; }
@@ -96,7 +96,7 @@ export component Sidebar inherits Rectangle {
         Text {
             horizontal-alignment: center;
             text: "About";
-            font-size: 11.5px;
+            font-size: 12px;
             color: fs.has-focus || about-ta.has-hover ? Theme.text : Theme.faint;
             accessible-label: "About";
             accessible-role: button;

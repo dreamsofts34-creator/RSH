@@ -53,7 +53,7 @@ component LiveChart inherits VerticalLayout {
             stroke-width: 2px;
         }
     }
-    Text { text: "Last 10 s"; font-size: 11px; color: Theme.faint; }
+    Text { text: "Last 10 s"; font-size: 12px; color: Theme.faint; }
 }
 
 // One packet stat: label + mono value.
@@ -63,7 +63,7 @@ component StatCell inherits VerticalLayout {
     in property <bool> bad: false;
     spacing: 1px;
     Text { text: value; font-family: Theme.font-mono; font-size: 18px; font-weight: 600; color: bad ? Theme.bad : Theme.text; }
-    Text { text: label; font-size: 11.5px; color: Theme.mute; }
+    Text { text: label; font-size: 12px; color: Theme.mute; }
 }
 
 export component DiagnosticsDrawer inherits FocusScope {
@@ -119,10 +119,15 @@ export component DiagnosticsDrawer inherits FocusScope {
         }
         return reject;
     }
+    // D5: overlay depth — blur 24, y 8, 25% black. (The root is a
+    // FocusScope, which takes no shadow — it lives on the panel.)
     Rectangle {
         width: 100%;
         height: 100%;
         background: Theme.side;
+        drop-shadow-blur: Theme.shadow-blur;
+        drop-shadow-offset-y: Theme.shadow-offset-y;
+        drop-shadow-color: Theme.shadow-color;
         Rectangle { width: 1px; height: 100%; background: Theme.line; }
         VerticalLayout {
             spacing: 0px;
@@ -138,7 +143,7 @@ export component DiagnosticsDrawer inherits FocusScope {
                 cross-axis-alignment: center;
                 Text { text: "Diagnostics"; font-size: 17px; font-weight: 600; color: Theme.text; }
                 Rectangle { horizontal-stretch: 1; }
-                Text { text: "Esc to close"; font-size: 11.5px; color: Theme.faint; vertical-alignment: center; }
+                Text { text: "Esc to close"; font-size: 12px; color: Theme.faint; vertical-alignment: center; }
                 Btn { label: "Close"; clicked => { closed(); } }
             }
             Rectangle { height: 1px; background: Theme.line; }
@@ -211,7 +216,7 @@ export component DiagnosticsDrawer inherits FocusScope {
                             for e in events : Text {
                                 text: e;
                                 font-family: Theme.font-mono;
-                                font-size: 11.5px;
+                                font-size: 12px;
                                 color: Theme.mute;
                                 wrap: word-wrap;
                             }

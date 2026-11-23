@@ -68,15 +68,14 @@ component ProfileRowItem inherits Rectangle {
             background: active ? Theme.check-bg : transparent;
             border-width: active ? 0px : 1px;
             border-color: Theme.line;
-            Text {
-                width: 100%;
-                height: 100%;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                text: active ? "✓" : "";
-                font-size: 10px;
-                font-weight: 700;
-                color: Theme.ok;
+            // D12: the tick is an SVG, not the "✓" text glyph.
+            if active : Image {
+                x: 3px;
+                y: 3px;
+                width: 12px;
+                height: 12px;
+                source: @image-url("../../assets/icons/check.svg");
+                colorize: Theme.ok;
             }
         }
         VerticalLayout {
@@ -88,7 +87,7 @@ component ProfileRowItem inherits Rectangle {
                 Text { text: name; font-size: 12.5px; font-weight: 600; color: Theme.text; wrap: no-wrap; overflow: elide; }
                 if is-preset : Pill { label: "Preset"; bg: Theme.panel2; fg: Theme.faint; }
             }
-            Text { text: game; font-size: 11.5px; color: Theme.mute; wrap: no-wrap; overflow: elide; }
+            Text { text: game; font-size: 12px; color: Theme.mute; wrap: no-wrap; overflow: elide; }
         }
         if !active : Btn { label: "Use"; disabled: use-disabled; clicked => { use-clicked(); } }
     }
@@ -136,6 +135,10 @@ export component ProfilePopover inherits Card {
     callback closed();
 
     width: 300px;
+    // D5: overlay depth — blur 24, y 8, 25% black.
+    drop-shadow-blur: Theme.shadow-blur;
+    drop-shadow-offset-y: Theme.shadow-offset-y;
+    drop-shadow-color: Theme.shadow-color;
     // B5 (PC-test Bug 5): an explicit content height — a height-less
     // Card parented by the window stretches to the window height
     // (gate-measured 580 px), so the popover used to render as a
@@ -153,9 +156,9 @@ export component ProfilePopover inherits Card {
         HorizontalLayout {
             Text { text: "Profiles"; font-size: 12.5px; font-weight: 600; color: Theme.text; }
             Rectangle { horizontal-stretch: 1; }
-            if unsaved : Text { text: "● Unsaved changes"; font-size: 11.5px; font-weight: 600; color: Theme.warn; }
+            if unsaved : Text { text: "● Unsaved changes"; font-size: 12px; font-weight: 600; color: Theme.warn; }
         }
-        Text { text: "Presets"; font-size: 10.5px; font-weight: 600; color: Theme.faint; }
+        Text { text: "Presets"; font-size: 12px; font-weight: 600; color: Theme.faint; }
         VerticalLayout {
             spacing: 2px;
             for p[i] in presets : ProfileRowItem {
@@ -169,7 +172,7 @@ export component ProfilePopover inherits Card {
                 use-clicked => { use-preset(i); }
             }
         }
-        Text { text: "My profiles"; font-size: 10.5px; font-weight: 600; color: Theme.faint; }
+        Text { text: "My profiles"; font-size: 12px; font-weight: 600; color: Theme.faint; }
         VerticalLayout {
             spacing: 2px;
             if profiles.length == 0 : Text { text: "No profiles yet — press New to create one."; font-size: 12px; color: Theme.faint; wrap: word-wrap; }
@@ -235,7 +238,7 @@ export component ProfilePopover inherits Card {
             }
         }
         Btn { label: "Link to game"; disabled: busy-kind == 8; clicked => { link-selected(selected); } }
-        Text { text: "Presets are read-only — duplicate one to edit it."; font-size: 11.5px; color: Theme.faint; wrap: word-wrap; }
+        Text { text: "Presets are read-only — duplicate one to edit it."; font-size: 12px; color: Theme.faint; wrap: word-wrap; }
         // Save / Discard prompt (§8.4): switching with unsaved changes
         if show-unsaved-prompt : Rectangle {
             border-radius: 8px;

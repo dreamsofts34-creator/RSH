@@ -47,21 +47,30 @@ component StepRow inherits HorizontalLayout {
         border-width: 2px;
         border-color: done ? transparent : now ? Theme.accent : Theme.ring-line;
         background: done ? Theme.check-bg : now ? Theme.accent : transparent;
-        Text {
+        // D12: the done tick is an SVG, not the "✓" text glyph.
+        if done : Image {
+            x: 6px;
+            y: 6px;
+            width: 14px;
+            height: 14px;
+            source: @image-url("../../assets/icons/check.svg");
+            colorize: Theme.ok;
+        }
+        if !done : Text {
             width: 100%;
             height: 100%;
             horizontal-alignment: center;
             vertical-alignment: center;
-            text: done ? "✓" : "" + num;
+            text: "" + num;
             font-size: 12px;
             font-weight: 700;
-            color: done ? Theme.ok : now ? #ffffff : Theme.mute;
+            color: now ? #ffffff : Theme.mute;
         }
     }
     VerticalLayout {
         spacing: 0px;
         Text { text: label; font-size: 13px; font-weight: 500; color: now ? Theme.text : Theme.mute; }
-        Text { text: sub; font-size: 11.5px; color: Theme.faint; }
+        Text { text: sub; font-size: 12px; color: Theme.faint; }
     }
 }
 
@@ -227,7 +236,7 @@ export component SetupWizard inherits Rectangle {
             padding-left: 36px;
             padding-right: 36px;
             spacing: 0px;
-            Text { text: "Step " + (step + 1) + " of 4"; font-size: 11.5px; font-weight: 700; color: Theme.accent-text; }
+            Text { text: "Step " + (step + 1) + " of 4"; font-size: 12px; font-weight: 700; color: Theme.accent-text; }
             // UI-UX polish (a): preview `h2` is margin 6px 0 4px —
             // eyebrow-to-title 6px, title-to-lead 4px (was 0/0).
             Rectangle { height: 6px; }
@@ -327,7 +336,8 @@ export component SetupWizard inherits Rectangle {
                         // known, else indeterminate + elapsed time.
                         Text { vertical-alignment: center; text: !daemon-live ? "Disconnected — status unknown" : vjoy-installed ? "Installed" + (vjoy-version == "" ? "" : " · " + vjoy-version) : vjoy-installing ? (vjoy-progress >= 0 ? "Installing… " + vjoy-progress + "%" : "Installing…" + (vjoy-elapsed == "" ? "" : " " + vjoy-elapsed)) : "Not installed — games need a controller driver"; font-size: 12.5px; color: vjoy-installed ? Theme.ok : Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        if vjoy-installed : Text { vertical-alignment: center; text: "✓"; font-size: 16px; font-weight: 700; color: Theme.ok; }
+                        // D12: SVG tick, not the "✓" text glyph.
+                        if vjoy-installed : Image { width: 16px; height: 16px; source: @image-url("../../assets/icons/check.svg"); colorize: Theme.ok; }
                         if !vjoy-installed && !vjoy-installing : Btn { label: "Install vJoy"; primary: true; disabled: busy-kind == 14; clicked => { install-vjoy(); } }
                     }
                 }
@@ -354,7 +364,7 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "HIDMaestro"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: "Needs admin permission when first used."; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: vjoy-fallback ? "Selected ✓" : "Use HIDMaestro instead"; primary: !vjoy-fallback; disabled: busy-kind == 14; clicked => { use-hidmaestro(); } }
+                        Btn { label: vjoy-fallback ? "Selected" : "Use HIDMaestro instead"; primary: !vjoy-fallback; disabled: busy-kind == 14; clicked => { use-hidmaestro(); } }
                     }
                 }
                 if vjoy-fallback : Text { text: "HIDMaestro selected — RSH will ask for admin permission on start."; font-size: 12.5px; color: Theme.mute; wrap: word-wrap; }
@@ -380,7 +390,7 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "Centre"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: centre-done ? "Centre set" : "Hold the wheel straight, then set the centre"; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: centre-done ? "Set ✓" : "Set centre"; primary: !centre-done; disabled: !calibration-available || busy-kind == 10; clicked => { calibrate-action("centre"); } }
+                        Btn { label: centre-done ? "Set" : "Set centre"; primary: !centre-done; disabled: !calibration-available || busy-kind == 10; clicked => { calibrate-action("centre"); } }
                     }
                 }
                 Rectangle {
@@ -398,7 +408,7 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "Pedals"; font-size: 13.5px; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: pedals-done ? "Pedals set" : "Press each pedal fully, then set"; font-size: 12.5px; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: pedals-done ? "Set ✓" : "Set pedals"; primary: !pedals-done; disabled: !calibration-available || busy-kind == 10; clicked => { calibrate-action("pedals"); } }
+                        Btn { label: pedals-done ? "Set" : "Set pedals"; primary: !pedals-done; disabled: !calibration-available || busy-kind == 10; clicked => { calibrate-action("pedals"); } }
                     }
                 }
                 // D16: pedal graphs live on this step too — the same
