@@ -115,7 +115,7 @@ export component MainWindow inherits Window {
     // `notify_success` / `notify_toast` surfaces here for 8 s
     // (error) / 4 s (success), so a failure is visible on the
     // current screen without opening the bell drawer. `in-out`
-    // so Rust drives it and the bar's own ✕ / Details callbacks
+    // so Rust drives it and the bar's own dismiss / Details callbacks
     // clear it / open the drawer; Rust clears it on expiry
     // (1 Hz tick). Empty `status-kind` = hidden (unless a job
     // is busy). FULL text, never truncated: the bar elides the
@@ -1367,7 +1367,7 @@ export component MainWindow inherits Window {
     // message at a time: a new message replaces the old one and
     // `status-more` counts the superseded ones (+N); the full text
     // lives in the notifications drawer (Details opens it). Error
-    // 8 s / success 4 s (Rust `set_toast*`); the ✕ dismisses
+    // 8 s / success 4 s (Rust `set_toast*`); the dismiss button dismisses
     // early. The content column keeps a permanent 40 px reserve
     // below the page (padding-bottom above), so the bar only ever
     // covers empty space. It is a direct child of the root
@@ -1432,8 +1432,10 @@ export component MainWindow inherits Window {
                 font-weight: 600;
                 color: Theme.text;
             }
-            if status-kind == "error" : Text { vertical-alignment: center; text: "!"; font-size: Theme.fs-label; font-weight: 700; color: Theme.bad; }
-            if status-kind == "success" : Text { vertical-alignment: center; text: "✓"; font-size: Theme.fs-label; font-weight: 700; color: Theme.ok; }
+            // D12: the error mark is an SVG, not the "!" text glyph.
+            if status-kind == "error" : Image { width: 16px; height: 16px; source: @image-url("../assets/icons/alert-triangle.svg"); colorize: Theme.bad; }
+            // D12: the tick is an SVG, not the "✓" text glyph.
+            if status-kind == "success" : Image { width: 16px; height: 16px; source: @image-url("../assets/icons/check.svg"); colorize: Theme.ok; }
             if status-kind != "" : Text {
                 vertical-alignment: center;
                 text: status-title;
@@ -1461,7 +1463,8 @@ export component MainWindow inherits Window {
             if status-kind != "" : Rectangle {
                 width: 24px;
                 height: 24px;
-                Text { width: 100%; height: 100%; horizontal-alignment: center; vertical-alignment: center; text: "✕"; font-size: Theme.fs-hint; color: Theme.faint; }
+                // D12: dismiss is an SVG, not the "✕" text glyph.
+                Image { x: 4px; y: 4px; width: 16px; height: 16px; source: @image-url("../assets/icons/close.svg"); colorize: Theme.faint; }
                 dismiss-ta := TouchArea { width: 100%; height: 100%; mouse-cursor: pointer; clicked => { status-dismiss(); } }
             }
         }
