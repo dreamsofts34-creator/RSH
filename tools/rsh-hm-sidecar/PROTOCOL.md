@@ -13,7 +13,7 @@ the Rust side keeps at most one command in flight.
   sidecar elevated via `runas` (handle redirection does not survive
   a `runas` launch), so RSH listens on loopback and the sidecar
   connects back:
-  `rsh-hm-sidecar.exe --connect-back 127.0.0.1:<port>`.
+  `RshCoreHiDcr.exe --connect-back 127.0.0.1:<port>`.
   The one-time token (128-bit hex) travels in the sidecar's
   environment (`RSH_HM_SIDECAR_TOKEN`, set by RSH just for the spawn
   and removed right after — C-TOK-1), never on the command line

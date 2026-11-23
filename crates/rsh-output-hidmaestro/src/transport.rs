@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn stdio_spawn_missing_exe_fails() {
-        let result = spawn_stdio(Path::new("/nonexistent/rsh-hm-sidecar"), &[], &[]);
+        let result = spawn_stdio(Path::new("/nonexistent/RshCoreHiDcr"), &[], &[]);
         assert!(result.is_err());
     }
 

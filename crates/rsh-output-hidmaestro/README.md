@@ -9,7 +9,7 @@ is interchangeable with the vJoy backend; the selector is G4.
 ## Design
 
 ```
-OutputState (rsh_engine) ──► mapping (this crate) ──► JSON-lines ──► rsh-hm-sidecar.exe ──► HIDMaestro SDK ──► virtual wheel
+OutputState (rsh_engine) ──► mapping (this crate) ──► JSON-lines ──► RshCoreHiDcr.exe ──► HIDMaestro SDK ──► virtual wheel
 ```
 
 - **Sidecar process manager** (`manager.rs`): spawns the sidecar,

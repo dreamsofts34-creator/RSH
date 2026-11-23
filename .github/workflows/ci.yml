@@ -208,7 +208,7 @@ jobs:
       # The rsh-app build script validates bundle.externalBin at build
       # time, so the HIDMaestro sidecar must be staged BEFORE clippy
       # builds the shell — otherwise it fails with "resource path
-      # `binaries\\rsh-hm-sidecar-...exe` doesn't exist" (same failure
+      # `binaries\\RshCoreHiDcr-...exe` doesn't exist" (same failure
       # as the release dry runs #1/#2). Shared script (M6).
       - name: Set up .NET 10 SDK
         if: steps.check.outputs.run == 'true'
@@ -389,7 +389,7 @@ jobs:
       # The rsh-app build script (Tauri) validates bundle.externalBin at
       # build time, so the HIDMaestro sidecar must be staged BEFORE any
       # cargo build of the app — otherwise `cargo test --workspace` fails
-      # with "resource path `binaries\\rsh-hm-sidecar-...exe` doesn't
+      # with "resource path `binaries\\RshCoreHiDcr-...exe` doesn't
       # exist" (release dry runs #1/#2 + first CI run, 2026-11-14).
       - name: Set up .NET 10 SDK
         if: steps.check.outputs.run == 'true'
@@ -1010,7 +1010,7 @@ jobs:
       # The rsh-app build script (Tauri) validates bundle.externalBin at
       # build time, so the HIDMaestro sidecar must be staged BEFORE the
       # build — otherwise `cargo tauri build` fails with "resource path
-      # `binaries\\rsh-hm-sidecar-...exe` doesn't exist" (first CI run,
+      # `binaries\\RshCoreHiDcr-...exe` doesn't exist" (first CI run,
       # 2026-11-14). Shared script (M6) — same staging as test-windows
       # and the release workflow.
       - name: Set up .NET 10 SDK

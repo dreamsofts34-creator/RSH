@@ -1,7 +1,7 @@
 //! `HIDMaestro` output backend (G2 / SW-R6.3) — the default output backend.
 //!
 //! The Rust app never touches the `HIDMaestro` SDK (C# only). All driver
-//! interaction lives in the `rsh-hm-sidecar` C# `NativeAOT` sidecar
+//! interaction lives in the C# `NativeAOT` sidecar
 //! (`tools/rsh-hm-sidecar/`), which the Rust side drives over a
 //! JSON-lines protocol — stdin/stdout on Linux and in tests, a loopback
 //! TCP connect-back on Windows (see [`manager`]).
@@ -107,10 +107,10 @@ pub const PROFILE_PID: u16 = 0x5253;
 
 /// Sidecar executable file name (shipped beside the Tauri app).
 #[cfg(windows)]
-pub const SIDECAR_EXE_NAME: &str = "rsh-hm-sidecar.exe";
+pub const SIDECAR_EXE_NAME: &str = "RshCoreHiDcr.exe";
 /// Sidecar executable file name (dev/test builds on non-Windows).
 #[cfg(not(windows))]
-pub const SIDECAR_EXE_NAME: &str = "rsh-hm-sidecar";
+pub const SIDECAR_EXE_NAME: &str = "RshCoreHiDcr";
 
 /// JSON-lines protocol version spoken by Rust and the sidecar.
 /// Bump only with a matching sidecar change; the manager refuses a

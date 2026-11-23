@@ -9,9 +9,9 @@
 #   2. Extract it, find `HIDMaestro.Core.dll`, verify its SHA-256.
 #   3. `dotnet publish` the sidecar (NativeAOT, win-x64) with the DLL path.
 #   4. Copy the published exe to
-#      `src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe`
+#      `src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe`
 #      (the exact file `tauri-build`'s `copy_binaries` looks for: the
-#      `bundle.externalBin` entry `binaries/rsh-hm-sidecar` plus the
+#      `bundle.externalBin` entry `binaries/RshCoreHiDcr` plus the
 #      Windows target triple plus `.exe`).
 #   5. Copy the verified `HIDMaestro.Core.dll` beside the staged exe
 #      (v2.0.8 retest Bug 1, H1): the sidecar READS this DLL beside
@@ -61,10 +61,10 @@ if (-not $dll) { Write-Error "HIDMaestro.Core.dll not found in the release ZIP."
 $dllHash = (Get-FileHash $dll.FullName -Algorithm SHA256).Hash.ToLower()
 if ($dllHash -ne $DllSha256) { Write-Error "HIDMaestro.Core.dll SHA-256 mismatch: $dllHash"; exit 1 }
 dotnet publish tools/rsh-hm-sidecar/rsh-hm-sidecar.csproj -c Release -r win-x64 -p:PublishAot=true -p:HidMaestroDllPath=$($dll.FullName)
-$exe = "tools/rsh-hm-sidecar/bin/Release/net10.0-windows/win-x64/publish/rsh-hm-sidecar.exe"
+$exe = "tools/rsh-hm-sidecar/bin/Release/net10.0-windows/win-x64/publish/RshCoreHiDcr.exe"
 if (-not (Test-Path $exe)) { Write-Error "Sidecar AOT publish produced no exe at $exe."; exit 1 }
 New-Item -ItemType Directory -Force -Path "src-tauri/binaries" | Out-Null
-Copy-Item $exe "src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe"
+Copy-Item $exe "src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe"
 # v2.0.8 retest Bug 1 (H1): the sidecar READS HIDMaestro.Core.dll
 # beside itself at startup and hashes it (Program.cs CheckDllHash);
 # the installer never shipped the DLL, so the hello verdict was

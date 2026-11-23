@@ -36,7 +36,7 @@ missing.
 
 ```sh
 dotnet build -p:HidMaestroDllPath=/path/to/HIDMaestro.Core.dll
-dotnet bin/Debug/net10.0-windows/rsh-hm-sidecar.dll
+dotnet bin/Debug/net10.0-windows/RshCoreHiDcr.dll
 ```
 
 `verify-linux.sh` does this end-to-end (build + scripted session
@@ -53,7 +53,7 @@ dotnet publish -c Release -r win-x64 -p:PublishAot=true `
   -p:HidMaestroDllPath=C:\path\to\HIDMaestro.Core.dll
 ```
 
-That produces a single `rsh-hm-sidecar.exe` (no .NET runtime
+That produces a single `RshCoreHiDcr.exe` (no .NET runtime
 needed). A self-contained non-AOT publish is the fallback if AOT
 ever breaks:
 
@@ -65,11 +65,11 @@ dotnet publish -c Release -r win-x64 --self-contained true
 
 ```sh
 # stdio (dev / when RSH itself runs elevated)
-rsh-hm-sidecar.exe
+RshCoreHiDcr.exe
 # TCP connect-back (production; RSH listens on loopback first).
 # The token comes from the environment, never argv (C-TOK-1):
 $env:RSH_HM_SIDECAR_TOKEN = "<128-bit hex>"
-rsh-hm-sidecar.exe --connect-back 127.0.0.1:54321
+RshCoreHiDcr.exe --connect-back 127.0.0.1:54321
 ```
 
 > Sandbox note: the TCP connect-back path is **sandbox-blocked**

@@ -24,9 +24,9 @@
 #   rsh-daemon.exe            always-on daemon (engine + transport +
 #                             output + tray + auto profiles)
 #   rsh-ui.exe                Slint main window (spawned from the tray)
-#   rsh-hm-sidecar.exe        HIDMaestro NativeAOT sidecar — MUST sit
+#   RshCoreHiDcr.exe          HIDMaestro NativeAOT sidecar — MUST sit
 #                             beside rsh-daemon.exe: the daemon resolves
-#                             it as <own exe dir>/rsh-hm-sidecar.exe
+#                             it as <own exe dir>/RshCoreHiDcr.exe
 #                             (rsh-output-hidmaestro `resolve_sidecar_path`)
 # Firmware v4.0.2 IS shipped in this release (user orders 2026-11-16
 # ~20:20 + 2026-11-17 ~07:48): BOTH firmware files, built + signed
@@ -428,7 +428,7 @@ jobs:
             return [BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68)
           }
           $bins = @(
-            "src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe",
+            "src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe",
             "target/release/rsh-daemon.exe",
             "target/release/rsh-ui.exe"
           )
@@ -741,8 +741,12 @@ jobs:
             File "..\target\release\rsh-daemon.exe"
             File "..\target\release\rsh-ui.exe"
             ; Sidecar MUST sit beside rsh-daemon.exe: the daemon resolves it
-            ; as <own exe dir>\rsh-hm-sidecar.exe (resolve_sidecar_path).
-            File "/oname=rsh-hm-sidecar.exe" "..\src-tauri\binaries\rsh-hm-sidecar-x86_64-pc-windows-msvc.exe"
+            ; as <own exe dir>\RshCoreHiDcr.exe (resolve_sidecar_path).
+            File "/oname=RshCoreHiDcr.exe" "..\src-tauri\binaries\RshCoreHiDcr-x86_64-pc-windows-msvc.exe"
+            ; Rename cleanup: drop a stale old-name sidecar from a
+            ; <= v2.0.8 install so the old exe never lingers after an
+            ; update (Delete on a locked file fails silently).
+            Delete "$INSTDIR\rsh-hm-sidecar.exe"
             ; HIDMaestro.Core.dll (v2.0.8 retest Bug 1, H1): the
             ; sidecar reads + SHA-256-hashes this DLL beside itself
             ; at startup (Program.cs CheckDllHash) and the Rust side
@@ -872,6 +876,10 @@ jobs:
             Sleep 1000
             nsExec::Exec 'taskkill /F /IM rsh-daemon.exe'
             nsExec::Exec 'taskkill /F /IM RSH.exe'
+            nsExec::Exec 'taskkill /F /IM RshCoreHiDcr.exe'
+            ; Old exe name (<= v2.0.8): an upgrade from an old install
+            ; can leave a running rsh-hm-sidecar.exe behind — kill it
+            ; too so the old file is never locked during uninstall.
             nsExec::Exec 'taskkill /F /IM rsh-hm-sidecar.exe'
             Sleep 1000
             nsExec::Exec 'taskkill /F /IM rsh-ui.exe'
@@ -900,6 +908,9 @@ jobs:
             SetRegView 32
             Delete "$INSTDIR\rsh-daemon.exe"
             Delete "$INSTDIR\rsh-ui.exe"
+            Delete "$INSTDIR\RshCoreHiDcr.exe"
+            ; Old exe name (<= v2.0.8): remove it too on uninstall so
+            ; no stale sidecar survives an upgrade.
             Delete "$INSTDIR\rsh-hm-sidecar.exe"
             Delete "$INSTDIR\HIDMaestro.Core.dll"
             Delete "$INSTDIR\HIDMaestro-LICENSE.txt"
@@ -919,11 +930,14 @@ jobs:
             Sleep 3000
             nsExec::Exec 'taskkill /F /IM rsh-ui.exe'
             nsExec::Exec 'taskkill /F /IM rsh-daemon.exe'
+            nsExec::Exec 'taskkill /F /IM RshCoreHiDcr.exe'
             nsExec::Exec 'taskkill /F /IM rsh-hm-sidecar.exe'
             nsExec::Exec 'taskkill /F /IM RSH.exe'
             Sleep 1000
             Delete "$INSTDIR\rsh-daemon.exe"
             Delete "$INSTDIR\rsh-ui.exe"
+            Delete "$INSTDIR\RshCoreHiDcr.exe"
+            ; Old exe name (<= v2.0.8): remove it too on the retry pass.
             Delete "$INSTDIR\rsh-hm-sidecar.exe"
             Delete "$INSTDIR\HIDMaestro.Core.dll"
             Delete "$INSTDIR\HIDMaestro-LICENSE.txt"
@@ -1039,7 +1053,7 @@ jobs:
           # HIDMaestro.Core.dll beside itself at startup, so the DLL
           # must be installed beside the sidecar — fail closed here
           # when it is missing (same pattern as the LICENSE check).
-          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "rsh-hm-sidecar.exe", "HIDMaestro.Core.dll", "firmware-signed.bin", "HIDMaestro-LICENSE.txt")) {
+          foreach ($exe in @("rsh-daemon.exe", "rsh-ui.exe", "RshCoreHiDcr.exe", "HIDMaestro.Core.dll", "firmware-signed.bin", "HIDMaestro-LICENSE.txt")) {
             if (-not (Test-Path (Join-Path $installDir $exe))) { Write-Error "Smoke test: installed $exe not found in $installDir after silent install."; exit 1 }
           }
           Write-Host "Installed to $installDir — all three binaries + HIDMaestro DLL + bundled firmware image + HIDMaestro LICENSE present."
@@ -1106,7 +1120,7 @@ jobs:
           Write-Host "Smoke test PASS: update path — data kept, version $version, daemon restarted, --check exit 0."
           # The sidecar is a separate process the uninstaller also
           # kills — stop it here too so it cannot hold its exe open.
-          taskkill /F /IM rsh-hm-sidecar.exe | Out-Null
+          taskkill /F /IM RshCoreHiDcr.exe | Out-Null
           $uninstaller = Join-Path $installDir "uninstall.exe"
           if (-not (Test-Path $uninstaller)) { Write-Error "Smoke test: uninstaller not found at $uninstaller."; exit 1 }
           Start-WaitOrFail $uninstaller @("/S") 120 "silent uninstall"

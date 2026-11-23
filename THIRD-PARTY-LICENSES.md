@@ -122,8 +122,8 @@ allow-list verbatim):**
 
 | Component | Version | License | Notes |
 |---|---|---|---|
-| `rsh-hm-sidecar` (RSH) | 1.0.0 | MIT | C# NativeAOT exe, `tools/rsh-hm-sidecar/`; self-contained, no .NET runtime ships with it |
-| `HIDMaestro.Core.dll` | 2.1.0 | MIT | Pinned SDK DLL, SHA-256 `f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5`. Fetched at build time, **never committed**; the sidecar re-verifies the hash at startup; ships in the installer beside `rsh-hm-sidecar.exe` (v2.0.8 retest Bug 1 — the switch failed without it) |
+| `RshCoreHiDcr` (RSH) | 1.0.0 | MIT | C# NativeAOT exe, `tools/rsh-hm-sidecar/`; self-contained, no .NET runtime ships with it |
+| `HIDMaestro.Core.dll` | 2.1.0 | MIT | Pinned SDK DLL, SHA-256 `f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5`. Fetched at build time, **never committed**; the sidecar re-verifies the hash at startup; ships in the installer beside `RshCoreHiDcr.exe` (v2.0.8 retest Bug 1 — the switch failed without it) |
 | HIDMaestro UMDF2 driver | 2.1.0 | MIT | Installed by the sidecar's `install-driver` step (admin) from the pinned release ZIP, SHA-256 `7fe349f163864b8dfc36117af260d51bac94a2263b6cdfa719cb364a808397b4` |
 
 The sidecar has **no NuGet packages** (only the DLL reference above), so its SBOM is
@@ -131,7 +131,7 @@ hand-written; verify the pins at release time against the sidecar
 staging script (`tools/ci/stage-sidecar.ps1`).
 
 The HIDMaestro MIT notice ships in the installer as `HIDMaestro-LICENSE.txt`
-beside `rsh-hm-sidecar.exe` (GitHub issue #2): the file is the LICENSE from
+beside `RshCoreHiDcr.exe` (GitHub issue #2): the file is the LICENSE from
 the pinned v2.1.0 release ZIP, committed verbatim at
 `tools/rsh-hm-sidecar/HIDMaestro-LICENSE.txt` (SHA-256
 `fba8db4fff568ac6a91e4c3100d1be32d83dae713d924eecb291182ffc11d885`).

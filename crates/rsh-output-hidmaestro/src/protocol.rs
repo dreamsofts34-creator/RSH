@@ -1,4 +1,4 @@
-//! JSON-lines protocol between the Rust app and `rsh-hm-sidecar`.
+//! JSON-lines protocol between the Rust app and the C# sidecar.
 //!
 //! One command per line on stdin (or the loopback TCP stream on
 //! Windows), one reply per line back. The sidecar processes commands

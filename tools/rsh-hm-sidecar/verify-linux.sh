@@ -24,7 +24,7 @@ fi
 
 "$DOTNET" build -c Release -p:HidMaestroDllPath="$DLL" --nologo -v q
 
-DLL_OUT="bin/Release/net10.0-windows/rsh-hm-sidecar.dll"
+DLL_OUT="bin/Release/net10.0-windows/RshCoreHiDcr.dll"
 if [ ! -f "$DLL_OUT" ]; then
   echo "build output missing: $DLL_OUT" >&2
   exit 1

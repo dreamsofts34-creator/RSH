@@ -165,7 +165,7 @@ fn create_refused_is_one_failure_not_fallback_yet() {
 
 #[test]
 fn missing_sidecar_file_is_not_found() {
-    let mut cfg = SidecarConfig::with_path(PathBuf::from("/nonexistent/rsh-hm-sidecar"));
+    let mut cfg = SidecarConfig::with_path(PathBuf::from("/nonexistent/RshCoreHiDcr"));
     cfg.spawn_timeout = Duration::from_secs(2);
     let mut m = SidecarManager::new(cfg);
     let err = m.connect().unwrap_err();
@@ -468,7 +468,7 @@ fn stderr_ring_is_available() {
 /// sidecar + driver are Windows-only in production).
 ///
 /// Run it with:
-///   HM_REAL_SIDECAR_DLL=tools/rsh-hm-sidecar/bin/Release/net10.0-windows/rsh-hm-sidecar.dll \
+///   HM_REAL_SIDECAR_DLL=tools/rsh-hm-sidecar/bin/Release/net10.0-windows/RshCoreHiDcr.dll \
 ///     cargo test -p `rsh-output-hidmaestro` `real_sidecar_stdio_smoke`
 #[test]
 fn real_sidecar_stdio_smoke() {

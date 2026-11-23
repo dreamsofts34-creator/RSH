@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
-  <assemblyIdentity version="1.0.0.0" name="rsh-hm-sidecar" />
+  <assemblyIdentity version="1.0.0.0" name="RshCoreHiDcr" />
   <!-- The HIDMaestro driver install / device create path needs an
        elevated helper for the WHOLE session (R-1): the sidecar runs
        elevated, so Windows shows a UAC prompt on every RSH launch

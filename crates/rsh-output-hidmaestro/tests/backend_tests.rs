@@ -157,7 +157,7 @@ fn try_connect_not_admin_reports_uac() {
 
 #[test]
 fn try_connect_sidecar_missing() {
-    let mut cfg = HidMaestroConfig::with_sidecar_path(PathBuf::from("/nonexistent/rsh-hm-sidecar"));
+    let mut cfg = HidMaestroConfig::with_sidecar_path(PathBuf::from("/nonexistent/RshCoreHiDcr"));
     cfg.sidecar.spawn_timeout = Duration::from_secs(2);
     let mut b = HidMaestroOutput::with_config(cfg);
     let err = b.try_connect().unwrap_err();
@@ -312,14 +312,14 @@ fn status_carries_uac_note_and_elevation_flag() {
 
 #[test]
 fn trait_error_preserves_hidmaestro_message() {
-    let mut cfg = HidMaestroConfig::with_sidecar_path(PathBuf::from("/nonexistent/rsh-hm-sidecar"));
+    let mut cfg = HidMaestroConfig::with_sidecar_path(PathBuf::from("/nonexistent/RshCoreHiDcr"));
     cfg.sidecar.spawn_timeout = Duration::from_secs(2);
     let mut b = HidMaestroOutput::with_config(cfg);
     let err = b.try_connect().unwrap_err();
     match err {
         VJoyError::DriverNotFound(msg) => {
             assert!(
-                msg.contains("rsh-hm-sidecar"),
+                msg.contains("RshCoreHiDcr"),
                 "message names the sidecar: {msg}"
             );
         }

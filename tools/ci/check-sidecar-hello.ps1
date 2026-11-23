@@ -22,7 +22,7 @@
 # Requires: PowerShell 7+ (Start-Process redirection), Windows.
 [CmdletBinding()]
 param(
-  [string]$Exe = "src-tauri/binaries/rsh-hm-sidecar-x86_64-pc-windows-msvc.exe",
+  [string]$Exe = "src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe",
   [string]$ExpectedDllSha256 = "f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5",
   [string]$ExpectedSdk = "2.1.0",
   [int]$TimeoutSec = 60

@@ -21,7 +21,7 @@
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>rsh-hm-sidecar</AssemblyName>
+    <AssemblyName>RshCoreHiDcr</AssemblyName>
     <RootNamespace>RshHmSidecar</RootNamespace>
     <!-- The sidecar runs elevated (requireAdministrator manifest), so it
          never needs to be self-contained-trimmed beyond the AOT publish. -->
