@@ -1,10 +1,97 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.7 · firmware v4.0.4 · protocol v2.2 (frozen)**.
+**app v2.0.8 · firmware v4.0.4 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.8] — 2026-11-23
+
+App-only release (firmware stays v4.0.4, protocol v2.2 frozen — no
+firmware change in this range). Two things land together: the 8 bugs
+found on the user's own PC test of v2.0.7, and per-module tuning
+features for every module.
+
+**PC-test bug fixes (user reported 2026-11-22, all 8 fixed).**
+
+- **False "connected" toast (Bug 1).** The "RSH connected / Live data
+  is back" toast fired when the UI↔daemon feed resumed, even with the
+  board offline. It now fires only when the board is actually
+  connected, and says "Wheel connected".
+- **Huge toast (Bug 2).** A height-less Slint rectangle stretched to
+  the full window height on Windows. The toast now has an explicit
+  height (~53 px short / ~69 px long) with title/body length caps.
+- **Clipped "Wheel not found" banner (Bug 3).** The banner text
+  wrapped and its second line was cut off on Windows (Inter font).
+  Both Overview texts are shortened to fit one line at window width,
+  with regression guards. Final proof needs the user's PC (the clip
+  never reproduced on Linux).
+- **Controller switch stuck (Bug 4).** Switching vJoy → HIDMaestro
+  stuck on "Waiting for admin permission…" even after UAC was
+  granted: the IPC error reason was dropped in two places and the
+  state error never matched `HID_NOT_ADMIN`. The reason now survives
+  end to end, the time-based relabel is gone (the label honestly
+  says "Switching controller…"), and a failed switch shows one clear
+  error.
+- **Big warning popups (Bug 5).** The same height defect made every
+  overlay a full window. All overlays now have explicit content
+  heights; all 109 notify call sites go through the one small toast.
+- **Add game (Bug 6).** The manual text form is gone: Add now opens
+  the native Windows Explorer picker (`IFileOpenDialog`, .exe/.lnk
+  filter) and the name auto-fills from the file.
+- **Steering Advanced (Bug 7).** The useless read-only rows (Centre
+  mV, Raw live, curve exponent box, min/max note) are removed.
+  Advanced is now real tuning: Invert steering toggle, Steering lock
+  270/360/540/720/900°, Smoothing 0–100% (default 30%), and the Basic
+  deadzone cap widened to 30%. No second Sensitivity slider — the
+  Basic Response curve already is it.
+- **Wrong-backend switch (Bug 8).** A failed HIDMaestro activation
+  silently fell back to vJoy and the UI reported success ("now
+  vJoy"). An explicit switch now never falls back: a mismatch
+  between requested and active backend is a failure with a clear
+  error, and the Settings radio resyncs to the live backend.
+
+**UI polish.** Steering Advanced Invert row centre-aligned, row gaps
+matched to the Feel card, "Recommended: vJoy" spacer, GameDialog
+file row centre-aligned. No design change — the approved preview is
+still the source of truth.
+
+**HIDMaestro LICENSE (GitHub issue #2).** The installer now ships
+`HIDMaestro-LICENSE.txt` beside `rsh-hm-sidecar.exe`, and the release
+smoke test fails closed if it is missing.
+
+**Per-module tuning — every module gets its own settings**
+(researched against Fanatec / Moza / Logitech G HUB / SimHub /
+iRacing / ACC; nothing is copy-pasted between modules).
+
+- **Steering:** Capture full lock (left/right buttons), left/right
+  lock balance ±20%, centre trim ±5%.
+- **Brake:** Brake force (BRF) 50–100% (new `saturation` knob, so
+  pedal calibration is untouched), bite point, progressive curve
+  (default 1.3), initial bite speed.
+- **Accelerator:** Tip-in / lift-off ramps, throttle curve,
+  saturation, combined-pedals toggle (one axis, for old games).
+- **Clutch:** Bite point (kept), engagement width / slip zone
+  5–40% (new `bite_width`), release speed, curve.
+- **Handbrake:** Latch mode, auto-release on throttle, grab speed.
+- **Shifter:** Sensitivity slider wired up (was disabled; writes
+  the firmware config blob, debounce 20–5 ms) plus shift lockout
+  0–200 ms.
+- **Buttons:** Debounce 0–50 ms, long-press action, double-press
+  action.
+- **Encoders:** Pulse length 20–200 ms (games polling slowly no
+  longer miss steps), steps per click 1/2/4 (default 4),
+  acceleration, per-knob direction invert.
+- **LED:** Blink / chase speed 100–5000 ms, custom colour picker.
+- **Horn:** Minimum honk duration 100–1000 ms, Momentary / Latch
+  mode (default Momentary).
+
+Skipped on the user's order: LED RPM / shift-light and per-LED
+zones (they need a game-telemetry subsystem that does not exist
+yet). Also fixed along the way: the `gate-already-running-race`
+flake (pid-file write is now awaited before a claim is reclaimed)
+and a clippy `struct_excessive_bools` in the engine pipeline.
 
 ## [2.0.7] — 2026-11-22
 
