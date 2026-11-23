@@ -1,8 +1,13 @@
 // RSH v2.0 — Add/edit game dialog (manual games, no auto-scan).
-// B19: the dialog IS the P1 shared Modal — centred 420px card, 40%
-// scrim, shadow, scrim-click + Esc close. The P2 hand-rolled centred
-// Card + separate backdrop is gone; Modal owns the shell now.
-// Content only below the title (CardBody shows `title`).
+// The dialog IS the shared Modal (P1): centred 420px card, 40%
+// scrim, overlay shadow — P2's hand-rolled centred Card + shadow
+// + separate backdrop duplicated that pattern and is gone (P2
+// merge). The scrim closes it on outside click, Cancel / Save /
+// Esc close it too (Esc is owned by the root keyboard worker);
+// it does NOT own the Window. Reuses the profile popover's
+// patterns: Rust-owned props, TextInput box with two-way binding
+// for the name, Save disabled while a field is empty, Enter in
+// the name field saves when both fields are filled.
 // The exe path is NOT typed: Browse opens the native Windows file
 // picker (Rust `game-dialog-browse`, PC-test Bug 6) and the picked
 // path shows read-only here, elided when long; the name auto-fills
@@ -12,9 +17,10 @@
 // back to "No profile".
 
 import { Theme } from "../tokens.slint";
-import { Btn, Modal } from "../components.slint";
+import { Modal, Btn } from "../components.slint";
 
 export component GameDialog inherits Modal {
+    // Modal owns `title` / `closed()`; the default title is set here.
     title: "Add game";
     in-out property <string> name: "";
     in-out property <string> exe: "";
@@ -23,31 +29,16 @@ export component GameDialog inherits Modal {
     callback cancel();
     callback browse();
     callback cycle-profile();
+    // Modal's scrim / Esc close the dialog via `closed()`; that is
+    // the same path as Cancel.
     closed => { cancel(); }
-    Text { text: "Name"; font-size: Theme.fs-hint; color: Theme.mute; }
-    Rectangle {
-        horizontal-stretch: 1;
-        height: Theme.control-height;
-        border-radius: 7px;
-        border-width: 1px;
-        border-color: Theme.line;
-        background: Theme.bg;
-        TextInput {
-            x: 10px;
-            width: parent.width - 20px;
-            height: 100%;
-            vertical-alignment: center;
-            text <=> name;
-            font-size: Theme.fs-hint;
-            font-weight: 500;
-            color: Theme.text;
-            selection-background-color: Theme.accent;
-            accepted => { if (name != "" && exe != "") { save(name, exe); } }
-        }
-    }
-    Text { text: "Game file (.exe or shortcut)"; font-size: Theme.fs-hint; color: Theme.mute; }
-    HorizontalLayout {
-        spacing: 8px;
+    // CardBody (inside Modal) owns the title + 16px padding; this
+    // layout is the body content. The card height comes from the
+    // body's preferred height (Modal) — no explicit height here, so
+    // the Bug-5 full-height-panel defect cannot recur.
+    VerticalLayout {
+        spacing: 10px;
+        Text { text: "Name"; font-size: Theme.fs-label; color: Theme.mute; }
         Rectangle {
             horizontal-stretch: 1;
             height: Theme.control-height;
@@ -55,30 +46,54 @@ export component GameDialog inherits Modal {
             border-width: 1px;
             border-color: Theme.line;
             background: Theme.bg;
-            Text {
+            TextInput {
                 x: 10px;
                 width: parent.width - 20px;
                 height: 100%;
                 vertical-alignment: center;
-                text: exe == "" ? "No file chosen" : exe;
+                text <=> name;
                 font-size: Theme.fs-hint;
                 font-weight: 500;
-                color: exe == "" ? Theme.faint : Theme.text;
-                overflow: elide;
+                color: Theme.text;
+                selection-background-color: Theme.accent;
+                accepted => { if (name != "" && exe != "") { save(name, exe); } }
             }
         }
-        Btn { label: "Browse…"; clicked => { browse(); } }
+        Text { text: "Game file (.exe or shortcut)"; font-size: Theme.fs-label; color: Theme.mute; }
+        HorizontalLayout {
+            spacing: 8px;
+            Rectangle {
+                horizontal-stretch: 1;
+                height: Theme.control-height;
+                border-radius: 7px;
+                border-width: 1px;
+                border-color: Theme.line;
+                background: Theme.bg;
+                Text {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    height: 100%;
+                    vertical-alignment: center;
+                    text: exe == "" ? "No file chosen" : exe;
+                    font-size: Theme.fs-hint;
+                    font-weight: 500;
+                    color: exe == "" ? Theme.faint : Theme.text;
+                    overflow: elide;
+                }
+            }
+            Btn { label: "Browse…"; icon: @image-url("../../assets/icons/folder.svg"); has-icon: true; clicked => { browse(); } }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Text { vertical-alignment: center; text: "Profile: " + profile-name; font-size: Theme.fs-label; color: Theme.text; }
+            Rectangle { horizontal-stretch: 1; }
+            Btn { label: "Change"; clicked => { cycle-profile(); } }
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            Btn { label: "Save"; primary: true; icon: @image-url("../../assets/icons/save.svg"); has-icon: true; disabled: name == "" || exe == ""; clicked => { save(name, exe); } }
+            Btn { label: "Cancel"; clicked => { cancel(); } }
+        }
+        Text { text: "RSH switches profile automatically when this game starts."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
     }
-    HorizontalLayout {
-        spacing: 8px;
-        Text { vertical-alignment: center; text: "Profile: " + profile-name; font-size: Theme.fs-hint; color: Theme.text; }
-        Rectangle { horizontal-stretch: 1; }
-        Btn { label: "Change"; clicked => { cycle-profile(); } }
-    }
-    HorizontalLayout {
-        spacing: 6px;
-        Btn { label: "Save"; primary: true; disabled: name == "" || exe == ""; clicked => { save(name, exe); } }
-        Btn { label: "Cancel"; clicked => { cancel(); } }
-    }
-    Text { text: "RSH switches profile automatically when this game starts."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
 }

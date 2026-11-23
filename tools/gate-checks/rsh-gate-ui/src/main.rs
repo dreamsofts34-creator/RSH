@@ -1896,7 +1896,10 @@ fn ui_overview_banner_real() -> Outcome {
 /// This check proves the fix: the confirm dialog's structure (as a
 /// replica — the real one is inline in `MainWindow`) plus the real
 /// `GameDialog` and the real `ProfilePopover`, all with their
-/// height bound to their content layout.
+/// height bound to their content layout. (`GameDialog` is the shared
+/// `Modal` now, so the probe measures its 420px card, not the
+/// full-window Modal bounds — same Bug-5 intent: the visible popup
+/// is a small card, never a full-height panel.)
 /// Acceptance: every surface renders at content height, far below
 /// the 580 px window height — a popup is a small card, never a
 /// full-height panel.
