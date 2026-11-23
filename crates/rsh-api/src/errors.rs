@@ -150,7 +150,7 @@ impl ConnectionError {
                 "Wheel not found — join the RSH-XXXX Wi-Fi network (or plug in the USB cable), then retry."
             }
             Self::Timeout => "The wheel did not answer in time — check the connection and retry.",
-            Self::TransportClosed => "Connection to the wheel dropped — reconnecting.",
+            Self::TransportClosed => "RSH is reconnecting automatically.",
             Self::BindFailed(kind) => kind.hint(),
             Self::BoardMismatch => {
                 "A different wheel answered than the one this session is bound to — check you joined the right RSH-XXXX network, then retry."

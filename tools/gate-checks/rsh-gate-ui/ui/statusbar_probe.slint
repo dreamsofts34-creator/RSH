@@ -1,0 +1,41 @@
+// Probe window hosting the REAL MainWindow status bar (B01):
+// the gate renders each variant and measures the bar's pixel
+// bbox in the bottom 40 px strip — the rendered geometry of the
+// production bar. This is the regression guard for B01: the bar
+// is exactly 40 px tall, spans the full window width, and never
+// covers content (it sits over the permanent 40 px reserve).
+// Two properties the probe proves that the old toast could not:
+// the bar stays 40 px tall for a 200-char UNCAPPED error body
+// (the text elides to one line), and it is absent when idle.
+// Variants are subclasses because the interpreter cannot set
+// inherited properties on an instance.
+import { MainWindow } from "../../../crates/rsh-ui/ui/main.slint";
+
+// Long error body, UNCAPPED (B01: set_toast no longer truncates
+// at 120 chars — the bar carries the full text, the drawer holds
+// the same text). If the bar grew past 40 px for this body, the
+// error bar would cover page content again.
+export component GateMainStatusError inherits MainWindow {
+    status-kind: "error";
+    status-title: "Couldn't complete that";
+    status-text: "Couldn't reach the wheel — the connection timed out after 10 s. Check the RSH-XXXX Wi-Fi is joined (or the USB cable is plugged in), then press Reconnect. If it still fails, restart RSH and try again.";
+}
+
+// Short success body.
+export component GateMainStatusSuccess inherits MainWindow {
+    status-kind: "success";
+    status-title: "RSH connected";
+    status-text: "Live data is back.";
+}
+
+// Busy only: the spinner dot (Theme.accent) must paint in the
+// strip, and no err-bg / ok-bg may (no message showing).
+export component GateMainStatusBusy inherits MainWindow {
+    busy: true;
+    busy-label: "Switching controller…";
+}
+
+// Idle: no bar at all — the bottom strip must carry no err-bg,
+// ok-bg or accent pixels (the reserve is empty space).
+export component GateMainStatusIdle inherits MainWindow {
+}

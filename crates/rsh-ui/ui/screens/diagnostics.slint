@@ -144,6 +144,7 @@ export component DiagnosticsDrawer inherits FocusScope {
             Rectangle { height: 1px; background: Theme.line; }
             ScrollView {
                 vertical-stretch: 1;
+                viewport-width: self.visible-width;
                 VerticalLayout {
                     padding-top: 14px;
                     padding-bottom: 14px;

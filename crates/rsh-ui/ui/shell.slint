@@ -25,9 +25,9 @@ export component Sidebar inherits Rectangle {
         padding-top: 14px;
         padding-left: 10px;
         padding-right: 10px;
-        // UI-UX polish (c): the busy strip floats over the bottom
-        // 38px of the window, so the sidebar keeps 38px of empty
-        // padding below the About link — otherwise the strip would
+        // UI-UX polish (c): the status bar sits over the bottom
+        // 40px of the window, so the sidebar keeps 52px of empty
+        // padding below the About link — otherwise the bar would
         // cover the link (and the StatusCard's bottom edge) while a
         // job runs. The window never resizes; this is the reserve.
         padding-bottom: 52px;
