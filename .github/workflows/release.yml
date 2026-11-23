@@ -69,6 +69,11 @@
 #      with `makensis`. The installer:
 #        * requests admin ONCE at install time (`RequestExecutionLevel
 #          admin`) — never at login;
+#        * modern MUI2 wizard (welcome / license / directory /
+#          install / finish + RSH branding + a "Run RSH" finish
+#          checkbox that launches the UI via ExecShell) — silent
+#          (/S) installs skip all pages, so the headless smoke
+#          test is structurally unaffected;
 #        * creates the program-scoped inbound UDP firewall rule for
 #          rsh-daemon.exe (Private + Public, LOGIC-FIX-PLAN §4.3 /
 #          C-10) via `netsh` (hidden, `nsExec`), and removes it on
@@ -318,6 +323,11 @@ jobs:
           $makensis = Get-Command makensis -ErrorAction SilentlyContinue
           if (-not $makensis) { Write-Error "makensis not found on the runner — the NSIS installer cannot be built. Install NSIS (https://nsis.sourceforge.io/) on the runner image."; exit 1 }
           makensis -VERSION
+          # E2 (installer-modern): the pin above is only a request —
+          # prove the installed makensis IS the pinned 3.13.x,
+          # fail-closed, instead of trusting the choco install.
+          $ver = (makensis -VERSION) -join " "
+          if ($ver -notmatch "^v3\.13") { Write-Error "makensis version is '$ver', expected v3.13.x (NSIS pinned to 3.13.0, R3-12)."; exit 1 }
 
       # ---- Sidecar FIRST: fetch pinned HIDMaestro, verify hashes, AOT publish ----
       # The v2.0 installer bundles the staged sidecar exe beside
@@ -622,6 +632,46 @@ jobs:
           !include "StrFunc.nsh"
           ${Using:StrFunc} StrStr
           !define VERSION "${VERSION}"
+          ; ---- Modern UI 2 (MUI2) -------------------------------------
+          ; MUI2 wizard (welcome / license / directory / install /
+          ; finish) + branding. Silent installs (/S) skip ALL pages,
+          ; so the headless smoke test is structurally unaffected.
+          ; License file is the repo-root MIT LICENSE — makensis
+          ; fails closed if it is missing. Bitmaps are the RSH brand
+          ; assets in src-tauri/icons/ (header 150x57, sidebar
+          ; 164x314 — the exact MUI sizes; icon.ico is the app icon).
+          !include "MUI2.nsh"
+          !define MUI_ABORTWARNING
+          !define MUI_ICON "..\src-tauri\icons\icon.ico"
+          !define MUI_UNICON "..\src-tauri\icons\icon.ico"
+          !define MUI_HEADERIMAGE
+          !define MUI_HEADERIMAGE_BITMAP "..\src-tauri\icons\header.bmp"
+          !define MUI_WELCOMEFINISHPAGE_BITMAP "..\src-tauri\icons\sidebar.bmp"
+          ; Finish page offers "Run RSH" (checked by default): the
+          ; checkbox runs LaunchRSH below. The UI self-spawns the
+          ; daemon on first launch — the installer never starts the
+          ; daemon itself on a fresh install.
+          !define MUI_FINISHPAGE_RUN
+          !define MUI_FINISHPAGE_RUN_TEXT "Run RSH"
+          !define MUI_FINISHPAGE_RUN_FUNCTION "LaunchRSH"
+          BrandingText "RSH ${VERSION}"
+          !insertmacro MUI_PAGE_WELCOME
+          !insertmacro MUI_PAGE_LICENSE "..\LICENSE"
+          !insertmacro MUI_PAGE_DIRECTORY
+          !insertmacro MUI_PAGE_INSTFILES
+          !insertmacro MUI_PAGE_FINISH
+          !insertmacro MUI_UNPAGE_CONFIRM
+          !insertmacro MUI_UNPAGE_INSTFILES
+          !insertmacro MUI_UNPAGE_FINISH
+          !insertmacro MUI_LANGUAGE "English"
+          ; ExecShell, NOT Exec (DS-70, same lesson as the update
+          ; daemon restart below): NSIS Exec inherits the
+          ; installer's stdio pipes to the forever-running UI, so
+          ; the installer would never exit. ShellExecuteEx gives
+          ; the UI a fresh handle table.
+          Function LaunchRSH
+            ExecShell "open" "$INSTDIR\rsh-ui.exe"
+          FunctionEnd
           ; Smart-installer state: set by .onInit (detection) and read
           ; by the install section (daemon restart after an update).
           Var UpdateMode
@@ -801,12 +851,18 @@ jobs:
             ; deliberately stays 32-bit — see the note in .onInit)
             ; is unaffected. The uninstaller removes these keys
             ; (the dumps themselves are kept, like %APPDATA%\RSH).
-            CreateDirectory "$PROGRAMDATA\RSH\dumps"
+            ; $COMMONPROGRAMDATA, NOT $PROGRAMDATA: NSIS has no
+            ; $PROGRAMDATA constant (manual §4.2.3 lists
+            ; $COMMONPROGRAMDATA as the all-users app-data alias) —
+            ; the unknown name expands to empty, so the old path was
+            ; "\RSH\dumps" and WER dumps went nowhere. Found by the
+            ; makensis warning-6000 check during installer-modern.
+            CreateDirectory "$COMMONPROGRAMDATA\RSH\dumps"
             SetRegView 64
-            WriteRegStr HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-daemon.exe" "DumpFolder" "$PROGRAMDATA\RSH\dumps"
+            WriteRegStr HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-daemon.exe" "DumpFolder" "$COMMONPROGRAMDATA\RSH\dumps"
             WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-daemon.exe" "DumpType" 1
             WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-daemon.exe" "DumpCount" 5
-            WriteRegStr HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe" "DumpFolder" "$PROGRAMDATA\RSH\dumps"
+            WriteRegStr HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe" "DumpFolder" "$COMMONPROGRAMDATA\RSH\dumps"
             WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe" "DumpType" 1
             WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe" "DumpCount" 5
             SetRegView 32
