@@ -450,7 +450,7 @@ fn color_row_counts(
 
 /// Bounding box of pixels within `tol` of `color`, restricted to
 /// the rectangle `region` (x0, x1, y0, y1). Used for the real-MainWindow
-/// StatusBar: the window's Overview page contains other ok-bg elements
+/// `StatusBar`: the window's Overview page contains other ok-bg elements
 /// (status pills/bars), so the whole-snapshot bbox of ok-bg spans
 /// the page, not the bar — the bar lives in the bottom 40 px strip,
 /// so the region pins the measurement to it. Returns (`count`,
@@ -1463,39 +1463,46 @@ fn ui_banner_wrap() -> Outcome {
     report.finish()
 }
 
-/// Gate: bottom StatusBar (B01) — the real MainWindow bar, four
+/// Render one `StatusBar` probe variant and return its snapshot
+/// (rgba bytes, width, height).
+fn statusbar_snapshot(component: &str) -> Result<(Vec<u8>, u32, u32), String> {
+    let instance = compile(
+        "tools/gate-checks/rsh-gate-ui/ui/statusbar_probe.slint",
+        component,
+    )?;
+    snapshot(&instance)
+}
+
+/// Gate: bottom `StatusBar` (B01) — the real `MainWindow` bar, four
 /// variants: a 200-char UNCAPPED error body, a short success body,
-/// busy-only, and idle. Acceptance: the error/success bar is
-/// exactly 40 px tall (39 px of bg + the 1 px top line) and spans
-/// the full window width in the bottom strip, whatever the text
-/// length (the text elides to one line); busy paints the spinner
-/// dot (accent) in the strip and no message bg; idle paints
-/// nothing in the strip at all (the reserve is empty space).
-/// Pixel proof on the real `MainWindow`: err-bg (#2E1F26) /
-/// ok-bg (#1B3635) bbox restricted to y 540..580, accent counts
+/// busy-only, and idle. Acceptance: the error bar is exactly 40 px
+/// tall (39 px of bg + the 1 px top line) and spans the full window
+/// width in the bottom strip, whatever the text length (the text
+/// elides to one line); the success bar shows its ok "✓" + ok title
+/// well above the idle baseline; busy paints the spinner dot
+/// (accent) in the strip and no message bg; idle paints nothing in
+/// the strip at all (the reserve is empty space).
+/// Pixel proof on the real `MainWindow`: err-bg (#2E1F26) bbox
+/// restricted to the bottom 40 px strip, ok-foreground (#3DD68C)
+/// counts in the same strip for success vs idle, accent counts
 /// in the same strip for busy vs idle.
 #[allow(clippy::cast_precision_loss)]
 fn ui_statusbar_real_mainwindow() -> Outcome {
     let mut report = Report::new();
     // Idle baseline first: accent pixels already in the strip
     // (page content cut at the fold) would make a busy-only
-    // accent assertion meaningless without a baseline.
+    // accent assertion meaningless without a baseline. Same for
+    // the success bar's ok-coloured glyphs (see below).
     let mut idle_accent = 0_usize;
-    let cases: [(&str, &str, &str); 4] = [
-        ("GateMainStatusIdle", "idle", "idle"),
-        ("GateMainStatusError", "error", "error"),
-        ("GateMainStatusSuccess", "success", "success"),
-        ("GateMainStatusBusy", "busy", "busy"),
+    let mut idle_ok_fg = 0_usize;
+    let cases: [(&str, &str); 4] = [
+        ("GateMainStatusIdle", "idle"),
+        ("GateMainStatusError", "error"),
+        ("GateMainStatusSuccess", "success"),
+        ("GateMainStatusBusy", "busy"),
     ];
-    for (component, kind, label) in cases {
-        let instance = match compile(
-            "tools/gate-checks/rsh-gate-ui/ui/statusbar_probe.slint",
-            component,
-        ) {
-            Ok(instance) => instance,
-            Err(error) => return Outcome::fail(error),
-        };
-        let (rgba, width, height) = match snapshot(&instance) {
+    for (component, kind) in cases {
+        let (rgba, width, height) = match statusbar_snapshot(component) {
             Ok(snap) => snap,
             Err(error) => return Outcome::fail(error),
         };
@@ -1510,12 +1517,19 @@ fn ui_statusbar_real_mainwindow() -> Outcome {
         let strip_bottom = strip.3;
         let (err_count, err_min_x, err_max_x, err_top, err_bottom) =
             count_color_rect(&rgba, width, (0x2e, 0x1f, 0x26), 6, strip);
-        let (ok_count, ok_min_x, ok_max_x, ok_top, ok_bottom) =
-            count_color_rect(&rgba, width, (0x1b, 0x36, 0x35), 6, strip);
+        let (ok_count, _, _, _, _) = count_color_rect(&rgba, width, (0x1b, 0x36, 0x35), 6, strip);
         let (accent_count, _, _, _, _) = count_color_rect(&rgba, width, ACCENT, 12, strip);
+        // Success-bar glyphs: the "✓" icon + title render in
+        // Theme.ok (#3DD68C). (The bar background is Theme.panel
+        // per the §3.1 sketch — ok-bg is the wrong signal: the
+        // only ok-bg pixels a success render shows are the
+        // anti-aliased fringes of those ok glyphs.)
+        let (ok_fg_count, _, _, _, _) =
+            count_color_rect(&rgba, width, (0x3d, 0xd6, 0x8c), 12, strip);
         match kind {
             "idle" => {
                 idle_accent = accent_count;
+                idle_ok_fg = ok_fg_count;
                 report.check(
                     "statusbar-idle-no-bar",
                     err_count == 0 && ok_count == 0,
@@ -1524,27 +1538,47 @@ fn ui_statusbar_real_mainwindow() -> Outcome {
                     ),
                 );
             }
-            "error" | "success" => {
-                let (count, min_x, max_x, top, bottom) = if kind == "error" {
-                    (err_count, err_min_x, err_max_x, err_top, err_bottom)
+            "error" => {
+                let px_height = if err_bottom >= err_top {
+                    err_bottom - err_top + 1
                 } else {
-                    (ok_count, ok_min_x, ok_max_x, ok_top, ok_bottom)
+                    0
                 };
-                let px_height = if bottom >= top { bottom - top + 1 } else { 0 };
                 report.check(
-                    &format!("statusbar-{label}-full-width"),
-                    count > 0 && min_x == 0 && max_x == width as usize - 1,
+                    "statusbar-error-full-width",
+                    err_count > 0 && err_min_x == 0 && err_max_x == width as usize - 1,
                     &format!(
-                        "{label} bar spans x={min_x}..{max_x} (want 0..{}), {count} px",
+                        "error bar spans x={err_min_x}..{err_max_x} (want 0..{}), {err_count} px",
                         width as usize - 1
                     ),
                 );
                 report.check(
-                    &format!("statusbar-{label}-height-40px"),
+                    "statusbar-error-height-40px",
                     (38..=40).contains(&px_height)
-                        && top <= strip_top + 1
-                        && bottom >= strip_bottom.saturating_sub(2),
-                    &format!("{label} bar y={top}..{bottom} ({px_height} px tall, want ~40 px)"),
+                        && err_top <= strip_top + 1
+                        && err_bottom >= strip_bottom.saturating_sub(2),
+                    &format!(
+                        "error bar y={err_top}..{err_bottom} ({px_height} px tall, want ~40 px)"
+                    ),
+                );
+            }
+            "success" => {
+                // The success bar is panel-backed with an ok "✓" +
+                // ok title: its ok-foreground pixels must exceed
+                // the idle baseline by a clear margin (the title
+                // alone is ~100 px of 13 px semibold text), and no
+                // error background may show.
+                report.check(
+                    "statusbar-success-ok-glyphs",
+                    ok_fg_count > idle_ok_fg + 50,
+                    &format!(
+                        "success: ok-fg {ok_fg_count} px in the strip vs idle {idle_ok_fg} px (want > idle + 50)"
+                    ),
+                );
+                report.check(
+                    "statusbar-success-no-error-bg",
+                    err_count == 0,
+                    &format!("success: err-bg {err_count} px in the strip (want 0)"),
                 );
             }
             _ => {
@@ -1572,12 +1606,12 @@ fn ui_statusbar_real_mainwindow() -> Outcome {
 
 /// Gate: no-clip (B07/B08) — every `ScrollView` in the shipped UI
 /// clamps its content to the visible width
-/// (`viewport-width: self.visible-width`), so a wide child can
+/// (`content-width: self.visible-width`), so a wide child can
 /// never force a horizontal scroll / clip the panel's right side
 /// the way the Steering tuning panel clipped at 296 px. Static
 /// source check: the interpreter cannot read nested-element
 /// properties, so this scans the `.slint` sources and brace-matches
-/// each `ScrollView { ... }` block for the clamp. A ScrollView
+/// each `ScrollView { ... }` block for the clamp. A `ScrollView`
 /// without the clamp fails the gate.
 fn ui_scrollview_no_clip() -> Outcome {
     let mut report = Report::new();
@@ -1616,8 +1650,8 @@ fn ui_scrollview_no_clip() -> Outcome {
             let bytes = text.as_bytes();
             let mut depth = 0_i32;
             let mut end: Option<usize> = None;
-            for i in block_start..bytes.len() {
-                match bytes[i] {
+            for (i, &byte) in bytes.iter().enumerate().skip(block_start) {
+                match byte {
                     b'{' => depth += 1,
                     b'}' => {
                         depth -= 1;
@@ -1637,8 +1671,8 @@ fn ui_scrollview_no_clip() -> Outcome {
             checked += 1;
             report.check(
                 &format!("scrollview-no-clip-{name}:{line_no}"),
-                block.contains("viewport-width: self.visible-width"),
-                &format!("{name}:{line_no} ScrollView clamps viewport-width to visible-width"),
+                block.contains("content-width: self.visible-width"),
+                &format!("{name}:{line_no} ScrollView clamps content-width to visible-width"),
             );
             offset = block_end + 1;
             rest = &text[offset..];
@@ -2847,7 +2881,7 @@ fn checks() -> Vec<UiCheck> {
         ),
         (
             "ui-scrollview-no-clip",
-            "B07/B08: every ScrollView in the shipped UI clamps viewport-width to visible-width (no horizontal clip)",
+            "B07/B08: every ScrollView in the shipped UI clamps content-width to visible-width (no horizontal clip)",
             ui_scrollview_no_clip as fn() -> Outcome,
         ),
         (

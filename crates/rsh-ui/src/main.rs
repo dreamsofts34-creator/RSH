@@ -3346,7 +3346,7 @@ impl Ctx {
         self.set_toast(win, title, body);
     }
 
-    /// Show a failure in the bottom StatusBar (B01, was the DS-24
+    /// Show a failure in the bottom `StatusBar` (B01, was the DS-24
     /// toast): title + body on the current screen for 8 s, then
     /// the 1 Hz tick clears it. Skipped while the window is hidden
     /// (F27: no property writes on a hidden window) — the
@@ -3373,7 +3373,7 @@ impl Ctx {
             .set(Some(Instant::now() + Duration::from_secs(8)));
     }
 
-    /// Show a success in the bottom StatusBar (B01, was the D17
+    /// Show a success in the bottom `StatusBar` (B01, was the D17
     /// toast): same 8 s / 4 s rule as [`Self::set_toast`] — success
     /// lives 4 s. Same full text, same +N counter.
     fn set_toast_success(&self, win: &MainWindow, title: &str, body: &str) {

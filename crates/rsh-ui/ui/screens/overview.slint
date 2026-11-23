@@ -69,7 +69,7 @@ export component OverviewPage inherits VerticalLayout {
     // with one. Root padding lives on the inner layout now.
     overview-scroll := ScrollView {
         vertical-stretch: 1;
-        viewport-width: self.visible-width;
+        content-width: self.visible-width;
         VerticalLayout {
     padding-top: 16px; padding-bottom: 16px; padding-left: 20px; padding-right: 20px;
     spacing: 12px;
