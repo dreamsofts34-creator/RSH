@@ -1,10 +1,51 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.9 · firmware v4.0.4 · protocol v2.2 (frozen)**.
+**app v2.0.10 · firmware v4.0.4 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.10] — 2026-11-24
+
+App-only release (firmware stays v4.0.4, protocol v2.2 frozen — no
+firmware change). The user's final code drop: game saving, the HID
+loopback check, StatusBar lifetime, and layout alignment.
+
+**HID backend — loopback peer check fixed.**
+
+- `verify_loopback_peer_pid` matched the daemon's own TCP table row
+  instead of the sidecar's mirror row, so the check always reported
+  the daemon's PID and refused every sidecar. It now matches the
+  mirror row (local=remote_port, remote=local_port) and requires both
+  addresses to be loopback.
+
+**Games — saving no longer fails as "Connection dropped".**
+
+- Add/update game now gets a 10 s bound: an atomic file write plus a
+  daemon process refresh can exceed the 500 ms default and surfaced
+  as a bogus "Connection dropped".
+- A failed save keeps the daemon's real reason (empty name, unknown
+  profile, "cannot save manual games: …") instead of collapsing into
+  the generic link failure; IPC errors now carry the detailed
+  `code|reason` payload.
+- A game whose save fails is no longer kept in memory — the list
+  cannot show an unsaved game.
+
+**StatusBar — errors hide after ~1 s.**
+
+- Error lifetime 8 s → ~1 s (1 Hz tick, real range 1–2 s). An expired
+  message now hides the bar (empty kind) instead of leaving an empty
+  red bar on screen forever.
+- A file-picker failure now includes the detail.
+
+**Layout — rows vertically centred.**
+
+- Every `HorizontalLayout` row across all screens now uses
+  `cross-axis-alignment: center`.
+- The setup wizard reserves a permanent 40 px for the floating
+  StatusBar (padding-bottom 24 → 64 px) so the "Skip for now" link
+  is never covered.
 
 ## [2.0.9] — 2026-11-24
 

@@ -28,7 +28,7 @@ Forgot the Wi-Fi password? Hold the board's BOOT button for 10+ seconds — it r
 
 ### 2. Software setup
 
-1. Download **RSH_2.0.9_x64-setup.exe** from the [latest release](https://github.com/dreamsofts34-creator/RSH/releases/latest) and run it. If RSH is already installed, it offers an update instead.
+1. Download **RSH_2.0.10_x64-setup.exe** from the [latest release](https://github.com/dreamsofts34-creator/RSH/releases/latest) and run it. If RSH is already installed, it offers an update instead.
 2. Open RSH and follow the **Setup wizard**: connect the board, check drivers, calibrate, add a game.
 3. **First connect:** join the board's open hotspot (`RSH-XXXX`) from the wizard, or plug in the USB cable. No pairing, no code.
 4. **Set a Wi-Fi password** in Settings → Connection. Until you do, the hotspot stays open.
