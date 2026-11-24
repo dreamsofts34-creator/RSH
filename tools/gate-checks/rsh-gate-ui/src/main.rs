@@ -1438,10 +1438,16 @@ fn ui_banner_wrap() -> Outcome {
         return Outcome::fail(error);
     }
     let short = get_num(&instance, "banner-height");
-    let long_text = "Daemon failed to start: IPC bind failed after 5 attempts — pipe is held by another process or the previous daemon did not exit cleanly. Close the old RSH app and retry.";
+    // DS-21 probe text must wrap to 3 lines at the 712 px text width:
+    // the old 168-char text wrapped to exactly 2 lines, and 2 lines +
+    // 16 px padding sits exactly on the 46 px min-height when the
+    // fallback font's line height is 15 px (CI measured 46.0, local
+    // 49.0) — so the check flipped with the font, not the code.
+    // 318 chars forces 3 lines on any fallback font (~61 px).
+    let long_text = "Daemon failed to start: IPC bind failed after 5 attempts — pipe is held by another process or the previous daemon did not exit cleanly. Close the old RSH app and retry. If it still fails, open Task Manager, end any rsh-daemon.exe process, then start RSH again from the installer shortcut and check the Diagnostics log.";
     assert!(
-        long_text.chars().count() > 150,
-        "probe text must exceed 150 chars"
+        long_text.chars().count() > 300,
+        "probe text must exceed 300 chars"
     );
     if let Err(error) = set_str(&instance, "banner-text", long_text) {
         return Outcome::fail(error);
@@ -1458,7 +1464,7 @@ fn ui_banner_wrap() -> Outcome {
     report.check(
         "banner-long-grows",
         long.is_some_and(|h| h > 46.0),
-        &format!("150-char text banner height: {long:?} (want > 46)"),
+        &format!("long text banner height: {long:?} (want > 46)"),
     );
     report.finish()
 }
