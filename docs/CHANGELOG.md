@@ -1,10 +1,66 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.8 · firmware v4.0.4 · protocol v2.2 (frozen)**.
+**app v2.0.9 · firmware v4.0.4 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.9] — 2026-11-24
+
+App-only release (firmware stays v4.0.4, protocol v2.2 frozen — no
+firmware change). Fixes the v2.0.8 retest findings: the HID backend
+switch, all 20 UI report bugs, and the installer — plus the sidecar
+rename.
+
+**HID backend (v2.0.8 retest Bug 1 — root cause found and fixed).**
+
+- **Missing DLL.** The installer never shipped `HIDMaestro.Core.dll`,
+  so the sidecar's DLL-hash check failed and every HIDMaestro switch
+  errored. The DLL is now staged beside the sidecar, installed with
+  it, removed on uninstall, and the release smoke test fails closed
+  if it is missing after install.
+- **Full diagnostics.** The sidecar hello now reports `dll_sha256`
+  and `dll_sha256_ok`; every backend-switch outcome is logged to the
+  daemon log; Diagnostics shows the full notification body instead of
+  just the title. A failed switch now says why.
+- **Windows 10 22H2 is supported.** HIDMaestro v2.1.0 is tested on
+  Win10 IoT Enterprise LTSC (build 19044); the user's PC (19045) is
+  newer. WDK 26100 is a build requirement, not a runtime minimum.
+- **CI check.** A new `check-sidecar-hello.ps1` runs the staged
+  sidecar and asserts SDK 2.1.0 + a matching DLL hash.
+
+**Sidecar renamed: `rsh-hm-sidecar.exe` → `RshCoreHiDcr.exe`.**
+The old name was unprofessional. Renamed end to end (csproj,
+staging, NSIS, daemon resolve path, docs); uninstall removes both
+names so an upgrade from ≤ v2.0.8 leaves no stale exe. The
+wire-protocol hello identity `"rsh-hm-sidecar"` is unchanged — it is
+a protocol value, not a filename.
+
+**Installer modernized (MUI2).** Welcome / License / Directory /
+Install / Finish pages with RSH header + sidebar bitmaps and a
+"Run RSH" checkbox on Finish. Smart install/update/detect,
+firewall rule, clean uninstall and registry keys are unchanged.
+Also fixed: the WER crash-dump folder used `$PROGRAMDATA`, which
+is not an NSIS constant — dumps went nowhere since Round 3. NSIS
+is now pinned to 3.13.0 with a fail-closed version check.
+
+**UI — all 20 retest-report bugs (B01–B20) + design fixes (D1–D12).**
+The floating toast is replaced by one 40 px bottom StatusBar
+(busy/error/success, full untruncated text, Details drawer);
+Buttons page gets its own scroll + edit panel; Steering panel
+widened; type scale, spacing and icons are theme tokens / Lucide
+SVGs; the game dialog is a real centred Modal; sidebar labels say
+"Wheel not found" / "Disconnected" instead of "Unreachable" /
+"Timeout".
+
+**Security advisory.** `cookie` 0.18.2 → 0.18.3 (RUSTSEC-2026-0594,
+transitive via Tauri).
+
+**CI/gate.** The `ui-banner-wrap` probe hardened: its 168-char text
+wrapped to exactly 2 lines and sat on the 46 px min-height under
+the CI fallback font, so the check flipped with the font. 318
+chars force 3 lines.
 
 ## [2.0.8] — 2026-11-23
 

@@ -114,7 +114,7 @@ export component SettingsScreen inherits VerticalLayout {
     // Theme.mode; the window binds this two-way to `theme-choice`.
     in-out property <int> theme-choice: 0;
     in-out property <[ProfileRow]> profiles;
-    in-out property <string> app-version: "RSH 2.0.8";
+    in-out property <string> app-version: "RSH 2.0.9";
     in-out property <string> firmware-text: "—";
     in-out property <string> app-update-text: "Auto-update is off — new versions are on GitHub Releases";
     in-out property <string> backup-text: "No backups yet";
@@ -569,7 +569,7 @@ export component SettingsScreen inherits VerticalLayout {
             }
     }
     // diagnostics link, pinned at the bottom (§7.5) + version
-    // (B17: the header badge moved here — "RSH 2.0.8").
+    // (B17: the header badge moved here — "RSH 2.0.9").
     HorizontalLayout {
         padding-top: 4px;
         padding-bottom: 12px;
