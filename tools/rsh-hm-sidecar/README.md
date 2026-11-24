@@ -80,7 +80,11 @@ RshCoreHiDcr.exe --connect-back 127.0.0.1:54321
 > `real_sidecar_stdio_smoke` test).
 
 The sidecar prints a `hello` line first (see `PROTOCOL.md`), then
-answers one command per line. Log lines go to stderr only.
+answers one command per line. Log lines go to stderr and to the
+file log `%PROGRAMDATA%\RSH\logs\rsh-sidecar-YYYYMMDD.log`
+(v2.0.11 P0). The hello is sent BEFORE the HIDMaestro context is
+created (v2.0.11 P1), so a context-creation failure can no longer
+kill the sidecar before it says hello.
 
 The sidecar's manifest requests `requireAdministrator`: launching
 it directly prompts UAC. That is the headline UX cost of this

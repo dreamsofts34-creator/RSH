@@ -169,6 +169,31 @@ fn log_line(verbose: bool, message: &str) {
     let _ = append_startup_log_both(message);
 }
 
+/// The daemon's elevation state for the startup log (P0, v2.0.11):
+/// `"elevated"` / `"non-elevated"` on Windows, `"n/a (non-Windows)"`
+/// elsewhere. Diagnostic label only — nothing branches on it.
+/// `IsUserAnAdmin` is deprecated in the Windows SDK but remains the
+/// one-call answer for "is this token elevated"; the deprecation is
+/// about new code preferring explicit token checks, not about this
+/// call being wrong.
+fn elevation_state() -> &'static str {
+    #[cfg(windows)]
+    {
+        // SAFETY: `IsUserAnAdmin` takes no arguments and has no
+        // failure mode that matters for a diagnostic label.
+        let elevated = unsafe { windows::Win32::UI::Shell::IsUserAnAdmin().as_bool() };
+        if elevated {
+            "elevated (WARNING: the daemon must never run elevated — the UI/daemon must be launched non-elevated)"
+        } else {
+            "non-elevated"
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        "n/a (non-Windows)"
+    }
+}
+
 /// The manager loop (tokio task): drives the L1 Connection Manager
 /// from live `AppStateCore` observations, drains the connection
 /// log into the diagnostics file, runs the heartbeat watchdog,
@@ -1593,6 +1618,17 @@ fn main() {
             std::process::id(),
             data_dir.display()
         ),
+    );
+    // P0 (v2.0.11): log the daemon's own elevation state at startup.
+    // The v2.0.10 investigation found the daemon running ELEVATED
+    // (the installer finish page launched the UI elevated, and the UI
+    // spawns the daemon) — which suppressed the sidecar's UAC prompt
+    // entirely. The design is non-elevated ("daemon must never run
+    // elevated"); this line makes a violation visible in the log
+    // instead of inferable only from the missing mutex-scope line.
+    log_line(
+        verbose,
+        &format!("daemon: elevation: {}", elevation_state()),
     );
     // Round 3 WS-6 (R3-AK-01): a Task-Scheduler respawn
     // (`--scheduled-respawn`, the "RSH Daemon" task the installer

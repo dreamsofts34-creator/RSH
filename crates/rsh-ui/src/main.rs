@@ -1173,6 +1173,15 @@ const STATUS_ERROR_LIFETIME: Duration = Duration::from_secs(1);
 /// the burst's single entry instead of one entry per death.
 const FLAP_BURST_UPTIME: Duration = Duration::from_secs(30);
 
+/// P2 (v2.0.10 HID retest, Bug 1 retry storm): how long the
+/// backend selector stays disabled after ANY output-backend switch
+/// failure — the switch card re-enabled instantly after each
+/// sub-second failure, so the user could hammer it ~4 times a
+/// second (30 failures in ~4 minutes). 30 s matches the daemon's
+/// own post-failure refusal window, so the UI and the daemon
+/// re-enable together.
+const BACKEND_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// F12 (v2.0.3): a burst count older than this is stale — a much
 /// later, unrelated death must not claim "flapped ×N".
 const FLAP_COUNT_STALE: Duration = Duration::from_secs(600);
@@ -1934,6 +1943,16 @@ struct Ctx {
     /// after 30 s.
     wifi_rejoining: Rc<Cell<bool>>,
     wifi_rejoin_since: Rc<Cell<Option<Instant>>>,
+    /// P2 (v2.0.10 HID retest, Bug 1 retry storm): when the
+    /// backend-selector cooldown ends — set by ANY output-backend
+    /// switch failure (Err, wrong-backend success, or job timeout,
+    /// including a daemon-side "retry in 30 s" refusal, which
+    /// arrives here as an ordinary `Err` — no error text is
+    /// parsed), cleared on a genuine switch success or on expiry
+    /// by the 1 Hz tick. `None` = no cooldown. The Slint
+    /// `backend-cooldown-secs` prop (seconds left, 0 = idle) is
+    /// driven from this by [`Ctx::sync_backend_cooldown`].
+    backend_cooldown_until: Rc<Cell<Option<Instant>>>,
     /// Last `password_set` value `sync_wifi_password_state` saw
     /// (R3-UI-02): the success message is cleared when the state
     /// moves on — otherwise it persists across Settings visits
@@ -3515,6 +3534,80 @@ impl Ctx {
         }
     }
 
+    /// Whole seconds left on the backend-selector cooldown,
+    /// rounded UP so the countdown shows 30 immediately after a
+    /// failure and 1 in its last second — never 0 while it is
+    /// still running. 0 = no cooldown (none set, or expired).
+    fn backend_cooldown_remaining(&self) -> u32 {
+        let Some(until) = self.backend_cooldown_until.get() else {
+            return 0;
+        };
+        let now = Instant::now();
+        if until <= now {
+            return 0;
+        }
+        let left = until.duration_since(now);
+        // Ceiling: a 29.2 s remainder still reads "30 s" at the
+        // start and "1 s" at the end (as_secs alone would show 29
+        // then 0 while a second is still left).
+        u32::try_from(left.as_secs() + u64::from(left.subsec_nanos() > 0)).unwrap_or(u32::MAX)
+    }
+
+    /// True while the backend selector must stay disabled (P2).
+    fn backend_cooldown_active(&self) -> bool {
+        self.backend_cooldown_remaining() > 0
+    }
+
+    /// Arm the 30 s backend-selector cooldown (P2): called from
+    /// the single failure funnel in [`Ctx::apply_job_done`] (and
+    /// the Backend branch of [`Ctx::check_job_timeouts`]) — the
+    /// failure EVENT arms it, never any error text, so a
+    /// daemon-side cooldown refusal arms it exactly like a
+    /// sidecar crash. Drives the countdown prop at once (the
+    /// 1 Hz tick keeps it ticking from there).
+    fn start_backend_cooldown(&self, win: &MainWindow) {
+        self.backend_cooldown_until
+            .set(Some(Instant::now() + BACKEND_COOLDOWN));
+        win.set_backend_cooldown_secs(
+            u32::try_from(BACKEND_COOLDOWN.as_secs())
+                .unwrap_or(u32::MAX)
+                .cast_signed(),
+        );
+        ui_log!("RSH-UI backend switch failed — selector cooling down for 30 s");
+    }
+
+    /// Clear the cooldown (P2): a genuine switch success, or
+    /// expiry on the 1 Hz tick. The prop write is unconditional —
+    /// clearing an already-clear cooldown is a no-op in Slint
+    /// (same value), and the success path must never leave a
+    /// stale countdown on screen.
+    fn clear_backend_cooldown(&self, win: &MainWindow) {
+        self.backend_cooldown_until.set(None);
+        win.set_backend_cooldown_secs(0);
+    }
+
+    /// Drive the countdown prop from the cooldown deadline (P2,
+    /// 1 Hz tick): ticks once a second, and clears the state
+    /// cleanly the moment it expires. The write is
+    /// change-guarded — a tick with the same remaining second
+    /// costs nothing.
+    fn sync_backend_cooldown(&self, win: &MainWindow) {
+        let remaining = self.backend_cooldown_remaining();
+        if remaining == 0 {
+            if self.backend_cooldown_until.get().is_some() {
+                self.clear_backend_cooldown(win);
+            }
+            return;
+        }
+        set_if_changed(
+            win.get_backend_cooldown_secs(),
+            remaining.cast_signed(),
+            |v| {
+                win.set_backend_cooldown_secs(v);
+            },
+        );
+    }
+
     /// Drive the M-2 daemon-error banner (FC2): the fatal reason
     /// from `daemon-status.json` while the daemon is down, empty
     /// (banner hidden) while it is live or no fatal file exists.
@@ -3811,6 +3904,9 @@ impl Ctx {
                 let requested = if index == 1 { "vJoy" } else { "HIDMaestro" };
                 let failure: Option<UserError> = match result {
                     Ok(active) if active == requested => {
+                        // P2: a genuine success ends any cooldown
+                        // an earlier failure armed.
+                        self.clear_backend_cooldown(win);
                         self.sync_overview(win);
                         // The wizard's Drivers step mirrors the same
                         // backend choice (fallback flag + controller
@@ -3849,6 +3945,12 @@ impl Ctx {
                     // backend moved mid-switch.
                     self.resync_controller_from_live(win, 1 - index);
                     self.notify_error(win, "Game controller", &error);
+                    // P2: ANY backend-switch failure arms the 30 s
+                    // selector cooldown — Err, wrong-backend
+                    // success, or a daemon-side cooldown refusal
+                    // (all arrive here as a failure event; no error
+                    // text is parsed).
+                    self.start_backend_cooldown(win);
                 }
             }
             JobDone::FirmwareCheck(result) => {
@@ -4065,6 +4167,9 @@ impl Ctx {
                 // ignored, so restore the live backend's segment now.
                 let backend = self.api().output_backend();
                 win.set_controller(i32::from(backend != "HIDMaestro"));
+                // P2: a switch that never answers is a failure too
+                // — arm the same 30 s cooldown as a reported one.
+                self.start_backend_cooldown(win);
             }
             if kind == JobKind::SettingsOp {
                 // R3-UI-02: the timed-out job's apply is dropped
@@ -4335,6 +4440,14 @@ impl Ctx {
     fn start_backend_job(&self, win: &MainWindow, index: i32) {
         let name = if index == 1 { "vJoy" } else { "HIDMaestro" };
         if self.api().output_backend() == name {
+            return;
+        }
+        // P2: while the post-failure cooldown runs the selector is
+        // disabled in Slint (Settings radios + wizard fallback
+        // button), so this guard is defence-in-depth for any other
+        // caller — refuse silently, no job, no admin warning.
+        if self.backend_cooldown_active() {
+            ui_log!("RSH-UI backend switch refused — selector cooling down");
             return;
         }
         if self.busy_jobs.borrow().contains_key(&JobKind::Backend) {
@@ -12211,6 +12324,9 @@ fn start_frame_timer(
                 ctx.sync_daemon_error(&w);
                 ctx.check_job_timeouts(&w);
                 ctx.check_status_expiry(&w);
+                // P2: tick the backend-selector countdown (1 Hz)
+                // and clear it cleanly on expiry.
+                ctx.sync_backend_cooldown(&w);
                 ctx.sync_auto_theme(&w);
                 ctx.check_wifi_rejoin_timeout();
                 ctx.check_connecting_timeout(&w);
@@ -12443,6 +12559,7 @@ fn main() -> Result<(), slint::PlatformError> {
         theme_choice: Rc::new(Cell::new(read_theme(data_dir.as_ref()))),
         wifi_rejoining: Rc::new(Cell::new(false)),
         wifi_rejoin_since: Rc::new(Cell::new(None)),
+        backend_cooldown_until: Rc::new(Cell::new(None)),
         wifi_password_set_known: Rc::new(Cell::new(None)),
         wifi_password_message_for: Rc::new(Cell::new(None)),
         confirm_pending: Rc::new(RefCell::new(None)),
@@ -13475,6 +13592,7 @@ mod tests {
             theme_choice: Rc::new(Cell::new(0)),
             wifi_rejoining: Rc::new(Cell::new(false)),
             wifi_rejoin_since: Rc::new(Cell::new(None)),
+            backend_cooldown_until: Rc::new(Cell::new(None)),
             wifi_password_set_known: Rc::new(Cell::new(None)),
             wifi_password_message_for: Rc::new(Cell::new(None)),
             confirm_pending: Rc::new(RefCell::new(None)),
@@ -15176,6 +15294,106 @@ mod tests {
                 .contains("Game controller is now HIDMaestro"),
             "genuine success still toasts, got: {}",
             win.get_status_text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P2 (v2.0.10 HID retest, Bug 1 retry storm): ANY backend-switch
+    // failure arms a 30 s selector cooldown — the countdown prop
+    // reads 30, a new switch is refused while it runs, the 1 Hz
+    // sync ticks it down and clears it on expiry, and a genuine
+    // success clears it at once.
+    #[test]
+    fn backend_job_failure_starts_30s_cooldown() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("backend cooldown test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        assert_eq!(ctx.api().output_backend(), "vJoy");
+        assert_eq!(win.get_backend_cooldown_secs(), 0);
+
+        // 1. A switch failure arms the cooldown at 30 s.
+        win.set_controller(0);
+        let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
+            JobDone::Backend {
+                index: 0,
+                result: Err(UserError {
+                    code: "Unknown".to_string(),
+                    title: "Something went wrong".to_string(),
+                    what_happened: "Something went wrong.".to_string(),
+                    what_to_do: "Try again.".to_string(),
+                    detail: Some(
+                        "could not switch output backend to HIDMaestro: HIDMaestro sidecar failed to start."
+                            .to_string(),
+                    ),
+                }),
+            }
+        });
+        assert!(started, "backend job should start");
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(
+            win.get_controller(),
+            1,
+            "radio reverts to the live backend (vJoy)"
+        );
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            30,
+            "cooldown arms at 30 s on failure"
+        );
+
+        // 2. While it runs, a new switch is refused (no job starts)
+        // and the refusal does not re-arm the countdown.
+        ctx.start_backend_job(&win, 0);
+        assert_eq!(
+            win.get_busy_kind(),
+            -1,
+            "no backend job starts during the cooldown"
+        );
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            30,
+            "refused switch does not re-arm the cooldown"
+        );
+
+        // 3. The 1 Hz sync ticks it down and clears it on expiry.
+        ctx.backend_cooldown_until
+            .set(Some(Instant::now() + Duration::from_secs(5)));
+        ctx.sync_backend_cooldown(&win);
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            5,
+            "countdown ticks to the seconds left"
+        );
+        ctx.backend_cooldown_until.set(Some(
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        ));
+        ctx.sync_backend_cooldown(&win);
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "cooldown clears cleanly on expiry"
+        );
+
+        // 4. A genuine success clears a live cooldown at once.
+        ctx.backend_cooldown_until
+            .set(Some(Instant::now() + Duration::from_secs(30)));
+        win.set_backend_cooldown_secs(30);
+        win.set_controller(1);
+        let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
+            JobDone::Backend {
+                index: 1,
+                result: Ok("vJoy".to_string()),
+            }
+        });
+        assert!(started, "backend job should start");
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "success clears the cooldown"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

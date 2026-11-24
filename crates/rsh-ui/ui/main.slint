@@ -89,7 +89,7 @@ export component MainWindow inherits Window {
     in property <bool> buttons-listening: false;
     in property <string> profile-name: "GT3 Sprint";
     in property <string> auto-profile-text: "No profile yet";
-    in property <string> app-version: "2.0.10";
+    in property <string> app-version: "2.0.11";
     in property <bool> daemon-live: false;
     // B5 (v2.0.2): the global busy strip reads these — Rust drives
     // them from busy_jobs (each start_*_job records its label, the
@@ -100,6 +100,12 @@ export component MainWindow inherits Window {
     // value (-1 = idle) — screens disable + dim the button that
     // started it while its job runs.
     in property <int> busy-kind: -1;
+    // P2 (v2.0.10 HID retest, Bug 1 retry storm): seconds left on
+    // the post-failure backend-selector cooldown, 0 = idle. Rust
+    // arms it for 30 s on ANY backend-switch failure and ticks it
+    // on the 1 Hz timer; the Settings radios + wizard fallback
+    // button disable while it is > 0.
+    in property <int> backend-cooldown-secs: 0;
     // F27 (v2.0.3): true while the window is hidden to tray —
     // the busy spinner's Timer stops (see below), so no redraw
     // is scheduled on the hidden window. Set from Rust in the
@@ -1090,6 +1096,7 @@ export component MainWindow inherits Window {
             if page == 5 : SettingsScreen {
                 connected: connected;
                 busy-kind: busy-kind;
+                backend-cooldown-secs: backend-cooldown-secs;
                 // Two-way bindings: the screen edits these, Rust
                 // reverts them on a failed backend call (A9/A10).
                 connection-type <=> transport;
@@ -1161,6 +1168,7 @@ export component MainWindow inherits Window {
         step: setup-step;
         daemon-live: daemon-live;
         busy-kind: busy-kind;
+        backend-cooldown-secs: backend-cooldown-secs;
         connect-done: setup-connect-done;
         connect-hint: setup-connect-hint;
         centre-done: setup-centre-done;

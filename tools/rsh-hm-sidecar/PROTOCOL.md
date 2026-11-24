@@ -35,7 +35,11 @@ the Rust side keeps at most one command in flight.
   > gate H-HID-5). The stdio path is fully verified in the sandbox
   > instead (see `verify-linux.sh` + the Rust smoke test).
 
-Logging goes to stderr only. stdout / the socket is the protocol.
+Logging goes to stderr AND the file log
+`%PROGRAMDATA%\RSH\logs\rsh-sidecar-YYYYMMDD.log` (v2.0.11 P0 —
+stderr is discarded on the TCP path and when elevated, so the file
+is the only trace a pre-hello death leaves). stdout / the socket
+is the protocol.
 
 ## Hello (first line, before any command)
 
@@ -50,7 +54,11 @@ RSH refuses the sidecar when `ok` is not `true`, `sidecar` is not
 (C-SEC-1 — all of `ok` / `sdk` / `dll_sha256` are REQUIRED; a hello
 that stays silent about any of them is refused).
 `driver_installed` is the state at startup (null when the context
-could not be created yet); `version` re-reports it live.
+could not be created yet — v2.0.11 sends the hello BEFORE the
+context is created, so a null here means "context not attempted
+yet", and `install-driver` / `create` then report
+`context-unavailable` when the context cannot be created);
+`version` re-reports it live.
 
 ## Commands
 
@@ -86,6 +94,7 @@ could not be created yet); `version` re-reports it live.
 | `not-admin` | The operation needs elevation (driver install) and the sidecar is not administrator. |
 | `driver-not-installed` | Driver required and not installed (install failed or was refused). |
 | `driver-install-failed` | `InstallDriver()` threw. |
+| `context-unavailable` | The HIDMaestro context could not be created (`new HMContext()` threw) — the sidecar is alive, the context is not. v2.0.11: install-driver / create report this instead of a generic failure, so the daemon can name the state. |
 | `dll-hash-mismatch` | (Rust-side refusal) the loaded DLL's SHA-256 is not the pinned v2.1.0 hash. |
 | `profile-refused` | The requested profile is not `rsh-wheel-custom`, or the built profile fails the SEC-H-06 rules (usbip / self-reporting / not deployable). |
 | `create-failed` | `CreateController` threw. |

@@ -102,6 +102,12 @@ export component SetupWizard inherits Rectangle {
     // JobKind::order value (-1 = idle) — the invoking button
     // disables + dims while its job runs.
     in property <int> busy-kind: -1;
+    // P2 (v2.0.10 HID retest, Bug 1 retry storm): seconds left on
+    // the post-failure backend-selector cooldown, 0 = idle. Rust
+    // arms it for 30 s on ANY backend-switch failure and ticks it
+    // on the 1 Hz timer; the HIDMaestro fallback button disables
+    // while it is > 0.
+    in property <int> backend-cooldown-secs: 0;
     // A3 (v2.0.2): daemon state drives the display — while the
     // background service is down the wizard shows "Disconnected" /
     // "—", never a plausible-looking address or status.
@@ -368,9 +374,13 @@ export component SetupWizard inherits Rectangle {
                         Text { vertical-alignment: center; text: "HIDMaestro"; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
                         Text { vertical-alignment: center; text: "Needs admin permission when first used."; font-size: Theme.fs-label; color: Theme.mute; }
                         Rectangle { horizontal-stretch: 1; }
-                        Btn { label: vjoy-fallback ? "Selected" : "Use HIDMaestro instead"; primary: !vjoy-fallback; disabled: busy-kind == 14; clicked => { use-hidmaestro(); } }
+                        Btn { label: vjoy-fallback ? "Selected" : "Use HIDMaestro instead"; primary: !vjoy-fallback; disabled: busy-kind == 14 || backend-cooldown-secs > 0; clicked => { use-hidmaestro(); } }
                     }
                 }
+                // P2: the cooldown countdown — `visible`, never
+                // `if`, so the step keeps the SAME size while it
+                // shows/hides.
+                Text { visible: backend-cooldown-secs > 0; text: "Retry in " + backend-cooldown-secs + " s — switching is paused after the last failure."; font-size: Theme.fs-label; color: Theme.warn; wrap: word-wrap; }
                 if vjoy-fallback : Text { text: "HIDMaestro selected — RSH will ask for admin permission on start."; font-size: Theme.fs-label; color: Theme.mute; wrap: word-wrap; }
             }
 

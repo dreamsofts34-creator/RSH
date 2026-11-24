@@ -415,6 +415,7 @@ pub fn reply_to_error(reply: &Reply) -> Result<(), HidMaestroError> {
     let code = reply.code.as_deref().unwrap_or("");
     Err(match code {
         "not-admin" => HidMaestroError::NotAdmin,
+        "context-unavailable" => HidMaestroError::ContextUnavailable(msg),
         "driver-not-installed" => HidMaestroError::DriverNotInstalled(msg),
         "driver-install-failed" => HidMaestroError::DriverInstallFailed(msg),
         "dll-hash-mismatch" => HidMaestroError::DllHashMismatch {
@@ -771,6 +772,16 @@ mod tests {
         assert!(matches!(
             reply_to_error(&reply),
             Err(HidMaestroError::NotAdmin)
+        ));
+        // P1 (v2.0.11): a live sidecar whose context could not be
+        // created is its own error, not a generic failure.
+        let reply = parse_reply(
+            r#"{"ok":false,"code":"context-unavailable","error":"cannot create HIDMaestro context: boom"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            reply_to_error(&reply),
+            Err(HidMaestroError::ContextUnavailable(_))
         ));
         let reply =
             parse_reply(r#"{"ok":false,"code":"profile-refused","error":"usbip"}"#).unwrap();

@@ -83,6 +83,10 @@ pub enum HidMaestroStateKind {
     CreateFailed,
     /// Sidecar died or stopped answering.
     SidecarFailed,
+    /// Sidecar is alive but its `HIDMaestro` context could not be
+    /// created (P1, v2.0.11 — `context-unavailable`): the driver
+    /// install / device create was never attempted.
+    ContextUnavailable,
     /// One retry used up — vJoy fallback is in effect until the user
     /// re-selects this backend.
     FallbackToVJoy,
@@ -334,6 +338,7 @@ impl HidMaestroOutput {
             | HidMaestroError::HelloTimeout
             | HidMaestroError::BadHello(_)
             | HidMaestroError::BadReply(_) => HidMaestroStateKind::SidecarFailed,
+            HidMaestroError::ContextUnavailable(_) => HidMaestroStateKind::ContextUnavailable,
             HidMaestroError::FallbackNeeded => HidMaestroStateKind::FallbackToVJoy,
             _ => HidMaestroStateKind::Error,
         };
@@ -386,6 +391,15 @@ impl Default for HidMaestroOutput {
 impl IJoystickOutput for HidMaestroOutput {
     fn name(&self) -> &'static str {
         "HIDMaestro"
+    }
+
+    /// P2 (v2.0.11): re-arm the manager IN PLACE — the explicit
+    /// re-select path calls this on the installed backend instead of
+    /// replacing it with a fresh factory build, so the manager (its
+    /// retry budget, its decline latch) survives across attempts and
+    /// only an explicit re-select clears it.
+    fn reset_fallback(&mut self) {
+        HidMaestroOutput::reset_fallback(self);
     }
 
     fn is_connected(&self) -> bool {

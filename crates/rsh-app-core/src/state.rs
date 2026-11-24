@@ -1036,10 +1036,27 @@ pub struct AppStateCore {
     /// (re-)activation of `HIDMaestro` fails fast with the `NotAdmin`
     /// message instead of prompting again. Only an explicit user
     /// re-select ([`AppStateCore::set_output_backend`]) clears it —
-    /// a fresh factory build (the H2 re-arm in
-    /// [`Self::apply_backend_switch`]) must NOT clear it, or the
-    /// prompt would loop again.
+    /// the in-place re-arm in [`Self::apply_backend_switch`] (P2,
+    /// v2.0.11) must NOT clear it, or the prompt would loop again.
+    /// (The re-arm clears the backend manager's own decline latch;
+    /// this app-core flag is a separate latch, cleared only by the
+    /// explicit re-select path.)
     elevation_declined: AtomicBool,
+    /// Consecutive failed EXPLICIT switches to `HIDMaestro` this
+    /// session (P2, v2.0.11 — the retry-storm guard). At 3 failures
+    /// (`HID_SWITCH_MAX_CONSECUTIVE_FAILURES`) the explicit switch
+    /// is refused for 30 s (`HID_SWITCH_COOLDOWN`, see
+    /// `hid_switch_cooldown_until` below). A successful explicit
+    /// switch resets the count.
+    hid_switch_failures: AtomicU32,
+    /// When the explicit-`HIDMaestro`-switch cooldown ends (P2,
+    /// v2.0.11): while in the future, an explicit switch to
+    /// `HIDMaestro` fails fast with `HID_SWITCH_COOLDOWN_MESSAGE`
+    /// instead of spawning another sidecar. `None` when no cooldown
+    /// is active. Automatic paths (startup activation, deferred
+    /// enable, mid-session failover) never consult this — only the
+    /// explicit user switch does.
+    hid_switch_cooldown_until: Mutex<Option<std::time::Instant>>,
     /// Serialises backend switches (B-2): a switch already in
     /// flight (UAC prompt on screen / sidecar spawning, up to ~10 s)
     /// rejects a second overlapping switch instead of spawning a
@@ -1280,6 +1297,8 @@ impl AppStateCore {
             fallback_used: AtomicBool::new(false),
             fallback_last_attempt: Mutex::new(None),
             elevation_declined: AtomicBool::new(false),
+            hid_switch_failures: AtomicU32::new(0),
+            hid_switch_cooldown_until: Mutex::new(None),
             switch_in_flight: Mutex::new(()),
             firmware_update: Mutex::new(FirmwareUpdateStatus::default()),
             board_reachable: AtomicBool::new(false),
@@ -3519,6 +3538,19 @@ impl AppStateCore {
         let requested = BackendKind::parse(name).ok_or_else(|| {
             format!("unknown output backend '{name}' (expected HIDMaestro, vJoy, or none)")
         })?;
+        // P2 (v2.0.11): the explicit-switch storm guard — after 3
+        // consecutive failed explicit switches to HIDMaestro, refuse
+        // further explicit switches for 30 s instead of spawning
+        // another sidecar (the v2.0.10 retest fired 30 attempts in
+        // ~4 minutes). Checked FIRST, before any latch is cleared or
+        // any choice is persisted, so a refused attempt changes no
+        // state. Automatic paths never consult this.
+        if requested == BackendKind::HidMaestro
+            && let Some(until) = *lock(&self.hid_switch_cooldown_until)
+            && std::time::Instant::now() < until
+        {
+            return Err(Self::HID_SWITCH_COOLDOWN_MESSAGE.to_string());
+        }
         // R2-20: a backend switch re-probes the vJoy DLL on the next
         // status read instead of trusting the cached probe.
         self.invalidate_vjoy_dll_cache();
@@ -3574,6 +3606,22 @@ impl AppStateCore {
             }
             self.refresh_settings_cache();
         }
+        // P2 (v2.0.11): maintain the explicit-switch storm counter
+        // for HIDMaestro only — a success resets it, a failure counts
+        // toward the 3-strike cooldown. (vJoy / none switches never
+        // touch it: only the elevated sidecar spawn can storm.)
+        if requested == BackendKind::HidMaestro {
+            if result.is_ok() {
+                self.hid_switch_failures.store(0, Ordering::SeqCst);
+            } else {
+                let failures = self.hid_switch_failures.fetch_add(1, Ordering::SeqCst) + 1;
+                if failures >= Self::HID_SWITCH_MAX_CONSECUTIVE_FAILURES {
+                    self.hid_switch_failures.store(0, Ordering::SeqCst);
+                    *lock(&self.hid_switch_cooldown_until) =
+                        Some(std::time::Instant::now() + Self::HID_SWITCH_COOLDOWN);
+                }
+            }
+        }
         result
     }
 
@@ -3584,14 +3632,13 @@ impl AppStateCore {
     ///
     /// This clears only the app-core flag. The backend's own latch
     /// (the `HIDMaestro` `SidecarManager::fallback_needed` latch — the
-    /// "H2 latch") lives behind the [`IJoystickOutput`] trait, which
-    /// exposes no reset hook, so this method cannot call the
-    /// backend's `reset_fallback` directly. The backend side of the
-    /// re-arm happens in [`Self::apply_backend_switch`]: a
-    /// disconnected same-kind re-select replaces the installed
-    /// instance with a fresh factory build, whose manager latch is
-    /// clear — the same state `HidMaestroBackend::reset_fallback`
-    /// produces. Without that step the selector's same-kind path
+    /// "H2 latch") is cleared in [`Self::apply_backend_switch`] via
+    /// the [`IJoystickOutput::reset_fallback`](rsh_output::IJoystickOutput::reset_fallback)
+    /// hook, which re-arms the INSTALLED backend in place (P2,
+    /// v2.0.11) — the same state `HidMaestroBackend::reset_fallback`
+    /// produces, without replacing the instance (a replacement used
+    /// to hand every attempt a fresh manager with a full retry
+    /// budget). Without that step the selector's same-kind path
     /// would reconnect the latched instance, fail fast with
     /// `FallbackNeeded`, and the re-select could never succeed
     /// (deep-scan Round 2, item 5).
@@ -3605,6 +3652,21 @@ impl AppStateCore {
     pub fn fallback_used(&self) -> bool {
         self.fallback_used.load(Ordering::SeqCst)
     }
+
+    /// Explicit-switch storm guard (P2, v2.0.11): after this many
+    /// consecutive failed explicit switches to `HIDMaestro`, further
+    /// explicit switches to it are refused for
+    /// [`HID_SWITCH_COOLDOWN`](Self::HID_SWITCH_COOLDOWN). The
+    /// cooldown value (30 s) matches the frontend's UI cooldown for
+    /// the same guard — change both together.
+    const HID_SWITCH_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+    /// Explicit-switch cooldown (P2, v2.0.11): 30 s, matching the
+    /// frontend's UI cooldown.
+    const HID_SWITCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+    /// Message for an explicit `HIDMaestro` switch refused by the
+    /// storm guard (P2, v2.0.11).
+    pub const HID_SWITCH_COOLDOWN_MESSAGE: &str =
+        "HIDMaestro switch failed 3 times — retry in 30 s";
 
     /// UAC decline message (B-2/A10, v2.0.2): shown once when the user
     /// declines the `HIDMaestro` elevation prompt. The switch fails with
@@ -3654,24 +3716,24 @@ impl AppStateCore {
         // re-select of a disconnected backend whose manager latch is
         // set (`fallback_needed`, after its retry budget is spent)
         // would fail fast with `FallbackNeeded` forever — the
-        // same-kind re-select trap. The trait exposes no reset hook,
-        // so re-arm the backend by replacing a DISCONNECTED same-kind
-        // instance with a fresh factory build before the selector
-        // runs: a fresh `HidMaestroBackend` has a fresh
-        // `SidecarManager` (latch clear), which is exactly what the
-        // backend's own `reset_fallback` does. A connected instance
-        // is never replaced (its live sidecar session survives), and
-        // a missing factory falls through to the selector's old
-        // behaviour. `set_output_backend` calls `reset_fallback`
+        // same-kind re-select trap. P2 (v2.0.11): the re-arm now
+        // happens IN PLACE — the trait's `reset_fallback` hook
+        // clears the installed backend's latch on its own manager,
+        // instead of replacing the instance with a fresh factory
+        // build. The replacement used to defeat the manager's
+        // 2-failure latch and clear `elevation_declined` on every
+        // attempt (the retry storm's enabler: every call got a
+        // fresh manager with a full retry budget). A connected
+        // instance is never reset (its live sidecar session
+        // survives). `set_output_backend` calls `reset_fallback`
         // first, so by the time this runs the app-core flag is clear
         // too — both latches re-arm on one explicit re-select.
         let live = self.backend_handle();
         if requested != BackendKind::None
             && BackendKind::from_backend_name(&self.backend_name()) == Some(requested)
             && !lock(&live).is_connected()
-            && let Some(fresh) = factories.build(requested)
         {
-            *lock(&self.backend) = Arc::new(Mutex::new(fresh));
+            lock(&live).reset_fallback();
         }
         // R2-09: the selector's connect (up to 60 s of sidecar
         // spawn + UAC dwell for HIDMaestro) must NOT run under the
@@ -9628,6 +9690,14 @@ mod tests {
         /// connect failed"; tests set it to e.g. an "administrator
         /// rights" wording to model a UAC decline).
         fail_connect_message: Arc<Mutex<String>>,
+        /// The manager latch (P2, v2.0.11): models the `HIDMaestro`
+        /// `SidecarManager::fallback_needed` latch. While set,
+        /// `try_connect` fails fast — exactly like the real latched
+        /// manager — and only the trait's `reset_fallback` hook
+        /// clears it. Distinct from `fail_connect`, which models an
+        /// external failure (the sidecar will not start) that no
+        /// re-arm can clear.
+        latched: Arc<Mutex<bool>>,
         /// Reported by `name()`; the failover test needs a backend
         /// that reports `"HIDMaestro"` / `"vJoy"`.
         name: &'static str,
@@ -9657,6 +9727,7 @@ mod tests {
                     fail: Arc::clone(&fail),
                     fail_connect: Arc::new(Mutex::new(false)),
                     fail_connect_message: Arc::new(Mutex::new("mock connect failed".to_string())),
+                    latched: Arc::new(Mutex::new(false)),
                     name,
                 },
                 sent,
@@ -9679,6 +9750,14 @@ mod tests {
                 .lock()
                 .expect("fail_connect_message lock poisoned") = message.to_string();
         }
+
+        /// Sets the mock manager latch (P2, v2.0.11): while latched,
+        /// `try_connect` fails fast with the fallback wording, and
+        /// only the trait's `reset_fallback` hook clears it — the
+        /// H2 re-select test's model of the latched manager.
+        fn set_latched(&self, latched: bool) {
+            *self.latched.lock().expect("latched lock poisoned") = latched;
+        }
     }
 
     impl IJoystickOutput for RecordingBackend {
@@ -9691,6 +9770,15 @@ mod tests {
         }
 
         fn try_connect(&mut self) -> Result<(), VJoyError> {
+            // P2 (v2.0.11): the manager latch fails fast, like the
+            // real latched manager — before any external failure is
+            // consulted, and with the fallback wording.
+            if *self.latched.lock().expect("latched lock poisoned") {
+                return Err(VJoyError::DriverNotFound(
+                    "HIDMaestro already failed once and the retry was used up — falling back to vJoy."
+                        .to_string(),
+                ));
+            }
             if *self
                 .fail_connect
                 .lock()
@@ -9705,6 +9793,14 @@ mod tests {
             }
             *self.connected.lock().expect("connected lock poisoned") = true;
             Ok(())
+        }
+
+        /// P2 (v2.0.11): the trait's re-arm hook clears the mock
+        /// manager latch (and only the latch — an external
+        /// `fail_connect` failure survives it, like the real
+        /// sidecar that still will not start).
+        fn reset_fallback(&mut self) {
+            *self.latched.lock().expect("latched lock poisoned") = false;
         }
 
         fn disconnect(&mut self) {
@@ -10092,6 +10188,130 @@ mod tests {
             state.settings().output_backend,
             "VJoy",
             "persisted choice reverts to the previous backend"
+        );
+    }
+
+    /// Mock factories for the P2 tests where the test keeps a handle
+    /// to the `HIDMaestro` mock, so it can flip `fail_connect` on the
+    /// INSTALLED instance: a same-kind re-select reconnects the
+    /// installed backend (a fresh factory build is never consulted
+    /// on that path), so a separate failing factory cannot make a
+    /// re-select fail — only the installed instance's own flag can.
+    fn hidmaestro_mock_factories() -> (BackendFactories, RecordingBackend) {
+        let (hm, _hm_sent, _hm_fail) = RecordingBackend::new_named("HIDMaestro");
+        let (vj, _vj_sent, _vj_fail) = RecordingBackend::new_named("vJoy");
+        let hm_factory = hm.clone();
+        let vj_factory = vj.clone();
+        (
+            BackendFactories {
+                hidmaestro: Some(Box::new(move || {
+                    Box::new(hm_factory.clone()) as Box<dyn IJoystickOutput>
+                })),
+                vjoy: Some(Box::new(move || {
+                    Box::new(vj_factory.clone()) as Box<dyn IJoystickOutput>
+                })),
+                none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
+            },
+            hm,
+        )
+    }
+
+    /// P2 (v2.0.11): the explicit-switch storm guard — 3 consecutive
+    /// failed explicit switches to `HIDMaestro` refuse the 4th for
+    /// 30 s with the cooldown message (the v2.0.10 retest fired 30
+    /// attempts in ~4 minutes). A refused attempt changes no state,
+    /// vJoy switches are unaffected, and a successful `HIDMaestro`
+    /// switch resets the counter.
+    #[test]
+    fn explicit_hidmaestro_switch_cooldown_after_three_failures() {
+        let (factories, hm) = hidmaestro_mock_factories();
+        hm.set_fail_connect(true);
+        hm.set_fail_connect_message("HIDMaestro sidecar failed to start.");
+        let (state, _dir) = test_state();
+        // One failure, then a success: the success resets the
+        // counter, so the three failures below are strikes #1–#3,
+        // not #2–#4.
+        let error = state
+            .set_output_backend_with_factories("HIDMaestro", &factories)
+            .expect_err("failing HIDMaestro switch must error");
+        assert!(
+            error.contains("sidecar failed to start"),
+            "the real reason is reported: {error}"
+        );
+        hm.set_fail_connect(false);
+        state
+            .set_output_backend_with_factories("HIDMaestro", &factories)
+            .expect("HIDMaestro switch succeeds with a working sidecar");
+        // A connected same-kind re-select is a no-op success, so
+        // disconnect first — the re-select must actually attempt a
+        // connect to count as a failure.
+        {
+            let handle = state.backend_handle();
+            lock(&handle).disconnect();
+        }
+        hm.set_fail_connect(true);
+        for attempt in 1..=3 {
+            let error = state
+                .set_output_backend_with_factories("HIDMaestro", &factories)
+                .expect_err("failing HIDMaestro switch must error");
+            assert!(
+                error.contains("sidecar failed to start"),
+                "attempt {attempt} reports the real reason: {error}"
+            );
+            assert!(
+                !error.contains("retry in 30 s"),
+                "attempt {attempt} is not yet refused: {error}"
+            );
+        }
+        // The 4th attempt inside the 30 s window is refused — and a
+        // refused attempt changes no state (the persisted choice and
+        // the selection are exactly as the 3rd failure left them).
+        let settings_before = state.settings().output_backend.clone();
+        let selected_before = state.selected_backend();
+        let error = state
+            .set_output_backend_with_factories("HIDMaestro", &factories)
+            .expect_err("4th switch must be refused by the cooldown");
+        assert_eq!(error, AppStateCore::HID_SWITCH_COOLDOWN_MESSAGE);
+        assert_eq!(state.settings().output_backend, settings_before);
+        assert_eq!(state.selected_backend(), selected_before);
+        // The guard is HIDMaestro-only: vJoy still switches.
+        let switched = state
+            .set_output_backend_with_factories("vJoy", &factories)
+            .expect("vJoy switch is unaffected by the HIDMaestro cooldown");
+        assert_eq!(switched.backend, "vJoy");
+    }
+
+    /// P2 (v2.0.11): a same-kind re-select re-arms the INSTALLED
+    /// backend in place — the backend handle Arc survives a failed
+    /// re-select (the old code replaced it with a fresh factory
+    /// build, handing every attempt a fresh manager with a full
+    /// retry budget).
+    #[test]
+    fn same_kind_reselect_reuses_installed_backend() {
+        let (factories, hm) = hidmaestro_mock_factories();
+        let (state, _dir) = test_state();
+        state
+            .set_output_backend_with_factories("HIDMaestro", &factories)
+            .expect("HIDMaestro switch succeeds");
+        assert!(state.output_state().connected);
+        {
+            let handle = state.backend_handle();
+            lock(&handle).disconnect();
+        }
+        assert!(!state.output_state().connected);
+        let handle_before = state.backend_handle();
+        hm.set_fail_connect(true);
+        hm.set_fail_connect_message("HIDMaestro sidecar failed to start.");
+        let error = state
+            .set_output_backend_with_factories("HIDMaestro", &factories)
+            .expect_err("failing re-select must error");
+        assert!(
+            error.contains("sidecar failed to start"),
+            "the real reason is reported: {error}"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&state.backend_handle(), &handle_before),
+            "the installed backend instance survives the failed re-select"
         );
     }
 
@@ -12270,16 +12490,18 @@ mod tests {
 
     /// Deep-scan Round 2 item 5 (H2 latch): re-selecting a
     /// disconnected `HIDMaestro` whose manager latch is set must
-    /// succeed — the re-select rebuilds the installed instance with
-    /// a fresh factory build (latch clear) instead of reconnecting
-    /// the latched instance, which would fail fast with
-    /// `FallbackNeeded` and fall back to vJoy. The latched instance
-    /// is modelled by a mock whose `try_connect` always fails; the
-    /// factory builds a fresh mock per call whose connect succeeds.
+    /// succeed — the re-select re-arms the INSTALLED instance in
+    /// place (P2, v2.0.11: the trait's `reset_fallback` hook clears
+    /// the latch) instead of reconnecting the latched instance,
+    /// which would fail fast with `FallbackNeeded` and fall back to
+    /// vJoy. The latched instance is modelled by a mock whose
+    /// `try_connect` fails while its latch is set; the factory
+    /// builds fresh mocks per call whose connect succeeds (the
+    /// kind-change path still uses them).
     #[test]
-    fn reselect_disconnected_hidmaestro_rebuilds_latched_instance() {
+    fn reselect_disconnected_hidmaestro_rearms_latched_instance() {
         let (latched, _latched_sent, _latched_fail) = RecordingBackend::new_named("HIDMaestro");
-        latched.set_fail_connect(true);
+        latched.set_latched(true);
         let dir = test_dir("latched-reselect");
         let store = ProfileStore::open(&dir).expect("open test store");
         let state = Arc::new(AppStateCore::new(
@@ -12298,16 +12520,20 @@ mod tests {
             })),
             none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
         };
-        // Without the rebuild this re-select would reconnect the
-        // latched instance, fail, and fall back to vJoy.
+        // Without the in-place re-arm this re-select would
+        // reconnect the latched instance, fail, and fall back to
+        // vJoy.
         state.reset_fallback();
         let outcome = state
             .apply_backend_switch(BackendKind::HidMaestro, &factories, false)
-            .expect("re-select of a latched backend must succeed on the fresh instance");
+            .expect("re-select of a latched backend must succeed on the re-armed instance");
         assert_eq!(outcome.active, BackendKind::HidMaestro);
         assert!(!outcome.fell_back);
         assert_eq!(state.backend_name(), "HIDMaestro");
-        assert!(state.output_state().connected, "fresh instance connected");
+        assert!(
+            state.output_state().connected,
+            "re-armed instance connected"
+        );
     }
 
     /// C1: the real auto-switch wiring — a fake car source + fake
