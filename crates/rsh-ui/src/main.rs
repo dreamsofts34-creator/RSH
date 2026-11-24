@@ -3569,7 +3569,9 @@ impl Ctx {
         self.backend_cooldown_until
             .set(Some(Instant::now() + BACKEND_COOLDOWN));
         win.set_backend_cooldown_secs(
-            u32::try_from(BACKEND_COOLDOWN.as_secs()).unwrap_or(u32::MAX) as i32,
+            u32::try_from(BACKEND_COOLDOWN.as_secs())
+                .unwrap_or(u32::MAX)
+                .cast_signed(),
         );
         ui_log!("RSH-UI backend switch failed — selector cooling down for 30 s");
     }
@@ -3597,8 +3599,8 @@ impl Ctx {
             }
             return;
         }
-        set_if_changed(win.get_backend_cooldown_secs(), remaining as i32, |v| {
-            win.set_backend_cooldown_secs(v)
+        set_if_changed(win.get_backend_cooldown_secs(), remaining.cast_signed(), |v| {
+            win.set_backend_cooldown_secs(v);
         });
     }
 

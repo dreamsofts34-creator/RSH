@@ -638,15 +638,15 @@ impl SidecarManager {
     /// instead of guessing.
     #[cfg(windows)]
     fn sidecar_exit_code(&self) -> Option<u32> {
-        let process = self.elevated_process?;
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::Threading::GetExitCodeProcess;
+        let process = self.elevated_process?;
         let handle = HANDLE(process as *mut std::ffi::c_void);
         let mut code = 0u32;
         // SAFETY: `handle` is the live `SEE_MASK_NOCLOSEPROCESS`
         // handle stored at spawn; `kill_transport` closes it exactly
         // once, after this read.
-        unsafe { GetExitCodeProcess(handle, &mut code).ok()? };
+        unsafe { GetExitCodeProcess(handle, &raw mut code).ok()? };
         Some(code)
     }
 
