@@ -106,6 +106,11 @@ export component SettingsScreen inherits VerticalLayout {
     // default (the window binds this to setup-address).
     in-out property <string> address: "—";
     in-out property <int> backend: 0; // 0 HIDMaestro, 1 vJoy
+    // P2 (v2.0.10 HID retest, Bug 1 retry storm): seconds left on
+    // the post-failure backend-selector cooldown, 0 = idle. Rust
+    // arms it for 30 s on ANY backend-switch failure and ticks it
+    // on the 1 Hz timer; both radios disable while it is > 0.
+    in property <int> backend-cooldown-secs: 0;
     in-out property <bool> start-with-windows: true;
     in-out property <bool> keep-in-tray: true;
     // R2-31 (UI-UX polish, h): the STORED theme choice (0 Dark,
@@ -366,17 +371,25 @@ export component SettingsScreen inherits VerticalLayout {
                                     title: "HIDMaestro";
                                     desc: "Needs admin permission when first used.";
                                     selected: backend == 0;
-                                    disabled: busy-kind == 2;
+                                    disabled: busy-kind == 2 || backend-cooldown-secs > 0;
                                     clicked => { backend = 0; backend-selected(0); }
                                 }
                                 RadioOptionCard {
                                     title: "vJoy";
                                     desc: "No admin prompt. Needs vJoy.";
                                     selected: backend == 1;
-                                    disabled: busy-kind == 2;
+                                    disabled: busy-kind == 2 || backend-cooldown-secs > 0;
                                     clicked => { backend = 1; backend-selected(1); }
                                 }
                             }
+                            // P2: the cooldown countdown — `visible`,
+                            // never `if`, so the card keeps the SAME
+                            // size while it shows/hides (a hidden
+                            // element still reserves its layout
+                            // space). The StatusBar error lives ~1 s;
+                            // this line is the visible surface for
+                            // the remaining ~29 s.
+                            Text { visible: backend-cooldown-secs > 0; text: "Retry in " + backend-cooldown-secs + " s — switching is paused after the last failure."; font-size: Theme.fs-hint; color: Theme.warn; wrap: word-wrap; }
                             // M-6 (v2.0.2): the sub-text wraps — at
                             // 920px the "Run setup" button is primary
                             // (wider), so the 39-char sub needs two
