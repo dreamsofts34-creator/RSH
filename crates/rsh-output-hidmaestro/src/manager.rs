@@ -227,6 +227,16 @@ pub struct SidecarManager {
     /// backend must stay `Send` for the engine slot.
     #[cfg(windows)]
     elevated_process: Option<usize>,
+    /// Windows elevated spawn: the sidecar's PID (P0, v2.0.11 — the
+    /// spawn PID per switch attempt, carried in the
+    /// `SidecarDied` message so the daemon log names the process
+    /// that died before hello).
+    #[cfg(windows)]
+    last_spawn_pid: Option<u32>,
+    /// When the current spawn + hello attempt started (P0, v2.0.11):
+    /// the accept→EOF elapsed ms in the `SidecarDied` message tells
+    /// an instant native crash apart from a slow clean exit.
+    hello_started: Option<Instant>,
     last_hello: Option<HelloInfo>,
     consecutive_failures: u32,
     fallback_needed: bool,
@@ -265,6 +275,9 @@ impl SidecarManager {
             token: None,
             #[cfg(windows)]
             elevated_process: None,
+            #[cfg(windows)]
+            last_spawn_pid: None,
+            hello_started: None,
             last_hello: None,
             consecutive_failures: 0,
             fallback_needed: false,
@@ -427,6 +440,9 @@ impl SidecarManager {
     }
 
     fn spawn_and_hello(&mut self) -> Result<HelloInfo, HidMaestroError> {
+        // P0 (v2.0.11): the clock for the accept→EOF elapsed ms in
+        // the `SidecarDied` message.
+        self.hello_started = Some(Instant::now());
         if !self.config.sidecar_path.is_file() {
             return Err(HidMaestroError::SidecarNotFound(
                 self.config.sidecar_path.clone(),
@@ -523,6 +539,10 @@ impl SidecarManager {
             // with `SEE_MASK_NOCLOSEPROCESS`.
             unsafe { GetProcessId(HANDLE(process as *mut std::ffi::c_void)) }
         };
+        // P0 (v2.0.11): keep the spawn PID for the `SidecarDied`
+        // message — the daemon log then names the process that died
+        // before hello, per switch attempt.
+        self.last_spawn_pid = Some(pid);
         let transport = accept_loopback(&listener, self.config.spawn_timeout, Some(pid))
             .map_err(HidMaestroError::from)?;
         self.elevated_process = Some(process);
@@ -551,11 +571,83 @@ impl SidecarManager {
                     dll_sha256_ok: reply.dll_sha256_ok,
                 })
             }
-            Ok(TransportEvent::Eof) => Err(HidMaestroError::SidecarDied(
-                "sidecar exited before hello".to_string(),
-            )),
+            Ok(TransportEvent::Eof) => {
+                // P0 (v2.0.11): the v2.0.10 failure mode — the sidecar
+                // died between connect and hello — used to report
+                // only "sidecar exited before hello", with no PID, no
+                // exit code, and no timing, so a native crash
+                // (0xC0000005, instant) was indistinguishable from a
+                // clean exit. The enriched message lands in the
+                // daemon log via the switch-failure line, and the
+                // sidecar's own file log
+                // (%PROGRAMDATA%\RSH\logs\rsh-sidecar-YYYYMMDD.log)
+                // carries its startup milestones.
+                let elapsed_ms = self
+                    .hello_started
+                    .map_or(0, |started| started.elapsed().as_millis());
+                Err(HidMaestroError::SidecarDied(
+                    self.describe_hello_eof(elapsed_ms),
+                ))
+            }
             Err(_) => Err(HidMaestroError::HelloTimeout),
         }
+    }
+
+    /// Describe a sidecar death before hello (P0, v2.0.11): PID +
+    /// exit code + accept→EOF elapsed ms. On Windows the exit code
+    /// comes from `GetExitCodeProcess` on the stored elevated-process
+    /// handle — `0xC0000005` is the native access-violation signature
+    /// (the suspected `new HMContext()` crash), `2` is the sidecar's
+    /// own clean fast-exit code, `259` (`STILL_ACTIVE`) means the
+    /// socket closed while the process was still alive. Off Windows
+    /// (stdio path) there is no process handle, so only the timing
+    /// is reported.
+    ///
+    /// `self` is only used on Windows (PID + exit code); off
+    /// Windows the method is a plain formatter — the `allow` keeps
+    /// clippy's `unused_self` quiet on non-Windows targets instead
+    /// of splitting the method per platform.
+    #[allow(clippy::unused_self)]
+    fn describe_hello_eof(&self, elapsed_ms: u128) -> String {
+        #[cfg(windows)]
+        {
+            let pid = self
+                .last_spawn_pid
+                .map_or("?".to_string(), |pid| pid.to_string());
+            match self.sidecar_exit_code() {
+                Some(259) => format!(
+                    "sidecar exited before hello (pid {pid}, process still running, {elapsed_ms} ms after spawn; sidecar log: %PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log)"
+                ),
+                Some(code) => format!(
+                    "sidecar exited before hello (pid {pid}, exit code 0x{code:08X}, {elapsed_ms} ms after spawn; sidecar log: %PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log)"
+                ),
+                None => format!(
+                    "sidecar exited before hello (pid {pid}, exit code unknown, {elapsed_ms} ms after spawn; sidecar log: %PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log)"
+                ),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            format!("sidecar exited before hello ({elapsed_ms} ms after spawn)")
+        }
+    }
+
+    /// The sidecar's exit code via `GetExitCodeProcess` on the stored
+    /// elevated-process handle (P0, v2.0.11). `None` when no handle
+    /// was stored or the query fails — the caller reports "unknown"
+    /// instead of guessing.
+    #[cfg(windows)]
+    fn sidecar_exit_code(&self) -> Option<u32> {
+        let process = self.elevated_process?;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::GetExitCodeProcess;
+        let handle = HANDLE(process as *mut std::ffi::c_void);
+        let mut code = 0u32;
+        // SAFETY: `handle` is the live `SEE_MASK_NOCLOSEPROCESS`
+        // handle stored at spawn; `kill_transport` closes it exactly
+        // once, after this read.
+        unsafe { GetExitCodeProcess(handle, &mut code).ok()? };
+        Some(code)
     }
 
     /// Send one command and wait for its reply (one in flight at a
@@ -991,6 +1083,36 @@ mod tests {
         assert!(!manager.elevation_declined());
         let error = manager.connect().expect_err("no sidecar binary on Linux");
         assert!(!matches!(error, HidMaestroError::NotAdmin));
+    }
+
+    /// P3 (v2.0.11): the v2.0.10 failure mode, on the TCP
+    /// connect-back path — a sidecar that connects and dies before
+    /// hello must make the daemon report `SidecarDied` (with the
+    /// accept→EOF elapsed ms), never hang. A stub TCP client plays
+    /// the dying sidecar: connect, then close without writing.
+    #[test]
+    fn tcp_connect_then_die_before_hello_is_sidecar_died() {
+        use crate::transport::{accept_loopback, listen_loopback};
+        use std::net::TcpStream;
+
+        let (listener, port) = listen_loopback().expect("loopback listener");
+        std::thread::spawn(move || {
+            let _stream = TcpStream::connect(("127.0.0.1", port)).expect("connect back");
+            // Dropped without writing: EOF before hello.
+        });
+        let transport = accept_loopback(&listener, Duration::from_secs(5), None).expect("accept");
+        let mut manager = SidecarManager::new(SidecarConfig::with_path(PathBuf::from(
+            "/nonexistent/rsh-hidmaestro-sidecar",
+        )));
+        manager.transport = Some(transport);
+        manager.hello_started = Some(Instant::now());
+        let err = manager
+            .read_hello(None)
+            .expect_err("EOF before hello must fail");
+        assert!(matches!(err, HidMaestroError::SidecarDied(_)));
+        let message = err.to_string();
+        assert!(message.contains("exited before hello"), "{message}");
+        assert!(message.contains("ms after spawn"), "{message}");
     }
 
     /// H4 (v2.0.8 retest Bug 1): `read_hello` preserves the

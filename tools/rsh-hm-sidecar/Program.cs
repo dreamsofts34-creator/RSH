@@ -17,7 +17,10 @@
 // the pinned constant), no reflection — that is what the spike's
 // IL3050/IL2026 warnings came from.
 //
-// Logging goes to stderr only. stdout is the protocol.
+// Logging goes to stderr AND the file log
+// (%PROGRAMDATA%\RSH\logs\rsh-sidecar-YYYYMMDD.log, v2.0.11 P0 —
+// stderr is discarded on the TCP path and when elevated).
+// stdout is the protocol.
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -40,6 +43,42 @@ internal static class Program
     static string? dllSha256Cache;
     static bool dllSha256OkCache;
     static readonly Stopwatch sw = Stopwatch.StartNew();
+    // P0 (v2.0.11): the sidecar's file log. Log() used to write to
+    // stderr only, which the daemon never captures on the TCP path
+    // (and which is discarded when the sidecar runs elevated) — so a
+    // sidecar that died before hello left no trace anywhere. The log
+    // lives in %PROGRAMDATA%\RSH\logs (all-users, writable from an
+    // elevated process — %APPDATA% would resolve under the admin
+    // token, not the user's), one file per local day, mirroring the
+    // daemon's rsh-YYYYMMDD.log naming. Best-effort: logging must
+    // never break the protocol loop.
+    static string? logFilePath;
+    static bool logFilePathResolved;
+
+    static string? LogFilePath()
+    {
+        if (logFilePathResolved)
+        {
+            return logFilePath;
+        }
+
+        logFilePathResolved = true;
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "RSH",
+                "logs");
+            Directory.CreateDirectory(dir);
+            logFilePath = Path.Combine(dir, $"rsh-sidecar-{DateTime.Now:yyyyMMdd}.log");
+        }
+        catch
+        {
+            logFilePath = null;
+        }
+
+        return logFilePath;
+    }
 
     static int Main(string[] args)
     {
@@ -51,15 +90,8 @@ internal static class Program
         {
             // Last resort: the process cannot even start the loop
             // (missing DLL, no listener). Never crash silently.
-            try
-            {
-                Console.Error.WriteLine($"[sidecar] fatal: {ex.GetType().Name}: {ex.Message}");
-            }
-            catch
-            {
-                // Stderr is gone too; nothing left to do.
-            }
-
+            // Log() also writes the file log (P0, v2.0.11).
+            Log($"fatal: {ex.GetType().Name}: {ex.Message}");
             return 2;
         }
     }
@@ -87,7 +119,9 @@ internal static class Program
         {
             var parts = connectBack.Split(':');
             tcp = new TcpClient();
+            Log($"connect-back {connectBack} (token present={!string.IsNullOrEmpty(token)})");
             tcp.Connect(parts[0], int.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture));
+            Log("tcp connected");
             var stream = tcp.GetStream();
             reader = new StreamReader(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
             writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
@@ -112,8 +146,19 @@ internal static class Program
         Console.CancelKeyPress += (_, _) => DisposeAll();
 
         var (dllSha256, dllSha256Ok) = CheckDllHash();
-        EnsureCtxBestEffort();
 
+        // P1 (v2.0.11): the hello goes out BEFORE the HIDMaestro
+        // context is created. `new HMContext()` is the prime suspect
+        // for the v2.0.10 native crash (30/30 deaths between connect
+        // and hello on Win10 22H2) — a native crash there is invisible
+        // (no managed exception, no stderr on the TCP path) and used
+        // to kill the sidecar before it ever said hello. The hello
+        // already tolerates a null context (`DriverInstalled` is
+        // `ctx?.IsDriverInstalled`), so sending it first turns a
+        // context-creation failure into a diagnosable, recoverable
+        // protocol state: the daemon gets a live sidecar, and
+        // install-driver / create then report `context-unavailable`
+        // instead of the sidecar vanishing.
         Log($"start transport={transport} sdk={Constants.PinnedVersion} admin={IsAdmin()} dll_ok={dllSha256Ok}");
 
         var hello = new SidecarReply
@@ -133,6 +178,10 @@ internal static class Program
             DllSha256Ok = dllSha256Ok,
         };
         WriteReply(writer, hello);
+        Log("hello sent");
+
+        EnsureCtxBestEffort();
+        Log($"context ready={ctx is not null} driver_installed={ctx?.IsDriverInstalled}");
 
         string? line;
         while ((line = reader.ReadLine()) is not null)
@@ -302,7 +351,11 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            return Error("driver-install-failed", $"cannot create HIDMaestro context: {ex.Message}");
+            // P1 (v2.0.11): a context that cannot be created is a
+            // distinct, diagnosable state — the sidecar is alive, the
+            // HIDMaestro context is not. The Rust side maps this code
+            // to `ContextUnavailable`, never to a generic failure.
+            return Error("context-unavailable", $"cannot create HIDMaestro context: {ex.Message}");
         }
 
         if (ctx!.IsDriverInstalled)
@@ -371,7 +424,9 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            return Error("create-failed", $"cannot create HIDMaestro context: {ex.Message}");
+            // P1 (v2.0.11): see InstallDriver — a context that cannot
+            // be created is `context-unavailable`, not `create-failed`.
+            return Error("context-unavailable", $"cannot create HIDMaestro context: {ex.Message}");
         }
 
         if (!ctx!.IsDriverInstalled)
@@ -741,13 +796,32 @@ internal static class Program
 
     static void Log(string message)
     {
+        // P0 (v2.0.11): stderr AND the file log
+        // (%PROGRAMDATA%\RSH\logs\rsh-sidecar-YYYYMMDD.log) — stderr
+        // is discarded on the TCP path and when elevated, so the file
+        // is the only trace a pre-hello death leaves. Best-effort:
+        // logging must never break the protocol loop.
+        var line = $"[sidecar] [{DateTime.Now:HH:mm:ss.fff}] {message}";
         try
         {
-            Console.Error.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
+            Console.Error.WriteLine(line);
         }
         catch
         {
-            // Logging must never break the protocol loop.
+            // Stderr is gone; the file log below may still work.
+        }
+
+        try
+        {
+            var path = LogFilePath();
+            if (path is not null)
+            {
+                File.AppendAllText(path, line + Environment.NewLine);
+            }
+        }
+        catch
+        {
+            // File log unwritable; stderr already carried the line.
         }
     }
 }

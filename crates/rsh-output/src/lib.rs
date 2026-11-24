@@ -99,4 +99,15 @@ pub trait IJoystickOutput: Send {
     /// (e.g. misuse after a failed connect); driver failures during
     /// the neutral send itself are swallowed by design.
     fn send_neutral(&mut self) -> Result<(), VJoyError>;
+
+    /// Clear a latched failure state on an explicit user re-select
+    /// (P2, v2.0.11). Default: no-op — backends without a latch keep
+    /// it. `HIDMaestro` overrides it to clear its sidecar manager's
+    /// fallback / UAC-decline latches IN PLACE, so the re-select
+    /// retries with the SAME manager instead of a fresh factory build
+    /// (a fresh build used to defeat the manager's 2-failure latch
+    /// and clear `elevation_declined` on every attempt — the retry
+    /// storm's enabler). Only an explicit re-select calls this;
+    /// ordinary attempts reuse the latched manager and fail fast.
+    fn reset_fallback(&mut self) {}
 }

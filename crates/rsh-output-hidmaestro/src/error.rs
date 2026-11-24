@@ -41,6 +41,16 @@ pub enum HidMaestroError {
     DriverNotInstalled(String),
     /// `InstallDriver()` failed.
     DriverInstallFailed(String),
+    /// The sidecar is alive but its `HIDMaestro` context could not be
+    /// created (P1, v2.0.11 — the sidecar reports
+    /// `context-unavailable` when `new HMContext()` throws; a native
+    /// crash there instead surfaces as [`SidecarDied`](Self::SidecarDied)).
+    /// Distinct from [`DriverInstallFailed`](Self::DriverInstallFailed):
+    /// the driver install was never attempted — the context itself is
+    /// unavailable on this PC. The sidecar log
+    /// (`%PROGRAMDATA%\RSH\logs\rsh-sidecar-YYYYMMDD.log`) names the
+    /// failure.
+    ContextUnavailable(String),
     /// The requested profile was refused (brand catalog profile, usbip
     /// composite, own-reports, or not deployable — SEC-H-06).
     ProfileRefused(String),
@@ -98,6 +108,10 @@ impl fmt::Display for HidMaestroError {
             Self::DriverInstallFailed(msg) => {
                 write!(f, "HIDMaestro driver install failed: {msg}")
             }
+            Self::ContextUnavailable(msg) => write!(
+                f,
+                "HIDMaestro context is unavailable: {msg} — the sidecar is running but HIDMaestro could not start on this PC. Check the sidecar log (%PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log) or switch the output backend to vJoy."
+            ),
             Self::ProfileRefused(msg) => write!(f, "{msg}"),
             Self::CreateFailed(msg) => {
                 write!(f, "HIDMaestro device could not be created: {msg}")

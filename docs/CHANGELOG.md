@@ -1,10 +1,89 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.10 · firmware v4.0.4 · protocol v2.2 (frozen)**.
+**app v2.0.11 · firmware v4.0.4 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.11] — 2026-11-24
+
+App-only release (firmware stays v4.0.4, protocol v2.2 frozen — no
+firmware change). The HID fix batch for the v2.0.10 user-PC retest
+Bug 1: the HIDMaestro sidecar died between connect and hello,
+30/30 times, with no trace anywhere.
+
+**HID backend — sidecar death before hello (root cause addressed).**
+
+- **Hello before context (P1).** The sidecar now sends its hello
+  BEFORE creating the HIDMaestro context (`new HMContext()` is the
+  prime suspect for the native crash — a native crash there used to
+  kill the sidecar before it ever said hello). The hello already
+  tolerates a null context, so a context failure is now a
+  diagnosable, recoverable protocol state instead of an invisible
+  fatal crash. A sidecar whose context cannot be created reports
+  `context-unavailable` from install-driver / create (new
+  `ContextUnavailable` error + Output-page state), instead of
+  vanishing.
+- **Win10 22H2 investigation (P1).** No concrete Win10
+  incompatibility was found: HIDMaestro's own prerequisites say
+  "Windows 10/11", and the `windows10.0.26100.0` annotation is a
+  build-time API-surface marker, not a runtime OS requirement
+  (Microsoft: the TFM version "doesn't control the OS version that
+  your app supports at runtime"). No Win10-specific fix was
+  invented; the proof needed is the Event Viewer Application-log
+  entry (Event 1000) at a failure timestamp.
+
+**Diagnostics (P0) — a pre-hello death now leaves a trace.**
+
+- The sidecar writes a file log,
+  `%PROGRAMDATA%\RSH\logs\rsh-sidecar-YYYYMMDD.log`, with startup
+  milestones (connect ok, DLL-hash verdict, context result, hello
+  sent) — stderr alone was discarded on the TCP path and when
+  elevated.
+- The daemon's `SidecarDied` message now carries the sidecar's PID,
+  its exit code via `GetExitCodeProcess` (0xC0000005 = native crash,
+  2 = clean exit), and the accept→EOF elapsed ms, so an instant
+  native crash is distinguishable from a clean exit. It lands in
+  the daemon log through the switch-failure line.
+- The daemon logs its own elevation state at startup (`daemon:
+  elevation: …`) — an elevated daemon (the v2.0.10 finding) is now
+  visible in the log instead of inferable.
+- The installer registers WER LocalDumps for `RshCoreHiDcr.exe`
+  too (daemon/UI only before) — a sidecar native crash now
+  produces a dump in `%ProgramData%\RSH\dumps`.
+
+**Retry storm (P2) — explicit switches are rate-limited.**
+
+- After 3 consecutive failed explicit switches to HIDMaestro,
+  further explicit switches are refused for 30 s with "HIDMaestro
+  switch failed 3 times — retry in 30 s" (the UI shows the same
+  30 s cooldown). A successful switch resets the count.
+- An explicit re-select now re-arms the INSTALLED backend in place
+  (new `IJoystickOutput::reset_fallback` hook) instead of
+  replacing it with a fresh factory build — a fresh build used to
+  hand every attempt a fresh manager with a full retry budget,
+  defeating the 2-failure latch and clearing the UAC-decline latch.
+
+**Installer (P4) — no more elevated launch.**
+
+- The finish-page "Run RSH" checkbox now launches the UI
+  non-elevated via explorer.exe (the standard stock-NSIS
+  technique) instead of `ExecShell`, which inherited the elevated
+  installer token — the UI and the daemon it spawns ran elevated,
+  so the sidecar's UAC prompt never appeared. The after-update
+  daemon restart uses the same non-elevated launch.
+
+**CI (P3) — the TCP path is tested now.**
+
+- `check-sidecar-hello.ps1` now also spawns the staged sidecar
+  with `--connect-back` + token, accepts the loopback connection,
+  and asserts a hello arrives over the socket (the v2.0.10 failure
+  mode passed the old stdio-only check). It also asserts the
+  sidecar file log exists with the 'hello sent' milestone.
+- New Rust test: a sidecar that connects and dies before hello
+  must report `SidecarDied`, never hang
+  (`tcp_connect_then_die_before_hello_is_sidecar_died`).
 
 ## [2.0.10] — 2026-11-24
 

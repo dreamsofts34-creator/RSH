@@ -71,7 +71,10 @@
 #          admin`) — never at login;
 #        * modern MUI2 wizard (welcome / license / directory /
 #          install / finish + RSH branding + a "Run RSH" finish
-#          checkbox that launches the UI via ExecShell) — silent
+#          checkbox that launches the UI NON-elevated via
+#          explorer.exe — v2.0.11 P4: the old ExecShell launch
+#          inherited the elevated installer token, so the UI and
+#          the daemon it spawns ran elevated) — silent
 #          (/S) installs skip all pages, so the headless smoke
 #          test is structurally unaffected;
 #        * creates the program-scoped inbound UDP firewall rule for
@@ -79,8 +82,10 @@
 #          C-10) via `netsh` (hidden, `nsExec`), and removes it on
 #          uninstall;
 #        * registers the WER LocalDumps keys for rsh-daemon.exe /
-#          rsh-ui.exe (Round 3 WS-6, R3-AK-02 — native-crash dumps
-#          to `%ProgramData%\RSH\dumps`, DumpCount 5) and removes
+#          rsh-ui.exe / RshCoreHiDcr.exe (Round 3 WS-6, R3-AK-02 —
+#          native-crash dumps to `%ProgramData%\RSH\dumps`,
+#          DumpCount 5; v2.0.11 P0 adds the sidecar — its native
+#          crash used to leave no dump at all) and removes
 #          them on uninstall (the dumps themselves are kept, like
 #          `%APPDATA%\RSH`);
 #        * creates the "RSH Daemon" Task Scheduler supervisor task
@@ -664,13 +669,28 @@ jobs:
           !insertmacro MUI_UNPAGE_INSTFILES
           !insertmacro MUI_UNPAGE_FINISH
           !insertmacro MUI_LANGUAGE "English"
-          ; ExecShell, NOT Exec (DS-70, same lesson as the update
-          ; daemon restart below): NSIS Exec inherits the
-          ; installer's stdio pipes to the forever-running UI, so
-          ; the installer would never exit. ShellExecuteEx gives
-          ; the UI a fresh handle table.
+          ; P4 (v2.0.11): launch the UI NON-elevated. The old
+          ; `ExecShell "open"` inherited the elevated installer
+          ; token, so the UI — and the daemon it spawns — ran
+          ; elevated (design violation: "daemon must never run
+          ; elevated"), which suppressed the sidecar's UAC prompt
+          ; entirely on the v2.0.10 retest. Explorer runs at the
+          ; user's medium integrity level and launches the UI
+          ; there; the UI then spawns the daemon non-elevated, so
+          ; the "Windows will ask once" promise holds. This is the
+          ; standard stock-NSIS technique (no plugin): launching
+          ; explorer.exe with the target as its argument asks the
+          ; shell to start it unelevated. Caveat: it relies on
+          ; Explorer being the shell — if it is not, the launch
+          ; silently does nothing and the user starts RSH from the
+          ; Start menu instead. `Exec`, NOT `ExecShell` (DS-70):
+          ; NSIS Exec does not wait, and explorer.exe exits at
+          ; once after handing off, so the installer is never held
+          ; open by inherited pipes — the launched UI is a child
+          ; of Explorer, not of the installer, so it inherits no
+          ; installer handles at all.
           Function LaunchRSH
-            ExecShell "open" "$INSTDIR\rsh-ui.exe"
+            Exec '"$WINDIR\explorer.exe" "$INSTDIR\rsh-ui.exe"'
           FunctionEnd
           ; Smart-installer state: set by .onInit (detection) and read
           ; by the install section (daemon restart after an update).
@@ -865,6 +885,13 @@ jobs:
             WriteRegStr HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe" "DumpFolder" "$COMMONPROGRAMDATA\RSH\dumps"
             WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe" "DumpType" 1
             WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe" "DumpCount" 5
+            ; P0 (v2.0.11): the sidecar too — its suspected native
+            ; crash inside `new HMContext()` left no dump at all in
+            ; the v2.0.10 retest because only daemon/UI were
+            ; registered, so the dumps folder looked empty.
+            WriteRegStr HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\RshCoreHiDcr.exe" "DumpFolder" "$COMMONPROGRAMDATA\RSH\dumps"
+            WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\RshCoreHiDcr.exe" "DumpType" 1
+            WriteRegDWORD HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\RshCoreHiDcr.exe" "DumpCount" 5
             SetRegView 32
             ; Round 3 WS-6 (R3-AK-01): Task Scheduler supervisor —
             ; the "RSH Daemon" task relaunches the daemon at logon
@@ -906,19 +933,21 @@ jobs:
             ; After an update, restart the daemon (it was stopped
             ; above so its files could be replaced). Fresh installs do
             ; not start it — the UI self-spawns it on first launch.
-            ; ExecShell, NOT Exec: NSIS Exec calls CreateProcess with
-            ; bInheritHandles=TRUE, so the forever-running daemon
-            ; inherits the installer's stdio/nsExec pipes and holds
-            ; them open — the silent installer then never finishes
-            ; and the caller (Start-Process -Wait) hangs forever.
-            ; This hung release run 44047919933 for 13+ min at the
-            ; second (update) install until the run was cancelled
-            ; (orphan rsh-daemon pid 8920 was still alive). The same
-            ; inherited-pipe hang is documented in nteract/nteract
-            ; aa838d9. ShellExecuteEx gives the daemon a fresh handle
-            ; table, so the installer can exit.
+            ; P4 (v2.0.11): restart it NON-elevated, via explorer.exe
+            ; (same technique as LaunchRSH above) — the old
+            ; `ExecShell "open"` inherited the elevated installer
+            ; token, so the restarted daemon ran elevated until the
+            ; next logon, the same design violation as the finish
+            ; page. `Exec` of explorer.exe does not wait, explorer
+            ; exits at once after handing off, and the daemon is a
+            ; child of Explorer — so it inherits no installer
+            ; handles, and the DS-70 inherited-pipe hang (release
+            ; run 44047919933, 13+ min) cannot recur through this
+            ; path either: the old `Exec` hang needed the daemon to
+            ; inherit the installer's pipes, which only happens when
+            ; the installer itself is the parent.
             ${If} $UpdateMode == "1"
-              ExecShell "open" "$INSTDIR\rsh-daemon.exe"
+              Exec '"$WINDIR\explorer.exe" "$INSTDIR\rsh-daemon.exe"'
             ${EndIf}
           SectionEnd
           Section "Uninstall"
@@ -961,6 +990,7 @@ jobs:
             SetRegView 64
             DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-daemon.exe"
             DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe"
+            DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\RshCoreHiDcr.exe"
             SetRegView 32
             Delete "$INSTDIR\rsh-daemon.exe"
             Delete "$INSTDIR\rsh-ui.exe"

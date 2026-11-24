@@ -9,6 +9,20 @@
 # the pinned SDK. Fail-closed on timeout, on a non-hello first
 # line, or on a bad verdict.
 #
+# v2.0.11 (P3): the stdio check never exercised the production
+# TCP connect-back path — the v2.0.10 failure mode (sidecar dies
+# between tcp.Connect and hello) passed it. The script now ALSO
+# spawns the sidecar with --connect-back + RSH_HM_SIDECAR_TOKEN,
+# accepts the loopback connection, and asserts a hello arrives
+# over the socket with the token echoed. It then asserts the
+# sidecar file log (%PROGRAMDATA%\RSH\logs\rsh-sidecar-*.log)
+# exists with the 'hello sent' milestone (P0).
+#
+# The daemon-side negative test — a sidecar that connects and dies
+# before hello must report SidecarDied, never hang — lives in the
+# Rust suite (manager::tests::tcp_connect_then_die_before_hello_is_sidecar_died),
+# which runs on the Windows CI job too.
+#
 # The sidecar is a WinExe (no console): stdout/stderr go to files
 # via Start-Process redirection (no pipe-buffer deadlock), and
 # stdin comes from an empty file so the sidecar sees EOF and exits
@@ -79,4 +93,99 @@ if ("$($hello.dll_sha256)".ToLower() -ne $ExpectedDllSha256) {
   Write-Error "Sidecar hello check: dll_sha256 is '$($hello.dll_sha256)', expected '$ExpectedDllSha256'."
   exit 1
 }
-Write-Host "Sidecar hello OK: sdk $($hello.sdk), dll_sha256_ok $($hello.dll_sha256_ok), admin $($hello.admin), transport $($hello.transport), exit $($p.ExitCode)."
+Write-Host "Sidecar hello OK (stdio): sdk $($hello.sdk), dll_sha256_ok $($hello.dll_sha256_ok), admin $($hello.admin), transport $($hello.transport), exit $($p.ExitCode)."
+
+# --- TCP connect-back path (v2.0.11, P3) ---------------------------------
+# The v2.0.10 failure mode happened ONLY on this path: the sidecar
+# died between tcp.Connect and hello, and the stdio check above
+# never exercised the connect-back at all (CI hello check ran the
+# sidecar directly with stdin closed). So: listen on loopback,
+# spawn the sidecar with --connect-back + RSH_HM_SIDECAR_TOKEN,
+# accept, and assert a hello line arrives OVER THE SOCKET with the
+# token echoed and the DLL verdict OK. Fail closed on timeout, on
+# a non-hello first line, or on a bad verdict / wrong token echo.
+$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+$listener.Start()
+$tcpPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+$token = -join ((1..32) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) })
+$env:RSH_HM_SIDECAR_TOKEN = $token
+$tcpErrFile = Join-Path $tmp "tcp.stderr.txt"
+Remove-Item $tcpErrFile -Force -ErrorAction SilentlyContinue
+$tcpClient = $null
+$p2 = $null
+try {
+  $p2 = Start-Process -FilePath (Resolve-Path $Exe).Path `
+    -ArgumentList "--connect-back", "127.0.0.1:$tcpPort" `
+    -RedirectStandardError $tcpErrFile -PassThru -NoNewWindow
+  $acceptTask = $listener.AcceptTcpClientAsync()
+  if (-not $acceptTask.Wait(15000)) {
+    $p2.Kill()
+    Write-Error "Sidecar hello check (TCP): sidecar did not connect back to 127.0.0.1:$tcpPort within 15 s."
+    exit 1
+  }
+  $tcpClient = $acceptTask.Result
+  $reader = [System.IO.StreamReader]::new($tcpClient.GetStream())
+  $readTask = $reader.ReadLineAsync()
+  if (-not $readTask.Wait(15000)) {
+    $p2.Kill()
+    Write-Error "Sidecar hello check (TCP): no hello line arrived over the socket within 15 s (the v2.0.10 failure mode — sidecar died between connect and hello)."
+    exit 1
+  }
+  $tcpLine = $readTask.Result
+  if (-not $tcpLine) {
+    $tcpErr = if (Test-Path $tcpErrFile) { Get-Content $tcpErrFile -Raw } else { "" }
+    Write-Error "Sidecar hello check (TCP): socket closed before hello (EOF). Sidecar stderr: $tcpErr"
+    exit 1
+  }
+  try {
+    $tcpHello = $tcpLine | ConvertFrom-Json
+  } catch {
+    Write-Error "Sidecar hello check (TCP): first socket line is not JSON: $tcpLine"
+    exit 1
+  }
+  if ($tcpHello.hello -ne "rsh-hm-sidecar" -and $tcpHello.sidecar -ne "rsh-hm-sidecar") {
+    Write-Error "Sidecar hello check (TCP): first line is not a hello: $tcpLine"
+    exit 1
+  }
+  if ($tcpHello.sdk -ne $ExpectedSdk) {
+    Write-Error "Sidecar hello check (TCP): sdk is '$($tcpHello.sdk)', expected '$ExpectedSdk'."
+    exit 1
+  }
+  if ($tcpHello.dll_sha256_ok -ne $true) {
+    Write-Error "Sidecar hello check (TCP): dll_sha256_ok is '$($tcpHello.dll_sha256_ok)'."
+    exit 1
+  }
+  if ($tcpHello.token -ne $token) {
+    Write-Error "Sidecar hello check (TCP): hello did not echo the loopback token."
+    exit 1
+  }
+  if ($tcpHello.transport -ne "tcp") {
+    Write-Error "Sidecar hello check (TCP): transport is '$($tcpHello.transport)', expected 'tcp'."
+    exit 1
+  }
+  Write-Host "Sidecar hello OK (TCP connect-back): sdk $($tcpHello.sdk), dll_sha256_ok $($tcpHello.dll_sha256_ok), admin $($tcpHello.admin), transport $($tcpHello.transport), pid $($tcpHello.pid)."
+} finally {
+  if ($null -ne $tcpClient) { $tcpClient.Close() }
+  $listener.Stop()
+  if ($null -ne $p2) {
+    # Closing the socket is the sidecar's EOF: it disposes and exits.
+    if (-not $p2.WaitForExit(10000)) { $p2.Kill() }
+  }
+  Remove-Item Env:\RSH_HM_SIDECAR_TOKEN -ErrorAction SilentlyContinue
+}
+
+# --- Sidecar file log (v2.0.11, P0) --------------------------------------
+# Both runs above must have written the file log
+# (%PROGRAMDATA%\RSH\logs\rsh-sidecar-YYYYMMDD.log) with the hello
+# milestone — it is the only trace a pre-hello death leaves.
+$sidecarLogs = Get-ChildItem "$env:ProgramData\RSH\logs\rsh-sidecar-*.log" -ErrorAction SilentlyContinue
+if (-not $sidecarLogs) {
+  Write-Error "Sidecar hello check: no sidecar file log found at %PROGRAMDATA%\RSH\logs\rsh-sidecar-*.log (the sidecar must log to file as well as stderr)."
+  exit 1
+}
+$logText = ($sidecarLogs | Get-Content -Raw) -join "`n"
+if ($logText -notmatch "hello sent") {
+  Write-Error "Sidecar hello check: sidecar file log exists but contains no 'hello sent' milestone."
+  exit 1
+}
+Write-Host "Sidecar file log OK: $($sidecarLogs.Count) file(s) under %PROGRAMDATA%\RSH\logs, 'hello sent' present."
