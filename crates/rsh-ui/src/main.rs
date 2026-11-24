@@ -3599,9 +3599,13 @@ impl Ctx {
             }
             return;
         }
-        set_if_changed(win.get_backend_cooldown_secs(), remaining.cast_signed(), |v| {
-            win.set_backend_cooldown_secs(v);
-        });
+        set_if_changed(
+            win.get_backend_cooldown_secs(),
+            remaining.cast_signed(),
+            |v| {
+                win.set_backend_cooldown_secs(v);
+            },
+        );
     }
 
     /// Drive the M-2 daemon-error banner (FC2): the fatal reason
@@ -15364,9 +15368,7 @@ mod tests {
             "countdown ticks to the seconds left"
         );
         ctx.backend_cooldown_until.set(Some(
-            Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .unwrap(),
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         ));
         ctx.sync_backend_cooldown(&win);
         assert_eq!(
