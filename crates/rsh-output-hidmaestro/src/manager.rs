@@ -543,9 +543,18 @@ impl SidecarManager {
         // message — the daemon log then names the process that died
         // before hello, per switch attempt.
         self.last_spawn_pid = Some(pid);
-        let transport = accept_loopback(&listener, self.config.spawn_timeout, Some(pid))
-            .map_err(HidMaestroError::from)?;
+        // Keep the process handle BEFORE waiting for the connect-back:
+        // when the accept fails (slow UAC, foreign peer, I/O error) the
+        // elevated sidecar must be terminated and its handle closed,
+        // not leaked (a retry would otherwise spawn a second one).
         self.elevated_process = Some(process);
+        let transport = match accept_loopback(&listener, self.config.spawn_timeout, Some(pid)) {
+            Ok(transport) => transport,
+            Err(error) => {
+                self.kill_transport();
+                return Err(HidMaestroError::from(error));
+            }
+        };
         self.token = Some(token.clone());
         self.transport = Some(transport);
         self.read_hello(Some(token.as_str()))
@@ -663,6 +672,23 @@ impl SidecarManager {
     /// own error is *not* mapped here — use
     /// [`request_checked`](Self::request_checked) for that.
     pub fn request(&mut self, cmd: &Command) -> Result<Reply, HidMaestroError> {
+        self.request_with_timeout(cmd, self.config.reply_timeout)
+    }
+
+    /// [`request`](Self::request) with an explicit reply bound, for
+    /// the slow driver operations (`install-driver`, `create`): the
+    /// 200 ms default is meant for submit / ping, and a driver
+    /// install takes seconds — it used to time out, kill the elevated
+    /// sidecar mid-install and latch the vJoy fallback.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`request`](Self::request).
+    pub fn request_with_timeout(
+        &mut self,
+        cmd: &Command,
+        timeout: Duration,
+    ) -> Result<Reply, HidMaestroError> {
         let line = encode_command(cmd)?;
         let Some(transport) = self.transport.as_mut() else {
             return Err(HidMaestroError::NotConnected);
@@ -672,7 +698,7 @@ impl SidecarManager {
             self.note_failure();
             return Err(HidMaestroError::SidecarDied(e.to_string()));
         }
-        match transport.events.recv_timeout(self.config.reply_timeout) {
+        match transport.events.recv_timeout(timeout) {
             Ok(TransportEvent::Line(line)) => {
                 self.last_reply = Some(Instant::now());
                 parse_reply(&line)
@@ -757,7 +783,8 @@ impl SidecarManager {
     ///
     /// Propagates request errors plus `NotAdmin` / `DriverInstallFailed`.
     pub fn install_driver(&mut self) -> Result<InstallInfo, HidMaestroError> {
-        let reply = self.request_checked(&Command::InstallDriver)?;
+        let reply = self.request_with_timeout(&Command::InstallDriver, self.config.spawn_timeout)?;
+        reply_to_error(&reply)?;
         Ok(InstallInfo {
             was_installed: reply.was_installed.unwrap_or(false),
             now_installed: reply.now_installed.unwrap_or(false),
@@ -772,9 +799,13 @@ impl SidecarManager {
     ///
     /// Propagates request errors plus `ProfileRefused` / `CreateFailed`.
     pub fn create(&mut self) -> Result<CreateInfo, HidMaestroError> {
-        let reply = self.request_checked(&Command::Create {
-            profile: PROFILE_ID.to_string(),
-        })?;
+        let reply = self.request_with_timeout(
+            &Command::Create {
+                profile: PROFILE_ID.to_string(),
+            },
+            self.config.spawn_timeout,
+        )?;
+        reply_to_error(&reply)?;
         // C2: parse the REAL sidecar shape — `axes` is a count
         // (`axes == 5` ⇒ all five axes). No `capabilities` object
         // (older sidecar) falls back to the custom-wheel caps.

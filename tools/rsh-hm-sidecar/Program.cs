@@ -183,35 +183,50 @@ internal static class Program
         EnsureCtxBestEffort();
         Log($"context ready={ctx is not null} driver_installed={ctx?.IsDriverInstalled}");
 
-        string? line;
-        while ((line = reader.ReadLine()) is not null)
+        try
         {
-            SidecarReply reply;
-            try
+            string? line;
+            while ((line = reader.ReadLine()) is not null)
             {
-                reply = Handle(line);
-            }
-            catch (Exception ex)
-            {
-                Log($"command failed: {ex.GetType().Name}: {ex.Message}");
-                reply = new SidecarReply
+                SidecarReply reply;
+                try
                 {
-                    Ok = false,
-                    Code = "internal-error",
-                    Error = $"{ex.GetType().Name}: {ex.Message}",
-                };
+                    reply = Handle(line);
+                }
+                catch (Exception ex)
+                {
+                    Log($"command failed: {ex.GetType().Name}: {ex.Message}");
+                    reply = new SidecarReply
+                    {
+                        Ok = false,
+                        Code = "internal-error",
+                        Error = $"{ex.GetType().Name}: {ex.Message}",
+                    };
+                }
+
+                WriteReply(writer, reply);
+                if (exitRequested)
+                {
+                    break;
+                }
             }
 
-            WriteReply(writer, reply);
-            if (exitRequested)
-            {
-                break;
-            }
+            Log("stdin EOF / exit — disposing");
+        }
+        catch (IOException ex)
+        {
+            // A socket reset / broken pipe while reading or writing:
+            // the daemon went away. Fall through to the cleanup below
+            // instead of skipping it (the virtual controller must be
+            // disposed on EVERY exit path, not only a clean EOF).
+            Log($"transport error: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            DisposeAll();
+            tcp?.Dispose();
         }
 
-        Log("stdin EOF / exit — disposing");
-        DisposeAll();
-        tcp?.Dispose();
         return 0;
     }
 

@@ -245,7 +245,20 @@ pub fn accept_loopback(
                 }
                 #[cfg(windows)]
                 if let Some(pid) = expected_pid {
-                    verify_loopback_peer_pid(&stream, pid)?;
+                    // A foreign local process that connects first
+                    // must not abort the wait (and orphan the real
+                    // sidecar): drop it and keep listening until the
+                    // deadline. Only the table query itself failing
+                    // is a hard error (`ErrorKind::Other` from the
+                    // lookup; a PID mismatch is `PermissionDenied`).
+                    match verify_loopback_peer_pid(&stream, pid) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            drop(stream);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 #[cfg(not(windows))]
                 let _ = expected_pid;
@@ -379,10 +392,13 @@ fn verify_loopback_peer_pid(stream: &TcpStream, expected_pid: u32) -> std::io::R
             if row.dwOwningPid == expected_pid {
                 return Ok(());
             }
-            return Err(std::io::Error::other(format!(
-                "loopback peer is PID {}, not the spawned sidecar PID {expected_pid}",
-                row.dwOwningPid
-            )));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "loopback peer is PID {}, not the spawned sidecar PID {expected_pid}",
+                    row.dwOwningPid
+                ),
+            ));
         }
     }
     Err(std::io::Error::other(

@@ -9,7 +9,7 @@
 // a `mode` binding, so switching theme repaints the whole UI; no
 // screen reads a literal colour for a themed surface any more.
 // Light palette: bg #F5F3FF (approved light bg), panel pure white.
-// Contrast (WCAG, vs white panel): text 17.2, mute 6.7, faint 4.6,
+// Contrast (WCAG, vs white panel): text 17.2, mute 6.7, faint 5.8,
 // accent-text 6.2, ok 5.4, warn 5.5, bad 5.5 — all >= 4.5:1. White on
 // accent is 4.50:1 in both themes.
 export global Theme {
@@ -24,7 +24,9 @@ export global Theme {
     in-out property <color> line: is-light ? #D9D4EC : #262F40;
     in-out property <color> text: is-light ? #171B26 : #E9EDF4;
     in-out property <color> mute: is-light ? #565C6E : #9AA5B8;
-    in-out property <color> faint: is-light ? #6E7490 : #7C879B;
+    // WCAG AA (4.5:1) on every surface the hint text sits on: panel,
+    // panel2, selected/accent tints (was 4.0-4.3 on panel2 / side / bg).
+    in-out property <color> faint: is-light ? #5F657F : #8892A6;
     in-out property <color> accent: #2F6BFF;
     in-out property <color> accent-text: is-light ? #2456D6 : #8EB0FF;
     in-out property <color> ok: is-light ? #157A4C : #3DD68C;
@@ -97,7 +99,9 @@ export global Theme {
     // darkens in Light (white label stays 4.5:1 on both).
     in-out property <color> hover-bg: is-light ? #E3E8F6 : #28324A;
     in-out property <color> pressed-bg: is-light ? #D2D9EC : #1A2233;
-    in-out property <color> accent-hover: is-light ? #2456D6 : #4A7DFF;
+    // Dark hover DARKENS (white label 5.1:1); the old lighter #4A7DFF
+    // dropped the white label to 3.7:1 (below AA).
+    in-out property <color> accent-hover: is-light ? #2456D6 : #2A63F0;
     in-out property <color> accent-pressed: is-light ? #1D49B8 : #2456D6;
     // Text on a selected / accent-tinted surface (acc-bg, panel2):
     // white in Dark, near-black in Light (white on #DCE6FF is unreadable).

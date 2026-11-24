@@ -253,9 +253,17 @@ export component Btn inherits Rectangle {
             return reject;
         }
     }
+    // The layout fills the button and CENTRES its content. It used
+    // to rely on `x: (parent.width - self.width) / 2`, but a layout
+    // with no explicit size takes the parent's size, so that was 0
+    // and the label sat at the left edge, off-centre (the "text
+    // aage-peeche" bug on every Btn).
     content := HorizontalLayout {
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        alignment: center;
         spacing: 6px;
         cross-axis-alignment: center;
         if has-icon : Image {

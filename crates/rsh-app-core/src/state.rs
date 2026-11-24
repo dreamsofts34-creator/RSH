@@ -1705,19 +1705,30 @@ impl AppStateCore {
             .map(|byte| format!("{byte:02X}"))
             .collect::<Vec<String>>()
             .join(":");
-        *lock(&self.session_last_hello) = Some(ObservedHello {
-            board_mac: board_mac.clone(),
-        });
+        // The board answers a HELLO every second while the link is
+        // up: log it only the first time in a session (or when the
+        // board MAC changes), not on every repeat — a 1 Hz line
+        // buried every real error in the log.
+        let first_or_changed = {
+            let mut last = lock(&self.session_last_hello);
+            let changed = last.as_ref().is_none_or(|prev| prev.board_mac != board_mac);
+            *last = Some(ObservedHello {
+                board_mac: board_mac.clone(),
+            });
+            changed
+        };
         self.board_reachable.store(true, Ordering::SeqCst);
         // Phase 0 gate §6.2 format 3 (HELLO received — MAC +
         // firmware only, never a secret).
-        self.push_connection_log(
-            "INFO",
-            &format!(
-                "HELLO received: board_mac={board_mac} firmware={}.{}.{}",
-                hello.firmware.0, hello.firmware.1, hello.firmware.2
-            ),
-        );
+        if first_or_changed {
+            self.push_connection_log(
+                "INFO",
+                &format!(
+                    "HELLO received: board_mac={board_mac} firmware={}.{}.{}",
+                    hello.firmware.0, hello.firmware.1, hello.firmware.2
+                ),
+            );
+        }
     }
 
     /// Whether a board `HELLO` has been observed since the last
