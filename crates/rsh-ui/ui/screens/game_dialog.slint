@@ -60,7 +60,7 @@ export component GameDialog inherits Modal {
             }
         }
         Text { text: "Game file (.exe or shortcut)"; font-size: Theme.fs-label; color: Theme.mute; }
-        HorizontalLayout {
+        HorizontalLayout { cross-axis-alignment: center;
             spacing: 8px;
             Rectangle {
                 horizontal-stretch: 1;
@@ -83,13 +83,13 @@ export component GameDialog inherits Modal {
             }
             Btn { label: "Browse…"; icon: @image-url("../../assets/icons/folder.svg"); has-icon: true; clicked => { browse(); } }
         }
-        HorizontalLayout {
+        HorizontalLayout { cross-axis-alignment: center;
             spacing: 8px;
             Text { vertical-alignment: center; text: "Profile: " + profile-name; font-size: Theme.fs-label; color: Theme.text; }
             Rectangle { horizontal-stretch: 1; }
             Btn { label: "Change"; clicked => { cycle-profile(); } }
         }
-        HorizontalLayout {
+        HorizontalLayout { cross-axis-alignment: center;
             spacing: 6px;
             Btn { label: "Save"; primary: true; icon: @image-url("../../assets/icons/save.svg"); has-icon: true; disabled: name == "" || exe == ""; clicked => { save(name, exe); } }
             Btn { label: "Cancel"; clicked => { cancel(); } }

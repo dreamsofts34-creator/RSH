@@ -145,7 +145,12 @@ impl ManualGameStore {
             bound_profile_id: bound_profile_id.filter(|id| !id.trim().is_empty()),
         };
         self.games.push(game.clone());
-        self.save()?;
+        if let Err(error) = self.save() {
+            // Don't keep an unsaved game in memory: the UI got an
+            // error, so the list must not show it anyway.
+            self.games.pop();
+            return Err(error);
+        }
         Ok(game)
     }
 

@@ -81,7 +81,7 @@ component ProfileRowItem inherits Rectangle {
         VerticalLayout {
             horizontal-stretch: 1;
             spacing: 0px;
-            HorizontalLayout {
+            HorizontalLayout { cross-axis-alignment: center;
                 spacing: 6px;
                 alignment: start;
                 Text { text: name; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; wrap: no-wrap; overflow: elide; }
@@ -188,7 +188,7 @@ export component ProfilePopover inherits Card {
             }
         }
         Rectangle { height: 1px; background: Theme.line; }
-        HorizontalLayout {
+        HorizontalLayout { cross-axis-alignment: center;
             spacing: 6px;
             Btn { label: "New"; disabled: busy-kind == 8; clicked => { new-profile(); } }
             Btn { label: "Duplicate"; disabled: busy-kind == 8; clicked => { duplicate-selected(selected); } }
@@ -230,7 +230,7 @@ export component ProfilePopover inherits Card {
                         accepted => { rename-open = false; rename-confirmed(selected, rename-text); }
                     }
                 }
-                HorizontalLayout {
+                HorizontalLayout { cross-axis-alignment: center;
                     spacing: 6px;
                     Btn { label: "Save"; primary: true; disabled: rename-text == "" || busy-kind == 8; clicked => { rename-open = false; rename-confirmed(selected, rename-text); } }
                     Btn { label: "Cancel"; clicked => { rename-open = false; } }
@@ -250,7 +250,7 @@ export component ProfilePopover inherits Card {
                 spacing: 8px;
                 Text { text: "Unsaved changes"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                 Text { text: "Save your changes before switching to “" + pending-name + "”?"; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
-                HorizontalLayout {
+                HorizontalLayout { cross-axis-alignment: center;
                     spacing: 6px;
                     Btn { label: "Save"; primary: true; disabled: busy-kind == 8; clicked => { save-and-switch(); } }
                     Btn { label: "Discard"; disabled: busy-kind == 8; clicked => { discard-and-switch(); } }

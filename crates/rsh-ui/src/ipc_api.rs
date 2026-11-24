@@ -308,6 +308,10 @@ impl Drop for LongCallGuard<'_> {
 /// on lane B (`job2_client`), so a slow save can no longer stall
 /// an unrelated job behind it. The poller lanes (fast/slow) and
 /// the long-call lane are untouched.
+/// Bound for add / update game: an atomic file write plus a process
+/// refresh on the daemon, which can exceed the default 500 ms.
+const GAME_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 const JOB_LANE_A_METHODS: &[&str] = &[
     "set_tuning",
     "save_draft",
@@ -594,6 +598,24 @@ impl IpcApi {
             &self.job2_client
         };
         lane.call(method, params).await
+    }
+
+    /// [`call_async`] with a longer bound for calls that touch the
+    /// disk and the process list on the daemon side (add / update /
+    /// remove game: an atomic file write + a process refresh, which
+    /// can pass the default 500 ms on Windows with an AV scan — and
+    /// then surfaced as a bogus "Connection dropped"). Same
+    /// fail-fast on a proven-dead link, same shared job client.
+    async fn call_async_slow(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, IpcError> {
+        if self.cache.link_dead.load(Ordering::Relaxed) {
+            return Err(IpcError::Closed);
+        }
+        self.client.call_with_timeout(method, params, timeout).await
     }
 
     /// [`call_async`] with an explicit bound (B-2, v2.0.2): the
@@ -2593,7 +2615,7 @@ impl IpcApi {
         let profile_id = profile_id.filter(|s| !s.is_empty());
         let got: Result<GameSummary, IpcError> = self.rt.block_on(async {
             let value = self
-                .call_async(
+                .call_async_slow(
                     method,
                     serde_json::json!({
                         "id": id,
@@ -2601,6 +2623,7 @@ impl IpcApi {
                         "exe_path": exe_path,
                         "profile_id": profile_id,
                     }),
+                    GAME_WRITE_TIMEOUT,
                 )
                 .await?;
             serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
@@ -2619,7 +2642,42 @@ impl IpcApi {
                 self.request_slow_refresh();
                 Ok(summary)
             }
-            Err(_) => Err(Self::ipc_failed()),
+            Err(e) => Err(Self::game_write_error(&e)),
+        }
+    }
+
+    /// The [`UserError`] for a failed add / update game call: the
+    /// daemon's `code|reason` payload (see `detailed_api_error`)
+    /// keeps its real reason (empty name, unknown profile, "cannot
+    /// save manual games: …") instead of collapsing into the
+    /// generic "daemon IPC link failed". A dropped link / timeout
+    /// stays the generic link failure.
+    fn game_write_error(error: &IpcError) -> UserError {
+        if let IpcError::Api(payload) = error {
+            let head = payload
+                .split(": daemon API error: ")
+                .next()
+                .unwrap_or(payload);
+            if let Some((code, reason)) = head.split_once('|') {
+                if !reason.is_empty() {
+                    return UserError {
+                        code: code.to_string(),
+                        title: "Couldn't save the game".to_string(),
+                        what_happened: format!("{reason}."),
+                        what_to_do: String::new(),
+                        detail: Some(reason.to_string()),
+                    };
+                }
+            }
+        }
+        // Timeout / closed link / protocol: say what actually
+        // happened instead of the misleading "Connection dropped".
+        UserError {
+            code: "Unknown".to_string(),
+            title: "Couldn't save the game".to_string(),
+            what_happened: format!("RSH didn't complete the request ({error})."),
+            what_to_do: "Try again.".to_string(),
+            detail: Some(error.to_string()),
         }
     }
 

@@ -488,12 +488,12 @@ export component ButtonsPage inherits HorizontalLayout {
                 VerticalLayout {
                     padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
                     spacing: 0px;
-                    if edit-kind == 0 : HorizontalLayout {
+                    if edit-kind == 0 : HorizontalLayout { cross-axis-alignment: center;
                         alignment: space-between;
                         Text { text: "Button " + (selected-index + 1); font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                         Pill { label: selected-action; }
                     }
-                    if edit-kind == 1 : HorizontalLayout {
+                    if edit-kind == 1 : HorizontalLayout { cross-axis-alignment: center;
                         alignment: space-between;
                         Text { text: "Knob " + (edit-knob + 1); font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                         Pill { label: knob-row-action; }
@@ -597,7 +597,7 @@ export component ButtonsPage inherits HorizontalLayout {
                         ActionChipGrid { current: selected-long-action; picked(a) => { long-action-selected(a); } }
                     }
                     Rectangle { height: 16px; }
-                    HorizontalLayout {
+                    HorizontalLayout { cross-axis-alignment: center;
                         spacing: 8px;
                         Btn { horizontal-stretch: 1; label: "Cancel"; disabled: busy-kind == 8; clicked => { edit-cancel(); } }
                         Btn { horizontal-stretch: 1; label: "Save"; primary: true; icon: @image-url("../../assets/icons/save.svg"); has-icon: true; disabled: busy-kind == 9 || busy-kind == 8; clicked => { edit-save(); } }

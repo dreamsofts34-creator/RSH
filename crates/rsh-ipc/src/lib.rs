@@ -864,15 +864,15 @@ fn dispatch_game_write(
         "add_game" => api
             .add_game(text("name"), text("exe_path"), profile_id)
             .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         "update_game" => api
             .update_game(text("id"), text("name"), text("exe_path"), profile_id)
             .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         "remove_game" => api
             .remove_game(text("id"))
             .map(|removed| serde_json::json!({"removed": removed}))
-            .map_err(|e| IpcError::Api(e.code)),
+            .map_err(|e| detailed_api_error(&e)),
         other => Err(IpcError::UnknownMethod(other.to_string())),
     }
 }

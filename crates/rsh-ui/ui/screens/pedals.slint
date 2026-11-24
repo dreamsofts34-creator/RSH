@@ -193,7 +193,7 @@ component PedalCard inherits Card {
     // 12px spacing, alignment: start) — cards of different
     // heights in one row never grow an inner gap.
     CardBody {
-        HorizontalLayout {
+        HorizontalLayout { cross-axis-alignment: center;
             alignment: space-between;
             Text { text: pedal-name; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
             Pill { label: Math.round(pct) + "%"; bg: pct > 0 ? Theme.ok-bg : Theme.panel2; fg: pct > 0 ? Theme.ok : Theme.mute; }

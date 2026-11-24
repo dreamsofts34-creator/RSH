@@ -285,7 +285,7 @@ export component ExtrasScreen inherits PageScaffold {
                                 }
                                 RangeBlock { up-value: handbrake-up-mv; down-value: handbrake-down-mv; up-disabled: calibration-disabled || busy-kind == 10; down-disabled: calibration-disabled || busy-kind == 10; set-up => { action("handbrake-up"); } set-down => { action("handbrake-down"); } }
                                 if calibration-disabled : Text { text: "RSH isn't running — reconnect to capture."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
-                                HorizontalLayout {
+                                HorizontalLayout { cross-axis-alignment: center;
                                     spacing: 4px;
                                     PresetChip { horizontal-stretch: 1; label: "Linear"; active: handbrake-feel == 0; clicked => { handbrake-feel-selected(0); } }
                                     PresetChip { horizontal-stretch: 1; label: "Soft"; active: handbrake-feel == 1; clicked => { handbrake-feel-selected(1); } }
@@ -373,7 +373,7 @@ export component ExtrasScreen inherits PageScaffold {
                         VerticalLayout { visible: horn-on;
                             spacing: 10px;
                             ButtonTile { label: "HORN BUTTON"; action: horn-button; pressed: horn-pressed; clicked => { action("horn-learn"); } }
-                            HorizontalLayout {
+                            HorizontalLayout { cross-axis-alignment: center;
                                 spacing: 8px;
                                 Btn { label: horn-learning ? "Listening…" : "Learn from wheel"; primary: true; disabled: busy-kind == 11 || busy-kind == 17; clicked => { action("horn-learn"); } }
                                 Btn { label: "Test"; clicked => { action("horn-test"); } }
@@ -416,7 +416,7 @@ export component ExtrasScreen inherits PageScaffold {
                                     background: c;
                                 }
                             }
-                            HorizontalLayout {
+                            HorizontalLayout { cross-axis-alignment: center;
                                 spacing: 4px;
                                 PresetChip { horizontal-stretch: 1; label: "Off"; active: led-pattern == 0; clicked => { led-pattern-selected(0); } }
                                 PresetChip { horizontal-stretch: 1; label: "Solid"; active: led-pattern == 1; clicked => { led-pattern-selected(1); } }

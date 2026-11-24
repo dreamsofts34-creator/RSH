@@ -144,7 +144,7 @@ export component AboutPage inherits VerticalLayout {
         VerticalLayout {
             padding: 16px;
             spacing: 10px;
-            HorizontalLayout {
+            HorizontalLayout { cross-axis-alignment: center;
                 Text { text: "About RSH"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text; }
                 Rectangle { horizontal-stretch: 1; }
                 Btn { label: "Back"; clicked => { back(); } }

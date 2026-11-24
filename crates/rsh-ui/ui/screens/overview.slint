@@ -119,7 +119,7 @@ export component OverviewPage inherits PageScaffold {
                 // can't push the profile row to the bottom.)
                 cross-axis-self-alignment: stretch;
                 spacing: 4px;
-                HorizontalLayout {
+                HorizontalLayout { cross-axis-alignment: center;
                     spacing: 6px;
                     Text { text: "RSH Wheel"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                     Pill { label: connected ? "Online" : "Offline"; bg: connected ? Theme.ok-bg : Theme.err-bg; fg: connected ? Theme.ok : Theme.bad; }
@@ -167,7 +167,7 @@ export component OverviewPage inherits PageScaffold {
         VerticalLayout {
             padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
             spacing: 10px;
-            HorizontalLayout {
+            HorizontalLayout { cross-axis-alignment: center;
                 Text { text: "Games"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                 Rectangle { horizontal-stretch: 1; }
                 Text { text: "Auto-switches profile."; font-size: Theme.fs-hint; color: Theme.mute; }
@@ -235,7 +235,7 @@ export component OverviewPage inherits PageScaffold {
                 // padding 4px 0 — title to first row 14px, rows 8px
                 // apart. Was spacing 4 throughout (rows packed).
                 spacing: 8px;
-                HorizontalLayout {
+                HorizontalLayout { cross-axis-alignment: center;
                     // UI-UX polish (a): preview is h2 margin 10 +
                     // `.chk` padding 4px 0 — title to first row 14px
                     // (8 spacing + this 6px row padding), rows 8px.

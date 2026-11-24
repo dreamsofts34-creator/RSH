@@ -743,7 +743,7 @@ export component MainWindow inherits Window {
                         paused: auto-paused;
                         pause-toggled => { auto-pause-toggled(); }
                     }
-                    if page >= 1 && page <= 4 : HorizontalLayout {
+                    if page >= 1 && page <= 4 : HorizontalLayout { cross-axis-alignment: center;
                         horizontal-stretch: 0;
                         spacing: 8px;
                         // R2-16: the preview shows the Basic/Advanced
@@ -1286,7 +1286,7 @@ export component MainWindow inherits Window {
             spacing: 10px;
             Text { text: confirm-title; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; wrap: word-wrap; }
             Text { text: confirm-text; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
-            HorizontalLayout {
+            HorizontalLayout { cross-axis-alignment: center;
                 spacing: 6px;
                 Btn { label: confirm-confirm-label; destructive: true; clicked => { confirm-yes(); } }
                 Btn { label: "Cancel"; clicked => { confirm-no(); } }

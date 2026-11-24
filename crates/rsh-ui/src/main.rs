@@ -1163,6 +1163,10 @@ const FLAP_DOWN_WINDOW: Duration = Duration::from_secs(10);
 /// this to the last accepted step change are ignored, so a rapid
 /// double-click advances exactly one step.
 const SETUP_STEP_DEBOUNCE: Duration = Duration::from_millis(300);
+/// How long an error message stays in the bottom status bar before
+/// the 1 Hz tick clears it (requested: every error hides after ~1 s;
+/// the tick granularity makes the real range 1–2 s).
+const STATUS_ERROR_LIFETIME: Duration = Duration::from_secs(1);
 
 /// F12 (v2.0.3): a death within this long after a reconnect belongs
 /// to the same flapping burst — its down-notify is collapsed into
@@ -3364,6 +3368,7 @@ impl Ctx {
     /// status already showing means this message supersedes it:
     /// `status-more` counts the superseded ones (+N).
     fn set_toast(&self, win: &MainWindow, title: &str, body: &str) {
+        // (error lifetime: STATUS_ERROR_LIFETIME, 1 s)
         if self.hidden.load(Ordering::SeqCst) {
             return;
         }
@@ -3378,7 +3383,7 @@ impl Ctx {
         win.set_status_more(more);
         ui_log!("RSH-UI status shown (error): {title} — {body}");
         self.status_until
-            .set(Some(Instant::now() + Duration::from_secs(8)));
+            .set(Some(Instant::now() + STATUS_ERROR_LIFETIME));
     }
 
     /// Show a success in the bottom `StatusBar` (B01, was the D17
@@ -3421,7 +3426,10 @@ impl Ctx {
         self.status_until.set(None);
         win.set_status_title("".into());
         win.set_status_text("".into());
-        win.set_status_kind("error".into());
+        // Empty kind = bar hidden (main.slint: `status-kind != ""`).
+        // It used to be reset to "error", which left an empty red
+        // bar on screen forever after the message expired.
+        win.set_status_kind("".into());
         win.set_status_more(0);
     }
 
@@ -7032,7 +7040,7 @@ impl Ctx {
                     win,
                     "Game",
                     "Couldn't open the file picker",
-                    "The file picker couldn't be opened — try again.",
+                    &format!("The file picker couldn't be opened — try again. ({detail})"),
                 );
             }
         }
@@ -14986,7 +14994,11 @@ mod tests {
         ctx.check_status_expiry(&win);
         assert_eq!(win.get_status_text().as_str(), "");
         assert_eq!(win.get_status_title().as_str(), "");
-        assert_eq!(win.get_status_kind().as_str(), "error");
+        assert_eq!(
+            win.get_status_kind().as_str(),
+            "",
+            "an expired message must hide the bar (empty kind)"
+        );
 
         // A success shows the same way — ok-accent kind, drawer
         // still shut.

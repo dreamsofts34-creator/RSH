@@ -200,7 +200,7 @@ export component SettingsScreen inherits VerticalLayout {
                                 selected: connection-type;
                                 selected-changed(i) => { connection-type = i; connection-selected(i); }
                             }
-                            HorizontalLayout {
+                            HorizontalLayout { cross-axis-alignment: center;
                                 padding-top: 6px;
                                 padding-bottom: 6px;
                                 spacing: 10px;
@@ -240,7 +240,7 @@ export component SettingsScreen inherits VerticalLayout {
                                 padding-top: 6px;
                                 padding-bottom: 6px;
                                 spacing: 6px;
-                                HorizontalLayout {
+                                HorizontalLayout { cross-axis-alignment: center;
                                     spacing: 10px;
                                     VerticalLayout {
                                         horizontal-stretch: 1;
@@ -323,7 +323,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     }
                                 }
                                 Text { text: "New password (8–63 characters) — type it again to confirm."; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
-                                HorizontalLayout {
+                                HorizontalLayout { cross-axis-alignment: center;
                                     spacing: 8px;
                                     Btn { label: wifi-password-busy ? "Setting…" : wifi-password-set ? "Change password" : "Set password"; primary: true; disabled: wifi-password-busy || busy-kind == 14; clicked => { set-wifi-password(); } }
                                     if wifi-password-set : Btn { label: "Forget password"; disabled: wifi-password-busy || busy-kind == 14; clicked => { forget-wifi-password(); } }
@@ -337,7 +337,7 @@ export component SettingsScreen inherits VerticalLayout {
                             // password" above is this screen's
                             // primary, so "Run setup" is a secondary
                             // outline button (was primary, A1).
-                            HorizontalLayout {
+                            HorizontalLayout { cross-axis-alignment: center;
                                 padding-top: 6px;
                                 padding-bottom: 6px;
                                 spacing: 10px;
@@ -442,14 +442,14 @@ export component SettingsScreen inherits VerticalLayout {
                             }
                             for p[i] in profiles : VerticalLayout {
                                 if i > 0 : Rectangle { height: 1px; background: Theme.line; }
-                                HorizontalLayout {
+                                HorizontalLayout { cross-axis-alignment: center;
                                     padding-top: 6px;
                                     padding-bottom: 6px;
                                     spacing: 10px;
                                     VerticalLayout {
                                         horizontal-stretch: 1;
                                         spacing: 0px;
-                                        HorizontalLayout {
+                                        HorizontalLayout { cross-axis-alignment: center;
                                             spacing: 4px;
                                             alignment: start;
                                             Text { text: p.name; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; wrap: word-wrap; }
@@ -517,14 +517,14 @@ export component SettingsScreen inherits VerticalLayout {
                                 // Update firmware starts the flash
                                 // (daemon validates + flashes, the
                                 // global busy strip shows progress).
-                                HorizontalLayout {
+                                HorizontalLayout { cross-axis-alignment: center;
                                     spacing: 6px;
                                     Btn { label: "Check"; icon: @image-url("../../assets/icons/check.svg"); has-icon: true; disabled: busy-kind == 3; clicked => { check-firmware(); } }
                                     Btn { label: "Update firmware"; disabled: busy-kind == 4; clicked => { update-firmware(); } }
                                 }
                             }
                             Rectangle { height: 1px; background: Theme.line; }
-                            HorizontalLayout {
+                            HorizontalLayout { cross-axis-alignment: center;
                                 padding-top: 6px;
                                 padding-bottom: 6px;
                                 spacing: 10px;
@@ -557,7 +557,7 @@ export component SettingsScreen inherits VerticalLayout {
                                     Text { text: "Backups"; font-size: Theme.fs-label; color: Theme.text; }
                                     Text { text: backup-text; font-size: Theme.fs-hint; color: Theme.mute; wrap: word-wrap; }
                                 }
-                                HorizontalLayout {
+                                HorizontalLayout { cross-axis-alignment: center;
                                     spacing: 6px;
                                     Btn { label: "Back up"; disabled: busy-kind == 14; clicked => { backup(); } }
                                     Btn { label: "Restore"; icon: @image-url("../../assets/icons/restore.svg"); has-icon: true; destructive: true; disabled: busy-kind == 14; clicked => { restore(); } }

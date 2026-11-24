@@ -363,9 +363,17 @@ fn verify_loopback_peer_pid(stream: &TcpStream, expected_pid: u32) -> std::io::R
         // `Copy`, so an unaligned read is sound.
         let row: MIB_TCPROW_OWNER_PID =
             unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset).cast()) };
+        // A loopback connection has TWO rows in the table, one per end.
+        // `local_port`/`remote_port` are from the daemon's accepted
+        // socket, so the daemon's own row is (local=local_port,
+        // remote=remote_port). The sidecar's row is the mirror image
+        // (local=remote_port, remote=local_port) — that is the row whose
+        // owner PID we must check. Matching the daemon's own row made the
+        // check always report the daemon's PID and refuse every sidecar.
         if row.dwState == ESTABLISHED
-            && table_port(row.dwLocalPort) == local_port
-            && table_port(row.dwRemotePort) == remote_port
+            && table_port(row.dwLocalPort) == remote_port
+            && table_port(row.dwRemotePort) == local_port
+            && row.dwLocalAddr == LOOPBACK_ADDR
             && row.dwRemoteAddr == LOOPBACK_ADDR
         {
             if row.dwOwningPid == expected_pid {

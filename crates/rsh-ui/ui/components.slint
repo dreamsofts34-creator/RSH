@@ -1025,7 +1025,7 @@ export component RangeBlock inherits VerticalLayout {
     callback set-up();
     callback set-down();
     spacing: 8px;
-    HorizontalLayout {
+    HorizontalLayout { cross-axis-alignment: center;
         VerticalLayout {
             horizontal-stretch: 1;
             spacing: 1px;
@@ -1034,7 +1034,7 @@ export component RangeBlock inherits VerticalLayout {
         }
         Btn { label: "Set up"; disabled: up-disabled; clicked => { set-up(); } }
     }
-    HorizontalLayout {
+    HorizontalLayout { cross-axis-alignment: center;
         VerticalLayout {
             horizontal-stretch: 1;
             spacing: 1px;

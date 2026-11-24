@@ -165,7 +165,10 @@ export component SetupWizard inherits Rectangle {
                 width: 100%;
                 height: 100%;
                 padding-top: 24px;
-                padding-bottom: 24px;
+                // Permanent 40px reserve for the bottom StatusBar
+                // (it floats over the window's last 40px, incl. this
+                // "Skip for now" link) + the 24px margin.
+                padding-bottom: 64px;
                 padding-left: 22px;
                 padding-right: 22px;
                 spacing: 6px;
@@ -262,7 +265,7 @@ export component SetupWizard inherits Rectangle {
                     border-width: 1px;
                     border-color: Theme.line;
                     background: Theme.panel;
-                    HorizontalLayout {
+                    HorizontalLayout { cross-axis-alignment: center;
                         padding-left: 16px;
                         padding-right: 16px;
                         spacing: 12px;
@@ -286,7 +289,7 @@ export component SetupWizard inherits Rectangle {
                     border-width: 1px;
                     border-color: Theme.line;
                     background: Theme.panel;
-                    HorizontalLayout {
+                    HorizontalLayout { cross-axis-alignment: center;
                         padding-left: 16px;
                         padding-right: 16px;
                         spacing: 12px;
@@ -326,7 +329,7 @@ export component SetupWizard inherits Rectangle {
                     border-width: 1px;
                     border-color: Theme.line;
                     background: Theme.panel;
-                    HorizontalLayout {
+                    HorizontalLayout { cross-axis-alignment: center;
                         padding-left: 16px;
                         padding-right: 16px;
                         spacing: 12px;
@@ -358,7 +361,7 @@ export component SetupWizard inherits Rectangle {
                     border-width: 1px;
                     border-color: Theme.line;
                     background: Theme.panel;
-                    HorizontalLayout {
+                    HorizontalLayout { cross-axis-alignment: center;
                         padding-left: 16px;
                         padding-right: 16px;
                         spacing: 12px;
@@ -384,7 +387,7 @@ export component SetupWizard inherits Rectangle {
                     border-width: 1px;
                     border-color: Theme.line;
                     background: Theme.panel;
-                    HorizontalLayout {
+                    HorizontalLayout { cross-axis-alignment: center;
                         padding-left: 16px;
                         padding-right: 16px;
                         spacing: 12px;
@@ -402,7 +405,7 @@ export component SetupWizard inherits Rectangle {
                     border-width: 1px;
                     border-color: Theme.line;
                     background: Theme.panel;
-                    HorizontalLayout {
+                    HorizontalLayout { cross-axis-alignment: center;
                         padding-left: 16px;
                         padding-right: 16px;
                         spacing: 12px;
@@ -451,7 +454,7 @@ export component SetupWizard inherits Rectangle {
                     border-width: 1px;
                     border-color: Theme.line;
                     background: Theme.panel;
-                    HorizontalLayout {
+                    HorizontalLayout { cross-axis-alignment: center;
                         padding-left: 16px;
                         padding-right: 16px;
                         spacing: 12px;
@@ -467,7 +470,7 @@ export component SetupWizard inherits Rectangle {
             // Footer: Back / Next. Next is gated: Connect only
             // completes when the board is reachable (HELLO or
             // better — never on Active/pairing).
-            HorizontalLayout {
+            HorizontalLayout { cross-axis-alignment: center;
                 horizontal-stretch: 1;
                 width: 584px;
                 spacing: 8px;

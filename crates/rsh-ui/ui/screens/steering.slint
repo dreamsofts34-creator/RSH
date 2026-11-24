@@ -105,7 +105,7 @@ export component SteeringPage inherits HorizontalLayout {
                 // margin-bottom 10px — the chips sat flush under the
                 // title (spacing 0 + no spacer).
                 Rectangle { height: 10px; }
-                HorizontalLayout {
+                HorizontalLayout { cross-axis-alignment: center;
                     spacing: 6px;
                     PresetChip { horizontal-stretch: 1; label: "Soft"; active: preset == 0; clicked => { preset-selected(0); } }
                     PresetChip { horizontal-stretch: 1; label: "Balanced"; active: preset == 1; clicked => { preset-selected(1); } }
@@ -152,12 +152,12 @@ export component SteeringPage inherits HorizontalLayout {
             VerticalLayout {
                 padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
                 spacing: 10px;
-                HorizontalLayout {
+                HorizontalLayout { cross-axis-alignment: center;
                     Text { text: "Steering centre"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
                     Rectangle { horizontal-stretch: 1; }
                     if centre-set : Pill { label: "Set"; bg: Theme.ok-bg; fg: Theme.ok; }
                 }
-                HorizontalLayout {
+                HorizontalLayout { cross-axis-alignment: center;
                     spacing: 10px;
                     // UI-UX polish (a): the hint centres against the
                     // 30px Set centre button instead of top-aligning
@@ -170,7 +170,7 @@ export component SteeringPage inherits HorizontalLayout {
                 // S1: Capture full lock — the two buttons sit next
                 // to Set centre: turn fully left / right, press.
                 // Same availability: live daemon only (CaptureOp).
-                HorizontalLayout {
+                HorizontalLayout { cross-axis-alignment: center;
                     spacing: 10px;
                     Text { horizontal-stretch: 1; vertical-alignment: center; wrap: word-wrap; text: "Turn fully left or right, then press."; font-size: Theme.fs-hint; color: Theme.mute; }
                     Btn { label: "Full left"; disabled: !centre-available || busy-kind == 10; clicked => { capture-full-left(); } }
@@ -189,7 +189,7 @@ export component SteeringPage inherits HorizontalLayout {
                 padding-top: 14px; padding-bottom: 14px; padding-left: 16px; padding-right: 16px;
                 spacing: 10px;
                 Text { text: "Advanced"; font-size: Theme.fs-card; font-weight: 600; color: Theme.text; }
-                HorizontalLayout {
+                HorizontalLayout { cross-axis-alignment: center;
                     spacing: 8px;
                     VerticalLayout {
                         Text { text: "Invert steering"; font-size: Theme.fs-label; color: Theme.text; }
