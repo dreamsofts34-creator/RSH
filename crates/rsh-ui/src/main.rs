@@ -15363,8 +15363,11 @@ mod tests {
             5,
             "countdown ticks to the seconds left"
         );
-        ctx.backend_cooldown_until
-            .set(Some(Instant::now() - Duration::from_secs(1)));
+        ctx.backend_cooldown_until.set(Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
+        ));
         ctx.sync_backend_cooldown(&win);
         assert_eq!(
             win.get_backend_cooldown_secs(),
