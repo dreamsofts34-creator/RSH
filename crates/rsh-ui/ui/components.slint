@@ -86,10 +86,13 @@ export component PageScaffold inherits VerticalLayout {
 // ---------------------------------------------------------------- modal (P1, B19 wiring is P2): centred
 // 420px card over a 40% scrim, overlay shadow. The caller owns
 // the open state (places `if open : Modal { ... }` over the area
-// it covers) and closes on `closed()` — scrim click, or Escape
-// when the modal has focus (the root keyboard scope also
-// forwards Escape to the same callback). The scrim is a child
-// Rectangle so its opacity never dims the card.
+// it covers) and closes on `closed()` — scrim click only. Escape
+// is NOT owned here (UI-10, v2.0.12): the Modal's FocusScope
+// rejects it so it bubbles to the root keyboard scope, whose
+// single Rust handler closes the TOPMOST overlay first — the old
+// direct `closed()` here made one key close the dialog or only
+// clear the status bar depending on invisible focus state. The
+// scrim is a child Rectangle so its opacity never dims the card.
 export component Modal inherits Rectangle {
     in property <string> title;
     callback closed();
@@ -105,10 +108,12 @@ export component Modal inherits Rectangle {
         width: 100%;
         height: 100%;
         key-pressed(event) => {
-            if (event.text == Key.Escape) {
-                closed();
-                return accept;
-            }
+            // UI-10: Escape is rejected on purpose — it bubbles to
+            // the root keyboard scope, the single Esc owner (see
+            // `wire_keyboard`), which closes the topmost overlay.
+            // Accepting it here used to close the dialog while a
+            // status message stayed, or (focus elsewhere) clear the
+            // status while the dialog stayed — one key, two outcomes.
             return reject;
         }
     }
@@ -1165,18 +1170,29 @@ export component GameTile inherits Rectangle {
         VerticalLayout {
             horizontal-stretch: 1;
             spacing: 1px;
+            // UI-9 (v2.0.12): the name and sub elide at two lines
+            // max — a long game name used to wrap without limit and
+            // stretch its whole grid row. The caps are two lines at
+            // the token sizes (fs-label 13 px / fs-hint 12 px, ~17 px
+            // and ~16 px a line); `overflow: elide` puts the "…"
+            // on the last visible line. The tile clips, so nothing
+            // can paint outside it.
             Text {
                 text: name;
                 font-size: Theme.fs-label;
                 font-weight: 600;
                 color: Theme.text;
                 wrap: word-wrap;
+                overflow: elide;
+                max-height: 34px;
             }
             Text {
                 text: sub;
                 font-size: Theme.fs-hint;
                 color: sub-warn ? Theme.warn : Theme.mute;
                 wrap: word-wrap;
+                overflow: elide;
+                max-height: 32px;
             }
         }
         // Edit / Remove links (manual games): text links with the

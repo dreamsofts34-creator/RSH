@@ -91,7 +91,19 @@ export component MainWindow inherits Window {
     in property <string> selected-action: "Gear 3";
     // BU2: the selected tile's long-press action ("Not set" = none).
     in property <string> selected-long-action: "Not set";
-    in property <string> knob-row-action: "Gear 1";
+    // UI-1 (v2.0.12): the rotary-knob card labels — driven from
+    // Rust (`load_knobs`, which reads the real `knob_actions()`),
+    // never literals. The old "Gear 1"/"Gear 2" literals here
+    // claimed bindings that did not exist on a fresh install, and
+    // a rebind never updated the card. "Not set" is the honest
+    // default until the daemon's stored bindings arrive.
+    in property <string> knob1-left: "Not set";
+    in property <string> knob1-right: "Not set";
+    in property <string> knob1-press: "Not set";
+    in property <string> knob2-left: "Not set";
+    in property <string> knob2-right: "Not set";
+    in property <string> knob2-press: "Not set";
+    in property <string> knob-row-action: "Not set";
     in property <bool> buttons-listening: false;
     in property <string> profile-name: "GT3 Sprint";
     in property <string> auto-profile-text: "No profile yet";
@@ -126,9 +138,10 @@ export component MainWindow inherits Window {
     // floating toast (DS-24, deleted) — every `notify_error` /
     // `notify_success` / `notify_toast` surfaces here, so a failure
     // is visible on the current screen without opening the bell
-    // drawer. Lifetimes (Rust `set_toast*`): error 1 s, info and
-    // success 4 s — P3-1: the old "8 s" here was stale, the code
-    // has been 1 s since STATUS_ERROR_LIFETIME landed. `in-out`
+    // drawer. Lifetimes (Rust `set_toast*`): error 4 s, info and
+    // success 4 s — UI-5 (v2.0.12): the old 1 s error flash was
+    // too short to read (and tick-quantised to 0–2 s). P3-1: the
+    // old "8 s" here was stale. `in-out`
     // so Rust drives it and the bar's own dismiss / Details callbacks
     // clear it / open the drawer; Rust clears it on expiry
     // (1 Hz tick). Empty `status-kind` = hidden (unless a job
@@ -984,12 +997,12 @@ export component MainWindow inherits Window {
                 selected-index: selected-index;
                 selected-action: selected-action;
                 selected-long-action: selected-long-action;
-                knob1-left: "Gear 1";
-                knob1-right: "Gear 2";
-                knob1-press: "Not set";
-                knob2-left: "Not set";
-                knob2-right: "Not set";
-                knob2-press: "Not set";
+                knob1-left: knob1-left;
+                knob1-right: knob1-right;
+                knob1-press: knob1-press;
+                knob2-left: knob2-left;
+                knob2-right: knob2-right;
+                knob2-press: knob2-press;
                 knob-flash-index: -1;
                 knob-flash-text: "";
                 knob-row-action: knob-row-action;
@@ -1267,8 +1280,10 @@ export component MainWindow inherits Window {
     // B19: Add/edit game dialog overlay (manual games) — the P1
     // shared Modal (full-window host; the card is Modal's own
     // centred 420px card, 40% scrim, shadow, scrim-click close).
-    // Esc is owned by the keyboard worker (clears
-    // `game-dialog-open`) and by Modal's own FocusScope.
+    // Esc is owned ONLY by the keyboard worker (clears
+    // `game-dialog-open`) — UI-10 (v2.0.12): Modal's own
+    // FocusScope forwards Escape to the root scope instead of
+    // closing directly, so one key has one outcome.
     if game-dialog-open : GameDialog {
         width: parent.width;
         height: parent.height;
@@ -1407,8 +1422,9 @@ export component MainWindow inherits Window {
     // message at a time: a new message replaces the old one and
     // `status-more` counts the superseded ones (+N); the full text
     // lives in the notifications drawer (Details opens it). Error
-    // 1 s / info + success 4 s (Rust `set_toast*` — P3-1: the old
-    // "8 s" here was stale); the dismiss button dismisses
+    // 4 s / info + success 4 s (Rust `set_toast*` — UI-5 v2.0.12:
+    // the old 1 s error lifetime was too short to read; P3-1: the
+    // old "8 s" here was stale); the dismiss button dismisses
     // early. The content column keeps a permanent 40 px reserve
     // below the page (padding-bottom above), so the bar only ever
     // covers empty space. It is a direct child of the root
