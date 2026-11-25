@@ -51,6 +51,16 @@ pub struct ManualGame {
     /// Id of the profile bound to this game, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_profile_id: Option<String>,
+    /// Client-generated idempotency key for the add that created
+    /// this entry (P1-3, v2.0.11): the UI generates one per
+    /// add-dialog session and sends it with `add_game`; a retry of
+    /// a call that timed out on the client but succeeded on the
+    /// daemon returns the existing entry instead of minting a
+    /// duplicate. `None` for entries added before keys existed
+    /// (or by callers that send none) — those keep the old
+    /// always-new-id behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// On-disk shape of `manual-games.json` (`schemaVersion` camelCase,
@@ -126,6 +136,34 @@ impl ManualGameStore {
         exe_path: &str,
         bound_profile_id: Option<String>,
     ) -> Result<ManualGame, String> {
+        self.add_with_key(name, exe_path, bound_profile_id, None)
+    }
+
+    /// [`add`](Self::add) with an idempotency key (P1-3, v2.0.11):
+    /// when `key` is a non-empty key that already created an entry,
+    /// that entry is returned unchanged — no duplicate, no new id,
+    /// no write. The key is stored on the entry so the dedupe
+    /// survives a daemon restart (the store file round-trips it).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`add`](Self::add).
+    pub fn add_with_key(
+        &mut self,
+        name: &str,
+        exe_path: &str,
+        bound_profile_id: Option<String>,
+        key: Option<&str>,
+    ) -> Result<ManualGame, String> {
+        let key = key.map(str::trim).filter(|key| !key.is_empty());
+        if let Some(key) = key
+            && let Some(existing) = self
+                .games
+                .iter()
+                .find(|game| game.idempotency_key.as_deref() == Some(key))
+        {
+            return Ok(existing.clone());
+        }
         let name = name.trim();
         if name.is_empty() {
             return Err("game name must not be empty".to_string());
@@ -143,6 +181,7 @@ impl ManualGameStore {
             name: name.to_string(),
             exe_path: exe_path.to_string(),
             bound_profile_id: bound_profile_id.filter(|id| !id.trim().is_empty()),
+            idempotency_key: key.map(str::to_string),
         };
         self.games.push(game.clone());
         if let Err(error) = self.save() {
@@ -293,6 +332,7 @@ impl ManualGameStore {
                 name: name.to_string(),
                 exe_path: exe_path.to_string(),
                 bound_profile_id: game.bound_profile_id.filter(|id| !id.trim().is_empty()),
+                idempotency_key: game.idempotency_key.filter(|key| !key.trim().is_empty()),
             });
             if games.len() >= MAX_MANUAL_GAMES {
                 warnings.push(format!(
@@ -461,6 +501,42 @@ mod tests {
         let store = ManualGameStore::open(&dir);
         assert_eq!(store.list(), []);
         assert_eq!(store.load_warnings().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_with_key_dedupes_retries_and_survives_reopen() {
+        // P1-3: a retry carrying the key of an add that already
+        // succeeded returns the existing entry — no duplicate, no
+        // new id, no second write.
+        let dir = test_dir("idempotent");
+        let mut store = ManualGameStore::open(&dir);
+        let first = store
+            .add_with_key("Race", r"C:\a.exe", None, Some("dialog-1"))
+            .expect("add");
+        let retry = store
+            .add_with_key("Race", r"C:\a.exe", None, Some("dialog-1"))
+            .expect("retry");
+        assert_eq!(first.id, retry.id, "same key returns the same entry");
+        assert_eq!(store.list().len(), 1, "no duplicate is created");
+        // A different key is a different add, even for the same name.
+        let second = store
+            .add_with_key("Race", r"C:\b.exe", None, Some("dialog-2"))
+            .expect("add 2");
+        assert_ne!(second.id, first.id);
+        assert_eq!(store.list().len(), 2);
+        // The key survives a reopen: a retry after a daemon restart
+        // still dedupes.
+        let mut store = ManualGameStore::open(&dir);
+        let after_restart = store
+            .add_with_key("Race", r"C:\a.exe", None, Some("dialog-1"))
+            .expect("retry after reopen");
+        assert_eq!(after_restart.id, first.id);
+        assert_eq!(store.list().len(), 2);
+        // No key (old callers) keeps the old always-new-id behaviour.
+        let third = store.add("Race", r"C:\c.exe", None).expect("add 3");
+        assert_ne!(third.id, first.id);
+        assert_ne!(third.id, second.id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

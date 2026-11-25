@@ -98,6 +98,25 @@ pub enum ConnectionError {
     /// times with no frame seen and latched (F20, v2.0.3). The fix
     /// is the user's Retry.
     WatchdogStall,
+    /// The platform credential store failed during activation
+    /// (P2-1, v2.0.11): the failure is a local-store fault, not
+    /// an unreachable board — it keeps its own code so diagnostics
+    /// and the UI can tell the user to check the credential store
+    /// instead of the Wi-Fi.
+    Keystore,
+    /// A control step of the activation failed for a reason other
+    /// than a timeout (P2-1, v2.0.11): the board rejected the
+    /// command, a reply failed to parse, or the reply was for a
+    /// different command. The detail string carries the specifics;
+    /// the code keeps it distinct from `Unknown` and from a plain
+    /// transport loss.
+    ControlFailed,
+    /// The board's `HELLO` was malformed or cannot start a session
+    /// (P2-1, v2.0.11): unparseable bytes, or a structurally usable
+    /// `HELLO` the session layer refuses (e.g. an old-protocol
+    /// board). Distinct from `BoardMismatch` (wrong board) and from
+    /// `Unknown` so the UI can name the firmware mismatch.
+    MalformedHello,
     /// Anything else (detail string carried separately, never a secret).
     Unknown,
 }
@@ -114,6 +133,9 @@ impl ConnectionError {
             Self::BindFailed(kind) => kind.code(),
             Self::BoardMismatch => "BoardMismatch",
             Self::WatchdogStall => "WatchdogStall",
+            Self::Keystore => "Keystore",
+            Self::ControlFailed => "ControlFailed",
+            Self::MalformedHello => "MalformedHello",
             Self::Unknown => "Unknown",
         }
     }
@@ -137,6 +159,9 @@ impl ConnectionError {
             "BindFailed" => Self::BindFailed(BindErrorKind::Other),
             "BoardMismatch" => Self::BoardMismatch,
             "WatchdogStall" => Self::WatchdogStall,
+            "Keystore" => Self::Keystore,
+            "ControlFailed" => Self::ControlFailed,
+            "MalformedHello" => Self::MalformedHello,
             "Unknown" => Self::Unknown,
             _ => return None,
         })
@@ -157,6 +182,15 @@ impl ConnectionError {
             }
             Self::WatchdogStall => {
                 "The wheel connected but stopped sending data — rebuilding did not help. Check the wheel, then press Retry."
+            }
+            Self::Keystore => {
+                "The credential store could not be read — check the OS credential store is available, then retry."
+            }
+            Self::ControlFailed => {
+                "The wheel rejected a setup command or its reply could not be understood — check the wheel, then retry."
+            }
+            Self::MalformedHello => {
+                "The wheel answered, but its HELLO could not start a session — update the board firmware, then retry."
             }
             Self::Unknown => "Something went wrong — retry, then check the diagnostics log.",
         }
@@ -216,6 +250,9 @@ impl UserError {
                 ConnectionError::BindFailed(_) => "Wheel port could not be opened".to_string(),
                 ConnectionError::BoardMismatch => "Different wheel answered".to_string(),
                 ConnectionError::WatchdogStall => "Wheel stopped sending data".to_string(),
+                ConnectionError::Keystore => "Credential store failed".to_string(),
+                ConnectionError::ControlFailed => "Wheel rejected a command".to_string(),
+                ConnectionError::MalformedHello => "Wheel HELLO not usable".to_string(),
                 ConnectionError::Unknown => "Something went wrong".to_string(),
             },
             what_happened: match error {
@@ -230,6 +267,11 @@ impl UserError {
                 }
                 ConnectionError::WatchdogStall => {
                     "The wheel connected but stopped sending data.".to_string()
+                }
+                ConnectionError::Keystore => "The credential store could not be read.".to_string(),
+                ConnectionError::ControlFailed => "The wheel rejected a setup command.".to_string(),
+                ConnectionError::MalformedHello => {
+                    "The wheel's HELLO could not start a session.".to_string()
                 }
                 ConnectionError::Unknown => "Something went wrong.".to_string(),
             },
@@ -258,6 +300,9 @@ mod tests {
             ConnectionError::BindFailed(BindErrorKind::Other),
             ConnectionError::BoardMismatch,
             ConnectionError::WatchdogStall,
+            ConnectionError::Keystore,
+            ConnectionError::ControlFailed,
+            ConnectionError::MalformedHello,
             ConnectionError::Unknown,
         ] {
             assert_eq!(
@@ -282,6 +327,9 @@ mod tests {
             ConnectionError::BindFailed(BindErrorKind::AddrInUse),
             ConnectionError::BoardMismatch,
             ConnectionError::WatchdogStall,
+            ConnectionError::Keystore,
+            ConnectionError::ControlFailed,
+            ConnectionError::MalformedHello,
             ConnectionError::Unknown,
         ] {
             let user_error = UserError::from_connection(error, "detail");

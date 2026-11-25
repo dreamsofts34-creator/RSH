@@ -14462,6 +14462,7 @@ mod tests {
             board_reachable: true,
             error: None,
             hint: None,
+            connect_started: None,
         };
 
         // Non-flap setup: down 60 s ago — the connected notify is

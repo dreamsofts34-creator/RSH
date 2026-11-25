@@ -1272,9 +1272,11 @@ async fn serve_ipc(
 const DAEMON_STATUS_FILE: &str = "daemon-status.json";
 
 /// Write `daemon-status.json` (M8/L8): `{"status": "fatal" |
-/// "running", "code": ..., "detail": ..., "pid": ..., "at_unix":
-/// ...}`. Atomic (temp file in the same directory, then rename).
-/// Best effort — a failure is swallowed, never fatal: the
+/// "running" | "degraded", "code": ..., "detail": ..., "pid": ...,
+/// "at_unix": ...}`. `degraded` (P1-4) is the manager-loop watchdog
+/// budget exhausting: the daemon keeps serving IPC/tray but the
+/// manager loop is dead. Atomic (temp file in the same directory,
+/// then rename). Best effort — a failure is swallowed, never fatal: the
 /// dual-location fatal log is the other channel, and a status
 /// write must never mask the fatal exit itself.
 fn write_daemon_status(data_dir: &std::path::Path, status: &str, code: &str, detail: &str) {
@@ -1401,6 +1403,7 @@ fn starting_connection() -> ConnectionInfo {
         board_reachable: false,
         error: None,
         hint: None,
+        connect_started: None,
     }
 }
 
@@ -1959,10 +1962,21 @@ fn main() {
     // `MANAGER_LOOP_MAX_RESTARTS`: a deterministically panicking
     // loop becomes a visible fatal (dual-location log) instead of a
     // hot respawn loop.
+    // P1-4 (v2.0.11): when the budget exhausts, the daemon also
+    // writes a machine-readable `degraded` signal to
+    // `daemon-status.json` (`code: ManagerLoopHung`) — the old code
+    // only wrote the fatal log, so IPC/tray kept serving a dead
+    // manager loop with no machine-readable trace. The daemon does
+    // NOT exit here: nothing supervises it (autostart is
+    // login-only), so exiting would drop the tray + IPC with nobody
+    // to bring them back — strictly worse than a degraded daemon
+    // that advertises its degradation. A fresh start clears the
+    // file (`clear_daemon_status`).
     let _manager_watchdog = {
         let slot = Arc::clone(&manager_slot);
         let spawn_loop = Arc::clone(&spawn_manager_loop);
         let shutdown = Arc::clone(&shutdown);
+        let status_dir = data_dir.clone();
         std::thread::Builder::new()
             .name("rsh-manager-watchdog".to_string())
             .spawn(move || {
@@ -1978,8 +1992,14 @@ fn main() {
                         continue;
                     }
                     if restarts >= MANAGER_LOOP_MAX_RESTARTS {
+                        write_daemon_status(
+                            &status_dir,
+                            "degraded",
+                            "ManagerLoopHung",
+                            "manager loop ended repeatedly — restart budget exhausted, leaving it stopped; connection retries and watchdog are dead while IPC/tray keep serving",
+                        );
                         let _ = log_fatal(
-                            "daemon: manager loop ended repeatedly — restart budget exhausted, leaving it stopped",
+                            "daemon: manager loop ended repeatedly — restart budget exhausted, leaving it stopped (daemon-status.json: degraded/ManagerLoopHung)",
                         );
                         return;
                     }
@@ -3260,6 +3280,27 @@ mod tests {
         clear_daemon_status(&dir);
         assert!(!path.exists(), "clear removes the file");
         clear_daemon_status(&dir); // clearing an absent file is fine
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1-4: the degraded signal the manager-loop watchdog writes
+    /// when its restart budget exhausts is valid JSON with the
+    /// `degraded` / `ManagerLoopHung` vocabulary.
+    #[test]
+    fn daemon_status_degraded_round_trip() {
+        let dir = temp_dir("status-degraded");
+        write_daemon_status(
+            &dir,
+            "degraded",
+            "ManagerLoopHung",
+            "manager loop ended repeatedly — restart budget exhausted",
+        );
+        let path = dir.join(DAEMON_STATUS_FILE);
+        assert!(path.is_file(), "the degraded status file is written");
+        let text = std::fs::read_to_string(&path).expect("read status");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("status is valid JSON");
+        assert_eq!(value["status"], "degraded");
+        assert_eq!(value["code"], "ManagerLoopHung");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
