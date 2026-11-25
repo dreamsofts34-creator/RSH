@@ -1894,7 +1894,30 @@ impl AppApi for IpcApi {
         exe_path: &str,
         profile_id: Option<String>,
     ) -> Result<GameSummary, UserError> {
-        self.game_write_call("add_game", None, name, exe_path, profile_id)
+        self.game_write_call("add_game", None, name, exe_path, profile_id, None)
+    }
+
+    /// [`add_game`](Self::add_game) with the dialog-session
+    /// idempotency key (P1-3, v2.0.12): the daemon dedupes a retry
+    /// carrying the same key, so a save retried after a client-side
+    /// timeout returns the already-created entry instead of a
+    /// duplicate game. The UI mints one key per add-dialog session
+    /// (see `Ctx::open_game_dialog`).
+    fn add_game_with_key(
+        &self,
+        name: &str,
+        exe_path: &str,
+        profile_id: Option<String>,
+        idempotency_key: Option<&str>,
+    ) -> Result<GameSummary, UserError> {
+        self.game_write_call(
+            "add_game",
+            None,
+            name,
+            exe_path,
+            profile_id,
+            idempotency_key,
+        )
     }
 
     /// Update a manually added game's name / exe path / bound
@@ -1906,7 +1929,7 @@ impl AppApi for IpcApi {
         exe_path: &str,
         profile_id: Option<String>,
     ) -> Result<GameSummary, UserError> {
-        self.game_write_call("update_game", Some(id), name, exe_path, profile_id)
+        self.game_write_call("update_game", Some(id), name, exe_path, profile_id, None)
     }
 
     /// Remove a manually added game; returns `true` when removed.
@@ -2633,6 +2656,7 @@ impl IpcApi {
         name: &str,
         exe_path: &str,
         profile_id: Option<String>,
+        idempotency_key: Option<&str>,
     ) -> Result<GameSummary, UserError> {
         let profile_id = profile_id.filter(|s| !s.is_empty());
         let got: Result<GameSummary, IpcError> = self.rt.block_on(async {
@@ -2644,6 +2668,7 @@ impl IpcApi {
                         "name": name,
                         "exe_path": exe_path,
                         "profile_id": profile_id,
+                        "idempotency_key": idempotency_key,
                     }),
                     GAME_WRITE_TIMEOUT,
                 )
@@ -2995,6 +3020,182 @@ mod tests {
         assert!(client.cancel_learn().is_err());
         assert!(!client.is_learning());
         assert_eq!(client.take_learned_button(), None);
+        drop(client);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Recording `AppApi` for the P1-3 key test: delegates to a
+    /// `SimApi` and records the idempotency key each dispatched add
+    /// carried. Unix-only: the test that uses it binds a real Unix
+    /// socket.
+    #[cfg(unix)]
+    struct KeyRecordingApi {
+        inner: SimApi,
+        keys: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    #[cfg(unix)]
+    impl KeyRecordingApi {
+        fn summary(name: &str) -> GameSummary {
+            GameSummary {
+                id: "race".to_string(),
+                name: name.to_string(),
+                exe_path: r"C:\race.exe".to_string(),
+                running: false,
+                installed: true,
+                bound_profile_id: None,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl AppApi for KeyRecordingApi {
+        fn version(&self) -> String {
+            self.inner.version()
+        }
+
+        fn connection(&self) -> ConnectionInfo {
+            self.inner.connection()
+        }
+
+        fn connect(&self, transport: ApiTransport) -> Result<ConnectionInfo, UserError> {
+            self.inner.connect(transport)
+        }
+
+        fn disconnect(&self) -> Result<ConnectionInfo, UserError> {
+            self.inner.disconnect()
+        }
+
+        fn wifi_status(&self) -> WifiStatus {
+            self.inner.wifi_status()
+        }
+
+        fn snapshot(&self) -> SnapshotInfo {
+            self.inner.snapshot()
+        }
+
+        fn output_enabled(&self) -> bool {
+            self.inner.output_enabled()
+        }
+
+        fn set_output_enabled(&self, enabled: bool) {
+            self.inner.set_output_enabled(enabled);
+        }
+
+        fn get_tuning(&self, module: &str) -> TuningSettings {
+            self.inner.get_tuning(module)
+        }
+
+        fn set_tuning(&self, tuning: &TuningSettings) -> Result<TuningSettings, UserError> {
+            self.inner.set_tuning(tuning)
+        }
+
+        fn draft_status(&self) -> Option<DraftStatus> {
+            self.inner.draft_status()
+        }
+
+        fn save_draft(&self) -> Result<bool, UserError> {
+            self.inner.save_draft()
+        }
+
+        fn discard_draft(&self) -> bool {
+            self.inner.discard_draft()
+        }
+
+        fn list_profiles(&self) -> Vec<ProfileSummary> {
+            self.inner.list_profiles()
+        }
+
+        fn set_output_backend(&self, name: &str) -> Result<String, UserError> {
+            self.inner.set_output_backend(name)
+        }
+
+        fn add_game(
+            &self,
+            name: &str,
+            _exe_path: &str,
+            _profile_id: Option<String>,
+        ) -> Result<GameSummary, UserError> {
+            self.keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(None);
+            Ok(Self::summary(name))
+        }
+
+        fn add_game_with_key(
+            &self,
+            name: &str,
+            _exe_path: &str,
+            _profile_id: Option<String>,
+            idempotency_key: Option<&str>,
+        ) -> Result<GameSummary, UserError> {
+            self.keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(idempotency_key.map(str::to_string));
+            Ok(Self::summary(name))
+        }
+    }
+
+    /// P1-3 (v2.0.12): the dialog-session idempotency key actually
+    /// travels over IPC — `add_game_with_key` sends the key the
+    /// dialog minted, plain `add_game` sends none. The dispatch
+    /// comment always claimed the UI sends a key; it never did, so
+    /// a save retried after a client-side timeout duplicated the
+    /// game. A recording stub Api stands in for the daemon.
+    #[test]
+    #[cfg(unix)]
+    fn add_game_with_key_sends_the_key_over_ipc() {
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-ipc-key-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api: Arc<dyn AppApi> = Arc::new(KeyRecordingApi {
+            inner: SimApi::new(),
+            keys: Arc::clone(&keys),
+        });
+        let (tx, _rx) = broadcast::channel(64);
+        let server = Arc::new(IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let client = IpcApi::connect(&sock).expect("connect");
+        let added = client
+            .add_game_with_key("Race", r"C:\race.exe", None, Some("dialog-1"))
+            .expect("keyed add must succeed");
+        assert_eq!(added.name, "Race");
+        let added_plain = client
+            .add_game("Race 2", r"C:\race2.exe", None)
+            .expect("plain add must succeed");
+        assert_eq!(added_plain.name, "Race 2");
+        let recorded = keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            recorded,
+            vec![Some("dialog-1".to_string()), None],
+            "the keyed add carries its key, the plain add carries none"
+        );
         drop(client);
         handle.join().expect("server thread");
         let _ = std::fs::remove_dir_all(&dir);

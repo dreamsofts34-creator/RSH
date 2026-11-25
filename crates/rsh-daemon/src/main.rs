@@ -1513,6 +1513,28 @@ impl AppApi for DeferredApi {
     fwd!(value wifi_status() -> WifiStatus = starting_wifi_status());
     fwd!(result set_wifi_password(password: &str, confirm: &str) -> WifiStatus);
     fwd!(result clear_wifi_password() -> WifiStatus);
+    // Bug 2 (v2.0.11 retest, v2.0.12): the game + Wi-Fi + shifter
+    // + long-press + capture methods below MUST be forwarded like
+    // everything else — a method missing here silently falls
+    // through to the TRAIT DEFAULT, and that is not just a startup
+    // gap: the IPC server holds this `DeferredApi` permanently (the
+    // live `DaemonApi` is only ever *installed into* it), so an
+    // un-forwarded method returns the default FOREVER. `add_game`
+    // returned "games are not supported by this API" on every Add
+    // Game click with the daemon fully running — the user saw it
+    // four times (notification ×4). Before install these fail with
+    // `starting_error` ("RSH is still starting"), never the trait
+    // default, and never a silent success.
+    //
+    // Deliberately NOT forwarded: `slow_poll` — its trait default
+    // composes the forwarded getters, so it already answers
+    // correctly through this wrapper (the daemon's cached override
+    // is an optimisation, not a different answer); and
+    // `cache_generation` — its default `0` IS the documented daemon
+    // behaviour, and it is never dispatched over IPC.
+    fwd!(value scan_rsh_networks() -> Vec<String> = Vec::new());
+    fwd!(result rejoin_wifi_open(ssid: &str) -> WifiStatus);
+    fwd!(result rejoin_wifi(ssid: &str, password: &str) -> WifiStatus);
     fwd!(value snapshot() -> SnapshotInfo = SnapshotInfo::default());
     fwd!(value output_enabled() -> bool = false);
     fwd!(unit set_output_enabled(enabled: bool));
@@ -1531,6 +1553,8 @@ impl AppApi for DeferredApi {
     fwd!(result set_board_address(address: &str) -> String);
     fwd!(value module_enabled(module: &str) -> bool = false);
     fwd!(result set_module_enabled(module: &str, enabled: bool) -> bool);
+    fwd!(result shifter_sensitivity() -> Option<u8>);
+    fwd!(result set_shifter_sensitivity(sensitivity: u8) -> u8);
     fwd!(value auto_pause() -> bool = false);
     fwd!(result set_auto_pause(paused: bool) -> bool);
     fwd!(value close_to_tray() -> bool = true);
@@ -1544,6 +1568,10 @@ impl AppApi for DeferredApi {
     fwd!(result duplicate_profile(id: &str) -> String);
     fwd!(result delete_profile(id: &str) -> bool);
     fwd!(value list_games() -> Vec<GameSummary> = Vec::new());
+    fwd!(result add_game(name: &str, exe_path: &str, profile_id: Option<String>) -> GameSummary);
+    fwd!(result add_game_with_key(name: &str, exe_path: &str, profile_id: Option<String>, idempotency_key: Option<&str>) -> GameSummary);
+    fwd!(result update_game(id: &str, name: &str, exe_path: &str, profile_id: Option<String>) -> GameSummary);
+    fwd!(result remove_game(id: &str) -> bool);
     fwd!(result launch_game(id: &str) -> GameSummary);
     fwd!(result stop_game(id: &str) -> GameSummary);
     fwd!(result game_state(id: &str) -> GameSummary);
@@ -1556,9 +1584,14 @@ impl AppApi for DeferredApi {
     fwd!(result capture_centre() -> u16);
     fwd!(result capture_pedal_min(pedal: &str) -> u16);
     fwd!(result capture_pedal_max(pedal: &str) -> u16);
+    fwd!(result capture_steering_left() -> u16);
+    fwd!(result capture_steering_right() -> u16);
     fwd!(value list_bindings() -> Vec<ButtonBinding> = Vec::new());
     fwd!(result set_binding(button: u8, action: &str) -> ButtonBinding);
     fwd!(result clear_binding(button: u8) -> bool);
+    fwd!(value list_long_press_bindings() -> Vec<ButtonBinding> = Vec::new());
+    fwd!(result set_long_press_binding(button: u8, action: &str) -> ButtonBinding);
+    fwd!(result clear_long_press_binding(button: u8) -> bool);
     fwd!(result rename_profile(id: &str, name: &str) -> String);
     fwd!(result link_profile(id: &str, game_slug: &str) -> String);
     fwd!(result restore_backup() -> String);
@@ -3529,5 +3562,151 @@ mod tests {
             now
         ));
         assert!(tray_theme_stale(Some(ago(Duration::from_secs(5))), now));
+    }
+
+    /// Bug 2 (v2.0.11 retest, v2.0.12): `DeferredApi` is the
+    /// `Arc<dyn AppApi>` the IPC server holds permanently — the live
+    /// `DaemonApi` is only ever installed INTO it — so a game method
+    /// it does not forward falls through to the trait default
+    /// ("games are not supported by this API") on EVERY Add Game
+    /// click, daemon fully running or not. This test drives
+    /// `add_game` through the installed `DeferredApi` over a real
+    /// `DaemonApi` with NO board ever connected (temp data dir):
+    /// the add must succeed — games are local data, the board is
+    /// irrelevant — and a same-key retry must return the same entry
+    /// instead of duplicating it.
+    #[test]
+    fn deferred_api_forwards_game_methods_after_install() {
+        let dir = temp_dir("deferred-games");
+        let state =
+            Arc::new(AppStateCore::open_with_null_sink(&dir).expect("open state with null sink"));
+        let live = Arc::new(DaemonApi::new(state));
+        let deferred = DeferredApi::new();
+        deferred.install(Arc::clone(&live));
+
+        let added = deferred
+            .add_game("Race", r"C:\race.exe", None)
+            .expect("add_game through the installed DeferredApi must succeed");
+        assert_eq!(added.name, "Race");
+        assert_eq!(deferred.list_games().len(), 1, "one game listed");
+
+        // P1-3: a retry carrying the same idempotency key returns
+        // the already-created entry — no duplicate.
+        let retry = deferred
+            .add_game_with_key("Race", r"C:\race.exe", None, Some("dialog-1"))
+            .expect("first keyed add must succeed");
+        let replay = deferred
+            .add_game_with_key("Race", r"C:\race.exe", None, Some("dialog-1"))
+            .expect("same-key retry must return the existing entry");
+        assert_eq!(retry.id, replay.id, "same key returns the same entry");
+        assert_eq!(
+            deferred.list_games().len(),
+            2,
+            "keyed add is a second entry; the retry adds none"
+        );
+
+        let updated = deferred
+            .update_game(&added.id, "Race 2", r"C:\race2.exe", None)
+            .expect("update_game through the installed DeferredApi must succeed");
+        assert_eq!(updated.name, "Race 2");
+        assert!(
+            deferred
+                .remove_game(&added.id)
+                .expect("remove_game through the installed DeferredApi must succeed"),
+            "remove reports true"
+        );
+        assert!(deferred.list_games().iter().all(|g| g.id != added.id));
+    }
+
+    /// Bug 2 (v2.0.12): before install the forwarded game methods
+    /// fail with the honest "still starting" error — never the
+    /// trait default ("games are not supported by this API"), and
+    /// never a silent success. The same holds for the sibling
+    /// forwards (Wi-Fi rejoin, steering capture). (The reason
+    /// travels in `UserError::detail` — `what_happened` is the
+    /// generic "Something went wrong." for `Unknown` — so the
+    /// assertions read `detail`, the same field the IPC error
+    /// payload and the UI's game dialog show.)
+    #[test]
+    fn deferred_api_game_methods_fail_starting_before_install() {
+        fn reason(err: &UserError) -> String {
+            err.detail.clone().unwrap_or_default()
+        }
+        let deferred = DeferredApi::new();
+        let err = deferred
+            .add_game("Race", r"C:\race.exe", None)
+            .expect_err("add_game before install must fail");
+        assert!(
+            reason(&err).contains("still starting"),
+            "before install the error must say starting, got: {}",
+            reason(&err)
+        );
+        assert!(
+            !reason(&err).contains("not supported by this API"),
+            "the trait default must never surface, got: {}",
+            reason(&err)
+        );
+        let err = deferred
+            .add_game_with_key("Race", r"C:\race.exe", None, Some("dialog-1"))
+            .expect_err("add_game_with_key before install must fail");
+        assert!(reason(&err).contains("still starting"));
+        assert!(
+            deferred
+                .update_game("nope", "Race", r"C:\race.exe", None)
+                .is_err(),
+            "update before install must fail"
+        );
+        assert!(
+            deferred.remove_game("nope").is_err(),
+            "remove before install must fail"
+        );
+        assert!(
+            reason(
+                &deferred
+                    .rejoin_wifi_open("RSH-1234")
+                    .expect_err("rejoin before install must fail")
+            )
+            .contains("still starting"),
+            "wifi rejoin before install must say starting"
+        );
+        assert!(
+            reason(
+                &deferred
+                    .capture_steering_left()
+                    .expect_err("capture before install must fail")
+            )
+            .contains("still starting"),
+            "steering capture before install must say starting"
+        );
+        assert!(
+            deferred.scan_rsh_networks().is_empty(),
+            "scan before install answers the starting value (empty)"
+        );
+    }
+
+    /// Bug 2 sibling (v2.0.12): after install a steering capture
+    /// reaches the live daemon — with no wheel data it fails with
+    /// the daemon's REAL reason (no live reading), never the trait
+    /// default ("steering capture is not supported by this API").
+    #[test]
+    fn deferred_api_forwards_capture_after_install() {
+        let dir = temp_dir("deferred-capture");
+        let state =
+            Arc::new(AppStateCore::open_with_null_sink(&dir).expect("open state with null sink"));
+        let live = Arc::new(DaemonApi::new(state));
+        let deferred = DeferredApi::new();
+        deferred.install(Arc::clone(&live));
+        let err = deferred
+            .capture_steering_left()
+            .expect_err("capture with no wheel data must fail");
+        let detail = err.detail.clone().unwrap_or_default();
+        assert!(
+            !detail.contains("not supported by this API"),
+            "the trait default must never surface, got: {detail}"
+        );
+        assert!(
+            !detail.is_empty(),
+            "the failure must carry the daemon's real reason, not an empty detail"
+        );
     }
 }

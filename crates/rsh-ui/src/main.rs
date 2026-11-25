@@ -1863,6 +1863,13 @@ struct Ctx {
     /// id chosen in the dialog (`None` = no profile bound).
     game_dialog_edit_id: Rc<RefCell<Option<String>>>,
     game_dialog_profile_id: Rc<RefCell<Option<String>>>,
+    /// One idempotency key per add-dialog session (P1-3, v2.0.12):
+    /// minted when the dialog opens for a NEW add, kept for the
+    /// dialog's lifetime so a Save retried after a client-side
+    /// timeout carries the same key and the daemon returns the
+    /// already-created entry instead of a duplicate. `None` for an
+    /// Edit (updates are idempotent by id and take no key).
+    game_dialog_idempotency_key: Rc<RefCell<Option<String>>>,
     /// R2-11: the games list the profile presets were last built
     /// from — the presets model is only rebuilt when it changed.
     presets_games: Rc<RefCell<Vec<GameSummary>>>,
@@ -7113,6 +7120,19 @@ impl Ctx {
         *self.games_profiles.borrow_mut() = profiles;
     }
 
+    /// One idempotency key per add-dialog session (P1-3, v2.0.12):
+    /// process id + wall-clock nanos — unique per dialog open
+    /// within a process run, and a new process gets a new pid, so a
+    /// stale key from an earlier run can never dedupe a fresh add.
+    /// No extra dependency for one string: the store only needs the
+    /// key to be stable across retries of the SAME session.
+    fn new_game_dialog_key() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("game-add-{}-{nanos}", std::process::id())
+    }
+
     /// Open the add/edit game dialog for a new game (`None`) or
     /// the game with this id. Games are manual-only: the exe path
     /// comes from the native file picker (Browse — see
@@ -7169,6 +7189,17 @@ impl Ctx {
         self.game_dialog_profile_id
             .borrow_mut()
             .clone_from(&profile_id);
+        // P1-3 (v2.0.12): a NEW add mints one idempotency key for
+        // the dialog session — a Save retried after a client-side
+        // timeout reuses it, so the daemon dedupes instead of
+        // duplicating the game. An Edit takes no key (updates are
+        // idempotent by id).
+        let key = self
+            .game_dialog_edit_id
+            .borrow()
+            .is_none()
+            .then(Ctx::new_game_dialog_key);
+        *self.game_dialog_idempotency_key.borrow_mut() = key;
         win.set_game_dialog_title(title.into());
         win.set_game_dialog_name(name.into());
         win.set_game_dialog_exe(exe.into());
@@ -7266,6 +7297,20 @@ impl Ctx {
     /// game tiles + profiles (a new bound profile changes the
     /// auto-profile line) and closes the dialog.
     fn save_game_dialog(&self, win: &MainWindow, name: &str, exe: &str) {
+        // The link can die while the dialog is open (the open-time
+        // guard above only covers the open): a Save against the
+        // `SimApi` fallback would hit the trait default ("games are
+        // not supported by this API") — refuse with the honest
+        // reason instead, like `remove_game` does.
+        if !self.is_live() {
+            self.notify_toast(
+                win,
+                "Game",
+                "RSH isn't running",
+                "RSH isn't running — reconnect, then save the game.",
+            );
+            return;
+        }
         let name = name.trim().to_string();
         let exe = exe.trim().to_string();
         // P1-7: a new save attempt clears the previous inline
@@ -7291,6 +7336,11 @@ impl Ctx {
         }
         let edit_id = self.game_dialog_edit_id.borrow().clone();
         let profile_id = self.game_dialog_profile_id.borrow().clone();
+        // P1-3 (v2.0.12): the dialog-session key, minted at open
+        // for a NEW add — a Save retried after a client-side timeout
+        // reuses it, so the daemon returns the already-created entry
+        // instead of duplicating the game. `None` for an Edit.
+        let idempotency_key = self.game_dialog_idempotency_key.borrow().clone();
         let adding = edit_id.is_none();
         let label = if adding {
             "Adding game…"
@@ -7305,7 +7355,7 @@ impl Ctx {
                 let result = if let Some(id) = &edit_id {
                     api.update_game(id, &name, &exe, profile_id.clone())
                 } else {
-                    api.add_game(&name, &exe, profile_id)
+                    api.add_game_with_key(&name, &exe, profile_id, idempotency_key.as_deref())
                 };
                 JobResult::Text(result.map(|g| g.name))
             },
@@ -12609,6 +12659,7 @@ fn main() -> Result<(), slint::PlatformError> {
         games_cache: Rc::new(RefCell::new(Vec::new())),
         game_dialog_edit_id: Rc::new(RefCell::new(None)),
         game_dialog_profile_id: Rc::new(RefCell::new(None)),
+        game_dialog_idempotency_key: Rc::new(RefCell::new(None)),
         presets_games: Rc::new(RefCell::new(Vec::new())),
         games_profiles: Rc::new(RefCell::new(Vec::new())),
         pending_profile_id: Rc::new(RefCell::new(None)),
@@ -13708,6 +13759,7 @@ mod tests {
             games_cache: Rc::new(RefCell::new(Vec::new())),
             game_dialog_edit_id: Rc::new(RefCell::new(None)),
             game_dialog_profile_id: Rc::new(RefCell::new(None)),
+            game_dialog_idempotency_key: Rc::new(RefCell::new(None)),
             presets_games: Rc::new(RefCell::new(Vec::new())),
             games_profiles: Rc::new(RefCell::new(Vec::new())),
             pending_profile_id: Rc::new(RefCell::new(None)),
