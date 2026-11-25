@@ -312,6 +312,13 @@ impl Drop for LongCallGuard<'_> {
 /// refresh on the daemon, which can exceed the default 500 ms.
 const GAME_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound for launch / stop game (UI-3, v2.0.12): spawning or
+/// killing a game process routinely exceeds the 500 ms default —
+/// the old bound timed out healthy launches and reported a bogus
+/// "Connection dropped" while the daemon kept launching. Same
+/// 10 s budget as the game writes.
+const GAME_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 const JOB_LANE_A_METHODS: &[&str] = &[
     "set_tuning",
     "save_draft",
@@ -819,6 +826,42 @@ impl IpcApi {
     /// thread, never the UI thread.
     pub fn refresh_slow_blocking(&self) {
         self.rt.block_on(refresh_slow(&self.client, &self.cache));
+    }
+
+    /// One-shot LIVE backend query (HID-3, v2.0.12): ask the daemon
+    /// for the CURRENT output backend over IPC instead of reading
+    /// the UI-side cache. The cache is only as fresh as the slow
+    /// poller's last cycle — while a `set_output_backend` call is
+    /// still running in the daemon, the poller's `slow_poll` calls
+    /// fail against the daemon's single-flight lock and the cache
+    /// keeps the PRE-switch backend, so a backend-job timeout that
+    /// trusted the cache declared a live switch dead and armed a
+    /// cooldown for nothing. A fresh answer also refreshes the
+    /// cache slot; no answer (`None`) leaves it untouched. Only
+    /// ever called from a job thread — it blocks on the runtime
+    /// like `refresh_slow_blocking`, never on the UI thread.
+    pub fn query_output_backend(&self) -> Option<String> {
+        let got: Result<String, IpcError> = self.rt.block_on(async {
+            let value = self
+                .call_async("output_backend", serde_json::json!({}))
+                .await?;
+            value
+                .get("output_backend")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    IpcError::Protocol("output_backend has no output_backend".to_string())
+                })
+        });
+        match got {
+            Ok(backend) => {
+                if let Ok(mut slot) = self.cache.backend.lock() {
+                    *slot = Some(backend.clone());
+                }
+                Some(backend)
+            }
+            Err(_) => None,
+        }
     }
 
     /// Mark the cached draft dirty for `module` (F6): the daemon
@@ -2717,15 +2760,78 @@ impl IpcApi {
                 }
             }
         }
-        // Timeout / closed link / protocol: say what actually
-        // happened instead of the misleading "Connection dropped".
-        UserError {
-            code: "Unknown".to_string(),
-            title: "Couldn't save the game".to_string(),
-            what_happened: format!("RSH didn't complete the request ({error})."),
-            what_to_do: "Try again.".to_string(),
-            detail: Some(error.to_string()),
+        // Timeout / closed link / protocol: the raw IPC wording
+        // must never reach the user (UI-7, v2.0.12) — the old
+        // fallback embedded the `IpcError` Display ("IPC unknown
+        // method: …", "IPC protocol version … is not supported")
+        // in the dialog's inline error and the status bar. The
+        // generic link failure says the link failed, without IPC
+        // internals; the daemon's own typed reason still arrives
+        // through the `Api` arm above.
+        Self::ipc_failed()
+    }
+
+    /// The [`UserError`] for a failed launch / stop game call
+    /// (UI-3, v2.0.12): the daemon's reason survives instead of
+    /// collapsing into the generic "Connection dropped". The
+    /// `Api` payload carries it code-first — detailed
+    /// (`"{code}|{reason}"`, post-CORE-2 dispatch) or `"{code}:
+    /// {reason}"` — and a bare code (pre-CORE-2 dispatch) still
+    /// names the refusal instead of blaming the link. A timeout
+    /// is its own plain reason (the daemon did not answer in
+    /// 10 s); any other link failure stays the generic link
+    /// failure.
+    fn game_call_error(method: &str, error: &IpcError) -> UserError {
+        let verb = if method == "stop_game" {
+            "stop"
+        } else {
+            "launch"
+        };
+        if let IpcError::Api(payload) = error {
+            // The client formats the payload as `"{code}:
+            // {message}"` with both halves carrying the dispatch
+            // payload — the LAST half is the complete one.
+            let tail = payload
+                .rsplit(": daemon API error: ")
+                .next()
+                .unwrap_or(payload.as_str());
+            let (code, reason) = tail
+                .split_once('|')
+                .or_else(|| tail.split_once(": "))
+                .unwrap_or((tail, ""));
+            let reason = reason.trim();
+            if !reason.is_empty() {
+                return UserError {
+                    code: code.trim().to_string(),
+                    title: format!("Couldn't {verb} game"),
+                    what_happened: format!("{reason}."),
+                    what_to_do: "Try again.".to_string(),
+                    detail: Some(reason.to_string()),
+                };
+            }
+            return UserError {
+                code: code.trim().to_string(),
+                title: format!("Couldn't {verb} game"),
+                what_happened: format!("RSH couldn't {verb} the game."),
+                what_to_do: "Try again.".to_string(),
+                detail: None,
+            };
         }
+        // A timeout is its own plain reason (the client-side
+        // `call_with_timeout` reports it as `Io("IPC call '…' timed
+        // out after … ms")`) — not a dropped link.
+        if let IpcError::Io(message) = error {
+            if message.contains("timed out after") {
+                return UserError {
+                    code: "Timeout".to_string(),
+                    title: format!("Couldn't {verb} game"),
+                    what_happened: "RSH didn't answer in time.".to_string(),
+                    what_to_do: "Try again.".to_string(),
+                    detail: None,
+                };
+            }
+        }
+        Self::ipc_failed()
     }
 
     /// Shared `{"id": …}` game call: one game id in, its
@@ -2733,7 +2839,7 @@ impl IpcApi {
     fn game_call(&self, method: &str, id: &str) -> Result<GameSummary, UserError> {
         let got: Result<GameSummary, IpcError> = self.rt.block_on(async {
             let value = self
-                .call_async(method, serde_json::json!({"id": id}))
+                .call_async_slow(method, serde_json::json!({"id": id}), GAME_LAUNCH_TIMEOUT)
                 .await?;
             serde_json::from_value(value).map_err(|e| IpcError::Protocol(e.to_string()))
         });
@@ -2751,7 +2857,7 @@ impl IpcApi {
                 self.request_slow_refresh();
                 Ok(summary)
             }
-            Err(_) => Err(Self::ipc_failed()),
+            Err(e) => Err(Self::game_call_error(method, &e)),
         }
     }
 
@@ -2983,6 +3089,25 @@ mod tests {
         assert_eq!(client.output_backend(), "vJoy");
         assert!(client.set_output_backend("bogus").is_err());
         assert_eq!(client.output_backend(), "vJoy");
+        // HID-3 (v2.0.12): the one-shot live query reads the
+        // daemon's CURRENT backend (not the cache) and refreshes
+        // the cache slot with it.
+        assert_eq!(
+            client.query_output_backend().as_deref(),
+            Some("vJoy"),
+            "live query must read the daemon's backend"
+        );
+        assert_eq!(client.output_backend(), "vJoy");
+        assert_eq!(
+            client.set_output_backend("HIDMaestro").expect("HIDMaestro"),
+            "HIDMaestro"
+        );
+        assert_eq!(
+            client.query_output_backend().as_deref(),
+            Some("HIDMaestro"),
+            "live query must follow a switch at once"
+        );
+        assert_eq!(client.output_backend(), "HIDMaestro");
         // Sim never pretends a backup happened.
         assert!(client.backup_now().is_err());
         // v2.0.1 BACKEND-2 over the same socket: the sim never fakes
@@ -3801,6 +3926,73 @@ mod tests {
         assert_eq!(error.code, "TransportClosed");
         let error = IpcApi::daemon_backend_error(&IpcError::Io("connection refused".to_string()));
         assert_eq!(error.code, "TransportClosed");
+    }
+
+    #[test]
+    fn game_call_error_keeps_the_daemons_reason() {
+        // UI-3 (v2.0.12): a launch / stop failure keeps the
+        // daemon's reason instead of collapsing into the generic
+        // "Connection dropped".
+        // Detailed payload (post-CORE-2 dispatch): `code|reason`.
+        let detailed = IpcError::Api(
+            "game_not_found|That game isn't in the list any more.: daemon API error: game_not_found|That game isn't in the list any more."
+                .to_string(),
+        );
+        let error = IpcApi::game_call_error("launch_game", &detailed);
+        assert_eq!(error.title, "Couldn't launch game");
+        assert!(
+            error.what_happened.contains("isn't in the list"),
+            "reason must survive: {}",
+            error.what_happened
+        );
+        // Bare code (pre-CORE-2 dispatch): still a refusal with
+        // the right verb, never a link failure.
+        let bare = IpcError::Api("game_not_found: daemon API error: game_not_found".to_string());
+        let error = IpcApi::game_call_error("stop_game", &bare);
+        assert_eq!(error.title, "Couldn't stop game");
+        assert_eq!(error.code, "game_not_found");
+        // A timeout names the timeout, not a dropped link.
+        let timeout = IpcError::Io("IPC call 'launch_game' timed out after 10000 ms".to_string());
+        let error = IpcApi::game_call_error("launch_game", &timeout);
+        assert_eq!(error.title, "Couldn't launch game");
+        assert!(
+            error.what_happened.contains("didn't answer in time"),
+            "timeout must say so: {}",
+            error.what_happened
+        );
+        // Any other link failure stays the generic link failure.
+        let error = IpcApi::game_call_error("launch_game", &IpcError::Closed);
+        assert_eq!(error.code, "TransportClosed");
+    }
+
+    #[test]
+    fn game_write_error_never_embeds_raw_ipc_text() {
+        // UI-7 (v2.0.12): a non-`Api` error maps to the generic
+        // link failure — no "IPC …" wording reaches the dialog's
+        // inline error or the status bar.
+        for error in [
+            IpcError::Closed,
+            IpcError::Protocol("garbage".to_string()),
+            IpcError::UnknownMethod("add_game".to_string()),
+            IpcError::UnsupportedVersion(3),
+            IpcError::Io("socket gone".to_string()),
+        ] {
+            let mapped = IpcApi::game_write_error(&error);
+            assert_eq!(
+                mapped.code, "TransportClosed",
+                "non-Api error must map to the link failure: {error:?}"
+            );
+            assert!(
+                !mapped.what_happened.contains("IPC"),
+                "raw IPC wording must not reach the user: {}",
+                mapped.what_happened
+            );
+            assert!(
+                !mapped.what_happened.contains("protocol"),
+                "raw IPC wording must not reach the user: {}",
+                mapped.what_happened
+            );
+        }
     }
 
     /// Minimal `AppApi` for the capture test: only the capture

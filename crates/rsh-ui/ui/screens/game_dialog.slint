@@ -38,8 +38,9 @@ export component GameDialog inherits Modal {
     callback cancel();
     callback browse();
     callback cycle-profile();
-    // Modal's scrim / Esc close the dialog via `closed()`; that is
-    // the same path as Cancel.
+    // Modal's scrim closes the dialog via `closed()`; Escape
+    // closes it via the root keyboard worker (UI-10) — the same
+    // outcome as Cancel (the dialog just closes).
     closed => { cancel(); }
     // CardBody (inside Modal) owns the title + 16px padding; this
     // layout is the body content. The card height comes from the

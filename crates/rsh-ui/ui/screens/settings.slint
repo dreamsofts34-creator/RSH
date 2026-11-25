@@ -391,9 +391,9 @@ export component SettingsScreen inherits VerticalLayout {
                             // never `if`, so the card keeps the SAME
                             // size while it shows/hides (a hidden
                             // element still reserves its layout
-                            // space). The StatusBar error lives ~1 s;
+                            // space). The StatusBar error lives ~4 s;
                             // this line is the visible surface for
-                            // the remaining ~29 s.
+                            // the remaining ~26 s.
                             Text { visible: backend-cooldown-secs > 0; text: "Retry in " + backend-cooldown-secs + " s — switching is paused after the last failure."; font-size: Theme.fs-hint; color: Theme.warn; wrap: word-wrap; }
                             // M-6 (v2.0.2): the sub-text wraps — at
                             // 920px the "Run setup" button is primary

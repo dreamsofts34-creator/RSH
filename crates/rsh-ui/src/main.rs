@@ -1031,8 +1031,17 @@ impl JobKind {
         match self {
             // The probe and the seed fetch it follows share the
             // 15 s bound (the seed is ~35 round-trips on a live
-            // daemon; a dead one fails fast per call).
-            JobKind::Reconnect | JobKind::ReconnectSeed => Duration::from_secs(15),
+            // daemon; a dead one fails fast per call). GameOp
+            // shares it too (UI-4, v2.0.12): a game add / update /
+            // remove / launch / stop gets 15 s — it must exceed the
+            // 10 s game-write / launch IPC budget
+            // (`GAME_WRITE_TIMEOUT` / `GAME_LAUNCH_TIMEOUT`), or a
+            // healthy 5–10 s write was declared timed out, its
+            // apply dropped, and the dialog left open with no inline
+            // error (the Bug-2 shape).
+            JobKind::Reconnect | JobKind::ReconnectSeed | JobKind::GameOp => {
+                Duration::from_secs(15)
+            }
             // P1-1 (update4-fix): 420 s. Must exceed the 390 s
             // backend-switch IPC bound (see `IpcApi::set_output_backend`),
             // which itself must exceed the daemon worst case incl. a
@@ -1062,8 +1071,7 @@ impl JobKind {
             | JobKind::BindingOp
             | JobKind::CaptureOp
             | JobKind::LearnOp
-            | JobKind::LearnToggle
-            | JobKind::GameOp => Duration::from_secs(5),
+            | JobKind::LearnToggle => Duration::from_secs(5),
         }
     }
 
@@ -1172,11 +1180,13 @@ const FLAP_DOWN_WINDOW: Duration = Duration::from_secs(10);
 /// double-click advances exactly one step.
 const SETUP_STEP_DEBOUNCE: Duration = Duration::from_millis(300);
 /// How long an error message stays in the bottom status bar before
-/// the 1 Hz tick clears it (requested: every error hides after ~1 s;
-/// the tick granularity makes the real range 1–2 s).
-const STATUS_ERROR_LIFETIME: Duration = Duration::from_secs(1);
+/// the 1 Hz tick clears it (UI-5, v2.0.12: 4 s, the same as info /
+/// success — the old 1 s flash was too short to read, and the tick
+/// granularity made the real range 0–2 s).
+const STATUS_ERROR_LIFETIME: Duration = Duration::from_secs(4);
 /// How long an informational message stays (P1-3: info + success
-/// both live 4 s — long enough to read, unlike the 1 s error flash).
+/// both live 4 s — long enough to read; UI-5: errors live 4 s too
+/// now, the old 1 s error flash was unreadable).
 const STATUS_INFO_LIFETIME: Duration = Duration::from_secs(4);
 
 /// F12 (v2.0.3): a death within this long after a reconnect belongs
@@ -1319,6 +1329,17 @@ enum JobDone {
     Backend {
         index: i32,
         result: Result<String, UserError>,
+    },
+    /// Backend-switch timeout re-query finished (HID-3, v2.0.12):
+    /// the switch job timed out, so the UI asked the daemon for its
+    /// LIVE backend instead of trusting the UI-side cache.
+    /// `requested` is the Settings segment the timed-out switch
+    /// asked for (0 `HIDMaestro`, 1 vJoy); `backend` is what the
+    /// daemon reports right now — `None` when the re-query itself
+    /// did not answer, so the timeout stands as a failure.
+    BackendRequery {
+        requested: i32,
+        backend: Option<String>,
     },
     /// Firmware check finished (board vs bundled version).
     FirmwareCheck(Result<FirmwareCheck, UserError>),
@@ -1962,15 +1983,28 @@ struct Ctx {
     wifi_rejoining: Rc<Cell<bool>>,
     wifi_rejoin_since: Rc<Cell<Option<Instant>>>,
     /// P2 (v2.0.10 HID retest, Bug 1 retry storm): when the
-    /// backend-selector cooldown ends — set by ANY output-backend
-    /// switch failure (Err, wrong-backend success, or job timeout,
-    /// including a daemon-side "retry in 30 s" refusal, which
-    /// arrives here as an ordinary `Err` — no error text is
-    /// parsed), cleared on a genuine switch success or on expiry
-    /// by the 1 Hz tick. `None` = no cooldown. The Slint
-    /// `backend-cooldown-secs` prop (seconds left, 0 = idle) is
-    /// driven from this by [`Ctx::sync_backend_cooldown`].
+    /// backend-selector cooldown ends — set by a `HIDMaestro`-requested
+    /// switch failure only (HID-4, v2.0.12: a vJoy failure must not
+    /// lock the user out of `HIDMaestro`, the daemon storm guard
+    /// counts `HIDMaestro` attempts only; a backend-job timeout
+    /// re-queries the live backend first, see HID-3, and arms only
+    /// when the re-query itself fails), cleared on a genuine switch
+    /// success or on expiry by the 1 Hz tick. `None` = no cooldown.
+    /// The Slint `backend-cooldown-secs` prop (seconds left, 0 =
+    /// idle) is driven from this by [`Ctx::sync_backend_cooldown`].
     backend_cooldown_until: Rc<Cell<Option<Instant>>>,
+    /// HID-3 (v2.0.12): the Settings segment the in-flight backend
+    /// switch requested (0 `HIDMaestro`, 1 vJoy) — recorded by
+    /// [`Ctx::start_backend_job`] so a backend-job timeout can
+    /// re-query the live backend and tell a switch that actually
+    /// succeeded from one still running. `None` = no switch in
+    /// flight. Cleared when the switch resolves (success, failure,
+    /// or the timeout re-query's verdict).
+    backend_job_requested: Rc<Cell<Option<i32>>>,
+    /// HID-3 (v2.0.12): true while a backend-timeout re-query job
+    /// is in flight — a second backend timeout while one runs must
+    /// not spawn another (the re-query's own verdict reports).
+    backend_requery_in_flight: Rc<Cell<bool>>,
     /// Last `password_set` value `sync_wifi_password_state` saw
     /// (R3-UI-02): the success message is cleared when the state
     /// moves on — otherwise it persists across Settings visits
@@ -3412,7 +3446,7 @@ impl Ctx {
     }
 
     /// Show a failure in the bottom `StatusBar` (B01, was the DS-24
-    /// toast): title + body on the current screen for 1 s (see
+    /// toast): title + body on the current screen for 4 s (see
     /// `STATUS_ERROR_LIFETIME`), then the 1 Hz tick clears it.
     /// Skipped while the window is hidden (F27: no property writes
     /// on a hidden window) — the notification itself is still stored
@@ -3422,7 +3456,7 @@ impl Ctx {
     /// status already showing means this message supersedes it:
     /// `status-more` counts the superseded ones (+N).
     fn set_toast(&self, win: &MainWindow, title: &str, body: &str) {
-        // (error lifetime: STATUS_ERROR_LIFETIME, 1 s)
+        // (error lifetime: STATUS_ERROR_LIFETIME, 4 s)
         if self.hidden.load(Ordering::SeqCst) {
             return;
         }
@@ -3463,7 +3497,7 @@ impl Ctx {
     }
 
     /// Show a success in the bottom `StatusBar` (B01, was the D17
-    /// toast): same 1 s / 4 s rule as [`Self::set_toast`] — success
+    /// toast): error and success both live 4 s now (UI-5) — success
     /// lives 4 s. Same full text, same +N counter.
     fn set_toast_success(&self, win: &MainWindow, title: &str, body: &str) {
         if self.hidden.load(Ordering::SeqCst) {
@@ -3484,7 +3518,7 @@ impl Ctx {
     }
 
     /// Clear an expired status-bar message (B01, was the DS-24
-    /// toast, 1 Hz): the error lives 1 s / info + success 4 s from
+    /// toast, 1 Hz): the error lives 4 s / info + success 4 s from
     /// the last message, then vanishes — a newer message re-arms
     /// the deadline via [`Self::set_toast`].
     fn check_status_expiry(&self, win: &MainWindow) {
@@ -3927,7 +3961,20 @@ impl Ctx {
                 }
                 match result {
                     Ok(info) => {
-                        ui_log!("RSH-UI transport switch ok: {}", info.label);
+                        // CORE-13 (v2.0.12): `connect_started:
+                        // Some(false)` means the call no-op'd
+                        // because a retry was already in flight —
+                        // the switch itself is accepted (the
+                        // in-flight retry carries the session), so
+                        // there is nothing to revert or toast; the
+                        // outcome surfaces via the poller, which
+                        // the refresh below picks up. The value is
+                        // logged so a no-op switch is diagnosable.
+                        ui_log!(
+                            "RSH-UI transport switch ok: {} (connect_started={:?})",
+                            info.label,
+                            info.connect_started
+                        );
                         self.refresh(win, 0);
                     }
                     Err(e) => {
@@ -3947,6 +3994,9 @@ impl Ctx {
                 {
                     return;
                 }
+                // HID-3: the switch resolved — the timeout re-query
+                // has nothing to compare against any more.
+                self.backend_job_requested.set(None);
                 // Bug 4/8: a success toast is only honest when the
                 // backend that is actually live is the one the user
                 // asked for. The daemon reports the LIVE name, so a
@@ -4002,12 +4052,108 @@ impl Ctx {
                     // backend moved mid-switch.
                     self.resync_controller_from_live(win, 1 - index);
                     self.notify_error(win, "Game controller", &error);
-                    // P2: ANY backend-switch failure arms the 30 s
-                    // selector cooldown — Err, wrong-backend
-                    // success, or a daemon-side cooldown refusal
-                    // (all arrive here as a failure event; no error
-                    // text is parsed).
-                    self.start_backend_cooldown(win);
+                    // HID-4 (v2.0.12): the 30 s selector cooldown
+                    // arms ONLY for a HIDMaestro-requested failure.
+                    // The daemon storm guard counts HIDMaestro
+                    // attempts only, so a vJoy failure (e.g. vJoy
+                    // not installed) must not lock the user out of
+                    // HIDMaestro for 30 s. The old code armed on
+                    // ANY failure — Err, wrong-backend success, or
+                    // a daemon-side cooldown refusal — with no
+                    // error text parsed and no requested index
+                    // consulted.
+                    if index == 0 {
+                        self.start_backend_cooldown(win);
+                    }
+                }
+            }
+            JobDone::BackendRequery { requested, backend } => {
+                if self
+                    .busy_jobs
+                    .borrow_mut()
+                    .remove(&JobKind::Backend)
+                    .is_none()
+                {
+                    return;
+                }
+                // HID-3: the re-query answered — the timeout's
+                // verdict lands here, never in `check_job_timeouts`
+                // (which only starts the re-query and stays silent).
+                self.backend_requery_in_flight.set(false);
+                self.backend_job_requested.set(None);
+                // F27: a verdict that lands after the window was
+                // hidden must not touch it — the frame timer
+                // re-derives the display from state/cache when the
+                // window comes back, and the next poll re-syncs the
+                // backend either way.
+                if self.hidden.load(Ordering::SeqCst) {
+                    ui_log!(
+                        "RSH-UI backend re-query finished while hidden — verdict skipped (F27)"
+                    );
+                    return;
+                }
+                let requested_name = if requested == 1 { "vJoy" } else { "HIDMaestro" };
+                match backend.as_deref() {
+                    Some(live) if live == requested_name => {
+                        // The switch DID complete while the UI was
+                        // timing it out (long UAC dwell, slow
+                        // sidecar spawn) — report the success, not
+                        // the timeout. A genuine success ends any
+                        // cooldown an earlier failure armed.
+                        self.clear_backend_cooldown(win);
+                        win.set_controller(requested);
+                        self.sync_overview(win);
+                        self.notify_success(
+                            win,
+                            "Game controller",
+                            "Controller switched",
+                            &format!("Game controller is now {live}."),
+                        );
+                    }
+                    Some(live) => {
+                        // The daemon is still on the old backend:
+                        // the switch may still be running (the
+                        // client timeout never cancels the daemon
+                        // handler) or it failed without answering.
+                        // Say so plainly instead of declaring a
+                        // failure — no cooldown, so the user can
+                        // retry at once; a retry while the daemon
+                        // is still switching is refused with its
+                        // real reason, and the next poll re-syncs
+                        // the segment if the switch lands.
+                        win.set_controller(i32::from(live != "HIDMaestro"));
+                        self.notify_toast(
+                            win,
+                            "Game controller",
+                            "Controller switch still running",
+                            &format!(
+                                "The switch to {requested_name} is still running in the background — {live} is still the game controller for now. It will update when the switch finishes; try again if it doesn't."
+                            ),
+                        );
+                    }
+                    None => {
+                        // The re-query itself did not answer — the
+                        // daemon link is gone or wedged, so the
+                        // timeout stands as a failure: restore the
+                        // segment from the cache and arm the
+                        // cooldown, but only for a
+                        // HIDMaestro-requested switch (HID-4).
+                        self.resync_controller_from_live(win, 1 - requested);
+                        self.notify_error(
+                            win,
+                            "Game controller",
+                            &UserError {
+                                code: "Unknown".to_string(),
+                                title: "Controller switch timed out".to_string(),
+                                what_happened: "The controller switch took too long — the previous controller is still active.".to_string(),
+                                what_to_do: "Try again.".to_string(),
+                                detail: None,
+                            },
+                        );
+                        if requested == 0 {
+                            self.start_backend_cooldown(win);
+                        }
+                    }
                 }
             }
             JobDone::FirmwareCheck(result) => {
@@ -4196,6 +4342,11 @@ impl Ctx {
             self.pending_applies
                 .borrow_mut()
                 .retain(|_, (k, _)| *k != kind);
+            // HID-3: set when a backend timeout starts a live
+            // re-query instead of failing — the generic timeout
+            // toast below is skipped then (the re-query's verdict
+            // notifies, so the user never sees the false failure).
+            let mut backend_requery = false;
             if kind == JobKind::Reconnect {
                 self.reconnect_in_flight.set(false);
                 // F3: a timed-out manual retry counts as a failed
@@ -4220,13 +4371,48 @@ impl Ctx {
                 self.connecting_since.set(None);
             }
             if kind == JobKind::Backend {
-                // The switch already flipped; the late result is
-                // ignored, so restore the live backend's segment now.
-                let backend = self.api().output_backend();
-                win.set_controller(i32::from(backend != "HIDMaestro"));
-                // P2: a switch that never answers is a failure too
-                // — arm the same 30 s cooldown as a reported one.
-                self.start_backend_cooldown(win);
+                // HID-3 (v2.0.12): a backend job that never answers
+                // is NOT declared a failure here — the daemon keeps
+                // switching after the client times out (a >60 s UAC
+                // dwell is the known case), and the UI-side cache
+                // still holds the PRE-switch backend, so restoring
+                // from it + arming the cooldown reported a live
+                // switch dead. Instead, re-query the LIVE backend
+                // from the daemon on a background job; its verdict
+                // (switched / still running / re-query failed)
+                // lands in `JobDone::BackendRequery` and notifies
+                // there, so the generic timeout toast below is
+                // skipped for this kind (`backend_requery`).
+                if self.backend_requery_in_flight.get() {
+                    // The timed-out Backend job IS the re-query
+                    // itself — no switch can start while it occupies
+                    // `JobKind::Backend`, so this timeout means the
+                    // re-query never answered. Clear the flag and
+                    // fall through to the plain failure path
+                    // instead of staying silent forever.
+                    self.backend_requery_in_flight.set(false);
+                    self.backend_timeout_failure(win);
+                } else if self.start_backend_requery(win) {
+                    backend_requery = true;
+                } else {
+                    // No re-query possible (no recorded request or
+                    // no live link): the timeout stands as a
+                    // failure.
+                    self.backend_timeout_failure(win);
+                }
+            }
+            if kind == JobKind::GameOp {
+                // UI-4 (v2.0.12): a timed-out save leaves the dialog
+                // open with no inline error — set one, so the user
+                // staring at the dialog sees why Save re-enabled.
+                // Only for the dialog's own save labels; a launch /
+                // stop timeout has no dialog to explain to.
+                if (label == "Adding game…" || label == "Saving game…")
+                    && win.get_game_dialog_open()
+                    && !self.hidden.load(Ordering::SeqCst)
+                {
+                    win.set_game_dialog_error("The save took too long — try again.".into());
+                }
             }
             if kind == JobKind::SettingsOp {
                 // R3-UI-02: the timed-out job's apply is dropped
@@ -4276,7 +4462,7 @@ impl Ctx {
                 }
             }
             ui_log!("RSH-UI job {kind:?} timed out ({label})");
-            if !tuning_silent && !sensitivity_silent {
+            if !tuning_silent && !sensitivity_silent && !backend_requery {
                 let body = if tuning_reverted || sensitivity_reverted {
                     "The change wasn't saved — the slider was put back to its previous value."
                 } else if kind == JobKind::Backend {
@@ -4522,6 +4708,9 @@ impl Ctx {
                 "HIDMaestro needs admin permission — Windows will ask once.",
             );
         }
+        // HID-3: record what this switch asked for — a job timeout
+        // re-queries the live backend and compares against this.
+        self.backend_job_requested.set(Some(index));
         // D17: the switch itself is not a notification — the busy
         // strip is the surface while it runs. The label stays
         // "Switching controller…" for the whole switch (Bug 4/8):
@@ -4542,6 +4731,59 @@ impl Ctx {
                 result: api.set_output_backend(name),
             },
         );
+    }
+
+    /// The plain backend-timeout failure (HID-3 fallback): the
+    /// timeout stands — restore the segment from the (possibly
+    /// stale) cache and arm the cooldown, but only for a
+    /// `HIDMaestro`-requested switch (HID-4). A vJoy request never
+    /// arms; an unrecorded request keeps the old storm-guard
+    /// behaviour (arm) — the daemon counts `HIDMaestro` attempts,
+    /// and an unknown request is most likely one.
+    fn backend_timeout_failure(&self, win: &MainWindow) {
+        let requested = self.backend_job_requested.get();
+        self.backend_job_requested.set(None);
+        let backend = self.api().output_backend();
+        win.set_controller(i32::from(backend != "HIDMaestro"));
+        if requested != Some(1) {
+            self.start_backend_cooldown(win);
+        }
+    }
+
+    /// Start the HID-3 re-query after a backend-job timeout: ask
+    /// the daemon for its LIVE backend on a background job thread
+    /// (one 500 ms `output_backend` call via
+    /// [`IpcApi::query_output_backend`]) and report the verdict in
+    /// [`JobDone::BackendRequery`]. Returns true when the re-query
+    /// started; false when there is nothing to re-query (no
+    /// recorded request, a re-query already in flight, or no live
+    /// link) — the caller then falls back to the plain timeout
+    /// failure. The job runs under [`JobKind::Backend`] so the busy
+    /// strip shows "Checking controller…" while it runs; its own
+    /// 420 s timeout cannot fire (the call is bounded at 500 ms),
+    /// and the in-flight flag stops a second timeout from
+    /// spawning a second re-query.
+    fn start_backend_requery(&self, win: &MainWindow) -> bool {
+        let Some(requested) = self.backend_job_requested.get() else {
+            return false;
+        };
+        if self.backend_requery_in_flight.get() {
+            return false;
+        }
+        let Some(live_api) = self.state.borrow().live_api.clone() else {
+            return false;
+        };
+        self.backend_requery_in_flight.set(true);
+        let started = self.run_job(win, JobKind::Backend, "Checking controller…", move || {
+            JobDone::BackendRequery {
+                requested,
+                backend: live_api.query_output_backend(),
+            }
+        });
+        if !started {
+            self.backend_requery_in_flight.set(false);
+        }
+        started
     }
 
     /// Start a firmware-check job (M-8): board live version vs the
@@ -4800,15 +5042,29 @@ impl Ctx {
                 // A set password lives in the stored WLAN profile —
                 // it cannot be read back, so the daemon reconnects
                 // with it; an open AP is joined directly.
+                // CORE-13 (v2.0.12): `connect()` returns Ok with
+                // `connect_started: Some(false)` when a retry was
+                // already in flight — the wheel is NOT joined yet,
+                // so the success toast below must not claim it.
+                // The marker rides in the Ok string (empty =
+                // joined, "in-flight" = a retry is running and its
+                // outcome surfaces via the poller).
+                let marker = |info: ConnectionInfo| {
+                    if info.connect_started == Some(false) {
+                        "in-flight".to_string()
+                    } else {
+                        String::new()
+                    }
+                };
                 let joined = if api.wifi_status().password_set {
-                    api.connect(ApiTransport::Wifi).map(|_| ())
+                    api.connect(ApiTransport::Wifi).map(marker)
                 } else {
                     match api.rejoin_wifi_open(&ssid) {
-                        Ok(_) => api.connect(ApiTransport::Wifi).map(|_| ()),
+                        Ok(_) => api.connect(ApiTransport::Wifi).map(marker),
                         Err(e) => Err(e),
                     }
                 };
-                JobResult::Text(joined.map(|()| String::new()))
+                JobResult::Text(joined)
             },
             move |ctx, win, result| {
                 win.set_setup_wifi_joining(false);
@@ -4816,6 +5072,19 @@ impl Ctx {
                     return;
                 };
                 match result {
+                    // CORE-13: the connect no-op'd (a retry is
+                    // already in flight) — not joined yet, so no
+                    // success toast; the retry's outcome surfaces
+                    // via the poller.
+                    Ok(marker) if marker == "in-flight" => {
+                        win.set_setup_wifi_error("".into());
+                        ctx.notify_toast(
+                            win,
+                            "Connection",
+                            "Still connecting",
+                            "The wheel is still connecting — it should appear shortly.",
+                        );
+                    }
                     Ok(_) => {
                         win.set_setup_wifi_error("".into());
                         ctx.notify_success(
@@ -4946,7 +5215,18 @@ impl Ctx {
         let knob = usize::try_from(self.edit_knob.get()).unwrap_or(0);
         let row = usize::try_from(self.knob_row.get()).unwrap_or(0);
         let row_action = knobs[knob][row].clone();
-        *self.knob_actions.borrow_mut() = knobs;
+        self.knob_actions.borrow_mut().clone_from(&knobs);
+        // UI-1 (v2.0.12): drive the card + edit-panel labels from
+        // the real bindings — the Slint defaults are "Not set" and
+        // nothing else ever writes these props, so without this the
+        // card kept showing the old hardcoded "Gear 1 / Gear 2".
+        // Rows are [left, right, press] per knob.
+        win.set_knob1_left(knobs[0][0].clone().into());
+        win.set_knob1_right(knobs[0][1].clone().into());
+        win.set_knob1_press(knobs[0][2].clone().into());
+        win.set_knob2_left(knobs[1][0].clone().into());
+        win.set_knob2_right(knobs[1][1].clone().into());
+        win.set_knob2_press(knobs[1][2].clone().into());
         win.set_knob_row_action(row_action.into());
     }
 
@@ -5371,7 +5651,19 @@ impl Ctx {
         // The title says "Wheel connected" (the board), never
         // "RSH connected" (the daemon link) — the two must not
         // read as the same thing.
-        if seed.connect.is_ok() && !self.suppress_connected_notify.get() {
+        // CORE-13 (v2.0.12): `connect()` returns Ok with
+        // `connect_started: Some(false)` when a retry was already
+        // in flight — the session is NOT established yet, so an Ok
+        // seed must not toast "Wheel connected" for it. Only a
+        // fresh connect that actually started (or an unknown
+        // `None`, e.g. a test fake) counts as connected here; the
+        // in-flight retry's outcome surfaces via the poller / the
+        // next seed.
+        let connect_started = match &seed.connect {
+            Ok(info) => info.connect_started != Some(false),
+            Err(_) => false,
+        };
+        if connect_started && !self.suppress_connected_notify.get() {
             let n = self.flap_count.get();
             let recent = self
                 .last_flap_at
@@ -7323,7 +7615,7 @@ impl Ctx {
         if name.is_empty() || exe.is_empty() {
             // P1-7: the validation refusal is inline too — the
             // dialog stays open, so the reason belongs in it, not
-            // only in the 1 s status bar.
+            // only in the 4 s status bar.
             win.set_game_dialog_error(
                 "Choose the game's file with Browse, and enter a name.".into(),
             );
@@ -7388,7 +7680,7 @@ impl Ctx {
                         // dialog — the same wording the status bar +
                         // drawer show (see `error_title_body`). The
                         // dialog stays open on failure; without this
-                        // the failed save looked inert after the 1 s
+                        // the failed save looked inert after the 4 s
                         // status message expired.
                         let (_title, body) = Ctx::error_title_body(&e);
                         w.set_game_dialog_error(body.into());
@@ -11090,17 +11382,22 @@ fn wire_keyboard(win: &MainWindow, ctx: &Rc<Ctx>) {
         let ctx = ctx.clone();
         win.unwrap().on_keyboard_escape(move || {
             if let Some(w) = win.upgrade() {
-                // D16: Esc dismisses only the TOPMOST overlay /
-                // status-bar message — never the wizard itself
-                // (closing the wizard needs the explicit
-                // Skip/Finish path).
+                // D16 / UI-10 (v2.0.12): Esc has ONE owner — this
+                // handler closes the TOPMOST overlay first and only
+                // clears the status-bar message when no overlay is
+                // open. The Modal's own FocusScope forwards Escape
+                // here instead of closing directly (it used to close
+                // the dialog while a toast stayed, or — focus
+                // elsewhere — clear the toast while the dialog
+                // stayed). Order is the paint order, topmost first:
+                // confirm, game dialog, popover, notifications
+                // drawer, diagnostics drawer, then the status bar.
+                // Never the wizard itself (closing it needs the
+                // explicit Skip/Finish path).
                 if w.get_confirm_open() {
                     w.set_confirm_open(false);
                     *ctx.confirm_pending.borrow_mut() = None;
                     ui_log!("RSH-UI keyboard-escape closed confirm dialog");
-                } else if w.get_status_title() != "" {
-                    ctx.clear_status(&w);
-                    ui_log!("RSH-UI keyboard-escape dismissed status bar");
                 } else if w.get_game_dialog_open() {
                     w.set_game_dialog_open(false);
                     ui_log!("RSH-UI keyboard-escape closed game dialog");
@@ -11113,6 +11410,9 @@ fn wire_keyboard(win: &MainWindow, ctx: &Rc<Ctx>) {
                 } else if w.get_diag_open() {
                     w.set_diag_open(false);
                     ui_log!("RSH-UI keyboard-escape closed diagnostics drawer");
+                } else if w.get_status_title() != "" {
+                    ctx.clear_status(&w);
+                    ui_log!("RSH-UI keyboard-escape dismissed status bar");
                 } else {
                     ui_log!("RSH-UI keyboard-escape (no overlay open)");
                 }
@@ -11288,6 +11588,18 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
             let Some(w) = win.upgrade() else {
                 return;
             };
+            // UI-2 (v2.0.12): refuse while RSH isn't running, like
+            // the add / edit / remove paths — a launch against the
+            // `SimApi` fallback could only fail with `needs_daemon`.
+            if !ctx.is_live() {
+                ctx.notify_toast(
+                    &w,
+                    "Game",
+                    "RSH isn't running",
+                    "Reconnect to RSH, then try again.",
+                );
+                return;
+            }
             let id = id.to_string();
             let Some(game) = ctx
                 .games_cache
@@ -11296,7 +11608,7 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                 .find(|g| g.id == id)
                 .cloned()
             else {
-                ctx.notify(
+                ctx.notify_toast(
                     &w,
                     "Game",
                     "Game not found",
@@ -11305,7 +11617,7 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                 return;
             };
             if !game.installed {
-                ctx.notify(
+                ctx.notify_toast(
                     &w,
                     "Game",
                     "Game not installed",
@@ -11357,7 +11669,27 @@ fn wire_action_notifications(win: &MainWindow, ctx: &Rc<Ctx>) {
                             );
                         }
                         Err(e) => {
-                            ctx.notify(w, "Game", "Couldn't launch game", &e.title);
+                            // UI-2 (v2.0.12): a launch / stop failure
+                            // surfaces in place via `notify_error`
+                            // (status bar + drawer), never drawer-only
+                            // — the old `notify` left the user staring
+                            // at a tile that did nothing. The title
+                            // carries the right verb: the old code
+                            // said "Couldn't launch game" for a STOP
+                            // failure too, and showed only `e.title`
+                            // (reason + next step dropped).
+                            let titled = UserError {
+                                code: e.code.clone(),
+                                title: if running {
+                                    "Couldn't stop game".to_string()
+                                } else {
+                                    "Couldn't launch game".to_string()
+                                },
+                                what_happened: e.what_happened.clone(),
+                                what_to_do: e.what_to_do.clone(),
+                                detail: e.detail.clone(),
+                            };
+                            ctx.notify_error(w, "Game", &titled);
                             ui_log!("RSH-UI launch-game failed: {} ({})", e.code, e.title);
                         }
                     }
@@ -11722,7 +12054,13 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
                                 Ok(path) => {
                                     // C3: the backup line updates after a backup.
                                     w.set_backup_text("Saved just now".into());
-                                    ctx.notify(
+                                    // UI-8 (v2.0.12): success surfaces
+                                    // in place (`notify_success`),
+                                    // like every other success path —
+                                    // the old drawer-only `notify`
+                                    // left the user with no visible
+                                    // confirmation at all.
+                                    ctx.notify_success(
                                         w,
                                         "Backup",
                                         "Backup saved",
@@ -11746,7 +12084,10 @@ fn wire_settings_action(win: &MainWindow, ctx: &Rc<Ctx>) {
                             };
                             match result {
                                 Ok(message) => {
-                                    ctx.notify(w, "Backup", "Backup restored", &message);
+                                    // UI-8 (v2.0.12): see the backup
+                                    // arm above — success surfaces in
+                                    // place, not drawer-only.
+                                    ctx.notify_success(w, "Backup", "Backup restored", &message);
                                     ctx.refresh_profiles(w);
                                 }
                                 Err(e) => ctx.notify_error(w, "Backup", &e),
@@ -12693,6 +13034,8 @@ fn main() -> Result<(), slint::PlatformError> {
         wifi_rejoining: Rc::new(Cell::new(false)),
         wifi_rejoin_since: Rc::new(Cell::new(None)),
         backend_cooldown_until: Rc::new(Cell::new(None)),
+        backend_job_requested: Rc::new(Cell::new(None)),
+        backend_requery_in_flight: Rc::new(Cell::new(false)),
         wifi_password_set_known: Rc::new(Cell::new(None)),
         wifi_password_message_for: Rc::new(Cell::new(None)),
         confirm_pending: Rc::new(RefCell::new(None)),
@@ -13581,6 +13924,15 @@ mod tests {
     }
 
     #[test]
+    fn game_op_timeout_exceeds_the_game_ipc_budgets() {
+        // UI-4 (v2.0.12): the GameOp job timeout must exceed the
+        // 10 s game-write / launch IPC budgets, or a healthy 5–10 s
+        // write was declared timed out while the daemon was still
+        // working on it.
+        assert_eq!(JobKind::GameOp.timeout(), Duration::from_secs(15));
+    }
+
+    #[test]
     fn r2_setup_step_debounce() {
         // R2-36: first click passes; a second click within 300 ms
         // is ignored; a click after the window passes again.
@@ -13792,6 +14144,8 @@ mod tests {
             wifi_rejoining: Rc::new(Cell::new(false)),
             wifi_rejoin_since: Rc::new(Cell::new(None)),
             backend_cooldown_until: Rc::new(Cell::new(None)),
+            backend_job_requested: Rc::new(Cell::new(None)),
+            backend_requery_in_flight: Rc::new(Cell::new(false)),
             wifi_password_set_known: Rc::new(Cell::new(None)),
             wifi_password_message_for: Rc::new(Cell::new(None)),
             confirm_pending: Rc::new(RefCell::new(None)),
@@ -15268,8 +15622,8 @@ mod tests {
 
     // D17 (was DS-24): a failure shows in the status bar and NEVER
     // opens the drawer — the drawer opens only on bell click. The
-    // error lives 1 s, then the 1 Hz expiry clears it (P3-1: the
-    // old "8 s" here was stale — the code is 1 s). A success
+    // error lives 4 s (UI-5, v2.0.12 — the old 1 s flash was too
+    // short to read), then the 1 Hz expiry clears it. A success
     // shows the same way, with the ok-accent kind.
     #[test]
     fn d17_failure_status_never_opens_drawer() {
@@ -15303,7 +15657,7 @@ mod tests {
         ctx.check_status_expiry(&win);
         assert_ne!(win.get_status_text().as_str(), "");
 
-        // Past the 1 s deadline: the expiry clears it (and the kind
+        // Past the 4 s deadline: the expiry clears it (and the kind
         // resets to error).
         ctx.status_until.set(Some(
             Instant::now()
@@ -15597,6 +15951,301 @@ mod tests {
             "success clears the cooldown"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // HID-4 (v2.0.12): a vJoy-requested switch failure must NOT arm
+    // the 30 s selector cooldown — the daemon storm guard counts
+    // HIDMaestro attempts only, so a failed vJoy switch (e.g. vJoy
+    // not installed) must not lock the user out of HIDMaestro.
+    #[test]
+    fn backend_job_vjoy_failure_does_not_arm_cooldown() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("backend cooldown test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        assert_eq!(ctx.api().output_backend(), "vJoy");
+        assert_eq!(win.get_backend_cooldown_secs(), 0);
+
+        // A vJoy switch failure: the error toasts, the radio stays
+        // on the live backend (vJoy), and no cooldown arms.
+        win.set_controller(1);
+        let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
+            JobDone::Backend {
+                index: 1,
+                result: Err(UserError {
+                    code: "Unknown".to_string(),
+                    title: "Something went wrong".to_string(),
+                    what_happened: "Something went wrong.".to_string(),
+                    what_to_do: "Try again.".to_string(),
+                    detail: Some("vJoy is not installed.".to_string()),
+                }),
+            }
+        });
+        assert!(started, "backend job should start");
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(
+            win.get_controller(),
+            1,
+            "radio stays on the live backend (vJoy)"
+        );
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "a vJoy failure must not arm the cooldown"
+        );
+        // And a HIDMaestro-requested failure still arms (the
+        // mismatch arm counts too: Ok(vJoy) for a HIDMaestro
+        // request is a failure of the HIDMaestro switch).
+        win.set_controller(0);
+        let started = ctx.run_job(&win, JobKind::Backend, "Switching controller…", || {
+            JobDone::Backend {
+                index: 0,
+                result: Ok("vJoy".to_string()),
+            }
+        });
+        assert!(started, "backend job should start");
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            30,
+            "a HIDMaestro-requested failure must still arm the cooldown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // HID-3 (v2.0.12): a backend-job timeout re-queries the LIVE
+    // backend from the daemon instead of trusting the UI-side
+    // cache — a switch that actually completed reports success,
+    // and one still running reports "still running" with no
+    // cooldown, never the false failure + 30 s lockout.
+    #[test]
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    fn backend_timeout_requeries_the_live_backend() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("HID-3 test skipped: no usable display/backend");
+            return;
+        };
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-hid3-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let server = Arc::new(rsh_ipc::IpcServer::new(api, tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let live_api = IpcApi::connect(&sock).expect("connect");
+        let (ctx, ctx_dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        ctx.swap_to_live(live_api.clone());
+        ctx.state.borrow_mut().live = true;
+        let unread = || ctx.notifications.borrow().unread_count();
+        let last_title = || {
+            ctx.notifications
+                .borrow()
+                .to_model_items()
+                .into_iter()
+                .next_back()
+                .map(|item| item.title.as_str().to_string())
+                .unwrap_or_default()
+        };
+        // A stale backend job stands in for the timed-out switch:
+        // the 420 s Backend bound makes a 421 s old entry due.
+        let stale_backend_job = || {
+            ctx.backend_job_requested.set(Some(0));
+            ctx.busy_jobs.borrow_mut().insert(
+                JobKind::Backend,
+                (
+                    "Switching controller…".to_string(),
+                    Instant::now()
+                        .checked_sub(Duration::from_secs(421))
+                        .expect("421 s ago exists"),
+                ),
+            );
+        };
+
+        // Leg 1: the daemon is still on vJoy, the UI asked for
+        // HIDMaestro — the timeout stays silent (the re-query
+        // reports), no cooldown arms, and the verdict is "still
+        // running", not a failure.
+        assert_eq!(live_api.output_backend(), "vJoy");
+        stale_backend_job();
+        let before = unread();
+        ctx.check_job_timeouts(&win);
+        assert_eq!(
+            unread(),
+            before,
+            "the timeout itself must stay silent — the re-query reports"
+        );
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "no cooldown before the verdict"
+        );
+        assert!(
+            ctx.backend_requery_in_flight.get(),
+            "the timeout must start a live re-query"
+        );
+        drain_all_jobs(&ctx, &win);
+        assert!(
+            !ctx.backend_requery_in_flight.get(),
+            "the re-query flag clears on its verdict"
+        );
+        assert_eq!(unread(), before + 1, "the verdict notifies exactly once");
+        assert_eq!(last_title(), "Controller switch still running");
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "a still-running switch must not arm the cooldown"
+        );
+        assert_eq!(
+            win.get_controller(),
+            1,
+            "the segment re-syncs to the live backend (vJoy)"
+        );
+
+        // Leg 2: the daemon HAS switched to HIDMaestro by the time
+        // the re-query runs — the timeout reports the success, not
+        // the timeout.
+        assert_eq!(
+            live_api.set_output_backend("HIDMaestro").expect("switch"),
+            "HIDMaestro"
+        );
+        stale_backend_job();
+        let before = unread();
+        ctx.check_job_timeouts(&win);
+        assert_eq!(unread(), before, "the timeout itself stays silent");
+        drain_all_jobs(&ctx, &win);
+        assert_eq!(unread(), before + 1, "the verdict notifies exactly once");
+        assert_eq!(last_title(), "Controller switched");
+        assert_eq!(
+            win.get_controller(),
+            0,
+            "the segment shows the switched backend (HIDMaestro)"
+        );
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "a completed switch arms no cooldown"
+        );
+
+        // Teardown: `mark_dead` drops the live link so the server
+        // thread ends when the client goes away.
+        ctx.mark_dead(&win);
+        drop(live_api);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ctx_dir);
+    }
+
+    // CORE-13 (v2.0.12): a reconnect seed whose `connect` Ok'd
+    // with `connect_started: Some(false)` — a retry was already in
+    // flight — must NOT toast "Wheel connected": the session is
+    // not established yet. A fresh connect still notifies.
+    #[test]
+    #[cfg(unix)]
+    fn reconnect_seed_noop_connect_does_not_notify_connected() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("CORE-13 test skipped: no usable display/backend");
+            return;
+        };
+        let _guard = crate::live_probe::TEST_IPC_PIPE_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!("rsh-core13-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let sock = dir.join("rsh-daemon.sock");
+        let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let server = Arc::new(rsh_ipc::IpcServer::new(api.clone(), tx));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let sock_clone = sock.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("server runtime");
+            rt.block_on(async move {
+                let listener = rsh_ipc::bind_unix_socket(&sock_clone).expect("bind");
+                ready_tx.send(()).expect("ready signal");
+                if let Ok((stream, _)) = listener.accept().await {
+                    server.serve_stream(stream).await;
+                }
+            });
+        });
+        ready_rx.recv().expect("server bound");
+        let live_api = IpcApi::connect(&sock).expect("connect");
+        let (ctx, ctx_dir) = fc2_test_ctx();
+        wire_callbacks(&win, &ctx);
+        ctx.swap_to_live(live_api.clone());
+        ctx.state.borrow_mut().live = true;
+        let unread = || ctx.notifications.borrow().unread_count();
+        let last_title = || {
+            ctx.notifications
+                .borrow()
+                .to_model_items()
+                .into_iter()
+                .next_back()
+                .map(|item| item.title.as_str().to_string())
+                .unwrap_or_default()
+        };
+        let seed_with = |connect: Result<ConnectionInfo, UserError>| crate::ipc_api::LiveSeed {
+            backend: "vJoy".to_string(),
+            autostart: true,
+            connect,
+            wifi: WifiStatus {
+                ssid: None,
+                connected: false,
+                password_set: false,
+                board_mac: None,
+            },
+        };
+
+        // No-op connect (retry already in flight): silent.
+        let mut noop = api.connection();
+        noop.connect_started = Some(false);
+        let before = unread();
+        ctx.apply_reconnect_seed(&win, live_api.clone(), seed_with(Ok(noop)));
+        assert_eq!(
+            unread(),
+            before,
+            "a no-op connect must not notify 'Wheel connected'"
+        );
+
+        // Fresh connect: notifies exactly once.
+        let mut fresh = api.connection();
+        fresh.connect_started = Some(true);
+        let before = unread();
+        ctx.apply_reconnect_seed(&win, live_api.clone(), seed_with(Ok(fresh)));
+        assert_eq!(unread(), before + 1, "a fresh connect must notify once");
+        assert_eq!(last_title(), "Wheel connected");
+
+        ctx.mark_dead(&win);
+        drop(live_api);
+        handle.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ctx_dir);
     }
 
     // D15: the wizard's Connect step unlocks on `board_reachable`
