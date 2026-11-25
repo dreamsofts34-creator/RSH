@@ -1920,9 +1920,15 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
     let handler = &ui_main[handler_start..handler_end];
     let job_fn = ui_main.find("fn start_backend_job").map_or("", |start| {
         let rest = &ui_main[start..];
-        let end = rest
-            .find("\n    /// Start a firmware-check job")
-            .unwrap_or(rest.len());
+        // The old end marker was the `/// Start a firmware-check
+        // job` doc comment — but read_code strips comments, so it
+        // never matched and the slice ran to EOF, counting a second
+        // `set_output_backend` call in a test helper at the file's
+        // tail (`live_api.set_output_backend(...)`). End at the
+        // next method instead.
+        let end = rest[1..]
+            .find("\n    fn ")
+            .map_or(rest.len(), |off| off + 1);
         &rest[..end]
     });
     // v2.0.12 HID-3: the job fn's doc comment names
