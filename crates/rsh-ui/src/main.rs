@@ -7116,10 +7116,13 @@ impl Ctx {
     /// Open the add/edit game dialog for a new game (`None`) or
     /// the game with this id. Games are manual-only: the exe path
     /// comes from the native file picker (Browse — see
-    /// [`Ctx::pick_game_exe`]), and [`GameSummary`] carries no exe
-    /// path, so Edit pre-fills the name + bound profile and the exe
-    /// field starts empty — the user picks the file again with
-    /// Browse. Refuses
+    /// [`Ctx::pick_game_exe`]). Edit pre-fills the name, the bound
+    /// profile and the exe path from the game's stored `exe_path`
+    /// (P2-3: the games list returns it, so a pure rename saves
+    /// without re-browsing — Save is disabled while the exe field
+    /// is empty). An empty stored path (unknown/legacy game) falls
+    /// back to an empty exe field, so Browse is still required;
+    /// Add always starts empty. Refuses
     /// while RSH isn't running: there is no store to save to, so
     /// say so instead of opening a dialog whose Save can only fail.
     fn open_game_dialog(&self, win: &MainWindow, edit_id: Option<String>) {
@@ -7149,13 +7152,18 @@ impl Ctx {
             );
             return;
         }
-        let (title, name, profile_id) = match &game {
+        let (title, name, profile_id, exe) = match &game {
             Some(g) => (
                 "Edit game".to_string(),
                 g.name.clone(),
                 g.bound_profile_id.clone(),
+                // P2-3: pre-fill the stored exe path so a pure
+                // rename saves without re-browsing; empty when the
+                // game has no stored path (unknown/legacy), which
+                // keeps the old behaviour — Browse required.
+                g.exe_path.clone(),
             ),
-            None => ("Add game".to_string(), String::new(), None),
+            None => ("Add game".to_string(), String::new(), None, String::new()),
         };
         *self.game_dialog_edit_id.borrow_mut() = edit_id;
         self.game_dialog_profile_id
@@ -7163,7 +7171,7 @@ impl Ctx {
             .clone_from(&profile_id);
         win.set_game_dialog_title(title.into());
         win.set_game_dialog_name(name.into());
-        win.set_game_dialog_exe("".into());
+        win.set_game_dialog_exe(exe.into());
         // P1-7: a previous save error never survives into a fresh
         // dialog — the inline error starts empty every open.
         win.set_game_dialog_error("".into());
@@ -13122,6 +13130,71 @@ mod tests {
     fn pretty_game_slug_reads_as_name() {
         assert_eq!(pretty_game_slug("assetto_corsa"), "Assetto Corsa");
         assert_eq!(pretty_game_slug("dirt_rally_2"), "Dirt Rally 2");
+    }
+
+    /// P2-3: Edit pre-fills the exe path from the game's stored
+    /// `exe_path`, so a pure rename saves without re-browsing
+    /// (Save is disabled while the exe field is empty). Add still
+    /// starts empty, and a game with no stored path (unknown /
+    /// legacy) falls back to empty + Browse required.
+    #[test]
+    fn edit_game_dialog_prefills_exe_path() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("game dialog test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, _dir) = fc2_test_ctx();
+        *ctx.games_cache.borrow_mut() = vec![
+            GameSummary {
+                id: "ets2".to_string(),
+                name: "Euro Truck Simulator 2".to_string(),
+                exe_path: r"C:\Games\ETS2\eurotrucks2.exe".to_string(),
+                running: false,
+                installed: true,
+                bound_profile_id: None,
+            },
+            GameSummary {
+                id: "legacy".to_string(),
+                name: "Legacy Game".to_string(),
+                exe_path: String::new(),
+                running: false,
+                installed: false,
+                bound_profile_id: None,
+            },
+        ];
+        {
+            let mut state = ctx.state.borrow_mut();
+            state.live = true;
+        }
+
+        ctx.open_game_dialog(&win, Some("ets2".to_string()));
+        assert!(win.get_game_dialog_open(), "dialog must open for edit");
+        assert_eq!(win.get_game_dialog_title().as_str(), "Edit game");
+        assert_eq!(
+            win.get_game_dialog_name().as_str(),
+            "Euro Truck Simulator 2"
+        );
+        assert_eq!(
+            win.get_game_dialog_exe().as_str(),
+            r"C:\Games\ETS2\eurotrucks2.exe",
+            "edit pre-fills the stored exe path"
+        );
+
+        ctx.open_game_dialog(&win, Some("legacy".to_string()));
+        assert_eq!(
+            win.get_game_dialog_exe().as_str(),
+            "",
+            "empty stored path falls back to empty + Browse required"
+        );
+
+        ctx.open_game_dialog(&win, None);
+        assert_eq!(win.get_game_dialog_title().as_str(), "Add game");
+        assert_eq!(win.get_game_dialog_name().as_str(), "");
+        assert_eq!(
+            win.get_game_dialog_exe().as_str(),
+            "",
+            "add still starts empty"
+        );
     }
 
     #[test]
