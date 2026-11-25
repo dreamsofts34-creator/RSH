@@ -49,6 +49,7 @@
 #define RSH_DIAG_PASSWORD_CLEARED 17  // D7: value = 0 (BOOT >= 10 s hold se password mita)
 #define RSH_DIAG_WDT_STATE       15  // DS-64: value 0 = loop task subscribed now, 1 = already subscribed, 2 = subscribe failed
 #define RSH_DIAG_KEYSTORE_NVS_FAIL 16  // DS-65: value 0 = keystore NVS write fail (set/clear password)
+#define RSH_DIAG_CFG_SAVE_FAIL   18  // P2-2: value 0 = config NVS persist fail / verify mismatch (COMMIT/CONFIRM/rollback persist) — in-RAM config chalti rehti hai, agle boot par LKG/factory fallback
 
 #define RSH_DIAG_MAX_EVENTS 32
 

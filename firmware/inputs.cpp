@@ -179,6 +179,22 @@ bool inputs_steering_is_mv() {
     return true;
   return useMv;
 }
+
+// P1-1: har slot ke liye mV flag (stream_emit axes_is_mv mask).
+// I2C axis (ADS1115/AS5600) ki value sampler se mV mein aati hai;
+// native steering mV mode mein bhi mV hai (useMv probe); baaqi native
+// axes raw counts hain. Button-mode handbrake (4095/0 raw) mV NAHI hai —
+// us par raw->mV convert hona chahiye (4095 -> 3300 full), is liye
+// axisType check hi kaafi hai (button mode ka type AXIS_ADC hai).
+bool inputs_axis_is_mv(uint8_t slot) {
+  pinmap_ensure_defaults_();
+  if (slot > RSH_PINMAP_AXIS_HANDBRAKE) return false;
+  uint8_t t = pinMap.axisType[slot];
+  if (t == RSH_CFG_TYPE_AXIS_AS5600 || t == RSH_CFG_TYPE_AXIS_ADS1115)
+    return true;
+  if (slot == RSH_PINMAP_AXIS_STEERING) return useMv;
+  return false;
+}
 SampleGovernor &inputs_governor() { return governor; }
 uint8_t inputs_axis_invalid_mask() { return axisInvalidMask; }
 bool inputs_axis_invalid() { return axisInvalidMask != 0; }
@@ -360,9 +376,11 @@ InputSample inputs_read() {
   // FW-12: quadrature encoders — band module ke counts freeze (step nahi
   // hota) aur report 0 hoti hai; chalu module cumulative i16 count deta hai.
   // Phase F WS5: H-pattern runtime mode mein encoder pins shifter ke
-  // hain — no read (enc values freeze nahi, 0 report hoti hain — neeche
-  // else branch jaisi; mode wapas sequential hone par decoders wahi se
-  // continue karte hain jahan ruke the — prev state mehfooz hai).
+  // hain — no read (decoders freeze, prev state mehfooz hai). P3-2:
+  // H-pattern mein AAKHRI count report hoti hai, 0 nahi — 0 report
+  // karne se engine baseline 0 par re-sync ho jata aur sequential par
+  // wapas aate hi ek glitch-drop hoti (decoders wahi se continue karte
+  // hain jahan ruke the — baseline bhi wahi rehni chahiye).
   // Phase G (C3): har encoder alag — sirf wohi step hota hai jis ke dono
   // pins blob mein hain (ek channel akela ho to pinmap use absent karta hai).
   s.enc[2] = 0;
@@ -383,6 +401,11 @@ InputSample inputs_read() {
     } else {
       s.enc[1] = 0;
     }
+  } else if (rsh_modules_encoders_enabled() &&
+             rsh_modules_shifter_mode() == RSH_SHIFTER_HPATTERN) {
+    // H-pattern: decoders frozen — aakhri count report karo (P3-2).
+    s.enc[0] = enc1.count;
+    s.enc[1] = enc2.count;
   } else {
     s.enc[0] = 0;
     s.enc[1] = 0;

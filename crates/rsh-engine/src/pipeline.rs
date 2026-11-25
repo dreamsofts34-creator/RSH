@@ -793,6 +793,15 @@ pub struct ProcessingPipeline {
     /// Previous tick's pressed state (processed handbrake value
     /// above 0.5): a rising edge toggles the latch (H1).
     handbrake_prev_pressed: bool,
+    /// P2-1 hold-last-good: the last axis outputs from a frame
+    /// WITHOUT `axis_invalid` set, in slot order (steering,
+    /// accelerator, brake, clutch, handbrake — handbrake is the
+    /// post-latch output). While the flag is set the pipeline
+    /// re-emits these instead of driving the outputs from the
+    /// untrusted sample (a rail-stuck axis would otherwise drive
+    /// full deflection). Buttons/encoders keep processing the
+    /// live frame — only the axes hold.
+    last_good_axes: [f32; 5],
     /// HO1 hold: ticks left the horn output stays on after the
     /// button is released (re-armed to the full minimum on every
     /// pressed tick, so a tap honks for at least `horn_min_ms`).
@@ -855,6 +864,7 @@ impl ProcessingPipeline {
             // --- Handbrake/clutch per-module tuning ---
             handbrake_latched: false,
             handbrake_prev_pressed: false,
+            last_good_axes: [0.0; 5],
             // --- LED/horn per-module tuning ---
             horn_hold_remaining: 0,
             horn_latch_on: false,
@@ -934,6 +944,7 @@ impl ProcessingPipeline {
         // --- Handbrake/clutch per-module tuning ---
         self.handbrake_latched = false;
         self.handbrake_prev_pressed = false;
+        self.last_good_axes = [0.0; 5];
         // --- LED/horn per-module tuning ---
         // A held/latched honk must not survive a reset (or a
         // re-enable) — the next press starts from silence.
@@ -962,6 +973,15 @@ impl ProcessingPipeline {
     /// previous frame (`skipped` stream frames were lost in between).
     /// The gap scales the encoder glitch filter (M4) so legitimate
     /// motion during the gap is not dropped as a glitch.
+    ///
+    /// P2-1: when `frame.flags.axis_invalid` is set, the axis
+    /// sample is untrusted (the board flags a rail-stuck / failed
+    /// axis, whose value sits at full deflection) — the axes hold
+    /// their last good outputs instead of being driven from it.
+    /// Filters/ramps are not fed the suspect sample, so resuming
+    /// after the flag clears continues from the held state. Buttons
+    /// and encoders still process the live frame (the flag is about
+    /// axes only). Before any good frame the hold is neutral.
     #[must_use]
     pub fn process_with_gap(&mut self, frame: &StreamFrame, skipped: u16) -> OutputState {
         let mut out = OutputState::neutral();
@@ -971,49 +991,69 @@ impl ProcessingPipeline {
         // (+21 ns/tick on criterion) — the local copies scalarize
         // into registers, while the reference re-loads tuning
         // fields from memory on every access. Copies stay.
-        let steering_tuning = self.plan.steering;
-        out.steering = process_steering_axis(
-            frame.axes_mv[STEERING_SLOT],
-            &steering_tuning,
-            &mut self.steering_filter,
-        );
-        let accel_tuning = self.plan.accelerator;
-        out.accelerator = process_pedal_axis(
-            frame.axes_mv[ACCEL_SLOT],
-            &accel_tuning,
-            &mut self.accel_filter,
-            &mut self.accel_ramp,
-        );
-        let brake_tuning = self.plan.brake;
-        out.brake = process_pedal_axis(
-            frame.axes_mv[BRAKE_SLOT],
-            &brake_tuning,
-            &mut self.brake_filter,
-            &mut self.brake_ramp,
-        );
-        let clutch_tuning = self.plan.clutch;
-        out.clutch = process_pedal_axis(
-            frame.axes_mv[CLUTCH_SLOT],
-            &clutch_tuning,
-            &mut self.clutch_filter,
-            &mut self.clutch_ramp,
-        );
-        let handbrake_tuning = self.plan.handbrake;
-        let handbrake_value = process_pedal_axis(
-            frame.axes_mv[HANDBRAKE_SLOT],
-            &handbrake_tuning,
-            &mut self.handbrake_filter,
-            &mut self.handbrake_ramp,
-        );
-        // H1/H3: the latch holds the output at full after the input
-        // is released (and auto-release drops it on throttle).
-        // The accelerator is already processed above, so the
-        // 20% throttle test reads this tick's value.
-        out.handbrake = self.apply_handbrake_latch(
-            handbrake_value,
-            out.accelerator,
-            frame.axes_mv[HANDBRAKE_SLOT].is_some(),
-        );
+        if frame.flags.axis_invalid {
+            // P2-1 hold-last-good (see the doc comment above).
+            out.steering = self.last_good_axes[0];
+            out.accelerator = self.last_good_axes[1];
+            out.brake = self.last_good_axes[2];
+            out.clutch = self.last_good_axes[3];
+            out.handbrake = self.last_good_axes[4];
+        } else {
+            let steering_tuning = self.plan.steering;
+            out.steering = process_steering_axis(
+                frame.axes_mv[STEERING_SLOT],
+                &steering_tuning,
+                &mut self.steering_filter,
+            );
+            let accel_tuning = self.plan.accelerator;
+            out.accelerator = process_pedal_axis(
+                frame.axes_mv[ACCEL_SLOT],
+                &accel_tuning,
+                &mut self.accel_filter,
+                &mut self.accel_ramp,
+            )
+            .0;
+            let brake_tuning = self.plan.brake;
+            out.brake = process_pedal_axis(
+                frame.axes_mv[BRAKE_SLOT],
+                &brake_tuning,
+                &mut self.brake_filter,
+                &mut self.brake_ramp,
+            )
+            .0;
+            let clutch_tuning = self.plan.clutch;
+            out.clutch = process_pedal_axis(
+                frame.axes_mv[CLUTCH_SLOT],
+                &clutch_tuning,
+                &mut self.clutch_filter,
+                &mut self.clutch_ramp,
+            )
+            .0;
+            let handbrake_tuning = self.plan.handbrake;
+            let (handbrake_value, handbrake_pressed) = process_pedal_axis(
+                frame.axes_mv[HANDBRAKE_SLOT],
+                &handbrake_tuning,
+                &mut self.handbrake_filter,
+                &mut self.handbrake_ramp,
+            );
+            // H1/H3: the latch holds the output at full after the input
+            // is released (and auto-release drops it on throttle).
+            // The accelerator is already processed above, so the
+            // 20% throttle test reads this tick's value.
+            out.handbrake = self.apply_handbrake_latch(
+                handbrake_value,
+                handbrake_pressed,
+                out.accelerator,
+                frame.axes_mv[HANDBRAKE_SLOT].is_some(),
+            );
+            self.last_good_axes = [
+                out.steering,
+                out.accelerator,
+                out.brake,
+                out.clutch,
+                out.handbrake,
+            ];
+        }
 
         if self.plan.combine_pedals {
             out.pedals_combined = (out.accelerator - out.brake).clamp(-1.0, 1.0);
@@ -1071,12 +1111,17 @@ impl ProcessingPipeline {
         // button reaches the stream raw. The stability stage holds
         // each wheel-button bit until it has been steady for
         // `debounce_ms` (5 ms ticks at 200 Hz); bits 0/1/2 skip it
-        // (firmware-debounced already). Skipped while the buttons
-        // module is disabled — the disabled branch below clears the
+        // (firmware-debounced already). P3-5: the gap (`skipped`
+        // lost frames) fast-forwards the debounce — a press that
+        // was already steady for the whole gap counts it, instead
+        // of the gap being invisible (pulse E1 and lockout SH2
+        // deliberately do NOT fast-forward; their windows are
+        // documented as approximate over a loss).
+        // Skipped while the buttons module is disabled — the disabled branch below clears the
         // state instead, so a stale hold can never survive a
         // re-enable.
         if self.plan.buttons.enabled {
-            buttons = self.apply_button_debounce(buttons);
+            buttons = self.apply_button_debounce(buttons, skipped);
         }
 
         // Horn (BUTTON slot 2, bit 2).
@@ -1315,6 +1360,11 @@ impl ProcessingPipeline {
     /// A bounce shorter than the hold never reaches the output; a
     /// genuine press is delayed by at most `debounce_ms`.
     ///
+    /// P3-5: `skipped` lost frames (from `process_with_gap`)
+    /// count toward the hold — this tick advances each candidate
+    /// by `1 + skipped`, so a press steady across a gap is not
+    /// held back by frames that never arrived.
+    ///
     /// Fast path: when every wheel bit already agrees with stable,
     /// the per-bit loop would only clear pending candidates — the
     /// same clearing in one shot, then the raw word unchanged.
@@ -1322,7 +1372,7 @@ impl ProcessingPipeline {
     /// and count cleared here exactly as the loop's settled branch
     /// would; a bit that disagrees on a later tick re-arms from
     /// zero either way, so the debounce timing is unchanged.)
-    fn apply_button_debounce(&mut self, raw: u32) -> u32 {
+    fn apply_button_debounce(&mut self, raw: u32, skipped: u16) -> u32 {
         let needed = button_debounce_ticks(self.plan.buttons.debounce_ms);
         let wheel_raw = raw & !BUTTON_DEBOUNCE_EXCLUDE_MASK;
         if needed == 0 {
@@ -1336,6 +1386,8 @@ impl ProcessingPipeline {
             self.button_candidate_ticks = [0; 32];
             return raw;
         }
+        // P3-5: one processed tick plus each skipped (lost) tick.
+        let step: u8 = 1u8.saturating_add(u8::try_from(skipped).unwrap_or(u8::MAX));
         for bit in 0..32 {
             let mask = 1u32 << bit;
             if mask & BUTTON_DEBOUNCE_EXCLUDE_MASK != 0 {
@@ -1359,7 +1411,7 @@ impl ProcessingPipeline {
                     self.button_candidate_ticks[bit] = 0;
                 }
                 self.button_candidate_ticks[bit] =
-                    self.button_candidate_ticks[bit].saturating_add(1);
+                    self.button_candidate_ticks[bit].saturating_add(step);
                 if self.button_candidate_ticks[bit] >= needed {
                     if raw_bit {
                         self.button_stable |= mask;
@@ -1451,10 +1503,15 @@ impl ProcessingPipeline {
     /// H1/H3: handbrake latch + auto-release on throttle.
     ///
     /// `value` is the processed handbrake output (post-ramp,
-    /// `0..=1`); `accel` is this tick's accelerator output;
+    /// `0..=1`); `pressed_value` is the pre-ramp value (P2-3) the
+    /// latch edge test reads — a button-mode tap held for less
+    /// than the press ramp must still toggle the latch, and the
+    /// post-ramp value would never reach 0.5 in that time
+    /// (default press ramp 150 ms caps the rise at 0.033/tick);
+    /// `accel` is this tick's accelerator output;
     /// `input_present` is false when the axis is missing (the
-    /// board does not sample it). "Pressed" is `value > 0.5`:
-    /// a full pull (axis) or a debounced press (button mode,
+    /// board does not sample it). "Pressed" is `pressed_value >
+    /// 0.5`: a full pull (axis) or a debounced press (button mode,
     /// which the firmware sends as 4095/0 on the same axis).
     /// A rising edge toggles the latch — press once = stays at
     /// full, press again = release. While latched the output is
@@ -1466,7 +1523,13 @@ impl ProcessingPipeline {
     /// auto-release both on, accelerator past 20% clears the
     /// latch (rally launch) — before the edge test, so a
     /// throttle press never re-latches in the same tick.
-    fn apply_handbrake_latch(&mut self, value: f32, accel: f32, input_present: bool) -> f32 {
+    fn apply_handbrake_latch(
+        &mut self,
+        value: f32,
+        pressed_value: f32,
+        accel: f32,
+        input_present: bool,
+    ) -> f32 {
         let tuning = self.plan.handbrake;
         if !tuning.enabled || !input_present {
             self.handbrake_latched = false;
@@ -1475,13 +1538,13 @@ impl ProcessingPipeline {
         }
         if !tuning.handbrake_latch {
             self.handbrake_latched = false;
-            self.handbrake_prev_pressed = value > 0.5;
+            self.handbrake_prev_pressed = pressed_value > 0.5;
             return value;
         }
         if tuning.handbrake_auto_release && self.handbrake_latched && accel > 0.2 {
             self.handbrake_latched = false;
         }
-        let pressed = value > 0.5;
+        let pressed = pressed_value > 0.5;
         if pressed && !self.handbrake_prev_pressed {
             self.handbrake_latched = !self.handbrake_latched;
         }
@@ -1777,23 +1840,28 @@ fn process_steering_axis(
 }
 
 /// Pedal chain for one tick: map → saturation → bite → deadzone →
-/// curve → smooth → ramp. Returns `0.0` (and resets filter and
-/// ramp) when the module is disabled or the axis is missing.
+/// curve → smooth → ramp. Returns `(ramped, pre_ramp)` — the ramped
+/// output first, and the pre-ramp (post-smoothing) value second: the
+/// handbrake latch edge test reads the pre-ramp value (P2-3), so a
+/// short button-mode tap still toggles the latch even though the
+/// default 150 ms press ramp has not risen past 0.5 yet. Returns
+/// `(0.0, 0.0)` (and resets filter and ramp) when the module is
+/// disabled or the axis is missing.
 fn process_pedal_axis(
     mv: Option<u16>,
     tuning: &ModuleTuning,
     filter: &mut OneEuroFilter,
     ramp: &mut RampLimiter,
-) -> f32 {
+) -> (f32, f32) {
     if !tuning.enabled {
         filter.reset();
         ramp.reset();
-        return 0.0;
+        return (0.0, 0.0);
     }
     let Some(mv) = mv else {
         filter.reset();
         ramp.reset();
-        return 0.0;
+        return (0.0, 0.0);
     };
     let (min_mv, max_mv) = pedal_range(tuning);
     let mut value = map_pedal_mv(mv, min_mv, max_mv);
@@ -1818,7 +1886,11 @@ fn process_pedal_axis(
     value = apply_deadzone_unipolar(value, tuning.deadzone);
     value = apply_curve(value, tuning.curve_strength);
     value = apply_smoothing(filter, value, tuning.smoothing);
-    ramp.update(value, DT_S, tuning.press_ms, tuning.release_ms)
+    let pre_ramp = value;
+    (
+        ramp.update(value, DT_S, tuning.press_ms, tuning.release_ms),
+        pre_ramp,
+    )
 }
 
 /// Effective steering range for a tuning: the tuning's own range when
@@ -2846,6 +2918,43 @@ mod tests {
     }
 
     #[test]
+    fn axis_invalid_flag_holds_last_good_axes() {
+        // P2-1: axis_invalid set ho to axes aakhri achhi values par
+        // hold hote hain (rail-stuck sample full deflection nahi
+        // deta); buttons/encoders live frame se chalte rehte hain;
+        // flag clear hone par nayi values phir flow karti hain.
+        let mut pipe = ProcessingPipeline::new(plain_plan());
+        let out = pipe.process(&frame(&[(0, 3300), (1, 1800)], &[], 0));
+        assert!(approx(out.steering, 1.0));
+        assert!(approx(out.accelerator, 0.5));
+        let flags = StreamFlags {
+            axis_invalid: true,
+            ..Default::default()
+        };
+        let bad = StreamFrame::new(2, 5000, flags, &[(0, 300), (1, 300)], &[], 0);
+        let out = pipe.process(&bad);
+        assert!(approx(out.steering, 1.0), "held steering: {}", out.steering);
+        assert!(
+            approx(out.accelerator, 0.5),
+            "held accel: {}",
+            out.accelerator
+        );
+        // Buttons still live: horn bit (1 << 2) on an invalid frame honks.
+        let bad_horn = StreamFrame::new(3, 5000, flags, &[(0, 300)], &[], 1 << 2);
+        let out = pipe.process(&bad_horn);
+        assert!(out.horn, "horn still live on invalid frame");
+        assert!(approx(out.steering, 1.0));
+        // Flag clears: new values flow again.
+        let out = pipe.process(&frame(&[(0, 300)], &[], 0));
+        assert!(approx(out.steering, -1.0));
+        // No good frame yet: hold is neutral.
+        let mut pipe = ProcessingPipeline::new(plain_plan());
+        let out = pipe.process(&bad);
+        assert!(approx(out.steering, 0.0));
+        assert!(approx(out.accelerator, 0.0));
+    }
+
+    #[test]
     fn handbrake_latch_holds_and_releases_on_second_press() {
         // H1: press once = stays on after release, press again =
         // release. Latch off = the output follows the input.
@@ -2881,6 +2990,45 @@ mod tests {
         assert!(approx(out.handbrake, 0.0), "missing axis clears latch");
         let out = pipe.process(&frame(&[(4, 3300)], &[], 0));
         assert!(approx(out.handbrake, 1.0), "fresh latch after clear");
+    }
+
+    #[test]
+    fn handbrake_latch_toggles_on_short_button_tap_despite_press_ramp() {
+        // P2-3: button-mode tap (3300 for 5 ticks, phir release) —
+        // default press ramp 150 ms se post-ramp value 5 ticks mein
+        // sirf ~0.165 tak pahunchti hai (0.5 kabhi nahi) — latch edge
+        // pre-ramp value par hai, is liye pehle hi tick par toggle hoti hai.
+        let mut plan = plain_plan();
+        plan.handbrake.handbrake_latch = true;
+        plan.handbrake.press_ms = 150.0;
+        plan.handbrake.release_ms = 100.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[(4, 300)], &[], 0)); // rest
+        assert!(approx(out.handbrake, 0.0));
+        // 5-tick tap: pre-ramp 1.0 pehle tick par — latch on.
+        for _ in 0..5 {
+            let out = pipe.process(&frame(&[(4, 3300)], &[], 0));
+            assert!(approx(out.handbrake, 1.0));
+        }
+        // Release: latched rehta hai (output 1.0, ramp ke bawajood).
+        let out = pipe.process(&frame(&[(4, 300)], &[], 0));
+        assert!(approx(out.handbrake, 1.0), "latched after short tap");
+        let out = pipe.process(&frame(&[(4, 300)], &[], 0));
+        assert!(approx(out.handbrake, 1.0), "still latched");
+        // Doosra tap: unlatch.
+        for _ in 0..5 {
+            let _ = pipe.process(&frame(&[(4, 3300)], &[], 0));
+        }
+        // Release: latch off hai — ramp neeche aane tak output
+        // input follow karta hai (0 tak girta hai).
+        let mut out = pipe.process(&frame(&[(4, 300)], &[], 0));
+        for _ in 0..10 {
+            if approx(out.handbrake, 0.0) {
+                break;
+            }
+            out = pipe.process(&frame(&[(4, 300)], &[], 0));
+        }
+        assert!(approx(out.handbrake, 0.0), "released after second tap");
     }
 
     #[test]
@@ -3056,6 +3204,28 @@ mod tests {
         assert_eq!(out.buttons, 1 << 3);
         let out = pipe.process(&frame(&[], &[], 0));
         assert_eq!(out.buttons, 0);
+    }
+
+    #[test]
+    fn button_debounce_counts_skipped_frames() {
+        // P3-5: BU1 debounce gap ko fast-forward karta hai — 10 ms
+        // debounce (2 ticks) + 5 lost frames ke baad press foran stable hai.
+        let mut plan = plain_plan();
+        plan.buttons.debounce_ms = 10.0;
+        let mut pipe = ProcessingPipeline::new(plan);
+        // Bit 3 (wheel button) — pehla frame: candidate 1 tick,
+        // abhi stable nahi.
+        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        assert_eq!(out.buttons, 0);
+        // Gap frame (5 lost): candidate 1 + 1 + 5 = 7 >= 2 -> stable.
+        let out = pipe.process_with_gap(&frame(&[], &[], 1 << 3), 5);
+        assert_eq!(out.buttons, 1 << 3, "gap fast-forwards debounce");
+        // Gap ke baghair: doosra steady frame bhi chahiye hota.
+        let mut pipe = ProcessingPipeline::new(plan);
+        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        assert_eq!(out.buttons, 0);
+        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        assert_eq!(out.buttons, 1 << 3);
     }
 
     #[test]

@@ -11,10 +11,15 @@
 // hai). Status packet (1 Hz) is se alag hai — waisa hi rehta hai.
 //
 // Wire rules (§1.1, D6): sab axes mV mein hain. Steering mV mode mein
-// analogReadMilliVolts se seedha mV aata hai; pedals/clutch/handbrake
-// raw counts (0-4095) aate hain — unhein yahin nominal ADC scale se mV
-// mein badla jata hai (calibration PC-side hoti hai; ye scale sirf
-// wire unit hai). Clutch slot 3, handbrake slot 4 (Phase F WS5).
+// analogReadMilliVolts se seedha mV aata hai; native pedals/clutch/
+// handbrake raw counts (0-4095) aate hain — unhein yahin nominal ADC
+// scale se mV mein badla jata hai (calibration PC-side hoti hai; ye scale
+// sirf wire unit hai). I2C axes (ADS1115/AS5600) ki values PEHLE SE mV
+// mein hoti hain (inputs.cpp read_axis_value_ / i2c_axes.h value_mv) —
+// un par dobara raw->mV NAHI lagta (P1-1: pehle har non-steering axis
+// par lagta tha — 1650 mV -> 1330 mV, full travel kabhi 100% nahi).
+// Caller har slot ke liye `axes_is_mv` bit deta hai (inputs_axis_is_mv).
+// Clutch slot 3, handbrake slot 4 (Phase F WS5).
 // Encoders cumulative i16 hain (D1). Buttons v1 byte (RSH_BTN_* bits)
 // ki bit positions v2 bits 0..4 se milti hain (gear up/down, accel,
 // brake, horn) — module gating rsh_stream_button_bits karta hai.
@@ -57,7 +62,11 @@ static inline rsh_emit_kind_t rsh_stream_emit_kind(uint8_t pc_active,
 /// v2 stream packet banao (InputSample jaisi values se — .ino se call
 /// hota hai). Axes mask-order mein bhare jate hain (rsh_v2_build_stream
 /// ka contract: axes[] ascending slot order mein).
-///   steering: steering value; steering_is_mv=0 ho to raw->mV convert.
+///   axes_is_mv: bit per slot (bit 0 steering … bit 4 handbrake) — bit
+///     set ho to value pehle se mV mein hai (I2C axis, ya mV-mode
+///     steering), clear ho to raw counts hain aur raw->mV convert hota
+///     hai. P1-1: pehle sirf steering ka flag tha — I2C pedals do
+///     dafa convert hote thay (mV -> dobara mV scale).
 ///   n_enc: encoders enabled hon to 2 (enc[0..1]), warna 0.
 ///   buttons_v1: RSH_BTN_* byte.
 ///   clutch_raw: clutch raw counts (slot 3, Phase F WS5 — module band
@@ -67,7 +76,7 @@ static inline rsh_emit_kind_t rsh_stream_emit_kind(uint8_t pc_active,
 /// Return packet length (20 + 2*axes + 2*n_enc + 2), ya 0 (ghalat input).
 static inline size_t rsh_build_v2_stream_packet(
     uint8_t *buf, size_t buf_len, uint16_t seq, uint32_t timestamp_us,
-    uint8_t flags, uint16_t steering, uint8_t steering_is_mv,
+    uint8_t flags, uint16_t steering, uint8_t axes_is_mv,
     uint16_t accel_raw, uint16_t brake_raw, uint16_t handbrake_raw,
     const int16_t *enc, uint8_t n_enc, uint8_t buttons_v1,
     const RshModuleEnable *en, uint16_t clutch_raw, uint8_t shifter_gear) {
@@ -79,16 +88,28 @@ static inline size_t rsh_build_v2_stream_packet(
   uint8_t n = 0;
   // Slots ascending: 0 steering, 1 accel, 2 brake, 3 clutch, 4 handbrake.
   // (Phase F WS5: handbrake slot 3 se 4 par gaya — clutch ke liye slot 3.)
+  // P1-1: har slot ka mV bit alag — I2C value pehle se mV hai, us par
+  // dobara raw->mV NAHI lagta; native raw counts convert hote hain.
   if (mask & (uint8_t)(1u << RSH_AXIS_SLOT_STEERING))
-    axes[n++] = steering_is_mv ? steering : rsh_raw_to_mv(steering);
+    axes[n++] = (axes_is_mv & (uint8_t)(1u << RSH_AXIS_SLOT_STEERING))
+                    ? steering
+                    : rsh_raw_to_mv(steering);
   if (mask & (uint8_t)(1u << RSH_AXIS_SLOT_ACCEL))
-    axes[n++] = rsh_raw_to_mv(accel_raw);
+    axes[n++] = (axes_is_mv & (uint8_t)(1u << RSH_AXIS_SLOT_ACCEL))
+                    ? accel_raw
+                    : rsh_raw_to_mv(accel_raw);
   if (mask & (uint8_t)(1u << RSH_AXIS_SLOT_BRAKE))
-    axes[n++] = rsh_raw_to_mv(brake_raw);
+    axes[n++] = (axes_is_mv & (uint8_t)(1u << RSH_AXIS_SLOT_BRAKE))
+                    ? brake_raw
+                    : rsh_raw_to_mv(brake_raw);
   if (mask & (uint8_t)(1u << RSH_AXIS_SLOT_CLUTCH))
-    axes[n++] = rsh_raw_to_mv(clutch_raw);
+    axes[n++] = (axes_is_mv & (uint8_t)(1u << RSH_AXIS_SLOT_CLUTCH))
+                    ? clutch_raw
+                    : rsh_raw_to_mv(clutch_raw);
   if (mask & (uint8_t)(1u << RSH_AXIS_SLOT_HANDBRAKE))
-    axes[n++] = rsh_raw_to_mv(handbrake_raw);
+    axes[n++] = (axes_is_mv & (uint8_t)(1u << RSH_AXIS_SLOT_HANDBRAKE))
+                    ? handbrake_raw
+                    : rsh_raw_to_mv(handbrake_raw);
   uint32_t buttons = rsh_stream_button_bits(
       en, (uint8_t)((buttons_v1 & RSH_BTN_GEAR_UP) != 0),
       (uint8_t)((buttons_v1 & RSH_BTN_GEAR_DOWN) != 0),

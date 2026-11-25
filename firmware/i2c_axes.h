@@ -96,12 +96,14 @@ static inline uint8_t rsh_i2c_axes_has_slow_axis(const RshI2cAxes *a) {
   return 0;
 }
 
-// I2C bus chahiye? (AS5600 ya ADS1115 ya expander record ho.)
+// I2C bus chahiye? (AS5600 ya ADS1115 record ho.)
+// P3-3: hasExpander check hata diya — expander records COMMIT par
+// reject hote hain, is liye valid map mein expander kabhi nahi hota.
 static inline uint8_t rsh_i2c_axes_needs_bus(const RshI2cAxes *a,
                                             const RshPinMap *map) {
   if (!a) return 0;
   if (a->as5600_slot != 0xFF || a->ads.n_channels > 0) return 1;
-  if (map && map->hasExpander) return 1;  // FW-01: expander sampling pending
+  (void)map;
   return 0;
 }
 
