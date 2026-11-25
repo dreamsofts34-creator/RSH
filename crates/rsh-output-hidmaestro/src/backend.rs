@@ -338,7 +338,7 @@ impl HidMaestroOutput {
                 HidMaestroStateKind::CreateFailed
             }
             HidMaestroError::SidecarDied(_)
-            | HidMaestroError::ReplyTimeout
+            | HidMaestroError::ReplyTimeout(_)
             | HidMaestroError::HelloTimeout
             | HidMaestroError::BadHello(_)
             | HidMaestroError::BadReply(_) => HidMaestroStateKind::SidecarFailed,

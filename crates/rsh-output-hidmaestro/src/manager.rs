@@ -733,16 +733,38 @@ impl SidecarManager {
     /// elevated-process handle, after which the exit code is
     /// unknowable (see [`request_with_timeout`](Self::request_with_timeout)).
     fn describe_post_hello_eof(&self) -> String {
-        let elapsed_ms = self.last_reply.map_or_else(
+        self.describe_eof(
+            "sidecar closed the connection",
+            self.ms_since_last_reply(),
+            "since last reply",
+        )
+    }
+
+    /// Ms since the last reply (or since spawn when no reply ever
+    /// arrived): the elapsed clock shared by the post-hello EOF
+    /// and reply-timeout diagnostics.
+    fn ms_since_last_reply(&self) -> u128 {
+        self.last_reply.map_or_else(
             || {
                 self.hello_started
                     .map_or(0, |started| started.elapsed().as_millis())
             },
             |last| last.elapsed().as_millis(),
-        );
+        )
+    }
+
+    /// Describe a reply timeout (HID path sweep, v2.0.12): which
+    /// bound was hit plus the same PID + exit-code + timing
+    /// enrichment as the EOF arms — the bound names the stage (a
+    /// 120 s timeout is install/create, 10 s is the first neutral,
+    /// 200 ms is a submit/heartbeat), and the exit code tells a
+    /// hung sidecar (`STILL_ACTIVE`, still running) from a crashed
+    /// one. Must be called BEFORE `kill_transport`, like the EOF
+    /// descriptions.
+    fn describe_reply_timeout(&self, timeout: Duration) -> String {
         self.describe_eof(
-            "sidecar closed the connection",
-            elapsed_ms,
+            &format!("sidecar did not answer within {timeout:?}"),
+            self.ms_since_last_reply(),
             "since last reply",
         )
     }
@@ -851,9 +873,20 @@ impl SidecarManager {
                 Err(HidMaestroError::SidecarDied(message))
             }
             Err(_) => {
+                // HID path sweep (v2.0.12): the timeout arm used to
+                // return the bare unit `ReplyTimeout` — no bound, no
+                // PID, no exit code — so a 120 s install/create
+                // timeout (hung driver install, sidecar alive) read
+                // exactly like a crashed sidecar in the daemon log
+                // and on the Output page. The EOF arm above was
+                // enriched in v2.0.11 (P1-3) but this arm was missed.
+                // Capture the diagnostic BEFORE `kill_transport`
+                // (which takes the elevated-process handle the exit
+                // code is read from), exactly like the EOF arm.
+                let message = self.describe_reply_timeout(timeout);
                 self.kill_transport();
                 self.note_failure();
-                Err(HidMaestroError::ReplyTimeout)
+                Err(HidMaestroError::ReplyTimeout(message))
             }
         }
     }
@@ -1118,13 +1151,29 @@ impl SidecarManager {
             }
         }
         self.kill_transport();
-        self.token = None;
         self.last_reply = None;
     }
 
     fn kill_transport(&mut self) {
         if let Some(mut transport) = self.transport.take() {
             transport.writer.kill();
+        }
+        // HID path sweep (v2.0.12): the one-time nonce is cleared
+        // on EVERY teardown, not only on `shutdown()` — the
+        // `connect()` failure path (`kill_transport` + `note_failure`)
+        // used to leave a stale nonce from a failed attempt stored
+        // in the manager (the field is never read after hello, so
+        // this was dead state, but a stale single-use secret must
+        // not linger past the attempt that issued it). The same
+        // applies to the spawn PID: a later failure on the stdio
+        // path (which spawns no elevated process) must not name a
+        // dead PID from an earlier elevated attempt. Both are safe
+        // to clear here: every diagnostic read of the PID / exit
+        // code happens BEFORE `kill_transport` is called.
+        self.token = None;
+        #[cfg(windows)]
+        {
+            self.last_spawn_pid = None;
         }
         // M4: terminate the elevated sidecar process itself (the
         // handle was kept via `SEE_MASK_NOCLOSEPROCESS`) — closing
@@ -1535,5 +1584,29 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("closed the connection"), "{message}");
         assert!(message.contains("ms since last reply"), "{message}");
+    }
+
+    /// HID path sweep (v2.0.12): `kill_transport` clears the
+    /// stored one-time nonce (and, on Windows, the spawn PID) —
+    /// a failed attempt must not leave a stale nonce / dead PID
+    /// behind for a later failure to report. `shutdown()` funnels
+    /// through here, so the disconnect path is covered too.
+    #[test]
+    fn kill_transport_clears_token_and_spawn_pid() {
+        let mut manager = SidecarManager::new(SidecarConfig::with_path(PathBuf::from(
+            "/nonexistent/rsh-hidmaestro-sidecar",
+        )));
+        manager.token = Some("0123456789abcdef0123456789abcdef".to_string());
+        #[cfg(windows)]
+        {
+            manager.last_spawn_pid = Some(4848);
+        }
+        manager.kill_transport();
+        assert!(manager.token.is_none(), "stale nonce survived teardown");
+        #[cfg(windows)]
+        assert!(
+            manager.last_spawn_pid.is_none(),
+            "stale spawn PID survived teardown"
+        );
     }
 }

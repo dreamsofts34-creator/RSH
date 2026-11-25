@@ -58,8 +58,15 @@ pub enum HidMaestroError {
     CreateFailed(String),
     /// The sidecar died (EOF / crash / heartbeat timeout) mid-session.
     SidecarDied(String),
-    /// A sidecar reply did not arrive within the reply timeout.
-    ReplyTimeout,
+    /// A sidecar reply did not arrive within the reply timeout. The
+    /// payload is the enriched diagnostic (HID path sweep, v2.0.12):
+    /// which bound was hit, the spawn PID, the sidecar exit code
+    /// (`STILL_ACTIVE` = hung, not dead), and the ms since the last
+    /// reply — the bare unit variant could not tell a 120 s
+    /// install/create timeout (hung driver install, sidecar alive)
+    /// from a crashed sidecar, and the daemon log + Output page
+    /// showed only "stopped answering" either way.
+    ReplyTimeout(String),
     /// A sidecar reply was not valid JSON or failed validation.
     BadReply(String),
     /// `update` called while not connected.
@@ -120,9 +127,9 @@ impl fmt::Display for HidMaestroError {
                 f,
                 "The HIDMaestro sidecar stopped unexpectedly ({msg}). Falling back to vJoy."
             ),
-            Self::ReplyTimeout => write!(
+            Self::ReplyTimeout(detail) => write!(
                 f,
-                "The HIDMaestro sidecar stopped answering. Falling back to vJoy."
+                "The HIDMaestro sidecar stopped answering: {detail}. Falling back to vJoy."
             ),
             Self::BadReply(msg) => write!(f, "The HIDMaestro sidecar sent an invalid reply: {msg}"),
             Self::NotConnected => write!(f, "HIDMaestro is not connected."),

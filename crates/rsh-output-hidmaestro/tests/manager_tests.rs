@@ -451,7 +451,14 @@ fn slow_sidecar_reply_times_out() {
     let mut m = SidecarManager::new(cfg);
     m.connect().unwrap();
     let err = m.request(&Command::Ping).unwrap_err();
-    assert!(matches!(err, HidMaestroError::ReplyTimeout));
+    // HID path sweep (v2.0.12): the timeout carries the enriched
+    // diagnostic — the bound that was hit plus the ms since the
+    // last reply — so the daemon log can tell a hung sidecar from
+    // a crashed one (on Windows the PID + exit code ride along).
+    assert!(
+        matches!(&err, HidMaestroError::ReplyTimeout(message) if message.contains("50ms") && message.contains("since last reply")),
+        "expected an enriched ReplyTimeout, got {err:?}"
+    );
     assert!(!m.is_running());
 }
 

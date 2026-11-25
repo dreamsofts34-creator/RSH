@@ -967,8 +967,10 @@ enum JobKind {
     Reconnect,
     /// Transport switch (`connect`).
     Transport,
-    /// Output-backend switch (`set_output_backend`, up to 390 s while
-    /// the user answers UAC + the sidecar spawns).
+    /// Output-backend switch (`set_output_backend`, 420 s job timeout
+    /// over the 390 s IPC bound while the user answers UAC + the
+    /// sidecar spawns; P1-1 invariant: job > IPC > daemon worst
+    /// case incl. UAC).
     Backend,
     /// Firmware check (board vs bundled version).
     FirmwareCheck,
@@ -4488,8 +4490,9 @@ impl Ctx {
     }
 
     /// Start an output-backend switch job (A9/B-2): `set_output_backend`
-    /// runs on a background thread with its 390 s bound (UAC dwell +
-    /// 60 s sidecar spawn). Switching to `HIDMaestro` warns first —
+    /// runs on a background thread with the 420 s job timeout (IPC
+    /// 390 s > daemon worst case 310 s + 60 s UAC allowance, P1-1).
+    /// Switching to `HIDMaestro` warns first —
     /// Windows will ask once for admin permission. A second switch
     /// while one is in flight is ignored (no re-spawn loop, A10).
     fn start_backend_job(&self, win: &MainWindow, index: i32) {
