@@ -100,7 +100,9 @@ from the installed location at runtime.
 - The TCP connect-back path is **sandbox-blocked** in the Linux
   dev sandbox (raw TCP from a .NET process is redirected to the
   egress proxy, which refuses it). The stdio path is verified
-  instead; TCP is exercised on Windows (H-HID-5).
+  instead; TCP is exercised on Windows (H-HID-5) — the manager
+  side by `tests/elevated_e2e_tests.rs` (real `SidecarManager`,
+  `elevated=true`, staged sidecar, CI `test-windows`).
 
 ## Tests
 
@@ -117,6 +119,15 @@ cargo test -p rsh-output-hidmaestro
 cargo clippy -p rsh-output-hidmaestro --all-targets -- -D warnings
 cargo fmt -p rsh-output-hidmaestro -- --check
 ```
+
+One more test, `elevated_sidecar_connect_hello_e2e` (Windows-only,
+`tests/elevated_e2e_tests.rs`), runs the Rust manager against the
+**staged production sidecar** over the real production path
+(`runas` + loopback TCP connect-back) and asserts hello + token
+echo + DLL verdict OK + `admin=true` — no driver install needed
+(hello is sent before `HMContext` creation). It runs in CI
+`test-windows` after `stage-sidecar.ps1` and fails (never skips)
+when the staged exe is missing.
 
 ## H-HID-1–H-HID-8 checklist (honest status)
 

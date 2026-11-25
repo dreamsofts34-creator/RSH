@@ -463,6 +463,15 @@ jobs:
       # (rsh-daemon, rsh-ui, rsh-api, rsh-ipc) on Windows, sidecar
       # staged above; on Linux the same crates are covered by
       # test-linux (--workspace --exclude rsh-app).
+      # It also runs the true daemon→sidecar E2E test
+      # (`crates/rsh-output-hidmaestro/tests/elevated_e2e_tests.rs`):
+      # a real `SidecarManager` with `elevated=true` spawns the
+      # STAGED sidecar above via `runas` + loopback TCP connect-back
+      # and asserts hello + token echo + DLL verdict OK + admin.
+      # The staging step MUST stay before this step — the test
+      # resolves the staged exe from the repo tree and FAILS (never
+      # skips) when it is missing. No driver install is needed:
+      # hello is sent before `HMContext` creation.
       - name: cargo test --workspace
         if: steps.check.outputs.run == 'true'
         run: cargo test --workspace
