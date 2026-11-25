@@ -1,10 +1,58 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.11 · firmware v4.0.5 · protocol v2.2 (frozen)**.
+**app v2.0.12 · firmware v4.0.5 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.12] — 2026-11-25
+
+App 2.0.12 + firmware 4.0.5 unchanged (protocol v2.2 frozen — no wire-format
+change). Fixes the v2.0.11 user-PC retest Bug 1 (HID switch still failing —
+new error "sidecar did not connect back in time") with a PROVEN root cause,
+plus the user-reported Add Game bug ("games are not supported by this API").
+
+**HID backend — token never reached the sidecar (root cause PROVEN on the user's PC).**
+
+- **Token via argv nonce (H1).** The daemon passed the sidecar token through
+  the environment (`RSH_HM_SIDECAR_TOKEN`); a non-elevated daemon launching
+  the elevated sidecar via `ShellExecuteEx "runas"` goes through AIS, which
+  builds a fresh environment and drops the var. The sidecar log proved it
+  (`bad-args: --connect-back needs RSH_HM_SIDECAR_TOKEN`, exit 2 before
+  connect). The token is now a random one-time nonce on the command line
+  (`--token <nonce>`), echoed in hello and checked by `validate_hello`;
+  the env transport is deleted and must not be reintroduced. The nonce is
+  never logged anywhere.
+- **Accept-timeout diagnostics (P0).** The v2.0.11 timeout path logged only
+  the outcome — no spawn detail. It now logs spawn PID + `GetExitCodeProcess`
+  exit code + elapsed ms; `hProcess` NULL / PID 0 fails fast with
+  `SpawnFailed`; foreign-peer drops log expected-vs-actual PID. Reply
+  timeouts (`install_driver`/`create`) now carry the bound hit + PID + exit
+  code + ms since last reply instead of the bare `ReplyTimeout`.
+- **Nonce/PID hygiene.** Stale single-use nonces and spawn PIDs are cleared
+  on teardown (`kill_transport`), so a later failure cannot name a dead PID
+  or reuse a nonce.
+- **HID path sweep.** Full switch path re-reviewed (spawn → accept → hello →
+  install_driver → create → live); nothing else found blocking.
+
+**Add Game — "games are not supported by this API" (Bug 2, root cause in code).**
+
+- **`DeferredApi` never forwarded game calls.** The IPC server holds
+  `DeferredApi` permanently and installs the live `DaemonApi` into it, but
+  its `AppApi` impl never forwarded `add_game`/`add_game_with_key`/
+  `update_game`/`remove_game` — every Add Game click fell through to the
+  trait default, daemon running, no board needed. The `.lnk` shortcut was a
+  red herring. 14 methods are now forwarded (4 game, 3 Wi-Fi, 2 shifter,
+  3 long-press, 2 capture); a scripted comparison of all 89 trait fns
+  confirms no other IPC-dispatched method remains un-forwarded.
+- **Idempotency key now actually sent.** The dispatch comment claimed the UI
+  sent one — no UI code ever did, so daemon dedupe never engaged and a
+  retried save could duplicate the game. One key is now minted per
+  add-dialog session and sent over IPC.
+- **Honest failure.** If the IPC link dies while the Add Game dialog is open,
+  the UI now says RSH isn't running instead of hitting the `SimApi` trait
+  default.
 
 ## [2.0.11] — 2026-11-25
 

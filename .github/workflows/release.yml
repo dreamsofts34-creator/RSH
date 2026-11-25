@@ -125,7 +125,7 @@
 #     installed (it will not).
 #
 # Release assets (exact list — THREE assets, as listed in this workflow's header):
-#   RSH_2.0.11_x64-setup.exe            (NSIS installer — app version)
+#   RSH_2.0.12_x64-setup.exe            (NSIS installer — app version)
 #   RSH-Firmware-DevKitV1-v4.0.5.bin    (merged full-flash firmware image — firmware version)
 #   RSH-Firmware-DevKitV1-v4.0.5-OTA.bin (Ed25519-signed OTA image — firmware version)
 #
