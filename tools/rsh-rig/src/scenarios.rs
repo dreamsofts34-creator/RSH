@@ -1587,7 +1587,7 @@ pub fn registry() -> Vec<Scenario> {
         // ---- Cards layout fix (2026-11-19): Extras ON/OFF size + responsive gaps ----
         Scenario {
             id: "gate-extras-card-size-source",
-            description: "Gate (cards fix, Bug 2), source audit: the 4 Extras module cards keep their exact ON size while OFF with `if` branches — the OFF note sits centred in a fixed min-height box equal to the row's ON body height (638 px row-1, 262 px row-2) — so the grid never reflows on toggle.",
+            description: "Gate (cards fix, Bug 2), source audit: the 4 Extras module cards keep their exact ON size while OFF with the overlap/`visible` design — the ON body stays in the tree (`visible: false` keeps layout space), the OFF note is overlaid on the same space, centred vertically — no fixed pixel height, so the grid never reflows on toggle in any font environment.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1595,7 +1595,7 @@ pub fn registry() -> Vec<Scenario> {
                 metric: "selfCheck",
                 op: "==",
                 value: MetricValue::Str("pass"),
-                note: "Gate PASS: Extras cards use `if` + fixed-height OFF boxes (same size ON/OFF).",
+                note: "Gate PASS: Extras cards use overlap/`visible` (same size ON/OFF, no fixed height).",
                 min_duration_s: 0.0,
             }],
         },

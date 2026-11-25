@@ -220,27 +220,29 @@ export component ExtrasScreen inherits PageScaffold {
                     min-width: 322px;
                     CardBody {
                         ExtrasCardHeader { title: "Handbrake"; on: handbrake-on; toggled => { handbrake-on = !handbrake-on; action("handbrake-toggle"); } }
-                        // P2-2: OFF is an `if` branch — the ON body
-                        // leaves the tree entirely (no invisible body
-                        // taking layout space or input), and the OFF
-                        // note sits CENTRED in a fixed min-height box
-                        // equal to the row's ON body height (row-1:
-                        // 638 px — gate-measured: all-ON row-1 run
-                        // 694 px - 56 px chrome; the old 723 px
-                        // baseline still held the invisible OFF note),
-                        // so the card keeps its
-                        // exact ON size with no blank region below
-                        // the note and the grid never reflows on
-                        // toggle. The old `visible` trick kept the
-                        // full ON body in the tree, so an OFF card
-                        // was a one-line note over ~600 px of blank.
-                        if !handbrake-on : VerticalLayout {
-                            min-height: 638px;
-                            alignment: center;
-                            Text { text: "Off, turn on to edit"; font-size: Theme.fs-hint; color: Theme.faint; horizontal-alignment: center; }
-                        }
-                        if handbrake-on : VerticalLayout {
-                            spacing: 10px;
+                        // P2-2 (overlap/`visible` rework, update4):
+                        // the ON body stays in the tree with
+                        // `visible: handbrake-on` — `visible: false`
+                        // still keeps layout space in Slint 1.18.1
+                        // (see overview.slint P1-1), so the card
+                        // height is the ON body height in BOTH
+                        // states, in every font environment. The old
+                        // fixed min-height box (638 px, gate-measured
+                        // locally) split ON/OFF on CI, where font
+                        // metrics differ (694 vs 674 px). The OFF
+                        // note is a Text overlaid on the same space,
+                        // centred vertically against the holder's
+                        // height — no hardcoded pixel height is left,
+                        // so a font-metrics shift can never split the
+                        // states again. The hidden body takes no
+                        // input (invisible elements are skipped by
+                        // hit-testing; ui-extras-off-no-input proves
+                        // it with a real click).
+                        Rectangle {
+                            VerticalLayout {
+                                visible: handbrake-on;
+                                width: 100%;
+                                spacing: 10px;
                             SegmentedControl {
                                 option-0: "Axis";
                                 option-1: "Button";
@@ -318,6 +320,17 @@ export component ExtrasScreen inherits PageScaffold {
                             SliderRow { label: "Grab speed"; hint: "How fast the handbrake bites"; value-text: handbrake-grab-ms-text; value: handbrake-grab-ms; changed(v) => { handbrake-grab-ms-changed(v); } value-edited(t) => { handbrake-grab-ms-edited(t); } }
                             FormRow { label: "Auto-release on throttle"; hint: "Throttle releases a latched handbrake"; Switch { accessible-name: "Auto-release on throttle"; on: handbrake-auto-release; toggled => { handbrake-auto-release-changed(!handbrake-auto-release); } } }
                             if !handbrake-latch : Text { text: "Auto-release only works with latch on."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
+                            }
+                            // OFF note overlaid on the ON body's
+                            // space, centred vertically (see above).
+                            Text {
+                                visible: !handbrake-on;
+                                text: "Off, turn on to edit";
+                                font-size: Theme.fs-hint; color: Theme.faint;
+                                width: 100%;
+                                y: (parent.height - self.height) / 2;
+                                horizontal-alignment: center;
+                            }
                         }
                     }
                 }
@@ -333,15 +346,14 @@ export component ExtrasScreen inherits PageScaffold {
                     min-width: 322px;
                     CardBody {
                         ExtrasCardHeader { title: "Shifter"; on: shifter-on; toggled => { shifter-on = !shifter-on; action("shifter-toggle"); } }
-                        // P2-2: OFF note centred in the row-1 fixed
-                        // min-height (638 px, see Handbrake above).
-                        if !shifter-on : VerticalLayout {
-                            min-height: 638px;
-                            alignment: center;
-                            Text { text: "Off, turn on to edit"; font-size: Theme.fs-hint; color: Theme.faint; horizontal-alignment: center; }
-                        }
-                        if shifter-on : VerticalLayout {
-                            spacing: 10px;
+                        // P2-2 (see Handbrake): the ON body stays
+                        // in the tree with `visible: shifter-on`,
+                        // the OFF note is overlaid on the same space.
+                        Rectangle {
+                            VerticalLayout {
+                                visible: shifter-on;
+                                width: 100%;
+                                spacing: 10px;
                             Text { text: gear; font-family: Theme.font-mono; font-size: 44px; font-weight: 600; color: Theme.text; horizontal-alignment: center; }
                             Text { text: shifter-mode == 1 ? "H-pattern · current gear" : "Sequential · current gear"; font-size: Theme.fs-hint; color: Theme.mute; horizontal-alignment: center; }
                             // D8: the disabled reason (Rust-owned
@@ -370,6 +382,15 @@ export component ExtrasScreen inherits PageScaffold {
                                 }
                                 gear-ta := TouchArea { mouse-cursor: pointer; clicked => { action("shifter-change-in-buttons"); } }
                             }
+                            }
+                            Text {
+                                visible: !shifter-on;
+                                text: "Off, turn on to edit";
+                                font-size: Theme.fs-hint; color: Theme.faint;
+                                width: 100%;
+                                y: (parent.height - self.height) / 2;
+                                horizontal-alignment: center;
+                            }
                         }
                     }
                 }
@@ -382,18 +403,14 @@ export component ExtrasScreen inherits PageScaffold {
                     min-width: 322px;
                     CardBody {
                         ExtrasCardHeader { title: "Horn"; on: horn-on; toggled => { horn-on = !horn-on; action("horn-toggle"); } }
-                        // P2-2: OFF note centred in the row-2 fixed
-                        // min-height (262 px = gate-measured true ON
-                        // row-2 run 318 px - 56 px chrome; the old
-                        // 283 px baseline run was clipped at the
-                        // 1050 px probe window, see Handbrake above).
-                        if !horn-on : VerticalLayout {
-                            min-height: 262px;
-                            alignment: center;
-                            Text { text: "Off, turn on to edit"; font-size: Theme.fs-hint; color: Theme.faint; horizontal-alignment: center; }
-                        }
-                        if horn-on : VerticalLayout {
-                            spacing: 10px;
+                        // P2-2 (see Handbrake): the ON body stays
+                        // in the tree with `visible: horn-on`, the
+                        // OFF note is overlaid on the same space.
+                        Rectangle {
+                            VerticalLayout {
+                                visible: horn-on;
+                                width: 100%;
+                                spacing: 10px;
                             ButtonTile { label: "HORN BUTTON"; action: horn-button; pressed: horn-pressed; clicked => { action("horn-learn"); } }
                             HorizontalLayout { cross-axis-alignment: center;
                                 spacing: 8px;
@@ -410,6 +427,15 @@ export component ExtrasScreen inherits PageScaffold {
                             }
                             SliderRow { label: "Minimum honk"; hint: "Quick taps still honk this long"; value-text: horn-min-text; value: (horn-min-ms - 100) / 900; changed(v) => { horn-min-changed(v); } value-edited(t) => { horn-min-edited(t); } }
                             if horn-mode == 1 : Text { text: "Latch: press once to honk, again to stop."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }
+                            }
+                            Text {
+                                visible: !horn-on;
+                                text: "Off, turn on to edit";
+                                font-size: Theme.fs-hint; color: Theme.faint;
+                                width: 100%;
+                                y: (parent.height - self.height) / 2;
+                                horizontal-alignment: center;
+                            }
                         }
                     }
                 }
@@ -425,15 +451,14 @@ export component ExtrasScreen inherits PageScaffold {
                     min-width: 322px;
                     CardBody {
                         ExtrasCardHeader { title: "LEDs"; on: leds-on; toggled => { leds-on = !leds-on; action("leds-toggle"); } }
-                        // P2-2: OFF note centred in the row-2 fixed
-                        // min-height (262 px, see Horn above).
-                        if !leds-on : VerticalLayout {
-                            min-height: 262px;
-                            alignment: center;
-                            Text { text: "Off, turn on to edit"; font-size: Theme.fs-hint; color: Theme.faint; horizontal-alignment: center; }
-                        }
-                        if leds-on : VerticalLayout {
-                            spacing: 10px;
+                        // P2-2 (see Handbrake): the ON body stays
+                        // in the tree with `visible: leds-on`, the
+                        // OFF note is overlaid on the same space.
+                        Rectangle {
+                            VerticalLayout {
+                                visible: leds-on;
+                                width: 100%;
+                                spacing: 10px;
                             // Live LED strip preview (8 circles, colours from Rust)
                             HorizontalLayout {
                                 spacing: 6px;
@@ -504,6 +529,15 @@ export component ExtrasScreen inherits PageScaffold {
                                     SliderRow { label: "Green"; hint: "Custom colour channel (0–255)"; value-text: Math.round(led-green * 255) + ""; value: led-green; changed(v) => { led-green-changed(v); } value-edited(t) => { led-green-edited(t); } }
                                     SliderRow { label: "Blue"; hint: "Custom colour channel (0–255)"; value-text: Math.round(led-blue * 255) + ""; value: led-blue; changed(v) => { led-blue-changed(v); } value-edited(t) => { led-blue-edited(t); } }
                                 }
+                            }
+                            }
+                            Text {
+                                visible: !leds-on;
+                                text: "Off, turn on to edit";
+                                font-size: Theme.fs-hint; color: Theme.faint;
+                                width: 100%;
+                                y: (parent.height - self.height) / 2;
+                                horizontal-alignment: center;
                             }
                         }
                     }

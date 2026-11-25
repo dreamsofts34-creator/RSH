@@ -1634,21 +1634,20 @@ pub fn gate_notifications_source() -> (bool, String) {
 
 /// Gate: Extras card size, source audit (cards layout fix, Bug 2).
 ///
-/// Source audit for the P2-2 design (update4 UI fixes): the 4
-/// Extras module cards keep their exact ON size while OFF with
-/// `if` branches — the OFF note leaves the tree entirely (no
-/// invisible body taking layout space or input) and sits CENTRED
-/// in a fixed min-height box equal to the row's ON body height
-/// (row-1: 638 px, row-2: 262 px — gate-measured), so the card
-/// keeps its exact ON size with no blank region and the grid
-/// never reflows on toggle. The old `visible` approach this audit
-/// used to demand kept the full ON body in the tree, so an OFF
-/// card was a one-line note over ~600 px of blank — same size,
-/// worse UI. The pixel proof (row heights identical ON/OFF on the
-/// real `ExtrasScreen`: 692/694 px row-1, 312/314 px row-2 across
-/// all-ON / one-OFF / all-OFF) runs in `tools/gate-checks/
-/// rsh-gate-ui` (`ui-extras-card-size`); this audit is the fast
-/// regression net for the mechanism that produces those heights.
+/// Source audit for the P2-2 design (update4 UI fixes, overlap/
+/// `visible` rework): the 4 Extras module cards keep their exact
+/// ON size while OFF because the ON body stays in the tree with
+/// `visible: <card>-on` — `visible: false` still keeps layout
+/// space in Slint 1.18.1, so the card height IS the ON body height
+/// in both states, in every font environment — and the OFF note is
+/// a Text overlaid on the same space, centred vertically against
+/// the holder's height. No hardcoded pixel height is left: the old
+/// fixed min-height boxes (638 px row-1, 262 px row-2, gate-measured
+/// locally) split ON/OFF on CI, where font metrics differ (694 vs
+/// 674 px). The pixel proof (row heights identical ON/OFF on the
+/// real `ExtrasScreen`) runs in `tools/gate-checks/rsh-gate-ui`
+/// (`ui-extras-card-size`); this audit is the fast regression net
+/// for the mechanism that produces those heights.
 #[must_use]
 pub fn gate_extras_card_size_source() -> (bool, String) {
     let mut report = Report::new();
@@ -1656,43 +1655,45 @@ pub fn gate_extras_card_size_source() -> (bool, String) {
         report.check("extras-source-present", false, "extras.slint missing");
         return report.finish();
     };
-    // P2-2: row-1 (handbrake, shifter) OFF boxes are 638 px,
-    // row-2 (horn, leds) 262 px — the gate-measured ON body
-    // heights (see the P2-2 comment in extras.slint).
-    for (card, off_height) in [
-        ("handbrake", 638),
-        ("shifter", 638),
-        ("horn", 262),
-        ("leds", 262),
-    ] {
+    // P2-2 (overlap/`visible` rework): the ON body stays in the
+    // tree under `visible: <card>-on`, the OFF note is the
+    // overlaid Text under `visible: !<card>-on`, centred
+    // vertically with `y: (parent.height - self.height) / 2;`.
+    // No `if !<card>-on` branch and no fixed min-height box may
+    // remain — the old mechanism split ON/OFF across font
+    // environments (local 694 px vs CI 674 px).
+    for card in ["handbrake", "shifter", "horn", "leds"] {
         report.check(
-            &format!("extras-{card}-if-off"),
-            extras.contains(&format!("if !{card}-on")),
-            &format!("`if !{card}-on` branch present (OFF note leaves the tree, takes no input)"),
+            &format!("extras-{card}-on-visible"),
+            extras.contains(&format!("visible: {card}-on;")),
+            &format!("ON body stays in the tree with `visible: {card}-on` (keeps layout space, takes no input while hidden)"),
         );
         report.check(
-            &format!("extras-{card}-if-on"),
-            extras.contains(&format!("if {card}-on :")),
-            &format!("`if {card}-on :` branch present (ON body)"),
-        );
-        // The OFF branch right after `if !{card}-on` must be the
-        // centred fixed-height box, not a bare note.
-        let off_box = extras
-            .find(&format!("if !{card}-on"))
-            .map_or("", |pos| &extras[pos..extras.len().min(pos + 400)]);
-        report.check(
-            &format!("extras-{card}-off-min-height"),
-            off_box.contains(&format!("min-height: {off_height}px;")),
-            &format!(
-                "OFF note sits in a fixed min-height: {off_height}px box (row ON-body height)"
-            ),
+            &format!("extras-{card}-off-visible"),
+            extras.contains(&format!("visible: !{card}-on;")),
+            &format!("OFF note is overlaid with `visible: !{card}-on`"),
         );
         report.check(
-            &format!("extras-{card}-off-centred"),
-            off_box.contains("alignment: center;"),
-            "OFF note is centred in its fixed-height box",
+            &format!("extras-{card}-no-if-off"),
+            !extras.contains(&format!("if !{card}-on")),
+            &format!("no `if !{card}-on` branch (the old fixed-height mechanism is gone)"),
+        );
+        report.check(
+            &format!("extras-{card}-no-if-on"),
+            !extras.contains(&format!("if {card}-on :")),
+            &format!("no `if {card}-on :` branch (ON body is not conditionally removed)"),
         );
     }
+    report.check(
+        "extras-off-notes-centred",
+        count(&extras, "y: (parent.height - self.height) / 2;") == 4,
+        "all 4 OFF notes are centred vertically over the ON body's space",
+    );
+    report.check(
+        "extras-no-fixed-off-height",
+        !extras.contains("min-height: 638px;") && !extras.contains("min-height: 262px;"),
+        "no fixed min-height OFF box remains (638/262 px were font-environment fragile)",
+    );
     // R-10: the 4 cards share the row equally — 322 px floor each
     // (P1-6: (656 - 12) / 2 at the 880 px minimum window; they
     // still stretch to 342 px at the 920 px design width) — via
