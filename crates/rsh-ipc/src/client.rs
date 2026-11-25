@@ -657,6 +657,15 @@ mod tests {
             timeout_for_method("set_wifi_password"),
             Duration::from_secs(30)
         );
+        assert_eq!(timeout_for_method("rejoin_wifi"), Duration::from_secs(30));
+        assert_eq!(
+            timeout_for_method("rejoin_wifi_open"),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            timeout_for_method("scan_rsh_networks"),
+            Duration::from_secs(30)
+        );
         assert_eq!(
             timeout_for_method("unknown_method"),
             Duration::from_millis(500)
