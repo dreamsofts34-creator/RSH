@@ -43,35 +43,57 @@ const CALL_TIMEOUT: Duration = Duration::from_millis(500);
 /// right bound by default; [`IpcClient::call_with_timeout`] still
 /// overrides when the caller knows better. Bounds are grounded in
 /// the UI's own explicit bounds where they exist (`set_output_backend`
-/// 75 s, game writes 10 s) and in the daemon-side work otherwise
+/// 390 s, game writes 10 s) and in the daemon-side work otherwise
 /// (a board control round-trip, a file copy, a driver download).
 #[must_use]
 pub fn timeout_for_method(method: &str) -> Duration {
     match method {
-        // UAC prompt + 60 s sidecar spawn (B-2, v2.0.2): the UI's
-        // own long-call bound, kept here so a plain call agrees.
-        "set_output_backend" => Duration::from_secs(75),
+        // UAC prompt + 60 s sidecar spawn (B-2, v2.0.2) + the
+        // 310 s post-UAC switch budget (HID path sweep, v2.0.12):
+        // the UI's own long-call bound (390 s), kept here so a
+        // plain call agrees. The old 75 s arm was stale (P3-1,
+        // v2.0.12 scan) — a healthy 310 s switch timed out at
+        // 75 s while the daemon kept going.
+        "set_output_backend" => Duration::from_secs(390),
         // Game writes: atomic file write + process refresh, which
         // can pass 500 ms on Windows under an AV scan (the UI's
         // `GAME_WRITE_TIMEOUT`). Board control round-trip (LED test
         // on `set_tuning`, config transaction, firmware
-        // stat/parse) — same 10 s bound, one arm.
+        // stat/parse) — same 10 s bound, one arm. `update_firmware`
+        // (P2-1, v2.0.12 scan) rides here too: its daemon
+        // pre-flight (keystore read, bundled-image stat + version
+        // parse, validation) runs synchronously before the flash
+        // thread spawns, so the 500 ms default timed out a flash
+        // that had already started.
         "add_game"
         | "update_game"
         | "remove_game"
         | "set_tuning"
         | "set_shifter_sensitivity"
-        | "firmware_check" => Duration::from_secs(10),
-        // Control session + OS WLAN profile write; Wi-Fi scan (OS
-        // scan takes seconds); file copies / restores — same 30 s
-        // bound, one arm.
-        "set_wifi_password"
-        | "clear_wifi_password"
-        | "rejoin_wifi"
-        | "rejoin_wifi_open"
-        | "scan_rsh_networks"
-        | "backup_now"
-        | "restore_backup" => Duration::from_secs(30),
+        | "firmware_check"
+        | "update_firmware" => Duration::from_secs(10),
+        // Wi-Fi password set / rejoin (P1-3, v2.0.12 scan): the
+        // daemon worst case is ≈150 s (netsh add ≤30 s + connect
+        // ≤30 s + confirm ≤90 s, plus board round-trips and a
+        // possible rollback), so the bound is 180 s — a client
+        // timeout mid-rejoin used to race the rollback and strand
+        // board/PC out of sync.
+        "set_wifi_password" | "clear_wifi_password" | "rejoin_wifi" | "rejoin_wifi_open" => {
+            Duration::from_secs(180)
+        }
+        // Wi-Fi scan (P2-2, v2.0.12 scan): one netsh call with a
+        // 30 s timeout of its own, so the 30 s client bound left
+        // zero headroom — 45 s.
+        "scan_rsh_networks" => Duration::from_secs(45),
+        // Control session + OS WLAN profile write; file copies /
+        // restores — same 30 s bound, one arm.
+        "backup_now" | "restore_backup" => Duration::from_secs(30),
+        // `slow_poll` (P2-3, v2.0.12 scan): the cached static
+        // groups are cheap, but on TTL expiry / generation change
+        // the daemon re-reads them (incl. `list_games()` with
+        // per-game disk probes) — 5 s so a cache miss does not
+        // read as link degradation to the health monitor.
+        "slow_poll" => Duration::from_secs(5),
         // Driver download + install.
         "install_vjoy" => Duration::from_secs(120),
         _ => CALL_TIMEOUT,
@@ -651,9 +673,11 @@ mod tests {
     #[test]
     fn timeout_for_method_gives_slow_methods_room() {
         assert_eq!(timeout_for_method("ping"), Duration::from_millis(500));
+        // P3-1 (v2.0.12 scan): the UI's long-call bound is 390 s,
+        // not the stale 75 s.
         assert_eq!(
             timeout_for_method("set_output_backend"),
-            Duration::from_secs(75)
+            Duration::from_secs(390)
         );
         assert_eq!(timeout_for_method("add_game"), Duration::from_secs(10));
         assert_eq!(timeout_for_method("set_tuning"), Duration::from_secs(10));
@@ -661,21 +685,39 @@ mod tests {
             timeout_for_method("firmware_check"),
             Duration::from_secs(10)
         );
+        // P2-1 (v2.0.12 scan): firmware pre-flight runs before
+        // the flash thread spawns, so it needs the 10 s arm too.
+        assert_eq!(
+            timeout_for_method("update_firmware"),
+            Duration::from_secs(10)
+        );
         assert_eq!(timeout_for_method("backup_now"), Duration::from_secs(30));
         assert_eq!(timeout_for_method("install_vjoy"), Duration::from_secs(120));
+        // P1-3 (v2.0.12 scan): Wi-Fi password/rejoin worst case
+        // ≈150 s, so the bound is 180 s.
         assert_eq!(
             timeout_for_method("set_wifi_password"),
-            Duration::from_secs(30)
+            Duration::from_secs(180)
         );
-        assert_eq!(timeout_for_method("rejoin_wifi"), Duration::from_secs(30));
+        assert_eq!(
+            timeout_for_method("clear_wifi_password"),
+            Duration::from_secs(180)
+        );
+        assert_eq!(timeout_for_method("rejoin_wifi"), Duration::from_secs(180));
         assert_eq!(
             timeout_for_method("rejoin_wifi_open"),
-            Duration::from_secs(30)
+            Duration::from_secs(180)
         );
+        // P2-2 (v2.0.12 scan): the scan's netsh call alone takes
+        // up to 30 s, so the client bound is 45 s.
         assert_eq!(
             timeout_for_method("scan_rsh_networks"),
-            Duration::from_secs(30)
+            Duration::from_secs(45)
         );
+        // P2-3 (v2.0.12 scan): a slow_poll cache miss re-reads
+        // the static groups, so it gets 5 s, not the 500 ms
+        // default.
+        assert_eq!(timeout_for_method("slow_poll"), Duration::from_secs(5));
         assert_eq!(
             timeout_for_method("unknown_method"),
             Duration::from_millis(500)

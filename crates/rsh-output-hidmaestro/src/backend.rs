@@ -88,7 +88,11 @@ pub enum HidMaestroStateKind {
     /// install / device create was never attempted.
     ContextUnavailable,
     /// One retry used up — vJoy fallback is in effect until the user
-    /// re-selects this backend.
+    /// re-selects this backend. Retained for the status vocabulary
+    /// (the Output page renders it with a "switched to vJoy"
+    /// banner); `fail()` no longer produces it (P2-5, v2.0.12 scan
+    /// — the retry-budget error maps to `Error`, because on the
+    /// explicit path no fallback happens and the banner lied).
     FallbackToVJoy,
     /// Any other failure (message carries the detail).
     Error,
@@ -339,11 +343,23 @@ impl HidMaestroOutput {
             }
             HidMaestroError::SidecarDied(_)
             | HidMaestroError::ReplyTimeout(_)
-            | HidMaestroError::HelloTimeout
+            | HidMaestroError::HelloTimeout(_)
             | HidMaestroError::BadHello(_)
             | HidMaestroError::BadReply(_) => HidMaestroStateKind::SidecarFailed,
             HidMaestroError::ContextUnavailable(_) => HidMaestroStateKind::ContextUnavailable,
-            HidMaestroError::FallbackNeeded => HidMaestroStateKind::FallbackToVJoy,
+            // P2-5 (v2.0.12 scan): the retry-budget error is an
+            // `Error`, NOT `FallbackToVJoy` — on the explicit path
+            // no fallback happens (the selector errors and the slot
+            // stays untouched), so the old mapping told the Output
+            // page the backend had "switched to vJoy" when vJoy was
+            // not active at all. The automatic path never shows
+            // this status: its fallback installs vJoy and reports
+            // vJoy `Ready`. The arm stays explicit even though its
+            // body matches the wildcard — it pins this decision, so
+            // a later wildcard change cannot silently re-label the
+            // retry-budget error as a fallback again.
+            #[allow(clippy::match_same_arms)]
+            HidMaestroError::FallbackNeeded => HidMaestroStateKind::Error,
             _ => HidMaestroStateKind::Error,
         };
         self.status = HidMaestroStatus {

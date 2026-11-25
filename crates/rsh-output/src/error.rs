@@ -152,8 +152,12 @@ pub enum OutputError {
     ProfileRefused(String),
     /// `CreateController` failed.
     CreateFailed(String),
-    /// The sidecar already failed once and the one retry was used up —
-    /// fall back to vJoy (G3). Cleared by an explicit user re-select.
+    /// The sidecar already failed once and the one retry was used up
+    /// (G3). Cleared by an explicit user re-select. The message
+    /// claims NO fallback (P2-5, v2.0.12 scan): whether one happens
+    /// is decided by the selector — on the automatic path the
+    /// fallback outcome states it, on the explicit path there is
+    /// none.
     FallbackNeeded,
     /// This backend only runs on Windows (sidecar + driver).
     UnsupportedPlatform,
@@ -286,7 +290,7 @@ impl fmt::Display for OutputError {
             }
             Self::FallbackNeeded => write!(
                 f,
-                "HIDMaestro already failed once and the retry was used up — falling back to vJoy. Re-select HIDMaestro in Output settings to try again."
+                "HIDMaestro already failed once and the retry was used up — re-select HIDMaestro in Output settings to try again."
             ),
             Self::UnsupportedPlatform => write!(
                 f,
@@ -372,6 +376,14 @@ mod tests {
         );
         assert!(
             OutputError::FallbackNeeded
+                .to_string()
+                .contains("retry was used up")
+        );
+        // P2-5 (v2.0.12 scan): the wording claims NO fallback —
+        // the fallback is stated by the selector's outcome on the
+        // automatic path, never by this error on the explicit path.
+        assert!(
+            !OutputError::FallbackNeeded
                 .to_string()
                 .contains("falling back to vJoy")
         );

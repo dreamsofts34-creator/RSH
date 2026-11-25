@@ -151,6 +151,10 @@ pub fn spawn_stdio(
 
 /// Close a stdio child's stdin (EOF → clean sidecar exit) and
 /// terminate + reap the child. Idempotent: both handles are `take()`n.
+/// P1-2 (v2.0.12 scan): grace period — closing stdin is the
+/// sidecar's dispose-on-EOF signal, so poll for a self-exit for up
+/// to ~1 s before killing it; the old code killed at once, so the
+/// dispose almost never ran and a created device could be orphaned.
 fn kill_stdio(stdin: &Arc<Mutex<Option<ChildStdin>>>, child: &Arc<Mutex<Option<Child>>>) {
     // A poisoned mutex still holds the handle — recover it rather
     // than leaving a child alive because a writer thread panicked.
@@ -163,7 +167,23 @@ fn kill_stdio(stdin: &Arc<Mutex<Option<ChildStdin>>>, child: &Arc<Mutex<Option<C
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(mut child) = child_guard.take() {
-        let _ = child.kill();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    break;
+                }
+            }
+        }
         let _ = child.wait();
     }
 }

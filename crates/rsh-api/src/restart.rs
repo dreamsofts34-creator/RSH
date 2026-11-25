@@ -300,6 +300,18 @@ unsafe extern "system" fn recovery_callback(pvparameter: *mut std::ffi::c_void) 
 mod tests {
     use super::*;
 
+    /// Process-wide test mutex (P1-5, v2.0.12 scan): WER
+    /// Application Restart registration is per-process global state,
+    /// and the harness runs the tests below in the same process on
+    /// parallel threads — one test's `UnregisterApplicationRestart`
+    /// landing between the other's register and
+    /// `GetApplicationRestartSettings` produced exactly
+    /// `HRESULT 0x80070490` (`ERROR_NOT_FOUND`). Both tests hold this
+    /// lock across their whole register → get → unregister sequence,
+    /// so they can never interleave. Poison is recovered (a test
+    /// that panicked mid-sequence must not wedge the other one).
+    static RESTART_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rsh-restart-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -390,6 +402,12 @@ mod tests {
 
     #[test]
     fn register_is_noop_off_windows() {
+        // P1-5 (v2.0.12 scan): hold the process-wide WER lock —
+        // on Windows this test unregisters the process registration
+        // the round-trip test reads, so the two must never overlap.
+        let _guard = RESTART_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_dir("noop");
         let outcome = register_application_restart(&dir, false).expect("register must not fail");
         #[cfg(not(windows))]
@@ -425,20 +443,48 @@ mod tests {
         use windows::Win32::System::Threading::GetCurrentProcess;
         use windows::core::PWSTR;
 
+        // P1-5 (v2.0.12 scan): hold the process-wide WER lock for
+        // the whole register → get → unregister sequence (see
+        // `RESTART_TEST_LOCK`).
+        let _guard = RESTART_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_dir("round-trip");
         let outcome = register_application_restart(&dir, false).expect("register");
         assert_eq!(outcome, RestartOutcome::Registered);
         let mut buf = vec![0u16; 4096];
         let mut size = u32::try_from(buf.len()).unwrap_or(u32::MAX);
         let mut flags = 0u32;
-        unsafe {
-            GetApplicationRestartSettings(
-                GetCurrentProcess(),
-                Some(PWSTR(buf.as_mut_ptr())),
-                &raw mut size,
-                Some(&raw mut flags),
-            )
-            .expect("get settings");
+        // P1-5 (v2.0.12 scan): retry the Get instead of a single
+        // `.expect` — a transient unregistration (e.g. a racing
+        // test, or WER itself) must not produce a bare `0x80070490`
+        // panic; assert on the last error after 5 × 100 ms.
+        let mut last_error = None;
+        for _ in 0..5 {
+            // A failed Get may have consumed `size` — reset the
+            // buffer length each attempt.
+            size = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+            let result = unsafe {
+                GetApplicationRestartSettings(
+                    GetCurrentProcess(),
+                    Some(PWSTR(buf.as_mut_ptr())),
+                    &raw mut size,
+                    Some(&raw mut flags),
+                )
+            };
+            match result {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        if let Some(error) = last_error {
+            panic!("get settings (after 5 attempts): {error}");
         }
         let expected = RESTART_NO_PATCH.0 | RESTART_NO_REBOOT.0;
         assert_eq!(flags & expected, expected, "flags: {flags:#x}");

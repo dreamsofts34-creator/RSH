@@ -272,7 +272,16 @@ fn crash_mid_session_marks_disconnected_then_fallback() {
     assert!(b.fallback_needed(), "second death: fallback latch set");
     let err = b.try_connect().unwrap_err();
     assert!(matches!(err, VJoyError::DriverNotFound(_)));
-    assert_eq!(b.status().kind, HidMaestroStateKind::FallbackToVJoy);
+    // P2-5 (v2.0.12 scan): the retry-budget error maps to `Error`,
+    // not `FallbackToVJoy` — no fallback happened on this explicit
+    // re-connect, so the "switched to vJoy" banner would lie. The
+    // message itself no longer claims a fallback either.
+    assert_eq!(b.status().kind, HidMaestroStateKind::Error);
+    assert!(
+        !b.status().message.contains("falling back to vJoy"),
+        "message: {}",
+        b.status().message
+    );
     // The user re-selects the backend: the latch clears.
     b.reset_fallback();
     assert!(!b.fallback_needed());

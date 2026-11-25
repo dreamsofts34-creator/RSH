@@ -758,7 +758,7 @@ mod tests {
         // still fall back, without branching on the variant.
         hm.fail_next(
             1,
-            "HIDMaestro already failed once and the retry was used up — falling back to vJoy.",
+            "HIDMaestro already failed once and the retry was used up — re-select HIDMaestro in Output settings to try again.",
         );
         let vjoy = MockFactory::new("vJoy");
         let factories = factories_with(&hm, &vjoy);
@@ -779,7 +779,15 @@ mod tests {
         let reason = outcome
             .fallback_reason
             .expect("fallback reason is recorded");
-        assert!(reason.contains("falling back to vJoy"), "{reason}");
+        // P2-5 (v2.0.12 scan): the reason names the spent retry,
+        // not a fallback — the fallback itself is stated by the
+        // outcome detail, where it really happened.
+        assert!(reason.contains("retry was used up"), "{reason}");
+        assert!(
+            outcome.detail.contains("fell back to vJoy"),
+            "{}",
+            outcome.detail
+        );
         assert!(current.is_connected());
         assert_eq!(current.name(), "vJoy");
     }

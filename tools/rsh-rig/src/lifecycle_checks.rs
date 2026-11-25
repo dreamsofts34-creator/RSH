@@ -21,7 +21,12 @@
 //! * Tray icon counting/ghosting, foreground activation, the
 //!   named-pipe single instance, NSIS flows, UAC and rendering are
 //!   Windows-only and are NOT proven here (F18 Windows CI + the
-//!   user-PC retest cover them).
+//!   user-PC retest cover them) — except the Windows
+//!   single-instance race check
+//!   (`gate_already_running_race_windows`, P2-4 v2.0.12 scan),
+//!   which exists in this file but has no Windows runner executing
+//!   it yet (rig-gate is ubuntu-only; it is compile-verified for
+//!   the Windows target only).
 //! * The app-driven hide→show path (X-close → tray → page request
 //!   → `win.show()`) PANICS under Xvfb in winit's draw
 //!   (`GetGeometry` → `BadDrawable`, and one run died with SIGSEGV
@@ -43,8 +48,11 @@
 //!   condition records the exit instead of asserting it; whether the
 //!   segfault is X11-backend-only needs a UI-worker look.
 //!
-//! Platform: the process/X11 checks are Linux-only. On other
-//! platforms each check returns a PASS with an explicit SKIP note
+//! Platform: the process/X11 checks are Linux-only, except
+//! `gate_already_running_race`, which dispatches to a Windows
+//! implementation on Windows (P2-4, v2.0.12 scan — compile-verified
+//! for the Windows target; no CI job runs the rig on Windows yet).
+//! On other platforms each check returns a PASS with an explicit SKIP note
 //! (the Windows execution proof is F18, not this file).
 //! Environment: needs `Xvfb` + `xdotool` + `libxkbcommon-x11-0` +
 //! `libxcb-xkb1` (winit panics at startup without the xkbcommon
@@ -145,7 +153,16 @@ fn debug_bin(name: &str) -> Option<PathBuf> {
         .join("target")
         .join("debug")
         .join(name);
-    path.is_file().then_some(path)
+    if path.is_file() {
+        return Some(path);
+    }
+    // Windows binaries carry `.exe` (the Windows race check needs
+    // this; on Linux the `.exe` candidate simply never exists).
+    let exe = path.with_extension("exe");
+    if exe.is_file() {
+        return Some(exe);
+    }
+    None
 }
 
 /// Copy a debug binary into the stage dir.
@@ -332,7 +349,9 @@ fn wait_until(timeout: Duration, f: impl Fn() -> bool) -> bool {
 /// every `sample_every` also record `sample()` into the returned
 /// timeline (R3-05: when settlement times out, the next failure
 /// must be diagnosable from the check detail — live-count + ping
-/// over time — instead of a bare "live daemons: 2").
+/// over time — instead of a bare "live daemons: 2"). Unix-only:
+/// only the Unix race check samples `/proc` liveness.
+#[cfg(not(windows))]
 fn wait_until_sampled(
     timeout: Duration,
     sample_every: Duration,
@@ -364,7 +383,9 @@ fn wait_until_sampled(
 /// rig has not reaped yet still has a `/proc` entry, and counting
 /// it would fail a correct product for being slow to reap
 /// (R3-05 — the `procs_with_arg` zombie flag exists for exactly
-/// this; the race check used to ignore it).
+/// this; the race check used to ignore it). Unix-only: only the
+/// Unix race check reads `/proc` liveness.
+#[cfg(not(windows))]
 fn live_daemon_pids(needle: &str) -> Vec<u32> {
     procs_with_arg(needle)
         .into_iter()
@@ -443,6 +464,13 @@ fn procs_with_arg(needle: &str) -> Vec<(u32, bool)> {
 /// same. `false` covers "no socket", "no answer" and "wrong reply".
 fn ipc_ping(data_dir: &Path) -> bool {
     let path = rsh_ipc::socket_path(data_dir);
+    // Unix only: the socket file must exist before a connect is
+    // attempted. On Windows there is no socket file — the daemon
+    // binds the global named pipe instead (P2-4, v2.0.12 scan) —
+    // so the existence gate is skipped and the connect below goes
+    // straight to the pipe (`IpcClient::connect` ignores the path
+    // on Windows).
+    #[cfg(unix)]
     if !path.exists() {
         return false;
     }
@@ -1016,14 +1044,31 @@ pub fn gate_hung_daemon() -> (bool, String) {
     report.finish()
 }
 
-/// F17.4 — already-running race. 8 daemons launched at once
+/// F17.4 — already-running race: dispatches to the Windows check
+/// on Windows and the Unix check elsewhere, so neither platform
+/// compiles the other's body (a cfg-gated early return inside one
+/// function left the Unix body unreachable on Windows — a warning
+/// `clippy-windows` denies).
+#[must_use]
+pub fn gate_already_running_race() -> (bool, String) {
+    // P2-4 (v2.0.12 scan): the Windows `CreateMutexW` +
+    // `write_pid_file` path has its own race check below — the
+    // Unix `/proc` half never exercises it.
+    #[cfg(windows)]
+    return gate_already_running_race_windows();
+    #[cfg(not(windows))]
+    return gate_already_running_race_unix();
+}
+
+/// F17.4 — already-running race (Unix). 8 daemons launched at once
 /// against one data dir (3 rounds) → exactly 1 First, the rest
 /// exit 0 (live peer answers) — never 2 live daemons/listeners.
 /// Then 2 UIs at once → exactly 1 window, the second exits 0.
 /// The pid-file claim is `O_EXCL` (the old check-then-truncate
 /// let two processes both become First).
+#[cfg(not(windows))]
 #[must_use]
-pub fn gate_already_running_race() -> (bool, String) {
+fn gate_already_running_race_unix() -> (bool, String) {
     let mut report = LcReport::new();
     if let Some(skip) = not_unix_skip("gate-already-running-race") {
         return skip;
@@ -1077,6 +1122,32 @@ pub fn gate_already_running_race() -> (bool, String) {
         // sequential 10 s waits could add 70 s of reap time);
         // zombies are excluded from the live count (an exited
         // loser the rig has not reaped yet is not a live daemon).
+        //
+        // P1-4 (v2.0.12 scan): settlement could still fire while a
+        // late-exec'd loser was invisible in `/proc` (a cold debug
+        // daemon under load can take >10 s just to exec, during
+        // which `/proc/<pid>/cmdline` is empty and `procs_with_arg`
+        // skips it) — and the verdict re-sampled `live`/`ping_ok`
+        // BEFORE the loser reap, so a loser still inside its 10 s
+        // F15 ping wait counted live at verdict time even though it
+        // exited 0 moments later. The hardening below adds: (d) the
+        // settlement predicate requires every spawned child to be
+        // accounted for (a `/proc/<pid>` entry exists — live,
+        // zombie, or still pre-exec; the entry exists from `fork`,
+        // and nothing reaps before the reap phase); (e) the verdict
+        // is re-sampled AFTER the loser reap and recomputed from
+        // that post-reap sample; (f) the per-loser reap bound is
+        // 20 s (a loser whose F15 window started late needs its
+        // full 10 s from ITS start, not from round start); (g) the
+        // winner is killed only AFTER the verdict is recorded —
+        // killing it first could strand a still-waiting loser (its
+        // peer answers no more, so it reports Hung and exits 1
+        // instead of 0).
+        let all_accounted = || {
+            children
+                .iter()
+                .all(|c| std::path::Path::new(&format!("/proc/{}", c.id())).exists())
+        };
         let (settled, timeline) = wait_until_sampled(
             Duration::from_secs(120),
             Duration::from_secs(5),
@@ -1087,7 +1158,7 @@ pub fn gate_already_running_race() -> (bool, String) {
                     ipc_ping(&data_dir)
                 )
             },
-            || live_daemon_pids(&needle).len() == 1 && ipc_ping(&data_dir),
+            || live_daemon_pids(&needle).len() == 1 && ipc_ping(&data_dir) && all_accounted(),
         );
         let live = live_daemon_pids(&needle);
         let ping_ok = ipc_ping(&data_dir);
@@ -1116,14 +1187,21 @@ pub fn gate_already_running_race() -> (bool, String) {
         }
         // The losers exit 0 quickly (live peer answers); reap them
         // IN PARALLEL (R3-05c) and record each loser's exit latency
-        // (ms since the round started), then stop the winner.
+        // (ms since the round started). The winner is NOT killed
+        // here (P1-4, v2.0.12 scan): killing it first could strand
+        // a still-waiting loser, and the verdict below must be
+        // sampled while the winner is still alive — it is killed
+        // after the check is recorded. The per-loser reap bound is
+        // 20 s (P1-4): a loser whose F15 window started late needs
+        // its full 10 s from ITS start, not from round start.
+        let mut winners: Vec<Child> = Vec::new();
         let mut loser_threads = Vec::new();
         for mut c in children {
             if live.contains(&c.id()) {
-                kill_child(&mut c);
+                winners.push(c);
             } else {
                 loser_threads.push(std::thread::spawn(move || {
-                    let code = wait_child_timeout(&mut c, Duration::from_secs(10));
+                    let code = wait_child_timeout(&mut c, Duration::from_secs(20));
                     (c.id(), code, round_started.elapsed().as_millis())
                 }));
             }
@@ -1140,6 +1218,12 @@ pub fn gate_already_running_race() -> (bool, String) {
             }
         }
         let losers_all_zero = loser_codes.iter().all(|c| *c == Some(0));
+        // P1-4 (v2.0.12 scan): re-sample AFTER the loser reap and
+        // recompute the verdict from the post-reap sample — the
+        // pre-reap `live`/`ping_ok` can predate a late loser that
+        // only became visible (or exited) during the reap.
+        let live = live_daemon_pids(&needle);
+        let ping_ok = ipc_ping(&data_dir);
         let round_ok = live.len() == 1 && ping_ok && losers_all_zero;
         report.check(
             &format!("round {round}: exactly 1 live daemon, rest exit 0"),
@@ -1152,6 +1236,10 @@ pub fn gate_already_running_race() -> (bool, String) {
                 loser_latencies
             ),
         );
+        // Stop the winner(s) now that the verdict is recorded.
+        for mut c in winners {
+            kill_child(&mut c);
+        }
         // A fresh data dir per round would hide a stale pid file;
         // keep the same dir (the winner's pid file must be
         // re-claimable after the kill) — wait for the socket to
@@ -1276,6 +1364,147 @@ pub fn gate_already_running_race() -> (bool, String) {
         ui_count == 1,
         &format!("{ui_count} rsh-ui processes with this data dir"),
     );
+    report.finish()
+}
+
+/// Windows single-instance race (P2-4, v2.0.12 scan): the Unix gate
+/// above never exercises the Windows `CreateMutexW` +
+/// `write_pid_file` path — the mutex claim and the pid-file write
+/// are two separate steps (not one atomic claim like the Unix
+/// `O_EXCL` path), and the `Local\` fallback probes `Global\` first,
+/// so a cross-session race (elevated first daemon vs non-elevated
+/// second) had no test at all. This is the Windows half: 8 daemons
+/// at once against one data dir (3 rounds) → exactly one survivor,
+/// the rest exit 0 (live peer answers).
+///
+/// Liveness has no `/proc` on Windows, so each child is accounted
+/// for with `try_wait` (exited — code recorded at reap time, since a
+/// reaped child answers `Err` afterwards — or the one still
+/// running); the named-pipe ping proves the survivor answers. The
+/// 2-UIs half of the Unix check is NOT replicated here (it needs
+/// Xvfb/`xdotool`).
+///
+/// Honest limits of THIS check: the pipe name is global
+/// (`\\.\pipe\rsh-daemon`, not per data dir), so a foreign daemon
+/// already holding the mutex makes every child exit and the check
+/// fails "never settled" instead of passing against the wrong
+/// daemon — a clear signal, not a false pass. And no CI job runs
+/// the rig on Windows today (rig-gate is ubuntu-only), so this
+/// check is compile-verified for the Windows target but its
+/// execution proof is still outstanding: run the rig on a Windows
+/// runner (`cargo run -p rsh-rig`) to execute it.
+#[cfg(windows)]
+#[must_use]
+fn gate_already_running_race_windows() -> (bool, String) {
+    let mut report = LcReport::new();
+    let stage = stage_dir("already-running-race");
+    let data_dir = stage.join("data");
+    let _ = std::fs::create_dir_all(&data_dir);
+    for round in 1..=3 {
+        let round_started = Instant::now();
+        let mut children: Vec<Child> = Vec::new();
+        for i in 0..8 {
+            let log = stage.join(format!("daemon-r{round}-{i}.log"));
+            match launch_real_daemon(&data_dir, &log) {
+                Ok(c) => children.push(c),
+                Err(e) => {
+                    report.note(&format!("round {round}: daemon {i} did not start: {e}"));
+                }
+            }
+        }
+        let total = children.len();
+        // Per-child exit codes, recorded at reap time. `None` =
+        // still running at the last sample. `-1` = the child is
+        // gone but no code could be read (reaped elsewhere, or
+        // `try_wait` errored) — an unaccountable child fails the
+        // round honestly instead of passing silently.
+        let mut codes: Vec<Option<i32>> = vec![None; total];
+        let mut settled = false;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while Instant::now() < deadline {
+            let mut exited = 0usize;
+            for (i, c) in children.iter_mut().enumerate() {
+                if codes[i].is_none() {
+                    match c.try_wait() {
+                        Ok(Some(status)) => codes[i] = Some(status.code().unwrap_or(-1)),
+                        Ok(None) => {}
+                        Err(_) => codes[i] = Some(-1),
+                    }
+                }
+                if codes[i].is_some() {
+                    exited += 1;
+                }
+            }
+            let running = total - exited;
+            if running == 1 && ipc_ping(&data_dir) {
+                settled = true;
+                break;
+            }
+            if running == 0 {
+                // Nobody survived — a foreign daemon holding the
+                // mutex, or every child crashed. Do not burn the
+                // rest of the 120 s budget waiting for a winner
+                // that cannot appear.
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let exited_codes: Vec<Option<i32>> = codes.clone();
+        let running: Vec<u32> = children
+            .iter()
+            .zip(codes.iter())
+            .filter(|(_, code)| code.is_none())
+            .map(|(c, _)| c.id())
+            .collect();
+        if !settled {
+            for mut c in children {
+                kill_child(&mut c);
+            }
+            report.check(
+                &format!("round {round}: settlement within 120 s"),
+                false,
+                &format!(
+                    "NEVER SETTLED in 120 s — still running: {running:?}, ping: {}, loser exits: {exited_codes:?}",
+                    ipc_ping(&data_dir)
+                ),
+            );
+            let _ = wait_until(Duration::from_secs(30), || {
+                !ipc_ping(&data_dir) && pid_file_clear(&data_dir)
+            });
+            continue;
+        }
+        // The survivor's entry is `None` (still running) — the
+        // all-zero check covers the EXITED children only.
+        let loser_codes: Vec<Option<i32>> = exited_codes
+            .iter()
+            .copied()
+            .filter(|c| c.is_some())
+            .collect();
+        let losers_all_zero = loser_codes.iter().all(|c| *c == Some(0));
+        let round_ok = running.len() == 1 && losers_all_zero;
+        report.check(
+            &format!("round {round}: exactly 1 live daemon, rest exit 0"),
+            round_ok,
+            &format!(
+                "live daemons: {}, ping: {}, loser exits: {:?}, round ms: {}",
+                running.len(),
+                ipc_ping(&data_dir),
+                loser_codes,
+                round_started.elapsed().as_millis()
+            ),
+        );
+        // Stop the survivor now that the verdict is recorded.
+        for mut c in children {
+            kill_child(&mut c);
+        }
+        // Same inter-round clear as the Unix half (the socket wait
+        // is the pipe wait here; `pid_file_clear` is trivially true
+        // on Windows — no `/proc` — and the daemon's own stale-pid
+        // reclaim covers the pid file).
+        let _ = wait_until(Duration::from_secs(30), || {
+            !ipc_ping(&data_dir) && pid_file_clear(&data_dir)
+        });
+    }
     report.finish()
 }
 

@@ -648,18 +648,24 @@ impl AppApi for DaemonApi {
         // persisted the flag — a backend activation/connect failure
         // was invisible, and the toggle did not survive a restart
         // (`settings().output_enabled` is the persisted source the
-        // UI polls on the next `poll`). Now: a failure in the
-        // applied state is noted in the engine detail (which the
-        // diagnostics surface), the flag is persisted, and a persist
-        // failure is logged + noted and reverts the in-memory toggle
-        // so the engine and the polled flag agree.
+        // UI polls on the next `poll`). P1-1 (v2.0.12 scan): persist
+        // the APPLIED state, not the requested one — the core only
+        // reports the toggle ON once a backend actually connects,
+        // so persisting the request would re-arm the lie on the
+        // next poll (and `set_settings_patch` below would re-run
+        // the failed activation, since the in-memory flag and the
+        // persisted value disagree). A failure in the applied state
+        // is noted in the engine detail (which the diagnostics
+        // surface).
+        let before = self.state.settings().output_enabled;
         let applied = self.state.set_output_enabled(enabled);
         if applied.detail.contains("failed") {
             self.state
                 .note_engine_detail(format!("output enable failed: {}", applied.detail));
         }
+        let applied_enabled = applied.enabled.unwrap_or(enabled);
         let patch = AppSettingsPatch {
-            output_enabled: Some(enabled),
+            output_enabled: Some(applied_enabled),
             ..Default::default()
         };
         if let Err(error) = self.state.set_settings_patch(patch) {
@@ -669,7 +675,17 @@ impl AppApi for DaemonApi {
             self.state.note_engine_detail(format!(
                 "output setting could not be saved ({error}) — the toggle was reverted"
             ));
-            let _ = self.state.set_output_enabled(!enabled);
+            // Revert the in-memory toggle so the engine and the
+            // polled flag agree — but only when the revert is a
+            // disable. Re-enabling here would re-run an activation
+            // that just failed or was refused (and count another
+            // storm-guard strike); a refused enable already leaves
+            // the in-memory flag OFF, which is the honest state —
+            // the persisted value just stays stale until the next
+            // successful save heals it.
+            if before != applied_enabled && !before {
+                let _ = self.state.set_output_enabled(false);
+            }
         }
     }
 
@@ -1745,13 +1761,24 @@ mod tests {
         // polls `settings().output_enabled`, so a restart reverted
         // it and a persist failure was invisible. Now the flag is
         // persisted, and the polled value agrees with the toggle.
+        // P1-1 (v2.0.12 scan): the persisted value is the APPLIED
+        // state, not the request — on this Linux test box no real
+        // backend can connect (the NullSink's `try_connect` always
+        // fails), so the enable honestly fails and the persisted
+        // flag is OFF. The old assertion (enable persists `true`)
+        // only passed because the flag lied about a failed enable.
+        // The invariant is agreement: the polled value matches the
+        // toggle. The ON-persist half is covered in app-core
+        // (`recording_backend_actuation_is_real` asserts the
+        // successful enable reports `Some(true)`); the daemon layer
+        // cannot inject a connecting backend on Linux.
         let (api, _dir) = live_api_named("output-persist");
         api.set_output_enabled(true);
         assert!(
-            api.state.settings().output_enabled,
-            "the toggle must persist"
+            !api.state.settings().output_enabled,
+            "a failed enable must persist OFF, not the requested ON"
         );
-        assert!(api.output_enabled());
+        assert!(!api.output_enabled());
         api.set_output_enabled(false);
         assert!(
             !api.state.settings().output_enabled,
