@@ -1475,12 +1475,8 @@ fn gate_already_running_race_windows() -> (bool, String) {
         }
         // The survivor's entry is `None` (still running) — the
         // all-zero check covers the EXITED children only.
-        let loser_codes: Vec<Option<i32>> = exited_codes
-            .iter()
-            .copied()
-            .filter(|c| c.is_some())
-            .collect();
-        let losers_all_zero = loser_codes.iter().all(|c| *c == Some(0));
+        let loser_codes: Vec<i32> = exited_codes.iter().copied().flatten().collect();
+        let losers_all_zero = loser_codes.iter().all(|c| *c == 0);
         let round_ok = running.len() == 1 && losers_all_zero;
         report.check(
             &format!("round {round}: exactly 1 live daemon, rest exit 0"),

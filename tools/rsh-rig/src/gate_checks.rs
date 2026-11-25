@@ -1925,11 +1925,16 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
             .unwrap_or(rest.len());
         &rest[..end]
     });
+    // v2.0.12 HID-3: the job fn's doc comment names
+    // `set_output_backend` in prose ("the switch runs
+    // synchronously inside the daemon's `set_output_backend`
+    // call"), so the bare string occurs twice — count the actual
+    // call site `api.set_output_backend(` instead.
     report.check(
         "hid-ui-single-attempt",
         count(handler, "start_backend_job") == 1
             && !handler.contains("loop")
-            && count(job_fn, "set_output_backend") == 1
+            && count(job_fn, "api.set_output_backend(") == 1
             && job_fn.contains("contains_key(&JobKind::Backend)"),
         "UI backend-selected handler starts exactly one backend job (no loop); the job calls set_output_backend once, guarded by the Backend in-flight check",
     );
@@ -1937,9 +1942,14 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
         .find("JobDone::Backend { index, result } => {")
         .map_or("", |start| {
             let rest = &ui_main[start..];
-            let end = rest
-                .find("JobDone::FirmwareCheck(result) => {")
-                .unwrap_or(rest.len());
+            // v2.0.12 HID-3: the arm after Backend is
+            // BackendRequery now (the timeout verdict), not
+            // FirmwareCheck — stop at the NEXT JobDone:: arm,
+            // whichever it is, so the re-query's own
+            // `notify_error` is not counted against this arm.
+            let end = rest[1..]
+                .find("\n            JobDone::")
+                .map_or(rest.len(), |off| off + 1);
             &rest[..end]
         });
     // WS-A (Bug 4/8) replaced the direct `win.set_controller(1 -

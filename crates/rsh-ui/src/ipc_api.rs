@@ -1030,7 +1030,23 @@ async fn refresh_slow(client: &IpcClient, cache: &LiveCache) {
     // failure — old daemon without the method, an unparseable reply
     // — fall through to the sequential per-slot pass below, which
     // keeps exactly its old behaviour (including `link_dead` checks).
-    let slow_state = match client.call("slow_poll", serde_json::json!({})).await {
+    // R2-21: the combined call is best-effort at the 500 ms
+    // default — `timeout_for_method("slow_poll")` is 5 s (P2-3: a
+    // cache-miss re-read), but a silent daemon must not cost this
+    // cycle 5 s before the budgeted fallback even starts (that
+    // broke the ~2.5 s budget: 5 s + 3 x 500 ms = 6.5 s). A slow
+    // daemon falls through to the per-slot pass below, which
+    // fetches the same data inside the 2 s / 3-failure budget;
+    // the next ~1 s cycle retries the combined call against the
+    // warm cache.
+    let slow_state = match client
+        .call_with_timeout(
+            "slow_poll",
+            serde_json::json!({}),
+            Duration::from_millis(500),
+        )
+        .await
+    {
         Ok(value) => serde_json::from_value::<SlowPollState>(value).ok(),
         Err(_) => None,
     };
