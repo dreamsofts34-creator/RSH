@@ -171,7 +171,7 @@ pub mod latency;
 /// The methods the IPC server answers, with their params.
 pub mod server;
 
-pub use client::{IpcClient, WireFrameKind, classify_wire_line};
+pub use client::{IpcClient, WireFrameKind, classify_wire_line, timeout_for_method};
 pub use latency::{
     action_latency_p50_p99_ms, ipc_latency_global_p50_p99_ms, ipc_latency_snapshot,
     record_action_completed, record_ipc_latency, record_poll_observed,
@@ -860,9 +860,23 @@ fn dispatch_game_write(
         .get("profile_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    // P1-3: the UI sends one idempotency key per add-dialog
+    // session (`idempotency_key`); a retry after a client-side
+    // timeout replays the same key and the daemon returns the
+    // already-created entry instead of a duplicate. Absent (old
+    // UI) means no dedupe — the old behaviour.
+    let idempotency_key = params
+        .get("idempotency_key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     match request.method.as_str() {
         "add_game" => api
-            .add_game(text("name"), text("exe_path"), profile_id)
+            .add_game_with_key(
+                text("name"),
+                text("exe_path"),
+                profile_id,
+                idempotency_key.as_deref(),
+            )
             .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
             .map_err(|e| detailed_api_error(&e)),
         "update_game" => api

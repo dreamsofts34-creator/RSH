@@ -49,6 +49,7 @@ impl AppApi for StubApi {
             board_reachable: true,
             error: None,
             hint: None,
+            connect_started: None,
         }
     }
     fn connect(&self, _transport: ApiTransport) -> Result<ConnectionInfo, UserError> {

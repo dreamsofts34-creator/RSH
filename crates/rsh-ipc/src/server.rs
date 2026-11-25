@@ -29,6 +29,35 @@ use crate::{
     encode_response, parse_request,
 };
 
+/// Capacity of the per-connection response channel (P3-3,
+/// v2.0.11): 256, matching the event channel — the old 64 silently
+/// dropped cheap responses under a burst (a `try_send` failure was
+/// swallowed), so a 500 ms client timeout read as link degradation.
+/// Drops that still happen are logged (see
+/// [`log_dropped_response`]).
+const RESPONSE_CHANNEL_CAPACITY: usize = 256;
+
+/// Log a response the response channel could not take (P3-3,
+/// v2.0.11): the method + request id only, never the payload (it
+/// can carry a Wi-Fi password). A `Closed` channel means the client
+/// is gone — nothing to log. Written to stderr, which the daemon
+/// captures into its log files.
+fn log_dropped_response(
+    parsed: &Result<crate::IpcRequest, IpcError>,
+    error: tokio::sync::mpsc::error::TrySendError<String>,
+) {
+    if matches!(error, tokio::sync::mpsc::error::TrySendError::Closed(_)) {
+        return;
+    }
+    let (method, id) = match parsed {
+        Ok(request) => (request.method.as_str(), request.id),
+        Err(_) => ("<unparseable>", 0),
+    };
+    eprintln!(
+        "[WARN rsh-ipc] dropped response: response channel full (method={method} id={id}) — the client will time out; this is not link degradation"
+    );
+}
+
 /// The IPC server: owns the API handle and the event broadcast
 /// channel. One `serve_*` task per listener; each connection gets
 /// its own task.
@@ -63,11 +92,13 @@ impl IpcServer {
         // (below), so one slow handler — a backend switch waiting
         // out a UAC prompt, a Wi-Fi password set — never stalls this
         // connection's event forwarding or its next request. The
-        // channel is bounded (64): `blocking_send` in the handler
-        // task applies backpressure instead of piling up responses
-        // for a client that stopped reading. Responses can arrive
-        // out of order; the client matches them by `id`.
-        let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<String>(64);
+        // channel is bounded ([`RESPONSE_CHANNEL_CAPACITY`]):
+        // `blocking_send` in the handler task applies backpressure
+        // instead of piling up responses for a client that stopped
+        // reading. Responses can arrive out of order; the client
+        // matches them by `id`.
+        let (resp_tx, mut resp_rx) =
+            tokio::sync::mpsc::channel::<String>(RESPONSE_CHANNEL_CAPACITY);
         // DS-28: bound in-flight blocking dispatches per connection
         // — a client that floods the server gets a `Busy` error
         // instead of unbounded queued work. Cheap reads bypass this
@@ -112,7 +143,15 @@ impl IpcServer {
                         .is_ok_and(|request| is_cheap_method(&request.method))
                     {
                         if let Some(text) = self.response_text(&line) {
-                            let _ = resp_tx.try_send(text);
+                            // P3-3: a full channel used to swallow
+                            // this response silently (and the client
+                            // then timed out, misread as link
+                            // degradation) — log the drop with the
+                            // method + id (never the payload: it can
+                            // carry a Wi-Fi password).
+                            if let Err(error) = resp_tx.try_send(text) {
+                                log_dropped_response(&parsed, error);
+                            }
                         }
                         continue;
                     }
@@ -125,7 +164,9 @@ impl IpcServer {
                         // for the same reason as the cheap path —
                         // never await a send inside the read arm.
                         if let Some(text) = busy_response_text(&line) {
-                            let _ = resp_tx.try_send(text);
+                            if let Err(error) = resp_tx.try_send(text) {
+                                log_dropped_response(&parsed, error);
+                            }
                         }
                         continue;
                     };
@@ -550,6 +591,7 @@ mod tests {
                 board_reachable: false,
                 error: None,
                 hint: None,
+                connect_started: None,
             }
         }
         fn connect(&self, _transport: ApiTransport) -> Result<ConnectionInfo, UserError> {

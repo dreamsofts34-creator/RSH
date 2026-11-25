@@ -954,6 +954,7 @@ impl IpcApi {
             board_reachable: false,
             error: Some(ConnectionError::TransportClosed),
             hint: Some(ConnectionError::TransportClosed.hint().to_string()),
+            connect_started: None,
         }
     }
 }
@@ -3204,6 +3205,7 @@ mod tests {
                 board_reachable: false,
                 error: None,
                 hint: None,
+                connect_started: None,
             }
         }
 
@@ -3602,6 +3604,7 @@ mod tests {
                 board_reachable: false,
                 error: None,
                 hint: None,
+                connect_started: None,
             }
         }
 

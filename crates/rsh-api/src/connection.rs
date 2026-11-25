@@ -122,8 +122,9 @@ impl ConnectionState {
     /// red. Anything else unconnected (not found, dropped,
     /// retrying) is amber: the wheel being off is not a fault in
     /// the app. Faults: a foreign board answered, the watchdog
-    /// latched, the UDP port is held by another app, or an
-    /// unknown failure.
+    /// latched, the UDP port is held by another app, a malformed
+    /// HELLO, a credential-store failure, a rejected control
+    /// command, or an unknown failure.
     #[must_use]
     pub fn is_fault(&self) -> bool {
         matches!(
@@ -132,6 +133,9 @@ impl ConnectionState {
                 reason: ConnectionError::BoardMismatch
                     | ConnectionError::WatchdogStall
                     | ConnectionError::BindFailed(_)
+                    | ConnectionError::Keystore
+                    | ConnectionError::ControlFailed
+                    | ConnectionError::MalformedHello
                     | ConnectionError::Unknown,
                 ..
             }
@@ -168,7 +172,13 @@ pub enum ConnEvent {
     /// the failure and watchdog budgets exactly like a retry — is
     /// the one documented retry event.
     Connect,
-    /// The transport bound and the link is up.
+    /// The transport bound and the link is up. P1-1 (v2.0.11):
+    /// no production caller feeds this — `Connect` and
+    /// `RetryTimer` move the manager to `LinkUp` themselves, and
+    /// the activator/forwarder own the link. Kept on the enum so
+    /// the wire shape and any harness stay compiling; `on_event`
+    /// deliberately ignores it (single retry owner: the
+    /// activator/forwarder, never the manager).
     LinkUp,
     /// A HELLO arrived (the board is reachable; no pairing
     /// state rides along anymore — v2.2 HELLO carries none).
@@ -177,13 +187,29 @@ pub enum ConnEvent {
     CapsOk,
     /// Activation failed with a typed reason.
     ActivationFailed(ConnectionError),
-    /// One HELLO wait expired with no reply.
+    /// One HELLO wait expired with no reply. P1-1 (v2.0.11):
+    /// no production caller feeds this — the HELLO wait lives in
+    /// the activator (`await_new_session_hello`, 3 × 750 ms) and
+    /// its expiry surfaces as `ActivationFailed(Unreachable)`.
+    /// Kept on the enum for the same reason as `LinkUp`;
+    /// `on_event` deliberately ignores it.
     HelloTimeout,
     /// A stream or status frame arrived (heartbeat).
     FrameSeen,
-    /// The transport was lost (source drop / bind death).
+    /// The transport was lost (source drop / bind death). P1-1
+    /// (v2.0.11): no production caller feeds this — transport
+    /// loss is owned by the forwarder + the heartbeat watchdog
+    /// (`check_watchdog` → `RebuildTransport`), and a dead
+    /// transport during activation surfaces as
+    /// `ActivationFailed(TransportClosed)`. Kept on the enum for
+    /// the same reason as `LinkUp`; `on_event` deliberately
+    /// ignores it.
     TransportLost,
-    /// The UDP bind failed (typed).
+    /// The UDP bind failed (typed). P1-1 (v2.0.11): no production
+    /// caller feeds this — a bind failure surfaces as
+    /// `ActivationFailed(BindFailed(..))`. Kept on the enum for
+    /// the same reason as `LinkUp`; `on_event` deliberately
+    /// ignores it.
     BindFailed(crate::errors::BindErrorKind),
     /// The backoff/retry timer fired.
     RetryTimer,
@@ -334,10 +360,12 @@ impl ConnectionManager {
                 ManagerAction::None
             }
             ConnEvent::LinkUp => {
-                if matches!(self.state, ConnectionState::Backoff { .. }) {
-                    self.transition(ConnectionState::LinkUp, now);
-                    return ManagerAction::RequestHello;
-                }
+                // P1-1 (v2.0.11): dead arm, deliberately a no-op.
+                // No production caller feeds `LinkUp` (`Connect`
+                // and `RetryTimer` already land the manager in
+                // `LinkUp`); the link itself is owned by the
+                // activator/forwarder. Returning an action here
+                // would make the manager a second retry owner.
                 ManagerAction::None
             }
             ConnEvent::HelloReceived => {
@@ -351,11 +379,23 @@ impl ConnectionManager {
                 // skips while the forwarder owns the retry). The
                 // backoff is over once activation starts: disarm
                 // its timer.
+                // P1-2 (v2.0.11): accept from `Error` too. A
+                // failed activation clears the core's
+                // `board_reachable` latch, so the next HELLO is a
+                // fresh rising edge the daemon loop feeds — and
+                // without this arm the manager would drop it in
+                // `Error` and never re-activate (the old code only
+                // accepted it from `LinkUp`/`Hello`/`Backoff`).
+                // `CapsOk` was already accepted from `Error`
+                // (R2-01); accepting the HELLO that precedes it
+                // is the same shape, not a shortcut around
+                // `GET_CAPS`.
                 if matches!(
                     self.state,
                     ConnectionState::LinkUp
                         | ConnectionState::Hello
                         | ConnectionState::Backoff { .. }
+                        | ConnectionState::Error { .. }
                 ) {
                     self.hello_attempts = 0;
                     self.backoff_until = None;
@@ -399,35 +439,20 @@ impl ConnectionManager {
                 ManagerAction::None
             }
             ConnEvent::ActivationFailed(reason) => self.fail(reason, now),
-            ConnEvent::HelloTimeout => {
-                if matches!(self.state, ConnectionState::LinkUp | ConnectionState::Hello) {
-                    self.hello_attempts += 1;
-                    if self.hello_attempts < HELLO_ATTEMPTS {
-                        return ManagerAction::RequestHello;
-                    }
-                    return self.fail(ConnectionError::Unreachable, now);
-                }
+            // P1-1 (v2.0.11): dead arms, deliberately no-ops (see
+            // the `ConnEvent` docs). `HelloTimeout` is owned by
+            // the activator, `TransportLost` by the forwarder +
+            // watchdog, `BindFailed` arrives as
+            // `ActivationFailed(BindFailed(..))` — giving any of
+            // them behaviour here would make the manager a second
+            // retry owner next to the activator/forwarder. The
+            // variants stay on the enum so the wire shape and any
+            // harness keep compiling; feeding one must change
+            // nothing (covered by
+            // `dead_manager_arms_are_noops` below).
+            ConnEvent::HelloTimeout | ConnEvent::TransportLost | ConnEvent::BindFailed(_) => {
                 ManagerAction::None
             }
-            ConnEvent::TransportLost => {
-                if self.state.is_active() {
-                    let wait = Self::backoff_delay(1);
-                    self.backoff_until = Some(now + wait);
-                    self.transition(
-                        ConnectionState::Backoff {
-                            wait_ms: Self::ms_u64(wait),
-                            attempt: 1,
-                        },
-                        now,
-                    );
-                    return ManagerAction::RebuildTransport;
-                }
-                if !matches!(self.state, ConnectionState::Idle) {
-                    return self.fail(ConnectionError::TransportClosed, now);
-                }
-                ManagerAction::None
-            }
-            ConnEvent::BindFailed(kind) => self.fail(ConnectionError::BindFailed(kind), now),
             ConnEvent::RetryTimer => {
                 if let ConnectionState::Backoff { attempt, .. } = self.state {
                     self.backoff_until = None;
@@ -708,27 +733,58 @@ mod tests {
     }
 
     #[test]
-    fn hello_timeout_retries_three_times_then_unreachable() {
+    fn dead_manager_arms_are_noops() {
+        // P1-1 (v2.0.11): `HelloTimeout` / `TransportLost` /
+        // `BindFailed` / `LinkUp` have no production caller — the
+        // HELLO wait lives in the activator, transport loss in the
+        // forwarder + watchdog, bind failure arrives as
+        // `ActivationFailed(BindFailed(..))`. Feeding any of them
+        // must change nothing: the manager must not become a second
+        // retry owner. (`LinkUp` is covered too: `Connect` and
+        // `RetryTimer` already land the manager there.)
+        for event in [
+            ConnEvent::HelloTimeout,
+            ConnEvent::TransportLost,
+            ConnEvent::BindFailed(crate::errors::BindErrorKind::AddrInUse),
+            ConnEvent::LinkUp,
+        ] {
+            // From `LinkUp` (a live attempt) and from `Active` (a
+            // live session): neither may move, retry, or rebuild.
+            for setup in [false, true] {
+                let mut m = ConnectionManager::new();
+                let t = now();
+                m.on_event(ConnEvent::Connect, t);
+                if setup {
+                    m.on_event(ConnEvent::HelloReceived, t);
+                    m.on_event(ConnEvent::CapsOk, t);
+                    assert!(m.state().is_active());
+                }
+                let before = m.state().clone();
+                assert_eq!(m.on_event(event, t), ManagerAction::None, "{event:?}");
+                assert_eq!(*m.state(), before, "{event:?} must not move the state");
+                assert_eq!(m.retry_due_at(), None, "{event:?} must not arm a retry");
+            }
+        }
+    }
+
+    #[test]
+    fn hello_received_from_error_restarts_activation() {
+        // P1-2 (v2.0.11): after a failed activation the manager
+        // sits in `Error`; the next HELLO (a fresh rising edge —
+        // the core clears the reachable latch on the failure) must
+        // restart activation instead of being dropped.
         let mut m = ConnectionManager::new();
         let t = now();
         m.on_event(ConnEvent::Connect, t);
+        let _ = m.on_event(ConnEvent::ActivationFailed(ConnectionError::Unreachable), t);
+        assert!(matches!(m.state(), ConnectionState::Error { .. }));
         assert_eq!(
-            m.on_event(ConnEvent::HelloTimeout, t),
-            ManagerAction::RequestHello
+            m.on_event(ConnEvent::HelloReceived, t),
+            ManagerAction::StartActivation
         );
-        assert_eq!(
-            m.on_event(ConnEvent::HelloTimeout, t),
-            ManagerAction::RequestHello
-        );
-        let action = m.on_event(ConnEvent::HelloTimeout, t);
-        assert_eq!(action, ManagerAction::StateChanged);
-        assert!(matches!(
-            m.state(),
-            ConnectionState::Error {
-                reason: ConnectionError::Unreachable,
-                ..
-            }
-        ));
+        assert!(matches!(m.state(), ConnectionState::Hello));
+        m.on_event(ConnEvent::CapsOk, t);
+        assert!(m.state().is_active());
     }
 
     #[test]
@@ -1081,16 +1137,6 @@ mod tests {
         );
         m.on_event(ConnEvent::CapsOk, t);
         assert!(m.state().is_active());
-    }
-
-    #[test]
-    fn transport_loss_in_active_rebuilds() {
-        let mut m = active_manager();
-        let t = now();
-        assert_eq!(
-            m.on_event(ConnEvent::TransportLost, t),
-            ManagerAction::RebuildTransport
-        );
     }
 
     #[test]
