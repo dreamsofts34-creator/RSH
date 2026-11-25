@@ -316,6 +316,15 @@ pub fn accept_loopback(
             Err(e) => return Err(e),
         }
     };
+    // The listener is nonblocking (poll loop above) and an accepted
+    // socket inherits that mode on Windows — a reader doing a
+    // blocking `read_line` on it gets `WouldBlock` at once, which
+    // `read_line_capped` maps to EOF, so a healthy sidecar that
+    // has not written its hello yet reads as "died before hello"
+    // (CI e2e: EOF 32 ms after spawn, process still running). The
+    // transport is a blocking line reader — restore blocking mode
+    // on the accepted stream before spawning it.
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     let read_half = stream.try_clone()?;
     // The write half shares the socket for shutdown: killing the
