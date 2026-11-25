@@ -116,12 +116,16 @@ internal static class Program
 
     static int Run(string[] args)
     {
-        var connectBack = ParseArgs(args);
-        // C-TOK-1: the loopback token comes from the ENVIRONMENT
-        // (`RSH_HM_SIDECAR_TOKEN`, set by RSH just for the spawn),
-        // never from argv — argv is world-readable via WMI / Process
-        // Explorer. `--token` is rejected by ParseArgs (above).
-        var token = Environment.GetEnvironmentVariable("RSH_HM_SIDECAR_TOKEN");
+        var (connectBack, token) = ParseArgs(args);
+        // v2.0.12 (H1 — PROVEN on the owner's PC): the loopback token
+        // comes from argv (`--token <nonce>`), NOT the environment.
+        // The old env transport (`RSH_HM_SIDECAR_TOKEN`) is dead: a
+        // non-elevated daemon launches this sidecar elevated via
+        // `runas`, and AIS builds a FRESH environment for the
+        // elevated child, dropping the runtime-set variable — so the
+        // sidecar exited 2 here before connecting. The nonce is
+        // single-use random and briefly visible in the process list /
+        // WMI — accepted; it is NEVER logged (presence only, below).
         if (connectBack is not null && string.IsNullOrEmpty(token))
         {
             // P2-7 (update4-fix): this used to bypass the file log
@@ -129,7 +133,7 @@ internal static class Program
             // connect-back failure left no trace in the file log,
             // the one place the daemon-side diagnostics look.
             // Log() writes stderr AND the file log.
-            Log("bad-args: --connect-back needs RSH_HM_SIDECAR_TOKEN in the environment (the token is never passed on the command line)");
+            Log("bad-args: --connect-back needs --token <nonce> (the one-time loopback token is required as a --token argument — it is no longer read from the environment)");
             return 2;
         }
 
@@ -280,16 +284,23 @@ internal static class Program
 
     /// <summary>
     /// Parse the command line (M5 — strict). Only
-    /// `--connect-back 127.0.0.1:&lt;port&gt;` is accepted. Anything else —
-    /// an unknown flag, a missing value, a non-loopback host, a bad
-    /// port, a duplicate flag, or the removed `--token` flag (the
-    /// token now travels in `RSH_HM_SIDECAR_TOKEN`, C-TOK-1) — is a
-    /// distinctive stderr message + fast exit 2, never a silent
+    /// `--connect-back 127.0.0.1:&lt;port&gt;` and `--token &lt;nonce&gt;`
+    /// are accepted. Anything else — an unknown flag, a missing
+    /// value, a non-loopback host, a bad port, or a duplicate flag —
+    /// is a distinctive stderr message + fast exit 2, never a silent
     /// fallback to stdio with a half-parsed address.
+    /// The token travels on argv (v2.0.12, H1): AIS drops
+    /// environment variables set by the non-elevated daemon when it
+    /// launches this sidecar elevated via `runas`, so the old
+    /// `RSH_HM_SIDECAR_TOKEN` environment transport is dead — a
+    /// connect-back with no `--token` is `bad-args`, exit 2 (see
+    /// `Run`). `--token` with no value, and a duplicate `--token`,
+    /// are `bad-args` too.
     /// </summary>
-    static string? ParseArgs(string[] args)
+    static (string? ConnectBack, string? Token) ParseArgs(string[] args)
     {
         string? connectBack = null;
+        string? token = null;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -305,16 +316,24 @@ internal static class Program
                 case "--connect-back":
                     throw new InvalidOperationException(
                         "[sidecar] bad-args: --connect-back needs a value (127.0.0.1:<port>)");
+                case "--token" when i + 1 < args.Length:
+                    if (token is not null)
+                    {
+                        throw new InvalidOperationException(
+                            "[sidecar] bad-args: --token given twice");
+                    }
+                    token = args[++i];
+                    break;
                 case "--token":
                     throw new InvalidOperationException(
-                        "[sidecar] bad-args: --token is no longer accepted — the loopback token comes from the RSH_HM_SIDECAR_TOKEN environment variable");
+                        "[sidecar] bad-args: --token needs a value (the one-time loopback nonce)");
                 default:
                     throw new InvalidOperationException(
-                        $"[sidecar] bad-args: unknown argument '{args[i]}' (only --connect-back 127.0.0.1:<port> is accepted)");
+                        $"[sidecar] bad-args: unknown argument '{args[i]}' (only --connect-back 127.0.0.1:<port> and --token <nonce> are accepted)");
             }
         }
 
-        return connectBack;
+        return (connectBack, token);
     }
 
     static string ValidateConnectBack(string value)

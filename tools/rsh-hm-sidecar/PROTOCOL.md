@@ -13,17 +13,22 @@ the Rust side keeps at most one command in flight.
   sidecar elevated via `runas` (handle redirection does not survive
   a `runas` launch), so RSH listens on loopback and the sidecar
   connects back:
-  `RshCoreHiDcr.exe --connect-back 127.0.0.1:<port>`.
-  The one-time token (128-bit hex) travels in the sidecar's
-  environment (`RSH_HM_SIDECAR_TOKEN`, set by RSH just for the spawn
-  and removed right after — C-TOK-1), never on the command line
-  (argv is world-readable via WMI / Process Explorer). The token is
-  echoed in `hello`; RSH refuses a hello whose token does not match,
-  and additionally verifies the accepted socket's peer PID against
-  the spawned sidecar process (C-TOK-1). The sidecar validates
-  `--connect-back` strictly (loopback host + port 1–65535 only;
-  anything else, including the removed `--token` flag, is a
-  distinctive `[sidecar] bad-args:` stderr line + fast exit 2).
+  `RshCoreHiDcr.exe --connect-back 127.0.0.1:<port> --token <nonce>`.
+  The one-time token (128-bit hex) travels on the sidecar's command
+  line (`--token`, v2.0.12) — NOT in the environment: AIS builds a
+  fresh environment for a `runas` child, dropping runtime-set
+  variables, so the old `RSH_HM_SIDECAR_TOKEN` env transport died
+  with exit 2 before connecting (proven on the owner's PC, v2.0.11
+  retest). The nonce is single-use random and briefly visible in
+  the process list / WMI — accepted; it is never logged anywhere
+  (presence only). The token is echoed in `hello`; RSH refuses a
+  hello whose token does not match, and additionally verifies the
+  accepted socket's peer PID against the spawned sidecar process
+  (C-TOK-1). The sidecar validates `--connect-back` strictly
+  (loopback host + port 1–65535 only; `--token` is required with a
+  connect-back, and a missing value / duplicate flag is
+  `bad-args`); anything else is a distinctive `[sidecar] bad-args:`
+  stderr line + fast exit 2.
   The same JSON framing runs over the socket.
   > Sandbox-blocked: in the Linux dev sandbox, a .NET process's
   > raw TCP connect is redirected to the egress proxy, which

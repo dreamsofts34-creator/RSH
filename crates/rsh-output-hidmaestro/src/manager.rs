@@ -9,11 +9,18 @@
 //!   `ShellExecuteEx` (`runas` verb — the UAC prompt) and connects back
 //!   over a loopback TCP socket ([`transport::listen_loopback`] /
 //!   `accept_loopback`), because handle redirection does not survive a
-//!   `runas` launch. The one-time token travels in the sidecar's
-//!   environment ([`SIDECAR_TOKEN_ENV`], C-TOK-1 — never on the command
-//!   line) and is echoed in `hello` and verified; the accepted
-//!   socket's peer PID is additionally verified against the spawned
-//!   process (C-TOK-1).
+//!   `runas` launch. The one-time token travels on the sidecar's
+//!   command line (`--token <nonce>`, v2.0.12) and is echoed in
+//!   `hello` and verified; the accepted socket's peer PID is
+//!   additionally verified against the spawned process (C-TOK-1).
+//!   The token used to travel in the environment
+//!   (`RSH_HM_SIDECAR_TOKEN`, v2.0.11 and earlier) — AIS builds a
+//!   FRESH environment for a `runas` child, dropping runtime-set
+//!   variables, so the sidecar died with exit 2 before connecting
+//!   (proven on the owner's PC, v2.0.11 retest). The nonce is
+//!   single-use random and briefly visible in the process list /
+//!   WMI — accepted; it is never logged anywhere, only its
+//!   presence.
 //! * Windows, non-elevated (dev only — works when RSH itself runs
 //!   elevated): stdio spawn. A manifest elevation failure (OS error
 //!   740) is mapped to [`HidMaestroError::NotAdmin`].
@@ -53,8 +60,6 @@ use std::time::{Duration, Instant};
 /// unconditional import warned as unused in release builds.
 #[cfg(debug_assertions)]
 use crate::SIDECAR_PATH_ENV;
-#[cfg(windows)]
-use crate::SIDECAR_TOKEN_ENV;
 use crate::error::HidMaestroError;
 use crate::mapping::HidMaestroCapabilities;
 use crate::protocol::{
@@ -63,7 +68,7 @@ use crate::protocol::{
 };
 use crate::transport::{LiveTransport, TransportEvent, spawn_stdio};
 #[cfg(windows)]
-use crate::transport::{accept_loopback, generate_token, listen_loopback};
+use crate::transport::{accept_loopback_with_diagnostics, generate_token, listen_loopback};
 use crate::{PROFILE_ID, SIDECAR_EXE_NAME};
 
 /// Timeout budget (P1-1, update4-fix): the UI bound must EXCEED the
@@ -545,24 +550,21 @@ impl SidecarManager {
     fn spawn_windows_elevated(&mut self) -> Result<HelloInfo, HidMaestroError> {
         let (listener, port) = listen_loopback().map_err(HidMaestroError::from)?;
         let token = generate_token().map_err(HidMaestroError::from)?;
-        // C-TOK-1: the token travels in the sidecar's ENVIRONMENT, not
-        // on its command line (argv is world-readable via WMI /
-        // Process Explorer). `ShellExecuteEx` has no env-block
-        // parameter, so the variable is set in this process just for
-        // the spawn — the child inherits a copy — and removed
-        // immediately afterwards, even on spawn failure.
-        // SAFETY: edition-2024 `set_var`/`remove_var` are `unsafe`
-        // because concurrent env access is UB. This runs on the
-        // engine's connect path only (no other thread touches the
-        // process environment here), and the variable is removed
-        // before this function returns on every path.
-        unsafe {
-            std::env::set_var(SIDECAR_TOKEN_ENV, &token);
-        }
-        let spawned = spawn_elevated_runas(&self.config.sidecar_path, port);
-        unsafe {
-            std::env::remove_var(SIDECAR_TOKEN_ENV);
-        }
+        // v2.0.12 (H1 — PROVEN on the owner's PC): the token travels
+        // on the sidecar's command line (`--token <nonce>`), NOT in
+        // its environment. The old env transport
+        // (`RSH_HM_SIDECAR_TOKEN`, set just for the spawn) is dead:
+        // a non-elevated daemon launches the elevated sidecar via
+        // `ShellExecuteEx "runas"`, and AIS builds a FRESH
+        // environment for the elevated child, dropping the
+        // runtime-set variable — the sidecar logged `bad-args:
+        // --connect-back needs RSH_HM_SIDECAR_TOKEN...` and exited 2
+        // before connecting. The old comment's claim ("the child
+        // inherits a copy") was FALSE through AIS. The nonce is
+        // single-use random (128-bit hex) and briefly visible in the
+        // process list / WMI — accepted; it is NEVER logged anywhere
+        // (presence only, never the value).
+        let spawned = spawn_elevated_runas(&self.config.sidecar_path, port, &token);
         // B-2/A10: a declined UAC prompt latches the decline — the
         // next `connect()` fails fast with NotAdmin instead of
         // prompting again.
@@ -575,6 +577,13 @@ impl SidecarManager {
                 return Err(error);
             }
         };
+        // Keep the process handle BEFORE waiting for the connect-back:
+        // when the accept fails (slow UAC, foreign peer, I/O error) the
+        // elevated sidecar must be terminated and its handle closed,
+        // not leaked (a retry would otherwise spawn a second one).
+        // Stored before the PID check so the pid-0 fail-fast below
+        // can terminate it via `kill_transport`.
+        self.elevated_process = Some(process);
         let pid = {
             use windows::Win32::Foundation::HANDLE;
             use windows::Win32::System::Threading::GetProcessId;
@@ -582,29 +591,75 @@ impl SidecarManager {
             // with `SEE_MASK_NOCLOSEPROCESS`.
             unsafe { GetProcessId(HANDLE(process as *mut std::ffi::c_void)) }
         };
+        // (2b, v2.0.12) H4 pid-0 hole: `GetProcessId` returns 0 for
+        // an invalid handle — fail fast with `SpawnFailed`, never a
+        // silent 30 s accept timeout on a process that was never
+        // really spawned.
+        if pid == 0 {
+            self.kill_transport();
+            return Err(HidMaestroError::SpawnFailed(
+                "elevated sidecar spawn returned PID 0 (no live process — refusing to wait out the 30 s accept timeout)"
+                    .to_string(),
+            ));
+        }
         // P0 (v2.0.11): keep the spawn PID for the `SidecarDied`
         // message — the daemon log then names the process that died
         // before hello, per switch attempt.
         self.last_spawn_pid = Some(pid);
-        // Keep the process handle BEFORE waiting for the connect-back:
-        // when the accept fails (slow UAC, foreign peer, I/O error) the
-        // elevated sidecar must be terminated and its handle closed,
-        // not leaked (a retry would otherwise spawn a second one).
-        self.elevated_process = Some(process);
         // P1-1: the spawn (and the UAC prompt) has returned — start
         // the hello clock now, at accept start, so the accept→EOF
         // elapsed ms never includes the UAC dwell.
         self.hello_started = Some(Instant::now());
-        let transport = match accept_loopback(&listener, self.config.spawn_timeout, Some(pid)) {
+        let mut accept_diagnostics = Vec::new();
+        let transport = match accept_loopback_with_diagnostics(
+            &listener,
+            self.config.spawn_timeout,
+            Some(pid),
+            &mut accept_diagnostics,
+        ) {
             Ok(transport) => transport,
             Err(error) => {
+                // (2a, v2.0.12) P0: the accept-failure diagnostic —
+                // PID + exit code + elapsed ms — is captured BEFORE
+                // `kill_transport` (which takes the handle the exit
+                // code is read from) and folded into the returned
+                // error, which lands in the daemon log via the
+                // switch-failure line (`daemon_api::set_output_backend`
+                // logs `set_output_backend(HIDMaestro) failed:
+                // <reason>` — the same channel the v2.0.11 P0
+                // `SidecarDied` enrichment already uses). Exit 2 =
+                // the sidecar exited fast on its own (bad-args — see
+                // its file log); 259 = still running but never
+                // connected back; anything else = crash code.
+                let message = self.describe_accept_failure(&error, &accept_diagnostics);
                 self.kill_transport();
-                return Err(HidMaestroError::from(error));
+                return Err(HidMaestroError::Io(message));
             }
         };
         self.token = Some(token.clone());
         self.transport = Some(transport);
         self.read_hello(Some(token.as_str()))
+    }
+
+    /// Accept-failure diagnostic (2a, v2.0.12): `{source} (pid …,
+    /// exit code …, N ms since spawn; …)` plus any foreign-peer
+    /// drops (2c). Windows-only: the exit code comes from
+    /// `GetExitCodeProcess` on the stored elevated-process handle,
+    /// so this MUST be called before `kill_transport` (which closes
+    /// the handle). The pure formatting lives in
+    /// [`format_accept_failure`] so it is unit-testable off Windows.
+    #[cfg(windows)]
+    fn describe_accept_failure(&self, source: &std::io::Error, foreign_drops: &[String]) -> String {
+        let elapsed_ms = self
+            .hello_started
+            .map_or(0, |started| started.elapsed().as_millis());
+        format_accept_failure(
+            &source.to_string(),
+            self.last_spawn_pid,
+            self.sidecar_exit_code(),
+            elapsed_ms,
+            foreign_drops,
+        )
     }
 
     fn read_hello(&mut self, expected_token: Option<&str>) -> Result<HelloInfo, HidMaestroError> {
@@ -1103,6 +1158,43 @@ impl Drop for SidecarManager {
     }
 }
 
+/// Pure accept-failure formatter (2a/2c, v2.0.12): the source error
+/// plus spawn PID, sidecar exit code, accept→deadline elapsed ms,
+/// and any foreign-peer drops — never the token (it is not an
+/// argument here by design; the caller must not pass it). `exit_code`
+/// `Some(259)` (`STILL_ACTIVE`) means the process was alive but
+/// never connected back; `Some(2)` is the sidecar's own fast-exit
+/// code (bad-args — the sidecar file log names it); `None` means the
+/// code could not be read. Kept free of Windows APIs so the
+/// formatting is unit-testable on Linux; the Windows-only
+/// [`SidecarManager::describe_accept_failure`] gathers the values.
+/// Windows-only in non-test builds (its only production caller is
+/// Windows-only); compiled on every target under `test` for the
+/// unit tests below.
+#[cfg(any(windows, test))]
+fn format_accept_failure(
+    source: &str,
+    pid: Option<u32>,
+    exit_code: Option<u32>,
+    elapsed_ms: u128,
+    foreign_drops: &[String],
+) -> String {
+    let pid = pid.map_or("?".to_string(), |pid| pid.to_string());
+    let exit = match exit_code {
+        Some(259) => "process still running".to_string(),
+        Some(code) => format!("exit code 0x{code:08X}"),
+        None => "exit code unknown".to_string(),
+    };
+    let mut message = format!(
+        "{source} (pid {pid}, {exit}, {elapsed_ms} ms since spawn; exit 2 = sidecar exited fast on its own — see its file log; 259 = still running but never connected back; sidecar log: %PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log)"
+    );
+    if !foreign_drops.is_empty() {
+        message.push_str("; foreign loopback peers dropped: ");
+        message.push_str(&foreign_drops.join("; "));
+    }
+    message
+}
+
 /// Map a spawn I/O error: Windows elevation-required (OS error 740)
 /// becomes [`HidMaestroError::NotAdmin`]; anything else is
 /// `SpawnFailed` with the OS message.
@@ -1131,17 +1223,24 @@ fn outcome_static(outcome: &str) -> &'static str {
 ///
 /// M4 / C-TOK-1: `SEE_MASK_NOCLOSEPROCESS` is set and the returned
 /// process handle is kept by the manager, so a hung sidecar can be
-/// terminated on kill. The loopback token is NOT on the command line
-/// (argv is world-readable) — it travels in the sidecar's environment
-/// ([`SIDECAR_TOKEN_ENV`], set by the caller just for the spawn; see
-/// [`SidecarManager::spawn_windows_elevated`]).
+/// terminated on kill. The one-time loopback token travels on the
+/// command line (`--token <nonce>`, v2.0.12 — see
+/// [`SidecarManager::spawn_windows_elevated`]): AIS builds a fresh
+/// environment for a `runas` child, so the old env transport dropped
+/// the token and the sidecar died with exit 2 before connecting. The
+/// nonce is single-use random and briefly visible in the process
+/// list / WMI — accepted; it is never logged (presence only).
 ///
 /// Windows-only. The `windows` crate code here is **not** compiled in
 /// the Linux sandbox — it is verified by the Windows target check
 /// (`cargo check --target x86_64-pc-windows-msvc`) and the Windows CI
 /// publish job / owner-PC gate (H-HID-5).
 #[cfg(windows)]
-fn spawn_elevated_runas(path: &std::path::Path, port: u16) -> Result<usize, HidMaestroError> {
+fn spawn_elevated_runas(
+    path: &std::path::Path,
+    port: u16,
+    token: &str,
+) -> Result<usize, HidMaestroError> {
     use windows::Win32::Foundation::{ERROR_CANCELLED, HINSTANCE, HWND, WIN32_ERROR};
     use windows::Win32::UI::Shell::{
         SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -1153,7 +1252,13 @@ fn spawn_elevated_runas(path: &std::path::Path, port: u16) -> Result<usize, HidM
     }
 
     let file = wide(&path.to_string_lossy());
-    let params = wide(&format!("--connect-back 127.0.0.1:{port}"));
+    // The token is 32 lowercase hex chars (see
+    // `transport::generate_token`), so it needs no quoting — it
+    // contains no spaces or shell metacharacters.
+    let params = wide(&format!(
+        "--connect-back 127.0.0.1:{port} {} {token}",
+        crate::SIDECAR_TOKEN_ARG
+    ));
     let verb = wide("runas");
     // SAFETY: all three wide strings are NUL-terminated and live for
     // the whole call; `cbSize` is the struct's own size.
@@ -1181,7 +1286,18 @@ fn spawn_elevated_runas(path: &std::path::Path, port: u16) -> Result<usize, HidM
         // The handle address (not the `HANDLE` itself — it is not
         // `Send`, and the backend must stay `Send`); the manager
         // reconstructs it only to terminate + close it.
-        Ok(()) => Ok(info.hProcess.0 as usize),
+        // (2b, v2.0.12): a success with no process handle is a
+        // spawn failure, not a process to wait on — fail fast with
+        // `SpawnFailed` instead of a silent 30 s accept timeout.
+        Ok(()) => {
+            if info.hProcess.0.is_null() {
+                return Err(HidMaestroError::SpawnFailed(
+                    "ShellExecuteEx (runas) succeeded but returned no process handle (hProcess is NULL) — refusing to wait out the accept timeout"
+                        .to_string(),
+                ));
+            }
+            Ok(info.hProcess.0 as usize)
+        }
         Err(e) => {
             let win32 = WIN32_ERROR::from_error(&e);
             if win32 == Some(ERROR_CANCELLED) {
@@ -1299,6 +1415,79 @@ mod tests {
             Some("f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5")
         );
         assert_eq!(info.dll_sha256_ok, Some(true));
+    }
+
+    /// (2a, v2.0.12): the accept-failure diagnostic names the spawn
+    /// PID, the sidecar exit code, and the accept→deadline elapsed
+    /// ms — the three facts the v2.0.11 retest was missing. Exit 2
+    /// is the sidecar's own fast-exit code (bad-args).
+    #[test]
+    fn accept_failure_names_pid_exit_code_and_elapsed() {
+        let message = format_accept_failure(
+            "sidecar did not connect back in time",
+            Some(4848),
+            Some(2),
+            32,
+            &[],
+        );
+        assert!(
+            message.contains("sidecar did not connect back in time"),
+            "{message}"
+        );
+        assert!(message.contains("pid 4848"), "{message}");
+        assert!(message.contains("exit code 0x00000002"), "{message}");
+        assert!(message.contains("32 ms since spawn"), "{message}");
+    }
+
+    /// (2a, v2.0.12): exit 259 (`STILL_ACTIVE`) reads as "process
+    /// still running", not as a crash code — a live-but-stuck sidecar
+    /// is a different failure from a dead one.
+    #[test]
+    fn accept_failure_still_active_reads_as_running() {
+        let message = format_accept_failure(
+            "sidecar did not connect back in time",
+            Some(1234),
+            Some(259),
+            30_000,
+            &[],
+        );
+        assert!(message.contains("pid 1234"), "{message}");
+        assert!(message.contains("process still running"), "{message}");
+        assert!(!message.contains("exit code 0x00000103"), "{message}");
+    }
+
+    /// (2a, v2.0.12): an unreadable exit code reports "unknown",
+    /// never a guessed code; a missing PID reports "?", never 0
+    /// (0 is not a PID — it is the H4 hole).
+    #[test]
+    fn accept_failure_unknown_exit_code_is_not_guessed() {
+        let message =
+            format_accept_failure("sidecar did not connect back in time", None, None, 5, &[]);
+        assert!(message.contains("pid ?"), "{message}");
+        assert!(message.contains("exit code unknown"), "{message}");
+        assert!(!message.contains("pid 0"), "{message}");
+    }
+
+    /// (2c, v2.0.12): foreign-peer drops ride in the diagnostic
+    /// with expected-vs-actual PID — and the token is never part of
+    /// the message (it is not even an argument to the formatter).
+    #[test]
+    fn accept_failure_carries_foreign_peer_drops() {
+        let drops = vec!["loopback peer is PID 9999, not the spawned sidecar PID 4848".to_string()];
+        let message = format_accept_failure(
+            "sidecar did not connect back in time",
+            Some(4848),
+            Some(2),
+            30_000,
+            &drops,
+        );
+        assert!(
+            message.contains("foreign loopback peers dropped"),
+            "{message}"
+        );
+        assert!(message.contains("loopback peer is PID 9999"), "{message}");
+        assert!(message.contains("spawned sidecar PID 4848"), "{message}");
+        assert!(!message.contains("abcdef0123456789"), "{message}");
     }
 
     /// P1-3 (update4-fix): a sidecar death AFTER hello reports the

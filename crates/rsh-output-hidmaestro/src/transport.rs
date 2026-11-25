@@ -212,6 +212,13 @@ pub fn listen_loopback() -> std::io::Result<(TcpListener, u16)> {
     Ok((listener, port))
 }
 
+/// Maximum foreign-peer drop lines kept in the accept diagnostics
+/// (2c, v2.0.12): a foreign-peer flood inside the 30 s accept window
+/// must not grow the list without bound. Windows-only: the PID check
+/// that records drops is Windows-only.
+#[cfg(windows)]
+const MAX_ACCEPT_DIAGNOSTICS: usize = 8;
+
 /// Accept one loopback connection within `timeout`, and wrap it as a
 /// live transport. The peer must be the sidecar we just spawned; the
 /// token check happens at the `hello` layer ([`crate::protocol`]).
@@ -236,6 +243,38 @@ pub fn accept_loopback(
     timeout: Duration,
     expected_pid: Option<u32>,
 ) -> std::io::Result<LiveTransport> {
+    let mut diagnostics = Vec::new();
+    accept_loopback_with_diagnostics(listener, timeout, expected_pid, &mut diagnostics)
+}
+
+/// [`accept_loopback`] with a diagnostics sink for dropped foreign
+/// peers (2c, v2.0.12): every definitively-foreign peer (a TCP-table
+/// PID mismatch — `PermissionDenied`) appends one line naming the
+/// expected-vs-actual PID (`loopback peer is PID {actual}, not the
+/// spawned sidecar PID {expected}` — never the token). The manager
+/// folds these lines into the accept-failure error, which lands in
+/// the daemon log; on success they are discarded (a dropped foreign
+/// peer that did not stop the real sidecar connecting is not a
+/// failure). At most [`MAX_ACCEPT_DIAGNOSTICS`] lines are kept, so a
+/// foreign-peer flood cannot grow the list without bound inside the
+/// 30 s accept window. Transient PID-lookup failures are NOT
+/// recorded here — the deadline error already carries the last one
+/// (P1-4) — only definitive mismatches are foreign peers.
+///
+/// # Errors
+///
+/// Same as [`accept_loopback`].
+pub fn accept_loopback_with_diagnostics(
+    listener: &TcpListener,
+    timeout: Duration,
+    expected_pid: Option<u32>,
+    diagnostics: &mut Vec<String>,
+) -> std::io::Result<LiveTransport> {
+    // Off Windows the diagnostics sink is never written (the PID
+    // check that records drops is Windows-only) — the parameter
+    // still exists so the signature is identical on every target.
+    #[cfg(not(windows))]
+    let _ = diagnostics;
     listener.set_nonblocking(true)?;
     let deadline = Instant::now() + timeout;
     // P1-4: the last transient peer-PID lookup failure (size query,
@@ -296,6 +335,16 @@ pub fn accept_loopback(
                     match verify_loopback_peer_pid_retry(&stream, pid, retry_deadline) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            // (2c, v2.0.12): a definitively foreign
+                            // peer — record the expected-vs-actual
+                            // PIDs (never the token) for the
+                            // accept-failure diagnostic. The drop
+                            // itself is silent here; the manager
+                            // surfaces the recorded lines in the
+                            // daemon log when the accept fails.
+                            if diagnostics.len() < MAX_ACCEPT_DIAGNOSTICS {
+                                diagnostics.push(e.to_string());
+                            }
                             drop(stream);
                             continue;
                         }
@@ -863,6 +912,83 @@ mod tests {
             Ok(_) => panic!("a wrong-PID peer must never be accepted"),
         }
         let _peer = handle.join().unwrap();
+    }
+
+    /// (2c, v2.0.12): the diagnostics variant records the dropped
+    /// foreign peer with expected-vs-actual PID — the line the
+    /// manager folds into the daemon log on accept failure.
+    /// Windows-only (the PID check is Windows-only); runs on CI
+    /// test-windows.
+    #[cfg(windows)]
+    #[test]
+    fn loopback_accept_diagnostics_records_foreign_peer_drop() {
+        let (listener, port) = listen_loopback().unwrap();
+        let handle =
+            std::thread::spawn(move || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let mut diagnostics = Vec::new();
+        match accept_loopback_with_diagnostics(
+            &listener,
+            Duration::from_millis(300),
+            Some(u32::MAX),
+            &mut diagnostics,
+        ) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            Ok(_) => panic!("a wrong-PID peer must never be accepted"),
+        }
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let line = &diagnostics[0];
+        // Expected-vs-actual: the peer is this test process, the
+        // expected PID is the impossible u32::MAX.
+        assert!(
+            line.contains(&format!("PID {}", std::process::id())),
+            "{line}"
+        );
+        assert!(
+            line.contains("not the spawned sidecar PID 4294967295"),
+            "{line}"
+        );
+        let _peer = handle.join().unwrap();
+    }
+
+    /// (2c, v2.0.12): no foreign peer, no diagnostics — a plain
+    /// timeout records nothing, so the manager's accept-failure
+    /// message stays short when there is nothing to explain.
+    /// Cross-platform: runs on Linux too.
+    #[test]
+    fn loopback_accept_diagnostics_empty_without_foreign_peer() {
+        let (listener, _port) = listen_loopback().unwrap();
+        let mut diagnostics = Vec::new();
+        match accept_loopback_with_diagnostics(
+            &listener,
+            Duration::from_millis(50),
+            None,
+            &mut diagnostics,
+        ) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            Ok(_) => panic!("expected a timeout, got a connection"),
+        }
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    /// (2c, v2.0.12): the happy path records nothing either — a
+    /// clean accept leaves the diagnostics empty.
+    /// Cross-platform: runs on Linux too.
+    #[test]
+    fn loopback_accept_diagnostics_empty_on_clean_accept() {
+        let (listener, port) = listen_loopback().unwrap();
+        let handle =
+            std::thread::spawn(move || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let mut diagnostics = Vec::new();
+        let transport = accept_loopback_with_diagnostics(
+            &listener,
+            Duration::from_secs(5),
+            None,
+            &mut diagnostics,
+        )
+        .expect("loopback peer must be accepted");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let _peer = handle.join().unwrap();
+        drop(transport);
     }
 
     /// H4: the writer thread + bounded queue accept lines without

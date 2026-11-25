@@ -40,6 +40,13 @@
 //! There is no separate token assert because `HelloInfo` carries
 //! no token field by design (the token is a secret while the
 //! sidecar is alive).
+//!
+//! v2.0.12 (H1): the token travels on the sidecar's command line
+//! (`--token <nonce>`) — the old environment transport died on the
+//! owner's PC (AIS drops env vars set by the non-elevated daemon
+//! when it launches the sidecar elevated via `runas`). This test
+//! exercises exactly that production path, so a regression in the
+//! argv token handoff fails here instead of on the user's PC.
 #![cfg(windows)]
 
 use std::path::PathBuf;
