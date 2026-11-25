@@ -1859,7 +1859,7 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
     report.check(
         "hid-uac-dwell-clock-starts-after-spawn",
         manager.contains("self.hello_started = Some(Instant::now())")
-            && manager.contains("accept_loopback(&listener, self.config.spawn_timeout"),
+            && manager.contains("accept_loopback_with_diagnostics(&listener, self.config.spawn_timeout"),
         "hello clock starts at accept start, after the spawn (and its UAC dwell) has returned",
     );
 
