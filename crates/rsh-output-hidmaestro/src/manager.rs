@@ -303,6 +303,13 @@ pub struct SidecarManager {
     /// round-trip on the 200 Hz tick. Cleared on the next successful
     /// heartbeat.
     last_alive_failure: Option<Instant>,
+    /// The cached heartbeat failure's own detail (P3-8, v2.0.12
+    /// scan): the cached arm used to return a bare fixed string
+    /// ("sidecar heartbeat failed recently (cached)") with no PID,
+    /// exit code, or timing — it now replays the original failure's
+    /// enriched detail instead. Set/cleared together with
+    /// `last_alive_failure`.
+    last_alive_failure_detail: Option<String>,
     last_submit_latency_us: Option<f64>,
     submit_count: u64,
     transport_index: Option<i32>,
@@ -331,6 +338,7 @@ impl SidecarManager {
             healthy_submits: 0,
             last_reply: None,
             last_alive_failure: None,
+            last_alive_failure_detail: None,
             last_submit_latency_us: None,
             submit_count: 0,
             transport_index: None,
@@ -530,9 +538,12 @@ impl SidecarManager {
             match transport.events.try_recv() {
                 Ok(TransportEvent::Line(_)) => {} // stray line: discard, keep draining
                 Ok(TransportEvent::Eof) => {
-                    return Err(HidMaestroError::SidecarDied(
-                        "sidecar exited (EOF queued)".to_string(),
-                    ));
+                    // P3-8 (v2.0.12 scan): the queued-EOF liveness
+                    // death carries the same PID + exit-code + timing
+                    // enrichment as the request-path EOF arm (captured
+                    // before the caller kills the transport) instead
+                    // of the bare fixed string.
+                    return Err(HidMaestroError::SidecarDied(self.describe_post_hello_eof()));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(()),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -700,8 +711,39 @@ impl SidecarManager {
                     self.describe_hello_eof(elapsed_ms),
                 ))
             }
-            Err(_) => Err(HidMaestroError::HelloTimeout),
+            Err(_) => {
+                // P1-1 (v2.0.12 scan): the timeout arm used to
+                // return the bare unit `HelloTimeout` — no PID, no
+                // exit code, no elapsed ms — while the EOF arm in
+                // this same function is fully enriched. Capture the
+                // enriched diagnostic BEFORE the caller kills the
+                // transport (which takes the elevated-process handle
+                // the exit code is read from), exactly like the EOF
+                // arm.
+                let message = self.describe_hello_timeout();
+                Err(HidMaestroError::HelloTimeout(message))
+            }
         }
+    }
+
+    /// Describe a hello timeout (P1-1, v2.0.12 scan): which bound
+    /// was hit plus the same PID + exit-code + timing enrichment as
+    /// the EOF arms — the bound names the stage, and the exit code
+    /// tells a slow-but-alive sidecar (`STILL_ACTIVE`) from a
+    /// crashed one. Must be called BEFORE `kill_transport`, like the
+    /// EOF descriptions.
+    fn describe_hello_timeout(&self) -> String {
+        let elapsed_ms = self
+            .hello_started
+            .map_or(0, |started| started.elapsed().as_millis());
+        self.describe_eof(
+            &format!(
+                "sidecar did not answer hello within {:?}",
+                self.config.spawn_timeout
+            ),
+            elapsed_ms,
+            "after spawn",
+        )
     }
 
     /// Describe a sidecar death before hello (P0, v2.0.11): PID +
@@ -852,9 +894,21 @@ impl SidecarManager {
             return Err(HidMaestroError::NotConnected);
         };
         if let Err(e) = transport.writer.write_line(&line) {
+            // P3-7 (v2.0.12 scan): the write-failure arm used to
+            // return the bare I/O string (e.g. "sidecar write queue
+            // full — sidecar is not reading"), with no PID, exit
+            // code, or timing — a hung sidecar that stops reading
+            // at 200 Hz read exactly like a dead one. Enrich it
+            // like the EOF/timeout arms, captured BEFORE
+            // `kill_transport`.
+            let message = self.describe_eof(
+                &format!("sidecar write failed ({e})"),
+                self.ms_since_last_reply(),
+                "since last reply",
+            );
             self.kill_transport();
             self.note_failure();
-            return Err(HidMaestroError::SidecarDied(e.to_string()));
+            return Err(HidMaestroError::SidecarDied(message));
         }
         match transport.events.recv_timeout(timeout) {
             Ok(TransportEvent::Line(line)) => {
@@ -930,8 +984,14 @@ impl SidecarManager {
         if let Some(failed_at) = self.last_alive_failure
             && failed_at.elapsed() < ALIVE_FAILURE_COOLDOWN
         {
+            // P3-8 (v2.0.12 scan): replay the original failure's
+            // enriched detail instead of a bare fixed string — the
+            // cached arm used to lose the PID / exit code / timing
+            // the live arm had captured.
             return Err(HidMaestroError::SidecarDied(
-                "sidecar heartbeat failed recently (cached)".to_string(),
+                self.last_alive_failure_detail
+                    .clone()
+                    .unwrap_or_else(|| "sidecar heartbeat failed recently (cached)".to_string()),
             ));
         }
         let outcome = self
@@ -940,10 +1000,12 @@ impl SidecarManager {
         match outcome {
             Ok(()) => {
                 self.last_alive_failure = None;
+                self.last_alive_failure_detail = None;
                 Ok(())
             }
             Err(error) => {
                 self.last_alive_failure = Some(Instant::now());
+                self.last_alive_failure_detail = Some(error.to_string());
                 Err(error)
             }
         }
@@ -1131,12 +1193,16 @@ impl SidecarManager {
     }
 
     /// Best-effort shutdown (H4): fire `dispose` + `exit` into the
-    /// writer queue and kill the transport immediately — NEVER wait
-    /// for an `exit` reply. The sidecar disposes the device on stdin
-    /// EOF / socket close as well, so killing the transport is itself
-    /// the clean-shutdown signal; waiting for the reply used to stall
+    /// writer queue and kill the transport — NEVER wait for an `exit`
+    /// reply. The sidecar disposes the device on stdin EOF / socket
+    /// close as well, so killing the transport is itself the
+    /// clean-shutdown signal; waiting for the reply used to stall
     /// the caller for up to the reply timeout. Never panics, never
-    /// blocks long. Idempotent.
+    /// blocks long. Idempotent. P1-2 (v2.0.12 scan): the kill itself
+    /// now grants the sidecar a ~1 s grace period to exit on its own
+    /// after the EOF signal before terminating it (see
+    /// `kill_transport`) — that is a bounded wait for process exit,
+    /// not a wait for a reply.
     pub fn shutdown(&mut self) {
         if self.transport.is_none() {
             return;
@@ -1181,13 +1247,29 @@ impl SidecarManager {
         // device.
         #[cfg(windows)]
         if let Some(process) = self.elevated_process.take() {
-            use windows::Win32::Foundation::{CloseHandle, HANDLE};
-            use windows::Win32::System::Threading::TerminateProcess;
+            use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+            use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
             // SAFETY: `process` is the live handle address stored at
             // spawn; it is reconstructed and closed exactly once, here.
             let handle = HANDLE(process as *mut std::ffi::c_void);
             unsafe {
-                let _ = TerminateProcess(handle, 1);
+                // P1-2 (v2.0.12 scan): grace period — the socket
+                // shutdown above is the sidecar's dispose-on-EOF
+                // signal (`finally { DisposeAll(); }`), so give it
+                // up to ~1 s to dispose the created device and exit
+                // on its own before terminating it. The old code
+                // `TerminateProcess`d at once, so the dispose almost
+                // never ran and a created device could be orphaned
+                // (whether the driver auto-removes a device whose
+                // owner died is not established — the next `create`
+                // with the same identity could fail or duplicate).
+                // `WaitForSingleObject` on the stored handle waits
+                // for exactly this process; `WAIT_OBJECT_0` means
+                // it exited on its own and needs no terminate.
+                let exited = WaitForSingleObject(handle, 1000) == WAIT_OBJECT_0;
+                if !exited {
+                    let _ = TerminateProcess(handle, 1);
+                }
                 let _ = CloseHandle(handle);
             }
         }

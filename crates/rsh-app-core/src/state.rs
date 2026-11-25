@@ -174,6 +174,8 @@ use rsh_engine::metrics::EngineMetrics;
 use rsh_engine::pipeline::OutputState as PipelineOutputState;
 use rsh_engine::pipeline::{PipelinePlan, ProcessingPipeline};
 use rsh_output::selector::{BackendFactories, BackendKind, SwitchOutcome, switch_backend};
+#[cfg(windows)]
+use rsh_output::vjoy::{RealVJoyDll, VJoyInterface};
 use rsh_output::vjoy::{VJOY_DOWNLOAD_URL, VJoyOutput, resolve_dll_path};
 use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
 use rsh_output_hidmaestro::HidMaestroOutput;
@@ -1009,6 +1011,14 @@ pub struct AppStateCore {
     /// `installing` / `install_error` are NOT cached — they are
     /// cheap lock reads and must stay live.
     vjoy_dll_cache: Mutex<VjoyDllCache>,
+    /// Last measured vJoy driver version (P3-9, v2.0.12 scan):
+    /// the live vJoy backend measures it at connect (see
+    /// [`IJoystickOutput::vjoy_driver_version`]), and `vjoy_status()`
+    /// caches it here so the version survives a switch away to
+    /// another backend (the live backend then measures nothing).
+    /// [`None`] until a vJoy backend has connected once — an
+    /// unmeasured version is never invented.
+    last_vjoy_driver_version: Mutex<Option<String>>,
     /// Cached Wi-Fi password-set flag (R3-D-08, see
     /// [`WifiPasswordCache`]): the Credential Manager read behind
     /// `wifi_status()` is cached the same way, so the ~1 Hz slow
@@ -1324,6 +1334,7 @@ impl AppStateCore {
             backend_migration_note: Mutex::new(backend_migration_note),
             vjoy_install: Mutex::new(VjoyInstallState::default()),
             vjoy_dll_cache: Mutex::new(VjoyDllCache::default()),
+            last_vjoy_driver_version: Mutex::new(None),
             wifi_password_cache: Mutex::new(WifiPasswordCache::default()),
             session_gate_open: Mutex::new(false),
             session_gate_held_frames: Mutex::new(0),
@@ -1659,6 +1670,14 @@ impl AppStateCore {
             // reply, unexpected reply, bad argument) keeps its own
             // type instead of collapsing into `Unknown`.
             SessionError::Control(_) => ConnectionError::ControlFailed,
+            // P3-2 (v2.0.12 scan): genuinely unknown future
+            // variants collapse to `Unknown` here — and the
+            // collapse must be VISIBLE, not silent: the only call
+            // site logs the unmapped variant (Debug) to the
+            // connection log when the classification comes back
+            // `Unknown`, so a future variant that lands here shows
+            // up in diagnostics instead of vanishing into a bare
+            // "Something went wrong".
             _ => ConnectionError::Unknown,
         }
     }
@@ -3485,6 +3504,16 @@ impl AppStateCore {
     /// mock backends here, the shell and settings paths use the real
     /// factories through [`AppStateCore::set_output_enabled`]).
     ///
+    /// The `output_enabled` flag is the toggle's truth: it is set
+    /// ONLY once the enable has actually happened (P1-1, v2.0.12
+    /// scan). Enabling starts from OFF and sets it `true` only when
+    /// the guard + deferred activation pass AND the backend
+    /// connects; a cooldown refusal, a failed activation, a switch
+    /// already in flight, or a failed connect all report the toggle
+    /// OFF. Disabling sets it `false` up front — stopping the engine
+    /// from sending is the safe direction even when a switch is in
+    /// flight.
+    ///
     /// When output is enabled while the [`NullSink`] is installed and
     /// a real backend is selected, this is the user-initiated moment
     /// the deferred startup backend is activated: startup never
@@ -3502,8 +3531,14 @@ impl AppStateCore {
         enabled: bool,
         factories: &BackendFactories,
     ) -> CommandOutputState {
-        *lock(&self.output_enabled) = enabled;
         if enabled {
+            // P1-1 (v2.0.12 scan): assume the enable fails — the
+            // flag reads OFF on every early return below (refusal,
+            // failed activation, switch in flight, failed connect)
+            // and is only set `true` once a backend actually
+            // connects. The old code set it `true` up front, so a
+            // refused/failed enable reported the toggle ON.
+            *lock(&self.output_enabled) = false;
             // P1-5 (update4-fix): the storm guard covers the enable
             // toggle too — see `hid_switch_cooldown_refusal`.
             if let Some(refused) = self.hid_switch_cooldown_refusal() {
@@ -3536,10 +3571,15 @@ impl AppStateCore {
             } else {
                 // No sink factory (test-only path — the real
                 // factories always provide one): connect on the
-                // live handle, as before.
+                // live handle, as before. The flag follows the
+                // connect outcome (P1-1): `connect_and_resend`
+                // reports the backend's connected state, so a
+                // failed connect leaves the toggle OFF.
                 let handle = self.backend_handle();
                 let mut backend = lock(&handle);
-                return self.connect_and_resend(&mut backend);
+                let state = self.connect_and_resend(&mut backend);
+                *lock(&self.output_enabled) = state.connected;
+                return self.output_state();
             };
             // The extracted handle is owned by this scope: the slow
             // connect + resend run on its own lock, never on the
@@ -3554,6 +3594,13 @@ impl AppStateCore {
             // like a switch, so it must not bypass the guard.
             let backend_kind = BackendKind::from_backend_name(lock(&backend).name());
             let connected = lock(&backend).try_connect();
+            // P1-1 (v2.0.12 scan): the flag is set from the connect
+            // outcome, not from the request — a failed connect
+            // leaves the toggle OFF even though the user asked for
+            // ON. A connected backend reports ON even if the single
+            // resend below fails (the engine keeps sending on its
+            // ticks; the failure is in the detail).
+            *lock(&self.output_enabled) = connected.is_ok();
             match connected {
                 Ok(()) => {
                     if backend_kind == Some(BackendKind::HidMaestro) {
@@ -3581,12 +3628,14 @@ impl AppStateCore {
             }
             *lock(&self.backend) = backend;
         } else {
+            // P1-1 (v2.0.12 scan): disabling sets the flag up
+            // front — stopping the engine from sending is the safe
+            // direction, even when a switch is in flight (the
+            // switch result is left alone; see `send_engine_output`).
+            *lock(&self.output_enabled) = false;
             // R2-09: same extract pattern for the neutral +
             // disconnect — a sidecar shutdown must not hold the
-            // backend lock either. If a switch is in flight the
-            // flag above is already false, so the engine sends
-            // nothing (see `send_engine_output`) and the switch
-            // result is left alone.
+            // backend lock either.
             let Ok(_switch_guard) = self.switch_in_flight.try_lock() else {
                 self.record_send(
                     false,
@@ -4309,10 +4358,25 @@ impl AppStateCore {
     /// was found (cached file probe — see
     /// [`Self::vjoy_dll_path`]), whether a background install is
     /// running, the last install failure, and the resolved DLL path.
-    /// `version` is [`None`]: there is no version read without
-    /// loading the DLL, and an unmeasured version is never invented.
+    /// `version` is the last measured driver version (P3-9, v2.0.12
+    /// scan — it used to be always [`None`]): the live vJoy backend
+    /// measures it at connect, and the value is cached so it
+    /// survives a switch away to another backend; [`None`] until a
+    /// vJoy backend has connected once, never invented.
     #[must_use]
     pub fn vjoy_status(&self) -> rsh_api::VjoyStatus {
+        // Read the live backend's measured version FIRST and drop
+        // the backend lock before taking the DLL-cache / install
+        // locks below (no lock-ordering vs the install thread,
+        // which never takes the backend lock).
+        let live_version = {
+            let backend = self.backend_handle();
+            lock(&backend).vjoy_driver_version()
+        };
+        if let Some(version) = &live_version {
+            *lock(&self.last_vjoy_driver_version) = Some(version.clone());
+        }
+        let version = live_version.or_else(|| lock(&self.last_vjoy_driver_version).clone());
         // Probe before taking the install lock: the probe takes the
         // cache lock, and no other path takes both locks in the
         // opposite order.
@@ -4323,7 +4387,35 @@ impl AppStateCore {
             installing: install.installing,
             install_error: install.error.clone(),
             dll_path: dll.map(|path| path.to_string_lossy().into_owned()),
-            version: None,
+            version,
+        }
+    }
+
+    /// Whether the vJoy driver behind the resolved DLL is actually
+    /// enabled (P2-6, v2.0.12 scan): `resolve_dll_path` only proves
+    /// the file exists, so a present DLL with a disabled driver used
+    /// to make `install_vjoy` answer "already installed" with no
+    /// repair path. Loading the DLL and asking it (`VJoyEnabled()`)
+    /// is a read-only probe — no device is acquired. Any probe
+    /// failure (no DLL, DLL will not load, entry point missing)
+    /// counts as NOT usable: reinstalling is the repair for a
+    /// corrupt DLL too. Windows-only in practice — `install_vjoy`
+    /// refuses non-Windows before this runs — and off Windows there
+    /// is no DLL to probe.
+    fn vjoy_driver_usable() -> bool {
+        #[cfg(windows)]
+        {
+            let Some(path) = resolve_dll_path() else {
+                return false;
+            };
+            let Ok(dll) = RealVJoyDll::load_from(&path) else {
+                return false;
+            };
+            dll.vjoy_enabled()
+        }
+        #[cfg(not(windows))]
+        {
+            false
         }
     }
 
@@ -4346,7 +4438,13 @@ impl AppStateCore {
         if !cfg!(windows) {
             return Err("vJoy is Windows-only".to_string());
         }
-        if resolve_dll_path().is_some() {
+        // P2-6 (v2.0.12 scan): DLL presence alone is NOT "already
+        // installed" — a present DLL with a disabled (or corrupt)
+        // driver is installable, so the installer re-runs as the
+        // repair path instead of the Settings button dead-ending
+        // with "already installed" while every switch fails with
+        // `DriverDisabled`.
+        if resolve_dll_path().is_some() && Self::vjoy_driver_usable() {
             return Ok("vJoy is already installed".to_string());
         }
         {
@@ -8841,6 +8939,22 @@ where
                         typed,
                         &format!("session activation failed: {error}"),
                     );
+                    // P3-2 (v2.0.12 scan): the wildcard arm of
+                    // `classify_session_error` collapses genuinely
+                    // unknown future variants to `Unknown` — log the
+                    // unmapped variant itself, so the collapse is
+                    // visible in the connection log instead of
+                    // silent. (`Unknown` is only produced by that
+                    // wildcard arm, so this fires exactly when a
+                    // variant went unmapped.)
+                    if typed == ConnectionError::Unknown {
+                        state.push_connection_log(
+                            "ERROR",
+                            &format!(
+                                "unmapped SessionError variant collapsed to Unknown: {error:?}"
+                            ),
+                        );
+                    }
                     // Fail-closed: the gate stays exactly as it was
                     // (closed in production — never opened on a
                     // failed GET_CAPS).
@@ -10244,7 +10358,7 @@ mod tests {
             // consulted, and with the fallback wording.
             if *self.latched.lock().expect("latched lock poisoned") {
                 return Err(VJoyError::DriverNotFound(
-                    "HIDMaestro already failed once and the retry was used up — falling back to vJoy."
+                    "HIDMaestro already failed once and the retry was used up — re-select HIDMaestro in Output settings to try again."
                         .to_string(),
                 ));
             }
@@ -10489,9 +10603,11 @@ mod tests {
         // is delivered. (Hotfix v1.0.1: the enable now activates the
         // selected backend through the selector instead of only
         // `try_connect`-ing the NullSink, so the failure names the
-        // backend activation, not a bare connect.)
+        // backend activation, not a bare connect.) P1-1 (v2.0.12
+        // scan): the failed enable reports the toggle OFF — the
+        // flag is set only once an enable actually happens.
         let enabled = state.set_output_enabled(true);
-        assert_eq!(enabled.enabled, Some(true));
+        assert_eq!(enabled.enabled, Some(false));
         assert!(!enabled.connected);
         assert!(
             enabled.detail.contains("backend activation failed"),
@@ -10506,6 +10622,11 @@ mod tests {
         // Enable acquires the device and sends the last output (neutral).
         let enabled = state.set_output_enabled(true);
         assert!(enabled.connected);
+        // P1-1 (v2.0.12 scan): the successful enable reports the
+        // toggle ON — the flag is set only once an enable actually
+        // happens (the mirror of the failed-enable OFF assertions in
+        // `null_sink_state_reports_not_connected_and_not_sent`).
+        assert_eq!(enabled.enabled, Some(true));
         assert_eq!(sent.lock().expect("sent lock").len(), 1);
         assert_eq!(
             *sent.lock().expect("sent lock").last().unwrap(),
@@ -10775,6 +10896,14 @@ mod tests {
             !enabled.connected,
             "no backend is activated during the cooldown"
         );
+        // P1-1 (v2.0.12 scan): a refused enable reports the
+        // toggle OFF — the flag is set only once an enable
+        // actually happens.
+        assert_eq!(
+            enabled.enabled,
+            Some(false),
+            "a cooldown-refused enable must not report ON"
+        );
         assert!(
             enabled.detail.contains("retry in 30 s"),
             "the toggle is refused by the cooldown: {}",
@@ -11043,6 +11172,23 @@ mod tests {
         assert_eq!(status.install_error, None);
         assert_eq!(status.dll_path, None);
         assert_eq!(status.version, None, "version is never invented");
+    }
+
+    /// P3-9 (v2.0.12 scan): the last measured driver version is
+    /// reported (and survives a backend that measures nothing) —
+    /// the live read is covered by the `vJoy` backend's own test
+    /// (`vjoy_driver_version_is_measured_at_connect`); this pins
+    /// the cache half.
+    #[test]
+    fn vjoy_status_returns_last_measured_driver_version() {
+        let (state, _dir) = test_state();
+        assert_eq!(state.vjoy_status().version, None);
+        *lock(&state.last_vjoy_driver_version) = Some("2.2.2".to_string());
+        assert_eq!(
+            state.vjoy_status().version.as_deref(),
+            Some("2.2.2"),
+            "the cached measurement is reported"
+        );
     }
 
     #[test]

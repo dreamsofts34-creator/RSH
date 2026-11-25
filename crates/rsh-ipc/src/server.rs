@@ -838,6 +838,27 @@ mod tests {
         stub_server_with_events().0
     }
 
+    /// Assert an error response keeps its reason (CORE-2, v2.0.12
+    /// scan): the wire `code` carries the `code|detail` payload
+    /// (the UI parses exactly this shape — see `game_write_error`
+    /// / `capture_code_detail` in `rsh-ui`), and the message
+    /// carries it too. One line per site keeps the round-trip
+    /// tests under clippy's 100-line limit.
+    fn assert_error_keeps_reason(resp: &IpcResponse, reason: &str) {
+        assert!(!resp.ok, "resp: {resp:?}");
+        let error = resp.error.as_ref().expect("error body");
+        assert!(
+            error.code.contains(reason),
+            "error code must carry the reason: {}",
+            error.code
+        );
+        assert!(
+            error.message.contains(reason),
+            "error message must carry the reason: {}",
+            error.message
+        );
+    }
+
     /// The stub server plus its event sender, so tests can flood
     /// the broadcast channel (DS-17: the Lagged path).
     fn stub_server_with_events() -> (Arc<IpcServer>, broadcast::Sender<AppEvent>) {
@@ -1154,8 +1175,10 @@ mod tests {
         let resp = server
             .handle_line(r#"{"v":2,"id":13,"method":"set_tuning","params":{"module":"steering","deadzone":5.0,"curve":9.0,"minMv":0.0,"maxMv":3300.0,"smoothing":10.0}}"#)
             .expect("invalid set_tuning parses");
-        assert!(!resp.ok);
-        assert_eq!(resp.error.expect("error").code, "Unknown");
+        // CORE-2 (v2.0.12 scan): the error keeps the reason
+        // (`code|detail`), not a bare "Unknown" — same shape as the
+        // capture arms below.
+        assert_error_keeps_reason(&resp, "invalid tuning");
         // save_draft: saves, then the draft is clean (null status).
         let resp = server
             .handle_line(r#"{"v":2,"id":14,"method":"save_draft","params":{}}"#)
@@ -1215,13 +1238,14 @@ mod tests {
         let resp = server
             .handle_line(r#"{"v":2,"id":31,"method":"activate_profile","params":{"id":"x"}}"#)
             .expect("activate_profile parses");
-        assert!(!resp.ok);
-        assert_eq!(resp.error.expect("error").code, "Unknown");
+        // CORE-2 (v2.0.12 scan): the error keeps the reason
+        // (`code|detail`), not a bare "Unknown" — the profile arms
+        // below carry the same reason.
+        assert_error_keeps_reason(&resp, "profiles are not supported by this API");
         let resp = server
             .handle_line(r#"{"v":2,"id":32,"method":"create_profile","params":{"name":"New"}}"#)
             .expect("create_profile parses");
-        assert!(!resp.ok);
-        assert_eq!(resp.error.expect("error").code, "Unknown");
+        assert_error_keeps_reason(&resp, "profiles are not supported by this API");
         let resp = server
             .handle_line(r#"{"v":2,"id":33,"method":"duplicate_profile","params":{"id":"x"}}"#)
             .expect("duplicate_profile parses");
@@ -1243,8 +1267,10 @@ mod tests {
                 r#"{"v":2,"id":36,"method":"launch_game","params":{"id":"assetto_corsa"}}"#,
             )
             .expect("launch_game parses");
-        assert!(!resp.ok);
-        assert_eq!(resp.error.expect("error").code, "Unknown");
+        // CORE-2 (v2.0.12 scan): the launch failure keeps its
+        // reason (`code|detail`) — the UI's launch path parses
+        // exactly this shape instead of a generic link failure.
+        assert_error_keeps_reason(&resp, "games are not supported by this API");
         let resp = server
             .handle_line(r#"{"v":2,"id":37,"method":"stop_game","params":{"id":"assetto_corsa"}}"#)
             .expect("stop_game parses");
@@ -1256,8 +1282,9 @@ mod tests {
         let resp = server
             .handle_line(r#"{"v":2,"id":39,"method":"start_learn","params":{}}"#)
             .expect("start_learn parses");
-        assert!(!resp.ok);
-        assert_eq!(resp.error.expect("error").code, "Unknown");
+        // CORE-2 (v2.0.12 scan): the learn failure keeps its reason
+        // (`code|detail`), not a bare "Unknown".
+        assert_error_keeps_reason(&resp, "learn mode is not supported by this API");
         let resp = server
             .handle_line(r#"{"v":2,"id":40,"method":"cancel_learn","params":{}}"#)
             .expect("cancel_learn parses");
@@ -1297,7 +1324,9 @@ mod tests {
             .handle_line(r#"{"v":2,"id":21,"method":"set_autostart","params":{"enabled":true}}"#)
             .expect("set_autostart parses");
         assert!(!resp.ok);
-        assert_eq!(resp.error.expect("error").code, "Unknown");
+        // CORE-2 (v2.0.12 scan): the error keeps the reason
+        // (`code|detail`), not a bare "Unknown".
+        assert_error_keeps_reason(&resp, "autostart is not supported by this API");
         let resp = server
             .handle_line(r#"{"v":2,"id":22,"method":"firmware_version","params":{}}"#)
             .expect("firmware_version parses");
@@ -1336,7 +1365,9 @@ mod tests {
             .handle_line(r#"{"v":2,"id":25,"method":"backup_now","params":{}}"#)
             .expect("backup_now parses");
         assert!(!resp.ok);
-        assert_eq!(resp.error.expect("error").code, "Unknown");
+        // CORE-2 (v2.0.12 scan): the error keeps the reason
+        // (`code|detail`), not a bare "Unknown".
+        assert_error_keeps_reason(&resp, "backup is not supported by this API");
     }
 
     #[test]

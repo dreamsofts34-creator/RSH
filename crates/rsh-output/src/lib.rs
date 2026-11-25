@@ -76,6 +76,18 @@ pub trait IJoystickOutput: Send {
         self.try_connect()
     }
 
+    /// The vJoy driver version (`"2.2.2"` form) this backend
+    /// measured at connect, when this backend IS vJoy and has
+    /// connected. The default is [`None`] — only vJoy measures a
+    /// vJoy driver version (P3-9, v2.0.12 scan:
+    /// `vjoy_status().version` was always `None` because nothing
+    /// ever surfaced the measured version). The app core caches
+    /// the last measured value so the version survives a switch
+    /// away to another backend.
+    fn vjoy_driver_version(&self) -> Option<String> {
+        None
+    }
+
     /// Best-effort neutral send, then release the device. Never
     /// panics; calling it while disconnected is a no-op.
     fn disconnect(&mut self);

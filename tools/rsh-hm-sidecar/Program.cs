@@ -328,8 +328,15 @@ internal static class Program
                     throw new InvalidOperationException(
                         "[sidecar] bad-args: --token needs a value (the one-time loopback nonce)");
                 default:
+                    // P3-10 (v2.0.12 scan): name the POSITION, never
+                    // the value — a nonce passed as a bare argument
+                    // (no `--token`) would otherwise land in the
+                    // file log verbatim, breaking the "never logged
+                    // anywhere" rule for the one-time token (it is
+                    // single-use and dead by then, but the log must
+                    // not be the place a secret ever appears).
                     throw new InvalidOperationException(
-                        $"[sidecar] bad-args: unknown argument '{args[i]}' (only --connect-back 127.0.0.1:<port> and --token <nonce> are accepted)");
+                        $"[sidecar] bad-args: unknown argument at position {i} (only --connect-back 127.0.0.1:<port> and --token <nonce> are accepted; argument values are never logged)");
             }
         }
 
@@ -344,8 +351,11 @@ internal static class Program
                 System.Globalization.CultureInfo.InvariantCulture, out var port)
             || port < 1 || port > 65535)
         {
+            // P3-10 (v2.0.12 scan): do not echo the supplied value
+            // — a malformed launch could pass the nonce here, and
+            // argument values are never logged.
             throw new InvalidOperationException(
-                $"[sidecar] bad-args: --connect-back must be 127.0.0.1:<port> (1-65535), got '{value}'");
+                "[sidecar] bad-args: --connect-back must be 127.0.0.1:<port> (1-65535)");
         }
 
         return value;

@@ -1272,10 +1272,13 @@ async fn serve_ipc(
 const DAEMON_STATUS_FILE: &str = "daemon-status.json";
 
 /// Write `daemon-status.json` (M8/L8): `{"status": "fatal" |
-/// "running" | "degraded", "code": ..., "detail": ..., "pid": ...,
-/// "at_unix": ...}`. `degraded` (P1-4) is the manager-loop watchdog
+/// "running" | "degraded" | "info", "code": ..., "detail": ...,
+/// "pid": ..., "at_unix": ...}`. `degraded` (P1-4) is the manager-loop watchdog
 /// budget exhausting: the daemon keeps serving IPC/tray but the
-/// manager loop is dead. Atomic (temp file in the same directory,
+/// manager loop is dead. `info` (P3-5, v2.0.12 scan) is a
+/// non-fatal note — a second daemon exiting because the first is
+/// still starting — which readers must NOT treat as fatal (the UI
+/// only treats `status == "fatal"` as fatal). Atomic (temp file in the same directory,
 /// then rename). Best effort — a failure is swallowed, never fatal: the
 /// dual-location fatal log is the other channel, and a status
 /// write must never mask the fatal exit itself.
@@ -1811,20 +1814,29 @@ fn main() {
                     std::process::exit(1);
                 }
                 single_instance::AlreadyRunningVerdict::Starting => {
-                    // No fatal status: the first daemon is still
+                    // No FATAL status: the first daemon is still
                     // starting (its IPC endpoint never appeared in
                     // ~10 s). Exiting 1 without writing `DaemonHung`,
                     // so the UI does not latch a false fatal for a
                     // daemon that is still coming up — the first
                     // daemon will either answer or leave its own
-                    // trace.
-                    log_line(
-                        verbose,
-                        &format!(
-                            "daemon: already running (pid {pid:?}) but its IPC endpoint never appeared after {} tries — the first daemon is still starting; not declaring it hung, not taking over",
-                            single_instance::PING_ATTEMPTS
-                        ),
+                    // trace. P3-5 (v2.0.12 scan): the exit used to
+                    // be silent (UI-spawned daemons dying ~11 s
+                    // after spawn left no trace — the UI spawn path
+                    // discards stdio), so write a NON-FATAL `info`
+                    // status instead: the UI only treats
+                    // `status == "fatal"` as fatal
+                    // (`read_daemon_status` / `fresh_fatal_daemon_status`),
+                    // so this can never latch a false fatal — but a
+                    // user-PC repro now has a timestamped, PID-named
+                    // record of the duplicate-spawn exit in
+                    // `daemon-status.json`.
+                    let detail = format!(
+                        "already running (pid {pid:?}) but its IPC endpoint never appeared after {} tries — the first daemon is still starting; not declaring it hung, not taking over (second-instance exit)",
+                        single_instance::PING_ATTEMPTS
                     );
+                    write_daemon_status(&data_dir, "info", "SecondInstanceStarting", &detail);
+                    log_line(verbose, &format!("daemon: {detail}"));
                     std::process::exit(1);
                 }
             }
@@ -3334,6 +3346,29 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).expect("status is valid JSON");
         assert_eq!(value["status"], "degraded");
         assert_eq!(value["code"], "ManagerLoopHung");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P3-5 (v2.0.12 scan): the second-instance `Starting` exit
+    /// writes a non-fatal `info` status (same writer, same shape)
+    /// so the ~11 s duplicate-spawn death leaves a trace — and the
+    /// vocabulary is exactly what the UI's fatal reader ignores
+    /// (`status == "fatal"` only).
+    #[test]
+    fn daemon_status_info_round_trip() {
+        let dir = temp_dir("status-info");
+        write_daemon_status(
+            &dir,
+            "info",
+            "SecondInstanceStarting",
+            "already running (pid 1234) but its IPC endpoint never appeared — second-instance exit",
+        );
+        let path = dir.join(DAEMON_STATUS_FILE);
+        assert!(path.is_file(), "the info status file is written");
+        let text = std::fs::read_to_string(&path).expect("read status");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("status is valid JSON");
+        assert_eq!(value["status"], "info");
+        assert_eq!(value["code"], "SecondInstanceStarting");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

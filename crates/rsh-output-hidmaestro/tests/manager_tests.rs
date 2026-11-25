@@ -187,8 +187,16 @@ fn silent_sidecar_hello_times_out() {
     let mut cfg = config(&[("HM_STUB_SILENT", "1")]);
     cfg.spawn_timeout = Duration::from_millis(200);
     let mut m = SidecarManager::new(cfg);
-    let err = m.connect().unwrap_err();
-    assert!(matches!(err, HidMaestroError::HelloTimeout));
+    // P1-1 (v2.0.12 scan): the timeout carries the enriched
+    // diagnostic (bound + elapsed ms), not the bare unit variant.
+    let HidMaestroError::HelloTimeout(detail) = m.connect().unwrap_err() else {
+        panic!("expected HelloTimeout");
+    };
+    assert!(
+        detail.contains("did not answer hello within"),
+        "detail: {detail}"
+    );
+    assert!(detail.contains("after spawn"), "detail: {detail}");
     m.shutdown(); // kills the lingering silent stub
 }
 
