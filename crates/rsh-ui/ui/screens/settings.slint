@@ -167,23 +167,28 @@ export component SettingsScreen inherits VerticalLayout {
         vertical-stretch: 1;
             HorizontalLayout {
                 spacing: 0px;
-                // Equal columns: `min-width: 342px` each
-                // ((736 - 40 pad - 12 gap) / 2 = 342 at 920px, with
-                // the 20px PageScaffold side padding — P2's 338px
-                // assumed its 24px pad-page token, which the
-                // scaffold does not use; the gate audits 342px).
-                // staging formula sized them from the ScrollView's
-                // visible-width, but that feeds back into the page's
-                // own preferred width here and the columns came out
-                // ~357px, overflowing the right edge to x=915.
+                // Equal columns: `min-width: 322px` each — P1-6:
+                // (656 - 12 gap) / 2 = 322 at the 880px minimum
+                // window ((880 - 184 sidebar - 40 page pad) = 656
+                // content). At the 920px design width the columns
+                // still stretch to 342px ((736 - 40 - 12) / 2), so
+                // the design-width maths — and the gate's 342px
+                // audit — are unchanged; 322 is only the floor
+                // two-across needs at the minimum width.
+                // (P2's 338px assumed its 24px pad-page token,
+                // which the scaffold does not use.) Staging formula
+                // sized them from the ScrollView's visible-width,
+                // but that feeds back into the page's own preferred
+                // width here and the columns came out ~357px,
+                // overflowing the right edge to x=915.
                 // CARDS-LAYOUT-RESEARCH §2: min-width (not `width`)
                 // + stretch 1 so the columns GROW with the window
-                // instead of sitting left-aligned at 342px; the gap
+                // instead of sitting left-aligned at 322px; the gap
                 // is a spacer Rectangle (min-width 12px, stretch
                 // 0.05) that scales with the window.
                 // ---- left column
                 VerticalLayout {
-                    min-width: 342px;
+                    min-width: 322px;
                     horizontal-stretch: 1;
                     spacing: 12px;
                     SectionHeader { text: "CONNECTION"; }
@@ -437,7 +442,7 @@ export component SettingsScreen inherits VerticalLayout {
                 Rectangle { min-width: 12px; horizontal-stretch: 0.05; }
                 // ---- right column
                 VerticalLayout {
-                    min-width: 342px;
+                    min-width: 322px;
                     horizontal-stretch: 1;
                     spacing: 12px;
                     SectionHeader { text: "PROFILES"; }

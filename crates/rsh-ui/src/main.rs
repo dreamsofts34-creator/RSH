@@ -1173,6 +1173,9 @@ const SETUP_STEP_DEBOUNCE: Duration = Duration::from_millis(300);
 /// the 1 Hz tick clears it (requested: every error hides after ~1 s;
 /// the tick granularity makes the real range 1–2 s).
 const STATUS_ERROR_LIFETIME: Duration = Duration::from_secs(1);
+/// How long an informational message stays (P1-3: info + success
+/// both live 4 s — long enough to read, unlike the 1 s error flash).
+const STATUS_INFO_LIFETIME: Duration = Duration::from_secs(4);
 
 /// F12 (v2.0.3): a death within this long after a reconnect belongs
 /// to the same flapping burst — its down-notify is collapsed into
@@ -3316,22 +3319,27 @@ impl Ctx {
         }
     }
 
-    /// Show a typed error gracefully (B6): the title is the plain
-    /// headline, the body is what happened + the next step — never a
-    /// raw code or stack trace. The daemon maps untyped state errors
-    /// to `Unknown` with the real message in `detail`, so a generic
-    /// "Something went wrong." is replaced by that detail, and an
-    /// "Unknown" title by a plain one.
+    /// The (title, body) pair [`Self::notify_error`] shows for a
+    /// `UserError` — the title is the plain headline, the body is
+    /// what happened + the next step, never a raw code or stack
+    /// trace. The daemon maps untyped state errors to `Unknown`
+    /// with the real message in `detail`, so a generic "Something
+    /// went wrong." is replaced by that detail, and an "Unknown"
+    /// title by a plain one.
     ///
     /// R3-D-15: the title is now a human headline, so the
     /// generic-error check keys on `code`, not `title` (the old
     /// `title == "Unknown"` check could never fire once the title
     /// stopped being the raw code).
-    fn notify_error(&self, win: &MainWindow, kind: &str, err: &UserError) {
+    ///
+    /// Shared with the game dialog's inline error (P1-7), so the
+    /// dialog shows exactly the text the status bar + drawer show,
+    /// never a second wording.
+    fn error_title_body(err: &UserError) -> (String, String) {
         let title = if err.code == "Unknown" {
-            "Couldn't complete that"
+            "Couldn't complete that".to_string()
         } else {
-            err.title.as_str()
+            err.title.clone()
         };
         let happened = match (&err.detail, err.what_happened.as_str()) {
             (Some(detail), "Something went wrong.") => detail.clone(),
@@ -3350,12 +3358,20 @@ impl Ctx {
         } else {
             format!("{happened} {}", err.what_to_do)
         };
-        self.notify(win, kind, title, &body);
+        (title, body)
+    }
+
+    /// Show a typed error gracefully (B6): drawer entry + the
+    /// transient status-bar message (see [`Self::error_title_body`]
+    /// for the title/body wording).
+    fn notify_error(&self, win: &MainWindow, kind: &str, err: &UserError) {
+        let (title, body) = Self::error_title_body(err);
+        self.notify(win, kind, &title, &body);
         // B01 (was DS-24): the failure also surfaces in place, as
         // a transient status-bar message on the current screen — a
         // user who never opens the bell drawer still sees that an
         // action failed.
-        self.set_toast(win, title, &body);
+        self.set_toast(win, &title, &body);
     }
 
     // D17: `notify_error_urgent` is DELETED — no failure ever
@@ -3378,16 +3394,20 @@ impl Ctx {
     /// results — "RSH isn't running", "Admin permission needed",
     /// "Game refused", timeouts. Same status-bar-only rule as
     /// [`Self::notify_error`]: the drawer never auto-opens.
+    /// P1-3: informational, NOT an error — it renders with the
+    /// neutral "info" kind (panel background, plain title, no red),
+    /// never the red error paint `set_toast` gives failures.
     fn notify_toast(&self, win: &MainWindow, kind: &str, title: &str, body: &str) {
         self.notify(win, kind, title, body);
-        self.set_toast(win, title, body);
+        self.set_toast_info(win, title, body);
     }
 
     /// Show a failure in the bottom `StatusBar` (B01, was the DS-24
-    /// toast): title + body on the current screen for 8 s, then
-    /// the 1 Hz tick clears it. Skipped while the window is hidden
-    /// (F27: no property writes on a hidden window) — the
-    /// notification itself is still stored and synced on reopen.
+    /// toast): title + body on the current screen for 1 s (see
+    /// `STATUS_ERROR_LIFETIME`), then the 1 Hz tick clears it.
+    /// Skipped while the window is hidden (F27: no property writes
+    /// on a hidden window) — the notification itself is still stored
+    /// and synced on reopen.
     /// FULL text, never truncated: the bar elides the one line
     /// visually (H4: the drawer carries the same full text). A
     /// status already showing means this message supersedes it:
@@ -3411,8 +3431,30 @@ impl Ctx {
             .set(Some(Instant::now() + STATUS_ERROR_LIFETIME));
     }
 
+    /// Show an informational message in the bottom `StatusBar`
+    /// (P1-3): same shape as [`Self::set_toast_success`] — neutral
+    /// "info" kind (panel background, plain title, no icon), never
+    /// the red error paint. Lives 4 s (`STATUS_INFO_LIFETIME`).
+    fn set_toast_info(&self, win: &MainWindow, title: &str, body: &str) {
+        if self.hidden.load(Ordering::SeqCst) {
+            return;
+        }
+        let more = if self.status_until.get().is_some() {
+            win.get_status_more() + 1
+        } else {
+            0
+        };
+        win.set_status_kind("info".into());
+        win.set_status_title(title.into());
+        win.set_status_text(body.into());
+        win.set_status_more(more);
+        ui_log!("RSH-UI status shown (info): {title} — {body}");
+        self.status_until
+            .set(Some(Instant::now() + STATUS_INFO_LIFETIME));
+    }
+
     /// Show a success in the bottom `StatusBar` (B01, was the D17
-    /// toast): same 8 s / 4 s rule as [`Self::set_toast`] — success
+    /// toast): same 1 s / 4 s rule as [`Self::set_toast`] — success
     /// lives 4 s. Same full text, same +N counter.
     fn set_toast_success(&self, win: &MainWindow, title: &str, body: &str) {
         if self.hidden.load(Ordering::SeqCst) {
@@ -3433,9 +3475,9 @@ impl Ctx {
     }
 
     /// Clear an expired status-bar message (B01, was the DS-24
-    /// toast, 1 Hz): the error lives 8 s / success 4 s from the
-    /// last message, then vanishes — a newer message re-arms the
-    /// deadline via [`Self::set_toast`].
+    /// toast, 1 Hz): the error lives 1 s / info + success 4 s from
+    /// the last message, then vanishes — a newer message re-arms
+    /// the deadline via [`Self::set_toast`].
     fn check_status_expiry(&self, win: &MainWindow) {
         let Some(until) = self.status_until.get() else {
             return;
@@ -7122,6 +7164,9 @@ impl Ctx {
         win.set_game_dialog_title(title.into());
         win.set_game_dialog_name(name.into());
         win.set_game_dialog_exe("".into());
+        // P1-7: a previous save error never survives into a fresh
+        // dialog — the inline error starts empty every open.
+        win.set_game_dialog_error("".into());
         win.set_game_dialog_profile_name(
             self.game_dialog_profile_label(profile_id.as_ref()).into(),
         );
@@ -7215,7 +7260,17 @@ impl Ctx {
     fn save_game_dialog(&self, win: &MainWindow, name: &str, exe: &str) {
         let name = name.trim().to_string();
         let exe = exe.trim().to_string();
+        // P1-7: a new save attempt clears the previous inline
+        // error first — a stale reason must never sit under a
+        // fresh attempt.
+        win.set_game_dialog_error("".into());
         if name.is_empty() || exe.is_empty() {
+            // P1-7: the validation refusal is inline too — the
+            // dialog stays open, so the reason belongs in it, not
+            // only in the 1 s status bar.
+            win.set_game_dialog_error(
+                "Choose the game's file with Browse, and enter a name.".into(),
+            );
             self.notify_error(
                 win,
                 "Game",
@@ -7267,7 +7322,17 @@ impl Ctx {
                             &body,
                         );
                     }
-                    Err(e) => ctx.notify_error(w, "Game", &e),
+                    Err(e) => {
+                        // P1-7: the daemon's error, inline in the
+                        // dialog — the same wording the status bar +
+                        // drawer show (see `error_title_body`). The
+                        // dialog stays open on failure; without this
+                        // the failed save looked inert after the 1 s
+                        // status message expired.
+                        let (_title, body) = Ctx::error_title_body(&e);
+                        w.set_game_dialog_error(body.into());
+                        ctx.notify_error(w, "Game", &e);
+                    }
                 }
             },
         );
@@ -15075,7 +15140,8 @@ mod tests {
 
     // D17 (was DS-24): a failure shows in the status bar and NEVER
     // opens the drawer — the drawer opens only on bell click. The
-    // error lives 8 s, then the 1 Hz expiry clears it. A success
+    // error lives 1 s, then the 1 Hz expiry clears it (P3-1: the
+    // old "8 s" here was stale — the code is 1 s). A success
     // shows the same way, with the ok-accent kind.
     #[test]
     fn d17_failure_status_never_opens_drawer() {
@@ -15109,7 +15175,7 @@ mod tests {
         ctx.check_status_expiry(&win);
         assert_ne!(win.get_status_text().as_str(), "");
 
-        // Past the 8 s deadline: the expiry clears it (and the kind
+        // Past the 1 s deadline: the expiry clears it (and the kind
         // resets to error).
         ctx.status_until.set(Some(
             Instant::now()

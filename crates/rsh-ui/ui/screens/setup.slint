@@ -155,12 +155,14 @@ export component SetupWizard inherits Rectangle {
     property <string> step-lead: step == 0 ? "Join the wheel's Wi-Fi, or plug in a USB cable." : step == 1 ? "Games need a controller driver — vJoy is the default." : step == 2 ? "Centre the wheel and set the pedals, so the game gets true inputs." : "Add your racing games — pick the exe or shortcut for each game. RSH switches profile automatically when a game starts.";
 
     HorizontalLayout {
-        // Explicit 920px (not 100%): the wizard is a fixed-size
-        // 920x580 screen. (Layout note: the right column sizes to
-        // content here, so full-width elements carry explicit 584px
-        // widths — (920 - 264 - 2*36) — the same explicit-width
-        // pattern as the Pedals/Settings fixes.)
-        width: 920px;
+        // P1-6: 100% of the window, not an explicit 920px — at
+        // 1366x768 @150% the window is 880px wide and a 920px
+        // wizard clipped 40px off the right edge. The right column
+        // sizes to content here, so full-width elements still carry
+        // explicit 584px widths ((920 - 264 - 2*36) — the same
+        // explicit-width pattern as the Pedals/Settings fixes);
+        // at 880px the column is 616px, so the 584px widths fit.
+        width: 100%;
         height: 100%;
         // Left column: logo + steps + Skip (preview: 264px).
         Rectangle {
@@ -254,6 +256,16 @@ export component SetupWizard inherits Rectangle {
             Rectangle { height: 4px; }
             Text { text: step-lead; font-size: Theme.fs-label; color: Theme.mute; }
 
+            // P1-6: the step area scrolls when the window is short
+            // (1366x768 @150% = 480px tall — Calibrate with its
+            // pedal graphs needs ~518px). The ScrollView takes the
+            // column's slack (it replaces the stretch spacer below),
+            // so at the 580px design height the content fits, no
+            // scrollbar appears, and the footer stays at the bottom.
+            step-scroll := ScrollView {
+                vertical-stretch: 1;
+                content-width: self.visible-width;
+                VerticalLayout {
             // ---- Step 0: Connect ----
             // (horizontal-stretch: the right column is 656px wide, but
             // a VerticalLayout child takes its preferred width unless
@@ -475,8 +487,9 @@ export component SetupWizard inherits Rectangle {
                 }
                 Text { text: "RSH switches profile automatically when a game starts."; font-size: Theme.fs-label; color: Theme.mute; }
             }
+                }
+            }
 
-            Rectangle { vertical-stretch: 1; }
             // Footer: Back / Next. Next is gated: Connect only
             // completes when the board is reachable (HELLO or
             // better — never on Active/pairing).
