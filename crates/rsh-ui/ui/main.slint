@@ -40,13 +40,19 @@ export component MainWindow inherits Window {
     icon: @image-url("../assets/tray.png");
     preferred-width: Theme.window-width;
     preferred-height: Theme.window-height;
-    // min-width MUST equal the design width (920px). Slint opens the window
-    // at the content's preferred size clamped to [min-width, preferred-width],
-    // so min-width 840px opened narrow pages at 840px (audit FIX-1: Extras/
-    // Settings windows measured 839px, right edge clipped). The window can
-    // still be enlarged; it just never opens (or shrinks) below the design.
-    min-width: 920px;
-    min-height: 580px;
+    // P1-6: the minimums fit 1366x768 @150% (910x512 logical,
+    // ~910x480 work area with the taskbar) — the window opens at
+    // the 920x580 preferred size wherever it fits and can shrink
+    // to 880x480 where it does not. The old 920x580 minimums made
+    // the window taller/wider than the screen at 150% scaling, so
+    // it could never fit. Every page already scrolls vertically
+    // (PageScaffold) and the wizard step area scrolls too, so the
+    // shorter height only scrolls — nothing clips. The 920x580
+    // layout maths are unchanged (preferred size + column widths
+    // below are the same); the 342px card floors drop to 322px so
+    // two-across cards fit the 656px content width at 880px.
+    min-width: 880px;
+    min-height: 480px;
     background: Theme.bg;
     // A8 (v2.0.2): the window theme drives the global tokens — the
     // whole UI repaints when it changes. `theme` is the RESOLVED
@@ -118,15 +124,20 @@ export component MainWindow inherits Window {
     in property <string> daemon-error: "";
     // B01 (v2.0.8 retest): the bottom StatusBar replaces the
     // floating toast (DS-24, deleted) — every `notify_error` /
-    // `notify_success` / `notify_toast` surfaces here for 8 s
-    // (error) / 4 s (success), so a failure is visible on the
-    // current screen without opening the bell drawer. `in-out`
+    // `notify_success` / `notify_toast` surfaces here, so a failure
+    // is visible on the current screen without opening the bell
+    // drawer. Lifetimes (Rust `set_toast*`): error 1 s, info and
+    // success 4 s — P3-1: the old "8 s" here was stale, the code
+    // has been 1 s since STATUS_ERROR_LIFETIME landed. `in-out`
     // so Rust drives it and the bar's own dismiss / Details callbacks
     // clear it / open the drawer; Rust clears it on expiry
     // (1 Hz tick). Empty `status-kind` = hidden (unless a job
     // is busy). FULL text, never truncated: the bar elides the
     // one line visually and the whole message lives in the drawer.
-    in-out property <string> status-kind: ""; // "", "error", "success"
+    // P1-3: kinds are "", "error", "success", "info" — info is the
+    // neutral kind for `notify_toast` (panel background, plain
+    // title, no icon), never the red error paint.
+    in-out property <string> status-kind: ""; // "", "error", "success", "info"
     in-out property <string> status-title: "";
     in-out property <string> status-text: "";
     // Superseded-message counter: a new message replaces the
@@ -361,6 +372,10 @@ export component MainWindow inherits Window {
     in-out property <string> game-dialog-name: "";
     in-out property <string> game-dialog-exe: "";
     in property <string> game-dialog-profile-name: "No profile";
+    // P1-7: the last game-dialog save error, shown inline in the
+    // dialog ("" = none) — set from Rust on a failed save, cleared
+    // when the dialog opens or a new save starts.
+    in property <string> game-dialog-error: "";
     in property <[ProfileItem]> popover-presets;
     in property <[ProfileItem]> popover-profiles;
     in property <bool> popover-show-prompt: false;
@@ -682,7 +697,7 @@ export component MainWindow inherits Window {
         }
         VerticalLayout {
             // The column must fill the window (920px) minus the 184px
-            // sidebar: min-width 736px. Without it the column takes the
+            // sidebar: 736px at design width. Without it the column takes the
             // current page's preferred width (Slint 1.18.1: the root
             // layout sizes to content, horizontal-stretch: 1 only shares
             // space the layout already has) — measured before this fix:
@@ -690,10 +705,13 @@ export component MainWindow inherits Window {
             // so the top-bar divider and Save ended short of the right
             // edge on every narrow page. A "width: parent.width - 184px"
             // binding was tried by Phase 3 and reverted (binding loop);
-            // a constant min-width has no cycle: the window itself is
-            // pinned to 920px by min-width = preferred-width, so the
-            // column can never ask for more than the window gives.
-            min-width: 736px;
+            // a constant min-width has no cycle. P1-6: the floor is
+            // 696px (880px minimum window - 184px sidebar), not 736px —
+            // at 880px a 736px floor would overflow the window by 40px
+            // and clip the right edge. At the 920px design width the
+            // layout still gives the column the full 736px, so the
+            // design-width maths are unchanged.
+            min-width: 696px;
             horizontal-stretch: 1;
             // B06: permanent 40px empty reserve at the bottom of
             // the content column — the StatusBar sits over this
@@ -1209,7 +1227,12 @@ export component MainWindow inherits Window {
     // backdrop + full-window TouchArea behind EACH overlay. The
     // backdrop is painted before the overlay (so it sits behind
     // it) and closes only that overlay; clicks on the overlay
-    // itself never reach the backdrop. No popup in this window
+    // itself never reach the backdrop — P2-5: each overlay root
+    // (popover, drawers, confirm card, Modal card) carries a
+    // blocking TouchArea as its first child, because a plain
+    // Rectangle background does NOT consume clicks in Slint and
+    // interior background clicks used to fall through to the
+    // backdrop and dismiss the overlay. No popup in this window
     // closes only via its own toggle button any more.
     if popover-open : Rectangle {
         x: 0px; y: 0px; width: parent.width; height: parent.height;
@@ -1253,6 +1276,9 @@ export component MainWindow inherits Window {
         name <=> game-dialog-name;
         exe <=> game-dialog-exe;
         profile-name: game-dialog-profile-name;
+        // P1-7 / P2-4: the save error + the running job kind.
+        error-text: game-dialog-error;
+        busy-kind: busy-kind;
         save(n, e) => { game-dialog-save(n, e); }
         cancel => { game-dialog-cancel(); }
         browse => { game-dialog-browse(); }
@@ -1289,6 +1315,12 @@ export component MainWindow inherits Window {
         drop-shadow-blur: Theme.shadow-blur;
         drop-shadow-offset-y: Theme.shadow-offset-y;
         drop-shadow-color: Theme.shadow-color;
+        // P2-5: a blocking TouchArea over the whole card, FIRST so
+        // the content paints above it — clicks on card background
+        // stop here instead of falling through to the backdrop
+        // TouchArea above (which cancelled the confirm). Same
+        // pattern as the Modal card (P1-2).
+        TouchArea { width: 100%; height: 100%; }
         confirm-layout := VerticalLayout {
             padding-top: 12px; padding-bottom: 12px; padding-left: 12px; padding-right: 12px;
             spacing: 10px;
@@ -1367,15 +1399,16 @@ export component MainWindow inherits Window {
     }
     // B01 (v2.0.8 retest): ONE bottom StatusBar replaces the
     // floating toast (DS-24, deleted) and the separate busy strip
-    // (B5, merged in) — busy + error + success share this single
-    // 40 px bar, so a message never covers content, a dialog or a
-    // banner. Priority: Error > Busy > Success — an error paints
+    // (B5, merged in) — busy + error + success + info share this
+    // single 40 px bar, so a message never covers content, a dialog
+    // or a banner. Priority: Error > Busy > Success — an error paints
     // the bar err-bg with its title + one elided line; a busy job
     // still shows its spinner + a small label at the left. One
     // message at a time: a new message replaces the old one and
     // `status-more` counts the superseded ones (+N); the full text
     // lives in the notifications drawer (Details opens it). Error
-    // 8 s / success 4 s (Rust `set_toast*`); the dismiss button dismisses
+    // 1 s / info + success 4 s (Rust `set_toast*` — P3-1: the old
+    // "8 s" here was stale); the dismiss button dismisses
     // early. The content column keeps a permanent 40 px reserve
     // below the page (padding-bottom above), so the bar only ever
     // covers empty space. It is a direct child of the root
@@ -1449,7 +1482,9 @@ export component MainWindow inherits Window {
                 text: status-title;
                 font-size: Theme.fs-label;
                 font-weight: 600;
-                color: status-kind == "error" ? Theme.bad : Theme.ok;
+                // P1-3: info titles stay plain text — only errors
+                // go red and only successes go green.
+                color: status-kind == "error" ? Theme.bad : status-kind == "success" ? Theme.ok : Theme.text;
                 overflow: elide;
             }
             if status-kind != "" : Text {

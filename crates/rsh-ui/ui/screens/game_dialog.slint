@@ -25,6 +25,15 @@ export component GameDialog inherits Modal {
     in-out property <string> name: "";
     in-out property <string> exe: "";
     in property <string> profile-name: "No profile";
+    // P1-7: the daemon's save error, shown inline in the dialog
+    // ("" = no error). A failed save used to surface only as a 1 s
+    // StatusBar message while the dialog stayed open looking inert.
+    in property <string> error-text: "";
+    // P2-4: which job kind is running (JobKind::order, -1 = idle)
+    // — Save disables + dims while its GameOp job (13) runs, like
+    // the Overview / wizard Add buttons, so a double-click cannot
+    // start a second save (run_generic_job silently ignores it).
+    in property <int> busy-kind: -1;
     callback save(string, string);
     callback cancel();
     callback browse();
@@ -56,7 +65,7 @@ export component GameDialog inherits Modal {
                 font-weight: 500;
                 color: Theme.text;
                 selection-background-color: Theme.accent;
-                accepted => { if (name != "" && exe != "") { save(name, exe); } }
+                accepted => { if (name != "" && exe != "" && busy-kind != 13) { save(name, exe); } }
             }
         }
         Text { text: "Game file (.exe or shortcut)"; font-size: Theme.fs-label; color: Theme.mute; }
@@ -89,9 +98,13 @@ export component GameDialog inherits Modal {
             Rectangle { horizontal-stretch: 1; }
             Btn { label: "Change"; clicked => { cycle-profile(); } }
         }
+        // P1-7: the save error, inline — the dialog stays open on
+        // failure, so the reason must be visible HERE, not only in
+        // the 1 s StatusBar message.
+        if error-text != "" : Text { text: error-text; font-size: Theme.fs-hint; color: Theme.bad; wrap: word-wrap; }
         HorizontalLayout { cross-axis-alignment: center;
             spacing: 6px;
-            Btn { label: "Save"; primary: true; icon: @image-url("../../assets/icons/save.svg"); has-icon: true; disabled: name == "" || exe == ""; clicked => { save(name, exe); } }
+            Btn { label: "Save"; primary: true; icon: @image-url("../../assets/icons/save.svg"); has-icon: true; disabled: name == "" || exe == "" || busy-kind == 13; clicked => { save(name, exe); } }
             Btn { label: "Cancel"; clicked => { cancel(); } }
         }
         Text { text: "RSH switches profile automatically when this game starts."; font-size: Theme.fs-hint; color: Theme.faint; wrap: word-wrap; }

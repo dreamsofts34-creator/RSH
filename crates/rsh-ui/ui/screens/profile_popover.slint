@@ -146,6 +146,12 @@ export component ProfilePopover inherits Card {
     // (fixed 300 px width, grows with the profile list), so binding
     // to it sizes the card to its content.
     height: layout.preferred-height;
+    // P2-5: a blocking TouchArea over the whole card, FIRST so the
+    // content paints above it — clicks on popover background stop
+    // here instead of falling through to the shell backdrop
+    // TouchArea below (which closed the popover). Same pattern as
+    // the Modal card (P1-2).
+    TouchArea { width: 100%; height: 100%; }
     // Esc is owned by the root keyboard scope (`keyboard-escape`
     // in src/main.rs) — Phase 2 (F-3) removed the zero-size
     // FocusScope here: it was never focused by Rust, so it could
