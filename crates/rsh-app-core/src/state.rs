@@ -3398,6 +3398,88 @@ impl AppStateCore {
         self.set_output_enabled_with_factories(enabled, &factories)
     }
 
+    /// Storm-guard refusal for the enable toggle (P1-5,
+    /// update4-fix): `Some(state)` when enabling output would
+    /// spawn a `HIDMaestro` sidecar while the cooldown is armed —
+    /// the refusal is recorded honestly and no backend is touched.
+    /// `None` when the toggle may proceed (no spawn would happen,
+    /// or the guard is not armed). Split out of
+    /// [`Self::set_output_enabled_with_factories`] so that function
+    /// stays under clippy's `too_many_lines` limit.
+    fn hid_switch_cooldown_refusal(&self) -> Option<CommandOutputState> {
+        // Enabling output spawns a sidecar exactly like an explicit
+        // switch when the live backend is a disconnected
+        // `HIDMaestro` (plain reconnect) or when the deferred
+        // activation would switch a persisted `HIDMaestro` in —
+        // so a toggle loop used to bypass the cooldown entirely. A
+        // connected backend is unaffected (enabling it only resends,
+        // never spawns), and a disconnected vJoy is unaffected too
+        // (its reconnect spawns nothing).
+        let live_kind = BackendKind::from_backend_name(&self.backend_name());
+        let enable_would_spawn_hidmaestro = !lock(&self.backend_handle()).is_connected()
+            && (live_kind == Some(BackendKind::HidMaestro)
+                || (live_kind == Some(BackendKind::None)
+                    && self.selected_backend() == BackendKind::HidMaestro));
+        if enable_would_spawn_hidmaestro && self.hid_switch_cooldown_active() {
+            self.record_send(
+                false,
+                format!("output enabled: {}", Self::HID_SWITCH_COOLDOWN_MESSAGE),
+            );
+            Some(self.output_state())
+        } else {
+            None
+        }
+    }
+
+    /// Deferred-activation half of
+    /// [`Self::set_output_enabled_with_factories`]: when output is
+    /// enabled while the [`NullSink`] is installed and a real
+    /// backend is selected, switch the selected backend in (the
+    /// user-initiated moment the deferred startup backend is
+    /// activated). Returns `Some(state)` when the activation
+    /// failed — the caller returns it at once, the [`NullSink`]
+    /// stays installed. Returns `None` when there was no deferred
+    /// activation to run, or it succeeded. Split out so the caller
+    /// stays under clippy's `too_many_lines` limit.
+    fn deferred_enable_activation(
+        &self,
+        factories: &BackendFactories,
+    ) -> Option<CommandOutputState> {
+        if BackendKind::from_backend_name(&self.backend_name()) == Some(BackendKind::None)
+            && self.selected_backend() != BackendKind::None
+        {
+            let requested = self.selected_backend();
+            // Deferred startup activation (automatic path): the
+            // fallback stays allowed here — enabling output is
+            // not an explicit backend switch (Bug 4/8 bans the
+            // fallback only for `set_output_backend`).
+            return match self.apply_backend_switch(requested, factories, true) {
+                Ok(outcome) => {
+                    // P1-5: a `HIDMaestro` activation that fell
+                    // back to vJoy still spent a failed sidecar
+                    // spawn — it counts toward the storm guard,
+                    // exactly like a failed explicit switch; a
+                    // clean activation resets the counter.
+                    if requested == BackendKind::HidMaestro {
+                        self.note_hid_switch_attempt(!outcome.fell_back);
+                    }
+                    None
+                }
+                Err(error) => {
+                    if requested == BackendKind::HidMaestro {
+                        self.note_hid_switch_attempt(false);
+                    }
+                    self.record_send(
+                        false,
+                        format!("output enabled: backend activation failed ({error})"),
+                    );
+                    Some(self.output_state())
+                }
+            };
+        }
+        None
+    }
+
     /// [`AppStateCore::set_output_enabled`] with injectable factories
     /// (the test seam: tests drive the deferred-activation path with
     /// mock backends here, the shell and settings paths use the real
@@ -3422,24 +3504,17 @@ impl AppStateCore {
     ) -> CommandOutputState {
         *lock(&self.output_enabled) = enabled;
         if enabled {
-            if BackendKind::from_backend_name(&self.backend_name()) == Some(BackendKind::None)
-                && self.selected_backend() != BackendKind::None
-            {
-                let requested = self.selected_backend();
-                // Deferred startup activation (automatic path): the
-                // fallback stays allowed here — enabling output is
-                // not an explicit backend switch (Bug 4/8 bans the
-                // fallback only for `set_output_backend`).
-                if let Err(error) = self.apply_backend_switch(requested, factories, true) {
-                    self.record_send(
-                        false,
-                        format!("output enabled: backend activation failed ({error})"),
-                    );
-                    return self.output_state();
-                }
+            // P1-5 (update4-fix): the storm guard covers the enable
+            // toggle too — see `hid_switch_cooldown_refusal`.
+            if let Some(refused) = self.hid_switch_cooldown_refusal() {
+                return refused;
             }
-            // R2-09: connect outside the backend lock (up to 60 s
-            // for HIDMaestro's sidecar spawn + UAC dwell). Take the
+            if let Some(failed) = self.deferred_enable_activation(factories) {
+                return failed;
+            }
+            // R2-09: connect outside the backend lock (up to 310 s
+            // for HIDMaestro's sidecar stages + UAC dwell, P1-1).
+            // Take the
             // backend out of the slot (a disconnected NullSink
             // stands in, so engine ticks keep flowing instead of
             // blocking on the mutex), connect + resend on the local
@@ -3473,9 +3548,17 @@ impl AppStateCore {
             // bound first — the scrutinee guard of a `match` would
             // still be held inside the arm and deadlock the resend
             // on the same handle.
+            // P1-5: the storm guard counts a `HIDMaestro` connect
+            // here too (a success resets it, a failure is a strike)
+            // — the plain reconnect below spawns a sidecar exactly
+            // like a switch, so it must not bypass the guard.
+            let backend_kind = BackendKind::from_backend_name(lock(&backend).name());
             let connected = lock(&backend).try_connect();
             match connected {
                 Ok(()) => {
+                    if backend_kind == Some(BackendKind::HidMaestro) {
+                        self.note_hid_switch_attempt(true);
+                    }
                     let last = *lock(&self.last_output);
                     match lock(&backend).update(&last) {
                         Ok(()) => {
@@ -3490,6 +3573,9 @@ impl AppStateCore {
                     }
                 }
                 Err(error) => {
+                    if backend_kind == Some(BackendKind::HidMaestro) {
+                        self.note_hid_switch_attempt(false);
+                    }
                     self.record_send(false, format!("output enabled: connect failed ({error})"));
                 }
             }
@@ -3547,8 +3633,16 @@ impl AppStateCore {
     /// split out so the no-sink-factory fallback can run it under
     /// the lock without duplicating the block).
     fn connect_and_resend(&self, backend: &mut Box<dyn IJoystickOutput>) -> CommandOutputState {
+        // P1-5: same storm-guard counting as the extracted path
+        // above (test-only path — the real factories always provide
+        // a sink — but a failing `HIDMaestro` connect here is still
+        // a spent sidecar spawn).
+        let kind = BackendKind::from_backend_name(backend.name());
         match backend.try_connect() {
             Ok(()) => {
+                if kind == Some(BackendKind::HidMaestro) {
+                    self.note_hid_switch_attempt(true);
+                }
                 let last = *lock(&self.last_output);
                 match backend.update(&last) {
                     Ok(()) => {
@@ -3560,6 +3654,9 @@ impl AppStateCore {
                 }
             }
             Err(error) => {
+                if kind == Some(BackendKind::HidMaestro) {
+                    self.note_hid_switch_attempt(false);
+                }
                 self.record_send(false, format!("output enabled: connect failed ({error})"));
             }
         }
@@ -3643,11 +3740,11 @@ impl AppStateCore {
         // another sidecar (the v2.0.10 retest fired 30 attempts in
         // ~4 minutes). Checked FIRST, before any latch is cleared or
         // any choice is persisted, so a refused attempt changes no
-        // state. Automatic paths never consult this.
-        if requested == BackendKind::HidMaestro
-            && let Some(until) = *lock(&self.hid_switch_cooldown_until)
-            && std::time::Instant::now() < until
-        {
+        // state. P1-5 (update4-fix): automatic paths consult the
+        // same guard inside `apply_backend_switch` / the enable
+        // toggle — only this FIRST check (before the persist)
+        // belongs to the explicit path.
+        if requested == BackendKind::HidMaestro && self.hid_switch_cooldown_active() {
             return Err(Self::HID_SWITCH_COOLDOWN_MESSAGE.to_string());
         }
         // R2-20: a backend switch re-probes the vJoy DLL on the next
@@ -3709,17 +3806,11 @@ impl AppStateCore {
         // for HIDMaestro only — a success resets it, a failure counts
         // toward the 3-strike cooldown. (vJoy / none switches never
         // touch it: only the elevated sidecar spawn can storm.)
+        // P1-5: shared with the enable toggle (see
+        // `note_hid_switch_attempt`) — the counting itself is the
+        // same from either entry point.
         if requested == BackendKind::HidMaestro {
-            if result.is_ok() {
-                self.hid_switch_failures.store(0, Ordering::SeqCst);
-            } else {
-                let failures = self.hid_switch_failures.fetch_add(1, Ordering::SeqCst) + 1;
-                if failures >= Self::HID_SWITCH_MAX_CONSECUTIVE_FAILURES {
-                    self.hid_switch_failures.store(0, Ordering::SeqCst);
-                    *lock(&self.hid_switch_cooldown_until) =
-                        Some(std::time::Instant::now() + Self::HID_SWITCH_COOLDOWN);
-                }
-            }
+            self.note_hid_switch_attempt(result.is_ok());
         }
         result
     }
@@ -3767,6 +3858,35 @@ impl AppStateCore {
     pub const HID_SWITCH_COOLDOWN_MESSAGE: &str =
         "HIDMaestro switch failed 3 times — retry in 30 s";
 
+    /// True while the storm guard refuses `HIDMaestro` switches
+    /// (P1-5, update4-fix): consulted by the explicit switch AND
+    /// every automatic path ([`Self::apply_backend_switch`],
+    /// [`Self::set_output_enabled_with_factories`]), so a toggle
+    /// or re-activation loop cannot bypass the cooldown.
+    fn hid_switch_cooldown_active(&self) -> bool {
+        lock(&self.hid_switch_cooldown_until).is_some_and(|until| std::time::Instant::now() < until)
+    }
+
+    /// Record one `HIDMaestro` switch attempt against the storm
+    /// guard (P1-5, update4-fix): shared by the explicit switch
+    /// and the enable toggle — a failed attempt counts toward the
+    /// 3-strike cooldown from EITHER entry point (a toggle loop
+    /// used to never arm the guard at all), and a success resets
+    /// the counter. Only ever called for `HIDMaestro` attempts
+    /// (vJoy / none never touch the guard).
+    fn note_hid_switch_attempt(&self, success: bool) {
+        if success {
+            self.hid_switch_failures.store(0, Ordering::SeqCst);
+        } else {
+            let failures = self.hid_switch_failures.fetch_add(1, Ordering::SeqCst) + 1;
+            if failures >= Self::HID_SWITCH_MAX_CONSECUTIVE_FAILURES {
+                self.hid_switch_failures.store(0, Ordering::SeqCst);
+                *lock(&self.hid_switch_cooldown_until) =
+                    Some(std::time::Instant::now() + Self::HID_SWITCH_COOLDOWN);
+            }
+        }
+    }
+
     /// UAC decline message (B-2/A10, v2.0.2): shown once when the user
     /// declines the `HIDMaestro` elevation prompt. The switch fails with
     /// this (no silent fallback to vJoy) and the decline latch blocks
@@ -3802,6 +3922,18 @@ impl AppStateCore {
         let _switch_guard = self.switch_in_flight.try_lock().map_err(|_| {
             "a backend switch is already in progress — wait for it to finish".to_string()
         })?;
+        // P1-5 (update4-fix): the storm guard is consulted on EVERY
+        // path into a `HIDMaestro` switch, not only the explicit
+        // selector path — an automatic re-attempt (deferred enable,
+        // mid-session re-activation) used to rebuild a fresh manager
+        // with a full retry budget while the guard was armed, so the
+        // 30-attempt storm could continue through the toggle. The
+        // explicit path still refuses first (before persisting) in
+        // `set_output_backend_with_factories`; this is the backstop
+        // for every other caller.
+        if requested == BackendKind::HidMaestro && self.hid_switch_cooldown_active() {
+            return Err(Self::HID_SWITCH_COOLDOWN_MESSAGE.to_string());
+        }
         // B-2/A10: the user declined the UAC prompt this session.
         // Fail fast with the NotAdmin message — no new prompt, no
         // silent fallback. Only an explicit re-select clears this
@@ -3827,15 +3959,24 @@ impl AppStateCore {
         // survives). `set_output_backend` calls `reset_fallback`
         // first, so by the time this runs the app-core flag is clear
         // too — both latches re-arm on one explicit re-select.
+        // P1-5 (update4-fix): the in-place re-arm is EXPLICIT ONLY
+        // (`!allow_fallback`). An automatic re-attempt must NOT
+        // clear the manager's 2-failure latch — a latched instance
+        // fails fast with `FallbackNeeded` and the automatic path
+        // falls back to vJoy, which IS the guard working. Clearing
+        // it on automatic re-attempts handed every retry a fresh
+        // budget and defeated the guard exactly like the old
+        // fresh-manager replacement did.
         let live = self.backend_handle();
         if requested != BackendKind::None
             && BackendKind::from_backend_name(&self.backend_name()) == Some(requested)
             && !lock(&live).is_connected()
+            && !allow_fallback
         {
             lock(&live).reset_fallback();
         }
-        // R2-09: the selector's connect (up to 60 s of sidecar
-        // spawn + UAC dwell for HIDMaestro) must NOT run under the
+        // R2-09: the selector's connect (up to 310 s of sidecar
+        // stages + UAC dwell for HIDMaestro, P1-1) must NOT run under the
         // backend lock — while it did, every engine tick blocked on
         // the mutex and output stopped entirely for as long as the
         // user took to answer UAC. Take the installed backend OUT of
@@ -3853,8 +3994,8 @@ impl AppStateCore {
                 std::mem::replace(&mut *slot, Arc::new(Mutex::new(placeholder)))
             };
             // The extracted handle is owned by this scope: the
-            // switch (up to 60 s of sidecar spawn + UAC dwell)
-            // runs on its own lock, never on the slot lock.
+            // switch (up to 310 s of sidecar stages + UAC dwell,
+            // P1-1) runs on its own lock, never on the slot lock.
             let mut current = lock(&handle);
             let outcome = switch_backend(&mut current, requested, factories, None, allow_fallback)
                 .map_err(|error| error.to_string());
@@ -10079,6 +10220,13 @@ mod tests {
         fn set_latched(&self, latched: bool) {
             *self.latched.lock().expect("latched lock poisoned") = latched;
         }
+
+        /// Whether the mock manager latch is set (P1-5, update4-fix:
+        /// the automatic-path test asserts the latch SURVIVES an
+        /// automatic re-attempt).
+        fn is_latched(&self) -> bool {
+            *self.latched.lock().expect("latched lock poisoned")
+        }
     }
 
     impl IJoystickOutput for RecordingBackend {
@@ -10600,6 +10748,118 @@ mod tests {
             .set_output_backend_with_factories("vJoy", &factories)
             .expect("vJoy switch is unaffected by the HIDMaestro cooldown");
         assert_eq!(switched.backend, "vJoy");
+    }
+
+    /// P1-5 (update4-fix): the enable toggle consults the storm
+    /// guard — after 3 failed explicit switches arm the cooldown,
+    /// enabling output with a persisted `HIDMaestro` choice is
+    /// refused with the cooldown message even though the sidecar
+    /// would now succeed, and no backend is activated.
+    #[test]
+    fn enable_toggle_consults_hidmaestro_switch_cooldown() {
+        let (factories, hm) = hidmaestro_mock_factories();
+        hm.set_fail_connect(true);
+        hm.set_fail_connect_message("HIDMaestro sidecar failed to start.");
+        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
+        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
+        for _ in 1..=3 {
+            let _ = state
+                .set_output_backend_with_factories("HIDMaestro", &factories)
+                .expect_err("failing HIDMaestro switch must error");
+        }
+        // The sidecar is fixed now — but the cooldown still holds.
+        hm.set_fail_connect(false);
+        let backend_before = state.backend_name();
+        let enabled = state.set_output_enabled_with_factories(true, &factories);
+        assert!(
+            !enabled.connected,
+            "no backend is activated during the cooldown"
+        );
+        assert!(
+            enabled.detail.contains("retry in 30 s"),
+            "the toggle is refused by the cooldown: {}",
+            enabled.detail
+        );
+        assert_eq!(
+            state.backend_name(),
+            backend_before,
+            "no backend is activated during the cooldown"
+        );
+    }
+
+    /// P1-5 (update4-fix): failed enable-toggle activations count
+    /// toward the storm guard too — 3 failing enables arm the
+    /// cooldown, and the 4th enable is refused without spawning
+    /// another sidecar. (Before this fix the toggle never counted,
+    /// so the guard could never arm from the toggle alone.)
+    #[test]
+    fn enable_toggle_failures_arm_the_cooldown() {
+        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
+        let factories = mock_factories(true, true);
+        for attempt in 1..=3 {
+            let enabled = state.set_output_enabled_with_factories(true, &factories);
+            assert!(!enabled.connected, "attempt {attempt} must not connect");
+            assert!(
+                enabled.detail.contains("backend activation failed"),
+                "attempt {attempt} reports the activation failure: {}",
+                enabled.detail
+            );
+            assert!(
+                !enabled.detail.contains("retry in 30 s"),
+                "attempt {attempt} is not yet refused: {}",
+                enabled.detail
+            );
+        }
+        let enabled = state.set_output_enabled_with_factories(true, &factories);
+        assert!(!enabled.connected, "4th enable must not connect");
+        assert!(
+            enabled.detail.contains("retry in 30 s"),
+            "4th enable is refused by the cooldown: {}",
+            enabled.detail
+        );
+    }
+
+    /// P1-5 (update4-fix): an AUTOMATIC re-attempt must NOT clear
+    /// the manager's 2-failure latch — the latched instance fails
+    /// fast with `FallbackNeeded`, the automatic path falls back to
+    /// vJoy, and the latch survives (only an explicit re-select
+    /// re-arms it in place; see
+    /// `reselect_disconnected_hidmaestro_rearms_latched_instance`).
+    #[test]
+    fn automatic_switch_does_not_clear_manager_latch() {
+        let (latched, _latched_sent, _latched_fail) = RecordingBackend::new_named("HIDMaestro");
+        latched.set_latched(true);
+        let live = latched.clone();
+        let dir = test_dir("latched-automatic");
+        let store = ProfileStore::open(&dir).expect("open test store");
+        let state = Arc::new(AppStateCore::new(
+            store,
+            Box::new(live),
+            "test latched backend",
+        ));
+        let factories = BackendFactories {
+            hidmaestro: Some(Box::new(|| {
+                let (backend, _, _) = RecordingBackend::new_named("HIDMaestro");
+                Box::new(backend) as Box<dyn IJoystickOutput>
+            })),
+            vjoy: Some(Box::new(|| {
+                let (backend, _, _) = RecordingBackend::new_named("vJoy");
+                Box::new(backend) as Box<dyn IJoystickOutput>
+            })),
+            none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
+        };
+        // Automatic path (allow_fallback: true): the latched
+        // instance must NOT be re-armed — it fails fast, the switch
+        // falls back to vJoy, and the latch is still set afterwards.
+        let outcome = state
+            .apply_backend_switch(BackendKind::HidMaestro, &factories, true)
+            .expect("automatic switch falls back to vJoy");
+        assert!(outcome.fell_back, "the latched backend falls back");
+        assert_eq!(outcome.active, BackendKind::VJoy);
+        assert!(
+            latched.is_latched(),
+            "the latch survives an automatic re-attempt"
+        );
     }
 
     /// P2 (v2.0.11): a same-kind re-select re-arms the INSTALLED

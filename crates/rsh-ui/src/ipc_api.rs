@@ -80,7 +80,7 @@ struct LiveCache {
     /// `link_dead`) until a poll round succeeded.
     consecutive_poll_failures: AtomicU32,
     /// DS-19: true while a long IPC call (e.g. `set_output_backend`,
-    /// 75 s) is in flight. The fast poller freezes its failure
+    /// 390 s) is in flight. The fast poller freezes its failure
     /// counter while this is set: the long call holds the
     /// single-flight IPC lock, so polls behind it time out and
     /// would otherwise trip the link spuriously.
@@ -399,7 +399,7 @@ impl LiveSeed {
 /// Live daemon API over IPC.
 pub struct IpcApi {
     client: Arc<IpcClient>,
-    /// R2-22: the long-call lane — `call_async_long` (the 75 s
+    /// R2-22: the long-call lane — `call_async_long` (the 390 s
     /// backend switch) runs here, so a UAC dwell can no longer
     /// stall the slow poller or a `set_tuning` job behind the
     /// main client's single-flight lock. Falls back to `client`
@@ -530,7 +530,7 @@ impl IpcApi {
             // the period (1 s, or 5 s once parked — item 3c) in
             // 50 ms steps and run early when a write asked for a
             // refresh. The poller runs on its OWN connection
-            // (R2-22): a 75 s backend switch on the job lane can
+            // (R2-22): a 390 s backend switch on the job lane can
             // no longer stall it, and a stalled slow cycle can no
             // longer delay a `set_tuning` job.
             let slow_cache = cache;
@@ -619,8 +619,9 @@ impl IpcApi {
     }
 
     /// [`call_async`] with an explicit bound (B-2, v2.0.2): the
-    /// backend switch waits out a UAC prompt + a 60 s sidecar spawn
-    /// (75 s), so the UI does not time out while the user is still
+    /// backend switch waits out a UAC prompt + the daemon stages
+    /// (390 s, P1-1 — see `set_output_backend` for the budget),
+    /// so the UI does not time out while the user is still
     /// answering the prompt. Same fail-fast on a proven-dead link.
     /// Runs on the long-call lane (R2-22), not the shared job
     /// client — the switch must not stall the slow poller or a
@@ -1743,12 +1744,32 @@ impl AppApi for IpcApi {
                     "set_output_backend",
                     serde_json::json!({"name": name}),
                     // B-2: the switch waits out the UAC prompt (the
-                    // user may take seconds to answer) + the 60 s
+                    // user may take seconds to answer) + the
                     // sidecar spawn — a 500 ms bound timed out while
                     // the prompt was still on screen, reverted the
-                    // toggle, and looped the prompt. 75 s covers the
-                    // 60 s spawn bound with margin.
-                    Duration::from_secs(75),
+                    // toggle, and looped the prompt. The old 75 s
+                    // bound covered the old 60 s spawn bound with
+                    // margin; P1-1 below supersedes both numbers.
+                    //
+                    // P1-1 (update4-fix): 390 s. The daemon worst
+                    // case is now bounded per stage in
+                    // `rsh-output-hidmaestro` (accept 30 s + hello
+                    // 30 s + install-driver 120 s + create 120 s +
+                    // first neutral 10 s = 310 s after the UAC
+                    // prompt is answered), plus a 60 s allowance
+                    // for the user to answer the prompt (370 s).
+                    // The IPC bound MUST exceed that, or a
+                    // slow-but-healthy switch is reported as
+                    // failed while the daemon keeps going (and may
+                    // still succeed). Invariant (see
+                    // `DEFAULT_SPAWN_TIMEOUT` in the hidmaestro
+                    // manager): job (420 s) > IPC (390 s) > worst
+                    // case incl. UAC (370 s) > worst case post-UAC
+                    // (310 s). Residual: the UAC dwell itself is
+                    // unbounded, so a user who takes longer than
+                    // 60 s to answer can still see a UI timeout
+                    // while the daemon continues.
+                    Duration::from_secs(390),
                 )
                 .await?;
             value
@@ -3833,7 +3854,7 @@ mod tests {
         /// generation bumps once per completed cycle).
         profiles_epoch: AtomicUsize,
         /// R2-22 test hook: `set_output_backend` sleeps this long
-        /// before delegating — a stand-in for the 75 s backend
+        /// before delegating — a stand-in for the 390 s backend
         /// switch (UAC prompt + sidecar spawn).
         backend_switch_delay: std::time::Duration,
     }
@@ -4185,7 +4206,7 @@ mod tests {
     }
 
     /// R2-22: the slow poller runs on its own connection — while
-    /// a 3 s backend switch (75 s bound, long-call lane) is in
+    /// a 3 s backend switch (390 s bound, long-call lane) is in
     /// flight, the slow poller still completes cycles on its own
     /// lane and the generation advances. Without the dedicated
     /// lanes the switch would hold the shared client's

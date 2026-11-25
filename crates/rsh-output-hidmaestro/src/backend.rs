@@ -285,7 +285,11 @@ impl HidMaestroOutput {
         }
 
         // Neutral first, so a game never sees a stale deflection.
-        self.send_neutral_inner()?;
+        // P2-2: the FIRST neutral after create gets the longer
+        // first-neutral bound (slow first driver I/O), not the
+        // 200 ms submit bound — a slow first neutral used to fail
+        // the whole switch after the device was created.
+        self.send_first_neutral_inner()?;
         self.connected = true;
         self.last_error = None;
         self.status = HidMaestroStatus {
@@ -361,6 +365,12 @@ impl HidMaestroOutput {
         // re-submitting a neutral frame — the sidecar owns the neutral
         // frame for its own submit path.
         self.manager.neutral(self.config.use_raw_report)
+    }
+
+    /// First neutral after `create` (P2-2): the longer
+    /// first-neutral bound, used only by the connect flow.
+    fn send_first_neutral_inner(&mut self) -> Result<(), HidMaestroError> {
+        self.manager.neutral_first(self.config.use_raw_report)
     }
 
     fn current_caps(&self) -> HidMaestroCapabilities {

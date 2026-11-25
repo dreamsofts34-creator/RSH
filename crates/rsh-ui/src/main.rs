@@ -967,7 +967,7 @@ enum JobKind {
     Reconnect,
     /// Transport switch (`connect`).
     Transport,
-    /// Output-backend switch (`set_output_backend`, up to 75 s while
+    /// Output-backend switch (`set_output_backend`, up to 390 s while
     /// the user answers UAC + the sidecar spawns).
     Backend,
     /// Firmware check (board vs bundled version).
@@ -1031,7 +1031,13 @@ impl JobKind {
             // 15 s bound (the seed is ~35 round-trips on a live
             // daemon; a dead one fails fast per call).
             JobKind::Reconnect | JobKind::ReconnectSeed => Duration::from_secs(15),
-            JobKind::Backend => Duration::from_secs(80),
+            // P1-1 (update4-fix): 420 s. Must exceed the 390 s
+            // backend-switch IPC bound (see `IpcApi::set_output_backend`),
+            // which itself must exceed the daemon worst case incl. a
+            // 60 s UAC allowance (370 s). Invariant: job (420 s) >
+            // IPC (390 s) > worst case incl. UAC (370 s) > worst
+            // case post-UAC (310 s).
+            JobKind::Backend => Duration::from_secs(420),
             // FirmwareUpdate is 10 s on purpose (A9); settings ops
             // share it — they can cross a UAC prompt (HIDMaestro
             // enable), the same bound the old callers tolerated,
@@ -4433,7 +4439,7 @@ impl Ctx {
     }
 
     /// Start an output-backend switch job (A9/B-2): `set_output_backend`
-    /// runs on a background thread with its 75 s bound (UAC dwell +
+    /// runs on a background thread with its 390 s bound (UAC dwell +
     /// 60 s sidecar spawn). Switching to `HIDMaestro` warns first —
     /// Windows will ask once for admin permission. A second switch
     /// while one is in flight is ignored (no re-spawn loop, A10).
@@ -4473,7 +4479,7 @@ impl Ctx {
         // time-based relabel to "Waiting for admin permission…"
         // would claim knowledge the UI does not have (it stayed
         // stuck on that label after the prompt was answered). The
-        // 75 s timeout already ends the job with a clear error.
+        // 420 s timeout already ends the job with a clear error.
         let api = self.api();
         self.run_job(
             win,
@@ -8749,7 +8755,7 @@ fn wire_setup_vjoy(win: &MainWindow, ctx: &Rc<Ctx>) {
         win.unwrap().on_setup_use_hidmaestro(move || {
             if let Some(w) = win.upgrade() {
                 // A9/B-2/A10: the shared backend-switch job (warn +
-                // 75 s bound); the wizard's fallback flag is set in
+                // 390 s bound); the wizard's fallback flag is set in
                 // the job drain on success.
                 ctx.start_backend_job(&w, 0);
             }
@@ -11428,7 +11434,7 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
                 return;
             };
             // A9/B-2/A10: the switch runs on a background job with
-            // its 75 s bound (UAC dwell + 60 s sidecar spawn) — the
+            // its 390 s bound (UAC dwell + daemon stages) — the
             // click returns immediately; a failure (including a UAC
             // decline) reverts the switch in the job drain.
             ctx.start_backend_job(&w, i);

@@ -18,6 +18,13 @@
 # sidecar file log (%PROGRAMDATA%\RSH\logs\rsh-sidecar-*.log)
 # exists with the 'hello sent' milestone (P0).
 #
+# update4-fix (P1-2 / P2-5): the stdio run now asserts exit code 0
+# (it never checked $p.ExitCode), the TCP run's exit path is
+# checked too (exit 0 after the socket closes), and the file-log
+# check asserts 'context ready=' as well as 'hello sent' — scoped
+# to TODAY's log file, deleted before the runs, with a fresh mtime,
+# so a stale log can never pass.
+#
 # The daemon-side negative test — a sidecar that connects and dies
 # before hello must report SidecarDied, never hang — lives in the
 # Rust suite (manager::tests::tcp_connect_then_die_before_hello_is_sidecar_died),
@@ -56,6 +63,12 @@ $errFile = Join-Path $tmp "stderr.txt"
 New-Item -ItemType File -Force -Path $emptyIn | Out-Null
 Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
 
+# P2-5: delete today's sidecar log BEFORE the runs, so the file-log
+# check below can only pass on a log this run wrote — a stale log
+# from an earlier day (or an earlier run) must never satisfy it.
+$todayLog = Join-Path "$env:ProgramData\RSH\logs" ("rsh-sidecar-{0}.log" -f (Get-Date -Format yyyyMMdd))
+Remove-Item $todayLog -Force -ErrorAction SilentlyContinue
+
 $p = Start-Process -FilePath (Resolve-Path $Exe).Path `
   -RedirectStandardInput $emptyIn -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
   -PassThru -NoNewWindow
@@ -91,6 +104,14 @@ if ($hello.dll_sha256_ok -ne $true) {
 }
 if ("$($hello.dll_sha256)".ToLower() -ne $ExpectedDllSha256) {
   Write-Error "Sidecar hello check: dll_sha256 is '$($hello.dll_sha256)', expected '$ExpectedDllSha256'."
+  exit 1
+}
+# P1-2: assert the stdio run's exit code too — the check used to
+# read the hello and never look at how the sidecar exited (stdin
+# EOF is a clean exit, so 0 is expected; a crash or a fast-exit 2
+# after a good hello must fail the check).
+if ($p.ExitCode -ne 0) {
+  Write-Error "Sidecar hello check: sidecar exited $($p.ExitCode) on the stdio run (expected 0)."
   exit 1
 }
 Write-Host "Sidecar hello OK (stdio): sdk $($hello.sdk), dll_sha256_ok $($hello.dll_sha256_ok), admin $($hello.admin), transport $($hello.transport), exit $($p.ExitCode)."
@@ -167,25 +188,50 @@ try {
 } finally {
   if ($null -ne $tcpClient) { $tcpClient.Close() }
   $listener.Stop()
-  if ($null -ne $p2) {
-    # Closing the socket is the sidecar's EOF: it disposes and exits.
-    if (-not $p2.WaitForExit(10000)) { $p2.Kill() }
-  }
   Remove-Item Env:\RSH_HM_SIDECAR_TOKEN -ErrorAction SilentlyContinue
 }
+# P1-2: the TCP run's exit path is checked too — closing the socket
+# is the sidecar's EOF, so it must exit 0 promptly, like the stdio
+# run. (The wait used to live in the finally above with no
+# exit-code assertion at all.)
+if ($null -ne $p2) {
+  if (-not $p2.WaitForExit(10000)) {
+    $p2.Kill()
+    Write-Error "Sidecar hello check (TCP): sidecar did not exit within 10 s after the socket closed."
+    exit 1
+  }
+  if ($p2.ExitCode -ne 0) {
+    Write-Error "Sidecar hello check (TCP): sidecar exited $($p2.ExitCode) (expected 0)."
+    exit 1
+  }
+}
 
-# --- Sidecar file log (v2.0.11, P0) --------------------------------------
-# Both runs above must have written the file log
+# --- Sidecar file log (v2.0.11, P0; P1-2/P2-5 update4-fix) --------
+# Both runs above must have written TODAY'S file log
 # (%PROGRAMDATA%\RSH\logs\rsh-sidecar-YYYYMMDD.log) with the hello
-# milestone — it is the only trace a pre-hello death leaves.
-$sidecarLogs = Get-ChildItem "$env:ProgramData\RSH\logs\rsh-sidecar-*.log" -ErrorAction SilentlyContinue
-if (-not $sidecarLogs) {
-  Write-Error "Sidecar hello check: no sidecar file log found at %PROGRAMDATA%\RSH\logs\rsh-sidecar-*.log (the sidecar must log to file as well as stderr)."
+# milestone AND the context milestone ("context ready=") — the
+# context line proves the sidecar got past hello into context
+# creation, which the old "hello sent"-only check did not. P2-5:
+# today's log was deleted before the runs (above), so this file can
+# only be from this run; the mtime is asserted fresh (last
+# 10 minutes) as well, so a stale file can never pass.
+$sidecarLog = Join-Path "$env:ProgramData\RSH\logs" ("rsh-sidecar-{0}.log" -f (Get-Date -Format yyyyMMdd))
+if (-not (Test-Path $sidecarLog)) {
+  Write-Error "Sidecar hello check: no sidecar file log for today at $sidecarLog (the sidecar must log to file as well as stderr)."
   exit 1
 }
-$logText = ($sidecarLogs | Get-Content -Raw) -join "`n"
+$logAge = (Get-Date) - (Get-Item $sidecarLog).LastWriteTime
+if ($logAge.TotalMinutes -gt 10) {
+  Write-Error "Sidecar hello check: today's sidecar file log is stale (last write $([math]::Round($logAge.TotalMinutes, 1)) min ago, expected < 10 min) — it is not from this run."
+  exit 1
+}
+$logText = Get-Content $sidecarLog -Raw
 if ($logText -notmatch "hello sent") {
   Write-Error "Sidecar hello check: sidecar file log exists but contains no 'hello sent' milestone."
   exit 1
 }
-Write-Host "Sidecar file log OK: $($sidecarLogs.Count) file(s) under %PROGRAMDATA%\RSH\logs, 'hello sent' present."
+if ($logText -notmatch "context ready=") {
+  Write-Error "Sidecar hello check: sidecar file log exists but contains no 'context ready=' milestone (the sidecar never reached context creation)."
+  exit 1
+}
+Write-Host "Sidecar file log OK: $sidecarLog, 'hello sent' and 'context ready=' present, fresh ($([math]::Round($logAge.TotalMinutes, 1)) min old)."
