@@ -1114,6 +1114,10 @@ pub fn shifter_debounce_ms(sensitivity: u8) -> u8 {
 /// are replaced by these record counts so a blob is never rejected
 /// twice for the same limit.
 #[must_use]
+// Validator ek hi pass mein har record kind ka guard lagata hai
+// (expander / matrix / slot-range) — is liye 100-line pedantic
+// limit se upar hai; split karne se checks bikhar jayenge.
+#[allow(clippy::too_many_lines)]
 pub fn validate_blob(blob: &ConfigBlob) -> Vec<String> {
     let mut errs: Vec<String> = Vec::new();
     let mut modules: Vec<PinModule> = Vec::new();
@@ -1162,6 +1166,9 @@ pub fn validate_blob(blob: &ConfigBlob) -> Vec<String> {
     // Round 3 (v4.0.4): expander sampling is not implemented — one
     // error per blob, not per record (see the loop below).
     let mut saw_expander = false;
+    // P1-3: same shape for button matrices — no firmware consumer,
+    // one error per blob.
+    let mut saw_matrix = false;
 
     for (idx, record) in blob.records.iter().enumerate() {
         if record.rec_type == record_type::SHIFTER {
@@ -1183,6 +1190,22 @@ pub fn validate_blob(blob: &ConfigBlob) -> Vec<String> {
                         .to_string(),
                 );
                 saw_expander = true;
+            }
+            continue;
+        }
+        if record.rec_type == record_type::BUTTON_MATRIX {
+            // P1-3: the board rejects matrix records at COMMIT — the
+            // firmware has no matrix scanner, so these buttons would
+            // never work. Reject here first with a plain message
+            // (same shape as the expander reject above). Skipped
+            // entirely — no module is built, so no range/uniqueness
+            // checks run on a dead record.
+            if !saw_matrix {
+                errs.push(
+                    "button_matrix: button matrices are not supported yet — the firmware has no matrix scanner, so these buttons would never work. Remove the button matrix from the configuration and try again."
+                        .to_string(),
+                );
+                saw_matrix = true;
             }
             continue;
         }
@@ -1829,6 +1852,32 @@ mod tests {
         assert!(
             !errs.iter().any(|e| e.contains("not supported yet")),
             "I2C axes must not trip the expander guard, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn button_matrix_records_rejected_at_validate_blob() {
+        // P1-3 (update4): BUTTON_MATRIX has no firmware consumer —
+        // like expanders, COMMIT must fail with a plain message
+        // instead of accepting a silently dead record.
+        let rec = ConfigRecord::new(record_type::BUTTON_MATRIX, 0, 4, 13, 14);
+        let errs = validate_blob(&ConfigBlob::new(1, vec![rec]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("button_matrix") && e.contains("not supported")),
+            "button_matrix must be rejected, got {errs:?}"
+        );
+        // Matrix + valid axis: still rejected (guard fires regardless
+        // of the other records).
+        let records = vec![
+            ConfigRecord::new(record_type::AXIS_ADC, 0, 34, 0xFF, 0xFF),
+            ConfigRecord::new(record_type::BUTTON_MATRIX, 0, 4, 13, 14),
+        ];
+        let errs = validate_blob(&ConfigBlob::new(1, records));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("button_matrix") && e.contains("not supported")),
+            "matrix + axis must be rejected, got {errs:?}"
         );
     }
 

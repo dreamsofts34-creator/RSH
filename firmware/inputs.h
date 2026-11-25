@@ -221,6 +221,11 @@ struct InputSample {
 void inputs_begin();
 InputSample inputs_read();   // ADC averages + debounced buttons, ek cycle
 bool inputs_steering_is_mv();  // asal mode jo chal raha hai (fallback ke baad)
+// P1-1: slot ki value pehle se mV mein hai? I2C axis (ADS1115/AS5600)
+// hamesha mV deta hai; native steering useMv probe par; baaqi native
+// axes raw counts hain. stream_emit isi se axes_is_mv mask banata hai
+// (dobara raw->mV se bachne ke liye).
+bool inputs_axis_is_mv(uint8_t slot);
 // Config blob (SET_CFG, §3.6) se live pin table lagao — COMMIT / boot /
 // rollback par .ino bulata hai (Phase G, C3). Blob invalid ho to 0 aur
 // pin table waisi ki waisi (fail closed); valid ho to 1. Pin badle hon

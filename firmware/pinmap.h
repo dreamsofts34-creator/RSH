@@ -26,11 +26,13 @@
 //   LED_STRIP (type 6): slot 0.
 //   SHIFTER (type 11): params[0] gate mode (0 sequential, 1 H-pattern);
 //     H-pattern gear pins 1..6 = pinA/pinB/pinC + params[1..3].
-//   BUTTON_MATRIX (4): koi firmware consumer nahi — ignore.
+//   BUTTON_MATRIX (4): COMMIT par REJECT (P1-3) — koi firmware consumer
+//     nahi, is liye accept karna silently dead buttons deta (expander
+//     gap jaisa). Validator (config_transaction.h) err 3 deta hai.
 //   EXPANDER (8/9): REJECTED at COMMIT (v4.0.4) — sampling not
-//     implemented, is liye validator in records ko refuse karta hai;
-//     `hasExpander` kisi valid blob mein kabhi 1 nahi hota (field
-//     parser ke liye rehta hai).
+//     implemented, is liye validator in records ko refuse karta hai.
+//     Koi hasExpander field nahi — P3-3: wo sirf dead branches ko
+//     khilata tha (valid blob mein kabhi 1 nahi hota tha), hata diya.
 //   Accel/brake BUTTON pins (25/26) blob mein NAHI hain aur PC pin map
 //   mein bhi nahi — wo pedal button-mode ke fixed pins hain, inputs.cpp
 //   unhein hamesha PIN_ACCEL_BTN/PIN_BRAKE_BTN se parhta hai.
@@ -91,8 +93,6 @@ typedef struct {
   uint8_t adsCh[5];     // ADS1115 AIN channel (0..3) per slot; 0xFF = n/a
   uint8_t as5600Rotation;  // 0=360°, 1=540°, 2=900° (RSH_CFG_AS5600_ROT_PARAM)
   uint8_t as5600Multiturn;  // flags bit0 (RSH_CFG_AS5600_MULTITURN_FLAG)
-  uint8_t hasExpander;  // koi EXP_MCP23017/PCF8574 record hai (v4.0.4:
-                          // validator reject karta hai — valid blob mein hamesha 0)
 } RshPinMap;
 
 // Compiled defaults (config.h PIN_* + naye modules) — factory blob ke
@@ -129,7 +129,6 @@ static inline void rsh_pinmap_defaults(RshPinMap *out) {
   out->axisType[4] = RSH_CFG_TYPE_AXIS_ADC;  // handbrake
   out->as5600Rotation = 0;  // memset 0xFF ke baad saaf karo
   out->as5600Multiturn = 0;
-  out->hasExpander = 0;
 }
 
 // Kya ye GPIO live pin table mein kisi function ko diya gaya hai?
@@ -161,11 +160,12 @@ static inline uint8_t rsh_pinmap_axis_present(const RshPinMap *map,
   if (!map || slot > RSH_PINMAP_AXIS_HANDBRAKE) return 0;
   return map->axisType[slot] != RSH_PINMAP_ABSENT;
 }
-// Koi I2C kind (ADS1115/AS5600/expander) configure hai? (Wire.begin
+// Koi I2C kind (ADS1115/AS5600) configure hai? (Wire.begin
 // sirf tab — warna GPIO21 LED strip ka pin rehta hai, I2C nahi.)
+// P3-3: hasExpander check hata diya — expander records COMMIT par
+// reject hote hain, is liye valid map mein expander kabhi nahi hota.
 static inline uint8_t rsh_pinmap_has_i2c(const RshPinMap *map) {
   if (!map) return 0;
-  if (map->hasExpander) return 1;
   for (int i = 0; i < 5; i++)
     if (map->axisType[i] == RSH_CFG_TYPE_AXIS_ADS1115 ||
         map->axisType[i] == RSH_CFG_TYPE_AXIS_AS5600)
@@ -195,7 +195,6 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
   m.handbrakeButtonMode = 0;  // F-15: default axis mode (memset 0xFF ke baad saaf karo)
   m.as5600Rotation = 0;  // FW-01: memset 0xFF ke baad saaf karo (default 360°)
   m.as5600Multiturn = 0;
-  m.hasExpander = 0;  // axisType/adsCh 0xFF hi rehte hain (memset se)
   // H-pattern gear pins bhi default rakho — sequential mode mein istemal
   // nahi hote, lekin GET_CAPS/debug mein kabhi kachra na dikhe.
   m.shiftH[0] = PIN_SHIFT_H1;
@@ -259,14 +258,6 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
         m.as5600Rotation = r[6 + RSH_CFG_AS5600_ROT_PARAM];
         break;
       }
-      case RSH_CFG_TYPE_EXP_MCP23017:
-      case RSH_CFG_TYPE_EXP_PCF8574:
-        // Round 3 (v4.0.4): expander records COMMIT par reject hote
-        // hain (validator, config_transaction.h) — ye case kabhi live
-        // blob par nahi chalta; hasExpander sirf parser completeness
-        // ke liye set hota hai (I2C axes axisType se pehchane jate hain).
-        m.hasExpander = 1;
-        break;
       case RSH_CFG_TYPE_BATTERY:
         if (slot == 0 && pinA != RSH_PINMAP_ABSENT && m.battery == RSH_PINMAP_ABSENT)
           m.battery = pinA;
@@ -310,7 +301,10 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
         break;
       }
       default:
-        break;  // BUTTON_MATRIX: koi consumer nahi (EXPANDER ka case upar hai)
+        break;  // BUTTON_MATRIX (P1-3: COMMIT par reject) aur EXPANDER
+                // (v4.0.4: COMMIT par reject) ka koi consumer nahi —
+                // valid blob mein ye records aate hi nahi (from_blob
+                // pehle validate karta hai), is liye default ignore.
     }
   }
   // Quadrature decoder ko dono channels chahiye — ek channel akela ho
@@ -326,23 +320,4 @@ static inline uint8_t rsh_pinmap_from_blob(const uint8_t *blob, size_t len,
   }
   *out = m;
   return 1;
-}
-
-// Legacy factory blob pehchano: Phase D/E/F firmware ka factory blob
-// BUTTON slots 0..3 = accel-btn/brake-btn/gear-up/gear-down bolta tha.
-// PC builder BUTTON slot 3 KABHI nahi bhejta (slots sirf 0/1/2), is
-// liye slot-3 BUTTON record sirf purane factory blob ki nishani hai.
-// Aisa blob replace semantics mein horn/encoders/LED/handbrake band kar
-// deta (un ke records purane blob mein hain hi nahi) — boot par is
-// blob ko naye factory blob se migrate karna hai (rsh.ino). Return 1 =
-// legacy (valid blob + BUTTON slot-3 record), warna 0.
-static inline uint8_t rsh_pinmap_blob_is_legacy(const uint8_t *blob, size_t len) {
-  if (!blob || len == 0) return 0;
-  if (rsh_cfg_blob_validate(blob, len, NULL, NULL) != RSH_CTRL_OK) return 0;
-  uint8_t mc = blob[5];
-  for (uint8_t i = 0; i < mc; i++) {
-    const uint8_t *r = blob + RSH_CFG_HEADER_SIZE + (size_t)i * RSH_CFG_RECORD_SIZE;
-    if (r[0] == RSH_CFG_TYPE_BUTTON && r[1] == 3) return 1;
-  }
-  return 0;
 }

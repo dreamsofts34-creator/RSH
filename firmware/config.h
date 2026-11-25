@@ -97,6 +97,14 @@
 // Wiper par 0.1 uF capacitor ESP pin ke paas phir bhi lagao (noise ke liye).
 // Sab se accurate hissa 150-2450 mV hai; upar wale hisay ka halki si
 // non-linearity PC ki calibration sambhal leti hai (endpoints map hote hain).
+//
+// AS5600 MULTITURN NOTE (P1-2): AS5600 ka turn counter RELATIVE hai —
+// koi absolute index nahi. Boot angle mapped window ka CENTRE hai
+// (as5600.h rsh_as5600_steps_to_mv): 900° rotation par boot se ±450°
+// travel milti hai (boot = 1650 mV). Board ko full-left lock par boot
+// karne ki ZAROORAT NAHI — aur aisa karna ghalat bhi hota (reboot
+// kabhi bhi, kisi bhi angle par ho sakta hai). PC calibration observed
+// min/max ko lock ends par map karti hai.
 
 // ---------- Wired USB-serial transport (Phase G, D26 / OPEN-20) ----------
 // ESP32 DevKit V1 par native USB NAHI — USB-serial = CP2102 USB-UART
