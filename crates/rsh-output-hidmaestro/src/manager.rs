@@ -66,15 +66,43 @@ use crate::transport::{LiveTransport, TransportEvent, spawn_stdio};
 use crate::transport::{accept_loopback, generate_token, listen_loopback};
 use crate::{PROFILE_ID, SIDECAR_EXE_NAME};
 
-/// How long to wait for the sidecar's `hello` line after spawn.
+/// Timeout budget (P1-1, update4-fix): the UI bound must EXCEED the
+/// daemon worst case, or a slow-but-healthy switch is reported as
+/// failed while the daemon keeps going (and may still succeed).
 ///
-/// B-2: 60 s, not 10 s — the elevated sidecar is launched via UAC
-/// (`runas`) and the user needs the 10 s spawn plus thinking time to
-/// read and answer the prompt; a user who takes longer trips
-/// `HelloTimeout` and the switch fails. The UI gives this call a
-/// 75 s IPC bound (see `IpcApi::set_output_backend`), so the wait
-/// never outlives the caller's patience.
-pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-stage bounds, each stage getting its own window:
+/// * accept (connect-back) + hello: [`DEFAULT_SPAWN_TIMEOUT`] each
+///   (30 s — the sidecar is already running by then; hello is sent
+///   before `HMContext` creation, so both are normally < 2 s).
+/// * `install-driver` + `create`: [`DEFAULT_DRIVER_OP_TIMEOUT`]
+///   each (120 s, P2-1 — a Windows driver install / device creation
+///   on a slow or loaded machine takes seconds to a couple of
+///   minutes; update4's 60 s killed the sidecar mid-install).
+/// * first neutral after create: [`DEFAULT_FIRST_NEUTRAL_TIMEOUT`]
+///   (10 s, P2-2 — 50x the normal 200 ms reply bound).
+///
+/// Daemon worst case after the UAC prompt is answered:
+/// 30 + 30 + 120 + 120 + 10 = **310 s**. The UI allows 60 s for the
+/// user to answer the UAC prompt on top of that (370 s) — the IPC
+/// bound is 390 s and the Backend job timeout 420 s, so
+/// **job (420 s) > IPC (390 s) > worst case incl. UAC (370 s) >
+/// worst case post-UAC (310 s)**. Residual: the UAC dwell itself is
+/// unbounded (the user may stare at the prompt), so no finite UI
+/// bound can cover a user who takes longer than 60 s to answer —
+/// that case still reports failure while the daemon continues, and
+/// is documented, not silently fixed.
+pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `install-driver` and `create` may each take (P2-1).
+/// 120 s: a slow-but-healthy Windows driver install / device
+/// creation finishes inside it; a genuinely hung sidecar still
+/// fails in 2 minutes instead of hanging forever. Counts toward
+/// the P1-1 budget above (two 120 s stages dominate it).
+pub const DEFAULT_DRIVER_OP_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the first neutral after `create` may take (P2-2).
+/// 10 s: the first driver I/O after device creation can be slow,
+/// and a 200 ms bound there used to fail the whole switch after
+/// the device was already created.
+pub const DEFAULT_FIRST_NEUTRAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for one reply. H4: 200 ms, not 500 ms — the spike
 /// measured IPC p99 276 µs at 200 Hz, so 200 ms is still generous, and
 /// a reply slower than that would already trip the engine's 250 ms
@@ -109,6 +137,12 @@ pub struct SidecarConfig {
     pub elevated: bool,
     /// Timeout for spawn + `hello`.
     pub spawn_timeout: Duration,
+    /// Timeout for the slow driver operations (`install-driver`,
+    /// `create`) — see [`DEFAULT_DRIVER_OP_TIMEOUT`].
+    pub driver_op_timeout: Duration,
+    /// Timeout for the first neutral after `create` — see
+    /// [`DEFAULT_FIRST_NEUTRAL_TIMEOUT`].
+    pub first_neutral_timeout: Duration,
     /// Timeout for a single reply.
     pub reply_timeout: Duration,
     /// Heartbeat cadence while connected.
@@ -128,6 +162,8 @@ impl Default for SidecarConfig {
             sidecar_path: resolve_sidecar_path(),
             elevated: true,
             spawn_timeout: DEFAULT_SPAWN_TIMEOUT,
+            driver_op_timeout: DEFAULT_DRIVER_OP_TIMEOUT,
+            first_neutral_timeout: DEFAULT_FIRST_NEUTRAL_TIMEOUT,
             reply_timeout: DEFAULT_REPLY_TIMEOUT,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             extra_env: Vec::new(),
@@ -235,7 +271,12 @@ pub struct SidecarManager {
     last_spawn_pid: Option<u32>,
     /// When the current spawn + hello attempt started (P0, v2.0.11):
     /// the accept→EOF elapsed ms in the `SidecarDied` message tells
-    /// an instant native crash apart from a slow clean exit.
+    /// an instant native crash apart from a slow clean exit. P1-1
+    /// (update4-fix): the clock starts AFTER the spawn returns —
+    /// `ShellExecuteEx` (`runas`) blocks on the UAC prompt, so a
+    /// clock started before the spawn inflated the elapsed ms with
+    /// the user's UAC dwell. Set at accept start on the elevated
+    /// path, right after the stdio spawn on the stdio path.
     hello_started: Option<Instant>,
     last_hello: Option<HelloInfo>,
     consecutive_failures: u32,
@@ -440,9 +481,9 @@ impl SidecarManager {
     }
 
     fn spawn_and_hello(&mut self) -> Result<HelloInfo, HidMaestroError> {
-        // P0 (v2.0.11): the clock for the accept→EOF elapsed ms in
-        // the `SidecarDied` message.
-        self.hello_started = Some(Instant::now());
+        // P1-1: `hello_started` is NOT set here — the elevated spawn
+        // below blocks on the UAC prompt, and the clock must start
+        // after the spawn returns (set in each path below).
         if !self.config.sidecar_path.is_file() {
             return Err(HidMaestroError::SidecarNotFound(
                 self.config.sidecar_path.clone(),
@@ -462,6 +503,8 @@ impl SidecarManager {
         .map_err(|e| map_spawn_error(&e))?;
         self.token = None;
         self.transport = Some(transport);
+        // P1-1: spawn has returned — start the hello clock now.
+        self.hello_started = Some(Instant::now());
         self.read_hello(None)
     }
 
@@ -548,6 +591,10 @@ impl SidecarManager {
         // elevated sidecar must be terminated and its handle closed,
         // not leaked (a retry would otherwise spawn a second one).
         self.elevated_process = Some(process);
+        // P1-1: the spawn (and the UAC prompt) has returned — start
+        // the hello clock now, at accept start, so the accept→EOF
+        // elapsed ms never includes the UAC dwell.
+        self.hello_started = Some(Instant::now());
         let transport = match accept_loopback(&listener, self.config.spawn_timeout, Some(pid)) {
             Ok(transport) => transport,
             Err(error) => {
@@ -618,6 +665,40 @@ impl SidecarManager {
     /// of splitting the method per platform.
     #[allow(clippy::unused_self)]
     fn describe_hello_eof(&self, elapsed_ms: u128) -> String {
+        self.describe_eof("sidecar exited before hello", elapsed_ms, "after spawn")
+    }
+
+    /// Describe a sidecar death AFTER hello (P1-3, update4-fix):
+    /// the same PID + exit-code + timing enrichment as the
+    /// pre-hello path — the old bare "sidecar closed the
+    /// connection" could not tell a native crash from a clean exit
+    /// or say how long the session had lived. Elapsed is since the
+    /// last reply (or since spawn when no reply ever arrived).
+    /// Must be called BEFORE `kill_transport`: killing takes the
+    /// elevated-process handle, after which the exit code is
+    /// unknowable (see [`request_with_timeout`](Self::request_with_timeout)).
+    fn describe_post_hello_eof(&self) -> String {
+        let elapsed_ms = self.last_reply.map_or_else(
+            || {
+                self.hello_started
+                    .map_or(0, |started| started.elapsed().as_millis())
+            },
+            |last| last.elapsed().as_millis(),
+        );
+        self.describe_eof(
+            "sidecar closed the connection",
+            elapsed_ms,
+            "since last reply",
+        )
+    }
+
+    /// Shared death description: `{what} (pid …, exit code …, N ms
+    /// {elapsed_label}; sidecar log: …)`. `what` names the phase
+    /// ("exited before hello" / "closed the connection") and
+    /// `elapsed_label` names the clock ("after spawn" /
+    /// "since last reply").
+    #[allow(clippy::unused_self)]
+    fn describe_eof(&self, what: &str, elapsed_ms: u128, elapsed_label: &str) -> String {
         #[cfg(windows)]
         {
             let pid = self
@@ -625,19 +706,19 @@ impl SidecarManager {
                 .map_or("?".to_string(), |pid| pid.to_string());
             match self.sidecar_exit_code() {
                 Some(259) => format!(
-                    "sidecar exited before hello (pid {pid}, process still running, {elapsed_ms} ms after spawn; sidecar log: %PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log)"
+                    "{what} (pid {pid}, process still running, {elapsed_ms} ms {elapsed_label}; sidecar log: %PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log)"
                 ),
                 Some(code) => format!(
-                    "sidecar exited before hello (pid {pid}, exit code 0x{code:08X}, {elapsed_ms} ms after spawn; sidecar log: %PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log)"
+                    "{what} (pid {pid}, exit code 0x{code:08X}, {elapsed_ms} ms {elapsed_label}; sidecar log: %PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log)"
                 ),
                 None => format!(
-                    "sidecar exited before hello (pid {pid}, exit code unknown, {elapsed_ms} ms after spawn; sidecar log: %PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log)"
+                    "{what} (pid {pid}, exit code unknown, {elapsed_ms} ms {elapsed_label}; sidecar log: %PROGRAMDATA%\\RSH\\logs\\rsh-sidecar-YYYYMMDD.log)"
                 ),
             }
         }
         #[cfg(not(windows))]
         {
-            format!("sidecar exited before hello ({elapsed_ms} ms after spawn)")
+            format!("{what} ({elapsed_ms} ms {elapsed_label})")
         }
     }
 
@@ -704,11 +785,15 @@ impl SidecarManager {
                 parse_reply(&line)
             }
             Ok(TransportEvent::Eof) => {
+                // P1-3: the post-hello death carries the same
+                // enrichment as the pre-hello one (PID + exit code +
+                // ms since last reply) — captured BEFORE
+                // `kill_transport`, which takes the elevated-process
+                // handle the exit code is read from.
+                let message = self.describe_post_hello_eof();
                 self.kill_transport();
                 self.note_failure();
-                Err(HidMaestroError::SidecarDied(
-                    "sidecar closed the connection".to_string(),
-                ))
+                Err(HidMaestroError::SidecarDied(message))
             }
             Err(_) => {
                 self.kill_transport();
@@ -783,7 +868,8 @@ impl SidecarManager {
     ///
     /// Propagates request errors plus `NotAdmin` / `DriverInstallFailed`.
     pub fn install_driver(&mut self) -> Result<InstallInfo, HidMaestroError> {
-        let reply = self.request_with_timeout(&Command::InstallDriver, self.config.spawn_timeout)?;
+        let reply =
+            self.request_with_timeout(&Command::InstallDriver, self.config.driver_op_timeout)?;
         reply_to_error(&reply)?;
         Ok(InstallInfo {
             was_installed: reply.was_installed.unwrap_or(false),
@@ -803,7 +889,7 @@ impl SidecarManager {
             &Command::Create {
                 profile: PROFILE_ID.to_string(),
             },
-            self.config.spawn_timeout,
+            self.config.driver_op_timeout,
         )?;
         reply_to_error(&reply)?;
         // C2: parse the REAL sidecar shape — `axes` is a count
@@ -904,7 +990,35 @@ impl SidecarManager {
     /// Propagates request errors; a failed reply maps to
     /// [`HidMaestroError::UpdateFailed`].
     pub fn neutral(&mut self, raw: bool) -> Result<(), HidMaestroError> {
-        let reply = self.request(&Command::Neutral { raw })?;
+        self.neutral_with_timeout(raw, self.config.reply_timeout)
+    }
+
+    /// The first neutral after `create` (P2-2): the same command
+    /// with the longer [`DEFAULT_FIRST_NEUTRAL_TIMEOUT`] bound —
+    /// the first driver I/O after device creation can be slow, and
+    /// the 200 ms bound used to fail the whole switch after the
+    /// device was already created. Counts as a healthy submit like
+    /// [`neutral`](Self::neutral).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`neutral`](Self::neutral).
+    pub fn neutral_first(&mut self, raw: bool) -> Result<(), HidMaestroError> {
+        self.neutral_with_timeout(raw, self.config.first_neutral_timeout)
+    }
+
+    /// [`neutral`](Self::neutral) with an explicit reply bound.
+    ///
+    /// # Errors
+    ///
+    /// Propagates request errors; a failed reply maps to
+    /// [`HidMaestroError::UpdateFailed`].
+    pub fn neutral_with_timeout(
+        &mut self,
+        raw: bool,
+        timeout: Duration,
+    ) -> Result<(), HidMaestroError> {
+        let reply = self.request_with_timeout(&Command::Neutral { raw }, timeout)?;
         if !reply.ok {
             let msg = reply
                 .error
@@ -1185,5 +1299,52 @@ mod tests {
             Some("f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5")
         );
         assert_eq!(info.dll_sha256_ok, Some(true));
+    }
+
+    /// P1-3 (update4-fix): a sidecar death AFTER hello reports the
+    /// same enrichment as a pre-hello death — the phase ("closed the
+    /// connection") plus the ms since the last reply — not the bare
+    /// "sidecar closed the connection" with no timing. A stub
+    /// transport plays a sidecar that says hello, then dies.
+    #[test]
+    fn post_hello_eof_is_enriched_like_pre_hello_eof() {
+        use crate::transport::TransportWriter;
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        struct StubWriter;
+        impl TransportWriter for StubWriter {
+            fn write_line(&mut self, _line: &str) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn kill(&mut self) {}
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let transport = LiveTransport {
+            writer: Box::new(StubWriter),
+            events: rx,
+            stderr_lines: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        let mut manager = SidecarManager::new(SidecarConfig::with_path(std::path::PathBuf::from(
+            "/nonexistent/rsh-hidmaestro-sidecar",
+        )));
+        manager.transport = Some(transport);
+        manager.hello_started = Some(Instant::now());
+        tx.send(TransportEvent::Line(
+            r#"{"ok":true,"hello":"rsh-hm-sidecar","sidecar":"rsh-hm-sidecar","sdk":"2.1.0","protocol":1,"dll_sha256":"f13e32591404db0f418af9265b8e240f71257297cfae5a41dcd696fd87e9b4d5","dll_sha256_ok":true,"admin":true}"#
+                .to_string(),
+        ))
+        .unwrap();
+        manager.read_hello(None).expect("good hello must parse");
+        // The sidecar dies mid-session: EOF instead of a reply.
+        tx.send(TransportEvent::Eof).unwrap();
+        let err = manager
+            .request(&Command::Ping)
+            .expect_err("EOF after hello must fail");
+        assert!(matches!(err, HidMaestroError::SidecarDied(_)));
+        let message = err.to_string();
+        assert!(message.contains("closed the connection"), "{message}");
+        assert!(message.contains("ms since last reply"), "{message}");
     }
 }
