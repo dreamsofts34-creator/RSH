@@ -408,6 +408,40 @@ impl AppApi for DaemonApi {
         crate::rejoin::scan_rsh_networks()
     }
 
+    /// Join a board hotspot that has no password (open AP, D5):
+    /// the first-connect flow's rejoin step. v2.0.11: this
+    /// override was missing, so the trait default answered every
+    /// IPC `rejoin_wifi_open` with "not supported by this API"
+    /// even once dispatch reached it — the wizard's "Join wheel
+    /// Wi-Fi" flow could never succeed. On Linux the rejoin
+    /// helper returns the exact manual steps instead of
+    /// pretending to work; on Windows it writes the open WLAN
+    /// profile and connects.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the network cannot be joined.
+    fn rejoin_wifi_open(&self, ssid: &str) -> Result<WifiStatus, UserError> {
+        crate::rejoin::rejoin_wifi_open(ssid).map_err(|error| {
+            UserError::from_connection(ConnectionError::Unknown, error.to_string())
+        })?;
+        Ok(self.state.wifi_status())
+    }
+
+    /// Join a board hotspot with its stored password (D5/D8).
+    /// v2.0.11: same missing-override gap as `rejoin_wifi_open`
+    /// above — the trait default always errored.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the network cannot be joined.
+    fn rejoin_wifi(&self, ssid: &str, password: &str) -> Result<WifiStatus, UserError> {
+        crate::rejoin::rejoin_wifi(ssid, password).map_err(|error| {
+            UserError::from_connection(ConnectionError::Unknown, error.to_string())
+        })?;
+        Ok(self.state.wifi_status())
+    }
+
     /// Set (or change) the board Wi-Fi password (D19 + D8): validate
     /// here (8–63 printable ASCII, no space — the protocol rule —
     /// and the confirmation must match), then the core sets it on

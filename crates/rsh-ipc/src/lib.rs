@@ -105,7 +105,8 @@ pub struct IpcRequest {
     pub id: u64,
     /// Method name (`ping`, `version`, `connection`, `connect`,
     /// `disconnect`, `wifi_status`, `set_wifi_password`,
-    /// `clear_wifi_password`, `snapshot`,
+    /// `clear_wifi_password`, `scan_rsh_networks`, `rejoin_wifi`,
+    /// `rejoin_wifi_open`, `snapshot`,
     /// `poll`, `output_enabled`, `set_output_enabled`, `subscribe`,
     /// `get_tuning`, `set_tuning`, `draft_status`, `save_draft`,
     /// `discard_draft`, `autostart`, `set_autostart`,
@@ -433,8 +434,17 @@ pub fn dispatch(
         // v2.0.2 Round 3: Wi-Fi password set/clear (v2.0.6),
         // firmware check/update, board address, module toggles,
         // auto-pause, tray, backup, profile rename/link, knob actions.
+        // v2.0.11: Wi-Fi scan + rejoin (open / with password) —
+        // the UI called these three over IPC since the no-pairing
+        // redesign, but no arm dispatched them, so every call
+        // failed with `UnknownMethod` (the wizard's "Join wheel
+        // Wi-Fi" flow calls `scan_rsh_networks` +
+        // `rejoin_wifi_open`).
         "set_wifi_password"
         | "clear_wifi_password"
+        | "scan_rsh_networks"
+        | "rejoin_wifi"
+        | "rejoin_wifi_open"
         | "firmware_check"
         | "update_firmware"
         | "firmware_update_status"
@@ -603,6 +613,11 @@ fn detailed_api_error(error: &rsh_api::UserError) -> IpcError {
 /// Wire shapes: `set_wifi_password` takes `{"password",
 /// "confirm"}` and returns the [`WifiStatus`](rsh_api::WifiStatus);
 /// `clear_wifi_password` takes no params and returns the
+/// [`WifiStatus`](rsh_api::WifiStatus); `scan_rsh_networks` takes
+/// no params and returns the bare SSID array (the UI parses the
+/// result itself as `Vec<String>`, so it is NOT wrapped in an
+/// object); `rejoin_wifi_open` takes `{"ssid"}` and `rejoin_wifi`
+/// takes `{"ssid", "password"}`, both returning the
 /// [`WifiStatus`](rsh_api::WifiStatus); `firmware_check` → the
 /// [`FirmwareCheck`](rsh_api::FirmwareCheck);
 /// `update_firmware` starts the flash and returns the running
@@ -640,6 +655,35 @@ fn dispatch_round3(
             .clear_wifi_password()
             .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
             .map_err(|error| detailed_api_error(&error)),
+        // v2.0.11: Wi-Fi scan + rejoin — dispatched here with the
+        // other Wi-Fi arms (same `detailed_api_error` mapping, so
+        // the failure reason reaches the UI instead of a bare
+        // "Unknown"). `scan_rsh_networks` returns the bare array:
+        // the UI parses the result itself as `Vec<String>`.
+        "scan_rsh_networks" => Ok(serde_json::to_value(api.scan_rsh_networks())
+            .map_err(|e| IpcError::Protocol(e.to_string()))?),
+        "rejoin_wifi_open" => {
+            let ssid = params
+                .get("ssid")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.rejoin_wifi_open(ssid)
+                .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
+                .map_err(|error| detailed_api_error(&error))
+        }
+        "rejoin_wifi" => {
+            let ssid = params
+                .get("ssid")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let password = params
+                .get("password")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.rejoin_wifi(ssid, password)
+                .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
+                .map_err(|error| detailed_api_error(&error))
+        }
         "firmware_check" => api
             .firmware_check()
             .map(|check| serde_json::to_value(check).unwrap_or(serde_json::Value::Null))
