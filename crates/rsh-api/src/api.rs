@@ -60,8 +60,9 @@ pub struct ConnectionInfo {
     pub session_active: bool,
     /// Sticky "board reachable" latch (D15): set on every HELLO
     /// observed, cleared on disconnect / transport switch /
-    /// `NoRoute` / HELLO-timeout. The wizard Step 1 Next unlocks
-    /// on this (HELLO-or-better), never on `Active` alone.
+    /// `NoRoute` / HELLO-timeout / activation failure (P1-2). The
+    /// wizard Step 1 Next unlocks on this (HELLO-or-better), never
+    /// on `Active` alone.
     #[serde(default)]
     pub board_reachable: bool,
     /// Typed failure reason, when in `Error`.
@@ -70,6 +71,14 @@ pub struct ConnectionInfo {
     /// One-line hint for the error, when in `Error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// P2-3 (v2.0.11): only set on the reply to a `connect` call —
+    /// `Some(true)` when the call started a fresh (re)connect,
+    /// `Some(false)` when it no-op'd because a retry was already in
+    /// flight (activation in flight / forwarder retry wait). `None`
+    /// on every other read (`connection`, `poll`, events), where no
+    /// connect was attempted and the field would be meaningless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_started: Option<bool>,
 }
 
 /// Wi-Fi status, as the API reports it (no-pairing redesign):
@@ -316,6 +325,12 @@ pub struct GameSummary {
     pub id: String,
     /// Display name.
     pub name: String,
+    /// Full path to the game exe or shortcut, as stored (empty when
+    /// unknown — the UI edit-game re-browse fix pre-fills the file
+    /// picker from this; `#[serde(default)]` so older cached
+    /// payloads without it still parse).
+    #[serde(default)]
+    pub exe_path: String,
     /// True when this game is the currently tracked running game.
     pub running: bool,
     /// True when the game exe was found on disk.
@@ -547,6 +562,9 @@ pub trait AppApi: Send + Sync {
 
     /// Ask to connect (Wi-Fi by default, or the requested transport).
     /// Returns the connection state right after the request.
+    /// `connect_started` on the reply (P2-3) is `Some(true)` when a
+    /// fresh (re)connect started and `Some(false)` when the call
+    /// no-op'd because a retry was already in flight.
     ///
     /// # Errors
     ///
@@ -1140,6 +1158,28 @@ pub trait AppApi: Send + Sync {
         ))
     }
 
+    /// [`add_game`](Self::add_game) with a client-generated
+    /// idempotency key (P1-3, v2.0.11): the UI generates one key per
+    /// add-dialog session, so a retry after a client-side timeout
+    /// returns the already-created entry instead of duplicating
+    /// the game. The default delegates to [`add_game`](Self::add_game)
+    /// (no dedupe) — the daemon overrides it with the deduping
+    /// store call.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`add_game`](Self::add_game): an empty name or exe
+    /// path, an unknown bound profile, or a save failure.
+    fn add_game_with_key(
+        &self,
+        name: &str,
+        exe_path: &str,
+        profile_id: Option<String>,
+        _idempotency_key: Option<&str>,
+    ) -> Result<GameSummary, UserError> {
+        self.add_game(name, exe_path, profile_id)
+    }
+
     /// Update a manually added game's name / exe path / bound
     /// profile; returns the updated entry.
     ///
@@ -1546,6 +1586,7 @@ mod tests {
                     board_reachable: true,
                     error: None,
                     hint: None,
+                    connect_started: None,
                 }
             } else {
                 ConnectionInfo {
@@ -1557,6 +1598,7 @@ mod tests {
                     board_reachable: false,
                     error: None,
                     hint: None,
+                    connect_started: None,
                 }
             }
         }

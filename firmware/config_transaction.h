@@ -23,9 +23,17 @@
 //       err 3 unknown module/type/schema/magic -> UNSUPPORTED (6)
 //       err 3 expander record (type 8/9, sampling not implemented — v4.0.4)
 //           -> UNSUPPORTED (6) (fail closed, silently dead buttons nahi)
+//       err 3 button-matrix record (type 4, koi firmware consumer nahi —
+//           P1-3, expander jaisa hi fail-closed reject)
+//           -> UNSUPPORTED (6)
+//       err 2 slot out of range (P2-5: AXIS/AS5600 slot > 4, BUTTON > 2,
+//           ENCODER > 1, LED_STRIP/BATTERY slot != 0 — pinmap ka koi
+//           consumer nahi, lekin pin reserve ho jata) -> PIN_CONFLICT (5)
 //       err 4 chunk/blob CRC mismatch        -> BAD_CRC (3)
 //       err 5 total size mismatch            -> TOO_BIG (4)
-//   * Safe mode mein stage + commit dono BUSY (7) — config apply nahi hoti.
+//   * Safe mode mein stage + commit + revert teeno BUSY (7) — config
+//     apply nahi hoti, purani config wapas bhi nahi aati (P3-4:
+//     REVERT safe mode mein bhi config badal deta tha).
 //   * REVERT idempotent hai: staged ya committed-lekin-unconfirmed config
 //     discard karke purani config wapas; kuch pending na ho to no-op OK.
 //
@@ -200,8 +208,9 @@ static inline size_t rsh_cfg_blob_build(uint8_t *out, const uint8_t *records,
 // button-mode ke fixed pins hain (pinmap.h).
 // Purana factory blob (7 records, BUTTON slots 0..3 = accel/brake/
 // gear-up/gear-down) Phase G mein KHATAM — BUTTON slot scheme badal
-// gaya hai; purane NVS blob ko boot par migrate kiya jata hai
-// (rsh_pinmap_blob_is_legacy, rsh.ino).
+// gaya hai; purana NVS blob ab validate nahi hota (P2-5: BUTTON slot
+// > 2 reject) aur boot par LKG/factory fallback leta hai (wahi end
+// state jo purani migration deti thi).
 // Return length (188 B), ya 0.
 static inline size_t rsh_cfg_factory_blob(uint8_t *out) {
   uint8_t rec[11 * RSH_CFG_RECORD_SIZE];
@@ -416,6 +425,49 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
         if (status == RSH_CTRL_OK) status = RSH_CTRL_UNSUPPORTED;
         continue;
       }
+      if (type == RSH_CFG_TYPE_BUTTON_MATRIX) {
+        // P1-3: BUTTON_MATRIX ka koi firmware consumer nahi (pinmap
+        // record ignore karta hai, inputs.cpp kabhi nahi parhta) —
+        // expander gap jaisa hi silently-dead case. Accept karne se
+        // matrix buttons kabhi kaam na karte (aur n_btn gin'ti mein
+        // 16 buttons ban kar N1 limit bhi bigarte). Reject
+        // fail-closed: err 3 -> UNSUPPORTED. The app (`validate_blob`,
+        // rsh-protocol) rejects first with a plain message; this is
+        // the backstop for old apps / direct SET_CFG.
+        RSH_CFG_ADD_ERR(RSH_CFG_ERR_UNKNOWN_TYPE);
+        if (status == RSH_CTRL_OK) status = RSH_CTRL_UNSUPPORTED;
+        continue;
+      }
+      // P2-5: slot range — pinmap ke paas in slots ka koi consumer
+      // nahi (AXIS > 4, BUTTON > 2, ENCODER > 1, LED_STRIP/BATTERY
+      // != 0, AS5600 > 4), lekin record ka pin used_pin mein reserve
+      // ho jata — silently dead function + zaya pin. Reject
+      // fail-closed: err 2 -> PIN_CONFLICT. (BUTTON slot 3 purane
+      // factory blob ki nishani tha — wo scheme KHATAM hai; purana
+      // blob ab validate nahi hota aur boot par LKG/factory fallback
+      // leta hai — pinmap.h rsh_pinmap_blob_is_legacy bhi hata diya
+      // gaya, kyun ke us ka kaam khatam.)
+      {
+        uint8_t slot = r[1];
+        uint8_t slot_bad = 0;
+        if (type == RSH_CFG_TYPE_AXIS_ADC ||
+            type == RSH_CFG_TYPE_AXIS_ADS1115 ||
+            type == RSH_CFG_TYPE_AXIS_GENERIC ||
+            type == RSH_CFG_TYPE_AXIS_AS5600)
+          slot_bad = (slot > 4);
+        else if (type == RSH_CFG_TYPE_BUTTON)
+          slot_bad = (slot > 2);
+        else if (type == RSH_CFG_TYPE_ENCODER)
+          slot_bad = (slot > 1);
+        else if (type == RSH_CFG_TYPE_LED_STRIP ||
+                 type == RSH_CFG_TYPE_BATTERY)
+          slot_bad = (slot != 0);
+        if (slot_bad) {
+          RSH_CFG_ADD_ERR(RSH_CFG_ERR_OUT_OF_RANGE);
+          if (status == RSH_CTRL_OK) status = RSH_CTRL_PIN_CONFLICT;
+          continue;
+        }
+      }
       if (type == RSH_CFG_TYPE_AXIS_ADC || type == RSH_CFG_TYPE_AXIS_ADS1115
           || type == RSH_CFG_TYPE_AXIS_GENERIC) n_axes++;
       // F-15: handbrake AXIS slot 4 ke flags mein sirf bit0 (button mode)
@@ -446,7 +498,6 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
       }
       else if (type == RSH_CFG_TYPE_ENCODER) n_enc++;
       else if (type == RSH_CFG_TYPE_BUTTON) n_btn++;
-      else if (type == RSH_CFG_TYPE_BUTTON_MATRIX) n_btn += 16;  // default 4x4
       else if (type == RSH_CFG_TYPE_BATTERY) n_bat++;
       else if (type == RSH_CFG_TYPE_LED_STRIP) {
         if (r[3] != 0xFF) n_led++;  // pinless LED record no-op hai (upar dekho)
@@ -918,8 +969,12 @@ static inline uint8_t rsh_cfg_confirm(rsh_cfg_txn_t *t, uint32_t now_ms) {
 // ---- REVERT (§3.6) ----
 // Staged ya committed-lekin-unconfirmed config discard karke purani
 // config wapas. Kuch pending na ho to no-op OK (idempotent).
+// P3-4: safe mode mein REVERT bhi BUSY hai — stage/commit ki tarah
+// (safe mode ka matlab hai config ko haath nahi lagana; REVERT bhi
+// live config badal deta hai, is liye usi gate ke peeche hai).
 static inline uint8_t rsh_cfg_revert(rsh_cfg_txn_t *t) {
   if (!t) return RSH_CTRL_UNSUPPORTED;
+  if (t->safe_mode) return RSH_CTRL_BUSY;
   if (t->state == RSH_TXN_COMMITTED && t->has_previous) {
     memcpy(t->current, t->previous, t->previous_len);
     t->current_len = t->previous_len;

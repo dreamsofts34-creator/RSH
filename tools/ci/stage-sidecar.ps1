@@ -51,7 +51,23 @@ if (-not (Test-Path "tools/rsh-hm-sidecar/rsh-hm-sidecar.csproj")) {
 
 $zipUrl = "https://github.com/hifihedgehog/HIDMaestro/releases/download/v$HidMaestroVersion/HIDMaestro-v$HidMaestroVersion.zip"
 $zip = Join-Path $env:RUNNER_TEMP "HIDMaestro-v$HidMaestroVersion.zip"
-Invoke-WebRequest -Uri $zipUrl -OutFile $zip
+# P3 (retry): a transient network failure used to fail the release
+# job fail-closed with no retry. Retry the download up to 3 times
+# with backoff; a persistent failure still fails closed below — a
+# partial/corrupt download can never pass the SHA-256 check.
+$downloaded = $false
+for ($attempt = 1; $attempt -le 3; $attempt++) {
+  try {
+    Invoke-WebRequest -Uri $zipUrl -OutFile $zip
+    $downloaded = $true
+    break
+  } catch {
+    Write-Host "HIDMaestro download attempt $attempt/3 failed: $($_.Exception.Message)"
+    if ($attempt -lt 3) { Start-Sleep -Seconds 10 }
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+  }
+}
+if (-not $downloaded) { Write-Error "HIDMaestro download failed after 3 attempts ($zipUrl) — transient network failure, retry the run."; exit 1 }
 $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
 if ($zipHash -ne $ZipSha256) { Write-Error "HIDMaestro ZIP SHA-256 mismatch: $zipHash"; exit 1 }
 $dllDir = Join-Path $env:RUNNER_TEMP "hidmaestro"

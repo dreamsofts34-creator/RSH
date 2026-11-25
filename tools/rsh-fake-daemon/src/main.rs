@@ -56,6 +56,7 @@ impl AppApi for StubApi {
             address: String::new(),
             session_active: false,
             board_reachable: false,
+            connect_started: None,
             error: None,
             hint: None,
         }

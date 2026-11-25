@@ -49,6 +49,7 @@ impl AppApi for StubApi {
             address: "192.168.4.1".to_string(),
             session_active: true,
             board_reachable: false,
+            connect_started: None,
             error: None,
             hint: None,
         }

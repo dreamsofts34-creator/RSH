@@ -170,6 +170,12 @@ export component NotificationsDrawer inherits Rectangle {
     drop-shadow-blur: Theme.shadow-blur;
     drop-shadow-offset-y: Theme.shadow-offset-y;
     drop-shadow-color: Theme.shadow-color;
+    // P2-5: a blocking TouchArea over the whole drawer, FIRST so
+    // the content paints above it — clicks on drawer background
+    // stop here instead of falling through to the shell backdrop
+    // TouchArea below (which closed the drawer). Same pattern as
+    // the Modal card (P1-2).
+    TouchArea { width: 100%; height: 100%; }
     VerticalLayout {
         spacing: 0px;
         // header

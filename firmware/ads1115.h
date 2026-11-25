@@ -93,6 +93,11 @@ static inline void rsh_ads1115_configure(RshAds1115 *s,
 // cadence hai — jald-bazi mein bulaya jaye to kuch nahi hota).
 // Return 0 = ok / is poll par kuch nahi karna tha, -1 = I2C error
 // (value nahi badli — caller last value + invalid flag istemal kare).
+// P3-1: read kamyab ho kar taaza value store ho chuki ho to agle
+// conversion-start ki write fail par bhi 0 milta hai — taaza value
+// ek frame ke liye invalid nahi hoti (write fail sirf AGLI conversion
+// ko rokta hai; channel dobara start hone ke liye converting -1 aur
+// next_idx waisi ki waisi rehti hai). Read fail ho to hamesha -1.
 static inline int rsh_ads1115_poll(RshAds1115 *s, rsh_ads1115_i2c_read_fn read,
                                    rsh_ads1115_i2c_write_fn write, void *user,
                                    uint32_t now_ms) {
@@ -100,6 +105,7 @@ static inline int rsh_ads1115_poll(RshAds1115 *s, rsh_ads1115_i2c_read_fn read,
   if (s->n_channels == 0) return 0;
   if ((uint32_t)(now_ms - s->last_poll_ms) < RSH_ADS1115_POLL_MS) return 0;
   s->last_poll_ms = now_ms;
+  uint8_t fresh = 0;  // is poll par taaza value store hui?
   // Pehle pichli conversion ka result parho (128 SPS par 20 ms mein
   // poori ho chuki hoti hai; register mein last completed result rehta
   // hai — jald read bhi purana result deta hai, garbage nahi).
@@ -112,13 +118,18 @@ static inline int rsh_ads1115_poll(RshAds1115 *s, rsh_ads1115_i2c_read_fn read,
     s->value_mv[ch] = rsh_ads1115_raw_to_mv(raw);
     s->has_value[ch] = 1;
     s->converting = -1;
+    fresh = 1;
   }
   // Agli conversion start karo (round-robin).
   uint8_t ch = s->channels[s->next_idx];
   uint16_t cfg = rsh_ads1115_config_word(ch);
   uint8_t wbuf[2] = {(uint8_t)(cfg >> 8), (uint8_t)(cfg & 0xFF)};
-  if (write(RSH_ADS1115_I2C_ADDR, RSH_ADS1115_REG_CONFIG, wbuf, 2, user) != 0)
-    return -1;  // next_idx aage nahi — agla poll wahi channel dobara start karega
+  if (write(RSH_ADS1115_I2C_ADDR, RSH_ADS1115_REG_CONFIG, wbuf, 2, user) != 0) {
+    // P3-1: taaza value pehle hi store ho chuki — is poll ko kamyab
+    // mano (next_idx aage nahi — agla poll wahi channel dobara start karega).
+    // Koi taaza value na ho to -1 (value nahi badli).
+    return fresh ? 0 : -1;
+  }
   s->converting = (int8_t)ch;
   s->next_idx = (uint8_t)((s->next_idx + 1) % s->n_channels);
   return 0;

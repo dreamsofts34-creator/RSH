@@ -124,6 +124,14 @@ export component Modal inherits Rectangle {
         drop-shadow-blur: 24px;
         drop-shadow-offset-y: 8px;
         drop-shadow-color: #00000040;
+        // P1-2: a blocking TouchArea over the whole card, FIRST so
+        // the body paints above it — clicks on card background or
+        // labels stop here instead of falling through to the scrim
+        // TouchArea below (which closed the dialog and discarded
+        // typed input). It takes no input itself and never sits
+        // above an interactive child: buttons / inputs inside the
+        // body keep their own TouchAreas on top.
+        TouchArea { width: 100%; height: 100%; }
         body := CardBody {
             title: title;
             @children
@@ -228,6 +236,9 @@ export component Btn inherits Rectangle {
     width: btn-w > 0px ? btn-w : content.preferred-width + 24px;
     height: 30px; // not control-height (32px): Btn lives in the 30px top-bar row.
     border-radius: Theme.radius-control;
+    // P3-2: clip so an over-long label (fixed btn-w caller) can
+    // never paint outside the button's rounded edge.
+    clip: true;
     border-width: ghost ? 0px : 1px;
     // A5: hover + pressed feedback — primary lightens/darkens the
     // accent, secondary/destructive lift the border + fill on
@@ -253,9 +264,17 @@ export component Btn inherits Rectangle {
             return reject;
         }
     }
+    // The layout fills the button and CENTRES its content. It used
+    // to rely on `x: (parent.width - self.width) / 2`, but a layout
+    // with no explicit size takes the parent's size, so that was 0
+    // and the label sat at the left edge, off-centre (the "text
+    // aage-peeche" bug on every Btn).
     content := HorizontalLayout {
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        alignment: center;
         spacing: 6px;
         cross-axis-alignment: center;
         if has-icon : Image {
@@ -269,6 +288,10 @@ export component Btn inherits Rectangle {
             text: label;
             font-size: Theme.fs-label;
             font-weight: 600;
+            // P3-2: elide instead of overflowing when a fixed
+            // btn-w caller constrains the label (no caller does
+            // today — Btn sizes to content — this is defence).
+            overflow: elide;
             // White on accent (4.50:1); Theme.text on accent is 3.83:1 (audit FIX-2).
             color: primary ? #FFFFFF : destructive ? Theme.bad : Theme.text;
         }
@@ -576,6 +599,10 @@ export component ProfileButton inherits Rectangle {
     accessible-role: button;
     height: 30px; // not control-height (32px): this lives in the 30px top-bar row.
     border-radius: 8px;
+    // P2-6: a long profile name must elide, not push the bell
+    // button off-screen at 920 px — the button caps at 220 px and
+    // the name Text (stretch, elide) takes what is left.
+    max-width: 220px;
     border-width: 1px;
     border-color: fs.has-focus ? Theme.accent-text : (ta.has-hover ? Theme.faint : Theme.line);
     background: ta.pressed ? Theme.pressed-bg : (ta.has-hover ? Theme.hover-bg : Theme.panel);
@@ -599,7 +626,7 @@ export component ProfileButton inherits Rectangle {
         // 12px chevron centres against the label in the 30px button.
         cross-axis-alignment: center;
         if unsaved : Rectangle { width: 8px; height: 8px; border-radius: 4px; background: Theme.warn; }
-        Text { text: name; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
+        Text { horizontal-stretch: 1; min-width: 0px; text: name; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; overflow: elide; }
         Image { width: 12px; height: 12px; source: @image-url("../assets/icons/chevron.svg"); }
     }
     ta := TouchArea { mouse-cursor: pointer; clicked => { clicked(); } }
@@ -612,6 +639,9 @@ export component AutoProfileChip inherits Rectangle {
     callback pause-toggled();
     height: 30px; // not control-height (32px): this lives in the 30px top-bar row.
     border-radius: 8px;
+    // P2-6: same cap as ProfileButton — a long auto-profile name
+    // elides instead of pushing the bell off-screen at 920 px.
+    max-width: 300px;
     border-width: 1px;
     border-color: Theme.line;
     background: Theme.panel;
@@ -624,7 +654,7 @@ export component AutoProfileChip inherits Rectangle {
         cross-axis-alignment: center;
         Rectangle { width: 7px; height: 7px; border-radius: 4px; background: paused ? Theme.warn : Theme.accent-text; }
         Text { text: "Auto profile"; font-size: Theme.fs-label; color: Theme.mute; }
-        Text { text: game-profile; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; }
+        Text { horizontal-stretch: 1; min-width: 0px; text: game-profile; font-size: Theme.fs-label; font-weight: 600; color: Theme.text; overflow: elide; }
         Switch { accessible-name: "Pause auto profile"; on: !paused; toggled => { pause-toggled(); } }
     }
 }

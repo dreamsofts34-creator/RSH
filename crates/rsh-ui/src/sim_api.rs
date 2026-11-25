@@ -106,6 +106,7 @@ impl AppApi for SimApi {
             board_reachable: true,
             error: None,
             hint: None,
+            connect_started: None,
         }
     }
 
@@ -123,6 +124,7 @@ impl AppApi for SimApi {
             board_reachable: false,
             error: None,
             hint: None,
+            connect_started: None,
         })
     }
 

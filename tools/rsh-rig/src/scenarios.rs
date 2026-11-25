@@ -1242,7 +1242,7 @@ pub fn registry() -> Vec<Scenario> {
         },
         Scenario {
             id: "connect-unreachable",
-            description: "Connect-play (v2.2): no board — 3 HELLO timeouts -> Error(Unreachable), never Active.",
+            description: "Connect-play (v2.2): no board — the activator's HELLO wait exhausts -> session error Unreachable -> Error(Unreachable), never Active.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1587,7 +1587,7 @@ pub fn registry() -> Vec<Scenario> {
         // ---- Cards layout fix (2026-11-19): Extras ON/OFF size + responsive gaps ----
         Scenario {
             id: "gate-extras-card-size-source",
-            description: "Gate (cards fix, Bug 2), source audit: the 4 Extras module cards keep the OFF note and the ON body in the tree with `visible` (no `if` branches), so a card is the same size ON and OFF instead of collapsing when off.",
+            description: "Gate (cards fix, Bug 2), source audit: the 4 Extras module cards keep their exact ON size while OFF with the overlap/`visible` design — the ON body stays in the tree (`visible: false` keeps layout space), the OFF note is overlaid on the same space, centred vertically — no fixed pixel height, so the grid never reflows on toggle in any font environment.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),
@@ -1595,7 +1595,7 @@ pub fn registry() -> Vec<Scenario> {
                 metric: "selfCheck",
                 op: "==",
                 value: MetricValue::Str("pass"),
-                note: "Gate PASS: Extras cards use `visible` (no `if` size swap).",
+                note: "Gate PASS: Extras cards use overlap/`visible` (same size ON/OFF, no fixed height).",
                 min_duration_s: 0.0,
             }],
         },
@@ -1616,7 +1616,7 @@ pub fn registry() -> Vec<Scenario> {
         // ---- v2.0.2 gate checks, re-scan findings (B-1, B-2, H-3, H-4, M-9) ----
         Scenario {
             id: "gate-hid-uac-dwell",
-            description: "Gate (B-2): HID switch UAC dwell — spawn/hello wait covers 10 s + user thinking time (>= 60 s); decline yields one clear message, no retry loop, nothing installed.",
+            description: "Gate (B-2): HID switch UAC dwell — the spawn call absorbs the UAC prompt (ShellExecuteEx returns only once it is answered), the hello clock starts after spawn, and each post-spawn stage gets >= 30 s; decline yields one clear message, no retry loop, nothing installed.",
             durations: (0, 0, 0),
             wheel: WheelConfig::default(),
             harness: HarnessConfig::default(),

@@ -49,6 +49,7 @@ impl AppApi for StubApi {
             board_reachable: true,
             error: None,
             hint: None,
+            connect_started: None,
         }
     }
     fn connect(&self, _transport: ApiTransport) -> Result<ConnectionInfo, UserError> {
@@ -74,6 +75,29 @@ impl AppApi for StubApi {
         })
     }
     fn clear_wifi_password(&self) -> Result<WifiStatus, UserError> {
+        Ok(self.wifi_status())
+    }
+    /// v2.0.11: canned Wi-Fi scan + rejoin for the dispatch
+    /// round-trip — the real daemon drives `rejoin.rs` here.
+    fn scan_rsh_networks(&self) -> Vec<String> {
+        vec!["RSH-9A55".to_string(), "RSH-AB12".to_string()]
+    }
+    fn rejoin_wifi_open(&self, ssid: &str) -> Result<WifiStatus, UserError> {
+        if ssid.is_empty() {
+            return Err(UserError::from_connection(
+                rsh_api::ConnectionError::Unknown,
+                "SSID must not be empty — pick a wheel network first",
+            ));
+        }
+        Ok(self.wifi_status())
+    }
+    fn rejoin_wifi(&self, ssid: &str, _password: &str) -> Result<WifiStatus, UserError> {
+        if ssid.is_empty() {
+            return Err(UserError::from_connection(
+                rsh_api::ConnectionError::Unknown,
+                "SSID must not be empty — pick a wheel network first",
+            ));
+        }
         Ok(self.wifi_status())
     }
     fn snapshot(&self) -> SnapshotInfo {
@@ -269,6 +293,55 @@ async fn assert_shifter_sensitivity_round_trip(client: &IpcClient) {
     );
 }
 
+/// v2.0.11: Wi-Fi scan + rejoin round-trip over the same socket —
+/// these three methods had no dispatch arm, so every call failed
+/// with `UnknownMethod` even though the UI sends them (the
+/// wizard's "Join wheel Wi-Fi" flow calls `scan_rsh_networks` +
+/// `rejoin_wifi_open`).
+async fn assert_wifi_rejoin_round_trip(client: &IpcClient) {
+    let networks = client
+        .call("scan_rsh_networks", serde_json::json!({}))
+        .await
+        .expect("scan_rsh_networks");
+    let networks: Vec<String> =
+        serde_json::from_value(networks).expect("scan result parses as a bare SSID array");
+    assert_eq!(
+        networks,
+        vec!["RSH-9A55".to_string(), "RSH-AB12".to_string()]
+    );
+
+    let joined = client
+        .call("rejoin_wifi_open", serde_json::json!({"ssid": "RSH-9A55"}))
+        .await
+        .expect("rejoin_wifi_open");
+    let status: WifiStatus =
+        serde_json::from_value(joined).expect("rejoin result parses as WifiStatus");
+    assert_eq!(status.ssid.as_deref(), Some("RSH-9A55"));
+    assert!(status.connected);
+
+    let joined = client
+        .call(
+            "rejoin_wifi",
+            serde_json::json!({"ssid": "RSH-9A55", "password": "password1"}),
+        )
+        .await
+        .expect("rejoin_wifi");
+    let status: WifiStatus =
+        serde_json::from_value(joined).expect("rejoin result parses as WifiStatus");
+    assert_eq!(status.ssid.as_deref(), Some("RSH-9A55"));
+    assert!(status.connected);
+
+    // A failed rejoin carries the reason, not a bare "Unknown".
+    let err = client
+        .call("rejoin_wifi_open", serde_json::json!({"ssid": ""}))
+        .await
+        .expect_err("an empty SSID must be rejected");
+    assert!(
+        format!("{err:?}").contains("SSID must not be empty"),
+        "unexpected error: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn ipc_round_trip_ping_version_connection_and_event() {
     let dir = std::env::temp_dir().join(format!("rsh-ipc-test-{}", std::process::id()));
@@ -366,6 +439,9 @@ async fn ipc_round_trip_ping_version_connection_and_event() {
 
     // SH1 shifter sensitivity round-trip over the same socket.
     assert_shifter_sensitivity_round_trip(&client).await;
+
+    // v2.0.11 Wi-Fi scan + rejoin round-trip over the same socket.
+    assert_wifi_rejoin_round_trip(&client).await;
 
     serve.abort();
     let _ = std::fs::remove_dir_all(&dir);

@@ -15,7 +15,10 @@
 //   - 12-bit raw 0..4095 = 0..359.912°, 0.0879°/LSB.
 //   - mV mapping: raw * 3300 / 4095 (D6 — sab axes mV, 0..3300).
 //   - Turn counter: i12 wrap-aware delta (encoders.h ke i16 delta jaisa);
-//     boot par turns = 0 (power loss se count bhool jata hai).
+//     boot par turns = 0 (power loss se count bhool jata hai) — boot
+//     angle mapped window ka CENTRE hai (rsh_as5600_steps_to_mv:
+//     ±half-rotation boot ke gird, full-left-lock par boot ki zaroorat
+//     nahi — P1-2).
 //   - Glitch rule: ek 5 ms tick mein > 90° (1024 steps) ka jump namumkin
 //     hai (90°/tick @200 Hz = 3000 RPM) — aisa jump glitch hai, count nahi.
 #include <stdint.h>
@@ -90,15 +93,33 @@ static inline uint16_t rsh_as5600_raw_to_mv(uint16_t raw) {
 }
 
 // ---- Cumulative steps -> mV (multi-turn mode, D34) ----
-// total_steps: turn tracker se cumulative steps (0..rotation_steps).
+// Centre-boot mapping (P1-2 fix — research-first decision):
+// the turn counter is RELATIVE — there is no absolute index, so the
+// boot angle is the centre of the mapped window, NOT full-left.
+// total_steps in [-rotation_steps/2, +rotation_steps/2] maps linearly
+// to [0, 3300] mV (boot = 1650 mV); travel past either end clamps.
+//   * Why not clamp [0, rotation_steps] (old code)? A wheel rests at
+//     centre and reboots happen at any angle — booted centred, all
+//     left travel read 0 mV (full-left) and PC calibration could NOT
+//     fix it: the clamp destroyed the information (left half all 0).
+//   * Why not boot-at-full-left-lock? It is unenforceable — watchdog
+//     / power-loss reboots happen mid-drive at arbitrary angles, and
+//     a user-hostile boot ritual is not a sensor spec. Centre-boot
+//     preserves full ±half-rotation travel around ANY boot angle;
+//     PC calibration maps the observed min/max to the lock ends, so
+//     a boot off-centre only shifts the window, it never destroys
+//     half the travel.
+//   * rotation_steps is always even (4096/6144/10240); the /2 is exact.
+// total_steps: turn tracker se cumulative steps (manfi bhi ho sakta hai).
 // rotation_steps: 4096 (360°) / 6144 (540°) / 10240 (900°).
 // Range se bahar clamp hota hai — kabhi 0..3300 se bahar mV nahi jata.
 static inline uint16_t rsh_as5600_steps_to_mv(int32_t total_steps,
                                               int32_t rotation_steps) {
   if (rotation_steps <= 0) rotation_steps = RSH_AS5600_ROT_360_STEPS;
-  if (total_steps < 0) total_steps = 0;
-  if (total_steps > rotation_steps) total_steps = rotation_steps;
-  return (uint16_t)(((int64_t)total_steps * (int64_t)RSH_AS5600_MV_FULL) /
+  int64_t centred = (int64_t)total_steps + rotation_steps / 2;
+  if (centred < 0) centred = 0;
+  if (centred > rotation_steps) centred = rotation_steps;
+  return (uint16_t)(centred * (int64_t)RSH_AS5600_MV_FULL /
                     (int64_t)rotation_steps);
 }
 
@@ -152,7 +173,7 @@ typedef struct {
   uint16_t raw;       // 0..4095 (RAWANGLE)
   uint8_t status;     // STATUS byte (raw)
   uint8_t agc;        // AGC byte
-  uint8_t valid;      // 1 = I2C theek + MD=1 (angle par bharosa karo)
+  uint8_t valid;      // 1 = I2C theek + MD=1 + AGC band mein (angle par bharosa karo)
   uint8_t magnet_ok;  // MD bit (STATUS decode)
 } RshAs5600Sample;
 
@@ -181,7 +202,11 @@ static inline int rsh_as5600_read(rsh_as5600_i2c_read_fn read, void *user,
   out->agc = gb[0];
   RshAs5600Status st = rsh_as5600_status_decode(sb[0]);
   out->magnet_ok = st.magnet_detected;
-  out->valid = st.magnet_detected;
+  // P2-4: AGC band bhi validity ka hissa hai — magnet detected (MD=1)
+  // hone ke bawajood AGC 16..112 se bahar ho to magnet gap ghalat hai
+  // (angle par bharosa nahi). rsh_as5600_agc_ok pehle kabhi call hi
+  // nahi hota tha — sirf define tha.
+  out->valid = (uint8_t)(st.magnet_detected && rsh_as5600_agc_ok(out->agc));
   return 0;
 }
 

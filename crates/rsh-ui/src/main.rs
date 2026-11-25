@@ -967,7 +967,7 @@ enum JobKind {
     Reconnect,
     /// Transport switch (`connect`).
     Transport,
-    /// Output-backend switch (`set_output_backend`, up to 75 s while
+    /// Output-backend switch (`set_output_backend`, up to 390 s while
     /// the user answers UAC + the sidecar spawns).
     Backend,
     /// Firmware check (board vs bundled version).
@@ -1031,7 +1031,13 @@ impl JobKind {
             // 15 s bound (the seed is ~35 round-trips on a live
             // daemon; a dead one fails fast per call).
             JobKind::Reconnect | JobKind::ReconnectSeed => Duration::from_secs(15),
-            JobKind::Backend => Duration::from_secs(80),
+            // P1-1 (update4-fix): 420 s. Must exceed the 390 s
+            // backend-switch IPC bound (see `IpcApi::set_output_backend`),
+            // which itself must exceed the daemon worst case incl. a
+            // 60 s UAC allowance (370 s). Invariant: job (420 s) >
+            // IPC (390 s) > worst case incl. UAC (370 s) > worst
+            // case post-UAC (310 s).
+            JobKind::Backend => Duration::from_secs(420),
             // FirmwareUpdate is 10 s on purpose (A9); settings ops
             // share it — they can cross a UAC prompt (HIDMaestro
             // enable), the same bound the old callers tolerated,
@@ -1167,6 +1173,9 @@ const SETUP_STEP_DEBOUNCE: Duration = Duration::from_millis(300);
 /// the 1 Hz tick clears it (requested: every error hides after ~1 s;
 /// the tick granularity makes the real range 1–2 s).
 const STATUS_ERROR_LIFETIME: Duration = Duration::from_secs(1);
+/// How long an informational message stays (P1-3: info + success
+/// both live 4 s — long enough to read, unlike the 1 s error flash).
+const STATUS_INFO_LIFETIME: Duration = Duration::from_secs(4);
 
 /// F12 (v2.0.3): a death within this long after a reconnect belongs
 /// to the same flapping burst — its down-notify is collapsed into
@@ -3310,22 +3319,27 @@ impl Ctx {
         }
     }
 
-    /// Show a typed error gracefully (B6): the title is the plain
-    /// headline, the body is what happened + the next step — never a
-    /// raw code or stack trace. The daemon maps untyped state errors
-    /// to `Unknown` with the real message in `detail`, so a generic
-    /// "Something went wrong." is replaced by that detail, and an
-    /// "Unknown" title by a plain one.
+    /// The (title, body) pair [`Self::notify_error`] shows for a
+    /// `UserError` — the title is the plain headline, the body is
+    /// what happened + the next step, never a raw code or stack
+    /// trace. The daemon maps untyped state errors to `Unknown`
+    /// with the real message in `detail`, so a generic "Something
+    /// went wrong." is replaced by that detail, and an "Unknown"
+    /// title by a plain one.
     ///
     /// R3-D-15: the title is now a human headline, so the
     /// generic-error check keys on `code`, not `title` (the old
     /// `title == "Unknown"` check could never fire once the title
     /// stopped being the raw code).
-    fn notify_error(&self, win: &MainWindow, kind: &str, err: &UserError) {
+    ///
+    /// Shared with the game dialog's inline error (P1-7), so the
+    /// dialog shows exactly the text the status bar + drawer show,
+    /// never a second wording.
+    fn error_title_body(err: &UserError) -> (String, String) {
         let title = if err.code == "Unknown" {
-            "Couldn't complete that"
+            "Couldn't complete that".to_string()
         } else {
-            err.title.as_str()
+            err.title.clone()
         };
         let happened = match (&err.detail, err.what_happened.as_str()) {
             (Some(detail), "Something went wrong.") => detail.clone(),
@@ -3344,12 +3358,20 @@ impl Ctx {
         } else {
             format!("{happened} {}", err.what_to_do)
         };
-        self.notify(win, kind, title, &body);
+        (title, body)
+    }
+
+    /// Show a typed error gracefully (B6): drawer entry + the
+    /// transient status-bar message (see [`Self::error_title_body`]
+    /// for the title/body wording).
+    fn notify_error(&self, win: &MainWindow, kind: &str, err: &UserError) {
+        let (title, body) = Self::error_title_body(err);
+        self.notify(win, kind, &title, &body);
         // B01 (was DS-24): the failure also surfaces in place, as
         // a transient status-bar message on the current screen — a
         // user who never opens the bell drawer still sees that an
         // action failed.
-        self.set_toast(win, title, &body);
+        self.set_toast(win, &title, &body);
     }
 
     // D17: `notify_error_urgent` is DELETED — no failure ever
@@ -3372,16 +3394,20 @@ impl Ctx {
     /// results — "RSH isn't running", "Admin permission needed",
     /// "Game refused", timeouts. Same status-bar-only rule as
     /// [`Self::notify_error`]: the drawer never auto-opens.
+    /// P1-3: informational, NOT an error — it renders with the
+    /// neutral "info" kind (panel background, plain title, no red),
+    /// never the red error paint `set_toast` gives failures.
     fn notify_toast(&self, win: &MainWindow, kind: &str, title: &str, body: &str) {
         self.notify(win, kind, title, body);
-        self.set_toast(win, title, body);
+        self.set_toast_info(win, title, body);
     }
 
     /// Show a failure in the bottom `StatusBar` (B01, was the DS-24
-    /// toast): title + body on the current screen for 8 s, then
-    /// the 1 Hz tick clears it. Skipped while the window is hidden
-    /// (F27: no property writes on a hidden window) — the
-    /// notification itself is still stored and synced on reopen.
+    /// toast): title + body on the current screen for 1 s (see
+    /// `STATUS_ERROR_LIFETIME`), then the 1 Hz tick clears it.
+    /// Skipped while the window is hidden (F27: no property writes
+    /// on a hidden window) — the notification itself is still stored
+    /// and synced on reopen.
     /// FULL text, never truncated: the bar elides the one line
     /// visually (H4: the drawer carries the same full text). A
     /// status already showing means this message supersedes it:
@@ -3405,8 +3431,30 @@ impl Ctx {
             .set(Some(Instant::now() + STATUS_ERROR_LIFETIME));
     }
 
+    /// Show an informational message in the bottom `StatusBar`
+    /// (P1-3): same shape as [`Self::set_toast_success`] — neutral
+    /// "info" kind (panel background, plain title, no icon), never
+    /// the red error paint. Lives 4 s (`STATUS_INFO_LIFETIME`).
+    fn set_toast_info(&self, win: &MainWindow, title: &str, body: &str) {
+        if self.hidden.load(Ordering::SeqCst) {
+            return;
+        }
+        let more = if self.status_until.get().is_some() {
+            win.get_status_more() + 1
+        } else {
+            0
+        };
+        win.set_status_kind("info".into());
+        win.set_status_title(title.into());
+        win.set_status_text(body.into());
+        win.set_status_more(more);
+        ui_log!("RSH-UI status shown (info): {title} — {body}");
+        self.status_until
+            .set(Some(Instant::now() + STATUS_INFO_LIFETIME));
+    }
+
     /// Show a success in the bottom `StatusBar` (B01, was the D17
-    /// toast): same 8 s / 4 s rule as [`Self::set_toast`] — success
+    /// toast): same 1 s / 4 s rule as [`Self::set_toast`] — success
     /// lives 4 s. Same full text, same +N counter.
     fn set_toast_success(&self, win: &MainWindow, title: &str, body: &str) {
         if self.hidden.load(Ordering::SeqCst) {
@@ -3427,9 +3475,9 @@ impl Ctx {
     }
 
     /// Clear an expired status-bar message (B01, was the DS-24
-    /// toast, 1 Hz): the error lives 8 s / success 4 s from the
-    /// last message, then vanishes — a newer message re-arms the
-    /// deadline via [`Self::set_toast`].
+    /// toast, 1 Hz): the error lives 1 s / info + success 4 s from
+    /// the last message, then vanishes — a newer message re-arms
+    /// the deadline via [`Self::set_toast`].
     fn check_status_expiry(&self, win: &MainWindow) {
         let Some(until) = self.status_until.get() else {
             return;
@@ -4433,7 +4481,7 @@ impl Ctx {
     }
 
     /// Start an output-backend switch job (A9/B-2): `set_output_backend`
-    /// runs on a background thread with its 75 s bound (UAC dwell +
+    /// runs on a background thread with its 390 s bound (UAC dwell +
     /// 60 s sidecar spawn). Switching to `HIDMaestro` warns first —
     /// Windows will ask once for admin permission. A second switch
     /// while one is in flight is ignored (no re-spawn loop, A10).
@@ -4473,7 +4521,7 @@ impl Ctx {
         // time-based relabel to "Waiting for admin permission…"
         // would claim knowledge the UI does not have (it stayed
         // stuck on that label after the prompt was answered). The
-        // 75 s timeout already ends the job with a clear error.
+        // 420 s timeout already ends the job with a clear error.
         let api = self.api();
         self.run_job(
             win,
@@ -7068,10 +7116,13 @@ impl Ctx {
     /// Open the add/edit game dialog for a new game (`None`) or
     /// the game with this id. Games are manual-only: the exe path
     /// comes from the native file picker (Browse — see
-    /// [`Ctx::pick_game_exe`]), and [`GameSummary`] carries no exe
-    /// path, so Edit pre-fills the name + bound profile and the exe
-    /// field starts empty — the user picks the file again with
-    /// Browse. Refuses
+    /// [`Ctx::pick_game_exe`]). Edit pre-fills the name, the bound
+    /// profile and the exe path from the game's stored `exe_path`
+    /// (P2-3: the games list returns it, so a pure rename saves
+    /// without re-browsing — Save is disabled while the exe field
+    /// is empty). An empty stored path (unknown/legacy game) falls
+    /// back to an empty exe field, so Browse is still required;
+    /// Add always starts empty. Refuses
     /// while RSH isn't running: there is no store to save to, so
     /// say so instead of opening a dialog whose Save can only fail.
     fn open_game_dialog(&self, win: &MainWindow, edit_id: Option<String>) {
@@ -7101,13 +7152,18 @@ impl Ctx {
             );
             return;
         }
-        let (title, name, profile_id) = match &game {
+        let (title, name, profile_id, exe) = match &game {
             Some(g) => (
                 "Edit game".to_string(),
                 g.name.clone(),
                 g.bound_profile_id.clone(),
+                // P2-3: pre-fill the stored exe path so a pure
+                // rename saves without re-browsing; empty when the
+                // game has no stored path (unknown/legacy), which
+                // keeps the old behaviour — Browse required.
+                g.exe_path.clone(),
             ),
-            None => ("Add game".to_string(), String::new(), None),
+            None => ("Add game".to_string(), String::new(), None, String::new()),
         };
         *self.game_dialog_edit_id.borrow_mut() = edit_id;
         self.game_dialog_profile_id
@@ -7115,7 +7171,10 @@ impl Ctx {
             .clone_from(&profile_id);
         win.set_game_dialog_title(title.into());
         win.set_game_dialog_name(name.into());
-        win.set_game_dialog_exe("".into());
+        win.set_game_dialog_exe(exe.into());
+        // P1-7: a previous save error never survives into a fresh
+        // dialog — the inline error starts empty every open.
+        win.set_game_dialog_error("".into());
         win.set_game_dialog_profile_name(
             self.game_dialog_profile_label(profile_id.as_ref()).into(),
         );
@@ -7209,7 +7268,17 @@ impl Ctx {
     fn save_game_dialog(&self, win: &MainWindow, name: &str, exe: &str) {
         let name = name.trim().to_string();
         let exe = exe.trim().to_string();
+        // P1-7: a new save attempt clears the previous inline
+        // error first — a stale reason must never sit under a
+        // fresh attempt.
+        win.set_game_dialog_error("".into());
         if name.is_empty() || exe.is_empty() {
+            // P1-7: the validation refusal is inline too — the
+            // dialog stays open, so the reason belongs in it, not
+            // only in the 1 s status bar.
+            win.set_game_dialog_error(
+                "Choose the game's file with Browse, and enter a name.".into(),
+            );
             self.notify_error(
                 win,
                 "Game",
@@ -7261,7 +7330,17 @@ impl Ctx {
                             &body,
                         );
                     }
-                    Err(e) => ctx.notify_error(w, "Game", &e),
+                    Err(e) => {
+                        // P1-7: the daemon's error, inline in the
+                        // dialog — the same wording the status bar +
+                        // drawer show (see `error_title_body`). The
+                        // dialog stays open on failure; without this
+                        // the failed save looked inert after the 1 s
+                        // status message expired.
+                        let (_title, body) = Ctx::error_title_body(&e);
+                        w.set_game_dialog_error(body.into());
+                        ctx.notify_error(w, "Game", &e);
+                    }
                 }
             },
         );
@@ -8749,7 +8828,7 @@ fn wire_setup_vjoy(win: &MainWindow, ctx: &Rc<Ctx>) {
         win.unwrap().on_setup_use_hidmaestro(move || {
             if let Some(w) = win.upgrade() {
                 // A9/B-2/A10: the shared backend-switch job (warn +
-                // 75 s bound); the wizard's fallback flag is set in
+                // 390 s bound); the wizard's fallback flag is set in
                 // the job drain on success.
                 ctx.start_backend_job(&w, 0);
             }
@@ -11428,7 +11507,7 @@ fn wire_transport(win: &MainWindow, ctx: &Rc<Ctx>) {
                 return;
             };
             // A9/B-2/A10: the switch runs on a background job with
-            // its 75 s bound (UAC dwell + 60 s sidecar spawn) — the
+            // its 390 s bound (UAC dwell + daemon stages) — the
             // click returns immediately; a failure (including a UAC
             // decline) reverts the switch in the job drain.
             ctx.start_backend_job(&w, i);
@@ -13053,6 +13132,71 @@ mod tests {
         assert_eq!(pretty_game_slug("dirt_rally_2"), "Dirt Rally 2");
     }
 
+    /// P2-3: Edit pre-fills the exe path from the game's stored
+    /// `exe_path`, so a pure rename saves without re-browsing
+    /// (Save is disabled while the exe field is empty). Add still
+    /// starts empty, and a game with no stored path (unknown /
+    /// legacy) falls back to empty + Browse required.
+    #[test]
+    fn edit_game_dialog_prefills_exe_path() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("game dialog test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, _dir) = fc2_test_ctx();
+        *ctx.games_cache.borrow_mut() = vec![
+            GameSummary {
+                id: "ets2".to_string(),
+                name: "Euro Truck Simulator 2".to_string(),
+                exe_path: r"C:\Games\ETS2\eurotrucks2.exe".to_string(),
+                running: false,
+                installed: true,
+                bound_profile_id: None,
+            },
+            GameSummary {
+                id: "legacy".to_string(),
+                name: "Legacy Game".to_string(),
+                exe_path: String::new(),
+                running: false,
+                installed: false,
+                bound_profile_id: None,
+            },
+        ];
+        {
+            let mut state = ctx.state.borrow_mut();
+            state.live = true;
+        }
+
+        ctx.open_game_dialog(&win, Some("ets2".to_string()));
+        assert!(win.get_game_dialog_open(), "dialog must open for edit");
+        assert_eq!(win.get_game_dialog_title().as_str(), "Edit game");
+        assert_eq!(
+            win.get_game_dialog_name().as_str(),
+            "Euro Truck Simulator 2"
+        );
+        assert_eq!(
+            win.get_game_dialog_exe().as_str(),
+            r"C:\Games\ETS2\eurotrucks2.exe",
+            "edit pre-fills the stored exe path"
+        );
+
+        ctx.open_game_dialog(&win, Some("legacy".to_string()));
+        assert_eq!(
+            win.get_game_dialog_exe().as_str(),
+            "",
+            "empty stored path falls back to empty + Browse required"
+        );
+
+        ctx.open_game_dialog(&win, None);
+        assert_eq!(win.get_game_dialog_title().as_str(), "Add game");
+        assert_eq!(win.get_game_dialog_name().as_str(), "");
+        assert_eq!(
+            win.get_game_dialog_exe().as_str(),
+            "",
+            "add still starts empty"
+        );
+    }
+
     #[test]
     fn user_text_never_says_daemon() {
         // L3: the background service is called "RSH" now.
@@ -14462,6 +14606,7 @@ mod tests {
             board_reachable: true,
             error: None,
             hint: None,
+            connect_started: None,
         };
 
         // Non-flap setup: down 60 s ago — the connected notify is
@@ -15068,7 +15213,8 @@ mod tests {
 
     // D17 (was DS-24): a failure shows in the status bar and NEVER
     // opens the drawer — the drawer opens only on bell click. The
-    // error lives 8 s, then the 1 Hz expiry clears it. A success
+    // error lives 1 s, then the 1 Hz expiry clears it (P3-1: the
+    // old "8 s" here was stale — the code is 1 s). A success
     // shows the same way, with the ok-accent kind.
     #[test]
     fn d17_failure_status_never_opens_drawer() {
@@ -15102,7 +15248,7 @@ mod tests {
         ctx.check_status_expiry(&win);
         assert_ne!(win.get_status_text().as_str(), "");
 
-        // Past the 8 s deadline: the expiry clears it (and the kind
+        // Past the 1 s deadline: the expiry clears it (and the kind
         // resets to error).
         ctx.status_until.set(Some(
             Instant::now()

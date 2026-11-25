@@ -22,8 +22,8 @@ use rsh_api::{ConnEvent, ConnectionManager};
 use rsh_app_core::commands::{set_shifter_sensitivity_in_config, shifter_sensitivity_from_config};
 use rsh_app_core::snapshot::EngineSnapshot;
 use rsh_app_core::state::{
-    AppSettingsPatch, AppStateCore, GameInfo, ProfileSummary as CoreProfileSummary, TransportKind,
-    TransportState,
+    AppSettingsPatch, AppStateCore, ConnectOutcome, GameInfo, ProfileSummary as CoreProfileSummary,
+    TransportKind, TransportState,
 };
 
 /// Feed window for the F20 watchdog frame feed (see
@@ -328,6 +328,8 @@ impl DaemonApi {
             board_reachable: transport_state.board_reachable,
             error,
             hint,
+            // P2-3: no connect was attempted for this read.
+            connect_started: None,
         }
     }
 
@@ -368,23 +370,26 @@ impl AppApi for DaemonApi {
     /// dead activation, tripped breaker), `connect_transport`
     /// spawns a fresh forwarder at once. When an activation or a
     /// forwarder retry wait IS in flight, `connect_transport`
-    /// no-ops instead of tearing that forwarder down — and this
-    /// still returns `Ok`, but with the LIVE connection state
-    /// (`Backoff` → "Reconnecting", `LinkUp`/`Hello` →
-    /// "Connecting"): the returned state is the honest status, not
-    /// a claim that a fresh connection started. (A full
-    /// accepted-vs-already-connecting distinction would need an IPC
-    /// schema change; R3-D-14 owns the error mapping here.)
+    /// no-ops instead of tearing that forwarder down.
+    /// P2-3 (v2.0.11): the reply now says which happened —
+    /// `ConnectionInfo.connect_started` is `Some(true)` when a
+    /// fresh (re)connect started and `Some(false)` when the call
+    /// no-op'd as already-retrying. The returned state is still
+    /// the live connection state (`Backoff` → "Reconnecting",
+    /// `LinkUp`/`Hello` → "Connecting").
     fn connect(&self, transport: ApiTransport) -> Result<ConnectionInfo, UserError> {
         let kind = match transport {
             ApiTransport::Wifi => TransportKind::Udp,
             ApiTransport::Usb => TransportKind::Serial,
         };
-        self.state
-            .connect_transport(kind)
+        let outcome = self
+            .state
+            .connect_transport_with_outcome(kind)
             .map_err(classify_connect_error)?;
         self.manager_event(ConnEvent::Connect);
-        Ok(self.connection())
+        let mut info = self.connection();
+        info.connect_started = Some(outcome == ConnectOutcome::Started);
+        Ok(info)
     }
 
     fn disconnect(&self) -> Result<ConnectionInfo, UserError> {
@@ -403,6 +408,40 @@ impl AppApi for DaemonApi {
         crate::rejoin::scan_rsh_networks()
     }
 
+    /// Join a board hotspot that has no password (open AP, D5):
+    /// the first-connect flow's rejoin step. v2.0.11: this
+    /// override was missing, so the trait default answered every
+    /// IPC `rejoin_wifi_open` with "not supported by this API"
+    /// even once dispatch reached it — the wizard's "Join wheel
+    /// Wi-Fi" flow could never succeed. On Linux the rejoin
+    /// helper returns the exact manual steps instead of
+    /// pretending to work; on Windows it writes the open WLAN
+    /// profile and connects.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the network cannot be joined.
+    fn rejoin_wifi_open(&self, ssid: &str) -> Result<WifiStatus, UserError> {
+        crate::rejoin::rejoin_wifi_open(ssid).map_err(|error| {
+            UserError::from_connection(ConnectionError::Unknown, error.to_string())
+        })?;
+        Ok(self.state.wifi_status())
+    }
+
+    /// Join a board hotspot with its stored password (D5/D8).
+    /// v2.0.11: same missing-override gap as `rejoin_wifi_open`
+    /// above — the trait default always errored.
+    ///
+    /// # Errors
+    ///
+    /// [`UserError`] when the network cannot be joined.
+    fn rejoin_wifi(&self, ssid: &str, password: &str) -> Result<WifiStatus, UserError> {
+        crate::rejoin::rejoin_wifi(ssid, password).map_err(|error| {
+            UserError::from_connection(ConnectionError::Unknown, error.to_string())
+        })?;
+        Ok(self.state.wifi_status())
+    }
+
     /// Set (or change) the board Wi-Fi password (D19 + D8): validate
     /// here (8–63 printable ASCII, no space — the protocol rule —
     /// and the confirmation must match), then the core sets it on
@@ -410,10 +449,11 @@ impl AppApi for DaemonApi {
     /// the daemon updates the Windows WLAN profile in the same IPC
     /// call (the app-core has no netsh layer, so the profile update
     /// lives here — the closest faithful variant of D8's "same
-    /// transaction"). If the profile update fails after the board
-    /// password changed, the error says so plainly: the board
-    /// password changed but the PC profile is stale, so the user
-    /// must rejoin the network manually with the new password.
+    /// transaction"). P2-6 (v2.0.11): no atomicity is possible
+    /// across board + OS, so when the profile update fails the
+    /// daemon attempts a board password rollback to the previous
+    /// password and always reports the partial state plainly —
+    /// which password is live on the board and what to rejoin with.
     ///
     /// # Errors
     ///
@@ -440,6 +480,13 @@ impl AppApi for DaemonApi {
                 "no board observed yet — join an RSH-XXXX network first, then set the password",
             )
         })?;
+        // P2-6 (v2.0.11): read the previous password BEFORE the
+        // board password changes, so a failed profile update can
+        // roll the board back to it. `None` = first set (open AP,
+        // nothing to roll back to) — then a profile failure leaves
+        // the board on the new password and the message must say
+        // so plainly.
+        let previous_password = self.state.stored_wifi_password();
         self.state
             .set_password(password)
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
@@ -448,12 +495,35 @@ impl AppApi for DaemonApi {
         // cannot drive NetworkManager here) — the board password
         // already changed, so surface that explicitly.
         if let Err(error) = crate::rejoin::rejoin_wifi(&ssid, password) {
-            return Err(UserError::from_connection(
-                ConnectionError::Unknown,
-                format!(
-                    "the board Wi-Fi password changed, but the PC Wi-Fi profile could not be updated ({error}) — rejoin the '{ssid}' network manually with the new password"
+            // No atomicity is possible across board + OS: try to
+            // roll the board back to the previous password (the
+            // board change needs the *current* password, which is
+            // now the new one — exactly what `set_password` sends
+            // — so this succeeds when the board is still reachable).
+            // Best-effort: whatever happens, the message states the
+            // partial state plainly with the manual rejoin step.
+            return Err(match previous_password {
+                Some(previous) => match self.state.set_password(&previous) {
+                    Ok(()) => UserError::from_connection(
+                        ConnectionError::Unknown,
+                        format!(
+                            "the PC Wi-Fi profile for '{ssid}' could not be updated ({error}) — the board Wi-Fi password was restored to the previous one, so the old password still works; rejoin the '{ssid}' network manually with the previous password if the PC does not reconnect"
+                        ),
+                    ),
+                    Err(rollback_error) => UserError::from_connection(
+                        ConnectionError::Unknown,
+                        format!(
+                            "the board Wi-Fi password changed to the new password, but the PC Wi-Fi profile could not be updated ({error}) — and restoring the previous board password also failed ({rollback_error}); rejoin the '{ssid}' network manually with the NEW password"
+                        ),
+                    ),
+                },
+                None => UserError::from_connection(
+                    ConnectionError::Unknown,
+                    format!(
+                        "the board Wi-Fi password changed, but the PC Wi-Fi profile could not be updated ({error}) — there was no previous password to roll back to; rejoin the '{ssid}' network manually with the new password"
+                    ),
                 ),
-            ));
+            });
         }
         Ok(self.state.wifi_status())
     }
@@ -884,6 +954,19 @@ impl AppApi for DaemonApi {
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
     }
 
+    fn add_game_with_key(
+        &self,
+        name: &str,
+        exe_path: &str,
+        profile_id: Option<String>,
+        idempotency_key: Option<&str>,
+    ) -> Result<GameSummary, UserError> {
+        self.state
+            .add_manual_game_with_key(name, exe_path, profile_id, idempotency_key)
+            .map(|game| to_api_game(&game))
+            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))
+    }
+
     fn update_game(
         &self,
         id: &str,
@@ -1248,6 +1331,7 @@ fn to_api_game(game: &GameInfo) -> GameSummary {
     GameSummary {
         id: game.id.clone(),
         name: game.name.clone(),
+        exe_path: game.exe_path.clone(),
         running: game.running,
         installed: game.installed,
         bound_profile_id: game.bound_profile_id.clone(),
@@ -1273,8 +1357,17 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("rsh-daemon-capture-{name}-{}", std::process::id()));
+        // Unique per call: several tests share `live_api()` and
+        // used to wipe the SAME dir (`remove_dir_all` in here)
+        // while another test was mid-`activate_profile` — a
+        // "profile store I/O error: No such file or directory"
+        // race. Each call gets its own dir now.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "rsh-daemon-capture-{name}-{}-{n}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
@@ -1323,6 +1416,27 @@ mod tests {
             stats.ipc_p50_ms.is_some() && stats.ipc_p99_ms.is_some(),
             "global aggregate still filled: {stats:?}"
         );
+    }
+
+    /// P2-3: a fresh `connect` reports that it started one
+    /// (`connect_started: Some(true)`), while a plain
+    /// `connection()` read carries no connect outcome (`None`).
+    #[test]
+    fn connect_reports_started_on_a_fresh_connect() {
+        let (api, _dir) = live_api();
+        let info = api.connect(ApiTransport::Wifi).expect("connect");
+        assert_eq!(
+            info.connect_started,
+            Some(true),
+            "a fresh connect started a (re)connect"
+        );
+        let plain = api.connection();
+        assert_eq!(
+            plain.connect_started, None,
+            "a plain read carries no connect outcome"
+        );
+        let _ = api.disconnect();
+        let _ = api.state.stop_engine();
     }
 
     /// R3-D-14: daemon-internal faults must not surface as

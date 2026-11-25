@@ -386,7 +386,19 @@ pub fn acquire(data_dir: &std::path::Path) -> Result<AcquireOutcome, String> {
                 // owner wrote, so the second instance can name it.
                 return Ok(AcquireOutcome::AlreadyRunning(recorded_pid(data_dir)));
             }
-            let pid_path = write_pid_file(data_dir).unwrap_or_else(|_| pid_file_path(data_dir));
+            let pid_path = write_pid_file(data_dir).map_err(|error| {
+                // P2-5 (v2.0.11): fail closed — the old
+                // `unwrap_or_else` claimed the lock without the pid
+                // file, so a second instance reported
+                // `AlreadyRunning(None)` and could never name the
+                // owner. Release the mutex first so a failed acquire
+                // holds nothing.
+                let _ = unsafe { CloseHandle(handle) };
+                format!(
+                    "cannot write daemon pid file {}: {error}",
+                    pid_file_path(data_dir).display()
+                )
+            })?;
             Ok(AcquireOutcome::First(SingleInstance::Mutex {
                 handle,
                 pid_path,
@@ -448,7 +460,14 @@ fn acquire_local_mutex(data_dir: &std::path::Path, user: &str) -> Result<Acquire
         let _ = unsafe { CloseHandle(handle) };
         return Ok(AcquireOutcome::AlreadyRunning(recorded_pid(data_dir)));
     }
-    let pid_path = write_pid_file(data_dir).unwrap_or_else(|_| pid_file_path(data_dir));
+    let pid_path = write_pid_file(data_dir).map_err(|error| {
+        // P2-5 (v2.0.11): fail closed — see the `Global` path above.
+        let _ = unsafe { CloseHandle(handle) };
+        format!(
+            "cannot write daemon pid file {}: {error}",
+            pid_file_path(data_dir).display()
+        )
+    })?;
     Ok(AcquireOutcome::First(SingleInstance::Mutex {
         handle,
         pid_path,

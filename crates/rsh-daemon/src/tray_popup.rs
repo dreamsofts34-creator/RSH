@@ -836,6 +836,7 @@ mod tests {
                 board_reachable: true,
                 error: None,
                 hint: None,
+                connect_started: None,
             }
         }
 
@@ -961,6 +962,7 @@ mod tests {
         GameInfo {
             id: id.to_string(),
             name: name.to_string(),
+            exe_path: String::new(),
             bound_profile_id: None,
             running,
             installed,

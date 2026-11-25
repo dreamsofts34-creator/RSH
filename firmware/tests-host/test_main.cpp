@@ -302,6 +302,7 @@ static uint16_t ads_mock_raw[4] = {0, 0, 0, 0};  // conversion result per AIN
 static uint16_t ads_mock_last_config = 0;
 static int ads_mock_writes = 0;
 static int ads_mock_fail = 0;
+static int ads_mock_write_fail = 0;  // P3-1: sirf config-write fail kare (read theek)
 static uint8_t ads_mock_converting = 0;  // channel jis ki conversion in-flight hai
 static int i2c_mock_read(uint8_t dev, uint8_t reg, uint8_t *buf, uint8_t len,
                          void *user) {
@@ -323,7 +324,7 @@ static int i2c_mock_write(uint8_t dev, uint8_t reg, const uint8_t *buf,
                           uint8_t len, void *user) {
   (void)user;
   if (dev == RSH_ADS1115_I2C_ADDR && reg == RSH_ADS1115_REG_CONFIG && len == 2) {
-    if (ads_mock_fail) return -1;
+    if (ads_mock_fail || ads_mock_write_fail) return -1;
     ads_mock_last_config = (uint16_t)(((uint16_t)buf[0] << 8) | buf[1]);
     ads_mock_writes++;
     // MUX bits [14:12] = 100+ch (single-ended AIN ch).
@@ -1471,34 +1472,42 @@ int main() {
       // FW-01: ADS1115 channels distinct hone chahiye (duplicate channel
       // ab PIN_CONFLICT hai), is liye 6 ADC (distinct ADC1 pins) +
       // 3 ADS1115 (ch 0/1/2) — koi per-record ghalti nahi, sirf count fail.
+      // Slots duplicate hain (pehla jeetta hai — gin'ti records ki hoti
+      // hai, slots ki nahi), taake P2-5 slot range fail na ho.
       uint8_t many[9 * 16];
       const uint8_t adc_pins[6] = {32, 33, 34, 35, 36, 39};
       for (int i = 0; i < 6; i++)
-        rsh_cfg_record(many + i * 16, RSH_CFG_TYPE_AXIS_ADC, (uint8_t)i, 0,
+        rsh_cfg_record(many + i * 16, RSH_CFG_TYPE_AXIS_ADC, (uint8_t)(i % 5), 0,
                        adc_pins[i], 0xFF, 0xFF, NULL);
       for (int i = 0; i < 3; i++) {
         uint8_t p10[10] = {0};
         p10[0] = (uint8_t)i;  // ADS1115 channel
         rsh_cfg_record(many + (6 + i) * 16, RSH_CFG_TYPE_AXIS_ADS1115,
-                       (uint8_t)(6 + i), 0, 0xFF, 0xFF, 0xFF, p10);
+                       (uint8_t)((6 + i) % 5), 0, 0xFF, 0xFF, 0xFF, p10);
       }
       uint8_t manyb[256];
       size_t mlen = rsh_cfg_blob_build(manyb, many, 9, 1);
       CHECK(rsh_cfg_blob_validate(manyb, mlen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
       CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
-      // 5 encoders (> 4) -> PIN_CONFLICT, err 2
+      // 5 encoders (> 4) -> PIN_CONFLICT, err 2 (slots 0/1 repeat —
+      // pehla jeetta hai — gin'ti records ki hoti hai; pins sab valid
+      // pull-up pins hain, taake sirf count fail ho).
       uint8_t enc[5 * 16];
+      const uint8_t enc_pins[5][2] = {{23, 19}, {16, 17}, {25, 26}, {27, 4}, {13, 14}};
       for (int i = 0; i < 5; i++)
-        rsh_cfg_record(enc + i * 16, RSH_CFG_TYPE_ENCODER, (uint8_t)i, 0,
-                       (uint8_t)(25 + i), (uint8_t)(30 + i), 0xFF, NULL);
+        rsh_cfg_record(enc + i * 16, RSH_CFG_TYPE_ENCODER, (uint8_t)(i % 2), 0,
+                       enc_pins[i][0], enc_pins[i][1], 0xFF, NULL);
       uint8_t encb[256];
       size_t elen = rsh_cfg_blob_build(encb, enc, 5, 1);
       CHECK(rsh_cfg_blob_validate(encb, elen, errs, &nerr) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
       // 65 buttons (N1: wire slot nahi) -> UNSUPPORTED, err 3
-      // (65 BUTTON records — 65*16+12 = 1052 B, limit ke andar)
+      // (65 BUTTON records — 65*16+12 = 1052 B, limit ke andar; sab
+      // slot 0 — duplicate slot allowed hai, pehla jeetta hai — taake
+      // sirf N1 fail ho, P2-5 slot range nahi).
       static uint8_t btnrec[65 * 16];
       for (int i = 0; i < 65; i++)
-        rsh_cfg_record(btnrec + i * 16, RSH_CFG_TYPE_BUTTON, (uint8_t)i, 0,
+        rsh_cfg_record(btnrec + i * 16, RSH_CFG_TYPE_BUTTON, 0, 0,
                        0xFF, 0xFF, 0xFF, NULL);
       static uint8_t btnb[2048];
       size_t blen = rsh_cfg_blob_build(btnb, btnrec, 65, 1);
@@ -1539,9 +1548,12 @@ int main() {
       rsh_cfg_record(pc + 9 * 16, RSH_CFG_TYPE_ENCODER, 1, 0, 16, 17, 0xFF, NULL);
       rsh_cfg_record(pc + 10 * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
       CHECK(v(pc, 11) == RSH_CTRL_OK);
-      // Direct full rig (pin_rules_ref.py): 5 axes + battery + 7 buttons
-      // + 2 encoders + LED 21.
-      uint8_t rig[16 * 16];
+      // Direct full rig (pin_rules_ref.py): 5 axes + battery + 3 buttons
+      // + 2 encoders + LED 21. P2-5 note: purane preset mein BUTTON
+      // slots 3..6 bhi thay — un ka koi consumer nahi tha (silently
+      // dead), is liye COMMIT par reject hote hain; mirror blob se
+      // hata diye gaye (pin_rules_ref.py ko bhi wahi update chahiye).
+      uint8_t rig[12 * 16];
       rsh_cfg_record(rig + 0 * 16, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 32, 0xFF, 0xFF, NULL);
       rsh_cfg_record(rig + 1 * 16, RSH_CFG_TYPE_AXIS_ADC, 1, 0, 33, 0xFF, 0xFF, NULL);
       rsh_cfg_record(rig + 2 * 16, RSH_CFG_TYPE_AXIS_ADC, 2, 0, 34, 0xFF, 0xFF, NULL);
@@ -1551,14 +1563,10 @@ int main() {
       rsh_cfg_record(rig + 6 * 16, RSH_CFG_TYPE_BUTTON, 0, 0, 4, 0xFF, 0xFF, NULL);
       rsh_cfg_record(rig + 7 * 16, RSH_CFG_TYPE_BUTTON, 1, 0, 13, 0xFF, 0xFF, NULL);
       rsh_cfg_record(rig + 8 * 16, RSH_CFG_TYPE_BUTTON, 2, 0, 14, 0xFF, 0xFF, NULL);
-      rsh_cfg_record(rig + 9 * 16, RSH_CFG_TYPE_BUTTON, 3, 0, 16, 0xFF, 0xFF, NULL);
-      rsh_cfg_record(rig + 10 * 16, RSH_CFG_TYPE_BUTTON, 4, 0, 17, 0xFF, 0xFF, NULL);
-      rsh_cfg_record(rig + 11 * 16, RSH_CFG_TYPE_BUTTON, 5, 0, 18, 0xFF, 0xFF, NULL);
-      rsh_cfg_record(rig + 12 * 16, RSH_CFG_TYPE_BUTTON, 6, 0, 19, 0xFF, 0xFF, NULL);
-      rsh_cfg_record(rig + 13 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 25, 0xFF, NULL);
-      rsh_cfg_record(rig + 14 * 16, RSH_CFG_TYPE_ENCODER, 1, 0, 26, 27, 0xFF, NULL);
-      rsh_cfg_record(rig + 15 * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
-      CHECK(v(rig, 16) == RSH_CTRL_OK);
+      rsh_cfg_record(rig + 9 * 16, RSH_CFG_TYPE_ENCODER, 0, 0, 23, 25, 0xFF, NULL);
+      rsh_cfg_record(rig + 10 * 16, RSH_CFG_TYPE_ENCODER, 1, 0, 26, 27, 0xFF, NULL);
+      rsh_cfg_record(rig + 11 * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
+      CHECK(v(rig, 12) == RSH_CTRL_OK);
       // GPIO5 (caution, boot log) allowed hai — PC + ref dono allow karte hain.
       uint8_t one[16];
       rsh_cfg_record(one, RSH_CFG_TYPE_BUTTON, 0, 0, 5, 0xFF, 0xFF, NULL);
@@ -1625,13 +1633,51 @@ int main() {
       rsh_cfg_record(two + 0, RSH_CFG_TYPE_AXIS_ADS1115, 0, 0, 0xFF, 0xFF, 0xFF, NULL);
       rsh_cfg_record(two + 16, RSH_CFG_TYPE_AXIS_AS5600, 1, 0, 0xFF, 0xFF, 0xFF, NULL);
       CHECK(v(two, 2) == RSH_CTRL_OK);
-      // 2 batteries / 2 LED strips (pin wale) reject.
+      // P1-3: BUTTON_MATRIX COMMIT par reject (UNSUPPORTED, err 3) —
+      // koi firmware consumer nahi (expander guard jaisa fail-closed).
+      rsh_cfg_record(one, RSH_CFG_TYPE_BUTTON_MATRIX, 0, 0, 4, 13, 14, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_UNSUPPORTED);
+      CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
+      // Matrix + valid axis: phir bhi reject (guard har record par).
+      rsh_cfg_record(two + 0, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 34, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(two + 16, RSH_CFG_TYPE_BUTTON_MATRIX, 0, 0, 4, 13, 14, NULL);
+      CHECK(v(two, 2) == RSH_CTRL_UNSUPPORTED);
+      CHECK(errs[0] == RSH_CFG_ERR_UNKNOWN_TYPE);
+      // P2-5: out-of-range slots COMMIT par reject (PIN_CONFLICT,
+      // err 2) — pinmap ka koi consumer nahi, lekin pin reserve ho jata.
+      rsh_cfg_record(one, RSH_CFG_TYPE_AXIS_ADC, 5, 0, 34, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      rsh_cfg_record(one, RSH_CFG_TYPE_AXIS_AS5600, 5, 0, 0xFF, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      rsh_cfg_record(one, RSH_CFG_TYPE_BUTTON, 3, 0, 4, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      rsh_cfg_record(one, RSH_CFG_TYPE_ENCODER, 2, 0, 23, 19, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      rsh_cfg_record(one, RSH_CFG_TYPE_LED_STRIP, 1, 0, 21, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      rsh_cfg_record(one, RSH_CFG_TYPE_BATTERY, 1, 0, 39, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_PIN_CONFLICT);
+      CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
+      // Boundary: sab se bara valid slot OK hai.
+      rsh_cfg_record(one, RSH_CFG_TYPE_AXIS_ADC, 4, 0, 32, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_OK);
+      rsh_cfg_record(one, RSH_CFG_TYPE_BUTTON, 2, 0, 4, 0xFF, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_OK);
+      rsh_cfg_record(one, RSH_CFG_TYPE_ENCODER, 1, 0, 16, 17, 0xFF, NULL);
+      CHECK(v(one, 1) == RSH_CTRL_OK);
+      // 2 batteries / 2 LED strips (pin wale) reject — dono records
+      // slot 0 (taake sirf count fail ho, P2-5 slot range nahi).
       rsh_cfg_record(two + 0, RSH_CFG_TYPE_BATTERY, 0, 0, 39, 0xFF, 0xFF, NULL);
-      rsh_cfg_record(two + 16, RSH_CFG_TYPE_BATTERY, 1, 0, 36, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(two + 16, RSH_CFG_TYPE_BATTERY, 0, 0, 36, 0xFF, 0xFF, NULL);
       CHECK(v(two, 2) == RSH_CTRL_PIN_CONFLICT);
       CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
       rsh_cfg_record(two + 0, RSH_CFG_TYPE_LED_STRIP, 0, 0, 21, 0xFF, 0xFF, NULL);
-      rsh_cfg_record(two + 16, RSH_CFG_TYPE_LED_STRIP, 1, 0, 4, 0xFF, 0xFF, NULL);
+      rsh_cfg_record(two + 16, RSH_CFG_TYPE_LED_STRIP, 0, 0, 4, 0xFF, 0xFF, NULL);
       CHECK(v(two, 2) == RSH_CTRL_PIN_CONFLICT);
       CHECK(errs[0] == RSH_CFG_ERR_OUT_OF_RANGE);
       // H-pattern gear pin input-only ho to reject (pull-up rule).
@@ -1876,6 +1922,9 @@ int main() {
       CHECK(rsh_cfg_stage_chunk(&t, 0, (uint16_t)flen, (uint16_t)flen,
                                 rsh_crc16_ccitt(factory, (uint16_t)flen),
                                 factory, &sb, &tot) == RSH_CTRL_BUSY);
+      CHECK(t.state == RSH_TXN_IDLE);
+      // P3-4: safe mode mein REVERT bhi BUSY (stage/commit ki tarah).
+      CHECK(rsh_cfg_revert(&t) == RSH_CTRL_BUSY);
       CHECK(t.state == RSH_TXN_IDLE);
       // Safe mode khatam (naye txn mein flag 0) -> stage phir chalta hai
       rsh_cfg_set_safe_mode(&t, 0);
@@ -3007,6 +3056,10 @@ int main() {
     fl2 = build(RSH_CMD_COMMIT, NULL, 0, frame);
     CHECK(disp(frame, fl2) == RSH_CTRL_DISP_REPLY && verified());
     CHECK(rf.payload[0] == RSH_CTRL_BUSY);
+    // P3-4: safe mode mein REVERT bhi BUSY.
+    fl2 = build(RSH_CMD_REVERT, NULL, 0, frame);
+    CHECK(disp(frame, fl2) == RSH_CTRL_DISP_REPLY && verified());
+    CHECK(rf.payload[0] == RSH_CTRL_BUSY);
     fl2 = build(RSH_CMD_GET_CFG, getpl, 4, frame);
     CHECK(disp(frame, fl2) == RSH_CTRL_DISP_REPLY && verified());
     CHECK(rf.payload[0] == RSH_CTRL_OK);  // read block nahi hoti
@@ -3078,9 +3131,11 @@ int main() {
     CHECK(hctx.last_cmd == 0x7F);
 
     // --- GET_CFG clamp: 2044 B blob, wantLen 1024 -> 1019 data bytes ---
+    // 127 pinless LED_STRIP records (slot 0 — P2-5: LED slot != 0
+    // reject hota hai; pinless records no-op hain, is liye 127 bhi OK).
     static uint8_t bigrec[127 * 16];
     for (int i = 0; i < 127; i++)
-      rsh_cfg_record(bigrec + i * 16, RSH_CFG_TYPE_LED_STRIP, (uint8_t)i, 0,
+      rsh_cfg_record(bigrec + i * 16, RSH_CFG_TYPE_LED_STRIP, 0, 0,
                      0xFF, 0xFF, 0xFF, NULL);
     static uint8_t bigblob[2048];
     size_t biglen = rsh_cfg_blob_build(bigblob, bigrec, 127, 9);
@@ -3331,7 +3386,7 @@ int main() {
     // clutch raw 1024 -> 825 mV, handbrake raw 4095 -> 3300 mV,
     // encoders, buttons 0x1F.
     size_t n = rsh_build_v2_stream_packet(buf, sizeof(buf), 42, 123456,
-                                          RSH_V2_FLAG_AXIS_INVALID, 1500, 1,
+                                          RSH_V2_FLAG_AXIS_INVALID, 1500, 0x01,
                                           2048, 0, 4095, enc2, 2, 0x1F, &enAll,
                                           1024, 0);
     CHECK(n == 20 + 2 * 5 + 2 * 2 + 2);  // 36 B
@@ -3345,7 +3400,7 @@ int main() {
     CHECK(parsed.n_enc == 2 && parsed.enc[0] == 10 && parsed.enc[1] == -5);
     CHECK(parsed.buttons == 0x1F);
     // Steering raw mode: 2048 raw -> 1650 mV (convert hota hai).
-    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 43, 1000, 0, 2048, 0,
+    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 43, 1000, 0, 2048, 0x00,
                                    0, 0, 0, enc2, 0, 0, &enAll, 0, 0);
     CHECK(n == 20 + 2 * 5 + 0 + 2);
     CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
@@ -3353,7 +3408,7 @@ int main() {
     CHECK(parsed.n_enc == 0);
     // Clutch band: mask 0x17 (slot 3 bit clear), 4 axes.
     RshModuleEnable enNoClutch = {1, 1, 1, 1, 1, 0, 0};
-    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 44, 1000, 0, 1500, 1,
+    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 44, 1000, 0, 1500, 0x01,
                                    2048, 1024, 4095, enc2, 2, 0x1F, &enNoClutch,
                                    2048, 0);
     CHECK(n == 20 + 2 * 4 + 2 * 2 + 2);  // 34 B
@@ -3366,7 +3421,7 @@ int main() {
     CHECK(parsed.axes[4] == 3300);  // handbrake slot 4 — mask order mein aakhri
     // Handbrake band: mask 0x0F (clutch slot 3 + core), sirf 4 axes.
     RshModuleEnable enNoHb = {0, 1, 1, 1, 1, 1, 0};
-    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 45, 1000, 0, 1500, 1,
+    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 45, 1000, 0, 1500, 0x01,
                                    2048, 1024, 4095, enc2, 2, 0x1F, &enNoHb,
                                    1024, 0);
     CHECK(n == 20 + 2 * 4 + 2 * 2 + 2);  // 34 B
@@ -3376,31 +3431,52 @@ int main() {
     CHECK(parsed.axes[3] == 825);  // clutch slot 3 — mask order mein aakhri
     // H-pattern: gear 2 -> button bit 6 (4+2), up/down bits clear.
     RshModuleEnable enHpat = {1, 1, 1, 1, 1, 1, 1};
-    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 46, 1000, 0, 1500, 1,
+    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 46, 1000, 0, 1500, 0x01,
                                    0, 0, 0, enc2, 0, 0x03, &enHpat, 0, 2);
     CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
     CHECK(parsed.buttons == 0x40);  // sirf gear bit 6
     // Button gating: shifter band -> bits 0,1 clear; horn band -> bit 4 clear.
     RshModuleEnable enNoShiftHorn = {1, 0, 0, 1, 1, 0, 0};
-    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 47, 1000, 0, 1500, 1,
+    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 47, 1000, 0, 1500, 0x01,
                                    0, 0, 0, enc2, 0, 0x1F, &enNoShiftHorn, 0, 0);
     CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
     CHECK(parsed.buttons == 0x0C);  // sirf accel (bit2) + brake (bit3)
     // Negatives: chhota buffer, n_enc 3, reserved flags.
-    CHECK(rsh_build_v2_stream_packet(buf, 10, 1, 1000, 0, 1500, 1, 0, 0, 0,
+    CHECK(rsh_build_v2_stream_packet(buf, 10, 1, 1000, 0, 1500, 0x01, 0, 0, 0,
                                      enc2, 2, 0, &enAll, 0, 0) == 0);
-    CHECK(rsh_build_v2_stream_packet(buf, sizeof(buf), 1, 1000, 0, 1500, 1,
+    CHECK(rsh_build_v2_stream_packet(buf, sizeof(buf), 1, 1000, 0, 1500, 0x01,
                                      0, 0, 0, enc2, 3, 0, &enAll, 0, 0) == 0);
-    CHECK(rsh_build_v2_stream_packet(buf, sizeof(buf), 1, 1000, 0x10, 1500, 1,
+    CHECK(rsh_build_v2_stream_packet(buf, sizeof(buf), 1, 1000, 0x10, 1500, 0x01,
                                      0, 0, 0, enc2, 0, 0, &enAll, 0, 0) == 0);
-    CHECK(rsh_build_v2_stream_packet(NULL, sizeof(buf), 1, 1000, 0, 1500, 1,
+    CHECK(rsh_build_v2_stream_packet(NULL, sizeof(buf), 1, 1000, 0, 1500, 0x01,
                                      0, 0, 0, enc2, 0, 0, &enAll, 0, 0) == 0);
-    CHECK(rsh_build_v2_stream_packet(buf, sizeof(buf), 1, 1000, 0, 1500, 1,
+    CHECK(rsh_build_v2_stream_packet(buf, sizeof(buf), 1, 1000, 0, 1500, 0x01,
                                      0, 0, 0, NULL, 0, 0, &enAll, 0, 0) == 0);
-    // 36 B packet 35 B buffer mein nahi banta (5 axes + 2 enc overflow).
-    CHECK(rsh_build_v2_stream_packet(buf, 35, 1, 1000, 0, 1500, 1,
-                                     2048, 0, 4095, enc2, 2, 0x1F, &enAll,
-                                     1024, 0) == 0);
+    // P1-1: I2C axes pehle se mV hain — mask bit set ho to wire value
+    // waisi ki waisi jati hai (dobara raw->mV nahi). Mask 0x1E (slots
+    // 1..4 mV, steering raw): accel 1650 -> 1650, brake 3300 -> 3300
+    // (full travel), clutch 1650 -> 1650, handbrake 2659 -> 2659.
+    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 48, 1000, 0, 2048, 0x1E,
+                                   1650, 3300, 2659, enc2, 0, 0, &enAll,
+                                   1650, 0);
+    CHECK(n == 20 + 2 * 5 + 0 + 2);
+    CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
+    CHECK(parsed.axes[0] == 1650);  // steering raw 2048 -> 1650 (bit clear)
+    CHECK(parsed.axes[1] == 1650);  // I2C accel mV — unchanged
+    CHECK(parsed.axes[2] == 3300);  // I2C brake mV — unchanged (full travel)
+    CHECK(parsed.axes[3] == 1650);  // I2C clutch mV — unchanged
+    CHECK(parsed.axes[4] == 2659);  // I2C handbrake mV — unchanged
+    // Control: mask 0 — sab raw counts convert hote hain (purana
+    // double-convert bug: I2C 1650 mV yahan 1330 mV ban jata tha —
+    // rsh_raw_to_mv mein +2047 rounding hai).
+    n = rsh_build_v2_stream_packet(buf, sizeof(buf), 49, 1000, 0, 2048, 0x00,
+                                   1650, 3300, 2659, enc2, 0, 0, &enAll,
+                                   1650, 0);
+    CHECK(rsh_v2_parse_stream(buf, n, &parsed) == RSH_V2_OK);
+    CHECK(parsed.axes[1] == 1330);  // 1650 raw -> 1330 mV
+    CHECK(parsed.axes[2] == 2659);  // 3300 raw -> 2659 mV (kabhi 100% nahi)
+    CHECK(parsed.axes[3] == 1330);
+    CHECK(parsed.axes[4] == 2143);  // 2659 raw -> 2143 mV
   }
 
   // 24) NVS password obfuscation (SEC-E-01, Phase F W1, pw_obfuscate.h):
@@ -3758,7 +3834,10 @@ int main() {
     CHECK(rsh_pinmap_from_blob(factory, 0, &keep) == 0);
     CHECK(rsh_pinmap_from_blob(factory, flen, NULL) == 0);
 
-    // --- Legacy factory blob (BUTTON slots 0..3) pehchano ---
+    // --- Legacy factory blob (BUTTON slots 0..3): P2-5 ke baad ye
+    // blob validate nahi hota (BUTTON slot 3 ka koi consumer nahi) —
+    // boot par load LKG/factory fallback leta hai (wahi end state jo
+    // purani migration deti thi). rsh_pinmap_blob_is_legacy hata diya.
     uint8_t lrec[7 * 16];
     rsh_cfg_record(lrec + 0 * 16, RSH_CFG_TYPE_AXIS_ADC, 0, 0, 34, 0xFF, 0xFF, NULL);
     rsh_cfg_record(lrec + 1 * 16, RSH_CFG_TYPE_AXIS_ADC, 1, 0, 35, 0xFF, 0xFF, NULL);
@@ -3769,11 +3848,11 @@ int main() {
     rsh_cfg_record(lrec + 6 * 16, RSH_CFG_TYPE_BUTTON, 3, 0, 33, 0xFF, 0xFF, NULL);
     uint8_t lblob[256];
     size_t llen = rsh_cfg_blob_build(lblob, lrec, 7, 1);
-    CHECK(rsh_cfg_blob_validate(lblob, llen, NULL, NULL) == RSH_CTRL_OK);
-    CHECK(rsh_pinmap_blob_is_legacy(lblob, llen) == 1);
-    CHECK(rsh_pinmap_blob_is_legacy(factory, flen) == 0);  // naya factory
-    CHECK(rsh_pinmap_blob_is_legacy(blob, clen) == 0);      // PC-style blob
-    CHECK(rsh_pinmap_blob_is_legacy(NULL, 0) == 0);
+    CHECK(rsh_cfg_blob_validate(lblob, llen, NULL, NULL) == RSH_CTRL_PIN_CONFLICT);
+    rsh_cfg_txn_t lt;
+    rsh_cfg_txn_init(&lt);
+    CHECK(rsh_cfg_txn_load_current(&lt, lblob, llen) == RSH_CTRL_PIN_CONFLICT);
+    CHECK(rsh_cfg_txn_load_current(&lt, factory, flen) == RSH_CTRL_OK);
 
     // --- Duplicate slot: pehla jeetta hai ---
     uint8_t drec[2 * 16];
@@ -4011,19 +4090,19 @@ int main() {
     int16_t enc0[4] = {0, 0, 0, 0};
     uint8_t pbuf[64];
     rsh_v2_stream_t pp;
-    size_t pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 1, 1000, 0, 1500, 1,
+    size_t pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 1, 1000, 0, 1500, 0x01,
                                            0, 0, 0, enc0, 0, 0x03, &enSeq, 0, 0);
     CHECK(pn > 0 && rsh_v2_parse_stream(pbuf, pn, &pp) == RSH_V2_OK);
     CHECK(pp.buttons == 0x03);
     // H-pattern packet: up/down dabaye + gear 3 -> sirf gear bit 7 (0x80).
-    pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 2, 1000, 0, 1500, 1,
+    pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 2, 1000, 0, 1500, 0x01,
                                     0, 0, 0, enc0, 0, 0x03, &enH, 0, 3);
     CHECK(pn > 0 && rsh_v2_parse_stream(pbuf, pn, &pp) == RSH_V2_OK);
     CHECK(pp.buttons == 0x80);
     // H-pattern + encoders ek saath: conflict (shared pins 16/17/19) —
     // is halat mein encoders report 0 hote hain (inputs.cpp else branch).
     CHECK(rsh_modules_hpattern_encoder_conflict(RSH_SHIFTER_HPATTERN, 1) == 1);
-    pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 3, 1000, 0, 1500, 1,
+    pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 3, 1000, 0, 1500, 0x01,
                                     0, 0, 0, enc0, 0, 0x00, &enH, 0, 0);
     CHECK(pn > 0 && rsh_v2_parse_stream(pbuf, pn, &pp) == RSH_V2_OK);
     CHECK(pp.n_enc == 0);  // H-pattern mode mein encoders nahi bheje jate
@@ -4035,7 +4114,7 @@ int main() {
     const uint16_t craw[5] = {0, 1024, 2048, 3072, 4095};
     const uint16_t cmv[5] = {0, 825, 1650, 2476, 3300};
     for (int i = 0; i < 5; i++) {
-      pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 10, 1000, 0, 1500, 1,
+      pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 10, 1000, 0, 1500, 0x01,
                                       0, 0, 0, enc0, 0, 0x00, &enC, craw[i], 0);
       CHECK(pn > 0 && rsh_v2_parse_stream(pbuf, pn, &pp) == RSH_V2_OK);
       CHECK(pp.axis_mask == 0x1F);
@@ -4043,7 +4122,7 @@ int main() {
     }
     // Clutch band: raw 4095 bhi slot 3 mein nahi jata (mask bit clear).
     RshModuleEnable enNoC = {1, 1, 1, 1, 1, 0, 0};
-    pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 11, 1000, 0, 1500, 1,
+    pn = rsh_build_v2_stream_packet(pbuf, sizeof(pbuf), 11, 1000, 0, 1500, 0x01,
                                     0, 0, 4095, enc0, 0, 0x00, &enNoC, 4095, 0);
     CHECK(pn > 0 && rsh_v2_parse_stream(pbuf, pn, &pp) == RSH_V2_OK);
     CHECK(pp.axis_mask == 0x17);
@@ -4376,13 +4455,20 @@ int main() {
       rsh_as5600_turn_update(&big, (uint16_t)(((i + 1) * 256) % 4096));
     CHECK(big.total_steps == 12288);
     CHECK(rsh_as5600_steps_to_mv(big.total_steps, RSH_AS5600_ROT_900_STEPS)
-          == 3300);  // clamp: 12288 > 10240
-    // 900° mapping: 450° = 5120 steps -> 1650 mV.
-    CHECK(rsh_as5600_steps_to_mv(5120, RSH_AS5600_ROT_900_STEPS) == 1650);
-    CHECK(rsh_as5600_steps_to_mv(0, RSH_AS5600_ROT_900_STEPS) == 0);
+          == 3300);  // clamp: 12288 > 10240 (boot se +12288 steps)
+    // Centre-boot mapping (P1-2): total 0 (boot angle) = 1650 mV;
+    // +5120 steps (boot se +450°) = 3300, -5120 = 0 — left travel
+    // centre se neeche jati hai (pehle -5 bhi 0 clamp hota tha).
+    CHECK(rsh_as5600_steps_to_mv(0, RSH_AS5600_ROT_900_STEPS) == 1650);
+    CHECK(rsh_as5600_steps_to_mv(5120, RSH_AS5600_ROT_900_STEPS) == 3300);
+    CHECK(rsh_as5600_steps_to_mv(-5120, RSH_AS5600_ROT_900_STEPS) == 0);
     CHECK(rsh_as5600_steps_to_mv(10240, RSH_AS5600_ROT_900_STEPS) == 3300);
-    CHECK(rsh_as5600_steps_to_mv(-5, RSH_AS5600_ROT_900_STEPS) == 0);
-    CHECK(rsh_as5600_steps_to_mv(2048, RSH_AS5600_ROT_360_STEPS) == 1650);
+    CHECK(rsh_as5600_steps_to_mv(-5, RSH_AS5600_ROT_900_STEPS) == 1648);
+    CHECK(rsh_as5600_steps_to_mv(2560, RSH_AS5600_ROT_900_STEPS) == 2475);
+    CHECK(rsh_as5600_steps_to_mv(-2560, RSH_AS5600_ROT_900_STEPS) == 825);
+    CHECK(rsh_as5600_steps_to_mv(2048, RSH_AS5600_ROT_360_STEPS) == 3300);
+    CHECK(rsh_as5600_steps_to_mv(0, RSH_AS5600_ROT_360_STEPS) == 1650);
+    CHECK(rsh_as5600_steps_to_mv(-2048, RSH_AS5600_ROT_360_STEPS) == 0);
     // Glitch: ek tick mein >90° (1024 steps) jump reject hota hai.
     RshAs5600Turns g;
     rsh_as5600_turns_init(&g);
@@ -4408,6 +4494,28 @@ int main() {
     as5600_mock_status = 0x30;
     CHECK(rsh_as5600_read(as5600_mock_read, NULL, &smp) == 0);
     CHECK(smp.valid == 1);
+    // P2-4: AGC band se bahar (magnet gap ghalat) -> valid=0, MD=1
+    // hone ke bawajood; band ke andar (16/112) -> valid=1.
+    as5600_mock_status = 0x20;  // MD=1
+    as5600_mock_agc = 0;
+    CHECK(rsh_as5600_read(as5600_mock_read, NULL, &smp) == 0);
+    CHECK(smp.valid == 0);
+    as5600_mock_agc = 128;
+    CHECK(rsh_as5600_read(as5600_mock_read, NULL, &smp) == 0);
+    CHECK(smp.valid == 0);
+    as5600_mock_agc = 15;
+    CHECK(rsh_as5600_read(as5600_mock_read, NULL, &smp) == 0);
+    CHECK(smp.valid == 0);
+    as5600_mock_agc = 113;
+    CHECK(rsh_as5600_read(as5600_mock_read, NULL, &smp) == 0);
+    CHECK(smp.valid == 0);
+    as5600_mock_agc = 16;
+    CHECK(rsh_as5600_read(as5600_mock_read, NULL, &smp) == 0);
+    CHECK(smp.valid == 1);
+    as5600_mock_agc = 112;
+    CHECK(rsh_as5600_read(as5600_mock_read, NULL, &smp) == 0);
+    CHECK(smp.valid == 1);
+    as5600_mock_agc = 64;
     // I2C NACK: read + probe dono fail.
     as5600_mock_fail = 1;
     CHECK(rsh_as5600_read(as5600_mock_read, NULL, &smp) != 0);
@@ -5214,6 +5322,21 @@ int main() {
     ads_mock_fail = 1;
     CHECK(rsh_ads1115_probe(i2c_mock_write, NULL) == 0);
     ads_mock_fail = 0;
+    // P3-1: read kamyab + agla write fail -> poll 0 (taaza value
+    // valid rehti hai), converting -1, agla poll wahi channel restart karta hai.
+    // Mock note: probe write ne mock converting latch 0 par kar diya
+    // tha, is liye dono channels ki raw value 4000 rakho — read chahe
+    // jis channel ki ho, taaza value 750 mV milti hai.
+    ads_mock_raw[0] = 4000;  // -> 750 mV (pehle 3072 thi — taaza value)
+    ads_mock_raw[1] = 4000;  // -> 750 mV (pehle 1536 thi — taaza value)
+    ads_mock_write_fail = 1;
+    CHECK(rsh_ads1115_poll(&ads, i2c_mock_read, i2c_mock_write, NULL, 120) == 0);
+    CHECK(ads.has_value[1] == 1 && ads.value_mv[1] == 750);
+    CHECK(ads.value_mv[0] == 3072);  // ch0 purani value mehfooz
+    CHECK(ads.converting == -1);
+    ads_mock_write_fail = 0;
+    CHECK(rsh_ads1115_poll(&ads, i2c_mock_read, i2c_mock_write, NULL, 140) == 0);
+    CHECK(ads.converting == 0);  // ch0 dobara start (next_idx aage nahi gaya tha)
 
     // --- 26b) Pinmap: I2C kinds assign hote hain (FW-01 bug: pehle nahi hote the) ---
     uint8_t i2c_recs[7 * 16];
@@ -5387,13 +5510,52 @@ int main() {
     as5600_mock_status = 0x20;
     as5600_mock_raw = 4000;
     CHECK(rsh_i2c_axes_poll(&mt, i2c_mock_read, i2c_mock_write, NULL, 0) == 0);
-    CHECK(mt.value_mv[0] == 0 && mt.valid[0] == 1);  // pehla sample: sirf state
+    CHECK(mt.value_mv[0] == 1650 && mt.valid[0] == 1);  // pehla sample: boot = centre (P1-2)
     as5600_mock_raw = 5;
     CHECK(rsh_i2c_axes_poll(&mt, i2c_mock_read, i2c_mock_write, NULL, 1) == 0);
-    CHECK(mt.value_mv[0] == 32);  // +101 steps -> 101*3300/10240 = 32
+    CHECK(mt.value_mv[0] == 1682);  // +101 steps -> (101+5120)*3300/10240 = 1682
     as5600_mock_raw = 4090;
     CHECK(rsh_i2c_axes_poll(&mt, i2c_mock_read, i2c_mock_write, NULL, 2) == 0);
-    CHECK(mt.value_mv[0] == 29);  // -11 steps -> total 90 -> 90*3300/10240 = 29
+    CHECK(mt.value_mv[0] == 1679);  // -11 steps -> total 90 -> (90+5120)*3300/10240 = 1679
+    // P1-2: boot se left travel — centre se neeche jati hai (pehle 0 clamp).
+    as5600_mock_raw = 3834;  // -256 steps -> total -166
+    CHECK(rsh_i2c_axes_poll(&mt, i2c_mock_read, i2c_mock_write, NULL, 3) == 0);
+    CHECK(mt.value_mv[0] == 1596);  // (-166+5120)*3300/10240 = 1596
+  }
+
+  // --- 26e) P3-1 sampler level: ADS write-fail ke baad bhi taaza
+  // value valid rehti hai (poll 0 milta hai, valid=1).
+  {
+    uint8_t ads_only_recs[2 * 16];
+    uint8_t p_c0[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    uint8_t p_c2[10] = {2, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    rsh_cfg_record(ads_only_recs + 0, RSH_CFG_TYPE_AXIS_ADS1115, 1, 0,
+                   0xFF, 0xFF, 0xFF, p_c0);
+    rsh_cfg_record(ads_only_recs + 16, RSH_CFG_TYPE_AXIS_ADS1115, 2, 0,
+                   0xFF, 0xFF, 0xFF, p_c2);
+    uint8_t ads_only_blob[128];
+    size_t ads_only_len = rsh_cfg_blob_build(ads_only_blob, ads_only_recs, 2, 1);
+    CHECK(rsh_cfg_blob_validate(ads_only_blob, ads_only_len, NULL, NULL) == RSH_CTRL_OK);
+    RshPinMap am;
+    CHECK(rsh_pinmap_from_blob(ads_only_blob, ads_only_len, &am) == 1);
+    RshI2cAxes ao;
+    rsh_i2c_axes_configure(&ao, &am);
+    ads_mock_raw[0] = 16384;  // -> 3072 mV
+    ads_mock_raw[2] = 8192;   // -> 1536 mV
+    ads_mock_fail = 0;
+    ads_mock_write_fail = 0;
+    CHECK(rsh_i2c_axes_poll(&ao, i2c_mock_read, i2c_mock_write, NULL, 0) == 0);
+    CHECK(rsh_i2c_axes_poll(&ao, i2c_mock_read, i2c_mock_write, NULL, 20) == 0);
+    CHECK(rsh_i2c_axes_poll(&ao, i2c_mock_read, i2c_mock_write, NULL, 40) == 0);
+    CHECK(ao.value_mv[1] == 3072 && ao.valid[1] == 1);
+    // Write fail (read theek): taaza value + valid=1 rehti hai.
+    ads_mock_raw[2] = 4000;  // -> 750 mV (taaza)
+    ads_mock_write_fail = 1;
+    CHECK(rsh_i2c_axes_poll(&ao, i2c_mock_read, i2c_mock_write, NULL, 60) == 0);
+    CHECK(ao.value_mv[2] == 750 && ao.valid[2] == 1);
+    ads_mock_write_fail = 0;
+    CHECK(rsh_i2c_axes_poll(&ao, i2c_mock_read, i2c_mock_write, NULL, 80) == 0);
+    CHECK(ao.valid[2] == 1);
   }
 
   printf("%s — %d checks, %d failures\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", checks, failures);

@@ -9,9 +9,14 @@
 // a `mode` binding, so switching theme repaints the whole UI; no
 // screen reads a literal colour for a themed surface any more.
 // Light palette: bg #F5F3FF (approved light bg), panel pure white.
-// Contrast (WCAG, vs white panel): text 17.2, mute 6.7, faint 4.6,
-// accent-text 6.2, ok 5.4, warn 5.5, bad 5.5 — all >= 4.5:1. White on
-// accent is 4.50:1 in both themes.
+// Contrast (WCAG, vs white panel only — pairs on tinted fills are
+// listed separately below): text 17.2, mute 6.7, faint 5.8,
+// accent-text 6.2, ok 6.2, warn 5.5, bad 5.5 — all >= 4.5:1. White on
+// accent is 4.50:1 in both themes (a floor, not a margin — P3-3).
+// Tinted-fill pairs: ok on ok-bg is 5.0:1 Light (P1-4: ok Light was
+// #157A4C at 4.38:1, darkened to #12703F); faint on sel-bg is 4.9:1
+// Dark (P1-5: faint Dark was #8892A6 at 4.16:1, lightened to
+// #94A0B4 — the worst faint/Dark surface, pressed-tile-bg, is 4.6:1).
 export global Theme {
     // 0 Dark, 1 Light, 2 Auto (Auto = Dark until Rust resolves it).
     in-out property <int> mode: 0;
@@ -24,10 +29,17 @@ export global Theme {
     in-out property <color> line: is-light ? #D9D4EC : #262F40;
     in-out property <color> text: is-light ? #171B26 : #E9EDF4;
     in-out property <color> mute: is-light ? #565C6E : #9AA5B8;
-    in-out property <color> faint: is-light ? #6E7490 : #7C879B;
+    // WCAG AA (4.5:1) on every surface the hint text sits on: panel,
+    // panel2, selected/accent tints. P1-5: faint Dark was #8892A6 —
+    // 4.16:1 on sel-bg and 3.86:1 on pressed-tile-bg — now #94A0B4
+    // (4.9:1 on sel-bg, worst surface 4.6:1 on pressed-tile-bg).
+    in-out property <color> faint: is-light ? #5F657F : #94A0B4;
     in-out property <color> accent: #2F6BFF;
     in-out property <color> accent-text: is-light ? #2456D6 : #8EB0FF;
-    in-out property <color> ok: is-light ? #157A4C : #3DD68C;
+    // P1-4: ok Light was #157A4C — 4.38:1 on ok-bg (and 4.29:1 on
+    // acc-bg, 4.37:1 on hover-bg) — now #12703F: 5.0:1 on ok-bg,
+    // 6.2:1 on the white panel, 4.9:1 on acc-bg, 5.0:1 on hover-bg.
+    in-out property <color> ok: is-light ? #12703F : #3DD68C;
     in-out property <color> warn: is-light ? #8A6100 : #F5B84A;
     in-out property <color> bad: is-light ? #C92A2A : #FF6B6B;
     in-out property <length> window-width: 920px;
@@ -97,7 +109,9 @@ export global Theme {
     // darkens in Light (white label stays 4.5:1 on both).
     in-out property <color> hover-bg: is-light ? #E3E8F6 : #28324A;
     in-out property <color> pressed-bg: is-light ? #D2D9EC : #1A2233;
-    in-out property <color> accent-hover: is-light ? #2456D6 : #4A7DFF;
+    // Dark hover DARKENS (white label 5.1:1); the old lighter #4A7DFF
+    // dropped the white label to 3.7:1 (below AA).
+    in-out property <color> accent-hover: is-light ? #2456D6 : #2A63F0;
     in-out property <color> accent-pressed: is-light ? #1D49B8 : #2456D6;
     // Text on a selected / accent-tinted surface (acc-bg, panel2):
     // white in Dark, near-black in Light (white on #DCE6FF is unreadable).

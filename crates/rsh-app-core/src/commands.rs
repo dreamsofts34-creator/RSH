@@ -1704,14 +1704,25 @@ mod tests {
     }
 
     #[test]
-    fn button_matrix_with_eight_pins_is_valid() {
+    fn button_matrix_is_rejected_as_unsupported() {
+        // P1-3 (update4): BUTTON_MATRIX has no firmware consumer — COMMIT
+        // rejects it fail-closed (same shape as the expander reject), so a
+        // matrix pin map must not validate.
         let mut pins = factory_assignments();
         pins.push(multi_assignment(
             "button_matrix",
             &[4, 13, 14, 16, 17, 18, 19, 23],
         ));
         let result = validate_pin_map(&pins);
-        assert!(result.valid, "errors: {:?}", result.errors);
+        assert!(!result.valid);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("button_matrix") && e.contains("not supported")),
+            "errors: {:?}",
+            result.errors
+        );
     }
 
     #[test]

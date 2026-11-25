@@ -1594,7 +1594,7 @@ fn self_check_connect_password_set() -> (bool, String) {
 /// stored WLAN profile reconnects with no user action and no
 /// pairing action — the manager returns to Active on its own.
 fn self_check_connect_password_reconnect() -> (bool, String) {
-    use rsh_api::{ConnEvent, ConnectionManager, ManagerAction};
+    use rsh_api::{ConnEvent, ConnectionManager, ManagerAction, WATCHDOG_TIMEOUT};
     let mut manager = ConnectionManager::new();
     let now = Instant::now();
     manager.on_event(ConnEvent::Connect, now);
@@ -1606,22 +1606,39 @@ fn self_check_connect_password_reconnect() -> (bool, String) {
             format!("must be Active before the drop, got {:?}", manager.state()),
         );
     }
-    let action = manager.on_event(ConnEvent::TransportLost, now);
+    // P1-1 (v2.0.11): `TransportLost` is a dead arm on the manager
+    // — transport loss is owned by the forwarder + watchdog, not
+    // by a second retry owner in the manager (see
+    // `dead_manager_arms_are_noops`). The watchdog rebuilds the
+    // transport after `WATCHDOG_TIMEOUT` of silence in Active.
+    let silent_at = now + WATCHDOG_TIMEOUT + Duration::from_secs(1);
+    let action = manager.check_watchdog(silent_at);
     if action != ManagerAction::RebuildTransport {
         return (
             false,
-            format!("transport loss must rebuild, got {action:?}"),
+            format!("watchdog silence must rebuild transport, got {action:?}"),
         );
     }
-    manager.on_event(ConnEvent::LinkUp, now);
-    let action = manager.on_event(ConnEvent::HelloReceived, now);
+    if !matches!(manager.state(), rsh_api::ConnectionState::Backoff { .. }) {
+        return (
+            false,
+            format!(
+                "must be in Backoff after watchdog rebuild, got {:?}",
+                manager.state()
+            ),
+        );
+    }
+    // The forwarder re-activates on its own while the manager sits
+    // in Backoff — the HELLO that re-opens the session is accepted
+    // from Backoff (R3-D-01) and starts activation.
+    let action = manager.on_event(ConnEvent::HelloReceived, silent_at);
     if action != ManagerAction::StartActivation {
         return (
             false,
             format!("reconnect HELLO must start activation, got {action:?}"),
         );
     }
-    manager.on_event(ConnEvent::CapsOk, now);
+    manager.on_event(ConnEvent::CapsOk, silent_at);
     if !manager.state().is_active() {
         return (
             false,
@@ -1633,7 +1650,7 @@ fn self_check_connect_password_reconnect() -> (bool, String) {
     }
     (
         true,
-        "password reconnect: Active -> Backoff -> LinkUp -> Hello -> Active, no pairing action"
+        "password reconnect: Active -> watchdog rebuild -> Backoff -> Hello -> Active, no pairing action"
             .into(),
     )
 }
@@ -1732,16 +1749,24 @@ fn self_check_connect_unreachable() -> (bool, String) {
     let mut manager = ConnectionManager::new();
     let now = Instant::now();
     manager.on_event(ConnEvent::Connect, now);
-    for _ in 0..3 {
-        manager.on_event(ConnEvent::HelloTimeout, now);
-    }
+    // P1-1 (v2.0.11): `HelloTimeout` is a dead arm on the manager
+    // — the HELLO wait lives in the activator
+    // (`SESSION_HELLO_ATTEMPTS` x `SESSION_HELLO_WAIT`), and on
+    // exhaustion the activator records the session error
+    // `Unreachable` ("no HELLO reply from the board"), which the
+    // daemon loop feeds as `ActivationFailed(Unreachable)` (see
+    // `dead_manager_arms_are_noops`). Drive that production path.
+    manager.on_event(
+        ConnEvent::ActivationFailed(ConnectionError::Unreachable),
+        now,
+    );
     match manager.state() {
         rsh_api::ConnectionState::Error { reason, .. }
             if *reason == ConnectionError::Unreachable => {}
         other => {
             return (
                 false,
-                format!("3 HELLO timeouts must end in Error(Unreachable), got {other:?}"),
+                format!("HELLO exhaustion must end in Error(Unreachable), got {other:?}"),
             );
         }
     }

@@ -210,17 +210,10 @@ static void fw34_boot_setup() {
     }
     cfgPref.putUChar("pend", 0);
   }
-  // Phase G (C3): purana factory blob (Phase D/E/F — BUTTON slots 0..3)
-  // naye slot scheme mein horn/encoders/LED/handbrake band kar deta
-  // (un ke records purane blob mein hain hi nahi). Aisa blob mile to
-  // naye factory blob par migrate karo aur NVS saaf karo (cur slot).
-  // PC se aaya blob kabhi legacy nahi hota (PC builder BUTTON slot 3
-  // kabhi nahi bhejta — rsh_pinmap_blob_is_legacy).
-  if (rsh_pinmap_blob_is_legacy(cfgTxn.current, cfgTxn.current_len)) {
-    uint16_t mlen = (uint16_t)rsh_cfg_factory_blob(fw34_scratch);
-    if (rsh_cfg_txn_load_current(&cfgTxn, fw34_scratch, mlen) == RSH_CTRL_OK)
-      fw34_slot_save(cfgPref, "cur", cfgTxn.current, cfgTxn.current_len);
-  }
+  // P2-5: purana factory blob (Phase D/E/F — BUTTON slot 3) ab validate
+  // nahi hota (BUTTON slot > 2 reject) — load upar hi LKG/factory
+  // fallback leta hai (wahi end state jo purani legacy-migration deti
+  // thi), is liye alag migration block ki zaroorat nahi.
   cfgPref.end();
 }
 
@@ -322,15 +315,62 @@ rsh_cfg_txn_t *rsh_fw34_cfg_txn(void) {
   return &cfgTxn;
 }
 
-// Config persist karo (NVS "rsh-cfg"): current hamesha, previous sirf jab
-// has_previous ho (COMMIT ke baad), pend flag caller ke mutabiq.
+// Config persist karo (NVS "rsh-cfg"): previous sirf jab has_previous
+// ho (COMMIT ke baad), pend flag caller ke mutabiq, current aakhir mein.
+// P2-2 atomicity — order + verify:
+//   prv -> pend -> cur, phir cur read-back verify.
+//   * pend=1 se PEHLE prv durable hota hai (invariant: pend=1 ho to
+//     prv maujood hai) — beech mein power loss ho to boot ya to purani
+//     confirmed config dekhta hai (pend=0), ya prv se rollback karta
+//     hai (pend=1). Kisi bhi waqt unconfirmed config confirmed nahi banti.
+//   * cur aakhir mein likha jata hai — torn cur + pend=1 ho to boot
+//     prv se recover karta hai (LKG/factory fallback bhi hai).
+//   * cur pehle se RAM jaisa ho (CONFIRM — bytes waisi ki waisi) to
+//     dobara NAHI likha jata (torn-write ka koi faida nahi).
+//   * Koi write ya verify fail ho to FAIL LOUDLY: flag + diag event
+//     (GET_DIAG, RSH_DIAG_CFG_SAVE_FAIL) + RSH_DEBUG log — pehle sirf
+//     unread flag lagta tha. In-RAM config chalti rehti hai; agla boot
+//     LKG/factory se recover karta hai.
 void rsh_fw34_cfg_persist(uint8_t pending) {
   Preferences cfgPref;
-  if (!cfgPref.begin("rsh-cfg", false)) return;
-  fw34_slot_save(cfgPref, "cur", cfgTxn.current, cfgTxn.current_len);
-  if (cfgTxn.has_previous)
-    fw34_slot_save(cfgPref, "prv", cfgTxn.previous, cfgTxn.previous_len);
-  cfgPref.putUChar("pend", pending ? 1 : 0);
+  if (!cfgPref.begin("rsh-cfg", false)) {
+    fw34_cfg_save_failed = 1;
+    rsh_diag_record_global(RSH_DIAG_CFG_SAVE_FAIL, 0, millis());
+#if RSH_DEBUG
+    Serial.println("RSH: NVS config persist FAILED (begin)");
+#endif
+    return;
+  }
+  uint8_t ok = 1;
+  if (cfgTxn.has_previous &&
+      !fw34_slot_save(cfgPref, "prv", cfgTxn.previous, cfgTxn.previous_len))
+    ok = 0;
+  if (cfgPref.putUChar("pend", pending ? 1 : 0) != 1) {
+    fw34_cfg_save_failed = 1;
+    ok = 0;
+  }
+  // Cur sirf tab likho jab NVS wala RAM se mukhtalif ho (CONFIRM par
+  // bytes waisi ki waisi hoti hain — dobara likhna sirf torn-write risk hai).
+  // Ye read-back skip case mein hi verify hai.
+  uint16_t cur_len = fw34_slot_load(cfgPref, "cur", fw34_scratch);
+  if (cur_len != cfgTxn.current_len ||
+      memcmp(fw34_scratch, cfgTxn.current, cfgTxn.current_len) != 0) {
+    if (!fw34_slot_save(cfgPref, "cur", cfgTxn.current, cfgTxn.current_len))
+      ok = 0;
+    // Verify: cur read-back RAM se mile (torn write pakro).
+    uint16_t vlen = fw34_slot_load(cfgPref, "cur", fw34_scratch);
+    if (vlen != cfgTxn.current_len ||
+        memcmp(fw34_scratch, cfgTxn.current, cfgTxn.current_len) != 0) {
+      fw34_cfg_save_failed = 1;
+      ok = 0;
+    }
+  }
+  if (!ok) {
+    rsh_diag_record_global(RSH_DIAG_CFG_SAVE_FAIL, 0, millis());
+#if RSH_DEBUG
+    Serial.println("RSH: NVS config persist FAILED (write/verify)");
+#endif
+  }
   cfgPref.end();
 }
 
@@ -433,9 +473,14 @@ static uint8_t sample_once_(RshSampleMailbox *frame, uint32_t nowMs,
     uint8_t flags2 = 0;
     if (inputs_axis_invalid()) flags2 |= RSH_V2_FLAG_AXIS_INVALID;  // F2
     if (seqGap != lastSentSeqGap) flags2 |= RSH_V2_FLAG_TICK_SKIPPED;  // D5
+    // P1-1: har slot ka mV bit (I2C axes pehle se mV hain — dobara
+    // raw->mV nahi lagta; native axes raw counts hain).
+    uint8_t axes_mv = 0;
+    for (uint8_t ax = 0; ax < 5; ax++)
+      if (inputs_axis_is_mv(ax)) axes_mv |= (uint8_t)(1u << ax);
     size_t n2 = rsh_build_v2_stream_packet(
         frame->v2pkt, sizeof(frame->v2pkt), seq, tsUs, flags2, s.steering,
-        inputs_steering_is_mv() ? 1 : 0, s.accelAnalog, s.brakeAnalog,
+        axes_mv, s.accelAnalog, s.brakeAnalog,
         s.handbrake, s.enc, rsh_modules_encoders_enabled() ? 2 : 0,
         s.buttons, rsh_modules_enabled(), s.clutch, s.shifterGear);
     if (n2 > 0) frame->v2len = (uint8_t)n2;

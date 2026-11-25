@@ -139,7 +139,7 @@
 //!   is no local pin-map store), so both need a live board session;
 //!   with no board they fail honestly instead of returning a guess.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::net::IpAddr;
@@ -357,6 +357,10 @@ pub struct GameInfo {
     pub id: String,
     /// Display name.
     pub name: String,
+    /// Full path to the game exe or shortcut, as stored (empty when
+    /// unknown — the UI team's edit-game re-browse fix reads this to
+    /// pre-fill the file picker; the daemon never invents a path).
+    pub exe_path: String,
     /// Id of the profile bound to this game, if any.
     pub bound_profile_id: Option<String>,
     /// True when this game is the currently tracked running game.
@@ -695,6 +699,42 @@ pub struct SessionActivation {
 struct ObservedHello {
     /// Board MAC (`"AA:BB:CC:DD:EE:FF"`) that sent this `HELLO`.
     board_mac: String,
+    /// Firmware version that sent this `HELLO` (P3-1, v2.0.11):
+    /// the dedupe key is (MAC, firmware), so a firmware change on
+    /// the same board — or a board reboot — produces a fresh HELLO
+    /// line instead of being swallowed as a repeat.
+    firmware: (u8, u8, u8),
+}
+
+/// Outcome of one [`AppStateCore::connect_transport`] attempt
+/// (P2-3, v2.0.11): whether the call actually started a fresh
+/// (re)connect, or no-op'd because a retry was already in flight.
+/// The old `Result<(), String>` could not tell them apart — a
+/// no-op still returned `Ok`, so the UI could not distinguish
+/// "retry started" from "already retrying / breaker latched".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    /// A fresh forwarder (re)connect was queued.
+    Started,
+    /// No new connect was started: an activation is in flight or
+    /// the forwarder is waiting out its own retry backoff. The
+    /// live attempt keeps running; the caller must not assume a
+    /// fresh attempt began.
+    AlreadyRetrying,
+}
+
+/// On-disk shape of the dirty-draft autosave file (P2-2, v2.0.11):
+/// the draft profile (stored profile + unsaved edits) for one
+/// profile id, plus which modules are dirty. The draft is dirty by
+/// construction — a clean draft is never written.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DraftAutosave {
+    schema_version: u32,
+    profile_id: String,
+    profile: WheelProfile,
+    #[serde(default)]
+    dirty_modules: BTreeSet<String>,
 }
 
 /// The outcome of one [`AppStateCore::activate_startup_backend`] call:
@@ -1115,7 +1155,8 @@ pub struct AppStateCore {
     forwarder_breaker_open: AtomicBool,
     /// Sticky "board reachable" latch (D15): set on every HELLO
     /// observed ([`Self::note_observed_hello`]), cleared on
-    /// disconnect / transport switch / `NoRoute` / HELLO-timeout.
+    /// disconnect / transport switch / `NoRoute` / HELLO-timeout /
+    /// activation failure (P1-2).
     /// The daemon reports it as `ConnectionInfo.board_reachable`;
     /// the wizard Step 1 Next unlocks on it (HELLO-or-better),
     /// never on `Active` alone.
@@ -1230,7 +1271,7 @@ impl AppStateCore {
         // (same load-never-fails contract — see `manual_games`).
         let manual_games = ManualGameStore::open(store.dir());
         let manual_game_load_warnings = manual_games.load_warnings().to_vec();
-        Self {
+        let state = Self {
             metrics: Mutex::new(EngineMetrics::new()),
             loop_rate: Mutex::new(LoopRateTracker::new()),
             encoders: Mutex::new(EncoderState::new()),
@@ -1311,7 +1352,13 @@ impl AppStateCore {
             connection_log: Mutex::new(VecDeque::new()),
             connection_log_tail: Mutex::new(VecDeque::new()),
             last_stream_frame_at: Mutex::new(None),
-        }
+        };
+        // P2-2 (v2.0.11): a dirty draft left by a previous run
+        // (daemon crash / restart before Save) is restored here,
+        // so the unsaved tuning is offered back instead of
+        // silently lost. No-op when no autosave file exists.
+        state.restore_autosaved_draft();
+        state
     }
 
     /// Builds the state with the [`NullSink`] installed: no output
@@ -1580,7 +1627,12 @@ impl AppStateCore {
 
     /// Classify a [`SessionError`] into its typed
     /// [`ConnectionError`] (no secret ever rides along — the detail
-    /// string stays separate).
+    /// string stays separate). P2-1 (v2.0.11): every failure family
+    /// keeps its own type — keystore failures, control failures,
+    /// and malformed `HELLO`s no longer collapse into `Unknown`,
+    /// so diagnostics and the UI keep the real reason. Only
+    /// `NotActive` / `AlreadyActive` (which cannot surface from an
+    /// activation attempt) still map to `Unknown`.
     fn classify_session_error(error: &SessionError) -> ConnectionError {
         use rsh_transport::control_client::ControlError;
         match error {
@@ -1590,12 +1642,23 @@ impl AppStateCore {
             // caller still produces) to `Unknown`, so this match
             // stays exhaustive across the WS-2 SessionError rewrite.
             SessionError::BoardMismatch => ConnectionError::BoardMismatch,
+            // A `HELLO` that cannot start a session: unparseable
+            // bytes, or an old-protocol board the session layer
+            // refuses.
+            SessionError::InvalidHello(_) | SessionError::HelloParse(_) => {
+                ConnectionError::MalformedHello
+            }
+            // The platform credential store failed during
+            // activation.
+            SessionError::Keystore(_) => ConnectionError::Keystore,
             SessionError::Control(ControlError::Timeout) => ConnectionError::Timeout,
-            // Every other `SessionError` (control failures,
-            // keystore failures, malformed HELLOs, …) maps to
-            // `Unknown` — the wildcard keeps this exhaustive
-            // across the WS-2 `SessionError` rewrite without
-            // naming variants that no longer exist.
+            // A dead control transport is a dropped connection,
+            // not a board rejection.
+            SessionError::Control(ControlError::Transport(_)) => ConnectionError::TransportClosed,
+            // Any other control failure (board rejection, bad
+            // reply, unexpected reply, bad argument) keeps its own
+            // type instead of collapsing into `Unknown`.
+            SessionError::Control(_) => ConnectionError::ControlFailed,
             _ => ConnectionError::Unknown,
         }
     }
@@ -1656,9 +1719,16 @@ impl AppStateCore {
     /// sets both the string and the typed records, the engine
     /// detail, and the Phase 0 gate §6.2 format-6 failure line
     /// (`activation failed: reason=<code> detail=<hint>`).
+    /// P1-2 (v2.0.11): a failed activation also clears the
+    /// `board_reachable` latch. The latch is sticky and the daemon
+    /// loop feeds `HelloReceived` only on its rising edge, so
+    /// without this a HELLO after the failure would never be fed
+    /// again and the manager could never leave `Error` — the next
+    /// HELLO re-sets the latch and re-opens the activation path.
     fn note_session_error_typed(&self, typed: ConnectionError, reason: &str) {
         *lock(&self.session_last_error) = Some(reason.to_string());
         *lock(&self.session_last_error_typed) = Some(typed);
+        self.clear_board_reachable();
         self.push_connection_log(
             "ERROR",
             &format!(
@@ -1705,19 +1775,33 @@ impl AppStateCore {
             .map(|byte| format!("{byte:02X}"))
             .collect::<Vec<String>>()
             .join(":");
-        *lock(&self.session_last_hello) = Some(ObservedHello {
-            board_mac: board_mac.clone(),
-        });
+        // The board answers a HELLO every second while the link is
+        // up: log it only the first time in a session (or when the
+        // board MAC or firmware changes, P3-1), not on every repeat
+        // — a 1 Hz line buried every real error in the log.
+        let first_or_changed = {
+            let mut last = lock(&self.session_last_hello);
+            let changed = last
+                .as_ref()
+                .is_none_or(|prev| prev.board_mac != board_mac || prev.firmware != hello.firmware);
+            *last = Some(ObservedHello {
+                board_mac: board_mac.clone(),
+                firmware: hello.firmware,
+            });
+            changed
+        };
         self.board_reachable.store(true, Ordering::SeqCst);
         // Phase 0 gate §6.2 format 3 (HELLO received — MAC +
         // firmware only, never a secret).
-        self.push_connection_log(
-            "INFO",
-            &format!(
-                "HELLO received: board_mac={board_mac} firmware={}.{}.{}",
-                hello.firmware.0, hello.firmware.1, hello.firmware.2
-            ),
-        );
+        if first_or_changed {
+            self.push_connection_log(
+                "INFO",
+                &format!(
+                    "HELLO received: board_mac={board_mac} firmware={}.{}.{}",
+                    hello.firmware.0, hello.firmware.1, hello.firmware.2
+                ),
+            );
+        }
     }
 
     /// Whether a board `HELLO` has been observed since the last
@@ -1729,7 +1813,9 @@ impl AppStateCore {
     }
 
     /// Clears the [`Self::board_reachable`] latch (D15): on
-    /// disconnect / transport switch / `NoRoute` / HELLO-timeout.
+    /// disconnect / transport switch / `NoRoute` / HELLO-timeout /
+    /// activation failure (P1-2: a failed `GET_CAPS` must not leave
+    /// the latch set, or the next HELLO is never a rising edge).
     pub fn clear_board_reachable(&self) {
         self.board_reachable.store(false, Ordering::SeqCst);
     }
@@ -1943,6 +2029,7 @@ impl AppStateCore {
         // As with a manual switch: the old draft is gone and the new
         // profile's plan goes live.
         *lock(&self.draft) = None;
+        self.clear_dirty_draft_autosave();
         self.push_pipeline_plan();
         Ok(())
     }
@@ -2127,6 +2214,18 @@ impl AppStateCore {
             snapshot.committed_at = None;
         }
         snapshot
+    }
+
+    /// The stored Wi-Fi password for the last observed board, when
+    /// one is stored (P2-6, v2.0.11): the daemon reads this BEFORE
+    /// [`Self::set_password`] so a failed WLAN-profile update can
+    /// roll the board password back to it. `None` when no board was
+    /// observed, no password is stored, or the store cannot be read.
+    /// The password itself is never logged.
+    #[must_use]
+    pub fn stored_wifi_password(&self) -> Option<String> {
+        let mac = self.last_observed_board_mac()?;
+        KeyStore::new().get_wifi_password(&mac).ok()
     }
 
     /// Change the board AP password (`set_password`): the new
@@ -3299,6 +3398,88 @@ impl AppStateCore {
         self.set_output_enabled_with_factories(enabled, &factories)
     }
 
+    /// Storm-guard refusal for the enable toggle (P1-5,
+    /// update4-fix): `Some(state)` when enabling output would
+    /// spawn a `HIDMaestro` sidecar while the cooldown is armed —
+    /// the refusal is recorded honestly and no backend is touched.
+    /// `None` when the toggle may proceed (no spawn would happen,
+    /// or the guard is not armed). Split out of
+    /// [`Self::set_output_enabled_with_factories`] so that function
+    /// stays under clippy's `too_many_lines` limit.
+    fn hid_switch_cooldown_refusal(&self) -> Option<CommandOutputState> {
+        // Enabling output spawns a sidecar exactly like an explicit
+        // switch when the live backend is a disconnected
+        // `HIDMaestro` (plain reconnect) or when the deferred
+        // activation would switch a persisted `HIDMaestro` in —
+        // so a toggle loop used to bypass the cooldown entirely. A
+        // connected backend is unaffected (enabling it only resends,
+        // never spawns), and a disconnected vJoy is unaffected too
+        // (its reconnect spawns nothing).
+        let live_kind = BackendKind::from_backend_name(&self.backend_name());
+        let enable_would_spawn_hidmaestro = !lock(&self.backend_handle()).is_connected()
+            && (live_kind == Some(BackendKind::HidMaestro)
+                || (live_kind == Some(BackendKind::None)
+                    && self.selected_backend() == BackendKind::HidMaestro));
+        if enable_would_spawn_hidmaestro && self.hid_switch_cooldown_active() {
+            self.record_send(
+                false,
+                format!("output enabled: {}", Self::HID_SWITCH_COOLDOWN_MESSAGE),
+            );
+            Some(self.output_state())
+        } else {
+            None
+        }
+    }
+
+    /// Deferred-activation half of
+    /// [`Self::set_output_enabled_with_factories`]: when output is
+    /// enabled while the [`NullSink`] is installed and a real
+    /// backend is selected, switch the selected backend in (the
+    /// user-initiated moment the deferred startup backend is
+    /// activated). Returns `Some(state)` when the activation
+    /// failed — the caller returns it at once, the [`NullSink`]
+    /// stays installed. Returns `None` when there was no deferred
+    /// activation to run, or it succeeded. Split out so the caller
+    /// stays under clippy's `too_many_lines` limit.
+    fn deferred_enable_activation(
+        &self,
+        factories: &BackendFactories,
+    ) -> Option<CommandOutputState> {
+        if BackendKind::from_backend_name(&self.backend_name()) == Some(BackendKind::None)
+            && self.selected_backend() != BackendKind::None
+        {
+            let requested = self.selected_backend();
+            // Deferred startup activation (automatic path): the
+            // fallback stays allowed here — enabling output is
+            // not an explicit backend switch (Bug 4/8 bans the
+            // fallback only for `set_output_backend`).
+            return match self.apply_backend_switch(requested, factories, true) {
+                Ok(outcome) => {
+                    // P1-5: a `HIDMaestro` activation that fell
+                    // back to vJoy still spent a failed sidecar
+                    // spawn — it counts toward the storm guard,
+                    // exactly like a failed explicit switch; a
+                    // clean activation resets the counter.
+                    if requested == BackendKind::HidMaestro {
+                        self.note_hid_switch_attempt(!outcome.fell_back);
+                    }
+                    None
+                }
+                Err(error) => {
+                    if requested == BackendKind::HidMaestro {
+                        self.note_hid_switch_attempt(false);
+                    }
+                    self.record_send(
+                        false,
+                        format!("output enabled: backend activation failed ({error})"),
+                    );
+                    Some(self.output_state())
+                }
+            };
+        }
+        None
+    }
+
     /// [`AppStateCore::set_output_enabled`] with injectable factories
     /// (the test seam: tests drive the deferred-activation path with
     /// mock backends here, the shell and settings paths use the real
@@ -3323,24 +3504,17 @@ impl AppStateCore {
     ) -> CommandOutputState {
         *lock(&self.output_enabled) = enabled;
         if enabled {
-            if BackendKind::from_backend_name(&self.backend_name()) == Some(BackendKind::None)
-                && self.selected_backend() != BackendKind::None
-            {
-                let requested = self.selected_backend();
-                // Deferred startup activation (automatic path): the
-                // fallback stays allowed here — enabling output is
-                // not an explicit backend switch (Bug 4/8 bans the
-                // fallback only for `set_output_backend`).
-                if let Err(error) = self.apply_backend_switch(requested, factories, true) {
-                    self.record_send(
-                        false,
-                        format!("output enabled: backend activation failed ({error})"),
-                    );
-                    return self.output_state();
-                }
+            // P1-5 (update4-fix): the storm guard covers the enable
+            // toggle too — see `hid_switch_cooldown_refusal`.
+            if let Some(refused) = self.hid_switch_cooldown_refusal() {
+                return refused;
             }
-            // R2-09: connect outside the backend lock (up to 60 s
-            // for HIDMaestro's sidecar spawn + UAC dwell). Take the
+            if let Some(failed) = self.deferred_enable_activation(factories) {
+                return failed;
+            }
+            // R2-09: connect outside the backend lock (up to 310 s
+            // for HIDMaestro's sidecar stages + UAC dwell, P1-1).
+            // Take the
             // backend out of the slot (a disconnected NullSink
             // stands in, so engine ticks keep flowing instead of
             // blocking on the mutex), connect + resend on the local
@@ -3374,9 +3548,17 @@ impl AppStateCore {
             // bound first — the scrutinee guard of a `match` would
             // still be held inside the arm and deadlock the resend
             // on the same handle.
+            // P1-5: the storm guard counts a `HIDMaestro` connect
+            // here too (a success resets it, a failure is a strike)
+            // — the plain reconnect below spawns a sidecar exactly
+            // like a switch, so it must not bypass the guard.
+            let backend_kind = BackendKind::from_backend_name(lock(&backend).name());
             let connected = lock(&backend).try_connect();
             match connected {
                 Ok(()) => {
+                    if backend_kind == Some(BackendKind::HidMaestro) {
+                        self.note_hid_switch_attempt(true);
+                    }
                     let last = *lock(&self.last_output);
                     match lock(&backend).update(&last) {
                         Ok(()) => {
@@ -3391,6 +3573,9 @@ impl AppStateCore {
                     }
                 }
                 Err(error) => {
+                    if backend_kind == Some(BackendKind::HidMaestro) {
+                        self.note_hid_switch_attempt(false);
+                    }
                     self.record_send(false, format!("output enabled: connect failed ({error})"));
                 }
             }
@@ -3448,8 +3633,16 @@ impl AppStateCore {
     /// split out so the no-sink-factory fallback can run it under
     /// the lock without duplicating the block).
     fn connect_and_resend(&self, backend: &mut Box<dyn IJoystickOutput>) -> CommandOutputState {
+        // P1-5: same storm-guard counting as the extracted path
+        // above (test-only path — the real factories always provide
+        // a sink — but a failing `HIDMaestro` connect here is still
+        // a spent sidecar spawn).
+        let kind = BackendKind::from_backend_name(backend.name());
         match backend.try_connect() {
             Ok(()) => {
+                if kind == Some(BackendKind::HidMaestro) {
+                    self.note_hid_switch_attempt(true);
+                }
                 let last = *lock(&self.last_output);
                 match backend.update(&last) {
                     Ok(()) => {
@@ -3461,6 +3654,9 @@ impl AppStateCore {
                 }
             }
             Err(error) => {
+                if kind == Some(BackendKind::HidMaestro) {
+                    self.note_hid_switch_attempt(false);
+                }
                 self.record_send(false, format!("output enabled: connect failed ({error})"));
             }
         }
@@ -3544,11 +3740,11 @@ impl AppStateCore {
         // another sidecar (the v2.0.10 retest fired 30 attempts in
         // ~4 minutes). Checked FIRST, before any latch is cleared or
         // any choice is persisted, so a refused attempt changes no
-        // state. Automatic paths never consult this.
-        if requested == BackendKind::HidMaestro
-            && let Some(until) = *lock(&self.hid_switch_cooldown_until)
-            && std::time::Instant::now() < until
-        {
+        // state. P1-5 (update4-fix): automatic paths consult the
+        // same guard inside `apply_backend_switch` / the enable
+        // toggle — only this FIRST check (before the persist)
+        // belongs to the explicit path.
+        if requested == BackendKind::HidMaestro && self.hid_switch_cooldown_active() {
             return Err(Self::HID_SWITCH_COOLDOWN_MESSAGE.to_string());
         }
         // R2-20: a backend switch re-probes the vJoy DLL on the next
@@ -3610,17 +3806,11 @@ impl AppStateCore {
         // for HIDMaestro only — a success resets it, a failure counts
         // toward the 3-strike cooldown. (vJoy / none switches never
         // touch it: only the elevated sidecar spawn can storm.)
+        // P1-5: shared with the enable toggle (see
+        // `note_hid_switch_attempt`) — the counting itself is the
+        // same from either entry point.
         if requested == BackendKind::HidMaestro {
-            if result.is_ok() {
-                self.hid_switch_failures.store(0, Ordering::SeqCst);
-            } else {
-                let failures = self.hid_switch_failures.fetch_add(1, Ordering::SeqCst) + 1;
-                if failures >= Self::HID_SWITCH_MAX_CONSECUTIVE_FAILURES {
-                    self.hid_switch_failures.store(0, Ordering::SeqCst);
-                    *lock(&self.hid_switch_cooldown_until) =
-                        Some(std::time::Instant::now() + Self::HID_SWITCH_COOLDOWN);
-                }
-            }
+            self.note_hid_switch_attempt(result.is_ok());
         }
         result
     }
@@ -3668,6 +3858,35 @@ impl AppStateCore {
     pub const HID_SWITCH_COOLDOWN_MESSAGE: &str =
         "HIDMaestro switch failed 3 times — retry in 30 s";
 
+    /// True while the storm guard refuses `HIDMaestro` switches
+    /// (P1-5, update4-fix): consulted by the explicit switch AND
+    /// every automatic path ([`Self::apply_backend_switch`],
+    /// [`Self::set_output_enabled_with_factories`]), so a toggle
+    /// or re-activation loop cannot bypass the cooldown.
+    fn hid_switch_cooldown_active(&self) -> bool {
+        lock(&self.hid_switch_cooldown_until).is_some_and(|until| std::time::Instant::now() < until)
+    }
+
+    /// Record one `HIDMaestro` switch attempt against the storm
+    /// guard (P1-5, update4-fix): shared by the explicit switch
+    /// and the enable toggle — a failed attempt counts toward the
+    /// 3-strike cooldown from EITHER entry point (a toggle loop
+    /// used to never arm the guard at all), and a success resets
+    /// the counter. Only ever called for `HIDMaestro` attempts
+    /// (vJoy / none never touch the guard).
+    fn note_hid_switch_attempt(&self, success: bool) {
+        if success {
+            self.hid_switch_failures.store(0, Ordering::SeqCst);
+        } else {
+            let failures = self.hid_switch_failures.fetch_add(1, Ordering::SeqCst) + 1;
+            if failures >= Self::HID_SWITCH_MAX_CONSECUTIVE_FAILURES {
+                self.hid_switch_failures.store(0, Ordering::SeqCst);
+                *lock(&self.hid_switch_cooldown_until) =
+                    Some(std::time::Instant::now() + Self::HID_SWITCH_COOLDOWN);
+            }
+        }
+    }
+
     /// UAC decline message (B-2/A10, v2.0.2): shown once when the user
     /// declines the `HIDMaestro` elevation prompt. The switch fails with
     /// this (no silent fallback to vJoy) and the decline latch blocks
@@ -3703,6 +3922,18 @@ impl AppStateCore {
         let _switch_guard = self.switch_in_flight.try_lock().map_err(|_| {
             "a backend switch is already in progress — wait for it to finish".to_string()
         })?;
+        // P1-5 (update4-fix): the storm guard is consulted on EVERY
+        // path into a `HIDMaestro` switch, not only the explicit
+        // selector path — an automatic re-attempt (deferred enable,
+        // mid-session re-activation) used to rebuild a fresh manager
+        // with a full retry budget while the guard was armed, so the
+        // 30-attempt storm could continue through the toggle. The
+        // explicit path still refuses first (before persisting) in
+        // `set_output_backend_with_factories`; this is the backstop
+        // for every other caller.
+        if requested == BackendKind::HidMaestro && self.hid_switch_cooldown_active() {
+            return Err(Self::HID_SWITCH_COOLDOWN_MESSAGE.to_string());
+        }
         // B-2/A10: the user declined the UAC prompt this session.
         // Fail fast with the NotAdmin message — no new prompt, no
         // silent fallback. Only an explicit re-select clears this
@@ -3728,15 +3959,24 @@ impl AppStateCore {
         // survives). `set_output_backend` calls `reset_fallback`
         // first, so by the time this runs the app-core flag is clear
         // too — both latches re-arm on one explicit re-select.
+        // P1-5 (update4-fix): the in-place re-arm is EXPLICIT ONLY
+        // (`!allow_fallback`). An automatic re-attempt must NOT
+        // clear the manager's 2-failure latch — a latched instance
+        // fails fast with `FallbackNeeded` and the automatic path
+        // falls back to vJoy, which IS the guard working. Clearing
+        // it on automatic re-attempts handed every retry a fresh
+        // budget and defeated the guard exactly like the old
+        // fresh-manager replacement did.
         let live = self.backend_handle();
         if requested != BackendKind::None
             && BackendKind::from_backend_name(&self.backend_name()) == Some(requested)
             && !lock(&live).is_connected()
+            && !allow_fallback
         {
             lock(&live).reset_fallback();
         }
-        // R2-09: the selector's connect (up to 60 s of sidecar
-        // spawn + UAC dwell for HIDMaestro) must NOT run under the
+        // R2-09: the selector's connect (up to 310 s of sidecar
+        // stages + UAC dwell for HIDMaestro, P1-1) must NOT run under the
         // backend lock — while it did, every engine tick blocked on
         // the mutex and output stopped entirely for as long as the
         // user took to answer UAC. Take the installed backend OUT of
@@ -3754,8 +3994,8 @@ impl AppStateCore {
                 std::mem::replace(&mut *slot, Arc::new(Mutex::new(placeholder)))
             };
             // The extracted handle is owned by this scope: the
-            // switch (up to 60 s of sidecar spawn + UAC dwell)
-            // runs on its own lock, never on the slot lock.
+            // switch (up to 310 s of sidecar stages + UAC dwell,
+            // P1-1) runs on its own lock, never on the slot lock.
             let mut current = lock(&handle);
             let outcome = switch_backend(&mut current, requested, factories, None, allow_fallback)
                 .map_err(|error| error.to_string());
@@ -4854,13 +5094,32 @@ impl AppStateCore {
     /// a tripped breaker stays tripped against automatic retries,
     /// not against the user pressing Connect.
     pub fn connect_transport(self: &Arc<Self>, kind: TransportKind) -> Result<(), String> {
+        self.connect_transport_with_outcome(kind).map(|_| ())
+    }
+
+    /// [`connect_transport`](Self::connect_transport) that also
+    /// reports whether a fresh (re)connect actually started (P2-3,
+    /// v2.0.11): `Started` when a forwarder (re)connect was
+    /// queued, `AlreadyRetrying` when the call no-op'd because an
+    /// activation is in flight or the forwarder is waiting out its
+    /// own retry backoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no board serial port is detected, the
+    /// engine cannot be started, or the connect command cannot be
+    /// queued.
+    pub fn connect_transport_with_outcome(
+        self: &Arc<Self>,
+        kind: TransportKind,
+    ) -> Result<ConnectOutcome, String> {
         // R3-D-05: never tear an in-flight activation / retry-wait
         // down. The supervisor aborts the running forwarder on every
         // `EngineCommand::Connect`, so queueing one here would
         // restart the exchange the live forwarder is already
         // running — and reset its breaker streak (R3-D-02).
         if self.activation_in_flight.load(Ordering::SeqCst) || self.forwarder_retry_waiting() {
-            return Ok(());
+            return Ok(ConnectOutcome::AlreadyRetrying);
         }
         // An explicit (re)connect that proceeds clears a latched
         // breaker: the user asked for a fresh run (R3-D-02).
@@ -4909,7 +5168,7 @@ impl AppStateCore {
         // the fresh `GET_CAPS` passes.
         self.close_session_gate();
         self.clear_board_reachable();
-        Ok(())
+        Ok(ConnectOutcome::Started)
     }
 
     /// Disconnects the live transport (aborts its forwarder). The
@@ -5306,6 +5565,7 @@ impl AppStateCore {
         // A switch drops the old profile's draft (its edits belong to
         // the old profile) and pushes the new profile's plan live.
         *lock(&self.draft) = None;
+        self.clear_dirty_draft_autosave();
         self.push_pipeline_plan();
         self.note_slow_state_changed();
         Ok(summary)
@@ -5606,6 +5866,8 @@ impl AppStateCore {
             entry.enabled = enabled;
             draft.mark_dirty(&module);
         }
+        // P2-2: same crash-safe autosave as `set_tuning`.
+        self.persist_dirty_draft_autosave();
         self.push_pipeline_plan();
         self.note_slow_state_changed();
         Ok(enabled)
@@ -5707,6 +5969,7 @@ impl AppStateCore {
                 .map_err(|error| error.to_string())?;
         }
         *lock(&self.draft) = None;
+        self.clear_dirty_draft_autosave();
         lock(&self.tunings).clear();
         self.push_pipeline_plan();
         Ok(match saved_at {
@@ -6244,6 +6507,7 @@ impl AppStateCore {
             .map(|game| GameInfo {
                 id: game.id.clone(),
                 name: game.name.clone(),
+                exe_path: game.exe_path.clone(),
                 bound_profile_id: game.bound_profile_id.clone(),
                 running: running_id.as_deref() == Some(game.id.as_str()),
                 installed: Path::new(&game.exe_path).is_file(),
@@ -6425,8 +6689,33 @@ impl AppStateCore {
         exe_path: &str,
         bound_profile_id: Option<String>,
     ) -> Result<GameInfo, String> {
+        self.add_manual_game_with_key(name, exe_path, bound_profile_id, None)
+    }
+
+    /// [`add_manual_game`](Self::add_manual_game) with an
+    /// idempotency key (P1-3, v2.0.11): a retry carrying the key of
+    /// an add that already succeeded returns the existing entry
+    /// instead of creating a duplicate — the 10 s game-write
+    /// timeout is a client-side bound, not proof the daemon did
+    /// not execute the add.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`add_manual_game`](Self::add_manual_game).
+    pub fn add_manual_game_with_key(
+        &self,
+        name: &str,
+        exe_path: &str,
+        bound_profile_id: Option<String>,
+        idempotency_key: Option<&str>,
+    ) -> Result<GameInfo, String> {
         let bound_profile_id = self.check_bound_profile(bound_profile_id)?;
-        let game = lock(&self.manual_games).add(name, exe_path, bound_profile_id)?;
+        let game = lock(&self.manual_games).add_with_key(
+            name,
+            exe_path,
+            bound_profile_id,
+            idempotency_key,
+        )?;
         let info = self.game_info(&game.id)?;
         self.note_slow_state_changed();
         Ok(info)
@@ -6450,10 +6739,14 @@ impl AppStateCore {
         bound_profile_id: Option<String>,
     ) -> Result<GameInfo, String> {
         let bound_profile_id = self.check_bound_profile(bound_profile_id)?;
-        {
-            let running_id = lock(&self.launcher)
-                .refresh()
-                .map(|running| running.game_id.clone());
+        // P1-5 (v2.0.11): the launcher lock is held across the
+        // running check AND the store update — the old code dropped
+        // it after `refresh()`, so a `launch_game` in the gap
+        // defeated the running-game guard (the same TOCTOU
+        // `stop_game` already closes by holding one lock, M12).
+        let game = {
+            let mut launcher = lock(&self.launcher);
+            let running_id = launcher.refresh().map(|running| running.game_id.clone());
             if running_id.as_deref() == Some(id) {
                 let stored = lock(&self.manual_games)
                     .get(id)
@@ -6465,8 +6758,8 @@ impl AppStateCore {
                     ));
                 }
             }
-        }
-        let game = lock(&self.manual_games).update(id, name, exe_path, bound_profile_id)?;
+            lock(&self.manual_games).update(id, name, exe_path, bound_profile_id)?
+        };
         let info = self.game_info(&game.id)?;
         self.note_slow_state_changed();
         Ok(info)
@@ -6480,17 +6773,18 @@ impl AppStateCore {
     /// Returns a message for an unknown id, a running game, or a
     /// save failure.
     pub fn remove_manual_game(&self, id: &str) -> Result<bool, String> {
+        // P1-5 (v2.0.11): one launcher lock across the running
+        // check AND the remove — see `update_manual_game`.
         {
-            let running_id = lock(&self.launcher)
-                .refresh()
-                .map(|running| running.game_id.clone());
+            let mut launcher = lock(&self.launcher);
+            let running_id = launcher.refresh().map(|running| running.game_id.clone());
             if running_id.as_deref() == Some(id) {
                 return Err(format!(
                     "game '{id}' is running — stop it before removing it"
                 ));
             }
+            lock(&self.manual_games).remove(id)?;
         }
-        lock(&self.manual_games).remove(id)?;
         self.note_slow_state_changed();
         Ok(true)
     }
@@ -6498,6 +6792,140 @@ impl AppStateCore {
     /* ------------------------------------------------------------------ */
     /* Tuning + calibration                                                */
     /* ------------------------------------------------------------------ */
+
+    /// Steering profile-level tuning (Bug 7 / S2+S3): invert + lock +
+    /// balance + centre trim live on the profile, not in the per-module
+    /// tuning. Shared by [`tuning_settings_from_stored`] and the
+    /// neutral-default branch of [`AppStateCore::get_tuning`].
+    fn steering_opts_for(
+        profile: &WheelProfile,
+        module: &str,
+    ) -> (Option<bool>, Option<f64>, Option<f64>, Option<f64>) {
+        if module == "steering" {
+            (
+                Some(profile.invert_steering),
+                Some(snap_steering_lock_deg(profile.steering_scale * 900.0)),
+                Some(profile.steering_balance_pct),
+                Some(profile.steering_center_trim_pct),
+            )
+        } else {
+            (None, None, None, None)
+        }
+    }
+
+    /// One stored per-module tuning as the frontend `TuningSettings`
+    /// shape (P2-2, v2.0.11): factored out of [`AppStateCore::get_tuning`]
+    /// so the dirty-draft autosave restore replays exactly the same
+    /// conversion — one conversion, two callers, no drift. `module` must
+    /// already be canonicalized (C-MOD-1) and `stored` the entry from
+    /// `profile.module_tunings`.
+    #[allow(clippy::too_many_lines)]
+    fn tuning_settings_from_stored(
+        profile: &WheelProfile,
+        module: &str,
+        stored: &PerModuleTuning,
+    ) -> TuningSettings {
+        // Bug 7 (PC-test fix): steering invert + lock live on the
+        // profile (`invert_steering` / `steering_scale`), not in the
+        // per-module tuning. (S2+S3: the balance / centre trim live on
+        // the profile the same way.) Other modules never carry them
+        // (`None`).
+        let (invert, steering_lock_deg, steering_balance_pct, steering_center_trim_pct) =
+            Self::steering_opts_for(profile, module);
+        TuningSettings {
+            module: module.to_string(),
+            deadzone: stored.deadzone * 100.0,
+            curve: 1.0 + stored.curve_strength,
+            min_mv: stored.min_mv.unwrap_or(0.0),
+            max_mv: stored.max_mv.unwrap_or(3300.0),
+            smoothing: stored.smoothing * 100.0,
+            invert,
+            steering_lock_deg,
+            // --- Steering per-module tuning ---
+            steering_balance_pct,
+            steering_center_trim_pct,
+            bite_point: stored.bite_point,
+            saturation: stored.saturation,
+            shifter_gate: if module == "shifter" {
+                Some(if stored.gate_mode.eq_ignore_ascii_case("h-pattern") {
+                    ShifterGate::HPattern
+                } else {
+                    ShifterGate::Sequential
+                })
+            } else {
+                None
+            },
+            horn_button: stored.horn_button,
+            led_brightness: stored.led_brightness,
+            led_pattern: stored
+                .led_pattern
+                .as_deref()
+                .and_then(LedPattern::parse_name),
+            // M2/H8: stored colour (hex) + handbrake mode round-trip.
+            led_color: stored.led_color.as_deref().and_then(parse_hex_color),
+            handbrake_button_mode: stored.handbrake_button_mode,
+            // --- Pedal ramps/curves per-module tuning ---
+            // A stored per-module ramp wins; otherwise the task
+            // default for the module — old profiles load with
+            // the defaults, never with a silent 0. Combined
+            // pedals is a profile-level switch, carried on the
+            // throttle record (both spellings: the UI writes
+            // "throttle", the pipeline reads "accelerator").
+            press_ms: stored.press_ms.or(default_press_ms(module)),
+            release_ms: stored.release_ms.or(default_release_ms(module)),
+            combine_pedals: if module == "accelerator" || module == "throttle" {
+                Some(profile.combine_pedals)
+            } else {
+                None
+            },
+            // --- Encoder per-module tuning ---
+            // Old profiles carry none of these fields: the
+            // defaults (50 ms pulse, 4 counts per click, accel
+            // off, sensitivity 1.0, no invert) apply.
+            encoder_pulse_ms: Some(stored.encoder_pulse_ms.unwrap_or(50.0)),
+            encoder_counts_per_click: Some(stored.encoder_counts_per_click.unwrap_or(4)),
+            encoder_accel: Some(stored.encoder_accel.unwrap_or(false)),
+            encoder_accel_sensitivity: Some(stored.encoder_accel_sensitivity.unwrap_or(1.0)),
+            encoder_invert_mask: Some(stored.encoder_invert_mask.unwrap_or(0)),
+            // --- Buttons per-module tuning ---
+            // Old profiles carry none of these fields: the
+            // defaults (10 ms debounce, 800 ms long-press
+            // threshold, 300 ms double-press window) apply.
+            button_debounce_ms: Some(stored.button_debounce_ms.unwrap_or(10.0)),
+            button_long_press_ms: Some(stored.button_long_press_ms.unwrap_or(800.0)),
+            button_double_press_ms: Some(stored.button_double_press_ms.unwrap_or(300.0)),
+            // --- Shifter per-module tuning ---
+            // Old profiles carry no lockout: the 50 ms default
+            // applies (`Some(0.0)` = off, once set).
+            shift_lockout_ms: Some(stored.shift_lockout_ms.unwrap_or(50.0)),
+            // --- Handbrake/clutch per-module tuning ---
+            // Old profiles carry none of these fields either:
+            // latch off, auto-release off, slip zone 15% — and
+            // only the owning module carries them at all.
+            handbrake_latch: if module == "handbrake" {
+                Some(stored.handbrake_latch.unwrap_or(false))
+            } else {
+                None
+            },
+            handbrake_auto_release: if module == "handbrake" {
+                Some(stored.handbrake_auto_release.unwrap_or(false))
+            } else {
+                None
+            },
+            bite_width: if module == "clutch" {
+                Some(stored.bite_width.unwrap_or(0.15))
+            } else {
+                None
+            },
+            // --- LED/horn per-module tuning ---
+            // Old profiles carry none of these fields: the
+            // defaults (1000 ms period, 400 ms minimum honk,
+            // Momentary mode) apply.
+            led_period_ms: Some(stored.led_period_ms.unwrap_or(1000.0)),
+            horn_min_ms: Some(stored.horn_min_ms.unwrap_or(400.0)),
+            horn_latch: Some(stored.horn_latch.unwrap_or(false)),
+        }
+    }
 
     /// The tuning for one module: the session's validated tuning when
     /// one was set, else the active profile's stored tuning converted
@@ -6519,131 +6947,16 @@ impl AppStateCore {
         if let Some(tuning) = lock(&self.tunings).get(&module) {
             return tuning.clone();
         }
-        // Bug 7 (PC-test fix): steering invert + lock live on the
-        // profile (`invert_steering` / `steering_scale`), not in the
-        // per-module tuning — both branches below report them, so
-        // the UI can init the Advanced controls from a stored
-        // profile even before any steering edit created a module
-        // entry. (S2+S3: the balance / centre trim live on the
-        // profile the same way.) Other modules never carry them
-        // (`None`).
-        let steering_opts =
-            |profile: &WheelProfile| -> (Option<bool>, Option<f64>, Option<f64>, Option<f64>) {
-                if module == "steering" {
-                    (
-                        Some(profile.invert_steering),
-                        Some(snap_steering_lock_deg(profile.steering_scale * 900.0)),
-                        Some(profile.steering_balance_pct),
-                        Some(profile.steering_center_trim_pct),
-                    )
-                } else {
-                    (None, None, None, None)
-                }
-            };
         if let Some(active) = lock(&self.store).active()
             && let Some(stored) = active.profile.module_tunings.get(&module)
         {
-            let (invert, steering_lock_deg, steering_balance_pct, steering_center_trim_pct) =
-                steering_opts(&active.profile);
-            return TuningSettings {
-                module: module.clone(),
-                deadzone: stored.deadzone * 100.0,
-                curve: 1.0 + stored.curve_strength,
-                min_mv: stored.min_mv.unwrap_or(0.0),
-                max_mv: stored.max_mv.unwrap_or(3300.0),
-                smoothing: stored.smoothing * 100.0,
-                invert,
-                steering_lock_deg,
-                // --- Steering per-module tuning ---
-                steering_balance_pct,
-                steering_center_trim_pct,
-                bite_point: stored.bite_point,
-                saturation: stored.saturation,
-                shifter_gate: if module == "shifter" {
-                    Some(if stored.gate_mode.eq_ignore_ascii_case("h-pattern") {
-                        ShifterGate::HPattern
-                    } else {
-                        ShifterGate::Sequential
-                    })
-                } else {
-                    None
-                },
-                horn_button: stored.horn_button,
-                led_brightness: stored.led_brightness,
-                led_pattern: stored
-                    .led_pattern
-                    .as_deref()
-                    .and_then(LedPattern::parse_name),
-                // M2/H8: stored colour (hex) + handbrake mode round-trip.
-                led_color: stored.led_color.as_deref().and_then(parse_hex_color),
-                handbrake_button_mode: stored.handbrake_button_mode,
-                // --- Pedal ramps/curves per-module tuning ---
-                // A stored per-module ramp wins; otherwise the task
-                // default for the module — old profiles load with
-                // the defaults, never with a silent 0. Combined
-                // pedals is a profile-level switch, carried on the
-                // throttle record (both spellings: the UI writes
-                // "throttle", the pipeline reads "accelerator").
-                press_ms: stored.press_ms.or(default_press_ms(&module)),
-                release_ms: stored.release_ms.or(default_release_ms(&module)),
-                combine_pedals: if module == "accelerator" || module == "throttle" {
-                    Some(active.profile.combine_pedals)
-                } else {
-                    None
-                },
-                // --- Encoder per-module tuning ---
-                // Old profiles carry none of these fields: the
-                // defaults (50 ms pulse, 4 counts per click, accel
-                // off, sensitivity 1.0, no invert) apply.
-                encoder_pulse_ms: Some(stored.encoder_pulse_ms.unwrap_or(50.0)),
-                encoder_counts_per_click: Some(stored.encoder_counts_per_click.unwrap_or(4)),
-                encoder_accel: Some(stored.encoder_accel.unwrap_or(false)),
-                encoder_accel_sensitivity: Some(stored.encoder_accel_sensitivity.unwrap_or(1.0)),
-                encoder_invert_mask: Some(stored.encoder_invert_mask.unwrap_or(0)),
-                // --- Buttons per-module tuning ---
-                // Old profiles carry none of these fields: the
-                // defaults (10 ms debounce, 800 ms long-press
-                // threshold, 300 ms double-press window) apply.
-                button_debounce_ms: Some(stored.button_debounce_ms.unwrap_or(10.0)),
-                button_long_press_ms: Some(stored.button_long_press_ms.unwrap_or(800.0)),
-                button_double_press_ms: Some(stored.button_double_press_ms.unwrap_or(300.0)),
-                // --- Shifter per-module tuning ---
-                // Old profiles carry no lockout: the 50 ms default
-                // applies (`Some(0.0)` = off, once set).
-                shift_lockout_ms: Some(stored.shift_lockout_ms.unwrap_or(50.0)),
-                // --- Handbrake/clutch per-module tuning ---
-                // Old profiles carry none of these fields either:
-                // latch off, auto-release off, slip zone 15% — and
-                // only the owning module carries them at all.
-                handbrake_latch: if module == "handbrake" {
-                    Some(stored.handbrake_latch.unwrap_or(false))
-                } else {
-                    None
-                },
-                handbrake_auto_release: if module == "handbrake" {
-                    Some(stored.handbrake_auto_release.unwrap_or(false))
-                } else {
-                    None
-                },
-                bite_width: if module == "clutch" {
-                    Some(stored.bite_width.unwrap_or(0.15))
-                } else {
-                    None
-                },
-                // --- LED/horn per-module tuning ---
-                // Old profiles carry none of these fields: the
-                // defaults (1000 ms period, 400 ms minimum honk,
-                // Momentary mode) apply.
-                led_period_ms: Some(stored.led_period_ms.unwrap_or(1000.0)),
-                horn_min_ms: Some(stored.horn_min_ms.unwrap_or(400.0)),
-                horn_latch: Some(stored.horn_latch.unwrap_or(false)),
-            };
+            return Self::tuning_settings_from_stored(&active.profile, &module, stored);
         }
         let (invert, steering_lock_deg, steering_balance_pct, steering_center_trim_pct) =
             lock(&self.store)
                 .active()
                 .map_or((None, None, None, None), |active| {
-                    steering_opts(&active.profile)
+                    Self::steering_opts_for(&active.profile, &module)
                 });
         // --- Pedal ramps/curves per-module tuning ---
         let press_ms = default_press_ms(&module);
@@ -6712,11 +7025,15 @@ impl AppStateCore {
     }
 
     /// Validates and stores one module's tuning for this session, and
-    /// writes it into the in-memory draft (L4, D-1) — NOT to disk:
-    /// the tuning survives a restart only after an explicit Save
-    /// ([`Self::save_draft`]). The same call pushes the rebuilt
-    /// [`PipelinePlan`] live to the running engine, so a slider move
-    /// takes effect on the next tick instead of only after Save.
+    /// writes it into the in-memory draft (L4, D-1) — NOT into the
+    /// stored profile on disk: the tuning survives as a *saved*
+    /// profile only after an explicit Save ([`Self::save_draft`]).
+    /// P2-2: the dirty draft itself IS autosaved to
+    /// `draft-autosave.json`, so a daemon crash/restart offers the
+    /// unsaved edits back instead of losing them. The same call
+    /// pushes the rebuilt [`PipelinePlan`] live to the running
+    /// engine, so a slider move takes effect on the next tick
+    /// instead of only after Save.
     /// The curve mapping is approximate (exponent 1.0 = linear
     /// strength 0.0). The module id is canonicalized (C-MOD-1). When
     /// the module is `"led"` and a pattern is set, the LED test is
@@ -6753,6 +7070,9 @@ impl AppStateCore {
             Self::apply_tuning_to_profile(&mut draft.profile, &tuning);
             draft.mark_dirty(&tuning.module);
         }
+        // P2-2: the dirty draft is autosaved (crash-safe) — the
+        // stored profile on disk is still untouched until Save.
+        self.persist_dirty_draft_autosave();
         self.push_pipeline_plan();
         // C-LED-1: apply the LED pattern best-effort — a board that
         // is not connected never fails the tuning save. L1: the
@@ -6949,6 +7269,8 @@ impl AppStateCore {
         if let Some(draft) = lock(&self.draft).as_mut() {
             draft.mark_clean();
         }
+        // P2-2: the draft is saved — the autosave is spent.
+        self.clear_dirty_draft_autosave();
         self.note_slow_state_changed();
         Ok(true)
     }
@@ -6964,8 +7286,137 @@ impl AppStateCore {
             lock(&self.tunings).clear();
             self.push_pipeline_plan();
             self.note_slow_state_changed();
+            self.clear_dirty_draft_autosave();
         }
         had_dirty
+    }
+
+    /// Crash-safe dirty draft (P2-2, v2.0.11): the unsaved tuning
+    /// draft is persisted to `<data_dir>/draft-autosave.json`
+    /// (atomic temp-file + rename, like `manual-games.json`) on
+    /// every edit that marks the draft dirty, and restored on the
+    /// next state open — a daemon crash or restart no longer
+    /// silently loses unsaved tuning. The file holds the draft
+    /// profile (the stored profile + the unsaved edits) and which
+    /// modules are dirty; it is NOT the saved profile — Save still
+    /// goes through [`Self::save_draft`] (which deletes this file),
+    /// and Discard / a profile switch / a backup restore delete it
+    /// too. A file for another profile, or a corrupt one, is
+    /// discarded (the saved profile is never touched).
+    const DRAFT_AUTOSAVE_FILE_NAME: &str = "draft-autosave.json";
+    /// Schema version of [`DraftAutosave`].
+    const DRAFT_AUTOSAVE_SCHEMA_VERSION: u32 = 1;
+
+    /// Persist the current dirty draft to the autosave file.
+    /// Best-effort: a failure is logged (diagnostics-visible) but
+    /// never fails the tuning edit itself — the edit is still live
+    /// and in the in-memory draft; only crash-recovery degrades.
+    /// No-op when there is no dirty draft.
+    fn persist_dirty_draft_autosave(&self) {
+        let Some((profile_id, draft)) = ({
+            let profile_id = lock(&self.store).active().map(|active| active.id.clone());
+            let draft = lock(&self.draft).clone();
+            profile_id.zip(draft)
+        }) else {
+            return;
+        };
+        if !draft.dirty {
+            return;
+        }
+        let file = DraftAutosave {
+            schema_version: Self::DRAFT_AUTOSAVE_SCHEMA_VERSION,
+            profile_id,
+            profile: draft.profile,
+            dirty_modules: draft.dirty_modules,
+        };
+        let json = match serde_json::to_string_pretty(&file) {
+            Ok(json) => json,
+            Err(error) => {
+                self.push_connection_log(
+                    "WARN",
+                    &format!("dirty draft autosave failed (serialize): {error}"),
+                );
+                return;
+            }
+        };
+        let dir = lock(&self.store).dir().to_path_buf();
+        let path = dir.join(Self::DRAFT_AUTOSAVE_FILE_NAME);
+        let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        let written = std::fs::write(&temp, json).is_ok() && std::fs::rename(&temp, &path).is_ok();
+        if !written {
+            let _ = std::fs::remove_file(&temp);
+            self.push_connection_log(
+                "WARN",
+                "dirty draft autosave failed (write): unsaved tuning will not survive a daemon restart",
+            );
+        }
+    }
+
+    /// Delete the autosave file (the draft was saved, discarded, or
+    /// superseded by a profile switch / backup restore). Missing
+    /// file is fine.
+    fn clear_dirty_draft_autosave(&self) {
+        let dir = lock(&self.store).dir().to_path_buf();
+        let _ = std::fs::remove_file(dir.join(Self::DRAFT_AUTOSAVE_FILE_NAME));
+    }
+
+    /// Restore a dirty draft left by a previous run (called from
+    /// [`AppStateCore::new`]). The draft profile is installed as
+    /// the dirty draft and the session tunings are rebuilt from it
+    /// with the same conversion [`AppStateCore::get_tuning`] uses,
+    /// so the restored edits go live in the pipeline plan and the
+    /// UI's Save / Discard prompt sees them.
+    fn restore_autosaved_draft(&self) {
+        let dir = lock(&self.store).dir().to_path_buf();
+        let path = dir.join(Self::DRAFT_AUTOSAVE_FILE_NAME);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        let file: DraftAutosave = match serde_json::from_slice(&bytes) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = std::fs::remove_file(&path);
+                self.push_connection_log(
+                    "WARN",
+                    &format!(
+                        "dirty draft autosave unreadable ({error}) — discarded; the saved profile is intact"
+                    ),
+                );
+                return;
+            }
+        };
+        if file.schema_version != Self::DRAFT_AUTOSAVE_SCHEMA_VERSION {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let Some(active_id) = lock(&self.store).active().map(|active| active.id.clone()) else {
+            return;
+        };
+        if file.profile_id != active_id {
+            // The draft belongs to another profile (a switch raced
+            // the crash, or the profile was deleted): never apply
+            // one profile's edits to another.
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        {
+            let mut tunings = lock(&self.tunings);
+            for (module, stored) in &file.profile.module_tunings {
+                tunings.insert(
+                    module.clone(),
+                    Self::tuning_settings_from_stored(&file.profile, module, stored),
+                );
+            }
+        }
+        *lock(&self.draft) = Some(ProfileDraft {
+            profile: file.profile,
+            dirty: true,
+            dirty_modules: file.dirty_modules,
+        });
+        self.push_connection_log(
+            "INFO",
+            "restored unsaved tuning draft from the previous run — save or discard it",
+        );
     }
 
     /// Switches profile with the dirty guard (L4, preview §8.4): when
@@ -8359,7 +8810,18 @@ where
             Some(transport)
         }
         NewSessionHello::Found(hello) => {
-            state.note_observed_hello(&hello);
+            // P3-4 (v2.0.11): only a fresh echo-1 HELLO counts as
+            // observed. The echo-0 fallback is a stale reply to a
+            // routine flag-0 HELO (old nonce) — `open_session_for_hello`
+            // then rejects it — so recording it here would set the
+            // reachable latch and feed `HelloReceived` for a HELLO
+            // the activator rejects. The fallback still gets its
+            // activation attempt below (the `GET_CAPS` decides);
+            // when it succeeds, the frame loop's HELLO drain
+            // observes the next live HELLO and sets the latch then.
+            if hello.session_echo == 1 {
+                state.note_observed_hello(&hello);
+            }
             // M-12: no `std::sync::Mutex` guard is ever held across
             // an await in this module.
             let (mut session, outcome) = open_session_for_hello(transport, keystore, &hello).await;
@@ -9758,6 +10220,13 @@ mod tests {
         fn set_latched(&self, latched: bool) {
             *self.latched.lock().expect("latched lock poisoned") = latched;
         }
+
+        /// Whether the mock manager latch is set (P1-5, update4-fix:
+        /// the automatic-path test asserts the latch SURVIVES an
+        /// automatic re-attempt).
+        fn is_latched(&self) -> bool {
+            *self.latched.lock().expect("latched lock poisoned")
+        }
     }
 
     impl IJoystickOutput for RecordingBackend {
@@ -10279,6 +10748,118 @@ mod tests {
             .set_output_backend_with_factories("vJoy", &factories)
             .expect("vJoy switch is unaffected by the HIDMaestro cooldown");
         assert_eq!(switched.backend, "vJoy");
+    }
+
+    /// P1-5 (update4-fix): the enable toggle consults the storm
+    /// guard — after 3 failed explicit switches arm the cooldown,
+    /// enabling output with a persisted `HIDMaestro` choice is
+    /// refused with the cooldown message even though the sidecar
+    /// would now succeed, and no backend is activated.
+    #[test]
+    fn enable_toggle_consults_hidmaestro_switch_cooldown() {
+        let (factories, hm) = hidmaestro_mock_factories();
+        hm.set_fail_connect(true);
+        hm.set_fail_connect_message("HIDMaestro sidecar failed to start.");
+        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
+        assert_eq!(state.selected_backend(), BackendKind::HidMaestro);
+        for _ in 1..=3 {
+            let _ = state
+                .set_output_backend_with_factories("HIDMaestro", &factories)
+                .expect_err("failing HIDMaestro switch must error");
+        }
+        // The sidecar is fixed now — but the cooldown still holds.
+        hm.set_fail_connect(false);
+        let backend_before = state.backend_name();
+        let enabled = state.set_output_enabled_with_factories(true, &factories);
+        assert!(
+            !enabled.connected,
+            "no backend is activated during the cooldown"
+        );
+        assert!(
+            enabled.detail.contains("retry in 30 s"),
+            "the toggle is refused by the cooldown: {}",
+            enabled.detail
+        );
+        assert_eq!(
+            state.backend_name(),
+            backend_before,
+            "no backend is activated during the cooldown"
+        );
+    }
+
+    /// P1-5 (update4-fix): failed enable-toggle activations count
+    /// toward the storm guard too — 3 failing enables arm the
+    /// cooldown, and the 4th enable is refused without spawning
+    /// another sidecar. (Before this fix the toggle never counted,
+    /// so the guard could never arm from the toggle alone.)
+    #[test]
+    fn enable_toggle_failures_arm_the_cooldown() {
+        let (state, _dir) = test_state_with_backend_setting("HIDMaestro");
+        let factories = mock_factories(true, true);
+        for attempt in 1..=3 {
+            let enabled = state.set_output_enabled_with_factories(true, &factories);
+            assert!(!enabled.connected, "attempt {attempt} must not connect");
+            assert!(
+                enabled.detail.contains("backend activation failed"),
+                "attempt {attempt} reports the activation failure: {}",
+                enabled.detail
+            );
+            assert!(
+                !enabled.detail.contains("retry in 30 s"),
+                "attempt {attempt} is not yet refused: {}",
+                enabled.detail
+            );
+        }
+        let enabled = state.set_output_enabled_with_factories(true, &factories);
+        assert!(!enabled.connected, "4th enable must not connect");
+        assert!(
+            enabled.detail.contains("retry in 30 s"),
+            "4th enable is refused by the cooldown: {}",
+            enabled.detail
+        );
+    }
+
+    /// P1-5 (update4-fix): an AUTOMATIC re-attempt must NOT clear
+    /// the manager's 2-failure latch — the latched instance fails
+    /// fast with `FallbackNeeded`, the automatic path falls back to
+    /// vJoy, and the latch survives (only an explicit re-select
+    /// re-arms it in place; see
+    /// `reselect_disconnected_hidmaestro_rearms_latched_instance`).
+    #[test]
+    fn automatic_switch_does_not_clear_manager_latch() {
+        let (latched, _latched_sent, _latched_fail) = RecordingBackend::new_named("HIDMaestro");
+        latched.set_latched(true);
+        let live = latched.clone();
+        let dir = test_dir("latched-automatic");
+        let store = ProfileStore::open(&dir).expect("open test store");
+        let state = Arc::new(AppStateCore::new(
+            store,
+            Box::new(live),
+            "test latched backend",
+        ));
+        let factories = BackendFactories {
+            hidmaestro: Some(Box::new(|| {
+                let (backend, _, _) = RecordingBackend::new_named("HIDMaestro");
+                Box::new(backend) as Box<dyn IJoystickOutput>
+            })),
+            vjoy: Some(Box::new(|| {
+                let (backend, _, _) = RecordingBackend::new_named("vJoy");
+                Box::new(backend) as Box<dyn IJoystickOutput>
+            })),
+            none: Box::new(|| Box::new(NullSink) as Box<dyn IJoystickOutput>),
+        };
+        // Automatic path (allow_fallback: true): the latched
+        // instance must NOT be re-armed — it fails fast, the switch
+        // falls back to vJoy, and the latch is still set afterwards.
+        let outcome = state
+            .apply_backend_switch(BackendKind::HidMaestro, &factories, true)
+            .expect("automatic switch falls back to vJoy");
+        assert!(outcome.fell_back, "the latched backend falls back");
+        assert_eq!(outcome.active, BackendKind::VJoy);
+        assert!(
+            latched.is_latched(),
+            "the latch survives an automatic re-attempt"
+        );
     }
 
     /// P2 (v2.0.11): a same-kind re-select re-arms the INSTALLED
@@ -12006,6 +12587,78 @@ mod tests {
         assert!(state.wifi_status().ssid.is_none());
     }
 
+    /// P1-2: a failed activation clears the reachable latch, so the
+    /// next HELLO is a fresh rising edge (the daemon loop feeds
+    /// `HelloReceived` only on the rising edge) instead of being
+    /// swallowed by the sticky latch.
+    #[test]
+    fn activation_failure_clears_reachable_latch_for_next_hello() {
+        use rsh_protocol::hello::HelloReply;
+
+        let (state, _dir) = test_state();
+        let hello = HelloReply {
+            protocol: (2, 2),
+            flags: 0,
+            session_echo: 0,
+            board_mac: [0x20, 0x9B, 0xA9, 0x70, 0x9A, 0x55],
+            firmware: (4, 0, 3),
+            nonce: [0; 16],
+            device_key: [0; 32],
+            wifi_password: [0; 24],
+        };
+        state.note_observed_hello(&hello);
+        assert!(state.board_reachable());
+        state.note_session_error_typed(ConnectionError::Unknown, "activation failed");
+        assert!(
+            !state.board_reachable(),
+            "a failed GET_CAPS must clear the latch"
+        );
+        state.note_observed_hello(&hello);
+        assert!(
+            state.board_reachable(),
+            "the next HELLO re-sets the latch (fresh rising edge)"
+        );
+    }
+
+    /// P3-1: the HELLO-log dedupe key is (MAC, firmware) — a
+    /// firmware change on the same board logs a fresh HELLO line
+    /// instead of being swallowed as a repeat, while an identical
+    /// repeat still logs only once.
+    #[test]
+    fn hello_log_dedupes_on_mac_and_firmware() {
+        use rsh_protocol::hello::HelloReply;
+
+        let (state, _dir) = test_state();
+        let hello_lines = || {
+            state
+                .connection_log_lines()
+                .into_iter()
+                .filter(|line| line.contains("HELLO received"))
+                .count()
+        };
+        let mut hello = HelloReply {
+            protocol: (2, 2),
+            flags: 0,
+            session_echo: 0,
+            board_mac: [0x20, 0x9B, 0xA9, 0x70, 0x9A, 0x55],
+            firmware: (4, 0, 3),
+            nonce: [0; 16],
+            device_key: [0; 32],
+            wifi_password: [0; 24],
+        };
+        state.note_observed_hello(&hello);
+        assert_eq!(hello_lines(), 1);
+        state.note_observed_hello(&hello);
+        assert_eq!(hello_lines(), 1, "an identical repeat logs nothing new");
+        hello.firmware = (4, 0, 4);
+        state.note_observed_hello(&hello);
+        assert_eq!(
+            hello_lines(),
+            2,
+            "a firmware change on the same board is a fresh HELLO"
+        );
+    }
+
     /// R2-28: `connect_session` no-ops while an activation is
     /// already in flight — a manager `RetryTimer` can no longer
     /// abort a mid-activation forwarder by starting a second
@@ -12095,6 +12748,185 @@ mod tests {
         );
         let _ = state.disconnect_transport();
         let _ = state.stop_engine();
+    }
+
+    /// P2-3: `connect_transport_with_outcome` distinguishes a fresh
+    /// (re)connect from a no-op — an activation in flight or a
+    /// forwarder retry wait reports `AlreadyRetrying`, a real
+    /// connect reports `Started`.
+    #[test]
+    fn connect_transport_with_outcome_distinguishes_already_retrying() {
+        let (state, _dir) = test_state();
+        state.activation_in_flight.store(true, Ordering::SeqCst);
+        assert_eq!(
+            state
+                .connect_transport_with_outcome(TransportKind::Udp)
+                .expect("no-op is still Ok"),
+            ConnectOutcome::AlreadyRetrying,
+            "activation in flight: no fresh connect starts"
+        );
+        state.activation_in_flight.store(false, Ordering::SeqCst);
+        state.forwarder_retry_wait.store(1, Ordering::SeqCst);
+        assert_eq!(
+            state
+                .connect_transport_with_outcome(TransportKind::Udp)
+                .expect("no-op is still Ok"),
+            ConnectOutcome::AlreadyRetrying,
+            "forwarder retry wait: no fresh connect starts"
+        );
+        state.forwarder_retry_wait.store(0, Ordering::SeqCst);
+        assert_eq!(
+            state
+                .connect_transport_with_outcome(TransportKind::Udp)
+                .expect("connect"),
+            ConnectOutcome::Started,
+            "nothing in flight: a fresh connect starts"
+        );
+        let _ = state.disconnect_transport();
+        let _ = state.stop_engine();
+    }
+
+    /// P2-1: every activation-failure family keeps its own typed
+    /// reason instead of collapsing into `Unknown`.
+    #[test]
+    fn classify_session_error_keeps_distinct_types() {
+        use rsh_protocol::ControlParseError;
+        use rsh_protocol::HelloError;
+        use rsh_protocol::control::ErrorCode;
+        use rsh_transport::TransportError;
+        use rsh_transport::control_client::ControlError;
+
+        for (error, expected) in [
+            (SessionError::BoardMismatch, ConnectionError::BoardMismatch),
+            (
+                SessionError::InvalidHello("old protocol"),
+                ConnectionError::MalformedHello,
+            ),
+            (
+                SessionError::HelloParse(HelloError::BadCrc),
+                ConnectionError::MalformedHello,
+            ),
+            (
+                SessionError::Keystore(KeystoreError::NotFound),
+                ConnectionError::Keystore,
+            ),
+            (
+                SessionError::Keystore(KeystoreError::PlatformUnavailable),
+                ConnectionError::Keystore,
+            ),
+            (
+                SessionError::Control(ControlError::Timeout),
+                ConnectionError::Timeout,
+            ),
+            (
+                SessionError::Control(ControlError::Transport(TransportError::Closed)),
+                ConnectionError::TransportClosed,
+            ),
+            (
+                SessionError::Control(ControlError::BoardError(ErrorCode::BadPassword)),
+                ConnectionError::ControlFailed,
+            ),
+            (
+                SessionError::Control(ControlError::Parse(ControlParseError::BadLength)),
+                ConnectionError::ControlFailed,
+            ),
+            (
+                SessionError::Control(ControlError::UnexpectedReply),
+                ConnectionError::ControlFailed,
+            ),
+            (
+                SessionError::Control(ControlError::TooBig),
+                ConnectionError::ControlFailed,
+            ),
+            (
+                SessionError::Control(ControlError::InvalidArgument("bad")),
+                ConnectionError::ControlFailed,
+            ),
+            (SessionError::NotActive, ConnectionError::Unknown),
+            (SessionError::AlreadyActive, ConnectionError::Unknown),
+        ] {
+            assert_eq!(
+                AppStateCore::classify_session_error(&error),
+                expected,
+                "{error:?}"
+            );
+        }
+    }
+
+    /// P1-3 (state level): a retried add carrying the same
+    /// idempotency key returns the existing entry — no duplicate —
+    /// and the games list reports the stored exe path.
+    #[test]
+    fn add_game_with_key_dedupes_retries_and_reports_exe_path() {
+        let (state, _dir) = test_state();
+        let first = state
+            .add_manual_game_with_key("Race", r"C:\a.exe", None, Some("dialog-1"))
+            .expect("add");
+        let retry = state
+            .add_manual_game_with_key("Race", r"C:\a.exe", None, Some("dialog-1"))
+            .expect("retry");
+        assert_eq!(first.id, retry.id, "same key returns the same entry");
+        assert_eq!(state.list_games().len(), 1, "no duplicate is created");
+        let listed = state.list_games().into_iter().next().expect("one game");
+        assert_eq!(
+            listed.exe_path, r"C:\a.exe",
+            "games list carries the exe path"
+        );
+        let second = state
+            .add_manual_game_with_key("Race", r"C:\b.exe", None, Some("dialog-2"))
+            .expect("add 2");
+        assert_ne!(second.id, first.id, "a different key is a different add");
+        assert_eq!(state.list_games().len(), 2);
+    }
+
+    /// P2-2: a dirty draft is autosaved on edit, restored on the
+    /// next open (values + dirty flag, stored profile untouched),
+    /// and the autosave is spent by Save.
+    #[test]
+    fn dirty_draft_autosave_survives_restart_until_save() {
+        let (state, dir) = test_state();
+        let _ = activate_first_profile(&state);
+        let mut tuning = state.get_tuning("steering");
+        tuning.module = "brake".to_string();
+        tuning.deadzone = 7.0;
+        state.set_tuning(&tuning).expect("valid tuning");
+        assert!(state.draft_dirty());
+        let autosave = dir.join("draft-autosave.json");
+        assert!(autosave.is_file(), "set_tuning autosaves the dirty draft");
+        // Simulate a daemon restart: a fresh state over the same dir
+        // restores the dirty draft, without the stored profile
+        // having changed.
+        let reopened =
+            Arc::new(AppStateCore::open_with_null_sink(&dir).expect("reopen over the same dir"));
+        assert!(reopened.draft_dirty(), "restored draft is still dirty");
+        assert!(
+            (reopened.get_tuning("brake").deadzone - 7.0).abs() < 1e-9,
+            "restored tuning values go live (deadzone {} is 7.0 within float round-trip)",
+            reopened.get_tuning("brake").deadzone
+        );
+        let stored_deadzone = lock(&reopened.store).active().and_then(|active| {
+            active
+                .profile
+                .module_tunings
+                .get("brake")
+                .map(|entry| entry.deadzone)
+        });
+        assert_eq!(
+            stored_deadzone, None,
+            "autosave is not a save: disk is untouched before Save"
+        );
+        assert!(reopened.save_draft().expect("save"));
+        assert!(!autosave.is_file(), "save deletes the autosave");
+        let reopened_again = AppStateCore::open_with_null_sink(&dir).expect("reopen after save");
+        assert!(
+            !reopened_again.draft_dirty(),
+            "no draft is restored after a save"
+        );
+        assert!(
+            (reopened_again.get_tuning("brake").deadzone - 7.0).abs() < 1e-9,
+            "the saved tuning survives (deadzone {} is 7.0 within float round-trip)",
+            reopened_again.get_tuning("brake").deadzone
+        );
     }
 
     /// R3-D-02 (integration): while a forwarder run waits out its

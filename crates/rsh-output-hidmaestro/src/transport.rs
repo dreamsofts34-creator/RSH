@@ -227,7 +227,10 @@ pub fn listen_loopback() -> std::io::Result<(TcpListener, u16)> {
 /// # Errors
 ///
 /// Returns [`std::io::ErrorKind::TimedOut`] when nobody connects in
-/// time, or the accept I/O error.
+/// time, or the accept I/O error. When a peer connected but its PID
+/// could never be verified (P1-4), the last lookup error is
+/// returned instead of the timeout, so the failure names the table
+/// problem rather than a missing sidecar.
 pub fn accept_loopback(
     listener: &TcpListener,
     timeout: Duration,
@@ -235,7 +238,30 @@ pub fn accept_loopback(
 ) -> std::io::Result<LiveTransport> {
     listener.set_nonblocking(true)?;
     let deadline = Instant::now() + timeout;
+    // P1-4: the last transient peer-PID lookup failure (size query,
+    // empty table, no row yet) — surfaced only if the deadline is
+    // reached with no verified peer, never as an instant hard error
+    // (a possibly healthy sidecar must not be terminated for a
+    // table that is just not populated yet).
+    #[cfg(windows)]
+    let mut last_lookup_error: Option<std::io::Error> = None;
     let stream = loop {
+        // P2-3: check the deadline EVERY iteration, not only on
+        // `WouldBlock` — a flood of foreign peers used to spin the
+        // accept-success branch forever without ever hitting the
+        // `WouldBlock` arm.
+        if Instant::now() >= deadline {
+            #[cfg(windows)]
+            if let Some(error) = last_lookup_error {
+                return Err(std::io::Error::other(format!(
+                    "loopback peer verification kept failing until the deadline; last error: {error}"
+                )));
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "sidecar did not connect back in time",
+            ));
+        }
         match listener.accept() {
             Ok((stream, addr)) => {
                 // L4: loopback only.
@@ -245,24 +271,60 @@ pub fn accept_loopback(
                 }
                 #[cfg(windows)]
                 if let Some(pid) = expected_pid {
-                    verify_loopback_peer_pid(&stream, pid)?;
+                    // A foreign local process that connects first
+                    // must not abort the wait (and orphan the real
+                    // sidecar): drop it and keep listening until the
+                    // deadline. A PID mismatch is `PermissionDenied`
+                    // (drop, keep waiting); a table-query failure is
+                    // transient (P1-4 below), never a hard error.
+                    //
+                    // P1-4: a lookup failure is TRANSIENT — the TCP
+                    // table row for a just-accepted connection may
+                    // not be populated yet, and the peer holding
+                    // this socket may BE the healthy sidecar, so
+                    // dropping it on the first miss would fail a
+                    // healthy switch. Retry the verification of
+                    // THIS peer briefly (2 s, 25 ms polls) instead:
+                    // a row that appears verifies the peer, a PID
+                    // mismatch is still `PermissionDenied` (drop
+                    // and keep waiting), and only a lookup that
+                    // never succeeds is recorded and the wait
+                    // continues — the last error surfaces at the
+                    // deadline above.
+                    let retry_deadline =
+                        std::cmp::min(deadline, Instant::now() + Duration::from_secs(2));
+                    match verify_loopback_peer_pid_retry(&stream, pid, retry_deadline) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                            drop(stream);
+                            continue;
+                        }
+                        Err(e) => {
+                            last_lookup_error = Some(e);
+                            drop(stream);
+                            continue;
+                        }
+                    }
                 }
                 #[cfg(not(windows))]
                 let _ = expected_pid;
                 break stream;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "sidecar did not connect back in time",
-                    ));
-                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => return Err(e),
         }
     };
+    // The listener is nonblocking (poll loop above) and an accepted
+    // socket inherits that mode on Windows — a reader doing a
+    // blocking `read_line` on it gets `WouldBlock` at once, which
+    // `read_line_capped` maps to EOF, so a healthy sidecar that
+    // has not written its hello yet reads as "died before hello"
+    // (CI e2e: EOF 32 ms after spawn, process still running). The
+    // transport is a blocking line reader — restore blocking mode
+    // on the accepted stream before spawning it.
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     let read_half = stream.try_clone()?;
     // The write half shares the socket for shutdown: killing the
@@ -286,6 +348,34 @@ pub fn accept_loopback(
         events: rx,
         stderr_lines: Arc::new(Mutex::new(VecDeque::new())),
     })
+}
+
+/// Windows-only (P1-4): [`verify_loopback_peer_pid`] with a short
+/// retry window for TRANSIENT lookup failures (size query, empty
+/// table, no row yet — the TCP table lags a just-accepted
+/// connection by milliseconds). Retries every 25 ms until
+/// `retry_deadline`; a PID mismatch (`PermissionDenied`) returns
+/// at once — it is definitive, not transient — and so does a
+/// success. The last transient error is returned when the window
+/// runs out, so the caller can record it and keep waiting.
+#[cfg(windows)]
+fn verify_loopback_peer_pid_retry(
+    stream: &TcpStream,
+    expected_pid: u32,
+    retry_deadline: Instant,
+) -> std::io::Result<()> {
+    loop {
+        match verify_loopback_peer_pid(stream, expected_pid) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Err(e),
+            Err(e) => {
+                if Instant::now() >= retry_deadline {
+                    return Err(e);
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
 }
 
 /// Windows-only (C-TOK-1): verify that the accepted loopback socket's
@@ -379,10 +469,13 @@ fn verify_loopback_peer_pid(stream: &TcpStream, expected_pid: u32) -> std::io::R
             if row.dwOwningPid == expected_pid {
                 return Ok(());
             }
-            return Err(std::io::Error::other(format!(
-                "loopback peer is PID {}, not the spawned sidecar PID {expected_pid}",
-                row.dwOwningPid
-            )));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "loopback peer is PID {}, not the spawned sidecar PID {expected_pid}",
+                    row.dwOwningPid
+                ),
+            ));
         }
     }
     Err(std::io::Error::other(
@@ -731,6 +824,45 @@ mod tests {
         let transport = accept_loopback(&listener, Duration::from_secs(5), None).unwrap();
         let _peer = handle.join().unwrap();
         drop(transport);
+    }
+
+    /// P2-6: the PID check accepts the real sidecar — the MIRROR
+    /// row, not the daemon's own row (v2.0.10: matching the daemon's
+    /// row refused every sidecar). The test process plays the
+    /// sidecar: it connects, and accept with `Some(own pid)` must
+    /// succeed. Windows-only (off Windows the PID is ignored);
+    /// runs on CI test-windows.
+    #[cfg(windows)]
+    #[test]
+    fn loopback_accept_verifies_same_process_pid() {
+        let (listener, port) = listen_loopback().unwrap();
+        let handle =
+            std::thread::spawn(move || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let transport =
+            accept_loopback(&listener, Duration::from_secs(10), Some(std::process::id()))
+                .expect("same-process peer must verify as the spawned sidecar");
+        let _peer = handle.join().unwrap();
+        drop(transport);
+    }
+
+    /// P2-6 (negative): a peer whose PID does not match is dropped
+    /// and the wait continues — the accept never returns the
+    /// foreign peer, and the deadline still reports `TimedOut`
+    /// (no lookup error is recorded for a definitive mismatch).
+    /// Windows-only; runs on CI test-windows.
+    #[cfg(windows)]
+    #[test]
+    fn loopback_accept_refuses_wrong_pid_then_times_out() {
+        let (listener, port) = listen_loopback().unwrap();
+        let handle =
+            std::thread::spawn(move || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap());
+        // `u32::MAX` is never a live PID, so the mirror row (owned
+        // by this test process) mismatches at once.
+        match accept_loopback(&listener, Duration::from_millis(300), Some(u32::MAX)) {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            Ok(_) => panic!("a wrong-PID peer must never be accepted"),
+        }
+        let _peer = handle.join().unwrap();
     }
 
     /// H4: the writer thread + bounded queue accept lines without

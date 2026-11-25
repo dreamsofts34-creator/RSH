@@ -105,7 +105,8 @@ pub struct IpcRequest {
     pub id: u64,
     /// Method name (`ping`, `version`, `connection`, `connect`,
     /// `disconnect`, `wifi_status`, `set_wifi_password`,
-    /// `clear_wifi_password`, `snapshot`,
+    /// `clear_wifi_password`, `scan_rsh_networks`, `rejoin_wifi`,
+    /// `rejoin_wifi_open`, `snapshot`,
     /// `poll`, `output_enabled`, `set_output_enabled`, `subscribe`,
     /// `get_tuning`, `set_tuning`, `draft_status`, `save_draft`,
     /// `discard_draft`, `autostart`, `set_autostart`,
@@ -171,7 +172,7 @@ pub mod latency;
 /// The methods the IPC server answers, with their params.
 pub mod server;
 
-pub use client::{IpcClient, WireFrameKind, classify_wire_line};
+pub use client::{IpcClient, WireFrameKind, classify_wire_line, timeout_for_method};
 pub use latency::{
     action_latency_p50_p99_ms, ipc_latency_global_p50_p99_ms, ipc_latency_snapshot,
     record_action_completed, record_ipc_latency, record_poll_observed,
@@ -433,8 +434,17 @@ pub fn dispatch(
         // v2.0.2 Round 3: Wi-Fi password set/clear (v2.0.6),
         // firmware check/update, board address, module toggles,
         // auto-pause, tray, backup, profile rename/link, knob actions.
+        // v2.0.11: Wi-Fi scan + rejoin (open / with password) —
+        // the UI called these three over IPC since the no-pairing
+        // redesign, but no arm dispatched them, so every call
+        // failed with `UnknownMethod` (the wizard's "Join wheel
+        // Wi-Fi" flow calls `scan_rsh_networks` +
+        // `rejoin_wifi_open`).
         "set_wifi_password"
         | "clear_wifi_password"
+        | "scan_rsh_networks"
+        | "rejoin_wifi"
+        | "rejoin_wifi_open"
         | "firmware_check"
         | "update_firmware"
         | "firmware_update_status"
@@ -603,6 +613,11 @@ fn detailed_api_error(error: &rsh_api::UserError) -> IpcError {
 /// Wire shapes: `set_wifi_password` takes `{"password",
 /// "confirm"}` and returns the [`WifiStatus`](rsh_api::WifiStatus);
 /// `clear_wifi_password` takes no params and returns the
+/// [`WifiStatus`](rsh_api::WifiStatus); `scan_rsh_networks` takes
+/// no params and returns the bare SSID array (the UI parses the
+/// result itself as `Vec<String>`, so it is NOT wrapped in an
+/// object); `rejoin_wifi_open` takes `{"ssid"}` and `rejoin_wifi`
+/// takes `{"ssid", "password"}`, both returning the
 /// [`WifiStatus`](rsh_api::WifiStatus); `firmware_check` → the
 /// [`FirmwareCheck`](rsh_api::FirmwareCheck);
 /// `update_firmware` starts the flash and returns the running
@@ -640,6 +655,35 @@ fn dispatch_round3(
             .clear_wifi_password()
             .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
             .map_err(|error| detailed_api_error(&error)),
+        // v2.0.11: Wi-Fi scan + rejoin — dispatched here with the
+        // other Wi-Fi arms (same `detailed_api_error` mapping, so
+        // the failure reason reaches the UI instead of a bare
+        // "Unknown"). `scan_rsh_networks` returns the bare array:
+        // the UI parses the result itself as `Vec<String>`.
+        "scan_rsh_networks" => Ok(serde_json::to_value(api.scan_rsh_networks())
+            .map_err(|e| IpcError::Protocol(e.to_string()))?),
+        "rejoin_wifi_open" => {
+            let ssid = params
+                .get("ssid")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.rejoin_wifi_open(ssid)
+                .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
+                .map_err(|error| detailed_api_error(&error))
+        }
+        "rejoin_wifi" => {
+            let ssid = params
+                .get("ssid")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let password = params
+                .get("password")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            api.rejoin_wifi(ssid, password)
+                .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null))
+                .map_err(|error| detailed_api_error(&error))
+        }
         "firmware_check" => api
             .firmware_check()
             .map(|check| serde_json::to_value(check).unwrap_or(serde_json::Value::Null))
@@ -860,9 +904,23 @@ fn dispatch_game_write(
         .get("profile_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    // P1-3: the UI sends one idempotency key per add-dialog
+    // session (`idempotency_key`); a retry after a client-side
+    // timeout replays the same key and the daemon returns the
+    // already-created entry instead of a duplicate. Absent (old
+    // UI) means no dedupe — the old behaviour.
+    let idempotency_key = params
+        .get("idempotency_key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     match request.method.as_str() {
         "add_game" => api
-            .add_game(text("name"), text("exe_path"), profile_id)
+            .add_game_with_key(
+                text("name"),
+                text("exe_path"),
+                profile_id,
+                idempotency_key.as_deref(),
+            )
             .map(|game| serde_json::to_value(game).unwrap_or(serde_json::Value::Null))
             .map_err(|e| detailed_api_error(&e)),
         "update_game" => api

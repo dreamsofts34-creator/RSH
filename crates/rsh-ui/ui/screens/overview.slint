@@ -189,14 +189,18 @@ export component OverviewPage inherits PageScaffold {
             // three tiles in one row left ~26 px for the game name
             // (the Edit/Remove column broke the preview's 3-tile
             // layout); rows beyond two scroll with the page (F-4).
-            // (`for … : if …` is not valid Slint, so each row
-            // repeats all tiles and hides the other row's via
-            // `visible` — NOTE: in Slint 1.18.1 `visible: false`
-            // still KEEPS layout space (proved by the extras gate:
-            // row-1 is 471 px whether the cards are ON or OFF), so
-            // hidden tiles do NOT free their slot; the rows work
-            // because each row's tiles are laid out identically
-            // and only the visible row's content is painted.)
+            // P1-1: a REAL 2-column grid — one `for` over all games,
+            // each tile placed by its index (row idx/2, col idx%2),
+            // so N games make ceil(N/2) rows of exactly 2 columns.
+            // The old shape (two Rows, each repeating ALL games
+            // with `visible: idx<2 / idx>=2`) asked the GridLayout
+            // for N columns of min 300 px against ~664 px, so the
+            // grid broke at >=3 games — and `visible: false` still
+            // keeps layout space in Slint 1.18.1, so the hidden
+            // tiles never freed their slot. Runtime row/col in a
+            // repeater is supported (both axes runtime, no
+            // auto-numbering mix); `Math.floor` covers int-vs-float
+            // division either way.
             if games.length > 0 : GridLayout {
                 // R3-UI-06: the gap is responsive now — it reads
                 // `scroll-width` (the PageScaffold ScrollView's
@@ -216,12 +220,7 @@ export component OverviewPage inherits PageScaffold {
                 // tiles themselves still grow (min-width 300px +
                 // stretch 1).
                 spacing: 10px + Math.max(0px, (root.scroll-width - 736px) * 0.025);
-                Row {
-                    for g[idx] in games : GameTile { visible: idx < 2; horizontal-stretch: 1; min-width: 300px; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-disabled: busy-kind == 13; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
-                }
-                Row {
-                    for g[idx] in games : GameTile { visible: idx >= 2; horizontal-stretch: 1; min-width: 300px; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-disabled: busy-kind == 13; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
-                }
+                for g[idx] in games : GameTile { row: Math.floor(idx / 2); col: Math.mod(idx, 2); horizontal-stretch: 1; min-width: 300px; code: g.code; name: g.name; sub: g.sub; sub-warn: g.sub_warn; action: g.action; action-primary: g.action_primary; action-disabled: busy-kind == 13; action-clicked => { launch-game(g.id); } edit-clicked => { edit-game(g.id); } remove-clicked => { remove-game(g.id); } }
             }
         }
     }

@@ -126,6 +126,39 @@ jobs:
         if: steps.check.outputs.run == 'true'
         run: cargo fmt --all -- --check
 
+  # TRIPWIRE guard (release.yml "Write NSIS script" run: block):
+  # GitHub rejects a run: value over 21,000 chars — a real rejection
+  # was observed at 22,024 chars (0 s failed run, no jobs). This job
+  # parses release.yml and fails if that block's parsed value exceeds
+  # 20,800 chars, so the block can never grow back to the limit. The
+  # PARSED value (not the raw YAML text) is what counts, so the check
+  # uses PyYAML, not a line count.
+  nsis-block-guard:
+    name: nsis-block-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: NSIS run-block must stay under 20,800 chars (parsed)
+        shell: bash
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+          try:
+              import yaml
+          except ImportError:
+              print("::error::PyYAML is not available on the runner — cannot parse release.yml.")
+              sys.exit(1)
+          doc = yaml.safe_load(open(".github/workflows/release.yml"))
+          steps = doc["jobs"]["release"]["steps"]
+          block = next(s["run"] for s in steps if s.get("name") == "Write NSIS script")
+          n = len(block)
+          print(f"Write NSIS script run: block is {n} chars (guard 20,800; GitHub rejects above 21,000).")
+          if n > 20800:
+              print(f"::error::NSIS run: block is {n} chars, over the 20,800-char guard (GitHub rejects above 21,000). Move new content to OTHER steps and trim comments inside the block — do not grow it.")
+              sys.exit(1)
+          PYEOF
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest
@@ -430,6 +463,15 @@ jobs:
       # (rsh-daemon, rsh-ui, rsh-api, rsh-ipc) on Windows, sidecar
       # staged above; on Linux the same crates are covered by
       # test-linux (--workspace --exclude rsh-app).
+      # It also runs the true daemon→sidecar E2E test
+      # (`crates/rsh-output-hidmaestro/tests/elevated_e2e_tests.rs`):
+      # a real `SidecarManager` with `elevated=true` spawns the
+      # STAGED sidecar above via `runas` + loopback TCP connect-back
+      # and asserts hello + token echo + DLL verdict OK + admin.
+      # The staging step MUST stay before this step — the test
+      # resolves the staged exe from the repo tree and FAILS (never
+      # skips) when it is missing. No driver install is needed:
+      # hello is sent before `HMContext` creation.
       - name: cargo test --workspace
         if: steps.check.outputs.run == 'true'
         run: cargo test --workspace
@@ -1040,6 +1082,7 @@ jobs:
     timeout-minutes: 10
     needs:
       - fmt
+      - nsis-block-guard
       - clippy
       - clippy-windows
       - test-linux

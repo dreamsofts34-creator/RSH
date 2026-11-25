@@ -35,6 +35,49 @@ use crate::{IPC_PROTOCOL_VERSION, IpcError, IpcRequest, IpcResponse};
 /// socket is still open.
 const CALL_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Per-method round-trip bound (P2-4, v2.0.11): the 500 ms default
+/// is right for cheap reads, but several methods legitimately take
+/// seconds on the daemon side — a plain `call()` to one of them
+/// used to time out misleadingly (read as link degradation) while
+/// the daemon was still working. Callers of these methods get the
+/// right bound by default; [`IpcClient::call_with_timeout`] still
+/// overrides when the caller knows better. Bounds are grounded in
+/// the UI's own explicit bounds where they exist (`set_output_backend`
+/// 75 s, game writes 10 s) and in the daemon-side work otherwise
+/// (a board control round-trip, a file copy, a driver download).
+#[must_use]
+pub fn timeout_for_method(method: &str) -> Duration {
+    match method {
+        // UAC prompt + 60 s sidecar spawn (B-2, v2.0.2): the UI's
+        // own long-call bound, kept here so a plain call agrees.
+        "set_output_backend" => Duration::from_secs(75),
+        // Game writes: atomic file write + process refresh, which
+        // can pass 500 ms on Windows under an AV scan (the UI's
+        // `GAME_WRITE_TIMEOUT`). Board control round-trip (LED test
+        // on `set_tuning`, config transaction, firmware
+        // stat/parse) — same 10 s bound, one arm.
+        "add_game"
+        | "update_game"
+        | "remove_game"
+        | "set_tuning"
+        | "set_shifter_sensitivity"
+        | "firmware_check" => Duration::from_secs(10),
+        // Control session + OS WLAN profile write; Wi-Fi scan (OS
+        // scan takes seconds); file copies / restores — same 30 s
+        // bound, one arm.
+        "set_wifi_password"
+        | "clear_wifi_password"
+        | "rejoin_wifi"
+        | "rejoin_wifi_open"
+        | "scan_rsh_networks"
+        | "backup_now"
+        | "restore_backup" => Duration::from_secs(30),
+        // Driver download + install.
+        "install_vjoy" => Duration::from_secs(120),
+        _ => CALL_TIMEOUT,
+    }
+}
+
 /// Methods whose result arrives via events/polling, not the RPC
 /// reply (B-1, v2.0.2). No-pairing redesign: the only
 /// fire-and-forget method was `begin_pairing` (it only *started*
@@ -242,12 +285,15 @@ impl IpcClient {
 
     /// Call one method and await its response.
     ///
-    /// The whole round-trip is bounded by [`CALL_TIMEOUT`] (B3): a
-    /// daemon that never answers surfaces as [`IpcError::Io`]
-    /// ("timed out") instead of hanging the caller forever. The
-    /// call is strictly single-flight — the writer lock is held
-    /// across the write + response wait, so no second call can
-    /// interleave and steal the response.
+    /// The whole round-trip is bounded by
+    /// [`timeout_for_method`] (P2-4): 500 ms by default (B3), longer
+    /// for the methods whose daemon side legitimately takes seconds
+    /// (backend switch, game writes, tuning with LED test, Wi-Fi
+    /// password set, vJoy install, …). A daemon that never answers
+    /// surfaces as [`IpcError::Io`] ("timed out") instead of hanging
+    /// the caller forever. The call is strictly single-flight — the
+    /// writer lock is held across the write + response wait, so no
+    /// second call can interleave and steal the response.
     ///
     /// # Errors
     ///
@@ -262,7 +308,8 @@ impl IpcClient {
         if FIRE_AND_FORGET_METHODS.contains(&method) {
             return self.call_send_only(method, params).await;
         }
-        self.call_with_timeout(method, params, CALL_TIMEOUT).await
+        self.call_with_timeout(method, params, timeout_for_method(method))
+            .await
     }
 
     /// Send one request and return as soon as it is written, without
@@ -422,8 +469,12 @@ impl IpcClient {
 
 #[cfg(test)]
 mod tests {
-    // Unix-only: the module's only test binds a real Unix socket.
-    #[cfg(unix)]
+    // The P2-4 timeout-table test below is platform-independent
+    // (pure function, no socket), so it runs on Windows too — the
+    // `super::*` import must NOT be unix-gated, or the Windows
+    // target check cannot compile that test (`timeout_for_method`
+    // / `Duration` not in scope). The other tests bind a real Unix
+    // socket and stay `#[cfg(unix)]`.
     use super::*;
     #[cfg(unix)]
     use std::time::Instant;
@@ -591,5 +642,89 @@ mod tests {
             );
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-4: the per-method timeout table gives the known slow
+    /// methods room by default (the old code gave every plain
+    /// `call()` 500 ms, which mis-reported slow-but-working calls
+    /// as timeouts).
+    #[test]
+    fn timeout_for_method_gives_slow_methods_room() {
+        assert_eq!(timeout_for_method("ping"), Duration::from_millis(500));
+        assert_eq!(
+            timeout_for_method("set_output_backend"),
+            Duration::from_secs(75)
+        );
+        assert_eq!(timeout_for_method("add_game"), Duration::from_secs(10));
+        assert_eq!(timeout_for_method("set_tuning"), Duration::from_secs(10));
+        assert_eq!(
+            timeout_for_method("firmware_check"),
+            Duration::from_secs(10)
+        );
+        assert_eq!(timeout_for_method("backup_now"), Duration::from_secs(30));
+        assert_eq!(timeout_for_method("install_vjoy"), Duration::from_secs(120));
+        assert_eq!(
+            timeout_for_method("set_wifi_password"),
+            Duration::from_secs(30)
+        );
+        assert_eq!(timeout_for_method("rejoin_wifi"), Duration::from_secs(30));
+        assert_eq!(
+            timeout_for_method("rejoin_wifi_open"),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            timeout_for_method("scan_rsh_networks"),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            timeout_for_method("unknown_method"),
+            Duration::from_millis(500)
+        );
+    }
+
+    /// P2-4: a `set_tuning` reply arriving after 800 ms succeeds
+    /// through the plain `call()` path — under the old 500 ms
+    /// default it would have timed out while the daemon kept
+    /// running.
+    #[test]
+    #[cfg(unix)]
+    fn slow_set_tuning_succeeds_through_plain_call() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let (client_side, server_side) = tokio::io::duplex(8192);
+            let client = IpcClient::from_stream(client_side);
+            tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(server_side);
+                let mut lines = BufReader::new(reader).lines();
+                if let Ok(Some(line)) = lines.next_line().await {
+                    let id = serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|value| value.get("id").and_then(serde_json::Value::as_u64))
+                        .unwrap_or(0);
+                    // Slower than the 500 ms default, inside the
+                    // 10 s `set_tuning` bound.
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    let response = serde_json::json!({
+                        "v": IPC_PROTOCOL_VERSION,
+                        "id": id,
+                        "ok": true,
+                        "result": { "ok": true },
+                        "error": null,
+                    });
+                    let text = serde_json::to_string(&response).expect("encode");
+                    let _ = writer.write_all(text.as_bytes()).await;
+                    let _ = writer.write_all(b"\n").await;
+                    let _ = writer.flush().await;
+                }
+            });
+            let result = client
+                .call("set_tuning", serde_json::json!({"module": "steering"}))
+                .await
+                .expect("plain call must wait out the 10 s method bound");
+            assert_eq!(result.get("ok"), Some(&serde_json::Value::Bool(true)));
+        });
     }
 }

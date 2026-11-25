@@ -43,6 +43,10 @@ internal static class Program
     static string? dllSha256Cache;
     static bool dllSha256OkCache;
     static readonly Stopwatch sw = Stopwatch.StartNew();
+    /// P2-4 (update4-fix): bound for the TCP connect-back (see
+    /// `Run` — below the daemon's 30 s accept bound, far above a
+    /// normal loopback connect).
+    const int ConnectBackTimeoutSeconds = 15;
     // P0 (v2.0.11): the sidecar's file log. Log() used to write to
     // stderr only, which the daemon never captures on the TCP path
     // (and which is discarded when the sidecar runs elevated) — so a
@@ -54,15 +58,24 @@ internal static class Program
     // never break the protocol loop.
     static string? logFilePath;
     static bool logFilePathResolved;
+    // P3-3 (update4-fix): the day the cached log path was resolved
+    // for. The path is date-based, so a sidecar that runs past
+    // midnight must re-resolve (a new day's file) instead of
+    // writing into yesterday's file forever.
+    static DateTime logFileDate;
 
     static string? LogFilePath()
     {
-        if (logFilePathResolved)
+        // P3-3: re-resolve when the day rolls over. A failed
+        // resolution is NOT latched — the next Log() retries
+        // (the old code resolved once and never retried, so a
+        // transient %PROGRAMDATA% failure silenced the file log
+        // for the whole session).
+        if (logFilePathResolved && logFileDate == DateTime.Now.Date)
         {
             return logFilePath;
         }
 
-        logFilePathResolved = true;
         try
         {
             var dir = Path.Combine(
@@ -71,10 +84,15 @@ internal static class Program
                 "logs");
             Directory.CreateDirectory(dir);
             logFilePath = Path.Combine(dir, $"rsh-sidecar-{DateTime.Now:yyyyMMdd}.log");
+            logFilePathResolved = true;
+            logFileDate = DateTime.Now.Date;
         }
         catch
         {
+            // Unresolved: the next Log() retries. stderr (written
+            // first, in Log()) still carries the line.
             logFilePath = null;
+            logFilePathResolved = false;
         }
 
         return logFilePath;
@@ -106,8 +124,12 @@ internal static class Program
         var token = Environment.GetEnvironmentVariable("RSH_HM_SIDECAR_TOKEN");
         if (connectBack is not null && string.IsNullOrEmpty(token))
         {
-            Console.Error.WriteLine(
-                "[sidecar] bad-args: --connect-back needs RSH_HM_SIDECAR_TOKEN in the environment (the token is never passed on the command line)");
+            // P2-7 (update4-fix): this used to bypass the file log
+            // (`Console.Error` + return 2) — a token-missing
+            // connect-back failure left no trace in the file log,
+            // the one place the daemon-side diagnostics look.
+            // Log() writes stderr AND the file log.
+            Log("bad-args: --connect-back needs RSH_HM_SIDECAR_TOKEN in the environment (the token is never passed on the command line)");
             return 2;
         }
 
@@ -120,7 +142,25 @@ internal static class Program
             var parts = connectBack.Split(':');
             tcp = new TcpClient();
             Log($"connect-back {connectBack} (token present={!string.IsNullOrEmpty(token)})");
-            tcp.Connect(parts[0], int.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture));
+            // P2-4 (update4-fix): the connect is BOUNDED (15 s).
+            // `TcpClient.Connect` blocks with no timeout — a
+            // loopback listener that never accepts (daemon gone
+            // between spawn and connect) used to hang the sidecar
+            // forever, invisible to every timeout on the daemon
+            // side. 15 s is far above a loopback connect (< 1 ms
+            // normally, seconds on a loaded machine) and below the
+            // daemon's 30 s accept bound, so a sidecar-side
+            // timeout surfaces here (exit 2 + log line) instead of
+            // the daemon timing out the accept with no trace.
+            var connectTask = tcp.ConnectAsync(parts[0], int.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture));
+            if (!connectTask.Wait(TimeSpan.FromSeconds(ConnectBackTimeoutSeconds)))
+            {
+                Log($"tcp connect-back timed out after {ConnectBackTimeoutSeconds} s");
+                tcp.Dispose();
+                return 2;
+            }
+
+            connectTask.GetAwaiter().GetResult();
             Log("tcp connected");
             var stream = tcp.GetStream();
             reader = new StreamReader(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
@@ -177,41 +217,64 @@ internal static class Program
             DllSha256 = dllSha256,
             DllSha256Ok = dllSha256Ok,
         };
+        // P3-2 (update4-fix, verified harmless, LEFT as-is): the
+        // hello WriteReply below sits OUTSIDE the try/finally that
+        // disposes on every exit path — moving it inside would turn
+        // a hello-write failure (daemon already gone) from a fatal
+        // exit 2 into a clean exit 0, and nothing needs disposing
+        // yet at this point (`ctx`/`ctl` are still null; the
+        // process is exiting, so the OS reclaims the socket).
+        // Deliberately not moved.
         WriteReply(writer, hello);
         Log("hello sent");
 
         EnsureCtxBestEffort();
         Log($"context ready={ctx is not null} driver_installed={ctx?.IsDriverInstalled}");
 
-        string? line;
-        while ((line = reader.ReadLine()) is not null)
+        try
         {
-            SidecarReply reply;
-            try
+            string? line;
+            while ((line = reader.ReadLine()) is not null)
             {
-                reply = Handle(line);
-            }
-            catch (Exception ex)
-            {
-                Log($"command failed: {ex.GetType().Name}: {ex.Message}");
-                reply = new SidecarReply
+                SidecarReply reply;
+                try
                 {
-                    Ok = false,
-                    Code = "internal-error",
-                    Error = $"{ex.GetType().Name}: {ex.Message}",
-                };
+                    reply = Handle(line);
+                }
+                catch (Exception ex)
+                {
+                    Log($"command failed: {ex.GetType().Name}: {ex.Message}");
+                    reply = new SidecarReply
+                    {
+                        Ok = false,
+                        Code = "internal-error",
+                        Error = $"{ex.GetType().Name}: {ex.Message}",
+                    };
+                }
+
+                WriteReply(writer, reply);
+                if (exitRequested)
+                {
+                    break;
+                }
             }
 
-            WriteReply(writer, reply);
-            if (exitRequested)
-            {
-                break;
-            }
+            Log("stdin EOF / exit — disposing");
+        }
+        catch (IOException ex)
+        {
+            // A socket reset / broken pipe while reading or writing:
+            // the daemon went away. Fall through to the cleanup below
+            // instead of skipping it (the virtual controller must be
+            // disposed on EVERY exit path, not only a clean EOF).
+            Log($"transport error: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            DisposeAll();
+            tcp?.Dispose();
         }
 
-        Log("stdin EOF / exit — disposing");
-        DisposeAll();
-        tcp?.Dispose();
         return 0;
     }
 
@@ -801,7 +864,12 @@ internal static class Program
         // is discarded on the TCP path and when elevated, so the file
         // is the only trace a pre-hello death leaves. Best-effort:
         // logging must never break the protocol loop.
-        var line = $"[sidecar] [{DateTime.Now:HH:mm:ss.fff}] {message}";
+        // P3-3 (update4-fix): the PID rides in every log line.
+        // Concurrent sidecars share one daily file and interleave
+        // lines — without the PID a line cannot be attributed to
+        // its process, and a pre-hello death is indistinguishable
+        // from another sidecar's milestones.
+        var line = $"[sidecar] [pid {Environment.ProcessId}] [{DateTime.Now:HH:mm:ss.fff}] {message}";
         try
         {
             Console.Error.WriteLine(line);
