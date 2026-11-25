@@ -1690,7 +1690,7 @@ pub fn gate_extras_card_size_source() -> (bool, String) {
         report.check(
             &format!("extras-{card}-off-centred"),
             off_box.contains("alignment: center;"),
-            &format!("OFF note is centred in its fixed-height box"),
+            "OFF note is centred in its fixed-height box",
         );
     }
     // R-10: the 4 cards share the row equally — 322 px floor each
@@ -1814,7 +1814,7 @@ pub fn gate_card_gap_source() -> (bool, String) {
 /// failed while the daemon continues. This gate therefore asserts
 /// the P1-1 shape instead: the spawn returns on decline, the
 /// hello clock starts after spawn, and each post-spawn stage gets
-/// >= 30 s. On decline the switch must surface ONE clear
+/// at least 30 s. On decline the switch must surface ONE clear
 /// message and never retry-loop: the UI handler starts exactly one
 /// backend job (which calls `set_output_backend` once, guarded by
 /// the Backend in-flight check) and the done-arm notifies once
