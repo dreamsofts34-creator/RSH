@@ -1634,16 +1634,21 @@ pub fn gate_notifications_source() -> (bool, String) {
 
 /// Gate: Extras card size, source audit (cards layout fix, Bug 2).
 ///
-/// Source audit: the 4 Extras module cards must NOT swap their body
-/// with `if` branches — `if` removes the element from the tree, so
-/// the card collapsed to ~71 px when off and the whole grid reflowed
-/// on every toggle (measured: grid 1030 px all-ON → 190 px all-OFF).
-/// Both the OFF note and the ON body stay in the tree and only
-/// `visible` toggles (`visible: false` keeps the layout space in box
-/// layouts, verified headless). The pixel proof (row heights identical
-/// ON/OFF on the real `ExtrasScreen`) runs in `tools/gate-checks/
+/// Source audit for the P2-2 design (update4 UI fixes): the 4
+/// Extras module cards keep their exact ON size while OFF with
+/// `if` branches — the OFF note leaves the tree entirely (no
+/// invisible body taking layout space or input) and sits CENTRED
+/// in a fixed min-height box equal to the row's ON body height
+/// (row-1: 638 px, row-2: 262 px — gate-measured), so the card
+/// keeps its exact ON size with no blank region and the grid
+/// never reflows on toggle. The old `visible` approach this audit
+/// used to demand kept the full ON body in the tree, so an OFF
+/// card was a one-line note over ~600 px of blank — same size,
+/// worse UI. The pixel proof (row heights identical ON/OFF on the
+/// real `ExtrasScreen`: 692/694 px row-1, 312/314 px row-2 across
+/// all-ON / one-OFF / all-OFF) runs in `tools/gate-checks/
 /// rsh-gate-ui` (`ui-extras-card-size`); this audit is the fast
-/// regression net.
+/// regression net for the mechanism that produces those heights.
 #[must_use]
 pub fn gate_extras_card_size_source() -> (bool, String) {
     let mut report = Report::new();
@@ -1651,37 +1656,53 @@ pub fn gate_extras_card_size_source() -> (bool, String) {
         report.check("extras-source-present", false, "extras.slint missing");
         return report.finish();
     };
-    for card in ["handbrake", "shifter", "horn", "leds"] {
+    // P2-2: row-1 (handbrake, shifter) OFF boxes are 638 px,
+    // row-2 (horn, leds) 262 px — the gate-measured ON body
+    // heights (see the P2-2 comment in extras.slint).
+    for (card, off_height) in [
+        ("handbrake", 638),
+        ("shifter", 638),
+        ("horn", 262),
+        ("leds", 262),
+    ] {
         report.check(
-            &format!("extras-{card}-no-if-off"),
-            !extras.contains(&format!("if !{card}-on")),
-            &format!("no `if !{card}-on` branch (OFF note is `visible`, not `if`)"),
+            &format!("extras-{card}-if-off"),
+            extras.contains(&format!("if !{card}-on")),
+            &format!("`if !{card}-on` branch present (OFF note leaves the tree, takes no input)"),
         );
         report.check(
-            &format!("extras-{card}-no-if-on"),
-            !extras.contains(&format!("if {card}-on :")),
-            &format!("no `if {card}-on :` branch (ON body is `visible`, not `if`)"),
+            &format!("extras-{card}-if-on"),
+            extras.contains(&format!("if {card}-on :")),
+            &format!("`if {card}-on :` branch present (ON body)"),
+        );
+        // The OFF branch right after `if !{card}-on` must be the
+        // centred fixed-height box, not a bare note.
+        let off_box = extras
+            .find(&format!("if !{card}-on"))
+            .map_or("", |pos| &extras[pos..extras.len().min(pos + 400)]);
+        report.check(
+            &format!("extras-{card}-off-min-height"),
+            off_box.contains(&format!("min-height: {off_height}px;")),
+            &format!(
+                "OFF note sits in a fixed min-height: {off_height}px box (row ON-body height)"
+            ),
         );
         report.check(
-            &format!("extras-{card}-visible-off"),
-            extras.contains(&format!("visible: !{card}-on;")),
-            &format!("OFF note uses `visible: !{card}-on`"),
-        );
-        report.check(
-            &format!("extras-{card}-visible-on"),
-            extras.contains(&format!("visible: {card}-on;")),
-            &format!("ON body uses `visible: {card}-on`"),
+            &format!("extras-{card}-off-centred"),
+            off_box.contains("alignment: center;"),
+            &format!("OFF note is centred in its fixed-height box"),
         );
     }
-    // R-10: the 4 cards share the row equally — 342 px each at
-    // design width ((696 - 12) / 2) — via `min-width`, so they still
-    // grow on wider windows. Without it the row was lopsided
-    // (measured: Horn ~213 px, LEDs ~471 px — content-preferred
-    // widths, no floor).
+    // R-10: the 4 cards share the row equally — 322 px floor each
+    // (P1-6: (656 - 12) / 2 at the 880 px minimum window; they
+    // still stretch to 342 px at the 920 px design width) — via
+    // `min-width`, so they still grow on wider windows. Without
+    // it the row was lopsided (measured: Horn ~213 px, LEDs
+    // ~471 px — content-preferred widths, no floor).
     report.check(
         "extras-cards-min-width",
-        count(&extras, "min-width: 342px;") == 4,
-        "all 4 Extras cards have min-width: 342px (equal columns)",
+        count(&extras, "min-width: 322px;") == 4,
+        "all 4 Extras cards have min-width: 322px (equal columns)",
     );
     report.finish()
 }
@@ -1763,11 +1784,14 @@ pub fn gate_card_gap_source() -> (bool, String) {
             && count(&buttons, "width: 90px;") - count(&buttons, "min-width: 90px;") == 0,
         "Buttons tiles use min-width: 90px (no explicit width: 90px)",
     );
+    // P1-6: the Settings columns use a 322 px floor ((656 - 12) / 2
+    // at the 880 px minimum window) and still stretch to 342 px at
+    // the 920 px design width — 322 is the floor, not the size.
     report.check(
         "gap-settings-min-width",
-        count(&settings, "min-width: 342px;") == 2
-            && count(&settings, "width: 342px;") - count(&settings, "min-width: 342px;") == 0,
-        "Settings columns use min-width: 342px + stretch (no explicit width: 342px)",
+        count(&settings, "min-width: 322px;") == 2
+            && count(&settings, "width: 322px;") - count(&settings, "min-width: 322px;") == 0,
+        "Settings columns use min-width: 322px + stretch (no explicit width: 322px)",
     );
     report.finish()
 }
@@ -1775,12 +1799,22 @@ pub fn gate_card_gap_source() -> (bool, String) {
 /// Gate: HID switch UAC dwell (B-2, re-scan finding).
 ///
 /// The elevated sidecar is launched via UAC (`runas`); the user
-/// needs 10 s for the spawn plus thinking time to read and answer
-/// the prompt. The manager waits `DEFAULT_SPAWN_TIMEOUT` for the
-/// sidecar `hello` — 10 s today, so a user who takes longer to
-/// answer the prompt trips `HelloTimeout` and the switch fails.
-/// The gate requires the spawn/hello wait to cover 10 s + thinking
-/// time (>= 60 s). On decline the switch must surface ONE clear
+/// needs time to read and answer the prompt. P1-1 (v2.0.11) moved
+/// the dwell OUT of the spawn/hello wait: `ShellExecuteExW`
+/// (runas) only returns once the user answers the prompt — a
+/// decline comes back as `ERROR_CANCELLED` → `NotAdmin` — so the
+/// hello clock starts at accept start, after the spawn returns,
+/// and `DEFAULT_SPAWN_TIMEOUT` (30 s per stage: accept + hello,
+/// normally < 2 s each) never includes the dwell. The old
+/// requirement (>= 60 s to cover the dwell) predates that design
+/// and would break the P1-1 budget invariant (job 420 s > IPC
+/// 390 s > worst case incl. UAC 370 s > post-UAC 310 s): at 60 s
+/// the post-UAC worst case alone is 370 s and the incl.-UAC case
+/// 430 s, so a slow-but-healthy switch would again be reported
+/// failed while the daemon continues. This gate therefore asserts
+/// the P1-1 shape instead: the spawn returns on decline, the
+/// hello clock starts after spawn, and each post-spawn stage gets
+/// >= 30 s. On decline the switch must surface ONE clear
 /// message and never retry-loop: the UI handler starts exactly one
 /// backend job (which calls `set_output_backend` once, guarded by
 /// the Backend in-flight check) and the done-arm notifies once
@@ -1790,7 +1824,12 @@ pub fn gate_card_gap_source() -> (bool, String) {
 pub fn gate_hid_uac_dwell() -> (bool, String) {
     let mut report = Report::new();
 
-    // Dwell: parse DEFAULT_SPAWN_TIMEOUT from the manager.
+    // Dwell (P1-1): the spawn call itself absorbs the UAC dwell —
+    // `ShellExecuteExW` returns `ERROR_CANCELLED` when the user
+    // declines, so the dwell is over before accept starts — and
+    // the hello clock starts at accept start. Parse
+    // `DEFAULT_SPAWN_TIMEOUT` (per post-spawn stage) and require
+    // both markers of that shape.
     let manager = read_code("crates/rsh-output-hidmaestro/src/manager.rs").unwrap_or_default();
     let spawn_marker = "pub const DEFAULT_SPAWN_TIMEOUT: Duration = Duration::from_secs(";
     let spawn_secs = manager
@@ -1806,10 +1845,21 @@ pub fn gate_hid_uac_dwell() -> (bool, String) {
         .unwrap_or(0);
     report.check(
         "hid-uac-dwell-timeout",
-        spawn_secs >= 60,
+        spawn_secs >= 30,
         &format!(
-            "DEFAULT_SPAWN_TIMEOUT is {spawn_secs} s (must be >= 60 s: 10 s spawn + user thinking time)"
+            "DEFAULT_SPAWN_TIMEOUT is {spawn_secs} s per post-spawn stage (must be >= 30 s: accept + hello are normally < 2 s each once the spawn — incl. the UAC dwell — has returned)"
         ),
+    );
+    report.check(
+        "hid-uac-dwell-spawn-returns-on-decline",
+        manager.contains("ERROR_CANCELLED"),
+        "spawn maps ShellExecuteEx ERROR_CANCELLED to NotAdmin (the UAC prompt is answered inside the spawn call, before accept starts)",
+    );
+    report.check(
+        "hid-uac-dwell-clock-starts-after-spawn",
+        manager.contains("self.hello_started = Some(Instant::now())")
+            && manager.contains("accept_loopback(&listener, self.config.spawn_timeout"),
+        "hello clock starts at accept start, after the spawn (and its UAC dwell) has returned",
     );
 
     // Decline / no-sidecar path on Linux: one call, one typed

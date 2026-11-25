@@ -44,7 +44,7 @@ const RESPONSE_CHANNEL_CAPACITY: usize = 256;
 /// captures into its log files.
 fn log_dropped_response(
     parsed: &Result<crate::IpcRequest, IpcError>,
-    error: tokio::sync::mpsc::error::TrySendError<String>,
+    error: &tokio::sync::mpsc::error::TrySendError<String>,
 ) {
     if matches!(error, tokio::sync::mpsc::error::TrySendError::Closed(_)) {
         return;
@@ -150,7 +150,7 @@ impl IpcServer {
                             // method + id (never the payload: it can
                             // carry a Wi-Fi password).
                             if let Err(error) = resp_tx.try_send(text) {
-                                log_dropped_response(&parsed, error);
+                                log_dropped_response(&parsed, &error);
                             }
                         }
                         continue;
@@ -163,10 +163,10 @@ impl IpcServer {
                         // queueing unbounded work. R2-49: `try_send`
                         // for the same reason as the cheap path —
                         // never await a send inside the read arm.
-                        if let Some(text) = busy_response_text(&line) {
-                            if let Err(error) = resp_tx.try_send(text) {
-                                log_dropped_response(&parsed, error);
-                            }
+                        if let Some(text) = busy_response_text(&line)
+                            && let Err(error) = resp_tx.try_send(text)
+                        {
+                            log_dropped_response(&parsed, &error);
                         }
                         continue;
                     };

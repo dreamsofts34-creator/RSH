@@ -53,19 +53,25 @@ pub fn timeout_for_method(method: &str) -> Duration {
         "set_output_backend" => Duration::from_secs(75),
         // Game writes: atomic file write + process refresh, which
         // can pass 500 ms on Windows under an AV scan (the UI's
-        // `GAME_WRITE_TIMEOUT`).
-        "add_game" | "update_game" | "remove_game" => Duration::from_secs(10),
-        // Board control round-trip (LED test on `set_tuning`,
-        // config transaction, firmware stat/parse).
-        "set_tuning" | "set_shifter_sensitivity" | "firmware_check" => Duration::from_secs(10),
-        // Control session + OS WLAN profile write.
-        "set_wifi_password" | "clear_wifi_password" | "rejoin_wifi" | "rejoin_wifi_open" => {
-            Duration::from_secs(30)
-        }
-        // Wi-Fi scan (OS scan takes seconds).
-        "scan_rsh_networks" => Duration::from_secs(30),
-        // File copies / restores.
-        "backup_now" | "restore_backup" => Duration::from_secs(30),
+        // `GAME_WRITE_TIMEOUT`). Board control round-trip (LED test
+        // on `set_tuning`, config transaction, firmware
+        // stat/parse) — same 10 s bound, one arm.
+        "add_game"
+        | "update_game"
+        | "remove_game"
+        | "set_tuning"
+        | "set_shifter_sensitivity"
+        | "firmware_check" => Duration::from_secs(10),
+        // Control session + OS WLAN profile write; Wi-Fi scan (OS
+        // scan takes seconds); file copies / restores — same 30 s
+        // bound, one arm.
+        "set_wifi_password"
+        | "clear_wifi_password"
+        | "rejoin_wifi"
+        | "rejoin_wifi_open"
+        | "scan_rsh_networks"
+        | "backup_now"
+        | "restore_backup" => Duration::from_secs(30),
         // Driver download + install.
         "install_vjoy" => Duration::from_secs(120),
         _ => CALL_TIMEOUT,
@@ -463,8 +469,12 @@ impl IpcClient {
 
 #[cfg(test)]
 mod tests {
-    // Unix-only: the module's only test binds a real Unix socket.
-    #[cfg(unix)]
+    // The P2-4 timeout-table test below is platform-independent
+    // (pure function, no socket), so it runs on Windows too — the
+    // `super::*` import must NOT be unix-gated, or the Windows
+    // target check cannot compile that test (`timeout_for_method`
+    // / `Duration` not in scope). The other tests bind a real Unix
+    // socket and stay `#[cfg(unix)]`.
     use super::*;
     #[cfg(unix)]
     use std::time::Instant;

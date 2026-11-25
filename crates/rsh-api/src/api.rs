@@ -1165,6 +1165,11 @@ pub trait AppApi: Send + Sync {
     /// the game. The default delegates to [`add_game`](Self::add_game)
     /// (no dedupe) — the daemon overrides it with the deduping
     /// store call.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`add_game`](Self::add_game): an empty name or exe
+    /// path, an unknown bound profile, or a save failure.
     fn add_game_with_key(
         &self,
         name: &str,

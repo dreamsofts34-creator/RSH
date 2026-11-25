@@ -6871,8 +6871,8 @@ impl AppStateCore {
             // pedals is a profile-level switch, carried on the
             // throttle record (both spellings: the UI writes
             // "throttle", the pipeline reads "accelerator").
-            press_ms: stored.press_ms.or(default_press_ms(&module)),
-            release_ms: stored.release_ms.or(default_release_ms(&module)),
+            press_ms: stored.press_ms.or(default_press_ms(module)),
+            release_ms: stored.release_ms.or(default_release_ms(module)),
             combine_pedals: if module == "accelerator" || module == "throttle" {
                 Some(profile.combine_pedals)
             } else {
