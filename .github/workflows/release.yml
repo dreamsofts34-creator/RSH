@@ -28,7 +28,7 @@
 #                             beside rsh-daemon.exe: the daemon resolves
 #                             it as <own exe dir>/RshCoreHiDcr.exe
 #                             (rsh-output-hidmaestro `resolve_sidecar_path`)
-# Firmware v4.0.4 IS shipped in this release (user orders 2026-11-16
+# Firmware v4.0.5 IS shipped in this release (user orders 2026-11-16
 # ~20:20 + 2026-11-17 ~07:48): BOTH firmware files, built + signed
 # HERE on the runner from the tagged source (step 6 below) — never
 # copied from a developer machine. The merged factory image is for
@@ -96,7 +96,7 @@
 #        * does NOT enable autostart: Settings owns that (the daemon
 #          syncs the Run key / .desktop file from
 #          `settings.autostart` on startup).
-#   6. Firmware (v4.0.4): build with PlatformIO (`esp32dev` env),
+#   6. Firmware (v4.0.5): build with PlatformIO (`esp32dev` env),
 #      sign the app image with the release Ed25519 key (GitHub secret
 #      RSH_SIGNING_KEY_PEM — the private key never enters the repo),
 #      verify the signature + version marker fail-closed, then stage
@@ -126,8 +126,8 @@
 #
 # Release assets (exact list — THREE assets, as listed in this workflow's header):
 #   RSH_2.0.11_x64-setup.exe            (NSIS installer — app version)
-#   RSH-Firmware-DevKitV1-v4.0.4.bin    (merged full-flash firmware image — firmware version)
-#   RSH-Firmware-DevKitV1-v4.0.4-OTA.bin (Ed25519-signed OTA image — firmware version)
+#   RSH-Firmware-DevKitV1-v4.0.5.bin    (merged full-flash firmware image — firmware version)
+#   RSH-Firmware-DevKitV1-v4.0.5-OTA.bin (Ed25519-signed OTA image — firmware version)
 #
 # REMOVED in the v2.0 rewrite (2026-11-16) — these v1.x steps no longer
 # exist in this file:
@@ -473,7 +473,7 @@ jobs:
             Write-Host "$b : subsystem 2 (GUI) OK"
           }
 
-      # ---- Firmware v4.0.4: build + sign (TWO assets) ----
+      # ---- Firmware v4.0.5: build + sign (TWO assets) ----
       # Runs BEFORE the NSIS build: the installer bundles
       # firmware-signed.bin, so makensis fails closed if the
       # image is missing or unsigned.

@@ -1,17 +1,18 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.11 · firmware v4.0.4 · protocol v2.2 (frozen)**.
+**app v2.0.11 · firmware v4.0.5 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
 
-## [2.0.11] — 2026-11-24
+## [2.0.11] — 2026-11-25
 
-App-only release (firmware stays v4.0.4, protocol v2.2 frozen — no
-firmware change). The HID fix batch for the v2.0.10 user-PC retest
-Bug 1: the HIDMaestro sidecar died between connect and hello,
-30/30 times, with no trace anywhere.
+App 2.0.11 + firmware 4.0.5 (protocol v2.2 frozen — no wire-format
+change). Two rounds: the HID fix batch for the v2.0.10 user-PC
+retest Bug 1 (sidecar died between connect and hello, 30/30 times,
+with no trace anywhere), then a full-project deep scan of the user's
+`rsh-update4` code drop (PR #4, 64 findings, all fixed).
 
 **HID backend — sidecar death before hello (root cause addressed).**
 
@@ -84,6 +85,82 @@ Bug 1: the HIDMaestro sidecar died between connect and hello,
 - New Rust test: a sidecar that connects and dies before hello
   must report `SidecarDied`, never hang
   (`tcp_connect_then_die_before_hello_is_sidecar_died`).
+
+**Root-cause reframe (deep scan, PR #4) — the socket, not the crash.**
+
+- The v2.0.10 failure is now believed to be a **nonblocking-socket
+  bug, not the HMContext native crash**: the accepted loopback
+  socket inherited nonblocking mode from the listener, so a healthy
+  sidecar that had not written hello yet read as "died before
+  hello" (`read_line_capped` maps any read error to EOF). It fits
+  all the evidence (exit code 259 STILL_ACTIVE, 32 ms after spawn,
+  no crash dialog, no dump; the standalone hello check passes on
+  blocking .NET sockets). Fix: the accepted stream is put back to
+  blocking mode right after accept (`transport.rs:327`), plus a
+  real daemon→sidecar TCP end-to-end test in CI. **The user's PC
+  retest remains the proof — this is not claimed proven until the
+  switch works on Win10 22H2.**
+- The HID double-verify also fixed the timeout budget (daemon worst
+  case 310 s post-UAC vs the UI's 390 s IPC / 420 s job bound —
+  a slow-but-healthy switch used to be reported failed while the
+  daemon kept going), enriched the post-hello EOF with PID /
+  exit code / timing like the pre-hello path, retries transient
+  PID-lookup failures for up to 2 s instead of killing a healthy
+  sidecar, puts the storm guard on the enable-toggle path too, and
+  gives install/create 120 s and the first neutral 10 s.
+
+**Firmware 4.0.5 (deep scan) — pedals, AS5600, config validation.**
+
+- I2C pedals now reach 100% in-game: the pedal path converted
+  raw→mV twice (steering was exempt via `steering_is_mv`; the
+  pedal path was missed). Per-slot `axes_is_mv` bitmask.
+- AS5600 centre-boot mapping: boot position is now 1650 mV, so a
+  boot-centred wheel no longer reads all left travel as 0 mV
+  (boot-at-lock was rejected as unenforceable).
+- `BUTTON_MATRIX` records are rejected at COMMIT (no firmware
+  consumer — the expander-gap pattern, silently dead before);
+  out-of-range slots are rejected too (AXIS/AS5600 > 4, BUTTON >
+  2, ENCODER > 1, LED_STRIP/BATTERY != 0).
+- COMMIT persist rewritten (prv → pend → cur + read-back verify);
+  handbrake latch uses the pre-ramp value; AGC is enforced. The
+  engine holds the last-good axes on `axis_invalid`.
+
+**Daemon / engine (deep scan).**
+
+- Game writes are idempotent (idempotency key) and the IPC
+  timeout no longer means "not executed"; TOCTOU in the
+  remove/update game guards is fixed.
+- The watchdog writes `degraded` / `ManagerLoopHung` to
+  `daemon-status.json` instead of leaving the daemon half-alive
+  with no signal; `HelloReceived` fires again after an activation
+  failure; the pid-file claim is fail-closed; Wi-Fi password
+  changes roll back on failure.
+- The wizard "Join wheel Wi-Fi" flow could never succeed
+  (`UnknownMethod` — the Wi-Fi scan + rejoin IPC dispatch arms
+  were missing); the dispatch arms and `DaemonApi` overrides are
+  added. HELLO log dedupe is keyed on (MAC, firmware).
+
+**UI (deep scan).**
+
+- Real 2-column games grid (broke at ≥3 games); the Modal scrim
+  no longer closes the GameDialog and discards typed input
+  (blocking TouchArea on Modal/popover/drawers); game save failure
+  shows an inline error; the edit-game dialog pre-fills the exe
+  path.
+- Contrast: `ok` on Light 4.38→5.03:1, `faint` on Dark
+  4.16→4.93:1 (WCAG AA); window minimums 880×480, wizard
+  ScrollView; Extras cards reworked to overlap/`visible` so ON
+  and OFF are the same size.
+
+**Installer / CI (deep scan).**
+
+- An update install now kills the running sidecar (both exe
+  names) before writing files — the update used to abort with
+  "Error opening file for writing" while the HIDMaestro backend
+  was active.
+- The sidecar hello check now runs in the release workflow, and a
+  CI guard job fails if the NSIS `run:` block grows past 20,800
+  chars (GitHub's limit is 21,000; it is at 20,469).
 
 ## [2.0.10] — 2026-11-24
 

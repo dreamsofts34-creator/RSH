@@ -16,10 +16,10 @@ A small backend engine runs in the background; the app window is only there when
 
 **Supported board:** ESP32 DevKit V1.
 
-- **First time, or a board that won't boot:** flash the merged image `RSH-Firmware-DevKitV1-v4.0.4.bin` at offset `0x0` with esptool:
+- **First time, or a board that won't boot:** flash the merged image `RSH-Firmware-DevKitV1-v4.0.5.bin` at offset `0x0` with esptool:
 
   ```sh
-  esptool.py --port <port> write_flash 0x0 RSH-Firmware-DevKitV1-v4.0.4.bin
+  esptool.py --port <port> write_flash 0x0 RSH-Firmware-DevKitV1-v4.0.5.bin
   ```
 
 - **Updating a working board:** use the app — Settings → Firmware → update (WebOTA). The image is signature-checked before it is applied. Update the app before the firmware.
