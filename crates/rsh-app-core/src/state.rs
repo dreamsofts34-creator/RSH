@@ -4439,7 +4439,12 @@ impl AppStateCore {
     // `self` is used on Windows (backend / output / engine reads);
     // off Windows the whole Windows block is cfg'd out, so the
     // pedantic unused-self lint is allowed here.
+    // `unnecessary_wraps` is Windows-only too: off Windows this
+    // returns `None` (no registry / vJoy to check), so the `Option`
+    // is load-bearing for the shared signature — on Windows the
+    // check always produces a value.
     #[allow(clippy::unused_self)]
+    #[allow(clippy::unnecessary_wraps)]
     fn refresh_wheel_check(&self) -> Option<rsh_api::WheelCheck> {
         #[cfg(windows)]
         {
