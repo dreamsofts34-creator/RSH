@@ -244,7 +244,7 @@ pub fn resolve_vjoy_config_path_from_env(
 /// wait includes the user answering the UAC prompt).
 pub const VJOY_CONFIG_TIMEOUT_SECS: u64 = 120;
 
-/// Configure vJoy device 1 to the EmuWheel envelope (Windows-only).
+/// Configure vJoy device 1 to the `EmuWheel` envelope (Windows-only).
 ///
 /// Locates `vJoyConfig.exe` ([`resolve_vjoy_config_path`]) and runs
 /// it elevated (`Start-Process -Verb RunAs`, one UAC prompt) with
@@ -267,6 +267,7 @@ pub const VJOY_CONFIG_TIMEOUT_SECS: u64 = 120;
 /// connect-time capabilities read is the verification.
 #[cfg(windows)]
 pub fn configure_device_1_envelope() -> Result<(), VJoyConfigError> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
 
     let tool = resolve_vjoy_config_path().ok_or(VJoyConfigError::ToolNotFound)?;

@@ -489,7 +489,7 @@ impl SystemSpawner {
                 lp_parameters: std::ptr::null(),
                 lp_directory: dir_wide
                     .as_ref()
-                    .map_or(std::ptr::null(), |wide| wide.as_ptr()),
+                    .map_or(std::ptr::null(), std::vec::Vec::as_ptr),
                 n_show: win32::SW_SHOWNORMAL,
                 h_inst_app: 0,
                 lp_id_list: std::ptr::null_mut(),

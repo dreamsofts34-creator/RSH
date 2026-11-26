@@ -188,8 +188,8 @@ try {
     Write-Error "Sidecar hello check (TCP): hello did not echo the loopback token."
     exit 1
   }
-  if ($tcpHello.transport -ne "tcp") {
-    Write-Error "Sidecar hello check (TCP): transport is '$($tcpHello.transport)', expected 'tcp'."
+  if ($tcpHello.transport -ne "tcp-loopback") {
+    Write-Error "Sidecar hello check (TCP): transport is '$($tcpHello.transport)', expected 'tcp-loopback'."
     exit 1
   }
   Write-Host "Sidecar hello OK (TCP connect-back): sdk $($tcpHello.sdk), dll_sha256_ok $($tcpHello.dll_sha256_ok), admin $($tcpHello.admin), transport $($tcpHello.transport), pid $($tcpHello.pid)."
