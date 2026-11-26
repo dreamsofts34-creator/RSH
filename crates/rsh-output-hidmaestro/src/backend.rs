@@ -270,6 +270,11 @@ impl HidMaestroOutput {
 
     fn connect_inner(&mut self, plan: Option<&PipelinePlan>) -> Result<(), HidMaestroError> {
         let _hello: HelloInfo = self.manager.connect()?;
+        // HID P2-1 (polish round): production `connect` never called
+        // `describe-profile` — the only callers were the stub sidecar
+        // and tests. Verify the descriptor/size before the first
+        // submit so a packing mismatch fails here, not in-game.
+        self.manager.describe_profile()?;
         self.manager.install_driver()?;
         let created: CreateInfo = self.manager.create()?;
         self.capabilities = created.capabilities;
@@ -465,27 +470,27 @@ impl IJoystickOutput for HidMaestroOutput {
             self.fail(&err);
             return Err(VJoyError::from(err));
         }
+        // PERF P1-1 (polish round): the 200 Hz tick submits
+        // async — enqueue only, no round-trip wait. A refused
+        // submit surfaces on the next tick via the drained reply;
+        // a dead sidecar is caught by `ensure_alive` above.
         let result = if self.config.use_raw_report {
             build_raw_report(state, &self.current_caps(), &mut self.raw_report);
             let report = self.raw_report;
-            self.manager.submit_raw(&report)
+            self.manager.submit_raw_async(&report)
         } else {
             let frame = build_gamepad_frame(state, &self.current_caps());
-            self.manager.submit(frame)
+            self.manager.submit_async(frame)
         };
-        match result {
-            Ok(_) => {
-                self.refresh_status_after_submit();
-                Ok(())
-            }
-            Err(err) => {
-                // The device is gone (or refused the frame): mark
-                // disconnected so the next try_connect is the retry.
-                // The engine sends neutral and keeps ticking.
-                self.fail(&err);
-                Err(VJoyError::from(err))
-            }
+        if let Err(err) = result {
+            // The device is gone (or refused the frame): mark
+            // disconnected so the next try_connect is the retry.
+            // The engine sends neutral and keeps ticking.
+            self.fail(&err);
+            return Err(VJoyError::from(err));
         }
+        self.refresh_status_after_submit();
+        Ok(())
     }
 
     fn send_neutral(&mut self) -> Result<(), VJoyError> {

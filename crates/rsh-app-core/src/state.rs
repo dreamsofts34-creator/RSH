@@ -183,7 +183,7 @@ use rsh_output_hidmaestro::backend::UAC_NOTE;
 use rsh_output_hidmaestro::manager::resolve_sidecar_path;
 use rsh_profiles::bindings::{BindingError, BindingStore, is_app_action};
 use rsh_profiles::csharp_import::{
-    GameId, PedalCalibration, PerModuleTuning, SteeringCalibration, WheelProfile,
+    GameId, KNOWN_MODULES, PedalCalibration, PerModuleTuning, SteeringCalibration, WheelProfile,
     canonical_module_id,
 };
 use rsh_profiles::resolver::{
@@ -230,7 +230,7 @@ use crate::launcher::{GameLauncher, SystemSpawner};
 use crate::manual_games::ManualGameStore;
 use crate::snapshot::{
     ConnectionState, EncoderState, EngineSnapshot, EngineStats, LoopRateTracker, PedalSnapshot,
-    SnapshotInput, build_engine_stats,
+    SnapshotInput, build_engine_stats_cached,
 };
 use crate::system::{NullSink, ShutdownOutcome};
 use crate::telemetry_adapter::TelemetryCarSource;
@@ -980,6 +980,12 @@ pub struct AppStateCore {
     /// The engine supervisor std thread, while the engine task is
     /// running ([`None`] before start / after stop).
     engine_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Readiness receiver of a supervisor whose 5 s ready wait timed
+    /// out (CORE-P3-7, polish round): the thread may still report
+    /// ready a moment later, so the receiver is kept for the next
+    /// `start_engine` call to re-await instead of returning early
+    /// with a stale `Failed` status while the engine runs.
+    engine_ready_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// Frame channel into the running engine (the forwarder and test
     /// feeders send here), while the engine task is running.
     engine_frame_tx: Mutex<Option<tokio::sync::mpsc::Sender<StreamFrame>>>,
@@ -1326,6 +1332,7 @@ impl AppStateCore {
             engine_cmd_tx: Mutex::new(None),
             engine_report_rx: Mutex::new(None),
             engine_thread: Mutex::new(None),
+            engine_ready_rx: Mutex::new(None),
             engine_frame_tx: Mutex::new(None),
             engine_last_report: Mutex::new(None),
             engine_encoders: Mutex::new(EngineEncoderAccum::default()),
@@ -3029,9 +3036,13 @@ impl AppStateCore {
     /// loop rate (`None` p99s while unmeasured — never a fake 0).
     #[must_use]
     pub fn engine_stats(&self) -> EngineStats {
-        let metrics = *lock(&self.metrics);
+        // PERF P1-3 (polish round): the cached-stats variant — the
+        // three p99 sorts run at most every 100 ms instead of on
+        // every 200 Hz tick. The metrics lock is held mutably for
+        // the cache update, same short hold as before.
         let loop_hz = lock(&self.loop_rate).rate_hz();
-        build_engine_stats(&metrics, loop_hz)
+        let mut metrics = lock(&self.metrics);
+        build_engine_stats_cached(&mut metrics, loop_hz)
     }
 
     /// The latest snapshot (built by the most recent `ingest_frame`;
@@ -3100,8 +3111,8 @@ impl AppStateCore {
     /// a button restores the pipeline's own value on the next tick.
     ///
     /// * Game action: the source button's bit is cleared and the
-    ///   target is set while the button is held — `horn` sets bit 2
-    ///   (button 3, plus the `horn` flag), `shifter_up` /
+    ///   target is set while the button is held — `horn` sets bit 4
+    ///   (button 5, plus the `horn` flag), `shifter_up` /
     ///   `shifter_down` set bits 0/1, `gear_N` sets the decoded
     ///   `gear` field, `handbrake` drives the handbrake axis to
     ///   1.0. The game never sees the raw button as well.
@@ -3227,7 +3238,10 @@ impl AppStateCore {
                 Self::clear_bound_button(&mut out, button);
                 match action {
                     "horn" => {
-                        out.buttons |= 1 << 2;
+                        // HID P1-1: the canonical horn bit is 4
+                        // (stream `buttons` bit 4), not 2 — bit 2
+                        // is the accel pedal button.
+                        out.buttons |= 1 << 4;
                         out.horn = true;
                     }
                     "shifter_up" => out.buttons |= 1 << 0,
@@ -5088,7 +5102,32 @@ impl AppStateCore {
             *lock(&self.engine_cmd_tx) = None;
             *lock(&self.engine_report_rx) = None;
         }
+        // CORE-P3-7 (polish round): a live handle with a stale
+        // `Failed` status (ready-timeout path) is not "already
+        // running" — re-await the kept readiness receiver once more
+        // (up to 5 s). A supervisor that reported ready at 5.1 s
+        // heals the status instead of leaving the UI showing a dead
+        // engine while it serves connects.
         if lock(&self.engine_thread).is_some() {
+            if matches!(self.engine_status(), EngineTaskStatus::Failed { .. })
+                && let Some(ready_rx) = lock(&self.engine_ready_rx).take()
+            {
+                // A second 5 s wait: keep the receiver for yet
+                // another call if it times out again (the supervisor
+                // may still be starting).
+                match ready_rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(()) => {
+                        self.set_engine_status(
+                            EngineTaskStatus::Running { transport: None },
+                            "engine running, no transport — idle (watchdog neutral)".to_string(),
+                        );
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        *lock(&self.engine_ready_rx) = Some(ready_rx);
+                    }
+                }
+            }
             return Ok(());
         }
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(ENGINE_COMMAND_CAPACITY);
@@ -5110,6 +5149,11 @@ impl AppStateCore {
                     );
                     Ok(())
                 } else {
+                    // CORE-P3-7: keep the readiness receiver — the
+                    // supervisor may still report ready, and the next
+                    // `start_engine` re-awaits it (see above) instead
+                    // of leaving a stale `Failed` forever.
+                    *lock(&self.engine_ready_rx) = Some(ready_rx);
                     let reason = "engine supervisor did not report ready within 5 s".to_string();
                     self.set_engine_status(
                         EngineTaskStatus::Failed {
@@ -5580,8 +5624,23 @@ impl AppStateCore {
         }
         let live =
             BackendKind::from_backend_name(&self.backend_name()).unwrap_or(BackendKind::None);
-        let Some(fallback) = live.fallback() else {
-            return Err(SinkError::new(REFUSED));
+        // HID P2-4 (polish round): vJoy has no fallback target, so a
+        // mid-session vJoy death used to be an unrecovered silent
+        // output stop — one tick errored, the engine sent one neutral
+        // and then nothing, with no retry and no notification. Reconnect
+        // vJoy itself (same backend, same 30 s throttle as failover,
+        // once until an explicit re-select) and surface the loss in
+        // the engine detail so the UI can toast it.
+        let fallback = match live.fallback() {
+            Some(fallback) => fallback,
+            None if live == BackendKind::VJoy => {
+                self.note_engine_detail(
+                    "vJoy device was lost mid-session — attempting one reconnect (30 s throttle)"
+                        .to_string(),
+                );
+                BackendKind::VJoy
+            }
+            None => return Err(SinkError::new(REFUSED)),
         };
         *lock(&self.fallback_last_attempt) = Some(now);
         self.fallback_used.store(true, Ordering::SeqCst);
@@ -5654,10 +5713,19 @@ impl AppStateCore {
     pub fn activate_profile(&self, id: &str) -> Result<ProfileSummary, String> {
         let summary = {
             let mut store = lock(&self.store);
-            store
+            // CORE-P2-3 (polish round): snapshot first — a save
+            // failure after `activate` used to leave the active
+            // profile switched in memory while disk still had the old
+            // one (the switch silently reverted on restart).
+            let snapshot = store.snapshot();
+            if let Err(error) = store
                 .activate(id, true)
-                .map_err(|error| error.to_string())?;
-            store.save().map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .and_then(|()| store.save().map_err(|error| error.to_string()))
+            {
+                store.restore(snapshot);
+                return Err(error);
+            }
             Self::summary(&store, id)?
         };
         // A switch drops the old profile's draft (its edits belong to
@@ -5946,6 +6014,10 @@ impl AppStateCore {
         module: &str,
         enabled: bool,
     ) -> Result<bool, String> {
+        // CORE-P3-4 (polish round): see `set_tuning`.
+        if !KNOWN_MODULES.contains(&canonical_module_id(module).as_str()) {
+            return Err(format!("unknown module '{module}'"));
+        }
         let module = canonical_module_id(module);
         let active = {
             lock(&self.store)
@@ -6094,6 +6166,10 @@ impl AppStateCore {
         let name = name.trim().to_string();
         let summary = {
             let mut store = lock(&self.store);
+            // CORE-P2-3 (polish round): snapshot first — a save
+            // failure after `update` used to leave the renamed
+            // profile in memory while disk kept the old name.
+            let snapshot = store.snapshot();
             let mut profile = store
                 .list()
                 .iter()
@@ -6101,10 +6177,14 @@ impl AppStateCore {
                 .map(|stored| stored.profile.clone())
                 .ok_or_else(|| format!("no profile with id '{id}'"))?;
             profile.name.clone_from(&name);
-            store
+            if let Err(error) = store
                 .update(id, profile)
-                .map_err(|error| error.to_string())?;
-            store.save().map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .and_then(|()| store.save().map_err(|error| error.to_string()))
+            {
+                store.restore(snapshot);
+                return Err(error);
+            }
             Self::summary(&store, id)?
         };
         if lock(&self.store)
@@ -6336,8 +6416,12 @@ impl AppStateCore {
     /// Returns a message when the name is invalid or saving fails.
     pub fn create_profile(&self, name: &str) -> Result<ProfileSummary, String> {
         let mut store = lock(&self.store);
+        let snapshot = store.snapshot();
         let created = store.create(name).map_err(|error| error.to_string())?;
-        store.save().map_err(|error| error.to_string())?;
+        if let Err(error) = store.save().map_err(|error| error.to_string()) {
+            store.restore(snapshot);
+            return Err(error);
+        }
         let summary = Self::summary(&store, &created.id)?;
         self.note_slow_state_changed();
         Ok(summary)
@@ -6350,8 +6434,12 @@ impl AppStateCore {
     /// Returns a message for an unknown id or a store save failure.
     pub fn duplicate_profile(&self, id: &str) -> Result<ProfileSummary, String> {
         let mut store = lock(&self.store);
+        let snapshot = store.snapshot();
         let created = store.duplicate(id).map_err(|error| error.to_string())?;
-        store.save().map_err(|error| error.to_string())?;
+        if let Err(error) = store.save().map_err(|error| error.to_string()) {
+            store.restore(snapshot);
+            return Err(error);
+        }
         let summary = Self::summary(&store, &created.id)?;
         self.note_slow_state_changed();
         Ok(summary)
@@ -6364,8 +6452,15 @@ impl AppStateCore {
     /// Returns a message for an unknown id or a store save failure.
     pub fn delete_profile(&self, id: &str) -> Result<(), String> {
         let mut store = lock(&self.store);
-        store.delete(id).map_err(|error| error.to_string())?;
-        store.save().map_err(|error| error.to_string())?;
+        let snapshot = store.snapshot();
+        if let Err(error) = store
+            .delete(id)
+            .map_err(|error| error.to_string())
+            .and_then(|()| store.save().map_err(|error| error.to_string()))
+        {
+            store.restore(snapshot);
+            return Err(error);
+        }
         self.note_slow_state_changed();
         Ok(())
     }
@@ -6379,10 +6474,14 @@ impl AppStateCore {
     /// fails schema checks, or saving fails.
     pub fn import_profile(&self, path: &str) -> Result<ProfileSummary, String> {
         let mut store = lock(&self.store);
+        let snapshot = store.snapshot();
         let imported = store
             .import_profile(Path::new(path))
             .map_err(|error| error.to_string())?;
-        store.save().map_err(|error| error.to_string())?;
+        if let Err(error) = store.save().map_err(|error| error.to_string()) {
+            store.restore(snapshot);
+            return Err(error);
+        }
         let summary = Self::summary(&store, &imported.id)?;
         self.note_slow_state_changed();
         Ok(summary)
@@ -7041,6 +7140,9 @@ impl AppStateCore {
     #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn get_tuning(&self, module: &str) -> TuningSettings {
+        // CORE-P3-4 (polish round): an unknown module reads as the
+        // neutral default (no stored entry can exist for it); the
+        // write paths above reject it outright.
         let module = canonical_module_id(module);
         if let Some(tuning) = lock(&self.tunings).get(&module) {
             return tuning.clone();
@@ -7143,6 +7245,13 @@ impl AppStateCore {
     /// Returns a message when the tuning fails validation or there is
     /// no active profile to draft against.
     pub fn set_tuning(self: &Arc<Self>, tuning: &TuningSettings) -> Result<TuningSettings, String> {
+        // CORE-P3-4 (polish round): an unknown module id used to be
+        // accepted, dirtied the draft and persisted into the profile
+        // while the pipeline never read it — a silent no-op that
+        // looked saved.
+        if !KNOWN_MODULES.contains(&canonical_module_id(&tuning.module).as_str()) {
+            return Err(format!("unknown module '{}'", tuning.module));
+        }
         let errors = validate_tuning(tuning);
         if !errors.is_empty() {
             return Err(format!("invalid tuning: {}", errors.join("; ")));
@@ -12434,8 +12543,8 @@ mod tests {
         let received = drive_tick(&state, &sent, &output);
         assert_eq!(
             received.buttons,
-            1 << 2,
-            "only the horn bit (button 3) survives — source bits 4/5/6 are cleared"
+            1 << 4,
+            "only the horn bit (button 5) survives — source bits 4/5/6 are cleared"
         );
         assert!(received.horn, "horn flag follows the bound horn bit");
         assert_eq!(received.gear, 2, "gear_2 sets the decoded gear field");
@@ -12487,7 +12596,7 @@ mod tests {
         assert!(!received.horn);
         output.long_press_buttons = 1 << 5;
         let received = drive_tick(&state, &sent, &output);
-        assert_eq!(received.buttons, 1 << 2, "horn bit only");
+        assert_eq!(received.buttons, 1 << 4, "horn bit only");
         assert!(received.horn);
         // Long-press app action: queues once on the threshold edge,
         // not once per tick while held.

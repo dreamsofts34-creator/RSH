@@ -156,11 +156,24 @@ impl ManualGameStore {
         key: Option<&str>,
     ) -> Result<ManualGame, String> {
         let key = key.map(str::trim).filter(|key| !key.is_empty());
+        // CORE-P3-10 (polish round): a key hit returns the existing
+        // entry only when the retried parameters match — a retry
+        // carrying edited parameters used to silently return the old
+        // entry and lose the edit with a success response. A
+        // parameter mismatch falls through to a fresh add (a new id,
+        // same as a retry without a key).
         if let Some(key) = key
             && let Some(existing) = self
                 .games
                 .iter()
                 .find(|game| game.idempotency_key.as_deref() == Some(key))
+            && existing.name == name.trim()
+            && existing.exe_path == exe_path.trim()
+            && existing.bound_profile_id.as_deref()
+                == bound_profile_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
         {
             return Ok(existing.clone());
         }
@@ -215,14 +228,22 @@ impl ManualGameStore {
         if exe_path.is_empty() {
             return Err("game exe path must not be empty".to_string());
         }
-        let Some(game) = self.games.iter_mut().find(|game| game.id == id) else {
+        let Some(pos) = self.games.iter().position(|game| game.id == id) else {
             return Err(format!("unknown game '{id}'"));
         };
-        game.name = name.to_string();
-        game.exe_path = exe_path.to_string();
-        game.bound_profile_id = bound_profile_id.filter(|id| !id.trim().is_empty());
-        let game = game.clone();
-        self.save()?;
+        // CORE-P2-3 (polish round): clone-save-swap — a save failure
+        // used to leave the edited entry in memory while the UI
+        // showed an error, so the change silently vanished on the
+        // next restart. Restore the old entry on failure.
+        let old = self.games[pos].clone();
+        self.games[pos].name = name.to_string();
+        self.games[pos].exe_path = exe_path.to_string();
+        self.games[pos].bound_profile_id = bound_profile_id.filter(|id| !id.trim().is_empty());
+        let game = self.games[pos].clone();
+        if let Err(error) = self.save() {
+            self.games[pos] = old;
+            return Err(error);
+        }
         Ok(game)
     }
 
@@ -235,8 +256,14 @@ impl ManualGameStore {
         let Some(pos) = self.games.iter().position(|game| game.id == id) else {
             return Err(format!("unknown game '{id}'"));
         };
-        self.games.remove(pos);
-        self.save()
+        // CORE-P2-3 (polish round): restore the removed entry when
+        // the save fails, so memory never diverges from disk.
+        let removed = self.games.remove(pos);
+        if let Err(error) = self.save() {
+            self.games.insert(pos, removed);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Bind (`Some`) or unbind (`None`) a profile for a game.
@@ -250,12 +277,17 @@ impl ManualGameStore {
         id: &str,
         bound_profile_id: Option<String>,
     ) -> Result<ManualGame, String> {
-        let Some(game) = self.games.iter_mut().find(|game| game.id == id) else {
+        let Some(pos) = self.games.iter().position(|game| game.id == id) else {
             return Err(format!("unknown game '{id}'"));
         };
-        game.bound_profile_id = bound_profile_id.filter(|id| !id.trim().is_empty());
-        let game = game.clone();
-        self.save()?;
+        // CORE-P2-3 (polish round): same rollback as `update`.
+        let old = self.games[pos].clone();
+        self.games[pos].bound_profile_id = bound_profile_id.filter(|id| !id.trim().is_empty());
+        let game = self.games[pos].clone();
+        if let Err(error) = self.save() {
+            self.games[pos] = old;
+            return Err(error);
+        }
         Ok(game)
     }
 
@@ -537,6 +569,77 @@ mod tests {
         let third = store.add("Race", r"C:\c.exe", None).expect("add 3");
         assert_ne!(third.id, first.id);
         assert_ne!(third.id, second.id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CORE-P3-10: a retry carrying the SAME key but EDITED
+    /// parameters must not return the old entry — the edit would
+    /// be silently lost behind a success response. It falls through
+    /// to a fresh add (a new id, same as a retry without a key).
+    #[test]
+    fn add_with_key_param_mismatch_is_a_fresh_add() {
+        let dir = test_dir("idempotent-mismatch");
+        let mut store = ManualGameStore::open(&dir);
+        let first = store
+            .add_with_key("Race", r"C:\a.exe", None, Some("dialog-1"))
+            .expect("add");
+        // Same key, edited exe path: a NEW entry, not the old one.
+        let edited = store
+            .add_with_key("Race", r"C:\b.exe", None, Some("dialog-1"))
+            .expect("edited retry");
+        assert_ne!(edited.id, first.id, "edited retry must not dedupe");
+        assert_eq!(edited.exe_path, r"C:\b.exe");
+        assert_eq!(store.list().len(), 2);
+        // Same key, edited name: also a fresh add.
+        let renamed = store
+            .add_with_key("Race 2", r"C:\a.exe", None, Some("dialog-1"))
+            .expect("renamed retry");
+        assert_ne!(renamed.id, first.id);
+        assert_eq!(store.list().len(), 3);
+        // Exact retry still dedupes.
+        let retry = store
+            .add_with_key("Race", r"C:\a.exe", None, Some("dialog-1"))
+            .expect("exact retry");
+        assert_eq!(retry.id, first.id);
+        assert_eq!(store.list().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CORE-P2-3: when the save fails, memory must stay exactly as
+    /// disk — the old code left the edited entry in memory while the
+    /// UI showed an error, so the change silently vanished on the
+    /// next restart. The save is broken here by replacing the games
+    /// file with a directory (the atomic rename cannot land on it).
+    #[test]
+    fn save_failure_rolls_back_update_remove_and_set_profile() {
+        let dir = test_dir("rollback");
+        let mut store = ManualGameStore::open(&dir);
+        let game = store.add("Race", r"C:\a.exe", None).expect("add");
+        let path = dir.join(MANUAL_GAMES_FILE_NAME);
+        std::fs::remove_file(&path).expect("remove games file");
+        std::fs::create_dir(&path).expect("games file becomes a dir");
+        // update fails and memory keeps the old entry.
+        assert!(
+            store
+                .update(&game.id, "Race 2", r"D:\race2.exe", None)
+                .is_err()
+        );
+        let kept = store.get(&game.id).expect("still there");
+        assert_eq!(kept.name, "Race");
+        assert_eq!(kept.exe_path, r"C:\a.exe");
+        // set_profile fails and memory keeps the old binding.
+        assert!(
+            store
+                .set_profile(&game.id, Some("profile-1".to_string()))
+                .is_err()
+        );
+        assert!(store.get(&game.id).unwrap().bound_profile_id.is_none());
+        // remove fails and the entry stays.
+        assert!(store.remove(&game.id).is_err());
+        assert_eq!(store.list().len(), 1);
+        // add fails too and leaves no phantom entry.
+        assert!(store.add("Other", r"C:\b.exe", None).is_err());
+        assert_eq!(store.list().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

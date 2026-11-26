@@ -121,6 +121,34 @@ any version — an altered packet fails CRC16 and is dropped, and
 status packets carry `seqGap` + `txFail` counters so loss is
 visible.
 
+### 1.3.1 Stream `buttons` bit assignment (PINNED, v2.0.13)
+
+The `buttons u32` word is the board's button word — bit *n* is
+game button *n+1*. Pinned here (HID P1-1, polish round) because
+v2.1/v2.2 never wrote the numbers down and the host read the
+horn on the wrong bit:
+
+| bits | meaning |
+| --- | --- |
+| 0 | shift-up (sequential) |
+| 1 | shift-down (sequential) |
+| 2 | accel pedal, button mode (digital pedal press) |
+| 3 | brake pedal, button mode (digital pedal press) |
+| 4 | horn |
+| 5–10 | H-pattern gears 1–6 (one bit per gear) |
+| 11–31 | wheel buttons (BUTTON slots) |
+| 32–63 | extended buttons (`btns_ex` in the 38 B status packet) |
+
+Canonical source: `firmware/modules.h` (`RSH_BTN2_HORN 4`,
+`RSH_BTN2_ACCEL 2`, `RSH_BTN2_BRAKE 3`) and
+`crates/rsh-engine/src/pipeline.rs` (`HORN_BIT`,
+`PEDAL_BUTTON_BITS`). The host pipeline strips bits 2/3 before
+debounce/output — they are NOT wheel buttons: in pedal
+button-mode the firmware drives the accel/brake axis from the
+debounced pedal bit (4095 pressed / 0 released) and the axis is
+what the game sees. A bit-2 press must never honk and a bit-4
+press must never reach the game as a pedal.
+
 ### 1.4 Status packets (board → PC, 1 Hz) — `0xA6`
 
 Sent at 1 Hz to a v2 peer only (a legacy v1 app does not
@@ -469,6 +497,7 @@ emit (`firmware/diag_log.h`; wire values never change):
 | 5 | `PIN_CONFLICT` |
 | 6 | `UNSUPPORTED` |
 | 7 | `BUSY` |
+| 8 | `NVS_FAIL` — SET_PASSWORD synchronous NVS write failed (firmware 4.0.6, F-07): the password was NOT changed; retry or keep the old one. |
 
 ## 4. Ping (NTP-style, 34 B fixed)
 

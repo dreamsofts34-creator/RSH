@@ -99,6 +99,19 @@ static void fw34_password_cb(void *user, const uint8_t *pw, uint16_t len) {
   pendingPasswordLen = (uint8_t)len;
   passwordChangePending = true;
 }
+
+// F-07: synchronous NVS write (SET_PASSWORD reply se pehle). Sirf NVS
+// likhta hai — AP restart ab bhi deferred hota hai (password_cb ke
+// zariye). Deferred action wahi value dobara likhta hai (idempotent);
+// agar deferred write fail bhi ho jaye to restart skip hota hai, lekin
+// password NVS mein naya wala hota hai (reboot par apply ho jata hai).
+static uint8_t fw34_password_set_sync_cb(void *user, const uint8_t *pw,
+                                         uint16_t len) {
+  (void)user;
+  if (!pw || len < RSH_PASSWORD_MIN_LEN || len > RSH_PASSWORD_MAX_LEN)
+    return 0;
+  return keystore_set_password((const char *)pw, (uint8_t)len) ? 1 : 0;
+}
 static void fw34_persist_cb(void *user, uint8_t pending) {
   (void)user;
   rsh_fw34_cfg_persist(pending);
@@ -367,6 +380,7 @@ bool net_begin() {
     rsh_fw34_handler_ctx_init(&fw34Ctx, NULL);
     fw34Ctx.password_verify_current = fw34_password_verify_cb;
     fw34Ctx.password_change_request = fw34_password_cb;
+    fw34Ctx.password_set_sync = fw34_password_set_sync_cb;  // F-07
     fw34Ctx.cfg_persist = fw34_persist_cb;
     fw34Ctx.now_ms = fw34_now_cb;
     // LED_TEST (Phase H WS2): RMT WS2812 sink + driver. Sink ya driver
@@ -595,8 +609,10 @@ static uint8_t net_ctrl_handler(uint8_t cmd, const uint8_t *payload, uint16_t le
         rsh_cfg_txn_t *txn = rsh_fw34_cfg_txn();
         if (txn)
           rsh_cfg_led_pin(txn->current, txn->current_len, &fw34Ctx.led_pin);
-        fw34Ctx.led_has_expanders =
-            txn ? rsh_cfg_has_expanders(txn->current, txn->current_len) : 0;
+        // F-11: expander input hamesha 0 — validated live config mein
+        // expander records kabhi nahi hote (COMMIT par reject), is liye
+        // rsh_cfg_has_expanders() yahan sirf 0 deta tha (dead input).
+        fw34Ctx.led_has_expanders = 0;
       }
       st = rsh_fw34_handler(cmd, payload, len, reply_body, reply_body_len, &fw34Ctx);
       break;

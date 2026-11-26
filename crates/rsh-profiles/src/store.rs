@@ -422,7 +422,34 @@ pub struct ProfileStore {
     load_warnings: Vec<String>,
 }
 
+/// In-memory snapshot of the profile list for rollback
+/// (CORE-P2-3, polish round): a save failure after a mutation must
+/// restore the list, never leave memory diverged from disk.
+#[derive(Clone, Debug)]
+pub struct ProfileSnapshot {
+    profiles: Vec<StoredProfile>,
+    active_profile_id: Option<String>,
+    auto_switch_locked: bool,
+}
+
 impl ProfileStore {
+    /// Capture the current profile list for a possible rollback.
+    #[must_use]
+    pub fn snapshot(&self) -> ProfileSnapshot {
+        ProfileSnapshot {
+            profiles: self.profiles.clone(),
+            active_profile_id: self.active_profile_id.clone(),
+            auto_switch_locked: self.auto_switch_locked,
+        }
+    }
+
+    /// Restore a snapshot taken by [`Self::snapshot`] (save-failure
+    /// rollback — the caller reports the save error).
+    pub fn restore(&mut self, snapshot: ProfileSnapshot) {
+        self.profiles = snapshot.profiles;
+        self.active_profile_id = snapshot.active_profile_id;
+        self.auto_switch_locked = snapshot.auto_switch_locked;
+    }
     /// Open the store in `dir`, loading `profiles.json` and
     /// `settings.json` when they exist. A missing file means defaults
     /// (one `Default` profile, default settings); a corrupt file is an
@@ -1539,6 +1566,31 @@ mod tests {
             car_model: car.to_string(),
             ..WheelProfile::default()
         }
+    }
+
+    /// CORE-P2-3: a snapshot taken before a mutation restores the
+    /// list, the active id and the auto-switch lock exactly — the
+    /// save-failure rollback the profile mutators in `state.rs`
+    /// rely on.
+    #[test]
+    fn snapshot_restore_rolls_back_profile_mutations() {
+        let dir = temp_dir();
+        let mut store = ProfileStore::open(&dir).expect("open store");
+        assert_eq!(store.profiles.len(), 1, "starts with Default only");
+        let snap = store.snapshot();
+        let created = store.create("Track").expect("create profile");
+        assert_eq!(store.profiles.len(), 2);
+        store.activate(&created.id, true).expect("activate");
+        assert_eq!(
+            store.active().map(|p| p.id.as_str()),
+            Some(created.id.as_str())
+        );
+        store.restore(snap);
+        assert_eq!(store.profiles.len(), 1, "list restored");
+        assert_eq!(store.profiles[0].profile.name, "Default");
+        assert!(store.active().is_none(), "active id restored");
+        assert_eq!(store.profiles[0].id, "default");
+        cleanup(&dir);
     }
 
     #[test]

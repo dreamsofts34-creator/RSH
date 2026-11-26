@@ -583,19 +583,21 @@ impl ControlTransport for UdpTransport {
     /// # Errors
     ///
     /// Returns [`TransportError::Io`] when the datagram cannot be sent.
-    fn send_control(
-        &mut self,
-        bytes: &[u8],
-    ) -> impl Future<Output = Result<(), TransportError>> + Send {
+    /// Send one control frame (PERF P3-3, polish round): an `async
+    /// fn` over the borrowed slice instead of copying every frame
+    /// into a fresh `Vec` for a returned future. Callers await it
+    /// immediately, so the borrow lives long enough.
+    // The trait signature is async, but the send itself is one
+    // `std::net::UdpSocket::send_to` datagram syscall — nothing to
+    // await — so the async is load-bearing only for the trait.
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn send_control(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
         let socket = Arc::clone(&self.socket);
         let target = self.board_control_addr();
-        let owned = bytes.to_vec();
-        async move {
-            socket
-                .send_to(&owned, target)
-                .map(|_| ())
-                .map_err(TransportError::Io)
-        }
+        socket
+            .send_to(bytes, target)
+            .map(|_| ())
+            .map_err(TransportError::Io)
     }
 
     /// Receive one raw control reply, waiting at most `timeout_duration`.

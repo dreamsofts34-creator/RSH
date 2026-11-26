@@ -120,7 +120,10 @@ impl IpcServer {
                     }
                     // Cheap parse here (no I/O, never blocks): the
                     // subscribe flag is set on request, since the
-                    // response now arrives asynchronously.
+                    // response now arrives asynchronously. PERF P2-2
+                    // (polish round): this parse is THE parse — it is
+                    // passed into `response_text` below instead of
+                    // re-parsing the same line twice more there.
                     let parsed = parse_request(&line);
                     if parsed
                         .as_ref()
@@ -142,7 +145,7 @@ impl IpcServer {
                         .as_ref()
                         .is_ok_and(|request| is_cheap_method(&request.method))
                     {
-                        if let Some(text) = self.response_text(&line) {
+                        if let Some(text) = self.response_text(&parsed) {
                             // P3-3: a full channel used to swallow
                             // this response silently (and the client
                             // then timed out, misread as link
@@ -174,7 +177,7 @@ impl IpcServer {
                         // The permit is held until this handler
                         // finishes, then released.
                         let _permit = permit;
-                        if let Some(text) = server.response_text(&line) {
+                        if let Some(text) = server.response_text(&parsed) {
                             let _ = tx.blocking_send(text);
                         }
                     });
@@ -262,23 +265,33 @@ impl IpcServer {
         true
     }
 
-    /// Encode one request line's response (DS-28): shared by the
-    /// inline cheap path and the `spawn_blocking` path. Returns
-    /// `None` when the response itself cannot be encoded.
-    fn response_text(&self, line: &str) -> Option<String> {
+    /// Encode one request's response (DS-28): shared by the inline
+    /// cheap path and the `spawn_blocking` path. Returns `None` when
+    /// the response itself cannot be encoded. Takes the already-parsed
+    /// request (PERF P2-2): the read loop parsed the line once, and
+    /// this path must not parse it again.
+    fn response_text(&self, parsed: &Result<crate::IpcRequest, IpcError>) -> Option<String> {
         // DS-82: the single instrumentation point — every dispatch
         // (inline or blocking) records its latency per method.
         let started = std::time::Instant::now();
-        let method = parse_request(line).map_or_else(|_| "?".to_string(), |request| request.method);
-        let out = match self.handle_line(line) {
-            Ok(resp) => encode_response(&resp).ok(),
+        // PERF P3-1: borrow the parsed method name — the old
+        // `.clone()` allocated one String per dispatch just for
+        // the latency label (plus `to_string()` inside the record
+        // call); `record_ipc_latency` now takes `&str` and only
+        // allocates on first sight of a method.
+        let method = parsed
+            .as_ref()
+            .map_or("?", |request| request.method.as_str());
+        let out = match parsed {
+            Ok(request) => encode_response(&self.handle_parsed(request)).ok(),
             Err(error) => {
                 // Unparseable request: answer with a Protocol error
-                // instead of dropping the connection silently.
-                let id = request_id(line);
+                // instead of dropping the connection silently. The id
+                // is 0 here — the line could not be parsed, so there
+                // is no trustworthy id to echo.
                 encode_response(&IpcResponse {
                     v: IPC_PROTOCOL_VERSION,
-                    id,
+                    id: 0,
                     ok: false,
                     result: None,
                     error: Some(IpcErrorBody {
@@ -289,12 +302,12 @@ impl IpcServer {
                 .ok()
             }
         };
-        crate::record_ipc_latency(&method, started.elapsed());
+        crate::record_ipc_latency(method, started.elapsed());
         // R3-D-13: action → visible-result latency — a mutating
         // dispatch arms the pending-action timestamp; the first
         // later `poll` / `slow_poll` consumes it into a sample
         // (the poll that shows the action's result).
-        if is_action_method(&method) {
+        if is_action_method(method) {
             crate::record_action_completed();
         } else if method == "poll" || method == "slow_poll" {
             crate::record_poll_observed();
@@ -340,16 +353,24 @@ impl IpcServer {
             }
             Err(other) => return Err(other),
         };
+        Ok(self.handle_parsed(&request))
+    }
+
+    /// Handle one already-parsed request → response (PERF P2-2):
+    /// the dispatch + error mapping, split out of [`Self::handle_line`]
+    /// so the server's read loop (which already parsed the line) does
+    /// not parse it a second and third time in `response_text`.
+    fn handle_parsed(&self, request: &crate::IpcRequest) -> IpcResponse {
         let id = request.id;
-        match dispatch(&self.api, &request) {
-            Ok(result) => Ok(IpcResponse {
+        match dispatch(&self.api, request) {
+            Ok(result) => IpcResponse {
                 v: IPC_PROTOCOL_VERSION,
                 id,
                 ok: true,
                 result: Some(result),
                 error: None,
-            }),
-            Err(IpcError::UnknownMethod(method)) => Ok(IpcResponse {
+            },
+            Err(IpcError::UnknownMethod(method)) => IpcResponse {
                 v: IPC_PROTOCOL_VERSION,
                 id,
                 ok: false,
@@ -358,29 +379,41 @@ impl IpcServer {
                     code: "UnknownMethod".to_string(),
                     message: format!("unknown method: {method}"),
                 }),
-            }),
-            Err(IpcError::Api(payload)) => Ok(IpcResponse {
+            },
+            Err(IpcError::Api(payload)) => IpcResponse {
                 v: IPC_PROTOCOL_VERSION,
                 id,
                 ok: false,
                 result: None,
                 error: Some(IpcErrorBody {
-                    // Bug 4/8: the payload is code-first
-                    // (`"{code}: {reason}"` — `set_output_backend`
-                    // carries the failure's real reason after the
-                    // code). The body's `code` stays the bare code
-                    // (callers parse it), the full payload — reason
-                    // included — rides in the message. A bare-code
-                    // payload (every other method) has no `": "`,
-                    // so it passes through unchanged.
+                    // CORE-P1-3/P1-4 (polish round): the payload
+                    // is code-first in one of two shapes —
+                    // `"{code}|{detail}"` (detailed_api_error, the
+                    // common shape) or `"{code}: {reason}"`
+                    // (`set_output_backend`). Split on `|` FIRST:
+                    // splitting on `": "` cut a detail containing
+                    // `": "` mid-detail (e.g. "cannot save manual
+                    // games: …"), and the UI's `split(':')` parse
+                    // then saw the whole detail as the code and
+                    // fell back to a generic link failure. The
+                    // body's `code` stays the bare code (callers
+                    // parse it), the full payload rides in the
+                    // message unchanged.
                     code: payload
-                        .split_once(": ")
-                        .map_or(payload.as_str(), |(code, _)| code)
+                        .split_once('|')
+                        .map_or_else(
+                            || {
+                                payload
+                                    .split_once(": ")
+                                    .map_or(payload.as_str(), |(code, _)| code)
+                            },
+                            |(code, _)| code,
+                        )
                         .to_string(),
                     message: format!("daemon API error: {payload}"),
                 }),
-            }),
-            Err(IpcError::UnsupportedVersion(v)) => Ok(IpcResponse {
+            },
+            Err(IpcError::UnsupportedVersion(v)) => IpcResponse {
                 v: IPC_PROTOCOL_VERSION,
                 id,
                 ok: false,
@@ -389,8 +422,8 @@ impl IpcServer {
                     code: "UnsupportedVersion".to_string(),
                     message: format!("protocol version {v} not supported"),
                 }),
-            }),
-            Err(other) => Ok(IpcResponse {
+            },
+            Err(other) => IpcResponse {
                 v: IPC_PROTOCOL_VERSION,
                 id,
                 ok: false,
@@ -399,7 +432,7 @@ impl IpcServer {
                     code: "Protocol".to_string(),
                     message: other.to_string(),
                 }),
-            }),
+            },
         }
     }
 }
@@ -847,9 +880,20 @@ mod tests {
     fn assert_error_keeps_reason(resp: &IpcResponse, reason: &str) {
         assert!(!resp.ok, "resp: {resp:?}");
         let error = resp.error.as_ref().expect("error body");
+        // CORE-P1-3/P1-4 (polish round): the body code is the BARE
+        // code — the reason rides in the message, never in the code.
+        // A detail containing ": " used to leak into the code (the
+        // old split on ": "), and the UI's split(':') parse then saw
+        // the whole detail as the code and fell back to a generic
+        // link failure. The code must carry no pipe and no detail.
         assert!(
-            error.code.contains(reason),
-            "error code must carry the reason: {}",
+            !error.code.contains(reason),
+            "bare code must not carry the reason: {}",
+            error.code
+        );
+        assert!(
+            !error.code.contains('|'),
+            "bare code must not contain the pipe: {}",
             error.code
         );
         assert!(
@@ -1051,17 +1095,44 @@ mod tests {
     /// percentiles (the global aggregate is `Some` once anything
     /// was recorded; counts are lower bounds — the snapshot is
     /// process-global, so other tests in this binary add to it).
+    /// CORE-P1-3/P1-4: a `code|detail` payload whose detail
+    /// contains `": "` (here: "invalid tuning: …") must yield a
+    /// body code that is exactly the bare code — the old split on
+    /// `": "` produced "Unknown|invalid tuning" as the code, and
+    /// the UI's split(':') parse then read the whole detail as the
+    /// code and fell back to a generic link failure. The full
+    /// payload still rides in the message unchanged.
+    #[test]
+    fn error_body_code_is_bare_when_detail_contains_colon_space() {
+        let server = stub_server();
+        let resp = server
+            .handle_line(r#"{"v":2,"id":13,"method":"set_tuning","params":{"module":"steering","deadzone":5.0,"curve":9.0,"minMv":0.0,"maxMv":3300.0,"smoothing":10.0}}"#)
+            .expect("invalid set_tuning parses");
+        assert!(!resp.ok, "resp: {resp:?}");
+        let error = resp.error.as_ref().expect("error body");
+        assert_eq!(error.code, "Unknown");
+        assert!(
+            error.message.contains("invalid tuning: "),
+            "message keeps the full detail: {}",
+            error.message
+        );
+    }
+
     #[test]
     fn ds82_response_text_records_dispatch_latency() {
         let server = stub_server();
         assert!(
             server
-                .response_text(r#"{"v":2,"id":60,"method":"ping","params":{}}"#)
+                .response_text(&parse_request(
+                    r#"{"v":2,"id":60,"method":"ping","params":{}}"#
+                ))
                 .is_some()
         );
         assert!(
             server
-                .response_text(r#"{"v":2,"id":61,"method":"poll","params":{}}"#)
+                .response_text(&parse_request(
+                    r#"{"v":2,"id":61,"method":"poll","params":{}}"#
+                ))
                 .is_some()
         );
         let snapshot = crate::ipc_latency_snapshot();
@@ -1493,11 +1564,9 @@ mod tests {
             .expect("capture_pedal_min parses");
         assert!(!resp.ok, "resp: {resp:?}");
         let error = resp.error.expect("error body");
-        assert!(
-            error.code.contains("unknown pedal 'gear'"),
-            "error code must carry the reason: {}",
-            error.code
-        );
+        // CORE-P1-3/P1-4 (polish round): the body code is the bare
+        // code — the reason rides in the message, never in the code.
+        assert_eq!(error.code, "Unknown");
         assert!(error.message.contains("unknown pedal 'gear'"));
     }
 

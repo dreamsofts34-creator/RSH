@@ -1143,22 +1143,74 @@ fn gate_already_running_race_unix() -> (bool, String) {
         // killing it first could strand a still-waiting loser (its
         // peer answers no more, so it reports Hung and exits 1
         // instead of 0).
+        //
+        // P1-4 follow-up (v2.0.13 polish): (d) was NOT enough.
+        // `all_accounted` only proves the `/proc` entry exists — a
+        // child still PRE-EXEC has an entry too (empty cmdline, not
+        // a zombie), so settlement could fire with one loser
+        // invisible: it was then classified as a loser and reaped
+        // with a 20 s bound measured from REAP start, but its 10 s
+        // F15 window only starts at ITS exec — exec 12 s after
+        // settlement + 10 s wait = exit at 22 s, past the bound,
+        // `None` exit code, round failed ("one loser slow to
+        // exit", the 6th-hit pattern). The predicate below adds
+        // (h) every child must be KNOWN: exec'd (non-empty
+        // cmdline) or exited (zombie). A pre-exec child is
+        // neither, so settlement waits for it; once all are
+        // known, every loser's F15 window has already started and
+        // the 20 s reap bound covers it with 10 s margin. The
+        // transient neither-state (a child exiting between the
+        // cmdline and stat reads) only delays settlement by one
+        // 100 ms sample — it self-heals on the next sample.
         let all_accounted = || {
             children
                 .iter()
                 .all(|c| std::path::Path::new(&format!("/proc/{}", c.id())).exists())
+        };
+        let all_known = || {
+            children.iter().all(|c| {
+                let pid = c.id();
+                let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                if !cmd.is_empty() {
+                    return true;
+                }
+                // Empty cmdline: exited (zombie) or still pre-exec —
+                // `/proc/<pid>/stat` state Z tells them apart.
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|s| {
+                        s.rsplit(')')
+                            .next()
+                            .map(|t| t.trim_start().starts_with('Z'))
+                    })
+                    .unwrap_or(false)
+            })
         };
         let (settled, timeline) = wait_until_sampled(
             Duration::from_secs(120),
             Duration::from_secs(5),
             || {
                 format!(
-                    "live={} ping={}",
+                    "live={} ping={} known={}",
                     live_daemon_pids(&needle).len(),
-                    ipc_ping(&data_dir)
+                    ipc_ping(&data_dir),
+                    children
+                        .iter()
+                        .filter(|c| {
+                            let pid = c.id();
+                            !std::fs::read(format!("/proc/{pid}/cmdline"))
+                                .unwrap_or_default()
+                                .is_empty()
+                        })
+                        .count(),
                 )
             },
-            || live_daemon_pids(&needle).len() == 1 && ipc_ping(&data_dir) && all_accounted(),
+            || {
+                live_daemon_pids(&needle).len() == 1
+                    && ipc_ping(&data_dir)
+                    && all_accounted()
+                    && all_known()
+            },
         );
         let live = live_daemon_pids(&needle);
         let ping_ok = ipc_ping(&data_dir);
@@ -1388,11 +1440,11 @@ fn gate_already_running_race_unix() -> (bool, String) {
 /// (`\\.\pipe\rsh-daemon`, not per data dir), so a foreign daemon
 /// already holding the mutex makes every child exit and the check
 /// fails "never settled" instead of passing against the wrong
-/// daemon — a clear signal, not a false pass. And no CI job runs
-/// the rig on Windows today (rig-gate is ubuntu-only), so this
-/// check is compile-verified for the Windows target but its
-/// execution proof is still outstanding: run the rig on a Windows
-/// runner (`cargo run -p rsh-rig`) to execute it.
+/// daemon — a clear signal, not a false pass. CORE-9 (v2.0.13
+/// polish): the `rig-gate-windows` CI job runs exactly this gate
+/// on windows-latest (`cargo run -p rsh-rig -- --gate --only
+/// gate-already-running-race`); before that job existed the check
+/// was compile-verified for the Windows target only, never executed.
 #[cfg(windows)]
 #[must_use]
 fn gate_already_running_race_windows() -> (bool, String) {

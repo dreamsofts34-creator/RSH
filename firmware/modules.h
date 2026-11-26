@@ -144,7 +144,7 @@ static inline uint8_t rsh_caps_default_table(RshCapsEntry *out, uint8_t maxEntri
       {PIN_BRAKE_ADC, RSH_KIND_ADC_NATIVE, RSH_MOD_BRAKE, RSH_CAP_INPUT | RSH_CAP_ADC, {0, 0, 0, 0}},
       {PIN_HANDBRAKE_ADC, RSH_KIND_ADC_NATIVE, RSH_MOD_HANDBRAKE,
        RSH_CAP_INPUT | RSH_CAP_ADC | RSH_CAP_PULLUP, {0, 0, 0, 0}},
-      {PIN_BATTERY_ADC, RSH_KIND_ADC_NATIVE, RSH_MOD_BATTERY, RSH_CAP_INPUT | RSH_CAP_ADC, {0, 0, 0, 0}},
+      // F-12: BATTERY row nahi (GPIO39 kabhi sample nahi hota) — 15 -> 14.
       {PIN_GEAR_UP, RSH_KIND_DIGITAL_IN, RSH_MOD_SHIFTER, RSH_CAP_INPUT | RSH_CAP_PULLUP, {0, 0, 0, 0}},
       {PIN_GEAR_DOWN, RSH_KIND_DIGITAL_IN, RSH_MOD_SHIFTER,
        RSH_CAP_INPUT | RSH_CAP_ADC | RSH_CAP_PULLUP, {0, 0, 0, 0}},
@@ -178,8 +178,8 @@ static inline uint8_t rsh_caps_pin_caps_(uint8_t pin, uint8_t isAnalog) {
 }
 
 // Board ki CURRENT pin table — pinmap (blob) se (Phase G, C3: "board ki
-// table hi jeet-ti hai"). Order default table jaisa hai: axes, battery,
-// shifter, horn, buttons, encoders, LED. Factory blob se bani table
+// table hi jeet-ti hai"). Order default table jaisa hai: axes, shifter,
+// horn, buttons, encoders, LED (F-12: battery row nahi). Factory blob se bani table
 // default table ke barabar hoti hai (host test § pinmap mein compare
 // hoti hai). Accel/brake BUTTON rows (25/26) hamesha shamil hain — wo
 // fixed pedal button-mode pins hain, blob mein nahi aate (pinmap.h).
@@ -232,9 +232,13 @@ static inline uint8_t rsh_caps_table_from_pinmap(const RshPinMap *map,
                  rsh_caps_pin_caps_(map->handbrake, 0));
   else
     RSH_CAPS_AXIS_ROW(map->handbrake, map->axisType[4], RSH_MOD_HANDBRAKE);
-  if (map->battery != RSH_PINMAP_ABSENT)
-    RSH_CAPS_ADD(map->battery, RSH_KIND_ADC_NATIVE, RSH_MOD_BATTERY,
-                 rsh_caps_pin_caps_(map->battery, 1));
+  // F-12 (polish round): BATTERY row HATA DI — GPIO39 kabhi sample
+  // nahi hota tha (status packet mein battery_pct=255 / supply_mv=0),
+  // is liye GET_CAPS mein is ka hona misleading tha (app battery
+  // capability dikha sakta tha jo board measure hi nahi karta). Jab
+  // GPIO39 sampling implement ho (divider ratio ke saath), row wapas
+  // aayegi. Pinmap slot (blob compatibility) waisa hi rehta hai.
+  (void)map;
   if (map->shifterMode == RSH_SHIFTER_HPATTERN) {
     for (int i = 0; i < 6; i++) {
       if (map->shiftH[i] != RSH_PINMAP_ABSENT)

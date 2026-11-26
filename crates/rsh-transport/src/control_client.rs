@@ -132,6 +132,13 @@ pub struct ControlClient<T: ControlTransport> {
     session: Session,
     timeout: Duration,
     max_attempts: u32,
+    /// PERF P2-8 (polish round): set once a command in this session
+    /// has timed out (or by the caller when it already knows the
+    /// link is dead, e.g. watchdog stale ≥ 250 ms) — later commands
+    /// then use a single attempt instead of 3 × 250 ms. Retries only
+    /// help on a live-but-lossy link; on a dead link they burn
+    /// 750 ms per command for nothing.
+    link_dead: bool,
 }
 
 impl<T: ControlTransport> ControlClient<T> {
@@ -143,6 +150,7 @@ impl<T: ControlTransport> ControlClient<T> {
             session,
             timeout: Duration::from_millis(RETRY_INTERVAL_MS),
             max_attempts: MAX_RETRIES,
+            link_dead: false,
         }
     }
 
@@ -196,6 +204,26 @@ impl<T: ControlTransport> ControlClient<T> {
     #[must_use]
     pub fn max_attempts(&self) -> u32 {
         self.max_attempts
+    }
+
+    /// Whether the link is known dead (a command in this session
+    /// already timed out, or the caller said so).
+    #[must_use]
+    pub fn link_dead(&self) -> bool {
+        self.link_dead
+    }
+
+    /// Mark the link dead (PERF P2-8): the caller knows from its own
+    /// freshness signal (e.g. the engine watchdog is stale) that the
+    /// board is not answering, so retries are skipped. Cleared by
+    /// [`Self::clear_link_dead`] when the link is proven live again.
+    pub fn set_link_dead(&mut self, dead: bool) {
+        self.link_dead = dead;
+    }
+
+    /// Clear the dead-link flag (a reply arrived — the link is live).
+    pub fn clear_link_dead(&mut self) {
+        self.link_dead = false;
     }
 
     /// Consume the client, returning the transport and the session.
@@ -436,18 +464,27 @@ impl<T: ControlTransport> ControlClient<T> {
         }
         .encode()
         .map_err(ControlError::Parse)?;
+        // PERF P2-8: on a known-dead link a single attempt is
+        // enough (250 ms, not 750 ms); on a live link the full
+        // retry budget still applies.
+        let attempts_budget = if self.link_dead { 1 } else { self.max_attempts };
         let mut attempts = 0u32;
-        while attempts < self.max_attempts {
+        while attempts < attempts_budget {
             attempts += 1;
             self.transport
                 .send_control(&bytes)
                 .await
                 .map_err(ControlError::Transport)?;
             if let Some(frame) = self.wait_for_reply(cmd, req_id).await? {
+                self.link_dead = false;
                 return Ok(frame);
             }
             // Attempt timed out: retry with the same reqId, same bytes.
         }
+        // The link is now known dead for the rest of this session:
+        // the next command fails fast instead of burning another
+        // 750 ms of retries on a board that is not answering.
+        self.link_dead = true;
         Err(ControlError::Timeout)
     }
 
@@ -608,6 +645,46 @@ mod tests {
                 None => Err(TransportError::Timeout),
             })
         }
+    }
+
+    /// PERF P2-8: after one command times out the link is known dead
+    /// and the next command uses a single attempt instead of the full
+    /// 3-attempt budget — a dead board must not cost 750 ms per
+    /// command. (`ScriptedTransport` answers every receive with a
+    /// timeout at once, so no real waiting is involved.)
+    #[tokio::test]
+    async fn dead_link_second_command_uses_one_attempt() {
+        let mut c = client(ScriptedTransport::new(vec![]));
+        assert!(!c.link_dead());
+        let r1 = c.execute(Opcode::GetCaps as u8, &[]).await;
+        assert!(matches!(r1, Err(ControlError::Timeout)));
+        assert!(c.link_dead(), "first timeout marks the link dead");
+        assert_eq!(
+            c.transport().sent.len(),
+            3,
+            "first command on an unknown link uses the full budget"
+        );
+        let r2 = c.execute(Opcode::GetCaps as u8, &[]).await;
+        assert!(matches!(r2, Err(ControlError::Timeout)));
+        assert_eq!(
+            c.transport().sent.len(),
+            4,
+            "second command on a dead link sends exactly once more"
+        );
+        assert!(c.link_dead());
+    }
+
+    /// PERF P2-8: a live reply clears the dead flag — the next command
+    /// gets the full retry budget again.
+    #[tokio::test]
+    async fn live_reply_clears_link_dead() {
+        let mut c = client(FakeBoard::new(ErrorCode::Ok, vec![]));
+        c.set_link_dead(true);
+        assert!(c.link_dead());
+        let r = c.execute(Opcode::GetCaps as u8, &[]).await;
+        assert!(r.is_ok());
+        assert!(!c.link_dead(), "live reply clears the dead flag");
+        assert_eq!(c.transport().sent.len(), 1);
     }
 
     /// A fake board: verifies CRCs, answers same-`reqId` retries from a

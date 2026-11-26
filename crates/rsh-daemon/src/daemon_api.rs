@@ -668,7 +668,17 @@ impl AppApi for DaemonApi {
             output_enabled: Some(applied_enabled),
             ..Default::default()
         };
-        if let Err(error) = self.state.set_settings_patch(patch) {
+        // CORE-P3-9 (polish round): one retry on persist failure —
+        // the disable path used to leave `output_enabled=true`
+        // persisted while memory said OFF, so the next launch
+        // re-enabled output from the stale setting.
+        let patch_result = self.state.set_settings_patch(patch).or_else(|_| {
+            self.state.set_settings_patch(AppSettingsPatch {
+                output_enabled: Some(applied_enabled),
+                ..Default::default()
+            })
+        });
+        if let Err(error) = patch_result {
             // R3-D-16: into the diagnostics log, not stderr — the
             // persisted setting is already noted there too, so the
             // failure is visible in the log file either way.
@@ -751,14 +761,12 @@ impl AppApi for DaemonApi {
     }
 
     fn set_autostart(&self, enabled: bool) -> Result<bool, UserError> {
-        let mut settings = self.state.settings();
-        settings.autostart = enabled;
-        let saved = self
-            .state
-            .set_settings(settings)
-            .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
-        // Sync the Windows Run key / Linux .desktop entry right away
-        // so the toggle takes effect without a daemon restart.
+        // CORE-P3-2 (polish round): sync the Run key FIRST, then
+        // persist — the old order persisted the flag and then failed
+        // the sync, leaving Settings showing ON with no autostart.
+        // A persist failure after a successful sync rolls the key
+        // back to the old value (best-effort).
+        let before = self.state.settings().autostart;
         let exe = std::env::current_exe().map_err(|detail| {
             UserError::from_connection(
                 ConnectionError::Unknown,
@@ -767,7 +775,15 @@ impl AppApi for DaemonApi {
         })?;
         crate::tray_autostart::sync_autostart(enabled, &exe)
             .map_err(|detail| UserError::from_connection(ConnectionError::Unknown, detail))?;
-        Ok(saved.autostart)
+        let mut settings = self.state.settings();
+        settings.autostart = enabled;
+        match self.state.set_settings(settings) {
+            Ok(saved) => Ok(saved.autostart),
+            Err(detail) => {
+                let _ = crate::tray_autostart::sync_autostart(before, &exe);
+                Err(UserError::from_connection(ConnectionError::Unknown, detail))
+            }
+        }
     }
 
     fn firmware_version(&self) -> String {

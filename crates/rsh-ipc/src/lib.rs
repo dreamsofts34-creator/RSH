@@ -285,13 +285,22 @@ pub fn dispatch(
         "connection" => Ok(serde_json::to_value(api.connection())
             .map_err(|e| IpcError::Protocol(e.to_string()))?),
         "connect" => {
+            // CORE-P3-6 (polish round): an unknown transport string
+            // used to silently mean Wi-Fi — a typo connected over
+            // the wrong transport and failed later as "wheel not
+            // found" instead of erroring at the call.
             let transport = match params
                 .get("transport")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("wifi")
             {
                 "usb" => ApiTransport::Usb,
-                _ => ApiTransport::Wifi,
+                "wifi" => ApiTransport::Wifi,
+                other => {
+                    return Err(IpcError::Api(format!(
+                        "Protocol|unknown transport '{other}' (want usb or wifi)"
+                    )));
+                }
             };
             api.connect(transport)
                 .map(|info| serde_json::to_value(info).unwrap_or(serde_json::Value::Null))
@@ -323,10 +332,7 @@ pub fn dispatch(
         }
         "output_enabled" => Ok(serde_json::json!({"enabled": api.output_enabled()})),
         "set_output_enabled" => {
-            let enabled = params
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let enabled = parse_bool_param(params, "enabled")?;
             api.set_output_enabled(enabled);
             Ok(serde_json::json!({"enabled": api.output_enabled()}))
         }
@@ -591,6 +597,17 @@ fn parse_binding_button(params: &serde_json::Value) -> Result<u8, IpcError> {
         })
 }
 
+/// Require a boolean param (CORE-P2-5, polish round): a missing
+/// or non-boolean param used to silently default to `false` — so a
+/// malformed `set_output_enabled` DISABLED output instead of
+/// erroring. Same stable `code|detail` shape as the other parsers.
+fn parse_bool_param(params: &serde_json::Value, name: &str) -> Result<bool, IpcError> {
+    params
+        .get(name)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| IpcError::Api(format!("Protocol|{name} must be a boolean")))
+}
+
 /// Map a [`UserError`](rsh_api::UserError) to an IPC error that
 /// keeps the reason: [`IpcError::Api`] otherwise carries only the
 /// code, so a failed call would reach the UI as a bare "Unknown"
@@ -718,30 +735,21 @@ fn dispatch_round3(
                 .get("module")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            let enabled = params
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let enabled = parse_bool_param(params, "enabled")?;
             api.set_module_enabled(module, enabled)
                 .map(|new_state| serde_json::json!({"enabled": new_state}))
                 .map_err(|error| detailed_api_error(&error))
         }
         "auto_pause" => Ok(serde_json::json!({"paused": api.auto_pause()})),
         "set_auto_pause" => {
-            let paused = params
-                .get("paused")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let paused = parse_bool_param(params, "paused")?;
             api.set_auto_pause(paused)
                 .map(|new_state| serde_json::json!({"paused": new_state}))
                 .map_err(|error| detailed_api_error(&error))
         }
         "close_to_tray" => Ok(serde_json::json!({"close_to_tray": api.close_to_tray()})),
         "set_close_to_tray" => {
-            let enabled = params
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let enabled = parse_bool_param(params, "enabled")?;
             api.set_close_to_tray(enabled)
                 .map(|new_state| serde_json::json!({"close_to_tray": new_state}))
                 .map_err(|error| detailed_api_error(&error))
@@ -844,10 +852,7 @@ fn dispatch_settings(
     match request.method.as_str() {
         "autostart" => Ok(serde_json::json!({"autostart": api.autostart()})),
         "set_autostart" => {
-            let enabled = params
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let enabled = parse_bool_param(params, "enabled")?;
             api.set_autostart(enabled)
                 .map(|new_state| serde_json::json!({"autostart": new_state}))
                 .map_err(|e| detailed_api_error(&e))

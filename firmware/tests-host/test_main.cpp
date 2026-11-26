@@ -166,7 +166,7 @@ static uint32_t rng() { rng_state = rng_state * 1664525u + 1013904223u; return r
 
 // FW-8 dispatcher test handler (ctrl.h, §19): GET_CAPS -> golden minimal
 // body (17 B, pinCount 0 — protocol_v2_vectors.py ctrl_get_caps_reply
-// payload se, fw 4.0.5 / proto 2.2); GET_CFG -> 200 B body
+// payload se, fw 4.0.6 / proto 2.2); GET_CFG -> 200 B body
 // (cache-overflow path); REBOOT -> reboot flag; baqi -> UNSUPPORTED
 // (execute nahi hota).
 struct test_ctrl_ctx_t {
@@ -237,6 +237,16 @@ static void fw34_test_password_cb(void *u, const uint8_t *pw, uint16_t len) {
   fw34_test_password_len = len;
   if (pw && len <= 64) memcpy(fw34_test_password, pw, len);
 }
+// F-07: SET_PASSWORD sync NVS fake — return value test se set hota hai.
+static uint8_t fw34_test_pw_sync_result = 1;
+static int fw34_test_pw_sync_calls = 0;
+static uint8_t fw34_test_pw_sync(void *u, const uint8_t *pw, uint16_t len) {
+  (void)u;
+  (void)pw;
+  (void)len;
+  fw34_test_pw_sync_calls++;
+  return fw34_test_pw_sync_result;
+}
 // SET_PASSWORD verify fake (D3): NULL = koi password stored nahi -> proceed;
 // warna current password stored se milna chahiye.
 static const char *fw34_test_stored_pw = NULL;
@@ -280,6 +290,14 @@ static int as5600_mock_read(uint8_t dev, uint8_t reg, uint8_t *buf,
   if (as5600_mock_fail) return -1;
   if (reg == RSH_AS5600_REG_STATUS && len == 1) {
     buf[0] = as5600_mock_status;
+    return 0;
+  }
+  // F-18: STATUS+RAWANGLE ek 3-byte transaction (0x0B-0x0D contiguous,
+  // device auto-increment karta hai) — mock bhi sequential read deta hai.
+  if (reg == RSH_AS5600_REG_STATUS && len == 3) {
+    buf[0] = as5600_mock_status;
+    buf[1] = (uint8_t)((as5600_mock_raw >> 8) & 0x0F);
+    buf[2] = (uint8_t)(as5600_mock_raw & 0xFF);
     return 0;
   }
   if (reg == RSH_AS5600_REG_RAWANGLE_H && len == 2) {
@@ -393,6 +411,21 @@ int main() {
     CHECK(f.update(true, 10) == true);
     CHECK(f.update(false, 50) == true);
     CHECK(f.update(false, 60) == false);
+    // F-10: 5 ms debounce (sensitivity 100) par 6 ms ka bounce pulse
+    // (2 samples pressed, phir released) state NAHI badalta — pehle
+    // agle hi sample par flip ho jata tha. Lamba press 10 ms par flip
+    // hota hai (minimum effective debounce 10 ms + 2 samples).
+    Debouncer g5;
+    g5.debounceMs = 5;
+    CHECK(g5.update(true, 0) == false);   // pending (sample 1)
+    CHECK(g5.update(true, 5) == false);   // sample 2 — 5 ms lekin < 10 ms min
+    CHECK(g5.update(false, 10) == false);  // pulse khatam — pending reset
+    CHECK(g5.state == false);
+    Debouncer h5;
+    h5.debounceMs = 5;
+    CHECK(h5.update(true, 0) == false);
+    CHECK(h5.update(true, 5) == false);
+    CHECK(h5.update(true, 10) == true);   // 10 ms + 3 samples — flip
   }
 
   // 6) Scheduler ka wrap-safe comparison (micros ~71.6 min par wrap hota hai)
@@ -533,6 +566,24 @@ int main() {
       uint16_t v = (uint16_t)(i * 41);
       inv = s.update(v, 4095, false, (uint32_t)(i * 5));
     }
+    // F-03: rail par 10 s lekin ±1 count wiggle (zinda pot, haath ka load)
+    // -> VALID (pehle invalid hota tha — full lock pakar kar rakhna bhi
+    // rail hi hai). Bilkul constant rail (spread 0) ab bhi invalid hai
+    // (upar wala test).
+    AxisHealth w;
+    inv = false;
+    for (int t = 0; t <= 10000; t += 5) {
+      uint16_t v = (t / 5 % 2 == 0) ? 4095 : 4094;
+      inv = w.update(v, 4095, true, (uint32_t)t);
+    }
+    CHECK(inv == false);
+    // F-03: I2C axis (railTest=false) constant rail par bhi valid — us
+    // ki values rail par EXACT clamp hoti hain; validity valid[] se aati hai.
+    AxisHealth x;
+    inv = false;
+    for (int t = 0; t <= 10000; t += 5)
+      inv = x.update(3300, 3300, true, (uint32_t)t, false);
+    CHECK(inv == false);
     CHECK(inv == false);
   }
 
@@ -737,9 +788,11 @@ int main() {
       0x00, 0x00, 0x00, 0x40, 0x00, 0x10, 0x00, 0xeb, 0x52, 0x52, 0x53, 0x48,
       0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
       0x00, 0x87, 0x9d};
+    // fw patch 4.0.6 (CRC16-CCITT-FALSE, LE: 0xb2a1 — patch byte badla
+    // to CRC bhi badla; protocol_v2_vectors.py ka ctrl_get_caps_reply bhi dekho).
     const uint8_t ctrl_reply[29] = {0x52, 0x53, 0x48, 0x43, 0x81, 0x01, 0x00, 0x12,
-      0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x05, 0x02,
-      0x02, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0xe5, 0x9f};
+      0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x04, 0x00, 0x06, 0x02,
+      0x02, 0x08, 0x40, 0x04, 0x06, 0x00, 0x00, 0xa1, 0xb2};
     rsh_v2_ctrl_t cf;
     CHECK(rsh_v2_ctrl_parse_structure(ctrl_caps, sizeof(ctrl_caps), &cf) == RSH_V2_OK);
     CHECK(cf.cmd == 0x01 && cf.req_id == 1 && cf.len == 0);
@@ -751,7 +804,7 @@ int main() {
     CHECK(rsh_v2_ctrl_parse_structure(ctrl_reply, sizeof(ctrl_reply), &cf) == RSH_V2_OK);
     CHECK(cf.cmd == 0x81 && cf.payload[0] == RSH_CTRL_OK && cf.len == 18);
     CHECK(cf.payload[13] == 64);  // nBtnMax (wire)
-    CHECK(cf.payload[9] == 5);    // fw patch 4.0.5
+    CHECK(cf.payload[9] == 6);    // fw patch 4.0.6
     CHECK(cf.payload[10] == 2 && cf.payload[11] == 2);  // proto 2.2
     // build roundtrip golden se match kare
     {
@@ -997,13 +1050,13 @@ int main() {
     // RSH_CAPS_FW_* hi net.cpp HELLO reply ka bhi source hai (single source
     // of truth) — 4.0.0 hard-code dobara na aaye, is liye constants + string
     // dono yahan bandhe hain.
-    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 5);
-    CHECK(strcmp(FIRMWARE_VERSION, "4.0.5") == 0);
+    CHECK(RSH_CAPS_FW_MAJOR == 4 && RSH_CAPS_FW_MINOR == 0 && RSH_CAPS_FW_PATCH == 6);
+    CHECK(strcmp(FIRMWARE_VERSION, "4.0.6") == 0);
 
     // --- FW-11: default pin table mein naye modules ki rows ---
     RshCapsEntry table[20];
     uint8_t ntab = rsh_caps_default_table(table, 20);
-    CHECK(ntab == 15);
+    CHECK(ntab == 14);  // F-12: battery row nahi
     int handbrakeRow = -1, hornRow = -1, ledRow = -1, shifterRows = 0, encRows = 0;
     uint8_t seenPins[40] = {0};
     for (int i = 0; i < ntab; i++) {
@@ -1039,7 +1092,7 @@ int main() {
       CHECK(blen == 18 + 8u * ntab);
       CHECK(body[0] == RSH_CTRL_OK);
       CHECK(memcmp(body + 1, mac, 6) == 0);
-      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 5);   // fw 4.0.5 (Round 2 W3 FIX-1)
+      CHECK(body[7] == 4 && body[8] == 0 && body[9] == 6);   // fw 4.0.5 (Round 2 W3 FIX-1)
       CHECK(body[10] == 2 && body[11] == 2);                 // proto 2.2
       CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
       CHECK(body[15] == 6 && body[16] == 0 && body[17] == ntab);
@@ -1292,7 +1345,10 @@ int main() {
     CHECK(c.total_boots == 1);
     CHECK(rsh_boot_decide_source(&c, 1) == RSH_BOOT_SRC_CURRENT);
     CHECK(rsh_boot_tick(&c, 0, 14000, 0) == RSH_BOOT_WAITING);  // 14 s: abhi wait
-    CHECK(rsh_boot_tick(&c, 1, 14000, 0) == RSH_BOOT_SUCCESS);  // AP waqt par up
+    // F-02: AP-up par SUCCESS nahi — 60 s stable uptime chahiye (14 s + 60 s).
+    CHECK(rsh_boot_tick(&c, 1, 14000, 0) == RSH_BOOT_WAITING);  // AP up, window shuru
+    CHECK(rsh_boot_tick(&c, 1, 73999, 0) == RSH_BOOT_WAITING);  // 59.999 s — abhi nahi
+    CHECK(rsh_boot_tick(&c, 1, 74000, 0) == RSH_BOOT_SUCCESS);  // 60 s stable
     CHECK(c.consecutive_failures == 0);
     CHECK(rsh_boot_tick(&c, 1, 20000, 0) == RSH_BOOT_WAITING);  // natija darj ho chuka
     // --- Boot fail: deadline (15 s) par ek dafa gin'a jata hai ---
@@ -1318,7 +1374,8 @@ int main() {
     rsh_boot_begin(&c);
     c.using_lkg = 1;
     CHECK(rsh_boot_decide_source(&c, 1) == RSH_BOOT_SRC_LAST_KNOWN_GOOD);
-    CHECK(rsh_boot_tick(&c, 1, 5000, 300000) == RSH_BOOT_SUCCESS);
+    CHECK(rsh_boot_tick(&c, 1, 5000, 300000) == RSH_BOOT_WAITING);  // F-02: AP up, stable nahi
+    CHECK(rsh_boot_tick(&c, 1, 65000, 300000) == RSH_BOOT_SUCCESS);  // 60 s stable
     CHECK(c.consecutive_failures == 0 && c.lkg_consecutive_failures == 0);
     // LKG se 3 fail -> factory (factory source par bhi fail gin'a jata hai)
     rsh_boot_counter_init(&c);
@@ -1725,6 +1782,35 @@ int main() {
                                 rsh_crc16_ccitt(newblob, c0), newblob, &sb, &tot)
             == RSH_CTRL_OK);
       CHECK(sb == nlen && t.state == RSH_TXN_STAGED);
+      // F-21: same-length NAYA blob (offset-0 chunk ke bytes mukhtalif)
+      // purana staged DISCARD karta hai — pehle sirf total check hota
+      // tha, is liye naya blob purane se merge ho jata tha.
+      {
+        uint8_t other[256];
+        memcpy(other, newblob, nlen);
+        rsh_put_u16(other + 6, 3);  // version 3 — pehle bytes mukhtalif
+        rsh_put_u32(other + nlen - 4, rsh_crc32(other, nlen - 4));
+        CHECK(rsh_cfg_stage_chunk(&t, 0, (uint16_t)nlen, c0,
+                                  rsh_crc16_ccitt(other, c0), other, &sb, &tot)
+              == RSH_CTRL_OK);
+        CHECK(sb == c0 && t.state == RSH_TXN_STAGING);  // dobara staging
+        CHECK(memcmp(t.staged, other, c0) == 0);
+        // Purana blob dobara stage karo taake baad wale checks wahi rahen.
+        CHECK(rsh_cfg_stage_chunk(&t, 0, (uint16_t)nlen, c0,
+                                  rsh_crc16_ccitt(newblob, c0), newblob, &sb, &tot)
+              == RSH_CTRL_OK);
+        CHECK(rsh_cfg_stage_chunk(&t, 93, (uint16_t)nlen, c3,
+                                  rsh_crc16_ccitt(newblob + 93, c3), newblob + 93, &sb, &tot)
+              == RSH_CTRL_OK);
+        CHECK(rsh_cfg_stage_chunk(&t, 62, (uint16_t)nlen, c2,
+                                  rsh_crc16_ccitt(newblob + 62, c2), newblob + 62, &sb, &tot)
+              == RSH_CTRL_OK);
+        CHECK(rsh_cfg_stage_chunk(&t, 31, (uint16_t)nlen, c1,
+                                  rsh_crc16_ccitt(newblob + 31, c1), newblob + 31, &sb, &tot)
+              == RSH_CTRL_OK);
+        CHECK(sb == nlen && t.state == RSH_TXN_STAGED);
+        CHECK(memcmp(t.staged, newblob, nlen) == 0);
+      }
       // Naya session (offset 0, alag total) purana staged discard karta hai
       uint8_t small[64];
       uint8_t srec[16];
@@ -1987,7 +2073,8 @@ int main() {
       rsh_boot_begin(&c);
       CHECK(rsh_boot_decide_source(&c, 1) == RSH_BOOT_SRC_LAST_KNOWN_GOOD);
       c.using_lkg = 1;
-      CHECK(rsh_boot_tick(&c, 1, 3000, 180000) == RSH_BOOT_SUCCESS);
+      CHECK(rsh_boot_tick(&c, 1, 3000, 180000) == RSH_BOOT_WAITING);  // F-02: AP up, stable nahi
+      CHECK(rsh_boot_tick(&c, 1, 63000, 180000) == RSH_BOOT_SUCCESS);  // 60 s stable
       CHECK(c.consecutive_failures == 0);
     }
   }
@@ -2026,7 +2113,36 @@ int main() {
     rsh_boot_counter_init(&t);
     rsh_boot_begin(&t);
     CHECK(rsh_boot_tick(&t, 0, 14000, 0) == RSH_BOOT_WAITING);
-    CHECK(rsh_boot_tick(&t, 1, 14000, 0) == RSH_BOOT_SUCCESS);
+    CHECK(rsh_boot_tick(&t, 1, 14000, 0) == RSH_BOOT_WAITING);  // F-02: AP up, stable nahi
+    CHECK(rsh_boot_tick(&t, 1, 74000, 0) == RSH_BOOT_SUCCESS);  // 60 s stable
+    // F-02: AP flap (up -> down -> up) deadline fail nahi karta — sirf
+    // stable window faisla karti hai (pehli AP-up se 60 s).
+    rsh_boot_counter_t f;
+    rsh_boot_counter_init(&f);
+    rsh_boot_begin(&f);
+    CHECK(rsh_boot_tick(&f, 1, 10000, 0) == RSH_BOOT_WAITING);
+    CHECK(rsh_boot_tick(&f, 0, 30000, 0) == RSH_BOOT_WAITING);  // AP gira, deadline guzri — fail nahi
+    CHECK(rsh_boot_tick(&f, 1, 40000, 0) == RSH_BOOT_WAITING);
+    CHECK(rsh_boot_tick(&f, 1, 69999, 0) == RSH_BOOT_WAITING);
+    CHECK(rsh_boot_tick(&f, 1, 70000, 0) == RSH_BOOT_SUCCESS);  // pehli AP-up (10 s) + 60 s
+    // F-02: crash record — pichle boot ki failure, is boot ka natija alag.
+    rsh_boot_counter_t g;
+    rsh_boot_counter_init(&g);
+    rsh_boot_begin(&g);
+    rsh_boot_record_crash(&g);
+    CHECK(g.consecutive_failures == 1);
+    rsh_boot_record_crash(&g);  // dobara — ek dafa hi gin'a jata hai
+    CHECK(g.consecutive_failures == 1);
+    CHECK(rsh_boot_tick(&g, 1, 0, 0) == RSH_BOOT_WAITING);  // is boot ka natija abhi bhi khula hai
+    CHECK(rsh_boot_tick(&g, 1, 60000, 0) == RSH_BOOT_SUCCESS);
+    CHECK(g.consecutive_failures == 0);  // kamyab boot counter saaf karta hai
+    // LKG source par crash LKG counter mein jata hai.
+    rsh_boot_counter_t h;
+    rsh_boot_counter_init(&h);
+    rsh_boot_begin(&h);
+    h.using_lkg = 1;
+    rsh_boot_record_crash(&h);
+    CHECK(h.lkg_consecutive_failures == 1 && h.consecutive_failures == 0);
     rsh_boot_begin(&t);
     CHECK(rsh_boot_tick(&t, 0, 15000, 0) == RSH_BOOT_FAILED);
     CHECK(rsh_boot_tick(&t, 0, 20000, 0) == RSH_BOOT_WAITING);  // darj ho chuka
@@ -2261,29 +2377,29 @@ int main() {
 
   // 16) Modules (FW-11, modules.h): GET_CAPS table/body, on/off, H-pattern.
   {
-    RshCapsEntry table[15];
-    CHECK(rsh_caps_default_table(NULL, 15) == 0);
-    CHECK(rsh_caps_default_table(table, 14) == 0);  // chhota buffer
-    CHECK(rsh_caps_default_table(table, 15) == 15);
+    RshCapsEntry table[14];  // F-12: battery row nahi — 15 -> 14
+    CHECK(rsh_caps_default_table(NULL, 14) == 0);
+    CHECK(rsh_caps_default_table(table, 13) == 0);  // chhota buffer
+    CHECK(rsh_caps_default_table(table, 14) == 14);
     CHECK(table[0].pin == PIN_STEER && table[0].module == RSH_MOD_STEERING);
     CHECK(table[3].pin == PIN_HANDBRAKE_ADC && table[3].module == RSH_MOD_HANDBRAKE);
-    CHECK(table[7].pin == PIN_HORN_BTN && table[7].module == RSH_MOD_HORN);
-    CHECK(table[14].pin == PIN_LED_STRIP && table[14].kind == RSH_KIND_LED_STRIP);
+    CHECK(table[6].pin == PIN_HORN_BTN && table[6].module == RSH_MOD_HORN);
+    CHECK(table[13].pin == PIN_LED_STRIP && table[13].kind == RSH_KIND_LED_STRIP);
     // caps bits 5-7 hamesha 0 (§3.4).
     RshCapsEntry e = rsh_caps_entry(4, RSH_KIND_DIGITAL_IN, RSH_MOD_HORN, 0xFF);
     CHECK(e.caps == 0x1F);
     CHECK(e.reserved[0] == 0 && e.reserved[3] == 0);
-    // GET_CAPS body: 18 + 8*15 = 138 B.
+    // GET_CAPS body: 18 + 8*14 = 130 B (F-12: battery row nahi).
     uint8_t mac[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
     uint8_t body[256];
-    CHECK(rsh_caps_build_body(NULL, sizeof(body), mac, 6, 0, table, 15) == 0);
-    CHECK(rsh_caps_build_body(body, 100, mac, 6, 0, table, 15) == 0);
+    CHECK(rsh_caps_build_body(NULL, sizeof(body), mac, 6, 0, table, 14) == 0);
+    CHECK(rsh_caps_build_body(body, 100, mac, 6, 0, table, 14) == 0);
     CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 41) == 0);
-    CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 15) == 138);
-    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 5);  // fw 4.0.5 (Round 2 W3 FIX-1)
+    CHECK(rsh_caps_build_body(body, sizeof(body), mac, 6, 0, table, 14) == 130);
+    CHECK(body[0] == RSH_CTRL_OK && body[7] == 4 && body[8] == 0 && body[9] == 6);  // fw 4.0.6 (Round 2 W3 FIX-1)
     CHECK(body[10] == 2 && body[11] == 2);  // proto 2.2
     CHECK(body[12] == 8 && body[13] == 64 && body[14] == 4);
-    CHECK(body[15] == 6 && body[17] == 15);
+    CHECK(body[15] == 6 && body[17] == 14);
     CHECK(body[18 + 3 * 8] == PIN_HANDBRAKE_ADC);
     // On/off (F7): band module ka axis/button bit clear hota hai.
     // Phase F WS5: handbrake slot 4 hai (mask 0x17), clutch slot 3 off hai.
@@ -3355,6 +3471,31 @@ int main() {
     CHECK(disp2(badcrc2, fl22) == RSH_CTRL_DISP_DROP && rlen2 == 0);
     CHECK(hctx2.calls == calls_before2);
     CHECK(fw34_test_password_calls == 3);
+    // F-07: sync NVS write — fail ho to NVS_FAIL (8), OK nahi; deferred
+    // change callback bhi nahi bulaya jata. Kamyabi par OK + deferred
+    // restart path (change callback) chalta hai.
+    hctx2.password_set_sync = fw34_test_pw_sync;
+    fw34_test_pw_sync_result = 0;
+    fw34_test_pw_sync_calls = 0;
+    uint32_t ch_before = (uint32_t)fw34_test_password_calls;
+    pln2 = pw_pl(NULL, 0, good_pw, 12, pl2);
+    fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
+    CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
+    CHECK(rf2.payload[0] == RSH_CTRL_NVS_FAIL);
+    CHECK(fw34_test_pw_sync_calls == 1);
+    CHECK(fw34_test_password_calls == (int)ch_before);  // restart path nahi chala
+    fw34_test_pw_sync_result = 1;
+    fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
+    CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
+    CHECK(rf2.payload[0] == RSH_CTRL_OK);
+    CHECK(fw34_test_pw_sync_calls == 2);
+    CHECK(fw34_test_password_calls == (int)ch_before + 1);  // AP restart scheduled
+    // Sync callback NULL ho to purana deferred rasta (NVS write baad mein).
+    hctx2.password_set_sync = NULL;
+    fl22 = build2(RSH_CMD_SET_PASSWORD, pl2, pln2, frame2);
+    CHECK(disp2(frame2, fl22) == RSH_CTRL_DISP_REPLY && verified2());
+    CHECK(rf2.payload[0] == RSH_CTRL_OK);
+    CHECK(fw34_test_pw_sync_calls == 2);
   }
 
   // 23) v2.2 stream emission (Phase E WS5, PROTOCOL-V2.2.md §1.1):
@@ -3762,6 +3903,16 @@ int main() {
     rsh_fw34_handler_ctx_init(&nctx, NULL);
     CHECK(rsh_fw34_handler(RSH_CMD_FACTORY_RESET, NULL, 0, reply, &reply_len,
                            &nctx) == RSH_CTRL_UNSUPPORTED);
+    // F-17: safe mode mein FACTORY_RESET BUSY hai — safe mode ka matlab
+    // hai "config apply nahi hoti", aur factory reset config replace +
+    // apply karta hai. Safe mode se nikalne ka rasta reboot hai.
+    rsh_cfg_set_safe_mode(&txn, 1);
+    CHECK(rsh_fw34_handler(RSH_CMD_FACTORY_RESET, NULL, 0, reply, &reply_len,
+                           &fctx) == RSH_CTRL_BUSY);
+    CHECK(memcmp(txn.current, factory, flen) == 0);  // kuch nahi badla
+    rsh_cfg_set_safe_mode(&txn, 0);
+    CHECK(rsh_fw34_handler(RSH_CMD_FACTORY_RESET, NULL, 0, reply, &reply_len,
+                           &fctx) == RSH_CTRL_OK);
   }
 
   // 25a) Phase G C3 — pin map board-apply (pinmap.h): blob -> live table,
@@ -3912,11 +4063,12 @@ int main() {
     CHECK(rsh_modules_encoders_enabled() == 0);  // H-pattern mein encoders nahi
 
     // --- GET_CAPS table factory blob se == default table (entry by entry) ---
-    RshCapsEntry defTable[15];
+    // F-12: BATTERY row hata di (GPIO39 kabhi sample nahi hota) — 15 -> 14.
+    RshCapsEntry defTable[14];
     RshCapsEntry blobTable[40];
-    CHECK(rsh_caps_default_table(defTable, 15) == 15);
-    CHECK(rsh_caps_table_from_pinmap(&fm, blobTable, 40) == 15);
-    for (int i = 0; i < 15; i++) {
+    CHECK(rsh_caps_default_table(defTable, 14) == 14);
+    CHECK(rsh_caps_table_from_pinmap(&fm, blobTable, 40) == 14);
+    for (int i = 0; i < 14; i++) {
       CHECK(blobTable[i].pin == defTable[i].pin);
       CHECK(blobTable[i].kind == defTable[i].kind);
       CHECK(blobTable[i].module == defTable[i].module);
@@ -3935,11 +4087,15 @@ int main() {
     clen = rsh_cfg_blob_build(blob, recs, 7, 1);
     CHECK(rsh_pinmap_from_blob(blob, clen, &cm2) == 1);
     uint8_t ntab = rsh_caps_table_from_pinmap(&cm2, blobTable, 40);
-    CHECK(ntab == 10);  // steer/accel/brake/clutch/battery/gearUp + 2 fixed btn + enc1A/B
+    CHECK(ntab == 9);  // F-12: battery row nahi — steer/accel/brake/clutch/gearUp + 2 fixed btn + enc1A/B
     CHECK(blobTable[0].pin == 32 && blobTable[0].module == RSH_MOD_STEERING);
     CHECK(blobTable[3].pin == 33 && blobTable[3].module == RSH_MOD_CLUTCH);
-    CHECK(blobTable[4].pin == 39 && blobTable[4].module == RSH_MOD_BATTERY);
-    CHECK(blobTable[5].pin == 27 && blobTable[5].module == RSH_MOD_SHIFTER);
+    CHECK(blobTable[4].pin == 27 && blobTable[4].module == RSH_MOD_SHIFTER);
+    // Battery record blob mein hai lekin GET_CAPS table mein nahi (F-12).
+    bool hasBattery = false;
+    for (int i = 0; i < ntab; i++)
+      if (blobTable[i].module == RSH_MOD_BATTERY) hasBattery = true;
+    CHECK(!hasBattery);
     bool hasHorn = false, hasLed = false, hasEnc2 = false;
     for (int i = 0; i < ntab; i++) {
       if (blobTable[i].module == RSH_MOD_HORN) hasHorn = true;
@@ -4659,7 +4815,7 @@ int main() {
     CHECK(dec.frames_ok == 1);
   }
 
-  // ============ §34: firmware v4.0.5 (F-01..F-16, v2.2) ============
+  // ============ §34: firmware v4.0.6 (F-01..F-16, v2.2) ============
   // Net.cpp / rsh.ino wiring (AP open/password, serial HELO, horn OR)
   // host par nahi chalti — wo pio build + real-board HIL se cover hoti
   // hai (gate doc). Yahan pure logic hai. Pairing khatam (D1/D7):
@@ -5082,8 +5238,8 @@ int main() {
 
     // --- F-12: version single source (version.h + modules.h + config.h) ---
     CHECK(RSH_FW_VERSION_MAJOR == 4 && RSH_FW_VERSION_MINOR == 0 &&
-          RSH_FW_VERSION_PATCH == 5);
-    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.5") == 0);
+          RSH_FW_VERSION_PATCH == 6);
+    CHECK(strcmp(RSH_FW_VERSION_STRING, "4.0.6") == 0);
     CHECK(strcmp(FIRMWARE_VERSION, RSH_FW_VERSION_STRING) == 0);
     CHECK(RSH_CAPS_FW_MAJOR == RSH_FW_VERSION_MAJOR &&
           RSH_CAPS_FW_MINOR == RSH_FW_VERSION_MINOR &&

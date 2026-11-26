@@ -138,7 +138,23 @@ static void fw34_boot_setup() {
   bootCounter.total_boots = bootPref.getUInt("total", 0);
   bootCounter.consecutive_failures = bootPref.getUInt("fails", 0);
   bootCounter.lkg_consecutive_failures = bootPref.getUInt("lkgFails", 0);
+  // F-02: pichle boot ka source (persisted "lkg") — crash record ko pata
+  // chale ke pichla boot kis source par tha (current/LKG), taake failure
+  // sahi counter mein jaye. decide_source() neeche is boot ka source set
+  // karke dobara persist karta hai.
+  bootCounter.using_lkg = bootPref.getUChar("lkg", 0);
   rsh_boot_begin(&bootCounter);
+  // F-02: PANIC / TASK_WDT / INT_WDT / WDT reset = pichle boot ki failure
+  // (post-AP-up panic loop bhi accumulate ho — pehle har AP-up SUCCESS
+  // counter zero kar deta tha). Power-on / brown-out / software reboot
+  // is mein nahi aate (wo crash nahi hain).
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    if (rr == ESP_RST_PANIC || rr == ESP_RST_TASK_WDT ||
+        rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT) {
+      rsh_boot_record_crash(&bootCounter);
+    }
+  }
   bootPref.putUInt("total", bootCounter.total_boots);
   bootPref.putUInt("fails", bootCounter.consecutive_failures);
   bootPref.putUInt("lkgFails", bootCounter.lkg_consecutive_failures);
@@ -179,6 +195,14 @@ static void fw34_boot_setup() {
                  ? lkglen : 0;
   rsh_boot_src_t src = rsh_boot_decide_source(&bootCounter, fw34_lkg_len > 0 ? 1 : 0);
   bootCounter.using_lkg = (src == RSH_BOOT_SRC_LAST_KNOWN_GOOD) ? 1 : 0;
+  // F-02: is boot ka source agle boot ke crash record ke liye persist karo.
+  {
+    Preferences bootPref2;
+    if (bootPref2.begin("rsh-boot", false)) {
+      bootPref2.putUChar("lkg", bootCounter.using_lkg);
+      bootPref2.end();
+    }
+  }
   uint8_t loaded = 0;
   uint16_t blen = fw34_slot_load(cfgPref, "cur", fw34_scratch);
   if (src == RSH_BOOT_SRC_CURRENT && blen > 0)
@@ -255,6 +279,25 @@ static void fw34_loop_tick(uint32_t nowMs) {
   if (ev == RSH_HOLD_SAFE_MODE) {
     rsh_safe_mode_enter(&safeMode, nowMs);
     rsh_cfg_set_safe_mode(&cfgTxn, 1);
+    // F-06 (polish round): safe mode FACTORY pin map lagata hai — pehle
+    // sirf future config changes block hote thay, live map wahi rehta
+    // tha (bad pin assignment se recovery ka waada poora nahi hota tha).
+    // Factory blob sirf RAM mein cfgTxn.current mein aata hai (persist
+    // NAHI hota — reboot par user ki config wapas aati hai) aur
+    // cfg_dirty apply (modules + inputs + LED) isay live karta hai.
+    // Safe-mode gate stage/commit ko rokta rehta hai, is liye apply ke
+    // baad bhi koi config change nahi ho sakta.
+    {
+      uint16_t flen = (uint16_t)rsh_cfg_factory_blob(fw34_scratch);
+      if (flen > 0 && flen <= sizeof(cfgTxn.current)) {
+        memcpy(cfgTxn.current, fw34_scratch, flen);
+        cfgTxn.current_len = flen;
+        // cfg_version blob header (offset 6) se — warna status packet
+        // factory blob ka CRC purani version ke saath bhejta.
+        cfgTxn.cfg_version = rsh_get_u16(fw34_scratch + 6);
+        cfgTxn.cfg_dirty = 1;
+      }
+    }
     led_set(LedState::SafeMode);
   } else if (ev == RSH_HOLD_KEY_RESET_CLEAR) {
     // D7: BOOT >= 10 s hold — password seedha mitao + reboot -> open AP.
@@ -489,8 +532,19 @@ static uint8_t sample_once_(RshSampleMailbox *frame, uint32_t nowMs,
   if (emitKind == RSH_EMIT_V1 || serialEmitKind == RSH_EMIT_V1) {
     uint8_t flags = inputs_steering_is_mv() ? RSH_FLAG_STEER_MV : 0;
     if (inputs_axis_invalid()) flags |= RSH_FLAG_AXIS_INVALID;  // F2
-    rsh_build_packet(frame->v1pkt, seq, tsUs, s.steering, s.accelAnalog,
-                     s.brakeAnalog, s.buttons, flags);
+    // F-05 (polish round): v1 packet mein accel/brake RAW counts hote
+    // hain (sirf steering ka RSH_FLAG_STEER_MV flag hai). I2C axis ki
+    // value pehle se mV mein hai — use raw mein wapas convert karo
+    // (mV * 4095 / 3300), warna v1 peer dobara convert karke 1650 mV ko
+    // 1330 mV parhta hai (v2.0.11 wala bug, v1 path par abhi bhi live tha).
+    // Steering mV flag se cover hai (v1 peer flag dekh kar mV samajhta hai).
+    uint16_t v1Accel = s.accelAnalog, v1Brake = s.brakeAnalog;
+    if (inputs_axis_is_mv(RSH_PINMAP_AXIS_ACCEL))
+      v1Accel = (uint16_t)(((uint32_t)s.accelAnalog * 4095u) / 3300u);
+    if (inputs_axis_is_mv(RSH_PINMAP_AXIS_BRAKE))
+      v1Brake = (uint16_t)(((uint32_t)s.brakeAnalog * 4095u) / 3300u);
+    rsh_build_packet(frame->v1pkt, seq, tsUs, s.steering, v1Accel,
+                     v1Brake, s.buttons, flags);
     frame->v1len = RSH_PACKET_SIZE;
   }
   frame->seq = seq;
@@ -760,7 +814,16 @@ void loop() {
     // F-06 task mode: sampling task karta hai; yahan sirf mailbox drain
     // + send (WiFiUDP loop task mein hi — thread-safe nahi).
     RshSampleMailbox frame;
-    if (rsh_sample_mailbox_consume(&sampleMailbox, &frame)) {
+    // PERF P2-5 (v2.0.13 polish): mailbox frame har 5 ms aata hai —
+    // frame na mile to delay(4) (~200 iter/s, net/LED phir bhi
+    // 200 Hz); frame mile to delay(1) (packet processing ke doran
+    // 1 ms spin). Pehle har iteration delay(1) thi (~1000 iter/s,
+    // idle core-0 ~3-10% busy). Net control timeouts 250 ms hain,
+    // is liye 4 ms service latency kuch nahi bigaadti; sampling
+    // task core 1 par hai, is liye delay use rokta nahi.
+    // HW-VERIFY: maxCycleUs / overruns board par pehle/baad.
+    bool frameConsumed = rsh_sample_mailbox_consume(&sampleMailbox, &frame);
+    if (frameConsumed) {
       // Overwrite hue frames seqGap mein (D5 tick-skipped flag).
       seqGap = (uint16_t)(seqGap + frame.skipped);
       sample_send_frame_(&frame);
@@ -771,8 +834,8 @@ void loop() {
     if (net_serial_pc_active(nowMs)) active = true;
 #endif
     led_set_for_link_(active, nowMs);
-    // Task mode mein loop jaldi spin kare — delay(1) se CPU yield.
-    delay(1);
+    // Task mode mein loop jaldi spin kare — delay se CPU yield.
+    delay(frameConsumed ? 1 : 4);
   } else {
 #endif
   // Wrap-safe scheduler: micros() ~71.6 min mein wrap hota hai,
@@ -837,6 +900,13 @@ void loop() {
     // 16 bits — wrap-aware counter hai (layout change nahi, protocol
     // bump nahi); PC sirf deltas parhe (PROTOCOL-V2.2.md §1.4).
     st.max_cycle_us = maxCycleUs > 0xFFFF ? 0xFFFF : (uint16_t)maxCycleUs;
+    // F-20 (polish round): windowed max — har status window (1 s) ke
+    // baad reset karo, taake status packet hamesha aakhri 1 s ka max
+    // bataye, lifetime max nahi (pehle ek early spike hamesha ke liye
+    // max ko inflate kar deta tha). Sample task maxCycleUs likhta rehta
+    // hai (volatile u32 — reset ke saath race mein zyada se zyada ek
+    // cycle ka max kho jata hai, koi torn read nahi).
+    maxCycleUs = 0;
     st.governor = inputs_governor().level;
     st.reset_reason = rsh_reset_reason_code();  // FIX-4: asal wajah (pehle hamesha 1)
     st.cfg_crc = rsh_crc32(cfgTxn.current, cfgTxn.current_len);  // Phase G (C3):

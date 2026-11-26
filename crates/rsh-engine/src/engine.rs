@@ -172,6 +172,11 @@ const PING_REPLY_CHANNEL_CAPACITY: usize = 8;
 /// deferred, never dropped — so the cap cannot reintroduce
 /// coalescing, it only bounds drain latency.
 const MAX_FRAMES_PER_TICK: usize = 32;
+/// Maximum age of a `btnsEx` value without a status-packet refresh
+/// (HID P2-3): the extended packet arrives at ~1 Hz, so 2 s without
+/// one means the source is gone — the value must age out instead of
+/// holding a stale press forever.
+const BTNS_EX_MAX_AGE: Duration = Duration::from_secs(2);
 /// Max status packets drained per tick (L-1: 2× the 16-slot channel
 /// capacity — a racing producer cannot make one tick drain
 /// unboundedly).
@@ -407,6 +412,12 @@ pub struct WheelEngine<S: PacketSource> {
     /// Latest `btnsEx` (buttons 32–63) from a status packet, merged
     /// into every processed output.
     last_btns_ex: u32,
+    /// When `last_btns_ex` was last refreshed by a status packet
+    /// (HID P2-3, polish round): the firmware never emits the
+    /// extended status packet today, so without ageing the engine
+    /// would hold a stale value indefinitely. Older than
+    /// [`BTNS_EX_MAX_AGE`] it reads as 0.
+    last_btns_ex_at: Option<Instant>,
     /// `timestamp_us` of the last processed frame, for the
     /// inter-arrival jitter metric.
     last_frame_ts: Option<u32>,
@@ -436,6 +447,9 @@ pub struct WheelEngine<S: PacketSource> {
     stop_tx: watch::Sender<bool>,
     /// Receiver side of the stop `watch` channel.
     stop_rx: watch::Receiver<bool>,
+    /// Reused per-tick drain buffer (PERF P2-1): `drain_source`
+    /// fills this instead of allocating a fresh `Vec` per tick.
+    tick_frames: Vec<StreamFrame>,
     /// Receiver for live pipeline plans (L4 pipeline push), [`None`]
     /// when no plan sender is attached. A `watch` channel carries
     /// only the latest plan, so a slider drag that sends ten plans
@@ -468,6 +482,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
             counters: EngineCounters::default(),
             last_output: OutputState::neutral(),
             last_btns_ex: 0,
+            last_btns_ex_at: None,
             last_frame_ts: None,
             last_status_uptime_ms: None,
             status_uptime_reset: false,
@@ -481,6 +496,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
             stop_tx,
             stop_rx,
             plan_rx: None,
+            tick_frames: Vec::new(),
         }
     }
 
@@ -676,16 +692,21 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
         self.drain_ping_replies(now);
         self.maybe_send_ping(now);
         self.maybe_reconnect(now).await;
-        let frames = self.drain_source().await;
-        let had_frame = !frames.is_empty();
+        let n_frames = self.drain_source().await;
+        let had_frame = n_frames > 0;
         let started = Instant::now();
         let mut out = if self.watchdog.is_stale(now) {
             OutputState::neutral()
         } else {
             self.last_output
         };
-        for frame in &frames {
-            out = self.handle_frame(frame, now);
+        // The frames are cloned out of the reused buffer one at a
+        // time (`StreamFrame` is inline data — the clone is a
+        // memcpy, no heap allocation) so `handle_frame` can take
+        // `&mut self` while the buffer stays owned by the engine.
+        for i in 0..n_frames {
+            let frame = self.tick_frames[i].clone();
+            out = self.handle_frame(&frame, now);
         }
         let out = if self.watchdog.is_stale(now) {
             OutputState::neutral()
@@ -739,6 +760,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
             );
             if let Some(btns_ex) = status.btns_ex {
                 self.last_btns_ex = btns_ex;
+                self.last_btns_ex_at = Some(Instant::now());
             }
         }
     }
@@ -830,10 +852,16 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
     /// a reconnect. Frames already collected are still returned when
     /// the source drops mid-drain, and frames past the cap stay
     /// queued for the next tick — deferred, never dropped.
-    async fn drain_source(&mut self) -> Vec<StreamFrame> {
-        let mut frames = Vec::new();
+    /// Drain the source into the engine's reused tick buffer
+    /// (PERF P2-1, polish round): the old code heap-allocated a
+    /// `Vec` on every 5 ms tick for the common 1-frame case. The
+    /// buffer lives on the engine and is cleared per tick, so the
+    /// tick path allocates 0 B. Returns the number of frames
+    /// drained; frames are read from [`Self::tick_frames`].
+    async fn drain_source(&mut self) -> usize {
+        self.tick_frames.clear();
         let mut dropped = false;
-        while frames.len() < MAX_FRAMES_PER_TICK {
+        while self.tick_frames.len() < MAX_FRAMES_PER_TICK {
             let polled = {
                 let Some(source) = self.source.as_mut() else {
                     break;
@@ -841,7 +869,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
                 timeout(Duration::ZERO, source.next_frame()).await
             };
             match polled {
-                Ok(Some(frame)) => frames.push(frame),
+                Ok(Some(frame)) => self.tick_frames.push(frame),
                 Ok(None) => {
                     dropped = true;
                     break;
@@ -854,7 +882,7 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
             self.source = None;
             self.next_reconnect_at = Some(Instant::now() + RECONNECT_INTERVAL);
         }
-        frames
+        self.tick_frames.len()
     }
 
     /// Handle one drained frame: watchdog tick, jitter sample, the
@@ -902,7 +930,14 @@ impl<S: PacketSource + 'static> WheelEngine<S> {
             SeqDecision::Duplicate => unreachable!("duplicates returned above"),
         };
         let mut out = self.pipeline.process_with_gap(frame, skipped);
-        out.buttons_ex = self.last_btns_ex;
+        // HID P2-3 (polish round): age the extended buttons out —
+        // a `btnsEx` older than `BTNS_EX_MAX_AGE` with no status
+        // refresh is stale (the firmware never emits it today) and
+        // must not hold a press indefinitely.
+        let btns_ex_fresh = self
+            .last_btns_ex_at
+            .is_some_and(|at| at.elapsed() <= BTNS_EX_MAX_AGE);
+        out.buttons_ex = if btns_ex_fresh { self.last_btns_ex } else { 0 };
         self.counters.frames_processed += 1;
         self.counters.encoder_glitch_dropped = self.pipeline.encoder_glitch_dropped();
         self.last_output = out;
@@ -1326,12 +1361,12 @@ mod tests {
                 .expect("source channel open");
         }
         let first = engine.drain_source().await;
-        assert_eq!(first.len(), MAX_FRAMES_PER_TICK);
-        assert_eq!(first.first().map(|f| f.seq), Some(0));
-        assert_eq!(first.last().map(|f| f.seq), Some(cap_u16 - 1));
+        assert_eq!(first, MAX_FRAMES_PER_TICK);
+        assert_eq!(engine.tick_frames.first().map(|f| f.seq), Some(0));
+        assert_eq!(engine.tick_frames.last().map(|f| f.seq), Some(cap_u16 - 1));
         let rest = engine.drain_source().await;
-        assert_eq!(rest.len(), 8);
-        assert_eq!(rest.first().map(|f| f.seq), Some(cap_u16));
+        assert_eq!(rest, 8);
+        assert_eq!(engine.tick_frames.first().map(|f| f.seq), Some(cap_u16));
     }
 
     #[test]

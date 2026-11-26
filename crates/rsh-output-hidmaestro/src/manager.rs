@@ -317,6 +317,35 @@ pub struct SidecarManager {
     sdk_version: Option<String>,
 }
 
+/// True when the sidecar process behind `process` is known to have
+/// exited (PERF P2-7). Windows: exit code present and not
+/// `STILL_ACTIVE` (259). Everywhere else: no process handle is kept,
+/// so this is always false.
+fn sidecar_exited(process: Option<usize>) -> bool {
+    #[cfg(windows)]
+    {
+        let Some(process) = process else {
+            return false;
+        };
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::GetExitCodeProcess;
+        let handle = HANDLE(process as *mut std::ffi::c_void);
+        let mut code = 0u32;
+        // SAFETY: `handle` is the live `SEE_MASK_NOCLOSEPROCESS`
+        // handle stored at spawn; `kill_transport` closes it exactly
+        // once, after reads like this one.
+        let Ok(()) = (unsafe { GetExitCodeProcess(handle, &raw mut code) }) else {
+            return false;
+        };
+        code != 259
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = process;
+        false
+    }
+}
+
 impl SidecarManager {
     /// Create a manager. Nothing is spawned yet — call
     /// [`connect`](Self::connect).
@@ -453,6 +482,12 @@ impl SidecarManager {
         if self.fallback_needed {
             return Err(HidMaestroError::FallbackNeeded);
         }
+        // HID P3-4 (polish round): a liveness-detected death and
+        // its in-call respawn used to count as TWO failures, so one
+        // sidecar death + one unlucky respawn latched the fallback
+        // permanently — harsher than the documented per-failure
+        // budget. They count as one failure per `connect()` call.
+        let mut liveness_failure_counted = false;
         if self.transport.is_some() {
             // M8: a transport that exists is not proof the sidecar is
             // alive — drain the event channel without blocking. A
@@ -464,11 +499,12 @@ impl SidecarManager {
                 Err(err) => {
                     self.kill_transport();
                     self.note_failure();
+                    liveness_failure_counted = true;
                     if self.fallback_needed {
                         return Err(HidMaestroError::FallbackNeeded);
                     }
                     // Fall through to spawn_and_hello for the retry;
-                    // its own failure path counts the second failure.
+                    // its failure does NOT count again (see below).
                     let _ = err;
                 }
             }
@@ -487,7 +523,9 @@ impl SidecarManager {
             }
             Err(err) => {
                 self.kill_transport();
-                self.note_failure();
+                if !liveness_failure_counted {
+                    self.note_failure();
+                }
                 Err(err)
             }
         }
@@ -910,12 +948,51 @@ impl SidecarManager {
             self.note_failure();
             return Err(HidMaestroError::SidecarDied(message));
         }
-        match transport.events.recv_timeout(timeout) {
-            Ok(TransportEvent::Line(line)) => {
+        // PERF P2-7 (polish round): fail fast when the sidecar
+        // process exits mid-wait instead of burning the whole reply
+        // timeout (up to 120 s on install/create). The reply channel
+        // is polled in 250 ms slices and the process handle is
+        // checked between slices — `sidecar_exited` is Windows-only
+        // (no process handle is kept elsewhere), so on other
+        // platforms this degrades to the old single wait.
+        // Borrow the process handle BEFORE borrowing the transport
+        // mutably — `sidecar_exited` needs the handle and the loop
+        // below holds `&mut self.transport`. The field only exists
+        // on Windows.
+        #[cfg(windows)]
+        let elevated_process = self.elevated_process;
+        #[cfg(not(windows))]
+        let elevated_process = None;
+        let deadline = Instant::now() + timeout;
+        let event = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let message = self.describe_reply_timeout(timeout);
+                self.kill_transport();
+                self.note_failure();
+                return Err(HidMaestroError::ReplyTimeout(message));
+            }
+            match transport
+                .events
+                .recv_timeout(remaining.min(Duration::from_millis(250)))
+            {
+                Ok(event) => break event,
+                Err(_) => {
+                    if sidecar_exited(elevated_process) {
+                        let message = self.describe_post_hello_eof();
+                        self.kill_transport();
+                        self.note_failure();
+                        return Err(HidMaestroError::SidecarDied(message));
+                    }
+                }
+            }
+        };
+        match event {
+            TransportEvent::Line(line) => {
                 self.last_reply = Some(Instant::now());
                 parse_reply(&line)
             }
-            Ok(TransportEvent::Eof) => {
+            TransportEvent::Eof => {
                 // P1-3: the post-hello death carries the same
                 // enrichment as the pre-hello one (PID + exit code +
                 // ms since last reply) — captured BEFORE
@@ -925,22 +1002,6 @@ impl SidecarManager {
                 self.kill_transport();
                 self.note_failure();
                 Err(HidMaestroError::SidecarDied(message))
-            }
-            Err(_) => {
-                // HID path sweep (v2.0.12): the timeout arm used to
-                // return the bare unit `ReplyTimeout` — no bound, no
-                // PID, no exit code — so a 120 s install/create
-                // timeout (hung driver install, sidecar alive) read
-                // exactly like a crashed sidecar in the daemon log
-                // and on the Output page. The EOF arm above was
-                // enriched in v2.0.11 (P1-3) but this arm was missed.
-                // Capture the diagnostic BEFORE `kill_transport`
-                // (which takes the elevated-process handle the exit
-                // code is read from), exactly like the EOF arm.
-                let message = self.describe_reply_timeout(timeout);
-                self.kill_transport();
-                self.note_failure();
-                Err(HidMaestroError::ReplyTimeout(message))
             }
         }
     }
@@ -1045,6 +1106,19 @@ impl SidecarManager {
         // C2: parse the REAL sidecar shape — `axes` is a count
         // (`axes == 5` ⇒ all five axes). No `capabilities` object
         // (older sidecar) falls back to the custom-wheel caps.
+        // HID P2-1 (polish round): the 15-byte raw-report layout
+        // was assumed on both sides and never verified — `create`
+        // ignored the sidecar's derived `input_report_size`. A
+        // mismatch now fails the connect instead of misaligning
+        // every frame.
+        if let Some(size) = reply.input_report_size
+            && size != crate::mapping::CUSTOM_RAW_REPORT_SIZE
+        {
+            return Err(HidMaestroError::CreateFailed(format!(
+                "create reply input_report_size is {size}, expected {} — the HID descriptor layout does not match the Rust raw-report layout",
+                crate::mapping::CUSTOM_RAW_REPORT_SIZE
+            )));
+        }
         let caps = reply.capabilities.map_or_else(
             HidMaestroCapabilities::custom_wheel,
             CapabilitiesJson::to_capabilities,
@@ -1057,6 +1131,133 @@ impl SidecarManager {
             driver_version: reply.driver.clone(),
             capabilities: caps,
         })
+    }
+
+    /// Verify the live profile against the expected descriptor
+    /// (HID P2-1, polish round): `describe-profile` reports the
+    /// descriptor + derived input-report size the sidecar built with
+    /// the SDK. A mismatch means the SDK packed the report
+    /// differently from the hardcoded 15-byte Rust layout, and every
+    /// frame would be silently misaligned — fail the connect instead
+    /// of shipping garbage to the game.
+    ///
+    /// # Errors
+    ///
+    /// Propagates request errors plus `CreateFailed` on a size /
+    /// descriptor mismatch.
+    pub fn describe_profile(&mut self) -> Result<Reply, HidMaestroError> {
+        let reply =
+            self.request_with_timeout(&Command::DescribeProfile, self.config.driver_op_timeout)?;
+        reply_to_error(&reply)?;
+        match reply.input_report_size {
+            Some(size) if size == crate::mapping::CUSTOM_RAW_REPORT_SIZE => Ok(reply),
+            Some(size) => Err(HidMaestroError::CreateFailed(format!(
+                "sidecar input_report_size is {size}, expected {} — the HID descriptor layout does not match the Rust raw-report layout",
+                crate::mapping::CUSTOM_RAW_REPORT_SIZE
+            ))),
+            None => Err(HidMaestroError::CreateFailed(
+                "describe-profile reply carries no input_report_size".to_string(),
+            )),
+        }
+    }
+
+    /// Submit one frame without waiting for the reply (PERF P1-1,
+    /// polish round): the synchronous `submit` paid a full IPC
+    /// round-trip (~276 µs p99, up to a 200 ms stall) on EVERY
+    /// 200 Hz engine tick. The async path only enqueues the command
+    /// on the writer queue (~1–5 µs) and drains any replies that
+    /// have already arrived (updating `last_reply` / submit stats
+    /// and surfacing a refused submit on the NEXT call). A dead
+    /// sidecar is still caught within ~1 s by the `ensure_alive`
+    /// heartbeat the backend runs before every submit, and by the
+    /// write-queue-full fail-fast below — the 200 ms bound is an
+    /// async watchdog now, never a tick block. The synchronous
+    /// `submit` stays for the first/neutral submit and tests.
+    ///
+    /// # Errors
+    ///
+    /// Fails fast when the transport is gone or the write queue is
+    /// full (sidecar not reading), or when a previously drained
+    /// reply refused a submit.
+    pub fn submit_async(&mut self, frame: crate::GamepadFrame) -> Result<(), HidMaestroError> {
+        self.drain_async_replies()?;
+        let line = encode_command(&Command::Submit {
+            axes: frame.into(),
+            buttons: frame.buttons,
+        })?;
+        self.write_async_line(&line)
+    }
+
+    /// Async raw-report submit — same contract as
+    /// [`submit_async`](Self::submit_async).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`submit_async`](Self::submit_async).
+    pub fn submit_raw_async(&mut self, report: &[u8]) -> Result<(), HidMaestroError> {
+        self.drain_async_replies()?;
+        let encoded = bytes_to_hex(report);
+        let line = encode_command(&Command::SubmitRaw { bytes: encoded })?;
+        self.write_async_line(&line)
+    }
+
+    /// Enqueue one encoded command line on the writer queue without
+    /// waiting for a reply. A write failure is a sidecar death
+    /// (enriched + counted, like the sync path).
+    fn write_async_line(&mut self, line: &str) -> Result<(), HidMaestroError> {
+        let Some(transport) = self.transport.as_mut() else {
+            return Err(HidMaestroError::NotConnected);
+        };
+        if let Err(e) = transport.writer.write_line(line) {
+            let message = self.describe_eof(
+                &format!("sidecar async write failed ({e})"),
+                self.ms_since_last_reply(),
+                "since last reply",
+            );
+            self.kill_transport();
+            self.note_failure();
+            return Err(HidMaestroError::SidecarDied(message));
+        }
+        Ok(())
+    }
+
+    /// Drain already-arrived submit replies without blocking: each
+    /// updates `last_reply` and the submit stats; a refused reply
+    /// (`ok: false`) is returned as [`HidMaestroError::UpdateFailed`]
+    /// so the backend fails the NEXT tick, not this one; EOF is a
+    /// sidecar death. An empty queue is the common case (one
+    /// `try_recv` each) and costs ~nothing.
+    fn drain_async_replies(&mut self) -> Result<(), HidMaestroError> {
+        loop {
+            let Some(transport) = self.transport.as_mut() else {
+                return Ok(());
+            };
+            match transport.events.try_recv() {
+                Ok(TransportEvent::Line(line)) => {
+                    self.last_reply = Some(Instant::now());
+                    // A garbled async reply is not fatal to the
+                    // tick — the heartbeat re-proves liveness at
+                    // 1 Hz. Drop it.
+                    if let Ok(reply) = parse_reply(&line) {
+                        if !reply.ok {
+                            let msg = reply
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "submit refused".to_string());
+                            return Err(HidMaestroError::UpdateFailed(msg));
+                        }
+                        self.record_submit(&reply);
+                    }
+                }
+                Ok(TransportEvent::Eof) => {
+                    let message = self.describe_post_hello_eof();
+                    self.kill_transport();
+                    self.note_failure();
+                    return Err(HidMaestroError::SidecarDied(message));
+                }
+                Err(_) => return Ok(()),
+            }
+        }
     }
 
     /// Submit one frame (`SubmitState` path). Returns the sidecar's

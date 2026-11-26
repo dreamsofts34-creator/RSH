@@ -42,12 +42,29 @@ pub const CLUTCH_SLOT: usize = 3;
 pub const HANDBRAKE_SLOT: usize = 4;
 /// Bitmask of the H-pattern gear bits 5–10 in the stream `buttons` word.
 pub const GEAR_BITS_MASK: u32 = 0x7E0;
-/// Stream `buttons` bit for the horn (BUTTON slot 2).
-pub const HORN_BIT: u32 = 1 << 2;
+/// Stream `buttons` bit for the horn.
+///
+/// HID P1-1 (polish round): the firmware sends horn on bit 4
+/// (`firmware/modules.h` `RSH_BTN2_HORN 4`, asserted by the
+/// firmware host tests) while the pipeline used to read bit 2 —
+/// the firmware's accel-button bit — so a horn press did nothing
+/// and a pedal press honked. The canonical assignment is pinned
+/// in `docs/PROTOCOL-V2.2.md` §1.1: bit 0 shift-up, 1 shift-down,
+/// 2 accel-button, 3 brake-button, 4 horn, 5–10 H-pattern gears.
+/// The debounce-exclusion mask below follows this constant, so it
+/// stays correct if the assignment ever moves.
+pub const HORN_BIT: u32 = 1 << 4;
+/// Stream `buttons` bits for the pedal buttons (firmware fixed
+/// pins 25/26): bit 2 accel-button, bit 3 brake-button. HID P1-2
+/// (polish round): these are pedal inputs, never wheel buttons —
+/// the pipeline strips them from the button word (the firmware
+/// drives the pedal axis from them in button mode), so they can
+/// never reach the game as buttons 3/4 or trip the horn logic.
+pub const PEDAL_BUTTON_BITS: u32 = (1 << 2) | (1 << 3);
 /// Stream `buttons` bits for sequential shifter up/down (BUTTON slots 0/1).
 pub const SHIFTER_SEQ_BITS: u32 = 0b11;
 /// Stream `buttons` bits the BU1 debounce stage skips: 0/1
-/// (sequential shifter) and 2 (horn) — the firmware already
+/// (sequential shifter) and 4 (horn) — the firmware already
 /// debounces them (`inputs.cpp:9-10`, `125-127`, `516-530`), so a
 /// second stage would only add latency to shifts and the horn.
 pub const BUTTON_DEBOUNCE_EXCLUDE_MASK: u32 = SHIFTER_SEQ_BITS | HORN_BIT;
@@ -337,7 +354,7 @@ pub struct PipelinePlan {
     pub handbrake: ModuleTuning,
     /// Shifter tuning (buttons / gear decode).
     pub shifter: ModuleTuning,
-    /// Horn tuning (stream `buttons` bit 2).
+    /// Horn tuning (stream `buttons` bit 4 — see [`HORN_BIT`]).
     pub horn: ModuleTuning,
     /// Wheel-buttons tuning (stream `buttons` word).
     pub buttons: ModuleTuning,
@@ -449,7 +466,7 @@ pub struct OutputState {
     /// Decoded H-pattern gear: `0` = neutral, `1..=6` = gear. Always
     /// `0` in sequential mode or when the shifter module is disabled.
     pub gear: u8,
-    /// True when the horn button (stream `buttons` bit 2) is pressed
+    /// True when the horn button (stream `buttons` bit 4) is pressed
     /// and the horn module is enabled.
     pub horn: bool,
 }
@@ -1106,11 +1123,18 @@ impl ProcessingPipeline {
             }
         }
 
+        // HID P1-2 (polish round): pedal-button bits are not wheel
+        // buttons — strip them before debounce/output so a digital
+        // pedal press never reaches the game as button 3/4 (and,
+        // before the HORN_BIT fix, never honked). The firmware
+        // drives the pedal axis from these bits in button mode.
+        buttons &= !PEDAL_BUTTON_BITS;
+
         // BU1: wheel-button debounce — the firmware debounces only
         // gear / horn / pedal / handbrake inputs, so a bouncy wheel
         // button reaches the stream raw. The stability stage holds
         // each wheel-button bit until it has been steady for
-        // `debounce_ms` (5 ms ticks at 200 Hz); bits 0/1/2 skip it
+        // `debounce_ms` (5 ms ticks at 200 Hz); bits 0/1/4 skip it
         // (firmware-debounced already). P3-5: the gap (`skipped`
         // lost frames) fast-forwards the debounce — a press that
         // was already steady for the whole gap counts it, instead
@@ -1124,17 +1148,17 @@ impl ProcessingPipeline {
             buttons = self.apply_button_debounce(buttons, skipped);
         }
 
-        // Horn (BUTTON slot 2, bit 2).
+        // Horn (BUTTON slot 2, bit 4 — see [`HORN_BIT`]).
         out.horn = self.plan.horn.enabled && (buttons & HORN_BIT) != 0;
-        // Horn (BUTTON slot 2, bit 2) — HO1 minimum honk + HO2
+        // Horn (BUTTON slot 2, bit 4) — HO1 minimum honk + HO2
         // latch. Momentary: the output follows the button, and a
         // press re-arms the hold to the full minimum on every
         // pressed tick, so the honk lasts at least `horn_min_ms`
         // after release. Latch: each rising edge toggles the horn
         // on/off (the hold does not apply — a latched honk stays
         // on until toggled off, it must not tail after switch-off).
-        // The held/latched horn keeps bit 2 set in the button word
-        // too, so the game sees button 3 held — the `horn` flag
+        // The held/latched horn keeps bit 4 set in the button word
+        // too, so the game sees button 5 held — the `horn` flag
         // alone would not honk in-game. Disabled clears the hold,
         // the latch and the bit, like the encoder pulse clear.
         let raw_horn = (buttons & HORN_BIT) != 0;
@@ -2568,16 +2592,16 @@ mod tests {
     fn golden_sequential_shifter_and_horn() {
         let mut pipe = ProcessingPipeline::new(plain_plan());
         // Sequential: up/down/horn bits pass through as buttons.
-        let out = pipe.process(&frame(&[], &[], 0b111));
+        let out = pipe.process(&frame(&[], &[], 0b10011));
         assert_eq!(out.gear, 0);
-        assert_eq!(out.buttons, 0b111);
+        assert_eq!(out.buttons, 0b10011);
         assert!(out.horn);
 
         let mut plan = plain_plan();
         plan.shifter.enabled = false;
         plan.horn.enabled = false;
         let mut pipe = ProcessingPipeline::new(plan);
-        let out = pipe.process(&frame(&[], &[], 0b111));
+        let out = pipe.process(&frame(&[], &[], 0b10011));
         assert_eq!(out.buttons, 0);
         assert!(!out.horn);
     }
@@ -2586,24 +2610,24 @@ mod tests {
     fn horn_min_hold_keeps_honk_after_a_quick_tap() {
         // HO1: a one-tick tap (5 ms) with a 400 ms minimum holds
         // the horn — flag + button bit — for 80 ticks after release,
-        // then goes quiet. The game polls button 3, so the bit must
+        // then goes quiet. The game polls button 5, so the bit must
         // stay set for the whole hold, not just the `horn` flag.
         let mut plan = plain_plan();
         plan.horn.horn_min_ms = 400.0;
         let mut pipe = ProcessingPipeline::new(plan);
-        let out = pipe.process(&frame(&[], &[], 0b100));
+        let out = pipe.process(&frame(&[], &[], 0b1_0000));
         assert!(out.horn);
-        assert_eq!(out.buttons & 0b100, 0b100);
+        assert_eq!(out.buttons & 0b1_0000, 0b1_0000);
         // 79 released ticks: still honking (the release tick counts
         // as the first of the 80-tick hold).
         for _ in 0..79 {
             let out = pipe.process(&frame(&[], &[], 0));
             assert!(out.horn);
-            assert_eq!(out.buttons & 0b100, 0b100);
+            assert_eq!(out.buttons & 0b1_0000, 0b1_0000);
         }
         let out = pipe.process(&frame(&[], &[], 0));
         assert!(!out.horn);
-        assert_eq!(out.buttons & 0b100, 0);
+        assert_eq!(out.buttons & 0b1_0000, 0);
         // A 100 ms minimum is 20 ticks; out-of-range sanitizes to
         // 100..=1000 (default 400).
         assert_eq!(super::horn_min_ticks(100.0), 20);
@@ -2618,6 +2642,37 @@ mod tests {
     }
 
     #[test]
+    fn horn_bit4_canonical_and_pedal_bits_stripped() {
+        // HID P1-1/P1-2 (polish round): the canonical stream
+        // assignment is horn = bit 4, accel pedal = bit 2, brake
+        // pedal = bit 3 (firmware modules.h + PROTOCOL-V2.2 §1.1).
+        // A horn press honks and keeps bit 4 in the button word;
+        // pedal bits never honk and never reach the game as
+        // buttons 3/4 — the firmware drives the pedal axis from
+        // them in button mode.
+        let mut pipe = ProcessingPipeline::new(plain_plan());
+        let out = pipe.process(&frame(&[], &[], 1 << 4));
+        assert!(out.horn);
+        assert_eq!(out.buttons, 1 << 4);
+        // Fresh pipeline per probe: the horn min-hold keeps honking
+        // for 80 ticks after a horn press, so a reused pipeline
+        // would report `horn` on the pedal frames too.
+        let mut pipe = ProcessingPipeline::new(plain_plan());
+        let out = pipe.process(&frame(&[], &[], 1 << 2));
+        assert!(!out.horn, "accel pedal bit must not honk");
+        assert_eq!(out.buttons, 0, "accel pedal bit must not leak as a button");
+        let mut pipe = ProcessingPipeline::new(plain_plan());
+        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        assert!(!out.horn, "brake pedal bit must not honk");
+        assert_eq!(out.buttons, 0, "brake pedal bit must not leak as a button");
+        // All three at once: horn survives, pedal bits are gone.
+        let mut pipe = ProcessingPipeline::new(plain_plan());
+        let out = pipe.process(&frame(&[], &[], (1 << 2) | (1 << 3) | (1 << 4)));
+        assert!(out.horn);
+        assert_eq!(out.buttons, 1 << 4);
+    }
+
+    #[test]
     fn horn_latch_toggles_on_each_press() {
         // HO2: press once = on (stays on with no button held),
         // press again = off. A held press does not re-toggle —
@@ -2625,26 +2680,26 @@ mod tests {
         let mut plan = plain_plan();
         plan.horn.horn_latch = true;
         let mut pipe = ProcessingPipeline::new(plan);
-        let out = pipe.process(&frame(&[], &[], 0b100));
+        let out = pipe.process(&frame(&[], &[], 0b1_0000));
         assert!(out.horn);
-        let out = pipe.process(&frame(&[], &[], 0b100));
+        let out = pipe.process(&frame(&[], &[], 0b1_0000));
         assert!(out.horn, "holding the button must not toggle off");
         let out = pipe.process(&frame(&[], &[], 0));
         assert!(out.horn, "latched honk stays on after release");
-        assert_eq!(out.buttons & 0b100, 0b100);
-        let out = pipe.process(&frame(&[], &[], 0b100));
+        assert_eq!(out.buttons & 0b1_0000, 0b1_0000);
+        let out = pipe.process(&frame(&[], &[], 0b1_0000));
         assert!(!out.horn, "second press toggles off");
-        assert_eq!(out.buttons & 0b100, 0);
+        assert_eq!(out.buttons & 0b1_0000, 0);
         let out = pipe.process(&frame(&[], &[], 0));
         assert!(!out.horn, "no hold tail after a latch switch-off");
         // Live-disable clears a latched honk; re-enable stays quiet.
-        let out = pipe.process(&frame(&[], &[], 0b100));
+        let out = pipe.process(&frame(&[], &[], 0b1_0000));
         assert!(out.horn);
         plan.horn.enabled = false;
         pipe.set_plan_live(plan);
-        let out = pipe.process(&frame(&[], &[], 0b100));
+        let out = pipe.process(&frame(&[], &[], 0b1_0000));
         assert!(!out.horn);
-        assert_eq!(out.buttons & 0b100, 0);
+        assert_eq!(out.buttons & 0b1_0000, 0);
         plan.horn.enabled = true;
         pipe.set_plan_live(plan);
         let out = pipe.process(&frame(&[], &[], 0));
@@ -2939,8 +2994,8 @@ mod tests {
             "held accel: {}",
             out.accelerator
         );
-        // Buttons still live: horn bit (1 << 2) on an invalid frame honks.
-        let bad_horn = StreamFrame::new(3, 5000, flags, &[(0, 300)], &[], 1 << 2);
+        // Buttons still live: horn bit (1 << 4) on an invalid frame honks.
+        let bad_horn = StreamFrame::new(3, 5000, flags, &[(0, 300)], &[], 1 << 4);
         let out = pipe.process(&bad_horn);
         assert!(out.horn, "horn still live on invalid frame");
         assert!(approx(out.steering, 1.0));
@@ -3185,23 +3240,23 @@ mod tests {
         let mut pipe = ProcessingPipeline::new(plain_plan());
         let _ = pipe.process(&frame(&[], &[], 0)); // baseline
         // A 1-tick blip never reaches the output.
-        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
         assert_eq!(out.buttons, 0);
         let out = pipe.process(&frame(&[], &[], 0));
         assert_eq!(out.buttons, 0);
         // Two steady ticks: the press lands on the second.
-        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
         assert_eq!(out.buttons, 0);
-        let out = pipe.process(&frame(&[], &[], 1 << 3));
-        assert_eq!(out.buttons, 1 << 3);
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
+        assert_eq!(out.buttons, 1 << 11);
         // A 1-tick drop while held is a bounce, not a release.
         let out = pipe.process(&frame(&[], &[], 0));
-        assert_eq!(out.buttons, 1 << 3);
-        let out = pipe.process(&frame(&[], &[], 1 << 3));
-        assert_eq!(out.buttons, 1 << 3);
+        assert_eq!(out.buttons, 1 << 11);
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
+        assert_eq!(out.buttons, 1 << 11);
         // Two steady ticks released: the release lands.
         let out = pipe.process(&frame(&[], &[], 0));
-        assert_eq!(out.buttons, 1 << 3);
+        assert_eq!(out.buttons, 1 << 11);
         let out = pipe.process(&frame(&[], &[], 0));
         assert_eq!(out.buttons, 0);
     }
@@ -3215,17 +3270,17 @@ mod tests {
         let mut pipe = ProcessingPipeline::new(plan);
         // Bit 3 (wheel button) — pehla frame: candidate 1 tick,
         // abhi stable nahi.
-        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
         assert_eq!(out.buttons, 0);
         // Gap frame (5 lost): candidate 1 + 1 + 5 = 7 >= 2 -> stable.
-        let out = pipe.process_with_gap(&frame(&[], &[], 1 << 3), 5);
-        assert_eq!(out.buttons, 1 << 3, "gap fast-forwards debounce");
+        let out = pipe.process_with_gap(&frame(&[], &[], 1 << 11), 5);
+        assert_eq!(out.buttons, 1 << 11, "gap fast-forwards debounce");
         // Gap ke baghair: doosra steady frame bhi chahiye hota.
         let mut pipe = ProcessingPipeline::new(plan);
-        let out = pipe.process(&frame(&[], &[], 1 << 3));
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
         assert_eq!(out.buttons, 0);
-        let out = pipe.process(&frame(&[], &[], 1 << 3));
-        assert_eq!(out.buttons, 1 << 3);
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
+        assert_eq!(out.buttons, 1 << 11);
     }
 
     #[test]
@@ -3234,15 +3289,15 @@ mod tests {
         let mut plan = plain_plan();
         plan.buttons.debounce_ms = 0.0;
         let mut pipe = ProcessingPipeline::new(plan);
-        let out = pipe.process(&frame(&[], &[], 1 << 3));
-        assert_eq!(out.buttons, 1 << 3);
-        // Excluded bits (shifter 0/1, horn 2) pass through even at
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
+        assert_eq!(out.buttons, 1 << 11);
+        // Excluded bits (shifter 0/1, horn 4) pass through even at
         // the 50 ms maximum — the firmware already debounces them.
         let mut plan = plain_plan();
         plan.buttons.debounce_ms = 50.0;
         let mut pipe = ProcessingPipeline::new(plan);
-        let out = pipe.process(&frame(&[], &[], 0b111));
-        assert_eq!(out.buttons, 0b111);
+        let out = pipe.process(&frame(&[], &[], 0b10011));
+        assert_eq!(out.buttons, 0b10011);
         assert!(out.horn);
     }
 
@@ -3259,15 +3314,15 @@ mod tests {
         let mut pipe = ProcessingPipeline::new(plan);
         let _ = pipe.process(&frame(&[], &[], 0));
         for _ in 0..59 {
-            let out = pipe.process(&frame(&[], &[], 1 << 4));
-            assert_eq!(out.buttons, 1 << 4);
+            let out = pipe.process(&frame(&[], &[], 1 << 11));
+            assert_eq!(out.buttons, 1 << 11);
             assert_eq!(out.long_press_buttons, 0);
         }
-        let out = pipe.process(&frame(&[], &[], 1 << 4));
-        assert_eq!(out.long_press_buttons, 1 << 4);
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
+        assert_eq!(out.long_press_buttons, 1 << 11);
         // Still held: the bit stays set.
-        let out = pipe.process(&frame(&[], &[], 1 << 4));
-        assert_eq!(out.long_press_buttons, 1 << 4);
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
+        assert_eq!(out.long_press_buttons, 1 << 11);
         // Released: both bits clear at once.
         let out = pipe.process(&frame(&[], &[], 0));
         assert_eq!(out.buttons, 0);
@@ -3333,8 +3388,8 @@ mod tests {
         let mut pipe = ProcessingPipeline::new(plan);
         let _ = pipe.process(&frame(&[], &[], 0)); // baseline
         // First press: single.
-        let out = pipe.process(&frame(&[], &[], 1 << 4));
-        assert_eq!(out.buttons, 1 << 4);
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
+        assert_eq!(out.buttons, 1 << 11);
         assert_eq!(out.double_press_buttons, 0);
         // Release, then 20 ticks of rest (inside the 60-tick window).
         let _ = pipe.process(&frame(&[], &[], 0));
@@ -3342,11 +3397,11 @@ mod tests {
             let _ = pipe.process(&frame(&[], &[], 0));
         }
         // Second press: double, and it stays set while held.
-        let out = pipe.process(&frame(&[], &[], 1 << 4));
-        assert_eq!(out.buttons, 1 << 4);
-        assert_eq!(out.double_press_buttons, 1 << 4);
-        let out = pipe.process(&frame(&[], &[], 1 << 4));
-        assert_eq!(out.double_press_buttons, 1 << 4);
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
+        assert_eq!(out.buttons, 1 << 11);
+        assert_eq!(out.double_press_buttons, 1 << 11);
+        let out = pipe.process(&frame(&[], &[], 1 << 11));
+        assert_eq!(out.double_press_buttons, 1 << 11);
         // Release clears both.
         let out = pipe.process(&frame(&[], &[], 0));
         assert_eq!(out.buttons, 0);

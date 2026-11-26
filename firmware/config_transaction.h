@@ -381,6 +381,10 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
     uint8_t ads_ch_used = 0;  // FW-01: ADS1115 AIN channels (bit n = ch n istemal)
     // Pre-scan: I2C kinds (ADS1115/expander/AS5600) hon to GPIO21/22 I2C
     // hain (R-L9) — direct pin istemal neeche reject hota hai.
+    // F-11: expander kinds yahan I2C kinds ki tarah gine jate hain —
+    // ye pre-scan sirf pin rule (R-L9) ke liye hai; expander records
+    // neeche reject hote hain (kabhi live nahi hote), is liye ye
+    // gin'ti defence-in-depth hai, koi behaviour nahi badalti.
     uint8_t has_i2c = 0;
     for (uint8_t j = 0; j < mc; j++) {
       uint8_t tj = blob[RSH_CFG_HEADER_SIZE + (size_t)j * RSH_CFG_RECORD_SIZE];
@@ -417,8 +421,12 @@ static inline uint8_t rsh_cfg_blob_validate(const uint8_t *blob, size_t len,
         // COMMIT that accepts these records would leave silently dead
         // buttons (validator pehle accept karta tha, pinmap sirf
         // presence track karta tha). Reject fail-closed: err 3 ->
-        // UNSUPPORTED. The app (`validate_blob`, rsh-protocol) rejects
-        // first with a plain message; this is the backstop for old
+        // UNSUPPORTED. F-11: err 3 (UNKNOWN_TYPE) jaan-boojh kar
+        // rakha hai — known-but-unsupported ke liye alag code
+        // (protocol bump) nahi; GET_DIAG err list mein ye "unknown
+        // type" dikhega, user-facing message app ka `validate_blob`
+        // deta hai (wo pehle reject karta hai). The app rejects first
+        // with a plain message; this is the backstop for old
         // apps / direct SET_CFG. Axes (ADS1115/AS5600) unaffected —
         // sirf kinds 8/9 reject hote hain.
         RSH_CFG_ADD_ERR(RSH_CFG_ERR_UNKNOWN_TYPE);
@@ -831,6 +839,11 @@ static inline void rsh_cfg_set_safe_mode(rsh_cfg_txn_t *t, uint8_t active) {
   if (t) t->safe_mode = active ? 1 : 0;
 }
 
+// F-17: safe-mode gate parhne ke liye (FACTORY_RESET handler).
+static inline uint8_t rsh_cfg_is_safe_mode(const rsh_cfg_txn_t *t) {
+  return (t && t->safe_mode) ? 1 : 0;
+}
+
 // Live config load karo (boot par: NVS slot ya factory blob). Blob ko
 // validate kiya jata hai — ghalat blob load nahi hota (caller factory
 // fallback le). Return OK ya validation status.
@@ -877,13 +890,29 @@ static inline uint8_t rsh_cfg_stage_chunk(rsh_cfg_txn_t *t, uint16_t offset,
   // Naya session (offset 0, ALAG total) purana staged buffer discard karta
   // hai (§3.5). Same total par offset-0 chunk dobara bhejna sirf retry hai
   // (idempotent) — STAGED state mein bhi discard NAHI hota, warna
-  // complete hone ke baad chunk-0 retry poora blob phenk deta.
-  if (offset == 0 && (!t->has_total || t->total != total)) {
-    memset(t->staged, 0, sizeof(t->staged));
-    memset(t->received, 0, sizeof(t->received));
-    t->received_count = 0;
-    t->total = total;
-    t->has_total = 1;
+  // F-21 (polish round): offset-0 chunk naya session hai — total
+  // badla ho YA chunk ke bytes staged prefix se mukhtalif hon (pehle
+  // sirf total check hota tha: same-length naya blob purane staged
+  // blob se merge ho jata tha, sirf trailer CRC32 pakarta tha).
+  // Retry (wahi bytes dobara) staged buffer ko nahi phenkta.
+  if (offset == 0) {
+    uint8_t same_session = (t->has_total && t->total == total) ? 1 : 0;
+    if (same_session) {
+      for (uint16_t i = 0; i < chunk_len; i++) {
+        uint8_t got = (uint8_t)(t->received[i / 8] & (uint8_t)(1u << (i % 8)));
+        if (got && t->staged[i] != data[i]) {
+          same_session = 0;
+          break;
+        }
+      }
+    }
+    if (!same_session) {
+      memset(t->staged, 0, sizeof(t->staged));
+      memset(t->received, 0, sizeof(t->received));
+      t->received_count = 0;
+      t->total = total;
+      t->has_total = 1;
+    }
   }
   if (!t->has_total || t->total != total) return RSH_CTRL_TOO_BIG;
   for (uint16_t i = 0; i < chunk_len; i++) {

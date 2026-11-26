@@ -38,11 +38,14 @@ internal static class Program
     static int inputReportSize;
     static long submitCount;
     static long lastLatencyUs;
-    static bool exitRequested;
+    static volatile bool exitRequested;
     static string transportName = "stdio";
     static string? dllSha256Cache;
     static bool dllSha256OkCache;
     static readonly Stopwatch sw = Stopwatch.StartNew();
+    // P3-2: serialises in-process file-log writers (Log is also
+    // called from the submit-latency callback thread).
+    static readonly object logLock = new();
     /// P2-4 (update4-fix): bound for the TCP connect-back (see
     /// `Run` — below the daemon's 30 s accept bound, far above a
     /// normal loopback connect).
@@ -172,8 +175,12 @@ internal static class Program
             {
                 AutoFlush = true,
             };
-            transport = "tcp";
-            transportName = "tcp";
+            // P3-6 (v2.0.13 polish): the Rust contract documents
+            // "tcp-loopback" (protocol.rs, manager.rs) — the sidecar
+            // sent "tcp", so the hello/reply transport never matched
+            // the documented value.
+            transport = "tcp-loopback";
+            transportName = "tcp-loopback";
         }
         else
         {
@@ -187,7 +194,14 @@ internal static class Program
             transport = "stdio";
         }
 
-        Console.CancelKeyPress += (_, _) => DisposeAll();
+        // P3-1 (v2.0.13 polish): Ctrl+C used to call DisposeAll()
+        // straight from the console signal thread while the main
+        // loop could be mid-submit — DisposeAll racing the loop's
+        // own dispose. Now the handler only sets the flag (and
+        // cancels the default terminate so the loop can exit
+        // cleanly); the loop breaks after the current command and
+        // disposes on its own thread (finally block below).
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; exitRequested = true; };
 
         var (dllSha256, dllSha256Ok) = CheckDllHash();
 
@@ -908,17 +922,37 @@ internal static class Program
             // Stderr is gone; the file log below may still work.
         }
 
-        try
+        // P3-2 (v2.0.13 polish): the file log had no locking —
+        // two sidecars share one daily file, and concurrent
+        // AppendAllText calls (same process via the submit-latency
+        // callback thread, or a second sidecar process) could
+        // collide on open and silently drop the line. A static
+        // lock serialises in-process writers; FileShare.ReadWrite
+        // + a short retry absorbs a cross-process open collision.
+        // Logging must still never break the protocol loop.
+        lock (logLock)
         {
-            var path = LogFilePath();
-            if (path is not null)
+            for (var attempt = 0; attempt < 3; attempt++)
             {
-                File.AppendAllText(path, line + Environment.NewLine);
+                try
+                {
+                    var path = LogFilePath();
+                    if (path is null) break;
+                    using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                    var bytes = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(line + Environment.NewLine);
+                    fs.Write(bytes, 0, bytes.Length);
+                    break;
+                }
+                catch (IOException) when (attempt < 2)
+                {
+                    Thread.Sleep(10);
+                }
+                catch
+                {
+                    // File log unwritable; stderr already carried the line.
+                    break;
+                }
             }
-        }
-        catch
-        {
-            // File log unwritable; stderr already carried the line.
         }
     }
 }

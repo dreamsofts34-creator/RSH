@@ -458,9 +458,23 @@ mod tests {
         // P1-5 (v2.0.12 scan): retry the Get instead of a single
         // `.expect` — a transient unregistration (e.g. a racing
         // test, or WER itself) must not produce a bare `0x80070490`
-        // panic; assert on the last error after 5 × 100 ms.
+        // panic; assert on the last error after the budget below.
+        //
+        // Evidence note (v2.0.13 polish): the cited failing run
+        // 45640120547 panicked at `restart.rs:441` with the OLD
+        // single-attempt `.expect("get settings")` — that run was
+        // on commit 37e9bca, BEFORE this retry landed in 3579f75,
+        // so no post-hardening failure is on record; the retry is
+        // unproven, not disproven. The budget below is widened
+        // anyway (5 x 100 ms -> 10 x 200 ms = 2 s, backoff): a
+        // registration-propagation delay has no documented bound,
+        // and the test only pays the budget when the Get actually
+        // fails. The sleep is skipped after the final attempt
+        // (the old code slept 100 ms and then panicked).
         let mut last_error = None;
-        for _ in 0..5 {
+        let mut attempts = 0;
+        for attempt in 0..10 {
+            attempts = attempt + 1;
             // A failed Get may have consumed `size` — reset the
             // buffer length each attempt.
             size = u32::try_from(buf.len()).unwrap_or(u32::MAX);
@@ -479,12 +493,14 @@ mod tests {
                 }
                 Err(error) => {
                     last_error = Some(error);
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if attempt < 9 {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
                 }
             }
         }
         if let Some(error) = last_error {
-            panic!("get settings (after 5 attempts): {error}");
+            panic!("get settings (after {attempts} attempts): {error}");
         }
         let expected = RESTART_NO_PATCH.0 | RESTART_NO_REBOOT.0;
         assert_eq!(flags & expected, expected, "flags: {flags:#x}");

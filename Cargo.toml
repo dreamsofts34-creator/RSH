@@ -52,7 +52,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "2.0.12"
+version = "2.0.13"
 edition = "2024"
 license = "MIT"
 
@@ -123,3 +123,14 @@ strip = true
 debug = true
 lto = "fat"
 codegen-units = 1
+
+# PERF P3-6 (polish round): bench builds inherit `release` above,
+# so even a local `cargo bench` paid the full fat-LTO link (~10 min
+# wall on this VM). The bench profile keeps the release opts except
+# LTO / single codegen unit, for iteration speed only — shipped
+# binaries still use `[profile.release]`.
+[profile.bench]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = false

@@ -86,6 +86,15 @@ typedef struct {
   // to handler UNSUPPORTED deta hai (fail closed — password accept karke
   // apply na karna us se bura hai ke caller ko pata hi na chale).
   void (*password_change_request)(void *user, const uint8_t *pw, uint16_t len);
+  // F-07 (polish round): NVS write SYNCHRONOUSLY, reply se pehle.
+  // Callback set ho to handler pehle is se NVS likhta hai; 0 aaye to
+  // RSH_CTRL_NVS_FAIL (8) — app ko pata chalta hai ke password NAHI
+  // badla (pehle reply OK jata tha, NVS fail hone par app/board ka
+  // password alag ho jata tha). NULL ho to purana deferred rasta
+  // (host tests / purane callers). Kamyabi par bhi password_change_request
+  // bulaya jata hai — AP restart ab bhi reply ke baad deferred hota hai;
+  // deferred NVS write wahi value dobara likhta hai (idempotent).
+  uint8_t (*password_set_sync)(void *user, const uint8_t *pw, uint16_t len);
   // LED_TEST (Phase F WS5, §3.7): LED module ki board-side state.
   // led_pin = config blob LED_STRIP record ka pin (0xFF = configured nahi);
   // expanders = 1 jab MCP23017/PCF8574 records hon (R-L9 rule badal jata hai).
@@ -208,7 +217,12 @@ static inline uint8_t rsh_fw34_handler(uint8_t cmd, const uint8_t *payload, uint
       // has_previous=0). Persist karo taake reboot ke baad bhi
       // defaults rahen; live blob badalte hi rsh.ino ka detector
       // modules + inputs dobara lagata hai (reboot nahi chahiye).
+      // F-17 (polish round): safe mode mein FACTORY_RESET bhi BUSY hai —
+      // safe mode ka matlab hai "config apply nahi hoti", aur factory
+      // reset config replace + apply karta hai. Safe mode se nikalne ka
+      // rasta reboot hai (factory reset safe-mode exit nahi hai).
       if (!c || !c->txn) return RSH_CTRL_UNSUPPORTED;
+      if (rsh_cfg_is_safe_mode(c->txn)) return RSH_CTRL_BUSY;
       if (len != 0) return RSH_CTRL_UNSUPPORTED;
       uint8_t factory[RSH_CFG_MAX_TOTAL];
       size_t flen = rsh_cfg_factory_blob(factory);
@@ -266,6 +280,11 @@ static inline uint8_t rsh_fw34_handler(uint8_t cmd, const uint8_t *payload, uint
       if (!c || !c->password_verify_current) return RSH_CTRL_UNSUPPORTED;
       if (!c->password_verify_current(c->user, cur_pw, cur_len))
         return RSH_CTRL_BAD_PASSWORD;  // D3: ghalat current password
+      // F-07: NVS write reply se PEHLE (sync callback ho to) — fail
+      // ho to app ko NVS_FAIL batao, OK nahi.
+      if (c->password_set_sync &&
+          !c->password_set_sync(c->user, rest + 1, new_len))
+        return RSH_CTRL_NVS_FAIL;
       if (!c->password_change_request) return RSH_CTRL_UNSUPPORTED;
       c->password_change_request(c->user, rest + 1, new_len);
       return RSH_CTRL_OK;

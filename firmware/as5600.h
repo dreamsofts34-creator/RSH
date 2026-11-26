@@ -180,10 +180,14 @@ typedef struct {
 // Ek poora sample parho: STATUS + RAWANGLE (2 B) + AGC.
 // Koi bhi transaction fail ho to valid=0, raw/agc 0 — caller axis-invalid
 // (F2/D12) ka rasta le (aakhri valid value + invalid flag, 0 mat bhejo).
+// F-18 (polish round): STATUS (0x0B) + RAWANGLE_H/L (0x0C/0x0D) contiguous
+// hain — ek 3-byte transaction mein parho (pehle 2 transactions thay,
+// is liye magnet state aur angle alag instants par sample hote thay;
+// magnet beech mein hate to ek frame stale angle + valid=1 deta tha).
+// AGC (0x1A) alag register hai — wo apni transaction mein hi rehta hai.
 static inline int rsh_as5600_read(rsh_as5600_i2c_read_fn read, void *user,
                                   RshAs5600Sample *out) {
-  uint8_t sb[1];
-  uint8_t ab[2];
+  uint8_t sab[3];
   uint8_t gb[1];
   out->raw = 0;
   out->status = 0;
@@ -191,16 +195,14 @@ static inline int rsh_as5600_read(rsh_as5600_i2c_read_fn read, void *user,
   out->valid = 0;
   out->magnet_ok = 0;
   if (read == NULL || out == NULL) return -1;
-  if (read(RSH_AS5600_I2C_ADDR, RSH_AS5600_REG_STATUS, sb, 1, user) != 0)
-    return -1;
-  if (read(RSH_AS5600_I2C_ADDR, RSH_AS5600_REG_RAWANGLE_H, ab, 2, user) != 0)
+  if (read(RSH_AS5600_I2C_ADDR, RSH_AS5600_REG_STATUS, sab, 3, user) != 0)
     return -1;
   if (read(RSH_AS5600_I2C_ADDR, RSH_AS5600_REG_AGC, gb, 1, user) != 0)
     return -1;
-  out->status = sb[0];
-  out->raw = (uint16_t)(((uint16_t)(ab[0] & 0x0F) << 8) | (uint16_t)ab[1]);
+  out->status = sab[0];
+  out->raw = (uint16_t)(((uint16_t)(sab[1] & 0x0F) << 8) | (uint16_t)sab[2]);
   out->agc = gb[0];
-  RshAs5600Status st = rsh_as5600_status_decode(sb[0]);
+  RshAs5600Status st = rsh_as5600_status_decode(sab[0]);
   out->magnet_ok = st.magnet_detected;
   // P2-4: AGC band bhi validity ka hissa hai — magnet detected (MD=1)
   // hone ke bawajood AGC 16..112 se bahar ho to magnet gap ghalat hai

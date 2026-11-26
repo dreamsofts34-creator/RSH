@@ -53,8 +53,11 @@ pub fn timeout_for_method(method: &str) -> Duration {
         // the UI's own long-call bound (390 s), kept here so a
         // plain call agrees. The old 75 s arm was stale (P3-1,
         // v2.0.12 scan) — a healthy 310 s switch timed out at
-        // 75 s while the daemon kept going.
-        "set_output_backend" => Duration::from_secs(390),
+        // 75 s while the daemon kept going. `set_output_enabled`
+        // rides the same arm (CORE-P1-2, polish round): it can run
+        // the full backend switch inline, so the UI no longer
+        // times out at 500 ms while the daemon keeps switching.
+        "set_output_backend" | "set_output_enabled" => Duration::from_secs(390),
         // Game writes: atomic file write + process refresh, which
         // can pass 500 ms on Windows under an AV scan (the UI's
         // `GAME_WRITE_TIMEOUT`). Board control round-trip (LED test
@@ -71,7 +74,13 @@ pub fn timeout_for_method(method: &str) -> Duration {
         | "set_tuning"
         | "set_shifter_sensitivity"
         | "firmware_check"
-        | "update_firmware" => Duration::from_secs(10),
+        | "update_firmware"
+        // CORE-P3-1 (polish round): launch/stop/state are slow
+        // methods too (process spawn under AV, TerminateProcess +
+        // wait) — a plain call() used to get 500 ms.
+        | "launch_game"
+        | "stop_game"
+        | "game_state" => Duration::from_secs(10),
         // Wi-Fi password set / rejoin (P1-3, v2.0.12 scan): the
         // daemon worst case is ≈150 s (netsh add ≤30 s + connect
         // ≤30 s + confirm ≤90 s, plus board round-trips and a

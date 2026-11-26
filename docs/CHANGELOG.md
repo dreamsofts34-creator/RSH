@@ -1,10 +1,29 @@
 # Changelog — RSH (Real Sim Hub)
 
 All notable changes to the RSH app and firmware. Current versions:
-**app v2.0.12 · firmware v4.0.5 · protocol v2.2 (frozen)**.
+**app v2.0.13 · firmware v4.0.6 · protocol v2.2 (frozen)**.
 Release notes on GitHub are the same text, shorter; this file is the
 full record. The C# series (v2.0.4 and earlier) is superseded — the
 Rust series below starts at v1.0.0.
+
+## [2.0.13] — 2026-11-26 (polish round, unreleased — proposal only)
+
+App 2.0.13 + firmware 4.0.6 (protocol v2.2 frozen — no wire-format change,
+one new ctrl status code: NVS_FAIL 8, SET_PASSWORD sync failure).
+Backend polish batch from the 2026-11-26 deep scan (122 findings):
+CORE 19, HID 15, PERF backend, INSTALLER 21, FIRMWARE 21.
+Horn bit canonicalised (firmware bit 4, was read as bit 2 on the host);
+pedal button-mode wired end to end; HID submit async; p99 caching;
+IPC parse-once + latency without per-dispatch alloc; installer now
+committed `installer/rsh.nsi` (no more 21,000-char ceiling), NO
+scheduled task (autostart owner is the daemon Run key), desktop-shortcut
+option, ARP fields, SHA256SUMS.txt as a 4th release asset; firmware
+I2C recovery, 60 s boot-stability rule, handbrake health, mV probe
+stepped, AS5600 3-byte read. Code-signing cert still NOT bought
+(user decision 2026-11-13). Gate-race hardened (all-known settlement
+predicate); restart-test retry widened to 10x200 ms. Bench re-measure
+was host-noise-dominated (loadavg 5.5–6.9 on the shared VM) — thresholds
+unchanged. Release NOT in this round — proposal only, on user order.
 
 ## [2.0.12] — 2026-11-25
 

@@ -791,6 +791,9 @@ fn reader_loop(
 ) {
     let mut decoder = SerialDecoder::new();
     let mut buf = [0u8; MAX_READ_LEN];
+    // PERF P3-2: one reused frame buffer for the reader loop — the
+    // old code allocated a fresh `Vec` per `read()` via `feed()`.
+    let mut frames: Vec<SerialFrame> = Vec::new();
     while !shutdown.load(Ordering::Relaxed) {
         match port.read(&mut buf) {
             Ok(0) => thread::sleep(Duration::from_millis(1)),
@@ -803,7 +806,8 @@ fn reader_loop(
                     decoder.dropped_bad_crc,
                     decoder.dropped_bad_length,
                 );
-                let frames = decoder.feed(&buf[..n]);
+                frames.clear();
+                decoder.feed_into(&buf[..n], &mut frames);
                 let after = (
                     decoder.dropped_bad_magic,
                     decoder.dropped_bad_crc,
@@ -818,7 +822,7 @@ fn reader_loop(
                 counters
                     .dropped_bad_length
                     .fetch_add(after.2 - before.2, Ordering::Relaxed);
-                for frame in frames {
+                for frame in frames.drain(..) {
                     counters.frames_received.fetch_add(1, Ordering::Relaxed);
                     handle_serial_frame(frame, senders, counters);
                 }

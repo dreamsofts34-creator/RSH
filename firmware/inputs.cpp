@@ -26,13 +26,16 @@ static bool accelAnalogMode = true, brakeAnalogMode = true;
 static uint32_t pedalCycle = 0;   // button-mode diagnostic cadence ke liye
 static uint16_t lastAccelDiag = 0, lastBrakeDiag = 0;
 static AxisHealth healthSteer, healthAccel, healthBrake, healthClutch;
+static AxisHealth healthHandbrake;  // F-04: handbrake health (slot 4)
 static uint8_t axisInvalidMask = 0;
 // Movement tracking — rail-stuck faisle ke liye "doosre axes move kar rahe
 // hon" (D12): har axis ki aakhri harkat ka waqt. (Yahan upar hain taake
 // inputs_apply_config_blob() inhein reset kar sake — wo neeche hai.)
 static uint16_t prevSteer = 0, prevAccel = 0, prevBrake = 0, prevClutch = 0;
+static uint16_t prevHandbrake = 0;  // F-04
 static bool hasPrev = false;
 static uint32_t movedAtSteer = 0, movedAtAccel = 0, movedAtBrake = 0, movedAtClutch = 0;
+static uint32_t movedAtHandbrake = 0;  // F-04
 // Phase G (C3): live pin table — compiled defaults, phir config blob se.
 // inputs_read har jagah PIN_* ki jagah is table se parhta hai; blob
 // badle to inputs_apply_config_blob() table badal kar pinMode dobara karta hai.
@@ -44,6 +47,19 @@ static bool forceMvProbe = false;  // steering pin badle to agle read par mV pro
 // callbacks + bus management hain.
 static RshI2cAxes i2cAxes;
 static bool i2cBusStarted = false;
+// F-01 (polish round): I2C poll backoff — lagatar fail hone par bus ko
+// har cycle hammer karne ke bajaye 500 ms skip karo, aur backoff lagte
+// hi ek dafa bus recovery (9 SCL pulses + STOP) chalao. Ek mara hua
+// device warna har 5 ms cycle mein Wire timeout khata (sample task
+// stall -> 5 s task WDT -> reboot loop).
+static uint8_t i2cFailStreak = 0;
+static uint32_t i2cBackoffUntilMs = 0;
+static bool i2cRecoveredThisBackoff = false;
+// F-16 (polish round): mV probe ab stepped hai — 8 raw+mV pairs 8 cycles
+// mein (2 reads/cycle), ek cycle mein 16 reads nahi. Probe state:
+static bool mvProbeActive = false;
+static uint8_t mvProbeCount = 0;
+static uint32_t mvProbeRawSum = 0, mvProbeMvSum = 0;
 
 // Wire callbacks (as5600.h / ads1115.h signature) — register likho, phir
 // bytes parho (repeated start, endTransmission(false)).
@@ -69,6 +85,39 @@ static int i2c_wire_write_(uint8_t dev, uint8_t reg, const uint8_t *buf,
   return Wire.endTransmission() == 0 ? 0 : -1;
 }
 
+// F-01: SDA/SCL bus recovery — Wire band karo, SCL par 9 clock pulses
+// (stuck slave apna byte poora karke SDA chhore), phir STOP condition,
+// phir Wire dobara start. Sirf backoff lagne par ek dafa chalti hai;
+// NACK karne wala device (sahi bus, mara hua chip) par bhi be-zarar hai.
+static void i2c_bus_recover_(void) {
+  Wire.end();
+  pinMode(21, OUTPUT);
+  pinMode(22, OUTPUT);
+  digitalWrite(21, HIGH);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(22, LOW);
+    delayMicroseconds(5);
+    digitalWrite(22, HIGH);
+    delayMicroseconds(5);
+  }
+  digitalWrite(21, LOW);   // STOP: SDA LOW jab SCL HIGH
+  delayMicroseconds(5);
+  digitalWrite(22, LOW);
+  delayMicroseconds(5);
+  digitalWrite(22, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(21, HIGH);
+  delayMicroseconds(5);
+  pinMode(21, INPUT_PULLUP);
+  pinMode(22, INPUT_PULLUP);
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+  Wire.setTimeout(5);  // F-01: requestFrom/endTransmission 5 ms se zyada
+                       // block na kare (Arduino default timeout kabhi
+                       // set hi nahi hua tha)
+  i2cBusStarted = true;
+}
+
 // I2C bus sirf tab start karo jab koi I2C kind configure ho — warna
 // GPIO21 LED strip ka pin rehta hai (validator R-L9: I2C kinds hon to
 // 21/22 I2C hain). Bus band bhi karo jab I2C khatam ho (LED wapas).
@@ -81,7 +130,12 @@ static void i2c_bus_ensure_(void) {
     Wire.setClock(400000);  // Fast mode — AS5600 + ADS1115 dono support
                             // karte hain; sample cycle (5 ms) mein I2C
                             // cost ~0.25 ms rehta hai (100 kHz par ~1 ms)
+    Wire.setTimeout(5);     // F-01: I2C transaction 5 ms se zyada block
+                            // na kare (sample task + 5 s task WDT)
     i2cBusStarted = true;
+    i2cFailStreak = 0;
+    i2cBackoffUntilMs = 0;
+    i2cRecoveredThisBackoff = false;
   } else if (!need && i2cBusStarted) {
     Wire.end();
     i2cBusStarted = false;
@@ -124,12 +178,26 @@ uint8_t inputs_apply_config_blob(const uint8_t *blob, size_t len) {
   shifterDebounceMs = rsh_shifter_debounce_ms(shifterSensitivity);
   dbGearUp.debounceMs = shifterDebounceMs;
   dbGearDown.debounceMs = shifterDebounceMs;
-  dbHandbrake.debounceMs = shifterDebounceMs;
+  // F-09 (polish round): handbrake debounce FIXED 10 ms (DEBOUNCE_MS,
+  // Debouncer default) — shifter sensitivity se nahi chalta. Pehle
+  // sensitivity 100 par handbrake 5 ms debounce leta tha (bounce-prone
+  // switch flicker karta tha) aur 0 par 20 ms (sluggish). H-pattern
+  // stability timer shifterDebounceMs par hi rehta hai (wo shifter ka hai).
+  dbHandbrake.debounceMs = DEBOUNCE_MS;
   pinmap_ensure_defaults_();
   if (memcmp(&next, &pinMap, sizeof(next)) == 0) return 1;  // wahi map — re-init nahi
   pinMap = next;
   pinmap_apply_pinmodes_();
   i2c_bus_ensure_();  // FW-01: I2C axis aaye/gaye to Wire start/stop + sampler config
+  // HID P1-2 (polish round): pedal button-mode switch. Axis record ho
+  // (pin assigned ya I2C axis) to analog; record hi na ho to button mode
+  // — fixed pins 25/26 debounced axis 4095/0 chalate hain (neeche
+  // inputs_read mein). Pehle inputs_set_pedal_analog ka koi caller nahi
+  // tha, is liye button-mode pedals ka axis stale/floating analog par
+  // rehta tha aur bits 2/3 wheel buttons 3/4 ban kar leak hote thay.
+  inputs_set_pedal_analog(
+      rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_ACCEL),
+      rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_BRAKE));
   // Naye pins = nayi state: purane pin ki debouncer/encoder/health state
   // naye pin par ghalat trigger na kare (e.g. purana gear-up daba hua
   // tha, naya pin HIGH hai — release ka intezar kiye baghair saaf karo).
@@ -141,7 +209,7 @@ uint8_t inputs_apply_config_blob(const uint8_t *blob, size_t len) {
   dbHandbrake = Debouncer{};
   dbGearUp.debounceMs = shifterDebounceMs;
   dbGearDown.debounceMs = shifterDebounceMs;
-  dbHandbrake.debounceMs = shifterDebounceMs;
+  dbHandbrake.debounceMs = DEBOUNCE_MS;  // F-09: fixed 10 ms (upar dekho)
   lastRawGear = 0;
   reportedGear = 0;
   gearStableSinceMs = 0;
@@ -151,9 +219,10 @@ uint8_t inputs_apply_config_blob(const uint8_t *blob, size_t len) {
   healthAccel = AxisHealth{};
   healthBrake = AxisHealth{};
   healthClutch = AxisHealth{};
-  prevSteer = prevAccel = prevBrake = prevClutch = 0;
+  healthHandbrake = AxisHealth{};  // F-04
+  prevSteer = prevAccel = prevBrake = prevClutch = prevHandbrake = 0;
   hasPrev = false;
-  movedAtSteer = movedAtAccel = movedAtBrake = movedAtClutch = 0;
+  movedAtSteer = movedAtAccel = movedAtBrake = movedAtClutch = movedAtHandbrake = 0;
   axisInvalidMask = 0;
   lastHandbrakeDiag = 0;
   lastClutchDiag = 0;
@@ -252,6 +321,34 @@ static bool mv_probe_ok() {
   return rsh_mv_should_restore(mvSum, 8);
 }
 
+// F-16: stepped mV probe — mv_probe_ok() ka ek pair (1 raw + 1 mV)
+// per cycle. inputs_read har cycle ek pair chalata hai; 8 pairs ke baad
+// faisla wahi hota hai jo mv_probe_ok() deta (boot par blocking probe
+// hi rehta hai — wahan cycle budget nahi hai).
+// Return: -1 = probe chal rahi, 0 = complete (useMv waisa hi),
+// 1 = complete (useMv badla).
+static int mv_probe_step_() {
+  if (!mvProbeActive) {
+    mvProbeActive = true;
+    mvProbeCount = 0;
+    mvProbeRawSum = 0;
+    mvProbeMvSum = 0;
+  }
+  if (pinMap.steer == RSH_PINMAP_ABSENT) {
+    mvProbeActive = false;
+    return 0;
+  }
+  mvProbeRawSum += (uint32_t)analogRead(pinMap.steer);
+  mvProbeMvSum += (uint32_t)analogReadMilliVolts(pinMap.steer);
+  if (++mvProbeCount < 8) return -1;
+  mvProbeActive = false;
+  bool ok = useMv ? !rsh_mv_should_fallback(mvProbeRawSum, mvProbeMvSum, 8)
+                  : rsh_mv_should_restore(mvProbeMvSum, 8);
+  if (ok == useMv) return 0;
+  useMv = !useMv;
+  return 1;
+}
+
 void inputs_begin() {
   analogReadResolution(12);              // board ka native size
   analogSetAttenuation(ADC_11db);        // default bhi yehi hai; wazeh likh diya
@@ -308,19 +405,48 @@ InputSample inputs_read() {
 
   // FW-01: I2C axes poll karo (AS5600 har cycle, ADS1115 20 ms cadence,
   // cached values). Bus on ho to hi — configure ke baghair poll no-op hai.
-  if (i2cBusStarted)
-    rsh_i2c_axes_poll(&i2cAxes, i2c_wire_read_, i2c_wire_write_, NULL, nowMs);
+  // F-01: lagatar 5 fail -> 500 ms backoff (bus hammer nahi) + ek dafa
+  // bus recovery. Backoff ke dauraan valid[] waisa hi rehta hai (axis
+  // invalid flag fail-closed rehta hai), values stale rehti hain.
+  if (i2cBusStarted) {
+    if (i2cBackoffUntilMs != 0 &&
+        (uint32_t)(nowMs - i2cBackoffUntilMs) < 0x80000000u) {
+      i2cBackoffUntilMs = 0;  // backoff khatam — dobara poll karo
+      i2cRecoveredThisBackoff = false;
+    }
+    if (i2cBackoffUntilMs == 0) {
+      int rc = rsh_i2c_axes_poll(&i2cAxes, i2c_wire_read_, i2c_wire_write_,
+                                 NULL, nowMs);
+      if (rc == 0) {
+        i2cFailStreak = 0;
+        i2cRecoveredThisBackoff = false;
+      } else if (++i2cFailStreak >= 5) {
+        i2cBackoffUntilMs = nowMs + 500;
+        i2cFailStreak = 0;
+        if (!i2cRecoveredThisBackoff) {
+          i2c_bus_recover_();
+          i2cRecoveredThisBackoff = true;
+        }
+      }
+    }
+  }
 
   // mV fallback periodic recheck (F13 — sirf boot par nahi): raw mode mein
   // har 30 s dobara probe karo; calibration wapas aaye to mV restore karo.
   // mV mode mein bhi probe karo — calibration beech mein mare to fallback.
   // Phase G (C3): steering pin badle to forceMvProbe agle read par probe
   // karwata hai (nay pin ki calibration alag ho sakti hai).
-  if (pinMap.steer != RSH_PINMAP_ABSENT &&
-      (forceMvProbe || (uint32_t)(nowMs - lastMvCheckMs) >= RSH_MV_RECHECK_MS)) {
-    lastMvCheckMs = nowMs;
-    forceMvProbe = false;
-    if (mv_probe_ok() != useMv) useMv = !useMv;
+  // F-16: probe stepped hai — har cycle sirf 1 raw + 1 mV read (8 cycles
+  // mein poora), ek cycle mein 16 reads ka spike nahi.
+  if (pinMap.steer != RSH_PINMAP_ABSENT) {
+    if (mvProbeActive) {
+      (void)mv_probe_step_();
+    } else if (forceMvProbe ||
+               (uint32_t)(nowMs - lastMvCheckMs) >= RSH_MV_RECHECK_MS) {
+      lastMvCheckMs = nowMs;
+      forceMvProbe = false;
+      (void)mv_probe_step_();  // pehla pair isi cycle
+    }
   }
 
   InputSample s{};   // value-init: band module ki values 0 rehti hain
@@ -333,13 +459,35 @@ InputSample inputs_read() {
     s.steering = i2cAxes.value_mv[RSH_PINMAP_AXIS_STEERING];
   else
     s.steering = avg_steering();
+  // HID P1-2: pedal button debouncers EK dafa yahan update karo — axis
+  // drive (button mode) aur button bits dono isi state se aate hain.
+  // Dobara update karna debounce counting bigarta (ek cycle mein 2
+  // observations). Round 2 W3 guard: pin 25/26 kisi aur function ko
+  // diye hon to button hi nahi (axis 0 rehta hai).
+  bool accelBtnPressed = false, brakeBtnPressed = false;
+  if (!rsh_pinmap_uses_pin(&pinMap, PIN_ACCEL_BTN))
+    accelBtnPressed =
+        dbAccel.update(digitalRead(PIN_ACCEL_BTN) == LOW, nowMs);
+  if (!rsh_pinmap_uses_pin(&pinMap, PIN_BRAKE_BTN))
+    brakeBtnPressed =
+        dbBrake.update(digitalRead(PIN_BRAKE_BTN) == LOW, nowMs);
   // Phase G (C3): axes live pin table se; unassigned axis (record nahi)
   // sample nahi hota — value 0 (avg_pedal kabhi 0xFF pin par nahi bulaya jata).
   // FW-01: I2C axis ho to read_axis_value_ sampler se deta hai.
-  s.accelAnalog = read_axis_value_(RSH_PINMAP_AXIS_ACCEL, pinMap.accel,
-                                   accelAnalogMode, lastAccelDiag);
-  s.brakeAnalog = read_axis_value_(RSH_PINMAP_AXIS_BRAKE, pinMap.brake,
-                                   brakeAnalogMode, lastBrakeDiag);
+  // HID P1-2: button mode mein axis debounced button se chalta hai
+  // (4095 daba hua / 0 chhora hua) — pehle stale/floating analog jata tha.
+  if (accelAnalogMode) {
+    s.accelAnalog = read_axis_value_(RSH_PINMAP_AXIS_ACCEL, pinMap.accel,
+                                     accelAnalogMode, lastAccelDiag);
+  } else {
+    s.accelAnalog = accelBtnPressed ? 4095 : 0;
+  }
+  if (brakeAnalogMode) {
+    s.brakeAnalog = read_axis_value_(RSH_PINMAP_AXIS_BRAKE, pinMap.brake,
+                                     brakeAnalogMode, lastBrakeDiag);
+  } else {
+    s.brakeAnalog = brakeBtnPressed ? 4095 : 0;
+  }
   // FW-11 (F7): band module ka ADC read NAHI hota — handbrake band ho to
   // avg_pedal call hi nahi hota (koi ADC conversion, koi dummy read nahi),
   // value 0 rehti hai aur axis mask bit bhi clear hoti hai (modules.h).
@@ -457,9 +605,12 @@ InputSample inputs_read() {
       movedAtBrake = nowMs;
     if (s.clutch > prevClutch + 30 || prevClutch > s.clutch + 30)
       movedAtClutch = nowMs;
+    if (s.handbrake > prevHandbrake + 30 || prevHandbrake > s.handbrake + 30)
+      movedAtHandbrake = nowMs;  // F-04
   }
   prevSteer = s.steering; prevAccel = s.accelAnalog; prevBrake = s.brakeAnalog;
   prevClutch = s.clutch;
+  prevHandbrake = s.handbrake;  // F-04
   hasPrev = true;
   bool othersForSteer = (uint32_t)(nowMs - movedAtAccel) < 2000 ||
                         (uint32_t)(nowMs - movedAtBrake) < 2000 ||
@@ -473,6 +624,10 @@ InputSample inputs_read() {
   bool othersForClutch = (uint32_t)(nowMs - movedAtSteer) < 2000 ||
                          (uint32_t)(nowMs - movedAtAccel) < 2000 ||
                          (uint32_t)(nowMs - movedAtBrake) < 2000;
+  bool othersForHandbrake = (uint32_t)(nowMs - movedAtSteer) < 2000 ||  // F-04
+                            (uint32_t)(nowMs - movedAtAccel) < 2000 ||
+                            (uint32_t)(nowMs - movedAtBrake) < 2000 ||
+                            (uint32_t)(nowMs - movedAtClutch) < 2000;
   // mV mode mein steering rail ~3300 mV hai, raw mode mein 4095.
   // FW-01: I2C steering bhi mV hai (inputs_steering_is_mv).
   uint16_t steerRail = inputs_steering_is_mv() ? 3300 : 4095;
@@ -482,18 +637,31 @@ InputSample inputs_read() {
   // invalid bit lagana ghalat hota (axis maujood hi nahi).
   // FW-01: I2C axis ka bhi health check hota hai (axis_present — pin
   // ya I2C kind); rail mV ke hisaab se (axis_rail_).
+  // F-03: I2C axis ka rail test nahi chalta (values rail par EXACT
+  // clamp hoti hain) aur button-mode axis ka bhi nahi (4095/0 binary hai
+  // — daba hua pedal/handbrake rail hi hota hai). Dono ke liye sirf
+  // jitter rule aur sampler valid[] flags chalte hain.
+  auto axis_is_i2c = [](uint8_t slot) {
+    uint8_t t = pinMap.axisType[slot];
+    return t == RSH_CFG_TYPE_AXIS_AS5600 || t == RSH_CFG_TYPE_AXIS_ADS1115;
+  };
   if (rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_STEERING) &&
-      healthSteer.update(s.steering, steerRail, othersForSteer, nowMs))
+      healthSteer.update(s.steering, steerRail, othersForSteer, nowMs,
+                         !axis_is_i2c(RSH_PINMAP_AXIS_STEERING)))
     axisInvalidMask |= 0x01;
   if (rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_ACCEL) &&
       healthAccel.update(s.accelAnalog,
                          axis_rail_(RSH_PINMAP_AXIS_ACCEL, pinMap.accel),
-                         othersForAccel, nowMs))
+                         othersForAccel, nowMs,
+                         accelAnalogMode &&
+                             !axis_is_i2c(RSH_PINMAP_AXIS_ACCEL)))
     axisInvalidMask |= 0x02;
   if (rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_BRAKE) &&
       healthBrake.update(s.brakeAnalog,
                          axis_rail_(RSH_PINMAP_AXIS_BRAKE, pinMap.brake),
-                         othersForBrake, nowMs))
+                         othersForBrake, nowMs,
+                         brakeAnalogMode &&
+                             !axis_is_i2c(RSH_PINMAP_AXIS_BRAKE)))
     axisInvalidMask |= 0x04;
   // Phase F WS5: clutch health bit 3. Band module ka clutch hamesha 0
   // hai — AxisHealth rail-stuck is par bhi chalega, lekin band module
@@ -504,8 +672,19 @@ InputSample inputs_read() {
   if (rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_CLUTCH) &&
       healthClutch.update(s.clutch,
                           axis_rail_(RSH_PINMAP_AXIS_CLUTCH, pinMap.clutch),
-                          othersForClutch, nowMs))
+                          othersForClutch, nowMs,
+                          !axis_is_i2c(RSH_PINMAP_AXIS_CLUTCH)))
     axisInvalidMask |= 0x08;
+  // F-04: handbrake health (slot 4) — pehle koi coverage nahi thi.
+  // Button mode mein rail test nahi (4095/0 binary); I2C par bhi nahi.
+  if (rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_HANDBRAKE) &&
+      healthHandbrake.update(s.handbrake,
+                             axis_rail_(RSH_PINMAP_AXIS_HANDBRAKE,
+                                        pinMap.handbrake),
+                             othersForHandbrake, nowMs,
+                             !pinMap.handbrakeButtonMode &&
+                                 !axis_is_i2c(RSH_PINMAP_AXIS_HANDBRAKE)))
+    axisInvalidMask |= 0x10;
   // FW-01: I2C axis fail (NACK / magnet ghayab) -> invalid bit (last
   // value rehti hai — health check alag se rail-stuck bhi pakad sakta
   // hai, lekin ye bit seedha sampler ki validity se aata hai).
@@ -525,6 +704,11 @@ InputSample inputs_read() {
       rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_CLUTCH) &&
       !i2cAxes.valid[RSH_PINMAP_AXIS_CLUTCH])
     axisInvalidMask |= 0x08;
+  // F-04: I2C handbrake fail (NACK / magnet ghayab) -> invalid bit 4.
+  if (pinMap.handbrake == RSH_PINMAP_ABSENT &&
+      rsh_pinmap_axis_present(&pinMap, RSH_PINMAP_AXIS_HANDBRAKE) &&
+      !i2cAxes.valid[RSH_PINMAP_AXIS_HANDBRAKE])
+    axisInvalidMask |= 0x10;
 
   // Buttons active-low hain (INPUT_PULLUP, doosri taraf GND).
   // Debounce time-based hai (F12) — governor level se aazad, hamesha 10 ms.
@@ -545,10 +729,11 @@ InputSample inputs_read() {
   // physical pin do button bits deta (misal encoder B pin 25 LOW hone
   // par accel-button bit bhi lag jata). rsh_pinmap_uses_pin pure hai,
   // host tests mein covered hai.
-  if (!rsh_pinmap_uses_pin(&pinMap, PIN_ACCEL_BTN) &&
-      dbAccel.update(digitalRead(PIN_ACCEL_BTN) == LOW, nowMs))  b |= RSH_BTN_ACCEL;
-  if (!rsh_pinmap_uses_pin(&pinMap, PIN_BRAKE_BTN) &&
-      dbBrake.update(digitalRead(PIN_BRAKE_BTN) == LOW, nowMs))  b |= RSH_BTN_BRAKE;
+  // HID P1-2: pedal bits upar precomputed state se (debouncer dobara
+  // update nahi hota). Bits stream mein jate hain; host pipeline inhein
+  // strip karta hai (PROTOCOL-V2.2 §1.3.1) — game ko sirf axis dikhta hai.
+  if (accelBtnPressed) b |= RSH_BTN_ACCEL;
+  if (brakeBtnPressed) b |= RSH_BTN_BRAKE;
   if (rsh_modules_horn_enabled() && pinMap.horn != RSH_PINMAP_ABSENT &&
       dbHorn.update(digitalRead(pinMap.horn) == LOW, nowMs))    b |= RSH_BTN_HORN;
   s.buttons = b;

@@ -132,6 +132,11 @@ static inline size_t rsh_build_packet(uint8_t *buf, uint16_t seq, uint32_t times
 #define RSH_CTRL_PIN_CONFLICT 5
 #define RSH_CTRL_UNSUPPORTED  6
 #define RSH_CTRL_BUSY         7
+#define RSH_CTRL_NVS_FAIL     8   // F-07 (polish round, v4.0.6): SET_PASSWORD
+                                  // ki synchronous NVS write fail hui —
+// password NAHI badla; app dobara koshish kare ya purana password
+                                  // istemal kare. Rust ErrorCode::NvsFail = 8
+                                  // (crates/rsh-protocol/src/control.rs).
 
 // Control commands (§3.3); reply mein cmd = reqCmd | 0x80
 #define RSH_CMD_GET_CAPS     0x01

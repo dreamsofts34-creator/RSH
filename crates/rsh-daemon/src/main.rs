@@ -49,8 +49,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rsh_api::{
     ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnEvent, ConnectionError,
     ConnectionInfo, ConnectionState, DiagStats, DraftStatus, FirmwareCheck, FirmwareUpdateStatus,
-    GameSummary, ManagerAction, PollState, ProfileSummary, RawMv, SnapshotInfo, TuningSettings,
-    UserError, VjoyStatus, WifiStatus,
+    GameSummary, ManagerAction, PollState, ProfileSummary, RawMv, SlowPollState, SnapshotInfo,
+    TuningSettings, UserError, VjoyStatus, WifiStatus,
 };
 use rsh_app_core::diagnostics::{
     append_startup_log_both, fresh_fatal_daemon_status, install_panic_hook, log_fatal,
@@ -214,6 +214,12 @@ async fn manager_loop(
     let mut last_error: Option<ConnectionError> = None;
     let mut last_reachable = false;
     let mut last_want_escalated = false;
+    // PERF P1-5 (polish round): last snapshot seq already
+    // pushed as an `AppEvent::Snapshot` — the push the UI's
+    // subscribe path consumes, so it can drop its 20 Hz poll to
+    // a 1 Hz fallback. Published at most once per 250 ms tick,
+    // only when the seq actually advanced.
+    let mut last_snapshot_seq: u64 = 0;
     // D6 migration (lazy, per board): board MACs whose legacy
     // device-key entry was already deleted this run — the entry
     // is deleted once, on the first HELLO observed from that
@@ -269,32 +275,23 @@ async fn manager_loop(
                     }
                 }
                 TrayAction::ToggleSend => {
-                    // R3-D-03: the backend switch behind this toggle
-                    // can take up to 60 s (HIDMaestro sidecar spawn
-                    // + UAC dwell) — running it here, on the
-                    // manager-loop task, stalled the 250 ms tick
-                    // (watchdog, retry timer, tray drain) and the
-                    // resume then fired a spurious watchdog rebuild.
-                    // Same `spawn_blocking` fix as `RestartWheel`
-                    // below; the loop awaits the outcome and logs it
-                    // like every other tray action.
+                    // CORE-P2-4 (polish round): the switch behind
+                    // this toggle can take up to 310 s — awaiting
+                    // the `spawn_blocking` join here still suspended
+                    // the manager loop for the whole switch (the old
+                    // comment claimed the move fixed the stall; it
+                    // only moved the work, not the wait). Fire it
+                    // on the blocking pool and return at once; the
+                    // next poll surfaces the applied state.
                     let enabled = !api.output_enabled();
                     let api_clone = Arc::clone(&api);
-                    match tokio::task::spawn_blocking(move || {
+                    tokio::task::spawn_blocking(move || {
                         api_clone.set_output_enabled(enabled);
-                    })
-                    .await
-                    {
-                        Ok(()) => {
-                            log_line(verbose, &format!("tray: Send to game = {enabled}"));
-                        }
-                        Err(error) => {
-                            log_line(
-                                verbose,
-                                &format!("tray: Send to game toggle failed: {error}"),
-                            );
-                        }
-                    }
+                    });
+                    log_line(
+                        verbose,
+                        &format!("tray: Send to game toggle started (target {enabled})"),
+                    );
                 }
                 TrayAction::ProfileSelected(name) => match resolve_profile_id(&api, &name) {
                     Some(id) => match api.state.activate_profile(&id) {
@@ -412,6 +409,14 @@ async fn manager_loop(
             let _ = action;
         }
         last_gate = gate;
+        // PERF P1-5: push the live snapshot when it advanced.
+        // `snapshot()` clones a cheap Arc-backed struct; the seq
+        // check keeps this to one publish per tick at most.
+        let snapshot = api.snapshot();
+        if snapshot.seq != last_snapshot_seq {
+            last_snapshot_seq = snapshot.seq;
+            publish(&event_tx, AppEvent::Snapshot(snapshot));
+        }
         let error = api.state.session_last_error_typed();
         if error != last_error {
             if let Some(reason) = error {
@@ -506,8 +511,24 @@ async fn manager_loop(
                 verbose,
                 "connection: heartbeat watchdog fired — rebuilding transport",
             );
-            let _ = api.state.disconnect_transport();
-            let _ = api.state.connect_transport(TransportKind::Udp);
+            // CORE-P1-1 (polish round): rebuild on the RECORDED
+            // transport, never hard-coded UDP — a USB wheel whose
+            // stream stalls was silently rebuilt on Wi-Fi, rebuilt
+            // 5x and latched WatchdogStall. Errors are logged,
+            // not discarded.
+            let recorded = api.state.transport_request().0;
+            if let Err(error) = api.state.disconnect_transport() {
+                log_line(
+                    verbose,
+                    &format!("connection: watchdog rebuild disconnect failed: {error}"),
+                );
+            }
+            if let Err(error) = api.state.connect_transport(recorded) {
+                log_line(
+                    verbose,
+                    &format!("connection: watchdog rebuild connect ({recorded:?}) failed: {error}"),
+                );
+            }
             publish(&event_tx, connection_changed_event(&api));
         }
         // Backoff retry timer. R3-D-02: ONE loop owns the retry —
@@ -1476,6 +1497,56 @@ impl DeferredApi {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Starting-values `slow_poll` (pre-install fallback for the
+    /// `slow_poll` forward above): the same composition as the
+    /// trait default, built from this wrapper's starting getters.
+    fn default_slow_poll(&self) -> SlowPollState {
+        SlowPollState {
+            version: self.version(),
+            firmware_version: self.firmware_version(),
+            backend: self.output_backend(),
+            autostart: self.autostart(),
+            board_address: self.board_address(),
+            diag_stats: self.diag_stats().ok(),
+            wifi_status: self.wifi_status(),
+            calibration: self.calibration().ok(),
+            raw_mv: self.raw_mv().ok(),
+            profiles: self.list_profiles(),
+            games: self.list_games(),
+            firmware_check: self.firmware_check().ok(),
+            firmware_update_status: self.firmware_update_status(),
+            vjoy_status: self.vjoy_status().ok(),
+            close_to_tray: self.close_to_tray(),
+            auto_pause: self.auto_pause(),
+            bindings: self.list_bindings(),
+            knobs: self.knob_actions(),
+            draft: self.draft_status(),
+            tunings: {
+                let mut tunings = std::collections::BTreeMap::new();
+                for module in [
+                    "steering",
+                    "throttle",
+                    "brake",
+                    "clutch",
+                    "handbrake",
+                    "led",
+                    "shifter",
+                    "horn",
+                ] {
+                    tunings.insert(module.to_string(), self.get_tuning(module));
+                }
+                tunings
+            },
+            modules: {
+                let mut modules = std::collections::BTreeMap::new();
+                for module in ["handbrake", "shifter", "horn", "led"] {
+                    modules.insert(module.to_string(), self.module_enabled(module));
+                }
+                modules
+            },
+        }
+    }
 }
 
 /// Forward one [`AppApi`] method to the installed [`DaemonApi`]:
@@ -1529,12 +1600,13 @@ impl AppApi for DeferredApi {
     // `starting_error` ("RSH is still starting"), never the trait
     // default, and never a silent success.
     //
-    // Deliberately NOT forwarded: `slow_poll` — its trait default
-    // composes the forwarded getters, so it already answers
-    // correctly through this wrapper (the daemon's cached override
-    // is an optimisation, not a different answer); and
-    // `cache_generation` — its default `0` IS the documented daemon
-    // behaviour, and it is never dispatched over IPC.
+    // Deliberately NOT forwarded: `cache_generation` — its
+    // default `0` IS the documented daemon behaviour, and it is
+    // never dispatched over IPC. `slow_poll` IS forwarded below
+    // (CORE-P2-1 / PERF F-6, polish round): the trait default
+    // re-reads every slow getter fresh on every call, so the
+    // daemon's 5 s / 10 s / 30 s TTL cache never engaged in
+    // production and every ~1 Hz poll paid full disk/DLL probes.
     fwd!(value scan_rsh_networks() -> Vec<String> = Vec::new());
     fwd!(result rejoin_wifi_open(ssid: &str) -> WifiStatus);
     fwd!(result rejoin_wifi(ssid: &str, password: &str) -> WifiStatus);
@@ -1604,6 +1676,17 @@ impl AppApi for DeferredApi {
     fwd!(result install_vjoy() -> String);
     fwd!(result diag_stats() -> DiagStats);
 
+    /// CORE-P2-1 / PERF F-6 (polish round): forward `slow_poll`
+    /// to the installed `DaemonApi` so its TTL cache engages; before
+    /// install, fall back to the trait default (which composes the
+    /// starting getters and is correct, just uncached).
+    fn slow_poll(&self) -> SlowPollState {
+        match self.inner() {
+            Some(api) => api.slow_poll(),
+            None => self.default_slow_poll(),
+        }
+    }
+
     /// DS-81: delegate — do NOT fall back to the trait default's
     /// three separate reads, which would undo
     /// [`DaemonApi::poll`]'s single-read guarantee. Before install,
@@ -1670,8 +1753,10 @@ fn main() {
         &format!("daemon: elevation: {}", elevation_state()),
     );
     // Round 3 WS-6 (R3-AK-01): a Task-Scheduler respawn
-    // (`--scheduled-respawn`, the "RSH Daemon" task the installer
-    // creates) must stay blocked on the fatal latches — a daemon
+    // (`--scheduled-respawn` — the "RSH Daemon" task the installer
+    // used to create; the task was removed in v2.0.13, P2-1, but
+    // the flag is kept for manual/debug launches) must stay
+    // blocked on the fatal latches — a daemon
     // that died `IpcBindFailed` / `DaemonHung` exits 1 on purpose,
     // and the task's restart-on-failure would otherwise resurrect
     // it in a loop. Exit 0 here: Task Scheduler only restarts on

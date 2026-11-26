@@ -79,16 +79,30 @@ fn latency() -> &'static Mutex<IpcLatency> {
 }
 
 /// Record one dispatch duration for `method` (DS-82).
+///
+/// PERF P3-1 (v2.0.13 polish): steady state allocates NOTHING —
+/// a borrowed `get_mut` hit is the common path (every method is
+/// seen within the first seconds of daemon life); the `String`
+/// alloc happens once per method, on first sight. The global
+/// `Mutex` stays: ~25 dispatches/s cannot contend it in
+/// practice, and a lock-free/sharded counter would buy nothing
+/// measurable here. p50/p99 are already lazy — they are computed
+/// only inside `ipc_latency_snapshot` / `ipc_latency_global_p50_p99_ms`
+/// (the 1 Hz `diag_stats` read), never on the dispatch path.
 pub fn record_ipc_latency(method: &str, elapsed: Duration) {
     let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
     let Ok(mut guard) = latency().lock() else {
         return;
     };
-    guard
-        .methods
-        .entry(method.to_string())
-        .or_default()
-        .record(micros);
+    if let Some(stats) = guard.methods.get_mut(method) {
+        stats.record(micros);
+    } else {
+        guard
+            .methods
+            .entry(method.to_string())
+            .or_default()
+            .record(micros);
+    }
     guard.global.record(micros);
 }
 

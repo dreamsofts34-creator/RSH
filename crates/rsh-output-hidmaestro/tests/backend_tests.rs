@@ -43,6 +43,27 @@ fn backend(envs: &[(&str, &str)]) -> HidMaestroOutput {
     HidMaestroOutput::with_config(config(envs))
 }
 
+/// PERF P1-1 (polish round): submits are async — the reply (and
+/// the submit count / latency it carries) lands after the tick that
+/// sent it, and a sidecar death is noticed by the drain on the
+/// following tick, not by the submit that killed it. So a test that
+/// wants to observe a submit's reply must: submit once, let the
+/// stub answer, then submit again — the second call's start-drain
+/// consumes exactly the first reply (drain-before-enqueue), so the
+/// count advances by exactly one. The sleeps are settle windows,
+/// not timing assumptions: 50 ms is ~50x a local-process round-trip
+/// and the assertion after them is ordered (one reply in flight),
+/// so the test cannot flake on a slow tick.
+fn settle_after_submit() {
+    std::thread::sleep(Duration::from_millis(50));
+}
+
+/// Same, for a crashing stub: process exit + EOF delivery through
+/// the reader thread. 100 ms is ~50x that path on a local machine.
+fn settle_after_crash() {
+    std::thread::sleep(Duration::from_millis(100));
+}
+
 fn full_state() -> OutputState {
     let mut s = OutputState::neutral();
     s.steering = 0.5;
@@ -87,8 +108,13 @@ fn update_submits_frame() {
     let mut b = backend(&[]);
     b.try_connect().unwrap();
     b.update(&full_state()).expect("update");
+    // Async submit: the reply lands after the tick, so the count is
+    // still 1 here — the second update's start-drain consumes the
+    // first reply (neutral at connect + this update = 2 submits).
+    assert_eq!(b.status().submit_count, 1, "reply not drained yet");
+    settle_after_submit();
+    b.update(&full_state()).expect("second update");
     let status = b.status();
-    // Neutral at connect + this update = 2 submits.
     assert_eq!(status.submit_count, 2);
     assert_eq!(status.last_submit_latency_us, Some(9.0));
     b.disconnect();
@@ -237,6 +263,8 @@ fn raw_report_path_submits_15_bytes() {
     assert!(b.use_raw_report());
     b.try_connect().unwrap();
     b.update(&full_state()).unwrap();
+    settle_after_submit();
+    b.update(&full_state()).unwrap();
     assert_eq!(b.status().submit_count, 2, "neutral + one update");
     b.disconnect();
 }
@@ -251,6 +279,8 @@ fn submit_state_path_still_available_when_opted_out() {
     assert!(!b.use_raw_report());
     b.try_connect().unwrap();
     b.update(&full_state()).unwrap();
+    settle_after_submit();
+    b.update(&full_state()).unwrap();
     assert_eq!(b.status().submit_count, 2, "neutral + one update");
     b.disconnect();
 }
@@ -259,7 +289,13 @@ fn submit_state_path_still_available_when_opted_out() {
 fn crash_mid_session_marks_disconnected_then_fallback() {
     let mut b = backend(&[("HM_STUB_CRASH_AFTER_SUBMITS", "1")]);
     b.try_connect().unwrap(); // neutral (Neutral cmd) lands
-    let err = b.update(&full_state()).unwrap_err(); // submit #1 crashes
+    // Async submit: the crashing submit itself returns Ok (queued)
+    // — the stub dies processing it, and the drain on the NEXT
+    // update sees the EOF and fails the backend.
+    b.update(&full_state())
+        .expect("crashing submit queues fine");
+    settle_after_crash();
+    let err = b.update(&full_state()).unwrap_err(); // drain sees the death
     assert!(matches!(err, VJoyError::DriverNotFound(_)));
     assert!(!b.is_connected());
     assert_eq!(b.status().kind, HidMaestroStateKind::SidecarFailed);
@@ -267,6 +303,9 @@ fn crash_mid_session_marks_disconnected_then_fallback() {
     // The one retry: reconnect, then the next update dies again.
     b.try_connect().expect("retry connect");
     assert!(b.is_connected());
+    b.update(&full_state())
+        .expect("retry crashing submit queues fine");
+    settle_after_crash();
     assert!(b.update(&full_state()).is_err());
     assert!(!b.is_connected());
     assert!(b.fallback_needed(), "second death: fallback latch set");
@@ -292,7 +331,14 @@ fn crash_mid_session_marks_disconnected_then_fallback() {
 fn update_after_crash_is_not_connected() {
     let mut b = backend(&[("HM_STUB_CRASH_AFTER_SUBMITS", "1")]);
     b.try_connect().unwrap();
-    assert!(b.update(&full_state()).is_err());
+    // The crashing submit queues fine (async); the next update's
+    // drain sees the EOF and fails the backend; the one after that
+    // hits the not-connected guard.
+    b.update(&full_state())
+        .expect("crashing submit queues fine");
+    settle_after_crash();
+    let err = b.update(&full_state()).unwrap_err();
+    assert!(matches!(err, VJoyError::DriverNotFound(_)));
     let err = b.update(&full_state()).unwrap_err();
     assert_eq!(err, VJoyError::NotConnected);
 }

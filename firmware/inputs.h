@@ -17,24 +17,40 @@ struct Debouncer {
   bool pendingValue = false;     // nayi value jis ka intezar hai
   bool hasPending = false;
   uint32_t pendingSinceMs = 0;   // pending kab se chal raha hai
+  uint8_t pendingSamples = 0;    // F-10: pending value kitni lagataar
+                                 // samples par dekhi gayi (pending wali
+                                 // sample bhi gin'ti mein)
   uint16_t debounceMs = DEBOUNCE_MS;
 
   // Har cycle par call karo, nowMs = millis(). Debounced state return hota hai.
   // (uint32 subtraction wrap-safe hai — millis ~49 din par wrap hota hai.)
+  // F-10 (polish round): flip SIRF tab jab (a) pending value kam az kam
+  // 10 ms tak rahi ho — chahe debounceMs 5 ms hi kyun na ho (sensitivity
+  // 100) — AUR (b) wo kam az kam 2 lagataar samples par dekhi gayi ho.
+  // Pehle 5 ms debounce par agle hi sample par flip ho jata tha (ek
+  // sample ka bounce pulse — 6 ms ka pulse do 5 ms samples par dikh kar
+  // state flip kar deta tha; governor level 3 par 10 ms period mein to
+  // 10 ms default bhi ek sample ka hota tha).
   bool update(bool rawPressed, uint32_t nowMs) {
     if (rawPressed == state) {
       hasPending = false;
+      pendingSamples = 0;
       return state;
     }
     if (!hasPending || pendingValue != rawPressed) {
       hasPending = true;
       pendingValue = rawPressed;
       pendingSinceMs = nowMs;
+      pendingSamples = 1;
       return state;
     }
-    if ((uint32_t)(nowMs - pendingSinceMs) >= debounceMs) {
+    if (pendingSamples < 255) pendingSamples++;
+    uint16_t effMs = debounceMs < 10 ? 10 : debounceMs;
+    if (pendingSamples >= 2 &&
+        (uint32_t)(nowMs - pendingSinceMs) >= effMs) {
       state = rawPressed;
       hasPending = false;
+      pendingSamples = 0;
     }
     return state;
   }
@@ -161,11 +177,32 @@ struct AxisHealth {
   uint32_t railSinceMs = 0;    // rail par kab se (sirf onRail ke saath valid)
   bool onRail = false;         // railSinceMs==0 bhi valid waqt hai (t=0),
                                // is liye alag flag lazmi hai — sentinel nahi
+  uint16_t railMin = 0;        // F-03: is rail episode ki min value
+  uint16_t railMax = 0;        // F-03: is rail episode ki max value
 
-  bool update(uint16_t value, uint16_t railHigh, bool othersMoving, uint32_t nowMs) {
+  // F-03 (polish round): rail-stuck SIRF tab jab value 10 s tak EXACT
+  // rail par ho AUR us poore window mein bilkul na hili ho (spread 0)
+  // AUR doosre axes move kar rahe hon. Pehle har 10 s rail-hold invalid
+  // hota tha — full lock / full brake pakar kar rakhna bhi rail hi hai,
+  // aur zinda pot haath ke load par microscopically hilta rehta hai
+  // (trimmed mean bhi ±1-2 counts deta hai), jabke kata hua pot bilkul
+  // nahi hilta. `railTest=false` I2C axes ke liye hai — ADS1115/AS5600
+  // values rail par EXACT clamp hoti hain (3300 mV), is liye un ka rail
+  // test kabhi nahi chalta; un ki validity sirf sampler ke `valid[]`
+  // flags se aati hai (inputs.cpp I2C-invalid branch).
+  bool update(uint16_t value, uint16_t railHigh, bool othersMoving, uint32_t nowMs,
+              bool railTest = true) {
     bool railed = (value == 0 || value >= railHigh);
     if (railed) {
-      if (!onRail) { onRail = true; railSinceMs = nowMs; }
+      if (!onRail) {
+        onRail = true;
+        railSinceMs = nowMs;
+        railMin = value;
+        railMax = value;
+      } else {
+        if (value < railMin) railMin = value;
+        if (value > railMax) railMax = value;
+      }
     } else {
       onRail = false;
       railSinceMs = 0;
@@ -177,7 +214,8 @@ struct AxisHealth {
     }
     lastValue = value;
     hasLast = true;
-    if (onRail && (uint32_t)(nowMs - railSinceMs) >= RSH_AXIS_RAIL_MS
+    if (railTest && onRail && railMax == railMin &&
+        (uint32_t)(nowMs - railSinceMs) >= RSH_AXIS_RAIL_MS
         && othersMoving)
       return true;
     if (emaJitterX256 / 256 > RSH_AXIS_JITTER_THRESHOLD) return true;
@@ -238,7 +276,8 @@ const RshPinMap *inputs_pin_map();
 // Pedal analog mode: false = button mode (analog skip, sirf 10 Hz diagnostic)
 void inputs_set_pedal_analog(bool accelAnalog, bool brakeAnalog);
 // Axis validity mask: bit0 steering, bit1 accel, bit2 brake,
-// bit3 clutch (Phase F WS5, 1 = invalid, F2)
+// bit3 clutch (Phase F WS5), bit4 handbrake (F-04, polish round),
+// 1 = invalid, F2
 uint8_t inputs_axis_invalid_mask();
 bool inputs_axis_invalid();
 SampleGovernor &inputs_governor();   // adaptive sampling (neeche dekho)
