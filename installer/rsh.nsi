@@ -288,6 +288,166 @@ FunctionEnd
     ${EndIf}
   ${EndIf}
 !macroend
+
+; FH4 fix #1 (v2.0.13): GameInput RacingWheel mapping for the vJoy
+; device, so Windows.Gaming.Input wheel games (Forza Horizon 4/5,
+; Forza Motorsport on the Store) show a Wheel tab for RSH.
+; Wheel games classify wheels from the registry, not from
+; visibility:
+; mappings for VID VVVV / PID PPPP / usage page UUUU / usage XXXX
+; are read from
+;   HKLM\SYSTEM\CurrentControlSet\Control\GameInput\Devices\VVVVPPPPUUUUXXXX
+; (Microsoft Learn, "Registry data for game controllers"). vJoy
+; device 1 is VID 1234 / PID BEAD, usage page 0001 (Generic
+; Desktop), usage 0004 (Joystick) — hence key 1234BEAD00010004.
+; This is a Windows-level classification, not a per-game hack: no
+; game is detected, no game-specific key is written.
+; Axis indices are RawGameController indices, which follow the
+; vJoy HID descriptor order (fixed upstream in vJoyConf's
+; CreateHidReportDesc): X=0, Y=1, Z=2, Rx=3, Ry=4, Rz=5,
+; Slider=6, Dial=7 — the EmuWheel envelope (see
+; ConfigureVJoyDevice1) enables exactly these eight, so:
+;   Wheel=X/0, Throttle=Y/1, Brake=Z/2, Handbrake=Slider/6.
+; Invert is 0 everywhere: RSH's raw values RISE with input
+; (steering right = max, pedals pressed = max — see
+; crates/rsh-output/src/vjoy.rs), so no inversion is needed.
+; (The Learn example inverts Throttle/Brake because ITS example
+; device reports pedals inverted; RSH does not.)
+; PreviousGear/NextGear are the sequential-shifter paddles:
+; PROTOCOL-V2.2 §1.1 — stream bit 0 = shift-up, bit 1 =
+; shift-down — and the output button word is 1-based (bit 0 =
+; button 1), so NextGear = button 1 = ButtonIndex 0 and
+; PreviousGear = button 2 = ButtonIndex 1. H-pattern gears are
+; deliberately NOT mapped (FirstGear..SixthGear, ReverseGear):
+; the pipeline strips gear bits 5–10 from the button word, so
+; those buttons never fire — a mapping would point at dead
+; indices. No Clutch subkey either: the envelope has no Clutch
+; usage axis (RSH's wClutch field is ignored by the driver when
+; the axis is absent), and Clutch is optional in the schema.
+; MaxWheelAngle 450 = the default 900° lock-to-lock, one
+; direction (the Learn example uses 0x1C2 = 450 for the same
+; reason). Labels are optional in the schema and skipped.
+; SetRegView 64 is SCOPED (same pattern as the WER block): the
+; mapping must land in the native 64-bit view, where 64-bit games
+; read it. Written on EVERY install (fresh and update — this
+; section always runs), and removed by the uninstaller.
+; The game must be restarted after install for the mapping to take
+; effect (GameInput reads it at device enumeration). The user's
+; PC retest — in Forza Horizon 4 and in a second game — is the
+; only proof the Wheel tab appears; nothing here claims the wheel
+; works in every game.
+Function WriteGameInputVJoyMapping
+  SetRegView 64
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004" "Description" "RSH Wheel (vJoy)"
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel" "MaxWheelAngle" 450
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Wheel" "AxisIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Wheel" "Invert" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Throttle" "AxisIndex" 1
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Throttle" "Invert" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Brake" "AxisIndex" 2
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Brake" "Invert" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Handbrake" "AxisIndex" 6
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Handbrake" "Invert" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\PreviousGear" "ButtonIndex" 1
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\NextGear" "ButtonIndex" 0
+  SetRegView 32
+FunctionEnd
+
+; FH4 fix #2 (v2.0.13): the same Windows-level RacingWheel
+; classification for the HIDMaestro device — the parallel /
+; alternate experiment to fix #1, same mechanism, no
+; game-specific behaviour. VID 1209 / PID 5253 (the pid.codes
+; claim; tools/rsh-hm-sidecar/Constants.cs), usage page 0001,
+; usage 0004 — hence key 1209525300010004. Axis indices are
+; RawGameController indices following the custom profile's HID
+; descriptor order (tools/rsh-hm-sidecar/Program.cs,
+; BuildDescriptor: X, Y, Z, Rx, Slider — 5× 16-bit axes, 32
+; buttons, 1 hat, 15-byte report):
+;   Wheel=X/0, Throttle=Y/1, Brake=Z/2, Clutch=Rx/3,
+;   Handbrake=Slider/4.
+; Clutch IS mapped here (unlike the vJoy mapping): Rx is the
+; clutch axis on this profile and RSH feeds it there
+; (crates/rsh-output-hidmaestro/src/mapping.rs). Invert is 0
+; everywhere for the same reason as fix #1 (raw values rise with
+; input — see mapping.rs axis_to_u16: released = 0, pressed =
+; 32767). PreviousGear/NextGear are the same sequential-shifter
+; paddles as fix #1 (PROTOCOL-V2.2 §1.1: bit 0 = shift-up =
+; button 1 = ButtonIndex 0; bit 1 = shift-down = button 2 =
+; ButtonIndex 1). H-pattern gears are not mapped (gear bits are
+; stripped from the button word — same reason as fix #1).
+; MaxWheelAngle 450, same as fix #1 (default 900° lock). Written
+; on EVERY install (fresh and update), removed by the
+; uninstaller. The game must be restarted after install; the
+; user's PC retest (FH4 and a second game) is the only proof.
+Function WriteGameInputHidMapping
+  SetRegView 64
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004" "Description" "RSH Wheel (HIDMaestro)"
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel" "MaxWheelAngle" 450
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Wheel" "AxisIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Wheel" "Invert" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Throttle" "AxisIndex" 1
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Throttle" "Invert" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Brake" "AxisIndex" 2
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Brake" "Invert" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Clutch" "AxisIndex" 3
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Clutch" "Invert" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Handbrake" "AxisIndex" 4
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Handbrake" "Invert" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\PreviousGear" "ButtonIndex" 1
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\NextGear" "ButtonIndex" 0
+  SetRegView 32
+FunctionEnd
+
+; FH4 fix #1 (v2.0.13): reconfigure vJoy device 1 to the EmuWheel
+; envelope (8 axes, 128 buttons, 1× 4-direction POV, all FFB) via
+; vJoy's own CLI — see crates/rsh-output/src/vjoy_config.rs for
+; the full derivation (the argv spelling lives there as the single
+; source of truth; this call mirrors it exactly):
+;   vJoyConfig.exe 1 -f -a x y z rx ry rz sl0 sl1 -b 128 -s 1 -e All
+; Runs on EVERY install (fresh and update — `-f` replaces the
+; existing device-1 config). vJoy missing → skipped silently
+; (DetailPrint): the wizard installs vJoy later, and the app's
+; post-install path (rsh-app-core run_vjoy_install_inner) configures
+; device 1 then. Best-effort, never fatal: a failure warns (the
+; mapping above is still written) and the app's connect-time
+; capabilities check is the real verification — vJoyConfig exits 0
+; even when its registry write fails, so the exit code only proves
+; the tool ran. The installer additionally reads back
+; HidReportDescriptorSize for Device01 (non-zero = a descriptor
+; landed). vJoyConfig restarts the vJoy devices itself
+; (refresh_vjoy), so no reboot is needed in the normal case.
+Function ConfigureVJoyDevice1
+  StrCpy $R0 ""
+  IfFileExists "$PROGRAMFILES64\vJoy\x64\vJoyConfig.exe" vjoycfg_found
+  IfFileExists "$PROGRAMFILES32\vJoy\x64\vJoyConfig.exe" vjoycfg_found_x86
+  DetailPrint "FH4: vJoy not installed yet — skipping vJoy device-1 configuration (the app configures it after installing vJoy)."
+  Return
+  vjoycfg_found_x86:
+    StrCpy $R0 "$PROGRAMFILES32\vJoy\x64\vJoyConfig.exe"
+    Goto vjoycfg_run
+  vjoycfg_found:
+    StrCpy $R0 "$PROGRAMFILES64\vJoy\x64\vJoyConfig.exe"
+  vjoycfg_run:
+  nsExec::ExecToStack '"$R0" 1 -f -a x y z rx ry rz sl0 sl1 -b 128 -s 1 -e All'
+  Pop $R1  ; exit code
+  Pop $R2  ; stdout (discard)
+  ${If} $R1 != 0
+    MessageBox MB_ICONEXCLAMATION "RSH installed, but vJoy device 1 could not be configured as a wheel for Windows.Gaming.Input games (vJoyConfig exit $R1). Wheel games (for example Forza Horizon 4) may not show a Wheel tab. Next step: open vJoyConf, set device 1 to 8 axes (X Y Z Rx Ry Rz Slider Dial), 128 buttons, 1 POV hat, all FFB effects — or run the RSH installer again."
+    Return
+  ${EndIf}
+  ; Verify the descriptor landed: Device01 must exist with a
+  ; non-zero HidReportDescriptorSize (SetRegView 64 — the key
+  ; lives in the native view; see WriteGameInputVJoyMapping).
+  SetRegView 64
+  ClearErrors
+  ReadRegDWORD $R3 HKLM "SYSTEM\CurrentControlSet\Services\vjoy\Parameters\Device01" "HidReportDescriptorSize"
+  SetRegView 32
+  ${If} ${Errors}
+  ${OrIf} $R3 == 0
+    MessageBox MB_ICONEXCLAMATION "RSH installed, but the vJoy device-1 configuration could not be verified (no descriptor found for device 1). Wheel games (for example Forza Horizon 4) may not show a Wheel tab. Next step: open vJoyConf, set device 1 to 8 axes (X Y Z Rx Ry Rz Slider Dial), 128 buttons, 1 POV hat, all FFB effects — or run the RSH installer again."
+  ${EndIf}
+FunctionEnd
+
 Section "RSH"
   SetOutPath "$INSTDIR"
   Call KillRSHProcesses
@@ -400,6 +560,13 @@ Section "RSH"
   ${If} $0 != 0
     MessageBox MB_ICONEXCLAMATION "RSH installed, but the Windows Firewall rule could not be created (netsh exit $0). The wheel may not connect over Wi-Fi. Next step: Windows Security -> Firewall & network protection -> Allow an app through firewall -> add rsh-daemon.exe; or run the installer again as administrator."
   ${EndIf}
+  ; FH4 fixes #1+#2 (v2.0.13): the RacingWheel mappings FIRST, then
+  ; the device-1 envelope — vJoyConfig restarts the vJoy devices,
+  ; so a mapping written before it is picked up at the same
+  ; re-enumeration. All run on every install (fresh and update).
+  Call WriteGameInputVJoyMapping
+  Call WriteGameInputHidMapping
+  Call ConfigureVJoyDevice1
   ; After an update, restart the daemon (it was stopped
   ; above so its files could be replaced). Fresh installs do
   ; not start it — the UI self-spawns it on first launch.
@@ -454,6 +621,12 @@ Section "Uninstall"
   DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-daemon.exe"
   DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\rsh-ui.exe"
   DeleteRegKey HKLM "Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\RshCoreHiDcr.exe"
+  ; FH4 fix #1 (v2.0.13): remove the vJoy RacingWheel mapping this
+  ; installer wrote — a stale mapping would classify a device that
+  ; no longer has RSH behind it.
+  DeleteRegKey HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004"
+  ; FH4 fix #2 (v2.0.13): same for the HIDMaestro mapping.
+  DeleteRegKey HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004"
   SetRegView 32
   Delete "$INSTDIR\rsh-daemon.exe"
   Delete "$INSTDIR\rsh-ui.exe"

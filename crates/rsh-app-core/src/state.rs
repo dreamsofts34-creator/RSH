@@ -177,6 +177,8 @@ use rsh_output::selector::{BackendFactories, BackendKind, SwitchOutcome, switch_
 #[cfg(windows)]
 use rsh_output::vjoy::{RealVJoyDll, VJoyInterface};
 use rsh_output::vjoy::{VJOY_DOWNLOAD_URL, VJoyOutput, resolve_dll_path};
+#[cfg(windows)]
+use rsh_output::vjoy_config::configure_device_1_envelope;
 use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
 use rsh_output_hidmaestro::HidMaestroOutput;
 use rsh_output_hidmaestro::backend::UAC_NOTE;
@@ -8355,6 +8357,23 @@ fn run_vjoy_install_inner() -> Result<(), String> {
         ));
     }
     if resolve_dll_path().is_some() {
+        // FH4 fix #1 (v2.0.13): vJoy installs with its own default
+        // device-1 shape, not the EmuWheel envelope wheel games
+        // need (8 axes, 128 buttons, 1 discrete POV, all FFB — see
+        // `rsh_output::vjoy_config`). Configure device 1 now,
+        // while the user is here — one UAC prompt (the installer
+        // already prompted once). The RSH installer does the same
+        // step directly (it is already elevated) and also writes
+        // the GameInput RacingWheel mapping, so a failed config
+        // here is reported as a failure with that repair path
+        // instead of a silent wrong-shaped device: without the
+        // envelope no wheel game can classify the device.
+        #[cfg(windows)]
+        if let Err(error) = configure_device_1_envelope() {
+            return Err(format!(
+                "vJoy installed, but its device 1 could not be configured as a wheel for Windows.Gaming.Input games (for example Forza Horizon 4): {error}"
+            ));
+        }
         Ok(())
     } else {
         Err(
