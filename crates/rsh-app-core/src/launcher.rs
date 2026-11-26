@@ -10,6 +10,18 @@
 //!   `ShellExecuteExW`) — directly and tracks the child pid.
 //!   Exactly one game runs at a time. Stop kills **only** the
 //!   tracked pid (SEC-E-10: never kill another same-name process).
+//! * The child runs with the **game's own folder** as its working
+//!   directory (v2.0.13: the daemon's cwd is never inherited —
+//!   most games fail to start, or exit at once, when started from
+//!   a foreign folder, which read as a silent no-op launch).
+//!   For an exe that is the exe's parent dir; for a `.lnk` the
+//!   shortcut target's parent dir (the target is read out of the
+//!   shortcut — see [`resolve_shortcut_target`]).
+//! * A game that starts and exits at once is a real error, not a
+//!   silent "not running" (settle check in [`GameLauncher::launch`]);
+//!   a shortcut helper that spawns the real game and exits is not
+//!   mistaken for that — the first refreshes after launch keep the
+//!   game running (launch grace in [`GameLauncher::refresh`]).
 //! * Spawn uses null stdio + detached, no-window creation (DS-47):
 //!   a game that inherits the daemon's stdio pipes can block the
 //!   parent forever (the NSIS `Exec` hang class fixed in v2.0.2),
@@ -30,6 +42,36 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// How long after a launch the tracked pid is given the benefit
+/// of the doubt: a shortcut helper spawns the real game and exits
+/// at once, and a game can take a moment to get going — the first
+/// refreshes inside this window never clear a just-launched game.
+const LAUNCH_GRACE: Duration = Duration::from_secs(5);
+
+/// Unix seconds now (0 on a clock failure — never panics).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+/// True when two paths name the same file. Windows paths compare
+/// case-insensitively (the pid image query can return different
+/// casing than the stored path); elsewhere the comparison is exact.
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        a.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
 
 /// Why a launch failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,6 +134,21 @@ pub trait ProcessSpawner {
     ///
     /// Returns an error message when the process could not be started.
     fn spawn(&mut self, exe: &Path) -> Result<u32, String>;
+
+    /// Spawns an exe (or shortcut) with `cwd` as the child's
+    /// working directory and returns its pid (v2.0.13: a game must
+    /// start in its own folder, never in the daemon's). [`None`]
+    /// inherits the parent's directory. The default delegates to
+    /// [`ProcessSpawner::spawn`] (spawners that cannot set a
+    /// working directory keep the old behaviour).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the process could not be started.
+    fn spawn_in(&mut self, exe: &Path, cwd: Option<&Path>) -> Result<u32, String> {
+        let _ = cwd;
+        self.spawn(exe)
+    }
 
     /// True when the pid is still alive.
     fn is_alive(&self, pid: u32) -> bool;
@@ -177,7 +234,8 @@ mod win32 {
         pub lp_file: *const u16,
         /// Parameters (`null`).
         pub lp_parameters: *const u16,
-        /// Working directory (`null` = the shortcut's own).
+        /// Working directory (`null` = the caller's current
+        /// directory — never leave this null for a game launch).
         pub lp_directory: *const u16,
         /// Show command (`SW_SHOWNORMAL`).
         pub n_show: i32,
@@ -206,6 +264,184 @@ pub fn is_shortcut(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
 }
 
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    bytes
+        .get(offset..offset + 2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset + 4)
+        .map(|quad| u32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]))
+}
+
+/// Reads a NUL-terminated ANSI string at `offset` (relative to
+/// `base`), or [`None`] when the offset is out of bounds.
+fn read_cstr(bytes: &[u8], base: usize, offset: u32) -> Option<String> {
+    let start = base.checked_add(usize::try_from(offset).ok()?)?;
+    let rest = bytes.get(start..)?;
+    let end = rest.iter().position(|byte| *byte == 0)?;
+    Some(String::from_utf8_lossy(&rest[..end]).into_owned())
+}
+
+/// Reads a NUL-terminated UTF-16 string at `offset` (relative to
+/// `base`), or [`None`] when the offset is out of bounds.
+fn read_wstr(bytes: &[u8], base: usize, offset: u32) -> Option<String> {
+    let start = base.checked_add(usize::try_from(offset).ok()?)?;
+    let mut units = Vec::new();
+    let mut at = start;
+    loop {
+        let unit = read_u16(bytes, at)?;
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+        at = at.checked_add(2)?;
+    }
+    Some(String::from_utf16_lossy(&units))
+}
+
+/// Resolves a Windows shortcut (`.lnk`) to the target it points at
+/// (v2.0.13: the launch working directory is the *target's* folder,
+/// and a broken shortcut is a real error, not a silent no-op).
+///
+/// Pure-Rust reader of the Shell Link binary format (MS-SHLLINK):
+/// 76-byte header, optional `LinkTargetIDList`, then `LinkInfo`
+/// with `LocalBasePath` (Unicode form preferred when present).
+/// Relative targets resolve against the shortcut's own folder.
+///
+/// # Errors
+///
+/// Returns a message when the file is not a shortcut, is truncated,
+/// or carries no readable target — the caller turns it into a
+/// launch error that names the shortcut.
+pub fn resolve_shortcut_target(shortcut: &Path) -> Result<PathBuf, String> {
+    let bytes = std::fs::read(shortcut)
+        .map_err(|error| format!("couldn't read shortcut '{}': {error}", shortcut.display()))?;
+    // Header: 76 bytes, signature 0x0000004C, LinkFlags at +20.
+    if bytes.len() < 76 {
+        return Err(format!(
+            "shortcut '{}' is too small to be a shortcut ({} bytes)",
+            shortcut.display(),
+            bytes.len()
+        ));
+    }
+    if read_u32(&bytes, 0) != Some(0x0000_004C) {
+        return Err(format!(
+            "shortcut '{}' is not a Windows shortcut (bad header)",
+            shortcut.display()
+        ));
+    }
+    let flags = read_u32(&bytes, 20).unwrap_or(0);
+    let has_id_list = flags & 0x0000_0001 != 0;
+    let has_link_info = flags & 0x0000_0002 != 0;
+    let mut offset = 76_usize;
+    if has_id_list {
+        let id_list_size = usize::from(read_u16(&bytes, offset).unwrap_or(0));
+        offset = offset
+            .checked_add(2)
+            .and_then(|at| at.checked_add(id_list_size))
+            .ok_or_else(|| {
+                format!(
+                    "shortcut '{}' has a corrupt target list",
+                    shortcut.display()
+                )
+            })?;
+    }
+    if !has_link_info {
+        return Err(format!(
+            "shortcut '{}' has no target information",
+            shortcut.display()
+        ));
+    }
+    let info_size = read_u32(&bytes, offset).unwrap_or(0);
+    let header_size = read_u32(&bytes, offset + 4).unwrap_or(0);
+    if info_size < 28 || header_size < 28 {
+        return Err(format!(
+            "shortcut '{}' has a corrupt target block",
+            shortcut.display()
+        ));
+    }
+    let end = offset
+        .checked_add(usize::try_from(info_size).unwrap_or(usize::MAX))
+        .ok_or_else(|| {
+            format!(
+                "shortcut '{}' has a corrupt target block",
+                shortcut.display()
+            )
+        })?;
+    if end > bytes.len() {
+        return Err(format!(
+            "shortcut '{}' is truncated (target block runs past the end)",
+            shortcut.display()
+        ));
+    }
+    linkinfo_target(&bytes, offset, header_size, shortcut)
+}
+
+/// Reads the target out of a validated `LinkInfo` block starting
+/// at `offset` (`header_size` from the block itself).
+fn linkinfo_target(
+    bytes: &[u8],
+    offset: usize,
+    header_size: u32,
+    shortcut: &Path,
+) -> Result<PathBuf, String> {
+    // LinkInfo offsets (relative to the LinkInfo start): +12
+    // VolumeIDOffset, +16 LocalBasePath, +20
+    // CommonNetworkRelativeLinkOffset, +24 CommonPathSuffix, +28/+32
+    // the Unicode forms (header size >= 36).
+    let unicode_base = if header_size >= 36 {
+        read_u32(bytes, offset + 28)
+            .filter(|at| *at != 0)
+            .and_then(|at| read_wstr(bytes, offset, at))
+            .filter(|path| !path.is_empty())
+    } else {
+        None
+    };
+    let base = unicode_base.or_else(|| {
+        read_u32(bytes, offset + 16)
+            .filter(|at| *at != 0)
+            .and_then(|at| read_cstr(bytes, offset, at))
+            .filter(|path| !path.is_empty())
+    });
+    if let Some(target) = base {
+        let target = PathBuf::from(target);
+        if target.is_absolute() {
+            return Ok(target);
+        }
+        if let Some(parent) = shortcut.parent() {
+            return Ok(parent.join(target));
+        }
+        return Ok(target);
+    }
+    // No base path — a suffix alone is relative to the shortcut.
+    let suffix = if header_size >= 36 {
+        read_u32(bytes, offset + 32)
+            .filter(|at| *at != 0)
+            .and_then(|at| read_wstr(bytes, offset, at))
+    } else {
+        None
+    }
+    .or_else(|| {
+        read_u32(bytes, offset + 24)
+            .filter(|at| *at != 0)
+            .and_then(|at| read_cstr(bytes, offset, at))
+    })
+    .filter(|path| !path.is_empty());
+    if let Some(suffix) = suffix {
+        if let Some(parent) = shortcut.parent() {
+            return Ok(parent.join(suffix));
+        }
+        return Ok(PathBuf::from(suffix));
+    }
+    Err(format!(
+        "shortcut '{}' has no target path in it",
+        shortcut.display()
+    ))
+}
+
 /// Spawns real OS processes.
 ///
 /// * Spawn uses [`std::process::Command`] (works on Windows and Linux).
@@ -220,19 +456,29 @@ pub struct SystemSpawner;
 
 impl SystemSpawner {
     /// Launches a shortcut (`.lnk`) via `ShellExecuteExW` and
-    /// returns the child pid. Windows-only.
+    /// returns the child pid. Windows-only. `cwd` is the child's
+    /// working directory (v2.0.13: the shortcut target's folder —
+    /// `lp_directory: null` left the game in the daemon's folder,
+    /// where most games fail to start or exit at once).
     #[cfg(windows)]
-    fn spawn_shortcut(exe: &Path) -> Result<u32, String> {
+    fn spawn_shortcut(exe: &Path, cwd: Option<&Path>) -> Result<u32, String> {
         use std::os::windows::ffi::OsStrExt;
         // SAFETY: plain Win32 call with checked returns; the path
-        // buffer is valid for the call, the info struct is fully
-        // initialised, and the process handle is always closed.
+        // and directory buffers are valid for the call, the info
+        // struct is fully initialised, and the process handle is
+        // always closed.
         unsafe {
             let file_wide: Vec<u16> = exe
                 .as_os_str()
                 .encode_wide()
                 .chain(std::iter::once(0))
                 .collect();
+            let dir_wide: Option<Vec<u16>> = cwd.map(|dir| {
+                dir.as_os_str()
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect()
+            });
             let mut info = win32::ShellExecuteInfoW {
                 cb_size: u32::try_from(std::mem::size_of::<win32::ShellExecuteInfoW>())
                     .unwrap_or(u32::MAX),
@@ -241,7 +487,9 @@ impl SystemSpawner {
                 lp_verb: std::ptr::null(),
                 lp_file: file_wide.as_ptr(),
                 lp_parameters: std::ptr::null(),
-                lp_directory: std::ptr::null(),
+                lp_directory: dir_wide
+                    .as_ref()
+                    .map_or(std::ptr::null(), |wide| wide.as_ptr()),
                 n_show: win32::SW_SHOWNORMAL,
                 h_inst_app: 0,
                 lp_id_list: std::ptr::null_mut(),
@@ -276,11 +524,15 @@ impl SystemSpawner {
 
 impl ProcessSpawner for SystemSpawner {
     fn spawn(&mut self, exe: &Path) -> Result<u32, String> {
+        self.spawn_in(exe, None)
+    }
+
+    fn spawn_in(&mut self, exe: &Path, cwd: Option<&Path>) -> Result<u32, String> {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             if is_shortcut(exe) {
-                return Self::spawn_shortcut(exe);
+                return Self::spawn_shortcut(exe, cwd);
             }
             // DS-47: null stdio + detached, no-window creation —
             // mirroring the daemon's `spawn_ui` (F8). A game that
@@ -290,11 +542,19 @@ impl ProcessSpawner for SystemSpawner {
             // game. Flags are the raw Win32 values, as elsewhere in
             // this crate (`state.rs`): DETACHED_PROCESS 0x8,
             // CREATE_NO_WINDOW 0x0800_0000.
-            std::process::Command::new(exe)
+            // v2.0.13: the child runs in the game's own folder
+            // (`current_dir`) — without it most games fail to start
+            // or exit at once, which read as a silent no-op launch.
+            let mut command = std::process::Command::new(exe);
+            command
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .creation_flags(0x0000_0008 | 0x0800_0000)
+                .creation_flags(0x0000_0008 | 0x0800_0000);
+            if let Some(dir) = cwd {
+                command.current_dir(dir);
+            }
+            command
                 .spawn()
                 .map(|child| child.id())
                 .map_err(|error| error.to_string())
@@ -304,7 +564,7 @@ impl ProcessSpawner for SystemSpawner {
             // The sandbox has no Windows games; spawning a Windows exe
             // here fails at the OS level and that failure is reported,
             // never hidden.
-            let _ = exe;
+            let _ = (exe, cwd);
             Err("game launch is Windows-only".to_owned())
         }
     }
@@ -406,16 +666,40 @@ impl ProcessSpawner for SystemSpawner {
 pub struct GameLauncher<S: ProcessSpawner> {
     spawner: S,
     running: Option<RunningGame>,
+    /// How long to watch a just-spawned pid before reporting the
+    /// launch as a success (v2.0.13): a game that starts and exits
+    /// at once is a real error, never a silent "not running".
+    settle: Duration,
+    /// How long after a launch a dead pid is given the benefit of
+    /// the doubt (see [`LAUNCH_GRACE`]).
+    grace: Duration,
 }
 
 impl<S: ProcessSpawner> GameLauncher<S> {
-    /// Creates a launcher over a spawner.
+    /// Creates a launcher over a spawner (1.5 s settle, 5 s grace).
     #[must_use]
     pub fn new(spawner: S) -> Self {
+        Self::with_timing(spawner, Duration::from_millis(1500), LAUNCH_GRACE)
+    }
+
+    /// Creates a launcher with an explicit settle / grace (tests
+    /// use zero for both when they check launch / stop / refresh
+    /// semantics without waiting).
+    #[must_use]
+    pub fn with_timing(spawner: S, settle: Duration, grace: Duration) -> Self {
         Self {
             spawner,
             running: None,
+            settle,
+            grace,
         }
+    }
+
+    /// Creates a launcher with an explicit settle and the default
+    /// grace (tests that check the immediate-exit error).
+    #[must_use]
+    pub fn with_settle(spawner: S, settle: Duration) -> Self {
+        Self::with_timing(spawner, settle, LAUNCH_GRACE)
     }
 
     /// The currently tracked running game, if any.
@@ -426,11 +710,30 @@ impl<S: ProcessSpawner> GameLauncher<S> {
 
     /// Launches a manually added game.
     ///
+    /// The child runs with the game's own folder as its working
+    /// directory (v2.0.13 — the root cause of the silent no-op
+    /// launch: neither spawn path set one, so the game started in
+    /// the daemon's folder and died at once). For an exe that is
+    /// the exe's parent dir; for a `.lnk` the shortcut target is
+    /// resolved first and its parent dir is used — a shortcut
+    /// whose target cannot be read is a [`LaunchError::SpawnFailed`],
+    /// never a launch into the void.
+    ///
+    /// After spawning, the pid is watched for `settle`: when the
+    /// spawned process *is* the game (its image matches the exe /
+    /// shortcut target) and it dies inside the settle window, the
+    /// launch fails with a real "started but exited immediately"
+    /// error. When the image is a helper (or unreadable) the pid
+    /// may legitimately exit at once — it spawned the real game —
+    /// so the launch succeeds and the grace window in
+    /// [`GameLauncher::refresh`] keeps it running.
+    ///
     /// # Errors
     ///
     /// [`LaunchError::NotInstalled`] when the exe path is empty,
     /// [`LaunchError::AlreadyRunning`] when another game is tracked as
-    /// running, [`LaunchError::SpawnFailed`] when the OS refuses to start it.
+    /// running, [`LaunchError::SpawnFailed`] when the OS refuses to start it
+    /// or it exits immediately.
     pub fn launch(&mut self, game_id: &str, exe_path: &str) -> Result<RunningGame, LaunchError> {
         let _ = self.refresh();
         if let Some(running) = &self.running {
@@ -439,13 +742,32 @@ impl<S: ProcessSpawner> GameLauncher<S> {
         if exe_path.trim().is_empty() {
             return Err(LaunchError::NotInstalled(game_id.to_string()));
         }
+        let exe = Path::new(exe_path);
+        // v2.0.13: the working directory is the game's own folder.
+        // (An empty parent — a bare file name with no folder — is
+        // no directory at all, never an empty `current_dir`.)
+        let parent_dir = |path: &Path| {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+        };
+        let (cwd, expected): (Option<PathBuf>, PathBuf) = if is_shortcut(exe) {
+            match resolve_shortcut_target(exe) {
+                Ok(target) => (parent_dir(&target), target),
+                Err(detail) => {
+                    return Err(LaunchError::SpawnFailed(format!(
+                        "couldn't read the shortcut's target ({detail}). The shortcut may be broken — re-create it, or add the game's exe directly."
+                    )));
+                }
+            }
+        } else {
+            (parent_dir(exe), exe.to_path_buf())
+        };
         let pid = self
             .spawner
-            .spawn(Path::new(exe_path))
+            .spawn_in(exe, cwd.as_deref())
             .map_err(LaunchError::SpawnFailed)?;
-        let started_unix_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_secs());
+        let started_unix_secs = now_unix_secs();
         // R3-D-04: resolve the exe the pid actually runs NOW — for
         // a `.lnk` launch this is the shortcut's target exe, not
         // the `.lnk` path. The pid-reuse guard compares against
@@ -456,6 +778,32 @@ impl<S: ProcessSpawner> GameLauncher<S> {
             .spawner
             .exe_path(pid)
             .map(|path| path.to_string_lossy().into_owned());
+        // v2.0.13 settle: a game that starts and dies at once must
+        // be a visible error, not a silent "not running" — but only
+        // when the dead pid *is* the game. A helper that spawned the
+        // real game and exited is the normal case for some
+        // shortcuts; its image never matches the expected target.
+        if !self.settle.is_zero() {
+            let deadline = std::time::Instant::now() + self.settle;
+            loop {
+                if !self.spawner.is_alive(pid) {
+                    let is_game = resolved_exe_path
+                        .as_deref()
+                        .is_some_and(|image| paths_equal(Path::new(image), &expected));
+                    if is_game {
+                        return Err(LaunchError::SpawnFailed(format!(
+                            "game started but exited immediately ({}). It may need files from its own folder, or administrator rights. Try starting it from File Explorer — if it closes there too, the game itself is failing to start.",
+                            expected.display()
+                        )));
+                    }
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
         let running = RunningGame {
             game_id: game_id.to_string(),
             pid,
@@ -477,12 +825,21 @@ impl<S: ProcessSpawner> GameLauncher<S> {
     /// the image could not be resolved at launch AND the launch was
     /// a shortcut, the exe-path comparison is skipped (liveness
     /// only): a stale comparison there is worse than no comparison.
+    ///
+    /// v2.0.13 launch grace: a dead pid inside the grace window
+    /// after launch does NOT clear the record — a shortcut helper
+    /// spawns the real game and exits at once, and the first
+    /// refresh must not report the game "not running" while the
+    /// real game is starting. The pid-reuse guard still applies
+    /// inside the grace (a live pid running another exe clears).
     #[must_use]
     pub fn refresh(&mut self) -> Option<&RunningGame> {
+        let now = now_unix_secs();
+        let grace_secs = self.grace.as_secs();
         let dead = match &self.running {
             Some(running) => {
                 if !self.spawner.is_alive(running.pid) {
-                    true
+                    now >= running.started_unix_secs.saturating_add(grace_secs)
                 } else if is_shortcut(Path::new(&running.exe_path))
                     && running.resolved_exe_path.is_none()
                 {
@@ -548,7 +905,7 @@ impl<S: ProcessSpawner> GameLauncher<S> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
 
@@ -556,9 +913,18 @@ mod tests {
     struct FakeSpawner {
         next_pid: u32,
         alive: RefCell<HashMap<u32, PathBuf>>,
+        /// Pids that "exited at once" after spawn (v2.0.13 settle /
+        /// grace tests): dead for `is_alive`, but their image is
+        /// still readable via `exe_path`, like a real just-exited
+        /// process whose image was resolved at launch.
+        dead: RefCell<HashSet<u32>>,
         spawned: RefCell<Vec<PathBuf>>,
+        /// Working directory each spawn was asked for, in order.
+        spawned_cwd: RefCell<Vec<Option<PathBuf>>>,
         killed: RefCell<Vec<u32>>,
         fail_terminate: RefCell<bool>,
+        /// When set, every spawned pid dies at once.
+        die_after_spawn: RefCell<bool>,
         /// Shortcut → target resolution (R3-D-04): when a spawn
         /// path is listed here, the pid's image is the target, not
         /// the spawned path — what `QueryFullProcessImageNameW`
@@ -573,9 +939,12 @@ mod tests {
             Self {
                 next_pid: 1000,
                 alive: RefCell::new(HashMap::new()),
+                dead: RefCell::new(HashSet::new()),
                 spawned: RefCell::new(Vec::new()),
+                spawned_cwd: RefCell::new(Vec::new()),
                 killed: RefCell::new(Vec::new()),
                 fail_terminate: RefCell::new(false),
+                die_after_spawn: RefCell::new(false),
                 resolve: RefCell::new(HashMap::new()),
                 fail_exe_path: RefCell::new(false),
             }
@@ -599,6 +968,10 @@ mod tests {
         fn set_fail_exe_path(&self, fail: bool) {
             *self.fail_exe_path.borrow_mut() = fail;
         }
+
+        fn set_die_after_spawn(&self, die: bool) {
+            *self.die_after_spawn.borrow_mut() = die;
+        }
     }
 
     impl ProcessSpawner for FakeSpawner {
@@ -614,12 +987,22 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| exe.to_path_buf());
             self.alive.borrow_mut().insert(pid, image);
+            if *self.die_after_spawn.borrow() {
+                self.dead.borrow_mut().insert(pid);
+            }
             self.spawned.borrow_mut().push(exe.to_path_buf());
             Ok(pid)
         }
 
+        fn spawn_in(&mut self, exe: &Path, cwd: Option<&Path>) -> Result<u32, String> {
+            self.spawned_cwd
+                .borrow_mut()
+                .push(cwd.map(Path::to_path_buf));
+            self.spawn(exe)
+        }
+
         fn is_alive(&self, pid: u32) -> bool {
-            self.alive.borrow().contains_key(&pid)
+            self.alive.borrow().contains_key(&pid) && !self.dead.borrow().contains(&pid)
         }
 
         fn terminate(&mut self, pid: u32) -> Result<(), String> {
@@ -665,6 +1048,70 @@ mod tests {
         exe.to_string_lossy().into_owned()
     }
 
+    /// Launcher with zero settle / grace: existing semantics tests
+    /// check launch / stop / refresh without waiting out the
+    /// production settle window or the launch grace.
+    fn launcher() -> GameLauncher<FakeSpawner> {
+        GameLauncher::with_timing(
+            FakeSpawner::new(),
+            std::time::Duration::from_millis(0),
+            std::time::Duration::from_millis(0),
+        )
+    }
+
+    /// Writes a minimal but structurally valid `.lnk` pointing at
+    /// `target` (76-byte header + `LinkInfo` with `LocalBasePath`),
+    /// so [`resolve_shortcut_target`] reads the target back.
+    fn write_lnk(dir: &Path, name: &str, target: &Path) -> PathBuf {
+        let target_bytes = target
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned()
+            .into_bytes();
+        let suffix = target
+            .file_name()
+            .map(|file| file.to_string_lossy().into_owned().into_bytes())
+            .unwrap_or_default();
+        let mut header = vec![0_u8; 76];
+        header[0..4].copy_from_slice(&0x0000_004C_u32.to_le_bytes());
+        // ShellLink GUID {00021401-0000-0000-C000-000000000046}.
+        header[4..20].copy_from_slice(&[
+            0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x46,
+        ]);
+        header[20..24].copy_from_slice(&0x0000_0002_u32.to_le_bytes()); // HasLinkInfo
+        let volume_size = 16_u32;
+        let local_base_off = 28 + volume_size;
+        let suffix_off = local_base_off + u32::try_from(target_bytes.len()).unwrap_or(u32::MAX) + 1;
+        let linkinfo_size = suffix_off + u32::try_from(suffix.len()).unwrap_or(u32::MAX) + 1;
+        let mut info = Vec::new();
+        info.extend_from_slice(&linkinfo_size.to_le_bytes());
+        info.extend_from_slice(&28_u32.to_le_bytes()); // LinkInfoHeaderSize
+        info.extend_from_slice(&0x0000_0001_u32.to_le_bytes()); // VolumeIDAndLocalBasePath
+        info.extend_from_slice(&28_u32.to_le_bytes()); // VolumeIDOffset
+        info.extend_from_slice(&local_base_off.to_le_bytes());
+        info.extend_from_slice(&0_u32.to_le_bytes()); // CommonNetworkRelativeLinkOffset
+        info.extend_from_slice(&suffix_off.to_le_bytes());
+        info.extend_from_slice(&volume_size.to_le_bytes()); // VolumeIDSize
+        info.extend_from_slice(&3_u32.to_le_bytes()); // DRIVE_FIXED
+        info.extend_from_slice(&0_u32.to_le_bytes()); // DriveSerialNumber
+        info.extend_from_slice(&16_u32.to_le_bytes()); // VolumeLabelOffset (empty label)
+        info.extend_from_slice(&target_bytes);
+        info.push(0);
+        info.extend_from_slice(&suffix);
+        info.push(0);
+        assert_eq!(
+            u32::try_from(info.len()).expect("fixture link fits in u32"),
+            linkinfo_size,
+            "fixture link size"
+        );
+        let mut bytes = header;
+        bytes.extend_from_slice(&info);
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("write fixture lnk");
+        path
+    }
+
     #[test]
     fn is_shortcut_matches_lnk_case_insensitively() {
         assert!(is_shortcut(Path::new(r"C:\Games\race.lnk")));
@@ -679,7 +1126,7 @@ mod tests {
         let ac = fake_exe(&dir, "race.exe");
         let dirt = fake_exe(&dir, "dirt2.exe");
 
-        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let mut launcher = launcher();
         let running = launcher.launch("my-race", &ac).expect("launch");
         assert_eq!(running.game_id, "my-race");
         assert_eq!(
@@ -704,7 +1151,7 @@ mod tests {
 
     #[test]
     fn launch_empty_exe_path_is_not_installed() {
-        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let mut launcher = launcher();
         assert_eq!(
             launcher.launch("my-race", ""),
             Err(LaunchError::NotInstalled("my-race".to_owned()))
@@ -720,7 +1167,7 @@ mod tests {
         let dir = test_dir("stop-only-tracked");
         let ac = fake_exe(&dir, "race.exe");
 
-        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let mut launcher = launcher();
         // A second, unrelated process with pid 2000 is alive in the fake.
         launcher
             .spawner
@@ -742,7 +1189,7 @@ mod tests {
         let dir = test_dir("refresh-dead");
         let ac = fake_exe(&dir, "race.exe");
 
-        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let mut launcher = launcher();
         let running = launcher.launch("my-race", &ac).expect("launch");
         launcher.spawner.kill_from_outside(running.pid);
         assert!(launcher.refresh().is_none());
@@ -752,7 +1199,7 @@ mod tests {
 
     #[test]
     fn stop_with_nothing_running_is_an_error() {
-        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let mut launcher = launcher();
         assert!(launcher.stop().is_err());
     }
 
@@ -763,7 +1210,7 @@ mod tests {
         let dir = test_dir("stop-fail");
         let ac = fake_exe(&dir, "race.exe");
 
-        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let mut launcher = launcher();
         launcher.launch("my-race", &ac).expect("launch");
         launcher.spawner.set_fail_terminate(true);
         assert!(launcher.stop().is_err());
@@ -786,7 +1233,7 @@ mod tests {
         let dir = test_dir("stop-dead");
         let ac = fake_exe(&dir, "race.exe");
 
-        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let mut launcher = launcher();
         let running = launcher.launch("my-race", &ac).expect("launch");
         launcher.spawner.kill_from_outside(running.pid);
         assert!(launcher.stop().is_ok());
@@ -800,7 +1247,7 @@ mod tests {
         let dir = test_dir("refresh-mismatch");
         let ac = fake_exe(&dir, "race.exe");
 
-        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let mut launcher = launcher();
         let running = launcher.launch("my-race", &ac).expect("launch");
         launcher
             .spawner
@@ -819,10 +1266,9 @@ mod tests {
     fn shortcut_launch_stays_running_against_resolved_target() {
         let dir = test_dir("refresh-lnk");
         let target = fake_exe(&dir, "race.exe");
-        let shortcut = dir.join("race.lnk");
-        std::fs::write(&shortcut, b"fake shortcut").expect("write fixture lnk");
+        let shortcut = write_lnk(&dir, "race.lnk", Path::new(&target));
 
-        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let mut launcher = launcher();
         launcher.spawner.map_shortcut(&shortcut, Path::new(&target));
         let running = launcher
             .launch("my-race", &shortcut.to_string_lossy())
@@ -860,10 +1306,9 @@ mod tests {
     #[test]
     fn unresolved_shortcut_launch_is_liveness_only() {
         let dir = test_dir("refresh-lnk-unresolved");
-        let shortcut = dir.join("race.lnk");
-        std::fs::write(&shortcut, b"fake shortcut").expect("write fixture lnk");
+        let shortcut = write_lnk(&dir, "race.lnk", Path::new(r"C:\Games\race.exe"));
 
-        let mut launcher = GameLauncher::new(FakeSpawner::new());
+        let mut launcher = launcher();
         launcher.spawner.set_fail_exe_path(true);
         let running = launcher
             .launch("my-race", &shortcut.to_string_lossy())
@@ -877,6 +1322,159 @@ mod tests {
         assert!(
             launcher.refresh().is_none(),
             "a dead shortcut game still clears on liveness"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- v2.0.13 game-launch gate tests ---
+
+    /// The `.lnk` fixture round-trips through the parser, and
+    /// garbage / truncated files are rejected, never silently
+    /// launched into the daemon's folder.
+    #[test]
+    fn shortcut_target_resolution_round_trips() {
+        let dir = test_dir("lnk-parse");
+        let target = fake_exe(&dir, "race.exe");
+        let shortcut = write_lnk(&dir, "race.lnk", Path::new(&target));
+        assert_eq!(
+            resolve_shortcut_target(&shortcut).expect("parse fixture lnk"),
+            Path::new(&target)
+        );
+
+        let garbage = dir.join("garbage.lnk");
+        std::fs::write(&garbage, b"not a shortcut at all").expect("write garbage lnk");
+        assert!(
+            resolve_shortcut_target(&garbage).is_err(),
+            "garbage must not resolve to a target"
+        );
+        let tiny = dir.join("tiny.lnk");
+        std::fs::write(&tiny, b"tiny").expect("write tiny lnk");
+        assert!(resolve_shortcut_target(&tiny).is_err(), "truncated lnk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v2.0.13 root cause: an exe launch must run with the exe's
+    /// own folder as the working directory — never the daemon's.
+    #[test]
+    fn launch_exe_uses_exe_parent_as_cwd() {
+        let dir = test_dir("cwd-exe");
+        let game_dir = dir.join("game");
+        std::fs::create_dir_all(&game_dir).expect("create game dir");
+        let exe = fake_exe(&game_dir, "race.exe");
+
+        let mut launcher = launcher();
+        launcher.launch("my-race", &exe).expect("launch");
+        assert_eq!(
+            launcher.spawner.spawned_cwd.borrow().as_slice(),
+            [Some(game_dir)],
+            "the game must start in its own folder"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shortcut launch must run with the *target's* folder as
+    /// the working directory — not the shortcut's folder (Desktop)
+    /// and never the daemon's.
+    #[test]
+    fn launch_shortcut_uses_target_parent_as_cwd() {
+        let dir = test_dir("cwd-lnk");
+        let game_dir = dir.join("game");
+        let desk_dir = dir.join("desktop");
+        std::fs::create_dir_all(&game_dir).expect("create game dir");
+        std::fs::create_dir_all(&desk_dir).expect("create desk dir");
+        let target = fake_exe(&game_dir, "race.exe");
+        let shortcut = write_lnk(&desk_dir, "race.lnk", Path::new(&target));
+
+        let mut launcher = launcher();
+        launcher.spawner.map_shortcut(&shortcut, Path::new(&target));
+        let running = launcher
+            .launch("my-race", &shortcut.to_string_lossy())
+            .expect("launch shortcut");
+        assert_eq!(
+            launcher.spawner.spawned_cwd.borrow().as_slice(),
+            [Some(game_dir)],
+            "the shortcut launch must start in the target's folder"
+        );
+        assert_eq!(running.resolved_exe_path.as_deref(), Some(target.as_str()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shortcut whose target cannot be read is a real error
+    /// naming the shortcut — never a launch into the void.
+    #[test]
+    fn launch_broken_shortcut_is_a_real_error() {
+        let dir = test_dir("cwd-lnk-broken");
+        let shortcut = dir.join("broken.lnk");
+        std::fs::write(&shortcut, b"not a shortcut at all").expect("write broken lnk");
+
+        let mut launcher = launcher();
+        let error = launcher
+            .launch("my-race", &shortcut.to_string_lossy())
+            .expect_err("a broken shortcut must not launch");
+        assert!(
+            matches!(error, LaunchError::SpawnFailed(_)),
+            "broken shortcut must be SpawnFailed, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("shortcut"),
+            "the error must name the shortcut: {error}"
+        );
+        assert!(launcher.running().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A game that starts and exits at once is a visible error,
+    /// not a silent "not running" tile.
+    #[test]
+    fn launch_game_that_exits_immediately_is_an_error() {
+        let dir = test_dir("settle-exit");
+        let exe = fake_exe(&dir, "race.exe");
+
+        let mut launcher =
+            GameLauncher::with_settle(FakeSpawner::new(), std::time::Duration::from_millis(500));
+        launcher.spawner.set_die_after_spawn(true);
+        let error = launcher
+            .launch("my-race", &exe)
+            .expect_err("an instantly-exiting game must fail the launch");
+        assert!(
+            matches!(error, LaunchError::SpawnFailed(_)),
+            "instant exit must be SpawnFailed, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("exited immediately"),
+            "the error must say the game exited immediately: {error}"
+        );
+        assert!(launcher.running().is_none(), "no stale running record");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...but a shortcut helper that spawns the real game and exits
+    /// at once is NOT that error: the launch succeeds and the first
+    /// refreshes keep the game running (launch grace).
+    #[test]
+    fn launch_helper_that_exits_immediately_stays_running() {
+        let dir = test_dir("settle-helper");
+        let game_dir = dir.join("game");
+        std::fs::create_dir_all(&game_dir).expect("create game dir");
+        let target = fake_exe(&game_dir, "race.exe");
+        let helper = fake_exe(&dir, "helper.exe");
+        let shortcut = write_lnk(&dir, "race.lnk", Path::new(&target));
+
+        let mut launcher =
+            GameLauncher::with_settle(FakeSpawner::new(), std::time::Duration::from_millis(500));
+        launcher.spawner.map_shortcut(&shortcut, Path::new(&helper));
+        launcher.spawner.set_die_after_spawn(true);
+        let running = launcher
+            .launch("my-race", &shortcut.to_string_lossy())
+            .expect("a helper exit must not fail the launch");
+        assert_eq!(running.game_id, "my-race");
+        assert!(
+            launcher.refresh().is_some(),
+            "the first refreshes after launch must keep the game running"
+        );
+        assert_eq!(
+            launcher.running().map(|game| game.game_id.as_str()),
+            Some("my-race")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
