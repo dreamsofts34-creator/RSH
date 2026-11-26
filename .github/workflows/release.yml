@@ -676,6 +676,11 @@ jobs:
         shell: pwsh
         run: |
           $staging = "release-staging"
+          # P1-3 fix (run 45770389133): $names was defined in the
+          # previous step only — each step runs in a fresh pwsh, so
+          # it was $null here and the firmware checks failed closed.
+          $files = Get-ChildItem $staging -File
+          $names = $files | ForEach-Object { $_.Name }
           $lines = Get-ChildItem $staging -File | Sort-Object Name | ForEach-Object {
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$h  $($_.Name)"
