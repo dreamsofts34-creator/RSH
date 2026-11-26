@@ -206,7 +206,7 @@ fn elevated_sidecar_driver_path_e2e() {
         .submit(GamepadFrame::neutral())
         .expect("neutral submit after create");
     assert!(
-        latency_ms >= 0.0 && latency_ms < 5_000.0,
+        (0.0..5_000.0).contains(&latency_ms),
         "submit latency must be sane: {latency_ms} ms"
     );
     // dispose: the controller is released cleanly.

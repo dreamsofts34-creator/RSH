@@ -1049,17 +1049,18 @@ pub fn gate_ota_e2e() -> (bool, String) {
 }
 
 /// Gate: installer install → update flows (B3, plan §C) — read-only
-/// audit of `.github/workflows/release.yml`.
-///
-/// The workflow generates the NSIS script and runs a headless
-/// smoke test; this check asserts both halves cover what B3
-/// promises: version-compare (update / reinstall / downgrade
-/// prompts), daemon stop + restart around an update, registry
-/// version write, user-data survival, firewall rule, and uninstall
-/// cleanup. It CANNOT prove the installer UI on a real PC — and it
-/// records the gap honestly: the smoke test installs the SAME
-/// version twice, so the update-vs-reinstall-vs-downgrade branches
-/// (different installed version) are never exercised in CI.
+/// audit of the committed `installer/rsh.nsi` (version-compare
+/// branches — the script was extracted from the release workflow
+/// in v2.0.13 P1-1, so the markers live there now, not in the
+/// workflow) and of `.github/workflows/release.yml` (headless smoke
+/// test). This check asserts both halves cover what B3 promises:
+/// version-compare (update / reinstall / downgrade prompts), daemon
+/// stop + restart around an update, registry version write,
+/// user-data survival, firewall rule, and uninstall cleanup. It
+/// CANNOT prove the installer UI on a real PC — and it records the
+/// gap honestly: the smoke test installs the SAME version twice, so
+/// the update-vs-reinstall-vs-downgrade branches (different
+/// installed version) are never exercised in CI.
 #[must_use]
 pub fn gate_installer_audit() -> (bool, String) {
     let mut report = Report::new();
@@ -1067,41 +1068,55 @@ pub fn gate_installer_audit() -> (bool, String) {
         report.check("installer-workflow-present", false, "release.yml missing");
         return report.finish();
     };
-    let markers: &[(&str, &str)] = &[
+    let Some(nsi) = read("installer/rsh.nsi") else {
+        report.check("installer-nsi-present", false, "installer/rsh.nsi missing");
+        return report.finish();
+    };
+    // Version-compare branches live in the committed .nsi;
+    // smoke-test markers live in the release workflow.
+    let markers: &[(&str, &str, bool)] = &[
         (
             "VersionCompare",
             "smart installer compares installed vs new version",
+            true,
         ),
         (
             "Update it to",
             "update prompt (existing install, older version)",
+            true,
         ),
-        ("Reinstall it?", "reinstall prompt (same version)"),
+        ("Reinstall it?", "reinstall prompt (same version)", true),
         (
             "Downgrade to",
             "downgrade warning (newer version installed)",
+            true,
         ),
         (
             "smoke-marker.txt",
             "smoke test: user data survives the update",
+            false,
         ),
         (
             "daemon --check",
             "smoke test: daemon answers after install/update",
+            false,
         ),
         (
             "firewall rule 'RSH'",
             "smoke test: firewall rule present after install",
+            false,
         ),
         (
             "uninstall",
             "smoke test: uninstall removes rule + install dir",
+            false,
         ),
     ];
-    for (marker, what) in markers {
+    for (marker, what, in_nsi) in markers {
+        let source = if *in_nsi { &nsi } else { &workflow };
         report.check(
             &format!("installer-{marker}"),
-            workflow.contains(marker),
+            source.contains(marker),
             what,
         );
     }
@@ -1694,16 +1709,20 @@ pub fn gate_extras_card_size_source() -> (bool, String) {
         !extras.contains("min-height: 638px;") && !extras.contains("min-height: 262px;"),
         "no fixed min-height OFF box remains (638/262 px were font-environment fragile)",
     );
-    // R-10: the 4 cards share the row equally — 322 px floor each
-    // (P1-6: (656 - 12) / 2 at the 880 px minimum window; they
-    // still stretch to 342 px at the 920 px design width) — via
-    // `min-width`, so they still grow on wider windows. Without
-    // it the row was lopsided (measured: Horn ~213 px, LEDs
-    // ~471 px — content-preferred widths, no floor).
+    // R-10: the 4 cards share the row equally — 318 px floor each
+    // (P1-6: the floor is 318, not 322 — 318*2 + 12 gap = 648,
+    // leaving 8 px slack in the 656 px column at the 880 px
+    // minimum window; at exactly 322 the two columns + gap filled
+    // the column with zero slack and the card borders pushed the
+    // right column over the edge. They still stretch to 342 px at
+    // the 920 px design width) — via `min-width`, so they still
+    // grow on wider windows. Without it the row was lopsided
+    // (measured: Horn ~213 px, LEDs ~471 px — content-preferred
+    // widths, no floor).
     report.check(
         "extras-cards-min-width",
-        count(&extras, "min-width: 322px;") == 4,
-        "all 4 Extras cards have min-width: 322px (equal columns)",
+        count(&extras, "min-width: 318px;") == 4,
+        "all 4 Extras cards have min-width: 318px (equal columns)",
     );
     report.finish()
 }
@@ -1770,14 +1789,20 @@ pub fn gate_card_gap_source() -> (bool, String) {
         overview.contains("spacing: 10px;"),
         "Overview games grid keeps fixed 10px spacing (a computed spacing from self.width is a binding loop inside the ScrollView — see the comment at the grid; the tiles still grow)",
     );
-    // NOTE: `count("width: 224px;")` also matches the `min-width:`
+    // NOTE: `count("width: 210px;")` also matches the `min-width:`
     // occurrences (substring), so the explicit-width count is the
     // total minus the min-width count.
+    // P1-6: the Pedals cards use a 210 px floor — the old 224 px
+    // (preview-exact: (696 - 2*12) / 3) preferred 696 px and
+    // clipped the clutch card at the 880 px minimum window; 210 px
+    // makes the row prefer 654 px (3*210 + 2*12), so the page spans
+    // the full column at design width AND fits the 656 px column at
+    // the minimum window.
     report.check(
         "gap-pedals-min-width",
-        count(&pedals, "min-width: 224px;") == 3
-            && count(&pedals, "width: 224px;") - count(&pedals, "min-width: 224px;") == 0,
-        "Pedals cards use min-width: 224px (no explicit width: 224px)",
+        count(&pedals, "min-width: 210px;") == 3
+            && count(&pedals, "width: 210px;") - count(&pedals, "min-width: 210px;") == 0,
+        "Pedals cards use min-width: 210px (no explicit width: 210px)",
     );
     report.check(
         "gap-buttons-min-width",
@@ -1785,14 +1810,16 @@ pub fn gate_card_gap_source() -> (bool, String) {
             && count(&buttons, "width: 90px;") - count(&buttons, "min-width: 90px;") == 0,
         "Buttons tiles use min-width: 90px (no explicit width: 90px)",
     );
-    // P1-6: the Settings columns use a 322 px floor ((656 - 12) / 2
-    // at the 880 px minimum window) and still stretch to 342 px at
-    // the 920 px design width — 322 is the floor, not the size.
+    // P1-6: the Settings columns use a 318 px floor (318*2 + 12
+    // gap = 648, leaving 8 px slack in the 656 px column at the
+    // 880 px minimum window — at exactly 322 the borders pushed
+    // the right column over the edge) and still stretch to 342 px
+    // at the 920 px design width — 318 is the floor, not the size.
     report.check(
         "gap-settings-min-width",
-        count(&settings, "min-width: 322px;") == 2
-            && count(&settings, "width: 322px;") - count(&settings, "min-width: 322px;") == 0,
-        "Settings columns use min-width: 322px + stretch (no explicit width: 322px)",
+        count(&settings, "min-width: 318px;") == 2
+            && count(&settings, "width: 318px;") - count(&settings, "min-width: 318px;") == 0,
+        "Settings columns use min-width: 318px + stretch (no explicit width: 318px)",
     );
     report.finish()
 }

@@ -324,11 +324,11 @@ pub struct SidecarManager {
 fn sidecar_exited(process: Option<usize>) -> bool {
     #[cfg(windows)]
     {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::GetExitCodeProcess;
         let Some(process) = process else {
             return false;
         };
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::System::Threading::GetExitCodeProcess;
         let handle = HANDLE(process as *mut std::ffi::c_void);
         let mut code = 0u32;
         // SAFETY: `handle` is the live `SEE_MASK_NOCLOSEPROCESS`
