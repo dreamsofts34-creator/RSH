@@ -14,8 +14,13 @@
 //! detected, no game-specific key is written — any game that reads
 //! the `RacingWheel` classification sees the same wheel. The
 //! second part — the `1234BEAD00010004` `RacingWheel` registry
-//! mapping itself — lives in the installer, not here: it needs
-//! admin + HKLM, and the installer is the elevated component.
+//! mapping itself (plus the HID one) — lives in the installer,
+//! which is already elevated. The app-side repair path is
+//! [`configure_device_1_envelope_and_mappings`]: one elevated
+//! PowerShell run that applies the envelope AND re-writes the
+//! complete mapping tree (both devices) from the same
+//! [`wheel_check::mapping_entries`] source of truth, so a
+//! post-install repair needs exactly one UAC prompt.
 //!
 //! # Why `vJoyConfig.exe`, not a hand-built descriptor
 //!
@@ -59,6 +64,27 @@
 //!   FFB section; without it the device reports no force feedback
 //!   and a wheel game has no reason to treat it as a wheel.
 //!
+//! # Device restart after the config change
+//!
+//! `vJoyConfig.exe` calls `refresh_vjoy()` after `Create`
+//! (unless deferred). Verified against the upstream source
+//! (`BrunnerInnovation/vJoy`, `apps/vJoyInstall/`):
+//! `refresh_vjoy` is `Repair(DeviceHWID, INFFILE)`, which
+//! re-installs the driver on the existing device node with
+//! `UpdateDriverForPlugAndPlayDevices` (`INSTALLFLAG_FORCE`,
+//! the system `Input.inf`) — a real restart of the device stack
+//! (driver reload), not a registry re-read. That is why the new
+//! HID report descriptor is picked up without a manual
+//! disable → re-enable cycle and without a reboot in the normal
+//! case. It is NOT literally a disable/enable cycle
+//! (`ChangeInstalled` with `DIF_PROPERTYCHANGE` is a different
+//! upstream helper, unused here) — but the effect is the same
+//! class: the device node restarts, so the descriptor a game
+//! enumerates afterwards is the new one. A game that already
+//! enumerated the old descriptor still needs a restart; nothing
+//! here can fix that from the RSH side. No strengthening was
+//! needed (FH4 fix, v2.0.14).
+//!
 //! # Who runs it
 //!
 //! Two call sites, both best-effort-or-loud (never silent):
@@ -67,29 +93,37 @@
 //!   `vJoyConfig.exe` directly when vJoy is already installed —
 //!   fresh install and update alike (the install section runs on
 //!   every install). vJoy missing → skipped: the wizard installs
-//!   vJoy later, and the second call site covers that.
-//! * [`configure_device_1_envelope`] (Windows-only) is the
-//!   in-app path, called after the wizard's vJoy install
-//!   (`rsh-app-core`, `run_vjoy_install_inner`). The daemon runs
-//!   non-elevated, so this runs `vJoyConfig.exe` elevated via
+//!   vJoy later, and the second call site covers that. The
+//!   installer also writes the complete `GameInput` mapping tree
+//!   (both devices) directly.
+//! * [`configure_device_1_envelope_and_mappings`] (Windows-only)
+//!   is the in-app path, called after the wizard's vJoy install
+//!   (`rsh-app-core`, `run_vjoy_install_inner`). One elevated
+//!   PowerShell run applies the envelope AND the complete mapping
+//!   tree. The daemon runs non-elevated, so this runs elevated via
 //!   PowerShell `Start-Process -Verb RunAs` (one UAC prompt — the
 //!   vJoy installer itself already prompted once). A declined
 //!   prompt, a timeout, or a non-zero exit is a loud failure: the
 //!   caller reports it and points at re-running the RSH installer
 //!   (which writes the envelope *and* the `GameInput` mapping).
+//!   [`configure_device_1_envelope`] (envelope only) is kept for
+//!   callers that only need the envelope.
 //!
 //! # Verification (and its limit)
 //!
 //! `vJoyConfig.exe` exits 0 even when the registry write fails
 //! (upstream `_tmain` ignores the write result), so the exit code
 //! only proves the tool ran — it does **not** prove the envelope
-//! landed. The real verification is the connect-time capabilities
-//! read the vJoy backend already does (`GetVJDAxisExist` /
-//! `GetVJDButtonNumber` → [`VJoyCapabilities`](super::vjoy::VJoyCapabilities),
-//! validated against the plan by
-//! [`validate_capabilities`](super::vjoy::validate_capabilities)):
-//! a device 1 without the envelope fails the connect with a named
-//! missing capability instead of feeding a wrong-shaped device.
+//! landed. The real verification is the envelope-shape read: the
+//! connect-time [`validate_envelope`](super::vjoy::validate_envelope)
+//! (which REPORTS a wrong-shaped device instead of refusing it —
+//! feeding keeps working) and the daemon wheel check
+//! ([`super::wheel_check::run_wheel_check`], which re-measures the
+//! mappings + envelope + FFB live and surfaces them as
+//! `VjoyStatus.wheel_check`). An earlier version of these docs
+//! claimed the connect-time caps read "is the verification" —
+//! that was false: the caps read never checked the button count
+//! against 128, Rx/Ry/Rz/Dial, the POVs, or FFB.
 //! The installer additionally checks the descriptor landed by
 //! reading back `HidReportDescriptorSize` for `Device01`.
 //! The only proof a game shows the Wheel tab is the user's PC
@@ -267,9 +301,6 @@ pub const VJOY_CONFIG_TIMEOUT_SECS: u64 = 120;
 /// connect-time capabilities read is the verification.
 #[cfg(windows)]
 pub fn configure_device_1_envelope() -> Result<(), VJoyConfigError> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-
     let tool = resolve_vjoy_config_path().ok_or(VJoyConfigError::ToolNotFound)?;
     // `-Verb RunAs` elevates (one UAC prompt); `-Wait` blocks the
     // PowerShell child until vJoyConfig exits, so the exit code
@@ -282,8 +313,141 @@ pub fn configure_device_1_envelope() -> Result<(), VJoyConfigError> {
         "Start-Process -FilePath \"{}\" -ArgumentList \"{args}\" -Verb RunAs -Wait",
         tool.display()
     );
+    let status = run_powershell(&script)?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(VJoyConfigError::Failed(format!(
+        "vJoyConfig.exe failed (exit {}) — the device-1 envelope was not applied. If the UAC prompt was declined, accept it; otherwise re-run the RSH installer, which writes the envelope and the Windows.Gaming.Input RacingWheel mapping together.",
+        status.code().unwrap_or(-1)
+    )))
+}
+
+/// The PowerShell script (one file) that applies the envelope AND
+/// the complete `GameInput` mapping tree, for one elevated run.
+///
+/// Pure — testable on any OS. The script:
+/// * runs `vJoyConfig.exe` with [`vjoy_config_argv`] and exits with
+///   its exit code on failure (the envelope step);
+/// * then writes every mapping entry of both devices with `reg add`
+///   (`/f`, output silenced) and exits 1 on the first failed write;
+/// * exits 0 when everything landed.
+///
+/// The entries come from [`wheel_check::mapping_entries`], the same
+/// source of truth the self-check verifies and the installer
+/// mirrors — a drift would fail the installer's mapping test.
+/// `reg.exe` runs from the elevated 64-bit PowerShell, so it writes
+/// the native 64-bit registry view — the same view the installer
+/// targets with `SetRegView 64` and the view 64-bit games read.
+#[must_use]
+pub fn wheel_setup_script(tool: &Path) -> String {
+    use crate::wheel_check::{HID_EXPECTED_MAPPING, VJOY_EXPECTED_MAPPING, mapping_entries};
+    use crate::wheel_check::{HID_GAMEINPUT_SUBKEY, MappingValue, VJOY_GAMEINPUT_SUBKEY};
+    use std::fmt::Write as _;
+    let mut script = String::new();
+    let args = vjoy_config_argv().join(" ");
+    let _ = writeln!(
+        script,
+        "$p = Start-Process -FilePath \"{}\" -ArgumentList \"{args}\" -Wait -PassThru",
+        tool.display()
+    );
+    let _ = writeln!(script, "if ($p.ExitCode -ne 0) {{ exit $p.ExitCode }}");
+    for (device_subkey, expected) in [
+        (VJOY_GAMEINPUT_SUBKEY, VJOY_EXPECTED_MAPPING),
+        (HID_GAMEINPUT_SUBKEY, HID_EXPECTED_MAPPING),
+    ] {
+        for entry in mapping_entries(&expected) {
+            let full_key = if entry.subkey.is_empty() {
+                device_subkey.to_string()
+            } else {
+                format!("{device_subkey}\\{}", entry.subkey)
+            };
+            let (kind, value) = match entry.value {
+                MappingValue::Str(text) => ("REG_SZ", format!("\"{text}\"")),
+                MappingValue::Dword(number) => ("REG_DWORD", number.to_string()),
+            };
+            let _ = writeln!(
+                script,
+                "reg add \"HKLM\\{full_key}\" /v \"{}\" /t {kind} /d {value} /f > $null",
+                entry.name
+            );
+            let _ = writeln!(script, "if ($LASTEXITCODE -ne 0) {{ exit 1 }}");
+        }
+    }
+    script.push_str("exit 0\n");
+    script
+}
+
+/// Configure vJoy device 1 AND re-write the complete `GameInput`
+/// mapping tree (Windows-only) — the in-app repair path, called
+/// after the wizard's vJoy install
+/// (`rsh-app-core`, `run_vjoy_install_inner`).
+///
+/// Writes [`wheel_setup_script`] to a temp `.ps1` file and runs it
+/// elevated in ONE PowerShell (`Start-Process -Verb RunAs` — one
+/// UAC prompt for the envelope + both mappings together), waiting
+/// at most [`VJOY_CONFIG_TIMEOUT_SECS`] seconds. The temp script
+/// is removed afterwards (best effort).
+///
+/// # Errors
+///
+/// [`VJoyConfigError::ToolNotFound`] when vJoy is not installed,
+/// [`VJoyConfigError::SpawnFailed`] when the elevated run could
+/// not be started, [`VJoyConfigError::TimedOut`] when it did not
+/// finish in time (child killed), [`VJoyConfigError::Failed`]
+/// when it exited non-zero (including a declined UAC prompt, or a
+/// failed `reg add` — the mapping was not fully written).
+#[cfg(windows)]
+pub fn configure_device_1_envelope_and_mappings() -> Result<(), VJoyConfigError> {
+    let tool = resolve_vjoy_config_path().ok_or(VJoyConfigError::ToolNotFound)?;
+    let script = wheel_setup_script(&tool);
+    let dir = std::env::temp_dir().join("RSH");
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        VJoyConfigError::SpawnFailed(format!("could not create the temp folder: {error}"))
+    })?;
+    let ps1 = dir.join("rsh-wheel-setup.ps1");
+    std::fs::write(&ps1, script).map_err(|error| {
+        VJoyConfigError::SpawnFailed(format!("could not write the wheel setup script: {error}"))
+    })?;
+    // One elevated PowerShell runs the script file; `-PassThru`
+    // + `exit $p.ExitCode` propagates the script's exit code, so
+    // a declined UAC prompt (Start-Process throws) and a failed
+    // envelope/mapping step both surface as non-zero here.
+    let runner = format!(
+        "$p = Start-Process -FilePath \"powershell.exe\" -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','{}') -Verb RunAs -Wait -PassThru; exit $p.ExitCode",
+        ps1.display()
+    );
+    let outcome = run_powershell(&runner);
+    let _ = std::fs::remove_file(&ps1);
+    let status = outcome?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(VJoyConfigError::Failed(format!(
+        "the wheel setup failed (exit {}) — vJoy device 1 and/or the Windows.Gaming.Input RacingWheel mapping were not fully applied. If the UAC prompt was declined, accept it; otherwise re-run the RSH installer, which writes the envelope and the mapping together.",
+        status.code().unwrap_or(-1)
+    )))
+}
+
+/// Run one (already complete) PowerShell `-Command` script and
+/// wait for it, bounded by [`VJOY_CONFIG_TIMEOUT_SECS`]
+/// (Windows-only shared helper for the two elevated entry points
+/// above — the wait/timeout mapping lives in exactly one place).
+///
+/// # Errors
+///
+/// [`VJoyConfigError::SpawnFailed`] when PowerShell could not be
+/// started, [`VJoyConfigError::TimedOut`] when it did not finish
+/// in time (child killed), [`VJoyConfigError::Failed`] when
+/// waiting on it failed. A non-zero exit is NOT an error here —
+/// the caller maps the status to its own message.
+#[cfg(windows)]
+fn run_powershell(script: &str) -> Result<std::process::ExitStatus, VJoyConfigError> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
     let mut child = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -295,15 +459,7 @@ pub fn configure_device_1_envelope() -> Result<(), VJoyConfigError> {
     let deadline = Instant::now() + Duration::from_secs(VJOY_CONFIG_TIMEOUT_SECS);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
-                    return Ok(());
-                }
-                return Err(VJoyConfigError::Failed(format!(
-                    "vJoyConfig.exe failed (exit {}) — the device-1 envelope was not applied. If the UAC prompt was declined, accept it; otherwise re-run the RSH installer, which writes the envelope and the Windows.Gaming.Input RacingWheel mapping together.",
-                    status.code().unwrap_or(-1)
-                )));
-            }
+            Ok(Some(status)) => return Ok(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -314,7 +470,7 @@ pub fn configure_device_1_envelope() -> Result<(), VJoyConfigError> {
             }
             Err(error) => {
                 return Err(VJoyConfigError::Failed(format!(
-                    "could not wait for vJoyConfig.exe: {error}"
+                    "could not wait for powershell.exe: {error}"
                 )));
             }
         }
@@ -413,5 +569,39 @@ mod tests {
                 .contains('x'),
             "Failed carries the detail verbatim"
         );
+    }
+
+    #[test]
+    fn wheel_setup_script_applies_envelope_then_both_mappings() {
+        let tool = Path::new(r"C:\Program Files\vJoy\x64\vJoyConfig.exe");
+        let script = wheel_setup_script(tool);
+        // Envelope first, with the exact argv, and a failure exits
+        // with the tool's code before any registry write.
+        assert!(
+            script.contains("1 -f -a x y z rx ry rz sl0 sl1 -b 128 -s 1 -e All"),
+            "{script}"
+        );
+        assert!(script.contains("if ($p.ExitCode -ne 0) { exit $p.ExitCode }"));
+        // Both device keys, complete tree: 40 reg adds each.
+        assert_eq!(script.matches("reg add ").count(), 80, "{script}");
+        assert!(script.contains("1234BEAD00010004"));
+        assert!(script.contains("1209525300010004"));
+        assert!(script.contains("Labels\\Buttons"));
+        assert!(script.contains("Labels\\Switches"));
+        assert!(script.contains("RacingWheel\\DPadUp"));
+        assert!(script.contains("RacingWheel\\Clutch"));
+        // Spot-check value spellings (DWORD decimal, strings quoted).
+        assert!(script.contains("/t REG_DWORD /d 450 /f"));
+        assert!(script.contains("/v \"Button0\" /t REG_SZ /d \"LetterA\" /f"));
+        assert!(script.contains("/v \"SwitchPosition\" /t REG_SZ /d \"Up\" /f"));
+        // Every write is checked; the script exits 0 at the end.
+        assert_eq!(
+            script
+                .matches("if ($LASTEXITCODE -ne 0) { exit 1 }")
+                .count(),
+            80,
+            "{script}"
+        );
+        assert!(script.trim_end().ends_with("exit 0"));
     }
 }

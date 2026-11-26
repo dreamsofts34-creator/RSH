@@ -2039,6 +2039,15 @@ fn main() {
     if let Some(note) = state.backend_migration_note() {
         log_line(verbose, &format!("daemon: backend migration: {note}"));
     }
+    // FH4 wheel check (v2.0.14): log the one-line summary at
+    // startup so the daemon log tells us, without the user running
+    // diagnostics, which piece is missing on his PC (mapping,
+    // envelope, feeder). No-op off Windows — `wheel_check` is
+    // `None` there. On Windows the first `vjoy_status()` call runs
+    // the check and caches it for the slow poll.
+    if let Some(check) = state.vjoy_status().wheel_check {
+        log_line(verbose, &format!("daemon: {}", check.summary_line()));
+    }
     // Binding store: log the load warnings (dropped entries,
     // corrupt file) so a binding that did not survive is never
     // silent.

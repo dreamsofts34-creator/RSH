@@ -18,13 +18,15 @@ pub mod error;
 pub mod selector;
 pub mod vjoy;
 pub mod vjoy_config;
+pub mod wheel_check;
 
 use rsh_engine::pipeline::{OutputState, PipelinePlan};
 
 pub use error::OutputError;
 pub use selector::{BackendFactories, BackendKind, SwitchOutcome, switch_backend};
-pub use vjoy::{VJoyError, VJoyOutput, VJoyStateKind, VJoyStatus};
+pub use vjoy::{EnvelopeCaps, VJoyError, VJoyOutput, VJoyStateKind, VJoyStatus, validate_envelope};
 pub use vjoy_config::{VJOY_FH4_DEVICE_ID, VJoyConfigError, vjoy_config_argv};
+pub use wheel_check::{WheelCheckResult, mapping_entries, run_wheel_check};
 
 /// The processed state the engine hands to an output backend.
 ///

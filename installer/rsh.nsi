@@ -354,7 +354,8 @@ FunctionEnd
 ; CreateHidReportDesc): X=0, Y=1, Z=2, Rx=3, Ry=4, Rz=5,
 ; Slider=6, Dial=7 — the EmuWheel envelope (see
 ; ConfigureVJoyDevice1) enables exactly these eight, so:
-;   Wheel=X/0, Throttle=Y/1, Brake=Z/2, Handbrake=Slider/6.
+;   Wheel=X/0, Throttle=Y/1, Brake=Z/2, Clutch=Rx/3,
+;   Handbrake=Slider/6.
 ; Invert is 0 everywhere: RSH's raw values RISE with input
 ; (steering right = max, pedals pressed = max — see
 ; crates/rsh-output/src/vjoy.rs), so no inversion is needed.
@@ -368,12 +369,23 @@ FunctionEnd
 ; deliberately NOT mapped (FirstGear..SixthGear, ReverseGear):
 ; the pipeline strips gear bits 5–10 from the button word, so
 ; those buttons never fire — a mapping would point at dead
-; indices. No Clutch subkey either: the envelope has no Clutch
-; usage axis (RSH's wClutch field is ignored by the driver when
-; the axis is absent), and Clutch is optional in the schema.
+; indices. Clutch IS mapped (v2.0.14): the vJoy backend feeds
+; clutch to Rx (axis 3) as well as to wClutch, so the axis the
+; mapping points at is really fed (see crates/rsh-output/src/
+; vjoy.rs — clutch was wClutch-only before; mapping it to an
+; unfed axis would have been a lie). Button3–8 are not mapped
+; either: raw buttons 3–4 are pedal buttons (stripped by the
+; pipeline) and 6–11 are the H-pattern gear bits, so only
+; Button1 (shift-up, raw 1) and Button2 (shift-down, raw 2)
+; have fixed assignments. Labels ARE written (v2.0.14): the
+; Learn doc says they "should be present" and its example
+; includes them — v2.0.13 skipped them, and the incomplete tree
+; is the #1 suspect for FH4 ignoring the mapping. DPadUp/Down/
+; Left/Right point at switch index 0 (the 1 discrete POV) with
+; IncludeAdjacent 1, per the example.
 ; MaxWheelAngle 450 = the default 900° lock-to-lock, one
 ; direction (the Learn example uses 0x1C2 = 450 for the same
-; reason). Labels are optional in the schema and skipped.
+; reason).
 ; SetRegView 64 is SCOPED (same pattern as the WER block): the
 ; mapping must land in the native 64-bit view, where 64-bit games
 ; read it. Written on EVERY install (fresh and update — this
@@ -395,8 +407,36 @@ Function WriteGameInputVJoyMapping
   WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Brake" "Invert" 0
   WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Handbrake" "AxisIndex" 6
   WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Handbrake" "Invert" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Clutch" "AxisIndex" 3
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Clutch" "Invert" 0
   WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\PreviousGear" "ButtonIndex" 1
   WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\NextGear" "ButtonIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Button1" "ButtonIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\Button2" "ButtonIndex" 1
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadUp" "SwitchIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadUp" "IncludeAdjacent" 1
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadUp" "SwitchPosition" "Up"
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadDown" "SwitchIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadDown" "IncludeAdjacent" 1
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadDown" "SwitchPosition" "Down"
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadLeft" "SwitchIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadLeft" "IncludeAdjacent" 1
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadLeft" "SwitchPosition" "Left"
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadRight" "SwitchIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadRight" "IncludeAdjacent" 1
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\RacingWheel\DPadRight" "SwitchPosition" "Right"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button0" "LetterA"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button1" "LetterB"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button2" "LetterX"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button3" "LetterY"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button6" "Menu"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button7" "View"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button8" "RightStickButton"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Buttons" "Button9" "LeftStickButton"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Switches" "Switch0Up" "Up"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Switches" "Switch0Right" "Right"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Switches" "Switch0Down" "Down"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1234BEAD00010004\Labels\Switches" "Switch0Left" "Left"
   SetRegView 32
 FunctionEnd
 
@@ -412,8 +452,8 @@ FunctionEnd
 ; buttons, 1 hat, 15-byte report):
 ;   Wheel=X/0, Throttle=Y/1, Brake=Z/2, Clutch=Rx/3,
 ;   Handbrake=Slider/4.
-; Clutch IS mapped here (unlike the vJoy mapping): Rx is the
-; clutch axis on this profile and RSH feeds it there
+; Clutch IS mapped here (and on the vJoy mapping since v2.0.14):
+; Rx is the clutch axis on this profile and RSH feeds it there
 ; (crates/rsh-output-hidmaestro/src/mapping.rs). Invert is 0
 ; everywhere for the same reason as fix #1 (raw values rise with
 ; input — see mapping.rs axis_to_u16: released = 0, pressed =
@@ -422,6 +462,8 @@ FunctionEnd
 ; button 1 = ButtonIndex 0; bit 1 = shift-down = button 2 =
 ; ButtonIndex 1). H-pattern gears are not mapped (gear bits are
 ; stripped from the button word — same reason as fix #1).
+; Labels, DPad and Button1–2 are written exactly as in fix #1
+; (same Learn example values), v2.0.14.
 ; MaxWheelAngle 450, same as fix #1 (default 900° lock). Written
 ; on EVERY install (fresh and update), removed by the
 ; uninstaller. The game must be restarted after install; the
@@ -442,6 +484,32 @@ Function WriteGameInputHidMapping
   WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Handbrake" "Invert" 0
   WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\PreviousGear" "ButtonIndex" 1
   WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\NextGear" "ButtonIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Button1" "ButtonIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\Button2" "ButtonIndex" 1
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadUp" "SwitchIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadUp" "IncludeAdjacent" 1
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadUp" "SwitchPosition" "Up"
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadDown" "SwitchIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadDown" "IncludeAdjacent" 1
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadDown" "SwitchPosition" "Down"
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadLeft" "SwitchIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadLeft" "IncludeAdjacent" 1
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadLeft" "SwitchPosition" "Left"
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadRight" "SwitchIndex" 0
+  WriteRegDWORD HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadRight" "IncludeAdjacent" 1
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\RacingWheel\DPadRight" "SwitchPosition" "Right"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button0" "LetterA"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button1" "LetterB"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button2" "LetterX"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button3" "LetterY"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button6" "Menu"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button7" "View"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button8" "RightStickButton"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Buttons" "Button9" "LeftStickButton"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Switches" "Switch0Up" "Up"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Switches" "Switch0Right" "Right"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Switches" "Switch0Down" "Down"
+  WriteRegStr HKLM "SYSTEM\CurrentControlSet\Control\GameInput\Devices\1209525300010004\Labels\Switches" "Switch0Left" "Left"
   SetRegView 32
 FunctionEnd
 
@@ -452,10 +520,12 @@ FunctionEnd
 ; source of truth; this call mirrors it exactly):
 ;   vJoyConfig.exe 1 -f -a x y z rx ry rz sl0 sl1 -b 128 -s 1 -e All
 ; Runs on EVERY install (fresh and update — `-f` replaces the
-; existing device-1 config). vJoy missing → skipped silently
-; (DetailPrint): the wizard installs vJoy later, and the app's
-; post-install path (rsh-app-core run_vjoy_install_inner) configures
-; device 1 then. Best-effort, never fatal: a failure warns (the
+; existing device-1 config). vJoy missing → LOUD (v2.0.14 — a
+; MessageBox, not a silent DetailPrint): the wizard installs vJoy
+; later, and the app's post-install path (rsh-app-core
+; run_vjoy_install_inner) configures device 1 then — but a skipped
+; envelope must be visible at install time, not discovered later
+; in a game. Best-effort, never fatal: a failure warns (the
 ; mapping above is still written) and the app's connect-time
 ; capabilities check is the real verification — vJoyConfig exits 0
 ; even when its registry write fails, so the exit code only proves
@@ -467,7 +537,12 @@ Function ConfigureVJoyDevice1
   StrCpy $R0 ""
   IfFileExists "$PROGRAMFILES64\vJoy\x64\vJoyConfig.exe" vjoycfg_found
   IfFileExists "$PROGRAMFILES32\vJoy\x64\vJoyConfig.exe" vjoycfg_found_x86
-  DetailPrint "FH4: vJoy not installed yet — skipping vJoy device-1 configuration (the app configures it after installing vJoy)."
+  ; FH4 fix (v2.0.14, B3): a missing vJoyConfig.exe used to skip
+  ; silently (DetailPrint only) — a skipped envelope is invisible
+  ; at install time and only shows up later as "no Wheel tab".
+  ; Make it LOUD, same pattern as the failure boxes below
+  ; (/SD IDOK so silent installs never hang).
+  MessageBox MB_ICONEXCLAMATION "RSH installed, but vJoy is not installed yet, so vJoy device 1 could not be configured as a wheel for Windows.Gaming.Input games. Wheel games (for example Forza Horizon 4) may not show a Wheel tab until vJoy is installed. Next step: install vJoy from the RSH wizard (Settings / Output) — the app configures device 1 right after the install — or run the RSH installer again after installing vJoy." /SD IDOK
   Return
   vjoycfg_found_x86:
     StrCpy $R0 "$PROGRAMFILES32\vJoy\x64\vJoyConfig.exe"

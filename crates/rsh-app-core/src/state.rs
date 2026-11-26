@@ -178,7 +178,7 @@ use rsh_output::selector::{BackendFactories, BackendKind, SwitchOutcome, switch_
 use rsh_output::vjoy::{RealVJoyDll, VJoyInterface};
 use rsh_output::vjoy::{VJOY_DOWNLOAD_URL, VJoyOutput, resolve_dll_path};
 #[cfg(windows)]
-use rsh_output::vjoy_config::configure_device_1_envelope;
+use rsh_output::vjoy_config::configure_device_1_envelope_and_mappings;
 use rsh_output::{IJoystickOutput, ProcessedState, VJoyError};
 use rsh_output_hidmaestro::HidMaestroOutput;
 use rsh_output_hidmaestro::backend::UAC_NOTE;
@@ -431,6 +431,29 @@ struct VjoyDllCache {
 /// long enough that the ~1 Hz slow poll never probes, short enough
 /// that a hand-installed driver shows up without a restart.
 const VJOY_DLL_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Cached FH4 wheel check (v2.0.14): [`AppStateCore::vjoy_status`]
+/// is called ~1 Hz by the slow poll, but the check reads the
+/// registry + loads the vJoy DLL — it runs at most once per
+/// [`WHEEL_CHECK_CACHE_TTL`] window, or when invalidated (backend
+/// switch, vJoy install completion). Off Windows the check does
+/// not exist, so the cache stays empty and `vjoy_status()` reports
+/// `wheel_check: None` forever.
+#[derive(Default)]
+struct WheelCheckCache {
+    /// When the cached check ran ([`None`] = never checked, or
+    /// invalidated — the next read re-checks immediately).
+    checked_at: Option<Instant>,
+    /// The last check result ([`None`] off Windows, or before the
+    /// first check ran).
+    result: Option<rsh_api::WheelCheck>,
+}
+
+/// Time after which the cached wheel check is re-run (v2.0.14):
+/// the mapping / envelope only change when something installs or
+/// reconfigures vJoy, so 30 s is plenty live without re-reading
+/// the registry every slow-poll cycle.
+const WHEEL_CHECK_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Cached Wi-Fi password-set flag (R3-D-08): [`AppStateCore::wifi_status`]
 /// did one Credential Manager read per call, and the daemon's slow
@@ -1019,6 +1042,10 @@ pub struct AppStateCore {
     /// `installing` / `install_error` are NOT cached — they are
     /// cheap lock reads and must stay live.
     vjoy_dll_cache: Mutex<VjoyDllCache>,
+    /// Cached FH4 wheel check (v2.0.14, see [`WheelCheckCache`]):
+    /// the check result `vjoy_status()` reports, so the ~1 Hz slow
+    /// poll does not re-run the registry / DLL reads every cycle.
+    wheel_check_cache: Mutex<WheelCheckCache>,
     /// Last measured vJoy driver version (P3-9, v2.0.12 scan):
     /// the live vJoy backend measures it at connect (see
     /// [`IJoystickOutput::vjoy_driver_version`]), and `vjoy_status()`
@@ -1343,6 +1370,7 @@ impl AppStateCore {
             backend_migration_note: Mutex::new(backend_migration_note),
             vjoy_install: Mutex::new(VjoyInstallState::default()),
             vjoy_dll_cache: Mutex::new(VjoyDllCache::default()),
+            wheel_check_cache: Mutex::new(WheelCheckCache::default()),
             last_vjoy_driver_version: Mutex::new(None),
             wifi_password_cache: Mutex::new(WifiPasswordCache::default()),
             session_gate_open: Mutex::new(false),
@@ -4146,6 +4174,15 @@ impl AppStateCore {
         }
         *lock(&self.backend_name) = live_name;
         *lock(&self.backend_detail) = detail;
+        // FH4 wheel check (v2.0.14): the switch changed what the
+        // check measures (which backend feeds), so invalidate and
+        // re-check immediately, and log the one-line summary —
+        // the daemon log then shows the wheel state at every
+        // switch, not just at startup.
+        self.invalidate_wheel_check_cache();
+        if let Some(check) = self.cached_wheel_check() {
+            self.push_connection_log("INFO", &format!("wheel check: {}", check.summary_line()));
+        }
         Ok(outcome)
     }
 
@@ -4370,6 +4407,78 @@ impl AppStateCore {
         cache.dll = None;
     }
 
+    /// Cached wheel check (v2.0.14): at most one
+    /// [`rsh_output::wheel_check::run_wheel_check`] per
+    /// [`WHEEL_CHECK_CACHE_TTL`] window, so the ~1 Hz slow poll
+    /// never re-reads the registry every cycle. Never blocks the
+    /// caller beyond the check itself (registry + DLL reads,
+    /// milliseconds — no elevation, no network).
+    fn cached_wheel_check(&self) -> Option<rsh_api::WheelCheck> {
+        {
+            let cache = lock(&self.wheel_check_cache);
+            if let Some(checked_at) = cache.checked_at
+                && checked_at.elapsed() < WHEEL_CHECK_CACHE_TTL
+            {
+                return cache.result.clone();
+            }
+        }
+        let result = self.refresh_wheel_check();
+        let mut cache = lock(&self.wheel_check_cache);
+        cache.checked_at = Some(Instant::now());
+        cache.result.clone_from(&result);
+        result
+    }
+
+    /// Run the wheel check once and map it to the API shape,
+    /// computing `feeding` from the live backend. Windows-only:
+    /// off Windows there is no registry / vJoy to check, so this
+    /// returns [`None`] without touching anything. Each lock is
+    /// taken in its own scope and dropped before the next — the
+    /// three locks (`output_enabled`, backend, `engine_status`)
+    /// are never held nested, matching the `vjoy_status()` pattern.
+    // `self` is used on Windows (backend / output / engine reads);
+    // off Windows the whole Windows block is cfg'd out, so the
+    // pedantic unused-self lint is allowed here.
+    #[allow(clippy::unused_self)]
+    fn refresh_wheel_check(&self) -> Option<rsh_api::WheelCheck> {
+        #[cfg(windows)]
+        {
+            let result = rsh_output::wheel_check::run_wheel_check();
+            let enabled = *lock(&self.output_enabled);
+            let (is_vjoy, connected) = {
+                let backend = self.backend_handle();
+                let live = lock(&backend);
+                (live.name() == "vJoy", live.is_connected())
+            };
+            let engine_running = matches!(self.engine_status(), EngineTaskStatus::Running { .. });
+            Some(rsh_api::WheelCheck {
+                vjoy_mapping_ok: result.vjoy_mapping_ok,
+                hid_mapping_ok: result.hid_mapping_ok,
+                envelope_ok: result.envelope_ok,
+                button_count: result.button_count,
+                ffb_present: result.ffb_present,
+                feeding: enabled && is_vjoy && connected && engine_running,
+                next_step: result.next_step,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    /// Drop the cached wheel check (v2.0.14): the next
+    /// [`Self::cached_wheel_check`] re-checks immediately. Callers
+    /// that change what the check measures — backend switch
+    /// ([`Self::finish_backend_switch`]), vJoy install completion
+    /// ([`run_vjoy_install`]) — invalidate instead of waiting out
+    /// the TTL.
+    fn invalidate_wheel_check_cache(&self) {
+        let mut cache = lock(&self.wheel_check_cache);
+        cache.checked_at = None;
+        cache.result = None;
+    }
+
     /// vJoy driver status (v2.0.1 hotfix BACKEND-2): whether the DLL
     /// was found (cached file probe — see
     /// [`Self::vjoy_dll_path`]), whether a background install is
@@ -4395,8 +4504,11 @@ impl AppStateCore {
         let version = live_version.or_else(|| lock(&self.last_vjoy_driver_version).clone());
         // Probe before taking the install lock: the probe takes the
         // cache lock, and no other path takes both locks in the
-        // opposite order.
+        // opposite order. The wheel check goes first for the same
+        // reason (it takes the wheel-check cache lock, then
+        // `output_enabled` / backend / `engine_status`).
         let dll = self.vjoy_dll_path();
+        let wheel_check = self.cached_wheel_check();
         let install = lock(&self.vjoy_install);
         rsh_api::VjoyStatus {
             installed: dll.is_some(),
@@ -4404,10 +4516,11 @@ impl AppStateCore {
             install_error: install.error.clone(),
             dll_path: dll.map(|path| path.to_string_lossy().into_owned()),
             version,
-            // FH4 wheel check (v2.0.14): None until the
-            // daemon-side check lands (backend) — the UI renders
-            // None as "not checked yet", never as OK.
-            wheel_check: None,
+            // FH4 wheel check (v2.0.14): the cached daemon-side
+            // check — None off Windows, or before the first check
+            // ran. The UI renders None as "not checked yet", never
+            // as OK.
+            wheel_check,
         }
     }
 
@@ -8240,6 +8353,10 @@ fn run_vjoy_install(state: &Arc<AppStateCore>) {
     // R2-20: the install may have placed (or failed to place) the
     // DLL — the cached probe must not keep answering the old result.
     state.invalidate_vjoy_dll_cache();
+    // FH4 fix (v2.0.14): the install reconfigures device 1 and
+    // re-writes the mapping tree — the cached wheel check must not
+    // keep answering the pre-install state either.
+    state.invalidate_wheel_check_cache();
     let mut install = lock(&state.vjoy_install);
     install.installing = false;
     install.error = result.err();
@@ -8361,19 +8478,20 @@ fn run_vjoy_install_inner() -> Result<(), String> {
         ));
     }
     if resolve_dll_path().is_some() {
-        // FH4 fix #1 (v2.0.13): vJoy installs with its own default
-        // device-1 shape, not the EmuWheel envelope wheel games
-        // need (8 axes, 128 buttons, 1 discrete POV, all FFB — see
-        // `rsh_output::vjoy_config`). Configure device 1 now,
-        // while the user is here — one UAC prompt (the installer
-        // already prompted once). The RSH installer does the same
-        // step directly (it is already elevated) and also writes
-        // the GameInput RacingWheel mapping, so a failed config
-        // here is reported as a failure with that repair path
-        // instead of a silent wrong-shaped device: without the
-        // envelope no wheel game can classify the device.
+        // FH4 fix #1 (v2.0.13) + complete tree (v2.0.14): vJoy
+        // installs with its own default device-1 shape, not the
+        // EmuWheel envelope wheel games need (8 axes, 128 buttons,
+        // 1 discrete POV, all FFB — see `rsh_output::vjoy_config`).
+        // Configure device 1 AND re-write the complete GameInput
+        // RacingWheel mapping tree now, while the user is here —
+        // one UAC prompt (the installer already prompted once).
+        // The RSH installer does the same steps directly (it is
+        // already elevated), so a failed config here is reported
+        // as a failure with that repair path instead of a silent
+        // wrong-shaped device: without the envelope + mapping no
+        // wheel game can classify the device.
         #[cfg(windows)]
-        if let Err(error) = configure_device_1_envelope() {
+        if let Err(error) = configure_device_1_envelope_and_mappings() {
             return Err(format!(
                 "vJoy installed, but its device 1 could not be configured as a wheel for Windows.Gaming.Input games (for example Forza Horizon 4): {error}"
             ));
@@ -11304,6 +11422,24 @@ mod tests {
         assert_eq!(status.install_error, None);
         assert_eq!(status.dll_path, None);
         assert_eq!(status.version, None, "version is never invented");
+        assert_eq!(
+            status.wheel_check, None,
+            "the wheel check does not exist off Windows"
+        );
+    }
+
+    /// FH4 wheel check (v2.0.14): off Windows the check never
+    /// runs — the cache stays empty and invalidation is a no-op
+    /// (no registry / vJoy to read, no panic).
+    #[test]
+    #[cfg(not(windows))]
+    fn wheel_check_cache_stays_empty_off_windows() {
+        let (state, _dir) = test_state();
+        assert_eq!(state.cached_wheel_check(), None);
+        assert!(lock(&state.wheel_check_cache).checked_at.is_some());
+        state.invalidate_wheel_check_cache();
+        assert!(lock(&state.wheel_check_cache).checked_at.is_none());
+        assert_eq!(state.cached_wheel_check(), None);
     }
 
     /// P3-9 (v2.0.12 scan): the last measured driver version is

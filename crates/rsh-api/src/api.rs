@@ -453,6 +453,36 @@ pub struct WheelCheck {
     pub next_step: String,
 }
 
+impl WheelCheck {
+    /// `ok` / `fail` flag for one check item, for log lines.
+    const fn flag(ok: bool) -> &'static str {
+        if ok { "ok" } else { "FAIL" }
+    }
+
+    /// One-line log summary, e.g.
+    /// `wheel check: vjoy_mapping=ok hid_mapping=ok envelope=ok
+    /// buttons=128 ffb=yes feeding=yes` plus ` — next step: ...`
+    /// when [`Self::next_step`] is non-empty. Used by the daemon
+    /// log at startup and on backend switch (FH4 fix, v2.0.14).
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        let line = format!(
+            "wheel check: vjoy_mapping={} hid_mapping={} envelope={} buttons={} ffb={} feeding={}",
+            Self::flag(self.vjoy_mapping_ok),
+            Self::flag(self.hid_mapping_ok),
+            Self::flag(self.envelope_ok),
+            self.button_count,
+            if self.ffb_present { "yes" } else { "no" },
+            if self.feeding { "yes" } else { "no" },
+        );
+        if self.next_step.is_empty() {
+            line
+        } else {
+            format!("{line} — next step: {}", self.next_step)
+        }
+    }
+}
+
 /// vJoy driver status, as the API reports it (v2.0.1 hotfix
 /// BACKEND-2). Detection is a file probe
 /// (`vJoyInterface.dll` resolvable); `version` is [`None`] until a
@@ -1897,5 +1927,36 @@ mod tests {
         )
         .expect("unknown-count check reads");
         assert_eq!(unknown.wheel_check.as_ref().unwrap().button_count, -1);
+    }
+
+    /// FH4 wheel check (v2.0.14): the daemon-log summary line.
+    #[test]
+    fn wheel_check_summary_line() {
+        let ok = WheelCheck {
+            vjoy_mapping_ok: true,
+            hid_mapping_ok: true,
+            envelope_ok: true,
+            button_count: 128,
+            ffb_present: true,
+            feeding: true,
+            next_step: String::new(),
+        };
+        assert_eq!(
+            ok.summary_line(),
+            "wheel check: vjoy_mapping=ok hid_mapping=ok envelope=ok buttons=128 ffb=yes feeding=yes"
+        );
+        let bad = WheelCheck {
+            vjoy_mapping_ok: false,
+            hid_mapping_ok: true,
+            envelope_ok: false,
+            button_count: 32,
+            ffb_present: false,
+            feeding: false,
+            next_step: "mapping incomplete — Labels missing".to_string(),
+        };
+        assert_eq!(
+            bad.summary_line(),
+            "wheel check: vjoy_mapping=FAIL hid_mapping=ok envelope=FAIL buttons=32 ffb=no feeding=no — next step: mapping incomplete — Labels missing"
+        );
     }
 }

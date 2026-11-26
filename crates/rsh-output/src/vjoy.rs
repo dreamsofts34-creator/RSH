@@ -63,7 +63,9 @@
 //! `VJoyOutput.BuildPosition` (56-test `RSH.VJoy.Tests` suite):
 //! steering → X (+ V3 `wSteering`), accelerator → Y (+ V3
 //! `wAccelerator`), brake → Z (+ V3 `wBrake`), clutch → V3 `wClutch`
-//! (caps-independent — there is no HID usage to query), handbrake →
+//! AND Rx (FH4 fix, v2.0.14 — Rx is the `GameInput` clutch axis,
+//! `RawGameController` axis 3; the Rx write is caps-gated, the
+//! `wClutch` write stays caps-independent as before), handbrake →
 //! `wSlider` (HID usage `0x36`, caps-gated), POV/hats always neutral
 //! (`0xFFFF_FFFF` — this wheel has no hat input). Buttons 1–32 →
 //! `lButtons`; buttons 33–64 (`OutputState::buttons_ex`) →
@@ -137,6 +139,14 @@ pub const USAGE_Y: u16 = 0x31;
 pub const USAGE_Z: u16 = 0x32;
 /// HID usage: Slider (`0x36`) — the handbrake axis (Phase G C8).
 pub const USAGE_SLIDER: u16 = 0x36;
+/// HID usage: Rx (`0x33`) — envelope axis 4.
+pub const USAGE_RX: u16 = 0x33;
+/// HID usage: Ry (`0x34`) — envelope axis 5.
+pub const USAGE_RY: u16 = 0x34;
+/// HID usage: Rz (`0x35`) — envelope axis 6.
+pub const USAGE_RZ: u16 = 0x35;
+/// HID usage: Dial (`0x37`) — envelope axis 8 (Slider1).
+pub const USAGE_DIAL: u16 = 0x37;
 
 // ---------------------------------------------------------------------
 // Errors
@@ -482,6 +492,58 @@ const _: () = assert!(offset_of!(JoystickPosition, w_axis_vbrz) == 120);
 // Capabilities (D11)
 // ---------------------------------------------------------------------
 
+/// The `EmuWheel` envelope shape of a vJoy device (FH4 fix batch,
+/// v2.0.14): the four axes [`VJoyCapabilities`] never measured
+/// (Rx/Ry/Rz/Dial) and the POV counts (discrete 1, continuous 0 —
+/// `-s 1` is the discrete flag, `-p` would be continuous;
+/// verified against the upstream vJoyConfig source).
+///
+/// A device without the envelope still feeds (see
+/// [`validate_envelope`]) — these fields only *report* the shape,
+/// they never gate feeding. FFB is deliberately NOT here: it is a
+/// wheel-check diagnostic only (FH4 does not send FFB to vJoy, so
+/// input works without it).
+// Four bools because the envelope IS four axes (Rx/Ry/Rz/Dial);
+// grouping them into a bitmask would hide which axis is missing
+// from the report, so the pedantic bool-count lint is allowed here.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnvelopeCaps {
+    /// Rx axis present (envelope axis 4). Also the clutch axis:
+    /// the feed writes the clutch here (see [`build_position`]).
+    pub has_axis_rx: bool,
+    /// Ry axis present (envelope axis 5).
+    pub has_axis_ry: bool,
+    /// Rz axis present (envelope axis 6).
+    pub has_axis_rz: bool,
+    /// Dial axis present (envelope axis 8, Slider1).
+    pub has_axis_dial: bool,
+    /// Discrete (4-direction) POV hat count as reported;
+    /// `-1` = not read.
+    pub discrete_pov_count: i32,
+    /// Continuous POV hat count as reported;
+    /// `-1` = not read.
+    pub continuous_pov_count: i32,
+}
+
+impl EnvelopeCaps {
+    /// Envelope shape not read yet: extra axes assumed present,
+    /// POV counts unknown. [`validate_envelope`] only reports
+    /// what was actually measured, so unknown fields never produce
+    /// a false "missing" report.
+    #[must_use]
+    pub const fn unknown() -> Self {
+        Self {
+            has_axis_rx: true,
+            has_axis_ry: true,
+            has_axis_rz: true,
+            has_axis_dial: true,
+            discrete_pov_count: -1,
+            continuous_pov_count: -1,
+        }
+    }
+}
+
 /// A vJoy device's capabilities, read by `TryConnect` from the driver.
 ///
 /// `Unknown` means "not read yet" — old behaviour: write everything
@@ -502,6 +564,11 @@ pub struct VJoyCapabilities {
     pub button_count: i32,
     /// Slider axis present (handbrake, HID usage `0x36`).
     pub has_axis_slider: bool,
+    /// `EmuWheel` envelope shape (see [`EnvelopeCaps`]).
+    /// [`EnvelopeCaps::unknown`] unless the caps were built with
+    /// [`Self::with_envelope`] — [`Self::new`] predates the
+    /// envelope read and cannot measure it.
+    pub envelope: EnvelopeCaps,
 }
 
 impl VJoyCapabilities {
@@ -523,7 +590,16 @@ impl VJoyCapabilities {
             has_axis_z,
             button_count,
             has_axis_slider,
+            envelope: EnvelopeCaps::unknown(),
         }
+    }
+
+    /// Attach a measured envelope shape to caps built with
+    /// [`Self::new`] (the connect path reads the envelope after
+    /// the five classic caps).
+    #[must_use]
+    pub const fn with_envelope(self, envelope: EnvelopeCaps) -> Self {
+        Self { envelope, ..self }
     }
 
     /// Caps not read yet: assume a full device (no gating).
@@ -606,6 +682,77 @@ pub fn validate_capabilities(plan: &PipelinePlan, caps: &VJoyCapabilities) -> Ve
     errors
 }
 
+/// Validate a device's shape against the `EmuWheel` envelope
+/// (FH4 fix batch, v2.0.14): 128 buttons, all 8 axes, exactly one
+/// discrete POV hat and no continuous POV.
+///
+/// REPORTS ONLY — it never refuses a connect. A default-shape
+/// vJoy device (32 buttons, no FFB) connects and feeds silently
+/// today (ETS2 and friends depend on it), and that stays true:
+/// the caller stores the returned problems (see
+/// [`VJoyOutput::envelope_warnings`]) and the wheel check
+/// (`wheel_check::run_wheel_check`) re-measures the live shape —
+/// it does not fail `try_connect`. The old module docs claimed
+/// the connect-time caps read "is the verification" for the
+/// envelope; that was false (the caps read never checked buttons
+/// beyond range, Rx/Ry/Rz/Dial, POVs, or FFB) — this function is
+/// the envelope verification, and the wheel check is the live
+/// reporter. Unmeasured fields never report: a POV count of `-1`
+/// (not read) and extra axes from [`VJoyCapabilities::new`]
+/// (assumed present — the pre-envelope constructor cannot measure
+/// them) are skipped. FFB is deliberately NOT checked here: it is
+/// a wheel-check diagnostic only (FH4 does not send FFB to vJoy).
+/// Returns the list of problems; empty means the envelope matches
+/// (or nothing measurable was missing).
+#[must_use]
+pub fn validate_envelope(caps: &VJoyCapabilities) -> Vec<String> {
+    let mut errors = Vec::new();
+    if caps.button_count != MAX_BUTTONS {
+        errors.push(format!(
+            "vJoy device has {} buttons, expected {MAX_BUTTONS} (EmuWheel envelope).",
+            caps.button_count
+        ));
+    }
+    let envelope = &caps.envelope;
+    if !envelope.has_axis_rx {
+        errors.push(
+            "vJoy device has no Rx axis (EmuWheel envelope needs X Y Z Rx Ry Rz Slider Dial)."
+                .to_string(),
+        );
+    }
+    if !envelope.has_axis_ry {
+        errors.push(
+            "vJoy device has no Ry axis (EmuWheel envelope needs X Y Z Rx Ry Rz Slider Dial)."
+                .to_string(),
+        );
+    }
+    if !envelope.has_axis_rz {
+        errors.push(
+            "vJoy device has no Rz axis (EmuWheel envelope needs X Y Z Rx Ry Rz Slider Dial)."
+                .to_string(),
+        );
+    }
+    if !envelope.has_axis_dial {
+        errors.push(
+            "vJoy device has no Dial axis (EmuWheel envelope needs X Y Z Rx Ry Rz Slider Dial)."
+                .to_string(),
+        );
+    }
+    if envelope.discrete_pov_count >= 0 && envelope.discrete_pov_count != 1 {
+        errors.push(format!(
+            "vJoy device has {} discrete POV hats, expected 1 (EmuWheel envelope).",
+            envelope.discrete_pov_count
+        ));
+    }
+    if envelope.continuous_pov_count > 0 {
+        errors.push(format!(
+            "vJoy device has {} continuous POV hat(s), expected 0 (the envelope uses one discrete POV).",
+            envelope.continuous_pov_count
+        ));
+    }
+    errors
+}
+
 // ---------------------------------------------------------------------
 // Axis conversion (C# `InputMapper` parity)
 // ---------------------------------------------------------------------
@@ -669,7 +816,10 @@ pub fn pedal_to_axis(value: f32) -> i32 {
 ///
 /// Slider neutral is `AXIS_MIN`, not centre — centre would be half a
 /// handbrake. Pedals are `AXIS_MIN` for the same reason; only the
-/// steering-class axes sit at centre.
+/// steering-class axes sit at centre. Rx is the clutch axis (FH4
+/// fix, v2.0.14 — the feed writes the clutch to Rx as well as to
+/// `wClutch`, so `GameInput` can map it), so its neutral is
+/// `AXIS_MIN` too: released clutch, not half clutch.
 #[must_use]
 pub fn neutral_position(device_id: u32) -> JoystickPosition {
     JoystickPosition {
@@ -682,7 +832,7 @@ pub fn neutral_position(device_id: u32) -> JoystickPosition {
         w_axis_x: AXIS_CENTER,
         w_axis_y: AXIS_MIN,
         w_axis_z: AXIS_MIN,
-        w_axis_x_rot: AXIS_CENTER,
+        w_axis_x_rot: AXIS_MIN,
         w_axis_y_rot: AXIS_CENTER,
         w_axis_z_rot: AXIS_CENTER,
         w_slider: AXIS_MIN,
@@ -753,9 +903,18 @@ pub fn build_position(
         p.w_axis_z = z;
         p.w_brake = z;
     }
-    // Clutch is caps-independent: `wClutch` has no HID usage to query,
-    // and the driver ignores the field when the axis is absent.
+    // Clutch is caps-independent for `wClutch` (it has no HID usage
+    // to query, and the driver ignores the field when the axis is
+    // absent) — but it ALSO feeds Rx (FH4 fix, v2.0.14): Rx is the
+    // `GameInput` clutch axis (RawGameController axis 3), so a wheel
+    // game can see the clutch. Rx is caps-gated (the driver ignores
+    // the field when the axis is absent, same as the other axes);
+    // `wClutch` keeps its old unconditional write for the games
+    // that read the V3 driving axis.
     p.w_clutch = pedal_to_axis(state.clutch);
+    if caps.envelope.has_axis_rx {
+        p.w_axis_x_rot = pedal_to_axis(state.clutch);
+    }
     if caps.has_axis_slider {
         p.w_slider = pedal_to_axis(state.handbrake);
     }
@@ -1005,6 +1164,12 @@ pub trait VJoyInterface: Send {
     /// `GetVJDButtonNumber(id)`.
     #[must_use]
     fn get_vjd_button_number(&self, device_id: u32) -> i32;
+    /// `GetVJDDiscPovNumber(id)` — discrete (4-direction) POV hats.
+    #[must_use]
+    fn get_vjd_disc_pov_number(&self, device_id: u32) -> i32;
+    /// `GetVJDContPovNumber(id)` — continuous POV hats.
+    #[must_use]
+    fn get_vjd_cont_pov_number(&self, device_id: u32) -> i32;
 }
 
 // Raw `extern "C"` function-pointer types, one per export. The
@@ -1019,6 +1184,8 @@ type ResetVjdFn = unsafe extern "C" fn(u32) -> i32;
 type UpdateVjdFn = unsafe extern "C" fn(u32, *const JoystickPosition) -> i32;
 type GetVjdAxisExistFn = unsafe extern "C" fn(u32, u32) -> i32;
 type GetVjdButtonNumberFn = unsafe extern "C" fn(u32) -> i32;
+type GetVjdDiscPovNumberFn = unsafe extern "C" fn(u32) -> i32;
+type GetVjdContPovNumberFn = unsafe extern "C" fn(u32) -> i32;
 
 /// The real DLL, loaded with `libloading`.
 ///
@@ -1037,6 +1204,8 @@ pub struct RealVJoyDll {
     update_vjd: UpdateVjdFn,
     get_vjd_axis_exist: GetVjdAxisExistFn,
     get_vjd_button_number: GetVjdButtonNumberFn,
+    get_vjd_disc_pov_number: GetVjdDiscPovNumberFn,
+    get_vjd_cont_pov_number: GetVjdContPovNumberFn,
     /// The loaded library. Last field = dropped last.
     _library: Library,
 }
@@ -1108,6 +1277,12 @@ impl RealVJoyDll {
             let get_vjd_button_number: Symbol<'_, GetVjdButtonNumberFn> = library
                 .get(b"GetVJDButtonNumber\0")
                 .map_err(|e| VJoyError::LoadFailed(format!("GetVJDButtonNumber: {e}")))?;
+            let get_vjd_disc_pov_number: Symbol<'_, GetVjdDiscPovNumberFn> = library
+                .get(b"GetVJDDiscPovNumber\0")
+                .map_err(|e| VJoyError::LoadFailed(format!("GetVJDDiscPovNumber: {e}")))?;
+            let get_vjd_cont_pov_number: Symbol<'_, GetVjdContPovNumberFn> = library
+                .get(b"GetVJDContPovNumber\0")
+                .map_err(|e| VJoyError::LoadFailed(format!("GetVJDContPovNumber: {e}")))?;
             Ok(Self {
                 vjoy_enabled: *vjoy_enabled,
                 get_vjoy_version: *get_vjoy_version,
@@ -1119,6 +1294,8 @@ impl RealVJoyDll {
                 update_vjd: *update_vjd,
                 get_vjd_axis_exist: *get_vjd_axis_exist,
                 get_vjd_button_number: *get_vjd_button_number,
+                get_vjd_disc_pov_number: *get_vjd_disc_pov_number,
+                get_vjd_cont_pov_number: *get_vjd_cont_pov_number,
                 _library: library,
             })
         }
@@ -1183,6 +1360,16 @@ impl VJoyInterface for RealVJoyDll {
         // SAFETY: as above.
         unsafe { (self.get_vjd_button_number)(device_id) }
     }
+
+    fn get_vjd_disc_pov_number(&self, device_id: u32) -> i32 {
+        // SAFETY: as above.
+        unsafe { (self.get_vjd_disc_pov_number)(device_id) }
+    }
+
+    fn get_vjd_cont_pov_number(&self, device_id: u32) -> i32 {
+        // SAFETY: as above.
+        unsafe { (self.get_vjd_cont_pov_number)(device_id) }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1210,6 +1397,12 @@ pub struct VJoyOutput {
     caps_known: bool,
     capabilities: VJoyCapabilities,
     status: VJoyStatus,
+    /// Envelope-shape problems measured at connect (see
+    /// [`validate_envelope`]): REPORTS only — a non-empty list
+    /// never refused the connect, feeding keeps working on a
+    /// default-shape device. Empty when the envelope matches (or
+    /// when never connected).
+    envelope_warnings: Vec<String>,
     /// Consecutive failed `UpdateVJD` calls (M2). Reset on every
     /// successful update; at [`MAX_CONSECUTIVE_UPDATE_FAILURES`] the
     /// backend marks itself disconnected (status `Error`) instead of
@@ -1238,6 +1431,7 @@ impl VJoyOutput {
             caps_known: false,
             capabilities: VJoyCapabilities::unknown(),
             status: VJoyStatus::idle(),
+            envelope_warnings: Vec::new(),
             consecutive_update_failures: 0,
         }
     }
@@ -1285,6 +1479,15 @@ impl VJoyOutput {
     #[must_use]
     pub const fn capabilities(&self) -> VJoyCapabilities {
         self.capabilities
+    }
+
+    /// Envelope-shape problems measured at the last successful
+    /// connect ([`validate_envelope`]) — empty when the envelope
+    /// matches or when never connected. Reporting only: a
+    /// non-empty list never refused the connect.
+    #[must_use]
+    pub fn envelope_warnings(&self) -> &[String] {
+        &self.envelope_warnings
     }
 
     /// Connect, validating the device against the enabled modules of
@@ -1364,9 +1567,10 @@ impl VJoyOutput {
             connect_via(device_id, dll, plan)
         };
         match outcome {
-            Ok((dll_version, driver_version, caps)) => {
+            Ok((dll_version, driver_version, caps, envelope_warnings)) => {
                 self.capabilities = caps;
                 self.caps_known = true;
+                self.envelope_warnings = envelope_warnings;
                 self.connected = true;
                 self.consecutive_update_failures = 0;
                 self.status = VJoyStatus {
@@ -1430,15 +1634,20 @@ impl VJoyOutput {
 }
 
 /// The driver conversation: enabled → versions → status → acquire →
-/// caps → plan validation → reset + neutral. Returns the versions and
-/// caps on success. The device is relinquished on any failure after
-/// acquisition. A free function (not a method) so it can borrow the
-/// injected DLL without borrowing the whole backend.
+/// caps → plan validation → reset + neutral. Returns the versions,
+/// caps, and envelope warnings on success. The device is
+/// relinquished on any failure after acquisition. A free function
+/// (not a method) so it can borrow the injected DLL without
+/// borrowing the whole backend.
+///
+/// The envelope read is REPORTS ONLY (see [`validate_envelope`]):
+/// its warnings ride along in the return value and never fail the
+/// connect — a default-shape device still feeds.
 fn connect_via(
     device_id: u32,
     dll: &mut dyn VJoyInterface,
     plan: Option<&PipelinePlan>,
-) -> Result<(String, String, VJoyCapabilities), VJoyError> {
+) -> Result<(String, String, VJoyCapabilities, Vec<String>), VJoyError> {
     if !dll.vjoy_enabled() {
         return Err(VJoyError::DriverDisabled);
     }
@@ -1474,7 +1683,21 @@ fn connect_via(
         dll.get_vjd_axis_exist(device_id, USAGE_Z),
         dll.get_vjd_button_number(device_id),
         dll.get_vjd_axis_exist(device_id, USAGE_SLIDER),
-    );
+    )
+    .with_envelope(EnvelopeCaps {
+        has_axis_rx: dll.get_vjd_axis_exist(device_id, USAGE_RX),
+        has_axis_ry: dll.get_vjd_axis_exist(device_id, USAGE_RY),
+        has_axis_rz: dll.get_vjd_axis_exist(device_id, USAGE_RZ),
+        has_axis_dial: dll.get_vjd_axis_exist(device_id, USAGE_DIAL),
+        discrete_pov_count: dll.get_vjd_disc_pov_number(device_id),
+        continuous_pov_count: dll.get_vjd_cont_pov_number(device_id),
+    });
+    // Envelope-shape validation REPORTS only: a wrong-shaped
+    // device still connects and feeds (ETS2 etc. depend on it).
+    // The warnings ride along for the backend status and the wheel
+    // check; the plan validation below is the only gate, and it
+    // only checks the enabled modules' axes/buttons.
+    let envelope_warnings = validate_envelope(&caps);
     if let Some(plan) = plan {
         let errors = validate_capabilities(plan, &caps);
         if !errors.is_empty() {
@@ -1490,7 +1713,7 @@ fn connect_via(
     let _ = dll.reset_vjd(device_id);
     let neutral = neutral_position(device_id);
     let _ = dll.update_vjd(device_id, &neutral);
-    Ok((dll_version, driver_version, caps))
+    Ok((dll_version, driver_version, caps, envelope_warnings))
 }
 
 impl Drop for VJoyOutput {
@@ -1678,6 +1901,12 @@ mod tests {
         update_ok: bool,
         /// X, Y, Z, Slider.
         axes: [bool; 4],
+        /// Rx, Ry, Rz, Dial (envelope axes).
+        extra_axes: [bool; 4],
+        /// Discrete POV hats (envelope: 1).
+        disc_pov_count: i32,
+        /// Continuous POV hats (envelope: 0).
+        cont_pov_count: i32,
         button_count: i32,
         calls: Vec<MockCall>,
         positions: Vec<JoystickPosition>,
@@ -1694,6 +1923,9 @@ mod tests {
                 acquire_ok: true,
                 update_ok: true,
                 axes: [true; 4],
+                extra_axes: [true; 4],
+                disc_pov_count: 1,
+                cont_pov_count: 0,
                 button_count: 32,
                 calls: Vec::new(),
                 positions: Vec::new(),
@@ -1794,6 +2026,10 @@ mod tests {
                 USAGE_Y => s.axes[1],
                 USAGE_Z => s.axes[2],
                 USAGE_SLIDER => s.axes[3],
+                USAGE_RX => s.extra_axes[0],
+                USAGE_RY => s.extra_axes[1],
+                USAGE_RZ => s.extra_axes[2],
+                USAGE_DIAL => s.extra_axes[3],
                 _ => false,
             }
         }
@@ -1801,6 +2037,16 @@ mod tests {
         fn get_vjd_button_number(&self, device_id: u32) -> i32 {
             let _ = device_id;
             self.state.lock().expect("mock lock").button_count
+        }
+
+        fn get_vjd_disc_pov_number(&self, device_id: u32) -> i32 {
+            let _ = device_id;
+            self.state.lock().expect("mock lock").disc_pov_count
+        }
+
+        fn get_vjd_cont_pov_number(&self, device_id: u32) -> i32 {
+            let _ = device_id;
+            self.state.lock().expect("mock lock").cont_pov_count
         }
     }
 
@@ -1843,6 +2089,7 @@ mod tests {
         assert_eq!(p.w_axis_y, 1); // pedal released
         assert_eq!(p.w_axis_z, 1);
         assert_eq!(p.w_slider, 1); // handbrake released (min, not centre)
+        assert_eq!(p.w_axis_x_rot, 1); // clutch released (Rx is the clutch axis)
         assert_eq!(p.w_steering, 16384);
         assert_eq!(p.w_accelerator, 1);
         assert_eq!(p.w_brake, 1);
@@ -2436,6 +2683,125 @@ mod tests {
             &VJoyCapabilities::new(true, true, true, 32, true),
         );
         assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    // ---- envelope validation (FH4 fix, v2.0.14) ---------------------
+
+    /// Caps with a measured full envelope (128 buttons, all extra
+    /// axes, 1 discrete POV, 0 continuous).
+    fn envelope_caps() -> VJoyCapabilities {
+        VJoyCapabilities::new(true, true, true, 128, true).with_envelope(EnvelopeCaps {
+            has_axis_rx: true,
+            has_axis_ry: true,
+            has_axis_rz: true,
+            has_axis_dial: true,
+            discrete_pov_count: 1,
+            continuous_pov_count: 0,
+        })
+    }
+
+    #[test]
+    fn envelope_full_shape_validates_clean() {
+        assert_eq!(validate_envelope(&envelope_caps()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn envelope_reports_each_missing_piece() {
+        let mut caps = envelope_caps();
+        caps.button_count = 32;
+        assert!(
+            validate_envelope(&caps)
+                .iter()
+                .any(|e| e.contains("32 buttons")),
+            "32 buttons reported"
+        );
+        let mut caps = envelope_caps();
+        caps.envelope.has_axis_rx = false;
+        assert!(
+            validate_envelope(&caps).iter().any(|e| e.contains("Rx")),
+            "missing Rx reported"
+        );
+        let mut caps = envelope_caps();
+        caps.envelope.has_axis_dial = false;
+        assert!(
+            validate_envelope(&caps).iter().any(|e| e.contains("Dial")),
+            "missing Dial reported"
+        );
+        let mut caps = envelope_caps();
+        caps.envelope.discrete_pov_count = 0;
+        assert!(
+            validate_envelope(&caps)
+                .iter()
+                .any(|e| e.contains("discrete POV")),
+            "no discrete POV reported"
+        );
+        let mut caps = envelope_caps();
+        caps.envelope.continuous_pov_count = 1;
+        assert!(
+            validate_envelope(&caps)
+                .iter()
+                .any(|e| e.contains("continuous POV")),
+            "continuous POV reported"
+        );
+    }
+
+    #[test]
+    fn envelope_unknown_pov_never_reports() {
+        // `new()` caps never measured the POVs (-1) — a 128-button
+        // device built the old way validates clean instead of
+        // crying about an unread count.
+        let caps = VJoyCapabilities::new(true, true, true, 128, true);
+        assert_eq!(caps.envelope.discrete_pov_count, -1);
+        assert!(validate_envelope(&caps).is_empty(), "unknown POV skipped");
+    }
+
+    #[test]
+    fn connect_reports_envelope_warnings_without_refusing() {
+        // Mock defaults are a default-shape device (32 buttons):
+        // the connect SUCCEEDS (feeding keeps working) and the
+        // warnings name the gap.
+        let (mock, _handle) = MockDll::with_defaults();
+        let mut out = VJoyOutput::with_dll(1, Box::new(mock));
+        out.try_connect().expect("default-shape device connects");
+        assert!(out.is_connected());
+        assert!(
+            out.envelope_warnings()
+                .iter()
+                .any(|w| w.contains("32 buttons")),
+            "{:?}",
+            out.envelope_warnings()
+        );
+    }
+
+    #[test]
+    fn connect_with_full_envelope_has_no_warnings() {
+        let (mock, _handle) = MockDll::with_state(MockState {
+            button_count: 128,
+            ..MockState::default()
+        });
+        let mut out = VJoyOutput::with_dll(1, Box::new(mock));
+        out.try_connect().expect("full-envelope device connects");
+        assert!(
+            out.envelope_warnings().is_empty(),
+            "{:?}",
+            out.envelope_warnings()
+        );
+    }
+
+    #[test]
+    fn clutch_feeds_rx_when_present_and_stays_neutral_without_it() {
+        let s = OutputState {
+            clutch: 1.0,
+            ..state(0.0, 0.0, 0.0)
+        };
+        let p = build_position(&s, &envelope_caps(), 1);
+        assert_eq!(p.w_axis_x_rot, 32768, "clutch fully pressed on Rx");
+        assert_eq!(p.w_clutch, 32768, "wClutch still fed too");
+        let mut caps = envelope_caps();
+        caps.envelope.has_axis_rx = false;
+        let p = build_position(&s, &caps, 1);
+        assert_eq!(p.w_axis_x_rot, 1, "no Rx axis: Rx stays released");
+        assert_eq!(p.w_clutch, 32768, "wClutch is caps-independent");
     }
 
     #[test]

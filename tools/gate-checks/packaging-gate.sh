@@ -15,6 +15,9 @@
 #   3. The headless smoke-test run block stays under GitHub's 21,000
 #      char expression limit (indent-stripped, as GitHub counts it).
 #   4. Every file the installer references exists in the tree.
+#   5. FH4 wheel fix: the installer writes the complete GameInput
+#      RacingWheel tree and its vJoyConfig argv matches
+#      vjoy_config_argv() (single source of truth — no drift).
 # Windows-only runtime behaviour (the headless smoke test itself:
 # install/update/uninstall on a real Windows runner) is NOT covered
 # here — per the local-first rule it is covered by waiting for the
@@ -105,4 +108,41 @@ for f in LICENSE target/release/rsh-daemon.exe target/release/rsh-ui.exe \
     src-tauri/icons/icon.ico src-tauri/icons/header.bmp src-tauri/icons/sidebar.bmp; do
     [ -f "$f" ] || echo "NOTE: installer input missing (release build produces it): $f"
 done
+
+# 5. FH4 wheel fix (v2.0.14): the installer writes the COMPLETE
+# GameInput RacingWheel tree (not just the required subkeys —
+# v2.0.13's incomplete tree is the #1 suspect for FH4 ignoring
+# the mapping), AND its vJoyConfig argv matches vjoy_config_argv()
+# (single source of truth — no drift). Deep NSIS<->Rust equality
+# is also covered by the Rust test
+# `installer_writes_the_complete_mapping` (rsh-output); this step
+# is the fast gate-side tripwire.
+python3 - <<'PYEOF' || fail "installer GameInput mapping / vJoyConfig argv check failed"
+import re
+nsi = open('installer/rsh.nsi').read()
+for call in ("Call WriteGameInputVJoyMapping", "Call WriteGameInputHidMapping",
+             "Call ConfigureVJoyDevice1"):
+    assert call in nsi, f"installer missing {call}"
+# Complete-tree markers (both devices): Labels, DPad, Button1,
+# Clutch — a required-subkeys-only mapping fails here.
+for marker in (r"Labels\Buttons", r"Labels\Switches", r"RacingWheel\DPadUp",
+               r"RacingWheel\Button1", r"RacingWheel\Clutch"):
+    assert marker in nsi, f"installer mapping missing {marker}"
+# vJoyConfig argv: parse the Rust constants, rebuild the argv the
+# way vjoy_config_argv() does, and compare with the NSIS call.
+rs = open('crates/rsh-output/src/vjoy_config.rs').read()
+axes = re.search(r'VJOY_FH4_AXES[^=]*=\s*\[([^\]]*)\]', rs).group(1)
+axes = [a.strip().strip('"') for a in axes.split(',') if a.strip()]
+buttons = re.search(r'VJOY_FH4_BUTTONS[^=]*=\s*(\d+)', rs).group(1)
+povs = re.search(r'VJOY_FH4_DISCRETE_POVS[^=]*=\s*(\d+)', rs).group(1)
+ffb = re.search(r'VJOY_FH4_FFB_EFFECTS[^=]*=\s*"([^"]*)"', rs).group(1)
+device = re.search(r'VJOY_FH4_DEVICE_ID[^=]*=\s*(\d+)', rs).group(1)
+expected = f"{device} -f -a {' '.join(axes)} -b {buttons} -s {povs} -e {ffb}"
+m = re.search(r'nsExec::ExecToStack \'"\$R0" ([^\']*)\'', nsi)
+assert m, "installer vJoyConfig call not found"
+assert m.group(1) == expected, (
+    f"installer vJoyConfig argv drifted: NSIS has {m.group(1)!r}, "
+    f"vjoy_config_argv() is {expected!r}")
+print(f"GameInput mapping complete in installer; vJoyConfig argv matches ({expected})")
+PYEOF
 echo "packaging gate: PASS"
