@@ -123,6 +123,16 @@ export component SetupWizard inherits Rectangle {
     in property <string> vjoy-version: "";
     in property <string> vjoy-error: "";
     in property <bool> vjoy-fallback: false;
+    // FH4 wheel check (v2.0.14): the daemon's GameInput-mapping +
+    // EmuWheel-envelope check, synced with the vJoy status above.
+    // `wheel-line` is the Rust-computed plain-words summary
+    // ("Wheel setup: mapping OK · envelope OK · feed active");
+    // `wheel-next` is the daemon's next step verbatim ("" when all
+    // OK). Both stay hidden until a check exists (`wheel-checked`).
+    in property <bool> wheel-checked: false;
+    in property <bool> wheel-ok: false;
+    in property <string> wheel-line: "";
+    in property <string> wheel-next: "";
     // Step 2 — Calibrate availability (A17): false while the
     // calibration backend is unavailable; the buttons stay disabled
     // and Next does not gate on calibration then — the step says
@@ -364,6 +374,12 @@ export component SetupWizard inherits Rectangle {
                         if !vjoy-installed && !vjoy-installing : Btn { label: "Install vJoy"; primary: true; disabled: busy-kind == 14; clicked => { install-vjoy(); } }
                     }
                 }
+                // FH4 wheel check (v2.0.14): only once vJoy is
+                // installed and the daemon has checked — the line
+                // is plain words for a photo, never registry paths
+                // or hex. The next step is the daemon's own text.
+                if vjoy-installed && wheel-checked : Text { text: wheel-line; font-size: Theme.fs-label; font-weight: 600; color: wheel-ok ? Theme.ok : Theme.bad; wrap: word-wrap; }
+                if vjoy-installed && wheel-checked && wheel-next != "" : Text { text: wheel-next; font-size: Theme.fs-label; color: Theme.mute; wrap: word-wrap; }
                 if vjoy-error != "" : Text { text: vjoy-error; font-size: Theme.fs-label; color: Theme.bad; wrap: word-wrap; }
                 // R2-40: an install failure strands the wizard on
                 // this step unless the fallback is picked — say so

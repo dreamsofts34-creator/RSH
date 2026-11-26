@@ -8187,6 +8187,27 @@ impl Ctx {
         set_if_changed(win.get_diag_firmware(), firmware.clone().into(), |v| {
             win.set_diag_firmware(v);
         });
+        // FH4 wheel check (v2.0.14): the same cached
+        // `vjoy_status()` the wizard reads — a local cache read,
+        // not a second IPC call — so the drawer shows the same
+        // line. "—" until a check exists (non-Windows / before
+        // the first check), never a fake OK.
+        let (wheel_text, wheel_ok) = match api.vjoy_status() {
+            Ok(status) => match status.wheel_check {
+                Some(check) => {
+                    let (ok, line, _) = Self::wheel_check_summary(&check);
+                    (line, ok)
+                }
+                None => ("—".to_string(), false),
+            },
+            Err(_) => ("—".to_string(), false),
+        };
+        set_if_changed(win.get_diag_wheel_text(), wheel_text.into(), |v| {
+            win.set_diag_wheel_text(v);
+        });
+        set_if_changed(win.get_diag_wheel_ok(), wheel_ok, |v| {
+            win.set_diag_wheel_ok(v);
+        });
         // A20: measured stats, or "—" (the drawer shows
         // "No telemetry yet" while these are "—").
         if let Ok(stats) = api.diag_stats() {
@@ -8329,6 +8350,65 @@ impl Ctx {
         }
     }
 
+    /// Plain-words one-line summary of a [`rsh_api::WheelCheck`] for the
+    /// wizard Drivers step and the Diagnostics drawer (FH4 fix,
+    /// v2.0.14). Returns (`all_ok`, `summary_line`, `next_step`): the
+    /// summary names the three things a game needs to see the wheel
+    /// — the complete `GameInput` mapping, the `EmuWheel` envelope,
+    /// and the feeder state — in words the user can read in a photo;
+    /// no registry paths, hex keys, or jargon. The wording is
+    /// universal (Windows-level wheel setup, every `GameInput`
+    /// game and the vJoy joystick games, not one game) and never
+    /// promises a game will work: when everything is OK the next
+    /// step frames the check as setup-complete and asks the user
+    /// to test in the game — the game itself is the proof. FFB is
+    /// deliberately not an item: FH4 does not send FFB data to
+    /// vJoy, so it never blocks the headline. `next_step` is the
+    /// daemon's text verbatim when present; when the daemon
+    /// reports a problem with no next step, the repair path is
+    /// the RSH installer (it writes both the mapping and the
+    /// envelope while elevated), so that is the fallback — never
+    /// a blank.
+    fn wheel_check_summary(check: &rsh_api::WheelCheck) -> (bool, String, String) {
+        let mapping_ok = check.vjoy_mapping_ok && check.hid_mapping_ok;
+        let all_ok = mapping_ok && check.envelope_ok && check.feeding;
+        let line = format!(
+            "Wheel setup: {} · {} · {}",
+            if mapping_ok {
+                "mapping OK"
+            } else {
+                "mapping incomplete"
+            },
+            if check.envelope_ok {
+                "envelope OK"
+            } else {
+                "envelope wrong"
+            },
+            if check.feeding {
+                "feed active"
+            } else {
+                "not feeding"
+            },
+        );
+        let next = if check.next_step.is_empty() {
+            if all_ok {
+                // Facts only, never a promise about a game: the
+                // setup is complete, the game is the test.
+                "Wheel setup complete — test it in your game.".to_string()
+            } else if mapping_ok && check.envelope_ok {
+                // Only the feeder is down: the installer writes
+                // mapping + envelope, it cannot start a stopped
+                // feeder — a restart is the repair.
+                "Restart RSH to start feeding the wheel.".to_string()
+            } else {
+                "Re-run the RSH installer to repair the wheel setup.".to_string()
+            }
+        } else {
+            check.next_step.clone()
+        };
+        (all_ok, line, next)
+    }
+
     /// Sync the wizard Drivers step (vJoy) from `vjoy_status()`:
     /// installed / installing / version / last install error are all
     /// real. When the call errors (sim / no daemon) the status is
@@ -8337,6 +8417,10 @@ impl Ctx {
     /// fallback choice is preserved across calls.
     /// R2-11: every write is change-guarded.
     fn sync_vjoy(&self, win: &MainWindow) {
+        // FH4 wheel check (v2.0.14): (checked, all_ok, line, next)
+        // — filled from the daemon's check below, all-false/blank
+        // when there is no check to show.
+        let wheel: (bool, bool, String, String);
         if let Ok(status) = self.api().vjoy_status() {
             set_if_changed(win.get_setup_vjoy_installed(), status.installed, |v| {
                 win.set_setup_vjoy_installed(v);
@@ -8349,6 +8433,17 @@ impl Ctx {
                 status.version.unwrap_or_default().into(),
                 |v| win.set_setup_vjoy_version(v),
             );
+            // The daemon's wheel check rides on this same ~1 Hz
+            // poll. None = not checked yet (non-Windows / before
+            // the first check) — the wizard hides the line until
+            // a check exists, never a fake OK.
+            wheel = match &status.wheel_check {
+                Some(check) => {
+                    let (ok, line, next) = Self::wheel_check_summary(check);
+                    (true, ok, line, next)
+                }
+                None => (false, false, String::new(), String::new()),
+            };
             // R2-40: never clobber a failure the install job already
             // reported with the daemon's (possibly empty)
             // `install_error` — the 1 Hz tick used to wipe the
@@ -8380,7 +8475,31 @@ impl Ctx {
                 "Driver status unavailable — use HIDMaestro instead.".into(),
                 |v| win.set_setup_vjoy_error(v),
             );
+            // No daemon answer means no wheel check either.
+            wheel = (false, false, String::new(), String::new());
         }
+        // FH4 wheel check (v2.0.14): one write site for both arms
+        // above, change-guarded like the rest.
+        set_if_changed(win.get_setup_vjoy_wheel_checked(), wheel.0, |v| {
+            win.set_setup_vjoy_wheel_checked(v);
+        });
+        set_if_changed(win.get_setup_vjoy_wheel_ok(), wheel.1, |v| {
+            win.set_setup_vjoy_wheel_ok(v);
+        });
+        set_if_changed(
+            win.get_setup_vjoy_wheel_line(),
+            wheel.2.clone().into(),
+            |v| {
+                win.set_setup_vjoy_wheel_line(v);
+            },
+        );
+        set_if_changed(
+            win.get_setup_vjoy_wheel_next(),
+            wheel.3.clone().into(),
+            |v| {
+                win.set_setup_vjoy_wheel_next(v);
+            },
+        );
         // D16: the Drivers step shows indeterminate progress +
         // elapsed while an install runs (the daemon reports no %).
         let elapsed = self
@@ -13699,6 +13818,91 @@ mod tests {
         assert_eq!(t.deadzone_pct, 1.0);
         t.set_exponent(0.5);
         assert_eq!(t.exponent, 1.0);
+    }
+
+    /// FH4 wheel check (v2.0.14): the Drivers-step / Diagnostics
+    /// summary names mapping + envelope + feeder in plain words,
+    /// and the daemon's next step passes through verbatim. The
+    /// wording is universal wheel setup, never one game — and the
+    /// all-OK next step frames the check as setup-complete, never
+    /// a promise about a game.
+    #[test]
+    fn wheel_check_summary_states() {
+        let ok = rsh_api::WheelCheck {
+            vjoy_mapping_ok: true,
+            hid_mapping_ok: true,
+            envelope_ok: true,
+            button_count: 128,
+            ffb_present: true,
+            feeding: true,
+            next_step: String::new(),
+        };
+        let (all_ok, line, next) = Ctx::wheel_check_summary(&ok);
+        assert!(all_ok);
+        assert_eq!(line, "Wheel setup: mapping OK · envelope OK · feed active");
+        assert_eq!(next, "Wheel setup complete — test it in your game.");
+
+        let mut missing_mapping = ok.clone();
+        missing_mapping.vjoy_mapping_ok = false;
+        // The daemon names the missing piece; it passes through
+        // verbatim, never paraphrased.
+        missing_mapping.next_step = "mapping incomplete — Labels missing".to_string();
+        let (all_ok, line, next) = Ctx::wheel_check_summary(&missing_mapping);
+        assert!(!all_ok);
+        assert_eq!(
+            line,
+            "Wheel setup: mapping incomplete · envelope OK · feed active"
+        );
+        assert_eq!(next, "mapping incomplete — Labels missing");
+
+        let mut wrong_envelope = ok.clone();
+        wrong_envelope.envelope_ok = false;
+        wrong_envelope.button_count = 32;
+        // No next step from the daemon: the installer repair path
+        // is the fallback, never a blank.
+        let (all_ok, line, next) = Ctx::wheel_check_summary(&wrong_envelope);
+        assert!(!all_ok);
+        assert_eq!(
+            line,
+            "Wheel setup: mapping OK · envelope wrong · feed active"
+        );
+        assert_eq!(next, "Re-run the RSH installer to repair the wheel setup.");
+
+        // HID mapping alone missing still reads "mapping incomplete".
+        let mut hid_missing = ok.clone();
+        hid_missing.hid_mapping_ok = false;
+        let (all_ok, line, _) = Ctx::wheel_check_summary(&hid_missing);
+        assert!(!all_ok);
+        assert_eq!(
+            line,
+            "Wheel setup: mapping incomplete · envelope OK · feed active"
+        );
+
+        // Feeder down, mapping + envelope fine: the headline says
+        // so, and the daemon's next step passes through verbatim.
+        let mut not_feeding = ok.clone();
+        not_feeding.feeding = false;
+        not_feeding.next_step = "Feeder stopped — restart the RSH backend.".to_string();
+        let (all_ok, line, next) = Ctx::wheel_check_summary(&not_feeding);
+        assert!(!all_ok);
+        assert_eq!(line, "Wheel setup: mapping OK · envelope OK · not feeding");
+        assert_eq!(next, "Feeder stopped — restart the RSH backend.");
+
+        // Feeder down with no next step: a restart is the repair,
+        // not the installer (it cannot start a stopped feeder).
+        let mut not_feeding_quiet = ok.clone();
+        not_feeding_quiet.feeding = false;
+        let (all_ok, line, next) = Ctx::wheel_check_summary(&not_feeding_quiet);
+        assert!(!all_ok);
+        assert_eq!(line, "Wheel setup: mapping OK · envelope OK · not feeding");
+        assert_eq!(next, "Restart RSH to start feeding the wheel.");
+
+        // FFB is not a blocking item: no FFB still reads all OK.
+        let mut no_ffb = ok.clone();
+        no_ffb.ffb_present = false;
+        let (all_ok, line, _) = Ctx::wheel_check_summary(&no_ffb);
+        assert!(all_ok);
+        assert_eq!(line, "Wheel setup: mapping OK · envelope OK · feed active");
     }
 
     #[test]

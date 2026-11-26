@@ -94,6 +94,11 @@ export component DiagnosticsDrawer inherits FocusScope {
     in property <bool> daemon-live: false;
     in property <string> app-version: "—";
     in property <string> firmware: "—";
+    // FH4 wheel check (v2.0.14): the plain-words summary line
+    // ("Wheel setup: mapping OK · envelope OK · feed active");
+    // "—" until a check exists.
+    in property <string> wheel-text: "—";
+    in property <bool> wheel-ok: false;
     in property <[string]> events;
     in property <[bool]> buttons-pressed;
     in property <string> knob-1-text: "Knob 1 · —";
@@ -169,6 +174,10 @@ export component DiagnosticsDrawer inherits FocusScope {
                         Text { text: "Status: " + conn-label; font-family: Theme.font-mono; font-size: Theme.fs-value; color: Theme.mute; }
                         Text { text: "RSH: " + (daemon-live ? "running" : "not running"); font-family: Theme.font-mono; font-size: Theme.fs-value; color: Theme.mute; }
                         Text { text: "App: " + app-version + " · Firmware: " + firmware; font-family: Theme.font-mono; font-size: Theme.fs-value; color: Theme.mute; wrap: word-wrap; }
+                        // FH4 wheel check (v2.0.14): bad (red) only
+                        // once a check has reported a problem —
+                        // "—" and OK stay muted like the lines above.
+                        Text { text: wheel-text; font-family: Theme.font-mono; font-size: Theme.fs-value; color: wheel-text == "—" || wheel-ok ? Theme.mute : Theme.bad; wrap: word-wrap; }
                     }
                     // live charts (§8.3)
                     LiveChart { title: "Steering"; chart-commands: steer-chart; readout: steer-readout; }

@@ -407,6 +407,52 @@ pub struct ButtonBinding {
     pub action: String,
 }
 
+/// Wheel-game readiness check for the vJoy device (FH4 fix,
+/// v2.0.14): whether Windows sees the vJoy device as a racing
+/// wheel — the `GameInput` `RacingWheel` mappings plus the `EmuWheel`
+/// device-1 envelope (128 buttons, 8 axes, 1 discrete POV, FFB)
+/// plus the feeder state. All of mapping / envelope / feeding
+/// must be true for a wheel game (for example Forza Horizon 4)
+/// to offer a Wheel tab; `next_step` is the one-line plain-words
+/// repair for the user ("" when everything is OK) and names any
+/// missing piece (for example "mapping incomplete — Labels
+/// missing"). `button_count` is the vJoy device-1 button count
+/// as reported (-1 when unknown). The daemon reports this on
+/// Windows only; the UI renders a missing check as "not checked
+/// yet", never as OK.
+//
+// The five bools are the contract's independent checks (mapping ×2,
+// envelope, FFB, feeding); grouping them would break the wire shape
+// the daemon reports field-by-field, so the pedantic bool-count
+// lint is allowed here.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WheelCheck {
+    /// Complete `GameInput` `RacingWheel` mapping for vJoy: the
+    /// required subkeys plus `Labels`, `DPad`, and `Button1–8` as
+    /// applicable — a bare `RacingWheel` key alone does not
+    /// enumerate, so it does not count.
+    pub vjoy_mapping_ok: bool,
+    /// `GameInput` `RacingWheel` mapping for HID present.
+    pub hid_mapping_ok: bool,
+    /// vJoy device 1 has the `EmuWheel` envelope.
+    pub envelope_ok: bool,
+    /// vJoy device-1 button count as reported (-1 when unknown).
+    pub button_count: i32,
+    /// Force feedback present on vJoy device 1 — reported, not
+    /// a blocking item: FH4 does not send FFB data to vJoy, so
+    /// input works without it.
+    pub ffb_present: bool,
+    /// True when the vJoy backend is currently feeding vJoy
+    /// device 1. The daemon acquires + feeds the device from
+    /// backend start even with no board connected, so the wheel
+    /// is alive before any game launches.
+    pub feeding: bool,
+    /// One-line plain-words next step ("" when everything is OK).
+    pub next_step: String,
+}
+
 /// vJoy driver status, as the API reports it (v2.0.1 hotfix
 /// BACKEND-2). Detection is a file probe
 /// (`vJoyInterface.dll` resolvable); `version` is [`None`] until a
@@ -429,6 +475,10 @@ pub struct VjoyStatus {
     /// Installed driver version, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// FH4 wheel check (v2.0.14): [`None`] on non-Windows or
+    /// before the first check — never a fake OK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wheel_check: Option<WheelCheck>,
 }
 
 /// Live engine / link diagnostics, as the API reports it (v2.0.1
@@ -1800,5 +1850,52 @@ mod tests {
         assert!(json.contains("\"closeToTray\":true"), "{json}");
         let back: SlowPollState = serde_json::from_str(&json).expect("slow_poll round-trips");
         assert_eq!(back, slow);
+    }
+
+    /// FH4 wheel check (v2.0.14): `VjoyStatus` carries the check
+    /// under the exact contract names (`wheelCheck`,
+    /// `vjoyMappingOk`, `nextStep`, …), and JSON from an older
+    /// daemon without `wheelCheck` still reads as `None` — the UI
+    /// must keep working against a daemon that predates the check.
+    #[test]
+    fn vjoy_status_wheel_check_wire_shape() {
+        let status = VjoyStatus {
+            installed: true,
+            installing: false,
+            install_error: None,
+            dll_path: None,
+            version: Some("2.2.2".to_string()),
+            wheel_check: Some(WheelCheck {
+                vjoy_mapping_ok: true,
+                hid_mapping_ok: false,
+                envelope_ok: true,
+                button_count: 128,
+                ffb_present: true,
+                feeding: true,
+                next_step: "Re-run the RSH installer.".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&status).expect("vjoy_status serializes");
+        assert!(json.contains("\"wheelCheck\":"), "{json}");
+        assert!(json.contains("\"vjoyMappingOk\":true"), "{json}");
+        assert!(json.contains("\"hidMappingOk\":false"), "{json}");
+        assert!(json.contains("\"buttonCount\":128"), "{json}");
+        assert!(json.contains("\"feeding\":true"), "{json}");
+        assert!(
+            json.contains("\"nextStep\":\"Re-run the RSH installer.\""),
+            "{json}"
+        );
+        let back: VjoyStatus = serde_json::from_str(&json).expect("vjoy_status round-trips");
+        assert_eq!(back, status);
+        // Older daemon: no `wheelCheck` key at all.
+        let old = r#"{"installed":true,"installing":false,"version":"2.2.2"}"#;
+        let back: VjoyStatus = serde_json::from_str(old).expect("old vjoy_status reads");
+        assert!(back.wheel_check.is_none());
+        // A check that measured nothing yet (-1) still round-trips.
+        let unknown = serde_json::from_str::<VjoyStatus>(
+            r#"{"installed":true,"installing":false,"wheelCheck":{"vjoyMappingOk":false,"hidMappingOk":false,"envelopeOk":false,"buttonCount":-1,"ffbPresent":false,"feeding":false,"nextStep":""}}"#,
+        )
+        .expect("unknown-count check reads");
+        assert_eq!(unknown.wheel_check.as_ref().unwrap().button_count, -1);
     }
 }

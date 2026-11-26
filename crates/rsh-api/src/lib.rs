@@ -27,7 +27,7 @@ pub mod wifi;
 pub use api::{
     ApiTransport, AppApi, AppEvent, ButtonBinding, CalibrationInfo, ConnectionInfo, DiagStats,
     FirmwareCheck, FirmwareUpdateStatus, GameSummary, IpcMethodLatency, PollState, ProfileSummary,
-    RawMv, SlowPollState, SnapshotInfo, VjoyStatus, WifiStatus, app_version,
+    RawMv, SlowPollState, SnapshotInfo, VjoyStatus, WheelCheck, WifiStatus, app_version,
 };
 pub use connection::{
     BACKOFF_BASE, BACKOFF_MAX, ConnEvent, ConnectionManager, ConnectionState, HELLO_ATTEMPTS,

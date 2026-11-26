@@ -450,6 +450,12 @@ export component MainWindow inherits Window {
     in-out property <string> setup-vjoy-version: "";
     in-out property <string> setup-vjoy-error: "";
     in-out property <bool> setup-vjoy-fallback: false;
+    // FH4 wheel check (v2.0.14): synced with the vJoy status
+    // above — see the SetupScreen props for the meanings.
+    in-out property <bool> setup-vjoy-wheel-checked: false;
+    in-out property <bool> setup-vjoy-wheel-ok: false;
+    in-out property <string> setup-vjoy-wheel-line: "";
+    in-out property <string> setup-vjoy-wheel-next: "";
     in-out property <bool> setup-calibration-available: false;
     in-out property <string> setup-calibration-reason: "RSH isn't running — reconnect to capture.";
     // Diagnostics drawer (v2.0.1 hotfix): right-edge overlay like the
@@ -479,6 +485,10 @@ export component MainWindow inherits Window {
     in-out property <string> diag-ipc-p50-text: "—";
     in-out property <string> diag-ipc-p99-text: "—";
     in-out property <[bool]> diag-buttons-pressed;
+    // FH4 wheel check (v2.0.14): the Diagnostics drawer's
+    // "Wheel setup: …" line — "—" until a check exists.
+    in-out property <string> diag-wheel-text: "—";
+    in-out property <bool> diag-wheel-ok: false;
 
     callback toggled-send();
     callback reconnect();
@@ -1245,6 +1255,10 @@ export component MainWindow inherits Window {
         vjoy-version: setup-vjoy-version;
         vjoy-error: setup-vjoy-error;
         vjoy-fallback: setup-vjoy-fallback;
+        wheel-checked: setup-vjoy-wheel-checked;
+        wheel-ok: setup-vjoy-wheel-ok;
+        wheel-line: setup-vjoy-wheel-line;
+        wheel-next: setup-vjoy-wheel-next;
         calibration-available: setup-calibration-available;
         calibration-reason: setup-calibration-reason;
         live-throttle: setup-live-throttle;
@@ -1405,6 +1419,8 @@ export component MainWindow inherits Window {
         daemon-live: diag-daemon-live;
         app-version: diag-app-version;
         firmware: diag-firmware;
+        wheel-text: diag-wheel-text;
+        wheel-ok: diag-wheel-ok;
         throttle-pct: throttle;
         brake-pct: brake;
         clutch-pct: clutch;

@@ -738,6 +738,8 @@ mod tests {
                 install_error: None,
                 dll_path: Some("C:\\Program Files\\vJoy\\x64\\vJoyInterface.dll".to_string()),
                 version: Some("2.2.2".to_string()),
+                // Canned dispatch value — no wheel check measured.
+                wheel_check: None,
             })
         }
 

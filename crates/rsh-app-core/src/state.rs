@@ -4404,6 +4404,10 @@ impl AppStateCore {
             install_error: install.error.clone(),
             dll_path: dll.map(|path| path.to_string_lossy().into_owned()),
             version,
+            // FH4 wheel check (v2.0.14): None until the
+            // daemon-side check lands (backend) — the UI renders
+            // None as "not checked yet", never as OK.
+            wheel_check: None,
         }
     }
 
