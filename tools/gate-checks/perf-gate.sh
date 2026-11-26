@@ -98,8 +98,12 @@ fi
 
 # Daemon startup: --check starts the runtime + IPC, verifies
 # a ping round-trip, and exits 0 (enforcing: wall time).
+# Audit (v2.0.13, A P3-2): bound the --check itself — without a
+# timeout a hung --check would stall until the job timeout instead
+# of failing fast (timeout is GNU coreutils: present in git bash
+# on the Windows runner and on Linux CI).
 start_ms=$(date +%s%N | cut -c1-13)
-if ! "$daemon_bin" --check >"$OUT/perf-daemon-check.log" 2>&1; then
+if ! timeout 30 "$daemon_bin" --check >"$OUT/perf-daemon-check.log" 2>&1; then
     echo "ERROR: rsh-daemon --check failed (see $OUT/perf-daemon-check.log)" >&2
     exit 1
 fi

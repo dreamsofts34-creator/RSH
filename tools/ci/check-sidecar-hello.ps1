@@ -251,7 +251,7 @@ Write-Host "Sidecar token-missing check OK: exit 2 with 'bad-args' in the file l
 # today's log was deleted before the runs (above), so this file can
 # only be from this run; the mtime is asserted fresh (last
 # 10 minutes) as well, so a stale file can never pass.
-$sidecarLog = Join-Path "$env:ProgramData\RSH\logs" ("rsh-sidecar-{0}.log" -f (Get-Date -Format yyyyMMdd))
+$sidecarLog = $todayLog  # Audit (v2.0.13, A P3-5): reuse the single date computed at the top — recomputing here could cross midnight and look for tomorrow's log.
 if (-not (Test-Path $sidecarLog)) {
   Write-Error "Sidecar hello check: no sidecar file log for today at $sidecarLog (the sidecar must log to file as well as stderr)."
   exit 1

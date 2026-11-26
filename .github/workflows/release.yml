@@ -31,7 +31,7 @@
 #                             beside rsh-daemon.exe: the daemon resolves
 #                             it as <own exe dir>/RshCoreHiDcr.exe
 #                             (rsh-output-hidmaestro `resolve_sidecar_path`)
-# Firmware v4.0.5 IS shipped in this release (user orders 2026-11-16
+# Firmware v4.0.6 IS shipped in this release (user orders 2026-11-16
 # ~20:20 + 2026-11-17 ~07:48): BOTH firmware files, built + signed
 # HERE on the runner from the tagged source (step 6 below) — never
 # copied from a developer machine. The merged factory image is for
@@ -62,10 +62,9 @@
 #   3. `cargo build --release -p rsh-daemon -p rsh-ui`.
 #   4. PE-subsystem check: daemon + UI + sidecar must ALL be
 #      GUI-subsystem (2) — a console-subsystem (3) binary would pop
-#      a terminal window on launch (v1.0.0 lesson). NOTE: this check
-#      FAILS until Phase 3 adds `windows_subsystem = "windows"` to
-#      rsh-ui (the daemon already has it) — that is the check doing
-#      its job, not a workflow bug.
+#      a terminal window on launch (v1.0.0 lesson). rsh-ui sets
+#      `windows_subsystem = "windows"` (Phase 3), so this check
+#      passes; a console-subsystem binary fails it.
 #   5. NSIS installer: the committed `installer/rsh.nsi` (P1-1,
 #      v2.0.13 — extracted from this workflow), version-substituted
 #      by the "Prepare NSIS script" step, built with `makensis`.
@@ -114,10 +113,14 @@
 #   8. Headless launch smoke test: silently install the staged NSIS
 #      exe, prove the firewall rule exists, run
 #      `rsh-daemon --check --no-tray --no-connect` (exit 0 = IPC
-#      answers), uninstall silently, prove the rule and the install
-#      dir are gone. Cannot prove window paint on a headless runner
-#      — process + IPC + rule is the strongest launch evidence in
-#      CI; real paint stays a human gate.
+#      answers), then install a SECOND time over the first (update
+#      path: user data survives, registry version is the new one,
+#      the daemon restarts non-elevated with a new pid, the Run key
+#      points at the installed daemon), launch the UI and prove a
+#      main window appears, uninstall silently, prove the rule, the
+#      install dir and the WER keys are gone. Cannot prove window
+#      paint on a headless runner — process + IPC + rule is the
+#      strongest launch evidence in CI; real paint stays a human gate.
 #
 # PREREQUISITES (human gates — NOT checked by this workflow):
 #   * Workspace version bumped to the tag version (Cargo.toml
@@ -129,10 +132,11 @@
 #     workflow only records whether the runner happens to have vJoy
 #     installed (it will not).
 #
-# Release assets (exact list — THREE assets, as listed in this workflow's header):
-#   RSH_2.0.12_x64-setup.exe            (NSIS installer — app version)
-#   RSH-Firmware-DevKitV1-v4.0.5.bin    (merged full-flash firmware image — firmware version)
-#   RSH-Firmware-DevKitV1-v4.0.5-OTA.bin (Ed25519-signed OTA image — firmware version)
+# Release assets (exact list — FOUR assets, as listed in this workflow's header):
+#   RSH_2.0.13_x64-setup.exe            (NSIS installer — app version)
+#   RSH-Firmware-DevKitV1-v4.0.6.bin    (merged full-flash firmware image — firmware version)
+#   RSH-Firmware-DevKitV1-v4.0.6-OTA.bin (Ed25519-signed OTA image — firmware version)
+#   SHA256SUMS.txt                      (SHA-256 of assets 1-3)
 #
 # REMOVED in the v2.0 rewrite (2026-11-16) — these v1.x steps no longer
 # exist in this file:
@@ -616,6 +620,11 @@ jobs:
           # file keeps the placeholders; the substituted copy is
           # what makensis builds (runner workspace only).
           (Get-Content installer\rsh.nsi -Raw) -replace '\$\{VERSION\}', "${{ steps.tag.outputs.version }}" | Set-Content -Path installer\rsh.nsi -Encoding ASCII
+          # Audit (v2.0.13): fail fast if any placeholder survived
+          # the substitution — a literal "${VERSION}" would
+          # otherwise ship into DisplayVersion and only fail 40
+          # minutes later at the smoke test's ARP check.
+          if ((Get-Content installer\rsh.nsi -Raw) -match '\$\{VERSION\}') { Write-Error 'NSIS script still contains an unsubstituted ${VERSION} placeholder after version substitution.'; exit 1 }
           Get-Content installer\rsh.nsi | Select-Object -First 5
 
       - name: Build NSIS installer
@@ -626,7 +635,15 @@ jobs:
           # entry — the sum of the files the installer copies into
           # $INSTDIR (same list as installer/rsh.nsi's RSH_File
           # calls; makensis fails closed if a file is missing).
-          $installedKb = [int]((Get-ChildItem target/release/rsh-daemon.exe, target/release/rsh-ui.exe, src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe, src-tauri/binaries/HIDMaestro.Core.dll, tools/rsh-hm-sidecar/HIDMaestro-LICENSE.txt, firmware/.pio/build/esp32dev/firmware-signed.bin -File | Measure-Object Length -Sum).Sum / 1KB)
+          # Audit (v2.0.13, A P3-4): Get-ChildItem silently skips a
+          # missing path (non-terminating error) — a missing file
+          # would only shrink the sum while staying positive, so
+          # fail closed on each file first. (C P2-1): the +256 KB
+          # is the allowance for uninstall.exe (WriteUninstaller)
+          # — a 7th file in $INSTDIR that is not in this 6-file sum.
+          $installedFiles = @("target/release/rsh-daemon.exe", "target/release/rsh-ui.exe", "src-tauri/binaries/RshCoreHiDcr-x86_64-pc-windows-msvc.exe", "src-tauri/binaries/HIDMaestro.Core.dll", "tools/rsh-hm-sidecar/HIDMaestro-LICENSE.txt", "firmware/.pio/build/esp32dev/firmware-signed.bin")
+          foreach ($f in $installedFiles) { if (-not (Test-Path $f -PathType Leaf)) { Write-Error "EstimatedSize: expected installed file '$f' is missing."; exit 1 } }
+          $installedKb = [int]((Get-ChildItem $installedFiles -File | Measure-Object Length -Sum).Sum / 1KB) + 256
           # Run 45775988045: the bare -DESTIMATEDSIZEKB=$installedKb
           # reached makensis as the literal "$installedKb" (NSIS
           # warning 6000, EstimatedSize written as 0) — pass it as a
@@ -806,7 +823,12 @@ jobs:
           if ($unKey.GetValue("QuietUninstallString") -notlike "*uninstall.exe /S") { Write-Error "Smoke test: ARP QuietUninstallString is '$($unKey.GetValue("QuietUninstallString"))', expected 'uninstall.exe /S'."; exit 1 }
           if ($unKey.GetValue("NoModify") -ne 1 -or $unKey.GetValue("NoRepair") -ne 1) { Write-Error "Smoke test: ARP NoModify/NoRepair is '$($unKey.GetValue("NoModify"))'/'$($unKey.GetValue("NoRepair"))', expected 1/1."; exit 1 }
           if (-not $unKey.GetValue("EstimatedSize") -or $unKey.GetValue("EstimatedSize") -le 0) { Write-Error "Smoke test: ARP EstimatedSize is '$($unKey.GetValue("EstimatedSize"))', expected a positive KB value."; exit 1 }
-          Write-Host "ARP entry verified (DisplayName/DisplayVersion/Publisher/DisplayIcon/InstallLocation/QuietUninstallString/NoModify/NoRepair/EstimatedSize)."
+          # Audit (v2.0.13, C P2-2): VersionMajor/Minor were written
+          # but never asserted — pin them to the tag's first two
+          # components so the installer's WordFind parse is proven.
+          $major = [int]($version.Split('.')[0]); $minor = [int]($version.Split('.')[1])
+          if ($unKey.GetValue("VersionMajor") -ne $major -or $unKey.GetValue("VersionMinor") -ne $minor) { Write-Error "Smoke test: ARP VersionMajor/VersionMinor is '$($unKey.GetValue("VersionMajor"))'/'$($unKey.GetValue("VersionMinor"))', expected $major/$minor."; exit 1 }
+          Write-Host "ARP entry verified (DisplayName/DisplayVersion/Publisher/DisplayIcon/InstallLocation/QuietUninstallString/NoModify/NoRepair/EstimatedSize/VersionMajor/VersionMinor)."
           $dataDir = Join-Path $env:TEMP "rsh-smoke-data"
           $daemon = Join-Path $installDir "rsh-daemon.exe"
           Start-WaitOrFail $daemon @("--check", "--no-tray", "--no-connect", "--data-dir", $dataDir) 60 "daemon --check (IPC must answer)"
@@ -820,6 +842,16 @@ jobs:
           $realDataDir = Join-Path $env:APPDATA "RSH"
           New-Item -ItemType Directory -Force -Path $realDataDir | Out-Null
           Set-Content -Path (Join-Path $realDataDir "smoke-marker.txt") -Value "user data must survive an update" -Encoding ASCII
+          # Audit (v2.0.13): elevation-log snapshot + daemon pid,
+          # taken BEFORE the second install. The FIRST install
+          # already started a daemon (P2-4) that wrote its own
+          # "daemon: elevation: ..." line into this same daily log,
+          # so the poll below must only match lines appended AFTER
+          # the update restart (B P2) — and the restart proof must
+          # compare pids, not just existence (B P3).
+          $elevLog = Join-Path $realDataDir "logs\rsh-$(Get-Date -Format yyyyMMdd).log"
+          $elevLogLinesBefore = if (Test-Path $elevLog) { @(Get-Content $elevLog -ErrorAction SilentlyContinue).Count } else { 0 }
+          $daemonPidBefore = (Get-Process rsh-daemon -ErrorAction SilentlyContinue | Select-Object -First 1).Id
           Start-WaitOrFail $installer @("/S", "/D=$installDir") 180 "second silent install (update path)"
           if (-not (Test-Path (Join-Path $realDataDir "smoke-marker.txt"))) { Write-Error "Smoke test: user data in %APPDATA%\RSH was lost by the update install."; exit 1 }
           Write-Host "User data in %APPDATA%\RSH survived the update install."
@@ -832,20 +864,31 @@ jobs:
           if ($dispVersion -ne $version) { Write-Error "Smoke test: Uninstall key DisplayVersion is '$dispVersion', expected '$version'."; exit 1 }
           Write-Host "Registry version is $version (RSH key + Uninstall key)."
           Start-Sleep -Seconds 3
-          $daemonProc = Get-Process rsh-daemon -ErrorAction SilentlyContinue
+          $daemonProc = Get-Process rsh-daemon -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $daemonProc) { Write-Error "Smoke test: daemon was NOT restarted by the update install (no rsh-daemon process)."; exit 1 }
-          Write-Host "Daemon restarted by the update install (pid $($daemonProc.Id))."
+          # Audit (v2.0.13, B P3): a survivor is not a restart — the
+          # pid must have changed across the update install.
+          # ($daemonPidBefore is $null when no daemon ran before;
+          # then the existence check above is the whole proof.)
+          if ($daemonPidBefore -and $daemonProc.Id -eq $daemonPidBefore) { Write-Error "Smoke test: daemon pid $($daemonProc.Id) is unchanged across the update install — the installer did not restart it (a survivor, not a restart)."; exit 1 }
+          Write-Host "Daemon restarted by the update install (pid $($daemonProc.Id), was $daemonPidBefore)."
           # P2-8: the daemon syncs the Run key at startup (default
           # autostart on) — poll for it, since the sync runs on a
           # spawned task and may lag the process appearing.
+          # Audit (v2.0.13, B P1): the stored value is QUOTED
+          # (`"C:\...\rsh-daemon.exe"` — autostart_command wraps
+          # the path in quotes), so the pattern must allow the
+          # trailing quote: `*rsh-daemon.exe` (no trailing `*`)
+          # can never match and the poll would burn all 15 s
+          # then fail the run.
           $runVal = $null
           for ($i = 0; $i -lt 15; $i++) {
             $runKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\Microsoft\Windows\CurrentVersion\Run")
             $runVal = if ($runKey) { $runKey.GetValue("RSH") } else { $null }
-            if ($runVal -and $runVal -like "*rsh-daemon.exe") { break }
+            if ($runVal -and $runVal -like "*rsh-daemon.exe*") { break }
             Start-Sleep -Seconds 1
           }
-          if (-not $runVal -or $runVal -notlike "*rsh-daemon.exe") { Write-Error "Smoke test: HKCU Run\RSH is '$runVal' 15 s after the update restart, expected the installed rsh-daemon.exe."; exit 1 }
+          if (-not $runVal -or $runVal -notlike "*rsh-daemon.exe*") { Write-Error "Smoke test: HKCU Run\RSH is '$runVal' 15 s after the update restart, expected the installed rsh-daemon.exe."; exit 1 }
           Write-Host "HKCU Run\RSH points at the installed daemon ($runVal)."
           # P2-A: the update-path restart must be NON-elevated (P4) —
           # the installer relaunches the daemon via explorer.exe, and
@@ -864,14 +907,20 @@ jobs:
           # not a product defect (release run 45586820051 failed
           # exactly this way: daemon elevated, no medium shell).
           # Where a medium shell exists the assertion stays hard.
-          # (Log placement: the first --check ran with --data-dir in
-          # $dataDir, so %APPDATA%\RSH\logs is first written by this
-          # update-restarted daemon — no stale line can confuse it.)
-          $elevLog = Join-Path $realDataDir "logs\rsh-$(Get-Date -Format yyyyMMdd).log"
+          # (Log placement, audit v2.0.13 B P2: the comment that used
+          # to stand here claimed %APPDATA%\RSH\logs is first written
+          # by the update-restarted daemon — false since P2-4 made
+          # the FIRST install start a daemon too, which logs its own
+          # elevation line into this same daily file. $elevLog and
+          # $elevLogLinesBefore were snapshotted BEFORE the second
+          # install above; only lines appended after the restart
+          # count here, so a stale first-install line can never
+          # satisfy this poll.)
           $elevState = $null
           for ($i = 0; $i -lt 60; $i++) {
             if (Test-Path $elevLog) {
-              $tail = Get-Content $elevLog -Raw -ErrorAction SilentlyContinue
+              $elevLines = @(Get-Content $elevLog -ErrorAction SilentlyContinue)
+              $tail = if ($elevLines.Count -gt $elevLogLinesBefore) { ($elevLines[$elevLogLinesBefore..($elevLines.Count - 1)] -join "`n") } else { "" }
               if ($tail -match "daemon: elevation: non-elevated") { $elevState = "non-elevated"; break }
               if ($tail -match "daemon: elevation: elevated") { $elevState = "elevated"; break }
             }
@@ -947,10 +996,24 @@ jobs:
           }
           if ($null -eq $windowMs) { Write-Error "Smoke test: rsh-ui.exe showed no main window within 60 s (startup probe, R3-19)."; taskkill /F /IM rsh-ui.exe | Out-Null; exit 1 }
           Write-Host "Smoke test: rsh-ui main window appeared after $windowMs ms (bound 60000 ms, R3-19)."
+          # Audit (v2.0.13, B P3): the UI respawns a dead daemon
+          # (DS-68), so the UI must be FULLY gone before the daemon
+          # is killed — and the daemon fully gone before --check
+          # runs, or --check can hit the AlreadyRunning branch on a
+          # dying pipe. Poll (bounded, fail closed), never a fixed
+          # sleep after a taskkill.
           taskkill /F /IM rsh-ui.exe | Out-Null
-          Start-Sleep -Seconds 2
+          for ($i = 0; $i -lt 30; $i++) {
+            if (-not (Get-Process rsh-ui -ErrorAction SilentlyContinue)) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (Get-Process rsh-ui -ErrorAction SilentlyContinue) { Write-Error "Smoke test: rsh-ui.exe still running 30 s after taskkill."; exit 1 }
           taskkill /F /IM rsh-daemon.exe | Out-Null
-          Start-Sleep -Seconds 2
+          for ($i = 0; $i -lt 30; $i++) {
+            if (-not (Get-Process rsh-daemon -ErrorAction SilentlyContinue)) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (Get-Process rsh-daemon -ErrorAction SilentlyContinue) { Write-Error "Smoke test: rsh-daemon.exe still running 30 s after taskkill."; exit 1 }
           Start-WaitOrFail $daemon @("--check", "--no-tray", "--no-connect", "--data-dir", $dataDir) 60 "daemon --check after the update install"
           Write-Host "Smoke test PASS: update path — data kept, version $version, daemon restarted, --check exit 0."
           # The sidecar is a separate process the uninstaller also
@@ -1013,19 +1076,43 @@ jobs:
           else { Write-Host "vJoy is not installed on the runner (expected). PINNED_DLL_SHA256_HEX stays None until measured on the Windows release machine (G-G3) — never invented." }
 
       - name: Create GitHub Release
-        if: ${{ github.ref_type == 'tag' || inputs.dry_run == 'false' }}
+        # Audit (v2.0.13, B P2): a tag-ref dispatch with dry_run=true
+        # used to create the release anyway (ref_type == 'tag' alone
+        # satisfied the condition) — dry_run=true must always win.
+        if: ${{ (github.ref_type == 'tag' || inputs.dry_run == 'false') && inputs.dry_run != 'true' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ steps.tag.outputs.tag }}"
+          # Audit (v2.0.13, B P3): fail closed unless the tag exists
+          # — a typo'd inputs.tag would otherwise make `gh release
+          # create` invent the tag at the dispatch ref and publish
+          # a release on the wrong commit.
+          git fetch origin tag $tag --force 2>$null
+          if (-not (git rev-parse "refs/tags/$tag" 2>$null)) { Write-Error "Tag '$tag' does not exist in the repo — refusing to create a release (check inputs.tag)."; exit 1 }
           $files = Get-ChildItem release-staging -File | ForEach-Object { $_.FullName }
           if ($files.Count -ne 4) { Write-Error "Expected exactly four staged files (NSIS exe + merged firmware + OTA firmware + SHA256SUMS.txt) — refusing to create a partial release."; exit 1 }
           Write-Host "Releasing 4 files:"
           $files | ForEach-Object { Write-Host "  $_" }
-          gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes "RSH v${{ steps.tag.outputs.version }} — NSIS installer + firmware v${{ steps.verify-firmware.outputs.fw_version }} (merged full-flash image + Ed25519-signed OTA image for the app's WebOTA flow). v2.0 redesign: Slint UI + always-on daemon (tray popup + menu, autostart, lazy-start — no UAC prompt at login). Auto-update is off for this release: no latest.json is published — download and install manually. App ships unsigned (OV cert deferred, D-R11). Installer SHA-256: ${{ steps.sha256sums.outputs.exe_sha256 }} (verify against SHA256SUMS.txt). Uninstall keeps %APPDATA%\RSH (profiles/settings/logs) and %ProgramData%\RSH\dumps (crash dumps) — delete them manually for a fully clean start." $files
+          $notes = "RSH v${{ steps.tag.outputs.version }} — NSIS installer + firmware v${{ steps.verify-firmware.outputs.fw_version }} (merged full-flash image + Ed25519-signed OTA image for the app's WebOTA flow). v2.0 redesign: Slint UI + always-on daemon (tray popup + menu, autostart, lazy-start — no UAC prompt at login). Auto-update is off for this release: no latest.json is published — download and install manually. App ships unsigned (OV cert deferred, D-R11). Installer SHA-256: ${{ steps.sha256sums.outputs.exe_sha256 }} (verify against SHA256SUMS.txt). Uninstall keeps %APPDATA%\RSH (profiles/settings/logs) and %ProgramData%\RSH\dumps (crash dumps) — delete them manually for a fully clean start. Uninstall leaves the vJoy device 1 wheel configuration in place (re-configure it in vJoyConf if needed)."
+          # Audit (v2.0.13, B P2): `gh release create` fails (HTTP
+          # 422, already exists) when a release for the tag exists
+          # — a re-run after a partially-successful create would
+          # die here at the end of a ~45 min run. Upload (clobber)
+          # + edit the notes instead.
+          if (gh release view $tag --json tagName -q '.tagName' 2>$null) {
+            Write-Host "Release for $tag already exists — uploading the 4 assets (clobber) instead of creating a duplicate release."
+            gh release upload $tag $files --clobber
+            if ($LASTEXITCODE -ne 0) { Write-Error "gh release upload failed for $tag."; exit 1 }
+            gh release edit $tag --notes $notes
+            if ($LASTEXITCODE -ne 0) { Write-Error "gh release edit failed for $tag."; exit 1 }
+          } else {
+            gh release create $tag --title "RSH v${{ steps.tag.outputs.version }}" --notes $notes $files
+            if ($LASTEXITCODE -ne 0) { Write-Error "gh release create failed for $tag."; exit 1 }
+          }
 
       - name: Dry run — release NOT created
-        if: ${{ github.ref_type != 'tag' && inputs.dry_run != 'false' }}
+        if: ${{ !((github.ref_type == 'tag' || inputs.dry_run == 'false') && inputs.dry_run != 'true') }}
         shell: pwsh
         run: Write-Host "Dry run complete — four assets verified in release-staging/, no GitHub Release created."

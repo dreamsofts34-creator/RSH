@@ -175,6 +175,13 @@ Function .onInit
     Abort
   ${EndIf}
   done:
+    ; Audit (v2.0.13): `done:` MUST return here — without this
+    ; Return, execution falls through into
+    ; silent_downgrade_refused below and EVERY update/reinstall
+    ; aborts with exit code 1 (release run 45782080003: the
+    ; second silent install exited 1 in 0.3 s; fresh installs
+    ; were unaffected because they Return early above).
+    Return
   silent_downgrade_refused:
     DetailPrint "Refusing silent downgrade from $InstalledVersion to ${VERSION} (pass /ALLOWDOWNGRADE to allow it)."
     SetErrorLevel 1
@@ -255,6 +262,34 @@ Function KillRSHProcesses
   ${AndIf} $R0 < 10
     Goto DS68KillLoop
   ${EndIf}
+  ; Audit (v2.0.13, C P3-3): the loop above gives up silently after
+  ; 10 passes — if a copied exe is still running, fail visibly here
+  ; instead of letting the File copy hit the retry dialog (or a
+  ; half-installed state) with no diagnostic.
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq rsh-daemon.exe" /NH'
+  Pop $R1
+  Pop $R2
+  ${StrStr} $R3 $R2 "rsh-daemon.exe"
+  ${If} $R3 != ""
+    DetailPrint "KillRSHProcesses: rsh-daemon.exe is still running after 10 kill passes — aborting the install."
+    Abort
+  ${EndIf}
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq rsh-ui.exe" /NH'
+  Pop $R1
+  Pop $R2
+  ${StrStr} $R3 $R2 "rsh-ui.exe"
+  ${If} $R3 != ""
+    DetailPrint "KillRSHProcesses: rsh-ui.exe is still running after 10 kill passes — aborting the install."
+    Abort
+  ${EndIf}
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq RshCoreHiDcr.exe" /NH'
+  Pop $R1
+  Pop $R2
+  ${StrStr} $R3 $R2 "RshCoreHiDcr.exe"
+  ${If} $R3 != ""
+    DetailPrint "KillRSHProcesses: RshCoreHiDcr.exe is still running after 10 kill passes — aborting the install."
+    Abort
+  ${EndIf}
 FunctionEnd
 
 ; P2-2 (v2.0.13 polish): copy with one automatic kill-loop retry,
@@ -274,7 +309,7 @@ FunctionEnd
     ClearErrors
     File ${OPT} "${SRC}"
     ${If} ${Errors}
-      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Could not write $\"${SRC}$\" — it is still in use (another RSH process or antivirus may hold it). Click Retry after closing RSH, or Cancel to stop the install." IDRETRY RSH_File_retry_${N} IDCANCEL RSH_File_abort_${N}
+      MessageBox /SD IDCANCEL MB_RETRYCANCEL|MB_ICONEXCLAMATION "Could not write $\"${SRC}$\" — it is still in use (another RSH process or antivirus may hold it). Click Retry after closing RSH, or Cancel to stop the install." IDRETRY RSH_File_retry_${N} IDCANCEL RSH_File_abort_${N}
       RSH_File_abort_${N}:
         Abort
       RSH_File_retry_${N}:
@@ -432,7 +467,7 @@ Function ConfigureVJoyDevice1
   Pop $R1  ; exit code
   Pop $R2  ; stdout (discard)
   ${If} $R1 != 0
-    MessageBox MB_ICONEXCLAMATION "RSH installed, but vJoy device 1 could not be configured as a wheel for Windows.Gaming.Input games (vJoyConfig exit $R1). Wheel games (for example Forza Horizon 4) may not show a Wheel tab. Next step: open vJoyConf, set device 1 to 8 axes (X Y Z Rx Ry Rz Slider Dial), 128 buttons, 1 POV hat, all FFB effects — or run the RSH installer again."
+    MessageBox /SD IDOK MB_ICONEXCLAMATION "RSH installed, but vJoy device 1 could not be configured as a wheel for Windows.Gaming.Input games (vJoyConfig exit $R1). Wheel games (for example Forza Horizon 4) may not show a Wheel tab. Next step: open vJoyConf, set device 1 to 8 axes (X Y Z Rx Ry Rz Slider Dial), 128 buttons, 1 POV hat, all FFB effects — or run the RSH installer again."
     Return
   ${EndIf}
   ; Verify the descriptor landed: Device01 must exist with a
@@ -444,7 +479,7 @@ Function ConfigureVJoyDevice1
   SetRegView 32
   ${If} ${Errors}
   ${OrIf} $R3 == 0
-    MessageBox MB_ICONEXCLAMATION "RSH installed, but the vJoy device-1 configuration could not be verified (no descriptor found for device 1). Wheel games (for example Forza Horizon 4) may not show a Wheel tab. Next step: open vJoyConf, set device 1 to 8 axes (X Y Z Rx Ry Rz Slider Dial), 128 buttons, 1 POV hat, all FFB effects — or run the RSH installer again."
+    MessageBox /SD IDOK MB_ICONEXCLAMATION "RSH installed, but the vJoy device-1 configuration could not be verified (no descriptor found for device 1). Wheel games (for example Forza Horizon 4) may not show a Wheel tab. Next step: open vJoyConf, set device 1 to 8 axes (X Y Z Rx Ry Rz Slider Dial), 128 buttons, 1 POV hat, all FFB effects — or run the RSH installer again."
   ${EndIf}
 FunctionEnd
 
@@ -489,20 +524,20 @@ Section "RSH"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "DisplayName" "RSH ${VERSION}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "DisplayVersion" "${VERSION}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "UninstallString" "$INSTDIR\uninstall.exe"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RSH" "Publisher" "Dreamsofts"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RSH" "DisplayIcon" "$INSTDIR\\rsh-ui.exe"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RSH" "InstallLocation" "$INSTDIR"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RSH" "QuietUninstallString" "$INSTDIR\\uninstall.exe /S"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RSH" "URLInfoAbout" "https://github.com/dreamsofts34-creator/RSH"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RSH" "HelpLink" "https://github.com/dreamsofts34-creator/RSH"
-  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RSH" "NoModify" 1
-  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RSH" "NoRepair" 1
-  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RSH" "EstimatedSize" ${ESTIMATEDSIZEKB}
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "Publisher" "Dreamsofts"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "DisplayIcon" "$INSTDIR\\rsh-ui.exe"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "QuietUninstallString" "$INSTDIR\\uninstall.exe /S"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "URLInfoAbout" "https://github.com/dreamsofts34-creator/RSH"
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "HelpLink" "https://github.com/dreamsofts34-creator/RSH"
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "NoModify" 1
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "NoRepair" 1
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "EstimatedSize" ${ESTIMATEDSIZEKB}
   ; VersionMajor/Minor from ${VERSION} (WordFind: "2.0.13" -> 2 / 0).
   ${WordFind} ${VERSION} "." "1" $R0
   ${WordFind} ${VERSION} "." "2" $R1
-  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RSH" "VersionMajor" $R0
-  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RSH" "VersionMinor" $R1
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "VersionMajor" $R0
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "VersionMinor" $R1
   ; Round 3 WS-6 (R3-AK-02): WER LocalDumps — native-crash
   ; forensics with zero runtime cost. WER writes the dump
   ; out of process after any unhandled exception, including
@@ -558,7 +593,7 @@ Section "RSH"
   Pop $0
   Pop $1  ; DS-70: ExecToStack pushes exit code + stdout — discard both
   ${If} $0 != 0
-    MessageBox MB_ICONEXCLAMATION "RSH installed, but the Windows Firewall rule could not be created (netsh exit $0). The wheel may not connect over Wi-Fi. Next step: Windows Security -> Firewall & network protection -> Allow an app through firewall -> add rsh-daemon.exe; or run the installer again as administrator."
+    MessageBox /SD IDOK MB_ICONEXCLAMATION "RSH installed, but the Windows Firewall rule could not be created (netsh exit $0). The wheel may not connect over Wi-Fi. Next step: Windows Security -> Firewall & network protection -> Allow an app through firewall -> add rsh-daemon.exe; or run the installer again as administrator."
   ${EndIf}
   ; FH4 fixes #1+#2 (v2.0.13): the RacingWheel mappings FIRST, then
   ; the device-1 envelope — vJoyConfig restarts the vJoy devices,
@@ -609,6 +644,12 @@ Section "Uninstall"
   ; Runs before the script file itself is deleted below.
   ; The `schtasks` line is the fallback for an install
   ; whose rsh-task.ps1 is already gone.
+  ; Audit (v2.0.13, C P3-5): rsh-task.ps1 is NOT shipped by this
+  ; installer (no File instruction for it), so the powershell call
+  ; below always errors (ignored via nsExec) — the `schtasks`
+  ; line is the real legacy-task removal. Both are kept: an
+  ; upgrade from an install that did ship the file still needs
+  ; the Deletes below, and the call is a harmless no-op otherwise.
   nsExec::Exec 'powershell -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\rsh-task.ps1" -Uninstall'
   nsExec::Exec 'schtasks /delete /tn "RSH Daemon" /f'
   ; Round 3 WS-6 (R3-AK-02): remove the WER LocalDumps
@@ -671,7 +712,7 @@ Section "Uninstall"
   ; running/locked) instead of reporting a partial uninstall
   ; as success.
   IfFileExists "$INSTDIR\rsh-daemon.exe" 0 warn_done
-  MessageBox MB_ICONEXCLAMATION "RSH could not be fully removed: rsh-daemon.exe is still in use (the app may still be running). Close RSH and run the uninstaller again."
+  MessageBox /SD IDOK MB_ICONEXCLAMATION "RSH could not be fully removed: rsh-daemon.exe is still in use (the app may still be running). Close RSH and run the uninstaller again."
   warn_done:
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH"
   DeleteRegKey HKLM "Software\RSH"

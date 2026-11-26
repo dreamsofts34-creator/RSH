@@ -26,11 +26,13 @@
 # at build-script time and fails with `ResourcePathNotFound` when the file
 # is missing (release dry runs #1/#2 + first CI run, 2026-11-14).
 #
-# Outputs (for the release workflow's sidecar-SBOM verification, M4):
-#   `zip_sha256` / `dll_sha256` — the MEASURED hashes, written to
-#   `$env:GITHUB_OUTPUT` when running on a GitHub runner. The M4 step
-#   compares the SBOM's recorded hashes against these measured values,
-#   so a re-typed constant can never drift from what was actually staged.
+# Outputs (audit, v2.0.13, A P3-3): `zip_sha256` / `dll_sha256` — the
+# MEASURED hashes, written to `$env:GITHUB_OUTPUT` when running on a
+# GitHub runner. NOTE: no step currently consumes them (the M4
+# SBOM-verification step they were written for does not exist —
+# SBOMs are not published); they are recorded only. If an M4 step
+# is added later it must compare against these measured values, so
+# a re-typed constant can never drift from what was actually staged.
 #
 # Run from the repo root: `pwsh -NoProfile -ExecutionPolicy Bypass -File tools/ci/stage-sidecar.ps1`
 # Requires: .NET 10 SDK on PATH (`dotnet`), PowerShell 7+.
