@@ -50,6 +50,18 @@
 #      backoff sleep for the latch) and the 300 s lifecycle soak
 #      is inside the 5-min soak cap — so a full --gate run takes
 #      >= 10 min before any scenario work is counted.
+#   8. packaging-gate (local-first rule, user order 2026-11-26):
+#      the release-packaging checks CI never ran in the same form —
+#      makensis compiles the REAL installer/rsh.nsi (dummy
+#      binaries, real icons, workspace version, the release
+#      workflow's -D defines), release.yml parses, the smoke-test
+#      run block stays under GitHub's 21,000-char limit, and every
+#      installer input file exists. v2.0.13 failed five release
+#      attempts on exactly this class while the app code built
+#      green. Implementation: tools/gate-checks/packaging-gate.sh.
+#      The Windows runtime smoke test itself cannot run on Linux;
+#      per the local-first rule it is covered by waiting for the
+#      fix commit's CI to go fully green before triggering.
 #
 # Usage:
 #   tools/gate-checks/run-gate.sh [--full] [--rig-quick] [--out DIR]
@@ -253,6 +265,10 @@ perf_gate() {
     bash "$ROOT/tools/gate-checks/perf-gate.sh" --out "$OUT" --record-only-if-missing
 }
 run_step perf-gate perf_gate
+# Local-first rule (user order 2026-11-26): packaging checks — the
+# class that killed five v2.0.13 release attempts — run in the
+# DEFAULT gate path, not only --full.
+run_step packaging-gate bash "$ROOT/tools/gate-checks/packaging-gate.sh" --out "$OUT"
 
 if [ "$FULL" -eq 1 ]; then
     run_step clippy-workspace cargo clippy --workspace --exclude rsh-app --all-targets -- -D warnings
