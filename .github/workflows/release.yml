@@ -652,7 +652,14 @@ jobs:
           # Fail closed on a non-positive value so a bad size can
           # never silently ship again.
           if (-not $installedKb -or $installedKb -le 0) { Write-Error "EstimatedSize computation produced '$installedKb' — failing closed."; exit 1 }
-          makensis "-DESTIMATEDSIZEKB=$installedKb" installer\rsh.nsi
+          # Audit (v2.0.13, attempt 5): VersionMajor/Minor as
+          # makensis defines, split from the tag version — the
+          # installer's old WordFind parse returned the wrong
+          # minor (2 instead of 0 for 2.0.13).
+          $tagVersion = "${{ steps.tag.outputs.version }}"
+          if ($tagVersion -notmatch '^\d+\.\d+\.\d+$') { Write-Error "Tag version '$tagVersion' is not x.y.z — cannot derive VersionMajor/Minor."; exit 1 }
+          $major = [int]($tagVersion.Split('.')[0]); $minor = [int]($tagVersion.Split('.')[1])
+          makensis "-DESTIMATEDSIZEKB=$installedKb" "-DVERSIONMAJOR=$major" "-DVERSIONMINOR=$minor" installer\rsh.nsi
           Get-ChildItem release-staging -File | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) B)" }
 
       # ---- Stage firmware assets (after the NSIS build) ----

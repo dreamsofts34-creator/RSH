@@ -35,6 +35,18 @@ SetCompressor /SOLID lzma
 !ifndef ESTIMATEDSIZEKB
   !define ESTIMATEDSIZEKB 0
 !endif
+; Audit (v2.0.13, attempt 5): VersionMajor/Minor are filled by the
+; release workflow too (makensis /DVERSIONMAJOR=<n>
+; /DVERSIONMINOR=<n>, split from the tag version) — the old
+; WordFind parse returned the wrong minor (WordFind "2.0.13" "."
+; "2" gave 2, not 0), so the installer no longer parses the
+; version string itself. 0 here means "unknown", as above.
+!ifndef VERSIONMAJOR
+  !define VERSIONMAJOR 0
+!endif
+!ifndef VERSIONMINOR
+  !define VERSIONMINOR 0
+!endif
 ; ---- Modern UI 2 (MUI2) -------------------------------------
 ; MUI2 wizard (welcome / license / directory / install /
 ; finish) + branding. Silent installs (/S) skip ALL pages,
@@ -533,11 +545,11 @@ Section "RSH"
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "NoModify" 1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "NoRepair" 1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "EstimatedSize" ${ESTIMATEDSIZEKB}
-  ; VersionMajor/Minor from ${VERSION} (WordFind: "2.0.13" -> 2 / 0).
-  ${WordFind} ${VERSION} "." "1" $R0
-  ${WordFind} ${VERSION} "." "2" $R1
-  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "VersionMajor" $R0
-  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "VersionMinor" $R1
+  ; VersionMajor/Minor from the makensis defines (see above) —
+  ; same tag version the smoke test asserts, so write and check
+  ; can never disagree.
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "VersionMajor" ${VERSIONMAJOR}
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\RSH" "VersionMinor" ${VERSIONMINOR}
   ; Round 3 WS-6 (R3-AK-02): WER LocalDumps — native-crash
   ; forensics with zero runtime cost. WER writes the dump
   ; out of process after any unhandled exception, including
