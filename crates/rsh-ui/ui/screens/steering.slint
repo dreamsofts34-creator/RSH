@@ -182,6 +182,13 @@ export component SteeringPage inherits HorizontalLayout {
                     // D12: no "✓" glyph in the label — the "Set" pill above already shows the state.
                     Btn { label: centre-set ? "Set" : "Set centre"; disabled: !centre-available || busy-kind == 10; clicked => { set-centre(); } }
                 }
+                // HID P3-3 (v2.0.13): the board treats the wheel
+                // position at power-on as its centre, which can
+                // disagree with the pipeline's centre — a wheel
+                // turned at boot stays off-centre. The capture
+                // above is the fix; the note tells the user why
+                // it matters and how to avoid it next boot.
+                Text { wrap: word-wrap; text: "The board treats the wheel position at power-on as its centre — always switch it on with the wheel straight. If steering feels off-centre, hold it straight and press Set centre."; font-size: Theme.fs-hint; color: Theme.mute; }
                 // S1: Capture full lock — the two buttons sit next
                 // to Set centre: turn fully left / right, press.
                 // Same availability: live daemon only (CaptureOp).

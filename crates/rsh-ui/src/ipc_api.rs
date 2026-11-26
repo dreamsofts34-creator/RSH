@@ -319,6 +319,18 @@ const GAME_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 10 s budget as the game writes.
 const GAME_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// HID P3-5 (v2.0.13): the backend-timeout re-query polls the
+/// LIVE backend this many times, this far apart, instead of
+/// sampling once — one sample cannot tell "still switching" from
+/// "failed", and a switch that lands just after the single sample
+/// left a stale verdict until the ~1 Hz poll re-synced it. Five
+/// samples at 1 s (each call bounded at 500 ms) is ~5 s worst
+/// case on the background job thread — far inside the re-query
+/// job's own 420 s timeout, and short enough that the verdict
+/// still lands promptly.
+const BACKEND_REQUERY_SAMPLES: u32 = 5;
+const BACKEND_REQUERY_INTERVAL: Duration = Duration::from_secs(1);
+
 const JOB_LANE_A_METHODS: &[&str] = &[
     "set_tuning",
     "save_draft",
@@ -864,6 +876,34 @@ impl IpcApi {
         }
     }
 
+    /// Polled LIVE backend query (HID P3-5, v2.0.13): sample
+    /// [`Self::query_output_backend`] up to
+    /// `BACKEND_REQUERY_SAMPLES` times, `BACKEND_REQUERY_INTERVAL`
+    /// apart, and stop early the moment the daemon reports the
+    /// `requested` backend — a switch that completes mid-poll is
+    /// reported as the success it is, not as the stale "still
+    /// running" the single sample returned. A sample that still
+    /// shows the old backend, or no answer at all (transient —
+    /// the daemon's single-flight lock can refuse a poll while
+    /// the switch runs), is retried, not verdicted: only the
+    /// LAST sample decides, so the caller can tell "still
+    /// switching after N polls" from "failed". Only ever called
+    /// from a job thread — it blocks on the runtime like the
+    /// one-shot query, never on the UI thread.
+    pub fn query_output_backend_polled(&self, requested: &str) -> Option<String> {
+        let mut last: Option<String> = None;
+        for attempt in 0..BACKEND_REQUERY_SAMPLES {
+            if attempt > 0 {
+                std::thread::sleep(BACKEND_REQUERY_INTERVAL);
+            }
+            last = self.query_output_backend();
+            if last.as_deref() == Some(requested) {
+                break;
+            }
+        }
+        last
+    }
+
     /// Mark the cached draft dirty for `module` (F6): the daemon
     /// marks the draft dirty on `set_tuning` /
     /// `set_module_enabled`, so a successful write dirties the
@@ -939,10 +979,9 @@ impl IpcApi {
                 (code.trim(), detail.trim())
             });
         match ConnectionError::from_code(code) {
-            Some(error) => UserError::from_connection(
-                error,
-                if detail.is_empty() { code } else { detail },
-            ),
+            Some(error) => {
+                UserError::from_connection(error, if detail.is_empty() { code } else { detail })
+            }
             None => Self::ipc_failed(),
         }
     }
@@ -2650,7 +2689,10 @@ impl IpcApi {
         mix(conn.label.as_bytes());
         mix(conn.transport.as_str().as_bytes());
         mix(conn.address.as_bytes());
-        mix(&[u8::from(conn.session_active), u8::from(conn.board_reachable)]);
+        mix(&[
+            u8::from(conn.session_active),
+            u8::from(conn.board_reachable),
+        ]);
         match &conn.error {
             Some(error) => mix(error.code().as_bytes()),
             None => mix(b"no-error"),
@@ -4073,8 +4115,7 @@ mod tests {
             Some("wheel did not answer: waited 3 s")
         );
         // The bare detailed payload (no client wrap) parses too.
-        let error =
-            IpcApi::daemon_connect_error("Unreachable|no board found");
+        let error = IpcApi::daemon_connect_error("Unreachable|no board found");
         assert_eq!(error.code, "Unreachable");
         assert_eq!(error.title, "Wheel not found");
     }
@@ -4102,7 +4143,11 @@ mod tests {
         assert_eq!(error.code, "Unknown");
         assert_eq!(error.detail.as_deref(), Some("Unknown"));
         assert!(
-            !error.detail.as_deref().unwrap_or("").contains("daemon API error"),
+            !error
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("daemon API error"),
             "the fallback must use the stripped tail, never the wrapped payload"
         );
         // A non-Api error stays the generic link failure.

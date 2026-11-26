@@ -1254,6 +1254,25 @@ fn daemon_error_for(live: bool, status: Option<(String, String)>) -> String {
     }
 }
 
+/// Format a Unix timestamp as `HH:MM:SS UTC` (CORE-P3-8): the
+/// second-instance record's `at_unix` in the notification, so the
+/// user (and a diagnostics report) can match it to the UI spawn.
+/// No chrono dependency in this crate — plain arithmetic on the
+/// seconds since midnight UTC. `0` (no usable timestamp) reads as
+/// "unknown time", never as 1970.
+fn format_unix_time(at_unix: u64) -> String {
+    if at_unix == 0 {
+        return "unknown time".to_string();
+    }
+    let secs = at_unix % 86_400;
+    format!(
+        "{:02}:{:02}:{:02} UTC",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
 /// Write one Extras module `-on` prop by module index (H7, FC2):
 /// 0 handbrake, 1 shifter, 2 horn, 3 led. The props are `MainWindow`
 /// in-out props, so Rust can revert a toggle the backend rejected.
@@ -1360,7 +1379,12 @@ enum JobDone {
     /// `requested` is the Settings segment the timed-out switch
     /// asked for (0 `HIDMaestro`, 1 vJoy); `backend` is what the
     /// daemon reports right now — `None` when the re-query itself
-    /// did not answer, so the timeout stands as a failure.
+    /// did not answer, so the timeout stands as a failure. HID
+    /// P3-5 (v2.0.13): the re-query polls a few times before it
+    /// reports, so `backend` is the last of several samples — a
+    /// switch that completed mid-poll reports its success, and a
+    /// still-old backend means "still switching after N polls",
+    /// not one unlucky sample.
     BackendRequery {
         requested: i32,
         backend: Option<String>,
@@ -2101,6 +2125,11 @@ struct Ctx {
     /// `mark_spawn_latched` does not notify the same fatal reason
     /// twice. `None` = the generic "not running" was shown.
     last_dead_detail: Rc<RefCell<Option<String>>>,
+    /// CORE-P3-8 (v2.0.13): the `at_unix` of the second-instance
+    /// `info` record already surfaced, so `sync_daemon_error`'s
+    /// 1 Hz safety call notifies once per record, not once per
+    /// second. `None` = none surfaced yet.
+    last_second_instance_at: Rc<Cell<Option<u64>>>,
     /// F12 (v2.0.3): when the current down-episode started (set by
     /// `mark_dead`, cleared by `swap_to_live`). `None` = never down
     /// since launch, or back live.
@@ -3926,7 +3955,50 @@ impl Ctx {
                 text.clone_from(latch);
             }
         }
+        // CORE-P3-8 (v2.0.13): no fatal file and no latch — a fresh
+        // second-instance `info` record is still worth one
+        // notification (it is the only trace of the ~11 s
+        // UI-spawned daemon death). It never drives the banner:
+        // the first daemon is still starting, not dead.
+        if text.is_empty() && !self.is_live() {
+            self.surface_second_instance_info(win);
+        }
         set_daemon_error_prop(win, &text);
+    }
+
+    /// Surface a fresh second-instance `info` record (CORE-P3-8):
+    /// a second daemon exited because the first was still starting
+    /// — the ~11 s UI-spawned daemon death. Shown once per record
+    /// (`at_unix` dedupe) as a notification + info status-bar
+    /// message (drawer entry survives for Diagnostics), with the
+    /// record's timestamp in the body so a user-PC repro can be
+    /// matched to the spawn; the raw detail (with pids) goes to
+    /// the diagnostics log, not the user-facing text. Never a
+    /// fatal banner, never a spawn latch.
+    fn surface_second_instance_info(&self, win: &MainWindow) {
+        if self.is_live() {
+            return;
+        }
+        let Some((detail, at_unix)) = live_probe::read_second_instance_info(
+            self.data_dir.as_deref(),
+            live_probe::FATAL_FRESHNESS,
+        ) else {
+            return;
+        };
+        if self.last_second_instance_at.get() == Some(at_unix) {
+            return;
+        }
+        self.last_second_instance_at.set(Some(at_unix));
+        ui_log!("RSH-UI second-instance record: at_unix={at_unix} detail={detail}");
+        let when = format_unix_time(at_unix);
+        self.notify_toast(
+            win,
+            "Connection",
+            "Second RSH backend start noticed",
+            &format!(
+                "Another RSH backend tried to start at {when} while the first was still starting, so it closed itself — this is usually harmless. If RSH never connects, check Diagnostics."
+            ),
+        );
     }
 
     /// Latch the respawn-failure state (F3): the monitor sent
@@ -4320,23 +4392,26 @@ impl Ctx {
                         );
                     }
                     Some(live) => {
-                        // The daemon is still on the old backend:
-                        // the switch may still be running (the
-                        // client timeout never cancels the daemon
-                        // handler) or it failed without answering.
-                        // Say so plainly instead of declaring a
-                        // failure — no cooldown, so the user can
-                        // retry at once; a retry while the daemon
-                        // is still switching is refused with its
-                        // real reason, and the next poll re-syncs
-                        // the segment if the switch lands.
+                        // The daemon is still on the old backend
+                        // after several re-query polls: the switch
+                        // may still be running (the client timeout
+                        // never cancels the daemon handler) or it
+                        // failed without answering. Say so plainly
+                        // instead of declaring a failure — no
+                        // cooldown, but NO immediate-retry
+                        // invitation either (HID P3-5: a retry
+                        // while the daemon is still switching is
+                        // refused by the in-flight guard, so
+                        // "retry at once" was a guaranteed error);
+                        // the next poll re-syncs the segment if
+                        // the switch lands.
                         win.set_controller(i32::from(live != "HIDMaestro"));
                         self.notify_toast(
                             win,
                             "Game controller",
                             "Controller switch still running",
                             &format!(
-                                "The switch to {requested_name} is still running in the background — {live} is still the game controller for now. It will update when the switch finishes; try again if it doesn't."
+                                "The switch to {requested_name} is still running in the background — {live} is still the game controller for now. It will update on its own when the switch finishes; wait a moment before trying again — a retry while the switch is running is refused."
                             ),
                         );
                     }
@@ -4961,17 +5036,19 @@ impl Ctx {
 
     /// Start the HID-3 re-query after a backend-job timeout: ask
     /// the daemon for its LIVE backend on a background job thread
-    /// (one 500 ms `output_backend` call via
-    /// [`IpcApi::query_output_backend`]) and report the verdict in
-    /// [`JobDone::BackendRequery`]. Returns true when the re-query
-    /// started; false when there is nothing to re-query (no
-    /// recorded request, a re-query already in flight, or no live
-    /// link) — the caller then falls back to the plain timeout
-    /// failure. The job runs under [`JobKind::Backend`] so the busy
-    /// strip shows "Checking controller…" while it runs; its own
-    /// 420 s timeout cannot fire (the call is bounded at 500 ms),
-    /// and the in-flight flag stops a second timeout from
-    /// spawning a second re-query.
+    /// (HID P3-5, v2.0.13: [`IpcApi::query_output_backend_polled`]
+    /// polls a few times instead of sampling once, so a switch
+    /// that lands mid-poll reports success and a still-running
+    /// switch is a verdict after several samples, not one) and
+    /// report the verdict in [`JobDone::BackendRequery`]. Returns
+    /// true when the re-query started; false when there is nothing
+    /// to re-query (no recorded request, a re-query already in
+    /// flight, or no live link) — the caller then falls back to
+    /// the plain timeout failure. The job runs under
+    /// [`JobKind::Backend`] so the busy strip shows "Checking
+    /// controller…" while it runs; its own 420 s timeout cannot
+    /// fire (the poll is bounded at ~5 s), and the in-flight flag
+    /// stops a second timeout from spawning a second re-query.
     fn start_backend_requery(&self, win: &MainWindow) -> bool {
         let Some(requested) = self.backend_job_requested.get() else {
             return false;
@@ -4983,10 +5060,11 @@ impl Ctx {
             return false;
         };
         self.backend_requery_in_flight.set(true);
+        let requested_name = if requested == 1 { "vJoy" } else { "HIDMaestro" };
         let started = self.run_job(win, JobKind::Backend, "Checking controller…", move || {
             JobDone::BackendRequery {
                 requested,
-                backend: live_api.query_output_backend(),
+                backend: live_api.query_output_backend_polled(requested_name),
             }
         });
         if !started {
@@ -13319,6 +13397,7 @@ fn main() -> Result<(), slint::PlatformError> {
         spawn_budget: Arc::new(live_probe::SpawnBudget::new()),
         spawn_latch: Rc::new(RefCell::new(None)),
         last_dead_detail: Rc::new(RefCell::new(None)),
+        last_second_instance_at: Rc::new(Cell::new(None)),
         down_since: Rc::new(Cell::new(None)),
         last_back_at: Rc::new(Cell::new(None)),
         last_flap_at: Rc::new(Cell::new(None)),
@@ -14018,14 +14097,20 @@ mod tests {
             .last_cheap_frame
             .get()
             .expect("key stored after the first frame");
-        assert!(!ctx.push_frame(&win, 1), "identical tick rests on the cheap key");
+        assert!(
+            !ctx.push_frame(&win, 1),
+            "identical tick rests on the cheap key"
+        );
         assert_eq!(
             ctx.last_cheap_frame.get(),
             Some(key0),
             "resting tick keeps the same key"
         );
         ctx.bump_tuning_gen();
-        assert!(!ctx.push_frame(&win, 3), "bump alone changes nothing visible");
+        assert!(
+            !ctx.push_frame(&win, 3),
+            "bump alone changes nothing visible"
+        );
         let key1 = ctx
             .last_cheap_frame
             .get()
@@ -14387,6 +14472,64 @@ mod tests {
         assert_eq!(clean_profile_name("   "), None);
     }
 
+    // CORE-P3-8 (v2.0.13): a fresh second-instance `info` record
+    // surfaces once (notification + info status-bar message) with
+    // its timestamp, never as a fatal banner — and the 1 Hz
+    // re-sync does not notify the same record again.
+    #[test]
+    #[cfg(unix)]
+    fn second_instance_info_surfaces_once_with_timestamp() {
+        let Ok(Ok(win)) = std::panic::catch_unwind(MainWindow::new) else {
+            eprintln!("second-instance test skipped: no usable display/backend");
+            return;
+        };
+        let (ctx, dir) = fc2_test_ctx();
+        assert!(!ctx.is_live(), "test ctx starts down");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        std::fs::write(
+            dir.join("daemon-status.json"),
+            format!(
+                r#"{{"status":"info","code":"SecondInstanceStarting","detail":"already running (pid 1234) but its IPC endpoint never appeared","pid":5678,"at_unix":{now}}}"#
+            ),
+        )
+        .expect("status file");
+        let unread = || ctx.notifications.borrow().unread_count();
+        let before = unread();
+        ctx.sync_daemon_error(&win);
+        assert_eq!(
+            unread(),
+            before + 1,
+            "the info record notifies exactly once"
+        );
+        assert_eq!(
+            win.get_daemon_error().as_str(),
+            "",
+            "an info record never drives the fatal banner"
+        );
+        let last = ctx
+            .notifications
+            .borrow()
+            .to_model_items()
+            .into_iter()
+            .next_back()
+            .expect("one entry");
+        assert_eq!(last.title.as_str(), "Second RSH backend start noticed");
+        assert!(
+            last.body.as_str().contains(&format_unix_time(now)),
+            "the notification carries the record timestamp"
+        );
+        // The 1 Hz safety re-sync must not notify the same record again.
+        ctx.sync_daemon_error(&win);
+        assert_eq!(unread(), before + 1, "the same record does not re-notify");
+        // And the timestamp helper itself: midnight, one afternoon time, unknown.
+        assert_eq!(format_unix_time(0), "unknown time");
+        assert_eq!(format_unix_time(86_400), "00:00:00 UTC");
+        assert_eq!(format_unix_time(45_261), "12:34:21 UTC");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Minimal [`Ctx`] for the FC2 window test: the sim API, an
     /// isolated temp data dir (notifications + `daemon-status.json`
     /// never touch the real data dir), no health monitor, no frame
@@ -14500,6 +14643,7 @@ mod tests {
             spawn_budget: Arc::new(live_probe::SpawnBudget::new()),
             spawn_latch: Rc::new(RefCell::new(None)),
             last_dead_detail: Rc::new(RefCell::new(None)),
+            last_second_instance_at: Rc::new(Cell::new(None)),
             down_since: Rc::new(Cell::new(None)),
             last_back_at: Rc::new(Cell::new(None)),
             last_flap_at: Rc::new(Cell::new(None)),
@@ -14541,7 +14685,12 @@ mod tests {
     /// F6 handlers apply on the drain, so tests assert after this,
     /// not right after the invoke.
     fn drain_all_jobs(ctx: &Ctx, win: &MainWindow) {
-        for _ in 0..150 {
+        // 500 × 20 ms = 10 s cap: the HID P3-5 polling re-query
+        // takes ~4-5 s when the daemon stays on the old backend
+        // (5 samples, 1 s apart), so the old 3 s cap gave up
+        // before its verdict landed. Returns the moment the busy
+        // set empties, so fast jobs cost nothing extra.
+        for _ in 0..500 {
             ctx.drain_jobs(win);
             if ctx.busy_jobs.borrow().is_empty() {
                 return;
@@ -15205,12 +15354,15 @@ mod tests {
         let (ctx, ctx_dir) = fc2_test_ctx();
         wire_callbacks(&win, &ctx);
         let unread = || ctx.notifications.borrow().unread_count();
+        // Newest first: the center stores the latest push at the
+        // front, so `.next()` — not `.next_back()` (the oldest) —
+        // is the verdict that just landed.
         let last_title = || {
             ctx.notifications
                 .borrow()
                 .to_model_items()
                 .into_iter()
-                .next_back()
+                .next()
                 .map(|item| item.title.as_str().to_string())
                 .unwrap_or_default()
         };
@@ -16374,7 +16526,7 @@ mod tests {
         let sock = dir.join("rsh-daemon.sock");
         let api: Arc<dyn AppApi> = Arc::new(SimApi::new());
         let (tx, _rx) = tokio::sync::broadcast::channel(64);
-        let server = Arc::new(rsh_ipc::IpcServer::new(api, tx));
+        let server = Arc::new(rsh_ipc::IpcServer::new(api.clone(), tx));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
         let sock_clone = sock.clone();
         let handle = std::thread::spawn(move || {
@@ -16397,12 +16549,15 @@ mod tests {
         ctx.swap_to_live(live_api.clone());
         ctx.state.borrow_mut().live = true;
         let unread = || ctx.notifications.borrow().unread_count();
+        // Newest first: the center stores the latest push at the
+        // front, so `.next()` — not `.next_back()` (the oldest) —
+        // is the verdict that just landed.
         let last_title = || {
             ctx.notifications
                 .borrow()
                 .to_model_items()
                 .into_iter()
-                .next_back()
+                .next()
                 .map(|item| item.title.as_str().to_string())
                 .unwrap_or_default()
         };
@@ -16424,8 +16579,17 @@ mod tests {
         // Leg 1: the daemon is still on vJoy, the UI asked for
         // HIDMaestro — the timeout stays silent (the re-query
         // reports), no cooldown arms, and the verdict is "still
-        // running", not a failure.
-        assert_eq!(live_api.output_backend(), "vJoy");
+        // running", not a failure. The LIVE query proves the
+        // backend — `output_backend()` reads the async-filled
+        // cache, which is still "Unknown" until the connect
+        // poller first runs, so asserting on it here races the
+        // poller (pre-existing: the test only ever ran where a
+        // display exists, and failed at once under Xvfb).
+        assert_eq!(
+            live_api.query_output_backend().as_deref(),
+            Some("vJoy"),
+            "the daemon starts on vJoy"
+        );
         stale_backend_job();
         let before = unread();
         ctx.check_job_timeouts(&win);
@@ -16475,6 +16639,52 @@ mod tests {
         drain_all_jobs(&ctx, &win);
         assert_eq!(unread(), before + 1, "the verdict notifies exactly once");
         assert_eq!(last_title(), "Controller switched");
+        assert_eq!(
+            win.get_controller(),
+            0,
+            "the segment shows the switched backend (HIDMaestro)"
+        );
+        assert_eq!(
+            win.get_backend_cooldown_secs(),
+            0,
+            "a completed switch arms no cooldown"
+        );
+
+        // Leg 3 (HID P3-5, v2.0.13): the switch lands MID-POLL —
+        // the daemon is still on vJoy when the re-query starts
+        // and flips to HIDMaestro 1.2 s in. A single sample would
+        // have read vJoy and reported "still running"; the polling
+        // re-query must report the success. The 1.2 s delay sits
+        // between the first sample (~0 s) and the last (~4 s) with
+        // margin both ways, so the leg is not timing-fragile.
+        assert_eq!(
+            live_api.set_output_backend("vJoy").expect("switch back"),
+            "vJoy"
+        );
+        let switcher_api = api.clone();
+        let switcher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1200));
+            switcher_api
+                .set_output_backend("HIDMaestro")
+                .expect("mid-poll switch");
+        });
+        stale_backend_job();
+        let before = unread();
+        ctx.check_job_timeouts(&win);
+        assert_eq!(unread(), before, "the timeout itself stays silent");
+        drain_all_jobs(&ctx, &win);
+        switcher.join().expect("switcher thread");
+        // No unread-count assert here: this verdict is identical
+        // to Leg 2's ("Controller switched"), so the F12 dedupe
+        // folds it into that row ("Controller switched (×2)")
+        // instead of adding a new unread row when it lands within
+        // the 5 s cooldown — the verdict still landed, which the
+        // segment + title below prove.
+        assert!(
+            last_title().starts_with("Controller switched"),
+            "a switch that lands mid-poll reports success, not 'still running' (got {})",
+            last_title()
+        );
         assert_eq!(
             win.get_controller(),
             0,

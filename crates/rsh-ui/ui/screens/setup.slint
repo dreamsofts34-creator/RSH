@@ -420,6 +420,13 @@ export component SetupWizard inherits Rectangle {
                         Btn { label: centre-done ? "Set" : "Set centre"; primary: !centre-done; disabled: !calibration-available || busy-kind == 10; clicked => { calibrate-action("centre"); } }
                     }
                 }
+                // HID P3-3 (v2.0.13): the board treats the wheel
+                // position at power-on as its centre — a wheel
+                // turned at boot stays off-centre until it is
+                // re-captured here (or the board is rebooted with
+                // the wheel straight). Say so on the step itself,
+                // not just in docs.
+                Text { text: "Tip: switch the board on with the wheel straight — it treats the power-on position as its centre. If steering feels off-centre, hold the wheel straight and press Set centre."; font-size: Theme.fs-label; color: Theme.mute; wrap: word-wrap; }
                 Rectangle {
                     horizontal-stretch: 1;
                     width: 584px;
